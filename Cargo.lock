@@ -9057,6 +9057,8 @@ dependencies = [
  "tod-agent",
  "tod-integration",
  "tod-journey",
+ "tod-orchestrator",
+ "tod-sandbox",
  "tod-store",
  "tokio",
  "toml 0.8.23",
@@ -9064,6 +9066,7 @@ dependencies = [
  "tracing-appender",
  "tracing-rolling-file",
  "tracing-subscriber",
+ "ureq",
  "uuid",
 ]
 
@@ -9109,6 +9112,19 @@ dependencies = [
  "tod-integration",
  "tod-journey",
  "toml 0.8.23",
+]
+
+[[package]]
+name = "tod-orchestrator"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tod-sandbox",
+ "tod-store",
+ "ureq",
 ]
 
 [[package]]
@@ -9182,6 +9198,25 @@ dependencies = [
  "ureq",
  "uuid",
  "windows 0.57.0",
+]
+
+[[package]]
+name = "tod-supervisor"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "libc",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tod-agent",
+ "tod-core",
+ "tod-orchestrator",
+ "tod-store",
+ "tracing",
+ "tracing-subscriber",
+ "ureq",
+ "uuid",
 ]
 
 [[package]]

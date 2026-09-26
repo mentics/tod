@@ -36,10 +36,12 @@
 //!   `create_triggers_sql` above is seeded at, so their triggers are created
 //!   by [`decisions_triggers_sql`] instead, run by the same migration step
 //!   that creates the tables.
+//! - `waits` (`tod_store::waits`), created by [`waits_triggers_sql`] in the
+//!   v67 migration for the same reason.
 //! - `request_feedback` (`tod_store::request_feedback`; `doc/ui/task-panel.md`
 //!   "Shouldn't have asked") — same story: added after the epoch, so its
-//!   trigger is created by [`request_feedback_triggers_sql`] in the migration
-//!   step that creates the table.
+//!   trigger is created by [`request_feedback_triggers_sql`] in the v69
+//!   migration step that creates the table.
 //!
 //! Deliberately excluded, with reasons:
 //! - `node_plan_step_deps`, `node_plan_step_obligations`, `node_plan_step_notes`
@@ -58,6 +60,8 @@
 //!   drafting flow this replaced (CLAUDE.md: "Drafting ... is gone").
 //! - every `conversation_*` table — conversations are recorded through the
 //!   driver instead (step 3 of the plan).
+//! - `sync_changes`, `sync_state` (`crate::sync`) — a log about other
+//!   tables' rows (with its own triggers), not data the user changed.
 //! - fleet run-tracking tables (`agent_configs`, `agent_runs`,
 //!   `shell_sessions`, `notifications`, `notification_agents`,
 //!   `transcript_turns`, `tasks`) — the fleet concept is being deprecated
@@ -263,6 +267,12 @@ pub fn decisions_triggers_sql() -> String {
         "
     ));
     sql
+}
+
+/// Triggers for `waits` (simple `(id, node_id)` shape; state and due time
+/// are updated).
+pub fn waits_triggers_sql() -> String {
+    simple_id_triggers("waits")
 }
 
 /// Triggers for `request_feedback` (simple `(id, node_id)` shape, can be

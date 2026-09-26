@@ -499,6 +499,7 @@ pub fn sibling_exe(name: &str) -> PathBuf {
 }
 
 /// The Linux relay binary: `TOD_RELAY_BIN`, the install's `sandbox/tod-relay`,
+/// `target/sandbox/tod-relay` (built by `scripts/build-sandbox-binaries.sh`),
 /// or, in a dev build, the cross-compiled one in `target/`.
 pub fn relay_path() -> Result<PathBuf> {
     if let Some(p) = std::env::var_os("TOD_RELAY_BIN") {
@@ -510,6 +511,13 @@ pub fn relay_path() -> Result<PathBuf> {
         return Ok(installed);
     }
     for ancestor in dir.ancestors() {
+        // `scripts/build-sandbox-binaries.sh` builds every sandbox binary
+        // (whichever way it managed to cross-compile it) into this one
+        // directory, so prefer it over the raw per-target cargo output.
+        let built = ancestor.join("sandbox").join("tod-relay");
+        if built.is_file() {
+            return Ok(built);
+        }
         let dev = ancestor.join("x86_64-unknown-linux-musl").join("release").join("tod-relay");
         if dev.is_file() {
             return Ok(dev);
@@ -517,6 +525,7 @@ pub fn relay_path() -> Result<PathBuf> {
     }
     bail!(
         "tod-relay not found ({}); build it with \
+         `scripts/build-sandbox-binaries.sh` or \
          `cargo build --release -p tod-relay --target x86_64-unknown-linux-musl`",
         installed.display()
     )

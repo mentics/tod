@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Current fleet schema epoch stored in `PRAGMA user_version`.
-pub const CURRENT_USER_VERSION: i32 = 67;
+pub const CURRENT_USER_VERSION: i32 = 69;
 
 const BUSY_TIMEOUT_MS: i64 = 5000;
 
@@ -404,7 +404,20 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
         conn.pragma_update(None, "user_version", 65)?;
     }
     if version < 66 {
-        // Checked first: a store wound back below 66 still has the column.
+        // The sync change log (`crate::sync`); its triggers are recreated
+        // on every open below, from the live schema.
+        crate::sync::install(conn)?;
+        conn.pragma_update(None, "user_version", 66)?;
+    }
+    if version < 67 {
+        // What autonomous nodes wait on (`crate::waits`); synced, so its
+        // sync triggers come from `crate::sync::install` below.
+        conn.execute_batch(crate::waits::CREATE_TABLE)?;
+        conn.execute_batch(&crate::journey_changes::waits_triggers_sql())?;
+        conn.pragma_update(None, "user_version", 67)?;
+    }
+    if version < 68 {
+        // Checked first: a store wound back below 68 still has the column.
         let has_reason: bool = conn.query_row(
             "SELECT COUNT(*) > 0 FROM pragma_table_info('decisions') WHERE name = 'reason'",
             [],
@@ -415,13 +428,14 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
                 "ALTER TABLE decisions ADD COLUMN reason TEXT NOT NULL DEFAULT 'other';",
             )?;
         }
-        conn.pragma_update(None, "user_version", 66)?;
+        conn.pragma_update(None, "user_version", 68)?;
     }
-    if version < 67 {
+    if version < 69 {
         conn.execute_batch(crate::request_feedback::CREATE_TABLE)?;
         conn.execute_batch(&crate::journey_changes::request_feedback_triggers_sql())?;
-        conn.pragma_update(None, "user_version", 67)?;
+        conn.pragma_update(None, "user_version", 69)?;
     }
+    crate::sync::install(conn)?;
     // Idempotent and cheap — keeps the gate criteria catalog's wording in
     // sync with the source on every startup, not just the migration that
     // first seeded it (`INSERT OR IGNORE` alone would never update labels

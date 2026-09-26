@@ -58,6 +58,9 @@ pub(crate) struct LifecycleSnapshot {
     /// Why implementation, verification, or review cannot run here, when it
     /// cannot.
     pub blocked: Option<String>,
+    /// The node runs in the cloud: its supervisor moves it along, not these
+    /// buttons (`tod_core::cloud_sync`).
+    pub cloud: Option<tod_core::cloud_sync::CloudNode>,
 }
 
 impl LifecycleSnapshot {
@@ -104,6 +107,7 @@ impl LifecycleSnapshot {
             standing,
             lifecycle,
             blocked,
+            cloud: tod_core::cloud_sync::cloud_node(fleet.paths().root(), &task_id),
         })
     }
 
@@ -146,6 +150,13 @@ impl ConversationView {
         let Some(snapshot) = self.data.lifecycle.as_ref() else {
             return (actions, notices);
         };
+        if let Some(cloud) = &snapshot.cloud {
+            notices.push(PanelNotice::new(
+                NoticeTone::Muted,
+                crate::views::cloud_node::status_line(cloud, &snapshot.lifecycle),
+            ));
+            return (actions, notices);
+        }
         let task_id = snapshot.node.to_string();
         let empty = GateCheckState::default();
         let controller = self.lifecycle.read(cx);

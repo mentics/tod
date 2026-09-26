@@ -117,6 +117,10 @@ impl Blaxel {
         &self.token
     }
 
+    pub fn workspace(&self) -> &str {
+        &self.workspace
+    }
+
     fn auth<B>(&self, req: ureq::RequestBuilder<B>) -> ureq::RequestBuilder<B> {
         req.header("Authorization", &format!("Bearer {}", self.token))
             .header("X-Blaxel-Workspace", &self.workspace)
@@ -163,6 +167,19 @@ impl Blaxel {
         check(&mut resp, "create sandbox")
     }
 
+    /// Creates a sandbox from a full request body (see `node::create_body`).
+    pub fn create_from_body(&self, body: &Value) -> Result<()> {
+        let mut resp =
+            self.auth(self.agent.post(&format!("{API}/sandboxes"))).send_json(body).context("Blaxel API")?;
+        check(&mut resp, "create sandbox")
+    }
+
+    /// `POST {API}{path}` with a JSON body, for calls this type has no method for.
+    pub fn post_json(&self, path: &str, body: &Value, what: &str) -> Result<()> {
+        let mut resp = self.auth(self.agent.post(&format!("{API}{path}"))).send_json(body).context("Blaxel API")?;
+        check(&mut resp, what)
+    }
+
     /// Creates `target` as a copy of `source`'s current state (Blaxel's
     /// fork; not every workspace has it). Returns once the control plane
     /// accepted it; see [`Blaxel::wait_deployed`].
@@ -188,6 +205,15 @@ impl Blaxel {
             }
             _ => check(&mut resp, &format!("fork {source}")),
         }
+    }
+
+    /// `DELETE {API}{path}`; a 404 (already gone) is not an error.
+    pub fn delete_path(&self, path: &str, what: &str) -> Result<()> {
+        let mut resp = self.auth(self.agent.delete(&format!("{API}{path}"))).call().context("Blaxel API")?;
+        if resp.status().as_u16() == 404 {
+            return Ok(());
+        }
+        check(&mut resp, what)
     }
 
     pub fn delete(&self, name: &str) -> Result<()> {
@@ -236,7 +262,25 @@ impl Blaxel {
 
     /// Starts a background process by name. It does not hold the sandbox awake.
     pub fn start(&self, url: &str, name: &str, command: &str, restart_on_failure: bool) -> Result<()> {
+        self.start_with_env(url, name, command, restart_on_failure, &[])
+    }
+
+    /// [`Self::start`] with environment variables set for the process only
+    /// (the process API's `env`), so secrets stay off its command line.
+    pub fn start_with_env(
+        &self,
+        url: &str,
+        name: &str,
+        command: &str,
+        restart_on_failure: bool,
+        env: &[(&str, &str)],
+    ) -> Result<()> {
         let mut body = json!({ "command": command, "name": name, "timeout": 0 });
+        if !env.is_empty() {
+            let env: serde_json::Map<String, Value> =
+                env.iter().map(|(k, v)| (k.to_string(), Value::String(v.to_string()))).collect();
+            body["env"] = Value::Object(env);
+        }
         if restart_on_failure {
             body["restartOnFailure"] = json!(true);
             body["maxRestarts"] = json!(100);

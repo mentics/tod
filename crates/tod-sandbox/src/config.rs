@@ -91,10 +91,25 @@ pub struct Sandbox {
     pub agents: bool,
 }
 
+/// Who keeps a waiting node's wake timer (`tod_core::scheduler`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SchedulerKind {
+    /// The orchestrator's own timer (`POST /wakes`): the development account,
+    /// where Blaxel schedules are unverified.
+    #[default]
+    Orchestrator,
+    /// A Blaxel schedule on the node's own sandbox (`wait-<id>`).
+    Blaxel,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default)]
     pub blaxel: Option<Account>,
+    /// `scheduler = "orchestrator" | "blaxel"`; defaults to the orchestrator.
+    #[serde(default)]
+    pub scheduler: SchedulerKind,
     #[serde(default, rename = "sandbox")]
     pub sandboxes: Vec<Sandbox>,
 }

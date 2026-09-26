@@ -11,6 +11,10 @@
 //! - `/tunnel`: carry connections to a loopback port here (2223) to the
 //!   client, so `tod-cli` in the sandbox reaches the app on the client's machine.
 //!
+//! `POST /poke` (plain HTTP, not a WebSocket, on the same port) wakes the
+//! node's supervisor, starting it (`--supervisor-cmd`) if it is not already
+//! running, or signalling it (`SIGUSR1`) if it is.
+//!
 //! While a terminal runs a foreground job, a non-interactive command asked to
 //! keep the sandbox awake runs, or an agent answers a request, the relay holds
 //! the sandbox awake through the provider's local API, so work never freezes

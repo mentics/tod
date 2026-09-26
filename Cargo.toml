@@ -1,17 +1,20 @@
 [workspace]
-members = ["crates/tod-agent", "crates/tod-integration", "crates/tod-store", "crates/tod-core", "crates/tod-ui", "crates/tod-cli", "crates/tod", "crates/nov-viz", "crates/tod-journey", "crates/tod-journeys", "crates/tod-relay", "crates/tod-sandbox", "crates/tod-sandbox-cli", "crates/tod-zed-shim"]
+members = ["crates/tod-agent", "crates/tod-integration", "crates/tod-store", "crates/tod-core", "crates/tod-ui", "crates/tod-cli", "crates/tod", "crates/nov-viz", "crates/tod-journey", "crates/tod-journeys", "crates/tod-relay", "crates/tod-sandbox", "crates/tod-sandbox-cli", "crates/tod-zed-shim", "crates/tod-orchestrator", "crates/tod-supervisor"]
 resolver = "2"
 
 # Dev profile tuned for fast incremental rebuilds:
 # - local crate stays unoptimized (opt-level 0, default)
 # - dependencies compile once with light optimization (gpui stack is heavy)
 # - line-table debug info keeps binaries smaller and links faster
+# - dependencies carry no debug info, to keep target/ small (every worktree
+#   has its own)
 [profile.dev]
 debug = 1
 incremental = true
 
 [profile.dev.package."*"]
 opt-level = 1
+debug = 0
 
 [profile.dev.build-override]
 opt-level = 3

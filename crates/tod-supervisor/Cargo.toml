@@ -1,0 +1,36 @@
+[package]
+name = "tod-supervisor"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Runs one autonomous node's lifecycle in its cloud sandbox: the autopilot, the hold, sync with the orchestrator, transcripts"
+
+# Runs on Linux in a node's sandbox (cross-built by
+# scripts/build-sandbox-binaries.sh, which needs zigbuild: tod-store bundles
+# SQLite). Builds and tests anywhere; SIGUSR1 handling is Unix-only.
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "tod-supervisor"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+rusqlite = { version = "0.37", features = ["bundled", "backup"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tod-agent = { path = "../tod-agent" }
+tod-core = { path = "../tod-core" }
+tod-store = { path = "../tod-store" }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+ureq = { version = "3", features = ["json"] }
+uuid = { version = "1.0", features = ["v4"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tod-orchestrator = { path = "../tod-orchestrator" }
