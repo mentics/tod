@@ -10,8 +10,9 @@ relay has no authentication of its own. The client side is
 The relay routes by the path's segments, since the proxy may or may not keep
 its `/port/2222` prefix: a path with an `agent` segment goes to
 [`/agent/<name>`](#agentname), one with an `exec` segment goes to
-[`/exec`](#exec), and one with a `tunnel` segment goes to
-[`/tunnel`](#tunnel).
+[`/exec`](#exec), one with a `tunnel` segment goes to [`/tunnel`](#tunnel),
+and a `POST` with a `poke` segment goes to [`POST /poke`](#post-poke) instead
+of the WebSocket upgrade every other path expects.
 
 ## `/exec`
 
@@ -102,23 +103,63 @@ command against the app's data root.
 The provider freezes a sandbox about 15 s after its last proxied connection
 closes, whatever is running inside it. The relay starts one process through
 the provider's local API (`127.0.0.1:8080/process` with `keepAlive`), which
-disables standby. It keeps that process while any of these reasons hold:
+disables standby. It keeps that process while any *reason* holds
+(`crates/tod-relay/src/hold.rs`). A reason is either:
 
-- **`busy:<session>`:** a pty session has a foreground job (a build, a test
-  run, a dev server). An idle prompt does not count.
-- **`awake:<session>`:** an `/exec` command was started with `keep_awake`.
-- **`agent:<name>`:** the agent owes the client an answer (a request it has
-  not responded to), unless it is itself waiting on a client request while no
-  client is attached. In that case it cannot make progress anyway.
+- **Lease-less** (`Hold::set(reason, on)`): holds exactly as long as it is
+  set. These are all internal, tied to a liveness check the relay already
+  runs, so it renews the underlying process for them on its own in a rolling
+  window — it never needs telling twice:
+  - **`busy:<session>`:** a pty session has a foreground job (a build, a test
+    run, a dev server). An idle prompt does not count.
+  - **`awake:<session>`:** an `/exec` command was started with `keep_awake`.
+  - **`agent:<name>`:** the agent owes the client an answer (a request it has
+    not responded to), unless it is itself waiting on a client request while
+    no client is attached. In that case it cannot make progress anyway.
+  - **`poke`:** see [`POST /poke`](#post-poke) below.
+- **Leased** (`Hold::lease(reason, secs)`): holds until `secs` from now,
+  and ends there unless renewed (called again, with a later deadline) before
+  then. Nothing in the relay's own wire protocol takes one today; it is there
+  for a caller outside the relay — such as a future supervisor — that must
+  prove it is still alive to keep the sandbox up, rather than being trusted
+  to say so once.
 
-When the last reason ends, the relay kills that process and the sandbox can
-sleep. `--max-hold-secs` (default 4 h) bounds any one hold, so a forgotten dev
-server cannot keep a sandbox running forever.
+The underlying process's `timeout` is the shortest lease still open, or
+`--max-hold-secs` (default 4 h) when only lease-less reasons are open — this
+replaces the old fixed 4 h cap applied regardless of what was holding. When
+the last reason ends, the relay kills the process and the sandbox can sleep.
+
+## `POST /poke`
+
+A plain HTTP request (not a WebSocket) on the relay's own port, used to wake
+the node's sandbox and its supervisor — the same operation whether the
+message behind it is a webhook, a user's answer, or a changed context (see
+`doc/cloud-sandboxes/autonomous-nodes.md`). Reaching the relay at all, over
+the provider's proxy, is what actually wakes the sandbox; the request itself
+needs no body and gets `200` with an empty one back.
+
+`tod-supervisor` does not exist yet. The contract a poke needs from it:
+
+- **Starting it.** If no supervisor the relay itself started is still
+  running, it runs `--supervisor-cmd` (default `tod-supervisor wake`) as a
+  plain process — **not** `keepAlive`: the supervisor decides for itself
+  whether there is work, and if so takes its own hold (a lease, once it
+  exists, through this same relay or directly against the provider's process
+  API — not yet decided). If there is nothing to do it just exits.
+- **Signalling it.** If a supervisor the relay started is still running (its
+  pid is tracked from when it was started), a poke instead sends it
+  `SIGUSR1`, so it looks again now rather than waiting for its next schedule.
+- **The bridge.** Either way, a poke first takes a 60 s leased hold of its
+  own (reason `poke`) before starting or signalling anything, so the sandbox
+  cannot go back to standby in the moment before the supervisor decides
+  whether to take its own hold. It lapses on its own unless another poke
+  renews it — a poke is not a substitute for the supervisor's own hold once
+  it has real work.
 
 ## Running it
 
 ```sh
-tod-relay --port 2222 --tunnel-port 2223 --max-hold-secs 14400
+tod-relay --port 2222 --tunnel-port 2223 --max-hold-secs 14400 --supervisor-cmd "tod-supervisor wake"
 tod-relay --version
 ```
 
