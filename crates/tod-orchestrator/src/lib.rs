@@ -19,6 +19,8 @@
 //! - `GET /users/<u>/nodes/<n>/transcripts` — the node's mirrored agent
 //!   transcripts; `GET`/`POST .../transcripts/<name>` reads or appends one
 //!   (see [`transcripts`]).
+//! - `POST /webhooks/github`, `POST /webhooks/linear` — no user: signed, and
+//!   routed to nodes by branch or open waits (see [`webhooks`]).
 
 pub mod cli;
 pub mod http;
@@ -28,6 +30,7 @@ pub mod sync_backend;
 pub mod transcripts;
 pub mod users;
 pub mod wakes;
+pub mod webhooks;
 
 use anyhow::{Context, Result};
 use http::{Request, Response};
@@ -63,6 +66,7 @@ pub struct Server {
     users: Arc<Users>,
     wakes: Arc<wakes::Wakes>,
     notifier: Arc<notify::Notifier>,
+    webhook_secrets: webhooks::Secrets,
 }
 
 impl Server {
@@ -81,7 +85,8 @@ impl Server {
         let users = Arc::new(Users::new(config.base.clone()));
         let wakes = wakes::Wakes::load(&config.base, poker)?;
         let notifier = notify::Notifier::start(Box::new(notify::StoreProbe(users.clone())), sink);
-        Ok(Arc::new(Self { config, users, wakes, notifier }))
+        let webhook_secrets = webhooks::Secrets::load(&config.base)?;
+        Ok(Arc::new(Self { config, users, wakes, notifier, webhook_secrets }))
     }
 
     pub fn wakes(&self) -> &Arc<wakes::Wakes> {
@@ -138,6 +143,14 @@ impl Server {
         let method = request.method.as_str();
         match segments.as_slice() {
             ["health"] => Response::text(200, "ok"),
+            ["webhooks", source] => {
+                let (response, touched) =
+                    webhooks::handle(&self.users, &self.wakes, &self.webhook_secrets, source, request);
+                for user in touched {
+                    self.notifier.poke(&user);
+                }
+                response
+            }
             ["cli"] => {
                 if method != "POST" {
                     return Response::text(405, "POST /cli");

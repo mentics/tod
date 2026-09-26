@@ -9119,9 +9119,11 @@ name = "tod-orchestrator"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "hmac",
  "rusqlite",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tod-core",
  "tod-sandbox",
  "tod-store",

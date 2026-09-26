@@ -273,6 +273,11 @@ pub fn waits_triggers_sql() -> String {
     simple_id_triggers("waits")
 }
 
+/// Triggers for `node_events` (webhook events routed to a node).
+pub fn node_events_triggers_sql() -> String {
+    simple_id_triggers("node_events")
+}
+
 /// Triggers for `cloud_nodes` (one row per node, keyed by `node_id`).
 pub fn cloud_nodes_triggers_sql() -> String {
     node_keyed_triggers("cloud_nodes")

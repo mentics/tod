@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Current fleet schema epoch stored in `PRAGMA user_version`.
-pub const CURRENT_USER_VERSION: i32 = 68;
+pub const CURRENT_USER_VERSION: i32 = 69;
 
 const BUSY_TIMEOUT_MS: i64 = 5000;
 
@@ -422,6 +422,12 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
         conn.execute_batch(crate::cloud_nodes::CREATE_TABLE)?;
         conn.execute_batch(&crate::journey_changes::cloud_nodes_triggers_sql())?;
         conn.pragma_update(None, "user_version", 68)?;
+    }
+    if version < 69 {
+        // Webhook events routed to a node (`crate::node_events`); synced.
+        conn.execute_batch(crate::node_events::CREATE_TABLE)?;
+        conn.execute_batch(&crate::journey_changes::node_events_triggers_sql())?;
+        conn.pragma_update(None, "user_version", 69)?;
     }
     crate::sync::install(conn)?;
     // Idempotent and cheap — keeps the gate criteria catalog's wording in

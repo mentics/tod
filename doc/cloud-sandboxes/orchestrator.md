@@ -80,3 +80,69 @@ the server in `TOD_NTFY_URL`; `off` turns it off). Messages carry no data.
   on a background thread (renewed every 10 minutes, resuming with `since=`;
   reconnects with backoff), and runs one cloud sync per message, never two
   at once.
+- The `tod-orchestrator` binary publishes by default. The library's
+  `Server::new` / `with_poker` publish only when `TOD_NTFY_URL` is set, so
+  tests and embedders never reach ntfy.sh unasked.
+
+## Webhooks (`webhooks.rs`)
+
+GitHub and Linear deliveries go to the orchestrator's public preview URL:
+`POST /webhooks/github` and `POST /webhooks/linear`. They carry no
+`X-Tod-User`; the signature authenticates them and routing picks the user.
+
+**Registering.** One secret per source for the whole orchestrator, made once
+in `<base>/webhooks.json` (`{"github": "...", "linear": "..."}`), or set by
+`TOD_ORCHESTRATOR_GITHUB_WEBHOOK_SECRET` / `TOD_ORCHESTRATOR_LINEAR_WEBHOOK_SECRET`.
+Read it from that file on the orchestrator sandbox, then:
+
+- GitHub (repository or organization → Settings → Webhooks): payload URL
+  `<preview-url>/webhooks/github`, content type `application/json`, that
+  secret; events: pull requests, pull request reviews and review comments,
+  issue comments, check suites, check runs, workflow runs, pushes.
+- Linear (Settings → API → Webhooks): URL `<preview-url>/webhooks/linear`;
+  Linear makes the signing secret, so put it in `linear` in `webhooks.json`
+  (or the env var) and restart.
+
+A request whose HMAC-SHA256 over the raw body (`X-Hub-Signature-256:
+sha256=<hex>`, `Linear-Signature: <hex>`) does not match, compared in
+constant time, is refused with 401 before its body is parsed.
+
+**Keys.** Each delivery becomes match keys:
+
+| Event | Keys |
+|---|---|
+| `pull_request` | `github:pr:<n>:<action>` (`merged` for a merged close), `github:branch:<b>:pr:<action>` |
+| `pull_request_review(_comment)` | `github:pr:<n>:review:<state>` (`approved`, `changes_requested`, `commented`; `comment` for review comments), same under `github:branch:<b>:` |
+| `issue_comment` | `github:pr:<n>:comment` or `github:issue:<n>:comment` |
+| `check_suite`, `check_run`, `workflow_run` (only `completed`) | `github:pr:<n>:checks:<conclusion>` per PR, `github:branch:<b>:checks:<conclusion>` |
+| `push` | `github:branch:<b>:push` |
+| other GitHub events | `github:<event>:<action>` (routed by wait only) |
+| Linear | `linear:<type>:<identifier>:<action>` and `linear:<type>:<id>:<action>` (e.g. `linear:issue:ENG-12:update`) |
+
+An `event` wait's `match_spec` matches a key when, with `:` and spaces both
+taken as separators, it is the key or a prefix of it ending at a separator:
+`github:pr 12 checks` matches `github:pr:12:checks:failure`. The agents'
+version is in `media/context/cli/wait.md`.
+
+**Routing**, across every user under `<base>/users/`: first the cloud nodes
+(`cloud_nodes`) whose Files branch (`node_fields.branch`) is the event's
+branch (a Linear issue's `branchName`); if none, every node with a pending
+event wait that matches. For each node:
+
+1. The event is recorded in `node_events` (schema v69, synced: keys, a
+   summary, the raw payload), under the user's sync lock.
+2. Its matching pending waits are set `satisfied` through
+   `InterviewCommand::SetWaitState` (actor `webhook`).
+3. Their orchestrator wakes (id = wait id, in `wakes.json`) are dropped.
+4. Its sandbox is poked (a failed poke is retried by the wake timer), and
+   the user's change notice is sent.
+
+Gap: a wait scheduled with Blaxel (`BlaxelScheduler`) keeps its schedule
+`wait-<id>`: the orchestrator has no Blaxel credentials for the user's
+sandboxes. It fires later as a harmless poke; the supervisor should delete
+it once it sees the wait satisfied.
+
+Deliveries are not deduplicated (`X-GitHub-Delivery` is ignored); a repeat
+records the event again and pokes again, which is harmless. Webhooks can be
+lost; every event wait also has its deadline, so a lost one only delays the
+node.
