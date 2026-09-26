@@ -2,20 +2,14 @@
 //!
 //! Column 1 (the node tree) is always shown and always pinned, but it is not
 //! stored as a column here — this model only tracks columns 2 onward. See
-//! `doc/ui/unified-view.md` ("Where a panel opens", "Singleton panels",
-//! "Pinning") for the rules this implements.
+//! `doc/ui/unified-view.md` ("Where a panel opens", "Pinning") for the rules this implements.
 
 /// What panel a column shows, and what it targets.
-///
-/// `Decisions` has no target: it is a singleton that always shows whichever
-/// node's decisions are current (see `doc/ui/unified-view.md` "Singleton
-/// panels").
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PanelKind {
     Details(uuid::Uuid),
     /// The task panel (`doc/ui/task-panel.md`): a task node's default panel.
     Task(uuid::Uuid),
-    Decisions,
     Obligations(uuid::Uuid),
     Plan(uuid::Uuid),
     Findings(uuid::Uuid),
@@ -29,7 +23,8 @@ pub enum PanelKind {
 
 impl PanelKind {
     /// The node this panel is about, when it targets one; `None` for a
-    /// singleton with no target (`Decisions`) or a conversation's transcript.
+    /// conversation's transcript.
+    #[cfg(test)]
     pub fn node(&self) -> Option<uuid::Uuid> {
         match self {
             PanelKind::Details(id)
@@ -40,25 +35,8 @@ impl PanelKind {
             | PanelKind::Settings(id)
             | PanelKind::Changes(id) => Some(*id),
             // A transcript's id is its conversation's, not a node's.
-            PanelKind::Transcript(_) | PanelKind::Decisions => None,
+            PanelKind::Transcript(_) => None,
         }
-    }
-
-    /// Whether this panel kind may exist in at most one column at a time.
-    /// Opening one that is already shown retargets and focuses it instead of
-    /// opening a new column (`doc/ui/unified-view.md` "Singleton panels").
-    pub fn is_singleton(&self) -> bool {
-        matches!(self, PanelKind::Decisions)
-    }
-
-    /// Two panel kinds are "the same panel" for the singleton check: for a
-    /// singleton kind, any instance matches regardless of target; for
-    /// everything else, kind and target must match exactly.
-    fn matches_open_request(&self, other: &PanelKind) -> bool {
-        if self.is_singleton() && other.is_singleton() {
-            return std::mem::discriminant(self) == std::mem::discriminant(other);
-        }
-        self == other
     }
 }
 
@@ -120,8 +98,7 @@ impl ColumnModel {
     /// Open `panel`, following the placement rule in
     /// `doc/ui/unified-view.md`:
     ///
-    /// - A singleton panel already shown anywhere is retargeted in place and
-    ///   focused — the column rule below does not apply.
+    /// - The same panel (kind and target) already shown is focused in place.
     /// - Otherwise: the first unpinned column starting at `from_column`
     ///   (inclusive, 0-based over `columns()`); with `ctrl`, starting
     ///   strictly after it. If none is found, a new column is appended.
@@ -135,7 +112,7 @@ impl ColumnModel {
         if let Some(existing) = self
             .columns
             .iter()
-            .position(|c| c.panel.matches_open_request(&panel))
+            .position(|c| c.panel == panel)
         {
             self.columns[existing].panel = panel;
             self.focused = Some(existing);
@@ -172,6 +149,7 @@ impl ColumnModel {
         }
     }
 
+    #[cfg(test)]
     pub fn set_pinned(&mut self, index: usize, pinned: bool) {
         if let Some(col) = self.columns.get_mut(index) {
             col.pinned = pinned;
@@ -272,10 +250,9 @@ mod tests {
     }
 
     #[test]
-    fn task_panel_targets_its_node_and_is_not_a_singleton() {
+    fn task_panel_targets_its_node() {
         let t = task(1);
         assert_eq!(t.node(), details(1).node());
-        assert!(!t.is_singleton());
     }
 
     #[test]
@@ -304,7 +281,6 @@ mod tests {
         bytes[15] = 3;
         let changes = PanelKind::Changes(Uuid::from_bytes(bytes));
         assert_eq!(changes.node(), task(3).node());
-        assert!(!changes.is_singleton());
         let mut m = ColumnModel::new();
         m.open(task(3), 0, false);
         // Ctrl+click on the task's Changes link opens beside it.
@@ -403,30 +379,7 @@ mod tests {
     }
 
     #[test]
-    fn singleton_reopen_retargets_existing_column_instead_of_opening_new() {
-        let mut m = ColumnModel::new();
-        m.open(details(1), 0, false); // col2
-        m.open(PanelKind::Decisions, 1, false); // col3
-        assert_eq!(m.len(), 2);
-        // Opening Decisions again from a different clicked column retargets
-        // the existing one and focuses it, rather than opening a third column.
-        let ix = m.open(PanelKind::Decisions, 0, false);
-        assert_eq!(ix, 1);
-        assert_eq!(m.len(), 2);
-        assert_eq!(m.focused_index(), Some(1));
-    }
-
-    #[test]
-    fn singleton_not_yet_shown_follows_the_normal_column_rule() {
-        let mut m = ColumnModel::new();
-        m.open(details(1), 0, false);
-        m.toggle_pin(0);
-        let ix = m.open(PanelKind::Decisions, 0, false);
-        assert_eq!(ix, 1);
-    }
-
-    #[test]
-    fn non_singleton_reopen_with_same_target_replaces_in_place_and_focuses() {
+    fn reopen_with_same_target_focuses_in_place() {
         let mut m = ColumnModel::new();
         m.open(details(1), 0, false); // col2
         m.open(obligations(2), 1, false); // col3

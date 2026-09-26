@@ -2,7 +2,7 @@
 //! question with options and evidence, and the app queues it for the user.
 //!
 //! Agents only `ask`; there is no answer command here on purpose —
-//! answering is the user's, from the decisions panel
+//! answering is the user's, from the task panel
 //! (`doc/ui/unified-view.md` "Decisions"). Inside a conversation
 //! `TOD_IMPLEMENT_NODE` / `TOD_IMPLEMENT_CONVERSATION` supply `--node` and
 //! the asking conversation when they are not given explicitly.

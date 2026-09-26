@@ -268,10 +268,10 @@ pub enum TaskListEvent {
         task_id: String,
         editor_id: String,
     },
-    /// Right-click menu's "Open decisions (n)", or the attention badge on a
+    /// Right-click menu's "Open requests (n)", or the attention badge on a
     /// row. The host decides what "open" means (the unified view's
-    /// decisions panel); the existing Tasks view may ignore it.
-    OpenDecisions {
+    /// task panel); the existing Tasks view may ignore it.
+    OpenTaskPanel {
         task_id: String,
     },
     /// Right-click menu's "Settings" entry: the unified view's settings
@@ -798,21 +798,21 @@ impl TaskListView {
             RowAction::OpenContextMenu { task_id } => {
                 self.open_context_menu(&task_id, window, cx);
             }
-            RowAction::OpenDecisions { task_id } => {
+            RowAction::OpenTaskPanel { task_id } => {
                 self.select_task_by_id(&task_id, window, cx);
-                cx.emit(TaskListEvent::OpenDecisions {
+                cx.emit(TaskListEvent::OpenTaskPanel {
                     task_id: task_id.clone(),
                 });
                 let presented = tod_journey::Presented {
                     actions: Vec::new(),
-                    focused: Some("Open decisions".to_string()),
+                    focused: Some("Open requests".to_string()),
                     notices: Vec::new(),
                 };
                 if let Ok(node_id) = uuid::Uuid::parse_str(&task_id) {
                     crate::ui::journey::record_action(
                         cx,
                         tod_store::conversation::Focus::Node(node_id),
-                        "Open decisions",
+                        "Open requests",
                         Source::Click,
                         "task_list_attention_badge",
                         presented,
@@ -2710,7 +2710,7 @@ impl TaskListView {
     /// The host (e.g. W6's attention feed) reports what each node is
     /// waiting on the user for, keyed by node id. Nodes not present in
     /// `map` are cleared back to zero. Rows with `count > 0` show a badge
-    /// (clicking it emits `OpenDecisions`), the right-click menu's "Open
+    /// (clicking it emits `OpenTaskPanel`), the right-click menu's "Open
     /// decisions" entry uses the count, and the "Needs you" filter and the
     /// "Waiting longest" sort both read it.
     pub fn set_attention(
@@ -3788,13 +3788,13 @@ mod tests {
     }
 
     #[gpui::test]
-    fn attention_badge_click_emits_open_decisions(cx: &mut TestAppContext) {
+    fn attention_badge_click_emits_open_task_panel(cx: &mut TestAppContext) {
         let fixture = Fixture::new();
         let node_id = fixture.node_id.to_string();
         let (view, events, cx) = open_view(&fixture, cx);
         view.update_in(cx, |view, window, cx| {
             view.handle_row_action(
-                delegate::RowAction::OpenDecisions {
+                delegate::RowAction::OpenTaskPanel {
                     task_id: node_id.clone(),
                 },
                 window,
@@ -3803,7 +3803,7 @@ mod tests {
         });
         draw(cx);
         assert!(events.borrow().iter().any(
-            |e| matches!(e, TaskListEvent::OpenDecisions { task_id } if task_id == &node_id)
+            |e| matches!(e, TaskListEvent::OpenTaskPanel { task_id } if task_id == &node_id)
         ));
     }
 

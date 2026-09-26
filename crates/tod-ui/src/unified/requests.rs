@@ -1,6 +1,6 @@
 //! Requests: everything a node is waiting on the user for, rendered and
-//! answered in one place so the task panel (`doc/ui/task-panel.md`
-//! "Requests") and the decisions panel (until T7 deletes it) behave the same.
+//! answered in one place: the task panel (`doc/ui/task-panel.md`
+//! "Requests").
 //!
 //! [`Requests`] is an entity a host panel embeds as a child. It loads
 //! [`tod_core::attention::for_node`] (oldest first) off the UI thread and
@@ -25,8 +25,7 @@
 //! the request, then offers a note and a switch to "bad question".
 //!
 //! The decision answer log with **Change** is here too
-//! ([`Requests::render_log`]), shown only when the host asks for it
-//! ([`Requests::set_show_log`]).
+//! ([`Requests::render_log_entries`]), for the task panel's Answered drawer.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -73,8 +72,8 @@ pub const REQUESTS_CONTEXT: &str = "UnifiedRequests";
 const FREEFORM_TAG: &str = "RequestsFreeform";
 /// Key-context tag for the feedback note field while it is in edit mode.
 const FEEDBACK_NOTE_TAG: &str = "RequestsFeedbackNote";
-/// The journey surface every answer is recorded under — the same whether it
-/// came from the task panel or the decisions panel.
+/// The journey surface every answer is recorded under; the name "decisions"
+/// is kept so earlier journeys still compare.
 const JOURNEY_SURFACE: &str = "decisions";
 
 /// Answer the top request with option `.0` (1-based, matching the numbered
@@ -315,7 +314,6 @@ pub struct Requests {
     /// Index of the keyboard stop on the current decision.
     selected_link: usize,
     pub(crate) last_error: Option<String>,
-    show_log: bool,
     /// Feedback given per request id.
     feedback: HashMap<Uuid, FeedbackState>,
     /// The request whose feedback note field is in edit mode.
@@ -381,7 +379,6 @@ impl Requests {
             changing: None,
             selected_link: 0,
             last_error: None,
-            show_log: false,
             feedback: HashMap::new(),
             feedback_note_editing: None,
             feedback_note_input,
@@ -390,12 +387,6 @@ impl Requests {
         };
         this.reload(cx);
         this
-    }
-
-    /// Show the decision answer log with **Change** below the requests.
-    pub fn set_show_log(&mut self, show: bool, cx: &mut Context<Self>) {
-        self.show_log = show;
-        cx.notify();
     }
 
     #[allow(dead_code)] // for hosts (T5, T6) and tests.
@@ -1346,22 +1337,6 @@ impl Requests {
         div().flex().flex_col().children(entries).into_any_element()
     }
 
-    /// The append-only decision answer log, newest first, each entry with
-    /// **Change** and a link to the conversation that asked (the decisions
-    /// panel's; the task panel shows it in its Answered drawer).
-    pub fn render_log(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        let muted = cx.theme().muted_foreground;
-        let entries = self.render_log_entries(window, cx);
-        div()
-            .flex()
-            .flex_col()
-            .child(div().text_xs().text_color(muted).child("Answer log"))
-            .child(entries)
-            .when(self.loaded.log.is_empty(), |el| {
-                el.child(div().text_xs().text_color(muted).child("No answers yet."))
-            })
-            .into_any_element()
-    }
 }
 
 /// A small label naming which kind a card is.
@@ -1392,7 +1367,6 @@ impl Render for Requests {
             .iter()
             .map(|item| self.render_item(item, window, cx))
             .collect();
-        let log = self.show_log.then(|| self.render_log(window, cx));
         div()
             .flex()
             .flex_col()
@@ -1406,15 +1380,6 @@ impl Render for Requests {
                 )))
             })
             .children(items)
-            .when(self.show_log && self.loaded.items.is_empty(), |el| {
-                el.child(
-                    div()
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child("Nothing pending on this node."),
-                )
-            })
-            .children(log.map(|log| div().pt_2().child(log)))
     }
 }
 

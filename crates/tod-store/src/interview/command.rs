@@ -224,7 +224,7 @@ pub enum InterviewCommand {
     /// Record the user's answer to a pending decision (`crate::decisions`):
     /// append-only, so a change of mind is a new answer row, never an
     /// update. Not offered by `tod-cli`: answering is the user's, from the
-    /// decisions panel, which runs this through `AgentRuns::answer_decision`.
+    /// task panel, which runs this through `AgentRuns::answer_decision`.
     AnswerDecision {
         decision_id: Uuid,
         #[serde(default)]
