@@ -9057,6 +9057,8 @@ dependencies = [
  "tod-agent",
  "tod-integration",
  "tod-journey",
+ "tod-orchestrator",
+ "tod-sandbox",
  "tod-store",
  "tokio",
  "toml 0.8.23",
@@ -9064,6 +9066,7 @@ dependencies = [
  "tracing-appender",
  "tracing-rolling-file",
  "tracing-subscriber",
+ "ureq",
  "uuid",
 ]
 

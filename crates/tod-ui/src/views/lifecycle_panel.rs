@@ -35,6 +35,7 @@ use crate::ui::key_context;
 use crate::ui::pane_nav::{PaneFocusLeft, bind_modified_pane_nav};
 use crate::ui::selectable_text::{selectable_markdown, selectable_text};
 use crate::ui::style;
+use crate::views::cloud_node::CloudUpdate;
 use crate::views::incoming_check::{IncomingCheck, outcome_line};
 use crate::views::lifecycle_control::{
     GateCheckState, LifecycleController, enters_with_agent, implement_directory,
@@ -95,6 +96,10 @@ pub enum LifecyclePanelEvent {
 /// Keyboard-navigable stops within the panel, in visual order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LifecyclePanelStop {
+    /// Hand the node to a cloud sandbox (`views::cloud_node`).
+    RunInCloud,
+    /// A cloud node: sync with the orchestrator now.
+    SyncCloud,
     MoveBack,
     CheckIncoming,
     Implement,
@@ -236,6 +241,14 @@ pub struct LifecyclePanelView {
     /// The node's stored `learn` retrospectives, one per completed pass, as
     /// `(pass, content)` (`doc/conversation/incoming-changes.md` §9).
     learnings: Vec<(i64, String)>,
+    /// Where the node runs in the cloud, when it does; its lifecycle buttons
+    /// are replaced by a status line.
+    cloud: Option<tod_core::cloud_sync::CloudNode>,
+    /// The latest word from a cloud job (Run in the cloud, Sync now), and
+    /// whether one is still running.
+    /// Keyed by the node it is about.
+    cloud_status: Option<(String, String)>,
+    cloud_busy: bool,
     focus_handle: FocusHandle,
     focus_index: usize,
     _controller_subscription: Subscription,
@@ -312,6 +325,9 @@ impl LifecyclePanelView {
             standing: None,
             incoming: Vec::new(),
             learnings: Vec::new(),
+            cloud: None,
+            cloud_status: None,
+            cloud_busy: false,
             focus_handle: cx.focus_handle(),
             focus_index: 0,
             _controller_subscription: subscription,
@@ -368,6 +384,14 @@ impl LifecyclePanelView {
 
     fn stops(&self, cx: &App) -> Vec<LifecyclePanelStop> {
         let mut stops = Vec::new();
+        if self.lifecycle_capable && self.cloud.is_some() {
+            stops.push(LifecyclePanelStop::SyncCloud);
+            stops.push(LifecyclePanelStop::Close);
+            return stops;
+        }
+        if self.lifecycle_capable {
+            stops.push(LifecyclePanelStop::RunInCloud);
+        }
         if self.regression.is_some() {
             stops.push(LifecyclePanelStop::MoveBack);
         }
@@ -462,6 +486,12 @@ impl LifecyclePanelView {
     /// body and [`Self::presented`] use it — never computed twice.
     fn stop_label(&self, stop: LifecyclePanelStop, cx: &App) -> String {
         match stop {
+            LifecyclePanelStop::RunInCloud => {
+                if self.cloud_busy { "Starting in the cloud…" } else { "Run in the cloud" }.to_string()
+            }
+            LifecyclePanelStop::SyncCloud => {
+                if self.cloud_busy { "Syncing…" } else { "Sync now" }.to_string()
+            }
             LifecyclePanelStop::MoveBack => self
                 .regression
                 .as_ref()
@@ -554,6 +584,8 @@ impl LifecyclePanelView {
             | LifecyclePanelStop::WaiveCriterion(_)
             | LifecyclePanelStop::OpenInterviewCriterion(_)
             | LifecyclePanelStop::CheckIncoming
+            | LifecyclePanelStop::RunInCloud
+            | LifecyclePanelStop::SyncCloud
             | LifecyclePanelStop::Close => false,
             #[allow(unreachable_patterns)]
             _ => {
@@ -568,6 +600,7 @@ impl LifecyclePanelView {
     fn stop_disabled(&self, stop: LifecyclePanelStop, cx: &App) -> bool {
         match stop {
             LifecyclePanelStop::Implement => self.implement_directory().is_err(),
+            LifecyclePanelStop::RunInCloud | LifecyclePanelStop::SyncCloud => self.cloud_busy,
             LifecyclePanelStop::AdvanceAfterCriteria => {
                 !self.current_state(cx, |s| s.all_clear())
             }
@@ -606,6 +639,12 @@ impl LifecyclePanelView {
         if let Some(error) = gate_error {
             notices.push(error);
         }
+        if let Some(cloud) = &self.cloud {
+            notices.push(crate::views::cloud_node::status_line(cloud, &self.lifecycle));
+        }
+        if let Some(status) = self.cloud_status_line() {
+            notices.push(status);
+        }
         Presented {
             actions,
             focused,
@@ -630,6 +669,8 @@ impl LifecyclePanelView {
             );
         }
         match stop {
+            LifecyclePanelStop::RunInCloud => self.run_in_cloud(cx),
+            LifecyclePanelStop::SyncCloud => self.sync_cloud(cx),
             LifecyclePanelStop::MoveBack => self.move_back(cx),
             LifecyclePanelStop::CheckIncoming => self.check_incoming(cx),
             LifecyclePanelStop::Implement => self.launch_implementation(window, cx),
@@ -651,6 +692,67 @@ impl LifecyclePanelView {
             LifecyclePanelStop::AdvanceAfterCriteria => self.advance_after_criteria(window, cx),
             LifecyclePanelStop::Close => self.close(cx),
         }
+    }
+
+    fn run_in_cloud(&mut self, cx: &mut Context<Self>) {
+        let Some(task_id) = self.task_id.clone() else {
+            return;
+        };
+        if self.cloud_busy {
+            return;
+        }
+        self.cloud_busy = true;
+        self.cloud_status = Some((task_id.clone(), "Starting…".to_string()));
+        cx.notify();
+        let fleet = self.fleet.clone();
+        crate::views::cloud_node::run_in_cloud(fleet, task_id.clone(), cx, move |this, update, cx| {
+            this.cloud_update(&task_id, update, cx)
+        });
+    }
+
+    fn sync_cloud(&mut self, cx: &mut Context<Self>) {
+        let Some(task_id) = self.task_id.clone() else {
+            return;
+        };
+        if self.cloud_busy {
+            return;
+        }
+        self.cloud_busy = true;
+        self.cloud_status = Some((task_id.clone(), "Syncing…".to_string()));
+        cx.notify();
+        crate::views::cloud_node::sync_now(self.fleet.clone(), cx, move |this, update, cx| {
+            this.cloud_update(&task_id, update, cx)
+        });
+    }
+
+    /// The cloud job's latest word, when it is about the node shown.
+    fn cloud_status_line(&self) -> Option<String> {
+        self.cloud_status
+            .as_ref()
+            .filter(|(id, _)| self.task_id.as_deref() == Some(id.as_str()))
+            .map(|(_, msg)| msg.clone())
+    }
+
+    /// A cloud job's word, about `task_id`.
+    fn cloud_update(&mut self, task_id: &str, update: CloudUpdate, cx: &mut Context<Self>) {
+        let msg = match update {
+            CloudUpdate::Progress(msg) => msg,
+            CloudUpdate::Accepted(node) => {
+                self.cloud_busy = false;
+                let msg = format!("Running in sandbox {}.", node.sandbox);
+                if self.task_id.as_deref() == Some(task_id) {
+                    self.cloud = Some(node);
+                    self.clamp_focus_index(cx);
+                }
+                msg
+            }
+            CloudUpdate::Synced(msg) | CloudUpdate::Failed(msg) => {
+                self.cloud_busy = false;
+                msg
+            }
+        };
+        self.cloud_status = Some((task_id.to_string(), msg));
+        cx.notify();
     }
 
     fn activate_focused(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -991,6 +1093,52 @@ impl LifecyclePanelView {
     /// its note; they cannot be fixed from here.
     /// "Past learnings": the retrospective each completed pass stored, read
     /// only. Earlier passes' work history is summed up here, not re-shown.
+    /// Run in the cloud (or, for a cloud node, its status line and Sync
+    /// now), with the cloud job's latest word.
+    fn render_cloud(&self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let list_active_border = cx.theme().list_active_border;
+        let stop = if self.cloud.is_some() {
+            LifecyclePanelStop::SyncCloud
+        } else {
+            LifecyclePanelStop::RunInCloud
+        };
+        let focused = self.is_focused(stop, cx);
+        let mut section = v_flex().gap_1();
+        if let Some(cloud) = &self.cloud {
+            section = section.child(style::text_dense_muted(div()).child(selectable_text(
+                "lifecycle-panel-cloud-status",
+                crate::views::cloud_node::status_line(cloud, &self.lifecycle),
+                window,
+                cx,
+            )));
+        }
+        section = section.child(
+            div()
+                .w_full()
+                .rounded_md()
+                .when(focused, |el| el.border_1().border_color(list_active_border))
+                .child(
+                    Button::new("lifecycle-panel-cloud")
+                        .label(self.stop_label(stop, cx))
+                        .compact()
+                        .w_full()
+                        .disabled(self.stop_disabled(stop, cx))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.perform(stop, Source::Click, window, cx);
+                        })),
+                ),
+        );
+        if let Some(status) = self.cloud_status_line() {
+            section = section.child(style::text_dense_muted(div()).child(selectable_text(
+                "lifecycle-panel-cloud-progress",
+                status,
+                window,
+                cx,
+            )));
+        }
+        section.into_any_element()
+    }
+
     fn render_learnings(&self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
         let muted = cx.theme().muted_foreground;
         let mut section = v_flex()
@@ -1348,6 +1496,8 @@ impl LifecyclePanelView {
                 self.refresh_standing();
                 self.refresh_incoming();
                 self.refresh_learnings();
+                let root = self.fleet.paths().root().to_path_buf();
+                self.cloud = tod_core::cloud_sync::cloud_node(&root, task_id);
                 true
             }
             _ => false,
@@ -1493,6 +1643,10 @@ impl Render for LifecyclePanelView {
                     .text_color(muted)
                     .child("Current selection doesn't have lifecycle capability."),
             );
+        } else if self.cloud.is_some() {
+            // The supervisor moves a cloud node along: a status line instead
+            // of the lifecycle buttons.
+            body = body.child(self.render_cloud(window, cx));
         } else {
             body = body.child(
                 div()
@@ -1500,6 +1654,7 @@ impl Render for LifecyclePanelView {
                     .text_color(muted)
                     .child(format!("Current: {}", self.lifecycle)),
             );
+            body = body.child(self.render_cloud(window, cx));
 
             if let Some(found) = self.regression.clone() {
                 let focused = self.is_focused(LifecyclePanelStop::MoveBack, cx);
@@ -2181,6 +2336,35 @@ mod tests {
     /// `stop_disabled` compute for each visible stop, so the recorded journey
     /// snapshot never drifts from the rendered buttons (doc/journeys/spec.md
     /// §3.1).
+    #[gpui::test]
+    fn a_cloud_node_shows_its_status_instead_of_lifecycle_buttons(cx: &mut TestAppContext) {
+        let fixture = Fixture::new();
+        set_lifecycle(&fixture, "design");
+        let mut state = tod_core::cloud_sync::CloudSyncState::default();
+        state.nodes.insert(
+            fixture.node_id.to_string(),
+            tod_core::cloud_sync::CloudNode {
+                sandbox: "node-x".into(),
+                user: "u".into(),
+                accepted_at_ms: 0,
+            },
+        );
+        state.save(fixture.store.paths().root()).unwrap();
+        let (view, cx) = open_panel(&fixture, cx);
+        let (stops, presented) = view.read_with(cx, |panel, cx| (panel.stops(cx), panel.presented(cx)));
+        assert_eq!(stops, vec![LifecyclePanelStop::SyncCloud, LifecyclePanelStop::Close]);
+        assert!(presented.notices.iter().any(|n| n.contains("node-x")), "{presented:?}");
+    }
+
+    #[gpui::test]
+    fn a_lifecycle_node_offers_run_in_the_cloud(cx: &mut TestAppContext) {
+        let fixture = Fixture::new();
+        set_lifecycle(&fixture, "design");
+        let (view, cx) = open_panel(&fixture, cx);
+        let stops = view.read_with(cx, |panel, cx| panel.stops(cx));
+        assert_eq!(stops.first(), Some(&LifecyclePanelStop::RunInCloud));
+    }
+
     #[gpui::test]
     fn presented_matches_the_rendered_stops(cx: &mut TestAppContext) {
         let fixture = Fixture::new();
