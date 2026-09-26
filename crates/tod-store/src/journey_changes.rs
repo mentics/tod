@@ -36,6 +36,10 @@
 //!   `create_triggers_sql` above is seeded at, so their triggers are created
 //!   by [`decisions_triggers_sql`] instead, run by the same migration step
 //!   that creates the tables.
+//! - `request_feedback` (`tod_store::request_feedback`; `doc/ui/task-panel.md`
+//!   "Shouldn't have asked") — same story: added after the epoch, so its
+//!   trigger is created by [`request_feedback_triggers_sql`] in the migration
+//!   step that creates the table.
 //!
 //! Deliberately excluded, with reasons:
 //! - `node_plan_step_deps`, `node_plan_step_obligations`, `node_plan_step_notes`
@@ -259,6 +263,12 @@ pub fn decisions_triggers_sql() -> String {
         "
     ));
     sql
+}
+
+/// Triggers for `request_feedback` (simple `(id, node_id)` shape, can be
+/// updated — adding a note or switching the verdict).
+pub fn request_feedback_triggers_sql() -> String {
+    simple_id_triggers("request_feedback")
 }
 
 /// Triggers for a table shaped `(id BLOB PRIMARY KEY, node_id BLOB, ...)`.
