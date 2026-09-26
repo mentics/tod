@@ -32,6 +32,7 @@ use crate::ui::selectable_text::selectable_text;
 use crate::ui::style;
 use crate::unified::columns::PanelKind;
 use crate::unified::panel::{ColumnPanel, PanelOpenRequest};
+use crate::unified::panels::changes::{ChangesWatch, HasChangesWatch};
 
 /// Loaded, denormalized data for the task panel's header. Re-fetched
 /// whenever the store changes.
@@ -97,7 +98,15 @@ pub struct TaskPanel {
     focus_handle: FocusHandle,
     header: TaskHeader,
     pending_refresh: bool,
+    /// T8: the files-changed count behind the Changes link.
+    changes: ChangesWatch,
     _poll: gpui::Task<()>,
+}
+
+impl HasChangesWatch for TaskPanel {
+    fn changes_watch(&mut self) -> &mut ChangesWatch {
+        &mut self.changes
+    }
 }
 
 impl TaskPanel {
@@ -127,14 +136,18 @@ impl TaskPanel {
             }
         });
         let header = load(&fleet, node_id);
-        Self {
+        let changes = ChangesWatch::new(node_id, fleet.clone(), cx);
+        let mut this = Self {
             node_id,
             fleet,
             focus_handle: cx.focus_handle(),
             header,
             pending_refresh: false,
+            changes,
             _poll,
-        }
+        };
+        ChangesWatch::recompute(&mut this, node_id, cx);
+        this
     }
 
     #[cfg(test)]
@@ -148,6 +161,7 @@ impl TaskPanel {
             return;
         }
         self.node_id = node_id;
+        ChangesWatch::recompute(self, node_id, cx);
         self.reload(cx);
     }
 
@@ -230,7 +244,10 @@ impl TaskPanel {
             .gap_3()
             .child(obligations)
             .child(plan)
-            // T8: the Changes link (files changed) goes here.
+            // Only a current count: none while unknown or recomputing.
+            .children(self.changes.state.label().map(|label| {
+                self.artifact_link("unified-task-changes", label, PanelKind::Changes(node_id), cx)
+            }))
             .into_any_element()
     }
 

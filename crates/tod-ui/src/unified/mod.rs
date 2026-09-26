@@ -66,6 +66,7 @@ enum HostedPanel {
     Findings(Entity<panels::findings::FindingsPanel>),
     Settings(Entity<panels::settings::SettingsPanel>),
     Transcript(Entity<panels::transcript::TranscriptPanel>),
+    Changes(Entity<panels::changes::ChangesPanel>),
 }
 
 impl HostedPanel {
@@ -79,6 +80,7 @@ impl HostedPanel {
             Self::Findings(e) => e.read(cx).title(cx),
             Self::Settings(e) => e.read(cx).title(cx),
             Self::Transcript(e) => e.read(cx).title(cx),
+            Self::Changes(e) => e.read(cx).title(cx),
         }
     }
 
@@ -92,6 +94,7 @@ impl HostedPanel {
             Self::Findings(e) => e.read(cx).focus_handle(cx),
             Self::Settings(e) => e.read(cx).focus_handle(cx),
             Self::Transcript(e) => e.read(cx).focus_handle(cx),
+            Self::Changes(e) => e.read(cx).focus_handle(cx),
         }
     }
 
@@ -105,6 +108,7 @@ impl HostedPanel {
             Self::Findings(e) => e.entity_id(),
             Self::Settings(e) => e.entity_id(),
             Self::Transcript(e) => e.entity_id(),
+            Self::Changes(e) => e.entity_id(),
         }
     }
 
@@ -118,6 +122,7 @@ impl HostedPanel {
             Self::Findings(e) => e.clone().into_any_element(),
             Self::Settings(e) => e.clone().into_any_element(),
             Self::Transcript(e) => e.clone().into_any_element(),
+            Self::Changes(e) => e.clone().into_any_element(),
         }
     }
 }
@@ -553,6 +558,14 @@ impl UnifiedView {
                 HostedColumn {
                     panel: HostedPanel::Findings(panel),
                     _subscriptions: vec![subscription],
+                }
+            }
+            PanelKind::Changes(id) => {
+                let panel = cx
+                    .new(|cx| panels::changes::ChangesPanel::new(id, self.fleet.clone(), window, cx));
+                HostedColumn {
+                    panel: HostedPanel::Changes(panel),
+                    _subscriptions: Vec::new(),
                 }
             }
             PanelKind::Settings(id) => {

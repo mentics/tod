@@ -9,6 +9,7 @@ pub mod plan;
 pub mod settings;
 pub mod task;
 pub mod transcript;
+pub mod changes;
 
 pub use details::DetailsPanel;
 
