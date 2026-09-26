@@ -17,7 +17,14 @@
 //! Wire format, request: `tod-cli-relay 1\n`, `<token>\n`, `<n>\n` then `n`
 //! NUL-terminated `KEY=VALUE` entries, `<n>\n` then `n` NUL-terminated
 //! arguments, `<len>\n` then `len` bytes of stdin. Reply: `<code> <stdout
-//! len> <stderr len>\n`, then stdout, then stderr.
+//! len> <stderr len>\n`, then stdout, then stderr. [`encode_request`],
+//! [`decode_request`], [`encode_reply`], and [`decode_reply`] are that
+//! format; the orchestrator's `POST /cli` uses it too.
+//!
+//! An autonomous node's sandbox runs [`HTTP_SHIM_SCRIPT`] instead: the same
+//! request body `curl`ed to the orchestrator through the sandbox's proxy
+//! (which adds the Blaxel token), with the user and node in `X-Tod-User` /
+//! `X-Tod-Node`. Design: `doc/cloud-sandboxes/autonomous-nodes.md`.
 
 use anyhow::{Context, Result, bail};
 use std::io::{BufRead, BufReader, Write};
@@ -86,6 +93,85 @@ fi
 cat <&3 > "$tmp/out"
 head -c "$out_len" "$tmp/out"
 tail -c +"$((out_len + 1))" "$tmp/out" >&2
+exit "$code"
+"#;
+
+/// The orchestrator's `/cli` URL, for [`HTTP_SHIM_SCRIPT`] (e.g.
+/// `https://<orchestrator>.bl.run/port/8080/cli`).
+pub const ORCHESTRATOR_CLI_URL_ENV: &str = "TOD_ORCHESTRATOR_CLI_URL";
+/// The user whose database the orchestrator uses (`X-Tod-User`).
+pub const USER_ENV: &str = "TOD_USER";
+/// The node the sandbox works on (`X-Tod-Node`).
+pub const NODE_ENV: &str = "TOD_NODE";
+pub const USER_HEADER: &str = "X-Tod-User";
+pub const NODE_HEADER: &str = "X-Tod-Node";
+
+/// The `tod-cli` an autonomous node's sandbox runs: [`SHIM_SCRIPT`]'s request
+/// body (with an empty token) sent with `curl` to the orchestrator, retried
+/// with backoff on connection errors and 5xx/407/429 answers (the proxy
+/// answers 407 for a moment after the sandbox is created).
+pub const HTTP_SHIM_SCRIPT: &str = r#"#!/usr/bin/env bash
+# tod-cli, relayed over HTTP to the tod orchestrator, which runs the real
+# tod-cli against this user's database. Written by tod; edits are overwritten.
+url="${TOD_ORCHESTRATOR_CLI_URL:-}"
+user="${TOD_USER:-}"
+node="${TOD_NODE:-}"
+if [ -z "$url" ] || [ -z "$user" ] || [ -z "$node" ]; then
+  echo "tod-cli: TOD_ORCHESTRATOR_CLI_URL, TOD_USER, and TOD_NODE must be set" >&2
+  exit 70
+fi
+tmp="$(mktemp -d)" || exit 70
+trap 'rm -rf "$tmp"' EXIT
+: > "$tmp/in"
+reads_stdin=; questions=; add=
+for arg in "$@"; do
+  case "$arg" in
+    -) reads_stdin=1 ;;
+    questions) questions=1 ;;
+    add) add=1 ;;
+  esac
+done
+if [ -n "$questions" ] && [ -n "$add" ]; then reads_stdin=1; fi
+if [ -n "$reads_stdin" ]; then cat > "$tmp/in"; fi
+names=()
+for name in $(compgen -e); do
+  case "$name" in
+    TOD_CLI_RELAY_*|TOD_ORCHESTRATOR_*) ;;
+    TOD_*) names+=("$name") ;;
+  esac
+done
+{
+  printf 'tod-cli-relay 1\n\n%d\n' "${#names[@]}"
+  for name in "${names[@]}"; do printf '%s=%s\0' "$name" "${!name}"; done
+  printf '%d\n' "$#"
+  for arg in "$@"; do printf '%s\0' "$arg"; done
+  printf '%d\n' "$(wc -c < "$tmp/in")"
+  cat "$tmp/in"
+} > "$tmp/req"
+status=000
+delay=1
+for attempt in 1 2 3 4 5 6; do
+  status="$(curl -sS -o "$tmp/reply" -w '%{http_code}' --max-time 300 \
+    -X POST -H 'Content-Type: application/octet-stream' \
+    -H "X-Tod-User: $user" -H "X-Tod-Node: $node" \
+    --data-binary @"$tmp/req" "$url" 2>"$tmp/curl-err")" || status=000
+  case "$status" in
+    000|407|429|5??) [ "$attempt" -lt 6 ] && sleep "$delay"; delay=$((delay * 2)) ;;
+    *) break ;;
+  esac
+done
+if [ "$status" != 200 ]; then
+  echo "tod-cli: the orchestrator did not answer (HTTP $status): $(cat "$tmp/curl-err" 2>/dev/null; head -c 400 "$tmp/reply" 2>/dev/null)" >&2
+  exit 70
+fi
+if ! read -r code out_len _ < "$tmp/reply"; then
+  echo "tod-cli: empty reply from the orchestrator" >&2
+  exit 70
+fi
+header_len=$(head -n 1 "$tmp/reply" | wc -c)
+tail -c +"$((header_len + 1))" "$tmp/reply" > "$tmp/body"
+head -c "$out_len" "$tmp/body"
+tail -c +"$((out_len + 1))" "$tmp/body" >&2
 exit "$code"
 "#;
 
@@ -165,10 +251,99 @@ pub fn start(data_root: PathBuf, cli: PathBuf) -> Result<RelayEndpoint> {
     Ok(endpoint)
 }
 
-struct Request {
-    env: Vec<(String, String)>,
-    args: Vec<String>,
-    stdin: Vec<u8>,
+/// One `tod-cli` invocation as carried by the relay's wire format (see the
+/// module docs). The orchestrator's `POST /cli` takes the same body.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RelayRequest {
+    /// `TOD_*` variables only (never `TOD_CLI_RELAY_*`) after decoding.
+    pub env: Vec<(String, String)>,
+    pub args: Vec<String>,
+    pub stdin: Vec<u8>,
+}
+
+/// What `tod-cli` did: the reply half of the wire format.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RelayReply {
+    pub code: i32,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+}
+
+/// Encodes a request the way the shims send it. `token` is the relay's
+/// token; the HTTP shim sends an empty one (the orchestrator is reached only
+/// through the workspace's proxy, and names user and node in headers).
+pub fn encode_request(token: &str, request: &RelayRequest) -> Vec<u8> {
+    let mut out = format!("tod-cli-relay 1\n{token}\n{}\n", request.env.len()).into_bytes();
+    for (key, value) in &request.env {
+        out.extend_from_slice(format!("{key}={value}").as_bytes());
+        out.push(0);
+    }
+    out.extend_from_slice(format!("{}\n", request.args.len()).as_bytes());
+    for arg in &request.args {
+        out.extend_from_slice(arg.as_bytes());
+        out.push(0);
+    }
+    out.extend_from_slice(format!("{}\n", request.stdin.len()).as_bytes());
+    out.extend_from_slice(&request.stdin);
+    out
+}
+
+/// Decodes a request. With `expected_token`, a request carrying any other
+/// token is refused (compared in constant time); `None` skips the check (the
+/// orchestrator, which has no token). Non-`TOD_*` and `TOD_CLI_RELAY_*`
+/// variables are dropped.
+pub fn decode_request(reader: &mut impl BufRead, expected_token: Option<&str>) -> Result<RelayRequest> {
+    if read_line(reader)? != "tod-cli-relay 1" {
+        bail!("not a tod-cli relay request");
+    }
+    let given = read_line(reader)?;
+    if let Some(token) = expected_token
+        && !constant_time_eq(given.as_bytes(), token.as_bytes())
+    {
+        bail!("tod-cli relay request with a wrong token");
+    }
+    let mut env = Vec::new();
+    for entry in read_items(reader)? {
+        let Some((key, value)) = entry.split_once('=') else {
+            continue;
+        };
+        // Only tod's own variables, and never the relay's.
+        if key.starts_with("TOD_") && !key.starts_with("TOD_CLI_RELAY_") {
+            env.push((key.to_string(), value.to_string()));
+        }
+    }
+    let args = read_items(reader)?;
+    let len: usize = read_line(reader)?.trim().parse().context("stdin length")?;
+    if len > MAX_STDIN {
+        bail!("tod-cli relay stdin too large ({len} bytes)");
+    }
+    let mut stdin = vec![0; len];
+    reader.read_exact(&mut stdin)?;
+    Ok(RelayRequest { env, args, stdin })
+}
+
+/// Encodes a reply: `<code> <stdout len> <stderr len>\n`, stdout, stderr.
+pub fn encode_reply(reply: &RelayReply) -> Vec<u8> {
+    let mut out = format!("{} {} {}\n", reply.code, reply.stdout.len(), reply.stderr.len()).into_bytes();
+    out.extend_from_slice(&reply.stdout);
+    out.extend_from_slice(&reply.stderr);
+    out
+}
+
+/// Decodes a reply written by [`encode_reply`].
+pub fn decode_reply(bytes: &[u8]) -> Result<RelayReply> {
+    let newline = bytes.iter().position(|&b| b == b'\n').context("tod-cli reply has no header")?;
+    let header = std::str::from_utf8(&bytes[..newline]).context("tod-cli reply header")?;
+    let mut parts = header.split_whitespace();
+    let mut next = |what: &str| -> Result<&str> { parts.next().with_context(|| format!("tod-cli reply: no {what}")) };
+    let code: i32 = next("exit code")?.parse().context("tod-cli reply exit code")?;
+    let out_len: usize = next("stdout length")?.parse().context("tod-cli reply stdout length")?;
+    let err_len: usize = next("stderr length")?.parse().context("tod-cli reply stderr length")?;
+    let body = &bytes[newline + 1..];
+    if body.len() != out_len + err_len {
+        bail!("tod-cli reply body is {} bytes, header says {}", body.len(), out_len + err_len);
+    }
+    Ok(RelayReply { code, stdout: body[..out_len].to_vec(), stderr: body[out_len..].to_vec() })
 }
 
 fn serve(stream: TcpStream, data_root: &Path, cli: &Path, token: &str) -> Result<()> {
@@ -213,32 +388,8 @@ fn serve(stream: TcpStream, data_root: &Path, cli: &Path, token: &str) -> Result
     Ok(())
 }
 
-fn read_request(reader: &mut impl BufRead, token: &str) -> Result<Request> {
-    if read_line(reader)? != "tod-cli-relay 1" {
-        bail!("not a tod-cli relay request");
-    }
-    let given = read_line(reader)?;
-    if !constant_time_eq(given.as_bytes(), token.as_bytes()) {
-        bail!("tod-cli relay request with a wrong token");
-    }
-    let mut env = Vec::new();
-    for entry in read_items(reader)? {
-        let Some((key, value)) = entry.split_once('=') else {
-            continue;
-        };
-        // Only tod's own variables, and never the relay's.
-        if key.starts_with("TOD_") && !key.starts_with("TOD_CLI_RELAY_") {
-            env.push((key.to_string(), value.to_string()));
-        }
-    }
-    let args = read_items(reader)?;
-    let len: usize = read_line(reader)?.trim().parse().context("stdin length")?;
-    if len > MAX_STDIN {
-        bail!("tod-cli relay stdin too large ({len} bytes)");
-    }
-    let mut stdin = vec![0; len];
-    reader.read_exact(&mut stdin)?;
-    Ok(Request { env, args, stdin })
+fn read_request(reader: &mut impl BufRead, token: &str) -> Result<RelayRequest> {
+    decode_request(reader, Some(token))
 }
 
 fn read_line(reader: &mut impl BufRead) -> Result<String> {
@@ -333,6 +484,37 @@ mod tests {
         );
         assert_eq!(parsed.args, ["node", "", "multi\nline", "-"]);
         assert_eq!(parsed.stdin, b"body\n");
+    }
+
+    #[test]
+    fn frames_round_trip() {
+        let request = RelayRequest {
+            env: vec![("TOD_NODE".into(), "n1".into()), ("TOD_X".into(), "a=b\nc".into())],
+            args: vec!["plan".into(), "".into(), "multi\nline".into()],
+            stdin: b"body\0bytes".to_vec(),
+        };
+        let raw = encode_request("", &request);
+        assert_eq!(decode_request(&mut Cursor::new(&raw), None).unwrap(), request);
+        assert_eq!(decode_request(&mut Cursor::new(&raw), Some("")).unwrap(), request);
+        assert!(decode_request(&mut Cursor::new(&raw), Some("t")).is_err());
+
+        let reply = RelayReply { code: 3, stdout: b"out\n2".to_vec(), stderr: b"err".to_vec() };
+        assert_eq!(decode_reply(&encode_reply(&reply)).unwrap(), reply);
+        assert!(decode_reply(b"0 5 0\nabc").is_err());
+        assert!(decode_reply(b"").is_err());
+    }
+
+    #[test]
+    fn the_http_shim_posts_the_same_body_with_user_and_node() {
+        let s = HTTP_SHIM_SCRIPT;
+        assert!(s.contains(r"printf 'tod-cli-relay 1\n\n%d\n'"));
+        assert!(s.contains(&format!("{USER_HEADER}: $user")));
+        assert!(s.contains(&format!("{NODE_HEADER}: $node")));
+        for var in [ORCHESTRATOR_CLI_URL_ENV, USER_ENV, NODE_ENV] {
+            assert!(s.contains(&format!("${{{var}:-}}")), "{var}");
+        }
+        assert!(s.contains("--data-binary"));
+        assert!(s.contains("delay=$((delay * 2))"));
     }
 
     #[test]

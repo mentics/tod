@@ -24,7 +24,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use users::Users;
 
-pub const USER_HEADER: &str = "X-Tod-User";
+pub const USER_HEADER: &str = tod_store::fleet::cli_relay::USER_HEADER;
 pub const DEFAULT_PORT: u16 = 8080;
 pub const DEFAULT_BASE: &str = "/data";
 

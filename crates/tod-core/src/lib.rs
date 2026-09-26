@@ -20,6 +20,7 @@ pub const GIT_DIRTY: &str = env!("TOD_GIT_DIRTY");
 
 pub mod agent_context;
 pub mod attention;
+pub mod autopilot;
 pub mod codebase_rules;
 pub mod context_recipes;
 pub mod conversation;
@@ -31,6 +32,7 @@ pub mod generator;
 pub mod install;
 pub mod interview;
 pub mod journey;
+pub mod lifecycle;
 pub mod lifecycle_next;
 pub mod lifecycle_validity;
 pub mod linear_import;

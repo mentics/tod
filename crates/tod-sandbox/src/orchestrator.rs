@@ -31,7 +31,7 @@ pub struct Spec<'a> {
 pub fn provision(bx: &Blaxel, spec: &Spec, progress: &mut dyn FnMut(&str)) -> Result<String> {
     if bx.get(NAME)?.is_none() {
         progress(&format!("creating sandbox {NAME}…"));
-        bx.post_json("/sandboxes", &create_body(spec), "create the orchestrator sandbox")?;
+        bx.create_from_body(&create_body(spec))?;
     }
     let info = bx.wait_deployed(NAME, Duration::from_secs(300))?;
     let Some(url) = info.url else { bail!("{NAME} has no URL") };

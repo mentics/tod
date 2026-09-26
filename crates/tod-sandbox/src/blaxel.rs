@@ -163,6 +163,13 @@ impl Blaxel {
         check(&mut resp, "create sandbox")
     }
 
+    /// Creates a sandbox from a full request body (see `node::create_body`).
+    pub fn create_from_body(&self, body: &Value) -> Result<()> {
+        let mut resp =
+            self.auth(self.agent.post(&format!("{API}/sandboxes"))).send_json(body).context("Blaxel API")?;
+        check(&mut resp, "create sandbox")
+    }
+
     /// `POST {API}{path}` with a JSON body, for calls this type has no method for.
     pub fn post_json(&self, path: &str, body: &Value, what: &str) -> Result<()> {
         let mut resp = self.auth(self.agent.post(&format!("{API}{path}"))).send_json(body).context("Blaxel API")?;

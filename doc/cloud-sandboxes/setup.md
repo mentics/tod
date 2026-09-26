@@ -240,3 +240,9 @@ says to quit Zed and try again.
 | Zed's `ssh`/`scp`/`sftp`, and their log | `<data root>/zed-shim/` (`shim.log`) |
 | Which sandboxes a turn is holding awake | `<data root>/zed-shim/awake/<sandbox>/` |
 | In the sandbox | `/opt/tod/` (relay, bootstrap script, manifest, `bin/sftp-server`, `bin/tod-cli`, `node/`, `logs/`) |
+
+## The orchestrator
+
+The sandbox that holds each user's database for autonomous nodes and runs
+their `tod-cli` commands: `tod-sandbox orchestrator` sets it up. See
+[orchestrator.md](orchestrator.md).
