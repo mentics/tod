@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/tod-agent", "crates/tod-integration", "crates/tod-store", "crates/tod-core", "crates/tod-ui", "crates/tod-cli", "crates/tod", "crates/nov-viz", "crates/tod-journey", "crates/tod-journeys", "crates/tod-relay", "crates/tod-sandbox", "crates/tod-sandbox-cli", "crates/tod-zed-shim", "crates/tod-orchestrator"]
+members = ["crates/tod-agent", "crates/tod-integration", "crates/tod-store", "crates/tod-core", "crates/tod-ui", "crates/tod-cli", "crates/tod", "crates/nov-viz", "crates/tod-journey", "crates/tod-journeys", "crates/tod-relay", "crates/tod-sandbox", "crates/tod-sandbox-cli", "crates/tod-zed-shim", "crates/tod-orchestrator", "crates/tod-supervisor"]
 resolver = "2"
 
 # Dev profile tuned for fast incremental rebuilds:

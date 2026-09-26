@@ -438,8 +438,22 @@ pub fn export_changes(conn: &Connection, after: i64) -> Result<Vec<Change>> {
 /// contents here are neither the sender's `before` nor its `after` is
 /// reported as a conflict, and the sender's version applied anyway.
 pub fn apply_changes(conn: &mut Connection, changes: &[Change]) -> Result<ApplyReport> {
+    apply_changes_with(conn, changes, false)
+}
+
+/// [`apply_changes`], but logging what it applies, so the changes appear in
+/// this side's feed ([`export_changes`]) for other copies: the orchestrator
+/// takes a node supervisor's changes this way, since the app has to get them.
+pub fn apply_changes_logged(conn: &mut Connection, changes: &[Change]) -> Result<ApplyReport> {
+    apply_changes_with(conn, changes, true)
+}
+
+fn apply_changes_with(conn: &mut Connection, changes: &[Change], log: bool) -> Result<ApplyReport> {
     let tx = conn.transaction()?;
-    tx.execute_batch("PRAGMA defer_foreign_keys = ON; UPDATE sync_state SET suppress = 1 WHERE id = 1;")?;
+    tx.execute_batch("PRAGMA defer_foreign_keys = ON;")?;
+    if !log {
+        tx.execute_batch("UPDATE sync_state SET suppress = 1 WHERE id = 1;")?;
+    }
     let mut report = ApplyReport::default();
     let mut infos: HashMap<String, TableInfo> = HashMap::new();
     for change in changes {

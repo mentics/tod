@@ -10,10 +10,17 @@
 //! - `POST /users/<u>/seed` — a snapshot of the user's database.
 //! - `POST /users/<u>/changes` — the app's changes.
 //! - `GET /users/<u>/changes?after=<n>` — the changes after number `n`.
+//! - `POST /users/<u>/changes?from=supervisor` — a node supervisor's changes
+//!   (logged, so the app gets them).
+//! - `GET /users/<u>/snapshot` — the whole database, for a supervisor's copy.
+//! - `GET /users/<u>/nodes/<n>/transcripts` — the node's mirrored agent
+//!   transcripts; `GET`/`POST .../transcripts/<name>` reads or appends one
+//!   (see [`transcripts`]).
 
 pub mod cli;
 pub mod http;
 pub mod sync_backend;
+pub mod transcripts;
 pub mod users;
 
 use anyhow::{Context, Result};
@@ -101,7 +108,11 @@ impl Server {
                 match (method, rest) {
                     ("POST", ["seed"]) => sync_backend::seed(&self.users, &user, &request.body),
                     ("POST", ["changes"]) => match self.users.get(&user) {
-                        Ok(data) => sync_backend::apply_changes(&data, &request.body),
+                        Ok(data) => sync_backend::apply_changes(
+                            &data,
+                            &request.body,
+                            request.query_param("from") == Some("supervisor"),
+                        ),
                         Err(err) => Response::text(500, format!("{err:#}")),
                     },
                     ("GET", ["changes"]) => {
@@ -114,7 +125,15 @@ impl Server {
                             Err(err) => Response::text(500, format!("{err:#}")),
                         }
                     }
-                    (_, ["seed" | "changes"]) => Response::text(405, "method not allowed"),
+                    ("GET", ["snapshot"]) => match self.users.get(&user) {
+                        Ok(data) => sync_backend::snapshot(&data),
+                        Err(err) => Response::text(500, format!("{err:#}")),
+                    },
+                    (_, ["nodes", node, "transcripts", rest @ ..]) => match self.users.root_of(&user) {
+                        Ok(root) => transcripts::handle(&root, node, method, rest, request),
+                        Err(err) => Response::text(400, format!("{err:#}")),
+                    },
+                    (_, ["seed" | "changes" | "snapshot"]) => Response::text(405, "method not allowed"),
                     _ => Response::text(404, "not found"),
                 }
             }

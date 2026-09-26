@@ -44,9 +44,9 @@ struct Relay {
     hold: Hold,
     home: String,
     /// The command a poke starts when no supervisor is running
-    /// (`--supervisor-cmd`, e.g. `tod-supervisor wake`). The binary does not
-    /// exist yet; this just needs to be a valid shell command line once it
-    /// does.
+    /// (`--supervisor-cmd`; by default the one `tod_sandbox::node` installs,
+    /// `/opt/tod/tod-supervisor wake --workspace /workspace/repo`). A shell
+    /// command line.
     supervisor_cmd: String,
     /// The pid of a supervisor this relay started, while it is still
     /// running. `None` both before one has been started and once it exits.
@@ -57,7 +57,7 @@ pub fn main(args: &[String]) {
     let mut port = 2222u16;
     let mut max_hold = 4 * 3600u64;
     let mut tunnel_port = crate::tunnel::DEFAULT_PORT;
-    let mut supervisor_cmd = "tod-supervisor wake".to_string();
+    let mut supervisor_cmd = "/opt/tod/tod-supervisor wake --workspace /workspace/repo".to_string();
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -130,15 +130,52 @@ async fn try_poke(relay: &Arc<Relay>, stream: TcpStream) -> Option<TcpStream> {
         return Some(stream);
     }
     // The proxy may or may not strip its `/port/<n>` prefix, so match segments.
+    let (path, query) = path.split_once('?').unwrap_or((path, ""));
     let segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-    if !segs.contains(&"poke") {
-        return Some(stream);
-    }
-    handle_poke(relay, stream).await;
+    let action = match segs.last() {
+        Some(&"poke") => HttpAction::Poke,
+        Some(&"hold") => {
+            let reason = query_param(query, "reason").unwrap_or_default();
+            let secs = query_param(query, "secs").and_then(|s| s.parse::<u64>().ok());
+            match secs {
+                Some(secs) if !reason.is_empty() && secs > 0 => HttpAction::Hold(reason, secs),
+                _ => HttpAction::Bad("hold needs reason=<r>&secs=<n>"),
+            }
+        }
+        Some(&"release") => match query_param(query, "reason") {
+            Some(reason) if !reason.is_empty() => HttpAction::Release(reason),
+            _ => HttpAction::Bad("release needs reason=<r>"),
+        },
+        _ => return Some(stream),
+    };
+    handle_http(relay, stream, action).await;
     None
 }
 
-async fn handle_poke(relay: &Arc<Relay>, mut stream: TcpStream) {
+/// A plain-HTTP request on the relay's port (see `try_poke`).
+enum HttpAction {
+    Poke,
+    /// `POST /hold?reason=<r>&secs=<n>`: take or renew a leased hold.
+    Hold(String, u64),
+    /// `POST /release?reason=<r>`: end it now.
+    Release(String),
+    Bad(&'static str),
+}
+
+/// Holds are namespaced so an HTTP caller cannot clear the relay's own.
+fn external_reason(reason: &str) -> String {
+    format!("ext:{reason}")
+}
+
+fn query_param(query: &str, name: &str) -> Option<String> {
+    query
+        .split('&')
+        .filter_map(|kv| kv.split_once('='))
+        .find(|(k, _)| *k == name)
+        .map(|(_, v)| v.chars().filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':')).collect())
+}
+
+async fn handle_http(relay: &Arc<Relay>, mut stream: TcpStream, action: HttpAction) {
     // Drain enough of the request to be a well-behaved HTTP peer; nothing in
     // it (headers or body) matters to a poke.
     let mut buf = vec![0u8; 4096];
@@ -155,8 +192,25 @@ async fn handle_poke(relay: &Arc<Relay>, mut stream: TcpStream) {
             Err(_) => break,
         }
     }
-    poke(relay);
-    let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+    let reply: &[u8] = match action {
+        HttpAction::Poke => {
+            poke(relay);
+            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        }
+        HttpAction::Hold(reason, secs) => {
+            relay.hold.lease(&external_reason(&reason), secs);
+            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        }
+        HttpAction::Release(reason) => {
+            relay.hold.release(&external_reason(&reason));
+            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        }
+        HttpAction::Bad(why) => {
+            eprintln!("relay: bad request: {why}");
+            b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        }
+    };
+    let _ = stream.write_all(reply).await;
 }
 
 /// Returns true if a process with this pid is (still) around. Used to decide

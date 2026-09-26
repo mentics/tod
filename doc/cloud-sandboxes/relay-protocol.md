@@ -11,8 +11,9 @@ The relay routes by the path's segments, since the proxy may or may not keep
 its `/port/2222` prefix: a path with an `agent` segment goes to
 [`/agent/<name>`](#agentname), one with an `exec` segment goes to
 [`/exec`](#exec), one with a `tunnel` segment goes to [`/tunnel`](#tunnel),
-and a `POST` with a `poke` segment goes to [`POST /poke`](#post-poke) instead
-of the WebSocket upgrade every other path expects.
+and a `POST` whose last segment is `poke`, `hold`, or `release` goes to
+[`POST /poke`](#post-poke) or [`POST /hold`, `POST /release`](#post-hold-post-release)
+instead of the WebSocket upgrade every other path expects.
 
 ## `/exec`
 
@@ -138,14 +139,15 @@ message behind it is a webhook, a user's answer, or a changed context (see
 the provider's proxy, is what actually wakes the sandbox; the request itself
 needs no body and gets `200` with an empty one back.
 
-`tod-supervisor` does not exist yet. The contract a poke needs from it:
+What a poke does with `tod-supervisor` (`crates/tod-supervisor`):
 
 - **Starting it.** If no supervisor the relay itself started is still
-  running, it runs `--supervisor-cmd` (default `tod-supervisor wake`) as a
-  plain process — **not** `keepAlive`: the supervisor decides for itself
-  whether there is work, and if so takes its own hold (a lease, once it
-  exists, through this same relay or directly against the provider's process
-  API — not yet decided). If there is nothing to do it just exits.
+  running, it runs `--supervisor-cmd` (default
+  `/opt/tod/tod-supervisor wake --workspace /workspace/repo`) as a plain
+  process — **not** `keepAlive`: the supervisor decides for itself whether
+  there is work, and if so takes its own hold through
+  [`POST /hold`](#post-hold-post-release). If there is nothing to do it just
+  exits.
 - **Signalling it.** If a supervisor the relay started is still running (its
   pid is tracked from when it was started), a poke instead sends it
   `SIGUSR1`, so it looks again now rather than waiting for its next schedule.
@@ -156,10 +158,27 @@ needs no body and gets `200` with an empty one back.
   renews it — a poke is not a substitute for the supervisor's own hold once
   it has real work.
 
+## `POST /hold`, `POST /release`
+
+Plain HTTP on the relay's port, for a process in the sandbox (the supervisor,
+on `127.0.0.1`) to hold the sandbox awake through the relay, which stays the
+only owner of the `keepAlive` process:
+
+- `POST /hold?reason=<r>&secs=<n>` takes or renews a leased hold named `r`
+  for `n` seconds from now. Not renewing it before then ends it, so a caller
+  that dies or hangs stops holding the sandbox. The supervisor holds 120 s
+  and renews every 40 s while it works.
+- `POST /release?reason=<r>` ends it now (the supervisor's last act before it
+  exits to sleep).
+
+Both answer `200` with an empty body, or `400` when a parameter is missing.
+`reason` keeps only `[A-Za-z0-9._:-]` and is namespaced (`ext:<r>`), so it
+never names one of the relay's own reasons.
+
 ## Running it
 
 ```sh
-tod-relay --port 2222 --tunnel-port 2223 --max-hold-secs 14400 --supervisor-cmd "tod-supervisor wake"
+tod-relay --port 2222 --tunnel-port 2223 --max-hold-secs 14400 --supervisor-cmd "/opt/tod/tod-supervisor wake --workspace /workspace/repo"
 tod-relay --version
 ```
 

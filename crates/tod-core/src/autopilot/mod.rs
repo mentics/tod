@@ -74,6 +74,34 @@ pub enum Outcome {
     NeedsHuman { reason: NeedsHuman },
     /// The run spent its budget.
     BudgetExhausted { limit: BudgetLimit },
+    /// The caller's [`StepHook`] stopped it (the agent recorded a wait, the
+    /// supervisor was asked to stop). Whatever conversation was in progress
+    /// stays current, so the next run reopens it.
+    Stopped { reason: String },
+}
+
+/// Where a run is when it calls its [`StepHook`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Boundary {
+    /// Before deciding the next step (so also after each step).
+    Step,
+    /// An agent turn ended inside a conversation (the protocol may already
+    /// have sent the next one).
+    Turn,
+}
+
+/// Called by [`Autopilot::run_with`] at every [`Boundary`]: a headless
+/// supervisor syncs its copy of the store here and says whether to stop.
+pub trait StepHook {
+    /// `Some(reason)` stops the run with [`Outcome::Stopped`].
+    fn at(&mut self, fleet: &FleetStore, boundary: Boundary) -> Result<Option<String>>;
+}
+
+/// No hook: never stops.
+impl StepHook for () {
+    fn at(&mut self, _: &FleetStore, _: Boundary) -> Result<Option<String>> {
+        Ok(None)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -220,12 +248,25 @@ impl Autopilot {
         fleet: &FleetStore,
         agent: &mut A,
     ) -> Result<Outcome> {
+        self.run_with(fleet, agent, &mut ())
+    }
+
+    /// [`Self::run`], calling `hook` at every [`Boundary`].
+    pub fn run_with<A: AgentAccess + ?Sized, H: StepHook + ?Sized>(
+        &mut self,
+        fleet: &FleetStore,
+        agent: &mut A,
+        hook: &mut H,
+    ) -> Result<Outcome> {
         // Called again after it stopped: the user has presumably dealt with
         // what it stopped for.
         self.state.outcome = None;
         self.save()?;
         let mut last: Option<(Standing, NextStep)> = None;
         loop {
+            if let Some(reason) = hook.at(fleet, Boundary::Step)? {
+                return self.finish(Outcome::Stopped { reason });
+            }
             if let Some(limit) = self.over_budget() {
                 return self.finish(Outcome::BudgetExhausted { limit });
             }
@@ -264,17 +305,17 @@ impl Autopilot {
             last = Some((standing, step));
 
             let stopped = match step {
-                NextStep::Implement => self.converse(fleet, agent, ProtocolKind::Implementation)?,
-                NextStep::Verify => self.converse(fleet, agent, ProtocolKind::Verification)?,
-                NextStep::Review => self.converse(fleet, agent, ProtocolKind::Review)?,
-                NextStep::Fix => self.converse(fleet, agent, ProtocolKind::Fix)?,
+                NextStep::Implement => self.converse(fleet, agent, hook, ProtocolKind::Implementation)?,
+                NextStep::Verify => self.converse(fleet, agent, hook, ProtocolKind::Verification)?,
+                NextStep::Review => self.converse(fleet, agent, hook, ProtocolKind::Review)?,
+                NextStep::Fix => self.converse(fleet, agent, hook, ProtocolKind::Fix)?,
                 NextStep::FixFailed => {
                     // Back to `active`; the next round implements the fix.
                     lifecycle::revert(fleet, self.node)?;
                     self.record(fleet, step_name(step), &lifecycle, None)?;
                     None
                 }
-                NextStep::GateCheck => self.gate(fleet, agent, &lifecycle)?,
+                NextStep::GateCheck => self.gate(fleet, agent, hook, &lifecycle)?,
             };
             if let Some(outcome) = stopped {
                 return self.finish(outcome);
@@ -283,17 +324,18 @@ impl Autopilot {
     }
 
     /// Settle the gate and advance through it: the `GateCheck` step.
-    fn gate<A: AgentAccess + ?Sized>(
+    fn gate<A: AgentAccess + ?Sized, H: StepHook + ?Sized>(
         &mut self,
         fleet: &FleetStore,
         agent: &mut A,
+        hook: &mut H,
         from: &str,
     ) -> Result<Option<Outcome>> {
         // In `pr`, the pull request's own agent comes first: the gate only
         // asks GitHub what it made of it.
         if from == "pr" {
             if matches!(self.pr_report(fleet)?, PrStanding::Open)
-                && let Some(outcome) = self.converse(fleet, agent, ProtocolKind::Pr)?
+                && let Some(outcome) = self.converse(fleet, agent, hook, ProtocolKind::Pr)?
             {
                 return Ok(Some(outcome));
             }
@@ -314,7 +356,7 @@ impl Autopilot {
             }
         }
         let needs_agent = settle_derived_criteria(fleet, self.node)?;
-        if needs_agent && let Some(outcome) = self.converse(fleet, agent, ProtocolKind::GateCheck)? {
+        if needs_agent && let Some(outcome) = self.converse(fleet, agent, hook, ProtocolKind::GateCheck)? {
             return Ok(Some(outcome));
         }
         let now = lifecycle::current_state(fleet, self.node)?;
@@ -356,7 +398,7 @@ impl Autopilot {
         };
         self.record(fleet, "advance", from, None)?;
         if lifecycle::enters_with_agent(&entered) {
-            return self.converse(fleet, agent, ProtocolKind::OnEntry);
+            return self.converse(fleet, agent, hook, ProtocolKind::OnEntry);
         }
         Ok(None)
     }
@@ -386,10 +428,11 @@ impl Autopilot {
 
     /// Run `kind`'s conversation on the node until its protocol says it is
     /// done. `Some` when the run has to stop.
-    fn converse<A: AgentAccess + ?Sized>(
+    fn converse<A: AgentAccess + ?Sized, H: StepHook + ?Sized>(
         &mut self,
         fleet: &FleetStore,
         agent: &mut A,
+        hook: &mut H,
         kind: ProtocolKind,
     ) -> Result<Option<Outcome>> {
         if let Some(limit) = self.over_budget() {
@@ -427,6 +470,7 @@ impl Autopilot {
 
         loop {
             let mut finished = false;
+            let mut turn_ended = false;
             for event in driver.tick(fleet, agent) {
                 match event {
                     ConversationEvent::TurnFinished { error: Some(error) } => {
@@ -435,14 +479,28 @@ impl Autopilot {
                             reason: NeedsHuman::AgentFailed { error },
                         }));
                     }
-                    ConversationEvent::TurnFinished { error: None } => finished = true,
+                    ConversationEvent::TurnFinished { error: None } => {
+                        finished = true;
+                        turn_ended = true;
+                    }
                     ConversationEvent::Notice(notice) => {
                         tracing::info!(node = %self.node, ?notice, "autopilot notice");
                     }
-                    ConversationEvent::Rotated | ConversationEvent::Continued => {}
+                    ConversationEvent::Continued => turn_ended = true,
+                    ConversationEvent::Rotated => {}
                 }
             }
             let status = driver.status();
+            if turn_ended && let Some(reason) = hook.at(fleet, Boundary::Turn)? {
+                if status.running {
+                    // Kept as current: the next run reopens it.
+                    driver.cancel(fleet, agent)?;
+                } else {
+                    self.state.current = None;
+                    self.record(fleet, protocol_name(kind), &lifecycle, conversation_id)?;
+                }
+                return Ok(Some(Outcome::Stopped { reason }));
+            }
             if finished || !status.running {
                 break;
             }

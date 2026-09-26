@@ -12,6 +12,11 @@
 //!   before the seed). Reply: `{"last_seq": n, "changes": [...]}`; the app
 //!   pulls again with `after` = `last_seq`.
 //!
+//! - `GET /users/<u>/snapshot`: the whole database, for a node supervisor's
+//!   local copy (its `last_seq` is where that copy pulls from).
+//! - `POST /users/<u>/changes?from=supervisor`: a supervisor's changes,
+//!   logged so the app gets them.
+//!
 //! Each runs on its own SQLite connection, under the user's sync lock, after
 //! flushing the store's pending writes; the store reloads its read view
 //! after an apply so `tod-cli` and later reads see the result.
@@ -51,13 +56,20 @@ fn seed_inner(users: &Users, user: &str, snapshot: &[u8]) -> Result<Response> {
     Ok(json(&serde_json::json!({ "last_seq": last })))
 }
 
-pub fn apply_changes(user: &UserData, body: &[u8]) -> Response {
+/// `logged`: the changes come from a node's supervisor, not the app, so they
+/// are logged here and reach the app through the feed (the supervisor gets
+/// them back too, which it applies as a no-op).
+pub fn apply_changes(user: &UserData, body: &[u8], logged: bool) -> Response {
     reply((|| {
         let changes: Vec<Change> = serde_json::from_slice(body).context("changes: a JSON array of Change")?;
         let _guard = user.sync_lock.lock().unwrap_or_else(|e| e.into_inner());
         let _ = user.store.flush_on_quit();
         let mut conn = connect(user)?;
-        let report = sync::apply_changes(&mut conn, &changes)?;
+        let report = if logged {
+            sync::apply_changes_logged(&mut conn, &changes)?
+        } else {
+            sync::apply_changes(&mut conn, &changes)?
+        };
         let last = sync::last_seq(&conn)?;
         drop(conn);
         let _ = user.store.reload_if_stale();
@@ -76,6 +88,23 @@ pub fn export_changes(user: &UserData, after: i64) -> Response {
         let last = sync::last_seq(&conn)?;
         let changes = sync::export_changes(&conn, after)?;
         Ok(json(&serde_json::json!({ "last_seq": last, "changes": changes })))
+    })())
+}
+
+/// `GET /users/<u>/snapshot`: the user's whole database (the body), for a
+/// node's supervisor to seed its local copy from. Taken under the sync lock,
+/// so the snapshot's own `last_seq` is the feed cursor to pull after.
+pub fn snapshot(user: &UserData) -> Response {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(0);
+    reply((|| {
+        let _guard = user.sync_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = user.store.flush_on_quit();
+        let out = user.root.join(format!("snapshot-{}.db", N.fetch_add(1, Ordering::Relaxed)));
+        let taken = sync::snapshot(user.store.paths().db(), &out);
+        let bytes = taken.and_then(|()| std::fs::read(&out).context("read the snapshot"));
+        let _ = std::fs::remove_file(&out);
+        Ok(Response::bytes(bytes?))
     })())
 }
 

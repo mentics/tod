@@ -120,6 +120,11 @@ impl Hold {
         self.state.lock().unwrap().lease(reason, deadline);
         let _ = self.worker.send(());
     }
+
+    /// Ends a hold (leased or not) now.
+    pub fn release(&self, reason: &str) {
+        self.set(reason, false);
+    }
 }
 
 /// Brings the running `keepAlive` process (if any) in line with the current

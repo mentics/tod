@@ -9195,6 +9195,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "tod-supervisor"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "libc",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tod-agent",
+ "tod-core",
+ "tod-orchestrator",
+ "tod-store",
+ "tracing",
+ "tracing-subscriber",
+ "ureq",
+ "uuid",
+]
+
+[[package]]
 name = "tod-ui"
 version = "0.1.0"
 dependencies = [

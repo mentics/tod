@@ -231,11 +231,31 @@ pub fn provision(bx: &Blaxel, url: &str, payload: &NodePayload, progress: &mut d
     if bx.process_status(url, RELAY_PROCESS)?.as_deref() != Some("running") {
         bx.start(url, RELAY_PROCESS, &format!("{RELAY_PATH} --port {RELAY_PORT}"), true)?;
     }
-    if payload.supervisor.is_some() && bx.process_status(url, SUPERVISOR_PROCESS)?.as_deref() != Some("running") {
+    if payload.supervisor.is_some() {
+        // Through the relay's poke, like every later wake: the relay starts
+        // `tod-supervisor wake` (its default `--supervisor-cmd`, the same
+        // [`supervisor_command`]) and tracks it, so a later poke signals it.
         progress("starting the supervisor…");
-        bx.start(url, SUPERVISOR_PROCESS, &format!("{SUPERVISOR_PATH} --workspace {WORKSPACE_DIR}"), true)?;
+        let res = bx.run(url, &poke_script(), 60)?;
+        if res.exit_code != 0 {
+            bail!("poking the relay to start the supervisor failed: {}", res.output());
+        }
     }
     Ok(())
+}
+
+/// The command the relay runs to start the supervisor (its default
+/// `--supervisor-cmd`).
+pub fn supervisor_command() -> String {
+    format!("{SUPERVISOR_PATH} wake --workspace {WORKSPACE_DIR}")
+}
+
+/// Pokes the relay on loopback, retrying while it starts listening.
+pub fn poke_script() -> String {
+    format!(
+        "for i in 1 2 3 4 5 6 7 8 9 10; do \
+         curl -fsS -X POST http://127.0.0.1:{RELAY_PORT}/poke && exit 0; sleep 1; done; exit 1"
+    )
 }
 
 #[cfg(test)]
@@ -289,6 +309,13 @@ mod tests {
         let proxy = body["spec"]["network"]["proxy"].to_string();
         assert!(proxy.contains("ghp_x") && proxy.contains("{{SECRET:github}}"));
         assert!(!format!("{:?}", creds()).contains("ghp_x"));
+    }
+
+    #[test]
+    fn the_supervisor_command_is_the_relays_default() {
+        // tod-relay's `--supervisor-cmd` default (crates/tod-relay/src/server.rs).
+        assert_eq!(supervisor_command(), "/opt/tod/tod-supervisor wake --workspace /workspace/repo");
+        assert!(poke_script().contains("http://127.0.0.1:2222/poke"));
     }
 
     #[test]
