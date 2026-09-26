@@ -13,7 +13,7 @@ use tod_store::sync::{CLIENT_HEADER, Change};
 
 #[derive(Clone)]
 pub struct Orchestrator {
-    /// E.g. `https://<orchestrator>.bl.run/port/8080`, no trailing `/`.
+    /// E.g. `https://<orchestrator>.bl.run/port/8090`, no trailing `/`.
     base: String,
     user: String,
     node: String,
@@ -212,7 +212,7 @@ mod tests {
 
     #[test]
     fn base_url_drops_the_cli_route() {
-        assert_eq!(base_from_cli_url("https://o.bl.run/port/8080/cli"), "https://o.bl.run/port/8080");
+        assert_eq!(base_from_cli_url("https://o.bl.run/port/8090/cli"), "https://o.bl.run/port/8090");
         assert_eq!(base_from_cli_url("http://127.0.0.1:9/cli/"), "http://127.0.0.1:9");
         assert_eq!(base_from_cli_url("http://h:1"), "http://h:1");
     }

@@ -313,6 +313,14 @@ impl Blaxel {
         check(&mut resp, "kill process")
     }
 
+    /// `GET` any URL with this account's token (a sandbox's `/port/<n>/...`,
+    /// which wakes it): the status and the body.
+    pub fn get_url(&self, url: &str) -> Result<(u16, String)> {
+        let mut resp = self.auth(self.agent.get(url)).call().with_context(|| format!("GET {url}"))?;
+        let status = resp.status().as_u16();
+        Ok((status, resp.body_mut().read_to_string().unwrap_or_default()))
+    }
+
     /// Writes a file into the sandbox (at most 5 MB per call).
     pub fn upload(&self, url: &str, path: &str, bytes: &[u8], mode: &str) -> Result<()> {
         const BOUNDARY: &str = "tod-sandbox-7d1f0c2e";

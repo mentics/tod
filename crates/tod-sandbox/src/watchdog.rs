@@ -232,7 +232,7 @@ pub fn run_once(env: &dyn WatchdogEnv, policy: &Policy, now: SystemTime) -> Resu
 
 /// The real environment: Blaxel for the listing, each sandbox's relay
 /// through its port proxy, and the orchestrator at `orchestrator_url` (its
-/// base, e.g. `https://<sandbox-url>/port/8080`), all with the one token.
+/// base, e.g. `https://<sandbox-url>/port/8090`), all with the one token.
 pub struct BlaxelEnv {
     pub bx: Blaxel,
     pub orchestrator_url: String,

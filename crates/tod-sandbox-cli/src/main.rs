@@ -385,6 +385,7 @@ fn orchestrator(ctx: &Ctx, mut args: Args) -> Result<i32> {
     };
     let orchestrator = read(bin, "tod-orchestrator")?;
     let tod_cli = read(cli, "tod-cli")?;
+    let relay = read(None, "tod-relay")?;
     let bx = ctx.blaxel()?;
     let spec = orch::Spec {
         image: image.as_deref().unwrap_or(&acct.default_image),
@@ -392,6 +393,7 @@ fn orchestrator(ctx: &Ctx, mut args: Args) -> Result<i32> {
         memory_mb: acct.memory_mb,
         orchestrator: &orchestrator,
         tod_cli: &tod_cli,
+        relay: &relay,
         // The caller's own account, for poking node sandboxes.
         blaxel_workspace: bx.workspace(),
         blaxel_token: bx.token(),
