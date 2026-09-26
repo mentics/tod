@@ -368,6 +368,21 @@ Nothing starts or builds a container; tod only uses a running one.
   checks a per-process token and runs the real `tod-cli` with the app's own
   data root. This needs Docker Desktop (native Linux Docker does not forward
   `host.docker.internal` to the host's loopback).
+- Code opens in the editor over SSH (`fleet::code_editor::ssh`): `ssh` runs
+  `sshd -i` in the container through `docker exec` as its `ProxyCommand`
+  (no port). `devcontainer::prepare_sshd` readies the container (host keys,
+  `/run/sshd`, tod's key in the user's `authorized_keys`, and `127.0.0.1
+  UNKNOWN` in `/etc/hosts`, without which every PAM login waits on Docker's
+  DNS); it does not install sshd. tod keeps its key, a `Host tod-<container>`
+  per container, and each container's own host key under `<data root>/ssh/`,
+  which on Windows must be readable by the user alone or `ssh` refuses the
+  config. Editors run the user's `ssh`, so `~/.ssh/config` needs one
+  `Include` of tod's config, added only after the user agrees
+  (`SshIncludeNeeded`; `TOD_SSH_CONFIG` points it elsewhere for tests). On
+  Windows that `ssh` may be Git's MSYS build: the `Include` names the file
+  both as `C:/…` and `/c/…`, and the `ProxyCommand` says `//usr/sbin/sshd`
+  so MSYS does not rewrite it. Zed gets the directory, then the file once
+  its connection is up.
 - Shells and terminal agents open a host terminal whose startup command is
   `docker exec -it [-u user] <id> sh /tmp/tod-cli-relay/launch-<id>.sh`; the
   script sets the directory, `PATH`, and relay env, so the token never goes on

@@ -24,7 +24,7 @@ use crate::ui::app_nav::{
     HasAppNav, ShellGoConversation, ShellGoDatabase, ShellGoSettings, ShellGoTasks,
     register_app_nav_keyboard_bindings,
 };
-use crate::ui::code_links::{OpenCodeRef, open_code_ref};
+use crate::ui::code_links::{OpenCodeRef, open_code_ref, open_node_in_editor};
 use crate::ui::key_context::NOT_INPUT;
 use crate::ui::panel_split::{PanelSplitState, h_panel_split};
 use crate::ui::selectable_text::selectable_text;
@@ -57,7 +57,7 @@ use tod_store::agent_traffic::{
 };
 use tod_store::conversation::{Focus, ProtocolKind};
 use tod_store::fleet::terminal::{focus_shell_session, open_shell_for_node};
-use tod_store::fleet::{FleetLaunchError, FleetStore, code_editor, open_code_editor_for_node};
+use tod_store::fleet::{FleetLaunchError, FleetStore, code_editor};
 use uuid::Uuid;
 
 actions!(
@@ -801,26 +801,14 @@ impl Shell {
         &mut self,
         task_id: String,
         editor_id: String,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let Some(editor) = code_editor(&editor_id) else {
             self.queue_error_toast(format!("Unknown code editor: {editor_id}"), cx);
             return;
         };
-        match open_code_editor_for_node(&self.fleet, editor, &task_id) {
-            Ok(cwd) => {
-                self.task_list.update(cx, |list, cx| {
-                    list.set_status_message(
-                        format!("Opened {} in {}", editor.label(), cwd.display()),
-                        cx,
-                    );
-                });
-            }
-            Err(err) => {
-                self.queue_error_toast(format!("Open code failed: {err:#}"), cx);
-            }
-        }
-        cx.notify();
+        open_node_in_editor(self.fleet.clone(), task_id, editor, window, cx);
     }
 
     fn undo_last(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1604,7 +1592,10 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                         let database = cx.new(|cx| DatabaseView::new(window, cx, fleet.clone()));
                         let view = cx.new(|cx| {
                             let _task_list_subscription =
-                                cx.subscribe(&task_list, |this: &mut Shell, _, event, cx| {
+                                cx.subscribe_in(
+                                    &task_list,
+                                    window,
+                                    |this: &mut Shell, _, event, window, cx| {
                                     match event {
                                         TaskListEvent::FocusDrawer => {
                                             this.queue_drawer(DrawerRequest::Focus, cx);
@@ -1696,11 +1687,13 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                             this.handle_open_code_editor(
                                                 task_id.clone(),
                                                 editor_id.clone(),
+                                                window,
                                                 cx,
                                             );
                                         }
                                     }
-                                });
+                                    },
+                                );
                             let _task_edit_subscription =
                                 cx.subscribe(&task_edit, |this: &mut Shell, _, event, cx| {
                                     match event {

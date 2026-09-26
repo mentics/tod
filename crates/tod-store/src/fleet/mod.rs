@@ -34,8 +34,8 @@ mod test_util;
 mod tests;
 
 pub use code_editor::{
-    CodeEditor, CodeLocation, code_editor, code_editors, find_code_refs, open_code_editor_for_node,
-    open_code_location,
+    CodeEditor, CodeLocation, RemoteHost, SshIncludeNeeded, code_editor, code_editors,
+    find_code_refs, open_code_editor_for_node, open_code_location,
 };
 pub use command_log::{CommandEntry, CommandLog};
 pub use launch::FleetLaunchError;

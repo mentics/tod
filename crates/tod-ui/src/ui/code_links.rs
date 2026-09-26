@@ -6,16 +6,25 @@
 //! [`OpenCodeRef`]; the view that knows which node the text is about handles
 //! it with [`open_code_ref`], and the shell root is the fallback (the task
 //! tree's selection). A relative path is resolved against that node's Files
-//! directory.
+//! directory; one inside a dev container opens over SSH, after the user agrees
+//! to let tod add an `Include` line to their ssh config.
 
 use std::sync::Arc;
 
-use gpui::{App, AppContext as _, ClickEvent, MouseButton, SharedString, Window};
+use gpui::{
+    App, AppContext as _, ClickEvent, MouseButton, ParentElement as _, SharedString, Styled as _,
+    Window,
+};
+use gpui_component::button::{Button, ButtonVariants as _};
+use gpui_component::{WindowExt as _, h_flex, v_flex};
+use tod_store::fleet::code_editor::ssh;
 use tod_store::fleet::{
-    CodeLocation, FleetStore, code_editors, find_code_refs, open_code_location,
+    CodeEditor, CodeLocation, FleetStore, SshIncludeNeeded, code_editors, find_code_refs,
+    open_code_editor_for_node, open_code_location,
 };
 use uuid::Uuid;
 
+use crate::ui::selectable_text::selectable_text;
 use crate::ui::toast::error_toast;
 
 /// Open a code reference clicked in text. Dispatched by the link, handled by
@@ -67,17 +76,152 @@ pub fn open_code_ref(
         error_toast(window, cx, "No code editor is supported on this machine");
         return;
     };
-    let task = cx.background_spawn(async move {
-        let node = node.map(|node| node.to_string());
-        open_code_location(&fleet, editor, node.as_deref(), &location)
+    let node = node.map(|node| node.to_string());
+    run_open(
+        fleet,
+        "Open code failed",
+        Arc::new(move |fleet| {
+            open_code_location(fleet, editor, node.as_deref(), &location).map(|_| ())
+        }),
+        window,
+        cx,
+    );
+}
+
+/// Open the Files directory of `node` in `editor`, off the UI thread: one in a
+/// dev container is reached over SSH. Failures show as an error toast.
+pub fn open_node_in_editor(
+    fleet: Arc<FleetStore>,
+    node: String,
+    editor: &'static dyn CodeEditor,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    run_open(
+        fleet,
+        "Open code editor failed",
+        Arc::new(move |fleet| open_code_editor_for_node(fleet, editor, &node).map(|_| ())),
+        window,
+        cx,
+    );
+}
+
+type OpenJob = Arc<dyn Fn(&FleetStore) -> anyhow::Result<()> + Send + Sync>;
+
+/// Run `job` in the background. When it needs the user's ssh config to
+/// include tod's, ask, and run it again once they agree.
+fn run_open(
+    fleet: Arc<FleetStore>,
+    failure: &'static str,
+    job: OpenJob,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let task = cx.background_spawn({
+        let fleet = fleet.clone();
+        let job = job.clone();
+        async move { job(&fleet) }
     });
     window
         .spawn(cx, async move |cx| {
-            if let Err(err) = task.await {
-                let _ = cx.update(|window, cx| {
-                    error_toast(window, cx, format!("Open code failed: {err:#}"));
-                });
-            }
+            let Err(err) = task.await else {
+                return;
+            };
+            let _ = cx.update(|window, cx| match err.downcast_ref::<SshIncludeNeeded>() {
+                Some(needed) => ask_to_include(needed.clone(), fleet, failure, job, window, cx),
+                None => error_toast(window, cx, format!("{failure}: {err:#}")),
+            });
+        })
+        .detach();
+}
+
+/// Ask before adding tod's `Include` line to the user's ssh config: it is
+/// their file.
+fn ask_to_include(
+    needed: SshIncludeNeeded,
+    fleet: Arc<FleetStore>,
+    failure: &'static str,
+    job: OpenJob,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let config: SharedString = needed.user_config.display().to_string().into();
+    let line: SharedString = needed.line.clone().into();
+    window.open_dialog(cx, move |dialog, window, cx| {
+        let needed = needed.clone();
+        let fleet = fleet.clone();
+        let job = job.clone();
+        dialog
+            .title("Open code in dev containers")
+            .overlay(true)
+            .child(
+                v_flex()
+                    .gap_2()
+                    .text_sm()
+                    .child(
+                        "The editor reaches a dev container over ssh, which reads \
+                         tod's settings for it only when your ssh config includes \
+                         them. Add this line to the top of your ssh config?",
+                    )
+                    .child(selectable_text(
+                        "ssh-include-config",
+                        config.clone(),
+                        window,
+                        cx,
+                    ))
+                    .child(selectable_text(
+                        "ssh-include-line",
+                        line.clone(),
+                        window,
+                        cx,
+                    )),
+            )
+            .footer(
+                h_flex()
+                    .justify_end()
+                    .gap_2()
+                    .child(
+                        Button::new("ssh-include-cancel")
+                            .label("Cancel")
+                            .on_click(|_, window, cx| window.close_dialog(cx)),
+                    )
+                    .child(
+                        Button::new("ssh-include-add")
+                            .label("Add line")
+                            .primary()
+                            .on_click(move |_, window, cx| {
+                                window.close_dialog(cx);
+                                add_include_then(
+                                    needed.clone(),
+                                    fleet.clone(),
+                                    failure,
+                                    job.clone(),
+                                    window,
+                                    cx,
+                                );
+                            }),
+                    ),
+            )
+    });
+}
+
+fn add_include_then(
+    needed: SshIncludeNeeded,
+    fleet: Arc<FleetStore>,
+    failure: &'static str,
+    job: OpenJob,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let task = cx
+        .background_spawn(async move { ssh::add_include(&needed.user_config, &needed.data_root) });
+    window
+        .spawn(cx, async move |cx| {
+            let result = task.await;
+            let _ = cx.update(|window, cx| match result {
+                Ok(()) => run_open(fleet, failure, job, window, cx),
+                Err(err) => error_toast(window, cx, format!("{failure}: {err:#}")),
+            });
         })
         .detach();
 }

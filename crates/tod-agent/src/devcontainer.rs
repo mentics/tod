@@ -655,6 +655,115 @@ impl ContainerExec {
     }
 }
 
+/// Readies a container for `ssh` over `docker exec … sshd -i`: host keys,
+/// sshd's privilege-separation directory, `authorized_key` for `user`, and a
+/// local name for `UNKNOWN`. Over a pipe sshd has no peer address and hands
+/// PAM the host `UNKNOWN`, which Docker Desktop's DNS takes seconds to fail to
+/// resolve, several times per login. Idempotent. Prints the ed25519 host key.
+const PREPARE_SSHD: &str = r#"set -e
+user="$1"
+key="$2"
+sshd=$(command -v sshd || echo /usr/sbin/sshd)
+if [ ! -x "$sshd" ]; then
+  echo "there is no sshd in the container: install openssh-server in its image" >&2
+  exit 3
+fi
+ssh-keygen -A >/dev/null
+mkdir -p /run/sshd
+chmod 755 /run/sshd
+grep -Eq '^[^#]*[[:space:]]UNKNOWN([[:space:]]|$)' /etc/hosts || echo '127.0.0.1 UNKNOWN' >> /etc/hosts
+home=$(awk -F: -v u="$user" '$1 == u { print $6 }' /etc/passwd)
+if [ -z "$home" ]; then
+  echo "user $user has no home directory in the container" >&2
+  exit 4
+fi
+group=$(id -gn "$user")
+mkdir -p "$home/.ssh"
+touch "$home/.ssh/authorized_keys"
+grep -qxF "$key" "$home/.ssh/authorized_keys" || echo "$key" >> "$home/.ssh/authorized_keys"
+chown "$user:$group" "$home/.ssh" "$home/.ssh/authorized_keys"
+chmod 700 "$home/.ssh"
+chmod 600 "$home/.ssh/authorized_keys"
+echo "sshd=$sshd"
+cat /etc/ssh/ssh_host_ed25519_key.pub
+"#;
+
+/// A container readied by [`prepare_sshd`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContainerSshd {
+    /// Where `sshd` is in the container.
+    pub sshd: String,
+    /// The container's ed25519 host key: `ssh-ed25519 AAAA…`.
+    pub host_key: String,
+}
+
+/// Ready `container` so `user` can log in with `authorized_key` through
+/// `docker exec -i -u 0 <container> <sshd> -i` (see [`sshd_proxy_command`]).
+/// Runs as root; does not install sshd. Talks to Docker.
+pub fn prepare_sshd(container: &str, user: &str, authorized_key: &str) -> Result<ContainerSshd> {
+    validate_container_ref(container)?;
+    let authorized_key = authorized_key.trim();
+    if authorized_key.contains('\n') {
+        bail!("an authorized key is one line");
+    }
+    let mut child = docker_command()?
+        .args(["exec", "-i", "-u", "0", container, "sh", "-s", "--"])
+        .args([user, authorized_key])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("run docker (is Docker installed and running?)")?;
+    child
+        .stdin
+        .take()
+        .context("docker stdin")?
+        .write_all(PREPARE_SSHD.as_bytes())?;
+    let out = child.wait_with_output()?;
+    if !out.status.success() {
+        bail!(
+            "prepare ssh in dev container `{container}`: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    parse_prepared_sshd(&String::from_utf8_lossy(&out.stdout))
+        .with_context(|| format!("prepare ssh in dev container `{container}`"))
+}
+
+fn parse_prepared_sshd(stdout: &str) -> Result<ContainerSshd> {
+    let mut sshd = None;
+    let mut host_key = None;
+    for line in stdout.lines().map(str::trim) {
+        if let Some(path) = line.strip_prefix("sshd=") {
+            sshd = Some(path.to_string());
+        } else if line.starts_with("ssh-ed25519 ") {
+            // Drop the comment: `type key`.
+            let key: Vec<&str> = line.split_whitespace().take(2).collect();
+            host_key = Some(key.join(" "));
+        }
+    }
+    Ok(ContainerSshd {
+        sshd: sshd.context("sshd's path was not reported")?,
+        host_key: host_key.context("the container has no ed25519 host key")?,
+    })
+}
+
+/// The `ssh` `ProxyCommand` that runs `sshd -i` in `container` as root, so
+/// `ssh` talks to it over `docker exec`'s stdio: no port, no network.
+///
+/// On Windows the `ssh` may be Git's MSYS build, whose shell rewrites a
+/// `/usr/sbin/sshd` argument into a Windows path before `docker.exe` sees
+/// it. `//usr/sbin/sshd` is left alone and is the same path in the container.
+pub fn sshd_proxy_command(container: &str, sshd: &str) -> String {
+    let docker = docker_bin().to_string_lossy().replace('\\', "/");
+    let sshd = if cfg!(windows) && sshd.starts_with('/') && !sshd.starts_with("//") {
+        format!("/{sshd}")
+    } else {
+        sshd.to_string()
+    };
+    format!("\"{docker}\" exec -i -u 0 {container} {sshd} -i")
+}
+
 /// Single-quote `value` for a POSIX shell.
 pub fn sh_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
@@ -800,5 +909,18 @@ mod tests {
             ]
         );
         assert!(!args.iter().any(|a| a.contains("s3cret")));
+    }
+
+    #[test]
+    fn prepared_sshd_reports_its_path_and_host_key() {
+        let out = "sshd=/usr/sbin/sshd\nssh-ed25519 AAAAC3Nza root@dev\n";
+        assert_eq!(
+            parse_prepared_sshd(out).unwrap(),
+            ContainerSshd {
+                sshd: "/usr/sbin/sshd".into(),
+                host_key: "ssh-ed25519 AAAAC3Nza".into(),
+            }
+        );
+        assert!(parse_prepared_sshd("sshd=/usr/sbin/sshd\n").is_err());
     }
 }
