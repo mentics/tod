@@ -127,8 +127,10 @@ pub fn cloud_node(root: &Path, node_id: &str) -> Option<CloudNode> {
     from_db.or_else(|| CloudSyncState::load(root).ok()?.nodes.get(node_id).cloned())
 }
 
-/// Held by every exchange with the orchestrator from this process, so a
-/// background outbox push never overlaps a sync.
+/// Held by every [`sync`] in this process. Background syncs (the outbox
+/// push, notices, the start) go through one coalescing runner
+/// ([`crate::cloud_notify::runner`]); this lock also keeps the user's own
+/// "Sync now" and [`run_in_cloud`] from overlapping one.
 static SYNC_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn sync_lock() -> std::sync::MutexGuard<'static, ()> {
@@ -368,32 +370,15 @@ pub fn sync(fleet: &FleetStore, root: &Path, orch: &dyn Orchestrator, user: &str
     Ok(report)
 }
 
-/// Send the outbox only (no seed, no pull): what the app does a moment after
-/// each change, so running nodes see the user's edits. Nothing when this
-/// data root was never seeded or has nothing new. The number sent.
-pub fn push_outbox(fleet: &FleetStore, root: &Path, orch: &dyn Orchestrator, user: &str) -> Result<usize> {
-    let _guard = sync_lock();
-    let mut state = CloudSyncState::load(root)?;
-    if !state.seeded {
-        return Ok(0);
-    }
-    let _ = fleet.flush_on_quit();
-    let outbox = sync::export_changes(&connect(fleet.paths().db())?, state.sent_after)?;
-    if outbox.is_empty() {
-        return Ok(0);
-    }
-    orch.send(user, &outbox)?;
-    state.sent_after = outbox.iter().map(|c| c.seq).max().unwrap_or(state.sent_after);
-    state.save(root)?;
-    Ok(outbox.len())
-}
-
 /// How long the store must be quiet before the outbox goes out.
 pub const PUSH_DEBOUNCE: Duration = Duration::from_secs(2);
 
-/// On a thread of its own: [`push_outbox`] [`PUSH_DEBOUNCE`] after the last
-/// store change, for as long as the store lives. A data root that was never
-/// seeded makes no network call (nor resolves the orchestrator).
+/// On a thread of its own: a sync through the shared runner
+/// ([`crate::cloud_notify::runner`]) [`PUSH_DEBOUNCE`] after the last store
+/// change, for as long as the store lives, so the user's edits reach running
+/// nodes. A data root that was never seeded makes no network call. The sync
+/// the push starts reloads the store only when it received something, and
+/// an empty outbox sends nothing.
 pub fn spawn_outbox_pusher(fleet: std::sync::Arc<FleetStore>) {
     let mut rx = fleet.subscribe_changes();
     let root = fleet.paths().root().to_path_buf();
@@ -422,11 +407,14 @@ pub fn spawn_outbox_pusher(fleet: std::sync::Arc<FleetStore>) {
             if !CloudSyncState::load(&root).is_ok_and(|s| s.seeded) {
                 continue;
             }
-            let pushed = resolve(&root).and_then(|(orch, user)| push_outbox(&fleet, &root, &orch, &user));
-            match pushed {
-                Ok(0) => {}
-                Ok(n) => tracing::info!("cloud outbox: sent {n} change(s)"),
-                Err(err) => tracing::warn!("cloud outbox push failed: {err:#}"),
+            // Nothing new of ours to send: no call (the store also changes
+            // when a sync applies what it received).
+            let pending = CloudSyncState::load(&root).ok().and_then(|state| {
+                let conn = connect(fleet.paths().db()).ok()?;
+                Some(sync::last_seq(&conn).ok()? > state.sent_after)
+            });
+            if pending == Some(true) {
+                crate::cloud_notify::runner(&fleet).request();
             }
         }
     });
@@ -485,10 +473,7 @@ pub fn sync_on_start(fleet: std::sync::Arc<FleetStore>) {
     if !CloudSyncState::load(&root).is_ok_and(|s| s.seeded) {
         return;
     }
-    std::thread::spawn(move || match sync_now(&fleet, &root) {
-        Ok(report) => tracing::info!("cloud sync on start: {}", report.summary()),
-        Err(err) => tracing::warn!("cloud sync on start failed: {err:#}"),
-    });
+    crate::cloud_notify::runner(&fleet).request();
 }
 
 /// Run `node_id` in the cloud: sync (seeding first), create the node's
@@ -622,7 +607,7 @@ pub fn run_in_cloud(
     )?;
     let _ = fleet.reload_if_stale();
     let _ = sandboxes.save();
-    if let Err(err) = push_outbox(fleet, root, &orch, &user) {
+    if let Err(err) = sync(fleet, root, &orch, &user) {
         progress(&format!("warning: could not send the record to the orchestrator yet: {err:#}"));
     }
     Ok(record)

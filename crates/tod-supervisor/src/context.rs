@@ -20,7 +20,7 @@
 use anyhow::Result;
 use std::path::Path;
 use tod_core::conversation::driver::{AgentAccess, ConversationDriver};
-use tod_store::conversation::TurnRole;
+use tod_store::conversation::{ConversationRepo, Focus, TurnRole};
 use tod_store::fleet::FleetStore;
 use tod_store::interview::{ACTOR_USER, InterviewCommand};
 use uuid::Uuid;
@@ -56,7 +56,8 @@ pub struct Taken {
 }
 
 /// Takes a context change: see the module docs. `current` is the
-/// autopilot's current conversation, if one is to be continued.
+/// autopilot's current conversation, if one is to be continued; else the
+/// node's latest conversation gets the note (and loses its session).
 pub fn take<A: AgentAccess + ?Sized>(
     store: &FleetStore,
     agent: &mut A,
@@ -82,6 +83,14 @@ pub fn take<A: AgentAccess + ?Sized>(
     } else {
         tracing::info!(%node, "context changed: rebuilding the agent's context");
     }
+    // Said in the conversation the autopilot continues, else the node's
+    // latest one, where the user reads what happened.
+    let current = match current {
+        Some(id) => Some(id),
+        None => store.read(|conn| {
+            Ok(ConversationRepo::new(conn).latest_for_focus(Focus::Node(node))?.map(|c| c.id))
+        })?,
+    };
     if let Some(id) = current {
         agent.with(|a| a.close_session(&ConversationDriver::session_key(id)));
         store.interview(

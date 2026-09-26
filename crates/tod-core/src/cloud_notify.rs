@@ -125,6 +125,29 @@ impl Coalesced {
     }
 }
 
+/// The one background sync runner for `fleet`'s data root, shared by
+/// notices ([`start`]), the app's start, and the outbox push
+/// (`cloud_sync::spawn_outbox_pusher`), so their syncs coalesce and never
+/// overlap.
+pub fn runner(fleet: &Arc<FleetStore>) -> Arc<Coalesced> {
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    static RUNNERS: Mutex<Option<HashMap<PathBuf, Arc<Coalesced>>>> = Mutex::new(None);
+    let root = fleet.paths().root().to_path_buf();
+    let mut runners = RUNNERS.lock().unwrap_or_else(|e| e.into_inner());
+    runners
+        .get_or_insert_with(HashMap::new)
+        .entry(root.clone())
+        .or_insert_with(|| {
+            let fleet = fleet.clone();
+            Coalesced::new(move || match cloud_sync::sync_now(&fleet, &root) {
+                Ok(report) => tracing::info!("cloud sync: {}", report.summary()),
+                Err(err) => tracing::warn!("cloud sync failed: {err:#}"),
+            })
+        })
+        .clone()
+}
+
 /// The topics for `root`, from `cloud-sync.json` or else the orchestrator
 /// (then saved).
 fn topics(root: &Path) -> Result<NotifyTopics> {
@@ -147,13 +170,7 @@ pub fn start(fleet: Arc<FleetStore>) {
         while !CloudSyncState::load(&root).is_ok_and(|s| s.seeded) {
             std::thread::sleep(SEEDED_CHECK);
         }
-        let sync = {
-            let (fleet, root) = (fleet.clone(), root.clone());
-            Coalesced::new(move || match cloud_sync::sync_now(&fleet, &root) {
-                Ok(report) => tracing::info!("cloud sync on notice: {}", report.summary()),
-                Err(err) => tracing::warn!("cloud sync on notice failed: {err:#}"),
-            })
-        };
+        let sync = runner(&fleet);
         let mut backoff = Duration::from_secs(1);
         let mut since: Option<String> = None;
         loop {

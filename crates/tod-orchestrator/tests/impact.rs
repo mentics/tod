@@ -7,15 +7,18 @@ use tod_orchestrator::http::Request;
 use tod_orchestrator::wakes::{Poker, Wake};
 use tod_orchestrator::{Config, Server};
 use tod_store::fleet::FleetStore;
-use tod_store::outline::{CreatePosition, OutlineMutation};
+use tod_store::outline::{Capability, CreatePosition, OutlineMutation};
 use uuid::Uuid;
 
 #[derive(Default)]
-struct FakePoker(Mutex<Vec<String>>);
+struct Poked(Mutex<Vec<String>>);
 
-impl Poker for Arc<FakePoker> {
+#[derive(Default)]
+struct FakePoker(Arc<Poked>);
+
+impl Poker for FakePoker {
     fn poke(&self, wake: &Wake) -> anyhow::Result<()> {
-        self.0.lock().unwrap().push(wake.sandbox.clone());
+        self.0.0.lock().unwrap().push(wake.sandbox.clone());
         Ok(())
     }
 }
@@ -41,6 +44,9 @@ fn node(fleet: &FleetStore, list_id: Uuid, parent: Option<Uuid>, title: &str) ->
             position: CreatePosition::Below,
             title: title.into(),
         })
+        .unwrap();
+    fleet
+        .enqueue_outline(OutlineMutation::EnableCapabilities { node_id: id, capabilities: vec![Capability::Spec] })
         .unwrap();
     fleet.writer().flush().unwrap();
     id
@@ -96,10 +102,10 @@ fn posted_changes_mark_and_poke_only_the_affected_nodes() {
     }
     let _ = fleet.reload_if_stale();
 
-    let poker = Arc::new(FakePoker::default());
+    let poker = Arc::new(Poked::default());
     let server = Server::with_poker(
         Config { base: base.join("orchestrator"), tod_cli: "unused".into(), tod_cli_prefix: Vec::new() },
-        Box::new(poker.clone()),
+        Box::new(FakePoker(poker.clone())),
     )
     .unwrap();
     let snap = base.join("snap.db");
