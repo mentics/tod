@@ -37,6 +37,53 @@ pub enum AttentionKind {
     Gate,
 }
 
+/// Why the agent or runner could not handle the request itself
+/// (`doc/ui/task-panel.md` "Requests"). A fixed set so they can be counted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestReason {
+    /// No obligation, plan step, or process doc settles it.
+    MissingRule,
+    /// Obligations or other requirements that cannot all hold.
+    Conflict,
+    /// A secret, account, or permission the agent does not have.
+    Access,
+    /// A judgment call worth a human's sign-off (a review finding, a gate
+    /// blocker) rather than a missing rule or an outright conflict.
+    Risk,
+    /// About a capability's own configuration.
+    Capability,
+    /// Does not fit the other reasons.
+    Other,
+}
+
+impl RequestReason {
+    /// The string stored in `tod_store::decisions` and reported by
+    /// `tod-cli decisions ask --reason`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::MissingRule => "missing_rule",
+            Self::Conflict => "conflict",
+            Self::Access => "access",
+            Self::Risk => "risk",
+            Self::Capability => "capability",
+            Self::Other => "other",
+        }
+    }
+
+    /// Parses a stored reason string, falling back to `Other` for anything
+    /// unrecognized (an older row, or a value from a future version).
+    pub fn parse(raw: &str) -> Self {
+        match raw {
+            "missing_rule" => Self::MissingRule,
+            "conflict" => Self::Conflict,
+            "access" => Self::Access,
+            "risk" => Self::Risk,
+            "capability" => Self::Capability,
+            _ => Self::Other,
+        }
+    }
+}
+
 /// One thing a node is waiting on the user for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttentionItem {
@@ -52,6 +99,8 @@ pub struct AttentionItem {
     pub options: Vec<String>,
     /// Milliseconds since the epoch: when this item started waiting.
     pub since: i64,
+    /// Why the agent or runner could not handle this itself.
+    pub reason: RequestReason,
 }
 
 /// What one node is waiting on, oldest item first.
@@ -141,6 +190,9 @@ pub fn for_nodes(conn: &Connection, node_ids: &[Uuid]) -> Result<HashMap<Uuid, N
                     summary: finding.summary.clone(),
                     options: Vec::new(),
                     since: finding.created_at,
+                    // A review finding is a judgment call the reviewer flagged
+                    // for the user, not a missing rule or a conflict.
+                    reason: RequestReason::Risk,
                 });
         }
     }
@@ -182,6 +234,9 @@ pub fn for_nodes(conn: &Connection, node_ids: &[Uuid]) -> Result<HashMap<Uuid, N
                     summary,
                     options: Vec::new(),
                     since: conversation.created_at,
+                    // A gate blocker asked of the user is a judgment call by
+                    // default; nothing on the report says otherwise today.
+                    reason: RequestReason::Risk,
                 });
             }
         }
@@ -203,6 +258,7 @@ fn decision_item(decision: &Decision) -> AttentionItem {
         summary: decision.question.clone(),
         options: decision.options.clone(),
         since: decision.created_at,
+        reason: RequestReason::parse(&decision.reason),
     }
 }
 
@@ -210,6 +266,16 @@ fn plan_step_item(step: &PlanStep, updated_at: i64) -> AttentionItem {
     let options = match &step.reason {
         Some(HandoffReason::Decision { options }) => options.clone(),
         _ => Vec::new(),
+    };
+    // A handoff reason maps straight onto a request reason: a `Decision` is
+    // a choice no rule settles, `Conflict` is a conflict, and `Access` is
+    // access; a step handed back with no reason recorded falls back to
+    // `Other`.
+    let reason = match &step.reason {
+        Some(HandoffReason::Decision { .. }) => RequestReason::MissingRule,
+        Some(HandoffReason::Conflict { .. }) => RequestReason::Conflict,
+        Some(HandoffReason::Access { .. }) => RequestReason::Access,
+        None => RequestReason::Other,
     };
     // The step itself is what the user is answering about; its reason and
     // note say why, and a `Decision`'s options are offered as `options`, so
@@ -221,6 +287,7 @@ fn plan_step_item(step: &PlanStep, updated_at: i64) -> AttentionItem {
         summary: step.body.clone(),
         options,
         since: updated_at,
+        reason,
     }
 }
 
@@ -284,6 +351,7 @@ mod tests {
                         kind: "obligation".to_string(),
                         id: Uuid::new_v4(),
                     }],
+                    ..Default::default()
                 },
             )
             .unwrap();
@@ -420,6 +488,7 @@ mod tests {
                     question: "A or B?".to_string(),
                     options: vec!["A".to_string(), "B".to_string()],
                     evidence: vec![],
+                    ..Default::default()
                 },
             )
             .unwrap();
@@ -446,6 +515,7 @@ mod tests {
                     question: "Q on A".to_string(),
                     options: vec![],
                     evidence: vec![],
+                    ..Default::default()
                 },
             )
             .unwrap();

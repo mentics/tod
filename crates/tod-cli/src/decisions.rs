@@ -11,7 +11,9 @@ use crate::Invocation;
 use crate::args::Args;
 use tod_core::conversation::implement::{IMPLEMENT_CONVERSATION_ENV, IMPLEMENT_NODE_ENV};
 use tod_store::conversation::ConversationRepo;
-use tod_store::decisions::{Decision, DecisionRepo, EVIDENCE_KINDS, EvidenceRef, NewDecision};
+use tod_store::decisions::{
+    DECISION_REASONS, Decision, DecisionRepo, EVIDENCE_KINDS, EvidenceRef, NewDecision,
+};
 use tod_store::interview::{InterviewCommand, short_id};
 use uuid::Uuid;
 
@@ -23,15 +25,16 @@ Inside a conversation --node defaults to the node it is about, and asks are
 filed under that conversation and its protocol.
 
 COMMANDS:
-    ask   [--node <UUID>] <QUESTION> --option <TEXT> (repeatable) [--evidence <KIND>:<ID> (repeatable)]
+    ask   [--node <UUID>] <QUESTION> --option <TEXT> (repeatable) [--evidence <KIND>:<ID> (repeatable)] [--reason <KIND>]
     list  [--node <UUID>] [--all]
     show  <ID>
 
 `ask` records a pending decision: the question (as one positional argument —
 quote it), at least one --option (repeatable, in the order they should be
-offered), and any --evidence links the user should be able to open while
+offered), any --evidence links the user should be able to open while
 answering, each `kind:id` with kind one of: obligation, plan_step, test_run,
-conversation, finding, node.
+conversation, finding, node, and --reason, one of: missing_rule, conflict,
+access, risk, capability, other (defaults to other when omitted).
 `list` shows a node's pending decisions, oldest first; --all includes
 answered and withdrawn ones too.
 `show` prints one decision and its full answer log, oldest first.
@@ -111,6 +114,18 @@ fn ask(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
         .iter()
         .map(|raw| parse_evidence(raw))
         .collect::<anyhow::Result<Vec<_>>>()?;
+    let reason = match args.get("--reason") {
+        Some(raw) => {
+            if !DECISION_REASONS.contains(&raw) {
+                anyhow::bail!(
+                    "unknown --reason `{raw}` (expected {})",
+                    DECISION_REASONS.join("|")
+                );
+            }
+            raw.to_string()
+        }
+        None => String::new(),
+    };
     let (conversation_id, protocol) = asking_conversation(inv)?;
     let result = inv.client().interview(InterviewCommand::AskDecision {
         node_id: node,
@@ -120,6 +135,7 @@ fn ask(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
             question,
             options,
             evidence,
+            reason,
         },
     })?;
     let id = result
@@ -143,6 +159,7 @@ fn decision_json(d: &Decision) -> serde_json::Value {
         "options": d.options,
         "evidence": d.evidence.iter().map(|e| serde_json::json!({"kind": e.kind, "id": e.id.to_string()})).collect::<Vec<_>>(),
         "status": d.status,
+        "reason": d.reason,
     })
 }
 
@@ -154,7 +171,13 @@ fn decision_line(d: &Decision) -> String {
         .map(|(i, o)| format!("{}. {o}", i + 1))
         .collect::<Vec<_>>()
         .join(" | ");
-    format!("[{}] {} {}\n    {options}", short_id(d.id), d.status, d.question)
+    format!(
+        "[{}] {} {} · {}\n    {options}",
+        short_id(d.id),
+        d.status,
+        d.question,
+        d.reason
+    )
 }
 
 fn list(inv: &Invocation, args: &Args) -> anyhow::Result<String> {

@@ -1403,6 +1403,7 @@ mod tests {
                         question: question.to_string(),
                         options: vec!["a".to_string(), "b".to_string()],
                         evidence: Vec::new(),
+                        ..Default::default()
                     },
                 },
             )
@@ -1424,6 +1425,7 @@ mod tests {
                         question: question.to_string(),
                         options: vec!["a".to_string(), "b".to_string()],
                         evidence: Vec::new(),
+                        ..Default::default()
                     },
                 },
             )
