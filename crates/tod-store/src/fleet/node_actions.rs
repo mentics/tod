@@ -202,6 +202,19 @@ fn nearest_with_capability(
     Ok(None)
 }
 
+/// Whether `node_id` is a **task node** (`doc/glossary.md`): the Lifecycle
+/// capability on the node itself, and Agent on it or inherited from an
+/// ancestor. The unified view opens the task panel for these by default.
+pub fn is_task_node(conn: &Connection, node_id: Uuid) -> Result<bool> {
+    if !NodeRepo::new(conn)
+        .list_capabilities(node_id)?
+        .contains(&Capability::Lifecycle)
+    {
+        return Ok(false);
+    }
+    Ok(nearest_with_capability(conn, &node_id.to_string(), Capability::Agent)?.is_some())
+}
+
 pub fn resolve_files_for_node(conn: &Connection, node_id: &str) -> Result<Option<ResolvedFiles>> {
     let Some((source, source_title, inherited)) =
         nearest_with_capability(conn, node_id, Capability::Files)?
@@ -665,5 +678,36 @@ mod tests {
         );
         files.repo = Some(r"C:\src\app".into());
         assert!(matches!(files.directory(), FilesDirectory::Missing(_)));
+    }
+
+    #[test]
+    fn task_node_with_own_agent() {
+        let tree = setup_tree();
+        enable(&tree.store, tree.child, vec![Capability::Lifecycle, Capability::Agent]);
+        assert!(tree.store.read(|conn| is_task_node(conn, tree.child)).unwrap());
+        drop(tree.store);
+        cleanup_fleet_root(&tree.root);
+    }
+
+    #[test]
+    fn task_node_with_inherited_agent() {
+        let tree = setup_tree();
+        enable(&tree.store, tree.grandparent, vec![Capability::Agent]);
+        enable(&tree.store, tree.child, vec![Capability::Lifecycle]);
+        assert!(tree.store.read(|conn| is_task_node(conn, tree.child)).unwrap());
+        // The ancestor itself has no Lifecycle, so it is not a task.
+        assert!(!tree.store.read(|conn| is_task_node(conn, tree.grandparent)).unwrap());
+        drop(tree.store);
+        cleanup_fleet_root(&tree.root);
+    }
+
+    #[test]
+    fn not_a_task_node_without_lifecycle_or_agent() {
+        let tree = setup_tree();
+        assert!(!tree.store.read(|conn| is_task_node(conn, tree.child)).unwrap());
+        enable(&tree.store, tree.child, vec![Capability::Lifecycle]);
+        assert!(!tree.store.read(|conn| is_task_node(conn, tree.child)).unwrap());
+        drop(tree.store);
+        cleanup_fleet_root(&tree.root);
     }
 }

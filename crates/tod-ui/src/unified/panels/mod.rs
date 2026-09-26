@@ -7,6 +7,7 @@ pub mod findings;
 pub mod obligations;
 pub mod plan;
 pub mod settings;
+pub mod task;
 pub mod transcript;
 
 pub use details::DetailsPanel;
