@@ -485,11 +485,53 @@ The plan:
   sandbox) the same way; it runs no agent, so an environment variable would
   also do.
 - Holding a sandbox awake needs no credentials at all (see above).
-- **The Claude subscription**: a long-lived token from `claude setup-token`,
-  given to Claude Code as `CLAUDE_CODE_OAUTH_TOKEN`. Whether the proxy can
-  inject it instead (a placeholder in the environment, the real token added
-  for `api.anthropic.com`) is untested. Otherwise it is an environment variable
-  of the agent's process.
+- **The Claude subscription: proxy injection too.** A long-lived token from
+  `claude setup-token`, which the user runs once on their own machine
+  (Settings → Cloud sandboxes → Claude subscription → **Get a token** opens a
+  terminal running it; the printed token is pasted into the row above it).
+  tod keeps it in `CredentialStore` (`claude_oauth_token`, a kind agents
+  cannot read through `tod-cli secrets`) and puts it in each node sandbox's
+  proxy: a rule for `api.anthropic.com` sets `Authorization: Bearer
+  {{SECRET:claude}}`, and the sandbox's environment gets
+  `CLAUDE_CODE_OAUTH_TOKEN=<placeholder>`, so Claude Code starts signed in
+  and never sees the token. No `claude /login` in any sandbox.
+  `sandboxes.toml`'s `claude_token_via = "env"` (under `[blaxel]`) is the
+  fallback: the token goes into the supervisor's environment alone (the
+  relay is started with it as `TOD_SUPERVISOR_ENV_CLAUDE_CODE_OAUTH_TOKEN`,
+  takes it out of its own environment, and hands it only to the supervisor
+  it starts, so shells and other processes the relay starts do not get it),
+  never into the sandbox-wide environment. Claude Code, the supervisor's
+  child, then holds the real token, and so can anything it runs.
+  "Run in the cloud" and the replacement of a lost sandbox fail before
+  creating anything when no token is stored and the node would run Claude
+  (anything but `TOD_CLOUD_AGENT=mock`), naming the Settings row.
+  **A token changed later** reaches a node when its sandbox is next created
+  (a replacement, or running it in the cloud again after deleting it): proxy
+  rules cannot be changed after creation. With `env`, it is passed at every
+  provisioning, so it also reaches the supervisor's next start after the
+  node is run in the cloud again.
+
+  Measured (September 2026, `testspace-358401`, a node sandbox created by
+  `tod_sandbox::node::create_body` in proxy mode with the dummy token
+  `test-not-a-real-token`, plus, for the test only, the same rule for
+  `httpbin.org`):
+
+  | Check | Result |
+  |---|---|
+  | `curl httpbin.org/headers` with `Authorization: Bearer <placeholder>` | echoed `Bearer test-not-a-real-token`: the proxy **replaces** the header, the placeholder is not sent |
+  | `POST api.anthropic.com/v1/messages`, no auth header, through the proxy | `401 Invalid bearer token` (the dummy was added) |
+  | the same bypassing the proxy (`--noproxy '*'`) | `401 x-api-key header is required` |
+  | the placeholder (`sk-ant-oat01-…`) sent directly, bypassing the proxy | `401 OAuth access token is invalid.` |
+  | `claude -p hi` (Claude Code 2.1.283) | no login prompt; `401 Invalid bearer token`: its request went through the proxy and got the dummy |
+  | `claude -p hi` with `NO_PROXY='*'` | `401 OAuth access token is invalid.`: the placeholder, sent directly |
+  | `claude-code-acp` 0.16.2: `initialize`, `session/new`, `session/prompt` | session created with no `~/.claude` credentials; the prompt failed with `401 Invalid bearer token`, again the injected dummy |
+  | the dummy in the sandbox's environment or files (`/etc /root /opt /tmp`) | nowhere |
+  | env mode: relay started with `TOD_SUPERVISOR_ENV_CLAUDE_CODE_OAUTH_TOKEN`, then poked | the supervisor's environment had `CLAUDE_CODE_OAUTH_TOKEN`; a command run through the relay (`tod-sandbox exec`) had neither variable; the process API's record of the relay shows no environment |
+
+  So Claude Code's own traffic (Node, with `NODE_USE_ENV_PROXY=1` and the
+  proxy's CA in `NODE_EXTRA_CA_CERTS`) goes through the proxy, and it does
+  not check the token locally: the proxy is the default. Not measured, as it
+  needs a real token: a successful, streamed turn through the proxy.
 - **The watchdog** holds a Blaxel key as a job secret.
 
 ## Development account
@@ -536,10 +578,12 @@ both and only the stand-ins are dev-only.
    appended per transcript write.
 3. **Volumes.** Available on the deployment account (not the development
    one). Check reattaching one to a replacement orchestrator sandbox.
-4. **The proxy.** Claude Code's own traffic through it (subscription auth,
-   streaming); whether a rule's secrets can be rotated on a running sandbox
-   (the proxy cannot be added after creation); and existing sandboxes, which
-   were created without it.
+4. **The proxy.** Claude Code's own traffic goes through it and gets the
+   subscription token injected (see Credentials; measured with a dummy
+   token). Still open: a successful, streamed turn with a real token; whether
+   a rule's secrets can be rotated on a running sandbox (the proxy cannot be
+   added after creation); and existing sandboxes, which were created without
+   it.
 5. **The push service.** Pick one; measure publish-to-app latency.
 6. **Subscription use.** One subscription driving many unattended agents: the
    limits, and that it is within the subscription's terms.
