@@ -13,10 +13,13 @@
 //!
 //! Both block on the network: never call them on the UI thread.
 //!
-//! The cursors, the orchestrator's URL and user override, and which nodes run
-//! in the cloud are kept in [`STATE_FILE`] under the data root. That record is
-//! this machine's: another copy of the app does not see which nodes it sent
-//! to the cloud.
+//! - [`spawn_outbox_pusher`]: sends the outbox a moment after each change,
+//!   in the background, so running nodes see the user's edits.
+//!
+//! The cursors and the orchestrator's URL and user override are kept in
+//! [`STATE_FILE`] under the data root. Which nodes run in the cloud is in
+//! the synced `cloud_nodes` table (`tod_store::cloud_nodes`); older builds
+//! kept it in the state file, which [`cloud_node`] still reads.
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
@@ -102,10 +105,31 @@ impl CloudSyncState {
     }
 }
 
-/// Where the node runs in the cloud, if it does (a small file read: fine on
-/// the UI thread).
+/// Where the node runs in the cloud, if it does: its `cloud_nodes` row in
+/// the database (synced, so every copy of the app sees it), else the record
+/// older builds kept in [`STATE_FILE`]. One indexed read: fine on the UI
+/// thread.
 pub fn cloud_node(root: &Path, node_id: &str) -> Option<CloudNode> {
-    CloudSyncState::load(root).ok()?.nodes.get(node_id).cloned()
+    let from_db = (|| {
+        let node = uuid::Uuid::parse_str(node_id).ok()?;
+        let db = tod_store::fleet::FleetPaths::new(root).ok()?.db().to_path_buf();
+        if !db.is_file() {
+            return None;
+        }
+        let conn = rusqlite::Connection::open_with_flags(&db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).ok()?;
+        let _ = conn.busy_timeout(Duration::from_millis(200));
+        let row = tod_store::cloud_nodes::get(&conn, node).ok()??;
+        Some(CloudNode { sandbox: row.sandbox, user: row.user, accepted_at_ms: row.accepted_at })
+    })();
+    from_db.or_else(|| CloudSyncState::load(root).ok()?.nodes.get(node_id).cloned())
+}
+
+/// Held by every exchange with the orchestrator from this process, so a
+/// background outbox push never overlaps a sync.
+static SYNC_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn sync_lock() -> std::sync::MutexGuard<'static, ()> {
+    SYNC_LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// A user name the orchestrator accepts: letters, digits, `-`, `_`, `.`,
@@ -287,6 +311,7 @@ fn connect(db: &Path) -> Result<rusqlite::Connection> {
 /// Seed if not seeded, send the outbox, pull and apply the feed; saves the
 /// cursors after each step, so a failure part way loses nothing.
 pub fn sync(fleet: &FleetStore, root: &Path, orch: &dyn Orchestrator, user: &str) -> Result<SyncReport> {
+    let _guard = sync_lock();
     let mut state = CloudSyncState::load(root)?;
     let mut report = SyncReport::default();
     let _ = fleet.flush_on_quit();
@@ -334,6 +359,73 @@ pub fn sync(fleet: &FleetStore, root: &Path, orch: &dyn Orchestrator, user: &str
     Ok(report)
 }
 
+/// Send the outbox only (no seed, no pull): what the app does a moment after
+/// each change, so running nodes see the user's edits. Nothing when this
+/// data root was never seeded or has nothing new. The number sent.
+pub fn push_outbox(fleet: &FleetStore, root: &Path, orch: &dyn Orchestrator, user: &str) -> Result<usize> {
+    let _guard = sync_lock();
+    let mut state = CloudSyncState::load(root)?;
+    if !state.seeded {
+        return Ok(0);
+    }
+    let _ = fleet.flush_on_quit();
+    let outbox = sync::export_changes(&connect(fleet.paths().db())?, state.sent_after)?;
+    if outbox.is_empty() {
+        return Ok(0);
+    }
+    orch.send(user, &outbox)?;
+    state.sent_after = outbox.iter().map(|c| c.seq).max().unwrap_or(state.sent_after);
+    state.save(root)?;
+    Ok(outbox.len())
+}
+
+/// How long the store must be quiet before the outbox goes out.
+pub const PUSH_DEBOUNCE: Duration = Duration::from_secs(2);
+
+/// On a thread of its own: [`push_outbox`] [`PUSH_DEBOUNCE`] after the last
+/// store change, for as long as the store lives. A data root that was never
+/// seeded makes no network call (nor resolves the orchestrator).
+pub fn spawn_outbox_pusher(fleet: std::sync::Arc<FleetStore>) {
+    let mut rx = fleet.subscribe_changes();
+    let root = fleet.paths().root().to_path_buf();
+    let spawned = std::thread::Builder::new().name("tod-cloud-outbox".into()).spawn(move || {
+        use tokio::sync::broadcast::error::{RecvError, TryRecvError};
+        loop {
+            match rx.blocking_recv() {
+                Ok(()) | Err(RecvError::Lagged(_)) => {}
+                Err(RecvError::Closed) => return,
+            }
+            // Wait until a whole debounce passes with no change.
+            loop {
+                std::thread::sleep(PUSH_DEBOUNCE);
+                let mut more = false;
+                loop {
+                    match rx.try_recv() {
+                        Ok(()) | Err(TryRecvError::Lagged(_)) => more = true,
+                        Err(TryRecvError::Empty) => break,
+                        Err(TryRecvError::Closed) => return,
+                    }
+                }
+                if !more {
+                    break;
+                }
+            }
+            if !CloudSyncState::load(&root).is_ok_and(|s| s.seeded) {
+                continue;
+            }
+            let pushed = resolve(&root).and_then(|(orch, user)| push_outbox(&fleet, &root, &orch, &user));
+            match pushed {
+                Ok(0) => {}
+                Ok(n) => tracing::info!("cloud outbox: sent {n} change(s)"),
+                Err(err) => tracing::warn!("cloud outbox push failed: {err:#}"),
+            }
+        }
+    });
+    if let Err(err) = spawned {
+        tracing::warn!("cloud outbox pusher did not start: {err}");
+    }
+}
+
 /// The orchestrator and user this data root syncs with: the URL (from the
 /// state file, [`ORCHESTRATOR_URL_ENV`], or the workspace's
 /// `tod-orchestrator` sandbox) and, for a sandbox URL, the Blaxel token.
@@ -375,7 +467,11 @@ pub fn sync_now(fleet: &FleetStore, root: &Path) -> Result<SyncReport> {
 /// Sync on a thread of its own, when this data root has been seeded (a data
 /// root that never sent a node to the cloud makes no network call). For the
 /// app's start.
+///
+/// Also starts [`spawn_outbox_pusher`], whether or not the root is seeded
+/// yet (it checks before each push).
 pub fn sync_on_start(fleet: std::sync::Arc<FleetStore>) {
+    spawn_outbox_pusher(fleet.clone());
     let root = fleet.paths().root().to_path_buf();
     if !CloudSyncState::load(&root).is_ok_and(|s| s.seeded) {
         return;
@@ -497,16 +593,29 @@ pub fn run_in_cloud(
 
     let record = CloudNode {
         sandbox: name,
-        user,
+        user: user.clone(),
         accepted_at_ms: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0),
     };
-    let mut state = CloudSyncState::load(root)?;
-    state.nodes.insert(node_id.to_string(), record.clone());
-    state.save(root)?;
+    // Recorded in the database, which is synced: the orchestrator needs to
+    // know the node is active (`tod_core::impact`), and its supervisor reads
+    // its context mark there.
+    let node_uuid = uuid::Uuid::parse_str(node_id).with_context(|| format!("node id {node_id}"))?;
+    let _ = fleet.flush_on_quit();
+    tod_store::cloud_nodes::upsert(
+        &connect(fleet.paths().db())?,
+        node_uuid,
+        &record.sandbox,
+        &record.user,
+        record.accepted_at_ms,
+    )?;
+    let _ = fleet.reload_if_stale();
     let _ = sandboxes.save();
+    if let Err(err) = push_outbox(fleet, root, &orch, &user) {
+        progress(&format!("warning: could not send the record to the orchestrator yet: {err:#}"));
+    }
     Ok(record)
 }
 

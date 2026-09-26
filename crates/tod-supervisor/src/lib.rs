@@ -13,12 +13,16 @@
 //! Claude's session files are mirrored as they are written
 //! ([`transcripts`]), and restored first on a new sandbox so its sessions
 //! resume. A `SIGUSR1` (a poke while it runs) is taken at the next stopping
-//! point.
+//! point, and so is a context change the orchestrator marked on the node
+//! ([`context`]): the autopilot stops there, the node is moved back if its
+//! state no longer holds, the conversation's session is ended so the next
+//! turn gets the new context, and the autopilot continues.
 //!
 //! Design: `doc/cloud-sandboxes/autonomous-nodes.md` ("The supervisor and
 //! waiting", "Holding the sandbox awake", "Transcripts").
 
 pub mod agent;
+pub mod context;
 pub mod git;
 pub mod hold;
 pub mod orchestrator;
@@ -81,6 +85,10 @@ struct Hook<'a> {
     node: Uuid,
     workspace: &'a std::path::Path,
     push_branch: bool,
+    /// The last context mark taken.
+    context_seen: i64,
+    /// A newer mark found at the last boundary, to take.
+    context_pending: Option<i64>,
 }
 
 impl StepHook for Hook<'_> {
@@ -97,6 +105,10 @@ impl StepHook for Hook<'_> {
             if let Err(err) = git::push_branch(self.workspace) {
                 tracing::warn!("pushing the branch: {err:#}");
             }
+        }
+        if let Some(at) = context::changed_since(fleet, self.node, self.context_seen)? {
+            self.context_pending = Some(at);
+            return Ok(Some(context::CONTEXT_CHANGED.to_string()));
         }
         Ok(match waits::check(fleet, self.node, self.workspace)? {
             waits::WaitStatus::Clear => None,
@@ -161,10 +173,24 @@ pub fn wake(config: Config) -> Result<Woke> {
         node: config.node,
         workspace: &config.workspace,
         push_branch: config.push_branch,
+        context_seen: context::load_seen(&config.state_dir),
+        context_pending: None,
     };
     let run = Autopilot::new(conversation, config.node, config.budget)
         .map(|pilot| pilot.with_poll_interval(config.poll))
-        .and_then(|mut pilot| pilot.run_with(&store, &mut agent, &mut hook));
+        .and_then(|mut pilot| loop {
+            let outcome = pilot.run_with(&store, &mut agent, &mut hook)?;
+            let Some(at) = hook.context_pending.take() else {
+                break Ok(outcome);
+            };
+            // Stopped to take a context change: take it and go on.
+            let current = pilot.state().current.as_ref().map(|c| c.conversation_id);
+            let taken = context::take(&store, &mut agent, config.node, current)?;
+            tracing::info!(?taken, "took a context change");
+            hook.context_seen = at;
+            context::save_seen(&config.state_dir, at)?;
+            replica.lock().unwrap_or_else(|e| e.into_inner()).push()?;
+        });
 
     // Whatever happened, leave the orchestrator and the branch with it.
     let pushed = replica.lock().unwrap_or_else(|e| e.into_inner()).push();

@@ -149,6 +149,16 @@ impl Wakes {
         fired
     }
 
+    /// Pokes `wake`'s sandbox now; if that fails, records it to be retried
+    /// [`RETRY_MS`] later by the timer.
+    pub fn poke_now(&self, mut wake: Wake) {
+        if let Err(err) = self.poker.poke(&wake) {
+            eprintln!("tod-orchestrator: poke {} ({}): {err:#}; retrying later", wake.sandbox, wake.id);
+            wake.at = now_ms() + RETRY_MS;
+            let _ = self.put(wake).map_err(|e| eprintln!("tod-orchestrator: wakes: {e:#}"));
+        }
+    }
+
     /// Runs the timer forever: fires due wakes, ticks `awake`, and sleeps
     /// until the next wake, a change, or [`MAX_SLEEP`].
     pub fn run_timer(self: &Arc<Self>, clock: &dyn Fn() -> i64, awake: &dyn KeepAwake) {

@@ -1,5 +1,6 @@
 //! Durable persistence for fleet tasks, outline trees, and related storage.
 
+pub mod cloud_nodes;
 pub mod conversation;
 pub mod credentials;
 pub mod decisions;

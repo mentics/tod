@@ -58,20 +58,40 @@ fn seed_inner(users: &Users, user: &str, snapshot: &[u8]) -> Result<Response> {
 
 /// Logged, tagged with the sending `client`, so every other client gets
 /// them through the feed and `client` does not get them back.
-pub fn apply_changes(user: &UserData, body: &[u8], client: &str) -> Response {
-    reply((|| {
+///
+/// With `impact` (the user's name and the wakes), the running cloud nodes
+/// the changes affect are marked and poked ([`crate::impact_handler`]).
+pub fn apply_changes(
+    user: &UserData,
+    body: &[u8],
+    client: &str,
+    impact: Option<(&str, &crate::wakes::Wakes)>,
+) -> Response {
+    let mut affected = Vec::new();
+    let response = reply((|| {
         let changes: Vec<Change> = serde_json::from_slice(body).context("changes: a JSON array of Change")?;
         let _guard = user.sync_lock.lock().unwrap_or_else(|e| e.into_inner());
         let _ = user.store.flush_on_quit();
         let mut conn = connect(user)?;
         let report = sync::apply_changes_from(&mut conn, &changes, client)?;
+        if impact.is_some() {
+            affected = crate::impact_handler::record(&conn, &changes, client, crate::wakes::now_ms())
+                .unwrap_or_else(|err| {
+                    eprintln!("tod-orchestrator: impact: {err:#}");
+                    Vec::new()
+                });
+        }
         let last = sync::last_seq(&conn)?;
         drop(conn);
         let _ = user.store.reload_if_stale();
         let mut v = serde_json::to_value(&report)?;
         v["last_seq"] = last.into();
         Ok(json(&v))
-    })())
+    })());
+    if let Some((name, wakes)) = impact {
+        crate::impact_handler::poke(wakes, name, &affected);
+    }
+    response
 }
 
 /// `client`'s own changes are left out.

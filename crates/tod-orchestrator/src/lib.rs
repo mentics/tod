@@ -20,6 +20,7 @@
 
 pub mod cli;
 pub mod http;
+pub mod impact_handler;
 pub mod sync_backend;
 pub mod transcripts;
 pub mod users;
@@ -143,6 +144,7 @@ impl Server {
                             &data,
                             &request.body,
                             client(request).unwrap_or("unknown"),
+                            Some((&user, &self.wakes)),
                         ),
                         Err(err) => Response::text(500, format!("{err:#}")),
                     },

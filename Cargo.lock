@@ -9122,6 +9122,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "tod-core",
  "tod-sandbox",
  "tod-store",
  "ureq",

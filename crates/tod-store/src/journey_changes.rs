@@ -38,6 +38,8 @@
 //!   that creates the tables.
 //! - `waits` (`tod_store::waits`), created by [`waits_triggers_sql`] in the
 //!   v67 migration for the same reason.
+//! - `cloud_nodes` (`tod_store::cloud_nodes`), created by
+//!   [`cloud_nodes_triggers_sql`] in the v68 migration.
 //!
 //! Deliberately excluded, with reasons:
 //! - `node_plan_step_deps`, `node_plan_step_obligations`, `node_plan_step_notes`
@@ -269,6 +271,11 @@ pub fn decisions_triggers_sql() -> String {
 /// are updated).
 pub fn waits_triggers_sql() -> String {
     simple_id_triggers("waits")
+}
+
+/// Triggers for `cloud_nodes` (one row per node, keyed by `node_id`).
+pub fn cloud_nodes_triggers_sql() -> String {
+    node_keyed_triggers("cloud_nodes")
 }
 
 /// Triggers for a table shaped `(id BLOB PRIMARY KEY, node_id BLOB, ...)`.

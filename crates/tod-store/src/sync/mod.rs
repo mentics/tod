@@ -123,6 +123,7 @@ pub const SYNCED_TABLES: &[&str] = &[
     "conversation_flags",
     "conversation_reports",
     "waits",
+    "cloud_nodes",
 ];
 
 /// The HTTP header a client names itself by to the orchestrator
