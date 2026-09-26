@@ -52,7 +52,8 @@ fn start_orchestrator(base: &Path) -> String {
         // `/cli` is not used here.
         tod_cli: base.join("no-tod-cli"),
         tod_cli_prefix: Vec::new(),
-    });
+    })
+    .unwrap();
     std::thread::spawn(move || server.serve(listener));
     format!("http://127.0.0.1:{port}")
 }
