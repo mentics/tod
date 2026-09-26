@@ -475,18 +475,18 @@ Drawer panels in the Tasks view do not move focus themselves — they emit a `Fo
 
 `crates/tod-ui/src/unified/` is the multi-column workbench for supervising
 many nodes at once: `mod.rs` (`UnifiedView`, `ColumnModel`, column
-placement), `panels/` (`DetailsPanel`, `DecisionsPanel`, `ObligationsPanel`,
+placement), `panels/` (`DetailsPanel`, `TaskPanel`, `ObligationsPanel`,
 `PlanPanel`, `FindingsPanel`, `SettingsPanel`, `TranscriptPanel`), and
 `chat_drawer.rs`. Column 1 is always the node tree; a panel opens in the
 first unpinned column from the one it was opened from, or a new column is
-appended — `ColumnModel::open` is the one place that rule lives. Some panels
-(today, `Decisions`) are singletons: opening one that is already shown
-retargets it in place instead of opening a second copy, and a column the
-user pinned is never unpinned or replaced by that rule. **Alt+Q** /
-**Alt+Shift+Q** jump the tree selection to the next/previous node waiting on
-the user, longest-waiting first (wrapping), and show it in the singleton
-decisions panel, opening and pinning its column if it is not shown yet
-(`UnifiedView::advance_waiting`). What each node is waiting on comes from
+appended, and the same panel already shown is focused instead —
+`ColumnModel::open` is the one place that rule lives; a column the user
+pinned is never unpinned or replaced by it. A task node's default panel is
+the task panel (`doc/ui/task-panel.md`), where its requests are answered.
+**Alt+Q** / **Alt+Shift+Q** jump the tree selection to the next/previous
+node waiting on the user, longest-waiting first (wrapping), and show it in
+its task panel by that rule, with keyboard focus there so the number keys
+answer its top request (`UnifiedView::advance_waiting`). What each node is waiting on comes from
 `tod_core::attention` (`for_node` / `for_nodes`), recomputed off the UI
 thread on every store change by `unified/attention_feed.rs` and pushed into
 the tree with `TaskListView::set_attention`. See `doc/ui/unified-view.md` for

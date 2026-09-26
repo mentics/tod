@@ -491,7 +491,7 @@ impl AgentRuns {
     }
 
     /// Answer a plan step the agent handed back to the user (`HandoffReason`),
-    /// from outside the conversation view — the unified Decisions panel's
+    /// from outside the conversation view — the unified task panel's
     /// `PlanStep` items (`crate::unified::panels::decisions`). Sends the same
     /// message `conversation::side_pane::answer_handoff` sends, to whichever
     /// implementation/verification conversation on the step's node most
@@ -541,7 +541,7 @@ impl AgentRuns {
     }
 
     /// Answer an open review finding, from outside the conversation view —
-    /// the unified Decisions panel's `Finding` items. Mirrors
+    /// the unified task panel's `Finding` items. Mirrors
     /// `conversation::side_pane::respond_to_finding`: a pure status write,
     /// nothing to deliver to an agent (a fix conversation answers findings on
     /// its own initiative instead).

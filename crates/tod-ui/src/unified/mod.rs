@@ -61,7 +61,6 @@ use crate::views::task_list::{TaskListEvent, TaskListView};
 enum HostedPanel {
     Details(Entity<DetailsPanel>),
     Task(Entity<panels::task::TaskPanel>),
-    Decisions(Entity<panels::decisions::DecisionsPanel>),
     Obligations(Entity<panels::obligations::ObligationsPanel>),
     Plan(Entity<panels::plan::PlanPanel>),
     Findings(Entity<panels::findings::FindingsPanel>),
@@ -75,7 +74,6 @@ impl HostedPanel {
         match self {
             Self::Details(e) => e.read(cx).title(cx),
             Self::Task(e) => e.read(cx).title(cx),
-            Self::Decisions(e) => e.read(cx).title(cx),
             Self::Obligations(e) => e.read(cx).title(cx),
             Self::Plan(e) => e.read(cx).title(cx),
             Self::Findings(e) => e.read(cx).title(cx),
@@ -89,7 +87,6 @@ impl HostedPanel {
         match self {
             Self::Details(e) => e.read(cx).focus_handle(cx),
             Self::Task(e) => e.read(cx).focus_handle(cx),
-            Self::Decisions(e) => e.read(cx).focus_handle(cx),
             Self::Obligations(e) => e.read(cx).focus_handle(cx),
             Self::Plan(e) => e.read(cx).focus_handle(cx),
             Self::Findings(e) => e.read(cx).focus_handle(cx),
@@ -103,7 +100,6 @@ impl HostedPanel {
         match self {
             Self::Details(e) => e.entity_id(),
             Self::Task(e) => e.entity_id(),
-            Self::Decisions(e) => e.entity_id(),
             Self::Obligations(e) => e.entity_id(),
             Self::Plan(e) => e.entity_id(),
             Self::Findings(e) => e.entity_id(),
@@ -117,7 +113,6 @@ impl HostedPanel {
         match self {
             Self::Details(e) => e.clone().into_any_element(),
             Self::Task(e) => e.clone().into_any_element(),
-            Self::Decisions(e) => e.clone().into_any_element(),
             Self::Obligations(e) => e.clone().into_any_element(),
             Self::Plan(e) => e.clone().into_any_element(),
             Self::Findings(e) => e.clone().into_any_element(),
@@ -182,7 +177,7 @@ pub struct UnifiedView {
     agent_runs: Entity<AgentRuns>,
     /// The one lifecycle controller the shell shares with the conversation
     /// view and the lifecycle panel (`.claude/CLAUDE.md`): a gate check
-    /// started or waived in either shows in the Decisions panel too.
+    /// started or waived in either shows in the task panel too.
     lifecycle: Entity<LifecycleController>,
     task_list: Entity<TaskListView>,
     columns: ColumnModel,
@@ -355,11 +350,6 @@ impl UnifiedView {
                     self.open_panel(self.default_panel(id), 0, false, window, cx);
                     self.set_chat_focus(Focus::Node(id), cx);
                 }
-                // The decisions panel is a singleton with no target of its own:
-                // it always follows whichever node is current
-                // (`doc/ui/unified-view.md` "Decisions"), so any open column
-                // retargets in place rather than through the placement rule.
-                self.sync_decisions_node(node_id, window, cx);
             }
             // The tree's right-click menu (W4) and the attention badge on a
             // row emit these; map each to the column it opens
@@ -385,10 +375,9 @@ impl UnifiedView {
                     self.open_panel(PanelKind::Plan(id), 0, false, window, cx);
                 }
             }
-            TaskListEvent::OpenDecisions { task_id } => {
+            TaskListEvent::OpenTaskPanel { task_id } => {
                 if let Ok(id) = Uuid::parse_str(task_id) {
-                    self.sync_decisions_node(Some(id), window, cx);
-                    self.open_panel(PanelKind::Decisions, 0, false, window, cx);
+                    self.open_panel(PanelKind::Task(id), 0, false, window, cx);
                 }
             }
             TaskListEvent::OpenSettings { task_id } => {
@@ -422,15 +411,6 @@ impl UnifiedView {
             PanelKind::Task(node_id)
         } else {
             PanelKind::Details(node_id)
-        }
-    }
-
-    fn sync_decisions_node(&mut self, node_id: Option<Uuid>, window: &mut Window, cx: &mut Context<Self>) {
-        for hosted in &self.hosted {
-            if let HostedPanel::Decisions(panel) = &hosted.panel {
-                let panel = panel.clone();
-                panel.update(cx, |panel, cx| panel.set_node(node_id, window, cx));
-            }
         }
     }
 
@@ -468,28 +448,6 @@ impl UnifiedView {
                     });
                 HostedColumn {
                     panel: HostedPanel::Task(panel),
-                    _subscriptions: vec![subscription],
-                }
-            }
-            PanelKind::Decisions => {
-                let node_id = self.task_list.read(cx).selected_node_id();
-                let panel = cx.new(|cx| {
-                    panels::decisions::DecisionsPanel::new(
-                        node_id,
-                        self.fleet.clone(),
-                        self.agent_runs.clone(),
-                        self.lifecycle.clone(),
-                        window,
-                        cx,
-                    )
-                });
-                let panel_id = panel.entity_id();
-                let subscription =
-                    cx.subscribe_in(&panel, window, move |this, _, event: &PanelOpenRequest, window, cx| {
-                        this.route_open_request(panel_id, event, window, cx);
-                    });
-                HostedColumn {
-                    panel: HostedPanel::Decisions(panel),
                     _subscriptions: vec![subscription],
                 }
             }
@@ -649,10 +607,9 @@ impl UnifiedView {
         let ix = self.columns.open(target, from_column, ctrl);
         if ix < before {
             // Details keeps its entity (and any unsaved edit state) when it
-            // is only retargeted to another node. So does the singleton
-            // decisions panel: its callers point it at the node first
-            // (`sync_decisions_node`), and rebuilding it would drop a
-            // half-typed freeform answer on every Alt+Q.
+            // is only retargeted to another node. So does the task panel:
+            // rebuilding it would drop a half-typed freeform answer on
+            // every Alt+Q.
             if let (HostedPanel::Details(panel), PanelKind::Details(node_id)) =
                 (&self.hosted[ix].panel, target)
             {
@@ -664,10 +621,7 @@ impl UnifiedView {
                 // A task column retargeted to another task keeps its entity.
                 let panel = panel.clone();
                 panel.update(cx, |panel, cx| panel.set_node(node_id, cx));
-            } else if !matches!(
-                (&self.hosted[ix].panel, target),
-                (HostedPanel::Decisions(_), PanelKind::Decisions)
-            ) {
+            } else {
                 self.hosted[ix] = self.construct_hosted(target, window, cx);
             }
         } else {
@@ -761,41 +715,27 @@ impl UnifiedView {
     }
 
     /// Alt+Q / Alt+Shift+Q: select the next (or previous) node waiting on
-    /// the user, and show it in the singleton decisions panel, opening and
-    /// pinning its column if it is not shown yet. A column the user pinned
-    /// is never unpinned or replaced: the decisions panel is a singleton
-    /// (`ColumnModel::open`), so it either retargets in place wherever it
-    /// already is, or opens in the first unpinned column (appending one if
-    /// every column is pinned) — the same rule every other panel follows
-    /// (`doc/ui/unified-view.md` "Where a panel opens", "Singleton panels").
+    /// the user in the tree and show it in its default panel (the task
+    /// panel for a task node), with keyboard focus on it so the number keys
+    /// answer its top request at once. The panel opens by the ordinary
+    /// column rule (`ColumnModel::open`): an already-open panel for the node
+    /// is focused, else it replaces the first unpinned column, else a new
+    /// column is appended; a pinned column is never replaced or unpinned
+    /// (`doc/ui/unified-view.md` "Where a panel opens").
     fn advance_waiting(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
         let Some(target) = self.next_waiting_node(forward, cx) else {
             return;
         };
-        let already_shown = self
-            .hosted
-            .iter()
-            .any(|h| matches!(h.panel, HostedPanel::Decisions(_)));
         let task_id = target.to_string();
         self.task_list
             .update(cx, |task_list, cx| task_list.reveal_node(&task_id, window, cx));
-        self.sync_decisions_node(Some(target), window, cx);
-        self.open_panel(PanelKind::Decisions, 0, false, window, cx);
-        if !already_shown {
-            if let Some(ix) = self
-                .hosted
-                .iter()
-                .position(|h| matches!(h.panel, HostedPanel::Decisions(_)))
-            {
-                self.columns.set_pinned(ix, true);
-            }
-        }
-        // `open_panel` -> `ColumnModel::open` already points `focused_index`
-        // at the Decisions column, but keyboard focus itself stays wherever
-        // it was (the tree, or another column) unless we move it: without
-        // this, the number keys that answer a decision do nothing until the
-        // user clicks the panel. Move it the same way `focus_left`/`focus_right`
-        // do, so the very next keypress lands on the panel Alt+Q just opened.
+        // Selecting in the tree opens the default panel too (through
+        // `SelectionChanged`), but that event is delivered later; open it
+        // now so focus can move to it in this same keypress.
+        self.open_panel(self.default_panel(target), 0, false, window, cx);
+        // `ColumnModel::open` points `focused_index` at the column; move
+        // keyboard focus there as well, or the number keys do nothing until
+        // the user clicks the panel.
         self.sync_window_focus(window, cx);
         cx.notify();
     }
@@ -1615,7 +1555,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn alt_q_opens_and_pins_decisions_without_touching_an_already_pinned_column(
+    fn alt_q_opens_the_default_panel_without_touching_an_already_pinned_column(
         cx: &mut TestAppContext,
     ) {
         let fixture = Fixture::new();
@@ -1624,10 +1564,10 @@ mod tests {
         let (view, cx) = open_view(&fixture, cx);
         load_attention(&view, cx);
 
-        // Pin an unrelated column first (Details) so Alt+Q has to route
+        // Pin an unrelated column first (Settings) so Alt+Q has to route
         // around it rather than replace or unpin it.
         view.update_in(cx, |view, window, cx| {
-            view.open_panel(PanelKind::Details(node_id), 0, false, window, cx);
+            view.open_panel(PanelKind::Settings(node_id), 0, false, window, cx);
             view.columns.set_pinned(0, true);
         });
         draw(cx);
@@ -1637,24 +1577,20 @@ mod tests {
         });
         draw(cx);
 
+        let expected = view.read_with(cx, |view, _| view.default_panel(node_id));
         view.read_with(cx, |view, _| {
-            // The pinned Details column is untouched...
+            // The pinned column is untouched...
             assert!(view.columns.is_pinned(0));
-            assert_eq!(view.columns.columns()[0].panel, PanelKind::Details(node_id));
-            // ...and Decisions opened in a new column and was pinned, since
-            // it was not shown anywhere yet.
-            let decisions_ix = view
-                .columns
-                .columns()
-                .iter()
-                .position(|c| c.panel == PanelKind::Decisions)
-                .expect("decisions column opened");
-            assert!(view.columns.is_pinned(decisions_ix));
+            assert_eq!(view.columns.columns()[0].panel, PanelKind::Settings(node_id));
+            // ...and the node's default panel opened in a new column,
+            // focused, and not pinned (the ordinary column rule).
+            let ix = view.columns.focused_index().expect("a column is focused");
+            assert_eq!(view.columns.columns()[ix].panel, expected);
+            assert!(!view.columns.is_pinned(ix));
         });
 
-        // A second Alt+Q press on the same lone waiting node re-targets the
-        // existing (already pinned) Decisions column rather than opening
-        // another one.
+        // A second Alt+Q press on the same lone waiting node focuses the
+        // already open panel rather than opening another one.
         let before = view.read_with(cx, |view, _| view.columns.len());
         view.update_in(cx, |view, window, cx| {
             view.next_waiting(&UnifiedNextWaiting, window, cx);
@@ -1855,60 +1791,35 @@ mod tests {
         view.read_with(cx, |view, _| assert_eq!(view.columns.focused_index(), Some(1)));
     }
 
-    /// Alt+Q must move keyboard focus into the Decisions panel it opens —
-    /// not just point `ColumnModel::focused_index` at it — so the number
-    /// keys that answer the top pending decision work on the very next
-    /// keypress with no click in between (the bug this closes: focus stayed
-    /// on the tree after Alt+Q).
+    /// Alt+Q must move keyboard focus into the panel it opens — not just
+    /// point `ColumnModel::focused_index` at it — so the number keys that
+    /// answer the top request work on the very next keypress with no click
+    /// in between.
     #[gpui::test]
-    fn alt_q_focuses_the_decisions_panel(cx: &mut TestAppContext) {
+    fn alt_q_focuses_the_panel_it_opens(cx: &mut TestAppContext) {
         let fixture = Fixture::new();
         let node_id = fixture.node_id;
         ask_decision(&fixture, node_id, "Focus me?");
         let (view, cx) = open_view(&fixture, cx);
         load_attention(&view, cx);
 
-        view.update_in(cx, |view, window, cx| {
-            view.next_waiting(&UnifiedNextWaiting, window, cx);
-        });
-        draw(cx);
-
-        let decisions_focus = view.read_with(cx, |view, cx| {
-            let ix = view
-                .columns
-                .columns()
-                .iter()
-                .position(|c| c.panel == PanelKind::Decisions)
-                .expect("decisions column opened");
-            view.hosted[ix].panel.focus_handle(cx)
-        });
-        cx.update(|window, _| {
-            assert!(
-                decisions_focus.is_focused(window),
-                "Alt+Q should focus the Decisions panel so the next keypress can answer it"
-            );
-        });
-
-        // Pressing Alt+Q again while focus is already in the Decisions panel
-        // must still work (repeat presses from inside the panel): the
-        // singleton retarget reconstructs the panel entity (`open_panel`),
-        // so re-fetch its (now different) focus handle rather than reusing
-        // the one from before, and check that one is focused.
-        view.update_in(cx, |view, window, cx| {
-            view.next_waiting(&UnifiedNextWaiting, window, cx);
-        });
-        draw(cx);
-        let decisions_focus_again = view.read_with(cx, |view, cx| {
-            let ix = view
-                .columns
-                .columns()
-                .iter()
-                .position(|c| c.panel == PanelKind::Decisions)
-                .expect("decisions column still open");
-            view.hosted[ix].panel.focus_handle(cx)
-        });
-        cx.update(|window, _| {
-            assert!(decisions_focus_again.is_focused(window));
-        });
+        for _ in 0..2 {
+            // The second press comes from inside the panel itself.
+            view.update_in(cx, |view, window, cx| {
+                view.next_waiting(&UnifiedNextWaiting, window, cx);
+            });
+            draw(cx);
+            let focus = view.read_with(cx, |view, cx| {
+                let ix = view.columns.focused_index().expect("a column is focused");
+                assert_eq!(view.columns.columns()[ix].panel.node(), Some(node_id));
+                view.hosted[ix].panel.focus_handle(cx)
+            });
+            cx.update(|window, _| {
+                assert!(
+                    focus.is_focused(window),
+                    "Alt+Q should focus the panel so the next keypress can answer it"
+                );
+            });
+        }
     }
 }

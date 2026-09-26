@@ -1,7 +1,6 @@
 //! The column panels for the unified view. Each module owns one
 //! `PanelKind`'s implementation.
 
-pub mod decisions;
 pub mod details;
 pub mod findings;
 pub mod obligations;

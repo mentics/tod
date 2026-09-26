@@ -99,7 +99,7 @@ fn load(fleet: &FleetStore, node_id: Uuid) -> Loaded {
     }
     loaded.decisions_waiting = fleet
         .read(|conn| tod_core::attention::for_node(conn, node_id))
-        // Everything the Decisions panel lists for the node (blocked plan
+        // Everything the task panel lists for the node (blocked plan
         // steps too), so the count matches the tree's "needs you" badge.
         .map(|attention| attention.items.len())
         .unwrap_or(0);
@@ -501,10 +501,10 @@ impl Render for DetailsPanel {
                     .when(decisions_waiting > 0, |el| {
                         el.child(
                             Button::new("unified-details-open-decisions")
-                                .label(format!("Decisions waiting ({decisions_waiting})"))
+                                .label(format!("Requests waiting ({decisions_waiting})"))
                                 .small()
                                 .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.open(PanelKind::Decisions, cx);
+                                    this.open(PanelKind::Task(node_id), cx);
                                 })),
                         )
                     })

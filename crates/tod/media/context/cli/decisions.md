@@ -18,7 +18,7 @@ in full or as the 8-character prefix listings show.
 
 - The question is one positional argument — quote it.
 - `--option`: repeatable, in the order they should be offered to the user
-  (numbered 1, 2, 3 … in the decisions panel). At least one is required.
+  (numbered 1, 2, 3 … in the task panel). At least one is required.
 - `--evidence`: repeatable `kind:id` links the user can open while
   answering, kind one of `obligation`, `plan_step`, `test_run`,
   `conversation`, `finding`, `node`.

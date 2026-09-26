@@ -85,7 +85,7 @@ pub enum RowAction {
         task_id: String,
     },
     /// The row's attention badge (needs-you count).
-    OpenDecisions {
+    OpenTaskPanel {
         task_id: String,
     },
 }
@@ -273,7 +273,7 @@ impl ListDelegate for TaskListDelegate {
                         MouseButton::Left,
                         cx.listener(move |_, _, _, cx| {
                             cx.stop_propagation();
-                            sink_badge.borrow_mut().push(RowAction::OpenDecisions {
+                            sink_badge.borrow_mut().push(RowAction::OpenTaskPanel {
                                 task_id: task_id_badge.clone(),
                             });
                             cx.notify();

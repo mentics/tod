@@ -16,7 +16,7 @@ use super::model::TaskItem;
 
 /// Build the right-click menu for `task`. `attention_count` is the node's
 /// pending-decision count as last reported by `TaskListView::set_attention`
-/// — "Open decisions (n)" only shows when it is greater than zero.
+/// — "Open requests (n)" only shows when it is greater than zero.
 pub(super) fn build(
     mut menu: PopupMenu,
     task: &TaskItem,
@@ -29,7 +29,7 @@ pub(super) fn build(
     // every entry's click records (`doc/ui/unified-view-plan.md` W4 step 3).
     let mut labels = vec!["Open (E)".to_string()];
     if attention_count > 0 {
-        labels.push(format!("Open decisions ({attention_count})"));
+        labels.push(format!("Open requests ({attention_count})"));
     }
     if task.has_spec {
         labels.push("Obligations (O)".to_string());
@@ -58,12 +58,12 @@ pub(super) fn build(
     ));
 
     if attention_count > 0 {
-        let label = format!("Open decisions ({attention_count})");
+        let label = format!("Open requests ({attention_count})");
         let id = task_id.clone();
         let view = view.clone();
         let presented = presented.clone();
         menu = menu.item(PopupMenuItem::new(label.clone()).on_click(move |_, _window, cx| {
-            open_decisions(&view, &id, &label, &presented, cx);
+            open_task_panel(&view, &id, &label, &presented, cx);
         }));
     }
 
@@ -171,7 +171,7 @@ fn entry(
     })
 }
 
-fn open_decisions(
+fn open_task_panel(
     view: &WeakEntity<TaskListView>,
     task_id: &str,
     label: &str,
@@ -183,7 +183,7 @@ fn open_decisions(
     };
     entity.update(cx, |this, cx| {
         record_action(this, task_id, label, presented, cx);
-        cx.emit(TaskListEvent::OpenDecisions {
+        cx.emit(TaskListEvent::OpenTaskPanel {
             task_id: task_id.to_string(),
         });
     });
