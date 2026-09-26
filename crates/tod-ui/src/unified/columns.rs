@@ -20,6 +20,8 @@ pub enum PanelKind {
     Plan(uuid::Uuid),
     Findings(uuid::Uuid),
     Settings(uuid::Uuid),
+    /// Files changed on the node's branch against its base.
+    Changes(uuid::Uuid),
     /// A single conversation's transcript; the id is the conversation's, not
     /// a node's.
     Transcript(uuid::Uuid),
@@ -35,7 +37,8 @@ impl PanelKind {
             | PanelKind::Obligations(id)
             | PanelKind::Plan(id)
             | PanelKind::Findings(id)
-            | PanelKind::Settings(id) => Some(*id),
+            | PanelKind::Settings(id)
+            | PanelKind::Changes(id) => Some(*id),
             // A transcript's id is its conversation's, not a node's.
             PanelKind::Transcript(_) | PanelKind::Decisions => None,
         }
@@ -293,6 +296,29 @@ mod tests {
         assert_ne!(ix, 0);
         assert_eq!(m.columns()[0].panel, task(3));
         assert_eq!(m.columns()[ix].panel, task(4));
+    }
+
+    #[test]
+    fn changes_panel_targets_its_node_and_opens_beside_the_task() {
+        let mut bytes = [0u8; 16];
+        bytes[15] = 3;
+        let changes = PanelKind::Changes(Uuid::from_bytes(bytes));
+        assert_eq!(changes.node(), task(3).node());
+        assert!(!changes.is_singleton());
+        let mut m = ColumnModel::new();
+        m.open(task(3), 0, false);
+        // Ctrl+click on the task's Changes link opens beside it.
+        assert_eq!(m.open(changes, 0, true), 1);
+        assert_eq!(m.columns()[0].panel, task(3));
+        assert_eq!(m.columns()[1].panel, changes);
+        // Opening it again focuses the same column, not a second copy.
+        assert_eq!(m.open(changes, 0, true), 1);
+        assert_eq!(m.columns().len(), 2);
+        // A plain click replaces the task column, by the column rule.
+        let mut m = ColumnModel::new();
+        m.open(task(3), 0, false);
+        assert_eq!(m.open(changes, 0, false), 0);
+        assert_eq!(m.columns()[0].panel, changes);
     }
 
     #[test]

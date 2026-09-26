@@ -62,6 +62,37 @@ pub fn open_code_editor_for_node(
     Ok(normalize_launch_path(&cwd))
 }
 
+/// Open one file, `rel` (relative to `dir`, a node's Files directory), in
+/// the first available code editor. A file in a sandbox opens in Zed over
+/// the sandbox; one in a dev container cannot be opened from here.
+pub fn open_file_in_code_editor(
+    fleet: &FleetStore,
+    dir: &crate::fleet::Workdir,
+    rel: &str,
+) -> Result<()> {
+    let editor = code_editors()
+        .iter()
+        .copied()
+        .find(|editor| editor.is_available())
+        .context("no code editor found on this machine")?;
+    match dir.join(rel) {
+        crate::fleet::Workdir::Host(path) => editor
+            .open(&path)
+            .with_context(|| format!("open {} in {}", path.display(), editor.label())),
+        crate::fleet::Workdir::Container { container, path } => anyhow::bail!(
+            "{path} is inside dev container {container}; open it from an editor attached to the container"
+        ),
+        crate::fleet::Workdir::Sandbox { sandbox, path } => {
+            if editor.id() != zed::ZedEditor.id() {
+                anyhow::bail!("{path} is in sandbox {sandbox}; only Zed opens a sandbox");
+            }
+            let url = zed::sandbox_url(&sandbox, &path);
+            zed::spawn_zed_url(&url, fleet.paths().root())
+                .with_context(|| format!("open {url} in Zed"))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -42,6 +42,7 @@ use tod_store::conversation::Focus;
 use crate::ui::agent_runs::AgentRuns;
 use crate::unified::columns::PanelKind;
 use crate::unified::panel::{ColumnPanel, PanelOpenRequest};
+use crate::unified::panels::changes::{ChangesWatch, HasChangesWatch};
 
 /// Loaded, denormalized data for the task panel's header. Re-fetched
 /// whenever the store changes.
@@ -142,11 +143,19 @@ pub struct TaskPanel {
     focus_handle: FocusHandle,
     header: TaskHeader,
     pending_refresh: bool,
+    /// T8: the files-changed count behind the Changes link.
+    changes: ChangesWatch,
     _poll: gpui::Task<()>,
     agent_runs: Entity<AgentRuns>,
     runner: RunnerLine,
     _runner_tick: gpui::Task<()>,
     _agent_runs_sub: Subscription,
+}
+
+impl HasChangesWatch for TaskPanel {
+    fn changes_watch(&mut self) -> &mut ChangesWatch {
+        &mut self.changes
+    }
 }
 
 impl TaskPanel {
@@ -201,12 +210,14 @@ impl TaskPanel {
                 };
             }
         });
+        let changes = ChangesWatch::new(node_id, fleet.clone(), cx);
         let mut panel = Self {
             node_id,
             fleet,
             focus_handle: cx.focus_handle(),
             header,
             pending_refresh: false,
+            changes,
             _poll,
             agent_runs,
             runner: RunnerLine::default(),
@@ -215,6 +226,7 @@ impl TaskPanel {
         };
         panel.track_run_since(cx);
         panel.refresh_runner(cx);
+        ChangesWatch::recompute(&mut panel, node_id, cx);
         panel
     }
 
@@ -232,6 +244,7 @@ impl TaskPanel {
         self.runner = RunnerLine::default();
         self.track_run_since(cx);
         self.refresh_runner(cx);
+        ChangesWatch::recompute(self, node_id, cx);
         self.reload(cx);
     }
 
@@ -314,7 +327,10 @@ impl TaskPanel {
             .gap_3()
             .child(obligations)
             .child(plan)
-            // T8: the Changes link (files changed) goes here.
+            // Only a current count: none while unknown or recomputing.
+            .children(self.changes.state.label().map(|label| {
+                self.artifact_link("unified-task-changes", label, PanelKind::Changes(node_id), cx)
+            }))
             .into_any_element()
     }
 

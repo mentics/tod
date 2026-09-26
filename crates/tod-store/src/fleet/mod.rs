@@ -1,5 +1,6 @@
 //! Fleet persistence — durable on-machine storage for tasks, agents, and related entities.
 
+pub mod changes;
 pub mod cli_relay;
 pub mod code_editor;
 pub mod command_log;
