@@ -9,8 +9,8 @@
 //!    the column rule (`render_artifacts`). The Changes link (T8) joins this
 //!    strip.
 //! 3. **Runner line** (T2) — `render_runner_line`, a placeholder for now.
-//! 4. **Requests** (T4) — the only part that scrolls; `render_requests`,
-//!    a placeholder for now.
+//! 4. **Requests** (T4) — the only part that scrolls: the shared
+//!    [`crate::unified::requests::Requests`], oldest first, no heading.
 //! 5. **Answered drawer** (T5) — anchored to the bottom;
 //!    `render_answered_drawer`, a placeholder for now.
 //!
@@ -43,6 +43,11 @@ use crate::ui::agent_runs::AgentRuns;
 use crate::unified::columns::PanelKind;
 use crate::unified::panel::{ColumnPanel, PanelOpenRequest};
 use crate::unified::panels::changes::{ChangesWatch, HasChangesWatch};
+
+// T4: the requests.
+use gpui::AppContext as _;
+use crate::unified::requests::{Requests, bind_request_actions};
+use crate::views::lifecycle_control::LifecycleController;
 
 /// Loaded, denormalized data for the task panel's header. Re-fetched
 /// whenever the store changes.
@@ -150,6 +155,9 @@ pub struct TaskPanel {
     runner: RunnerLine,
     _runner_tick: gpui::Task<()>,
     _agent_runs_sub: Subscription,
+    /// T4: what the task is waiting on the user for.
+    pub(crate) requests: Entity<Requests>,
+    _requests_subs: Vec<Subscription>,
 }
 
 impl HasChangesWatch for TaskPanel {
@@ -163,7 +171,8 @@ impl TaskPanel {
         node_id: Uuid,
         fleet: Arc<FleetStore>,
         agent_runs: Entity<AgentRuns>,
-        _window: &mut Window,
+        lifecycle: Entity<LifecycleController>,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         // Store changes mark the header stale; it reloads on the next render
@@ -211,10 +220,21 @@ impl TaskPanel {
             }
         });
         let changes = ChangesWatch::new(node_id, fleet.clone(), cx);
+        let focus_handle = cx.focus_handle();
+        let requests = {
+            let (fleet, agent_runs, focus) = (fleet.clone(), agent_runs.clone(), focus_handle.clone());
+            cx.new(|cx| Requests::new(Some(node_id), fleet, agent_runs, lifecycle, focus, window, cx))
+        };
+        let _requests_subs = vec![
+            cx.subscribe(&requests, |_, _, event: &PanelOpenRequest, cx| cx.emit(event.clone())),
+            cx.observe(&requests, |_, _, cx| cx.notify()),
+        ];
         let mut panel = Self {
             node_id,
             fleet,
-            focus_handle: cx.focus_handle(),
+            focus_handle,
+            requests,
+            _requests_subs,
             header,
             pending_refresh: false,
             changes,
@@ -245,6 +265,7 @@ impl TaskPanel {
         self.track_run_since(cx);
         self.refresh_runner(cx);
         ChangesWatch::recompute(self, node_id, cx);
+        self.requests.update(cx, |requests, cx| requests.set_node(Some(node_id), cx));
         self.reload(cx);
     }
 
@@ -477,10 +498,11 @@ impl TaskPanel {
         Some(line.id("unified-task-runner").into_any_element())
     }
 
-    /// T4: the requests waiting on the user — the only part that scrolls.
-    /// Not implemented yet.
+    /// T4: the requests waiting on the user, oldest first — the only part
+    /// that scrolls. Rendering, answering, and keys are the shared
+    /// [`Requests`]'s.
     fn render_requests(&self, _cx: &mut Context<Self>) -> Option<AnyElement> {
-        None
+        Some(div().px_3().pb_3().child(self.requests.clone()).into_any_element())
     }
 
     /// T5: the Answered drawer, anchored to the bottom of the column.
@@ -520,8 +542,7 @@ impl Render for TaskPanel {
         let requests = self.render_requests(cx);
         let drawer = self.render_answered_drawer(cx);
 
-        div()
-            .id("unified-task-panel")
+        bind_request_actions(div().id("unified-task-panel"), &self.requests)
             .track_focus(&self.focus_handle)
             .flex()
             .flex_col()
@@ -585,10 +606,11 @@ mod tests {
             Arc::new(std::sync::Mutex::new(Box::new(tod_agent::MockAgentProvider::new())));
         let agent_runs = cx.new(|_| AgentRuns::new(fixture.store.clone(), agent));
         let (node, fleet, runs_in) = (fixture.node_id, fixture.store.clone(), agent_runs.clone());
+        let lifecycle = cx.new(|_| LifecycleController::new(fixture.store.clone()));
         let slot = Rc::new(RefCell::new(None));
         let slot_in = slot.clone();
         let (_, cx) = cx.add_window_view(move |window, cx| {
-            let view = cx.new(|cx| TaskPanel::new(node, fleet, runs_in, window, cx));
+            let view = cx.new(|cx| TaskPanel::new(node, fleet, runs_in, lifecycle, window, cx));
             *slot_in.borrow_mut() = Some(view.clone());
             gpui_component::Root::new(view, window, cx)
         });
@@ -632,5 +654,84 @@ mod tests {
         // Stop while the driver is away marks the slot to cancel.
         view.update(cx, |view, cx| view.stop_runner(slot_id, cx));
         assert!(agent_runs.update(cx, |registry, _| registry.take_cancel(slot_id)));
+    }
+
+    /// T4: a pending decision shows among the task panel's requests, and
+    /// the number key answers it through the shared module.
+    #[gpui::test]
+    fn a_pending_decision_renders_and_can_be_answered(cx: &mut gpui::TestAppContext) {
+        use crate::views::rows::fixture::Fixture;
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        use tod_store::decisions::DecisionRepo;
+        use tod_store::interview::{ACTOR_USER, InterviewCommand};
+
+        let fixture = Fixture::new();
+        let decision_id = fixture
+            .store
+            .interview(
+                ACTOR_USER,
+                InterviewCommand::AskDecision {
+                    node_id: fixture.node_id,
+                    conversation_id: None,
+                    protocol: None,
+                    decision: tod_store::decisions::NewDecision {
+                        question: "Round per line or per invoice?".to_string(),
+                        options: vec!["per line".to_string(), "per invoice".to_string()],
+                        evidence: Vec::new(),
+                        ..Default::default()
+                    },
+                },
+            )
+            .unwrap()
+            .get("id")
+            .and_then(|v| v.as_str())
+            .and_then(|raw| Uuid::parse_str(raw).ok())
+            .unwrap();
+
+        cx.update(gpui_component::init);
+        let agent: crate::interview::agent::SharedAgent =
+            Arc::new(std::sync::Mutex::new(Box::new(tod_agent::MockAgentProvider::new())));
+        let agent_runs = cx.new(|_| AgentRuns::new(fixture.store.clone(), agent));
+        let lifecycle = cx.new(|_| LifecycleController::new(fixture.store.clone()));
+        let (node, fleet) = (fixture.node_id, fixture.store.clone());
+        let slot = Rc::new(RefCell::new(None));
+        let slot_in = slot.clone();
+        let (_, cx) = cx.add_window_view(move |window, cx| {
+            let view = cx.new(|cx| TaskPanel::new(node, fleet, agent_runs, lifecycle, window, cx));
+            *slot_in.borrow_mut() = Some(view.clone());
+            gpui_component::Root::new(view, window, cx)
+        });
+        let view: Entity<TaskPanel> = slot.borrow_mut().take().unwrap();
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+
+        let requests = view.read_with(cx, |view, _| view.requests.clone());
+        requests.read_with(cx, |requests, _| {
+            assert_eq!(requests.items().len(), 1);
+            assert_eq!(requests.items()[0].id, decision_id);
+        });
+
+        // Answer with the panel gone: T8's `ChangesWatch` awaits store
+        // changes directly, which the test scheduler rejects as a wake from
+        // the store's own thread. The answer path is the shared module's.
+        drop(view);
+        cx.update(|window, _| window.remove_window());
+        cx.run_until_parked();
+        let decision = requests.read_with(cx, |requests, _| requests.loaded.pending[0].clone());
+        requests.update(cx, |requests, cx| requests.click_option(decision, 2, cx));
+        cx.run_until_parked();
+
+        let answers = fixture
+            .store
+            .read(|conn| DecisionRepo::new(conn).get_with_answers(decision_id))
+            .unwrap()
+            .unwrap()
+            .answers;
+        assert_eq!(answers.len(), 1);
+        assert_eq!(answers[0].option, Some(2));
+        requests.read_with(cx, |requests, _| assert!(requests.items().is_empty()));
     }
 }

@@ -12,6 +12,7 @@ mod chat_drawer;
 mod columns;
 mod panel;
 pub mod panels;
+pub mod requests;
 mod resize;
 pub mod status_label;
 
@@ -146,7 +147,7 @@ pub const UNIFIED_CONTEXT: &str = "Unified";
 pub fn register_unified_keyboard_bindings(cx: &mut App) {
     bind_pane_nav(cx, UNIFIED_CONTEXT);
     panels::details::register_details_panel_keyboard_bindings(cx);
-    panels::decisions::register_decisions_panel_keyboard_bindings(cx);
+    requests::register_request_keyboard_bindings(cx);
     let context = Some(key_context::excluding_input(UNIFIED_CONTEXT));
     cx.bind_keys([
         KeyBinding::new("alt-w", UnifiedTogglePinFocused, context),
@@ -459,7 +460,7 @@ impl UnifiedView {
             }
             PanelKind::Task(node_id) => {
                 let panel =
-                    cx.new(|cx| panels::task::TaskPanel::new(node_id, self.fleet.clone(), self.agent_runs.clone(), window, cx));
+                    cx.new(|cx| panels::task::TaskPanel::new(node_id, self.fleet.clone(), self.agent_runs.clone(), self.lifecycle.clone(), window, cx));
                 let panel_id = panel.entity_id();
                 let subscription =
                     cx.subscribe_in(&panel, window, move |this, _, event: &PanelOpenRequest, window, cx| {
