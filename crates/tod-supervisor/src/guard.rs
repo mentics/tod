@@ -331,6 +331,7 @@ mod tests {
             resume_session_id: None,
             opening: None,
             message: "go".into(),
+            images: Vec::new(),
             purpose: Default::default(),
             env: Vec::new(),
             environment: AgentEnvironment::Host,

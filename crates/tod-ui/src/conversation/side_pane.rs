@@ -197,6 +197,7 @@ impl ConversationView {
         };
         self.deliver(
             &handoff_answer_message(&step, &answer),
+            Vec::new(),
             super::AfterSend::Handoff(step.id),
             cx,
         );

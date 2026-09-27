@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Current fleet schema epoch stored in `PRAGMA user_version`.
-pub const CURRENT_USER_VERSION: i32 = 72;
+pub const CURRENT_USER_VERSION: i32 = 73;
 
 const BUSY_TIMEOUT_MS: i64 = 5000;
 
@@ -446,6 +446,11 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
         conn.execute_batch(&crate::journey_changes::request_feedback_triggers_sql())?;
         conn.pragma_update(None, "user_version", 72)?;
     }
+    if version < 73 {
+        // Images the user attached to a message.
+        ensure_turn_attachments(conn)?;
+        conn.pragma_update(None, "user_version", 73)?;
+    }
     // Other branches (the task panel) numbered their own steps 66–67 at the
     // same time as 66–70 above, so a store may be past a version without
     // having these. Every one is idempotent: make sure of them all.
@@ -460,6 +465,7 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
     ensure_decisions_reason(conn)?;
     conn.execute_batch(crate::request_feedback::CREATE_TABLE)?;
     conn.execute_batch(&crate::journey_changes::request_feedback_triggers_sql())?;
+    ensure_turn_attachments(conn)?;
     crate::sync::install(conn)?;
     // Idempotent and cheap — keeps the gate criteria catalog's wording in
     // sync with the source on every startup, not just the migration that
@@ -896,6 +902,20 @@ fn migrate_v59_to_v60(conn: &Connection) -> Result<()> {
         .exists([])?;
     if !present {
         conn.execute_batch("ALTER TABLE conversation_turns ADD COLUMN sent_context TEXT;")?;
+    }
+    Ok(())
+}
+
+/// `conversation_turns.attachments`: the images the user attached to a
+/// message (JSON `crate::conversation::TurnAttachment`s, null when none); the
+/// files themselves are under the data root. A no-op when the column is
+/// already there.
+fn ensure_turn_attachments(conn: &Connection) -> Result<()> {
+    let present = conn
+        .prepare("SELECT 1 FROM pragma_table_info('conversation_turns') WHERE name = 'attachments'")?
+        .exists([])?;
+    if !present {
+        conn.execute_batch("ALTER TABLE conversation_turns ADD COLUMN attachments TEXT;")?;
     }
     Ok(())
 }

@@ -234,6 +234,7 @@ pub fn wake(config: Config) -> Result<Woke> {
         data_root: data_root.clone(),
         media: config.media.clone(),
         launch: AgentLaunchOptions::for_platform(AgentPlatform::Claude),
+        settings_path: None,
         context: InterviewContextSettings::default(),
     };
     let mut agent = Guarded::new(

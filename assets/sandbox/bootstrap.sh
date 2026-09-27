@@ -136,10 +136,12 @@ if [ "$AGENTS" = 1 ]; then
         install_node
         node_ok || { echo "bootstrap: Node.js install failed" >&2; exit 1; }
     fi
-    if ! have claude-code-acp; then
-        echo "bootstrap: installing @zed-industries/claude-code-acp"
+    # The adapter, renamed from @zed-industries/claude-code-acp, whose
+    # bundled Claude Code no longer updates (its `sonnet` is Sonnet 4.5).
+    if ! have claude-agent-acp; then
+        echo "bootstrap: installing @agentclientprotocol/claude-agent-acp"
         # Into /usr/local, on PATH, whichever npm this is.
-        npm install -g --silent --prefix /usr/local @zed-industries/claude-code-acp
+        npm install -g --silent --prefix /usr/local @agentclientprotocol/claude-agent-acp
     fi
     # `claude` itself: signing in (`claude /login`, once per sandbox) and
     # terminal agents.

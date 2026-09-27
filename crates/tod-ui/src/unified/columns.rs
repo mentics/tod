@@ -70,6 +70,15 @@ impl ColumnModel {
         Self::default()
     }
 
+    /// Exactly `columns`, with focus on the node tree: what Back returns
+    /// the view to (`UnifiedView::restore_place`).
+    pub fn from_columns(columns: Vec<Column>) -> Self {
+        Self {
+            columns,
+            focused: None,
+        }
+    }
+
     pub fn columns(&self) -> &[Column] {
         &self.columns
     }

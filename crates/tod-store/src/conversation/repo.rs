@@ -244,7 +244,8 @@ impl<'a> ConversationRepo<'a> {
 
     pub fn turns(&self, conversation_id: Uuid) -> Result<Vec<Turn>> {
         let mut stmt = self.conn.prepare(
-            "SELECT seq, role, body, parts, sent_context, created_at FROM conversation_turns
+            "SELECT seq, role, body, parts, sent_context, attachments, created_at
+             FROM conversation_turns
              WHERE conversation_id = ?1 ORDER BY seq",
         )?;
         let rows = stmt
@@ -262,7 +263,8 @@ impl<'a> ConversationRepo<'a> {
         to_seq: i64,
     ) -> Result<Vec<Turn>> {
         let mut stmt = self.conn.prepare(
-            "SELECT seq, role, body, parts, sent_context, created_at FROM conversation_turns
+            "SELECT seq, role, body, parts, sent_context, attachments, created_at
+             FROM conversation_turns
              WHERE conversation_id = ?1 AND seq BETWEEN ?2 AND ?3 ORDER BY seq",
         )?;
         let rows = stmt
@@ -275,7 +277,7 @@ impl<'a> ConversationRepo<'a> {
     }
 
     pub fn append_turn(&self, conversation_id: Uuid, role: TurnRole, body: &str) -> Result<Turn> {
-        self.append_turn_with_parts_and_context(conversation_id, role, body, &[], None)
+        self.append_turn_with_parts_and_context(conversation_id, role, body, &[], None, &[])
     }
 
     /// [`Self::append_turn`] for an agent reply that came with its parts.
@@ -286,13 +288,14 @@ impl<'a> ConversationRepo<'a> {
         body: &str,
         parts: &[ReplyPart],
     ) -> Result<Turn> {
-        self.append_turn_with_parts_and_context(conversation_id, role, body, parts, None)
+        self.append_turn_with_parts_and_context(conversation_id, role, body, parts, None, &[])
     }
 
     /// [`Self::append_turn_with_parts`], also recording the part of what was
     /// sent to the agent that is not the user's own text (the protocol delta
     /// prepended to a user turn). `None` for a continuation turn, whose body
-    /// already equals what was sent, and for every non-user turn.
+    /// already equals what was sent, and for every non-user turn. A user turn
+    /// also records the images attached to it.
     pub fn append_turn_with_parts_and_context(
         &self,
         conversation_id: Uuid,
@@ -300,6 +303,7 @@ impl<'a> ConversationRepo<'a> {
         body: &str,
         parts: &[ReplyPart],
         sent_context: Option<&str>,
+        attachments: &[TurnAttachment],
     ) -> Result<Turn> {
         let now = now_ms();
         let seq: i64 = self.conn.query_row(
@@ -309,8 +313,9 @@ impl<'a> ConversationRepo<'a> {
         )?;
         self.conn.execute(
             "INSERT INTO conversation_turns
-                (id, conversation_id, seq, role, body, parts, sent_context, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                (id, conversation_id, seq, role, body, parts, sent_context, attachments,
+                 created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 uuid_to_blob(Uuid::new_v4()),
                 uuid_to_blob(conversation_id),
@@ -321,6 +326,9 @@ impl<'a> ConversationRepo<'a> {
                     .then(|| serde_json::to_string(parts))
                     .transpose()?,
                 sent_context,
+                (!attachments.is_empty())
+                    .then(|| serde_json::to_string(attachments))
+                    .transpose()?,
                 now
             ],
         )?;
@@ -331,6 +339,7 @@ impl<'a> ConversationRepo<'a> {
             body: body.to_string(),
             parts: parts.to_vec(),
             sent_context: sent_context.map(str::to_string),
+            attachments: attachments.to_vec(),
             created_at: now,
         })
     }
@@ -495,7 +504,15 @@ impl<'a> ConversationRepo<'a> {
     }
 }
 
-type RawTurnRow = (i64, String, String, Option<String>, Option<String>, i64);
+type RawTurnRow = (
+    i64,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    i64,
+);
 
 fn read_turn_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawTurnRow> {
     Ok((
@@ -504,14 +521,18 @@ fn read_turn_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawTurnRow> {
         row.get::<_, String>(2)?,
         row.get::<_, Option<String>>(3)?,
         row.get::<_, Option<String>>(4)?,
-        row.get::<_, i64>(5)?,
+        row.get::<_, Option<String>>(5)?,
+        row.get::<_, i64>(6)?,
     ))
 }
 
 fn parse_turn_row(row: RawTurnRow) -> Result<Turn> {
-    let (seq, role, body, parts, sent_context, created_at) = row;
+    let (seq, role, body, parts, sent_context, attachments, created_at) = row;
     // Parts are for display; a row that does not parse shows its body.
     let parts = parts
+        .and_then(|json| serde_json::from_str(&json).ok())
+        .unwrap_or_default();
+    let attachments = attachments
         .and_then(|json| serde_json::from_str(&json).ok())
         .unwrap_or_default();
     Ok(Turn {
@@ -520,6 +541,7 @@ fn parse_turn_row(row: RawTurnRow) -> Result<Turn> {
         body,
         parts,
         sent_context,
+        attachments,
         created_at,
     })
 }
