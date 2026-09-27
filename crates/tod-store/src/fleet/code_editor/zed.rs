@@ -1,6 +1,6 @@
 //! Zed code editor plugin.
 
-use crate::fleet::code_editor::CodeEditor;
+use crate::fleet::code_editor::{CodeEditor, CodeLocation};
 use crate::fleet::terminal::path_util::normalize_launch_path;
 use anyhow::{Context, Result, bail};
 use std::ffi::OsString;
@@ -10,6 +10,17 @@ use std::process::{Command, Stdio};
 /// CLI args for opening a workspace in Zed (focus-or-open via `--classic`).
 pub fn zed_open_args(cwd: &Path) -> Vec<String> {
     vec!["--classic".into(), cwd.display().to_string()]
+}
+
+/// CLI args for opening `file` at `location`'s position. With `root`, the
+/// file opens in that workspace: Zed reuses a window that already has it.
+pub fn zed_location_args(root: Option<&Path>, file: &Path, location: &CodeLocation) -> Vec<String> {
+    let mut args = vec!["--classic".to_string()];
+    if let Some(root) = root {
+        args.push(root.display().to_string());
+    }
+    args.push(location.with_position(&file.display().to_string()));
+    args
 }
 
 /// Candidate binary names to try on PATH (order matters).
@@ -202,12 +213,61 @@ pub fn open_in_container(
     };
     // The file goes to a window whose remote project holds it, so the
     // folder's call has to have handed off to Zed first.
+    let before = zed_connections(&exec);
     let mut child = spawn_zed_child(&[folder_url], &zed_env(data_root)?)?;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     while child.try_wait()?.is_none() && std::time::Instant::now() < deadline {
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
+    // The CLI returns before Zed has connected, and a file sent before then
+    // opens as a project of its own. A folder already open with Zed still
+    // connected only comes to the front, with no new connection to wait for.
+    let key = format!("{}:{folder}", exec.id);
+    let mut opened = opened_folders().lock().unwrap_or_else(|e| e.into_inner());
+    if !(opened.contains(&key) && before.is_some_and(|n| n > 0)) {
+        wait_for_new_connection(&exec, before);
+    }
+    opened.insert(key);
+    drop(opened);
     spawn_zed_url(&container_url(&user, host, path, position), data_root)
+}
+
+/// Container folders tod has opened in Zed during this run.
+fn opened_folders() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
+    static OPENED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    OPENED.get_or_init(Default::default)
+}
+
+/// How many Zed clients are connected to the container: its remote server
+/// runs one `proxy` per connection. `None` when it cannot tell.
+fn zed_connections(exec: &tod_agent::devcontainer::ContainerExec) -> Option<usize> {
+    let script = "for f in /proc/[0-9]*/cmdline; do tr '\\0' ' ' < \"$f\" 2>/dev/null; echo; done \
+                  | grep -c '[z]ed-remote-server.*proxy'";
+    let out = exec.output("/", "sh", &["-c", script]).ok()?;
+    // grep -c exits 1 when it counts none.
+    String::from_utf8_lossy(&out.stdout).trim().parse().ok()
+}
+
+/// Wait until Zed has a connection to the container it did not have
+/// `before`: long when it has none (the first connect installs Zed's
+/// server), briefly otherwise.
+fn wait_for_new_connection(exec: &tod_agent::devcontainer::ContainerExec, before: Option<usize>) {
+    use std::time::{Duration, Instant};
+    let Some(before) = before else {
+        std::thread::sleep(Duration::from_secs(3));
+        return;
+    };
+    let limit = if before == 0 { 120 } else { 10 };
+    let deadline = Instant::now() + Duration::from_secs(limit);
+    while Instant::now() < deadline {
+        if zed_connections(exec).is_some_and(|now| now > before) {
+            // Let the new window take the project before the file arrives.
+            std::thread::sleep(Duration::from_secs(1));
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
 }
 
 pub fn spawn_zed_url(url: &str, data_root: &Path) -> Result<()> {
@@ -227,6 +287,7 @@ fn spawn_zed_child(args: &[String], env: &[(String, OsString)]) -> Result<std::p
              Windows: typically %LOCALAPPDATA%\\Programs\\Zed\\bin)."
         )
     })?;
+    allow_foreground();
     Command::new(&bin)
         .args(args)
         .envs(env.iter().map(|(k, v)| (k, v)))
@@ -235,6 +296,18 @@ fn spawn_zed_child(args: &[String], env: &[(String, OsString)]) -> Result<std::p
         .stderr(Stdio::null())
         .spawn()
         .with_context(|| format!("spawn `{} {}`", bin.display(), args.join(" ")))
+}
+
+/// Let the Zed window come to the front. The CLI hands the request to the
+/// running Zed, a process Windows would otherwise not let take the foreground
+/// from tod, so its window would only flash in the taskbar.
+fn allow_foreground() {
+    #[cfg(windows)]
+    {
+        use windows::Win32::UI::WindowsAndMessaging::{ASFW_ANY, AllowSetForegroundWindow};
+        // Fails harmlessly when tod is not in the foreground itself.
+        let _ = unsafe { AllowSetForegroundWindow(ASFW_ANY) };
+    }
 }
 
 /// Where Zed's `ssh`, `scp`, and `sftp` stand-ins live, under the data root.
@@ -318,6 +391,14 @@ impl CodeEditor for ZedEditor {
     fn open(&self, dir: &Path) -> Result<()> {
         spawn_zed(dir)
     }
+
+    fn open_location(&self, root: Option<&Path>, file: &Path, location: &CodeLocation) -> Result<()> {
+        let env = crate::paths::TodPaths::discover()
+            .ok()
+            .and_then(|paths| zed_env(paths.data_root()).ok())
+            .unwrap_or_default();
+        spawn_zed_with(&zed_location_args(root, file, location), &env)
+    }
 }
 
 #[cfg(test)]
@@ -393,6 +474,26 @@ mod tests {
         let exec = tod_agent::devcontainer::ContainerExec::connect(&container).unwrap();
         let user = exec.user.clone().unwrap_or_else(|| "root".into());
         tod_agent::devcontainer::prepare_sshd(&exec.id, &user, &key).unwrap();
+    }
+
+    #[test]
+    fn location_args_open_the_file_in_its_workspace() {
+        let location = CodeLocation::parse("src/main.rs:6:4").unwrap();
+        let root = PathBuf::from("/w/demo");
+        let file = root.join("src/main.rs");
+        assert_eq!(
+            zed_location_args(Some(&root), &file, &location),
+            vec![
+                "--classic".to_string(),
+                root.display().to_string(),
+                format!("{}:6:4", file.display()),
+            ]
+        );
+        let bare = CodeLocation::parse("/w/x.rs").unwrap();
+        assert_eq!(
+            zed_location_args(None, Path::new("/w/x.rs"), &bare),
+            vec!["--classic".to_string(), "/w/x.rs".to_string()]
+        );
     }
 
     #[test]

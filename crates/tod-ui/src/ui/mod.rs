@@ -4,6 +4,7 @@ pub mod agent_runs;
 pub mod agent_conversation;
 pub mod agent_permission;
 pub mod app_nav;
+pub mod code_links;
 pub mod item_list;
 pub mod journey;
 pub mod key_context;

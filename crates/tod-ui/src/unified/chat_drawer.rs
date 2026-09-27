@@ -164,7 +164,7 @@ impl ChatDrawer {
         self.conversation_id
     }
 
-    #[cfg(test)]
+    /// What the drawer is about.
     pub fn focus(&self) -> Focus {
         self.focus
     }

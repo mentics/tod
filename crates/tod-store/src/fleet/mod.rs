@@ -36,7 +36,10 @@ mod test_util;
 #[cfg(test)]
 mod tests;
 
-pub use code_editor::{CodeEditor, code_editor, code_editors, open_code_editor_for_node};
+pub use code_editor::{
+    CodeEditor, CodeLocation, code_editor, code_editors, find_code_refs, open_code_editor_for_node,
+    open_code_location,
+};
 pub use command_log::{CommandEntry, CommandLog};
 pub use launch::FleetLaunchError;
 pub use migration::{FleetMigrationError, HeldWritesApplyResult, MigrationMode};
