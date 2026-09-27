@@ -14,6 +14,7 @@
 pub mod agent;
 pub mod blaxel;
 pub mod config;
+pub mod edge;
 pub mod node;
 pub mod orchestrator;
 pub mod provision;

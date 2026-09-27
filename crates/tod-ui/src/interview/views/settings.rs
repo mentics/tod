@@ -33,7 +33,7 @@ const SIDEBAR_MIN: f32 = 140.0;
 const PANEL_MIN: f32 = 320.0;
 const SETTINGS_CONTEXT: &str = "Settings";
 
-const SECTIONS: [SettingsSection; 7] = [
+const SECTIONS: [SettingsSection; 8] = [
     SettingsSection::Agents,
     SettingsSection::QuestionMaker,
     SettingsSection::AnswerProcessor,
@@ -41,6 +41,7 @@ const SECTIONS: [SettingsSection; 7] = [
     SettingsSection::CloudSandboxes,
     SettingsSection::Logging,
     SettingsSection::Journeys,
+    SettingsSection::Advanced,
 ];
 
 /// Spec §9.1's first warning callout, verbatim.
@@ -115,6 +116,7 @@ enum SettingsSection {
     CloudSandboxes,
     Logging,
     Journeys,
+    Advanced,
 }
 
 impl SettingsSection {
@@ -127,6 +129,7 @@ impl SettingsSection {
             Self::CloudSandboxes => "Cloud sandboxes",
             Self::Logging => "Logging",
             Self::Journeys => "Journeys",
+            Self::Advanced => "Advanced",
         }
     }
 
@@ -139,6 +142,7 @@ impl SettingsSection {
             Self::CloudSandboxes => "cloud-sandboxes",
             Self::Logging => "logging",
             Self::Journeys => "journeys",
+            Self::Advanced => "advanced",
         }
     }
 
@@ -178,6 +182,7 @@ impl SettingsSection {
                 JourneysMilestoneStates,
                 JourneysStorageCap,
             ],
+            Self::Advanced => &[SandboxTerminalPark, SandboxZedPark, SandboxAgentIdle],
         }
     }
 }
@@ -219,6 +224,12 @@ enum SettingField {
     JourneysSendTest,
     JourneysMilestoneStates,
     JourneysStorageCap,
+    /// Seconds an idle sandbox terminal keeps its connection.
+    SandboxTerminalPark,
+    /// Seconds an idle Zed on a sandbox keeps its connection.
+    SandboxZedPark,
+    /// Seconds an idle sandbox agent keeps its connection between turns.
+    SandboxAgentIdle,
 }
 
 impl SettingField {
@@ -252,6 +263,9 @@ impl SettingField {
             Self::JourneysSendTest => "journeys-send-test",
             Self::JourneysMilestoneStates => "journeys-milestone-states",
             Self::JourneysStorageCap => "journeys-storage-cap",
+            Self::SandboxTerminalPark => "sandbox-terminal-park",
+            Self::SandboxZedPark => "sandbox-zed-park",
+            Self::SandboxAgentIdle => "sandbox-agent-idle",
         }
     }
 }
@@ -1061,6 +1075,26 @@ impl SettingsView {
         self.focus_region == SettingsFocus::Sidebar && self.active_section == section
     }
 
+    /// One second per step, never below 1: 0 (never close) is left to
+    /// `tod.yml`, since it keeps the sandbox awake for as long as the
+    /// terminal or Zed is open.
+    fn step_sandbox_idle(
+        &mut self,
+        field: fn(&mut tod_store::settings::SandboxIdleSettings) -> &mut u64,
+        key: &str,
+        delta: i32,
+        cx: &mut Context<Self>,
+    ) {
+        let secs = field(&mut self.settings.sandbox_idle);
+        *secs = if delta >= 0 {
+            secs.saturating_add(1)
+        } else {
+            secs.saturating_sub(1).max(1)
+        };
+        self.schedule_save(key, cx);
+        cx.notify();
+    }
+
     fn adjust_selected(&mut self, delta: i32, cx: &mut Context<Self>) {
         if self.text_editing() || self.focus_region != SettingsFocus::Panel {
             return;
@@ -1100,6 +1134,24 @@ impl SettingsView {
             SettingField::JourneysRelayCode
             | SettingField::JourneysSendTest
             | SettingField::JourneysMilestoneStates => {}
+            SettingField::SandboxTerminalPark => self.step_sandbox_idle(
+                |idle| &mut idle.terminal_park_secs,
+                "sandbox_idle.terminal_park_secs",
+                delta,
+                cx,
+            ),
+            SettingField::SandboxZedPark => self.step_sandbox_idle(
+                |idle| &mut idle.zed_park_secs,
+                "sandbox_idle.zed_park_secs",
+                delta,
+                cx,
+            ),
+            SettingField::SandboxAgentIdle => self.step_sandbox_idle(
+                |idle| &mut idle.agent_idle_secs,
+                "sandbox_idle.agent_idle_secs",
+                delta,
+                cx,
+            ),
         }
     }
 
@@ -2323,6 +2375,59 @@ impl SettingsView {
                     )
                 })
                 .into_any_element(),
+            SettingsSection::Advanced => {
+                use tod_store::settings::{
+                    DEFAULT_AGENT_IDLE_SECS, DEFAULT_TERMINAL_PARK_SECS, DEFAULT_ZED_PARK_SECS,
+                };
+                let idle = &self.settings.sandbox_idle;
+                let secs = |secs: u64| {
+                    if secs == 0 { "never".to_string() } else { format!("{secs} s") }
+                };
+                v_flex()
+                    .gap_1()
+                    .child(
+                        div()
+                            .px_3()
+                            .text_sm()
+                            .text_color(theme.muted_foreground)
+                            .whitespace_normal()
+                            .child("A cloud sandbox stays awake while any connection to it is open, and goes to standby about 14 s after the last one closes. These set how long an idle connection stays open. Reopening one takes about 0.1 s while the sandbox is awake, and about 0.5 s once it is in standby. Changes apply to connections opened afterward."),
+                    )
+                    .child(stepper_row(
+                        cx,
+                        self,
+                        SettingField::SandboxTerminalPark,
+                        secs(idle.terminal_park_secs),
+                        "Sandbox terminal idle",
+                        format!("A terminal with no input, no output, and no running command closes its connection after this long. A running command keeps it open. Default {DEFAULT_TERMINAL_PARK_SECS} s."),
+                        theme,
+                        |this, _, cx| this.step_sandbox_idle(|i| &mut i.terminal_park_secs, "sandbox_idle.terminal_park_secs", -1, cx),
+                        |this, _, cx| this.step_sandbox_idle(|i| &mut i.terminal_park_secs, "sandbox_idle.terminal_park_secs", 1, cx),
+                    ))
+                    .child(stepper_row(
+                        cx,
+                        self,
+                        SettingField::SandboxZedPark,
+                        secs(idle.zed_park_secs),
+                        "Sandbox Zed idle",
+                        format!("Zed's connection closes after this long with nothing sent either way. While it is closed, what the sandbox sends on its own, such as new diagnostics, waits for Zed's next request. Default {DEFAULT_ZED_PARK_SECS} s."),
+                        theme,
+                        |this, _, cx| this.step_sandbox_idle(|i| &mut i.zed_park_secs, "sandbox_idle.zed_park_secs", -1, cx),
+                        |this, _, cx| this.step_sandbox_idle(|i| &mut i.zed_park_secs, "sandbox_idle.zed_park_secs", 1, cx),
+                    ))
+                    .child(stepper_row(
+                        cx,
+                        self,
+                        SettingField::SandboxAgentIdle,
+                        secs(idle.agent_idle_secs),
+                        "Sandbox agent idle",
+                        format!("An agent's connection closes after this long between turns. The agent keeps running, and the next turn reconnects. Default {DEFAULT_AGENT_IDLE_SECS} s."),
+                        theme,
+                        |this, _, cx| this.step_sandbox_idle(|i| &mut i.agent_idle_secs, "sandbox_idle.agent_idle_secs", -1, cx),
+                        |this, _, cx| this.step_sandbox_idle(|i| &mut i.agent_idle_secs, "sandbox_idle.agent_idle_secs", 1, cx),
+                    ))
+                    .into_any_element()
+            }
             SettingsSection::Logging => v_flex()
                 .gap_1()
                 .child(read_only_row(

@@ -210,7 +210,8 @@ the real `ssh`, so Zed's ordinary SSH remotes are unaffected.
 While Zed is open and idle, its connection is parked and the sandbox sleeps.
 The first action after a sleep wakes it in about 0.7 s. Zed's terminals are
 parked the same way when they are idle, and stay attached while a command
-runs in them.
+runs in them. How long each waits before parking (Zed 10 s, terminals and
+agents 3 s) is in Settings → Advanced.
 
 **tod assumes it is the only thing that starts Zed.** Windows Zed is
 single-instance, so a Zed that was already open (started from the Start menu,

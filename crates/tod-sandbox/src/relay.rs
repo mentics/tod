@@ -6,7 +6,8 @@ use futures_util::{SinkExt, StreamExt};
 use serde::Serialize;
 use std::collections::HashMap;
 use tokio::io::AsyncWriteExt;
-use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::MaybeTlsStream;
+use tokio_tungstenite::tungstenite::{self, Message};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
 pub type Ws = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
@@ -22,11 +23,33 @@ pub fn init_tls() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
+/// Opens a relay connection: on a spare the process kept ready
+/// ([`crate::edge::keep_spares`]) when there is one, else over a new TCP and
+/// TLS connection that uses the process's one TLS configuration.
 pub async fn connect(url: &str, token: &str) -> Result<Ws> {
-    init_tls();
-    let mut req = url.into_client_request()?;
-    req.headers_mut().insert("Authorization", format!("Bearer {token}").parse()?);
-    let (ws, _) = tokio_tungstenite::connect_async(req).await.with_context(|| format!("connect {url}"))?;
+    let request = || -> Result<_> {
+        let mut req = url.into_client_request()?;
+        req.headers_mut().insert("Authorization", format!("Bearer {token}").parse()?);
+        Ok(req)
+    };
+    let Some((host, port)) = crate::edge::host_port(url) else {
+        // Plain `ws://`: a local relay in tests.
+        let (ws, _) = tokio_tungstenite::connect_async(request()?).await.with_context(|| format!("connect {url}"))?;
+        return Ok(ws);
+    };
+    if let Some(tls) = crate::edge::take(&host, port) {
+        match tokio_tungstenite::client_async(request()?, MaybeTlsStream::Rustls(tls)).await {
+            Ok((ws, _)) => return Ok(ws),
+            // The relay answered: a new connection would get the same answer.
+            Err(e @ tungstenite::Error::Http(_)) => return Err(e).with_context(|| format!("connect {url}")),
+            // The edge closed the spare first; open a new one.
+            Err(_) => {}
+        }
+    }
+    let tls = crate::edge::open(&host, port).await?;
+    let (ws, _) = tokio_tungstenite::client_async(request()?, MaybeTlsStream::Rustls(tls))
+        .await
+        .with_context(|| format!("connect {url}"))?;
     Ok(ws)
 }
 

@@ -76,7 +76,8 @@ pub async fn run(sandbox_url: &str, token: &str, opts: BridgeOptions) -> Result<
         let (url, sandbox_url, token) = (url.clone(), sandbox_url.to_string(), token.to_string());
         let (tunnel_port, awake_file) = (opts.tunnel_port, opts.awake_file.clone());
         async move {
-            // The tunnel first, so the agent's first `tod-cli` finds it.
+            // The tunnel is ready before the first message, so the agent's
+            // first `tod-cli` finds it.
             let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
             let tunnel = tunnel_port.map(|port| {
                 let (sandbox_url, token) = (sandbox_url.clone(), token.clone());
@@ -89,10 +90,16 @@ pub async fn run(sandbox_url: &str, token: &str, opts: BridgeOptions) -> Result<
                     }
                 })
             });
-            if tunnel.is_some() {
-                let _ = tokio::time::timeout(Duration::from_secs(20), ready_rx).await;
-            }
-            let mut ws = match relay::connect(&url, &token).await {
+            // The agent's own connection opens meanwhile, so a reattach
+            // costs one round trip to the sandbox rather than two; nothing is
+            // sent on it until the tunnel is ready.
+            let tunnel_ready = async {
+                if tunnel.is_some() {
+                    let _ = tokio::time::timeout(Duration::from_secs(20), ready_rx).await;
+                }
+            };
+            let ((), connected) = tokio::join!(tunnel_ready, relay::connect(&url, &token));
+            let mut ws = match connected {
                 Ok(ws) => ws,
                 Err(e) => {
                     if let Some(t) = tunnel {
@@ -243,6 +250,10 @@ pub async fn run(sandbox_url: &str, token: &str, opts: BridgeOptions) -> Result<
                         let _ = a.ws.close(None).await;
                         a.release(&opts.awake_file);
                     }
+                }
+                // Ready for the next turn (`edge`).
+                if attached.is_none() {
+                    crate::edge::keep_spares(&url);
                 }
             }
         }

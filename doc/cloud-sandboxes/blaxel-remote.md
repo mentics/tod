@@ -150,8 +150,8 @@ that command bridges its stdio to `/agent/<name>`:
   line.
 - While attached, it keeps a file fresh in `<data root>/zed-shim/awake/<sandbox>/`,
   which keeps a Zed on the sandbox attached for the turn. See below.
-- It detaches after `--idle` seconds (default 30) with nothing owed in either
-  direction. The agent keeps running in the sandbox, and the next turn
+- It detaches after `--idle` seconds (default 3, from Settings → Advanced)
+  with nothing owed in either direction. The agent keeps running in the sandbox, and the next turn
   reattaches.
 
 `tod-store` builds the launch (`fleet::dev_container::sandbox_launch_for`),
@@ -203,7 +203,8 @@ after the destination) and handles four cases:
    the remote exit code passed back.
 3. **The proxy** (`... proxy --identifier X [--reconnect]`): this becomes
    `/exec` with a session id. The shim then *parks* it: after
-   `TOD_ZED_PARK_SECS` (default 30 s; 20 s in testing) with no real message in either
+   the Zed idle time in Settings → Advanced (default 10 s; `TOD_ZED_PARK_SECS`
+   overrides it) with no real message in either
    direction, it closes the WebSocket. Zed's pipe stays open, and Zed never
    learns it was disconnected. The first real message from Zed reattaches
    (about 90–130 ms warm), and the relay replays anything the server sent
@@ -251,13 +252,22 @@ starts a real Zed through the shim and checks connect, park, and reattach.
 
 A terminal is an `/exec` session on a pty. That covers Zed's terminals (`ssh
 -t` through the shim) and `tod-sandbox shell`, which share
-`tod_sandbox::terminal`. After 60 s with no input, no output, and no foreground
+`tod_sandbox::terminal`. After 3 s with no input, no output, and no foreground
 job, the client closes the socket and the sandbox can sleep. The shell stays
 where it was, and the next keypress reattaches (a wake plus a reattach: about
 0.5–0.8 s cold). While a foreground job runs, such as a build, a test run, or a
 dev server, the terminal stays attached and the relay holds the sandbox
-awake, so the job never freezes mid-way. `TOD_TERMINAL_PARK_SECS` sets the
-idle time; 0 never parks.
+awake, so the job never freezes mid-way. The idle time is the terminal idle
+time in Settings → Advanced; `--park` (for `tod-sandbox shell`) and
+`TOD_TERMINAL_PARK_SECS` (for Zed's terminals) override it, and 0 never parks.
+
+**Why the idle times are short.** Each one adds to the ~13.5 s Blaxel waits
+before standby, and the sandbox is paid for throughout. Parking costs little:
+within those 13.5 s a reattach is 90–130 ms, and after them a wake is about
+0.5 s. The settings are in `tod.yml` (`sandbox_idle`); `tod-sandbox` reads
+them, and passes the terminal and Zed ones to the shim in `connect-info`. Zed
+has the longest (10 s), since a parked Zed sees the server's own messages,
+such as diagnostics, only when it next sends something.
 
 tod's own shells for a sandbox node run `tod-sandbox shell <sandbox> --cwd
 <dir> --cli-relay-file <file>`. The app writes the relay environment to a
@@ -296,6 +306,62 @@ Warm (just used), for comparison:
 
 Waking adds roughly 150–450 ms to the first request, with no trend by sleep
 length up to the 60 minutes tested.
+
+### Opening a connection
+
+`*.bl.run` is Amazon CloudFront. A relay connection is TCP and TLS to the
+CloudFront edge, then the WebSocket upgrade, which alone goes on to Blaxel's
+gateway and the sandbox. Measured from the laptop to the Hillsboro edge
+(`tod-latency-probe.bl.run`, which a CloudFront Function answers at the edge,
+so these exclude the gateway and sandbox leg):
+
+- One round trip to the edge: about 15 ms.
+- A new TLS configuration (loading Windows' root certificates): about 4 ms.
+  `tokio-tungstenite` built one per connection when given none.
+- `relay::connect` before: 67 ms median. With one TLS configuration per
+  process: 52 ms. On a spare connection (below): 14 ms.
+
+What the edge does not offer, checked: no WebSocket over HTTP/2 (its
+`SETTINGS` lack `ENABLE_CONNECT_PROTOCOL`, RFC 8441), so no WebSocket over
+HTTP/3 either in practice, though HTTP/3 is advertised; no TLS 0-RTT (its
+session tickets allow no early data, so a client that supports 0-RTT gets
+none). It closes an idle connection after about 30 s (open at 28 s, closed
+at 30 s).
+
+So `tod_sandbox::edge` keeps **spares**: a process that has parked a
+connection (a terminal, Zed's proxy, an agent between turns) keeps two TLS
+connections to the edge open, with no request sent, and replaces them every
+20 s. The next connect sends its upgrade on one, which leaves the one round
+trip the upgrade needs. A spare has not reached Blaxel, so it neither wakes
+the sandbox nor keeps it awake. Confirmed: with spares kept for 90 s after
+the last connection closed, the sandbox froze 15 s after the close (a tick
+loop in it stopped) and stayed frozen, the same as with none (14 s).
+
+Against a real sandbox in `us-was-1` (Hillsboro edge; 2026-09-27), "open" is
+a relay connection ready, "done" is `echo ok` finished on it:
+
+| Path | Warm open | Warm done | Cold open | Cold done |
+|---|---|---|---|---|
+| Before (`tokio-tungstenite` TLS) | 320 ms | 409 ms | 376 ms | 470 ms |
+| One TLS configuration | 286 ms | 373 ms | 349 ms | 443 ms |
+| On a spare | 275 ms | 370 ms | 304 ms | 397 ms |
+
+Medians of 10 warm and 3 cold. What this shows:
+
+- Waking now costs about 30 ms on a spare (cold 304 vs warm 275), in line
+  with Blaxel's stated ~25 ms resume. The earlier 150–450 ms was mostly the
+  handshakes.
+- A message on an open connection takes about 90 ms (the gap from "open" to
+  "done"), but the upgrade takes about 260 ms beyond our part. That is on
+  the way from the edge to the sandbox: the upgrade alone crosses from the
+  edge to the origin, likely with new connections there, and the client
+  cannot shorten it.
+- `us-was-1` is far from this laptop. The same reattach against `us-pdx-1`
+  measured 90–130 ms in the earlier prototype, so the sandbox's region is now
+  the largest single term.
+An agent reattaching also opens its own connection alongside its `tod-cli`
+tunnel instead of after it, holding its first message until the tunnel is
+ready.
 
 ### Zed
 

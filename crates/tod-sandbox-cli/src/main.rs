@@ -20,6 +20,7 @@ use tod_sandbox::terminal::{self, TerminalOptions};
 use tod_store::credentials::CredentialKind;
 use tod_store::fleet::cli_relay;
 use tod_store::fleet::sandbox::{self as sandboxes, BOOTSTRAP, NewSandboxSource, Sandboxes};
+use tod_store::settings::SandboxIdleSettings;
 
 const USAGE: &str = "\
 tod-sandbox: cloud sandboxes for tod (Blaxel)
@@ -49,11 +50,13 @@ exec <name> [--keep-awake] [--cwd DIR] -- <command...>
 shell <name> [--cwd DIR] [--park SECS] [--run CMD] [--cli-relay]
       [--cli-relay-file FILE] [--env NAME]...
                          Interactive shell; parks when idle so the sandbox sleeps.
+                         --park defaults to Settings, Advanced (0 never parks).
                          --run runs CMD first; the shell stays after it.
 agent <name> --name AGENT [--cwd DIR] [--idle SECS] [--cli-relay] [--env NAME]...
       -- <command...>    A line-oriented (ACP) agent in the sandbox over this
                          process's stdio; detaches when idle so the sandbox
                          sleeps. What tod runs its agents in a sandbox with.
+                         --idle defaults to Settings, Advanced.
                          --cli-relay: `tod-cli` there reaches the tod that set
                          TOD_CLI_RELAY_PORT and TOD_CLI_RELAY_TOKEN here.
                          --env NAME passes this process's NAME (or NAME=VALUE).
@@ -71,7 +74,7 @@ orchestrator [--image IMAGE] [--bin PATH] [--tod-cli PATH]
                          default target/sandbox/, from
                          scripts/build-sandbox-binaries.sh), and start it.
 doctor                   Check the setup.
-connect-info <name>      (internal) The relay URL and token, as JSON.
+connect-info <name>      (internal) The relay URL, token, and idle times, as JSON.
 ";
 
 fn main() {
@@ -224,7 +227,17 @@ fn run() -> Result<i32> {
             let name = config::name_for_host(&target).unwrap_or(&target).to_string();
             let bx = ctx.blaxel()?;
             let url = ctx.url(&bx, &name)?;
-            println!("{}", serde_json::json!({ "url": url, "token": bx.token() }));
+            // The shim has no tod-store, so its idle times come from here.
+            let idle = SandboxIdleSettings::load(&ctx.root);
+            println!(
+                "{}",
+                serde_json::json!({
+                    "url": url,
+                    "token": bx.token(),
+                    "terminal_park_secs": idle.terminal_park_secs,
+                    "zed_park_secs": idle.zed_park_secs,
+                })
+            );
             Ok(0)
         }
         other => bail!("unknown command {other:?}\n\n{USAGE}"),
@@ -559,7 +572,12 @@ fn with_tod_cli(cmd: &str) -> String {
 fn shell(ctx: &mut Ctx, mut args: Args) -> Result<i32> {
     let name = args.positional("sandbox name")?;
     let cwd = args.opt("--cwd");
-    let park: u64 = args.opt("--park").map(|s| s.parse()).transpose().context("--park is in seconds")?.unwrap_or(60);
+    let park: u64 = args
+        .opt("--park")
+        .map(|s| s.parse())
+        .transpose()
+        .context("--park is in seconds")?
+        .unwrap_or_else(|| SandboxIdleSettings::load(&ctx.root).terminal_park_secs);
     let relay_file = args.opt("--cli-relay-file").map(PathBuf::from);
     let carry = args.flag("--cli-relay") || relay_file.is_some();
     let run = args.opt("--run");
@@ -600,7 +618,12 @@ fn agent(ctx: &mut Ctx, mut args: Args, remote: Vec<String>) -> Result<i32> {
         bail!("--name is letters, digits, dashes, and underscores: {agent_name:?}");
     }
     let cwd = args.opt("--cwd");
-    let idle: u64 = args.opt("--idle").map(|s| s.parse()).transpose().context("--idle is in seconds")?.unwrap_or(30);
+    let idle: u64 = args
+        .opt("--idle")
+        .map(|s| s.parse())
+        .transpose()
+        .context("--idle is in seconds")?
+        .unwrap_or_else(|| SandboxIdleSettings::load(&ctx.root).agent_idle_secs);
     let carry = args.flag("--cli-relay");
     let mut env = env_flags(&mut args)?;
     args.done()?;

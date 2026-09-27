@@ -19,6 +19,10 @@ anyhow = "1.0"
 base64 = "0.22"
 futures-util = "0.3"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+# Both already come with tokio-tungstenite; named here to set up TLS once per
+# process and keep connections ready (`edge`).
+rustls-native-certs = "0.8"
+tokio-rustls = { version = "0.26", default-features = false }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"
