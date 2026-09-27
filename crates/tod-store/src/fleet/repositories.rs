@@ -23,7 +23,9 @@ pub struct NodeRepository {
     /// Where it sits in the superproject: empty for the superproject itself,
     /// else the submodule's path (`lib/a`, `lib/a/b`).
     pub path: String,
-    pub dir: Workdir,
+    /// Its checkout; `None` when the repository is known only by its URL
+    /// (an autonomous cloud node's, cloned in the node's sandbox).
+    pub dir: Option<Workdir>,
     /// The remote its pull requests go to, as git has it: `origin`, else the
     /// first remote. `None` for a repository with no remote.
     pub remote_url: Option<String>,
@@ -53,6 +55,20 @@ pub struct NodeRepositories {
 /// The repositories of the node whose Files resolve to `files`, or why there
 /// are none to show (user-facing).
 pub fn node_repositories(files: &ResolvedFiles) -> Result<NodeRepositories, String> {
+    // A cloud node's repository is a URL, not a checkout here: the one
+    // repository is the URL's (its submodules are not known without one).
+    if let Some(url) = files.repo_url() {
+        return Ok(NodeRepositories {
+            branch: files.branch().map(str::to_string),
+            repos: vec![NodeRepository {
+                path: String::new(),
+                dir: None,
+                remote_url: Some(url.to_string()),
+                github: parse_remote_url(url),
+            }],
+            warnings: Vec::new(),
+        });
+    }
     let root = match files.directory() {
         FilesDirectory::Ready(dir) => dir,
         // Before the worktree exists, the repository it will be made from
@@ -95,7 +111,7 @@ fn repository(path: String, dir: Workdir) -> NodeRepository {
     let github = remote_url.as_deref().and_then(parse_remote_url);
     NodeRepository {
         path,
-        dir,
+        dir: Some(dir),
         remote_url,
         github,
     }
@@ -219,6 +235,27 @@ mod tests {
         assert_eq!(found.repos.len(), 1);
         assert_eq!(found.repos[0].remote_url, None);
         assert_eq!(found.repos[0].github, None);
+    }
+
+    #[test]
+    fn a_cloud_nodes_repository_is_its_url() {
+        let mut files = files_at(Path::new("https://github.com/mentics/test-repo"), Some("tod/x"));
+        let found = node_repositories(&files).unwrap();
+        assert_eq!(found.branch.as_deref(), Some("tod/x"));
+        assert_eq!(found.repos.len(), 1);
+        assert_eq!(found.repos[0].dir, None);
+        assert_eq!(found.repos[0].remote_url.as_deref(), Some("https://github.com/mentics/test-repo"));
+        assert_eq!(found.repos[0].github.as_ref().map(ToString::to_string).as_deref(), Some("mentics/test-repo"));
+
+        files.repo = Some("git@github.com:mentics/test-repo.git".into());
+        let found = node_repositories(&files).unwrap();
+        assert_eq!(found.repos[0].github.as_ref().map(ToString::to_string).as_deref(), Some("mentics/test-repo"));
+
+        // Paths are not URLs.
+        for path in ["C:/src/repo", r"C:\src\repo", "/home/u/repo", "repo"] {
+            files.repo = Some(path.into());
+            assert_eq!(files.repo_url(), None, "{path}");
+        }
     }
 
     #[test]
