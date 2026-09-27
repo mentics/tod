@@ -59,22 +59,30 @@ pub fn run(inv: Invocation) -> anyhow::Result<String> {
 }
 
 fn list(inv: &Invocation, store: &CredentialStore) -> String {
-    let rows: Vec<(CredentialKind, bool)> = CredentialKind::ALL
+    // A secret the sandbox's proxy injects is set, though never here.
+    let rows: Vec<(CredentialKind, bool, bool)> = CredentialKind::ALL
         .into_iter()
-        .map(|kind| (kind, store.get(kind).is_some()))
+        .map(|kind| {
+            let proxy = store.backend(kind) == Some(tod_store::CredentialBackend::Proxy);
+            (kind, store.get(kind).is_some(), proxy)
+        })
         .collect();
     if inv.json {
         let rows: Vec<serde_json::Value> = rows
             .iter()
-            .map(|(kind, set)| {
-                serde_json::json!({ "name": kind.name(), "label": kind.label(), "set": set })
+            .map(|(kind, set, proxy)| {
+                serde_json::json!({ "name": kind.name(), "label": kind.label(), "set": set, "via_proxy": proxy })
             })
             .collect();
         return serde_json::to_string_pretty(&rows).unwrap_or_default();
     }
     rows.iter()
-        .map(|(kind, set)| {
-            let state = if *set { "set" } else { "not set" };
+        .map(|(kind, set, proxy)| {
+            let state = match (*set, *proxy) {
+                (_, true) => "set (added by the sandbox's proxy; commands get a placeholder)",
+                (true, false) => "set",
+                (false, false) => "not set",
+            };
             format!("{} ({}): {state}", kind.name(), kind.label())
         })
         .collect::<Vec<_>>()

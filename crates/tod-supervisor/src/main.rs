@@ -102,7 +102,9 @@ fn run(args: &[String]) -> Result<()> {
         orchestrator,
         node,
         workspace,
-        state_dir: state_dir.unwrap_or_else(|| PathBuf::from("/var/lib/tod-supervisor").join(node.to_string())),
+        state_dir: state_dir.unwrap_or_else(|| {
+            PathBuf::from(tod_store::fleet::cli_relay::SUPERVISOR_STATE_ROOT).join(node.to_string())
+        }),
         agent,
         holder: Arc::new(RelayHolder::new(relay)),
         transcripts,

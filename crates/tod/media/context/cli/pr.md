@@ -37,3 +37,9 @@ checks, not yours to decide.
 `blocked` records that you cannot make further progress without the user (an
 unresolvable conflict, a requested change you cannot judge); the app hands
 back to them with your `--why`.
+
+`pr` needs no token from you. In an autonomous node's cloud sandbox GitHub is
+signed in for every request (the sandbox's network adds the user's token),
+so `pr`, `gh` (its `GH_TOKEN` is a placeholder that is replaced in flight),
+and `git push` over HTTPS all work as the user; never try to find or set a
+token there.

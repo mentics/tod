@@ -28,6 +28,18 @@ pub const SUPERVISOR_PROCESS: &str = "tod-supervisor";
 pub const WORKSPACE_DIR: &str = "/workspace/repo";
 /// What `gh` sees as its token; the proxy replaces the header it sends.
 pub const GH_TOKEN_PLACEHOLDER: &str = "placeholder-injected-by-proxy";
+/// Set to [`GITHUB_AUTH_PROXY`] in a node's sandbox whose proxy injects the
+/// user's GitHub token: tod's own GitHub client (`tod_store::github`) then
+/// sends no token of its own, through the proxy, trusting its CA.
+pub const GITHUB_AUTH_ENV: &str = "TOD_GITHUB_AUTH";
+pub const GITHUB_AUTH_PROXY: &str = "proxy";
+/// Where the real `tod-cli` is installed in a node's sandbox, beside the
+/// HTTP shim at `TOD_CLI_PATH`: the shim runs the nouns that reach GitHub
+/// with it (`tod_store::fleet::cli_relay::HTTP_SHIM_SCRIPT`).
+pub const LOCAL_CLI_PATH: &str = "/opt/tod/tod-cli-local";
+/// The supervisor keeps its copy of the user's database in
+/// `<this>/<node>` (its default `--state-dir`).
+pub const SUPERVISOR_STATE_ROOT: &str = "/var/lib/tod-supervisor";
 /// What Claude Code sees as `CLAUDE_CODE_OAUTH_TOKEN` with
 /// [`ClaudeTokenVia::Proxy`], so it believes it is signed in; the proxy
 /// replaces the `Authorization` header it sends to `api.anthropic.com`.
@@ -103,7 +115,7 @@ fn rule(destination: &str, secret: &str, value_prefix: &str, secret_value: Strin
 /// credential just leaves its rule out.
 pub fn proxy_rules(creds: &NodeCredentials, orchestrator_host: &str, claude_via: ClaudeTokenVia) -> Vec<ProxyRule> {
     let mut rules = Vec::new();
-    if let Some(token) = creds.github_token.as_deref().filter(|t| !t.is_empty()) {
+    if let Some(token) = github_token(creds) {
         rules.push(rule("api.github.com", "github", "Bearer ", token.to_string()));
         let basic = base64::engine::general_purpose::STANDARD.encode(format!("x-access-token:{token}"));
         rules.push(rule("github.com", "github_basic", "Basic ", basic));
@@ -172,6 +184,8 @@ pub fn proxy_spec(rules: &[ProxyRule]) -> Value {
 /// `None` leaves it to the supervisor's default, Claude. `claude_placeholder`
 /// (the proxy holds a Claude token) sets `CLAUDE_CODE_OAUTH_TOKEN` to
 /// [`CLAUDE_TOKEN_PLACEHOLDER`], so Claude Code starts signed in.
+/// `github_via_proxy` (the proxy holds a GitHub token) sets
+/// [`GITHUB_AUTH_ENV`], so tod's own GitHub client relies on the proxy.
 pub fn node_env(
     sandbox: &str,
     user: &str,
@@ -179,6 +193,7 @@ pub fn node_env(
     orchestrator_cli_url: &str,
     agent: Option<&str>,
     claude_placeholder: bool,
+    github_via_proxy: bool,
 ) -> Vec<(&'static str, String)> {
     let mut env = vec![
         ("GH_TOKEN", GH_TOKEN_PLACEHOLDER.to_string()),
@@ -195,7 +210,14 @@ pub fn node_env(
     if claude_placeholder {
         env.push((CLAUDE_TOKEN_ENV, CLAUDE_TOKEN_PLACEHOLDER.to_string()));
     }
+    if github_via_proxy {
+        env.push((GITHUB_AUTH_ENV, GITHUB_AUTH_PROXY.to_string()));
+    }
     env
+}
+
+fn github_token(creds: &NodeCredentials) -> Option<&str> {
+    creds.github_token.as_deref().filter(|t| !t.is_empty())
 }
 
 /// What a node's sandbox is created as.
@@ -220,9 +242,17 @@ pub struct NodeSandboxSpec<'a> {
 /// The `POST /sandboxes` body for a node's sandbox.
 pub fn create_body(spec: &NodeSandboxSpec, creds: &NodeCredentials) -> Value {
     let claude_placeholder = spec.claude_via == ClaudeTokenVia::Proxy && claude_token(creds).is_some();
-    let envs: Vec<Value> =
-        node_env(spec.name, spec.user, spec.node, spec.orchestrator_cli_url, spec.agent, claude_placeholder)
-            .into_iter()
+    let github_via_proxy = github_token(creds).is_some();
+    let envs: Vec<Value> = node_env(
+        spec.name,
+        spec.user,
+        spec.node,
+        spec.orchestrator_cli_url,
+        spec.agent,
+        claude_placeholder,
+        github_via_proxy,
+    )
+    .into_iter()
             .map(|(name, value)| json!({ "name": name, "value": value }))
             .collect();
     json!({
@@ -254,6 +284,10 @@ pub struct NodePayload<'a> {
     pub relay: &'a [u8],
     /// `tod_store::fleet::cli_relay::HTTP_SHIM_SCRIPT`.
     pub shim: &'a [u8],
+    /// The real `tod-cli` (Linux), installed at [`LOCAL_CLI_PATH`] for the
+    /// nouns the shim runs here. `None` when not built yet: installing goes
+    /// on without it, with a warning.
+    pub local_cli: Option<&'a [u8]>,
     /// `None` when not built yet: installing goes on without it, with a warning.
     pub supervisor: Option<&'a [u8]>,
     /// The repository's HTTPS URL (git goes through the proxy).
@@ -296,6 +330,11 @@ pub fn supervisor_from(sandbox_target_dir: &Path) -> Option<Vec<u8>> {
     std::fs::read(sandbox_target_dir.join("tod-supervisor")).ok()
 }
 
+/// Reads the Linux `tod-cli` from `target/sandbox/`, if present.
+pub fn local_cli_from(sandbox_target_dir: &Path) -> Option<Vec<u8>> {
+    std::fs::read(sandbox_target_dir.join("tod-cli")).ok()
+}
+
 /// Sets git's CA to the proxy's system-wide, then clones the repository (or
 /// fetches) and checks out `branch`, from `origin/<branch>` when it exists.
 pub fn checkout_script(repo_url: &str, branch: &str) -> String {
@@ -321,6 +360,10 @@ pub fn provision(bx: &Blaxel, url: &str, payload: &NodePayload, progress: &mut d
     match payload.supervisor {
         Some(bytes) => bx.upload_large(url, SUPERVISOR_PATH, bytes, "0755")?,
         None => progress("warning: tod-supervisor is not built (target/sandbox/); the node will not run on its own"),
+    }
+    match payload.local_cli {
+        Some(bytes) => bx.upload_large(url, LOCAL_CLI_PATH, bytes, "0755")?,
+        None => progress("warning: tod-cli is not built for Linux (target/sandbox/); `tod-cli pr` will not work in the node"),
     }
     let res = bx.run(
         url,
@@ -474,6 +517,17 @@ mod tests {
             .iter()
             .find(|e| e["name"] == name)
             .map(|e| e["value"].as_str().unwrap().to_string())
+    }
+
+    #[test]
+    fn github_through_the_proxy_is_flagged_only_with_a_token() {
+        let body = create_body(&spec(ClaudeTokenVia::Proxy), &creds());
+        assert_eq!(env_value(&body, GITHUB_AUTH_ENV).as_deref(), Some(GITHUB_AUTH_PROXY));
+        let none = NodeCredentials { github_token: None, ..creds() };
+        let body = create_body(&spec(ClaudeTokenVia::Proxy), &none);
+        assert_eq!(env_value(&body, GITHUB_AUTH_ENV), None);
+        // `gh` gets its placeholder either way.
+        assert_eq!(env_value(&body, "GH_TOKEN").as_deref(), Some(GH_TOKEN_PLACEHOLDER));
     }
 
     #[test]

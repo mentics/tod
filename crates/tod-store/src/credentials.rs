@@ -84,7 +84,16 @@ pub enum CredentialBackend {
     Keyring,
     EncryptedFile,
     Environment,
+    /// Not held here at all: an autonomous node's sandbox, whose proxy adds
+    /// the user's GitHub token to every request for GitHub
+    /// ([`crate::github::GITHUB_AUTH_ENV`]).
+    Proxy,
 }
+
+/// What stands in for the GitHub token where the proxy injects it: `gh` and
+/// `tod-cli secrets run` get this, and the proxy replaces the header they
+/// send (`tod_sandbox::node::GH_TOKEN_PLACEHOLDER`, the sandbox's `GH_TOKEN`).
+pub const GITHUB_PROXY_PLACEHOLDER: &str = tod_sandbox::node::GH_TOKEN_PLACEHOLDER;
 
 #[derive(Debug, Error)]
 pub enum CredentialError {
@@ -106,6 +115,9 @@ pub struct CredentialStore {
     /// OS keyring service name. Always `KEYRING_SERVICE` outside tests; tests use a
     /// unique name so they never touch (or delete) the user's real stored credentials.
     keyring_service: String,
+    /// GitHub is authenticated by the sandbox's proxy
+    /// ([`crate::github::proxy_authenticated`], read when the store is made).
+    github_via_proxy: bool,
 }
 
 impl CredentialStore {
@@ -113,6 +125,7 @@ impl CredentialStore {
         Self {
             credentials_dir: paths.credentials_dir(),
             keyring_service: KEYRING_SERVICE.to_string(),
+            github_via_proxy: crate::github::proxy_authenticated(),
         }
     }
 
@@ -120,10 +133,25 @@ impl CredentialStore {
         Self {
             credentials_dir: data_root.join("credentials"),
             keyring_service: KEYRING_SERVICE.to_string(),
+            github_via_proxy: crate::github::proxy_authenticated(),
         }
     }
 
-    /// Read a credential using the most secure available source.
+    /// This store as if GitHub were (or were not) authenticated by the
+    /// sandbox's proxy, whatever the environment says.
+    pub fn with_github_via_proxy(mut self, via_proxy: bool) -> Self {
+        self.github_via_proxy = via_proxy;
+        self
+    }
+
+    fn proxied(&self, kind: CredentialKind) -> bool {
+        kind == CredentialKind::GithubToken && self.github_via_proxy
+    }
+
+    /// Read a credential using the most secure available source. Where the
+    /// sandbox's proxy injects the GitHub token and none is stored, the
+    /// GitHub token is [`GITHUB_PROXY_PLACEHOLDER`]: a command given it
+    /// (`tod-cli secrets run`) sends it through the proxy, which replaces it.
     pub fn get(&self, kind: CredentialKind) -> Option<String> {
         match self.get_from_keyring(kind) {
             Ok(Some(value)) => return Some(value),
@@ -131,6 +159,9 @@ impl CredentialStore {
         }
         if let Ok(value) = self.get_from_file(kind) {
             return Some(value);
+        }
+        if self.proxied(kind) {
+            return Some(GITHUB_PROXY_PLACEHOLDER.to_string());
         }
         kind.env_var()
             .and_then(|name| std::env::var(name).ok())
@@ -144,6 +175,9 @@ impl CredentialStore {
         }
         if self.file_path(kind).is_file() {
             return Some(CredentialBackend::EncryptedFile);
+        }
+        if self.proxied(kind) {
+            return Some(CredentialBackend::Proxy);
         }
         if kind
             .env_var()
@@ -475,8 +509,14 @@ pub fn resolve_linear_api_key(store: &CredentialStore) -> Option<String> {
     store.get(CredentialKind::LinearApiKey)
 }
 
-pub fn resolve_github_token(store: &CredentialStore) -> Option<String> {
-    store.get(CredentialKind::GithubToken)
+/// How to authenticate to GitHub from here: through the sandbox's proxy
+/// when it injects the token (whatever is stored), else the stored token.
+/// `None` when neither.
+pub fn resolve_github_auth(store: &CredentialStore) -> Option<crate::github::GithubAuth> {
+    if store.github_via_proxy {
+        return Some(crate::github::GithubAuth::Proxy);
+    }
+    store.get(CredentialKind::GithubToken).map(crate::github::GithubAuth::Token)
 }
 
 #[cfg(test)]
@@ -499,6 +539,7 @@ mod tests {
                 store: CredentialStore {
                     credentials_dir: dir,
                     keyring_service: format!("tod-test-{id}"),
+                    github_via_proxy: false,
                 },
             }
         }
@@ -507,6 +548,7 @@ mod tests {
     impl Drop for IsolatedStore {
         fn drop(&mut self) {
             let _ = self.store.delete(CredentialKind::LinearApiKey);
+            let _ = self.store.delete(CredentialKind::GithubToken);
             let _ = fs::remove_dir_all(&self.store.credentials_dir);
         }
     }
@@ -572,6 +614,30 @@ mod tests {
             store.get(CredentialKind::LinearApiKey).as_deref(),
             Some(secret.as_str()),
             "credential not readable after set (backend: {backend:?})"
+        );
+    }
+
+    #[test]
+    fn github_via_the_proxy_is_available_without_a_token() {
+        let isolated = IsolatedStore::new();
+        let store = isolated.store.clone().with_github_via_proxy(true);
+        assert_eq!(resolve_github_auth(&store), Some(crate::github::GithubAuth::Proxy));
+        assert_eq!(store.backend(CredentialKind::GithubToken), Some(CredentialBackend::Proxy));
+        assert_eq!(store.get(CredentialKind::GithubToken).as_deref(), Some(GITHUB_PROXY_PLACEHOLDER));
+        // Only GitHub goes through it.
+        assert_ne!(store.backend(CredentialKind::LinearApiKey), Some(CredentialBackend::Proxy));
+    }
+
+    #[test]
+    fn the_proxy_wins_over_a_stored_token() {
+        let isolated = IsolatedStore::new();
+        isolated.store.set_in_file(CredentialKind::GithubToken, "ghp_stored").unwrap();
+        let proxied = isolated.store.clone().with_github_via_proxy(true);
+        assert_eq!(resolve_github_auth(&proxied), Some(crate::github::GithubAuth::Proxy));
+        let direct = isolated.store.clone().with_github_via_proxy(false);
+        assert_eq!(
+            resolve_github_auth(&direct),
+            Some(crate::github::GithubAuth::Token("ghp_stored".into()))
         );
     }
 }

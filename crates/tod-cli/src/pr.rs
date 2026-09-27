@@ -17,8 +17,8 @@ use tod_core::pull_requests::{
     NodePulls, PullScope, RepoPulls, RepoSection, load_node_pulls, read_target,
 };
 use tod_store::conversation::ConversationRepo;
-use tod_store::credentials::{CredentialStore, resolve_github_token};
-use tod_store::github::{self, NodePrRepo};
+use tod_store::credentials::{CredentialStore, resolve_github_auth};
+use tod_store::github::{Github, NodePrRepo};
 use tod_store::interview::{InterviewCommand, short_id};
 use uuid::Uuid;
 
@@ -110,9 +110,10 @@ fn env_uuid(name: &str) -> anyhow::Result<Option<Uuid>> {
     }
 }
 
-fn token(inv: &Invocation) -> anyhow::Result<String> {
+fn github(inv: &Invocation) -> anyhow::Result<Github> {
     let store = CredentialStore::from_data_root(&inv.data_root);
-    resolve_github_token(&store)
+    resolve_github_auth(&store)
+        .map(Github::new)
         .ok_or_else(|| anyhow::anyhow!("no GitHub token configured — see `tod-cli secrets`"))
 }
 
@@ -239,16 +240,16 @@ fn open(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
     let base = args.require("--base")?.to_string();
     let title = args.require("--title")?.to_string();
     let body = args.get("--body").unwrap_or_default().to_string();
-    let token = token(inv)?;
+    let github = github(inv)?;
     // GitHub itself is the source of truth for whether one already exists —
     // not just the local record checked above — so a retry after the local
     // write below failed (the PR now orphaned from tod's perspective) finds
     // the existing PR instead of opening a duplicate.
-    let pr = match github::find_open_pr(&token, &owner, &repo, &head)
+    let pr = match github.find_open_pr(&owner, &repo, &head)
         .map_err(|err| anyhow::anyhow!("GitHub: {err}"))?
     {
         Some(pr) => pr,
-        None => github::create_pr(&token, &owner, &repo, &head, &base, &title, &body)
+        None => github.create_pr(&owner, &repo, &head, &base, &title, &body)
             .map_err(|err| anyhow::anyhow!("GitHub: {err}"))?,
     };
     inv.client()
@@ -276,8 +277,8 @@ fn status(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
         .client()
         .read(|conn| NodePrRepo::new(conn).get(node))?
         .ok_or_else(|| anyhow::anyhow!("no pull request on record for node {node} — run `pr open`"))?;
-    let token = token(inv)?;
-    let status = github::get_pr_status(&token, &pr.owner, &pr.repo, pr.pr_number)
+    let status = github(inv)?
+        .get_pr_status(&pr.owner, &pr.repo, pr.pr_number)
         .map_err(|err| anyhow::anyhow!("GitHub: {err}"))?;
     if inv.json {
         return Ok(serde_json::to_string(&serde_json::json!({
@@ -312,8 +313,8 @@ fn comment(inv: &Invocation, rest: &[String]) -> anyhow::Result<String> {
         .client()
         .read(|conn| NodePrRepo::new(conn).get(node))?
         .ok_or_else(|| anyhow::anyhow!("no pull request on record for node {node}"))?;
-    let token = token(inv)?;
-    github::reply_to_comment(&token, &pr.owner, &pr.repo, pr.pr_number, comment_id, &text)
+    github(inv)?
+        .reply_to_comment(&pr.owner, &pr.repo, pr.pr_number, comment_id, &text)
         .map_err(|err| anyhow::anyhow!("GitHub: {err}"))?;
     Ok("ok".to_string())
 }
