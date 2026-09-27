@@ -66,7 +66,11 @@ fn handle_turn(data_root: &Path, turn: &MockInterviewTurn) -> Result<MockReply> 
             )
             .map(MockReply::from);
         }
-        return crate::conversation::mock::plan_turn(&client, node, conversation)
+        let place = crate::conversation::mock::Place {
+            cwd: Some(&turn.cwd),
+            env: &turn.env,
+        };
+        return crate::conversation::mock::plan_turn(&client, node, conversation, place)
             .map(MockReply::from);
     }
     // A conversation's actor is `conversation:<uuid>`, not a session id.

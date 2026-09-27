@@ -38,7 +38,7 @@ use crate::interview::client::InterviewClient;
 use anyhow::{Context, Result, bail};
 use rusqlite::Connection;
 use serde_json::Value;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tod_agent::{MockInterviewTurn, MockReply, ReplyPart};
 use tod_store::conversation::{Entity, actor_conversation};
 use tod_store::fleet::FleetStore;
@@ -51,10 +51,27 @@ use uuid::Uuid;
 /// (see `driver::join`).
 const MESSAGE_HEADING: &str = "# Message\n\n";
 
+/// Where a node-working mock turn runs, for the directives that act outside
+/// the store: the plan step's `write` (a file in the working directory) and
+/// `open pr` (a real pull request, through `tod-cli pr open`).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Place<'a> {
+    /// The turn's working directory: the node's checkout.
+    pub cwd: Option<&'a Path>,
+    /// The turn's extra environment (`PATH` with the app's `tod-cli` first,
+    /// the node and conversation), given to the `tod-cli` it runs.
+    pub env: &'a [(String, String)],
+}
+
 /// Plays whichever node-working agent runs `conversation` — implementation,
 /// verification, review, or fix. Each is told its node and conversation the same
 /// way, so the conversation's own protocol says which one this is.
-pub fn plan_turn(access: &impl Access, node_id: Uuid, conversation_id: Uuid) -> Result<String> {
+pub fn plan_turn(
+    access: &impl Access,
+    node_id: Uuid,
+    conversation_id: Uuid,
+    place: Place<'_>,
+) -> Result<String> {
     let protocol = access.read(|conn| {
         Ok(tod_store::conversation::ConversationRepo::new(conn)
             .get(conversation_id)?
@@ -71,9 +88,9 @@ pub fn plan_turn(access: &impl Access, node_id: Uuid, conversation_id: Uuid) -> 
             super::fix::mock_turn(access, node_id, conversation_id)
         }
         Some(tod_store::conversation::ProtocolKind::Pr) => {
-            super::pr::mock_turn(access, node_id, conversation_id)
+            super::pr::mock_turn(access, node_id, conversation_id, place)
         }
-        _ => super::implement::mock_turn(access, node_id, conversation_id),
+        _ => super::implement::mock_turn(access, node_id, conversation_id, place),
     }
 }
 
@@ -83,6 +100,8 @@ pub trait Access {
     fn actor(&self) -> &str;
     fn interview(&self, command: InterviewCommand) -> Result<Value>;
     fn read<R>(&self, f: impl FnOnce(&Connection) -> Result<R>) -> Result<R>;
+    /// The data root the mock's own `tod-cli` calls are given.
+    fn data_root(&self) -> PathBuf;
 }
 
 impl Access for InterviewClient {
@@ -96,6 +115,10 @@ impl Access for InterviewClient {
 
     fn read<R>(&self, f: impl FnOnce(&Connection) -> Result<R>) -> Result<R> {
         InterviewClient::read(self, f)
+    }
+
+    fn data_root(&self) -> PathBuf {
+        InterviewClient::data_root(self).to_path_buf()
     }
 }
 
@@ -118,6 +141,10 @@ impl Access for Direct<'_> {
 
     fn read<R>(&self, f: impl FnOnce(&Connection) -> Result<R>) -> Result<R> {
         self.fleet.read(f)
+    }
+
+    fn data_root(&self) -> PathBuf {
+        self.fleet.paths().root().to_path_buf()
     }
 }
 

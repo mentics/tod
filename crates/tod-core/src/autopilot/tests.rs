@@ -58,7 +58,11 @@ impl FakeAgent {
         if let (Some(node), Some(conversation)) =
             (env(IMPLEMENT_NODE_ENV), env(IMPLEMENT_CONVERSATION_ENV))
         {
-            return crate::conversation::mock::plan_turn(&user, node.parse()?, conversation.parse()?);
+            let place = crate::conversation::mock::Place {
+                cwd: Some(&turn.cwd),
+                env: &turn.env,
+            };
+            return crate::conversation::mock::plan_turn(&user, node.parse()?, conversation.parse()?, place);
         }
         match env(ACTOR_ENV) {
             Some(actor) => {

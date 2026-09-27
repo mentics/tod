@@ -192,32 +192,115 @@ fn continuation_message() -> String {
         .to_string()
 }
 
-/// Plays the pr agent for `--agent mock`: the first turn opens the PR (a
-/// fake reference, no live GitHub call) and stops without finishing; the
-/// next records mergeable.
+/// Plays the pr agent for `--agent mock`: the first turn opens the PR and
+/// stops without finishing; the next records mergeable.
+///
+/// Without a directive the PR is a fake reference, with no GitHub call. A
+/// line `open pr: <title>` in one of the node's plan steps makes it open a
+/// real one instead, the way a real agent does: `tod-cli pr open` with the
+/// checkout's `origin` repository, its branch as head, and `origin`'s
+/// default branch as base (so the branch must already be pushed, as a cloud
+/// node's supervisor does after each session).
 pub fn mock_turn(
     access: &impl super::mock::Access,
     node_id: Uuid,
-    _conversation_id: Uuid,
+    conversation_id: Uuid,
+    place: super::mock::Place<'_>,
 ) -> Result<String> {
     let has_pr = access.read(|conn| Ok(NodePrRepo::new(conn).get(node_id)?.is_some()))?;
     if !has_pr {
-        access.interview(tod_store::interview::InterviewCommand::RecordNodePr {
-            node_id,
-            owner: "mock-owner".to_string(),
-            repo: "mock-repo".to_string(),
-            pr_number: 1,
-            url: "https://github.com/mock-owner/mock-repo/pull/1".to_string(),
-        })?;
+        let steps = mock_step_bodies(access, node_id)?;
+        match steps.iter().find_map(|body| mock_pr_title(body)) {
+            Some(title) => open_real_pr(access, node_id, title, place)?,
+            None => {
+                access.interview(tod_store::interview::InterviewCommand::RecordNodePr {
+                    node_id,
+                    owner: "mock-owner".to_string(),
+                    repo: "mock-repo".to_string(),
+                    pr_number: 1,
+                    url: "https://github.com/mock-owner/mock-repo/pull/1".to_string(),
+                })?;
+            }
+        }
         return Ok(String::new());
     }
     access.interview(
         tod_store::interview::InterviewCommand::RecordConversationReport {
-            conversation_id: _conversation_id,
+            conversation_id,
             body: mergeable_report(None),
         },
     )?;
     Ok(String::new())
+}
+
+fn mock_step_bodies(access: &impl super::mock::Access, node_id: Uuid) -> Result<Vec<String>> {
+    access.read(|conn| {
+        Ok(tod_store::outline::repos::PlanStepRepo::new(conn)
+            .list_for_node(node_id)?
+            .into_iter()
+            .map(|step| step.body)
+            .collect())
+    })
+}
+
+/// The title of an `open pr: <title>` line (see [`mock_turn`]).
+fn mock_pr_title(body: &str) -> Option<&str> {
+    body.lines()
+        .filter_map(|line| line.trim().strip_prefix("open pr:"))
+        .map(str::trim)
+        .find(|title| !title.is_empty())
+}
+
+/// `tod-cli pr open` for the checkout at `place.cwd`, as a real agent runs it.
+fn open_real_pr(
+    access: &impl super::mock::Access,
+    node_id: Uuid,
+    title: &str,
+    place: super::mock::Place<'_>,
+) -> Result<()> {
+    use anyhow::bail;
+    let cwd = place.cwd.context("the mock was given no checkout to open a pull request from")?;
+    let git = |args: &[&str]| -> Result<String> {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(cwd)
+            .args(args)
+            .output()
+            .with_context(|| format!("run git {}", args.join(" ")))?;
+        if !out.status.success() {
+            bail!("git {}: {}", args.join(" "), String::from_utf8_lossy(&out.stderr).trim());
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    };
+    let remote = git(&["remote", "get-url", "origin"])?;
+    let repo = tod_store::github::parse_remote_url(&remote)
+        .with_context(|| format!("origin is not on GitHub ({remote})"))?;
+    let head = git(&["rev-parse", "--abbrev-ref", "HEAD"])?;
+    let base = git(&["symbolic-ref", "--short", "refs/remotes/origin/HEAD"])?;
+    let base = base.strip_prefix("origin/").unwrap_or(&base).to_string();
+    // The installed `tod-cli` beside this binary, else the one on `PATH` (in
+    // a node's sandbox, the shim, which runs `pr` there).
+    let installed = crate::interview::tod_cli_path();
+    let program = if installed.is_file() { installed } else { PathBuf::from("tod-cli") };
+    let data_root = access.data_root();
+    let node = node_id.to_string();
+    let out = std::process::Command::new(&program)
+        .current_dir(cwd)
+        .envs(place.env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+        .args(["--data-root".as_ref(), data_root.as_os_str()])
+        .args(["pr", "open", "--node", &node, "--owner", &repo.owner, "--repo", &repo.repo])
+        .args(["--head", &head, "--base", &base, "--title", title])
+        .args(["--body", "Opened by tod's mock agent, testing the `pr` state."])
+        .output()
+        .with_context(|| format!("run {}", program.display()))?;
+    if !out.status.success() {
+        bail!(
+            "tod-cli pr open: {}{}",
+            String::from_utf8_lossy(&out.stdout).trim(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -246,6 +329,14 @@ mod tests {
                 progressed,
             })
             .expect("a decision")
+    }
+
+    #[test]
+    fn open_pr_lines_name_the_title() {
+        assert_eq!(mock_pr_title("Add a file
+open pr: Cloud test"), Some("Cloud test"));
+        assert_eq!(mock_pr_title("open pr:   "), None);
+        assert_eq!(mock_pr_title("Open the PR"), None);
     }
 
     #[test]
