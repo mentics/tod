@@ -2,6 +2,7 @@
 
 use crate::hold::Hold;
 use crate::pty;
+use crate::reaper;
 use crate::tunnel::Tunnel;
 use futures_util::stream::SplitStream;
 use futures_util::{SinkExt, StreamExt};
@@ -31,8 +32,7 @@ pub type WsIn = SplitStream<WebSocketStream<TcpStream>>;
 const MAX_HELD_BYTES: usize = 32 << 20;
 const LOG_DIR: &str = "/opt/tod/logs";
 /// How long a poke's own bridging lease (`Hold::lease("poke", ..)`) holds the
-/// sandbox awake by itself, giving the supervisor time to decide whether to
-/// take its own hold.
+/// sandbox awake by itself, giving the supervisor time to take its own hold.
 const POKE_BRIDGE_SECS: u64 = 60;
 
 static NEXT_CONN: AtomicU64 = AtomicU64::new(1);
@@ -86,6 +86,7 @@ fn supervisor_env_from(vars: impl Iterator<Item = (String, String)>) -> Vec<(Str
 
 pub fn main(args: &[String]) {
     let supervisor_env = take_supervisor_env();
+    reaper::start();
     let mut port = 2222u16;
     let mut max_hold = 4 * 3600u64;
     let mut tunnel_port = crate::tunnel::DEFAULT_PORT;
@@ -284,12 +285,12 @@ fn alive(pid: u32) -> bool {
 /// Wakes the node's supervisor: if one we started is still running, signal it
 /// (`SIGUSR1`) to look again now rather than at its next schedule; otherwise
 /// start it fresh with `supervisor_cmd` (`keepAlive: false` — it takes its
-/// own hold once it has decided there is work, see `doc/cloud-sandboxes/
+/// own hold as soon as it starts, see `doc/cloud-sandboxes/
 /// autonomous-nodes.md`).
 ///
 /// Either way, a poke takes a short leased hold of its own first: the
-/// supervisor needs a moment after waking to look and decide whether to take
-/// its own hold, and this bridges that gap without granting an indefinite
+/// supervisor needs a moment after starting to take its own hold, and this
+/// bridges that gap without granting an indefinite
 /// one — it lapses on its own (`POKE_BRIDGE_SECS`) unless another poke
 /// arrives to renew it.
 fn poke(relay: &Arc<Relay>) {
@@ -313,7 +314,7 @@ fn poke(relay: &Arc<Relay>) {
     cmd.arg("-c").arg(format!("exec {}", relay.supervisor_cmd));
     cmd.env("HOME", &relay.home);
     cmd.envs(relay.supervisor_env.iter().map(|(k, v)| (k, v)));
-    match cmd.spawn() {
+    match reaper::spawn_tracked(|| cmd.spawn(), |c| c.id()) {
         Ok(mut child) => {
             let pid = child.id().unwrap_or(0);
             *relay.supervisor.lock().unwrap() = Some(pid);
@@ -321,6 +322,7 @@ fn poke(relay: &Arc<Relay>) {
             let relay = relay.clone();
             tokio::spawn(async move {
                 let code = child.wait().await.map(exit_code).unwrap_or(255);
+                reaper::untrack(pid);
                 eprintln!("poke: supervisor pid {pid} exited {code}");
                 let mut sup = relay.supervisor.lock().unwrap();
                 if *sup == Some(pid) {
@@ -609,7 +611,7 @@ fn spawn_session(relay: &Arc<Relay>, req: &ExecReq, conn: u64) -> std::io::Resul
     eprintln!("exec {key}: {}", label.chars().take(120).collect::<String>());
 
     if let Some((cols, rows)) = req.pty {
-        let pty = pty::spawn(cmd, cols, rows)?;
+        let pty = reaper::spawn_tracked(|| pty::spawn(cmd, cols, rows), |p| Some(p.child.id()))?;
         let pid = pty.child.id();
         let mut child = pty.child;
         let master = Arc::new(pty.master);
@@ -657,6 +659,7 @@ fn spawn_session(relay: &Arc<Relay>, req: &ExecReq, conn: u64) -> std::io::Resul
         let (s, r) = (session.clone(), relay.clone());
         std::thread::spawn(move || {
             let code = child.wait().map(exit_code).unwrap_or(255);
+            reaper::untrack(pid);
             std::thread::sleep(Duration::from_millis(100)); // let the last output land first
             s.finish(&r, code);
         });
@@ -668,7 +671,7 @@ fn spawn_session(relay: &Arc<Relay>, req: &ExecReq, conn: u64) -> std::io::Resul
     cmd.stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
-    let mut child = cmd.spawn()?;
+    let mut child = reaper::spawn_tracked(|| cmd.spawn(), |c| c.id())?;
     let pid = child.id().unwrap_or(0);
     if req.session.is_some() {
         relay.sessions.lock().unwrap().insert(key.clone(), session.clone());
@@ -722,6 +725,7 @@ fn spawn_session(relay: &Arc<Relay>, req: &ExecReq, conn: u64) -> std::io::Resul
     let (s, r) = (session.clone(), relay.clone());
     tokio::spawn(async move {
         let status = child.wait().await;
+        reaper::untrack(pid);
         let _ = out_task.await;
         let _ = err_task.await;
         s.finish(&r, status.map(exit_code).unwrap_or(255));
@@ -916,7 +920,7 @@ fn spawn_agent(relay: &Arc<Relay>, name: &str, req: &AgentReq) -> std::io::Resul
     cmd.stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::from(log));
-    let mut child = cmd.spawn()?;
+    let mut child = reaper::spawn_tracked(|| cmd.spawn(), |c| c.id())?;
     let pid = child.id().unwrap_or(0);
     eprintln!("agent {name}: started pid {pid}: {}", req.cmd);
     let (itx, mut irx) = unbounded_channel::<String>();
@@ -947,6 +951,7 @@ fn spawn_agent(relay: &Arc<Relay>, name: &str, req: &AgentReq) -> std::io::Resul
     let (a, r, name) = (agent.clone(), relay.clone(), name.to_string());
     tokio::spawn(async move {
         let code = child.wait().await.map(exit_code).unwrap_or(255);
+        reaper::untrack(pid);
         let _ = out_task.await;
         eprintln!("agent {name}: exited {code}");
         // A replaced agent's name already belongs to its successor.

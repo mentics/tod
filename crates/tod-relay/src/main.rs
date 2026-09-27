@@ -20,12 +20,17 @@
 //! the sandbox awake through the provider's local API, so work never freezes
 //! mid-way just because no client is connected. Everything else lets it sleep.
 //!
+//! The sandbox's init does not reap orphans, so the relay is a child
+//! subreaper and reaps the processes orphaned below it (`reaper`).
+//!
 //! The wire protocol is in `doc/cloud-sandboxes/relay-protocol.md`.
 
 #[cfg(target_os = "linux")]
 mod hold;
 #[cfg(target_os = "linux")]
 mod pty;
+#[cfg(target_os = "linux")]
+mod reaper;
 #[cfg(target_os = "linux")]
 mod server;
 #[cfg(target_os = "linux")]
