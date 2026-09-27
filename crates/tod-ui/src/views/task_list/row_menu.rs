@@ -1,7 +1,7 @@
 use gpui::prelude::FluentBuilder;
 use gpui::{
     Anchor, App, Context, DismissEvent, Entity, Focusable, InteractiveElement, IntoElement,
-    ParentElement, Styled, Window, anchored, deferred, div, px,
+    ParentElement, Pixels, Point, Styled, Window, anchored, deferred, div, px,
 };
 
 use gpui_component::menu::{PopupMenu, PopupMenuItem};
@@ -14,8 +14,9 @@ use super::model::TaskItem;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum RowMenuKind {
     Shells,
-    /// The right-click menu (`context_menu.rs`).
-    Context,
+    /// The right-click menu (`context_menu.rs`), opened where the click
+    /// landed (window coordinates); `None` hangs it from the row's chips.
+    Context(Option<Point<Pixels>>),
 }
 
 /// Anchor a popup under a row trigger: it hangs from the trigger's own corner,
@@ -38,6 +39,19 @@ pub(super) fn popup_anchor(
                 .with_priority(1),
             )
         })
+}
+
+/// Paint a popup at a point in the window, above the list: where a
+/// right-click landed.
+pub(super) fn popup_at(position: Point<Pixels>, popup: impl IntoElement) -> impl IntoElement {
+    deferred(
+        anchored()
+            .position(position)
+            .anchor(Anchor::TopLeft)
+            .snap_to_window_with_margin(px(8.))
+            .child(div().occlude().child(popup)),
+    )
+    .with_priority(1)
 }
 
 /// Anchor a standard popup menu under a row trigger.
@@ -63,15 +77,21 @@ impl TaskListView {
     }
 
     /// Right-click: select the row and always (re-)open the context menu for
-    /// it, closing whatever menu was open before.
+    /// it at `position`, closing whatever menu was open before.
     pub(super) fn open_context_menu(
         &mut self,
         task_id: &str,
+        position: Option<Point<Pixels>>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         self.select_task_by_id(task_id, window, cx);
-        self.open_row_menu_for(RowMenuKind::Context, task_id.to_string(), window, cx);
+        self.open_row_menu_for(
+            RowMenuKind::Context(position),
+            task_id.to_string(),
+            window,
+            cx,
+        );
     }
 
     pub(super) fn close_row_menu(&mut self, cx: &mut Context<Self>) {
@@ -158,7 +178,7 @@ fn build_row_menu(
     view: gpui::WeakEntity<TaskListView>,
 ) -> PopupMenu {
     match kind {
-        RowMenuKind::Context => context_menu::build(menu, &task, attention_count, view),
+        RowMenuKind::Context(_) => context_menu::build(menu, &task, attention_count, view),
         RowMenuKind::Shells => {
             for shell in &task.shells {
                 let view = view.clone();

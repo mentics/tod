@@ -18,7 +18,7 @@ use gpui_component::{ActiveTheme, Sizable, StyledExt, h_flex};
 
 use super::TaskListView;
 use super::model::TaskItem;
-use super::row_menu::{RowMenuKind, popup_anchor, row_menu_anchor};
+use super::row_menu::{RowMenuKind, popup_anchor, popup_at, row_menu_anchor};
 
 /// Checkvist-style uniform tree row height.
 pub const TREE_ROW_HEIGHT: gpui::Pixels = gpui::px(28.0);
@@ -83,6 +83,7 @@ pub enum RowAction {
     /// Right-click anywhere on the row: select it and open the context menu.
     OpenContextMenu {
         task_id: String,
+        position: gpui::Point<gpui::Pixels>,
     },
     /// The row's attention badge (needs-you count).
     OpenTaskPanel {
@@ -657,9 +658,19 @@ impl ListDelegate for TaskListDelegate {
             ));
         }
         let chips_menu_open = self.open_row_menu.as_ref().is_some_and(|(kind, id)| {
-            (selected && matches!(kind, RowMenuKind::Shells) || matches!(kind, RowMenuKind::Context))
+            (selected && matches!(kind, RowMenuKind::Shells)
+                || matches!(kind, RowMenuKind::Context(None)))
                 && id == &item.id
         });
+        // A right-click menu opens where the click landed, not at the chips.
+        let menu_at = self
+            .open_row_menu
+            .as_ref()
+            .and_then(|(kind, id)| match kind {
+                RowMenuKind::Context(Some(at)) if id == &item.id => Some(*at),
+                _ => None,
+            })
+            .zip(self.row_menu.clone());
         let title_line = if chips_menu_open {
             title_row.child(row_menu_anchor(chips, self.row_menu.clone()))
         } else {
@@ -715,10 +726,11 @@ impl ListDelegate for TaskListDelegate {
             .on_mouse_down(MouseButton::Right, {
                 let task_id = item.id.clone();
                 let sink = sink.clone();
-                cx.listener(move |_, _, _, cx| {
+                cx.listener(move |_, event: &gpui::MouseDownEvent, _, cx| {
                     cx.stop_propagation();
                     sink.borrow_mut().push(RowAction::OpenContextMenu {
                         task_id: task_id.clone(),
+                        position: event.position,
                     });
                     cx.notify();
                 })
@@ -748,7 +760,8 @@ impl ListDelegate for TaskListDelegate {
             .when(!has_spec, |el| {
                 el.drag_over::<ItemDrag>(|style, _, _, _| style.cursor_not_allowed())
             })
-            .child(title_line);
+            .child(title_line)
+            .when_some(menu_at, |el, (at, menu)| el.child(popup_at(at, menu)));
 
         Some(
             ListItem::new(("task-row", ix.row))

@@ -15,3 +15,6 @@ agent-socket = ["tod-ui/agent-socket"]
 
 [dependencies]
 tod-ui = { path = "../tod-ui", default-features = false }
+
+[build-dependencies]
+embed-resource = "3"

@@ -1,0 +1,3 @@
+// Resource ID 1 is what GPUI loads for the window icon, and the first icon
+// group is what Explorer, the taskbar, and Task Manager show for the exe.
+1 ICON "tod.ico"
