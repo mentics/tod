@@ -104,11 +104,9 @@ fn field_anchor_id(field: TaskEditField) -> &'static str {
         TaskEditField::GeneratorSource => "task-edit-field-gen-source",
         TaskEditField::GeneratorField(_) => "task-edit-field-gen-field",
         TaskEditField::LinearQuery => "task-edit-field-linear-query",
-        TaskEditField::GeneratorSave => "task-edit-field-gen-save",
         TaskEditField::GeneratorRefresh => "task-edit-field-gen-refresh",
         TaskEditField::GeneratorAcceptDestination => "task-edit-field-gen-accept-dest",
         TaskEditField::GeneratorAcceptCapability(_) => "task-edit-field-gen-accept-cap",
-        TaskEditField::GeneratorAcceptSave => "task-edit-field-gen-accept-save",
     }
 }
 
@@ -182,17 +180,12 @@ enum TaskEditField {
     GeneratorField(usize),
     /// The Linear filter query editor.
     LinearQuery,
-    /// Generator "Save configuration" button — configuration is never saved
-    /// on blur, only from here.
-    GeneratorSave,
     /// Generator "Refresh now" button.
     GeneratorRefresh,
     /// Quick-accept destination node slug.
     GeneratorAcceptDestination,
     /// One quick-accept capability chip; Enter / click toggles it.
     GeneratorAcceptCapability(Capability),
-    /// Quick-accept "Save" button.
-    GeneratorAcceptSave,
     Capability(Capability),
 }
 
@@ -218,10 +211,8 @@ impl TaskEditField {
                 | Self::NewSandboxForkSource
                 | Self::NewSandboxCreate
                 | Self::GeneratorSource
-                | Self::GeneratorSave
                 | Self::GeneratorRefresh
                 | Self::GeneratorAcceptCapability(_)
-                | Self::GeneratorAcceptSave
                 | Self::Capability(_)
         )
     }
@@ -392,6 +383,10 @@ pub struct TaskEditView {
     /// its debounce task. A failed save is not retried until the form changes.
     generator_autosave_pending: Option<serde_json::Value>,
     _generator_autosave_task: Option<gpui::Task<()>>,
+    /// The form as it stood when a data source was first picked. Saving binds
+    /// the source for good, so the first autosave waits until the form
+    /// differs from this — picking (or cycling through) sources saves nothing.
+    generator_blank_config: Option<serde_json::Value>,
     generator_invalid_fields: HashSet<usize>,
     /// Label of the background save/refresh in flight, if any.
     generator_busy: Option<String>,
@@ -402,12 +397,16 @@ pub struct TaskEditView {
     generator_config_error: Option<String>,
     /// When true, show the generator detail view instead of the edit form.
     generator_show_detail: bool,
-    /// Quick-accept destination slug, as typed. Not saved until
-    /// `GeneratorAcceptSave` is activated.
+    /// Quick-accept destination slug, as typed. Saves itself after a short
+    /// pause, like the rest of the quick-accept form.
     generator_accept_destination_input: Entity<InputState>,
-    /// The last-saved quick-accept destination, so "unsaved changes" compares
-    /// like with like.
+    /// The quick-accept destination text as last saved, so "unsaved changes"
+    /// compares like with like.
     generator_accept_destination_saved: Option<String>,
+    /// The quick-accept form an autosave is scheduled (or was last attempted)
+    /// for, and its debounce task.
+    generator_accept_autosave_pending: Option<(String, Vec<Capability>)>,
+    _generator_accept_autosave_task: Option<gpui::Task<()>>,
     /// Capabilities currently checked in the quick-accept form.
     generator_accept_capabilities: Vec<Capability>,
     /// Capabilities as last persisted.
@@ -631,6 +630,7 @@ impl TaskEditView {
             generator_saved_config: None,
             generator_autosave_pending: None,
             _generator_autosave_task: None,
+            generator_blank_config: None,
             generator_invalid_fields: HashSet::new(),
             generator_busy: None,
             generator_data_source_type: None,
@@ -641,6 +641,8 @@ impl TaskEditView {
             generator_show_detail: false,
             generator_accept_destination_input,
             generator_accept_destination_saved: None,
+            generator_accept_autosave_pending: None,
+            _generator_accept_autosave_task: None,
             generator_accept_capabilities: Vec::new(),
             generator_accept_capabilities_saved: Vec::new(),
             generator_accept_error: None,
@@ -865,9 +867,6 @@ impl TaskEditView {
                         stops.push(TaskEditField::LinearQuery);
                     }
                 }
-                if self.generator_data_source_type.is_none() {
-                    stops.push(TaskEditField::GeneratorSave);
-                }
             }
             if self.generator_data_source_type.is_some() {
                 stops.push(TaskEditField::GeneratorRefresh);
@@ -877,7 +876,6 @@ impl TaskEditView {
                 for cap in Capability::ALL {
                     stops.push(TaskEditField::GeneratorAcceptCapability(cap));
                 }
-                stops.push(TaskEditField::GeneratorAcceptSave);
             }
         }
         for cap in Capability::ALL {
@@ -978,10 +976,8 @@ impl TaskEditView {
             | TaskEditField::WorktreeAction
             | TaskEditField::LaunchShell
             | TaskEditField::GeneratorSource
-            | TaskEditField::GeneratorSave
             | TaskEditField::GeneratorRefresh
             | TaskEditField::GeneratorAcceptCapability(_)
-            | TaskEditField::GeneratorAcceptSave
             | TaskEditField::Capability(_) => return None,
         })
     }
@@ -1059,20 +1055,12 @@ impl TaskEditView {
                 self.cycle_generator_source(window, cx);
                 return;
             }
-            TaskEditField::GeneratorSave => {
-                self.save_generator_config(cx);
-                return;
-            }
             TaskEditField::GeneratorRefresh => {
                 self.refresh_generator_now(cx);
                 return;
             }
             TaskEditField::GeneratorAcceptCapability(cap) => {
                 self.toggle_accept_capability(cap, cx);
-                return;
-            }
-            TaskEditField::GeneratorAcceptSave => {
-                self.save_generator_accept_config(cx);
                 return;
             }
             TaskEditField::Capability(cap) => {
@@ -1854,11 +1842,13 @@ impl TaskEditView {
         }
     }
 
-    /// Once a generator is configured, edits save themselves after a short
-    /// pause; only the first configuration needs an explicit Save.
+    /// Edits save themselves after a short pause. The first save binds the
+    /// data source, so it waits until the user has filled something in.
     fn schedule_generator_autosave(&mut self, cx: &mut Context<Self>) {
         const DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(500);
-        if self.generator_data_source_type.is_none() || !self.generator_dirty(cx) {
+        let untouched = self.generator_data_source_type.is_none()
+            && self.generator_blank_config.as_ref() == Some(&self.generator_config_value(cx));
+        if self.generator_source_key().is_none() || untouched || !self.generator_dirty(cx) {
             self.generator_autosave_pending = None;
             self._generator_autosave_task = None;
             return;
@@ -1923,6 +1913,7 @@ impl TaskEditView {
                 self.generator_extra_config.clear();
                 self.generator_invalid_fields.clear();
                 self.generator_saved_config = None;
+                self.generator_blank_config = None;
                 self.generator_accept_destination_input.update(cx, |input, cx| {
                     input.set_value("", window, cx);
                 });
@@ -2037,11 +2028,16 @@ impl TaskEditView {
                         // Re-read the filters against the new schema, which
                         // may let the query write ones it had to carry.
                         let was_dirty = this.generator_dirty(cx);
+                        let was_blank = this.generator_blank_config.as_ref()
+                            == Some(&this.generator_config_value(cx));
                         let filters = this.linear_filter_config(cx);
                         this.load_linear_state();
                         this.initialize_linear_filter_values(filters);
                         if !was_dirty {
                             this.generator_saved_config = Some(this.generator_config_value(cx));
+                        }
+                        if was_blank {
+                            this.generator_blank_config = Some(this.generator_config_value(cx));
                         }
                         this.clamp_focus_index();
                         this.linear_introspection_error = None;
@@ -2460,6 +2456,7 @@ impl TaskEditView {
             cx,
         );
         self.generator_pending_source_type = Some(data_source_type);
+        self.generator_blank_config = Some(self.generator_config_value(cx));
         self.clamp_focus_index();
         cx.notify();
     }
@@ -2509,7 +2506,7 @@ impl TaskEditView {
         cx.notify();
     }
 
-    /// Persist the form: the first Save, or a debounced autosave. Validation
+    /// Persist the form, from the debounced autosave. Validation
     /// runs here, and the store write plus the refresh a changed config is
     /// owed run on the background executor so the UI stays responsive
     /// throughout.
@@ -2662,6 +2659,9 @@ impl TaskEditView {
         let Some(node_id) = self.node_uuid() else {
             return;
         };
+        let destination_text = input_text(&self.generator_accept_destination_input, cx)
+            .trim()
+            .to_string();
         let destination_node_id = match self.resolve_accept_destination(cx) {
             Ok(id) => id,
             Err(err) => {
@@ -2692,10 +2692,41 @@ impl TaskEditView {
             return;
         }
         self.generator_accept_busy = false;
-        self.generator_accept_destination_saved =
-            destination_node_id.map(|id| id.to_string());
+        self.generator_accept_destination_saved = Some(destination_text);
         self.generator_accept_capabilities_saved = capabilities;
         self.notify_changed(cx);
+    }
+
+    /// Quick-accept edits save themselves after a short pause, like the
+    /// data-source config above them.
+    fn schedule_generator_accept_autosave(&mut self, cx: &mut Context<Self>) {
+        const DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(500);
+        let form = (
+            input_text(&self.generator_accept_destination_input, cx)
+                .trim()
+                .to_string(),
+            self.generator_accept_capabilities.clone(),
+        );
+        let saved_destination = self
+            .generator_accept_destination_saved
+            .clone()
+            .unwrap_or_default();
+        if self.generator_data_source_type.is_none()
+            || (form.0 == saved_destination && form.1 == self.generator_accept_capabilities_saved)
+        {
+            self.generator_accept_autosave_pending = None;
+            self._generator_accept_autosave_task = None;
+            return;
+        }
+        if self.generator_accept_autosave_pending.as_ref() == Some(&form) {
+            return;
+        }
+        self.generator_accept_autosave_pending = Some(form);
+        // Replacing the task drops (cancels) the previous debounce.
+        self._generator_accept_autosave_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(DEBOUNCE).await;
+            let _ = this.update(cx, |this, cx| this.save_generator_accept_config(cx));
+        }));
     }
 
     /// Fetch from the configured data source on the background executor. The
@@ -4442,7 +4473,7 @@ impl TaskEditView {
 
     /// Quick-accept: the destination node a ticket copies to on Accept, and
     /// the capabilities enabled on the copy. Both start unset — the Accept
-    /// action is a no-op until a destination is saved here.
+    /// action is a no-op until a destination is set here. Edits autosave.
     fn render_generator_accept_section(
         &self,
         muted: gpui::Hsla,
@@ -4529,23 +4560,6 @@ impl TaskEditView {
                 cx,
             )));
         }
-
-        col = col.child(
-            h_flex().justify_end().child(
-                Button::new("task-edit-gen-accept-save")
-                    .label(if self.generator_accept_busy {
-                        "Saving…"
-                    } else {
-                        "Save"
-                    })
-                    .compact()
-                    .selected(self.field_nav_focused(TaskEditField::GeneratorAcceptSave))
-                    .disabled(self.generator_accept_busy)
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.save_generator_accept_config(cx);
-                    })),
-            ),
-        );
 
         col
     }
@@ -5137,7 +5151,7 @@ impl TaskEditView {
         .into_any_element()
     }
 
-    /// Save (first configuration only; after that edits autosave) / Refresh.
+    /// Refresh, and whether the form is saved (edits autosave).
     fn render_generator_actions(
         &self,
         muted: gpui::Hsla,
@@ -5148,46 +5162,9 @@ impl TaskEditView {
         let configured = self.generator_data_source_type.is_some();
         let active = cx.theme().list_active;
         let active_border = cx.theme().list_active_border;
-        let save_focused = self.field_nav_focused(TaskEditField::GeneratorSave);
         let refresh_focused = self.field_nav_focused(TaskEditField::GeneratorRefresh);
 
-        let save_label = match (busy.as_deref(), configured) {
-            (Some(label), _) => label.to_string(),
-            (None, false) => "Save configuration".to_string(),
-            (None, true) => String::new(),
-        };
-
-        let mut row = h_flex()
-            .gap_2()
-            .items_center()
-            .flex_wrap()
-            .when(!configured, |row| {
-                row.child(
-                    self.apply_focus_scroll_anchor(
-                        TaskEditField::GeneratorSave,
-                        div()
-                            .id(field_anchor_id(TaskEditField::GeneratorSave))
-                            .rounded_md()
-                            .when(save_focused, |el| {
-                                el.bg(active).border_1().border_color(active_border)
-                            })
-                            .child(
-                                Button::new("task-edit-gen-save")
-                                    .label(save_label)
-                                    .primary()
-                                    .compact()
-                                    .disabled(busy.is_some() || !dirty)
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.enter_field_edit(
-                                            TaskEditField::GeneratorSave,
-                                            window,
-                                            cx,
-                                        );
-                                    })),
-                            ),
-                    ),
-                )
-            });
+        let mut row = h_flex().gap_2().items_center().flex_wrap();
 
         if configured {
             row = row.child(
@@ -5217,14 +5194,14 @@ impl TaskEditView {
             );
         }
 
-        let hint = match (&busy, dirty, configured) {
-            (Some(label), _, _) => label.clone(),
-            (None, true, true) if self.generator_config_error.is_some() => {
-                "Unsaved changes".to_string()
-            }
-            (None, true, true) => "Saving…".to_string(),
-            (None, false, _) => "Saved".to_string(),
-            (None, true, false) => String::new(),
+        let untouched = !configured
+            && self.generator_blank_config.as_ref() == Some(&self.generator_config_value(cx));
+        let hint = match (&busy, dirty) {
+            (Some(label), _) => label.clone(),
+            (None, true) if untouched => String::new(),
+            (None, true) if self.generator_config_error.is_some() => "Unsaved changes".to_string(),
+            (None, true) => "Saving…".to_string(),
+            (None, false) => "Saved".to_string(),
         };
         if !hint.is_empty() {
             row = row.child(div().text_xs().text_color(muted).child(hint));
@@ -5728,6 +5705,7 @@ impl Render for TaskEditView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.drain_pending(window, cx);
         self.schedule_generator_autosave(cx);
+        self.schedule_generator_accept_autosave(cx);
 
         if let Some(query) = self.linear_query_pending.take() {
             self.linear_query_input
