@@ -1,6 +1,6 @@
 //! Zed code editor plugin.
 
-use crate::fleet::code_editor::CodeEditor;
+use crate::fleet::code_editor::{CodeEditor, CodeLocation};
 use crate::fleet::terminal::path_util::normalize_launch_path;
 use anyhow::{Context, Result, bail};
 use std::ffi::OsString;
@@ -10,6 +10,17 @@ use std::process::{Command, Stdio};
 /// CLI args for opening a workspace in Zed (focus-or-open via `--classic`).
 pub fn zed_open_args(cwd: &Path) -> Vec<String> {
     vec!["--classic".into(), cwd.display().to_string()]
+}
+
+/// CLI args for opening `file` at `location`'s position. With `root`, the
+/// file opens in that workspace: Zed reuses a window that already has it.
+pub fn zed_location_args(root: Option<&Path>, file: &Path, location: &CodeLocation) -> Vec<String> {
+    let mut args = vec!["--classic".to_string()];
+    if let Some(root) = root {
+        args.push(root.display().to_string());
+    }
+    args.push(location.with_position(&file.display().to_string()));
+    args
 }
 
 /// Candidate binary names to try on PATH (order matters).
@@ -197,17 +208,181 @@ pub fn open_in_container(
         &exec.id
     };
     let folder_url = container_url(&user, host, folder, None);
+    let env = zed_env(data_root)?;
+    if env.is_empty() {
+        anyhow::bail!(
+            "tod-zed-shim is not installed next to tod, so Zed cannot reach dev container {container}; reinstall tod"
+        );
+    }
+    let since = launch_time();
+    let connection = format!("docker-{container}");
+    let what = format!("dev container {container}");
     let Some((path, position)) = file else {
-        return spawn_zed_url(&folder_url, data_root);
+        spawn_zed_with(&[folder_url], &env)?;
+        return require_connection(data_root, &connection, since, &what);
     };
     // The file goes to a window whose remote project holds it, so the
     // folder's call has to have handed off to Zed first.
-    let mut child = spawn_zed_child(&[folder_url], &zed_env(data_root)?)?;
+    let before = zed_connections(&exec);
+    let mut child = spawn_zed_child(&[folder_url], &env)?;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     while child.try_wait()?.is_none() && std::time::Instant::now() < deadline {
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
-    spawn_zed_url(&container_url(&user, host, path, position), data_root)
+    // A Zed that is not reaching the container through tod's shim will
+    // never connect: say so rather than wait for it.
+    require_connection(data_root, &connection, since, &what)?;
+    // The CLI returns before Zed has connected, and a file sent before then
+    // opens as a project of its own. A folder already open with Zed still
+    // connected only comes to the front, with no new connection to wait for.
+    let key = format!("{}:{folder}", exec.id);
+    let mut opened = opened_folders().lock().unwrap_or_else(|e| e.into_inner());
+    if !(opened.contains(&key) && before.is_some_and(|n| n > 0)) {
+        wait_for_new_connection(&exec, before);
+    }
+    opened.insert(key);
+    drop(opened);
+    spawn_zed_with(&[container_url(&user, host, path, position)], &env)
+}
+
+/// Open `path` in cloud sandbox `sandbox` in Zed, and report an error when
+/// no connection comes through tod's shim (see [`require_connection`]).
+/// Waits up to [`CONNECTION_WAIT`]: never call it on the UI thread.
+pub fn open_in_sandbox(data_root: &Path, sandbox: &str, path: &str) -> Result<()> {
+    open_url_in_sandbox(data_root, sandbox, &sandbox_url(sandbox, path))
+}
+
+/// [`open_in_sandbox`] for a `url` already made from [`sandbox_url`] (with a
+/// line and column, say).
+pub fn open_url_in_sandbox(data_root: &Path, sandbox: &str, url: &str) -> Result<()> {
+    let env = zed_env(data_root)?;
+    if env.is_empty() {
+        anyhow::bail!("tod-zed-shim is not installed next to tod, so Zed cannot reach sandbox {sandbox}; reinstall tod");
+    }
+    let since = launch_time();
+    spawn_zed_with(&[url.to_string()], &env)?;
+    require_connection(data_root, &format!("sandbox-{sandbox}"), since, &format!("sandbox {sandbox}"))
+}
+
+/// Where `tod-zed-shim` records the connections it carries, under
+/// [`SHIM_DIR`]: `connections/<key>/<pid>`, `<key>` being `docker-<container>`
+/// or `sandbox-<name>`. The shim holds a lock on its file while it runs. Must
+/// match the shim's `CONNECTIONS_DIR`.
+pub const CONNECTIONS_DIR: &str = "connections";
+
+/// How long to wait for Zed to connect through the shim after tod asks it
+/// to open a remote folder.
+pub const CONNECTION_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// A little before now, so a marker written in the same clock tick (or on a
+/// file system with coarse timestamps) still counts as new.
+fn launch_time() -> std::time::SystemTime {
+    std::time::SystemTime::now() - std::time::Duration::from_secs(2)
+}
+
+/// Waits for Zed to reach the host through tod's shim; an error means it
+/// did not. Windows Zed is single-instance: a Zed that was already running,
+/// not started by tod, gets tod's request but has no shim on its `PATH`, so
+/// its own `ssh` fails on the `.tod` host and nothing else says so.
+///
+/// A Zed tod started that is already connected to this host may reuse that
+/// connection and run no new `ssh`; its shim processes (the connection's
+/// master and proxy) are still running and hold their markers' locks, which
+/// counts as connected.
+fn require_connection(data_root: &Path, key: &str, since: std::time::SystemTime, what: &str) -> Result<()> {
+    let dir = data_root.join(SHIM_DIR).join(CONNECTIONS_DIR).join(key);
+    if wait_for_connection(&dir, since, CONNECTION_WAIT, std::time::Duration::from_millis(250)) {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "Zed was already open without tod's connection helper, so it could not reach {what}. Quit Zed and open again."
+    )
+}
+
+/// Polls [`connection_seen`] until it holds or `timeout` passes.
+pub fn wait_for_connection(
+    dir: &Path,
+    since: std::time::SystemTime,
+    timeout: std::time::Duration,
+    poll: std::time::Duration,
+) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if connection_seen(dir, since) {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(poll);
+    }
+}
+
+/// Whether a shim has carried a connection for this host since `since` (a
+/// marker written then), or carries one now (a marker it still locks).
+/// Unlocked markers from before are leftovers and are removed.
+pub fn connection_seen(dir: &Path, since: std::time::SystemTime) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    let mut seen = false;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if entry.metadata().and_then(|m| m.modified()).is_ok_and(|t| t >= since) {
+            seen = true;
+            continue;
+        }
+        let Ok(file) = std::fs::OpenOptions::new().read(true).open(&path) else {
+            continue;
+        };
+        match file.try_lock() {
+            Err(std::fs::TryLockError::WouldBlock) => seen = true,
+            Err(std::fs::TryLockError::Error(_)) => {}
+            Ok(()) => {
+                drop(file);
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+    }
+    seen
+}
+
+/// Container folders tod has opened in Zed during this run.
+fn opened_folders() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
+    static OPENED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    OPENED.get_or_init(Default::default)
+}
+
+/// How many Zed clients are connected to the container: its remote server
+/// runs one `proxy` per connection. `None` when it cannot tell.
+fn zed_connections(exec: &tod_agent::devcontainer::ContainerExec) -> Option<usize> {
+    let script = "for f in /proc/[0-9]*/cmdline; do tr '\\0' ' ' < \"$f\" 2>/dev/null; echo; done \
+                  | grep -c '[z]ed-remote-server.*proxy'";
+    let out = exec.output("/", "sh", &["-c", script]).ok()?;
+    // grep -c exits 1 when it counts none.
+    String::from_utf8_lossy(&out.stdout).trim().parse().ok()
+}
+
+/// Wait until Zed has a connection to the container it did not have
+/// `before`: long when it has none (the first connect installs Zed's
+/// server), briefly otherwise.
+fn wait_for_new_connection(exec: &tod_agent::devcontainer::ContainerExec, before: Option<usize>) {
+    use std::time::{Duration, Instant};
+    let Some(before) = before else {
+        std::thread::sleep(Duration::from_secs(3));
+        return;
+    };
+    let limit = if before == 0 { 120 } else { 10 };
+    let deadline = Instant::now() + Duration::from_secs(limit);
+    while Instant::now() < deadline {
+        if zed_connections(exec).is_some_and(|now| now > before) {
+            // Let the new window take the project before the file arrives.
+            std::thread::sleep(Duration::from_secs(1));
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
 }
 
 pub fn spawn_zed_url(url: &str, data_root: &Path) -> Result<()> {
@@ -227,6 +402,7 @@ fn spawn_zed_child(args: &[String], env: &[(String, OsString)]) -> Result<std::p
              Windows: typically %LOCALAPPDATA%\\Programs\\Zed\\bin)."
         )
     })?;
+    allow_foreground();
     Command::new(&bin)
         .args(args)
         .envs(env.iter().map(|(k, v)| (k, v)))
@@ -235,6 +411,18 @@ fn spawn_zed_child(args: &[String], env: &[(String, OsString)]) -> Result<std::p
         .stderr(Stdio::null())
         .spawn()
         .with_context(|| format!("spawn `{} {}`", bin.display(), args.join(" ")))
+}
+
+/// Let the Zed window come to the front. The CLI hands the request to the
+/// running Zed, a process Windows would otherwise not let take the foreground
+/// from tod, so its window would only flash in the taskbar.
+fn allow_foreground() {
+    #[cfg(windows)]
+    {
+        use windows::Win32::UI::WindowsAndMessaging::{ASFW_ANY, AllowSetForegroundWindow};
+        // Fails harmlessly when tod is not in the foreground itself.
+        let _ = unsafe { AllowSetForegroundWindow(ASFW_ANY) };
+    }
 }
 
 /// Where Zed's `ssh`, `scp`, and `sftp` stand-ins live, under the data root.
@@ -318,6 +506,14 @@ impl CodeEditor for ZedEditor {
     fn open(&self, dir: &Path) -> Result<()> {
         spawn_zed(dir)
     }
+
+    fn open_location(&self, root: Option<&Path>, file: &Path, location: &CodeLocation) -> Result<()> {
+        let env = crate::paths::TodPaths::discover()
+            .ok()
+            .and_then(|paths| zed_env(paths.data_root()).ok())
+            .unwrap_or_default();
+        spawn_zed_with(&zed_location_args(root, file, location), &env)
+    }
 }
 
 #[cfg(test)]
@@ -368,6 +564,56 @@ mod tests {
         Scratch(dir)
     }
 
+    fn short() -> (std::time::Duration, std::time::Duration) {
+        (std::time::Duration::from_millis(300), std::time::Duration::from_millis(20))
+    }
+
+    #[test]
+    fn no_connection_times_out() {
+        let root = scratch("conn-none");
+        let (timeout, poll) = short();
+        let since = std::time::SystemTime::now();
+        assert!(!wait_for_connection(&root.path().join("docker-c"), since, timeout, poll));
+        std::fs::create_dir_all(root.path()).unwrap();
+        assert!(!wait_for_connection(root.path(), since, timeout, poll));
+    }
+
+    #[test]
+    fn a_marker_written_after_launch_counts() {
+        let root = scratch("conn-new");
+        let dir = root.path().join("docker-c");
+        let since = launch_time();
+        let writer = {
+            let dir = dir.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                std::fs::create_dir_all(&dir).unwrap();
+                std::fs::write(dir.join("123"), b"").unwrap();
+            })
+        };
+        let (_, poll) = short();
+        assert!(wait_for_connection(&dir, since, std::time::Duration::from_secs(5), poll));
+        writer.join().unwrap();
+    }
+
+    #[test]
+    fn a_held_old_marker_counts_and_a_stale_one_is_removed() {
+        let root = scratch("conn-old");
+        let dir = root.path().join("docker-c");
+        std::fs::create_dir_all(&dir).unwrap();
+        let held = std::fs::File::create(dir.join("1")).unwrap();
+        held.lock().unwrap();
+        std::fs::write(dir.join("2"), b"").unwrap();
+        // Both markers predate this launch.
+        let since = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
+        let (timeout, poll) = short();
+        assert!(wait_for_connection(&dir, since, timeout, poll));
+        assert!(!dir.join("2").exists(), "the unlocked leftover is removed");
+        drop(held);
+        assert!(!wait_for_connection(&dir, since, timeout, poll));
+        assert!(!dir.join("1").exists());
+    }
+
     /// Needs `ssh-keygen` on PATH; skipped without it.
     #[test]
     fn container_key_is_generated_once() {
@@ -393,6 +639,26 @@ mod tests {
         let exec = tod_agent::devcontainer::ContainerExec::connect(&container).unwrap();
         let user = exec.user.clone().unwrap_or_else(|| "root".into());
         tod_agent::devcontainer::prepare_sshd(&exec.id, &user, &key).unwrap();
+    }
+
+    #[test]
+    fn location_args_open_the_file_in_its_workspace() {
+        let location = CodeLocation::parse("src/main.rs:6:4").unwrap();
+        let root = PathBuf::from("/w/demo");
+        let file = root.join("src/main.rs");
+        assert_eq!(
+            zed_location_args(Some(&root), &file, &location),
+            vec![
+                "--classic".to_string(),
+                root.display().to_string(),
+                format!("{}:6:4", file.display()),
+            ]
+        );
+        let bare = CodeLocation::parse("/w/x.rs").unwrap();
+        assert_eq!(
+            zed_location_args(None, Path::new("/w/x.rs"), &bare),
+            vec!["--classic".to_string(), "/w/x.rs".to_string()]
+        );
     }
 
     #[test]

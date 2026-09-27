@@ -408,7 +408,18 @@ Nothing starts or builds a container; tod only uses a running one.
   makes `/run/sshd`, maps `UNKNOWN` to 127.0.0.1 in `/etc/hosts` (PAM's
   ~13s DNS wait), and authorizes the key; it installs nothing, and a
   container without `sshd` gets an error saying to install it. A mounted
-  repository opens on this machine.
+  repository opens on this machine. On Windows the real `ssh` may be Git's
+  MSYS build, which rewrites an absolute path in a ProxyCommand, so the shim
+  says `//usr/sbin/sshd` there. The folder's `zed` call returns before Zed
+  has connected, and a file sent sooner opens as a project of its own, so
+  `open_in_container` waits for a new `zed-remote-server … proxy` in the
+  container before sending the file.
+- Code references (`path:line[:col]`) in selectable text and markdown are
+  links (`ui::code_links`): a click dispatches `OpenCodeRef`, which the
+  conversation view, the unified view (the chat drawer's focus), or the
+  shell resolves against that node's Files directory and opens through
+  `code_editor::open_code_location`, off the UI thread. Host, container,
+  and sandbox directories all work.
 - Tests that need a real container are skipped unless `TOD_TEST_DEV_CONTAINER`
   (a running container with git; some also need
   `TOD_TEST_DEV_CONTAINER_HOST_DIR` or `TOD_TEST_TOD_CLI`) is set; the

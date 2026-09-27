@@ -28,6 +28,7 @@ use crate::ui::app_nav::{
     HasAppNav, ShellGoConversation, ShellGoDatabase, ShellGoPullRequests, ShellGoSettings,
     ShellGoTasks, ShellGoWorkbench, register_app_nav_keyboard_bindings,
 };
+use crate::ui::code_links::{OpenCodeRef, open_code_ref};
 use crate::ui::key_context::NOT_INPUT;
 use crate::ui::panel_split::{PanelSplitState, h_panel_split};
 use crate::ui::selectable_text::selectable_text;
@@ -1242,6 +1243,12 @@ impl Render for Shell {
                 this.open_conversation(Focus::Project, window, cx);
             }))
             .on_action(cx.listener(Self::on_open_agent_chat))
+            .on_action(cx.listener(|this, action: &OpenCodeRef, window, cx| {
+                // Text outside a view that knows its node: the task tree's
+                // selection is what the user is looking at.
+                let node = this.task_list.read(cx).selected_node_id();
+                open_code_ref(this.fleet.clone(), node, &action.target, window, cx);
+            }))
             .on_action(cx.listener(Self::on_report_problem))
             .on_action(cx.listener(Self::on_open_report_dialog))
             .on_action(cx.listener(|this, action: &OpenConversation, window, cx| {

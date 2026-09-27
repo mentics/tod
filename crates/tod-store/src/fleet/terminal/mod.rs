@@ -1036,6 +1036,25 @@ pub fn open_terminal_command(
     )
 }
 
+/// Open a terminal on this machine, in `cwd`, that runs `command` (with `env`
+/// set) and is then the user's: the shell stays open when it exits, so what
+/// it printed can be read and copied. For commands that belong to no node,
+/// such as `claude setup-token` from Settings. Spawns a process: never call
+/// it on the UI thread.
+pub fn open_host_terminal_command(
+    paths: &TodPaths,
+    settings: &TodSettings,
+    cwd: &Path,
+    env: &[(String, String)],
+    command: &str,
+) -> Result<()> {
+    let terminal = fresh_terminal_settings(paths, &settings.terminal);
+    let assets = ensure_shell_init_assets(paths)?;
+    let session_id = format!("command-{}", uuid::Uuid::new_v4());
+    let startup = host_startup(env, None, command, &terminal);
+    launch_shell_terminal(cwd, &terminal, &session_id, &assets, Some(&startup))
+}
+
 /// `command` with `env` set first, for the terminal's own shell on this
 /// machine: PowerShell on Windows unless the terminal is Git Bash, else a
 /// POSIX shell.

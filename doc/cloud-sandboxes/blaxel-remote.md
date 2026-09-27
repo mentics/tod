@@ -332,6 +332,11 @@ length up to the 60 minutes tested.
   single-instance, so if Zed is already open, a launch from tod is handed to
   that instance, which has no shim. `tod-sandbox zed` notices that no
   connection came through the shim within 20 s and says to quit Zed first.
+  The app does the same for sandboxes and dev containers
+  (`zed::open_in_sandbox` / `open_in_container`), and reports it as an error:
+  the shim keeps a locked marker, `zed-shim/connections/<docker-|sandbox-><name>/<pid>`,
+  for each connection it carries, and a marker written since the launch, or
+  one still locked (a Zed tod started reusing its live connection), counts.
 - **A simpler relay, untested.** Zed's own server already keeps messages the
   client has not acknowledged, and resends them when a proxy connects with
   `--reconnect`. So parking could end the proxy process, and reattaching could

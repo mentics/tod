@@ -249,7 +249,18 @@ mock run, a plan step whose body starts `wait 3m: …` records a wait of that
 long, so the orchestrator's timer wakes the node. The relay's log
 (`GET <sandbox-url>/process/tod-relay/logs`) holds the supervisor's too.
 
-For Claude, the supervisor needs Claude Code logged in inside the node's
-sandbox: set `CLAUDE_CODE_OAUTH_TOKEN` (from `claude setup-token`) in the
-sandbox's environment, or run `claude /login` in `tod-sandbox shell
-<sandbox>` as the user the supervisor runs as (root).
+For Claude, the node needs your Claude subscription token, set **once per
+machine** (not per sandbox): Settings → Cloud sandboxes → **Claude
+subscription** → **Get a token** opens a terminal running `claude
+setup-token` (Claude Code must be installed on this machine); sign in in the
+browser it opens, copy the token it prints (`sk-ant-oat01-…`), and paste it
+into the **Claude subscription** field above the button (Enter saves it). tod
+keeps it in its credential store (the OS keyring, else an encrypted file) and
+gives it to each node sandbox it creates through the sandbox's proxy, as the
+header for `api.anthropic.com`; Claude Code in the sandbox only sees a
+placeholder, so nothing needs signing in there. Without a token, running a
+Claude node in the cloud fails at once with a message naming that row. A
+token changed later reaches a node when its sandbox is next created.
+`claude_token_via = "env"` under `[blaxel]` in `sandboxes.toml` puts the
+token in the supervisor's environment instead (see
+[autonomous-nodes.md](autonomous-nodes.md), Credentials).

@@ -47,6 +47,26 @@ pub struct Account {
     /// shows whose sandbox is whose.
     #[serde(default)]
     pub owner: Option<String>,
+    /// How a node's Claude Code gets the user's subscription token
+    /// (`claude_token_via = "proxy" | "env"`); see [`ClaudeTokenVia`].
+    #[serde(default)]
+    pub claude_token_via: ClaudeTokenVia,
+}
+
+/// How the Claude subscription token (`claude setup-token`) reaches the
+/// Claude Code agent in an autonomous node's sandbox
+/// (`doc/cloud-sandboxes/autonomous-nodes.md`, Credentials).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ClaudeTokenVia {
+    /// The sandbox's proxy adds it to requests for `api.anthropic.com`;
+    /// Claude Code sees only a placeholder. The token never enters the
+    /// sandbox.
+    #[default]
+    Proxy,
+    /// It is put in the supervisor's environment only (so Claude Code, its
+    /// child, has it), never in the sandbox-wide one.
+    Env,
 }
 
 /// What a new sandbox starts from when neither the account nor the request
@@ -67,6 +87,7 @@ impl Account {
             default_image: default_image(),
             memory_mb: default_memory(),
             owner: std::env::var("USERNAME").or_else(|_| std::env::var("USER")).ok(),
+            claude_token_via: ClaudeTokenVia::default(),
         }
     }
 }
@@ -158,6 +179,19 @@ mod tests {
     }
 
     #[test]
+    fn claude_token_via_defaults_to_the_proxy() {
+        let c: Config = toml::from_str("[blaxel]
+workspace = \"w\"
+").unwrap();
+        assert_eq!(c.blaxel.unwrap().claude_token_via, ClaudeTokenVia::Proxy);
+        let c: Config = toml::from_str("[blaxel]
+workspace = \"w\"
+claude_token_via = \"env\"
+").unwrap();
+        assert_eq!(c.blaxel.unwrap().claude_token_via, ClaudeTokenVia::Env);
+    }
+
+    #[test]
     fn round_trips() {
         let dir = std::env::temp_dir().join(format!("tod-sandbox-cfg-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -171,6 +205,7 @@ mod tests {
             default_image: default_image(),
             memory_mb: 4096,
             owner: Some("me".into()),
+            claude_token_via: ClaudeTokenVia::Env,
         });
         c.upsert(Sandbox { name: "a".into(), image: "i".into(), url: None, agents: true });
         c.upsert(Sandbox { name: "a".into(), image: "j".into(), url: Some("u".into()), agents: true });
@@ -178,7 +213,9 @@ mod tests {
         let back = Config::load(&path).unwrap();
         assert_eq!(back.sandboxes.len(), 1);
         assert_eq!(back.sandbox("a").unwrap().image, "j");
-        assert_eq!(back.blaxel.unwrap().auth, AuthMode::ApiKey);
+        let acct = back.blaxel.unwrap();
+        assert_eq!(acct.auth, AuthMode::ApiKey);
+        assert_eq!(acct.claude_token_via, ClaudeTokenVia::Env);
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

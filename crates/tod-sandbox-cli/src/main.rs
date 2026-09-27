@@ -257,6 +257,7 @@ fn setup(ctx: &mut Ctx, mut args: Args) -> Result<i32> {
         default_image: "blaxel/base-image:latest".into(),
         memory_mb: 4096,
         owner: std::env::var("USERNAME").or_else(|_| std::env::var("USER")).ok(),
+        claude_token_via: Default::default(),
     };
     let base = existing.filter(|a| a.workspace == workspace).unwrap_or(defaults);
     let acct = Account {
@@ -269,6 +270,7 @@ fn setup(ctx: &mut Ctx, mut args: Args) -> Result<i32> {
             None => base.memory_mb,
         },
         owner: args.opt("--owner").or(base.owner),
+        claude_token_via: base.claude_token_via,
     };
     args.done()?;
 
