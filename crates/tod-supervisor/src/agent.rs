@@ -19,7 +19,7 @@ use tod_agent::{
 /// Which agent runs the node.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentKind {
-    /// Claude Code through `claude-code-acp`, with the subscription token in
+    /// Claude Code through `claude-agent-acp`, with the subscription token in
     /// the environment (`CLAUDE_CODE_OAUTH_TOKEN`).
     Claude,
     /// The app's `--agent mock`, writing to the local copy.

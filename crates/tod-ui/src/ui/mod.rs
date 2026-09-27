@@ -1,6 +1,7 @@
 pub mod actionable;
 pub mod agent_chat;
 pub mod agent_runs;
+pub mod claude_adapter;
 pub mod agent_conversation;
 pub mod agent_permission;
 pub mod app_nav;
@@ -19,5 +20,6 @@ pub mod status_filter;
 pub mod style;
 pub mod terminal_handoff;
 pub mod toast;
+pub mod session_info;
 pub mod token_usage;
 pub mod transcript_list;

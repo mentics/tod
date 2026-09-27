@@ -6,6 +6,7 @@
 //! where anything is stored or when — it is told what to say and reports back.
 
 mod acp_host;
+pub mod claude_adapter;
 pub mod agent_launch;
 pub mod agent_traffic;
 mod cursor_acp;

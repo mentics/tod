@@ -41,6 +41,7 @@ use crate::interview::{TodPaths, TodSettings};
 use crate::ui::agent_conversation::{AgentConversationEvent, AgentConversationPanel, Entry, EntryKind};
 use crate::ui::agent_runs::AgentRuns;
 use crate::ui::key_context;
+use crate::ui::session_info::SessionInfo;
 use crate::ui::style;
 use crate::ui::terminal_handoff::{self, CONTINUE_IN_TERMINAL, OPEN_SHELL};
 use crate::unified::resize::{CHAT_START_HEIGHT, ChatDrawerEdge, DIVIDER_WIDTH, DividerDrag};
@@ -102,6 +103,8 @@ pub struct ChatDrawer {
     /// Whether the conversation has an agent session to continue elsewhere.
     has_session: bool,
     status: ConversationStatus,
+    /// The line above the transcript: platform, model, effort, and tokens.
+    session_info: SessionInfo,
     error: Option<SharedString>,
     transcript: Entity<AgentConversationPanel>,
     _transcript_events: Subscription,
@@ -144,6 +147,7 @@ impl ChatDrawer {
             conversation_id: None,
             has_session: false,
             status: ConversationStatus::default(),
+            session_info: SessionInfo::default(),
             error: None,
             transcript,
             _transcript_events: transcript_events,
@@ -400,7 +404,8 @@ impl ChatDrawer {
         Ok(ConversationConfig {
             data_root: self.fleet.paths().root().to_path_buf(),
             media,
-            launch: settings.interview_launch_options(),
+            launch: settings.launch_options_for(tod_store::AgentRole::Default),
+            settings_path: Some(paths.settings_path()),
             context: settings.interview_context.clone(),
         })
     }
@@ -411,8 +416,40 @@ impl ChatDrawer {
             .and_then(|ix| self.agent_runs.read(cx).status_at(ix))
             .unwrap_or_default();
         if status != self.status {
+            // A turn ended: what it spent is in the session log now.
+            if self.status.running && !status.running {
+                self.session_info.mark_stale();
+            }
             self.status = status;
         }
+    }
+
+    /// Read what the session line shows again when it is due (see
+    /// [`SessionInfo::take_due`]), on the background executor: it reads the
+    /// platforms' session logs and the settings.
+    fn refresh_session_info(&mut self, cx: &mut Context<Self>) {
+        self.session_info
+            .show(self.focus, ProtocolKind::Outline, self.conversation_id);
+        let Some(read) = self.session_info.take_due(self.status.running) else {
+            return;
+        };
+        let fleet = self.fleet.clone();
+        cx.spawn(async move |this, cx| {
+            let (read, result) = cx
+                .background_executor()
+                .spawn(async move {
+                    let result = read.run(&fleet);
+                    (read, result)
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if this.session_info.apply(&read, result) {
+                    let line = this.session_info.line(&this.status);
+                    this.transcript.update(cx, |panel, cx| panel.set_usage(line, cx));
+                }
+            });
+        })
+        .detach();
     }
 
     fn on_agent_runs_changed(&mut self, cx: &mut Context<Self>) {
@@ -447,7 +484,10 @@ impl ChatDrawer {
         let activity = self.status.activity.clone();
         let about = self.about.clone();
         let empty = format!("No conversation about {about} yet. Give direction below.");
+        self.refresh_session_info(cx);
+        let usage = self.session_info.line(&self.status);
         self.transcript.update(cx, |panel, cx| {
+            panel.set_usage(usage, cx);
             panel.set_entries(entries, cx);
             panel.set_tools(tools, cx);
             panel.set_status(running, activity, cx);

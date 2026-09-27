@@ -176,6 +176,7 @@ fn config(fx: &Fixture, budget: u64) -> ConversationConfig {
         data_root: fx.root.clone(),
         media: media(),
         launch: AgentLaunchOptions::for_platform(AgentPlatform::Claude),
+        settings_path: None,
         context: InterviewContextSettings {
             context_budget_tokens: budget,
             ..Default::default()

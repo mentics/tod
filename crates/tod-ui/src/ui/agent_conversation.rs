@@ -388,8 +388,9 @@ impl AgentConversationPanel {
         }
     }
 
-    /// The token usage shown under the title: a one-line summary, and the
-    /// full breakdown shown on hover. `None` hides the line.
+    /// The session line shown under the title (platform, model, effort,
+    /// tokens; see `ui::session_info`): one line, and everything behind it
+    /// shown on hover. `None` hides the line.
     pub fn set_usage(&mut self, usage: Option<(String, String)>, cx: &mut Context<Self>) {
         let usage = usage.map(|(line, details)| (line.into(), details.into()));
         if usage != self.usage {
