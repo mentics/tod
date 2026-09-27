@@ -8,6 +8,7 @@ use anyhow::{Result, bail};
 use rusqlite::{Connection, params};
 use uuid::Uuid;
 
+use crate::fleet::node_actions::{FilesDirectory, ResolvedFiles, resolve_files_for_node};
 use crate::fleet::{FleetStore, Workdir};
 use crate::outline::uuid_blob::uuid_to_blob;
 
@@ -74,6 +75,29 @@ pub fn node_branch_changes(fleet: &FleetStore, node_id: Uuid) -> Result<Option<B
     branch_changes(&dir).map(Some)
 }
 
+/// What a node's change count depends on, read cheaply from the store (no
+/// git, no Docker): when it differs from the last one read, the count is
+/// stale. It covers a turn on the node ending, and the node's Files settings
+/// or directory changing (the capability, workspace directory, worktree,
+/// dev container, or sandbox; its own or an ancestor's it inherits).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChangesTrigger {
+    pub ended_turns: i64,
+    pub files: Option<(ResolvedFiles, FilesDirectory)>,
+}
+
+/// The node's current [`ChangesTrigger`].
+pub fn changes_trigger(conn: &Connection, node_id: Uuid) -> Result<ChangesTrigger> {
+    let files = resolve_files_for_node(conn, &node_id.to_string())?.map(|files| {
+        let dir = files.directory();
+        (files, dir)
+    });
+    Ok(ChangesTrigger {
+        ended_turns: ended_turns_for_node(conn, node_id)?,
+        files,
+    })
+}
+
 /// How many turns on conversations focused on `node_id` have ended. A change
 /// in this number means a turn on the node ended since it was last read.
 pub fn ended_turns_for_node(conn: &Connection, node_id: Uuid) -> Result<i64> {
@@ -120,6 +144,65 @@ mod tests {
             .output()
             .expect("git");
         assert!(status.status.success(), "{:?}", String::from_utf8_lossy(&status.stderr));
+    }
+
+    #[test]
+    fn trigger_changes_when_files_settings_change() {
+        use crate::fleet::test_util::{cleanup_fleet_root, temp_fleet_root};
+        use crate::fleet::writer::FleetMutation;
+        use crate::outline::types::Capability;
+        use crate::outline::{CreatePosition, OutlineMutation};
+
+        let root = temp_fleet_root();
+        let store = FleetStore::open(&root).unwrap();
+        store
+            .enqueue_outline(OutlineMutation::CreateList { slug: "t".into(), title: "T".into() })
+            .unwrap();
+        store.writer().flush().unwrap();
+        let list_id = store.list_outline_lists().unwrap()[0].id;
+        let node = Uuid::new_v4();
+        store
+            .enqueue_outline(OutlineMutation::CreateNode {
+                node_id: Some(node),
+                list_id,
+                parent_id: None,
+                anchor_id: None,
+                position: CreatePosition::Below,
+                title: "N".into(),
+            })
+            .unwrap();
+        store.writer().flush().unwrap();
+        let read = || store.read(|conn| changes_trigger(conn, node)).unwrap();
+
+        let before = read();
+        assert_eq!(before.files, None);
+        assert_eq!(read(), before, "unchanged store, unchanged trigger");
+
+        store
+            .enqueue_outline(OutlineMutation::EnableCapabilities {
+                node_id: node,
+                capabilities: vec![Capability::Files],
+            })
+            .unwrap();
+        store.writer().flush().unwrap();
+        let enabled = read();
+        assert_ne!(enabled, before);
+        assert!(matches!(enabled.files, Some((_, FilesDirectory::Missing(_)))));
+
+        let repo = std::env::temp_dir();
+        store
+            .enqueue(FleetMutation::UpdateTaskRepo {
+                id: node.to_string(),
+                repo: Some(repo.display().to_string()),
+            })
+            .unwrap();
+        store.writer().flush().unwrap();
+        let ready = read();
+        assert_ne!(ready, enabled);
+        assert!(matches!(ready.files, Some((_, FilesDirectory::Ready(_)))));
+
+        drop(store);
+        cleanup_fleet_root(&root);
     }
 
     #[test]
