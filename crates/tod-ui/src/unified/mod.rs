@@ -319,6 +319,12 @@ impl UnifiedView {
             _attention_poll,
         };
         this.apply_status_overrides(cx);
+        // The tree comes up with the node selected last time already
+        // selected, which sends no `SelectionChanged`: show its default
+        // panel as selecting it would.
+        if let Some(node_id) = this.task_list.read(cx).selected_node_id() {
+            this.open_panel(this.default_panel(node_id), 0, false, window, cx);
+        }
         this
     }
 
@@ -1499,6 +1505,25 @@ mod tests {
     }
 
     #[gpui::test]
+    fn the_node_selected_at_startup_shows_its_default_panel(cx: &mut TestAppContext) {
+        let fixture = Fixture::new();
+        let (view, cx) = open_view(&fixture, cx);
+        draw(cx);
+
+        view.read_with(cx, |view, cx| {
+            let selected = view.task_list.read(cx).selected_node_id();
+            assert!(selected.is_some());
+            assert_eq!(view.columns.len(), 1);
+            assert_eq!(
+                view.columns.columns()[0].panel,
+                view.default_panel(selected.unwrap())
+            );
+            // Keys start in the tree.
+            assert_eq!(view.columns.focused_index(), None);
+        });
+    }
+
+    #[gpui::test]
     fn restoring_a_place_brings_back_its_columns_and_keeps_shown_panels(
         cx: &mut TestAppContext,
     ) {
@@ -1618,6 +1643,7 @@ mod tests {
         let (view, cx) = open_view(&fixture, cx);
         let node_id = fixture.node_id;
         let obligation_id = fixture.design_obligation;
+        let before = view.read_with(cx, |view, cx| view.chat_drawer.read(cx).focus());
 
         view.update_in(cx, |view, window, cx| {
             view.open_panel(PanelKind::Obligations(node_id), 0, false, window, cx);
@@ -1626,7 +1652,7 @@ mod tests {
         // Opening the list puts its cursor on the first row; that is not a
         // selection, so the drawer stays where it was.
         view.read_with(cx, |view, cx| {
-            assert_eq!(view.chat_drawer.read(cx).focus(), Focus::Project);
+            assert_eq!(view.chat_drawer.read(cx).focus(), before);
         });
 
         view.update_in(cx, |view, window, cx| {
