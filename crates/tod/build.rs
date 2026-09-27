@@ -3,6 +3,8 @@ use std::path::PathBuf;
 
 fn main() {
     let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
+    embed_windows_icon(&manifest_dir);
+
     let process_src = manifest_dir.join("../../assets/process");
     if !process_src.join("README.md").is_file() {
         println!(
@@ -34,6 +36,20 @@ fn main() {
     } else {
         println!("cargo:warning=tod: media/context not found; skipping media bundle copy");
     }
+}
+
+/// Embeds `assets/icon/tod.ico` as the exe's icon on Windows targets, where the
+/// taskbar, Task Manager, and GPUI's window class all read it from the binary.
+/// Regenerate the icon with `python assets/icon/make_icon.py`.
+fn embed_windows_icon(manifest_dir: &PathBuf) {
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
+        return;
+    }
+    let icon_dir = manifest_dir.join("../../assets/icon");
+    println!("cargo:rerun-if-changed={}", icon_dir.join("tod.ico").display());
+    embed_resource::compile(icon_dir.join("tod.rc"), embed_resource::NONE)
+        .manifest_optional()
+        .unwrap();
 }
 
 fn copy_dir_all(src: &PathBuf, dst: &PathBuf) -> std::io::Result<()> {
