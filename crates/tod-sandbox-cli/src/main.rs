@@ -68,11 +68,15 @@ watchdog run-once [--orchestrator-url URL] [--max-awake-secs N] [--max-lease-sec
 watchdog deploy --image IMAGE [--orchestrator-url URL] [--max-awake-secs N] [--max-lease-secs N]
                          Create (or replace) the hourly Blaxel job that runs
                          tod-watchdog from IMAGE. Needs an API-key sign-in.
-orchestrator [--image IMAGE] [--bin PATH] [--tod-cli PATH]
-                         Create (if needed) the team's orchestrator sandbox,
-                         install tod-orchestrator and tod-cli (Linux builds;
-                         default target/sandbox/, from
+orchestrator [--image IMAGE] [--bin PATH] [--tod-cli PATH] [--move-data]
+                         Create (if needed) the team's orchestrator sandbox
+                         (sandboxes.toml's `orchestrator`, with its data on the
+                         volume `orchestrator_volume` when set), install
+                         tod-orchestrator and tod-cli (Linux builds; default
+                         target/sandbox/, from
                          scripts/build-sandbox-binaries.sh), and start it.
+                         --move-data: the sandbox exists without the volume;
+                         copy its /data onto the volume, recreating it.
 doctor                   Check the setup.
 connect-info <name>      (internal) The relay URL, token, and idle times, as JSON.
 ";
@@ -264,13 +268,8 @@ fn setup(ctx: &mut Ctx, mut args: Args) -> Result<i32> {
     };
     let key_from_stdin = args.flag("--api-key-stdin");
     let defaults = Account {
-        workspace: workspace.clone(),
-        region: config::DEFAULT_REGION.into(),
-        auth,
         default_image: "blaxel/base-image:latest".into(),
-        memory_mb: 4096,
-        owner: std::env::var("USERNAME").or_else(|_| std::env::var("USER")).ok(),
-        claude_token_via: Default::default(),
+        ..Account::new(workspace.clone())
     };
     let base = existing.filter(|a| a.workspace == workspace).unwrap_or(defaults);
     let acct = Account {
@@ -283,7 +282,7 @@ fn setup(ctx: &mut Ctx, mut args: Args) -> Result<i32> {
             None => base.memory_mb,
         },
         owner: args.opt("--owner").or(base.owner),
-        claude_token_via: base.claude_token_via,
+        ..base
     };
     args.done()?;
 
@@ -389,6 +388,7 @@ fn orchestrator(ctx: &Ctx, mut args: Args) -> Result<i32> {
     let image = args.opt("--image");
     let bin = args.opt("--bin").map(PathBuf::from);
     let cli = args.opt("--tod-cli").map(PathBuf::from);
+    let move_data = args.flag("--move-data");
     args.done()?;
     let acct = ctx.account()?.clone();
     let read = |given: Option<PathBuf>, name: &str| -> Result<Vec<u8>> {
@@ -402,7 +402,12 @@ fn orchestrator(ctx: &Ctx, mut args: Args) -> Result<i32> {
     let tod_cli = read(cli, "tod-cli")?;
     let relay = read(None, "tod-relay")?;
     let bx = ctx.blaxel()?;
+    let backup = ctx.root.join(format!("{}-data.tar.gz", acct.orchestrator));
     let spec = orch::Spec {
+        name: &acct.orchestrator,
+        volume: acct.orchestrator_volume.as_deref().filter(|v| !v.is_empty()),
+        move_data,
+        backup: move_data.then_some(backup.as_path()),
         image: image.as_deref().unwrap_or(&acct.default_image),
         region: &acct.region,
         memory_mb: acct.memory_mb,
@@ -414,7 +419,7 @@ fn orchestrator(ctx: &Ctx, mut args: Args) -> Result<i32> {
         blaxel_token: bx.token(),
     };
     let url = orch::provision(&bx, &spec, &mut |m| eprintln!("{m}"))?;
-    println!("{}: running at {url}/port/{}", orch::NAME, orch::PORT);
+    println!("{}: running at {url}/port/{}", acct.orchestrator, orch::PORT);
     Ok(0)
 }
 
@@ -437,8 +442,9 @@ fn watchdog(ctx: &Ctx, mut args: Args) -> Result<i32> {
         Some(u) => u,
         None => {
             use tod_sandbox::orchestrator as orch;
-            let info = bx.get(orch::NAME)?.with_context(|| format!("no {} sandbox; pass --orchestrator-url", orch::NAME))?;
-            let url = info.url.with_context(|| format!("{} has no URL", orch::NAME))?;
+            let name = ctx.account()?.orchestrator.clone();
+            let info = bx.get(&name)?.with_context(|| format!("no {name} sandbox; pass --orchestrator-url"))?;
+            let url = info.url.with_context(|| format!("{name} has no URL"))?;
             format!("{}/port/{}", url.trim_end_matches('/'), orch::PORT)
         }
     };

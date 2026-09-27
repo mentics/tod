@@ -11,11 +11,12 @@
 //! - [`OrchestratorScheduler`] — the development account: the orchestrator
 //!   keeps the timer (`POST /wakes`, `DELETE /wakes/<id>`) and pokes the
 //!   sandbox's relay when due.
-//! - [`BlaxelScheduler`] — a Blaxel schedule named `wait-<id>` on the node's
-//!   own sandbox, running `tod-supervisor wake`. The schedule API is
-//!   unverified (design, "To verify 1"); its request shape is isolated in
-//!   [`blaxel_schedule_body`].
-//! - [`for_config`] picks one from `sandboxes.toml`'s `scheduler` key.
+//! - [`BlaxelScheduler`] — a one-shot Blaxel schedule on the node's own
+//!   sandbox whose process is named `wait-<id>`, poking its relay (which
+//!   starts `tod-supervisor wake`). Verified against a live workspace; see
+//!   its docs.
+//! - [`for_config`] picks one from `sandboxes.toml`'s `scheduler` key, and
+//!   [`from_env`] from what a node's sandbox was created with.
 //!
 //! The id is the wait's id; times are milliseconds since the epoch.
 
@@ -27,9 +28,6 @@ use uuid::Uuid;
 
 /// The header naming the user to the orchestrator.
 pub const USER_HEADER: &str = tod_store::fleet::cli_relay::USER_HEADER;
-
-/// What a Blaxel schedule runs.
-pub const WAKE_COMMAND: &str = "tod-supervisor wake";
 
 pub trait Scheduler: Send + Sync {
     /// Wake `sandbox` at `at_ms`. Scheduling an id again replaces its time.
@@ -116,6 +114,15 @@ impl Scheduler for OrchestratorScheduler {
 }
 
 /// Blaxel schedules on the node's own sandbox.
+///
+/// Measured on `testspace-358401` (September 2026; design, To verify 1):
+/// Blaxel picks a schedule's id (`schedule-0`, reused once that schedule is
+/// gone) and ignores any given, so a wake's schedule is known by the process
+/// name it runs as, `wait-<id>` ([`schedule_name`]): replacing or cancelling
+/// one lists the sandbox's schedules and deletes those by that name. A
+/// one-shot `at` schedule fires 10–50 s after its time (one in the past,
+/// within a minute), wakes a sandbox in standby, and is removed once it has
+/// fired.
 pub struct BlaxelScheduler {
     blaxel: Blaxel,
     /// The node's sandbox, for `cancel` (which is given only the id).
@@ -126,41 +133,74 @@ impl BlaxelScheduler {
     pub fn new(blaxel: Blaxel, sandbox: impl Into<String>) -> Self {
         Self { blaxel, sandbox: sandbox.into() }
     }
+
+    /// From a node sandbox's environment: `TOD_BLAXEL_WORKSPACE`,
+    /// `TOD_SANDBOX`. The calls go through the sandbox's proxy, which adds
+    /// the Blaxel token (`tod_sandbox::node::proxy_rules`); the sandbox never
+    /// holds it.
+    pub fn from_env() -> Result<Self> {
+        use tod_sandbox::node::{BLAXEL_TOKEN_PLACEHOLDER, BLAXEL_WORKSPACE_ENV};
+        let var = |name: &str| {
+            std::env::var(name).ok().filter(|v| !v.trim().is_empty()).with_context(|| format!("{name} is not set"))
+        };
+        let blaxel = Blaxel::with_agent(
+            var(BLAXEL_WORKSPACE_ENV)?,
+            BLAXEL_TOKEN_PLACEHOLDER,
+            sandbox_agent(Duration::from_secs(60)),
+        );
+        Ok(Self::new(blaxel, var("TOD_SANDBOX")?))
+    }
 }
 
-/// The request that creates a wake schedule: `(path, body)` under Blaxel's API.
-///
-/// TODO(To verify 1): Blaxel's sandbox schedule API is not documented in
-/// this repository; this shape (a one-shot `at`, the command, `keepAlive:
-/// false`) is the design's assumption. Fix it here once the spike is run.
-pub fn blaxel_schedule_body(sandbox: &str, id: Uuid, at_ms: i64) -> (String, serde_json::Value) {
-    let at = chrono::DateTime::from_timestamp_millis(at_ms)
-        .unwrap_or_default()
-        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-    (
-        format!("/sandboxes/{sandbox}/schedules"),
-        serde_json::json!({
-            "name": schedule_name(id),
-            "at": at,
-            "command": WAKE_COMMAND,
-            "keepAlive": false,
-        }),
-    )
+/// How late a wake may be set, at the soonest: a time already past (a wait
+/// due while the supervisor was deciding) becomes this far from now.
+pub const MIN_LEAD_MS: i64 = 5_000;
+
+/// The body of the schedule that wakes `id` at `at_ms` (never sooner than
+/// [`MIN_LEAD_MS`] after `now_ms`): a one-shot `at` running
+/// [`wake_command`] as process [`schedule_name`]. `keepAlive` holds the
+/// sandbox awake only while that poke runs (at most 2 minutes); the
+/// supervisor then takes its own hold.
+pub fn blaxel_schedule_body(id: Uuid, at_ms: i64, now_ms: i64) -> serde_json::Value {
+    tod_sandbox::blaxel::schedule_body(&schedule_name(id), &wake_command(), at_ms.max(now_ms + MIN_LEAD_MS), true, 120)
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 impl Scheduler for BlaxelScheduler {
     fn schedule(&self, id: Uuid, sandbox: &str, at_ms: i64) -> Result<()> {
-        // Replace any earlier time: delete, then create under the same name.
-        self.blaxel
-            .delete_path(&format!("/sandboxes/{sandbox}/schedules/{}", schedule_name(id)), "delete schedule")?;
-        let (path, body) = blaxel_schedule_body(sandbox, id, at_ms);
-        self.blaxel.post_json(&path, &body, "create schedule")
+        // Replace any earlier time: drop the old one by name, then create.
+        self.blaxel.delete_schedules_named(sandbox, &schedule_name(id))?;
+        self.blaxel.create_schedule(sandbox, &blaxel_schedule_body(id, at_ms, now_ms()))?;
+        Ok(())
     }
 
     fn cancel(&self, id: Uuid) -> Result<()> {
-        self.blaxel
-            .delete_path(&format!("/sandboxes/{}/schedules/{}", self.sandbox, schedule_name(id)), "delete schedule")
+        self.blaxel.delete_schedules_named(&self.sandbox, &schedule_name(id))?;
+        Ok(())
     }
+}
+
+/// What a Blaxel wake schedule runs: a poke of the node's relay
+/// (`tod_sandbox::node::wake_command`).
+pub fn wake_command() -> String {
+    tod_sandbox::node::wake_command()
+}
+
+/// The scheduler a node's supervisor uses, from its sandbox's environment:
+/// `TOD_SCHEDULER` (`tod_sandbox::node::node_env`, from `sandboxes.toml`'s
+/// `scheduler`; the orchestrator's when unset or unknown).
+pub fn from_env() -> Result<Box<dyn Scheduler>> {
+    let kind = std::env::var(tod_sandbox::node::SCHEDULER_ENV)
+        .ok()
+        .and_then(|raw| SchedulerKind::parse(&raw))
+        .unwrap_or_default();
+    for_config(kind, BlaxelScheduler::from_env, OrchestratorScheduler::from_env)
 }
 
 /// The scheduler `sandboxes.toml` picks for a node. `blaxel` is used only
@@ -213,13 +253,21 @@ mod tests {
     }
 
     #[test]
-    fn blaxel_body_names_the_schedule_after_the_wait() {
+    fn blaxel_body_names_the_schedules_process_after_the_wait() {
         let id = Uuid::nil();
-        let (path, body) = blaxel_schedule_body("node-sb", id, 10_000);
-        assert_eq!(path, "/sandboxes/node-sb/schedules");
-        assert_eq!(body["name"], format!("wait-{id}"));
-        assert_eq!(body["at"], "1970-01-01T00:00:10Z");
-        assert_eq!(body["keepAlive"], false);
+        let body = blaxel_schedule_body(id, 10_000, 0);
+        assert_eq!(body["type"], "at");
+        assert_eq!(body["value"], "1970-01-01T00:00:10Z");
+        assert_eq!(body["input"]["name"], format!("wait-{id}"));
+        assert_eq!(body["input"]["command"], wake_command());
+        assert!(wake_command().contains("/poke"));
+        assert_eq!(body["input"]["keepAlive"], true);
+    }
+
+    #[test]
+    fn a_wake_in_the_past_is_set_a_moment_from_now() {
+        let body = blaxel_schedule_body(Uuid::nil(), 1_000, 60_000);
+        assert_eq!(body["value"], "1970-01-01T00:01:05Z");
     }
 
     /// Serves `n` requests, answering each with `status`; returns the raw requests.

@@ -262,12 +262,18 @@ tod-cli ask <question>                       # a human (the existing question pa
 The wait is a row in the user's database on the orchestrator. The supervisor
 then:
 
-1. Creates a Blaxel schedule on its own sandbox with the id `wait-<id>`: the
-   deadline for an event wait (give up or check directly if the webhook never
-   comes), the next check for a poll, the time for a timer. Its command is
-   `tod-supervisor wake`, with `keepAlive: false`: the supervisor takes its own
-   hold as soon as it starts, before it syncs its copy of the database. (On the development account the
-   orchestrator keeps the timer instead; see Development account.)
+1. Creates a Blaxel schedule on its own sandbox for the soonest pending
+   wait: the deadline for an event wait (give up or check directly if the
+   webhook never comes), the next check for a poll, the time for a timer.
+   It is a one-shot `at` schedule whose process is named `wait-<id>`
+   (`tod_core::scheduler::BlaxelScheduler`). Its command pokes the relay on
+   loopback, which starts the supervisor with the environment only it gets,
+   or signals the one running, exactly as a poke from outside does; should
+   the relay not be running, it starts the supervisor directly. The call
+   goes to `api.blaxel.ai` with a placeholder token, which the sandbox's
+   proxy replaces. The supervisor takes its own hold as soon as it
+   starts, before it syncs its copy of the database. (With `scheduler = "orchestrator"` the orchestrator keeps
+   the timer instead; see Development account.)
 2. Releases its hold. The sandbox is in standby about 15 s later.
 
 **A wake is a poke, never an instruction.** Whether it comes from a schedule,
@@ -277,11 +283,16 @@ continues, or schedules the next check and goes back to sleep. Duplicate,
 late, and spurious wakes are therefore harmless, and so is a restart in the
 middle of a step.
 
-When a wait is satisfied some other way (the webhook arrived before the
-deadline), the supervisor deletes its schedule:
-`DELETE /v0/sandboxes/<sandbox>/schedules/wait-<id>`. Choosing the id when
-creating the schedule is what makes that a single call. A deleted or already
-fired schedule is not an error; a stale one firing later is a harmless poke.
+Blaxel assigns a schedule's id (`schedule-0`, `schedule-1`, … reused once
+free), so a wake is found by its process name: cancelling lists the
+sandbox's schedules and deletes those named `wait-<id>`, and scheduling
+deletes any of that name first, so rescheduling replaces it. The supervisor
+keeps the wait it last scheduled in its state directory (`scheduled-wake`):
+when a sooner wait takes over, or it wakes to work (the wait was satisfied
+some other way, such as a webhook before the deadline), it cancels that
+one. A deleted or already fired schedule is not an error (one-shot
+schedules delete themselves once they have run); a stale one firing later
+is a harmless poke.
 
 Polling backs off (for example 1, 2, 5, 15 minutes). Each check costs one
 wake (about 0.2–0.7 s) plus the ~15 s before standby: at 4 GB that is
@@ -586,13 +597,14 @@ The plan:
 
 ## Development account
 
-The account tod is developed on has no sandbox schedules, volumes, or
-forking; the account it is deployed on has all three. Each gap has a
-stand-in, chosen per account in `sandboxes.toml`, so the same code runs on
-both and only the stand-ins are dev-only.
+Sandbox schedules and volumes are now enabled on the development workspace
+(`testspace-358401`); forking still is not (`403 Sandbox snapshot/fork
+feature is not enabled for this workspace`). Each feature has a stand-in,
+chosen per account in `sandboxes.toml`, so the same code runs everywhere:
 
-- **Schedules → the orchestrator's timer** (`scheduler = "orchestrator"`;
-  the default, `"blaxel"`, is the design above). An agent sandbox still
+- **Schedules → the orchestrator's timer** (`scheduler = "orchestrator"`,
+  the default when the file does not say; `"blaxel"` is the design above,
+  verified on the development workspace). An agent sandbox still
   schedules its own wakes; the one call that creates or deletes a wake goes
   to the orchestrator (`POST /wakes` with the id, sandbox, and time;
   `DELETE /wakes/<id>`) instead of to Blaxel. The orchestrator keeps each
@@ -604,30 +616,63 @@ both and only the stand-ins are dev-only.
   reloads the pending wakes. Everything else is real: agent sandboxes sleep
   while they wait, waits and deadlines behave the same, and it runs with the
   app closed. The cost is an orchestrator that is awake while anything waits
-  on a timer, which at development scale is a few dollars a month. The timer
-  is deleted once development moves to an account with schedules.
-- **Volumes → the orchestrator's own disk.** The per-user databases go in
-  the same directory on the sandbox's ordinary filesystem. They survive
-  standby but not the sandbox, so on this account a lost orchestrator loses
-  them; that is acceptable for development data.
-- **Forking → creating from the image.** A node's sandbox (and a replacement
-  for one) is always created from the image and checks out the node's
-  branch, which the design needs anyway. Forking would only make that
-  faster.
+  on a timer, which at development scale is a few dollars a month. The
+  timer stays: the orchestrator's `wakes` table is also how the answer,
+  webhook, and impact paths retry a poke that did not get through, and how
+  a lost sandbox is noticed, whichever scheduler the nodes use.
+- **Volumes → the orchestrator's own disk.** Without `orchestrator_volume`,
+  the per-user databases are on the sandbox's ordinary filesystem: they
+  survive standby but not the sandbox. With it, `tod-sandbox orchestrator`
+  creates the volume (4 GB) and mounts it at `/data`; `--move-data` moves an
+  existing orchestrator's data onto it (see `orchestrator.md`).
+- **Forking → creating from the image.** Without `node_base`, a node's
+  sandbox (and a replacement for one) is created from the image, given the
+  relay, supervisor, and bundles, and checks out the node's branch. With
+  `node_base = "<name>"`, a base sandbox with everything but the checkout is
+  made once (and again when the binaries, bundles, credentials, image, or
+  orchestrator change: its fingerprint is kept in the data root), and each
+  node is forked from it with its own environment, then only checks out
+  and starts. A fork that is refused or fails falls back to creating from
+  the image. A fork has the base's labels (`tod-kind=node-base`, no node),
+  so the watchdog knows it by its `TOD_USER` and `TOD_NODE`.
 
 ## To verify
 
-1. **Sandbox schedules.** Not available on our development account (403).
-   On the deployment account, verify that a schedule wakes a sandbox in
-   standby, that a sandbox can schedule itself, and that deleting a schedule
-   by id works. Script: `.local/agent/scratchpad/sched-spike/spike.py`
-   (git-ignored).
+1. **Sandbox schedules.** Verified on the development workspace
+   (2026-09-27), with a probe sandbox and then a real node run with the
+   mock agent (`scheduler = "blaxel"`):
+   - A schedule is `POST /v0/sandboxes/<sb>/schedules` with `{type: at |
+     cron | sleep, value, input: {command, name, env, workingDir, keepAlive,
+     timeout}}`; `GET` lists them, `DELETE /v0/sandboxes/<sb>/schedules/<id>`
+     removes one, and `GET /v0/sandboxes/<sb>/schedule-executions` shows
+     each run. The id is Blaxel's (`schedule-N`, reused), not ours; at most
+     100 per sandbox. A one-shot `at` schedule deletes itself after it runs.
+   - It fires 10–50 s after its time (12–40 s on the probe, 10 s and 50 s
+     on two node runs), and wakes a sandbox in standby. A wake is never
+     early, and good to about a minute.
+   - A sandbox can schedule itself through its proxy, which adds the token
+     for `api.blaxel.ai` (the supervisor sends a placeholder).
+   - End to end: the mock node recorded `wait --until 3m`, the supervisor
+     created `wait-<id>` on its own sandbox and slept; the schedule fired,
+     the relay started the supervisor, it settled the wait, cancelled the
+     (already gone) schedule, and carried the node on to its review gate. A
+     10-minute wait satisfied from the app instead had its live schedule
+     deleted on the next poke.
+   - Open: a Blaxel token from `bl login` in a node's proxy expires; nodes
+     that schedule themselves for long should run on an API key (`auth =
+     "api-key"`).
 2. **Agent Drive.** Private preview, and only in `us-was-1`, which is also
    the region the team will use (tod's default region is now `us-was-1`).
    Check that a mount survives standby, and how it behaves with a line
    appended per transcript write.
-3. **Volumes.** Available on the deployment account (not the development
-   one). Check reattaching one to a replacement orchestrator sandbox.
+3. **Volumes.** Verified on the development workspace (2026-09-27): an
+   orchestrator's `/data` moved onto a volume with `--move-data`, then the
+   sandbox deleted and redeployed with `tod-sandbox orchestrator`: the
+   volume reattached at `/data` (virtiofs) with every database and marker
+   intact, and the app's sync carried on from its cursor. A volume attaches
+   to one sandbox at a time and hides what the image had at its mount
+   point; deleting a sandbox in standby can take minutes before its name
+   (and volume) are free.
 4. **The proxy.** Claude Code's own traffic goes through it and gets the
    subscription token injected (see Credentials; measured with a dummy
    token). Still open: a successful, streamed turn with a real token; whether

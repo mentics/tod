@@ -236,6 +236,8 @@ mod tests {
             url: None,
             image: String::new(),
             labels: Vec::new(),
+            volumes: Vec::new(),
+            node_env: Vec::new(),
         }
     }
 

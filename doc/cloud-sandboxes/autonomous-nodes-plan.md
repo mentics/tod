@@ -234,3 +234,19 @@ On the deployment account: switch `scheduler` to `blaxel` and run the
 schedules spike (design, To verify 1), move the orchestrator's data to a
 volume, and create node sandboxes by forking where it is faster. Delete the
 orchestrator's timer once nothing uses it.
+
+Done on the development workspace, which now has schedules and volumes
+(2026-09-27):
+
+- `scheduler = "blaxel"`: verified end to end with the mock agent (design,
+  To verify 1).
+- `orchestrator_volume` and `tod-sandbox orchestrator --move-data`:
+  verified, data survives deleting and redeploying the sandbox (To verify 3).
+- `node_base`: forking from a prepared base, falling back to creating from
+  the image. Only the fallback is verified: forking is still refused on this
+  workspace. A fresh node sandbox is up in 1–29 s and provisioned in about
+  22 s, most of it uploading the relay, supervisor, `tod-cli`, and bundles,
+  which a fork would skip.
+- The orchestrator's timer stays: its `wakes` are also how answers,
+  webhooks, and impact retry a poke that failed and notice a lost sandbox,
+  and `scheduler = "orchestrator"` is still the default.
