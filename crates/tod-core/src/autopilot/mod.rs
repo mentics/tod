@@ -559,6 +559,7 @@ impl Autopilot {
                 } else {
                     self.state.current = None;
                     self.record(fleet, protocol_name(kind), &lifecycle, conversation_id)?;
+                    close_session(agent, conversation_id);
                 }
                 return Ok(Some(Outcome::Stopped { reason }));
             }
@@ -581,6 +582,7 @@ impl Autopilot {
         }
         self.state.current = None;
         self.record(fleet, protocol_name(kind), &lifecycle, conversation_id)?;
+        close_session(agent, conversation_id);
         Ok(None)
     }
 
@@ -609,6 +611,17 @@ impl Autopilot {
             at_ms: state::now_ms(),
         });
         self.save()
+    }
+}
+
+/// Ends a finished step's agent session. Nothing resumes a finished step
+/// (the next step starts a conversation of its own), and each session holds
+/// an agent process: a node that went `proposed` → `approved` with Claude left
+/// eleven of them (about 200 MB each) in its 4 GB sandbox until the run
+/// ended. Its conversation stays resumable by id if a person opens it.
+fn close_session<A: AgentAccess + ?Sized>(agent: &mut A, conversation_id: Option<Uuid>) {
+    if let Some(id) = conversation_id {
+        agent.with(|a| a.close_session(&ConversationDriver::session_key(id)));
     }
 }
 
