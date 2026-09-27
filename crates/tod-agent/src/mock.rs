@@ -20,6 +20,9 @@ pub struct MockInterviewTurn {
     pub purpose: SessionPurpose,
     pub env: Vec<(String, String)>,
     pub blocks: Vec<String>,
+    /// The turn's working directory (`SessionTurn::cwd`), where a real
+    /// agent would edit files.
+    pub cwd: PathBuf,
 }
 
 /// What a mock handler replies: the text, and optionally the parts a real
@@ -279,6 +282,7 @@ impl AgentProvider for MockAgentProvider {
             purpose: turn.purpose,
             env: turn.env,
             blocks,
+            cwd: turn.cwd,
         };
         // A `permission <title>` line holds the turn on a permission request,
         // the way a real agent waits on one, until it is answered.

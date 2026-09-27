@@ -104,6 +104,10 @@ impl AgentProvider for FakeAgent {
                     &client,
                     node.parse().unwrap(),
                     conversation.parse().unwrap(),
+                    super::mock::Place {
+                        cwd: Some(&turn.cwd),
+                        env: &turn.env,
+                    },
                 )
                 .map(|text| tod_agent::MockReply::from(text)),
                 None => reply(&client, &blocks),

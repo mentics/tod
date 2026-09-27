@@ -762,10 +762,17 @@ fn sync_branch(env: &ProtocolEnv<'_>, node: Uuid, cwd: &Workdir) -> Option<RunNo
 /// as `tod-cli wait --until +<duration>` would, the first time only (while
 /// the node has no wait yet): so a cloud node can be taken through a sleep
 /// and a wake with the mock.
+///
+/// A line `write <path>: <text>` in the step it closes writes `<text>` (and a
+/// newline) to `<path>`, relative to the turn's working directory, the way a
+/// real agent edits the checkout: so the run's commit, and the branch pushed
+/// from it, differ from the base, and a mock run can open a real pull request
+/// (see `pr::mock_turn`).
 pub fn mock_turn(
     access: &impl super::mock::Access,
     node_id: Uuid,
     conversation_id: Uuid,
+    place: super::mock::Place<'_>,
 ) -> Result<String> {
     let steps = access.read(|conn| {
         Ok(tod_store::outline::repos::PlanStepRepo::new(conn).list_for_node(node_id)?)
@@ -787,6 +794,9 @@ pub fn mock_turn(
         }
     }
     if let Some(step) = steps.iter().find(|step| !step_is_done(&step.status)) {
+        for (path, text) in mock_writes(&step.body) {
+            mock_write(place.cwd, path, text)?;
+        }
         access.interview(tod_store::interview::InterviewCommand::Outline {
             mutation: tod_store::outline::OutlineMutation::UpdatePlanStepStatus {
                 step_id: step.id,
@@ -810,6 +820,32 @@ pub fn mock_turn(
         },
     )?;
     Ok(String::new())
+}
+
+/// The `write <path>: <text>` lines of a plan step (see [`mock_turn`]).
+fn mock_writes(body: &str) -> Vec<(&str, &str)> {
+    body.lines()
+        .filter_map(|line| line.trim().strip_prefix("write "))
+        .filter_map(|rest| rest.split_once(':'))
+        .map(|(path, text)| (path.trim(), text.trim()))
+        .filter(|(path, _)| !path.is_empty())
+        .collect()
+}
+
+/// Writes one `write` line's file under `cwd`, refusing a path that leaves it.
+fn mock_write(cwd: Option<&std::path::Path>, path: &str, text: &str) -> Result<()> {
+    let cwd = cwd.context("the mock was given no working directory to write in")?;
+    let rel = std::path::Path::new(path);
+    anyhow::ensure!(
+        rel.components().all(|c| matches!(c, std::path::Component::Normal(_))),
+        "the mock writes only inside the checkout, not {path:?}"
+    );
+    let file = cwd.join(rel);
+    if let Some(dir) = file.parent() {
+        std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+    }
+    std::fs::write(&file, format!("{text}
+")).with_context(|| format!("write {}", file.display()))
 }
 
 /// `wait 3m: …` → 180 (see [`mock_turn`]).
@@ -841,6 +877,21 @@ mod commit_tests {
         assert_eq!(mock_wait_secs("wait 90s"), Some(90));
         assert_eq!(mock_wait_secs("Write the parser"), None);
         assert_eq!(mock_wait_secs("wait for CI"), None);
+    }
+
+    #[test]
+    fn mock_write_lines_write_inside_the_checkout_only() {
+        let body = "Add the marker file.
+write notes/marker.txt: hello: world
+write : nothing";
+        assert_eq!(mock_writes(body), vec![("notes/marker.txt", "hello: world")]);
+        let dir = std::env::temp_dir().join(format!("tod-mock-write-{}", Uuid::new_v4()));
+        mock_write(Some(&dir), "notes/marker.txt", "hello").unwrap();
+        assert_eq!(std::fs::read_to_string(dir.join("notes/marker.txt")).unwrap(), "hello
+");
+        assert!(mock_write(Some(&dir), "../escape.txt", "x").is_err());
+        assert!(mock_write(None, "a.txt", "x").is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

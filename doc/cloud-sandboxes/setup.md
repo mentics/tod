@@ -240,7 +240,9 @@ their `tod-cli` commands: `tod-sandbox orchestrator` sets it up. See
 what the app's "Run in the cloud" does (`cloud_sync::run_in_cloud`): seed the
 orchestrator, create the node's sandbox with its proxy rules, install the
 relay, the `tod-cli` shim, the supervisor, and the process and media
-bundles, check out the node's branch, and poke it. `... sync` sends the
+bundles, check out the node's branch (its commits authored by your git
+`user.name`/`user.email`: the node repository's own if it is on this
+machine, else your global one), and poke it. `... sync` sends the
 outbox and pulls the node's progress back; `... init` makes a list `cloud` in
 a fresh data root to create a test node in with `tod-cli`. Build the sandbox
 binaries first, and never point it at a data root the app has open.
@@ -248,7 +250,12 @@ binaries first, and never point it at a data root the app has open.
 The node's supervisor runs Claude unless `TOD_CLOUD_AGENT=mock` is set when
 the sandbox is created (it becomes the sandbox's `TOD_SUPERVISOR_AGENT`). In a
 mock run, a plan step whose body starts `wait 3m: …` records a wait of that
-long, so the orchestrator's timer wakes the node. The relay's log
+long, so the orchestrator's timer wakes the node. A line `write <path>:
+<text>` in a step makes the mock write that file in the checkout when it
+closes the step (so the pushed branch differs from its base), and a line
+`open pr: <title>` in any step makes its `pr` turn open a real pull request
+with `tod-cli pr open` (from the branch to `origin`'s default branch)
+instead of recording a fake one. The relay's log
 (`GET <sandbox-url>/process/tod-relay/logs`) holds the supervisor's too.
 
 For Claude, the node needs your Claude subscription token, set **once per
