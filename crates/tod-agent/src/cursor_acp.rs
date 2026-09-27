@@ -14,6 +14,7 @@ use crate::agent_traffic::{
 use crate::ReplyPart;
 use crate::process_tree::AgentProcess;
 use crate::reply::{self, SharedReplyParts};
+use crate::usage::AcpUsage;
 use crate::util::normalize_absolute;
 use crate::util::path_is_under;
 use anyhow::{Context, Result, bail};
@@ -111,6 +112,9 @@ struct ConversationSpec {
     environment: AgentEnvironment,
 }
 
+/// What a conversation's agent reported spending, shared with the provider.
+type SharedAcpUsage = Arc<Mutex<AcpUsage>>;
+
 /// A long-lived conversation: a worker thread owning at most one agent process.
 struct LiveConversation {
     cmd_tx: Sender<ConversationCommand>,
@@ -130,6 +134,9 @@ struct LiveConversation {
     /// The parts of the latest turn (see
     /// [`AgentProvider::session_reply_parts`]).
     reply_parts: SharedReplyParts,
+    /// What the agent reported spending (see
+    /// [`AgentProvider::session_token_usage`]).
+    usage: SharedAcpUsage,
 }
 
 impl LiveConversation {
@@ -146,6 +153,7 @@ impl LiveConversation {
             pending_permission: Arc::new(Mutex::new(None)),
             context_chars: Arc::new(AtomicU64::new(0)),
             reply_parts: SharedReplyParts::default(),
+            usage: SharedAcpUsage::default(),
         };
         let conversation = Self {
             cmd_tx,
@@ -158,6 +166,7 @@ impl LiveConversation {
             purpose,
             context_chars: worker.context_chars.clone(),
             reply_parts: worker.reply_parts.clone(),
+            usage: worker.usage.clone(),
         };
         thread::spawn(move || worker.run(cmd_rx));
         conversation
@@ -189,6 +198,7 @@ struct ConversationWorker {
     pending_permission: PendingPermissionSlot,
     context_chars: Arc<AtomicU64>,
     reply_parts: SharedReplyParts,
+    usage: SharedAcpUsage,
 }
 
 impl ConversationWorker {
@@ -287,6 +297,7 @@ impl ConversationWorker {
                 &spec.environment,
                 Some(self.context_chars.clone()),
                 Some(self.reply_parts.clone()),
+                Some(self.usage.clone()),
             )?;
             *self.session_id.lock().unwrap_or_else(|e| e.into_inner()) =
                 Some(session.session_id.clone());
@@ -583,6 +594,13 @@ impl AgentProvider for CursorAcpProvider {
             .conversations
             .entry(key.clone())
             .or_insert_with(|| LiveConversation::spawn(spec.clone(), resume_session_id.clone()));
+        // The worker clears them when it starts the turn; until then a poll
+        // would report the previous turn's parts as this one's.
+        conversation
+            .reply_parts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         if let Err(mpsc::SendError(command)) = conversation.cmd_tx.send(command) {
             // The worker is gone: start another, resuming the session it reached.
             let resume = conversation.session_id().or(resume_session_id);
@@ -642,6 +660,16 @@ impl AgentProvider for CursorAcpProvider {
         self.conversations
             .get(key)
             .map(|conversation| conversation.context_chars.load(Ordering::Relaxed))
+    }
+
+    fn session_token_usage(&self, key: &str) -> Option<crate::TokenUsage> {
+        self.conversations.get(key).and_then(|conversation| {
+            conversation
+                .usage
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .usage()
+        })
     }
 
     fn session_reply_parts(&self, key: &str) -> Option<Vec<ReplyPart>> {
@@ -1011,6 +1039,8 @@ fn run_acp_session(
         pending_permission,
         context_chars: None,
         reply_parts: None,
+        usage: None,
+        sign_in_hint: sign_in_hint(host, environment),
     };
 
     let client_name = host.client_name();
@@ -1076,6 +1106,7 @@ fn run_acp_session(
             model,
             effort,
         )?;
+        apply_permission_mode(&mut session, host, session_id, &session_result)?;
 
         if cancelled.load(Ordering::SeqCst) {
             bail!("ACP run cancelled");
@@ -1157,6 +1188,10 @@ struct AcpClient {
     context_chars: Option<Arc<AtomicU64>>,
     /// The current turn's reply, part by part, when the caller keeps it.
     reply_parts: Option<SharedReplyParts>,
+    /// What the agent reports spending, when the caller keeps it.
+    usage: Option<SharedAcpUsage>,
+    /// What to tell the user when the agent says it is not signed in.
+    sign_in_hint: String,
 }
 
 impl AcpClient {
@@ -1172,6 +1207,12 @@ impl AcpClient {
         };
         self.tag
             .record(log, self.kind.traffic_category(), direction, content);
+    }
+
+    fn update_usage(&self, update: impl FnOnce(&mut AcpUsage)) {
+        if let Some(usage) = &self.usage {
+            update(&mut usage.lock().unwrap_or_else(|e| e.into_inner()));
+        }
     }
 
     fn update_reply(&self, update: impl FnOnce(&mut Vec<ReplyPart>)) {
@@ -1298,6 +1339,9 @@ impl AcpClient {
                     );
                     let code = error.get("code").and_then(Value::as_i64);
                     let data = error.get("data");
+                    if is_auth_required(code, &message) {
+                        bail!("{} (ACP: {message})", self.sign_in_hint);
+                    }
                     match (code, data) {
                         (Some(code), Some(data)) => {
                             bail!("ACP error {code}: {message} ({data})")
@@ -1346,6 +1390,8 @@ impl AcpClient {
                             self.update_reply(|parts| reply::push_text(parts, true, text));
                         }
                         self.set_activity(Some("Thinking…".to_string()));
+                    } else if kind == "usage_update" {
+                        self.update_usage(|usage| usage.apply_update(update));
                     } else if kind == "tool_call" || kind == "tool_call_update" {
                         let title = update.get("title").and_then(Value::as_str).unwrap_or("");
                         let status = update.get("status").and_then(Value::as_str).unwrap_or("");
@@ -1602,6 +1648,59 @@ fn spawn_agent(
                 in_container: true,
             })
         }
+        AgentEnvironment::Sandbox(launch) => {
+            let bin = crate::acp_host::sandbox_agent_bin(host, launch)?;
+            tracing::info!(
+                event = "agent",
+                action = "acp_spawn_sandbox",
+                host = host.label(),
+                sandbox = %launch.sandbox,
+                cwd = %launch.directory,
+                agent_bin = %bin,
+                "starting ACP agent in cloud sandbox"
+            );
+            let child = crate::acp_host::spawn_acp_in_sandbox(host, launch, &bin, env)?;
+            Ok(SpawnedAgent {
+                child,
+                agent_bin: PathBuf::from(bin),
+                cwd: PathBuf::from(&launch.directory),
+                write_roots: vec![PathBuf::from(&launch.directory)],
+                in_container: true,
+            })
+        }
+    }
+}
+
+/// ACP's `auth_required` error: the agent CLI where it runs is not signed in.
+const ACP_AUTH_REQUIRED: i64 = -32000;
+
+fn is_auth_required(code: Option<i64>, message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    // -32000 is also the start of JSON-RPC's generic server-error range, so
+    // the code alone is not taken as a sign-in problem.
+    message.contains("authentication required")
+        || (code == Some(ACP_AUTH_REQUIRED) && message.contains("auth"))
+}
+
+/// What the user does when `host`'s agent in `environment` is not signed in:
+/// sign in to its CLI there, which the adapter then uses.
+fn sign_in_hint(host: AcpHost, environment: &AgentEnvironment) -> String {
+    let (who, sign_in) = match host {
+        AcpHost::Claude => ("Claude Code", "run `claude` and sign in with `/login`"),
+        AcpHost::Cursor => ("Cursor Agent", "run `cursor-agent login`"),
+    };
+    match environment {
+        AgentEnvironment::Host => format!(
+            "{who} is not signed in on this machine. In a terminal, {sign_in}, then send again."
+        ),
+        AgentEnvironment::DevContainer(launch) => format!(
+            "{who} is not signed in inside dev container `{}`. Open a shell there (the node's              Files section, Open shell), {sign_in}, then send again.",
+            launch.container
+        ),
+        AgentEnvironment::Sandbox(launch) => format!(
+            "{who} is not signed in inside cloud sandbox `{0}`. Open a shell there (the node's              Files section, Open shell, or `tod-sandbox shell {0}`), {sign_in}, then send again.",
+            launch.sandbox
+        ),
     }
 }
 
@@ -1804,6 +1903,92 @@ fn apply_session_config_options(
     Ok(())
 }
 
+/// Claude permission modes to run in, most preferred first: Claude Code's
+/// `auto`, else `acceptEdits` for adapters that predate it. The adapter
+/// otherwise starts every session in `default`, which stops to ask before
+/// each edit.
+const CLAUDE_PERMISSION_MODES: &[&str] = &["auto", "acceptEdits"];
+
+/// The first of `preferred` among the modes `result` (a `session/new`,
+/// `session/load`, or `session/resume` response) offers, and how to set it:
+/// `Some(Some(config_id))` through `session/set_config_option`, `Some(None)`
+/// through `session/set_mode`. `None` when it offers none of them, or already
+/// runs in the first one it offers.
+fn pick_permission_mode(result: &Value, preferred: &[&str]) -> Option<(String, Option<Value>)> {
+    let mode_option = result
+        .get("configOptions")
+        .and_then(Value::as_array)
+        .and_then(|options| {
+            options
+                .iter()
+                .find(|o| o.get("category").and_then(Value::as_str) == Some("mode"))
+        });
+    if let Some(option) = mode_option {
+        let target = preferred
+            .iter()
+            .find(|mode| has_config_option_value(option, mode))?;
+        if option.get("currentValue").and_then(Value::as_str) == Some(target) {
+            return None;
+        }
+        let id = option.get("id").cloned().unwrap_or(json!("mode"));
+        return Some((target.to_string(), Some(id)));
+    }
+    let modes = result.get("modes")?;
+    let available = modes.get("availableModes")?.as_array()?;
+    let target = preferred.iter().find(|mode| {
+        available
+            .iter()
+            .any(|m| m.get("id").and_then(Value::as_str) == Some(mode))
+    })?;
+    if modes.get("currentModeId").and_then(Value::as_str) == Some(target) {
+        return None;
+    }
+    Some((target.to_string(), None))
+}
+
+/// Put a Claude session in [`CLAUDE_PERMISSION_MODES`]' first offered mode.
+/// Other hosts keep their own mode.
+fn apply_permission_mode(
+    session: &mut AcpClient,
+    host: AcpHost,
+    session_id: &str,
+    result: &Value,
+) -> Result<()> {
+    if host != AcpHost::Claude {
+        return Ok(());
+    }
+    let Some((mode, config_id)) = pick_permission_mode(result, CLAUDE_PERMISSION_MODES) else {
+        let modes = result.get("modes").map(Value::to_string).unwrap_or_default();
+        tracing::debug!(
+            event = "agent",
+            action = "acp_permission_mode_kept",
+            session_id,
+            modes = %modes,
+            "Claude session keeps its permission mode"
+        );
+        return Ok(());
+    };
+    tracing::info!(
+        event = "agent",
+        action = "acp_set_permission_mode",
+        session_id,
+        mode = %mode,
+        "ACP set permission mode"
+    );
+    match config_id {
+        Some(config_id) => session.send_request(
+            "session/set_config_option",
+            json!({ "sessionId": session_id, "configId": config_id, "value": mode }),
+        )?,
+        None => session.send_request(
+            "session/set_mode",
+            json!({ "sessionId": session_id, "modeId": mode }),
+        )?,
+    };
+    session.await_response(AUTH_TIMEOUT)?;
+    Ok(())
+}
+
 struct PersistentAcpSession {
     client: AcpClient,
     session_id: String,
@@ -1833,6 +2018,7 @@ impl PersistentAcpSession {
         environment: &AgentEnvironment,
         context_chars: Option<Arc<AtomicU64>>,
         reply_parts: Option<SharedReplyParts>,
+        usage: Option<SharedAcpUsage>,
     ) -> Result<Self> {
         let SpawnedAgent {
             mut child,
@@ -1869,6 +2055,8 @@ impl PersistentAcpSession {
             pending_permission,
             context_chars,
             reply_parts,
+            usage,
+            sign_in_hint: sign_in_hint(host, environment),
         };
 
         let client_name = host.client_name();
@@ -1938,6 +2126,7 @@ impl PersistentAcpSession {
             model,
             effort,
         )?;
+        apply_permission_mode(&mut client, host, &session_id, &session_result)?;
 
         Ok(Self {
             client,
@@ -1971,7 +2160,10 @@ impl PersistentAcpSession {
         if let Some((host, title)) = name {
             name_session_in_background(host, self.session_id.clone(), title.to_string());
         }
-        self.client.await_response(PROMPT_TIMEOUT)?;
+        let response = self.client.await_response(PROMPT_TIMEOUT)?;
+        if let Some(usage) = response.get("usage") {
+            self.client.update_usage(|kept| kept.apply_turn(usage));
+        }
         self.client.count_context(self.client.assistant_text.len());
         Ok(self.client.assistant_text.clone())
     }
@@ -1988,6 +2180,34 @@ impl PersistentAcpSession {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_unsigned_in_agent_says_where_to_sign_in() {
+        use super::{AcpHost, AgentEnvironment, is_auth_required, sign_in_hint};
+        assert!(is_auth_required(Some(-32000), "Authentication required"));
+        assert!(!is_auth_required(Some(-32000), "Internal error"));
+        assert!(!is_auth_required(Some(-32603), "session not found"));
+
+        let host = sign_in_hint(AcpHost::Claude, &AgentEnvironment::Host);
+        assert!(host.contains("on this machine") && host.contains("/login"), "{host}");
+        let sandbox = sign_in_hint(
+            AcpHost::Claude,
+            &AgentEnvironment::Sandbox(crate::sandbox::SandboxLaunch {
+                launcher: "tod-sandbox".into(),
+                data_root: "root".into(),
+                sandbox: "vm1".into(),
+                directory: "/work".into(),
+                env: Vec::new(),
+                cli_relay: Vec::new(),
+            }),
+        );
+        assert!(
+            sandbox.contains("cloud sandbox `vm1`") && sandbox.contains("tod-sandbox shell vm1"),
+            "{sandbox}"
+        );
+        let cursor = sign_in_hint(AcpHost::Cursor, &AgentEnvironment::Host);
+        assert!(cursor.contains("cursor-agent login"), "{cursor}");
+    }
+
     use super::*;
     use std::process::{Command, Stdio};
 
@@ -2034,6 +2254,51 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("tod-{label}-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).expect("create scratch dir");
         dir
+    }
+
+    fn session_with_modes(current: &str, ids: &[&str]) -> Value {
+        json!({
+            "sessionId": "s1",
+            "modes": {
+                "currentModeId": current,
+                "availableModes": ids.iter().map(|id| json!({ "id": id, "name": id })).collect::<Vec<_>>(),
+            }
+        })
+    }
+
+    #[test]
+    fn permission_mode_prefers_auto_then_accept_edits() {
+        let with_auto = session_with_modes("default", &["default", "acceptEdits", "auto"]);
+        assert_eq!(
+            pick_permission_mode(&with_auto, CLAUDE_PERMISSION_MODES),
+            Some(("auto".to_string(), None))
+        );
+        let without_auto = session_with_modes("default", &["default", "acceptEdits", "plan"]);
+        assert_eq!(
+            pick_permission_mode(&without_auto, CLAUDE_PERMISSION_MODES),
+            Some(("acceptEdits".to_string(), None))
+        );
+        let already = session_with_modes("auto", &["default", "auto"]);
+        assert_eq!(pick_permission_mode(&already, CLAUDE_PERMISSION_MODES), None);
+        let neither = session_with_modes("default", &["default", "plan"]);
+        assert_eq!(pick_permission_mode(&neither, CLAUDE_PERMISSION_MODES), None);
+        assert_eq!(pick_permission_mode(&json!({}), CLAUDE_PERMISSION_MODES), None);
+    }
+
+    #[test]
+    fn permission_mode_uses_a_mode_config_option_when_offered() {
+        let result = json!({
+            "configOptions": [{
+                "id": "permission",
+                "category": "mode",
+                "currentValue": "default",
+                "options": [{ "value": "default" }, { "value": "auto" }],
+            }]
+        });
+        assert_eq!(
+            pick_permission_mode(&result, CLAUDE_PERMISSION_MODES),
+            Some(("auto".to_string(), Some(json!("permission"))))
+        );
     }
 
     #[test]

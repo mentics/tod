@@ -18,6 +18,8 @@ actions!(
         ShellGoConversation,
         ShellGoSettings,
         ShellGoDatabase,
+        ShellGoWorkbench,
+        ShellGoPullRequests,
         AppNavSelectUp,
         AppNavSelectDown,
         AppNavConfirm,
@@ -26,7 +28,14 @@ actions!(
 );
 
 const APP_NAV_POPUP_CONTEXT: &str = "AppNavPopup";
-const APP_NAV_ITEMS: [&str; 4] = ["Tasks", "Conversation", "Settings", "Database"];
+const APP_NAV_ITEMS: [&str; 6] = [
+    "Tasks",
+    "Conversation",
+    "Settings",
+    "Database",
+    "Workbench",
+    "Pull requests",
+];
 
 /// Shared handler for `` ` `` / app-nav toggle — attach via [`HasAppNav::bind_app_nav_toggle`].
 pub fn on_app_nav_toggle<V: Render + HasAppNav + 'static>(
@@ -58,6 +67,8 @@ pub enum AppDestination {
     Conversation,
     Settings,
     Database,
+    Workbench,
+    PullRequests,
 }
 
 struct AppNavPopup {
@@ -80,10 +91,21 @@ impl AppNavPopup {
             0 => Box::new(ShellGoTasks),
             1 => Box::new(ShellGoConversation),
             2 => Box::new(ShellGoSettings),
-            _ => Box::new(ShellGoDatabase),
+            3 => Box::new(ShellGoDatabase),
+            4 => Box::new(ShellGoWorkbench),
+            _ => Box::new(ShellGoPullRequests),
         };
         self.action_context.focus(window, cx);
-        window.dispatch_action(action, cx);
+        // Dispatch from the popup's own node, not from the restored focus:
+        // the popup is rendered inside the view that opened it, so its path
+        // always reaches the shell's handlers. The restored focus may not be
+        // in the rendered frame (at startup, focus can sit on a view that is
+        // not shown), and GPUI would then dispatch from the window root,
+        // where nothing handles the action.
+        let popup_focus = self.focus_handle.clone();
+        window.defer(cx, move |window, cx| {
+            popup_focus.dispatch_action(action.as_ref(), window, cx);
+        });
         cx.emit(DismissEvent);
     }
 
@@ -319,26 +341,53 @@ pub trait HasAppNav {
     where
         Self: Render + HasAppNav + Sized + 'static,
     {
+        self.render_app_nav_with_badge(true, window, cx)
+    }
+
+    /// [`Self::render_app_nav`] without the shortcut badge hanging below the
+    /// button, for a fixed-height header that has no room for it.
+    fn render_app_nav_without_badge(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement
+    where
+        Self: Render + HasAppNav + Sized + 'static,
+    {
+        self.render_app_nav_with_badge(false, window, cx)
+    }
+
+    fn render_app_nav_with_badge(
+        &mut self,
+        badge: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement
+    where
+        Self: Render + HasAppNav + Sized + 'static,
+    {
         let menu_open = self.app_nav_mut().is_open();
         let menu_focused = self.app_nav_mut().menu_focused(window, cx);
         let menu = self.app_nav_mut().menu.clone();
 
+        let trigger = Button::new("app-nav-trigger")
+            .icon(IconName::Menu)
+            .compact()
+            .selected(menu_open || menu_focused)
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.toggle_app_nav(window, cx);
+            }));
+        let trigger = if badge {
+            chrome_control_with_shortcut_in_context(trigger, window, &AppNavToggle, None, cx)
+                .into_any_element()
+        } else {
+            trigger.into_any_element()
+        };
+
         div()
             .id("app-nav-menu")
             .relative()
-            .child(chrome_control_with_shortcut_in_context(
-                Button::new("app-nav-trigger")
-                    .icon(IconName::Menu)
-                    .compact()
-                    .selected(menu_open || menu_focused)
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.toggle_app_nav(window, cx);
-                    })),
-                window,
-                &AppNavToggle,
-                None,
-                cx,
-            ))
+            .child(trigger)
             .when(menu_open, |el| {
                 el.when_some(menu, |el, menu| {
                     el.child(
@@ -360,6 +409,8 @@ fn nav_item_index(current: Option<AppDestination>) -> usize {
         Some(AppDestination::Conversation) => 1,
         Some(AppDestination::Settings) => 2,
         Some(AppDestination::Database) => 3,
+        Some(AppDestination::Workbench) => 4,
+        Some(AppDestination::PullRequests) => 5,
         Some(AppDestination::Tasks) | None => 0,
     }
 }

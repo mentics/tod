@@ -8,7 +8,7 @@ tod-cli --data-root <DATA_ROOT> capabilities list    <NODE>
 tod-cli --data-root <DATA_ROOT> capabilities enable  <NODE> <CAP>...
 tod-cli --data-root <DATA_ROOT> capabilities disable <NODE> <CAP>
 tod-cli --data-root <DATA_ROOT> capabilities set     <NODE> agent [--platform claude|cursor] [--model <TEXT>] [--effort <TEXT>]
-tod-cli --data-root <DATA_ROOT> capabilities set     <NODE> files [--dir <PATH>] [--branch <TEXT>] [--worktree on|off] [--container <NAME|ID>] [--mounted on|off]
+tod-cli --data-root <DATA_ROOT> capabilities set     <NODE> files [--dir <PATH>] [--branch <TEXT>] [--worktree on|off] [--container <NAME|ID>] [--mounted on|off] [--sandbox <NAME>]
 tod-cli --data-root <DATA_ROOT> capabilities set     <NODE> ticket [--ticket <ID>]... [--pr <URL>]...
 tod-cli --data-root <DATA_ROOT> capabilities set     <NODE> tags (--tags <A,B,..> | --add <TAG> | --remove <TAG>)
 tod-cli --data-root <DATA_ROOT> capabilities set     <NODE> generator --source <TYPE> --config <JSON>
@@ -24,7 +24,9 @@ running dev container (`--container ''` moves them back to this machine).
 The repository lives in the container, so `--dir` is its path there. With
 `--mounted on` the repository is on the host and mounted into the container
 instead: `--dir` is the host path, and the directory inside the container
-follows from its mounts.
+follows from its mounts. `files --sandbox` does the same in a cloud sandbox
+(`--sandbox ''` moves them back); the repository always lives in the
+sandbox, so `--dir` is its path there.
 
 `disable` removes the capability **and everything that belongs to it** — a
 Spec's obligations and details, a generator's generated nodes. It is archived

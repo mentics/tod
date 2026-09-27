@@ -89,6 +89,11 @@ fn field_anchor_id(field: TaskEditField) -> &'static str {
         TaskEditField::ContainerName => "task-edit-field-container",
         TaskEditField::ContainerRefresh => "task-edit-field-container-refresh",
         TaskEditField::ContainerChoice(_) => "task-edit-field-container-choice",
+        TaskEditField::NewSandboxSource => "task-edit-field-new-sandbox-source",
+        TaskEditField::NewSandboxImage => "task-edit-field-new-sandbox-image",
+        TaskEditField::NewSandboxForkSource => "task-edit-field-new-sandbox-fork",
+        TaskEditField::NewSandboxName => "task-edit-field-new-sandbox-name",
+        TaskEditField::NewSandboxCreate => "task-edit-field-new-sandbox-create",
         TaskEditField::Capability(Capability::Agent) => "task-edit-field-cap-agent",
         TaskEditField::Capability(Capability::Files) => "task-edit-field-cap-files",
         TaskEditField::Capability(Capability::Ticket) => "task-edit-field-cap-ticket",
@@ -159,6 +164,16 @@ enum TaskEditField {
     ContainerRefresh,
     /// One listed running container, by index; Enter chooses it.
     ContainerChoice(usize),
+    /// New sandbox: from an image or a fork (Enter switches).
+    NewSandboxSource,
+    /// New sandbox: the image; empty uses the default from Settings.
+    NewSandboxImage,
+    /// New sandbox: the sandbox to fork (Enter takes the next listed one).
+    NewSandboxForkSource,
+    /// New sandbox: its name.
+    NewSandboxName,
+    /// New sandbox: create it and use it for this node.
+    NewSandboxCreate,
     /// Generator capability: pick the data source (only until one is saved).
     GeneratorSource,
     /// One field of the generator's configuration form, by index into
@@ -199,6 +214,9 @@ impl TaskEditField {
                 | Self::RepoLocation
                 | Self::ContainerRefresh
                 | Self::ContainerChoice(_)
+                | Self::NewSandboxSource
+                | Self::NewSandboxForkSource
+                | Self::NewSandboxCreate
                 | Self::GeneratorSource
                 | Self::GeneratorSave
                 | Self::GeneratorRefresh
@@ -336,6 +354,10 @@ pub struct TaskEditView {
     loaded_summary: Option<NodeSummary>,
     /// The store changed; reload what other writers (agents) may have touched.
     pending_live_refresh: bool,
+    /// Hosted in another view (the workbench's Settings column): Left and
+    /// Ctrl+Left (`PaneFocusLeft`) go to the host instead of emitting
+    /// `FocusTaskList`.
+    embedded: bool,
     notes: Vec<NoteItem>,
     details_collapsed: bool,
     notes_collapsed: bool,
@@ -664,6 +686,7 @@ impl TaskEditView {
             loaded_details: String::new(),
             loaded_summary: None,
             pending_live_refresh: false,
+            embedded: false,
             notes: Vec::new(),
             details_collapsed: false,
             notes_collapsed: false,
@@ -703,6 +726,11 @@ impl TaskEditView {
 
     pub fn open_task_id(&self, _cx: &Context<Self>) -> Option<String> {
         self.task_id.clone()
+    }
+
+    /// Host this view inside another; see `embedded`.
+    pub fn set_embedded(&mut self, embedded: bool) {
+        self.embedded = embedded;
     }
 
     pub fn open(&mut self, task_id: &str, window: &mut Window, cx: &mut Context<Self>) {
@@ -783,13 +811,24 @@ impl TaskEditView {
             if self.own_files().is_some() {
                 stops.push(TaskEditField::RunsIn);
             }
-            if self.own_dev_container().is_some() {
+            if let Some(dev) = self.own_dev_container() {
+                if !dev.sandbox {
+                    stops.push(TaskEditField::RepoLocation);
+                }
                 stops.extend([
-                    TaskEditField::RepoLocation,
                     TaskEditField::ContainerName,
                     TaskEditField::ContainerRefresh,
                 ]);
                 stops.extend((0..self.dev.container_count()).map(TaskEditField::ContainerChoice));
+                if dev.sandbox {
+                    stops.push(TaskEditField::NewSandboxSource);
+                    stops.push(if self.dev.new_from_fork() {
+                        TaskEditField::NewSandboxForkSource
+                    } else {
+                        TaskEditField::NewSandboxImage
+                    });
+                    stops.extend([TaskEditField::NewSandboxName, TaskEditField::NewSandboxCreate]);
+                }
             }
             stops.extend([
                 TaskEditField::Repo,
@@ -919,6 +958,8 @@ impl TaskEditView {
             TaskEditField::Branch => self.branch_input.clone().into(),
             TaskEditField::Details => self.details_input.clone().into(),
             TaskEditField::ContainerName => self.dev.container_input.clone().into(),
+            TaskEditField::NewSandboxImage => self.dev.new_image_input.clone().into(),
+            TaskEditField::NewSandboxName => self.dev.new_name_input.clone().into(),
             TaskEditField::GeneratorAcceptDestination => {
                 self.generator_accept_destination_input.clone().into()
             }
@@ -927,6 +968,9 @@ impl TaskEditView {
             | TaskEditField::RepoLocation
             | TaskEditField::ContainerRefresh
             | TaskEditField::ContainerChoice(_)
+            | TaskEditField::NewSandboxSource
+            | TaskEditField::NewSandboxForkSource
+            | TaskEditField::NewSandboxCreate
             | TaskEditField::AgentPlatform
             | TaskEditField::AgentModel
             | TaskEditField::AgentEffort
@@ -956,6 +1000,14 @@ impl TaskEditView {
             (
                 TaskEditField::ContainerName,
                 self.dev.container_input.clone().into(),
+            ),
+            (
+                TaskEditField::NewSandboxImage,
+                self.dev.new_image_input.clone().into(),
+            ),
+            (
+                TaskEditField::NewSandboxName,
+                self.dev.new_name_input.clone().into(),
             ),
             (
                 TaskEditField::GeneratorAcceptDestination,
@@ -1061,6 +1113,18 @@ impl TaskEditView {
             }
             TaskEditField::ContainerChoice(index) => {
                 self.choose_container(index, window, cx);
+                return;
+            }
+            TaskEditField::NewSandboxSource => {
+                self.toggle_new_sandbox_source(cx);
+                return;
+            }
+            TaskEditField::NewSandboxForkSource => {
+                self.cycle_fork_source(cx);
+                return;
+            }
+            TaskEditField::NewSandboxCreate => {
+                self.create_sandbox(window, cx);
                 return;
             }
             _ => {
@@ -1422,6 +1486,10 @@ impl TaskEditView {
         let _ = self.fleet.reload_if_stale();
         self.load_action_capabilities();
         self.clamp_focus_index();
+        if self.repo_in_container() {
+            // Whether the directory must be a git repository changed.
+            self.check_dev_container(cx);
+        }
         self.notify_changed(cx);
     }
 
@@ -3084,22 +3152,32 @@ impl TaskEditView {
         if value == self.loaded_repo {
             return;
         }
-        if !value.is_empty() && self.repo_in_container() {
+        if !value.is_empty() && self.repo_path_is_remote() {
             if !value.starts_with('/') {
-                self.pending_toast = Some(
-                    "The repository is inside the dev container: give its path there, \
-                     like /workspaces/app"
-                        .into(),
-                );
+                let example = if self.runs_in_sandbox() {
+                    "/root/app"
+                } else {
+                    "/workspaces/app"
+                };
+                self.pending_toast = Some(format!(
+                    "The repository is inside {}: give its path there, like {example}",
+                    self.remote_place()
+                ));
                 self.pending_repo_revert = true;
                 cx.notify();
                 return;
             }
         } else if !value.is_empty() {
-            if let Err(err) =
+            // Any directory will do; a worktree needs a git repository.
+            let checked = if self.own_files().is_some_and(|files| files.use_worktree) {
                 validate_interview_workspace(std::path::Path::new(&value), &self.loaded_branch)
-            {
-                self.pending_toast = Some(format!("Repository: {err:#}"));
+            } else if std::path::Path::new(&value).is_dir() {
+                Ok(())
+            } else {
+                Err(anyhow::anyhow!("{value} is not a directory"))
+            };
+            if let Err(err) = checked {
+                self.pending_toast = Some(format!("Workspace directory: {err:#}"));
                 self.pending_repo_revert = true;
                 cx.notify();
                 return;
@@ -3142,7 +3220,10 @@ impl TaskEditView {
             self.rename_worktree_branch(id, value, cx);
             return;
         }
-        if !self.loaded_repo.is_empty() && !self.repo_in_container() {
+        if !self.loaded_repo.is_empty()
+            && !self.repo_path_is_remote()
+            && self.own_files().is_some_and(|files| files.use_worktree)
+        {
             if let Err(err) =
                 validate_interview_workspace(std::path::Path::new(&self.loaded_repo), &value)
             {
@@ -3789,7 +3870,9 @@ impl TaskEditView {
                                 .w(px(280.))
                                 .flex_shrink_0()
                                 .child(Self::render_field_label(
-                                    if self.repo_in_container() {
+                                    if self.runs_in_sandbox() {
+                                        "Workspace directory (in the sandbox)"
+                                    } else if self.repo_path_is_remote() {
                                         "Workspace directory (in the container)"
                                     } else {
                                         "Workspace directory"
@@ -3947,8 +4030,7 @@ impl TaskEditView {
                 if let Some(container) = resolved
                     .dev_container
                     .as_ref()
-                    .filter(|dev| dev.repo_on_host)
-                    .and_then(|dev| dev.container())
+                    .and_then(|dev| dev.mounted_container())
                 {
                     summary = format!("{summary} · in dev container {container}");
                 }
@@ -5739,7 +5821,7 @@ impl Render for TaskEditView {
             .border_l_2()
             .border_color(accent)
             .on_action(cx.listener(|this, _: &PaneFocusLeft, _, cx| {
-                if this.editing.is_some() {
+                if this.editing.is_some() || this.embedded {
                     cx.propagate();
                     return;
                 }

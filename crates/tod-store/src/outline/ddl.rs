@@ -40,7 +40,7 @@ CREATE TABLE IF NOT EXISTS node_lifecycle (
     node_id     BLOB PRIMARY KEY NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
     state       TEXT NOT NULL CHECK (state IN (
                     'proposed', 'design', 'planning', 'ready', 'active',
-                    'verifying', 'review', 'approved', 'merged',
+                    'verifying', 'review', 'pr', 'approved', 'merged',
                     'released', 'learn', 'done'
                 )),
     updated_at  INTEGER NOT NULL

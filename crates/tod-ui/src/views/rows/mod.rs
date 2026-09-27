@@ -1,5 +1,5 @@
-//! Obligation, plan-step, node, and review-finding rows that any view can
-//! host.
+//! Obligation, plan-step, node, review-finding, and pull-request rows that
+//! any view can host.
 //!
 //! The obligations list, the plan list, and the conversation change set all
 //! render the same rows. A row reports what the user did through a
@@ -11,6 +11,7 @@ pub mod finding_row;
 pub mod node_row;
 pub mod obligation_row;
 pub mod plan_step_row;
+pub mod pull_request_row;
 pub mod status_menu;
 
 use std::cell::RefCell;

@@ -1,11 +1,16 @@
 //! Durable persistence for fleet tasks, outline trees, and related storage.
 
+pub mod cloud_nodes;
 pub mod conversation;
 pub mod credentials;
+pub mod decisions;
 pub mod fleet;
 pub mod incoming;
 pub mod install;
 pub mod interview;
+pub mod journey_changes;
+pub mod journey_rows;
+pub mod journey_submissions;
 pub mod learn;
 pub mod lifecycle_baseline;
 pub mod github;
@@ -14,9 +19,13 @@ pub mod log_level;
 pub mod outline;
 pub mod path_util;
 pub mod paths;
+pub mod request_feedback;
 pub mod review;
 pub mod settings;
+pub mod sync;
 pub mod verification;
+pub mod node_events;
+pub mod waits;
 
 /// Agent launch options and live traffic counters live in `tod-agent` (they
 /// describe how a session is started and how it is doing, not how it is
@@ -43,7 +52,7 @@ pub use paths::{
 };
 pub use settings::{
     AgentLaunchByPlatform, AgentPlatform, AgentRole, AgentRoleSettings, ChatLaunchMode,
-    DEFAULT_LOG_MAX_SIZE_KB, InterviewContextSettings, MAX_LOG_MAX_SIZE_KB, MIN_LOG_MAX_SIZE_KB,
-    PlatformLaunchSettings, QuestionMakerSettings, TerminalSettings, TodSettings, WindowGeometry,
-    WorktreeBackend,
+    DEFAULT_LOG_MAX_SIZE_KB, InterviewContextSettings, JourneySettings, MAX_LOG_MAX_SIZE_KB,
+    MIN_LOG_MAX_SIZE_KB, PlatformLaunchSettings, QuestionMakerSettings, TerminalSettings,
+    TodSettings, WindowGeometry, WorktreeBackend,
 };

@@ -1,0 +1,19 @@
+[package]
+name = "tod-zed-shim"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Installed as `ssh`, `scp`, and `sftp` on the PATH of a Zed that tod starts
+# (see `tod_store::fleet::code_editor::zed::zed_env`). Kept free of tod-store so
+# it starts fast: Zed runs it for every remote command.
+[[bin]]
+name = "tod-zed-shim"
+path = "src/main.rs"
+
+[dependencies]
+futures-util = "0.3"
+serde_json = "1.0"
+tod-sandbox = { path = "../tod-sandbox" }
+tokio = { version = "1", features = ["rt", "io-std", "io-util", "macros", "time", "sync"] }
+tokio-tungstenite = "0.24"

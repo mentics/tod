@@ -13,8 +13,10 @@
 
 use super::ConversationView;
 use crate::ui::agent_conversation::{NoticeTone, PanelAction, PanelNotice};
+use crate::ui::journey::Source;
 use crate::views::lifecycle_control::{GateCheckState, enters_with_agent, implement_directory};
 use gpui::{App, Context, SharedString, Window};
+use tod_journey::{Presented, PresentedAction};
 use tod_core::conversation::gate_check::{
     GateReportRecord, latest_gate_report, settle_derived_criteria,
 };
@@ -36,6 +38,9 @@ const FIX_FAILED: &str = "lifecycle:fix-failed";
 const BACK: &str = "lifecycle:back";
 const WAIVE: &str = "lifecycle:waive:";
 
+/// The gate check's status while the app answers the criteria it can.
+pub(super) const SETTLING: &str = "Checking the gate criteria…";
+
 /// Where the focused node stands, read with the rest of the view's data.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct LifecycleSnapshot {
@@ -53,6 +58,9 @@ pub(crate) struct LifecycleSnapshot {
     /// Why implementation, verification, or review cannot run here, when it
     /// cannot.
     pub blocked: Option<String>,
+    /// The node runs in the cloud: its supervisor moves it along, not these
+    /// buttons (`tod_core::cloud_sync`).
+    pub cloud: Option<tod_core::cloud_sync::CloudNode>,
 }
 
 impl LifecycleSnapshot {
@@ -99,6 +107,7 @@ impl LifecycleSnapshot {
             standing,
             lifecycle,
             blocked,
+            cloud: tod_core::cloud_sync::cloud_node(fleet, &task_id),
         })
     }
 
@@ -118,10 +127,18 @@ impl LifecycleSnapshot {
 impl ConversationView {
     /// Whether a conversation running `protocol` on `node` is working now,
     /// whichever conversation is open.
-    fn protocol_running(&self, node: Uuid, protocol: ProtocolKind) -> bool {
-        self.drivers.iter().any(|d| {
-            d.focus() == Focus::Node(node) && d.protocol().kind() == protocol && d.status().running
-        })
+    fn protocol_running(&self, node: Uuid, protocol: ProtocolKind, cx: &App) -> bool {
+        self.agent_runs
+            .read(cx)
+            .protocol_running(Focus::Node(node), protocol)
+    }
+
+    /// Whether a gate check on `node` is under way: waiting on its incoming
+    /// changes, settling the criteria the app answers, or in conversation.
+    fn gate_checking(&self, node: Uuid, cx: &App) -> bool {
+        self.settling_gate.contains(&node)
+            || self.checking_incoming(node, cx)
+            || self.protocol_running(node, ProtocolKind::GateCheck, cx)
     }
 
     /// The buttons beside Send and the short notices above the input (why a
@@ -133,6 +150,17 @@ impl ConversationView {
         let Some(snapshot) = self.data.lifecycle.as_ref() else {
             return (actions, notices);
         };
+        if let Some(cloud) = &snapshot.cloud {
+            notices.push(PanelNotice::new(
+                NoticeTone::Muted,
+                crate::views::cloud_node::status_line_with(
+                    cloud,
+                    &snapshot.lifecycle,
+                    tod_core::cloud_sync::lost::note(&snapshot.node.to_string()).as_deref(),
+                ),
+            ));
+            return (actions, notices);
+        }
         let task_id = snapshot.node.to_string();
         let empty = GateCheckState::default();
         let controller = self.lifecycle.read(cx);
@@ -143,10 +171,9 @@ impl ConversationView {
         // What the open conversation is already doing needs no button.
         let open_is = |protocol| self.data.protocol == protocol && self.status.running;
 
-        let implementing = self.protocol_running(snapshot.node, ProtocolKind::Implementation);
-        let checking = self.protocol_running(snapshot.node, ProtocolKind::GateCheck)
-            || self.checking_incoming(snapshot.node, cx);
-        let changing = implementing || self.protocol_running(snapshot.node, ProtocolKind::Fix);
+        let implementing = self.protocol_running(snapshot.node, ProtocolKind::Implementation, cx);
+        let checking = self.gate_checking(snapshot.node, cx);
+        let changing = implementing || self.protocol_running(snapshot.node, ProtocolKind::Fix, cx);
         let mut gate_offered = next.is_some();
         match snapshot.lifecycle.as_str() {
             "active" => match snapshot.plan {
@@ -213,7 +240,7 @@ impl ConversationView {
                 gate_offered = false;
             }
             "review" => {
-                let fixing = self.protocol_running(snapshot.node, ProtocolKind::Fix);
+                let fixing = self.protocol_running(snapshot.node, ProtocolKind::Fix, cx);
                 let fix_first =
                     snapshot.standing.review_done && snapshot.standing.open_findings > 0;
                 actions.push(
@@ -322,8 +349,7 @@ impl ConversationView {
         let task_id = snapshot.node.to_string();
         let empty = GateCheckState::default();
         let gate = self.lifecycle.read(cx).state(&task_id).unwrap_or(&empty);
-        let checking = self.protocol_running(snapshot.node, ProtocolKind::GateCheck)
-            || self.checking_incoming(snapshot.node, cx);
+        let checking = self.gate_checking(snapshot.node, cx);
         // A gate check recorded earlier says nothing once the work has moved
         // on: after a fix that reopened verification, a verification that
         // failed steps, or a review with open findings, its verdict — pass or
@@ -377,16 +403,63 @@ impl ConversationView {
         notices
     }
 
-    /// A lifecycle button or Waive was pressed.
+    /// The [`Presented`] snapshot for the lifecycle buttons and notices right
+    /// now: every button on offer (id, label, primary, disabled), the
+    /// transcript panel's keyboard highlight (when it names one of those
+    /// buttons), and the notices showing above the input plus the gate
+    /// check's own (§3.1: "what separates a user mistake from the app
+    /// pointing the wrong way").
+    pub(super) fn presented_lifecycle_controls(&self, cx: &App) -> Presented {
+        use crate::ui::agent_conversation::PanelStop;
+
+        let (actions, notices) = self.lifecycle_controls(cx);
+        let gate_notices = self.gate_notices(cx);
+        let highlight = self.transcript.read(cx).highlight();
+        let focused = match highlight {
+            PanelStop::Action(ix) => actions.get(ix).map(|a| a.id.to_string()),
+            other => Some(format!("{other:?}")),
+        };
+        Presented {
+            actions: actions
+                .iter()
+                .map(|a| PresentedAction {
+                    id: a.id.to_string(),
+                    label: a.label.to_string(),
+                    primary: a.primary,
+                    disabled: a.disabled,
+                })
+                .collect(),
+            focused,
+            notices: notices
+                .iter()
+                .chain(gate_notices.iter())
+                .map(|n| n.text.to_string())
+                .collect(),
+        }
+    }
+
+    /// A lifecycle button or Waive was pressed. Records the `UserAction`
+    /// (what was on offer, and the source: click or keyboard) before doing
+    /// what the button does.
     pub(super) fn lifecycle_action(
         &mut self,
         id: &SharedString,
+        source: Source,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let Some(snapshot) = self.data.lifecycle.clone() else {
             return;
         };
+        let presented = self.presented_lifecycle_controls(cx);
+        crate::ui::journey::record_action(
+            cx,
+            self.focus,
+            id.to_string(),
+            source,
+            "conversation",
+            presented,
+        );
         let node = snapshot.node;
         let task_id = node.to_string();
         let lifecycle = self.lifecycle.clone();
@@ -399,9 +472,7 @@ impl ConversationView {
             // the data root, and needs no worktree.
             GATE_CHECK => self.check_gate(node, window, cx),
             ADVANCE => {
-                if self.protocol_running(node, ProtocolKind::GateCheck)
-                    || self.checking_incoming(node, cx)
-                {
+                if self.gate_checking(node, cx) {
                     return;
                 }
                 let entered = lifecycle.update(cx, |c, cx| c.advance_after_criteria(&task_id, cx));
@@ -441,15 +512,53 @@ impl ConversationView {
             cx.notify();
             return;
         }
-        match settle_derived_criteria(&self.fleet, node) {
-            Ok(false) => {
-                let task_id = node.to_string();
-                self.lifecycle
-                    .update(cx, |c, cx| c.reload_criteria(&task_id, cx));
-            }
+        if self.settling_gate.contains(&node) {
+            return;
+        }
+        // Answering the criteria reads the pull request from GitHub (through
+        // the OS keyring's token), may give the node a branch, and waits on
+        // the writer, so it runs on the background executor; meanwhile the
+        // check shows as started here and in the lifecycle panel.
+        self.settling_gate.push(node);
+        let task_id = node.to_string();
+        self.lifecycle.update(cx, |c, cx| {
+            c.report_before_gate(&task_id, Some(SETTLING.to_string()), None, cx)
+        });
+        cx.notify();
+        let fleet = self.fleet.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let settled = cx
+                .background_executor()
+                .spawn(async move { settle_derived_criteria(&fleet, node) })
+                .await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.settled_gate(node, settled, window, cx)
+            });
+        })
+        .detach();
+    }
+
+    /// The criteria the app answers are settled: show them, or hand what is
+    /// left to a gate-check conversation.
+    fn settled_gate(
+        &mut self,
+        node: Uuid,
+        settled: anyhow::Result<bool>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.settling_gate.retain(|n| *n != node);
+        let task_id = node.to_string();
+        self.lifecycle
+            .update(cx, |c, cx| c.report_before_gate(&task_id, None, None, cx));
+        match settled {
+            Ok(false) => self
+                .lifecycle
+                .update(cx, |c, cx| c.reload_criteria(&task_id, cx)),
             Ok(true) => self.run(Focus::Node(node), ProtocolKind::GateCheck, window, cx),
             Err(err) => self.error = Some(format!("{err:#}").into()),
         }
+        cx.notify();
     }
 
     /// Run `protocol` on `node` in a new conversation (see

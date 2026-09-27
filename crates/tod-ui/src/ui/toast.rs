@@ -13,6 +13,35 @@ struct ConfirmToast;
 struct ErrorBannerNotification;
 struct WarningBannerNotification;
 struct CloseGuardToast;
+struct InfoBannerNotification;
+
+/// Brief, low-emphasis confirmation banner (autohides), for background work
+/// that finished successfully with nothing the user must act on.
+pub fn info_toast(window: &mut Window, cx: &mut App, message: impl Into<SharedString>) {
+    let message = message.into();
+    window.push_notification(
+        Notification::new()
+            .id::<InfoBannerNotification>()
+            .content(move |_note, window, cx| {
+                h_flex()
+                    .id("info-banner")
+                    .max_w(px(480.))
+                    .min_w(px(240.))
+                    .px_4()
+                    .py_2p5()
+                    .gap_2()
+                    .items_start()
+                    .child(
+                        div().flex_1().min_w_0().child(
+                            selectable_text("info-banner-text", message.clone(), window, cx)
+                                .text_sm(),
+                        ),
+                    )
+                    .into_any_element()
+            }),
+        cx,
+    );
+}
 
 /// Overlay for queued notifications (error banners, confirm toasts).
 pub fn notification_overlay(window: &mut Window, cx: &mut App) -> Option<impl IntoElement + use<>> {

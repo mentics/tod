@@ -13,7 +13,7 @@
 //! Spec: `doc/conversation/protocols.md` §4.
 
 use tod_store::fleet::Workdir;
-use super::protocol::{Next, Protocol, ProtocolEnv, RunNotice, TurnContext};
+use super::protocol::{Next, Protocol, ProtocolEnv, RunNotice, Stop, TurnContext, cap_or_stall};
 use crate::agent_context::{ImplementRequest, NodeSelection, build_implement_message};
 use crate::gate::PlanStepWithLinks;
 use anyhow::{Context, Result};
@@ -226,6 +226,9 @@ impl Protocol for ImplementationProtocol {
     /// one stuck step never stops work on the rest. Otherwise another turn
     /// goes out, until the cap or a turn that changed nothing.
     fn next(&self, turn: &TurnContext<'_>) -> Result<Next> {
+        if let Some(done) = super::protocol::hand_back_for_pending_decision(turn)? {
+            return Ok(done);
+        }
         let node = node_id(turn.env)?;
         let steps = plan_steps(turn.env.fleet, node);
         let open: Vec<&PlanStepWithLinks> = steps
@@ -235,17 +238,25 @@ impl Protocol for ImplementationProtocol {
         let needs_user = steps.iter().any(|linked| needs_user(&linked.step.status));
         let tests = turn.report.and_then(TestRun::from_report);
         if open.is_empty() && (needs_user || tests.as_ref().is_some_and(TestRun::green)) {
-            return Ok(Next::Done);
+            return Ok(Next::Done(Stop::Complete));
         }
-        if turn.continuations >= super::protocol::CONTINUATION_CAP {
-            return Ok(Next::Done);
-        }
-        if !turn.progressed {
-            return Ok(Next::Done);
+        if let Some(done) = cap_or_stall(turn) {
+            return Ok(done);
         }
         Ok(Next::Continue {
             message: continuation_message(&open, tests.as_ref()),
+            reason: continuation_reason(&open, tests.as_ref()),
         })
+    }
+}
+
+/// A short account of why the loop is continuing, for the journey.
+fn continuation_reason(open: &[&PlanStepWithLinks], tests: Option<&TestRun>) -> String {
+    match (open.len(), tests) {
+        (0, None) => "no test run recorded".to_string(),
+        (0, Some(run)) => format!("tests not green ({})", run.label()),
+        (1, _) => "1 plan step open".to_string(),
+        (n, _) => format!("{n} plan steps open"),
     }
 }
 
@@ -745,6 +756,12 @@ fn sync_branch(env: &ProtocolEnv<'_>, node: Uuid, cwd: &Workdir) -> Option<RunNo
 /// plan, so the app's loop is what carries it to the end — which is the point
 /// of running it under the mock at all. Like a real agent, it has nothing to
 /// say while the work goes to plan.
+///
+/// A step whose text starts `wait <duration>` (`wait 3m: …`, a
+/// `tod_store::waits::parse_duration`) makes it record a timed wait instead,
+/// as `tod-cli wait --until +<duration>` would, the first time only (while
+/// the node has no wait yet): so a cloud node can be taken through a sleep
+/// and a wake with the mock.
 pub fn mock_turn(
     access: &impl super::mock::Access,
     node_id: Uuid,
@@ -753,6 +770,22 @@ pub fn mock_turn(
     let steps = access.read(|conn| {
         Ok(tod_store::outline::repos::PlanStepRepo::new(conn).list_for_node(node_id)?)
     })?;
+    if let Some(step) = steps.iter().find(|step| !step_is_done(&step.status))
+        && let Some(secs) = mock_wait_secs(&step.body)
+    {
+        let waited = access.read(|conn| Ok(!tod_store::waits::WaitRepo::new(conn).list_for_node(node_id)?.is_empty()))?;
+        if !waited {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0);
+            access.interview(tod_store::interview::InterviewCommand::RecordWait {
+                node_id,
+                wait: tod_store::waits::NewWait::until(now + secs * 1000),
+            })?;
+            return Ok(String::new());
+        }
+    }
     if let Some(step) = steps.iter().find(|step| !step_is_done(&step.status)) {
         access.interview(tod_store::interview::InterviewCommand::Outline {
             mutation: tod_store::outline::OutlineMutation::UpdatePlanStepStatus {
@@ -779,6 +812,13 @@ pub fn mock_turn(
     Ok(String::new())
 }
 
+/// `wait 3m: …` → 180 (see [`mock_turn`]).
+fn mock_wait_secs(body: &str) -> Option<i64> {
+    let rest = body.trim().strip_prefix("wait ")?;
+    let word = rest.split(|c: char| c.is_whitespace() || c == ':').next()?;
+    tod_store::waits::parse_duration(word).ok()
+}
+
 #[cfg(test)]
 mod commit_tests {
     use super::*;
@@ -793,6 +833,14 @@ mod commit_tests {
             .unwrap();
         assert!(out.status.success(), "git {args:?}: {out:?}");
         String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    #[test]
+    fn mock_wait_steps_name_a_duration() {
+        assert_eq!(mock_wait_secs("wait 3m: then carry on"), Some(180));
+        assert_eq!(mock_wait_secs("wait 90s"), Some(90));
+        assert_eq!(mock_wait_secs("Write the parser"), None);
+        assert_eq!(mock_wait_secs("wait for CI"), None);
     }
 
     #[test]
@@ -1006,7 +1054,7 @@ mod tests {
         #[test]
         fn an_open_plan_step_keeps_the_loop_going_however_green_the_tests() {
             let fx = planned(2, 1);
-            let Next::Continue { message } = decide(&fx, green(), 0, true) else {
+            let Next::Continue { message, reason } = decide(&fx, green(), 0, true) else {
                 panic!("an open plan step should continue");
             };
             assert!(
@@ -1014,31 +1062,34 @@ mod tests {
                 "{message}"
             );
             assert!(message.contains("Step 1"), "{message}");
+            assert_eq!(reason, "1 plan step open");
         }
 
         #[test]
         fn a_closed_plan_and_green_tests_hand_back() {
             let fx = planned(2, 2);
-            assert!(matches!(decide(&fx, green(), 0, true), Next::Done));
+            assert!(matches!(decide(&fx, green(), 0, true), Next::Done(Stop::Complete)));
         }
 
         #[test]
         fn red_tests_keep_the_loop_going_even_with_every_step_closed() {
             let fx = planned(2, 2);
-            let Next::Continue { message } = decide(&fx, Some(run(22, 2, 0)), 0, true) else {
+            let Next::Continue { message, reason } = decide(&fx, Some(run(22, 2, 0)), 0, true) else {
                 panic!("red tests should continue");
             };
             assert!(message.contains("not green"), "{message}");
+            assert!(reason.contains("not green"), "{reason}");
         }
 
         /// A closed plan is not done until this turn has recorded its tests.
         #[test]
         fn no_recorded_test_run_keeps_the_loop_going() {
             let fx = planned(2, 2);
-            let Next::Continue { message } = decide(&fx, None, 0, true) else {
+            let Next::Continue { message, reason } = decide(&fx, None, 0, true) else {
                 panic!("an unrecorded test run should continue");
             };
             assert!(message.contains("No test run was recorded"), "{message}");
+            assert_eq!(reason, "no test run recorded");
         }
 
         fn handed_back(reason: HandoffReason) -> PlanStep {
@@ -1113,7 +1164,7 @@ mod tests {
         fn a_blocked_step_does_not_stop_the_open_ones() {
             let fx = planned(3, 0);
             hand_over(&fx, 1, STATUS_BLOCKED);
-            let Next::Continue { message } = decide(&fx, None, 0, true) else {
+            let Next::Continue { message, reason } = decide(&fx, None, 0, true) else {
                 panic!("the other open steps should continue");
             };
             assert!(
@@ -1121,6 +1172,7 @@ mod tests {
                 "{message}"
             );
             assert!(!message.contains("Step 1"), "{message}");
+            assert_eq!(reason, "2 plan steps open");
         }
 
         /// Once nothing but `partial` and `blocked` steps is left, the work
@@ -1130,7 +1182,7 @@ mod tests {
             let fx = planned(3, 1);
             hand_over(&fx, 1, STATUS_PARTIAL);
             hand_over(&fx, 2, STATUS_BLOCKED);
-            assert!(matches!(decide(&fx, None, 0, true), Next::Done));
+            assert!(matches!(decide(&fx, None, 0, true), Next::Done(Stop::Complete)));
         }
 
         fn set(fx: &Fixture, n: usize, status: &str, note: Option<&str>) {
@@ -1152,7 +1204,7 @@ mod tests {
         fn a_failed_step_goes_back_with_its_failure() {
             let fx = planned(2, 2);
             set(&fx, 0, STATUS_FAILED, Some("Empty input panics"));
-            let Next::Continue { message } = decide(&fx, green(), 0, true) else {
+            let Next::Continue { message, .. } = decide(&fx, green(), 0, true) else {
                 panic!("a failed step should continue");
             };
             assert!(
@@ -1167,7 +1219,7 @@ mod tests {
             );
 
             set(&fx, 0, "in_progress", None);
-            let Next::Continue { message } = decide(&fx, green(), 0, true) else {
+            let Next::Continue { message, .. } = decide(&fx, green(), 0, true) else {
                 panic!("an in-progress step should continue");
             };
             assert!(
@@ -1186,14 +1238,14 @@ mod tests {
             let fx = planned(2, 0);
             assert!(matches!(
                 decide(&fx, None, CONTINUATION_CAP, true),
-                Next::Done
+                Next::Done(Stop::ContinuationCap)
             ));
         }
 
         #[test]
         fn a_turn_that_changed_nothing_stops_the_loop() {
             let fx = planned(2, 0);
-            assert!(matches!(decide(&fx, None, 1, false), Next::Done));
+            assert!(matches!(decide(&fx, None, 1, false), Next::Done(Stop::NoProgress)));
         }
     }
 }

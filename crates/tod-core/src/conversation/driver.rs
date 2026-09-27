@@ -23,7 +23,7 @@ use anyhow::{Context, Result, bail};
 use std::path::PathBuf;
 use tod_agent::{
     AgentLaunchOptions, AgentProvider, AgentRunState, PermissionRequest, RunId, SessionOpening,
-    SessionTurn,
+    SessionTurn, SharedAgent, TokenUsage,
 };
 use tod_store::conversation::{
     Conversation, ConversationRepo, Focus, ProtocolKind, ReplyPart, TurnRole, reply_answer,
@@ -31,7 +31,46 @@ use tod_store::conversation::{
 use tod_store::fleet::FleetStore;
 use tod_store::interview::{ACTOR_USER, InterviewCommand};
 use tod_store::settings::InterviewContextSettings;
+use tod_journey::{Actor, Decision, Event, JourneyKey, TurnPhase};
 use uuid::Uuid;
+
+/// How the driver reaches the agent: for one provider call at a time.
+///
+/// Starting and finishing a turn runs git, Docker, and `tod-cli`, which can
+/// take seconds, so callers run the driver off the UI thread. A provider
+/// shared with the UI ([`SharedAgentAccess`]) is locked only for each call,
+/// never across that work, so the UI never waits on it.
+pub trait AgentAccess {
+    fn with<R>(&mut self, f: impl FnOnce(&mut dyn AgentProvider) -> R) -> R;
+}
+
+impl<T: AgentProvider> AgentAccess for T {
+    fn with<R>(&mut self, f: impl FnOnce(&mut dyn AgentProvider) -> R) -> R {
+        f(self)
+    }
+}
+
+impl AgentAccess for dyn AgentProvider + '_ {
+    fn with<R>(&mut self, f: impl FnOnce(&mut dyn AgentProvider) -> R) -> R {
+        f(self)
+    }
+}
+
+impl AgentAccess for dyn AgentProvider + Send + '_ {
+    fn with<R>(&mut self, f: impl FnOnce(&mut dyn AgentProvider) -> R) -> R {
+        f(self)
+    }
+}
+
+/// The app's shared provider, locked for each call and released between.
+pub struct SharedAgentAccess<'a>(pub &'a SharedAgent);
+
+impl AgentAccess for SharedAgentAccess<'_> {
+    fn with<R>(&mut self, f: impl FnOnce(&mut dyn AgentProvider) -> R) -> R {
+        let mut agent = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        f(agent.as_mut())
+    }
+}
 
 /// The body of the transcript entry that marks a fresh agent session.
 pub const ROTATION_NOTE: &str = "Started a fresh agent session";
@@ -52,11 +91,18 @@ pub struct ConversationStatus {
     pub running: bool,
     /// What the agent is doing right now, when the provider reports it.
     pub activity: Option<String>,
+    /// The turn in flight so far, part by part (text, thoughts, tool calls),
+    /// when the provider streams them. Empty when no turn is in flight.
+    pub parts: Vec<ReplyPart>,
     /// The agent is blocked on a permission decision; answer it through the
     /// provider (`respond_to_permission`) with this request's run.
     pub permission: Option<PermissionRequest>,
     /// The last turn's failure, until the next send.
     pub last_error: Option<String>,
+    /// The tokens the agent reported spending while this app held its
+    /// session, when the provider reports any. The platform's record says
+    /// more (`run_transcript::usage_for_key`).
+    pub live_usage: Option<TokenUsage>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -108,8 +154,10 @@ pub struct ConversationDriver {
     session_tokens: Option<i64>,
     reported_stale: ReportedStale,
     activity: Option<String>,
+    parts: Vec<ReplyPart>,
     permission: Option<PermissionRequest>,
     last_error: Option<String>,
+    live_usage: Option<TokenUsage>,
 }
 
 impl ConversationDriver {
@@ -127,8 +175,10 @@ impl ConversationDriver {
             session_tokens: None,
             reported_stale: ReportedStale::new(),
             activity: None,
+            parts: Vec::new(),
             permission: None,
             last_error: None,
+            live_usage: None,
         }
     }
 
@@ -185,8 +235,10 @@ impl ConversationDriver {
         ConversationStatus {
             running: self.run.is_some(),
             activity: self.activity.clone(),
+            parts: self.parts.clone(),
             permission: self.permission.clone(),
             last_error: self.last_error.clone(),
+            live_usage: self.live_usage.clone(),
         }
     }
 
@@ -195,30 +247,52 @@ impl ConversationDriver {
         format!("conversation-{conversation_id}")
     }
 
+    /// Which journey this conversation's events are recorded to: the focus
+    /// node's, or the project journey when it has none.
+    fn journey_key(&self) -> JourneyKey {
+        self.focus
+            .node_id()
+            .map(JourneyKey::Node)
+            .unwrap_or(JourneyKey::Project)
+    }
+
     /// Stop the turn in flight. Its user turn stays in the transcript with an
     /// error turn after it.
-    pub fn cancel(&mut self, fleet: &FleetStore, agent: &mut dyn AgentProvider) -> Result<()> {
+    pub fn cancel<A: AgentAccess + ?Sized>(&mut self, fleet: &FleetStore, agent: &mut A) -> Result<()> {
         let Some(run) = self.run.take() else {
             return Ok(());
         };
-        let _ = agent.cancel_run(run.id);
+        let _ = agent.with(|a| a.cancel_run(run.id));
         self.activity = None;
+        self.parts.clear();
         self.permission = None;
         let id = self
             .conversation_id
             .context("a run without a conversation")?;
         self.append(fleet, id, TurnRole::Error, "Stopped")?;
+        crate::journey::record(
+            self.journey_key(),
+            Actor::Agent { conversation: id },
+            Event::AgentTurn {
+                conversation: id,
+                phase: TurnPhase::Stopped,
+            },
+        );
         Ok(())
     }
 
     /// Append the user's message and start the agent's turn on it. Creates
     /// the conversation row on the first send.
-    pub fn send(
+    /// Sends `text` as the user's turn. Returns the turn's seq — recorded by
+    /// the caller as the journey's `send` `UserAction` (spec §3.1), along
+    /// with the text's length rather than its content, which is already in
+    /// the transcript.
+    pub fn send<A: AgentAccess + ?Sized>(
         &mut self,
         fleet: &FleetStore,
-        agent: &mut dyn AgentProvider,
+        agent: &mut A,
         text: &str,
-    ) -> Result<()> {
+    ) -> Result<i64> {
         if self.run.is_some() {
             bail!("the agent is still working on the previous message");
         }
@@ -253,11 +327,19 @@ impl ConversationDriver {
             }
             None => String::new(),
         };
-        let user_seq = self.append(fleet, id, TurnRole::User, text)?;
+        let sent_context = (!changes.is_empty()).then(|| changes.clone());
+        let user_seq = self.append_with_parts_and_context(
+            fleet,
+            id,
+            TurnRole::User,
+            text,
+            Vec::new(),
+            sent_context,
+        )?;
         // A user message ends whatever loop the previous one started.
         self.continuations = 0;
 
-        let live = agent.session_id(&key).is_some();
+        let live = agent.with(|a| a.session_id(&key).is_some());
         let resumable = live || conversation.agent_session_id.is_some();
         let budget = self.config.context.context_budget_tokens as i64;
         if resumable && self.session_tokens.is_none() {
@@ -265,9 +347,9 @@ impl ConversationDriver {
         }
         let over_budget = self.session_tokens.is_some_and(|t| t > budget);
 
-        if resumable && !over_budget {
+        let started = if resumable && !over_budget {
             let message = join(&changes, text);
-            return self.start(
+            self.start(
                 fleet,
                 agent,
                 &conversation,
@@ -275,64 +357,78 @@ impl ConversationDriver {
                 None,
                 message,
                 conversation.agent_session_id.clone().filter(|_| !live),
-            );
-        }
-        if has_history {
-            return self.rotate_and_start(fleet, agent, &conversation, user_seq, &changes, text);
-        }
-        // The first turn: the opening context, then the message.
-        let context = self.protocol.opening(&self.env(fleet, id))?;
-        // Kept so the user can read what the agent was given.
-        fleet.interview(
-            ACTOR_USER,
-            InterviewCommand::SetConversationOpeningContext {
-                conversation_id: id,
-                context: context.clone(),
-            },
-        )?;
-        self.session_tokens = Some(0);
-        self.start(
-            fleet,
-            agent,
-            &conversation,
-            user_seq,
-            Some(context),
-            join(&changes, text),
-            None,
-        )
+            )
+        } else if has_history {
+            let reason = if !resumable { "not resumable" } else { "over budget" };
+            self.rotate_and_start(fleet, agent, &conversation, user_seq, &changes, text, reason)
+        } else {
+            // The first turn: the opening context, then the message.
+            let context = self.protocol.opening(&self.env(fleet, id))?;
+            // Kept so the user can read what the agent was given.
+            fleet.interview(
+                ACTOR_USER,
+                InterviewCommand::SetConversationOpeningContext {
+                    conversation_id: id,
+                    context: context.clone(),
+                },
+            )?;
+            self.session_tokens = Some(0);
+            self.start(
+                fleet,
+                agent,
+                &conversation,
+                user_seq,
+                Some(context),
+                join(&changes, text),
+                None,
+            )
+        };
+        started.map(|()| user_seq)
     }
 
     /// Collect a finished turn. Call on every poll.
-    pub fn tick(
+    pub fn tick<A: AgentAccess + ?Sized>(
         &mut self,
         fleet: &FleetStore,
-        agent: &mut dyn AgentProvider,
+        agent: &mut A,
     ) -> Vec<ConversationEvent> {
         let mut events = Vec::new();
+        let key = self.run.as_ref().map(|run| run.key.clone());
         if let Err(err) = self.poll(fleet, agent, &mut events) {
             let error = format!("{err:#}");
             self.last_error = Some(error.clone());
             events.push(ConversationEvent::TurnFinished { error: Some(error) });
         }
+        // Read after the poll: a turn that just ended has reported its
+        // totals by the time it reads as ended.
+        if let Some(usage) = key.and_then(|key| agent.with(|a| a.session_token_usage(&key))) {
+            self.live_usage = Some(usage);
+        }
         events
     }
 
-    fn poll(
+    fn poll<A: AgentAccess + ?Sized>(
         &mut self,
         fleet: &FleetStore,
-        agent: &mut dyn AgentProvider,
+        agent: &mut A,
         events: &mut Vec<ConversationEvent>,
     ) -> Result<()> {
         let Some(run) = &self.run else {
             return Ok(());
         };
-        let outcome = match agent.poll_run(run.id) {
+        let outcome = match agent.with(|a| a.poll_run(run.id)) {
             Some(AgentRunState::InFlight(activity)) => {
+                self.parts = agent
+                    .with(|a| a.session_reply_parts(&run.key))
+                    .unwrap_or_default();
                 self.activity = activity;
                 self.permission = None;
                 return self.save_session_id(fleet, agent);
             }
             Some(AgentRunState::NeedsPermission(request)) => {
+                self.parts = agent
+                    .with(|a| a.session_reply_parts(&run.key))
+                    .unwrap_or_default();
                 // Otherwise the view keeps showing the tool that asked, as
                 // if it were still running.
                 self.activity = Some(format!(
@@ -348,16 +444,19 @@ impl ConversationDriver {
         };
         let run = self.run.take().expect("checked above");
         self.activity = None;
+        self.parts.clear();
         self.permission = None;
         let id = self
             .conversation_id
             .context("a run without a conversation")?;
         let chars = agent
-            .session_context_chars(&run.key)
+            .with(|a| a.session_context_chars(&run.key))
             .unwrap_or(run.chars_at_start);
         match outcome {
             Ok(reply) => {
-                let parts = agent.session_reply_parts(&run.key).unwrap_or_default();
+                let parts = agent
+                    .with(|a| a.session_reply_parts(&run.key))
+                    .unwrap_or_default();
                 let reply = reply.trim();
                 let added = (chars.saturating_sub(run.chars_at_start) / 4) as i64;
                 self.session_tokens =
@@ -370,7 +469,7 @@ impl ConversationDriver {
                     ACTOR_USER,
                     InterviewCommand::SetConversationSession {
                         conversation_id: id,
-                        agent_session_id: agent.session_id(&run.key),
+                        agent_session_id: agent.with(|a| a.session_id(&run.key)),
                         session_name: name,
                     },
                 )?;
@@ -381,7 +480,15 @@ impl ConversationDriver {
                 } else {
                     reply_answer(&parts)
                 };
-                self.land_reply(fleet, agent, id, &body, parts, run.user_seq, events)?;
+                let seq = self.land_reply(fleet, agent, id, &body, parts, run.user_seq, events)?;
+                crate::journey::record(
+                    self.journey_key(),
+                    Actor::Agent { conversation: id },
+                    Event::AgentTurn {
+                        conversation: id,
+                        phase: TurnPhase::Replied { seq: seq as u64 },
+                    },
+                );
             }
             Err(message) if run.cold_resume => {
                 // The recorded session could not be resumed: start fresh and
@@ -400,11 +507,30 @@ impl ConversationDriver {
                 tracing::warn!(conversation = %id, "resume failed, rotating: {message}");
                 // The corrections were already in the failed prompt; a fresh
                 // session gets the current state in its snapshot.
-                self.rotate_and_start(fleet, agent, &conversation, run.user_seq, "", &text)?;
+                self.rotate_and_start(
+                    fleet,
+                    agent,
+                    &conversation,
+                    run.user_seq,
+                    "",
+                    &text,
+                    "cold resume failed",
+                )?;
                 events.push(ConversationEvent::Rotated);
             }
             Err(message) => {
-                self.append(fleet, id, TurnRole::Error, &message)?;
+                let seq = self.append(fleet, id, TurnRole::Error, &message)?;
+                crate::journey::record(
+                    self.journey_key(),
+                    Actor::Agent { conversation: id },
+                    Event::AgentTurn {
+                        conversation: id,
+                        phase: TurnPhase::Failed {
+                            seq: seq as u64,
+                            error: message.clone(),
+                        },
+                    },
+                );
                 self.last_error = Some(message.clone());
                 events.push(ConversationEvent::TurnFinished {
                     error: Some(message),
@@ -416,19 +542,19 @@ impl ConversationDriver {
 
     /// Record a finished reply, and decide from what the agent recorded
     /// during the turn whether the exchange is over or another turn goes out
-    /// without the user.
+    /// without the user. Returns the agent turn's own seq.
     #[allow(clippy::too_many_arguments)]
-    fn land_reply(
+    fn land_reply<A: AgentAccess + ?Sized>(
         &mut self,
         fleet: &FleetStore,
-        agent: &mut dyn AgentProvider,
+        agent: &mut A,
         id: Uuid,
         body: &str,
         parts: Vec<ReplyPart>,
         turn_seq: i64,
         events: &mut Vec<ConversationEvent>,
-    ) -> Result<()> {
-        self.append_with_parts(fleet, id, TurnRole::Agent, body, parts)?;
+    ) -> Result<i64> {
+        let reply_seq = self.append_with_parts(fleet, id, TurnRole::Agent, body, parts)?;
         for notice in self.protocol.on_reply(&self.env(fleet, id), body) {
             events.push(ConversationEvent::Notice(notice));
         }
@@ -448,30 +574,56 @@ impl ConversationDriver {
                 progressed,
             })?
         };
+        let decision = match &next {
+            Next::Done(stop) => Decision::Stop {
+                stop: match stop {
+                    super::protocol::Stop::Complete => "complete".to_string(),
+                    super::protocol::Stop::HandBack(_) => "hand_back".to_string(),
+                    super::protocol::Stop::ContinuationCap => "continuation_cap".to_string(),
+                    super::protocol::Stop::NoProgress => "no_progress".to_string(),
+                },
+                reason: match stop {
+                    super::protocol::Stop::HandBack(reason) => reason.clone(),
+                    _ => String::new(),
+                },
+            },
+            Next::Continue { reason, .. } => Decision::Continue {
+                reason: reason.clone(),
+            },
+        };
+        crate::journey::record(
+            self.journey_key(),
+            Actor::App,
+            Event::ProtocolDecision {
+                conversation: id,
+                protocol: self.protocol.kind().as_str().to_string(),
+                decision,
+            },
+        );
         match next {
-            Next::Done => {
+            Next::Done(_) => {
                 self.continuations = 0;
                 for notice in self.protocol.finish(&self.env(fleet, id)) {
                     events.push(ConversationEvent::Notice(notice));
                 }
                 events.push(ConversationEvent::TurnFinished { error: None });
             }
-            Next::Continue { message } => {
+            Next::Continue { message, .. } => {
                 self.continuations += 1;
                 self.append(fleet, id, TurnRole::Continuation, &message)?;
                 self.resend(fleet, agent, id, message)?;
                 events.push(ConversationEvent::Continued);
             }
         }
-        Ok(())
+        Ok(reply_seq)
     }
 
     /// Send another turn on the conversation's own session, without a user
     /// message behind it.
-    fn resend(
+    fn resend<A: AgentAccess + ?Sized>(
         &mut self,
         fleet: &FleetStore,
-        agent: &mut dyn AgentProvider,
+        agent: &mut A,
         id: Uuid,
         message: String,
     ) -> Result<()> {
@@ -481,7 +633,7 @@ impl ConversationDriver {
             let last_seq = repo.turns(id)?.last().map_or(0, |t| t.seq);
             Ok((conversation, last_seq))
         })?;
-        let live = agent.session_id(&Self::session_key(id)).is_some();
+        let live = agent.with(|a| a.session_id(&Self::session_key(id)).is_some());
         let resume = conversation.agent_session_id.clone().filter(|_| !live);
         self.start(fleet, agent, &conversation, last_seq, None, message, resume)
     }
@@ -531,6 +683,19 @@ impl ConversationDriver {
         body: &str,
         parts: Vec<ReplyPart>,
     ) -> Result<i64> {
+        self.append_with_parts_and_context(fleet, id, role, body, parts, None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn append_with_parts_and_context(
+        &self,
+        fleet: &FleetStore,
+        id: Uuid,
+        role: TurnRole,
+        body: &str,
+        parts: Vec<ReplyPart>,
+        sent_context: Option<String>,
+    ) -> Result<i64> {
         let value = fleet.interview(
             ACTOR_USER,
             InterviewCommand::AppendConversationTurn {
@@ -538,25 +703,37 @@ impl ConversationDriver {
                 role,
                 body: body.to_string(),
                 parts,
+                sent_context,
             },
         )?;
         value["seq"].as_i64().context("turn seq missing")
     }
 
     /// Mark the rotation, forget the old session, and send `text` to a fresh
-    /// one that gets the conversation's snapshot.
-    fn rotate_and_start(
+    /// one that gets the conversation's snapshot. `reason` is recorded to the
+    /// journey ("over budget" | "not resumable" | "cold resume failed").
+    #[allow(clippy::too_many_arguments)]
+    fn rotate_and_start<A: AgentAccess + ?Sized>(
         &mut self,
         fleet: &FleetStore,
-        agent: &mut dyn AgentProvider,
+        agent: &mut A,
         conversation: &Conversation,
         user_seq: i64,
         changes: &str,
         text: &str,
+        reason: &str,
     ) -> Result<()> {
         let id = conversation.id;
-        agent.close_session(&Self::session_key(id));
+        agent.with(|a| a.close_session(&Self::session_key(id)));
         self.append(fleet, id, TurnRole::Rotation, ROTATION_NOTE)?;
+        crate::journey::record(
+            self.journey_key(),
+            Actor::App,
+            Event::SessionRotated {
+                conversation: id,
+                reason: reason.to_string(),
+            },
+        );
         fleet.interview(
             ACTOR_USER,
             InterviewCommand::SetConversationSession {
@@ -582,10 +759,10 @@ impl ConversationDriver {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn start(
+    fn start<A: AgentAccess + ?Sized>(
         &mut self,
         fleet: &FleetStore,
-        agent: &mut dyn AgentProvider,
+        agent: &mut A,
         conversation: &Conversation,
         user_seq: i64,
         context: Option<String>,
@@ -613,32 +790,24 @@ impl ConversationDriver {
                 self.protocol.progress(&env).ok().flatten(),
             )
         };
-        // A node whose Files name a dev container runs its agent there.
-        let environment = match self.focus.node_id() {
-            Some(node) => fleet.agent_environment(&node.to_string(), &cwd)?,
-            None => tod_store::fleet::dev_container::environment_for(
-                None,
-                &cwd,
-                fleet.paths().root(),
-            )?,
-        };
+        let environment = launch_environment(fleet, self.focus, &cwd)?;
         self.progress_before = progress;
         // Whatever the protocol, an agent running in a codebase gets its rules.
         let context =
             context.map(|context| crate::codebase_rules::with_codebase_rules_in(context, &cwd));
-        // An agent inside a dev container is started from the data root here.
+        // An agent inside a dev container or sandbox is started from the
+        // data root here.
         let cwd = match cwd {
             Workdir::Host(path) => path,
-            Workdir::Container { .. } => fleet.paths().root().to_path_buf(),
+            Workdir::Container { .. } | Workdir::Sandbox { .. } => fleet.paths().root().to_path_buf(),
         };
         let opening = context.as_ref().map(|context| SessionOpening {
             context: Some(context.clone()),
         });
         let sent = context.as_deref().map_or(0, estimate_tokens) + estimate_tokens(&message);
         self.session_tokens = Some(self.session_tokens.unwrap_or(0) + sent);
-        let chars_at_start = agent.session_context_chars(&key).unwrap_or(0);
         let cold_resume = resume.is_some();
-        let handle = agent.send_session_turn(SessionTurn {
+        let turn = SessionTurn {
             key: key.clone(),
             owner_id: id.to_string(),
             title: title.clone(),
@@ -650,6 +819,11 @@ impl ConversationDriver {
             purpose: self.protocol.purpose(),
             env: turn_env,
             environment,
+        };
+        let (chars_at_start, handle, chars_sent) = agent.with(|a| {
+            let before = a.session_context_chars(&key).unwrap_or(0);
+            let handle = a.send_session_turn(turn);
+            (before, handle, a.session_context_chars(&key).unwrap_or(0))
         });
         let handle = match handle {
             Ok(handle) => handle,
@@ -661,7 +835,7 @@ impl ConversationDriver {
             }
         };
         // Once sent, the chars the provider reports include this message.
-        let chars_at_start = chars_at_start.max(agent.session_context_chars(&key).unwrap_or(0));
+        let chars_at_start = chars_at_start.max(chars_sent);
         self.run = Some(Run {
             id: handle.id,
             key,
@@ -671,20 +845,30 @@ impl ConversationDriver {
             title,
             session_saved: false,
         });
+        crate::journey::record(
+            self.journey_key(),
+            Actor::Agent { conversation: id },
+            Event::AgentTurn {
+                conversation: id,
+                phase: TurnPhase::Started {
+                    user_seq: user_seq as u64,
+                },
+            },
+        );
         Ok(())
     }
 
     /// Store the session's id on the conversation as soon as the agent has
     /// given one, not when the turn ends: a turn that never ends still leaves
     /// the session resumable.
-    fn save_session_id(&mut self, fleet: &FleetStore, agent: &dyn AgentProvider) -> Result<()> {
+    fn save_session_id<A: AgentAccess + ?Sized>(&mut self, fleet: &FleetStore, agent: &mut A) -> Result<()> {
         let (Some(run), Some(id)) = (self.run.as_mut(), self.conversation_id) else {
             return Ok(());
         };
         if run.session_saved {
             return Ok(());
         }
-        let Some(session) = agent.session_id(&run.key) else {
+        let Some(session) = agent.with(|a| a.session_id(&run.key)) else {
             return Ok(());
         };
         run.session_saved = true;
@@ -735,6 +919,19 @@ impl ConversationDriver {
             .delta(&self.env(fleet, id), since, &mut reported);
         self.reported_stale = reported;
         result
+    }
+}
+
+/// Where a conversation about `focus` whose protocol works in `cwd` runs its
+/// agent: a node whose Files name a dev container or sandbox runs it there.
+pub(crate) fn launch_environment(
+    fleet: &FleetStore,
+    focus: Focus,
+    cwd: &Workdir,
+) -> Result<tod_agent::AgentEnvironment> {
+    match focus.node_id() {
+        Some(node) => fleet.agent_environment(&node.to_string(), cwd),
+        None => tod_store::fleet::dev_container::environment_for(None, cwd, fleet.paths().root()),
     }
 }
 

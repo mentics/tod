@@ -14,7 +14,7 @@
 
 use tod_store::fleet::Workdir;
 use super::implement::{IMPLEMENT_CONVERSATION_ENV, IMPLEMENT_NODE_ENV, node_id, plan_steps};
-use super::protocol::{Next, Protocol, ProtocolEnv, TurnContext};
+use super::protocol::{Next, Protocol, ProtocolEnv, Stop, TurnContext, cap_or_stall};
 use crate::agent_context::{ImplementRequest, NodeSelection, build_pr_message};
 use crate::process_bundle::{ProcessManifest, TodInstallPaths, state_role_doc};
 use anyhow::{Context, Result};
@@ -170,13 +170,14 @@ impl Protocol for PrProtocol {
     /// another turn goes out, until the cap or a turn that recorded nothing.
     fn next(&self, turn: &TurnContext<'_>) -> Result<Next> {
         if turn.report.is_some_and(is_done_report) {
-            return Ok(Next::Done);
+            return Ok(Next::Done(Stop::Complete));
         }
-        if turn.continuations >= super::protocol::CONTINUATION_CAP || !turn.progressed {
-            return Ok(Next::Done);
+        if let Some(done) = cap_or_stall(turn) {
+            return Ok(done);
         }
         Ok(Next::Continue {
             message: continuation_message(),
+            reason: "the PR is not recorded as mergeable yet".to_string(),
         })
     }
 }
@@ -249,17 +250,17 @@ mod tests {
 
     #[test]
     fn mergeable_hands_back() {
-        assert!(matches!(decide(Some(mergeable_report(None)), 0, true), Next::Done));
+        assert!(matches!(decide(Some(mergeable_report(None)), 0, true), Next::Done(Stop::Complete)));
     }
 
     #[test]
     fn merged_hands_back_too() {
-        assert!(matches!(decide(Some(merged_report(None)), 0, true), Next::Done));
+        assert!(matches!(decide(Some(merged_report(None)), 0, true), Next::Done(Stop::Complete)));
     }
 
     #[test]
     fn not_yet_mergeable_keeps_the_loop_going() {
-        let Next::Continue { message } = decide(None, 0, true) else {
+        let Next::Continue { message, .. } = decide(None, 0, true) else {
             panic!("a PR not yet mergeable should continue");
         };
         assert!(message.starts_with("The PR is not recorded as mergeable"), "{message}");
@@ -267,7 +268,7 @@ mod tests {
 
     #[test]
     fn the_cap_or_a_turn_that_changed_nothing_stops_the_loop() {
-        assert!(matches!(decide(None, CONTINUATION_CAP, true), Next::Done));
-        assert!(matches!(decide(None, 1, false), Next::Done));
+        assert!(matches!(decide(None, CONTINUATION_CAP, true), Next::Done(Stop::ContinuationCap)));
+        assert!(matches!(decide(None, 1, false), Next::Done(Stop::NoProgress)));
     }
 }

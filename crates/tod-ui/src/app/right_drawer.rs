@@ -45,6 +45,7 @@ const ALL_KINDS: [DrawerKind; 6] = [
 
 /// A change to the drawer, queued from event handlers (which have no
 /// `Window`) and applied in order on the shell's next render.
+#[derive(Debug)]
 pub(crate) enum DrawerRequest {
     OpenTaskEdit {
         task_id: String,

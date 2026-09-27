@@ -69,6 +69,7 @@ reverse.**
 - `crates/tod-core` — policy and orchestration shared by the UI and the CLI: conversation and interview flow, process/phase rules, bundled process- and media-doc resolution, path/settings resolution, the task model, and agent context assembly. Decides *when* and *what* to persist.
 - `crates/tod-agent` — agent transport: the provider interface and its implementations across platforms (Cursor, Claude, mock) and environments. **A leaf crate with no `tod-*` dependencies by design** — it knows how to hold conversations and sessions, and nothing about paths, settings, process docs, or persistence. It is told what to say and reports back.
 - `crates/tod-store` — durable persistence. SQLite-backed (`rusqlite`) storage for **fleet** (agents/tasks/worktrees) and **outline** (task tree) data, plus credentials (OS keyring + `chacha20poly1305` encryption), settings, paths, and Linear API integration. Depends on `tod-agent` for the agent types it persists (`AgentPlatform`, `AgentLaunchOptions`).
+- Cloud sandboxes (Blaxel; [doc/cloud-sandboxes/setup.md](../doc/cloud-sandboxes/setup.md), design in `blaxel-remote.md`): `crates/tod-sandbox` (leaf lib: Blaxel API, relay client, provisioning, `sandboxes.toml`), `crates/tod-sandbox-cli` (the `tod-sandbox` binary), `crates/tod-zed-shim` (the `ssh`/`scp`/`sftp` Zed runs, routing `<name>.tod` hosts to sandboxes), `crates/tod-relay` (the Linux server inside each sandbox, cross-built for `x86_64-unknown-linux-musl`; protocol in `relay-protocol.md`), and `assets/sandbox/bootstrap.sh` (installs dependencies on any image).
 - `crates/nov-viz` — a separate visualization crate (layout/nav/keyboard model), not part of the main app binary path.
 - `assets/process/` — version-controlled source for agent behavior docs (SKILL files, agent definitions, manifest). Copied by `build.rs` to `target/{debug,release}/process/` so dev runs mirror an installed layout.
 - `crates/tod/media/context/` — version-controlled agent context documents (see **Agent chat context** below). Copied by `build.rs` to `target/{debug,release}/media/`.
@@ -143,6 +144,16 @@ the agent never describes what it changed — the user sees the change set — s
 an empty reply is normal (shown as "Done, no notes"); `surface/conversation.md`
 states this, and that the agent acts without confirming because everything is
 reversible.
+
+The terminal icon left of Send (`ui::terminal_handoff`, in the conversation
+view and the workbench chat drawer) continues the conversation in the agent's
+own CLI (`claude --resume <id> --permission-mode auto`, as the app runs
+Claude, or `cursor-agent --resume <id>`), in a terminal
+opened where the agent ran: this machine, the node's dev container, or its
+cloud sandbox (`tod_core::conversation::handoff`,
+`tod_store::fleet::open_terminal_command`). The terminal gets the
+conversation's actor, so its outline writes stay in the change set; the app
+closes its own session first and resumes it by id on the next Send.
 
 Implement, Verify, Review, and the action panel's Chat now run in the conversation view (see
 **Protocols** below). The one chat left on the old path is the visual-design
@@ -306,6 +317,17 @@ its change set with `tod-cli changeset`. Drafting, which this replaced, is gone
 (schema v37); the legacy `Role::Drafter` / `SessionPurpose::Drafter` variants
 stay only for the interview.
 
+Starting and collecting a turn run git, Docker, and `tod-cli` (a protocol's
+`prepare`, `progress`, and `finish`, the container environment, the build
+stamp), so the view never calls `send` or `tick` on the main thread: the
+driver goes to the background executor and `tod_ui::conversation::driver_slot`
+holds what the view shows meanwhile ("Starting the agent…"; Stop is applied
+when it is back). The driver takes the shared agent through `AgentAccess`,
+which `SharedAgentAccess` locks for one provider call at a time, so the UI's
+own locks never wait on that work. The same holds for the incoming-changes
+check (`views::incoming_check` ticks its `IncomingRunner` there) and for
+settling a gate check's derived criteria, which may call GitHub.
+
 ### `tod-store::fleet` — agent/worktree orchestration
 
 Tracks agents running against git worktrees: provisioning (`provision.rs`), launching (`launch.rs`, `runtime.rs`), reattaching to running processes (`reattach.rs`), terminal sessions (`terminal/`), prompt queuing (`prompt_queue.rs`), and an undo log (`undo.rs`). `store.rs` / `writer.rs` / `schema.rs` / `migration.rs` are the SQLite persistence core; `projection.rs` derives read-side views for the UI.
@@ -347,7 +369,10 @@ Nothing starts or builds a container; tod only uses a running one.
   30s). A container directory is never checked from the UI thread. Git in a
   container runs with `-c safe.directory=*` (`workdir::CONTAINER_GIT_CONFIG`):
   Docker Desktop bind mounts can briefly report a new directory as root's,
-  and git would refuse it as "dubious ownership".
+  and git would refuse it as "dubious ownership". Treehouse in a container
+  is started through `workdir::CONTAINER_GIT_CONFIG_ENV`, which adds the same
+  setting to git's `GIT_CONFIG_COUNT` environment config (after any the
+  container sets), since it runs git itself.
 
 - `tod_agent::devcontainer` is the transport: `docker ps`/`inspect`, mount
   mapping, `prepare` (check the container is running, resolve directory, user
@@ -368,30 +393,59 @@ Nothing starts or builds a container; tod only uses a running one.
   checks a per-process token and runs the real `tod-cli` with the app's own
   data root. This needs Docker Desktop (native Linux Docker does not forward
   `host.docker.internal` to the host's loopback).
-- Code opens in the editor over SSH (`fleet::code_editor::ssh`): `ssh` runs
-  `sshd -i` in the container through `docker exec` as its `ProxyCommand`
-  (no port). `devcontainer::prepare_sshd` readies the container (host keys,
-  `/run/sshd`, tod's key in the user's `authorized_keys`, and `127.0.0.1
-  UNKNOWN` in `/etc/hosts`, without which every PAM login waits on Docker's
-  DNS); it does not install sshd. tod keeps its key, a `Host tod-<container>`
-  per container, and each container's own host key under `<data root>/ssh/`,
-  which on Windows must be readable by the user alone or `ssh` refuses the
-  config. Editors run the user's `ssh`, so `~/.ssh/config` needs one
-  `Include` of tod's config, added only after the user agrees
-  (`SshIncludeNeeded`; `TOD_SSH_CONFIG` points it elsewhere for tests). On
-  Windows that `ssh` may be Git's MSYS build: the `Include` names the file
-  both as `C:/…` and `/c/…`, and the `ProxyCommand` says `//usr/sbin/sshd`
-  so MSYS does not rewrite it. Zed gets the directory, then the file once
-  its connection is up.
 - Shells and terminal agents open a host terminal whose startup command is
   `docker exec -it [-u user] <id> sh /tmp/tod-cli-relay/launch-<id>.sh`; the
   script sets the directory, `PATH`, and relay env, so the token never goes on
   a command line.
+- Code editors: a repository in the container opens only in Zed, as
+  `ssh://<remoteUser>@<container>.docker.tod/<dir>`
+  (`code_editor::zed::open_in_container`; a file opens in a second call,
+  since Zed takes one `ssh://` URL per call). `tod-zed-shim` routes
+  `.docker.tod` hosts (before sandboxes' `.tod`) to the real `ssh` with a
+  ProxyCommand of `docker exec -i -u root <c> /usr/sbin/sshd -i` and tod's own
+  key (`<data root>/zed-shim/docker_ed25519`). Beforehand,
+  `devcontainer::prepare_sshd` (off the UI thread) runs `ssh-keygen -A`,
+  makes `/run/sshd`, maps `UNKNOWN` to 127.0.0.1 in `/etc/hosts` (PAM's
+  ~13s DNS wait), and authorizes the key; it installs nothing, and a
+  container without `sshd` gets an error saying to install it. A mounted
+  repository opens on this machine. On Windows the real `ssh` may be Git's
+  MSYS build, which rewrites an absolute path in a ProxyCommand, so the shim
+  says `//usr/sbin/sshd` there. The folder's `zed` call returns before Zed
+  has connected, and a file sent sooner opens as a project of its own, so
+  `open_in_container` waits for a new `zed-remote-server … proxy` in the
+  container before sending the file.
+- Code references (`path:line[:col]`) in selectable text and markdown are
+  links (`ui::code_links`): a click dispatches `OpenCodeRef`, which the
+  conversation view, the unified view (the chat drawer's focus), or the
+  shell resolves against that node's Files directory and opens through
+  `code_editor::open_code_location`, off the UI thread. Host, container,
+  and sandbox directories all work.
 - Tests that need a real container are skipped unless `TOD_TEST_DEV_CONTAINER`
   (a running container with git; some also need
   `TOD_TEST_DEV_CONTAINER_HOST_DIR` or `TOD_TEST_TOD_CLI`) is set; the
   Treehouse one needs `TOD_TEST_DEV_CONTAINER_TREEHOUSE` (a container with
   `treehouse` on its `PATH`).
+- **Cloud sandboxes** are the third place ("Runs in → Cloud sandbox";
+  `node_files.container_kind = 'sandbox'`, with the sandbox's name in
+  `container`; `tod-cli capabilities set <node> files --sandbox <name>`). The
+  repository always lives in the sandbox. The Files section lists the
+  workspace's sandboxes (`fleet::sandbox::list`) and makes new ones from an
+  image or as a fork (`Sandboxes::create` with `NewSandboxSource`, off the UI
+  thread); the workspace and default image are in Settings → Cloud sandboxes
+  (`account_settings` / `set_account_settings`, kept in `sandboxes.toml`,
+  not the settings file). `Workdir::Sandbox`
+  runs git through `tod-sandbox exec`, and `AgentEnvironment::Sandbox`
+  (`tod_agent::sandbox::SandboxLaunch`, built by
+  `dev_container::sandbox_launch_for`) spawns the agent as `tod-sandbox agent
+  … -- <adapter>`, whose stdio bridges to the relay. `tod-cli` there comes
+  back through the relay's `/tunnel` to the same `cli_relay` listener, and a
+  bridge keeps a Zed on that sandbox attached for the turn. Check
+  `DevContainerSetting::repo_is_remote` (container or sandbox) or `mounted_container`,
+  not `dev_container`, for "git runs elsewhere". Terminals run `tod-sandbox
+  shell`, and code editors open only Zed (`zed::sandbox_url`). The smoke test
+  `fleet::sandbox` needs `TOD_TEST_SANDBOX` (a sandbox created with
+  `--agents`) and `TOD_TEST_SANDBOX_ROOT` (an absolute data root with
+  `sandboxes.toml`). Docs: `doc/cloud-sandboxes/`.
 
 ### `tod-store::outline` — task tree
 
@@ -435,3 +489,29 @@ Drawer panels in the Tasks view do not move focus themselves — they emit a `Fo
 ### Feature flags
 
 `agent-socket` (default-on) compiles the TCP UI-automation control socket into dev/CI builds; release builds should use `--no-default-features` so that code isn't present in the shipped binary at all (not just disabled at runtime).
+
+### Journeys
+
+`crates/tod-journey` defines the append-only record format (`Record`/`Actor`/`Event`) that captures what a user, the app, and agents did, for later analysis and for filing problem reports. Recording happens through `tod_core::journey::record`, which is a no-op when the app is not installed with a journey sink configured — call sites never need to branch on whether journeys are on. Every new user-facing lifecycle action (a button in the conversation view or lifecycle panel) must record a `UserAction` with a `Presented` snapshot of the buttons that were on screen and which was primary, following the pattern in `crates/tod-ui/src/conversation/lifecycle.rs` and `crates/tod-ui/src/views/lifecycle_panel.rs` — this is what lets later analysis tell whether the highlighted action was the one actually clicked. Any new node-scoped table needs a `journey_changes` trigger (`crates/tod-store/src/journey_changes.rs`'s pattern) so its writes surface as `DataChanged` rows in the journey; a table intentionally left out needs a documented reason at its definition site. `crates/tod-journeys` is the standalone receiver binary (`init`/`pull`/`show`/`stats`) that decrypts and analyzes bundles sent from `tod`; see `doc/journeys/spec.md` for the full format and protocol.
+
+### Unified view
+
+`crates/tod-ui/src/unified/` is the multi-column workbench for supervising
+many nodes at once: `mod.rs` (`UnifiedView`, `ColumnModel`, column
+placement), `panels/` (`DetailsPanel`, `TaskPanel`, `ObligationsPanel`,
+`PlanPanel`, `FindingsPanel`, `SettingsPanel`, `TranscriptPanel`), and
+`chat_drawer.rs`. Column 1 is always the node tree; a panel opens in the
+first unpinned column from the one it was opened from, or a new column is
+appended, and the same panel already shown is focused instead —
+`ColumnModel::open` is the one place that rule lives; a column the user
+pinned is never unpinned or replaced by it. A task node's default panel is
+the task panel (`doc/ui/task-panel.md`), where its requests are answered.
+**Alt+Q** / **Alt+Shift+Q** jump the tree selection to the next/previous
+node waiting on the user, longest-waiting first (wrapping), and show it in
+its task panel by that rule, with keyboard focus there so the number keys
+answer its top request (`UnifiedView::advance_waiting`). What each node is waiting on comes from
+`tod_core::attention` (`for_node` / `for_nodes`), recomputed off the UI
+thread on every store change by `unified/attention_feed.rs` and pushed into
+the tree with `TaskListView::set_attention`. See `doc/ui/unified-view.md` for
+the full design (layout, pinning, panels, keys) and
+`doc/ui/unified-view-plan.md` for the work-item breakdown.

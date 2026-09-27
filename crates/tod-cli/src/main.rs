@@ -10,6 +10,7 @@
 
 mod args;
 mod capabilities;
+mod decisions;
 mod help;
 mod changeset;
 mod doc_sync;
@@ -25,6 +26,7 @@ mod secrets;
 mod test_runs;
 mod verdicts;
 mod visual_design;
+mod wait;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -59,6 +61,8 @@ NOUNS:
     incoming               Changes a node inherits, and the verdict that resolves them
     learn                  A node's retrospective, stored once per pass
     secrets                Run a command with stored secrets, without seeing them
+    decisions              What the user answers: ask, list, show
+    wait                   What a node waits on between sessions: a time, an event, a check
 
 Run `tod-cli <NOUN> --help` for that noun's commands, or
 `tod-cli help <WORDS>` to find the commands that mention them
@@ -84,6 +88,8 @@ const NOUNS: &[(&str, &str)] = &[
     ("incoming", crate::incoming::USAGE),
     ("learn", crate::learn::USAGE),
     ("secrets", crate::secrets::USAGE),
+    ("decisions", crate::decisions::USAGE),
+    ("wait", crate::wait::USAGE),
 ];
 
 fn main() -> ExitCode {
@@ -203,8 +209,10 @@ fn run(args: &[String]) -> anyhow::Result<String> {
         "incoming" => incoming::run(invocation),
         "learn" => learn::run(invocation),
         "secrets" => secrets::run(invocation),
+        "decisions" => decisions::run(invocation),
+        "wait" => wait::run(invocation),
         other => anyhow::bail!(
-            "unknown noun `{other}` (expected: node, obligations, content, plan, questions, memory, interview, visual-design, capabilities, changeset, tests, review, pr, verdicts, incoming, learn, secrets)"
+            "unknown noun `{other}` (expected: node, obligations, content, plan, questions, memory, interview, visual-design, capabilities, changeset, tests, review, pr, verdicts, incoming, learn, secrets, decisions, wait)"
         ),
     }
 }
@@ -788,6 +796,126 @@ Second."), "{listed}");
             .unwrap(),
             "ok"
         );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A node without the Agent capability still lists the Files, Tags, and
+    /// Ticket settings it was given, and a later `set` keeps the ones it
+    /// does not name.
+    #[test]
+    fn capabilities_set_then_list_without_the_agent_capability() {
+        let (root, node, _) = data_root();
+        let node = node.to_string();
+        cli(&root, &["capabilities", "enable", &node, "files", "tags", "ticket"]).unwrap();
+        let dir = root.join("repo").display().to_string();
+        cli(&root, &["capabilities", "set", &node, "files", "--dir", &dir, "--branch", "feat"])
+            .unwrap();
+        cli(&root, &["capabilities", "set", &node, "tags", "--add", "ui"]).unwrap();
+        cli(&root, &["capabilities", "set", &node, "ticket", "--ticket", "ABC-1"]).unwrap();
+        // Changing only the worktree setting leaves the directory and branch alone.
+        cli(&root, &["capabilities", "set", &node, "files", "--worktree", "on"]).unwrap();
+
+        let listed = cli(&root, &["capabilities", "list", &node]).unwrap();
+        assert!(
+            listed.contains(&format!("files: dir {dir}, branch feat, worktree on,")),
+            "{listed}"
+        );
+        assert!(listed.contains("tags: ui"), "{listed}");
+        assert!(listed.contains("ticket: tickets ABC-1;"), "{listed}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn wait_round_trip_add_list_and_close() {
+        let (root, node, _) = data_root();
+        let node = node.to_string();
+        assert_eq!(cli(&root, &["wait", "list", "--node", &node]).unwrap(), "(no pending waits)");
+        let err = cli(&root, &["wait", "--node", &node, "--until", "2h", "--check", "true"]).unwrap_err();
+        assert!(err.to_string().contains("exactly one"), "{err}");
+
+        let a = cli(&root, &["wait", "--node", &node, "--until", "2h"]).unwrap();
+        let a = a.strip_prefix("ok ").unwrap().to_string();
+        cli(&root, &["wait", "add", "--node", &node, "--event", "github:pr 12 checks"]).unwrap();
+        cli(&root, &["wait", "add", "--node", &node, "--check", "test -f x", "--every", "5m"]).unwrap();
+        let listed = cli(&root, &["wait", "list", "--node", &node]).unwrap();
+        assert_eq!(listed.lines().count(), 3, "{listed}");
+        assert!(listed.contains("check `test -f x` every 300s"), "{listed}");
+
+        assert_eq!(cli(&root, &["wait", "satisfy", &a]).unwrap(), "ok");
+        assert_eq!(cli(&root, &["wait", "list", "--node", &node]).unwrap().lines().count(), 2);
+        assert!(cli(&root, &["wait", "show", &a]).unwrap().contains("satisfied"));
+        assert!(cli(&root, &["wait", "reschedule", &a, "--at", "1h"]).is_err());
+        assert_eq!(cli(&root, &["wait", "list", "--node", &node, "--all"]).unwrap().lines().count(), 3);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn decisions_round_trip_ask_list_and_show() {
+        let (root, node, _) = data_root();
+        let node = node.to_string();
+
+        assert_eq!(
+            cli(&root, &["decisions", "list", "--node", &node]).unwrap(),
+            "(no pending decisions)"
+        );
+
+        let err = cli(&root, &["decisions", "ask", "--node", &node, "Round how?"]).unwrap_err();
+        assert!(err.to_string().contains("--option"), "{err}");
+
+        let asked = cli(
+            &root,
+            &[
+                "decisions", "ask", "--node", &node, "Round per line or per invoice?",
+                "--option", "per line", "--option", "per invoice",
+                "--evidence", &format!("node:{node}"),
+            ],
+        )
+        .unwrap();
+        let short = asked.strip_prefix("ok ").expect("one-line ack").to_string();
+        assert_eq!(short.len(), 8);
+
+        let listed = cli(&root, &["decisions", "list", "--node", &node]).unwrap();
+        assert!(listed.contains("pending Round per line or per invoice?"), "{listed}");
+        assert!(listed.contains("1. per line | 2. per invoice"), "{listed}");
+
+        let shown = cli(&root, &["decisions", "show", &short]).unwrap();
+        assert!(shown.contains("(no answers yet)"), "{shown}");
+
+        // Bad evidence kind is refused before anything is recorded.
+        let err = cli(
+            &root,
+            &[
+                "decisions", "ask", "--node", &node, "Bad evidence?",
+                "--option", "a", "--evidence", "spaceship:not-a-real-id",
+            ],
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("evidence kind"), "{err}");
+
+        // No --reason defaults to `other`; an unknown one is refused.
+        assert!(shown.contains(" · other"), "{shown}");
+        let err = cli(
+            &root,
+            &[
+                "decisions", "ask", "--node", &node, "Bad reason?",
+                "--option", "a", "--reason", "spaceship",
+            ],
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("--reason"), "{err}");
+
+        let with_reason = cli(
+            &root,
+            &[
+                "decisions", "ask", "--node", &node, "Missing a permission?",
+                "--option", "a", "--reason", "access",
+            ],
+        )
+        .unwrap();
+        let short = with_reason.strip_prefix("ok ").expect("one-line ack");
+        let shown = cli(&root, &["decisions", "show", short]).unwrap();
+        assert!(shown.contains(" · access"), "{shown}");
+
         let _ = std::fs::remove_dir_all(root);
     }
 }

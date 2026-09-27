@@ -42,6 +42,9 @@ pub mod color {
     pub fn highlight_edge() -> Hsla {
         hex(0x1d4ed8ff)
     }
+    pub fn highlight_faint() -> Hsla {
+        hex(0x1d4ed840)
+    }
     // Pane styles: no pane uses them yet (gpui-component draws its own
     // resizable handles).
     #[allow(dead_code)]
@@ -84,8 +87,26 @@ pub mod color {
     pub fn incoming_text() -> Hsla {
         hex(0xfacc15ff)
     }
+    pub fn linked_copy_text() -> Hsla {
+        hex(0xf59e0bff)
+    }
+    pub fn linked_source_text() -> Hsla {
+        hex(0xa06707ff)
+    }
+    pub fn callout_warning_fill() -> Hsla {
+        hex(0x7f1d1d33)
+    }
+    pub fn callout_warning_edge() -> Hsla {
+        hex(0xef4444ff)
+    }
+    pub fn callout_warning_text() -> Hsla {
+        hex(0xfca5a5ff)
+    }
     pub fn divider_strong() -> Hsla {
         hex(0xa3a3a380)
+    }
+    pub fn header_fill() -> Hsla {
+        hex(0xffffff20)
     }
     pub fn group_band() -> Hsla {
         hex(0x26262680)
@@ -168,6 +189,7 @@ pub mod size {
     use super::*;
 
     pub const BORDER: Pixels = px(1.);
+    pub const CONTROL: Pixels = px(32.);
     pub const PANE_MIN: Pixels = px(320.);
     pub const CONTROL_XSMALL: Pixels = px(20.);
     pub const GROUP_ROW: Pixels = px(28.);
@@ -382,6 +404,30 @@ pub fn callout_stale_title<E: Styled>(el: E) -> E {
         .text_color(color::stale_text())
 }
 
+/// `styles.callout-warning`: a stronger, red warning callout — distinct from
+/// `callout_stale`'s orange "this state may no longer hold" meaning. Used for
+/// the journeys-leave-this-computer warnings (spec §9.1).
+pub fn callout_warning<E: Styled>(el: E) -> E {
+    el.flex()
+        .flex_col()
+        .gap(space::RELATED)
+        .px(space::INSET)
+        .py(space::RELATED)
+        .rounded(radius::CONTROL)
+        .border(size::BORDER)
+        .border_color(color::callout_warning_edge())
+        .bg(color::callout_warning_fill())
+        .text_size(font::DENSE)
+        .text_color(color::callout_warning_text())
+}
+
+/// `styles.callout-warning-title`.
+pub fn callout_warning_title<E: Styled>(el: E) -> E {
+    el.text_size(font::BODY)
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(color::callout_warning_text())
+}
+
 /// `styles.node-title-pending-changes`: a tree row title whose node has
 /// incoming changes it has not been checked against.
 pub fn node_title_pending_changes<E: Styled>(el: E) -> E {
@@ -421,13 +467,58 @@ pub fn pane_divider<E: Styled>(el: E, dragging: bool) -> E {
     }
 }
 
+/// `styles.header`: the faint gray band behind every header.
+pub fn header<E: Styled>(el: E) -> E {
+    el.bg(color::header_fill())
+}
+
+/// `styles.header` for a header that tracks focus: in the `column-focused`
+/// state while `focused`, else the gray band.
+pub fn header_focusable<E: Styled + ParentElement>(el: E, focused: bool) -> E {
+    if focused {
+        column_focused(el)
+    } else {
+        header(el)
+    }
+}
+
 /// `styles.panel-header`.
 pub fn panel_header<E: Styled>(el: E) -> E {
-    el.px(space::INSET)
+    header(el)
+        .px(space::INSET)
         .py(space::RELATED)
         .gap(space::RELATED)
         .border_b(size::BORDER)
         .border_color(color::divider())
+}
+
+/// `styles.column-header`, in its `column-focused` state while `focused`.
+pub fn column_header<E: Styled + ParentElement>(el: E, focused: bool) -> E {
+    let el = el
+        .flex()
+        .items_center()
+        .flex_shrink_0()
+        .h(size::CONTROL)
+        .px(space::RELATED)
+        .gap(space::INLINE)
+        .border_b(size::BORDER)
+        .border_color(color::divider());
+    header_focusable(el, focused)
+}
+
+/// `states.column-focused`: the header of the column that has focus — a
+/// faint highlight behind it and a highlight-edge line along its top, drawn
+/// as an overlay so the header does not shift when focus arrives.
+pub fn column_focused<E: Styled + ParentElement>(el: E) -> E {
+    el.relative().bg(color::highlight_faint()).child(
+        div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .right_0()
+            .h(size::BORDER)
+            .bg(color::highlight_edge()),
+    )
 }
 
 /// `styles.panel-footer`.

@@ -1,4 +1,5 @@
 mod compose;
+mod context_menu;
 mod credential_prompt;
 use credential_prompt::PendingCredentialRequest;
 mod delegate;
@@ -18,9 +19,13 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 
+use chrono::{DateTime, Utc};
+
 use crate::interview::TodPaths;
+use crate::ui::journey::Source;
 use crate::ui::actionable::{chrome_control_with_shortcut, render_shortcut_pill};
 use crate::ui::agent_chat::{OpenAgentChat, OpenConversation};
+use crate::ui::report_problem::{OpenReportDialog, ReportProblem};
 use crate::ui::app_nav::{AppDestination, AppNavMenu, HasAppNav, on_app_nav_toggle};
 use crate::ui::key_context;
 use crate::ui::list::{
@@ -63,6 +68,7 @@ actions!(
         TaskListRowLifecycle,
         TaskListRowEdit,
         TaskListOpenEditPanel,
+        TaskListOpenEditPanelCtrl,
         TaskListOpenObligations,
         TaskListOpenPlan,
         TaskListTag1,
@@ -127,6 +133,11 @@ pub fn register_task_list_keyboard_bindings(cx: &mut App) {
         KeyBinding::new("o", TaskListOpenObligations, context),
         KeyBinding::new("p", TaskListOpenPlan, context),
         KeyBinding::new("e", TaskListOpenEditPanel, context),
+        // Unified view only: Ctrl+E opens the item's panel as a Ctrl+click
+        // would, beside the current column rather than replacing it
+        // (`doc/ui/unified-view.md` "Keys"). The plain Tasks view has no
+        // columns, so it treats this the same as `e`.
+        KeyBinding::new("ctrl-e", TaskListOpenEditPanelCtrl, context),
         KeyBinding::new("f2", TaskListRowEdit, context),
         KeyBinding::new("1", TaskListTag1, context),
         KeyBinding::new("2", TaskListTag2, context),
@@ -189,6 +200,15 @@ pub fn register_task_list_keyboard_bindings(cx: &mut App) {
     key_context::bind_panel_escape(cx, TaskListDismissOverlay, TASK_LIST_CONTEXT);
 }
 
+/// What a node is waiting on the user for, as the host (W6's attention
+/// module, once it exists) reports it: how many pending decisions, and
+/// since when the oldest of them has been waiting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Attention {
+    pub count: usize,
+    pub waiting_since: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone)]
 pub enum TaskListEvent {
     /// Ctrl+Right — move keyboard focus to the right drawer, if one is open.
@@ -248,6 +268,25 @@ pub enum TaskListEvent {
         task_id: String,
         editor_id: String,
     },
+    /// Right-click menu's "Open requests (n)", or the attention badge on a
+    /// row. The host decides what "open" means (the unified view's
+    /// task panel); the existing Tasks view may ignore it.
+    OpenTaskPanel {
+        task_id: String,
+    },
+    /// Right-click menu's "Settings" entry: the unified view's settings
+    /// panel (`PanelKind::Settings`, `TaskEditView` hosted). The existing
+    /// Tasks view treats this the same as `OpenTaskEdit`, since its own
+    /// edit drawer already hosts `TaskEditView`.
+    OpenSettings {
+        task_id: String,
+    },
+    /// Ctrl+E on a tree row: open its Details panel as a Ctrl+click would
+    /// (`doc/ui/unified-view.md` "Keys"). The existing Tasks view treats
+    /// this the same as `OpenTaskEdit`, since it has no columns.
+    OpenTaskEditCtrl {
+        task_id: String,
+    },
 }
 
 pub struct TaskListView {
@@ -258,6 +297,9 @@ pub struct TaskListView {
     list_view: ListView<TaskListDelegate>,
     search_input: Entity<InputState>,
     focus_handle: FocusHandle,
+    /// Hosted as a column of a multi-column view (the workbench): the
+    /// header takes the `column-focused` state while the tree has focus.
+    marks_focused_column: bool,
     last_selected: Option<IndexPath>,
     pending_revert: Option<IndexPath>,
     action_sink: Rc<RefCell<Vec<RowAction>>>,
@@ -323,6 +365,17 @@ pub struct TaskListView {
     /// The shared incoming-changes check (`bind_incoming_check`).
     incoming_check: Option<Entity<IncomingCheck>>,
     _incoming_check_subscription: Option<Subscription>,
+    /// Fed by the host through `set_attention` — what each node is waiting
+    /// on the user for, and since when. Not persisted; re-supplied on every
+    /// host-side change.
+    attention: std::collections::HashMap<String, Attention>,
+    /// `set_attention` changed `all_tasks` and needs a rebuild; applied on
+    /// the next render, which is when a `Window` is available (mirrors
+    /// `pending_live_refresh`).
+    pending_attention_apply: bool,
+    /// `set_status_overrides` changed `all_tasks` and needs a rebuild;
+    /// applied the same way `pending_attention_apply` is.
+    pending_status_override_apply: bool,
 }
 
 impl TaskListView {
@@ -408,12 +461,15 @@ impl TaskListView {
             }
             ListEvent::Confirm(ix) => {
                 this.close_sort_menu(cx);
-                this.clamp_selection(*ix, cx);
+                // A click lands where it was aimed: only arrow keys wrap, so
+                // only `Select` is checked for a wrap (a click from the first
+                // row to the last used to be undone as one).
+                this.last_selected = Some(*ix);
                 if this.pending_revert.is_none() {
                     this.sync_selected_id(cx);
                 }
                 // A click confirms via the nested list widget and leaves it focused;
-                // reclaim focus for the task-list surface so Enter still creates a node
+                // reclaim focus for the task-list surface so Enter still edits the node
                 // instead of being swallowed as another list Confirm.
                 this.pending_refocus_list = true;
                 cx.notify();
@@ -429,6 +485,7 @@ impl TaskListView {
             list_view,
             search_input,
             focus_handle,
+            marks_focused_column: false,
             last_selected: initial_selection.0,
             pending_revert: None,
             action_sink,
@@ -477,6 +534,9 @@ impl TaskListView {
             marked: std::collections::HashSet::new(),
             incoming_check: None,
             _incoming_check_subscription: None,
+            attention: std::collections::HashMap::new(),
+            pending_attention_apply: false,
+            pending_status_override_apply: false,
         };
 
         cx.defer_in(window, move |this, window, cx| {
@@ -735,6 +795,30 @@ impl TaskListView {
             RowAction::ToggleGeneratorFilter { task_id } => {
                 self.toggle_generator_filter(&task_id, window, cx);
             }
+            RowAction::OpenContextMenu { task_id } => {
+                self.open_context_menu(&task_id, window, cx);
+            }
+            RowAction::OpenTaskPanel { task_id } => {
+                self.select_task_by_id(&task_id, window, cx);
+                cx.emit(TaskListEvent::OpenTaskPanel {
+                    task_id: task_id.clone(),
+                });
+                let presented = tod_journey::Presented {
+                    actions: Vec::new(),
+                    focused: Some("Open requests".to_string()),
+                    notices: Vec::new(),
+                };
+                if let Ok(node_id) = uuid::Uuid::parse_str(&task_id) {
+                    crate::ui::journey::record_action(
+                        cx,
+                        tod_store::conversation::Focus::Node(node_id),
+                        "Open requests",
+                        Source::Click,
+                        "task_list_attention_badge",
+                        presented,
+                    );
+                }
+            }
             RowAction::AcceptTicket { task_id } => {
                 let ready = self
                     .all_tasks
@@ -742,7 +826,7 @@ impl TaskListView {
                     .find(|t| t.id == task_id)
                     .is_some_and(|t| t.accept_ready);
                 if ready {
-                    self.accept_ticket(&task_id, window, cx);
+                    self.accept_ticket(&task_id, Source::Click, window, cx);
                 }
             }
         }
@@ -1337,13 +1421,14 @@ impl TaskListView {
             }
             let repo = task_row.repo.as_deref().unwrap_or("");
             let branch = task_row.branch.as_deref().unwrap_or("");
-            // A repository inside a dev container can't be checked from here.
+            // A repository inside a dev container or sandbox can't be checked
+            // from here.
             let in_container = self
                 .fleet
                 .resolve_files_for_node(task_id)
                 .ok()
                 .flatten()
-                .is_some_and(|files| files.repo_container().is_some());
+                .is_some_and(|files| files.repo_is_remote());
             if !in_container
                 && let Err(err) =
                     validate_interview_workspace(PathBuf::from(repo).as_path(), branch)
@@ -1462,6 +1547,25 @@ impl TaskListView {
         cx.notify();
     }
 
+    /// Right-click menu's "Settings" entry.
+    pub fn open_settings_panel(
+        &mut self,
+        task_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(task) = self.all_tasks.iter().find(|t| t.id == task_id).cloned() else {
+            return;
+        };
+        self.close_chrome_overlays(cx);
+        cx.emit(TaskListEvent::OpenSettings {
+            task_id: task_id.to_string(),
+        });
+        self.set_status_line(format!("Settings: {}", task.title), cx);
+        self.bump_interaction(task_id, window, cx);
+        cx.notify();
+    }
+
     pub fn open_plan_panel(&mut self, task_id: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Some(task) = self.all_tasks.iter().find(|t| t.id == task_id).cloned() else {
             return;
@@ -1495,6 +1599,14 @@ impl TaskListView {
     }
 
     /// The selected node, when a saved (not draft) row is selected.
+    /// [`Self::selected_node_id`] with the node's title.
+    pub fn selected_node_with_title(&self) -> Option<(uuid::Uuid, String)> {
+        let id = self.selected_node_id()?;
+        let key = id.to_string();
+        let title = self.all_tasks.iter().find(|t| t.id == key)?.title.clone();
+        Some((id, title))
+    }
+
     pub fn selected_node_id(&self) -> Option<uuid::Uuid> {
         let id = self.working_set.selected_id.as_deref()?;
         if self.is_draft_id(id) {
@@ -1518,6 +1630,21 @@ impl TaskListView {
             });
         cx.stop_propagation();
         window.dispatch_action(Box::new(OpenConversation::outline(focus)), cx);
+    }
+
+    /// Ctrl+Shift+R: report a problem against the selected node, or the
+    /// whole project when nothing is selected.
+    fn on_report_problem(
+        &mut self,
+        _: &ReportProblem,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let key = self
+            .selected_node_id()
+            .map_or(tod_journey::JourneyKey::Project, tod_journey::JourneyKey::Node);
+        cx.stop_propagation();
+        window.dispatch_action(Box::new(OpenReportDialog { key, conversation: None }), cx);
     }
 
     fn selected_task(&self, cx: &Context<Self>) -> Option<TaskItem> {
@@ -1605,6 +1732,15 @@ impl TaskListView {
     }
 
     /// Load the active list's rows, with the draft row spliced in where it will be created.
+    ///
+    /// `load_tasks_from_store` reads fresh rows straight from the outline
+    /// store, which knows nothing about `set_attention`'s "needs you" data —
+    /// every freshly loaded row starts at zero. Re-apply the last attention
+    /// map we were given so a reload (a live-refresh triggered by any store
+    /// change, not just an attention change) never wipes the "needs you"
+    /// badge out from under a node that is still waiting: it would otherwise
+    /// flicker off here and only come back once the next attention poll
+    /// lands.
     fn reload_all_tasks(&mut self) {
         let mut tasks = load_tasks_from_store(&self.fleet, self.active_list_id);
         if let Some(draft) = &self.draft {
@@ -1612,7 +1748,25 @@ impl TaskListView {
                 edit::insert_draft_row(&mut tasks, draft);
             }
         }
+        Self::apply_attention_map(&mut tasks, &self.attention);
         self.all_tasks = tasks;
+    }
+
+    /// Stamp `needs_you_count` / `waiting_since` from `map` onto `tasks`,
+    /// leaving nodes absent from `map` at zero. The shared core of
+    /// `set_attention` and `reload_all_tasks`'s re-application of it.
+    fn apply_attention_map(
+        tasks: &mut [TaskItem],
+        map: &std::collections::HashMap<String, Attention>,
+    ) {
+        for task in tasks.iter_mut() {
+            let (count, waiting_since) = map
+                .get(&task.id)
+                .map(|a| (a.count, Some(a.waiting_since)))
+                .unwrap_or((0, None));
+            task.needs_you_count = count;
+            task.waiting_since = waiting_since;
+        }
     }
 
     /// Apply a reload that the change watcher read off the UI thread.
@@ -1639,15 +1793,17 @@ impl TaskListView {
             self.request_live_refresh(cx);
             return;
         }
-        if snapshot.tasks == self.all_tasks {
+        let mut tasks = snapshot.tasks;
+        Self::apply_attention_map(&mut tasks, &self.attention);
+        if tasks == self.all_tasks {
             return;
         }
-        let visible = Self::visible_tasks(&snapshot.tasks, &self.search_query, &self.working_set);
+        let visible = Self::visible_tasks(&tasks, &self.search_query, &self.working_set);
         if !same_visible_rows(self.list_state.read(cx).delegate().items(), &visible) {
             self.request_live_refresh(cx);
             return;
         }
-        self.all_tasks = snapshot.tasks;
+        self.all_tasks = tasks;
         self.list_state.update(cx, |state, cx| {
             state.delegate_mut().set_items(visible);
             cx.notify();
@@ -2487,6 +2643,40 @@ impl TaskListView {
         self.open_task_edit_panel(&task_id, window, cx);
     }
 
+    fn on_open_edit_panel_ctrl(
+        &mut self,
+        _: &TaskListOpenEditPanelCtrl,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(task_id) = self
+            .working_set
+            .selected_id
+            .clone()
+            .or_else(|| self.selected_task(cx).map(|t| t.id))
+        else {
+            return;
+        };
+        if self.is_draft_id(&task_id) {
+            return;
+        }
+        let Some(title) = self
+            .all_tasks
+            .iter()
+            .find(|t| t.id == task_id)
+            .map(|t| t.title.clone())
+        else {
+            return;
+        };
+        self.close_chrome_overlays(cx);
+        cx.emit(TaskListEvent::OpenTaskEditCtrl {
+            task_id: task_id.clone(),
+        });
+        self.set_status_line(format!("Edit: {title}"), cx);
+        self.bump_interaction(&task_id, window, cx);
+        cx.notify();
+    }
+
     fn on_open_obligations(
         &mut self,
         _: &TaskListOpenObligations,
@@ -2510,6 +2700,92 @@ impl TaskListView {
         self._incoming_check_subscription = Some(cx.observe(&check, |_, _, cx| cx.notify()));
         self.incoming_check = Some(check);
         cx.notify();
+    }
+
+    /// Host this view as a column; see `marks_focused_column`.
+    pub fn set_marks_focused_column(&mut self, marks: bool) {
+        self.marks_focused_column = marks;
+    }
+
+    /// The host (e.g. W6's attention feed) reports what each node is
+    /// waiting on the user for, keyed by node id. Nodes not present in
+    /// `map` are cleared back to zero. Rows with `count > 0` show a badge
+    /// (clicking it emits `OpenTaskPanel`), the right-click menu's "Open
+    /// decisions" entry uses the count, and the "Needs you" filter and the
+    /// "Waiting longest" sort both read it.
+    pub fn set_attention(
+        &mut self,
+        map: std::collections::HashMap<String, Attention>,
+        cx: &mut Context<Self>,
+    ) {
+        let mut changed = false;
+        for task in self.all_tasks.iter_mut() {
+            let (count, waiting_since) = map
+                .get(&task.id)
+                .map(|a| (a.count, Some(a.waiting_since)))
+                .unwrap_or((0, None));
+            if task.needs_you_count != count || task.waiting_since != waiting_since {
+                changed = true;
+            }
+        }
+        self.attention = map;
+        Self::apply_attention_map(&mut self.all_tasks, &self.attention);
+        if changed {
+            self.pending_attention_apply = true;
+        }
+        cx.notify();
+    }
+
+    /// The unified view (W11) reports each node's status label, keyed by
+    /// node id, computed once from `AgentRuns` whenever it notifies —
+    /// never read per row per frame, since building it touches
+    /// `AgentRuns::runs_for_node` (a `fleet.read`). Nodes not present in
+    /// `map` are cleared to `None`. The existing Tasks view never calls
+    /// this, so `status_override` stays `None` there and no chip renders.
+    pub fn set_status_overrides(
+        &mut self,
+        map: std::collections::HashMap<String, String>,
+        cx: &mut Context<Self>,
+    ) {
+        let mut changed = false;
+        for task in self.all_tasks.iter_mut() {
+            let next = map.get(&task.id).cloned();
+            if task.status_override != next {
+                task.status_override = next;
+                changed = true;
+            }
+        }
+        if changed {
+            self.pending_status_override_apply = true;
+        }
+        cx.notify();
+    }
+
+    /// Records toggling a "Needs you" / "Running" tree filter chip as a
+    /// journey `UserAction`, on the project (the toggle isn't about one node).
+    fn record_quick_filter_toggle(&self, chip: &str, on: bool, cx: &mut Context<Self>) {
+        let presented = tod_journey::Presented {
+            actions: vec![tod_journey::PresentedAction {
+                id: chip.to_string(),
+                label: chip.to_string(),
+                primary: false,
+                disabled: false,
+            }],
+            focused: Some(chip.to_string()),
+            notices: Vec::new(),
+        };
+        crate::ui::journey::record_action(
+            cx,
+            tod_store::conversation::Focus::Project,
+            if on {
+                format!("{chip}-on")
+            } else {
+                format!("{chip}-off")
+            },
+            Source::Click,
+            "task_list_quick_filters",
+            presented,
+        );
     }
 
     fn toggle_mark(&mut self, task_id: &str, cx: &mut Context<Self>) {
@@ -2549,7 +2825,7 @@ impl TaskListView {
             && task.external_id.is_some()
         {
             if task.accept_ready {
-                self.accept_ticket(&task_id, window, cx);
+                self.accept_ticket(&task_id, Source::Keyboard, window, cx);
             }
             return;
         }
@@ -2562,10 +2838,34 @@ impl TaskListView {
     /// still an accept-ready managed ticket — callers check `accept_ready`
     /// before calling this so the keystroke and chip are both silent
     /// no-ops otherwise, not an error toast.
-    fn accept_ticket(&mut self, task_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+    fn accept_ticket(
+        &mut self,
+        task_id: &str,
+        source: Source,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Ok(source_node_id) = uuid::Uuid::parse_str(task_id) else {
             return;
         };
+        // The ticket row offers exactly one action, so that is all that was presented.
+        crate::ui::journey::record_action(
+            cx,
+            tod_store::conversation::Focus::Node(source_node_id),
+            "accept-ticket",
+            source,
+            "task-list",
+            tod_journey::Presented {
+                actions: vec![tod_journey::PresentedAction {
+                    id: "accept-ticket".into(),
+                    label: "Accept".into(),
+                    primary: true,
+                    disabled: false,
+                }],
+                focused: Some("accept-ticket".into()),
+                notices: Vec::new(),
+            },
+        );
         let new_node_id = uuid::Uuid::new_v4();
         if let Err(err) = self.fleet.enqueue_outline(OutlineMutation::AcceptGeneratedTicket {
             source_node_id,
@@ -2636,7 +2936,104 @@ impl TaskListView {
         self.open_plan_panel(&task_id, window, cx);
     }
 
-    fn render_header(
+    fn render_header(&mut self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
+        use gpui::IntoElement as _;
+        if self.marks_focused_column {
+            self.render_column_header(window, cx).into_any_element()
+        } else {
+            self.render_toolbar(window, cx).into_any_element()
+        }
+    }
+
+    /// The header as a column of a multi-column view: the toolbar's controls
+    /// on one fixed-height `column-header` row, marked while the tree has
+    /// focus. Only the search field keeps its (inline) shortcut badge; the
+    /// others hang below their controls, which a fixed height has no room
+    /// for. What does not fit the column's width is clipped at the right.
+    fn render_column_header(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl gpui::IntoElement {
+        let focused = self.focus_handle.contains_focused(window, cx);
+        let sort_label = format!(
+            "Sort {} {}",
+            self.working_set.sort_key.label(),
+            self.working_set.sort_direction.arrow()
+        );
+        let mut search = Input::new(&self.search_input).cleanable(true).small().w_full();
+        if let Some(pill) =
+            render_shortcut_pill(window, &TaskListFocusSearch, TASK_LIST_CONTEXT, cx)
+        {
+            search = search.suffix(pill);
+        }
+        let list_count = self.outline_lists.len();
+
+        let mut row = crate::ui::style::column_header(div(), focused)
+            .overflow_hidden()
+            .child(self.render_app_nav_without_badge(window, cx))
+            .child(
+                Button::new("prev-list")
+                    .label("◀")
+                    .small()
+                    .disabled(list_count <= 1)
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.on_prev_list(&TaskListPrevList, window, cx);
+                    })),
+            )
+            .child(
+                crate::ui::style::text(div())
+                    .flex_shrink_0()
+                    .whitespace_nowrap()
+                    .child(self.active_list_title()),
+            )
+            .child(
+                Button::new("next-list")
+                    .label("▶")
+                    .small()
+                    .disabled(list_count <= 1)
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.on_next_list(&TaskListNextList, window, cx);
+                    })),
+            )
+            .child(
+                Button::new("new-list")
+                    .label("New list")
+                    .small()
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.on_new_list(&TaskListNewList, window, cx);
+                    })),
+            )
+            .child(
+                Button::new("new-task")
+                    .label("New item")
+                    .small()
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.on_create_below(&TaskListCreateBelow, window, cx);
+                    })),
+            )
+            .child(div().flex_1().min_w_0().child(search));
+        if let Some(tag) = &self.working_set.tag_filter {
+            row = row.child(
+                Button::new("active-tag-filter")
+                    .label(format!("Tag: {tag}"))
+                    .small()
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.on_clear_tag_filter(&TaskListClearTagFilter, window, cx);
+                    })),
+            );
+        }
+        row.child(
+            Button::new("sort-toggle")
+                .label(sort_label)
+                .small()
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.cycle_sort_and_show_menu(window, cx);
+                })),
+        )
+    }
+
+    fn render_toolbar(
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -2662,6 +3059,7 @@ impl TaskListView {
 
         let row = div()
             .h_flex()
+            .flex_wrap()
             .items_center()
             .gap_2()
             .px_3()
@@ -2717,7 +3115,7 @@ impl TaskListView {
                 TASK_LIST_CONTEXT,
                 cx,
             ))
-            .child(div().flex_1().min_w_0().child(search));
+            .child(div().flex_1().min_w(px(120.)).child(search));
 
         let mut row = row;
 
@@ -2775,7 +3173,24 @@ impl TaskListView {
             .iter()
             .filter(|t| t.incoming_count > 0)
             .count();
-        if pending_nodes == 0 && !self.working_set.pending_changes_only && self.marked.is_empty() {
+        let needs_you_nodes = self
+            .all_tasks
+            .iter()
+            .filter(|t| t.needs_you_count > 0)
+            .count();
+        let running_nodes = self
+            .all_tasks
+            .iter()
+            .filter(|t| t.live_run_count > 0)
+            .count();
+        if pending_nodes == 0
+            && needs_you_nodes == 0
+            && running_nodes == 0
+            && !self.working_set.pending_changes_only
+            && !self.working_set.needs_you_only
+            && !self.working_set.running_only
+            && self.marked.is_empty()
+        {
             return None;
         }
         let running = self
@@ -2808,6 +3223,7 @@ impl TaskListView {
         });
         Some(
             gpui_component::h_flex()
+                .flex_wrap()
                 .items_center()
                 .gap(crate::ui::style::space::HAIRLINE)
                 .px(crate::ui::style::space::RELATED)
@@ -2823,6 +3239,38 @@ impl TaskListView {
                             this.rebuild_visible_list(window, cx);
                         })),
                     self.working_set.pending_changes_only,
+                ))
+                .child(crate::ui::style::button_toggle(
+                    Button::new("needs-you-filter")
+                        .label(format!("Needs you ({needs_you_nodes})"))
+                        .ghost()
+                        .small()
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.working_set.needs_you_only = !this.working_set.needs_you_only;
+                            this.record_quick_filter_toggle(
+                                "needs-you-filter",
+                                this.working_set.needs_you_only,
+                                cx,
+                            );
+                            this.rebuild_visible_list(window, cx);
+                        })),
+                    self.working_set.needs_you_only,
+                ))
+                .child(crate::ui::style::button_toggle(
+                    Button::new("running-filter")
+                        .label(format!("Running ({running_nodes})"))
+                        .ghost()
+                        .small()
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.working_set.running_only = !this.working_set.running_only;
+                            this.record_quick_filter_toggle(
+                                "running-filter",
+                                this.working_set.running_only,
+                                cx,
+                            );
+                            this.rebuild_visible_list(window, cx);
+                        })),
+                    self.working_set.running_only,
                 ))
                 .child(check_button)
                 .children(clear_marks)
@@ -3054,7 +3502,12 @@ impl HasAppNav for TaskListView {
     }
 
     fn app_nav_current(&self) -> Option<AppDestination> {
-        Some(AppDestination::Tasks)
+        // Hosted as a column only in the workbench.
+        if self.marks_focused_column {
+            Some(AppDestination::Workbench)
+        } else {
+            Some(AppDestination::Tasks)
+        }
     }
 
     fn app_nav_fallback_focus(&self) -> FocusHandle {
@@ -3078,6 +3531,14 @@ impl Render for TaskListView {
         if self.pending_live_refresh {
             self.pending_live_refresh = false;
             self.live_refresh(window, cx);
+        }
+        if self.pending_attention_apply {
+            self.pending_attention_apply = false;
+            self.rebuild_visible_list(window, cx);
+        }
+        if self.pending_status_override_apply {
+            self.pending_status_override_apply = false;
+            self.rebuild_visible_list(window, cx);
         }
         self.apply_pending_revert(window, cx);
         if self.pending_compose_submit {
@@ -3165,6 +3626,7 @@ impl Render for TaskListView {
             .relative()
             .on_action(cx.listener(Self::on_focus_drawer))
             .on_action(cx.listener(Self::on_open_agent_chat))
+            .on_action(cx.listener(Self::on_report_problem))
             .on_action(cx.listener(Self::on_arrow_up))
             .on_action(cx.listener(Self::on_arrow_down))
             .on_action(cx.listener(Self::on_page_up))
@@ -3186,6 +3648,7 @@ impl Render for TaskListView {
             .on_action(cx.listener(Self::on_open_external))
             .on_action(cx.listener(Self::on_row_edit))
             .on_action(cx.listener(Self::on_open_edit_panel))
+            .on_action(cx.listener(Self::on_open_edit_panel_ctrl))
             .on_action(cx.listener(Self::on_open_obligations))
             .on_action(cx.listener(Self::on_open_plan))
             .on_action(cx.listener(Self::on_tag1))
@@ -3243,6 +3706,238 @@ mod tests {
     use super::model::filter_and_sort_tasks;
     use super::model::selection_after_delete;
     use super::model::{SortDirection, SortKey};
+    use super::row_menu::RowMenuKind;
+    use super::{Attention, TaskListEvent, TaskListView, delegate};
+    use crate::views::rows::fixture::Fixture;
+    use chrono::Utc;
+    use gpui::{AppContext as _, Entity, TestAppContext, VisualTestContext};
+    use gpui_component::Root;
+
+    type Events = std::rc::Rc<std::cell::RefCell<Vec<TaskListEvent>>>;
+
+    fn open_view<'a>(
+        fixture: &Fixture,
+        cx: &'a mut TestAppContext,
+    ) -> (Entity<TaskListView>, Events, &'a mut VisualTestContext) {
+        cx.update(gpui_component::init);
+        // `TaskListView::new` resolves `TodPaths::discover()` for its
+        // working-set file; pin it to a scratch dir for the test.
+        let data_root = std::env::temp_dir().join(format!("tod-task-list-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&data_root).unwrap();
+        tod_store::set_data_root(data_root);
+        let slot = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let events: Events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let store = fixture.store.clone();
+        let (slot_in, events_in) = (slot.clone(), events.clone());
+        let (_, cx) = cx.add_window_view(move |window, cx| {
+            let view = cx.new(|cx| TaskListView::new(window, cx, store));
+            cx.subscribe(&view, move |_, _, event: &TaskListEvent, _| {
+                events_in.borrow_mut().push(event.clone());
+            })
+            .detach();
+            *slot_in.borrow_mut() = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let view = slot.borrow_mut().take().unwrap();
+        draw(cx);
+        (view, events, cx)
+    }
+
+    fn draw(cx: &mut VisualTestContext) {
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+    }
+
+    #[gpui::test]
+    fn right_click_opens_the_context_menu_for_the_row(cx: &mut TestAppContext) {
+        let fixture = Fixture::new();
+        let node_id = fixture.node_id.to_string();
+        let (view, _events, cx) = open_view(&fixture, cx);
+        view.update_in(cx, |view, window, cx| {
+            view.open_context_menu(&node_id, window, cx);
+        });
+        draw(cx);
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.open_row_menu,
+                Some((RowMenuKind::Context, node_id.clone()))
+            );
+            assert!(view.row_menu.is_some(), "menu entity was built");
+            assert_eq!(view.working_set.selected_id.as_deref(), Some(node_id.as_str()));
+        });
+    }
+
+    #[gpui::test]
+    fn context_menu_rename_entry_starts_inline_edit(cx: &mut TestAppContext) {
+        let fixture = Fixture::new();
+        let node_id = fixture.node_id.to_string();
+        let (view, _events, cx) = open_view(&fixture, cx);
+        // Right-click, then run the same thing the menu's "Rename (F2)" entry
+        // does — the entries dispatch through `TaskListView`'s own methods
+        // (see `context_menu::build`), so driving `start_inline_edit`
+        // directly exercises the same path the click would.
+        view.update_in(cx, |view, window, cx| {
+            view.open_context_menu(&node_id, window, cx);
+            view.start_inline_edit(&node_id, window, cx);
+        });
+        draw(cx);
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.edit_open_for.as_deref(), Some(node_id.as_str()));
+        });
+    }
+
+    #[gpui::test]
+    fn attention_badge_click_emits_open_task_panel(cx: &mut TestAppContext) {
+        let fixture = Fixture::new();
+        let node_id = fixture.node_id.to_string();
+        let (view, events, cx) = open_view(&fixture, cx);
+        view.update_in(cx, |view, window, cx| {
+            view.handle_row_action(
+                delegate::RowAction::OpenTaskPanel {
+                    task_id: node_id.clone(),
+                },
+                window,
+                cx,
+            );
+        });
+        draw(cx);
+        assert!(events.borrow().iter().any(
+            |e| matches!(e, TaskListEvent::OpenTaskPanel { task_id } if task_id == &node_id)
+        ));
+    }
+
+    #[gpui::test]
+    fn set_attention_badges_rows_and_needs_you_filter_keeps_ancestors(cx: &mut TestAppContext) {
+        let fixture = Fixture::new();
+        let node_id = fixture.node_id.to_string();
+        let (view, _events, cx) = open_view(&fixture, cx);
+        let mut map = std::collections::HashMap::new();
+        map.insert(
+            node_id.clone(),
+            Attention {
+                count: 2,
+                waiting_since: Utc::now(),
+            },
+        );
+        view.update(cx, |view, cx| {
+            view.set_attention(map, cx);
+        });
+        draw(cx);
+        view.read_with(cx, |view, _| {
+            let task = view.all_tasks.iter().find(|t| t.id == node_id).unwrap();
+            assert_eq!(task.needs_you_count, 2);
+            assert!(task.waiting_since.is_some());
+        });
+        // The "Needs you" filter keeps the node visible (it matches).
+        view.update_in(cx, |view, window, cx| {
+            view.working_set.needs_you_only = true;
+            view.rebuild_visible_list(window, cx);
+        });
+        draw(cx);
+        view.read_with(cx, |view, cx| {
+            let visible = view.list_state.read(cx).delegate().items();
+            assert!(visible.iter().any(|t| t.id == node_id));
+        });
+    }
+
+    /// Only arrow keys wrap from the first row to the last; a click there
+    /// must land. Regression test for clicks on the last row being undone as
+    /// if they were a wrap.
+    #[gpui::test]
+    fn clicking_the_last_row_from_the_first_selects_it(cx: &mut TestAppContext) {
+        use gpui_component::IndexPath;
+        use gpui_component::list::ListEvent;
+        use tod_store::outline::{CreatePosition, OutlineMutation};
+
+        let fixture = Fixture::new();
+        let list_id = fixture.store.list_outline_lists().unwrap()[0].id;
+        for title in ["Second node", "Third node"] {
+            fixture
+                .store
+                .enqueue_outline(OutlineMutation::CreateNode {
+                    node_id: Some(uuid::Uuid::new_v4()),
+                    list_id,
+                    parent_id: None,
+                    anchor_id: None,
+                    position: CreatePosition::Below,
+                    title: title.into(),
+                })
+                .unwrap();
+        }
+        fixture.store.writer().flush().unwrap();
+        let (view, _events, cx) = open_view(&fixture, cx);
+        view.update_in(cx, |view, window, cx| {
+            view.refresh(window, cx);
+        });
+        draw(cx);
+
+        let last = view.read_with(cx, |view, cx| {
+            view.list_state.read(cx).delegate().items_count() - 1
+        });
+        assert!(last >= 2, "the fixture should show at least three rows");
+        let list_state = view.read_with(cx, |view, _| view.list_state.clone());
+        list_state.update_in(cx, |state, window, cx| {
+            state.set_selected_index(Some(IndexPath::new(0)), window, cx);
+        });
+        view.update(cx, |view, _| view.last_selected = Some(IndexPath::new(0)));
+        list_state.update_in(cx, |state, window, cx| {
+            state.set_selected_index(Some(IndexPath::new(last)), window, cx);
+            cx.emit(ListEvent::Confirm(IndexPath::new(last)));
+        });
+        draw(cx);
+
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.last_selected.map(|ix| ix.row), Some(last));
+            let selected = view.list_state.read(cx).selected_index().map(|ix| ix.row);
+            assert_eq!(selected, Some(last));
+        });
+    }
+
+    /// A store-change-triggered reload (`refresh` -> `live_refresh` ->
+    /// `reload_all_tasks`) reads rows straight from the outline store, which
+    /// knows nothing about `set_attention`'s "needs you" data. Regression
+    /// test for a bug where any such reload — triggered by any store change,
+    /// not just an attention change — silently wiped the badge back to zero
+    /// until the next attention poll happened to land, showing as a flicker
+    /// in the unified view's tree.
+    #[gpui::test]
+    fn refresh_after_set_attention_keeps_the_badge(cx: &mut TestAppContext) {
+        let fixture = Fixture::new();
+        let node_id = fixture.node_id.to_string();
+        let (view, _events, cx) = open_view(&fixture, cx);
+        let mut map = std::collections::HashMap::new();
+        map.insert(
+            node_id.clone(),
+            Attention {
+                count: 1,
+                waiting_since: Utc::now(),
+            },
+        );
+        view.update(cx, |view, cx| {
+            view.set_attention(map, cx);
+        });
+        draw(cx);
+        view.read_with(cx, |view, _| {
+            let task = view.all_tasks.iter().find(|t| t.id == node_id).unwrap();
+            assert_eq!(task.needs_you_count, 1);
+        });
+
+        // Any store change reruns `live_refresh`/`reload_all_tasks`, unrelated
+        // to attention — the badge must survive it.
+        view.update_in(cx, |view, window, cx| {
+            view.refresh(window, cx);
+        });
+        draw(cx);
+        view.read_with(cx, |view, _| {
+            let task = view.all_tasks.iter().find(|t| t.id == node_id).unwrap();
+            assert_eq!(
+                task.needs_you_count, 1,
+                "a reload triggered by an unrelated store change must not clear the \"needs you\" badge"
+            );
+            assert!(task.waiting_since.is_some());
+        });
+    }
 
     #[test]
     fn same_visible_rows_ignores_field_changes_but_not_shape_changes() {

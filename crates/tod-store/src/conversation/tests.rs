@@ -1446,6 +1446,26 @@ fn unsure_flags_live_on_the_change_set() {
 }
 
 #[test]
+fn latest_conversation_for_entity_finds_the_conversation_that_last_changed_it() {
+    let fx = setup();
+    let o = add_obligation(&fx.conn, fx.n1, "Original.");
+    let repo = ConversationRepo::new(&fx.conn);
+
+    // Nothing has changed it through a conversation yet.
+    assert_eq!(repo.latest_conversation_for_entity(o).unwrap(), None);
+
+    fx.agent(M::UpdateObligationBody {
+        obligation_id: o,
+        body: "Agent.".into(),
+    })
+    .unwrap();
+    assert_eq!(
+        repo.latest_conversation_for_entity(o).unwrap(),
+        Some(fx.conv)
+    );
+}
+
+#[test]
 fn agent_writes_record_one_conversation_action_and_other_actors_record_outside_it() {
     let fx = setup();
     let o = add_obligation(&fx.conn, fx.n1, "Original.");
@@ -1581,6 +1601,36 @@ fn conversations_are_listed_per_focus_and_keep_their_turns() {
         vec![newer.id, project.id]
     );
     assert_eq!(listed[1].opening, "Hi");
+}
+
+#[test]
+fn turns_range_returns_the_inclusive_seq_range() {
+    let fx = setup();
+    let repo = ConversationRepo::new(&fx.conn);
+    // `setup` already appended seq 1.
+    repo.append_turn(fx.conv, TurnRole::Agent, "reply 1").unwrap();
+    repo.append_turn_with_parts_and_context(
+        fx.conv,
+        TurnRole::User,
+        "turn 3",
+        &[],
+        Some("delta before turn 3"),
+    )
+    .unwrap();
+    repo.append_turn(fx.conv, TurnRole::Agent, "reply 3").unwrap();
+    repo.append_turn(fx.conv, TurnRole::User, "turn 5").unwrap();
+
+    let range = repo.turns_range(fx.conv, 2, 4).unwrap();
+    assert_eq!(
+        range.iter().map(|t| t.seq).collect::<Vec<_>>(),
+        vec![2, 3, 4]
+    );
+    let turn3 = range.iter().find(|t| t.seq == 3).unwrap();
+    assert_eq!(turn3.sent_context.as_deref(), Some("delta before turn 3"));
+    assert_eq!(range[0].sent_context, None);
+
+    // Out-of-range bounds are simply empty, not an error.
+    assert!(repo.turns_range(fx.conv, 100, 200).unwrap().is_empty());
 }
 
 #[test]

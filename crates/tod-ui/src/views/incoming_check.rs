@@ -5,9 +5,11 @@
 //! shows its progress and its summary in both.
 //!
 //! The work is `tod_core::incoming::IncomingRunner`: one short-lived agent
-//! session per node, at most `max_parallel_agent_sessions` at once. It is
-//! advanced from a timer that only takes the agent lock when it is free, so
-//! the UI never waits on it. Afterwards the summary lists the nodes whose
+//! session per node, at most `max_parallel_agent_sessions` at once. Starting
+//! and collecting a session runs git, Docker, and `tod-cli`, so each tick
+//! takes the runner to the background executor, where the shared agent is
+//! locked only for each provider call; the UI shows what it last knew of the
+//! run meanwhile, and never waits on it. Afterwards the summary lists the nodes whose
 //! verdict sends them back, and **Move back all** moves each through the
 //! same path as the lifecycle panel's orange callout
 //! (`lifecycle_validity::regression`, then `LifecycleController::revert_to`).
@@ -31,7 +33,7 @@ use crate::views::lifecycle_control::LifecycleController;
 use gpui::{Context, Entity, EventEmitter, Task};
 use std::sync::Arc;
 use std::time::Duration;
-use tod_core::conversation::ConversationConfig;
+use tod_core::conversation::{ConversationConfig, SharedAgentAccess};
 use tod_core::incoming::{
     BeforeGate, IncomingRunner, NodeOutcome, NodeResult, needs_check_before_gate,
 };
@@ -61,7 +63,7 @@ pub struct IncomingCheck {
     fleet: Arc<FleetStore>,
     agent: SharedAgent,
     lifecycle: Entity<LifecycleController>,
-    runner: Option<IncomingRunner>,
+    run: Option<Run>,
     /// The last finished check's results, until dismissed or replaced.
     results: Vec<NodeResult>,
     /// Why the last check could not start.
@@ -88,7 +90,7 @@ impl IncomingCheck {
             fleet,
             agent,
             lifecycle,
-            runner: None,
+            run: None,
             results: Vec::new(),
             error: None,
             move_back_armed: false,
@@ -100,17 +102,17 @@ impl IncomingCheck {
     }
 
     pub fn is_running(&self) -> bool {
-        self.runner.is_some()
+        self.run.is_some()
     }
 
     /// `(finished, total)` while a check runs.
     pub fn progress(&self) -> Option<(usize, usize)> {
-        self.runner.as_ref().map(|r| (r.finished(), r.total()))
+        self.run.as_ref().map(|r| (r.finished, r.total))
     }
 
     /// Whether the running check includes `node` and has not finished it.
     pub fn covers(&self, node: Uuid) -> bool {
-        self.runner.as_ref().is_some_and(|r| r.covers(node))
+        self.run.as_ref().is_some_and(|r| r.covers(node))
     }
 
     /// Whether a gate check on `node` waits on the running check.
@@ -163,7 +165,7 @@ impl IncomingCheck {
     /// Check `nodes` against their pending incoming changes. Nodes without
     /// any are cleared without an agent. Refused while a check runs.
     pub fn start(&mut self, nodes: Vec<Uuid>, cx: &mut Context<Self>) {
-        if self.runner.is_some() || nodes.is_empty() {
+        if self.run.is_some() || nodes.is_empty() {
             return;
         }
         self.results.clear();
@@ -190,8 +192,8 @@ impl IncomingCheck {
             return true;
         }
         let task_id = node.to_string();
-        let joined = match &self.runner {
-            Some(runner) => runner.covers(node),
+        let joined = match &self.run {
+            Some(run) => run.covers(node),
             None => match self.start_run(vec![node], true, cx) {
                 Ok(()) => true,
                 Err(err) => {
@@ -238,11 +240,32 @@ impl IncomingCheck {
     ) -> Result<(), String> {
         let (config, cap) = driver_config(&self.fleet)?;
         self.gate_only = gate_only;
-        self.runner = Some(IncomingRunner::new(config, cap, nodes));
+        self.run_with(IncomingRunner::new(config, cap, nodes), cx);
+        Ok(())
+    }
+
+    /// Run `runner`, a tick at a time on the background executor.
+    fn run_with(&mut self, runner: IncomingRunner, cx: &mut Context<Self>) {
+        self.run = Some(Run::new(runner));
+        let fleet = self.fleet.clone();
+        let agent = self.agent.clone();
         self._poll = Some(cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor().timer(POLL_INTERVAL).await;
-                let Ok(running) = this.update(cx, |this, cx| this.poll(cx)) else {
+                let Ok(Some(mut runner)) = this.update(cx, |this, _| this.take_runner()) else {
+                    break;
+                };
+                let fleet = fleet.clone();
+                let agent = agent.clone();
+                let (runner, changed) = cx
+                    .background_executor()
+                    .spawn(async move {
+                        let changed = runner.tick(&fleet, &mut SharedAgentAccess(&agent));
+                        (runner, changed)
+                    })
+                    .await;
+                let Ok(running) = this.update(cx, |this, cx| this.ticked(runner, changed, cx))
+                else {
                     break;
                 };
                 if !running {
@@ -250,20 +273,20 @@ impl IncomingCheck {
                 }
             }
         }));
-        Ok(())
     }
 
-    /// Advance the runner when the agent is free. `false` once it is done.
-    fn poll(&mut self, cx: &mut Context<Self>) -> bool {
-        let Some(runner) = self.runner.as_mut() else {
+    /// The runner, taken to be ticked off the main thread.
+    fn take_runner(&mut self) -> Option<IncomingRunner> {
+        self.run.as_mut().and_then(|run| run.runner.take())
+    }
+
+    /// The runner is back from a tick. `false` once it is done.
+    fn ticked(&mut self, runner: IncomingRunner, changed: bool, cx: &mut Context<Self>) -> bool {
+        let Some(run) = self.run.as_mut() else {
             return false;
         };
-        let changed = match self.agent.try_lock() {
-            Ok(mut agent) => runner.tick(&self.fleet, agent.as_mut()),
-            Err(_) => false,
-        };
         if runner.is_done() {
-            let runner = self.runner.take().expect("checked above");
+            self.run = None;
             for node in std::mem::take(&mut self.before_gate) {
                 self.release_gate_check(node, runner.results(), cx);
             }
@@ -273,6 +296,7 @@ impl IncomingCheck {
             cx.notify();
             return false;
         }
+        run.put_back(runner);
         if changed {
             cx.notify();
         }
@@ -360,6 +384,39 @@ impl IncomingCheck {
 
 impl EventEmitter<IncomingCheckEvent> for IncomingCheck {}
 
+/// A running check: its runner, away on the background executor while a tick
+/// runs, and what the view last knew of it.
+struct Run {
+    runner: Option<IncomingRunner>,
+    finished: usize,
+    total: usize,
+    unfinished: Vec<Uuid>,
+}
+
+impl Run {
+    fn new(runner: IncomingRunner) -> Self {
+        let mut run = Self {
+            runner: None,
+            finished: 0,
+            total: 0,
+            unfinished: Vec::new(),
+        };
+        run.put_back(runner);
+        run
+    }
+
+    fn covers(&self, node: Uuid) -> bool {
+        self.unfinished.contains(&node)
+    }
+
+    fn put_back(&mut self, runner: IncomingRunner) {
+        self.finished = runner.finished();
+        self.total = runner.total();
+        self.unfinished = runner.unfinished();
+        self.runner = Some(runner);
+    }
+}
+
 /// `results` in the outline's order, so the summary reads like the tree
 /// rather than in whichever order the sessions happened to finish. Nodes
 /// the outline no longer lists keep their place at the end.
@@ -412,5 +469,68 @@ pub fn outcome_line(result: &NodeResult) -> String {
         ),
         NodeOutcome::Verdict { note, .. } => format!("{}: not affected. {note}", result.title),
         NodeOutcome::Failed(err) => format!("{}: check failed — {err}", result.title),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::views::rows::fixture::Fixture;
+    use gpui::{AppContext as _, TestAppContext};
+    use std::sync::Mutex;
+    use tod_agent::MockAgentProvider;
+
+    /// A tick of the check runs git, Docker, and `tod-cli`, so it never runs
+    /// on the main thread: the runner goes to the background executor, and
+    /// meanwhile the UI still reads the check's progress from what it last
+    /// knew of it.
+    #[gpui::test]
+    fn an_incoming_check_ticks_off_the_main_thread(cx: &mut TestAppContext) {
+        let fixture = Fixture::new();
+        let node = fixture.node_id;
+        let store = fixture.store.clone();
+        let check = cx.new(|cx| {
+            let agent: SharedAgent = Arc::new(Mutex::new(Box::new(MockAgentProvider::new())));
+            let lifecycle = cx.new(|_| LifecycleController::new(store.clone()));
+            IncomingCheck::new(store.clone(), agent, lifecycle)
+        });
+        let config = ConversationConfig {
+            data_root: fixture.store.paths().root().to_path_buf(),
+            media: tod_core::media::MediaPaths::discover().expect("media paths"),
+            launch: tod_agent::AgentLaunchOptions::for_platform(tod_agent::AgentPlatform::Claude),
+            context: Default::default(),
+        };
+        check.update(cx, |check, cx| {
+            check.run_with(IncomingRunner::new(config, 1, vec![node]), cx)
+        });
+        check.read_with(cx, |check, _| {
+            assert!(check.is_running());
+            assert_eq!(check.progress(), Some((0, 1)));
+            assert!(check.covers(node));
+        });
+
+        // Away for a tick: the check still reads as running, where it was.
+        let runner = check.update(cx, |check, _| check.take_runner());
+        let runner = runner.expect("the runner was here");
+        check.read_with(cx, |check, _| {
+            assert!(check.is_running());
+            assert_eq!(check.progress(), Some((0, 1)));
+            assert!(check.covers(node), "the node is still being checked");
+        });
+        assert!(
+            check.update(cx, |check, _| check.take_runner()).is_none(),
+            "a tick already away is not started again"
+        );
+        check.update(cx, |check, cx| check.ticked(runner, false, cx));
+
+        // The node has no pending changes, so the timer's first tick clears
+        // it without an agent, on the background executor.
+        cx.executor().advance_clock(POLL_INTERVAL);
+        cx.run_until_parked();
+        check.read_with(cx, |check, _| {
+            assert!(!check.is_running(), "{:?}", check.error());
+            assert_eq!(check.results().len(), 1);
+            assert_eq!(check.results()[0].outcome, NodeOutcome::Cleared);
+        });
     }
 }

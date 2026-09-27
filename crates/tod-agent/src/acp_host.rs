@@ -404,6 +404,58 @@ pub fn container_agent_bin(
     })
 }
 
+/// The ACP agent for `host` in a cloud sandbox.
+pub fn sandbox_agent_bin(host: AcpHost, launch: &crate::sandbox::SandboxLaunch) -> Result<String> {
+    let (candidates, install): (&[&str], &str) = match host {
+        AcpHost::Claude => (
+            &["claude-agent-acp", "claude-code-acp"],
+            "create the sandbox with `tod-sandbox create <name> --agents`, then sign in to `claude` there",
+        ),
+        AcpHost::Cursor => (
+            &["cursor-agent", "agent"],
+            "curl https://cursor.com/install -fsS | bash (and sign in there)",
+        ),
+    };
+    launch.find_program(candidates)?.with_context(|| {
+        format!(
+            "No {} ACP agent in sandbox `{}` (looked for {}). Install it there: {install}",
+            host.label(),
+            launch.sandbox,
+            candidates.join(", "),
+        )
+    })
+}
+
+/// [`spawn_acp_process`] in a cloud sandbox, through `tod-sandbox agent`.
+/// ACP runs over the launcher's stdio exactly as it does over a local child's.
+pub fn spawn_acp_in_sandbox(
+    host: AcpHost,
+    launch: &crate::sandbox::SandboxLaunch,
+    agent_bin: &str,
+    env: &[(String, String)],
+) -> Result<crate::process_tree::AgentProcess> {
+    use std::process::Stdio;
+
+    let args: Vec<String> = if host.uses_acp_subcommand(Path::new(agent_bin)) {
+        vec!["acp".to_string()]
+    } else {
+        Vec::new()
+    };
+    let mut command = launch.agent_command(agent_bin, &args, env);
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    crate::process_tree::spawn(&mut command).with_context(|| {
+        format!(
+            "failed to start {} ACP in sandbox `{}` ({})",
+            host.label(),
+            launch.sandbox,
+            launch.launcher.display()
+        )
+    })
+}
+
 /// [`spawn_acp_process`] inside a dev container, through `docker exec -i`.
 /// ACP runs over the exec's stdio exactly as it does over a local child's.
 pub fn spawn_acp_in_container(

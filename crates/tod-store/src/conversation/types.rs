@@ -257,7 +257,9 @@ pub fn runs_in(dev: &Option<crate::fleet::repos::node_files::DevContainerSetting
         None => "this machine".into(),
         Some(dev) => {
             let container = dev.container().unwrap_or("(none chosen)");
-            if dev.repo_on_host {
+            if dev.sandbox {
+                format!("cloud sandbox {container}")
+            } else if dev.repo_on_host {
                 format!("dev container {container}, mounted")
             } else {
                 format!("dev container {container}")
@@ -466,6 +468,11 @@ pub struct Turn {
     /// An agent turn as the agent streamed it: narration, thoughts, tool
     /// calls, and the answer. Empty when the provider reported none.
     pub parts: Vec<ReplyPart>,
+    /// For a user turn: the part of what was sent to the agent that is not
+    /// the user's own text (the protocol delta prepended to it). `None` for
+    /// a continuation turn (its body already equals what was sent) and for
+    /// every non-user turn.
+    pub sent_context: Option<String>,
     pub created_at: i64,
 }
 

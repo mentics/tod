@@ -125,6 +125,11 @@ impl TodPaths {
             .join(node_id.to_string())
     }
 
+    /// Root directory for per-node and project journeys (`doc/journeys/spec.md`).
+    pub fn journeys_dir(&self) -> PathBuf {
+        self.data_root.join("journeys")
+    }
+
     pub fn ensure_config_dir(&self) -> Result<()> {
         std::fs::create_dir_all(&self.config_dir)
             .with_context(|| format!("failed to create config dir {}", self.config_dir.display()))

@@ -20,18 +20,23 @@ use crate::interview::views::{SessionsEvent, SessionsView, SettingsEvent, Settin
 use crate::interview::{TaskListProceedContext, TodPaths, TodSettings};
 use crate::ui::actionable::render_shortcut_pill_in_context;
 use crate::ui::agent_chat::{OpenAgentChat, OpenConversation};
-use crate::ui::app_nav::{
-    HasAppNav, ShellGoConversation, ShellGoDatabase, ShellGoSettings, ShellGoTasks,
-    register_app_nav_keyboard_bindings,
+use crate::ui::agent_runs::AgentRuns;
+use crate::ui::report_problem::{
+    self, OpenReportDialog, REPORT_DIALOG_CONTEXT, ReportDialogSubmit, ReportProblem,
 };
-use crate::ui::code_links::{OpenCodeRef, open_code_ref, open_node_in_editor};
+use crate::ui::app_nav::{
+    HasAppNav, ShellGoConversation, ShellGoDatabase, ShellGoPullRequests, ShellGoSettings,
+    ShellGoTasks, ShellGoWorkbench, register_app_nav_keyboard_bindings,
+};
+use crate::ui::code_links::{OpenCodeRef, open_code_ref};
 use crate::ui::key_context::NOT_INPUT;
 use crate::ui::panel_split::{PanelSplitState, h_panel_split};
 use crate::ui::selectable_text::selectable_text;
 use crate::ui::status::{self, StatusSource};
-use crate::ui::toast::{error_toast, notification_overlay, warning_toast};
+use crate::ui::toast::{error_toast, info_toast, notification_overlay, warning_toast};
 use crate::views::action_panel::{ActionPanelEvent, ActionPanelView};
 use crate::views::database::DatabaseView;
+use crate::views::pull_requests::PullRequestsView;
 use crate::views::incoming_check::{IncomingCheck, IncomingCheckEvent};
 use crate::views::lifecycle_control::LifecycleController;
 use crate::views::lifecycle_panel::{LifecyclePanelEvent, LifecyclePanelView};
@@ -39,13 +44,15 @@ use crate::views::obligations::{ObligationsEvent, ObligationsView};
 use crate::views::plan_steps::{PlanStepsEvent, PlanStepsView};
 use crate::views::task_edit::{TaskEditEvent, TaskEditView};
 use crate::views::task_list::{TaskListEvent, TaskListView};
+use crate::unified::UnifiedView;
 use crate::views::visual_design_panel::{
     EmbeddedChatParams, VisualDesignPanelEvent, VisualDesignPanelView,
 };
 use gpui::prelude::FluentBuilder;
 use gpui::*;
 use gpui_component::button::{Button, ButtonVariants};
-use gpui_component::{ActiveTheme, IconName, Root, Selectable, StyledExt, TitleBar, h_flex};
+use gpui_component::input::{Textarea, TextareaState};
+use gpui_component::{ActiveTheme, IconName, Root, Selectable, StyledExt, TitleBar, WindowExt, h_flex};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tod_agent::EngagementState;
@@ -55,9 +62,10 @@ use tod_core::run_transcript;
 use tod_store::agent_traffic::{
     AgentStatusGroups, SharedAgentTrafficLog, format_status_bar, shared_log,
 };
+use tod_journey::JourneyKey;
 use tod_store::conversation::{Focus, ProtocolKind};
 use tod_store::fleet::terminal::{focus_shell_session, open_shell_for_node};
-use tod_store::fleet::{FleetLaunchError, FleetStore, code_editor};
+use tod_store::fleet::{FleetLaunchError, FleetStore, code_editor, open_code_editor_for_node};
 use uuid::Uuid;
 
 actions!(
@@ -80,6 +88,10 @@ enum ShellView {
     Conversation,
     Settings,
     Database,
+    /// The pull requests of the node selected in Tasks.
+    PullRequests,
+    /// The unified view ("Workbench") — `doc/ui/unified-view.md`.
+    Unified,
 }
 
 struct PendingOpenInterview {
@@ -105,6 +117,8 @@ pub struct Shell {
     view_before_conversation: ShellView,
     settings: Entity<SettingsView>,
     database: Entity<DatabaseView>,
+    pull_requests: Entity<PullRequestsView>,
+    unified: Entity<UnifiedView>,
     fleet: Arc<FleetStore>,
     _mutation_socket: Option<tod_store::fleet::mutation_socket::PortFileGuard>,
     agent: SharedAgent,
@@ -122,6 +136,7 @@ pub struct Shell {
     pending_open_interview_for_task: Option<(String, String)>,
     /// A conversation to open once `window` is available (panel events have none).
     pending_open_conversation: Option<Focus>,
+    pending_report_dialog: Option<JourneyKey>,
     /// A node that just entered a state with on-entry work for its agent.
     pending_on_entry: Option<Uuid>,
     /// The conversation view asked to return to where the user came from.
@@ -200,7 +215,7 @@ fn collect_running_work(
     for item in sessions.read(cx).running_interview_work() {
         items.push(SharedString::from(item));
     }
-    for item in conversation.read(cx).running_work() {
+    for item in conversation.read(cx).running_work(cx) {
         items.push(SharedString::from(item));
     }
     items
@@ -218,6 +233,10 @@ impl Shell {
             .update(cx, |settings, _| settings.app_nav_mut().close());
         self.database
             .update(cx, |database, _| database.app_nav_mut().close());
+        self.pull_requests
+            .update(cx, |pull_requests, _| pull_requests.app_nav_mut().close());
+        self.unified
+            .update(cx, |unified, cx| unified.close_app_nav(cx));
         if self.active_view == view {
             if view == ShellView::Tasks {
                 self.task_list.update(cx, |list, cx| {
@@ -229,7 +248,14 @@ impl Shell {
         if view == ShellView::Conversation {
             self.view_before_conversation = self.active_view;
         }
+        let previous = self.active_view;
         self.active_view = view;
+        crate::ui::journey::record_nav(
+            cx,
+            tod_journey::NavEvent::ViewSelected {
+                view: format!("{view:?}"),
+            },
+        );
         match view {
             ShellView::Tasks => {
                 self.task_list.update(cx, |list, cx| {
@@ -255,6 +281,22 @@ impl Shell {
                 let focus = self.database.read(cx).focus_handle(cx);
                 focus.focus(window, cx);
             }
+            ShellView::PullRequests => {
+                // The node selected in the tree the user came from.
+                let node = if previous == ShellView::Unified {
+                    self.unified.read(cx).selected_node_with_title(cx)
+                } else {
+                    self.task_list.read(cx).selected_node_with_title()
+                };
+                self.pull_requests
+                    .update(cx, |pull_requests, cx| pull_requests.show(node, cx));
+                let focus = self.pull_requests.read(cx).focus_handle(cx);
+                focus.focus(window, cx);
+            }
+            ShellView::Unified => {
+                self.unified
+                    .update(cx, |unified, cx| unified.focus_tree(window, cx));
+            }
         }
         cx.notify();
     }
@@ -273,6 +315,12 @@ impl Shell {
             self.queue_open_conversation(focus, cx);
             return;
         }
+        crate::ui::journey::record_nav(
+            cx,
+            tod_journey::NavEvent::DrawerOpened {
+                drawer: "interview".into(),
+            },
+        );
         self.active_view = ShellView::Interview;
         self.pending_open_interview = Some(PendingOpenInterview {
             task_id,
@@ -480,6 +528,29 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        match &request {
+            DrawerRequest::Close | DrawerRequest::Follow { task_id: None } => {
+                crate::ui::journey::record_nav(
+                    cx,
+                    tod_journey::NavEvent::DrawerClosed {
+                        drawer: "drawer".into(),
+                    },
+                );
+            }
+            DrawerRequest::Follow { task_id: Some(_) } | DrawerRequest::Focus => {}
+            other => {
+                crate::ui::journey::record_nav(
+                    cx,
+                    tod_journey::NavEvent::DrawerOpened {
+                        drawer: format!("{other:?}")
+                            .split(|c: char| c == ' ' || c == '{')
+                            .next()
+                            .unwrap_or("drawer")
+                            .to_string(),
+                    },
+                );
+            }
+        }
         match request {
             DrawerRequest::OpenTaskEdit { task_id } => {
                 self.drawer
@@ -595,6 +666,9 @@ impl Shell {
                 conversation.open_with(focus, protocol, true, window, cx);
             }
         });
+        if let Some(conversation_id) = self.conversation.read(cx).conversation_id() {
+            crate::ui::journey::record_conversation_opened(cx, conversation_id);
+        }
         cx.notify();
     }
 
@@ -605,9 +679,24 @@ impl Shell {
         cx.notify();
     }
 
+    /// [`Self::on_open_report_dialog`] from an event handler, which has no
+    /// `window` and may run while nested entity leases are still on the
+    /// stack.
+    fn queue_open_report_dialog(&mut self, key: JourneyKey, cx: &mut Context<Self>) {
+        self.pending_report_dialog = Some(key);
+        cx.notify();
+    }
+
     fn drain_pending_conversation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(focus) = self.pending_open_conversation.take() {
             self.open_conversation(focus, window, cx);
+        }
+        if let Some(key) = self.pending_report_dialog.take() {
+            self.on_open_report_dialog(
+                &OpenReportDialog { key, conversation: None },
+                window,
+                cx,
+            );
         }
         if let Some(node) = self.pending_on_entry.take() {
             self.open_conversation_with(Focus::Node(node), ProtocolKind::OnEntry, true, window, cx);
@@ -673,6 +762,106 @@ impl Shell {
     ) {
         let focus = fallback_focus(self.task_list.read(cx).selected_node_id());
         self.open_conversation(focus, window, cx);
+    }
+
+    /// Ctrl+Shift+R that no view handled: the task tree's selection, else
+    /// the whole project.
+    fn on_report_problem(&mut self, _: &ReportProblem, window: &mut Window, cx: &mut Context<Self>) {
+        let focus = fallback_focus(self.task_list.read(cx).selected_node_id());
+        let key = journey_key_for_focus(focus);
+        self.on_open_report_dialog(&OpenReportDialog { key, conversation: None }, window, cx);
+    }
+
+    /// Handle [`OpenReportDialog`] dispatched by any view: opens the report
+    /// dialog for `key`. Snapshots the app journey ring buffer synchronously
+    /// on submit, then does the (potentially slow) screenshot capture and the
+    /// journey write on a background thread so the UI never blocks.
+    fn on_open_report_dialog(
+        &mut self,
+        action: &OpenReportDialog,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Every way in (shortcut, menus, views) ends here; with reporting
+        // not set up, none of them opens a dialog whose report goes nowhere.
+        if !report_problem::is_available(cx) {
+            return;
+        }
+        let key = action.key;
+        let title: SharedString = match key {
+            JourneyKey::Project => "Report a problem: project".into(),
+            JourneyKey::Node(id) => {
+                let node_title = self
+                    .fleet
+                    .get_node(&id.to_string())
+                    .ok()
+                    .flatten()
+                    .map(|task| task.title)
+                    .unwrap_or_else(|| id.to_string());
+                format!("Report a problem: {node_title}").into()
+            }
+        };
+
+        let input = cx.new(|cx| {
+            TextareaState::new(window, cx)
+                .rows(4)
+                .placeholder("What went wrong?")
+        });
+        let focus_handle = input.read(cx).focus_handle(cx);
+        window.focus(&focus_handle, cx);
+
+        let fleet = self.fleet.clone();
+        let paths = self.paths.clone();
+
+        window.open_dialog(cx, move |dialog, _window, _cx| {
+            let input = input.clone();
+            let input_for_submit = input.clone();
+            let fleet = fleet.clone();
+            let paths = paths.clone();
+            dialog
+                .title(title.clone())
+                .overlay(true)
+                .overlay_closable(true)
+                .keyboard(true)
+                .close_button(true)
+                .child({
+                    let fleet = fleet.clone();
+                    let paths = paths.clone();
+                    div()
+                        .key_context(REPORT_DIALOG_CONTEXT)
+                        .on_action(move |_: &ReportDialogSubmit, window, cx| {
+                            let note = input_for_submit.read(cx).value().trim().to_string();
+                            if note.is_empty() {
+                                return;
+                            }
+                            submit_report(key, note, fleet.clone(), paths.clone(), window, cx);
+                            window.close_dialog(cx);
+                        })
+                        .child(
+                            div()
+                                .w_full()
+                                .h(px(120.))
+                                .child(Textarea::new(&input).w_full().h(px(120.))),
+                        )
+                })
+                .footer(
+                    div().flex().justify_end().gap_2().child(
+                        Button::new("report-dialog-submit").label("Report").primary().on_click({
+                            let input = input.clone();
+                            let fleet = fleet.clone();
+                            let paths = paths.clone();
+                            move |_, window, cx| {
+                                let note = input.read(cx).value().trim().to_string();
+                                if note.is_empty() {
+                                    return;
+                                }
+                                submit_report(key, note, fleet.clone(), paths.clone(), window, cx);
+                                window.close_dialog(cx);
+                            }
+                        }),
+                    ),
+                )
+        });
     }
 
     /// Show `message` as an error banner on the next render; messages that
@@ -801,14 +990,37 @@ impl Shell {
         &mut self,
         task_id: String,
         editor_id: String,
-        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let Some(editor) = code_editor(&editor_id) else {
             self.queue_error_toast(format!("Unknown code editor: {editor_id}"), cx);
             return;
         };
-        open_node_in_editor(self.fleet.clone(), task_id, editor, window, cx);
+        // A dev container is prepared through Docker first: off the UI thread.
+        let fleet = self.fleet.clone();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { open_code_editor_for_node(&fleet, editor, &task_id) })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                match result {
+                    Ok(cwd) => {
+                        this.task_list.update(cx, |list, cx| {
+                            list.set_status_message(
+                                format!("Opened {} in {}", editor.label(), cwd.display()),
+                                cx,
+                            );
+                        });
+                    }
+                    Err(err) => {
+                        this.queue_error_toast(format!("Open code failed: {err:#}"), cx);
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn undo_last(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -855,7 +1067,11 @@ impl Shell {
         let source = match self.active_view {
             ShellView::Tasks => StatusSource::Tasks,
             ShellView::Conversation => StatusSource::Conversation,
-            ShellView::Interview | ShellView::Settings | ShellView::Database => {
+            ShellView::Interview
+            | ShellView::Settings
+            | ShellView::Database
+            | ShellView::PullRequests
+            | ShellView::Unified => {
                 return SharedString::default();
             }
         };
@@ -957,7 +1173,27 @@ impl Shell {
                             &OpenAgentChat,
                             None,
                             cx,
-                        )),
+                        ))
+                        .when(report_problem::is_available(cx), |bar| {
+                            bar.child(
+                                Button::new("title-report-problem")
+                                    .icon(gpui_component::Icon::new(
+                                        gpui_kit_assets::IconName::Flag,
+                                    ))
+                                    .label("Report a problem")
+                                    .ghost()
+                                    .compact()
+                                    .on_click(|_, window, cx| {
+                                        window.dispatch_action(Box::new(ReportProblem), cx);
+                                    }),
+                            )
+                            .children(render_shortcut_pill_in_context(
+                                window,
+                                &ReportProblem,
+                                None,
+                                cx,
+                            ))
+                        }),
                 )
                 .when(always_on_top::is_supported(), |bar| {
                     bar.child(
@@ -1013,6 +1249,8 @@ impl Render for Shell {
                 let node = this.task_list.read(cx).selected_node_id();
                 open_code_ref(this.fleet.clone(), node, &action.target, window, cx);
             }))
+            .on_action(cx.listener(Self::on_report_problem))
+            .on_action(cx.listener(Self::on_open_report_dialog))
             .on_action(cx.listener(|this, action: &OpenConversation, window, cx| {
                 this.open_conversation_with(
                     action.focus,
@@ -1027,6 +1265,12 @@ impl Render for Shell {
             }))
             .on_action(cx.listener(|this, _: &ShellGoDatabase, window, cx| {
                 this.select_view(ShellView::Database, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ShellGoPullRequests, window, cx| {
+                this.select_view(ShellView::PullRequests, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ShellGoWorkbench, window, cx| {
+                this.select_view(ShellView::Unified, window, cx);
             }))
             .on_action(cx.listener(|this, _: &ShellOpenAgentTranscripts, _, cx| {
                 this.open_transcript_window(cx);
@@ -1093,6 +1337,8 @@ impl Shell {
             ShellView::Conversation => self.conversation.clone().into_any_element(),
             ShellView::Settings => self.settings.clone().into_any_element(),
             ShellView::Database => self.database.clone().into_any_element(),
+            ShellView::PullRequests => self.pull_requests.clone().into_any_element(),
+            ShellView::Unified => self.unified.clone().into_any_element(),
         }
     }
 
@@ -1306,6 +1552,181 @@ pub(crate) fn fallback_focus(selected_node: Option<Uuid>) -> Focus {
     selected_node.map_or(Focus::Project, Focus::Node)
 }
 
+/// The journey a conversation focus reports against: the node it's about,
+/// or the project journey when there is none.
+pub(crate) fn journey_key_for_focus(focus: Focus) -> JourneyKey {
+    match focus {
+        Focus::Project => JourneyKey::Project,
+        Focus::Node(id) => JourneyKey::Node(id),
+        Focus::Obligation { node, .. } => JourneyKey::Node(node),
+        Focus::PlanStep { node, .. } => JourneyKey::Node(node),
+    }
+}
+
+/// Finishes a report-a-problem submission (implementation plan Step 6c): the
+/// app journey ring buffer is snapshotted synchronously (cheap, in-memory)
+/// before this runs; screenshot capture and the journey write happen on a
+/// background thread since the screenshot can be slow (Win32 GDI) and must
+/// never block the UI. Toasts once the report is queued, and again once the
+/// submission worker has tried to send it; anything that goes wrong along
+/// the way is an error toast saying what.
+fn submit_report(
+    key: JourneyKey,
+    note: String,
+    fleet: Arc<FleetStore>,
+    paths: TodPaths,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let app_journey: Vec<tod_journey::Record> = crate::ui::journey::hub(cx)
+        .read(cx)
+        .snapshot()
+        .into_iter()
+        .map(|entry| entry.record)
+        .collect();
+    let window_handle = window.window_handle();
+
+    // How the worker's first attempt to send went, or `None` if it did not
+    // happen within `REPORT_SEND_WAIT`.
+    let (outcome_tx, outcome_rx) = async_channel::unbounded::<Option<Result<(), String>>>();
+    cx.spawn(async move |cx| {
+        let (app_journey, note) = (app_journey, note);
+        let timeout_tx = outcome_tx.clone();
+        let queued = cx
+            .background_spawn(async move {
+                let screenshot = crate::ui::screenshot::capture_app_screenshot()
+                    .and_then(|img| {
+                        crate::ui::screenshot::encode_png(&img)
+                            .inspect_err(|err| {
+                                tracing::warn!("report: encoding the screenshot failed: {err}")
+                            })
+                            .ok()
+                    })
+                    .map(|bytes| tod_journey::Blob {
+                        mime: "image/png".into(),
+                        bytes,
+                    });
+                let event = tod_journey::Event::Report {
+                    note,
+                    app_journey,
+                    screenshot,
+                };
+                let seq =
+                    tod_core::journey::record_and_get_seq(key, tod_journey::Actor::User, event);
+                queue_report(seq, key, &fleet, &paths, outcome_tx)
+            })
+            .await;
+
+        let listening = match queued {
+            Ok(listening) => listening,
+            Err(message) => {
+                tracing::warn!("report: {message}");
+                let _ = cx.update_window(window_handle, move |_view, window, cx| {
+                    error_toast(window, cx, message);
+                });
+                return;
+            }
+        };
+        if !listening {
+            // No submission worker to hear back from (it starts with the
+            // store, so only when that failed to open).
+            let _ = cx.update_window(window_handle, |_view, window, cx| {
+                info_toast(window, cx, "Report recorded and queued to send");
+            });
+            return;
+        }
+        let _ = cx.update_window(window_handle, |_view, window, cx| {
+            info_toast(window, cx, "Report recorded, sending…");
+        });
+        cx.background_spawn({
+            let timer = cx.background_executor().timer(REPORT_SEND_WAIT);
+            async move {
+                timer.await;
+                let _ = timeout_tx.try_send(None);
+            }
+        })
+        .detach();
+        let outcome = outcome_rx.recv().await.ok().flatten();
+        let _ = cx.update_window(window_handle, move |_view, window, cx| match outcome {
+            Some(Ok(())) => info_toast(window, cx, "Report sent"),
+            Some(Err(err)) => error_toast(
+                window,
+                cx,
+                format!(
+                    "The report could not be sent: {err}. It stays queued, and tod keeps \
+                     trying while it is running."
+                ),
+            ),
+            None => warning_toast(
+                window,
+                cx,
+                "The report has not been sent yet. It stays queued, and tod keeps trying \
+                 while it is running.",
+            ),
+        });
+    })
+    .detach();
+}
+
+/// How long [`submit_report`] waits to hear how the first send went.
+const REPORT_SEND_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Queues a just-recorded report for the submission worker (spec §9.6), and
+/// has the worker send how its first attempt went on `outcome`. Runs on a
+/// background thread.
+///
+/// `Ok(false)` when no worker is running to hear back from; `Err` says why
+/// the report could not be queued at all.
+fn queue_report(
+    seq: Option<u64>,
+    key: JourneyKey,
+    fleet: &FleetStore,
+    paths: &TodPaths,
+    outcome: async_channel::Sender<Option<Result<(), String>>>,
+) -> Result<bool, String> {
+    let seq = seq.ok_or(
+        "The report could not be recorded: the journey writer is not running or could not \
+         open the journey file (see the log)",
+    )?;
+    let settings = TodSettings::load(paths)
+        .map_err(|err| format!("The report was recorded but not sent: reading settings: {err:#}"))?;
+    if !settings.journeys.can_submit() {
+        return Err("The report was recorded but not sent: sending journeys is not set up in \
+                    Settings"
+            .to_string());
+    }
+
+    // The queue entry gets its own bundle id now (the worker builds the
+    // bundle itself later) so the journey's `Submission` event can point at
+    // it. Listen for the worker before queuing, so its attempt can't be
+    // missed.
+    let bundle_id = Uuid::new_v4();
+    let listening = tod_core::journey::on_next_send_attempt(
+        bundle_id,
+        Box::new(move |result| {
+            let _ = outcome.try_send(Some(result));
+        }),
+    );
+    let node_id = match key {
+        JourneyKey::Project => None,
+        JourneyKey::Node(id) => Some(id),
+    };
+    let entry = fleet
+        .queue_journey_submission(bundle_id, node_id, seq as i64, "report")
+        .map_err(|err| {
+            format!("The report was recorded but could not be queued to send: {err:#}")
+        })?;
+    tod_core::journey::record(
+        key,
+        tod_journey::Actor::App,
+        tod_journey::Event::Submission {
+            bundle: entry.bundle_id,
+            status: "queued".to_string(),
+        },
+    );
+    Ok(listening)
+}
+
 #[cfg(feature = "agent-socket")]
 fn platform_label(platform: AgentPlatform) -> &'static str {
     match platform {
@@ -1507,6 +1928,8 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                 let _ = format_tx.send_blocking(notice);
                             });
                         });
+                        tod_core::cloud_sync::sync_on_start(fleet.clone());
+                        tod_core::cloud_notify::start(fleet.clone());
                         // Only the one long-lived GUI process should run this listener, so it
                         // starts here rather than inside `FleetStore::open` (which `tod-cli`
                         // also calls, as a one-shot process, when no GUI instance is running).
@@ -1525,6 +1948,16 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                 fleet.paths().root().to_path_buf(),
                             );
                         }
+                        // The journey recorder and change-feed thread start with the
+                        // store (never for a data root that failed to open above),
+                        // and stop with the app: no explicit shutdown, matching the
+                        // other background threads started here.
+                        tod_core::journey::start(
+                            fleet.paths().root().join("journeys"),
+                            fleet.clone(),
+                            app_settings.journeys.clone(),
+                        );
+                        report_problem::set_available_from(&app_settings.journeys, cx);
                         transcript_window.bind(fleet.clone(), traffic_log.clone());
                         history_window.bind(fleet.clone());
                         let app_settings = TodSettings::load(&paths).unwrap_or_default();
@@ -1576,6 +2009,7 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                             SessionsView::new(window, cx, agent_for_sessions, fleet.clone())
                         });
                         let agent_for_conversation = agent.clone();
+                        let agent_runs = cx.new(|_| AgentRuns::new(fleet.clone(), agent.clone()));
                         let conversation = cx.new(|cx| {
                             ConversationView::new(
                                 window,
@@ -1583,6 +2017,7 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                 agent_for_conversation,
                                 fleet.clone(),
                                 lifecycle.clone(),
+                                agent_runs.clone(),
                             )
                         });
                         conversation.update(cx, |conversation, cx| {
@@ -1590,12 +2025,23 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                         });
                         let settings = cx.new(|cx| SettingsView::new(window, cx));
                         let database = cx.new(|cx| DatabaseView::new(window, cx, fleet.clone()));
+                        let pull_requests = cx.new(|cx| {
+                            PullRequestsView::new(cx, fleet.clone(), paths.data_root().to_path_buf())
+                        });
+                        let unified = cx.new(|cx| {
+                            UnifiedView::new(
+                                window,
+                                cx,
+                                fleet.clone(),
+                                paths.clone(),
+                                agent.clone(),
+                                agent_runs.clone(),
+                                lifecycle.clone(),
+                            )
+                        });
                         let view = cx.new(|cx| {
                             let _task_list_subscription =
-                                cx.subscribe_in(
-                                    &task_list,
-                                    window,
-                                    |this: &mut Shell, _, event, window, cx| {
+                                cx.subscribe(&task_list, |this: &mut Shell, _, event, cx| {
                                     match event {
                                         TaskListEvent::FocusDrawer => {
                                             this.queue_drawer(DrawerRequest::Focus, cx);
@@ -1620,7 +2066,8 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                                 cx,
                                             );
                                         }
-                                        TaskListEvent::OpenTaskEdit { task_id } => {
+                                        TaskListEvent::OpenTaskEdit { task_id }
+                                        | TaskListEvent::OpenTaskEditCtrl { task_id } => {
                                             this.queue_drawer(
                                                 DrawerRequest::OpenTaskEdit {
                                                     task_id: task_id.clone(),
@@ -1687,13 +2134,23 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                             this.handle_open_code_editor(
                                                 task_id.clone(),
                                                 editor_id.clone(),
-                                                window,
+                                                cx,
+                                            );
+                                        }
+                                        // The unified view opens its task panel; the Tasks view has none.
+                                        TaskListEvent::OpenTaskPanel { .. } => {}
+                                        // The unified view's settings panel hosts the
+                                        // same `TaskEditView` this drawer already does.
+                                        TaskListEvent::OpenSettings { task_id } => {
+                                            this.queue_drawer(
+                                                DrawerRequest::OpenTaskEdit {
+                                                    task_id: task_id.clone(),
+                                                },
                                                 cx,
                                             );
                                         }
                                     }
-                                    },
-                                );
+                                });
                             let _task_edit_subscription =
                                 cx.subscribe(&task_edit, |this: &mut Shell, _, event, cx| {
                                     match event {
@@ -1748,6 +2205,12 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                         } => {
                                             this.queue_open_conversation(
                                                 obligation_focus(*node_id, *obligation_id),
+                                                cx,
+                                            );
+                                        }
+                                        ObligationsEvent::ReportProblem { node_id } => {
+                                            this.queue_open_report_dialog(
+                                                JourneyKey::Node(*node_id),
                                                 cx,
                                             );
                                         }
@@ -1911,7 +2374,7 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                 format_status_bar(&AgentStatusGroups::default()).into();
                             let tasks_split_state = cx.new(|_| PanelSplitState::centered());
                             let shell = Shell {
-                                active_view: ShellView::Tasks,
+                                active_view: ShellView::Unified,
                                 task_list,
                                 drawer: RightDrawer {
                                     task_edit,
@@ -1923,9 +2386,11 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                 },
                                 sessions,
                                 conversation,
-                                view_before_conversation: ShellView::Tasks,
+                                view_before_conversation: ShellView::Unified,
                                 settings,
                                 database,
+                                pull_requests,
+                                unified,
                                 fleet: fleet.clone(),
                                 _mutation_socket: mutation_socket,
                                 agent: agent.clone(),
@@ -1939,6 +2404,7 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                 pending_open_interview: None,
                                 pending_open_interview_for_task: None,
                                 pending_open_conversation: None,
+                                pending_report_dialog: None,
                                 pending_on_entry: None,
                                 pending_go_to_tasks: None,
                                 pending_gate_check: None,
@@ -2040,6 +2506,14 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                 false
                             }
                         });
+                        // The app opens on the workbench with keys on the
+                        // node tree, whatever took focus while the views
+                        // were being built.
+                        view.update(cx, |shell, cx| {
+                            shell
+                                .unified
+                                .update(cx, |unified, cx| unified.focus_tree(window, cx));
+                        });
                         cx.new(|cx| Root::new(view, window, cx))
                     }
                 }
@@ -2059,21 +2533,29 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
 
     #[cfg(feature = "agent-socket")]
     if let Some((listener, addr)) = socket_listener {
-        let shell_weak = shell_for_socket
-            .lock()
-            .ok()
-            .and_then(|slot| slot.clone())
-            .expect("shell weak entity for agent socket");
-        agent_socket::start(
-            cx,
-            handle.into(),
-            listener,
-            addr,
-            width,
-            height,
-            transcript_for_socket,
-            shell_weak,
-        );
+        // `open_window` builds the root view synchronously, so the slot is
+        // set by now unless the window is not a `Shell` (`FleetBlockedView`).
+        let shell_weak = shell_for_socket.lock().ok().and_then(|slot| slot.clone());
+        match shell_weak {
+            Some(shell_weak) => {
+                agent_socket::start(
+                    cx,
+                    handle.into(),
+                    listener,
+                    addr,
+                    width,
+                    height,
+                    transcript_for_socket,
+                    shell_weak,
+                );
+            }
+            // No shell to drive: skip the socket instead of crashing the app.
+            None => {
+                tracing::error!(
+                    "agent socket: no shell entity became available; control socket not started"
+                );
+            }
+        }
     }
 
     Ok(())

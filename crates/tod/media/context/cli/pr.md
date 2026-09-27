@@ -4,6 +4,7 @@ Opening and driving a node's pull request. The app reads the PR reference and
 status you record, not your reply.
 
 ```
+tod-cli --data-root <DATA_ROOT> pr list                              [--node <NODE_UUID>] [--all-open]
 tod-cli --data-root <DATA_ROOT> pr open                              [--node <NODE_UUID>] --owner <OWNER> --repo <REPO> --head <BRANCH> --base <BRANCH> --title <TEXT> [--body <TEXT>]
 tod-cli --data-root <DATA_ROOT> pr status                            [--node <NODE_UUID>]
 tod-cli --data-root <DATA_ROOT> pr comment reply <COMMENT_ID> <TEXT> [--node <NODE_UUID>]
@@ -12,7 +13,13 @@ tod-cli --data-root <DATA_ROOT> pr merged                            [--note <TE
 tod-cli --data-root <DATA_ROOT> pr blocked                           --why <TEXT>
 ```
 
-Inside a `pr` conversation `--node` defaults to the node under work. `open`
+Inside a `pr` conversation `--node` defaults to the node under work. `list`
+shows every pull request, in any state, from the node's branch in each
+repository its work spans — the one its Files capability names and each
+submodule in it — grouped by repository; `--all-open` lists every open pull
+request in those repositories instead, whichever branch it is from. `--json`
+gives the same as data.
+`open`
 creates the pull request on GitHub and records it on the node — it only works
 once per node; run `status` first if you are not sure one already exists.
 `status` fetches the PR's live mergeable flag, combined check status, and

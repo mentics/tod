@@ -2,27 +2,17 @@
 //! in it at a line.
 //!
 //! Each editor is a [`CodeEditor`] plugin; the Action panel lists every
-//! editor from [`code_editors`]. Code inside a dev container opens over SSH
-//! (see [`ssh`]).
+//! editor from [`code_editors`].
 
 pub mod location;
-pub mod ssh;
 pub mod zed;
 
 pub use location::{CodeLocation, find_code_refs};
-pub use ssh::SshIncludeNeeded;
 
 use crate::fleet::terminal::path_util::normalize_launch_path;
 use crate::fleet::{FleetStore, resolve_launch_cwd};
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
-
-/// A host `ssh` reaches by its alias in tod's ssh config.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RemoteHost {
-    pub alias: String,
-    pub user: String,
-}
 
 /// An external code editor tod can open a directory in.
 pub trait CodeEditor: Send + Sync {
@@ -34,23 +24,9 @@ pub trait CodeEditor: Send + Sync {
     fn is_available(&self) -> bool;
     /// Open (or focus) `dir` in the editor without waiting for it.
     fn open(&self, dir: &Path) -> Result<()>;
-    /// Open `file` at `location`'s line and column, in the workspace for
-    /// `root` when there is one, without waiting for it.
-    fn open_location(
-        &self,
-        root: Option<&Path>,
-        file: &Path,
-        location: &CodeLocation,
-    ) -> Result<()>;
-    /// Open `dir` on `host`, and `file` at its location in it when given.
-    /// Paths are absolute on the host. May wait for the editor to connect:
-    /// call it off the UI thread.
-    fn open_remote(
-        &self,
-        host: &RemoteHost,
-        dir: &str,
-        file: Option<(&str, &CodeLocation)>,
-    ) -> Result<()>;
+    /// Open `file` on this machine at `location`'s line and column, in the
+    /// workspace for `root` when there is one, without waiting for it.
+    fn open_location(&self, root: Option<&Path>, file: &Path, location: &CodeLocation) -> Result<()>;
 }
 
 /// Every supported code editor, in display order.
@@ -66,59 +42,97 @@ pub fn code_editor(id: &str) -> Option<&'static dyn CodeEditor> {
         .find(|editor| editor.id() == id)
 }
 
-/// Open the node's resolved Files directory in `editor`. Returns where it
-/// opened, for the user.
-///
-/// Reads the store, and talks to Docker for a directory inside a dev
-/// container: call it off the UI thread.
+/// Open the node's resolved Files directory in `editor`.
 pub fn open_code_editor_for_node(
     fleet: &FleetStore,
     editor: &dyn CodeEditor,
     node_id: &str,
-) -> Result<String> {
-    match resolve_launch_cwd(fleet, node_id)? {
-        crate::fleet::Workdir::Host(cwd) => {
-            editor
-                .open(&cwd)
-                .with_context(|| format!("open {} in {}", cwd.display(), editor.label()))?;
-            Ok(normalize_launch_path(&cwd).display().to_string())
-        }
+) -> Result<PathBuf> {
+    let cwd = match resolve_launch_cwd(fleet, node_id)? {
+        crate::fleet::Workdir::Host(cwd) => cwd,
         crate::fleet::Workdir::Container { container, path } => {
-            let host = connect(fleet, &container)?;
-            editor
-                .open_remote(&host, &path, None)
-                .with_context(|| format!("open {path} in {}", editor.label()))?;
-            Ok(format!("{path} in dev container {container}"))
+            // Mounted repositories resolve to `Host` above and open on this
+            // machine; this is a repository that lives in the container.
+            if editor.id() != zed::ZedEditor.id() {
+                anyhow::bail!("{path} is in dev container {container}; only Zed opens a dev container");
+            }
+            zed::open_in_container(fleet.paths().root(), &container, &path, None)
+                .with_context(|| format!("open {path} in dev container {container} in Zed"))?;
+            return Ok(PathBuf::from(path));
+        }
+        crate::fleet::Workdir::Sandbox { sandbox, path } => {
+            if editor.id() != zed::ZedEditor.id() {
+                anyhow::bail!("{path} is in sandbox {sandbox}; only Zed opens a sandbox");
+            }
+            let url = zed::sandbox_url(&sandbox, &path);
+            zed::spawn_zed_url(&url, fleet.paths().root())
+                .with_context(|| format!("open {url} in Zed"))?;
+            return Ok(PathBuf::from(path));
+        }
+    };
+    editor
+        .open(&cwd)
+        .with_context(|| format!("open {} in {}", cwd.display(), editor.label()))?;
+    Ok(normalize_launch_path(&cwd))
+}
+
+/// Open one file, `rel` (relative to `dir`, a node's Files directory), in
+/// the first available code editor. A file in a sandbox or a dev container
+/// opens in Zed over it.
+pub fn open_file_in_code_editor(
+    fleet: &FleetStore,
+    dir: &crate::fleet::Workdir,
+    rel: &str,
+) -> Result<()> {
+    let editor = code_editors()
+        .iter()
+        .copied()
+        .find(|editor| editor.is_available())
+        .context("no code editor found on this machine")?;
+    match dir.join(rel) {
+        crate::fleet::Workdir::Host(path) => editor
+            .open(&path)
+            .with_context(|| format!("open {} in {}", path.display(), editor.label())),
+        crate::fleet::Workdir::Container { container, path } => {
+            if editor.id() != zed::ZedEditor.id() {
+                anyhow::bail!("{path} is in dev container {container}; only Zed opens a dev container");
+            }
+            // The Files directory first, so the file lands in that window.
+            let folder = match dir {
+                crate::fleet::Workdir::Container { path: folder, .. } => folder.as_str(),
+                _ => path.as_str(),
+            };
+            zed::open_in_container(fleet.paths().root(), &container, folder, Some((&path, None)))
+                .with_context(|| format!("open {path} in dev container {container} in Zed"))
+        }
+        crate::fleet::Workdir::Sandbox { sandbox, path } => {
+            if editor.id() != zed::ZedEditor.id() {
+                anyhow::bail!("{path} is in sandbox {sandbox}; only Zed opens a sandbox");
+            }
+            let url = zed::sandbox_url(&sandbox, &path);
+            zed::spawn_zed_url(&url, fleet.paths().root())
+                .with_context(|| format!("open {url} in Zed"))
         }
     }
 }
 
-/// Ready `container` for the editor's `ssh`. Fails with
-/// [`SshIncludeNeeded`] until the user's ssh config includes tod's.
-fn connect(fleet: &FleetStore, container: &str) -> Result<RemoteHost> {
-    let data_root = fleet.paths().root();
-    ssh::require_include(data_root)?;
-    ssh::connect_container(data_root, container)
-}
-
 /// Open `location` in `editor`. A relative path is resolved against the
 /// Files directory of `node_id`, which is also the workspace the file opens
-/// in; an absolute one opens as it is. Returns the file opened.
+/// in; an absolute one opens as it is. A Files directory in a dev container
+/// or a sandbox opens there, in Zed. Returns the file opened.
 ///
-/// Reads the store and checks the file on disk, or in the dev container:
-/// call it off the UI thread.
+/// Reads the store and checks the file (in a container or sandbox, through
+/// it): call it off the UI thread.
 pub fn open_code_location(
     fleet: &FleetStore,
     editor: &dyn CodeEditor,
     node_id: Option<&str>,
     location: &CodeLocation,
-) -> Result<PathBuf> {
+) -> Result<String> {
     let root = match node_id {
         Some(node_id) => match resolve_launch_cwd(fleet, node_id) {
             Ok(crate::fleet::Workdir::Host(root)) => Some(normalize_launch_path(&root)),
-            Ok(crate::fleet::Workdir::Container { container, path }) => {
-                return open_in_container(fleet, editor, &container, &path, location);
-            }
+            Ok(remote) => return open_remote_location(fleet, editor, &remote, location),
             Err(err) => {
                 if Path::new(&location.path).is_absolute() {
                     None
@@ -135,46 +149,52 @@ pub fn open_code_location(
     editor
         .open_location(root.as_deref(), &file, location)
         .with_context(|| format!("open {} in {}", file.display(), editor.label()))?;
-    Ok(file)
+    Ok(file.display().to_string())
 }
 
-/// Open `location` in the Files directory `root` inside `container`.
-fn open_in_container(
+/// Open `location` in `root`, a Files directory in a dev container or a
+/// sandbox, where only Zed can open it.
+fn open_remote_location(
     fleet: &FleetStore,
     editor: &dyn CodeEditor,
-    container: &str,
-    root: &str,
+    root: &crate::fleet::Workdir,
     location: &CodeLocation,
-) -> Result<PathBuf> {
-    let root = root.trim_end_matches('/');
-    let file = container_file(root, &location.path);
-    let exec = tod_agent::devcontainer::ContainerExec::connect(container)?;
-    if !exec.output("/", "test", &["-f", &file])?.status.success() {
-        anyhow::bail!(
-            "{} is not a file in {root} (dev container {container})",
-            location.path
-        );
+) -> Result<String> {
+    let file = remote_file(root, &location.path);
+    let file_path = file.path_text();
+    if editor.id() != zed::ZedEditor.id() {
+        anyhow::bail!("{file_path} is in {root}; only Zed opens code there");
     }
-    let host = connect(fleet, container)?;
-    editor
-        .open_remote(&host, root, Some((&file, location)))
-        .with_context(|| format!("open {file} in {}", editor.label()))?;
-    Ok(PathBuf::from(file))
+    let found = root
+        .output("test", &["-f", &file_path])
+        .with_context(|| format!("look for {file_path} in {root}"))?;
+    if !found.status.success() {
+        anyhow::bail!("{} is not a file in {root}", location.path);
+    }
+    let position = location.line.map(|line| (line, location.column));
+    match root {
+        crate::fleet::Workdir::Container { container, path } => {
+            zed::open_in_container(fleet.paths().root(), container, path, Some((&file_path, position)))
+                .with_context(|| format!("open {file_path} in dev container {container} in Zed"))?
+        }
+        crate::fleet::Workdir::Sandbox { sandbox, .. } => {
+            let url = location.with_position(&zed::sandbox_url(sandbox, &file_path));
+            zed::spawn_zed_url(&url, fleet.paths().root()).with_context(|| format!("open {url} in Zed"))?
+        }
+        crate::fleet::Workdir::Host(_) => unreachable!("a host directory opens on this machine"),
+    }
+    Ok(file_path)
 }
 
-/// The container path `path` names: as it is when absolute, else under
-/// `root`, with `./` segments dropped.
-fn container_file(root: &str, path: &str) -> String {
+/// The file `path` names in `root` (a container or sandbox directory): as
+/// it is when absolute, else under `root`.
+fn remote_file(root: &crate::fleet::Workdir, path: &str) -> crate::fleet::Workdir {
+    let path = path.replace('\\', "/");
     if path.starts_with('/') {
-        return path.to_string();
+        root.at(&path)
+    } else {
+        root.join(path.trim_start_matches("./"))
     }
-    let rel = path
-        .replace('\\', "/")
-        .split('/')
-        .filter(|part| !part.is_empty() && *part != ".")
-        .collect::<Vec<_>>()
-        .join("/");
-    format!("{root}/{rel}")
 }
 
 /// The file `path` names: as it is when absolute, else under `root`. It must
@@ -235,10 +255,13 @@ mod tests {
     }
 
     #[test]
-    fn container_files_resolve_under_the_root() {
-        assert_eq!(container_file("/w/p", "src/a.rs"), "/w/p/src/a.rs");
-        assert_eq!(container_file("/w/p", "./src\\a.rs"), "/w/p/src/a.rs");
-        assert_eq!(container_file("/w/p", "/etc/hosts"), "/etc/hosts");
+    fn remote_files_resolve_under_the_root() {
+        let root = crate::fleet::Workdir::container("c1", "/workspaces/demo");
+        assert_eq!(remote_file(&root, "src/main.rs").path_text(), "/workspaces/demo/src/main.rs");
+        assert_eq!(remote_file(&root, "./src\\main.rs").path_text(), "/workspaces/demo/src/main.rs");
+        assert_eq!(remote_file(&root, "/etc/hosts").path_text(), "/etc/hosts");
+        let sandbox = crate::fleet::Workdir::sandbox("s1", "/root/app");
+        assert_eq!(remote_file(&sandbox, "a.rs").path_text(), "/root/app/a.rs");
     }
 
     #[test]

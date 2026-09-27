@@ -1,0 +1,20 @@
+[package]
+name = "tod-sandbox-cli"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# The user's tool for cloud sandboxes: set up the account, create and provision
+# sandboxes, open shells and Zed on them. Never shelled out to by agents, and it
+# holds the one credential agents must not have.
+[[bin]]
+name = "tod-sandbox"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+rpassword = "7"
+serde_json = "1.0"
+tod-sandbox = { path = "../tod-sandbox" }
+tod-store = { path = "../tod-store" }
+tokio = { version = "1", features = ["rt", "macros"] }

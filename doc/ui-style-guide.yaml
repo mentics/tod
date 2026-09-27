@@ -133,7 +133,15 @@ styles:
   # Panels
   panel:
     background: surface
+  # Every header (a panel's, a workbench column's, the chat drawer's) sits
+  # on a faint gray band, so it reads as a header even when its region does
+  # not have focus. One that tracks focus takes the column-focused state
+  # instead while its region has focus; only one header in a window does.
+  header:
+    background: header-fill
+    focused: column-focused
   panel-header:
+    extends: header
     padding-x: inset
     padding-y: related
     gap: related
@@ -154,6 +162,18 @@ styles:
     border-top: divider
   pane:
     min-width: pane-min
+  # The strip atop each panel column of a multi-column view (the workbench).
+  # The focused column's is tinted, so which column the keys go to shows at a
+  # glance without competing with a highlighted row. The node tree column has
+  # no column-header: its own toolbar is its header, and takes the same
+  # column-focused state.
+  column-header:
+    extends: header
+    height: control
+    padding-x: related
+    gap: inline
+    border-bottom: divider
+    focused: column-focused
   pane-divider:
     background: divider
     dragging: dragging
@@ -333,12 +353,32 @@ styles:
     extends: callout-stale
     font: title
     text-case: sentence
+  callout-warning:
+    color: callout-warning-text
+    background: callout-warning-fill
+    border: callout-warning-edge
+    radius: control
+    padding-x: inset
+    padding-y: related
+    gap: related
+  callout-warning-title:
+    extends: callout-warning
+    font: title
+    text-case: sentence
     text-end: no-period
   node-title-pending-changes:
     # A tree row whose node has incoming changes it has not been checked
     # against: rare, so it must stand out from every other row.
     extends: text-title
     color: incoming-text
+  node-title-linked-copy:
+    # A tree row copied out of a generator that still receives its source
+    # item's updates.
+    color: linked-copy-text
+  node-title-has-copies:
+    # A generator-managed row with a linked copy elsewhere: the copy's
+    # amber, faded as far as text-muted is from text.
+    color: linked-source-text
   scrim:
     background: scrim
 
@@ -360,6 +400,10 @@ states:
     border: highlight-edge
   dragging:
     background: drag-edge
+  # The top edge is drawn over the header, so it takes no layout space.
+  column-focused:
+    background: highlight-faint
+    border-top: highlight-edge
   disabled:
     color: text-muted
   toggle-on:
@@ -405,6 +449,7 @@ properties:
   highlighted: state
   disabled: state
   selected: state
+  focused: state
   font-weight: "regular | semibold"
   dragging: state
 
@@ -432,7 +477,12 @@ tokens:
     stale-fill: "#f9731626"
     stale-edge: "#f97316"
     stale-text: "#fdba74"
+    callout-warning-fill: "#7f1d1d33"
+    callout-warning-edge: "#ef4444"
+    callout-warning-text: "#fca5a5"
     incoming-text: "#facc15"
+    linked-copy-text: "#f59e0b"
+    linked-source-text: "#a06707"
     notice-fill: "#ffff00"
     notice-text: "#000000"
     badge-fill: "#262626"
@@ -447,7 +497,11 @@ tokens:
     # A group heading's rule, and the band behind an outermost heading.
     divider-strong: "#a3a3a380"
     group-band: "#26262680"
+    # The band behind every header: gray about as faint as highlight-faint.
+    header-fill: "#ffffff20"
     highlight-edge: "#1d4ed8"
+    # highlight-edge at 25%: tints the header of the column that has focus.
+    highlight-faint: "#1d4ed840"
     toggle-on-fill: "#1d4ed8"
     toggle-on-edge: "#93c5fd"
     accent: "#1d4ed88c"

@@ -6,7 +6,7 @@
 //! on the container's `PATH`, with the container's own configuration.
 
 use crate::fleet::treehouse::{TREEHOUSE_NO_UPDATE_CHECK_ENV, TreehouseInvocation};
-use crate::fleet::workdir::{Workdir, strip_verbatim};
+use crate::fleet::workdir::{CONTAINER_GIT_CONFIG_ENV, Workdir, strip_verbatim};
 use crate::paths::TodPaths;
 use crate::settings::{TodSettings, WorktreeBackend};
 use anyhow::{Context, Result, bail};
@@ -82,7 +82,7 @@ pub const CONTAINER_WORKTREES_DIR: &str = ".worktrees";
 pub fn worktree_dest_for(data_root: &Path, repo: &Workdir, branch: &str) -> Result<Workdir> {
     match repo {
         Workdir::Host(path) => Ok(Workdir::Host(worktree_dest(data_root, path, branch)?)),
-        Workdir::Container { .. } => Ok(repo
+        Workdir::Container { .. } | Workdir::Sandbox { .. } => Ok(repo
             .join(CONTAINER_WORKTREES_DIR)
             .join(&branch_slug(branch))),
     }
@@ -228,11 +228,24 @@ fn switch_to_branch(repo: &Workdir, branch: &str) -> Result<bool> {
 /// Initialized submodules of `repo`, recursively, parents before children.
 /// Empty for a repository without submodules.
 pub fn submodule_dirs(repo: &Workdir) -> Result<Vec<Workdir>> {
+    Ok(submodule_paths(repo)?
+        .iter()
+        .map(|rel| repo.join(rel))
+        .collect())
+}
+
+/// [`submodule_dirs`], as paths relative to `repo` (`lib/a`, `lib/a/b`).
+pub fn submodule_paths(repo: &Workdir) -> Result<Vec<String>> {
+    // `git submodule status --recursive` takes most of a second even with
+    // nothing to report, and every run start and commit asks.
+    if !has_gitmodules(repo) {
+        return Ok(Vec::new());
+    }
     let output = run_git(repo, &["submodule", "status", "--recursive"])?;
     Ok(output
         .lines()
-        .filter_map(|line| parse_submodule_status(line))
-        .map(|rel| repo.join(rel))
+        .filter_map(parse_submodule_status)
+        .map(str::to_string)
         .collect())
 }
 
@@ -422,7 +435,7 @@ fn git_path_arg(dir: &Workdir) -> Result<String> {
             .to_str()
             .context("worktree path utf8")?
             .to_string(),
-        Workdir::Container { path, .. } => path.clone(),
+        Workdir::Container { path, .. } | Workdir::Sandbox { path, .. } => path.clone(),
     })
 }
 
@@ -446,7 +459,7 @@ fn git_worktree_add(repo: &Workdir, dest: &Workdir, branch: &str) -> Result<Work
             .create_dir_all()
             .with_context(|| format!("create worktree parent {parent}"))?;
     }
-    if matches!(repo, Workdir::Container { .. }) {
+    if repo.is_remote() {
         exclude_container_worktrees(repo)?;
     }
     let dest_str = git_path_arg(dest)?;
@@ -497,40 +510,51 @@ struct TreehouseLeaseJson {
 }
 
 /// Whether Treehouse can serve `repo`: the configured executable here, or a
-/// `treehouse` in the repository's dev container.
+/// `treehouse` in the repository's dev container or sandbox.
 fn treehouse_available_for(repo: &Workdir, settings: &TodSettings) -> bool {
     match repo {
         Workdir::Host(_) => treehouse_available(settings),
-        Workdir::Container { container, .. } => {
-            matches!(container_treehouse(container), Ok(Some(_)))
+        Workdir::Container { .. } | Workdir::Sandbox { .. } => {
+            matches!(remote_treehouse(repo), Ok(Some(_)))
         }
     }
 }
 
-/// The `treehouse` in `container`: the one on its `PATH`, which sets up its
-/// own environment there. Tod's settings for Treehouse name paths on this
-/// machine, so none of them apply.
-fn container_treehouse(container: &str) -> Result<Option<String>> {
-    tod_agent::devcontainer::ContainerExec::connect(container)?.find_program("treehouse")
+/// The `treehouse` where `dir` is (a container or sandbox): the one on its
+/// `PATH`, which sets up its own environment there. Tod's settings for
+/// Treehouse name paths on this machine, so none of them apply.
+fn remote_treehouse(dir: &Workdir) -> Result<Option<String>> {
+    dir.find_remote_program("treehouse")
 }
 
-/// Run Treehouse with `args` in `dir`, which is in a dev container.
+/// Run Treehouse with `args` in `dir`, which is in a dev container or sandbox.
 fn run_container_treehouse(dir: &Workdir, args: &[&str]) -> Result<std::process::Output> {
-    let container = dir.container_name().context("not a container directory")?;
-    let program = container_treehouse(container)?.with_context(|| {
-        format!("No `treehouse` on the PATH in dev container {container}: install it there")
+    if !dir.is_remote() {
+        bail!("not a container or sandbox directory: {dir}");
+    }
+    let program = remote_treehouse(dir)?.with_context(|| {
+        format!("No `treehouse` on the PATH where {dir} is: install it there")
     })?;
     let no_update_check = format!("{TREEHOUSE_NO_UPDATE_CHECK_ENV}=1");
-    let mut all = vec![no_update_check.as_str(), program.as_str()];
+    // Treehouse runs git itself (in submodules too), which needs the same
+    // ownership exception as tod's own git there.
+    let mut all = vec![
+        "-c",
+        CONTAINER_GIT_CONFIG_ENV,
+        "sh",
+        "env",
+        no_update_check.as_str(),
+        program.as_str(),
+    ];
     all.extend_from_slice(args);
-    dir.output("env", &all)
+    dir.output("sh", &all)
 }
 
 /// Whether `repo` declares submodules. Talks to Docker for a container.
 fn has_gitmodules(repo: &Workdir) -> bool {
     match repo {
         Workdir::Host(path) => path.join(".gitmodules").is_file(),
-        Workdir::Container { .. } => repo
+        Workdir::Container { .. } | Workdir::Sandbox { .. } => repo
             .output("test", &["-f", ".gitmodules"])
             .is_ok_and(|out| out.status.success()),
     }
@@ -563,7 +587,9 @@ fn treehouse_get_lease(
                 .output()
                 .context("spawn treehouse get --lease")?
         }
-        Workdir::Container { .. } => run_container_treehouse(repo, &args)?,
+        Workdir::Container { .. } | Workdir::Sandbox { .. } => {
+            run_container_treehouse(repo, &args)?
+        }
     };
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -764,7 +790,9 @@ fn comparable_path(path: &Workdir) -> String {
                 text.to_string()
             }
         }
-        Workdir::Container { path, .. } => path.trim_end_matches('/').to_string(),
+        Workdir::Container { path, .. } | Workdir::Sandbox { path, .. } => {
+            path.trim_end_matches('/').to_string()
+        }
     }
 }
 
@@ -787,7 +815,7 @@ pub fn treehouse_return(
                 .output()
                 .context("spawn treehouse return")?
         }
-        Workdir::Container { path, .. } => run_container_treehouse(
+        Workdir::Container { path, .. } | Workdir::Sandbox { path, .. } => run_container_treehouse(
             &worktree.at("/"),
             &["return", path, "--if-lease-id", lease_id],
         )?,
@@ -807,7 +835,7 @@ pub fn validate_git_repo(repo: &Workdir) -> Result<Workdir> {
             path.canonicalize()
                 .with_context(|| format!("repo path {}", path.display()))?,
         ),
-        Workdir::Container { .. } => repo.clone(),
+        Workdir::Container { .. } | Workdir::Sandbox { .. } => repo.clone(),
     };
     run_git(&checked, &["rev-parse", "--git-dir"])?;
     Ok(checked)
@@ -1119,6 +1147,30 @@ mod tests {
 
         let repo = Workdir::container(&container, &dir);
         assert_eq!(run_git(&repo, &["branch", "--show-current"]).unwrap(), "main");
+
+        // So does git a program run there starts itself (Treehouse), and git
+        // config the container already puts in the environment still applies.
+        let out = scratch
+            .output(
+                "env",
+                &[
+                    "GIT_CONFIG_COUNT=1",
+                    "GIT_CONFIG_KEY_0=tod.test",
+                    "GIT_CONFIG_VALUE_0=kept",
+                    "sh",
+                    "-c",
+                    CONTAINER_GIT_CONFIG_ENV,
+                    "sh",
+                    "sh",
+                    "-c",
+                    "git -C \"$1\" rev-parse --abbrev-ref HEAD && git config tod.test",
+                    "sh",
+                    &dir,
+                ],
+            )
+            .unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "main\nkept");
         as_root("rm -rf \"$1\"");
     }
 

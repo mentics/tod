@@ -1,5 +1,6 @@
 //! Fleet persistence — durable on-machine storage for tasks, agents, and related entities.
 
+pub mod changes;
 pub mod cli_relay;
 pub mod code_editor;
 pub mod command_log;
@@ -16,8 +17,10 @@ pub mod projection;
 pub mod provision;
 pub mod reattach;
 pub mod reconnect_identity;
+pub mod repositories;
 pub mod repos;
 pub mod runtime;
+pub mod sandbox;
 pub mod schema;
 pub mod store;
 pub mod terminal;
@@ -34,8 +37,8 @@ mod test_util;
 mod tests;
 
 pub use code_editor::{
-    CodeEditor, CodeLocation, RemoteHost, SshIncludeNeeded, code_editor, code_editors,
-    find_code_refs, open_code_editor_for_node, open_code_location,
+    CodeEditor, CodeLocation, code_editor, code_editors, find_code_refs, open_code_editor_for_node,
+    open_code_location,
 };
 pub use command_log::{CommandEntry, CommandLog};
 pub use launch::FleetLaunchError;
@@ -59,7 +62,8 @@ pub use runtime::{GuestLivenessCheck, NoopGuestLiveness};
 pub use store::FleetStore;
 pub use terminal::{
     default_terminal_hint, focus_shell_session, focus_terminal_agent_run, launch_shell_terminal,
-    open_shell_for_node, open_terminal_agent_for_node, prune_stale_shell_sessions,
+    open_shell_for_node, open_terminal_agent_for_node, open_terminal_command,
+    prune_stale_shell_sessions,
     prune_stale_terminal_agent_runs, read_shell_state, remove_shell_state, shells_dir,
     state_file_path, verify_shell_session,
 };

@@ -8,17 +8,34 @@
 /// and a `tod-cli` built from the same source report the same stamp.
 pub const CLI_BUILD_STAMP: &str = env!("TOD_CLI_BUILD_STAMP");
 
+/// The git commit this binary was built from (`git rev-parse HEAD`), or
+/// `"unknown"` when git or the repository is missing (e.g. an installed
+/// build from a tarball with no `.git`). See `build.rs`.
+pub const GIT_COMMIT: &str = env!("TOD_GIT_COMMIT");
+
+/// Whether the working tree had uncommitted changes at build time
+/// (`git status --porcelain`), as `"true"` / `"false"`, or `"unknown"` when
+/// git or the repository is missing. See `build.rs`.
+pub const GIT_DIRTY: &str = env!("TOD_GIT_DIRTY");
+
 pub mod agent_context;
+pub mod attention;
+pub mod autopilot;
+pub mod cloud_notify;
+pub mod cloud_sync;
 pub mod codebase_rules;
 pub mod context_recipes;
 pub mod conversation;
 pub mod dynamic;
 pub mod fuzzy;
 pub mod gate;
+pub mod impact;
 pub mod incoming;
 pub mod generator;
 pub mod install;
 pub mod interview;
+pub mod journey;
+pub mod lifecycle;
 pub mod lifecycle_next;
 pub mod lifecycle_validity;
 pub mod linear_import;
@@ -27,9 +44,14 @@ pub mod media;
 pub mod node_context;
 pub mod process;
 pub mod process_bundle;
+pub mod pull_requests;
 pub mod run_transcript;
+pub mod runner_status;
+pub mod scheduler;
 pub mod session_name;
+pub mod stop_questions;
 pub mod task;
+pub mod workbench_layout;
 
 pub use interview::{TodPaths, set_data_root};
 

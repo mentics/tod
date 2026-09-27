@@ -15,8 +15,11 @@ use crate::interview::views::{
     register_sessions_keyboard_bindings, register_settings_keyboard_bindings,
 };
 use crate::ui::agent_chat::register_agent_chat_keyboard_bindings;
+use crate::ui::journey::register_app_journey_keystrokes;
+use crate::ui::report_problem::register_report_problem_keyboard_bindings;
 use crate::ui::list::register_list_keyboard_bindings;
 use crate::views::action_panel::register_action_panel_keyboard_bindings;
+use crate::views::pull_requests::register_pull_requests_keyboard_bindings;
 use crate::views::agent_transcripts::register_agent_transcripts_keyboard_bindings;
 use crate::views::command_history::register_command_history_keyboard_bindings;
 use crate::views::database::register_database_keyboard_bindings;
@@ -27,6 +30,10 @@ use crate::views::plan_steps::register_plan_steps_keyboard_bindings;
 use crate::views::task_edit::register_task_edit_keyboard_bindings;
 use crate::views::task_list::register_task_list_keyboard_bindings;
 use crate::views::visual_design_panel::register_visual_design_panel_keyboard_bindings;
+use crate::unified::panels::findings::register_findings_keyboard_bindings;
+use crate::unified::panels::obligations::register_obligations_panel_keyboard_bindings;
+use crate::unified::panels::plan::register_plan_panel_keyboard_bindings;
+use crate::unified::register_unified_keyboard_bindings;
 use gpui::*;
 
 pub use history_window::HistoryWindowControl;
@@ -36,6 +43,7 @@ pub use window::{open, open_data_root_setup};
 pub fn register_main_keyboard_bindings(cx: &mut gpui::App) {
     register_list_keyboard_bindings(cx);
     register_agent_chat_keyboard_bindings(cx);
+    register_report_problem_keyboard_bindings(cx);
     register_task_list_keyboard_bindings(cx);
     register_command_history_keyboard_bindings(cx);
     register_task_edit_keyboard_bindings(cx);
@@ -43,6 +51,7 @@ pub fn register_main_keyboard_bindings(cx: &mut gpui::App) {
     register_plan_steps_keyboard_bindings(cx);
     register_lifecycle_panel_keyboard_bindings(cx);
     register_action_panel_keyboard_bindings(cx);
+    register_pull_requests_keyboard_bindings(cx);
     register_sessions_keyboard_bindings(cx);
     register_conversation_keyboard_bindings(cx);
     register_settings_keyboard_bindings(cx);
@@ -50,7 +59,12 @@ pub fn register_main_keyboard_bindings(cx: &mut gpui::App) {
     register_agent_transcripts_keyboard_bindings(cx);
     register_interactive_agent_keyboard_bindings(cx);
     register_visual_design_panel_keyboard_bindings(cx);
+    register_unified_keyboard_bindings(cx);
+    register_findings_keyboard_bindings(cx);
+    register_obligations_panel_keyboard_bindings(cx);
+    register_plan_panel_keyboard_bindings(cx);
     window::register_shell_keyboard_bindings(cx);
+    register_app_journey_keystrokes(cx);
 }
 
 pub(crate) fn launch_main_application(

@@ -10,6 +10,8 @@
 //! agent: waiving a criterion, advancing once every recorded criterion reads
 //! pass/waived ([`LifecycleController::advance_after_criteria`]), forcing or
 //! reverting a transition, and showing the criteria the last check recorded.
+//! The store writes themselves are `tod_core::lifecycle`'s, shared with the
+//! headless `tod_core::autopilot`; this entity keeps only what is shown.
 //!
 //! Criteria the app can answer from its own data
 //! (`tod_core::gate::evaluate_derived_criterion` — e.g. `ready` → `active`'s
@@ -25,10 +27,7 @@ use std::sync::Arc;
 use tod_core::gate::GateAction;
 use tod_core::task::model::{next_lifecycle, previous_lifecycle};
 use tod_store::fleet::FleetStore;
-use tod_store::outline::OutlineMutation;
-use tod_store::outline::{
-    GateCriterion, NodeGateEvaluation, OUTCOME_PASS, OUTCOME_WAIVED, SOURCE_HUMAN,
-};
+use tod_store::outline::{GateCriterion, NodeGateEvaluation, OUTCOME_PASS, OUTCOME_WAIVED};
 use uuid::Uuid;
 
 /// One row of per-criterion detail shown after a gate check completes.
@@ -147,14 +146,8 @@ impl LifecycleController {
 
     /// Record `lifecycle` as the node's state. `Err` carries the message.
     fn set_lifecycle(&self, node_id: Uuid, lifecycle: &str) -> Result<(), String> {
-        self.fleet
-            .enqueue_outline(OutlineMutation::SetLifecycle {
-                node_id,
-                state: lifecycle.to_string(),
-            })
-            .map_err(|err| format!("{err:#}"))?;
-        let _ = self.fleet.writer().flush();
-        Ok(())
+        tod_core::lifecycle::set_lifecycle(&self.fleet, node_id, lifecycle)
+            .map_err(|err| format!("{err:#}"))
     }
 
     /// Advance the node to the next lifecycle state directly, bypassing the
@@ -296,27 +289,14 @@ impl LifecycleController {
             return;
         };
         row.outcome = OUTCOME_WAIVED.to_string();
-        row.detail = Some("Waived by user".to_string());
+        row.detail = Some(tod_core::lifecycle::WAIVED_DETAIL.to_string());
 
-        let saved = self
-            .fleet
-            .enqueue_outline(OutlineMutation::ApplyGateResults {
-                node_id,
-                results: vec![(
-                    criterion_id,
-                    OUTCOME_WAIVED.to_string(),
-                    Some("Waived by user".to_string()),
-                    tod_store::outline::repos::gate::ACTION_NONE.to_string(),
-                )],
-                forward_state: None,
-                source: SOURCE_HUMAN.to_string(),
-            });
+        let saved = tod_core::lifecycle::waive(&self.fleet, node_id, criterion_id);
         let Some(state) = self.gate_states.get_mut(task_id) else {
             return;
         };
         match saved {
             Ok(()) => {
-                let _ = self.fleet.writer().flush();
                 state.gate_status = if state.all_clear() {
                     "All criteria satisfied — advance when ready.".into()
                 } else {
@@ -341,25 +321,16 @@ impl LifecycleController {
             return None;
         }
         let node_id = Uuid::parse_str(task_id).ok()?;
-        let (lifecycle, _) = self.node(task_id)?;
-        let next = next_lifecycle(&lifecycle)?;
-
-        if let Err(err) = self
-            .fleet
-            .enqueue_outline(OutlineMutation::ApplyGateResults {
-                node_id,
-                results: Vec::new(),
-                forward_state: Some(next.to_string()),
-                source: SOURCE_HUMAN.to_string(),
-            })
-        {
-            if let Some(state) = self.gate_states.get_mut(task_id) {
-                state.gate_error = Some(format!("Failed to advance lifecycle: {err:#}"));
+        let next = match tod_core::lifecycle::advance(&self.fleet, node_id) {
+            Ok(next) => next?,
+            Err(err) => {
+                if let Some(state) = self.gate_states.get_mut(task_id) {
+                    state.gate_error = Some(format!("Failed to advance lifecycle: {err:#}"));
+                }
+                cx.notify();
+                return None;
             }
-            cx.notify();
-            return None;
-        }
-        let _ = self.fleet.writer().flush();
+        };
 
         if let Some(state) = self.gate_states.get_mut(task_id) {
             state.gate_status = format!("Advanced to {next}.");
@@ -425,33 +396,5 @@ impl LifecycleController {
     }
 }
 
-/// Where implementation (and verification) of `task_id` would run: the node
-/// needs a resolved Agent and a ready Files directory — what the `ready` →
-/// `active` gate requires (`tod_core::gate::derived`). `Err` carries the
-/// user-facing reason.
-pub fn implement_directory(
-    fleet: &FleetStore,
-    task_id: &str,
-) -> Result<tod_store::fleet::Workdir, String> {
-    if fleet
-        .resolve_agent_for_node(task_id)
-        .ok()
-        .flatten()
-        .is_none()
-    {
-        return Err(
-            "Enable the Agent capability on this node (or an ancestor) to implement.".into(),
-        );
-    }
-    tod_store::fleet::resolve_launch_cwd(fleet, task_id).map_err(|err| format!("{err:#}"))
-}
-
-/// Whether landing in `state` starts that state's agent on its on-entry work:
-/// the state has an agent, and is not active, verifying or review, which run
-/// in their own conversations from Implement, Verify and Review. Active's own
-/// on-entry step (checking whether the work is already done) is the
-/// implementation loop's first turn.
-pub fn enters_with_agent(state: &str) -> bool {
-    tod_core::task::model::state_has_agent(state)
-        && !matches!(state, "active" | "verifying" | "review")
-}
+// Moved to `tod_core::lifecycle`; kept here so callers need not change.
+pub use tod_core::lifecycle::{enters_with_agent, implement_directory};

@@ -12,7 +12,6 @@ use crate::interview::agent::{AgentRunState, RunId, SharedAgent};
 use crate::interview::settings::TodSettings;
 use crate::ui::actionable::chrome_control_with_shortcut;
 use crate::ui::agent_chat::OpenConversation;
-use crate::ui::code_links::open_node_in_editor;
 use crate::ui::key_context;
 use crate::ui::pane_nav::{PaneFocusLeft, bind_modified_pane_nav};
 use crate::ui::selectable_text::selectable_text;
@@ -40,7 +39,7 @@ use tod_store::fleet::terminal::{
 };
 use tod_store::fleet::{
     AgentRun, FilesDirectory, FleetMutation, FleetStore, ResolvedAgent, ResolvedFiles, code_editor,
-    code_editors, reconnect_identity,
+    code_editors, open_code_editor_for_node, reconnect_identity,
 };
 use tod_store::fleet::Workdir;
 use tod_store::{AgentLaunchOptions, AgentPlatform, AgentRole};
@@ -740,7 +739,17 @@ impl ActionPanelView {
         let (Some(task_id), Some(editor)) = (self.task_id.clone(), code_editor(editor_id)) else {
             return;
         };
-        open_node_in_editor(self.fleet.clone(), task_id, editor, window, cx);
+        // A dev container is prepared through Docker first: off the UI thread.
+        self.run_terminal_job(
+            &format!("Opening {}…", editor.label()),
+            "Open code editor failed",
+            move |fleet, _, _| {
+                let cwd = open_code_editor_for_node(fleet, editor, &task_id)?;
+                Ok(format!("Opened {} in {}", editor.label(), cwd.display()))
+            },
+            window,
+            cx,
+        );
     }
 
     fn on_close(&mut self, _: &ActionPanelClose, _: &mut Window, cx: &mut Context<Self>) {
@@ -787,8 +796,7 @@ impl ActionPanelView {
             .files
             .as_ref()
             .and_then(|files| files.dev_container.as_ref())
-            .filter(|dev| dev.repo_on_host)
-            .and_then(|dev| dev.container());
+            .and_then(|dev| dev.mounted_container());
         let directory = match self.files.as_ref().map(ResolvedFiles::directory) {
             Some(FilesDirectory::Ready(path)) => match mounted_container {
                 Some(container) => format!("{path} · runs in dev container {container}"),

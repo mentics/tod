@@ -1,8 +1,9 @@
 //! Zed code editor plugin.
 
-use crate::fleet::code_editor::{CodeEditor, CodeLocation, RemoteHost};
+use crate::fleet::code_editor::{CodeEditor, CodeLocation};
 use crate::fleet::terminal::path_util::normalize_launch_path;
 use anyhow::{Context, Result, bail};
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -20,30 +21,6 @@ pub fn zed_location_args(root: Option<&Path>, file: &Path, location: &CodeLocati
     }
     args.push(location.with_position(&file.display().to_string()));
     args
-}
-
-/// `ssh://user@host/path`, the form Zed opens a remote path in.
-pub fn zed_ssh_url(host: &RemoteHost, path: &str) -> String {
-    format!("ssh://{}@{}{}", host.user, host.alias, path)
-}
-
-/// CLI calls that open `dir` on `host`, then `file` at its position in it.
-/// Each call takes one `ssh://` URL (a second fails as "cannot open both
-/// local and ssh paths"), so the file is a call of its own: it lands in the
-/// window the first opened.
-pub fn zed_remote_calls(
-    host: &RemoteHost,
-    dir: &str,
-    file: Option<(&str, &CodeLocation)>,
-) -> Vec<Vec<String>> {
-    let mut calls = vec![vec!["--classic".to_string(), zed_ssh_url(host, dir)]];
-    if let Some((file, location)) = file {
-        calls.push(vec![
-            "--classic".to_string(),
-            zed_ssh_url(host, &location.with_position(file)),
-        ]);
-    }
-    calls
 }
 
 /// Candidate binary names to try on PATH (order matters).
@@ -108,41 +85,201 @@ pub fn spawn_zed(cwd: &Path) -> Result<()> {
     if !cwd.is_dir() {
         bail!("workspace directory does not exist: {}", cwd.display());
     }
-    run_zed(&zed_open_args(&cwd))
+    let env = crate::paths::TodPaths::discover()
+        .ok()
+        .and_then(|paths| zed_env(paths.data_root()).ok())
+        .unwrap_or_default();
+    spawn_zed_with(&zed_open_args(&cwd), &env)
 }
 
-/// Run the Zed CLI with `args` without waiting for it.
-fn run_zed(args: &[String]) -> Result<()> {
-    zed_command(args)?
-        .spawn()
-        .with_context(|| format!("spawn `zed {}`", args.join(" ")))
-        .map(|_| ())
+/// Opens `ssh://...` in Zed with the environment [`zed_env`] gives for `data_root`.
+/// The Zed URL for `path` in sandbox `sandbox`, which tod's shim routes.
+pub fn sandbox_url(sandbox: &str, path: &str) -> String {
+    format!(
+        "ssh://root@{}/{}",
+        tod_sandbox::config::host_for(sandbox),
+        path.trim_start_matches('/')
+    )
 }
 
-/// How long a remote open may take before tod stops waiting for it: the first
-/// connection to a container installs Zed's server there.
-const REMOTE_OPEN_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
+/// Hosts ending in this are dev containers (`ssh://<user>@<container>.docker.tod/...`);
+/// `tod-zed-shim` reaches them through `docker exec ... sshd -i`. Checked
+/// there before the sandbox suffix (`.tod`), which it also ends in.
+pub const CONTAINER_HOST_SUFFIX: &str = ".docker.tod";
 
-/// Run the Zed CLI with `args` and wait until it hands the request over (or
-/// [`REMOTE_OPEN_WAIT`] passes).
-fn run_zed_waiting(args: &[String]) -> Result<()> {
-    let mut child = zed_command(args)?
-        .spawn()
-        .with_context(|| format!("spawn `zed {}`", args.join(" ")))?;
-    let started = std::time::Instant::now();
-    while started.elapsed() < REMOTE_OPEN_WAIT {
-        if let Some(status) = child.try_wait()? {
-            if !status.success() {
-                bail!("`zed {}` failed ({status})", args.join(" "));
-            }
-            return Ok(());
+/// The key pair Zed logs in to dev containers with, in [`SHIM_DIR`] (the
+/// shim looks for it beside itself).
+pub const CONTAINER_KEY_FILE: &str = "docker_ed25519";
+
+/// The Zed URL for `path` (absolute) in dev container `container` as `user`,
+/// at `line[:column]` when given.
+pub fn container_url(user: &str, container: &str, path: &str, position: Option<(u32, Option<u32>)>) -> String {
+    let mut url = format!(
+        "ssh://{user}@{container}{CONTAINER_HOST_SUFFIX}/{}",
+        path.trim_start_matches('/')
+    );
+    if let Some((line, column)) = position {
+        url.push_str(&format!(":{line}"));
+        if let Some(column) = column {
+            url.push_str(&format!(":{column}"));
         }
+    }
+    url
+}
+
+/// No console window for a helper the app runs (Windows).
+fn no_window(command: &mut Command) -> &mut Command {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    command
+}
+
+/// The public key line of tod's container key pair, generating the pair
+/// with the host's `ssh-keygen` the first time.
+pub fn ensure_container_key(data_root: &Path) -> Result<String> {
+    let dir = data_root.join(SHIM_DIR);
+    std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+    let key = dir.join(CONTAINER_KEY_FILE);
+    let public = dir.join(format!("{CONTAINER_KEY_FILE}.pub"));
+    if !key.is_file() || !public.is_file() {
+        let _ = std::fs::remove_file(&key);
+        let _ = std::fs::remove_file(&public);
+        let out = no_window(&mut Command::new("ssh-keygen"))
+            .args(["-q", "-t", "ed25519", "-N", "", "-C", "tod-zed", "-f"])
+            .arg(&key)
+            .stdin(Stdio::null())
+            .output()
+            .context("run ssh-keygen (is OpenSSH installed?)")?;
+        if !out.status.success() {
+            bail!("ssh-keygen: {}", String::from_utf8_lossy(&out.stderr).trim());
+        }
+        // Windows' ssh ignores a private key others can read, and the file
+        // inherits the data root's permissions: keep only this user's.
+        #[cfg(windows)]
+        {
+            let user = match (std::env::var("USERDOMAIN"), std::env::var("USERNAME")) {
+                (Ok(domain), Ok(name)) => format!("{domain}\\{name}"),
+                (_, Ok(name)) => name,
+                _ => bail!("USERNAME is not set; cannot protect {}", key.display()),
+            };
+            let out = no_window(&mut Command::new("icacls"))
+                .arg(&key)
+                .args(["/inheritance:r", "/grant:r", &format!("{user}:F")])
+                .stdin(Stdio::null())
+                .output()
+                .context("run icacls")?;
+            if !out.status.success() {
+                let _ = std::fs::remove_file(&key);
+                bail!(
+                    "restrict {} to {user}: {}",
+                    key.display(),
+                    String::from_utf8_lossy(&out.stdout).trim()
+                );
+            }
+        }
+    }
+    let line = std::fs::read_to_string(&public).with_context(|| format!("read {}", public.display()))?;
+    Ok(line.trim().to_string())
+}
+
+/// Open `folder` in dev container `container` in Zed, then `file` (with its
+/// position) when given: Zed takes one `ssh://` URL per call, and the file
+/// then opens in the folder's window. Prepares the container's `sshd` first.
+/// Talks to Docker: never call it on the UI thread.
+pub fn open_in_container(
+    data_root: &Path,
+    container: &str,
+    folder: &str,
+    file: Option<(&str, Option<(u32, Option<u32>)>)>,
+) -> Result<()> {
+    let exec = tod_agent::devcontainer::ContainerExec::connect(container)?;
+    let user = exec.user.clone().unwrap_or_else(|| "root".to_string());
+    let key = ensure_container_key(data_root)?;
+    tod_agent::devcontainer::prepare_sshd(&exec.id, &user, &key)?;
+    // The name the user gave, so Zed's window titles and recent projects
+    // stay stable across container ids.
+    let host = if tod_agent::devcontainer::validate_container_ref(container).is_ok() {
+        container
+    } else {
+        &exec.id
+    };
+    let folder_url = container_url(&user, host, folder, None);
+    let Some((path, position)) = file else {
+        return spawn_zed_url(&folder_url, data_root);
+    };
+    // The file goes to a window whose remote project holds it, so the
+    // folder's call has to have handed off to Zed first.
+    let before = zed_connections(&exec);
+    let mut child = spawn_zed_child(&[folder_url], &zed_env(data_root)?)?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while child.try_wait()?.is_none() && std::time::Instant::now() < deadline {
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
-    Ok(())
+    // The CLI returns before Zed has connected, and a file sent before then
+    // opens as a project of its own. A folder already open with Zed still
+    // connected only comes to the front, with no new connection to wait for.
+    let key = format!("{}:{folder}", exec.id);
+    let mut opened = opened_folders().lock().unwrap_or_else(|e| e.into_inner());
+    if !(opened.contains(&key) && before.is_some_and(|n| n > 0)) {
+        wait_for_new_connection(&exec, before);
+    }
+    opened.insert(key);
+    drop(opened);
+    spawn_zed_url(&container_url(&user, host, path, position), data_root)
 }
 
-fn zed_command(args: &[String]) -> Result<Command> {
+/// Container folders tod has opened in Zed during this run.
+fn opened_folders() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
+    static OPENED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    OPENED.get_or_init(Default::default)
+}
+
+/// How many Zed clients are connected to the container: its remote server
+/// runs one `proxy` per connection. `None` when it cannot tell.
+fn zed_connections(exec: &tod_agent::devcontainer::ContainerExec) -> Option<usize> {
+    let script = "for f in /proc/[0-9]*/cmdline; do tr '\\0' ' ' < \"$f\" 2>/dev/null; echo; done \
+                  | grep -c '[z]ed-remote-server.*proxy'";
+    let out = exec.output("/", "sh", &["-c", script]).ok()?;
+    // grep -c exits 1 when it counts none.
+    String::from_utf8_lossy(&out.stdout).trim().parse().ok()
+}
+
+/// Wait until Zed has a connection to the container it did not have
+/// `before`: long when it has none (the first connect installs Zed's
+/// server), briefly otherwise.
+fn wait_for_new_connection(exec: &tod_agent::devcontainer::ContainerExec, before: Option<usize>) {
+    use std::time::{Duration, Instant};
+    let Some(before) = before else {
+        std::thread::sleep(Duration::from_secs(3));
+        return;
+    };
+    let limit = if before == 0 { 120 } else { 10 };
+    let deadline = Instant::now() + Duration::from_secs(limit);
+    while Instant::now() < deadline {
+        if zed_connections(exec).is_some_and(|now| now > before) {
+            // Let the new window take the project before the file arrives.
+            std::thread::sleep(Duration::from_secs(1));
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
+pub fn spawn_zed_url(url: &str, data_root: &Path) -> Result<()> {
+    let env = zed_env(data_root)?;
+    spawn_zed_with(&[url.to_string()], &env)
+}
+
+fn spawn_zed_with(args: &[String], env: &[(String, OsString)]) -> Result<()> {
+    spawn_zed_child(args, env).map(|_| ())
+}
+
+fn spawn_zed_child(args: &[String], env: &[(String, OsString)]) -> Result<std::process::Child> {
     let bin = resolve_zed_bin().ok_or_else(|| {
         anyhow::anyhow!(
             "Zed CLI not found. Install Zed and ensure `zed` is on PATH \
@@ -151,13 +288,14 @@ fn zed_command(args: &[String]) -> Result<Command> {
         )
     })?;
     allow_foreground();
-    let mut command = Command::new(&bin);
-    command
+    Command::new(&bin)
         .args(args)
+        .envs(env.iter().map(|(k, v)| (k, v)))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    Ok(command)
+        .stderr(Stdio::null())
+        .spawn()
+        .with_context(|| format!("spawn `{} {}`", bin.display(), args.join(" ")))
 }
 
 /// Let the Zed window come to the front. The CLI hands the request to the
@@ -170,6 +308,68 @@ fn allow_foreground() {
         // Fails harmlessly when tod is not in the foreground itself.
         let _ = unsafe { AllowSetForegroundWindow(ASFW_ANY) };
     }
+}
+
+/// Where Zed's `ssh`, `scp`, and `sftp` stand-ins live, under the data root.
+pub const SHIM_DIR: &str = "zed-shim";
+
+fn exe_name(stem: &str) -> String {
+    format!("{stem}{}", std::env::consts::EXE_SUFFIX)
+}
+
+/// The environment for a Zed that tod starts.
+///
+/// tod is assumed to be the only thing that starts Zed. Its `ssh` is
+/// `tod-zed-shim` (installed beside this executable), copied into
+/// `<data_root>/zed-shim/` as `ssh`, `scp`, and `sftp` and put first on Zed's
+/// PATH: hosts named `<sandbox>.tod` go to the sandbox's relay, every other
+/// host to the real `ssh`. The shim finds `tod-sandbox` and the data root
+/// through `TOD_SANDBOX_BIN` and `TOD_DATA_ROOT`. Without an installed shim
+/// the environment is empty and Zed starts as it always did.
+pub fn zed_env(data_root: &Path) -> Result<Vec<(String, OsString)>> {
+    let Some(exe_dir) = std::env::current_exe().ok().and_then(|e| e.parent().map(Path::to_path_buf)) else {
+        return Ok(Vec::new());
+    };
+    let shim = exe_dir.join(exe_name("tod-zed-shim"));
+    if !shim.is_file() {
+        return Ok(Vec::new());
+    }
+    let dir = data_root.join(SHIM_DIR);
+    std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+    let bytes = std::fs::read(&shim).with_context(|| format!("read {}", shim.display()))?;
+    for name in ["ssh", "scp", "sftp"] {
+        let target = dir.join(exe_name(name));
+        if std::fs::read(&target).is_ok_and(|current| current == bytes) {
+            continue;
+        }
+        // A running Zed holds the old copy open on Windows; it is replaced
+        // the next time Zed is not running.
+        if let Err(err) = std::fs::write(&target, &bytes) {
+            if !target.is_file() {
+                return Err(err).with_context(|| format!("install {}", target.display()));
+            }
+            tracing::warn!("keeping the older {}: {err}", target.display());
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755));
+        }
+    }
+    let mut path = OsString::from(dir.as_os_str());
+    if let Some(old) = std::env::var_os("PATH") {
+        path.push(if cfg!(windows) { ";" } else { ":" });
+        path.push(old);
+    }
+    let mut env = vec![
+        ("PATH".to_string(), path),
+        ("TOD_DATA_ROOT".to_string(), data_root.as_os_str().to_os_string()),
+    ];
+    let sandbox_bin = exe_dir.join(exe_name("tod-sandbox"));
+    if sandbox_bin.is_file() {
+        env.push(("TOD_SANDBOX_BIN".to_string(), sandbox_bin.into_os_string()));
+    }
+    Ok(env)
 }
 
 /// The Zed [`CodeEditor`] plugin.
@@ -192,89 +392,12 @@ impl CodeEditor for ZedEditor {
         spawn_zed(dir)
     }
 
-    fn open_location(
-        &self,
-        root: Option<&Path>,
-        file: &Path,
-        location: &CodeLocation,
-    ) -> Result<()> {
-        run_zed(&zed_location_args(root, file, location))
-    }
-
-    fn open_remote(
-        &self,
-        host: &RemoteHost,
-        dir: &str,
-        file: Option<(&str, &CodeLocation)>,
-    ) -> Result<()> {
-        let calls = zed_remote_calls(host, dir, file);
-        let (folder, files) = calls.split_first().context("no directory to open")?;
-        let key = format!("{}@{}:{dir}", host.user, host.alias);
-        let opened = |key: &str| opened_dirs().lock().expect("opened dirs").contains(key);
-        if !files.is_empty() && opened(&key) {
-            // Its window is most likely still open: the file lands in it.
-            return files.iter().try_for_each(|args| run_zed_waiting(args));
-        }
-        let before = zed_connections(host);
-        run_zed_waiting(folder)?;
-        opened_dirs().lock().expect("opened dirs").insert(key);
-        if !files.is_empty() {
-            wait_for_new_connection(host, before);
-        }
-        files.iter().try_for_each(|args| run_zed_waiting(args))
-    }
-}
-
-/// Remote directories opened in Zed since tod started.
-fn opened_dirs() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
-    static OPENED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
-        std::sync::OnceLock::new();
-    OPENED.get_or_init(Default::default)
-}
-
-/// How many clients Zed's remote server on `host` is serving: it runs one
-/// `proxy` per connection. Read from `/proc`, which needs no `ps` in the
-/// image. `None` when it cannot tell.
-fn zed_connections(host: &RemoteHost) -> Option<usize> {
-    const COUNT: &str = "for f in /proc/[0-9]*/cmdline; do tr '\\0' ' ' < \"$f\" 2>/dev/null; echo; done \
-                         | grep -c '[z]ed-remote-server.*proxy'";
-    let mut command = Command::new("ssh");
-    command
-        .args(["-o", "BatchMode=yes", &host.alias, COUNT])
-        .stdin(Stdio::null())
-        .stderr(Stdio::null());
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        command.creation_flags(0x0800_0000);
-    }
-    let out = command.output().ok()?;
-    String::from_utf8_lossy(&out.stdout).trim().parse().ok()
-}
-
-/// Wait until Zed's connection for a newly opened directory is up, so a file
-/// sent next lands in that window instead of opening a project of its own.
-/// The first connection to a host installs Zed's server there and may take
-/// long; with a server already serving, a new client shows in a second or
-/// two, or not at all when Zed only focused a window it had.
-fn wait_for_new_connection(host: &RemoteHost, before: Option<usize>) {
-    let Some(before) = before else {
-        std::thread::sleep(std::time::Duration::from_secs(3));
-        return;
-    };
-    let limit = if before == 0 {
-        REMOTE_OPEN_WAIT
-    } else {
-        std::time::Duration::from_secs(10)
-    };
-    let started = std::time::Instant::now();
-    while started.elapsed() < limit {
-        if zed_connections(host).is_some_and(|now| now > before) {
-            // The window registers its project just after connecting.
-            std::thread::sleep(std::time::Duration::from_secs(1));
-            return;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(500));
+    fn open_location(&self, root: Option<&Path>, file: &Path, location: &CodeLocation) -> Result<()> {
+        let env = crate::paths::TodPaths::discover()
+            .ok()
+            .and_then(|paths| zed_env(paths.data_root()).ok())
+            .unwrap_or_default();
+        spawn_zed_with(&zed_location_args(root, file, location), &env)
     }
 }
 
@@ -289,6 +412,68 @@ mod tests {
             zed_open_args(&cwd),
             vec!["--classic".to_string(), "/tmp/workspace".to_string()]
         );
+    }
+
+    #[test]
+    fn container_urls_name_the_container_host_and_position() {
+        assert_eq!(
+            container_url("vscode", "my-dev", "/workspaces/app", None),
+            "ssh://vscode@my-dev.docker.tod/workspaces/app"
+        );
+        assert_eq!(
+            container_url("root", "c1", "/w/src/main.rs", Some((12, Some(4)))),
+            "ssh://root@c1.docker.tod/w/src/main.rs:12:4"
+        );
+        assert_eq!(
+            container_url("root", "c1", "/w/a.rs", Some((7, None))),
+            "ssh://root@c1.docker.tod/w/a.rs:7"
+        );
+        // The sandbox suffix also matches; the shim checks this one first.
+        assert!(CONTAINER_HOST_SUFFIX.ends_with(tod_sandbox::config::HOST_SUFFIX));
+    }
+
+    struct Scratch(PathBuf);
+    impl Scratch {
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    fn scratch(name: &str) -> Scratch {
+        let dir = std::env::temp_dir().join(format!("tod-zed-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        Scratch(dir)
+    }
+
+    /// Needs `ssh-keygen` on PATH; skipped without it.
+    #[test]
+    fn container_key_is_generated_once() {
+        if Command::new("ssh-keygen").arg("-?").output().is_err() {
+            return;
+        }
+        let root = scratch("key");
+        let first = ensure_container_key(root.path()).unwrap();
+        assert!(first.starts_with("ssh-ed25519 "), "{first}");
+        assert_eq!(ensure_container_key(root.path()).unwrap(), first);
+        assert!(root.path().join(SHIM_DIR).join(CONTAINER_KEY_FILE).is_file());
+    }
+
+    /// Needs `TOD_TEST_DEV_CONTAINER`: a running container with `sshd`.
+    /// Prepares it the way opening it in Zed does (without opening Zed).
+    #[test]
+    fn prepares_a_real_container_for_zed() {
+        let Ok(container) = std::env::var("TOD_TEST_DEV_CONTAINER") else {
+            return;
+        };
+        let root = scratch("prep");
+        let key = ensure_container_key(root.path()).unwrap();
+        let exec = tod_agent::devcontainer::ContainerExec::connect(&container).unwrap();
+        let user = exec.user.clone().unwrap_or_else(|| "root".into());
+        tod_agent::devcontainer::prepare_sshd(&exec.id, &user, &key).unwrap();
     }
 
     #[test]
@@ -309,29 +494,6 @@ mod tests {
             zed_location_args(None, Path::new("/w/x.rs"), &bare),
             vec!["--classic".to_string(), "/w/x.rs".to_string()]
         );
-    }
-
-    #[test]
-    fn remote_calls_open_the_directory_then_the_file() {
-        let host = RemoteHost {
-            alias: "tod-dev".into(),
-            user: "vscode".into(),
-        };
-        let location = CodeLocation::parse("src/a.rs:3:2").unwrap();
-        assert_eq!(
-            zed_remote_calls(&host, "/w/p", Some(("/w/p/src/a.rs", &location))),
-            vec![
-                vec![
-                    "--classic".to_string(),
-                    "ssh://vscode@tod-dev/w/p".to_string()
-                ],
-                vec![
-                    "--classic".to_string(),
-                    "ssh://vscode@tod-dev/w/p/src/a.rs:3:2".to_string()
-                ],
-            ]
-        );
-        assert_eq!(zed_remote_calls(&host, "/w/p", None).len(), 1);
     }
 
     #[test]

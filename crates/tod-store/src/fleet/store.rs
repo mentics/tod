@@ -47,6 +47,7 @@ pub struct FleetStore {
     writer: FleetWriter,
     command_log: Arc<Mutex<crate::fleet::command_log::CommandLog>>,
     projection: Arc<Mutex<FleetProjection>>,
+    change_tx: broadcast::Sender<()>,
     notices: FleetNoticeHooks,
     migration: Option<StorageMigration>,
     traffic_log: Option<SharedAgentTrafficLog>,
@@ -94,6 +95,8 @@ impl FleetStore {
         recover_incomplete_storage_migration(&paths).map_err(FleetLaunchError::Other)?;
         FleetLaunch::prepare(&paths)?;
         let lock = FleetLock::try_acquire(paths.root()).map_err(map_lock_error)?;
+        // One app per data root: its cloud sandboxes are this root's.
+        crate::fleet::sandbox::set_data_root(paths.root());
         let command_log = CommandLog::shared();
         let writer = FleetWriter::open_with_debounce(
             paths.db(),
@@ -104,6 +107,7 @@ impl FleetStore {
         let projection = Arc::new(Mutex::new(
             FleetProjection::open(paths.db()).map_err(FleetLaunchError::Other)?,
         ));
+        let change_tx = projection.lock().expect("fleet projection mutex").change_sender();
         let background_shutdown = Arc::new(AtomicBool::new(false));
         crate::fleet::projection::spawn_commit_reloader(
             projection.clone(),
@@ -117,6 +121,7 @@ impl FleetStore {
             writer,
             command_log,
             projection,
+            change_tx,
             notices: FleetNoticeHooks::new(),
             migration: None,
             traffic_log: None,
@@ -241,6 +246,82 @@ impl FleetStore {
             .lock()
             .expect("fleet projection mutex")
             .subscribe()
+    }
+
+    /// Deletes every `journey_changes` row through `through_id`
+    /// (`crate::journey_changes::prune_through`), once the journey
+    /// change-feed thread has recorded it. A plain maintenance write on its
+    /// own short-lived connection, like `backup_database` — it does not need
+    /// the debounced `FleetMutation` queue.
+    pub fn prune_journey_changes_through(&self, through_id: i64) -> Result<()> {
+        let conn = rusqlite::Connection::open(self.writer.db_path())?;
+        crate::journey_changes::prune_through(&conn, through_id)
+    }
+
+    /// Queues a just-built bundle for submission (`crate::journey_submissions`).
+    /// A plain maintenance write on its own short-lived connection, like
+    /// `prune_journey_changes_through` — the queue is outside the
+    /// `OutlineMutation`/`FleetMutation` invariants, so it does not need the
+    /// debounced writer queue. The caller (e.g. `submit_report`) is
+    /// responsible for also recording the corresponding journey
+    /// `Event::Submission`, since `tod-store` cannot depend on `tod-core`.
+    pub fn queue_journey_submission(
+        &self,
+        bundle_id: uuid::Uuid,
+        node_id: Option<uuid::Uuid>,
+        seq: i64,
+        reason: &str,
+    ) -> Result<crate::journey_submissions::SubmissionEntry> {
+        let conn = rusqlite::Connection::open(self.writer.db_path())?;
+        let entry = crate::journey_submissions::JourneySubmissionRepo::new(&conn)
+            .insert_queued(bundle_id, node_id, seq, reason)?;
+        // This write bypasses the writer, so nothing else announces it; the
+        // submission worker would otherwise sleep until its fallback poll.
+        // Not through the projection: callers may already hold its lock.
+        let _ = self.change_tx.send(());
+        Ok(entry)
+    }
+
+    /// Moves a queued submission's status (`crate::journey_submissions`).
+    pub fn set_journey_submission_status(
+        &self,
+        bundle_id: uuid::Uuid,
+        status: &str,
+    ) -> Result<()> {
+        let conn = rusqlite::Connection::open(self.writer.db_path())?;
+        crate::journey_submissions::JourneySubmissionRepo::new(&conn).set_status(bundle_id, status)
+    }
+
+    /// Every still-`queued` milestone entry for `node_id`
+    /// (`crate::journey_submissions::JourneySubmissionRepo::queued_milestones_for_node`).
+    /// Used by the change-feed thread to find entries a just-recorded
+    /// milestone for the same node supersedes.
+    pub fn queued_milestones_for_node(
+        &self,
+        node_id: uuid::Uuid,
+    ) -> Result<Vec<crate::journey_submissions::SubmissionEntry>> {
+        let conn = rusqlite::Connection::open(self.writer.db_path())?;
+        crate::journey_submissions::JourneySubmissionRepo::new(&conn).queued_milestones_for_node(node_id)
+    }
+
+    /// Every `journey_submissions` entry with `status`
+    /// (`crate::journey_submissions::JourneySubmissionRepo::list_by_status`).
+    /// Used by the submission worker to find entries due to send or resend.
+    pub fn list_journey_submissions_by_status(
+        &self,
+        status: &str,
+    ) -> Result<Vec<crate::journey_submissions::SubmissionEntry>> {
+        let conn = rusqlite::Connection::open(self.writer.db_path())?;
+        crate::journey_submissions::JourneySubmissionRepo::new(&conn).list_by_status(status)
+    }
+
+    /// Looks up one `journey_submissions` entry by bundle id.
+    pub fn get_journey_submission(
+        &self,
+        bundle_id: uuid::Uuid,
+    ) -> Result<Option<crate::journey_submissions::SubmissionEntry>> {
+        let conn = rusqlite::Connection::open(self.writer.db_path())?;
+        crate::journey_submissions::JourneySubmissionRepo::new(&conn).get_by_bundle(bundle_id)
     }
 
     /// Enqueue a fleet mutation for the async writer.
@@ -909,6 +990,21 @@ mod tests {
         drop(store);
         let _ = fs::remove_dir_all(source);
         let _ = fs::remove_dir_all(dest);
+    }
+
+    #[test]
+    fn queueing_a_journey_submission_notifies_subscribers() {
+        let root =
+            std::env::temp_dir().join(format!("tod-fleet-store-queue-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let store = FleetStore::open(&root).unwrap();
+        let mut rx = store.subscribe_changes();
+        store
+            .queue_journey_submission(uuid::Uuid::new_v4(), None, 1, "report")
+            .unwrap();
+        assert!(rx.try_recv().is_ok());
+        drop(store);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

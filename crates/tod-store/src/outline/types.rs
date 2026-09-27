@@ -183,4 +183,9 @@ pub struct FlatNodeRow {
     /// True for a managed node whose generator has a quick-accept
     /// destination configured — accept is a no-op otherwise.
     pub accept_ready: bool,
+    /// True for a copied-out (non-managed) node that still carries a
+    /// data-source link, so refreshes keep updating it.
+    pub linked_copy: bool,
+    /// True for a managed node that has at least one linked copy elsewhere.
+    pub has_copies: bool,
 }

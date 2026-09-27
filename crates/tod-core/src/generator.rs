@@ -1046,28 +1046,25 @@ mod tests {
             .unwrap();
         fleet.writer().flush().unwrap();
 
-        fleet
-            .read(|conn| {
-                let gen_repo = tod_store::outline::repos::GeneratorRepo::new(conn);
-                assert!(gen_repo.is_greyed_out(managed_id).unwrap());
-                Ok(())
-            })
-            .unwrap();
+        let has_copies = |fleet: &FleetStore| {
+            fleet
+                .flatten_outline(list_id)
+                .unwrap()
+                .into_iter()
+                .find(|r| r.node.id == managed_id)
+                .expect("managed row visible")
+                .has_copies
+        };
+        assert!(has_copies(&fleet));
 
         // Config change / rebuild: same external_id still returned, same node id reused.
         ds.set_items(vec![item("EXT-1", "Updated from source", vec![])]);
         refresh_generator_with(&fleet, node_id, &ds, &HashMap::new()).unwrap();
 
-        fleet
-            .read(|conn| {
-                let gen_repo = tod_store::outline::repos::GeneratorRepo::new(conn);
-                assert!(
-                    gen_repo.is_greyed_out(managed_id).unwrap(),
-                    "greyed-out state must survive a config-change rebuild that still returns the same external id"
-                );
-                Ok(())
-            })
-            .unwrap();
+        assert!(
+            has_copies(&fleet),
+            "copied state must survive a config-change rebuild that still returns the same external id"
+        );
 
         drop(fleet);
         let _ = fs::remove_dir_all(root);

@@ -17,6 +17,7 @@
 
 mod change_set;
 mod context_panel;
+pub(crate) mod driver_slot;
 mod header;
 mod keyboard;
 mod lifecycle;
@@ -57,6 +58,8 @@ pub use keyboard::register_conversation_keyboard_bindings;
 use crate::interview::agent::SharedAgent;
 use crate::interview::{TodPaths, TodSettings};
 use crate::ui::agent_chat::OpenAgentChat;
+use crate::ui::agent_runs::AgentRuns;
+use crate::ui::report_problem::{OpenReportDialog, ReportProblem};
 use crate::ui::agent_conversation::{AgentConversationPanel, PanelStop};
 use crate::ui::agent_permission::queue_permission_request;
 use crate::ui::app_nav::{AppDestination, AppNavMenu, HasAppNav, on_app_nav_toggle};
@@ -76,9 +79,11 @@ use crate::views::rows::{
 };
 use change_set::{ChangeGroup, ChangeItem, ChangeKey, PendingReverse};
 use context_panel::{ContextPanel, ContextTab};
+use driver_slot::DriverSlot;
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    App, AppContext, Context, Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement,
+    AnyWindowHandle, App, AppContext, Context, Entity, EventEmitter, FocusHandle, Focusable,
+    InteractiveElement,
     IntoElement, ParentElement, Pixels, Render, SharedString, Styled, Subscription, Task, Window,
     div, px,
 };
@@ -93,7 +98,7 @@ use std::time::Duration;
 use tod_core::conversation::context::focus_selection;
 use tod_core::conversation::{
     ConversationConfig, ConversationDriver, ConversationEvent, ConversationStatus, RunNotice,
-    protocol_for,
+    SharedAgentAccess, protocol_for,
 };
 use tod_store::conversation::{
     ConversationRepo, ConversationSummary, Entity as ItemEntity, EntitySnapshot, Focus, NetChange,
@@ -102,7 +107,7 @@ use tod_store::conversation::{
 use tod_store::fleet::FleetStore;
 use tod_store::interview::{ACTOR_USER, InterviewCommand, short_id};
 use tod_store::outline::PlanStep;
-use tod_store::outline::repos::plan_steps::HandoffReason;
+use tod_store::outline::repos::plan_steps::{self, HandoffReason};
 use tod_store::outline::repos::{NodeRepo, ObligationRepo, PlanStepRepo};
 use tod_store::review::{ReviewFinding, ReviewRepo};
 use tod_store::verification::{ObligationStanding, VerdictRepo};
@@ -113,8 +118,35 @@ const AGENT_TURN: &str = "agent-turn";
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
 /// Polls between reloads when the store has not signalled a commit.
 const FALLBACK_POLLS: u32 = 8;
+/// How often a running turn's usage is read again from its platform's
+/// record: the read is the whole session log.
+const USAGE_REFRESH: Duration = Duration::from_secs(10);
 const TRANSCRIPT_WIDTH: f32 = 420.;
+
+/// The open conversation's token usage as its sessions' platform records
+/// say, and when it was last read.
+#[derive(Default)]
+struct ConversationUsage {
+    /// The conversation `recorded` is for.
+    conversation: Option<Uuid>,
+    recorded: Option<tod_agent::TokenUsage>,
+    read_at: Option<std::time::Instant>,
+    /// A turn ended since the last read.
+    stale: bool,
+    reading: bool,
+}
 const CONTEXT_WIDTH: f32 = 420.;
+
+/// What follows a message the view sends, once the driver is back with it.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum AfterSend {
+    /// It came from the input in this window, cleared when it was sent: the
+    /// text goes back there if it did not go out.
+    Input(AnyWindowHandle),
+    /// It answers a plan step the agent handed back: the step is in progress
+    /// again once the answer went out.
+    Handoff(Uuid),
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConversationViewEvent {
@@ -390,10 +422,11 @@ pub struct ConversationView {
     /// The open conversation; `None` for an unsaved new one.
     conversation_id: Option<Uuid>,
     history: FocusHistory,
-    /// Drivers with work in flight, plus the current conversation's. Idle
-    /// ones for other conversations are dropped: everything they know is in
-    /// the database.
-    drivers: Vec<ConversationDriver>,
+    /// The shared registry hosting every conversation's driver
+    /// (`ui::agent_runs::AgentRuns`). Idle slots for other conversations are
+    /// dropped there once this view stops needing them: everything they know
+    /// is in the database.
+    agent_runs: Entity<AgentRuns>,
     status: ConversationStatus,
     data: Snapshot,
 
@@ -416,6 +449,9 @@ pub struct ConversationView {
     /// Files the implementation protocol's worktree has changed, refreshed
     /// off the main thread when a turn ends.
     side_files: Vec<String>,
+    /// The open conversation's token usage, from its sessions' platform
+    /// records; read off the main thread (see [`Self::refresh_usage`]).
+    usage: ConversationUsage,
     /// Turns the protocol's loop has sent since the last user message.
     loop_turns: u32,
     /// Notices from finished runs, emitted as events on the next poll.
@@ -426,6 +462,9 @@ pub struct ConversationView {
     /// Nodes whose gate check just finished a turn: the criteria rows it
     /// recorded are re-read on the next poll, so Advance appears on a pass.
     pending_gate_reloads: Vec<Uuid>,
+    /// Nodes whose gate check is answering the criteria the app answers
+    /// itself, on the background executor.
+    settling_gate: Vec<Uuid>,
     /// The review pane's findings, on the shared item list: it owns the
     /// cursor, the scrolling, and the rows.
     findings: ItemList<FindingItem>,
@@ -488,6 +527,7 @@ impl ConversationView {
         agent: SharedAgent,
         fleet: Arc<FleetStore>,
         lifecycle: Entity<LifecycleController>,
+        agent_runs: Entity<AgentRuns>,
     ) -> Self {
         let (transcript, transcript_events) = Self::new_transcript(window, cx);
         let lifecycle_changes = cx.observe(&lifecycle, |_, _, cx| cx.notify());
@@ -497,6 +537,7 @@ impl ConversationView {
                 .placeholder("Ctrl+Enter to save, Esc to cancel")
         });
         let poll_fleet = fleet.clone();
+        let poll_agent = agent.clone();
         let poll_task = cx.spawn(async move |this, cx| {
             let mut changes = poll_fleet.subscribe_changes();
             let mut idle = 0;
@@ -518,8 +559,32 @@ impl ConversationView {
                 if committed {
                     idle = 0;
                 }
+                // Collecting a finished turn records the reply and may commit
+                // the work or start the loop's next turn (git, Docker,
+                // `tod-cli`), so it happens here, off the main thread.
+                let Ok(away) = this.update(cx, |this, cx| this.take_running(cx)) else {
+                    break;
+                };
+                let ticked = if away.is_empty() {
+                    Vec::new()
+                } else {
+                    let fleet = poll_fleet.clone();
+                    let agent = poll_agent.clone();
+                    cx.background_executor()
+                        .spawn(async move {
+                            away.into_iter()
+                                .map(|(slot, mut driver)| {
+                                    let events =
+                                        driver.tick(&fleet, &mut SharedAgentAccess(&agent));
+                                    (slot, driver, events)
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                        .await
+                };
                 let Ok(want_files) = this.update(cx, |this, cx| {
-                    let (changed, want_files) = this.poll(committed);
+                    let (changed, want_files) = this.poll(committed, ticked, cx);
+                    this.refresh_usage(cx);
                     this.publish_status(cx);
                     for notice in std::mem::take(&mut this.pending_notices) {
                         cx.emit(ConversationViewEvent::Notice(notice));
@@ -581,7 +646,7 @@ impl ConversationView {
             opened: false,
             conversation_id: None,
             history: FocusHistory::default(),
-            drivers: Vec::new(),
+            agent_runs,
             status: ConversationStatus::default(),
             data: Snapshot::default(),
             pane: Pane::Transcript,
@@ -593,10 +658,12 @@ impl ConversationView {
             nav: None,
             protocol: ProtocolKind::Outline,
             side_files: Vec::new(),
+            usage: ConversationUsage::default(),
             loop_turns: 0,
             pending_notices: Vec::new(),
             pending_entries: Vec::new(),
             pending_gate_reloads: Vec::new(),
+            settling_gate: Vec::new(),
             change_filter: StatusFilter::default(),
             // No columns: a change set is a plain list of items of several
             // kinds, not a table of one value per row.
@@ -692,10 +759,9 @@ impl ConversationView {
         cx: &mut Context<Self>,
     ) {
         let running = self
-            .drivers
-            .iter()
-            .find(|d| d.focus() == focus && d.protocol().kind() == protocol && d.status().running)
-            .map(|d| d.conversation_id());
+            .agent_runs
+            .read(cx)
+            .running_conversation(focus, protocol);
         self.protocol = protocol;
         self.show(focus, running.flatten(), true, cx);
         self.settle_on_transcript(window, cx);
@@ -785,10 +851,7 @@ impl ConversationView {
         }
         self.reload();
         self.load_lifecycle_state(cx);
-        self.status = self
-            .current_driver()
-            .map(|d| d.status())
-            .unwrap_or_default();
+        self.status = self.current_status(cx).unwrap_or_default();
         self.publish_status(cx);
         cx.notify();
     }
@@ -859,7 +922,7 @@ impl ConversationView {
         let Some(starter) = protocol_for(self.protocol).starter() else {
             return;
         };
-        if self.current_driver().is_some_and(|d| d.status().running) {
+        if self.current_status(cx).is_some_and(|s| s.running) {
             return;
         }
         self.send(starter, window, cx);
@@ -882,112 +945,157 @@ impl ConversationView {
         })
     }
 
-    fn is_current(&self, driver: &ConversationDriver) -> bool {
+    fn is_current(&self, driver: &DriverSlot) -> bool {
         match self.conversation_id {
-            Some(id) => driver.conversation_id() == Some(id),
+            Some(id) => driver.conversation_id == Some(id),
             None => {
-                driver.conversation_id().is_none()
-                    && driver.focus() == self.focus
-                    && driver.protocol().kind() == self.protocol
+                driver.conversation_id.is_none()
+                    && driver.focus == self.focus
+                    && driver.protocol == self.protocol
             }
         }
     }
 
-    fn current_driver(&self) -> Option<&ConversationDriver> {
-        self.drivers.iter().find(|d| self.is_current(d))
+    /// The registry's slot index for what this view has open, when there is
+    /// one.
+    fn current_index(&self, cx: &App) -> Option<usize> {
+        self.agent_runs
+            .read(cx)
+            .find_index(self.focus, self.protocol, self.conversation_id)
     }
 
-    fn ensure_current_driver(&mut self) -> Result<usize, String> {
-        if let Some(ix) = self.drivers.iter().position(|d| self.is_current(d)) {
-            return Ok(ix);
-        }
-        let config = self.driver_config()?;
-        let driver = match self.conversation_id {
-            Some(id) => {
-                ConversationDriver::open(config, &self.fleet, id).map_err(|e| format!("{e:#}"))?
-            }
-            None => ConversationDriver::new(config, self.focus, self.protocol),
-        };
-        self.drivers.push(driver);
-        Ok(self.drivers.len() - 1)
+    fn current_status(&self, cx: &App) -> Option<ConversationStatus> {
+        let ix = self.current_index(cx)?;
+        self.agent_runs.read(cx).status_at(ix)
+    }
+
+    fn ensure_current_driver(&mut self, cx: &mut Context<Self>) -> Result<usize, String> {
+        let config = self.driver_config();
+        let focus = self.focus;
+        let protocol = self.protocol;
+        let conversation_id = self.conversation_id;
+        let fleet = self.fleet.clone();
+        self.agent_runs.update(cx, |runs, cx| {
+            let result = runs.ensure(focus, protocol, conversation_id, move || {
+                let config = config?;
+                match conversation_id {
+                    Some(id) => {
+                        ConversationDriver::open(config, &fleet, id).map_err(|e| format!("{e:#}"))
+                    }
+                    None => Ok(ConversationDriver::new(config, focus, protocol)),
+                }
+            });
+            cx.notify();
+            result
+        })
     }
 
     /// Work in flight, for the close-window warning.
-    pub fn running_work(&self) -> Vec<String> {
-        self.drivers
-            .iter()
-            .filter(|d| d.status().running)
-            .map(|d| {
-                let id = d.conversation_id().map(short_id).unwrap_or_default();
-                format!("Conversation agent running: {id}")
-            })
-            .collect()
+    pub fn running_work(&self, cx: &App) -> Vec<String> {
+        self.agent_runs.read(cx).running_work()
     }
 
-    /// Advance the drivers, and reload when the store changed. Returns
-    /// whether anything visible changed, and the worktree to re-read the
-    /// changed files from (the caller does that off the main thread).
-    fn poll(&mut self, committed: bool) -> (bool, Option<tod_store::fleet::Workdir>) {
+    /// The drivers with a turn in flight, taken to be ticked off the main
+    /// thread; [`Self::poll`] puts them back.
+    fn take_running(&mut self, cx: &mut Context<Self>) -> Vec<(u64, ConversationDriver)> {
+        self.agent_runs.update(cx, |runs, cx| {
+            let taken = runs.take_running();
+            cx.notify();
+            taken
+        })
+    }
+
+    /// Put back a driver that was away, stopping its turn if Stop was
+    /// pressed meanwhile.
+    fn put_back(&mut self, slot: u64, mut driver: ConversationDriver, cx: &mut Context<Self>) {
+        let cancelled = self
+            .agent_runs
+            .update(cx, |runs, _| runs.take_cancel(slot));
+        if cancelled
+            && let Err(err) = driver.cancel(&self.fleet, &mut SharedAgentAccess(&self.agent))
+        {
+            self.error = Some(format!("{err:#}").into());
+        }
+        self.agent_runs.update(cx, |runs, cx| {
+            runs.put_back(slot, driver);
+            cx.notify();
+        });
+    }
+
+    /// Take back the drivers ticked off the main thread, act on what they
+    /// reported, and reload when the store changed. Returns whether anything
+    /// visible changed, and the worktree to re-read the changed files from
+    /// (the caller does that off the main thread).
+    fn poll(
+        &mut self,
+        committed: bool,
+        ticked: Vec<(u64, ConversationDriver, Vec<ConversationEvent>)>,
+        cx: &mut Context<Self>,
+    ) -> (bool, Option<tod_store::fleet::Workdir>) {
         let mut finished = false;
         let mut current_error = None;
         let mut loop_turns = None;
-        if let Ok(mut agent) = self.agent.try_lock() {
-            let current = self.conversation_id;
-            for driver in &mut self.drivers {
-                for event in driver.tick(&self.fleet, agent.as_mut()) {
-                    finished = true;
-                    match event {
-                        ConversationEvent::TurnFinished { error: Some(error) } => {
-                            current_error = Some(error);
-                        }
-                        // The loop sent another turn: nothing ended, but the
-                        // transcript has a new marker and the side pane's
-                        // counter moved.
-                        ConversationEvent::Continued => {}
-                        ConversationEvent::TurnFinished { error: None } => {
-                            if let (ProtocolKind::GateCheck, Focus::Node(node)) =
-                                (driver.protocol().kind(), driver.focus())
-                            {
-                                self.pending_gate_reloads.push(node);
-                            }
-                            if let Some(node) = entered_state(&self.fleet, driver) {
-                                self.pending_entries.push(node);
-                            }
-                        }
-                        ConversationEvent::Rotated => {}
-                        ConversationEvent::Notice(notice) => self.pending_notices.push(notice),
+        let current = self.conversation_id;
+        for (slot, driver, events) in ticked {
+            // Every run this loop collects can block on a permission, not
+            // only the one this view shows: the workbench's chat drawer and
+            // the lifecycle panel's background runs have no poll loop of
+            // their own, so nothing else would ever ask the user.
+            if let Some(request) = driver.status().permission {
+                queue_permission_request(self.agent.clone(), request);
+            }
+            for event in events {
+                finished = true;
+                match event {
+                    ConversationEvent::TurnFinished { error: Some(error) } => {
+                        current_error = Some(error);
                     }
-                    if driver.conversation_id() == current && current.is_some() {
-                        loop_turns = Some(driver.continuations());
+                    // The loop sent another turn: nothing ended, but the
+                    // transcript has a new marker and the side pane's
+                    // counter moved.
+                    ConversationEvent::Continued => {}
+                    ConversationEvent::TurnFinished { error: None } => {
+                        if let (ProtocolKind::GateCheck, Focus::Node(node)) =
+                            (driver.protocol().kind(), driver.focus())
+                        {
+                            self.pending_gate_reloads.push(node);
+                        }
+                        if let Some(node) = entered_state(&self.fleet, &driver) {
+                            self.pending_entries.push(node);
+                        }
                     }
+                    ConversationEvent::Rotated => {}
+                    ConversationEvent::Notice(notice) => self.pending_notices.push(notice),
+                }
+                if driver.conversation_id() == current && current.is_some() {
+                    loop_turns = Some(driver.continuations());
                 }
             }
+            self.put_back(slot, driver, cx);
         }
         if let Some(turns) = loop_turns {
             self.loop_turns = turns;
         }
         let want_files = finished.then(|| self.implementation_worktree()).flatten();
-        let current = self
-            .current_driver()
-            .map(|d| d.status())
-            .unwrap_or_default();
-        if let Some(request) = current.permission.clone() {
-            queue_permission_request(self.agent.clone(), request);
+        if finished {
+            self.usage.stale = true;
         }
+        let current = self.current_status(cx).unwrap_or_default();
         // A finished run for another conversation leaves nothing to show.
         let conversation_id = self.conversation_id;
         let focus = self.focus;
         let protocol = self.protocol;
-        self.drivers.retain(|d| {
-            let current = match conversation_id {
-                Some(id) => d.conversation_id() == Some(id),
-                None => {
-                    d.conversation_id().is_none()
-                        && d.focus() == focus
-                        && d.protocol().kind() == protocol
-                }
-            };
-            current || d.status().running
+        self.agent_runs.update(cx, |runs, cx| {
+            runs.retain(|d| {
+                let current = match conversation_id {
+                    Some(id) => d.conversation_id == Some(id),
+                    None => {
+                        d.conversation_id.is_none() && d.focus == focus && d.protocol == protocol
+                    }
+                };
+                current || d.status.running
+            });
+            cx.notify();
         });
         let mut changed = false;
         if current != self.status {
@@ -1001,6 +1109,72 @@ impl ConversationView {
             changed = true;
         }
         (changed, want_files)
+    }
+
+    /// Read the open conversation's usage again when it is due: a different
+    /// conversation is open, a turn ended, or a turn has been running for
+    /// [`USAGE_REFRESH`]. Reading is the platforms' whole session logs, so it
+    /// happens on the background executor.
+    fn refresh_usage(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self.conversation_id else {
+            self.usage = ConversationUsage::default();
+            return;
+        };
+        if self.usage.conversation != Some(id) {
+            self.usage = ConversationUsage {
+                conversation: Some(id),
+                ..ConversationUsage::default()
+            };
+        }
+        let due = self.usage.stale
+            || self.usage.read_at.is_none_or(|at| {
+                self.status.running && at.elapsed() >= USAGE_REFRESH
+            });
+        if !due || self.usage.reading {
+            return;
+        }
+        self.usage.stale = false;
+        self.usage.reading = true;
+        self.usage.read_at = Some(std::time::Instant::now());
+        let fleet = self.fleet.clone();
+        cx.spawn(async move |this, cx| {
+            let usage = cx
+                .background_executor()
+                .spawn(async move {
+                    tod_core::run_transcript::usage_for_key(
+                        &fleet,
+                        &ConversationDriver::session_key(id),
+                    )
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if this.usage.conversation == Some(id) {
+                    this.usage.reading = false;
+                    if this.usage.recorded != usage {
+                        this.usage.recorded = usage;
+                        cx.notify();
+                    }
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// The usage to show: the platform records', filled in with what the
+    /// agent reported live where the records say nothing.
+    fn shown_usage(&self) -> Option<tod_agent::TokenUsage> {
+        let recorded = self
+            .usage
+            .recorded
+            .clone()
+            .filter(|_| self.usage.conversation == self.conversation_id);
+        match (recorded, self.status.live_usage.as_ref()) {
+            (Some(mut recorded), Some(live)) => {
+                recorded.fill_from_live(live);
+                Some(recorded)
+            }
+            (recorded, live) => recorded.or_else(|| live.cloned()),
+        }
     }
 
     /// The worktree an implementation conversation is running in, when that
@@ -1323,21 +1497,28 @@ impl ConversationView {
         cx.notify();
     }
 
+    /// Send `text` from the input, which is cleared at once; it is given back
+    /// if the message does not go out.
     fn send(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
-        if self.deliver(text, cx) {
+        if self.deliver(text, AfterSend::Input(window.window_handle()), cx) {
             self.transcript
                 .update(cx, |panel, cx| panel.clear_input(window, cx));
         }
     }
 
-    /// Send `text` as the user's message, leaving the input as it is; `true`
-    /// when it went out.
-    fn deliver(&mut self, text: &str, cx: &mut Context<Self>) -> bool {
+    /// Send `text` as the user's message. `true` when it was handed to the
+    /// driver; what came of it arrives in [`Self::sent`].
+    ///
+    /// Starting a turn runs git, Docker, and `tod-cli` (the worktree's
+    /// submodules, the container's environment, the build stamp), so the
+    /// driver goes to the background executor for it. Meanwhile the view
+    /// shows the agent starting, and Stop stops it once it has.
+    fn deliver(&mut self, text: &str, after: AfterSend, cx: &mut Context<Self>) -> bool {
         let text = text.trim().to_string();
         if text.is_empty() {
             return false;
         }
-        let ix = match self.ensure_current_driver() {
+        let ix = match self.ensure_current_driver(cx) {
             Ok(ix) => ix,
             Err(err) => {
                 self.error = Some(err.into());
@@ -1345,40 +1526,142 @@ impl ConversationView {
                 return false;
             }
         };
-        let result = match self.agent.lock() {
-            Ok(mut agent) => self.drivers[ix]
-                .send(&self.fleet, agent.as_mut(), &text)
-                .map_err(|e| format!("{e:#}")),
-            Err(_) => Err("the agent is unavailable".to_string()),
+        let Some((slot, mut driver)) = self
+            .agent_runs
+            .update(cx, |runs, cx| {
+                let taken = runs.take_to_send(ix);
+                cx.notify();
+                taken
+            })
+        else {
+            self.error = Some("the agent is still working on the previous message".into());
+            cx.notify();
+            return false;
         };
-        let sent = match result {
-            Ok(()) => {
-                self.error = None;
-                self.conversation_id = self.drivers[ix].conversation_id();
-                self.status = self.drivers[ix].status();
-                true
+        self.error = None;
+        self.status = self.current_status(cx).unwrap_or_default();
+        self.publish_status(cx);
+        cx.notify();
+        let fleet = self.fleet.clone();
+        let agent = self.agent.clone();
+        cx.spawn(async move |this, cx| {
+            let (driver, text, result) = cx
+                .background_executor()
+                .spawn(async move {
+                    let result = driver
+                        .send(&fleet, &mut SharedAgentAccess(&agent), &text)
+                        .map_err(|e| format!("{e:#}"));
+                    (driver, text, result)
+                })
+                .await;
+            let Ok(restore) =
+                this.update(cx, |this, cx| this.sent(slot, driver, &text, result, after, cx))
+            else {
+                return;
+            };
+            if let Some(window) = restore {
+                let _ = cx.update_window(window, |_, window, cx| {
+                    let _ = this.update(cx, |this, cx| {
+                        this.transcript.update(cx, |panel, cx| {
+                            if panel.input().read(cx).value().trim().is_empty() {
+                                panel.set_input(&text, window, cx);
+                            }
+                        });
+                    });
+                });
+            }
+        })
+        .detach();
+        true
+    }
+
+    /// The driver is back from sending `text`. Returns the window whose
+    /// input should have the text back, when it did not go out.
+    fn sent(
+        &mut self,
+        slot: u64,
+        driver: ConversationDriver,
+        text: &str,
+        result: Result<i64, String>,
+        after: AfterSend,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyWindowHandle> {
+        // Still what the view shows, unless the user moved on meanwhile.
+        let shown = self
+            .agent_runs
+            .read(cx)
+            .slot_by_id(slot)
+            .is_some_and(|d| self.is_current(d));
+        let focus = driver.focus();
+        let conversation = driver.conversation_id();
+        self.put_back(slot, driver, cx);
+        let mut restore = None;
+        match result {
+            Ok(user_seq) => {
+                if shown {
+                    self.error = None;
+                    self.conversation_id = conversation;
+                }
+                crate::ui::journey::record_action(
+                    cx,
+                    focus,
+                    "send",
+                    crate::ui::journey::Source::Keyboard,
+                    "conversation",
+                    tod_journey::Presented {
+                        notices: vec![format!("seq={user_seq}"), format!("length={}", text.len())],
+                        ..Default::default()
+                    },
+                );
+                if let AfterSend::Handoff(step) = after {
+                    self.choose_status(step, plan_steps::STATUS_IN_PROGRESS, cx);
+                }
             }
             Err(err) => {
-                self.error = Some(err.into());
-                false
+                if shown {
+                    self.error = Some(err.into());
+                    if let AfterSend::Input(window) = after {
+                        restore = Some(window);
+                    }
+                }
             }
-        };
+        }
+        if shown {
+            self.status = self.current_status(cx).unwrap_or_default();
+        }
         self.reload();
         self.publish_status(cx);
         cx.notify();
-        sent
+        restore
     }
 
     fn stop_turn(&mut self, cx: &mut Context<Self>) {
-        let Some(ix) = self.drivers.iter().position(|d| self.is_current(d)) else {
+        let Some(ix) = self.current_index(cx) else {
             return;
         };
-        if let Ok(mut agent) = self.agent.lock()
-            && let Err(err) = self.drivers[ix].cancel(&self.fleet, agent.as_mut())
-        {
-            self.error = Some(format!("{err:#}").into());
+        let mut cancel_error = None;
+        self.agent_runs.update(cx, |runs, cx| {
+            let Some(slot) = runs.slot_by_index(ix).map(|s| s.id) else {
+                return;
+            };
+            match runs.driver_mut(slot) {
+                Some(driver) => {
+                    if let Err(err) = driver.cancel(&self.fleet, &mut SharedAgentAccess(&self.agent))
+                    {
+                        cancel_error = Some(format!("{err:#}"));
+                    }
+                    let driver_status = driver.status();
+                    runs.set_status(slot, driver_status);
+                }
+                // Away starting (or collecting) the turn: stopped when it is back.
+                None => runs.set_cancel(slot),
+            }
+            cx.notify();
+        });
+        if let Some(err) = cancel_error {
+            self.error = Some(err.into());
         }
-        self.status = self.drivers[ix].status();
+        self.status = self.current_status(cx).unwrap_or_default();
         self.reload();
         self.publish_status(cx);
         cx.notify();
@@ -1623,6 +1906,25 @@ impl ConversationView {
         }
     }
 
+    /// Ctrl+Shift+R inside the view: report a problem against this
+    /// conversation's own focus and conversation id.
+    fn on_report_problem(
+        &mut self,
+        _: &ReportProblem,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        cx.stop_propagation();
+        let key = crate::app::window::journey_key_for_focus(self.focus);
+        window.dispatch_action(
+            Box::new(OpenReportDialog {
+                key,
+                conversation: self.conversation_id,
+            }),
+            cx,
+        );
+    }
+
     /// Nav-mode handlers yield while a text field is being edited.
     fn nav_guard(&self) -> bool {
         !self.text_editing()
@@ -1767,6 +2069,7 @@ impl Render for ConversationView {
                     cx,
                 );
             }))
+            .on_action(cx.listener(Self::on_report_problem))
             .on_action(
                 cx.listener(|this, _: &ConversationSubmit, window, cx| this.submit(window, cx)),
             )

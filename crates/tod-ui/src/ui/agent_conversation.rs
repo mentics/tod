@@ -22,6 +22,8 @@
 //! and status lines above the input, each with an optional button
 //! ([`AgentConversationPanel::set_notices`]); the panel reports clicks on them
 //! as [`AgentConversationEvent::Action`] and knows nothing of what they do.
+//! Icon buttons in the input's own row, left of Send, are
+//! [`AgentConversationPanel::set_tools`]; they report the same way.
 
 use crate::ui::key_context;
 use crate::ui::key_context::set_input_tab_stop;
@@ -37,7 +39,8 @@ use gpui::{
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::input::{Textarea, TextareaState};
 use gpui_component::spinner::Spinner;
-use gpui_component::{Disableable, Selectable, Sizable, h_flex, v_flex};
+use gpui_component::tooltip::Tooltip;
+use gpui_component::{Disableable, Icon, IconNamed, Selectable, Sizable, h_flex, v_flex};
 use std::collections::HashMap;
 
 pub use crate::ui::transcript_list::{ChunkId, Entry, EntryKind};
@@ -77,6 +80,8 @@ pub enum PanelStop {
     /// The button on notice `ix` (only notices that have one are stops).
     NoticeAction(usize),
     Input,
+    /// The host's icon button `ix`, left of Send.
+    Tool(usize),
     /// The host's action `ix`, beside Send.
     Action(usize),
     /// Stop the turn in flight (only while one runs).
@@ -106,6 +111,37 @@ impl PanelAction {
     pub fn primary(mut self, primary: bool) -> Self {
         self.primary = primary;
         self
+    }
+
+    pub fn disabled(mut self, disabled: bool) -> Self {
+        self.disabled = disabled;
+        self
+    }
+}
+
+/// A host icon button in the input's row, left of Send.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PanelTool {
+    /// Reported back in [`AgentConversationEvent::Action`].
+    pub id: SharedString,
+    /// The icon's asset path.
+    pub icon: SharedString,
+    pub tooltip: SharedString,
+    pub disabled: bool,
+}
+
+impl PanelTool {
+    pub fn new(
+        id: impl Into<SharedString>,
+        icon: impl IconNamed,
+        tooltip: impl Into<SharedString>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            icon: icon.path(),
+            tooltip: tooltip.into(),
+            disabled: false,
+        }
     }
 
     pub fn disabled(mut self, disabled: bool) -> Self {
@@ -156,8 +192,9 @@ pub enum AgentConversationEvent {
     Activated,
     /// Writing started or stopped.
     EditingChanged(bool),
-    /// One of the host's buttons ([`PanelAction::id`]).
-    Action(SharedString),
+    /// One of the host's buttons ([`PanelAction::id`]), and whether it was
+    /// clicked or activated from the keyboard highlight.
+    Action(SharedString, crate::ui::journey::Source),
 }
 
 pub struct AgentConversationPanel {
@@ -170,16 +207,24 @@ pub struct AgentConversationPanel {
     running: bool,
     activity: Option<SharedString>,
     title: SharedString,
+    /// Whether the panel draws its own title bar; a host that has its own
+    /// header turns it off.
+    header_visible: bool,
     empty_message: SharedString,
     /// Shown after the panel's own hint while not writing.
     extra_hint: Option<SharedString>,
     /// The host's buttons beside Send.
     actions: Vec<PanelAction>,
+    /// The host's icon buttons left of Send.
+    tools: Vec<PanelTool>,
     /// The host's buttons beside the title.
     header_actions: Vec<PanelAction>,
     /// The host's status lines above the input.
     notices: Vec<PanelNotice>,
     lifecycle_state: Option<String>,
+    /// The session's token usage: a line under the title, and every figure
+    /// in its tooltip.
+    usage: Option<(SharedString, SharedString)>,
     input: Entity<TextareaState>,
     editing: bool,
     return_focus: Option<FocusHandle>,
@@ -222,12 +267,15 @@ impl AgentConversationPanel {
             running: false,
             activity: None,
             title: SharedString::from(title.to_string()),
+            header_visible: true,
             empty_message: SharedString::default(),
             extra_hint: None,
             actions: Vec::new(),
+            tools: Vec::new(),
             header_actions: Vec::new(),
             notices: Vec::new(),
             lifecycle_state: None,
+            usage: None,
             input,
             editing: false,
             return_focus: None,
@@ -296,11 +344,29 @@ impl AgentConversationPanel {
         }
     }
 
+    /// The host's icon buttons left of Send, left to right.
+    pub fn set_tools(&mut self, tools: Vec<PanelTool>, cx: &mut Context<Self>) {
+        if tools != self.tools {
+            self.tools = tools;
+            self.keep_highlight();
+            cx.notify();
+        }
+    }
+
     /// Replace the panel's title.
     pub fn set_title(&mut self, title: impl Into<SharedString>, cx: &mut Context<Self>) {
         let title = title.into();
         if title != self.title {
             self.title = title;
+            cx.notify();
+        }
+    }
+
+    /// Hide the panel's title bar (title and header buttons) when the host
+    /// draws its own header.
+    pub fn set_header_visible(&mut self, visible: bool, cx: &mut Context<Self>) {
+        if visible != self.header_visible {
+            self.header_visible = visible;
             cx.notify();
         }
     }
@@ -318,6 +384,16 @@ impl AgentConversationPanel {
     pub fn set_lifecycle_state(&mut self, state: Option<String>, cx: &mut Context<Self>) {
         if state != self.lifecycle_state {
             self.lifecycle_state = state;
+            cx.notify();
+        }
+    }
+
+    /// The token usage shown under the title: a one-line summary, and the
+    /// full breakdown shown on hover. `None` hides the line.
+    pub fn set_usage(&mut self, usage: Option<(String, String)>, cx: &mut Context<Self>) {
+        let usage = usage.map(|(line, details)| (line.into(), details.into()));
+        if usage != self.usage {
+            self.usage = usage;
             cx.notify();
         }
     }
@@ -415,6 +491,13 @@ impl AgentConversationPanel {
         );
         stops.push(PanelStop::Input);
         stops.extend(
+            self.tools
+                .iter()
+                .enumerate()
+                .filter(|(_, t)| !t.disabled)
+                .map(|(ix, _)| PanelStop::Tool(ix)),
+        );
+        stops.extend(
             self.actions
                 .iter()
                 .enumerate()
@@ -456,17 +539,34 @@ impl AgentConversationPanel {
             PanelStop::Input => self.start_editing(window, cx),
             PanelStop::Action(ix) => {
                 if let Some(action) = self.actions.get(ix) {
-                    cx.emit(AgentConversationEvent::Action(action.id.clone()));
+                    cx.emit(AgentConversationEvent::Action(
+                        action.id.clone(),
+                        crate::ui::journey::Source::Keyboard,
+                    ));
+                }
+            }
+            PanelStop::Tool(ix) => {
+                if let Some(tool) = self.tools.get(ix) {
+                    cx.emit(AgentConversationEvent::Action(
+                        tool.id.clone(),
+                        crate::ui::journey::Source::Keyboard,
+                    ));
                 }
             }
             PanelStop::NoticeAction(ix) => {
                 if let Some(action) = self.notices.get(ix).and_then(|n| n.action.as_ref()) {
-                    cx.emit(AgentConversationEvent::Action(action.id.clone()));
+                    cx.emit(AgentConversationEvent::Action(
+                        action.id.clone(),
+                        crate::ui::journey::Source::Keyboard,
+                    ));
                 }
             }
             PanelStop::HeaderAction(ix) => {
                 if let Some(action) = self.header_actions.get(ix) {
-                    cx.emit(AgentConversationEvent::Action(action.id.clone()));
+                    cx.emit(AgentConversationEvent::Action(
+                        action.id.clone(),
+                        crate::ui::journey::Source::Keyboard,
+                    ));
                 }
             }
             PanelStop::Stop => cx.emit(AgentConversationEvent::Stop),
@@ -489,7 +589,10 @@ impl AgentConversationPanel {
             .selected(self.active && self.highlight == stop)
             .on_click(cx.listener(move |_, _, _, cx| {
                 cx.emit(AgentConversationEvent::Activated);
-                cx.emit(AgentConversationEvent::Action(id.clone()));
+                cx.emit(AgentConversationEvent::Action(
+                    id.clone(),
+                    crate::ui::journey::Source::Click,
+                ));
             }));
         if action.primary {
             button.primary()
@@ -654,6 +757,30 @@ impl Render for AgentConversationPanel {
             })
             .collect();
 
+        let tools: Vec<Button> = self
+            .tools
+            .clone()
+            .into_iter()
+            .enumerate()
+            .map(|(ix, tool)| {
+                let id = tool.id.clone();
+                Button::new(("agent-conversation-tool", ix))
+                    .icon(Icon::default().path(tool.icon))
+                    .ghost()
+                    .small()
+                    .disabled(tool.disabled)
+                    .selected(self.active && self.highlight == PanelStop::Tool(ix))
+                    .tooltip(tool.tooltip.clone())
+                    .on_click(cx.listener(move |_, _, _, cx| {
+                        cx.emit(AgentConversationEvent::Activated);
+                        cx.emit(AgentConversationEvent::Action(
+                            id.clone(),
+                            crate::ui::journey::Source::Click,
+                        ));
+                    }))
+            })
+            .collect();
+
         let has_lifecycle = !self.notices.is_empty() || !self.actions.is_empty();
 
         v_flex()
@@ -677,21 +804,38 @@ impl Render for AgentConversationPanel {
                     }
                 }),
             )
-            .child(
-                style::panel_header(h_flex())
-                    .items_center()
-                    .child(
-                        if self.active {
-                            style::text_title(div())
-                        } else {
-                            style::text_muted(div())
-                        }
-                        .flex_1()
-                        .min_w_0()
-                        .child(self.title.clone()),
-                    )
-                    .children(header_actions),
-            )
+            .when(self.header_visible, |el| {
+                el.child(
+                    style::panel_header(h_flex())
+                        .items_center()
+                        .child(
+                            if self.active {
+                                style::text_title(div())
+                            } else {
+                                style::text_muted(div())
+                            }
+                            .flex_1()
+                            .min_w_0()
+                            .child(self.title.clone()),
+                        )
+                        .children(header_actions),
+                )
+            })
+            .children(self.usage.clone().map(|(line, details)| {
+                div()
+                    .id("agent-conversation-usage")
+                    .px(style::space::INSET)
+                    .py(style::space::HAIRLINE)
+                    .border_b(style::size::BORDER)
+                    .border_color(style::color::divider())
+                    .tooltip(move |window, cx| Tooltip::new(details.clone()).build(window, cx))
+                    .child(style::text_dense_muted(div()).child(selectable_text(
+                        "agent-conversation-usage-text",
+                        line,
+                        window,
+                        cx,
+                    )))
+            }))
             .child(div().flex_1().min_h_0().child(self.list.clone()))
             .child(
                 style::panel_footer(v_flex()).child(field).child(
@@ -716,6 +860,7 @@ impl Render for AgentConversationPanel {
                                     })),
                             )
                         })
+                        .children(tools)
                         .child(
                             Button::new("agent-conversation-send")
                                 .label("Send")

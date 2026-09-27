@@ -56,6 +56,13 @@ impl FleetProjection {
         self.change_tx.subscribe()
     }
 
+    /// The sender behind [`Self::subscribe`], for announcing a change made on
+    /// a connection of its own without taking the projection's lock (callers
+    /// such as the journey change feed already hold it).
+    pub fn change_sender(&self) -> broadcast::Sender<()> {
+        self.change_tx.clone()
+    }
+
     /// Compare `PRAGMA data_version` and metadata; reload when the on-disk store changed.
     pub fn reload_if_stale(&mut self) -> Result<bool> {
         let conn = schema::open_read_connection(&self.db_path)?;

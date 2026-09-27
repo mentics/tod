@@ -1,0 +1,26 @@
+[package]
+name = "tod-journeys"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "tod-journeys"
+path = "src/main.rs"
+
+# Receiver binary for sealed journey bundles (doc/journeys/spec.md §9.5).
+# Depends on tod-journey and tod-integration only — no tod-core, tod-store,
+# or GPUI, so it stays a small, fast-starting standalone program that runs on
+# whatever desktop is receiving journeys.
+[dependencies]
+tod-journey = { path = "../tod-journey" }
+tod-integration = { path = "../tod-integration" }
+anyhow = "1.0"
+chrono = "0.4"
+dirs = "6.0"
+rand = "0.8"
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.8"
+
+[dev-dependencies]
+tempfile = "3.10"

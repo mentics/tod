@@ -178,13 +178,25 @@ work around with fixtures never needs the user. When something does:
   answer. Act on it; where the answer changes what an obligation says, update
   the obligation to match.
 
+## Asking the user
+
+You have no free-text reply the user reads as a question — your turn ends and
+nobody is there to see it. When a step's `decision` or `conflict` reason is a
+real question, also record it with `decisions ask`: the question, every option
+you see as `--option`, and `--evidence` linking whatever backs it up (the
+obligation, the plan step, a test run). This turn then ends, since nothing
+more can happen on that step until the user answers; the app hands the session
+back to you with the answer once they do. Never ask in your reply text —
+`decisions ask` is the only way to ask here.
+
 ## Your reply
 
 This is a scoped exception to the stance, which otherwise asks you to report
 what you did: your reply is **short**. The user already sees each plan step's
-status, the recorded test counts, and the files you changed, so never restate
-them — no summary of what you did, no list of steps, no test results, no YAML
-or other structured report.
+status, the recorded test counts, the files you changed, and any decision you
+asked, so never restate them — no summary of what you did, no list of steps,
+no test results, no YAML or other structured report, and no question: ask
+those through `decisions ask` instead.
 
 - Plan done: reply with nothing, or one sentence the user needs to know that
   the steps and tests do not show.

@@ -27,6 +27,9 @@ fn open_view<'a>(
     cx.update(|cx| {
         gpui_component::init(cx);
         register_conversation_keyboard_bindings(cx);
+        // The header's navigation order below includes "Report a problem",
+        // which only shows once reporting is set up.
+        crate::ui::report_problem::set_available(true, cx);
     });
     let slot = Rc::new(RefCell::new(None));
     let events: Events = Rc::new(RefCell::new(Vec::new()));
@@ -35,7 +38,10 @@ fn open_view<'a>(
     let (_, cx) = cx.add_window_view(move |window, cx| {
         let agent: SharedAgent = Arc::new(Mutex::new(Box::new(MockAgentProvider::new())));
         let lifecycle = cx.new(|_| LifecycleController::new(store.clone()));
-        let view = cx.new(|cx| ConversationView::new(window, cx, agent, store, lifecycle));
+        let agent_runs = cx.new(|_| AgentRuns::new(store.clone(), agent.clone()));
+        let view = cx.new(|cx| {
+            ConversationView::new(window, cx, agent, store, lifecycle, agent_runs)
+        });
         cx.subscribe(&view, move |_, _, event: &ConversationViewEvent, _| {
             events_in.borrow_mut().push(event.clone());
         })
@@ -303,7 +309,9 @@ fn picker_lists_only_this_focus_and_opens_the_chosen_one(cx: &mut TestAppContext
         assert_eq!(view.picker_label(), "2 of 2");
     });
 
-    // Input -> Picker, open it, move to the older one, open that.
+    // Input -> the transcript header's "Report a problem" action -> Picker,
+    // open it, move to the older one, open that.
+    cx.dispatch_action(ConversationUp);
     cx.dispatch_action(ConversationUp);
     cx.dispatch_action(ConversationActivate);
     assert_eq!(view.read_with(cx, |v, _| v.picker), Some(0));
@@ -498,13 +506,15 @@ fn the_input_is_a_tab_stop_only_while_editing(cx: &mut TestAppContext) {
     assert!(!view.read_with(cx, |v, _| v.input_editing));
     assert!(!tab_stop(&view, cx));
 
-    // With no turns, stops run Back, Forward, Picker, then the transcript's
-    // input, and stop at the ends.
+    // With no turns, stops run Back, Forward, Picker, the transcript
+    // header's "Report a problem" action, then the transcript's input, and
+    // stop at the ends.
     cx.dispatch_action(ConversationUp);
     cx.dispatch_action(ConversationUp);
     cx.dispatch_action(ConversationUp);
     cx.dispatch_action(ConversationUp);
     assert_eq!(view.read_with(cx, |v, _| v.stop), Stop::Back);
+    cx.dispatch_action(ConversationDown);
     cx.dispatch_action(ConversationDown);
     cx.dispatch_action(ConversationDown);
     cx.dispatch_action(ConversationDown);
@@ -528,6 +538,7 @@ fn append_turn(
                 role,
                 body: body.into(),
                 parts,
+                sent_context: None,
             },
         )
         .unwrap();
@@ -619,7 +630,9 @@ fn a_reply_shows_its_answer_with_the_work_collapsed(cx: &mut TestAppContext) {
         view.read_with(cx, |v, cx| v.transcript.read(cx).highlight()),
         PanelStop::Input
     );
-    // Above the first message is the picker, then Forward and Back.
+    // Above the first message is the transcript header's "Report a
+    // problem" action, then the picker, then Forward and Back.
+    cx.dispatch_action(ConversationUp);
     cx.dispatch_action(ConversationUp);
     cx.dispatch_action(ConversationUp);
     cx.dispatch_action(ConversationUp);
@@ -1905,12 +1918,15 @@ fn copy_context_puts_the_opening_context_on_the_clipboard(cx: &mut TestAppContex
     let node = Focus::Node(fixture.node_id);
     let without = create_conversation(&fixture, node);
     let (view, _, cx) = open_view(&fixture, node, cx);
+    // "Report a problem" is always a header action here (`open_view` turns
+    // reporting on), so its presence isn't a useful signal; "Copy context" only appears once there's context to
+    // copy, at which point it pushes "Report a problem" out to index 1.
     let header_stop = |view: &Entity<ConversationView>, cx: &mut VisualTestContext| {
         view.read_with(cx, |view, cx| {
             view.transcript
                 .read(cx)
                 .stops()
-                .contains(&PanelStop::HeaderAction(0))
+                .contains(&PanelStop::HeaderAction(1))
         })
     };
     // Nothing recorded, nothing to copy.
@@ -1947,6 +1963,28 @@ fn copy_context_puts_the_opening_context_on_the_clipboard(cx: &mut TestAppContex
         view.read_with(cx, |v, _| v.status_line.contains("Copied")),
         "the header says it was copied"
     );
+}
+
+#[gpui::test]
+fn report_a_problem_is_not_offered_until_reporting_is_set_up(cx: &mut TestAppContext) {
+    let fixture = Fixture::new();
+    let node = Focus::Node(fixture.node_id);
+    create_conversation(&fixture, node);
+    let (view, _, cx) = open_view(&fixture, node, cx);
+    let has_header_action = |view: &Entity<ConversationView>, cx: &mut VisualTestContext| {
+        view.read_with(cx, |view, cx| {
+            view.transcript
+                .read(cx)
+                .stops()
+                .contains(&PanelStop::HeaderAction(0))
+        })
+    };
+    draw(cx);
+    assert!(has_header_action(&view, cx), "offered once set up");
+
+    cx.update(|_, cx| crate::ui::report_problem::set_available(false, cx));
+    draw(cx);
+    assert!(!has_header_action(&view, cx), "hidden while it is not");
 }
 
 #[gpui::test]
@@ -2004,6 +2042,7 @@ fn the_gate_check_waive_and_advance_run_from_the_conversation(cx: &mut TestAppCo
     set_lifecycle(&fixture, "ready");
     let (view, _, cx) = open_view(&fixture, Focus::Node(fixture.node_id), cx);
     press_lifecycle(&view, "Gate check → active", cx);
+    cx.run_until_parked();
 
     let waive = view
         .read_with(cx, |view, cx| view.gate_notices(cx))
@@ -2017,7 +2056,12 @@ fn the_gate_check_waive_and_advance_run_from_the_conversation(cx: &mut TestAppCo
     );
     for action in waive {
         view.update_in(cx, |view, window, cx| {
-            view.lifecycle_action(&action.id, window, cx)
+            view.lifecycle_action(
+                &action.id,
+                crate::ui::journey::Source::Click,
+                window,
+                cx,
+            )
         });
     }
     draw(cx);
@@ -2208,6 +2252,93 @@ fn every_lifecycle_run_starts_a_new_conversation(cx: &mut TestAppContext) {
     }
 }
 
+/// Starting a run never holds up the UI: it runs git, Docker, and `tod-cli`,
+/// so the click only shows the agent starting and the driver starts the turn
+/// on the background executor.
+#[gpui::test]
+fn a_lifecycle_run_starts_off_the_main_thread(cx: &mut TestAppContext) {
+    let fixture = Fixture::new();
+    set_lifecycle(&fixture, "review");
+    let node = Focus::Node(fixture.node_id);
+    let (view, _, cx) = open_view(&fixture, node, cx);
+    // The view builds its drivers from the installed data root, which a
+    // test has none of; give it one built from the fixture's.
+    let config = ConversationConfig {
+        data_root: fixture.store.paths().root().to_path_buf(),
+        media: tod_core::media::MediaPaths::discover().expect("media paths"),
+        launch: tod_agent::AgentLaunchOptions::for_platform(tod_agent::AgentPlatform::Claude),
+        context: Default::default(),
+    };
+    view.update(cx, |view, cx| {
+        let driver = ConversationDriver::new(config, node, ProtocolKind::Fix);
+        view.agent_runs.update(cx, |runs, cx| {
+            runs.ensure(node, ProtocolKind::Fix, None, || Ok(driver)).unwrap();
+            cx.notify();
+        });
+    });
+
+    view.update_in(cx, |view, window, cx| {
+        view.run(node, ProtocolKind::Fix, window, cx)
+    });
+    view.read_with(cx, |v, app| {
+        assert!(v.status.running, "the view shows the agent starting: {:?}", v.error);
+        assert_eq!(v.status.activity.as_deref(), Some("Starting the agent…"));
+        assert_eq!(v.conversation_id(), None, "nothing was sent on the main thread");
+        assert!(v.running_work(app).len() == 1, "a starting run is work in flight");
+    });
+
+    cx.run_until_parked();
+    view.read_with(cx, |v, _| {
+        assert_ne!(v.status.activity.as_deref(), Some("Starting the agent…"));
+        assert!(
+            v.conversation_id().is_some() || v.error.is_some(),
+            "the driver came back with the conversation, or why not"
+        );
+    });
+}
+
+/// The gate check answers the criteria the app can on the background
+/// executor: some read the pull request from GitHub, so the click only shows
+/// the check started, here and in the lifecycle panel, and the verdict
+/// arrives when the work is done.
+#[gpui::test]
+fn the_gate_check_settles_its_criteria_off_the_main_thread(cx: &mut TestAppContext) {
+    let fixture = Fixture::new();
+    set_lifecycle(&fixture, "ready");
+    let (view, _, cx) = open_view(&fixture, Focus::Node(fixture.node_id), cx);
+    let task_id = fixture.node_id.to_string();
+    let gate_status = |view: &Entity<ConversationView>, cx: &mut VisualTestContext| {
+        view.read_with(cx, |view, cx| {
+            view.lifecycle
+                .read(cx)
+                .state(&task_id)
+                .map(|s| (s.gate_status.clone(), s.criteria_detail.len()))
+                .unwrap_or_default()
+        })
+    };
+
+    press_lifecycle(&view, "Gate check → active", cx);
+    assert_eq!(
+        gate_status(&view, cx),
+        (lifecycle::SETTLING.to_string(), 0),
+        "the check shows as started, and nothing is settled on the main thread"
+    );
+    let labels = lifecycle_labels(&view, cx);
+    assert!(
+        labels.contains(&"Checking gate…".to_string()),
+        "no second check while one runs: {labels:?}"
+    );
+
+    cx.run_until_parked();
+    let (status, criteria) = gate_status(&view, cx);
+    assert_ne!(status, lifecycle::SETTLING);
+    assert!(criteria > 0, "the settled criteria are shown");
+    assert!(
+        lifecycle_labels(&view, cx).contains(&"Gate check → active".to_string()),
+        "the check is over, so it can be run again"
+    );
+}
+
 /// With findings open, Fix sits beside Review. A fix conversation's pane
 /// lists the same findings under a status filter, and a rejection shows its
 /// note.
@@ -2359,4 +2490,63 @@ fn conversation_obligations_pane_hosts_the_obligations_list(cx: &mut TestAppCont
 
 fn counts(changes: &[tod_store::conversation::NetChange]) -> Vec<usize> {
     change_counts(changes).into_iter().map(|(_, n)| n).collect()
+}
+
+// ----- journey: presented snapshot ---------------------------------------------
+
+/// `presented_lifecycle_controls` must describe exactly what `lifecycle_controls`
+/// renders — same ids/labels/primary/disabled — so the recorded journey
+/// snapshot never drifts from the UI (doc/journeys/spec.md §3.1).
+#[gpui::test]
+fn presented_lifecycle_controls_matches_the_rendered_buttons(cx: &mut TestAppContext) {
+    let fixture = Fixture::new();
+    set_lifecycle(&fixture, "design");
+    let (view, _, cx) = open_view(&fixture, Focus::Node(fixture.node_id), cx);
+
+    let presented = view.read_with(cx, |view, cx| view.presented_lifecycle_controls(cx));
+    let (actions, _) = view.read_with(cx, |view, cx| view.lifecycle_controls(cx));
+
+    assert_eq!(presented.actions.len(), actions.len());
+    for (p, a) in presented.actions.iter().zip(actions.iter()) {
+        assert_eq!(p.id, a.id.to_string());
+        assert_eq!(p.label, a.label.to_string());
+        assert_eq!(p.primary, a.primary);
+        assert_eq!(p.disabled, a.disabled);
+    }
+    // "Gate check → planning" is the primary action on a `design` node.
+    let primary = presented
+        .actions
+        .iter()
+        .find(|a| a.primary)
+        .expect("a design node has a primary action");
+    assert_eq!(primary.label, "Gate check → planning");
+}
+
+/// Pressing a lifecycle button records a `UserAction` to the app journey ring
+/// buffer with the `Presented` snapshot captured at press time.
+#[gpui::test]
+fn pressing_a_lifecycle_button_records_the_presented_snapshot(cx: &mut TestAppContext) {
+    let fixture = Fixture::new();
+    set_lifecycle(&fixture, "ready");
+    let (view, _, cx) = open_view(&fixture, Focus::Node(fixture.node_id), cx);
+
+    let before = cx.update(|_, cx| crate::ui::journey::hub(cx).read(cx).len());
+    press_lifecycle(&view, "Gate check → active", cx);
+    let after = cx.update(|_, cx| crate::ui::journey::hub(cx).read(cx).len());
+    assert!(after > before, "pressing a lifecycle button records an entry");
+
+    let last = cx.update(|_, cx| crate::ui::journey::hub(cx).read(cx).snapshot());
+    let last = last.last().expect("at least one entry recorded");
+    match &last.record.event {
+        tod_journey::Event::UserAction {
+            surface, presented, ..
+        } => {
+            assert_eq!(surface, "conversation");
+            assert!(
+                presented.actions.iter().any(|a| a.primary),
+                "the recorded snapshot includes the primary button"
+            );
+        }
+        other => panic!("expected a UserAction, got {other:?}"),
+    }
 }

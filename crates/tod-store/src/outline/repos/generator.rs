@@ -346,18 +346,6 @@ impl<'a> GeneratorRepo<'a> {
         Ok(links)
     }
 
-    /// List links by external id (across all generators).
-    pub fn links_for_external_id(&self, external_id: &str) -> Result<Vec<ManagedNodeLink>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT node_id, generator_node_id, external_id, source_type, user_modified_fields
-             FROM managed_node_links WHERE external_id = ?1",
-        )?;
-        let links = stmt
-            .query_map(params![external_id], row_to_link)?
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(links)
-    }
-
     /// Delete all managed child nodes under a generator node (recursive).
     pub fn delete_managed_children(&self, generator_node_id: Uuid) -> Result<()> {
         // Find all managed descendants by walking the outline tree from the generator.
@@ -431,27 +419,6 @@ impl<'a> GeneratorRepo<'a> {
             params![uuid_to_blob(node_id), json],
         )?;
         Ok(())
-    }
-
-    /// A managed node is greyed out when a copy of the same external item
-    /// exists outside any generator subtree (i.e. another link with the same
-    /// `external_id` points at a non-managed node). Computed live from the
-    /// links table, so it clears immediately when the last copy is deleted
-    /// and survives config-change rebuilds (which preserve node ids for
-    /// external ids that keep matching).
-    pub fn is_greyed_out(&self, node_id: Uuid) -> Result<bool> {
-        if !self.is_managed(node_id)? {
-            return Ok(false);
-        }
-        let Some(link) = self.get_link(node_id)? else {
-            return Ok(false);
-        };
-        for other in self.links_for_external_id(&link.external_id)? {
-            if other.node_id != node_id && !self.is_managed(other.node_id)? {
-                return Ok(true);
-            }
-        }
-        Ok(false)
     }
 
     /// Mark a single field as user-modified on a linked node, if it has a

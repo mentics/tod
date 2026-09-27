@@ -12,6 +12,7 @@ pub mod context;
 pub mod driver;
 pub mod fix;
 pub mod gate_check;
+pub mod handoff;
 pub mod implement;
 pub mod incoming;
 pub mod mock;
@@ -24,6 +25,7 @@ pub mod verify;
 mod tests;
 
 pub use driver::{
-    ConversationConfig, ConversationDriver, ConversationEvent, ConversationStatus, ROTATION_NOTE,
+    AgentAccess, ConversationConfig, ConversationDriver, ConversationEvent, ConversationStatus,
+    ROTATION_NOTE, SharedAgentAccess,
 };
 pub use protocol::{CONTINUATION_CAP, Next, Protocol, ProtocolEnv, RunNotice, protocol_for};

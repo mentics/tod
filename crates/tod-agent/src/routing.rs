@@ -101,6 +101,12 @@ impl AgentProvider for RoutingAgentProvider {
             .or_else(|| self.claude.session_reply_parts(key))
     }
 
+    fn session_token_usage(&self, key: &str) -> Option<crate::TokenUsage> {
+        self.cursor
+            .session_token_usage(key)
+            .or_else(|| self.claude.session_token_usage(key))
+    }
+
     fn close_session(&mut self, key: &str) {
         self.cursor.close_session(key);
         self.claude.close_session(key);

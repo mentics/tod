@@ -80,6 +80,14 @@ pub enum RowAction {
     AcceptTicket {
         task_id: String,
     },
+    /// Right-click anywhere on the row: select it and open the context menu.
+    OpenContextMenu {
+        task_id: String,
+    },
+    /// The row's attention badge (needs-you count).
+    OpenTaskPanel {
+        task_id: String,
+    },
 }
 
 pub struct TaskListDelegate {
@@ -243,7 +251,37 @@ impl ListDelegate for TaskListDelegate {
             });
 
         let mut chips = h_flex().gap_1().items_center().ml_auto();
-        if managed && self.recently_updated.contains(&item.id) {
+        if item.needs_you_count > 0 {
+            let task_id_badge = item.id.clone();
+            let sink_badge = sink.clone();
+            let warning_text = crate::ui::style::color::callout_warning_text();
+            let warning_fill = crate::ui::style::color::callout_warning_fill();
+            let warning_edge = crate::ui::style::color::callout_warning_edge();
+            chips = chips.child(
+                div()
+                    .px_2()
+                    .py_0p5()
+                    .rounded_md()
+                    .text_xs()
+                    .cursor_pointer()
+                    .border_1()
+                    .border_color(warning_edge)
+                    .bg(warning_fill)
+                    .text_color(warning_text)
+                    .child(format!("Needs you · {}", item.needs_you_count))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |_, _, _, cx| {
+                            cx.stop_propagation();
+                            sink_badge.borrow_mut().push(RowAction::OpenTaskPanel {
+                                task_id: task_id_badge.clone(),
+                            });
+                            cx.notify();
+                        }),
+                    ),
+            );
+        }
+        if item.linked_copy && self.recently_updated.contains(&item.id) {
             chips = chips.child(
                 div()
                     .size(px(6.0))
@@ -467,7 +505,14 @@ impl ListDelegate for TaskListDelegate {
         }
         if is_work {
             if !item.lifecycle.is_empty() {
-                let lifecycle = item.lifecycle.clone();
+                // The unified view (W11) may override the plain lifecycle
+                // name with its status label (`state`, `state →`, `→
+                // state`), precomputed by the host from `AgentRuns` and fed
+                // in via `TaskListView::set_status_overrides`; the existing
+                // Tasks view never calls it, so `status_override` stays
+                // `None` there and this chip shows the plain lifecycle name
+                // exactly as before.
+                let lifecycle = item.status_override.clone().unwrap_or_else(|| item.lifecycle.clone());
                 let task_id_lc = item.id.clone();
                 chips = chips.child(action_chip(
                     cx,
@@ -586,8 +631,14 @@ impl ListDelegate for TaskListDelegate {
         } else {
             let title_color = if item.title.is_empty() {
                 muted_foreground
+            } else if item.has_copies {
+                // `styles.node-title-has-copies`
+                crate::ui::style::color::linked_source_text()
             } else if managed {
                 muted_foreground
+            } else if item.linked_copy {
+                // `styles.node-title-linked-copy`
+                crate::ui::style::color::linked_copy_text()
             } else {
                 foreground
             };
@@ -605,11 +656,10 @@ impl ListDelegate for TaskListDelegate {
                 ),
             ));
         }
-        let chips_menu_open = selected
-            && self
-                .open_row_menu
-                .as_ref()
-                .is_some_and(|(kind, id)| matches!(kind, RowMenuKind::Shells) && id == &item.id);
+        let chips_menu_open = self.open_row_menu.as_ref().is_some_and(|(kind, id)| {
+            (selected && matches!(kind, RowMenuKind::Shells) || matches!(kind, RowMenuKind::Context))
+                && id == &item.id
+        });
         let title_line = if chips_menu_open {
             title_row.child(row_menu_anchor(chips, self.row_menu.clone()))
         } else {
@@ -662,6 +712,17 @@ impl ListDelegate for TaskListDelegate {
                     }
                 }),
             )
+            .on_mouse_down(MouseButton::Right, {
+                let task_id = item.id.clone();
+                let sink = sink.clone();
+                cx.listener(move |_, _, _, cx| {
+                    cx.stop_propagation();
+                    sink.borrow_mut().push(RowAction::OpenContextMenu {
+                        task_id: task_id.clone(),
+                    });
+                    cx.notify();
+                })
+            })
             .when(has_spec, |el| {
                 // An obligation dragged off the obligations panel: the same
                 // payload every item list drags, so the row it came from did

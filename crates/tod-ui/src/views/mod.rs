@@ -1,5 +1,6 @@
 pub mod action_panel;
 pub mod agent_transcripts;
+pub mod cloud_node;
 pub mod command_history;
 pub mod database;
 pub mod interactive_agent;
@@ -9,6 +10,7 @@ pub mod lifecycle_control;
 pub mod lifecycle_panel;
 pub mod obligations;
 pub mod plan_steps;
+pub mod pull_requests;
 pub mod rows;
 pub mod task_edit;
 pub mod task_list;

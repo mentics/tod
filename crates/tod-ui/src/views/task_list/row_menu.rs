@@ -8,11 +8,14 @@ use gpui_component::menu::{PopupMenu, PopupMenuItem};
 
 use super::TaskListEvent;
 use super::TaskListView;
+use super::context_menu;
 use super::model::TaskItem;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum RowMenuKind {
     Shells,
+    /// The right-click menu (`context_menu.rs`).
+    Context,
 }
 
 /// Anchor a popup under a row trigger: it hangs from the trigger's own corner,
@@ -59,6 +62,18 @@ impl TaskListView {
         }
     }
 
+    /// Right-click: select the row and always (re-)open the context menu for
+    /// it, closing whatever menu was open before.
+    pub(super) fn open_context_menu(
+        &mut self,
+        task_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.select_task_by_id(task_id, window, cx);
+        self.open_row_menu_for(RowMenuKind::Context, task_id.to_string(), window, cx);
+    }
+
     pub(super) fn close_row_menu(&mut self, cx: &mut Context<Self>) {
         if self.open_row_menu.take().is_some() || self.row_menu.is_some() {
             self.row_menu = None;
@@ -103,6 +118,11 @@ impl TaskListView {
             return;
         };
 
+        let attention_count = self
+            .attention
+            .get(&task_id)
+            .map(|a| a.count)
+            .unwrap_or(0);
         let view = cx.weak_entity();
         let focus = self.focus_handle.clone();
         let menu = PopupMenu::build(window, cx, move |menu, _window, _cx| {
@@ -111,6 +131,7 @@ impl TaskListView {
                     .min_w(crate::ui::style::size::ROW_MENU_MIN),
                 kind,
                 task,
+                attention_count,
                 view,
             )
         });
@@ -133,9 +154,11 @@ fn build_row_menu(
     mut menu: PopupMenu,
     kind: RowMenuKind,
     task: TaskItem,
+    attention_count: usize,
     view: gpui::WeakEntity<TaskListView>,
 ) -> PopupMenu {
     match kind {
+        RowMenuKind::Context => context_menu::build(menu, &task, attention_count, view),
         RowMenuKind::Shells => {
             for shell in &task.shells {
                 let view = view.clone();

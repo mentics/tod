@@ -186,6 +186,31 @@ impl<'a> PlanStepRepo<'a> {
         Ok(rows)
     }
 
+    /// Steps handed back to the user (`partial` / `blocked`) across every
+    /// node in `node_ids`, oldest-touched first, with the time each was last
+    /// updated — in one query, for a list view over many nodes at once (e.g.
+    /// `tod_core::attention`).
+    pub fn list_needs_user_for_nodes(&self, node_ids: &[Uuid]) -> Result<Vec<(PlanStep, i64)>> {
+        if node_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = node_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT id, node_id, ordinal, body, status, note, reason, updated_at
+             FROM node_plan_steps
+             WHERE status IN ('partial', 'blocked') AND node_id IN ({placeholders})
+             ORDER BY updated_at"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let params: Vec<Vec<u8>> = node_ids.iter().copied().map(uuid_to_blob).collect();
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(params.iter()), |row| {
+                Ok((map_plan_step(row)?, row.get::<_, i64>(7)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     pub fn list_ids_for_node(&self, node_id: Uuid) -> Result<Vec<Uuid>> {
         let mut stmt = self
             .conn

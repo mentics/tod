@@ -6,6 +6,7 @@ use crate::interview::settings::{
 use crate::ui::app_nav::{AppDestination, AppNavMenu, HasAppNav};
 use crate::ui::key_context;
 use crate::ui::list::{ListArrowDown, ListArrowUp};
+use crate::ui::style;
 use gpui::prelude::FluentBuilder;
 use gpui::{
     App, AppContext, Context, Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement,
@@ -17,12 +18,13 @@ use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::resizable::{h_resizable, resizable_panel};
 use gpui_component::scroll::ScrollableElement;
 use gpui_component::select::{Select, SelectEvent, SelectState};
-use gpui_component::{ActiveTheme, IndexPath, Selectable, StyledExt, h_flex, v_flex};
+use gpui_component::{ActiveTheme, Disableable, IndexPath, Selectable, StyledExt, h_flex, v_flex};
 use std::path::PathBuf;
 use std::time::Duration;
 use tod_core::logging;
+use tod_journey::RelayCode;
 use tod_store::fleet::default_terminal_hint;
-use tod_store::settings::DEFAULT_TREEHOUSE_EXECUTABLE;
+use tod_store::settings::{DEFAULT_TREEHOUSE_EXECUTABLE, JourneySettings};
 use tod_store::{AgentRole, efforts_for, models_for, parse_platform};
 
 const SAVE_DEBOUNCE: Duration = Duration::from_secs(2);
@@ -31,13 +33,21 @@ const SIDEBAR_MIN: f32 = 140.0;
 const PANEL_MIN: f32 = 320.0;
 const SETTINGS_CONTEXT: &str = "Settings";
 
-const SECTIONS: [SettingsSection; 5] = [
+const SECTIONS: [SettingsSection; 7] = [
     SettingsSection::Agents,
     SettingsSection::QuestionMaker,
     SettingsSection::AnswerProcessor,
     SettingsSection::Workspaces,
+    SettingsSection::CloudSandboxes,
     SettingsSection::Logging,
+    SettingsSection::Journeys,
 ];
+
+/// Spec §9.1's first warning callout, verbatim.
+const JOURNEYS_WARNING: &str = "Journeys leave this computer. They are encrypted so that only the receiving computer can read them, but they are delivered to a computer that is not managed by your employer. If this is a work computer, make sure your employer's policy allows it before turning this on. Transcripts are left out unless you include them below.";
+
+/// Spec §9.1's shorter warning, repeated beside Include transcripts.
+const JOURNEYS_TRANSCRIPTS_WARNING: &str = "Transcripts can contain anything you or the agent typed or read, including code and data from your work.";
 
 actions!(
     settings,
@@ -102,7 +112,9 @@ enum SettingsSection {
     QuestionMaker,
     AnswerProcessor,
     Workspaces,
+    CloudSandboxes,
     Logging,
+    Journeys,
 }
 
 impl SettingsSection {
@@ -112,7 +124,9 @@ impl SettingsSection {
             Self::QuestionMaker => "Question maker",
             Self::AnswerProcessor => "Agent context",
             Self::Workspaces => "Workspaces",
+            Self::CloudSandboxes => "Cloud sandboxes",
             Self::Logging => "Logging",
+            Self::Journeys => "Journeys",
         }
     }
 
@@ -122,7 +136,9 @@ impl SettingsSection {
             Self::QuestionMaker => "question-maker",
             Self::AnswerProcessor => "answer-processor",
             Self::Workspaces => "workspaces",
+            Self::CloudSandboxes => "cloud-sandboxes",
             Self::Logging => "logging",
+            Self::Journeys => "journeys",
         }
     }
 
@@ -144,7 +160,16 @@ impl SettingsSection {
                 TreehouseWorktreesRoot,
                 TerminalProgram,
             ],
+            Self::CloudSandboxes => &[SandboxWorkspace, SandboxSignIn, SandboxApiKey, SandboxDefaultImage],
             Self::Logging => &[LogLevel, LogMaxSize],
+            Self::Journeys => &[
+                JourneysSend,
+                JourneysIncludeTranscripts,
+                JourneysRelayCode,
+                JourneysSendTest,
+                JourneysMilestoneStates,
+                JourneysStorageCap,
+            ],
         }
     }
 }
@@ -161,10 +186,24 @@ enum SettingField {
     TreehouseExecutable,
     TreehouseWorktreesRoot,
     TerminalProgram,
+    /// The Blaxel workspace cloud sandboxes live in (`sandboxes.toml`).
+    SandboxWorkspace,
+    /// An API key or `bl login`.
+    SandboxSignIn,
+    /// The API key, kept in the credential store (never shown again).
+    SandboxApiKey,
+    /// The image a new sandbox starts from unless one is given.
+    SandboxDefaultImage,
     LogLevel,
     LogMaxSize,
     ChatLaunchMode,
     MaxParallelSessions,
+    JourneysSend,
+    JourneysIncludeTranscripts,
+    JourneysRelayCode,
+    JourneysSendTest,
+    JourneysMilestoneStates,
+    JourneysStorageCap,
 }
 
 impl SettingField {
@@ -181,10 +220,20 @@ impl SettingField {
             Self::TreehouseExecutable => "treehouse-executable",
             Self::TreehouseWorktreesRoot => "treehouse-worktrees-root",
             Self::TerminalProgram => "terminal-program",
+            Self::SandboxWorkspace => "sandbox-workspace",
+            Self::SandboxSignIn => "sandbox-sign-in",
+            Self::SandboxApiKey => "sandbox-api-key",
+            Self::SandboxDefaultImage => "sandbox-default-image",
             Self::LogLevel => "log-level",
             Self::LogMaxSize => "log-max-size",
             Self::ChatLaunchMode => "chat-launch-mode",
             Self::MaxParallelSessions => "max-parallel-sessions",
+            Self::JourneysSend => "journeys-send",
+            Self::JourneysIncludeTranscripts => "journeys-include-transcripts",
+            Self::JourneysRelayCode => "journeys-relay-code",
+            Self::JourneysSendTest => "journeys-send-test",
+            Self::JourneysMilestoneStates => "journeys-milestone-states",
+            Self::JourneysStorageCap => "journeys-storage-cap",
         }
     }
 }
@@ -252,7 +301,7 @@ impl AgentRoleSelects {
                 move |this, _, event: &SelectEvent<Vec<String>>, cx| {
                     if let SelectEvent::Confirm(Some(value)) = event {
                         this.settings.set_model_for(role, value.clone());
-                        this.schedule_save(cx);
+                        this.schedule_save("model", cx);
                         cx.notify();
                     }
                 },
@@ -262,7 +311,7 @@ impl AgentRoleSelects {
                 move |this, _, event: &SelectEvent<Vec<String>>, cx| {
                     if let SelectEvent::Confirm(Some(value)) = event {
                         this.settings.set_effort_for(role, value.clone());
-                        this.schedule_save(cx);
+                        this.schedule_save("effort", cx);
                         cx.notify();
                     }
                 },
@@ -286,6 +335,22 @@ pub struct SettingsView {
     terminal_program_input: Entity<InputState>,
     treehouse_worktrees_root_input: Entity<InputState>,
     treehouse_executable_input: Entity<InputState>,
+    relay_code_input: Entity<InputState>,
+    milestone_states_input: Entity<InputState>,
+    /// Cloud sandboxes: kept in `sandboxes.toml` (shared with `tod-sandbox`),
+    /// not in the settings file; saved when leaving the field with
+    /// Enter or Escape.
+    sandbox_workspace_input: Entity<InputState>,
+    sandbox_image_input: Entity<InputState>,
+    sandbox_key_input: Entity<InputState>,
+    sandbox_auth: tod_store::fleet::sandbox::AuthMode,
+    /// Whether an API key is stored; `None` until the keyring has been read
+    /// (off the UI thread: it can prompt).
+    sandbox_has_key: Option<bool>,
+    /// Drops a sign-in check superseded by a later change.
+    sandbox_check_generation: u64,
+    sandbox_editing: Option<SettingField>,
+    sandbox_status: Option<Result<SharedString, SharedString>>,
     agent_selects: Vec<AgentRoleSelects>,
     focus_handle: FocusHandle,
     app_nav: AppNavMenu,
@@ -295,12 +360,22 @@ pub struct SettingsView {
     terminal_program_editing: bool,
     treehouse_worktrees_root_editing: bool,
     treehouse_executable_editing: bool,
+    relay_code_editing: bool,
+    milestone_states_editing: bool,
     selected_agent_column: usize,
     pending_launch_select_sync: bool,
     save_generation: u64,
+    /// Setting keys changed since the last flush, recorded to the app
+    /// journey when the debounce actually writes them (spec §7, §8).
+    pending_changed_keys: Vec<String>,
+    /// Result of the last "Send a test" click, if any (spec §9.1, §9.7).
+    journeys_test_status: Option<Result<SharedString, SharedString>>,
+    journeys_test_sending: bool,
     _terminal_subscription: Subscription,
     _treehouse_worktrees_root_subscription: Subscription,
     _treehouse_executable_subscription: Subscription,
+    _relay_code_subscription: Subscription,
+    _milestone_states_subscription: Subscription,
 }
 
 impl SettingsView {
@@ -323,6 +398,38 @@ impl SettingsView {
                         .unwrap_or_default(),
                 )
         });
+        let (sandbox_workspace, sandbox_image) =
+            tod_store::fleet::sandbox::account_settings(paths.data_root());
+        let sandbox_workspace_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Enter to edit · Not set up")
+                .default_value(sandbox_workspace)
+        });
+        let sandbox_image_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(format!(
+                    "Enter to edit · Default: {}",
+                    tod_store::fleet::sandbox::DEFAULT_IMAGE
+                ))
+                .default_value(sandbox_image)
+        });
+        let sandbox_key_input = cx.new(|cx| {
+            InputState::new(window, cx).masked(true).placeholder("Enter to edit · Paste a Blaxel API key")
+        });
+        let sandbox_auth = tod_store::fleet::sandbox::sign_in_mode(paths.data_root());
+        {
+            let root = paths.data_root().to_path_buf();
+            cx.spawn(async move |this, cx| {
+                let has_key = cx
+                    .background_spawn(async move { tod_store::fleet::sandbox::has_api_key(&root) })
+                    .await;
+                let _ = this.update(cx, |this, cx| {
+                    this.sandbox_has_key = Some(has_key);
+                    cx.notify();
+                });
+            })
+            .detach();
+        }
         let treehouse_executable_input = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder(format!(
@@ -345,7 +452,7 @@ impl SettingsView {
                     let next = (!trimmed.is_empty()).then(|| PathBuf::from(trimmed));
                     if this.settings.treehouse_executable != next {
                         this.settings.treehouse_executable = next;
-                        this.schedule_save(cx);
+                        this.schedule_save("treehouse_executable", cx);
                     }
                 }
             });
@@ -366,7 +473,7 @@ impl SettingsView {
                     };
                     if this.settings.terminal.program != next {
                         this.settings.terminal.program = next;
-                        this.schedule_save(cx);
+                        this.schedule_save("terminal.program", cx);
                     }
                 }
             });
@@ -377,6 +484,43 @@ impl SettingsView {
                         input.read(cx).text().to_string(),
                         cx,
                     );
+                }
+            });
+
+        let relay_code_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Enter to edit · Paste a relay code (todj1:…)")
+                .default_value(settings.journeys.relay_code.clone().unwrap_or_default())
+        });
+        let _relay_code_subscription =
+            cx.subscribe(&relay_code_input, |this, input, event, cx| {
+                // Applied on every change as well as on blur/Enter: the code is
+                // pasted whole, and the toggles below depend on whether it parses,
+                // so they must not wait for a blur that may never come.
+                if matches!(
+                    event,
+                    InputEvent::Change | InputEvent::Blur | InputEvent::PressEnter { .. }
+                ) {
+                    let text = input.read(cx).text().to_string();
+                    let trimmed = text.trim();
+                    let next = (!trimmed.is_empty()).then(|| trimmed.to_string());
+                    if this.settings.journeys.relay_code != next {
+                        this.settings.journeys.relay_code = next;
+                        this.schedule_save("journeys.relay_code", cx);
+                    }
+                    cx.notify();
+                }
+            });
+        let milestone_states_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Comma-separated lifecycle states")
+                .default_value(settings.journeys.milestone_states.join(", "))
+        });
+        let _milestone_states_subscription =
+            cx.subscribe(&milestone_states_input, |this, input, event, cx| {
+                if matches!(event, InputEvent::Blur | InputEvent::PressEnter { .. }) {
+                    let text = input.read(cx).text().to_string();
+                    this.apply_milestone_states_input(text, cx);
                 }
             });
 
@@ -392,6 +536,16 @@ impl SettingsView {
             terminal_program_input,
             treehouse_worktrees_root_input,
             treehouse_executable_input,
+            sandbox_workspace_input,
+            sandbox_image_input,
+            sandbox_key_input,
+            sandbox_auth,
+            sandbox_has_key: None,
+            sandbox_check_generation: 0,
+            sandbox_editing: None,
+            sandbox_status: None,
+            relay_code_input,
+            milestone_states_input,
             agent_selects,
             focus_handle: cx.focus_handle(),
             app_nav: AppNavMenu::default(),
@@ -401,13 +555,58 @@ impl SettingsView {
             terminal_program_editing: false,
             treehouse_worktrees_root_editing: false,
             treehouse_executable_editing: false,
+            relay_code_editing: false,
+            milestone_states_editing: false,
             selected_agent_column: 0,
             pending_launch_select_sync: false,
             save_generation: 0,
+            pending_changed_keys: Vec::new(),
+            journeys_test_status: None,
+            journeys_test_sending: false,
             _terminal_subscription,
             _treehouse_worktrees_root_subscription,
             _treehouse_executable_subscription,
+            _relay_code_subscription,
+            _milestone_states_subscription,
         }
+    }
+
+    /// Parses a comma-separated milestone-state list, validating each name
+    /// the same way `TodSettings::validate` does (via a probe
+    /// `JourneySettings`, since `tod-store`'s valid-states list is private).
+    fn apply_milestone_states_input(&mut self, raw: String, cx: &mut Context<Self>) {
+        let states: Vec<String> = raw
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if !Self::milestone_states_valid(&states) {
+            tracing::warn!("invalid journeys milestone states: {raw}");
+            return;
+        }
+        if self.settings.journeys.milestone_states == states {
+            return;
+        }
+        self.settings.journeys.milestone_states = states;
+        self.schedule_save("journeys.milestone_states", cx);
+        cx.notify();
+    }
+
+    fn milestone_states_valid(states: &[String]) -> bool {
+        let probe = JourneySettings {
+            send: false,
+            milestone_states: states.to_vec(),
+            ..JourneySettings::default()
+        };
+        probe.validate().is_ok()
+    }
+
+    fn relay_code_valid(&self) -> bool {
+        self.settings
+            .journeys
+            .relay_code
+            .as_deref()
+            .is_some_and(|code| RelayCode::parse(code).is_ok())
     }
 
     fn apply_treehouse_worktrees_root_input(&mut self, raw: String, cx: &mut Context<Self>) {
@@ -427,14 +626,17 @@ impl SettingsView {
             return;
         }
         self.settings.treehouse_worktrees_root = next;
-        self.schedule_save(cx);
+        self.schedule_save("treehouse_worktrees_root", cx);
         cx.notify();
     }
 
     fn text_editing(&self) -> bool {
-        self.terminal_program_editing
+        self.sandbox_editing.is_some()
+            || self.terminal_program_editing
             || self.treehouse_worktrees_root_editing
             || self.treehouse_executable_editing
+            || self.relay_code_editing
+            || self.milestone_states_editing
     }
 
     fn exit_text_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -445,7 +647,147 @@ impl SettingsView {
             self.treehouse_worktrees_root_editing = false;
         }
         self.treehouse_executable_editing = false;
+        self.relay_code_editing = false;
+        self.milestone_states_editing = false;
+        if let Some(field) = self.sandbox_editing.take() {
+            self.leave_sandbox_field(field, window, cx);
+        }
         self.focus_handle.focus(window, cx);
+        cx.notify();
+    }
+
+    fn enter_sandbox_edit(
+        &mut self,
+        field: SettingField,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let input = match field {
+            SettingField::SandboxWorkspace => self.sandbox_workspace_input.clone(),
+            SettingField::SandboxApiKey => self.sandbox_key_input.clone(),
+            SettingField::SandboxDefaultImage => self.sandbox_image_input.clone(),
+            _ => return,
+        };
+        if self.selected_field() != field {
+            return;
+        }
+        // Moving from one to another keeps what was typed in the first.
+        if let Some(editing) = self.sandbox_editing.filter(|editing| *editing != field) {
+            self.leave_sandbox_field(editing, window, cx);
+        }
+        self.focus_region = SettingsFocus::Panel;
+        self.sandbox_editing = Some(field);
+        cx.notify();
+        cx.on_next_frame(window, move |_, window, cx| {
+            input.update(cx, |input, cx| input.focus(window, cx));
+        });
+    }
+
+    fn leave_sandbox_field(
+        &mut self,
+        field: SettingField,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match field {
+            SettingField::SandboxApiKey => self.save_sandbox_key(window, cx),
+            _ => self.save_sandbox_account(cx),
+        }
+    }
+
+    /// Store a pasted API key and sign in with it. The field is cleared: the
+    /// key is never shown again.
+    fn save_sandbox_key(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let key = self.sandbox_key_input.read(cx).text().to_string().trim().to_string();
+        if key.is_empty() {
+            return;
+        }
+        self.sandbox_key_input.update(cx, |input, cx| input.set_value("", window, cx));
+        self.sandbox_auth = tod_store::fleet::sandbox::AuthMode::ApiKey;
+        self.sandbox_has_key = Some(true);
+        self.apply_sandbox_sign_in(Some(key), cx);
+    }
+
+    fn cycle_sandbox_sign_in(&mut self, cx: &mut Context<Self>) {
+        use tod_store::fleet::sandbox::AuthMode;
+        self.sandbox_auth = match self.sandbox_auth {
+            AuthMode::ApiKey => AuthMode::Bl,
+            AuthMode::Bl => AuthMode::ApiKey,
+        };
+        self.apply_sandbox_sign_in(None, cx);
+    }
+
+    /// Record how to sign in (and a new key), then check it against Blaxel,
+    /// all off the UI thread (the keyring, `bl`, and the network).
+    fn apply_sandbox_sign_in(&mut self, key: Option<String>, cx: &mut Context<Self>) {
+        self.sandbox_check_generation += 1;
+        let generation = self.sandbox_check_generation;
+        let auth = self.sandbox_auth;
+        let root = self.paths.data_root().to_path_buf();
+        self.sandbox_status = Some(Ok("Saving…".into()));
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move {
+                    tod_store::fleet::sandbox::set_sign_in(&root, auth, key.as_deref())?;
+                    Ok::<_, anyhow::Error>(check_sandbox_sign_in(&root))
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if this.sandbox_check_generation == generation {
+                    this.sandbox_status = Some(match result {
+                        Ok(status) => status,
+                        Err(err) => Err(format!("Could not save: {err:#}").into()),
+                    });
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Check the sign-in after the workspace changed.
+    fn recheck_sandbox_sign_in(&mut self, cx: &mut Context<Self>) {
+        self.sandbox_check_generation += 1;
+        let generation = self.sandbox_check_generation;
+        let root = self.paths.data_root().to_path_buf();
+        cx.spawn(async move |this, cx| {
+            let status = cx.background_spawn(async move { check_sandbox_sign_in(&root) }).await;
+            let _ = this.update(cx, |this, cx| {
+                if this.sandbox_check_generation == generation {
+                    this.sandbox_status = Some(status);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Write the workspace and default image to `sandboxes.toml`.
+    fn save_sandbox_account(&mut self, cx: &mut Context<Self>) {
+        let workspace = self.sandbox_workspace_input.read(cx).text().to_string();
+        let image = self.sandbox_image_input.read(cx).text().to_string();
+        if (workspace.trim().to_string(), image.trim().to_string())
+            == tod_store::fleet::sandbox::account_settings(self.paths.data_root())
+        {
+            return;
+        }
+        self.sandbox_status = Some(
+            match tod_store::fleet::sandbox::set_account_settings(
+                self.paths.data_root(),
+                &workspace,
+                &image,
+            ) {
+                Ok(()) if workspace.trim().is_empty() => {
+                    Ok("Saved. Cloud sandboxes are off until a workspace is set.".into())
+                }
+                Ok(()) => {
+                    self.recheck_sandbox_sign_in(cx);
+                    Ok("Saved. Checking the sign-in…".into())
+                }
+                Err(err) => Err(format!("Could not save: {err:#}").into()),
+            },
+        );
         cx.notify();
     }
 
@@ -458,6 +800,11 @@ impl SettingsView {
         self.terminal_program_editing = false;
         self.treehouse_worktrees_root_editing = false;
         self.treehouse_executable_editing = false;
+        self.relay_code_editing = false;
+        self.milestone_states_editing = false;
+        if let Some(field) = self.sandbox_editing.take() {
+            self.leave_sandbox_field(field, window, cx);
+        }
         self.active_section = section;
         self.selected_field_index = 0;
         self.selected_agent_column = 0;
@@ -517,6 +864,8 @@ impl SettingsView {
         self.terminal_program_editing = false;
         self.treehouse_worktrees_root_editing = false;
         self.treehouse_executable_editing = false;
+        self.relay_code_editing = false;
+        self.milestone_states_editing = false;
         self.active_section = SECTIONS[next];
         self.selected_field_index = 0;
         self.focus_region = SettingsFocus::Sidebar;
@@ -585,12 +934,27 @@ impl SettingsView {
             SettingField::MaxParallelSessions => self.step_max_parallel_sessions(delta, cx),
             SettingField::TreehouseExecutable
             | SettingField::TreehouseWorktreesRoot
-            | SettingField::TerminalProgram => {}
+            | SettingField::TerminalProgram
+            | SettingField::SandboxWorkspace
+            | SettingField::SandboxApiKey
+            | SettingField::SandboxDefaultImage => {}
+            SettingField::SandboxSignIn => self.cycle_sandbox_sign_in(cx),
             SettingField::LogLevel => self.step_log_level(delta, cx),
             SettingField::LogMaxSize => {
                 let step = if delta >= 0 { 1024 } else { -1024 };
                 self.step_log_max_size(step, cx);
             }
+            SettingField::JourneysSend => self.toggle_journeys_send(cx),
+            SettingField::JourneysIncludeTranscripts => {
+                self.toggle_journeys_include_transcripts(cx)
+            }
+            SettingField::JourneysStorageCap => {
+                let step = if delta >= 0 { 64 } else { -64 };
+                self.step_journeys_storage_cap(step, cx);
+            }
+            SettingField::JourneysRelayCode
+            | SettingField::JourneysSendTest
+            | SettingField::JourneysMilestoneStates => {}
         }
     }
 
@@ -608,7 +972,17 @@ impl SettingsView {
                 self.enter_treehouse_worktrees_root_edit(window, cx)
             }
             SettingField::TreehouseExecutable => self.enter_treehouse_executable_edit(window, cx),
+            field @ (SettingField::SandboxWorkspace
+            | SettingField::SandboxApiKey
+            | SettingField::SandboxDefaultImage) => self.enter_sandbox_edit(field, window, cx),
             SettingField::Agent(role) => self.focus_agent_select(role, window, cx),
+            SettingField::JourneysRelayCode => self.enter_relay_code_edit(window, cx),
+            SettingField::JourneysMilestoneStates => self.enter_milestone_states_edit(window, cx),
+            SettingField::JourneysSendTest => self.send_journeys_test(cx),
+            SettingField::JourneysSend => self.toggle_journeys_send(cx),
+            SettingField::JourneysIncludeTranscripts => {
+                self.toggle_journeys_include_transcripts(cx)
+            }
             _ => {
                 // Cycle/step fields: Enter bumps forward like `=`.
                 self.adjust_selected(1, cx);
@@ -744,6 +1118,118 @@ impl SettingsView {
         });
     }
 
+    fn enter_relay_code_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !matches!(self.selected_field(), SettingField::JourneysRelayCode) {
+            return;
+        }
+        self.focus_region = SettingsFocus::Panel;
+        self.milestone_states_editing = false;
+        self.relay_code_editing = true;
+        cx.notify();
+        let input = self.relay_code_input.clone();
+        cx.on_next_frame(window, move |_, window, cx| {
+            input.update(cx, |input, cx| {
+                input.focus(window, cx);
+            });
+        });
+    }
+
+    fn enter_milestone_states_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !matches!(self.selected_field(), SettingField::JourneysMilestoneStates) {
+            return;
+        }
+        self.focus_region = SettingsFocus::Panel;
+        self.relay_code_editing = false;
+        self.milestone_states_editing = true;
+        cx.notify();
+        let input = self.milestone_states_input.clone();
+        cx.on_next_frame(window, move |_, window, cx| {
+            input.update(cx, |input, cx| {
+                input.focus(window, cx);
+            });
+        });
+    }
+
+    /// Toggles "Send journeys to development". Disabled (no-op) until the
+    /// relay code parses (spec §9.1: "Sending cannot be turned on until a
+    /// valid code is entered"). Turning it off also turns off "Include
+    /// transcripts", which is only meaningful while sending is on.
+    fn toggle_journeys_send(&mut self, cx: &mut Context<Self>) {
+        if !self.settings.journeys.send && !self.relay_code_valid() {
+            return;
+        }
+        self.settings.journeys.send = !self.settings.journeys.send;
+        if !self.settings.journeys.send {
+            self.settings.journeys.include_transcripts = false;
+        }
+        self.schedule_save("journeys.send", cx);
+        cx.notify();
+    }
+
+    /// Toggles "Include transcripts". Disabled while sending is off.
+    fn toggle_journeys_include_transcripts(&mut self, cx: &mut Context<Self>) {
+        if !self.settings.journeys.send {
+            return;
+        }
+        self.settings.journeys.include_transcripts = !self.settings.journeys.include_transcripts;
+        self.schedule_save("journeys.include_transcripts", cx);
+        cx.notify();
+    }
+
+    fn step_journeys_storage_cap(&mut self, delta_mb: i64, cx: &mut Context<Self>) {
+        let cap = &mut self.settings.journeys.storage_cap_mb;
+        *cap = if delta_mb >= 0 {
+            cap.saturating_add(delta_mb as u64)
+        } else {
+            cap.saturating_sub((-delta_mb) as u64).max(1)
+        };
+        self.schedule_save("journeys.storage_cap_mb", cx);
+        cx.notify();
+    }
+
+    /// "Send a test" (spec §9.1, §9.7): seals a tiny payload and `put`s it to
+    /// the configured relay on a background thread, then shows the result
+    /// inline next to the button.
+    fn send_journeys_test(&mut self, cx: &mut Context<Self>) {
+        if !matches!(self.selected_field(), SettingField::JourneysSendTest) {
+            return;
+        }
+        if self.journeys_test_sending {
+            return;
+        }
+        let Some(code) = self.settings.journeys.relay_code.clone() else {
+            self.journeys_test_status = Some(Err(SharedString::from("No relay code configured")));
+            cx.notify();
+            return;
+        };
+        self.journeys_test_sending = true;
+        self.journeys_test_status = None;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result: anyhow::Result<()> = cx
+                .background_spawn(async move {
+                    use tod_core::journey::Relay;
+                    let relay = tod_core::journey::NtfyRelay::parse(&code)?;
+                    // An empty but well-formed bundle, so `tod-journeys pull`
+                    // opens, files, and acknowledges it like a real one.
+                    let payload = tod_journey::bundle::BundleWriter::new()?.finish()?;
+                    let sealed = tod_journey::seal::seal(relay.recipient(), &payload)?;
+                    let name = format!("test-{}.journey.age", uuid::Uuid::new_v4().simple());
+                    relay.put(&name, &sealed)
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.journeys_test_sending = false;
+                this.journeys_test_status = Some(match result {
+                    Ok(()) => Ok(SharedString::from("Test bundle accepted by the relay")),
+                    Err(err) => Err(SharedString::from(format!("Failed: {err:#}"))),
+                });
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     fn handle_escape(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.text_editing() {
             self.exit_text_edit(window, cx);
@@ -755,7 +1241,11 @@ impl SettingsView {
         cx.notify();
     }
 
-    fn schedule_save(&mut self, cx: &mut Context<Self>) {
+    /// Schedules a debounce-autosave (`doc/../explicit-save-not-on-blur.md`)
+    /// and notes `key` as changed, so the actual write — when the debounce
+    /// fires — can record every key that changed since the last one.
+    fn schedule_save(&mut self, key: &str, cx: &mut Context<Self>) {
+        self.pending_changed_keys.push(key.to_string());
         self.save_generation = self.save_generation.wrapping_add(1);
         let generation = self.save_generation;
         let entity = cx.weak_entity();
@@ -780,13 +1270,17 @@ impl SettingsView {
         }
         let _ = logging::reload_level(self.settings.log_level);
         let _ = logging::set_max_size_kb(self.settings.log_max_size_kb);
+        crate::ui::report_problem::set_available_from(&self.settings.journeys, cx);
+        for key in std::mem::take(&mut self.pending_changed_keys) {
+            crate::ui::journey::record_settings_changed(cx, key, "");
+        }
         cx.notify();
     }
 
     fn step_replenish(&mut self, delta: i32, cx: &mut Context<Self>) {
         self.settings.question_maker.replenish_threshold =
             step_u32(self.settings.question_maker.replenish_threshold, delta);
-        self.schedule_save(cx);
+        self.schedule_save("question_maker.replenish_threshold", cx);
         cx.notify();
     }
 
@@ -797,7 +1291,7 @@ impl SettingsView {
         } else {
             budget.saturating_sub(10_000).max(10_000)
         };
-        self.schedule_save(cx);
+        self.schedule_save("interview_context.context_budget_tokens", cx);
         cx.notify();
     }
 
@@ -808,7 +1302,7 @@ impl SettingsView {
         } else {
             minutes.saturating_sub(1).max(1)
         };
-        self.schedule_save(cx);
+        self.schedule_save("interview_context.prompt_cache_idle_minutes", cx);
         cx.notify();
     }
 
@@ -819,7 +1313,7 @@ impl SettingsView {
         } else {
             cap.saturating_sub(10).max(10)
         };
-        self.schedule_save(cx);
+        self.schedule_save("interview_context.answered_history_cap", cx);
         cx.notify();
     }
 
@@ -832,13 +1326,13 @@ impl SettingsView {
             value.saturating_sub(1)
         }
         .clamp(min, max);
-        self.schedule_save(cx);
+        self.schedule_save("max_parallel_agent_sessions", cx);
         cx.notify();
     }
 
     fn step_log_level(&mut self, delta: i32, cx: &mut Context<Self>) {
         self.settings.log_level = self.settings.log_level.step(delta);
-        self.schedule_save(cx);
+        self.schedule_save("log_level", cx);
         cx.notify();
     }
 
@@ -851,7 +1345,7 @@ impl SettingsView {
                 .saturating_sub((-delta) as u64)
         };
         self.settings.log_max_size_kb = TodSettings::clamp_log_max_size_kb(next);
-        self.schedule_save(cx);
+        self.schedule_save("log_max_size_kb", cx);
         cx.notify();
     }
 
@@ -879,7 +1373,7 @@ impl SettingsView {
         if role == AgentRole::Interview {
             cx.emit(SettingsEvent::AgentPlatformChanged(platform));
         }
-        self.schedule_save(cx);
+        self.schedule_save("platform", cx);
         cx.notify();
     }
 
@@ -942,7 +1436,7 @@ impl SettingsView {
         let len = ORDER.len() as i32;
         let next = ((idx as i32 + delta).rem_euclid(len)) as usize;
         self.settings.worktree_backend = ORDER[next];
-        self.schedule_save(cx);
+        self.schedule_save("worktree_backend", cx);
         cx.notify();
     }
 
@@ -963,8 +1457,25 @@ impl SettingsView {
         let len = ORDER.len() as i32;
         let next = ((idx as i32 + delta).rem_euclid(len)) as usize;
         self.settings.chat_launch_mode = ORDER[next];
-        self.schedule_save(cx);
+        self.schedule_save("chat_launch_mode", cx);
         cx.notify();
+    }
+}
+
+/// Sign in to the workspace and say what came back. Network, and maybe
+/// `bl`: never on the UI thread.
+fn check_sandbox_sign_in(root: &std::path::Path) -> Result<SharedString, SharedString> {
+    let (workspace, _) = tod_store::fleet::sandbox::account_settings(root);
+    if workspace.trim().is_empty() {
+        return Ok("Saved. Set the workspace to sign in.".into());
+    }
+    match tod_store::fleet::sandbox::check_sign_in(root) {
+        Ok(count) => Ok(format!(
+            "Signed in to {workspace}: {count} sandbox{} there.",
+            if count == 1 { "" } else { "es" }
+        )
+        .into()),
+        Err(err) => Err(format!("Saved, but signing in failed: {err:#}").into()),
     }
 }
 
@@ -982,13 +1493,30 @@ fn catalog_strings(items: &[&str]) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::step_u32;
+    use super::{SettingsView, step_u32};
 
     #[test]
     fn step_increments_and_decrements() {
         assert_eq!(step_u32(8, 1), 9);
         assert_eq!(step_u32(8, -1), 7);
         assert_eq!(step_u32(0, -1), 0);
+    }
+
+    #[test]
+    fn milestone_states_valid_accepts_known_lifecycle_states() {
+        let states = vec!["active".to_string(), "review".to_string()];
+        assert!(SettingsView::milestone_states_valid(&states));
+    }
+
+    #[test]
+    fn milestone_states_valid_rejects_unknown_state() {
+        let states = vec!["active".to_string(), "not-a-real-state".to_string()];
+        assert!(!SettingsView::milestone_states_valid(&states));
+    }
+
+    #[test]
+    fn milestone_states_valid_accepts_empty_list() {
+        assert!(SettingsView::milestone_states_valid(&[]));
     }
 }
 
@@ -1035,6 +1563,41 @@ impl Render for SettingsView {
             self.treehouse_executable_editing,
             cx,
         );
+        key_context::set_input_tab_stop(&self.relay_code_input, self.relay_code_editing, cx);
+        for (field, input) in [
+            (SettingField::SandboxWorkspace, self.sandbox_workspace_input.clone()),
+            (SettingField::SandboxApiKey, self.sandbox_key_input.clone()),
+            (SettingField::SandboxDefaultImage, self.sandbox_image_input.clone()),
+        ] {
+            let editing = self.sandbox_editing == Some(field);
+            key_context::set_input_tab_stop(&input, editing, cx);
+            if !editing && input.read(cx).focus_handle(cx).is_focused(window) {
+                self.enter_sandbox_edit(field, window, cx);
+            }
+        }
+        key_context::set_input_tab_stop(
+            &self.milestone_states_input,
+            self.milestone_states_editing,
+            cx,
+        );
+        if !self.relay_code_editing
+            && self
+                .relay_code_input
+                .read(cx)
+                .focus_handle(cx)
+                .is_focused(window)
+        {
+            self.enter_relay_code_edit(window, cx);
+        }
+        if !self.milestone_states_editing
+            && self
+                .milestone_states_input
+                .read(cx)
+                .focus_handle(cx)
+                .is_focused(window)
+        {
+            self.enter_milestone_states_edit(window, cx);
+        }
         if !self.treehouse_executable_editing
             && self
                 .treehouse_executable_input
@@ -1366,6 +1929,75 @@ impl SettingsView {
                     theme,
                 ))
                 .into_any_element(),
+            SettingsSection::CloudSandboxes => v_flex()
+                .gap_1()
+                .child(text_input_row(
+                    cx,
+                    self,
+                    SettingField::SandboxWorkspace,
+                    "Blaxel workspace",
+                    "The Blaxel workspace nodes' cloud sandboxes live in. A team shares one workspace, and each person signs in as themselves. Empty turns cloud sandboxes off.",
+                    &self.sandbox_workspace_input,
+                    self.sandbox_editing == Some(SettingField::SandboxWorkspace),
+                    theme,
+                ))
+                .child(cycle_row(
+                    cx,
+                    self,
+                    SettingField::SandboxSignIn,
+                    match self.sandbox_auth {
+                        tod_store::fleet::sandbox::AuthMode::ApiKey => "API key",
+                        tod_store::fleet::sandbox::AuthMode::Bl => "bl login",
+                    },
+                    "Sign in with",
+                    "An API key needs nothing else installed: create one in the Blaxel console and paste it below. `bl login` signs you in through the Blaxel CLI in a browser; its tokens are short-lived and no key is stored.",
+                    theme,
+                    |this, _, cx| this.cycle_sandbox_sign_in(cx),
+                    |this, _, cx| this.cycle_sandbox_sign_in(cx),
+                ))
+                .child(text_input_row(
+                    cx,
+                    self,
+                    SettingField::SandboxApiKey,
+                    "API key",
+                    match self.sandbox_has_key {
+                        Some(true) => "A key is stored, in the OS keyring (else an encrypted file), where agents cannot read it. Paste a new one to replace it.",
+                        Some(false) => "No key is stored. A key pasted here is kept in the OS keyring (else an encrypted file), where agents cannot read it, and is used to sign in.",
+                        None => "Kept in the OS keyring (else an encrypted file), where agents cannot read it.",
+                    },
+                    &self.sandbox_key_input,
+                    self.sandbox_editing == Some(SettingField::SandboxApiKey),
+                    theme,
+                ))
+                .child(text_input_row(
+                    cx,
+                    self,
+                    SettingField::SandboxDefaultImage,
+                    "Default image",
+                    "What a new sandbox starts from unless the Files capability names another image. A baked image (`tod-sandbox bake`) is ready in seconds. Any other image is set up the first time, which takes a minute or more.",
+                    &self.sandbox_image_input,
+                    self.sandbox_editing == Some(SettingField::SandboxDefaultImage),
+                    theme,
+                ))
+                .when_some(self.sandbox_status.clone(), |el, status| {
+                    let (color, text) = match status {
+                        Ok(text) => (theme.muted_foreground, text),
+                        Err(text) => (theme.danger, text),
+                    };
+                    el.child(
+                        div()
+                            .px_3()
+                            .text_sm()
+                            .text_color(color)
+                            .child(crate::ui::selectable_text::selectable_text(
+                                "settings-sandbox-status",
+                                text,
+                                window,
+                                cx,
+                            )),
+                    )
+                })
+                .into_any_element(),
             SettingsSection::Logging => v_flex()
                 .gap_1()
                 .child(read_only_row(
@@ -1402,6 +2034,66 @@ impl SettingsView {
                     |this, _, cx| this.step_log_max_size(1024, cx),
                 ))
                 .into_any_element(),
+            SettingsSection::Journeys => {
+                let journeys = &self.settings.journeys;
+                let relay_valid = self.relay_code_valid();
+                let mut rows = v_flex()
+                    .gap_1()
+                    .child(journeys_warning_callout(JOURNEYS_WARNING, theme))
+                    .child(toggle_row(
+                        cx,
+                        self,
+                        SettingField::JourneysSend,
+                        journeys.send,
+                        !relay_valid,
+                        "Send journeys to development",
+                        "While off, reports and milestones are still recorded locally but nothing leaves this computer. Requires a valid relay code below.",
+                        theme,
+                        |this, cx| this.toggle_journeys_send(cx),
+                    ))
+                    .child(journeys_include_transcripts_row(cx, self, theme));
+                rows = rows
+                    .child(relay_code_row(
+                        cx,
+                        self,
+                        &self.relay_code_input,
+                        self.relay_code_editing,
+                        theme,
+                    ))
+                    .child(journeys_send_test_row(cx, self, theme))
+                    .child(text_input_row(
+                        cx,
+                        self,
+                        SettingField::JourneysMilestoneStates,
+                        "Milestone states",
+                        "Comma-separated lifecycle states that trigger a milestone bundle. Default: active, verifying, review, approved, done.",
+                        &self.milestone_states_input,
+                        self.milestone_states_editing,
+                        theme,
+                    ))
+                    .child(stepper_row(
+                        cx,
+                        self,
+                        SettingField::JourneysStorageCap,
+                        format!("{} MB", journeys.storage_cap_mb),
+                        "Journey storage cap",
+                        "Total on-disk cap across every journey before the oldest are pruned. Default 1024 MB.",
+                        theme,
+                        |this, _, cx| this.step_journeys_storage_cap(-64, cx),
+                        |this, _, cx| this.step_journeys_storage_cap(64, cx),
+                    ));
+                if let Some(err) = tod_core::journey::worker_last_error() {
+                    rows = rows.child(
+                        div()
+                            .px_3()
+                            .text_sm()
+                            .text_color(theme.danger)
+                            .whitespace_normal()
+                            .child(format!("Last delivery error: {err}")),
+                    );
+                }
+                rows.into_any_element()
+            }
         }
     }
 }
@@ -1666,6 +2358,13 @@ fn text_input_row(
                             this.enter_treehouse_executable_edit(window, cx);
                         }
                     }
+                    SettingField::SandboxWorkspace
+                    | SettingField::SandboxApiKey
+                    | SettingField::SandboxDefaultImage => {
+                        if this.sandbox_editing != Some(field) {
+                            this.enter_sandbox_edit(field, window, cx);
+                        }
+                    }
                     _ => {}
                 }
                 cx.notify();
@@ -1695,6 +2394,227 @@ fn text_input_row(
                 .focus_bordered(editing)
                 .w_full(),
         )
+}
+
+/// An On/Off row (spec §9.1, implementation plan step 8d): unlike
+/// `cycle_row`/`stepper_row` (which step through an ordered list with
+/// `-`/`=`), this has exactly two states and is flipped by Enter, Space, or a
+/// click on the pill — `-`/`=` also flip it, via `adjust_selected`, so the
+/// keyboard story matches every other row. `disabled` greys the row out and
+/// makes the toggle a no-op (the caller's `on_toggle` is expected to already
+/// guard the transition, e.g. `toggle_journeys_send`; this only affects
+/// rendering and the mouse click here).
+#[allow(clippy::too_many_arguments)]
+fn toggle_row(
+    cx: &mut Context<SettingsView>,
+    view: &SettingsView,
+    field: SettingField,
+    value: bool,
+    disabled: bool,
+    label: impl Into<SharedString>,
+    help: impl Into<SharedString>,
+    theme: &gpui_component::Theme,
+    on_toggle: impl Fn(&mut SettingsView, &mut Context<SettingsView>) + 'static,
+) -> impl IntoElement {
+    let selected = view.field_selected(field);
+    let id = field.id();
+    let label = label.into();
+    let help = help.into();
+
+    h_flex()
+        .w_full()
+        .gap_4()
+        .px_3()
+        .py_3()
+        .rounded_md()
+        .items_start()
+        .when(disabled, |el| el.opacity(0.5))
+        .when(selected, |el| {
+            el.bg(theme.list_active)
+                .border_1()
+                .border_color(theme.list_active_border)
+        })
+        .on_mouse_down(
+            gpui::MouseButton::Left,
+            cx.listener(select_field_listener(field)),
+        )
+        .child(
+            v_flex()
+                .flex_1()
+                .min_w_0()
+                .gap_1()
+                .child(
+                    div()
+                        .text_sm()
+                        .font_semibold()
+                        .text_color(theme.foreground)
+                        .child(label),
+                )
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(theme.muted_foreground)
+                        .whitespace_normal()
+                        .child(help),
+                ),
+        )
+        .child(
+            Button::new(SharedString::from(format!("{id}-toggle")))
+                .label(if value { "On" } else { "Off" })
+                .selected(value)
+                .disabled(disabled)
+                .tab_stop(false)
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.focus_region = SettingsFocus::Panel;
+                    this.focus_handle.focus(window, cx);
+                    on_toggle(this, cx);
+                })),
+        )
+}
+
+fn journeys_warning_callout(text: &str, theme: &gpui_component::Theme) -> impl IntoElement {
+    let _ = theme;
+    style::callout_warning(v_flex().w_full()).child(
+        style::callout_warning_title(div()).child(SharedString::from(text.to_string())),
+    )
+}
+
+fn journeys_include_transcripts_row(
+    cx: &mut Context<SettingsView>,
+    view: &SettingsView,
+    theme: &gpui_component::Theme,
+) -> impl IntoElement {
+    let send_on = view.settings.journeys.send;
+    let on = view.settings.journeys.include_transcripts;
+    v_flex()
+        .w_full()
+        .gap_2()
+        .child(toggle_row(
+            cx,
+            view,
+            SettingField::JourneysIncludeTranscripts,
+            on,
+            !send_on,
+            "Include transcripts",
+            "Off by default. What the user typed, what the agent read and wrote, and its prompts are the most likely place for sensitive data.",
+            theme,
+            |this, cx| this.toggle_journeys_include_transcripts(cx),
+        ))
+        .when(on, |el| {
+            el.child(
+                div()
+                    .px_3()
+                    .text_sm()
+                    .text_color(theme.muted_foreground)
+                    .whitespace_normal()
+                    .child(JOURNEYS_TRANSCRIPTS_WARNING),
+            )
+        })
+}
+
+fn relay_code_row(
+    cx: &mut Context<SettingsView>,
+    view: &SettingsView,
+    input: &Entity<InputState>,
+    editing: bool,
+    theme: &gpui_component::Theme,
+) -> impl IntoElement {
+    let code = view.settings.journeys.relay_code.clone();
+    let error = code.as_deref().and_then(|c| {
+        if c.trim().is_empty() {
+            None
+        } else {
+            RelayCode::parse(c).err().map(|e| format!("{e:#}"))
+        }
+    });
+    v_flex()
+        .w_full()
+        .gap_1()
+        .child(text_input_row(
+            cx,
+            view,
+            SettingField::JourneysRelayCode,
+            "Relay code",
+            "One pasted string holding the recipient's public key, the relay server, and the two topics. Sending cannot be turned on until this parses.",
+            input,
+            editing,
+            theme,
+        ))
+        .when_some(error, |el, err| {
+            el.child(
+                div()
+                    .px_3()
+                    .text_sm()
+                    .text_color(theme.danger)
+                    .whitespace_normal()
+                    .child(format!("Invalid relay code: {err}")),
+            )
+        })
+}
+
+fn journeys_send_test_row(
+    cx: &mut Context<SettingsView>,
+    view: &SettingsView,
+    theme: &gpui_component::Theme,
+) -> impl IntoElement {
+    let field = SettingField::JourneysSendTest;
+    let selected = view.field_selected(field);
+    let sending = view.journeys_test_sending;
+    let disabled = view.settings.journeys.relay_code.is_none() || sending;
+    let status = view.journeys_test_status.clone();
+
+    h_flex()
+        .w_full()
+        .gap_4()
+        .px_3()
+        .py_3()
+        .rounded_md()
+        .items_center()
+        .when(selected, |el| {
+            el.bg(theme.list_active)
+                .border_1()
+                .border_color(theme.list_active_border)
+        })
+        .on_mouse_down(
+            gpui::MouseButton::Left,
+            cx.listener(select_field_listener(field)),
+        )
+        .child(
+            v_flex().flex_1().min_w_0().gap_1().child(
+                div()
+                    .text_sm()
+                    .font_semibold()
+                    .text_color(theme.foreground)
+                    .child("Send a test"),
+            ),
+        )
+        .child(
+            Button::new("journeys-send-test-button")
+                .label(if sending { "Sending…" } else { "Send a test" })
+                .disabled(disabled)
+                .tab_stop(false)
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.focus_region = SettingsFocus::Panel;
+                    this.focus_handle.focus(window, cx);
+                    this.send_journeys_test(cx);
+                })),
+        )
+        .when_some(status, |el, status| match status {
+            Ok(msg) => el.child(
+                div()
+                    .text_sm()
+                    .text_color(theme.foreground)
+                    .whitespace_normal()
+                    .child(msg),
+            ),
+            Err(msg) => el.child(
+                div()
+                    .text_sm()
+                    .text_color(theme.danger)
+                    .whitespace_normal()
+                    .child(msg),
+            ),
+        })
 }
 
 fn read_only_row(

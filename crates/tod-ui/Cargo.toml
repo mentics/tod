@@ -37,6 +37,7 @@ toml = "0.8"
 tod-agent = { path = "../tod-agent" }
 tod-core = { path = "../tod-core" }
 tod-integration = { path = "../tod-integration" }
+tod-journey = { path = "../tod-journey" }
 tod-store = { path = "../tod-store" }
 tracing = "0.1"
 tracing-appender = "0.2"

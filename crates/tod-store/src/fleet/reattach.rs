@@ -113,7 +113,7 @@ pub fn clear_missing_worktrees(
         let in_container = files
             .dev_container
             .as_ref()
-            .is_some_and(|dev| dev.repo_container().is_some());
+            .is_some_and(|dev| dev.repo_is_remote());
         if in_container || std::path::Path::new(path).exists() {
             continue;
         }

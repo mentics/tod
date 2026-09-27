@@ -163,6 +163,11 @@ pub enum InterviewCommand {
         /// An agent reply's streamed parts, when the provider reported them.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         parts: Vec<crate::conversation::ReplyPart>,
+        /// The part of what was sent to the agent that is not the user's own
+        /// text (the protocol delta prepended to a user turn). `None` for a
+        /// continuation turn, and for every non-user turn.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sent_context: Option<String>,
     },
     /// Close the turns left waiting on an agent when the app last stopped
     /// (at startup, before any turn is in flight); returns their
@@ -203,6 +208,40 @@ pub enum InterviewCommand {
     /// Store a report against the conversation's turn in progress,
     /// replacing any earlier one for that turn.
     RecordConversationReport { conversation_id: Uuid, body: Value },
+    /// Record a pending decision on a node, for the user to answer
+    /// (`crate::decisions`). Agents only ask; there is no answer command
+    /// here on purpose — answering is the user's.
+    AskDecision {
+        node_id: Uuid,
+        /// The conversation asking.
+        #[serde(default)]
+        conversation_id: Option<Uuid>,
+        /// The protocol running that conversation, e.g. `implement`.
+        #[serde(default)]
+        protocol: Option<String>,
+        decision: crate::decisions::NewDecision,
+    },
+    /// Record the user's answer to a pending decision (`crate::decisions`):
+    /// append-only, so a change of mind is a new answer row, never an
+    /// update. Not offered by `tod-cli`: answering is the user's, from the
+    /// task panel, which runs this through `AgentRuns::answer_decision`.
+    AnswerDecision {
+        decision_id: Uuid,
+        #[serde(default)]
+        option: Option<i64>,
+        #[serde(default)]
+        text: Option<String>,
+    },
+    /// The user's "Shouldn't have asked" on a request
+    /// (`crate::request_feedback`). Not offered by `tod-cli`.
+    RecordRequestFeedback(crate::request_feedback::NewRequestFeedback),
+    /// Change a request feedback row's verdict and note.
+    UpdateRequestFeedback {
+        id: Uuid,
+        verdict: String,
+        #[serde(default)]
+        note: Option<String>,
+    },
     /// Record an open code review finding on a node (`crate::review`).
     AddReviewFinding {
         node_id: Uuid,
@@ -276,6 +315,15 @@ pub enum InterviewCommand {
         #[serde(default)]
         force: bool,
     },
+    /// Record what a node now waits on (`crate::waits`).
+    RecordWait {
+        node_id: Uuid,
+        wait: crate::waits::NewWait,
+    },
+    /// Move a wait to another state (`satisfied`, `cancelled`, `expired`).
+    SetWaitState { wait_id: Uuid, state: String },
+    /// Set a pending wait's next time (a poll's next check).
+    RescheduleWait { wait_id: Uuid, due_at: i64 },
 }
 
 /// Execute `command` as `actor` (`user`, or an interview agent session id).
@@ -810,12 +858,19 @@ pub fn execute(
             role,
             body,
             parts,
+            sent_context,
         } => {
             let repo = crate::conversation::ConversationRepo::new(conn);
             if repo.get(*conversation_id)?.is_none() {
                 bail!("conversation {conversation_id} not found");
             }
-            let turn = repo.append_turn_with_parts(*conversation_id, *role, body, parts)?;
+            let turn = repo.append_turn_with_parts_and_context(
+                *conversation_id,
+                *role,
+                body,
+                parts,
+                sent_context.as_deref(),
+            )?;
             Ok(json!({ "seq": turn.seq }))
         }
         InterviewCommand::CloseInterruptedConversationTurns { body } => {
@@ -849,6 +904,41 @@ pub fn execute(
             let turn_seq = crate::conversation::ConversationRepo::new(conn)
                 .record_report(*conversation_id, body)?;
             Ok(json!({ "turn_seq": turn_seq }))
+        }
+        InterviewCommand::AskDecision {
+            node_id,
+            conversation_id,
+            protocol,
+            decision,
+        } => {
+            let decision = crate::decisions::DecisionRepo::new(conn).create(
+                *node_id,
+                *conversation_id,
+                protocol.as_deref(),
+                decision,
+            )?;
+            Ok(json!({ "id": decision.id.to_string() }))
+        }
+        InterviewCommand::AnswerDecision {
+            decision_id,
+            option,
+            text,
+        } => {
+            let answer = crate::decisions::DecisionRepo::new(conn).answer(
+                *decision_id,
+                *option,
+                text.as_deref(),
+                author,
+            )?;
+            Ok(json!({ "id": answer.id }))
+        }
+        InterviewCommand::RecordRequestFeedback(feedback) => {
+            let id = crate::request_feedback::RequestFeedbackRepo::new(conn).record(feedback)?;
+            Ok(json!({ "id": id.to_string() }))
+        }
+        InterviewCommand::UpdateRequestFeedback { id, verdict, note } => {
+            crate::request_feedback::RequestFeedbackRepo::new(conn).update(*id, verdict, note.as_deref())?;
+            Ok(json!({}))
         }
         InterviewCommand::AddReviewFinding {
             node_id,
@@ -986,6 +1076,18 @@ pub fn execute(
             }
             let note = crate::fleet::repos::task::TaskRepo::new(conn).append_note(*node_id, text)?;
             Ok(json!({ "id": note.id.to_string() }))
+        }
+        InterviewCommand::RecordWait { node_id, wait } => {
+            let wait = crate::waits::WaitRepo::new(conn).create(*node_id, wait)?;
+            Ok(json!({ "id": wait.id.to_string(), "due_at": wait.due_at }))
+        }
+        InterviewCommand::SetWaitState { wait_id, state } => {
+            crate::waits::WaitRepo::new(conn).set_state(*wait_id, state)?;
+            Ok(json!({}))
+        }
+        InterviewCommand::RescheduleWait { wait_id, due_at } => {
+            crate::waits::WaitRepo::new(conn).reschedule(*wait_id, *due_at)?;
+            Ok(json!({}))
         }
     }
 }

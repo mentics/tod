@@ -33,6 +33,82 @@ fn main() {
             .hash(&mut hasher);
     }
     println!("cargo:rustc-env=TOD_CLI_BUILD_STAMP={:016x}", hasher.finish());
+
+    emit_git_identity(&here);
+}
+
+/// Emits `TOD_GIT_COMMIT` and `TOD_GIT_DIRTY` for the journey build-identity
+/// manifest (doc/journeys/spec.md §5.3). Falls back to `"unknown"` for both
+/// when git or the repository is missing, e.g. an installed build from a
+/// tarball with no `.git`.
+fn emit_git_identity(manifest_dir: &Path) {
+    let commit = run_git(manifest_dir, &["rev-parse", "HEAD"])
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "unknown".to_string());
+
+    let dirty = match run_git(manifest_dir, &["status", "--porcelain"]) {
+        Some(out) => (!out.trim().is_empty()).to_string(),
+        None => "unknown".to_string(),
+    };
+
+    println!("cargo:rustc-env=TOD_GIT_COMMIT={commit}");
+    println!("cargo:rustc-env=TOD_GIT_DIRTY={dirty}");
+
+    // Rerun only when HEAD (or the ref/commit it points to) changes, not on
+    // every build.
+    if let Some(git_dir) = find_git_dir(manifest_dir) {
+        let head = git_dir.join("HEAD");
+        if head.is_file() {
+            println!("cargo:rerun-if-changed={}", head.display());
+            if let Ok(contents) = std::fs::read_to_string(&head) {
+                if let Some(rest) = contents.trim().strip_prefix("ref: ") {
+                    let ref_path = git_dir.join(rest);
+                    println!("cargo:rerun-if-changed={}", ref_path.display());
+                }
+            }
+        }
+    }
+}
+
+/// Runs `git <args>` from `dir`, returning stdout on success.
+fn run_git(dir: &Path, args: &[&str]) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8(output.stdout).ok()
+}
+
+/// Locates the `.git` directory for `dir`, following `.git` files used by
+/// worktrees (which contain `gitdir: <path>`) up to a real directory.
+fn find_git_dir(dir: &Path) -> Option<PathBuf> {
+    let mut current = Some(dir.to_path_buf());
+    while let Some(d) = current {
+        let candidate = d.join(".git");
+        if candidate.is_dir() {
+            return Some(candidate);
+        }
+        if candidate.is_file() {
+            if let Ok(contents) = std::fs::read_to_string(&candidate) {
+                if let Some(rest) = contents.trim().strip_prefix("gitdir: ") {
+                    let gitdir = PathBuf::from(rest);
+                    let gitdir = if gitdir.is_absolute() {
+                        gitdir
+                    } else {
+                        d.join(gitdir)
+                    };
+                    return Some(gitdir);
+                }
+            }
+        }
+        current = d.parent().map(Path::to_path_buf);
+    }
+    None
 }
 
 fn collect(path: &Path, out: &mut Vec<PathBuf>) {

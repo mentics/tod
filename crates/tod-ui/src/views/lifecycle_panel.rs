@@ -30,10 +30,12 @@
 
 use crate::ui::actionable::chrome_control_with_shortcut;
 use crate::ui::agent_chat::OpenConversation;
+use crate::ui::journey::Source;
 use crate::ui::key_context;
 use crate::ui::pane_nav::{PaneFocusLeft, bind_modified_pane_nav};
 use crate::ui::selectable_text::{selectable_markdown, selectable_text};
 use crate::ui::style;
+use crate::views::cloud_node::CloudUpdate;
 use crate::views::incoming_check::{IncomingCheck, outcome_line};
 use crate::views::lifecycle_control::{
     GateCheckState, LifecycleController, enters_with_agent, implement_directory,
@@ -55,11 +57,13 @@ use tod_core::lifecycle_next::{NextStep, Standing, next_step};
 use tod_core::lifecycle_validity::{Regression, regression};
 use tod_core::process::interview_phase_for_lifecycle;
 use tod_core::task::model::{next_lifecycle, previous_lifecycle};
+use tod_journey::{Presented, PresentedAction};
 use tod_store::conversation::{ConversationRepo, Focus, ProtocolKind};
 use tod_store::fleet::FleetStore;
 use tod_store::outline::repos::plan_steps::{STATUS_FAILED, STATUS_VERIFIED};
 use tod_store::outline::{OUTCOME_PASS, OUTCOME_WAIVED};
 use tod_store::review::ReviewRepo;
+use uuid::Uuid;
 
 const LIFECYCLE_PANEL_CONTEXT: &str = "LifecyclePanel";
 
@@ -92,15 +96,36 @@ pub enum LifecyclePanelEvent {
 /// Keyboard-navigable stops within the panel, in visual order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LifecyclePanelStop {
+    /// Hand the node to a cloud sandbox (`views::cloud_node`).
+    RunInCloud,
+    /// A cloud node: sync with the orchestrator now.
+    SyncCloud,
+    /// A cloud node: take it out of the cloud (asks to confirm first).
+    StopCloud,
+    /// Confirm [`Self::StopCloud`]; `true` deletes the sandbox too.
+    ConfirmStopCloud(bool),
+    /// Back out of [`Self::StopCloud`].
+    CancelStopCloud,
     MoveBack,
     CheckIncoming,
     Implement,
     Verify,
+    /// `verifying`, when failed plan steps need implementation again — moves
+    /// the node back to `active` (same action as `RevertLifecycle`, offered
+    /// as its own button next to the failed-step count).
+    BackToActive,
     Review,
     RunGateCheck,
     OpenInterview,
     ForceAdvance,
     RevertLifecycle,
+    /// Waive the failing criterion `id` in the criteria table.
+    WaiveCriterion(Uuid),
+    /// Open the phase's interview for the failing criterion `id`, offered
+    /// alongside Waive when the agent reported `action: interview`.
+    OpenInterviewCriterion(Uuid),
+    /// Advance once every criterion in the table reads pass or waived.
+    AdvanceAfterCriteria,
     Close,
 }
 
@@ -114,6 +139,27 @@ enum ActiveControl {
     NoPlan,
     /// Every plan step is done: the gate check takes over.
     Complete { total: usize },
+}
+
+/// How verification stands for a node — shared by the render body and the
+/// button's label/primary/disabled state ([`LifecyclePanelView::verification_status`]).
+#[derive(Debug, Clone, Copy, Default)]
+struct VerificationStatus {
+    total_steps: usize,
+    verified: usize,
+    failed: usize,
+    total_obligations: usize,
+    obligations_verified: usize,
+    obligations_failed: usize,
+}
+
+/// How the code review stands for a node
+/// ([`LifecyclePanelView::review_status`]).
+#[derive(Debug, Clone, Copy, Default)]
+struct ReviewStatus {
+    total: usize,
+    open: usize,
+    reviewed: bool,
 }
 
 /// One net pending incoming change, as the panel shows it.
@@ -201,6 +247,16 @@ pub struct LifecyclePanelView {
     /// The node's stored `learn` retrospectives, one per completed pass, as
     /// `(pass, content)` (`doc/conversation/incoming-changes.md` §9).
     learnings: Vec<(i64, String)>,
+    /// Where the node runs in the cloud, when it does; its lifecycle buttons
+    /// are replaced by a status line.
+    cloud: Option<tod_core::cloud_sync::CloudNode>,
+    /// The latest word from a cloud job (Run in the cloud, Sync now), and
+    /// whether one is still running.
+    /// Keyed by the node it is about.
+    cloud_status: Option<(String, String)>,
+    cloud_busy: bool,
+    /// "Stop running in the cloud" was pressed and waits for confirmation.
+    cloud_stop_armed: bool,
     focus_handle: FocusHandle,
     focus_index: usize,
     _controller_subscription: Subscription,
@@ -216,7 +272,7 @@ impl LifecyclePanelView {
     ) -> Self {
         let incoming_check_subscription = cx.observe(&incoming_check, |this, check, cx| {
             this.check_running = check.read(cx).is_running();
-            this.clamp_focus_index();
+            this.clamp_focus_index(cx);
             cx.notify();
         });
         // The controller moves the lifecycle (a gate check that passed, an
@@ -224,7 +280,7 @@ impl LifecyclePanelView {
         let subscription = cx.observe(&controller, |this, _, cx| {
             if let Some(task_id) = this.task_id.clone() {
                 this.load_task(&task_id);
-                this.clamp_focus_index();
+                this.clamp_focus_index(cx);
             }
             cx.notify();
         });
@@ -252,7 +308,7 @@ impl LifecyclePanelView {
                             | learnings_changed
                             | standing_changed
                         {
-                            this.clamp_focus_index();
+                            this.clamp_focus_index(cx);
                             cx.notify();
                         }
                     }) else {
@@ -277,6 +333,10 @@ impl LifecyclePanelView {
             standing: None,
             incoming: Vec::new(),
             learnings: Vec::new(),
+            cloud: None,
+            cloud_status: None,
+            cloud_busy: false,
+            cloud_stop_armed: false,
             focus_handle: cx.focus_handle(),
             focus_index: 0,
             _controller_subscription: subscription,
@@ -284,8 +344,70 @@ impl LifecyclePanelView {
         }
     }
 
-    fn stops(&self) -> Vec<LifecyclePanelStop> {
+    fn node_id_for_stops(&self) -> Option<Uuid> {
+        self.task_id.as_deref().and_then(|id| Uuid::parse_str(id).ok())
+    }
+
+    /// How verification stands for the node: plan steps verified/failed, and
+    /// how many (steps plus obligations) are still unchecked. Shared by the
+    /// render body and the button's label/primary/disabled state so they
+    /// never drift.
+    fn verification_status(&self, node_id: Uuid) -> VerificationStatus {
+        let steps = self.fleet.list_plan_steps_for_node(node_id).unwrap_or_default();
+        let verified = steps.iter().filter(|s| s.status == STATUS_VERIFIED).count();
+        let failed = steps.iter().filter(|s| s.status == STATUS_FAILED).count();
+        let standings = tod_core::conversation::verify::standings(&self.fleet, node_id);
+        let obligations_verified = standings.iter().filter(|s| s.is_verified()).count();
+        let obligations_failed = standings.iter().filter(|s| s.is_failed()).count();
+        VerificationStatus {
+            total_steps: steps.len(),
+            verified,
+            failed,
+            total_obligations: standings.len(),
+            obligations_verified,
+            obligations_failed,
+        }
+    }
+
+    /// How the code review stands: findings and how many are open, and
+    /// whether a review conversation has run at all. Shared the same way as
+    /// [`Self::verification_status`].
+    fn review_status(&self, node_id: Uuid) -> ReviewStatus {
+        let (findings, reviewed) = self
+            .fleet
+            .read(|conn| {
+                let findings = ReviewRepo::new(conn).list_for_node(node_id)?;
+                let reviewed = ConversationRepo::new(conn)
+                    .latest_for_focus_with_protocol(Focus::Node(node_id), ProtocolKind::Review)?
+                    .is_some();
+                Ok((findings, reviewed))
+            })
+            .unwrap_or_default();
+        let open = findings.iter().filter(|f| f.is_open()).count();
+        ReviewStatus {
+            total: findings.len(),
+            open,
+            reviewed,
+        }
+    }
+
+    fn stops(&self, cx: &App) -> Vec<LifecyclePanelStop> {
         let mut stops = Vec::new();
+        if self.lifecycle_capable && self.cloud.is_some() {
+            stops.push(LifecyclePanelStop::SyncCloud);
+            if self.cloud_stop_armed {
+                stops.push(LifecyclePanelStop::ConfirmStopCloud(false));
+                stops.push(LifecyclePanelStop::ConfirmStopCloud(true));
+                stops.push(LifecyclePanelStop::CancelStopCloud);
+            } else {
+                stops.push(LifecyclePanelStop::StopCloud);
+            }
+            stops.push(LifecyclePanelStop::Close);
+            return stops;
+        }
+        if self.lifecycle_capable {
+            stops.push(LifecyclePanelStop::RunInCloud);
+        }
         if self.regression.is_some() {
             stops.push(LifecyclePanelStop::MoveBack);
         }
@@ -298,6 +420,12 @@ impl LifecyclePanelView {
             Some(ActiveControl::Complete { .. }) | None => {
                 if self.verification_offered() {
                     stops.push(LifecyclePanelStop::Verify);
+                    if let Some(node_id) = self.node_id_for_stops() {
+                        let status = self.verification_status(node_id);
+                        if status.failed > 0 {
+                            stops.push(LifecyclePanelStop::BackToActive);
+                        }
+                    }
                 }
                 if self.review_offered() {
                     stops.push(LifecyclePanelStop::Review);
@@ -316,6 +444,18 @@ impl LifecyclePanelView {
         if self.lifecycle_capable && previous_lifecycle(&self.lifecycle).is_some() {
             stops.push(LifecyclePanelStop::RevertLifecycle);
         }
+        if self.lifecycle_capable {
+            let criteria = self.current_state(cx, |s| s.criteria_detail.clone());
+            for row in criteria.iter().filter(|r| r.is_failing()) {
+                if row.action == GateAction::Interview {
+                    stops.push(LifecyclePanelStop::OpenInterviewCriterion(row.criterion_id));
+                }
+                stops.push(LifecyclePanelStop::WaiveCriterion(row.criterion_id));
+            }
+            if !criteria.is_empty() && next_lifecycle(&self.lifecycle).is_some() {
+                stops.push(LifecyclePanelStop::AdvanceAfterCriteria);
+            }
+        }
         stops.push(LifecyclePanelStop::Close);
         stops
     }
@@ -330,8 +470,8 @@ impl LifecyclePanelView {
         self.lifecycle_capable && interview_phase_for_lifecycle(&self.lifecycle).is_some()
     }
 
-    fn clamp_focus_index(&mut self) {
-        let len = self.stops().len();
+    fn clamp_focus_index(&mut self, cx: &App) {
+        let len = self.stops(cx).len();
         if len == 0 {
             self.focus_index = 0;
         } else if self.focus_index >= len {
@@ -339,16 +479,16 @@ impl LifecyclePanelView {
         }
     }
 
-    fn focused_stop(&self) -> Option<LifecyclePanelStop> {
-        self.stops().get(self.focus_index).copied()
+    fn focused_stop(&self, cx: &App) -> Option<LifecyclePanelStop> {
+        self.stops(cx).get(self.focus_index).copied()
     }
 
-    fn is_focused(&self, stop: LifecyclePanelStop) -> bool {
-        self.focused_stop() == Some(stop)
+    fn is_focused(&self, stop: LifecyclePanelStop, cx: &App) -> bool {
+        self.focused_stop(cx) == Some(stop)
     }
 
     fn move_focus(&mut self, delta: i32, window: &mut Window, cx: &mut Context<Self>) {
-        let stops = self.stops();
+        let stops = self.stops(cx);
         if stops.is_empty() {
             return;
         }
@@ -358,15 +498,223 @@ impl LifecyclePanelView {
         cx.notify();
     }
 
-    fn activate_focused(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        match self.focused_stop() {
-            Some(LifecyclePanelStop::MoveBack) => self.move_back(cx),
-            Some(LifecyclePanelStop::CheckIncoming) => self.check_incoming(cx),
-            Some(LifecyclePanelStop::Implement) => self.launch_implementation(window, cx),
-            Some(LifecyclePanelStop::Verify) => self.launch_verification(window, cx),
-            Some(LifecyclePanelStop::Review) => self.launch_review(window, cx),
-            Some(LifecyclePanelStop::RunGateCheck) => self.run_gate_check(window, cx),
-            Some(LifecyclePanelStop::OpenInterview) => {
+    /// A stop's label, and whether it renders primary, as both the render
+    /// body and [`Self::presented`] use it — never computed twice.
+    fn stop_label(&self, stop: LifecyclePanelStop, cx: &App) -> String {
+        match stop {
+            LifecyclePanelStop::RunInCloud => {
+                if self.cloud_busy { "Starting in the cloud…" } else { "Run in the cloud" }.to_string()
+            }
+            LifecyclePanelStop::SyncCloud => {
+                if self.cloud_busy { "Syncing…" } else { "Sync now" }.to_string()
+            }
+            LifecyclePanelStop::StopCloud => "Stop running in the cloud".to_string(),
+            LifecyclePanelStop::ConfirmStopCloud(false) => "Confirm: stop, keep the sandbox".to_string(),
+            LifecyclePanelStop::ConfirmStopCloud(true) => "Confirm: stop and delete the sandbox".to_string(),
+            LifecyclePanelStop::CancelStopCloud => "Cancel".to_string(),
+            LifecyclePanelStop::MoveBack => self
+                .regression
+                .as_ref()
+                .map(|r| format!("Move back to {}", r.target))
+                .unwrap_or_default(),
+            LifecyclePanelStop::CheckIncoming => "Check now".to_string(),
+            LifecyclePanelStop::Implement => {
+                if self.implementation_run_live().is_some() {
+                    "Implementing…".to_string()
+                } else {
+                    "Implement".to_string()
+                }
+            }
+            LifecyclePanelStop::Verify => {
+                if self.verification_due() { "Verify" } else { "Verify again" }.to_string()
+            }
+            LifecyclePanelStop::BackToActive => {
+                let armed = self.current_state(cx, |s| s.revert_armed);
+                if armed {
+                    "Confirm: back to active".to_string()
+                } else {
+                    let failed = self
+                        .node_id_for_stops()
+                        .map(|n| self.verification_status(n).failed)
+                        .unwrap_or(0);
+                    let steps_word = if failed == 1 { "step" } else { "steps" };
+                    format!("Back to active to fix {failed} failed {steps_word}")
+                }
+            }
+            LifecyclePanelStop::Review => {
+                let reviewed = self
+                    .node_id_for_stops()
+                    .is_some_and(|n| self.review_status(n).reviewed);
+                if reviewed { "Review again" } else { "Review" }.to_string()
+            }
+            LifecyclePanelStop::RunGateCheck => next_lifecycle(&self.lifecycle)
+                .map(|next| format!("Run gate check to advance to {next}"))
+                .unwrap_or_default(),
+            LifecyclePanelStop::OpenInterview => format!(
+                "Open {}",
+                tod_core::process::spec_view_label(&self.lifecycle)
+                    .unwrap_or("Interview")
+                    .to_lowercase()
+            ),
+            LifecyclePanelStop::ForceAdvance => {
+                let armed = self.current_state(cx, |s| s.force_advance_armed);
+                match next_lifecycle(&self.lifecycle) {
+                    Some(next) if armed => format!("Confirm force advance to {next}"),
+                    Some(next) => format!("Force advance to {next} (bypass gate)"),
+                    None => String::new(),
+                }
+            }
+            LifecyclePanelStop::RevertLifecycle => {
+                let armed = self.current_state(cx, |s| s.revert_armed);
+                match previous_lifecycle(&self.lifecycle) {
+                    Some(prev) if armed => format!("Confirm revert to {prev}"),
+                    Some(prev) => format!("Revert to {prev}"),
+                    None => String::new(),
+                }
+            }
+            LifecyclePanelStop::WaiveCriterion(_) => "Waive".to_string(),
+            LifecyclePanelStop::OpenInterviewCriterion(_) => tod_core::process::spec_view_label(
+                &self.lifecycle,
+            )
+            .unwrap_or("Interview")
+            .to_string(),
+            LifecyclePanelStop::AdvanceAfterCriteria => next_lifecycle(&self.lifecycle)
+                .map(|next| format!("Advance to {next}"))
+                .unwrap_or_default(),
+            LifecyclePanelStop::Close => "Close".to_string(),
+        }
+    }
+
+    /// Whether a stop renders as the panel's primary button.
+    fn stop_primary(&self, stop: LifecyclePanelStop, cx: &App) -> bool {
+        match stop {
+            LifecyclePanelStop::MoveBack | LifecyclePanelStop::Implement => true,
+            LifecyclePanelStop::Verify => self.verification_due(),
+            LifecyclePanelStop::BackToActive => !self.verification_due(),
+            LifecyclePanelStop::Review => self
+                .node_id_for_stops()
+                .is_none_or(|n| !self.review_status(n).reviewed),
+            LifecyclePanelStop::RunGateCheck => {
+                matches!(self.recommended(), Some(NextStep::GateCheck))
+            }
+            LifecyclePanelStop::AdvanceAfterCriteria => true,
+            LifecyclePanelStop::OpenInterview
+            | LifecyclePanelStop::ForceAdvance
+            | LifecyclePanelStop::RevertLifecycle
+            | LifecyclePanelStop::WaiveCriterion(_)
+            | LifecyclePanelStop::OpenInterviewCriterion(_)
+            | LifecyclePanelStop::CheckIncoming
+            | LifecyclePanelStop::RunInCloud
+            | LifecyclePanelStop::SyncCloud
+            | LifecyclePanelStop::StopCloud
+            | LifecyclePanelStop::ConfirmStopCloud(_)
+            | LifecyclePanelStop::CancelStopCloud
+            | LifecyclePanelStop::Close => false,
+            #[allow(unreachable_patterns)]
+            _ => {
+                let _ = cx;
+                false
+            }
+        }
+    }
+
+    /// Whether a stop's button is disabled (still a stop — a disabled stop is
+    /// still worth naming in `Presented`, but does nothing when activated).
+    fn stop_disabled(&self, stop: LifecyclePanelStop, cx: &App) -> bool {
+        match stop {
+            LifecyclePanelStop::Implement => self.implement_directory().is_err(),
+            LifecyclePanelStop::RunInCloud
+            | LifecyclePanelStop::SyncCloud
+            | LifecyclePanelStop::StopCloud
+            | LifecyclePanelStop::ConfirmStopCloud(_) => self.cloud_busy,
+            LifecyclePanelStop::AdvanceAfterCriteria => {
+                !self.current_state(cx, |s| s.all_clear())
+            }
+            _ => false,
+        }
+    }
+
+    /// The [`Presented`] snapshot for every button the panel is showing right
+    /// now — every stop's id/label/primary/disabled, which one has the
+    /// keyboard highlight, and the callouts showing (the stale-state
+    /// regression, the gate status, the gate error).
+    fn presented(&self, cx: &App) -> Presented {
+        let stops = self.stops(cx);
+        let focused = self.focused_stop(cx).map(|s| format!("{s:?}"));
+        let actions = stops
+            .iter()
+            .map(|stop| PresentedAction {
+                id: format!("{stop:?}"),
+                label: self.stop_label(*stop, cx),
+                primary: self.stop_primary(*stop, cx),
+                disabled: self.stop_disabled(*stop, cx),
+            })
+            .collect();
+        let mut notices = Vec::new();
+        if let Some(regression) = &self.regression {
+            notices.push(format!(
+                "This node is no longer {} — move it back to {}",
+                self.lifecycle, regression.target
+            ));
+        }
+        let (gate_status, gate_error) =
+            self.current_state(cx, |s| (s.gate_status.clone(), s.gate_error.clone()));
+        if !gate_status.is_empty() {
+            notices.push(gate_status);
+        }
+        if let Some(error) = gate_error {
+            notices.push(error);
+        }
+        if let Some(cloud) = &self.cloud {
+            notices.push(self.cloud_line(cloud));
+        }
+        if let Some(status) = self.cloud_status_line() {
+            notices.push(status);
+        }
+        Presented {
+            actions,
+            focused,
+            notices,
+        }
+    }
+
+    /// Every button's `on_click` and the keyboard activation path both call
+    /// this: it records the `UserAction` (what was on offer, and whether
+    /// `stop` was clicked or reached from the keyboard highlight) and then
+    /// does what the stop means.
+    fn perform(&mut self, stop: LifecyclePanelStop, source: Source, window: &mut Window, cx: &mut Context<Self>) {
+        let presented = self.presented(cx);
+        if let Some(focus) = self.node_id_for_stops().map(Focus::Node) {
+            crate::ui::journey::record_action(
+                cx,
+                focus,
+                format!("{stop:?}"),
+                source,
+                "lifecycle_panel",
+                presented,
+            );
+        }
+        match stop {
+            LifecyclePanelStop::RunInCloud => self.run_in_cloud(cx),
+            LifecyclePanelStop::SyncCloud => self.sync_cloud(cx),
+            LifecyclePanelStop::StopCloud => {
+                self.cloud_stop_armed = true;
+                cx.notify();
+            }
+            LifecyclePanelStop::CancelStopCloud => {
+                self.cloud_stop_armed = false;
+                self.clamp_focus_index(cx);
+                cx.notify();
+            }
+            LifecyclePanelStop::ConfirmStopCloud(delete) => self.stop_cloud(delete, cx),
+            LifecyclePanelStop::MoveBack => self.move_back(cx),
+            LifecyclePanelStop::CheckIncoming => self.check_incoming(cx),
+            LifecyclePanelStop::Implement => self.launch_implementation(window, cx),
+            LifecyclePanelStop::Verify => self.launch_verification(window, cx),
+            LifecyclePanelStop::BackToActive => self.revert_lifecycle(cx),
+            LifecyclePanelStop::Review => self.launch_review(window, cx),
+            LifecyclePanelStop::RunGateCheck => self.run_gate_check(window, cx),
+            LifecyclePanelStop::OpenInterview | LifecyclePanelStop::OpenInterviewCriterion(_) => {
                 if let Some(task_id) = self.task_id.clone() {
                     cx.emit(LifecyclePanelEvent::OpenInterview {
                         task_id,
@@ -374,10 +722,110 @@ impl LifecyclePanelView {
                     });
                 }
             }
-            Some(LifecyclePanelStop::ForceAdvance) => self.force_advance(window, cx),
-            Some(LifecyclePanelStop::RevertLifecycle) => self.revert_lifecycle(cx),
-            Some(LifecyclePanelStop::Close) => self.close(cx),
-            None => {}
+            LifecyclePanelStop::ForceAdvance => self.force_advance(window, cx),
+            LifecyclePanelStop::RevertLifecycle => self.revert_lifecycle(cx),
+            LifecyclePanelStop::WaiveCriterion(id) => self.waive_criterion(id, cx),
+            LifecyclePanelStop::AdvanceAfterCriteria => self.advance_after_criteria(window, cx),
+            LifecyclePanelStop::Close => self.close(cx),
+        }
+    }
+
+    fn run_in_cloud(&mut self, cx: &mut Context<Self>) {
+        let Some(task_id) = self.task_id.clone() else {
+            return;
+        };
+        if self.cloud_busy {
+            return;
+        }
+        self.cloud_busy = true;
+        self.cloud_status = Some((task_id.clone(), "Starting…".to_string()));
+        cx.notify();
+        let fleet = self.fleet.clone();
+        crate::views::cloud_node::run_in_cloud(fleet, task_id.clone(), cx, move |this, update, cx| {
+            this.cloud_update(&task_id, update, cx)
+        });
+    }
+
+    fn sync_cloud(&mut self, cx: &mut Context<Self>) {
+        let Some(task_id) = self.task_id.clone() else {
+            return;
+        };
+        if self.cloud_busy {
+            return;
+        }
+        self.cloud_busy = true;
+        self.cloud_status = Some((task_id.clone(), "Syncing…".to_string()));
+        cx.notify();
+        crate::views::cloud_node::sync_now(self.fleet.clone(), cx, move |this, update, cx| {
+            this.cloud_update(&task_id, update, cx)
+        });
+    }
+
+    /// Take the node out of the cloud off the UI thread, deleting its
+    /// sandbox when `delete_sandbox`.
+    fn stop_cloud(&mut self, delete_sandbox: bool, cx: &mut Context<Self>) {
+        let Some(task_id) = self.task_id.clone() else {
+            return;
+        };
+        if self.cloud_busy {
+            return;
+        }
+        self.cloud_busy = true;
+        self.cloud_stop_armed = false;
+        self.cloud_status = Some((task_id.clone(), "Leaving the cloud…".to_string()));
+        cx.notify();
+        crate::views::cloud_node::stop_running(self.fleet.clone(), task_id.clone(), delete_sandbox, cx, move |this, update, cx| {
+            this.cloud_update(&task_id, update, cx)
+        });
+    }
+
+    /// A cloud node's status line, with what the last lost-sandbox check did.
+    fn cloud_line(&self, cloud: &tod_core::cloud_sync::CloudNode) -> String {
+        let note = self.task_id.as_deref().and_then(tod_core::cloud_sync::lost::note);
+        crate::views::cloud_node::status_line_with(cloud, &self.lifecycle, note.as_deref())
+    }
+
+    /// The cloud job's latest word, when it is about the node shown.
+    fn cloud_status_line(&self) -> Option<String> {
+        self.cloud_status
+            .as_ref()
+            .filter(|(id, _)| self.task_id.as_deref() == Some(id.as_str()))
+            .map(|(_, msg)| msg.clone())
+    }
+
+    /// A cloud job's word, about `task_id`.
+    fn cloud_update(&mut self, task_id: &str, update: CloudUpdate, cx: &mut Context<Self>) {
+        let msg = match update {
+            CloudUpdate::Progress(msg) => msg,
+            CloudUpdate::Accepted(node) => {
+                self.cloud_busy = false;
+                let msg = format!("Running in sandbox {}.", node.sandbox);
+                if self.task_id.as_deref() == Some(task_id) {
+                    self.cloud = Some(node);
+                    self.clamp_focus_index(cx);
+                }
+                msg
+            }
+            CloudUpdate::Left(msg) => {
+                self.cloud_busy = false;
+                if self.task_id.as_deref() == Some(task_id) {
+                    self.cloud = None;
+                    self.clamp_focus_index(cx);
+                }
+                msg
+            }
+            CloudUpdate::Synced(msg) | CloudUpdate::Failed(msg) => {
+                self.cloud_busy = false;
+                msg
+            }
+        };
+        self.cloud_status = Some((task_id.to_string(), msg));
+        cx.notify();
+    }
+
+    fn activate_focused(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(stop) = self.focused_stop(cx) {
+            self.perform(stop, Source::Keyboard, window, cx);
         }
     }
 
@@ -438,6 +886,12 @@ impl LifecyclePanelView {
     }
 
     /// Re-read where the node's work stands. `true` when it changed.
+    /// Whether verification still owes a verdict (never checked, or reopened
+    /// by a change since), which decides "Verify" versus "Verify again".
+    fn verification_due(&self) -> bool {
+        self.standing.as_ref().is_some_and(Standing::verification_due)
+    }
+
     fn refresh_standing(&mut self) -> bool {
         let found = self
             .task_id
@@ -607,7 +1061,7 @@ impl LifecyclePanelView {
                 if self.implementation_run_live().is_none() =>
             {
                 self.refresh_active_control();
-                self.clamp_focus_index();
+                self.clamp_focus_index(cx);
                 cx.notify();
                 return;
             }
@@ -707,6 +1161,82 @@ impl LifecyclePanelView {
     /// its note; they cannot be fixed from here.
     /// "Past learnings": the retrospective each completed pass stored, read
     /// only. Earlier passes' work history is summed up here, not re-shown.
+    /// Run in the cloud (or, for a cloud node, its status line and Sync
+    /// now), with the cloud job's latest word.
+    fn render_cloud(&self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let list_active_border = cx.theme().list_active_border;
+        let stop = if self.cloud.is_some() {
+            LifecyclePanelStop::SyncCloud
+        } else {
+            LifecyclePanelStop::RunInCloud
+        };
+        let focused = self.is_focused(stop, cx);
+        let mut section = v_flex().gap_1();
+        if let Some(cloud) = &self.cloud {
+            section = section.child(style::text_dense_muted(div()).child(selectable_text(
+                "lifecycle-panel-cloud-status",
+                self.cloud_line(cloud),
+                window,
+                cx,
+            )));
+        }
+        section = section.child(
+            div()
+                .w_full()
+                .rounded_md()
+                .when(focused, |el| el.border_1().border_color(list_active_border))
+                .child(
+                    Button::new("lifecycle-panel-cloud")
+                        .label(self.stop_label(stop, cx))
+                        .compact()
+                        .w_full()
+                        .disabled(self.stop_disabled(stop, cx))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.perform(stop, Source::Click, window, cx);
+                        })),
+                ),
+        );
+        if self.cloud.is_some() {
+            let leave: Vec<LifecyclePanelStop> = if self.cloud_stop_armed {
+                vec![
+                    LifecyclePanelStop::ConfirmStopCloud(false),
+                    LifecyclePanelStop::ConfirmStopCloud(true),
+                    LifecyclePanelStop::CancelStopCloud,
+                ]
+            } else {
+                vec![LifecyclePanelStop::StopCloud]
+            };
+            for (i, stop) in leave.into_iter().enumerate() {
+                let focused = self.is_focused(stop, cx);
+                section = section.child(
+                    div()
+                        .w_full()
+                        .rounded_md()
+                        .when(focused, |el| el.border_1().border_color(list_active_border))
+                        .child(
+                            Button::new(("lifecycle-panel-cloud-stop", i))
+                                .label(self.stop_label(stop, cx))
+                                .compact()
+                                .w_full()
+                                .disabled(self.stop_disabled(stop, cx))
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.perform(stop, Source::Click, window, cx);
+                                })),
+                        ),
+                );
+            }
+        }
+        if let Some(status) = self.cloud_status_line() {
+            section = section.child(style::text_dense_muted(div()).child(selectable_text(
+                "lifecycle-panel-cloud-progress",
+                status,
+                window,
+                cx,
+            )));
+        }
+        section.into_any_element()
+    }
+
     fn render_learnings(&self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
         let muted = cx.theme().muted_foreground;
         let mut section = v_flex()
@@ -815,7 +1345,7 @@ impl LifecyclePanelView {
                     ),
                 ));
             }
-            let focused = self.is_focused(LifecyclePanelStop::CheckIncoming);
+            let focused = self.is_focused(LifecyclePanelStop::CheckIncoming, cx);
             let list_active_border = cx.theme().list_active_border;
             section = section.child(
                 div()
@@ -826,7 +1356,9 @@ impl LifecyclePanelView {
                         Button::new("lifecycle-panel-check-incoming")
                             .label("Check now")
                             .w_full()
-                            .on_click(cx.listener(|this, _, _, cx| this.check_incoming(cx))),
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.perform(LifecyclePanelStop::CheckIncoming, Source::Click, window, cx);
+                            })),
                     ),
             );
         }
@@ -852,40 +1384,31 @@ impl LifecyclePanelView {
         else {
             return body;
         };
-        let steps = self
-            .fleet
-            .list_plan_steps_for_node(node_id)
-            .unwrap_or_default();
-        let verified = steps.iter().filter(|s| s.status == STATUS_VERIFIED).count();
-        let failed = steps.iter().filter(|s| s.status == STATUS_FAILED).count();
-        let standings = tod_core::conversation::verify::standings(&self.fleet, node_id);
-        let obligations_verified = standings.iter().filter(|s| s.is_verified()).count();
-        let obligations_failed = standings.iter().filter(|s| s.is_failed()).count();
+        let status_counts = self.verification_status(node_id);
+        let VerificationStatus {
+            total_steps,
+            verified,
+            failed,
+            total_obligations,
+            obligations_verified,
+            obligations_failed,
+            ..
+        } = status_counts;
         // "Verify" while verification owes a verdict — never checked, or
         // reopened by a change since — then "Verify again".
-        let due = self
-            .standing
-            .as_ref()
-            .is_some_and(Standing::verification_due);
+        let due = self.verification_due();
         let status = self
             .task_id
             .as_ref()
             .and_then(|id| self.implement_status.get(id))
             .cloned();
-        let revert_armed = self.current_state(cx, |s| s.revert_armed);
 
         body = body.child(div().text_xs().font_semibold().child("Verification"));
-        let mut summary = format!(
-            "{obligations_verified} of {} requirements verified",
-            standings.len()
-        );
+        let mut summary = format!("{obligations_verified} of {total_obligations} requirements verified");
         if obligations_failed > 0 {
             summary.push_str(&format!(", {obligations_failed} failed"));
         }
-        summary.push_str(&format!(
-            "; {verified} of {} plan steps verified",
-            steps.len()
-        ));
+        summary.push_str(&format!("; {verified} of {total_steps} plan steps verified"));
         if failed > 0 {
             summary.push_str(&format!(", {failed} failed"));
         }
@@ -895,22 +1418,23 @@ impl LifecyclePanelView {
             window,
             cx,
         )));
-        if !steps.is_empty() {
+        if total_steps > 0 {
+            let label = self.stop_label(LifecyclePanelStop::Verify, cx);
             body = body.child(
                 div()
                     .w_full()
                     .rounded_md()
-                    .when(self.is_focused(LifecyclePanelStop::Verify), |el| {
+                    .when(self.is_focused(LifecyclePanelStop::Verify, cx), |el| {
                         el.border_1().border_color(list_active_border)
                     })
                     .child(
                         Button::new("lifecycle-panel-verify")
-                            .label(if due { "Verify" } else { "Verify again" })
+                            .label(label)
                             .when(due, |b| b.primary())
                             .when(!due, |b| b.ghost())
                             .w_full()
                             .on_click(cx.listener(|this, _, window, cx| {
-                                this.launch_verification(window, cx);
+                                this.perform(LifecyclePanelStop::Verify, Source::Click, window, cx);
                             })),
                     ),
             );
@@ -925,6 +1449,7 @@ impl LifecyclePanelView {
         }
         if failed > 0 {
             let steps_word = if failed == 1 { "step" } else { "steps" };
+            let label = self.stop_label(LifecyclePanelStop::BackToActive, cx);
             body = body
                 .child(div().text_xs().text_color(danger).child(format!(
                     "{failed} plan {steps_word} failed verification. Move the node back to \
@@ -932,18 +1457,27 @@ impl LifecyclePanelView {
                      with its note saying what to fix."
                 )))
                 .child(
-                    Button::new("lifecycle-panel-back-to-active")
-                        .label(if revert_armed {
-                            "Confirm: back to active".to_string()
-                        } else {
-                            format!("Back to active to fix {failed} failed {steps_word}")
-                        })
-                        // Once verification has finished; until then, Verify.
-                        .when(!due, |b| b.primary())
+                    div()
                         .w_full()
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.revert_lifecycle(cx);
-                        })),
+                        .rounded_md()
+                        .when(self.is_focused(LifecyclePanelStop::BackToActive, cx), |el| {
+                            el.border_1().border_color(list_active_border)
+                        })
+                        .child(
+                            Button::new("lifecycle-panel-back-to-active")
+                                .label(label)
+                                // Once verification has finished; until then, Verify.
+                                .when(!due, |b| b.primary())
+                                .w_full()
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.perform(
+                                        LifecyclePanelStop::BackToActive,
+                                        Source::Click,
+                                        window,
+                                        cx,
+                                    );
+                                })),
+                        ),
                 );
         }
         body
@@ -971,17 +1505,11 @@ impl LifecyclePanelView {
         else {
             return body;
         };
-        let (findings, reviewed) = self
-            .fleet
-            .read(|conn| {
-                let findings = ReviewRepo::new(conn).list_for_node(node_id)?;
-                let reviewed = ConversationRepo::new(conn)
-                    .latest_for_focus_with_protocol(Focus::Node(node_id), ProtocolKind::Review)?
-                    .is_some();
-                Ok((findings, reviewed))
-            })
-            .unwrap_or_default();
-        let open = findings.iter().filter(|f| f.is_open()).count();
+        let ReviewStatus {
+            total: findings_len,
+            open,
+            reviewed,
+        } = self.review_status(node_id);
         let status = self
             .task_id
             .as_ref()
@@ -989,12 +1517,13 @@ impl LifecyclePanelView {
             .cloned();
 
         body = body.child(div().text_xs().font_semibold().child("Code review"));
-        let summary = match (reviewed, findings.len()) {
+        let summary = match (reviewed, findings_len) {
             (false, 0) => "Not reviewed yet".to_string(),
             (true, 0) => "No findings".to_string(),
             (_, 1) => format!("1 finding, {open} open"),
             (_, n) => format!("{n} findings, {open} open"),
         };
+        let review_label = self.stop_label(LifecyclePanelStop::Review, cx);
         body = body
             .child(div().text_xs().text_color(muted).child(selectable_text(
                 "lifecycle-panel-review-summary",
@@ -1006,17 +1535,17 @@ impl LifecyclePanelView {
                 div()
                     .w_full()
                     .rounded_md()
-                    .when(self.is_focused(LifecyclePanelStop::Review), |el| {
+                    .when(self.is_focused(LifecyclePanelStop::Review, cx), |el| {
                         el.border_1().border_color(list_active_border)
                     })
                     .child(
                         Button::new("lifecycle-panel-review")
-                            .label(if reviewed { "Review again" } else { "Review" })
+                            .label(review_label)
                             .when(!reviewed, |b| b.primary())
                             .when(reviewed, |b| b.ghost())
                             .w_full()
                             .on_click(cx.listener(|this, _, window, cx| {
-                                this.launch_review(window, cx);
+                                this.perform(LifecyclePanelStop::Review, Source::Click, window, cx);
                             })),
                     ),
             );
@@ -1065,6 +1594,12 @@ impl LifecyclePanelView {
                 self.refresh_standing();
                 self.refresh_incoming();
                 self.refresh_learnings();
+                // The store's open read connection: no database is opened here.
+                let cloud = tod_core::cloud_sync::cloud_node(&self.fleet, task_id);
+                if cloud.is_none() {
+                    self.cloud_stop_armed = false;
+                }
+                self.cloud = cloud;
                 true
             }
             _ => false,
@@ -1172,7 +1707,7 @@ impl Render for LifecyclePanelView {
             return div().size_full().into_any_element();
         }
         self.refresh_active_control();
-        self.clamp_focus_index();
+        self.clamp_focus_index(cx);
 
         let theme = cx.theme();
         let border = theme.border;
@@ -1184,16 +1719,13 @@ impl Render for LifecyclePanelView {
         let list_active_border = theme.list_active_border;
 
         let next_state = next_lifecycle(&self.lifecycle);
-        let (gate_status, gate_error, criteria_detail, force_advance_armed, revert_armed) = self
-            .current_state(cx, |s| {
-                (
-                    s.gate_status.clone(),
-                    s.gate_error.clone(),
-                    s.criteria_detail.clone(),
-                    s.force_advance_armed,
-                    s.revert_armed,
-                )
-            });
+        let (gate_status, gate_error, criteria_detail) = self.current_state(cx, |s| {
+            (
+                s.gate_status.clone(),
+                s.gate_error.clone(),
+                s.criteria_detail.clone(),
+            )
+        });
 
         let mut body = v_flex()
             .id("lifecycle-panel-body")
@@ -1204,7 +1736,7 @@ impl Render for LifecyclePanelView {
             .overflow_y_scroll()
             .child(div().text_sm().font_semibold().child(self.title.clone()));
 
-        let run_gate_check_focused = self.is_focused(LifecyclePanelStop::RunGateCheck);
+        let run_gate_check_focused = self.is_focused(LifecyclePanelStop::RunGateCheck, cx);
         let gate_check_recommended = matches!(self.recommended(), Some(NextStep::GateCheck));
         if !self.lifecycle_capable {
             body = body.child(
@@ -1213,6 +1745,10 @@ impl Render for LifecyclePanelView {
                     .text_color(muted)
                     .child("Current selection doesn't have lifecycle capability."),
             );
+        } else if self.cloud.is_some() {
+            // The supervisor moves a cloud node along: a status line instead
+            // of the lifecycle buttons.
+            body = body.child(self.render_cloud(window, cx));
         } else {
             body = body.child(
                 div()
@@ -1220,9 +1756,10 @@ impl Render for LifecyclePanelView {
                     .text_color(muted)
                     .child(format!("Current: {}", self.lifecycle)),
             );
+            body = body.child(self.render_cloud(window, cx));
 
             if let Some(found) = self.regression.clone() {
-                let focused = self.is_focused(LifecyclePanelStop::MoveBack);
+                let focused = self.is_focused(LifecyclePanelStop::MoveBack, cx);
                 let mut callout = style::callout_stale(div().w_full())
                     .child(style::callout_stale_title(div()).child(format!(
                         "This node is no longer {} — move it back to {}",
@@ -1237,20 +1774,50 @@ impl Render for LifecyclePanelView {
                         cx,
                     ));
                 }
+                let node_id = self.node_id_for_stops();
                 body = body.child(
-                    callout.child(
-                        div()
-                            .w_full()
-                            .rounded_md()
-                            .when(focused, |el| el.border_1().border_color(list_active_border))
-                            .child(
-                                Button::new("lifecycle-panel-move-back")
-                                    .label(format!("Move back to {}", found.target))
-                                    .primary()
-                                    .w_full()
-                                    .on_click(cx.listener(|this, _, _, cx| this.move_back(cx))),
-                            ),
-                    ),
+                    callout
+                        .child(
+                            div()
+                                .w_full()
+                                .rounded_md()
+                                .when(focused, |el| el.border_1().border_color(list_active_border))
+                                .child(
+                                    Button::new("lifecycle-panel-move-back")
+                                        .label(format!("Move back to {}", found.target))
+                                        .primary()
+                                        .w_full()
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.perform(
+                                                LifecyclePanelStop::MoveBack,
+                                                Source::Click,
+                                                window,
+                                                cx,
+                                            );
+                                        })),
+                                ),
+                        )
+                        .when_some(
+                            node_id.filter(|_| crate::ui::report_problem::is_available(cx)),
+                            |el, node_id| {
+                            el.child(
+                                Button::new("lifecycle-panel-regression-report-problem")
+                                    .label("Report a problem")
+                                    .ghost()
+                                    .compact()
+                                    .on_click(move |_, window, cx| {
+                                        window.dispatch_action(
+                                            Box::new(
+                                                crate::ui::report_problem::OpenReportDialog::node(
+                                                    node_id,
+                                                ),
+                                            ),
+                                            cx,
+                                        );
+                                    }),
+                            )
+                            },
+                        ),
                 );
             }
 
@@ -1309,7 +1876,7 @@ impl Render for LifecyclePanelView {
                             div()
                                 .w_full()
                                 .rounded_md()
-                                .when(self.is_focused(LifecyclePanelStop::Implement), |el| {
+                                .when(self.is_focused(LifecyclePanelStop::Implement, cx), |el| {
                                     el.border_1().border_color(list_active_border)
                                 })
                                 .child(
@@ -1323,7 +1890,12 @@ impl Render for LifecyclePanelView {
                                         .w_full()
                                         .disabled(blocked)
                                         .on_click(cx.listener(|this, _, window, cx| {
-                                            this.launch_implementation(window, cx);
+                                            this.perform(
+                                                LifecyclePanelStop::Implement,
+                                                Source::Click,
+                                                window,
+                                                cx,
+                                            );
                                         })),
                                 ),
                         );
@@ -1370,7 +1942,12 @@ impl Render for LifecyclePanelView {
                                 .when(gate_check_recommended, |b| b.primary())
                                 .w_full()
                                 .on_click(cx.listener(|this, _, window, cx| {
-                                    this.run_gate_check(window, cx);
+                                    this.perform(
+                                        LifecyclePanelStop::RunGateCheck,
+                                        Source::Click,
+                                        window,
+                                        cx,
+                                    );
                                 })),
                         ),
                 ),
@@ -1384,7 +1961,7 @@ impl Render for LifecyclePanelView {
         }
 
         if self.interview_available() {
-            let open_interview_focused = self.is_focused(LifecyclePanelStop::OpenInterview);
+            let open_interview_focused = self.is_focused(LifecyclePanelStop::OpenInterview, cx);
             body = body.child(
                 div()
                     .w_full()
@@ -1402,21 +1979,21 @@ impl Render for LifecyclePanelView {
                             ))
                             .ghost()
                             .w_full()
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                if let Some(task_id) = this.task_id.clone() {
-                                    cx.emit(LifecyclePanelEvent::OpenInterview {
-                                        task_id,
-                                        lifecycle: this.lifecycle.clone(),
-                                    });
-                                }
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.perform(
+                                    LifecyclePanelStop::OpenInterview,
+                                    Source::Click,
+                                    window,
+                                    cx,
+                                );
                             })),
                     ),
             );
         }
 
-        if let Some(next) = next_state.filter(|_| self.lifecycle_capable) {
-            let force_focused = self.is_focused(LifecyclePanelStop::ForceAdvance);
-            let armed = force_advance_armed;
+        if next_state.filter(|_| self.lifecycle_capable).is_some() {
+            let force_focused = self.is_focused(LifecyclePanelStop::ForceAdvance, cx);
+            let label = self.stop_label(LifecyclePanelStop::ForceAdvance, cx);
             body = body.child(
                 div()
                     .w_full()
@@ -1426,23 +2003,24 @@ impl Render for LifecyclePanelView {
                     })
                     .child(
                         Button::new("lifecycle-panel-force-advance")
-                            .label(if armed {
-                                format!("Confirm force advance to {next}")
-                            } else {
-                                format!("Force advance to {next} (bypass gate)")
-                            })
+                            .label(label)
                             .ghost()
                             .w_full()
                             .on_click(cx.listener(|this, _, window, cx| {
-                                this.force_advance(window, cx);
+                                this.perform(
+                                    LifecyclePanelStop::ForceAdvance,
+                                    Source::Click,
+                                    window,
+                                    cx,
+                                );
                             })),
                     ),
             );
         }
 
-        if let Some(prev) = previous_lifecycle(&self.lifecycle).filter(|_| self.lifecycle_capable) {
-            let revert_focused = self.is_focused(LifecyclePanelStop::RevertLifecycle);
-            let armed = revert_armed;
+        if let Some(_prev) = previous_lifecycle(&self.lifecycle).filter(|_| self.lifecycle_capable) {
+            let revert_focused = self.is_focused(LifecyclePanelStop::RevertLifecycle, cx);
+            let label = self.stop_label(LifecyclePanelStop::RevertLifecycle, cx);
             body = body.child(
                 div()
                     .w_full()
@@ -1452,15 +2030,16 @@ impl Render for LifecyclePanelView {
                     })
                     .child(
                         Button::new("lifecycle-panel-revert")
-                            .label(if armed {
-                                format!("Confirm revert to {prev}")
-                            } else {
-                                format!("Revert to {prev}")
-                            })
+                            .label(label)
                             .ghost()
                             .w_full()
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.revert_lifecycle(cx);
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.perform(
+                                    LifecyclePanelStop::RevertLifecycle,
+                                    Source::Click,
+                                    window,
+                                    cx,
+                                );
                             })),
                     ),
             );
@@ -1483,6 +2062,25 @@ impl Render for LifecyclePanelView {
                     window,
                     cx,
                 )));
+                if let Some(node_id) = self
+                    .node_id_for_stops()
+                    .filter(|_| crate::ui::report_problem::is_available(cx))
+                {
+                    body = body.child(
+                        Button::new("lifecycle-panel-gate-error-report-problem")
+                            .label("Report a problem")
+                            .ghost()
+                            .compact()
+                            .on_click(move |_, window, cx| {
+                                window.dispatch_action(
+                                    Box::new(
+                                        crate::ui::report_problem::OpenReportDialog::node(node_id),
+                                    ),
+                                    cx,
+                                );
+                            }),
+                    );
+                }
             }
 
             if !criteria_detail.is_empty() {
@@ -1549,13 +2147,13 @@ impl Render for LifecyclePanelView {
                                     .ghost()
                                     .compact()
                                     .w_full()
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        if let Some(task_id) = this.task_id.clone() {
-                                            cx.emit(LifecyclePanelEvent::OpenInterview {
-                                                task_id,
-                                                lifecycle: this.lifecycle.clone(),
-                                            });
-                                        }
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.perform(
+                                            LifecyclePanelStop::OpenInterviewCriterion(criterion_id),
+                                            Source::Click,
+                                            window,
+                                            cx,
+                                        );
                                     })),
                             );
                         }
@@ -1565,8 +2163,13 @@ impl Render for LifecyclePanelView {
                                 .ghost()
                                 .compact()
                                 .w_full()
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.waive_criterion(criterion_id, cx);
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.perform(
+                                        LifecyclePanelStop::WaiveCriterion(criterion_id),
+                                        Source::Click,
+                                        window,
+                                        cx,
+                                    );
                                 })),
                         );
                         div().flex_shrink_0().w(px(ACTION_COL)).child(buttons)
@@ -1648,18 +2251,22 @@ impl Render for LifecyclePanelView {
                         .child(list),
                 );
 
-                if let Some(next) = next_state {
-                    let all_clear = criteria_detail
-                        .iter()
-                        .all(|r| r.outcome == OUTCOME_PASS || r.outcome == OUTCOME_WAIVED);
+                if next_state.is_some() {
+                    let label = self.stop_label(LifecyclePanelStop::AdvanceAfterCriteria, cx);
+                    let disabled = self.stop_disabled(LifecyclePanelStop::AdvanceAfterCriteria, cx);
                     body = body.child(
                         Button::new("lifecycle-panel-advance-after-criteria")
-                            .label(format!("Advance to {next}"))
+                            .label(label)
                             .primary()
                             .w_full()
-                            .disabled(!all_clear)
+                            .disabled(disabled)
                             .on_click(cx.listener(|this, _, window, cx| {
-                                this.advance_after_criteria(window, cx);
+                                this.perform(
+                                    LifecyclePanelStop::AdvanceAfterCriteria,
+                                    Source::Click,
+                                    window,
+                                    cx,
+                                );
                             })),
                     );
                 }
@@ -1714,7 +2321,7 @@ impl Render for LifecyclePanelView {
                     .child(
                         div()
                             .rounded_md()
-                            .when(self.is_focused(LifecyclePanelStop::Close), |el| {
+                            .when(self.is_focused(LifecyclePanelStop::Close, cx), |el| {
                                 el.border_1().border_color(list_active_border)
                             })
                             .child(chrome_control_with_shortcut(
@@ -1722,8 +2329,13 @@ impl Render for LifecyclePanelView {
                                     .label("Close")
                                     .ghost()
                                     .compact()
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.close(cx);
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.perform(
+                                            LifecyclePanelStop::Close,
+                                            Source::Click,
+                                            window,
+                                            cx,
+                                        );
                                     })),
                                 window,
                                 &LifecyclePanelClose,
@@ -1758,4 +2370,220 @@ pub fn register_lifecycle_panel_keyboard_bindings(cx: &mut App) {
         ),
     ]);
     bind_modified_pane_nav(cx, LIFECYCLE_PANEL_CONTEXT);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::views::incoming_check::IncomingCheck;
+    use crate::views::rows::fixture::Fixture;
+    use gpui::{AppContext as _, TestAppContext, VisualTestContext};
+    use gpui_component::Root;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use std::sync::Mutex;
+    use tod_agent::{MockAgentProvider, SharedAgent};
+
+    fn set_lifecycle(fixture: &Fixture, state: &str) {
+        fixture
+            .store
+            .enqueue_outline(tod_store::outline::OutlineMutation::EnableCapabilities {
+                node_id: fixture.node_id,
+                capabilities: vec![tod_store::outline::types::Capability::Lifecycle],
+            })
+            .unwrap();
+        fixture
+            .store
+            .enqueue_outline(tod_store::outline::OutlineMutation::SetLifecycle {
+                node_id: fixture.node_id,
+                state: state.into(),
+            })
+            .unwrap();
+        fixture.store.writer().flush().unwrap();
+    }
+
+    fn open_panel<'a>(
+        fixture: &Fixture,
+        cx: &'a mut TestAppContext,
+    ) -> (Entity<LifecyclePanelView>, &'a mut VisualTestContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            register_lifecycle_panel_keyboard_bindings(cx);
+        });
+        let slot = Rc::new(RefCell::new(None));
+        let store = fixture.store.clone();
+        let task_id = fixture.node_id.to_string();
+        let slot_in = slot.clone();
+        let (_, cx) = cx.add_window_view(move |window, cx| {
+            let agent: SharedAgent = Arc::new(Mutex::new(Box::new(MockAgentProvider::new())));
+            let lifecycle = cx.new(|_| LifecycleController::new(store.clone()));
+            let incoming_check = cx.new(|_| {
+                IncomingCheck::new(store.clone(), agent.clone(), lifecycle.clone())
+            });
+            let view = cx.new(|cx| {
+                LifecyclePanelView::new(cx, store.clone(), lifecycle.clone(), incoming_check.clone())
+            });
+            view.update(cx, |panel, cx| panel.retarget(&task_id, cx));
+            *slot_in.borrow_mut() = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let view = slot.borrow_mut().take().unwrap();
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        (view, cx)
+    }
+
+    /// `presented` must describe exactly what `stop_label`/`stop_primary`/
+    /// `stop_disabled` compute for each visible stop, so the recorded journey
+    /// snapshot never drifts from the rendered buttons (doc/journeys/spec.md
+    /// §3.1).
+    #[gpui::test]
+    fn a_cloud_node_shows_its_status_instead_of_lifecycle_buttons(cx: &mut TestAppContext) {
+        let fixture = Fixture::new();
+        set_lifecycle(&fixture, "design");
+        make_cloud_node(&fixture, "node-x");
+        let (view, cx) = open_panel(&fixture, cx);
+        let (stops, presented) = view.read_with(cx, |panel, cx| (panel.stops(cx), panel.presented(cx)));
+        assert_eq!(
+            stops,
+            vec![LifecyclePanelStop::SyncCloud, LifecyclePanelStop::StopCloud, LifecyclePanelStop::Close]
+        );
+        assert!(presented.notices.iter().any(|n| n.contains("node-x")), "{presented:?}");
+    }
+
+    fn make_cloud_node(fixture: &Fixture, sandbox: &str) {
+        let _ = fixture.store.flush_on_quit();
+        let conn = rusqlite::Connection::open(fixture.store.paths().db()).unwrap();
+        tod_store::cloud_nodes::upsert(&conn, fixture.node_id, sandbox, "u", 0).unwrap();
+        drop(conn);
+        fixture.store.reload_if_stale().unwrap();
+    }
+
+    /// "Stop running in the cloud" asks first, records what was on offer,
+    /// and removing the row (off the UI thread) turns the panel back into
+    /// the lifecycle buttons.
+    #[gpui::test]
+    fn stopping_a_cloud_node_confirms_then_removes_its_record(cx: &mut TestAppContext) {
+        let fixture = Fixture::new();
+        set_lifecycle(&fixture, "design");
+        make_cloud_node(&fixture, "node-x");
+        let (view, cx) = open_panel(&fixture, cx);
+
+        cx.update(|window, cx| {
+            view.update(cx, |panel, cx| panel.perform(LifecyclePanelStop::StopCloud, Source::Click, window, cx))
+        });
+        let stops = view.read_with(cx, |panel, cx| panel.stops(cx));
+        assert_eq!(
+            stops,
+            vec![
+                LifecyclePanelStop::SyncCloud,
+                LifecyclePanelStop::ConfirmStopCloud(false),
+                LifecyclePanelStop::ConfirmStopCloud(true),
+                LifecyclePanelStop::CancelStopCloud,
+                LifecyclePanelStop::Close,
+            ],
+            "nothing is removed before the user confirms"
+        );
+        let presented = view.read_with(cx, |panel, cx| panel.presented(cx));
+        assert!(
+            presented.actions.iter().any(|a| a.label == "Confirm: stop and delete the sandbox"),
+            "{presented:?}"
+        );
+
+        cx.update(|window, cx| {
+            view.update(cx, |panel, cx| {
+                panel.perform(LifecyclePanelStop::ConfirmStopCloud(false), Source::Click, window, cx)
+            })
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while view.read_with(cx, |panel, _| panel.cloud.is_some()) && std::time::Instant::now() < deadline {
+            cx.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(tod_core::cloud_sync::cloud_node(&fixture.store, &fixture.node_id.to_string()).is_none());
+        let stops = view.read_with(cx, |panel, cx| panel.stops(cx));
+        assert_eq!(stops.first(), Some(&LifecyclePanelStop::RunInCloud));
+    }
+
+    #[gpui::test]
+    fn a_lifecycle_node_offers_run_in_the_cloud(cx: &mut TestAppContext) {
+        let fixture = Fixture::new();
+        set_lifecycle(&fixture, "design");
+        let (view, cx) = open_panel(&fixture, cx);
+        let stops = view.read_with(cx, |panel, cx| panel.stops(cx));
+        assert_eq!(stops.first(), Some(&LifecyclePanelStop::RunInCloud));
+    }
+
+    #[gpui::test]
+    fn presented_matches_the_rendered_stops(cx: &mut TestAppContext) {
+        let fixture = Fixture::new();
+        set_lifecycle(&fixture, "design");
+        let (view, cx) = open_panel(&fixture, cx);
+
+        let (presented, stops) = view.read_with(cx, |panel, cx| {
+            (panel.presented(cx), panel.stops(cx))
+        });
+        assert_eq!(presented.actions.len(), stops.len());
+        for (p, stop) in presented.actions.iter().zip(stops.iter()) {
+            let (label, primary, disabled) = view.read_with(cx, |panel, cx| {
+                (
+                    panel.stop_label(*stop, cx),
+                    panel.stop_primary(*stop, cx),
+                    panel.stop_disabled(*stop, cx),
+                )
+            });
+            assert_eq!(p.id, format!("{stop:?}"));
+            assert_eq!(p.label, label);
+            assert_eq!(p.primary, primary);
+            assert_eq!(p.disabled, disabled);
+        }
+        // A `design` node's only lifecycle-moving stop is the gate check.
+        let primary = presented
+            .actions
+            .iter()
+            .find(|a| a.primary)
+            .expect("a design node has a primary stop");
+        assert_eq!(primary.id, format!("{:?}", LifecyclePanelStop::RunGateCheck));
+    }
+
+    /// Activating a stop (the keyboard path, which every `on_click` mirrors
+    /// through `perform`) records a `UserAction` with the `Presented`
+    /// snapshot captured at that moment.
+    #[gpui::test]
+    fn perform_records_the_presented_snapshot(cx: &mut TestAppContext) {
+        let fixture = Fixture::new();
+        set_lifecycle(&fixture, "design");
+        let (view, cx) = open_panel(&fixture, cx);
+
+        let before = cx.update(|_, cx| crate::ui::journey::hub(cx).read(cx).len());
+        view.update_in(cx, |panel, window, cx| {
+            panel.perform(LifecyclePanelStop::RunGateCheck, Source::Keyboard, window, cx);
+        });
+        let after = cx.update(|_, cx| crate::ui::journey::hub(cx).read(cx).len());
+        assert!(after > before, "activating a stop records an entry");
+
+        let last = cx.update(|_, cx| crate::ui::journey::hub(cx).read(cx).snapshot());
+        let last = last.last().expect("at least one entry recorded");
+        match &last.record.event {
+            tod_journey::Event::UserAction {
+                surface,
+                source,
+                action,
+                presented,
+            } => {
+                assert_eq!(surface, "lifecycle_panel");
+                assert_eq!(source, "keyboard");
+                assert_eq!(
+                    action.as_str(),
+                    format!("{:?}", LifecyclePanelStop::RunGateCheck)
+                );
+                assert!(
+                    presented.actions.iter().any(|a| a.primary),
+                    "the recorded snapshot includes the primary stop"
+                );
+            }
+            other => panic!("expected a UserAction, got {other:?}"),
+        }
+    }
 }

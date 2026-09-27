@@ -2,9 +2,11 @@
 //! by the general-purpose [`AgentConversationPanel`].
 
 use super::{ConversationView, Pane, Stop};
+use crate::ui::token_usage;
 use crate::ui::agent_conversation::{
     AgentConversationEvent, AgentConversationPanel, Entry, EntryKind, PanelAction,
 };
+use crate::ui::terminal_handoff::{self, CONTINUE_IN_TERMINAL, OPEN_SHELL};
 use gpui::{
     AnyElement, AppContext, ClipboardItem, Context, Entity, IntoElement, Subscription, Window,
 };
@@ -12,6 +14,8 @@ use tod_store::conversation::{ConversationRepo, ProtocolKind, Turn, TurnRole};
 
 /// The transcript header's button that copies the opening context.
 const COPY_CONTEXT: &str = "transcript:copy-context";
+/// The transcript header's button that opens the report-a-problem dialog.
+const REPORT_PROBLEM: &str = "transcript:report-problem";
 
 pub(super) fn entry_of(turn: &Turn) -> Entry {
     // What the app sent on its own, shown as sent.
@@ -29,6 +33,7 @@ pub(super) fn entry_of(turn: &Turn) -> Entry {
         parts: turn.parts.clone(),
         label: None,
         summary: None,
+        live: false,
     }
 }
 
@@ -77,10 +82,29 @@ impl ConversationView {
         match event {
             AgentConversationEvent::Send(text) => self.send(text, window, cx),
             AgentConversationEvent::Stop => self.stop_turn(cx),
-            AgentConversationEvent::Action(id) if id.as_ref() == COPY_CONTEXT => {
+            AgentConversationEvent::Action(id, _) if id.as_ref() == COPY_CONTEXT => {
                 self.copy_opening_context(cx)
             }
-            AgentConversationEvent::Action(id) => self.lifecycle_action(id, window, cx),
+            AgentConversationEvent::Action(id, _) if id.as_ref() == CONTINUE_IN_TERMINAL => {
+                terminal_handoff::continue_in_terminal(
+                    self.fleet.clone(),
+                    self.agent.clone(),
+                    self.driver_config(),
+                    self.conversation_id,
+                    self.status.running,
+                    window,
+                    cx,
+                )
+            }
+            AgentConversationEvent::Action(id, _) if id.as_ref() == OPEN_SHELL => {
+                terminal_handoff::open_shell(self.fleet.clone(), self.focus.node_id(), window, cx)
+            }
+            AgentConversationEvent::Action(id, _) if id.as_ref() == REPORT_PROBLEM => {
+                self.on_report_problem(&crate::ui::report_problem::ReportProblem, window, cx);
+            }
+            AgentConversationEvent::Action(id, source) => {
+                self.lifecycle_action(id, *source, window, cx)
+            }
             AgentConversationEvent::Activated => {
                 self.pane = Pane::Transcript;
                 self.stop = Stop::Transcript;
@@ -121,6 +145,18 @@ impl ConversationView {
         cx.notify();
     }
 
+    /// The open conversation's agent session, once it has one.
+    fn agent_session(&self) -> Option<&str> {
+        let id = self.conversation_id?;
+        self.data
+            .conversations
+            .iter()
+            .find(|c| c.conversation.id == id)?
+            .conversation
+            .agent_session_id
+            .as_deref()
+    }
+
     /// Bring the panel up to date and return it for the layout.
     pub(super) fn render_transcript(
         &mut self,
@@ -130,7 +166,7 @@ impl ConversationView {
         let active =
             self.pane == Pane::Transcript && self.stop == Stop::Transcript && self.picker.is_none();
         let gate_check = self.data.protocol == ProtocolKind::GateCheck;
-        let entries = self
+        let mut entries: Vec<_> = self
             .data
             .turns
             .iter()
@@ -152,6 +188,10 @@ impl ConversationView {
                 entry
             })
             .collect();
+        // The turn in flight, one line per step so far.
+        if self.status.running && !self.status.parts.is_empty() {
+            entries.push(Entry::live_reply(self.status.parts.clone()));
+        }
         let empty = format!(
             "No conversation about {} yet. Give direction below.",
             self.data.title
@@ -180,17 +220,30 @@ impl ConversationView {
         let return_focus = self.focus_handle.clone();
         let (actions, notices) = self.lifecycle_controls(cx);
         let lifecycle_state = self.data.lifecycle.as_ref().map(|s| s.lifecycle.clone());
-        let header_actions = if self.data.has_opening_context {
+        let usage = self
+            .shown_usage()
+            .map(|usage| (token_usage::summary(&usage), token_usage::details(&usage)));
+        let mut header_actions = if self.data.has_opening_context {
             vec![PanelAction::new(COPY_CONTEXT, "Copy context")]
         } else {
             Vec::new()
         };
+        if crate::ui::report_problem::is_available(cx) {
+            header_actions.push(PanelAction::new(REPORT_PROBLEM, "Report a problem"));
+        }
+        let tools = terminal_handoff::tools(
+            self.focus.node_id(),
+            self.agent_session().is_some(),
+            self.status.running,
+        );
         self.transcript.update(cx, |panel, cx| {
             panel.set_title(title, cx);
             panel.set_header_actions(header_actions, cx);
             panel.set_actions(actions, cx);
+            panel.set_tools(tools, cx);
             panel.set_notices(notices, cx);
             panel.set_lifecycle_state(lifecycle_state, cx);
+            panel.set_usage(usage, cx);
             panel.set_return_focus(return_focus);
             panel.set_entries(entries, cx);
             panel.set_empty_message(empty, cx);

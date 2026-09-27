@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use tod_agent::agent_traffic::InterviewAgentCounts;
 use tod_agent::{
-    AgentLaunchOptions, AgentPlatform, AgentRunHandle, AgentRunState, RunId, SessionTurn,
+    AgentLaunchOptions, AgentPlatform, AgentProvider, AgentRunHandle, AgentRunState, RunId, SessionTurn,
 };
 use tod_store::outline::{Capability, CreatePosition, KIND_CONSTRAINT, OutlineMutation};
 use tod_store::settings::InterviewContextSettings;

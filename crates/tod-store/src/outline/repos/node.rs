@@ -240,6 +240,36 @@ impl<'a> NodeRepo<'a> {
             .map_err(Into::into)
     }
 
+    /// Lifecycle state for every node in `node_ids` that has one, in one
+    /// query — for a list view over many nodes at once (e.g.
+    /// `tod_core::attention`). A node with no `node_lifecycle` row is absent
+    /// from the map.
+    pub fn get_lifecycle_for_nodes(
+        &self,
+        node_ids: &[Uuid],
+    ) -> Result<std::collections::HashMap<Uuid, String>> {
+        if node_ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let placeholders = node_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT node_id, state FROM node_lifecycle WHERE node_id IN ({placeholders})"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let params: Vec<Vec<u8>> = node_ids.iter().copied().map(uuid_to_blob).collect();
+        let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |row| {
+            let id_blob: Vec<u8> = row.get(0)?;
+            let state: String = row.get(1)?;
+            Ok((id_blob, state))
+        })?;
+        let mut map = std::collections::HashMap::new();
+        for row in rows {
+            let (id_blob, state) = row?;
+            map.insert(blob_to_uuid_sql(&id_blob)?, state);
+        }
+        Ok(map)
+    }
+
     pub fn set_fields(
         &self,
         node_id: Uuid,
