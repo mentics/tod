@@ -539,6 +539,7 @@ fn append_turn(
                 body: body.into(),
                 parts,
                 sent_context: None,
+                attachments: Vec::new(),
             },
         )
         .unwrap();

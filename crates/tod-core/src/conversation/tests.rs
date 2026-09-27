@@ -661,6 +661,51 @@ fn a_session_that_cannot_be_resumed_rotates_and_resends() {
 }
 
 #[test]
+fn attached_images_are_kept_with_the_turn_and_sent_again_after_a_failed_resume() {
+    let fx = fixture();
+    let mut agent = FakeAgent::new(&fx.fleet);
+    let mut driver =
+        ConversationDriver::new(config(&fx, 100_000), Focus::Project, ProtocolKind::Outline);
+    say(&mut driver, &fx, &mut agent, "ask Hello?");
+    let id = driver.conversation_id().unwrap();
+    let image = tod_agent::PromptImage {
+        mime_type: "image/png".into(),
+        data: b"not really a png".to_vec(),
+    };
+
+    // An image alone is a message.
+    let mut agent = FakeAgent::new(&fx.fleet);
+    agent.fail_resume = true;
+    let mut driver = ConversationDriver::open(config(&fx, 100_000), &fx.fleet, id).unwrap();
+    driver
+        .send_with_images(&fx.fleet, &mut agent, "  ", vec![image.clone()])
+        .unwrap();
+    assert_eq!(agent.last().images, [image.clone()]);
+    assert_eq!(
+        driver.tick(&fx.fleet, &mut agent),
+        [ConversationEvent::Rotated]
+    );
+    // The fresh session is sent the image again.
+    assert_eq!(agent.turns.len(), 2);
+    assert_eq!(agent.turns[1].images, [image.clone()]);
+
+    let user = fx
+        .fleet
+        .read(|conn| ConversationRepo::new(conn).turns(id))
+        .unwrap()
+        .into_iter()
+        .filter(|t| t.role == TurnRole::User)
+        .last()
+        .unwrap();
+    assert_eq!(user.body, "");
+    let [attachment] = user.attachments.as_slice() else {
+        panic!("one attachment: {:?}", user.attachments);
+    };
+    assert_eq!(attachment.mime_type, "image/png");
+    assert_eq!(attachment.read(fx.fleet.paths().root()).unwrap(), image.data);
+}
+
+#[test]
 fn a_failed_turn_is_an_error_turn() {
     let fx = fixture();
     let mut agent = FakeAgent::new(&fx.fleet);

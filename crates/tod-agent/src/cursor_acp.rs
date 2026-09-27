@@ -4,7 +4,8 @@ use super::acp_host::{
 };
 use super::provider::{
     AgentProvider, AgentRunHandle, AgentRunKind, AgentRunState, PermissionOption,
-    PermissionRequest, RunId, SessionObserver, SessionPurpose, SessionStarted, SessionTurn,
+    PermissionRequest, PromptImage, RunId, SessionObserver, SessionPurpose, SessionStarted,
+    SessionTurn,
 };
 use crate::agent_launch::{AgentLaunchOptions, effort_for_acp};
 use crate::devcontainer::AgentEnvironment;
@@ -88,6 +89,8 @@ enum ConversationCommand {
     Turn {
         run_id: RunId,
         blocks: Vec<String>,
+        /// Sent just before the last block, the message.
+        images: Vec<PromptImage>,
         /// Name for the agent-side session, if this turn creates one.
         title: String,
         reply: Sender<WorkerMessage>,
@@ -224,6 +227,7 @@ impl ConversationWorker {
             let ConversationCommand::Turn {
                 run_id,
                 blocks,
+                images,
                 title,
                 reply,
             } = command
@@ -237,7 +241,7 @@ impl ConversationWorker {
                 break;
             }
             self.cancelled.store(false, Ordering::SeqCst);
-            let result = self.turn(&mut live, run_id, &blocks, &title);
+            let result = self.turn(&mut live, run_id, &blocks, &images, &title);
             if result.is_err() {
                 // A failed or cancelled turn can leave the process mid-reply;
                 // the next message starts clean by resuming the session.
@@ -264,6 +268,7 @@ impl ConversationWorker {
         live: &mut Option<PersistentAcpSession>,
         run_id: RunId,
         blocks: &[String],
+        images: &[PromptImage],
         title: &str,
     ) -> Result<String> {
         *self.activity.lock().unwrap_or_else(|e| e.into_inner()) = None;
@@ -315,7 +320,7 @@ impl ConversationWorker {
         let live = live.as_mut().expect("connected above");
         // A container's session log is not on this machine to name.
         let name = (created && !live.in_container).then_some((self.spec.host, title));
-        live.prompt_blocks(blocks, run_id, name)
+        live.prompt_blocks(blocks, images, run_id, name)
     }
 }
 
@@ -556,6 +561,7 @@ impl AgentProvider for CursorAcpProvider {
         let blocks = turn.prompt_blocks();
         let SessionTurn {
             key,
+            images,
             title,
             cwd,
             options,
@@ -584,9 +590,17 @@ impl AgentProvider for CursorAcpProvider {
 
         let id = RunId::new();
         let (reply, receiver) = mpsc::channel();
+        // The traffic log names each image rather than carrying its bytes.
+        let logged = blocks
+            .iter()
+            .cloned()
+            .chain(images.iter().map(image_placeholder))
+            .collect::<Vec<_>>()
+            .join("\n\n");
         let command = ConversationCommand::Turn {
             run_id: id,
             blocks: blocks.clone(),
+            images,
             title,
             reply,
         };
@@ -617,7 +631,7 @@ impl AgentProvider for CursorAcpProvider {
             purpose.run_kind(),
             id,
             TrafficDirection::Request,
-            &blocks.join("\n\n"),
+            &logged,
         );
         let conversation = &self.conversations[&key];
         self.runs.insert(
@@ -1995,6 +2009,8 @@ struct PersistentAcpSession {
     /// The session's working directory as the agent sees it.
     cwd: PathBuf,
     in_container: bool,
+    /// Whether the agent said it takes image content in a prompt.
+    accepts_images: bool,
     _reader_handle: JoinHandle<()>,
 }
 
@@ -2076,6 +2092,10 @@ impl PersistentAcpSession {
             }),
         )?;
         let init_result = client.await_response(AUTH_TIMEOUT)?;
+        let accepts_images = init_result
+            .pointer("/agentCapabilities/promptCapabilities/image")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
 
         if cancelled.load(Ordering::SeqCst) {
             bail!("ACP run cancelled");
@@ -2133,26 +2153,30 @@ impl PersistentAcpSession {
             session_id,
             cwd,
             in_container,
+            accepts_images,
             _reader_handle: reader_handle,
         })
     }
 
-    /// Send one turn made of several text blocks, in order, naming the session
-    /// as the turn starts when `name` is given.
+    /// Send one turn made of several text blocks, in order, with `images`
+    /// just before the last one (the message), naming the session as the
+    /// turn starts when `name` is given.
     fn prompt_blocks(
         &mut self,
         blocks: &[String],
+        images: &[PromptImage],
         run_id: RunId,
         name: Option<(AcpHost, &str)>,
     ) -> Result<String> {
+        if !images.is_empty() && !self.accepts_images {
+            bail!("this agent does not accept images; send the message without them");
+        }
         self.client.clear_reply();
         self.client.run_id = run_id;
-        let content: Vec<Value> = blocks
-            .iter()
-            .map(|text| json!({ "type": "text", "text": text }))
-            .collect();
-        self.client
-            .count_context(blocks.iter().map(String::len).sum());
+        let content = prompt_content(blocks, images);
+        self.client.count_context(
+            blocks.iter().map(String::len).sum::<usize>() + images.len() * IMAGE_CONTEXT_CHARS,
+        );
         self.client.send_request(
             "session/prompt",
             json!({ "sessionId": self.session_id, "prompt": content }),
@@ -2178,8 +2202,68 @@ impl PersistentAcpSession {
     }
 }
 
+/// What an image adds to a session's context, in the characters the rest of
+/// the estimate counts: about the 1,600 tokens a full-size image costs.
+const IMAGE_CONTEXT_CHARS: usize = 6_400;
+
+/// A `session/prompt`'s content: each text block in order, with the images
+/// just before the last (the message). An empty message is left out, so an
+/// image can be sent on its own.
+fn prompt_content(blocks: &[String], images: &[PromptImage]) -> Vec<Value> {
+    use base64::Engine as _;
+    let text = |text: &String| json!({ "type": "text", "text": text });
+    let (message, context) = match blocks.split_last() {
+        Some((message, context)) => (Some(message), context),
+        None => (None, blocks),
+    };
+    context
+        .iter()
+        .map(text)
+        .chain(images.iter().map(|image| {
+            json!({
+                "type": "image",
+                "mimeType": image.mime_type,
+                "data": base64::engine::general_purpose::STANDARD.encode(&image.data),
+            })
+        }))
+        .chain(
+            message
+                .filter(|message| images.is_empty() || !message.trim().is_empty())
+                .map(text),
+        )
+        .collect()
+}
+
+/// How an image is shown where its bytes are not: the traffic log.
+fn image_placeholder(image: &PromptImage) -> String {
+    format!("[image: {}, {} bytes]", image.mime_type, image.data.len())
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn images_go_between_the_context_and_the_message() {
+        use super::{PromptImage, prompt_content};
+        let image = PromptImage {
+            mime_type: "image/png".into(),
+            data: vec![1, 2, 3],
+        };
+        let blocks = vec!["CONTEXT".to_string(), "look".to_string()];
+        let content = prompt_content(&blocks, std::slice::from_ref(&image));
+        let kinds: Vec<&str> = content.iter().map(|c| c["type"].as_str().unwrap()).collect();
+        assert_eq!(kinds, ["text", "image", "text"]);
+        assert_eq!(content[1]["mimeType"], "image/png");
+        assert_eq!(content[1]["data"], "AQID");
+        assert_eq!(content[2]["text"], "look");
+
+        // An image sent with no text is the whole message.
+        let content = prompt_content(&["".to_string()], std::slice::from_ref(&image));
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0]["type"], "image");
+        // Without images, the message goes as it is.
+        assert_eq!(prompt_content(&["".to_string()], &[]).len(), 1);
+    }
+
     #[test]
     fn an_unsigned_in_agent_says_where_to_sign_in() {
         use super::{AcpHost, AgentEnvironment, is_auth_required, sign_in_hint};
@@ -2419,6 +2503,7 @@ while True:
                 resume_session_id: resume,
                 opening,
                 message: message.into(),
+                images: Vec::new(),
                 purpose: crate::provider::SessionPurpose::Chat,
                 env: Vec::new(),
                 environment: AgentEnvironment::Host,
@@ -2561,6 +2646,7 @@ for line in sys.stdin:
                 resume_session_id: None,
                 opening: None,
                 message: "hi".into(),
+                images: Vec::new(),
                 purpose: crate::provider::SessionPurpose::Chat,
                 env: vec![("PATH".into(), r"C:\host\only".into())],
                 environment: AgentEnvironment::DevContainer(launch),

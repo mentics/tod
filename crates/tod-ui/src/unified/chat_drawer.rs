@@ -66,7 +66,7 @@ pub fn register_chat_drawer_keyboard_bindings(cx: &mut App) {
     ]);
 }
 
-fn entry_of(turn: &Turn) -> Entry {
+fn entry_of(turn: &Turn, root: &std::path::Path) -> Entry {
     Entry {
         kind: match turn.role {
             TurnRole::User => EntryKind::User,
@@ -79,6 +79,7 @@ fn entry_of(turn: &Turn) -> Entry {
         label: None,
         summary: None,
         live: false,
+        images: turn.attachments.iter().map(|a| a.path(root)).collect(),
     }
 }
 
@@ -254,7 +255,9 @@ impl ChatDrawer {
         cx: &mut Context<Self>,
     ) {
         match event {
-            AgentConversationEvent::Send(text) => self.send(text, window, cx),
+            AgentConversationEvent::Send(message) => {
+                self.send(&message.text, message.images.clone(), window, cx)
+            }
             AgentConversationEvent::Stop => self.stop_turn(cx),
             AgentConversationEvent::Activated | AgentConversationEvent::EditingChanged(_) => {
                 cx.notify();
@@ -277,9 +280,15 @@ impl ChatDrawer {
         }
     }
 
-    fn send(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+    fn send(
+        &mut self,
+        text: &str,
+        images: Vec<tod_agent::PromptImage>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let text = text.trim().to_string();
-        if text.is_empty() {
+        if text.is_empty() && images.is_empty() {
             return;
         }
         let ix = match self.ensure_current_driver(cx) {
@@ -310,7 +319,7 @@ impl ChatDrawer {
                 .background_executor()
                 .spawn(async move {
                     let result = driver
-                        .send(&fleet, &mut SharedAgentAccess(&agent), &text)
+                        .send_with_images(&fleet, &mut SharedAgentAccess(&agent), &text, images)
                         .map_err(|e| format!("{e:#}"));
                     (driver, result)
                 })
@@ -429,7 +438,8 @@ impl ChatDrawer {
                 .unwrap_or_default(),
             None => Vec::new(),
         };
-        let mut entries: Vec<Entry> = turns.iter().map(entry_of).collect();
+        let root = self.fleet.paths().root();
+        let mut entries: Vec<Entry> = turns.iter().map(|turn| entry_of(turn, root)).collect();
         // The turn in flight, one line per step so far.
         if self.status.running && !self.status.parts.is_empty() {
             entries.push(Entry::live_reply(self.status.parts.clone()));
@@ -768,7 +778,7 @@ mod tests {
         drawer.update(cx, |d, cx| d.set_focus(Focus::Node(fixture.node_id), cx));
 
         cx.update_window(cx.window_handle(), |_, window, cx| {
-            drawer.update(cx, |d, cx| d.send("think Hello there", window, cx));
+            drawer.update(cx, |d, cx| d.send("think Hello there", Vec::new(), window, cx));
         })
         .unwrap();
         cx.run_until_parked();
@@ -782,5 +792,93 @@ mod tests {
                 .any(|e| e.kind == EntryKind::Agent)
         });
         assert!(has_reply, "the mock agent's reply should be in the transcript");
+    }
+
+    #[gpui::test]
+    fn a_pasted_image_goes_out_with_the_message(cx: &mut TestAppContext) {
+        let fixture = Fixture::new();
+        let agent = mock_agent();
+        let (drawer, runs, cx) = open_drawer(&fixture, agent.clone(), cx);
+        drawer.update(cx, |d, cx| d.set_focus(Focus::Node(fixture.node_id), cx));
+        cx.update_window(cx.window_handle(), |_, window, cx| {
+            drawer.update(cx, |d, cx| {
+                d.toggle(window, cx);
+                d.transcript
+                    .update(cx, |panel, cx| panel.start_editing(window, cx));
+            });
+        })
+        .unwrap();
+        draw(cx);
+        cx.run_until_parked();
+        draw(cx);
+
+        // A 1×1 PNG, as a screenshot tool would put it on the clipboard.
+        let mut png = Vec::new();
+        image::DynamicImage::ImageRgba8(image::RgbaImage::new(1, 1))
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        let panel = drawer.read_with(cx, |d, _| d.transcript.clone());
+        // What the panel does on the next frame, which tests do not run.
+        cx.update(|window, cx| {
+            let input = panel.read(cx).input().clone();
+            input.update(cx, |input, cx| input.focus(window, cx));
+        });
+        // Text still pastes as text.
+        cx.update(|_, cx| cx.write_to_clipboard(gpui::ClipboardItem::new_string("typed".into())));
+        cx.dispatch_action(gpui_component::input::Paste);
+        cx.run_until_parked();
+        assert_eq!(panel.read_with(cx, |p, cx| p.input().read(cx).value().to_string()), "typed");
+        assert!(panel.read_with(cx, |p, _| p.images().is_empty()));
+        cx.update_window(cx.window_handle(), |_, window, cx| {
+            panel.update(cx, |p, cx| p.set_input("", window, cx));
+        })
+        .unwrap();
+
+        cx.update(|_, cx| {
+            cx.write_to_clipboard(gpui::ClipboardItem {
+                entries: vec![gpui::ClipboardEntry::Image(gpui::Image::from_bytes(
+                    gpui::ImageFormat::Png,
+                    png.clone(),
+                ))],
+            })
+        });
+        cx.dispatch_action(gpui_component::input::Paste);
+        cx.run_until_parked();
+
+        // Attached, not sent, and not pasted into the text.
+        assert_eq!(panel.read_with(cx, |p, _| p.images().len()), 1);
+        assert_eq!(panel.read_with(cx, |p, cx| p.input().read(cx).value().to_string()), "");
+        assert!(drawer.read_with(cx, |d, _| d.conversation_id()).is_none());
+
+        cx.update_window(cx.window_handle(), |_, window, cx| {
+            panel.update(cx, |p, cx| p.set_input("think What is this?", window, cx));
+        })
+        .unwrap();
+        panel.update(cx, |p, cx| p.submit(cx));
+        cx.run_until_parked();
+        drain(&runs, &fixture.store, &agent, cx);
+
+        assert!(panel.read_with(cx, |p, _| p.images().is_empty()), "sent with the message");
+        let id = drawer.read_with(cx, |d, _| d.conversation_id()).unwrap();
+        let user = fixture
+            .store
+            .read(|conn| ConversationRepo::new(conn).turns(id))
+            .unwrap()
+            .into_iter()
+            .find(|t| t.role == TurnRole::User)
+            .unwrap();
+        assert_eq!(user.body, "think What is this?");
+        assert_eq!(user.attachments.len(), 1);
+        assert_eq!(
+            user.attachments[0].read(fixture.store.paths().root()).unwrap(),
+            png
+        );
+        let shown = panel.read_with(cx, |p, _| {
+            p.entries()
+                .iter()
+                .find(|e| e.kind == EntryKind::User)
+                .map(|e| e.images.len())
+        });
+        assert_eq!(shown, Some(1), "the transcript shows the image");
     }
 }

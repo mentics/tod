@@ -426,6 +426,7 @@ impl InteractiveAgentView {
                     resume_session_id: self.agent_session_id.clone(),
                     opening: self.opening(),
                     message: text,
+                    images: Vec::new(),
                     purpose: tod_agent::SessionPurpose::Chat,
                     env: Vec::new(),
                     environment: Default::default(),

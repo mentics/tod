@@ -200,6 +200,7 @@ pub mod size {
     pub const TABLE_CELL: Pixels = px(160.);
     pub const SUMMARY_LIST_MAX: Pixels = px(240.);
     pub const ROW_MENU_MIN: Pixels = px(160.);
+    pub const THUMBNAIL: Pixels = px(64.);
 }
 
 /// `tokens.radius`.
@@ -561,6 +562,18 @@ fn row_base<E: Styled + InteractiveElement>(el: E) -> E {
 /// [`chunk_header`].
 pub fn chunk<E: Styled>(el: E) -> E {
     el.w_full()
+        .border(size::BORDER)
+        .border_color(color::divider())
+        .rounded(radius::CONTROL)
+}
+
+/// `styles.image-thumbnail`: a square frame for an attached image; put the
+/// image in it with `object_fit(ObjectFit::Cover)`. Apply [`highlighted`] on
+/// top for the highlighted one.
+pub fn image_thumbnail<E: Styled>(el: E) -> E {
+    el.size(size::THUMBNAIL)
+        .flex_none()
+        .overflow_hidden()
         .border(size::BORDER)
         .border_color(color::divider())
         .rounded(radius::CONTROL)

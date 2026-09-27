@@ -1,7 +1,7 @@
 //! Conversation log value types.
 
 use crate::outline::OutlineMutation;
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 pub use tod_agent::ReplyPart;
 use uuid::Uuid;
@@ -473,7 +473,64 @@ pub struct Turn {
     /// a continuation turn (its body already equals what was sent) and for
     /// every non-user turn.
     pub sent_context: Option<String>,
+    /// Images the user attached to a user turn, in the order they were sent.
+    pub attachments: Vec<TurnAttachment>,
     pub created_at: i64,
+}
+
+/// An image attached to a user turn: a file under the data root, kept so the
+/// transcript can show it and a fresh session can be sent it again.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnAttachment {
+    /// Relative to the data root, `/`-separated.
+    pub file: String,
+    pub mime_type: String,
+}
+
+/// Where a conversation's attachments are kept, relative to the data root.
+const ATTACHMENTS_DIR: &str = "conversation-attachments";
+
+impl TurnAttachment {
+    /// Write `data` under `root` as a new attachment of `conversation_id`.
+    pub fn save(
+        root: &std::path::Path,
+        conversation_id: Uuid,
+        mime_type: &str,
+        data: &[u8],
+    ) -> Result<Self> {
+        let extension = match mime_type {
+            "image/png" => "png",
+            "image/jpeg" => "jpg",
+            "image/gif" => "gif",
+            "image/webp" => "webp",
+            other => bail!("unsupported image type {other}"),
+        };
+        let file = format!(
+            "{ATTACHMENTS_DIR}/{conversation_id}/{}.{extension}",
+            Uuid::new_v4()
+        );
+        let attachment = Self {
+            file,
+            mime_type: mime_type.to_string(),
+        };
+        let path = attachment.path(root);
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)
+                .with_context(|| format!("create {}", dir.display()))?;
+        }
+        std::fs::write(&path, data).with_context(|| format!("write {}", path.display()))?;
+        Ok(attachment)
+    }
+
+    /// The file, under `root`.
+    pub fn path(&self, root: &std::path::Path) -> std::path::PathBuf {
+        self.file.split('/').fold(root.to_path_buf(), |path, part| path.join(part))
+    }
+
+    pub fn read(&self, root: &std::path::Path) -> Result<Vec<u8>> {
+        let path = self.path(root);
+        std::fs::read(&path).with_context(|| format!("read {}", path.display()))
+    }
 }
 
 /// The answer in a streamed reply: the text after the agent's last thought

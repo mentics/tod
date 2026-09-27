@@ -168,6 +168,9 @@ pub enum InterviewCommand {
         /// continuation turn, and for every non-user turn.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         sent_context: Option<String>,
+        /// Images attached to a user turn, already saved under the data root.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        attachments: Vec<crate::conversation::TurnAttachment>,
     },
     /// Close the turns left waiting on an agent when the app last stopped
     /// (at startup, before any turn is in flight); returns their
@@ -859,6 +862,7 @@ pub fn execute(
             body,
             parts,
             sent_context,
+            attachments,
         } => {
             let repo = crate::conversation::ConversationRepo::new(conn);
             if repo.get(*conversation_id)?.is_none() {
@@ -870,6 +874,7 @@ pub fn execute(
                 body,
                 parts,
                 sent_context.as_deref(),
+                attachments,
             )?;
             Ok(json!({ "seq": turn.seq }))
         }

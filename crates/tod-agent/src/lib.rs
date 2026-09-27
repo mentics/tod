@@ -41,7 +41,7 @@ pub use mock::{
 };
 pub use provider::{
     AgentProvider, AgentRunHandle, AgentRunState, PermissionOption, PermissionRequest, RunId,
-    SessionObserver, SessionOpening, SessionPurpose, SessionStarted, SessionTurn,
+    PromptImage, SessionObserver, SessionOpening, SessionPurpose, SessionStarted, SessionTurn,
 };
 pub use reply::ReplyPart;
 pub use routing::RoutingAgentProvider;

@@ -925,7 +925,7 @@ impl ConversationView {
         if self.current_status(cx).is_some_and(|s| s.running) {
             return;
         }
-        self.send(starter, window, cx);
+        self.send(starter, Vec::new(), window, cx);
     }
 
     // ----- drivers and data ----------------------------------------------
@@ -1497,10 +1497,16 @@ impl ConversationView {
         cx.notify();
     }
 
-    /// Send `text` from the input, which is cleared at once; it is given back
-    /// if the message does not go out.
-    fn send(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
-        if self.deliver(text, AfterSend::Input(window.window_handle()), cx) {
+    /// Send `text` and `images` from the input, which is cleared at once;
+    /// they are given back if the message does not go out.
+    fn send(
+        &mut self,
+        text: &str,
+        images: Vec<tod_agent::PromptImage>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.deliver(text, images, AfterSend::Input(window.window_handle()), cx) {
             self.transcript
                 .update(cx, |panel, cx| panel.clear_input(window, cx));
         }
@@ -1513,9 +1519,15 @@ impl ConversationView {
     /// submodules, the container's environment, the build stamp), so the
     /// driver goes to the background executor for it. Meanwhile the view
     /// shows the agent starting, and Stop stops it once it has.
-    fn deliver(&mut self, text: &str, after: AfterSend, cx: &mut Context<Self>) -> bool {
+    fn deliver(
+        &mut self,
+        text: &str,
+        images: Vec<tod_agent::PromptImage>,
+        after: AfterSend,
+        cx: &mut Context<Self>,
+    ) -> bool {
         let text = text.trim().to_string();
-        if text.is_empty() {
+        if text.is_empty() && images.is_empty() {
             return false;
         }
         let ix = match self.ensure_current_driver(cx) {
@@ -1545,26 +1557,35 @@ impl ConversationView {
         let fleet = self.fleet.clone();
         let agent = self.agent.clone();
         cx.spawn(async move |this, cx| {
-            let (driver, text, result) = cx
+            let (driver, text, images, result) = cx
                 .background_executor()
                 .spawn(async move {
                     let result = driver
-                        .send(&fleet, &mut SharedAgentAccess(&agent), &text)
+                        .send_with_images(
+                            &fleet,
+                            &mut SharedAgentAccess(&agent),
+                            &text,
+                            images.clone(),
+                        )
                         .map_err(|e| format!("{e:#}"));
-                    (driver, text, result)
+                    (driver, text, images, result)
                 })
                 .await;
-            let Ok(restore) =
-                this.update(cx, |this, cx| this.sent(slot, driver, &text, result, after, cx))
-            else {
+            let image_count = images.len();
+            let Ok(restore) = this.update(cx, |this, cx| {
+                this.sent(slot, driver, &text, image_count, result, after, cx)
+            }) else {
                 return;
             };
             if let Some(window) = restore {
                 let _ = cx.update_window(window, |_, window, cx| {
                     let _ = this.update(cx, |this, cx| {
                         this.transcript.update(cx, |panel, cx| {
-                            if panel.input().read(cx).value().trim().is_empty() {
+                            if panel.input().read(cx).value().trim().is_empty()
+                                && panel.images().is_empty()
+                            {
                                 panel.set_input(&text, window, cx);
+                                panel.add_images(images, cx);
                             }
                         });
                     });
@@ -1577,11 +1598,13 @@ impl ConversationView {
 
     /// The driver is back from sending `text`. Returns the window whose
     /// input should have the text back, when it did not go out.
+    #[allow(clippy::too_many_arguments)]
     fn sent(
         &mut self,
         slot: u64,
         driver: ConversationDriver,
         text: &str,
+        image_count: usize,
         result: Result<i64, String>,
         after: AfterSend,
         cx: &mut Context<Self>,
@@ -1609,7 +1632,11 @@ impl ConversationView {
                     crate::ui::journey::Source::Keyboard,
                     "conversation",
                     tod_journey::Presented {
-                        notices: vec![format!("seq={user_seq}"), format!("length={}", text.len())],
+                        notices: vec![
+                            format!("seq={user_seq}"),
+                            format!("length={}", text.len()),
+                            format!("images={image_count}"),
+                        ],
                         ..Default::default()
                     },
                 );

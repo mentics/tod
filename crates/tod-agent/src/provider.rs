@@ -142,6 +142,16 @@ pub struct SessionOpening {
     pub context: Option<String>,
 }
 
+/// An image the user attached to a message. It goes to the agent with the
+/// message, as a content block of its own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromptImage {
+    /// One the agents read: `image/png`, `image/jpeg`, `image/gif`, or
+    /// `image/webp`.
+    pub mime_type: String,
+    pub data: Vec<u8>,
+}
+
 /// One user message in a long-lived conversation.
 ///
 /// Conversations are addressed by a caller-chosen `key`. The provider keeps the
@@ -163,6 +173,9 @@ pub struct SessionTurn {
     /// Set on the conversation's first message only.
     pub opening: Option<SessionOpening>,
     pub message: String,
+    /// Images attached to the message, sent after the opening context and
+    /// before the message's text.
+    pub images: Vec<PromptImage>,
     pub purpose: SessionPurpose,
     /// Extra environment for the agent process. Applied when the process for
     /// this key is started, so it must stay the same for the life of the key.
@@ -281,6 +294,7 @@ mod tests {
             resume_session_id: None,
             opening,
             message: "hello".into(),
+            images: Vec::new(),
             purpose: SessionPurpose::Chat,
             env: Vec::new(),
             environment: AgentEnvironment::Host,

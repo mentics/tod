@@ -11,6 +11,7 @@ pub mod key_context;
 pub mod list;
 pub mod pane_nav;
 pub mod panel_split;
+pub mod pasted_image;
 pub mod report_problem;
 pub mod scroll_reveal;
 pub mod screenshot;
