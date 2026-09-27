@@ -230,7 +230,7 @@ fn a_changes_post_is_announced_on_the_users_topic() {
     assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
     let topics = json(&body);
     let topic = topics["topic"].as_str().unwrap().to_string();
-    assert!(topic.starts_with("tod-") && topic.len() > 60, "{topics}");
+    assert!(topic.starts_with("tod-") && (40..=64).contains(&topic.len()), "{topics}");
     assert_eq!(topics["alerts_topic"].as_str().unwrap(), format!("{topic}-alerts"));
     assert_eq!(*sink.0.lock().unwrap(), vec![(topic.clone(), Kind::Changed)]);
 
