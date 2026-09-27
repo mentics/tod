@@ -9,6 +9,7 @@ pub mod item_list;
 pub mod journey;
 pub mod key_context;
 pub mod list;
+pub mod nav_history;
 pub mod pane_nav;
 pub mod panel_split;
 pub mod pasted_image;
