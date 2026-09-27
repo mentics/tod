@@ -17,7 +17,7 @@ mod resize;
 pub mod runners;
 pub mod status_label;
 
-pub use columns::{ColumnModel, PanelKind};
+pub use columns::{Column, ColumnModel, PanelKind};
 pub use panel::ColumnPanel;
 use chat_drawer::{ChatDrawer, ChatDrawerEvent};
 use panel::{PanelFocusSelected, PanelOpenChat, PanelOpenRequest};
@@ -173,6 +173,30 @@ struct ColumnWidth {
     laid_out: Rc<Cell<Bounds<Pixels>>>,
 }
 
+/// Where the view is, as the app's Back and Forward record it
+/// (`ui::nav_history`): the tree's selection and what each column shows.
+/// Pins come back with it but are not part of what makes two places
+/// different, so pinning a column is not a step Back retraces.
+#[derive(Debug, Clone)]
+pub struct WorkbenchPlace {
+    pub node: Option<Uuid>,
+    pub columns: Vec<Column>,
+}
+
+impl PartialEq for WorkbenchPlace {
+    fn eq(&self, other: &Self) -> bool {
+        self.node == other.node
+            && self.columns.len() == other.columns.len()
+            && self
+                .columns
+                .iter()
+                .zip(&other.columns)
+                .all(|(a, b)| a.panel == b.panel)
+    }
+}
+
+impl Eq for WorkbenchPlace {}
+
 pub struct UnifiedView {
     fleet: Arc<FleetStore>,
     paths: TodPaths,
@@ -218,6 +242,10 @@ pub struct UnifiedView {
     /// task node (or back) swaps its default panel in place
     /// ([`Self::follow_default_panel`]).
     last_default: Cell<Option<(Uuid, bool)>>,
+    /// The node [`Self::restore_place`] selected in the tree: its
+    /// `SelectionChanged`, delivered later, must not open the node's default
+    /// panel over the columns that were restored with it.
+    restoring_selection: Option<Uuid>,
     _task_list_subscription: Subscription,
     _agent_runs_subscription: Subscription,
     _chat_drawer_subscription: Subscription,
@@ -284,6 +312,7 @@ impl UnifiedView {
             focus_handle: cx.focus_handle(),
             attention: HashMap::new(),
             last_default: Cell::new(None),
+            restoring_selection: None,
             _task_list_subscription,
             _agent_runs_subscription,
             _chat_drawer_subscription,
@@ -429,12 +458,16 @@ impl UnifiedView {
         match event {
             TaskListEvent::SelectionChanged { task_id } => {
                 let node_id = task_id.as_deref().and_then(|id| Uuid::parse_str(id).ok());
+                let restored = self.restoring_selection.take();
                 if let Some(id) = node_id {
-                    // The node tree (column 1) always counts as pinned, so a
-                    // selection opens the node's default panel in the first
-                    // unpinned column starting at column 2 (index 0), as a
-                    // plain (non-ctrl) open.
-                    self.open_panel(self.default_panel(id), 0, false, window, cx);
+                    // A selection Back or Forward made brings its own columns.
+                    if restored != Some(id) {
+                        // The node tree (column 1) always counts as pinned, so a
+                        // selection opens the node's default panel in the first
+                        // unpinned column starting at column 2 (index 0), as a
+                        // plain (non-ctrl) open.
+                        self.open_panel(self.default_panel(id), 0, false, window, cx);
+                    }
                     self.set_chat_focus(Focus::Node(id), cx);
                 }
             }
@@ -781,6 +814,58 @@ impl UnifiedView {
     /// `SortKey::WaitingLongest`) and the node adjacent to the current
     /// selection in it, wrapping around
     /// (`doc/ui/unified-view.md` "Alt+Q").
+    /// Where the view is now, for the app's Back and Forward.
+    pub fn place(&self, cx: &App) -> WorkbenchPlace {
+        WorkbenchPlace {
+            node: self.task_list.read(cx).selected_node_id(),
+            columns: self.columns.columns().to_vec(),
+        }
+    }
+
+    /// Put the view back at `place`: select its node in the tree and show
+    /// its columns, keeping the panel entity (and any unsaved edit in it) of
+    /// a column that already shows the same panel, and each position's
+    /// width. Keyboard focus goes to the tree. A node no longer in the tree
+    /// is left unselected; [`Self::place`] then tells where the view ended up.
+    pub fn restore_place(&mut self, place: &WorkbenchPlace, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(node) = place.node {
+            if self.task_list.read(cx).selected_node_id() != Some(node) {
+                let task_id = node.to_string();
+                self.task_list
+                    .update(cx, |task_list, cx| task_list.reveal_node(&task_id, window, cx));
+                self.restoring_selection = (self.task_list.read(cx).selected_node_id()
+                    == Some(node))
+                .then_some(node);
+            }
+            self.set_chat_focus(Focus::Node(node), cx);
+        }
+        let old_panels: Vec<PanelKind> =
+            self.columns.columns().iter().map(|column| column.panel).collect();
+        let mut old_hosted: Vec<Option<HostedColumn>> =
+            std::mem::take(&mut self.hosted).into_iter().map(Some).collect();
+        self.hosted = place
+            .columns
+            .iter()
+            .map(|column| {
+                old_panels
+                    .iter()
+                    .zip(old_hosted.iter_mut())
+                    .find(|(panel, hosted)| **panel == column.panel && hosted.is_some())
+                    .and_then(|(_, hosted)| hosted.take())
+                    .unwrap_or_else(|| self.construct_hosted(column.panel, window, cx))
+            })
+            .collect();
+        for position in self.column_widths.len()..place.columns.len() {
+            self.column_widths.push(ColumnWidth {
+                dragged: self.layout.column_width(position).map(px),
+                ..Default::default()
+            });
+        }
+        self.column_widths.truncate(place.columns.len());
+        self.columns = ColumnModel::from_columns(place.columns.clone());
+        self.focus_tree(window, cx);
+    }
+
     /// The node selected in this view's tree, with its title.
     pub fn selected_node_with_title(&self, cx: &App) -> Option<(Uuid, String)> {
         self.task_list.read(cx).selected_node_with_title()
@@ -1410,6 +1495,55 @@ mod tests {
                 view.columns.columns()[1].panel,
                 PanelKind::Obligations(node_id)
             );
+        });
+    }
+
+    #[gpui::test]
+    fn restoring_a_place_brings_back_its_columns_and_keeps_shown_panels(
+        cx: &mut TestAppContext,
+    ) {
+        let fixture = Fixture::new();
+        let (view, cx) = open_view(&fixture, cx);
+        let node_id = fixture.node_id;
+
+        let earlier = view.update_in(cx, |view, window, cx| {
+            view.open_panel(PanelKind::Details(node_id), 0, false, window, cx);
+            view.open_panel(PanelKind::Obligations(node_id), 0, true, window, cx);
+            view.place(cx)
+        });
+        // Plan replaces Details in column 2, and column 3 closes.
+        view.update_in(cx, |view, window, cx| {
+            view.close_column(1, cx);
+            view.open_panel(PanelKind::Plan(node_id), 0, false, window, cx);
+        });
+        draw(cx);
+        assert_ne!(view.read_with(cx, |view, cx| view.place(cx)), earlier);
+
+        view.update_in(cx, |view, window, cx| view.restore_place(&earlier, window, cx));
+        draw(cx);
+        let obligations = view.read_with(cx, |view, cx| {
+            assert_eq!(view.place(cx), earlier);
+            assert_eq!(view.hosted.len(), 2);
+            assert_eq!(view.column_widths.len(), 2);
+            assert_eq!(view.columns.focused_index(), None);
+            view.hosted[1].panel.entity_id()
+        });
+
+        // Obligations moves to column 2, keeping its entity.
+        view.update_in(cx, |view, window, cx| {
+            view.close_column(0, cx);
+            view.restore_place(
+                &WorkbenchPlace {
+                    node: earlier.node,
+                    columns: vec![earlier.columns[1].clone()],
+                },
+                window,
+                cx,
+            );
+        });
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.hosted.len(), 1);
+            assert_eq!(view.hosted[0].panel.entity_id(), obligations);
         });
     }
 
