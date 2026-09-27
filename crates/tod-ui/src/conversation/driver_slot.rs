@@ -27,6 +27,8 @@ pub(crate) struct DriverSlot {
     /// Stop was pressed while the driver was away; the turn is stopped as
     /// soon as it comes back.
     pub cancel: bool,
+    /// Another owner drives this conversation ([`Self::hosted_elsewhere`]).
+    elsewhere: bool,
 }
 
 impl DriverSlot {
@@ -40,9 +42,37 @@ impl DriverSlot {
             continuations: 0,
             cancel: false,
             driver: None,
+            elsewhere: false,
         };
         slot.put_back(driver);
         slot
+    }
+
+    /// A slot for a conversation another owner drives (a node's runner,
+    /// `crate::unified::runners`): it has no driver here, so nothing takes it
+    /// to send or tick, and it shows `status` until the owner releases it.
+    pub fn hosted_elsewhere(
+        id: u64,
+        focus: Focus,
+        protocol: ProtocolKind,
+        conversation_id: Uuid,
+        status: ConversationStatus,
+    ) -> Self {
+        Self {
+            id,
+            driver: None,
+            focus,
+            protocol,
+            conversation_id: Some(conversation_id),
+            status,
+            continuations: 0,
+            cancel: false,
+            elsewhere: true,
+        }
+    }
+
+    pub fn is_hosted_elsewhere(&self) -> bool {
+        self.elsewhere
     }
 
     /// The driver, when it is here.

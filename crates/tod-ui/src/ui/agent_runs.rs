@@ -208,6 +208,62 @@ impl AgentRuns {
         }
     }
 
+    /// Show `conversation_id`, which another owner drives (a node's runner),
+    /// as running here: every view that asks what runs on its node sees it,
+    /// and nothing here sends to it or ticks it until
+    /// [`Self::release_elsewhere`]. An idle slot this registry held for the
+    /// conversation is dropped (the database has everything it knew); a
+    /// working one is left alone and `None` returned.
+    pub fn host_elsewhere(
+        &mut self,
+        focus: Focus,
+        protocol: ProtocolKind,
+        conversation_id: Uuid,
+        status: ConversationStatus,
+    ) -> Option<u64> {
+        if let Some(ix) = self.slots.iter().position(|s| s.conversation_id == Some(conversation_id)) {
+            if self.slots[ix].status.running {
+                return None;
+            }
+            self.slots.remove(ix);
+        }
+        self.next_slot += 1;
+        self.slots.push(DriverSlot::hosted_elsewhere(
+            self.next_slot,
+            focus,
+            protocol,
+            conversation_id,
+            status,
+        ));
+        Some(self.next_slot)
+    }
+
+    /// The status a slot [`Self::host_elsewhere`] made shows; `false` when it
+    /// is gone (dropped by a view's [`Self::retain`]), so the owner hosts it
+    /// again.
+    pub fn update_elsewhere(&mut self, id: u64, status: ConversationStatus) -> bool {
+        match self.slots.iter_mut().find(|s| s.id == id && s.is_hosted_elsewhere()) {
+            Some(slot) => {
+                slot.status = status;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Drop a slot [`Self::host_elsewhere`] made.
+    pub fn release_elsewhere(&mut self, id: u64) {
+        self.slots.retain(|s| s.id != id);
+    }
+
+    /// Whether a conversation this registry drives is working on `node`
+    /// (not counting ones hosted for another owner).
+    pub fn driving_on_node(&self, node: Uuid) -> bool {
+        self.slots
+            .iter()
+            .any(|s| s.focus == Focus::Node(node) && s.status.running && !s.is_hosted_elsewhere())
+    }
+
     /// Drop every slot `keep` says no to; used to drop idle slots for a
     /// conversation nobody is showing.
     pub fn retain(&mut self, keep: impl FnMut(&DriverSlot) -> bool) {
@@ -584,6 +640,39 @@ mod tests {
 
     fn mock_agent() -> SharedAgent {
         Arc::new(Mutex::new(Box::new(MockAgentProvider::new())))
+    }
+
+    /// A conversation a node's runner drives shows as running here, is never
+    /// taken to send, and is gone once released.
+    #[gpui::test]
+    fn a_conversation_hosted_elsewhere_is_shown_but_never_sent_to(cx: &mut TestAppContext) {
+        let fixture = Fixture::new();
+        let registry = cx.new(|_| AgentRuns::new(fixture.store.clone(), mock_agent()));
+        let node = fixture.node_id;
+        let focus = Focus::Node(node);
+        let conversation = Uuid::new_v4();
+        registry.update(cx, |registry, _| {
+            let running = ConversationStatus {
+                running: true,
+                ..Default::default()
+            };
+            let id = registry
+                .host_elsewhere(focus, ProtocolKind::Implementation, conversation, running.clone())
+                .unwrap();
+            assert!(registry.protocol_running(focus, ProtocolKind::Implementation));
+            assert!(!registry.driving_on_node(node), "not one of the registry's own");
+            let ix = registry
+                .ensure(focus, ProtocolKind::Implementation, Some(conversation), || {
+                    Err("the hosted slot is found, none is made".into())
+                })
+                .unwrap();
+            assert!(registry.take_to_send(ix).is_none());
+            assert!(registry.take_running().is_empty());
+            assert!(registry.update_elsewhere(id, running));
+            registry.release_elsewhere(id);
+            assert!(registry.find_index(focus, ProtocolKind::Implementation, Some(conversation)).is_none());
+            assert!(!registry.update_elsewhere(id, ConversationStatus::default()));
+        });
     }
 
     #[gpui::test]

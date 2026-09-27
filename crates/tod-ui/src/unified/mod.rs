@@ -14,6 +14,7 @@ mod panel;
 pub mod panels;
 pub mod requests;
 mod resize;
+pub mod runners;
 pub mod status_label;
 
 pub use columns::{ColumnModel, PanelKind};
@@ -180,6 +181,8 @@ pub struct UnifiedView {
     /// view and the lifecycle panel (`.claude/CLAUDE.md`): a gate check
     /// started or waived in either shows in the task panel too.
     lifecycle: Entity<LifecycleController>,
+    /// Every task's runner on this machine, shared with the task panels.
+    runners: Entity<runners::NodeRunners>,
     task_list: Entity<TaskListView>,
     columns: ColumnModel,
     hosted: Vec<HostedColumn>,
@@ -243,7 +246,7 @@ impl UnifiedView {
         let layout = workbench_layout::load(paths.config_dir());
         let chat_height = layout.chat_height.map(px);
         let chat_drawer = cx.new(|cx| {
-            ChatDrawer::new(window, cx, fleet.clone(), agent, agent_runs.clone(), chat_height)
+            ChatDrawer::new(window, cx, fleet.clone(), agent.clone(), agent_runs.clone(), chat_height)
         });
         // Collapsing the drawer hands focus back to the focused column (or
         // the tree), so the keyboard is never left on the collapsed tab.
@@ -253,13 +256,22 @@ impl UnifiedView {
             });
         let _agent_runs_subscription = cx.observe(&agent_runs, |this, _, cx| {
             this.apply_status_overrides(cx);
+            // A turn answering a runner's request has finished.
+            let attention = std::mem::take(&mut this.attention);
+            this.runners.update(cx, |runners, cx| runners.on_attention(&attention, cx));
+            this.attention = attention;
         });
+        let runners = {
+            let (fleet, agent, agent_runs) = (fleet.clone(), agent.clone(), agent_runs.clone());
+            cx.new(|cx| runners::NodeRunners::new(fleet, agent, agent_runs, cx))
+        };
         let _attention_poll = Self::spawn_attention_poll(fleet.clone(), window, cx);
         let mut this = Self {
             fleet,
             paths,
             agent_runs,
             lifecycle,
+            runners,
             task_list,
             columns: ColumnModel::new(),
             hosted: Vec::new(),
@@ -381,6 +393,7 @@ impl UnifiedView {
         cx: &mut Context<Self>,
     ) {
         let for_tree = attention_feed::to_task_list_map(&map);
+        self.runners.update(cx, |runners, cx| runners.on_attention(&map, cx));
         self.attention = map;
         self.task_list.update(cx, |task_list, cx| {
             task_list.set_attention(for_tree, cx);
@@ -515,7 +528,7 @@ impl UnifiedView {
             }
             PanelKind::Task(node_id) => {
                 let panel =
-                    cx.new(|cx| panels::task::TaskPanel::new(node_id, self.fleet.clone(), self.agent_runs.clone(), self.lifecycle.clone(), window, cx));
+                    cx.new(|cx| panels::task::TaskPanel::new(node_id, self.fleet.clone(), self.agent_runs.clone(), self.lifecycle.clone(), self.runners.clone(), window, cx));
                 let panel_id = panel.entity_id();
                 let subscription =
                     cx.subscribe_in(&panel, window, move |this, _, event: &PanelOpenRequest, window, cx| {

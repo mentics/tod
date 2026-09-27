@@ -8,7 +8,10 @@
 //! 2. **Artifacts** — Obligations and Plan links, each opening its panel by
 //!    the column rule (`render_artifacts`). The Changes link (T8) joins this
 //!    strip.
-//! 3. **Runner line** (T2) — `render_runner_line`, a placeholder for now.
+//! 3. **Runner line** (T2) — `render_runner_line`: what the task's runner
+//!    (`crate::unified::runners`, or its supervisor in the cloud) is doing,
+//!    and a split button whose default action moves it along (Start,
+//!    Pause, Resume) with the rest in its menu.
 //! 4. **Requests** (T4) — the only part that scrolls: the shared
 //!    [`crate::unified::requests::Requests`], oldest first, no heading.
 //! 5. **Answered drawer** (T5) — anchored to the bottom, collapsed by
@@ -34,9 +37,17 @@ use crate::ui::style;
 // T2: the runner line.
 use gpui::{Entity, Subscription};
 use gpui_component::Sizable as _;
-use gpui_component::button::{Button, ButtonVariants as _};
+use gpui_component::Disableable as _;
+use gpui_component::button::Button;
 use tod_core::conversation::{ConversationStatus, SharedAgentAccess};
 use tod_core::runner_status::{RunnerStatus, format_elapsed, format_tokens};
+use tod_core::autopilot::Outcome;
+use tod_core::cloud_sync::CloudNode;
+use gpui_component::button::DropdownButton;
+use gpui_component::menu::PopupMenuItem;
+use tod_journey::{Presented, PresentedAction};
+use crate::unified::runners::NodeRunners;
+use crate::views::cloud_node::CloudUpdate;
 use tod_store::conversation::Focus;
 
 use crate::ui::agent_runs::AgentRuns;
@@ -125,10 +136,57 @@ struct RunnerLine {
     run_since: Option<(u64, i64)>,
     /// The status has an elapsed time, so the ticker re-renders each second.
     ticking: bool,
+    /// Set when the node runs in the cloud: its supervisor is its runner.
+    cloud: Option<CloudNode>,
+    /// A cloud job (Run in the cloud, Sync now, leaving) is in progress.
+    cloud_busy: bool,
+    /// The latest word from a cloud job; an error when `cloud_failed`.
+    cloud_note: Option<String>,
+    cloud_failed: bool,
 }
 
-/// The node's lifecycle state and how long it has waited on the user.
-fn load_runner(fleet: &FleetStore, node_id: Uuid) -> (String, Option<i64>) {
+/// What the runner line's split button offers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunnerAction {
+    Start,
+    Resume,
+    ResumeFreshBudget,
+    Pause,
+    StopNow,
+    /// Stop a conversation the user started by hand.
+    StopTurn,
+    RunInCloud,
+    SyncCloud,
+    LeaveCloud,
+}
+
+impl RunnerAction {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Start => "Start",
+            Self::Resume => "Resume",
+            Self::ResumeFreshBudget => "Resume with a fresh budget",
+            Self::Pause => "Pause",
+            Self::StopNow => "Stop now",
+            Self::StopTurn => "Stop",
+            Self::RunInCloud => "Run in the cloud",
+            Self::SyncCloud => "Sync now",
+            Self::LeaveCloud => "Stop running in the cloud",
+        }
+    }
+}
+
+/// The split button: its default action (with its label and whether it is
+/// disabled) and the menu's.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct RunnerActions {
+    primary: Option<(RunnerAction, &'static str, bool)>,
+    menu: Vec<RunnerAction>,
+}
+
+/// The node's lifecycle state, how long it has waited on the user, and
+/// whether it runs in the cloud.
+fn load_runner(fleet: &FleetStore, node_id: Uuid) -> (String, Option<i64>, Option<CloudNode>) {
     let lifecycle = fleet
         .get_node(&node_id.to_string())
         .ok()
@@ -139,7 +197,8 @@ fn load_runner(fleet: &FleetStore, node_id: Uuid) -> (String, Option<i64>) {
         .read(|conn| tod_core::attention::for_node(conn, node_id))
         .ok()
         .and_then(|a| a.waiting_since);
-    (lifecycle, waiting_since)
+    let cloud = tod_core::cloud_sync::cloud_node(fleet, &node_id.to_string());
+    (lifecycle, waiting_since, cloud)
 }
 
 pub struct TaskPanel {
@@ -153,8 +212,10 @@ pub struct TaskPanel {
     _poll: gpui::Task<()>,
     agent_runs: Entity<AgentRuns>,
     runner: RunnerLine,
+    runners: Entity<NodeRunners>,
     _runner_tick: gpui::Task<()>,
     _agent_runs_sub: Subscription,
+    _runners_sub: Subscription,
     /// T4: what the task is waiting on the user for.
     pub(crate) requests: Entity<Requests>,
     _requests_subs: Vec<Subscription>,
@@ -174,6 +235,7 @@ impl TaskPanel {
         fleet: Arc<FleetStore>,
         agent_runs: Entity<AgentRuns>,
         lifecycle: Entity<LifecycleController>,
+        runners: Entity<NodeRunners>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -209,6 +271,7 @@ impl TaskPanel {
             this.track_run_since(cx);
             cx.notify();
         });
+        let _runners_sub = cx.observe(&runners, |_, _, cx| cx.notify());
         let _runner_tick = cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor().timer(std::time::Duration::from_secs(1)).await;
@@ -244,8 +307,10 @@ impl TaskPanel {
             _poll,
             agent_runs,
             runner: RunnerLine::default(),
+            runners,
             _runner_tick,
             _agent_runs_sub,
+            _runners_sub,
         };
         panel.track_run_since(cx);
         panel.refresh_runner(cx);
@@ -367,7 +432,7 @@ impl TaskPanel {
         let fleet = self.fleet.clone();
         let node_id = self.node_id;
         cx.spawn(async move |this, cx| {
-            let (lifecycle, waiting_since) = cx
+            let (lifecycle, waiting_since, cloud) = cx
                 .background_executor()
                 .spawn(async move { load_runner(&fleet, node_id) })
                 .await;
@@ -375,6 +440,7 @@ impl TaskPanel {
                 if this.node_id == node_id {
                     this.runner.lifecycle = lifecycle;
                     this.runner.waiting_since = waiting_since;
+                    this.runner.cloud = cloud;
                     cx.notify();
                 }
             });
@@ -417,7 +483,8 @@ impl TaskPanel {
 
     fn runner_status(&self, cx: &App) -> (Option<u64>, RunnerStatus) {
         let slot = self.node_slot(cx);
-        let status = RunnerStatus::derive(
+        let status = RunnerStatus::with_runner(
+            self.runners.read(cx).runner(self.node_id),
             &self.runner.lifecycle,
             self.runner.waiting_since,
             slot.as_ref().map(|(_, s)| s),
@@ -445,10 +512,200 @@ impl TaskPanel {
         });
     }
 
-    /// T2: the runner line — lifecycle state, then what the runner is doing
-    /// (`doc/ui/task-panel.md`, "Runner"), with Stop while an agent runs.
-    fn render_runner_line(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+    /// What the split button offers for `status`.
+    fn runner_actions(&self, status: &RunnerStatus, cx: &App) -> RunnerActions {
+        use RunnerAction as A;
+        let runners = self.runners.read(cx);
+        let node = self.node_id;
+        if self.runner.cloud.is_some() {
+            return RunnerActions {
+                primary: Some((A::SyncCloud, A::SyncCloud.label(), self.runner.cloud_busy)),
+                menu: if self.runner.cloud_busy { Vec::new() } else { vec![A::LeaveCloud] },
+            };
+        }
+        if self.runner.cloud_busy {
+            return RunnerActions {
+                primary: Some((A::RunInCloud, "Starting in the cloud…", true)),
+                menu: Vec::new(),
+            };
+        }
+        if runners.is_running(node) {
+            let pausing = runners.is_pausing(node);
+            return RunnerActions {
+                primary: Some((A::Pause, if pausing { "Pausing…" } else { A::Pause.label() }, pausing)),
+                menu: vec![A::StopNow],
+            };
+        }
+        if status.is_running() {
+            return RunnerActions {
+                primary: Some((A::StopTurn, A::StopTurn.label(), false)),
+                menu: Vec::new(),
+            };
+        }
+        if *status == RunnerStatus::Done {
+            return RunnerActions::default();
+        }
+        match runners.outcome(node) {
+            Some(Outcome::BudgetExhausted { .. }) => RunnerActions {
+                primary: Some((A::ResumeFreshBudget, A::ResumeFreshBudget.label(), false)),
+                menu: vec![A::RunInCloud],
+            },
+            Some(outcome) if *outcome != Outcome::Done => RunnerActions {
+                primary: Some((A::Resume, A::Resume.label(), false)),
+                menu: vec![A::ResumeFreshBudget, A::RunInCloud],
+            },
+            _ => RunnerActions {
+                primary: Some((A::Start, A::Start.label(), false)),
+                menu: vec![A::RunInCloud],
+            },
+        }
+    }
+
+    /// The journey's snapshot of the split button and the line beside it.
+    fn presented(&self, actions: &RunnerActions, status: &RunnerStatus) -> Presented {
+        let mut presented: Vec<PresentedAction> = actions
+            .primary
+            .iter()
+            .map(|(action, label, disabled)| PresentedAction {
+                id: format!("{action:?}"),
+                label: label.to_string(),
+                primary: true,
+                disabled: *disabled,
+            })
+            .collect();
+        presented.extend(actions.menu.iter().map(|action| PresentedAction {
+            id: format!("{action:?}"),
+            label: action.label().to_string(),
+            primary: false,
+            disabled: false,
+        }));
+        Presented {
+            actions: presented,
+            focused: None,
+            notices: vec![format!("{} · {status:?}", self.runner.lifecycle)],
+        }
+    }
+
+    /// The split button's click handler, its default action's and its
+    /// menu's: records the `UserAction`, then does it.
+    fn perform(&mut self, action: RunnerAction, cx: &mut Context<Self>) {
+        use RunnerAction as A;
         let (slot, status) = self.runner_status(cx);
+        let actions = self.runner_actions(&status, cx);
+        let presented = self.presented(&actions, &status);
+        let node = self.node_id;
+        crate::ui::journey::record_action(
+            cx,
+            Focus::Node(node),
+            format!("{action:?}"),
+            crate::ui::journey::Source::Click,
+            "task_panel",
+            presented,
+        );
+        match action {
+            A::Start | A::Resume => {
+                let _ = self.runners.update(cx, |r, cx| r.start(node, false, cx));
+            }
+            A::ResumeFreshBudget => {
+                let _ = self.runners.update(cx, |r, cx| r.start(node, true, cx));
+            }
+            A::Pause => self.runners.update(cx, |r, cx| r.pause(node, cx)),
+            A::StopNow => self.runners.update(cx, |r, cx| r.stop_now(node, cx)),
+            A::StopTurn => {
+                if let Some(slot) = slot {
+                    self.stop_runner(slot, cx);
+                }
+            }
+            A::RunInCloud => {
+                self.cloud_started(cx);
+                crate::views::cloud_node::run_in_cloud(
+                    self.fleet.clone(),
+                    node.to_string(),
+                    cx,
+                    move |this, update, cx| this.on_cloud_update(node, update, cx),
+                );
+            }
+            A::SyncCloud => {
+                self.cloud_started(cx);
+                crate::views::cloud_node::sync_now(self.fleet.clone(), cx, move |this, update, cx| {
+                    this.on_cloud_update(node, update, cx)
+                });
+            }
+            A::LeaveCloud => {
+                self.cloud_started(cx);
+                crate::views::cloud_node::stop_running(
+                    self.fleet.clone(),
+                    node.to_string(),
+                    false,
+                    cx,
+                    move |this, update, cx| this.on_cloud_update(node, update, cx),
+                );
+            }
+        }
+        cx.notify();
+    }
+
+    fn cloud_started(&mut self, cx: &mut Context<Self>) {
+        self.runner.cloud_busy = true;
+        self.runner.cloud_note = None;
+        self.runner.cloud_failed = false;
+        cx.notify();
+    }
+
+    fn on_cloud_update(&mut self, node: Uuid, update: CloudUpdate, cx: &mut Context<Self>) {
+        if self.node_id != node {
+            return;
+        }
+        let (note, failed, done) = match update {
+            CloudUpdate::Progress(msg) => (msg, false, false),
+            CloudUpdate::Accepted(cloud) => {
+                self.runner.cloud = Some(cloud);
+                (String::new(), false, true)
+            }
+            CloudUpdate::Synced(msg) => (msg, false, true),
+            CloudUpdate::Left(msg) => {
+                self.runner.cloud = None;
+                (msg, false, true)
+            }
+            CloudUpdate::Failed(msg) => (msg, true, true),
+        };
+        self.runner.cloud_note = (!note.is_empty()).then_some(note);
+        self.runner.cloud_failed = failed;
+        if done {
+            self.runner.cloud_busy = false;
+            self.refresh_runner(cx);
+        }
+        cx.notify();
+    }
+
+    /// The split button: the default action, with the rest in its menu.
+    fn render_runner_button(&self, actions: RunnerActions, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let (primary, label, disabled) = actions.primary?;
+        let button = Button::new("unified-task-runner-action")
+            .label(label)
+            .disabled(disabled)
+            .on_click(cx.listener(move |this, _, _, cx| this.perform(primary, cx)));
+        let mut split = DropdownButton::new("unified-task-runner").small().button(button);
+        if !actions.menu.is_empty() {
+            let weak = cx.weak_entity();
+            let menu = actions.menu;
+            split = split.dropdown_menu(move |mut popup, _, _| {
+                for action in menu.iter().copied() {
+                    let weak = weak.clone();
+                    popup = popup.item(PopupMenuItem::new(action.label()).on_click(move |_, _, cx| {
+                        let _ = weak.update(cx, |this: &mut TaskPanel, cx| this.perform(action, cx));
+                    }));
+                }
+                popup
+            });
+        }
+        Some(split.into_any_element())
+    }
+
+    /// T2: the runner line — lifecycle state, then what the runner is doing
+    /// (`doc/ui/task-panel.md`, "Runner"), then the split button.
+    fn render_runner_line(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let (_, status) = self.runner_status(cx);
         self.runner.ticking = status.since().is_some();
         let elapsed = status.since().map(|since| format_elapsed(now_ms() - since));
         let sep = || style::text_muted(div().flex_none()).child("·");
@@ -457,52 +714,76 @@ impl TaskPanel {
         if status != RunnerStatus::Done {
             line = line.child(style::text(div().flex_none()).child(self.runner.lifecycle.clone()));
         }
-        match &status {
-            RunnerStatus::Running { activity, tokens, .. } => {
-                if let Some(activity) = activity {
-                    line = line.child(sep()).child(style::text_muted(div().flex_1().min_w_0()).child(
-                        selectable_text("unified-task-runner-activity", activity.clone(), window, cx),
+        if let Some(cloud) = &self.runner.cloud {
+            let mut text = format!("in the cloud (sandbox {})", cloud.sandbox);
+            if cloud.lost_at.is_some() {
+                text.push_str(", its sandbox is gone; replaced on the next sync");
+            }
+            line = line.child(sep()).child(style::text_muted(div().flex_1().min_w_0()).child(
+                selectable_text("unified-task-runner-cloud", text, window, cx),
+            ));
+        } else {
+            match &status {
+                RunnerStatus::Running { activity, tokens, .. } => {
+                    if let Some(activity) = activity {
+                        // Shrinks, never grows: the elapsed time and tokens
+                        // stay beside it.
+                        line = line.child(sep()).child(style::text_muted(div().flex_shrink_1().min_w_0()).child(
+                            selectable_text("unified-task-runner-activity", activity.clone(), window, cx),
+                        ));
+                    } else {
+                        line = line.child(sep()).child(style::text_muted(div().flex_none()).child("running"));
+                    }
+                    if let Some(elapsed) = elapsed {
+                        line = line.child(sep()).child(style::text_muted(div().flex_none()).child(elapsed));
+                    }
+                    if let Some(tokens) = tokens {
+                        line = line
+                            .child(sep())
+                            .child(style::text_muted(div().flex_none()).child(format_tokens(*tokens)));
+                    }
+                }
+                RunnerStatus::Waiting { .. } => {
+                    line = line.child(sep()).child(
+                        style::text_muted(div().flex_none())
+                            .child(format!("waiting {}", elapsed.unwrap_or_default())),
+                    );
+                }
+                RunnerStatus::Failed { error } => {
+                    line = line.child(sep()).child(style::text_error(div().flex_1().min_w_0()).child(
+                        selectable_text("unified-task-runner-error", error.clone(), window, cx),
                     ));
-                } else {
-                    line = line.child(sep()).child(style::text_muted(div().flex_none()).child("running"));
                 }
-                if let Some(elapsed) = elapsed {
-                    line = line.child(sep()).child(style::text_muted(div().flex_none()).child(elapsed));
+                RunnerStatus::Paused => {
+                    line = line.child(sep()).child(style::text_muted(div().flex_none()).child("paused"));
                 }
-                if let Some(tokens) = tokens {
-                    line = line
-                        .child(sep())
-                        .child(style::text_muted(div().flex_none()).child(format_tokens(*tokens)));
+                RunnerStatus::Stopped { reason } => {
+                    line = line.child(sep()).child(style::text_muted(div().flex_1().min_w_0()).child(
+                        selectable_text("unified-task-runner-stopped", format!("stopped: {reason}"), window, cx),
+                    ));
                 }
-            }
-            RunnerStatus::Waiting { .. } => {
-                line = line.child(sep()).child(
-                    style::text_muted(div().flex_none())
-                        .child(format!("waiting {}", elapsed.unwrap_or_default())),
-                );
-            }
-            RunnerStatus::Failed { error } => {
-                line = line.child(sep()).child(style::text_error(div().flex_1().min_w_0()).child(
-                    selectable_text("unified-task-runner-error", error.clone(), window, cx),
-                ));
-            }
-            RunnerStatus::Idle => {}
-            RunnerStatus::Done => {
-                line = line.child(style::text_muted(div().flex_none()).child("done"));
+                RunnerStatus::Idle => {}
+                RunnerStatus::Done => {
+                    line = line.child(style::text_muted(div().flex_none()).child("done"));
+                }
             }
         }
-        if status.is_running()
-            && let Some(slot) = slot
-        {
-            line = line.child(div().flex_1()).child(
-                Button::new("unified-task-runner-stop")
-                    .label("Stop")
-                    .ghost()
-                    .small()
-                    .on_click(cx.listener(move |this, _, _, cx| this.stop_runner(slot, cx))),
-            );
+        // Why the runner could not start, or the latest word from the cloud.
+        let note = match (&self.runner.cloud_note, self.runners.read(cx).error(self.node_id)) {
+            (Some(note), _) => Some((note.clone(), self.runner.cloud_failed)),
+            (None, Some(error)) => Some((error.to_string(), true)),
+            (None, None) => None,
+        };
+        if let Some((note, failed)) = note {
+            let el = div().flex_1().min_w_0();
+            let el = if failed { style::text_error(el) } else { style::text_muted(el) };
+            line = line.child(sep()).child(el.child(selectable_text("unified-task-runner-note", note, window, cx)));
         }
-        Some(line.id("unified-task-runner").into_any_element())
+        let actions = self.runner_actions(&status, cx);
+        if let Some(button) = self.render_runner_button(actions, cx) {
+            line = line.child(div().flex_1()).child(button);
+        }
+        Some(line.id("unified-task-runner-line").into_any_element())
     }
 
     /// T4: the requests waiting on the user, oldest first — the only part
@@ -630,6 +911,18 @@ impl Render for TaskPanel {
 }
 
 #[cfg(test)]
+fn test_runners(
+    fleet: &Arc<FleetStore>,
+    agent_runs: &Entity<AgentRuns>,
+    cx: &mut gpui::TestAppContext,
+) -> Entity<NodeRunners> {
+    let agent: crate::interview::agent::SharedAgent =
+        Arc::new(std::sync::Mutex::new(Box::new(tod_agent::MockAgentProvider::new())));
+    let (fleet, agent_runs) = (fleet.clone(), agent_runs.clone());
+    cx.new(|cx| NodeRunners::new(fleet, agent, agent_runs, cx))
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -664,10 +957,11 @@ mod tests {
         let agent_runs = cx.new(|_| AgentRuns::new(fixture.store.clone(), agent));
         let (node, fleet, runs_in) = (fixture.node_id, fixture.store.clone(), agent_runs.clone());
         let lifecycle = cx.new(|_| LifecycleController::new(fixture.store.clone()));
+        let runners = test_runners(&fleet, &agent_runs, cx);
         let slot = Rc::new(RefCell::new(None));
         let slot_in = slot.clone();
         let (_, cx) = cx.add_window_view(move |window, cx| {
-            let view = cx.new(|cx| TaskPanel::new(node, fleet, runs_in, lifecycle, window, cx));
+            let view = cx.new(|cx| TaskPanel::new(node, fleet, runs_in, lifecycle, runners, window, cx));
             *slot_in.borrow_mut() = Some(view.clone());
             gpui_component::Root::new(view, window, cx)
         });
@@ -675,6 +969,15 @@ mod tests {
         cx.run_until_parked();
         let status = view.read_with(cx, |view, cx| view.runner_status(cx).1);
         assert!(matches!(status, RunnerStatus::Idle | RunnerStatus::Waiting { .. }), "{status:?}");
+        // No runner yet: Start, with the cloud in the menu.
+        let actions = view.read_with(cx, |view, cx| view.runner_actions(&status, cx));
+        assert_eq!(
+            actions,
+            RunnerActions {
+                primary: Some((RunnerAction::Start, "Start", false)),
+                menu: vec![RunnerAction::RunInCloud],
+            }
+        );
 
         let focus = Focus::Node(node);
         let slot_id = agent_runs.update(cx, |registry, cx| {
@@ -707,6 +1010,12 @@ mod tests {
             }
             other => panic!("expected running, got {other:?}"),
         }
+        // A conversation run by hand: the button stops it, no runner to start.
+        let actions = view.read_with(cx, |view, cx| {
+            let (_, status) = view.runner_status(cx);
+            view.runner_actions(&status, cx)
+        });
+        assert_eq!(actions.primary, Some((RunnerAction::StopTurn, "Stop", false)));
 
         // Stop while the driver is away marks the slot to cancel.
         view.update(cx, |view, cx| view.stop_runner(slot_id, cx));
@@ -752,10 +1061,11 @@ mod tests {
         let agent_runs = cx.new(|_| AgentRuns::new(fixture.store.clone(), agent));
         let lifecycle = cx.new(|_| LifecycleController::new(fixture.store.clone()));
         let (node, fleet) = (fixture.node_id, fixture.store.clone());
+        let runners = test_runners(&fleet, &agent_runs, cx);
         let slot = Rc::new(RefCell::new(None));
         let slot_in = slot.clone();
         let (_, cx) = cx.add_window_view(move |window, cx| {
-            let view = cx.new(|cx| TaskPanel::new(node, fleet, agent_runs, lifecycle, window, cx));
+            let view = cx.new(|cx| TaskPanel::new(node, fleet, agent_runs, lifecycle, runners, window, cx));
             *slot_in.borrow_mut() = Some(view.clone());
             gpui_component::Root::new(view, window, cx)
         });
@@ -880,11 +1190,12 @@ mod request_tests {
         let agent_runs = cx.new(|_| AgentRuns::new(fleet.clone(), mock_agent()));
         let agent_runs_for_view = agent_runs.clone();
         let lifecycle = cx.new(|_| LifecycleController::new(fleet.clone()));
+        let runners = super::test_runners(&fleet, &agent_runs, cx);
         let slot = Rc::new(RefCell::new(None));
         let slot_in = slot.clone();
         let (_, cx) = cx.add_window_view(move |window, cx| {
             let view = cx.new(|cx| {
-                TaskPanel::new(node_id, fleet, agent_runs_for_view, lifecycle, window, cx)
+                TaskPanel::new(node_id, fleet, agent_runs_for_view, lifecycle, runners, window, cx)
             });
             *slot_in.borrow_mut() = Some(view.clone());
             Root::new(view, window, cx)

@@ -93,6 +93,38 @@ pause and resume at the end.
 While it waits, the line says only that and for how long; the request below
 says why.
 
+The line ends with a split button: its default action moves the runner
+along, and its menu holds the rest.
+
+| Runner is | Default action | Menu |
+|---|---|---|
+| never started, or done and moved back | **Start** | Run in the cloud |
+| running | **Pause** (once the agent's turn ends) | Stop now (cancels the turn) |
+| paused, stopped, failed, or waiting | **Resume** | Resume with a fresh budget, Run in the cloud |
+| stopped because its budget ran out | **Resume with a fresh budget** | Run in the cloud |
+| in the cloud | **Sync now** | Stop running in the cloud |
+| a conversation the user started by hand is running | **Stop** | |
+
+**Where it runs.** Start runs the node's autopilot
+(`tod_core::autopilot`) on this machine, on a thread of the app's
+(`tod_ui::unified::runners::NodeRunners`); its agent runs wherever the node's
+Files capability says (this machine, a dev container, a sandbox), as any
+conversation's does. Run in the cloud hands the node to a supervisor in its
+own sandbox instead (`doc/cloud-sandboxes/autonomous-nodes.md`). A local
+run's conversation shows in `AgentRuns` as hosted elsewhere, so the tree's
+status labels and the close-window warning see it and nothing else sends to
+it.
+
+**Closing the app** stops a local run where it is. It is started again when
+the app next opens, and reopens the conversation it was in; a paused or
+stopped run is left as it was.
+
+**Requests.** A run that stopped for a request (a decision, a plan step
+handed back, a gate criterion) continues by itself once the user has
+answered it and no conversation of the app's own is still working on the
+node. Any other stop (budget, a step that changed nothing, a failed turn)
+waits for Resume.
+
 ### Requests
 
 A **request** is something the runner cannot continue without the user

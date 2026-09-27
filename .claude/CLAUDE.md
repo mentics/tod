@@ -512,6 +512,11 @@ its task panel by that rule, with keyboard focus there so the number keys
 answer its top request (`UnifiedView::advance_waiting`). What each node is waiting on comes from
 `tod_core::attention` (`for_node` / `for_nodes`), recomputed off the UI
 thread on every store change by `unified/attention_feed.rs` and pushed into
-the tree with `TaskListView::set_attention`. See `doc/ui/unified-view.md` for
+the tree with `TaskListView::set_attention`. The task panel's runner line
+starts, pauses, and resumes the node's lifecycle autopilot on this machine
+(`unified/runners.rs`, `tod_core::autopilot::local`: one thread per run,
+its conversation shown in `AgentRuns` as hosted elsewhere, restarted on the
+next launch if the app closed mid-run) or hands it to the cloud
+(`doc/ui/task-panel.md`, "Runner"). See `doc/ui/unified-view.md` for
 the full design (layout, pinning, panels, keys) and
 `doc/ui/unified-view-plan.md` for the work-item breakdown.

@@ -393,3 +393,125 @@ fn a_restart_reopens_the_conversation_in_progress() {
         turns.iter().map(|t| &t.body).collect::<Vec<_>>()
     );
 }
+
+/// Stops the run from `watch`, the first time a turn is in flight.
+struct StopMidTurn(bool);
+
+impl StepHook for StopMidTurn {
+    fn at(&mut self, _: &FleetStore, _: Boundary) -> Result<Option<String>> {
+        Ok(None)
+    }
+
+    fn watch(&mut self, _: Turn<'_>) -> Option<String> {
+        (!std::mem::replace(&mut self.0, true)).then(|| "stop".to_string())
+    }
+}
+
+#[test]
+fn stopping_mid_turn_keeps_the_conversation_for_the_next_run() {
+    let fx = setup();
+    retire_outside_criteria(&fx);
+    // Implementing: the mock gate check cannot take a reopened turn.
+    lifecycle::set_lifecycle(&fx.fleet, fx.node, "active").unwrap();
+    let mut agent = FakeAgent::new(&fx.fleet);
+    let mut pilot = autopilot(&fx, Budget::default());
+    let outcome = pilot.run_with(&fx.fleet, &mut agent, &mut StopMidTurn(false)).unwrap();
+    assert_eq!(outcome, Outcome::Stopped { reason: "stop".into() });
+    let current = pilot.state().current.clone().expect("the conversation stays current");
+    assert_eq!(current.protocol, "implementation");
+
+    // The next run reopens it and carries on to the end.
+    let mut pilot = autopilot(&fx, Budget::default());
+    assert_eq!(pilot.run(&fx.fleet, &mut agent).unwrap(), Outcome::Done);
+    let first = &pilot.state().steps[0];
+    assert_eq!((first.step.as_str(), first.conversation_id), (current.protocol.as_str(), Some(current.conversation_id)));
+}
+
+#[test]
+fn a_renewed_budget_keeps_the_steps() {
+    let fx = setup();
+    retire_outside_criteria(&fx);
+    let mut agent = FakeAgent::new(&fx.fleet);
+    let budget = Budget {
+        max_sessions: 1,
+        ..Budget::default()
+    };
+    let mut pilot = autopilot(&fx, budget);
+    assert!(matches!(
+        pilot.run(&fx.fleet, &mut agent).unwrap(),
+        Outcome::BudgetExhausted { .. }
+    ));
+    let steps = pilot.state().steps.len();
+    assert!(steps > 0);
+    pilot.renew_budget().unwrap();
+    let saved = AutopilotState::load(&fx.root, fx.node).unwrap();
+    assert_eq!(saved.sessions, 0);
+    assert_eq!(saved.steps.len(), steps);
+}
+
+#[test]
+fn a_local_run_takes_the_node_to_done_on_its_own_thread() {
+    use super::local::{LocalEvent, LocalRun};
+    let fx = setup();
+    retire_outside_criteria(&fx);
+    let agent: tod_agent::SharedAgent =
+        Arc::new(std::sync::Mutex::new(Box::new(FakeAgent::new(&fx.fleet))));
+    let (tx, rx) = std::sync::mpsc::channel();
+    let run = LocalRun::start_with(
+        fx.fleet.clone(),
+        agent,
+        config(&fx),
+        fx.node,
+        Budget::default(),
+        false,
+        Some(Duration::ZERO),
+        move |event| {
+            let _ = tx.send(event);
+        },
+    )
+    .unwrap();
+    let events: Vec<LocalEvent> = rx.iter().collect();
+    run.join();
+    assert!(
+        events.iter().any(|e| matches!(e, LocalEvent::Live(live) if live.protocol == Some(ProtocolKind::Implementation))),
+        "{events:#?}"
+    );
+    assert_eq!(events.last(), Some(&LocalEvent::Finished(Ok(Outcome::Done))));
+}
+
+#[test]
+fn a_local_run_asked_to_pause_stops_at_the_first_boundary() {
+    use super::local::{LocalEvent, LocalRun, PAUSED, stopped_by_user};
+    let fx = setup();
+    retire_outside_criteria(&fx);
+    let agent: tod_agent::SharedAgent =
+        Arc::new(std::sync::Mutex::new(Box::new(FakeAgent::new(&fx.fleet))));
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+    // Held on the first event until the pause is asked for.
+    let mut first = Some(go_rx);
+    let run = LocalRun::start_with(
+        fx.fleet.clone(),
+        agent,
+        config(&fx),
+        fx.node,
+        Budget::default(),
+        false,
+        Some(Duration::ZERO),
+        move |event| {
+            if let Some(go) = first.take() {
+                let _ = go.recv();
+            }
+            let _ = tx.send(event);
+        },
+    )
+    .unwrap();
+    run.pause();
+    go_tx.send(()).unwrap();
+    let events: Vec<LocalEvent> = rx.iter().collect();
+    run.join();
+    let outcome = Outcome::Stopped { reason: PAUSED.into() };
+    assert!(stopped_by_user(&outcome));
+    assert_eq!(events.last(), Some(&LocalEvent::Finished(Ok(outcome))));
+    assert_ne!(lifecycle::current_state(&fx.fleet, fx.node).unwrap(), "done");
+}

@@ -22,6 +22,7 @@
 //! file under the data root (`autopilot/<node>.json`). A restart reopens the
 //! conversation that was in progress instead of starting another.
 
+pub mod local;
 mod state;
 
 #[cfg(test)]
@@ -29,7 +30,9 @@ mod tests;
 
 pub use state::{AutopilotState, CurrentStep, StepRecord, state_path};
 
-use crate::conversation::driver::{AgentAccess, ConversationConfig, ConversationDriver, ConversationEvent};
+use crate::conversation::driver::{
+    AgentAccess, ConversationConfig, ConversationDriver, ConversationEvent, ConversationStatus,
+};
 use crate::conversation::gate_check::{latest_gate_report, settle_derived_criteria};
 use crate::conversation::pr::is_done_report;
 use crate::conversation::protocol::protocol_for;
@@ -90,11 +93,29 @@ pub enum Boundary {
     Turn,
 }
 
+/// A turn in flight, as [`StepHook::watch`] sees it.
+#[derive(Debug, Clone, Copy)]
+pub struct Turn<'a> {
+    pub protocol: ProtocolKind,
+    /// `None` until the conversation is saved (its first send).
+    pub conversation_id: Option<Uuid>,
+    pub status: &'a ConversationStatus,
+}
+
 /// Called by [`Autopilot::run_with`] at every [`Boundary`]: a headless
 /// supervisor syncs its copy of the store here and says whether to stop.
 pub trait StepHook {
     /// `Some(reason)` stops the run with [`Outcome::Stopped`].
     fn at(&mut self, fleet: &FleetStore, boundary: Boundary) -> Result<Option<String>>;
+
+    /// Called while a conversation's turn is in flight: once it is sent,
+    /// then at every poll. For showing what the agent is doing, and for
+    /// stopping mid-turn: `Some(reason)` cancels the turn and stops the run
+    /// with [`Outcome::Stopped`], keeping the conversation current so the
+    /// next run reopens it. Must not block.
+    fn watch(&mut self, _turn: Turn<'_>) -> Option<String> {
+        None
+    }
 }
 
 /// No hook: never stops.
@@ -137,6 +158,19 @@ pub enum NeedsHuman {
 }
 
 impl NeedsHuman {
+    /// Whether this is one of the node's requests (`crate::attention`): the
+    /// user answers it where requests are answered, and once none is left
+    /// the run can simply continue.
+    pub fn is_request(&self) -> bool {
+        matches!(
+            self,
+            Self::Decision { .. }
+                | Self::BlockedSteps { .. }
+                | Self::FailingCriteria { .. }
+                | Self::GateNotPassed { .. }
+        )
+    }
+
     /// One line for the user.
     pub fn describe(&self) -> String {
         match self {
@@ -213,6 +247,18 @@ impl Autopilot {
     /// Forget the saved run: the next [`Self::run`] starts a fresh budget.
     pub fn reset(&mut self) -> Result<()> {
         self.state = AutopilotState::fresh();
+        self.save()
+    }
+
+    /// A fresh budget for the same run: the sessions and time spent start
+    /// again from zero, and the conversation in progress and the steps
+    /// taken are kept.
+    pub fn renew_budget(&mut self) -> Result<()> {
+        let fresh = AutopilotState::fresh();
+        self.state.started_at_ms = fresh.started_at_ms;
+        self.state.active_ms = 0;
+        self.state.active_since_ms = None;
+        self.state.sessions = 0;
         self.save()
     }
 
@@ -472,6 +518,18 @@ impl Autopilot {
         self.save()?;
 
         loop {
+            let status = driver.status();
+            if status.running
+                && let Some(reason) = hook.watch(Turn {
+                    protocol: kind,
+                    conversation_id,
+                    status: &status,
+                })
+            {
+                // Kept as current: the next run reopens it.
+                driver.cancel(fleet, agent)?;
+                return Ok(Some(Outcome::Stopped { reason }));
+            }
             let mut finished = false;
             let mut turn_ended = false;
             for event in driver.tick(fleet, agent) {
