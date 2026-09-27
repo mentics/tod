@@ -197,17 +197,122 @@ pub fn open_in_container(
         &exec.id
     };
     let folder_url = container_url(&user, host, folder, None);
-    let Some((path, position)) = file else {
-        return spawn_zed_url(&folder_url, data_root);
-    };
-    // The file goes to a window whose remote project holds it, so the
-    // folder's call has to have handed off to Zed first.
-    let mut child = spawn_zed_child(&[folder_url], &zed_env(data_root)?)?;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    while child.try_wait()?.is_none() && std::time::Instant::now() < deadline {
-        std::thread::sleep(std::time::Duration::from_millis(100));
+    let env = zed_env(data_root)?;
+    if env.is_empty() {
+        anyhow::bail!(
+            "tod-zed-shim is not installed next to tod, so Zed cannot reach dev container {container}; reinstall tod"
+        );
     }
-    spawn_zed_url(&container_url(&user, host, path, position), data_root)
+    let since = launch_time();
+    spawn_zed_with(&[folder_url], &env)?;
+    // The file goes to a window whose remote project holds it, so the
+    // folder has to have connected first.
+    require_connection(
+        data_root,
+        &format!("docker-{container}"),
+        since,
+        &format!("dev container {container}"),
+    )?;
+    let Some((path, position)) = file else {
+        return Ok(());
+    };
+    spawn_zed_with(&[container_url(&user, host, path, position)], &env)
+}
+
+/// Open `path` in cloud sandbox `sandbox` in Zed, and report an error when
+/// no connection comes through tod's shim (see [`require_connection`]).
+/// Waits up to [`CONNECTION_WAIT`]: never call it on the UI thread.
+pub fn open_in_sandbox(data_root: &Path, sandbox: &str, path: &str) -> Result<()> {
+    let env = zed_env(data_root)?;
+    if env.is_empty() {
+        anyhow::bail!("tod-zed-shim is not installed next to tod, so Zed cannot reach sandbox {sandbox}; reinstall tod");
+    }
+    let since = launch_time();
+    spawn_zed_with(&[sandbox_url(sandbox, path)], &env)?;
+    require_connection(data_root, &format!("sandbox-{sandbox}"), since, &format!("sandbox {sandbox}"))
+}
+
+/// Where `tod-zed-shim` records the connections it carries, under
+/// [`SHIM_DIR`]: `connections/<key>/<pid>`, `<key>` being `docker-<container>`
+/// or `sandbox-<name>`. The shim holds a lock on its file while it runs. Must
+/// match the shim's `CONNECTIONS_DIR`.
+pub const CONNECTIONS_DIR: &str = "connections";
+
+/// How long to wait for Zed to connect through the shim after tod asks it
+/// to open a remote folder.
+pub const CONNECTION_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// A little before now, so a marker written in the same clock tick (or on a
+/// file system with coarse timestamps) still counts as new.
+fn launch_time() -> std::time::SystemTime {
+    std::time::SystemTime::now() - std::time::Duration::from_secs(2)
+}
+
+/// Waits for Zed to reach the host through tod's shim; an error means it
+/// did not. Windows Zed is single-instance: a Zed that was already running,
+/// not started by tod, gets tod's request but has no shim on its `PATH`, so
+/// its own `ssh` fails on the `.tod` host and nothing else says so.
+///
+/// A Zed tod started that is already connected to this host may reuse that
+/// connection and run no new `ssh`; its shim processes (the connection's
+/// master and proxy) are still running and hold their markers' locks, which
+/// counts as connected.
+fn require_connection(data_root: &Path, key: &str, since: std::time::SystemTime, what: &str) -> Result<()> {
+    let dir = data_root.join(SHIM_DIR).join(CONNECTIONS_DIR).join(key);
+    if wait_for_connection(&dir, since, CONNECTION_WAIT, std::time::Duration::from_millis(250)) {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "Zed was already open without tod's connection helper, so it could not reach {what}. Quit Zed and open again."
+    )
+}
+
+/// Polls [`connection_seen`] until it holds or `timeout` passes.
+pub fn wait_for_connection(
+    dir: &Path,
+    since: std::time::SystemTime,
+    timeout: std::time::Duration,
+    poll: std::time::Duration,
+) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if connection_seen(dir, since) {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(poll);
+    }
+}
+
+/// Whether a shim has carried a connection for this host since `since` (a
+/// marker written then), or carries one now (a marker it still locks).
+/// Unlocked markers from before are leftovers and are removed.
+pub fn connection_seen(dir: &Path, since: std::time::SystemTime) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    let mut seen = false;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if entry.metadata().and_then(|m| m.modified()).is_ok_and(|t| t >= since) {
+            seen = true;
+            continue;
+        }
+        let Ok(file) = std::fs::OpenOptions::new().read(true).open(&path) else {
+            continue;
+        };
+        match file.try_lock() {
+            Err(std::fs::TryLockError::WouldBlock) => seen = true,
+            Err(std::fs::TryLockError::Error(_)) => {}
+            Ok(()) => {
+                drop(file);
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+    }
+    seen
 }
 
 pub fn spawn_zed_url(url: &str, data_root: &Path) -> Result<()> {
@@ -366,6 +471,56 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("tod-zed-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         Scratch(dir)
+    }
+
+    fn short() -> (std::time::Duration, std::time::Duration) {
+        (std::time::Duration::from_millis(300), std::time::Duration::from_millis(20))
+    }
+
+    #[test]
+    fn no_connection_times_out() {
+        let root = scratch("conn-none");
+        let (timeout, poll) = short();
+        let since = std::time::SystemTime::now();
+        assert!(!wait_for_connection(&root.path().join("docker-c"), since, timeout, poll));
+        std::fs::create_dir_all(root.path()).unwrap();
+        assert!(!wait_for_connection(root.path(), since, timeout, poll));
+    }
+
+    #[test]
+    fn a_marker_written_after_launch_counts() {
+        let root = scratch("conn-new");
+        let dir = root.path().join("docker-c");
+        let since = launch_time();
+        let writer = {
+            let dir = dir.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                std::fs::create_dir_all(&dir).unwrap();
+                std::fs::write(dir.join("123"), b"").unwrap();
+            })
+        };
+        let (_, poll) = short();
+        assert!(wait_for_connection(&dir, since, std::time::Duration::from_secs(5), poll));
+        writer.join().unwrap();
+    }
+
+    #[test]
+    fn a_held_old_marker_counts_and_a_stale_one_is_removed() {
+        let root = scratch("conn-old");
+        let dir = root.path().join("docker-c");
+        std::fs::create_dir_all(&dir).unwrap();
+        let held = std::fs::File::create(dir.join("1")).unwrap();
+        held.lock().unwrap();
+        std::fs::write(dir.join("2"), b"").unwrap();
+        // Both markers predate this launch.
+        let since = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
+        let (timeout, poll) = short();
+        assert!(wait_for_connection(&dir, since, timeout, poll));
+        assert!(!dir.join("2").exists(), "the unlocked leftover is removed");
+        drop(held);
+        assert!(!wait_for_connection(&dir, since, timeout, poll));
+        assert!(!dir.join("1").exists());
     }
 
     /// Needs `ssh-keygen` on PATH; skipped without it.

@@ -83,6 +83,35 @@ fn run_real(name: &str, args: &[String], extra: &[String]) -> ! {
     }
 }
 
+/// Where this shim records the connections it carries, one directory per
+/// host key (`docker-<container>`, `sandbox-<name>`), one file per process.
+/// Must match `tod_store::fleet::code_editor::zed::CONNECTIONS_DIR`: tod reads
+/// it to tell a Zed it started (which runs this shim) from one that was
+/// already open without it.
+const CONNECTIONS_DIR: &str = "connections";
+
+/// Creates `connections/<key>/<pid>` and holds an exclusive lock on it for as
+/// long as the returned file lives (the OS drops it when the process ends, so
+/// a killed shim leaves no live marker). Best effort: a failure only means tod
+/// may not see this connection.
+fn hold_connection_marker(key: &str) -> Option<(std::fs::File, PathBuf)> {
+    let dir = exe_dir().join(CONNECTIONS_DIR).join(key);
+    std::fs::create_dir_all(&dir).ok()?;
+    let path = dir.join(std::process::id().to_string());
+    let file = std::fs::OpenOptions::new().create(true).truncate(true).write(true).open(&path).ok()?;
+    file.lock().ok()?;
+    Some((file, path))
+}
+
+/// Unlocks and removes the marker (a leftover one is harmless: tod only
+/// counts a locked marker or one written after it launched Zed).
+fn release_connection_marker(marker: Option<(std::fs::File, PathBuf)>) {
+    if let Some((file, path)) = marker {
+        drop(file);
+        let _ = std::fs::remove_file(path);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Arguments
 
@@ -256,12 +285,21 @@ fn main() {
     let parsed = parse_args(&args);
     if let Some(container) = parsed.dest.as_deref().and_then(container_for_host) {
         log(&format!("{container}: ssh through docker exec sshd -i"));
-        run_real("ssh", &args, &container_ssh_options(container, &exe_dir().join(CONTAINER_KEY_FILE)));
+        let marker = hold_connection_marker(&format!("docker-{container}"));
+        let extra = container_ssh_options(container, &exe_dir().join(CONTAINER_KEY_FILE));
+        let status = Command::new(real_program("ssh")).args(&extra).args(&args).status();
+        release_connection_marker(marker);
+        match status {
+            Ok(s) => std::process::exit(s.code().unwrap_or(255)),
+            Err(e) => fail(&format!("could not run the real ssh: {e}")),
+        }
     }
     let Some(name) = parsed.dest.as_deref().and_then(config::name_for_host).map(str::to_string) else {
         run_real("ssh", &args, &[]);
     };
 
+    // Held until this process exits (every path below ends in `exit`).
+    let _marker = hold_connection_marker(&format!("sandbox-{name}"));
     if let Some(ctl) = &parsed.control {
         // Nothing to control: there is no master connection to check or stop.
         log(&format!("control request {ctl}: answered locally"));

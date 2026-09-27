@@ -57,9 +57,8 @@ pub fn open_code_editor_for_node(
             if editor.id() != zed::ZedEditor.id() {
                 anyhow::bail!("{path} is in sandbox {sandbox}; only Zed opens a sandbox");
             }
-            let url = zed::sandbox_url(&sandbox, &path);
-            zed::spawn_zed_url(&url, fleet.paths().root())
-                .with_context(|| format!("open {url} in Zed"))?;
+            zed::open_in_sandbox(fleet.paths().root(), &sandbox, &path)
+                .with_context(|| format!("open {path} in sandbox {sandbox} in Zed"))?;
             return Ok(PathBuf::from(path));
         }
     };
@@ -102,9 +101,8 @@ pub fn open_file_in_code_editor(
             if editor.id() != zed::ZedEditor.id() {
                 anyhow::bail!("{path} is in sandbox {sandbox}; only Zed opens a sandbox");
             }
-            let url = zed::sandbox_url(&sandbox, &path);
-            zed::spawn_zed_url(&url, fleet.paths().root())
-                .with_context(|| format!("open {url} in Zed"))
+            zed::open_in_sandbox(fleet.paths().root(), &sandbox, &path)
+                .with_context(|| format!("open {path} in sandbox {sandbox} in Zed"))
         }
     }
 }
