@@ -210,6 +210,11 @@ pub struct UnifiedView {
     /// via `TaskListView::set_attention`; Alt+Q walks the same data
     /// (`doc/ui/unified-view-plan.md` W12).
     attention: HashMap<Uuid, NodeAttention>,
+    /// The node [`Self::default_panel`] last judged, and whether it was a
+    /// task node then. A store change that turns the selected node into a
+    /// task node (or back) swaps its default panel in place
+    /// ([`Self::follow_default_panel`]).
+    last_default: Cell<Option<(Uuid, bool)>>,
     _task_list_subscription: Subscription,
     _agent_runs_subscription: Subscription,
     _chat_drawer_subscription: Subscription,
@@ -249,7 +254,7 @@ impl UnifiedView {
         let _agent_runs_subscription = cx.observe(&agent_runs, |this, _, cx| {
             this.apply_status_overrides(cx);
         });
-        let _attention_poll = Self::spawn_attention_poll(fleet.clone(), cx);
+        let _attention_poll = Self::spawn_attention_poll(fleet.clone(), window, cx);
         let mut this = Self {
             fleet,
             paths,
@@ -266,6 +271,7 @@ impl UnifiedView {
             last_chat_focus: Focus::Project,
             focus_handle: cx.focus_handle(),
             attention: HashMap::new(),
+            last_default: Cell::new(None),
             _task_list_subscription,
             _agent_runs_subscription,
             _chat_drawer_subscription,
@@ -279,16 +285,39 @@ impl UnifiedView {
     /// store changes (`FleetStore::subscribe_changes`), once immediately at
     /// startup, then feeds it to the tree and keeps it for Alt+Q
     /// (`doc/ui/unified-view-plan.md` W12 "Feed attention into the tree").
-    fn spawn_attention_poll(fleet: Arc<FleetStore>, cx: &mut Context<Self>) -> gpui::Task<()> {
-        cx.spawn(async move |this, cx| {
+    ///
+    /// The same pass re-judges whether the selected node is a task node, so
+    /// its default panel follows a capability change.
+    fn spawn_attention_poll(
+        fleet: Arc<FleetStore>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::Task<()> {
+        cx.spawn_in(window, async move |this, cx| {
             let mut rx = fleet.subscribe_changes();
             loop {
+                let Ok(selected) = this.update(cx, |this, cx| this.task_list.read(cx).selected_node_id()) else {
+                    break;
+                };
                 let fleet_for_read = fleet.clone();
-                let computed = cx
+                let (computed, is_task) = cx
                     .background_executor()
-                    .spawn(async move { attention_feed::compute(&fleet_for_read) })
+                    .spawn(async move {
+                        let is_task = selected.map(|id| {
+                            let is_task = fleet_for_read
+                                .read(|conn| tod_store::fleet::node_actions::is_task_node(conn, id))
+                                .unwrap_or(false);
+                            (id, is_task)
+                        });
+                        (attention_feed::compute(&fleet_for_read), is_task)
+                    })
                     .await;
-                let Ok(()) = this.update(cx, |this, cx| this.apply_attention(computed, cx)) else {
+                let Ok(()) = this.update_in(cx, |this, window, cx| {
+                    this.apply_attention(computed, cx);
+                    if let Some((node_id, is_task)) = is_task {
+                        this.follow_default_panel(node_id, is_task, window, cx);
+                    }
+                }) else {
                     break;
                 };
                 if rx.recv().await.is_err() {
@@ -298,6 +327,50 @@ impl UnifiedView {
                 while rx.try_recv().is_ok() {}
             }
         })
+    }
+
+    /// `node_id` is (or is no longer) a task node: when that changed since
+    /// [`Self::default_panel`] last judged it, an unpinned column showing
+    /// the old default for it (Details or Task) shows the new one, in place
+    /// and without moving focus. A Details the user opened on a node that
+    /// stays a task node is left alone.
+    fn follow_default_panel(
+        &mut self,
+        node_id: Uuid,
+        is_task: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((judged, was_task)) = self.last_default.get() else {
+            return;
+        };
+        if judged != node_id || was_task == is_task {
+            return;
+        }
+        self.last_default.set(Some((node_id, is_task)));
+        let (old, new) = if is_task {
+            (PanelKind::Details(node_id), PanelKind::Task(node_id))
+        } else {
+            (PanelKind::Task(node_id), PanelKind::Details(node_id))
+        };
+        let Some(ix) = self
+            .columns
+            .columns()
+            .iter()
+            .position(|column| !column.pinned && column.panel == old)
+        else {
+            return;
+        };
+        // Already shown elsewhere: nothing to swap.
+        if self.columns.columns().iter().any(|column| column.panel == new) {
+            return;
+        }
+        self.columns.replace(ix, new);
+        self.hosted[ix] = self.construct_hosted(new, window, cx);
+        if self.columns.focused_index() == Some(ix) {
+            self.sync_window_focus(window, cx);
+        }
+        cx.notify();
     }
 
     /// Store the freshly computed attention map and hand its
@@ -408,6 +481,7 @@ impl UnifiedView {
             .fleet
             .read(|conn| tod_store::fleet::node_actions::is_task_node(conn, node_id))
             .unwrap_or(false);
+        self.last_default.set(Some((node_id, is_task)));
         if is_task {
             PanelKind::Task(node_id)
         } else {
@@ -1254,6 +1328,48 @@ mod tests {
                 panic!("expected a task panel");
             };
             assert_eq!(panel.read(cx).node_id(), task_id);
+        });
+    }
+
+    #[gpui::test]
+    fn the_default_panel_follows_the_node_becoming_a_task(cx: &mut TestAppContext) {
+        let fixture = Fixture::new();
+        let node_id = fixture.node_id;
+        let (view, cx) = open_view(&fixture, cx);
+        view.update_in(cx, |view, window, cx| {
+            let target = view.default_panel(node_id);
+            assert_eq!(target, PanelKind::Details(node_id));
+            view.open_panel(target, 0, false, window, cx);
+            // Still not a task: a Details stays.
+            view.follow_default_panel(node_id, false, window, cx);
+        });
+        draw(cx);
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.columns.columns()[0].panel, PanelKind::Details(node_id));
+        });
+
+        view.update_in(cx, |view, window, cx| {
+            view.follow_default_panel(node_id, true, window, cx);
+        });
+        draw(cx);
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.columns.len(), 1);
+            assert_eq!(view.columns.columns()[0].panel, PanelKind::Task(node_id));
+            let HostedPanel::Task(panel) = &view.hosted[0].panel else {
+                panic!("expected a task panel");
+            };
+            assert_eq!(panel.read(cx).node_id(), node_id);
+        });
+
+        // The user opens Details on the task node: it stays while the node
+        // stays a task.
+        view.update_in(cx, |view, window, cx| {
+            view.open_panel(PanelKind::Details(node_id), 0, false, window, cx);
+            view.follow_default_panel(node_id, true, window, cx);
+        });
+        draw(cx);
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.columns.columns()[0].panel, PanelKind::Details(node_id));
         });
     }
 

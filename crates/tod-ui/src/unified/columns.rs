@@ -142,6 +142,14 @@ impl ColumnModel {
         }
     }
 
+    /// Show `panel` in column `index` in place of what it showed, leaving
+    /// focus and every other column alone.
+    pub fn replace(&mut self, index: usize, panel: PanelKind) {
+        if let Some(col) = self.columns.get_mut(index) {
+            col.panel = panel;
+        }
+    }
+
     /// Toggle the pinned flag of column `index`.
     pub fn toggle_pin(&mut self, index: usize) {
         if let Some(col) = self.columns.get_mut(index) {
