@@ -107,7 +107,7 @@ impl TranscriptWindowControl {
                         size: size(px(1100.), px(720.)),
                     })),
                     focus: super::no_focus::window_focus(),
-                    ..Default::default()
+                    ..super::app_icon::window_options()
                 },
                 move |window, cx| {
                     let control_for_close = control.clone();

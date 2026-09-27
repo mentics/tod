@@ -77,7 +77,7 @@ impl HistoryWindowControl {
                         size: size(px(640.), px(480.)),
                     })),
                     focus: super::no_focus::window_focus(),
-                    ..Default::default()
+                    ..super::app_icon::window_options()
                 },
                 move |window, cx| {
                     let control_for_close = control.clone();

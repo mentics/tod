@@ -69,6 +69,45 @@ for dir in process media; do
     fi
 done
 
+# On Linux the shell shows an app's icon only through a .desktop file whose
+# name matches the window's app id ("tod", crates/tod-ui/src/app/app_icon.rs),
+# with the icon installed in the hicolor theme. Both go in the user's own data
+# dir, so this needs no root.
+install_desktop_entry() {
+    local data_home="${XDG_DATA_HOME:-$HOME/.local/share}"
+    local size
+    for png in "$REPO_ROOT"/assets/icon/png/tod-*.png; do
+        size="${png##*/tod-}"
+        size="${size%.png}"
+        mkdir -p "$data_home/icons/hicolor/${size}x${size}/apps"
+        cp -f "$png" "$data_home/icons/hicolor/${size}x${size}/apps/tod.png"
+    done
+    mkdir -p "$data_home/applications"
+    local exec_path
+    exec_path="$(cd "$TARGET_DIR" && pwd)/tod"
+    cat > "$data_home/applications/tod.desktop" <<EOF
+[Desktop Entry]
+Type=Application
+Name=tod
+Comment=Tasks, obligations, and the agents working on them
+Exec="$exec_path"
+Icon=tod
+StartupWMClass=tod
+Terminal=false
+Categories=Development;
+EOF
+    if command -v gtk-update-icon-cache >/dev/null; then
+        gtk-update-icon-cache -q -t "$data_home/icons/hicolor" || true
+    fi
+    if command -v update-desktop-database >/dev/null; then
+        update-desktop-database -q "$data_home/applications" || true
+    fi
+    echo "Installed tod.desktop and icons under $data_home"
+}
+if [[ "$(uname -s)" == Linux ]]; then
+    install_desktop_entry
+fi
+
 # The relay runs inside Linux sandboxes: a static binary cross-built from this
 # machine (rust-lld links it; see .cargo/config.toml). A failure here leaves tod
 # installed without cloud-sandbox support.

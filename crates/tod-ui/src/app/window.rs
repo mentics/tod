@@ -1847,7 +1847,7 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                 }
             },
             focus: !no_focus,
-            ..Default::default()
+            ..super::app_icon::window_options()
         },
         {
             let paths = paths.clone();
@@ -2570,7 +2570,7 @@ pub fn open_data_root_setup(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()
                 size: size(px(720.), px(420.)),
             })),
             focus: no_focus::window_focus(),
-            ..Default::default()
+            ..super::app_icon::window_options()
         },
         {
             move |window, cx| {

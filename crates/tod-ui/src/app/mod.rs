@@ -1,4 +1,5 @@
 mod always_on_top;
+pub(crate) mod app_icon;
 pub(crate) mod assets;
 mod data_root_setup;
 mod fleet_blocked;
@@ -101,6 +102,7 @@ impl App {
 
         app.run(move |cx| {
             gpui_component::init(cx);
+            app_icon::set_dock_icon();
             register_app_lifecycle(cx);
             // Dark default accent (#171717) is nearly invisible for PopupMenu /
             // ListItem hover-selected chrome on #0a0a0a. Align with list_active

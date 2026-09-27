@@ -1,4 +1,5 @@
-"""Renders tod's app icon: `tod.ico` (every Windows size) and `tod.png` (1024px).
+"""Renders tod's app icon: `tod.ico` (every Windows size), `tod.png` (1024px),
+and `png/tod-<size>.png` (Linux icon theme sizes; 512 also feeds macOS and X11).
 
 Run from the repository root: `python assets/icon/make_icon.py`. Needs Pillow.
 Each size is drawn on its own, 8x supersampled, so small sizes keep crisp
@@ -12,6 +13,7 @@ from PIL import Image, ImageDraw
 
 HERE = Path(__file__).resolve().parent
 ICO_SIZES = [16, 20, 24, 32, 40, 48, 64, 128, 256]
+PNG_SIZES = [16, 24, 32, 48, 64, 128, 256, 512]
 SS = 8  # supersampling factor
 
 TOP = (38, 38, 44)  # charcoal
@@ -103,6 +105,14 @@ def main() -> None:
         append_images=images[:-1],
     )
     render(1024).save(HERE / "tod.png")
+
+    # One PNG per hicolor theme size, installed on Linux by scripts/install.sh.
+    # tod-512.png is also compiled into the app for the macOS Dock and the X11
+    # window icon (crates/tod-ui/src/app/app_icon.rs).
+    png_dir = HERE / "png"
+    png_dir.mkdir(exist_ok=True)
+    for px in PNG_SIZES:
+        render(px).save(png_dir / f"tod-{px}.png", optimize=True)
 
 
 if __name__ == "__main__":

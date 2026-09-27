@@ -55,6 +55,12 @@ wry = { version = "0.53.3", package = "lb-wry" }
 # `#[gpui::test]`, `TestAppContext` and simulated input, for UI regression tests.
 gpui = { version = "0.3.1", package = "gpui-pre", features = ["test-support"] }
 
+# Sets the Dock icon (`app::app_icon`). Same versions gpui's macOS backend uses.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSImage", "NSResponder"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSData"] }
+
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.57", features = [
     "Win32_Foundation",

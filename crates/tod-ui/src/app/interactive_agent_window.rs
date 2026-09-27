@@ -391,7 +391,7 @@ impl InteractiveAgentWindowControl {
                         size: size(px(720.), px(640.)),
                     })),
                     focus: super::no_focus::window_focus(),
-                    ..Default::default()
+                    ..super::app_icon::window_options()
                 },
                 move |window, cx| {
                     let session_for_close = session_run_id.clone();
