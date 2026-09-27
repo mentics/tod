@@ -795,8 +795,8 @@ impl TaskListView {
             RowAction::ToggleGeneratorFilter { task_id } => {
                 self.toggle_generator_filter(&task_id, window, cx);
             }
-            RowAction::OpenContextMenu { task_id } => {
-                self.open_context_menu(&task_id, window, cx);
+            RowAction::OpenContextMenu { task_id, position } => {
+                self.open_context_menu(&task_id, Some(position), window, cx);
             }
             RowAction::OpenTaskPanel { task_id } => {
                 self.select_task_by_id(&task_id, window, cx);
@@ -3755,13 +3755,13 @@ mod tests {
         let node_id = fixture.node_id.to_string();
         let (view, _events, cx) = open_view(&fixture, cx);
         view.update_in(cx, |view, window, cx| {
-            view.open_context_menu(&node_id, window, cx);
+            view.open_context_menu(&node_id, None, window, cx);
         });
         draw(cx);
         view.read_with(cx, |view, _| {
             assert_eq!(
                 view.open_row_menu,
-                Some((RowMenuKind::Context, node_id.clone()))
+                Some((RowMenuKind::Context(None), node_id.clone()))
             );
             assert!(view.row_menu.is_some(), "menu entity was built");
             assert_eq!(view.working_set.selected_id.as_deref(), Some(node_id.as_str()));
@@ -3778,7 +3778,7 @@ mod tests {
         // (see `context_menu::build`), so driving `start_inline_edit`
         // directly exercises the same path the click would.
         view.update_in(cx, |view, window, cx| {
-            view.open_context_menu(&node_id, window, cx);
+            view.open_context_menu(&node_id, None, window, cx);
             view.start_inline_edit(&node_id, window, cx);
         });
         draw(cx);
