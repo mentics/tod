@@ -109,6 +109,8 @@ struct Tally {
     index: HashMap<String, usize>,
     /// The latest main-chain response's whole prompt.
     context_tokens: Option<u64>,
+    /// The model that served the latest main-chain response.
+    model: Option<String>,
     cost_states: Vec<ClaudeCostState>,
 }
 
@@ -145,6 +147,7 @@ impl Tally {
         let counts = anthropic_counts(usage);
         if !sidechain {
             self.context_tokens = Some(counts.prompt());
+            self.model = Some(model.to_string());
         }
         let response = (id.to_string(), model.to_string(), counts, sidechain);
         match self.index.get(id) {
@@ -159,6 +162,7 @@ impl Tally {
     fn into_usage(self) -> TokenUsage {
         let mut usage = TokenUsage {
             context_tokens: self.context_tokens,
+            model: self.model,
             ..TokenUsage::default()
         };
         for (_, model, counts, sidechain) in &self.responses {
@@ -394,6 +398,8 @@ mod tests {
         assert_eq!(usage.by_model["haiku"].requests, 2);
         assert_eq!(usage.subagents.requests, 1);
         assert_eq!(usage.context_tokens, Some(3 + 200));
+        // The latest main-chain response's, not a subagent's or a stand-in's.
+        assert_eq!(usage.model.as_deref(), Some("haiku"));
         assert_eq!(usage.cost.as_ref().map(crate::Cost::amount), Some(0.5));
         assert_eq!(usage.api_duration_ms, Some(900));
     }

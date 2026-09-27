@@ -1,5 +1,5 @@
 use super::acp_host::{
-    AcpHost, container_agent_bin, is_standalone_acp_server, spawn_acp_in_container,
+    AcpHost, container_agent_bin, spawn_acp_in_container,
     spawn_acp_process,
 };
 use super::provider::{
@@ -327,7 +327,9 @@ impl ConversationWorker {
 /// ACP agent backend (Cursor, Claude, …).
 pub struct CursorAcpProvider {
     host: AcpHost,
-    agent_bin: PathBuf,
+    /// The agent to run; `None` finds it again for every launch, so one
+    /// installed while the app runs is used on the next.
+    agent_bin: Option<PathBuf>,
     /// Extra directories the agent may write to, supplied by the caller.
     /// This crate does not resolve the data root itself.
     extra_write_roots: Arc<Vec<PathBuf>>,
@@ -349,17 +351,19 @@ impl CursorAcpProvider {
         self
     }
 
-    pub fn for_host(host: AcpHost) -> Result<Self> {
-        Ok(Self {
+    /// The provider for `host`, finding its agent at each launch: a launch
+    /// with none installed fails with what to install.
+    pub fn for_host(host: AcpHost) -> Self {
+        Self {
             host,
-            agent_bin: host.resolve_bin()?,
+            agent_bin: None,
             extra_write_roots: Arc::new(Vec::new()),
             runs: HashMap::new(),
             fleet_run_context: HashMap::new(),
             conversations: HashMap::new(),
             traffic_log: None,
             session_observer: None,
-        })
+        }
     }
 
     pub fn with_traffic_log(mut self, traffic_log: SharedAgentTrafficLog) -> Self {
@@ -387,10 +391,18 @@ impl CursorAcpProvider {
         tag.record(log, kind.traffic_category(), direction, content);
     }
 
+    /// The agent to run, found now when the provider was not given one.
+    fn agent_bin(&self) -> Result<PathBuf> {
+        match &self.agent_bin {
+            Some(bin) => Ok(bin.clone()),
+            None => self.host.resolve_bin(),
+        }
+    }
+
     pub fn with_agent_bin(host: AcpHost, agent_bin: PathBuf) -> Self {
         Self {
             host,
-            agent_bin,
+            agent_bin: Some(agent_bin),
             extra_write_roots: Arc::new(Vec::new()),
             runs: HashMap::new(),
             fleet_run_context: HashMap::new(),
@@ -413,7 +425,7 @@ impl CursorAcpProvider {
     ) -> Result<AgentRunHandle> {
         let id = RunId::new();
         let (tx, rx) = mpsc::channel();
-        let agent_bin = self.agent_bin.clone();
+        let agent_bin = self.agent_bin()?;
         let host = self.host;
         let child_slot: Arc<Mutex<Option<AgentProcess>>> = Arc::new(Mutex::new(None));
         let cancelled = Arc::new(AtomicBool::new(false));
@@ -527,10 +539,7 @@ impl Drop for CursorAcpProvider {
 
 impl Default for CursorAcpProvider {
     fn default() -> Self {
-        Self::for_host(AcpHost::Cursor).unwrap_or_else(|err| {
-            eprintln!("Cursor ACP provider init failed: {err}; using placeholder agent path");
-            Self::with_agent_bin(AcpHost::Cursor, PathBuf::from("agent"))
-        })
+        Self::for_host(AcpHost::Cursor)
     }
 }
 
@@ -575,7 +584,7 @@ impl AgentProvider for CursorAcpProvider {
         let tag = TrafficTag::new(key.clone(), &title, purpose.run_kind().traffic_label());
         let spec = ConversationSpec {
             host: self.host,
-            agent_bin: self.agent_bin.clone(),
+            agent_bin: self.agent_bin()?,
             cwd,
             model: options.model,
             effort: options.effort,
@@ -810,12 +819,9 @@ impl AgentProvider for CursorAcpProvider {
     }
 }
 
-fn auth_method_from_initialize(
-    init_result: &Value,
-    host: AcpHost,
-    agent_bin: &Path,
-) -> Option<String> {
-    if host == AcpHost::Claude && is_standalone_acp_server(agent_bin) {
+fn auth_method_from_initialize(init_result: &Value, host: AcpHost) -> Option<String> {
+    // Claude's adapter relies on the `claude` CLI's own login.
+    if host == AcpHost::Claude {
         return None;
     }
     let methods = init_result.get("authMethods")?.as_array()?;
@@ -839,10 +845,9 @@ fn auth_method_from_initialize(
 fn run_acp_authenticate(
     session: &mut AcpClient,
     host: AcpHost,
-    agent_bin: &Path,
     init_result: &Value,
 ) -> Result<()> {
-    let Some(method_id) = auth_method_from_initialize(init_result, host, agent_bin) else {
+    let Some(method_id) = auth_method_from_initialize(init_result, host) else {
         tracing::debug!(
             event = "agent",
             action = "acp_authenticate_skip",
@@ -1019,12 +1024,10 @@ fn run_acp_session(
 ) -> Result<String> {
     let SpawnedAgent {
         mut child,
-        agent_bin,
         cwd,
         write_roots,
         in_container,
     } = spawn_agent(host, agent_bin, cwd, environment, &[], extra_write_roots)?;
-    let agent_bin = agent_bin.as_path();
     let cwd = cwd.as_path();
     let stdin = child.stdin.take().context("agent stdin unavailable")?;
     let stdout = child.stdout.take().context("agent stdout unavailable")?;
@@ -1085,7 +1088,7 @@ fn run_acp_session(
         if cancelled.load(Ordering::SeqCst) {
             bail!("ACP run cancelled");
         }
-        run_acp_authenticate(&mut session, host, agent_bin, &init_result)?;
+        run_acp_authenticate(&mut session, host, &init_result)?;
 
         if cancelled.load(Ordering::SeqCst) {
             bail!("ACP run cancelled");
@@ -1113,13 +1116,7 @@ fn run_acp_session(
             cwd,
         );
 
-        apply_session_config_options(
-            &mut session,
-            session_id,
-            session_result.get("configOptions"),
-            model,
-            effort,
-        )?;
+        apply_session_config_options(&mut session, session_id, &session_result, model, effort)?;
         apply_permission_mode(&mut session, host, session_id, &session_result)?;
 
         if cancelled.load(Ordering::SeqCst) {
@@ -1406,6 +1403,9 @@ impl AcpClient {
                         self.set_activity(Some("Thinking…".to_string()));
                     } else if kind == "usage_update" {
                         self.update_usage(|usage| usage.apply_update(update));
+                    } else if kind == "config_option_update" {
+                        let (model, effort) = reported_config(update.get("configOptions"));
+                        self.update_usage(|usage| usage.set_config(model, effort));
                     } else if kind == "tool_call" || kind == "tool_call_update" {
                         let title = update.get("title").and_then(Value::as_str).unwrap_or("");
                         let status = update.get("status").and_then(Value::as_str).unwrap_or("");
@@ -1613,8 +1613,6 @@ fn respond(stdin: &mut std::process::ChildStdin, id: i64, result: Value) -> Resu
 /// An agent process as one connection starts it.
 struct SpawnedAgent {
     child: AgentProcess,
-    /// The binary actually run: the container's own in a dev container.
-    agent_bin: PathBuf,
     /// The session's working directory as the agent sees it.
     cwd: PathBuf,
     write_roots: Vec<PathBuf>,
@@ -1635,7 +1633,6 @@ fn spawn_agent(
     match environment {
         AgentEnvironment::Host => Ok(SpawnedAgent {
             child: spawn_acp_process(host, agent_bin, env)?,
-            agent_bin: agent_bin.to_path_buf(),
             cwd: cwd.to_path_buf(),
             write_roots: acp_write_roots(cwd, extra_write_roots),
             in_container: false,
@@ -1656,7 +1653,6 @@ fn spawn_agent(
             let child = spawn_acp_in_container(host, &container, &bin, env)?;
             Ok(SpawnedAgent {
                 child,
-                agent_bin: PathBuf::from(bin),
                 cwd: PathBuf::from(&container.cwd),
                 write_roots: vec![PathBuf::from(&container.cwd)],
                 in_container: true,
@@ -1676,7 +1672,6 @@ fn spawn_agent(
             let child = crate::acp_host::spawn_acp_in_sandbox(host, launch, &bin, env)?;
             Ok(SpawnedAgent {
                 child,
-                agent_bin: PathBuf::from(bin),
                 cwd: PathBuf::from(&launch.directory),
                 write_roots: vec![PathBuf::from(&launch.directory)],
                 in_container: true,
@@ -1818,7 +1813,7 @@ fn pick_effort_option(config_options: Option<&Value>) -> Option<Value> {
         .find(|o| {
             matches!(
                 o.get("category").and_then(Value::as_str),
-                Some("effort") | Some("thinking")
+                Some("effort") | Some("thinking") | Some("thought_level")
             )
         })
         .or_else(|| {
@@ -1846,74 +1841,226 @@ fn has_config_option_value(option: &Value, value_id: &str) -> bool {
         })
 }
 
+/// The value `option` offers as `value`, as the agent names it:
+/// `sonnet (Sonnet 5)` when its description leads with a model's name, the
+/// option's own name when it differs from the value, else the value.
+fn config_value_label(option: &Value, value: &str) -> String {
+    let offered = option
+        .get("options")
+        .and_then(Value::as_array)
+        .and_then(|options| {
+            options
+                .iter()
+                .find(|o| o.get("value").and_then(Value::as_str) == Some(value))
+        });
+    let text = |key: &str| {
+        offered
+            .and_then(|o| o.get(key))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+    };
+    // Claude's adapter describes a model as "Sonnet 5 · Best for everyday
+    // tasks", and its Default as the model it resolves to.
+    let described = text("description")
+        .map(|d| d.split(" · ").next().unwrap_or(d).trim())
+        .filter(|d| !d.is_empty() && d.len() <= 40);
+    match (described, text("name")) {
+        (Some(model), _) if !model.eq_ignore_ascii_case(value) => format!("{value} ({model})"),
+        (_, Some(name)) if !name.eq_ignore_ascii_case(value) => format!("{value} ({name})"),
+        _ => value.to_string(),
+    }
+}
+
+/// The model and effort `config_options` say the session runs.
+fn reported_config(config_options: Option<&Value>) -> (Option<String>, Option<String>) {
+    let current = |option: Option<Value>| {
+        let option = option?;
+        let value = option.get("currentValue").and_then(Value::as_str)?;
+        Some(config_value_label(&option, value))
+    };
+    (
+        current(pick_model_option(config_options)),
+        current(pick_effort_option(config_options)),
+    )
+}
+
+/// Set one config option to `wanted`, when the agent offers it and does not
+/// already run it. Returns the config options the agent answers with, when
+/// it answers with them.
+fn set_config_option(
+    session: &mut AcpClient,
+    session_id: &str,
+    option: &Value,
+    wanted: &str,
+    what: &str,
+) -> Result<Option<Value>> {
+    let current = option.get("currentValue").and_then(Value::as_str);
+    if !has_config_option_value(option, wanted) {
+        let offered: Vec<&str> = option
+            .get("options")
+            .and_then(Value::as_array)
+            .map(|options| {
+                options
+                    .iter()
+                    .filter_map(|o| o.get("value").and_then(Value::as_str))
+                    .collect()
+            })
+            .unwrap_or_default();
+        tracing::warn!(
+            event = "agent",
+            action = "acp_config_not_offered",
+            what,
+            wanted,
+            current = current.unwrap_or(""),
+            offered = %offered.join(", "),
+            "the agent does not offer the {what} asked for; it keeps its own"
+        );
+        return Ok(None);
+    }
+    if current == Some(wanted) {
+        return Ok(None);
+    }
+    tracing::debug!(
+        event = "agent",
+        action = "acp_set_config_option",
+        what,
+        target = wanted,
+        "ACP session/set_config_option"
+    );
+    session.send_request(
+        "session/set_config_option",
+        json!({
+            "sessionId": session_id,
+            "configId": option.get("id").cloned().unwrap_or(json!(what)),
+            "value": wanted
+        }),
+    )?;
+    let response = session.await_response(AUTH_TIMEOUT)?;
+    Ok(response.get("configOptions").cloned())
+}
+
+/// Put the session on `model` and `effort`, through its config options, or
+/// for an agent that predates them, its `models` (`session/set_model`); then
+/// note what the agent says it runs, for the view to show beside what was
+/// asked for.
 fn apply_session_config_options(
     session: &mut AcpClient,
     session_id: &str,
-    config_options: Option<&Value>,
+    session_result: &Value,
     model: &str,
     effort: &str,
 ) -> Result<()> {
-    if let Some(model_option) = pick_model_option(config_options) {
-        let target = if has_config_option_value(&model_option, model) {
-            model
-        } else {
-            model_option
-                .get("currentValue")
-                .and_then(Value::as_str)
-                .unwrap_or(model)
-        };
-        if model_option.get("currentValue").and_then(Value::as_str) != Some(target) {
-            tracing::debug!(
-                event = "agent",
-                action = "acp_set_model",
-                target,
-                "ACP session/set_config_option model"
-            );
-            session.send_request(
-                "session/set_config_option",
-                json!({
-                    "sessionId": session_id,
-                    "configId": model_option.get("id").cloned().unwrap_or(json!("model")),
-                    "value": target
-                }),
-            )?;
-            session.await_response(AUTH_TIMEOUT)?;
+    let mut config_options = session_result.get("configOptions").cloned();
+
+    if let Some(model_option) = pick_model_option(config_options.as_ref()) {
+        match set_config_option(session, session_id, &model_option, model, "model")? {
+            Some(updated) => config_options = Some(updated),
+            // Set without the options coming back: the agent runs it now.
+            None if has_config_option_value(&model_option, model) => {
+                let id = model_option.get("id").and_then(Value::as_str).unwrap_or("model");
+                config_options = config_options.map(|options| with_current(options, id, model));
+            }
+            None => {}
         }
+    } else if let Some(models) = session_result.get("models") {
+        apply_legacy_model(session, session_id, models, model)?;
     }
 
     if let Some(effort_value) = effort_for_acp(effort) {
-        if let Some(effort_option) = pick_effort_option(config_options) {
-            let target = if has_config_option_value(&effort_option, effort_value) {
-                effort_value
-            } else {
-                effort_option
-                    .get("currentValue")
-                    .and_then(Value::as_str)
-                    .unwrap_or(effort_value)
-            };
-            if effort_option.get("currentValue").and_then(Value::as_str) != Some(target) {
-                tracing::debug!(
-                    event = "agent",
-                    action = "acp_set_effort",
-                    target,
-                    "ACP session/set_config_option effort"
-                );
-                session.send_request(
-                    "session/set_config_option",
-                    json!({
-                        "sessionId": session_id,
-                        "configId": effort_option
-                            .get("id")
-                            .cloned()
-                            .unwrap_or(json!("effort")),
-                        "value": target
-                    }),
-                )?;
-                session.await_response(AUTH_TIMEOUT)?;
+        if let Some(effort_option) = pick_effort_option(config_options.as_ref()) {
+            match set_config_option(session, session_id, &effort_option, effort_value, "effort")? {
+                Some(updated) => config_options = Some(updated),
+                None if has_config_option_value(&effort_option, effort_value) => {
+                    let id = effort_option.get("id").and_then(Value::as_str).unwrap_or("effort");
+                    config_options =
+                        config_options.map(|options| with_current(options, id, effort_value));
+                }
+                None => {}
             }
         }
     }
 
+    let (reported_model, reported_effort) = reported_config(config_options.as_ref());
+    if reported_model.is_some() || reported_effort.is_some() {
+        session.update_usage(|usage| usage.set_config(reported_model, reported_effort));
+    }
+    Ok(())
+}
+
+/// `options` with the option `id` showing `value` as current.
+fn with_current(mut options: Value, id: &str, value: &str) -> Value {
+    if let Some(list) = options.as_array_mut() {
+        for option in list {
+            if option.get("id").and_then(Value::as_str) == Some(id) {
+                option["currentValue"] = json!(value);
+            }
+        }
+    }
+    options
+}
+
+/// An agent without config options (adapters that predate them)
+/// offers its models as `models { availableModels, currentModelId }`, set
+/// with `session/set_model`.
+fn apply_legacy_model(
+    session: &mut AcpClient,
+    session_id: &str,
+    models: &Value,
+    model: &str,
+) -> Result<()> {
+    let available = models
+        .get("availableModels")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let offered = |id: &str| {
+        available
+            .iter()
+            .find(|m| m.get("modelId").and_then(Value::as_str) == Some(id))
+            .cloned()
+    };
+    let mut current = models
+        .get("currentModelId")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    if offered(model).is_none() {
+        tracing::warn!(
+            event = "agent",
+            action = "acp_config_not_offered",
+            what = "model",
+            wanted = model,
+            current = current.as_deref().unwrap_or(""),
+            "the agent does not offer the model asked for; it keeps its own"
+        );
+    } else if current.as_deref() != Some(model) {
+        tracing::debug!(
+            event = "agent",
+            action = "acp_set_model",
+            target = model,
+            "ACP session/set_model"
+        );
+        session.send_request(
+            "session/set_model",
+            json!({ "sessionId": session_id, "modelId": model }),
+        )?;
+        session.await_response(AUTH_TIMEOUT)?;
+        current = Some(model.to_string());
+    }
+    if let Some(current) = current {
+        let label = match offered(&current) {
+            Some(offer) => {
+                let as_option = json!({ "options": [{
+                    "value": current,
+                    "name": offer.get("name").cloned().unwrap_or(Value::Null),
+                    "description": offer.get("description").cloned().unwrap_or(Value::Null),
+                }] });
+                config_value_label(&as_option, &current)
+            }
+            None => current,
+        };
+        session.update_usage(|usage| usage.set_config(Some(label), None));
+    }
     Ok(())
 }
 
@@ -2038,12 +2185,10 @@ impl PersistentAcpSession {
     ) -> Result<Self> {
         let SpawnedAgent {
             mut child,
-            agent_bin,
             cwd,
             write_roots,
             in_container,
         } = spawn_agent(host, agent_bin, cwd, environment, env, extra_write_roots)?;
-        let agent_bin = agent_bin.as_path();
         let stdin = child.stdin.take().context("agent stdin unavailable")?;
         let stdout = child.stdout.take().context("agent stdout unavailable")?;
         let stderr = child.stderr.take().context("agent stderr unavailable")?;
@@ -2100,7 +2245,7 @@ impl PersistentAcpSession {
         if cancelled.load(Ordering::SeqCst) {
             bail!("ACP run cancelled");
         }
-        run_acp_authenticate(&mut client, host, agent_bin, &init_result)?;
+        run_acp_authenticate(&mut client, host, &init_result)?;
 
         if cancelled.load(Ordering::SeqCst) {
             bail!("ACP run cancelled");
@@ -2139,13 +2284,7 @@ impl PersistentAcpSession {
             }
         };
 
-        apply_session_config_options(
-            &mut client,
-            &session_id,
-            session_result.get("configOptions"),
-            model,
-            effort,
-        )?;
+        apply_session_config_options(&mut client, &session_id, &session_result, model, effort)?;
         apply_permission_mode(&mut client, host, &session_id, &session_result)?;
 
         Ok(Self {
@@ -2296,22 +2435,17 @@ mod tests {
     use std::process::{Command, Stdio};
 
     #[test]
-    fn skips_authenticate_for_claude_code_acp_adapter() {
+    fn skips_authenticate_for_claudes_adapter() {
         let init = json!({
             "authMethods": [{ "id": "claude_login", "name": "Claude login" }]
         });
-        let adapter = Path::new("/usr/local/bin/claude-code-acp");
-        assert!(auth_method_from_initialize(&init, AcpHost::Claude, adapter).is_none());
+        assert!(auth_method_from_initialize(&init, AcpHost::Claude).is_none());
 
         let cursor_init = json!({
             "authMethods": [{ "id": "cursor_login", "name": "Cursor login" }]
         });
         assert_eq!(
-            auth_method_from_initialize(
-                &cursor_init,
-                AcpHost::Cursor,
-                Path::new("/usr/local/bin/agent")
-            )
+            auth_method_from_initialize(&cursor_init, AcpHost::Cursor)
             .as_deref(),
             Some("cursor_login")
         );
@@ -2487,7 +2621,7 @@ while True:
         }
         let dir = scratch_dir("fake-acp");
         // The name marks it as a standalone adapter: no `acp` subcommand, no login.
-        let agent_bin = dir.join("fake-claude-code-acp.py");
+        let agent_bin = dir.join("fake-claude-agent-acp.py");
         std::fs::write(&agent_bin, FAKE_ACP_AGENT).unwrap();
         let traffic = crate::agent_traffic::shared_log();
         let mut provider = CursorAcpProvider::with_agent_bin(AcpHost::Claude, agent_bin)
@@ -2628,7 +2762,7 @@ for line in sys.stdin:
             env: vec![("TOD_PROBE".into(), "from-host".into())],
             path_prepend: vec!["/tmp/tod-test-bin".into()],
             files: vec![ContainerFile {
-                path: "/tmp/tod-test-bin/claude-code-acp".into(),
+                path: "/tmp/tod-test-bin/claude-agent-acp".into(),
                 contents: CONTAINER_FAKE_ACP_AGENT.into(),
                 executable: true,
             }],
@@ -2695,5 +2829,36 @@ for line in sys.stdin:
         );
 
         assert!(pick_effort_option(Some(&json!([]))).is_none());
+    }
+
+    /// The shape `claude-agent-acp` answers `session/new` with.
+    #[test]
+    fn reported_config_names_the_model_the_agent_runs() {
+        let options = json!([
+            { "id": "mode", "category": "mode", "currentValue": "default" },
+            {
+                "id": "model", "category": "model", "currentValue": "sonnet",
+                "options": [
+                    { "value": "default", "name": "Default (recommended)", "description": "Opus 5.5" },
+                    { "value": "sonnet", "name": "Sonnet", "description": "Sonnet 5 · Best for everyday tasks" },
+                    { "value": "haiku", "name": "haiku" }
+                ]
+            },
+            {
+                "id": "effort", "category": "thought_level", "currentValue": "medium",
+                "options": [{ "value": "default", "name": "Default" }, { "value": "medium", "name": "Medium" }]
+            }
+        ]);
+        let (model, effort) = reported_config(Some(&options));
+        assert_eq!(model.as_deref(), Some("sonnet (Sonnet 5)"));
+        assert_eq!(effort.as_deref(), Some("medium"));
+
+        let model_option = pick_model_option(Some(&options)).unwrap();
+        assert_eq!(config_value_label(&model_option, "default"), "default (Opus 5.5)");
+        assert_eq!(config_value_label(&model_option, "haiku"), "haiku");
+        assert_eq!(config_value_label(&model_option, "gone"), "gone");
+
+        let set = with_current(options, "model", "haiku");
+        assert_eq!(reported_config(Some(&set)).0.as_deref(), Some("haiku"));
     }
 }

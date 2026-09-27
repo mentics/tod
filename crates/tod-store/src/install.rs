@@ -31,6 +31,21 @@ pub fn app_config_dir() -> Result<PathBuf> {
         .context("failed to resolve OS config directory")
 }
 
+/// Env var overriding where tod installs agent adapters for itself.
+pub const TOD_ADAPTERS_DIR_ENV: &str = "TOD_ADAPTERS_DIR";
+
+/// Where tod installs Claude's ACP adapter for itself, when the user chooses
+/// that over a global install: `{TOD_ADAPTERS_DIR}/claude-agent-acp`, else
+/// under the OS's local (not roaming) data directory. One per machine, not
+/// per data root, so data roots share it.
+pub fn claude_adapter_dir() -> Option<PathBuf> {
+    let base = match std::env::var_os(TOD_ADAPTERS_DIR_ENV).filter(|v| !v.is_empty()) {
+        Some(dir) => PathBuf::from(dir),
+        None => dirs::data_local_dir()?.join("tod").join("adapters"),
+    };
+    Some(base.join("claude-agent-acp"))
+}
+
 /// Suggested default data root on first launch (same directory as `install.toml`).
 pub fn default_data_root() -> Result<PathBuf> {
     app_config_dir()

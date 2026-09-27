@@ -448,7 +448,8 @@ fn driver_config(fleet: &FleetStore) -> Result<(ConversationConfig, usize), Stri
         ConversationConfig {
             data_root: fleet.paths().root().to_path_buf(),
             media,
-            launch: settings.interview_launch_options(),
+            launch: settings.launch_options_for(tod_store::AgentRole::Default),
+            settings_path: Some(paths.settings_path()),
             context: settings.interview_context.clone(),
         },
         settings.parallel_agent_sessions(),
@@ -498,6 +499,7 @@ mod tests {
             data_root: fixture.store.paths().root().to_path_buf(),
             media: tod_core::media::MediaPaths::discover().expect("media paths"),
             launch: tod_agent::AgentLaunchOptions::for_platform(tod_agent::AgentPlatform::Claude),
+            settings_path: None,
             context: Default::default(),
         };
         check.update(cx, |check, cx| {

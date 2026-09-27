@@ -98,6 +98,14 @@ pub struct TokenUsage {
     pub api_duration_ms: Option<u64>,
     pub lines_added: Option<u64>,
     pub lines_removed: Option<u64>,
+    /// The model that served the session's latest request, as the
+    /// platform's record says (`claude-sonnet-5`): what really answered.
+    pub model: Option<String>,
+    /// The model the agent says the session runs, as it offers it over ACP
+    /// (`sonnet (Sonnet 5)`), when it says.
+    pub agent_model: Option<String>,
+    /// The effort the agent says the session runs, when it says.
+    pub agent_effort: Option<String>,
 }
 
 impl TokenUsage {
@@ -134,6 +142,16 @@ impl TokenUsage {
         self.api_duration_ms = sum(self.api_duration_ms, other.api_duration_ms);
         self.lines_added = sum(self.lines_added, other.lines_added);
         self.lines_removed = sum(self.lines_removed, other.lines_removed);
+        // The later session's, like the context.
+        for (mine, theirs) in [
+            (&mut self.model, &other.model),
+            (&mut self.agent_model, &other.agent_model),
+            (&mut self.agent_effort, &other.agent_effort),
+        ] {
+            if theirs.is_some() {
+                mine.clone_from(theirs);
+            }
+        }
     }
 
     /// Fill in what `live` (reported over ACP while the session ran) knows
@@ -147,6 +165,16 @@ impl TokenUsage {
         self.context_window = self.context_window.or(live.context_window);
         if self.cost.is_none() {
             self.cost = live.cost.clone();
+        }
+        // The live session's own word on what it runs is the newest there is.
+        if live.agent_model.is_some() {
+            self.agent_model.clone_from(&live.agent_model);
+        }
+        if live.agent_effort.is_some() {
+            self.agent_effort.clone_from(&live.agent_effort);
+        }
+        if self.model.is_none() {
+            self.model.clone_from(&live.model);
         }
     }
 }
@@ -247,6 +275,17 @@ impl AcpUsage {
             {
                 self.usage.cost = Some(cost);
             }
+        }
+    }
+
+    /// The model and effort the agent says the session runs, as its config
+    /// options show them; `None` leaves what was said before.
+    pub fn set_config(&mut self, model: Option<String>, effort: Option<String>) {
+        if model.is_some() {
+            self.usage.agent_model = model;
+        }
+        if effort.is_some() {
+            self.usage.agent_effort = effort;
         }
     }
 

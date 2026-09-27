@@ -89,7 +89,7 @@ What a ready sandbox has:
   `bash`, `ps`, `scp`, and `sftp-server`, linked as `/opt/tod/bin/sftp-server`
   wherever the distribution keeps it. Zed uploads extensions with `scp`, which
   speaks SFTP.
-- With `--agents`: Node.js 18+ and `@zed-industries/claude-code-acp`.
+- With `--agents`: Node.js 18+ and `@agentclientprotocol/claude-agent-acp` (formerly `@zed-industries/claude-code-acp`).
 - `/opt/tod/manifest`: hashes of the bootstrap script and the relay, and
   whether agents were asked for. Connecting checks it in one relay round trip
   (0.3 s) and reprovisions only when it differs, for example after a tod

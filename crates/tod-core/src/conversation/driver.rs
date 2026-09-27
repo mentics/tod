@@ -80,7 +80,13 @@ pub const ROTATION_NOTE: &str = "Started a fresh agent session";
 pub struct ConversationConfig {
     pub data_root: PathBuf,
     pub media: MediaPaths,
+    /// What the agent launches with when there is no `settings_path`; the
+    /// focus node's Agent capability still sets what it sets over it.
     pub launch: AgentLaunchOptions,
+    /// The settings file each turn's launch is read from
+    /// ([`crate::conversation::launch`]), so a change there applies to the
+    /// next turn. `None` launches with `launch`.
+    pub settings_path: Option<PathBuf>,
     /// `context_budget_tokens` decides when the session rotates.
     pub context: InterviewContextSettings,
 }
@@ -104,6 +110,9 @@ pub struct ConversationStatus {
     /// session, when the provider reports any. The platform's record says
     /// more (`run_transcript::usage_for_key`).
     pub live_usage: Option<TokenUsage>,
+    /// What the latest turn this driver started launched with: the platform,
+    /// model, and effort asked for. `None` until it starts one.
+    pub launch: Option<AgentLaunchOptions>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -159,6 +168,7 @@ pub struct ConversationDriver {
     permission: Option<PermissionRequest>,
     last_error: Option<String>,
     live_usage: Option<TokenUsage>,
+    launched: Option<AgentLaunchOptions>,
 }
 
 impl ConversationDriver {
@@ -180,6 +190,7 @@ impl ConversationDriver {
             permission: None,
             last_error: None,
             live_usage: None,
+            launched: None,
         }
     }
 
@@ -240,6 +251,18 @@ impl ConversationDriver {
             permission: self.permission.clone(),
             last_error: self.last_error.clone(),
             live_usage: self.live_usage.clone(),
+            launch: self.launched.clone(),
+        }
+    }
+
+    /// What the next turn launches with: the settings for this kind of
+    /// conversation, and the focus node's Agent capability over them. Reads
+    /// the settings file and the store.
+    pub fn launch_options(&self, fleet: &FleetStore) -> AgentLaunchOptions {
+        let kind = self.protocol.kind();
+        match &self.config.settings_path {
+            Some(path) => crate::conversation::launch::resolve_from(fleet, path, self.focus, kind),
+            None => crate::conversation::launch::for_focus(fleet, self.focus, self.config.launch.clone()),
         }
     }
 
@@ -694,7 +717,7 @@ impl ConversationDriver {
             return Ok(id);
         }
         let id = Uuid::new_v4();
-        let launch = &self.config.launch;
+        let launch = &self.launch_options(fleet);
         fleet.interview(
             ACTOR_USER,
             InterviewCommand::CreateConversation {
@@ -865,12 +888,14 @@ impl ConversationDriver {
             + images.len() as i64 * IMAGE_TOKENS;
         self.session_tokens = Some(self.session_tokens.unwrap_or(0) + sent);
         let cold_resume = resume.is_some();
+        let options = self.launch_options(fleet);
+        self.launched = Some(options.clone());
         let turn = SessionTurn {
             key: key.clone(),
             owner_id: id.to_string(),
             title: title.clone(),
             cwd,
-            options: self.config.launch.clone(),
+            options,
             resume_session_id: resume,
             opening,
             message,

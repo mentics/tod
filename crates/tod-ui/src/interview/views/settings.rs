@@ -149,6 +149,7 @@ impl SettingsSection {
                 Agent(AgentRole::Default),
                 Agent(AgentRole::Chat),
                 Agent(AgentRole::Interview),
+                ClaudeAdapter,
                 ChatLaunchMode,
                 MaxParallelSessions,
             ],
@@ -186,6 +187,8 @@ impl SettingsSection {
 enum SettingField {
     /// One line per role: platform, model, effort. `-`/`=` cycle the platform.
     Agent(AgentRole),
+    /// Claude's ACP adapter: what is installed, and installing it for tod.
+    ClaudeAdapter,
     ReplenishThreshold,
     ContextBudget,
     PromptCacheIdle,
@@ -227,6 +230,7 @@ impl SettingField {
             Self::Agent(AgentRole::Default) => "default-agent",
             Self::Agent(AgentRole::Chat) => "chat-agent",
             Self::Agent(AgentRole::Interview) => "interview-agent",
+            Self::ClaudeAdapter => "claude-adapter",
             Self::ReplenishThreshold => "replenish",
             Self::ContextBudget => "context-budget",
             Self::PromptCacheIdle => "prompt-cache-idle",
@@ -401,6 +405,7 @@ pub struct SettingsView {
     _treehouse_executable_subscription: Subscription,
     _relay_code_subscription: Subscription,
     _milestone_states_subscription: Subscription,
+    _claude_adapter_subscription: Subscription,
 }
 
 impl SettingsView {
@@ -552,6 +557,8 @@ impl SettingsView {
                 .placeholder("Comma-separated lifecycle states")
                 .default_value(settings.journeys.milestone_states.join(", "))
         });
+        let claude_adapter = crate::ui::claude_adapter::state(cx);
+        let _claude_adapter_subscription = cx.observe(&claude_adapter, |_, _, cx| cx.notify());
         let _milestone_states_subscription =
             cx.subscribe(&milestone_states_input, |this, input, event, cx| {
                 if matches!(event, InputEvent::Blur | InputEvent::PressEnter { .. }) {
@@ -607,6 +614,7 @@ impl SettingsView {
             _treehouse_executable_subscription,
             _relay_code_subscription,
             _milestone_states_subscription,
+            _claude_adapter_subscription,
         }
     }
 
@@ -1099,7 +1107,8 @@ impl SettingsView {
             }
             SettingField::JourneysRelayCode
             | SettingField::JourneysSendTest
-            | SettingField::JourneysMilestoneStates => {}
+            | SettingField::JourneysMilestoneStates
+            | SettingField::ClaudeAdapter => {}
         }
     }
 
@@ -1131,6 +1140,7 @@ impl SettingsView {
             SettingField::JourneysRelayCode => self.enter_relay_code_edit(window, cx),
             SettingField::JourneysMilestoneStates => self.enter_milestone_states_edit(window, cx),
             SettingField::JourneysSendTest => self.send_journeys_test(cx),
+            SettingField::ClaudeAdapter => self.activate_claude_adapter(cx),
             SettingField::JourneysSend => self.toggle_journeys_send(cx),
             SettingField::JourneysIncludeTranscripts => {
                 self.toggle_journeys_include_transcripts(cx)
@@ -1380,6 +1390,24 @@ impl SettingsView {
             });
         })
         .detach();
+    }
+
+    /// Enter on the Claude adapter row: install it for tod when tod has no
+    /// install of its own, else check again.
+    fn activate_claude_adapter(&mut self, cx: &mut Context<Self>) {
+        let adapter = crate::ui::claude_adapter::state(cx);
+        let (busy, for_tod) = {
+            let adapter = adapter.read(cx);
+            (adapter.busy(), adapter.installed_for_tod())
+        };
+        if busy {
+            return;
+        }
+        if for_tod {
+            crate::ui::claude_adapter::check(cx).detach();
+        } else {
+            crate::ui::claude_adapter::install_for_tod(cx);
+        }
     }
 
     fn handle_escape(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -2077,6 +2105,7 @@ impl SettingsView {
                 for role in AgentRole::ALL {
                     rows = rows.child(agent_role_row(cx, self, role, theme));
                 }
+                rows = rows.child(claude_adapter_row(window, cx, self, theme));
                 rows = rows.child(cycle_row(
                     cx,
                     self,
@@ -2941,6 +2970,136 @@ fn journeys_send_test_row(
                     .child(msg),
             ),
         })
+}
+
+/// Claude's ACP adapter: what is installed, the command that installs or
+/// updates it, and installing it for tod.
+fn claude_adapter_row(
+    window: &mut Window,
+    cx: &mut Context<SettingsView>,
+    view: &SettingsView,
+    theme: &gpui_component::Theme,
+) -> impl IntoElement {
+    use crate::ui::claude_adapter::{self, Severity};
+    let field = SettingField::ClaudeAdapter;
+    let selected = view.field_selected(field);
+    let adapter = claude_adapter::state(cx);
+    let (summary, busy, installing, for_tod, error) = {
+        let adapter = adapter.read(cx);
+        (
+            adapter.summary(),
+            adapter.busy(),
+            adapter.installing(),
+            adapter.installed_for_tod(),
+            adapter.error().map(str::to_string),
+        )
+    };
+    let (text, command, color) = match &summary {
+        Some(summary) => (
+            summary.text.clone(),
+            summary.command.clone(),
+            match summary.severity {
+                Severity::Fine => theme.muted_foreground,
+                Severity::Warning => style::color::callout_warning_text(),
+                Severity::Error => theme.danger,
+            },
+        ),
+        None => ("Checking…".into(), None, theme.muted_foreground),
+    };
+    let button_label = match (installing, for_tod, busy) {
+        (true, _, _) => "Installing…",
+        (false, true, true) => "Checking…",
+        (false, true, false) => "Check again",
+        (false, false, _) => "Install for tod only",
+    };
+    let copy_command = command.clone();
+
+    h_flex()
+        .w_full()
+        .gap_4()
+        .px_3()
+        .py_3()
+        .rounded_md()
+        .items_start()
+        .when(selected, |el| {
+            el.bg(theme.list_active)
+                .border_1()
+                .border_color(theme.list_active_border)
+        })
+        .on_mouse_down(
+            gpui::MouseButton::Left,
+            cx.listener(select_field_listener(field)),
+        )
+        .child(
+            v_flex()
+                .flex_1()
+                .min_w_0()
+                .gap_1()
+                .child(
+                    div()
+                        .text_sm()
+                        .font_semibold()
+                        .text_color(theme.foreground)
+                        .child("Claude ACP adapter"),
+                )
+                .child(
+                    div().text_sm().whitespace_normal().text_color(color).child(
+                        crate::ui::selectable_text::selectable_text(
+                            "settings-claude-adapter-status",
+                            text,
+                            window,
+                            cx,
+                        ),
+                    ),
+                )
+                .when_some(command, |el, command| {
+                    el.child(
+                        div()
+                            .text_sm()
+                            .font_family("monospace")
+                            .text_color(theme.foreground)
+                            .child(crate::ui::selectable_text::selectable_text(
+                                "settings-claude-adapter-command",
+                                command,
+                                window,
+                                cx,
+                            )),
+                    )
+                })
+                .when_some(error, |el, error| {
+                    el.child(
+                        div().text_sm().whitespace_normal().text_color(theme.danger).child(
+                            crate::ui::selectable_text::selectable_text(
+                                "settings-claude-adapter-error",
+                                error,
+                                window,
+                                cx,
+                            ),
+                        ),
+                    )
+                }),
+        )
+        .when_some(copy_command, |el, command| {
+            el.child(
+                Button::new("settings-claude-adapter-copy")
+                    .label("Copy command")
+                    .tab_stop(false)
+                    .on_click(cx.listener(move |_, _, _, cx| {
+                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(command.to_string()));
+                    })),
+            )
+        })
+        .child(
+            Button::new("settings-claude-adapter-button")
+                .label(button_label)
+                .disabled(busy)
+                .tab_stop(false)
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.focus_region = SettingsFocus::Panel;
+                    this.focus_handle.focus(window, cx);
+                    this.activate_claude_adapter(cx);
+                })),
+        )
 }
 
 fn read_only_row(

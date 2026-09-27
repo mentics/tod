@@ -1898,6 +1898,12 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
     } else {
         AgentBackend::from_platform(app_settings.agent_platform)
     };
+    tod_agent::claude_adapter::set_local_dir(tod_store::install::claude_adapter_dir());
+    // Whether a missing or outdated Claude adapter is worth saying at start.
+    let uses_claude = !matches!(agent_backend, AgentBackend::Mock)
+        && tod_store::AgentRole::ALL
+            .iter()
+            .any(|role| app_settings.platform_for(*role) == AgentPlatform::Claude);
     let agent: SharedAgent = agent_backend.create(traffic_log.clone());
 
     let fleet_open = open_fleet_store(traffic_log.clone());
@@ -2568,6 +2574,28 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                         break;
                                     }
                                 }
+                            })
+                            .detach();
+                            // Claude's adapter: tod's own install is brought up
+                            // to date; a missing one, or an outdated global one,
+                            // is said at once when Claude is in use.
+                            let adapter_entity = cx.weak_entity();
+                            cx.spawn(async move |_, cx| {
+                                cx.update(crate::ui::claude_adapter::check).await;
+                                if !uses_claude {
+                                    return;
+                                }
+                                let _ = adapter_entity.update(cx, |shell, cx| {
+                                    let adapter = crate::ui::claude_adapter::state(cx);
+                                    let message = adapter.read(cx).startup_message();
+                                    match message {
+                                        Some((crate::ui::claude_adapter::Severity::Error, text)) => {
+                                            shell.queue_error_toast(text, cx)
+                                        }
+                                        Some((_, text)) => shell.queue_warning_toast(text, cx),
+                                        None => {}
+                                    }
+                                });
                             })
                             .detach();
                             #[cfg(feature = "agent-socket")]

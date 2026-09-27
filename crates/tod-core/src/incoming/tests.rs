@@ -131,6 +131,7 @@ fn config(fx: &Fixture) -> ConversationConfig {
         )
         .unwrap(),
         launch: AgentLaunchOptions::for_platform(AgentPlatform::Claude),
+        settings_path: None,
         context: InterviewContextSettings::default(),
     }
 }
