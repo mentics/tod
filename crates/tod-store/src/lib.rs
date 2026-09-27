@@ -20,6 +20,7 @@ pub mod outline;
 pub mod path_util;
 pub mod paths;
 pub mod request_feedback;
+pub mod sandbox_http;
 pub mod review;
 pub mod settings;
 pub mod sync;

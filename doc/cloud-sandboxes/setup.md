@@ -37,7 +37,9 @@ skips all of this.
 Everything that runs inside a sandbox (`tod-relay`, `tod-supervisor`,
 `tod-orchestrator`, the Linux `tod-cli`, and `tod-watchdog`) is a static
 Linux binary for `x86_64-unknown-linux-musl`, built from whatever OS you
-develop on, into `target/sandbox/`. Provisioning looks there first
+develop on, into `target/sandbox/`. A node's sandbox gets the Linux
+`tod-cli` too: `tod-cli pr` and `secrets` run there, not on the
+orchestrator, so rebuild after changing either. Provisioning looks there first
 (`relay_path()` in `crates/tod-store/src/fleet/sandbox.rs`, and
 `tod-sandbox orchestrator`).
 

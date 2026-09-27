@@ -338,17 +338,18 @@ fn findings_answered_outcome(conn: &Connection, node_id: Uuid) -> Result<Derived
     )))
 }
 
-/// Resolve the GitHub token the same way `tod-cli pr` does — OS keyring or
-/// encrypted file first, `GITHUB_TOKEN` env var as a fallback
-/// (`CredentialStore::get`) — using the data root the open `Connection`
-/// itself lives under (`tod.db` sits directly at the data root, same as
-/// `FleetPaths::db()`), since `evaluate_derived_criterion` only has a
-/// `Connection` in scope, not a `CredentialStore`.
-fn resolve_github_token(conn: &Connection) -> Option<String> {
+/// A GitHub client authenticated the same way `tod-cli pr` is
+/// (`resolve_github_auth`: the sandbox's proxy in an autonomous node's
+/// sandbox, else the OS keyring, the encrypted file, or `GITHUB_TOKEN`),
+/// using the data root the open `Connection` itself lives under (`tod.db`
+/// sits directly at the data root, same as `FleetPaths::db()`), since
+/// `evaluate_derived_criterion` only has a `Connection` in scope, not a
+/// `CredentialStore`.
+fn github_client(conn: &Connection) -> Option<tod_store::github::Github> {
     let db_path = conn.path()?;
     let data_root = std::path::Path::new(db_path).parent()?;
     let store = tod_store::credentials::CredentialStore::from_data_root(data_root);
-    tod_store::credentials::resolve_github_token(&store)
+    tod_store::credentials::resolve_github_auth(&store).map(tod_store::github::Github::new)
 }
 
 /// The PR is mergeable: GitHub's own `mergeable_state` is `"clean"` —
@@ -362,12 +363,12 @@ fn pr_mergeable_outcome(conn: &Connection, node_id: Uuid) -> Result<DerivedOutco
             "No pull request has been opened yet — `tod-cli pr open` from the `pr` state.",
         ));
     };
-    let Some(token) = resolve_github_token(conn) else {
+    let Some(github) = github_client(conn) else {
         return Ok(fail(
             "No GitHub token configured — see `tod-cli secrets` — cannot check PR status.",
         ));
     };
-    let status = match tod_store::github::get_pr_status(&token, &pr.owner, &pr.repo, pr.pr_number) {
+    let status = match github.get_pr_status(&pr.owner, &pr.repo, pr.pr_number) {
         Ok(status) => status,
         Err(err) => return Ok(fail(format!("Could not read PR status: {err}"))),
     };
@@ -395,12 +396,12 @@ fn pr_merged_outcome(conn: &Connection, node_id: Uuid) -> Result<DerivedOutcome>
     let Some(pr) = NodePrRepo::new(conn).get(node_id)? else {
         return Ok(fail("No pull request on record for this node."));
     };
-    let Some(token) = resolve_github_token(conn) else {
+    let Some(github) = github_client(conn) else {
         return Ok(fail(
             "No GitHub token configured — see `tod-cli secrets` — cannot check PR status.",
         ));
     };
-    let status = match tod_store::github::get_pr_status(&token, &pr.owner, &pr.repo, pr.pr_number) {
+    let status = match github.get_pr_status(&pr.owner, &pr.repo, pr.pr_number) {
         Ok(status) => status,
         Err(err) => return Ok(fail(format!("Could not read PR status: {err}"))),
     };
