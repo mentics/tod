@@ -9,7 +9,7 @@
 //! this machine by `tod-sandbox agent`, and their `tod-cli` comes back
 //! through the relay's tunnel to [`crate::fleet::cli_relay`].
 
-use crate::credentials::{CredentialKind, CredentialStore};
+use crate::credentials::{CredentialBackend, CredentialKind, CredentialStore};
 use anyhow::{Context, Result, anyhow, bail};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -392,6 +392,32 @@ pub fn sign_in_mode(root: &Path) -> AuthMode {
 /// prompt: never on the UI thread.
 pub fn has_api_key(root: &Path) -> bool {
     CredentialStore::from_data_root(root).get(CredentialKind::BlaxelApiKey).is_some()
+}
+
+/// Where the Claude subscription token for autonomous nodes' sandboxes is
+/// kept, if anywhere. Reads the OS keyring, which can prompt: never on the
+/// UI thread.
+pub fn claude_token_backend(root: &Path) -> Option<CredentialBackend> {
+    CredentialStore::from_data_root(root).backend(CredentialKind::ClaudeOauthToken)
+}
+
+/// Store the Claude subscription token (from `claude setup-token`), as a kind
+/// agents cannot read. Touches the keyring: never on the UI thread.
+pub fn set_claude_token(root: &Path, token: &str) -> Result<CredentialBackend> {
+    CredentialStore::from_data_root(root)
+        .set(CredentialKind::ClaudeOauthToken, token)
+        .map_err(|e| anyhow!("could not store the token: {e}"))
+}
+
+/// Forget the stored Claude subscription token. Returns where one is still
+/// found (the environment tod was started from, which it cannot clear).
+/// Touches the keyring: never on the UI thread.
+pub fn clear_claude_token(root: &Path) -> Result<Option<CredentialBackend>> {
+    let store = CredentialStore::from_data_root(root);
+    store
+        .delete(CredentialKind::ClaudeOauthToken)
+        .map_err(|e| anyhow!("could not remove the token: {e}"))?;
+    Ok(store.backend(CredentialKind::ClaudeOauthToken))
 }
 
 /// Sign in with `auth` from now on, storing `api_key` when one is given (in

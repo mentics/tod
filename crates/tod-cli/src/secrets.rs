@@ -130,6 +130,9 @@ fn how_to_set(kind: CredentialKind) -> &'static str {
         }
         // Not in `CredentialKind::ALL`, so `from_name` never yields it here.
         CredentialKind::BlaxelApiKey => "only `tod-sandbox setup` stores it; agents cannot use it",
+        CredentialKind::ClaudeOauthToken => {
+            "only the app stores it (Settings → Cloud sandboxes → Claude subscription); agents cannot use it"
+        }
     }
 }
 

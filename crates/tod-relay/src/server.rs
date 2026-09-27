@@ -51,9 +51,41 @@ struct Relay {
     /// The pid of a supervisor this relay started, while it is still
     /// running. `None` both before one has been started and once it exits.
     supervisor: Mutex<Option<u32>>,
+    /// What only the supervisor is given: [`take_supervisor_env`].
+    supervisor_env: Vec<(String, String)>,
+}
+
+/// The relay's own environment variables under this prefix are for the
+/// supervisor alone (`tod_sandbox::node::RELAY_SUPERVISOR_ENV_PREFIX`): e.g.
+/// `TOD_SUPERVISOR_ENV_CLAUDE_CODE_OAUTH_TOKEN` becomes the supervisor's
+/// `CLAUDE_CODE_OAUTH_TOKEN`.
+pub const SUPERVISOR_ENV_PREFIX: &str = "TOD_SUPERVISOR_ENV_";
+
+/// Takes every `TOD_SUPERVISOR_ENV_<NAME>` out of this process's environment,
+/// as `(<NAME>, value)`, so no shell or agent the relay starts inherits it;
+/// only [`poke`] hands them on, to the supervisor. Call before any thread
+/// starts: removing environment variables is only sound then.
+fn take_supervisor_env() -> Vec<(String, String)> {
+    let taken = supervisor_env_from(std::env::vars());
+    for (name, _) in &taken {
+        // SAFETY: called first thing in `main`, before the runtime or any
+        // other thread exists.
+        unsafe { std::env::remove_var(format!("{SUPERVISOR_ENV_PREFIX}{name}")) };
+    }
+    taken
+}
+
+/// The supervisor's variables among `vars`, prefix removed.
+fn supervisor_env_from(vars: impl Iterator<Item = (String, String)>) -> Vec<(String, String)> {
+    vars.filter_map(|(key, value)| {
+        let name = key.strip_prefix(SUPERVISOR_ENV_PREFIX)?;
+        (!name.is_empty()).then(|| (name.to_string(), value))
+    })
+    .collect()
 }
 
 pub fn main(args: &[String]) {
+    let supervisor_env = take_supervisor_env();
     let mut port = 2222u16;
     let mut max_hold = 4 * 3600u64;
     let mut tunnel_port = crate::tunnel::DEFAULT_PORT;
@@ -79,6 +111,7 @@ pub fn main(args: &[String]) {
         home: home_dir(),
         supervisor_cmd,
         supervisor: Mutex::new(None),
+        supervisor_env,
     });
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
     rt.block_on(async move {
@@ -279,6 +312,7 @@ fn poke(relay: &Arc<Relay>) {
     // leave the supervisor running untracked.
     cmd.arg("-c").arg(format!("exec {}", relay.supervisor_cmd));
     cmd.env("HOME", &relay.home);
+    cmd.envs(relay.supervisor_env.iter().map(|(k, v)| (k, v)));
     match cmd.spawn() {
         Ok(mut child) => {
             let pid = child.id().unwrap_or(0);
@@ -932,4 +966,25 @@ fn spawn_agent(relay: &Arc<Relay>, name: &str, req: &AgentReq) -> std::io::Resul
         }
     });
     Ok(agent)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn supervisor_env_is_the_prefixed_variables_without_the_prefix() {
+        let vars = [
+            ("PATH", "/usr/bin"),
+            ("TOD_SUPERVISOR_ENV_CLAUDE_CODE_OAUTH_TOKEN", "tok"),
+            ("TOD_SUPERVISOR_ENV_", "ignored"),
+            ("TOD_SUPERVISOR_AGENT", "mock"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()));
+        assert_eq!(
+            supervisor_env_from(vars),
+            [("CLAUDE_CODE_OAUTH_TOKEN".to_string(), "tok".to_string())]
+        );
+    }
 }

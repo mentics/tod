@@ -22,6 +22,10 @@ pub enum CredentialKind {
     /// Creates and deletes cloud sandboxes (`tod-sandbox`). Deliberately not in
     /// [`CredentialKind::ALL`], so no agent can read it through `tod-cli secrets`.
     BlaxelApiKey,
+    /// The user's Claude subscription token (`claude setup-token`), for the
+    /// Claude Code agents in autonomous nodes' cloud sandboxes. Not in
+    /// [`CredentialKind::ALL`]: no agent reads it through `tod-cli secrets`.
+    ClaudeOauthToken,
 }
 
 impl CredentialKind {
@@ -42,6 +46,7 @@ impl CredentialKind {
             Self::LinearApiKey => "Linear API key",
             Self::GithubToken => "GitHub token",
             Self::BlaxelApiKey => "Blaxel API key",
+            Self::ClaudeOauthToken => "Claude subscription token",
         }
     }
 
@@ -50,6 +55,7 @@ impl CredentialKind {
             Self::LinearApiKey => "linear_api_key",
             Self::GithubToken => "github_token",
             Self::BlaxelApiKey => "blaxel_api_key",
+            Self::ClaudeOauthToken => "claude_oauth_token",
         }
     }
 
@@ -58,6 +64,7 @@ impl CredentialKind {
             Self::LinearApiKey => "linear_api_key.enc",
             Self::GithubToken => "github_token.enc",
             Self::BlaxelApiKey => "blaxel_api_key.enc",
+            Self::ClaudeOauthToken => "claude_oauth_token.enc",
         }
     }
 
@@ -66,6 +73,8 @@ impl CredentialKind {
             Self::LinearApiKey => Some("LINEAR_API_KEY"),
             Self::GithubToken => Some("GITHUB_TOKEN"),
             Self::BlaxelApiKey => Some("BL_API_KEY"),
+            // What Claude Code itself reads.
+            Self::ClaudeOauthToken => Some("CLAUDE_CODE_OAUTH_TOKEN"),
         }
     }
 }

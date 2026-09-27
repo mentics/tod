@@ -50,6 +50,7 @@ use crate::interview::agent::SharedAgent;
 use crate::ui::agent_chat::OpenAgentChat;
 use crate::ui::agent_runs::AgentRuns;
 use crate::ui::app_nav::{AppNavToggle, HasAppNav};
+use crate::ui::code_links::{OpenCodeRef, open_code_ref};
 use crate::ui::key_context;
 use crate::ui::pane_nav::{PaneFocusLeft, PaneFocusRight, bind_pane_nav};
 use crate::ui::style;
@@ -1053,6 +1054,12 @@ impl Render for UnifiedView {
             .track_focus(&self.focus_handle)
             .capture_action(cx.listener(Self::on_open_agent_chat))
             .on_action(cx.listener(Self::toggle_app_nav))
+            .on_action(cx.listener(|this, action: &OpenCodeRef, window, cx| {
+                // The chat drawer follows the focused column's node, else
+                // the tree selection: what the clicked text is about.
+                let node = this.chat_drawer.read(cx).focus().node_id();
+                open_code_ref(this.fleet.clone(), node, &action.target, window, cx);
+            }))
             .on_action(cx.listener(Self::toggle_pin_focused))
             .on_action(cx.listener(Self::next_waiting))
             .on_action(cx.listener(Self::prev_waiting))

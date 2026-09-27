@@ -211,15 +211,22 @@ fn container_for_host(dest: &str) -> Option<&str> {
 /// (`tod_agent::devcontainer::prepare_sshd`). Host keys are not checked:
 /// the connection never leaves this machine, and a rebuilt container gets
 /// new ones.
+///
+/// On Windows the real `ssh` may be Git's MSYS build, whose shell rewrites
+/// an absolute path in the ProxyCommand (`/usr/sbin/sshd` becomes a path
+/// under Git's install) and the connection closes at once. A leading `//`
+/// is left alone, and Linux reads it as `/`. Known hosts go to `/dev/null`,
+/// which both Windows' OpenSSH and MSYS read as the null device; MSYS takes
+/// `NUL` for a file of that name in the working directory.
 fn container_ssh_options(container: &str, key: &Path) -> Vec<String> {
-    let null = if cfg!(windows) { "NUL" } else { "/dev/null" };
+    let sshd = if cfg!(windows) { "//usr/sbin/sshd" } else { "/usr/sbin/sshd" };
     [
-        format!("ProxyCommand=docker exec -i -u root {container} /usr/sbin/sshd -i"),
+        format!("ProxyCommand=docker exec -i -u root {container} {sshd} -i"),
         "IdentitiesOnly=yes".to_string(),
         "PreferredAuthentications=publickey".to_string(),
         "BatchMode=yes".to_string(),
         "StrictHostKeyChecking=no".to_string(),
-        format!("UserKnownHostsFile={null}"),
+        "UserKnownHostsFile=/dev/null".to_string(),
         "LogLevel=ERROR".to_string(),
     ]
     .into_iter()
@@ -555,7 +562,8 @@ mod tests {
     fn container_options_proxy_through_sshd() {
         let opts = container_ssh_options("my-dev", Path::new("/data/zed-shim/docker_ed25519"));
         assert!(opts.chunks(2).all(|pair| pair[0] == "-o" || pair[0] == "-i"));
-        assert!(opts.contains(&"ProxyCommand=docker exec -i -u root my-dev /usr/sbin/sshd -i".to_string()));
+        let sshd = if cfg!(windows) { "//usr/sbin/sshd" } else { "/usr/sbin/sshd" };
+        assert!(opts.contains(&format!("ProxyCommand=docker exec -i -u root my-dev {sshd} -i")));
         assert!(opts.ends_with(&["-i".to_string(), "/data/zed-shim/docker_ed25519".to_string()]));
     }
 

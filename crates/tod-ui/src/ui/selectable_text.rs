@@ -6,6 +6,9 @@
 //! Copying is gpui-component's: a drag-selection focuses the text view, whose
 //! own Ctrl/Cmd+C binding copies it. The right-click menu added here copies the
 //! same window-wide selection.
+//!
+//! Code references (`src/foo.rs:42`) in the text are links; see
+//! [`code_links`](super::code_links).
 
 use gpui::{
     App, ClipboardItem, Div, ElementId, InteractiveElement, ParentElement, SharedString, Stateful,
@@ -15,6 +18,8 @@ use gpui_base::TextSelection;
 use gpui_component::ActiveTheme;
 use gpui_component::menu::{ContextMenu, ContextMenuExt, PopupMenuItem};
 use gpui_component::text::{TextView, TextViewStyle};
+
+use super::code_links::{linkify_html_line, linkify_markdown, on_link_click};
 
 /// A selectable text view with a right-click Copy menu.
 pub type SelectableText = ContextMenu<Stateful<Div>>;
@@ -32,7 +37,7 @@ fn escape_html(text: &str) -> String {
 /// drops the line break instead of making one — every newline in the source
 /// would collapse and the text would run together. One paragraph per line is
 /// the only structure the renderer honours. Blank lines carry a non-breaking
-/// space so they keep their height.
+/// space so they keep their height. Code references become links.
 fn plain_text_html(text: &str) -> SharedString {
     let mut body = String::new();
     for line in text.split('\n') {
@@ -41,7 +46,7 @@ fn plain_text_html(text: &str) -> SharedString {
             body.push_str("<p>&nbsp;</p>");
         } else {
             body.push_str("<p>");
-            body.push_str(&escape_html(line));
+            body.push_str(&linkify_html_line(line, escape_html));
             body.push_str("</p>");
         }
     }
@@ -106,6 +111,7 @@ pub fn selectable_text_with_menu(
     let id = id.into();
     let text = text.into();
     let view = TextView::html(id.clone(), plain_text_html(&text))
+        .on_link_click(on_link_click)
         .selectable(true)
         .style(TextViewStyle::default().paragraph_gap(rems(0.)));
     with_copy_menu(id, view, own_menu)
@@ -119,7 +125,8 @@ pub fn selectable_markdown(
     cx: &mut App,
 ) -> SelectableText {
     let id = id.into();
-    let view = TextView::markdown(id.clone(), markdown)
+    let view = TextView::markdown(id.clone(), linkify_markdown(&markdown.into()))
+        .on_link_click(on_link_click)
         .style(
             TextViewStyle::default()
                 .paragraph_gap(rems(0.5))

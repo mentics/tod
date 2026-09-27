@@ -36,7 +36,10 @@ mod test_util;
 #[cfg(test)]
 mod tests;
 
-pub use code_editor::{CodeEditor, code_editor, code_editors, open_code_editor_for_node};
+pub use code_editor::{
+    CodeEditor, CodeLocation, code_editor, code_editors, find_code_refs, open_code_editor_for_node,
+    open_code_location,
+};
 pub use command_log::{CommandEntry, CommandLog};
 pub use launch::FleetLaunchError;
 pub use migration::{FleetMigrationError, HeldWritesApplyResult, MigrationMode};
@@ -59,7 +62,7 @@ pub use runtime::{GuestLivenessCheck, NoopGuestLiveness};
 pub use store::FleetStore;
 pub use terminal::{
     default_terminal_hint, focus_shell_session, focus_terminal_agent_run, launch_shell_terminal,
-    open_shell_for_node, open_terminal_agent_for_node, open_terminal_command,
+    open_host_terminal_command, open_shell_for_node, open_terminal_agent_for_node, open_terminal_command,
     prune_stale_shell_sessions,
     prune_stale_terminal_agent_runs, read_shell_state, remove_shell_state, shells_dir,
     state_file_path, verify_shell_session,

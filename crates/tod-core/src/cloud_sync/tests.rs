@@ -11,6 +11,17 @@ fn user_names_are_what_the_orchestrator_accepts() {
 }
 
 #[test]
+fn a_claude_node_without_a_token_fails_before_anything_is_created() {
+    let err = require_claude_token(None, None).unwrap_err().to_string();
+    assert!(err.contains("Settings → Cloud sandboxes → Claude subscription"), "{err}");
+    assert!(require_claude_token(Some("claude"), Some("  ".into())).is_err());
+    // The mock needs none, but still gets one that is there.
+    assert_eq!(require_claude_token(Some("mock"), None).unwrap(), None);
+    assert_eq!(require_claude_token(Some("mock"), Some("t".into())).unwrap().as_deref(), Some("t"));
+    assert_eq!(require_claude_token(None, Some(" t ".into())).unwrap().as_deref(), Some("t"));
+}
+
+#[test]
 fn node_sandbox_names() {
     assert_eq!(node_sandbox_name("fix-login"), "node-fix-login");
     assert_eq!(node_sandbox_name("A_B c"), "node-a-b-c");
