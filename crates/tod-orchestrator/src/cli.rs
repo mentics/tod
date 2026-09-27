@@ -16,8 +16,14 @@ use tod_store::fleet::cli_relay::{self, RelayReply, RelayRequest};
 pub fn parse(mut body: &[u8]) -> Result<RelayRequest> {
     let mut request = cli_relay::decode_request(&mut body, None)?;
     // The data root is the user's, whatever the sandbox says, and only the
-    // orchestrator files stop questions (`tod_core::stop_questions`).
-    request.env.retain(|(k, _)| k != "TOD_DATA_ROOT" && k != tod_core::stop_questions::KIND_ENV);
+    // orchestrator files stop questions (`tod_core::stop_questions`). GitHub
+    // is authenticated by the sandbox's proxy, not this one's, so its flag
+    // stays behind (the shim runs `pr` in the sandbox).
+    request.env.retain(|(k, _)| {
+        k != "TOD_DATA_ROOT"
+            && k != tod_core::stop_questions::KIND_ENV
+            && k != tod_store::github::GITHUB_AUTH_ENV
+    });
     Ok(request)
 }
 
@@ -93,7 +99,7 @@ mod tests {
 
     #[test]
     fn parses_a_relay_frame_and_drops_foreign_variables() {
-        let body = b"tod-cli-relay 1\n\n3\nTOD_A=1\0PATH=/bin\0TOD_DATA_ROOT=/y\0\x32\nnode\0list\0\x33\nabc";
+        let body = b"tod-cli-relay 1\n\n4\nTOD_A=1\0PATH=/bin\0TOD_DATA_ROOT=/y\0TOD_GITHUB_AUTH=proxy\0\x32\nnode\0list\0\x33\nabc";
         let r = parse(body).unwrap();
         assert_eq!(r.env, [("TOD_A".to_string(), "1".to_string())]);
         assert_eq!(r.args, ["node", "list"]);

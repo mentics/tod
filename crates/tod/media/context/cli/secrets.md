@@ -23,6 +23,10 @@ For example, a script that calls Linear's API reads its key from
 tod-cli --data-root <DATA_ROOT> secrets run --env LINEAR_API_KEY=linear_api_key -- python scripts/fetch_schema.py
 ```
 
+In an autonomous node's cloud sandbox, `github_token` shows as set by the
+sandbox's proxy: `run` gives the command a placeholder, which the proxy
+replaces with the real token on every request to GitHub.
+
 Write the command to read the variable itself and never print it, write it to
 a file, or pass it on as an argument. If the secret you need is not set, or is
 not a kind tod stores, `run` fails with what the user has to do; that is

@@ -58,44 +58,217 @@ pub struct PrComment {
     pub author: Option<String>,
 }
 
-fn auth_header(token: &str) -> String {
-    format!("Bearer {token}")
+/// How requests to GitHub are authenticated.
+#[derive(Clone, PartialEq, Eq)]
+pub enum GithubAuth {
+    /// The user's token, sent as `Authorization: Bearer`.
+    Token(String),
+    /// None of our own: in an autonomous node's sandbox the proxy adds the
+    /// user's token to every request for `api.github.com`, and the token is
+    /// never in the sandbox. Requests go through `HTTPS_PROXY`, trusting its
+    /// CA (`crate::sandbox_http`). Chosen by [`GITHUB_AUTH_ENV`].
+    Proxy,
 }
 
-fn request_error(err: ureq::Error) -> GithubError {
-    GithubError::Http(err.to_string())
-}
-
-/// Find an already-open pull request from `head` into `owner/repo`, if any.
-/// `create_pr` checks this first — GitHub itself is the source of truth for
-/// whether one exists, not just the local `node_pr` record, so a lost local
-/// record (e.g. the DB write after creation failed) can't lead to a
-/// duplicate PR on retry.
-pub fn find_open_pr(
-    token: &str,
-    owner: &str,
-    repo: &str,
-    head: &str,
-) -> Result<Option<PullRequest>, GithubError> {
-    let url = format!("{GITHUB_API_URL}/repos/{owner}/{repo}/pulls?head={owner}:{head}&state=open");
-    let mut response = ureq::get(&url)
-        .header("Authorization", &auth_header(token))
-        .header("Accept", "application/vnd.github+json")
-        .header("User-Agent", "tod")
-        .call()
-        .map_err(request_error)?;
-    let status = response.status();
-    if status.as_u16() >= 400 {
-        return Err(api_error(status.as_u16(), &mut response));
+impl std::fmt::Debug for GithubAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Token(_) => f.write_str("Token(<set>)"),
+            Self::Proxy => f.write_str("Proxy"),
+        }
     }
-    let raw: Vec<PrRaw> = response
+}
+
+/// Set to [`GITHUB_AUTH_PROXY`] in an autonomous node's sandbox, whose proxy
+/// injects the user's GitHub token (`tod_sandbox::node::node_env`).
+pub use tod_sandbox::node::{GITHUB_AUTH_ENV, GITHUB_AUTH_PROXY};
+
+/// Whether this process runs where the proxy authenticates GitHub
+/// ([`GITHUB_AUTH_ENV`]).
+pub fn proxy_authenticated() -> bool {
+    std::env::var(GITHUB_AUTH_ENV).is_ok_and(|v| v.trim().eq_ignore_ascii_case(GITHUB_AUTH_PROXY))
+}
+
+const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// A GitHub REST client.
+pub struct Github {
+    auth: GithubAuth,
+    agent: ureq::Agent,
+    api: String,
+}
+
+impl Github {
+    pub fn new(auth: GithubAuth) -> Self {
+        let agent = match auth {
+            GithubAuth::Token(_) => ureq::Agent::config_builder()
+                .http_status_as_error(false)
+                .timeout_global(Some(TIMEOUT))
+                .build()
+                .into(),
+            GithubAuth::Proxy => crate::sandbox_http::sandbox_agent(TIMEOUT),
+        };
+        Self::with_agent(auth, agent, GITHUB_API_URL)
+    }
+
+    /// With the agent and API base URL given.
+    pub fn with_agent(auth: GithubAuth, agent: ureq::Agent, api: &str) -> Self {
+        Self { auth, agent, api: api.trim_end_matches('/').to_string() }
+    }
+
+    pub fn auth(&self) -> &GithubAuth {
+        &self.auth
+    }
+
+    fn authorize<B>(&self, req: ureq::RequestBuilder<B>) -> ureq::RequestBuilder<B> {
+        let req = req.header("Accept", "application/vnd.github+json").header("User-Agent", "tod");
+        match &self.auth {
+            GithubAuth::Token(token) => req.header("Authorization", &format!("Bearer {token}")),
+            GithubAuth::Proxy => req,
+        }
+    }
+
+    /// `GET <api><path>`, as JSON.
+    fn get_json<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<T, GithubError> {
+        let response = self.authorize(self.agent.get(&format!("{}{path}", self.api))).call();
+        read_json(response)
+    }
+
+    /// `POST <api><path>` with a JSON body, the reply as JSON.
+    fn post_json<T: serde::de::DeserializeOwned>(&self, path: &str, body: serde_json::Value) -> Result<T, GithubError> {
+        let response = self.authorize(self.agent.post(&format!("{}{path}", self.api))).send_json(body);
+        read_json(response)
+    }
+
+    /// The signed-in user's login: whether authentication works at all.
+    pub fn user_login(&self) -> Result<String, GithubError> {
+        Ok(self.get_json::<UserRaw>("/user")?.login)
+    }
+
+    /// Find an already-open pull request from `head` into `owner/repo`, if any.
+    /// `create_pr` checks this first — GitHub itself is the source of truth for
+    /// whether one exists, not just the local `node_pr` record, so a lost local
+    /// record (e.g. the DB write after creation failed) can't lead to a
+    /// duplicate PR on retry.
+    pub fn find_open_pr(&self, owner: &str, repo: &str, head: &str) -> Result<Option<PullRequest>, GithubError> {
+        let raw: Vec<PrRaw> = self.get_json(&format!(
+            "/repos/{owner}/{repo}/pulls?head={}&state=open",
+            query_encode(&format!("{owner}:{head}"))
+        ))?;
+        Ok(raw.into_iter().next().map(|pr| PullRequest { number: pr.number, url: pr.html_url }))
+    }
+
+    /// Every pull request, in any state, from `branch` of `repo` itself (not a
+    /// fork) into it, most recently updated first.
+    pub fn list_branch_prs(&self, repo: &GithubRepo, branch: &str) -> Result<Vec<PullSummary>, GithubError> {
+        let raw: Vec<PullListRaw> = self.get_json(&format!(
+            "/repos/{}/{}/pulls?head={}&state=all&sort=updated&direction=desc&per_page=50",
+            repo.owner,
+            repo.repo,
+            query_encode(&format!("{}:{branch}", repo.owner)),
+        ))?;
+        Ok(raw.into_iter().map(PullListRaw::into_summary).collect())
+    }
+
+    /// Every open pull request in `repo`, whichever branch it is from, most
+    /// recently updated first (the first 100).
+    pub fn list_open_prs(&self, repo: &GithubRepo) -> Result<Vec<PullSummary>, GithubError> {
+        let raw: Vec<PullListRaw> = self.get_json(&format!(
+            "/repos/{}/{}/pulls?state=open&sort=updated&direction=desc&per_page=100",
+            repo.owner, repo.repo,
+        ))?;
+        Ok(raw.into_iter().map(PullListRaw::into_summary).collect())
+    }
+
+    /// One pull request by number, as [`Github::list_branch_prs`] lists it.
+    pub fn get_pull(&self, repo: &GithubRepo, number: i64) -> Result<PullSummary, GithubError> {
+        let raw: PullListRaw = self.get_json(&format!("/repos/{}/{}/pulls/{number}", repo.owner, repo.repo))?;
+        Ok(raw.into_summary())
+    }
+
+    /// Open a pull request `head` -> `base` in `owner/repo`. Callers should
+    /// check [`Github::find_open_pr`] first — this always creates a new one.
+    pub fn create_pr(
+        &self,
+        owner: &str,
+        repo: &str,
+        head: &str,
+        base: &str,
+        title: &str,
+        body: &str,
+    ) -> Result<PullRequest, GithubError> {
+        let payload = serde_json::json!({ "title": title, "head": head, "base": base, "body": body });
+        let raw: PrRaw = self.post_json(&format!("/repos/{owner}/{repo}/pulls"), payload)?;
+        Ok(PullRequest { number: raw.number, url: raw.html_url })
+    }
+
+    /// Fetch a pull request's live status: mergeable flag, mergeable state,
+    /// combined check conclusion, and whether it has been merged.
+    pub fn get_pr_status(&self, owner: &str, repo: &str, number: i64) -> Result<PrStatus, GithubError> {
+        let raw: PrDetailRaw = self.get_json(&format!("/repos/{owner}/{repo}/pulls/{number}"))?;
+        let checks = match &raw.head {
+            Some(head) => self
+                .get_json::<CombinedStatusRaw>(&format!("/repos/{owner}/{repo}/commits/{}/status", head.sha))
+                .ok()
+                .map(|s| s.state),
+            None => None,
+        };
+        Ok(PrStatus {
+            mergeable: raw.mergeable,
+            mergeable_state: raw.mergeable_state,
+            merged: raw.merged.unwrap_or(false),
+            checks,
+        })
+    }
+
+    /// List review comments (inline PR comments) on a pull request.
+    pub fn list_review_comments(&self, owner: &str, repo: &str, number: i64) -> Result<Vec<PrComment>, GithubError> {
+        let raw: Vec<CommentRaw> = self.get_json(&format!("/repos/{owner}/{repo}/pulls/{number}/comments"))?;
+        Ok(raw
+            .into_iter()
+            .map(|c| PrComment { id: c.id, body: c.body, path: c.path, author: c.user.map(|u| u.login) })
+            .collect())
+    }
+
+    /// Reply to a review comment thread.
+    pub fn reply_to_comment(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: i64,
+        comment_id: i64,
+        body: &str,
+    ) -> Result<(), GithubError> {
+        self.post_json::<serde_json::Value>(
+            &format!("/repos/{owner}/{repo}/pulls/{number}/comments/{comment_id}/replies"),
+            serde_json::json!({ "body": body }),
+        )?;
+        Ok(())
+    }
+
+    /// Post a top-level (issue-style) comment on the pull request.
+    pub fn post_issue_comment(&self, owner: &str, repo: &str, number: i64, body: &str) -> Result<(), GithubError> {
+        self.post_json::<serde_json::Value>(
+            &format!("/repos/{owner}/{repo}/issues/{number}/comments"),
+            serde_json::json!({ "body": body }),
+        )?;
+        Ok(())
+    }
+}
+
+/// The reply's JSON, or the error its status says.
+fn read_json<T: serde::de::DeserializeOwned>(
+    response: Result<ureq::http::Response<ureq::Body>, ureq::Error>,
+) -> Result<T, GithubError> {
+    let mut response = response.map_err(|err| GithubError::Http(err.to_string()))?;
+    let status = response.status().as_u16();
+    if status >= 400 {
+        return Err(api_error(status, &mut response));
+    }
+    response
         .body_mut()
         .read_json()
-        .map_err(|err| GithubError::Http(format!("invalid JSON (HTTP {status}): {err}")))?;
-    Ok(raw.into_iter().next().map(|pr| PullRequest {
-        number: pr.number,
-        url: pr.html_url,
-    }))
+        .map_err(|err| GithubError::Http(format!("invalid JSON (HTTP {status}): {err}")))
 }
 
 /// A repository on github.com, as named in its remote URL.
@@ -189,73 +362,6 @@ pub struct PullSummary {
     pub updated_at: String,
 }
 
-/// Every pull request, in any state, from `branch` of `repo` itself (not a
-/// fork) into it, most recently updated first.
-pub fn list_branch_prs(
-    token: &str,
-    repo: &GithubRepo,
-    branch: &str,
-) -> Result<Vec<PullSummary>, GithubError> {
-    let url = format!(
-        "{GITHUB_API_URL}/repos/{}/{}/pulls?head={}&state=all&sort=updated&direction=desc&per_page=50",
-        repo.owner,
-        repo.repo,
-        query_encode(&format!("{}:{branch}", repo.owner)),
-    );
-    list_pulls(token, &url)
-}
-
-/// Every open pull request in `repo`, whichever branch it is from, most
-/// recently updated first (the first 100).
-pub fn list_open_prs(token: &str, repo: &GithubRepo) -> Result<Vec<PullSummary>, GithubError> {
-    let url = format!(
-        "{GITHUB_API_URL}/repos/{}/{}/pulls?state=open&sort=updated&direction=desc&per_page=100",
-        repo.owner, repo.repo,
-    );
-    list_pulls(token, &url)
-}
-
-fn list_pulls(token: &str, url: &str) -> Result<Vec<PullSummary>, GithubError> {
-    let mut response = ureq::get(url)
-        .header("Authorization", &auth_header(token))
-        .header("Accept", "application/vnd.github+json")
-        .header("User-Agent", "tod")
-        .call()
-        .map_err(request_error)?;
-    let status = response.status();
-    if status.as_u16() >= 400 {
-        return Err(api_error(status.as_u16(), &mut response));
-    }
-    let raw: Vec<PullListRaw> = response
-        .body_mut()
-        .read_json()
-        .map_err(|err| GithubError::Http(format!("invalid JSON (HTTP {status}): {err}")))?;
-    Ok(raw.into_iter().map(PullListRaw::into_summary).collect())
-}
-
-/// One pull request by number, as [`list_branch_prs`] lists it.
-pub fn get_pull(token: &str, repo: &GithubRepo, number: i64) -> Result<PullSummary, GithubError> {
-    let url = format!(
-        "{GITHUB_API_URL}/repos/{}/{}/pulls/{number}",
-        repo.owner, repo.repo
-    );
-    let mut response = ureq::get(&url)
-        .header("Authorization", &auth_header(token))
-        .header("Accept", "application/vnd.github+json")
-        .header("User-Agent", "tod")
-        .call()
-        .map_err(request_error)?;
-    let status = response.status();
-    if status.as_u16() >= 400 {
-        return Err(api_error(status.as_u16(), &mut response));
-    }
-    let raw: PullListRaw = response
-        .body_mut()
-        .read_json()
-        .map_err(|err| GithubError::Http(format!("invalid JSON (HTTP {status}): {err}")))?;
-    Ok(raw.into_summary())
-}
-
 /// Percent-encode a query value. A branch name may hold `&`, `#` or `+`.
 fn query_encode(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
@@ -268,189 +374,6 @@ fn query_encode(value: &str) -> String {
         }
     }
     out
-}
-
-/// Open a pull request `head` -> `base` in `owner/repo`. Callers should check
-/// `find_open_pr` first — this always creates a new one.
-pub fn create_pr(
-    token: &str,
-    owner: &str,
-    repo: &str,
-    head: &str,
-    base: &str,
-    title: &str,
-    body: &str,
-) -> Result<PullRequest, GithubError> {
-    let url = format!("{GITHUB_API_URL}/repos/{owner}/{repo}/pulls");
-    let payload = serde_json::json!({
-        "title": title,
-        "head": head,
-        "base": base,
-        "body": body,
-    });
-    let mut response = ureq::post(&url)
-        .header("Authorization", &auth_header(token))
-        .header("Accept", "application/vnd.github+json")
-        .header("User-Agent", "tod")
-        .send_json(payload)
-        .map_err(request_error)?;
-    let status = response.status();
-    if status.as_u16() >= 400 {
-        return Err(api_error(status.as_u16(), &mut response));
-    }
-    let raw: PrRaw = response
-        .body_mut()
-        .read_json()
-        .map_err(|err| GithubError::Http(format!("invalid JSON (HTTP {status}): {err}")))?;
-    Ok(PullRequest {
-        number: raw.number,
-        url: raw.html_url,
-    })
-}
-
-/// Fetch a pull request's live status: mergeable flag, review decision,
-/// combined check conclusion, and whether it has been merged.
-pub fn get_pr_status(
-    token: &str,
-    owner: &str,
-    repo: &str,
-    number: i64,
-) -> Result<PrStatus, GithubError> {
-    let url = format!("{GITHUB_API_URL}/repos/{owner}/{repo}/pulls/{number}");
-    let mut response = ureq::get(&url)
-        .header("Authorization", &auth_header(token))
-        .header("Accept", "application/vnd.github+json")
-        .header("User-Agent", "tod")
-        .call()
-        .map_err(request_error)?;
-    let status = response.status();
-    if status.as_u16() == 404 {
-        return Err(GithubError::NotFound);
-    }
-    if status.as_u16() >= 400 {
-        return Err(api_error(status.as_u16(), &mut response));
-    }
-    let raw: PrDetailRaw = response
-        .body_mut()
-        .read_json()
-        .map_err(|err| GithubError::Http(format!("invalid JSON (HTTP {status}): {err}")))?;
-
-    let checks = match &raw.head {
-        Some(head) => get_combined_status(token, owner, repo, &head.sha).ok(),
-        None => None,
-    };
-
-    Ok(PrStatus {
-        mergeable: raw.mergeable,
-        mergeable_state: raw.mergeable_state,
-        merged: raw.merged.unwrap_or(false),
-        checks,
-    })
-}
-
-fn get_combined_status(
-    token: &str,
-    owner: &str,
-    repo: &str,
-    sha: &str,
-) -> Result<String, GithubError> {
-    let url = format!("{GITHUB_API_URL}/repos/{owner}/{repo}/commits/{sha}/status");
-    let mut response = ureq::get(&url)
-        .header("Authorization", &auth_header(token))
-        .header("Accept", "application/vnd.github+json")
-        .header("User-Agent", "tod")
-        .call()
-        .map_err(request_error)?;
-    let status = response.status();
-    if status.as_u16() >= 400 {
-        return Err(api_error(status.as_u16(), &mut response));
-    }
-    let raw: CombinedStatusRaw = response
-        .body_mut()
-        .read_json()
-        .map_err(|err| GithubError::Http(format!("invalid JSON (HTTP {status}): {err}")))?;
-    Ok(raw.state)
-}
-
-/// List review comments (inline PR comments) on a pull request.
-pub fn list_review_comments(
-    token: &str,
-    owner: &str,
-    repo: &str,
-    number: i64,
-) -> Result<Vec<PrComment>, GithubError> {
-    let url = format!("{GITHUB_API_URL}/repos/{owner}/{repo}/pulls/{number}/comments");
-    let mut response = ureq::get(&url)
-        .header("Authorization", &auth_header(token))
-        .header("Accept", "application/vnd.github+json")
-        .header("User-Agent", "tod")
-        .call()
-        .map_err(request_error)?;
-    let status = response.status();
-    if status.as_u16() >= 400 {
-        return Err(api_error(status.as_u16(), &mut response));
-    }
-    let raw: Vec<CommentRaw> = response
-        .body_mut()
-        .read_json()
-        .map_err(|err| GithubError::Http(format!("invalid JSON (HTTP {status}): {err}")))?;
-    Ok(raw
-        .into_iter()
-        .map(|c| PrComment {
-            id: c.id,
-            body: c.body,
-            path: c.path,
-            author: c.user.map(|u| u.login),
-        })
-        .collect())
-}
-
-/// Reply to a review comment thread.
-pub fn reply_to_comment(
-    token: &str,
-    owner: &str,
-    repo: &str,
-    number: i64,
-    comment_id: i64,
-    body: &str,
-) -> Result<(), GithubError> {
-    let url =
-        format!("{GITHUB_API_URL}/repos/{owner}/{repo}/pulls/{number}/comments/{comment_id}/replies");
-    let payload = serde_json::json!({ "body": body });
-    let mut response = ureq::post(&url)
-        .header("Authorization", &auth_header(token))
-        .header("Accept", "application/vnd.github+json")
-        .header("User-Agent", "tod")
-        .send_json(payload)
-        .map_err(request_error)?;
-    let status = response.status();
-    if status.as_u16() >= 400 {
-        return Err(api_error(status.as_u16(), &mut response));
-    }
-    Ok(())
-}
-
-/// Post a top-level (issue-style) comment on the pull request.
-pub fn post_issue_comment(
-    token: &str,
-    owner: &str,
-    repo: &str,
-    number: i64,
-    body: &str,
-) -> Result<(), GithubError> {
-    let url = format!("{GITHUB_API_URL}/repos/{owner}/{repo}/issues/{number}/comments");
-    let payload = serde_json::json!({ "body": body });
-    let mut response = ureq::post(&url)
-        .header("Authorization", &auth_header(token))
-        .header("Accept", "application/vnd.github+json")
-        .header("User-Agent", "tod")
-        .send_json(payload)
-        .map_err(request_error)?;
-    let status = response.status();
-    if status.as_u16() >= 400 {
-        return Err(api_error(status.as_u16(), &mut response));
-    }
-    Ok(())
 }
 
 fn api_error(status: u16, response: &mut ureq::http::Response<ureq::Body>) -> GithubError {
@@ -674,6 +597,38 @@ mod tests {
             base: RefRaw { name: "main".into() },
             updated_at: String::new(),
         }
+    }
+
+    fn through_fake_proxy(auth: GithubAuth) -> (String, Vec<String>) {
+        let (proxy, seen) = crate::sandbox_http::tests::fake_proxy(200, r#"{"login":"octo"}"#);
+        let agent = crate::sandbox_http::agent_with(Some(proxy), None, std::time::Duration::from_secs(10));
+        let gh = Github::with_agent(auth, agent, "http://api.github.test");
+        let login = gh.user_login().unwrap();
+        (login, seen.recv_timeout(std::time::Duration::from_secs(10)).unwrap())
+    }
+
+    fn has_authorization(lines: &[String]) -> bool {
+        lines.iter().any(|l| l.to_ascii_lowercase().starts_with("authorization:"))
+    }
+
+    #[test]
+    fn proxy_mode_sends_no_token_of_its_own() {
+        let (login, seen) = through_fake_proxy(GithubAuth::Proxy);
+        assert_eq!(login, "octo");
+        assert_eq!(seen[0], "CONNECT api.github.test:80 HTTP/1.1", "{seen:?}");
+        assert!(seen.iter().any(|l| l.starts_with("GET /user ")), "{seen:?}");
+        assert!(!has_authorization(&seen), "{seen:?}");
+    }
+
+    #[test]
+    fn token_mode_sends_the_token() {
+        let (_, seen) = through_fake_proxy(GithubAuth::Token("t0k".into()));
+        assert!(seen.iter().any(|l| l.eq_ignore_ascii_case("authorization: Bearer t0k")), "{seen:?}");
+    }
+
+    #[test]
+    fn debug_never_shows_the_token() {
+        assert_eq!(format!("{:?}", GithubAuth::Token("secret".into())), "Token(<set>)");
     }
 
     #[test]

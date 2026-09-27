@@ -14,7 +14,7 @@
 use rusqlite::Connection;
 use std::collections::HashSet;
 use std::path::Path;
-use tod_store::credentials::{CredentialStore, resolve_github_token};
+use tod_store::credentials::{CredentialStore, resolve_github_auth};
 use tod_store::fleet::ResolvedFiles;
 use tod_store::fleet::node_actions::resolve_files_for_node;
 use tod_store::fleet::repositories::{NodeRepositories, node_repositories};
@@ -81,16 +81,17 @@ pub trait PullSource: Sync {
     fn pull(&self, repo: &GithubRepo, number: i64) -> Result<PullSummary, String>;
 }
 
-/// GitHub's REST API, as the token configured for the data root.
+/// GitHub's REST API, authenticated as configured for the data root (or by
+/// the sandbox's proxy, in an autonomous node's sandbox).
 pub struct GithubPulls {
-    token: String,
+    github: github::Github,
 }
 
 impl GithubPulls {
     /// `None` when no GitHub token is configured.
     pub fn from_data_root(data_root: &Path) -> Option<Self> {
         let store = CredentialStore::from_data_root(data_root);
-        resolve_github_token(&store).map(|token| Self { token })
+        resolve_github_auth(&store).map(|auth| Self { github: github::Github::new(auth) })
     }
 }
 
@@ -100,15 +101,15 @@ fn github_error(err: GithubError) -> String {
 
 impl PullSource for GithubPulls {
     fn branch_pulls(&self, repo: &GithubRepo, branch: &str) -> Result<Vec<PullSummary>, String> {
-        github::list_branch_prs(&self.token, repo, branch).map_err(github_error)
+        self.github.list_branch_prs(repo, branch).map_err(github_error)
     }
 
     fn open_pulls(&self, repo: &GithubRepo) -> Result<Vec<PullSummary>, String> {
-        github::list_open_prs(&self.token, repo).map_err(github_error)
+        self.github.list_open_prs(repo).map_err(github_error)
     }
 
     fn pull(&self, repo: &GithubRepo, number: i64) -> Result<PullSummary, String> {
-        github::get_pull(&self.token, repo, number).map_err(github_error)
+        self.github.get_pull(repo, number).map_err(github_error)
     }
 }
 

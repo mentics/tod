@@ -137,6 +137,22 @@ backoff; a command that cannot reach the orchestrator fails like any other.
 This replaces, in the cloud, the `cli_relay` route back to the app (a TCP
 listener reached through the relay's `/tunnel`). The app is not involved.
 
+**Except `pr` and `secrets`, which run in the sandbox.** GitHub is reached
+through the sandbox's proxy, which adds the user's token (see Credentials);
+the orchestrator holds no GitHub token and could not. And `secrets run` must
+start its command where the agent is. So the shim
+(`cli_relay::HTTP_SHIM_SCRIPT`, `LOCAL_NOUNS`) runs those two nouns with the
+real Linux `tod-cli`, installed beside it at `/opt/tod/tod-cli-local`
+(`tod_sandbox::node::LOCAL_CLI_PATH`), against the supervisor's copy of the
+database (`/var/lib/tod-supervisor/<node>`), whatever `--data-root` says.
+What they write (`pr open`'s record, `mergeable`, `blocked`) goes into the
+copy, through its mutation socket while the supervisor runs, and the
+supervisor pushes it to the orchestrator after the step, as it does its own
+writes; the gate checks that read it run in the supervisor against the same
+copy. One mechanism, no GitHub logic anywhere but `tod_store::github`.
+Before the supervisor has made its copy (the first seconds of a new
+sandbox), those nouns fail and say so.
+
 ## Sync with the app
 
 The app writes to its own database first, as it does today; the user never
@@ -462,6 +478,40 @@ The plan:
 - **GitHub, Linear, and similar APIs: proxy injection**, one routing rule per
   API host that adds the `Authorization` header, as measured above. `gh`
   gets a placeholder `GH_TOKEN` that the proxy overwrites.
+- **tod's own GitHub calls go through the proxy too.** A node's sandbox
+  created with a GitHub rule has `TOD_GITHUB_AUTH=proxy` in its environment
+  (`tod_sandbox::node::node_env`). With it, `tod_store::github::Github`
+  sends no `Authorization` header of its own and makes its requests through
+  `HTTPS_PROXY`, trusting the CA bundle `SSL_CERT_FILE` names
+  (`tod_store::sandbox_http`, the same agent the supervisor reaches the
+  orchestrator with); `CredentialStore` reports the GitHub token as
+  available from the proxy (`CredentialBackend::Proxy`,
+  `resolve_github_auth`) instead of "not configured", and `tod-cli secrets
+  run` gives a command the same placeholder `gh` gets. So the supervisor's
+  derived gate checks (`pr-mergeable`, `pr-merged`) and `tod-cli pr` (which
+  the shim runs in the sandbox; see `tod-cli` in an agent sandbox) work with
+  the token never in the sandbox. The orchestrator drops the flag from what
+  a shim sends it: its own proxy has no GitHub rule.
+
+  Measured (September 2026, `testspace-358401`, node sandbox
+  `node-cloud-test` created by "Run in the cloud" with the user's GitHub
+  token, mock agent, on the throwaway `octocat/Hello-World` checkout; all
+  GitHub traffic read-only except the supervisor's own branch push):
+
+  | Check | Result |
+  |---|---|
+  | the sandbox's environment | `TOD_GITHUB_AUTH=proxy`, `GH_TOKEN=<placeholder>`, `HTTPS_PROXY=http://localhost:49152`, `SSL_CERT_FILE=/etc/ssl/certs/sandbox-ca-bundle.crt`; no token |
+  | `curl https://api.github.com/user` | the user's login |
+  | `tod-cli pr status`, `pr list`, `pr list --all-open` (run by the shim in the sandbox) | the recorded PR's live state (merged, checks); the repository's open PRs |
+  | `tod-cli secrets list` | `github_token`: set, added by the sandbox's proxy |
+  | the supervisor's gate checks at `pr` and `approved` | `…/pull/6 is already merged.`, `…/pull/6 is merged.` (derived, pass); the node moved on to `learn` |
+  | `git push --dry-run` to `octocat/Hello-World` | `Permission to octocat/Hello-World.git denied to <the user>`: authenticated, refused only for permission |
+  | the same with `NO_PROXY=github.com` | no credentials at all |
+
+  The image (`tod-baked-ubuntu-24-04`) has no `gh`; where an image has it,
+  the placeholder `GH_TOKEN` works as measured above (`gh api user`, `gh
+  repo view`). Not yet measured with a repository the user can write to:
+  opening a PR (`tod-cli pr open`) and a push that is accepted.
 - **Where the values come from.** The user already stores a GitHub token and
   a Linear API key in tod (`CredentialStore`: the OS keyring, else an encrypted
   file; set in the app or with `tod-cli secrets set`). When tod creates a

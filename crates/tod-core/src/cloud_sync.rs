@@ -633,6 +633,7 @@ pub fn ensure_node_sandbox(
     let relay_path = tod_store::fleet::sandbox::relay_path()?;
     let relay = std::fs::read(&relay_path).with_context(|| format!("read {}", relay_path.display()))?;
     let supervisor = relay_path.parent().and_then(node::supervisor_from);
+    let local_cli = relay_path.parent().and_then(node::local_cli_from);
     // The supervisor builds the agent's context from the same process and
     // media bundles as this app, installed beside it.
     let mut bundles = node::bundle_files(crate::process_bundle::TodInstallPaths::discover()?.process_root(), "process")
@@ -647,6 +648,7 @@ pub fn ensure_node_sandbox(
     let payload = node::NodePayload {
         relay: &relay,
         shim: tod_store::fleet::cli_relay::HTTP_SHIM_SCRIPT.as_bytes(),
+        local_cli: local_cli.as_deref(),
         supervisor: supervisor.as_deref(),
         repo_url: &repo_url,
         branch: &branch,

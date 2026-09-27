@@ -86,7 +86,8 @@ impl TaskListView {
                     tod_store::CredentialBackend::EncryptedFile => {
                         "Saved Linear API key to encrypted credentials file".into()
                     }
-                    tod_store::CredentialBackend::Environment => "Saved Linear API key".into(),
+                    tod_store::CredentialBackend::Environment
+                    | tod_store::CredentialBackend::Proxy => "Saved Linear API key".into(),
                 };
                 match request {
                     PendingCredentialRequest::TicketImport {

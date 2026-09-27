@@ -106,10 +106,29 @@ pub const NODE_ENV: &str = "TOD_NODE";
 pub const USER_HEADER: &str = "X-Tod-User";
 pub const NODE_HEADER: &str = "X-Tod-Node";
 
+/// Where [`HTTP_SHIM_SCRIPT`] finds the real `tod-cli` in a node's sandbox
+/// (`tod_sandbox::node::LOCAL_CLI_PATH`); overridden by `TOD_LOCAL_CLI`.
+pub const LOCAL_CLI_DEFAULT: &str = tod_sandbox::node::LOCAL_CLI_PATH;
+/// The supervisor's copy of the database in a node's sandbox is
+/// `<this>/<node>` (`tod-supervisor`'s default `--state-dir`); overridden
+/// by `TOD_LOCAL_DATA_ROOT`.
+pub const SUPERVISOR_STATE_ROOT: &str = tod_sandbox::node::SUPERVISOR_STATE_ROOT;
+/// The nouns [`HTTP_SHIM_SCRIPT`] runs in the sandbox, not on the
+/// orchestrator.
+pub const LOCAL_NOUNS: &[&str] = &["pr", "secrets"];
+
 /// The `tod-cli` an autonomous node's sandbox runs: [`SHIM_SCRIPT`]'s request
 /// body (with an empty token) sent with `curl` to the orchestrator, retried
 /// with backoff on connection errors and 5xx/407/429 answers (the proxy
 /// answers 407 for a moment after the sandbox is created).
+///
+/// Except [`LOCAL_NOUNS`]: GitHub is reached through the sandbox's proxy,
+/// which injects the user's token (the orchestrator has none), and `secrets
+/// run` must start its command where the agent is. Those run the real
+/// `tod-cli` installed beside the shim ([`LOCAL_CLI_DEFAULT`]) against the
+/// supervisor's copy of the database (under [`SUPERVISOR_STATE_ROOT`]),
+/// whatever `--data-root` says; the supervisor pushes what they write to
+/// the orchestrator after each step, as it does its own writes.
 pub const HTTP_SHIM_SCRIPT: &str = r#"#!/usr/bin/env bash
 # tod-cli, relayed over HTTP to the tod orchestrator, which runs the real
 # tod-cli against this user's database. Written by tod; edits are overwritten.
@@ -120,6 +139,46 @@ if [ -z "$url" ] || [ -z "$user" ] || [ -z "$node" ]; then
   echo "tod-cli: TOD_ORCHESTRATOR_CLI_URL, TOD_USER, and TOD_NODE must be set" >&2
   exit 70
 fi
+# `pr` and `secrets` run here instead: GitHub is reached through this
+# sandbox's proxy, which adds the user's token (the orchestrator has none),
+# and `secrets run` starts its command here. They run the real tod-cli
+# against the supervisor's copy of the database, which sends what they
+# write on to the orchestrator.
+local_cli="${TOD_LOCAL_CLI:-/opt/tod/tod-cli-local}"
+local_root="${TOD_LOCAL_DATA_ROOT:-/var/lib/tod-supervisor/$node}"
+noun=; skip=
+for arg in "$@"; do
+  if [ -n "$skip" ]; then skip=; continue; fi
+  case "$arg" in
+    --data-root) skip=1 ;;
+    --data-root=*|--json) ;;
+    *) noun="$arg"; break ;;
+  esac
+done
+case "$noun" in
+  pr|secrets)
+    if [ ! -x "$local_cli" ]; then
+      echo "tod-cli: $noun runs in this sandbox, but $local_cli is not installed (run the node in the cloud again)" >&2
+      exit 70
+    fi
+    if [ ! -f "$local_root/tod.db" ]; then
+      echo "tod-cli: $noun uses the node's copy of the database ($local_root), which the supervisor has not made yet" >&2
+      exit 70
+    fi
+    args=(); skip=; rest=
+    for arg in "$@"; do
+      if [ -n "$rest" ]; then args+=("$arg"); continue; fi
+      if [ -n "$skip" ]; then skip=; continue; fi
+      case "$arg" in
+        --) rest=1; args+=("$arg") ;;
+        --data-root) skip=1 ;;
+        --data-root=*) ;;
+        *) args+=("$arg") ;;
+      esac
+    done
+    exec "$local_cli" --data-root "$local_root" "${args[@]}"
+    ;;
+esac
 tmp="$(mktemp -d)" || exit 70
 trap 'rm -rf "$tmp"' EXIT
 : > "$tmp/in"
@@ -515,6 +574,74 @@ mod tests {
         }
         assert!(s.contains("--data-binary"));
         assert!(s.contains("delay=$((delay * 2))"));
+    }
+
+    #[test]
+    fn the_http_shim_names_the_local_cli_and_copy() {
+        let s = HTTP_SHIM_SCRIPT;
+        assert!(s.contains(&format!("${{TOD_LOCAL_CLI:-{LOCAL_CLI_DEFAULT}}}")));
+        assert!(s.contains(&format!("${{TOD_LOCAL_DATA_ROOT:-{SUPERVISOR_STATE_ROOT}/$node}}")));
+        assert!(s.contains(&format!("  {})", LOCAL_NOUNS.join("|"))));
+    }
+
+    /// Runs the HTTP shim with bash: `pr` and `secrets` go to the local
+    /// `tod-cli` with the local copy as their data root, everything else to
+    /// `curl` (a fake one on `PATH`). Unix only: on Windows `bash` may be WSL's.
+    #[cfg(unix)]
+    #[test]
+    fn the_http_shim_runs_pr_and_secrets_here() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("tod-http-shim-{}", uuid::Uuid::new_v4()));
+        let bin = dir.join("bin");
+        let root = dir.join("copy");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("tod.db"), b"").unwrap();
+        let write_exe = |path: &Path, body: &str| {
+            std::fs::write(path, body).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        let shim = dir.join("tod-cli");
+        write_exe(&shim, HTTP_SHIM_SCRIPT);
+        let local = dir.join("tod-cli-local");
+        write_exe(&local, "#!/usr/bin/env bash\nprintf 'local:%s\\n' \"$@\"\n");
+        let marker = dir.join("curl-called");
+        write_exe(
+            &bin.join("curl"),
+            &format!("#!/usr/bin/env bash\ntouch '{}'\nprintf 404\n", marker.display()),
+        );
+        let run = |args: &[&str]| {
+            let _ = std::fs::remove_file(&marker);
+            let out = Command::new("bash")
+                .arg(&shim)
+                .args(args)
+                .env("PATH", format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default()))
+                .env(ORCHESTRATOR_CLI_URL_ENV, "http://127.0.0.1:9/cli")
+                .env(USER_ENV, "u")
+                .env(NODE_ENV, "n")
+                .env("TOD_LOCAL_CLI", &local)
+                .env("TOD_LOCAL_DATA_ROOT", &root)
+                .output()
+                .unwrap();
+            (String::from_utf8_lossy(&out.stdout).to_string(), marker.exists())
+        };
+        let (out, remote) = run(&["--data-root", "/elsewhere", "pr", "status", "--node", "x"]);
+        assert!(!remote);
+        let root_s = root.display().to_string();
+        let expected: Vec<String> = ["--data-root", root_s.as_str(), "pr", "status", "--node", "x"]
+            .iter()
+            .map(|a| format!("local:{a}"))
+            .collect();
+        assert_eq!(out.lines().collect::<Vec<_>>(), expected);
+
+        // Everything after `--` is the command's own, `--data-root` included.
+        let (out, _) = run(&["secrets", "run", "--env", "GH_TOKEN=github_token", "--", "x", "--data-root", "y"]);
+        assert!(out.ends_with("local:--\nlocal:x\nlocal:--data-root\nlocal:y\n"), "{out}");
+
+        let (out, remote) = run(&["--data-root", "/elsewhere", "node", "list"]);
+        assert!(remote, "{out}");
+        assert!(!out.contains("local:"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
