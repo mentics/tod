@@ -270,11 +270,70 @@ fn a_wake_runs_the_node_and_its_work_reaches_the_orchestrator() {
     let moved = WaitRepo::new(&conn).get(poll.id).unwrap().unwrap();
     assert_eq!(moved.state, "pending");
     assert!(moved.due_at >= now + 3_600_000, "{moved:?}");
+    assert!(scheduler.cancels.lock().unwrap().is_empty());
+    drop(conn);
+
+    // The timer is satisfied some other way (as a webhook would), so the
+    // check is now the soonest: its wake replaces the timer's, which is
+    // cancelled rather than left to poke later.
+    {
+        let conn = rusqlite::Connection::open(&remote_db).unwrap();
+        conn.busy_timeout(Duration::from_secs(10)).unwrap();
+        WaitRepo::new(&conn).set_state(timer.id, "satisfied").unwrap();
+    }
+    let woke = wake(Config {
+        orchestrator: orchestrator.clone(),
+        node,
+        workspace: workspace.clone(),
+        state_dir: base.join("supervisor"),
+        agent: AgentKind::Mock,
+        holder: Arc::new(RelayHolder::new(fake_relay().0)),
+        transcripts: None,
+        media: media(),
+        budget: Budget { max_sessions: 1, max_duration: Duration::from_secs(600) },
+        guards: Default::default(),
+        poll: Duration::from_millis(20),
+        push_branch: false,
+        scheduler: Some(scheduler.clone()),
+        sandbox: "node-test".into(),
+    })
+    .unwrap();
+    assert!(matches!(woke, Woke::StillWaiting(_)), "{woke:?}");
+    assert_eq!(scheduler.calls.lock().unwrap().last().map(|c| c.0), Some(poll.id));
+    assert_eq!(*scheduler.cancels.lock().unwrap(), vec![timer.id]);
+
+    // Nothing left to wait on: the node works, and first drops the check's
+    // wake, which it no longer needs.
+    {
+        let conn = rusqlite::Connection::open(&remote_db).unwrap();
+        conn.busy_timeout(Duration::from_secs(10)).unwrap();
+        WaitRepo::new(&conn).set_state(poll.id, "satisfied").unwrap();
+    }
+    let woke = wake(Config {
+        orchestrator: orchestrator.clone(),
+        node,
+        workspace: workspace.clone(),
+        state_dir: base.join("supervisor"),
+        agent: AgentKind::Mock,
+        holder: Arc::new(RelayHolder::new(fake_relay().0)),
+        transcripts: None,
+        media: media(),
+        budget: Budget { max_sessions: 1, max_duration: Duration::from_secs(600) },
+        guards: Default::default(),
+        poll: Duration::from_millis(20),
+        push_branch: false,
+        scheduler: Some(scheduler.clone()),
+        sandbox: "node-test".into(),
+    })
+    .unwrap();
+    assert!(matches!(woke, Woke::Ran(_)), "{woke:?}");
+    assert_eq!(*scheduler.cancels.lock().unwrap(), vec![timer.id, poll.id]);
 }
 
 #[derive(Default)]
 struct FakeScheduler {
     calls: Mutex<Vec<(Uuid, String, i64)>>,
+    cancels: Mutex<Vec<Uuid>>,
 }
 
 impl tod_core::scheduler::Scheduler for FakeScheduler {
@@ -282,7 +341,8 @@ impl tod_core::scheduler::Scheduler for FakeScheduler {
         self.calls.lock().unwrap().push((id, sandbox.to_string(), at_ms));
         Ok(())
     }
-    fn cancel(&self, _id: Uuid) -> anyhow::Result<()> {
+    fn cancel(&self, id: Uuid) -> anyhow::Result<()> {
+        self.cancels.lock().unwrap().push(id);
         Ok(())
     }
 }

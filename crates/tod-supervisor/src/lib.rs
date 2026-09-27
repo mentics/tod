@@ -130,11 +130,12 @@ impl StepHook for Hook<'_> {
     }
 }
 
-/// Schedules the wake the node's waits need, if it has a scheduler.
+/// Schedules the wake the node's waits need, if it has a scheduler, and
+/// cancels one left from before that they no longer need.
 fn schedule(store: &FleetStore, config: &Config) -> Result<()> {
     match &config.scheduler {
         Some(scheduler) => {
-            waits::schedule_wake(store, config.node, scheduler.as_ref(), &config.sandbox)?;
+            waits::reconcile_wake(store, config.node, scheduler.as_ref(), &config.sandbox, &config.state_dir)?;
         }
         None => tracing::warn!("no scheduler: nothing will wake this node but a poke"),
     }
@@ -216,6 +217,11 @@ pub fn wake(config: Config) -> Result<Woke> {
 
     // There is work: hold the sandbox awake until it is done.
     let hold = HoldGuard::take(config.holder.clone());
+    // A wake still scheduled (its wait was satisfied some other way, e.g.
+    // by a webhook) would only poke later; drop it now.
+    if let Some(scheduler) = &config.scheduler {
+        waits::cancel_scheduled(scheduler.as_ref(), &config.state_dir)?;
+    }
     let follow = match &config.transcripts {
         Some((projects, sink)) => {
             let mirror = Arc::new(Mirror::new(projects.clone(), sink.clone()));

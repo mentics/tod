@@ -18,7 +18,8 @@ use tod_supervisor::{Config, Woke, wake};
 const USAGE: &str = "usage: tod-supervisor wake [--workspace DIR] [--agent claude|mock] [--state-dir DIR]
                           [--relay URL] [--media-root DIR] [--no-push] [--no-transcripts]
 environment: TOD_USER, TOD_NODE, TOD_SANDBOX, TOD_ORCHESTRATOR_CLI_URL (or TOD_ORCHESTRATOR_URL),
-             TOD_SUPERVISOR_AGENT (the default for --agent; claude when unset)";
+             TOD_SUPERVISOR_AGENT (the default for --agent; claude when unset),
+             TOD_SCHEDULER (orchestrator | blaxel; with blaxel, TOD_BLAXEL_WORKSPACE)";
 
 fn env(name: &str) -> Result<String> {
     std::env::var(name).ok().filter(|v| !v.is_empty()).with_context(|| format!("{name} is not set"))
@@ -119,10 +120,10 @@ fn run(args: &[String]) -> Result<()> {
         },
         poll: Duration::from_millis(500),
         push_branch,
-        // The development account's timer. A Blaxel schedule would need
-        // Blaxel credentials, which a node's sandbox does not hold.
-        scheduler: match tod_core::scheduler::OrchestratorScheduler::from_env() {
-            Ok(s) => Some(Arc::new(s)),
+        // `TOD_SCHEDULER`: a Blaxel schedule on this sandbox (its proxy adds
+        // the token) or the orchestrator's timer.
+        scheduler: match tod_core::scheduler::from_env() {
+            Ok(s) => Some(Arc::from(s)),
             Err(err) => {
                 tracing::warn!("no wake scheduler: {err:#}");
                 None
