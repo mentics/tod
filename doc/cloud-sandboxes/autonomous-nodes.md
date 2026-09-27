@@ -266,7 +266,7 @@ then:
    deadline for an event wait (give up or check directly if the webhook never
    comes), the next check for a poll, the time for a timer. Its command is
    `tod-supervisor wake`, with `keepAlive: false`: the supervisor takes its own
-   hold once it has decided there is work. (On the development account the
+   hold as soon as it starts, before it syncs its copy of the database. (On the development account the
    orchestrator keeps the timer instead; see Development account.)
 2. Releases its hold. The sandbox is in standby about 15 s later.
 

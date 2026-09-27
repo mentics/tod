@@ -284,12 +284,12 @@ fn alive(pid: u32) -> bool {
 /// Wakes the node's supervisor: if one we started is still running, signal it
 /// (`SIGUSR1`) to look again now rather than at its next schedule; otherwise
 /// start it fresh with `supervisor_cmd` (`keepAlive: false` — it takes its
-/// own hold once it has decided there is work, see `doc/cloud-sandboxes/
+/// own hold as soon as it starts, see `doc/cloud-sandboxes/
 /// autonomous-nodes.md`).
 ///
 /// Either way, a poke takes a short leased hold of its own first: the
-/// supervisor needs a moment after waking to look and decide whether to take
-/// its own hold, and this bridges that gap without granting an indefinite
+/// supervisor needs a moment after starting to take its own hold, and this
+/// bridges that gap without granting an indefinite
 /// one — it lapses on its own (`POKE_BRIDGE_SECS`) unless another poke
 /// arrives to renew it.
 fn poke(relay: &Arc<Relay>) {

@@ -3,10 +3,12 @@
 //! `tod-supervisor wake` (started by the relay's poke, from a schedule, or
 //! when the sandbox is provisioned) asks what the node is waiting on. If it
 //! is still waiting, it schedules the next check and exits. Otherwise it
-//! takes a hold on the sandbox through the relay, runs the lifecycle
+//! runs the lifecycle
 //! [`Autopilot`] for the node with the agent started here, and when that
 //! stops — the node is done, needs the user, or recorded a wait — pushes the
-//! branch, schedules the wake a wait needs, releases the hold, and exits.
+//! branch, schedules the wake a wait needs, and exits. It holds the sandbox
+//! awake through the relay for the whole wake, from before it syncs its
+//! local copy ([`hold`]) until it exits.
 //!
 //! The autopilot runs against a local copy of the user's database that is
 //! synced with the orchestrator around every step and turn ([`replica`]).
@@ -192,6 +194,11 @@ fn ask(store: &FleetStore, node: Uuid, conversation: Option<Uuid>, kind: &str, q
 /// One wake. See the module docs.
 pub fn wake(config: Config) -> Result<Woke> {
     signal::install();
+    // Hold the sandbox awake from the start: seeding a new replica from the
+    // orchestrator can outlast the relay's poke hold, and the sandbox must
+    // not go to standby mid-seed. Released when the wake returns, including
+    // when it finds nothing to do.
+    let hold = HoldGuard::take(config.holder.clone());
     let replica = Replica::open(&config.state_dir, config.orchestrator.clone(), config.node, &config.workspace)?;
     let replica = Arc::new(Mutex::new(replica));
     let store = replica.lock().unwrap_or_else(|e| e.into_inner()).store().clone();
@@ -214,8 +221,6 @@ pub fn wake(config: Config) -> Result<Woke> {
         return Ok(Woke::StillWaiting(reason));
     }
 
-    // There is work: hold the sandbox awake until it is done.
-    let hold = HoldGuard::take(config.holder.clone());
     let follow = match &config.transcripts {
         Some((projects, sink)) => {
             let mirror = Arc::new(Mirror::new(projects.clone(), sink.clone()));
