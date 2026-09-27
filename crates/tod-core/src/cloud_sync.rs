@@ -491,6 +491,29 @@ pub fn sync_on_start(fleet: std::sync::Arc<FleetStore>) {
     lost::spawn_check(fleet, lost::Check::Full);
 }
 
+/// The user's git identity, for the node's commits in its sandbox: the
+/// node's repository's own when it is on this machine, else this machine's
+/// global one, else [`tod_sandbox::node::GitIdentity::fallback`].
+fn git_identity(repo: Option<&str>) -> tod_sandbox::node::GitIdentity {
+    let local = repo.map(Path::new).filter(|dir| dir.is_dir());
+    let get = |key: &str| {
+        let mut cmd = std::process::Command::new("git");
+        if let Some(dir) = local {
+            cmd.arg("-C").arg(dir);
+        }
+        cmd.args(["config", "--get", key])
+            .output()
+            .ok()
+            .filter(|out| out.status.success())
+            .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+            .filter(|value| !value.is_empty())
+    };
+    match (get("user.name"), get("user.email")) {
+        (Some(name), Some(email)) => tod_sandbox::node::GitIdentity { name, email },
+        _ => tod_sandbox::node::GitIdentity::fallback(),
+    }
+}
+
 /// Where a node's code comes from: its repository as an HTTPS URL, and branch.
 fn node_source(fleet: &FleetStore, node_id: &str) -> Result<(tod_store::fleet::FleetTask, String, String)> {
     let task = fleet.get_node(node_id)?.ok_or_else(|| anyhow!("no node {node_id}"))?;
@@ -652,6 +675,7 @@ pub fn ensure_node_sandbox(
         supervisor: supervisor.as_deref(),
         repo_url: &repo_url,
         branch: &branch,
+        git_identity: &git_identity(task.repo.as_deref()),
         bundles: &bundles,
         // At every provisioning, so the supervisor's next start has the
         // token as it is now (with `claude_token_via = "env"`).

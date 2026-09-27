@@ -45,8 +45,9 @@ pub struct PrStatus {
     /// still outstanding. `None` while GitHub is still computing it.
     pub mergeable_state: Option<String>,
     pub merged: bool,
-    /// Combined status of the head commit's check runs, e.g. `success`,
-    /// `failure`, `pending`.
+    /// The head commit's checks, commit statuses and check runs together:
+    /// `failure` if any failed, else `pending` if any is still running, else
+    /// `success`. `None` when it has none (or they could not be read).
     pub checks: Option<String>,
 }
 
@@ -206,11 +207,19 @@ impl Github {
     /// combined check conclusion, and whether it has been merged.
     pub fn get_pr_status(&self, owner: &str, repo: &str, number: i64) -> Result<PrStatus, GithubError> {
         let raw: PrDetailRaw = self.get_json(&format!("/repos/{owner}/{repo}/pulls/{number}"))?;
+        // Both kinds of check: commit statuses (the combined status, which
+        // says `pending` when there are none at all) and check runs (GitHub
+        // Actions and apps), which the combined status leaves out.
         let checks = match &raw.head {
-            Some(head) => self
-                .get_json::<CombinedStatusRaw>(&format!("/repos/{owner}/{repo}/commits/{}/status", head.sha))
-                .ok()
-                .map(|s| s.state),
+            Some(head) => {
+                let statuses = self
+                    .get_json::<CombinedStatusRaw>(&format!("/repos/{owner}/{repo}/commits/{}/status", head.sha))
+                    .ok();
+                let runs = self
+                    .get_json::<CheckRunsRaw>(&format!("/repos/{owner}/{repo}/commits/{}/check-runs", head.sha))
+                    .ok();
+                combine_checks(statuses.as_ref(), runs.as_ref())
+            }
             None => None,
         };
         Ok(PrStatus {
@@ -387,7 +396,7 @@ fn api_error(status: u16, response: &mut ureq::http::Response<ureq::Body>) -> Gi
         .body_mut()
         .read_json::<ErrorRaw>()
         .ok()
-        .map(|e| e.message)
+        .map(ErrorRaw::describe)
         .unwrap_or_else(|| format!("HTTP {status}"));
     GithubError::Api(message)
 }
@@ -460,6 +469,43 @@ struct HeadRaw {
 #[derive(Debug, Deserialize)]
 struct CombinedStatusRaw {
     state: String,
+    #[serde(default)]
+    total_count: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct CheckRunsRaw {
+    #[serde(default)]
+    check_runs: Vec<CheckRunRaw>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CheckRunRaw {
+    status: String,
+    conclusion: Option<String>,
+}
+
+/// [`PrStatus::checks`] from the combined status and the check runs.
+fn combine_checks(statuses: Option<&CombinedStatusRaw>, runs: Option<&CheckRunsRaw>) -> Option<String> {
+    let mut states: Vec<&str> = Vec::new();
+    if let Some(s) = statuses.filter(|s| s.total_count > 0) {
+        states.push(match s.state.as_str() {
+            "success" => "success",
+            "pending" => "pending",
+            _ => "failure",
+        });
+    }
+    for run in runs.map(|r| r.check_runs.as_slice()).unwrap_or_default() {
+        states.push(match (run.status.as_str(), run.conclusion.as_deref()) {
+            ("completed", Some("success" | "neutral" | "skipped")) => "success",
+            ("completed", _) => "failure",
+            _ => "pending",
+        });
+    }
+    ["failure", "pending", "success"]
+        .into_iter()
+        .find(|state| states.contains(state))
+        .map(str::to_string)
 }
 
 #[derive(Debug, Deserialize)]
@@ -478,6 +524,41 @@ struct UserRaw {
 #[derive(Debug, Deserialize)]
 struct ErrorRaw {
     message: String,
+    /// What a 422 "Validation Failed" was about (e.g. "No commits between
+    /// main and feature").
+    #[serde(default)]
+    errors: Vec<ErrorDetailRaw>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ErrorDetailRaw {
+    message: Option<String>,
+    resource: Option<String>,
+    field: Option<String>,
+    code: Option<String>,
+}
+
+impl ErrorRaw {
+    /// The message, followed by each detail GitHub gave: its own message, or
+    /// else the resource, field, and code it names.
+    fn describe(self) -> String {
+        let details: Vec<String> = self
+            .errors
+            .into_iter()
+            .filter_map(|e| {
+                e.message.filter(|m| !m.trim().is_empty()).or_else(|| {
+                    let parts: Vec<String> =
+                        [e.resource, e.field, e.code].into_iter().flatten().collect();
+                    (!parts.is_empty()).then(|| parts.join(" "))
+                })
+            })
+            .collect();
+        if details.is_empty() {
+            self.message
+        } else {
+            format!("{}: {}", self.message, details.join("; "))
+        }
+    }
 }
 
 /// A node's pull request reference: owner/repo/number/url, recorded once
@@ -536,6 +617,39 @@ impl<'a> NodePrRepo<'a> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn checks_combine_statuses_and_check_runs() {
+        use super::{CheckRunsRaw, CombinedStatusRaw, combine_checks};
+        let status = |state: &str, total_count| CombinedStatusRaw { state: state.into(), total_count };
+        let runs = |json: &str| -> CheckRunsRaw { serde_json::from_str(json).unwrap() };
+        let green = runs(r#"{"total_count":1,"check_runs":[{"status":"completed","conclusion":"success"}]}"#);
+        let running = runs(r#"{"check_runs":[{"status":"in_progress","conclusion":null}]}"#);
+        let failed = runs(r#"{"check_runs":[{"status":"completed","conclusion":"timed_out"}]}"#);
+        let none = runs(r#"{"total_count":0,"check_runs":[]}"#);
+        // No statuses at all: the combined status's "pending" is ignored.
+        assert_eq!(combine_checks(Some(&status("pending", 0)), Some(&green)).as_deref(), Some("success"));
+        assert_eq!(combine_checks(Some(&status("pending", 0)), Some(&none)), None);
+        assert_eq!(combine_checks(Some(&status("success", 2)), Some(&running)).as_deref(), Some("pending"));
+        assert_eq!(combine_checks(Some(&status("success", 1)), Some(&failed)).as_deref(), Some("failure"));
+        assert_eq!(combine_checks(Some(&status("error", 1)), None).as_deref(), Some("failure"));
+    }
+
+    #[test]
+    fn api_errors_carry_githubs_details() {
+        let raw: super::ErrorRaw = serde_json::from_str(
+            r#"{"message":"Validation Failed","errors":[
+                {"resource":"PullRequest","code":"custom","message":"No commits between main and x"},
+                {"resource":"PullRequest","field":"head","code":"invalid"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            raw.describe(),
+            "Validation Failed: No commits between main and x; PullRequest head invalid"
+        );
+        let plain: super::ErrorRaw = serde_json::from_str(r#"{"message":"Not Found"}"#).unwrap();
+        assert_eq!(plain.describe(), "Not Found");
+    }
+
     use super::*;
 
     fn repo(owner: &str, name: &str) -> Option<GithubRepo> {

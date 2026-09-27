@@ -293,6 +293,10 @@ pub struct NodePayload<'a> {
     /// The repository's HTTPS URL (git goes through the proxy).
     pub repo_url: &'a str,
     pub branch: &'a str,
+    /// Who the node's commits are by: the user's own git identity, set in
+    /// the checkout (a fresh sandbox has none, and `git commit` refuses to
+    /// run without one).
+    pub git_identity: &'a GitIdentity,
     /// The supervisor's bundles, as `(path relative to /opt/tod, contents)`:
     /// `process/...` and `media/...`, found beside its executable (it builds
     /// the agent's context from them). See [`bundle_files`].
@@ -335,16 +339,37 @@ pub fn local_cli_from(sandbox_target_dir: &Path) -> Option<Vec<u8>> {
     std::fs::read(sandbox_target_dir.join("tod-cli")).ok()
 }
 
+/// A git author: `user.name` and `user.email`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitIdentity {
+    pub name: String,
+    pub email: String,
+}
+
+impl GitIdentity {
+    /// Used when the user has no git identity of their own configured.
+    pub fn fallback() -> Self {
+        Self {
+            name: "tod".to_string(),
+            email: "tod@localhost".to_string(),
+        }
+    }
+}
+
 /// Sets git's CA to the proxy's system-wide, then clones the repository (or
-/// fetches) and checks out `branch`, from `origin/<branch>` when it exists.
-pub fn checkout_script(repo_url: &str, branch: &str) -> String {
+/// fetches), sets the checkout's author to `identity`, and checks out
+/// `branch`, from `origin/<branch>` when it exists.
+pub fn checkout_script(repo_url: &str, branch: &str, identity: &GitIdentity) -> String {
     let (repo, br, dir) = (shell_quote(repo_url), shell_quote(branch), shell_quote(WORKSPACE_DIR));
+    let (name, email) = (shell_quote(&identity.name), shell_quote(&identity.email));
     format!(
         "set -e\n\
          if [ -n \"$SSL_CERT_FILE\" ]; then git config --system http.sslCAInfo \"$SSL_CERT_FILE\"; fi\n\
          if [ -d {dir}/.git ]; then git -C {dir} fetch origin; \
          else mkdir -p \"$(dirname {dir})\" && git clone {repo} {dir}; fi\n\
          cd {dir}\n\
+         git config user.name {name}\n\
+         git config user.email {email}\n\
          if git show-ref --verify --quiet refs/remotes/origin/{br}; then \
          git checkout -B {br} origin/{br} && git branch --set-upstream-to=origin/{br}; \
          else git checkout -B {br}; fi\n",
@@ -385,7 +410,7 @@ pub fn provision(bx: &Blaxel, url: &str, payload: &NodePayload, progress: &mut d
     }
 
     progress(&format!("checking out {}…", payload.branch));
-    let res = bx.run(url, &format!("sh -c {} 2>&1", shell_quote(&checkout_script(payload.repo_url, payload.branch))), 600)?;
+    let res = bx.run(url, &format!("sh -c {} 2>&1", shell_quote(&checkout_script(payload.repo_url, payload.branch, payload.git_identity))), 600)?;
     if res.exit_code != 0 {
         bail!("checking out {} failed (exit {}): {}", payload.branch, res.exit_code, res.output());
     }
@@ -579,12 +604,18 @@ mod tests {
 
     #[test]
     fn checkout_sets_git_ca_and_tracks_origin() {
-        let s = checkout_script("https://github.com/o/r.git", "feat/x");
+        let me = GitIdentity {
+            name: "Ada O'Neil".into(),
+            email: "ada@example.com".into(),
+        };
+        let s = checkout_script("https://github.com/o/r.git", "feat/x", &me);
+        assert!(s.contains(r"git config user.name 'Ada O'\''Neil'"), "{s}");
+        assert!(s.contains("git config user.email ada@example.com"), "{s}");
         assert!(s.contains("git config --system http.sslCAInfo \"$SSL_CERT_FILE\""));
         assert!(s.contains("git clone https://github.com/o/r.git /workspace/repo"));
         assert!(s.contains("refs/remotes/origin/feat/x"));
         assert!(s.contains("git checkout -B feat/x origin/feat/x"));
         // A branch needing quotes stays one word after `origin/`.
-        assert!(checkout_script("u", "a b").contains("origin/'a b'"));
+        assert!(checkout_script("u", "a b", &me).contains("origin/'a b'"));
     }
 }
