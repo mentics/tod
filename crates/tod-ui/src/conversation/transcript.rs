@@ -3,7 +3,8 @@
 
 use super::{ConversationView, Pane, Stop};
 use crate::ui::agent_conversation::{
-    AgentConversationEvent, AgentConversationPanel, Entry, EntryKind, PanelAction,
+    AgentConversationEvent, AgentConversationPanel, Entry, EntryKind, NoticeTone, PanelAction,
+    PanelNotice,
 };
 use crate::ui::terminal_handoff::{self, CONTINUE_IN_TERMINAL, OPEN_SHELL};
 use gpui::{
@@ -15,6 +16,9 @@ use tod_store::conversation::{ConversationRepo, ProtocolKind, Turn, TurnRole};
 const COPY_CONTEXT: &str = "transcript:copy-context";
 /// The transcript header's button that opens the report-a-problem dialog.
 const REPORT_PROBLEM: &str = "transcript:report-problem";
+/// The error entry's button that resends the message that never reached
+/// the agent.
+const RETRY: &str = "transcript:retry";
 
 pub(super) fn entry_of(turn: &Turn, root: &std::path::Path) -> Entry {
     // What the app sent on its own, shown as sent.
@@ -105,6 +109,9 @@ impl ConversationView {
             }
             AgentConversationEvent::Action(id, _) if id.as_ref() == REPORT_PROBLEM => {
                 self.on_report_problem(&crate::ui::report_problem::ReportProblem, window, cx);
+            }
+            AgentConversationEvent::Action(id, _) if id.as_ref() == RETRY => {
+                self.retry_last_message(cx)
             }
             AgentConversationEvent::Action(id, source) => {
                 self.lifecycle_action(id, *source, window, cx)
@@ -211,7 +218,15 @@ impl ConversationView {
         };
         let status = self.status.clone();
         let return_focus = self.focus_handle.clone();
-        let (actions, notices) = self.lifecycle_controls(cx);
+        let (actions, mut notices) = self.lifecycle_controls(cx);
+        // The turn that failed before it reached the agent: offer to
+        // resend it rather than making the user retype it.
+        if !status.running && entries.last().is_some_and(|e| e.kind == EntryKind::Error) {
+            notices.push(
+                PanelNotice::new(NoticeTone::Error, "That message never reached the agent.")
+                    .with_action(PanelAction::new(RETRY, "Retry")),
+            );
+        }
         let lifecycle_state = self.data.lifecycle.as_ref().map(|s| s.lifecycle.clone());
         let usage = self.session_line();
         let mut header_actions = if self.data.has_opening_context {
