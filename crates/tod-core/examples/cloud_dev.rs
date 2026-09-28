@@ -13,7 +13,7 @@
 //!       `cloud_sync::sync_now`: send the outbox, pull the feed.
 //!
 //!   cargo run -p tod-core --example cloud_dev -- <data_root> node <title> <repo> <branch> <step>...
-//!       a node in `cloud`, `active`, with Files on `<repo>` (an HTTPS URL
+//!       a node in `cloud`, `active`, with Lifecycle, Agent, and Files on `<repo>` (an HTTPS URL
 //!       or a local checkout) and `<branch>`, and one plan step per
 //!       `<step>`; prints its UUID. The mock agent reads directives in the
 //!       steps (`wait 3m: …`, `write <path>: <text>`).
@@ -24,6 +24,10 @@
 //!   cargo run -p tod-core --example cloud_dev -- <data_root> state <node> <state>
 //!       sets the node's lifecycle state, bypassing every gate (to run a
 //!       node's later steps again); `run` or `sync` sends it.
+//!   cargo run -p tod-core --example cloud_dev -- <data_root> stop <node>
+//!       takes the node out of the cloud and deletes its sandbox (and with
+//!       it the sandbox's schedules), as the app's "Stop running in the
+//!       cloud" does; syncs.
 //!
 //! Never run it on a data root the app has open.
 
@@ -33,7 +37,7 @@ use tod_store::fleet::{FleetMutation, FleetStore};
 use tod_store::outline::{Capability, CreatePosition, OutlineMutation};
 
 const USAGE: &str =
-    "usage: cloud_dev <data_root> init | run <node> | sync | node <title> <repo> <branch> <step>... | answer <decision> <option> | state <node> <state>";
+    "usage: cloud_dev <data_root> init | run <node> | sync | node <title> <repo> <branch> <step>... | answer <decision> <option> | state <node> <state> | stop <node>";
 
 fn create_node(fleet: &FleetStore, title: &str, repo: &str, branch: &str, steps: &[String]) -> Result<uuid::Uuid> {
     fn e(err: impl std::fmt::Display) -> anyhow::Error {
@@ -60,7 +64,8 @@ fn create_node(fleet: &FleetStore, title: &str, repo: &str, branch: &str, steps:
     fleet
         .enqueue_outline(OutlineMutation::EnableCapabilities {
             node_id: node,
-            capabilities: vec![Capability::Spec, Capability::Files],
+            // Agent too: a Claude run's gate before `implementing` needs it.
+            capabilities: vec![Capability::Spec, Capability::Lifecycle, Capability::Agent, Capability::Files],
         })
         .map_err(e)?;
     fleet.writer().flush().map_err(e)?;
@@ -142,6 +147,10 @@ fn main() -> Result<()> {
             tod_core::lifecycle::set_lifecycle(&fleet, uuid::Uuid::parse_str(&id)?, state)?;
             fleet.writer().flush().map_err(|e| anyhow!("{e}"))?;
             println!("{id} is now {state}");
+        }
+        ("stop", [node]) => {
+            let id = resolve(&fleet, node)?;
+            println!("{}", tod_core::cloud_sync::lost::stop_running_in_cloud(&fleet, &id, true)?);
         }
         _ => bail!("{USAGE}"),
     }

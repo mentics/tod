@@ -60,8 +60,23 @@ pub fn peek_user_version(path: &Path) -> Result<i32> {
         .context("failed to read fleet user_version")
 }
 
-/// Copy a fleet database using the SQLite Online Backup API.
+/// Copy a fleet database using the SQLite Online Backup API, a few pages
+/// at a time with a pause between (so a live database's writers are not
+/// held off for the whole copy): about 40 s for an 8 MB database.
 pub fn backup_database(from: &Path, to: &Path) -> Result<()> {
+    copy_with_backup(from, to, 5, Duration::from_millis(100))
+}
+
+/// Copy a fleet database in one step of the SQLite Online Backup API
+/// (pausing only while the source is busy): the source is read-locked for
+/// the copy itself, well under a second for megabytes. For copies someone
+/// waits on: a snapshot to seed another replica from, and its restore
+/// (`crate::sync`).
+pub fn copy_database(from: &Path, to: &Path) -> Result<()> {
+    copy_with_backup(from, to, std::os::raw::c_int::MAX, Duration::from_millis(10))
+}
+
+fn copy_with_backup(from: &Path, to: &Path, pages_per_step: std::os::raw::c_int, pause: Duration) -> Result<()> {
     if let Some(parent) = to.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("failed to create backup parent dir {}", parent.display()))?;
@@ -74,7 +89,7 @@ pub fn backup_database(from: &Path, to: &Path) -> Result<()> {
     apply_connection_pragmas(&dst, false)?;
     let backup = Backup::new(&src, &mut dst).context("failed to start SQLite online backup")?;
     backup
-        .run_to_completion(5, Duration::from_millis(100), None)
+        .run_to_completion(pages_per_step, pause, None)
         .context("SQLite online backup failed")?;
     Ok(())
 }

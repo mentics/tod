@@ -61,7 +61,8 @@ fn seed_inner(users: &Users, user: &str, snapshot: &[u8]) -> Result<Response> {
 ///
 /// With `impact` (the user's name and the wakes), the running cloud nodes
 /// the changes affect are marked and poked ([`crate::impact_handler`]), and
-/// so are those whose stop questions they answer ([`crate::answers`]).
+/// so are those whose stop questions they answer ([`crate::answers`]) and
+/// those whose waits they change ([`crate::wait_changes`]).
 pub fn apply_changes(
     user: &UserData,
     body: &[u8],
@@ -70,6 +71,7 @@ pub fn apply_changes(
 ) -> Response {
     let mut affected = Vec::new();
     let mut answered = Vec::new();
+    let mut waits_changed = Vec::new();
     let response = reply((|| {
         let changes: Vec<Change> = serde_json::from_slice(body).context("changes: a JSON array of Change")?;
         let _guard = user.sync_lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -86,6 +88,10 @@ pub fn apply_changes(
                 eprintln!("tod-orchestrator: answers: {err:#}");
                 Vec::new()
             });
+            waits_changed = crate::wait_changes::record(&conn, &changes, client).unwrap_or_else(|err| {
+                eprintln!("tod-orchestrator: waits: {err:#}");
+                Vec::new()
+            });
         }
         let last = sync::last_seq(&conn)?;
         drop(conn);
@@ -97,6 +103,7 @@ pub fn apply_changes(
     if let Some((name, wakes)) = impact {
         crate::impact_handler::poke(wakes, name, &affected);
         crate::answers::poke(wakes, name, &answered);
+        crate::wait_changes::poke(wakes, name, &waits_changed);
     }
     response
 }

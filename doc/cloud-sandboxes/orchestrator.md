@@ -42,7 +42,7 @@ changes` never returns the app's own log back to it, whatever `after` says.
 The app pulls again with `after` set to the `last_seq` it was given. Changes
 from the app are applied without being logged again, so they are not echoed.
 
-After an apply, two handlers look at what arrived. `impact_handler.rs` marks
+After an apply, three handlers look at what arrived. `impact_handler.rs` marks
 the running cloud nodes whose context the changes affect and pokes them.
 `answers.rs` pokes a cloud node when the changes answer one of its **stop
 questions** (`tod_core::stop_questions`): the decisions the node's
@@ -55,7 +55,11 @@ stop question: "Keep going" / "Wake it again" carries on (after a spent
 budget, with another budget of the same size); "Leave it stopped" / "Leave
 it asleep" leaves it stopped, asking nothing and scheduling no wake, until
 the user answers again (the last answer counts). While one is unanswered the
-supervisor does not ask again.
+supervisor does not ask again. `wait_changes.rs` pokes a cloud node when a
+client other than its own supervisor changes one of its waits (the user
+cancels, satisfies, or reschedules it): waits are not context either, and
+without the poke the node would sleep until the wake it scheduled for the
+old time.
 
 ## Provisioning
 

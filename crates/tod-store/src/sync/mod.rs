@@ -712,11 +712,14 @@ fn drop_orphans(tx: &Connection, report: &mut ApplyReport) -> Result<()> {
 
 /// Copies the whole database at `db` to `to` (SQLite online backup), for
 /// seeding another copy. The copy's [`last_seq`] is the cursor to export from.
+/// One step, not the paced backup: the orchestrator takes it under the
+/// user's sync lock while a node's supervisor waits to start.
 pub fn snapshot(db: &Path, to: &Path) -> Result<()> {
-    crate::fleet::schema::backup_database(db, to)
+    crate::fleet::schema::copy_database(db, to)
 }
 
-/// Replaces the database at `db` with the snapshot at `from`.
+/// Replaces the database at `db` with the snapshot at `from` (in one step,
+/// like [`snapshot`]).
 pub fn restore(from: &Path, db: &Path) -> Result<()> {
-    crate::fleet::schema::restore_database(from, db)
+    crate::fleet::schema::copy_database(from, db)
 }

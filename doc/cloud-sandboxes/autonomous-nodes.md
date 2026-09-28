@@ -290,7 +290,9 @@ deletes any of that name first, so rescheduling replaces it. The supervisor
 keeps the wait it last scheduled in its state directory (`scheduled-wake`):
 when a sooner wait takes over, or it wakes to work (the wait was satisfied
 some other way, such as a webhook before the deadline), it cancels that
-one. A deleted or already fired schedule is not an error (one-shot
+one. A wait the user cancels, satisfies, or reschedules in the app pokes
+the node (the orchestrator's `wait_changes`), so it reconciles its wake
+then, not at the old time. A deleted or already fired schedule is not an error (one-shot
 schedules delete themselves once they have run); a stale one firing later
 is a harmless poke.
 
@@ -658,9 +660,31 @@ chosen per account in `sandboxes.toml`, so the same code runs everywhere:
      (already gone) schedule, and carried the node on to its review gate. A
      10-minute wait satisfied from the app instead had its live schedule
      deleted on the next poke.
-   - Open: a Blaxel token from `bl login` in a node's proxy expires; nodes
-     that schedule themselves for long should run on an API key (`auth =
-     "api-key"`).
+   - With an API key (`auth = "api-key"`, 2026-09-28): the node's proxy
+     rule for `api.blaxel.ai` carries the key (`Sandboxes::token`; the `bl`
+     token cache was not touched by the runs, and the user endpoint
+     `/v0/profile` answered 401 through the proxy, while schedules were
+     created, listed, and deleted through it). A mock node on `mentics/test-repo` recorded `wait 3m`; its
+     supervisor created `wait-<id>` (`at` 03:59:00Z, the wait due at
+     03:58:59.3Z) and exited; the sandbox went to standby; the schedule
+     fired at 03:59:42 (**42 s late**), its command poked the relay, which
+     started the supervisor; it settled the wait within a second, found the
+     schedule already gone, and carried the node on to its PR gate. The
+     schedule list was empty afterwards. `tod-sandbox status` (the control
+     plane) still said STANDBY for about three minutes after the wake.
+   - Cancelling: a second node's 10-minute wait, cancelled in the app
+     (`tod-cli wait cancel`, then sync), did **not** wake it: waits were not
+     context, so the orchestrator poked nobody, and the node would have slept
+     until the old time. Its next poke (an obligation added) deleted the
+     live schedule, which then never fired. Fixed: a wait changed by any
+     client but the node's own supervisor now pokes the node
+     (`tod-orchestrator`'s `wait_changes`); not yet deployed to the
+     development orchestrator.
+   - The first start of each node's supervisor spent 74–87 s seeding its
+     copy of the database: `sync::snapshot` (on the orchestrator, under the
+     user's sync lock) and `sync::restore` (in the sandbox) used the paced
+     backup, 5 pages then 100 ms, about 36 s each for the 7 MB database.
+     Both now copy in one step.
 2. **Agent Drive.** Private preview, and only in `us-was-1`, which is also
    the region the team will use (tod's default region is now `us-was-1`).
    Check that a mount survives standby, and how it behaves with a line
@@ -675,10 +699,21 @@ chosen per account in `sandboxes.toml`, so the same code runs everywhere:
    (and volume) are free.
 4. **The proxy.** Claude Code's own traffic goes through it and gets the
    subscription token injected (see Credentials; measured with a dummy
-   token). Still open: a successful, streamed turn with a real token; whether
-   a rule's secrets can be rotated on a running sandbox (the proxy cannot be
-   added after creation); and existing sandboxes, which were created without
-   it.
+   token). A real token works through it (2026-09-28): a Claude node
+   (`cloud-claude-pr-3`, from `proposed`, one obligation: add
+   `tod-claude-test-3.md` with one sentence) ran 11 Claude sessions (gate
+   checks, on-entry turns, Implement, Verify, Review, PR) with the token only
+   in the proxy, and opened https://github.com/mentics/test-repo/pull/4
+   (one file, one line), stopping at `approved` on "PR merged?". Polled
+   every ~16 s (58 polls, each stamped with the sandbox's clock): never more
+   than one `claude-agent-acp` and one `claude` alive (once, a `claude auth
+   status` beside them, from the same adapter); a session's `claude`,
+   orphaned when its adapter exits, showed as `<defunct>` under the relay in
+   3 polls and was gone by the next (the relay reaps orphans every 5 s; 11
+   reaped, one per session); afterwards nothing but the sandbox API and the
+   relay, no zombies. Still open: whether a rule's secrets can be rotated on
+   a running sandbox (the proxy cannot be added after creation); and
+   existing sandboxes, which were created without it.
 5. **The push service.** Pick one; measure publish-to-app latency.
 6. **Subscription use.** One subscription driving many unattended agents: the
    limits, and that it is within the subscription's terms.
