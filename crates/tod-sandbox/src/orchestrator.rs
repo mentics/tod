@@ -183,7 +183,7 @@ pub fn provision(bx: &Blaxel, spec: &Spec, progress: &mut dyn FnMut(&str)) -> Re
     bx.kill(&url, RELAY_PROCESS)?;
     bx.run(&url, "mkdir -p /opt/tod", 30)?;
     bx.upload(&url, RELAY_PATH, spec.relay, "0755")?;
-    bx.start(&url, RELAY_PROCESS, &format!("{RELAY_PATH} --port {RELAY_PORT}"), true)?;
+    bx.start(&url, RELAY_PROCESS, &crate::provision::relay_command(), true)?;
     progress("starting tod-orchestrator…");
     bx.start_with_env(&url, PROCESS, &start_command(), true, &process_env(spec))?;
     // A preview that already exists is fine; any other failure only costs

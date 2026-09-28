@@ -262,11 +262,13 @@ without it, so leave it unset there, or the base sits unused. See
 `cargo run -p tod-core --example cloud_dev -- <data_root> run <node>` does
 what the app's "Run in the cloud" does (`cloud_sync::run_in_cloud`): seed the
 orchestrator, create the node's sandbox with its proxy rules, install the
-relay, the `tod-cli` shim, the supervisor, and the process and media
-bundles, check out the node's branch (its commits authored by your git
+relay, the `tod-cli` shim, the supervisor, the process and media
+bundles, and the Claude agent adapter when the image lacks it, check out the node's branch (its commits authored by your git
 `user.name`/`user.email`: the node repository's own if it is on this
 machine, else your global one), and poke it. `... sync` sends the
-outbox and pulls the node's progress back; `... init` makes a list `cloud` in
+outbox and pulls the node's progress back; `... answer <decision> <option>`
+answers one of the node's pending decisions (as the task panel would; `sync`
+sends it); `... init` makes a list `cloud` in
 a fresh data root, and `... node <title> <repo> <branch> <step>...` a node
 in it (`active`, with Files on the repository, an HTTPS URL or a checkout,
 and one plan step per argument), printing its UUID. Build the sandbox

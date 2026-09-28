@@ -17,6 +17,10 @@
 //!       or a local checkout) and `<branch>`, and one plan step per
 //!       `<step>`; prints its UUID. The mock agent reads directives in the
 //!       steps (`wait 3m: …`, `write <path>: <text>`).
+//!   cargo run -p tod-core --example cloud_dev -- <data_root> answer <decision> <option>
+//!       answers a pending decision (its full UUID, from `tod-cli --json
+//!       decisions list`) with its 1-based option, as the task panel does;
+//!       `sync` then sends it to the node.
 //!
 //! Never run it on a data root the app has open.
 
@@ -26,7 +30,7 @@ use tod_store::fleet::{FleetMutation, FleetStore};
 use tod_store::outline::{Capability, CreatePosition, OutlineMutation};
 
 const USAGE: &str =
-    "usage: cloud_dev <data_root> init | run <node> | sync | node <title> <repo> <branch> <step>...";
+    "usage: cloud_dev <data_root> init | run <node> | sync | node <title> <repo> <branch> <step>... | answer <decision> <option>";
 
 fn create_node(fleet: &FleetStore, title: &str, repo: &str, branch: &str, steps: &[String]) -> Result<uuid::Uuid> {
     fn e(err: impl std::fmt::Display) -> anyhow::Error {
@@ -111,6 +115,24 @@ fn main() -> Result<()> {
         ("node", [title, repo, branch, steps @ ..]) if !steps.is_empty() => {
             let id = create_node(&fleet, title, repo, branch, steps)?;
             println!("{id}");
+        }
+        ("answer", [decision, option]) => {
+            let decision_id = uuid::Uuid::parse_str(decision).context("the decision's full UUID")?;
+            let option: i64 = option.parse().context("a 1-based option number")?;
+            if option < 1 {
+                bail!("options are numbered from 1");
+            }
+            fleet
+                .interview(
+                    tod_store::interview::ACTOR_USER,
+                    tod_store::interview::InterviewCommand::AnswerDecision {
+                        decision_id,
+                        option: Some(option),
+                        text: None,
+                    },
+                )
+                .map_err(|e| anyhow!("{e}"))?;
+            println!("answered {decision_id} with option {option}");
         }
         _ => bail!("{USAGE}"),
     }

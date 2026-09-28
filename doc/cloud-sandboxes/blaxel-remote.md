@@ -93,7 +93,11 @@ What a ready sandbox has:
 - `/opt/tod/manifest`: hashes of the bootstrap script and the relay, and
   whether agents were asked for. Connecting checks it in one relay round trip
   (0.3 s) and reprovisions only when it differs, for example after a tod
-  update. A baked image carries the same manifest.
+  update. A baked image carries the same manifest. An autonomous node's
+  sandbox has a `node relay=…` manifest instead, written by the app that
+  runs the node: connecting to it never reprovisions it, since that would
+  restart its relay (killing the node's supervisor) and replace its
+  `tod-cli`.
 
 Measured end to end with `tod-sandbox create`:
 

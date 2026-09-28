@@ -13,7 +13,7 @@
 
 use crate::blaxel::{Blaxel, RELAY_PORT};
 pub use crate::config::{ClaudeTokenVia, SchedulerKind};
-use crate::provision::{RELAY_PATH, RELAY_PROCESS, TOD_CLI_PATH, TOD_DIR};
+use crate::provision::{MANIFEST_PATH, RELAY_PATH, RELAY_PROCESS, TOD_CLI_PATH, TOD_DIR, node_manifest};
 use crate::relay::shell_quote;
 use anyhow::{Result, bail};
 use base64::Engine;
@@ -409,14 +409,20 @@ pub fn install(bx: &Blaxel, url: &str, payload: &NodePayload, progress: &mut dyn
         Some(bytes) => bx.upload_large(url, LOCAL_CLI_PATH, bytes, "0755")?,
         None => progress("warning: tod-cli is not built for Linux (target/sandbox/); `tod-cli pr` will not work in the node"),
     }
+    // The node manifest keeps `tod-sandbox`'s own provisioning (a shell,
+    // `exec`, Zed) from reinstalling over this relay and `tod-cli`.
     let res = bx.run(
         url,
-        &format!("mkdir -p {TOD_DIR}/bin && ln -sf {TOD_CLI_PATH} /usr/local/bin/tod-cli && {LOOPBACK_HOSTS}"),
+        &format!(
+            "mkdir -p {TOD_DIR}/bin && ln -sf {TOD_CLI_PATH} /usr/local/bin/tod-cli && {LOOPBACK_HOSTS} && printf '%s\\n' {} > {MANIFEST_PATH}",
+            shell_quote(&node_manifest(payload.relay))
+        ),
         30,
     )?;
     if res.exit_code != 0 {
         bail!("installing tod-cli failed: {}", res.output());
     }
+    ensure_claude_adapter(bx, url, progress)?;
     if !payload.bundles.is_empty() {
         progress(&format!("installing {} bundle files…", payload.bundles.len()));
         let res = bx.run(url, &format!("rm -rf {TOD_DIR}/process {TOD_DIR}/media"), 30)?;
@@ -444,7 +450,7 @@ pub fn start(bx: &Blaxel, url: &str, payload: &NodePayload, progress: &mut dyn F
     bx.kill(url, RELAY_PROCESS)?;
     let relay_env = relay_env(payload.supervisor_env);
     let relay_env: Vec<(&str, &str)> = relay_env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-    bx.start_with_env(url, RELAY_PROCESS, &format!("{RELAY_PATH} --port {RELAY_PORT}"), true, &relay_env)?;
+    bx.start_with_env(url, RELAY_PROCESS, &crate::provision::relay_command(), true, &relay_env)?;
     if payload.supervisor.is_some() {
         // Through the relay's poke, like every later wake: the relay starts
         // `tod-supervisor wake` (its default `--supervisor-cmd`, the same
@@ -536,6 +542,41 @@ pub fn fork(bx: &Blaxel, base: &str, spec: &NodeSandboxSpec, creds: &NodeCredent
 const LOOPBACK_HOSTS: &str = "{ grep -qw localhost /etc/hosts 2>/dev/null || \
      printf '127.0.0.1 localhost\\n::1 localhost ip6-localhost ip6-loopback\\n' >> /etc/hosts; }";
 
+/// The Claude ACP adapter's npm package: the only adapter tod runs Claude on
+/// (`tod_agent::claude_adapter`).
+const CLAUDE_ADAPTER_PACKAGE: &str = "@agentclientprotocol/claude-agent-acp";
+
+/// Installs the Claude adapter globally when the image lacks it, as an image
+/// baked before it replaced `claude-code-acp` does; otherwise a Claude node
+/// fails every step with "the Claude ACP adapter is not installed". Exits 0
+/// at once when it is there, 3 when there is no npm to install it with.
+fn claude_adapter_script() -> String {
+    format!(
+        "command -v claude-agent-acp >/dev/null 2>&1 && exit 0; \
+         command -v npm >/dev/null 2>&1 || {{ echo 'no npm in the image'; exit 3; }}; \
+         echo installing; npm install -g --silent --prefix /usr/local {CLAUDE_ADAPTER_PACKAGE} 2>&1"
+    )
+}
+
+/// See [`claude_adapter_script`]. A sandbox that cannot have it still runs
+/// a node on the mock agent, so failing is only a warning.
+fn ensure_claude_adapter(bx: &Blaxel, url: &str, progress: &mut dyn FnMut(&str)) -> Result<()> {
+    let check = bx.run(url, "command -v claude-agent-acp >/dev/null 2>&1", 30)?;
+    if check.exit_code == 0 {
+        return Ok(());
+    }
+    progress("installing the Claude agent adapter (the image lacks it)…");
+    let res = bx.run(url, &format!("sh -c {}", shell_quote(&claude_adapter_script())), 600)?;
+    if res.exit_code != 0 {
+        progress(&format!(
+            "warning: could not install {CLAUDE_ADAPTER_PACKAGE} (exit {}), so the node cannot run Claude: {}",
+            res.exit_code,
+            res.output().trim()
+        ));
+    }
+    Ok(())
+}
+
 /// The command the relay runs to start the supervisor (its default
 /// `--supervisor-cmd`).
 pub fn supervisor_command() -> String {
@@ -563,6 +604,53 @@ pub fn poke_script() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn claude_adapter_script_names_the_adapter_package() {
+        let s = claude_adapter_script();
+        assert!(s.starts_with("command -v claude-agent-acp"), "{s}");
+        assert!(s.contains("npm install -g --silent --prefix /usr/local @agentclientprotocol/claude-agent-acp"));
+        assert!(!s.contains("claude-code-acp"));
+    }
+
+    /// Runs the script with only `bin` on `PATH`; `npm` there records that
+    /// it ran.
+    #[cfg(unix)]
+    fn run_adapter_script(adapter: bool, npm: bool) -> (i32, bool) {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("tod-adapter-{}-{adapter}-{npm}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let bin = dir.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let script = |name: &str, body: &str| {
+            let p = bin.join(name);
+            std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        if adapter {
+            script("claude-agent-acp", "exit 0");
+        }
+        if npm {
+            script("npm", &format!(": > {}", dir.join("npm-ran").display()));
+        }
+        let status = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(claude_adapter_script())
+            .env("PATH", &bin)
+            .status()
+            .unwrap();
+        let ran = dir.join("npm-ran").exists();
+        let _ = std::fs::remove_dir_all(&dir);
+        (status.code().unwrap_or(-1), ran)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn claude_adapter_script_installs_only_when_missing() {
+        assert_eq!(run_adapter_script(true, true), (0, false));
+        assert_eq!(run_adapter_script(false, true), (0, true));
+        assert_eq!(run_adapter_script(false, false), (3, false));
+    }
 
     fn creds() -> NodeCredentials {
         NodeCredentials {

@@ -5,6 +5,12 @@
 //! `/opt/tod/manifest`. Checking it is one command through the relay when the
 //! relay is already up, so connecting to a ready sandbox costs one round trip.
 //! A baked image carries the same manifest, so it is never reprovisioned.
+//!
+//! A node sandbox (`crate::node`) is provisioned by the app that runs the
+//! node, not here, and its `tod-cli` is a different script. It writes a
+//! [`node_manifest`], which [`ensure`] takes as ready: reinstalling would
+//! kill its relay, and with it the node's running supervisor, and replace
+//! its `tod-cli`, just because someone opened a shell or ran a command there.
 
 use crate::blaxel::Blaxel;
 use crate::relay;
@@ -22,6 +28,15 @@ pub const TOD_CLI_PATH: &str = "/opt/tod/bin/tod-cli";
 pub const TUNNEL_PORT: u16 = 2223;
 /// The relay's name in the sandbox's process API.
 pub const RELAY_PROCESS: &str = "tod-relay";
+
+/// How the sandbox's process API starts the relay. The API runs a command
+/// through `sh -c` and reaps only its own children; `exec` makes the relay
+/// that child, so killing it to restart it leaves no `<defunct>` relay
+/// behind (without it `sh` is killed and reaped, and the relay is orphaned
+/// to PID 1, which never reaps it).
+pub fn relay_command() -> String {
+    format!("exec {RELAY_PATH} --port {}", crate::blaxel::RELAY_PORT)
+}
 
 /// What gets installed into a sandbox.
 pub struct Payload<'a> {
@@ -53,6 +68,25 @@ impl Payload<'_> {
     }
 }
 
+/// What a node sandbox's [`MANIFEST_PATH`] says: its relay, installed by
+/// `crate::node::install`. [`ensure`] never reprovisions a sandbox that has one.
+pub fn node_manifest(relay: &[u8]) -> String {
+    format!("{NODE_MANIFEST_PREFIX}relay={}", &hex(relay)[..16])
+}
+
+const NODE_MANIFEST_PREFIX: &str = "node ";
+
+/// Whether `manifest` is a node sandbox's ([`node_manifest`]).
+pub fn is_node_manifest(manifest: &str) -> bool {
+    manifest.trim().starts_with(NODE_MANIFEST_PREFIX)
+}
+
+/// Whether a sandbox whose relay reports `reported` needs nothing from
+/// [`ensure`]: it is the manifest expected, or the sandbox is a node's.
+fn ready_as_is(reported: Option<&str>, expected: &str) -> bool {
+    reported.is_some_and(|m| m == expected || is_node_manifest(m))
+}
+
 /// What [`ensure`] had to do.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Outcome {
@@ -64,11 +98,18 @@ pub enum Outcome {
 /// Makes the sandbox at `url` ready. `progress` hears about each slow step.
 pub fn ensure(bx: &Blaxel, url: &str, payload: &Payload, progress: &mut dyn FnMut(&str)) -> Result<Outcome> {
     let manifest = payload.manifest();
-    if relay_manifest(bx, url).as_deref() == Some(manifest.as_str()) {
+    if ready_as_is(relay_manifest(bx, url).as_deref(), &manifest) {
         return Ok(Outcome::AlreadyReady);
     }
 
     let current = bx.run(url, &format!("cat {MANIFEST_PATH} 2>/dev/null"), 30)?;
+    if is_node_manifest(current.output()) {
+        // Its relay is started by the node's provisioning, with the
+        // supervisor's environment; starting one here would lack it.
+        bail!(
+            "this is a node's sandbox and its relay is not answering; run the node in the cloud again to              reprovision it"
+        );
+    }
     let mut outcome = Outcome::RelayStarted;
     if current.output().trim() != manifest {
         progress("installing tod's dependencies in the sandbox (first connect only)…");
@@ -101,12 +142,12 @@ pub fn ensure(bx: &Blaxel, url: &str, payload: &Payload, progress: &mut dyn FnMu
 
     if bx.process_status(url, RELAY_PROCESS)?.as_deref() != Some("running") {
         progress("starting the relay…");
-        bx.start(url, RELAY_PROCESS, &format!("{RELAY_PATH} --port {}", crate::blaxel::RELAY_PORT), true)?;
+        bx.start(url, RELAY_PROCESS, &relay_command(), true)?;
     }
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
         match relay_manifest(bx, url) {
-            Some(m) if m == manifest => return Ok(outcome),
+            Some(m) if ready_as_is(Some(&m), &manifest) => return Ok(outcome),
             Some(m) => bail!("the sandbox reports manifest {m:?}, expected {manifest:?}"),
             None if Instant::now() > deadline => bail!("the relay did not come up within 20s"),
             None => std::thread::sleep(Duration::from_millis(500)),
@@ -190,6 +231,26 @@ mod tests {
         assert_ne!(a.manifest(), b.manifest());
         assert_ne!(a.manifest(), c.manifest());
         assert_eq!(a.manifest(), Payload { bootstrap: b"a", relay: b"r", tod_cli: b"t", agents: false }.manifest());
+    }
+
+    #[test]
+    fn the_relay_replaces_the_shell_that_starts_it() {
+        assert_eq!(relay_command(), format!("exec {RELAY_PATH} --port {}", crate::blaxel::RELAY_PORT));
+    }
+
+    #[test]
+    fn a_node_sandbox_is_ready_as_is() {
+        let p = Payload { bootstrap: b"a", relay: b"r", tod_cli: b"t", agents: true };
+        let node = node_manifest(b"another relay");
+        assert!(is_node_manifest(&node));
+        assert!(is_node_manifest(&format!("{node}
+")));
+        assert!(!is_node_manifest(&p.manifest()));
+        assert!(ready_as_is(Some(&node), &p.manifest()));
+        assert!(ready_as_is(Some(&p.manifest()), &p.manifest()));
+        assert!(!ready_as_is(Some("bootstrap=0 relay=0 tod-cli=0 agents=true"), &p.manifest()));
+        assert!(!ready_as_is(None, &p.manifest()));
+        assert_ne!(node_manifest(b"r1"), node_manifest(b"r2"));
     }
 
     #[test]
