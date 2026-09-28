@@ -46,9 +46,14 @@ pub fn is_certifiable(state: &str) -> bool {
     CERTIFIABLE_STATES.contains(&state)
 }
 
+///
+/// `id` is a UUIDv7: the table is synced, so two copies (the app and a cloud
+/// runner) insert on their own between syncs, and an autoincrement key would
+/// collide and let one side's event overwrite the other's. v7 ids also sort
+/// by time, which the log is read in.
 pub const CREATE_TABLE: &str = "
     CREATE TABLE IF NOT EXISTS phase_events (
-        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        id              BLOB PRIMARY KEY,
         node_id         BLOB NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
         state           TEXT NOT NULL,
         kind            TEXT NOT NULL CHECK (kind IN ('ready','certify','reject')),
@@ -59,12 +64,50 @@ pub const CREATE_TABLE: &str = "
         body            TEXT NOT NULL DEFAULT '',
         created_at      INTEGER NOT NULL
     );
-    CREATE INDEX IF NOT EXISTS idx_phase_events_node ON phase_events(node_id, state, id);
+    CREATE INDEX IF NOT EXISTS idx_phase_events_node ON phase_events(node_id, state, created_at);
 ";
+
+/// Create `phase_events`, or rebuild one whose `id` is still the integer it
+/// first was (a store opened by the branch that introduced the table),
+/// keeping its rows in order under new UUIDv7 ids.
+pub fn ensure_table(conn: &Connection) -> Result<()> {
+    let id_type: Option<String> = conn
+        .query_row(
+            "SELECT type FROM pragma_table_info('phase_events') WHERE name = 'id'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if !id_type.is_some_and(|t| t.eq_ignore_ascii_case("INTEGER")) {
+        conn.execute_batch(CREATE_TABLE)?;
+        return Ok(());
+    }
+    conn.execute_batch(
+        "DROP TRIGGER IF EXISTS trg_journey_phase_events_insert;
+         DROP INDEX IF EXISTS idx_phase_events_node;
+         ALTER TABLE phase_events RENAME TO phase_events_old;",
+    )?;
+    conn.execute_batch(CREATE_TABLE)?;
+    let old_ids: Vec<i64> = conn
+        .prepare("SELECT id FROM phase_events_old ORDER BY id")?
+        .query_map([], |row| row.get(0))?
+        .collect::<Result<_, _>>()?;
+    for old in old_ids {
+        conn.execute(
+            "INSERT INTO phase_events
+             (id, node_id, state, kind, digest, snapshot, conversation_id, certifier, body, created_at)
+             SELECT ?1, node_id, state, kind, digest, snapshot, conversation_id, certifier, body, created_at
+             FROM phase_events_old WHERE id = ?2",
+            params![uuid_to_blob(Uuid::now_v7()), old],
+        )?;
+    }
+    conn.execute_batch("DROP TABLE phase_events_old;")?;
+    Ok(())
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct PhaseEvent {
-    pub id: i64,
+    pub id: Uuid,
     pub node_id: Uuid,
     /// The lifecycle state the event is about.
     pub state: String,
@@ -177,7 +220,11 @@ struct Inputs {
 /// - `proposed`: the node's own obligations (id, kind, body).
 /// - `design`: those, plus its content except the regenerated `summary`
 ///   and the data source's `metadata`, each obligation's mockup (path and
-///   file hash), and any linked media (id, role, sha256).
+///   file hash), and any linked media (id, role, sha256). `metadata` is the
+///   generator's own record of the source item (it links the node to its
+///   Linear issue, and the task editor shows it); no agent is given it, so
+///   no design turns on it, and a refresh that only touches it must not
+///   send the phase back.
 /// - `planning`: own obligations, plan steps (id, body), and which step
 ///   satisfies which obligation.
 /// - `merged`, `released`: `{}` — the certificate is a check mark for the stay.
@@ -474,10 +521,11 @@ impl<'a> PhaseRepo<'a> {
             );
         }
         let digest = digest(&snapshot);
+        let id = Uuid::now_v7();
         self.conn.execute(
             "INSERT INTO phase_events
-             (node_id, state, kind, digest, snapshot, conversation_id, certifier, body, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+             (id, node_id, state, kind, digest, snapshot, conversation_id, certifier, body, created_at)
+             VALUES (?10, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 uuid_to_blob(node_id),
                 state,
@@ -488,13 +536,13 @@ impl<'a> PhaseRepo<'a> {
                 certifier,
                 body,
                 now_ms(),
+                uuid_to_blob(id),
             ],
         )?;
-        let id = self.conn.last_insert_rowid();
         self.conn
             .query_row(
                 &format!("SELECT {COLUMNS} FROM phase_events WHERE id = ?1"),
-                params![id],
+                params![uuid_to_blob(id)],
                 map_event,
             )
             .context("phase event vanished after insert")
@@ -536,7 +584,8 @@ impl<'a> PhaseRepo<'a> {
         };
         let mut stmt = self.conn.prepare(&format!(
             "SELECT {COLUMNS} FROM phase_events
-             WHERE node_id = ?1 AND state = ?2 AND created_at >= ?3 ORDER BY id"
+             WHERE node_id = ?1 AND state = ?2 AND created_at >= ?3
+             ORDER BY created_at, id"
         ))?;
         let rows = stmt
             .query_map(params![uuid_to_blob(node_id), state, since], map_event)?
@@ -547,7 +596,7 @@ impl<'a> PhaseRepo<'a> {
     /// Every event on the node, oldest first, across every stay.
     pub fn list_for_node(&self, node_id: Uuid) -> Result<Vec<PhaseEvent>> {
         let mut stmt = self.conn.prepare(&format!(
-            "SELECT {COLUMNS} FROM phase_events WHERE node_id = ?1 ORDER BY id"
+            "SELECT {COLUMNS} FROM phase_events WHERE node_id = ?1 ORDER BY created_at, id"
         ))?;
         let rows = stmt
             .query_map(params![uuid_to_blob(node_id)], map_event)?
@@ -657,7 +706,7 @@ fn map_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<PhaseEvent> {
     let conversation_id: Option<Vec<u8>> = row.get(6)?;
     let snapshot: String = row.get(5)?;
     Ok(PhaseEvent {
-        id: row.get(0)?,
+        id: blob_to_uuid_sql(&row.get::<_, Vec<u8>>(0)?)?,
         node_id: blob_to_uuid_sql(&row.get::<_, Vec<u8>>(1)?)?,
         state: row.get(2)?,
         kind: row.get(3)?,
@@ -1069,5 +1118,60 @@ mod tests {
             .execute("DELETE FROM nodes WHERE id = ?1", params![uuid_to_blob(fx.node)])
             .unwrap();
         assert!(PhaseRepo::new(&fx.conn).list_for_node(fx.node).unwrap().is_empty());
+    }
+
+    /// A store opened by the branch that introduced the table has integer
+    /// ids; opening it again rebuilds the table with UUIDs, keeping every
+    /// row and their order.
+    #[test]
+    fn an_integer_keyed_table_is_rebuilt_with_its_rows_in_order() {
+        let fx = setup("merged");
+        fx.conn
+            .execute_batch(
+                "DROP TABLE phase_events;
+                 CREATE TABLE phase_events (
+                     id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                     node_id         BLOB NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+                     state           TEXT NOT NULL,
+                     kind            TEXT NOT NULL,
+                     digest          TEXT NOT NULL,
+                     snapshot        TEXT NOT NULL,
+                     conversation_id BLOB,
+                     certifier       TEXT NOT NULL,
+                     body            TEXT NOT NULL DEFAULT '',
+                     created_at      INTEGER NOT NULL
+                 );
+                 CREATE INDEX idx_phase_events_node ON phase_events(node_id, state, id);",
+            )
+            .unwrap();
+        for body in ["first", "second"] {
+            fx.conn
+                .execute(
+                    "INSERT INTO phase_events
+                     (node_id, state, kind, digest, snapshot, certifier, body, created_at)
+                     VALUES (?1, 'merged', 'certify', 'd', '{}', 'user', ?2, 5)",
+                    params![uuid_to_blob(fx.node), body],
+                )
+                .unwrap();
+        }
+
+        ensure_table(&fx.conn).unwrap();
+        ensure_table(&fx.conn).unwrap();
+
+        let events = PhaseRepo::new(&fx.conn).list_for_node(fx.node).unwrap();
+        let bodies: Vec<&str> = events.iter().map(|e| e.body.as_str()).collect();
+        assert_eq!(bodies, ["first", "second"]);
+        assert!(events.iter().all(|e| e.id.get_version_num() == 7));
+        let old_left: i64 = fx
+            .conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE name = 'phase_events_old'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(old_left, 0);
+        certify(&fx, "merged");
+        assert_eq!(PhaseRepo::new(&fx.conn).list_for_node(fx.node).unwrap().len(), 3);
     }
 }

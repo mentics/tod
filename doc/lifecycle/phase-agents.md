@@ -109,23 +109,28 @@ same independence, and they are not changed.
 
 ## Certificates
 
-Table `phase_certifications`, keyed on `node_id` and `state`, so it holds only
-the latest certificate:
+Table `phase_events` (`tod_store::phase`), an append-only log of what was
+recorded about each state's phase: `ready` (the phase agent asks for an
+evaluation), `certify`, and `reject` (the evaluator's fixes). The certificate
+is the latest `certify` in the node's current stay in the state.
 
 | Column | |
 |---|---|
-| `node_id`, `state` | primary key |
+| `id` | UUIDv7. The table is synced, and the app and a cloud runner both write it between syncs, so an autoincrement key would collide; v7 ids also sort by time |
+| `node_id`, `state` | the node and the state the event is about |
+| `kind` | `ready` \| `certify` \| `reject` |
 | `digest` | SHA-256 over the canonical JSON of the state's inputs (below) |
-| `conversation_id` | who certified: phase agent, evaluator, or null for the user |
-| `evaluator` | `self` \| `independent` \| `user` |
-| `note` | the certifier's one-line rationale, shown in the lifecycle panel |
-| `certified_at` | |
+| `snapshot` | those inputs, so the app can say what changed since |
+| `conversation_id` | who recorded it: phase agent, evaluator, or null for the user |
+| `certifier` | `self` \| `independent` \| `user` |
+| `body` | `certify`: the note; `reject`: the fixes, as a JSON array |
+| `created_at` | |
 
 A certificate is **current** when both of these hold:
 
-- `certified_at` is not earlier than `node_lifecycle.updated_at`, so a
-  certificate from an earlier stay in the state does not count;
-- the digest recomputed now equals `digest`.
+- it was recorded at or after `node_lifecycle.updated_at`, so a certificate
+  from an earlier stay in the state does not count;
+- the digest recomputed now equals its `digest`.
 
 The digest is computed in `tod-store`, over rows sorted by id. `sha2` is
 already a dependency there. The same function runs at certify time and at gate
@@ -217,7 +222,7 @@ follow-up is not needed for this change.
 - **`lifecycle_next`:** `next_step` returns `Advance`, `Phase` or `Evaluate`
   in place of `GateCheck`. The autopilot's `gate()` becomes "evaluate the
   derived criteria; if all clear, advance".
-- The **`phase_certifications` table**, with a `journey_changes` trigger. The
+- The **`phase_events` table**, with a `journey_changes` trigger. The
   certify / reject / ready journey events come from `Actor::Agent`, or from
   `Actor::User` for "Mark phase done".
 - **UI.**
@@ -261,7 +266,7 @@ Items 1–7 are done.
 
 1. Free-text decisions: the CLI, the card, and the mock directive. This is
    independent of the rest and fixes the dead end on its own once (4) lands.
-2. The `phase_certifications` table, the digest functions per state, and
+2. The `phase_events` table, the digest functions per state, and
    `tod-cli phase` with docs and doc_sync. Also the `<state>.phase-certified`
    and `learn-recorded` derived criteria, the seed changes, and deactivating
    the agent-judged criteria.

@@ -228,7 +228,7 @@ impl PhaseStanding {
         let marker = format!(
             "{}:{}",
             digest.unwrap_or_default(),
-            last.map(|e| e.id).unwrap_or_default()
+            last.map(|e| e.id.to_string()).unwrap_or_default()
         );
         Ok(Self {
             certificate: repo.certificate_status(node, state)?,

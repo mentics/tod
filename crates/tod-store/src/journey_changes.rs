@@ -297,13 +297,13 @@ pub fn request_feedback_triggers_sql() -> String {
 }
 
 /// Trigger for `phase_events` (`crate::phase`): append-only, so insert
-/// only; the row id is an autoincrement integer.
+/// only.
 pub fn phase_events_triggers_sql() -> String {
     format!(
         "
         CREATE TRIGGER IF NOT EXISTS trg_journey_phase_events_insert AFTER INSERT ON phase_events BEGIN
             INSERT INTO journey_changes (node_id, tbl, row_id, op, at)
-            VALUES (NEW.node_id, 'phase_events', CAST(NEW.id AS TEXT), 'insert', {NOW});
+            VALUES (NEW.node_id, 'phase_events', hex(NEW.id), 'insert', {NOW});
         END;
         "
     )

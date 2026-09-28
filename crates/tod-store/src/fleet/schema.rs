@@ -470,7 +470,7 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
         // Phase certifications (`crate::phase`, `doc/lifecycle/phase-agents.md`);
         // synced. Certificates replace the buildable criterion and the
         // trigger that reset it on every obligation change.
-        conn.execute_batch(crate::phase::CREATE_TABLE)?;
+        crate::phase::ensure_table(conn)?;
         conn.execute_batch(&crate::journey_changes::phase_events_triggers_sql())?;
         conn.execute_batch("DROP TRIGGER IF EXISTS trg_buildable_reset;")?;
         conn.pragma_update(None, "user_version", 74)?;
@@ -489,7 +489,7 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
     ensure_decisions_reason(conn)?;
     conn.execute_batch(crate::request_feedback::CREATE_TABLE)?;
     conn.execute_batch(&crate::journey_changes::request_feedback_triggers_sql())?;
-    conn.execute_batch(crate::phase::CREATE_TABLE)?;
+    crate::phase::ensure_table(conn)?;
     conn.execute_batch(&crate::journey_changes::phase_events_triggers_sql())?;
     ensure_turn_attachments(conn)?;
     crate::sync::install(conn)?;
