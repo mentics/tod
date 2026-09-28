@@ -5,7 +5,7 @@
 //! Mirrors `crate::linear`: plain `ureq` calls, no async runtime, a typed
 //! error enum. GitHub's REST API (not GraphQL) is used throughout.
 
-use crate::outline::uuid_blob::{now_ms, uuid_to_blob};
+use crate::outline::uuid_blob::uuid_to_blob;
 use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Deserialize;
@@ -148,7 +148,7 @@ impl Github {
 
     /// Find an already-open pull request from `head` into `owner/repo`, if any.
     /// `create_pr` checks this first — GitHub itself is the source of truth for
-    /// whether one exists, not just the local `node_pr` record, so a lost local
+    /// whether one exists, not just the node's own links, so a lost local
     /// record (e.g. the DB write after creation failed) can't lead to a
     /// duplicate PR on retry.
     pub fn find_open_pr(&self, owner: &str, repo: &str, head: &str) -> Result<Option<PullRequest>, GithubError> {
@@ -561,18 +561,83 @@ impl ErrorRaw {
     }
 }
 
-/// A node's pull request reference: owner/repo/number/url, recorded once
-/// `tod-cli pr open` creates it.
+/// A pull request a node links to: one entry of the Ticket capability's
+/// `node_fields.linked_prs`, which is the one place a node's pull requests
+/// are kept. The user edits it in the task editor; `tod-cli pr open` adds
+/// the one it opens; the `pr -> approved` and `approved -> merged` gates
+/// check every one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NodePr {
-    pub node_id: Uuid,
     pub owner: String,
     pub repo: String,
     pub pr_number: i64,
     pub url: String,
-    pub created_at: i64,
 }
 
+impl NodePr {
+    pub fn new(owner: &str, repo: &str, pr_number: i64) -> Self {
+        Self {
+            owner: owner.to_string(),
+            repo: repo.to_string(),
+            pr_number,
+            url: format!("https://github.com/{owner}/{repo}/pull/{pr_number}"),
+        }
+    }
+
+    /// Whether `other` is the same pull request (GitHub names are not case
+    /// sensitive).
+    pub fn same_as(&self, other: &NodePr) -> bool {
+        self.pr_number == other.pr_number
+            && self.owner.eq_ignore_ascii_case(&other.owner)
+            && self.repo.eq_ignore_ascii_case(&other.repo)
+    }
+}
+
+/// The pull request a link names: `https://github.com/<owner>/<repo>/pull/<n>`
+/// (the scheme optional, anything after the number ignored) or
+/// `<owner>/<repo>#<n>`. `None` for anything else, a bare `#<n>` included:
+/// it does not say which repository.
+pub fn parse_pr_link(link: &str) -> Option<NodePr> {
+    let link = link.trim();
+    let lower = link.to_ascii_lowercase();
+    let path = ["https://", "http://", ""].iter().find_map(|scheme| {
+        let rest = lower.strip_prefix(scheme)?;
+        let rest = rest.strip_prefix("www.").unwrap_or(rest);
+        rest.starts_with("github.com/")
+            .then(|| &link[link.len() - rest.len() + "github.com/".len()..])
+    });
+    if let Some(path) = path {
+        let mut parts = path.split('/');
+        let owner = parts.next().filter(|s| !s.is_empty())?;
+        let repo = parts.next().filter(|s| !s.is_empty())?;
+        if !matches!(parts.next(), Some("pull" | "pulls")) {
+            return None;
+        }
+        let number = parts.next()?;
+        let number = number.split(['#', '?']).next()?;
+        return Some(NodePr::new(owner, repo, number.parse().ok()?));
+    }
+    let (name, number) = link.split_once('#')?;
+    let (owner, repo) = name.split_once('/')?;
+    let valid = |s: &str| {
+        !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))
+    };
+    if !valid(owner) || !valid(repo) {
+        return None;
+    }
+    Some(NodePr::new(owner, repo, number.parse().ok().filter(|n| *n > 0)?))
+}
+
+/// A node's pull request links, read.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PrLinks {
+    /// Every link that names a pull request, in order.
+    pub prs: Vec<NodePr>,
+    /// Links that do not (see [`parse_pr_link`]), as written.
+    pub unrecognized: Vec<String>,
+}
+
+/// A node's pull requests, in `node_fields.linked_prs`.
 pub struct NodePrRepo<'a> {
     conn: &'a Connection,
 }
@@ -582,35 +647,62 @@ impl<'a> NodePrRepo<'a> {
         Self { conn }
     }
 
-    pub fn get(&self, node_id: Uuid) -> Result<Option<NodePr>> {
-        self.conn
+    /// The links as written.
+    pub fn links(&self, node_id: Uuid) -> Result<Vec<String>> {
+        let raw: Option<String> = self
+            .conn
             .query_row(
-                "SELECT owner, repo, pr_number, url, created_at FROM node_pr WHERE node_id = ?1",
+                "SELECT linked_prs FROM node_fields WHERE node_id = ?1",
                 params![uuid_to_blob(node_id)],
-                |row| {
-                    Ok(NodePr {
-                        node_id,
-                        owner: row.get(0)?,
-                        repo: row.get(1)?,
-                        pr_number: row.get(2)?,
-                        url: row.get(3)?,
-                        created_at: row.get(4)?,
-                    })
-                },
+                |row| row.get(0),
             )
-            .optional()
-            .map_err(Into::into)
+            .optional()?;
+        Ok(raw
+            .and_then(|raw| serde_json::from_str::<Vec<String>>(&raw).ok())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|link| link.trim().to_string())
+            .filter(|link| !link.is_empty())
+            .collect())
     }
 
-    pub fn set(&self, node_id: Uuid, owner: &str, repo: &str, pr_number: i64, url: &str) -> Result<()> {
-        self.conn.execute(
-            "INSERT INTO node_pr (node_id, owner, repo, pr_number, url, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-             ON CONFLICT(node_id) DO UPDATE SET
-                 owner = excluded.owner, repo = excluded.repo,
-                 pr_number = excluded.pr_number, url = excluded.url",
-            params![uuid_to_blob(node_id), owner, repo, pr_number, url, now_ms()],
-        )?;
+    pub fn read(&self, node_id: Uuid) -> Result<PrLinks> {
+        let mut out = PrLinks::default();
+        for link in self.links(node_id)? {
+            match parse_pr_link(&link) {
+                Some(pr) if out.prs.iter().any(|p| p.same_as(&pr)) => {}
+                Some(pr) => out.prs.push(pr),
+                None => out.unrecognized.push(link),
+            }
+        }
+        Ok(out)
+    }
+
+    /// The first pull request linked.
+    pub fn get(&self, node_id: Uuid) -> Result<Option<NodePr>> {
+        Ok(self.read(node_id)?.prs.into_iter().next())
+    }
+
+    /// Link `pr` to the node, after any it already links, enabling the
+    /// Ticket capability (where the links are shown and edited) if it is not
+    /// on. Linking one already there changes nothing.
+    pub fn add(&self, node_id: Uuid, pr: &NodePr) -> Result<()> {
+        let nodes = crate::outline::repos::NodeRepo::new(self.conn);
+        let ticket = crate::outline::Capability::Ticket;
+        if !nodes.list_capabilities(node_id)?.contains(&ticket) {
+            nodes.enable_capability(node_id, ticket)?;
+        }
+        let mut links = self.links(node_id)?;
+        if links
+            .iter()
+            .filter_map(|link| parse_pr_link(link))
+            .any(|linked| linked.same_as(pr))
+        {
+            return Ok(());
+        }
+        links.push(pr.url.clone());
+        crate::fleet::repos::task::TaskRepo::new(self.conn)
+            .update_linked_prs(&node_id.to_string(), &links)?;
         Ok(())
     }
 }
@@ -751,5 +843,69 @@ mod tests {
         assert_eq!(raw("open", true, false).into_summary().state, PullState::Draft);
         assert_eq!(raw("closed", false, true).into_summary().state, PullState::Merged);
         assert_eq!(raw("closed", false, false).into_summary().state, PullState::Closed);
+    }
+
+    #[test]
+    fn pr_links_are_urls_or_owner_repo_number() {
+        use super::{NodePr, parse_pr_link};
+        let pr = NodePr::new("acme", "app", 42);
+        for link in [
+            "https://github.com/acme/app/pull/42",
+            "https://www.github.com/acme/app/pull/42/files",
+            "http://GitHub.com/acme/app/pull/42#issuecomment-1",
+            "github.com/acme/app/pull/42?w=1",
+            " acme/app#42 ",
+        ] {
+            assert_eq!(parse_pr_link(link), Some(pr.clone()), "{link}");
+        }
+        for link in [
+            "#42",
+            "42",
+            "acme#42",
+            "https://github.com/acme/app/issues/42",
+            "https://gitlab.com/acme/app/pull/42",
+            "acme/app#x",
+            "",
+        ] {
+            assert_eq!(parse_pr_link(link), None, "{link}");
+        }
+    }
+
+    #[test]
+    fn adding_a_pr_links_it_once_and_enables_ticket() {
+        use super::{NodePr, NodePrRepo};
+        use crate::fleet::FleetStore;
+        use crate::outline::{Capability, CreatePosition, OutlineMutation};
+        let root = std::env::temp_dir().join(format!("tod-node-pr-{}", uuid::Uuid::new_v4()));
+        let store = FleetStore::open(&root).unwrap();
+        store
+            .enqueue_outline(OutlineMutation::CreateList { slug: "t".into(), title: "T".into() })
+            .unwrap();
+        store.writer().flush().unwrap();
+        let list_id = store.list_outline_lists().unwrap()[0].id;
+        let node = uuid::Uuid::new_v4();
+        store
+            .enqueue_outline(OutlineMutation::CreateNode {
+                node_id: Some(node),
+                list_id,
+                parent_id: None,
+                anchor_id: None,
+                position: CreatePosition::Below,
+                title: "N".into(),
+            })
+            .unwrap();
+        store.writer().flush().unwrap();
+        let conn = crate::fleet::schema::open_writer_connection(store.writer().db_path()).unwrap();
+        let prs = NodePrRepo::new(&conn);
+        prs.add(node, &NodePr::new("acme", "app", 7)).unwrap();
+        prs.add(node, &NodePr::new("ACME", "App", 7)).unwrap();
+        prs.add(node, &NodePr::new("acme", "lib", 2)).unwrap();
+        let read = prs.read(node).unwrap();
+        assert_eq!(read.prs, vec![NodePr::new("acme", "app", 7), NodePr::new("acme", "lib", 2)]);
+        assert!(crate::outline::repos::NodeRepo::new(&conn)
+            .list_capabilities(node)
+            .unwrap()
+            .contains(&Capability::Ticket));
+        let _ = std::fs::remove_dir_all(root);
     }
 }

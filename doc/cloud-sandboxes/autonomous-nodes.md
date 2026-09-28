@@ -519,7 +519,7 @@ The plan:
   |---|---|
   | the sandbox's environment | `TOD_GITHUB_AUTH=proxy`, `GH_TOKEN=<placeholder>`, `HTTPS_PROXY=http://localhost:49152`, `SSL_CERT_FILE=/etc/ssl/certs/sandbox-ca-bundle.crt`; no token |
   | `curl https://api.github.com/user` | the user's login |
-  | `tod-cli pr status`, `pr list`, `pr list --all-open` (run by the shim in the sandbox) | the recorded PR's live state (merged, checks); the repository's open PRs |
+  | `tod-cli pr status`, `pr list`, `pr list --all-open` (run by the shim in the sandbox) | each linked PR's live state (merged, checks); the repository's open PRs |
   | `tod-cli secrets list` | `github_token`: set, added by the sandbox's proxy |
   | the supervisor's gate checks at `pr` and `approved` | `…/pull/6 is already merged.`, `…/pull/6 is merged.` (derived, pass); the node moved on to `learn` |
   | `git push --dry-run` to `octocat/Hello-World` | `Permission to octocat/Hello-World.git denied to <the user>`: authenticated, refused only for permission |

@@ -35,7 +35,7 @@ use crate::ui::selectable_text::selectable_text;
 use crate::ui::style;
 
 // T2: the runner line.
-use gpui::{Entity, Subscription};
+use gpui::{ElementId, Entity, Subscription};
 use gpui_component::Sizable as _;
 use gpui_component::Disableable as _;
 use gpui_component::button::Button;
@@ -70,8 +70,9 @@ pub(crate) struct TaskHeader {
     /// The Linear ticket's browser URL, when both the id and the workspace
     /// slug are known.
     pub ticket_url: Option<String>,
-    /// The node's recorded pull request (`tod-cli pr open`), when it has one.
-    pub pull_request: Option<tod_store::github::NodePr>,
+    /// The pull requests linked to the node (its Ticket capability's links,
+    /// where `tod-cli pr open` adds the one it opens).
+    pub pull_requests: Vec<tod_store::github::NodePr>,
     pub obligation_count: usize,
     /// Obligations whose latest verdict is `failed`.
     pub obligations_failed: usize,
@@ -117,10 +118,10 @@ fn load(fleet: &FleetStore, node_id: Uuid) -> TaskHeader {
         header.ticket_url =
             tod_integration::linear_issue_url(metadata.as_ref(), fleet.paths().root(), ticket);
     }
-    header.pull_request = fleet
-        .read(|conn| Ok(tod_store::github::NodePrRepo::new(conn).get(node_id)?))
-        .ok()
-        .flatten();
+    header.pull_requests = fleet
+        .read(|conn| Ok(tod_store::github::NodePrRepo::new(conn).read(node_id)?))
+        .map(|links| links.prs)
+        .unwrap_or_default();
     if let Ok(obligations) = fleet.list_obligations_for_node(node_id) {
         header.obligation_count = obligations.len();
     }
@@ -391,15 +392,10 @@ impl TaskPanel {
                             None => style::text_muted(div()).child(ticket).into_any_element(),
                         })
                     })
-                    .when_some(self.header.pull_request.clone(), |el, pr| {
+                    .children(self.header.pull_requests.iter().enumerate().map(|(ix, pr)| {
                         let label = format!("{}#{}", pr.repo, pr.pr_number);
-                        el.child(self.external_link(
-                            "unified-task-pr",
-                            label,
-                            pr.url.clone(),
-                            cx,
-                        ))
-                    }),
+                        self.external_link(("unified-task-pr", ix), label, pr.url.clone(), cx)
+                    })),
             )
             .into_any_element()
     }
@@ -407,7 +403,7 @@ impl TaskPanel {
     /// A muted, clickable label that opens `url` in the browser.
     fn external_link(
         &self,
-        id: &'static str,
+        id: impl Into<ElementId>,
         label: String,
         url: String,
         cx: &mut Context<Self>,

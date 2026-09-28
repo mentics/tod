@@ -5,9 +5,10 @@
 //! A submodule is its own GitHub repository, so a node whose work touches one
 //! has a pull request there as well as the superproject's. Both come from the
 //! same branch name: the worktree puts every submodule on the node's branch.
-//! The pull request the `pr` lifecycle state recorded (`node_pr`) is shown
-//! too, in its repository's section, even when its branch is not the one the
-//! node is on now.
+//! The pull requests linked to the node (its Ticket capability's links, where
+//! `tod-cli pr open` adds the one it opens) are shown too, each in its
+//! repository's section, even when its branch is not the one the node is on
+//! now.
 //!
 //! Everything here runs git and calls GitHub: call it off the UI thread.
 
@@ -57,8 +58,8 @@ impl RepoSection {
 /// Which pull requests to list in each repository.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PullScope {
-    /// Every one from the node's branch, in any state, and the one the `pr`
-    /// state recorded.
+    /// Every one from the node's branch, in any state, and every one linked
+    /// to the node.
     #[default]
     Branch,
     /// Every open one, whichever branch it is from.
@@ -120,12 +121,12 @@ pub const NO_FILES: &str =
 pub const NO_TOKEN: &str = "No GitHub token is configured — add one in Settings";
 
 /// Where to look for a node's pull requests, as the database has it: the
-/// Files capability it resolves to, and the pull request the `pr` state
-/// recorded. Reading it is quick; loading from it is not.
+/// Files capability it resolves to, and the pull requests linked to it.
+/// Reading it is quick; loading from it is not.
 #[derive(Debug, Clone)]
 pub struct PullsTarget {
     pub files: Option<ResolvedFiles>,
-    pub recorded: Option<NodePr>,
+    pub linked: Vec<NodePr>,
 }
 
 /// Read `node_id`'s [`PullsTarget`].
@@ -142,7 +143,7 @@ pub fn read_target(conn: &Connection, node_id: Uuid) -> anyhow::Result<PullsTarg
     }
     Ok(PullsTarget {
         files,
-        recorded: NodePrRepo::new(conn).get(node_id)?,
+        linked: NodePrRepo::new(conn).read(node_id)?.prs,
     })
 }
 
@@ -165,23 +166,23 @@ pub fn load_with(
 ) -> Result<NodePulls, String> {
     let repos = match target.files {
         Some(files) => node_repositories(&files)?,
-        // No repository to look in, but the `pr` state may have recorded one.
-        None if target.recorded.is_some() => NodeRepositories {
+        // No repository to look in, but the node may link pull requests.
+        None if !target.linked.is_empty() => NodeRepositories {
             branch: None,
             repos: Vec::new(),
             warnings: Vec::new(),
         },
         None => return Err(NO_FILES.to_string()),
     };
-    Ok(collect(repos, target.recorded.as_ref(), scope, source))
+    Ok(collect(repos, &target.linked, scope, source))
 }
 
 /// Ask `source` about every GitHub repository in `repos` at once (one
 /// request each, in parallel: a superproject with several submodules would
-/// otherwise wait on them one after another), then fold in `recorded`.
+/// otherwise wait on them one after another), then fold in `linked`.
 fn collect(
     repos: NodeRepositories,
-    recorded: Option<&NodePr>,
+    linked: &[NodePr],
     scope: PullScope,
     source: &dyn PullSource,
 ) -> NodePulls {
@@ -234,9 +235,11 @@ fn collect(
             .collect()
     });
     let mut warnings = repos.warnings;
-    // Listing every open one, the recorded one is shown if it is open.
-    if let (PullScope::Branch, Some(recorded)) = (scope, recorded) {
-        fold_in_recorded(&mut sections, &mut warnings, recorded, source);
+    // Listing every open one, a linked one is shown if it is open.
+    if scope == PullScope::Branch {
+        for pr in linked {
+            fold_in_linked(&mut sections, &mut warnings, pr, source);
+        }
     }
     NodePulls {
         scope,
@@ -246,23 +249,23 @@ fn collect(
     }
 }
 
-/// Show the pull request the `pr` state recorded, unless its section already
-/// lists it: in its repository's section, or one of its own when the node's
+/// Show a pull request linked to the node, unless its section already lists
+/// it: in its repository's section, or one of its own when the node's
 /// repositories do not include that one.
-fn fold_in_recorded(
+fn fold_in_linked(
     sections: &mut Vec<RepoSection>,
     warnings: &mut Vec<String>,
-    recorded: &NodePr,
+    linked: &NodePr,
     source: &dyn PullSource,
 ) {
     let repo = GithubRepo {
-        owner: recorded.owner.clone(),
-        repo: recorded.repo.clone(),
+        owner: linked.owner.clone(),
+        repo: linked.repo.clone(),
     };
     let section = sections
         .iter_mut()
         .find(|s| s.github.as_ref() == Some(&repo));
-    let listed = |pulls: &[PullSummary]| pulls.iter().any(|p| p.number == recorded.pr_number);
+    let listed = |pulls: &[PullSummary]| pulls.iter().any(|p| p.number == linked.pr_number);
     if let Some(RepoSection {
         pulls: RepoPulls::Listed(pulls),
         ..
@@ -271,10 +274,10 @@ fn fold_in_recorded(
     {
         return;
     }
-    let pull = match source.pull(&repo, recorded.pr_number) {
+    let pull = match source.pull(&repo, linked.pr_number) {
         Ok(pull) => pull,
         Err(err) => {
-            warnings.push(format!("Could not read {}: {err}", recorded.url));
+            warnings.push(format!("Could not read {}: {err}", linked.url));
             return;
         }
     };
@@ -380,15 +383,8 @@ mod tests {
         }
     }
 
-    fn recorded(owner: &str, name: &str, number: i64) -> NodePr {
-        NodePr {
-            node_id: Uuid::nil(),
-            owner: owner.into(),
-            repo: name.into(),
-            pr_number: number,
-            url: format!("https://github.com/{owner}/{name}/pull/{number}"),
-            created_at: 0,
-        }
+    fn linked_pr(owner: &str, name: &str, number: i64) -> NodePr {
+        NodePr::new(owner, name, number)
     }
 
     #[test]
@@ -409,7 +405,7 @@ mod tests {
                     node_repo("vendor/other", None),
                 ],
             ),
-            None,
+            &[],
             PullScope::Branch,
             &fake,
         );
@@ -443,7 +439,7 @@ mod tests {
                     node_repo("b", Some(repo("acme", "lib"))),
                 ],
             ),
-            None,
+            &[],
             PullScope::Branch,
             &Fake::default(),
         );
@@ -465,7 +461,7 @@ mod tests {
                     node_repo("lib", Some(repo("acme", "lib"))),
                 ],
             ),
-            None,
+            &[],
             PullScope::Branch,
             &fake,
         );
@@ -491,14 +487,14 @@ mod tests {
                     node_repo("lib", Some(repo("acme", "lib"))),
                 ],
             ),
-            Some(&recorded("acme", "app", 7)),
+            &[linked_pr("acme", "app", 7)],
             PullScope::AllOpen,
             &fake,
         );
         let mut asked = fake.asked.lock().unwrap().clone();
         asked.sort();
         assert_eq!(asked, vec!["acme/app open", "acme/lib open"]);
-        // The recorded pull request is not open, so it is not listed.
+        // The linked pull request is not open, so it is not listed.
         assert_eq!(found.sections[0].pulls, RepoPulls::Listed(Vec::new()));
         assert_eq!(
             found.sections[1].pulls,
@@ -567,7 +563,7 @@ mod tests {
         let fake = Fake::default();
         let found = collect(
             repos(None, vec![node_repo("", Some(repo("acme", "app")))]),
-            None,
+            &[],
             PullScope::Branch,
             &fake,
         );
@@ -576,7 +572,7 @@ mod tests {
     }
 
     #[test]
-    fn the_recorded_pull_request_is_shown_once() {
+    fn a_linked_pull_request_is_shown_once() {
         // Already listed from the branch: not added again.
         let fake = Fake {
             by_repo: vec![(repo("acme", "app"), Ok(vec![pull(4, "tod/x")]))],
@@ -588,7 +584,7 @@ mod tests {
                 Some("tod/x"),
                 vec![node_repo("", Some(repo("acme", "app")))],
             ),
-            Some(&recorded("acme", "app", 4)),
+            &[linked_pr("acme", "app", 4)],
             PullScope::Branch,
             &fake,
         );
@@ -608,7 +604,7 @@ mod tests {
                 Some("tod/y"),
                 vec![node_repo("", Some(repo("acme", "app")))],
             ),
-            Some(&recorded("acme", "app", 4)),
+            &[linked_pr("acme", "app", 4)],
             PullScope::Branch,
             &fake,
         );
@@ -619,14 +615,14 @@ mod tests {
     }
 
     #[test]
-    fn a_recorded_pull_request_outside_the_repositories_gets_its_own_section() {
+    fn a_linked_pull_request_outside_the_repositories_gets_its_own_section() {
         let fake = Fake {
             single: vec![(repo("else", "where"), pull(2, "b"))],
             ..Fake::default()
         };
         let found = collect(
             repos(None, Vec::new()),
-            Some(&recorded("else", "where", 2)),
+            &[linked_pr("else", "where", 2)],
             PullScope::Branch,
             &fake,
         );
@@ -640,7 +636,7 @@ mod tests {
         // One it cannot read is a warning, not a section.
         let found = collect(
             repos(None, Vec::new()),
-            Some(&recorded("gone", "x", 2)),
+            &[linked_pr("gone", "x", 2)],
             PullScope::Branch,
             &Fake::default(),
         );

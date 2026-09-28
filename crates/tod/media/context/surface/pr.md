@@ -21,8 +21,9 @@ repository may exist on this machine — never change into them or build them.
 
 ## What you do, in order
 
-1. If the node has no PR on record yet, open one with `pr open` — check
-   `pr status` first if you are not sure.
+1. If the node links no PR yet, open one with `pr open` — check `pr status`
+   first if you are not sure. A PR that already exists but is not linked is
+   linked, not opened again: `pr open` finds it from its branch.
 2. Check `pr status` for the PR's live mergeable flag, check conclusion, and
    review state.
 3. If a check is failing or a reviewer requested changes: fix it in the

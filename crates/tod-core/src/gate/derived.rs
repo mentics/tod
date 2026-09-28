@@ -16,7 +16,7 @@ use tod_store::outline::repos::{NodeRepo, PlanStepRepo};
 use tod_store::outline::repos::plan_steps::{STATUS_FAILED, STATUS_IMPLEMENTED, STATUS_VERIFIED};
 use tod_store::outline::repos::obligations::KIND_REQUIREMENT;
 use tod_store::outline::repos::ObligationRepo;
-use tod_store::github::NodePrRepo;
+use tod_store::github::{NodePr, NodePrRepo};
 use tod_store::outline::{
     ACTIVE_VERIFYING_PLAN_IMPLEMENTED_SLUG, GateCriterion, OUTCOME_FAIL, OUTCOME_PASS, PLANNING_READY_REQUIREMENTS_TRACEABLE_SLUG,
     READY_ACTIVE_ACTION_CONFIG_SLUG,
@@ -446,66 +446,87 @@ fn github_client(conn: &Connection) -> Option<tod_store::github::Github> {
     tod_store::credentials::resolve_github_auth(&store).map(tod_store::github::Github::new)
 }
 
-/// The PR is mergeable: GitHub's own `mergeable_state` is `"clean"` —
-/// meaning this repo's actual branch protection rules (required reviews,
-/// required checks) are satisfied and there's no conflict — and it hasn't
-/// already been merged. `None` when no PR is open yet is a fail — the `pr`
-/// state's agent hasn't finished its job.
-fn pr_mergeable_outcome(conn: &Connection, node_id: Uuid) -> Result<DerivedOutcome> {
-    let Some(pr) = NodePrRepo::new(conn).get(node_id)? else {
-        return Ok(fail(
-            "No pull request has been opened yet — `tod-cli pr open` from the `pr` state.",
-        ));
-    };
+/// The node's linked pull requests (the Ticket capability's links), or why
+/// the gate cannot check them: none linked, a link that names no pull
+/// request, or no GitHub token.
+fn linked_prs(
+    conn: &Connection,
+    node_id: Uuid,
+) -> Result<std::result::Result<(Vec<NodePr>, tod_store::github::Github), DerivedOutcome>> {
+    let links = NodePrRepo::new(conn).read(node_id)?;
+    if let Some(link) = links.unrecognized.first() {
+        return Ok(Err(fail(format!(
+            "The pull request link `{link}` does not say which pull request it is —              give its URL (https://github.com/<owner>/<repo>/pull/<number>) or              <owner>/<repo>#<number>."
+        ))));
+    }
+    if links.prs.is_empty() {
+        return Ok(Err(fail(
+            "No pull request is linked to this node — link one in its Ticket settings,              or open one with `tod-cli pr open` from the `pr` state.",
+        )));
+    }
     let Some(github) = github_client(conn) else {
-        return Ok(fail(
+        return Ok(Err(fail(
             "No GitHub token configured — see `tod-cli secrets` — cannot check PR status.",
-        ));
+        )));
     };
-    let status = match github.get_pr_status(&pr.owner, &pr.repo, pr.pr_number) {
-        Ok(status) => status,
-        Err(err) => return Ok(fail(format!("Could not read PR status: {err}"))),
-    };
-    if status.merged {
-        return Ok(DerivedOutcome {
-            outcome: OUTCOME_PASS,
-            detail: format!("{} is already merged.", pr.url),
-        });
-    }
-    if status.mergeable_state.as_deref() == Some("clean") {
-        return Ok(DerivedOutcome {
-            outcome: OUTCOME_PASS,
-            detail: format!("{} is mergeable.", pr.url),
-        });
-    }
-    Ok(fail(format!(
-        "{} is not mergeable yet (state: {}).",
-        pr.url,
-        status.mergeable_state.as_deref().unwrap_or("unknown")
-    )))
+    Ok(Ok((links.prs, github)))
 }
 
-/// The PR has actually been merged.
-fn pr_merged_outcome(conn: &Connection, node_id: Uuid) -> Result<DerivedOutcome> {
-    let Some(pr) = NodePrRepo::new(conn).get(node_id)? else {
-        return Ok(fail("No pull request on record for this node."));
+/// Every linked PR is mergeable: GitHub's own `mergeable_state` is
+/// `"clean"` — meaning this repo's actual branch protection rules (required
+/// reviews, required checks) are satisfied and there's no conflict — or it
+/// is already merged. No PR linked yet is a fail — the `pr` state's agent
+/// hasn't finished its job.
+fn pr_mergeable_outcome(conn: &Connection, node_id: Uuid) -> Result<DerivedOutcome> {
+    let (prs, github) = match linked_prs(conn, node_id)? {
+        Ok(found) => found,
+        Err(outcome) => return Ok(outcome),
     };
-    let Some(github) = github_client(conn) else {
-        return Ok(fail(
-            "No GitHub token configured — see `tod-cli secrets` — cannot check PR status.",
-        ));
-    };
-    let status = match github.get_pr_status(&pr.owner, &pr.repo, pr.pr_number) {
-        Ok(status) => status,
-        Err(err) => return Ok(fail(format!("Could not read PR status: {err}"))),
-    };
-    if status.merged {
-        return Ok(DerivedOutcome {
-            outcome: OUTCOME_PASS,
-            detail: format!("{} is merged.", pr.url),
-        });
+    let mut passed = Vec::new();
+    for pr in &prs {
+        let status = match github.get_pr_status(&pr.owner, &pr.repo, pr.pr_number) {
+            Ok(status) => status,
+            Err(err) => return Ok(fail(format!("Could not read {}: {err}", pr.url))),
+        };
+        if status.merged {
+            passed.push(format!("{} is already merged.", pr.url));
+        } else if status.mergeable_state.as_deref() == Some("clean") {
+            passed.push(format!("{} is mergeable.", pr.url));
+        } else {
+            return Ok(fail(format!(
+                "{} is not mergeable yet (state: {}).",
+                pr.url,
+                status.mergeable_state.as_deref().unwrap_or("unknown")
+            )));
+        }
     }
-    Ok(fail(format!("{} is not merged yet.", pr.url)))
+    Ok(DerivedOutcome {
+        outcome: OUTCOME_PASS,
+        detail: passed.join(" "),
+    })
+}
+
+/// Every linked PR has actually been merged.
+fn pr_merged_outcome(conn: &Connection, node_id: Uuid) -> Result<DerivedOutcome> {
+    let (prs, github) = match linked_prs(conn, node_id)? {
+        Ok(found) => found,
+        Err(outcome) => return Ok(outcome),
+    };
+    let mut passed = Vec::new();
+    for pr in &prs {
+        let status = match github.get_pr_status(&pr.owner, &pr.repo, pr.pr_number) {
+            Ok(status) => status,
+            Err(err) => return Ok(fail(format!("Could not read {}: {err}", pr.url))),
+        };
+        if !status.merged {
+            return Ok(fail(format!("{} is not merged yet.", pr.url)));
+        }
+        passed.push(format!("{} is merged.", pr.url));
+    }
+    Ok(DerivedOutcome {
+        outcome: OUTCOME_PASS,
+        detail: passed.join(" "),
+    })
 }
 
 #[cfg(test)]
@@ -579,6 +600,39 @@ mod tests {
         store
             .read(|conn| evaluate_derived_criterion(conn, node, &criterion(slug)))
             .unwrap()
+    }
+
+    /// The PR gates read the Ticket capability's links, which the user sets
+    /// in the task editor: a link set there is the node's pull request.
+    #[test]
+    fn pr_gates_read_the_linked_pull_requests() {
+        let (store, node) = store_with_node();
+        let merged = |store: &FleetStore| store.read(|conn| pr_merged_outcome(conn, node)).unwrap();
+        let outcome = merged(&store);
+        assert_eq!(outcome.outcome, OUTCOME_FAIL);
+        assert!(outcome.detail.contains("No pull request is linked"), "{}", outcome.detail);
+
+        enable(&store, node, vec![Capability::Ticket]);
+        let link = |links: &[&str]| {
+            store
+                .enqueue(FleetMutation::UpdateTaskLinkedPrs {
+                    id: node.to_string(),
+                    linked_prs: links.iter().map(|l| l.to_string()).collect(),
+                })
+                .unwrap();
+            store.writer().flush().unwrap();
+            store.reload_if_stale().ok();
+        };
+        link(&["#42"]);
+        let outcome = merged(&store);
+        assert_eq!(outcome.outcome, OUTCOME_FAIL);
+        assert!(outcome.detail.contains("`#42`"), "{}", outcome.detail);
+
+        // A link the gate can follow gets as far as asking GitHub.
+        link(&["https://github.com/acme/app/pull/42"]);
+        let outcome = merged(&store);
+        assert!(!outcome.detail.contains("No pull request"), "{}", outcome.detail);
+        assert!(!outcome.detail.contains("`#42`"), "{}", outcome.detail);
     }
 
     #[test]

@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Current fleet schema epoch stored in `PRAGMA user_version`.
-pub const CURRENT_USER_VERSION: i32 = 75;
+pub const CURRENT_USER_VERSION: i32 = 76;
 
 const BUSY_TIMEOUT_MS: i64 = 5000;
 
@@ -481,6 +481,12 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
         migrate_v74_to_v75(conn)?;
         conn.pragma_update(None, "user_version", 75)?;
     }
+    if version < 76 {
+        // A node's pull requests are its Ticket capability's `linked_prs`
+        // alone; `node_pr` is folded into them and dropped.
+        migrate_v75_to_v76(conn)?;
+        conn.pragma_update(None, "user_version", 76)?;
+    }
     // Other branches (the task panel) numbered their own steps 66–67 at the
     // same time as 66–70 above, so a store may be past a version without
     // having these. Every one is idempotent: make sure of them all.
@@ -869,6 +875,41 @@ fn migrate_v74_to_v75(conn: &Connection) -> Result<()> {
     tx.execute_batch(crate::fleet::repos::files_location::CREATE_TABLE)?;
     tx.execute_batch(&crate::journey_changes::files_locations_triggers_sql())?;
     crate::fleet::repos::files_location::migrate_from_node_files(&tx)?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// `node_pr` held the pull request `tod-cli pr open` recorded, apart from the
+/// links the user edits (`node_fields.linked_prs`), and only it was what the
+/// gates read. Each row becomes a link (enabling Ticket, where links are
+/// shown) and the table goes.
+fn migrate_v75_to_v76(conn: &Connection) -> Result<()> {
+    let present = conn
+        .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'node_pr'")?
+        .exists([])?;
+    if !present {
+        return Ok(());
+    }
+    let tx = conn.unchecked_transaction()?;
+    let rows: Vec<(Vec<u8>, String, String, i64, String)> = tx
+        .prepare(
+            "SELECT p.node_id, p.owner, p.repo, p.pr_number, p.url FROM node_pr p
+             JOIN nodes n ON n.id = p.node_id",
+        )?
+        .query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    let prs = crate::github::NodePrRepo::new(&tx);
+    for (node_id, owner, repo, number, url) in rows {
+        let node_id = crate::outline::uuid_blob::blob_to_uuid(&node_id)?;
+        let mut pr = crate::github::NodePr::new(&owner, &repo, number);
+        if !url.is_empty() {
+            pr.url = url;
+        }
+        prs.add(node_id, &pr)?;
+    }
+    tx.execute_batch("DROP TABLE node_pr;")?;
     tx.commit()?;
     Ok(())
 }
@@ -4266,6 +4307,62 @@ mod tests {
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
         assert_eq!(version, CURRENT_USER_VERSION);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// A pull request `tod-cli pr open` recorded in `node_pr` becomes one of
+    /// the node's links, after any it already had, with Ticket enabled.
+    #[test]
+    fn migrate_v75_to_v76_folds_node_pr_into_linked_prs() {
+        let (dir, conn) = temp_db();
+        apply_migrations(&conn).unwrap();
+        let recorded = insert_node(&conn, "recorded");
+        let both = insert_node(&conn, "both");
+        conn.execute_batch(
+            "CREATE TABLE node_pr (
+                node_id BLOB PRIMARY KEY, owner TEXT NOT NULL, repo TEXT NOT NULL,
+                pr_number INTEGER NOT NULL, url TEXT NOT NULL, created_at INTEGER NOT NULL
+            );",
+        )
+        .unwrap();
+        for (node, number) in [(recorded, 7), (both, 9)] {
+            conn.execute(
+                "INSERT INTO node_pr VALUES (?1, 'acme', 'app', ?2, ?3, 0)",
+                params![
+                    node.as_bytes().as_slice(),
+                    number,
+                    format!("https://github.com/acme/app/pull/{number}")
+                ],
+            )
+            .unwrap();
+        }
+        crate::fleet::repos::task::TaskRepo::new(&conn)
+            .update_linked_prs(
+                &both.to_string(),
+                &["https://github.com/acme/lib/pull/3".into(), "acme/app#9".into()],
+            )
+            .unwrap();
+        conn.pragma_update(None, "user_version", 75).unwrap();
+        apply_migrations(&conn).unwrap();
+
+        let prs = crate::github::NodePrRepo::new(&conn);
+        assert_eq!(
+            prs.links(recorded).unwrap(),
+            vec!["https://github.com/acme/app/pull/7".to_string()]
+        );
+        // Already linked (in another form), so not added twice.
+        assert_eq!(
+            prs.links(both).unwrap(),
+            vec!["https://github.com/acme/lib/pull/3".to_string(), "acme/app#9".to_string()]
+        );
+        let nodes = crate::outline::repos::NodeRepo::new(&conn);
+        assert!(nodes.list_capabilities(recorded).unwrap().contains(&crate::outline::Capability::Ticket));
+        let table: bool = conn
+            .prepare("SELECT 1 FROM sqlite_master WHERE name = 'node_pr'")
+            .unwrap()
+            .exists([])
+            .unwrap();
+        assert!(!table, "node_pr is dropped");
         let _ = fs::remove_dir_all(dir);
     }
 

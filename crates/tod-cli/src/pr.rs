@@ -18,7 +18,7 @@ use tod_core::pull_requests::{
 };
 use tod_store::conversation::ConversationRepo;
 use tod_store::credentials::{CredentialStore, resolve_github_auth};
-use tod_store::github::{Github, NodePrRepo};
+use tod_store::github::{Github, NodePrRepo, PrLinks, parse_pr_link};
 use tod_store::interview::{InterviewCommand, short_id};
 use uuid::Uuid;
 
@@ -31,23 +31,28 @@ COMMANDS:
     list                              [--node <UUID>] [--all-open]
     open                              [--node <UUID>] --owner <OWNER> --repo <REPO> --head <BRANCH> --base <BRANCH> --title <TEXT> [--body <TEXT>]
     status                            [--node <UUID>]
-    comment reply <COMMENT_ID> <TEXT> [--node <UUID>]
+    comment reply <COMMENT_ID> <TEXT> [--node <UUID>] [--pr <LINK>]
     mergeable                         [--note <TEXT>]
     merged                            [--note <TEXT>]
     blocked                           --why <TEXT>
 
+A node's pull requests are the links in its Ticket capability
+(`capabilities set <NODE> ticket --pr <URL>`), which the user can also edit;
+the `pr → approved` and `approved → merged` gates check every one.
 `list` shows every pull request, in any state, from the node's branch in each
 repository its work spans: the one its Files capability names and every
-submodule in it (all on the same branch), plus the one `open` recorded;
-with --all-open, every open pull request in those repositories instead,
+submodule in it (all on the same branch), plus every one linked; with
+--all-open, every open pull request in those repositories instead,
 whichever branch it is from.
-`open` creates the pull request via the GitHub API and records it on the node
-(owner/repo/number/url); it only works once per node — call `status` first if
-you are not sure one already exists.
-`status` fetches the PR's live mergeable flag, combined check status, and
-merged flag.
+`open` creates the pull request via the GitHub API (or finds the one already
+open from --head) and links it to the node, enabling Ticket if it is off; it
+refuses when the node already links a pull request in that repository — call
+`status` first if you are not sure one already exists.
+`status` fetches each linked PR's live mergeable flag, combined check status,
+and merged flag.
 `comment reply` posts a reply to a review comment thread by its numeric id
-(shown by GitHub, not tod's short ids).
+(shown by GitHub, not tod's short ids), on the linked PR --pr names (its URL
+or <OWNER>/<REPO>#<NUMBER>) — needed only when the node links more than one.
 `mergeable` records that the PR is ready for the `pr → approved` gate to
 check (checks green, reviews satisfied) — it does not itself approve
 anything. `blocked` records that you cannot make further progress without the
@@ -229,20 +234,41 @@ fn pulls_json(pulls: &NodePulls) -> serde_json::Value {
     })
 }
 
+/// The pull requests linked to `node`, refusing when there are none.
+fn linked(inv: &Invocation, node: Uuid) -> anyhow::Result<PrLinks> {
+    let links = inv.client().read(|conn| NodePrRepo::new(conn).read(node))?;
+    if links.prs.is_empty() {
+        match links.unrecognized.first() {
+            Some(link) => anyhow::bail!(
+                "node {node} links `{link}`, which does not say which pull request it is — \
+                 give its URL or <OWNER>/<REPO>#<NUMBER>"
+            ),
+            None => anyhow::bail!("no pull request is linked to node {node} — run `pr open`"),
+        }
+    }
+    Ok(links)
+}
+
 fn open(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
     let node = node(args)?;
-    if inv.client().read(|conn| NodePrRepo::new(conn).get(node))?.is_some() {
-        anyhow::bail!("node {node} already has a pull request on record — run `pr status`");
-    }
     let owner = args.require("--owner")?.to_string();
     let repo = args.require("--repo")?.to_string();
     let head = args.require("--head")?.to_string();
     let base = args.require("--base")?.to_string();
     let title = args.require("--title")?.to_string();
     let body = args.get("--body").unwrap_or_default().to_string();
+    let links = inv.client().read(|conn| NodePrRepo::new(conn).read(node))?;
+    if let Some(pr) = links.prs.iter().find(|pr| {
+        pr.owner.eq_ignore_ascii_case(&owner) && pr.repo.eq_ignore_ascii_case(&repo)
+    }) {
+        anyhow::bail!(
+            "node {node} already links {} in {owner}/{repo} — run `pr status`",
+            pr.url
+        );
+    }
     let github = github(inv)?;
     // GitHub itself is the source of truth for whether one already exists —
-    // not just the local record checked above — so a retry after the local
+    // not just the node's links checked above — so a retry after the local
     // write below failed (the PR now orphaned from tod's perspective) finds
     // the existing PR instead of opening a duplicate.
     let pr = match github.find_open_pr(&owner, &repo, &head)
@@ -262,7 +288,7 @@ fn open(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
         })
         .map_err(|err| {
             anyhow::anyhow!(
-                "{} is open on GitHub but could not be recorded on the node: {err}. \
+                "{} is open on GitHub but could not be linked to the node: {err}. \
                  Re-run `pr open` once fixed — it will find this PR rather than opening \
                  a duplicate.",
                 pr.url
@@ -273,26 +299,38 @@ fn open(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
 
 fn status(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
     let node = node(args)?;
-    let pr = inv
-        .client()
-        .read(|conn| NodePrRepo::new(conn).get(node))?
-        .ok_or_else(|| anyhow::anyhow!("no pull request on record for node {node} — run `pr open`"))?;
-    let status = github(inv)?
-        .get_pr_status(&pr.owner, &pr.repo, pr.pr_number)
-        .map_err(|err| anyhow::anyhow!("GitHub: {err}"))?;
-    if inv.json {
-        return Ok(serde_json::to_string(&serde_json::json!({
+    let links = linked(inv, node)?;
+    let github = github(inv)?;
+    let mut lines = Vec::new();
+    let mut pulls = Vec::new();
+    for pr in &links.prs {
+        let status = github
+            .get_pr_status(&pr.owner, &pr.repo, pr.pr_number)
+            .map_err(|err| anyhow::anyhow!("GitHub ({}): {err}", pr.url))?;
+        lines.push(format!(
+            "{} mergeable={:?} mergeable_state={:?} merged={} checks={:?}",
+            pr.url, status.mergeable, status.mergeable_state, status.merged, status.checks
+        ));
+        pulls.push(serde_json::json!({
             "url": pr.url,
             "mergeable": status.mergeable,
             "mergeable_state": status.mergeable_state,
             "merged": status.merged,
             "checks": status.checks,
+        }));
+    }
+    if inv.json {
+        return Ok(serde_json::to_string(&serde_json::json!({
+            "pulls": pulls,
+            "unrecognized_links": links.unrecognized,
         }))?);
     }
-    Ok(format!(
-        "{} mergeable={:?} mergeable_state={:?} merged={} checks={:?}",
-        pr.url, status.mergeable, status.mergeable_state, status.merged, status.checks
-    ))
+    for link in &links.unrecognized {
+        lines.push(format!(
+            "warning: the link `{link}` does not say which pull request it is"
+        ));
+    }
+    Ok(lines.join("\n"))
 }
 
 fn comment(inv: &Invocation, rest: &[String]) -> anyhow::Result<String> {
@@ -301,7 +339,7 @@ fn comment(inv: &Invocation, rest: &[String]) -> anyhow::Result<String> {
     }
     let rest = &rest[1..];
     if rest.len() < 2 {
-        anyhow::bail!("usage: pr comment reply <COMMENT_ID> <TEXT> [--node <UUID>]");
+        anyhow::bail!("usage: pr comment reply <COMMENT_ID> <TEXT> [--node <UUID>] [--pr <LINK>]");
     }
     let comment_id: i64 = rest[0]
         .parse()
@@ -309,10 +347,22 @@ fn comment(inv: &Invocation, rest: &[String]) -> anyhow::Result<String> {
     let args = Args::parse(&rest[2..])?;
     let text = rest[1].clone();
     let node = node(&args)?;
-    let pr = inv
-        .client()
-        .read(|conn| NodePrRepo::new(conn).get(node))?
-        .ok_or_else(|| anyhow::anyhow!("no pull request on record for node {node}"))?;
+    let mut prs = linked(inv, node)?.prs;
+    let pr = match args.get("--pr") {
+        Some(link) => {
+            let wanted = parse_pr_link(link).ok_or_else(|| {
+                anyhow::anyhow!("--pr `{link}` is not a pull request URL or <OWNER>/<REPO>#<NUMBER>")
+            })?;
+            prs.into_iter()
+                .find(|pr| pr.same_as(&wanted))
+                .ok_or_else(|| anyhow::anyhow!("node {node} does not link {}", wanted.url))?
+        }
+        None if prs.len() == 1 => prs.remove(0),
+        None => anyhow::bail!(
+            "node {node} links {} pull requests — say which with --pr <LINK>",
+            prs.len()
+        ),
+    };
     github(inv)?
         .reply_to_comment(&pr.owner, &pr.repo, pr.pr_number, comment_id, &text)
         .map_err(|err| anyhow::anyhow!("GitHub: {err}"))?;

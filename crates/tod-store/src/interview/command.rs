@@ -268,8 +268,9 @@ pub enum InterviewCommand {
         conversation_id: Option<Uuid>,
         finding: crate::review::NewFinding,
     },
-    /// Record a node's pull request reference, once `tod-cli pr open` has
-    /// created it (`crate::github::NodePrRepo`).
+    /// Link a pull request to a node, once `tod-cli pr open` has created it
+    /// (`crate::github::NodePrRepo::add`: the Ticket capability's
+    /// `linked_prs`).
     RecordNodePr {
         node_id: Uuid,
         owner: String,
@@ -1048,7 +1049,11 @@ pub fn execute(
             pr_number,
             url,
         } => {
-            crate::github::NodePrRepo::new(conn).set(*node_id, owner, repo, *pr_number, url)?;
+            let mut pr = crate::github::NodePr::new(owner, repo, *pr_number);
+            if !url.is_empty() {
+                pr.url = url.clone();
+            }
+            crate::github::NodePrRepo::new(conn).add(*node_id, &pr)?;
             Ok(json!({}))
         }
         InterviewCommand::RespondReviewFinding {

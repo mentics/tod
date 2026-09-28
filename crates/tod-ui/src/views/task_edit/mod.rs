@@ -486,7 +486,7 @@ impl TaskEditView {
         let linear_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("Enter to edit · TOD-142 or URL"));
         let github_pr_input =
-            cx.new(|cx| InputState::new(window, cx).placeholder("Enter to edit · #42 or URL"));
+            cx.new(|cx| InputState::new(window, cx).placeholder("Enter to edit · PR URL or owner/repo#42"));
         let repo_input = cx.new(|cx| {
             InputState::new(window, cx).placeholder("Enter to edit · Workspace directory")
         });
@@ -3295,11 +3295,24 @@ impl TaskEditView {
             return;
         };
         let value = input_text(&self.github_pr_input, cx).trim().to_string();
-        let linked = if value.is_empty() {
-            Vec::new()
-        } else {
-            vec![value]
-        };
+        // The field edits the first link; any others (`tod-cli pr open` adds
+        // one per repository) are kept.
+        let mut linked = self
+            .node_uuid()
+            .and_then(|node_id| {
+                self.fleet
+                    .read(|conn| Ok(tod_store::github::NodePrRepo::new(conn).links(node_id)?))
+                    .ok()
+            })
+            .unwrap_or_default();
+        match (linked.is_empty(), value.is_empty()) {
+            (true, true) => {}
+            (true, false) => linked.push(value),
+            (false, true) => {
+                linked.remove(0);
+            }
+            (false, false) => linked[0] = value,
+        }
         let _ = self.fleet.enqueue(FleetMutation::UpdateTaskLinkedPrs {
             id,
             linked_prs: linked,

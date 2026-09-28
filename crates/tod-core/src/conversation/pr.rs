@@ -2,8 +2,9 @@
 //! yet), then watching CI, reviews, and comments — pushing fixes and
 //! replying, until GitHub says the PR is mergeable.
 //!
-//! Nothing in the reply is parsed: the app reads the PR reference the agent
-//! recorded through `tod-cli pr open` (`tod_store::github::NodePrRepo`) and
+//! Nothing in the reply is parsed: the app reads the pull requests linked to
+//! the node (its Ticket capability's links, where `tod-cli pr open` adds the
+//! one it opens; `tod_store::github::NodePrRepo`) and
 //! knows the protocol's job is done when the agent records `mergeable` (or
 //! `merged`, if it happened out of band) through `tod-cli pr`. The forward
 //! gates (`pr → approved`, `approved → merged`) are app-checked directly
@@ -162,8 +163,13 @@ impl Protocol for PrProtocol {
     /// continuation that changed nothing stops the loop rather than re-poll.
     fn progress(&self, env: &ProtocolEnv<'_>) -> Result<Option<String>> {
         let node = node_id(env)?;
-        let pr = env.fleet.read(|conn| NodePrRepo::new(conn).get(node))?;
-        Ok(pr.map(|pr| format!("{}/{}#{}", pr.owner, pr.repo, pr.pr_number)))
+        let prs = env.fleet.read(|conn| NodePrRepo::new(conn).read(node))?.prs;
+        Ok((!prs.is_empty()).then(|| {
+            prs.iter()
+                .map(|pr| format!("{}/{}#{}", pr.owner, pr.repo, pr.pr_number))
+                .collect::<Vec<_>>()
+                .join(" ")
+        }))
     }
 
     /// Done when this turn recorded the PR mergeable or merged. Otherwise
