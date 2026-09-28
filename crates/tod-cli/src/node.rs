@@ -402,11 +402,37 @@ fn delete(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
         .client()
         .read(move |conn| NodeRepo::new(conn).get(id))?
         .ok_or_else(|| anyhow::anyhow!("node not found"))?;
+    refuse_deleting_locations(inv, id)?;
     inv.client().interview(InterviewCommand::Outline {
         mutation: OutlineMutation::DeleteNode { node_id: id },
         target: Some(id),
     })?;
     Ok(ack(&node, inv.json))
+}
+
+/// A node with a worktree or sandbox at or below it is deleted in the app,
+/// which removes them first (pushing each branch); from here they would be
+/// left behind.
+fn refuse_deleting_locations(inv: &Invocation, node: Uuid) -> anyhow::Result<()> {
+    use tod_store::fleet::repos::files_location::FilesLocationRepo;
+    let made = inv.client().read(move |conn| {
+        let mut made = 0;
+        for location in FilesLocationRepo::new(conn).list_all()? {
+            let target = Uuid::parse_str(&location.node_id)?;
+            if tod_store::outline::ancestor_chain(conn, target)?.contains(&node) {
+                made += 1;
+            }
+        }
+        Ok(made)
+    })?;
+    if made > 0 {
+        anyhow::bail!(
+            "{made} node(s) at or below this one have a worktree or sandbox. Deleting it here \
+             would leave them behind; ask the user to delete it in the app, which removes them \
+             (pushing each branch first)."
+        );
+    }
+    Ok(())
 }
 
 fn notes(inv: &Invocation, args: &Args) -> anyhow::Result<String> {

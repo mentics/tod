@@ -143,15 +143,51 @@ pub fn resolve_default_branch(repo: &Workdir) -> Result<String> {
     run_git(repo, &["branch", "--show-current"]).or_else(|_| Ok("main".into()))
 }
 
+/// Check `branch` out in `worktree` (see [`switch_to_branch`]). A new one
+/// starts from `origin`'s default branch ([`new_branch_base`]), so fetch
+/// first ([`fetch_origin`]).
 pub fn checkout_branch(worktree: &Workdir, branch: &str) -> Result<()> {
     if branch.is_empty() {
         return Ok(());
     }
-    switch_to_branch(worktree, branch).map(|_| ())
+    let base = new_branch_base(worktree);
+    switch_to_branch(worktree, branch, base.as_deref()).map(|_| ())
 }
 
 /// The remote a branch of the same name is looked for on.
 const REMOTE: &str = "origin";
+
+/// Fetch `origin` in `repo`, so a branch made next starts from the latest
+/// of it. A repository without an `origin` has nothing to fetch; one whose
+/// fetch fails is an error, rather than a branch made from stale work.
+/// Network: never on the UI thread.
+pub fn fetch_origin(repo: &Workdir) -> Result<()> {
+    let remotes = run_git(repo, &["remote"])?;
+    if !remotes.lines().any(|r| r.trim() == REMOTE) {
+        return Ok(());
+    }
+    run_git(repo, &["fetch", "--quiet", "--prune", REMOTE]).with_context(|| {
+        format!("fetch {REMOTE} in {repo}, so the node's new branch starts from the latest")
+    })?;
+    Ok(())
+}
+
+/// Where a new branch starts: `origin`'s default branch (`origin/HEAD`,
+/// else `origin/main` or `origin/master`) as of the last fetch. `None` for a
+/// repository without one, whose new branches start at HEAD.
+fn new_branch_base(repo: &Workdir) -> Option<String> {
+    if let Ok(head) = run_git(
+        repo,
+        &["symbolic-ref", "--quiet", "--short", &format!("refs/remotes/{REMOTE}/HEAD")],
+    ) && !head.is_empty()
+    {
+        return Some(head);
+    }
+    ["main", "master"]
+        .into_iter()
+        .map(|b| format!("{REMOTE}/{b}"))
+        .find(|b| run_git(repo, &["rev-parse", "--verify", "-q", &format!("refs/remotes/{b}")]).is_ok())
+}
 
 /// What a repository has of `branch`, from one git call.
 #[derive(Debug, Default)]
@@ -199,15 +235,20 @@ fn branch_state(repo: &Workdir, branch: &str) -> Result<BranchState> {
 
 /// Check `branch` out in `repo`. One that does not exist yet is created from
 /// `origin/<branch>` when there is one (work pushed before, a pull request),
-/// else at HEAD. A branch with no upstream is linked to `origin/<branch>`, so
-/// `git pull` and `git push` work. Nothing is fetched: this goes by what the
-/// last fetch saw. Returns whether the branch was created at HEAD.
-fn switch_to_branch(repo: &Workdir, branch: &str) -> Result<bool> {
+/// else from `base` (not tracking it), else at HEAD. A branch with no
+/// upstream is linked to `origin/<branch>`, so `git pull` and `git push`
+/// work. Nothing is fetched here: this goes by what the last fetch saw.
+/// Returns whether the branch was created at HEAD.
+fn switch_to_branch(repo: &Workdir, branch: &str, base: Option<&str>) -> Result<bool> {
     let state = branch_state(repo, branch)?;
     let tracking = format!("{REMOTE}/{branch}");
     if !state.local {
         if state.remote {
             run_git(repo, &["switch", "--track", "-c", branch, &tracking])?;
+            return Ok(false);
+        }
+        if let Some(base) = base {
+            run_git(repo, &["switch", "--no-track", "-c", branch, base])?;
             return Ok(false);
         }
         run_git(repo, &["switch", "-c", branch])?;
@@ -330,7 +371,7 @@ pub fn init_submodules(worktree: &Workdir) -> Result<()> {
 
 /// Check `branch` out in every initialized submodule of `worktree` (see
 /// [`switch_to_branch`]: from `origin/<branch>` if the submodule has one, else
-/// at its current commit), so an agent's commits inside a submodule land on a
+/// at the commit the superproject pins), so an agent's commits inside a submodule land on a
 /// branch rather than a detached HEAD. Idempotent. Returns one warning per
 /// submodule it could not switch.
 pub fn branch_submodules(worktree: &Workdir, branch: &str) -> Result<Vec<String>> {
@@ -339,7 +380,7 @@ pub fn branch_submodules(worktree: &Workdir, branch: &str) -> Result<Vec<String>
     }
     let mut warnings = Vec::new();
     for dir in submodule_dirs(worktree)? {
-        let switched = switch_to_branch(&dir, branch).and_then(|created_at_head| {
+        let switched = switch_to_branch(&dir, branch, None).and_then(|created_at_head| {
             if created_at_head {
                 let head = run_git(&dir, &["rev-parse", "HEAD"])?;
                 run_git(&dir, &["config", &start_key(branch), &head])?;
@@ -471,6 +512,11 @@ fn git_worktree_add(repo: &Workdir, dest: &Workdir, branch: &str) -> Result<Work
         run_git(
             repo,
             &["worktree", "add", "--track", "-b", &branch_ref, &dest_str, &tracking],
+        )?;
+    } else if let Some(base) = new_branch_base(repo) {
+        run_git(
+            repo,
+            &["worktree", "add", "--no-track", "-b", &branch_ref, &dest_str, &base],
         )?;
     } else {
         run_git(repo, &["worktree", "add", "-b", &branch_ref, &dest_str])?;
@@ -681,6 +727,9 @@ pub fn ensure_worktree(
             warnings: Vec::new(),
         });
     }
+    // Outside the creation lock, which others wait on for only 30s: a new
+    // branch starts from the latest of origin.
+    fetch_origin(repo)?;
 
     with_creation_lock(data_root, || {
         if let Some(path) = shared()? {

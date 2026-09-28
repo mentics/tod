@@ -21,7 +21,8 @@ to act relative to an existing node (its list is used automatically), or
 `--list` for a top-level node with no parent.
 
 `delete` removes the node and its entire subtree (archived for undo, same as
-the app). A node's slug may change on rename if it was auto-derived from the
+the app). It is refused when a node at or below it has its own worktree or
+sandbox: ask the user to delete it in the app, which removes them first. A node's slug may change on rename if it was auto-derived from the
 title — address it by id in scripts that rename and then reuse the reference.
 
 Use `search` to find another node when you only have an approximate or partial

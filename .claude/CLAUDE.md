@@ -383,9 +383,12 @@ below one (an override), or disabling it first shows every location that
 would go stale (`provision::locations_affected_by`) in
 `ui::files_impact`: removing one pushes its branch, then deletes the
 sandbox or worktree; uncommitted work offers Commit, Retry, Shell (the
-dialog stays open), and Discard. This is the rule for any significant
-change: confirm it with its impact shown. `tod-cli` refuses such a change
-instead. Spec: `doc/files-locations.md`.
+dialog stays open), and Discard. Deleting a node in the app shows the same
+dialog for every location at or below it (`provision::locations_in_subtree`)
+and deletes the node once they are gone. This is the rule for any
+significant change: confirm it with its impact shown. `tod-cli` refuses such
+a change instead (including `node delete`). Making a location fetches
+`origin` first, and a new branch starts from its default branch. Spec: `doc/files-locations.md`.
 
 ### Dev containers
 
@@ -407,10 +410,12 @@ Nothing starts or builds a container; tod only uses a running one.
   --recursive`. Either way `ensure_worktree` then initializes any submodule
   still left out and puts every submodule on the node's branch; what it
   could not do comes back as `WorktreeHandle::warnings` and is shown in the
-  Files section. In the superproject and each submodule, a branch that
-  `origin/<branch>` already has is created from it, and an existing one with
-  no upstream is linked to it (one `for-each-ref`, no fetch: it goes by the
-  last fetch). It runs with no store lock held (the shared-worktree lookup
+  Files section. `origin` is fetched first (`worktree::fetch_origin`; a
+  failed fetch fails the launch rather than branch from stale work). In the
+  superproject and each submodule, a branch that `origin/<branch>` already
+  has is created from it, and an existing one with no upstream is linked to
+  it; any other new branch starts from `origin/HEAD` (else `origin/main`) in
+  the superproject and at the pinned commit in a submodule. It runs with no store lock held (the shared-worktree lookup
   is a short `fleet.read`), so the UI never waits on git or Docker.
 - **Mounted** (`container_repo_on_host`): the repository is on this machine,
   git runs here, and only launches go into the container. The directory there

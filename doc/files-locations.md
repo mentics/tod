@@ -47,6 +47,13 @@ background run — `provision::resolve_launch_cwd` makes its location:
 - a sandbox from the image or as a fork (`Sandboxes::create`), named after
   the node, then the node's branch checked out in the repository there.
 
+Either way `origin` is fetched first (`worktree::fetch_origin`), so the work
+starts from the latest: a branch `origin` already has (work pushed before)
+is continued from there, and a new one starts from `origin`'s default branch
+(`origin/HEAD`, else `origin/main`), never from whatever the checkout had.
+A fetch that fails stops the launch with the reason. A repository without an
+`origin` starts new branches at HEAD.
+
 A per-node lock keeps two launches from making two. Making one runs git,
 Docker, or the network, so it only happens off the UI thread; the UI asks
 `launch_cwd_if_made`, which never makes anything.
@@ -63,7 +70,10 @@ Files, a change that would leave locations stale lists them
 - enabling Files on a descendant: the locations at or below it made from an
   ancestor's settings;
 - disabling Files: every location made from it;
-- "Remove" on one node: its own location.
+- "Remove" on one node: its own location;
+- deleting a node: every location at or below it
+  (`provision::locations_in_subtree`); the node is deleted once they are
+  gone.
 
 Each row shows the node, its worktree or sandbox, and its state. Confirm
 removes every one — pushing its branch to `origin` first, then deleting the
@@ -81,14 +91,15 @@ A row with uncommitted work blocks Confirm and offers:
 A row whose node has a shell or agent running is busy until it stops.
 
 `tod-cli capabilities set … files` refuses a change that would leave
-locations stale: removing them needs the user.
+locations stale, and `tod-cli node delete` refuses a node with locations at
+or below it: removing them needs the user.
 
 ## Known gaps
 
-- Deleting a node archives its location row but leaves its worktree or
-  sandbox; restoring the node puts it back in it.
 - The removal check sees shells and agents recorded for the node, not a
   conversation turn or autopilot run that is starting.
-- The cloud runner makes its sandbox on its own path
-  (`cloud_sync::ensure_node_sandbox`).
-- A new sandbox checks out the node's branch without fetching first.
+- "Run in the cloud" (a node's autonomous runner, `doc/cloud-sandboxes/
+  autonomous-nodes.md`) makes its sandbox on its own path
+  (`cloud_sync::ensure_node_sandbox`): it clones the repository by URL and
+  starts the node's branch from `origin/HEAD` there, but it is not recorded
+  as the node's location and none of the above applies to it.

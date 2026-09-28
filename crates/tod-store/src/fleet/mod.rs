@@ -48,7 +48,7 @@ pub use notices::FleetNoticeHooks;
 pub use paths::FleetPaths;
 pub use projection::FleetProjection;
 pub use provision::{
-    AffectedLocation, LocationState, launch_cwd_if_made, rename_branch_for_node, resolve_launch_cwd,
+    AffectedLocation, LocationState, launch_cwd_if_made, locations_in_subtree, rename_branch_for_node, resolve_launch_cwd,
     resolve_launch_cwd_with,
 };
 pub use reattach::ReattachReport;

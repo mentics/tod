@@ -267,6 +267,8 @@ fn make_sandbox(
              sandbox must hold it there"
         )
     })?;
+    progress(&format!("fetching origin in {name}…"));
+    worktree::fetch_origin(&dir)?;
     progress(&format!("checking out {branch} in {name}…"));
     worktree::checkout_branch(&dir, branch)?;
     let mut warnings = Vec::new();
@@ -479,22 +481,38 @@ pub struct AffectedLocation {
 /// Files on here overrides). One made from Files set further down is not
 /// affected. Includes ones already stale.
 pub fn locations_affected_by(fleet: &FleetStore, node_id: &str) -> Result<Vec<AffectedLocation>> {
-    fleet.reload_if_stale().ok();
     let node = uuid::Uuid::parse_str(node_id)?;
+    locations_where(fleet, |location, chain| {
+        location.source_node_id == node_id || {
+            let at = chain.iter().position(|id| *id == node);
+            let source = uuid::Uuid::parse_str(&location.source_node_id).ok();
+            let from = source.and_then(|s| chain.iter().position(|id| *id == s));
+            matches!((at, from), (Some(at), Some(from)) if from < at)
+        }
+    })
+}
+
+/// Every location at or below `node_id`, which deleting it would leave
+/// behind.
+pub fn locations_in_subtree(fleet: &FleetStore, node_id: &str) -> Result<Vec<AffectedLocation>> {
+    let node = uuid::Uuid::parse_str(node_id)?;
+    locations_where(fleet, |_, chain| chain.contains(&node))
+}
+
+/// The locations `keep` accepts, given each one's node's ancestor chain
+/// (root → leaf, both ends included).
+fn locations_where(
+    fleet: &FleetStore,
+    keep: impl Fn(&FilesLocation, &[uuid::Uuid]) -> bool,
+) -> Result<Vec<AffectedLocation>> {
+    fleet.reload_if_stale().ok();
     fleet.read(|conn| {
         let all = FilesLocationRepo::new(conn).list_all()?;
         let mut out = Vec::new();
         for location in all {
             let target = uuid::Uuid::parse_str(&location.node_id)?;
-            let affected = location.source_node_id == node_id || {
-                // Root → leaf, both ends included.
-                let chain = crate::outline::ancestor_chain(conn, target)?;
-                let at = chain.iter().position(|id| *id == node);
-                let source = uuid::Uuid::parse_str(&location.source_node_id).ok();
-                let from = source.and_then(|s| chain.iter().position(|id| *id == s));
-                matches!((at, from), (Some(at), Some(from)) if from < at)
-            };
-            if !affected {
+            let chain = crate::outline::ancestor_chain(conn, target)?;
+            if !keep(&location, &chain) {
                 continue;
             }
             let node_title = crate::outline::repos::NodeRepo::new(conn)
@@ -615,12 +633,21 @@ mod tests {
         };
         let store = FleetStore::open(root.join("fleet")).unwrap();
         let (parent, child) = tree(&store, &repo);
+        // Someone else pushes to main; this checkout has not fetched it.
+        let other = root.join("other");
+        git(&root, &["clone", "-q", &origin.to_string_lossy(), &other.to_string_lossy()]);
+        git(&other, &["-c", "user.email=o@example.com", "-c", "user.name=o", "commit", "-q", "--allow-empty", "-m", "newer"]);
+        git(&other, &["push", "-q", "origin", "main"]);
+        let latest = git(&origin, &["rev-parse", "main"]);
+        assert_ne!(git(&repo, &["rev-parse", "main"]), latest);
 
         let (dir, _) = make_location(&store, &paths, &settings, &child, &mut |_| {}).unwrap();
         assert!(dir.is_dir());
         let slug = store.get_node(&child).unwrap().unwrap().slug;
         let branch = format!("task/{slug}");
         assert_eq!(worktree::current_branch(&dir).as_deref(), Some(branch.as_str()));
+        // The new branch starts from the latest of origin, not the stale main.
+        assert_eq!(dir.git(&["rev-parse", "HEAD"]).unwrap(), latest);
         let files = store.resolve_files_for_node(&child).unwrap().unwrap();
         assert_eq!(files.branch(), Some(branch.as_str()));
         assert_eq!(files.ready_directory(), Some(dir.clone()));
@@ -630,6 +657,11 @@ mod tests {
 
         let affected = locations_affected_by(&store, &parent).unwrap();
         assert_eq!(affected.iter().map(|a| a.node_title.as_str()).collect::<Vec<_>>(), ["Fix login"]);
+        // Deleting either node would leave the child's worktree behind.
+        for node in [&parent, &child] {
+            let below = locations_in_subtree(&store, node).unwrap();
+            assert_eq!(below.iter().map(|a| a.node_title.as_str()).collect::<Vec<_>>(), ["Fix login"]);
+        }
 
         std::fs::write(dir.host_path().unwrap().join("work.txt"), "done").unwrap();
         assert!(matches!(location_state(&store, &paths, &child).unwrap(), LocationState::Dirty(lines) if lines.len() == 1));

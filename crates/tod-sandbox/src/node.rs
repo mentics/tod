@@ -369,7 +369,9 @@ impl GitIdentity {
 
 /// Sets git's CA to the proxy's system-wide, then clones the repository (or
 /// fetches), sets the checkout's author to `identity`, and checks out
-/// `branch`, from `origin/<branch>` when it exists.
+/// `branch`: from `origin/<branch>` when it exists, else the local branch
+/// when there is one, else a new branch from the latest of origin's default
+/// branch (`origin/HEAD`).
 pub fn checkout_script(repo_url: &str, branch: &str, identity: &GitIdentity) -> String {
     let (repo, br, dir) = (shell_quote(repo_url), shell_quote(branch), shell_quote(WORKSPACE_DIR));
     let (name, email) = (shell_quote(&identity.name), shell_quote(&identity.email));
@@ -383,7 +385,8 @@ pub fn checkout_script(repo_url: &str, branch: &str, identity: &GitIdentity) -> 
          git config user.email {email}\n\
          if git show-ref --verify --quiet refs/remotes/origin/{br}; then \
          git checkout -B {br} origin/{br} && git branch --set-upstream-to=origin/{br}; \
-         else git checkout -B {br}; fi\n",
+         elif git show-ref --verify --quiet refs/heads/{br}; then git checkout {br}; \
+         else git checkout --no-track -b {br} \"$(git symbolic-ref -q --short refs/remotes/origin/HEAD || echo origin/main)\"; fi\n",
     )
 }
 
@@ -868,6 +871,9 @@ mod tests {
         assert!(s.contains("git clone https://github.com/o/r.git /workspace/repo"));
         assert!(s.contains("refs/remotes/origin/feat/x"));
         assert!(s.contains("git checkout -B feat/x origin/feat/x"));
+        // A new branch starts from origin's default branch, never a stale HEAD.
+        assert!(s.contains("git checkout --no-track -b feat/x \"$(git symbolic-ref -q --short refs/remotes/origin/HEAD"));
+        assert!(!s.contains("else git checkout -B feat/x;"));
         // A branch needing quotes stays one word after `origin/`.
         assert!(checkout_script("u", "a b", &me).contains("origin/'a b'"));
     }

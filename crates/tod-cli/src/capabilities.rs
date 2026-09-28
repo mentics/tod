@@ -162,7 +162,9 @@ fn refuse_orphaning_locations(
     })?;
     if made > 0 {
         anyhow::bail!(
-            "{made} node(s) have a worktree or sandbox made from this node's current Files              settings. Changing where the files are would leave them behind; ask the user to              change it in the app, which removes them (pushing each branch first)."
+            "{made} node(s) have a worktree or sandbox made from this node's current Files \
+             settings. Changing where the files are would leave them behind; ask the user to \
+             change it in the app, which removes them (pushing each branch first)."
         );
     }
     Ok(())

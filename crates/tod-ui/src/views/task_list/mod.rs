@@ -2518,6 +2518,46 @@ impl TaskListView {
             );
             return;
         }
+        // Worktrees and sandboxes at or below it are removed first (each
+        // branch pushed), or they would be left behind.
+        let affected = match tod_store::fleet::locations_in_subtree(&self.fleet, &task.id) {
+            Ok(affected) => affected,
+            Err(err) => {
+                self.show_delete_error(err, window, cx);
+                return;
+            }
+        };
+        if affected.is_empty() {
+            self.delete_node_now(task, window, cx);
+            return;
+        }
+        let paths = match crate::interview::TodPaths::discover() {
+            Ok(paths) => paths,
+            Err(err) => {
+                self.show_delete_error(err, window, cx);
+                return;
+            }
+        };
+        let view = cx.entity().downgrade();
+        let title = task.title.clone();
+        crate::ui::files_impact::confirm_files_change(
+            window,
+            cx,
+            self.fleet.clone(),
+            paths,
+            affected,
+            format!("Delete \"{title}\"?"),
+            "These worktrees and sandboxes belong to it or to nodes under it. They are \
+             removed first (each branch is pushed before it goes), then the node is deleted.",
+            "Remove and delete",
+            Box::new(move |window, cx| {
+                let _ = view.update(cx, |this, cx| this.delete_node_now(task, window, cx));
+            }),
+        );
+    }
+
+    /// Delete `task`, once nothing of its files is left to lose.
+    fn delete_node_now(&mut self, task: TaskItem, window: &mut Window, cx: &mut Context<Self>) {
         // If deleting a generator node with children, show confirmation.
         // A generator node has managed_count.is_some().
         let is_generator = task.managed_count.is_some();
