@@ -466,7 +466,7 @@ impl Blaxel {
 
     /// Reads a file from the sandbox (this wakes it).
     pub fn download(&self, url: &str, path: &str) -> Result<Vec<u8>> {
-        let target = format!("{url}/filesystem/{}", path.trim_start_matches('/'));
+        let target = format!("{url}/filesystem%2F{}", path.trim_start_matches('/'));
         let mut resp = self
             .auth(self.agent.get(&target))
             // Without it the API answers with the file's metadata as JSON.
