@@ -178,6 +178,8 @@ fn runner_activity(live: &Live) -> String {
         Some(P::Verification) => "verifying",
         Some(P::Review) => "reviewing",
         Some(P::Fix) => "fixing review findings",
+        Some(P::Phase) => "working on the phase",
+        Some(P::Evaluate) => "evaluating the phase",
         Some(P::GateCheck) => "checking the gate",
         Some(P::OnEntry) => "starting the new state",
         Some(P::Pr) => "working on the pull request",

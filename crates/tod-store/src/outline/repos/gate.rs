@@ -55,12 +55,62 @@ pub const REVIEW_APPROVED_REVIEW_DONE_SLUG: &str = "review-approved.review-done"
 /// findings table (`tod_core::gate::derived`); it never goes to an agent.
 pub const REVIEW_APPROVED_FINDINGS_ANSWERED_SLUG: &str = "review-approved.findings-answered";
 
-/// `design` → `planning`: the one active criterion for that transition. Any obligation
-/// change on the node resets its evaluation to pending (a schema trigger).
+/// `pr` → `approved`: the PR is mergeable (checks green, reviews satisfied).
+pub const PR_APPROVED_MERGEABLE_SLUG: &str = "pr-approved.mergeable";
+/// `approved` → `merged`: the PR has actually been merged.
+pub const APPROVED_MERGED_PR_MERGED_SLUG: &str = "approved-merged.pr-merged";
+
+/// `proposed` → `design`: the node has at least one requirement of its own.
+pub const PROPOSED_DESIGN_HAS_REQUIREMENTS_SLUG: &str = "proposed-design.has-requirements";
+/// `<from>` → next: a current certificate for the `from` phase
+/// (`crate::phase`). One per certifiable state.
+pub const PROPOSED_DESIGN_PHASE_CERTIFIED_SLUG: &str = "proposed-design.phase-certified";
+pub const DESIGN_PLANNING_PHASE_CERTIFIED_SLUG: &str = "design-planning.phase-certified";
+pub const PLANNING_READY_PHASE_CERTIFIED_SLUG: &str = "planning-ready.phase-certified";
+pub const MERGED_RELEASED_PHASE_CERTIFIED_SLUG: &str = "merged-released.phase-certified";
+pub const RELEASED_LEARN_PHASE_CERTIFIED_SLUG: &str = "released-learn.phase-certified";
+/// `learn` → `done`: the learn phase recorded its retrospective in this stay
+/// (`crate::learn`).
+pub const LEARN_DONE_LEARN_RECORDED_SLUG: &str = "learn-done.learn-recorded";
+
+/// The `<from>.phase-certified` criterion's slug for a certifiable state.
+pub fn phase_certified_slug(from_state: &str) -> Option<&'static str> {
+    match from_state {
+        "proposed" => Some(PROPOSED_DESIGN_PHASE_CERTIFIED_SLUG),
+        "design" => Some(DESIGN_PLANNING_PHASE_CERTIFIED_SLUG),
+        "planning" => Some(PLANNING_READY_PHASE_CERTIFIED_SLUG),
+        "merged" => Some(MERGED_RELEASED_PHASE_CERTIFIED_SLUG),
+        "released" => Some(RELEASED_LEARN_PHASE_CERTIFIED_SLUG),
+        _ => None,
+    }
+}
+
+/// Every criterion the app answers itself (`tod_core::gate::derived`). A gate
+/// never runs an agent (`doc/lifecycle/phase-agents.md`), so the seed
+/// deactivates every criterion not listed here.
+pub const DERIVED_CRITERION_SLUGS: &[&str] = &[
+    PROPOSED_DESIGN_HAS_REQUIREMENTS_SLUG,
+    PROPOSED_DESIGN_PHASE_CERTIFIED_SLUG,
+    DESIGN_PLANNING_PHASE_CERTIFIED_SLUG,
+    PLANNING_READY_REQUIREMENTS_TRACEABLE_SLUG,
+    PLANNING_READY_PHASE_CERTIFIED_SLUG,
+    READY_ACTIVE_ACTION_CONFIG_SLUG,
+    ACTIVE_VERIFYING_PLAN_IMPLEMENTED_SLUG,
+    VERIFYING_REVIEW_OBLIGATIONS_VERIFIED_SLUG,
+    VERIFYING_REVIEW_PLAN_VERIFIED_SLUG,
+    REVIEW_APPROVED_REVIEW_DONE_SLUG,
+    REVIEW_APPROVED_FINDINGS_ANSWERED_SLUG,
+    PR_APPROVED_MERGEABLE_SLUG,
+    APPROVED_MERGED_PR_MERGED_SLUG,
+    MERGED_RELEASED_PHASE_CERTIFIED_SLUG,
+    RELEASED_LEARN_PHASE_CERTIFIED_SLUG,
+    LEARN_DONE_LEARN_RECORDED_SLUG,
+];
+
+/// Retired: `design` → `planning` was judged by an agent against this; the
+/// design certificate replaced it. Deactivated by the seed.
 pub const BUILDABLE_CRITERION_SLUG: &str = "design-planning.buildable";
-/// The design → planning check that the design violates no constraint (the
-/// node's own or inherited) and satisfies every one. Kept active beside
-/// `buildable` when the rest of that transition's checklist is retired.
+/// Retired with `buildable`; the design phase's "Done when" checklist asks it.
 pub const DESIGN_CONSTRAINTS_CRITERION_SLUG: &str = "design-planning.constraints-satisfied";
 
 #[derive(Debug, Clone, PartialEq, Eq)]

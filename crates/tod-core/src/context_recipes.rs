@@ -267,30 +267,37 @@ pub const FIX_SESSION: ContextRecipe = ContextRecipe {
     ],
 };
 
-/// A gate-check turn. Stance is `one-shot`: a single structured-response turn
-/// that must not end by asking a question. It loads no `cli/` fragments at all
-/// — it returns YAML and the app persists the result, so it never mutates
-/// anything. It does load `domain/capabilities`, because gate criteria
-/// routinely turn on which capabilities a node has.
-pub const GATE_CHECK: ContextRecipe = ContextRecipe {
-    name: "gate check",
+/// A lifecycle phase agent (`doc/lifecycle/phase-agents.md`): does the work of
+/// the state its node is in until the phase is certified, asking the user
+/// through `decisions` only for what no agent can supply. Replaces the gate
+/// check and on-entry turns that came before it. Its role doc is the state's, and the tail says
+/// what the gate checks and what, if anything, was sent back.
+pub const PHASE: ContextRecipe = ContextRecipe {
+    name: "lifecycle phase",
     situational: false,
     layers: &[
-        "stance/one-shot",
+        "stance/autonomous-session",
         "domain/outline",
         "domain/obligations",
         "domain/lifecycle",
         "domain/capabilities",
         "domain/plan",
-        "surface/gate-check",
+        "cli/intro",
+        "cli/obligations",
+        "cli/plan",
+        "cli/content",
+        "cli/decisions",
+        "cli/learn",
+        "cli/phase",
+        "surface/phase",
     ],
     blocks: &[
         DynamicBlock::DataRoot,
         DynamicBlock::Node,
         DynamicBlock::NodeProcessFields,
         DynamicBlock::NodeObligations {
-            note: "This node's own — evaluate the gate and probe questions against \
-                   these, not against the ancestor context below.",
+            note: "This node's own — do and judge the phase's work against these, \
+                   not against the ancestor context below.",
         },
         DynamicBlock::AncestorContext,
         DynamicBlock::Plan,
@@ -298,46 +305,28 @@ pub const GATE_CHECK: ContextRecipe = ContextRecipe {
     ],
 };
 
-/// The `learn` → `done` gate check: the node's retrospective. The same turn
-/// as [`GATE_CHECK`], with one scoped exception `surface/learn` states: it
-/// records the retrospective through `tod-cli learn` before it answers, so
-/// the app stores it per pass (`doc/conversation/incoming-changes.md` §9).
-pub const LEARN_GATE_CHECK: ContextRecipe = ContextRecipe {
-    name: "learn gate check",
-    situational: false,
-    layers: &[
-        "stance/one-shot",
-        "domain/outline",
-        "domain/obligations",
-        "domain/lifecycle",
-        "domain/capabilities",
-        "domain/plan",
-        "cli/intro",
-        "cli/learn",
-        "surface/gate-check",
-        "surface/learn",
-    ],
-    blocks: GATE_CHECK.blocks,
-};
-
-/// An on-entry turn. Unlike gate-check this turn does real work (e.g.
-/// `planning` writing plan steps), so its stance is `autonomous-session` and
-/// it loads the CLI nouns it writes through.
-pub const ON_ENTRY: ContextRecipe = ContextRecipe {
-    name: "on-entry",
+/// An independent phase evaluation: a fresh session that judges whether a
+/// phase agent's work is done, and certifies it or sends fixes back. It
+/// cannot edit (`tod-cli` refuses its writes), so it loads only the nouns it
+/// reads through and the two it finishes with.
+pub const EVALUATE: ContextRecipe = ContextRecipe {
+    name: "phase evaluation",
     situational: false,
     layers: &[
         "stance/autonomous-session",
         "domain/outline",
         "domain/obligations",
         "domain/lifecycle",
+        "domain/capabilities",
         "domain/plan",
         "cli/intro",
         "cli/obligations",
         "cli/plan",
-        "surface/on-entry",
+        "cli/decisions",
+        "cli/phase",
+        "surface/evaluate",
     ],
-    blocks: GATE_CHECK.blocks,
+    blocks: PHASE.blocks,
 };
 
 /// An autonomous fleet run: a state agent launched into a worktree to work a
@@ -475,9 +464,8 @@ pub const ALL_RECIPES: &[ContextRecipe] = &[
     REVIEW_SESSION,
     PR_SESSION,
     FIX_SESSION,
-    GATE_CHECK,
-    LEARN_GATE_CHECK,
-    ON_ENTRY,
+    PHASE,
+    EVALUATE,
     FLEET_AUTONOMOUS,
     INTERVIEW_AGENT,
 ];

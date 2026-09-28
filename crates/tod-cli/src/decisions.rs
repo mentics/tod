@@ -1,5 +1,6 @@
 //! `tod-cli decisions` — what the user answers: a structured agent asks a
-//! question with options and evidence, and the app queues it for the user.
+//! question, with options or for a free-text answer, and evidence, and the
+//! app queues it for the user.
 //!
 //! Agents only `ask`; there is no answer command here on purpose —
 //! answering is the user's, from the task panel
@@ -25,16 +26,17 @@ Inside a conversation --node defaults to the node it is about, and asks are
 filed under that conversation and its protocol.
 
 COMMANDS:
-    ask   [--node <UUID>] <QUESTION> --option <TEXT> (repeatable) [--evidence <KIND>:<ID> (repeatable)] [--reason <KIND>]
+    ask   [--node <UUID>] <QUESTION> [--option <TEXT> (repeatable)] [--evidence <KIND>:<ID> (repeatable)] [--reason <KIND>]
     list  [--node <UUID>] [--all]
     show  <ID>
 
 `ask` records a pending decision: the question (as one positional argument —
-quote it), at least one --option (repeatable, in the order they should be
-offered), any --evidence links the user should be able to open while
+quote it), any --option (repeatable, in the order they should be offered;
+none asks for a free-text answer), any --evidence links the user should be able to open while
 answering, each `kind:id` with kind one of: obligation, plan_step, test_run,
-conversation, finding, node, and --reason, one of: missing_rule, conflict,
-access, risk, capability, other (defaults to other when omitted).
+conversation, finding, node, and --reason, one of:
+intent, missing_rule, conflict, access, risk, capability, other (defaults to
+other when omitted).
 `list` shows a node's pending decisions, oldest first; --all includes
 answered and withdrawn ones too.
 `show` prints one decision and its full answer log, oldest first.
@@ -106,9 +108,6 @@ fn ask(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
     let node = node(args)?;
     let question = args.target("a question")?.to_string();
     let options: Vec<String> = args.get_all("--option").iter().map(|s| s.to_string()).collect();
-    if options.is_empty() {
-        anyhow::bail!("at least one --option is required");
-    }
     let evidence = args
         .get_all("--evidence")
         .iter()
@@ -170,13 +169,16 @@ fn decision_json(d: &Decision) -> serde_json::Value {
 }
 
 fn decision_line(d: &Decision) -> String {
-    let options = d
-        .options
-        .iter()
-        .enumerate()
-        .map(|(i, o)| format!("{}. {o}", i + 1))
-        .collect::<Vec<_>>()
-        .join(" | ");
+    let options = if d.options.is_empty() {
+        "(free text)".to_string()
+    } else {
+        d.options
+            .iter()
+            .enumerate()
+            .map(|(i, o)| format!("{}. {o}", i + 1))
+            .collect::<Vec<_>>()
+            .join(" | ")
+    };
     format!(
         "[{}] {} {} · {}\n    {options}",
         short_id(d.id),

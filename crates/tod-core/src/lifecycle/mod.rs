@@ -11,7 +11,7 @@
 //! Which step comes next is [`crate::lifecycle_next`]; whether the current
 //! state still holds is [`crate::lifecycle_validity`].
 
-use crate::task::model::{next_lifecycle, previous_lifecycle, state_has_agent};
+use crate::task::model::{next_lifecycle, previous_lifecycle};
 use anyhow::{Context, Result};
 use tod_store::fleet::FleetStore;
 use tod_store::outline::repos::gate::ACTION_NONE;
@@ -180,27 +180,9 @@ pub fn implement_directory(
     tod_store::fleet::resolve_launch_cwd(fleet, task_id).map_err(|err| format!("{err:#}"))
 }
 
-/// Whether landing in `state` starts that state's agent on its on-entry work:
-/// the state has an agent, and is not active, verifying or review, which run
-/// in their own conversations from Implement, Verify and Review. Active's own
-/// on-entry step (checking whether the work is already done) is the
-/// implementation loop's first turn.
-pub fn enters_with_agent(state: &str) -> bool {
-    state_has_agent(state) && !matches!(state, "active" | "verifying" | "review")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn on_entry_agents_skip_the_states_with_their_own_conversations() {
-        assert!(enters_with_agent("planning"));
-        assert!(enters_with_agent("design"));
-        for state in ["active", "verifying", "review", "ready", "done", "approved"] {
-            assert!(!enters_with_agent(state), "{state}");
-        }
-    }
 
     #[test]
     fn waiving_then_advancing_moves_the_node() {

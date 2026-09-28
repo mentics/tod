@@ -41,13 +41,17 @@ pub const REASON_ACCESS: &str = "access";
 pub const REASON_RISK: &str = "risk";
 /// About a capability's own configuration.
 pub const REASON_CAPABILITY: &str = "capability";
+/// What the user wants is not stated anywhere: the node's purpose, scope,
+/// or a preference only they can give.
+pub const REASON_INTENT: &str = "intent";
 /// Does not fit the other reasons.
 pub const REASON_OTHER: &str = "other";
 
 /// Every reason a decision can be asked with (`doc/ui/task-panel.md`
 /// "Requests"); mirrored by `tod_core::attention::RequestReason`, which this
 /// crate cannot depend on (policy depends on transport, never the reverse).
-pub const DECISION_REASONS: [&str; 6] = [
+pub const DECISION_REASONS: [&str; 7] = [
+    REASON_INTENT,
     REASON_MISSING_RULE,
     REASON_CONFLICT,
     REASON_ACCESS,

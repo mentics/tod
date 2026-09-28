@@ -49,7 +49,7 @@ use tod_store::outline::PlanStep;
 use tod_store::outline::repos::plan_steps::HandoffReason;
 use tod_store::outline::repos::{ObligationRepo, PlanStepRepo};
 use tod_store::request_feedback::{
-    KIND_DECISION, KIND_GATE_BLOCKER, KIND_PLAN_STEP_HANDOFF, KIND_REVIEW_FINDING, NewRequestFeedback,
+    KIND_DECISION, KIND_PLAN_STEP_HANDOFF, KIND_REVIEW_FINDING, NewRequestFeedback,
     VERDICT_BAD_QUESTION, VERDICT_SHOULD_NOT_ASK,
 };
 use tod_store::review::{FINDING_DECLINED, FINDING_FIXED, FINDING_OUT_OF_SCOPE, ReviewFinding, ReviewRepo};
@@ -62,7 +62,7 @@ use crate::ui::selectable_text::{selectable_markdown, selectable_text};
 use crate::ui::style;
 use crate::unified::columns::PanelKind;
 use crate::unified::panel::PanelOpenRequest;
-use crate::views::lifecycle_control::{CriterionOutcome, LifecycleController};
+use crate::views::lifecycle_control::LifecycleController;
 
 /// The key context a host panel puts on its focused root so the request keys
 /// apply there.
@@ -136,6 +136,7 @@ pub fn bind_request_actions(el: Stateful<gpui::Div>, requests: &Entity<Requests>
 /// The human label for a request's reason, shown on its footer line.
 pub fn reason_label(reason: RequestReason) -> &'static str {
     match reason {
+        RequestReason::Intent => "Needs your input",
         RequestReason::MissingRule => "No rule covers this",
         RequestReason::Conflict => "Conflicting requirements",
         RequestReason::Access => "Needs access",
@@ -529,7 +530,7 @@ impl Requests {
                     self.answer_plan_step(&step, HandoffAnswer::Choose(action.0 - 1), Source::Keyboard, cx);
                 }
             }
-            AttentionKind::Finding | AttentionKind::Gate => {}
+            AttentionKind::Finding => {}
         }
     }
 
@@ -621,31 +622,6 @@ impl Requests {
         self.reload(cx);
     }
 
-    /// Waive one failing gate criterion through the shared controller.
-    pub(crate) fn waive_criterion(&mut self, node_id: Uuid, criterion: &CriterionOutcome, source: Source, cx: &mut Context<Self>) {
-        record_action(
-            cx,
-            tod_store::conversation::Focus::Node(node_id),
-            "waive".to_string(),
-            source,
-            JOURNEY_SURFACE,
-            Presented {
-                actions: vec![PresentedAction {
-                    id: criterion.criterion_id.to_string(),
-                    label: format!("Waive: {}", criterion.label),
-                    primary: true,
-                    disabled: false,
-                }],
-                focused: None,
-                notices: vec![criterion.label.clone()],
-            },
-        );
-        let criterion_id = criterion.criterion_id;
-        let task_id = node_id.to_string();
-        self.lifecycle.update(cx, |controller, cx| controller.waive(&task_id, criterion_id, cx));
-        self.reload(cx);
-    }
-
     /// The feedback given on request `id` in this session, if any.
     #[allow(dead_code)] // for tests.
     pub fn feedback_for(&self, id: Uuid) -> Option<&FeedbackState> {
@@ -666,8 +642,6 @@ impl Requests {
                 self.loaded.findings.iter().find(|f| f.id == item.id).and_then(|f| f.conversation_id),
                 None,
             ),
-            // A gate request's id is the gate-check conversation.
-            AttentionKind::Gate => (KIND_GATE_BLOCKER, Some(item.id), None),
         };
         NewRequestFeedback {
             node_id: item.node_id,
@@ -1022,7 +996,6 @@ impl Requests {
                 .unwrap_or_default(),
             AttentionKind::PlanStep => vec![EvidenceRef { kind: "plan_step".into(), id: item.id }],
             AttentionKind::Finding => vec![EvidenceRef { kind: "finding".into(), id: item.id }],
-            AttentionKind::Gate => vec![EvidenceRef { kind: "conversation".into(), id: item.id }],
         }
     }
 
@@ -1047,7 +1020,9 @@ impl Requests {
             .into_any_element()
     }
 
-    fn render_freeform(&self, decision_id: Uuid, cx: &mut Context<Self>) -> impl IntoElement {
+    /// The free-text answer field. `only` marks a question asked with no
+    /// options, where typing an answer is the only way to answer it.
+    fn render_freeform(&self, decision_id: Uuid, only: bool, cx: &mut Context<Self>) -> impl IntoElement {
         let editing = self.freeform_editing == Some(decision_id);
         key_context::set_input_tab_stop(&self.freeform_input, editing, cx);
         div()
@@ -1064,7 +1039,7 @@ impl Requests {
                 div()
                     .text_xs()
                     .text_color(cx.theme().muted_foreground)
-                    .child("Enter to answer freely…")
+                    .child(if only { "Enter to type your answer…" } else { "Enter to answer freely…" })
                     .into_any_element()
             })
     }
@@ -1093,8 +1068,8 @@ impl Requests {
                 window,
                 cx,
             ))
-            .child(self.render_options(&decision, cx))
-            .child(self.render_freeform(decision.id, cx))
+            .when(!decision.options.is_empty(), |el| el.child(self.render_options(&decision, cx)))
+            .child(self.render_freeform(decision.id, decision.options.is_empty(), cx))
             .child(footer)
             .into_any_element()
     }
@@ -1203,61 +1178,11 @@ impl Requests {
         card.child(self.render_footer(item, window, cx)).into_any_element()
     }
 
-    fn render_gate_card(&self, item: &AttentionItem, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        let node_id = item.node_id;
-        let failing: Vec<CriterionOutcome> = self
-            .lifecycle
-            .read(cx)
-            .state(&node_id.to_string())
-            .map(|s| s.criteria_detail.iter().filter(|r| r.is_failing()).cloned().collect())
-            .unwrap_or_default();
-        let card = self
-            .card(format!("unified-decisions-gate-{}", item.id), cx)
-            .child(kind_badge("Gate check"))
-            .child(selectable_markdown(
-                SharedString::from(format!("unified-decisions-gate-summary-{}", item.id)),
-                item.summary.clone(),
-                window,
-                cx,
-            ));
-        let rows: Vec<AnyElement> = failing
-            .into_iter()
-            .map(|criterion| {
-                let label = criterion.label.clone();
-                div()
-                    .id(SharedString::from(format!("unified-decisions-gate-row-{}", criterion.criterion_id)))
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(div().flex_1().min_w_0().child(selectable_text(
-                        SharedString::from(format!("unified-decisions-gate-label-{}", criterion.criterion_id)),
-                        label,
-                        window,
-                        cx,
-                    )))
-                    .child(
-                        Button::new(SharedString::from(format!(
-                            "unified-decisions-gate-waive-{}",
-                            criterion.criterion_id
-                        )))
-                        .label("Waive")
-                        .small()
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.waive_criterion(node_id, &criterion, Source::Click, cx);
-                        })),
-                    )
-                    .into_any_element()
-            })
-            .collect();
-        card.children(rows).child(self.render_footer(item, window, cx)).into_any_element()
-    }
-
     fn render_item(&self, item: &AttentionItem, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         match item.kind {
             AttentionKind::Decision => self.render_decision_card(item, window, cx),
             AttentionKind::PlanStep => self.render_plan_step_card(item, window, cx),
             AttentionKind::Finding => self.render_finding_card(item, window, cx),
-            AttentionKind::Gate => self.render_gate_card(item, window, cx),
         }
     }
 
@@ -1324,7 +1249,7 @@ impl Requests {
             .when(changing, |el| {
                 el.child(self.render_options(&decision, cx))
                     .child(div().flex().flex_wrap().gap_2().children(evidence))
-                    .child(self.render_freeform(decision_id, cx))
+                    .child(self.render_freeform(decision_id, decision.options.is_empty(), cx))
             })
             .into_any_element()
     }
@@ -1390,6 +1315,7 @@ mod tests {
     #[test]
     fn every_reason_has_a_label() {
         for reason in [
+            RequestReason::Intent,
             RequestReason::MissingRule,
             RequestReason::Conflict,
             RequestReason::Access,

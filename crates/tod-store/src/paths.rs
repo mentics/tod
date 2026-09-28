@@ -65,6 +65,11 @@ impl TodPaths {
         Ok(Self::new(data_root))
     }
 
+    /// Paths for an explicit data root, bypassing the configured override.
+    pub fn at(data_root: impl Into<PathBuf>) -> Self {
+        Self::new(data_root.into())
+    }
+
     fn new(data_root: PathBuf) -> Self {
         let config_dir = data_root.clone();
         Self {

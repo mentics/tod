@@ -502,6 +502,16 @@ fn ask_with_pipes_records_a_decision_plain_ask_still_just_asks() {
         .read(|conn| tod_store::decisions::DecisionRepo::new(conn).list_pending_for_node(fx.node))
         .unwrap();
     assert_eq!(decisions.len(), 1, "plain ask must not add a decision");
+
+    // A pipe with no options asks for a free-text answer.
+    say(&mut driver, &fx, &mut agent, "ask What is this node for? |");
+    let decisions = fx
+        .fleet
+        .read(|conn| tod_store::decisions::DecisionRepo::new(conn).list_pending_for_node(fx.node))
+        .unwrap();
+    assert_eq!(decisions.len(), 2);
+    assert_eq!(decisions[1].question, "What is this node for?");
+    assert!(decisions[1].options.is_empty());
 }
 
 #[test]

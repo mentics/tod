@@ -120,7 +120,7 @@ the app next opens, and reopens the conversation it was in; a paused or
 stopped run is left as it was.
 
 **Requests.** A run that stopped for a request (a decision, a plan step
-handed back, a gate criterion) continues by itself once the user has
+handed back, a gate criterion no agent can fix) continues by itself once the user has
 answered it and no conversation of the app's own is still working on the
 node. Any other stop (budget, a step that changed nothing, a failed turn)
 waits for Resume.
@@ -143,7 +143,6 @@ Each request shows:
   | decision | its options, with quick keys (**1**, **2**, **3** …), or in words |
   | plan step handed back (`blocked` / `partial`) | words, or retry |
   | review finding the user must answer | its status (fixed / rejected) and a note |
-  | gate criterion needing a human | **Waive**, through the shared `LifecycleController` |
   | stuck, raised by the runner | the actions that fit what it detected |
 
 - One small footer line, never more, holding:

@@ -53,9 +53,15 @@ impl NodeRun {
         self.running && self.protocol == ProtocolKind::OnEntry
     }
 
-    /// Running a gate check: leaving `from_state` toward `to_state`.
+    /// Running the state's own work or its evaluation (or, from before
+    /// gates were app checks, a gate check): working toward leaving
+    /// `from_state`.
     pub fn leaving(&self) -> bool {
-        self.running && self.protocol == ProtocolKind::GateCheck
+        self.running
+            && matches!(
+                self.protocol,
+                ProtocolKind::Phase | ProtocolKind::Evaluate | ProtocolKind::GateCheck
+            )
     }
 }
 

@@ -19,6 +19,7 @@ mod learn;
 mod interview;
 mod node;
 mod obligations;
+mod phase;
 mod plan;
 mod pr;
 mod review;
@@ -62,6 +63,7 @@ NOUNS:
     learn                  A node's retrospective, stored once per pass
     secrets                Run a command with stored secrets, without seeing them
     decisions              What the user answers: ask, list, show
+    phase                  Whether a node's lifecycle phase is done: status, ready, certify, reject
     wait                   What a node waits on between sessions: a time, an event, a check
 
 Run `tod-cli <NOUN> --help` for that noun's commands, or
@@ -89,6 +91,7 @@ const NOUNS: &[(&str, &str)] = &[
     ("learn", crate::learn::USAGE),
     ("secrets", crate::secrets::USAGE),
     ("decisions", crate::decisions::USAGE),
+    ("phase", crate::phase::USAGE),
     ("wait", crate::wait::USAGE),
 ];
 
@@ -210,9 +213,10 @@ fn run(args: &[String]) -> anyhow::Result<String> {
         "learn" => learn::run(invocation),
         "secrets" => secrets::run(invocation),
         "decisions" => decisions::run(invocation),
+        "phase" => phase::run(invocation),
         "wait" => wait::run(invocation),
         other => anyhow::bail!(
-            "unknown noun `{other}` (expected: node, obligations, content, plan, questions, memory, interview, visual-design, capabilities, changeset, tests, review, pr, verdicts, incoming, learn, secrets, decisions, wait)"
+            "unknown noun `{other}` (expected: node, obligations, content, plan, questions, memory, interview, visual-design, capabilities, changeset, tests, review, pr, verdicts, incoming, learn, secrets, decisions, phase, wait)"
         ),
     }
 }
@@ -859,9 +863,6 @@ Second."), "{listed}");
             "(no pending decisions)"
         );
 
-        let err = cli(&root, &["decisions", "ask", "--node", &node, "Round how?"]).unwrap_err();
-        assert!(err.to_string().contains("--option"), "{err}");
-
         let asked = cli(
             &root,
             &[
@@ -915,6 +916,101 @@ Second."), "{listed}");
         let short = with_reason.strip_prefix("ok ").expect("one-line ack");
         let shown = cli(&root, &["decisions", "show", short]).unwrap();
         assert!(shown.contains(" · access"), "{shown}");
+
+        // No --option asks for a free-text answer.
+        let free = cli(
+            &root,
+            &["decisions", "ask", "--node", &node, "What is this node for?", "--reason", "intent"],
+        )
+        .unwrap();
+        let short = free.strip_prefix("ok ").expect("one-line ack");
+        let shown = cli(&root, &["decisions", "show", short]).unwrap();
+        assert!(shown.contains("(free text)"), "{shown}");
+        assert!(shown.contains(" · intent"), "{shown}");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+    #[test]
+    fn phase_round_trip_status_ready_certify_and_reject() {
+        let (root, node_id, _) = data_root();
+        let set_lifecycle = |state: &str| {
+            let fleet = FleetStore::open(&root).unwrap();
+            fleet
+                .enqueue_outline(OutlineMutation::SetLifecycle {
+                    node_id,
+                    state: state.into(),
+                })
+                .unwrap();
+            fleet.writer().flush().unwrap();
+        };
+        set_lifecycle("proposed");
+        let node = node_id.to_string();
+
+        let status = cli(&root, &["phase", "status", "--node", &node]).unwrap();
+        assert!(status.contains("state: proposed"), "{status}");
+        assert!(status.contains("gate proposed → design:"), "{status}");
+        assert!(status.contains("fail proposed-design.has-requirements"), "{status}");
+        assert!(status.contains("fail proposed-design.phase-certified: not certified"), "{status}");
+        assert!(status.contains("certificate: none"), "{status}");
+
+        assert_eq!(cli(&root, &["phase", "ready", "--node", &node]).unwrap(), "ok");
+        let err = cli(&root, &["phase", "certify", "--node", &node]).unwrap_err();
+        assert!(err.to_string().contains("--note"), "{err}");
+        // With independent evaluation on (the default) only the evaluator
+        // certifies; off, the agent that did the work may.
+        let err = cli(&root, &["phase", "certify", "--node", &node, "--note", "A real task"])
+            .unwrap_err();
+        assert!(err.to_string().contains("phase ready"), "{err}");
+        std::fs::write(root.join("tod.yml"), "lifecycle:\n  independent_evaluation: false\n")
+            .unwrap();
+        assert_eq!(
+            cli(&root, &["phase", "certify", "--node", &node, "--note", "A real task"]).unwrap(),
+            "ok"
+        );
+        let status = cli(&root, &["phase", "status", "--node", &node]).unwrap();
+        assert!(status.contains("certificate: current (self): A real task"), "{status}");
+        assert!(status.contains("pass proposed-design.phase-certified"), "{status}");
+
+        // An edit to what the phase covers makes it stale, and says what changed.
+        let obligation = Uuid::new_v4();
+        {
+            let fleet = FleetStore::open(&root).unwrap();
+            fleet
+                .enqueue_outline(OutlineMutation::CreateObligation {
+                    obligation_id: Some(obligation),
+                    node_id,
+                    kind: "requirement".into(),
+                    after_id: None,
+                    before: false,
+                    section: None,
+                    body: "Export to CSV".into(),
+                    phase: "requirements".into(),
+                })
+                .unwrap();
+            fleet.writer().flush().unwrap();
+        }
+        let status = cli(&root, &["phase", "status", "--node", &node]).unwrap();
+        assert!(status.contains("certificate: stale (self): A real task"), "{status}");
+        let short = &obligation.simple().to_string()[..8];
+        assert!(status.contains(&format!("obligation {short} added")), "{status}");
+        assert!(status.contains("pass proposed-design.has-requirements"), "{status}");
+
+        let err = cli(&root, &["phase", "reject", "--node", &node]).unwrap_err();
+        assert!(err.to_string().contains("--fix"), "{err}");
+        assert_eq!(
+            cli(
+                &root,
+                &["phase", "reject", "--node", &node, "--fix", "Say which format", "--fix", "Name the columns"],
+            )
+            .unwrap(),
+            "ok"
+        );
+
+        // Only a certifiable state can be certified.
+        set_lifecycle("ready");
+        let status = cli(&root, &["phase", "status", "--node", &node]).unwrap();
+        assert!(status.contains("certificate: not needed in `ready`"), "{status}");
+        assert!(cli(&root, &["phase", "certify", "--node", &node, "--note", "x"]).is_err());
 
         let _ = std::fs::remove_dir_all(root);
     }

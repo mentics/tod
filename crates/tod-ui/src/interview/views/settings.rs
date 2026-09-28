@@ -33,8 +33,9 @@ const SIDEBAR_MIN: f32 = 140.0;
 const PANEL_MIN: f32 = 320.0;
 const SETTINGS_CONTEXT: &str = "Settings";
 
-const SECTIONS: [SettingsSection; 7] = [
+const SECTIONS: [SettingsSection; 8] = [
     SettingsSection::Agents,
+    SettingsSection::Lifecycle,
     SettingsSection::QuestionMaker,
     SettingsSection::AnswerProcessor,
     SettingsSection::Workspaces,
@@ -109,6 +110,7 @@ enum SettingsFocus {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SettingsSection {
     Agents,
+    Lifecycle,
     QuestionMaker,
     AnswerProcessor,
     Workspaces,
@@ -121,6 +123,7 @@ impl SettingsSection {
     fn label(self) -> &'static str {
         match self {
             Self::Agents => "Agents",
+            Self::Lifecycle => "Lifecycle",
             Self::QuestionMaker => "Question maker",
             Self::AnswerProcessor => "Agent context",
             Self::Workspaces => "Workspaces",
@@ -133,6 +136,7 @@ impl SettingsSection {
     fn id(self) -> &'static str {
         match self {
             Self::Agents => "agents",
+            Self::Lifecycle => "lifecycle",
             Self::QuestionMaker => "question-maker",
             Self::AnswerProcessor => "answer-processor",
             Self::Workspaces => "workspaces",
@@ -152,6 +156,7 @@ impl SettingsSection {
                 ChatLaunchMode,
                 MaxParallelSessions,
             ],
+            Self::Lifecycle => &[LifecycleIndependentEvaluation],
             Self::QuestionMaker => &[ReplenishThreshold],
             Self::AnswerProcessor => &[ContextBudget, PromptCacheIdle, AnsweredHistoryCap],
             Self::Workspaces => &[
@@ -219,6 +224,8 @@ enum SettingField {
     JourneysSendTest,
     JourneysMilestoneStates,
     JourneysStorageCap,
+    /// `lifecycle.independent_evaluation`.
+    LifecycleIndependentEvaluation,
 }
 
 impl SettingField {
@@ -252,6 +259,7 @@ impl SettingField {
             Self::JourneysSendTest => "journeys-send-test",
             Self::JourneysMilestoneStates => "journeys-milestone-states",
             Self::JourneysStorageCap => "journeys-storage-cap",
+            Self::LifecycleIndependentEvaluation => "lifecycle-independent-evaluation",
         }
     }
 }
@@ -1093,6 +1101,9 @@ impl SettingsView {
             SettingField::JourneysIncludeTranscripts => {
                 self.toggle_journeys_include_transcripts(cx)
             }
+            SettingField::LifecycleIndependentEvaluation => {
+                self.toggle_lifecycle_independent_evaluation(cx)
+            }
             SettingField::JourneysStorageCap => {
                 let step = if delta >= 0 { 64 } else { -64 };
                 self.step_journeys_storage_cap(step, cx);
@@ -1134,6 +1145,9 @@ impl SettingsView {
             SettingField::JourneysSend => self.toggle_journeys_send(cx),
             SettingField::JourneysIncludeTranscripts => {
                 self.toggle_journeys_include_transcripts(cx)
+            }
+            SettingField::LifecycleIndependentEvaluation => {
+                self.toggle_lifecycle_independent_evaluation(cx)
             }
             _ => {
                 // Cycle/step fields: Enter bumps forward like `=`.
@@ -1325,6 +1339,14 @@ impl SettingsView {
         }
         self.settings.journeys.include_transcripts = !self.settings.journeys.include_transcripts;
         self.schedule_save("journeys.include_transcripts", cx);
+        cx.notify();
+    }
+
+    /// Toggles "Require independent evaluation for lifecycle transitions".
+    fn toggle_lifecycle_independent_evaluation(&mut self, cx: &mut Context<Self>) {
+        self.settings.lifecycle.independent_evaluation =
+            !self.settings.lifecycle.independent_evaluation;
+        self.schedule_save("lifecycle.independent_evaluation", cx);
         cx.notify();
     }
 
@@ -2357,6 +2379,20 @@ impl SettingsView {
                     theme,
                     |this, _, cx| this.step_log_max_size(-1024, cx),
                     |this, _, cx| this.step_log_max_size(1024, cx),
+                ))
+                .into_any_element(),
+            SettingsSection::Lifecycle => v_flex()
+                .gap_1()
+                .child(toggle_row(
+                    cx,
+                    self,
+                    SettingField::LifecycleIndependentEvaluation,
+                    self.settings.lifecycle.independent_evaluation,
+                    false,
+                    "Require independent evaluation for lifecycle transitions",
+                    "A fresh agent session, separate from the one that did the phase's work, judges whether each phase is done. It cannot edit; it sends fixes back to the phase agent.",
+                    theme,
+                    |this, cx| this.toggle_lifecycle_independent_evaluation(cx),
                 ))
                 .into_any_element(),
             SettingsSection::Journeys => {

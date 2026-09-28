@@ -653,10 +653,10 @@ mod tests {
             let driver = tod_core::conversation::ConversationDriver::new(
                 config,
                 focus,
-                tod_store::conversation::ProtocolKind::GateCheck,
+                tod_store::conversation::ProtocolKind::Phase,
             );
             let ix = registry
-                .ensure(focus, tod_store::conversation::ProtocolKind::GateCheck, None, || Ok(driver))
+                .ensure(focus, tod_store::conversation::ProtocolKind::Phase, None, || Ok(driver))
                 .unwrap();
             // Take the driver to send without putting it back: this is what
             // marks the slot `running` (`DriverSlot::take_to_send`) — a real

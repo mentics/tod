@@ -174,7 +174,11 @@ impl<'a> TaskRepo<'a> {
         let now = now_ms();
         self.conn.execute(
             "INSERT INTO node_lifecycle (node_id, state, updated_at) VALUES (?1, ?2, ?3)
-             ON CONFLICT(node_id) DO UPDATE SET state = excluded.state, updated_at = excluded.updated_at",
+             ON CONFLICT(node_id) DO UPDATE SET state = excluded.state,
+               -- When the node entered this state: setting the state it is
+               -- already in does not start a new stay (`crate::phase`).
+               updated_at = CASE WHEN node_lifecycle.state = excluded.state
+                                 THEN node_lifecycle.updated_at ELSE excluded.updated_at END",
             params![uuid_to_blob(node_id), lifecycle, now],
         )?;
         Ok(())

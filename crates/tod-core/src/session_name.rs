@@ -42,6 +42,12 @@ pub const GATE_CHECK_SURFACE: &str = "gate check";
 /// The surface label a state's on-entry session is named with.
 pub const ON_ENTRY_SURFACE: &str = "on entry";
 
+/// The surface label a lifecycle phase agent's session is named with.
+pub const PHASE_SURFACE: &str = "phase";
+
+/// The surface label an independent phase evaluation is named with.
+pub const EVALUATE_SURFACE: &str = "evaluation";
+
 /// Checking a node against its incoming changes.
 pub const INCOMING_SURFACE: &str = "incoming check";
 

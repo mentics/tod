@@ -1,11 +1,13 @@
 ## `tod-cli decisions`
 
 What the user answers. Reduce a decision to options wherever you can — the
-more it is reduced, the faster the user gets through the queue. You only
-ask; answering is the user's.
+more it is reduced, the faster the user gets through the queue. Ask for free
+text (no `--option`) only when the answers cannot reasonably be listed, such
+as what a node with nothing on it is for. You only ask; answering is the
+user's.
 
 ```
-tod-cli --data-root <DATA_ROOT> decisions ask  [--node <NODE_UUID>] <QUESTION> --option <TEXT> (repeatable) [--evidence <KIND>:<ID> (repeatable)] [--reason <KIND>]
+tod-cli --data-root <DATA_ROOT> decisions ask  [--node <NODE_UUID>] <QUESTION> [--option <TEXT> (repeatable)] [--evidence <KIND>:<ID> (repeatable)] [--reason <KIND>]
 tod-cli --data-root <DATA_ROOT> decisions list [--node <NODE_UUID>] [--all]
 tod-cli --data-root <DATA_ROOT> decisions show <DECISION_ID>
 ```
@@ -18,11 +20,12 @@ in full or as the 8-character prefix listings show.
 
 - The question is one positional argument — quote it.
 - `--option`: repeatable, in the order they should be offered to the user
-  (numbered 1, 2, 3 … in the task panel). At least one is required.
+  (numbered 1, 2, 3 … in the task panel). The user can always answer in
+  their own words instead. With none, the question asks for free text.
 - `--evidence`: repeatable `kind:id` links the user can open while
   answering, kind one of `obligation`, `plan_step`, `test_run`,
   `conversation`, `finding`, `node`.
-- `--reason`: one of `missing_rule`, `conflict`, `access`, `risk`,
+- `--reason`: one of `intent`, `missing_rule`, `conflict`, `access`, `risk`,
   `capability`, `other` — defaults to `other` when omitted. See "Asking the
   user" for what each means.
 

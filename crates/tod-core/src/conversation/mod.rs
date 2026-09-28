@@ -11,11 +11,11 @@
 pub mod context;
 pub mod driver;
 pub mod fix;
-pub mod gate_check;
 pub mod handoff;
 pub mod implement;
 pub mod incoming;
 pub mod mock;
+pub mod phase;
 pub mod pr;
 pub mod protocol;
 pub mod review;

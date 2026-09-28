@@ -158,9 +158,6 @@ pub enum ConversationViewEvent {
         node_id: Uuid,
         obligation_id: Option<Uuid>,
     },
-    /// A gate check advanced the node into a state whose agent has on-entry
-    /// work: the shell starts it in a conversation.
-    EnterState { node_id: Uuid },
     /// A run ended with something the user should hear about (a failed
     /// commit, a branch that does not match): the shell shows it as a toast.
     Notice(RunNotice),
@@ -456,15 +453,6 @@ pub struct ConversationView {
     loop_turns: u32,
     /// Notices from finished runs, emitted as events on the next poll.
     pending_notices: Vec<RunNotice>,
-    /// Nodes a finished gate check advanced, whose new state's on-entry work
-    /// starts on the next poll.
-    pending_entries: Vec<Uuid>,
-    /// Nodes whose gate check just finished a turn: the criteria rows it
-    /// recorded are re-read on the next poll, so Advance appears on a pass.
-    pending_gate_reloads: Vec<Uuid>,
-    /// Nodes whose gate check is answering the criteria the app answers
-    /// itself, on the background executor.
-    settling_gate: Vec<Uuid>,
     /// The review pane's findings, on the shared item list: it owns the
     /// cursor, the scrolling, and the rows.
     findings: ItemList<FindingItem>,
@@ -589,14 +577,6 @@ impl ConversationView {
                     for notice in std::mem::take(&mut this.pending_notices) {
                         cx.emit(ConversationViewEvent::Notice(notice));
                     }
-                    for node_id in std::mem::take(&mut this.pending_entries) {
-                        cx.emit(ConversationViewEvent::EnterState { node_id });
-                    }
-                    for node_id in std::mem::take(&mut this.pending_gate_reloads) {
-                        let task_id = node_id.to_string();
-                        this.lifecycle
-                            .update(cx, |c, cx| c.reload_criteria(&task_id, cx));
-                    }
                     if changed {
                         cx.notify();
                     }
@@ -661,9 +641,6 @@ impl ConversationView {
             usage: ConversationUsage::default(),
             loop_turns: 0,
             pending_notices: Vec::new(),
-            pending_entries: Vec::new(),
-            pending_gate_reloads: Vec::new(),
-            settling_gate: Vec::new(),
             change_filter: StatusFilter::default(),
             // No columns: a change set is a plain list of items of several
             // kinds, not a table of one value per row.
@@ -765,7 +742,7 @@ impl ConversationView {
         self.protocol = protocol;
         self.show(focus, running.flatten(), true, cx);
         self.settle_on_transcript(window, cx);
-        if running.is_none() && !self.gate_check_waits(focus, protocol, cx) {
+        if running.is_none() {
             self.start(window, cx);
         }
     }
@@ -780,15 +757,8 @@ impl ConversationView {
     /// A gate check on a node with pending incoming changes waits for them
     /// to be checked (`doc/conversation/incoming-changes.md` §5); the shell
     /// starts it when they affect nothing.
-    pub(super) fn gate_check_waits(
-        &self,
-        focus: Focus,
-        protocol: ProtocolKind,
-        cx: &mut Context<Self>,
-    ) -> bool {
-        let (ProtocolKind::GateCheck, Focus::Node(node), Some((check, _))) =
-            (protocol, focus, self.incoming_check.as_ref())
-        else {
+    pub(super) fn gate_check_waits(&self, node: Uuid, cx: &mut Context<Self>) -> bool {
+        let Some((check, _)) = self.incoming_check.as_ref() else {
             return false;
         };
         check.update(cx, |check, cx| check.hold_gate_check(node, cx))
@@ -1054,16 +1024,7 @@ impl ConversationView {
                     // transcript has a new marker and the side pane's
                     // counter moved.
                     ConversationEvent::Continued => {}
-                    ConversationEvent::TurnFinished { error: None } => {
-                        if let (ProtocolKind::GateCheck, Focus::Node(node)) =
-                            (driver.protocol().kind(), driver.focus())
-                        {
-                            self.pending_gate_reloads.push(node);
-                        }
-                        if let Some(node) = entered_state(&self.fleet, &driver) {
-                            self.pending_entries.push(node);
-                        }
-                    }
+                    ConversationEvent::TurnFinished { error: None } => {}
                     ConversationEvent::Rotated => {}
                     ConversationEvent::Notice(notice) => self.pending_notices.push(notice),
                 }
@@ -2265,23 +2226,3 @@ fn worktree_files(cwd: &tod_store::fleet::Workdir) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// The node a finished gate check just advanced into a state whose agent has
-/// on-entry work, when `driver` ran one that did.
-fn entered_state(fleet: &FleetStore, driver: &ConversationDriver) -> Option<Uuid> {
-    if driver.protocol().kind() != ProtocolKind::GateCheck {
-        return None;
-    }
-    let Focus::Node(node) = driver.focus() else {
-        return None;
-    };
-    let id = driver.conversation_id()?;
-    let advanced_to = fleet
-        .read(|conn| ConversationRepo::new(conn).latest_report(id))
-        .ok()
-        .flatten()
-        .and_then(|report| {
-            tod_core::conversation::gate_check::GateReportRecord::from_stored(&report)
-        })
-        .and_then(|report| report.advanced_to)?;
-    crate::views::lifecycle_control::enters_with_agent(&advanced_to).then_some(node)
-}

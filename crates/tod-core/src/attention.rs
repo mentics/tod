@@ -7,13 +7,15 @@
 //! store), for the node tree's "needs you" filter and sort
 //! (`doc/ui/unified-view-plan.md` "W6. Attention").
 //!
-//! Four sources, each documented at its match arm below:
+//! Three sources, each documented at its match arm below:
 //! 1. pending decisions (`tod_store::decisions`);
 //! 2. plan steps handed back to the user (`partial` / `blocked`);
-//! 3. open review findings, only while the node is actually answering them;
-//! 4. the latest gate-check report, when it needs a human.
+//! 3. open review findings, only while the node is actually answering them.
+//!
+//! Gates are app-checked and never hand anything to the user themselves: a
+//! failing criterion goes back to a phase agent, or is waived from the
+//! lifecycle panel.
 
-use crate::conversation::gate_check::latest_gate_report;
 use anyhow::Result;
 use rusqlite::Connection;
 use std::collections::HashMap;
@@ -32,23 +34,22 @@ pub enum AttentionKind {
     PlanStep,
     /// An open review finding.
     Finding,
-    /// A gate-check report that came back `blocked` or `needs_human` with a
-    /// blocker only the user can answer.
-    Gate,
 }
 
 /// Why the agent or runner could not handle the request itself
 /// (`doc/ui/task-panel.md` "Requests"). A fixed set so they can be counted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RequestReason {
+    /// What the user wants is not stated anywhere (the node's purpose or
+    /// scope); usually asked as free text.
+    Intent,
     /// No obligation, plan step, or process doc settles it.
     MissingRule,
     /// Obligations or other requirements that cannot all hold.
     Conflict,
     /// A secret, account, or permission the agent does not have.
     Access,
-    /// A judgment call worth a human's sign-off (a review finding, a gate
-    /// blocker) rather than a missing rule or an outright conflict.
+    /// A judgment call worth a human's sign-off (a review finding) rather than a missing rule or an outright conflict.
     Risk,
     /// About a capability's own configuration.
     Capability,
@@ -61,6 +62,7 @@ impl RequestReason {
     /// `tod-cli decisions ask --reason`.
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::Intent => "intent",
             Self::MissingRule => "missing_rule",
             Self::Conflict => "conflict",
             Self::Access => "access",
@@ -74,6 +76,7 @@ impl RequestReason {
     /// unrecognized (an older row, or a value from a future version).
     pub fn parse(raw: &str) -> Self {
         match raw {
+            "intent" => Self::Intent,
             "missing_rule" => Self::MissingRule,
             "conflict" => Self::Conflict,
             "access" => Self::Access,
@@ -197,50 +200,6 @@ pub fn for_nodes(conn: &Connection, node_ids: &[Uuid]) -> Result<HashMap<Uuid, N
         }
     }
 
-    // 4. The latest gate-check report, when it needs a human: `result` is
-    // `blocked` or `needs_human` and at least one blocker's `action` is
-    // `ask_user` or `waive` — the two actions a gate check hands to the
-    // user rather than back to an agent (`implement` / `fix` / `verify` /
-    // `interview` all go to a further agent turn instead).
-    // `latest_gate_report` is per node (it needs the node's own current
-    // lifecycle state to know which transition's report is still current),
-    // so this is the one source that still costs one query per node; gate
-    // checks are comparatively rare, so it stays this way rather than adding
-    // a bespoke batch query for it.
-    for &node in node_ids {
-        let Some(from_state) = lifecycles.get(&node) else {
-            continue;
-        };
-        if let Some((conversation, report)) = latest_gate_report(conn, node, from_state)? {
-            let asks_user = report
-                .blockers
-                .iter()
-                .any(|b| b.action == "ask_user" || b.action == "waive");
-            if (report.result == "blocked" || report.result == "needs_human") && asks_user {
-                let summary = if report.summary.trim().is_empty() {
-                    report
-                        .blockers
-                        .iter()
-                        .map(|b| b.what.as_str())
-                        .collect::<Vec<_>>()
-                        .join("; ")
-                } else {
-                    report.summary.clone()
-                };
-                by_node.entry(node).or_default().push(AttentionItem {
-                    kind: AttentionKind::Gate,
-                    id: conversation.id,
-                    node_id: node,
-                    summary,
-                    options: Vec::new(),
-                    since: conversation.created_at,
-                    // A gate blocker asked of the user is a judgment call by
-                    // default; nothing on the report says otherwise today.
-                    reason: RequestReason::Risk,
-                });
-            }
-        }
-    }
     Ok(node_ids
         .iter()
         .map(|&node| {
@@ -427,44 +386,6 @@ mod tests {
         // Moved on to `approved`: no longer today's business either.
         NodeRepo::new(&fx.conn).set_lifecycle(node, "approved").unwrap();
         assert_eq!(for_node(&fx.conn, node).unwrap().count, 0);
-    }
-
-    #[test]
-    fn a_gate_report_needing_the_user_counts() {
-        use tod_store::conversation::{ConversationRepo, Focus, ProtocolKind};
-
-        let fx = fixture();
-        let node = make_node(&fx.conn, "gated");
-        NodeRepo::new(&fx.conn).set_lifecycle(node, "review").unwrap();
-
-        let repo = ConversationRepo::new(&fx.conn);
-        let conversation = repo
-            .create(Focus::Node(node), ProtocolKind::GateCheck, None, None, None)
-            .unwrap();
-        repo.set_transition(conversation.id, "review", "approved")
-            .unwrap();
-        let report = serde_json::json!({
-            "gate_check": {
-                "result": "needs_human",
-                "summary": "One finding is a judgment call.",
-                "next": "",
-                "blockers": [{
-                    "kind": "finding",
-                    "reference": "f1",
-                    "what": "Is the off-by-one worth blocking on?",
-                    "action": "ask_user",
-                }],
-                "findings": "",
-                "no_reasons": false,
-                "advanced_to": null,
-            }
-        });
-        repo.record_report(conversation.id, &report).unwrap();
-
-        let attention = for_node(&fx.conn, node).unwrap();
-        assert_eq!(attention.count, 1);
-        assert_eq!(attention.items[0].kind, AttentionKind::Gate);
-        assert_eq!(attention.items[0].id, conversation.id);
     }
 
     #[test]

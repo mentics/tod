@@ -851,46 +851,63 @@ fn gate_criteria_seed_on_migration() {
     let _store = FleetStore::open(&root).unwrap();
     let conn = schema::open_writer_connection(&db).unwrap();
     let repo = GateRepo::new(&conn);
-    // `buildable` and the constraints check are the only active design → planning criteria.
-    let design_planning = repo.list_for_transition("design", "planning").unwrap();
-    let slugs: Vec<&str> = design_planning.iter().map(|c| c.slug.as_str()).collect();
+    let slugs = |from: &str, to: &str| -> Vec<String> {
+        repo.list_for_transition(from, to)
+            .unwrap()
+            .into_iter()
+            .map(|c| c.slug)
+            .collect()
+    };
+    use crate::outline::repos::gate::*;
+    // Every gate is the app's own check; the agent-judged rows are retired.
     assert_eq!(
-        slugs,
-        [
-            crate::outline::BUILDABLE_CRITERION_SLUG,
-            crate::outline::DESIGN_CONSTRAINTS_CRITERION_SLUG
-        ]
+        slugs("proposed", "design"),
+        [PROPOSED_DESIGN_HAS_REQUIREMENTS_SLUG, PROPOSED_DESIGN_PHASE_CERTIFIED_SLUG]
     );
-    let superseded = GATE_CRITERIA
-        .iter()
-        .filter(|c| c.from_state == "design" && c.to_state == "planning")
-        .count()
-        - 2;
-    let planning_ready = repo.list_for_transition("planning", "ready").unwrap();
-    assert_eq!(planning_ready.len(), 12);
-    let ready_active = repo.list_for_transition("ready", "active").unwrap();
-    assert_eq!(ready_active.len(), 1);
-    let active_verifying = repo.list_for_transition("active", "verifying").unwrap();
-    assert_eq!(active_verifying.len(), 1);
-    let verifying_review = repo.list_for_transition("verifying", "review").unwrap();
-    assert_eq!(verifying_review.len(), 11);
-    let review_pr = repo.list_for_transition("review", "pr").unwrap();
-    assert_eq!(review_pr.len(), 2);
-    let pr_approved = repo.list_for_transition("pr", "approved").unwrap();
-    assert_eq!(pr_approved.len(), 1);
-    let approved_merged = repo.list_for_transition("approved", "merged").unwrap();
-    assert_eq!(approved_merged.len(), 1);
+    assert_eq!(slugs("design", "planning"), [DESIGN_PLANNING_PHASE_CERTIFIED_SLUG]);
     assert_eq!(
-        design_planning.len()
-            + planning_ready.len()
-            + ready_active.len()
-            + active_verifying.len()
-            + verifying_review.len()
-            + review_pr.len()
-            + pr_approved.len()
-            + approved_merged.len(),
-        GATE_CRITERIA.len() - superseded
+        slugs("planning", "ready"),
+        [PLANNING_READY_REQUIREMENTS_TRACEABLE_SLUG, PLANNING_READY_PHASE_CERTIFIED_SLUG]
     );
+    assert_eq!(slugs("ready", "active"), [READY_ACTIVE_ACTION_CONFIG_SLUG]);
+    assert_eq!(slugs("active", "verifying"), [ACTIVE_VERIFYING_PLAN_IMPLEMENTED_SLUG]);
+    assert_eq!(
+        slugs("verifying", "review"),
+        [VERIFYING_REVIEW_OBLIGATIONS_VERIFIED_SLUG, VERIFYING_REVIEW_PLAN_VERIFIED_SLUG]
+    );
+    assert_eq!(
+        slugs("review", "pr"),
+        [REVIEW_APPROVED_REVIEW_DONE_SLUG, REVIEW_APPROVED_FINDINGS_ANSWERED_SLUG]
+    );
+    assert_eq!(slugs("pr", "approved"), [PR_APPROVED_MERGEABLE_SLUG]);
+    assert_eq!(slugs("approved", "merged"), [APPROVED_MERGED_PR_MERGED_SLUG]);
+    assert_eq!(slugs("merged", "released"), [MERGED_RELEASED_PHASE_CERTIFIED_SLUG]);
+    assert_eq!(slugs("released", "learn"), [RELEASED_LEARN_PHASE_CERTIFIED_SLUG]);
+    assert_eq!(slugs("learn", "done"), [LEARN_DONE_LEARN_RECORDED_SLUG]);
+
+    // Exactly the derived criteria are active, and each is seeded.
+    let mut active: Vec<String> = conn
+        .prepare("SELECT slug FROM gate_criteria WHERE active = 1")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    active.sort();
+    let mut derived: Vec<String> = DERIVED_CRITERION_SLUGS.iter().map(|s| s.to_string()).collect();
+    derived.sort();
+    assert_eq!(active, derived);
+    for slug in DERIVED_CRITERION_SLUGS {
+        assert!(GATE_CRITERIA.iter().any(|c| c.slug == *slug), "{slug} is not seeded");
+    }
+    assert!(!repo.get_by_slug(BUILDABLE_CRITERION_SLUG).unwrap().unwrap().active);
+
+    // Reseeding (every open) leaves it so.
+    crate::outline::seed_gate_criteria(&conn).unwrap();
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM gate_criteria WHERE active = 1", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(count as usize, DERIVED_CRITERION_SLUGS.len());
     let _ = fs::remove_dir_all(root);
 }
 

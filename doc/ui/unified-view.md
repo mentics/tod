@@ -200,16 +200,16 @@ label wherever the node is shown:
 
 | Label | Meaning |
 |---|---|
-| `verifying` | In this state. |
-| `verifying →` | Checking the gate to leave this state. |
-| `→ verifying` | Running the on-entry agent for this state. |
+| `design` | In this state. |
+| `design →` | The state's agent, or its evaluator, is working. |
 
 Decisions the lifecycle panel used to hold (gate verdicts, waives, what to do
 next) move to the task panel's requests.
 
 ### Structured agents
 
-Lifecycle agents (implement, verify, review, fix, gate checks, on-entry) reply
+Lifecycle agents (phase agents and their evaluators, implement, verify,
+review, fix) reply
 **only** in structure. They have no free-text reply. The app renders what they
 record: decisions with options, changes to items, findings, verdicts. The
 more a decision is reduced to options, the faster the user gets through the

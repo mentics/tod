@@ -44,6 +44,9 @@
 //!   "Shouldn't have asked") — same story: added after the epoch, so its
 //!   trigger is created by [`request_feedback_triggers_sql`] in the v72
 //!   migration step that creates the table.
+//! - `phase_events` (`tod_store::phase`; insert-only, the log is
+//!   append-only), created by [`phase_events_triggers_sql`] in the v73
+//!   migration step that creates the table.
 //!
 //! Deliberately excluded, with reasons:
 //! - `node_plan_step_deps`, `node_plan_step_obligations`, `node_plan_step_notes`
@@ -291,6 +294,19 @@ pub fn cloud_nodes_triggers_sql() -> String {
 /// updated — adding a note or switching the verdict).
 pub fn request_feedback_triggers_sql() -> String {
     simple_id_triggers("request_feedback")
+}
+
+/// Trigger for `phase_events` (`crate::phase`): append-only, so insert
+/// only; the row id is an autoincrement integer.
+pub fn phase_events_triggers_sql() -> String {
+    format!(
+        "
+        CREATE TRIGGER IF NOT EXISTS trg_journey_phase_events_insert AFTER INSERT ON phase_events BEGIN
+            INSERT INTO journey_changes (node_id, tbl, row_id, op, at)
+            VALUES (NEW.node_id, 'phase_events', CAST(NEW.id AS TEXT), 'insert', {NOW});
+        END;
+        "
+    )
 }
 
 /// Triggers for a table shaped `(id BLOB PRIMARY KEY, node_id BLOB, ...)`.

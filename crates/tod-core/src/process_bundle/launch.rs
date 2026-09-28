@@ -58,8 +58,8 @@ pub fn interview_session_prefix(
 
 /// The state agent's role doc for `lifecycle`: shared state-agent conventions
 /// (`agents/state/base.md`) plus that lifecycle's own doc, when bundled. This
-/// is the doc every state-agent turn needs — gate checks, on-entry work, and
-/// autonomous fleet runs alike — so every caller shares this one assembly.
+/// is the doc a phase agent, its evaluator, and an autonomous fleet run need,
+/// so every caller shares this one assembly.
 pub fn state_role_doc(manifest: &ProcessManifest, lifecycle: &str) -> Result<String> {
     let base_path = manifest.state_base_doc();
     let base = read_doc(&base_path)
@@ -76,9 +76,9 @@ pub fn state_role_doc(manifest: &ProcessManifest, lifecycle: &str) -> Result<Str
 }
 
 /// Only `lifecycle`'s own doc, without the shared state-agent conventions.
-/// Those conventions describe the app's structured turns (on-entry, gate
-/// check) and their YAML response envelope; a conversation that works a
-/// state's responsibilities replies in plain text, so it takes this instead.
+/// Those conventions describe how a phase agent certifies its work; a
+/// protocol conversation with its own notion of done (verification, say)
+/// takes this instead.
 pub fn state_lifecycle_doc(manifest: &ProcessManifest, lifecycle: &str) -> Result<String> {
     let state_body = manifest
         .state_doc(lifecycle)
@@ -90,18 +90,6 @@ pub fn state_lifecycle_doc(manifest: &ProcessManifest, lifecycle: &str) -> Resul
     Ok(format!("## Lifecycle state: {lifecycle}
 
 {}", state_body.trim()))
-}
-
-/// `lifecycle`'s doc up to its forward gate rules, for a conversation that does
-/// the state's work but does not evaluate the gate. The gate rules, "Exit", and
-/// "Blockers" tell the agent to return `gate_results` and `forward_lifecycle`;
-/// they sit last in the prompt, so they outweigh a surface's plain-reply rule.
-pub fn state_working_doc(manifest: &ProcessManifest, lifecycle: &str) -> Result<String> {
-    let doc = state_lifecycle_doc(manifest, lifecycle)?;
-    Ok(match doc.find("\n## Forward gate rules") {
-        Some(at) => doc[..at].trim_end().to_string(),
-        None => doc,
-    })
 }
 
 /// Assemble an ACP prompt for a fleet agent run from bundled state-agent docs.
@@ -206,8 +194,9 @@ mod tests {
     /// The verification conversation once carried the shared state-agent
     /// conventions, whose YAML response envelope the agent followed instead
     /// of the surface's short plain reply.
+    /// No state doc tells its agent to reply in the old gate-check envelope.
     #[test]
-    fn lifecycle_doc_leaves_out_the_structured_response_envelope() {
+    fn state_docs_carry_no_response_envelope() {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("..")
             .join("..")
@@ -218,32 +207,14 @@ mod tests {
         }
         let install = TodInstallPaths::from_process_root(root).unwrap();
         let manifest = ProcessManifest::load(&install).unwrap();
-        let full = state_role_doc(&manifest, "verifying").unwrap();
-        let only = state_lifecycle_doc(&manifest, "verifying").unwrap();
-        assert!(full.contains("## Response format"));
-        assert!(!only.contains("## Response format"));
-        assert!(only.starts_with("## Lifecycle state: verifying"));
-        assert!(full.ends_with(&only));
-    }
-
-    /// The gate rules' "return `gate_results` / `forward_lifecycle`" lines
-    /// pulled the verification reply back into a YAML envelope.
-    #[test]
-    fn working_doc_leaves_out_the_gate_rules() {
-        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join("..")
-            .join("assets")
-            .join("process");
-        if !root.join("README.md").is_file() {
-            return;
+        for state in crate::task::model::LIFECYCLE_STATES {
+            let full = state_role_doc(&manifest, state).unwrap();
+            let only = state_lifecycle_doc(&manifest, state).unwrap();
+            assert!(only.starts_with(&format!("## Lifecycle state: {state}")));
+            assert!(full.ends_with(&only));
+            for stale in ["gate_results", "forward_lifecycle", "## Response format", "## Forward gate rules"] {
+                assert!(!full.contains(stale), "{state}'s doc still says {stale}");
+            }
         }
-        let install = TodInstallPaths::from_process_root(root).unwrap();
-        let manifest = ProcessManifest::load(&install).unwrap();
-        let doc = state_working_doc(&manifest, "verifying").unwrap();
-        assert!(doc.contains("## On entry"));
-        assert!(doc.contains("### Test strategy"));
-        assert!(!doc.contains("gate_results"));
-        assert!(!doc.contains("forward_lifecycle"));
     }
 }
