@@ -48,6 +48,25 @@ impl Sandboxes {
         self.config.save(&self.config_path)
     }
 
+    /// Deletes the sandbox in Blaxel and forgets it here ([`Self::forget`]).
+    pub fn delete(&mut self, bx: &Blaxel, name: &str) -> Result<()> {
+        bx.delete(name)?;
+        self.forget(name)
+    }
+
+    /// Drops the sandbox's entry (its URL, whether it has agents) from the
+    /// config, as `tod-sandbox delete` does, so a deleted sandbox is not
+    /// still listed as known.
+    pub fn forget(&mut self, name: &str) -> Result<()> {
+        forget(name);
+        let before = self.config.sandboxes.len();
+        self.config.sandboxes.retain(|s| s.name != name);
+        if self.config.sandboxes.len() != before {
+            self.save()?;
+        }
+        Ok(())
+    }
+
     pub fn account(&self) -> Result<&Account> {
         self.config
             .blaxel
@@ -742,6 +761,27 @@ mod tests {
             assert!(validate_name(&name).is_ok(), "{slug:?} -> {name:?}");
         }
         assert_eq!(suggested_name("fix-login"), "fix-login");
+    }
+
+    #[test]
+    fn a_forgotten_sandbox_leaves_the_config() {
+        let root = std::env::temp_dir().join(format!("tod-sbx-forget-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut sandboxes = Sandboxes::load(&root).unwrap();
+        for name in ["keep", "node-x"] {
+            sandboxes.config.upsert(config::Sandbox {
+                name: name.into(),
+                image: "img".into(),
+                url: Some(format!("https://{name}")),
+                agents: false,
+            });
+        }
+        sandboxes.save().unwrap();
+        sandboxes.forget("node-x").unwrap();
+        sandboxes.forget("never-known").unwrap();
+        let names: Vec<_> = Sandboxes::load(&root).unwrap().config.sandboxes.into_iter().map(|s| s.name).collect();
+        assert_eq!(names, ["keep"]);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
