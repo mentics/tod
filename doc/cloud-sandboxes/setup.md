@@ -61,8 +61,10 @@ So the script picks, in order:
   (override with `TOD_SANDBOX_BUILD_IMAGE`), where musl is the native
   target and OpenSSL is linked statically, builds all five. The repository
   is mounted read-only; cargo's target directory, registry, and git
-  checkouts live in Docker volumes (`tod-sandbox-target`,
-  `tod-sandbox-cargo`, `tod-sandbox-cargo-git`), so the host's `target/` is
+  checkouts live in Docker volumes (`tod-sandbox-target-<checkout>`, one
+  per checkout, since cargo would otherwise reuse another worktree's build of
+  a crate whose files here are older; `tod-sandbox-cargo`,
+  `tod-sandbox-cargo-git`), so the host's `target/` is
   untouched but for the binaries copied to `target/sandbox/`, and later
   builds are incremental. The first build takes about 15 minutes (it
   fetches the workspace's git dependencies, gpui's included, to resolve it);

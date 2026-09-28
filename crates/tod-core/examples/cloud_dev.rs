@@ -21,6 +21,9 @@
 //!       answers a pending decision (its full UUID, from `tod-cli --json
 //!       decisions list`) with its 1-based option, as the task panel does;
 //!       `sync` then sends it to the node.
+//!   cargo run -p tod-core --example cloud_dev -- <data_root> state <node> <state>
+//!       sets the node's lifecycle state, bypassing every gate (to run a
+//!       node's later steps again); `run` or `sync` sends it.
 //!
 //! Never run it on a data root the app has open.
 
@@ -30,7 +33,7 @@ use tod_store::fleet::{FleetMutation, FleetStore};
 use tod_store::outline::{Capability, CreatePosition, OutlineMutation};
 
 const USAGE: &str =
-    "usage: cloud_dev <data_root> init | run <node> | sync | node <title> <repo> <branch> <step>... | answer <decision> <option>";
+    "usage: cloud_dev <data_root> init | run <node> | sync | node <title> <repo> <branch> <step>... | answer <decision> <option> | state <node> <state>";
 
 fn create_node(fleet: &FleetStore, title: &str, repo: &str, branch: &str, steps: &[String]) -> Result<uuid::Uuid> {
     fn e(err: impl std::fmt::Display) -> anyhow::Error {
@@ -133,6 +136,12 @@ fn main() -> Result<()> {
                 )
                 .map_err(|e| anyhow!("{e}"))?;
             println!("answered {decision_id} with option {option}");
+        }
+        ("state", [node, state]) => {
+            let id = resolve(&fleet, node)?;
+            tod_core::lifecycle::set_lifecycle(&fleet, uuid::Uuid::parse_str(&id)?, state)?;
+            fleet.writer().flush().map_err(|e| anyhow!("{e}"))?;
+            println!("{id} is now {state}");
         }
         _ => bail!("{USAGE}"),
     }
