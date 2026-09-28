@@ -1597,6 +1597,10 @@ impl TaskEditView {
     }
 
     /// Open a shell/terminal at the node's resolved directory, off the UI thread.
+    ///
+    /// A click here can arrive with the workspace directory or branch field
+    /// still in edit mode (unsaved), so commit those first — otherwise the
+    /// shell resolves against the stale, previously-saved directory.
     fn launch_shell_for_task(&mut self, cx: &mut Context<Self>) {
         if self.shell_busy {
             return;
@@ -1604,6 +1608,20 @@ impl TaskEditView {
         let Some(task_id) = self.task_id() else {
             return;
         };
+        self.persist_repo(cx);
+        self.persist_branch(cx);
+        if input_text(&self.repo_input, cx) != self.loaded_repo
+            || input_text(&self.branch_input, cx) != self.loaded_branch
+        {
+            // A guard dialog, validation revert, or background rename is
+            // still pending: the new value isn't saved yet, so opening now
+            // would still use the old one. Let that settle first.
+            self.pending_toast = Some(
+                "Finish editing the workspace directory or branch before opening a shell".into(),
+            );
+            cx.notify();
+            return;
+        }
         self.shell_busy = true;
         self.worktree_status = Some("Opening terminal…".into());
         cx.notify();
