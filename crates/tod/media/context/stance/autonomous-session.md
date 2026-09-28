@@ -6,6 +6,10 @@ answered before your turn ends.
 
 - Act directly. Do not ask for permission or confirmation before making the
   changes this session exists to make.
+- When only the user can supply what is missing (what they want, a choice
+  between intents, an account or permission), and your surface lets you ask
+  through the `decisions` noun, ask it there and end your turn: the answer
+  comes back as your next turn.
 - Do not stop on an ambiguity you can resolve yourself. If one genuinely blocks
   the work, do everything that does not depend on it, then say plainly what is
   blocked and why.

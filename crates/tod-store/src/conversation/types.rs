@@ -138,6 +138,8 @@ str_enum!(
         OnEntry => "on_entry",
         Incoming => "incoming",
         Pr => "pr",
+        Phase => "phase",
+        Evaluate => "evaluate",
     }
 );
 
@@ -157,7 +159,13 @@ impl ProtocolKind {
     /// Whether this kind belongs to a lifecycle transition (or a state's
     /// entry), which its conversation records as `from_state`/`to_state`.
     pub fn has_transition(self) -> bool {
-        matches!(self, ProtocolKind::GateCheck | ProtocolKind::OnEntry)
+        matches!(
+            self,
+            ProtocolKind::GateCheck
+                | ProtocolKind::OnEntry
+                | ProtocolKind::Phase
+                | ProtocolKind::Evaluate
+        )
     }
 }
 
@@ -444,6 +452,8 @@ impl Conversation {
         let (from, to) = (self.from_state.as_deref()?, self.to_state.as_deref()?);
         Some(match self.protocol {
             ProtocolKind::OnEntry => format!("on entry to {to}"),
+            ProtocolKind::Phase => format!("{from} phase"),
+            ProtocolKind::Evaluate => format!("evaluating {from}"),
             _ => format!("{from} \u{2192} {to}"),
         })
     }

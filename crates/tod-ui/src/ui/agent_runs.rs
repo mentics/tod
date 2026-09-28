@@ -23,7 +23,7 @@ use gpui::Context;
 use std::sync::Arc;
 use tod_core::conversation::implement::{HandoffAnswer, handoff_answer_message};
 use tod_core::conversation::{ConversationConfig, ConversationDriver, ConversationStatus, SharedAgentAccess};
-use tod_store::conversation::{ConversationRepo, Focus, ProtocolKind};
+use tod_store::conversation::{Conversation, ConversationRepo, Focus, ProtocolKind};
 use tod_store::decisions::{Decision, DecisionRepo};
 use tod_store::fleet::FleetStore;
 use tod_store::interview::{ACTOR_USER, InterviewCommand};
@@ -32,6 +32,27 @@ use tod_store::outline::repos::PlanStepRepo;
 use tod_store::outline::repos::plan_steps::STATUS_IN_PROGRESS;
 use tod_store::review::ReviewRepo;
 use uuid::Uuid;
+
+/// The answer a decision gets when the user settled it outside the app.
+pub const RESOLVED_ELSEWHERE: &str = "Resolved outside the app, in the agent's own session";
+
+/// The conversation that most recently handed a plan step back on `focus`:
+/// whichever of its implementation/verification conversations was updated
+/// last (there is at most one of each per focus — `Protocol::cwd` — so "most
+/// recent" picks the one whose agent produced the handoff).
+pub fn latest_handoff_conversation(
+    conn: &rusqlite::Connection,
+    focus: Focus,
+) -> anyhow::Result<Option<Conversation>> {
+    let repo = ConversationRepo::new(conn);
+    let implement = repo.latest_for_focus_with_protocol(focus, ProtocolKind::Implementation)?;
+    let verify = repo.latest_for_focus_with_protocol(focus, ProtocolKind::Verification)?;
+    Ok(match (implement, verify) {
+        (Some(a), Some(b)) => Some(if a.updated_at >= b.updated_at { a } else { b }),
+        (Some(a), None) | (None, Some(a)) => Some(a),
+        (None, None) => None,
+    })
+}
 
 /// One node's runs, as a status label (`state` / `state →` / `→ state`, W11)
 /// reads them.
@@ -53,9 +74,15 @@ impl NodeRun {
         self.running && self.protocol == ProtocolKind::OnEntry
     }
 
-    /// Running a gate check: leaving `from_state` toward `to_state`.
+    /// Running the state's own work or its evaluation (or, from before
+    /// gates were app checks, a gate check): working toward leaving
+    /// `from_state`.
     pub fn leaving(&self) -> bool {
-        self.running && self.protocol == ProtocolKind::GateCheck
+        self.running
+            && matches!(
+                self.protocol,
+                ProtocolKind::Phase | ProtocolKind::Evaluate | ProtocolKind::GateCheck
+            )
     }
 }
 
@@ -526,25 +553,21 @@ impl AgentRuns {
         Ok(())
     }
 
-    /// The conversation that most recently handed a plan step back on
-    /// `focus`: whichever of its implementation/verification conversations
-    /// was updated last (there is at most one of each per focus —
-    /// `Protocol::cwd` — so "most recent" picks the one whose agent produced
-    /// the handoff).
     fn latest_handoff_conversation(&self, focus: Focus) -> anyhow::Result<Option<Uuid>> {
-        let (implement, verify) = self.fleet.read(|conn| {
-            let repo = ConversationRepo::new(conn);
-            let implement =
-                repo.latest_for_focus_with_protocol(focus, ProtocolKind::Implementation)?;
-            let verify = repo.latest_for_focus_with_protocol(focus, ProtocolKind::Verification)?;
-            anyhow::Ok((implement, verify))
-        })?;
-        let latest = match (implement, verify) {
-            (Some(a), Some(b)) => Some(if a.updated_at >= b.updated_at { a } else { b }),
-            (Some(a), None) | (None, Some(a)) => Some(a),
-            (None, None) => None,
-        };
-        Ok(latest.map(|c| c.id))
+        Ok(self.fleet.read(|conn| latest_handoff_conversation(conn, focus))?.map(|c| c.id))
+    }
+
+    /// Whether `conversation_id`'s turn is in flight here, driven by the app
+    /// or by a runner hosted elsewhere.
+    pub fn conversation_running(&self, conversation_id: Uuid) -> bool {
+        self.slots
+            .iter()
+            .any(|d| d.conversation_id == Some(conversation_id) && d.status.running)
+    }
+
+    /// The config a driver started from the app gets.
+    pub fn conversation_config(&self) -> Result<ConversationConfig, String> {
+        self.driver_config()
     }
 
     /// Answer a plan step the agent handed back to the user (`HandoffReason`),
@@ -594,6 +617,52 @@ impl AgentRuns {
                 },
             },
         )?;
+        Ok(())
+    }
+
+    /// Settle a pending decision the user answered outside the app, in the
+    /// asking agent's own session: an answer saying so is logged, and no turn
+    /// is sent, since that session already has the answer. The next turn
+    /// resumes the same session.
+    pub fn resolve_decision_elsewhere(&mut self, decision_id: Uuid) -> anyhow::Result<()> {
+        self.fleet.interview(
+            ACTOR_USER,
+            InterviewCommand::AnswerDecision {
+                decision_id,
+                option: None,
+                text: Some(RESOLVED_ELSEWHERE.to_string()),
+            },
+        )?;
+        Ok(())
+    }
+
+    /// Put a plan step the agent handed back to `in_progress` without
+    /// sending an answer: the user settled it outside the app, in the agent's
+    /// own session. Recorded under the conversation that handed it back,
+    /// when there is one, as [`Self::answer_plan_step_handoff`] does.
+    pub fn resolve_plan_step_elsewhere(&mut self, step_id: Uuid) -> anyhow::Result<()> {
+        let step = self
+            .fleet
+            .read(|conn| PlanStepRepo::new(conn).get(step_id))?
+            .with_context(|| format!("plan step {step_id} not found"))?;
+        let mutation = OutlineMutation::UpdatePlanStepStatus {
+            step_id,
+            status: STATUS_IN_PROGRESS.to_string(),
+            note: None,
+            reason: None,
+        };
+        match self.latest_handoff_conversation(Focus::Node(step.node_id))? {
+            Some(conversation_id) => {
+                self.fleet.interview(
+                    ACTOR_USER,
+                    InterviewCommand::ConversationEdit { conversation_id, mutation },
+                )?;
+            }
+            None => {
+                self.fleet.enqueue_outline(mutation)?;
+                self.fleet.writer().flush()?;
+            }
+        }
         Ok(())
     }
 

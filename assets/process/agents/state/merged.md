@@ -1,30 +1,14 @@
 # State: `merged`
 
-**Forward gate:** `merged` → `released`
+**Gate:** `merged` → `released`. The app checks it: the phase is certified. The certificate here is a check mark for this stay in `merged`; its note carries the release evidence.
 
-## On entry
+## Your work
 
-1. Read lifecycle state and merge evidence.
-2. If already released to the agreed production/runtime environment → verify and proceed to exit.
+1. First, read the merge evidence.
+2. Drive the **release** to the agreed production or runtime environment: follow the node's or project's release process (deploy pipeline, tags, and so on), and watch the release and build pipelines.
+3. On a failure, diagnose and fix what an agent can. Ask the user only for what needs them: a deploy permission, credentials, or a release decision that is theirs.
 
-## Responsibilities
+## Done when
 
-Drive **release** to the agreed production/runtime environment:
-
-- Follow the node/project release process (deploy pipeline, tags, etc.).
-- Watch release/build pipelines; record release identifier in evidence.
-- On failure, diagnose or escalate—do not mark `released` without actual release.
-
-## Forward gate rules (`merged` → `released`)
-
-Apply these prose rules (no DB checklist items for this transition):
-
-- Changes are released to the agreed production/runtime environment. That release is the gate.
-
-## Exit
-
-When release completes, return `forward_lifecycle: released`.
-
-## Blockers
-
-Release pipeline failure or missing deploy permissions → `blocked`.
+- [ ] The change is released to the agreed production or runtime environment. That release is the gate; never certify without an actual release.
+- [ ] The release identifier is recorded: in the certificate's note (with independent evaluation off), or in your `ready` reply for the evaluator to check.

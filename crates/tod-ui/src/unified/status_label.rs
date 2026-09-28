@@ -1,12 +1,12 @@
 //! The status label (`doc/ui/unified-view.md` "Status label"): a node's
-//! lifecycle state, compactly showing whether a gate check is leaving it or
-//! an on-entry agent is entering it.
+//! lifecycle state, compactly showing whether its agent is working it toward
+//! the gate.
 //!
 //! | Label | Meaning |
 //! |---|---|
-//! | `verifying` | In this state. |
-//! | `verifying →` | Checking the gate to leave this state. |
-//! | `→ verifying` | Running the on-entry agent for this state. |
+//! | `design` | In this state. |
+//! | `design →` | The state's agent, or its evaluator, is working. |
+//! | `→ design` | An on-entry agent from before gates were app checks. |
 //!
 //! The text/shape logic (`compute`) is pure and unit-tested on its own;
 //! `render` turns it into an element styled per `doc/ui-style-guide.yaml`
@@ -24,7 +24,7 @@ use crate::ui::agent_runs::NodeRun;
 pub enum Direction {
     /// In this state, nothing running.
     None,
-    /// A gate check is running, leaving this state.
+    /// The state's agent or its evaluator is working, toward leaving it.
     Leaving,
     /// An on-entry agent is running, entering this state.
     Entering,

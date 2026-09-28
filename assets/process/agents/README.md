@@ -20,7 +20,7 @@ Then a compact **node snapshot**, once per agent session. Every later turn carri
 
 ## State agents
 
-Shared conventions: [state/base.md](state/base.md) + state role doc + DB gate criteria (gate-check invocations).
+Shared conventions: [state/base.md](state/base.md) + the state's role doc, whose **Done when** checklist is what the phase agent and the evaluator judge against. Gates are app checks; no agent evaluates them.
 
 ## Side tools
 

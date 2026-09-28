@@ -16,10 +16,10 @@ const DEFAULT_JOURNEY_STORAGE_CAP_MB: u64 = 1024;
 /// Every lifecycle state name a node can hold, mirroring the `CHECK`
 /// constraint on `node_lifecycle.state` (`outline/ddl.rs`). Kept here rather
 /// than importing `tod-core`'s `LIFECYCLE_STATES`: `tod-store` is the lower
-/// layer and never depends on `tod-core`.
-const VALID_LIFECYCLE_STATES: [&str; 12] = [
-    "proposed", "design", "planning", "ready", "active", "verifying", "review", "approved",
-    "merged", "released", "learn", "done",
+/// layer and never depends on `tod-core`. `tod-core` tests that the two agree.
+pub const VALID_LIFECYCLE_STATES: [&str; 13] = [
+    "proposed", "design", "planning", "ready", "active", "verifying", "review", "pr",
+    "approved", "merged", "released", "learn", "done",
 ];
 
 fn default_journey_milestone_states() -> Vec<String> {
@@ -34,6 +34,29 @@ fn default_journey_milestone_states() -> Vec<String> {
 
 fn default_journey_storage_cap_mb() -> u64 {
     DEFAULT_JOURNEY_STORAGE_CAP_MB
+}
+
+fn default_independent_evaluation() -> bool {
+    true
+}
+
+/// How the lifecycle runner judges a phase done
+/// (`doc/lifecycle/phase-agents.md`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LifecycleSettings {
+    /// A fresh Evaluate session, separate from the phase agent, judges each
+    /// phase and certifies it or sends it back. Off: the phase agent
+    /// certifies its own phase.
+    #[serde(default = "default_independent_evaluation")]
+    pub independent_evaluation: bool,
+}
+
+impl Default for LifecycleSettings {
+    fn default() -> Self {
+        Self {
+            independent_evaluation: default_independent_evaluation(),
+        }
+    }
 }
 
 /// Whether, and how, per-node/project journeys are recorded and can be sent
@@ -499,6 +522,9 @@ pub struct TodSettings {
     /// Per-node/project journey recording and submission (`doc/journeys/spec.md`).
     #[serde(default)]
     pub journeys: JourneySettings,
+    /// How lifecycle phases are judged done.
+    #[serde(default)]
+    pub lifecycle: LifecycleSettings,
     /// How long idle connections to cloud sandboxes stay open.
     #[serde(default)]
     pub sandbox_idle: SandboxIdleSettings,
@@ -530,6 +556,7 @@ impl Default for TodSettings {
             terminal: TerminalSettings::default(),
             window_geometry: None,
             journeys: JourneySettings::default(),
+            lifecycle: LifecycleSettings::default(),
             sandbox_idle: SandboxIdleSettings::default(),
         }
     }
@@ -887,6 +914,9 @@ mod tests {
                 maximized: false,
             }),
             journeys: JourneySettings::default(),
+            lifecycle: LifecycleSettings {
+                independent_evaluation: false,
+            },
             sandbox_idle: SandboxIdleSettings::default(),
         };
         settings.save_to_path(&path).unwrap();
@@ -961,6 +991,27 @@ mod tests {
         assert_eq!(settings.agent_platform, AgentPlatform::Claude);
         assert_eq!(settings.agent_model(), "opus");
         assert_eq!(settings.agent_effort(), "auto");
+    }
+
+    #[test]
+    fn independent_evaluation_defaults_on_and_round_trips_off() {
+        let dir = std::env::temp_dir().join(format!("tod-settings-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("tod.yml");
+        fs::write(&path, "log_max_size_kb: 1024
+").unwrap();
+        let loaded = TodSettings::load_from_path(&path).unwrap();
+        assert!(loaded.lifecycle.independent_evaluation, "a missing key means on");
+        fs::write(&path, "lifecycle: {}
+").unwrap();
+        assert!(TodSettings::load_from_path(&path).unwrap().lifecycle.independent_evaluation);
+
+        let mut off = loaded;
+        off.lifecycle.independent_evaluation = false;
+        off.save_to_path(&path).unwrap();
+        let reloaded = TodSettings::load_from_path(&path).unwrap();
+        assert!(!reloaded.lifecycle.independent_evaluation);
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]

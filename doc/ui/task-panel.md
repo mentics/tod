@@ -120,7 +120,7 @@ the app next opens, and reopens the conversation it was in; a paused or
 stopped run is left as it was.
 
 **Requests.** A run that stopped for a request (a decision, a plan step
-handed back, a gate criterion) continues by itself once the user has
+handed back, a gate criterion no agent can fix) continues by itself once the user has
 answered it and no conversation of the app's own is still working on the
 node. Any other stop (budget, a step that changed nothing, a failed turn)
 waits for Resume.
@@ -143,7 +143,6 @@ Each request shows:
   | decision | its options, with quick keys (**1**, **2**, **3** …), or in words |
   | plan step handed back (`blocked` / `partial`) | words, or retry |
   | review finding the user must answer | its status (fixed / rejected) and a note |
-  | gate criterion needing a human | **Waive**, through the shared `LifecycleController` |
   | stuck, raised by the runner | the actions that fit what it detected |
 
 - One small footer line, never more, holding:
@@ -154,6 +153,20 @@ Each request shows:
   - its **reason**: why the agent or runner could not handle it itself.
     Reasons are a fixed set (missing rule, conflict, access, risk,
     capability, other) so they can be counted.
+  - a **terminal** icon, when the lifecycle conversation that asked (the
+    decision's or finding's own, or the implement/verify conversation that
+    handed the plan step back) has an agent session:
+    it continues that session in a terminal, in the agent's own CLI, for
+    anything too involved to answer here. It is disabled while that
+    session's turn is running.
+  - **Answered elsewhere**, for a decision or a handed-back plan step: the
+    user settled it outside the app (typically in that terminal), so it is
+    dismissed without an answer going to the agent. A decision logs an
+    answer saying so; a plan step goes back to `in_progress`. A finding
+    needs none: its own status buttons already settle it without a turn.
+    Once nothing else is waiting, the runner continues as it would after an
+    answer (see "Runner" above), resuming the same agent session, so the
+    terminal should be closed first.
   - **Shouldn't have asked**, at the right end: feedback on the request
     itself (see below).
 

@@ -146,7 +146,15 @@ column 1, under the node tree.
 - **Ctrl+J** toggles it: expands it when collapsed, collapses it when
   expanded.
 - It holds only **freeform** conversations, where the agent may reply in plain
-  text. Structured lifecycle agents never appear here (see below).
+  text. Structured lifecycle agents never appear here (see below), even when
+  one is the subject's most recent conversation: the user reaches those from
+  the task panel's requests, in a terminal (`doc/ui/task-panel.md`,
+  "Requests").
+- Its header has two icons before the chevron: a **pen** starts a new session
+  (as **Ctrl+N** does), and a **history** icon shows or hides the **sessions**
+  list at the drawer's left: every freeform conversation about the subject,
+  newest first (time and opening words), the open one highlighted. Clicking
+  one reopens it.
 
 ## Panels
 
@@ -200,16 +208,16 @@ label wherever the node is shown:
 
 | Label | Meaning |
 |---|---|
-| `verifying` | In this state. |
-| `verifying →` | Checking the gate to leave this state. |
-| `→ verifying` | Running the on-entry agent for this state. |
+| `design` | In this state. |
+| `design →` | The state's agent, or its evaluator, is working. |
 
 Decisions the lifecycle panel used to hold (gate verdicts, waives, what to do
 next) move to the task panel's requests.
 
 ### Structured agents
 
-Lifecycle agents (implement, verify, review, fix, gate checks, on-entry) reply
+Lifecycle agents (phase agents and their evaluators, implement, verify,
+review, fix) reply
 **only** in structure. They have no free-text reply. The app renders what they
 record: decisions with options, changes to items, findings, verdicts. The
 more a decision is reduced to options, the faster the user gets through the

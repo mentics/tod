@@ -14,6 +14,7 @@
 //! flag <id>: <reason>
 //! ask <text>
 //! ask <question> | <option> | <option> ...
+//! ask <question> |
 //! think <text>
 //! permission <title>
 //! ```
@@ -23,7 +24,8 @@
 //! and a line the mock cannot carry out gets a one-line note, each note its
 //! own markdown paragraph. `ask` with pipes records a decision
 //! (`tod_store::decisions`) on the conversation's focus node instead of just
-//! asking in prose, so `--agent mock` can exercise the decisions loop.
+//! asking in prose, so `--agent mock` can exercise the decisions loop; a pipe
+//! with no options after it records a free-text one.
 //!
 //! Like a real agent, the mock also reports the reply's parts
 //! ([`MockReply::parts`]): when there is work, a note that it is working, a
@@ -86,6 +88,12 @@ pub fn plan_turn(
         }
         Some(tod_store::conversation::ProtocolKind::Fix) => {
             super::fix::mock_turn(access, node_id, conversation_id)
+        }
+        Some(tod_store::conversation::ProtocolKind::Phase) => {
+            super::phase::mock_turn(access, node_id, conversation_id)
+        }
+        Some(tod_store::conversation::ProtocolKind::Evaluate) => {
+            super::phase::mock_evaluate_turn(access, node_id)
         }
         Some(tod_store::conversation::ProtocolKind::Pr) => {
             super::pr::mock_turn(access, node_id, conversation_id, place)
@@ -227,8 +235,9 @@ fn directive(client: &impl Access, conversation: Uuid, line: &str) -> Result<Opt
         let text = text.trim();
         // `ask <question> | <option> | <option> ...` records a decision on
         // the conversation's focus node, so `--agent mock` can exercise the
-        // decisions loop end to end. Plain `ask <text>` (no pipes) keeps the
-        // old behaviour: a freeform question, just echoed back.
+        // decisions loop end to end; `ask <question> |` (a pipe and no
+        // options) records a free-text decision. Plain `ask <text>` (no
+        // pipes) keeps the old behaviour: a question just echoed back.
         if text.contains('|') {
             let mut parts = text.split('|').map(str::trim);
             let question = parts.next().unwrap_or_default();
@@ -238,9 +247,6 @@ fn directive(client: &impl Access, conversation: Uuid, line: &str) -> Result<Opt
                 .collect();
             if question.is_empty() {
                 bail!("expected `ask <question> | <option> | <option> ...`");
-            }
-            if options.is_empty() {
-                bail!("`ask {text}` has pipes but no options after the question");
             }
             let node_id = client
                 .read(|conn| {

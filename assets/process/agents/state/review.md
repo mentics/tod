@@ -1,10 +1,10 @@
 # State: `review`
 
-**Forward gate:** `review` → `approved`
+**Gate:** `review` → `pr`. The app checks it: the review is recorded done, and no finding is still open.
 
-## On entry
+## First
 
-The review runs as the node's review conversation, started from the lifecycle panel's **Review** button, not automatically on entry.
+The review runs as the node's review conversation: the runner starts it, or the conversation view's **Review**.
 
 1. Read lifecycle state, obligations (including design-phase) and plan steps, implementation, and verification evidence from `verifying`.
 2. Functional correctness should already be established—do not treat this state as primary QA.
@@ -24,32 +24,23 @@ Track all findings until each has an explicit response:
 - Not critical / beyond requirements / not worth the cost
 - Rejected: not a problem after all, with a note saying why
 
-Fixing is a separate fix conversation, started from the conversation view's **Fix** button: its agent answers each open finding `fixed` or `rejected`, and the user gives the other answers.
+Fixing is a separate fix conversation (the runner starts it, or the conversation view's **Fix**): its agent answers each open finding `fixed` or `rejected`. The other answers are the user's.
 
 No outstanding unaddressed findings.
 
-### External approval (always required)
+### External approval
 
-**`review` → `approved` is never waived in autonomous mode.** Some process **outside this automation** must mark the change approved (currently human review).
-
-Coordinate human/team review when applicable. Do not self-approve.
+Approval comes from outside this automation: the PR's own review in `pr`. Never approve your own PR.
 
 ### Respond to findings
 
 Implement fixes or document responses. Re-verify when fixes touch behavior covered by obligations.
 
-## Forward gate rules (`review` → `approved`)
-
-The app checks this gate itself from the node's data; no agent evaluates it:
+## Done when
 
 - The review conversation recorded the review finished.
-- No finding is still open: each has an explicit response (fixed, with a pointer to the change or commit; out of scope; declined as not critical, beyond requirements, or not worth the cost — small cheap extras may still be taken; or rejected as not a problem, with a note saying why).
-- **Approval is always an external gate** (not waived in autonomous mode): once both checks pass, the user advances the node. That is the external approval; do not advance it yourself.
-
-## Exit
-
-The user advances the node to `approved` once every finding is answered; that is the external approval.
+- No finding is still open: each has an explicit response (fixed, with a pointer to the change or commit; out of scope; declined as not critical, beyond requirements, or not worth the cost; or rejected as not a problem, with a note saying why).
 
 ## Blockers
 
-Waiting on external approver or unresolved findings → stay in `review` or `blocked`.
+Unresolved findings keep the node in `review`; a finding only the user can answer is asked through the `decisions` noun.

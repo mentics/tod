@@ -306,6 +306,11 @@ mod lifecycle_tests {
     }
 
     #[test]
+    fn store_settings_accept_every_lifecycle_state() {
+        assert_eq!(tod_store::settings::VALID_LIFECYCLE_STATES, LIFECYCLE_STATES);
+    }
+
+    #[test]
     fn next_lifecycle_none_at_end_or_unknown() {
         assert_eq!(next_lifecycle("done"), None);
         assert_eq!(next_lifecycle("bogus"), None);

@@ -11,8 +11,15 @@
 //!
 //! Freeform means the plain/default protocol (`ProtocolKind::Outline`), the
 //! same one Ctrl+J opens everywhere else. A structured lifecycle
-//! conversation (implement, verify, review, fix, gate check, on-entry) never
-//! shows here.
+//! conversation (implement, verify, review, fix, pr, a phase agent or its
+//! evaluator) — the sessions the lifecycle runner drives — never shows here;
+//! the user reaches those from the task panel's requests, in a terminal
+//! (`unified::requests`).
+//!
+//! The header's pen icon starts a new session (as Ctrl+N does), and its
+//! history icon opens the **sessions** list at the drawer's left: every
+//! freeform conversation about the current focus, newest first, one click to
+//! reopen.
 //!
 //! Sending goes through the shared `ui::agent_runs::AgentRuns` registry
 //! exactly as `conversation::ConversationView` does: this view only starts
@@ -30,12 +37,16 @@ use gpui::{
     SharedString, StatefulInteractiveElement, Styled, Subscription, Window, actions, div,
     prelude::FluentBuilder, px, relative,
 };
-use gpui_component::{ActiveTheme, Icon, IconName, Sizable};
+use gpui_component::button::{Button, ButtonVariants};
+use gpui_component::{ActiveTheme, Icon, IconName, Selectable, Sizable};
 use tod_core::conversation::context::focus_selection;
 use tod_core::conversation::{ConversationConfig, ConversationDriver, ConversationStatus, SharedAgentAccess};
-use tod_store::conversation::{ConversationRepo, Focus, ProtocolKind, Turn, TurnRole};
+use tod_store::conversation::{
+    ConversationRepo, ConversationSummary, Focus, ProtocolKind, Turn, TurnRole,
+};
 use tod_store::fleet::FleetStore;
 
+use crate::conversation::format_time;
 use crate::interview::agent::SharedAgent;
 use crate::interview::{TodPaths, TodSettings};
 use crate::ui::agent_conversation::{AgentConversationEvent, AgentConversationPanel, Entry, EntryKind};
@@ -52,6 +63,12 @@ pub const CHAT_DRAWER_CONTEXT: &str = "ChatDrawer";
 /// How thick the expanded drawer's top edge is drawn, inside its
 /// `DIVIDER_WIDTH` grab area.
 const EDGE_LINE: f32 = 3.;
+
+/// How wide the sessions list is, beside the transcript.
+const SESSIONS_WIDTH: f32 = 220.;
+
+/// The one protocol the drawer holds.
+const FREEFORM: ProtocolKind = ProtocolKind::Outline;
 
 actions!(chat_drawer, [ChatDrawerNewConversation]);
 
@@ -101,6 +118,12 @@ pub struct ChatDrawer {
     /// `CHAT_START_HEIGHT`.
     height: Option<Pixels>,
     conversation_id: Option<Uuid>,
+    /// The focus's freeform conversations, newest first.
+    sessions: Vec<ConversationSummary>,
+    /// Whether the sessions list is showing.
+    sessions_open: bool,
+    /// Bumped on every sessions load so an older one never lands last.
+    sessions_generation: u64,
     /// Whether the conversation has an agent session to continue elsewhere.
     has_session: bool,
     status: ConversationStatus,
@@ -146,6 +169,9 @@ impl ChatDrawer {
             expanded: false,
             height,
             conversation_id: None,
+            sessions: Vec::new(),
+            sessions_open: false,
+            sessions_generation: 0,
             has_session: false,
             status: ConversationStatus::default(),
             session_info: SessionInfo::default(),
@@ -156,6 +182,7 @@ impl ChatDrawer {
             focus_handle: cx.focus_handle(),
         };
         drawer.reload(cx);
+        drawer.load_sessions(cx);
         drawer
     }
 
@@ -167,6 +194,11 @@ impl ChatDrawer {
     #[cfg(test)]
     pub fn conversation_id(&self) -> Option<Uuid> {
         self.conversation_id
+    }
+
+    #[cfg(test)]
+    pub fn sessions(&self) -> &[ConversationSummary] {
+        &self.sessions
     }
 
     /// What the drawer is about.
@@ -193,16 +225,70 @@ impl ChatDrawer {
             return;
         }
         self.focus = focus;
+        // Only a freeform conversation: the focus's latest one may be a
+        // lifecycle session, which this drawer never drives.
         self.conversation_id = self
             .fleet
-            .read(|conn| ConversationRepo::new(conn).latest_for_focus(focus))
+            .read(|conn| ConversationRepo::new(conn).latest_for_focus_with_protocol(focus, FREEFORM))
             .ok()
             .flatten()
             .map(|c| c.id);
         self.about = self.about_text();
         self.error = None;
+        self.sessions = Vec::new();
         self.transcript.update(cx, |panel, cx| panel.reset(cx));
         self.reload(cx);
+        self.load_sessions(cx);
+    }
+
+    /// Reopen one of the focus's freeform conversations.
+    pub fn open_session(&mut self, id: Uuid, window: &mut Window, cx: &mut Context<Self>) {
+        self.focus_handle.focus(window, cx);
+        if self.conversation_id == Some(id) {
+            return;
+        }
+        self.conversation_id = Some(id);
+        self.error = None;
+        self.transcript.update(cx, |panel, cx| panel.reset(cx));
+        self.reload(cx);
+        cx.notify();
+    }
+
+    /// Show or hide the sessions list.
+    pub fn toggle_sessions(&mut self, cx: &mut Context<Self>) {
+        self.sessions_open = !self.sessions_open;
+        if self.sessions_open {
+            self.load_sessions(cx);
+        }
+        cx.notify();
+    }
+
+    /// Reload the focus's freeform conversations off the UI thread: each
+    /// one's change count projects its action log.
+    fn load_sessions(&mut self, cx: &mut Context<Self>) {
+        self.sessions_generation += 1;
+        let generation = self.sessions_generation;
+        let fleet = self.fleet.clone();
+        let focus = self.focus;
+        cx.spawn(async move |this, cx| {
+            let sessions = cx
+                .background_executor()
+                .spawn(async move {
+                    fleet
+                        .read(|conn| {
+                            ConversationRepo::new(conn).list_for_focus_with_protocol(focus, FREEFORM)
+                        })
+                        .unwrap_or_default()
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if this.sessions_generation == generation {
+                    this.sessions = sessions;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
     }
 
     fn about_text(&self) -> SharedString {
@@ -352,6 +438,8 @@ impl ChatDrawer {
             }
             Err(err) => self.error = Some(err.into()),
         }
+        // A first send saves a new session; any send moves its own up.
+        self.load_sessions(cx);
         self.reload(cx);
         self.refresh_status(cx);
         cx.notify();
@@ -382,7 +470,7 @@ impl ChatDrawer {
     fn current_index(&self, cx: &App) -> Option<usize> {
         self.agent_runs
             .read(cx)
-            .find_index(self.focus, ProtocolKind::Outline, self.conversation_id)
+            .find_index(self.focus, FREEFORM, self.conversation_id)
     }
 
     fn ensure_current_driver(&mut self, cx: &mut Context<Self>) -> Result<usize, String> {
@@ -391,13 +479,13 @@ impl ChatDrawer {
         let conversation_id = self.conversation_id;
         let fleet = self.fleet.clone();
         self.agent_runs.update(cx, |runs, cx| {
-            let result = runs.ensure(focus, ProtocolKind::Outline, conversation_id, move || {
+            let result = runs.ensure(focus, FREEFORM, conversation_id, move || {
                 let config = config?;
                 match conversation_id {
                     Some(id) => {
                         ConversationDriver::open(config, &fleet, id).map_err(|e| format!("{e:#}"))
                     }
-                    None => Ok(ConversationDriver::new(config, focus, ProtocolKind::Outline)),
+                    None => Ok(ConversationDriver::new(config, focus, FREEFORM)),
                 }
             });
             cx.notify();
@@ -462,7 +550,11 @@ impl ChatDrawer {
     }
 
     fn on_agent_runs_changed(&mut self, cx: &mut Context<Self>) {
+        let was_running = self.status.running;
         self.refresh_status(cx);
+        if was_running && !self.status.running {
+            self.load_sessions(cx);
+        }
         self.reload(cx);
         cx.notify();
     }
@@ -602,6 +694,36 @@ impl Render for ChatDrawer {
             .when_some(error, |el, err| {
                 el.child(style::text_error(div()).text_xs().child(err))
             })
+            .child(
+                // Its own clicks, not the header's collapse.
+                div()
+                    .flex()
+                    .items_center()
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .child(
+                        Button::new("chat-drawer-sessions")
+                            .icon(Icon::new(gpui_kit_assets::IconName::RotateCcwClock))
+                            .ghost()
+                            .xsmall()
+                            .selected(self.sessions_open)
+                            .tooltip(if self.sessions_open {
+                                "Hide past sessions"
+                            } else {
+                                "Show past sessions"
+                            })
+                            .on_click(cx.listener(|this, _, _, cx| this.toggle_sessions(cx))),
+                    )
+                    .child(
+                        Button::new("chat-drawer-new-session")
+                            .icon(Icon::new(gpui_kit_assets::IconName::SquarePen))
+                            .ghost()
+                            .xsmall()
+                            .tooltip("New session (Ctrl+N)")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.new_conversation(window, cx)
+                            })),
+                    ),
+            )
             .child(Icon::new(IconName::ChevronDown).small().text_color(muted));
 
         div()
@@ -625,10 +747,71 @@ impl Render for ChatDrawer {
                 div()
                     .flex_1()
                     .min_h_0()
-                    .overflow_hidden()
-                    .child(self.transcript.clone()),
+                    .flex()
+                    .when(self.sessions_open, |el| el.child(self.render_sessions(cx)))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .child(self.transcript.clone()),
+                    ),
             )
             .into_any_element()
+    }
+}
+
+impl ChatDrawer {
+    /// The sessions list: the unsaved new session when that is what is
+    /// open, then every freeform conversation about the focus, newest first.
+    fn render_sessions(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let current = self.conversation_id;
+        let mut list = div()
+            .id("chat-drawer-sessions")
+            .flex_shrink_0()
+            .w(px(SESSIONS_WIDTH))
+            .h_full()
+            .flex()
+            .flex_col()
+            .border_r_1()
+            .border_color(cx.theme().border)
+            .p_1()
+            .overflow_y_scroll();
+        if current.is_none() {
+            list = list.child(
+                style::menu_item(div().id("chat-drawer-session-new"), true).child("New session"),
+            );
+        }
+        for summary in &self.sessions {
+            let id = summary.conversation.id;
+            let opening = if summary.opening.is_empty() {
+                "(no messages)".to_string()
+            } else {
+                summary.opening.clone()
+            };
+            list = list.child(
+                style::menu_item(
+                    div().id(SharedString::from(format!("chat-drawer-session-{id}"))),
+                    current == Some(id),
+                )
+                .flex()
+                .items_center()
+                .cursor_pointer()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _: &MouseDownEvent, window, cx| {
+                        this.open_session(id, window, cx)
+                    }),
+                )
+                .child(
+                    style::text_dense_muted(div())
+                        .flex_shrink_0()
+                        .child(format_time(summary.conversation.updated_at)),
+                )
+                .child(div().flex_1().min_w_0().overflow_hidden().text_ellipsis().child(opening)),
+            );
+        }
+        list
     }
 }
 
@@ -808,6 +991,58 @@ mod tests {
 
         drawer.update(cx, |d, cx| d.set_focus(Focus::Node(other_node), cx));
         assert_eq!(drawer.read_with(cx, |d, _| d.conversation_id()), Some(conv_b));
+    }
+
+    /// The lifecycle's conversations on a node never show in the drawer,
+    /// even when one is the node's most recent.
+    #[gpui::test]
+    fn only_freeform_sessions_show(cx: &mut TestAppContext) {
+        let fixture = Fixture::new();
+        let create = |protocol| {
+            let id = Uuid::new_v4();
+            fixture
+                .store
+                .interview(
+                    ACTOR_USER,
+                    InterviewCommand::CreateConversation {
+                        id,
+                        protocol,
+                        focus: Focus::Node(fixture.node_id),
+                        platform: None,
+                        model: None,
+                        effort: None,
+                    },
+                )
+                .unwrap();
+            id
+        };
+        let freeform = create(ProtocolKind::Outline);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let _implement = create(ProtocolKind::Implementation);
+
+        let (drawer, _runs, cx) = open_drawer(&fixture, mock_agent(), cx);
+        drawer.update(cx, |d, cx| d.set_focus(Focus::Node(fixture.node_id), cx));
+        cx.run_until_parked();
+        let (current, sessions) = drawer.read_with(cx, |d, _| {
+            (
+                d.conversation_id(),
+                d.sessions().iter().map(|s| s.conversation.id).collect::<Vec<_>>(),
+            )
+        });
+        assert_eq!(current, Some(freeform));
+        assert_eq!(sessions, vec![freeform]);
+
+        // A new session leaves the old one listed, to come back to.
+        cx.update_window(cx.window_handle(), |_, window, cx| {
+            drawer.update(cx, |d, cx| d.new_conversation(window, cx));
+        })
+        .unwrap();
+        assert_eq!(drawer.read_with(cx, |d, _| d.conversation_id()), None);
+        cx.update_window(cx.window_handle(), |_, window, cx| {
+            drawer.update(cx, |d, cx| d.open_session(freeform, window, cx));
+        })
+        .unwrap();
+        assert_eq!(drawer.read_with(cx, |d, _| d.conversation_id()), Some(freeform));
     }
 
     #[gpui::test]

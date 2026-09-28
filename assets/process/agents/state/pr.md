@@ -1,8 +1,8 @@
 # State: `pr`
 
-**Forward gate:** `pr` → `approved`
+**Gate:** `pr` → `approved`. The app checks it against GitHub: the PR is approved and its checks are green.
 
-## On entry
+## First
 
 The PR is driven as the node's `pr` conversation, started from the conversation view's **Pr** step alongside Send.
 
@@ -21,15 +21,11 @@ Your job ends at **mergeable**, not **approved** — the forward gate is the app
 
 If you cannot make further progress without the user (a merge conflict you cannot resolve, a requested change you cannot judge), record it blocked with why and stop.
 
-## Forward gate rules (`pr` → `approved`)
+## Done when
 
 The app checks this gate itself from GitHub's live status; no agent evaluates it:
 
 - The PR is approved (per GitHub's review decision) and its checks are green.
-
-## Exit
-
-The gate advances the node once GitHub reports the PR mergeable — no agent turn decides this.
 
 ## Blockers
 

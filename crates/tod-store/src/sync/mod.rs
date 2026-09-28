@@ -115,6 +115,7 @@ pub const SYNCED_TABLES: &[&str] = &[
     "decisions",
     "decision_answers",
     "request_feedback",
+    "phase_events",
     "lifecycle_baselines",
     "learn_drafts",
     "learn_outputs",

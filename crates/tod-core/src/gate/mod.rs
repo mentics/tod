@@ -1,21 +1,15 @@
-//! Lifecycle gate-check orchestration — a single agent turn that decides
-//! whether a node may advance to the next lifecycle state.
-//!
-//! Mirrors `crate::interview`'s shape (context assembly, then a routing
-//! helper) but is one-shot: no driver, no multi-turn session management. The
-//! caller (an interactive UI, or eventually `tod-cli`) sends one
-//! [`context::GateCheckRequest`] as a session turn via `tod_agent::AgentProvider`,
-//! waits for the reply, and parses it with [`response::parse_gate_reply`].
+//! Lifecycle gates. Every gate is an app check (`derived`, settled by
+//! `crate::phase::settle_gate`); `context` builds a state agent's message.
+//! `response` reads the replies of gate-check conversations from before gates
+//! were app checks, which their transcripts still show, and names the actions
+//! a criterion row offers.
 
 pub mod context;
 pub mod derived;
 pub mod response;
 pub mod routing;
 
-pub use context::{
-    GATE_CHECK_RECIPE, GateCheckRequest, ON_ENTRY_RECIPE, PlanStepWithLinks,
-    build_gate_check_message, build_on_entry_message,
-};
-pub use derived::{DerivedOutcome, evaluate_derived_criterion};
+pub use context::{GateCheckRequest, PlanStepWithLinks, build_phase_message};
+pub use derived::{DerivedOutcome, evaluate_derived_criterion, is_derived_slug};
 pub use response::{GateAction, GateCheckReply, GateOutcome, GateResultRow, parse_gate_reply};
 pub use routing::{gate_criteria_for, gate_criteria_for_with_conn};

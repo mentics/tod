@@ -24,6 +24,8 @@ pub fn role_for(kind: ProtocolKind) -> AgentRole {
         | ProtocolKind::VisualDesign
         | ProtocolKind::GateCheck
         | ProtocolKind::OnEntry
+        | ProtocolKind::Phase
+        | ProtocolKind::Evaluate
         | ProtocolKind::Incoming
         | ProtocolKind::Pr => AgentRole::Default,
     }

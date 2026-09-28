@@ -1181,6 +1181,66 @@ mod request_tests {
         id
     }
 
+    /// A request offers its asking conversation to a terminal once that
+    /// conversation has an agent session to resume, and not before.
+    #[test]
+    fn a_request_links_the_session_that_asked_it_once_it_has_one() {
+        let fixture = Fixture::new();
+        let conversation_id = Uuid::new_v4();
+        fixture
+            .store
+            .interview(
+                ACTOR_USER,
+                InterviewCommand::CreateConversation {
+                    id: conversation_id,
+                    focus: tod_store::conversation::Focus::Node(fixture.node_id),
+                    protocol: tod_store::conversation::ProtocolKind::Implementation,
+                    platform: None,
+                    model: None,
+                    effort: None,
+                },
+            )
+            .unwrap();
+        let decision = fixture
+            .store
+            .interview(
+                ACTOR_USER,
+                InterviewCommand::AskDecision {
+                    node_id: fixture.node_id,
+                    conversation_id: Some(conversation_id),
+                    protocol: Some("implementation".into()),
+                    decision: tod_store::decisions::NewDecision {
+                        question: "Which store?".into(),
+                        options: vec!["SQLite".into(), "Files".into()],
+                        ..Default::default()
+                    },
+                },
+            )
+            .unwrap()
+            .get("id")
+            .and_then(|v| v.as_str())
+            .and_then(|raw| Uuid::parse_str(raw).ok())
+            .unwrap();
+
+        let loaded = crate::unified::requests::load(&fixture.store, fixture.node_id);
+        assert!(loaded.items.iter().any(|i| i.id == decision));
+        assert_eq!(loaded.sessions.get(&decision), None, "no agent session yet");
+
+        fixture
+            .store
+            .interview(
+                ACTOR_USER,
+                InterviewCommand::SetConversationSession {
+                    conversation_id,
+                    agent_session_id: Some("session-1".into()),
+                    session_name: None,
+                },
+            )
+            .unwrap();
+        let loaded = crate::unified::requests::load(&fixture.store, fixture.node_id);
+        assert_eq!(loaded.sessions.get(&decision), Some(&conversation_id));
+    }
+
     fn open_panel<'a>(
         node_id: Uuid,
         fixture: &Fixture,
@@ -1396,51 +1456,9 @@ mod request_tests {
         });
     }
 
-    /// A gate check that needs a human (`tod_core::attention::AttentionKind::Gate`)
-    /// shows its failing criterion with a Waive button, sourced from the one
-    /// [`LifecycleController`] the shell shares with the conversation view
-    /// and the lifecycle panel.
-    #[gpui::test]
-    fn a_gate_item_with_a_failing_criterion_shows_a_waive_button(cx: &mut TestAppContext) {
-        let fixture = Fixture::new();
-        fixture
-            .store
-            .enqueue_outline(tod_store::outline::OutlineMutation::SetLifecycle {
-                node_id: fixture.node_id,
-                state: "design".to_string(),
-            })
-            .unwrap();
-        fixture.store.writer().flush().unwrap();
-
-        // The seeded "design" -> "planning" criterion, failed so it shows as
-        // a row to waive (`LifecycleController::load_persisted`).
-        let criterion_id = fixture
-            .store
-            .read(|conn| {
-                tod_store::outline::repos::GateRepo::new(conn)
-                    .get_by_slug(tod_store::outline::repos::gate::BUILDABLE_CRITERION_SLUG)
-            })
-            .unwrap()
-            .unwrap()
-            .id;
-        fixture
-            .store
-            .enqueue_outline(tod_store::outline::OutlineMutation::ApplyGateResults {
-                node_id: fixture.node_id,
-                results: vec![(
-                    criterion_id,
-                    tod_store::outline::repos::gate::OUTCOME_FAIL.to_string(),
-                    Some("Not yet buildable.".to_string()),
-                    tod_store::outline::repos::gate::ACTION_NONE.to_string(),
-                )],
-                forward_state: None,
-                source: "agent".to_string(),
-            })
-            .unwrap();
-        fixture.store.writer().flush().unwrap();
-
-        // A gate-check conversation whose report needs a human, so the item
-        // shows up in the unified attention list too (`tod_core::attention`).
+    /// The implementation conversation a request came from, for the
+    /// "answered elsewhere" tests.
+    fn implementation_conversation(fixture: &Fixture) -> Uuid {
         let conversation_id = Uuid::new_v4();
         fixture
             .store
@@ -1449,87 +1467,104 @@ mod request_tests {
                 InterviewCommand::CreateConversation {
                     id: conversation_id,
                     focus: tod_store::conversation::Focus::Node(fixture.node_id),
-                    protocol: tod_store::conversation::ProtocolKind::GateCheck,
+                    protocol: tod_store::conversation::ProtocolKind::Implementation,
                     platform: None,
                     model: None,
                     effort: None,
                 },
             )
             .unwrap();
+        conversation_id
+    }
+
+    fn turn_count(fixture: &Fixture, conversation_id: Uuid) -> usize {
         fixture
+            .store
+            .read(|conn| tod_store::conversation::ConversationRepo::new(conn).turns(conversation_id))
+            .unwrap()
+            .len()
+    }
+
+    /// A decision settled in the agent's own session is dismissed with an
+    /// answer saying so, and nothing is sent to the agent.
+    #[gpui::test]
+    fn a_decision_answered_elsewhere_is_dismissed_without_a_turn(cx: &mut TestAppContext) {
+        let fixture = Fixture::new();
+        tod_store::paths::set_data_root(fixture.store.paths().root().to_path_buf());
+        let conversation_id = implementation_conversation(&fixture);
+        let decision = fixture
             .store
             .interview(
                 ACTOR_USER,
-                InterviewCommand::SetConversationTransition {
-                    conversation_id,
-                    from_state: "design".to_string(),
-                    to_state: "planning".to_string(),
+                InterviewCommand::AskDecision {
+                    node_id: fixture.node_id,
+                    conversation_id: Some(conversation_id),
+                    protocol: Some("implementation".into()),
+                    decision: tod_store::decisions::NewDecision {
+                        question: "Which store?".into(),
+                        options: vec!["SQLite".into(), "Files".into()],
+                        ..Default::default()
+                    },
                 },
             )
-            .unwrap();
-        let report = serde_json::json!({
-            "gate_check": {
-                "result": "needs_human",
-                "summary": "Buildable check needs your call.",
-                "next": "",
-                "blockers": [{
-                    "kind": "criterion",
-                    "reference": "c1",
-                    "what": "Is it buildable?",
-                    "action": "ask_user",
-                }],
-                "findings": "",
-                "no_reasons": false,
-                "advanced_to": null,
-            }
-        });
-        fixture
-            .store
-            .interview(
-                ACTOR_USER,
-                InterviewCommand::RecordConversationReport {
-                    conversation_id,
-                    body: report,
-                },
-            )
+            .unwrap()
+            .get("id")
+            .and_then(|v| v.as_str())
+            .and_then(|raw| Uuid::parse_str(raw).ok())
             .unwrap();
 
         let (view, _agent_runs, cx) = open_panel(fixture.node_id, &fixture, cx);
-        view.read_with(cx, |view, _| {
-            assert_eq!(view.loaded.items.len(), 1);
-            assert_eq!(view.loaded.items[0].kind, AttentionKind::Gate);
-        });
-
         view.update(cx, |view, cx| {
-            let criterion = view
-                .lifecycle
-                .read(cx)
-                .state(&fixture.node_id.to_string())
-                .unwrap()
-                .criteria_detail
-                .iter()
-                .find(|c| c.criterion_id == criterion_id)
-                .cloned()
-                .unwrap();
-            assert!(criterion.is_failing());
-            view.waive_criterion(fixture.node_id, &criterion, Source::Click, cx);
+            let item = view.loaded.items[0].clone();
+            assert_eq!(item.id, decision);
+            view.resolve_elsewhere(&item, Source::Click, cx);
         });
         cx.run_until_parked();
-        draw(cx);
 
-        view.read_with(cx, |view, cx| {
-            let outcome = view
-                .lifecycle
-                .read(cx)
-                .state(&fixture.node_id.to_string())
-                .unwrap()
-                .criteria_detail
-                .iter()
-                .find(|c| c.criterion_id == criterion_id)
-                .cloned()
-                .unwrap();
-            assert!(!outcome.is_failing(), "waiving clears the failing outcome");
+        view.read_with(cx, |view, _| {
+            assert!(view.loaded.items.is_empty(), "the request is dismissed");
+            let answer = &view.loaded.log.last().expect("an answer is logged").answer;
+            assert_eq!(answer.text.as_deref(), Some(crate::ui::agent_runs::RESOLVED_ELSEWHERE));
         });
+        assert_eq!(turn_count(&fixture, conversation_id), 0, "no turn goes to the agent");
+    }
+
+    /// A handed-back plan step settled elsewhere goes back to `in_progress`
+    /// with no answer sent.
+    #[gpui::test]
+    fn a_plan_step_answered_elsewhere_goes_back_to_in_progress(cx: &mut TestAppContext) {
+        let fixture = Fixture::new();
+        tod_store::paths::set_data_root(fixture.store.paths().root().to_path_buf());
+        let step_id = fixture.steps[0];
+        fixture
+            .store
+            .enqueue_outline(tod_store::outline::OutlineMutation::UpdatePlanStepStatus {
+                step_id,
+                status: tod_store::outline::repos::plan_steps::STATUS_BLOCKED.to_string(),
+                note: Some("Which rounding?".to_string()),
+                reason: None,
+            })
+            .unwrap();
+        fixture.store.writer().flush().unwrap();
+        let conversation_id = implementation_conversation(&fixture);
+
+        let (view, _agent_runs, cx) = open_panel(fixture.node_id, &fixture, cx);
+        view.update(cx, |view, cx| {
+            let item = view.loaded.items[0].clone();
+            assert_eq!(item.id, step_id);
+            view.resolve_elsewhere(&item, Source::Click, cx);
+        });
+        cx.run_until_parked();
+
+        let status = fixture
+            .store
+            .read(|conn| PlanStepRepo::new(conn).get(step_id))
+            .unwrap()
+            .unwrap()
+            .status;
+        assert_eq!(status, tod_store::outline::repos::plan_steps::STATUS_IN_PROGRESS);
+        view.read_with(cx, |view, _| assert!(view.loaded.items.is_empty()));
+        assert_eq!(turn_count(&fixture, conversation_id), 0, "no turn goes to the agent");
     }
 
     /// Mixed attention kinds on one node order oldest first, matching

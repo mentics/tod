@@ -18,8 +18,36 @@ pub struct GateCriterionSeed {
     pub sort_order: i32,
 }
 
-/// Stable criterion catalog (35 items across design→planning, planning→ready, verifying→review).
+/// Stable criterion catalog. Every active row is answered by the app itself
+/// (`tod_core::gate::derived`); the agent-judged rows are kept so their past
+/// evaluations still resolve, and deactivated by [`seed_gate_criteria`].
 pub const GATE_CRITERIA: &[GateCriterionSeed] = &[
+    // proposed → design
+    GateCriterionSeed {
+        id_str: "a1000008-0008-4008-8008-000000000001",
+        from_state: "proposed",
+        to_state: "design",
+        slug: crate::outline::repos::gate::PROPOSED_DESIGN_HAS_REQUIREMENTS_SLUG,
+        label: "Does the node have at least one requirement of its own?",
+        sort_order: 1,
+    },
+    GateCriterionSeed {
+        id_str: "a1000008-0008-4008-8008-000000000002",
+        from_state: "proposed",
+        to_state: "design",
+        slug: crate::outline::repos::gate::PROPOSED_DESIGN_PHASE_CERTIFIED_SLUG,
+        label: "Proposal certified done, and its obligations unchanged since?",
+        sort_order: 2,
+    },
+    // design → planning
+    GateCriterionSeed {
+        id_str: "a1000001-0001-4001-8001-00000000000e",
+        from_state: "design",
+        to_state: "planning",
+        slug: crate::outline::repos::gate::DESIGN_PLANNING_PHASE_CERTIFIED_SLUG,
+        label: "Design certified done, and its obligations, content, and mockups unchanged since?",
+        sort_order: -1,
+    },
     // design → planning
     GateCriterionSeed {
         id_str: "a1000001-0001-4001-8001-00000000000c",
@@ -223,6 +251,14 @@ pub const GATE_CRITERIA: &[GateCriterionSeed] = &[
         label: "Would a mid-active question only arise from a bug/code surprise—not from missing intent?",
         sort_order: 11,
     },
+    GateCriterionSeed {
+        id_str: "a1000002-0002-4002-8002-00000000000e",
+        from_state: "planning",
+        to_state: "ready",
+        slug: crate::outline::repos::gate::PLANNING_READY_PHASE_CERTIFIED_SLUG,
+        label: "Plan certified done, and its obligations, steps, and links unchanged since?",
+        sort_order: 12,
+    },
     // ready → active — evaluated by the app, not an agent (`tod_core::gate::derived`)
     GateCriterionSeed {
         id_str: "a1000005-0005-4005-8005-000000000001",
@@ -355,7 +391,7 @@ pub const GATE_CRITERIA: &[GateCriterionSeed] = &[
         id_str: "a1000006-0006-4006-8006-000000000003",
         from_state: "pr",
         to_state: "approved",
-        slug: "pr-approved.mergeable",
+        slug: crate::outline::repos::gate::PR_APPROVED_MERGEABLE_SLUG,
         label: "PR approved and checks green?",
         sort_order: 1,
     },
@@ -365,8 +401,35 @@ pub const GATE_CRITERIA: &[GateCriterionSeed] = &[
         id_str: "a1000006-0006-4006-8006-000000000004",
         from_state: "approved",
         to_state: "merged",
-        slug: "approved-merged.pr-merged",
+        slug: crate::outline::repos::gate::APPROVED_MERGED_PR_MERGED_SLUG,
         label: "PR merged?",
+        sort_order: 1,
+    },
+    // merged → released, released → learn: the certificate's note carries
+    // the release and post-release evidence.
+    GateCriterionSeed {
+        id_str: "a1000009-0009-4009-8009-000000000001",
+        from_state: "merged",
+        to_state: "released",
+        slug: crate::outline::repos::gate::MERGED_RELEASED_PHASE_CERTIFIED_SLUG,
+        label: "Release certified done, with its evidence?",
+        sort_order: 1,
+    },
+    GateCriterionSeed {
+        id_str: "a1000009-0009-4009-8009-000000000002",
+        from_state: "released",
+        to_state: "learn",
+        slug: crate::outline::repos::gate::RELEASED_LEARN_PHASE_CERTIFIED_SLUG,
+        label: "Post-release check certified done, with its evidence?",
+        sort_order: 1,
+    },
+    // learn → done
+    GateCriterionSeed {
+        id_str: "a1000009-0009-4009-8009-000000000003",
+        from_state: "learn",
+        to_state: "done",
+        slug: crate::outline::repos::gate::LEARN_DONE_LEARN_RECORDED_SLUG,
+        label: "Retrospective recorded for this pass?",
         sort_order: 1,
     },
 ];
@@ -443,15 +506,23 @@ pub fn seed_gate_criteria(conn: &Connection) -> Result<()> {
          WHERE from_state = 'review' AND to_state = 'approved'",
         params![now],
     )?;
-    // design → planning requires `buildable` and the constraints check only.
+    // A gate never runs an agent (`doc/lifecycle/phase-agents.md`): every
+    // criterion the app does not answer itself is retired, and every one it
+    // does is active.
+    let derived = crate::outline::repos::gate::DERIVED_CRITERION_SLUGS;
+    let placeholders = (0..derived.len())
+        .map(|i| format!("?{}", i + 2))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut values: Vec<rusqlite::types::Value> = vec![now.into()];
+    values.extend(derived.iter().map(|slug| rusqlite::types::Value::from(slug.to_string())));
     conn.execute(
-        "UPDATE gate_criteria SET active = 0, updated_at = ?1
-         WHERE from_state = 'design' AND to_state = 'planning' AND slug NOT IN (?2, ?3) AND active = 1",
-        params![
-            now,
-            crate::outline::BUILDABLE_CRITERION_SLUG,
-            crate::outline::DESIGN_CONSTRAINTS_CRITERION_SLUG
-        ],
+        &format!(
+            "UPDATE gate_criteria SET active = CASE WHEN slug IN ({placeholders}) THEN 1 ELSE 0 END,
+                                      updated_at = ?1
+             WHERE active != CASE WHEN slug IN ({placeholders}) THEN 1 ELSE 0 END"
+        ),
+        rusqlite::params_from_iter(values),
     )?;
     Ok(())
 }

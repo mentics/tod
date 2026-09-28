@@ -160,8 +160,6 @@ pub struct Shell {
     /// A conversation to open once `window` is available (panel events have none).
     pending_open_conversation: Option<Focus>,
     pending_report_dialog: Option<JourneyKey>,
-    /// A node that just entered a state with on-entry work for its agent.
-    pending_on_entry: Option<Uuid>,
     /// The conversation view asked to return to where the user came from.
     pending_leave_conversation: bool,
     /// The conversation's context panel asked to show a node (and maybe an
@@ -768,9 +766,6 @@ impl Shell {
                 window,
                 cx,
             );
-        }
-        if let Some(node) = self.pending_on_entry.take() {
-            self.open_conversation_with(Focus::Node(node), ProtocolKind::OnEntry, true, window, cx);
         }
         if std::mem::take(&mut self.pending_leave_conversation) {
             let view = self.view_before_conversation;
@@ -2449,10 +2444,6 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                                 this.queue_warning_toast(message.clone(), cx)
                                             }
                                         },
-                                        ConversationViewEvent::EnterState { node_id } => {
-                                            this.pending_on_entry = Some(*node_id);
-                                            cx.notify();
-                                        }
                                         ConversationViewEvent::GoToTasks {
                                             node_id,
                                             obligation_id,
@@ -2520,7 +2511,6 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                 pending_open_interview_for_task: None,
                                 pending_open_conversation: None,
                                 pending_report_dialog: None,
-                                pending_on_entry: None,
                                 pending_go_to_tasks: None,
                                 pending_gate_check: None,
                                 pending_leave_conversation: false,

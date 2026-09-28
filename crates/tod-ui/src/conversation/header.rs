@@ -510,6 +510,8 @@ pub(super) fn kind_label(kind: ProtocolKind) -> &'static str {
         ProtocolKind::Pr => "pr",
         ProtocolKind::Chat => "chat",
         ProtocolKind::VisualDesign => "visual design",
+        ProtocolKind::Phase => "phase",
+        ProtocolKind::Evaluate => "evaluation",
         ProtocolKind::GateCheck => "gate check",
         ProtocolKind::OnEntry => "on entry",
         ProtocolKind::Incoming => "incoming check",
@@ -529,6 +531,10 @@ pub(super) fn new_label(kind: ProtocolKind) -> &'static str {
         ProtocolKind::Chat => "New conversation",
         ProtocolKind::VisualDesign => "New visual design",
         // Started by the lifecycle buttons, which know the transition.
+        ProtocolKind::Phase => "New phase work",
+        ProtocolKind::Evaluate => "New evaluation",
+        // No longer started: gates are app checks, and on-entry work is the
+        // phase agent's.
         ProtocolKind::GateCheck => "New gate check",
         ProtocolKind::OnEntry => "New on-entry run",
         // Started from the lifecycle panel or the tree, never the picker.

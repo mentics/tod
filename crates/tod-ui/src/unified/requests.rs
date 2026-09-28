@@ -36,12 +36,13 @@ use gpui::{
     Stateful, Styled, Subscription, Window, actions, div,
     prelude::FluentBuilder,
 };
-use gpui_component::button::Button;
+use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::input::{Input, InputEvent, InputState};
-use gpui_component::{ActiveTheme, Sizable};
+use gpui_component::{ActiveTheme, Disableable, IconName, Sizable};
 use tod_core::attention::{AttentionItem, AttentionKind, RequestReason};
 use tod_core::conversation::implement::HandoffAnswer;
 use tod_journey::{Presented, PresentedAction};
+use tod_store::conversation::{ConversationRepo, Focus};
 use tod_store::decisions::{DECISION_PENDING, Decision, DecisionAnswer, DecisionRepo, EvidenceRef};
 use tod_store::fleet::FleetStore;
 use tod_store::interview::{ACTOR_USER, InterviewCommand, short_id};
@@ -49,7 +50,7 @@ use tod_store::outline::PlanStep;
 use tod_store::outline::repos::plan_steps::HandoffReason;
 use tod_store::outline::repos::{ObligationRepo, PlanStepRepo};
 use tod_store::request_feedback::{
-    KIND_DECISION, KIND_GATE_BLOCKER, KIND_PLAN_STEP_HANDOFF, KIND_REVIEW_FINDING, NewRequestFeedback,
+    KIND_DECISION, KIND_PLAN_STEP_HANDOFF, KIND_REVIEW_FINDING, NewRequestFeedback,
     VERDICT_BAD_QUESTION, VERDICT_SHOULD_NOT_ASK,
 };
 use tod_store::review::{FINDING_DECLINED, FINDING_FIXED, FINDING_OUT_OF_SCOPE, ReviewFinding, ReviewRepo};
@@ -60,9 +61,10 @@ use crate::ui::journey::{Source, record_action};
 use crate::ui::key_context;
 use crate::ui::selectable_text::{selectable_markdown, selectable_text};
 use crate::ui::style;
+use crate::ui::terminal_handoff::{self, CONTINUE_IN_TERMINAL};
 use crate::unified::columns::PanelKind;
 use crate::unified::panel::PanelOpenRequest;
-use crate::views::lifecycle_control::{CriterionOutcome, LifecycleController};
+use crate::views::lifecycle_control::LifecycleController;
 
 /// The key context a host panel puts on its focused root so the request keys
 /// apply there.
@@ -75,6 +77,8 @@ const FEEDBACK_NOTE_TAG: &str = "RequestsFeedbackNote";
 /// The journey surface every answer is recorded under; the name "decisions"
 /// is kept so earlier journeys still compare.
 const JOURNEY_SURFACE: &str = "decisions";
+/// The journey action id of **Answered elsewhere**.
+const RESOLVED_ELSEWHERE_ACTION: &str = "answered-elsewhere";
 
 /// Answer the top request with option `.0` (1-based, matching the numbered
 /// options shown).
@@ -136,6 +140,7 @@ pub fn bind_request_actions(el: Stateful<gpui::Div>, requests: &Entity<Requests>
 /// The human label for a request's reason, shown on its footer line.
 pub fn reason_label(reason: RequestReason) -> &'static str {
     match reason {
+        RequestReason::Intent => "Needs your input",
         RequestReason::MissingRule => "No rule covers this",
         RequestReason::Conflict => "Conflicting requirements",
         RequestReason::Access => "Needs access",
@@ -167,6 +172,26 @@ pub struct Loaded {
     /// Display names for evidence ids (obligations, plan steps, nodes,
     /// findings), for the footer links.
     pub names: HashMap<Uuid, String>,
+    /// Per request id: the lifecycle conversation that asked it, when that
+    /// conversation has an agent session a terminal can resume.
+    pub sessions: HashMap<Uuid, Uuid>,
+}
+
+/// The conversation `item` came from: a decision's or finding's own, or the
+/// implement/verify conversation a plan step was handed back by.
+fn asking_conversation(
+    conn: &rusqlite::Connection,
+    item: &AttentionItem,
+    pending: &[Decision],
+    findings: &[ReviewFinding],
+) -> anyhow::Result<Option<Uuid>> {
+    Ok(match item.kind {
+        AttentionKind::Decision => pending.iter().find(|d| d.id == item.id).and_then(|d| d.conversation_id),
+        AttentionKind::PlanStep => {
+            crate::ui::agent_runs::latest_handoff_conversation(conn, Focus::Node(item.node_id))?.map(|c| c.id)
+        }
+        AttentionKind::Finding => findings.iter().find(|f| f.id == item.id).and_then(|f| f.conversation_id),
+    })
 }
 
 fn first_line(text: &str) -> String {
@@ -209,6 +234,20 @@ pub fn load(fleet: &FleetStore, node_id: Uuid) -> Loaded {
             };
             let items = tod_core::attention::for_node(conn, node_id)?.items;
 
+            let mut sessions = HashMap::new();
+            let conversations = ConversationRepo::new(conn);
+            for item in &items {
+                let Some(conversation) = asking_conversation(conn, item, &pending, &findings)? else {
+                    continue;
+                };
+                let resumable = conversations
+                    .get(conversation)?
+                    .is_some_and(|c| c.agent_session_id.is_some_and(|s| !s.trim().is_empty()));
+                if resumable {
+                    sessions.insert(item.id, conversation);
+                }
+            }
+
             let mut names = HashMap::new();
             for step in &handoff_steps {
                 names.insert(step.id, first_line(&step.body));
@@ -229,7 +268,7 @@ pub fn load(fleet: &FleetStore, node_id: Uuid) -> Loaded {
                     names.insert(evidence.id, name);
                 }
             }
-            anyhow::Ok(Loaded { pending, handoff_steps, findings, items, log, names })
+            anyhow::Ok(Loaded { pending, handoff_steps, findings, items, log, names, sessions })
         })
         .unwrap_or_default();
     let node_ids: Vec<Uuid> = loaded
@@ -529,7 +568,7 @@ impl Requests {
                     self.answer_plan_step(&step, HandoffAnswer::Choose(action.0 - 1), Source::Keyboard, cx);
                 }
             }
-            AttentionKind::Finding | AttentionKind::Gate => {}
+            AttentionKind::Finding => {}
         }
     }
 
@@ -621,31 +660,6 @@ impl Requests {
         self.reload(cx);
     }
 
-    /// Waive one failing gate criterion through the shared controller.
-    pub(crate) fn waive_criterion(&mut self, node_id: Uuid, criterion: &CriterionOutcome, source: Source, cx: &mut Context<Self>) {
-        record_action(
-            cx,
-            tod_store::conversation::Focus::Node(node_id),
-            "waive".to_string(),
-            source,
-            JOURNEY_SURFACE,
-            Presented {
-                actions: vec![PresentedAction {
-                    id: criterion.criterion_id.to_string(),
-                    label: format!("Waive: {}", criterion.label),
-                    primary: true,
-                    disabled: false,
-                }],
-                focused: None,
-                notices: vec![criterion.label.clone()],
-            },
-        );
-        let criterion_id = criterion.criterion_id;
-        let task_id = node_id.to_string();
-        self.lifecycle.update(cx, |controller, cx| controller.waive(&task_id, criterion_id, cx));
-        self.reload(cx);
-    }
-
     /// The feedback given on request `id` in this session, if any.
     #[allow(dead_code)] // for tests.
     pub fn feedback_for(&self, id: Uuid) -> Option<&FeedbackState> {
@@ -666,8 +680,6 @@ impl Requests {
                 self.loaded.findings.iter().find(|f| f.id == item.id).and_then(|f| f.conversation_id),
                 None,
             ),
-            // A gate request's id is the gate-check conversation.
-            AttentionKind::Gate => (KIND_GATE_BLOCKER, Some(item.id), None),
         };
         NewRequestFeedback {
             node_id: item.node_id,
@@ -1022,7 +1034,6 @@ impl Requests {
                 .unwrap_or_default(),
             AttentionKind::PlanStep => vec![EvidenceRef { kind: "plan_step".into(), id: item.id }],
             AttentionKind::Finding => vec![EvidenceRef { kind: "finding".into(), id: item.id }],
-            AttentionKind::Gate => vec![EvidenceRef { kind: "conversation".into(), id: item.id }],
         }
     }
 
@@ -1033,6 +1044,8 @@ impl Requests {
             && self.loaded.pending.first().map(|d| d.id) == Some(item.id);
         let evidence = self.item_evidence(item);
         let links = self.render_evidence_links(item.id, item.node_id, &evidence, stops, cx);
+        let terminal = self.render_terminal_button(item, cx);
+        let elsewhere = self.render_resolved_elsewhere_button(item, cx);
         let feedback = self.render_feedback(item, window, cx);
         div()
             .id(SharedString::from(format!("unified-requests-footer-{}", item.id)))
@@ -1043,11 +1056,143 @@ impl Requests {
             .children(links)
             .child(style::text_muted(div().text_xs().flex_none()).child(reason_label(item.reason)))
             .child(div().flex_1())
+            .children(terminal)
+            .children(elsewhere)
             .child(feedback)
             .into_any_element()
     }
 
-    fn render_freeform(&self, decision_id: Uuid, cx: &mut Context<Self>) -> impl IntoElement {
+    /// The terminal icon: continue the lifecycle session that asked, in the
+    /// agent's own CLI, for anything too involved to answer here. Only when
+    /// that conversation has a session to resume.
+    fn render_terminal_button(&self, item: &AttentionItem, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let conversation = *self.loaded.sessions.get(&item.id)?;
+        let running = self.agent_runs.read(cx).conversation_running(conversation);
+        let tooltip = if running {
+            "Continue in a terminal (once the agent is done)"
+        } else {
+            "Continue the session that asked this in a terminal"
+        };
+        let item = item.clone();
+        Some(
+            Button::new(SharedString::from(format!("unified-requests-terminal-{}", item.id)))
+                .icon(IconName::SquareTerminal)
+                .ghost()
+                .xsmall()
+                .disabled(running)
+                .tooltip(tooltip)
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.continue_in_terminal(&item, conversation, Source::Click, window, cx);
+                }))
+                .into_any_element(),
+        )
+    }
+
+    /// **Answered elsewhere**: the user settled this request outside the
+    /// app (typically in the terminal session beside it), so it is dismissed
+    /// without an answer going to the agent. Offered for the kinds whose
+    /// answer would otherwise be sent (decisions, handed-back plan steps); a
+    /// finding's own status buttons already settle it without a turn.
+    fn render_resolved_elsewhere_button(&self, item: &AttentionItem, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if item.kind == AttentionKind::Finding {
+            return None;
+        }
+        let item = item.clone();
+        Some(
+            Button::new(SharedString::from(format!("unified-requests-elsewhere-{}", item.id)))
+                .label("Answered elsewhere")
+                .xsmall()
+                .tooltip(
+                    "You settled this outside the app, e.g. in the terminal: dismiss it without \
+                     sending an answer. Close that terminal first: the runner continues in the same session.",
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.resolve_elsewhere(&item, Source::Click, cx);
+                }))
+                .into_any_element(),
+        )
+    }
+
+    /// Dismiss `item` as settled outside the app. Once the node waits on
+    /// nothing else, a runner that stopped for it continues by itself
+    /// (`unified::runners`).
+    pub(crate) fn resolve_elsewhere(&mut self, item: &AttentionItem, source: Source, cx: &mut Context<Self>) {
+        record_action(
+            cx,
+            Focus::Node(item.node_id),
+            RESOLVED_ELSEWHERE_ACTION.to_string(),
+            source,
+            JOURNEY_SURFACE,
+            Presented {
+                actions: vec![PresentedAction {
+                    id: RESOLVED_ELSEWHERE_ACTION.to_string(),
+                    label: "Answered elsewhere".to_string(),
+                    primary: false,
+                    disabled: false,
+                }],
+                focused: None,
+                notices: Vec::new(),
+            },
+        );
+        let id = item.id;
+        let result = match item.kind {
+            AttentionKind::Decision => {
+                self.agent_runs.update(cx, |runs, _| runs.resolve_decision_elsewhere(id))
+            }
+            AttentionKind::PlanStep => {
+                self.agent_runs.update(cx, |runs, _| runs.resolve_plan_step_elsewhere(id))
+            }
+            AttentionKind::Finding => Ok(()),
+        };
+        self.set_error("dismiss the request", result);
+        self.reload(cx);
+    }
+
+    /// Open a terminal resuming `conversation`'s agent session
+    /// (`ui::terminal_handoff`); the app lets go of it first.
+    pub(crate) fn continue_in_terminal(
+        &mut self,
+        item: &AttentionItem,
+        conversation: Uuid,
+        source: Source,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        record_action(
+            cx,
+            Focus::Node(item.node_id),
+            CONTINUE_IN_TERMINAL.to_string(),
+            source,
+            JOURNEY_SURFACE,
+            Presented {
+                actions: vec![PresentedAction {
+                    id: CONTINUE_IN_TERMINAL.to_string(),
+                    label: "Continue in a terminal".to_string(),
+                    primary: false,
+                    disabled: false,
+                }],
+                focused: None,
+                notices: Vec::new(),
+            },
+        );
+        let (agent, config, running) = {
+            let runs = self.agent_runs.read(cx);
+            (runs.agent().clone(), runs.conversation_config(), runs.conversation_running(conversation))
+        };
+        terminal_handoff::continue_in_terminal(
+            self.fleet.clone(),
+            agent,
+            config,
+            Some(conversation),
+            running,
+            window,
+            cx,
+        );
+    }
+
+    /// The free-text answer field. `only` marks a question asked with no
+    /// options, where typing an answer is the only way to answer it.
+    fn render_freeform(&self, decision_id: Uuid, only: bool, cx: &mut Context<Self>) -> impl IntoElement {
         let editing = self.freeform_editing == Some(decision_id);
         key_context::set_input_tab_stop(&self.freeform_input, editing, cx);
         div()
@@ -1064,7 +1209,7 @@ impl Requests {
                 div()
                     .text_xs()
                     .text_color(cx.theme().muted_foreground)
-                    .child("Enter to answer freely…")
+                    .child(if only { "Enter to type your answer…" } else { "Enter to answer freely…" })
                     .into_any_element()
             })
     }
@@ -1093,8 +1238,8 @@ impl Requests {
                 window,
                 cx,
             ))
-            .child(self.render_options(&decision, cx))
-            .child(self.render_freeform(decision.id, cx))
+            .when(!decision.options.is_empty(), |el| el.child(self.render_options(&decision, cx)))
+            .child(self.render_freeform(decision.id, decision.options.is_empty(), cx))
             .child(footer)
             .into_any_element()
     }
@@ -1203,61 +1348,11 @@ impl Requests {
         card.child(self.render_footer(item, window, cx)).into_any_element()
     }
 
-    fn render_gate_card(&self, item: &AttentionItem, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        let node_id = item.node_id;
-        let failing: Vec<CriterionOutcome> = self
-            .lifecycle
-            .read(cx)
-            .state(&node_id.to_string())
-            .map(|s| s.criteria_detail.iter().filter(|r| r.is_failing()).cloned().collect())
-            .unwrap_or_default();
-        let card = self
-            .card(format!("unified-decisions-gate-{}", item.id), cx)
-            .child(kind_badge("Gate check"))
-            .child(selectable_markdown(
-                SharedString::from(format!("unified-decisions-gate-summary-{}", item.id)),
-                item.summary.clone(),
-                window,
-                cx,
-            ));
-        let rows: Vec<AnyElement> = failing
-            .into_iter()
-            .map(|criterion| {
-                let label = criterion.label.clone();
-                div()
-                    .id(SharedString::from(format!("unified-decisions-gate-row-{}", criterion.criterion_id)))
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(div().flex_1().min_w_0().child(selectable_text(
-                        SharedString::from(format!("unified-decisions-gate-label-{}", criterion.criterion_id)),
-                        label,
-                        window,
-                        cx,
-                    )))
-                    .child(
-                        Button::new(SharedString::from(format!(
-                            "unified-decisions-gate-waive-{}",
-                            criterion.criterion_id
-                        )))
-                        .label("Waive")
-                        .small()
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.waive_criterion(node_id, &criterion, Source::Click, cx);
-                        })),
-                    )
-                    .into_any_element()
-            })
-            .collect();
-        card.children(rows).child(self.render_footer(item, window, cx)).into_any_element()
-    }
-
     fn render_item(&self, item: &AttentionItem, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         match item.kind {
             AttentionKind::Decision => self.render_decision_card(item, window, cx),
             AttentionKind::PlanStep => self.render_plan_step_card(item, window, cx),
             AttentionKind::Finding => self.render_finding_card(item, window, cx),
-            AttentionKind::Gate => self.render_gate_card(item, window, cx),
         }
     }
 
@@ -1324,7 +1419,7 @@ impl Requests {
             .when(changing, |el| {
                 el.child(self.render_options(&decision, cx))
                     .child(div().flex().flex_wrap().gap_2().children(evidence))
-                    .child(self.render_freeform(decision_id, cx))
+                    .child(self.render_freeform(decision_id, decision.options.is_empty(), cx))
             })
             .into_any_element()
     }
@@ -1390,6 +1485,7 @@ mod tests {
     #[test]
     fn every_reason_has_a_label() {
         for reason in [
+            RequestReason::Intent,
             RequestReason::MissingRule,
             RequestReason::Conflict,
             RequestReason::Access,

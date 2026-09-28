@@ -24,10 +24,14 @@ use tod_store::outline::{
     VERIFYING_REVIEW_OBLIGATIONS_VERIFIED_SLUG, VERIFYING_REVIEW_PLAN_VERIFIED_SLUG,
 };
 
-/// `pr → approved`: the PR is mergeable (checks green, reviews satisfied).
-pub const PR_APPROVED_MERGEABLE_SLUG: &str = "pr-approved.mergeable";
-/// `approved → merged`: the PR has actually been merged.
-pub const APPROVED_MERGED_PR_MERGED_SLUG: &str = "approved-merged.pr-merged";
+pub use tod_store::outline::{APPROVED_MERGED_PR_MERGED_SLUG, PR_APPROVED_MERGEABLE_SLUG};
+use tod_store::outline::{
+    DERIVED_CRITERION_SLUGS, DESIGN_PLANNING_PHASE_CERTIFIED_SLUG, LEARN_DONE_LEARN_RECORDED_SLUG,
+    MERGED_RELEASED_PHASE_CERTIFIED_SLUG, PLANNING_READY_PHASE_CERTIFIED_SLUG,
+    PROPOSED_DESIGN_HAS_REQUIREMENTS_SLUG, PROPOSED_DESIGN_PHASE_CERTIFIED_SLUG,
+    RELEASED_LEARN_PHASE_CERTIFIED_SLUG,
+};
+use tod_store::phase::{CertificateStatus, PhaseRepo};
 use tod_store::review::ReviewRepo;
 use tod_store::verification::{ObligationStanding, VerdictRepo};
 use uuid::Uuid;
@@ -38,6 +42,12 @@ pub struct DerivedOutcome {
     /// `OUTCOME_PASS` or `OUTCOME_FAIL`.
     pub outcome: &'static str,
     pub detail: String,
+}
+
+/// Whether the app answers the criterion with this slug itself. Every active
+/// criterion does: the seed retires the rest.
+pub fn is_derived_slug(slug: &str) -> bool {
+    DERIVED_CRITERION_SLUGS.contains(&slug)
 }
 
 /// Evaluate `criterion` for `node_id` directly, or `None` when it needs an
@@ -63,6 +73,23 @@ pub fn evaluate_derived_criterion(
         }
         PR_APPROVED_MERGEABLE_SLUG => pr_mergeable_outcome(conn, node_id).map(Some),
         APPROVED_MERGED_PR_MERGED_SLUG => pr_merged_outcome(conn, node_id).map(Some),
+        PROPOSED_DESIGN_HAS_REQUIREMENTS_SLUG => has_requirements_outcome(conn, node_id).map(Some),
+        PROPOSED_DESIGN_PHASE_CERTIFIED_SLUG => {
+            phase_certified_outcome(conn, node_id, "proposed").map(Some)
+        }
+        DESIGN_PLANNING_PHASE_CERTIFIED_SLUG => {
+            phase_certified_outcome(conn, node_id, "design").map(Some)
+        }
+        PLANNING_READY_PHASE_CERTIFIED_SLUG => {
+            phase_certified_outcome(conn, node_id, "planning").map(Some)
+        }
+        MERGED_RELEASED_PHASE_CERTIFIED_SLUG => {
+            phase_certified_outcome(conn, node_id, "merged").map(Some)
+        }
+        RELEASED_LEARN_PHASE_CERTIFIED_SLUG => {
+            phase_certified_outcome(conn, node_id, "released").map(Some)
+        }
+        LEARN_DONE_LEARN_RECORDED_SLUG => learn_recorded_outcome(conn, node_id).map(Some),
         _ => Ok(None),
     }
 }
@@ -95,6 +122,60 @@ fn fail(detail: impl Into<String>) -> DerivedOutcome {
         outcome: OUTCOME_FAIL,
         detail: detail.into(),
     }
+}
+
+fn pass(detail: impl Into<String>) -> DerivedOutcome {
+    DerivedOutcome {
+        outcome: OUTCOME_PASS,
+        detail: detail.into(),
+    }
+}
+
+/// A node leaves `proposed` only with something concrete to do: at least one
+/// requirement of its own.
+fn has_requirements_outcome(conn: &Connection, node_id: Uuid) -> Result<DerivedOutcome> {
+    let count = ObligationRepo::new(conn)
+        .list_for_node(node_id)?
+        .iter()
+        .filter(|o| o.kind == KIND_REQUIREMENT)
+        .count();
+    Ok(match count {
+        0 => fail("The node has no requirements of its own."),
+        1 => pass("1 requirement."),
+        n => pass(format!("{n} requirements.")),
+    })
+}
+
+/// A current certificate for the `state` phase (`tod_store::phase`): recorded
+/// in this stay, over inputs that have not changed since.
+fn phase_certified_outcome(conn: &Connection, node_id: Uuid, state: &str) -> Result<DerivedOutcome> {
+    Ok(match PhaseRepo::new(conn).certificate_status(node_id, state)? {
+        CertificateStatus::Current(event) => pass(format!(
+            "Certified ({}): {}",
+            event.certifier,
+            event.body.lines().next().unwrap_or_default()
+        )),
+        CertificateStatus::None => fail("not certified"),
+        CertificateStatus::Stale { changed, .. } => {
+            fail(format!("certificate is stale: {}", changed.join("; ")))
+        }
+    })
+}
+
+/// The learn phase recorded its retrospective (`tod-cli learn record`) in
+/// the node's current stay in `learn`.
+fn learn_recorded_outcome(conn: &Connection, node_id: Uuid) -> Result<DerivedOutcome> {
+    let since = PhaseRepo::new(conn).stay_started_at(node_id)?.unwrap_or(0);
+    let recorded: bool = conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM learn_drafts WHERE node_id = ?1 AND at >= ?2)",
+        rusqlite::params![node_id.as_bytes().to_vec(), since],
+        |row| row.get(0),
+    )?;
+    Ok(if recorded {
+        pass("Retrospective recorded.")
+    } else {
+        fail("No retrospective recorded for this pass — `tod-cli learn record`.")
+    })
 }
 
 /// Implementation needs an Agent and a ready Files directory, each on the node
@@ -781,6 +862,113 @@ mod tests {
         store.writer().flush().unwrap();
         let outcome = evaluate(&store, node, slug).unwrap();
         assert_eq!(outcome.outcome, OUTCOME_PASS, "{}", outcome.detail);
+    }
+
+    fn writer_conn(store: &FleetStore) -> Connection {
+        tod_store::fleet::schema::open_writer_connection(store.writer().db_path()).unwrap()
+    }
+
+    #[test]
+    fn leaving_proposed_needs_a_requirement_of_its_own() {
+        let slug = PROPOSED_DESIGN_HAS_REQUIREMENTS_SLUG;
+        let (store, node) = store_with_node();
+        assert_eq!(evaluate(&store, node, slug).unwrap().outcome, OUTCOME_FAIL);
+        let conn = writer_conn(&store);
+        ObligationRepo::new(&conn)
+            .insert_at(Uuid::new_v4(), node, "constraint", 0, None, "No new deps", "design")
+            .unwrap();
+        assert_eq!(evaluate(&store, node, slug).unwrap().outcome, OUTCOME_FAIL);
+        ObligationRepo::new(&conn)
+            .insert_at(Uuid::new_v4(), node, "requirement", 0, None, "Export to CSV", "design")
+            .unwrap();
+        assert_eq!(evaluate(&store, node, slug).unwrap().outcome, OUTCOME_PASS);
+    }
+
+    #[test]
+    fn phase_certified_passes_only_while_the_certificate_is_current() {
+        use tod_store::phase::{CERTIFIER_USER, PHASE_CERTIFY};
+        let slug = DESIGN_PLANNING_PHASE_CERTIFIED_SLUG;
+        let (store, node) = store_with_node();
+        let conn = writer_conn(&store);
+        NodeRepo::new(&conn).set_lifecycle(node, "design").unwrap();
+        let obligation = Uuid::new_v4();
+        ObligationRepo::new(&conn)
+            .insert_at(obligation, node, "requirement", 0, None, "Export to CSV", "design")
+            .unwrap();
+        let outcome = evaluate(&store, node, slug).unwrap();
+        assert_eq!((outcome.outcome, outcome.detail.as_str()), (OUTCOME_FAIL, "not certified"));
+
+        PhaseRepo::new(&conn)
+            .record(node, "design", PHASE_CERTIFY, None, CERTIFIER_USER, "Buildable as is")
+            .unwrap();
+        let outcome = evaluate(&store, node, slug).unwrap();
+        assert_eq!(outcome.outcome, OUTCOME_PASS, "{}", outcome.detail);
+        assert!(outcome.detail.contains("Buildable as is"), "{}", outcome.detail);
+
+        ObligationRepo::new(&conn)
+            .update_body(obligation, "Export to CSV and JSON")
+            .unwrap();
+        let outcome = evaluate(&store, node, slug).unwrap();
+        assert_eq!(outcome.outcome, OUTCOME_FAIL);
+        assert_eq!(
+            outcome.detail,
+            format!("certificate is stale: obligation {} reworded", short_id(obligation))
+        );
+    }
+
+    #[test]
+    fn learn_needs_a_retrospective_recorded_in_this_stay() {
+        let slug = LEARN_DONE_LEARN_RECORDED_SLUG;
+        let (store, node) = store_with_node();
+        let conn = writer_conn(&store);
+        NodeRepo::new(&conn).set_lifecycle(node, "learn").unwrap();
+        assert_eq!(evaluate(&store, node, slug).unwrap().outcome, OUTCOME_FAIL);
+        tod_store::learn::LearnRepo::new(&conn)
+            .record_draft(node, "Went fine.")
+            .unwrap();
+        assert_eq!(evaluate(&store, node, slug).unwrap().outcome, OUTCOME_PASS);
+    }
+
+    /// A gate never runs an agent: every active criterion is one the app
+    /// answers itself.
+    #[test]
+    fn every_active_criterion_is_derived() {
+        let (store, node) = store_with_node();
+        let active: Vec<GateCriterion> = store
+            .read(|conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT id, from_state, to_state, slug, label, sort_order FROM gate_criteria
+                     WHERE active = 1",
+                )?;
+                let rows = stmt
+                    .query_map([], |row| {
+                        Ok(GateCriterion {
+                            id: Uuid::from_slice(&row.get::<_, Vec<u8>>(0)?).unwrap(),
+                            from_state: row.get(1)?,
+                            to_state: row.get(2)?,
+                            slug: row.get(3)?,
+                            label: row.get(4)?,
+                            sort_order: row.get(5)?,
+                            active: true,
+                        })
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(rows)
+            })
+            .unwrap();
+        assert!(!active.is_empty());
+        for criterion in &active {
+            assert!(is_derived_slug(&criterion.slug), "{} is not derived", criterion.slug);
+            assert!(
+                store
+                    .read(|conn| evaluate_derived_criterion(conn, node, criterion))
+                    .unwrap()
+                    .is_some(),
+                "{} has no evaluator",
+                criterion.slug
+            );
+        }
+        assert!(!is_derived_slug(tod_store::outline::BUILDABLE_CRITERION_SLUG));
     }
 
     #[test]

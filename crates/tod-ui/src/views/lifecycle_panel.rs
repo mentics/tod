@@ -38,7 +38,7 @@ use crate::ui::style;
 use crate::views::cloud_node::CloudUpdate;
 use crate::views::incoming_check::{IncomingCheck, outcome_line};
 use crate::views::lifecycle_control::{
-    GateCheckState, LifecycleController, enters_with_agent, implement_directory,
+    GateCheckState, LifecycleController, implement_directory,
 };
 use gpui::prelude::FluentBuilder;
 use gpui::{
@@ -116,6 +116,9 @@ enum LifecyclePanelStop {
     BackToActive,
     Review,
     RunGateCheck,
+    /// Certify the current phase as the user (`tod_store::phase`): the user
+    /// judges the phase's work done, in place of its agent or evaluator.
+    MarkPhaseDone,
     OpenInterview,
     ForceAdvance,
     RevertLifecycle,
@@ -240,6 +243,9 @@ pub struct LifecyclePanelView {
     /// the panel highlights next; re-read on open and whenever the store
     /// changes.
     standing: Option<Standing>,
+    /// In a state whose phase is certified: where its certificate stands, as
+    /// one line, and whether it is current.
+    certificate: Option<(String, bool)>,
     /// The node's pending incoming changes, netted per item
     /// (`doc/conversation/incoming-changes.md` §6); re-read on open and
     /// whenever the store changes.
@@ -331,6 +337,7 @@ impl LifecyclePanelView {
             active_control: None,
             regression: None,
             standing: None,
+            certificate: None,
             incoming: Vec::new(),
             learnings: Vec::new(),
             cloud: None,
@@ -432,6 +439,9 @@ impl LifecyclePanelView {
                 }
                 if self.lifecycle_capable && next_lifecycle(&self.lifecycle).is_some() {
                     stops.push(LifecyclePanelStop::RunGateCheck);
+                }
+                if self.certificate.as_ref().is_some_and(|(_, current)| !current) {
+                    stops.push(LifecyclePanelStop::MarkPhaseDone);
                 }
             }
         }
@@ -548,8 +558,9 @@ impl LifecyclePanelView {
                 if reviewed { "Review again" } else { "Review" }.to_string()
             }
             LifecyclePanelStop::RunGateCheck => next_lifecycle(&self.lifecycle)
-                .map(|next| format!("Run gate check to advance to {next}"))
+                .map(|next| format!("Check gate and advance to {next}"))
                 .unwrap_or_default(),
+            LifecyclePanelStop::MarkPhaseDone => "Mark phase done".to_string(),
             LifecyclePanelStop::OpenInterview => format!(
                 "Open {}",
                 tod_core::process::spec_view_label(&self.lifecycle)
@@ -599,6 +610,7 @@ impl LifecyclePanelView {
             }
             LifecyclePanelStop::AdvanceAfterCriteria => true,
             LifecyclePanelStop::OpenInterview
+            | LifecyclePanelStop::MarkPhaseDone
             | LifecyclePanelStop::ForceAdvance
             | LifecyclePanelStop::RevertLifecycle
             | LifecyclePanelStop::WaiveCriterion(_)
@@ -665,6 +677,9 @@ impl LifecyclePanelView {
         if let Some(error) = gate_error {
             notices.push(error);
         }
+        if let Some((line, _)) = &self.certificate {
+            notices.push(line.clone());
+        }
         if let Some(cloud) = &self.cloud {
             notices.push(self.cloud_line(cloud));
         }
@@ -713,7 +728,8 @@ impl LifecyclePanelView {
             LifecyclePanelStop::Verify => self.launch_verification(window, cx),
             LifecyclePanelStop::BackToActive => self.revert_lifecycle(cx),
             LifecyclePanelStop::Review => self.launch_review(window, cx),
-            LifecyclePanelStop::RunGateCheck => self.run_gate_check(window, cx),
+            LifecyclePanelStop::RunGateCheck => self.run_gate_check(cx),
+            LifecyclePanelStop::MarkPhaseDone => self.mark_phase_done(cx),
             LifecyclePanelStop::OpenInterview | LifecyclePanelStop::OpenInterviewCriterion(_) => {
                 if let Some(task_id) = self.task_id.clone() {
                     cx.emit(LifecyclePanelEvent::OpenInterview {
@@ -722,10 +738,10 @@ impl LifecyclePanelView {
                     });
                 }
             }
-            LifecyclePanelStop::ForceAdvance => self.force_advance(window, cx),
+            LifecyclePanelStop::ForceAdvance => self.force_advance(cx),
             LifecyclePanelStop::RevertLifecycle => self.revert_lifecycle(cx),
             LifecyclePanelStop::WaiveCriterion(id) => self.waive_criterion(id, cx),
-            LifecyclePanelStop::AdvanceAfterCriteria => self.advance_after_criteria(window, cx),
+            LifecyclePanelStop::AdvanceAfterCriteria => self.advance_after_criteria(cx),
             LifecyclePanelStop::Close => self.close(cx),
         }
     }
@@ -842,28 +858,14 @@ impl LifecyclePanelView {
         )
     }
 
-    /// Check the gate to the next state in a conversation, which shows what
-    /// the state's agent concluded and what to do about it.
-    fn run_gate_check(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.launch_node_conversation(ProtocolKind::GateCheck, window, cx);
+    /// Check the gate to the next state (an app check, no agent) and advance
+    /// when it is clear.
+    fn run_gate_check(&mut self, cx: &mut Context<Self>) {
+        self.with_controller(cx, |c, id, cx| c.check_gate(id, cx));
     }
 
-    fn force_advance(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let entered = self.with_controller(cx, |c, id, cx| c.force_advance(id, cx));
-        self.enter_state(entered.flatten(), window, cx);
-    }
-
-    /// A node landed in `state`: when that state has on-entry work for its
-    /// agent, start it in a conversation.
-    fn enter_state(
-        &mut self,
-        state: Option<&'static str>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if state.is_some_and(enters_with_agent) {
-            self.launch_node_conversation(ProtocolKind::OnEntry, window, cx);
-        }
+    fn force_advance(&mut self, cx: &mut Context<Self>) {
+        self.with_controller(cx, |c, id, cx| c.force_advance(id, cx));
     }
 
     /// Re-judge whether the node's state still holds. `true` when the answer
@@ -903,9 +905,52 @@ impl LifecyclePanelView {
                     .read(|conn| Standing::load(conn, node, &self.lifecycle))
                     .ok()
             });
-        let changed = found != self.standing;
+        let certificate = self
+            .node_uuid()
+            .filter(|_| self.lifecycle_capable && tod_store::phase::is_certifiable(&self.lifecycle))
+            .and_then(|node| {
+                self.fleet
+                    .read(|conn| {
+                        tod_store::phase::PhaseRepo::new(conn)
+                            .certificate_status(node, &self.lifecycle)
+                    })
+                    .ok()
+            })
+            .map(|status| certificate_line(&status));
+        let changed = found != self.standing || certificate != self.certificate;
         self.standing = found;
+        self.certificate = certificate;
         changed
+    }
+
+    /// Certify the current phase as the user, then check the gate: the user
+    /// has judged the phase done, so the node moves on if nothing else holds
+    /// it.
+    fn mark_phase_done(&mut self, cx: &mut Context<Self>) {
+        let Some(node_id) = self.node_uuid() else {
+            return;
+        };
+        let certified = self.fleet.interview(
+            tod_store::interview::ACTOR_USER,
+            tod_store::interview::InterviewCommand::PhaseCertify {
+                node_id,
+                state: self.lifecycle.clone(),
+                note: "Marked done by the user.".into(),
+            },
+        );
+        match certified {
+            Ok(_) => {
+                self.refresh_standing();
+                self.run_gate_check(cx);
+            }
+            Err(err) => {
+                let message = format!("Failed to mark the phase done: {err:#}");
+                self.with_controller(cx, |c, id, cx| {
+                    c.report_before_gate(id, None, Some(message), cx)
+                });
+            }
+        }
+        cx.notify();
     }
 
     /// The step the stored state recommends next, which the panel shows as
@@ -985,9 +1030,8 @@ impl LifecyclePanelView {
         self.with_controller(cx, |c, id, cx| c.waive(id, criterion_id, cx));
     }
 
-    fn advance_after_criteria(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let entered = self.with_controller(cx, |c, id, cx| c.advance_after_criteria(id, cx));
-        self.enter_state(entered.flatten(), window, cx);
+    fn advance_after_criteria(&mut self, cx: &mut Context<Self>) {
+        self.with_controller(cx, |c, id, cx| c.advance_after_criteria(id, cx));
     }
 
     /// Where implementation would run: the node needs a resolved Agent and a
@@ -1131,7 +1175,7 @@ impl LifecyclePanelView {
         let Some(task_id) = self.task_id.clone() else {
             return;
         };
-        // The state agents (gate check, on entry) work through `tod-cli`
+        // A state's phase agent and its evaluator work through `tod-cli`
         // wherever the node's files are; the rest need its worktree.
         if !protocol.has_transition() {
             if let Err(reason) = self.implement_directory() {
@@ -1936,7 +1980,7 @@ impl Render for LifecyclePanelView {
                         })
                         .child(
                             Button::new("lifecycle-panel-run-gate-check")
-                                .label(format!("Run gate check to advance to {next}"))
+                                .label(format!("Check gate and advance to {next}"))
                                 // Only the recommendation once nothing earlier
                                 // (verifying, fixing failures, review) is owed.
                                 .when(gate_check_recommended, |b| b.primary())
@@ -1958,6 +2002,37 @@ impl Render for LifecyclePanelView {
                         .child("No further lifecycle state to advance to."),
                 ),
             };
+            if let Some((line, current)) = self.certificate.clone() {
+                let mark_focused = self.is_focused(LifecyclePanelStop::MarkPhaseDone, cx);
+                body = body.child(
+                    style::text_dense_muted(div())
+                        .child(selectable_text("lifecycle-panel-certificate", line, window, cx)),
+                );
+                if !current {
+                    body = body.child(
+                        div()
+                            .w_full()
+                            .rounded_md()
+                            .when(mark_focused, |el| {
+                                el.border_1().border_color(list_active_border)
+                            })
+                            .child(
+                                Button::new("lifecycle-panel-mark-phase-done")
+                                    .label("Mark phase done")
+                                    .ghost()
+                                    .w_full()
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.perform(
+                                            LifecyclePanelStop::MarkPhaseDone,
+                                            Source::Click,
+                                            window,
+                                            cx,
+                                        );
+                                    })),
+                            ),
+                    );
+                }
+            }
         }
 
         if self.interview_available() {
@@ -2384,6 +2459,21 @@ mod tests {
     use std::sync::Mutex;
     use tod_agent::{MockAgentProvider, SharedAgent};
 
+    /// Certify the node's current phase as the user, as "Mark phase done" does.
+    fn certify(fixture: &Fixture, state: &str) {
+        fixture
+            .store
+            .interview(
+                tod_store::interview::ACTOR_USER,
+                tod_store::interview::InterviewCommand::PhaseCertify {
+                    node_id: fixture.node_id,
+                    state: state.into(),
+                    note: "Done.".into(),
+                },
+            )
+            .unwrap();
+    }
+
     fn set_lifecycle(fixture: &Fixture, state: &str) {
         fixture
             .store
@@ -2519,6 +2609,7 @@ mod tests {
     fn presented_matches_the_rendered_stops(cx: &mut TestAppContext) {
         let fixture = Fixture::new();
         set_lifecycle(&fixture, "design");
+        certify(&fixture, "design");
         let (view, cx) = open_panel(&fixture, cx);
 
         let (presented, stops) = view.read_with(cx, |panel, cx| {
@@ -2538,13 +2629,39 @@ mod tests {
             assert_eq!(p.primary, primary);
             assert_eq!(p.disabled, disabled);
         }
-        // A `design` node's only lifecycle-moving stop is the gate check.
+        // A certified `design` node's only lifecycle-moving stop is the gate.
         let primary = presented
             .actions
             .iter()
             .find(|a| a.primary)
             .expect("a design node has a primary stop");
         assert_eq!(primary.id, format!("{:?}", LifecyclePanelStop::RunGateCheck));
+    }
+
+    /// Until its phase is certified, a node's panel offers "Mark phase done"
+    /// (the user's own certificate) beside the gate, and neither is primary:
+    /// the phase's work comes first, from its agent.
+    #[gpui::test]
+    fn an_uncertified_phase_offers_mark_phase_done(cx: &mut TestAppContext) {
+        let fixture = Fixture::new();
+        set_lifecycle(&fixture, "design");
+        let (view, cx) = open_panel(&fixture, cx);
+        let presented = view.read_with(cx, |panel, cx| panel.presented(cx));
+        let mark = presented
+            .actions
+            .iter()
+            .find(|a| a.id == format!("{:?}", LifecyclePanelStop::MarkPhaseDone))
+            .expect("Mark phase done is offered");
+        assert!(!mark.primary);
+        assert!(presented.actions.iter().all(|a| !a.primary), "{presented:?}");
+
+        certify(&fixture, "design");
+        view.update(cx, |panel, cx| {
+            panel.refresh_standing();
+            cx.notify();
+        });
+        let stops = view.read_with(cx, |panel, cx| panel.stops(cx));
+        assert!(!stops.contains(&LifecyclePanelStop::MarkPhaseDone), "{stops:?}");
     }
 
     /// Activating a stop (the keyboard path, which every `on_click` mirrors
@@ -2554,6 +2671,7 @@ mod tests {
     fn perform_records_the_presented_snapshot(cx: &mut TestAppContext) {
         let fixture = Fixture::new();
         set_lifecycle(&fixture, "design");
+        certify(&fixture, "design");
         let (view, cx) = open_panel(&fixture, cx);
 
         let before = cx.update(|_, cx| crate::ui::journey::hub(cx).read(cx).len());
@@ -2585,5 +2703,25 @@ mod tests {
             }
             other => panic!("expected a UserAction, got {other:?}"),
         }
+    }
+}
+
+/// The certificate's standing as one line, and whether it is current.
+fn certificate_line(status: &tod_store::phase::CertificateStatus) -> (String, bool) {
+    use tod_store::phase::CertificateStatus;
+    match status {
+        CertificateStatus::None => ("Phase not certified yet.".to_string(), false),
+        CertificateStatus::Current(event) => (
+            format!("Phase certified ({}): {}", event.certifier, event.body),
+            true,
+        ),
+        CertificateStatus::Stale { event, changed } => (
+            format!(
+                "Phase certificate ({}) is stale; changed since: {}",
+                event.certifier,
+                changed.join("; ")
+            ),
+            false,
+        ),
     }
 }

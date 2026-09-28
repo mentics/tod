@@ -1,9 +1,11 @@
 //! The lifecycle buttons beside Send: whichever step moves the focused node
-//! along its lifecycle now — Implement, Verify, Review, Fix, the gate check, Advance — so
-//! the user never has to go to the lifecycle panel to take it. The gate
-//! check's state lives in the shared [`LifecycleController`], so a check
-//! started here shows in the lifecycle panel too, and the other way round;
-//! its verdict, and a Waive on each failing criterion, sit in the side pane
+//! along its lifecycle now — a phase agent's work or its evaluation,
+//! Implement, Verify, Review, Fix, Advance — so the user never has to go to
+//! the lifecycle panel to take it. Advance checks the gate (an app check, no
+//! agent: `tod_core::phase::settle_gate`) and moves the node on when it is
+//! clear. The gate's state lives in the shared [`LifecycleController`], so a
+//! check made here shows in the lifecycle panel too, and the other way round;
+//! its failing criteria, each with a Waive, sit in the side pane
 //! ([`ConversationView::gate_notices`]).
 //!
 //! Only the forward path is here. The manual escape hatches (force advance,
@@ -14,12 +16,9 @@
 use super::ConversationView;
 use crate::ui::agent_conversation::{NoticeTone, PanelAction, PanelNotice};
 use crate::ui::journey::Source;
-use crate::views::lifecycle_control::{GateCheckState, enters_with_agent, implement_directory};
+use crate::views::lifecycle_control::{GateCheckState, implement_directory};
 use gpui::{App, Context, SharedString, Window};
 use tod_journey::{Presented, PresentedAction};
-use tod_core::conversation::gate_check::{
-    GateReportRecord, latest_gate_report, settle_derived_criteria,
-};
 use tod_core::conversation::implement::{PlanProgress, plan_progress};
 use tod_core::lifecycle_next::{NextStep, Standing, next_step};
 use tod_core::task::model::{next_lifecycle, previous_lifecycle};
@@ -28,6 +27,8 @@ use tod_store::fleet::FleetStore;
 use tod_store::outline::types::Capability;
 use uuid::Uuid;
 
+const PHASE: &str = "lifecycle:phase";
+const EVALUATE: &str = "lifecycle:evaluate";
 const IMPLEMENT: &str = "lifecycle:implement";
 const VERIFY: &str = "lifecycle:verify";
 const REVIEW: &str = "lifecycle:review";
@@ -38,9 +39,6 @@ const FIX_FAILED: &str = "lifecycle:fix-failed";
 const BACK: &str = "lifecycle:back";
 const WAIVE: &str = "lifecycle:waive:";
 
-/// The gate check's status while the app answers the criteria it can.
-pub(super) const SETTLING: &str = "Checking the gate criteria…";
-
 /// Where the focused node stands, read with the rest of the view's data.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct LifecycleSnapshot {
@@ -50,8 +48,6 @@ pub(crate) struct LifecycleSnapshot {
     /// In `review`: whether the node has a review conversation. Whether it
     /// finished, and its open findings, are in [`Self::standing`].
     pub review_started: bool,
-    /// What the node's latest gate check, of its current transition, said.
-    pub gate: Option<GateReportRecord>,
     /// Where its work stands in the store, which decides the recommended
     /// next step ([`next_step`]).
     pub standing: Standing,
@@ -91,11 +87,6 @@ impl LifecycleSnapshot {
                         .is_some())
                 })
                 .unwrap_or_default();
-        let gate = fleet
-            .read(|conn| latest_gate_report(conn, node, &lifecycle))
-            .ok()
-            .flatten()
-            .map(|(_, report)| report);
         let standing = fleet
             .read(|conn| Standing::load(conn, node, &lifecycle))
             .unwrap_or_default();
@@ -103,7 +94,6 @@ impl LifecycleSnapshot {
             node,
             plan: plan_progress(fleet, node),
             review_started,
-            gate,
             standing,
             lifecycle,
             blocked,
@@ -134,11 +124,9 @@ impl ConversationView {
     }
 
     /// Whether a gate check on `node` is under way: waiting on its incoming
-    /// changes, settling the criteria the app answers, or in conversation.
+    /// changes, or being checked.
     fn gate_checking(&self, node: Uuid, cx: &App) -> bool {
-        self.settling_gate.contains(&node)
-            || self.checking_incoming(node, cx)
-            || self.protocol_running(node, ProtocolKind::GateCheck, cx)
+        self.lifecycle.read(cx).checking(&node.to_string()) || self.checking_incoming(node, cx)
     }
 
     /// The buttons beside Send and the short notices above the input (why a
@@ -293,6 +281,35 @@ impl ConversationView {
                     ));
                 }
             }
+            // A state whose agent does the work and certifies it: its work,
+            // then (with independent evaluation on) its evaluation, then the
+            // gate.
+            state if tod_core::phase::has_phase_agent(state) => {
+                let working = self.protocol_running(snapshot.node, ProtocolKind::Phase, cx);
+                let evaluating = self.protocol_running(snapshot.node, ProtocolKind::Evaluate, cx);
+                if working || evaluating {
+                    gate_offered = false;
+                    if !open_is(ProtocolKind::Phase) && !open_is(ProtocolKind::Evaluate) {
+                        actions.push(
+                            PanelAction::new(
+                                if working { PHASE } else { EVALUATE },
+                                if working { "Working…" } else { "Evaluating…" },
+                            )
+                            .disabled(true),
+                        );
+                    }
+                } else {
+                    match snapshot.next_step() {
+                        Some(NextStep::Evaluate) => actions.push(
+                            PanelAction::new(EVALUATE, format!("Evaluate {state}")).primary(true),
+                        ),
+                        step => actions.push(
+                            PanelAction::new(PHASE, format!("Work on {state}"))
+                                .primary(step == Some(NextStep::Phase)),
+                        ),
+                    }
+                }
+            }
             _ => {}
         }
         if blocked && !actions.is_empty() {
@@ -308,14 +325,13 @@ impl ConversationView {
                 actions.push(PanelAction::new(GATE_CHECK, "Checking gate…").disabled(true));
             } else if gate.all_clear() {
                 actions.push(PanelAction::new(ADVANCE, format!("Advance to {next}")).primary(true));
-                actions.push(PanelAction::new(GATE_CHECK, "Check again"));
             } else {
-                // Only once nothing earlier is owed: a gate check before then
-                // just reports what the stored state already says.
+                // The gate is an app check, so this checks and advances in
+                // one press. Primary only once nothing earlier is owed.
                 let primary = snapshot.next_step() == Some(NextStep::GateCheck)
                     && !actions.iter().any(|a| a.primary);
                 actions.push(
-                    PanelAction::new(GATE_CHECK, format!("Gate check → {next}")).primary(primary),
+                    PanelAction::new(GATE_CHECK, format!("Advance to {next}")).primary(primary),
                 );
             }
         }
@@ -365,7 +381,7 @@ impl ConversationView {
         // Say so, rather than let the old verdict vanish without a word.
         if gate_stale
             && snapshot.standing.verification_due()
-            && (snapshot.gate.is_some() || !gate.gate_status.is_empty())
+            && (!gate.criteria_detail.is_empty() || !gate.gate_status.is_empty())
         {
             notices.push(
                 PanelNotice::new(NoticeTone::Error, reverify_first(&snapshot.standing))
@@ -380,9 +396,6 @@ impl ConversationView {
         }
         if let Some(error) = &gate.gate_error {
             notices.push(PanelNotice::new(NoticeTone::Error, error.clone()));
-        }
-        if let Some(report) = snapshot.gate.as_ref().filter(|_| !gate_stale && !checking) {
-            notices.extend(gate_report_notices(report, &snapshot.lifecycle));
         }
         for row in gate
             .criteria_detail
@@ -464,21 +477,18 @@ impl ConversationView {
         let task_id = node.to_string();
         let lifecycle = self.lifecycle.clone();
         match id.as_ref() {
+            PHASE => self.run_protocol(node, ProtocolKind::Phase, window, cx),
+            EVALUATE => self.run_protocol(node, ProtocolKind::Evaluate, window, cx),
             IMPLEMENT => self.run_protocol(node, ProtocolKind::Implementation, window, cx),
             VERIFY => self.run_protocol(node, ProtocolKind::Verification, window, cx),
             REVIEW => self.run_protocol(node, ProtocolKind::Review, window, cx),
             FIX => self.run_protocol(node, ProtocolKind::Fix, window, cx),
-            // Not `run_protocol`: a gate check works in the node's files, or
-            // the data root, and needs no worktree.
             GATE_CHECK => self.check_gate(node, window, cx),
             ADVANCE => {
                 if self.gate_checking(node, cx) {
                     return;
                 }
-                let entered = lifecycle.update(cx, |c, cx| c.advance_after_criteria(&task_id, cx));
-                if entered.is_some_and(enters_with_agent) {
-                    self.run(Focus::Node(node), ProtocolKind::OnEntry, window, cx);
-                }
+                lifecycle.update(cx, |c, cx| c.advance_after_criteria(&task_id, cx));
             }
             BACK => lifecycle.update(cx, |c, cx| c.revert(&task_id, cx)),
             FIX_FAILED => {
@@ -500,64 +510,19 @@ impl ConversationView {
         cx.notify();
     }
 
-    /// The gate check: the criteria the app answers itself are answered and
-    /// shown at once; an agent conversation starts only when something is left
-    /// for it to judge.
+    /// Check the gate, an app check with no agent, and advance the node when
+    /// it is clear; otherwise its failing criteria show, each with a Waive.
     ///
     /// A node with pending incoming changes has them checked first
     /// (`views::incoming_check`); the shell calls this again when they turn
     /// out to affect nothing.
-    pub fn check_gate(&mut self, node: Uuid, window: &mut Window, cx: &mut Context<Self>) {
-        if self.gate_check_waits(Focus::Node(node), ProtocolKind::GateCheck, cx) {
+    pub fn check_gate(&mut self, node: Uuid, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.gate_check_waits(node, cx) {
             cx.notify();
             return;
         }
-        if self.settling_gate.contains(&node) {
-            return;
-        }
-        // Answering the criteria reads the pull request from GitHub (through
-        // the OS keyring's token), may give the node a branch, and waits on
-        // the writer, so it runs on the background executor; meanwhile the
-        // check shows as started here and in the lifecycle panel.
-        self.settling_gate.push(node);
         let task_id = node.to_string();
-        self.lifecycle.update(cx, |c, cx| {
-            c.report_before_gate(&task_id, Some(SETTLING.to_string()), None, cx)
-        });
-        cx.notify();
-        let fleet = self.fleet.clone();
-        cx.spawn_in(window, async move |this, cx| {
-            let settled = cx
-                .background_executor()
-                .spawn(async move { settle_derived_criteria(&fleet, node) })
-                .await;
-            let _ = this.update_in(cx, |this, window, cx| {
-                this.settled_gate(node, settled, window, cx)
-            });
-        })
-        .detach();
-    }
-
-    /// The criteria the app answers are settled: show them, or hand what is
-    /// left to a gate-check conversation.
-    fn settled_gate(
-        &mut self,
-        node: Uuid,
-        settled: anyhow::Result<bool>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.settling_gate.retain(|n| *n != node);
-        let task_id = node.to_string();
-        self.lifecycle
-            .update(cx, |c, cx| c.report_before_gate(&task_id, None, None, cx));
-        match settled {
-            Ok(false) => self
-                .lifecycle
-                .update(cx, |c, cx| c.reload_criteria(&task_id, cx)),
-            Ok(true) => self.run(Focus::Node(node), ProtocolKind::GateCheck, window, cx),
-            Err(err) => self.error = Some(format!("{err:#}").into()),
-        }
+        self.lifecycle.update(cx, |c, cx| c.check_gate(&task_id, cx));
         cx.notify();
     }
 
@@ -618,62 +583,4 @@ fn reverify_first(standing: &Standing) -> String {
         "Verify again before the gate check: {} not verified against the current          code (changed since the last verification, or never checked).",
         owed.join(" and ")
     )
-}
-
-/// What a gate check concluded, as lines above the input: why, each blocker
-/// with the button that acts on it when the app can, and the recommended next
-/// step. A verdict that says nothing is said to say nothing, so the user is
-/// never pointed at reasons that are not there.
-fn gate_report_notices(report: &GateReportRecord, lifecycle: &str) -> Vec<PanelNotice> {
-    let mut notices = Vec::new();
-    let passed = report.result == "pass";
-    if !report.summary.is_empty() {
-        notices.push(PanelNotice::new(
-            if passed {
-                NoticeTone::Muted
-            } else {
-                NoticeTone::Error
-            },
-            report.summary.clone(),
-        ));
-    }
-    if report.no_reasons {
-        notices.push(PanelNotice::new(
-            NoticeTone::Error,
-            "The gate check did not pass and gave no reasons. Its full reply is in the \
-             transcript; ask it why, or check again.",
-        ));
-    }
-    // Failing criterion rows carry their own Waive; the rest say what to do,
-    // with the button when the app can do it.
-    for blocker in report.blockers.iter().filter(|b| b.kind != "criterion") {
-        let text = if blocker.reference.is_empty() {
-            format!("\u{2717} {}", blocker.what)
-        } else {
-            format!("\u{2717} {}: {}", blocker.reference, blocker.what)
-        };
-        let mut notice = PanelNotice::new(NoticeTone::Error, text);
-        let button = match blocker.action.as_str() {
-            "implement" => Some(PanelAction::new(IMPLEMENT, "Implement")),
-            // Verification runs on a node in `verifying`; offered from any
-            // other state it would mislead.
-            "verify" if lifecycle == "verifying" => Some(PanelAction::new(VERIFY, "Verify")),
-            "fix" => Some(PanelAction::new(FIX, "Fix")),
-            _ => None,
-        };
-        if let Some(button) = button {
-            notice = notice.with_action(button);
-        }
-        notices.push(notice);
-    }
-    if !report.next.is_empty() && !passed {
-        notices.push(PanelNotice::new(
-            NoticeTone::Muted,
-            format!("Next: {}", report.next),
-        ));
-    }
-    if !report.no_reasons && report.blockers.is_empty() && !report.findings.is_empty() {
-        notices.push(PanelNotice::new(NoticeTone::Muted, report.findings.clone()));
-    }
-    notices
 }

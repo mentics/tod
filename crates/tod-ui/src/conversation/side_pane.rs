@@ -498,6 +498,13 @@ impl ConversationView {
             ProtocolKind::Outline | ProtocolKind::Chat => SideList::ChangeSet,
             ProtocolKind::Implementation | ProtocolKind::Verification => SideList::Plan,
             ProtocolKind::Review | ProtocolKind::Fix | ProtocolKind::Pr => SideList::Findings,
+            ProtocolKind::Phase | ProtocolKind::Evaluate => {
+                match self.data.lifecycle.as_ref().map(|s| s.lifecycle.as_str()) {
+                    Some("proposed" | "design") => SideList::Obligations,
+                    Some("planning") => SideList::Plan,
+                    _ => SideList::Gate,
+                }
+            }
             ProtocolKind::GateCheck | ProtocolKind::OnEntry => {
                 match self.data.lifecycle.as_ref().map(|s| s.lifecycle.as_str()) {
                     Some("proposed" | "design") => SideList::Obligations,

@@ -2,27 +2,22 @@
 //! the lifecycle panel and the conversation view's lifecycle buttons. One
 //! entity per window holds each node's gate-check display state.
 //!
-//! The agent runs are not here. A **gate check** and a state's **on-entry**
-//! work are conversations (`tod_core::conversation::gate_check`), run and
-//! driven by the conversation view like Implement and Review: they have a
-//! transcript, show in the picker with the transition they belong to, and take
-//! follow-up messages. What is left here is what the lifecycle does without an
-//! agent: waiving a criterion, advancing once every recorded criterion reads
+//! The agent runs are not here: a state's work, its evaluation, Implement,
+//! Verify, and Review are conversations the conversation view runs. What is
+//! here is what the lifecycle does without an agent: checking the gate
+//! ([`LifecycleController::check_gate`], an app check through
+//! `tod_core::phase::settle_gate`, which advances the node when it is clear),
+//! waiving a criterion, advancing once every recorded criterion reads
 //! pass/waived ([`LifecycleController::advance_after_criteria`]), forcing or
 //! reverting a transition, and showing the criteria the last check recorded.
-//! The store writes themselves are `tod_core::lifecycle`'s, shared with the
-//! headless `tod_core::autopilot`; this entity keeps only what is shown.
-//!
-//! Criteria the app can answer from its own data
-//! (`tod_core::gate::evaluate_derived_criterion` — e.g. `ready` → `active`'s
-//! "has Agent and Files configured") are evaluated directly and saved as
-//! `derived`; they are never sent to the agent.
+//! The store writes themselves are `tod_core`'s, shared with the headless
+//! `tod_core::autopilot`; this entity keeps only what is shown.
 //!
 //! Observers are notified whenever anything shown changes, including the
 //! node's lifecycle, so they re-read it from the store.
 
 use gpui::Context;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tod_core::gate::GateAction;
 use tod_core::task::model::{next_lifecycle, previous_lifecycle};
@@ -65,6 +60,8 @@ pub struct GateCheckState {
     pub revert_armed: bool,
     /// Same two-click confirm as `revert_armed`, for **Force advance**.
     pub force_advance_armed: bool,
+    /// The gate is being checked, on the background executor.
+    pub checking: bool,
 }
 
 impl GateCheckState {
@@ -77,6 +74,7 @@ impl GateCheckState {
 pub struct LifecycleController {
     fleet: Arc<FleetStore>,
     gate_states: HashMap<String, GateCheckState>,
+    checking: HashSet<String>,
 }
 
 impl LifecycleController {
@@ -84,7 +82,70 @@ impl LifecycleController {
         Self {
             fleet,
             gate_states: HashMap::new(),
+            checking: HashSet::new(),
         }
+    }
+
+    /// Whether the gate of `task_id` is being checked now.
+    pub fn checking(&self, task_id: &str) -> bool {
+        self.checking.contains(task_id)
+    }
+
+    /// Check the node's gate (an app check, no agent) and advance it when it
+    /// is clear; otherwise the failing criteria show, each with a Waive.
+    /// Checking reads the pull request from GitHub, may give the node a
+    /// branch, and waits on the writer, so it runs on the background executor.
+    pub fn check_gate(&mut self, task_id: &str, cx: &mut Context<Self>) {
+        let Ok(node) = Uuid::parse_str(task_id) else {
+            return;
+        };
+        if !self.checking.insert(task_id.to_string()) {
+            return;
+        }
+        let state = self.gate_states.entry(task_id.to_string()).or_default();
+        state.checking = true;
+        state.gate_error = None;
+        state.gate_status = "Checking the gate…".into();
+        cx.notify();
+        let fleet = self.fleet.clone();
+        let task_id = task_id.to_string();
+        cx.spawn(async move |this, cx| {
+            let checked = cx
+                .background_executor()
+                .spawn(async move { tod_core::phase::settle_gate(&fleet, node) })
+                .await;
+            let _ = this.update(cx, |this, cx| this.gate_checked(&task_id, checked, cx));
+        })
+        .detach();
+    }
+
+    fn gate_checked(
+        &mut self,
+        task_id: &str,
+        checked: anyhow::Result<tod_core::phase::GateCheck>,
+        cx: &mut Context<Self>,
+    ) {
+        self.checking.remove(task_id);
+        {
+            let state = self.gate_states.entry(task_id.to_string()).or_default();
+            state.checking = false;
+            state.gate_status.clear();
+        }
+        match checked {
+            Ok(check) => {
+                self.reload_criteria(task_id, cx);
+                if check.clear() {
+                    self.advance_after_criteria(task_id, cx);
+                } else if let Some(state) = self.gate_states.get_mut(task_id) {
+                    state.gate_status = "The gate is not clear yet — see the criteria below.".into();
+                }
+            }
+            Err(err) => {
+                let state = self.gate_states.entry(task_id.to_string()).or_default();
+                state.gate_error = Some(format!("Failed to check the gate: {err:#}"));
+            }
+        }
+        cx.notify();
     }
 
     pub fn state(&self, task_id: &str) -> Option<&GateCheckState> {
@@ -152,8 +213,7 @@ impl LifecycleController {
 
     /// Advance the node to the next lifecycle state directly, bypassing the
     /// gate criteria. First call arms; a second call while armed applies it,
-    /// returning the state entered — where the caller starts that state's
-    /// on-entry conversation (see [`enters_with_agent`]).
+    /// returning the state entered.
     pub fn force_advance(&mut self, task_id: &str, cx: &mut Context<Self>) -> Option<&'static str> {
         let (lifecycle, _) = self.node(task_id)?;
         let next = next_lifecycle(&lifecycle)?;
@@ -311,7 +371,7 @@ impl LifecycleController {
     /// Advance the node to its next lifecycle state once every recorded
     /// criterion reads pass/waived; does nothing otherwise. A pure lifecycle
     /// write — the criteria results are already recorded. Returns the state
-    /// entered, where the caller starts its on-entry conversation.
+    /// entered.
     pub fn advance_after_criteria(
         &mut self,
         task_id: &str,
@@ -391,10 +451,10 @@ impl LifecycleController {
         state.gate_status = if state.all_clear() {
             "All criteria satisfied — advance when ready.".into()
         } else {
-            "Gate check (from last run) — see criteria below.".into()
+            "Gate (last checked) — see criteria below.".into()
         };
     }
 }
 
 // Moved to `tod_core::lifecycle`; kept here so callers need not change.
-pub use tod_core::lifecycle::{enters_with_agent, implement_directory};
+pub use tod_core::lifecycle::implement_directory;
