@@ -531,8 +531,9 @@ The plan:
   node's sandbox, it reads them and passes them as the proxy rules' secrets;
   nothing is configured in Blaxel by hand. The sandbox therefore acts as the
   user who accepted the node: commits, PRs, and ticket updates are theirs. A
-  token changed later reaches only sandboxes created after (until rotating a
-  running sandbox's rule is verified). **User tokens never leave the user's
+  token changed later reaches only sandboxes created after (Blaxel can
+  replace a running sandbox's rules, but only by redeploying it; see To
+  verify 4). **User tokens never leave the user's
   machine except into a sandbox's proxy rules:** the orchestrator does not
   keep them. So a sandbox that expires while the app is closed is replaced
   only when the user's app next runs; until then its node waits (the
@@ -678,13 +679,24 @@ chosen per account in `sandboxes.toml`, so the same code runs everywhere:
      until the old time. Its next poke (an obligation added) deleted the
      live schedule, which then never fired. Fixed: a wait changed by any
      client but the node's own supervisor now pokes the node
-     (`tod-orchestrator`'s `wait_changes`); not yet deployed to the
-     development orchestrator.
+     (`tod-orchestrator`'s `wait_changes`). Deployed and verified
+     (2026-09-28): a mock node asleep in standby on a 10-minute wait (its
+     `wait-<id>` schedule listed); the wait cancelled in the app and synced
+     (the sync returned at 05:50:26.7); the orchestrator logged "a wait
+     changed", the relay started the supervisor, which deleted the schedule
+     at 05:50:27.1 (**0.4 s** after the sync returned) and carried the node
+     on to its PR gate; the schedule list was empty at the next look (5 s).
+     An event wait *added* in the app to a sleeping node woke it the same
+     way (0.65 s), and it went back to sleep on both waits.
    - The first start of each node's supervisor spent 74–87 s seeding its
      copy of the database: `sync::snapshot` (on the orchestrator, under the
      user's sync lock) and `sync::restore` (in the sandbox) used the paced
      backup, 5 pages then 100 ms, about 36 s each for the 7 MB database.
-     Both now copy in one step.
+     Both now copy in one step: on two fresh nodes (2026-09-28, same data
+     root) the supervisor's first start went from "seeding the local copy"
+     to its first step in **0.68 s** and **0.85 s**, and had scheduled its
+     wake 3.4 s and 4 s after it started. Creating and provisioning each
+     sandbox (baked image) took 29.5 s and 30.3 s.
 2. **Agent Drive.** Private preview, and only in `us-was-1`, which is also
    the region the team will use (tod's default region is now `us-was-1`).
    Check that a mount survives standby, and how it behaves with a line
@@ -711,9 +723,41 @@ chosen per account in `sandboxes.toml`, so the same code runs everywhere:
    orphaned when its adapter exits, showed as `<defunct>` under the relay in
    3 polls and was gone by the next (the relay reaps orphans every 5 s; 11
    reaped, one per session); afterwards nothing but the sandbox API and the
-   relay, no zombies. Still open: whether a rule's secrets can be rotated on
-   a running sandbox (the proxy cannot be added after creation); and
-   existing sandboxes, which were created without it.
-5. **The push service.** Pick one; measure publish-to-app latency.
+   relay, no zombies. Existing sandboxes, created without the proxy, cannot
+   get it (Blaxel: the proxy can be neither enabled nor fully disabled after
+   creation).
+
+   **Rotating a running sandbox's secrets** (2026-09-28). Blaxel documents
+   it (SDK `updateNetwork`; REST `PUT /v0/sandboxes/<name>`): the update
+   **replaces the whole network configuration**, so every rule and every
+   secret must be sent again (secrets are write-only: `GET` returns the
+   header templates, never the values, and shows every env value as
+   `****`). Tried on a mock node's running sandbox, adding a dummy rule
+   (`httpbin.org`, `X-Tod-Probe: {{SECRET:probe}}`) with a body of only
+   `metadata.name` and `spec.network.proxy` (the node's own rules and
+   credentials unchanged): accepted in 0.2 s and stored, but it is a **full
+   spec replace and a redeploy**, not a hot update. The events show "Update
+   deployment", then "Deployment has failed" 7 s later: the partial spec
+   had cleared `runtime.image` (to `""`), reset `memory` to 1024, and
+   dropped the relay's port (the env names were kept). A request through
+   the proxy in the second before the redeploy did not yet carry the new
+   header. So rotating needs the complete create body (`node::create_body`,
+   with every credential) and redeploys the sandbox. Whether a full-body
+   update keeps the sandbox's disk and processes (the checkout, `/opt/tod`,
+   the supervisor's replica) is untested: it means sending the real
+   credentials again, which was not approved for this run. Until then tod
+   does not rotate: a token replaced in Settings reaches a node when its
+   sandbox is next created ("Stop running in the cloud", then "Run in the
+   cloud").
+5. **The push service.** ntfy (`ntfy.sh`; see `orchestrator.md`, "Telling
+   the app"). Measured 2026-09-28 from this machine (US West) against the
+   development orchestrator (`us-was-1`), with a subscriber held the way
+   `cloud_notify` holds it (`GET <server>/<topic>/json`, the topic from `GET
+   /users/<u>/notify`). 12 samples, each a `tod-cli node rename` POSTed to
+   the orchestrator's `/cli` as a node's sandbox would: `/cli` answered in
+   124–273 ms, and the ntfy message arrived **47–61 ms (median 50 ms) after
+   that reply**, 180–329 ms (median 211 ms) after the request was sent. The
+   app then pulls the feed (one more round trip). The once-a-second limit
+   delayed no sample (they were 2.5 s apart).
 6. **Subscription use.** One subscription driving many unattended agents: the
    limits, and that it is within the subscription's terms.

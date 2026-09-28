@@ -225,6 +225,15 @@ credentials for the user's sandboxes. The poke wakes the supervisor, which
 cancels the schedule it no longer needs (`waits::reconcile_wake`); one that
 fires first is a harmless poke.
 
+Verified on the development orchestrator (2026-09-28) with a synthetic
+`pull_request_review` delivery (approved, PR 9999, the node's branch), signed
+with the orchestrator's own secret, sent to the public preview: 200 in
+0.42 s, routed by branch to the sleeping mock node, its `github:pr 9999
+review` wait satisfied (and synced to the app), the node's supervisor started
+within 1.5 s, found only its timed wait left, and slept again. The same body
+unsigned, with a wrong signature, or altered after signing got 401 and
+routed nothing.
+
 Deliveries are not deduplicated (`X-GitHub-Delivery` is ignored); a repeat
 records the event again and pokes again, which is harmless. Webhooks can be
 lost; every event wait also has its deadline, so a lost one only delays the
