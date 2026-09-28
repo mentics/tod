@@ -67,6 +67,11 @@ pub(crate) struct TaskHeader {
     pub title: String,
     /// The external (Linear) ticket id, when the node carries one.
     pub ticket_id: Option<String>,
+    /// The Linear ticket's browser URL, when both the id and the workspace
+    /// slug are known.
+    pub ticket_url: Option<String>,
+    /// The node's recorded pull request (`tod-cli pr open`), when it has one.
+    pub pull_request: Option<tod_store::github::NodePr>,
     pub obligation_count: usize,
     /// Obligations whose latest verdict is `failed`.
     pub obligations_failed: usize,
@@ -103,6 +108,19 @@ fn load(fleet: &FleetStore, node_id: Uuid) -> TaskHeader {
         .ok()
         .flatten()
         .filter(|id| !id.is_empty());
+    if let Some(ticket) = header.ticket_id.as_deref() {
+        let metadata = fleet
+            .get_extra_content(node_id, tod_store::outline::types::EXTRA_CONTENT_METADATA)
+            .ok()
+            .flatten()
+            .and_then(|json_str| serde_json::from_str::<serde_json::Value>(&json_str).ok());
+        header.ticket_url =
+            tod_integration::linear_issue_url(metadata.as_ref(), fleet.paths().root(), ticket);
+    }
+    header.pull_request = fleet
+        .read(|conn| Ok(tod_store::github::NodePrRepo::new(conn).get(node_id)?))
+        .ok()
+        .flatten();
     if let Ok(obligations) = fleet.list_obligations_for_node(node_id) {
         header.obligation_count = obligations.len();
     }
@@ -361,14 +379,48 @@ impl TaskPanel {
                     cx,
                 )),
             )
-            .when_some(self.header.ticket_id.clone(), |el, ticket| {
-                el.child(style::text_muted(div().flex_none().child(selectable_text(
-                    "unified-task-ticket",
-                    ticket,
-                    window,
-                    cx,
-                ))))
-            })
+            .child(
+                div()
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .gap_2()
+                    .when_some(self.header.ticket_id.clone(), |el, ticket| {
+                        el.child(match self.header.ticket_url.clone() {
+                            Some(url) => self.external_link("unified-task-ticket", ticket, url, cx),
+                            None => style::text_muted(div()).child(ticket).into_any_element(),
+                        })
+                    })
+                    .when_some(self.header.pull_request.clone(), |el, pr| {
+                        let label = format!("{}#{}", pr.repo, pr.pr_number);
+                        el.child(self.external_link(
+                            "unified-task-pr",
+                            label,
+                            pr.url.clone(),
+                            cx,
+                        ))
+                    }),
+            )
+            .into_any_element()
+    }
+
+    /// A muted, clickable label that opens `url` in the browser.
+    fn external_link(
+        &self,
+        id: &'static str,
+        label: String,
+        url: String,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        style::text_muted(div().id(id))
+            .cursor_pointer()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |_this, _event: &MouseDownEvent, _, cx| {
+                    cx.open_url(&url);
+                }),
+            )
+            .child(label)
             .into_any_element()
     }
 
