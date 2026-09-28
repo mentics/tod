@@ -1052,7 +1052,9 @@ fn check_tod_cli() -> Result<()> {
     let stamp = String::from_utf8_lossy(&out.stdout).trim().to_string();
     if !out.status.success() || stamp != crate::CLI_BUILD_STAMP {
         anyhow::bail!(
-            "{} was built from different source than this app, so the agent              would get commands that do not match its instructions. Rebuild it              (`cargo build -p tod-cli`) and send again.",
+            "{} was built from different source than this app, so the agent \
+            would get commands that do not match its instructions. Rebuild it \
+            (`cargo build -p tod-cli`) and send again.",
             cli.display()
         );
     }

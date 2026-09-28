@@ -593,7 +593,9 @@ impl AgentRuns {
         let conversation_id = self
             .latest_handoff_conversation(focus)?
             .context(
-                "No implement or verify conversation has worked on this node, so there is no                  agent to send the answer to. Start one, or change the step yourself in the                  Plan panel.",
+                "No implement or verify conversation has worked on this node, so there is no \
+                agent to send the answer to. Start one, or change the step yourself in the \
+                Plan panel.",
             )?;
 
         let message = handoff_answer_message(&step, &answer);

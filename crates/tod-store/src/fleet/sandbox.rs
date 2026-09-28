@@ -93,7 +93,8 @@ impl Sandboxes {
         match acct.auth {
             AuthMode::ApiKey => self.credentials().get(CredentialKind::BlaxelApiKey).ok_or_else(|| {
                 anyhow!(
-                    "no Blaxel API key stored: enter one in Settings → Cloud sandboxes,                      or run `tod-sandbox setup --auth api-key`"
+                    "no Blaxel API key stored: enter one in Settings → Cloud sandboxes, \
+                    or run `tod-sandbox setup --auth api-key`"
                 )
             }),
             AuthMode::Bl => bl_token(&self.root, &acct.workspace),
@@ -503,7 +504,9 @@ fn bl_token(root: &Path, workspace: &str) -> Result<String> {
     no_window(&mut command);
     let out = command.output().map_err(|_| {
         anyhow!(
-            "signing in with `bl login` needs the Blaxel CLI (`bl`), which is not installed;              install it (https://docs.blaxel.ai/cli-reference/introduction), or sign in with              an API key in Settings → Cloud sandboxes"
+            "signing in with `bl login` needs the Blaxel CLI (`bl`), which is not installed; \
+            install it (https://docs.blaxel.ai/cli-reference/introduction), or sign in with \
+            an API key in Settings → Cloud sandboxes"
         )
     })?;
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -516,7 +519,8 @@ fn bl_token(root: &Path, workspace: &str) -> Result<String> {
         .to_string();
     if !out.status.success() || token.is_empty() || token.contains(' ') {
         bail!(
-            "could not get a Blaxel token; run `bl login {workspace}`, or sign in with an API              key in Settings → Cloud sandboxes ({})",
+            "could not get a Blaxel token; run `bl login {workspace}`, or sign in with an API \
+            key in Settings → Cloud sandboxes ({})",
             String::from_utf8_lossy(&out.stderr).trim()
         );
     }
