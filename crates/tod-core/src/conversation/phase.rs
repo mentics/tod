@@ -25,8 +25,9 @@ use rusqlite::Connection;
 use tod_store::conversation::{Focus, ProtocolKind, actor_for};
 use tod_store::decisions::{DECISION_ANSWERED, DecisionRepo, NewDecision, REASON_INTENT};
 use tod_store::fleet::{FleetStore, Workdir};
-use tod_store::interview::{ACTOR_ENV, InterviewCommand, PHASE_REQUIREMENTS};
+use tod_store::interview::{ACTOR_ENV, ACTOR_USER, InterviewCommand, PHASE_REQUIREMENTS};
 use tod_store::outline::repos::{NodeRepo, ObligationRepo, PlanStepRepo};
+use tod_store::outline::types::Capability;
 use tod_store::outline::{KIND_REQUIREMENT, OutlineMutation};
 use tod_store::phase::{PHASE_CERTIFY, PHASE_REJECT, PhaseRepo, is_certifiable};
 use uuid::Uuid;
@@ -205,6 +206,34 @@ impl Protocol for PhaseProtocol {
 
     fn turn_env(&self, env: &ProtocolEnv<'_>) -> Vec<(String, String)> {
         phase_env(env)
+    }
+
+    /// Obligations are what the phases work on and the gates check, and
+    /// a node holds them only with the spec capability. A lifecycle node
+    /// made without it (a new task in the workbench) could never leave
+    /// `proposed`, so it is turned on here rather than left to the agent.
+    fn prepare(&self, env: &ProtocolEnv<'_>) -> Result<()> {
+        let node = node_id(env)?;
+        let has_spec = env.fleet.read(|conn| {
+            Ok(NodeRepo::new(conn)
+                .list_capabilities(node)?
+                .contains(&Capability::Spec))
+        })?;
+        if !has_spec {
+            // Through the writer's synchronous path: a queued mutation waits
+            // out the debounce, and the agent's first obligation would not.
+            env.fleet.interview(
+                ACTOR_USER,
+                InterviewCommand::Outline {
+                    mutation: OutlineMutation::EnableCapabilities {
+                        node_id: node,
+                        capabilities: vec![Capability::Spec],
+                    },
+                    target: None,
+                },
+            )?;
+        }
+        Ok(())
     }
 
     fn opening(&self, env: &ProtocolEnv<'_>) -> Result<String> {
@@ -535,4 +564,63 @@ pub fn mock_evaluate_turn(access: &impl super::mock::Access, node: Uuid) -> Resu
     };
     access.interview(command)?;
     Ok(String::new())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::interview::test_support::fixture;
+    use crate::media::MediaPaths;
+    use tod_store::outline::CreatePosition;
+
+    /// A lifecycle node made without the spec capability gets it before
+    /// its phase agent's first turn, so the obligations it writes land.
+    #[test]
+    fn a_phase_turn_turns_on_the_spec_capability() {
+        let fx = fixture();
+        let list_id = fx.fleet.list_outline_lists().unwrap()[0].id;
+        let node = Uuid::new_v4();
+        fx.fleet
+            .enqueue_outline(OutlineMutation::CreateNode {
+                node_id: Some(node),
+                list_id,
+                parent_id: None,
+                anchor_id: None,
+                position: CreatePosition::Below,
+                title: "New task".into(),
+            })
+            .unwrap();
+        fx.fleet
+            .interview(
+                ACTOR_USER,
+                InterviewCommand::Outline {
+                    mutation: OutlineMutation::EnableCapabilities {
+                        node_id: node,
+                        capabilities: vec![Capability::Lifecycle],
+                    },
+                    target: None,
+                },
+            )
+            .unwrap();
+        let caps = |fx: &crate::interview::test_support::Fixture| {
+            fx.fleet
+                .read(|conn| Ok(NodeRepo::new(conn).list_capabilities(node)?))
+                .unwrap()
+        };
+        assert_eq!(caps(&fx), vec![Capability::Lifecycle]);
+
+        let media = MediaPaths::discover().expect("media paths");
+        let env = ProtocolEnv {
+            fleet: &fx.fleet,
+            media: &media,
+            data_root: &fx.root,
+            conversation_id: Uuid::new_v4(),
+            focus: Focus::Node(node),
+        };
+        PhaseProtocol.prepare(&env).unwrap();
+        assert!(caps(&fx).contains(&Capability::Spec));
+        assert!(caps(&fx).contains(&Capability::Lifecycle));
+        // Again: nothing to do.
+        PhaseProtocol.prepare(&env).unwrap();
+    }
 }

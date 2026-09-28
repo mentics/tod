@@ -46,7 +46,10 @@ For a node in state *S*, the autopilot's `next_step` becomes:
 1. **Gate passes** → advance (app only, no agent). Then loop in the next state.
 2. **Unanswered decisions** → stop, `NeedsHuman::Decision` (same as today).
 3. **Otherwise** → run *S*'s phase agent. It resumes its conversation if one is
-   open for this stay in *S*, otherwise starts a new one.
+   open for this stay in *S*, otherwise starts a new one. Before each of its
+   turns the app turns on the node's spec capability if it is off
+   (`PhaseProtocol::prepare`): obligations are what the phases write and the
+   gates check, and a lifecycle node made without spec could not hold them.
 
 The phase agent's turn ends in one of three ways:
 
