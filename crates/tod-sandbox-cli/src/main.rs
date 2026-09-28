@@ -609,7 +609,11 @@ fn shell(ctx: &mut Ctx, mut args: Args) -> Result<i32> {
     let tunnel_port = carry.then(|| cli_relay_env(&mut env, relay_file.as_deref())).transpose()?;
     // Not a login shell when carrying `tod-cli`: a login profile resets
     // `PATH`, and with it `tod-cli`. The shell stays after `--run` exits.
-    let shell = "shell=bash; command -v bash >/dev/null 2>&1 || shell=sh; ";
+    // Use the sandbox user's own configured shell (`/etc/passwd`), falling
+    // back to bash, then sh, if it isn't set or isn't runnable here.
+    let shell = "shell=$(getent passwd \"$(id -un)\" 2>/dev/null | cut -d: -f7); \
+                 command -v \"$shell\" >/dev/null 2>&1 || shell=bash; \
+                 command -v \"$shell\" >/dev/null 2>&1 || shell=sh; ";
     let cmd = match (&run, carry) {
         (Some(run), true) => Some(with_tod_cli(&format!(
             "{shell}exec \"$shell\" -c {}",

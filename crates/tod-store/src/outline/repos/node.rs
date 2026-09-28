@@ -158,7 +158,7 @@ impl<'a> NodeRepo<'a> {
             Capability::Files => {
                 self.ensure_fields_row(node_id)?;
                 self.conn.execute(
-                    "INSERT OR IGNORE INTO node_files (node_id, use_worktree, updated_at) VALUES (?1, 0, ?2)",
+                    "INSERT OR IGNORE INTO node_files (node_id, use_worktree, updated_at) VALUES (?1, 1, ?2)",
                     params![&blob, now_ms()],
                 )?;
             }

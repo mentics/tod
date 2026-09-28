@@ -362,8 +362,10 @@ pub fn init_submodules(worktree: &Workdir) -> Result<()> {
                 Some(parent) => (worktree.join(parent), &path[parent.len() + 1..]),
                 None => (worktree.clone(), path),
             };
-            run_git(&dir, &["submodule", "update", "--init", "--", rel])
-                .with_context(|| format!("set up submodule {path} in {worktree}"))?;
+            retry_after_pruning_stale_worktree(&dir, || {
+                run_git(&dir, &["submodule", "update", "--init", "--", rel])
+            })
+            .with_context(|| format!("set up submodule {path} in {worktree}"))?;
         }
     }
     Ok(())
@@ -506,25 +508,35 @@ fn git_worktree_add(repo: &Workdir, dest: &Workdir, branch: &str) -> Result<Work
     let dest_str = git_path_arg(dest)?;
     let state = branch_state(repo, &branch_ref)?;
     if state.local {
-        run_git(repo, &["worktree", "add", &dest_str, &branch_ref])?;
+        retry_after_pruning_stale_worktree(repo, || {
+            run_git(repo, &["worktree", "add", &dest_str, &branch_ref])
+        })?;
     } else if state.remote {
         let tracking = format!("{REMOTE}/{branch_ref}");
-        run_git(
-            repo,
-            &["worktree", "add", "--track", "-b", &branch_ref, &dest_str, &tracking],
-        )?;
+        retry_after_pruning_stale_worktree(repo, || {
+            run_git(
+                repo,
+                &["worktree", "add", "--track", "-b", &branch_ref, &dest_str, &tracking],
+            )
+        })?;
     } else if let Some(base) = new_branch_base(repo) {
-        run_git(
-            repo,
-            &["worktree", "add", "--no-track", "-b", &branch_ref, &dest_str, &base],
-        )?;
+        retry_after_pruning_stale_worktree(repo, || {
+            run_git(
+                repo,
+                &["worktree", "add", "--no-track", "-b", &branch_ref, &dest_str, &base],
+            )
+        })?;
     } else {
-        run_git(repo, &["worktree", "add", "-b", &branch_ref, &dest_str])?;
+        retry_after_pruning_stale_worktree(repo, || {
+            run_git(repo, &["worktree", "add", "-b", &branch_ref, &dest_str])
+        })?;
     }
     // Only a new worktree: in one already in use this would put every
     // submodule back on a detached HEAD.
     if has_gitmodules(dest)
-        && let Err(err) = run_git(dest, &["submodule", "update", "--init", "--recursive"])
+        && let Err(err) = retry_after_pruning_stale_worktree(dest, || {
+            run_git(dest, &["submodule", "update", "--init", "--recursive"])
+        })
     {
         // Leave nothing behind, so trying again starts clean.
         let _ = remove_git_worktree(repo, dest);
@@ -623,23 +635,38 @@ fn treehouse_get_lease(
     paths: &TodPaths,
 ) -> Result<WorktreeHandle> {
     let args = lease_args(holder, has_gitmodules(repo));
-    let output = match repo {
-        Workdir::Host(repo) => {
-            let invocation = TreehouseInvocation::resolve(settings, paths)?;
-            invocation
-                .command()
-                .current_dir(repo)
-                .args(&args)
-                .output()
-                .context("spawn treehouse get --lease")?
-        }
-        Workdir::Container { .. } | Workdir::Sandbox { .. } => {
-            run_container_treehouse(repo, &args)?
+    let run = || -> Result<std::process::Output> {
+        match repo {
+            Workdir::Host(repo) => {
+                let invocation = TreehouseInvocation::resolve(settings, paths)?;
+                invocation
+                    .command()
+                    .current_dir(repo)
+                    .args(&args)
+                    .output()
+                    .context("spawn treehouse get --lease")
+            }
+            Workdir::Container { .. } | Workdir::Sandbox { .. } => {
+                run_container_treehouse(repo, &args)
+            }
         }
     };
+    let mut output = run()?;
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("treehouse get --lease failed: {}", stderr.trim());
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        // Treehouse runs its own `git worktree add` under the hood; a stale
+        // registration there is just as recoverable as one tod hits itself.
+        if is_stale_worktree_registration(&stderr) {
+            tracing::warn!(
+                "stale worktree registration reported by treehouse in {repo}; pruning and retrying: {stderr}"
+            );
+            prune_worktrees_recursive(repo);
+            output = run()?;
+        }
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            bail!("treehouse get --lease failed: {}", stderr.trim());
+        }
     }
     let parsed: TreehouseLeaseJson =
         serde_json::from_slice(&output.stdout).context("parse treehouse get --json stdout")?;
@@ -814,6 +841,53 @@ pub fn remove_git_worktree(repo: &Workdir, worktree: &Workdir) -> Result<()> {
 /// Forget worktrees of `repo` whose folders no longer exist.
 pub fn prune_git_worktrees(repo: &Workdir) -> Result<()> {
     run_git(repo, &["worktree", "prune"]).map(|_| ())
+}
+
+/// Whether `err` is git refusing to add a worktree because its registry
+/// still lists one at that path whose directory is gone (deleted by hand, or
+/// by a cleanup that didn't also unregister it). `git worktree prune` clears
+/// the stale entry, and the same add then succeeds — so this is recoverable
+/// without the user seeing it, unlike a real conflict or permission error.
+fn is_stale_worktree_registration(message: &str) -> bool {
+    message.contains("is a missing but already registered worktree")
+}
+
+/// [`prune_git_worktrees`] for `repo`, and, best-effort, for each of its
+/// already-checked-out submodules too. Treehouse pools a submodule's
+/// checkout the same way it pools the superproject's, so a submodule pool
+/// slot whose directory was deleted without being deregistered leaves that
+/// submodule's own worktree list stale — pruning only the superproject
+/// would miss it, and the retry would fail again with the same error, just
+/// deeper in the setup (submodule init instead of the top-level checkout).
+fn prune_worktrees_recursive(repo: &Workdir) {
+    if let Err(err) = prune_git_worktrees(repo) {
+        tracing::warn!("prune worktrees in {repo}: {err:#}");
+    }
+    // A submodule not checked out here has nothing of its own to prune yet,
+    // and `git submodule foreach` merely skips it — nothing to report.
+    let _ = run_git(
+        repo,
+        &["submodule", "foreach", "--recursive", "git worktree prune"],
+    );
+}
+
+/// Run `f` (a worktree-add attempt); if it fails only because of a stale
+/// registration in `repo`'s worktree list (or one of its submodules'),
+/// prune and retry once.
+fn retry_after_pruning_stale_worktree<T>(
+    repo: &Workdir,
+    f: impl Fn() -> Result<T>,
+) -> Result<T> {
+    match f() {
+        Err(err) if is_stale_worktree_registration(&format!("{err:#}")) => {
+            tracing::warn!(
+                "stale worktree registration in {repo}; pruning and retrying: {err:#}"
+            );
+            prune_worktrees_recursive(repo);
+            f()
+        }
+        other => other,
+    }
 }
 
 /// Whether git still lists `worktree` among `repo`'s worktrees.
