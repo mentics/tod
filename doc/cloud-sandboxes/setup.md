@@ -272,8 +272,10 @@ outbox and pulls the node's progress back; `... answer <decision> <option>`
 answers one of the node's pending decisions (as the task panel would; `sync`
 sends it); `... init` makes a list `cloud` in
 a fresh data root, and `... node <title> <repo> <branch> <step>...` a node
-in it (`active`, with Files on the repository, an HTTPS URL or a checkout,
-and one plan step per argument), printing its UUID. Build the sandbox
+in it (`active`, with Lifecycle, Agent, and Files on the repository, an
+HTTPS URL or a checkout, and one plan step per argument), printing its
+UUID; `... state <node> proposed` starts it from the beginning instead,
+and `... stop <node>` takes it out of the cloud and deletes its sandbox. Build the sandbox
 binaries first, and never point it at a data root the app has open. Each
 run reports how long the sandbox took to come up and to be provisioned.
 

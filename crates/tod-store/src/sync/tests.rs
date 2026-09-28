@@ -292,3 +292,35 @@ fn random_edits_on_both_sides_stay_equal() {
     let _ = std::fs::remove_dir_all(&a.root);
     let _ = std::fs::remove_dir_all(&b.root);
 }
+
+/// Seeding a node's replica snapshots the user's database on the
+/// orchestrator and restores it in the sandbox while the supervisor waits.
+/// Both were once the paced backup (5 pages, then 100 ms): 74–87 s for a
+/// real 7 MB database. A few-megabyte copy now takes well under a second.
+#[test]
+fn a_snapshot_and_its_restore_copy_megabytes_at_once() {
+    let root = temp_root("snap-speed");
+    let db = root.join("big.db");
+    {
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch("CREATE TABLE blobs (b BLOB); PRAGMA page_size = 4096;").unwrap();
+        let chunk = vec![7u8; 4000];
+        for _ in 0..2000 {
+            conn.execute("INSERT INTO blobs (b) VALUES (?1)", [&chunk]).unwrap();
+        }
+    }
+    let pages: i64 = Connection::open(&db).unwrap().query_row("PRAGMA page_count", [], |r| r.get(0)).unwrap();
+    assert!(pages >= 2000, "{pages} pages: the paced copy would take 40 s");
+
+    let started = std::time::Instant::now();
+    snapshot(&db, &root.join("snap.db")).unwrap();
+    restore(&root.join("snap.db"), &root.join("restored.db")).unwrap();
+    let took = started.elapsed();
+    assert!(took < std::time::Duration::from_secs(10), "snapshot and restore took {took:?}");
+    let rows: i64 = Connection::open(root.join("restored.db"))
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM blobs", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(rows, 2000);
+    let _ = std::fs::remove_dir_all(&root);
+}
