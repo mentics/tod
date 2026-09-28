@@ -42,7 +42,7 @@ use gpui_component::{ActiveTheme, Disableable, IconName, Sizable};
 use tod_core::attention::{AttentionItem, AttentionKind, RequestReason};
 use tod_core::conversation::implement::HandoffAnswer;
 use tod_journey::{Presented, PresentedAction};
-use tod_store::conversation::{ConversationRepo, Focus};
+use tod_store::conversation::{ConversationRepo, Focus, ProtocolKind};
 use tod_store::decisions::{DECISION_PENDING, Decision, DecisionAnswer, DecisionRepo, EvidenceRef};
 use tod_store::fleet::FleetStore;
 use tod_store::interview::{ACTOR_USER, InterviewCommand, short_id};
@@ -1183,6 +1183,8 @@ impl Requests {
             self.fleet.clone(),
             agent,
             config,
+            ProtocolKind::Outline,
+            Focus::Node(item.node_id),
             Some(conversation),
             running,
             window,

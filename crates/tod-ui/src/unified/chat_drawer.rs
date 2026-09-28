@@ -124,8 +124,6 @@ pub struct ChatDrawer {
     sessions_open: bool,
     /// Bumped on every sessions load so an older one never lands last.
     sessions_generation: u64,
-    /// Whether the conversation has an agent session to continue elsewhere.
-    has_session: bool,
     status: ConversationStatus,
     /// The line above the transcript: platform, model, effort, and tokens.
     session_info: SessionInfo,
@@ -172,7 +170,6 @@ impl ChatDrawer {
             sessions: Vec::new(),
             sessions_open: false,
             sessions_generation: 0,
-            has_session: false,
             status: ConversationStatus::default(),
             session_info: SessionInfo::default(),
             error: None,
@@ -357,6 +354,8 @@ impl ChatDrawer {
                     self.fleet.clone(),
                     self.agent.clone(),
                     self.driver_config(),
+                    FREEFORM,
+                    self.focus,
                     self.conversation_id,
                     self.status.running,
                     window,
@@ -573,15 +572,7 @@ impl ChatDrawer {
         if self.status.running && !self.status.parts.is_empty() {
             entries.push(Entry::live_reply(self.status.parts.clone()));
         }
-        self.has_session = self.conversation_id.is_some_and(|id| {
-            self.fleet
-                .read(|conn| ConversationRepo::new(conn).get(id))
-                .ok()
-                .flatten()
-                .is_some_and(|c| c.agent_session_id.is_some())
-        });
-        let tools =
-            terminal_handoff::tools(self.focus.node_id(), self.has_session, self.status.running);
+        let tools = terminal_handoff::tools(self.focus.node_id(), self.status.running);
         let running = self.status.running;
         let activity = self.status.activity.clone();
         let about = self.about.clone();
