@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Current fleet schema epoch stored in `PRAGMA user_version`.
-pub const CURRENT_USER_VERSION: i32 = 74;
+pub const CURRENT_USER_VERSION: i32 = 75;
 
 const BUSY_TIMEOUT_MS: i64 = 5000;
 
@@ -475,6 +475,12 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
         conn.execute_batch("DROP TRIGGER IF EXISTS trg_buildable_reset;")?;
         conn.pragma_update(None, "user_version", 74)?;
     }
+    if version < 75 {
+        // Files settings become a recipe for each node's own worktree or
+        // sandbox (`crate::fleet::repos::files_location`).
+        migrate_v74_to_v75(conn)?;
+        conn.pragma_update(None, "user_version", 75)?;
+    }
     // Other branches (the task panel) numbered their own steps 66–67 at the
     // same time as 66–70 above, so a store may be past a version without
     // having these. Every one is idempotent: make sure of them all.
@@ -840,6 +846,30 @@ fn migrate_v57_to_v58(conn: &Connection) -> Result<()> {
             ))?;
         }
     }
+    Ok(())
+}
+
+/// Files settings make each node a worktree or sandbox of its own: a sandbox
+/// recipe says what each node's is made from (`sandbox_source` 'image' or
+/// 'fork', and `sandbox_from`), and the locations already made move to
+/// `node_files_locations`.
+fn migrate_v74_to_v75(conn: &Connection) -> Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    for (column, ddl) in [
+        ("sandbox_source", "TEXT NOT NULL DEFAULT 'image'"),
+        ("sandbox_from", "TEXT NOT NULL DEFAULT ''"),
+    ] {
+        let present = tx
+            .prepare("SELECT 1 FROM pragma_table_info('node_files') WHERE name = ?1")?
+            .exists([column])?;
+        if !present {
+            tx.execute_batch(&format!("ALTER TABLE node_files ADD COLUMN {column} {ddl};"))?;
+        }
+    }
+    tx.execute_batch(crate::fleet::repos::files_location::CREATE_TABLE)?;
+    tx.execute_batch(&crate::journey_changes::files_locations_triggers_sql())?;
+    crate::fleet::repos::files_location::migrate_from_node_files(&tx)?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -4054,14 +4084,23 @@ mod tests {
             .unwrap();
         assert_eq!(version, CURRENT_USER_VERSION);
 
-        let (use_worktree, worktree_path): (i64, Option<String>) = conn
+        let use_worktree: i64 = conn
             .query_row(
-                "SELECT use_worktree, worktree_path FROM node_files WHERE node_id = ?1",
+                "SELECT use_worktree FROM node_files WHERE node_id = ?1",
                 params![node],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| row.get(0),
             )
             .unwrap();
-        assert_eq!((use_worktree, worktree_path.as_deref()), (1, Some("/wt")));
+        assert_eq!(use_worktree, 1);
+        // v75 made the set-up worktree the node's location.
+        let worktree_path: Option<String> = conn
+            .query_row(
+                "SELECT worktree_path FROM node_files_locations WHERE node_id = ?1",
+                params![node],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(worktree_path.as_deref(), Some("/wt"));
         let (platform, model, effort): (String, String, String) = conn
             .query_row(
                 "SELECT platform, model, effort FROM node_agent WHERE node_id = ?1",

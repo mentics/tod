@@ -266,7 +266,7 @@ pub fn runs_in(dev: &Option<crate::fleet::repos::node_files::DevContainerSetting
         Some(dev) => {
             let container = dev.container().unwrap_or("(none chosen)");
             if dev.sandbox {
-                format!("cloud sandbox {container}")
+                format!("a cloud sandbox per node, from {}", dev.sandbox_from.describe())
             } else if dev.repo_on_host {
                 format!("dev container {container}, mounted")
             } else {

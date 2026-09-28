@@ -795,6 +795,34 @@ pub fn open_shell_for_node(
     startup_command: Option<&str>,
 ) -> Result<(String, Workdir)> {
     let cwd = resolve_launch_cwd(fleet, node_id)?;
+    open_shell_at(fleet, paths, settings, node_id, cwd, startup_command)
+}
+
+/// Open a shell in the worktree or sandbox made for the node, whether or not
+/// its Files settings still resolve to it: how the user settles uncommitted
+/// work before it is removed.
+pub fn open_shell_in_location(
+    fleet: &FleetStore,
+    paths: &TodPaths,
+    settings: &TodSettings,
+    node_id: &str,
+) -> Result<(String, Workdir)> {
+    let location = crate::fleet::provision::node_location(fleet, node_id)?
+        .context("This node has no worktree or sandbox of its own")?;
+    let cwd = location
+        .directory()
+        .context("This node's worktree or sandbox has no directory recorded")?;
+    open_shell_at(fleet, paths, settings, node_id, cwd, None)
+}
+
+fn open_shell_at(
+    fleet: &FleetStore,
+    paths: &TodPaths,
+    settings: &TodSettings,
+    node_id: &str,
+    cwd: Workdir,
+    startup_command: Option<&str>,
+) -> Result<(String, Workdir)> {
     let terminal = fresh_terminal_settings(paths, &settings.terminal);
     let assets = ensure_shell_init_assets(paths)?;
     let shell_id = uuid::Uuid::new_v4().to_string();

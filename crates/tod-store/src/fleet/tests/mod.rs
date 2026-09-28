@@ -562,29 +562,32 @@ fn capability_disable_blockers_reflect_running_work() {
         .enqueue(FleetMutation::DismissShellSession { id: shell_id })
         .unwrap();
 
-    // So does a set-up worktree.
+    // So does a node's worktree made from its settings.
     store
-        .enqueue(FleetMutation::UpdateNodeWorktree {
-            node_id: task_id.clone(),
-            worktree_path: Some("/wt/blocker".into()),
-            worktree_lease_id: None,
-            worktree_lease_holder: None,
+        .enqueue(FleetMutation::RecordFilesLocation {
+            location: crate::fleet::FilesLocation {
+                node_id: task_id.clone(),
+                source_node_id: task_id.clone(),
+                recipe: String::new(),
+                repo: None,
+                container: None,
+                worktree_path: Some("/wt/blocker".into()),
+                worktree_lease_id: None,
+                worktree_lease_holder: None,
+                sandbox: None,
+                created_at: 0,
+            },
         })
         .unwrap();
     store.writer().flush().unwrap();
     let reason = store
         .capability_disable_blocker(&task_id, Capability::Files)
         .unwrap()
-        .expect("set-up worktree should block disabling Files");
-    assert!(reason.contains("worktree"));
+        .expect("a location made from its settings should block disabling Files");
+    assert!(reason.contains("worktree or sandbox"));
 
     store
-        .enqueue(FleetMutation::UpdateNodeWorktree {
-            node_id: task_id.clone(),
-            worktree_path: None,
-            worktree_lease_id: None,
-            worktree_lease_holder: None,
-        })
+        .enqueue(FleetMutation::DeleteFilesLocation { node_id: task_id.clone() })
         .unwrap();
     store.writer().flush().unwrap();
     assert!(
@@ -599,7 +602,7 @@ fn capability_disable_blockers_reflect_running_work() {
 }
 
 #[test]
-fn worktree_release_blocker_reflects_running_shells_and_agents() {
+fn location_blocker_reflects_running_shells_and_agents() {
     let root = temp_fleet_root();
     let store = FleetStore::open(&root).unwrap();
     let task_id = uuid::Uuid::new_v4().to_string();
@@ -617,7 +620,7 @@ fn worktree_release_blocker_reflects_running_shells_and_agents() {
         })
         .unwrap();
     store.writer().flush().unwrap();
-    assert!(store.worktree_release_blocker(&task_id).unwrap().is_none());
+    assert!(store.location_blocker(&task_id).unwrap().is_none());
 
     // A shell that's no longer running doesn't block; a running one does.
     store
@@ -628,7 +631,7 @@ fn worktree_release_blocker_reflects_running_shells_and_agents() {
         })
         .unwrap();
     store.writer().flush().unwrap();
-    assert!(store.worktree_release_blocker(&task_id).unwrap().is_none());
+    assert!(store.location_blocker(&task_id).unwrap().is_none());
 
     let live_shell = uuid::Uuid::new_v4().to_string();
     store
@@ -640,7 +643,7 @@ fn worktree_release_blocker_reflects_running_shells_and_agents() {
         .unwrap();
     store.writer().flush().unwrap();
     let reason = store
-        .worktree_release_blocker(&task_id)
+        .location_blocker(&task_id)
         .unwrap()
         .expect("running shell should block release");
     assert!(reason.contains("1 shell"));
@@ -648,7 +651,7 @@ fn worktree_release_blocker_reflects_running_shells_and_agents() {
         .enqueue(FleetMutation::DismissShellSession { id: live_shell })
         .unwrap();
     store.writer().flush().unwrap();
-    assert!(store.worktree_release_blocker(&task_id).unwrap().is_none());
+    assert!(store.location_blocker(&task_id).unwrap().is_none());
 
     // An agent at work blocks until it ends.
     let run_id = format!("{task_id}-run-1");
@@ -668,7 +671,7 @@ fn worktree_release_blocker_reflects_running_shells_and_agents() {
         .unwrap();
     store.writer().flush().unwrap();
     let reason = store
-        .worktree_release_blocker(&task_id)
+        .location_blocker(&task_id)
         .unwrap()
         .expect("working agent should block release");
     assert!(reason.contains("1 agent"));
@@ -676,7 +679,7 @@ fn worktree_release_blocker_reflects_running_shells_and_agents() {
         .enqueue(FleetMutation::EndAgentRun { run_id })
         .unwrap();
     store.writer().flush().unwrap();
-    assert!(store.worktree_release_blocker(&task_id).unwrap().is_none());
+    assert!(store.location_blocker(&task_id).unwrap().is_none());
 
     drop(store);
     cleanup_fleet_root(&root);

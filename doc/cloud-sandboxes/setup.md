@@ -158,32 +158,35 @@ reinstalls what changed in place, so a rebake is optional.
 ## A node's work in a sandbox
 
 In the task editor, a node's **Files** section has **Runs in**, which cycles
-through *This machine*, *Dev container*, and *Cloud sandbox*. Choose *Cloud
-sandbox*, pick a sandbox from the list (every sandbox in the workspace, with
-its status, image, and owner), and give the workspace directory as a path in
-the sandbox (`/root/app`).
+through *This machine*, *Dev container*, and *Cloud sandbox*. With *Cloud
+sandbox*, the node and every node under it that does not set Files itself
+each get **a sandbox of their own**, made the first time the node needs its
+files (a turn, a shell, an editor). There is nothing to create by hand.
 
-To make a new one there, use **New sandbox** below the list. **Start from**
-chooses between *An image* (a cold start; empty uses the default image from
-Settings) and *A fork of a sandbox* (pick which one; see **Forks** above).
-The name defaults to the node's slug. **Create and use it** makes the
-sandbox, installs what agents need, and selects it for the node; a baked
-image takes seconds, any other image a minute or more. tod checks the
-directory there, which wakes the sandbox. An agent can set the same thing:
+**Each node's sandbox starts from** chooses between *An image* (a cold
+start; empty uses the default image from Settings) and *A fork of a sandbox*
+(pick one from the list of the workspace's sandboxes; see **Forks** above).
+Either way it must already hold the repository: give the workspace directory
+as its path there (`/root/app`). A baked image takes seconds, any other image
+a minute or more. Each sandbox is named after its node and checks out the
+node's own branch (`task/<slug>` unless set). See
+[../files-locations.md](../files-locations.md) for how these are kept and
+removed. An agent can set the same thing:
 
 ```sh
-tod-cli capabilities set <node> files --sandbox <name> --dir /root/app
+tod-cli capabilities set <node> files --sandbox image --dir /root/app
+tod-cli capabilities set <node> files --sandbox fork:<name> --dir /root/app
 tod-cli capabilities set <node> files --sandbox ''     # back to this machine
 ```
 
-**Sign in to Claude in the sandbox once**, before the first turn:
+**Claude must be signed in** in each sandbox before its first turn. tod
+never copies credentials into a sandbox, so the simplest way is to sign in
+once in a sandbox that holds the repository and have every node fork it:
 
 ```sh
 tod-sandbox shell <name>
 claude /login
 ```
-
-tod never copies credentials into a sandbox.
 
 From then on, the node runs in the sandbox:
 - **Git and worktrees** run in the sandbox.

@@ -41,7 +41,7 @@ use tod_store::fleet::{
     AgentRun, FilesDirectory, FleetMutation, FleetStore, ResolvedAgent, ResolvedFiles, code_editor,
     code_editors, open_code_editor_for_node, reconnect_identity,
 };
-use tod_store::fleet::Workdir;
+use tod_store::fleet::{Workdir, resolve_launch_cwd};
 use tod_store::{AgentLaunchOptions, AgentPlatform, AgentRole};
 
 const ACTION_PANEL_CONTEXT: &str = "ActionPanel";
@@ -251,9 +251,7 @@ impl ActionPanelView {
         match self.files.as_ref().map(ResolvedFiles::directory) {
             None => Some("Enable Files and set a workspace directory to launch here.".into()),
             Some(FilesDirectory::Ready(_)) => None,
-            Some(FilesDirectory::NeedsWorktreeSetup) => {
-                Some("Set up the worktree in the node's Files section to launch here.".into())
-            }
+            Some(FilesDirectory::NotMade) => None,
             Some(FilesDirectory::Missing(reason)) => Some(reason),
         }
     }
@@ -387,17 +385,51 @@ impl ActionPanelView {
         }
     }
 
-    /// Start an autonomous background agent in the node's directory.
+    /// Start an autonomous background agent in the node's directory, making
+    /// the node's worktree or sandbox first (off the UI thread) when it has
+    /// none yet.
     fn launch_auto_run(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(task_id) = self.task_id.clone() else {
             return;
         };
-        let Some(cwd) = self.ready_directory() else {
-            if let Some(reason) = self.launch_blocker() {
-                error_toast(window, cx, reason);
-            }
+        if let Some(reason) = self.launch_blocker() {
+            error_toast(window, cx, reason);
             return;
-        };
+        }
+        if let Some(cwd) = self.ready_directory() {
+            self.launch_auto_run_in(task_id, cwd, window, cx);
+            return;
+        }
+        self.status_message = "Making this node's files…".into();
+        cx.notify();
+        let fleet = self.fleet.clone();
+        let node = task_id.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let made = cx
+                .background_executor()
+                .spawn(async move { resolve_launch_cwd(&fleet, &node) })
+                .await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.reload();
+                match made {
+                    Ok(cwd) => this.launch_auto_run_in(task_id, cwd, window, cx),
+                    Err(err) => {
+                        this.changed(String::new(), cx);
+                        error_toast(window, cx, format!("Launch agent failed: {err:#}"));
+                    }
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn launch_auto_run_in(
+        &mut self,
+        task_id: String,
+        cwd: Workdir,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let task = match self.fleet.get_node(&task_id) {
             Ok(Some(task)) => task,
             _ => {
@@ -802,7 +834,10 @@ impl ActionPanelView {
                 Some(container) => format!("{path} · runs in dev container {container}"),
                 None => path.to_string(),
             },
-            Some(FilesDirectory::NeedsWorktreeSetup) => "Worktree not set up".to_string(),
+            Some(FilesDirectory::NotMade) => format!(
+                "{} for this node, made when something first needs it",
+                self.files.as_ref().map(ResolvedFiles::describe_recipe).unwrap_or_default()
+            ),
             Some(FilesDirectory::Missing(reason)) => reason,
             None => "Files not enabled — chat runs in the data root".to_string(),
         };
@@ -840,7 +875,7 @@ impl ActionPanelView {
 
     fn render_agents(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let muted = cx.theme().muted_foreground;
-        let can_launch = self.ready_directory().is_some();
+        let can_launch = self.launch_blocker().is_none();
         let options = self.agent_launch_options(AgentRole::Default);
         let agent_summary = format!(
             "{} · {} · {}",
@@ -994,7 +1029,7 @@ impl ActionPanelView {
     }
 
     fn render_shells(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let can_launch = self.ready_directory().is_some();
+        let can_launch = self.launch_blocker().is_none();
         Self::render_section("Shells", cx)
             .when(self.shells.is_empty(), |col| {
                 col.child(Self::render_hint("No shells yet.", cx))
@@ -1052,7 +1087,7 @@ impl ActionPanelView {
     }
 
     fn render_code_editors(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let can_launch = self.ready_directory().is_some();
+        let can_launch = self.launch_blocker().is_none();
         Self::render_section("Code editors", cx).child(
             h_flex()
                 .gap_2()

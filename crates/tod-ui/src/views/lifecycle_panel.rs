@@ -1037,7 +1037,7 @@ impl LifecyclePanelView {
     /// Where implementation would run: the node needs a resolved Agent and a
     /// ready Files directory — what the `ready` → `active` gate requires
     /// (`tod_core::gate::derived`). `Err` carries the user-facing reason.
-    fn implement_directory(&self) -> Result<tod_store::fleet::Workdir, String> {
+    fn implement_directory(&self) -> Result<Option<tod_store::fleet::Workdir>, String> {
         let Some(task_id) = self.task_id.as_ref() else {
             return Err(String::new());
         };
@@ -1901,7 +1901,11 @@ impl Render for LifecyclePanelView {
                             .and_then(|id| self.implement_status.get(id))
                             .cloned();
                         let (directory, blocked) = match self.implement_directory() {
-                            Ok(dir) => (format!("Runs in {dir}"), false),
+                            Ok(Some(dir)) => (format!("Runs in {dir}"), false),
+                            Ok(None) => (
+                                "Its own worktree or sandbox is made when it starts.".to_string(),
+                                false,
+                            ),
                             Err(reason) => (reason, true),
                         };
                         let progress = if remaining == 0 {

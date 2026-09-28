@@ -2,8 +2,15 @@
 //!
 //! Both inherit from the nearest ancestor (or the node itself) that has the
 //! capability enabled; nodes between them without the capability are skipped.
+//!
+//! Files settings are a recipe. When they call for a worktree or a sandbox,
+//! every node that resolves to them works in one of its own, made the first
+//! time it needs its files ([`crate::fleet::provision::resolve_launch_cwd`])
+//! and recorded as its location ([`crate::fleet::repos::files_location`]).
+//! Otherwise every such node shares the workspace directory.
 
 use crate::agent_launch::AgentLaunchOptions;
+use crate::fleet::repos::files_location::{FilesLocation, FilesLocationRepo, recipe_key};
 use crate::fleet::repos::node_agent::{NodeAgent, NodeAgentRepo};
 use crate::fleet::repos::node_files::{DevContainerSetting, NodeFilesRepo};
 use crate::fleet::workdir::Workdir;
@@ -14,37 +21,48 @@ use crate::settings::{AgentRole, TodSettings};
 use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension, params};
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use uuid::Uuid;
 
-/// Files capability values for a node, possibly inherited.
+/// Files capability values for a node, possibly inherited, and the location
+/// made for that node from them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedFiles {
+    /// The node these were resolved for.
+    pub node_id: String,
     /// Node that owns the Files capability (the node itself unless inherited).
     pub source_node_id: String,
     pub source_title: String,
     pub inherited: bool,
-    /// Workspace directory (`node_fields.repo`).
+    /// Workspace directory (`node_fields.repo` of the source).
     pub repo: Option<String>,
+    /// The branch this node's work is on: its own `node_fields.branch` when
+    /// it gets a location of its own ([`Self::per_node`]), else the source's.
     pub branch: Option<String>,
+    /// Each node works in a worktree of its own (not with a sandbox, which
+    /// is already its own).
     pub use_worktree: bool,
-    pub worktree_path: Option<String>,
-    pub worktree_lease_id: Option<String>,
-    pub worktree_lease_holder: Option<String>,
-    /// Set when launches run in a dev container or cloud sandbox. When the
-    /// repository lives in it, `repo` and `worktree_path` are paths there;
-    /// when it is mounted from this machine they stay host paths, and the
+    /// Set when launches run in a dev container or cloud sandboxes. When the
+    /// repository lives in it, `repo` and worktrees are paths there; when it
+    /// is mounted from this machine they stay host paths, and the
     /// container's own is resolved against the running container at launch
     /// (see [`crate::fleet::dev_container`]).
     pub dev_container: Option<DevContainerSetting>,
+    /// This node's location, made from these settings.
+    pub location: Option<FilesLocation>,
+    /// A location this node has that was made from other settings (they
+    /// changed since, or it now resolves to another node's): never used,
+    /// only removed.
+    pub stale_location: Option<FilesLocation>,
 }
 
 /// Where launches from a node run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FilesDirectory {
     Ready(Workdir),
-    /// Worktree flag on, but no worktree has been set up (or it's gone).
-    NeedsWorktreeSetup,
+    /// The node gets a worktree or sandbox of its own, not made yet: the
+    /// first launch makes it.
+    NotMade,
     /// No usable directory; the reason is user-facing.
     Missing(String),
 }
@@ -82,9 +100,48 @@ impl ResolvedFiles {
         self.repo().filter(|repo| is_remote_url(repo))
     }
 
-    /// A worktree has been set up and recorded.
+    /// Each node works in a cloud sandbox of its own.
+    pub fn runs_in_sandbox(&self) -> bool {
+        self.dev_container.as_ref().is_some_and(|dev| dev.sandbox)
+    }
+
+    /// Whether each node gets a location of its own (a worktree or a
+    /// sandbox), rather than sharing the workspace directory.
+    pub fn per_node(&self) -> bool {
+        self.runs_in_sandbox() || self.use_worktree
+    }
+
+    /// What each node gets from these settings, in a phrase
+    /// ("a sandbox from image X", "a worktree in container Y").
+    pub fn describe_recipe(&self) -> String {
+        match &self.dev_container {
+            Some(dev) if dev.sandbox => {
+                format!("a cloud sandbox from {}", dev.sandbox_from.describe())
+            }
+            Some(dev) => {
+                let container = dev.container().unwrap_or("(none chosen)");
+                match (self.use_worktree, dev.repo_on_host) {
+                    (true, true) => format!("a worktree, run in dev container {container}"),
+                    (true, false) => format!("a worktree in dev container {container}"),
+                    (false, _) => format!("the workspace directory in dev container {container}"),
+                }
+            }
+            None if self.use_worktree => "a worktree on this machine".into(),
+            None => "the workspace directory on this machine".into(),
+        }
+    }
+
+    /// The fingerprint of these settings a location is made from.
+    pub fn recipe_key(&self) -> String {
+        recipe_key(self.repo(), self.use_worktree, self.dev_container.as_ref())
+    }
+
+    /// This node's worktree, when it has one.
     pub fn worktree_path(&self) -> Option<&str> {
-        non_empty(&self.worktree_path)
+        self.location
+            .as_ref()
+            .filter(|_| !self.runs_in_sandbox())
+            .and_then(FilesLocation::worktree_path)
     }
 
     /// The dev container the repository lives in, when it lives in one.
@@ -94,11 +151,12 @@ impl ResolvedFiles {
             .and_then(DevContainerSetting::repo_container)
     }
 
-    /// The cloud sandbox the repository lives in, when it lives in one.
+    /// This node's cloud sandbox, once it has been made.
     pub fn repo_sandbox(&self) -> Option<&str> {
-        self.dev_container
-            .as_ref()
-            .and_then(DevContainerSetting::repo_sandbox)
+        if !self.runs_in_sandbox() {
+            return None;
+        }
+        self.location.as_ref().and_then(FilesLocation::sandbox)
     }
 
     /// The repository is not on this machine.
@@ -109,7 +167,7 @@ impl ResolvedFiles {
     }
 
     /// `path` (the workspace directory or worktree) where it is: in the
-    /// repository's container or sandbox, else on this machine.
+    /// repository's container or this node's sandbox, else on this machine.
     pub fn workdir(&self, path: &str) -> Workdir {
         if let Some(container) = self.repo_container() {
             return Workdir::container(container, path);
@@ -120,54 +178,77 @@ impl ResolvedFiles {
         Workdir::host(path)
     }
 
-    /// The workspace directory, where it is.
+    /// The workspace directory, where it is. `None` for a sandbox not made
+    /// yet: there is no machine to find it on.
     pub fn repo_dir(&self) -> Option<Workdir> {
+        if self.runs_in_sandbox() && self.repo_sandbox().is_none() {
+            return None;
+        }
         self.repo().map(|repo| self.workdir(repo))
     }
 
-    /// The set-up worktree, where it is.
+    /// This node's worktree, where it is.
     pub fn worktree_dir(&self) -> Option<Workdir> {
         self.worktree_path().map(|path| self.workdir(path))
     }
 
-    /// The resolved directory: the worktree when enabled, else the workspace
-    /// directory. With the repository mounted into a dev container, the host
-    /// side of it. One inside a container or sandbox is not checked here
-    /// (that takes Docker, or the network); a launch into a missing one fails.
+    /// Why no location can be made from these settings yet (user-facing).
+    pub fn incomplete(&self) -> Option<String> {
+        if let Some(dev) = &self.dev_container {
+            if dev.sandbox {
+                if let Some(reason) = dev.sandbox_from.incomplete() {
+                    return Some(reason.into());
+                }
+            } else if dev.container().is_none() {
+                return Some("Choose a dev container".into());
+            }
+        }
+        let Some(repo) = self.repo() else {
+            return Some("Set a workspace directory".into());
+        };
+        let remote = if self.runs_in_sandbox() {
+            Some(("the sandbox", "/root/app"))
+        } else {
+            self.repo_container().map(|_| ("the dev container", "/workspaces/app"))
+        };
+        if let Some((place, example)) = remote {
+            if !repo.starts_with('/') {
+                return Some(format!(
+                    "The workspace directory is inside {place}: give its path there, like {example}"
+                ));
+            }
+        }
+        None
+    }
+
+    /// The resolved directory: this node's worktree or sandbox when it gets
+    /// one, else the workspace directory. With the repository mounted into
+    /// a dev container, the host side of it. One inside a container or
+    /// sandbox is not checked here (that takes Docker, or the network); a
+    /// launch into a missing one fails.
     pub fn directory(&self) -> FilesDirectory {
-        if let Some(dev) = self.dev_container.as_ref().filter(|dev| dev.container().is_none()) {
-            let what = if dev.sandbox { "Choose a cloud sandbox" } else { "Choose a dev container" };
-            return FilesDirectory::Missing(what.into());
+        if let Some(reason) = self.incomplete() {
+            return FilesDirectory::Missing(reason);
         }
         let Some(repo) = self.repo() else {
             return FilesDirectory::Missing("Set a workspace directory".into());
         };
-        let remote = self
-            .repo_container()
-            .map(|c| (format!("dev container {c}"), "/workspaces/app"))
-            .or_else(|| self.repo_sandbox().map(|s| (format!("sandbox {s}"), "/root/app")));
-        if let Some((place, example)) = remote {
-            if !repo.starts_with('/') {
-                return FilesDirectory::Missing(format!(
-                    "The workspace directory is inside {place}: \
-                     give its path there, like {example}"
-                ));
-            }
-            if self.use_worktree {
-                return match self.worktree_dir() {
-                    Some(dir) => FilesDirectory::Ready(dir),
-                    None => FilesDirectory::NeedsWorktreeSetup,
-                };
-            }
-            return FilesDirectory::Ready(self.workdir(repo));
+        if self.runs_in_sandbox() {
+            return match self.repo_sandbox() {
+                Some(_) => FilesDirectory::Ready(self.workdir(repo)),
+                None => FilesDirectory::NotMade,
+            };
         }
         if self.use_worktree {
-            return match self.worktree_path() {
-                Some(path) if Path::new(path).is_dir() => {
-                    FilesDirectory::Ready(Workdir::host(path))
+            return match self.worktree_dir() {
+                Some(dir) if self.repo_container().is_some() || dir.is_dir() => {
+                    FilesDirectory::Ready(dir)
                 }
-                _ => FilesDirectory::NeedsWorktreeSetup,
+                _ => FilesDirectory::NotMade,
             };
+        }
+        if self.repo_container().is_some() {
+            return FilesDirectory::Ready(self.workdir(repo));
         }
         let path = PathBuf::from(repo);
         if path.is_dir() {
@@ -242,27 +323,47 @@ pub fn resolve_files_for_node(conn: &Connection, node_id: &str) -> Result<Option
         return Ok(None);
     };
     let source_node_id = source.to_string();
-    let (repo, branch): (Option<String>, Option<String>) = conn
-        .query_row(
-            "SELECT repo, branch FROM node_fields WHERE node_id = ?1",
-            params![uuid_to_blob(source)],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .optional()?
-        .unwrap_or_default();
+    let fields = |id: Uuid| -> Result<(Option<String>, Option<String>)> {
+        Ok(conn
+            .query_row(
+                "SELECT repo, branch FROM node_fields WHERE node_id = ?1",
+                params![uuid_to_blob(id)],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?
+            .unwrap_or_default())
+    };
+    let (repo, source_branch) = fields(source)?;
     let files = NodeFilesRepo::new(conn).get(&source_node_id)?;
-    Ok(Some(ResolvedFiles {
+    let mut resolved = ResolvedFiles {
+        node_id: node_id.to_string(),
         source_title,
         inherited,
         repo,
-        branch,
+        branch: source_branch,
         use_worktree: files.as_ref().is_some_and(|f| f.use_worktree),
-        worktree_path: files.as_ref().and_then(|f| f.worktree_path.clone()),
-        worktree_lease_id: files.as_ref().and_then(|f| f.worktree_lease_id.clone()),
-        worktree_lease_holder: files.as_ref().and_then(|f| f.worktree_lease_holder.clone()),
         dev_container: files.and_then(|f| f.dev_container),
+        location: None,
+        stale_location: None,
         source_node_id,
-    }))
+    };
+    if resolved.per_node() && inherited {
+        resolved.branch = match Uuid::parse_str(node_id) {
+            Ok(id) => fields(id)?.1,
+            Err(_) => None,
+        };
+    }
+    if let Some(location) = FilesLocationRepo::new(conn).get(node_id)? {
+        let current = resolved.per_node()
+            && location.source_node_id == resolved.source_node_id
+            && location.recipe == resolved.recipe_key();
+        if current {
+            resolved.location = Some(location);
+        } else {
+            resolved.stale_location = Some(location);
+        }
+    }
+    Ok(Some(resolved))
 }
 
 pub fn resolve_agent_for_node(conn: &Connection, node_id: &str) -> Result<Option<ResolvedAgent>> {
@@ -593,31 +694,53 @@ mod tests {
         cleanup_fleet_root(&tree.root);
     }
 
-    #[test]
-    fn directory_reflects_worktree_state() {
-        let dir = std::env::temp_dir();
-        let mut files = ResolvedFiles {
+    fn resolved(repo: &str, dev: Option<DevContainerSetting>) -> ResolvedFiles {
+        ResolvedFiles {
+            node_id: Uuid::new_v4().to_string(),
             source_node_id: Uuid::new_v4().to_string(),
             source_title: "N".into(),
             inherited: false,
-            repo: None,
+            repo: Some(repo.into()),
             branch: None,
             use_worktree: false,
-            worktree_path: None,
+            dev_container: dev,
+            location: None,
+            stale_location: None,
+        }
+    }
+
+    fn location_at(files: &ResolvedFiles, worktree: Option<&str>, sandbox: Option<&str>) -> FilesLocation {
+        FilesLocation {
+            node_id: files.node_id.clone(),
+            source_node_id: files.source_node_id.clone(),
+            recipe: files.recipe_key(),
+            repo: files.repo.clone(),
+            container: files.repo_container().map(str::to_string),
+            worktree_path: worktree.map(str::to_string),
             worktree_lease_id: None,
             worktree_lease_holder: None,
-            dev_container: None,
-        };
+            sandbox: sandbox.map(str::to_string),
+            created_at: 1,
+        }
+    }
+
+    #[test]
+    fn directory_reflects_worktree_state() {
+        let dir = std::env::temp_dir();
         let host = Workdir::host(&dir);
+        let mut files = resolved("", None);
+        files.repo = None;
         assert!(matches!(files.directory(), FilesDirectory::Missing(_)));
         files.repo = Some(dir.display().to_string());
         assert_eq!(files.directory(), FilesDirectory::Ready(host.clone()));
         files.use_worktree = true;
-        assert_eq!(files.directory(), FilesDirectory::NeedsWorktreeSetup);
-        files.worktree_path = Some(dir.display().to_string());
+        assert_eq!(files.directory(), FilesDirectory::NotMade);
+        files.location = Some(location_at(&files, Some(&dir.display().to_string()), None));
         assert_eq!(files.directory(), FilesDirectory::Ready(host.clone()));
 
         // A dev container needs one chosen; mounted, the directory stays the host's.
+        files.use_worktree = false;
+        files.location = None;
         files.dev_container = Some(DevContainerSetting::default());
         assert_eq!(
             files.directory(),
@@ -633,21 +756,8 @@ mod tests {
 
     #[test]
     fn a_repository_in_a_dev_container_is_a_container_path() {
-        let mut files = ResolvedFiles {
-            source_node_id: Uuid::new_v4().to_string(),
-            source_title: "N".into(),
-            inherited: false,
-            repo: Some(r"C:\not\there".into()),
-            branch: None,
-            use_worktree: false,
-            worktree_path: None,
-            worktree_lease_id: None,
-            worktree_lease_holder: None,
-            dev_container: Some(DevContainerSetting {
-                container: Some("dev".into()),
-                ..Default::default()
-            }),
-        };
+        let dev = DevContainerSetting { container: Some("dev".into()), ..Default::default() };
+        let mut files = resolved(r"C:\not\there", Some(dev));
         assert!(matches!(files.directory(), FilesDirectory::Missing(_)));
         files.repo = Some("/workspaces/app".into());
         assert_eq!(
@@ -655,8 +765,8 @@ mod tests {
             FilesDirectory::Ready(Workdir::container("dev", "/workspaces/app"))
         );
         files.use_worktree = true;
-        assert_eq!(files.directory(), FilesDirectory::NeedsWorktreeSetup);
-        files.worktree_path = Some("/workspaces/app/.worktrees/x".into());
+        assert_eq!(files.directory(), FilesDirectory::NotMade);
+        files.location = Some(location_at(&files, Some("/workspaces/app/.worktrees/x"), None));
         assert_eq!(
             files.directory(),
             FilesDirectory::Ready(Workdir::container("dev", "/workspaces/app/.worktrees/x"))
@@ -664,40 +774,94 @@ mod tests {
     }
 
     #[test]
-    fn a_repository_in_a_sandbox_is_a_sandbox_path() {
-        let mut files = ResolvedFiles {
-            source_node_id: Uuid::new_v4().to_string(),
-            source_title: "N".into(),
-            inherited: false,
-            repo: Some("/root/app".into()),
-            branch: None,
-            use_worktree: false,
-            worktree_path: None,
-            worktree_lease_id: None,
-            worktree_lease_holder: None,
-            dev_container: Some(DevContainerSetting {
-                sandbox: true,
-                ..Default::default()
-            }),
-        };
-        assert_eq!(
-            files.directory(),
-            FilesDirectory::Missing("Choose a cloud sandbox".into())
-        );
-        files.dev_container = Some(DevContainerSetting {
-            container: Some("dev".into()),
-            // Ignored for a sandbox: the repository is always in it.
-            repo_on_host: true,
-            sandbox: true,
-        });
+    fn each_node_gets_its_own_sandbox() {
+        let dev = DevContainerSetting { sandbox: true, ..Default::default() };
+        let mut files = resolved("/root/app", Some(dev));
+        assert!(files.per_node());
         assert!(files.repo_is_remote());
+        assert_eq!(files.directory(), FilesDirectory::NotMade);
+        assert_eq!(files.repo_dir(), None, "no sandbox to find it in yet");
+        files.location = Some(location_at(&files, None, Some("tod-x")));
         assert_eq!(files.repo_container(), None);
-        assert_eq!(
-            files.directory(),
-            FilesDirectory::Ready(Workdir::sandbox("dev", "/root/app"))
-        );
+        assert_eq!(files.directory(), FilesDirectory::Ready(Workdir::sandbox("tod-x", "/root/app")));
         files.repo = Some(r"C:\src\app".into());
         assert!(matches!(files.directory(), FilesDirectory::Missing(_)));
+
+        // Forking needs a sandbox to fork.
+        let mut files = resolved(
+            "/root/app",
+            Some(DevContainerSetting {
+                sandbox: true,
+                sandbox_from: crate::fleet::repos::node_files::SandboxFrom::Fork(String::new()),
+                ..Default::default()
+            }),
+        );
+        assert_eq!(files.directory(), FilesDirectory::Missing("Choose the sandbox to fork".into()));
+        files.dev_container.as_mut().unwrap().sandbox_from =
+            crate::fleet::repos::node_files::SandboxFrom::Fork("template".into());
+        assert_eq!(files.directory(), FilesDirectory::NotMade);
+    }
+
+    /// An inheriting node resolves its own branch and its own location, and
+    /// one made from settings that have since changed is stale.
+    #[test]
+    fn inheriting_nodes_get_their_own_location() {
+        let tree = setup_tree();
+        enable(&tree.store, tree.grandparent, vec![Capability::Files]);
+        let (gp, child) = (tree.grandparent.to_string(), tree.child.to_string());
+        tree.store
+            .enqueue(FleetMutation::UpdateTaskRepo { id: gp.clone(), repo: Some("/root/app".into()) })
+            .unwrap();
+        tree.store
+            .enqueue(FleetMutation::UpdateTaskBranch { id: gp.clone(), branch: Some("main".into()) })
+            .unwrap();
+        tree.store
+            .enqueue(FleetMutation::UpdateTaskBranch { id: child.clone(), branch: Some("task/child".into()) })
+            .unwrap();
+        tree.store
+            .enqueue(FleetMutation::SetNodeDevContainer {
+                node_id: gp.clone(),
+                dev_container: Some(DevContainerSetting { sandbox: true, ..Default::default() }),
+            })
+            .unwrap();
+        tree.store.writer().flush().unwrap();
+        tree.store.reload_if_stale().unwrap();
+
+        let files = tree.store.resolve_files_for_node(&child).unwrap().unwrap();
+        assert!(files.inherited);
+        assert_eq!(files.branch(), Some("task/child"));
+        assert_eq!(files.directory(), FilesDirectory::NotMade);
+        tree.store
+            .enqueue(FleetMutation::RecordFilesLocation { location: location_at(&files, None, Some("tod-child")) })
+            .unwrap();
+        tree.store.writer().flush().unwrap();
+        tree.store.reload_if_stale().unwrap();
+        let files = tree.store.resolve_files_for_node(&child).unwrap().unwrap();
+        assert_eq!(files.repo_sandbox(), Some("tod-child"));
+        // The parent has none of its own.
+        let parent = tree.store.resolve_files_for_node(&gp).unwrap().unwrap();
+        assert_eq!(parent.branch(), Some("main"));
+        assert_eq!(parent.directory(), FilesDirectory::NotMade);
+
+        // Changing what sandboxes are made from leaves the child's stale.
+        tree.store
+            .enqueue(FleetMutation::SetNodeDevContainer {
+                node_id: gp.clone(),
+                dev_container: Some(DevContainerSetting {
+                    sandbox: true,
+                    sandbox_from: crate::fleet::repos::node_files::SandboxFrom::Image("other".into()),
+                    ..Default::default()
+                }),
+            })
+            .unwrap();
+        tree.store.writer().flush().unwrap();
+        tree.store.reload_if_stale().unwrap();
+        let files = tree.store.resolve_files_for_node(&child).unwrap().unwrap();
+        assert_eq!(files.location, None);
+        assert_eq!(files.stale_location.as_ref().and_then(|l| l.sandbox()), Some("tod-child"));
+        assert_eq!(files.directory(), FilesDirectory::NotMade);
+        drop(tree.store);
+        cleanup_fleet_root(&tree.root);
     }
 
     #[test]

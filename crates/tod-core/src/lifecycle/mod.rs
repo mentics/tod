@@ -161,12 +161,14 @@ pub fn advance_after_criteria(fleet: &FleetStore, node: Uuid) -> Result<Option<&
 
 /// Where implementation (and verification) of `task_id` would run: the node
 /// needs a resolved Agent and a ready Files directory — what the `ready` →
-/// `active` gate requires (`crate::gate::derived`). `Err` carries the
-/// user-facing reason.
+/// `active` gate requires (`crate::gate::derived`). `Ok(None)`: the node's
+/// own worktree or sandbox is not made yet, and the first turn makes it.
+/// `Err` carries the user-facing reason. Reads the store only, so the UI
+/// thread may call it.
 pub fn implement_directory(
     fleet: &FleetStore,
     task_id: &str,
-) -> std::result::Result<tod_store::fleet::Workdir, String> {
+) -> std::result::Result<Option<tod_store::fleet::Workdir>, String> {
     if fleet
         .resolve_agent_for_node(task_id)
         .ok()
@@ -177,7 +179,7 @@ pub fn implement_directory(
             "Enable the Agent capability on this node (or an ancestor) to implement.".into(),
         );
     }
-    tod_store::fleet::resolve_launch_cwd(fleet, task_id).map_err(|err| format!("{err:#}"))
+    tod_store::fleet::launch_cwd_if_made(fleet, task_id).map_err(|err| format!("{err:#}"))
 }
 
 #[cfg(test)]

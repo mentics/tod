@@ -1431,7 +1431,6 @@ git -c user.name=t -c user.email=t@t commit -q -m 'add sub'"#;
 
     #[test]
     fn git_worktree_sharing_by_branch() {
-        use crate::fleet::repos::node_files::NodeFilesRepo;
         use crate::fleet::repos::task::{FleetTask, TaskRepo};
         use crate::fleet::repos::{cleanup_test_dir, test_writer_conn};
         use crate::paths::{clear_data_root_override, set_data_root};
@@ -1469,7 +1468,7 @@ git -c user.name=t -c user.email=t@t commit -q -m 'add sub'"#;
         }
 
         let shared = |repo: &str, branch: &str| {
-            NodeFilesRepo::new(&conn).resolve_shared_worktree_path(repo, branch)
+            crate::fleet::repos::files_location::FilesLocationRepo::new(&conn).worktree_for(repo, branch)
         };
         let main_handle = ensure_worktree(
             &shared,
@@ -1495,13 +1494,19 @@ git -c user.name=t -c user.email=t@t commit -q -m 'add sub'"#;
         .unwrap();
         assert_ne!(main_handle.path, feature_handle.path);
 
-        NodeFilesRepo::new(&conn)
-            .update_worktree(
-                &node_main,
-                Some(main_handle.path.storage().as_str()),
-                None,
-                None,
-            )
+        crate::fleet::repos::files_location::FilesLocationRepo::new(&conn)
+            .upsert(&crate::fleet::repos::files_location::FilesLocation {
+                node_id: node_main.clone(),
+                source_node_id: node_main.clone(),
+                recipe: String::new(),
+                repo: Some(repo_str.clone()),
+                container: None,
+                worktree_path: Some(main_handle.path.storage()),
+                worktree_lease_id: None,
+                worktree_lease_holder: None,
+                sandbox: None,
+                created_at: 0,
+            })
             .unwrap();
 
         let reused = ensure_worktree(

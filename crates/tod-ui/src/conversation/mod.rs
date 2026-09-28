@@ -1099,7 +1099,9 @@ impl ConversationView {
             return None;
         }
         let node = self.focus.node_id()?;
-        tod_store::fleet::provision::resolve_launch_cwd(&self.fleet, &node.to_string()).ok()
+        tod_store::fleet::launch_cwd_if_made(&self.fleet, &node.to_string())
+            .ok()
+            .flatten()
     }
 
     /// Re-read everything shown; returns whether it changed.

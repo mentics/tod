@@ -1,8 +1,9 @@
 //! The Files capability's "Runs in" section: this machine, a running dev
-//! container the user picks from `docker ps` (or names by hand), or a cloud
-//! sandbox from the workspace's, which can also create one: from an image
-//! (the default from Settings unless one is given) or as a fork of another
-//! sandbox.
+//! container the user picks from `docker ps` (or names by hand), or cloud
+//! sandboxes. With sandboxes, this is only what each node's own sandbox
+//! starts from — an image (the default from Settings unless one is given)
+//! or a fork of one of the workspace's sandboxes; each is made the first
+//! time its node needs its files (`tod_store::fleet::provision`).
 //!
 //! The repository usually lives in the container, and the workspace
 //! directory is its path there. "Repository" switches to one on this machine
@@ -25,8 +26,8 @@ use gpui_component::input::{InputEvent, InputState};
 use gpui_component::{ActiveTheme, Disableable, h_flex, v_flex};
 use std::time::Duration;
 use tod_agent::devcontainer::{self, ContainerSummary};
-use tod_store::fleet::sandbox::{self as sandboxes, ListedSandbox, NewSandboxSource};
-use tod_store::fleet::{DevContainerSetting, FleetMutation};
+use tod_store::fleet::sandbox::{self as sandboxes, ListedSandbox};
+use tod_store::fleet::{DevContainerSetting, FleetMutation, SandboxFrom};
 
 const SAVE_DEBOUNCE: Duration = Duration::from_millis(500);
 
@@ -41,15 +42,10 @@ pub(super) struct DevContainerPanel {
     list_error: Option<String>,
     /// Bumped per listing, so one of the other kind that ends late is dropped.
     list_generation: u64,
-    /// A new sandbox: its image (empty means the default from Settings).
+    /// The image each node's sandbox starts from (empty means the default
+    /// from Settings).
     pub(super) new_image_input: Entity<InputState>,
-    /// A new sandbox: its name.
-    pub(super) new_name_input: Entity<InputState>,
-    /// A new sandbox forks `fork_source` instead of starting from an image.
-    new_from_fork: bool,
-    fork_source: Option<String>,
-    /// What creating a sandbox is doing, while it runs.
-    creating: Option<String>,
+    /// Why the chosen fork source cannot be used.
     create_error: Option<String>,
     /// The default image from Settings, shown under the image field.
     default_image: String,
@@ -60,7 +56,7 @@ pub(super) struct DevContainerPanel {
     /// panel has left is dropped.
     generation: u64,
     _save_task: Option<Task<()>>,
-    _subscriptions: [Subscription; 1],
+    _subscriptions: [Subscription; 2],
 }
 
 impl DevContainerPanel {
@@ -77,12 +73,10 @@ impl DevContainerPanel {
                 }
             })
         };
-        let _subscriptions = [subscribe(&container_input, cx)];
         let new_image_input = cx.new(|cx| {
             InputState::new(window, cx).placeholder("Enter to edit · Empty uses the default")
         });
-        let new_name_input =
-            cx.new(|cx| InputState::new(window, cx).placeholder("Enter to edit · Sandbox name"));
+        let _subscriptions = [subscribe(&container_input, cx), subscribe(&new_image_input, cx)];
         Self {
             container_input,
             containers: Vec::new(),
@@ -91,10 +85,6 @@ impl DevContainerPanel {
             list_error: None,
             list_generation: 0,
             new_image_input,
-            new_name_input,
-            new_from_fork: false,
-            fork_source: None,
-            creating: None,
             create_error: None,
             default_image: String::new(),
             check: None,
@@ -107,11 +97,6 @@ impl DevContainerPanel {
 
     pub(super) fn container_count(&self) -> usize {
         self.containers.len()
-    }
-
-    /// Whether a new sandbox forks one (else it starts from an image).
-    pub(super) fn new_from_fork(&self) -> bool {
-        self.new_from_fork
     }
 }
 
@@ -133,7 +118,14 @@ impl TaskEditView {
         self.dev.container_input.update(cx, |input, cx| {
             input.set_value(container, window, cx);
         });
-        self.reset_new_sandbox(window, cx);
+        self.dev.create_error = None;
+        let root = self.fleet.paths().root().to_path_buf();
+        self.dev.default_image = sandboxes::account_settings(&root).1;
+        let image = match &dev.sandbox_from {
+            SandboxFrom::Image(image) => image.clone(),
+            SandboxFrom::Fork(_) => String::new(),
+        };
+        self.dev.new_image_input.update(cx, |input, cx| input.set_value(image, window, cx));
         if self.own_dev_container().is_some() {
             if self.dev.containers.is_empty() && !self.dev.listing {
                 self.refresh_containers(cx);
@@ -142,29 +134,54 @@ impl TaskEditView {
         }
     }
 
-    /// A new sandbox's draft for this node: named after it, from the
-    /// default image. A creation still running keeps its own.
-    fn reset_new_sandbox(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.dev.creating.is_some() {
-            return;
-        }
-        self.dev.create_error = None;
-        let root = self.fleet.paths().root().to_path_buf();
-        self.dev.default_image = sandboxes::account_settings(&root).1;
-        let name = sandboxes::suggested_name(&self.loaded_slug);
-        self.dev.new_name_input.update(cx, |input, cx| input.set_value(name, window, cx));
-        self.dev.new_image_input.update(cx, |input, cx| input.set_value("", window, cx));
+    /// What each node's sandbox starts from, when it runs in sandboxes.
+    fn sandbox_from(&self) -> Option<SandboxFrom> {
+        self.own_dev_container()
+            .filter(|dev| dev.sandbox)
+            .map(|dev| dev.sandbox_from)
     }
 
-    /// "Start from": an image ↔ a fork of another sandbox.
-    pub(super) fn toggle_new_sandbox_source(&mut self, cx: &mut Context<Self>) {
-        self.dev.new_from_fork = !self.dev.new_from_fork;
+    /// Whether each node's sandbox is a fork (else it starts from an image).
+    pub(super) fn sandbox_is_fork(&self) -> bool {
+        matches!(self.sandbox_from(), Some(SandboxFrom::Fork(_)))
+    }
+
+    /// Save what each node's sandbox starts from.
+    fn save_sandbox_from(&mut self, from: SandboxFrom, cx: &mut Context<Self>) {
+        let Some(dev) = self.own_dev_container().filter(|dev| dev.sandbox) else {
+            return;
+        };
         self.dev.create_error = None;
+        self.save_dev_container(
+            Some(DevContainerSetting {
+                sandbox_from: from,
+                ..dev
+            }),
+            cx,
+        );
+    }
+
+    /// "Start from": an image ↔ a fork of one of the workspace's sandboxes.
+    pub(super) fn toggle_new_sandbox_source(&mut self, cx: &mut Context<Self>) {
+        let next = match self.sandbox_from() {
+            Some(SandboxFrom::Fork(_)) => {
+                SandboxFrom::Image(input_text(&self.dev.new_image_input, cx).trim().to_string())
+            }
+            Some(SandboxFrom::Image(_)) => SandboxFrom::Fork(
+                self.dev
+                    .sandboxes
+                    .first()
+                    .map(|s| s.name.clone())
+                    .unwrap_or_default(),
+            ),
+            None => return,
+        };
+        self.save_sandbox_from(next, cx);
         self.clamp_focus_index();
         cx.notify();
     }
 
-    /// The next listed sandbox to fork.
+    /// Fork the next listed sandbox.
     pub(super) fn cycle_fork_source(&mut self, cx: &mut Context<Self>) {
         let names: Vec<&str> = self.dev.sandboxes.iter().map(|s| s.name.as_str()).collect();
         if names.is_empty() {
@@ -172,95 +189,16 @@ impl TaskEditView {
             cx.notify();
             return;
         }
-        let next = match self.dev.fork_source.as_deref().and_then(|c| names.iter().position(|n| *n == c)) {
+        let current = match self.sandbox_from() {
+            Some(SandboxFrom::Fork(name)) => Some(name),
+            _ => None,
+        };
+        let next = match current.as_deref().and_then(|c| names.iter().position(|n| *n == c)) {
             Some(i) => names[(i + 1) % names.len()],
             None => names[0],
         };
-        self.dev.fork_source = Some(next.to_string());
-        self.dev.create_error = None;
-        cx.notify();
-    }
-
-    /// Create the drafted sandbox off the UI thread, then use it for this
-    /// node.
-    pub(super) fn create_sandbox(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.dev.creating.is_some() {
-            return;
-        }
-        let Some(node_id) = self.task_id() else {
-            return;
-        };
-        let name = input_text(&self.dev.new_name_input, cx).trim().to_string();
-        if let Err(err) = sandboxes::validate_name(&name) {
-            self.dev.create_error = Some(format!("{err:#}"));
-            cx.notify();
-            return;
-        }
-        let source = if self.dev.new_from_fork {
-            match self.dev.fork_source.clone() {
-                Some(source) => NewSandboxSource::Fork(source),
-                None => {
-                    self.dev.create_error = Some("Choose a sandbox to fork.".into());
-                    cx.notify();
-                    return;
-                }
-            }
-        } else {
-            NewSandboxSource::Image(input_text(&self.dev.new_image_input, cx).trim().to_string())
-        };
-        self.dev.creating = Some(match &source {
-            NewSandboxSource::Fork(from) => format!("Forking {from} into {name}…"),
-            NewSandboxSource::Image(_) => format!("Creating {name}…"),
-        });
-        self.dev.create_error = None;
-        cx.notify();
-        let root = self.fleet.paths().root().to_path_buf();
-        let (tx, rx) = async_channel::unbounded::<String>();
-        let created = name.clone();
-        let task = cx.background_spawn(async move {
-            let mut sandboxes = sandboxes::Sandboxes::load(&root)?;
-            // Agents run in every sandbox the app makes.
-            sandboxes.create(&created, &source, true, false, &mut |step| {
-                let _ = tx.try_send(step.to_string());
-            })
-        });
-        cx.spawn_in(window, async move |this, cx| {
-            while let Ok(step) = rx.recv().await {
-                let _ = this.update(cx, |this, cx| {
-                    this.dev.creating = Some(step);
-                    cx.notify();
-                });
-            }
-            let result = task.await;
-            let _ = this.update_in(cx, |this, window, cx| {
-                this.dev.creating = None;
-                match result {
-                    Ok(_) => {
-                        // Still on the node it was made for: use it there.
-                        if this.task_id().as_deref() == Some(node_id.as_str())
-                            && this.runs_in_sandbox()
-                        {
-                            this.dev.container_input.update(cx, |input, cx| {
-                                input.set_value(name.clone(), window, cx);
-                            });
-                            this.save_dev_container(
-                                Some(DevContainerSetting {
-                                    container: Some(name),
-                                    repo_on_host: false,
-                                    sandbox: true,
-                                }),
-                                cx,
-                            );
-                        }
-                    }
-                    Err(err) => this.dev.create_error = Some(format!("{err:#}")),
-                }
-                // A failed setup can leave the sandbox made: list it either way.
-                this.refresh_containers(cx);
-                cx.notify();
-            });
-        })
-        .detach();
+        let next = next.to_string();
+        self.save_sandbox_from(SandboxFrom::Fork(next), cx);
     }
 
     /// "Runs in": this machine → dev container → cloud sandbox → this machine.
@@ -347,6 +285,14 @@ impl TaskEditView {
         if self.own_dev_container().is_none() {
             return;
         }
+        // Sandboxes: the image, when they start from one.
+        if let Some(from) = self.sandbox_from() {
+            if matches!(from, SandboxFrom::Image(_)) {
+                let image = input_text(&self.dev.new_image_input, cx).trim().to_string();
+                self.save_sandbox_from(SandboxFrom::Image(image), cx);
+            }
+            return;
+        }
         let container = input_text(&self.dev.container_input, cx).trim().to_string();
         let sandbox = self.runs_in_sandbox();
         let valid = if sandbox {
@@ -361,12 +307,12 @@ impl TaskEditView {
             cx.notify();
             return;
         }
-        let repo_on_host = self.own_dev_container().is_some_and(|dev| dev.repo_on_host);
+        let current = self.own_dev_container().unwrap_or_default();
         self.save_dev_container(
             Some(DevContainerSetting {
                 container: (!container.is_empty()).then_some(container),
-                repo_on_host,
                 sandbox,
+                ..current
             }),
             cx,
         );
@@ -383,6 +329,11 @@ impl TaskEditView {
             return;
         };
         let name = chosen.name.clone();
+        // A listed sandbox is one to fork.
+        if self.sandbox_from().is_some() {
+            self.save_sandbox_from(SandboxFrom::Fork(name), cx);
+            return;
+        }
         self.dev.container_input.update(cx, |input, cx| {
             input.set_value(name.clone(), window, cx);
         });
@@ -397,8 +348,67 @@ impl TaskEditView {
     }
 
     /// Persist `setting` if it differs from the stored one. Returns whether
-    /// the stored setting is now `setting`.
+    /// the stored setting is now `setting`: not yet when worktrees or
+    /// sandboxes made from the old one must be removed first, which the
+    /// user confirms.
     fn save_dev_container(
+        &mut self,
+        setting: Option<DevContainerSetting>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let normalize = |dev: Option<DevContainerSetting>| {
+            dev.map(|dev| DevContainerSetting {
+                container: if dev.sandbox {
+                    None
+                } else {
+                    dev.container().map(str::to_string)
+                },
+                repo_on_host: dev.repo_on_host && !dev.sandbox,
+                sandbox: dev.sandbox,
+                sandbox_from: if dev.sandbox {
+                    dev.sandbox_from
+                } else {
+                    SandboxFrom::default()
+                },
+            })
+        };
+        let setting = normalize(setting);
+        if normalize(self.own_dev_container()) == setting {
+            return true;
+        }
+        let (repo, use_worktree, _) = self.files_settings();
+        let affected = self.locations_changed_by(repo.as_deref(), use_worktree, setting.as_ref());
+        if !affected.is_empty() {
+            let intro = match &setting {
+                Some(dev) if dev.sandbox => format!(
+                    "Each node's sandbox will start from {}. These were made from the old \
+                     settings, and are removed first (each branch is pushed before it goes).",
+                    dev.sandbox_from.describe()
+                ),
+                _ => "These were made from where the files were, and are removed first (each \
+                      branch is pushed before it goes)."
+                    .to_string(),
+            };
+            let listing = setting.is_some();
+            self.guard_files_change(
+                affected,
+                "Change where the files are?".into(),
+                intro,
+                "Remove and change",
+                move |this, window, cx| {
+                    if this.write_dev_container(setting, cx) && listing {
+                        this.refresh_containers(cx);
+                    }
+                    this.load_dev_container(window, cx);
+                },
+                cx,
+            );
+            return false;
+        }
+        self.write_dev_container(setting, cx)
+    }
+
+    fn write_dev_container(
         &mut self,
         setting: Option<DevContainerSetting>,
         cx: &mut Context<Self>,
@@ -406,17 +416,6 @@ impl TaskEditView {
         let Some(node_id) = self.task_id() else {
             return false;
         };
-        let normalize = |dev: Option<DevContainerSetting>| {
-            dev.map(|dev| DevContainerSetting {
-                container: dev.container().map(str::to_string),
-                repo_on_host: dev.repo_on_host && !dev.sandbox,
-                sandbox: dev.sandbox,
-            })
-        };
-        let setting = normalize(setting);
-        if normalize(self.own_dev_container()) == setting {
-            return true;
-        }
         if let Err(err) = self.fleet.enqueue(FleetMutation::SetNodeDevContainer {
             node_id,
             dev_container: setting,
@@ -472,12 +471,6 @@ impl TaskEditView {
                     }
                     Ok(Listing::Sandboxes(listed)) => {
                         this.dev.containers = listed.iter().map(sandbox_choice).collect();
-                        let still_there = this.dev.fork_source.as_deref().is_some_and(|source| {
-                            listed.iter().any(|s| s.name == source)
-                        });
-                        if !still_there {
-                            this.dev.fork_source = listed.first().map(|s| s.name.clone());
-                        }
                         this.dev.sandboxes = listed;
                     }
                     Err(err) => {
@@ -498,26 +491,51 @@ impl TaskEditView {
     /// container, else the host directory mapped through its mounts.
     pub(super) fn check_dev_container(&mut self, cx: &mut Context<Self>) {
         self.dev.generation += 1;
-        let generation = self.dev.generation;
         let Some(dev) = self.own_dev_container() else {
             self.dev.check = None;
             self.dev.checking = false;
             return;
         };
+        let use_worktree = self.own_files().is_some_and(|files| files.use_worktree);
+        if dev.sandbox {
+            // This node's own sandbox once made, else the one each is forked
+            // from. An image is only checked by making a sandbox from it.
+            let made = self.own_files().and_then(|files| files.repo_sandbox()).map(str::to_string);
+            let target = made.clone().or(match &dev.sandbox_from {
+                SandboxFrom::Fork(name) if !name.trim().is_empty() => Some(name.trim().to_string()),
+                _ => None,
+            });
+            let repo = self.own_files().and_then(|files| files.repo()).map(str::to_string);
+            let Some(target) = target else {
+                self.dev.checking = false;
+                self.dev.check = Some(Ok(format!(
+                    "Each node that needs its files gets a sandbox of its own from {}, made \
+                     then. The image must hold the repository{}.",
+                    dev.sandbox_from.describe(),
+                    repo.map(|repo| format!(" at {repo}")).unwrap_or_default()
+                )));
+                return;
+            };
+            let prefix = match made {
+                Some(_) => "This node's sandbox: ",
+                None => "The sandbox each node forks: ",
+            };
+            self.run_dev_container_check(
+                Box::new(move || {
+                    check_repo_in_sandbox(&target, repo.as_deref(), true)
+                        .map(|found| format!("{prefix}{found}"))
+                        .map_err(|err| format!("{prefix}{err}"))
+                }),
+                cx,
+            );
+            return;
+        }
         let Some(container) = dev.container().map(str::to_string) else {
             self.dev.check = None;
             self.dev.checking = false;
             return;
         };
-        let use_worktree = self.own_files().is_some_and(|files| files.use_worktree);
-        let check: Box<dyn FnOnce() -> Result<String, String> + Send> = if dev.sandbox {
-            let repo = self
-                .own_files()
-                .and_then(|files| files.repo_dir())
-                .filter(|dir| dir.sandbox_name().is_some())
-                .map(|dir| dir.path_text());
-            Box::new(move || check_repo_in_sandbox(&container, repo.as_deref(), use_worktree))
-        } else if dev.repo_on_host {
+        let check: Box<dyn FnOnce() -> Result<String, String> + Send> = if dev.repo_on_host {
             let Some(host_dir) = self
                 .own_files()
                 .and_then(|files| files.ready_directory())
@@ -544,6 +562,15 @@ impl TaskEditView {
                 .map(|dir| dir.path_text());
             Box::new(move || check_repo_in_container(&container, repo.as_deref(), use_worktree))
         };
+        self.run_dev_container_check(check, cx);
+    }
+
+    fn run_dev_container_check(
+        &mut self,
+        check: Box<dyn FnOnce() -> Result<String, String> + Send>,
+        cx: &mut Context<Self>,
+    ) {
+        let generation = self.dev.generation;
         self.dev.checking = true;
         cx.notify();
         cx.spawn(async move |this, cx| {
@@ -655,7 +682,7 @@ impl TaskEditView {
             .items_center()
             .child(Self::render_field_label(
                 if dev.sandbox {
-                    "Sandboxes"
+                    "Sandboxes to fork"
                 } else {
                     "Running containers"
                 },
@@ -682,6 +709,10 @@ impl TaskEditView {
             ));
 
         let chosen = dev.container().map(str::to_string);
+        let sandbox_fork = match &dev.sandbox_from {
+            SandboxFrom::Fork(name) if dev.sandbox => Some(name.clone()),
+            _ => None,
+        };
         let mut list = v_flex().gap_0p5();
         for (index, container) in self.dev.containers.iter().enumerate() {
             let field = TaskEditField::ContainerChoice(index);
@@ -690,6 +721,8 @@ impl TaskEditView {
                 chosen == container.name
                     || (chosen.len() >= 12 && container.id.starts_with(chosen))
             });
+            let is_chosen = is_chosen
+                || matches!(&sandbox_fork, Some(fork) if *fork == container.name);
             let mut detail = container.image.clone();
             if let Some(folder) = &container.local_folder {
                 detail = format!("{detail} · {folder}");
@@ -747,7 +780,7 @@ impl TaskEditView {
         }
         if self.dev.containers.is_empty() && !self.dev.listing && self.dev.list_error.is_none() {
             list = list.child(div().text_xs().text_color(muted).child(if dev.sandbox {
-                "No sandboxes in the workspace yet. Create one below."
+                "No sandboxes in the workspace to fork."
             } else {
                 "No running containers. Start the dev container, then Refresh."
             }));
@@ -764,20 +797,22 @@ impl TaskEditView {
             match &self.dev.check {
                 Some(Ok(text)) => Some((muted, text.clone())),
                 Some(Err(err)) => Some((danger, err.clone())),
-                None if chosen.is_none() => {
-                    let choose = if dev.sandbox { "Choose a sandbox" } else { "Choose a container" };
-                    Some((muted, choose.to_string()))
+                None if chosen.is_none() && !dev.sandbox => {
+                    Some((muted, "Choose a container".to_string()))
                 }
                 None => None,
             }
         };
 
+        let sandbox = dev.sandbox;
+        let forking = matches!(dev.sandbox_from, SandboxFrom::Fork(_));
         v_flex()
             .gap_2()
             .child(runs_in)
-            // A sandbox always holds its repository.
-            .when(!dev.sandbox, |el| el.child(location))
-            .child(fields)
+            // A sandbox always holds its repository, and each node's is
+            // made for it: there is none to name.
+            .when(!sandbox, |el| el.child(location).child(fields))
+            .when(sandbox, |el| el.child(self.render_sandbox_from(muted, window, cx)))
             .when_some(status, |el, (color, text)| {
                 el.child(div().text_xs().text_color(color).child(selectable_text(
                     "task-edit-dev-container-status",
@@ -786,21 +821,24 @@ impl TaskEditView {
                     cx,
                 )))
             })
-            .child(list_header)
-            .when_some(self.dev.list_error.clone(), |el, err| {
-                el.child(div().text_xs().text_color(danger).child(selectable_text(
-                    "task-edit-container-list-error",
-                    err,
-                    window,
-                    cx,
-                )))
+            // Sandboxes are listed only to pick the one to fork.
+            .when(!sandbox || forking, |el| {
+                el.child(list_header)
+                    .when_some(self.dev.list_error.clone(), |el, err| {
+                        el.child(div().text_xs().text_color(danger).child(selectable_text(
+                            "task-edit-container-list-error",
+                            err,
+                            window,
+                            cx,
+                        )))
+                    })
+                    .child(list)
             })
-            .child(list)
-            .when(dev.sandbox, |el| el.child(self.render_new_sandbox(muted, window, cx)))
     }
 
-    /// "New sandbox": start from an image or fork one, a name, and Create.
-    fn render_new_sandbox(
+    /// What each node's sandbox starts from: an image, or a fork of one of
+    /// the listed sandboxes.
+    fn render_sandbox_from(
         &self,
         muted: gpui::Hsla,
         window: &mut Window,
@@ -810,7 +848,7 @@ impl TaskEditView {
         let active_border = cx.theme().list_active_border;
         let foreground = cx.theme().foreground;
         let danger = cx.theme().danger;
-        let creating = self.dev.creating.is_some();
+        let from = self.sandbox_from().unwrap_or_default();
         let toggle_row = |field: TaskEditField, label: &'static str, value: String, hint: &'static str, cx: &mut Context<Self>| {
             let focused = self.field_nav_focused(field);
             self.apply_focus_scroll_anchor(
@@ -833,29 +871,36 @@ impl TaskEditView {
         };
         let source = toggle_row(
             TaskEditField::NewSandboxSource,
-            "Start from",
-            if self.dev.new_from_fork { "A fork of a sandbox" } else { "An image" }.to_string(),
+            "Each node's sandbox starts from",
+            match &from {
+                SandboxFrom::Fork(_) => "A fork of a sandbox",
+                SandboxFrom::Image(_) => "An image",
+            }
+            .to_string(),
             "Enter or click to switch",
             cx,
         );
-        let from = if self.dev.new_from_fork {
-            let value = match self.dev.fork_source.as_deref() {
-                Some(name) => match self.dev.sandboxes.iter().find(|s| s.name == name) {
-                    Some(listed) => format!("{name} ({})", listed.status.to_lowercase()),
-                    None => name.to_string(),
-                },
-                None => "No sandbox to fork".to_string(),
-            };
-            toggle_row(TaskEditField::NewSandboxForkSource, "Fork", value, "Enter or click for the next", cx)
-                .into_any_element()
-        } else {
-            v_flex()
+        let detail = match &from {
+            SandboxFrom::Fork(name) => {
+                let value = if name.trim().is_empty() {
+                    "None chosen: pick one from the list".to_string()
+                } else {
+                    match self.dev.sandboxes.iter().find(|s| s.name == *name) {
+                        Some(listed) => format!("{name} ({})", listed.status.to_lowercase()),
+                        None => name.clone(),
+                    }
+                };
+                toggle_row(TaskEditField::NewSandboxForkSource, "Fork", value, "Enter or click for the next", cx)
+                    .into_any_element()
+            }
+            SandboxFrom::Image(_) => v_flex()
                 .gap_1()
                 .child(self.apply_focus_scroll_anchor(
                     TaskEditField::NewSandboxImage,
                     v_flex()
                         .id(super::field_anchor_id(TaskEditField::NewSandboxImage))
                         .gap_1()
+                        .w(gpui::px(320.))
                         .child(Self::render_field_label("Image", cx))
                         .child(self.render_nav_input(
                             TaskEditField::NewSandboxImage,
@@ -871,65 +916,16 @@ impl TaskEditView {
                     window,
                     cx,
                 )))
-                .into_any_element()
-        };
-        let name = self.apply_focus_scroll_anchor(
-            TaskEditField::NewSandboxName,
-            v_flex()
-                .id(super::field_anchor_id(TaskEditField::NewSandboxName))
-                .gap_1()
-                .w(gpui::px(260.))
-                .child(Self::render_field_label("Name", cx))
-                .child(self.render_nav_input(
-                    TaskEditField::NewSandboxName,
-                    self.dev.new_name_input.clone(),
-                    None,
-                    window,
-                    cx,
-                )),
-        );
-        let create_focused = self.field_nav_focused(TaskEditField::NewSandboxCreate);
-        // In a row, so the button is only as wide as its label.
-        let create = h_flex().child(self.apply_focus_scroll_anchor(
-            TaskEditField::NewSandboxCreate,
-            div()
-                .id(super::field_anchor_id(TaskEditField::NewSandboxCreate))
-                .rounded_md()
-                .when(create_focused, |el| el.bg(active).border_1().border_color(active_border))
-                .child(
-                    Button::new("task-edit-new-sandbox-create")
-                        .label(if creating {
-                            "Creating…"
-                        } else if self.dev.new_from_fork {
-                            "Fork and use it"
-                        } else {
-                            "Create and use it"
-                        })
-                        .outline()
-                        .compact()
-                        .disabled(creating)
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.enter_field_edit(TaskEditField::NewSandboxCreate, window, cx);
-                        })),
-                ),
-        ));
-        let status = match (&self.dev.creating, &self.dev.create_error) {
-            (Some(step), _) => Some((muted, step.clone())),
-            (None, Some(err)) => Some((danger, err.clone())),
-            (None, None) => None,
+                .into_any_element(),
         };
         v_flex()
             .gap_2()
-            .pt_2()
-            .child(Self::render_field_label("New sandbox", cx))
             .child(source)
-            .child(from)
-            .child(name)
-            .child(create)
-            .when_some(status, |el, (color, text)| {
-                el.child(div().text_xs().text_color(color).child(selectable_text(
+            .child(detail)
+            .when_some(self.dev.create_error.clone(), |el, err| {
+                el.child(div().text_xs().text_color(danger).child(selectable_text(
                     "task-edit-new-sandbox-status",
-                    text,
+                    err,
                     window,
                     cx,
                 )))

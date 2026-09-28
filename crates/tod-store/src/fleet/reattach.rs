@@ -1,7 +1,7 @@
 //! Launch-time reattach orchestration for agent runs and shell sessions.
 
 use crate::fleet::repos::agent_run::{AgentRunRepo, RUNTIME_STATUS_ACTIVE, RUNTIME_STATUS_DONE};
-use crate::fleet::repos::node_files::NodeFilesRepo;
+use crate::fleet::repos::files_location::FilesLocationRepo;
 use crate::fleet::repos::shell::ShellRepo;
 use crate::fleet::runtime::GuestLivenessCheck;
 use crate::fleet::writer::{FleetMutation, FleetWriter};
@@ -96,34 +96,25 @@ fn mark_run_not_running(writer: &FleetWriter, run_id: &str) -> Result<()> {
     Ok(())
 }
 
-/// Clear recorded worktrees whose directory no longer exists, so the Files
-/// capability offers "Set up worktree" again. One inside a dev container is
-/// left alone: checking it needs Docker, and the container may not be
-/// running yet. Setting up the worktree again checks it there.
+/// Forget nodes' worktrees whose directory no longer exists, so the next
+/// launch makes a new one. One inside a dev container or a sandbox is left
+/// alone: checking it needs Docker or the network, and the container may not
+/// be running yet.
 pub fn clear_missing_worktrees(
     conn: &Connection,
     writer: &FleetWriter,
     notices: &crate::fleet::notices::FleetNoticeHooks,
 ) -> Result<usize> {
     let mut cleared = 0usize;
-    for files in NodeFilesRepo::new(conn).list_with_worktree()? {
-        let Some(path) = files.worktree_path() else {
+    for location in FilesLocationRepo::new(conn).list_all()? {
+        let Some(crate::fleet::Workdir::Host(path)) = location.directory() else {
             continue;
         };
-        let in_container = files
-            .dev_container
-            .as_ref()
-            .is_some_and(|dev| dev.repo_is_remote());
-        if in_container || std::path::Path::new(path).exists() {
+        if location.sandbox().is_some() || path.exists() {
             continue;
         }
-        notices.on_worktree_missing(&files.node_id);
-        writer.enqueue(FleetMutation::UpdateNodeWorktree {
-            node_id: files.node_id.clone(),
-            worktree_path: None,
-            worktree_lease_id: None,
-            worktree_lease_holder: None,
-        })?;
+        notices.on_worktree_missing(&location.node_id);
+        writer.enqueue(FleetMutation::DeleteFilesLocation { node_id: location.node_id.clone() })?;
         cleared += 1;
     }
     if cleared > 0 {
@@ -137,6 +128,7 @@ mod tests {
     use super::*;
     use crate::fleet::reconnect_identity;
     use crate::fleet::reconnect_identity::ReconnectIdentity;
+    use crate::fleet::repos::files_location::FilesLocation;
     use crate::fleet::repos::{cleanup_test_dir, seed_node, test_writer_conn};
     use crate::fleet::runtime::NoopGuestLiveness;
     use crate::fleet::writer::FleetWriter;
@@ -240,24 +232,36 @@ mod tests {
         cleanup_test_dir(&dir);
     }
 
+    fn location(node_id: &str, worktree: &str, container: Option<&str>) -> FilesLocation {
+        FilesLocation {
+            node_id: node_id.into(),
+            source_node_id: node_id.into(),
+            recipe: "r".into(),
+            repo: Some("/repo".into()),
+            container: container.map(str::to_string),
+            worktree_path: Some(worktree.into()),
+            worktree_lease_id: None,
+            worktree_lease_holder: None,
+            sandbox: None,
+            created_at: 0,
+        }
+    }
+
     #[test]
     fn missing_worktree_is_cleared() {
         let (dir, conn) = test_writer_conn();
         let writer = open_writer(&dir);
         let node_id = seed_node(&conn);
         let missing = dir.join("no-such-worktree");
-        NodeFilesRepo::new(&conn)
-            .update_worktree(&node_id, Some(&missing.display().to_string()), None, None)
-            .unwrap();
+        let locations = FilesLocationRepo::new(&conn);
+        locations.upsert(&location(&node_id, &missing.display().to_string(), None)).unwrap();
         let notices = crate::fleet::notices::FleetNoticeHooks::new();
 
         assert_eq!(
             clear_missing_worktrees(&conn, &writer, &notices).unwrap(),
             1
         );
-        let files = NodeFilesRepo::new(&conn).get(&node_id).unwrap().unwrap();
-        assert!(files.worktree_path().is_none());
-        assert!(files.use_worktree);
+        assert!(locations.get(&node_id).unwrap().is_none());
         assert_eq!(notices.worktree_missing_notices(), vec![node_id]);
 
         writer.shutdown().unwrap();
@@ -269,18 +273,9 @@ mod tests {
         let (dir, conn) = test_writer_conn();
         let writer = open_writer(&dir);
         let node_id = seed_node(&conn);
-        let files = NodeFilesRepo::new(&conn);
-        files
-            .set_dev_container(
-                &node_id,
-                Some(&crate::fleet::DevContainerSetting {
-                    container: Some("app".into()),
-                    ..Default::default()
-                }),
-            )
-            .unwrap();
-        files
-            .update_worktree(&node_id, Some("/workspaces/app/.worktrees/x"), None, None)
+        let locations = FilesLocationRepo::new(&conn);
+        locations
+            .upsert(&location(&node_id, "/workspaces/app/.worktrees/x", Some("app")))
             .unwrap();
         let notices = crate::fleet::notices::FleetNoticeHooks::new();
 
@@ -288,8 +283,7 @@ mod tests {
             clear_missing_worktrees(&conn, &writer, &notices).unwrap(),
             0
         );
-        let files = files.get(&node_id).unwrap().unwrap();
-        assert_eq!(files.worktree_path(), Some("/workspaces/app/.worktrees/x"));
+        assert!(locations.get(&node_id).unwrap().is_some());
 
         writer.shutdown().unwrap();
         cleanup_test_dir(&dir);

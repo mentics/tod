@@ -24,7 +24,8 @@ COMMANDS:
     disable <NODE> <CAP>
     set     <NODE> agent [--platform claude|cursor] [--model <TEXT>] [--effort <TEXT>]
     set     <NODE> files [--dir <PATH>] [--branch <TEXT>] [--worktree on|off]
-                         [--container <NAME|ID>] [--mounted on|off] [--sandbox <NAME>]
+                         [--container <NAME|ID>] [--mounted on|off]
+                         [--sandbox image[:<IMAGE>]|fork:<NAME>]
     set     <NODE> ticket [--ticket <ID>]... [--pr <URL>]...
     set     <NODE> tags (--tags <A,B,..> | --add <TAG> | --remove <TAG>)
     set     <NODE> generator --source <TYPE> --config <JSON>
@@ -44,10 +45,16 @@ dev container (`--container ''` runs them on this machine again). The
 repository lives in the container: `--dir` is its path there, and worktrees
 are made there. `--mounted on` is for a repository on this machine mounted
 into the container: `--dir` stays the host path, git runs here, and the
-directory inside the container follows from its mounts. `--sandbox` does
-the same in a cloud sandbox (`--sandbox ''` runs them on this machine
-again); the repository always lives in the sandbox, so `--dir` is its path
-there.
+directory inside the container follows from its mounts. `--sandbox` gives
+each node that works from these settings a cloud sandbox of its own, made
+the first time it needs one: `image` from the account's default image,
+`image:<IMAGE>` from that image, `fork:<NAME>` as a copy of that sandbox
+(`--sandbox ''` runs them on this machine again). The image or forked
+sandbox must already hold the repository; `--dir` is its path there.
+
+Changing where the files are, or turning worktrees on or off, is refused
+while any node has a worktree or sandbox made from the old settings: they
+are removed from the app, which pushes each one's branch first.
 ";
 
 pub fn run(inv: Invocation) -> anyhow::Result<String> {
@@ -97,11 +104,22 @@ fn files_dev_container(
             ..current.unwrap_or_default()
         }),
         (None, Some(sandbox)) => {
-            tod_store::fleet::sandbox::validate_name(sandbox)?;
+            let from = match sandbox.split_once(':') {
+                None if sandbox == "image" => tod_store::fleet::SandboxFrom::Image(String::new()),
+                Some(("image", image)) => tod_store::fleet::SandboxFrom::Image(image.trim().to_string()),
+                Some(("fork", name)) => {
+                    tod_store::fleet::sandbox::validate_name(name.trim())?;
+                    tod_store::fleet::SandboxFrom::Fork(name.trim().to_string())
+                }
+                _ => anyhow::bail!(
+                    "--sandbox must be image, image:<IMAGE>, or fork:<NAME>, not `{sandbox}`"
+                ),
+            };
             Some(tod_store::fleet::DevContainerSetting {
-                container: Some(sandbox.to_string()),
+                container: None,
                 repo_on_host: false,
                 sandbox: true,
+                sandbox_from: from,
             })
         }
     };
@@ -120,6 +138,34 @@ fn files_dev_container(
         };
     }
     Ok(dev)
+}
+
+/// Refuse new Files settings that would leave worktrees or sandboxes made
+/// from the old ones behind: removing those needs the user (uncommitted
+/// work, a push), so it happens in the app.
+fn refuse_orphaning_locations(
+    inv: &Invocation,
+    node: Uuid,
+    repo: Option<&str>,
+    use_worktree: bool,
+    dev: Option<&tod_store::fleet::DevContainerSetting>,
+) -> anyhow::Result<()> {
+    use tod_store::fleet::repos::files_location::{FilesLocationRepo, recipe_key};
+    let recipe = recipe_key(repo, use_worktree, dev);
+    let source = node.to_string();
+    let made = inv.client().read(|conn| {
+        Ok(FilesLocationRepo::new(conn)
+            .list_all()?
+            .into_iter()
+            .filter(|l| l.source_node_id == source && l.recipe != recipe)
+            .count())
+    })?;
+    if made > 0 {
+        anyhow::bail!(
+            "{made} node(s) have a worktree or sandbox made from this node's current Files              settings. Changing where the files are would leave them behind; ask the user to              change it in the app, which removes them (pushing each branch first)."
+        );
+    }
+    Ok(())
 }
 
 /// The node's enabled capabilities and settings.
@@ -272,18 +318,24 @@ fn set(inv: &Invocation, node: Uuid, args: &Args) -> anyhow::Result<String> {
                 effort: merged(args, "--effort", s.agent_effort),
             }
         }
-        Capability::Files => OutlineMutation::SetNodeFiles {
-            node_id: node,
-            repo: merged(args, "--dir", s.repo),
-            branch: merged(args, "--branch", s.branch),
-            use_worktree: match args.get("--worktree") {
+        Capability::Files => {
+            let repo = merged(args, "--dir", s.repo);
+            let use_worktree = match args.get("--worktree") {
                 None => s.use_worktree,
                 Some("on") => true,
                 Some("off") => false,
                 Some(other) => anyhow::bail!("--worktree must be on or off, not `{other}`"),
-            },
-            dev_container: files_dev_container(args, s.dev_container)?,
-        },
+            };
+            let dev_container = files_dev_container(args, s.dev_container)?;
+            refuse_orphaning_locations(inv, node, repo.as_deref(), use_worktree, dev_container.as_ref())?;
+            OutlineMutation::SetNodeFiles {
+                node_id: node,
+                repo,
+                branch: merged(args, "--branch", s.branch),
+                use_worktree,
+                dev_container,
+            }
+        }
         Capability::Ticket => {
             let given = |flag: &str, old: Vec<String>| {
                 let values: Vec<String> = args

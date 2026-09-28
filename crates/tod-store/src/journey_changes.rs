@@ -47,6 +47,9 @@
 //! - `phase_events` (`tod_store::phase`; insert-only, the log is
 //!   append-only), created by [`phase_events_triggers_sql`] in the v74
 //!   migration step that creates the table.
+//! - `node_files_locations` (`tod_store::fleet::repos::files_location`, the
+//!   worktree or sandbox made for each node), created by
+//!   [`files_locations_triggers_sql`] in the v75 migration.
 //!
 //! Deliberately excluded, with reasons:
 //! - `node_plan_step_deps`, `node_plan_step_obligations`, `node_plan_step_notes`
@@ -288,6 +291,11 @@ pub fn node_events_triggers_sql() -> String {
 /// Triggers for `cloud_nodes` (one row per node, keyed by `node_id`).
 pub fn cloud_nodes_triggers_sql() -> String {
     node_keyed_triggers("cloud_nodes")
+}
+
+/// Triggers for `node_files_locations` (one row per node).
+pub fn files_locations_triggers_sql() -> String {
+    node_keyed_triggers("node_files_locations")
 }
 
 /// Triggers for `request_feedback` (simple `(id, node_id)` shape, can be

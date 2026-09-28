@@ -444,7 +444,8 @@ impl FleetStore {
     ///
     /// - Agent: blocked while an agent launched from this node is still running.
     /// - Files: blocked while a shell launched from this node is open, or while
-    ///   this node has a set-up worktree (release it first).
+    ///   any node has a worktree or sandbox made from its settings (remove
+    ///   them first).
     pub fn capability_disable_blocker(
         &self,
         node_id: &str,
@@ -455,34 +456,24 @@ impl FleetStore {
         crate::outline::repos::NodeRepo::new(&guard.connection()).disable_blocker(node_id, cap)
     }
 
-    /// Why the worktree set up for `owner_node_id`'s Files can't be released yet:
-    /// shells or agents still running from any node whose Files resolve to it.
-    pub fn worktree_release_blocker(&self, owner_node_id: &str) -> Result<Option<String>> {
+    /// Why `node_id`'s own worktree or sandbox can't be removed yet: its
+    /// shells or agents still running.
+    pub fn location_blocker(&self, node_id: &str) -> Result<Option<String>> {
         let guard = self.projection.lock().expect("fleet projection mutex");
         let conn = guard.connection();
-        let mut resolved: HashMap<String, bool> = HashMap::new();
-        let mut uses_owner = |node_id: &str| -> Result<bool> {
-            if let Some(hit) = resolved.get(node_id) {
-                return Ok(*hit);
-            }
-            let hit = resolve_files_for_node(&conn, node_id)?
-                .is_some_and(|files| files.source_node_id == owner_node_id);
-            resolved.insert(node_id.to_string(), hit);
-            Ok(hit)
-        };
-        let mut shells = 0;
-        for shell in ShellRepo::new(&conn).list_all()? {
-            if shell.reconnect.is_some() && uses_owner(&shell.node_id)? {
-                shells += 1;
-            }
-        }
-        let mut agents = 0;
-        for run in AgentRunRepo::new(&conn).list_unended()? {
-            let running = run.reconnect.is_some() || run.runtime_status == RUNTIME_STATUS_ACTIVE;
-            if running && uses_owner(&run.node_id)? {
-                agents += 1;
-            }
-        }
+        let shells = ShellRepo::new(&conn)
+            .list_all()?
+            .into_iter()
+            .filter(|shell| shell.node_id == node_id && shell.reconnect.is_some())
+            .count();
+        let agents = AgentRunRepo::new(&conn)
+            .list_unended()?
+            .into_iter()
+            .filter(|run| {
+                run.node_id == node_id
+                    && (run.reconnect.is_some() || run.runtime_status == RUNTIME_STATUS_ACTIVE)
+            })
+            .count();
         let running = [(shells, "shell(s)"), (agents, "agent(s)")]
             .into_iter()
             .filter(|(count, _)| *count > 0)
@@ -491,10 +482,7 @@ impl FleetStore {
         if running.is_empty() {
             return Ok(None);
         }
-        Ok(Some(format!(
-            "{} still running in this worktree. Close them before releasing it.",
-            running.join(" and ")
-        )))
+        Ok(Some(format!("{} still running in it. Close them first.", running.join(" and "))))
     }
 
     /// Shell sessions launched from a node.

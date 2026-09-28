@@ -80,12 +80,13 @@ pub enum FleetMutation {
         node_id: String,
         dev_container: Option<crate::fleet::repos::node_files::DevContainerSetting>,
     },
-    /// Record (or clear, with `None`s) the node's set-up worktree.
-    UpdateNodeWorktree {
+    /// Record the worktree or sandbox made for a node.
+    RecordFilesLocation {
+        location: crate::fleet::repos::files_location::FilesLocation,
+    },
+    /// Forget a node's location (it was removed, or is gone).
+    DeleteFilesLocation {
         node_id: String,
-        worktree_path: Option<String>,
-        worktree_lease_id: Option<String>,
-        worktree_lease_holder: Option<String>,
     },
     // --- Agent capability (immediate) ---
     /// Platform / model / effort for a node; `None` follows settings.
@@ -205,7 +206,8 @@ impl FleetMutation {
             FleetMutation::DeleteTask { .. }
                 | FleetMutation::SetNodeUseWorktree { .. }
                 | FleetMutation::SetNodeDevContainer { .. }
-                | FleetMutation::UpdateNodeWorktree { .. }
+                | FleetMutation::RecordFilesLocation { .. }
+                | FleetMutation::DeleteFilesLocation { .. }
                 | FleetMutation::UpsertNodeAgent { .. }
                 | FleetMutation::UpdateAgentRunReconnect { .. }
                 | FleetMutation::ClearAgentRunReconnect { .. }
@@ -285,18 +287,11 @@ impl FleetMutation {
             } => {
                 NodeFilesRepo::new(conn).set_dev_container(node_id, dev_container.as_ref())?;
             }
-            FleetMutation::UpdateNodeWorktree {
-                node_id,
-                worktree_path,
-                worktree_lease_id,
-                worktree_lease_holder,
-            } => {
-                NodeFilesRepo::new(conn).update_worktree(
-                    node_id,
-                    worktree_path.as_deref(),
-                    worktree_lease_id.as_deref(),
-                    worktree_lease_holder.as_deref(),
-                )?;
+            FleetMutation::RecordFilesLocation { location } => {
+                crate::fleet::repos::files_location::FilesLocationRepo::new(conn).upsert(location)?;
+            }
+            FleetMutation::DeleteFilesLocation { node_id } => {
+                crate::fleet::repos::files_location::FilesLocationRepo::new(conn).delete(node_id)?;
             }
             FleetMutation::UpsertNodeAgent {
                 node_id,

@@ -97,6 +97,8 @@ pub fn evaluate_derived_criterion(
 /// Give the node's Files capability the branch `task/<slug>` when it has
 /// none, so the `ready` → `active` check that requires one always finds it.
 /// The slug is the node's own, even when Files is inherited from an ancestor.
+/// When each node gets its own worktree or sandbox, the branch is the node's
+/// own too; otherwise it goes on the Files it shares.
 pub fn generate_missing_branch(fleet: &FleetStore, node_id: Uuid) -> Result<()> {
     fleet.reload_if_stale().ok();
     let Some(files) = fleet.resolve_files_for_node(&node_id.to_string())? else {
@@ -108,8 +110,13 @@ pub fn generate_missing_branch(fleet: &FleetStore, node_id: Uuid) -> Result<()> 
     let Some(node) = fleet.read(|conn| Ok(NodeRepo::new(conn).get(node_id)?))? else {
         return Ok(());
     };
+    let id = if files.per_node() {
+        files.node_id
+    } else {
+        files.source_node_id
+    };
     fleet.enqueue(FleetMutation::UpdateTaskBranch {
-        id: files.source_node_id,
+        id,
         branch: Some(format!("task/{}", node.slug)),
     })?;
     fleet.writer().flush()?;
@@ -202,11 +209,17 @@ fn implementation_setup_outcome(conn: &Connection, node_id: Uuid) -> Result<Deri
     }
     let directory = match files.directory() {
         FilesDirectory::Ready(path) => path,
-        FilesDirectory::NeedsWorktreeSetup => {
-            return Ok(fail(format!(
-                "Files on \"{}\" uses a worktree that hasn't been set up yet.",
-                files.source_title
-            )));
+        // Made when implementation first needs it.
+        FilesDirectory::NotMade => {
+            return Ok(DerivedOutcome {
+                outcome: OUTCOME_PASS,
+                detail: format!(
+                    "Agent from \"{}\"; Files from \"{}\" ({}), made when implementation starts",
+                    agent.source_title,
+                    files.source_title,
+                    files.describe_recipe()
+                ),
+            });
         }
         FilesDirectory::Missing(reason) => {
             return Ok(fail(format!(

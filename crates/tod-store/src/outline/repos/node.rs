@@ -404,7 +404,7 @@ impl<'a> NodeRepo<'a> {
     /// something is still running off it.
     pub fn disable_blocker(&self, node_id: Uuid, cap: Capability) -> Result<Option<String>> {
         use crate::fleet::repos::agent_run::AgentRunRepo;
-        use crate::fleet::repos::node_files::NodeFilesRepo;
+        use crate::fleet::repos::files_location::FilesLocationRepo;
         use crate::fleet::repos::shell::ShellRepo;
         let id = node_id.to_string();
         Ok(match cap {
@@ -424,16 +424,18 @@ impl<'a> NodeRepo<'a> {
                         "{} shell(s) on this task are still open. Close them before disabling Files.",
                         shells.len()
                     ))
-                } else if NodeFilesRepo::new(self.conn)
-                    .get(&id)?
-                    .is_some_and(|files| files.worktree_path().is_some())
-                {
-                    Some(
-                        "This task has a set-up worktree. Release the worktree before disabling Files."
-                            .into(),
-                    )
                 } else {
-                    None
+                    let made = FilesLocationRepo::new(self.conn)
+                        .list_all()?
+                        .into_iter()
+                        .filter(|location| location.source_node_id == id)
+                        .count();
+                    (made > 0).then(|| {
+                        format!(
+                            "{made} node(s) have a worktree or sandbox made from these Files \
+                             settings. Remove them before disabling Files."
+                        )
+                    })
                 }
             }
             _ => None,

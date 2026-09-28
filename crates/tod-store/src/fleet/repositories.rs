@@ -72,10 +72,11 @@ pub fn node_repositories(files: &ResolvedFiles) -> Result<NodeRepositories, Stri
     let root = match files.directory() {
         FilesDirectory::Ready(dir) => dir,
         // Before the worktree exists, the repository it will be made from
-        // already has the remotes, and the branch is the configured one.
-        FilesDirectory::NeedsWorktreeSetup => files
+        // already has the remotes, and the branch is the node's. A sandbox
+        // not made yet has nothing to read.
+        FilesDirectory::NotMade => files
             .repo_dir()
-            .ok_or_else(|| "Set a workspace directory".to_string())?,
+            .ok_or_else(|| "Made when the node first needs its files".to_string())?,
         FilesDirectory::Missing(reason) => return Err(reason),
     };
     let worktree_ready = files.use_worktree && files.worktree_path().is_some();
@@ -174,15 +175,15 @@ mod tests {
 
     fn files_at(repo: &Path, branch: Option<&str>) -> ResolvedFiles {
         ResolvedFiles {
+            node_id: String::new(),
             source_node_id: String::new(),
             source_title: String::new(),
             inherited: false,
             repo: Some(repo.to_string_lossy().into_owned()),
             branch: branch.map(str::to_string),
             use_worktree: false,
-            worktree_path: None,
-            worktree_lease_id: None,
-            worktree_lease_holder: None,
+            location: None,
+            stale_location: None,
             dev_container: None,
         }
     }

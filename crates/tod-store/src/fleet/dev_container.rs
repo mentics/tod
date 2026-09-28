@@ -113,15 +113,15 @@ mod tests {
 
     fn files(dir: &Path, dev: Option<DevContainerSetting>) -> ResolvedFiles {
         ResolvedFiles {
+            node_id: "n".into(),
             source_node_id: "n".into(),
             source_title: "n".into(),
             inherited: false,
             repo: Some(dir.to_string_lossy().into_owned()),
             branch: None,
             use_worktree: false,
-            worktree_path: None,
-            worktree_lease_id: None,
-            worktree_lease_holder: None,
+            location: None,
+            stale_location: None,
             dev_container: dev,
         }
     }

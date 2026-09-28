@@ -48,13 +48,15 @@ pub use notices::FleetNoticeHooks;
 pub use paths::FleetPaths;
 pub use projection::FleetProjection;
 pub use provision::{
-    release_worktree_for_node, rename_branch_for_node, resolve_launch_cwd, setup_worktree_for_node,
+    AffectedLocation, LocationState, launch_cwd_if_made, rename_branch_for_node, resolve_launch_cwd,
+    resolve_launch_cwd_with,
 };
 pub use reattach::ReattachReport;
 pub use repos::agent_run::AgentRun;
 pub use repos::agent_session::{AgentSession, NewAgentSession};
 pub use repos::node_agent::NodeAgent;
-pub use repos::node_files::{DevContainerSetting, NodeFiles};
+pub use repos::files_location::FilesLocation;
+pub use repos::node_files::{DevContainerSetting, NodeFiles, SandboxFrom};
 pub use repos::notification::FleetNotification;
 pub use repos::shell::ShellSession;
 pub use repos::task::{FleetTask, NoteItem};
@@ -62,7 +64,7 @@ pub use runtime::{GuestLivenessCheck, NoopGuestLiveness};
 pub use store::FleetStore;
 pub use terminal::{
     default_terminal_hint, focus_shell_session, focus_terminal_agent_run, launch_shell_terminal,
-    open_host_terminal_command, open_shell_for_node, open_terminal_agent_for_node, open_terminal_command,
+    open_host_terminal_command, open_shell_for_node, open_shell_in_location, open_terminal_agent_for_node, open_terminal_command,
     prune_stale_shell_sessions,
     prune_stale_terminal_agent_runs, read_shell_state, remove_shell_state, shells_dir,
     state_file_path, verify_shell_session,

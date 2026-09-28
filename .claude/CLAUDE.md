@@ -362,6 +362,31 @@ checking a gate (`settle_gate`), which may call GitHub.
 
 Tracks agents running against git worktrees: provisioning (`provision.rs`), launching (`launch.rs`, `runtime.rs`), reattaching to running processes (`reattach.rs`), terminal sessions (`terminal/`), prompt queuing (`prompt_queue.rs`), and an undo log (`undo.rs`). `store.rs` / `writer.rs` / `schema.rs` / `migration.rs` are the SQLite persistence core; `projection.rs` derives read-side views for the UI.
 
+### Files: settings inherit, locations are per node
+
+The Files capability is a recipe, not a place: it says how to get a node
+its files, and every node below it that does not enable Files itself
+inherits it. A node whose files come from a worktree or a sandbox gets
+**its own** (`node_files_locations`, schema v75, machine-local and not
+synced), made the first time something needs its files: a launch, a shell,
+an editor, a protocol's `cwd` (`provision::resolve_launch_cwd`, which only
+runs off the UI thread; the UI thread asks `launch_cwd_if_made`). There is
+no "set up" button. Each is on its own branch (the node's own
+`node_fields.branch`, `task/<slug>` by default). Without a worktree or
+sandbox, nodes share the workspace directory as before.
+
+A location records the node it was made from (`source_node_id`) and a
+fingerprint of those settings (`files_location::recipe_key`). It is used
+only while both still match; otherwise it is stale and a launch refuses it
+until it is removed. Changing a Files capability's settings, enabling Files
+below one (an override), or disabling it first shows every location that
+would go stale (`provision::locations_affected_by`) in
+`ui::files_impact`: removing one pushes its branch, then deletes the
+sandbox or worktree; uncommitted work offers Commit, Retry, Shell (the
+dialog stays open), and Discard. This is the rule for any significant
+change: confirm it with its impact shown. `tod-cli` refuses such a change
+instead. Spec: `doc/files-locations.md`.
+
 ### Dev containers
 
 The Files capability can run a node's work in a running dev container
@@ -456,12 +481,15 @@ Nothing starts or builds a container; tod only uses a running one.
   Treehouse one needs `TOD_TEST_DEV_CONTAINER_TREEHOUSE` (a container with
   `treehouse` on its `PATH`).
 - **Cloud sandboxes** are the third place ("Runs in → Cloud sandbox";
-  `node_files.container_kind = 'sandbox'`, with the sandbox's name in
-  `container`; `tod-cli capabilities set <node> files --sandbox <name>`). The
-  repository always lives in the sandbox. The Files section lists the
-  workspace's sandboxes (`fleet::sandbox::list`) and makes new ones from an
-  image or as a fork (`Sandboxes::create` with `NewSandboxSource`, off the UI
-  thread); the workspace and default image are in Settings → Cloud sandboxes
+  `node_files.container_kind = 'sandbox'`, with what each node's sandbox
+  starts from in `sandbox_source` / `sandbox_from` (`SandboxFrom`: an image,
+  or a fork of a workspace sandbox); `tod-cli capabilities set <node> files
+  --sandbox image[:<IMAGE>]|fork:<NAME>`). Every node gets a sandbox of its
+  own (`provision::make_sandbox`, `Sandboxes::create`), whose name is on its
+  location, not the settings. The repository always lives in the sandbox:
+  the image or forked sandbox must already hold it. The Files section lists
+  the workspace's sandboxes (`fleet::sandbox::list`) to pick one to fork;
+  the workspace and default image are in Settings → Cloud sandboxes
   (`account_settings` / `set_account_settings`, kept in `sandboxes.toml`,
   not the settings file). `Workdir::Sandbox`
   runs git through `tod-sandbox exec`, and `AgentEnvironment::Sandbox`

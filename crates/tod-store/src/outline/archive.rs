@@ -43,6 +43,10 @@ pub struct ArchivedNode {
     pub files: Option<ArchivedNodeFiles>,
     #[serde(default)]
     pub agent: Option<ArchivedNodeAgent>,
+    /// The worktree or sandbox made for the node (it is not deleted with
+    /// the node, so restoring puts the node back in it).
+    #[serde(default)]
+    pub files_location: Option<crate::fleet::repos::files_location::FilesLocation>,
     /// Archives written before plan steps were archived have none.
     #[serde(default)]
     pub plan_steps: Vec<ArchivedPlanStep>,
@@ -82,6 +86,14 @@ pub struct ArchivedNodeFiles {
     pub container_repo_on_host: bool,
     #[serde(default = "docker_kind")]
     pub container_kind: String,
+    #[serde(default = "image_source")]
+    pub sandbox_source: String,
+    #[serde(default)]
+    pub sandbox_from: String,
+}
+
+fn image_source() -> String {
+    "image".into()
 }
 
 fn docker_kind() -> String {
@@ -302,7 +314,8 @@ fn snapshot_fields(conn: &Connection, node_id: Uuid) -> Result<Option<ArchivedFi
 fn snapshot_node_files(conn: &Connection, node_id: Uuid) -> Result<Option<ArchivedNodeFiles>> {
     conn.query_row(
         "SELECT use_worktree, worktree_path, worktree_lease_id, worktree_lease_holder, updated_at,
-                dev_container, container, container_repo_on_host, container_kind
+                dev_container, container, container_repo_on_host, container_kind,
+                sandbox_source, sandbox_from
          FROM node_files WHERE node_id = ?1",
         params![uuid_to_blob(node_id)],
         |row| {
@@ -316,6 +329,8 @@ fn snapshot_node_files(conn: &Connection, node_id: Uuid) -> Result<Option<Archiv
                 container: row.get(6)?,
                 container_repo_on_host: row.get::<_, i64>(7)? != 0,
                 container_kind: row.get(8)?,
+                sandbox_source: row.get(9)?,
+                sandbox_from: row.get(10)?,
             })
         },
     )
@@ -432,6 +447,8 @@ fn snapshot_node(conn: &Connection, node_id: Uuid) -> Result<ArchivedNode> {
         capability_archives,
         files: snapshot_node_files(conn, node_id)?,
         agent: snapshot_node_agent(conn, node_id)?,
+        files_location: crate::fleet::repos::files_location::FilesLocationRepo::new(conn)
+            .get(&node_id.to_string())?,
         plan_steps,
     })
 }
@@ -743,8 +760,9 @@ fn restore_node(conn: &Connection, archived: &ArchivedNode) -> Result<()> {
         conn.execute(
             "INSERT OR IGNORE INTO node_files
                (node_id, use_worktree, worktree_path, worktree_lease_id, worktree_lease_holder, updated_at,
-                dev_container, container, container_repo_on_host, container_kind)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                dev_container, container, container_repo_on_host, container_kind,
+                sandbox_source, sandbox_from)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 blob,
                 i32::from(files.use_worktree),
@@ -756,8 +774,13 @@ fn restore_node(conn: &Connection, archived: &ArchivedNode) -> Result<()> {
                 files.container,
                 i32::from(files.container_repo_on_host),
                 files.container_kind,
+                files.sandbox_source,
+                files.sandbox_from,
             ],
         )?;
+    }
+    if let Some(location) = &archived.files_location {
+        crate::fleet::repos::files_location::FilesLocationRepo::new(conn).upsert(location)?;
     }
     if let Some(agent) = &archived.agent {
         conn.execute(
@@ -952,7 +975,22 @@ mod tests {
             .unwrap();
         let child = child_id.to_string();
         crate::fleet::repos::node_files::NodeFilesRepo::new(&conn)
-            .update_worktree(&child, Some("/wt/child"), None, None)
+            .set_use_worktree(&child, true)
+            .unwrap();
+        let locations = crate::fleet::repos::files_location::FilesLocationRepo::new(&conn);
+        locations
+            .upsert(&crate::fleet::repos::files_location::FilesLocation {
+                node_id: child.clone(),
+                source_node_id: child.clone(),
+                recipe: "r".into(),
+                repo: Some("/repo".into()),
+                container: None,
+                worktree_path: Some("/wt/child".into()),
+                worktree_lease_id: None,
+                worktree_lease_holder: None,
+                sandbox: None,
+                created_at: 0,
+            })
             .unwrap();
         crate::fleet::repos::node_agent::NodeAgentRepo::new(&conn)
             .upsert(&child, Some("cursor"), None, Some("high"))
@@ -974,7 +1012,9 @@ mod tests {
             .get(&child)
             .unwrap()
             .expect("files restored");
-        assert_eq!(files.worktree_path(), Some("/wt/child"));
+        assert!(files.use_worktree);
+        let location = locations.get(&child).unwrap().expect("location restored");
+        assert_eq!(location.worktree_path(), Some("/wt/child"));
         let agent = crate::fleet::repos::node_agent::NodeAgentRepo::new(&conn)
             .get(&child)
             .unwrap()

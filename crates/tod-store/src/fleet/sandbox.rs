@@ -3,8 +3,12 @@
 //! running commands in one. `tod-sandbox` (the user's tool) and the app both
 //! go through here; the transport is `tod_sandbox`.
 //!
-//! A node's work runs in a sandbox when its Files capability names one
-//! ([`crate::fleet::DevContainerSetting::sandbox`]): git runs there through
+//! A node's work runs in a sandbox of its own when its Files capability
+//! (its own or an ancestor's) runs in sandboxes
+//! ([`crate::fleet::DevContainerSetting::sandbox`]); the sandbox is made
+//! from [`crate::fleet::SandboxFrom`] the first time the node needs it
+//! ([`crate::fleet::provision`]) and deleted with [`Sandboxes::delete`] when
+//! it is removed. Git runs there through
 //! the relay ([`SandboxExec`]), agents run under the relay and are bridged to
 //! this machine by `tod-sandbox agent`, and their `tod-cli` comes back
 //! through the relay's tunnel to [`crate::fleet::cli_relay`].
