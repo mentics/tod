@@ -1694,11 +1694,13 @@ fn sign_in_hint(host: AcpHost, environment: &AgentEnvironment) -> String {
             "{who} is not signed in on this machine. In a terminal, {sign_in}, then send again."
         ),
         AgentEnvironment::DevContainer(launch) => format!(
-            "{who} is not signed in inside dev container `{}`. Open a shell there (the node's              Files section, Open shell), {sign_in}, then send again.",
+            "{who} is not signed in inside dev container `{}`. Open a shell there (the node's \
+            Files section, Open shell), {sign_in}, then send again.",
             launch.container
         ),
         AgentEnvironment::Sandbox(launch) => format!(
-            "{who} is not signed in inside cloud sandbox `{0}`. Open a shell there (the node's              Files section, Open shell, or `tod-sandbox shell {0}`), {sign_in}, then send again.",
+            "{who} is not signed in inside cloud sandbox `{0}`. Open a shell there (the node's \
+            Files section, Open shell, or `tod-sandbox shell {0}`), {sign_in}, then send again.",
             launch.sandbox
         ),
     }

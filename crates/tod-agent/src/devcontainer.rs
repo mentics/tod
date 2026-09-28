@@ -500,7 +500,8 @@ pub fn resolve_directory(
         Some(dir) if !dir.is_empty() => dir.to_string(),
         _ => info.map_host_path(host_dir).with_context(|| {
             format!(
-                "{} is not mounted in dev container `{container}`. Mount it, or set the                  directory in the container (Files).",
+                "{} is not mounted in dev container `{container}`. Mount it, or set the \
+                directory in the container (Files).",
                 host_dir.display(),
             )
         })?,

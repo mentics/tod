@@ -611,11 +611,13 @@ fn reverify_first(standing: &Standing) -> String {
         ));
     }
     if owed.is_empty() {
-        return "Verify again before the gate check: a failed requirement has no failed                 plan step to carry it back to implementation."
+        return "Verify again before the gate check: a failed requirement has no failed \
+        plan step to carry it back to implementation."
             .to_string();
     }
     format!(
-        "Verify again before the gate check: {} not verified against the current          code (changed since the last verification, or never checked).",
+        "Verify again before the gate check: {} not verified against the current \
+        code (changed since the last verification, or never checked).",
         owed.join(" and ")
     )
 }
