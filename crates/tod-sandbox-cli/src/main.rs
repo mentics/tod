@@ -63,11 +63,13 @@ agent <name> --name AGENT [--cwd DIR] [--idle SECS] [--cli-relay] [--env NAME]..
 zed <name> [PATH]        Open PATH (default /root) in Zed on the sandbox.
 delete <name>            Delete a sandbox.
 watchdog run-once [--orchestrator-url URL] [--max-awake-secs N] [--max-lease-secs N]
-                         One watchdog pass: release the holds on any running
-                         node sandbox held past its lease, and flag its node.
-watchdog deploy --image IMAGE [--orchestrator-url URL] [--max-awake-secs N] [--max-lease-secs N]
-                         Create (or replace) the hourly Blaxel job that runs
-                         tod-watchdog from IMAGE. Needs an API-key sign-in.
+                         One watchdog pass: release the holds on any node
+                         sandbox held past its lease, and flag its node.
+watchdog deploy [--image IMAGE] [--orchestrator-url URL] [--max-awake-secs N] [--max-lease-secs N]
+                         Create (or update) the hourly Blaxel job that runs
+                         tod-watchdog. Without --image, builds job/tod-watchdog
+                         from target/sandbox/tod-watchdog with `bl push`.
+                         Needs an API-key sign-in.
 orchestrator [--image IMAGE] [--bin PATH] [--tod-cli PATH] [--move-data]
                          Create (if needed) the team's orchestrator sandbox
                          (sandboxes.toml's `orchestrator`, with its data on the
@@ -459,7 +461,21 @@ fn watchdog(ctx: &Ctx, mut args: Args) -> Result<i32> {
             if acct.auth == AuthMode::Bl {
                 bail!("the watchdog job needs a workspace API key (a `bl login` token expires): run `tod-sandbox setup --auth api-key` first");
             }
-            let image = image.context("deploy needs --image (an image with /opt/tod/tod-watchdog)")?;
+            let image = match image {
+                Some(image) => image,
+                None => {
+                    // The job's image: the Linux tod-watchdog as its entrypoint.
+                    let bin = sandbox_binary("tod-watchdog")
+                        .context("build it with scripts/build-sandbox-binaries.sh, or pass --image")?;
+                    let dir = sandboxes::build_dir(wd::JOB_NAME)?;
+                    std::fs::copy(&bin, dir.join("tod-watchdog")).with_context(|| format!("copy {}", bin.display()))?;
+                    std::fs::write(dir.join("Dockerfile"), wd::job_dockerfile())?;
+                    std::fs::write(dir.join("blaxel.toml"), wd::job_blaxel_toml())?;
+                    eprintln!("building {} from {}…", wd::JOB_IMAGE, bin.display());
+                    ctx.bl_push(&dir, true, &mut |m| eprintln!("{m}"))?;
+                    wd::JOB_IMAGE.to_string()
+                }
+            };
             let spec = wd::JobSpec { image: &image, region: &acct.region, orchestrator_url: &orchestrator_url, policy };
             wd::deploy(&bx, &spec)?;
             println!("{}: hourly ({}), from {image}", wd::JOB_NAME, wd::SCHEDULE);

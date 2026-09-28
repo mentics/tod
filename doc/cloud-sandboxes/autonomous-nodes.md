@@ -418,11 +418,15 @@ writes them.
   resets the failure count or grants another budget of the same size;
   "Leave it stopped" / "Leave it asleep" keeps the node stopped with no
   wake scheduled until the user answers again. See `orchestrator.md`.
-- **The watchdog.** Hourly, it lists the workspace's sandboxes through the
-  control plane (which does not wake them). A sandbox that has been awake
-  longer than its lease allows gets its hold cleared (the process API: kill
-  any `keepAlive` process), and the node is flagged through the
-  orchestrator. The watchdog does nothing else.
+- **The watchdog.** Hourly, it lists the workspace's node sandboxes through
+  the control plane and asks each one's relay what holds it. It cannot
+  skip the ones in standby: the control plane reports a sandbox held awake
+  by a `keepAlive` process as `STANDBY` (its state follows proxied traffic,
+  not the VM), so asking wakes a sleeping one for that one request. A
+  sandbox that has been awake longer than its lease allows gets its holds
+  cleared (the relay's `release-all`, which kills its `keepAlive`
+  process), and the node is flagged through the orchestrator. The watchdog
+  does nothing else. See `orchestrator.md`.
 - **A lost sandbox is replaced, not repaired.** See Where data lives: code is
   pushed, state is on the orchestrator, and a new sandbox continues from them.
 
@@ -700,7 +704,10 @@ chosen per account in `sandboxes.toml`, so the same code runs everywhere:
 2. **Agent Drive.** Private preview, and only in `us-was-1`, which is also
    the region the team will use (tod's default region is now `us-was-1`).
    Check that a mount survives standby, and how it behaves with a line
-   appended per transcript write.
+   appended per transcript write. Not testable yet (2026-09-28): the
+   development workspace does not have it (`GET /v0/drives` answers 403
+   "Drives feature is not enabled for this workspace"); it has to be
+   requested from Blaxel for the workspace first.
 3. **Volumes.** Verified on the development workspace (2026-09-27): an
    orchestrator's `/data` moved onto a volume with `--move-data`, then the
    sandbox deleted and redeployed with `tod-sandbox orchestrator`: the
@@ -761,3 +768,25 @@ chosen per account in `sandboxes.toml`, so the same code runs everywhere:
    delayed no sample (they were 2.5 s apart).
 6. **Subscription use.** One subscription driving many unattended agents: the
    limits, and that it is within the subscription's terms.
+7. **The watchdog job.** Verified on the development workspace
+   (2026-09-28), with the API key (`auth = "api-key"`): `tod-sandbox
+   watchdog deploy` built `job/tod-watchdog:latest` and created the job
+   (cron `0 * * * *`, UTC; the token a `secret: true` env). A test sandbox
+   labelled as a node of a scratch orchestrator user (`watchdog-test`, one
+   node) held itself with `hold?reason=wdtest&secs=7200`. The first job
+   skipped it (the control plane said `STANDBY`; see Crash guards). A tick
+   written every 5 s inside it had no gap for as long as it was held (13
+   minutes in all), and one 12 s gap, just after the watchdog released
+   it: held, the VM runs whatever `state` says. Fixed,
+   the next manual execution logged `released wd-test-node: hold
+   "ext:wdtest" leased for another 1h45m`, the relay's `/holds` was empty
+   afterwards, and the orchestrator had filed a pending `watchdog`
+   decision on the node ("Wake it again" / "Leave it asleep"). The
+   held-too-long path (`TOD_WATCHDOG_MAX_AWAKE_SECS=60` as an execution
+   env override): runs at 20 s and 44 s held left the hold alone; the run
+   after 60 s released it. `tod-sandbox watchdog run-once` from this
+   machine did the same. The cron fired on its own at 07:00:08 UTC (8 s
+   late) and released a hold left for it (`released wd-test-node: hold
+   "ext:wdcron" leased for another 1h17m`), filing its decision. Each run
+   took 1.5–3 s. The job stays deployed on the development workspace.
+   Blaxel's jobs API as found is in `orchestrator.md`.
