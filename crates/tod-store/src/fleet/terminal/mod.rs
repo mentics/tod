@@ -899,7 +899,14 @@ fn environment_startup(
         script.push_str(&format!("export {key}={}\n", sh_quote(value)));
     }
     // Not a login shell: a login profile resets `PATH`, and with it `tod-cli`.
-    script.push_str("shell=bash; command -v bash >/dev/null 2>&1 || shell=sh\n");
+    // The container user's own configured shell (as `/etc/passwd` has it,
+    // e.g. zsh), falling back to bash, then sh, if it isn't set or isn't
+    // runnable here.
+    script.push_str(
+        "shell=$(getent passwd \"$(id -un)\" 2>/dev/null | cut -d: -f7)\n\
+         command -v \"$shell\" >/dev/null 2>&1 || shell=bash\n\
+         command -v \"$shell\" >/dev/null 2>&1 || shell=sh\n",
+    );
     match inner.map(str::trim).filter(|c| !c.is_empty()) {
         // The shell stays after the CLI exits, as on this machine.
         Some(inner) => script.push_str(&format!(
@@ -927,8 +934,12 @@ fn environment_startup(
         exec.extend(["-u".to_string(), user.clone()]);
     }
     exec.extend([container.id.clone(), "sh".to_string(), script_path]);
+    // On a POSIX host shell, replace it outright: once the container's own
+    // shell exits, the wrapping terminal is done too, instead of dropping
+    // back into a leftover host shell that itself needs closing.
+    let exec_prefix = if cfg!(unix) { "exec " } else { "" };
     Ok(Some(format!(
-        "{} {}",
+        "{exec_prefix}{} {}",
         docker_invocation(terminal),
         exec.join(" ")
     )))
@@ -965,7 +976,11 @@ fn sandbox_startup(
     if let Some(inner) = inner.map(str::trim).filter(|c| !c.is_empty()) {
         parts.extend(["--run".into(), host_quote(inner, terminal)]);
     }
-    Ok(parts.join(" "))
+    // See the matching comment in `environment_startup`: replace the host
+    // shell outright on POSIX, instead of leaving it around to be exited
+    // a second time once the sandbox's own shell exits.
+    let cmd = parts.join(" ");
+    Ok(if cfg!(unix) { format!("exec {cmd}") } else { cmd })
 }
 
 /// Where a sandbox terminal's relay endpoint waits for `tod-sandbox`.

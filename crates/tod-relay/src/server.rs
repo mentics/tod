@@ -139,6 +139,24 @@ fn home_dir() -> String {
     "/root".into()
 }
 
+/// The user's own configured shell (`/etc/passwd`), for the no-`cmd` case:
+/// bash, then sh, if it isn't set or isn't runnable here.
+fn default_shell() -> String {
+    // SAFETY: getpwuid returns a pointer into static storage or null.
+    let from_passwd: Option<String> = unsafe {
+        let pw = libc::getpwuid(libc::getuid());
+        if !pw.is_null() && !(*pw).pw_shell.is_null() {
+            Some(CStr::from_ptr((*pw).pw_shell).to_string_lossy().into_owned())
+        } else {
+            None
+        }
+    };
+    if let Some(shell) = from_passwd.filter(|shell| Path::new(shell).is_file()) {
+        return shell;
+    }
+    if Path::new("/bin/bash").exists() { "/bin/bash".into() } else { "/bin/sh".into() }
+}
+
 fn close(code: u16, reason: &str) -> Message {
     Message::Close(Some(CloseFrame { code: CloseCode::from(code), reason: reason.to_string().into() }))
 }
@@ -581,8 +599,7 @@ fn command(relay: &Relay, req: &ExecReq) -> std::process::Command {
             cmd
         }
         _ => {
-            let shell = if Path::new("/bin/bash").exists() { "/bin/bash" } else { "/bin/sh" };
-            let mut cmd = std::process::Command::new(shell);
+            let mut cmd = std::process::Command::new(default_shell());
             cmd.arg("-l");
             cmd
         }
