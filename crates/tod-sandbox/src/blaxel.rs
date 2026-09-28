@@ -207,6 +207,22 @@ impl Blaxel {
         check(&mut resp, "create sandbox")
     }
 
+    /// `GET {API}{path}`, for calls this type has no method for; `None` on a 404.
+    pub fn get_path(&self, path: &str, what: &str) -> Result<Option<Value>> {
+        let mut resp = self.auth(self.agent.get(&format!("{API}{path}"))).call().context("Blaxel API")?;
+        if resp.status().as_u16() == 404 {
+            return Ok(None);
+        }
+        check(&mut resp, what)?;
+        Ok(Some(resp.body_mut().read_json()?))
+    }
+
+    /// `PUT {API}{path}` with a JSON body, for calls this type has no method for.
+    pub fn put_json(&self, path: &str, body: &Value, what: &str) -> Result<()> {
+        let mut resp = self.auth(self.agent.put(&format!("{API}{path}"))).send_json(body).context("Blaxel API")?;
+        check(&mut resp, what)
+    }
+
     /// `POST {API}{path}` with a JSON body, for calls this type has no method for.
     pub fn post_json(&self, path: &str, body: &Value, what: &str) -> Result<()> {
         let mut resp = self.auth(self.agent.post(&format!("{API}{path}"))).send_json(body).context("Blaxel API")?;

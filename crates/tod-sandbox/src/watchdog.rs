@@ -2,15 +2,18 @@
 //! held awake longer than its lease allows.
 //!
 //! Every hour it lists the workspace's node sandboxes (`tod-kind=node`), asks
-//! each running one's relay what holds it (`GET /holds`), and for any held
-//! past the policy's limits it ends every hold (`POST /release-all`) and flags
-//! the node through the orchestrator (`POST /users/<u>/nodes/<n>/flags`), so
-//! the user sees it in the decisions panel. A sandbox in standby is never
-//! contacted: anything sent to its URL would wake it.
+//! each one's relay what holds it (`GET /holds`), and for any held past the
+//! policy's limits it ends every hold (`POST /release-all`) and flags the
+//! node through the orchestrator (`POST /users/<u>/nodes/<n>/flags`), so the
+//! user sees it in the decisions panel. It asks every deployed node sandbox,
+//! whatever state Blaxel reports: the control plane says `STANDBY` for a
+//! sandbox a `keepAlive` process holds awake (see [`node_sandboxes`]), which
+//! is exactly the one the watchdog is for. Asking one that is really asleep
+//! wakes it for that one request.
 //!
 //! The decision ([`judge`]) is pure; the calls go through [`WatchdogEnv`], so
 //! both are tested with fakes. [`BlaxelEnv`] is the real one. Deploying the
-//! job is [`job_body`] (see its TODO). Design: `doc/cloud-sandboxes/
+//! job is [`job_dockerfile`] (its image) and [`job_body`]. Design: `doc/cloud-sandboxes/
 //! autonomous-nodes.md` (holds and leases, failures); running it:
 //! `doc/cloud-sandboxes/orchestrator.md`.
 
@@ -139,16 +142,21 @@ pub struct NodeSandbox {
     pub node: String,
 }
 
-/// The node sandboxes in a listing that are running now: labelled
-/// `tod-kind=node` with a user and node, a URL, and a state Blaxel reports as
-/// running. One in standby, or with no state reported, is left alone, since
-/// asking its relay anything would wake it. A node forked from a base
+/// The node sandboxes in a listing: deployed, labelled `tod-kind=node` with
+/// a user and node, and with a URL. A node forked from a base
 /// (`tod-kind=node-base`, the base's labels) is known by its `TOD_USER` and
 /// `TOD_NODE` instead; the base itself has no node, and is skipped.
-pub fn running_nodes(list: &[SandboxInfo]) -> Vec<NodeSandbox> {
+///
+/// Blaxel's `state` is not consulted. Measured on a live workspace
+/// (2026-09-28): a sandbox held awake by the relay's `keepAlive` process,
+/// its VM running without a pause (a tick every 5 s, no gaps, uptime equal
+/// to its age), was reported `STANDBY` for its whole life, since the state
+/// follows proxied traffic, not the VM. Skipping `STANDBY` skipped exactly
+/// the sandboxes the watchdog is for.
+pub fn node_sandboxes(list: &[SandboxInfo]) -> Vec<NodeSandbox> {
     list.iter()
         .filter(|s| matches!(s.label("tod-kind"), Some("node" | "node-base")))
-        .filter(|s| s.state.as_deref().is_some_and(|st| st.eq_ignore_ascii_case("running")))
+        .filter(|s| s.status.eq_ignore_ascii_case("deployed"))
         .filter_map(|s| {
             let label = |key: &str| s.label(key).filter(|v| !v.is_empty());
             Some(NodeSandbox {
@@ -186,7 +194,7 @@ pub trait WatchdogEnv {
 /// What one pass did.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Outcome {
-    /// Running node sandboxes looked at.
+    /// Node sandboxes looked at.
     pub checked: Vec<String>,
     /// Released (and flagged, unless an error for it says otherwise).
     pub released: Vec<(String, Overrun)>,
@@ -199,7 +207,7 @@ pub fn run_once(env: &dyn WatchdogEnv, policy: &Policy, now: SystemTime) -> Resu
     let list = env.list().context("list sandboxes")?;
     let mut out = Outcome::default();
     let now_ms = now.duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as i64;
-    for sb in running_nodes(&list) {
+    for sb in node_sandboxes(&list) {
         out.checked.push(sb.name.clone());
         let report = match env.holds(&sb) {
             Ok(r) => r,
@@ -308,25 +316,45 @@ impl WatchdogEnv for BlaxelEnv {
     }
 }
 
+/// The image `tod-sandbox watchdog deploy` builds (`bl push` of
+/// [`job_dockerfile`] with [`job_blaxel_toml`]): Blaxel files a job's image
+/// as `job/<name>`.
+pub const JOB_IMAGE: &str = "job/tod-watchdog:latest";
+
+/// The job's image: `tod-watchdog` (the static Linux build, beside this
+/// file in the build context) as its entrypoint. A job has no command of
+/// its own; Blaxel runs the image's entrypoint, once per task.
+pub fn job_dockerfile() -> &'static str {
+    "FROM alpine:3.20\n\
+     RUN apk add --no-cache ca-certificates\n\
+     COPY tod-watchdog /opt/tod/tod-watchdog\n\
+     RUN chmod 755 /opt/tod/tod-watchdog\n\
+     ENTRYPOINT [\"/opt/tod/tod-watchdog\"]\n"
+}
+
+/// The `blaxel.toml` that makes `bl push` build [`JOB_IMAGE`].
+pub fn job_blaxel_toml() -> String {
+    format!("name = \"{JOB_NAME}\"\ntype = \"job\"\n")
+}
+
 /// What the hourly job is created with.
 pub struct JobSpec<'a> {
-    /// An image with `tod-watchdog` at `/opt/tod/tod-watchdog`
-    /// (`scripts/build-sandbox-binaries.sh` builds it).
+    /// An image whose entrypoint is `tod-watchdog` ([`JOB_IMAGE`], unless
+    /// given).
     pub image: &'a str,
     pub region: &'a str,
     pub orchestrator_url: &'a str,
     pub policy: Policy,
 }
 
-/// The `POST /jobs` body for the hourly watchdog. The token is passed as a
-/// secret, referenced by name, never as a plain env value.
+/// The `POST /jobs` (or `PUT /jobs/<name>`) body for the hourly watchdog.
 ///
-/// TODO(W15): Blaxel's jobs API (and how a job's secrets are given) is not
-/// documented in this repository; this is our best reading of it (a job with
-/// a runtime image, envs, and a `schedule` trigger with a cron expression,
-/// secrets referenced as `{{SECRET:name}}` like the proxy rules in
-/// `node::proxy_spec`). Verify against a live workspace and adjust only here
-/// and in [`deploy`].
+/// Checked against a live workspace (2026-09-28): the runtime has no
+/// command (the image's entrypoint runs), and fields it does not know are
+/// dropped without an error; the memory floor is 1024 MB. A secret is an
+/// env entry with `secret: true` (there is no separate list of secrets);
+/// Blaxel shows every env value as `****` once stored. The trigger type is
+/// `cron`; its one task (`{}`) is the one run of `tod-watchdog`.
 pub fn job_body(spec: &JobSpec, workspace: &str, token: &str) -> Value {
     json!({
         "metadata": { "name": JOB_NAME, "labels": { "tod-kind": "watchdog" } },
@@ -334,34 +362,41 @@ pub fn job_body(spec: &JobSpec, workspace: &str, token: &str) -> Value {
             "region": spec.region,
             "runtime": {
                 "image": spec.image,
-                "memory": 256,
-                "maxConcurrentTasks": 1,
+                "memory": 1024,
                 "maxRetries": 0,
                 "timeout": 900,
-                "command": ["/opt/tod/tod-watchdog"],
                 "envs": [
                     { "name": ENV_WORKSPACE, "value": workspace },
-                    { "name": ENV_TOKEN, "value": "{{SECRET:tod-watchdog-token}}" },
+                    { "name": ENV_TOKEN, "value": token, "secret": true },
                     { "name": ENV_ORCHESTRATOR_URL, "value": spec.orchestrator_url },
                     { "name": ENV_MAX_AWAKE_SECS, "value": spec.policy.max_awake_secs.to_string() },
                     { "name": ENV_MAX_LEASE_SECS, "value": spec.policy.max_lease_secs.to_string() },
                 ],
             },
-            "secrets": [{ "name": "tod-watchdog-token", "value": token }],
-            "triggers": [{ "type": "schedule", "configuration": { "schedule": SCHEDULE } }],
+            "triggers": [{
+                "id": "hourly",
+                "type": "cron",
+                "configuration": { "schedule": SCHEDULE, "tasks": [{}] },
+            }],
         },
     })
 }
 
-/// Creates (or replaces) the hourly job. See [`job_body`]'s TODO.
+/// Creates the hourly job, or updates it in place when it exists (a new
+/// revision; deleting and recreating it could race the name's release).
 pub fn deploy(bx: &Blaxel, spec: &JobSpec) -> Result<()> {
-    bx.delete_path(&format!("/jobs/{JOB_NAME}"), "delete the old watchdog job")?;
-    bx.post_json("/jobs", &job_body(spec, bx.workspace(), bx.token()), "create the watchdog job")
+    let body = job_body(spec, bx.workspace(), bx.token());
+    let path = format!("/jobs/{JOB_NAME}");
+    if bx.get_path(&path, "get the watchdog job")?.is_some() {
+        bx.put_json(&path, &body, "update the watchdog job")
+    } else {
+        bx.post_json("/jobs", &body, "create the watchdog job")
+    }
 }
 
 /// Prints a pass's outcome; the exit code is 1 when anything failed.
 pub fn report(out: &Outcome) -> i32 {
-    println!("tod-watchdog: checked {} running node sandbox(es)", out.checked.len());
+    println!("tod-watchdog: checked {} node sandbox(es)", out.checked.len());
     for (name, why) in &out.released {
         println!("released {name}: {}", why.describe());
     }
@@ -436,15 +471,18 @@ mod tests {
     }
 
     #[test]
-    fn only_running_node_sandboxes_are_contacted() {
+    fn every_deployed_node_sandbox_is_contacted_whatever_its_state() {
+        let deleting = SandboxInfo { status: "DELETING".into(), ..info("e", Some("RUNNING"), "node") };
         let list = vec![
             info("a", Some("RUNNING"), "node"),
+            // Blaxel reports a sandbox held awake by keepAlive as STANDBY.
             info("b", Some("STANDBY"), "node"),
             info("c", None, "node"),
             info("d", Some("RUNNING"), "orchestrator"),
+            deleting,
         ];
-        let names: Vec<_> = running_nodes(&list).into_iter().map(|n| n.name).collect();
-        assert_eq!(names, vec!["a"]);
+        let names: Vec<_> = node_sandboxes(&list).into_iter().map(|n| n.name).collect();
+        assert_eq!(names, vec!["a", "b", "c"]);
     }
 
     #[test]
@@ -464,7 +502,7 @@ mod tests {
             node_env: vec![("TOD_USER".into(), "u1".into()), ("TOD_NODE".into(), "n-7".into())],
             ..info("node-x", Some("RUNNING"), "node-base")
         };
-        let found = running_nodes(&[base, fork]);
+        let found = node_sandboxes(&[base, fork]);
         assert_eq!(found.len(), 1);
         assert_eq!((found[0].name.as_str(), found[0].user.as_str(), found[0].node.as_str()), ("node-x", "u1", "n-7"));
     }
@@ -504,7 +542,7 @@ mod tests {
             list: vec![
                 info("over", Some("RUNNING"), "node"),
                 info("fine", Some("RUNNING"), "node"),
-                info("asleep", Some("STANDBY"), "node"),
+                info("held", Some("STANDBY"), "node"),
                 info("gone", Some("RUNNING"), "node"),
                 info("stuck", Some("RUNNING"), "node"),
             ],
@@ -515,21 +553,29 @@ mod tests {
             HoldsReport { held_for_secs: Some(7200), reasons: vec![reason("ext:supervisor", Some(100))] },
         );
         fake.holds.insert("fine".into(), HoldsReport { held_for_secs: Some(10), reasons: vec![reason("poke", Some(50))] });
-        fake.holds.insert("asleep".into(), HoldsReport { held_for_secs: Some(99_999), reasons: vec![reason("x", None)] });
+        // Reported STANDBY while a lease far out keeps it awake.
+        fake.holds.insert("held".into(), HoldsReport { held_for_secs: Some(60), reasons: vec![reason("ext:x", Some(7000))] });
         fake.holds.insert("stuck".into(), HoldsReport { held_for_secs: Some(99_999), reasons: vec![reason("x", None)] });
         fake.fail_release.push("stuck".into());
 
         let now = UNIX_EPOCH + Duration::from_secs(1_000_000);
         let out = run_once(&fake, &policy(), now).unwrap();
 
-        assert_eq!(out.checked, vec!["over", "fine", "gone", "stuck"]);
-        assert_eq!(out.released, vec![("over".into(), Overrun::AwakeTooLong { held_for_secs: 7200 })]);
-        assert_eq!(*fake.released.borrow(), vec!["over".to_string()]);
+        assert_eq!(out.checked, vec!["over", "fine", "held", "gone", "stuck"]);
+        assert_eq!(
+            out.released,
+            vec![
+                ("over".into(), Overrun::AwakeTooLong { held_for_secs: 7200 }),
+                ("held".into(), Overrun::LeaseTooLong { reason: "ext:x".into(), lease_secs_left: 7000 }),
+            ]
+        );
+        assert_eq!(*fake.released.borrow(), vec!["over".to_string(), "held".to_string()]);
         let errs: Vec<_> = out.errors.iter().map(|(n, _)| n.as_str()).collect();
         assert_eq!(errs, vec!["gone", "stuck"]);
 
         let flags = fake.flags.borrow();
-        assert_eq!(flags.len(), 1);
+        assert_eq!(flags.len(), 2);
+        assert_eq!(flags[1].1, "node-held");
         let (user, node, flag) = &flags[0];
         assert_eq!((user.as_str(), node.as_str()), ("u1", "node-over"));
         assert_eq!(flag.sandbox, "over");
@@ -539,12 +585,28 @@ mod tests {
     }
 
     #[test]
-    fn the_job_body_keeps_the_token_out_of_its_envs() {
+    fn the_job_body_marks_the_token_secret_and_runs_hourly() {
         let spec = JobSpec { image: "img", region: "r", orchestrator_url: "https://o", policy: policy() };
         let body = job_body(&spec, "ws", "secret-token");
-        let envs = body["spec"]["runtime"]["envs"].to_string();
-        assert!(!envs.contains("secret-token"));
-        assert!(envs.contains("{{SECRET:tod-watchdog-token}}"));
-        assert_eq!(body["spec"]["triggers"][0]["configuration"]["schedule"], SCHEDULE);
+        let envs = body["spec"]["runtime"]["envs"].as_array().unwrap();
+        // The token is the one secret env; nothing else carries it.
+        let secret: Vec<_> = envs.iter().filter(|e| e["secret"] == true).collect();
+        assert_eq!(secret.len(), 1);
+        assert_eq!((secret[0]["name"].as_str(), secret[0]["value"].as_str()), (Some(ENV_TOKEN), Some("secret-token")));
+        let others = envs.iter().filter(|e| e["secret"] != true).map(Value::to_string).collect::<String>();
+        assert!(!others.contains("secret-token"));
+        // Blaxel's job runtime has no command: the image's entrypoint runs.
+        assert!(body["spec"]["runtime"].get("command").is_none());
+        let trigger = &body["spec"]["triggers"][0];
+        assert_eq!(trigger["type"], "cron");
+        assert_eq!(trigger["configuration"]["schedule"], SCHEDULE);
+        assert_eq!(trigger["configuration"]["tasks"].as_array().map(Vec::len), Some(1));
+    }
+
+    #[test]
+    fn the_job_image_runs_tod_watchdog() {
+        assert!(job_dockerfile().contains("ENTRYPOINT [\"/opt/tod/tod-watchdog\"]"));
+        assert!(job_blaxel_toml().contains("type = \"job\""));
+        assert!(JOB_IMAGE.starts_with(&format!("job/{JOB_NAME}:")));
     }
 }
