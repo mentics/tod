@@ -389,22 +389,51 @@ fn submodule_dirty_lines(dir: &Workdir) -> Result<Vec<String>> {
     Ok(out.lines().map(str::to_string).filter(|l| !l.trim().is_empty()).collect())
 }
 
-/// Commit everything uncommitted in `node_id`'s location on its branch, so
-/// removing it loses nothing.
+/// Every repository in `dir`'s checkout, submodules (recursively) first and
+/// `dir` itself last, so a change in a submodule is dealt with before the
+/// parent that records it.
+fn repos_deepest_first(dir: &Workdir) -> Result<Vec<Workdir>> {
+    let mut repos = worktree::submodule_dirs(dir)?;
+    repos.reverse();
+    repos.push(dir.clone());
+    Ok(repos)
+}
+
+/// Commit everything uncommitted in `node_id`'s location on its branch, and
+/// in each of its submodules on theirs, so removing it loses nothing. Which
+/// commit a submodule is on is not recorded in the parent (it is not work
+/// worth keeping, and the check for uncommitted changes ignores it).
 pub fn commit_location_changes(fleet: &FleetStore, node_id: &str) -> Result<()> {
     let location = node_location(fleet, node_id)?.context("This node has no files of its own")?;
     let dir = location_dir(&location)?;
-    dir.git(&["add", "-A"])?;
-    dir.git(&["commit", "--no-verify", "-m", "tod: save work before this node's files were removed"])?;
+    for repo in repos_deepest_first(&dir)? {
+        repo.git(&["add", "-A"])?;
+        // Unstage any submodule pointer `add -A` picked up.
+        let staged = repo.git(&["diff", "--cached", "--raw", "--no-renames"])?;
+        for line in staged.lines() {
+            let Some((meta, path)) = line.split_once('\t') else { continue };
+            let mut modes = meta.trim_start_matches(':').split(' ');
+            if modes.next() == Some("160000") || modes.next() == Some("160000") {
+                repo.git(&["reset", "-q", "--", path])?;
+            }
+        }
+        if repo.git(&["diff", "--cached", "--name-only"])?.is_empty() {
+            continue;
+        }
+        repo.git(&["commit", "--no-verify", "-m", "tod: save work before this node's files were removed"])?;
+    }
     Ok(())
 }
 
-/// Throw away everything uncommitted in `node_id`'s location.
+/// Throw away everything uncommitted in `node_id`'s location and in each of
+/// its submodules.
 pub fn discard_location_changes(fleet: &FleetStore, node_id: &str) -> Result<()> {
     let location = node_location(fleet, node_id)?.context("This node has no files of its own")?;
     let dir = location_dir(&location)?;
-    dir.git(&["reset", "--hard", "-q"])?;
-    dir.git(&["clean", "-fdq"])?;
+    for repo in repos_deepest_first(&dir)? {
+        repo.git(&["reset", "--hard", "-q"])?;
+        repo.git(&["clean", "-fdq"])?;
+    }
     Ok(())
 }
 
@@ -412,12 +441,31 @@ pub fn discard_location_changes(fleet: &FleetStore, node_id: &str) -> Result<()>
 fn push_branch(dir: &Workdir) -> Result<()> {
     let branch = worktree::current_branch(dir)
         .context("its checkout is on a detached HEAD, so there is no branch to push")?;
+    push_named_branch(dir, &branch)
+}
+
+fn push_named_branch(dir: &Workdir, branch: &str) -> Result<()> {
     let remote = dir.git(&["remote"])?;
     if !remote.lines().any(|r| r.trim() == "origin") {
         bail!("it has no origin remote to push {branch} to");
     }
     dir.git(&["push", "--quiet", "-u", "origin", &format!("HEAD:refs/heads/{branch}")])
         .with_context(|| format!("push {branch}"))?;
+    Ok(())
+}
+
+/// Push the branch of `dir` and of each submodule that is on one (a
+/// submodule left on a detached HEAD has nothing of its own to push), the
+/// submodules first.
+fn push_branches(dir: &Workdir) -> Result<()> {
+    for repo in repos_deepest_first(dir)? {
+        if repo == *dir {
+            push_branch(&repo)?;
+        } else if let Some(branch) = worktree::current_branch(&repo) {
+            push_named_branch(&repo, &branch)
+                .with_context(|| format!("submodule {repo}"))?;
+        }
+    }
     Ok(())
 }
 
@@ -454,7 +502,7 @@ pub fn remove_location(
         LocationState::Clean => {
             let dir = location_dir(&location)?;
             progress(&format!("pushing the branch in {}…", location.describe()));
-            push_branch(&dir).with_context(|| format!("{} was kept", location.describe()))?;
+            push_branches(&dir).with_context(|| format!("{} was kept", location.describe()))?;
             progress(&format!("removing {}…", location.describe()));
             if let Some(name) = location.sandbox() {
                 let mut sandboxes = Sandboxes::load(fleet.paths().root())?;
