@@ -16,6 +16,7 @@ use gpui_component::IconName;
 use std::sync::Arc;
 use tod_core::conversation::handoff::{release_session, terminal_handoff};
 use tod_core::conversation::{ConversationConfig, SharedAgentAccess};
+use tod_store::conversation::{Focus, ProtocolKind};
 use tod_store::fleet::{FleetStore, open_shell_for_node, open_terminal_command};
 use uuid::Uuid;
 
@@ -27,8 +28,8 @@ pub const OPEN_SHELL: &str = "open-shell";
 
 /// Both icons left of Send, the shell first: the one for the conversation's
 /// node (`None` for the project, which has no Files directory).
-pub fn tools(node: Option<Uuid>, has_session: bool, running: bool) -> Vec<PanelTool> {
-    vec![shell_tool(node), tool(has_session, running)]
+pub fn tools(node: Option<Uuid>, running: bool) -> Vec<PanelTool> {
+    vec![shell_tool(node), tool(running)]
 }
 
 /// The shell icon, enabled when the conversation is about a node.
@@ -73,35 +74,35 @@ pub fn open_shell<T: 'static>(
     .detach();
 }
 
-/// The icon, enabled once the conversation has an agent session and no turn
-/// is using it.
-pub fn tool(has_session: bool, running: bool) -> PanelTool {
-    let tooltip = if !has_session {
-        "Continue in a terminal (after the agent's first reply)"
-    } else if running {
+/// The icon, enabled whenever no turn is using the agent. Before the first
+/// reply it opens the same agent fresh, in a terminal, without sending
+/// anything; once the conversation has a session it resumes it there.
+pub fn tool(running: bool) -> PanelTool {
+    let tooltip = if running {
         "Continue in a terminal (once the agent is done)"
     } else {
         "Continue this conversation in a terminal"
     };
-    PanelTool::new(CONTINUE_IN_TERMINAL, IconName::SquareTerminal, tooltip)
-        .disabled(!has_session || running)
+    PanelTool::new(CONTINUE_IN_TERMINAL, IconName::SquareTerminal, tooltip).disabled(running)
 }
 
-/// Open the terminal off the UI thread, and say how it went in a toast. The
-/// app lets go of the agent session first; its next turn resumes the session
-/// by id, and so sees what happened in the terminal.
+/// Open the terminal off the UI thread, and say how it went in a toast. When
+/// the conversation already has an agent session, the app lets go of it
+/// first so its next turn resumes the session by id, seeing what happened in
+/// the terminal; before the first reply — including when nothing has been
+/// sent yet, so `conversation_id` is still `None` — it just launches the
+/// same agent fresh, in the same place a turn would run.
 pub fn continue_in_terminal<T: 'static>(
     fleet: Arc<FleetStore>,
     agent: SharedAgent,
     config: Result<ConversationConfig, String>,
+    protocol: ProtocolKind,
+    focus: Focus,
     conversation_id: Option<Uuid>,
     running: bool,
     window: &mut Window,
     cx: &mut Context<T>,
 ) {
-    let Some(id) = conversation_id else {
-        return;
-    };
     if running {
         error_toast(window, cx, "Stop the agent before continuing in a terminal");
         return;
@@ -117,10 +118,19 @@ pub fn continue_in_terminal<T: 'static>(
         let opened = cx
             .background_executor()
             .spawn(async move {
-                let handoff = terminal_handoff(&fleet, &config.media, config.launch.platform, id)?;
+                let handoff = terminal_handoff(
+                    &fleet,
+                    &config.media,
+                    config.launch.platform,
+                    protocol,
+                    focus,
+                    conversation_id,
+                )?;
                 let paths = TodPaths::discover()?;
                 let settings = TodSettings::load(&paths).unwrap_or_default();
-                release_session(&mut SharedAgentAccess(&agent), id);
+                if let Some(id) = conversation_id {
+                    release_session(&mut SharedAgentAccess(&agent), id);
+                }
                 open_terminal_command(
                     &fleet,
                     &paths,

@@ -92,6 +92,8 @@ impl ConversationView {
                     self.fleet.clone(),
                     self.agent.clone(),
                     self.driver_config(),
+                    self.protocol,
+                    self.focus,
                     self.conversation_id,
                     self.status.running,
                     window,
@@ -145,18 +147,6 @@ impl ConversationView {
             Err(err) => self.status_line = format!("Could not read the context: {err:#}").into(),
         }
         cx.notify();
-    }
-
-    /// The open conversation's agent session, once it has one.
-    fn agent_session(&self) -> Option<&str> {
-        let id = self.conversation_id?;
-        self.data
-            .conversations
-            .iter()
-            .find(|c| c.conversation.id == id)?
-            .conversation
-            .agent_session_id
-            .as_deref()
     }
 
     /// Bring the panel up to date and return it for the layout.
@@ -232,11 +222,7 @@ impl ConversationView {
         if crate::ui::report_problem::is_available(cx) {
             header_actions.push(PanelAction::new(REPORT_PROBLEM, "Report a problem"));
         }
-        let tools = terminal_handoff::tools(
-            self.focus.node_id(),
-            self.agent_session().is_some(),
-            self.status.running,
-        );
+        let tools = terminal_handoff::tools(self.focus.node_id(), self.status.running);
         self.transcript.update(cx, |panel, cx| {
             panel.set_title(title, cx);
             panel.set_header_actions(header_actions, cx);
