@@ -107,7 +107,8 @@ pub fn ensure(bx: &Blaxel, url: &str, payload: &Payload, progress: &mut dyn FnMu
         // Its relay is started by the node's provisioning, with the
         // supervisor's environment; starting one here would lack it.
         bail!(
-            "this is a node's sandbox and its relay is not answering; run the node in the cloud again to              reprovision it"
+            "this is a node's sandbox and its relay is not answering; run the node in the cloud again to \
+            reprovision it"
         );
     }
     let mut outcome = Outcome::RelayStarted;

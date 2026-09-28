@@ -197,7 +197,8 @@ fn refuse_self_certification(inv: &Invocation) -> anyhow::Result<()> {
         .read(|conn| certifier_for_actor(conn, &actor))?;
     if certifier == CERTIFIER_SELF {
         anyhow::bail!(
-            "independent evaluation is on, so a separate session certifies this phase:              run `tod-cli phase ready` when its work is done"
+            "independent evaluation is on, so a separate session certifies this phase: \
+            run `tod-cli phase ready` when its work is done"
         );
     }
     Ok(())

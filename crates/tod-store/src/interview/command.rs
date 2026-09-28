@@ -399,7 +399,8 @@ pub fn execute(
     ) && crate::phase::certifier_for_actor(conn, actor)?.1 == crate::phase::CERTIFIER_INDEPENDENT
     {
         bail!(
-            "an evaluator does not change the node: certify the phase, reject it with              the fixes it needs, or ask the user"
+            "an evaluator does not change the node: certify the phase, reject it with \
+            the fixes it needs, or ask the user"
         );
     }
 
