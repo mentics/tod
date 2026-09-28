@@ -371,9 +371,22 @@ pub fn location_state(fleet: &FleetStore, paths: &TodPaths, node_id: &str) -> Re
     if !dir.is_dir() {
         return Ok(LocationState::Gone);
     }
-    let status = dir.git(&["status", "--porcelain", "--ignore-submodules=none"])?;
-    let lines: Vec<String> = status.lines().map(str::to_string).filter(|l| !l.trim().is_empty()).collect();
+    // A submodule's recorded commit is not work worth keeping (it moves
+    // whenever the submodule does), so the parent ignores submodules
+    // altogether and each one is checked for its own uncommitted files.
+    let status = dir.git(&["status", "--porcelain", "--ignore-submodules=all"])?;
+    let mut lines: Vec<String> = status.lines().map(str::to_string).filter(|l| !l.trim().is_empty()).collect();
+    lines.extend(submodule_dirty_lines(&dir)?);
     Ok(if lines.is_empty() { LocationState::Clean } else { LocationState::Dirty(lines) })
+}
+
+/// Uncommitted files inside every initialized submodule (recursively), as
+/// `git status --porcelain` lines with the submodule's path prepended.
+/// Which commit a submodule is on is not reported.
+fn submodule_dirty_lines(dir: &Workdir) -> Result<Vec<String>> {
+    const SCRIPT: &str = r#"git status --porcelain --ignore-submodules=all | while IFS= read -r l; do rest=${l#???}; printf '%s%s/%s\n' "${l%"$rest"}" "$displaypath" "$rest"; done"#;
+    let out = dir.git(&["submodule", "foreach", "--quiet", "--recursive", SCRIPT])?;
+    Ok(out.lines().map(str::to_string).filter(|l| !l.trim().is_empty()).collect())
 }
 
 /// Commit everything uncommitted in `node_id`'s location on its branch, so
