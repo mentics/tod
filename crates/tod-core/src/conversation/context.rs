@@ -557,7 +557,12 @@ fn append_recent_turns(
                 (TurnRole::Agent, "") => "(no reply)",
                 (_, body) => body,
             };
-            Some(format!("**{who}:** {body}\n"))
+            let images = match t.attachments.len() {
+                0 => String::new(),
+                1 => " (attached an image, not repeated here)".to_string(),
+                n => format!(" (attached {n} images, not repeated here)"),
+            };
+            Some(format!("**{who}:** {body}{images}\n"))
         })
         .collect();
     let room = (budget_tokens / 2 - estimate_tokens(&*out)).max(0);

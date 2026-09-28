@@ -32,6 +32,7 @@ pub mod notify;
 pub mod sync_backend;
 pub mod transcripts;
 pub mod users;
+pub mod wait_changes;
 pub mod wakes;
 pub mod webhooks;
 

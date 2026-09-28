@@ -31,25 +31,18 @@ fn handle_turn(data_root: &Path, turn: &MockInterviewTurn) -> Result<MockReply> 
             .find(|(key, _)| key == name)
             .and_then(|(_, value)| Uuid::parse_str(value).ok())
     };
-    // A gate check carries only its node.
-    let text = turn.blocks.join("\n\n");
-    if let Some(node) = env_uuid(IMPLEMENT_NODE_ENV)
-        && text.contains("phase_purpose:** gate_check")
-    {
-        let client = InterviewClient::new(data_root, ACTOR_USER.to_string());
-        return crate::conversation::gate_check::mock_turn(&client, node, &text)
-            .map(MockReply::from);
-    }
-    // A state's on-entry turn (`OnEntryProtocol`) carries neither a node nor
-    // an actor. The mock has no on-entry work: what a state sets up on entry
-    // (plan steps, for one), a mock run's outline already has.
-    if text.contains("phase_purpose:** on_entry") {
-        return Ok(MockReply::from("Nothing was needed on entry.".to_string()));
-    }
     if let (Some(node), Some(conversation)) =
         (env_uuid(IMPLEMENT_NODE_ENV), env_uuid(IMPLEMENT_CONVERSATION_ENV))
     {
-        let client = InterviewClient::new(data_root, ACTOR_USER.to_string());
+        // A phase agent or evaluator also carries its conversation actor:
+        // what it records is the conversation's.
+        let actor = turn
+            .env
+            .iter()
+            .find(|(key, _)| key == tod_store::interview::ACTOR_ENV)
+            .map(|(_, value)| value.clone())
+            .unwrap_or_else(|| ACTOR_USER.to_string());
+        let client = InterviewClient::new(data_root, actor);
         // An incoming-changes check carries the actions it was shown.
         if let Some((_, actions)) = turn
             .env

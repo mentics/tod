@@ -539,6 +539,7 @@ fn append_turn(
                 body: body.into(),
                 parts,
                 sent_context: None,
+                attachments: Vec::new(),
             },
         )
         .unwrap();
@@ -2023,13 +2024,13 @@ fn an_active_node_with_open_steps_offers_implement(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-fn a_design_node_offers_the_gate_check(cx: &mut TestAppContext) {
+fn a_design_node_offers_its_phase_work_and_the_gate(cx: &mut TestAppContext) {
     let fixture = Fixture::new();
     set_lifecycle(&fixture, "design");
     let (view, _, cx) = open_view(&fixture, Focus::Node(fixture.node_id), cx);
     assert_eq!(
         lifecycle_labels(&view, cx),
-        vec!["Gate check → planning", "Back to proposed"]
+        vec!["Work on design", "Advance to planning", "Back to proposed"]
     );
 }
 
@@ -2041,7 +2042,7 @@ fn the_gate_check_waive_and_advance_run_from_the_conversation(cx: &mut TestAppCo
     let fixture = Fixture::new();
     set_lifecycle(&fixture, "ready");
     let (view, _, cx) = open_view(&fixture, Focus::Node(fixture.node_id), cx);
-    press_lifecycle(&view, "Gate check → active", cx);
+    press_lifecycle(&view, "Advance to active", cx);
     cx.run_until_parked();
 
     let waive = view
@@ -2050,10 +2051,13 @@ fn the_gate_check_waive_and_advance_run_from_the_conversation(cx: &mut TestAppCo
         .filter_map(|n| n.action)
         .collect::<Vec<_>>();
     assert!(!waive.is_empty(), "the failing criteria can be waived");
-    assert!(
-        !lifecycle_labels(&view, cx).contains(&"Advance to active".to_string()),
-        "no Advance while a criterion fails"
-    );
+    let stayed = fixture
+        .store
+        .get_node(&fixture.node_id.to_string())
+        .unwrap()
+        .unwrap()
+        .lifecycle;
+    assert_eq!(stayed, "ready", "no advance while a criterion fails");
     for action in waive {
         view.update_in(cx, |view, window, cx| {
             view.lifecycle_action(
@@ -2067,7 +2071,7 @@ fn the_gate_check_waive_and_advance_run_from_the_conversation(cx: &mut TestAppCo
     draw(cx);
     assert_eq!(
         lifecycle_labels(&view, cx),
-        vec!["Advance to active", "Check again", "Back to planning"]
+        vec!["Advance to active", "Back to planning"]
     );
 
     press_lifecycle(&view, "Advance to active", cx);
@@ -2185,7 +2189,7 @@ fn verifying_recommends_verify_again_after_a_fix_not_the_gate(cx: &mut TestAppCo
                 .collect::<Vec<_>>()
         })
     };
-    assert_eq!(primary(&view, cx), vec!["Gate check → review"]);
+    assert_eq!(primary(&view, cx), vec!["Advance to review"]);
     assert!(lifecycle_labels(&view, cx).contains(&"Verify again".to_string()));
 
     fixture
@@ -2267,6 +2271,7 @@ fn a_lifecycle_run_starts_off_the_main_thread(cx: &mut TestAppContext) {
         data_root: fixture.store.paths().root().to_path_buf(),
         media: tod_core::media::MediaPaths::discover().expect("media paths"),
         launch: tod_agent::AgentLaunchOptions::for_platform(tod_agent::AgentPlatform::Claude),
+        settings_path: None,
         context: Default::default(),
     };
     view.update(cx, |view, cx| {
@@ -2297,10 +2302,9 @@ fn a_lifecycle_run_starts_off_the_main_thread(cx: &mut TestAppContext) {
     });
 }
 
-/// The gate check answers the criteria the app can on the background
-/// executor: some read the pull request from GitHub, so the click only shows
-/// the check started, here and in the lifecycle panel, and the verdict
-/// arrives when the work is done.
+/// The gate check runs on the background executor: some criteria read the
+/// pull request from GitHub, so the click only shows the check started, here
+/// and in the lifecycle panel, and the verdict arrives when the work is done.
 #[gpui::test]
 fn the_gate_check_settles_its_criteria_off_the_main_thread(cx: &mut TestAppContext) {
     let fixture = Fixture::new();
@@ -2317,10 +2321,10 @@ fn the_gate_check_settles_its_criteria_off_the_main_thread(cx: &mut TestAppConte
         })
     };
 
-    press_lifecycle(&view, "Gate check → active", cx);
+    press_lifecycle(&view, "Advance to active", cx);
     assert_eq!(
         gate_status(&view, cx),
-        (lifecycle::SETTLING.to_string(), 0),
+        ("Checking the gate…".to_string(), 0),
         "the check shows as started, and nothing is settled on the main thread"
     );
     let labels = lifecycle_labels(&view, cx);
@@ -2331,10 +2335,10 @@ fn the_gate_check_settles_its_criteria_off_the_main_thread(cx: &mut TestAppConte
 
     cx.run_until_parked();
     let (status, criteria) = gate_status(&view, cx);
-    assert_ne!(status, lifecycle::SETTLING);
-    assert!(criteria > 0, "the settled criteria are shown");
+    assert_ne!(status, "Checking the gate…");
+    assert!(criteria > 0, "the checked criteria are shown");
     assert!(
-        lifecycle_labels(&view, cx).contains(&"Gate check → active".to_string()),
+        lifecycle_labels(&view, cx).contains(&"Advance to active".to_string()),
         "the check is over, so it can be run again"
     );
 }
@@ -2513,13 +2517,14 @@ fn presented_lifecycle_controls_matches_the_rendered_buttons(cx: &mut TestAppCon
         assert_eq!(p.primary, a.primary);
         assert_eq!(p.disabled, a.disabled);
     }
-    // "Gate check → planning" is the primary action on a `design` node.
+    // The phase agent's work is the primary action on a `design` node with
+    // nothing certified.
     let primary = presented
         .actions
         .iter()
         .find(|a| a.primary)
         .expect("a design node has a primary action");
-    assert_eq!(primary.label, "Gate check → planning");
+    assert_eq!(primary.label, "Work on design");
 }
 
 /// Pressing a lifecycle button records a `UserAction` to the app journey ring
@@ -2531,7 +2536,7 @@ fn pressing_a_lifecycle_button_records_the_presented_snapshot(cx: &mut TestAppCo
     let (view, _, cx) = open_view(&fixture, Focus::Node(fixture.node_id), cx);
 
     let before = cx.update(|_, cx| crate::ui::journey::hub(cx).read(cx).len());
-    press_lifecycle(&view, "Gate check → active", cx);
+    press_lifecycle(&view, "Advance to active", cx);
     let after = cx.update(|_, cx| crate::ui::journey::hub(cx).read(cx).len());
     assert!(after > before, "pressing a lifecycle button records an entry");
 

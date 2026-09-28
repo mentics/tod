@@ -994,7 +994,10 @@ mod tests {
 
     #[test]
     fn debounced_mutation_waits_for_flush() {
-        let (dir, writer) = temp_writer(200);
+        // Far longer than any stall under a loaded test run: with 200 ms the
+        // auto-flush sometimes landed before the "not yet written" check.
+        // The auto-flush itself is `debounced_auto_flush_after_interval`'s.
+        let (dir, writer) = temp_writer(60_000);
         let id = uuid::Uuid::new_v4().to_string();
         writer
             .enqueue(FleetMutation::InsertTask {

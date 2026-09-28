@@ -22,11 +22,12 @@ use crate::session_name::session_name;
 use anyhow::{Context, Result, bail};
 use std::path::PathBuf;
 use tod_agent::{
-    AgentLaunchOptions, AgentProvider, AgentRunState, PermissionRequest, RunId, SessionOpening,
-    SessionTurn, SharedAgent, TokenUsage,
+    AgentLaunchOptions, AgentProvider, AgentRunState, PermissionRequest, PromptImage, RunId,
+    SessionOpening, SessionTurn, SharedAgent, TokenUsage,
 };
 use tod_store::conversation::{
-    Conversation, ConversationRepo, Focus, ProtocolKind, ReplyPart, TurnRole, reply_answer,
+    Conversation, ConversationRepo, Focus, ProtocolKind, ReplyPart, TurnAttachment, TurnRole,
+    reply_answer,
 };
 use tod_store::fleet::FleetStore;
 use tod_store::interview::{ACTOR_USER, InterviewCommand};
@@ -79,7 +80,13 @@ pub const ROTATION_NOTE: &str = "Started a fresh agent session";
 pub struct ConversationConfig {
     pub data_root: PathBuf,
     pub media: MediaPaths,
+    /// What the agent launches with when there is no `settings_path`; the
+    /// focus node's Agent capability still sets what it sets over it.
     pub launch: AgentLaunchOptions,
+    /// The settings file each turn's launch is read from
+    /// ([`crate::conversation::launch`]), so a change there applies to the
+    /// next turn. `None` launches with `launch`.
+    pub settings_path: Option<PathBuf>,
     /// `context_budget_tokens` decides when the session rotates.
     pub context: InterviewContextSettings,
 }
@@ -103,6 +110,9 @@ pub struct ConversationStatus {
     /// session, when the provider reports any. The platform's record says
     /// more (`run_transcript::usage_for_key`).
     pub live_usage: Option<TokenUsage>,
+    /// What the latest turn this driver started launched with: the platform,
+    /// model, and effort asked for. `None` until it starts one.
+    pub launch: Option<AgentLaunchOptions>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -158,6 +168,7 @@ pub struct ConversationDriver {
     permission: Option<PermissionRequest>,
     last_error: Option<String>,
     live_usage: Option<TokenUsage>,
+    launched: Option<AgentLaunchOptions>,
 }
 
 impl ConversationDriver {
@@ -179,6 +190,7 @@ impl ConversationDriver {
             permission: None,
             last_error: None,
             live_usage: None,
+            launched: None,
         }
     }
 
@@ -239,6 +251,18 @@ impl ConversationDriver {
             permission: self.permission.clone(),
             last_error: self.last_error.clone(),
             live_usage: self.live_usage.clone(),
+            launch: self.launched.clone(),
+        }
+    }
+
+    /// What the next turn launches with: the settings for this kind of
+    /// conversation, and the focus node's Agent capability over them. Reads
+    /// the settings file and the store.
+    pub fn launch_options(&self, fleet: &FleetStore) -> AgentLaunchOptions {
+        let kind = self.protocol.kind();
+        match &self.config.settings_path {
+            Some(path) => crate::conversation::launch::resolve_from(fleet, path, self.focus, kind),
+            None => crate::conversation::launch::for_focus(fleet, self.focus, self.config.launch.clone()),
         }
     }
 
@@ -293,16 +317,35 @@ impl ConversationDriver {
         agent: &mut A,
         text: &str,
     ) -> Result<i64> {
+        self.send_with_images(fleet, agent, text, Vec::new())
+    }
+
+    /// [`Self::send`], with images the user attached to the message. They
+    /// are kept under the data root with the turn, and go to the agent with
+    /// the message; a message may be images alone.
+    pub fn send_with_images<A: AgentAccess + ?Sized>(
+        &mut self,
+        fleet: &FleetStore,
+        agent: &mut A,
+        text: &str,
+        images: Vec<PromptImage>,
+    ) -> Result<i64> {
         if self.run.is_some() {
             bail!("the agent is still working on the previous message");
         }
         let text = text.trim();
-        if text.is_empty() {
+        if text.is_empty() && images.is_empty() {
             bail!("nothing to send");
         }
         self.last_error = None;
         let id = self.ensure_row(fleet)?;
         let key = Self::session_key(id);
+        let attachments = images
+            .iter()
+            .map(|image| {
+                TurnAttachment::save(fleet.paths().root(), id, &image.mime_type, &image.data)
+            })
+            .collect::<Result<Vec<_>>>()?;
 
         // Built before the user turn is appended: the user's corrections
         // since the previous prompt, which was built right after the previous
@@ -335,6 +378,7 @@ impl ConversationDriver {
             text,
             Vec::new(),
             sent_context,
+            attachments,
         )?;
         // A user message ends whatever loop the previous one started.
         self.continuations = 0;
@@ -356,11 +400,21 @@ impl ConversationDriver {
                 user_seq,
                 None,
                 message,
+                images,
                 conversation.agent_session_id.clone().filter(|_| !live),
             )
         } else if has_history {
             let reason = if !resumable { "not resumable" } else { "over budget" };
-            self.rotate_and_start(fleet, agent, &conversation, user_seq, &changes, text, reason)
+            self.rotate_and_start(
+                fleet,
+                agent,
+                &conversation,
+                user_seq,
+                &changes,
+                text,
+                images,
+                reason,
+            )
         } else {
             // The first turn: the opening context, then the message.
             let context = self.protocol.opening(&self.env(fleet, id))?;
@@ -380,6 +434,7 @@ impl ConversationDriver {
                 user_seq,
                 Some(context),
                 join(&changes, text),
+                images,
                 None,
             )
         };
@@ -492,18 +547,27 @@ impl ConversationDriver {
             }
             Err(message) if run.cold_resume => {
                 // The recorded session could not be resumed: start fresh and
-                // send the same message again.
-                let (conversation, text) = fleet.read(|conn| {
+                // send the same message again, with its images.
+                let (conversation, text, attachments) = fleet.read(|conn| {
                     let repo = ConversationRepo::new(conn);
                     let conversation = repo.get(id)?.context("conversation vanished")?;
-                    let text = repo
+                    let (text, attachments) = repo
                         .turns(id)?
                         .into_iter()
                         .find(|t| t.seq == run.user_seq)
-                        .map(|t| t.body)
+                        .map(|t| (t.body, t.attachments))
                         .unwrap_or_default();
-                    Ok((conversation, text))
+                    Ok((conversation, text, attachments))
                 })?;
+                let images = attachments
+                    .iter()
+                    .map(|attachment| {
+                        Ok(PromptImage {
+                            mime_type: attachment.mime_type.clone(),
+                            data: attachment.read(fleet.paths().root())?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
                 tracing::warn!(conversation = %id, "resume failed, rotating: {message}");
                 // The corrections were already in the failed prompt; a fresh
                 // session gets the current state in its snapshot.
@@ -514,6 +578,7 @@ impl ConversationDriver {
                     run.user_seq,
                     "",
                     &text,
+                    images,
                     "cold resume failed",
                 )?;
                 events.push(ConversationEvent::Rotated);
@@ -635,7 +700,16 @@ impl ConversationDriver {
         })?;
         let live = agent.with(|a| a.session_id(&Self::session_key(id)).is_some());
         let resume = conversation.agent_session_id.clone().filter(|_| !live);
-        self.start(fleet, agent, &conversation, last_seq, None, message, resume)
+        self.start(
+            fleet,
+            agent,
+            &conversation,
+            last_seq,
+            None,
+            message,
+            Vec::new(),
+            resume,
+        )
     }
 
     fn ensure_row(&mut self, fleet: &FleetStore) -> Result<Uuid> {
@@ -643,7 +717,7 @@ impl ConversationDriver {
             return Ok(id);
         }
         let id = Uuid::new_v4();
-        let launch = &self.config.launch;
+        let launch = &self.launch_options(fleet);
         fleet.interview(
             ACTOR_USER,
             InterviewCommand::CreateConversation {
@@ -683,7 +757,7 @@ impl ConversationDriver {
         body: &str,
         parts: Vec<ReplyPart>,
     ) -> Result<i64> {
-        self.append_with_parts_and_context(fleet, id, role, body, parts, None)
+        self.append_with_parts_and_context(fleet, id, role, body, parts, None, Vec::new())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -695,6 +769,7 @@ impl ConversationDriver {
         body: &str,
         parts: Vec<ReplyPart>,
         sent_context: Option<String>,
+        attachments: Vec<TurnAttachment>,
     ) -> Result<i64> {
         let value = fleet.interview(
             ACTOR_USER,
@@ -704,6 +779,7 @@ impl ConversationDriver {
                 body: body.to_string(),
                 parts,
                 sent_context,
+                attachments,
             },
         )?;
         value["seq"].as_i64().context("turn seq missing")
@@ -721,6 +797,7 @@ impl ConversationDriver {
         user_seq: i64,
         changes: &str,
         text: &str,
+        images: Vec<PromptImage>,
         reason: &str,
     ) -> Result<()> {
         let id = conversation.id;
@@ -754,6 +831,7 @@ impl ConversationDriver {
             user_seq,
             Some(context),
             join(changes, text),
+            images,
             None,
         )
     }
@@ -767,6 +845,7 @@ impl ConversationDriver {
         user_seq: i64,
         context: Option<String>,
         message: String,
+        images: Vec<PromptImage>,
         resume: Option<String>,
     ) -> Result<()> {
         let id = conversation.id;
@@ -804,18 +883,23 @@ impl ConversationDriver {
         let opening = context.as_ref().map(|context| SessionOpening {
             context: Some(context.clone()),
         });
-        let sent = context.as_deref().map_or(0, estimate_tokens) + estimate_tokens(&message);
+        let sent = context.as_deref().map_or(0, estimate_tokens)
+            + estimate_tokens(&message)
+            + images.len() as i64 * IMAGE_TOKENS;
         self.session_tokens = Some(self.session_tokens.unwrap_or(0) + sent);
         let cold_resume = resume.is_some();
+        let options = self.launch_options(fleet);
+        self.launched = Some(options.clone());
         let turn = SessionTurn {
             key: key.clone(),
             owner_id: id.to_string(),
             title: title.clone(),
             cwd,
-            options: self.config.launch.clone(),
+            options,
             resume_session_id: resume,
             opening,
             message,
+            images,
             purpose: self.protocol.purpose(),
             env: turn_env,
             environment,
@@ -934,6 +1018,9 @@ pub(crate) fn launch_environment(
         None => tod_store::fleet::dev_container::environment_for(None, cwd, fleet.paths().root()),
     }
 }
+
+/// About what one attached image adds to a session's context.
+const IMAGE_TOKENS: i64 = 1_600;
 
 /// The delta (if any), then the user's message.
 fn join(changes: &str, text: &str) -> String {

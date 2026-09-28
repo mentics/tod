@@ -13,9 +13,13 @@
 # if neither is available.
 #
 # The container mounts the repository read-only and keeps its own cargo
-# target, registry, and git checkouts in Docker volumes (tod-sandbox-target,
-# tod-sandbox-cargo, tod-sandbox-cargo-git), so it never touches the host's target/ beyond copying
-# the finished binaries into target/sandbox/.
+# target, registry, and git checkouts in Docker volumes
+# (tod-sandbox-target-<checkout>, tod-sandbox-cargo, tod-sandbox-cargo-git),
+# so it never touches the host's target/ beyond copying the finished binaries
+# into target/sandbox/. The target volume is per checkout: every checkout is
+# mounted at the same /src, and cargo decides a crate is fresh by comparing
+# source mtimes, so a target shared between worktrees reuses whichever one
+# built last whenever this one's files are older, and ships its code.
 #
 # Usage:
 #   scripts/build-sandbox-binaries.sh [--release|--debug] [--docker|--no-docker]
@@ -50,6 +54,16 @@ done
 
 DOCKER_IMAGE="${TOD_SANDBOX_BUILD_IMAGE:-rust:1-alpine}"
 
+# This checkout's own target volume (see the header).
+checkout_id() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        printf '%s' "$REPO_ROOT" | sha256sum | cut -c1-12
+    else
+        printf '%s' "$REPO_ROOT" | shasum -a 256 | cut -c1-12
+    fi
+}
+TARGET_VOLUME="tod-sandbox-target-$(checkout_id)"
+
 # Host path Docker can mount: Git Bash on Windows needs the Windows form.
 host_path() {
     if command -v cygpath >/dev/null 2>&1; then cygpath -w "$1"; else echo "$1"; fi
@@ -67,7 +81,7 @@ docker_run() {
     MSYS_NO_PATHCONV=1 docker run --rm \
         -v "$(host_path "$REPO_ROOT"):/src:ro" \
         -v "$(host_path "$REPO_ROOT/target/sandbox"):/out" \
-        -v tod-sandbox-target:/target \
+        -v "$TARGET_VOLUME:/target" \
         -v tod-sandbox-cargo:/usr/local/cargo/registry \
         -v tod-sandbox-cargo-git:/usr/local/cargo/git \
         -e CARGO_TARGET_DIR=/target \

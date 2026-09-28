@@ -391,16 +391,6 @@ impl AgentProvider for MockAgentProvider {
 /// Spell out what reached the agent, so UI checks can see a session's opening
 /// arrive exactly once.
 fn mock_session_reply(message_number: u32, turn: &SessionTurn) -> String {
-    // A gate check's request is the session's opening context; the message
-    // beside it is only the starter.
-    let request = match turn.opening.as_ref().and_then(|o| o.context.as_deref()) {
-        Some(context) => format!("{context}\n{}", turn.message),
-        None => turn.message.clone(),
-    };
-    if request.contains("phase_purpose:** gate_check") {
-        return mock_gate_check_reply(&request);
-    }
-
     let mut reply = format!("Mock session reply · message {message_number}\n\n");
     match &turn.opening {
         Some(opening) => {
@@ -416,40 +406,6 @@ fn mock_session_reply(message_number: u32, turn: &SessionTurn) -> String {
         None => reply.push_str("- Nothing re-sent: the session already has its context\n"),
     }
     reply.push_str(&format!("\nYou said: {}", turn.message));
-    reply
-}
-
-/// Canned pass reply for a gate-check turn (see `tod_core::gate::response`
-/// for the format this must satisfy). The mock has no lifecycle policy of
-/// its own — it just echoes the `forward_state` and criterion ids the
-/// request's `gate_check:` YAML block already carried.
-pub fn mock_gate_check_reply(message: &str) -> String {
-    // The role doc's response format shows the same keys with placeholders
-    // (`{target lifecycle}`, `{uuid}`); only real values count.
-    let forward_state = message
-        .lines()
-        .filter_map(|line| line.trim().strip_prefix("forward_state:"))
-        .map(str::trim)
-        .rfind(|value| !value.is_empty() && !value.starts_with('{'))
-        .unwrap_or("");
-    let criterion_ids: Vec<&str> = message
-        .lines()
-        .filter_map(|line| line.trim().strip_prefix("- id:"))
-        .map(str::trim)
-        .filter(|id| uuid::Uuid::parse_str(id).is_ok())
-        .collect();
-
-    let mut reply = format!(
-        "result: pass\nforward_lifecycle: {forward_state}\npaused: false\nsummary: \"Mock gate check: pass.\"\nfindings: \"Mock gate check: pass.\"\n"
-    );
-    if !criterion_ids.is_empty() {
-        reply.push_str("gate_results:\n");
-        for id in criterion_ids {
-            reply.push_str(&format!(
-                "  - criterion_id: {id}\n    outcome: pass\n    detail: \"mock pass\"\n    action: none\n"
-            ));
-        }
-    }
     reply
 }
 
@@ -495,6 +451,7 @@ mod tests {
             resume_session_id: resume_session_id.map(str::to_string),
             opening,
             message: message.into(),
+            images: Vec::new(),
             purpose,
             env: vec![("TOD_INTERVIEW_ACTOR".into(), "actor-1".into())],
             environment: crate::AgentEnvironment::Host,
@@ -574,52 +531,6 @@ mod tests {
                 ("run-7".to_string(), "Session run-7".to_string(), 4),
                 ("task-1".to_string(), "Fleet · Fix login".to_string(), 2),
             ]
-        );
-    }
-
-    /// The role doc's response format precedes the request's own block with
-    /// placeholders of the same keys; the reply echoes only the real ones.
-    #[test]
-    fn the_mock_gate_reply_skips_the_response_format_placeholders() {
-        let message = "forward_lifecycle: {target lifecycle}\n\
-             forward_state: {target lifecycle}\n\
-             - id: {uuid}\n\
-             gate_check:\n  forward_state: done\n";
-        let reply = mock_gate_check_reply(message);
-        assert!(reply.contains("forward_lifecycle: done\n"), "{reply}");
-        assert!(!reply.contains("gate_results"), "{reply}");
-    }
-
-    #[test]
-    fn mock_session_replies_with_gate_check_yaml() {
-        let mut mock = MockAgentProvider::new();
-        let message = "- **phase_purpose:** gate_check\n\n\
-             ```yaml\n\
-             gate_check:\n  \
-             forward_state: planning\n  \
-             criteria:\n    \
-             - id: a1000001-0001-4001-8001-000000000001\n      \
-             slug: design-planning.done-criteria-clear\n      \
-             label: \"Do I know what done looks like?\"\n  \
-             prior_evaluations: []\n\
-             ```\n";
-        let run = mock
-            .send_session_turn(session_turn(
-                "gate-1",
-                Some(crate::provider::SessionOpening { context: None }),
-                None,
-                message,
-                SessionPurpose::Chat,
-            ))
-            .unwrap();
-        let AgentRunState::Success(Some(reply)) = poll_run(&mut mock, run.id) else {
-            panic!("gate check turn failed");
-        };
-        assert!(reply.starts_with("result: pass"), "{reply}");
-        assert!(reply.contains("forward_lifecycle: planning"), "{reply}");
-        assert!(
-            reply.contains("criterion_id: a1000001-0001-4001-8001-000000000001"),
-            "{reply}"
         );
     }
 

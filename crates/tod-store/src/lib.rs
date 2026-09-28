@@ -19,6 +19,7 @@ pub mod log_level;
 pub mod outline;
 pub mod path_util;
 pub mod paths;
+pub mod phase;
 pub mod request_feedback;
 pub mod sandbox_http;
 pub mod review;
@@ -53,7 +54,7 @@ pub use paths::{
 };
 pub use settings::{
     AgentLaunchByPlatform, AgentPlatform, AgentRole, AgentRoleSettings, ChatLaunchMode,
-    DEFAULT_LOG_MAX_SIZE_KB, InterviewContextSettings, JourneySettings, MAX_LOG_MAX_SIZE_KB,
+    DEFAULT_LOG_MAX_SIZE_KB, InterviewContextSettings, JourneySettings, LifecycleSettings, MAX_LOG_MAX_SIZE_KB,
     MIN_LOG_MAX_SIZE_KB, PlatformLaunchSettings, QuestionMakerSettings, TerminalSettings,
     TodSettings, WindowGeometry, WorktreeBackend,
 };

@@ -1641,6 +1641,7 @@ fn turns_range_returns_the_inclusive_seq_range() {
         "turn 3",
         &[],
         Some("delta before turn 3"),
+        &[],
     )
     .unwrap();
     repo.append_turn(fx.conv, TurnRole::Agent, "reply 3").unwrap();
@@ -1657,6 +1658,33 @@ fn turns_range_returns_the_inclusive_seq_range() {
 
     // Out-of-range bounds are simply empty, not an error.
     assert!(repo.turns_range(fx.conv, 100, 200).unwrap().is_empty());
+}
+
+#[test]
+fn a_user_turn_keeps_its_attached_images() {
+    let fx = setup();
+    let repo = ConversationRepo::new(&fx.conn);
+    let root = std::env::temp_dir().join(format!("tod-attachments-{}", Uuid::new_v4()));
+    let image = TurnAttachment::save(&root, fx.conv, "image/png", b"png bytes").unwrap();
+    assert!(image.file.starts_with(&format!("conversation-attachments/{}/", fx.conv)));
+    assert!(image.file.ends_with(".png"));
+    repo.append_turn_with_parts_and_context(
+        fx.conv,
+        TurnRole::User,
+        "",
+        &[],
+        None,
+        std::slice::from_ref(&image),
+    )
+    .unwrap();
+
+    let turn = repo.turns(fx.conv).unwrap().pop().unwrap();
+    assert_eq!(turn.attachments, vec![image.clone()]);
+    assert_eq!(image.read(&root).unwrap(), b"png bytes");
+    // A turn with none reads as none.
+    assert!(repo.turns(fx.conv).unwrap()[0].attachments.is_empty());
+    assert!(TurnAttachment::save(&root, fx.conv, "image/bmp", b"").is_err());
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]

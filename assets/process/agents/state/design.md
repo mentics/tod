@@ -1,54 +1,22 @@
 # State: `design`
 
-**Forward gate:** `design` → `planning`
+**Gate:** `design` → `planning`. The app checks it: the phase is certified. The certificate covers the node's own obligations, its design content, and its mockups; any change to them makes it stale.
 
-## On entry
+## Your work
 
-1. Read lifecycle state, resolved obligations (including inherited and design-phase), the buildable evaluation, and plan steps (if any).
-2. Regenerate the node's summary from its details and now-settled requirements-phase obligations: `tod-cli content set --node <UUID> --type summary --body <TEXT>` (overwrite, not append). It is all this node's descendants see of its details and requirements.
-3. If the node is buildable and the gate checklist passes → verify upstream conformance and proceed to exit.
+1. First, regenerate the node's summary from its details and its settled requirements with the `content` noun (`summary` type, overwrite). It is all this node's descendants see of its details and requirements.
+2. Write the spec: the smallest set of obligations that gets the node built correctly. An obligation is written only where a competent implementer following the codebase would otherwise get it wrong.
+   - **Rules climb:** a constraint lives on the highest node where it holds.
+   - **References:** obligations reference other nodes inline as `[[slug]]` instead of restating them.
+   - Obligations are in effect as soon as they are written; never ask for confirmation.
+3. Resolve **design** questions here, not in `planning` or `active`. Read the code; run spikes when needed. A spike you defer needs a decision tree (outcome → action) recorded in a design-phase obligation.
+4. Visual design: for anything the user will see, draw a mockup and save it with the `visual-design` noun; one requirement "matches the mockup" replaces the layout obligations it covers.
+5. Ask the user only for a design choice that turns on what they want and that the requirements, the ancestors, and the codebase do not settle. Offer the options you see, with your recommendation first.
 
-## Responsibilities
+## Done when
 
-### Writing the spec
-
-The node's spec is written in the app's **conversation** view: the user gives direction, and the conversation agent writes the obligations directly, places what belongs on other nodes, and flags what it is unsure of in the conversation's change set. The user reviews that change set and reverses or edits what is wrong. This session does not run sequential Q&A.
-
-- **Goal:** the smallest set of obligations that gets the node built correctly, with the least human attention. An obligation is written only where a competent implementer following the codebase would otherwise get it wrong.
-- **Rules climb:** a constraint lives on the highest node where it holds.
-- **In effect at once:** obligations are in effect as soon as they are written; never ask for confirmation.
-- **References:** obligations reference other nodes inline as `[[slug]]` instead of restating them.
-
-### Research and spikes
-
-Resolve **design** questions here—not in `planning` or `active`.
-
-- Run spikes in subagents/worktrees when needed.
-- Deferred spikes need an explicit **decision tree** (outcome → action) recorded in a design-phase obligation.
-
-### Visual design
-
-Visual design is part of writing the spec: for anything the user will see, a mockup is drawn before anything is asked, saved with `tod-cli visual-design save`, and one requirement "matches the mockup" replaces the layout obligations it covers.
-
-**Implementation interview belongs in `planning`, not here.**
-
-## Forward gate rules (`design` → `planning`)
-
-The gate is **buildable**, plus the constraints check below: a competent implementer, given the hierarchical context, the node's obligations, the nodes they reference, the mockups, and the codebase, would build it correctly. Any obligation change touching the node resets it to pending.
-
-- Confirming obligations is **never** required.
-- **Constraints, both directions** — check this node's constraints and every inherited one (listed under Inherited context). Answer two questions; the criterion passes only if both are yes:
-  1. Is the design free of anything a constraint forbids? (Many constraints say what must *not* be done.)
-  2. Does the design do everything a constraint requires?
-  If either is no, set that criterion's `gate_results` row to `outcome: fail` (the reply is then `result: blocked`) and, in the row's `detail`, name each constraint and what in the design breaks or misses it.
-- Obligation references resolve (`tod-cli obligations check-refs --node <UUID>` prints `(none)`).
-
-Living checklist items for this transition are stored in the app database; return `gate_results` for each when gate-checking.
-
-## Exit
-
-When the `design` → `planning` gate passes, return `forward_lifecycle: planning` (app applies).
-
-## Blockers
-
-A failing buildable evaluation that needs the user's direction, unenumerated deferred spikes, or upstream conflicts → `blocked` / stay in `design`.
+- [ ] **Buildable:** a competent implementer, given the hierarchical context, the node's obligations, the nodes they reference, the mockups, and the codebase, would build it correctly.
+- [ ] **Constraints, both directions:** the design does nothing this node's or an inherited constraint forbids, and does everything one requires.
+- [ ] Every obligation reference resolves (the `obligations` noun's reference check prints nothing).
+- [ ] No design question is left open that planning would have to decide; every deferred spike has its decision tree.
+- [ ] The summary reflects the settled requirements.

@@ -1,10 +1,10 @@
 # State: `verifying`
 
-**Forward gate:** `verifying` → `review`
+**Gate:** `verifying` → `review`. The app checks it: every obligation and every plan step is `verified`, and a test run is recorded.
 
-## On entry
+## First
 
-This runs as the node's verification conversation, started from the lifecycle panel's **Verify** button, not automatically on entry.
+This runs as the node's verification conversation: the runner starts it, or the conversation view's **Verify**.
 
 1. Read lifecycle state, resolved obligations (including inherited and design-phase) and plan steps, implementation, and evidence from `active`.
 2. Ship-with-code tests should already exist from `active`.
@@ -24,11 +24,11 @@ This runs as the node's verification conversation, started from the lifecycle pa
 
 ### Run verification
 
-The **agent** runs the checks — do not hand primary verification to the human. Human look-over (interactive mode) and external approval (`review` → `approved`) are approval / safety net, not the first time the work is exercised.
+The **agent** runs the checks; never hand primary verification to the user. The PR's review is a safety net, not the first time the work is exercised.
 
 Runtime exercise of slices claimed complete should already have happened in `active`; this state finishes the **full** obligation sweep.
 
-Execute **every requirement**: run attached success criteria when present; otherwise verify the measurable requirement statement itself. Also run applicable inherited constraints. Record each verdict and its evidence through the `verdicts` noun — the forward gate reads those verdicts, and a requirement with none counts as unchecked.
+Execute **every requirement**: run attached success criteria when present; otherwise verify the measurable requirement statement itself. Also run applicable inherited constraints. Record each verdict and its evidence through the `verdicts` noun — the gate reads those verdicts, and a requirement with none counts as unchecked.
 
 Re-exercise in **running context** as needed for the full sweep (prefer automated end-to-end; otherwise drive the running system). Build and run **local-only** harnesses and one-off checks here when gaps remain.
 
@@ -51,31 +51,19 @@ Re-check upstream conformance when artifacts changed since last gate.
 
 Complete self-review before `review`. **`review` is not where functional bugs are found**—enter `review` only when near-certain of release readiness.
 
-## Forward gate rules (`verifying` → `review`)
+## Done when
 
-**Critical gate — do not treat `review` as the place that finds bugs.** Builder/verifier responsibility is near-certainty of release readiness.
+**Do not treat `review` as the place that finds bugs.** Leave `verifying` only when near-certain the work is ready to release.
 
-Apply these prose rules in addition to checklist criteria the app sends:
-
-- Verification is complete: **every requirement** in applicable obligations (node + ancestors as bound, including design-phase) has been checked (success criteria when present, otherwise the measurable statement) and is **traceable** upstream through the plan steps that satisfy it (each `verified`) and those obligations.
-- Verification was **agent-executed** in the work’s running context (harness built if needed); not deferred to human look-over as the primary check.
-- **Constraints, both directions** — check this node's constraints and every inherited one (listed under Inherited context). Answer two questions; the criterion passes only if both are yes:
-  1. Is the implementation free of anything a constraint forbids? (Many constraints say what must *not* be done.)
-  2. Does the implementation do everything a constraint requires?
-  If either is no, set that criterion's `gate_results` row to `outcome: fail` (the reply is then `result: blocked`) and, in the row's `detail`, name each constraint and what in the implementation breaks or misses it.
-- Upstream conformance **revalidated** (or short-circuited only for unchanged file pairs).
+- **Every requirement** in the applicable obligations (the node's and its ancestors', including design-phase) has been checked and has a verdict, and is **traceable** through the plan steps that satisfy it (each `verified`).
+- Verification was **agent-executed** in the work's running context (a harness built if needed).
+- **Constraints, both directions:** the implementation does nothing this node's or an inherited constraint forbids, and does everything one requires. A constraint that breaks is a `failed` verdict naming what breaks it.
+- Upstream conformance **revalidated** (or skipped only for unchanged files).
 - **Self-code review** completed.
-- Ancestor or node-specific verification extras (static analysis, etc.) satisfied when defined as obligations.
-- Entering `review` then runs an **independent** code review (clean subagent not involved in construction/docs; use a code-review skill when available).
-
-Living checklist items for this transition are stored in the app database; return `gate_results` for each when gate-checking.
-
-## Exit
-
-When the `verifying` → `review` gate passes (checklist included), return `forward_lifecycle: review`.
+- Verification extras defined as obligations (static analysis, and so on) are satisfied.
 
 ## Blockers
 
 Failed verification, untraceable results, or known functional defects → stay in `verifying` or move back to `active` for fixes; do not enter `review` hoping review will catch bugs.
 
-Any `failed` or unchecked obligation, and any `failed` plan step, blocks the gate. The fix is not made here: the user moves the node back to `active`, where implementation works every `failed` step again from its note, and back in `verifying` the user's **Verify** runs this state's verification over the result.
+Any `failed` or unchecked obligation, and any `failed` plan step, blocks the gate. The fix is not made here: implementation works every `failed` step again from its note, and verification then runs again over the result.

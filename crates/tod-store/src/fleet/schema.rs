@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Current fleet schema epoch stored in `PRAGMA user_version`.
-pub const CURRENT_USER_VERSION: i32 = 72;
+pub const CURRENT_USER_VERSION: i32 = 74;
 
 const BUSY_TIMEOUT_MS: i64 = 5000;
 
@@ -60,8 +60,23 @@ pub fn peek_user_version(path: &Path) -> Result<i32> {
         .context("failed to read fleet user_version")
 }
 
-/// Copy a fleet database using the SQLite Online Backup API.
+/// Copy a fleet database using the SQLite Online Backup API, a few pages
+/// at a time with a pause between (so a live database's writers are not
+/// held off for the whole copy): about 40 s for an 8 MB database.
 pub fn backup_database(from: &Path, to: &Path) -> Result<()> {
+    copy_with_backup(from, to, 5, Duration::from_millis(100))
+}
+
+/// Copy a fleet database in one step of the SQLite Online Backup API
+/// (pausing only while the source is busy): the source is read-locked for
+/// the copy itself, well under a second for megabytes. For copies someone
+/// waits on: a snapshot to seed another replica from, and its restore
+/// (`crate::sync`).
+pub fn copy_database(from: &Path, to: &Path) -> Result<()> {
+    copy_with_backup(from, to, std::os::raw::c_int::MAX, Duration::from_millis(10))
+}
+
+fn copy_with_backup(from: &Path, to: &Path, pages_per_step: std::os::raw::c_int, pause: Duration) -> Result<()> {
     if let Some(parent) = to.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("failed to create backup parent dir {}", parent.display()))?;
@@ -74,7 +89,7 @@ pub fn backup_database(from: &Path, to: &Path) -> Result<()> {
     apply_connection_pragmas(&dst, false)?;
     let backup = Backup::new(&src, &mut dst).context("failed to start SQLite online backup")?;
     backup
-        .run_to_completion(5, Duration::from_millis(100), None)
+        .run_to_completion(pages_per_step, pause, None)
         .context("SQLite online backup failed")?;
     Ok(())
 }
@@ -446,6 +461,20 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
         conn.execute_batch(&crate::journey_changes::request_feedback_triggers_sql())?;
         conn.pragma_update(None, "user_version", 72)?;
     }
+    if version < 73 {
+        // Images the user attached to a message.
+        ensure_turn_attachments(conn)?;
+        conn.pragma_update(None, "user_version", 73)?;
+    }
+    if version < 74 {
+        // Phase certifications (`crate::phase`, `doc/lifecycle/phase-agents.md`);
+        // synced. Certificates replace the buildable criterion and the
+        // trigger that reset it on every obligation change.
+        crate::phase::ensure_table(conn)?;
+        conn.execute_batch(&crate::journey_changes::phase_events_triggers_sql())?;
+        conn.execute_batch("DROP TRIGGER IF EXISTS trg_buildable_reset;")?;
+        conn.pragma_update(None, "user_version", 74)?;
+    }
     // Other branches (the task panel) numbered their own steps 66–67 at the
     // same time as 66–70 above, so a store may be past a version without
     // having these. Every one is idempotent: make sure of them all.
@@ -460,6 +489,9 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
     ensure_decisions_reason(conn)?;
     conn.execute_batch(crate::request_feedback::CREATE_TABLE)?;
     conn.execute_batch(&crate::journey_changes::request_feedback_triggers_sql())?;
+    crate::phase::ensure_table(conn)?;
+    conn.execute_batch(&crate::journey_changes::phase_events_triggers_sql())?;
+    ensure_turn_attachments(conn)?;
     crate::sync::install(conn)?;
     // Idempotent and cheap — keeps the gate criteria catalog's wording in
     // sync with the source on every startup, not just the migration that
@@ -896,6 +928,20 @@ fn migrate_v59_to_v60(conn: &Connection) -> Result<()> {
         .exists([])?;
     if !present {
         conn.execute_batch("ALTER TABLE conversation_turns ADD COLUMN sent_context TEXT;")?;
+    }
+    Ok(())
+}
+
+/// `conversation_turns.attachments`: the images the user attached to a
+/// message (JSON `crate::conversation::TurnAttachment`s, null when none); the
+/// files themselves are under the data root. A no-op when the column is
+/// already there.
+fn ensure_turn_attachments(conn: &Connection) -> Result<()> {
+    let present = conn
+        .prepare("SELECT 1 FROM pragma_table_info('conversation_turns') WHERE name = 'attachments'")?
+        .exists([])?;
+    if !present {
+        conn.execute_batch("ALTER TABLE conversation_turns ADD COLUMN attachments TEXT;")?;
     }
     Ok(())
 }

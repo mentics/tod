@@ -1,34 +1,15 @@
 # State: `released`
 
-**Forward gate:** `released` → `learn`
+**Gate:** `released` → `learn`. The app checks it: the phase is certified. The certificate here is a check mark for this stay in `released`; its note carries the post-release evidence.
 
-## On entry
+## Your work
 
-1. Read lifecycle state, obligations, and release evidence.
-2. If post-release smoke already passed with evidence → proceed to exit.
+1. First, read the node's obligations and the release evidence.
+2. Run **post-release smoke** (or its equivalent) in the released environment: confirm the node's requirements still hold there, not just the pre-release checks.
+3. If smoke fails, treat it as a defect: record what failed. Moving the node back toward `active` or `verifying` is the user's call, so ask them, with that as the recommended option.
+4. Ask the user only for environment access you do not have, or for that move back.
 
-## Responsibilities
+## Done when
 
-### Post-release confirmation
-
-Run **post-release smoke** (or equivalent) in the released environment:
-
-- Confirm obligations still hold in that environment—not just pre-release checks.
-- Record evidence.
-
-If smoke fails, treat as defect; likely move back toward `active` or `verifying` after human alignment—do not advance to `learn` on failed smoke.
-
-## Forward gate rules (`released` → `learn`)
-
-Apply these prose rules (no DB checklist items for this transition):
-
-- Post-release smoke (or equivalent) confirms the task’s requirements still hold in that environment.
-- Evidence recorded (journal and/or lifecycle note as appropriate). That confirmation is the gate.
-
-## Exit
-
-When post-release confirmation passes, return `forward_lifecycle: learn`.
-
-## Blockers
-
-Smoke failure or environment access issues → `blocked`.
+- [ ] Post-release smoke (or its equivalent) confirms the node's requirements hold in the released environment.
+- [ ] The evidence is recorded: in the certificate's note (with independent evaluation off), or in your `ready` reply for the evaluator to check.

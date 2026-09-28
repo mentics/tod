@@ -201,8 +201,9 @@ pub fn stop_running_in_cloud(fleet: &FleetStore, node_id: &str, delete_sandbox: 
     set_note(node_id, None);
     let mut message = "No longer runs in the cloud.".to_string();
     if delete_sandbox && let Some(row) = &row {
-        let sandboxes = tod_store::fleet::sandbox::Sandboxes::load(&root)?;
-        sandboxes.blaxel()?.delete(&row.sandbox).with_context(|| format!("delete sandbox {}", row.sandbox))?;
+        let mut sandboxes = tod_store::fleet::sandbox::Sandboxes::load(&root)?;
+        let bx = sandboxes.blaxel()?;
+        sandboxes.delete(&bx, &row.sandbox).with_context(|| format!("delete sandbox {}", row.sandbox))?;
         message = format!("No longer runs in the cloud; sandbox {} deleted.", row.sandbox);
     }
     if CloudSyncState::load(&root).is_ok_and(|s| s.seeded) {
@@ -236,6 +237,8 @@ mod tests {
             url: None,
             image: String::new(),
             labels: Vec::new(),
+            volumes: Vec::new(),
+            node_env: Vec::new(),
         }
     }
 

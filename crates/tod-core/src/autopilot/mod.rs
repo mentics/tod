@@ -2,16 +2,17 @@
 //! pressing the buttons.
 //!
 //! Each round asks [`crate::lifecycle_next::next_step`] what moves the node
-//! along, runs that protocol's conversation through [`ConversationDriver`]
-//! until the protocol says it is done, and at the gate settles the criteria
-//! the app answers itself, runs the gate-check conversation for the rest,
-//! advances once every recorded criterion is clear, and starts the new
-//! state's on-entry conversation — what the lifecycle panel's and the
-//! conversation view's buttons do, in the order their primary button
-//! suggests. It stops when the node is `done`, when a human is needed (a
-//! pending decision, a `blocked` plan step, a failing criterion nothing
-//! earlier can fix, a step that changed nothing), or when its budget
-//! (sessions started, time spent working) runs out.
+//! along and runs that protocol's conversation through [`ConversationDriver`]
+//! until the protocol says it is done: the state's phase agent, its
+//! independent evaluator, implementation, verification, review, fixes, the
+//! pull request. At the gate it checks every criterion itself (a gate never
+//! runs an agent, `crate::phase`) and advances when they all pass; the next
+//! round starts the new state's work. It has no stopping points of its own:
+//! it stops when the node is `done`, when a human is needed (a pending
+//! decision, a `blocked` plan step, a failing criterion no agent can fix, an
+//! evaluator that rejected the same work twice, a step that changed nothing),
+//! or when its budget (sessions started, time spent working) runs out.
+//! Spec: `doc/lifecycle/phase-agents.md`.
 //!
 //! It has no GPUI and blocks while it drives the agent, so it can run in a
 //! headless supervisor. What it decides from is all in the store (lifecycle,
@@ -33,11 +34,12 @@ pub use state::{AutopilotState, CurrentStep, StepRecord, state_path};
 use crate::conversation::driver::{
     AgentAccess, ConversationConfig, ConversationDriver, ConversationEvent, ConversationStatus,
 };
-use crate::conversation::gate_check::{latest_gate_report, set_resolved_elsewhere, settle_derived_criteria};
 use crate::conversation::pr::is_done_report;
 use crate::conversation::protocol::protocol_for;
 use crate::lifecycle;
 use crate::lifecycle_next::{NextStep, Standing, next_step};
+use crate::phase::{PhaseStanding, settle_gate};
+use tod_store::phase::PhaseRepo;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -48,11 +50,6 @@ use uuid::Uuid;
 
 /// The message that reopens a conversation a restart interrupted.
 pub const RESUME_MESSAGE: &str = "Continue where you left off.";
-
-/// What a gate check the user settled outside the app is told when the run
-/// reopens it (`gate_check::mark_resolved_elsewhere`): its own session holds
-/// what they settled, so it judges the gate again with that in mind.
-pub const SETTLED_ELSEWHERE_MESSAGE: &str = "The user has settled what you asked of them, in this session outside the app. Check the gate again with that in mind, and reply with your verdict in the same form as before.";
 
 /// How much one run may spend before it stops for the user.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -150,8 +147,12 @@ pub enum NeedsHuman {
     /// The gate check left criteria failing, and nothing earlier is owed
     /// that could fix them.
     FailingCriteria { criteria: Vec<String> },
-    /// A gate with no criteria of its own did not pass.
+    /// A gate with no criteria of its own did not pass. Only a run saved
+    /// before gates stopped running agents stops for this.
     GateNotPassed { result: String, summary: String },
+    /// An independent evaluator rejected the same work twice: the phase agent
+    /// changed nothing in between. `fixes` are what it asked for last.
+    EvaluationStuck { fixes: Vec<String> },
     /// The pull request's agent handed back.
     PrBlocked { why: String },
     /// The agent asked for a permission nobody is here to grant.
@@ -188,6 +189,10 @@ impl NeedsHuman {
             Self::GateNotPassed { result, summary } => {
                 format!("the gate check did not pass ({result}): {summary}")
             }
+            Self::EvaluationStuck { fixes } => format!(
+                "the evaluator sent the phase back twice for the same work: {}",
+                fixes.join("; ")
+            ),
             Self::PrBlocked { why } => format!("the pull request is blocked: {why}"),
             Self::Permission { title } => format!("the agent asked for permission: {title}"),
             Self::AgentFailed { error } => format!("the agent's turn failed: {error}"),
@@ -205,6 +210,8 @@ fn step_name(step: NextStep) -> &'static str {
         NextStep::Review => "review",
         NextStep::Fix => "fix",
         NextStep::GateCheck => "gate_check",
+        NextStep::Phase => "phase",
+        NextStep::Evaluate => "evaluate",
     }
 }
 
@@ -359,10 +366,12 @@ impl Autopilot {
             last = Some((standing, step));
 
             let stopped = match step {
-                NextStep::Implement => self.converse(fleet, agent, hook, ProtocolKind::Implementation)?,
-                NextStep::Verify => self.converse(fleet, agent, hook, ProtocolKind::Verification)?,
-                NextStep::Review => self.converse(fleet, agent, hook, ProtocolKind::Review)?,
-                NextStep::Fix => self.converse(fleet, agent, hook, ProtocolKind::Fix)?,
+                NextStep::Implement => self.converse(fleet, agent, hook, ProtocolKind::Implementation, None)?,
+                NextStep::Verify => self.converse(fleet, agent, hook, ProtocolKind::Verification, None)?,
+                NextStep::Review => self.converse(fleet, agent, hook, ProtocolKind::Review, None)?,
+                NextStep::Fix => self.converse(fleet, agent, hook, ProtocolKind::Fix, None)?,
+                NextStep::Phase => self.phase(fleet, agent, hook, &lifecycle)?,
+                NextStep::Evaluate => self.evaluate(fleet, agent, hook, &lifecycle)?,
                 NextStep::FixFailed => {
                     // Back to `active`; the next round implements the fix.
                     lifecycle::revert(fleet, self.node)?;
@@ -389,7 +398,7 @@ impl Autopilot {
         // asks GitHub what it made of it.
         if from == "pr" {
             if matches!(self.pr_report(fleet)?, PrStanding::Open)
-                && let Some(outcome) = self.converse(fleet, agent, hook, ProtocolKind::Pr)?
+                && let Some(outcome) = self.converse(fleet, agent, hook, ProtocolKind::Pr, None)?
             {
                 return Ok(Some(outcome));
             }
@@ -409,59 +418,81 @@ impl Autopilot {
                 PrStanding::Done => {}
             }
         }
-        let needs_agent = settle_derived_criteria(fleet, self.node)?;
-        if needs_agent && let Some(outcome) = self.converse(fleet, agent, hook, ProtocolKind::GateCheck)? {
+        let gate = settle_gate(fleet, self.node)?;
+        if !gate.clear() {
+            let failing: Vec<String> = gate
+                .failing()
+                .map(|c| {
+                    if c.detail.is_empty() {
+                        c.criterion.label.clone()
+                    } else {
+                        format!("{}: {}", c.criterion.label, c.detail)
+                    }
+                })
+                .collect();
+            return Ok(Some(Outcome::NeedsHuman {
+                reason: NeedsHuman::FailingCriteria { criteria: failing },
+            }));
+        }
+        if lifecycle::advance(fleet, self.node)?.is_none() {
+            return Ok(Some(Outcome::Done));
+        }
+        self.record(fleet, "advance", from, None)?;
+        Ok(None)
+    }
+
+    /// Run the state's phase agent: the `Phase` step. It reopens the phase
+    /// conversation of this stay in the state when there is one, told where
+    /// the phase stands now (what was sent back, what went stale), so it keeps
+    /// what it learned; a new one otherwise.
+    fn phase<A: AgentAccess + ?Sized, H: StepHook + ?Sized>(
+        &mut self,
+        fleet: &FleetStore,
+        agent: &mut A,
+        hook: &mut H,
+        state: &str,
+    ) -> Result<Option<Outcome>> {
+        let node = self.node;
+        let earlier = fleet.read(|conn| {
+            let since = PhaseRepo::new(conn).stay_started_at(node)?;
+            let conversation = ConversationRepo::new(conn)
+                .latest_for_focus_with_protocol(Focus::Node(node), ProtocolKind::Phase)?;
+            Ok(conversation.filter(|c| {
+                c.from_state.as_deref() == Some(state)
+                    && since.is_none_or(|since| c.created_at >= since)
+            }))
+        })?;
+        let reopen = match earlier {
+            Some(conversation) => Some((
+                conversation.id,
+                crate::conversation::phase::work_message(fleet, &self.config.data_root, node)?,
+            )),
+            None => None,
+        };
+        self.converse(fleet, agent, hook, ProtocolKind::Phase, reopen)
+    }
+
+    /// Run an independent evaluator on the phase its agent recorded ready:
+    /// the `Evaluate` step. Always a fresh session. Stops when it rejected the
+    /// same work a second time.
+    fn evaluate<A: AgentAccess + ?Sized, H: StepHook + ?Sized>(
+        &mut self,
+        fleet: &FleetStore,
+        agent: &mut A,
+        hook: &mut H,
+        state: &str,
+    ) -> Result<Option<Outcome>> {
+        if let Some(outcome) = self.converse(fleet, agent, hook, ProtocolKind::Evaluate, None)? {
             return Ok(Some(outcome));
         }
-        let now = lifecycle::current_state(fleet, self.node)?;
-        let entered = if now != from {
-            // A gate with no criteria advanced off the agent's pass.
-            now
-        } else {
-            let rows = lifecycle::recorded_criteria(fleet, self.node)?;
-            if lifecycle::all_clear(&rows) {
-                match lifecycle::advance(fleet, self.node)? {
-                    Some(next) => next.to_string(),
-                    None => return Ok(Some(Outcome::Done)),
-                }
-            } else {
-                let failing: Vec<String> = rows
-                    .iter()
-                    .filter(|r| r.evaluation.is_some() && !r.is_clear())
-                    .map(|r| match r.evaluation.as_ref().and_then(|e| e.detail.clone()) {
-                        Some(detail) => format!("{}: {detail}", r.criterion.label),
-                        None => r.criterion.label.clone(),
-                    })
-                    .collect();
-                // A check reopened for what the user settled elsewhere that
-                // gave no new verdict: its question stands again, so the
-                // stop below has a request to answer.
-                if let Some((conversation, report)) =
-                    fleet.read(|conn| latest_gate_report(conn, self.node, from))?
-                    && report.resolved_elsewhere
-                {
-                    set_resolved_elsewhere(fleet, conversation.id, false)?;
-                }
-                if !failing.is_empty() {
-                    return Ok(Some(Outcome::NeedsHuman {
-                        reason: NeedsHuman::FailingCriteria { criteria: failing },
-                    }));
-                }
-                let report = fleet
-                    .read(|conn| latest_gate_report(conn, self.node, from))?
-                    .map(|(_, report)| report)
-                    .unwrap_or_default();
-                return Ok(Some(Outcome::NeedsHuman {
-                    reason: NeedsHuman::GateNotPassed {
-                        result: report.result,
-                        summary: report.summary,
-                    },
-                }));
-            }
-        };
-        self.record(fleet, "advance", from, None)?;
-        if lifecycle::enters_with_agent(&entered) {
-            return self.converse(fleet, agent, hook, ProtocolKind::OnEntry);
+        let node = self.node;
+        let standing = fleet.read(|conn| PhaseStanding::load(conn, node, state))?;
+        if standing.stuck {
+            return Ok(Some(Outcome::NeedsHuman {
+                reason: NeedsHuman::EvaluationStuck {
+                    fixes: standing.fixes,
+                },
+            }));
         }
         Ok(None)
     }
@@ -490,35 +521,31 @@ impl Autopilot {
     }
 
     /// Run `kind`'s conversation on the node until its protocol says it is
-    /// done. `Some` when the run has to stop.
+    /// done. `Some` when the run has to stop. The conversation a restart
+    /// interrupted is reopened; else `reopen`'s, sent its message; else a new
+    /// one.
     fn converse<A: AgentAccess + ?Sized, H: StepHook + ?Sized>(
         &mut self,
         fleet: &FleetStore,
         agent: &mut A,
         hook: &mut H,
         kind: ProtocolKind,
+        reopen: Option<(Uuid, String)>,
     ) -> Result<Option<Outcome>> {
         if let Some(limit) = self.over_budget() {
             return Ok(Some(Outcome::BudgetExhausted { limit }));
         }
         let lifecycle = lifecycle::current_state(fleet, self.node)?;
-        let resumable = self.state.current.as_ref().and_then(|current| {
-            (current.protocol == protocol_name(kind) && current.lifecycle == lifecycle)
-                .then_some(current.conversation_id)
-        });
-        // A gate check the user settled in its own session, outside the app:
-        // reopened, so the agent judges again with what they settled.
-        let settled = match (resumable, kind) {
-            (None, ProtocolKind::GateCheck) => fleet
-                .read(|conn| latest_gate_report(conn, self.node, &lifecycle))?
-                .filter(|(_, report)| report.resolved_elsewhere)
-                .map(|(conversation, _)| conversation.id),
-            _ => None,
-        };
-        let reopen = resumable
-            .map(|id| (id, RESUME_MESSAGE))
-            .or(settled.map(|id| (id, SETTLED_ELSEWHERE_MESSAGE)));
-        let (mut driver, message) = match reopen {
+        let resumable = self
+            .state
+            .current
+            .as_ref()
+            .and_then(|current| {
+                (current.protocol == protocol_name(kind) && current.lifecycle == lifecycle)
+                    .then(|| (current.conversation_id, RESUME_MESSAGE.to_string()))
+            })
+            .or(reopen);
+        let (mut driver, message) = match resumable {
             Some((id, message)) => match ConversationDriver::open(self.config.clone(), fleet, id) {
                 Ok(driver) => (driver, message),
                 Err(_) => self.new_driver(kind),
@@ -526,7 +553,7 @@ impl Autopilot {
             None => self.new_driver(kind),
         };
         self.state.sessions += 1;
-        if let Err(err) = driver.send(fleet, agent, message) {
+        if let Err(err) = driver.send(fleet, agent, &message) {
             self.state.current = None;
             self.save()?;
             return Ok(Some(Outcome::NeedsHuman {
@@ -585,6 +612,7 @@ impl Autopilot {
                 } else {
                     self.state.current = None;
                     self.record(fleet, protocol_name(kind), &lifecycle, conversation_id)?;
+                    close_session(agent, conversation_id);
                 }
                 return Ok(Some(Outcome::Stopped { reason }));
             }
@@ -607,11 +635,12 @@ impl Autopilot {
         }
         self.state.current = None;
         self.record(fleet, protocol_name(kind), &lifecycle, conversation_id)?;
+        close_session(agent, conversation_id);
         Ok(None)
     }
 
-    fn new_driver(&self, kind: ProtocolKind) -> (ConversationDriver, &'static str) {
-        let message = protocol_for(kind).starter().unwrap_or("Continue.");
+    fn new_driver(&self, kind: ProtocolKind) -> (ConversationDriver, String) {
+        let message = protocol_for(kind).starter().unwrap_or("Continue.").to_string();
         (
             ConversationDriver::new(self.config.clone(), Focus::Node(self.node), kind),
             message,
@@ -635,6 +664,17 @@ impl Autopilot {
             at_ms: state::now_ms(),
         });
         self.save()
+    }
+}
+
+/// Ends a finished step's agent session. Nothing resumes a finished step
+/// (the next step starts a conversation of its own), and each session holds
+/// an agent process: a node that went `proposed` → `approved` with Claude left
+/// eleven of them (about 200 MB each) in its 4 GB sandbox until the run
+/// ended. Its conversation stays resumable by id if a person opens it.
+fn close_session<A: AgentAccess + ?Sized>(agent: &mut A, conversation_id: Option<Uuid>) {
+    if let Some(id) = conversation_id {
+        agent.with(|a| a.close_session(&ConversationDriver::session_key(id)));
     }
 }
 

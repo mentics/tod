@@ -208,16 +208,16 @@ label wherever the node is shown:
 
 | Label | Meaning |
 |---|---|
-| `verifying` | In this state. |
-| `verifying →` | Checking the gate to leave this state. |
-| `→ verifying` | Running the on-entry agent for this state. |
+| `design` | In this state. |
+| `design →` | The state's agent, or its evaluator, is working. |
 
 Decisions the lifecycle panel used to hold (gate verdicts, waives, what to do
 next) move to the task panel's requests.
 
 ### Structured agents
 
-Lifecycle agents (implement, verify, review, fix, gate checks, on-entry) reply
+Lifecycle agents (phase agents and their evaluators, implement, verify,
+review, fix) reply
 **only** in structure. They have no free-text reply. The app renders what they
 record: decisions with options, changes to items, findings, verdicts. The
 more a decision is reduced to options, the faster the user gets through the
@@ -242,6 +242,13 @@ visibly distinct from structured work.
 | **Ctrl+J** | Expand or collapse the chat drawer. |
 | **Ctrl+N** | Start a new conversation in the chat drawer. |
 | **Ctrl+Left / Ctrl+Right** | Move focus between columns (`ui/pane_nav.rs`). |
+| **Alt+Left / Alt+Right** | Back / Forward through where you have been (also the title bar's arrows). |
+
+Back and Forward (`ui/nav_history.rs`) remember the tree's selection and
+what each column shows, plus switches to other views, in memory only and
+for the last 50 places. A row the arrow keys pass through in under a second
+is not kept, so Back returns to the row you stopped on, not every row on the
+way. Pinning a column is not a step.
 
 The next-waiting key has to be easy to reach with the left hand in the usual
 typing position, and has to work while typing in the chat drawer. Nothing in

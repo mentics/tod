@@ -710,6 +710,7 @@ impl InterviewDriver {
             resume_session_id: resume,
             opening,
             message,
+            images: Vec::new(),
             purpose: match role {
                 Role::QuestionMaker => SessionPurpose::QuestionMaker,
                 Role::AnswerProcessor => SessionPurpose::AnswerProcessor,

@@ -2,7 +2,6 @@
 //! by the general-purpose [`AgentConversationPanel`].
 
 use super::{ConversationView, Pane, Stop};
-use crate::ui::token_usage;
 use crate::ui::agent_conversation::{
     AgentConversationEvent, AgentConversationPanel, Entry, EntryKind, PanelAction,
 };
@@ -17,7 +16,7 @@ const COPY_CONTEXT: &str = "transcript:copy-context";
 /// The transcript header's button that opens the report-a-problem dialog.
 const REPORT_PROBLEM: &str = "transcript:report-problem";
 
-pub(super) fn entry_of(turn: &Turn) -> Entry {
+pub(super) fn entry_of(turn: &Turn, root: &std::path::Path) -> Entry {
     // What the app sent on its own, shown as sent.
     if turn.role == TurnRole::Continuation {
         return Entry::raw(true, "Sent automatically", turn.body.clone());
@@ -34,6 +33,7 @@ pub(super) fn entry_of(turn: &Turn) -> Entry {
         label: None,
         summary: None,
         live: false,
+        images: turn.attachments.iter().map(|a| a.path(root)).collect(),
     }
 }
 
@@ -80,7 +80,9 @@ impl ConversationView {
         cx: &mut Context<Self>,
     ) {
         match event {
-            AgentConversationEvent::Send(text) => self.send(text, window, cx),
+            AgentConversationEvent::Send(message) => {
+                self.send(&message.text, message.images.clone(), window, cx)
+            }
             AgentConversationEvent::Stop => self.stop_turn(cx),
             AgentConversationEvent::Action(id, _) if id.as_ref() == COPY_CONTEXT => {
                 self.copy_opening_context(cx)
@@ -166,12 +168,13 @@ impl ConversationView {
         let active =
             self.pane == Pane::Transcript && self.stop == Stop::Transcript && self.picker.is_none();
         let gate_check = self.data.protocol == ProtocolKind::GateCheck;
+        let root = self.fleet.paths().root().to_path_buf();
         let mut entries: Vec<_> = self
             .data
             .turns
             .iter()
             .map(|turn| {
-                let mut entry = entry_of(turn);
+                let mut entry = entry_of(turn, &root);
                 // The verdict is structured YAML the app records and shows in
                 // the side pane; the transcript reads it in one line and keeps
                 // the YAML collapsed beneath, for digging in.
@@ -220,9 +223,7 @@ impl ConversationView {
         let return_focus = self.focus_handle.clone();
         let (actions, notices) = self.lifecycle_controls(cx);
         let lifecycle_state = self.data.lifecycle.as_ref().map(|s| s.lifecycle.clone());
-        let usage = self
-            .shown_usage()
-            .map(|usage| (token_usage::summary(&usage), token_usage::details(&usage)));
+        let usage = self.session_line();
         let mut header_actions = if self.data.has_opening_context {
             vec![PanelAction::new(COPY_CONTEXT, "Copy context")]
         } else {

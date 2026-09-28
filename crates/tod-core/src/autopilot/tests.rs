@@ -1,5 +1,6 @@
-//! The autopilot against the mock agents (`conversation::mock`, the gate
-//! check's `mock_turn`), played synchronously against the fixture's store.
+//! The autopilot against the mock agents (`conversation::mock`, and the
+//! phase agent and evaluator in `conversation::phase`), played synchronously
+//! against the fixture's store.
 
 use super::*;
 use crate::conversation::implement::{IMPLEMENT_CONVERSATION_ENV, IMPLEMENT_NODE_ENV};
@@ -26,9 +27,6 @@ struct FakeAgent {
     runs: HashMap<RunId, AgentRunState>,
     sessions: HashMap<String, String>,
     turns: usize,
-    /// Gives no verdict when a gate check is reopened for what the user
-    /// settled elsewhere.
-    silent_when_settled: bool,
 }
 
 impl FakeAgent {
@@ -38,7 +36,6 @@ impl FakeAgent {
             runs: HashMap::new(),
             sessions: HashMap::new(),
             turns: 0,
-            silent_when_settled: false,
         }
     }
 
@@ -49,22 +46,13 @@ impl FakeAgent {
                 .find(|(k, _)| k == name)
                 .map(|(_, v)| v.clone())
         };
-        let text = turn.prompt_blocks().join("\n\n");
-        let user = Direct {
-            fleet: &self.fleet,
-            actor: ACTOR_USER.to_string(),
-        };
-        if text.contains(SETTLED_ELSEWHERE_MESSAGE) && self.silent_when_settled {
-            return Ok(String::new());
-        }
-        if let Some(node) = env(IMPLEMENT_NODE_ENV)
-            && (text.contains("phase_purpose:** gate_check") || text.contains(SETTLED_ELSEWHERE_MESSAGE))
-        {
-            return crate::conversation::gate_check::mock_turn(&user, node.parse()?, &text);
-        }
         if let (Some(node), Some(conversation)) =
             (env(IMPLEMENT_NODE_ENV), env(IMPLEMENT_CONVERSATION_ENV))
         {
+            let user = Direct {
+                fleet: &self.fleet,
+                actor: env(ACTOR_ENV).unwrap_or_else(|| ACTOR_USER.to_string()),
+            };
             let place = crate::conversation::mock::Place {
                 cwd: Some(&turn.cwd),
                 env: &turn.env,
@@ -79,7 +67,6 @@ impl FakeAgent {
                 };
                 Ok(crate::conversation::mock::reply(&client, &turn.prompt_blocks())?.text)
             }
-            // On-entry work: nothing for the mock to do.
             None => Ok(String::new()),
         }
     }
@@ -156,6 +143,7 @@ fn config(fx: &Fixture) -> ConversationConfig {
         )
         .unwrap(),
         launch: AgentLaunchOptions::for_platform(AgentPlatform::Claude),
+        settings_path: None,
         context: InterviewContextSettings {
             context_budget_tokens: 1_000_000,
             ..Default::default()
@@ -163,22 +151,19 @@ fn config(fx: &Fixture) -> ConversationConfig {
     }
 }
 
-/// A node with a workspace and a two-step plan (standing in for planning's
-/// on-entry work, which the mock does not write).
+/// A node with a workspace, one requirement, and a two-step plan.
 fn setup() -> Fixture {
-    let fx = fixture();
-    let workspace = fx.root.join("workspace");
-    std::fs::create_dir_all(&workspace).unwrap();
+    let fx = bare();
     fx.fleet
-        .enqueue_outline(OutlineMutation::EnableCapabilities {
+        .enqueue_outline(OutlineMutation::CreateObligation {
+            obligation_id: None,
             node_id: fx.node,
-            capabilities: vec![Capability::Files],
-        })
-        .unwrap();
-    fx.fleet
-        .enqueue(tod_store::fleet::FleetMutation::UpdateTaskRepo {
-            id: fx.node.to_string(),
-            repo: Some(workspace.display().to_string()),
+            kind: tod_store::outline::KIND_REQUIREMENT.into(),
+            after_id: None,
+            before: false,
+            section: None,
+            body: "It works.".into(),
+            phase: tod_store::interview::PHASE_REQUIREMENTS.into(),
         })
         .unwrap();
     for n in 0..2 {
@@ -192,6 +177,33 @@ fn setup() -> Fixture {
             })
             .unwrap();
     }
+    fx.fleet.writer().flush().unwrap();
+    fx
+}
+
+/// A node with a workspace and nothing else: no requirements, no plan.
+fn bare() -> Fixture {
+    let fx = fixture();
+    let workspace = fx.root.join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    fx.fleet
+        .enqueue_outline(OutlineMutation::EnableCapabilities {
+            node_id: fx.node,
+            capabilities: vec![Capability::Files, Capability::Lifecycle],
+        })
+        .unwrap();
+    fx.fleet
+        .enqueue_outline(OutlineMutation::SetLifecycle {
+            node_id: fx.node,
+            state: "proposed".into(),
+        })
+        .unwrap();
+    fx.fleet
+        .enqueue(tod_store::fleet::FleetMutation::UpdateTaskRepo {
+            id: fx.node.to_string(),
+            repo: Some(workspace.display().to_string()),
+        })
+        .unwrap();
     fx.fleet.writer().flush().unwrap();
     fx
 }
@@ -231,7 +243,15 @@ fn takes_a_node_from_proposed_to_done() {
         .collect();
     assert_eq!(outcome, Outcome::Done, "{steps:#?}");
     assert_eq!(lifecycle::current_state(&fx.fleet, fx.node).unwrap(), "done");
-    for step in ["implementation", "verification", "review", "pr", "gate_check"] {
+    for step in [
+        "phase",
+        "evaluate",
+        "implementation",
+        "verification",
+        "review",
+        "pr",
+        "advance",
+    ] {
         assert!(steps.iter().any(|s| s.starts_with(step)), "{step}: {steps:#?}");
     }
     // Saved: a new autopilot reads the same run back.
@@ -239,6 +259,8 @@ fn takes_a_node_from_proposed_to_done() {
     assert_eq!(saved.outcome, Some(Outcome::Done));
     assert_eq!(&saved, pilot.state());
     assert_eq!(saved.current, None);
+    // Every finished step's session was ended, not left holding an agent.
+    assert!(agent.sessions.is_empty(), "{:?}", agent.sessions.keys().collect::<Vec<_>>());
 }
 
 #[test]
@@ -260,13 +282,6 @@ fn stops_at_a_failing_criterion_it_cannot_fix() {
         "{outcome:?}"
     );
     assert_eq!(lifecycle::current_state(&fx.fleet, fx.node).unwrap(), "ready");
-    // No gate check asked anything, yet the stop leaves a request.
-    let attention = fx
-        .fleet
-        .read(|conn| crate::attention::for_node(conn, fx.node))
-        .unwrap();
-    assert_eq!(attention.count, 1, "{attention:?}");
-    assert_eq!(attention.items[0].kind, crate::attention::AttentionKind::GateCriteria);
 }
 
 #[test]
@@ -348,8 +363,6 @@ fn stops_when_the_session_budget_runs_out_and_a_restart_keeps_count() {
             limit: BudgetLimit::Sessions { used: 2 }
         }
     );
-    let reached = lifecycle::current_state(&fx.fleet, fx.node).unwrap();
-    assert_ne!(reached, "proposed");
 
     // A restart reads the spent budget back and stops at once.
     let mut again = autopilot(&fx, budget);
@@ -408,77 +421,6 @@ fn a_restart_reopens_the_conversation_in_progress() {
     );
 }
 
-/// A gate check on the node whose report the user marked settled outside the
-/// app (`gate_check::mark_resolved_elsewhere`).
-fn gate_check_settled_elsewhere(fx: &Fixture, agent: &mut FakeAgent) -> Uuid {
-    // As a task node has: attention reads the state from its row.
-    lifecycle::set_lifecycle(&fx.fleet, fx.node, "proposed").unwrap();
-    let mut driver = ConversationDriver::new(config(fx), Focus::Node(fx.node), ProtocolKind::GateCheck);
-    driver.send(&fx.fleet, agent, "Run the gate check.").unwrap();
-    let id = driver.conversation_id().unwrap();
-    let report = crate::conversation::gate_check::GateReportRecord {
-        result: "needs_human".into(),
-        summary: "Which export format?".into(),
-        ..Default::default()
-    };
-    fx.fleet
-        .interview(
-            ACTOR_USER,
-            InterviewCommand::RecordConversationReport {
-                conversation_id: id,
-                body: report.to_value(),
-            },
-        )
-        .unwrap();
-    crate::conversation::gate_check::mark_resolved_elsewhere(&fx.fleet, id).unwrap();
-    id
-}
-
-fn turn_bodies(fx: &Fixture, id: Uuid) -> Vec<String> {
-    fx.fleet
-        .read(|conn| ConversationRepo::new(conn).turns(id))
-        .unwrap()
-        .into_iter()
-        .map(|t| t.body)
-        .collect()
-}
-
-#[test]
-fn a_gate_check_settled_elsewhere_is_reopened_not_started_afresh() {
-    let fx = setup();
-    let mut agent = FakeAgent::new(&fx.fleet);
-    let id = gate_check_settled_elsewhere(&fx, &mut agent);
-
-    let mut pilot = autopilot(&fx, Budget { max_sessions: 1, ..Budget::default() });
-    pilot.run(&fx.fleet, &mut agent).unwrap();
-    let first = pilot.state().steps.first().unwrap();
-    assert_eq!(first.step, "gate_check");
-    assert_eq!(first.conversation_id, Some(id));
-    let turns = turn_bodies(&fx, id);
-    assert!(turns.iter().any(|t| t == SETTLED_ELSEWHERE_MESSAGE), "{turns:?}");
-}
-
-#[test]
-fn a_reopened_gate_check_with_no_new_verdict_asks_again() {
-    let fx = setup();
-    let mut agent = FakeAgent::new(&fx.fleet);
-    agent.silent_when_settled = true;
-    let id = gate_check_settled_elsewhere(&fx, &mut agent);
-
-    let outcome = autopilot(&fx, Budget::default()).run(&fx.fleet, &mut agent).unwrap();
-    assert!(
-        matches!(&outcome, Outcome::NeedsHuman { reason } if reason.is_request()),
-        "{outcome:?}"
-    );
-    // The question stands again, so the stop has something to answer.
-    let attention = fx
-        .fleet
-        .read(|conn| crate::attention::for_node(conn, fx.node))
-        .unwrap();
-    assert_eq!(attention.count, 1, "{attention:?}");
-    assert_eq!(attention.items[0].id, id);
-}
-
 /// Stops the run from `watch`, the first time a turn is in flight.
 struct StopMidTurn(bool);
 
@@ -496,7 +438,6 @@ impl StepHook for StopMidTurn {
 fn stopping_mid_turn_keeps_the_conversation_for_the_next_run() {
     let fx = setup();
     retire_outside_criteria(&fx);
-    // Implementing: the mock gate check cannot take a reopened turn.
     lifecycle::set_lifecycle(&fx.fleet, fx.node, "active").unwrap();
     let mut agent = FakeAgent::new(&fx.fleet);
     let mut pilot = autopilot(&fx, Budget::default());
@@ -599,4 +540,84 @@ fn a_local_run_asked_to_pause_stops_at_the_first_boundary() {
     assert!(stopped_by_user(&outcome));
     assert_eq!(events.last(), Some(&LocalEvent::Finished(Ok(outcome))));
     assert_ne!(lifecycle::current_state(&fx.fleet, fx.node).unwrap(), "done");
+}
+
+/// A node with nothing on it that says what it is for: the `proposed` agent
+/// asks the user, in free text, and carries on from the answer.
+#[test]
+fn proposed_with_nothing_to_go_on_asks_the_user_what_it_is_for() {
+    let fx = bare();
+    retire_outside_criteria(&fx);
+    let mut agent = FakeAgent::new(&fx.fleet);
+    let outcome = autopilot(&fx, Budget::default())
+        .run(&fx.fleet, &mut agent)
+        .unwrap();
+    assert_eq!(
+        outcome,
+        Outcome::NeedsHuman {
+            reason: NeedsHuman::Decision { pending: 1 }
+        }
+    );
+    let asked = fx
+        .fleet
+        .read(|conn| Ok(tod_store::decisions::DecisionRepo::new(conn).list_for_node(fx.node)?))
+        .unwrap();
+    let [question] = asked.as_slice() else {
+        panic!("{asked:?}");
+    };
+    assert!(question.options.is_empty(), "free text: {question:?}");
+    assert_eq!(question.reason, tod_store::decisions::REASON_INTENT);
+
+    fx.fleet
+        .interview(
+            ACTOR_USER,
+            InterviewCommand::AnswerDecision {
+                decision_id: question.id,
+                option: None,
+                text: Some("Show the weather.".into()),
+            },
+        )
+        .unwrap();
+    let outcome = autopilot(&fx, Budget::default())
+        .run(&fx.fleet, &mut agent)
+        .unwrap();
+    assert_eq!(outcome, Outcome::Done);
+    let requirements = fx
+        .fleet
+        .read(|conn| Ok(tod_store::outline::repos::ObligationRepo::new(conn).list_for_node(fx.node)?))
+        .unwrap();
+    assert!(
+        requirements.iter().any(|o| o.body == "Show the weather."),
+        "{requirements:?}"
+    );
+}
+
+/// An evaluator that sends the same work back twice, with nothing changed
+/// between, stops the run for the user instead of looping.
+#[test]
+fn an_evaluator_that_keeps_rejecting_the_same_work_stops_the_run() {
+    let fx = setup();
+    retire_outside_criteria(&fx);
+    fx.fleet
+        .enqueue_outline(OutlineMutation::UpdateNodeTitle {
+            node_id: fx.node,
+            title: "Interview node [reject]".into(),
+        })
+        .unwrap();
+    fx.fleet.writer().flush().unwrap();
+    let mut agent = FakeAgent::new(&fx.fleet);
+    let mut pilot = autopilot(&fx, Budget::default());
+    let outcome = pilot.run(&fx.fleet, &mut agent).unwrap();
+    assert!(
+        matches!(
+            &outcome,
+            Outcome::NeedsHuman {
+                reason: NeedsHuman::EvaluationStuck { fixes }
+            } if !fixes.is_empty()
+        ),
+        "{outcome:?}"
+    );
+    assert_eq!(lifecycle::current_state(&fx.fleet, fx.node).unwrap(), "proposed");
+    let steps: Vec<_> = pilot.state().steps.iter().map(|s| s.step.clone()).collect();
+    assert_eq!(steps, ["phase", "evaluate", "phase", "evaluate"], "{steps:?}");
 }

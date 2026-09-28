@@ -8,9 +8,13 @@
 //! up here as unchecked work, the same as never having verified.
 //!
 //! The gate check is only ever the recommendation once nothing earlier is
-//! owed: running it before then only reports what this already knows.
+//! owed: running it before then only reports what this already knows. In a
+//! state worked by the generic phase agent (`crate::phase`), that means the
+//! gate already passes; until then the phase agent works, or an independent
+//! evaluator judges what it did.
 
 use crate::conversation::review::review_recorded_done;
+use crate::phase::{PhaseStanding, PhaseStep, has_phase_agent};
 use anyhow::Result;
 use rusqlite::Connection;
 use tod_store::outline::repos::PlanStepRepo;
@@ -42,6 +46,12 @@ pub struct Standing {
     pub review_done: bool,
     /// Review findings nobody has answered.
     pub open_findings: usize,
+    /// In a state the generic phase agent works: what it does next.
+    pub phase: Option<PhaseStep>,
+    /// In such a state: changes whenever the phase's inputs or events do
+    /// (`PhaseStanding::marker`), so a phase step that did something does
+    /// not read as one that did nothing.
+    pub phase_marker: String,
 }
 
 /// The recommended next step.
@@ -60,6 +70,11 @@ pub enum NextStep {
     Fix,
     /// Nothing earlier is owed: check the gate (or advance, once it passed).
     GateCheck,
+    /// The state's phase agent has work to do (`crate::phase`).
+    Phase,
+    /// The phase agent recorded its phase ready: an independent session
+    /// judges it.
+    Evaluate,
 }
 
 impl Standing {
@@ -78,7 +93,14 @@ impl Standing {
         } else {
             0
         };
+        let phase = if has_phase_agent(lifecycle) {
+            Some(PhaseStanding::load(conn, node_id, lifecycle)?)
+        } else {
+            None
+        };
         Ok(Self {
+            phase: phase.as_ref().map(PhaseStanding::step),
+            phase_marker: phase.map(|p| p.marker).unwrap_or_default(),
             lifecycle: lifecycle.to_string(),
             plan_steps: steps.len(),
             steps_open: steps
@@ -131,7 +153,11 @@ pub fn next_step(standing: &Standing) -> Option<NextStep> {
         "verifying" if standing.steps_failed > 0 => Some(NextStep::FixFailed),
         "review" if !standing.review_done => Some(NextStep::Review),
         "review" if standing.open_findings > 0 => Some(NextStep::Fix),
-        _ => Some(NextStep::GateCheck),
+        _ => match standing.phase {
+            Some(PhaseStep::Work) => Some(NextStep::Phase),
+            Some(PhaseStep::Evaluate) => Some(NextStep::Evaluate),
+            Some(PhaseStep::Gate) | None => Some(NextStep::GateCheck),
+        },
     }
 }
 
@@ -231,6 +257,17 @@ mod tests {
         s.open_findings = 1;
         assert_eq!(next_step(&s), Some(NextStep::Fix));
         s.open_findings = 0;
+        assert_eq!(next_step(&s), Some(NextStep::GateCheck));
+    }
+
+    #[test]
+    fn a_phase_state_works_then_is_evaluated_then_checks_the_gate() {
+        let mut s = standing("design");
+        s.phase = Some(PhaseStep::Work);
+        assert_eq!(next_step(&s), Some(NextStep::Phase));
+        s.phase = Some(PhaseStep::Evaluate);
+        assert_eq!(next_step(&s), Some(NextStep::Evaluate));
+        s.phase = Some(PhaseStep::Gate);
         assert_eq!(next_step(&s), Some(NextStep::GateCheck));
     }
 

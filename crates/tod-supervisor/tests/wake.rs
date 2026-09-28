@@ -15,7 +15,7 @@ use tod_store::fleet::FleetStore;
 use tod_store::outline::{Capability, CreatePosition, OutlineMutation};
 use tod_store::waits::{NewWait, WaitRepo};
 use tod_supervisor::agent::AgentKind;
-use tod_supervisor::hold::RelayHolder;
+use tod_supervisor::hold::{Holder, RelayHolder};
 use tod_supervisor::orchestrator::Orchestrator;
 use tod_supervisor::transcripts::TranscriptStore;
 use tod_supervisor::{Config, Woke, wake};
@@ -54,6 +54,24 @@ fn fake_relay() -> (String, Arc<Mutex<Vec<String>>>) {
         }
     });
     (url, seen)
+}
+
+/// A holder that notes whether the supervisor's local copy of the database
+/// existed when each hold was taken, and passes the call on to the relay.
+struct SeedWatcher {
+    relay: RelayHolder,
+    db: PathBuf,
+    seeded_at_hold: Mutex<Vec<bool>>,
+}
+
+impl Holder for SeedWatcher {
+    fn hold(&self, reason: &str, secs: u64) -> anyhow::Result<()> {
+        self.seeded_at_hold.lock().unwrap().push(self.db.exists());
+        self.relay.hold(reason, secs)
+    }
+    fn release(&self, reason: &str) -> anyhow::Result<()> {
+        self.relay.release(reason)
+    }
 }
 
 /// The user's app database: a node in `active` with Files and a two-step plan.
@@ -158,13 +176,18 @@ fn a_wake_runs_the_node_and_its_work_reaches_the_orchestrator() {
 
     let (relay_url, relay_seen) = fake_relay();
     let sink: Arc<dyn TranscriptStore> = Arc::new(orchestrator.clone());
+    let watcher = Arc::new(SeedWatcher {
+        relay: RelayHolder::new(relay_url),
+        db: base.join("supervisor").join("tod.db"),
+        seeded_at_hold: Mutex::new(Vec::new()),
+    });
     let woke = wake(Config {
         orchestrator: orchestrator.clone(),
         node,
         workspace: workspace.clone(),
         state_dir: base.join("supervisor"),
         agent: AgentKind::Mock,
-        holder: Arc::new(RelayHolder::new(relay_url)),
+        holder: watcher.clone(),
         transcripts: Some((projects.clone(), sink)),
         media: media(),
         budget: Budget { max_sessions: 1, max_duration: Duration::from_secs(600) },
@@ -196,7 +219,9 @@ fn a_wake_runs_the_node_and_its_work_reaches_the_orchestrator() {
     // Its local Files rewrite never leaves the sandbox.
     assert!(!tables.contains(&"node_files") && !tables.contains(&"node_fields"), "{tables:?}");
 
-    // Held while it worked, released at the end.
+    // Held from before it seeded its copy (seeding can outlast the relay's
+    // poke hold), released at the end.
+    assert_eq!(watcher.seeded_at_hold.lock().unwrap().first(), Some(&false));
     let seen = relay_seen.lock().unwrap().clone();
     assert!(seen.first().is_some_and(|l| l.starts_with("POST /hold?reason=supervisor&secs=120 ")), "{seen:?}");
     assert!(seen.last().is_some_and(|l| l.starts_with("POST /release?reason=supervisor ")), "{seen:?}");
@@ -262,7 +287,10 @@ fn a_wake_runs_the_node_and_its_work_reaches_the_orchestrator() {
     })
     .unwrap();
     assert!(matches!(woke, Woke::StillWaiting(_)), "{woke:?}");
-    assert!(relay_seen.lock().unwrap().is_empty(), "no hold while only waiting");
+    // Held while it looked, released before going back to sleep.
+    let seen = relay_seen.lock().unwrap().clone();
+    assert!(seen.first().is_some_and(|l| l.starts_with("POST /hold?reason=supervisor&secs=120 ")), "{seen:?}");
+    assert!(seen.last().is_some_and(|l| l.starts_with("POST /release?reason=supervisor ")), "{seen:?}");
     // Woken for the soonest: the timer, not the check pushed an hour out.
     assert_eq!(*scheduler.calls.lock().unwrap(), vec![(timer.id, "node-test".to_string(), timer.due_at)]);
     // The failed check moved on, and that reached the orchestrator.
@@ -270,11 +298,70 @@ fn a_wake_runs_the_node_and_its_work_reaches_the_orchestrator() {
     let moved = WaitRepo::new(&conn).get(poll.id).unwrap().unwrap();
     assert_eq!(moved.state, "pending");
     assert!(moved.due_at >= now + 3_600_000, "{moved:?}");
+    assert!(scheduler.cancels.lock().unwrap().is_empty());
+    drop(conn);
+
+    // The timer is satisfied some other way (as a webhook would), so the
+    // check is now the soonest: its wake replaces the timer's, which is
+    // cancelled rather than left to poke later.
+    {
+        let conn = rusqlite::Connection::open(&remote_db).unwrap();
+        conn.busy_timeout(Duration::from_secs(10)).unwrap();
+        WaitRepo::new(&conn).set_state(timer.id, "satisfied").unwrap();
+    }
+    let woke = wake(Config {
+        orchestrator: orchestrator.clone(),
+        node,
+        workspace: workspace.clone(),
+        state_dir: base.join("supervisor"),
+        agent: AgentKind::Mock,
+        holder: Arc::new(RelayHolder::new(fake_relay().0)),
+        transcripts: None,
+        media: media(),
+        budget: Budget { max_sessions: 1, max_duration: Duration::from_secs(600) },
+        guards: Default::default(),
+        poll: Duration::from_millis(20),
+        push_branch: false,
+        scheduler: Some(scheduler.clone()),
+        sandbox: "node-test".into(),
+    })
+    .unwrap();
+    assert!(matches!(woke, Woke::StillWaiting(_)), "{woke:?}");
+    assert_eq!(scheduler.calls.lock().unwrap().last().map(|c| c.0), Some(poll.id));
+    assert_eq!(*scheduler.cancels.lock().unwrap(), vec![timer.id]);
+
+    // Nothing left to wait on: the node works, and first drops the check's
+    // wake, which it no longer needs.
+    {
+        let conn = rusqlite::Connection::open(&remote_db).unwrap();
+        conn.busy_timeout(Duration::from_secs(10)).unwrap();
+        WaitRepo::new(&conn).set_state(poll.id, "satisfied").unwrap();
+    }
+    let woke = wake(Config {
+        orchestrator: orchestrator.clone(),
+        node,
+        workspace: workspace.clone(),
+        state_dir: base.join("supervisor"),
+        agent: AgentKind::Mock,
+        holder: Arc::new(RelayHolder::new(fake_relay().0)),
+        transcripts: None,
+        media: media(),
+        budget: Budget { max_sessions: 1, max_duration: Duration::from_secs(600) },
+        guards: Default::default(),
+        poll: Duration::from_millis(20),
+        push_branch: false,
+        scheduler: Some(scheduler.clone()),
+        sandbox: "node-test".into(),
+    })
+    .unwrap();
+    assert!(matches!(woke, Woke::Ran(_)), "{woke:?}");
+    assert_eq!(*scheduler.cancels.lock().unwrap(), vec![timer.id, poll.id]);
 }
 
 #[derive(Default)]
 struct FakeScheduler {
     calls: Mutex<Vec<(Uuid, String, i64)>>,
+    cancels: Mutex<Vec<Uuid>>,
 }
 
 impl tod_core::scheduler::Scheduler for FakeScheduler {
@@ -282,7 +369,8 @@ impl tod_core::scheduler::Scheduler for FakeScheduler {
         self.calls.lock().unwrap().push((id, sandbox.to_string(), at_ms));
         Ok(())
     }
-    fn cancel(&self, _id: Uuid) -> anyhow::Result<()> {
+    fn cancel(&self, id: Uuid) -> anyhow::Result<()> {
+        self.cancels.lock().unwrap().push(id);
         Ok(())
     }
 }

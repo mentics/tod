@@ -181,7 +181,7 @@ pub trait Protocol: Send + Sync {
     ) -> Result<String>;
 
     /// The lifecycle transition a conversation of this kind is about, for the
-    /// kinds that belong to one (a gate check, an on-entry run): recorded on
+    /// kinds that belong to one (phase work, an evaluation): recorded on
     /// the conversation when it starts, and shown by the picker. `None` for
     /// every other kind.
     fn transition(&self, _fleet: &FleetStore, _focus: Focus) -> Option<(String, String)> {
@@ -189,7 +189,7 @@ pub trait Protocol: Send + Sync {
     }
 
     /// Runs on every agent reply once it is in the transcript, for a protocol
-    /// that reads the reply itself (the gate check's verdict). What it returns
+    /// that reads the reply itself. What it returns
     /// is shown to the user as toasts.
     fn on_reply(&self, _env: &ProtocolEnv<'_>, _reply: &str) -> Vec<RunNotice> {
         Vec::new()
@@ -228,13 +228,64 @@ pub fn protocol_for(kind: ProtocolKind) -> &'static dyn Protocol {
         ProtocolKind::Review => &super::review::ReviewProtocol,
         ProtocolKind::Pr => &super::pr::PrProtocol,
         ProtocolKind::Fix => &super::fix::FixProtocol,
-        ProtocolKind::GateCheck => &super::gate_check::GateCheckProtocol,
-        ProtocolKind::OnEntry => &super::gate_check::OnEntryProtocol,
+        ProtocolKind::GateCheck => &RetiredProtocol(ProtocolKind::GateCheck),
+        ProtocolKind::OnEntry => &RetiredProtocol(ProtocolKind::OnEntry),
         ProtocolKind::Incoming => &super::incoming::IncomingProtocol,
+        ProtocolKind::Phase => &super::phase::PhaseProtocol,
+        ProtocolKind::Evaluate => &super::phase::EvaluateProtocol,
         ProtocolKind::Chat => &ChatProtocol,
         // Until the visual designer has its own protocol and side pane, a
         // visual-design conversation behaves as a plain chat.
         ProtocolKind::VisualDesign => &ChatProtocol,
+    }
+}
+
+/// A gate check or on-entry run from before gates were app checks and each
+/// state's work went to its phase agent (`doc/lifecycle/phase-agents.md`).
+/// Its transcript still reads; it takes no further turns.
+pub struct RetiredProtocol(pub ProtocolKind);
+
+impl RetiredProtocol {
+    fn refuse(&self) -> anyhow::Error {
+        anyhow::anyhow!(
+            "this {} conversation is from before gates were app checks and takes no \
+             further turns: the state's own work runs as phase work now",
+            self.surface()
+        )
+    }
+}
+
+impl Protocol for RetiredProtocol {
+    fn kind(&self) -> ProtocolKind {
+        self.0
+    }
+
+    fn surface(&self) -> &'static str {
+        match self.0 {
+            ProtocolKind::OnEntry => crate::session_name::ON_ENTRY_SURFACE,
+            _ => crate::session_name::GATE_CHECK_SURFACE,
+        }
+    }
+
+    fn cwd(&self, _env: &ProtocolEnv<'_>) -> Result<Workdir> {
+        Err(self.refuse())
+    }
+
+    fn prepare(&self, _env: &ProtocolEnv<'_>) -> Result<()> {
+        Err(self.refuse())
+    }
+
+    fn opening(&self, _env: &ProtocolEnv<'_>) -> Result<String> {
+        Err(self.refuse())
+    }
+
+    fn resume_snapshot(
+        &self,
+        _env: &ProtocolEnv<'_>,
+        _budget_tokens: i64,
+        _before_seq: Option<i64>,
+    ) -> Result<String> {
+        Err(self.refuse())
     }
 }
 
@@ -363,7 +414,7 @@ impl Protocol for ChatProtocol {
 /// else the scratch directory `name`. The agent CLI discovers the workspace's
 /// agent docs from its working directory, so this is what gives a
 /// conversation about a node the docs of the workspace that node lives in.
-fn focus_cwd_or_scratch(env: &ProtocolEnv<'_>, name: &str) -> Result<Workdir> {
+pub(super) fn focus_cwd_or_scratch(env: &ProtocolEnv<'_>, name: &str) -> Result<Workdir> {
     if let Some(node) = env.focus.node_id() {
         if let Ok(dir) =
             tod_store::fleet::provision::resolve_launch_cwd(env.fleet, &node.to_string())
@@ -401,6 +452,8 @@ mod tests {
             ProtocolKind::OnEntry,
             ProtocolKind::Incoming,
             ProtocolKind::Pr,
+            ProtocolKind::Phase,
+            ProtocolKind::Evaluate,
             ProtocolKind::Chat,
         ] {
             assert_eq!(protocol_for(kind).kind(), kind, "{kind:?}");

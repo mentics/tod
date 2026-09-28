@@ -235,8 +235,7 @@ fn reconcile(state: &Mutex<HoldState>, current: &mut Option<(String, Instant)>, 
     }
     *next_id += 1;
     let name = format!("tod-relay-hold-{}-{next_id}", std::process::id());
-    let body =
-        format!(r#"{{"command":"sleep 2147483","name":"{name}","keepAlive":true,"timeout":{desired_secs}}}"#);
+    let body = hold_process_body(&name, desired_secs);
     match api("POST", "/process", Some(&body)) {
         Ok(_) => {
             eprintln!("hold: awake ({name}, timeout {desired_secs}s)");
@@ -244,6 +243,14 @@ fn reconcile(state: &Mutex<HoldState>, current: &mut Option<(String, Instant)>, 
         }
         Err(e) => eprintln!("hold: could not start: {e}"),
     }
+}
+
+/// The process API request for a hold's `keepAlive` process. The API runs
+/// the command through `sh -c` and reaps only its own children, so `exec`
+/// makes `sleep` that child: killing it at release leaves no `<defunct>`
+/// `sleep` (orphaned to PID 1, which never reaps it) behind for every hold.
+fn hold_process_body(name: &str, timeout_secs: u64) -> String {
+    format!(r#"{{"command":"exec sleep 2147483","name":"{name}","keepAlive":true,"timeout":{timeout_secs}}}"#)
 }
 
 fn api(method: &str, path: &str, body: Option<&str>) -> std::io::Result<String> {
@@ -269,6 +276,16 @@ mod tests {
 
     fn secs(n: u64) -> Duration {
         Duration::from_secs(n)
+    }
+
+    #[test]
+    fn hold_process_is_the_sleep_itself() {
+        let body = hold_process_body("tod-relay-hold-1-1", 60);
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["command"], "exec sleep 2147483");
+        assert_eq!(v["name"], "tod-relay-hold-1-1");
+        assert_eq!(v["keepAlive"], true);
+        assert_eq!(v["timeout"], 60);
     }
 
     #[test]

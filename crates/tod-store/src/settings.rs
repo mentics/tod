@@ -16,10 +16,10 @@ const DEFAULT_JOURNEY_STORAGE_CAP_MB: u64 = 1024;
 /// Every lifecycle state name a node can hold, mirroring the `CHECK`
 /// constraint on `node_lifecycle.state` (`outline/ddl.rs`). Kept here rather
 /// than importing `tod-core`'s `LIFECYCLE_STATES`: `tod-store` is the lower
-/// layer and never depends on `tod-core`.
-const VALID_LIFECYCLE_STATES: [&str; 12] = [
-    "proposed", "design", "planning", "ready", "active", "verifying", "review", "approved",
-    "merged", "released", "learn", "done",
+/// layer and never depends on `tod-core`. `tod-core` tests that the two agree.
+pub const VALID_LIFECYCLE_STATES: [&str; 13] = [
+    "proposed", "design", "planning", "ready", "active", "verifying", "review", "pr",
+    "approved", "merged", "released", "learn", "done",
 ];
 
 fn default_journey_milestone_states() -> Vec<String> {
@@ -34,6 +34,29 @@ fn default_journey_milestone_states() -> Vec<String> {
 
 fn default_journey_storage_cap_mb() -> u64 {
     DEFAULT_JOURNEY_STORAGE_CAP_MB
+}
+
+fn default_independent_evaluation() -> bool {
+    true
+}
+
+/// How the lifecycle runner judges a phase done
+/// (`doc/lifecycle/phase-agents.md`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LifecycleSettings {
+    /// A fresh Evaluate session, separate from the phase agent, judges each
+    /// phase and certifies it or sends it back. Off: the phase agent
+    /// certifies its own phase.
+    #[serde(default = "default_independent_evaluation")]
+    pub independent_evaluation: bool,
+}
+
+impl Default for LifecycleSettings {
+    fn default() -> Self {
+        Self {
+            independent_evaluation: default_independent_evaluation(),
+        }
+    }
 }
 
 /// Whether, and how, per-node/project journeys are recorded and can be sent
@@ -166,6 +189,68 @@ fn default_prompt_cache_idle_minutes() -> u64 {
 
 fn default_answered_history_cap() -> u32 {
     DEFAULT_ANSWERED_HISTORY_CAP
+}
+
+/// How long a connection to a cloud sandbox stays open with nothing
+/// happening on it. An open connection keeps the sandbox awake, and Blaxel
+/// puts it in standby about 13.5 s after the last one closes, so each of
+/// these adds to how long an idle sandbox is paid for. Reopening costs a
+/// reattach (about 0.1 s) while the sandbox is still awake, or a wake (about
+/// 0.5 s) after. Read by `tod-sandbox` and, through `tod-sandbox
+/// connect-info`, by the Zed shim; their flags and environment variables
+/// override it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SandboxIdleSettings {
+    /// A terminal with no input, no output, and no foreground job closes its
+    /// connection after this long (`tod-sandbox shell --park`,
+    /// `TOD_TERMINAL_PARK_SECS`). 0 never closes it.
+    #[serde(default = "default_terminal_park_secs")]
+    pub terminal_park_secs: u64,
+    /// Zed's connection closes after this long with no message either way
+    /// (`TOD_ZED_PARK_SECS`). While closed, what the server sends on its own
+    /// (diagnostics, changed files) waits for Zed's next message. 0 never
+    /// closes it.
+    #[serde(default = "default_zed_park_secs")]
+    pub zed_park_secs: u64,
+    /// An agent's connection closes after this long with no turn and no
+    /// request open (`tod-sandbox agent --idle`).
+    #[serde(default = "default_agent_idle_secs")]
+    pub agent_idle_secs: u64,
+}
+
+pub const DEFAULT_TERMINAL_PARK_SECS: u64 = 3;
+pub const DEFAULT_ZED_PARK_SECS: u64 = 10;
+pub const DEFAULT_AGENT_IDLE_SECS: u64 = 3;
+
+impl Default for SandboxIdleSettings {
+    fn default() -> Self {
+        Self {
+            terminal_park_secs: DEFAULT_TERMINAL_PARK_SECS,
+            zed_park_secs: DEFAULT_ZED_PARK_SECS,
+            agent_idle_secs: DEFAULT_AGENT_IDLE_SECS,
+        }
+    }
+}
+
+impl SandboxIdleSettings {
+    /// The data root's settings, or the defaults if they cannot be read.
+    pub fn load(data_root: &Path) -> Self {
+        TodSettings::load_from_path(&data_root.join(crate::paths::SETTINGS_FILE))
+            .map(|settings| settings.sandbox_idle)
+            .unwrap_or_default()
+    }
+}
+
+fn default_terminal_park_secs() -> u64 {
+    DEFAULT_TERMINAL_PARK_SECS
+}
+
+fn default_zed_park_secs() -> u64 {
+    DEFAULT_ZED_PARK_SECS
+}
+
+fn default_agent_idle_secs() -> u64 {
+    DEFAULT_AGENT_IDLE_SECS
 }
 
 fn default_log_level() -> LogLevel {
@@ -437,6 +522,12 @@ pub struct TodSettings {
     /// Per-node/project journey recording and submission (`doc/journeys/spec.md`).
     #[serde(default)]
     pub journeys: JourneySettings,
+    /// How lifecycle phases are judged done.
+    #[serde(default)]
+    pub lifecycle: LifecycleSettings,
+    /// How long idle connections to cloud sandboxes stay open.
+    #[serde(default)]
+    pub sandbox_idle: SandboxIdleSettings,
 }
 
 /// The Treehouse executable when none is configured: found on PATH.
@@ -465,6 +556,8 @@ impl Default for TodSettings {
             terminal: TerminalSettings::default(),
             window_geometry: None,
             journeys: JourneySettings::default(),
+            lifecycle: LifecycleSettings::default(),
+            sandbox_idle: SandboxIdleSettings::default(),
         }
     }
 }
@@ -676,6 +769,26 @@ mod tests {
     use std::fs;
 
     #[test]
+    fn sandbox_idle_reads_the_data_roots_settings_and_defaults_what_is_missing() {
+        let dir = std::env::temp_dir().join(format!("tod-sandbox-idle-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        assert_eq!(SandboxIdleSettings::load(&dir), SandboxIdleSettings::default());
+
+        fs::write(dir.join(crate::paths::SETTINGS_FILE), "sandbox_idle:
+  zed_park_secs: 25
+").unwrap();
+        let idle = SandboxIdleSettings::load(&dir);
+        assert_eq!(idle.zed_park_secs, 25);
+        assert_eq!(idle.terminal_park_secs, DEFAULT_TERMINAL_PARK_SECS);
+        assert_eq!(idle.agent_idle_secs, DEFAULT_AGENT_IDLE_SECS);
+
+        fs::write(dir.join(crate::paths::SETTINGS_FILE), "sandbox_idle: [not, a, map]
+").unwrap();
+        assert_eq!(SandboxIdleSettings::load(&dir), SandboxIdleSettings::default());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn journeys_can_submit_only_when_sending_with_a_valid_relay_code() {
         let (_identity, recipient) = tod_journey::seal::generate_test_identity();
         let code = tod_journey::relay_code::RelayCode {
@@ -801,6 +914,10 @@ mod tests {
                 maximized: false,
             }),
             journeys: JourneySettings::default(),
+            lifecycle: LifecycleSettings {
+                independent_evaluation: false,
+            },
+            sandbox_idle: SandboxIdleSettings::default(),
         };
         settings.save_to_path(&path).unwrap();
         let loaded = TodSettings::load_from_path(&path).unwrap();
@@ -874,6 +991,27 @@ mod tests {
         assert_eq!(settings.agent_platform, AgentPlatform::Claude);
         assert_eq!(settings.agent_model(), "opus");
         assert_eq!(settings.agent_effort(), "auto");
+    }
+
+    #[test]
+    fn independent_evaluation_defaults_on_and_round_trips_off() {
+        let dir = std::env::temp_dir().join(format!("tod-settings-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("tod.yml");
+        fs::write(&path, "log_max_size_kb: 1024
+").unwrap();
+        let loaded = TodSettings::load_from_path(&path).unwrap();
+        assert!(loaded.lifecycle.independent_evaluation, "a missing key means on");
+        fs::write(&path, "lifecycle: {}
+").unwrap();
+        assert!(TodSettings::load_from_path(&path).unwrap().lifecycle.independent_evaluation);
+
+        let mut off = loaded;
+        off.lifecycle.independent_evaluation = false;
+        off.save_to_path(&path).unwrap();
+        let reloaded = TodSettings::load_from_path(&path).unwrap();
+        assert!(!reloaded.lifecycle.independent_evaluation);
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]

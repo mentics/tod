@@ -3,10 +3,12 @@
 //! `tod-supervisor wake` (started by the relay's poke, from a schedule, or
 //! when the sandbox is provisioned) asks what the node is waiting on. If it
 //! is still waiting, it schedules the next check and exits. Otherwise it
-//! takes a hold on the sandbox through the relay, runs the lifecycle
+//! runs the lifecycle
 //! [`Autopilot`] for the node with the agent started here, and when that
 //! stops — the node is done, needs the user, or recorded a wait — pushes the
-//! branch, schedules the wake a wait needs, releases the hold, and exits.
+//! branch, schedules the wake a wait needs, and exits. It holds the sandbox
+//! awake through the relay for the whole wake, from before it syncs its
+//! local copy ([`hold`]) until it exits.
 //!
 //! The autopilot runs against a local copy of the user's database that is
 //! synced with the orchestrator around every step and turn ([`replica`]).
@@ -130,11 +132,12 @@ impl StepHook for Hook<'_> {
     }
 }
 
-/// Schedules the wake the node's waits need, if it has a scheduler.
+/// Schedules the wake the node's waits need, if it has a scheduler, and
+/// cancels one left from before that they no longer need.
 fn schedule(store: &FleetStore, config: &Config) -> Result<()> {
     match &config.scheduler {
         Some(scheduler) => {
-            waits::schedule_wake(store, config.node, scheduler.as_ref(), &config.sandbox)?;
+            waits::reconcile_wake(store, config.node, scheduler.as_ref(), &config.sandbox, &config.state_dir)?;
         }
         None => tracing::warn!("no scheduler: nothing will wake this node but a poke"),
     }
@@ -192,6 +195,11 @@ fn ask(store: &FleetStore, node: Uuid, conversation: Option<Uuid>, kind: &str, q
 /// One wake. See the module docs.
 pub fn wake(config: Config) -> Result<Woke> {
     signal::install();
+    // Hold the sandbox awake from the start: seeding a new replica from the
+    // orchestrator can outlast the relay's poke hold, and the sandbox must
+    // not go to standby mid-seed. Released when the wake returns, including
+    // when it finds nothing to do.
+    let hold = HoldGuard::take(config.holder.clone());
     let replica = Replica::open(&config.state_dir, config.orchestrator.clone(), config.node, &config.workspace)?;
     let replica = Arc::new(Mutex::new(replica));
     let store = replica.lock().unwrap_or_else(|e| e.into_inner()).store().clone();
@@ -214,8 +222,11 @@ pub fn wake(config: Config) -> Result<Woke> {
         return Ok(Woke::StillWaiting(reason));
     }
 
-    // There is work: hold the sandbox awake until it is done.
-    let hold = HoldGuard::take(config.holder.clone());
+    // A wake still scheduled (its wait was satisfied some other way, e.g.
+    // by a webhook) would only poke later; drop it now.
+    if let Some(scheduler) = &config.scheduler {
+        waits::cancel_scheduled(scheduler.as_ref(), &config.state_dir)?;
+    }
     let follow = match &config.transcripts {
         Some((projects, sink)) => {
             let mirror = Arc::new(Mirror::new(projects.clone(), sink.clone()));
@@ -234,6 +245,7 @@ pub fn wake(config: Config) -> Result<Woke> {
         data_root: data_root.clone(),
         media: config.media.clone(),
         launch: AgentLaunchOptions::for_platform(AgentPlatform::Claude),
+        settings_path: None,
         context: InterviewContextSettings::default(),
     };
     let mut agent = Guarded::new(

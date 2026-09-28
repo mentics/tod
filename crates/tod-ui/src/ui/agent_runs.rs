@@ -74,9 +74,15 @@ impl NodeRun {
         self.running && self.protocol == ProtocolKind::OnEntry
     }
 
-    /// Running a gate check: leaving `from_state` toward `to_state`.
+    /// Running the state's own work or its evaluation (or, from before
+    /// gates were app checks, a gate check): working toward leaving
+    /// `from_state`.
     pub fn leaving(&self) -> bool {
-        self.running && self.protocol == ProtocolKind::GateCheck
+        self.running
+            && matches!(
+                self.protocol,
+                ProtocolKind::Phase | ProtocolKind::Evaluate | ProtocolKind::GateCheck
+            )
     }
 }
 
@@ -431,7 +437,8 @@ impl AgentRuns {
         Ok(ConversationConfig {
             data_root: self.fleet.paths().root().to_path_buf(),
             media,
-            launch: settings.interview_launch_options(),
+            launch: settings.launch_options_for(tod_store::AgentRole::Default),
+            settings_path: Some(paths.settings_path()),
             context: settings.interview_context.clone(),
         })
     }
@@ -697,6 +704,7 @@ mod tests {
             data_root: fixture.store.paths().root().to_path_buf(),
             media: tod_core::media::MediaPaths::discover().expect("media paths"),
             launch: tod_agent::AgentLaunchOptions::for_platform(tod_agent::AgentPlatform::Claude),
+            settings_path: None,
             context: Default::default(),
         }
     }

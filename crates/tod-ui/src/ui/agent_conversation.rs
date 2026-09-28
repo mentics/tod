@@ -24,24 +24,32 @@
 //! as [`AgentConversationEvent::Action`] and knows nothing of what they do.
 //! Icon buttons in the input's own row, left of Send, are
 //! [`AgentConversationPanel::set_tools`]; they report the same way.
+//!
+//! An image pasted while writing is attached to the message rather than
+//! sent: it waits above the input, where Enter on it (or its ×) takes it off,
+//! and goes out with the text in [`AgentConversationEvent::Send`].
 
 use crate::ui::key_context;
 use crate::ui::key_context::set_input_tab_stop;
+use crate::ui::pasted_image::{self, ClipboardImage, PendingImage};
 use crate::ui::selectable_text::selectable_text;
 use crate::ui::style;
 use crate::ui::transcript_list::{self, StartState, TranscriptList, TranscriptListEvent};
 use gpui::prelude::FluentBuilder;
 use gpui::{
     App, AppContext, Context, Entity, EventEmitter, FocusHandle, InteractiveElement, IntoElement,
-    KeyBinding, ParentElement, Render, SharedString, StatefulInteractiveElement, Styled,
-    Subscription, Window, actions, div, px,
+    KeyBinding, ObjectFit, ParentElement, Render, SharedString, StatefulInteractiveElement,
+    Styled, StyledImage, Subscription, Window, actions, div, img, px,
 };
 use gpui_component::button::{Button, ButtonVariants};
-use gpui_component::input::{Textarea, TextareaState};
+use gpui_component::input::{Paste, Textarea, TextareaState};
 use gpui_component::spinner::Spinner;
 use gpui_component::tooltip::Tooltip;
-use gpui_component::{Disableable, Icon, IconNamed, Selectable, Sizable, h_flex, v_flex};
+use gpui_component::{
+    Disableable, Icon, IconName, IconNamed, Selectable, Sizable, h_flex, v_flex,
+};
 use std::collections::HashMap;
+use tod_agent::PromptImage;
 
 pub use crate::ui::transcript_list::{ChunkId, Entry, EntryKind};
 
@@ -79,6 +87,8 @@ pub enum PanelStop {
     Chunk(ChunkId),
     /// The button on notice `ix` (only notices that have one are stops).
     NoticeAction(usize),
+    /// Image `ix` attached to the message being written.
+    Image(usize),
     Input,
     /// The host's icon button `ix`, left of Send.
     Tool(usize),
@@ -181,11 +191,19 @@ impl PanelNotice {
     }
 }
 
+/// A message the user sent: what they wrote and the images they attached.
+/// Either may be empty, not both.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutgoingMessage {
+    pub text: String,
+    pub images: Vec<PromptImage>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentConversationEvent {
     /// Send this message. The host clears the input
     /// ([`AgentConversationPanel::clear_input`]) once it is on its way.
-    Send(String),
+    Send(OutgoingMessage),
     /// Stop the turn in flight.
     Stop,
     /// The user clicked into the panel.
@@ -226,6 +244,12 @@ pub struct AgentConversationPanel {
     /// in its tooltip.
     usage: Option<(SharedString, SharedString)>,
     input: Entity<TextareaState>,
+    /// Images attached to the message being written.
+    images: Vec<PendingImage>,
+    /// Pasted images still being prepared; nothing is sent meanwhile.
+    preparing: usize,
+    /// Why the last pasted image could not be attached.
+    image_error: Option<SharedString>,
     editing: bool,
     return_focus: Option<FocusHandle>,
     /// The transcript above the input.
@@ -277,6 +301,9 @@ impl AgentConversationPanel {
             lifecycle_state: None,
             usage: None,
             input,
+            images: Vec::new(),
+            preparing: 0,
+            image_error: None,
             editing: false,
             return_focus: None,
             list,
@@ -388,8 +415,9 @@ impl AgentConversationPanel {
         }
     }
 
-    /// The token usage shown under the title: a one-line summary, and the
-    /// full breakdown shown on hover. `None` hides the line.
+    /// The session line shown under the title (platform, model, effort,
+    /// tokens; see `ui::session_info`): one line, and everything behind it
+    /// shown on hover. `None` hides the line.
     pub fn set_usage(&mut self, usage: Option<(String, String)>, cx: &mut Context<Self>) {
         let usage = usage.map(|(line, details)| (line.into(), details.into()));
         if usage != self.usage {
@@ -441,8 +469,66 @@ impl AgentConversationPanel {
         &self.entries
     }
 
+    /// Empty the message being written: its text and its images.
     pub fn clear_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.set_input("", window, cx);
+        self.images.clear();
+        self.image_error = None;
+        self.keep_highlight();
+        cx.notify();
+    }
+
+    // Read by tests.
+    #[allow(dead_code)]
+    pub fn images(&self) -> Vec<PromptImage> {
+        self.images.iter().map(|image| image.prompt.clone()).collect()
+    }
+
+    /// Attach `images` to the message being written, after any it has: the
+    /// host giving back a message that did not go out.
+    pub fn add_images(&mut self, images: Vec<PromptImage>, cx: &mut Context<Self>) {
+        self.images
+            .extend(images.into_iter().map(PendingImage::from_prompt));
+        cx.notify();
+    }
+
+    /// Attach the images a paste found, once each is prepared off the UI
+    /// thread, in the order they were on the clipboard.
+    fn paste_images(&mut self, found: Vec<ClipboardImage>, cx: &mut Context<Self>) {
+        self.image_error = None;
+        self.preparing += found.len();
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let count = found.len();
+            let prepared = cx
+                .background_executor()
+                .spawn(async move {
+                    found
+                        .into_iter()
+                        .map(pasted_image::prepare)
+                        .collect::<Vec<_>>()
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.preparing = this.preparing.saturating_sub(count);
+                for image in prepared {
+                    match image {
+                        Ok(image) => this.images.push(image),
+                        Err(err) => this.image_error = Some(err.into()),
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn remove_image(&mut self, ix: usize, cx: &mut Context<Self>) {
+        if ix < self.images.len() {
+            self.images.remove(ix);
+            self.keep_highlight();
+            cx.notify();
+        }
     }
 
     pub fn set_input(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
@@ -489,6 +575,7 @@ impl AgentConversationPanel {
                 .filter(|(_, n)| n.action.as_ref().is_some_and(|a| !a.disabled))
                 .map(|(ix, _)| PanelStop::NoticeAction(ix)),
         );
+        stops.extend((0..self.images.len()).map(PanelStop::Image));
         stops.push(PanelStop::Input);
         stops.extend(
             self.tools
@@ -537,6 +624,7 @@ impl AgentConversationPanel {
         match self.highlight {
             PanelStop::Chunk(id) => self.toggle(id, cx),
             PanelStop::Input => self.start_editing(window, cx),
+            PanelStop::Image(ix) => self.remove_image(ix, cx),
             PanelStop::Action(ix) => {
                 if let Some(action) = self.actions.get(ix) {
                     cx.emit(AgentConversationEvent::Action(
@@ -627,12 +715,84 @@ impl AgentConversationPanel {
         cx.notify();
     }
 
-    /// Ask the host to send what is written.
+    /// Ask the host to send what is written, with the images attached to
+    /// it. Waits for a pasted image still being prepared.
     pub fn submit(&mut self, cx: &mut Context<Self>) {
-        let text = self.input.read(cx).value().trim().to_string();
-        if !text.is_empty() {
-            cx.emit(AgentConversationEvent::Send(text));
+        if self.preparing > 0 {
+            return;
         }
+        let text = self.input.read(cx).value().trim().to_string();
+        if !text.is_empty() || !self.images.is_empty() {
+            cx.emit(AgentConversationEvent::Send(OutgoingMessage {
+                text,
+                images: self.images(),
+            }));
+        }
+    }
+
+    /// The images attached to the message being written, above the input,
+    /// and a line while one is being prepared or could not be.
+    fn render_images(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        if self.images.is_empty() && self.preparing == 0 && self.image_error.is_none() {
+            return None;
+        }
+        let thumbnails = self.images.iter().enumerate().map(|(ix, image)| {
+            let highlighted = self.active && self.highlight == PanelStop::Image(ix);
+            style::image_thumbnail(div())
+                .id(("agent-conversation-image", ix))
+                .relative()
+                .when(highlighted, style::highlighted)
+                .tooltip(|window, cx| {
+                    Tooltip::new("Attached image · Enter or × takes it off").build(window, cx)
+                })
+                .child(
+                    img(image.preview.clone())
+                        .size_full()
+                        .object_fit(ObjectFit::Cover),
+                )
+                .child(
+                    div().absolute().top_0().right_0().child(
+                        Button::new(("agent-conversation-image-remove", ix))
+                            .icon(IconName::Close)
+                            .ghost()
+                            .xsmall()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.remove_image(ix, cx);
+                                cx.emit(AgentConversationEvent::Activated);
+                            })),
+                    ),
+                )
+        });
+        let status = if self.preparing > 0 {
+            Some(
+                h_flex()
+                    .gap(style::space::RELATED)
+                    .child(Spinner::new().small())
+                    .child(style::text_dense_muted(div()).child("Attaching the image…"))
+                    .into_any_element(),
+            )
+        } else {
+            self.image_error.clone().map(|err| {
+                style::text_error(div())
+                    .child(err)
+                    .into_any_element()
+            })
+        };
+        Some(
+            v_flex()
+                .gap(style::space::INLINE)
+                .pb(style::space::INLINE)
+                .when(!self.images.is_empty(), |el| {
+                    el.child(
+                        h_flex()
+                            .flex_wrap()
+                            .gap(style::space::RELATED)
+                            .children(thumbnails),
+                    )
+                })
+                .children(status)
+                .into_any_element(),
+        )
     }
 }
 
@@ -681,7 +841,7 @@ impl Render for AgentConversationPanel {
             );
 
         let hint: SharedString = if self.editing {
-            "Ctrl+Enter sends · Esc stops writing".into()
+            "Ctrl+Enter sends · Ctrl+V attaches an image · Esc stops writing".into()
         } else {
             match &self.extra_hint {
                 Some(extra) => format!("Enter to write or expand · {extra}").into(),
@@ -795,6 +955,21 @@ impl Render for AgentConversationPanel {
                     cx.propagate();
                 }
             }))
+            // Ahead of the input's own paste: an image on the clipboard is
+            // attached to the message, and anything else pastes as text.
+            .capture_action(cx.listener(|this, _: &Paste, _, cx| {
+                if !this.editing {
+                    return;
+                }
+                let found = cx
+                    .read_from_clipboard()
+                    .map(|item| pasted_image::clipboard_images(&item))
+                    .unwrap_or_default();
+                if !found.is_empty() {
+                    cx.stop_propagation();
+                    this.paste_images(found, cx);
+                }
+            }))
             .on_action(
                 cx.listener(|this, _: &AgentConversationEscape, window, cx| {
                     if this.editing {
@@ -838,7 +1013,10 @@ impl Render for AgentConversationPanel {
             }))
             .child(div().flex_1().min_h_0().child(self.list.clone()))
             .child(
-                style::panel_footer(v_flex()).child(field).child(
+                style::panel_footer(v_flex())
+                    .children(self.render_images(cx))
+                    .child(field)
+                    .child(
                     h_flex()
                         .items_center()
                         .gap(style::space::RELATED)

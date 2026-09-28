@@ -6,6 +6,7 @@
 //! where anything is stored or when — it is told what to say and reports back.
 
 mod acp_host;
+pub mod claude_adapter;
 pub mod agent_launch;
 pub mod agent_traffic;
 mod cursor_acp;
@@ -36,12 +37,12 @@ use agent_traffic::SharedAgentTrafficLog;
 #[allow(unused_imports)]
 pub use cursor_acp::CursorAcpProvider;
 pub use mock::{
-    MockAgentProvider, MockInterviewHandler, MockInterviewTurn, MockReply, mock_gate_check_reply,
+    MockAgentProvider, MockInterviewHandler, MockInterviewTurn, MockReply,
     set_mock_interview_handler,
 };
 pub use provider::{
     AgentProvider, AgentRunHandle, AgentRunState, PermissionOption, PermissionRequest, RunId,
-    SessionObserver, SessionOpening, SessionPurpose, SessionStarted, SessionTurn,
+    PromptImage, SessionObserver, SessionOpening, SessionPurpose, SessionStarted, SessionTurn,
 };
 pub use reply::ReplyPart;
 pub use routing::RoutingAgentProvider;

@@ -168,6 +168,9 @@ pub enum InterviewCommand {
         /// continuation turn, and for every non-user turn.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         sent_context: Option<String>,
+        /// Images attached to a user turn, already saved under the data root.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        attachments: Vec<crate::conversation::TurnAttachment>,
     },
     /// Close the turns left waiting on an agent when the app last stopped
     /// (at startup, before any turn is in flight); returns their
@@ -231,6 +234,21 @@ pub enum InterviewCommand {
         option: Option<i64>,
         #[serde(default)]
         text: Option<String>,
+    },
+    /// Mark the node's `state` phase ready for evaluation (`crate::phase`).
+    /// Who it is from comes from the actor, as for the two below.
+    PhaseReady { node_id: Uuid, state: String },
+    /// Certify the node's `state` phase over its inputs as they stand now.
+    PhaseCertify {
+        node_id: Uuid,
+        state: String,
+        note: String,
+    },
+    /// Send the node's `state` phase back to its agent with these fixes.
+    PhaseReject {
+        node_id: Uuid,
+        state: String,
+        fixes: Vec<String>,
     },
     /// The user's "Shouldn't have asked" on a request
     /// (`crate::request_feedback`). Not offered by `tod-cli`.
@@ -326,6 +344,33 @@ pub enum InterviewCommand {
     RescheduleWait { wait_id: Uuid, due_at: i64 },
 }
 
+/// Append a phase event, attributed to `actor` (`crate::phase::certifier_for_actor`).
+fn record_phase(
+    conn: &Connection,
+    actor: &str,
+    node_id: Uuid,
+    state: &str,
+    kind: &str,
+    body: &str,
+) -> Result<Value> {
+    let (conversation_id, certifier) = crate::phase::certifier_for_actor(conn, actor)?;
+    let event = crate::phase::PhaseRepo::new(conn).record(
+        node_id,
+        state,
+        kind,
+        conversation_id,
+        certifier,
+        body,
+    )?;
+    Ok(json!({
+        "id": event.id,
+        "state": event.state,
+        "kind": event.kind,
+        "digest": event.digest,
+        "certifier": event.certifier,
+    }))
+}
+
 /// Execute `command` as `actor` (`user`, or an interview agent session id).
 pub fn execute(
     conn: &Connection,
@@ -343,6 +388,20 @@ pub fn execute(
         .map(|a| a.role.as_str())
         .unwrap_or(AUTHOR_USER);
     let now = now_ms();
+
+    // An evaluator judges a phase; it never changes what it judges
+    // (`doc/lifecycle/phase-agents.md`).
+    if !matches!(
+        command,
+        InterviewCommand::AskDecision { .. }
+            | InterviewCommand::PhaseCertify { .. }
+            | InterviewCommand::PhaseReject { .. }
+    ) && crate::phase::certifier_for_actor(conn, actor)?.1 == crate::phase::CERTIFIER_INDEPENDENT
+    {
+        bail!(
+            "an evaluator does not change the node: certify the phase, reject it with              the fixes it needs, or ask the user"
+        );
+    }
 
     match command {
         InterviewCommand::AddQuestion {
@@ -859,6 +918,7 @@ pub fn execute(
             body,
             parts,
             sent_context,
+            attachments,
         } => {
             let repo = crate::conversation::ConversationRepo::new(conn);
             if repo.get(*conversation_id)?.is_none() {
@@ -870,6 +930,7 @@ pub fn execute(
                 body,
                 parts,
                 sent_context.as_deref(),
+                attachments,
             )?;
             Ok(json!({ "seq": turn.seq }))
         }
@@ -931,6 +992,36 @@ pub fn execute(
                 author,
             )?;
             Ok(json!({ "id": answer.id }))
+        }
+        InterviewCommand::PhaseReady { node_id, state } => {
+            record_phase(conn, actor, *node_id, state, crate::phase::PHASE_READY, "")
+        }
+        InterviewCommand::PhaseCertify {
+            node_id,
+            state,
+            note,
+        } => {
+            let note = note.trim();
+            if note.is_empty() {
+                bail!("a certificate needs a note");
+            }
+            record_phase(conn, actor, *node_id, state, crate::phase::PHASE_CERTIFY, note)
+        }
+        InterviewCommand::PhaseReject {
+            node_id,
+            state,
+            fixes,
+        } => {
+            let fixes: Vec<&str> = fixes
+                .iter()
+                .map(|f| f.trim())
+                .filter(|f| !f.is_empty())
+                .collect();
+            if fixes.is_empty() {
+                bail!("a rejection needs at least one fix");
+            }
+            let body = serde_json::to_string(&fixes)?;
+            record_phase(conn, actor, *node_id, state, crate::phase::PHASE_REJECT, &body)
         }
         InterviewCommand::RecordRequestFeedback(feedback) => {
             let id = crate::request_feedback::RequestFeedbackRepo::new(conn).record(feedback)?;

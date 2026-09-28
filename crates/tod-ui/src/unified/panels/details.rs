@@ -648,15 +648,16 @@ mod tests {
                 data_root: fixture.store.paths().root().to_path_buf(),
                 media: tod_core::media::MediaPaths::discover().expect("media paths"),
                 launch: tod_agent::AgentLaunchOptions::for_platform(tod_agent::AgentPlatform::Claude),
+                settings_path: None,
                 context: Default::default(),
             };
             let driver = tod_core::conversation::ConversationDriver::new(
                 config,
                 focus,
-                tod_store::conversation::ProtocolKind::GateCheck,
+                tod_store::conversation::ProtocolKind::Phase,
             );
             let ix = registry
-                .ensure(focus, tod_store::conversation::ProtocolKind::GateCheck, None, || Ok(driver))
+                .ensure(focus, tod_store::conversation::ProtocolKind::Phase, None, || Ok(driver))
                 .unwrap();
             // Take the driver to send without putting it back: this is what
             // marks the slot `running` (`DriverSlot::take_to_send`) — a real

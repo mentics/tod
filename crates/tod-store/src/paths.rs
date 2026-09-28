@@ -46,6 +46,9 @@ pub fn clear_data_root_override() {
     *DATA_ROOT_OVERRIDE.write().expect("data root override lock") = None;
 }
 
+/// The settings file, in the data root.
+pub const SETTINGS_FILE: &str = "tod.yml";
+
 /// Resolved paths for durable tod data.
 #[derive(Debug, Clone)]
 pub struct TodPaths {
@@ -63,6 +66,11 @@ impl TodPaths {
             .clone()
             .context("data root is not configured")?;
         Ok(Self::new(data_root))
+    }
+
+    /// Paths for an explicit data root, bypassing the configured override.
+    pub fn at(data_root: impl Into<PathBuf>) -> Self {
+        Self::new(data_root.into())
     }
 
     fn new(data_root: PathBuf) -> Self {
@@ -96,7 +104,7 @@ impl TodPaths {
     }
 
     pub fn settings_path(&self) -> PathBuf {
-        self.config_dir.join("tod.yml")
+        self.config_dir.join(SETTINGS_FILE)
     }
 
     /// Segregated secret storage (`linear_api_key.enc`, …).

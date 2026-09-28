@@ -23,8 +23,8 @@ through **two independent channels** that know nothing about each other:
 | 1 | Obligations chat *(removed)* | chat icon / Ctrl+J in obligations panel | M | interactive | yes | `app`, `tod_cli`, `interactive`, `obligations` |
 | 2 | Visual-design chat | design panel chat | M | interactive | yes (1 cmd) | `app`, `interactive`, `design/visual-design` |
 | 3 | Implementation session | Active-phase **Implement** button | M | autonomous | yes | `app`, `tod_cli`, `active/implement` |
-| 4 | Gate check | **Run gate check** in lifecycle panel | M + P | one-shot | no | state role doc + `app`, `gate_check` |
-| 5 | On-entry turn | automatic, on lifecycle change | M + P | autonomous | yes | state role doc + `app`, `tod_cli`, `on_entry` |
+| 4 | Phase agent | the runner, or **Work on …** beside Send, in `proposed`/`design`/`planning`/`merged`/`released`/`learn` | M + P | autonomous | yes | state role doc + `phase` |
+| 5 | Phase evaluator | the runner, or **Evaluate …**, once the phase is marked ready (independent evaluation on) | M + P | autonomous | no (judges only) | state role doc + `evaluate` |
 | 6 | Fleet autonomous run | agent launched into a worktree | P | autonomous | yes | state role doc only |
 | 7 | Interview question-maker | `interview::driver` | P | agent-to-agent | yes | role + phase + interview base |
 | 8 | Interview answer-processor | `interview::driver` | P | agent-to-agent | yes | role + phase + interview base |
@@ -69,8 +69,8 @@ Actual need:
 | Obligations chat | ✓ | ✓ | ✓ | | |
 | Visual-design chat | | | | | ✓ |
 | Implementation | | ✓ | ✓ | | |
-| Gate check | | ✓ (read) | ✓ (read) | | |
-| On-entry (`planning`) | | ✓ | ✓ | | |
+| Phase agent | | ✓ | ✓ | | |
+| Phase evaluator | | ✓ (read) | ✓ (read) | | |
 | Interview / drafting | | ✓ | | ✓ | |
 
 Nobody needs all four. The `drafting` noun ships to every surface that loads
@@ -165,9 +165,11 @@ role docs.
 ### 3.4 Surface / role — what this specific job is
 
 Unchanged in spirit, minus the behavioral policy that moves to stance:
-`surface/implement.md`, `surface/gate-check.md`,
-`surface/on-entry.md`, `surface/visual-design.md`, `surface/conversation.md`
-(`surface/obligations.md` was removed with the obligations chat). For surfaces 4–8 the
+`surface/implement.md`, `surface/phase.md`, `surface/evaluate.md`,
+`surface/visual-design.md`, `surface/conversation.md`
+(`surface/obligations.md` was removed with the obligations chat, and
+`surface/gate-check.md`, `surface/on-entry.md` and `surface/learn.md` with the
+gate-check and on-entry turns, which phase agents replaced). For surfaces 4–8 the
 process-bundle role doc plays this part and stays where it is.
 
 ### 3.5 Dynamic blocks — composed, not branched
@@ -198,16 +200,16 @@ which surface it is serving.
   cli/secrets, surface/implement
   dyn: DataRoot, Node, Plan, NodeObligations, AncestorObligations, Workspace
 
-4 Gate check
-  stance/one-shot, domain/outline, domain/obligations, domain/lifecycle,
-  domain/capabilities, domain/plan, surface/gate-check   [+ state role doc]
+4 Phase agent
+  stance/autonomous-session, domain/outline, domain/obligations,
+  domain/lifecycle, domain/capabilities, domain/plan, cli/intro,
+  cli/obligations, cli/plan, cli/content, cli/decisions, cli/learn,
+  cli/phase, surface/phase               [+ state role doc, phase status]
   dyn: DataRoot, Node, GateCriteria, NodeObligations, Plan
 
-5 On-entry
-  stance/autonomous-session, domain/outline, domain/obligations,
-  domain/lifecycle, domain/plan, cli/intro, cli/obligations, cli/plan,
-  surface/on-entry                                       [+ state role doc]
-  dyn: DataRoot, Node, NodeObligations, Plan
+5 Phase evaluator
+  as the phase agent, without cli/content and cli/learn, and with
+  surface/evaluate instead of surface/phase
 
 6 Fleet autonomous run
   stance/autonomous-session, domain/outline, domain/obligations,

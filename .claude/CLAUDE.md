@@ -106,14 +106,36 @@ in the title bar (`render_shortcut_pill_in_context(.., &OpenAgentChat, None, ..)
 the app nav's "Conversation" opens it on the project.
 
 On a node with the Lifecycle capability, the step that moves it along —
-Implement, Verify, Review, the gate check, Advance — sits beside Send
-(`conversation/lifecycle.rs`). The gate check's verdict, with a Waive per
-failing criterion, sits in the side pane beneath the list the node's state is
-about (obligations, plan, or findings), never above the input. Gate checks, waiving, advancing, and on-entry
-turns run in `views::lifecycle_control::LifecycleController`, one entity the
-shell shares between the conversation view and the lifecycle panel, so a
-check started in either shows in both. The manual escape hatches (force
-advance, revert, open interview) stay in the panel.
+the state's phase work or its evaluation, Implement, Verify, Review, Advance —
+sits beside Send (`conversation/lifecycle.rs`). **Gates are app checks; no
+agent evaluates one** (`tod_core::phase::settle_gate`, over the derived
+criteria in `tod_core::gate::derived`). Advance checks the gate and moves the
+node on when it is clear; the failing criteria, each with a Waive, sit in the
+side pane beneath the list the node's state is about (obligations, plan, or
+findings), never above the input. Gate checks, waiving, and advancing run in
+`views::lifecycle_control::LifecycleController`, one entity the shell shares
+between the conversation view and the lifecycle panel, so a check started in
+either shows in both. The manual escape hatches (force advance, revert, open
+interview) stay in the panel.
+
+**Phase agents** (`doc/lifecycle/phase-agents.md`). In `proposed`, `design`,
+`planning`, `merged`, `released`, and `learn` a phase agent
+(`conversation/phase.rs`, `ProtocolKind::Phase`) does the state's work,
+judged against its role doc's **Done when** checklist, and records it where
+the gate can check it. Where the work is a judgment it **certifies** the phase
+(`tod-cli phase`, `tod_store::phase`): the certificate holds a digest of what
+it covers (obligations, plan, content, by state), so any later change makes
+it stale and the gate fails until the phase runs again. With the
+`lifecycle.independent_evaluation` setting on (the default) the phase agent
+records the phase `ready` instead, and a fresh evaluator session
+(`ProtocolKind::Evaluate`, which may not edit the node) certifies it or
+rejects it with fixes the phase agent then makes; a second rejection of
+unchanged work stops the run (`NeedsHuman::EvaluationStuck`). There is no
+on-entry turn and no gate-check agent: the `GateCheck` and `OnEntry`
+protocol kinds remain only so old conversations load, and run
+`RetiredProtocol`, which refuses further turns. An agent asks the user
+(`tod-cli decisions ask`, free text with no `--option`) only for what only
+the user can supply.
 
 A node's state can stop holding after the fact: its obligations or plan
 changed since it entered `ready` (compared with the snapshot
@@ -139,7 +161,14 @@ the opening context and the message as one turn; every later message sends only
 the *delta* (the user's own edits and reversals since the previous turn, and
 items changed elsewhere) plus the message. When the session outgrows
 `context_budget_tokens`, or can no longer be resumed, the driver rotates to a fresh session seeded with a snapshot, and
-the transcript shows a "Started a fresh agent session" marker. **Reply rule:**
+the transcript shows a "Started a fresh agent session" marker. An image
+pasted into the input (`ui::pasted_image`, caught ahead of the input's own
+`Paste`) is attached to the message being written, not sent: it goes out with
+the next Send as an ACP image block (refused by an agent whose
+`promptCapabilities.image` is not set), and is kept on the user turn
+(`conversation_turns.attachments`, schema v73; the files are under
+`<data root>/conversation-attachments/`), so the transcript shows it and a
+rotation after a failed resume sends it again. **Reply rule:**
 the agent never describes what it changed — the user sees the change set — so
 an empty reply is normal (shown as "Done, no notes"); `surface/conversation.md`
 states this, and that the agent acts without confirming because everything is
@@ -289,7 +318,7 @@ It loops until every own obligation and every plan step is `verified` or
 `failed`, every failed obligation has a `failed` step to carry it back to
 implementation, and a test run is recorded; it replaces the old `verifying`
 on-entry turn. The `verifying` → `review` gate app-checks both
-(`obligations-verified`, `plan-steps-verified`). The `learn` state agent is
+(`obligations-verified`, `plan-steps-verified`). The `learn` phase agent is
 given the node's work history (`node_context::render_work_history`: failed
 verdicts and steps, review findings, failed gate criteria, conversation
 counts), since the final state alone reads as a clean run. `review.rs` is the code review
@@ -300,7 +329,7 @@ conversation) and loops until it records `review done`; it replaces the old
 from its status badge. `fix.rs` resolves them (the conversation view's Fix,
 beside Review): given the open findings, the agent answers each `fixed` or
 `rejected` with a note — `tod-cli` refuses it the user's answers — and loops
-until none is open and a test run is green. The `review` → `approved` gate is app-checked
+until none is open and a test run is green. The `review` → `pr` gate is app-checked
 (`tod_core::gate::derived`): review recorded done, no finding still open. `tod_ui::conversation::side_pane` picks the pane, and the picker offers a
 "New …" entry per kind the focus can start. Adding a kind means a
 `ProtocolKind` variant, an impl, a registry arm, and a side pane. Spec:
@@ -311,7 +340,8 @@ resume, rotation), `context.rs` (opening message, per-turn delta, rotation
 snapshot, the `Focus` block's loader), and `mock.rs`, which plays the agent for
 `--agent mock` with one directive per line (`add obligation <slug>: <text>`,
 `add plan …`, `add node …`, `rename <id>: …`, `delete <id>`,
-`move <id> under <slug>`, `flag <id>: <reason>`, `ask <text>`, and
+`move <id> under <slug>`, `flag <id>: <reason>`, `ask <text>` (with
+`| <option> | …` a decision; with a bare trailing `|` a free-text one), and
 `think <text>`, which adds a thinking step to the reply). The agent reads
 its change set with `tod-cli changeset`. Drafting, which this replaced, is gone
 (schema v37); the legacy `Role::Drafter` / `SessionPurpose::Drafter` variants
@@ -326,7 +356,7 @@ when it is back). The driver takes the shared agent through `AgentAccess`,
 which `SharedAgentAccess` locks for one provider call at a time, so the UI's
 own locks never wait on that work. The same holds for the incoming-changes
 check (`views::incoming_check` ticks its `IncomingRunner` there) and for
-settling a gate check's derived criteria, which may call GitHub.
+checking a gate (`settle_gate`), which may call GitHub.
 
 ### `tod-store::fleet` — agent/worktree orchestration
 
