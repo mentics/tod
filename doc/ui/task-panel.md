@@ -125,6 +125,15 @@ answered it and no conversation of the app's own is still working on the
 node. Any other stop (budget, a step that changed nothing, a failed turn)
 waits for Resume.
 
+A run never stops at a gate without leaving a request: a gate check that did
+not pass is one whenever the run would stop there, whether it asked the user
+or handed the work back to an agent, until every recorded criterion passes or
+is waived. So is a gate the app checks itself, with no agent to ask, when one
+of its criteria failed; it has no terminal, "Answered elsewhere", or
+feedback, since nobody asked it. A gate check marked **Answered elsewhere** is reopened, not
+started again, so its agent judges the gate with what the user settled in
+that session; if it gives no new verdict, its question is shown again.
+
 ### Requests
 
 A **request** is something the runner cannot continue without the user
@@ -144,6 +153,7 @@ Each request shows:
   | plan step handed back (`blocked` / `partial`) | words, or retry |
   | review finding the user must answer | its status (fixed / rejected) and a note |
   | gate criterion needing a human | **Waive**, through the shared `LifecycleController` |
+  | gate the app checks itself, failed (`ready` → `active`, say) | **Waive**, or **Check again** once the cause is fixed |
   | stuck, raised by the runner | the actions that fit what it detected |
 
 - One small footer line, never more, holding:
@@ -154,6 +164,21 @@ Each request shows:
   - its **reason**: why the agent or runner could not handle it itself.
     Reasons are a fixed set (missing rule, conflict, access, risk,
     capability, other) so they can be counted.
+  - a **terminal** icon, when the lifecycle conversation that asked (the
+    decision's or finding's own, the implement/verify conversation that
+    handed the plan step back, or the gate check) has an agent session:
+    it continues that session in a terminal, in the agent's own CLI, for
+    anything too involved to answer here. It is disabled while that
+    session's turn is running.
+  - **Answered elsewhere**, for a decision, a handed-back plan step, or a
+    gate check: the user settled it outside the app (typically in that
+    terminal), so it is dismissed without an answer going to the agent. A
+    decision logs an answer saying so; a plan step goes back to
+    `in_progress`; a gate report is kept but marked resolved. A finding
+    needs none: its own status buttons already settle it without a turn.
+    Once nothing else is waiting, the runner continues as it would after an
+    answer (see "Runner" above), resuming the same agent session, so the
+    terminal should be closed first.
   - **Shouldn't have asked**, at the right end: feedback on the request
     itself (see below).
 

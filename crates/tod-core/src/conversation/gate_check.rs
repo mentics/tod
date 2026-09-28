@@ -52,6 +52,10 @@ pub struct GateReportRecord {
     pub no_reasons: bool,
     /// The state the node moved to off this reply, when it did.
     pub advanced_to: Option<String>,
+    /// The user settled what this report asked of them outside the app (in
+    /// the agent's own session, in a terminal): it no longer waits on them.
+    #[serde(default)]
+    pub resolved_elsewhere: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -74,7 +78,7 @@ impl From<&GateBlocker> for StoredBlocker {
 }
 
 impl GateReportRecord {
-    fn to_value(&self) -> Value {
+    pub(crate) fn to_value(&self) -> Value {
         json!({ REPORT_KEY: self })
     }
 
@@ -140,6 +144,36 @@ pub fn latest_gate_report(
         .latest_report(conversation.id)?
         .and_then(|value| GateReportRecord::from_value(&value));
     Ok(record.map(|record| (conversation, record)))
+}
+
+/// Mark gate-check `conversation_id`'s latest report as settled outside the
+/// app: the user answered what it asked in the agent's own session, so it
+/// is no longer a request (`crate::attention`). The report itself is kept.
+pub fn mark_resolved_elsewhere(fleet: &FleetStore, conversation_id: Uuid) -> Result<()> {
+    set_resolved_elsewhere(fleet, conversation_id, true)
+}
+
+/// Set whether gate-check `conversation_id`'s latest report was settled
+/// outside the app. The autopilot clears it again when the check it reopened
+/// for that gave no new verdict, so the request comes back rather than the
+/// run stopping with nothing to answer.
+pub fn set_resolved_elsewhere(fleet: &FleetStore, conversation_id: Uuid, resolved: bool) -> Result<()> {
+    let mut record = fleet
+        .read(|conn| ConversationRepo::new(conn).latest_report(conversation_id))?
+        .and_then(|value| GateReportRecord::from_value(&value))
+        .context("the gate check has no report to resolve")?;
+    if record.resolved_elsewhere == resolved {
+        return Ok(());
+    }
+    record.resolved_elsewhere = resolved;
+    fleet.interview(
+        ACTOR_USER,
+        InterviewCommand::RecordConversationReport {
+            conversation_id,
+            body: record.to_value(),
+        },
+    )?;
+    Ok(())
 }
 
 /// The states a conversation about `focus` is between: the node's current
@@ -382,6 +416,7 @@ impl GateCheckProtocol {
             findings: reply.findings.clone(),
             no_reasons: reply.gives_no_reasons(),
             advanced_to: forward_state,
+            resolved_elsewhere: false,
         };
         env.fleet.interview(
             ACTOR_USER,
@@ -596,6 +631,7 @@ mod tests {
             findings: String::new(),
             no_reasons: false,
             advanced_to: None,
+            resolved_elsewhere: false,
         };
         assert_eq!(GateReportRecord::from_value(&record.to_value()), Some(record));
     }

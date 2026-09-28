@@ -146,7 +146,15 @@ column 1, under the node tree.
 - **Ctrl+J** toggles it: expands it when collapsed, collapses it when
   expanded.
 - It holds only **freeform** conversations, where the agent may reply in plain
-  text. Structured lifecycle agents never appear here (see below).
+  text. Structured lifecycle agents never appear here (see below), even when
+  one is the subject's most recent conversation: the user reaches those from
+  the task panel's requests, in a terminal (`doc/ui/task-panel.md`,
+  "Requests").
+- Its header has two icons before the chevron: a **pen** starts a new session
+  (as **Ctrl+N** does), and a **history** icon shows or hides the **sessions**
+  list at the drawer's left: every freeform conversation about the subject,
+  newest first (time and opening words), the open one highlighted. Clicking
+  one reopens it.
 
 ## Panels
 

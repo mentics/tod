@@ -178,7 +178,21 @@ impl<'a> ConversationRepo<'a> {
 
     /// The focus's conversations, most recently updated first.
     pub fn list_for_focus(&self, focus: Focus) -> Result<Vec<ConversationSummary>> {
-        let conversations = self.for_focus(focus, None)?;
+        self.summaries(self.for_focus(focus, None, None)?)
+    }
+
+    /// The focus's conversations running `protocol`, most recently updated
+    /// first — the chat drawer's session list, which holds only freeform
+    /// ones, never the lifecycle's.
+    pub fn list_for_focus_with_protocol(
+        &self,
+        focus: Focus,
+        protocol: ProtocolKind,
+    ) -> Result<Vec<ConversationSummary>> {
+        self.summaries(self.for_focus(focus, Some(protocol), None)?)
+    }
+
+    fn summaries(&self, conversations: Vec<Conversation>) -> Result<Vec<ConversationSummary>> {
         conversations
             .into_iter()
             .map(|conversation| {
@@ -195,13 +209,18 @@ impl<'a> ConversationRepo<'a> {
 
     /// The focus's most recently updated conversation.
     pub fn latest_for_focus(&self, focus: Focus) -> Result<Option<Conversation>> {
-        Ok(self.for_focus(focus, Some(1))?.into_iter().next())
+        Ok(self.for_focus(focus, None, Some(1))?.into_iter().next())
     }
 
-    fn for_focus(&self, focus: Focus, limit: Option<i64>) -> Result<Vec<Conversation>> {
+    fn for_focus(
+        &self,
+        focus: Focus,
+        protocol: Option<ProtocolKind>,
+        limit: Option<i64>,
+    ) -> Result<Vec<Conversation>> {
         let mut stmt = self.conn.prepare(&format!(
             "SELECT {CONVERSATION_COLUMNS} FROM conversations
-             WHERE focus_kind = ?1 AND focus_id IS ?2
+             WHERE focus_kind = ?1 AND focus_id IS ?2 AND (?4 IS NULL OR protocol = ?4)
              ORDER BY updated_at DESC, created_at DESC
              LIMIT ?3"
         ))?;
@@ -210,7 +229,8 @@ impl<'a> ConversationRepo<'a> {
                 params![
                     focus.kind_str(),
                     focus.focus_id().map(uuid_to_blob),
-                    limit.unwrap_or(-1)
+                    limit.unwrap_or(-1),
+                    protocol.map(ProtocolKind::as_str)
                 ],
                 map_conversation,
             )?

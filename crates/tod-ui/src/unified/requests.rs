@@ -36,12 +36,13 @@ use gpui::{
     Stateful, Styled, Subscription, Window, actions, div,
     prelude::FluentBuilder,
 };
-use gpui_component::button::Button;
+use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::input::{Input, InputEvent, InputState};
-use gpui_component::{ActiveTheme, Sizable};
+use gpui_component::{ActiveTheme, Disableable, IconName, Sizable};
 use tod_core::attention::{AttentionItem, AttentionKind, RequestReason};
 use tod_core::conversation::implement::HandoffAnswer;
 use tod_journey::{Presented, PresentedAction};
+use tod_store::conversation::{ConversationRepo, Focus};
 use tod_store::decisions::{DECISION_PENDING, Decision, DecisionAnswer, DecisionRepo, EvidenceRef};
 use tod_store::fleet::FleetStore;
 use tod_store::interview::{ACTOR_USER, InterviewCommand, short_id};
@@ -60,6 +61,7 @@ use crate::ui::journey::{Source, record_action};
 use crate::ui::key_context;
 use crate::ui::selectable_text::{selectable_markdown, selectable_text};
 use crate::ui::style;
+use crate::ui::terminal_handoff::{self, CONTINUE_IN_TERMINAL};
 use crate::unified::columns::PanelKind;
 use crate::unified::panel::PanelOpenRequest;
 use crate::views::lifecycle_control::{CriterionOutcome, LifecycleController};
@@ -75,6 +77,10 @@ const FEEDBACK_NOTE_TAG: &str = "RequestsFeedbackNote";
 /// The journey surface every answer is recorded under; the name "decisions"
 /// is kept so earlier journeys still compare.
 const JOURNEY_SURFACE: &str = "decisions";
+/// The journey action id of **Answered elsewhere**.
+const RESOLVED_ELSEWHERE_ACTION: &str = "answered-elsewhere";
+/// Journey action id for a gate's "Check again".
+const CHECK_GATE_AGAIN_ACTION: &str = "check-gate-again";
 
 /// Answer the top request with option `.0` (1-based, matching the numbered
 /// options shown).
@@ -167,6 +173,40 @@ pub struct Loaded {
     /// Display names for evidence ids (obligations, plan steps, nodes,
     /// findings), for the footer links.
     pub names: HashMap<Uuid, String>,
+    /// Per request id: the lifecycle conversation that asked it, when that
+    /// conversation has an agent session a terminal can resume.
+    pub sessions: HashMap<Uuid, Uuid>,
+}
+
+/// The conversation `item` came from: a decision's or finding's own, the
+/// implement/verify conversation a plan step was handed back by, or the gate
+/// check itself.
+fn asking_conversation(
+    conn: &rusqlite::Connection,
+    item: &AttentionItem,
+    pending: &[Decision],
+    findings: &[ReviewFinding],
+) -> anyhow::Result<Option<Uuid>> {
+    Ok(match item.kind {
+        AttentionKind::Decision => pending.iter().find(|d| d.id == item.id).and_then(|d| d.conversation_id),
+        AttentionKind::PlanStep => {
+            crate::ui::agent_runs::latest_handoff_conversation(conn, Focus::Node(item.node_id))?.map(|c| c.id)
+        }
+        AttentionKind::Finding => findings.iter().find(|f| f.id == item.id).and_then(|f| f.conversation_id),
+        AttentionKind::Gate => Some(item.id),
+        // Checked by the app: no agent asked.
+        AttentionKind::GateCriteria => None,
+    })
+}
+
+/// The gate requests in `loaded`, to tell when they changed.
+fn gate_items(loaded: &Loaded) -> Vec<(Uuid, i64, String)> {
+    loaded
+        .items
+        .iter()
+        .filter(|i| matches!(i.kind, AttentionKind::Gate | AttentionKind::GateCriteria))
+        .map(|i| (i.id, i.since, i.summary.clone()))
+        .collect()
 }
 
 fn first_line(text: &str) -> String {
@@ -209,6 +249,20 @@ pub fn load(fleet: &FleetStore, node_id: Uuid) -> Loaded {
             };
             let items = tod_core::attention::for_node(conn, node_id)?.items;
 
+            let mut sessions = HashMap::new();
+            let conversations = ConversationRepo::new(conn);
+            for item in &items {
+                let Some(conversation) = asking_conversation(conn, item, &pending, &findings)? else {
+                    continue;
+                };
+                let resumable = conversations
+                    .get(conversation)?
+                    .is_some_and(|c| c.agent_session_id.is_some_and(|s| !s.trim().is_empty()));
+                if resumable {
+                    sessions.insert(item.id, conversation);
+                }
+            }
+
             let mut names = HashMap::new();
             for step in &handoff_steps {
                 names.insert(step.id, first_line(&step.body));
@@ -229,7 +283,7 @@ pub fn load(fleet: &FleetStore, node_id: Uuid) -> Loaded {
                     names.insert(evidence.id, name);
                 }
             }
-            anyhow::Ok(Loaded { pending, handoff_steps, findings, items, log, names })
+            anyhow::Ok(Loaded { pending, handoff_steps, findings, items, log, names, sessions })
         })
         .unwrap_or_default();
     let node_ids: Vec<Uuid> = loaded
@@ -319,6 +373,8 @@ pub struct Requests {
     /// The request whose feedback note field is in edit mode.
     feedback_note_editing: Option<Uuid>,
     feedback_note_input: Entity<InputState>,
+    /// The node whose gate "Check again" is checking.
+    checking_gate: Option<Uuid>,
     _subscriptions: Vec<Subscription>,
     _poll: gpui::Task<()>,
 }
@@ -382,6 +438,7 @@ impl Requests {
             feedback: HashMap::new(),
             feedback_note_editing: None,
             feedback_note_input,
+            checking_gate: None,
             _subscriptions: vec![freeform_sub, lifecycle_sub, note_sub],
             _poll,
         };
@@ -442,7 +499,17 @@ impl Requests {
     }
 
     fn apply(&mut self, loaded: Loaded, cx: &mut Context<Self>) {
+        let gates_before = gate_items(&self.loaded);
         self.loaded = loaded;
+        // A gate request that came or changed since: the rows to waive are
+        // the shared controller's, which reads them only when asked.
+        let gates = gate_items(&self.loaded);
+        if !gates.is_empty()
+            && gates != gates_before
+            && let Some(node) = self.node_id
+        {
+            self.lifecycle.update(cx, |controller, cx| controller.reload_criteria(&node.to_string(), cx));
+        }
         if let Some(changing) = self.changing
             && !self.loaded.log.iter().any(|e| e.decision.id == changing)
         {
@@ -529,7 +596,7 @@ impl Requests {
                     self.answer_plan_step(&step, HandoffAnswer::Choose(action.0 - 1), Source::Keyboard, cx);
                 }
             }
-            AttentionKind::Finding | AttentionKind::Gate => {}
+            AttentionKind::Finding | AttentionKind::Gate | AttentionKind::GateCriteria => {}
         }
     }
 
@@ -668,6 +735,7 @@ impl Requests {
             ),
             // A gate request's id is the gate-check conversation.
             AttentionKind::Gate => (KIND_GATE_BLOCKER, Some(item.id), None),
+            AttentionKind::GateCriteria => (KIND_GATE_BLOCKER, None, None),
         };
         NewRequestFeedback {
             node_id: item.node_id,
@@ -1023,6 +1091,7 @@ impl Requests {
             AttentionKind::PlanStep => vec![EvidenceRef { kind: "plan_step".into(), id: item.id }],
             AttentionKind::Finding => vec![EvidenceRef { kind: "finding".into(), id: item.id }],
             AttentionKind::Gate => vec![EvidenceRef { kind: "conversation".into(), id: item.id }],
+            AttentionKind::GateCriteria => Vec::new(),
         }
     }
 
@@ -1033,7 +1102,10 @@ impl Requests {
             && self.loaded.pending.first().map(|d| d.id) == Some(item.id);
         let evidence = self.item_evidence(item);
         let links = self.render_evidence_links(item.id, item.node_id, &evidence, stops, cx);
-        let feedback = self.render_feedback(item, window, cx);
+        let terminal = self.render_terminal_button(item, cx);
+        let elsewhere = self.render_resolved_elsewhere_button(item, cx);
+        // Nobody asked a gate the app checks itself.
+        let feedback = (item.kind != AttentionKind::GateCriteria).then(|| self.render_feedback(item, window, cx));
         div()
             .id(SharedString::from(format!("unified-requests-footer-{}", item.id)))
             .flex()
@@ -1043,8 +1115,141 @@ impl Requests {
             .children(links)
             .child(style::text_muted(div().text_xs().flex_none()).child(reason_label(item.reason)))
             .child(div().flex_1())
-            .child(feedback)
+            .children(terminal)
+            .children(elsewhere)
+            .children(feedback)
             .into_any_element()
+    }
+
+    /// The terminal icon: continue the lifecycle session that asked, in the
+    /// agent's own CLI, for anything too involved to answer here. Only when
+    /// that conversation has a session to resume.
+    fn render_terminal_button(&self, item: &AttentionItem, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let conversation = *self.loaded.sessions.get(&item.id)?;
+        let running = self.agent_runs.read(cx).conversation_running(conversation);
+        let tooltip = if running {
+            "Continue in a terminal (once the agent is done)"
+        } else {
+            "Continue the session that asked this in a terminal"
+        };
+        let item = item.clone();
+        Some(
+            Button::new(SharedString::from(format!("unified-requests-terminal-{}", item.id)))
+                .icon(IconName::SquareTerminal)
+                .ghost()
+                .xsmall()
+                .disabled(running)
+                .tooltip(tooltip)
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.continue_in_terminal(&item, conversation, Source::Click, window, cx);
+                }))
+                .into_any_element(),
+        )
+    }
+
+    /// **Answered elsewhere**: the user settled this request outside the
+    /// app (typically in the terminal session beside it), so it is dismissed
+    /// without an answer going to the agent. Offered for the kinds whose
+    /// answer would otherwise be sent (decisions, handed-back plan steps) or
+    /// that only an agent can clear (gate checks); a finding's own status
+    /// buttons already settle it without a turn.
+    fn render_resolved_elsewhere_button(&self, item: &AttentionItem, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if matches!(item.kind, AttentionKind::Finding | AttentionKind::GateCriteria) {
+            return None;
+        }
+        let item = item.clone();
+        Some(
+            Button::new(SharedString::from(format!("unified-requests-elsewhere-{}", item.id)))
+                .label("Answered elsewhere")
+                .xsmall()
+                .tooltip(
+                    "You settled this outside the app, e.g. in the terminal: dismiss it without \
+                     sending an answer. Close that terminal first: the runner continues in the same session.",
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.resolve_elsewhere(&item, Source::Click, cx);
+                }))
+                .into_any_element(),
+        )
+    }
+
+    /// Dismiss `item` as settled outside the app. Once the node waits on
+    /// nothing else, a runner that stopped for it continues by itself
+    /// (`unified::runners`).
+    pub(crate) fn resolve_elsewhere(&mut self, item: &AttentionItem, source: Source, cx: &mut Context<Self>) {
+        record_action(
+            cx,
+            Focus::Node(item.node_id),
+            RESOLVED_ELSEWHERE_ACTION.to_string(),
+            source,
+            JOURNEY_SURFACE,
+            Presented {
+                actions: vec![PresentedAction {
+                    id: RESOLVED_ELSEWHERE_ACTION.to_string(),
+                    label: "Answered elsewhere".to_string(),
+                    primary: false,
+                    disabled: false,
+                }],
+                focused: None,
+                notices: Vec::new(),
+            },
+        );
+        let id = item.id;
+        let result = match item.kind {
+            AttentionKind::Decision => {
+                self.agent_runs.update(cx, |runs, _| runs.resolve_decision_elsewhere(id))
+            }
+            AttentionKind::PlanStep => {
+                self.agent_runs.update(cx, |runs, _| runs.resolve_plan_step_elsewhere(id))
+            }
+            // A gate request's id is its gate-check conversation.
+            AttentionKind::Gate => tod_core::conversation::gate_check::mark_resolved_elsewhere(&self.fleet, id),
+            AttentionKind::Finding | AttentionKind::GateCriteria => Ok(()),
+        };
+        self.set_error("dismiss the request", result);
+        self.reload(cx);
+    }
+
+    /// Open a terminal resuming `conversation`'s agent session
+    /// (`ui::terminal_handoff`); the app lets go of it first.
+    pub(crate) fn continue_in_terminal(
+        &mut self,
+        item: &AttentionItem,
+        conversation: Uuid,
+        source: Source,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        record_action(
+            cx,
+            Focus::Node(item.node_id),
+            CONTINUE_IN_TERMINAL.to_string(),
+            source,
+            JOURNEY_SURFACE,
+            Presented {
+                actions: vec![PresentedAction {
+                    id: CONTINUE_IN_TERMINAL.to_string(),
+                    label: "Continue in a terminal".to_string(),
+                    primary: false,
+                    disabled: false,
+                }],
+                focused: None,
+                notices: Vec::new(),
+            },
+        );
+        let (agent, config, running) = {
+            let runs = self.agent_runs.read(cx);
+            (runs.agent().clone(), runs.conversation_config(), runs.conversation_running(conversation))
+        };
+        terminal_handoff::continue_in_terminal(
+            self.fleet.clone(),
+            agent,
+            config,
+            Some(conversation),
+            running,
+            window,
+            cx,
+        );
     }
 
     fn render_freeform(&self, decision_id: Uuid, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1211,19 +1416,28 @@ impl Requests {
             .state(&node_id.to_string())
             .map(|s| s.criteria_detail.iter().filter(|r| r.is_failing()).cloned().collect())
             .unwrap_or_default();
+        // A gate the app checks itself has no summary beyond its rows (once
+        // they are loaded).
+        let checked_by_app = item.kind == AttentionKind::GateCriteria;
+        let summary = !checked_by_app || failing.is_empty();
         let card = self
             .card(format!("unified-decisions-gate-{}", item.id), cx)
-            .child(kind_badge("Gate check"))
-            .child(selectable_markdown(
-                SharedString::from(format!("unified-decisions-gate-summary-{}", item.id)),
-                item.summary.clone(),
-                window,
-                cx,
-            ));
+            .child(kind_badge(if checked_by_app { "Gate" } else { "Gate check" }))
+            .when(summary, |card| {
+                card.child(selectable_markdown(
+                    SharedString::from(format!("unified-decisions-gate-summary-{}", item.id)),
+                    item.summary.clone(),
+                    window,
+                    cx,
+                ))
+            });
         let rows: Vec<AnyElement> = failing
             .into_iter()
             .map(|criterion| {
-                let label = criterion.label.clone();
+                let label = match &criterion.detail {
+                    Some(detail) if !detail.trim().is_empty() => format!("{}: {detail}", criterion.label),
+                    _ => criterion.label.clone(),
+                };
                 div()
                     .id(SharedString::from(format!("unified-decisions-gate-row-{}", criterion.criterion_id)))
                     .flex()
@@ -1249,7 +1463,62 @@ impl Requests {
                     .into_any_element()
             })
             .collect();
-        card.children(rows).child(self.render_footer(item, window, cx)).into_any_element()
+        let check_again = (item.kind == AttentionKind::GateCriteria).then(|| {
+            let checking = self.checking_gate == Some(node_id);
+            div().flex().child(
+                Button::new(SharedString::from(format!("unified-decisions-gate-check-{node_id}")))
+                    .label(if checking { "Checking…" } else { "Check again" })
+                    .small()
+                    .disabled(checking)
+                    .tooltip("Check the gate again, once you have fixed what it found")
+                    .on_click(cx.listener(move |this, _, _, cx| this.check_gate_again(node_id, Source::Click, cx))),
+            )
+        });
+        card.children(rows)
+            .children(check_again)
+            .child(self.render_footer(item, window, cx))
+            .into_any_element()
+    }
+
+    /// Check a gate the app checks itself again (`settle_derived_criteria`),
+    /// off the UI thread: it may ask GitHub. Once it passes, the node waits
+    /// on nothing and a runner that stopped there continues by itself.
+    pub(crate) fn check_gate_again(&mut self, node_id: Uuid, source: Source, cx: &mut Context<Self>) {
+        if self.checking_gate.is_some() {
+            return;
+        }
+        record_action(
+            cx,
+            Focus::Node(node_id),
+            CHECK_GATE_AGAIN_ACTION.to_string(),
+            source,
+            JOURNEY_SURFACE,
+            Presented {
+                actions: vec![PresentedAction {
+                    id: CHECK_GATE_AGAIN_ACTION.to_string(),
+                    label: "Check again".to_string(),
+                    primary: false,
+                    disabled: false,
+                }],
+                focused: None,
+                notices: Vec::new(),
+            },
+        );
+        self.checking_gate = Some(node_id);
+        cx.notify();
+        let fleet = self.fleet.clone();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { tod_core::conversation::gate_check::settle_derived_criteria(&fleet, node_id).map(|_| ()) })
+                .await;
+            let _ = this.update(cx, |this: &mut Requests, cx| {
+                this.checking_gate = None;
+                this.set_error("check the gate", result);
+                this.reload(cx);
+            });
+        })
+        .detach();
     }
 
     fn render_item(&self, item: &AttentionItem, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
@@ -1257,7 +1526,7 @@ impl Requests {
             AttentionKind::Decision => self.render_decision_card(item, window, cx),
             AttentionKind::PlanStep => self.render_plan_step_card(item, window, cx),
             AttentionKind::Finding => self.render_finding_card(item, window, cx),
-            AttentionKind::Gate => self.render_gate_card(item, window, cx),
+            AttentionKind::Gate | AttentionKind::GateCriteria => self.render_gate_card(item, window, cx),
         }
     }
 

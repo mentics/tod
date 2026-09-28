@@ -33,7 +33,7 @@ pub use state::{AutopilotState, CurrentStep, StepRecord, state_path};
 use crate::conversation::driver::{
     AgentAccess, ConversationConfig, ConversationDriver, ConversationEvent, ConversationStatus,
 };
-use crate::conversation::gate_check::{latest_gate_report, settle_derived_criteria};
+use crate::conversation::gate_check::{latest_gate_report, set_resolved_elsewhere, settle_derived_criteria};
 use crate::conversation::pr::is_done_report;
 use crate::conversation::protocol::protocol_for;
 use crate::lifecycle;
@@ -48,6 +48,11 @@ use uuid::Uuid;
 
 /// The message that reopens a conversation a restart interrupted.
 pub const RESUME_MESSAGE: &str = "Continue where you left off.";
+
+/// What a gate check the user settled outside the app is told when the run
+/// reopens it (`gate_check::mark_resolved_elsewhere`): its own session holds
+/// what they settled, so it judges the gate again with that in mind.
+pub const SETTLED_ELSEWHERE_MESSAGE: &str = "The user has settled what you asked of them, in this session outside the app. Check the gate again with that in mind, and reply with your verdict in the same form as before.";
 
 /// How much one run may spend before it stops for the user.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -428,6 +433,15 @@ impl Autopilot {
                         None => r.criterion.label.clone(),
                     })
                     .collect();
+                // A check reopened for what the user settled elsewhere that
+                // gave no new verdict: its question stands again, so the
+                // stop below has a request to answer.
+                if let Some((conversation, report)) =
+                    fleet.read(|conn| latest_gate_report(conn, self.node, from))?
+                    && report.resolved_elsewhere
+                {
+                    set_resolved_elsewhere(fleet, conversation.id, false)?;
+                }
                 if !failing.is_empty() {
                     return Ok(Some(Outcome::NeedsHuman {
                         reason: NeedsHuman::FailingCriteria { criteria: failing },
@@ -492,9 +506,21 @@ impl Autopilot {
             (current.protocol == protocol_name(kind) && current.lifecycle == lifecycle)
                 .then_some(current.conversation_id)
         });
-        let (mut driver, message) = match resumable {
-            Some(id) => match ConversationDriver::open(self.config.clone(), fleet, id) {
-                Ok(driver) => (driver, RESUME_MESSAGE),
+        // A gate check the user settled in its own session, outside the app:
+        // reopened, so the agent judges again with what they settled.
+        let settled = match (resumable, kind) {
+            (None, ProtocolKind::GateCheck) => fleet
+                .read(|conn| latest_gate_report(conn, self.node, &lifecycle))?
+                .filter(|(_, report)| report.resolved_elsewhere)
+                .map(|(conversation, _)| conversation.id),
+            _ => None,
+        };
+        let reopen = resumable
+            .map(|id| (id, RESUME_MESSAGE))
+            .or(settled.map(|id| (id, SETTLED_ELSEWHERE_MESSAGE)));
+        let (mut driver, message) = match reopen {
+            Some((id, message)) => match ConversationDriver::open(self.config.clone(), fleet, id) {
+                Ok(driver) => (driver, message),
                 Err(_) => self.new_driver(kind),
             },
             None => self.new_driver(kind),

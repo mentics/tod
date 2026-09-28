@@ -26,6 +26,9 @@ struct FakeAgent {
     runs: HashMap<RunId, AgentRunState>,
     sessions: HashMap<String, String>,
     turns: usize,
+    /// Gives no verdict when a gate check is reopened for what the user
+    /// settled elsewhere.
+    silent_when_settled: bool,
 }
 
 impl FakeAgent {
@@ -35,6 +38,7 @@ impl FakeAgent {
             runs: HashMap::new(),
             sessions: HashMap::new(),
             turns: 0,
+            silent_when_settled: false,
         }
     }
 
@@ -50,8 +54,11 @@ impl FakeAgent {
             fleet: &self.fleet,
             actor: ACTOR_USER.to_string(),
         };
+        if text.contains(SETTLED_ELSEWHERE_MESSAGE) && self.silent_when_settled {
+            return Ok(String::new());
+        }
         if let Some(node) = env(IMPLEMENT_NODE_ENV)
-            && text.contains("phase_purpose:** gate_check")
+            && (text.contains("phase_purpose:** gate_check") || text.contains(SETTLED_ELSEWHERE_MESSAGE))
         {
             return crate::conversation::gate_check::mock_turn(&user, node.parse()?, &text);
         }
@@ -253,6 +260,13 @@ fn stops_at_a_failing_criterion_it_cannot_fix() {
         "{outcome:?}"
     );
     assert_eq!(lifecycle::current_state(&fx.fleet, fx.node).unwrap(), "ready");
+    // No gate check asked anything, yet the stop leaves a request.
+    let attention = fx
+        .fleet
+        .read(|conn| crate::attention::for_node(conn, fx.node))
+        .unwrap();
+    assert_eq!(attention.count, 1, "{attention:?}");
+    assert_eq!(attention.items[0].kind, crate::attention::AttentionKind::GateCriteria);
 }
 
 #[test]
@@ -392,6 +406,77 @@ fn a_restart_reopens_the_conversation_in_progress() {
         "{:?}",
         turns.iter().map(|t| &t.body).collect::<Vec<_>>()
     );
+}
+
+/// A gate check on the node whose report the user marked settled outside the
+/// app (`gate_check::mark_resolved_elsewhere`).
+fn gate_check_settled_elsewhere(fx: &Fixture, agent: &mut FakeAgent) -> Uuid {
+    // As a task node has: attention reads the state from its row.
+    lifecycle::set_lifecycle(&fx.fleet, fx.node, "proposed").unwrap();
+    let mut driver = ConversationDriver::new(config(fx), Focus::Node(fx.node), ProtocolKind::GateCheck);
+    driver.send(&fx.fleet, agent, "Run the gate check.").unwrap();
+    let id = driver.conversation_id().unwrap();
+    let report = crate::conversation::gate_check::GateReportRecord {
+        result: "needs_human".into(),
+        summary: "Which export format?".into(),
+        ..Default::default()
+    };
+    fx.fleet
+        .interview(
+            ACTOR_USER,
+            InterviewCommand::RecordConversationReport {
+                conversation_id: id,
+                body: report.to_value(),
+            },
+        )
+        .unwrap();
+    crate::conversation::gate_check::mark_resolved_elsewhere(&fx.fleet, id).unwrap();
+    id
+}
+
+fn turn_bodies(fx: &Fixture, id: Uuid) -> Vec<String> {
+    fx.fleet
+        .read(|conn| ConversationRepo::new(conn).turns(id))
+        .unwrap()
+        .into_iter()
+        .map(|t| t.body)
+        .collect()
+}
+
+#[test]
+fn a_gate_check_settled_elsewhere_is_reopened_not_started_afresh() {
+    let fx = setup();
+    let mut agent = FakeAgent::new(&fx.fleet);
+    let id = gate_check_settled_elsewhere(&fx, &mut agent);
+
+    let mut pilot = autopilot(&fx, Budget { max_sessions: 1, ..Budget::default() });
+    pilot.run(&fx.fleet, &mut agent).unwrap();
+    let first = pilot.state().steps.first().unwrap();
+    assert_eq!(first.step, "gate_check");
+    assert_eq!(first.conversation_id, Some(id));
+    let turns = turn_bodies(&fx, id);
+    assert!(turns.iter().any(|t| t == SETTLED_ELSEWHERE_MESSAGE), "{turns:?}");
+}
+
+#[test]
+fn a_reopened_gate_check_with_no_new_verdict_asks_again() {
+    let fx = setup();
+    let mut agent = FakeAgent::new(&fx.fleet);
+    agent.silent_when_settled = true;
+    let id = gate_check_settled_elsewhere(&fx, &mut agent);
+
+    let outcome = autopilot(&fx, Budget::default()).run(&fx.fleet, &mut agent).unwrap();
+    assert!(
+        matches!(&outcome, Outcome::NeedsHuman { reason } if reason.is_request()),
+        "{outcome:?}"
+    );
+    // The question stands again, so the stop has something to answer.
+    let attention = fx
+        .fleet
+        .read(|conn| crate::attention::for_node(conn, fx.node))
+        .unwrap();
+    assert_eq!(attention.count, 1, "{attention:?}");
+    assert_eq!(attention.items[0].id, id);
 }
 
 /// Stops the run from `watch`, the first time a turn is in flight.

@@ -765,6 +765,32 @@ fn net_ops_fold_per_item() {
 }
 
 #[test]
+fn listing_by_protocol_leaves_out_the_lifecycles_conversations() {
+    let fx = setup();
+    let repo = ConversationRepo::new(&fx.conn);
+    let implement = repo
+        .create(Focus::Node(fx.n1), ProtocolKind::Implementation, None, None, None)
+        .unwrap()
+        .id;
+
+    let all: Vec<Uuid> = repo
+        .list_for_focus(Focus::Node(fx.n1))
+        .unwrap()
+        .into_iter()
+        .map(|s| s.conversation.id)
+        .collect();
+    assert!(all.contains(&implement) && all.contains(&fx.conv));
+
+    let freeform: Vec<Uuid> = repo
+        .list_for_focus_with_protocol(Focus::Node(fx.n1), ProtocolKind::Outline)
+        .unwrap()
+        .into_iter()
+        .map(|s| s.conversation.id)
+        .collect();
+    assert_eq!(freeform, vec![fx.conv]);
+}
+
+#[test]
 fn a_deletion_followed_by_a_create_in_the_same_turn_reads_as_replaced() {
     let fx = setup();
     let old = add_obligation(&fx.conn, fx.n1, "Old wording.");

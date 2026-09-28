@@ -11,14 +11,17 @@
 //! 1. pending decisions (`tod_store::decisions`);
 //! 2. plan steps handed back to the user (`partial` / `blocked`);
 //! 3. open review findings, only while the node is actually answering them;
-//! 4. the latest gate-check report, when it needs a human.
+//! 4. the latest gate-check report, when it needs a human, or failing gate
+//!    criteria the app checked itself when there is no report.
 
 use crate::conversation::gate_check::latest_gate_report;
+use crate::lifecycle_next::{NextStep, Standing, next_step};
 use anyhow::Result;
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use std::collections::HashMap;
 use tod_store::decisions::{Decision, DecisionRepo};
 use tod_store::outline::repos::plan_steps::{HandoffReason, PlanStep};
+use tod_store::outline::repos::gate::{GateRepo, OUTCOME_PASS, OUTCOME_WAIVED};
 use tod_store::outline::repos::{NodeRepo, PlanStepRepo};
 use tod_store::review::ReviewRepo;
 use uuid::Uuid;
@@ -33,8 +36,11 @@ pub enum AttentionKind {
     /// An open review finding.
     Finding,
     /// A gate-check report that came back `blocked` or `needs_human` with a
-    /// blocker only the user can answer.
+    /// blocker only the user can answer, or that the run stops at.
     Gate,
+    /// Gate criteria the app checks itself (no gate-check conversation) that
+    /// failed, where the run stops. The item's `id` is the node's.
+    GateCriteria,
 }
 
 /// Why the agent or runner could not handle the request itself
@@ -200,8 +206,8 @@ pub fn for_nodes(conn: &Connection, node_ids: &[Uuid]) -> Result<HashMap<Uuid, N
     // 4. The latest gate-check report, when it needs a human: `result` is
     // `blocked` or `needs_human` and at least one blocker's `action` is
     // `ask_user` or `waive` — the two actions a gate check hands to the
-    // user rather than back to an agent (`implement` / `fix` / `verify` /
-    // `interview` all go to a further agent turn instead).
+    // user rather than back to an agent — or the node's next step is the
+    // gate itself, so the autopilot stops there (`Autopilot::gate`).
     // `latest_gate_report` is per node (it needs the node's own current
     // lifecycle state to know which transition's report is still current),
     // so this is the one source that still costs one query per node; gate
@@ -216,7 +222,18 @@ pub fn for_nodes(conn: &Connection, node_ids: &[Uuid]) -> Result<HashMap<Uuid, N
                 .blockers
                 .iter()
                 .any(|b| b.action == "ask_user" || b.action == "waive");
-            if (report.result == "blocked" || report.result == "needs_human") && asks_user {
+            // A report the user settled in the agent's own session no
+            // longer waits on them, and neither does a gate the run would
+            // now go through (every recorded criterion passed or waived).
+            // Otherwise it waits on them when it asks them, and also
+            // whenever the run would stop at it: a gate the run cannot get
+            // through must leave something to answer.
+            let waits = !report.resolved_elsewhere
+                && report.advanced_to.is_none()
+                && !gate_clear(conn, node, from_state)?
+                && (((report.result == "blocked" || report.result == "needs_human") && asks_user)
+                    || at_gate(conn, node, from_state)?);
+            if waits {
                 let summary = if report.summary.trim().is_empty() {
                     report
                         .blockers
@@ -239,6 +256,29 @@ pub fn for_nodes(conn: &Connection, node_ids: &[Uuid]) -> Result<HashMap<Uuid, N
                     reason: RequestReason::Risk,
                 });
             }
+        } else if at_gate(conn, node, from_state)? {
+            // No gate check to ask: a gate the app checks all by itself
+            // (`ready` -> `active`, say) that failed stops the run too.
+            let failing = failing_criteria(conn, node, from_state)?;
+            if let Some(since) = failing.iter().map(|f| f.2).max() {
+                let summary = failing
+                    .iter()
+                    .map(|(label, detail, _)| match detail {
+                        Some(detail) => format!("{label}: {detail}"),
+                        None => label.clone(),
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                by_node.entry(node).or_default().push(AttentionItem {
+                    kind: AttentionKind::GateCriteria,
+                    id: node,
+                    node_id: node,
+                    summary,
+                    options: Vec::new(),
+                    since,
+                    reason: RequestReason::Other,
+                });
+            }
         }
     }
     Ok(node_ids
@@ -248,6 +288,57 @@ pub fn for_nodes(conn: &Connection, node_ids: &[Uuid]) -> Result<HashMap<Uuid, N
             (node, NodeAttention::from_items(node, items))
         })
         .collect())
+}
+
+/// Whether every recorded criterion of the node's gate out of `from_state`
+/// passed or was waived (`lifecycle::all_clear`): the run would advance.
+fn gate_clear(conn: &Connection, node: Uuid, from_state: &str) -> Result<bool> {
+    let Some(to_state) = crate::task::model::next_lifecycle(from_state) else {
+        return Ok(false);
+    };
+    let rows: Vec<_> = GateRepo::new(conn)
+        .list_evaluations_for_transition(node, from_state, to_state)?
+        .into_iter()
+        .map(|(criterion, evaluation)| crate::lifecycle::RecordedCriterion {
+            criterion,
+            evaluation,
+        })
+        .collect();
+    Ok(crate::lifecycle::all_clear(&rows))
+}
+
+/// The criteria of the node's gate out of `from_state` whose latest outcome,
+/// recorded since the node entered the state, is neither pass nor waived:
+/// label, detail, and when it was recorded.
+fn failing_criteria(conn: &Connection, node: Uuid, from_state: &str) -> Result<Vec<(String, Option<String>, i64)>> {
+    let Some(to_state) = crate::task::model::next_lifecycle(from_state) else {
+        return Ok(Vec::new());
+    };
+    let entered_at: i64 = conn
+        .query_row(
+            "SELECT updated_at FROM node_lifecycle WHERE node_id = ?1",
+            [node.as_bytes().to_vec()],
+            |row| row.get(0),
+        )
+        .optional()?
+        .unwrap_or(0);
+    Ok(GateRepo::new(conn)
+        .list_evaluations_for_transition(node, from_state, to_state)?
+        .into_iter()
+        .filter_map(|(criterion, evaluation)| {
+            let evaluation = evaluation?;
+            let clear = evaluation.outcome == OUTCOME_PASS || evaluation.outcome == OUTCOME_WAIVED;
+            (!clear && evaluation.evaluated_at >= entered_at)
+                .then_some((criterion.label, evaluation.detail, evaluation.evaluated_at))
+        })
+        .collect())
+}
+
+/// Whether the node's next step is its gate (`lifecycle_next`): nothing
+/// earlier is owed, so a gate that has not passed is where the run stops.
+fn at_gate(conn: &Connection, node: Uuid, from_state: &str) -> Result<bool> {
+    let standing = Standing::load(conn, node, from_state)?;
+    Ok(next_step(&standing) == Some(NextStep::GateCheck))
 }
 
 fn decision_item(decision: &Decision) -> AttentionItem {
@@ -465,6 +556,126 @@ mod tests {
         assert_eq!(attention.count, 1);
         assert_eq!(attention.items[0].kind, AttentionKind::Gate);
         assert_eq!(attention.items[0].id, conversation.id);
+    }
+
+    /// A gate-check conversation on `node` for `from` → `to`, with a report
+    /// of `result` whose one blocker's action is `action`.
+    fn gate_report(conn: &Connection, node: Uuid, from: &str, to: &str, result: &str, action: &str) -> Uuid {
+        use tod_store::conversation::{ConversationRepo, Focus, ProtocolKind};
+        let repo = ConversationRepo::new(conn);
+        let conversation = repo
+            .create(Focus::Node(node), ProtocolKind::GateCheck, None, None, None)
+            .unwrap();
+        repo.set_transition(conversation.id, from, to).unwrap();
+        record_gate_report(conn, conversation.id, result, action, false);
+        conversation.id
+    }
+
+    fn record_gate_report(conn: &Connection, conversation: Uuid, result: &str, action: &str, resolved: bool) {
+        let report = serde_json::json!({
+            "gate_check": {
+                "result": result,
+                "summary": "The gate did not pass.",
+                "next": "",
+                "blockers": [{
+                    "kind": "criterion",
+                    "reference": "c1",
+                    "what": "Something is missing.",
+                    "action": action,
+                }],
+                "findings": "",
+                "no_reasons": false,
+                "advanced_to": null,
+                "resolved_elsewhere": resolved,
+            }
+        });
+        tod_store::conversation::ConversationRepo::new(conn)
+            .record_report(conversation, &report)
+            .unwrap();
+    }
+
+    #[test]
+    fn a_gate_the_run_would_stop_at_waits_until_settled_elsewhere() {
+        let fx = fixture();
+        let node = make_node(&fx.conn, "stuck-at-gate");
+        NodeRepo::new(&fx.conn).set_lifecycle(node, "approved").unwrap();
+        // Handed to an agent, not the user: still where the run stops, so
+        // it has to leave something to answer.
+        let conversation = gate_report(&fx.conn, node, "approved", "pr", "blocked", "implement");
+        let attention = for_node(&fx.conn, node).unwrap();
+        assert_eq!(attention.count, 1);
+        assert_eq!(attention.items[0].kind, AttentionKind::Gate);
+
+        record_gate_report(&fx.conn, conversation, "blocked", "implement", true);
+        assert_eq!(for_node(&fx.conn, node).unwrap().count, 0);
+    }
+
+    #[test]
+    fn a_gate_with_every_criterion_waived_no_longer_waits() {
+        let fx = fixture();
+        let node = make_node(&fx.conn, "waived");
+        NodeRepo::new(&fx.conn).set_lifecycle(node, "review").unwrap();
+        gate_report(&fx.conn, node, "review", "pr", "needs_human", "waive");
+        assert_eq!(for_node(&fx.conn, node).unwrap().count, 1);
+
+        tod_store::outline::gate_criteria_seed::seed_gate_criteria(&fx.conn).unwrap();
+        let gates = GateRepo::new(&fx.conn);
+        let criteria = gates.list_for_transition("review", "pr").unwrap();
+        assert!(!criteria.is_empty());
+        for criterion in criteria {
+            gates
+                .upsert_evaluation(&tod_store::outline::repos::gate::NodeGateEvaluation {
+                    node_id: node,
+                    criterion_id: criterion.id,
+                    outcome: "waived".into(),
+                    detail: None,
+                    source: "human".into(),
+                    evaluated_at: 0,
+                    action: "none".into(),
+                })
+                .unwrap();
+        }
+        assert_eq!(for_node(&fx.conn, node).unwrap().count, 0);
+    }
+
+    #[test]
+    fn a_failing_gate_the_app_checks_itself_waits() {
+        use tod_store::outline::repos::gate::{NodeGateEvaluation, READY_ACTIVE_ACTION_CONFIG_SLUG};
+        let fx = fixture();
+        tod_store::outline::gate_criteria_seed::seed_gate_criteria(&fx.conn).unwrap();
+        let node = make_node(&fx.conn, "unconfigured");
+        NodeRepo::new(&fx.conn).set_lifecycle(node, "ready").unwrap();
+        let gates = GateRepo::new(&fx.conn);
+        let criterion = gates.get_by_slug(READY_ACTIVE_ACTION_CONFIG_SLUG).unwrap().unwrap();
+        let record = |outcome: &str, evaluated_at: i64| {
+            gates
+                .upsert_evaluation(&NodeGateEvaluation {
+                    node_id: node,
+                    criterion_id: criterion.id,
+                    outcome: outcome.into(),
+                    detail: Some("No agent configured.".into()),
+                    source: "derived".into(),
+                    evaluated_at,
+                    action: "none".into(),
+                })
+                .unwrap();
+        };
+
+        // From before the node entered `ready`: not today's result.
+        record("fail", 0);
+        assert_eq!(for_node(&fx.conn, node).unwrap().count, 0);
+
+        let now = i64::MAX / 2;
+        record("fail", now);
+        let attention = for_node(&fx.conn, node).unwrap();
+        assert_eq!(attention.count, 1);
+        let item = &attention.items[0];
+        assert_eq!(item.kind, AttentionKind::GateCriteria);
+        assert_eq!(item.id, node);
+        assert!(item.summary.contains("No agent configured."), "{}", item.summary);
+
+        record("pass", now);
+        assert_eq!(for_node(&fx.conn, node).unwrap().count, 0);
     }
 
     #[test]
