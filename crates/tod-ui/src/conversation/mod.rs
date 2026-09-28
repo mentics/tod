@@ -104,7 +104,7 @@ use tod_core::conversation::{
 };
 use tod_store::conversation::{
     ConversationRepo, ConversationSummary, Entity as ItemEntity, EntitySnapshot, Focus, NetChange,
-    ProtocolKind, Turn, net_changes,
+    ProtocolKind, Turn, TurnRole, net_changes,
 };
 use tod_store::fleet::FleetStore;
 use tod_store::interview::{ACTOR_USER, InterviewCommand, short_id};
@@ -133,6 +133,10 @@ pub(crate) enum AfterSend {
     /// It answers a plan step the agent handed back: the step is in progress
     /// again once the answer went out.
     Handoff(Uuid),
+    /// It resends the last message after the turn that carried it failed
+    /// before reaching the agent: nothing to restore, since it was not
+    /// typed just now.
+    Retry,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1427,6 +1431,42 @@ impl ConversationView {
             self.transcript
                 .update(cx, |panel, cx| panel.clear_input(window, cx));
         }
+    }
+
+    /// Resend the message that ended in an error turn: the turn was
+    /// recorded but never reached the agent, so there is nothing sitting in
+    /// the input to just hit Send on again.
+    pub(super) fn retry_last_message(&mut self, cx: &mut Context<Self>) {
+        let Some(last_user) = self
+            .data
+            .turns
+            .iter()
+            .rev()
+            .find(|t| matches!(t.role, TurnRole::User | TurnRole::Continuation))
+        else {
+            return;
+        };
+        let root = self.fleet.paths().root().to_path_buf();
+        let text = last_user.body.clone();
+        let images = match last_user
+            .attachments
+            .iter()
+            .map(|a| {
+                a.read(&root).map(|data| tod_agent::PromptImage {
+                    mime_type: a.mime_type.clone(),
+                    data,
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()
+        {
+            Ok(images) => images,
+            Err(err) => {
+                self.error = Some(format!("Could not read the attached image: {err:#}").into());
+                cx.notify();
+                return;
+            }
+        };
+        self.deliver(&text, images, AfterSend::Retry, cx);
     }
 
     /// Send `text` as the user's message. `true` when it was handed to the
