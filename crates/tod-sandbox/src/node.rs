@@ -12,8 +12,8 @@
 //! Design: `doc/cloud-sandboxes/autonomous-nodes.md` (Credentials).
 
 use crate::blaxel::{Blaxel, RELAY_PORT};
-pub use crate::config::ClaudeTokenVia;
-use crate::provision::{RELAY_PATH, RELAY_PROCESS, TOD_CLI_PATH, TOD_DIR};
+pub use crate::config::{ClaudeTokenVia, SchedulerKind};
+use crate::provision::{MANIFEST_PATH, RELAY_PATH, RELAY_PROCESS, TOD_CLI_PATH, TOD_DIR, node_manifest};
 use crate::relay::shell_quote;
 use anyhow::{Result, bail};
 use base64::Engine;
@@ -50,6 +50,13 @@ pub const CLAUDE_TOKEN_ENV: &str = "CLAUDE_CODE_OAUTH_TOKEN";
 /// environment and gives it to the supervisor it starts, as `<NAME>`
 /// (`tod-relay`'s `SUPERVISOR_ENV_PREFIX`). Nothing else it starts sees it.
 pub const RELAY_SUPERVISOR_ENV_PREFIX: &str = "TOD_SUPERVISOR_ENV_";
+/// Which [`SchedulerKind`] the node's supervisor uses (`orchestrator` or `blaxel`).
+pub const SCHEDULER_ENV: &str = "TOD_SCHEDULER";
+/// The Blaxel workspace the node's sandbox is in.
+pub const BLAXEL_WORKSPACE_ENV: &str = "TOD_BLAXEL_WORKSPACE";
+/// What the supervisor sends Blaxel as its token: the proxy replaces the
+/// `Authorization` header for `api.blaxel.ai` with the real one.
+pub const BLAXEL_TOKEN_PLACEHOLDER: &str = "placeholder-injected-by-proxy";
 
 /// The user's credentials for a node's proxy rules.
 #[derive(Clone, Default)]
@@ -186,25 +193,22 @@ pub fn proxy_spec(rules: &[ProxyRule]) -> Value {
 /// [`CLAUDE_TOKEN_PLACEHOLDER`], so Claude Code starts signed in.
 /// `github_via_proxy` (the proxy holds a GitHub token) sets
 /// [`GITHUB_AUTH_ENV`], so tod's own GitHub client relies on the proxy.
-pub fn node_env(
-    sandbox: &str,
-    user: &str,
-    node: &str,
-    orchestrator_cli_url: &str,
-    agent: Option<&str>,
-    claude_placeholder: bool,
-    github_via_proxy: bool,
-) -> Vec<(&'static str, String)> {
+/// `TOD_SCHEDULER` ([`SchedulerKind`]) and `TOD_BLAXEL_WORKSPACE` (for
+/// the Blaxel scheduler's calls, whose token the proxy adds) say how the
+/// supervisor schedules its wakes (`tod_core::scheduler::from_env`).
+pub fn node_env(spec: &NodeSandboxSpec, claude_placeholder: bool, github_via_proxy: bool) -> Vec<(&'static str, String)> {
     let mut env = vec![
         ("GH_TOKEN", GH_TOKEN_PLACEHOLDER.to_string()),
         // Node's fetch ignores HTTP(S)_PROXY without it, and so gets nothing injected.
         ("NODE_USE_ENV_PROXY", "1".to_string()),
-        ("TOD_SANDBOX", sandbox.to_string()),
-        ("TOD_USER", user.to_string()),
-        ("TOD_NODE", node.to_string()),
-        ("TOD_ORCHESTRATOR_CLI_URL", orchestrator_cli_url.to_string()),
+        ("TOD_SANDBOX", spec.name.to_string()),
+        ("TOD_USER", spec.user.to_string()),
+        ("TOD_NODE", spec.node.to_string()),
+        ("TOD_ORCHESTRATOR_CLI_URL", spec.orchestrator_cli_url.to_string()),
+        (SCHEDULER_ENV, spec.scheduler.as_str().to_string()),
+        (BLAXEL_WORKSPACE_ENV, spec.workspace.to_string()),
     ];
-    if let Some(agent) = agent.filter(|a| !a.is_empty()) {
+    if let Some(agent) = spec.agent.filter(|a| !a.is_empty()) {
         env.push(("TOD_SUPERVISOR_AGENT", agent.to_string()));
     }
     if claude_placeholder {
@@ -220,7 +224,9 @@ fn github_token(creds: &NodeCredentials) -> Option<&str> {
     creds.github_token.as_deref().filter(|t| !t.is_empty())
 }
 
-/// What a node's sandbox is created as.
+/// What a node's sandbox is created as. With an empty `node`, a base
+/// that nodes are forked from ([`ensure_base`]).
+#[derive(Clone, Copy)]
 pub struct NodeSandboxSpec<'a> {
     pub name: &'a str,
     pub image: &'a str,
@@ -237,28 +243,33 @@ pub struct NodeSandboxSpec<'a> {
     /// Where the Claude subscription token goes (`sandboxes.toml`'s
     /// `claude_token_via`).
     pub claude_via: ClaudeTokenVia,
+    /// Who wakes the node when it waits (`sandboxes.toml`'s `scheduler`).
+    pub scheduler: SchedulerKind,
+    /// The Blaxel workspace, for the supervisor's own Blaxel calls.
+    pub workspace: &'a str,
+}
+
+/// The variables [`node_env`] gives a node for `spec` and `creds`.
+pub fn env_for(spec: &NodeSandboxSpec, creds: &NodeCredentials) -> Vec<(&'static str, String)> {
+    let claude_placeholder = spec.claude_via == ClaudeTokenVia::Proxy && claude_token(creds).is_some();
+    let github_via_proxy = github_token(creds).is_some();
+    node_env(spec, claude_placeholder, github_via_proxy)
 }
 
 /// The `POST /sandboxes` body for a node's sandbox.
 pub fn create_body(spec: &NodeSandboxSpec, creds: &NodeCredentials) -> Value {
-    let claude_placeholder = spec.claude_via == ClaudeTokenVia::Proxy && claude_token(creds).is_some();
-    let github_via_proxy = github_token(creds).is_some();
-    let envs: Vec<Value> = node_env(
-        spec.name,
-        spec.user,
-        spec.node,
-        spec.orchestrator_cli_url,
-        spec.agent,
-        claude_placeholder,
-        github_via_proxy,
-    )
-    .into_iter()
-            .map(|(name, value)| json!({ "name": name, "value": value }))
-            .collect();
+    let envs: Vec<Value> = env_for(spec, creds)
+        .into_iter()
+        .map(|(name, value)| json!({ "name": name, "value": value }))
+        .collect();
     json!({
         "metadata": {
             "name": spec.name,
-            "labels": { "tod-kind": "node", "tod-user": spec.user, "tod-node": spec.node },
+            "labels": {
+                "tod-kind": if spec.node.is_empty() { "node-base" } else { "node" },
+                "tod-user": spec.user,
+                "tod-node": spec.node,
+            },
         },
         "spec": {
             "region": spec.region,
@@ -380,6 +391,14 @@ pub fn checkout_script(repo_url: &str, branch: &str, identity: &GitIdentity) -> 
 /// at `url`, checks out the branch, and starts the relay and supervisor.
 /// `progress` hears each slow step and any warning.
 pub fn provision(bx: &Blaxel, url: &str, payload: &NodePayload, progress: &mut dyn FnMut(&str)) -> Result<()> {
+    install(bx, url, payload, progress)?;
+    start(bx, url, payload, progress)
+}
+
+/// The part of [`provision`] that is the same for every node: the relay,
+/// the shim, the supervisor, the Linux `tod-cli`, and the bundles. A base
+/// gets only this.
+pub fn install(bx: &Blaxel, url: &str, payload: &NodePayload, progress: &mut dyn FnMut(&str)) -> Result<()> {
     bx.upload_large(url, RELAY_PATH, payload.relay, "0755")?;
     bx.upload(url, TOD_CLI_PATH, payload.shim, "0755")?;
     match payload.supervisor {
@@ -390,14 +409,20 @@ pub fn provision(bx: &Blaxel, url: &str, payload: &NodePayload, progress: &mut d
         Some(bytes) => bx.upload_large(url, LOCAL_CLI_PATH, bytes, "0755")?,
         None => progress("warning: tod-cli is not built for Linux (target/sandbox/); `tod-cli pr` will not work in the node"),
     }
+    // The node manifest keeps `tod-sandbox`'s own provisioning (a shell,
+    // `exec`, Zed) from reinstalling over this relay and `tod-cli`.
     let res = bx.run(
         url,
-        &format!("mkdir -p {TOD_DIR}/bin && ln -sf {TOD_CLI_PATH} /usr/local/bin/tod-cli && {LOOPBACK_HOSTS}"),
+        &format!(
+            "mkdir -p {TOD_DIR}/bin && ln -sf {TOD_CLI_PATH} /usr/local/bin/tod-cli && {LOOPBACK_HOSTS} && printf '%s\\n' {} > {MANIFEST_PATH}",
+            shell_quote(&node_manifest(payload.relay))
+        ),
         30,
     )?;
     if res.exit_code != 0 {
         bail!("installing tod-cli failed: {}", res.output());
     }
+    ensure_claude_adapter(bx, url, progress)?;
     if !payload.bundles.is_empty() {
         progress(&format!("installing {} bundle files…", payload.bundles.len()));
         let res = bx.run(url, &format!("rm -rf {TOD_DIR}/process {TOD_DIR}/media"), 30)?;
@@ -408,7 +433,13 @@ pub fn provision(bx: &Blaxel, url: &str, payload: &NodePayload, progress: &mut d
             bx.upload(url, &format!("{TOD_DIR}/{rel}"), bytes, "0644")?;
         }
     }
+    Ok(())
+}
 
+/// The part of [`provision`] that is the node's own: checks out its branch,
+/// and starts the relay and the supervisor. All a node forked from a base
+/// needs.
+pub fn start(bx: &Blaxel, url: &str, payload: &NodePayload, progress: &mut dyn FnMut(&str)) -> Result<()> {
     progress(&format!("checking out {}…", payload.branch));
     let res = bx.run(url, &format!("sh -c {} 2>&1", shell_quote(&checkout_script(payload.repo_url, payload.branch, payload.git_identity))), 600)?;
     if res.exit_code != 0 {
@@ -419,7 +450,7 @@ pub fn provision(bx: &Blaxel, url: &str, payload: &NodePayload, progress: &mut d
     bx.kill(url, RELAY_PROCESS)?;
     let relay_env = relay_env(payload.supervisor_env);
     let relay_env: Vec<(&str, &str)> = relay_env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-    bx.start_with_env(url, RELAY_PROCESS, &format!("{RELAY_PATH} --port {RELAY_PORT}"), true, &relay_env)?;
+    bx.start_with_env(url, RELAY_PROCESS, &crate::provision::relay_command(), true, &relay_env)?;
     if payload.supervisor.is_some() {
         // Through the relay's poke, like every later wake: the relay starts
         // `tod-supervisor wake` (its default `--supervisor-cmd`, the same
@@ -433,16 +464,133 @@ pub fn provision(bx: &Blaxel, url: &str, payload: &NodePayload, progress: &mut d
     Ok(())
 }
 
+/// What a base made from `base_body` (its [`create_body`]) with `payload`
+/// installed is: a base whose fingerprint differs (new binaries, bundles,
+/// credentials, image, orchestrator) is made again. Hex SHA-256; it
+/// covers the proxy's secrets, so it is kept only on this machine.
+pub fn base_fingerprint(base_body: &Value, payload: &NodePayload) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    let mut part = |bytes: &[u8]| {
+        h.update((bytes.len() as u64).to_le_bytes());
+        h.update(bytes);
+    };
+    part(base_body.to_string().as_bytes());
+    part(payload.relay);
+    part(payload.shim);
+    part(payload.local_cli.unwrap_or_default());
+    part(payload.supervisor.unwrap_or_default());
+    for (rel, bytes) in payload.bundles {
+        part(rel.as_bytes());
+        part(bytes);
+    }
+    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Makes sure the base `base` (a [`NodeSandboxSpec`] with no node) is there,
+/// deployed, and has `payload` installed ([`install`]), making it again when
+/// it is missing, can no longer run, or its fingerprint ([`base_fingerprint`])
+/// is not `recorded`. Returns the fingerprint to record once it is ready.
+pub fn ensure_base(
+    bx: &Blaxel,
+    base: &NodeSandboxSpec,
+    creds: &NodeCredentials,
+    payload: &NodePayload,
+    recorded: Option<&str>,
+    progress: &mut dyn FnMut(&str),
+) -> Result<String> {
+    let body = create_body(base, creds);
+    let fingerprint = base_fingerprint(&body, payload);
+    let existing = bx.get(base.name)?;
+    let dead = |status: &str| matches!(status.to_ascii_uppercase().as_str(), "FAILED" | "TERMINATED" | "DELETING" | "DELETED");
+    if let Some(info) = &existing
+        && !dead(&info.status)
+        && recorded == Some(fingerprint.as_str())
+    {
+        return Ok(fingerprint);
+    }
+    if existing.is_some() {
+        progress(&format!("replacing the base {}…", base.name));
+        bx.delete(base.name)?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        while bx.get(base.name)?.is_some() {
+            if std::time::Instant::now() >= deadline {
+                bail!("the old base {} is still there", base.name);
+            }
+            std::thread::sleep(std::time::Duration::from_secs(2));
+        }
+    }
+    progress(&format!("creating the base {}…", base.name));
+    bx.create_from_body(&body)?;
+    let info = bx.wait_deployed(base.name, std::time::Duration::from_secs(300))?;
+    let url = info.url.ok_or_else(|| anyhow::anyhow!("sandbox {} has no URL", base.name))?;
+    install(bx, &url, payload, progress)?;
+    Ok(fingerprint)
+}
+
+/// Forks `spec`'s sandbox from the base `base`, with `spec`'s environment
+/// ([`env_for`]) over the base's. Its proxy rules and labels are the base's
+/// (the same user's credentials); wait with [`Blaxel::wait_deployed`], then
+/// [`start`] it.
+pub fn fork(bx: &Blaxel, base: &str, spec: &NodeSandboxSpec, creds: &NodeCredentials) -> Result<()> {
+    bx.fork_with_envs(base, spec.name, &env_for(spec, creds))
+}
+
 /// Names `localhost` in `/etc/hosts` when the image left it out (Blaxel's
 /// images ship it empty). curl resolves `localhost` by itself; most programs
 /// do not, and the sandbox's proxy is `http://localhost:49152`.
 const LOOPBACK_HOSTS: &str = "{ grep -qw localhost /etc/hosts 2>/dev/null || \
      printf '127.0.0.1 localhost\\n::1 localhost ip6-localhost ip6-loopback\\n' >> /etc/hosts; }";
 
+/// The Claude ACP adapter's npm package: the only adapter tod runs Claude on
+/// (`tod_agent::claude_adapter`).
+const CLAUDE_ADAPTER_PACKAGE: &str = "@agentclientprotocol/claude-agent-acp";
+
+/// Installs the Claude adapter globally when the image lacks it, as an image
+/// baked before it replaced `claude-code-acp` does; otherwise a Claude node
+/// fails every step with "the Claude ACP adapter is not installed". Exits 0
+/// at once when it is there, 3 when there is no npm to install it with.
+fn claude_adapter_script() -> String {
+    format!(
+        "command -v claude-agent-acp >/dev/null 2>&1 && exit 0; \
+         command -v npm >/dev/null 2>&1 || {{ echo 'no npm in the image'; exit 3; }}; \
+         echo installing; npm install -g --silent --prefix /usr/local {CLAUDE_ADAPTER_PACKAGE} 2>&1"
+    )
+}
+
+/// See [`claude_adapter_script`]. A sandbox that cannot have it still runs
+/// a node on the mock agent, so failing is only a warning.
+fn ensure_claude_adapter(bx: &Blaxel, url: &str, progress: &mut dyn FnMut(&str)) -> Result<()> {
+    let check = bx.run(url, "command -v claude-agent-acp >/dev/null 2>&1", 30)?;
+    if check.exit_code == 0 {
+        return Ok(());
+    }
+    progress("installing the Claude agent adapter (the image lacks it)…");
+    let res = bx.run(url, &format!("sh -c {}", shell_quote(&claude_adapter_script())), 600)?;
+    if res.exit_code != 0 {
+        progress(&format!(
+            "warning: could not install {CLAUDE_ADAPTER_PACKAGE} (exit {}), so the node cannot run Claude: {}",
+            res.exit_code,
+            res.output().trim()
+        ));
+    }
+    Ok(())
+}
+
 /// The command the relay runs to start the supervisor (its default
 /// `--supervisor-cmd`).
 pub fn supervisor_command() -> String {
     format!("{SUPERVISOR_PATH} wake --workspace {WORKSPACE_DIR}")
+}
+
+/// What a wake's Blaxel schedule runs in the node's sandbox: a poke of the
+/// relay, which starts the supervisor (with the environment only it is
+/// given) or signals the one running, exactly as a poke from outside does.
+/// Should the relay not be running (the sandbox was restarted, not just
+/// woken), the supervisor is started directly. The process API runs it
+/// with a shell.
+pub fn wake_command() -> String {
+    format!("curl -fsS -m 20 -X POST http://127.0.0.1:{RELAY_PORT}/poke || exec {}", supervisor_command())
 }
 
 /// Pokes the relay on loopback, retrying while it starts listening.
@@ -456,6 +604,53 @@ pub fn poke_script() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn claude_adapter_script_names_the_adapter_package() {
+        let s = claude_adapter_script();
+        assert!(s.starts_with("command -v claude-agent-acp"), "{s}");
+        assert!(s.contains("npm install -g --silent --prefix /usr/local @agentclientprotocol/claude-agent-acp"));
+        assert!(!s.contains("claude-code-acp"));
+    }
+
+    /// Runs the script with only `bin` on `PATH`; `npm` there records that
+    /// it ran.
+    #[cfg(unix)]
+    fn run_adapter_script(adapter: bool, npm: bool) -> (i32, bool) {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("tod-adapter-{}-{adapter}-{npm}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let bin = dir.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let script = |name: &str, body: &str| {
+            let p = bin.join(name);
+            std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        if adapter {
+            script("claude-agent-acp", "exit 0");
+        }
+        if npm {
+            script("npm", &format!(": > {}", dir.join("npm-ran").display()));
+        }
+        let status = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(claude_adapter_script())
+            .env("PATH", &bin)
+            .status()
+            .unwrap();
+        let ran = dir.join("npm-ran").exists();
+        let _ = std::fs::remove_dir_all(&dir);
+        (status.code().unwrap_or(-1), ran)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn claude_adapter_script_installs_only_when_missing() {
+        assert_eq!(run_adapter_script(true, true), (0, false));
+        assert_eq!(run_adapter_script(false, true), (0, true));
+        assert_eq!(run_adapter_script(false, false), (3, false));
+    }
 
     fn creds() -> NodeCredentials {
         NodeCredentials {
@@ -478,7 +673,65 @@ mod tests {
             orchestrator_cli_url: "https://orch.bl.run/port/8090/cli",
             agent: Some("mock"),
             claude_via,
+            scheduler: SchedulerKind::Blaxel,
+            workspace: "ws-1",
         }
+    }
+
+    #[test]
+    fn the_node_is_told_its_scheduler_and_workspace() {
+        let body = create_body(&spec(ClaudeTokenVia::Proxy), &creds());
+        assert_eq!(env_value(&body, SCHEDULER_ENV).as_deref(), Some("blaxel"));
+        assert_eq!(env_value(&body, BLAXEL_WORKSPACE_ENV).as_deref(), Some("ws-1"));
+        let orch = NodeSandboxSpec { scheduler: SchedulerKind::Orchestrator, ..spec(ClaudeTokenVia::Proxy) };
+        assert_eq!(env_value(&create_body(&orch, &creds()), SCHEDULER_ENV).as_deref(), Some("orchestrator"));
+    }
+
+    #[test]
+    fn a_base_is_labelled_apart_from_nodes() {
+        let node = spec(ClaudeTokenVia::Proxy);
+        assert_eq!(create_body(&node, &creds())["metadata"]["labels"]["tod-kind"], "node");
+        let base = NodeSandboxSpec { name: "tod-node-base", node: "", ..node };
+        assert_eq!(create_body(&base, &creds())["metadata"]["labels"]["tod-kind"], "node-base");
+    }
+
+    #[test]
+    fn a_base_fingerprint_changes_with_what_it_is_made_from() {
+        fn payload<'a>(relay: &'a [u8], bundles: &'a [(String, Vec<u8>)], identity: &'a GitIdentity) -> NodePayload<'a> {
+            NodePayload {
+                relay,
+                shim: b"shim",
+                local_cli: None,
+                supervisor: Some(b"sup"),
+                repo_url: "https://example/r.git",
+                branch: "b",
+                git_identity: identity,
+                bundles,
+                supervisor_env: &[],
+            }
+        }
+        let identity = GitIdentity::fallback();
+        let bundles = vec![("process/a.md".to_string(), b"one".to_vec())];
+        let bundles = bundles.as_slice();
+        let body = create_body(&NodeSandboxSpec { node: "", ..spec(ClaudeTokenVia::Proxy) }, &creds());
+        let a = base_fingerprint(&body, &payload(b"relay-1", bundles, &identity));
+        assert_eq!(a, base_fingerprint(&body, &payload(b"relay-1", bundles, &identity)));
+        assert_ne!(a, base_fingerprint(&body, &payload(b"relay-2", bundles, &identity)));
+        assert_ne!(a, base_fingerprint(&body, &payload(b"relay-1", &[], &identity)));
+        let mut other = body.clone();
+        other["spec"]["runtime"]["image"] = json!("other:latest");
+        assert_ne!(a, base_fingerprint(&other, &payload(b"relay-1", bundles, &identity)));
+        // The branch and repository are the node's, not the base's.
+        let mut p = payload(b"relay-1", bundles, &identity);
+        p.branch = "other";
+        assert_eq!(a, base_fingerprint(&body, &p));
+    }
+
+    #[test]
+    fn a_wake_pokes_the_relay_and_falls_back_to_the_supervisor() {
+        let cmd = wake_command();
+        assert!(cmd.starts_with("curl -fsS -m 20 -X POST http://127.0.0.1:2222/poke || exec "), "{cmd}");
+        assert!(cmd.ends_with(&supervisor_command()), "{cmd}");
     }
 
     #[test]

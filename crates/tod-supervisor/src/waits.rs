@@ -121,6 +121,10 @@ pub fn check(fleet: &FleetStore, node: Uuid, workspace: &Path) -> Result<WaitSta
 /// Asks `scheduler` to wake `sandbox` at `node`'s soonest pending wait, if any.
 /// The schedule's id is that wait's, so rescheduling replaces it.
 pub fn schedule_wake(fleet: &FleetStore, node: Uuid, scheduler: &dyn Scheduler, sandbox: &str) -> Result<Option<i64>> {
+    Ok(schedule_next(fleet, node, scheduler, sandbox)?.map(|(_, at)| at))
+}
+
+fn schedule_next(fleet: &FleetStore, node: Uuid, scheduler: &dyn Scheduler, sandbox: &str) -> Result<Option<(Uuid, i64)>> {
     let waits = pending(fleet, node)?;
     let Some(next) = waits.iter().min_by_key(|w| w.due_at) else {
         return Ok(None);
@@ -129,5 +133,65 @@ pub fn schedule_wake(fleet: &FleetStore, node: Uuid, scheduler: &dyn Scheduler, 
         .schedule(next.id, sandbox, next.due_at)
         .with_context(|| format!("scheduling the wake for wait {}", next.id))?;
     tracing::info!(wait = %next.id, at = next.due_at, "wake scheduled");
-    Ok(Some(next.due_at))
+    Ok(Some((next.id, next.due_at)))
+}
+
+/// The file in the supervisor's state directory naming the wait whose wake
+/// is scheduled, so a wake left over (its wait was satisfied another way, or
+/// a sooner one was scheduled instead) can be cancelled.
+pub const SCHEDULED_FILE: &str = "scheduled-wake";
+
+fn load_scheduled(state_dir: &Path) -> Option<Uuid> {
+    let raw = std::fs::read_to_string(state_dir.join(SCHEDULED_FILE)).ok()?;
+    Uuid::parse_str(raw.trim()).ok()
+}
+
+fn save_scheduled(state_dir: &Path, id: Option<Uuid>) -> Result<()> {
+    let path = state_dir.join(SCHEDULED_FILE);
+    match id {
+        Some(id) => std::fs::write(&path, id.to_string()).with_context(|| format!("write {}", path.display())),
+        None => match std::fs::remove_file(&path) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                Err(e).with_context(|| format!("remove {}", path.display()))
+            }
+            _ => Ok(()),
+        },
+    }
+}
+
+/// Makes the scheduled wake match the node's waits: schedules the soonest
+/// (see [`schedule_wake`]), and cancels the one scheduled before it when
+/// that was for another wait, or when nothing is left to wait on. A
+/// cancel that fails is only logged: a stale wake is a harmless poke.
+/// Returns the wait and time scheduled.
+pub fn reconcile_wake(
+    fleet: &FleetStore,
+    node: Uuid,
+    scheduler: &dyn Scheduler,
+    sandbox: &str,
+    state_dir: &Path,
+) -> Result<Option<(Uuid, i64)>> {
+    let before = load_scheduled(state_dir);
+    let next = schedule_next(fleet, node, scheduler, sandbox)?;
+    if let Some(old) = before.filter(|old| Some(*old) != next.map(|(id, _)| id)) {
+        match scheduler.cancel(old) {
+            Ok(()) => tracing::info!(wait = %old, "stale wake cancelled"),
+            Err(err) => tracing::warn!(wait = %old, "cancelling a stale wake: {err:#}"),
+        }
+    }
+    save_scheduled(state_dir, next.map(|(id, _)| id))?;
+    Ok(next)
+}
+
+/// Cancels the wake scheduled for this node, if any: it has work now, and
+/// will schedule what it needs when it stops.
+pub fn cancel_scheduled(scheduler: &dyn Scheduler, state_dir: &Path) -> Result<()> {
+    if let Some(old) = load_scheduled(state_dir) {
+        match scheduler.cancel(old) {
+            Ok(()) => tracing::info!(wait = %old, "scheduled wake cancelled"),
+            Err(err) => tracing::warn!(wait = %old, "cancelling the scheduled wake: {err:#}"),
+        }
+        save_scheduled(state_dir, None)?;
+    }
+    Ok(())
 }

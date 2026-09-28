@@ -14,6 +14,7 @@ pub mod fix;
 pub mod handoff;
 pub mod implement;
 pub mod incoming;
+pub mod launch;
 pub mod mock;
 pub mod phase;
 pub mod pr;

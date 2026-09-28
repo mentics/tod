@@ -451,6 +451,7 @@ mod tests {
             resume_session_id: resume_session_id.map(str::to_string),
             opening,
             message: message.into(),
+            images: Vec::new(),
             purpose,
             env: vec![("TOD_INTERVIEW_ACTOR".into(), "actor-1".into())],
             environment: crate::AgentEnvironment::Host,

@@ -146,17 +146,18 @@ What a poke does with `tod-supervisor` (`crates/tod-supervisor`):
 - **Starting it.** If no supervisor the relay itself started is still
   running, it runs `--supervisor-cmd` (default
   `/opt/tod/tod-supervisor wake --workspace /workspace/repo`) as a plain
-  process — **not** `keepAlive`: the supervisor decides for itself whether
-  there is work, and if so takes its own hold through
-  [`POST /hold`](#post-hold-post-release). If there is nothing to do it just
-  exits.
+  process — **not** `keepAlive`: the supervisor takes its own hold through
+  [`POST /hold`](#post-hold-post-release) as soon as it starts (syncing its
+  copy of the database can take longer than the poke's hold), looks for
+  work, and releases the hold when it exits, at once if there is nothing to
+  do.
 - **Signalling it.** If a supervisor the relay started is still running (its
   pid is tracked from when it was started), a poke instead sends it
   `SIGUSR1`, so it looks again now rather than waiting for its next schedule.
 - **The bridge.** Either way, a poke first takes a 60 s leased hold of its
   own (reason `poke`) before starting or signalling anything, so the sandbox
-  cannot go back to standby in the moment before the supervisor decides
-  whether to take its own hold. It lapses on its own unless another poke
+  cannot go back to standby in the moment before the supervisor has taken
+  its own hold. It lapses on its own unless another poke
   renews it — a poke is not a substitute for the supervisor's own hold once
   it has real work.
 

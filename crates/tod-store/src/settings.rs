@@ -191,6 +191,68 @@ fn default_answered_history_cap() -> u32 {
     DEFAULT_ANSWERED_HISTORY_CAP
 }
 
+/// How long a connection to a cloud sandbox stays open with nothing
+/// happening on it. An open connection keeps the sandbox awake, and Blaxel
+/// puts it in standby about 13.5 s after the last one closes, so each of
+/// these adds to how long an idle sandbox is paid for. Reopening costs a
+/// reattach (about 0.1 s) while the sandbox is still awake, or a wake (about
+/// 0.5 s) after. Read by `tod-sandbox` and, through `tod-sandbox
+/// connect-info`, by the Zed shim; their flags and environment variables
+/// override it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SandboxIdleSettings {
+    /// A terminal with no input, no output, and no foreground job closes its
+    /// connection after this long (`tod-sandbox shell --park`,
+    /// `TOD_TERMINAL_PARK_SECS`). 0 never closes it.
+    #[serde(default = "default_terminal_park_secs")]
+    pub terminal_park_secs: u64,
+    /// Zed's connection closes after this long with no message either way
+    /// (`TOD_ZED_PARK_SECS`). While closed, what the server sends on its own
+    /// (diagnostics, changed files) waits for Zed's next message. 0 never
+    /// closes it.
+    #[serde(default = "default_zed_park_secs")]
+    pub zed_park_secs: u64,
+    /// An agent's connection closes after this long with no turn and no
+    /// request open (`tod-sandbox agent --idle`).
+    #[serde(default = "default_agent_idle_secs")]
+    pub agent_idle_secs: u64,
+}
+
+pub const DEFAULT_TERMINAL_PARK_SECS: u64 = 3;
+pub const DEFAULT_ZED_PARK_SECS: u64 = 10;
+pub const DEFAULT_AGENT_IDLE_SECS: u64 = 3;
+
+impl Default for SandboxIdleSettings {
+    fn default() -> Self {
+        Self {
+            terminal_park_secs: DEFAULT_TERMINAL_PARK_SECS,
+            zed_park_secs: DEFAULT_ZED_PARK_SECS,
+            agent_idle_secs: DEFAULT_AGENT_IDLE_SECS,
+        }
+    }
+}
+
+impl SandboxIdleSettings {
+    /// The data root's settings, or the defaults if they cannot be read.
+    pub fn load(data_root: &Path) -> Self {
+        TodSettings::load_from_path(&data_root.join(crate::paths::SETTINGS_FILE))
+            .map(|settings| settings.sandbox_idle)
+            .unwrap_or_default()
+    }
+}
+
+fn default_terminal_park_secs() -> u64 {
+    DEFAULT_TERMINAL_PARK_SECS
+}
+
+fn default_zed_park_secs() -> u64 {
+    DEFAULT_ZED_PARK_SECS
+}
+
+fn default_agent_idle_secs() -> u64 {
+    DEFAULT_AGENT_IDLE_SECS
+}
+
 fn default_log_level() -> LogLevel {
     LogLevel::Info
 }
@@ -463,6 +525,9 @@ pub struct TodSettings {
     /// How lifecycle phases are judged done.
     #[serde(default)]
     pub lifecycle: LifecycleSettings,
+    /// How long idle connections to cloud sandboxes stay open.
+    #[serde(default)]
+    pub sandbox_idle: SandboxIdleSettings,
 }
 
 /// The Treehouse executable when none is configured: found on PATH.
@@ -492,6 +557,7 @@ impl Default for TodSettings {
             window_geometry: None,
             journeys: JourneySettings::default(),
             lifecycle: LifecycleSettings::default(),
+            sandbox_idle: SandboxIdleSettings::default(),
         }
     }
 }
@@ -703,6 +769,26 @@ mod tests {
     use std::fs;
 
     #[test]
+    fn sandbox_idle_reads_the_data_roots_settings_and_defaults_what_is_missing() {
+        let dir = std::env::temp_dir().join(format!("tod-sandbox-idle-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        assert_eq!(SandboxIdleSettings::load(&dir), SandboxIdleSettings::default());
+
+        fs::write(dir.join(crate::paths::SETTINGS_FILE), "sandbox_idle:
+  zed_park_secs: 25
+").unwrap();
+        let idle = SandboxIdleSettings::load(&dir);
+        assert_eq!(idle.zed_park_secs, 25);
+        assert_eq!(idle.terminal_park_secs, DEFAULT_TERMINAL_PARK_SECS);
+        assert_eq!(idle.agent_idle_secs, DEFAULT_AGENT_IDLE_SECS);
+
+        fs::write(dir.join(crate::paths::SETTINGS_FILE), "sandbox_idle: [not, a, map]
+").unwrap();
+        assert_eq!(SandboxIdleSettings::load(&dir), SandboxIdleSettings::default());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn journeys_can_submit_only_when_sending_with_a_valid_relay_code() {
         let (_identity, recipient) = tod_journey::seal::generate_test_identity();
         let code = tod_journey::relay_code::RelayCode {
@@ -831,6 +917,7 @@ mod tests {
             lifecycle: LifecycleSettings {
                 independent_evaluation: false,
             },
+            sandbox_idle: SandboxIdleSettings::default(),
         };
         settings.save_to_path(&path).unwrap();
         let loaded = TodSettings::load_from_path(&path).unwrap();

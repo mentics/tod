@@ -143,6 +143,7 @@ fn config(fx: &Fixture) -> ConversationConfig {
         )
         .unwrap(),
         launch: AgentLaunchOptions::for_platform(AgentPlatform::Claude),
+        settings_path: None,
         context: InterviewContextSettings {
             context_budget_tokens: 1_000_000,
             ..Default::default()
@@ -258,6 +259,8 @@ fn takes_a_node_from_proposed_to_done() {
     assert_eq!(saved.outcome, Some(Outcome::Done));
     assert_eq!(&saved, pilot.state());
     assert_eq!(saved.current, None);
+    // Every finished step's session was ended, not left holding an agent.
+    assert!(agent.sessions.is_empty(), "{:?}", agent.sessions.keys().collect::<Vec<_>>());
 }
 
 #[test]

@@ -61,8 +61,10 @@ So the script picks, in order:
   (override with `TOD_SANDBOX_BUILD_IMAGE`), where musl is the native
   target and OpenSSL is linked statically, builds all five. The repository
   is mounted read-only; cargo's target directory, registry, and git
-  checkouts live in Docker volumes (`tod-sandbox-target`,
-  `tod-sandbox-cargo`, `tod-sandbox-cargo-git`), so the host's `target/` is
+  checkouts live in Docker volumes (`tod-sandbox-target-<checkout>`, one
+  per checkout, since cargo would otherwise reuse another worktree's build of
+  a crate whose files here are older; `tod-sandbox-cargo`,
+  `tod-sandbox-cargo-git`), so the host's `target/` is
   untouched but for the binaries copied to `target/sandbox/`, and later
   builds are incremental. The first build takes about 15 minutes (it
   fetches the workspace's git dependencies, gpui's included, to resolve it);
@@ -210,7 +212,8 @@ the real `ssh`, so Zed's ordinary SSH remotes are unaffected.
 While Zed is open and idle, its connection is parked and the sandbox sleeps.
 The first action after a sleep wakes it in about 0.7 s. Zed's terminals are
 parked the same way when they are idle, and stay attached while a command
-runs in them.
+runs in them. How long each waits before parking (Zed 10 s, terminals and
+agents 3 s) is in Settings → Advanced.
 
 **tod assumes it is the only thing that starts Zed.** Windows Zed is
 single-instance, so a Zed that was already open (started from the Start menu,
@@ -234,23 +237,50 @@ The sandbox that holds each user's database for autonomous nodes and runs
 their `tod-cli` commands: `tod-sandbox orchestrator` sets it up. See
 [orchestrator.md](orchestrator.md).
 
+Settings for autonomous nodes in `sandboxes.toml` (none is needed):
+
+```toml
+scheduler = "blaxel"                        # who wakes a waiting node: "orchestrator" (default) or "blaxel"
+
+[blaxel]
+orchestrator = "tod-orchestrator"           # the orchestrator sandbox's name (default)
+orchestrator_volume = "tod-orchestrator-data" # keep its /data on a volume (see orchestrator.md)
+node_base = "tod-node-base"                 # fork node sandboxes from this base (needs forking)
+```
+
+`scheduler = "blaxel"` has each node's supervisor schedule its own wake on
+its sandbox (a Blaxel schedule; the workspace needs sandbox schedules, and
+the node's proxy adds the token, so prefer an API key, whose token does not
+expire); `"orchestrator"` has the orchestrator's timer poke it. It is read
+when a node's sandbox is created. `node_base` makes a base sandbox with the
+relay, supervisor, and bundles once (again when any of them, the
+credentials, the image, or the orchestrator change) and forks each new node
+from it; where forking is refused, nodes are created from the image as
+without it, so leave it unset there, or the base sits unused. See
+[autonomous-nodes.md](autonomous-nodes.md), Development account.
+
 ## Running a node in the cloud without the window
 
 `cargo run -p tod-core --example cloud_dev -- <data_root> run <node>` does
 what the app's "Run in the cloud" does (`cloud_sync::run_in_cloud`): seed the
 orchestrator, create the node's sandbox with its proxy rules, install the
-relay, the `tod-cli` shim, the supervisor, and the process and media
-bundles, check out the node's branch (its commits authored by your git
+relay, the `tod-cli` shim, the supervisor, the process and media
+bundles, and the Claude agent adapter when the image lacks it, check out the node's branch (its commits authored by your git
 `user.name`/`user.email`: the node repository's own if it is on this
 machine, else your global one), and poke it. `... sync` sends the
-outbox and pulls the node's progress back; `... init` makes a list `cloud` in
-a fresh data root to create a test node in with `tod-cli`. Build the sandbox
-binaries first, and never point it at a data root the app has open.
+outbox and pulls the node's progress back; `... answer <decision> <option>`
+answers one of the node's pending decisions (as the task panel would; `sync`
+sends it); `... init` makes a list `cloud` in
+a fresh data root, and `... node <title> <repo> <branch> <step>...` a node
+in it (`active`, with Files on the repository, an HTTPS URL or a checkout,
+and one plan step per argument), printing its UUID. Build the sandbox
+binaries first, and never point it at a data root the app has open. Each
+run reports how long the sandbox took to come up and to be provisioned.
 
 The node's supervisor runs Claude unless `TOD_CLOUD_AGENT=mock` is set when
 the sandbox is created (it becomes the sandbox's `TOD_SUPERVISOR_AGENT`). In a
 mock run, a plan step whose body starts `wait 3m: …` records a wait of that
-long, so the orchestrator's timer wakes the node. A line `write <path>:
+long, so the node sleeps until its scheduler wakes it. A line `write <path>:
 <text>` in a step makes the mock write that file in the checkout when it
 closes the step (so the pushed branch differs from its base), and a line
 `open pr: <title>` in any step makes its `pr` turn open a real pull request

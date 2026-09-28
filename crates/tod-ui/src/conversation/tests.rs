@@ -539,6 +539,7 @@ fn append_turn(
                 body: body.into(),
                 parts,
                 sent_context: None,
+                attachments: Vec::new(),
             },
         )
         .unwrap();
@@ -2270,6 +2271,7 @@ fn a_lifecycle_run_starts_off_the_main_thread(cx: &mut TestAppContext) {
         data_root: fixture.store.paths().root().to_path_buf(),
         media: tod_core::media::MediaPaths::discover().expect("media paths"),
         launch: tod_agent::AgentLaunchOptions::for_platform(tod_agent::AgentPlatform::Claude),
+        settings_path: None,
         context: Default::default(),
     };
     view.update(cx, |view, cx| {

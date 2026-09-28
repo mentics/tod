@@ -238,7 +238,9 @@ fn leave_it_stopped_after_failures_keeps_the_node_stopped() {
     let (relay, seen) = fake_relay();
     let woke = wake_once(&s, relay, 30);
     assert!(matches!(woke, Woke::LeftStopped(_)), "{woke:?}");
-    assert!(seen.lock().unwrap().is_empty(), "no hold: nothing ran");
+    // Held only while it looked: released before going back to sleep.
+    let seen = seen.lock().unwrap().clone();
+    assert!(seen.last().is_some_and(|l| l.starts_with("POST /release?reason=supervisor ")), "{seen:?}");
     assert_eq!(count(&s.remote_db, "SELECT COUNT(*) FROM conversation_turns"), turns);
     // And it asked nothing more.
     assert_eq!(count(&s.remote_db, "SELECT COUNT(*) FROM decisions"), 1);

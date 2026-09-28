@@ -161,7 +161,14 @@ the opening context and the message as one turn; every later message sends only
 the *delta* (the user's own edits and reversals since the previous turn, and
 items changed elsewhere) plus the message. When the session outgrows
 `context_budget_tokens`, or can no longer be resumed, the driver rotates to a fresh session seeded with a snapshot, and
-the transcript shows a "Started a fresh agent session" marker. **Reply rule:**
+the transcript shows a "Started a fresh agent session" marker. An image
+pasted into the input (`ui::pasted_image`, caught ahead of the input's own
+`Paste`) is attached to the message being written, not sent: it goes out with
+the next Send as an ACP image block (refused by an agent whose
+`promptCapabilities.image` is not set), and is kept on the user turn
+(`conversation_turns.attachments`, schema v73; the files are under
+`<data root>/conversation-attachments/`), so the transcript shows it and a
+rotation after a failed resume sends it again. **Reply rule:**
 the agent never describes what it changed — the user sees the change set — so
 an empty reply is normal (shown as "Done, no notes"); `surface/conversation.md`
 states this, and that the agent acts without confirming because everything is

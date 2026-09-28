@@ -153,6 +153,10 @@ pub async fn run(url: &str, token: &str, opts: TerminalOptions) -> Result<i32> {
                         (opts.log)(&format!("terminal {session}: parked"));
                     }
                 }
+                // Ready for the next keypress (`edge`).
+                if ws.is_none() {
+                    crate::edge::keep_spares(url);
+                }
             }
         }
     }

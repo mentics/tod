@@ -19,6 +19,7 @@ use tod_store::fleet::ResolvedFiles;
 use tod_store::fleet::node_actions::resolve_files_for_node;
 use tod_store::fleet::repositories::{NodeRepositories, node_repositories};
 use tod_store::github::{self, GithubError, GithubRepo, NodePr, NodePrRepo, PullSummary};
+use tod_store::outline::repos::NodeRepo;
 use uuid::Uuid;
 
 /// What one repository's section of the list says.
@@ -129,8 +130,18 @@ pub struct PullsTarget {
 
 /// Read `node_id`'s [`PullsTarget`].
 pub fn read_target(conn: &Connection, node_id: Uuid) -> anyhow::Result<PullsTarget> {
+    let mut files = resolve_files_for_node(conn, &node_id.to_string())?;
+    // A cloud node's repository is a URL, with no checkout here to read the
+    // branch from; with none configured, its work is on a branch named after
+    // the node, as `cloud_sync` starts it.
+    if let Some(files) = files.as_mut()
+        && files.repo_url().is_some()
+        && files.branch().is_none()
+    {
+        files.branch = NodeRepo::new(conn).get(node_id)?.map(|node| node.slug);
+    }
     Ok(PullsTarget {
-        files: resolve_files_for_node(conn, &node_id.to_string())?,
+        files,
         recorded: NodePrRepo::new(conn).get(node_id)?,
     })
 }
@@ -352,7 +363,7 @@ mod tests {
     fn node_repo(path: &str, github: Option<GithubRepo>) -> NodeRepository {
         NodeRepository {
             path: path.into(),
-            dir: Workdir::host(format!("/work/{path}")),
+            dir: Some(Workdir::host(format!("/work/{path}"))),
             remote_url: github
                 .as_ref()
                 .map(|g| format!("https://github.com/{g}.git"))
@@ -494,6 +505,61 @@ mod tests {
             RepoPulls::Listed(vec![pull(4, "someone/else")])
         );
         assert_eq!(found.scope, PullScope::AllOpen);
+    }
+
+    /// A cloud node's Files directory is its repository's URL: its pull
+    /// requests come from that repository, on the branch named after the
+    /// node, with no checkout on this machine.
+    #[test]
+    fn a_cloud_nodes_repository_url_needs_no_checkout() {
+        use tod_store::fleet::{FleetMutation, FleetStore};
+        use tod_store::outline::{Capability, CreatePosition, OutlineMutation};
+        let root = std::env::temp_dir().join(format!("tod-pulls-{}", Uuid::new_v4()));
+        let fleet = FleetStore::open(&root).unwrap();
+        fleet
+            .enqueue_outline(OutlineMutation::CreateList { slug: "t".into(), title: "T".into() })
+            .unwrap();
+        let list_id = fleet.list_outline_lists().unwrap()[0].id;
+        let node = Uuid::new_v4();
+        fleet
+            .enqueue_outline(OutlineMutation::CreateNode {
+                node_id: Some(node),
+                list_id,
+                parent_id: None,
+                anchor_id: None,
+                position: CreatePosition::Below,
+                title: "Cloud node".into(),
+            })
+            .unwrap();
+        fleet
+            .enqueue_outline(OutlineMutation::EnableCapabilities {
+                node_id: node,
+                capabilities: vec![Capability::Files],
+            })
+            .unwrap();
+        fleet
+            .enqueue(FleetMutation::UpdateTaskRepo {
+                id: node.to_string(),
+                repo: Some("https://github.com/mentics/test-repo".into()),
+            })
+            .unwrap();
+        fleet.writer().flush().unwrap();
+
+        let target = fleet.read(|conn| read_target(conn, node)).unwrap();
+        let slug = fleet
+            .read(|conn| Ok(NodeRepo::new(conn).get(node)?.unwrap().slug))
+            .unwrap();
+        let fake = Fake {
+            by_repo: vec![(repo("mentics", "test-repo"), Ok(vec![pull(3, &slug)]))],
+            ..Fake::default()
+        };
+        let found = load_with(target, PullScope::Branch, &fake).unwrap();
+        assert_eq!(found.branch.as_deref(), Some(slug.as_str()));
+        assert_eq!(*fake.asked.lock().unwrap(), vec![format!("mentics/test-repo@{slug}")]);
+        assert_eq!(found.sections.len(), 1);
+        assert_eq!(found.sections[0].pulls, RepoPulls::Listed(vec![pull(3, &slug)]));
+        drop(fleet);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

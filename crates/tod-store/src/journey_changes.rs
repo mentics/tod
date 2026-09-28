@@ -45,7 +45,7 @@
 //!   trigger is created by [`request_feedback_triggers_sql`] in the v72
 //!   migration step that creates the table.
 //! - `phase_events` (`tod_store::phase`; insert-only, the log is
-//!   append-only), created by [`phase_events_triggers_sql`] in the v73
+//!   append-only), created by [`phase_events_triggers_sql`] in the v74
 //!   migration step that creates the table.
 //!
 //! Deliberately excluded, with reasons:

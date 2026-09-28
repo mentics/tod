@@ -242,6 +242,16 @@ struct Target {
     name: String,
     ws: String,
     token: String,
+    /// Idle times from Settings, Advanced; see [`park_secs`].
+    terminal_park_secs: Option<u64>,
+    zed_park_secs: Option<u64>,
+}
+
+/// How long a connection idles before it is parked: the environment variable
+/// if set (for testing), else what `tod-sandbox connect-info` gave, else
+/// `default` (tod's own default, for a `tod-sandbox` that gives none).
+fn park_secs(var: &str, configured: Option<u64>, default: u64) -> u64 {
+    std::env::var(var).ok().and_then(|s| s.parse().ok()).or(configured).unwrap_or(default)
 }
 
 fn tod_sandbox() -> PathBuf {
@@ -259,7 +269,13 @@ fn target(name: &str) -> Target {
     let (Some(url), Some(token)) = (v["url"].as_str(), v["token"].as_str()) else {
         fail("tod-sandbox connect-info gave no url and token");
     };
-    Target { name: name.to_string(), ws: relay::ws_url(url, "/exec"), token: token.to_string() }
+    Target {
+        name: name.to_string(),
+        ws: relay::ws_url(url, "/exec"),
+        token: token.to_string(),
+        terminal_park_secs: v["terminal_park_secs"].as_u64(),
+        zed_park_secs: v["zed_park_secs"].as_u64(),
+    }
 }
 
 /// Connects to the relay; if that fails, has `tod-sandbox` bring the sandbox
@@ -373,7 +389,7 @@ async fn exec(t: Target, cmd: String) -> i32 {
 
 async fn tty(t: Target, cmd: String) -> i32 {
     drop(connect(&t).await);
-    let park = std::env::var("TOD_TERMINAL_PARK_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(60u64);
+    let park = park_secs("TOD_TERMINAL_PARK_SECS", t.terminal_park_secs, 3);
     log(&format!("{}: terminal {}", t.name, &cmd[..cmd.len().min(100)]));
     let opts = TerminalOptions {
         cmd: (!cmd.trim().is_empty()).then_some(cmd),
@@ -392,9 +408,10 @@ async fn tty(t: Target, cmd: String) -> i32 {
 // `attach!` also runs just before a return, where its bookkeeping goes unread.
 #[allow(unused_assignments)]
 async fn proxy(t: Target, cmd: String) -> i32 {
-    let park_after = Duration::from_secs(
-        std::env::var("TOD_ZED_PARK_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(30),
-    );
+    // 0 never parks.
+    let park_after = Some(park_secs("TOD_ZED_PARK_SECS", t.zed_park_secs, 10))
+        .filter(|&secs| secs > 0)
+        .map(Duration::from_secs);
     let session = format!(
         "zed-{}-{}",
         std::process::id(),
@@ -505,10 +522,17 @@ async fn proxy(t: Target, cmd: String) -> i32 {
                 }
             }
             _ = tick.tick() => {
+                // Ready for Zed's next message (`tod_sandbox::edge`).
+                if ws.is_none() {
+                    tod_sandbox::edge::keep_spares(&t.ws);
+                }
                 let hold = held_awake(&hold_flag);
                 if hold && ws.is_none() { attach!(again, "tod: sandbox busy"); }
                 if hold { last_real = Instant::now(); }
-                if ws.is_some() && last_real.elapsed() >= park_after && from_server.is_empty() {
+                if ws.is_some()
+                    && park_after.is_some_and(|after| last_real.elapsed() >= after)
+                    && from_server.is_empty()
+                {
                     let _ = ws.as_mut().unwrap().close(None).await;
                     ws = None;
                     log(&format!("{}: parked after {}s idle", t.name, last_real.elapsed().as_secs()));

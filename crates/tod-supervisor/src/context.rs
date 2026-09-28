@@ -105,6 +105,7 @@ pub fn take<A: AgentAccess + ?Sized>(
                 body: note,
                 parts: Vec::new(),
                 sent_context: None,
+                attachments: Vec::new(),
             },
         )?;
     }

@@ -20,7 +20,7 @@ use crate::unified::panel::ColumnPanel;
 /// What the transcript panel shows about a turn — mirrors
 /// `conversation/transcript.rs::entry_of`, without the gate-check YAML
 /// summarizing this read-only view has no protocol context for.
-fn entry_of(turn: &Turn) -> Entry {
+fn entry_of(turn: &Turn, root: &std::path::Path) -> Entry {
     if turn.role == TurnRole::Continuation {
         return Entry::raw(true, "Sent automatically", turn.body.clone());
     }
@@ -36,6 +36,7 @@ fn entry_of(turn: &Turn) -> Entry {
         label: None,
         summary: None,
         live: false,
+        images: turn.attachments.iter().map(|a| a.path(root)).collect(),
     }
 }
 
@@ -95,7 +96,8 @@ impl TranscriptPanel {
                 anyhow::Ok((turns, session_name))
             })
             .unwrap_or_default();
-        let entries: Vec<Entry> = turns.iter().map(entry_of).collect();
+        let root = self.fleet.paths().root();
+        let entries: Vec<Entry> = turns.iter().map(|turn| entry_of(turn, root)).collect();
         self.title = session_name.unwrap_or_else(|| "Transcript".to_string()).into();
         self.panel.update(cx, |panel, cx| {
             panel.set_title(self.title.clone(), cx);
@@ -168,6 +170,7 @@ mod tests {
                     body: "Add offline support".into(),
                     parts: Vec::new(),
                     sent_context: None,
+                    attachments: Vec::new(),
                 },
             )
             .unwrap();
@@ -181,6 +184,7 @@ mod tests {
                     body: "Done".into(),
                     parts: Vec::new(),
                     sent_context: None,
+                    attachments: Vec::new(),
                 },
             )
             .unwrap();

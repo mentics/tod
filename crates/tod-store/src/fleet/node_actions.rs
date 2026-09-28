@@ -53,6 +53,19 @@ fn non_empty(value: &Option<String>) -> Option<&str> {
     value.as_deref().map(str::trim).filter(|v| !v.is_empty())
 }
 
+/// A git remote URL (`https://…`, `ssh://…`, `git@host:owner/repo`) rather
+/// than a path. A Windows path (`C:\src`, `C:/src`) has no `@` before its
+/// colon, so it is not one.
+fn is_remote_url(value: &str) -> bool {
+    if value.contains("://") {
+        return true;
+    }
+    match value.split_once(':') {
+        Some((user_host, _)) => user_host.contains('@') && !user_host.contains(['/', '\\']),
+        None => false,
+    }
+}
+
 impl ResolvedFiles {
     pub fn repo(&self) -> Option<&str> {
         non_empty(&self.repo)
@@ -60,6 +73,13 @@ impl ResolvedFiles {
 
     pub fn branch(&self) -> Option<&str> {
         non_empty(&self.branch)
+    }
+
+    /// The workspace directory when it is a git remote URL rather than a
+    /// directory: an autonomous cloud node's repository, which is cloned in
+    /// the node's sandbox and has no checkout on this machine.
+    pub fn repo_url(&self) -> Option<&str> {
+        self.repo().filter(|repo| is_remote_url(repo))
     }
 
     /// A worktree has been set up and recorded.

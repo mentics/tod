@@ -48,7 +48,7 @@ pub const CLOUD_AGENT_ENV: &str = "TOD_CLOUD_AGENT";
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CloudSyncState {
     /// The orchestrator's base URL; else [`ORCHESTRATOR_URL_ENV`], else the
-    /// `tod-orchestrator` sandbox's `/port/8090`.
+    /// orchestrator sandbox's `/port/8090` (`sandboxes.toml`'s `orchestrator`).
     #[serde(default)]
     pub orchestrator_url: Option<String>,
     /// The user name on the orchestrator; else the Blaxel account's owner,
@@ -438,7 +438,7 @@ pub fn spawn_outbox_pusher(fleet: std::sync::Arc<FleetStore>) {
 
 /// The orchestrator and user this data root syncs with: the URL (from the
 /// state file, [`ORCHESTRATOR_URL_ENV`], or the workspace's
-/// `tod-orchestrator` sandbox) and, for a sandbox URL, the Blaxel token.
+/// orchestrator sandbox, `sandboxes.toml`'s `orchestrator`) and, for a sandbox URL, the Blaxel token.
 pub fn resolve(root: &Path) -> Result<(HttpOrchestrator, String)> {
     let state = CloudSyncState::load(root)?;
     let sandboxes = tod_store::fleet::sandbox::Sandboxes::load(root);
@@ -461,8 +461,9 @@ pub fn resolve(root: &Path) -> Result<(HttpOrchestrator, String)> {
     }
     let mut sandboxes = sandboxes?;
     let bx = sandboxes.blaxel()?;
+    let name = sandboxes.account()?.orchestrator.clone();
     let url = sandboxes
-        .url(&bx, tod_sandbox::orchestrator::NAME)
+        .url(&bx, &name)
         .context("find the orchestrator (run `tod-sandbox orchestrator` first)")?;
     let base = format!("{}/port/{}", url.trim_end_matches('/'), tod_sandbox::orchestrator::PORT);
     Ok((HttpOrchestrator::new(base, Some(bx.token().to_string())).with_client(client_id(root)?), user))
@@ -594,7 +595,7 @@ pub fn ensure_node_sandbox(
     let account = sandboxes.account()?.clone();
     let bx = sandboxes.blaxel()?;
     let orchestrator_url = sandboxes
-        .url(&bx, tod_sandbox::orchestrator::NAME)
+        .url(&bx, &account.orchestrator)
         .context("find the orchestrator sandbox")?;
     let orchestrator_host = orchestrator_url
         .trim_start_matches("https://")
@@ -633,26 +634,9 @@ pub fn ensure_node_sandbox(
         orchestrator_cli_url: &cli_url,
         agent: agent.as_deref(),
         claude_via: account.claude_token_via,
+        scheduler: sandboxes.config.scheduler,
+        workspace: &account.workspace,
     };
-    let existing = bx.get(&name)?;
-    if let Some(info) = &existing
-        && sandbox_is_dead(info)
-    {
-        progress(&format!("removing the dead sandbox {name} ({})…", info.status));
-        bx.delete(&name)?;
-        let deadline = std::time::Instant::now() + Duration::from_secs(120);
-        while bx.get(&name)?.is_some() && std::time::Instant::now() < deadline {
-            std::thread::sleep(Duration::from_secs(2));
-        }
-    }
-    if existing.as_ref().is_none_or(sandbox_is_dead) {
-        progress(&format!("creating sandbox {name}…"));
-        node::create(&bx, &spec, &credentials)?;
-    }
-    progress(&format!("waiting for {name}…"));
-    let info = bx.wait_deployed(&name, Duration::from_secs(300))?;
-    let url = info.url.clone().ok_or_else(|| anyhow!("sandbox {name} has no URL"))?;
-
     let relay_path = tod_store::fleet::sandbox::relay_path()?;
     let relay = std::fs::read(&relay_path).with_context(|| format!("read {}", relay_path.display()))?;
     let supervisor = relay_path.parent().and_then(node::supervisor_from);
@@ -668,6 +652,8 @@ pub fn ensure_node_sandbox(
         )
         .context("read the media bundle")?,
     );
+    let identity = git_identity(task.repo.as_deref());
+    let supervisor_env = node::supervisor_env(&credentials, account.claude_token_via);
     let payload = node::NodePayload {
         relay: &relay,
         shim: tod_store::fleet::cli_relay::HTTP_SHIM_SCRIPT.as_bytes(),
@@ -675,14 +661,66 @@ pub fn ensure_node_sandbox(
         supervisor: supervisor.as_deref(),
         repo_url: &repo_url,
         branch: &branch,
-        git_identity: &git_identity(task.repo.as_deref()),
+        git_identity: &identity,
         bundles: &bundles,
         // At every provisioning, so the supervisor's next start has the
         // token as it is now (with `claude_token_via = "env"`).
-        supervisor_env: &node::supervisor_env(&credentials, account.claude_token_via),
+        supervisor_env: &supervisor_env,
     };
-    progress("installing the relay and supervisor…");
-    node::provision(&bx, &url, &payload, progress)?;
+
+    let started = std::time::Instant::now();
+    let existing = bx.get(&name)?;
+    if let Some(info) = &existing
+        && sandbox_is_dead(info)
+    {
+        progress(&format!("removing the dead sandbox {name} ({})…", info.status));
+        bx.delete(&name)?;
+        let deadline = std::time::Instant::now() + Duration::from_secs(120);
+        while bx.get(&name)?.is_some() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_secs(2));
+        }
+    }
+    let mut forked = false;
+    if existing.as_ref().is_none_or(sandbox_is_dead) {
+        if let Some(base) = account.node_base.as_deref().filter(|b| !b.is_empty()) {
+            match fork_from_base(&bx, root, base, &spec, &credentials, &payload, progress) {
+                Ok(()) => forked = true,
+                Err(err) => {
+                    progress(&format!("could not fork from {base} ({err:#}); creating {name} instead…"));
+                    // A fork that got as far as making the sandbox is not
+                    // one to keep: it may be only partly there.
+                    if bx.get(&name).ok().flatten().is_some() {
+                        bx.delete(&name)?;
+                        let deadline = std::time::Instant::now() + Duration::from_secs(120);
+                        while bx.get(&name)?.is_some() && std::time::Instant::now() < deadline {
+                            std::thread::sleep(Duration::from_secs(2));
+                        }
+                    }
+                }
+            }
+        }
+        if !forked {
+            progress(&format!("creating sandbox {name}…"));
+            node::create(&bx, &spec, &credentials)?;
+        }
+    }
+    progress(&format!("waiting for {name}…"));
+    let info = bx.wait_deployed(&name, Duration::from_secs(300))?;
+    let url = info.url.clone().ok_or_else(|| anyhow!("sandbox {name} has no URL"))?;
+    progress(&format!("{name} is up after {:.1}s", started.elapsed().as_secs_f64()));
+
+    if forked {
+        // The base has everything but the node's own checkout and processes.
+        node::start(&bx, &url, &payload, progress)?;
+    } else {
+        progress("installing the relay and supervisor…");
+        node::provision(&bx, &url, &payload, progress)?;
+    }
+    progress(&format!(
+        "{name} {} and provisioned after {:.1}s",
+        if forked { "forked" } else { "created" },
+        started.elapsed().as_secs_f64()
+    ));
 
     progress("waking the node…");
     let poke = format!("{}/port/{}/poke", url.trim_end_matches('/'), tod_sandbox::blaxel::RELAY_PORT);
@@ -698,6 +736,36 @@ pub fn ensure_node_sandbox(
     }
     let _ = sandboxes.save();
     Ok(name)
+}
+
+/// Where the fingerprint of the base nodes are forked from is kept
+/// (`tod_sandbox::node::base_fingerprint`): it covers the credentials in the
+/// base's proxy, so it is kept here rather than on the base.
+fn base_fingerprint_path(root: &Path, base: &str) -> PathBuf {
+    root.join(format!("{base}.base-fingerprint"))
+}
+
+/// Forks `spec`'s sandbox from `base` (`sandboxes.toml`'s `node_base`),
+/// making or remaking the base first when it is missing or out of date.
+fn fork_from_base(
+    bx: &tod_sandbox::blaxel::Blaxel,
+    root: &Path,
+    base: &str,
+    spec: &tod_sandbox::node::NodeSandboxSpec,
+    creds: &tod_sandbox::node::NodeCredentials,
+    payload: &tod_sandbox::node::NodePayload,
+    progress: &mut dyn FnMut(&str),
+) -> Result<()> {
+    use tod_sandbox::node;
+    let base_spec = node::NodeSandboxSpec { name: base, node: "", ..*spec };
+    let path = base_fingerprint_path(root, base);
+    let recorded = std::fs::read_to_string(&path).ok();
+    let fingerprint = node::ensure_base(bx, &base_spec, creds, payload, recorded.as_deref().map(str::trim), progress)?;
+    if recorded.as_deref().map(str::trim) != Some(fingerprint.as_str()) {
+        std::fs::write(&path, &fingerprint).with_context(|| format!("write {}", path.display()))?;
+    }
+    progress(&format!("forking {} from {base}…", spec.name));
+    node::fork(bx, base, spec, creds)
 }
 
 /// Records that `node_id` runs in `sandbox` (clearing any lost mark) in the

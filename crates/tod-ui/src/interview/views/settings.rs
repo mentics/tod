@@ -33,7 +33,7 @@ const SIDEBAR_MIN: f32 = 140.0;
 const PANEL_MIN: f32 = 320.0;
 const SETTINGS_CONTEXT: &str = "Settings";
 
-const SECTIONS: [SettingsSection; 8] = [
+const SECTIONS: [SettingsSection; 9] = [
     SettingsSection::Agents,
     SettingsSection::Lifecycle,
     SettingsSection::QuestionMaker,
@@ -42,6 +42,7 @@ const SECTIONS: [SettingsSection; 8] = [
     SettingsSection::CloudSandboxes,
     SettingsSection::Logging,
     SettingsSection::Journeys,
+    SettingsSection::Advanced,
 ];
 
 /// Spec §9.1's first warning callout, verbatim.
@@ -117,6 +118,7 @@ enum SettingsSection {
     CloudSandboxes,
     Logging,
     Journeys,
+    Advanced,
 }
 
 impl SettingsSection {
@@ -130,6 +132,7 @@ impl SettingsSection {
             Self::CloudSandboxes => "Cloud sandboxes",
             Self::Logging => "Logging",
             Self::Journeys => "Journeys",
+            Self::Advanced => "Advanced",
         }
     }
 
@@ -143,6 +146,7 @@ impl SettingsSection {
             Self::CloudSandboxes => "cloud-sandboxes",
             Self::Logging => "logging",
             Self::Journeys => "journeys",
+            Self::Advanced => "advanced",
         }
     }
 
@@ -153,6 +157,7 @@ impl SettingsSection {
                 Agent(AgentRole::Default),
                 Agent(AgentRole::Chat),
                 Agent(AgentRole::Interview),
+                ClaudeAdapter,
                 ChatLaunchMode,
                 MaxParallelSessions,
             ],
@@ -183,6 +188,7 @@ impl SettingsSection {
                 JourneysMilestoneStates,
                 JourneysStorageCap,
             ],
+            Self::Advanced => &[SandboxTerminalPark, SandboxZedPark, SandboxAgentIdle],
         }
     }
 }
@@ -191,6 +197,8 @@ impl SettingsSection {
 enum SettingField {
     /// One line per role: platform, model, effort. `-`/`=` cycle the platform.
     Agent(AgentRole),
+    /// Claude's ACP adapter: what is installed, and installing it for tod.
+    ClaudeAdapter,
     ReplenishThreshold,
     ContextBudget,
     PromptCacheIdle,
@@ -226,6 +234,12 @@ enum SettingField {
     JourneysStorageCap,
     /// `lifecycle.independent_evaluation`.
     LifecycleIndependentEvaluation,
+    /// Seconds an idle sandbox terminal keeps its connection.
+    SandboxTerminalPark,
+    /// Seconds an idle Zed on a sandbox keeps its connection.
+    SandboxZedPark,
+    /// Seconds an idle sandbox agent keeps its connection between turns.
+    SandboxAgentIdle,
 }
 
 impl SettingField {
@@ -234,6 +248,7 @@ impl SettingField {
             Self::Agent(AgentRole::Default) => "default-agent",
             Self::Agent(AgentRole::Chat) => "chat-agent",
             Self::Agent(AgentRole::Interview) => "interview-agent",
+            Self::ClaudeAdapter => "claude-adapter",
             Self::ReplenishThreshold => "replenish",
             Self::ContextBudget => "context-budget",
             Self::PromptCacheIdle => "prompt-cache-idle",
@@ -260,6 +275,9 @@ impl SettingField {
             Self::JourneysMilestoneStates => "journeys-milestone-states",
             Self::JourneysStorageCap => "journeys-storage-cap",
             Self::LifecycleIndependentEvaluation => "lifecycle-independent-evaluation",
+            Self::SandboxTerminalPark => "sandbox-terminal-park",
+            Self::SandboxZedPark => "sandbox-zed-park",
+            Self::SandboxAgentIdle => "sandbox-agent-idle",
         }
     }
 }
@@ -409,6 +427,7 @@ pub struct SettingsView {
     _treehouse_executable_subscription: Subscription,
     _relay_code_subscription: Subscription,
     _milestone_states_subscription: Subscription,
+    _claude_adapter_subscription: Subscription,
 }
 
 impl SettingsView {
@@ -560,6 +579,8 @@ impl SettingsView {
                 .placeholder("Comma-separated lifecycle states")
                 .default_value(settings.journeys.milestone_states.join(", "))
         });
+        let claude_adapter = crate::ui::claude_adapter::state(cx);
+        let _claude_adapter_subscription = cx.observe(&claude_adapter, |_, _, cx| cx.notify());
         let _milestone_states_subscription =
             cx.subscribe(&milestone_states_input, |this, input, event, cx| {
                 if matches!(event, InputEvent::Blur | InputEvent::PressEnter { .. }) {
@@ -615,6 +636,7 @@ impl SettingsView {
             _treehouse_executable_subscription,
             _relay_code_subscription,
             _milestone_states_subscription,
+            _claude_adapter_subscription,
         }
     }
 
@@ -1069,6 +1091,26 @@ impl SettingsView {
         self.focus_region == SettingsFocus::Sidebar && self.active_section == section
     }
 
+    /// One second per step, never below 1: 0 (never close) is left to
+    /// `tod.yml`, since it keeps the sandbox awake for as long as the
+    /// terminal or Zed is open.
+    fn step_sandbox_idle(
+        &mut self,
+        field: fn(&mut tod_store::settings::SandboxIdleSettings) -> &mut u64,
+        key: &str,
+        delta: i32,
+        cx: &mut Context<Self>,
+    ) {
+        let secs = field(&mut self.settings.sandbox_idle);
+        *secs = if delta >= 0 {
+            secs.saturating_add(1)
+        } else {
+            secs.saturating_sub(1).max(1)
+        };
+        self.schedule_save(key, cx);
+        cx.notify();
+    }
+
     fn adjust_selected(&mut self, delta: i32, cx: &mut Context<Self>) {
         if self.text_editing() || self.focus_region != SettingsFocus::Panel {
             return;
@@ -1110,7 +1152,26 @@ impl SettingsView {
             }
             SettingField::JourneysRelayCode
             | SettingField::JourneysSendTest
-            | SettingField::JourneysMilestoneStates => {}
+            | SettingField::JourneysMilestoneStates
+            | SettingField::ClaudeAdapter => {}
+            SettingField::SandboxTerminalPark => self.step_sandbox_idle(
+                |idle| &mut idle.terminal_park_secs,
+                "sandbox_idle.terminal_park_secs",
+                delta,
+                cx,
+            ),
+            SettingField::SandboxZedPark => self.step_sandbox_idle(
+                |idle| &mut idle.zed_park_secs,
+                "sandbox_idle.zed_park_secs",
+                delta,
+                cx,
+            ),
+            SettingField::SandboxAgentIdle => self.step_sandbox_idle(
+                |idle| &mut idle.agent_idle_secs,
+                "sandbox_idle.agent_idle_secs",
+                delta,
+                cx,
+            ),
         }
     }
 
@@ -1142,6 +1203,7 @@ impl SettingsView {
             SettingField::JourneysRelayCode => self.enter_relay_code_edit(window, cx),
             SettingField::JourneysMilestoneStates => self.enter_milestone_states_edit(window, cx),
             SettingField::JourneysSendTest => self.send_journeys_test(cx),
+            SettingField::ClaudeAdapter => self.activate_claude_adapter(cx),
             SettingField::JourneysSend => self.toggle_journeys_send(cx),
             SettingField::JourneysIncludeTranscripts => {
                 self.toggle_journeys_include_transcripts(cx)
@@ -1402,6 +1464,24 @@ impl SettingsView {
             });
         })
         .detach();
+    }
+
+    /// Enter on the Claude adapter row: install it for tod when tod has no
+    /// install of its own, else check again.
+    fn activate_claude_adapter(&mut self, cx: &mut Context<Self>) {
+        let adapter = crate::ui::claude_adapter::state(cx);
+        let (busy, for_tod) = {
+            let adapter = adapter.read(cx);
+            (adapter.busy(), adapter.installed_for_tod())
+        };
+        if busy {
+            return;
+        }
+        if for_tod {
+            crate::ui::claude_adapter::check(cx).detach();
+        } else {
+            crate::ui::claude_adapter::install_for_tod(cx);
+        }
     }
 
     fn handle_escape(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -2099,6 +2179,7 @@ impl SettingsView {
                 for role in AgentRole::ALL {
                     rows = rows.child(agent_role_row(cx, self, role, theme));
                 }
+                rows = rows.child(claude_adapter_row(window, cx, self, theme));
                 rows = rows.child(cycle_row(
                     cx,
                     self,
@@ -2345,6 +2426,59 @@ impl SettingsView {
                     )
                 })
                 .into_any_element(),
+            SettingsSection::Advanced => {
+                use tod_store::settings::{
+                    DEFAULT_AGENT_IDLE_SECS, DEFAULT_TERMINAL_PARK_SECS, DEFAULT_ZED_PARK_SECS,
+                };
+                let idle = &self.settings.sandbox_idle;
+                let secs = |secs: u64| {
+                    if secs == 0 { "never".to_string() } else { format!("{secs} s") }
+                };
+                v_flex()
+                    .gap_1()
+                    .child(
+                        div()
+                            .px_3()
+                            .text_sm()
+                            .text_color(theme.muted_foreground)
+                            .whitespace_normal()
+                            .child("A cloud sandbox stays awake while any connection to it is open, and goes to standby about 14 s after the last one closes. These set how long an idle connection stays open. Reopening one takes about 0.1 s while the sandbox is awake, and about 0.5 s once it is in standby. Changes apply to connections opened afterward."),
+                    )
+                    .child(stepper_row(
+                        cx,
+                        self,
+                        SettingField::SandboxTerminalPark,
+                        secs(idle.terminal_park_secs),
+                        "Sandbox terminal idle",
+                        format!("A terminal with no input, no output, and no running command closes its connection after this long. A running command keeps it open. Default {DEFAULT_TERMINAL_PARK_SECS} s."),
+                        theme,
+                        |this, _, cx| this.step_sandbox_idle(|i| &mut i.terminal_park_secs, "sandbox_idle.terminal_park_secs", -1, cx),
+                        |this, _, cx| this.step_sandbox_idle(|i| &mut i.terminal_park_secs, "sandbox_idle.terminal_park_secs", 1, cx),
+                    ))
+                    .child(stepper_row(
+                        cx,
+                        self,
+                        SettingField::SandboxZedPark,
+                        secs(idle.zed_park_secs),
+                        "Sandbox Zed idle",
+                        format!("Zed's connection closes after this long with nothing sent either way. While it is closed, what the sandbox sends on its own, such as new diagnostics, waits for Zed's next request. Default {DEFAULT_ZED_PARK_SECS} s."),
+                        theme,
+                        |this, _, cx| this.step_sandbox_idle(|i| &mut i.zed_park_secs, "sandbox_idle.zed_park_secs", -1, cx),
+                        |this, _, cx| this.step_sandbox_idle(|i| &mut i.zed_park_secs, "sandbox_idle.zed_park_secs", 1, cx),
+                    ))
+                    .child(stepper_row(
+                        cx,
+                        self,
+                        SettingField::SandboxAgentIdle,
+                        secs(idle.agent_idle_secs),
+                        "Sandbox agent idle",
+                        format!("An agent's connection closes after this long between turns. The agent keeps running, and the next turn reconnects. Default {DEFAULT_AGENT_IDLE_SECS} s."),
+                        theme,
+                        |this, _, cx| this.step_sandbox_idle(|i| &mut i.agent_idle_secs, "sandbox_idle.agent_idle_secs", -1, cx),
+                        |this, _, cx| this.step_sandbox_idle(|i| &mut i.agent_idle_secs, "sandbox_idle.agent_idle_secs", 1, cx),
+                    ))
+                    .into_any_element()
+            }
             SettingsSection::Logging => v_flex()
                 .gap_1()
                 .child(read_only_row(
@@ -2977,6 +3111,136 @@ fn journeys_send_test_row(
                     .child(msg),
             ),
         })
+}
+
+/// Claude's ACP adapter: what is installed, the command that installs or
+/// updates it, and installing it for tod.
+fn claude_adapter_row(
+    window: &mut Window,
+    cx: &mut Context<SettingsView>,
+    view: &SettingsView,
+    theme: &gpui_component::Theme,
+) -> impl IntoElement {
+    use crate::ui::claude_adapter::{self, Severity};
+    let field = SettingField::ClaudeAdapter;
+    let selected = view.field_selected(field);
+    let adapter = claude_adapter::state(cx);
+    let (summary, busy, installing, for_tod, error) = {
+        let adapter = adapter.read(cx);
+        (
+            adapter.summary(),
+            adapter.busy(),
+            adapter.installing(),
+            adapter.installed_for_tod(),
+            adapter.error().map(str::to_string),
+        )
+    };
+    let (text, command, color) = match &summary {
+        Some(summary) => (
+            summary.text.clone(),
+            summary.command.clone(),
+            match summary.severity {
+                Severity::Fine => theme.muted_foreground,
+                Severity::Warning => style::color::callout_warning_text(),
+                Severity::Error => theme.danger,
+            },
+        ),
+        None => ("Checking…".into(), None, theme.muted_foreground),
+    };
+    let button_label = match (installing, for_tod, busy) {
+        (true, _, _) => "Installing…",
+        (false, true, true) => "Checking…",
+        (false, true, false) => "Check again",
+        (false, false, _) => "Install for tod only",
+    };
+    let copy_command = command.clone();
+
+    h_flex()
+        .w_full()
+        .gap_4()
+        .px_3()
+        .py_3()
+        .rounded_md()
+        .items_start()
+        .when(selected, |el| {
+            el.bg(theme.list_active)
+                .border_1()
+                .border_color(theme.list_active_border)
+        })
+        .on_mouse_down(
+            gpui::MouseButton::Left,
+            cx.listener(select_field_listener(field)),
+        )
+        .child(
+            v_flex()
+                .flex_1()
+                .min_w_0()
+                .gap_1()
+                .child(
+                    div()
+                        .text_sm()
+                        .font_semibold()
+                        .text_color(theme.foreground)
+                        .child("Claude ACP adapter"),
+                )
+                .child(
+                    div().text_sm().whitespace_normal().text_color(color).child(
+                        crate::ui::selectable_text::selectable_text(
+                            "settings-claude-adapter-status",
+                            text,
+                            window,
+                            cx,
+                        ),
+                    ),
+                )
+                .when_some(command, |el, command| {
+                    el.child(
+                        div()
+                            .text_sm()
+                            .font_family("monospace")
+                            .text_color(theme.foreground)
+                            .child(crate::ui::selectable_text::selectable_text(
+                                "settings-claude-adapter-command",
+                                command,
+                                window,
+                                cx,
+                            )),
+                    )
+                })
+                .when_some(error, |el, error| {
+                    el.child(
+                        div().text_sm().whitespace_normal().text_color(theme.danger).child(
+                            crate::ui::selectable_text::selectable_text(
+                                "settings-claude-adapter-error",
+                                error,
+                                window,
+                                cx,
+                            ),
+                        ),
+                    )
+                }),
+        )
+        .when_some(copy_command, |el, command| {
+            el.child(
+                Button::new("settings-claude-adapter-copy")
+                    .label("Copy command")
+                    .tab_stop(false)
+                    .on_click(cx.listener(move |_, _, _, cx| {
+                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(command.to_string()));
+                    })),
+            )
+        })
+        .child(
+            Button::new("settings-claude-adapter-button")
+                .label(button_label)
+                .disabled(busy)
+                .tab_stop(false)
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.focus_region = SettingsFocus::Panel;
+                    this.focus_handle.focus(window, cx);
+                    this.activate_claude_adapter(cx);
+                })),
+        )
 }
 
 fn read_only_row(

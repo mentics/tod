@@ -165,7 +165,8 @@ impl NodeRunners {
         Ok(ConversationConfig {
             data_root: self.fleet.paths().root().to_path_buf(),
             media,
-            launch: settings.interview_launch_options(),
+            launch: settings.launch_options_for(tod_store::AgentRole::Default),
+            settings_path: Some(paths.settings_path()),
             context: settings.interview_context.clone(),
         })
     }

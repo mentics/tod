@@ -15,6 +15,8 @@ path = "src/lib.rs"
 # are decisions `tod-core` makes and `tod-store` records.
 [dependencies]
 anyhow = "1.0"
+# Image content in ACP prompts.
+base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 # Reads Cursor's per-session store (read-only) for transcripts.
 rusqlite = { version = "0.37", features = ["bundled"] }

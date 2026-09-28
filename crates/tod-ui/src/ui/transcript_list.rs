@@ -29,13 +29,14 @@ use gpui::prelude::FluentBuilder;
 use gpui::{
     AnyElement, Context, ElementId, EventEmitter, InteractiveElement, IntoElement, ListAlignment,
     ListState, ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, Window,
-    div, list, px,
+    ObjectFit, StyledImage, div, img, list, px,
 };
 use gpui_component::button::ButtonVariants;
 use gpui_component::scroll::Scrollbar;
 use gpui_component::{Icon, Sizable, h_flex, v_flex};
 use gpui_kit_assets::IconName;
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use tod_agent::ReplyPart;
 
 /// Who a transcript entry is from.
@@ -72,6 +73,8 @@ pub struct Entry {
     /// An agent reply still being streamed: every piece is work so far (none
     /// is the answer yet), and each starts collapsed.
     pub live: bool,
+    /// Image files a user message was sent with, shown beneath its text.
+    pub images: Vec<PathBuf>,
 }
 
 impl Entry {
@@ -84,6 +87,7 @@ impl Entry {
             label: Some(label.into()),
             summary: None,
             live: false,
+            images: Vec::new(),
         }
     }
 
@@ -96,6 +100,7 @@ impl Entry {
             label: None,
             summary: None,
             live: true,
+            images: Vec::new(),
         }
     }
 }
@@ -694,10 +699,18 @@ impl TranscriptList {
                     entry.kind,
                     EntryKind::User | EntryKind::Raw { outgoing: true }
                 );
+                let headline = match (first_line(&entry.body), entry.images.len()) {
+                    (line, 0) => line,
+                    (line, _) if !line.is_empty() => line,
+                    (_, 1) => "An image".to_string(),
+                    (_, n) => format!("{n} images"),
+                };
                 let mut chunk = style::chunk(v_flex())
                     .when(tinted, |el| el.bg(style::color::badge_fill()))
-                    .child(self.chunk_header(id, None, label, Some(first_line(&entry.body)), cx));
-                if self.is_expanded(id) {
+                    .child(self.chunk_header(id, None, label, Some(headline), cx));
+                let expanded = self.is_expanded(id);
+                // An image sent alone has no text to show above it.
+                if expanded && !(entry.body.is_empty() && !entry.images.is_empty()) {
                     // Shown verbatim: a user message may carry markdown, but
                     // so may a raw payload contain text that must not be
                     // reflowed, and neither is the agent's own prose.
@@ -734,6 +747,22 @@ impl TranscriptList {
                             }),
                         );
                     }
+                }
+                if expanded && !entry.images.is_empty() {
+                    let thumbnails = entry.images.iter().enumerate().map(|(ix, path)| {
+                        let open = path.clone();
+                        style::image_thumbnail(div())
+                            .id(ElementId::Name(format!("entry-image-{entry_ix}-{ix}").into()))
+                            .cursor_pointer()
+                            .on_click(move |_, _, cx| cx.open_with_system(&open))
+                            .child(img(path.clone()).size_full().object_fit(ObjectFit::Cover))
+                    });
+                    chunk = chunk.child(
+                        style::chunk_body(h_flex())
+                            .flex_wrap()
+                            .gap(style::space::RELATED)
+                            .children(thumbnails),
+                    );
                 }
                 chunk.into_any_element()
             }
@@ -892,6 +921,7 @@ mod tests {
             label: None,
             summary: None,
             live: false,
+            images: Vec::new(),
         }
     }
 
@@ -911,6 +941,7 @@ mod tests {
             label: None,
             summary: None,
             live: false,
+            images: Vec::new(),
         }
     }
 

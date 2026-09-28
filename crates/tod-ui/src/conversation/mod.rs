@@ -60,6 +60,7 @@ use crate::interview::{TodPaths, TodSettings};
 use crate::ui::agent_chat::OpenAgentChat;
 use crate::ui::agent_runs::AgentRuns;
 use crate::ui::report_problem::{OpenReportDialog, ReportProblem};
+use crate::ui::session_info::SessionInfo;
 use crate::ui::agent_conversation::{AgentConversationPanel, PanelStop};
 use crate::ui::agent_permission::queue_permission_request;
 use crate::ui::app_nav::{AppDestination, AppNavMenu, HasAppNav, on_app_nav_toggle};
@@ -118,23 +119,8 @@ const AGENT_TURN: &str = "agent-turn";
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
 /// Polls between reloads when the store has not signalled a commit.
 const FALLBACK_POLLS: u32 = 8;
-/// How often a running turn's usage is read again from its platform's
-/// record: the read is the whole session log.
-const USAGE_REFRESH: Duration = Duration::from_secs(10);
 const TRANSCRIPT_WIDTH: f32 = 420.;
 
-/// The open conversation's token usage as its sessions' platform records
-/// say, and when it was last read.
-#[derive(Default)]
-struct ConversationUsage {
-    /// The conversation `recorded` is for.
-    conversation: Option<Uuid>,
-    recorded: Option<tod_agent::TokenUsage>,
-    read_at: Option<std::time::Instant>,
-    /// A turn ended since the last read.
-    stale: bool,
-    reading: bool,
-}
 const CONTEXT_WIDTH: f32 = 420.;
 
 /// What follows a message the view sends, once the driver is back with it.
@@ -446,9 +432,9 @@ pub struct ConversationView {
     /// Files the implementation protocol's worktree has changed, refreshed
     /// off the main thread when a turn ends.
     side_files: Vec<String>,
-    /// The open conversation's token usage, from its sessions' platform
-    /// records; read off the main thread (see [`Self::refresh_usage`]).
-    usage: ConversationUsage,
+    /// The line under the title: platform, model, effort, and tokens; read
+    /// off the main thread (see [`Self::refresh_session_info`]).
+    session_info: SessionInfo,
     /// Turns the protocol's loop has sent since the last user message.
     loop_turns: u32,
     /// Notices from finished runs, emitted as events on the next poll.
@@ -572,7 +558,7 @@ impl ConversationView {
                 };
                 let Ok(want_files) = this.update(cx, |this, cx| {
                     let (changed, want_files) = this.poll(committed, ticked, cx);
-                    this.refresh_usage(cx);
+                    this.refresh_session_info(cx);
                     this.publish_status(cx);
                     for notice in std::mem::take(&mut this.pending_notices) {
                         cx.emit(ConversationViewEvent::Notice(notice));
@@ -638,7 +624,7 @@ impl ConversationView {
             nav: None,
             protocol: ProtocolKind::Outline,
             side_files: Vec::new(),
-            usage: ConversationUsage::default(),
+            session_info: SessionInfo::default(),
             loop_turns: 0,
             pending_notices: Vec::new(),
             change_filter: StatusFilter::default(),
@@ -895,7 +881,7 @@ impl ConversationView {
         if self.current_status(cx).is_some_and(|s| s.running) {
             return;
         }
-        self.send(starter, window, cx);
+        self.send(starter, Vec::new(), window, cx);
     }
 
     // ----- drivers and data ----------------------------------------------
@@ -910,7 +896,8 @@ impl ConversationView {
         Ok(ConversationConfig {
             data_root: self.fleet.paths().root().to_path_buf(),
             media,
-            launch: settings.interview_launch_options(),
+            launch: settings.launch_options_for(tod_store::AgentRole::Default),
+            settings_path: Some(paths.settings_path()),
             context: settings.interview_context.clone(),
         })
     }
@@ -1039,7 +1026,7 @@ impl ConversationView {
         }
         let want_files = finished.then(|| self.implementation_worktree()).flatten();
         if finished {
-            self.usage.stale = true;
+            self.session_info.mark_stale();
         }
         let current = self.current_status(cx).unwrap_or_default();
         // A finished run for another conversation leaves nothing to show.
@@ -1072,70 +1059,36 @@ impl ConversationView {
         (changed, want_files)
     }
 
-    /// Read the open conversation's usage again when it is due: a different
-    /// conversation is open, a turn ended, or a turn has been running for
-    /// [`USAGE_REFRESH`]. Reading is the platforms' whole session logs, so it
-    /// happens on the background executor.
-    fn refresh_usage(&mut self, cx: &mut Context<Self>) {
-        let Some(id) = self.conversation_id else {
-            self.usage = ConversationUsage::default();
+    /// Read what the line under the title shows again when it is due (see
+    /// [`SessionInfo::take_due`]), on the background executor: it reads the
+    /// platforms' session logs and the settings.
+    fn refresh_session_info(&mut self, cx: &mut Context<Self>) {
+        self.session_info
+            .show(self.focus, self.data.protocol, self.conversation_id);
+        let Some(read) = self.session_info.take_due(self.status.running) else {
             return;
         };
-        if self.usage.conversation != Some(id) {
-            self.usage = ConversationUsage {
-                conversation: Some(id),
-                ..ConversationUsage::default()
-            };
-        }
-        let due = self.usage.stale
-            || self.usage.read_at.is_none_or(|at| {
-                self.status.running && at.elapsed() >= USAGE_REFRESH
-            });
-        if !due || self.usage.reading {
-            return;
-        }
-        self.usage.stale = false;
-        self.usage.reading = true;
-        self.usage.read_at = Some(std::time::Instant::now());
         let fleet = self.fleet.clone();
         cx.spawn(async move |this, cx| {
-            let usage = cx
+            let (read, result) = cx
                 .background_executor()
                 .spawn(async move {
-                    tod_core::run_transcript::usage_for_key(
-                        &fleet,
-                        &ConversationDriver::session_key(id),
-                    )
+                    let result = read.run(&fleet);
+                    (read, result)
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
-                if this.usage.conversation == Some(id) {
-                    this.usage.reading = false;
-                    if this.usage.recorded != usage {
-                        this.usage.recorded = usage;
-                        cx.notify();
-                    }
+                if this.session_info.apply(&read, result) {
+                    cx.notify();
                 }
             });
         })
         .detach();
     }
 
-    /// The usage to show: the platform records', filled in with what the
-    /// agent reported live where the records say nothing.
-    fn shown_usage(&self) -> Option<tod_agent::TokenUsage> {
-        let recorded = self
-            .usage
-            .recorded
-            .clone()
-            .filter(|_| self.usage.conversation == self.conversation_id);
-        match (recorded, self.status.live_usage.as_ref()) {
-            (Some(mut recorded), Some(live)) => {
-                recorded.fill_from_live(live);
-                Some(recorded)
-            }
-            (recorded, live) => recorded.or_else(|| live.cloned()),
-        }
+    /// The line under the title and the figures behind it.
+    fn session_line(&self) -> Option<(String, String)> {
+        self.session_info.line(&self.status)
     }
 
     /// The worktree an implementation conversation is running in, when that
@@ -1458,10 +1411,16 @@ impl ConversationView {
         cx.notify();
     }
 
-    /// Send `text` from the input, which is cleared at once; it is given back
-    /// if the message does not go out.
-    fn send(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
-        if self.deliver(text, AfterSend::Input(window.window_handle()), cx) {
+    /// Send `text` and `images` from the input, which is cleared at once;
+    /// they are given back if the message does not go out.
+    fn send(
+        &mut self,
+        text: &str,
+        images: Vec<tod_agent::PromptImage>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.deliver(text, images, AfterSend::Input(window.window_handle()), cx) {
             self.transcript
                 .update(cx, |panel, cx| panel.clear_input(window, cx));
         }
@@ -1474,9 +1433,15 @@ impl ConversationView {
     /// submodules, the container's environment, the build stamp), so the
     /// driver goes to the background executor for it. Meanwhile the view
     /// shows the agent starting, and Stop stops it once it has.
-    fn deliver(&mut self, text: &str, after: AfterSend, cx: &mut Context<Self>) -> bool {
+    fn deliver(
+        &mut self,
+        text: &str,
+        images: Vec<tod_agent::PromptImage>,
+        after: AfterSend,
+        cx: &mut Context<Self>,
+    ) -> bool {
         let text = text.trim().to_string();
-        if text.is_empty() {
+        if text.is_empty() && images.is_empty() {
             return false;
         }
         let ix = match self.ensure_current_driver(cx) {
@@ -1506,26 +1471,35 @@ impl ConversationView {
         let fleet = self.fleet.clone();
         let agent = self.agent.clone();
         cx.spawn(async move |this, cx| {
-            let (driver, text, result) = cx
+            let (driver, text, images, result) = cx
                 .background_executor()
                 .spawn(async move {
                     let result = driver
-                        .send(&fleet, &mut SharedAgentAccess(&agent), &text)
+                        .send_with_images(
+                            &fleet,
+                            &mut SharedAgentAccess(&agent),
+                            &text,
+                            images.clone(),
+                        )
                         .map_err(|e| format!("{e:#}"));
-                    (driver, text, result)
+                    (driver, text, images, result)
                 })
                 .await;
-            let Ok(restore) =
-                this.update(cx, |this, cx| this.sent(slot, driver, &text, result, after, cx))
-            else {
+            let image_count = images.len();
+            let Ok(restore) = this.update(cx, |this, cx| {
+                this.sent(slot, driver, &text, image_count, result, after, cx)
+            }) else {
                 return;
             };
             if let Some(window) = restore {
                 let _ = cx.update_window(window, |_, window, cx| {
                     let _ = this.update(cx, |this, cx| {
                         this.transcript.update(cx, |panel, cx| {
-                            if panel.input().read(cx).value().trim().is_empty() {
+                            if panel.input().read(cx).value().trim().is_empty()
+                                && panel.images().is_empty()
+                            {
                                 panel.set_input(&text, window, cx);
+                                panel.add_images(images, cx);
                             }
                         });
                     });
@@ -1538,11 +1512,13 @@ impl ConversationView {
 
     /// The driver is back from sending `text`. Returns the window whose
     /// input should have the text back, when it did not go out.
+    #[allow(clippy::too_many_arguments)]
     fn sent(
         &mut self,
         slot: u64,
         driver: ConversationDriver,
         text: &str,
+        image_count: usize,
         result: Result<i64, String>,
         after: AfterSend,
         cx: &mut Context<Self>,
@@ -1570,7 +1546,11 @@ impl ConversationView {
                     crate::ui::journey::Source::Keyboard,
                     "conversation",
                     tod_journey::Presented {
-                        notices: vec![format!("seq={user_seq}"), format!("length={}", text.len())],
+                        notices: vec![
+                            format!("seq={user_seq}"),
+                            format!("length={}", text.len()),
+                            format!("images={image_count}"),
+                        ],
                         ..Default::default()
                     },
                 );

@@ -44,7 +44,10 @@ use crate::views::obligations::{ObligationsEvent, ObligationsView};
 use crate::views::plan_steps::{PlanStepsEvent, PlanStepsView};
 use crate::views::task_edit::{TaskEditEvent, TaskEditView};
 use crate::views::task_list::{TaskListEvent, TaskListView};
-use crate::unified::UnifiedView;
+use crate::ui::nav_history::{
+    NavHistory, NavigateBack, NavigateForward, register_nav_history_bindings,
+};
+use crate::unified::{UnifiedView, WorkbenchPlace};
 use crate::views::visual_design_panel::{
     EmbeddedChatParams, VisualDesignPanelEvent, VisualDesignPanelView,
 };
@@ -52,7 +55,9 @@ use gpui::prelude::FluentBuilder;
 use gpui::*;
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::input::{Textarea, TextareaState};
-use gpui_component::{ActiveTheme, IconName, Root, Selectable, StyledExt, TitleBar, WindowExt, h_flex};
+use gpui_component::{
+    ActiveTheme, Disableable, IconName, Root, Selectable, StyledExt, TitleBar, WindowExt, h_flex,
+};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tod_agent::EngagementState;
@@ -94,6 +99,22 @@ enum ShellView {
     Unified,
 }
 
+/// Where Back and Forward take the user (`ui::nav_history`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Location {
+    Workbench(WorkbenchPlace),
+    /// Any other view, shown as it is when the user returns to it.
+    View(ShellView),
+}
+
+impl Location {
+    /// Two places in the workbench are the same kind: stepping through the
+    /// tree's rows quickly keeps only the row the user settles on.
+    fn same_kind(a: &Self, b: &Self) -> bool {
+        matches!((a, b), (Location::Workbench(_), Location::Workbench(_)))
+    }
+}
+
 struct PendingOpenInterview {
     task_id: String,
     node_id: Uuid,
@@ -119,6 +140,8 @@ pub struct Shell {
     database: Entity<DatabaseView>,
     pull_requests: Entity<PullRequestsView>,
     unified: Entity<UnifiedView>,
+    /// Where the user has been, for Back and Forward.
+    history: NavHistory<Location>,
     fleet: Arc<FleetStore>,
     _mutation_socket: Option<tod_store::fleet::mutation_socket::PortFileGuard>,
     agent: SharedAgent,
@@ -169,6 +192,7 @@ pub struct Shell {
     _conversation_subscription: Subscription,
     _settings_subscription: Subscription,
     _incoming_check_subscription: Subscription,
+    _unified_nav_subscription: Subscription,
 }
 
 /// Where "open" goes for a node in `lifecycle`: `proposed` and `design` nodes
@@ -220,6 +244,53 @@ fn collect_running_work(
 }
 
 impl Shell {
+    /// Where the UI is, as Back and Forward record it; `None` for the
+    /// interview, which cannot be returned to without its session.
+    fn location(&self, cx: &App) -> Option<Location> {
+        match self.active_view {
+            ShellView::Unified => Some(Location::Workbench(self.unified.read(cx).place(cx))),
+            ShellView::Interview => None,
+            view => Some(Location::View(view)),
+        }
+    }
+
+    /// Tell the history where the UI is now.
+    fn note_location(&mut self, cx: &mut Context<Self>) {
+        let could = (self.history.can_go_back(), self.history.can_go_forward());
+        match self.location(cx) {
+            Some(location) => self.history.visit(location, std::time::Instant::now()),
+            None => self.history.leave(),
+        }
+        if could != (self.history.can_go_back(), self.history.can_go_forward()) {
+            cx.notify();
+        }
+    }
+
+    /// Alt+Left / Alt+Right and the title bar's arrows.
+    fn navigate(&mut self, back: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.note_location(cx);
+        let target = if back {
+            self.history.back()
+        } else {
+            self.history.forward()
+        };
+        let Some(target) = target else {
+            return;
+        };
+        match &target {
+            Location::Workbench(place) => {
+                self.select_view(ShellView::Unified, window, cx);
+                self.unified
+                    .update(cx, |unified, cx| unified.restore_place(place, window, cx));
+            }
+            Location::View(view) => self.select_view(*view, window, cx),
+        }
+        if let Some(reached) = self.location(cx) {
+            self.history.arrive(reached);
+        }
+        cx.notify();
+    }
+
     fn select_view(&mut self, view: ShellView, window: &mut Window, cx: &mut Context<Self>) {
         self.task_list
             .update(cx, |list, _| list.app_nav_mut().close());
@@ -1142,6 +1213,32 @@ impl Shell {
                 .items_center()
                 .justify_between()
                 .child("tod")
+                .child(
+                    h_flex()
+                        .ml(crate::ui::style::space::INLINE)
+                        .child(
+                            Button::new("nav-back")
+                                .icon(IconName::ArrowLeft)
+                                .ghost()
+                                .compact()
+                                .disabled(!self.history.can_go_back())
+                                .tooltip("Back (Alt+Left)")
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.navigate(true, window, cx);
+                                })),
+                        )
+                        .child(
+                            Button::new("nav-forward")
+                                .icon(IconName::ArrowRight)
+                                .ghost()
+                                .compact()
+                                .disabled(!self.history.can_go_forward())
+                                .tooltip("Forward (Alt+Right)")
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.navigate(false, window, cx);
+                                })),
+                        ),
+                )
                 .child(div().flex_1())
                 // The shortcut pill sits beside the button, not under it as
                 // `chrome_control_with_shortcut_in_context` puts it: the
@@ -1226,6 +1323,7 @@ impl Render for Shell {
         self.drain_pending_task_list(window, cx);
         self.drain_pending_error_toast(window, cx);
         crate::ui::agent_permission::drain_queued_requests(window, cx);
+        self.note_location(cx);
 
         div()
             .v_flex()
@@ -1238,6 +1336,12 @@ impl Render for Shell {
                 this.open_conversation(Focus::Project, window, cx);
             }))
             .on_action(cx.listener(Self::on_open_agent_chat))
+            .on_action(cx.listener(|this, _: &NavigateBack, window, cx| {
+                this.navigate(true, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &NavigateForward, window, cx| {
+                this.navigate(false, window, cx);
+            }))
             .on_action(cx.listener(|this, action: &OpenCodeRef, window, cx| {
                 // Text outside a view that knows its node: the task tree's
                 // selection is what the user is looking at.
@@ -1789,6 +1893,12 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
     } else {
         AgentBackend::from_platform(app_settings.agent_platform)
     };
+    tod_agent::claude_adapter::set_local_dir(tod_store::install::claude_adapter_dir());
+    // Whether a missing or outdated Claude adapter is worth saying at start.
+    let uses_claude = !matches!(agent_backend, AgentBackend::Mock)
+        && tod_store::AgentRole::ALL
+            .iter()
+            .any(|role| app_settings.platform_for(*role) == AgentPlatform::Claude);
     let agent: SharedAgent = agent_backend.create(traffic_log.clone());
 
     let fleet_open = open_fleet_store(traffic_log.clone());
@@ -2364,6 +2474,10 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                             let agent_status_text =
                                 format_status_bar(&AgentStatusGroups::default()).into();
                             let tasks_split_state = cx.new(|_| PanelSplitState::centered());
+                            let _unified_nav_subscription =
+                                cx.observe(&unified, |this: &mut Shell, _, cx| {
+                                    this.note_location(cx);
+                                });
                             let shell = Shell {
                                 active_view: ShellView::Unified,
                                 task_list,
@@ -2382,6 +2496,7 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                 database,
                                 pull_requests,
                                 unified,
+                                history: NavHistory::new(Location::same_kind),
                                 fleet: fleet.clone(),
                                 _mutation_socket: mutation_socket,
                                 agent: agent.clone(),
@@ -2420,6 +2535,7 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                 _conversation_subscription,
                                 _settings_subscription,
                                 _incoming_check_subscription,
+                                _unified_nav_subscription,
                             };
                             let status_hub = status::hub(cx);
                             cx.observe(&status_hub, |_, _, cx| cx.notify()).detach();
@@ -2448,6 +2564,28 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                         break;
                                     }
                                 }
+                            })
+                            .detach();
+                            // Claude's adapter: tod's own install is brought up
+                            // to date; a missing one, or an outdated global one,
+                            // is said at once when Claude is in use.
+                            let adapter_entity = cx.weak_entity();
+                            cx.spawn(async move |_, cx| {
+                                cx.update(crate::ui::claude_adapter::check).await;
+                                if !uses_claude {
+                                    return;
+                                }
+                                let _ = adapter_entity.update(cx, |shell, cx| {
+                                    let adapter = crate::ui::claude_adapter::state(cx);
+                                    let message = adapter.read(cx).startup_message();
+                                    match message {
+                                        Some((crate::ui::claude_adapter::Severity::Error, text)) => {
+                                            shell.queue_error_toast(text, cx)
+                                        }
+                                        Some((_, text)) => shell.queue_warning_toast(text, cx),
+                                        None => {}
+                                    }
+                                });
                             })
                             .detach();
                             #[cfg(feature = "agent-socket")]
@@ -2574,6 +2712,7 @@ pub fn open_data_root_setup(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()
 
 pub fn register_shell_keyboard_bindings(cx: &mut App) {
     register_app_nav_keyboard_bindings(cx);
+    register_nav_history_bindings(cx);
     cx.bind_keys([
         KeyBinding::new("ctrl-shift-a", ShellOpenAgentTranscripts, Some(NOT_INPUT)),
         KeyBinding::new("ctrl-shift-h", ShellOpenHistory, Some(NOT_INPUT)),

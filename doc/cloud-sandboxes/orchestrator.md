@@ -61,10 +61,12 @@ supervisor does not ask again.
 
 ```sh
 scripts/build-sandbox-binaries.sh      # target/sandbox/tod-orchestrator and tod-cli (needs zigbuild)
-tod-sandbox --data-root <root> orchestrator [--image IMAGE] [--bin PATH] [--tod-cli PATH]
+tod-sandbox --data-root <root> orchestrator [--image IMAGE] [--bin PATH] [--tod-cli PATH] [--move-data]
 ```
 
-This creates `tod-orchestrator` if it does not exist (labelled
+This creates the orchestrator's sandbox (`tod-orchestrator`, or
+`orchestrator = "<name>"` under `[blaxel]` in `sandboxes.toml`; the app and
+the nodes find it by that name too) if it does not exist (labelled
 `tod-role=orchestrator`, declaring the relay's port and 8090; not 8080, where the sandbox's own API listens), uploads the
 two binaries to `/opt/tod-orchestrator/` in 4 MB parts, (re)starts the
 server as a sandbox process that restarts on failure, asks for a public
@@ -72,8 +74,21 @@ preview on 8090 (named `webhooks`, for later; a failure there is only
 reported), and waits for `/health`. The server's URL is
 `<sandbox url>/port/8090`. Run it again to update the binaries.
 
-On the dev account its data lives on the sandbox's own disk, `/data`: it
-goes with the sandbox. The image needs `curl` (for the health check).
+Its data is under `/data`. By default that is the sandbox's own disk, and
+goes with the sandbox. With `orchestrator_volume = "<volume>"` under
+`[blaxel]`, the volume (4 GB, in the account's region, labelled
+`tod-role=orchestrator-data`) is created if missing and mounted at `/data`,
+so the data outlives the sandbox: delete it, run `tod-sandbox orchestrator`
+again, and the new one has everything. A volume can only be given to a
+sandbox when it is created, so for an orchestrator that already exists
+without it the command stops and asks for `--move-data`, which stops the
+server, packs `/data`, keeps a copy in the data root
+(`<orchestrator>-data.tar.gz`), deletes and recreates the sandbox with the
+volume, and unpacks it there; the copy is removed once it is on the volume.
+If the move stops after the old sandbox was deleted (deleting one in standby
+can take minutes), run it again with `--move-data`: it restores from that
+copy. Nodes reach the orchestrator by name, so they are unaffected. The
+image needs `curl` (for the health check).
 
 ## Telling the app (`notify.rs`)
 
@@ -200,10 +215,11 @@ event wait that matches. For each node:
 4. Its sandbox is poked (a failed poke is retried by the wake timer), and
    the user's change notice is sent.
 
-Gap: a wait scheduled with Blaxel (`BlaxelScheduler`) keeps its schedule
-`wait-<id>`: the orchestrator has no Blaxel credentials for the user's
-sandboxes. It fires later as a harmless poke; the supervisor should delete
-it once it sees the wait satisfied.
+A wait scheduled with Blaxel (`BlaxelScheduler`) keeps its schedule (its
+process is named `wait-<id>`) here: the orchestrator has no Blaxel
+credentials for the user's sandboxes. The poke wakes the supervisor, which
+cancels the schedule it no longer needs (`waits::reconcile_wake`); one that
+fires first is a harmless poke.
 
 Deliveries are not deduplicated (`X-GitHub-Delivery` is ignored); a repeat
 records the event again and pokes again, which is harmless. Webhooks can be

@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Current fleet schema epoch stored in `PRAGMA user_version`.
-pub const CURRENT_USER_VERSION: i32 = 73;
+pub const CURRENT_USER_VERSION: i32 = 74;
 
 const BUSY_TIMEOUT_MS: i64 = 5000;
 
@@ -447,13 +447,18 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
         conn.pragma_update(None, "user_version", 72)?;
     }
     if version < 73 {
+        // Images the user attached to a message.
+        ensure_turn_attachments(conn)?;
+        conn.pragma_update(None, "user_version", 73)?;
+    }
+    if version < 74 {
         // Phase certifications (`crate::phase`, `doc/lifecycle/phase-agents.md`);
         // synced. Certificates replace the buildable criterion and the
         // trigger that reset it on every obligation change.
         conn.execute_batch(crate::phase::CREATE_TABLE)?;
         conn.execute_batch(&crate::journey_changes::phase_events_triggers_sql())?;
         conn.execute_batch("DROP TRIGGER IF EXISTS trg_buildable_reset;")?;
-        conn.pragma_update(None, "user_version", 73)?;
+        conn.pragma_update(None, "user_version", 74)?;
     }
     // Other branches (the task panel) numbered their own steps 66–67 at the
     // same time as 66–70 above, so a store may be past a version without
@@ -471,6 +476,7 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
     conn.execute_batch(&crate::journey_changes::request_feedback_triggers_sql())?;
     conn.execute_batch(crate::phase::CREATE_TABLE)?;
     conn.execute_batch(&crate::journey_changes::phase_events_triggers_sql())?;
+    ensure_turn_attachments(conn)?;
     crate::sync::install(conn)?;
     // Idempotent and cheap — keeps the gate criteria catalog's wording in
     // sync with the source on every startup, not just the migration that
@@ -907,6 +913,20 @@ fn migrate_v59_to_v60(conn: &Connection) -> Result<()> {
         .exists([])?;
     if !present {
         conn.execute_batch("ALTER TABLE conversation_turns ADD COLUMN sent_context TEXT;")?;
+    }
+    Ok(())
+}
+
+/// `conversation_turns.attachments`: the images the user attached to a
+/// message (JSON `crate::conversation::TurnAttachment`s, null when none); the
+/// files themselves are under the data root. A no-op when the column is
+/// already there.
+fn ensure_turn_attachments(conn: &Connection) -> Result<()> {
+    let present = conn
+        .prepare("SELECT 1 FROM pragma_table_info('conversation_turns') WHERE name = 'attachments'")?
+        .exists([])?;
+    if !present {
+        conn.execute_batch("ALTER TABLE conversation_turns ADD COLUMN attachments TEXT;")?;
     }
     Ok(())
 }

@@ -142,17 +142,20 @@ pub struct NodeSandbox {
 /// The node sandboxes in a listing that are running now: labelled
 /// `tod-kind=node` with a user and node, a URL, and a state Blaxel reports as
 /// running. One in standby, or with no state reported, is left alone, since
-/// asking its relay anything would wake it.
+/// asking its relay anything would wake it. A node forked from a base
+/// (`tod-kind=node-base`, the base's labels) is known by its `TOD_USER` and
+/// `TOD_NODE` instead; the base itself has no node, and is skipped.
 pub fn running_nodes(list: &[SandboxInfo]) -> Vec<NodeSandbox> {
     list.iter()
-        .filter(|s| s.label("tod-kind") == Some("node"))
+        .filter(|s| matches!(s.label("tod-kind"), Some("node" | "node-base")))
         .filter(|s| s.state.as_deref().is_some_and(|st| st.eq_ignore_ascii_case("running")))
         .filter_map(|s| {
+            let label = |key: &str| s.label(key).filter(|v| !v.is_empty());
             Some(NodeSandbox {
                 name: s.name.clone(),
                 url: s.url.clone()?,
-                user: s.label("tod-user")?.to_string(),
-                node: s.label("tod-node")?.to_string(),
+                user: label("tod-user").or_else(|| s.env("TOD_USER"))?.to_string(),
+                node: label("tod-node").or_else(|| s.env("TOD_NODE"))?.to_string(),
             })
         })
         .collect()
@@ -427,6 +430,8 @@ mod tests {
                 ("tod-user".into(), "u1".into()),
                 ("tod-node".into(), format!("node-{name}")),
             ],
+            volumes: Vec::new(),
+            node_env: Vec::new(),
         }
     }
 
@@ -440,6 +445,28 @@ mod tests {
         ];
         let names: Vec<_> = running_nodes(&list).into_iter().map(|n| n.name).collect();
         assert_eq!(names, vec!["a"]);
+    }
+
+    #[test]
+    fn a_forked_node_is_known_by_its_environment_and_its_base_is_skipped() {
+        let base_labels = vec![
+            ("tod-kind".to_string(), "node-base".to_string()),
+            ("tod-user".to_string(), "u1".to_string()),
+            ("tod-node".to_string(), String::new()),
+        ];
+        let base = SandboxInfo {
+            labels: base_labels.clone(),
+            node_env: vec![("TOD_USER".into(), "u1".into()), ("TOD_NODE".into(), String::new())],
+            ..info("tod-node-base", Some("RUNNING"), "node-base")
+        };
+        let fork = SandboxInfo {
+            labels: base_labels,
+            node_env: vec![("TOD_USER".into(), "u1".into()), ("TOD_NODE".into(), "n-7".into())],
+            ..info("node-x", Some("RUNNING"), "node-base")
+        };
+        let found = running_nodes(&[base, fork]);
+        assert_eq!(found.len(), 1);
+        assert_eq!((found[0].name.as_str(), found[0].user.as_str(), found[0].node.as_str()), ("node-x", "u1", "n-7"));
     }
 
     #[derive(Default)]

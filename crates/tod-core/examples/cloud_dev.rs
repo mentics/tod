@@ -12,17 +12,88 @@
 //!   cargo run -p tod-core --example cloud_dev -- <data_root> sync
 //!       `cloud_sync::sync_now`: send the outbox, pull the feed.
 //!
+//!   cargo run -p tod-core --example cloud_dev -- <data_root> node <title> <repo> <branch> <step>...
+//!       a node in `cloud`, `active`, with Files on `<repo>` (an HTTPS URL
+//!       or a local checkout) and `<branch>`, and one plan step per
+//!       `<step>`; prints its UUID. The mock agent reads directives in the
+//!       steps (`wait 3m: …`, `write <path>: <text>`).
+//!   cargo run -p tod-core --example cloud_dev -- <data_root> answer <decision> <option>
+//!       answers a pending decision (its full UUID, from `tod-cli --json
+//!       decisions list`) with its 1-based option, as the task panel does;
+//!       `sync` then sends it to the node.
+//!   cargo run -p tod-core --example cloud_dev -- <data_root> state <node> <state>
+//!       sets the node's lifecycle state, bypassing every gate (to run a
+//!       node's later steps again); `run` or `sync` sends it.
+//!
 //! Never run it on a data root the app has open.
 
 use anyhow::{Context, Result, anyhow, bail};
 use std::path::PathBuf;
-use tod_store::fleet::FleetStore;
-use tod_store::outline::OutlineMutation;
+use tod_store::fleet::{FleetMutation, FleetStore};
+use tod_store::outline::{Capability, CreatePosition, OutlineMutation};
+
+const USAGE: &str =
+    "usage: cloud_dev <data_root> init | run <node> | sync | node <title> <repo> <branch> <step>... | answer <decision> <option> | state <node> <state>";
+
+fn create_node(fleet: &FleetStore, title: &str, repo: &str, branch: &str, steps: &[String]) -> Result<uuid::Uuid> {
+    fn e(err: impl std::fmt::Display) -> anyhow::Error {
+        anyhow!("{err}")
+    }
+    let list_id = fleet
+        .list_outline_lists()
+        .map_err(e)?
+        .into_iter()
+        .find(|l| l.slug == "cloud")
+        .context("no list `cloud`: run `init` first")?
+        .id;
+    let node = uuid::Uuid::new_v4();
+    fleet
+        .enqueue_outline(OutlineMutation::CreateNode {
+            node_id: Some(node),
+            list_id,
+            parent_id: None,
+            anchor_id: None,
+            position: CreatePosition::Below,
+            title: title.into(),
+        })
+        .map_err(e)?;
+    fleet
+        .enqueue_outline(OutlineMutation::EnableCapabilities {
+            node_id: node,
+            capabilities: vec![Capability::Spec, Capability::Files],
+        })
+        .map_err(e)?;
+    fleet.writer().flush().map_err(e)?;
+    fleet
+        .enqueue(FleetMutation::UpdateTaskRepo { id: node.to_string(), repo: Some(repo.into()) })
+        .map_err(e)?;
+    fleet
+        .enqueue(FleetMutation::UpdateTaskBranch { id: node.to_string(), branch: Some(branch.into()) })
+        .map_err(e)?;
+    let mut after = None;
+    for body in steps {
+        let step = uuid::Uuid::new_v4();
+        fleet
+            .enqueue_outline(OutlineMutation::CreatePlanStep {
+                step_id: Some(step),
+                node_id: node,
+                after_id: after,
+                before: false,
+                body: body.clone(),
+            })
+            .map_err(e)?;
+        after = Some(step);
+    }
+    fleet.writer().flush().map_err(e)?;
+    tod_core::lifecycle::set_lifecycle(fleet, node, "active")?;
+    fleet.writer().flush().map_err(e)?;
+    Ok(node)
+}
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let [root, cmd, rest @ ..] = args.as_slice() else {
-        bail!("usage: cloud_dev <data_root> init | run <node> | sync");
+        bail!("{USAGE}");
     };
     let root = PathBuf::from(root);
     std::fs::create_dir_all(&root)?;
@@ -44,7 +115,35 @@ fn main() -> Result<()> {
             let report = tod_core::cloud_sync::sync_now(&fleet, &root)?;
             println!("{}", report.summary());
         }
-        _ => bail!("usage: cloud_dev <data_root> init | run <node> | sync"),
+        ("node", [title, repo, branch, steps @ ..]) if !steps.is_empty() => {
+            let id = create_node(&fleet, title, repo, branch, steps)?;
+            println!("{id}");
+        }
+        ("answer", [decision, option]) => {
+            let decision_id = uuid::Uuid::parse_str(decision).context("the decision's full UUID")?;
+            let option: i64 = option.parse().context("a 1-based option number")?;
+            if option < 1 {
+                bail!("options are numbered from 1");
+            }
+            fleet
+                .interview(
+                    tod_store::interview::ACTOR_USER,
+                    tod_store::interview::InterviewCommand::AnswerDecision {
+                        decision_id,
+                        option: Some(option),
+                        text: None,
+                    },
+                )
+                .map_err(|e| anyhow!("{e}"))?;
+            println!("answered {decision_id} with option {option}");
+        }
+        ("state", [node, state]) => {
+            let id = resolve(&fleet, node)?;
+            tod_core::lifecycle::set_lifecycle(&fleet, uuid::Uuid::parse_str(&id)?, state)?;
+            fleet.writer().flush().map_err(|e| anyhow!("{e}"))?;
+            println!("{id} is now {state}");
+        }
+        _ => bail!("{USAGE}"),
     }
     let _ = fleet.flush_on_quit();
     Ok(())

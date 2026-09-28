@@ -513,6 +513,7 @@ mod tests {
                     body: "add an obligation".into(),
                     parts: Vec::new(),
                     sent_context: Some("delta context".into()),
+                    attachments: Vec::new(),
                 },
             )
             .unwrap();
@@ -525,6 +526,7 @@ mod tests {
                     body: String::new(),
                     parts: Vec::new(),
                     sent_context: None,
+                    attachments: Vec::new(),
                 },
             )
             .unwrap();

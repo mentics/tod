@@ -304,6 +304,15 @@ styles:
     padding-bottom: related
   chunk-children:
     padding-left: section
+  # An image attached to a message: in the input before it is sent, and in
+  # the transcript after. Cropped to fill the square, never stretched.
+  image-thumbnail:
+    size: thumbnail
+    border: divider
+    radius: control
+    overflow: hidden
+    object-fit: cover
+    highlighted: highlighted
 
   # Overlays and notices
   toast:
@@ -548,6 +557,8 @@ tokens:
     # Narrowest a row's right-click menu gets, so a one-word entry does not
     # make a sliver of a menu.
     row-menu-min: 160px
+    # An image attached to a message, shown as a square.
+    thumbnail: 64px
     toast-min: 240px
     toast-max: 480px
     toast-narrow-min: 280px

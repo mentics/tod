@@ -32,20 +32,7 @@ impl RoutingAgentProvider {
 }
 
 fn build_host_provider(host: AcpHost, traffic_log: SharedAgentTrafficLog) -> CursorAcpProvider {
-    CursorAcpProvider::for_host(host)
-        .unwrap_or_else(|err| {
-            let placeholder = match host {
-                AcpHost::Cursor => PathBuf::from("agent"),
-                AcpHost::Claude => PathBuf::from("claude-code-acp"),
-            };
-            eprintln!(
-                "{} ACP provider init failed: {err}; using placeholder path {}",
-                host.label(),
-                placeholder.display()
-            );
-            CursorAcpProvider::with_agent_bin(host, placeholder)
-        })
-        .with_traffic_log(traffic_log)
+    CursorAcpProvider::for_host(host).with_traffic_log(traffic_log)
 }
 
 fn sum_interview_counts(a: InterviewAgentCounts, b: InterviewAgentCounts) -> InterviewAgentCounts {
