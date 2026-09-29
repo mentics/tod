@@ -42,6 +42,7 @@ pub mod linear_import;
 pub mod logging;
 pub mod media;
 pub mod node_context;
+pub mod permission;
 pub mod phase;
 pub mod process;
 pub mod process_bundle;

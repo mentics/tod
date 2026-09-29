@@ -137,6 +137,14 @@ protocol kinds remain only so old conversations load, and run
 (`tod-cli decisions ask`, free text with no `--option`) only for what only
 the user can supply.
 
+**Permissions while unattended** (`tod_core::permission`). A permission an agent asks for that
+nobody has granted is recorded as a pending decision on the node (protocol `permission`,
+reason `access`), so it survives a restart and is answered where requests are. Answering it
+records a standing grant (this exact action, or file actions under its folder; or a deny) and
+sends the agent nothing: the runner reopens the step, and the autopilot answers the agent's
+next ask from the saved answer. `TOD_ACP_PERMISSION_MODE=default` keeps Claude's own mode (it
+asks before edits) to force a request when testing.
+
 A node's state can stop holding after the fact: its obligations or plan
 changed since it entered `ready` (compared with the snapshot
 `tod_store::lifecycle_baseline` takes then, so a reversed change stops

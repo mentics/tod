@@ -547,6 +547,13 @@ impl AgentRuns {
             .read(|conn| DecisionRepo::new(conn).get_with_answers(decision_id))?
             .with_context(|| format!("decision {decision_id} vanished after answering"))?;
 
+        // A permission is a standing grant, not a message: the runner that
+        // stopped for it reopens the step once nothing is waiting, and the
+        // agent's next ask is answered from the saved answer
+        // (`tod_core::permission`).
+        if after.decision.protocol.as_deref() == Some(tod_core::permission::PROTOCOL) {
+            return Ok(());
+        }
         let Some(conversation_id) = after.decision.conversation_id else {
             return Ok(());
         };

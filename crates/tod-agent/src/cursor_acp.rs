@@ -2120,7 +2120,14 @@ fn apply_permission_mode(
     if host != AcpHost::Claude {
         return Ok(());
     }
-    let Some((mode, config_id)) = pick_permission_mode(result, CLAUDE_PERMISSION_MODES) else {
+    // A test knob: `TOD_ACP_PERMISSION_MODE=default` keeps the adapter's own
+    // mode (it asks before each edit), so a permission request can be forced.
+    let forced = std::env::var("TOD_ACP_PERMISSION_MODE").ok();
+    let preferred: Vec<&str> = match forced.as_deref() {
+        Some(mode) if !mode.is_empty() => vec![mode],
+        _ => CLAUDE_PERMISSION_MODES.to_vec(),
+    };
+    let Some((mode, config_id)) = pick_permission_mode(result, &preferred) else {
         let modes = result.get("modes").map(Value::to_string).unwrap_or_default();
         tracing::debug!(
             event = "agent",

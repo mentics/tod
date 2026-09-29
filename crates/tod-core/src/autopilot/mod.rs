@@ -44,7 +44,8 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use tod_store::conversation::{ConversationRepo, Focus, ProtocolKind};
-use tod_store::decisions::DecisionRepo;
+use tod_store::decisions::{DecisionRepo, NewDecision, REASON_ACCESS};
+use tod_store::interview::InterviewCommand;
 use tod_store::fleet::FleetStore;
 use uuid::Uuid;
 
@@ -570,6 +571,8 @@ impl Autopilot {
         });
         self.save()?;
 
+        // The permission already answered from saved answers, until it clears.
+        let mut answered: Option<String> = None;
         loop {
             let status = driver.status();
             if status.running
@@ -619,13 +622,17 @@ impl Autopilot {
             if finished || !status.running {
                 break;
             }
-            if let Some(request) = status.permission {
-                driver.cancel(fleet, agent)?;
-                return Ok(Some(Outcome::NeedsHuman {
-                    reason: NeedsHuman::Permission {
-                        title: request.title,
-                    },
-                }));
+            match status.permission {
+                None => answered = None,
+                Some(request) if answered.as_deref() == Some(request.title.as_str()) => {}
+                Some(request) => {
+                    if let Some(outcome) =
+                        self.handle_permission(fleet, agent, &mut driver, conversation_id, &request)?
+                    {
+                        return Ok(Some(outcome));
+                    }
+                    answered = Some(request.title);
+                }
             }
             if let Some(limit) = self.over_budget().filter(|l| matches!(l, BudgetLimit::Time { .. })) {
                 driver.cancel(fleet, agent)?;
@@ -637,6 +644,67 @@ impl Autopilot {
         self.record(fleet, protocol_name(kind), &lifecycle, conversation_id)?;
         close_session(agent, conversation_id);
         Ok(None)
+    }
+
+    /// The agent is blocked on `request`. What the node's saved answers
+    /// cover is answered here, and the run goes on (`None`). Anything else
+    /// nobody here can grant: it is recorded as a pending decision on the node
+    /// (`crate::permission`) and the run stops on it, kept as current so
+    /// answering reopens it. The agent then asks again, and is covered.
+    fn handle_permission<A: AgentAccess + ?Sized>(
+        &mut self,
+        fleet: &FleetStore,
+        agent: &mut A,
+        driver: &mut ConversationDriver,
+        conversation_id: Option<Uuid>,
+        request: &tod_agent::PermissionRequest,
+    ) -> Result<Option<Outcome>> {
+        use crate::permission::{self, Verdict};
+        let node = self.node;
+        let saved = fleet.read(|conn| permission::load(conn, node))?;
+        let verdict = permission::verdict(&saved, &request.title);
+        tracing::info!(%node, title = %request.title, ?verdict, saved = saved.len(), options = ?request.options, "agent is blocked on a permission");
+        let option = match verdict {
+            Verdict::Allow => permission::allow_option(request),
+            Verdict::Deny => permission::deny_option(request),
+            Verdict::Ask => None,
+        };
+        if let Some(option) = option {
+            tracing::info!(%node, title = %request.title, ?verdict, "answering a permission from the node's saved answers");
+            let _ = agent.with(|a| a.respond_to_permission(request.run, option));
+            return Ok(None);
+        }
+        let reason = if verdict == Verdict::Ask {
+            let pending = fleet.read(|conn| Ok(DecisionRepo::new(conn).list_pending_for_node(node)?))?;
+            if !permission::already_asked(&pending, &request.title) {
+                fleet
+                    .interview(
+                        "autopilot",
+                        InterviewCommand::AskDecision {
+                            node_id: node,
+                            conversation_id,
+                            protocol: Some(permission::PROTOCOL.to_string()),
+                            decision: NewDecision {
+                                question: permission::question(&request.title),
+                                options: permission::options(&request.title),
+                                evidence: Vec::new(),
+                                reason: REASON_ACCESS.to_string(),
+                            },
+                        },
+                    )
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+            }
+            NeedsHuman::Decision {
+                pending: pending.len() + usize::from(!permission::already_asked(&pending, &request.title)),
+            }
+        } else {
+            // Answered, but the agent offered no option to say it with.
+            NeedsHuman::Permission {
+                title: request.title.clone(),
+            }
+        };
+        driver.cancel(fleet, agent)?;
+        Ok(Some(Outcome::NeedsHuman { reason }))
     }
 
     fn new_driver(&self, kind: ProtocolKind) -> (ConversationDriver, String) {
