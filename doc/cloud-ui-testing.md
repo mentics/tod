@@ -12,7 +12,7 @@ Rust, Chromium.
 ```bash
 apt-get update -qq || true   # a broken third-party PPA may 403; ignore it
 apt-get install -y -qq --no-install-recommends \
-  mesa-vulkan-drivers libxkbcommon-x11-dev libwebkit2gtk-4.1-dev scrot
+  mesa-vulkan-drivers libxkbcommon-x11-dev libwebkit2gtk-4.1-dev scrot xdotool
 ```
 
 - `mesa-vulkan-drivers`: `lvp_icd.json` (lavapipe, CPU Vulkan). GPUI cannot
@@ -21,7 +21,7 @@ apt-get install -y -qq --no-install-recommends \
   `.so`, so the runtime package alone is not enough.
 - `libwebkit2gtk-4.1-dev`: `tod-ui` embeds a webview (`gpui-wry` → `wry` →
   GTK/WebKit), so the build needs `gdk-3.0` and friends (this pulls in GTK).
-- `scrot`: screenshots. The agent socket's `shot` is not supported on Linux.
+- `scrot`, `xdotool`: screenshots and real mouse clicks (the agent socket's `shot` and `click` are Windows-only).
 
 Network policy must allow the package mirror, crates.io, and
 `github.com` (GPUI is a git dependency of zed-industries/zed).
@@ -44,3 +44,30 @@ Drive input over the socket (`key`, `text`, `click`, `sync`; not `shot`):
 Never `pkill -f tod`: it matches your own shell; use `pkill -x`.
 
 The first build takes several minutes (GPUI); keep `target/` if you can.
+
+## Driving the app
+
+- `click`, `drag` and `shot` on the socket are Windows-only. On Linux use real
+  X input for clicks (`DISPLAY=:77 xdotool mousemove X Y click 1`, needs the
+  `xdotool` package) and `scrot` for screenshots. `key` and `text` on the
+  socket work; `text` needs an input in edit mode, so click it first.
+- `xdotool type` does not reach GPUI (no window manager gives it focus); use
+  the socket's `text`.
+- Ctrl+J toggles the chat drawer: press it once. Ctrl+Enter sends.
+- After changing `tod-core`/`tod-store`, build `tod-cli` too
+  (`cargo build -p tod -p tod-cli`), or a turn is refused as "built from
+  different source".
+
+## Real Claude instead of the mock
+
+The container already has Claude credentials in its environment, so no login
+is needed. Two extra steps:
+
+```bash
+npm install --prefix ~/acp @agentclientprotocol/claude-agent-acp@latest
+IS_SANDBOX=1 CLAUDE_ACP_BIN=~/acp/node_modules/.bin/claude-agent-acp \
+  ./target/debug/tod --agent claude ...
+```
+
+`IS_SANDBOX=1` is needed because the container runs as root and Claude Code
+refuses `--dangerously-skip-permissions` as root otherwise.
