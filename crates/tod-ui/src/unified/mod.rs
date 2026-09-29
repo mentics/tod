@@ -682,6 +682,21 @@ impl UnifiedView {
                     _subscriptions: Vec::new(),
                 }
             }
+            PanelKind::Watch(id) => {
+                let panel = cx.new(|cx| {
+                    panels::transcript::TranscriptPanel::watching(
+                        id,
+                        self.fleet.clone(),
+                        self.agent_runs.clone(),
+                        window,
+                        cx,
+                    )
+                });
+                HostedColumn {
+                    panel: HostedPanel::Transcript(panel),
+                    _subscriptions: Vec::new(),
+                }
+            }
             PanelKind::Transcript(id) => {
                 let panel = cx
                     .new(|cx| panels::transcript::TranscriptPanel::new(id, self.fleet.clone(), window, cx));

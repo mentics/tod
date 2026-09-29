@@ -918,12 +918,13 @@ impl TaskPanel {
             line = line.child(sep()).child(el.child(selectable_text("unified-task-runner-note", note, window, cx)));
         }
         let actions = self.runner_actions(&status, cx);
-        let watch = self.watch_target(cx).map(|conversation| {
+        let node = self.node_id;
+        let watch = self.watch_target(cx).map(|_| {
             Button::new("unified-task-runner-watch")
                 .label("Watch")
                 .small()
                 .on_click(cx.listener(move |this, _, _, cx| {
-                    this.open(PanelKind::Transcript(conversation), false, cx)
+                    this.open(PanelKind::Watch(node), false, cx)
                 }))
         });
         let button = self.render_runner_button(actions, cx);
