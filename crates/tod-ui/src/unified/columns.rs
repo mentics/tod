@@ -19,6 +19,9 @@ pub enum PanelKind {
     /// A single conversation's transcript; the id is the conversation's, not
     /// a node's.
     Transcript(uuid::Uuid),
+    /// The live transcript of a node's lifecycle processor, following it
+    /// from one agent session to the next; the id is the node's.
+    Watch(uuid::Uuid),
 }
 
 impl PanelKind {
@@ -33,7 +36,8 @@ impl PanelKind {
             | PanelKind::Plan(id)
             | PanelKind::Findings(id)
             | PanelKind::Settings(id)
-            | PanelKind::Changes(id) => Some(*id),
+            | PanelKind::Changes(id)
+            | PanelKind::Watch(id) => Some(*id),
             // A transcript's id is its conversation's, not a node's.
             PanelKind::Transcript(_) => None,
         }

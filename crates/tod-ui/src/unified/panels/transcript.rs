@@ -8,13 +8,14 @@ use gpui::{
     App, AppContext, Context, Entity, FocusHandle, Focusable, InteractiveElement, IntoElement,
     ParentElement, Render, SharedString, Styled, Subscription, Window, div,
 };
-use tod_store::conversation::{ConversationRepo, Turn, TurnRole};
+use tod_store::conversation::{ConversationRepo, Focus, ProtocolKind, Turn, TurnRole};
 use tod_store::fleet::FleetStore;
 use uuid::Uuid;
 
 use crate::ui::agent_conversation::{
     AgentConversationEvent, AgentConversationPanel, Entry, EntryKind,
 };
+use crate::ui::agent_runs::AgentRuns;
 use crate::unified::panel::ColumnPanel;
 
 /// What the transcript panel shows about a turn — mirrors
@@ -50,6 +51,20 @@ pub struct TranscriptPanel {
     /// Reloads the turns when the store changes, so a running conversation
     /// is watched as it goes.
     _follow: gpui::Task<()>,
+    /// Set when watching a node's lifecycle processor: the panel moves to
+    /// whichever of the node's conversations is running, and shows the turn
+    /// in flight as it streams.
+    watching: Option<Watching>,
+    /// The stored turns, as entries.
+    stored: Vec<Entry>,
+}
+
+struct Watching {
+    node: Uuid,
+    runs: Entity<AgentRuns>,
+    /// The streamed reply of the turn in flight.
+    live: Vec<tod_agent::ReplyPart>,
+    _sub: Subscription,
 }
 
 impl TranscriptPanel {
@@ -74,6 +89,8 @@ impl TranscriptPanel {
             panel,
             _subscription,
             _follow: gpui::Task::ready(()),
+            watching: None,
+            stored: Vec::new(),
         };
         let mut fleet_rx = this.fleet.subscribe_changes();
         this._follow = cx.spawn(async move |this, cx| {
@@ -92,6 +109,74 @@ impl TranscriptPanel {
         });
         this.reload(cx);
         this
+    }
+
+    /// A panel that follows `node`'s lifecycle processor from one agent
+    /// session to the next, live.
+    pub fn watching(
+        node: Uuid,
+        fleet: Arc<FleetStore>,
+        runs: Entity<AgentRuns>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let mut this = Self::new(Uuid::nil(), fleet, window, cx);
+        let _sub = cx.observe(&runs, |this, _, cx| this.sync_watch(cx));
+        this.watching = Some(Watching { node, runs, live: Vec::new(), _sub });
+        this.sync_watch(cx);
+        this
+    }
+
+    /// Move to the node's running conversation (else, when none is showing
+    /// yet, its latest), and take its streamed reply.
+    fn sync_watch(&mut self, cx: &mut Context<Self>) {
+        let Some(watching) = &self.watching else {
+            return;
+        };
+        let node = watching.node;
+        let focus = Focus::Node(node);
+        let running = {
+            let runs = watching.runs.read(cx);
+            let mut found = None;
+            let mut ix = 0;
+            while let Some(slot) = runs.slot_by_index(ix) {
+                ix += 1;
+                if slot.focus == focus
+                    && slot.status.running
+                    && !matches!(slot.protocol, ProtocolKind::Outline | ProtocolKind::Chat)
+                    && let Some(conversation) = slot.conversation_id
+                {
+                    found = Some((conversation, slot.status.parts.clone()));
+                    break;
+                }
+            }
+            found
+        };
+        let (target, live) = match running {
+            Some((conversation, parts)) => (Some(conversation), parts),
+            None if self.conversation_id.is_nil() => {
+                let latest = self
+                    .fleet
+                    .read(|conn| ConversationRepo::new(conn).list_for_focus(focus))
+                    .ok()
+                    .and_then(|list| {
+                        list.into_iter()
+                            .map(|s| s.conversation)
+                            .filter(|c| !matches!(c.protocol, ProtocolKind::Outline | ProtocolKind::Chat))
+                            .max_by_key(|c| c.updated_at)
+                            .map(|c| c.id)
+                    });
+                (latest, Vec::new())
+            }
+            None => (None, Vec::new()),
+        };
+        if let Some(watching) = &mut self.watching {
+            watching.live = live;
+        }
+        match target {
+            Some(id) if id != self.conversation_id => self.retarget(id, cx),
+            _ => self.show(cx),
+        }
     }
 
     pub fn conversation_id(&self) -> Uuid {
@@ -116,8 +201,19 @@ impl TranscriptPanel {
             })
             .unwrap_or_default();
         let root = self.fleet.paths().root();
-        let entries: Vec<Entry> = turns.iter().map(|turn| entry_of(turn, root)).collect();
+        self.stored = turns.iter().map(|turn| entry_of(turn, root)).collect();
         self.title = session_name.unwrap_or_else(|| "Transcript".to_string()).into();
+        self.show(cx);
+    }
+
+    /// Push the stored turns, and the turn in flight, to the panel.
+    fn show(&mut self, cx: &mut Context<Self>) {
+        let mut entries = self.stored.clone();
+        if let Some(watching) = &self.watching
+            && !watching.live.is_empty()
+        {
+            entries.push(Entry::live_reply(watching.live.clone()));
+        }
         self.panel.update(cx, |panel, cx| {
             panel.set_title(self.title.clone(), cx);
             panel.set_entries(entries, cx);
