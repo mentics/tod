@@ -234,6 +234,35 @@ process:
 python .local/agent/ui-smoke/conversation.py   # --no-build to skip cargo build
 ```
 
+## Downloading problem journeys
+
+When a user submits a problem journey, it arrives as an encrypted bundle on the
+relay inbox. `scripts/pull-journeys.sh` (or `scripts\pull-journeys.ps1` on
+Windows) runs `tod-journeys pull`, which downloads each bundle, decrypts it, and
+saves it as `<bundle-id>.journey` in the `received/` folder of the
+`tod-journeys` home (under the OS data dir by default).
+
+```bash
+# One-time: create the receiving identity and print the relay code to paste
+# into tod's settings
+cargo run -p tod-journeys -- init
+
+# Fetch whatever is waiting, then exit
+scripts/pull-journeys.sh
+
+# Keep listening for new bundles
+scripts/pull-journeys.sh --watch
+```
+
+```powershell
+scripts\pull-journeys.ps1          # add -Watch to keep listening
+```
+
+Read one with `cargo run -p tod-journeys -- show <file>` (add `--full` for
+everything), or summarize a folder with `... stats <dir>`. Pass `--home DIR`
+(`-JourneysHome DIR` in PowerShell) to use a different home. Format and
+protocol: [doc/journeys/spec.md](doc/journeys/spec.md).
+
 ## Project layout
 
 ```text
