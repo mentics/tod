@@ -316,7 +316,28 @@ fn main() {
         log(&format!("{container}: ssh through docker exec sshd -i {args:?}"));
         let marker = hold_connection_marker(&format!("docker-{container}"));
         let extra = container_ssh_options(container, &exe_dir().join(CONTAINER_KEY_FILE));
-        let status = Command::new(real_program("ssh")).args(&extra).args(&args).status();
+        // ssh's stderr is passed on and also logged: a failed connection
+        // otherwise leaves only its exit status.
+        let status = Command::new(real_program("ssh"))
+            .args(&extra)
+            .args(&args)
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .and_then(|mut child| {
+                let copier = child.stderr.take().map(|err| {
+                    std::thread::spawn(move || {
+                        for line in std::io::BufRead::lines(std::io::BufReader::new(err)).map_while(Result::ok) {
+                            log(&format!("ssh stderr: {line}"));
+                            eprintln!("{line}");
+                        }
+                    })
+                });
+                let status = child.wait();
+                if let Some(copier) = copier {
+                    let _ = copier.join();
+                }
+                status
+            });
         release_connection_marker(marker);
         log(&format!("{container}: ssh ended: {status:?}"));
         match status {
