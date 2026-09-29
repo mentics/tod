@@ -519,7 +519,10 @@ impl OutlineMutation {
                 let (restored_node, restored) =
                     crate::outline::archive::restore_capability(conn, *archive_id)?;
                 if (restored_node, restored) != (*node_id, *capability) {
-                    anyhow::bail!("archive {archive_id} is not {} on {node_id}", capability.label());
+                    anyhow::bail!(
+                        "archive {archive_id} is not {} on {node_id}",
+                        capability.label()
+                    );
                 }
             }
             OutlineMutation::SetNodeAgent {
@@ -548,9 +551,7 @@ impl OutlineMutation {
                 let tasks = crate::fleet::repos::task::TaskRepo::new(conn);
                 tasks.update_repo(&id, repo.as_deref())?;
                 tasks.update_branch(&id, branch.as_deref())?;
-                if let Some(container) =
-                    dev_container.as_ref().and_then(|dev| dev.container())
-                {
+                if let Some(container) = dev_container.as_ref().and_then(|dev| dev.container()) {
                     tod_agent::devcontainer::validate_container_ref(container)?;
                 }
                 let files = crate::fleet::repos::node_files::NodeFilesRepo::new(conn);
@@ -928,7 +929,10 @@ impl OutlineMutation {
 /// Only generator refresh mutations (CreateManagedNode) may add children there.
 /// Refuse to configure a capability the node does not have.
 fn require_capability(conn: &Connection, node_id: Uuid, cap: Capability) -> Result<()> {
-    if !NodeRepo::new(conn).list_capabilities(node_id)?.contains(&cap) {
+    if !NodeRepo::new(conn)
+        .list_capabilities(node_id)?
+        .contains(&cap)
+    {
         anyhow::bail!("{} is not enabled on node {node_id}", cap.label());
     }
     Ok(())
@@ -1269,7 +1273,9 @@ fn parse_obligation_phase(phase: &str, allow_unknown: bool) -> Result<&'static s
             anyhow::bail!("a new obligation must be tagged with a real phase, not `unknown`")
         }
         Some(p) => Ok(*p),
-        None => anyhow::bail!("unknown phase `{phase}` (expected requirements|design)"),
+        None => {
+            anyhow::bail!("unknown phase `{phase}` (expected requirements|design|verification)")
+        }
     }
 }
 
@@ -1541,7 +1547,11 @@ fn create_managed_node(
     // Store metadata as extra content.
     if let Some(meta) = metadata {
         let json = serde_json::to_string(meta)?;
-        node_repo.set_extra_content(node.id, crate::outline::types::EXTRA_CONTENT_METADATA, &json)?;
+        node_repo.set_extra_content(
+            node.id,
+            crate::outline::types::EXTRA_CONTENT_METADATA,
+            &json,
+        )?;
     }
 
     Ok(node.id)
@@ -1580,7 +1590,11 @@ fn update_managed_node(
     // Update metadata as extra content.
     if let Some(meta) = metadata {
         let json = serde_json::to_string(meta)?;
-        node_repo.set_extra_content(node_id, crate::outline::types::EXTRA_CONTENT_METADATA, &json)?;
+        node_repo.set_extra_content(
+            node_id,
+            crate::outline::types::EXTRA_CONTENT_METADATA,
+            &json,
+        )?;
     }
 
     Ok(())

@@ -52,10 +52,13 @@ pub fn new_section_row_key(phase: &str, kind: &str) -> String {
 /// as plan steps instead) but a legacy row tagged that way before the split
 /// still renders sensibly here.
 pub fn phase_label(phase: &str) -> &str {
-    use tod_store::interview::{PHASE_DESIGN, PHASE_PLANNING, PHASE_REQUIREMENTS, PHASE_UNKNOWN};
+    use tod_store::interview::{
+        PHASE_DESIGN, PHASE_PLANNING, PHASE_REQUIREMENTS, PHASE_UNKNOWN, PHASE_VERIFICATION,
+    };
     match phase {
         PHASE_REQUIREMENTS => "Requirements phase",
         PHASE_DESIGN => "Design phase",
+        PHASE_VERIFICATION => "Verification phase",
         PHASE_PLANNING => "Planning phase (legacy)",
         PHASE_UNKNOWN => "Unknown phase",
         other => other,
@@ -224,6 +227,7 @@ pub fn render_obligation(
         row_ix: state.row_ix,
         highlighted: state.highlighted,
         editor: Some(editor).filter(|_| state.editing),
+        columns: state.columns,
     };
     obligation_row(props, host, opts, window, cx)
 }

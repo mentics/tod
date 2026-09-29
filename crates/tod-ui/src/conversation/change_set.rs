@@ -885,6 +885,7 @@ impl ConversationView {
                         row_ix: ix,
                         highlighted,
                         editor,
+                        columns: &[],
                     },
                     &host,
                     opts,

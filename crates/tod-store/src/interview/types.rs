@@ -33,6 +33,8 @@ pub const MEMORY_DONE: &str = "done";
 pub const PHASE_REQUIREMENTS: &str = "requirements";
 pub const PHASE_DESIGN: &str = "design";
 pub const PHASE_PLANNING: &str = "planning";
+/// An obligation phase only: not an interview phase, so not in [`PHASES`].
+pub const PHASE_VERIFICATION: &str = "verification";
 pub const PHASES: [&str; 3] = [PHASE_REQUIREMENTS, PHASE_DESIGN, PHASE_PLANNING];
 
 /// Sentinel phase for obligations that predate phase-tagging (migrated rows,
@@ -44,7 +46,16 @@ pub const PHASE_UNKNOWN: &str = "unknown";
 /// artifact, while planning produces structured plan steps
 /// (`outline::PlanStepRepo`) instead. Historical obligations tagged `planning`
 /// from before this split still read back fine — this only gates creation.
-pub const OBLIGATION_PHASES: [&str; 3] = [PHASE_UNKNOWN, PHASE_REQUIREMENTS, PHASE_DESIGN];
+///
+/// `verification` is the obligations that check the work rather than define it:
+/// what the verify agent adds when it finds something the running work must
+/// also do. It has no interview.
+pub const OBLIGATION_PHASES: [&str; 4] = [
+    PHASE_UNKNOWN,
+    PHASE_REQUIREMENTS,
+    PHASE_DESIGN,
+    PHASE_VERIFICATION,
+];
 
 pub const QUESTION_MAKER_IDLE: &str = "idle";
 pub const QUESTION_MAKER_EXHAUSTED: &str = "exhausted";

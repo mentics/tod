@@ -1,16 +1,19 @@
 //! One obligation, as a row.
 
 use super::{RowHost, RowOptions, row_group, row_tail};
+use crate::ui::item_list::{ColumnSpec, column_cell};
 use crate::ui::selectable_text::selectable_text_with_menu;
 use crate::ui::style;
 use gpui::{
     AnyElement, App, Entity, InteractiveElement, IntoElement, MouseButton, ParentElement,
-    SharedString, Styled, Window, div, prelude::FluentBuilder,
+    SharedString, Styled, Window, div, prelude::FluentBuilder, px,
 };
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::input::{Textarea, TextareaState};
 use gpui_component::{ActiveTheme, Sizable as _, h_flex};
-use tod_store::interview::{PHASE_DESIGN, short_id};
+use tod_store::interview::{
+    PHASE_DESIGN, PHASE_PLANNING, PHASE_REQUIREMENTS, PHASE_UNKNOWN, PHASE_VERIFICATION, short_id,
+};
 use tod_store::outline::NodeObligation;
 use uuid::Uuid;
 
@@ -26,6 +29,33 @@ pub enum ObligationRowEvent {
     OpenVisualDesign { obligation_id: Uuid },
 }
 
+pub const COLUMN_TEXT: &str = "obligation";
+pub const COLUMN_STATUS: &str = "status";
+pub const COLUMN_PHASE: &str = "phase";
+
+/// The columns the obligations list is a table of: the text, then the two
+/// values every obligation has, each in a column of its own. The text column
+/// has no name; the row's ordinal leads it.
+pub fn obligation_columns() -> Vec<ColumnSpec> {
+    vec![
+        ColumnSpec::content(COLUMN_TEXT, ""),
+        ColumnSpec::fixed(COLUMN_STATUS, COLUMN_STATUS, px(110.)),
+        ColumnSpec::fixed(COLUMN_PHASE, COLUMN_PHASE, px(110.)),
+    ]
+}
+
+/// The phase an obligation belongs to, as the phase column shows it.
+pub fn phase_name(phase: &str) -> &str {
+    match phase {
+        PHASE_REQUIREMENTS => "Requirements",
+        PHASE_DESIGN => "Design",
+        PHASE_VERIFICATION => "Verification",
+        PHASE_PLANNING => "Planning",
+        PHASE_UNKNOWN => "Unknown",
+        other => other,
+    }
+}
+
 pub struct ObligationRowProps<'a> {
     pub obligation: &'a NodeObligation,
     /// The row's index in its host, reported back on select and used to key
@@ -34,6 +64,9 @@ pub struct ObligationRowProps<'a> {
     pub highlighted: bool,
     /// The inline editor, when this row is being edited.
     pub editor: Option<&'a Entity<TextareaState>>,
+    /// The list's columns, so the status and phase line up with the header.
+    /// Empty for a row that is not in a table (the change set's).
+    pub columns: &'a [ColumnSpec],
 }
 
 /// Render one obligation. The default [`RowOptions`] give the row the
@@ -51,6 +84,7 @@ pub fn obligation_row<A: From<ObligationRowEvent> + 'static>(
         row_ix,
         highlighted,
         editor,
+        columns,
     } = props;
     let id = obligation.id;
     let key = id.to_string();
@@ -84,7 +118,7 @@ pub fn obligation_row<A: From<ObligationRowEvent> + 'static>(
     } else {
         let row = row
             .items_start()
-            .gap_2()
+            .gap(style::space::INLINE)
             .px_2()
             .py_1p5()
             .pl_12()
@@ -183,6 +217,22 @@ pub fn obligation_row<A: From<ObligationRowEvent> + 'static>(
                     }),
             );
         }
+    }
+
+    if !compact && !columns.is_empty() {
+        // Their own cells, so both line up down the list whether or not a
+        // row has a standing.
+        let status = column_cell(columns, COLUMN_STATUS, h_flex())
+            .items_start()
+            .children(opts.trailing_context.take());
+        let phase = column_cell(columns, COLUMN_PHASE, div())
+            .text_xs()
+            .text_color(muted)
+            .whitespace_nowrap()
+            .text_ellipsis()
+            .overflow_hidden()
+            .child(phase_name(&obligation.phase).to_string());
+        row = row.child(status).child(phase);
     }
 
     row.children(row_tail(&key, &group, highlighted, &mut opts))

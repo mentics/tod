@@ -32,7 +32,9 @@ pub use finding_row::{
     FindingRowEvent, FindingRowProps, STATUS_COLUMN_WIDTH, finding_columns, finding_row,
 };
 pub use node_row::{NodeRowEvent, NodeRowProps, node_row};
-pub use obligation_row::{ObligationRowEvent, ObligationRowProps, obligation_row};
+pub use obligation_row::{
+    ObligationRowEvent, ObligationRowProps, obligation_columns, obligation_row,
+};
 pub use plan_step_row::{PlanStepRowEvent, PlanStepRowProps, plan_step_columns, plan_step_row};
 pub use status_menu::StatusMenu;
 

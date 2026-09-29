@@ -51,6 +51,10 @@ Work in this order:
    delivered the behaviour; if no step covers it, add one that `--satisfies`
    the obligation and fail that. The app sends you back until this is so.
 
+If verifying shows the work must also do something no obligation states, you
+may add it as an obligation. Give it `--phase verification`: it is a check you
+found, not a requirement or design decision the user made.
+
 The app reads the verdicts and the plan steps, not your reply — a finding
 that is only in your reply is lost. A `failed` step's note is what the
 implementation agent starts from, so make it complete on its own: what you

@@ -24,8 +24,8 @@ required) and names each row's node as `on <slug>`.
 COMMANDS:
     list       [--node <UUID>] [--search <TEXT>] [--kind requirement|constraint] [--inherited]
     show       <ID>
-    add        --node <UUID> --kind requirement|constraint --body <TEXT> --phase requirements|design [--section <NAME>] [--after <ID>] [--before]
-    update     <ID> [--body <TEXT>] [--section <NAME>] [--phase requirements|design|unknown]      (--section \"\" clears it)
+    add        --node <UUID> --kind requirement|constraint --body <TEXT> --phase requirements|design|verification [--section <NAME>] [--after <ID>] [--before]
+    update     <ID> [--body <TEXT>] [--section <NAME>] [--phase requirements|design|verification|unknown]      (--section \"\" clears it)
     move       <ID> --node <UUID>
     delete     <ID>
     deleted    --node <UUID> [--by user|agent|<SESSION>]      deleted obligations that can still be restored, newest first
@@ -75,23 +75,29 @@ fn normalize_kind(raw: &str) -> anyhow::Result<&'static str> {
 
 /// Parse a `--phase` value for `update` (allows `unknown`).
 fn normalize_phase(raw: &str) -> anyhow::Result<&'static str> {
-    use tod_store::interview::{PHASE_DESIGN, PHASE_UNKNOWN};
+    use tod_store::interview::{PHASE_DESIGN, PHASE_UNKNOWN, PHASE_VERIFICATION};
     match raw.trim().to_ascii_lowercase().as_str() {
         "requirements" | "requirement" => Ok(PHASE_REQUIREMENTS),
         "design" => Ok(PHASE_DESIGN),
+        "verification" => Ok(PHASE_VERIFICATION),
         "unknown" => Ok(PHASE_UNKNOWN),
-        other => anyhow::bail!("unknown phase `{other}` (expected requirements|design|unknown)"),
+        other => anyhow::bail!(
+            "unknown phase `{other}` (expected requirements|design|verification|unknown)"
+        ),
     }
 }
 
 /// Parse a `--phase` value for `add` (never allows `unknown` — new obligations
 /// must always be tagged with a real phase).
 fn normalize_creation_phase(raw: &str) -> anyhow::Result<&'static str> {
-    use tod_store::interview::PHASE_DESIGN;
+    use tod_store::interview::{PHASE_DESIGN, PHASE_VERIFICATION};
     match raw.trim().to_ascii_lowercase().as_str() {
         "requirements" | "requirement" => Ok(PHASE_REQUIREMENTS),
         "design" => Ok(PHASE_DESIGN),
-        other => anyhow::bail!("unknown phase `{other}` (expected requirements|design)"),
+        "verification" => Ok(PHASE_VERIFICATION),
+        other => {
+            anyhow::bail!("unknown phase `{other}` (expected requirements|design|verification)")
+        }
     }
 }
 
@@ -145,7 +151,13 @@ fn list(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
         };
         let slugs = match node {
             Some(_) => None,
-            None => Some(nodes.list_all()?.into_iter().map(|n| (n.id, n.slug)).collect()),
+            None => Some(
+                nodes
+                    .list_all()?
+                    .into_iter()
+                    .map(|n| (n.id, n.slug))
+                    .collect(),
+            ),
         };
         let rows = rows
             .into_iter()
@@ -268,7 +280,10 @@ fn add(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
         .map(normalize_creation_phase)
         .transpose()?
         .unwrap_or(PHASE_REQUIREMENTS);
-    let after = args.get("--after").map(|raw| resolve(inv, raw)).transpose()?;
+    let after = args
+        .get("--after")
+        .map(|raw| resolve(inv, raw))
+        .transpose()?;
     let id = Uuid::new_v4();
     let client = inv.client();
     // Routed through `interview()` (not the raw `.outline()` mutation queue) so
@@ -424,7 +439,11 @@ fn restore(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
             if done.is_empty() {
                 anyhow::bail!("r-{}: {err}", snapshot.rev);
             }
-            anyhow::bail!("r-{}: {err}\n(already restored: {})", snapshot.rev, done.join(", "));
+            anyhow::bail!(
+                "r-{}: {err}\n(already restored: {})",
+                snapshot.rev,
+                done.join(", ")
+            );
         }
         restored.push(snapshot);
     }
@@ -518,7 +537,11 @@ fn render_snapshots(rows: &[ObligationSnapshot], json: bool) -> String {
                 "r-{} [{}] {} by {}, was {}/{}{section}: {}",
                 s.rev,
                 short_id(s.obligation_id),
-                if s.op == "delete" { "deleted" } else { "edited" },
+                if s.op == "delete" {
+                    "deleted"
+                } else {
+                    "edited"
+                },
                 actor_label(&s.actor),
                 s.prior.phase,
                 s.prior.kind,

@@ -6,7 +6,6 @@ pub use rows::DRAG_LIST;
 
 use crate::ui::actionable::{chrome_control_with_shortcut, render_shortcut_pill};
 use crate::ui::agent_chat::OpenAgentChat;
-use crate::ui::report_problem::ReportProblem;
 use crate::ui::item_list::keyboard::{
     ItemListActivate, ItemListAddGroup, ItemListCollapse, ItemListCommitEdit, ItemListCreateAbove,
     ItemListCreateBelow, ItemListCreateChild, ItemListDelete, ItemListDown, ItemListEdit,
@@ -20,8 +19,9 @@ use crate::ui::item_list::{
 };
 use crate::ui::key_context;
 use crate::ui::pane_nav::{PaneFocusLeft, bind_modified_pane_nav};
+use crate::ui::report_problem::ReportProblem;
 use crate::ui::status_filter::{StatusFilter, render_status_filter, status_counts};
-use crate::views::rows::{RowAction, RowHost};
+use crate::views::rows::{RowAction, RowHost, obligation_columns};
 use gpui::prelude::FluentBuilder;
 use gpui::{
     App, AppContext, Context, Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement,
@@ -129,7 +129,9 @@ pub enum ObligationsEvent {
     },
     /// Ctrl+Shift+R — report a problem against the node behind the selected
     /// obligation.
-    ReportProblem { node_id: Uuid },
+    ReportProblem {
+        node_id: Uuid,
+    },
     /// Clicked the "Design"/"+ Design" affordance on a design-phase
     /// obligation row — create or open its associated visual-design mockup.
     OpenVisualDesign {
@@ -258,6 +260,7 @@ impl ObligationsView {
             active_phase: None,
             focus_handle: cx.focus_handle(),
             list: ItemList::new()
+                .with_columns(obligation_columns())
                 .with_group_editor(section_edit_input.clone(), SECTION_EDIT_TAG)
                 .with_marking()
                 .with_reorder(DRAG_LIST)
@@ -530,7 +533,7 @@ impl ObligationsView {
         self.rebuild_visible(window, cx);
     }
 
-    /// Phases in display order: the two obligation-eligible phases, then
+    /// Phases in display order: the obligation-eligible phases, then
     /// `unknown` last (legacy/unclassified obligations trail behind real
     /// ones). `planning` is not a valid obligation phase — planning work is
     /// tracked as plan steps instead — so it never appears here.
@@ -538,6 +541,7 @@ impl ObligationsView {
         [
             PHASE_REQUIREMENTS,
             tod_store::interview::PHASE_DESIGN,
+            tod_store::interview::PHASE_VERIFICATION,
             PHASE_UNKNOWN,
         ]
     }
@@ -595,7 +599,10 @@ impl ObligationsView {
                 .filter(|o| o.phase == phase)
                 .copied()
                 .collect();
-            if phase_items.is_empty() && (narrowed || phase == PHASE_UNKNOWN) {
+            // Requirements and design are always there to add to; the others only
+            // when something is in them.
+            let always = phase == PHASE_REQUIREMENTS || phase == tod_store::interview::PHASE_DESIGN;
+            if phase_items.is_empty() && (narrowed || !always) {
                 continue;
             }
             let key = phase_row_key(phase);

@@ -37,3 +37,18 @@ planning, since the component's requirements and constraints can call for plan
 steps here, look the node up by its slug and list its obligations with
 `tod-cli`.
 
+
+## Phase
+
+Every obligation belongs to one phase, the one whose work it belongs to, and
+the app shows it beside the obligation. Choose it when you add one:
+
+- `requirements` — what the work must achieve, from the user's point of view.
+- `design` — how it is to look or be built: interface, structure, technology.
+- `verification` — a check on the finished work that the requirements and
+  design did not already state: something you found while verifying that the
+  running work must also do. It is not a restatement of a requirement; a
+  requirement you are verifying keeps its own phase.
+
+Do not default to `requirements`. If you cannot say which phase it is, it is
+probably not an obligation yet.

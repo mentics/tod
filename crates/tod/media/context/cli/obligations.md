@@ -6,8 +6,8 @@ as the 8-character prefix shown in listings.
 ```
 tod-cli --data-root <DATA_ROOT> obligations list       [--node <UUID>] [--search <TEXT>] [--kind requirement|constraint] [--inherited]
 tod-cli --data-root <DATA_ROOT> obligations show       <ID>
-tod-cli --data-root <DATA_ROOT> obligations add        --node <UUID> --kind requirement|constraint --body <TEXT> --phase requirements|design [--section <NAME>] [--after <ID>] [--before]
-tod-cli --data-root <DATA_ROOT> obligations update     <ID> [--body <TEXT>] [--section <NAME>] [--phase requirements|design|unknown]
+tod-cli --data-root <DATA_ROOT> obligations add        --node <UUID> --kind requirement|constraint --body <TEXT> --phase requirements|design|verification [--section <NAME>] [--after <ID>] [--before]
+tod-cli --data-root <DATA_ROOT> obligations update     <ID> [--body <TEXT>] [--section <NAME>] [--phase requirements|design|verification|unknown]
 tod-cli --data-root <DATA_ROOT> obligations move       <ID> --node <UUID>
 tod-cli --data-root <DATA_ROOT> obligations delete     <ID>
 tod-cli --data-root <DATA_ROOT> obligations deleted    --node <UUID> [--by user|agent|<SESSION>]
@@ -26,7 +26,8 @@ it after a specific obligation, and add `--before` to place it before that one
 instead. Obligation text with no words is refused. On `update`, `--section ""`
 clears the section.
 
-Inside an interview, an agent's `add` always writes its own session's phase —
+`--phase` says which phase the obligation belongs to; see the Phase section of
+the obligations concepts for how to choose. Inside an interview, an agent's `add` always writes its own session's phase —
 `--phase` there only matters when running `add` outside an interview.
 
 `deleted` and `history` list changes as `r-<n>`; deletions and edits stay
