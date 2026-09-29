@@ -400,7 +400,7 @@ impl TaskPanel {
             .into_any_element()
     }
 
-    /// A muted, clickable label that opens `url` in the browser.
+    /// A label that opens `url` in the browser (`styles.text-link-external`).
     fn external_link(
         &self,
         id: impl Into<ElementId>,
@@ -408,8 +408,7 @@ impl TaskPanel {
         url: String,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        style::text_muted(div().id(id))
-            .cursor_pointer()
+        style::text_link_external(div().id(id))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |_this, _event: &MouseDownEvent, _, cx| {
