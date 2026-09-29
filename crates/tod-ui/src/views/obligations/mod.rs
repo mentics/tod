@@ -533,7 +533,7 @@ impl ObligationsView {
         self.rebuild_visible(window, cx);
     }
 
-    /// Phases in display order: the obligation-eligible phases, then
+    /// Phases in display order: the two obligation-eligible phases, then
     /// `unknown` last (legacy/unclassified obligations trail behind real
     /// ones). `planning` is not a valid obligation phase — planning work is
     /// tracked as plan steps instead — so it never appears here.
@@ -541,7 +541,6 @@ impl ObligationsView {
         [
             PHASE_REQUIREMENTS,
             tod_store::interview::PHASE_DESIGN,
-            tod_store::interview::PHASE_VERIFICATION,
             PHASE_UNKNOWN,
         ]
     }
@@ -599,10 +598,7 @@ impl ObligationsView {
                 .filter(|o| o.phase == phase)
                 .copied()
                 .collect();
-            // Requirements and design are always there to add to; the others only
-            // when something is in them.
-            let always = phase == PHASE_REQUIREMENTS || phase == tod_store::interview::PHASE_DESIGN;
-            if phase_items.is_empty() && (narrowed || !always) {
+            if phase_items.is_empty() && (narrowed || phase == PHASE_UNKNOWN) {
                 continue;
             }
             let key = phase_row_key(phase);
@@ -1948,6 +1944,7 @@ mod tests {
                 section: Some(section.to_string()),
                 body: format!("ob {ix}"),
                 phase: "requirements".to_string(),
+                acts_in: "active".to_string(),
                 visual_design_path: None,
             })
             .collect()

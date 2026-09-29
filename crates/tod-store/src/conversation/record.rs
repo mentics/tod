@@ -45,6 +45,7 @@ pub fn snapshot(conn: &Connection, entity: Entity, id: Uuid) -> Result<Option<En
                     section: o.section,
                     body: o.body,
                     phase: o.phase,
+                    acts_in: o.acts_in,
                     ordinal: o.ordinal,
                     visual_design_path: o.visual_design_path,
                 })
@@ -138,7 +139,8 @@ pub fn classify(mutation: &OutlineMutation) -> Option<(ActionKind, Entity, Uuid)
         M::UpdateObligationBody { obligation_id, .. }
         | M::UpdateObligationVisualDesign { obligation_id, .. }
         | M::UpdateObligationSection { obligation_id, .. }
-        | M::UpdateObligationPhase { obligation_id, .. } => {
+        | M::UpdateObligationPhase { obligation_id, .. }
+        | M::UpdateObligationActsIn { obligation_id, .. } => {
             (Edit, Entity::Obligation, *obligation_id)
         }
         M::UpdatePlanStepBody { step_id, .. }

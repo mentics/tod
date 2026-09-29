@@ -167,8 +167,14 @@ pub fn obligation_line(o: &NodeObligation) -> String {
     } else {
         ""
     };
+    // Only when it is not the usual: built in `active`.
+    let acts_in = if o.acts_in == tod_store::outline::ACTS_IN_ACTIVE {
+        String::new()
+    } else {
+        format!(" acts_in={}", o.acts_in)
+    };
     format!(
-        "[{}] {}{section}: {}{visual_design}",
+        "[{}] {}{acts_in}{section}: {}{visual_design}",
         short_id(o.id),
         o.kind,
         one_line(&o.body)
@@ -458,6 +464,7 @@ mod tests {
             section: section.map(Into::into),
             body: format!("body {n}"),
             phase: "requirements".into(),
+            acts_in: "active".into(),
             visual_design_path: None,
         }
     }

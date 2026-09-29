@@ -24,8 +24,8 @@ required) and names each row's node as `on <slug>`.
 COMMANDS:
     list       [--node <UUID>] [--search <TEXT>] [--kind requirement|constraint] [--inherited]
     show       <ID>
-    add        --node <UUID> --kind requirement|constraint --body <TEXT> --phase requirements|design|verification [--section <NAME>] [--after <ID>] [--before]
-    update     <ID> [--body <TEXT>] [--section <NAME>] [--phase requirements|design|verification|unknown]      (--section \"\" clears it)
+    add        --node <UUID> --kind requirement|constraint --body <TEXT> --phase requirements|design [--acts-in design|active|verifying|merged|released] [--section <NAME>] [--after <ID>] [--before]
+    update     <ID> [--body <TEXT>] [--section <NAME>] [--phase requirements|design|unknown] [--acts-in design|active|verifying|merged|released]      (--section \"\" clears it)
     move       <ID> --node <UUID>
     delete     <ID>
     deleted    --node <UUID> [--by user|agent|<SESSION>]      deleted obligations that can still be restored, newest first
@@ -38,6 +38,9 @@ obligation as it was before that change — a deleted one with its id and
 position; an edited one with its earlier wording. With --node and --by it
 restores every listed deletion by that party. Deletions and edits stay
 restorable for 30 days.
+
+`--phase` is the state the obligation was introduced in; `--acts-in` is the
+state whose agent acts on it (default `active`: it is built).
 
 Inside an interview, an agent's `add` always writes its own session's phase —
 `--phase` there only matters when running `add` outside an interview.
@@ -75,29 +78,37 @@ fn normalize_kind(raw: &str) -> anyhow::Result<&'static str> {
 
 /// Parse a `--phase` value for `update` (allows `unknown`).
 fn normalize_phase(raw: &str) -> anyhow::Result<&'static str> {
-    use tod_store::interview::{PHASE_DESIGN, PHASE_UNKNOWN, PHASE_VERIFICATION};
+    use tod_store::interview::{PHASE_DESIGN, PHASE_UNKNOWN};
     match raw.trim().to_ascii_lowercase().as_str() {
         "requirements" | "requirement" => Ok(PHASE_REQUIREMENTS),
         "design" => Ok(PHASE_DESIGN),
-        "verification" => Ok(PHASE_VERIFICATION),
         "unknown" => Ok(PHASE_UNKNOWN),
-        other => anyhow::bail!(
-            "unknown phase `{other}` (expected requirements|design|verification|unknown)"
-        ),
+        other => anyhow::bail!("unknown phase `{other}` (expected requirements|design|unknown)"),
     }
+}
+
+/// Parse an `--acts-in` value.
+fn normalize_acts_in(raw: &str) -> anyhow::Result<&'static str> {
+    let raw = raw.trim().to_ascii_lowercase();
+    tod_store::outline::OBLIGATION_ACTS_IN
+        .iter()
+        .find(|a| **a == raw)
+        .copied()
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "unknown acts-in `{raw}` (expected design|active|verifying|merged|released)"
+            )
+        })
 }
 
 /// Parse a `--phase` value for `add` (never allows `unknown` — new obligations
 /// must always be tagged with a real phase).
 fn normalize_creation_phase(raw: &str) -> anyhow::Result<&'static str> {
-    use tod_store::interview::{PHASE_DESIGN, PHASE_VERIFICATION};
+    use tod_store::interview::PHASE_DESIGN;
     match raw.trim().to_ascii_lowercase().as_str() {
         "requirements" | "requirement" => Ok(PHASE_REQUIREMENTS),
         "design" => Ok(PHASE_DESIGN),
-        "verification" => Ok(PHASE_VERIFICATION),
-        other => {
-            anyhow::bail!("unknown phase `{other}` (expected requirements|design|verification)")
-        }
+        other => anyhow::bail!("unknown phase `{other}` (expected requirements|design)"),
     }
 }
 
@@ -194,6 +205,7 @@ fn list(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
                     "section": r.section,
                     "body": r.body,
                     "phase": r.phase,
+                    "acts_in": r.acts_in,
                     "inherited_from": source,
                 });
                 if let Some(item) = item.as_object_mut() {
@@ -217,6 +229,7 @@ fn list(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
                 .as_deref()
                 .map(|s| format!(" ({s})"))
                 .unwrap_or_default();
+            let acts = acts_in_note(&o.acts_in);
             let from = source
                 .as_deref()
                 .map(|s| format!(" [from \"{s}\"]"))
@@ -225,7 +238,7 @@ fn list(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
                 .map(|slug| format!(" on {slug}"))
                 .unwrap_or_default();
             format!(
-                "[{}] {}/{}{section}{from}{on}: {}",
+                "[{}] {}/{}{acts}{section}{from}{on}: {}",
                 short_id(o.id),
                 o.phase,
                 o.kind,
@@ -234,6 +247,15 @@ fn list(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
         })
         .collect::<Vec<_>>()
         .join("\n"))
+}
+
+/// ` acts-in=<state>` when the obligation is not acted on in `active`.
+fn acts_in_note(acts_in: &str) -> String {
+    if acts_in == tod_store::outline::ACTS_IN_ACTIVE {
+        String::new()
+    } else {
+        format!(" acts-in={acts_in}")
+    }
 }
 
 fn show(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
@@ -253,6 +275,7 @@ fn show(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
             "section": row.section,
             "body": row.body,
             "phase": row.phase,
+            "acts_in": row.acts_in,
         });
         return Ok(value.to_string());
     }
@@ -262,10 +285,11 @@ fn show(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
         .map(|s| format!(" ({s})"))
         .unwrap_or_default();
     Ok(format!(
-        "[{}] {}/{}{section} on node {}\n{}",
+        "[{}] {}/{}{}{section} on node {}\n{}",
         short_id(row.id),
         row.phase,
         row.kind,
+        acts_in_note(&row.acts_in),
         row.node_id,
         row.body
     ))
@@ -280,6 +304,7 @@ fn add(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
         .map(normalize_creation_phase)
         .transpose()?
         .unwrap_or(PHASE_REQUIREMENTS);
+    let acts_in = args.get("--acts-in").map(normalize_acts_in).transpose()?;
     let after = args
         .get("--after")
         .map(|raw| resolve(inv, raw))
@@ -306,6 +331,15 @@ fn add(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
         },
         target: None,
     })?;
+    if let Some(acts_in) = acts_in.filter(|a| *a != tod_store::outline::ACTS_IN_ACTIVE) {
+        client.interview(InterviewCommand::Outline {
+            mutation: OutlineMutation::UpdateObligationActsIn {
+                obligation_id: id,
+                acts_in: acts_in.to_string(),
+            },
+            target: None,
+        })?;
+    }
     Ok(ack(id, inv.json))
 }
 
@@ -314,8 +348,9 @@ fn update(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
     let body = args.get("--body");
     let section = args.get("--section");
     let phase = args.get("--phase").map(normalize_phase).transpose()?;
-    if body.is_none() && section.is_none() && phase.is_none() {
-        anyhow::bail!("--body, --section, and/or --phase is required");
+    let acts_in = args.get("--acts-in").map(normalize_acts_in).transpose()?;
+    if body.is_none() && section.is_none() && phase.is_none() && acts_in.is_none() {
+        anyhow::bail!("--body, --section, --phase, and/or --acts-in is required");
     }
     let client = inv.client();
     let mut target = Some(id);
@@ -342,6 +377,15 @@ fn update(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
             mutation: OutlineMutation::UpdateObligationPhase {
                 obligation_id: id,
                 phase: phase.to_string(),
+            },
+            target: target.take(),
+        })?;
+    }
+    if let Some(acts_in) = acts_in {
+        client.interview(InterviewCommand::Outline {
+            mutation: OutlineMutation::UpdateObligationActsIn {
+                obligation_id: id,
+                acts_in: acts_in.to_string(),
             },
             target: target.take(),
         })?;

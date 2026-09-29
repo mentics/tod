@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Current fleet schema epoch stored in `PRAGMA user_version`.
-pub const CURRENT_USER_VERSION: i32 = 78;
+pub const CURRENT_USER_VERSION: i32 = 79;
 
 const BUSY_TIMEOUT_MS: i64 = 5000;
 
@@ -498,6 +498,12 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
         // their nodes by it; `managed_node_links` is folded in and dropped.
         migrate_v77_to_v78(conn)?;
         conn.pragma_update(None, "user_version", 78)?;
+    }
+    if version < 79 {
+        // The lifecycle state whose agent acts on each obligation, apart
+        // from the state it was introduced in (`phase`).
+        ensure_obligation_acts_in(conn)?;
+        conn.pragma_update(None, "user_version", 79)?;
     }
     // Other branches (the task panel) numbered their own steps 66–67 at the
     // same time as 66–70 above, so a store may be past a version without
@@ -1328,6 +1334,30 @@ fn ensure_plan_step_phase(conn: &Connection) -> Result<()> {
                  CHECK (phase IN ('active', 'verifying', 'merged', 'released'));",
         )?;
     }
+    Ok(())
+}
+
+/// `node_obligations.acts_in`: where an obligation is acted on, which
+/// defaults to `active` (it is built). A no-op when the column is there.
+/// A `verification` value in `phase` (an obligation phase that briefly
+/// existed) was really this: it becomes a design obligation acting in
+/// `verifying`.
+fn ensure_obligation_acts_in(conn: &Connection) -> Result<()> {
+    let has: bool = conn.query_row(
+        "SELECT COUNT(*) > 0 FROM pragma_table_info('node_obligations') WHERE name = 'acts_in'",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has {
+        conn.execute_batch(
+            "ALTER TABLE node_obligations ADD COLUMN acts_in TEXT NOT NULL DEFAULT 'active'
+                 CHECK (acts_in IN ('design', 'active', 'verifying', 'merged', 'released'));",
+        )?;
+    }
+    conn.execute_batch(
+        "UPDATE node_obligations SET acts_in = 'verifying', phase = 'design'
+         WHERE phase = 'verification';",
+    )?;
     Ok(())
 }
 

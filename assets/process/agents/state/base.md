@@ -37,7 +37,7 @@ Some or all of the following appear in your prompt:
 
 ## Plan steps belong to phases
 
-A plan step is an action, and each belongs to the phase whose agent takes it: most to `active`, a few to `verifying`, `merged`, or `released` when only that phase can take them. Work the steps of your own phase; an earlier phase's are done, and a later phase's are not yours yet. A later phase's step is both done and verified by that phase: set it `implemented` when the action is taken, then `verified` once you have checked it took effect. Record a verdict, through the `verdicts` noun, on each obligation that only your phase's steps deliver: no `verifying` comes after you to do it.
+A plan step is an action, and each belongs to the phase whose agent takes it: most to `active`, a few to `verifying`, `merged`, or `released` when only that phase can take them. Work the steps of your own phase; an earlier phase's are done, and a later phase's are not yours yet. A later phase's step is both done and verified by that phase: set it `implemented` when the action is taken, then `verified` once you have checked it took effect. Record a verdict, through the `verdicts` noun, on each obligation that acts in your phase or that only your phase's steps deliver: no `verifying` comes after you to do it.
 
 ## Acting on shared environments
 

@@ -11,9 +11,7 @@ use gpui::{
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::input::{Textarea, TextareaState};
 use gpui_component::{ActiveTheme, Sizable as _, h_flex};
-use tod_store::interview::{
-    PHASE_DESIGN, PHASE_PLANNING, PHASE_REQUIREMENTS, PHASE_UNKNOWN, PHASE_VERIFICATION, short_id,
-};
+use tod_store::interview::{PHASE_DESIGN, short_id};
 use tod_store::outline::NodeObligation;
 use uuid::Uuid;
 
@@ -31,29 +29,19 @@ pub enum ObligationRowEvent {
 
 pub const COLUMN_TEXT: &str = "obligation";
 pub const COLUMN_STATUS: &str = "status";
-pub const COLUMN_PHASE: &str = "phase";
+pub const COLUMN_ACTS_IN: &str = "acts_in";
 
 /// The columns the obligations list is a table of: the text, then the two
 /// values every obligation has, each in a column of its own. The text column
-/// has no name; the row's ordinal leads it.
+/// has no name; the row's ordinal leads it. "Acts in" is the lifecycle state
+/// whose agent acts on the obligation, not the state it was introduced in
+/// (that is the group it sits under).
 pub fn obligation_columns() -> Vec<ColumnSpec> {
     vec![
         ColumnSpec::content(COLUMN_TEXT, ""),
         ColumnSpec::fixed(COLUMN_STATUS, COLUMN_STATUS, px(110.)),
-        ColumnSpec::fixed(COLUMN_PHASE, COLUMN_PHASE, px(110.)),
+        ColumnSpec::fixed(COLUMN_ACTS_IN, "acts in", px(110.)),
     ]
-}
-
-/// The phase an obligation belongs to, as the phase column shows it.
-pub fn phase_name(phase: &str) -> &str {
-    match phase {
-        PHASE_REQUIREMENTS => "Requirements",
-        PHASE_DESIGN => "Design",
-        PHASE_VERIFICATION => "Verification",
-        PHASE_PLANNING => "Planning",
-        PHASE_UNKNOWN => "Unknown",
-        other => other,
-    }
 }
 
 pub struct ObligationRowProps<'a> {
@@ -225,14 +213,14 @@ pub fn obligation_row<A: From<ObligationRowEvent> + 'static>(
         let status = column_cell(columns, COLUMN_STATUS, h_flex())
             .items_start()
             .children(opts.trailing_context.take());
-        let phase = column_cell(columns, COLUMN_PHASE, div())
+        let acts_in = column_cell(columns, COLUMN_ACTS_IN, div())
             .text_xs()
             .text_color(muted)
             .whitespace_nowrap()
             .text_ellipsis()
             .overflow_hidden()
-            .child(phase_name(&obligation.phase).to_string());
-        row = row.child(status).child(phase);
+            .child(obligation.acts_in.clone());
+        row = row.child(status).child(acts_in);
     }
 
     row.children(row_tail(&key, &group, highlighted, &mut opts))

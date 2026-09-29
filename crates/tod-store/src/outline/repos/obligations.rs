@@ -9,6 +9,28 @@ use uuid::Uuid;
 pub const KIND_REQUIREMENT: &str = "requirement";
 pub const KIND_CONSTRAINT: &str = "constraint";
 
+/// Where an obligation is acted on: the lifecycle state whose agent takes
+/// action on it, apart from `phase`, the state it was *introduced* in. An
+/// obligation nearly always acts in `active` (it is built). `design` is for a
+/// high-level obligation that the design phase's own work carries out (through
+/// design obligations that refine it), so no plan step delivers it and
+/// verification does not rule on it directly. `verifying` is for one that
+/// only needs checking, not building; `merged` and `released` are for what
+/// only those phases can deliver.
+pub const ACTS_IN_DESIGN: &str = "design";
+pub const ACTS_IN_ACTIVE: &str = "active";
+pub const ACTS_IN_VERIFYING: &str = "verifying";
+pub const ACTS_IN_MERGED: &str = "merged";
+pub const ACTS_IN_RELEASED: &str = "released";
+/// The values `acts_in` may take, earliest first.
+pub const OBLIGATION_ACTS_IN: [&str; 5] = [
+    ACTS_IN_DESIGN,
+    ACTS_IN_ACTIVE,
+    ACTS_IN_VERIFYING,
+    ACTS_IN_MERGED,
+    ACTS_IN_RELEASED,
+];
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ObligationCounts {
     pub requirements: usize,
@@ -23,7 +45,11 @@ pub struct NodeObligation {
     pub ordinal: i32,
     pub section: Option<String>,
     pub body: String,
+    /// The lifecycle state this obligation was introduced in
+    /// (`requirements` | `design`).
     pub phase: String,
+    /// The lifecycle state whose agent acts on it (see [`ACTS_IN_ACTIVE`]).
+    pub acts_in: String,
     /// Path (relative to the data root) of the associated visual-design
     /// mockup HTML file, when one has been saved. At most one per
     /// obligation — saving again overwrites this rather than adding another.
@@ -34,6 +60,15 @@ pub struct ObligationRepo<'a> {
     conn: &'a Connection,
 }
 
+impl NodeObligation {
+    /// Whether plan steps deliver this obligation, so the planning trace
+    /// gate needs one for it. A `design` obligation is carried out by the
+    /// design work and a `verifying` one only needs checking.
+    pub fn needs_plan_step(&self) -> bool {
+        self.acts_in != ACTS_IN_DESIGN && self.acts_in != ACTS_IN_VERIFYING
+    }
+}
+
 impl<'a> ObligationRepo<'a> {
     pub fn new(conn: &'a Connection) -> Self {
         Self { conn }
@@ -42,8 +77,8 @@ impl<'a> ObligationRepo<'a> {
     pub fn insert(&self, row: &NodeObligation) -> Result<()> {
         let now = now_ms();
         self.conn.execute(
-            "INSERT INTO node_obligations (id, node_id, kind, ordinal, section, body, phase, visual_design_path, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)",
+            "INSERT INTO node_obligations (id, node_id, kind, ordinal, section, body, phase, acts_in, visual_design_path, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)",
             params![
                 uuid_to_blob(row.id),
                 uuid_to_blob(row.node_id),
@@ -52,6 +87,7 @@ impl<'a> ObligationRepo<'a> {
                 row.section,
                 row.body,
                 row.phase,
+                row.acts_in,
                 row.visual_design_path,
                 now
             ],
@@ -61,7 +97,7 @@ impl<'a> ObligationRepo<'a> {
 
     pub fn get(&self, id: Uuid) -> Result<Option<NodeObligation>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, node_id, kind, ordinal, section, body, phase, visual_design_path FROM node_obligations WHERE id = ?1",
+            "SELECT id, node_id, kind, ordinal, section, body, phase, acts_in, visual_design_path FROM node_obligations WHERE id = ?1",
         )?;
         let row = stmt
             .query_row(params![uuid_to_blob(id)], map_obligation)
@@ -71,7 +107,7 @@ impl<'a> ObligationRepo<'a> {
 
     pub fn list_for_node(&self, node_id: Uuid) -> Result<Vec<NodeObligation>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, node_id, kind, ordinal, section, body, phase, visual_design_path FROM node_obligations
+            "SELECT id, node_id, kind, ordinal, section, body, phase, acts_in, visual_design_path FROM node_obligations
              WHERE node_id = ?1 ORDER BY kind, ordinal",
         )?;
         let rows = stmt
@@ -84,7 +120,7 @@ impl<'a> ObligationRepo<'a> {
     /// kind and ordinal. Backs the project-wide `tod-cli obligations list`.
     pub fn list_all(&self) -> Result<Vec<NodeObligation>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, node_id, kind, ordinal, section, body, phase, visual_design_path FROM node_obligations
+            "SELECT id, node_id, kind, ordinal, section, body, phase, acts_in, visual_design_path FROM node_obligations
              ORDER BY node_id, kind, ordinal",
         )?;
         let rows = stmt
@@ -148,6 +184,17 @@ impl<'a> ObligationRepo<'a> {
         Ok(())
     }
 
+    pub fn update_acts_in(&self, id: Uuid, acts_in: &str) -> Result<()> {
+        let n = self.conn.execute(
+            "UPDATE node_obligations SET acts_in = ?1, updated_at = ?2 WHERE id = ?3",
+            params![acts_in, now_ms(), uuid_to_blob(id)],
+        )?;
+        if n == 0 {
+            anyhow::bail!("obligation not found");
+        }
+        Ok(())
+    }
+
     /// Set (or clear, with `None`) the associated visual-design mockup path.
     /// Overwrites any previous value — an obligation has at most one.
     pub fn update_visual_design_path(&self, id: Uuid, path: Option<&str>) -> Result<()> {
@@ -195,6 +242,7 @@ impl<'a> ObligationRepo<'a> {
             section: section.map(str::to_string),
             body: body.to_string(),
             phase: phase.to_string(),
+            acts_in: ACTS_IN_ACTIVE.to_string(),
             visual_design_path: None,
         })?;
         ids.insert(index, id);
@@ -252,6 +300,7 @@ impl<'a> ObligationRepo<'a> {
             section: row.section,
             body: row.body,
             phase: row.phase,
+            acts_in: row.acts_in,
             visual_design_path: row.visual_design_path,
         })?;
         Ok(())
@@ -351,6 +400,7 @@ fn map_obligation(row: &rusqlite::Row<'_>) -> rusqlite::Result<NodeObligation> {
         section: row.get(4)?,
         body: row.get(5)?,
         phase: row.get(6)?,
-        visual_design_path: row.get(7)?,
+        acts_in: row.get(7)?,
+        visual_design_path: row.get(8)?,
     })
 }

@@ -409,6 +409,7 @@ fn capture_outline_inverse(conn: &Connection, m: &OutlineMutation) -> Result<Opt
         | OutlineMutation::RenameObligationSection { .. }
         | OutlineMutation::UpdateObligationSection { .. }
         | OutlineMutation::UpdateObligationPhase { .. }
+        | OutlineMutation::UpdateObligationActsIn { .. }
         | OutlineMutation::ReorderObligation { .. }
         // Conversation reversal only; never on the Ctrl+Z history.
         | OutlineMutation::RestoreObligationRow { .. }

@@ -31,6 +31,13 @@ pub struct BaselineObligation {
     pub id: Uuid,
     pub kind: String,
     pub body: String,
+    /// `active` in snapshots taken before obligations had it.
+    #[serde(default = "acts_in_active")]
+    pub acts_in: String,
+}
+
+fn acts_in_active() -> String {
+    crate::outline::ACTS_IN_ACTIVE.to_string()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -83,6 +90,7 @@ impl<'a> BaselineRepo<'a> {
                     id: o.id,
                     kind: o.kind,
                     body: o.body,
+                    acts_in: o.acts_in,
                 })
                 .collect(),
             plan_steps: PlanStepRepo::new(self.conn)

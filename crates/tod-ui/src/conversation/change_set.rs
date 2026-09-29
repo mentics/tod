@@ -283,6 +283,7 @@ pub(crate) fn field_diffs(
                 section: s0,
                 body: b0,
                 phase: ph0,
+                acts_in: a0,
                 ordinal: o0,
                 ..
             }),
@@ -292,6 +293,7 @@ pub(crate) fn field_diffs(
                 section: s1,
                 body: b1,
                 phase: ph1,
+                acts_in: a1,
                 ordinal: o1,
                 ..
             }),
@@ -299,7 +301,8 @@ pub(crate) fn field_diffs(
             field("Text", b0.clone(), b1.clone());
             field("Kind", k0.clone(), k1.clone());
             field("Section", opt(s0), opt(s1));
-            field("Phase", ph0.clone(), ph1.clone());
+            field("Introduced in", ph0.clone(), ph1.clone());
+            field("Acts in", a0.clone(), a1.clone());
             field("Node", node(n0), node(n1));
             field("Position", o0.to_string(), o1.to_string());
         }
@@ -351,6 +354,7 @@ pub(crate) fn obligation_of(change: &NetChange) -> Option<NodeObligation> {
             section,
             body,
             phase,
+            acts_in,
             ordinal,
             visual_design_path,
         } => Some(NodeObligation {
@@ -361,6 +365,7 @@ pub(crate) fn obligation_of(change: &NetChange) -> Option<NodeObligation> {
             section: section.clone(),
             body: body.clone(),
             phase: phase.clone(),
+            acts_in: acts_in.clone(),
             visual_design_path: visual_design_path.clone(),
         }),
         _ => None,

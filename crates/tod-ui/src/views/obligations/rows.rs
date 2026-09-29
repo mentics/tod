@@ -53,12 +53,11 @@ pub fn new_section_row_key(phase: &str, kind: &str) -> String {
 /// still renders sensibly here.
 pub fn phase_label(phase: &str) -> &str {
     use tod_store::interview::{
-        PHASE_DESIGN, PHASE_PLANNING, PHASE_REQUIREMENTS, PHASE_UNKNOWN, PHASE_VERIFICATION,
+        PHASE_DESIGN, PHASE_PLANNING, PHASE_REQUIREMENTS, PHASE_UNKNOWN,
     };
     match phase {
         PHASE_REQUIREMENTS => "Requirements phase",
         PHASE_DESIGN => "Design phase",
-        PHASE_VERIFICATION => "Verification phase",
         PHASE_PLANNING => "Planning phase (legacy)",
         PHASE_UNKNOWN => "Unknown phase",
         other => other,

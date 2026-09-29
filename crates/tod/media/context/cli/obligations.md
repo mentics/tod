@@ -6,8 +6,8 @@ as the 8-character prefix shown in listings.
 ```
 tod-cli --data-root <DATA_ROOT> obligations list       [--node <UUID>] [--search <TEXT>] [--kind requirement|constraint] [--inherited]
 tod-cli --data-root <DATA_ROOT> obligations show       <ID>
-tod-cli --data-root <DATA_ROOT> obligations add        --node <UUID> --kind requirement|constraint --body <TEXT> --phase requirements|design|verification [--section <NAME>] [--after <ID>] [--before]
-tod-cli --data-root <DATA_ROOT> obligations update     <ID> [--body <TEXT>] [--section <NAME>] [--phase requirements|design|verification|unknown]
+tod-cli --data-root <DATA_ROOT> obligations add        --node <UUID> --kind requirement|constraint --body <TEXT> --phase requirements|design [--acts-in design|active|verifying|merged|released] [--section <NAME>] [--after <ID>] [--before]
+tod-cli --data-root <DATA_ROOT> obligations update     <ID> [--body <TEXT>] [--section <NAME>] [--phase requirements|design|unknown] [--acts-in design|active|verifying|merged|released]
 tod-cli --data-root <DATA_ROOT> obligations move       <ID> --node <UUID>
 tod-cli --data-root <DATA_ROOT> obligations delete     <ID>
 tod-cli --data-root <DATA_ROOT> obligations deleted    --node <UUID> [--by user|agent|<SESSION>]
@@ -26,8 +26,10 @@ it after a specific obligation, and add `--before` to place it before that one
 instead. Obligation text with no words is refused. On `update`, `--section ""`
 clears the section.
 
-`--phase` says which phase the obligation belongs to; see the Phase section of
-the obligations concepts for how to choose. Inside an interview, an agent's `add` always writes its own session's phase —
+An obligation has two phases, set by two flags: `--phase` is the state it was
+**introduced** in and `--acts-in` is the state whose agent **acts on** it.
+The obligations concepts say how to set each. `--acts-in` is left off when it
+is `active`. Listings show it as `acts-in=<state>` when it is not. Inside an interview, an agent's `add` always writes its own session's phase —
 `--phase` there only matters when running `add` outside an interview.
 
 `deleted` and `history` list changes as `r-<n>`; deletions and edits stay

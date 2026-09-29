@@ -59,11 +59,13 @@ pub fn inverse(action: &ActionRow) -> Result<Vec<OutlineMutation>> {
         M::UpdateObligationBody { .. }
         | M::UpdateObligationSection { .. }
         | M::UpdateObligationPhase { .. }
+        | M::UpdateObligationActsIn { .. }
         | M::UpdateObligationVisualDesign { .. } => {
             let EntitySnapshot::Obligation {
                 section,
                 body,
                 phase,
+                acts_in,
                 visual_design_path,
                 ..
             } = before()?
@@ -82,6 +84,10 @@ pub fn inverse(action: &ActionRow) -> Result<Vec<OutlineMutation>> {
                 M::UpdateObligationPhase { .. } => M::UpdateObligationPhase {
                     obligation_id: id,
                     phase,
+                },
+                M::UpdateObligationActsIn { .. } => M::UpdateObligationActsIn {
+                    obligation_id: id,
+                    acts_in,
                 },
                 _ => M::UpdateObligationVisualDesign {
                     obligation_id: id,
