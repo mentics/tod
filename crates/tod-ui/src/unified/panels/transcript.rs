@@ -338,4 +338,58 @@ mod tests {
             assert_eq!(view.panel.read(cx).entries().len(), 2);
         });
     }
+
+    #[gpui::test]
+    fn watching_shows_the_live_reply_and_moves_to_the_next_session(cx: &mut TestAppContext) {
+        use crate::interview::agent::SharedAgent;
+        use std::sync::{Arc, Mutex};
+        use tod_core::conversation::ConversationStatus;
+
+        let fixture = Fixture::new();
+        let first = add_conversation(&fixture);
+        let second = add_conversation(&fixture);
+        cx.update(gpui_component::init);
+        let agent: SharedAgent = Arc::new(Mutex::new(Box::new(
+            crate::interview::agent::MockAgentProvider::new(),
+        )));
+        let runs = cx.new(|_| AgentRuns::new(fixture.store.clone(), agent));
+        let (store, node, runs_in) = (fixture.store.clone(), fixture.node_id, runs.clone());
+        let slot = std::rc::Rc::new(RefCell::new(None));
+        let slot_in = slot.clone();
+        let (_, cx) = cx.add_window_view(move |window, cx| {
+            let view = cx.new(|cx| TranscriptPanel::watching(node, store, runs_in, window, cx));
+            *slot_in.borrow_mut() = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let view = slot.borrow_mut().take().unwrap();
+
+        let live = |text: &str| ConversationStatus {
+            running: true,
+            parts: vec![tod_agent::ReplyPart::Text { text: text.into() }],
+            ..Default::default()
+        };
+        // The first session is running and streaming.
+        let slot_id = runs.update(cx, |runs, cx| {
+            cx.notify();
+            runs.host_elsewhere(Focus::Node(node), ProtocolKind::Phase, first, live("working")).unwrap()
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.conversation_id(), first);
+            // Two stored turns and the reply in flight.
+            assert_eq!(view.panel.read(cx).entries().len(), 3);
+        });
+
+        // The next session takes over: the panel moves to it.
+        runs.update(cx, |runs, cx| {
+            cx.notify();
+            runs.release_elsewhere(slot_id);
+            runs.host_elsewhere(Focus::Node(node), ProtocolKind::Evaluate, second, live("evaluating")).unwrap();
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.conversation_id(), second);
+            assert_eq!(view.panel.read(cx).entries().len(), 3);
+        });
+    }
 }
