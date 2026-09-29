@@ -215,19 +215,17 @@ fn container_for_host(dest: &str) -> Option<&str> {
 /// new ones.
 ///
 /// On Windows the real `ssh` may be Git's MSYS build, whose shell rewrites
-/// an absolute path in the ProxyCommand (`/usr/sbin/sshd` becomes a path
+/// an absolute path in the ProxyCommand (`/tmp/tod-sshd/run` becomes a path
 /// under Git's install) and the connection closes at once. A leading `//`
 /// is left alone, and Linux reads it as `/`. Known hosts go to `/dev/null`,
 /// which both Windows' OpenSSH and MSYS read as the null device; MSYS takes
 /// `NUL` for a file of that name in the working directory.
 fn container_ssh_options(container: &str, key: &Path) -> Vec<String> {
-    let (sshd, config) = if cfg!(windows) {
-        ("//usr/sbin/sshd", "//tmp/tod-sshd/sshd_config")
-    } else {
-        ("/usr/sbin/sshd", "/tmp/tod-sshd/sshd_config")
-    };
+    // A script tod's prepare step wrote (`tod_agent::devcontainer::SSHD_RUN`);
+    // `//` for the reason above.
+    let run = if cfg!(windows) { "//tmp/tod-sshd/run" } else { "/tmp/tod-sshd/run" };
     [
-        format!("ProxyCommand=docker exec -i -u root {container} {sshd} -i -f {config}"),
+        format!("ProxyCommand=docker exec -i -u root {container} sh {run}"),
         "IdentitiesOnly=yes".to_string(),
         "PreferredAuthentications=publickey".to_string(),
         "BatchMode=yes".to_string(),
@@ -614,12 +612,8 @@ mod tests {
     fn container_options_proxy_through_sshd() {
         let opts = container_ssh_options("my-dev", Path::new("/data/zed-shim/docker_ed25519"));
         assert!(opts.chunks(2).all(|pair| pair[0] == "-o" || pair[0] == "-i"));
-        let (sshd, config) = if cfg!(windows) {
-        ("//usr/sbin/sshd", "//tmp/tod-sshd/sshd_config")
-    } else {
-        ("/usr/sbin/sshd", "/tmp/tod-sshd/sshd_config")
-    };
-        assert!(opts.contains(&format!("ProxyCommand=docker exec -i -u root my-dev {sshd} -i")));
+        let run = if cfg!(windows) { "//tmp/tod-sshd/run" } else { "/tmp/tod-sshd/run" };
+        assert!(opts.contains(&format!("ProxyCommand=docker exec -i -u root my-dev sh {run}")));
         assert!(opts.ends_with(&["-i".to_string(), "/data/zed-shim/docker_ed25519".to_string()]));
     }
 

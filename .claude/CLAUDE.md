@@ -470,7 +470,7 @@ Nothing starts or builds a container; tod only uses a running one.
   (`code_editor::zed::open_in_container`; a file opens in a second call,
   since Zed takes one `ssh://` URL per call). `tod-zed-shim` routes
   `.docker.tod` hosts (before sandboxes' `.tod`) to the real `ssh` with a
-  ProxyCommand of `docker exec -i -u root <c> /usr/sbin/sshd -i -f /tmp/tod-sshd/sshd_config` and tod's own
+  ProxyCommand of `docker exec -i -u root <c> sh /tmp/tod-sshd/run` (a launcher for `sshd -i -f /tmp/tod-sshd/sshd_config` with a short resolver timeout) and tod's own
   key (`<data root>/zed-shim/docker_ed25519`). Beforehand,
   `devcontainer::prepare_sshd` (off the UI thread) writes
   only under `/tmp/tod-sshd` (host key, sshd config, authorized key: the
@@ -479,7 +479,7 @@ Nothing starts or builds a container; tod only uses a running one.
   container without `sshd` gets an error saying to install it. A mounted
   repository opens on this machine. On Windows the real `ssh` may be Git's
   MSYS build, which rewrites an absolute path in a ProxyCommand, so the shim
-  says `//usr/sbin/sshd` there. The folder's `zed` call returns before Zed
+  says `//tmp/tod-sshd/run` there. The folder's `zed` call returns before Zed
   has connected, and a file sent sooner opens as a project of its own, so
   `open_in_container` waits for a new `zed-remote-server … proxy` in the
   container before sending the file.
