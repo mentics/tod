@@ -58,13 +58,17 @@ impl Request {
     }
 }
 
+/// How often streamed parts alone are reported: they change with every token.
+const PARTS_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+
 /// What the run is doing right now.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Live {
     /// The conversation's protocol; `None` between conversations.
     pub protocol: Option<ProtocolKind>,
     pub conversation_id: Option<Uuid>,
-    /// The turn in flight, without its streamed parts.
+    /// The turn in flight, with its streamed parts (sent at most every
+    /// [`PARTS_INTERVAL`] while only they change).
     pub status: ConversationStatus,
 }
 
@@ -121,6 +125,7 @@ impl LocalRun {
                     request: hook_request,
                     on_event: &mut on_event,
                     last: None,
+                    last_at: None,
                 };
                 let result = (|| {
                     let mut pilot = Autopilot::new(config, node, budget)?;
@@ -195,14 +200,33 @@ struct Hook<'a, F: FnMut(LocalEvent)> {
     on_event: &'a mut F,
     /// The last [`Live`] reported, so an unchanged one is not sent again.
     last: Option<Live>,
+    last_at: Option<std::time::Instant>,
 }
 
 impl<F: FnMut(LocalEvent)> Hook<'_, F> {
     fn report(&mut self, live: Live) {
-        if self.last.as_ref() != Some(&live) {
-            self.last = Some(live.clone());
-            (self.on_event)(LocalEvent::Live(live));
+        let Some(last) = &self.last else {
+            return self.send(live);
+        };
+        if *last == live {
+            return;
         }
+        // Only the streamed parts moved: not every token.
+        let parts_only = {
+            let mut probe = live.clone();
+            probe.status.parts = last.status.parts.clone();
+            probe == *last
+        };
+        let recent = self.last_at.is_some_and(|at| at.elapsed() < PARTS_INTERVAL);
+        if !(parts_only && recent) {
+            self.send(live);
+        }
+    }
+
+    fn send(&mut self, live: Live) {
+        self.last_at = Some(std::time::Instant::now());
+        self.last = Some(live.clone());
+        (self.on_event)(LocalEvent::Live(live));
     }
 
     fn requested(&self) -> Request {
@@ -226,9 +250,7 @@ impl<F: FnMut(LocalEvent)> StepHook for Hook<'_, F> {
         if self.requested() == Request::StopNow {
             return Some(STOPPED.to_string());
         }
-        let mut status = turn.status.clone();
-        // Streamed parts change with every token; the runner shows none.
-        status.parts.clear();
+        let status = turn.status.clone();
         self.report(Live {
             protocol: Some(turn.protocol),
             conversation_id: turn.conversation_id,
