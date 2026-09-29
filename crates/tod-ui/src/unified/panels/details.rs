@@ -53,6 +53,10 @@ pub fn register_details_panel_keyboard_bindings(cx: &mut App) {
 /// whenever the store changes.
 struct Loaded {
     title: String,
+    /// The external (Linear) ticket id, when the node carries one.
+    ticket_id: Option<String>,
+    /// The ticket's browser URL, when it can be worked out.
+    ticket_url: Option<String>,
     lifecycle: String,
     details: String,
     obligation_count: usize,
@@ -67,6 +71,8 @@ impl Loaded {
     fn empty() -> Self {
         Self {
             title: String::new(),
+            ticket_id: None,
+            ticket_url: None,
             lifecycle: String::new(),
             details: String::new(),
             obligation_count: 0,
@@ -84,6 +90,22 @@ fn load(fleet: &FleetStore, node_id: Uuid) -> Loaded {
     if let Ok(Some(task)) = fleet.get_node(&node_id.to_string()) {
         loaded.title = task.title;
         loaded.lifecycle = task.lifecycle;
+    }
+    loaded.ticket_id = fleet
+        .read(|conn| {
+            Ok(tod_store::outline::repos::NodeRepo::new(conn).get_ticket_id(node_id)?)
+        })
+        .ok()
+        .flatten()
+        .filter(|id| !id.is_empty());
+    if let Some(ticket) = loaded.ticket_id.as_deref() {
+        let metadata = fleet
+            .get_extra_content(node_id, tod_store::outline::types::EXTRA_CONTENT_METADATA)
+            .ok()
+            .flatten()
+            .and_then(|json_str| serde_json::from_str::<serde_json::Value>(&json_str).ok());
+        loaded.ticket_url =
+            tod_integration::linear_issue_url(metadata.as_ref(), fleet.paths().root(), ticket);
     }
     loaded.details = fleet
         .get_extra_content(node_id, EXTRA_CONTENT_DETAILS)
@@ -385,13 +407,32 @@ impl Render for DetailsPanel {
             .size_full()
             .child(
                 div()
-                    .text_lg()
-                    .child(selectable_markdown(
+                    .flex()
+                    .items_start()
+                    .justify_between()
+                    .gap_2()
+                    .child(div().flex_1().min_w_0().text_lg().child(selectable_markdown(
                         "unified-details-title",
                         self.loaded.title.clone(),
                         window,
                         cx,
-                    )),
+                    )))
+                    .when_some(self.loaded.ticket_id.clone(), |el, ticket| {
+                        el.child(div().flex_none().child(
+                            match self.loaded.ticket_url.clone() {
+                                Some(url) => style::text_link_external(
+                                    div().id("unified-details-ticket"),
+                                )
+                                .on_mouse_down(
+                                    gpui::MouseButton::Left,
+                                    move |_, _, cx| cx.open_url(&url),
+                                )
+                                .child(ticket)
+                                .into_any_element(),
+                                None => style::text_muted(div()).child(ticket).into_any_element(),
+                            },
+                        ))
+                    }),
             )
             .child(status_label::render(&self.loaded.lifecycle, &runs, cx))
             .child(

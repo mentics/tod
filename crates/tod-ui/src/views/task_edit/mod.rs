@@ -5479,22 +5479,44 @@ impl TaskEditView {
             }
         }
 
+        let origin_ticket = link.as_ref().map(|link| link.external_id.clone());
+        let origin_prefix = match (&source_type, &origin_ticket) {
+            (Some(source_type), Some(_)) => format!("{source_type} · "),
+            _ => String::new(),
+        };
         body = body.child(
             v_flex()
                 .gap_1()
                 .child(Self::render_field_label("Origin", cx))
-                .child(selectable_text(
-                    "task-edit-managed-origin",
-                    match (&source_type, &link) {
-                        (Some(source_type), Some(link)) => {
-                            format!("{source_type} · {}", link.external_id)
-                        }
-                        (None, Some(link)) => link.external_id.clone(),
-                        _ => String::new(),
-                    },
-                    window,
-                    cx,
-                )),
+                .child(match (origin_ticket, external_url.clone()) {
+                    // The ticket id is a link to the ticket.
+                    (Some(ticket), Some(url)) => h_flex()
+                        .child(div().child(origin_prefix))
+                        .child(
+                            crate::ui::style::text_link_external(
+                                div().id("task-edit-managed-origin-ticket"),
+                            )
+                            .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                                cx.open_url(&url)
+                            })
+                            .child(ticket),
+                        )
+                        .into_any_element(),
+                    (Some(ticket), None) => selectable_text(
+                        "task-edit-managed-origin",
+                        format!("{origin_prefix}{ticket}"),
+                        window,
+                        cx,
+                    )
+                    .into_any_element(),
+                    (None, _) => selectable_text(
+                        "task-edit-managed-origin",
+                        String::new(),
+                        window,
+                        cx,
+                    )
+                    .into_any_element(),
+                }),
         );
         body = body.child(
             v_flex()

@@ -5,7 +5,7 @@ use crate::ui::item_list::ItemDrag;
 use crate::views::obligations::DRAG_LIST as OBLIGATION_DRAG_LIST;
 use gpui::{
     Context, Entity, InteractiveElement, IntoElement, MouseButton, ParentElement, Styled,
-    WeakEntity, Window, div, prelude::FluentBuilder, px,
+    SharedString, WeakEntity, Window, div, prelude::FluentBuilder, px,
 };
 use gpui_component::IndexPath;
 use gpui_component::button::{Button, ButtonVariants};
@@ -66,6 +66,10 @@ pub enum RowAction {
         task_id: String,
     },
     OpenExternal {
+        task_id: String,
+    },
+    /// A click on the ticket id shown in the row's title.
+    OpenTicket {
         task_id: String,
     },
     CycleGeneratorSort {
@@ -573,13 +577,28 @@ impl ListDelegate for TaskListDelegate {
             .pl(depth_indent)
             .child(chevron_cell)
             .when_some(item.ticket_id.clone(), |row, ticket| {
+                let sink = sink.clone();
+                let task_id_ticket = item.id.clone();
                 row.child(
                     div()
+                        .id(SharedString::from(format!("row-ticket-{}", item.id)))
                         .text_xs()
                         .font_semibold()
                         .text_color(link_color)
+                        .underline()
+                        .cursor_pointer()
                         .flex_shrink_0()
-                        .child(format!("{ticket}: ")),
+                        .child(format!("{ticket}: "))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |_, _, _, cx| {
+                                cx.stop_propagation();
+                                sink.borrow_mut().push(RowAction::OpenTicket {
+                                    task_id: task_id_ticket.clone(),
+                                });
+                                cx.notify();
+                            }),
+                        ),
                 )
             })
             .when(item.ticket_id.is_none(), |row| {
