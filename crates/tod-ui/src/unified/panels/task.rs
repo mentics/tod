@@ -44,7 +44,7 @@ use tod_core::runner_status::{RunnerStatus, format_elapsed, format_tokens};
 use tod_core::autopilot::Outcome;
 use tod_core::cloud_sync::CloudNode;
 use gpui_component::button::DropdownButton;
-use gpui_component::menu::PopupMenuItem;
+use gpui_component::menu::{DropdownMenu as _, PopupMenuItem};
 use tod_journey::{Presented, PresentedAction};
 use crate::unified::runners::NodeRunners;
 use crate::views::cloud_node::CloudUpdate;
@@ -719,6 +719,70 @@ impl TaskPanel {
         cx.notify();
     }
 
+    /// The phase chip: an exceptional, deliberate override, so the menu
+    /// lists every other phase and the pick is applied at once, bypassing
+    /// the gates. Off the UI thread; the store change refreshes the line.
+    fn set_phase(&mut self, target: &'static str, cx: &mut Context<Self>) {
+        let node = self.node_id;
+        let presented = Presented {
+            actions: Vec::new(),
+            focused: None,
+            notices: vec![format!("{} → {target}", self.runner.lifecycle)],
+        };
+        crate::ui::journey::record_action(
+            cx,
+            Focus::Node(node),
+            format!("SetPhase({target})"),
+            crate::ui::journey::Source::Click,
+            "task_panel",
+            presented,
+        );
+        self.runner.lifecycle = target.to_string();
+        let fleet = self.fleet.clone();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { tod_core::lifecycle::set_lifecycle(&fleet, node, target) })
+                .await;
+            let _ = this.update(cx, |this: &mut TaskPanel, cx| {
+                if let Err(err) = result {
+                    this.runner.cloud_note = Some(format!("Could not change the phase: {err:#}"));
+                    this.runner.cloud_failed = true;
+                }
+                this.refresh_runner(cx);
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// The lifecycle state as a chip; clicking it lists the other phases.
+    fn render_phase_chip(&self, cx: &mut Context<Self>) -> AnyElement {
+        let weak = cx.weak_entity();
+        let current = self.runner.lifecycle.clone();
+        let menu_current = current.clone();
+        Button::new("unified-task-phase")
+            .label(current)
+            .outline()
+            .xsmall()
+            .rounded(gpui::px(999.))
+            .dropdown_caret(true)
+            .dropdown_menu(move |mut popup, _, _| {
+                for state in tod_core::task::model::LIFECYCLE_STATES {
+                    if state == menu_current {
+                        continue;
+                    }
+                    let weak = weak.clone();
+                    popup = popup.item(PopupMenuItem::new(state).on_click(move |_, _, cx| {
+                        let _ = weak.update(cx, |this: &mut TaskPanel, cx| this.set_phase(state, cx));
+                    }));
+                }
+                popup
+            })
+            .into_any_element()
+    }
+
     fn cloud_started(&mut self, cx: &mut Context<Self>) {
         self.runner.cloud_busy = true;
         self.runner.cloud_note = None;
@@ -786,7 +850,7 @@ impl TaskPanel {
 
         let mut line = div().flex().items_center().gap_2().min_w_0();
         if status != RunnerStatus::Done {
-            line = line.child(style::text(div().flex_none()).child(self.runner.lifecycle.clone()));
+            line = line.child(self.render_phase_chip(cx));
         }
         if let Some(cloud) = &self.runner.cloud {
             let mut text = format!("in the cloud (sandbox {})", cloud.sandbox);
