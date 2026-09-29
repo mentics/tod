@@ -13,7 +13,8 @@
 //! the node's `verified` verdicts ([`VerdictRepo::reopen_verified`]): the
 //! code they were earned against has changed.
 
-use crate::outline::repos::ObligationRepo;
+use crate::outline::repos::plan_steps::PHASE_ACTIVE;
+use crate::outline::repos::{ObligationRepo, PlanStepRepo};
 use crate::outline::repos::obligations::NodeObligation;
 use crate::outline::uuid_blob::{blob_to_uuid_sql, now_ms, uuid_to_blob};
 use crate::review::normalize;
@@ -75,9 +76,18 @@ pub struct ObligationStanding {
     pub obligation: NodeObligation,
     /// `None` until verification has ruled on it.
     pub verdict: Option<ObligationVerdict>,
+    /// The phase it is verified in: the latest phase of a plan step that
+    /// satisfies it (`PlanStepRepo::obligation_phases`). An obligation only a
+    /// `released` step delivers cannot be checked before the release.
+    pub phase: String,
 }
 
 impl ObligationStanding {
+    /// Whether it is owed a verdict by the time its node is in `state`.
+    pub fn due_by(&self, state: &str) -> bool {
+        crate::outline::repos::plan_steps::due_by(&self.phase, state)
+    }
+
     pub fn is_verified(&self) -> bool {
         self.verdict.as_ref().is_some_and(ObligationVerdict::is_verified)
     }
@@ -238,11 +248,15 @@ impl<'a> VerdictRepo<'a> {
     /// which of them apply is the agent's judgement, so none is demanded.
     pub fn standings(&self, node_id: Uuid) -> Result<Vec<ObligationStanding>> {
         let mut latest = self.latest_for_node(node_id)?;
+        let mut phases = PlanStepRepo::new(self.conn).obligation_phases(node_id)?;
         Ok(ObligationRepo::new(self.conn)
             .list_for_node(node_id)?
             .into_iter()
             .map(|obligation| ObligationStanding {
                 verdict: latest.remove(&obligation.id),
+                phase: phases
+                    .remove(&obligation.id)
+                    .unwrap_or_else(|| PHASE_ACTIVE.to_string()),
                 obligation,
             })
             .collect())

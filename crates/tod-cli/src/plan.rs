@@ -7,10 +7,10 @@ use std::collections::HashMap;
 use tod_core::fuzzy::fuzzy_score;
 use tod_store::interview::{InterviewCommand, InterviewRepo, short_id};
 use tod_store::outline::repos::plan_steps::{
-    HandoffReason, STATUS_FAILED, STATUS_PARTIAL, STATUS_VERIFIED, needs_user,
+    self, HandoffReason, PHASE_ACTIVE, STATUS_FAILED, STATUS_PARTIAL, STATUS_VERIFIED, needs_user,
 };
 use tod_store::outline::repos::{NodeRepo, PlanStepRepo};
-use tod_store::outline::{OutlineMutation, PLAN_STEP_STATUSES, PlanStep};
+use tod_store::outline::{OutlineMutation, PLAN_STEP_PHASES, PLAN_STEP_STATUSES, PlanStep};
 use uuid::Uuid;
 
 pub(crate) const USAGE: &str = "\
@@ -23,10 +23,10 @@ required) and names each row's node as `on <slug>`.
 COMMANDS:
     list      [--node <UUID>] [--search <TEXT>]
     show      <ID>
-    add       --node <UUID> --body <TEXT> [--after <ID>] [--before] [--depends-on <ID>] [--satisfies <OBLIGATION_ID>]
+    add       --node <UUID> --body <TEXT> [--phase active|verifying|merged|released] [--after <ID>] [--before] [--depends-on <ID>] [--satisfies <OBLIGATION_ID>]
 
 Use `depend`/`satisfy` to add further links after creation — `add` only takes one of each.
-    update    <ID> [--body <TEXT>] [--status pending|ready|in_progress|implemented|verified|failed|partial|blocked] [--reason conflict|decision|access] [--why <TEXT>] [--did <TEXT>] [--cites <OBLIGATION_ID>]... [--option <TEXT>]... [--needs <TEXT>] [--tried <TEXT>] [--note <TEXT>]
+    update    <ID> [--body <TEXT>] [--phase active|verifying|merged|released] [--status pending|ready|in_progress|implemented|verified|failed|partial|blocked] [--reason conflict|decision|access] [--why <TEXT>] [--did <TEXT>] [--cites <OBLIGATION_ID>]... [--option <TEXT>]... [--needs <TEXT>] [--tried <TEXT>] [--note <TEXT>]
     delete    <ID>
     depend    <ID> --on <ID>
     undepend  <ID> --on <ID>
@@ -35,7 +35,14 @@ Use `depend`/`satisfy` to add further links after creation — `add` only takes 
     ready     --node <UUID>
 
 `ready` lists steps eligible to start now (status ready, or pending with every
-dependency implemented/verified) — the set that can be dispatched in parallel.
+dependency implemented/verified) and due by the node's lifecycle state — the
+set that can be dispatched in parallel.
+
+A step is an action, and --phase is the lifecycle state whose agent takes it:
+`active` (the default) for implementation, or `verifying`, `merged`, or
+`released` for an action only that phase can take, such as a backfill that
+needs the release in place. That phase also verifies it. A step may depend
+only on steps of its own phase or an earlier one.
 
 `partial` means done as far as it can go without the user; `blocked` means it
 could not be started. Both require --reason and --why (why the user has to act:
@@ -103,6 +110,7 @@ fn step_json(row: &PlanStep, deps: &[Uuid], obligations: &[Uuid]) -> serde_json:
         "id": row.id.to_string(),
         "node_id": row.node_id.to_string(),
         "status": row.status,
+        "phase": row.phase,
         "note": row.note,
         "reason": row.reason,
         "body": row.body,
@@ -140,8 +148,13 @@ fn step_line(row: &PlanStep, deps: &[Uuid], obligations: &[Uuid]) -> String {
         Some(note) => format!("\n    note: {note}"),
         None => String::new(),
     };
+    let phase = if row.phase == PHASE_ACTIVE {
+        String::new()
+    } else {
+        format!(" phase={}", row.phase)
+    };
     format!(
-        "[{}] {}{deps}{satisfies}: {}{reason}{note}",
+        "[{}] {}{phase}{deps}{satisfies}: {}{reason}{note}",
         short_id(row.id),
         row.status,
         row.body
@@ -285,9 +298,23 @@ fn timestamp(ms: i64) -> String {
         .unwrap_or_else(|| ms.to_string())
 }
 
+fn normalize_phase(raw: &str) -> anyhow::Result<&'static str> {
+    PLAN_STEP_PHASES
+        .iter()
+        .copied()
+        .find(|phase| phase.eq_ignore_ascii_case(raw.trim()))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "unknown phase `{raw}` (expected: {})",
+                PLAN_STEP_PHASES.join(", ")
+            )
+        })
+}
+
 fn add(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
     let node = args.node()?;
     let body = args.require("--body")?.to_string();
+    let phase = args.get("--phase").map(normalize_phase).transpose()?;
     let after = args.get("--after").map(|raw| resolve(inv, raw)).transpose()?;
     let id = Uuid::new_v4();
     inv.client().interview(InterviewCommand::Outline {
@@ -301,6 +328,16 @@ fn add(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
         target: None,
     })?;
     let client = inv.client();
+    // Before the dependency, which is checked against it.
+    if let Some(phase) = phase.filter(|phase| *phase != PHASE_ACTIVE) {
+        client.interview(InterviewCommand::Outline {
+            mutation: OutlineMutation::SetPlanStepPhase {
+                step_id: id,
+                phase: phase.to_string(),
+            },
+            target: Some(id),
+        })?;
+    }
     if let Some(raw) = args.get("--depends-on") {
         let dep = resolve(inv, raw)?;
         client.interview(InterviewCommand::Outline {
@@ -347,9 +384,10 @@ fn update(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
     let id = resolve(inv, args.target("a plan step id")?)?;
     let body = args.get("--body");
     let status = args.get("--status").map(normalize_status).transpose()?;
+    let phase = args.get("--phase").map(normalize_phase).transpose()?;
     let text = |flag: &str| args.get(flag).map(str::trim).filter(|text| !text.is_empty());
-    if body.is_none() && status.is_none() {
-        anyhow::bail!("--body and/or --status is required");
+    if body.is_none() && status.is_none() && phase.is_none() {
+        anyhow::bail!("--body, --phase, and/or --status is required");
     }
     if let Some(status) = status.filter(|s| !VERIFY_AGENT_STATUSES.contains(s))
         && in_verify_conversation(inv)?
@@ -392,6 +430,15 @@ fn update(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
             mutation: OutlineMutation::UpdatePlanStepBody {
                 step_id: id,
                 body: body.to_string(),
+            },
+            target: target.take(),
+        })?;
+    }
+    if let Some(phase) = phase {
+        client.interview(InterviewCommand::Outline {
+            mutation: OutlineMutation::SetPlanStepPhase {
+                step_id: id,
+                phase: phase.to_string(),
             },
             target: target.take(),
         })?;
@@ -601,7 +648,14 @@ fn ready(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
     let node = args.node()?;
     let ids: Vec<Uuid> = inv
         .client()
-        .read(|conn| PlanStepRepo::new(conn).ready_steps(node))?;
+        .read(|conn| {
+            let state = NodeRepo::new(conn).get_lifecycle(node)?;
+            // Before implementation starts, what implementation will start with.
+            let state = state
+                .filter(|state| plan_steps::due_by(PHASE_ACTIVE, state))
+                .unwrap_or_else(|| PHASE_ACTIVE.to_string());
+            PlanStepRepo::new(conn).ready_steps(node, Some(&state))
+        })?;
     if inv.json {
         let items: Vec<_> = ids.iter().map(|id| id.to_string()).collect();
         return Ok(serde_json::to_string(&items)?);

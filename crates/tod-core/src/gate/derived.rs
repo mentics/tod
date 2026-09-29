@@ -27,9 +27,10 @@ use tod_store::outline::{
 pub use tod_store::outline::{APPROVED_MERGED_PR_MERGED_SLUG, PR_APPROVED_MERGEABLE_SLUG};
 use tod_store::outline::{
     DERIVED_CRITERION_SLUGS, DESIGN_PLANNING_PHASE_CERTIFIED_SLUG, LEARN_DONE_LEARN_RECORDED_SLUG,
-    MERGED_RELEASED_PHASE_CERTIFIED_SLUG, PLANNING_READY_PHASE_CERTIFIED_SLUG,
-    PROPOSED_DESIGN_HAS_REQUIREMENTS_SLUG, PROPOSED_DESIGN_PHASE_CERTIFIED_SLUG,
-    RELEASED_LEARN_PHASE_CERTIFIED_SLUG,
+    MERGED_RELEASED_PHASE_CERTIFIED_SLUG, MERGED_RELEASED_PLAN_VERIFIED_SLUG,
+    PLANNING_READY_PHASE_CERTIFIED_SLUG, PROPOSED_DESIGN_HAS_REQUIREMENTS_SLUG,
+    PROPOSED_DESIGN_PHASE_CERTIFIED_SLUG, RELEASED_LEARN_PHASE_CERTIFIED_SLUG,
+    RELEASED_LEARN_PLAN_VERIFIED_SLUG,
 };
 use tod_store::phase::{CertificateStatus, PhaseRepo};
 use tod_store::review::ReviewRepo;
@@ -63,7 +64,15 @@ pub fn evaluate_derived_criterion(
         }
         READY_ACTIVE_ACTION_CONFIG_SLUG => implementation_setup_outcome(conn, node_id).map(Some),
         ACTIVE_VERIFYING_PLAN_IMPLEMENTED_SLUG => plan_implemented_outcome(conn, node_id).map(Some),
-        VERIFYING_REVIEW_PLAN_VERIFIED_SLUG => plan_verified_outcome(conn, node_id).map(Some),
+        VERIFYING_REVIEW_PLAN_VERIFIED_SLUG => {
+            plan_verified_outcome(conn, node_id, "verifying").map(Some)
+        }
+        MERGED_RELEASED_PLAN_VERIFIED_SLUG => {
+            plan_verified_outcome(conn, node_id, "merged").map(Some)
+        }
+        RELEASED_LEARN_PLAN_VERIFIED_SLUG => {
+            plan_verified_outcome(conn, node_id, "released").map(Some)
+        }
         VERIFYING_REVIEW_OBLIGATIONS_VERIFIED_SLUG => {
             obligations_verified_outcome(conn, node_id).map(Some)
         }
@@ -272,11 +281,16 @@ fn requirements_traceable_outcome(conn: &Connection, node_id: Uuid) -> Result<De
     )))
 }
 
-/// No plan step still open. Whether the work behind an `implemented` step is
-/// real is verification's question, not this gate's: a step verification
-/// fails goes back to open, and this gate is what sends it through again.
+/// No `active` plan step still open. Whether the work behind an
+/// `implemented` step is real is verification's question, not this gate's: a
+/// step verification fails goes back to open, and this gate is what sends it
+/// through again. A later phase's steps wait for that phase.
 fn plan_implemented_outcome(conn: &Connection, node_id: Uuid) -> Result<DerivedOutcome> {
-    let steps = PlanStepRepo::new(conn).list_for_node(node_id)?;
+    let steps: Vec<_> = PlanStepRepo::new(conn)
+        .list_for_node(node_id)?
+        .into_iter()
+        .filter(|s| s.due_by("active"))
+        .collect();
     if steps.is_empty() {
         return Ok(fail("This node has no plan steps to implement."));
     }
@@ -299,11 +313,35 @@ fn plan_implemented_outcome(conn: &Connection, node_id: Uuid) -> Result<DerivedO
     )))
 }
 
-/// Every plan step `verified`. Verification records its verdict on each step,
-/// so a `failed` one is a finding that has to go back to implementation, and
-/// any other status is a step nobody has checked yet.
-fn plan_verified_outcome(conn: &Connection, node_id: Uuid) -> Result<DerivedOutcome> {
-    let steps = PlanStepRepo::new(conn).list_for_node(node_id)?;
+/// Every plan step due by `state` `verified`. Verification records its
+/// verdict on each step, so a `failed` one is a finding that has to be done
+/// again, and any other status is a step nobody has checked yet. In
+/// `verifying` a node must have steps; in `merged` and `released`, where
+/// steps are the exception, one with none of that phase passes. There, the
+/// obligations only that phase's steps deliver must be verified too, since
+/// no `verifying` came after them.
+fn plan_verified_outcome(conn: &Connection, node_id: Uuid, state: &str) -> Result<DerivedOutcome> {
+    let steps: Vec<_> = PlanStepRepo::new(conn)
+        .list_for_node(node_id)?
+        .into_iter()
+        .filter(|s| s.due_by(state))
+        .collect();
+    if state != "verifying" && !steps.iter().any(|s| s.phase == state) {
+        return Ok(DerivedOutcome {
+            outcome: OUTCOME_PASS,
+            detail: format!("No plan steps belong to the {state} phase."),
+        });
+    }
+    let owed_obligations: Vec<String> = if state == "verifying" {
+        Vec::new()
+    } else {
+        VerdictRepo::new(conn)
+            .standings(node_id)?
+            .into_iter()
+            .filter(|s| s.phase == state && !s.is_verified())
+            .map(|s| format!("[{}] {}", short_id(s.obligation.id), s.obligation.body))
+            .collect()
+    };
     if steps.is_empty() {
         return Ok(fail(
             "This node has no plan steps, so nothing traces to a verified step.",
@@ -321,7 +359,7 @@ fn plan_verified_outcome(conn: &Connection, node_id: Uuid) -> Result<DerivedOutc
         .filter(|s| s.status != STATUS_FAILED && s.status != STATUS_VERIFIED)
         .map(line)
         .collect();
-    if failed.is_empty() && unchecked.is_empty() {
+    if failed.is_empty() && unchecked.is_empty() && owed_obligations.is_empty() {
         return Ok(DerivedOutcome {
             outcome: OUTCOME_PASS,
             detail: format!("All {} plan steps verified.", steps.len()),
@@ -329,9 +367,13 @@ fn plan_verified_outcome(conn: &Connection, node_id: Uuid) -> Result<DerivedOutc
     }
     let mut parts = Vec::new();
     if !failed.is_empty() {
+        let redo = if state == "verifying" {
+            "Move the node back to active and implement again".to_string()
+        } else {
+            format!("Run the {state} phase again")
+        };
         parts.push(format!(
-            "{} failed verification: {}. Move the node back to active and implement \
-             again — each failed step's note says what to fix.",
+            "{} failed verification: {}. {redo} — each failed step's note says what to fix.",
             failed.len(),
             failed.join("; ")
         ));
@@ -343,15 +385,28 @@ fn plan_verified_outcome(conn: &Connection, node_id: Uuid) -> Result<DerivedOutc
             unchecked.join("; ")
         ));
     }
+    if !owed_obligations.is_empty() {
+        parts.push(format!(
+            "{} obligation(s) the {state} phase delivers not verified yet: {}.",
+            owed_obligations.len(),
+            owed_obligations.join("; ")
+        ));
+    }
     Ok(fail(parts.join(" ")))
 }
 
 /// Every obligation of the node `verified`. This is the criterion that says
 /// the work does what was asked: a plan whose every step checks out can still
 /// miss a requirement, or add up to something that does not run. A node with
-/// no obligations of its own passes — there is nothing it promised.
+/// no obligations of its own passes — there is nothing it promised. One that
+/// only a later phase's step delivers is checked in that phase instead
+/// (see [`plan_verified_outcome`]).
 fn obligations_verified_outcome(conn: &Connection, node_id: Uuid) -> Result<DerivedOutcome> {
-    let standings = VerdictRepo::new(conn).standings(node_id)?;
+    let standings: Vec<_> = VerdictRepo::new(conn)
+        .standings(node_id)?
+        .into_iter()
+        .filter(|s| s.due_by("verifying"))
+        .collect();
     let line = |s: &ObligationStanding| {
         format!("[{}] {}", short_id(s.obligation.id), s.obligation.body)
     };
@@ -1045,5 +1100,92 @@ mod tests {
             evaluate(&store, node, "planning-ready.plan-actionable"),
             None
         );
+    }
+
+    fn set_phase(store: &FleetStore, step: Uuid, phase: &str) {
+        store
+            .enqueue_outline(OutlineMutation::SetPlanStepPhase {
+                step_id: step,
+                phase: phase.into(),
+            })
+            .unwrap();
+        store.writer().flush().unwrap();
+    }
+
+    fn set_status(store: &FleetStore, step: Uuid, status: &str) {
+        store
+            .enqueue_outline(OutlineMutation::UpdatePlanStepStatus {
+                step_id: step,
+                status: status.into(),
+                note: None,
+                reason: None,
+            })
+            .unwrap();
+        store.writer().flush().unwrap();
+    }
+
+    /// A `released` step is not implementation's: `active` leaves without it,
+    /// and `verifying` neither checks it nor the obligation only it delivers.
+    /// The `released` gate does, and the `merged` one has nothing to check.
+    #[test]
+    fn later_phase_steps_are_checked_by_their_own_phase() {
+        let (store, node) = store_with_node();
+        let steps = plan(&store, node, [STATUS_VERIFIED, "pending"]);
+        set_phase(&store, steps[1], "released");
+        let obligation = Uuid::new_v4();
+        store
+            .enqueue_outline(OutlineMutation::CreateObligation {
+                obligation_id: Some(obligation),
+                node_id: node,
+                kind: "requirement".into(),
+                after_id: None,
+                before: false,
+                section: None,
+                body: "Production data is backfilled".into(),
+                phase: "requirements".into(),
+            })
+            .unwrap();
+        store
+            .enqueue_outline(OutlineMutation::LinkPlanStepObligation {
+                step_id: steps[1],
+                obligation_id: obligation,
+            })
+            .unwrap();
+        store.writer().flush().unwrap();
+
+        for slug in [
+            ACTIVE_VERIFYING_PLAN_IMPLEMENTED_SLUG,
+            VERIFYING_REVIEW_PLAN_VERIFIED_SLUG,
+            VERIFYING_REVIEW_OBLIGATIONS_VERIFIED_SLUG,
+            MERGED_RELEASED_PLAN_VERIFIED_SLUG,
+        ] {
+            let outcome = evaluate(&store, node, slug).unwrap();
+            assert_eq!(outcome.outcome, OUTCOME_PASS, "{slug}: {}", outcome.detail);
+        }
+
+        let released = RELEASED_LEARN_PLAN_VERIFIED_SLUG;
+        let outcome = evaluate(&store, node, released).unwrap();
+        assert_eq!(outcome.outcome, OUTCOME_FAIL, "{}", outcome.detail);
+
+        set_status(&store, steps[1], STATUS_IMPLEMENTED);
+        set_status(&store, steps[1], STATUS_VERIFIED);
+        let outcome = evaluate(&store, node, released).unwrap();
+        assert_eq!(outcome.outcome, OUTCOME_FAIL, "obligation owed: {}", outcome.detail);
+
+        store
+            .writer()
+            .execute_interview(
+                "test",
+                tod_store::interview::InterviewCommand::RecordObligationVerdict {
+                    node_id: node,
+                    obligation_id: obligation,
+                    conversation_id: None,
+                    status: "verified".into(),
+                    evidence: "Queried production after the backfill.".into(),
+                },
+            )
+            .unwrap();
+        let outcome = evaluate(&store, node, released).unwrap();
+        assert_eq!(outcome.outcome, OUTCOME_PASS, "{}", outcome.detail);
     }
 }

@@ -198,10 +198,15 @@ fn bare() -> Fixture {
             state: "proposed".into(),
         })
         .unwrap();
+    fx.fleet.writer().flush().unwrap();
     fx.fleet
-        .enqueue(tod_store::fleet::FleetMutation::UpdateTaskRepo {
-            id: fx.node.to_string(),
+        // The workspace itself: a worktree of its own would need a data root.
+        .enqueue_outline(OutlineMutation::SetNodeFiles {
+            node_id: fx.node,
             repo: Some(workspace.display().to_string()),
+            branch: None,
+            use_worktree: false,
+            dev_container: None,
         })
         .unwrap();
     fx.fleet.writer().flush().unwrap();

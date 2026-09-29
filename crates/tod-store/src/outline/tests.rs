@@ -881,8 +881,14 @@ fn gate_criteria_seed_on_migration() {
     );
     assert_eq!(slugs("pr", "approved"), [PR_APPROVED_MERGEABLE_SLUG]);
     assert_eq!(slugs("approved", "merged"), [APPROVED_MERGED_PR_MERGED_SLUG]);
-    assert_eq!(slugs("merged", "released"), [MERGED_RELEASED_PHASE_CERTIFIED_SLUG]);
-    assert_eq!(slugs("released", "learn"), [RELEASED_LEARN_PHASE_CERTIFIED_SLUG]);
+    assert_eq!(
+        slugs("merged", "released"),
+        [MERGED_RELEASED_PHASE_CERTIFIED_SLUG, MERGED_RELEASED_PLAN_VERIFIED_SLUG]
+    );
+    assert_eq!(
+        slugs("released", "learn"),
+        [RELEASED_LEARN_PHASE_CERTIFIED_SLUG, RELEASED_LEARN_PLAN_VERIFIED_SLUG]
+    );
     assert_eq!(slugs("learn", "done"), [LEARN_DONE_LEARN_RECORDED_SLUG]);
 
     // Exactly the derived criteria are active, and each is seeded.
@@ -1002,7 +1008,7 @@ fn plan_step_dependency_graph_and_obligation_links() {
             assert!(repo.add_dependency(step_a, step_b).is_err());
 
             // step_b is blocked on step_a until step_a is implemented.
-            assert_eq!(repo.ready_steps(node_id).unwrap(), vec![step_a]);
+            assert_eq!(repo.ready_steps(node_id, None).unwrap(), vec![step_a]);
 
             assert_eq!(repo.list_obligations(step_a).unwrap(), vec![req]);
             assert_eq!(repo.list_steps_for_obligation(req).unwrap(), vec![step_a]);
@@ -1053,7 +1059,7 @@ fn plan_step_dependency_graph_and_obligation_links() {
         .read(|conn| {
             let repo = PlanStepRepo::new(conn);
             // step_b is now unblocked (auto-promoted to ready).
-            let mut ready = repo.ready_steps(node_id).unwrap();
+            let mut ready = repo.ready_steps(node_id, None).unwrap();
             ready.sort();
             let mut expected = vec![step_b];
             expected.sort();
@@ -2302,4 +2308,189 @@ fn restoring_a_disabled_generator_brings_back_its_managed_tree() {
 
     drop(store);
     let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn plan_step_phases_order_dependencies_and_readiness() {
+    use crate::outline::repos::PlanStepRepo;
+    use crate::outline::repos::plan_steps::{PHASE_ACTIVE, PHASE_RELEASED, due_by};
+
+    assert!(due_by("active", "verifying"));
+    assert!(due_by("released", "released"));
+    assert!(!due_by("released", "merged"));
+
+    let root = std::env::temp_dir().join(format!("tod-plan-phase-{}", Uuid::new_v4()));
+    fs::create_dir_all(&root).unwrap();
+    let store = FleetStore::open(&root).unwrap();
+    store
+        .enqueue_outline(OutlineMutation::CreateList {
+            slug: "plan".into(),
+            title: "Plan".into(),
+        })
+        .unwrap();
+    store.writer().flush().unwrap();
+    let list_id = store.list_outline_lists().unwrap()[0].id;
+    let node_id = Uuid::new_v4();
+    store
+        .enqueue_outline(OutlineMutation::CreateNode {
+            node_id: Some(node_id),
+            list_id,
+            parent_id: None,
+            anchor_id: None,
+            position: CreatePosition::Below,
+            title: "Phased node".into(),
+        })
+        .unwrap();
+    store.writer().flush().unwrap();
+    store
+        .enqueue_outline(OutlineMutation::EnableCapabilities {
+            node_id,
+            capabilities: vec![Capability::Spec],
+        })
+        .unwrap();
+    store.writer().flush().unwrap();
+    let req = Uuid::new_v4();
+    store
+        .enqueue_outline(OutlineMutation::CreateObligation {
+            obligation_id: Some(req),
+            node_id,
+            kind: crate::outline::KIND_REQUIREMENT.into(),
+            after_id: None,
+            before: false,
+            section: None,
+            body: "Backfilled".into(),
+            phase: PHASE_REQUIREMENTS.into(),
+        })
+        .unwrap();
+    let build = Uuid::new_v4();
+    let backfill = Uuid::new_v4();
+    for (id, body) in [(build, "Build the backfill"), (backfill, "Run the backfill")] {
+        store
+            .enqueue_outline(OutlineMutation::CreatePlanStep {
+                step_id: Some(id),
+                node_id,
+                after_id: None,
+                before: false,
+                body: body.into(),
+            })
+            .unwrap();
+    }
+    store.writer().flush().unwrap();
+    store
+        .enqueue_outline(OutlineMutation::SetPlanStepPhase {
+            step_id: backfill,
+            phase: PHASE_RELEASED.into(),
+        })
+        .unwrap();
+    store
+        .enqueue_outline(OutlineMutation::AddPlanStepDependency {
+            step_id: backfill,
+            depends_on_step_id: build,
+        })
+        .unwrap();
+    store
+        .enqueue_outline(OutlineMutation::LinkPlanStepObligation {
+            step_id: backfill,
+            obligation_id: req,
+        })
+        .unwrap();
+    store
+        .enqueue_outline(OutlineMutation::LinkPlanStepObligation {
+            step_id: build,
+            obligation_id: req,
+        })
+        .unwrap();
+    store.writer().flush().unwrap();
+
+    // An earlier phase may not wait on a later one, either way round.
+    let reverse = store.enqueue_outline(OutlineMutation::AddPlanStepDependency {
+        step_id: build,
+        depends_on_step_id: backfill,
+    });
+    assert!(reverse.is_err() || store.writer().flush().is_err());
+    let set_phase = |step_id, phase: &str| {
+        store
+            .enqueue_outline(OutlineMutation::SetPlanStepPhase {
+                step_id,
+                phase: phase.into(),
+            })
+            .and_then(|_| store.writer().flush())
+    };
+    set_phase(backfill, "merged").unwrap();
+    assert!(set_phase(build, PHASE_RELEASED).is_err(), "a merged step would wait on it");
+    set_phase(build, "merged").unwrap();
+    set_phase(build, PHASE_ACTIVE).unwrap();
+    set_phase(backfill, PHASE_RELEASED).unwrap();
+    let bogus = store.enqueue_outline(OutlineMutation::SetPlanStepPhase {
+        step_id: build,
+        phase: "review".into(),
+    });
+    assert!(bogus.is_err() || store.writer().flush().is_err());
+
+    store
+        .read(|conn| {
+            let repo = PlanStepRepo::new(conn);
+            let phase = |id| repo.get(id).unwrap().unwrap().phase;
+            assert_eq!(phase(build), PHASE_ACTIVE);
+            assert_eq!(phase(backfill), PHASE_RELEASED);
+            // The obligation is delivered by the latest of its steps.
+            assert_eq!(repo.obligation_phases(node_id).unwrap()[&req], PHASE_RELEASED);
+            Ok(())
+        })
+        .unwrap();
+
+    store
+        .enqueue_outline(OutlineMutation::UpdatePlanStepStatus {
+            step_id: build,
+            status: "implemented".into(),
+            note: None,
+            reason: None,
+        })
+        .unwrap();
+    store.writer().flush().unwrap();
+    store
+        .read(|conn| {
+            let repo = PlanStepRepo::new(conn);
+            let ids = |state: Option<&str>| -> Vec<Uuid> {
+                repo.ready_steps(node_id, state).unwrap()
+            };
+            assert!(ids(Some("active")).is_empty(), "the backfill waits for release");
+            assert_eq!(ids(Some("released")), vec![backfill]);
+            assert_eq!(ids(None), vec![backfill]);
+            Ok(())
+        })
+        .unwrap();
+
+    // Verifying the obligation, then taking the released step, does not
+    // reopen it: that phase's action is not a reimplementation.
+    store
+        .writer()
+        .execute_interview(
+            "test",
+            crate::interview::InterviewCommand::RecordObligationVerdict {
+                node_id,
+                obligation_id: req,
+                conversation_id: None,
+                status: "verified".into(),
+                evidence: "Checked.".into(),
+            },
+        )
+        .unwrap();
+    store
+        .enqueue_outline(OutlineMutation::UpdatePlanStepStatus {
+            step_id: backfill,
+            status: "implemented".into(),
+            note: None,
+            reason: None,
+        })
+        .unwrap();
+    store.writer().flush().unwrap();
+    store
+        .read(|conn| {
+            let standings = crate::verification::VerdictRepo::new(conn).standings(node_id)?;
+            assert!(standings[0].is_verified());
+            assert_eq!(standings[0].phase, PHASE_RELEASED);
+            Ok(())
+        })
+        .unwrap();
 }

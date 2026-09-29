@@ -416,12 +416,28 @@ pub const GATE_CRITERIA: &[GateCriterionSeed] = &[
         sort_order: 1,
     },
     GateCriterionSeed {
+        id_str: "a1000009-0009-4009-8009-000000000004",
+        from_state: "merged",
+        to_state: "released",
+        slug: crate::outline::repos::gate::MERGED_RELEASED_PLAN_VERIFIED_SLUG,
+        label: "Every plan step of the merged phase done and verified?",
+        sort_order: 2,
+    },
+    GateCriterionSeed {
         id_str: "a1000009-0009-4009-8009-000000000002",
         from_state: "released",
         to_state: "learn",
         slug: crate::outline::repos::gate::RELEASED_LEARN_PHASE_CERTIFIED_SLUG,
         label: "Post-release check certified done, with its evidence?",
         sort_order: 1,
+    },
+    GateCriterionSeed {
+        id_str: "a1000009-0009-4009-8009-000000000005",
+        from_state: "released",
+        to_state: "learn",
+        slug: crate::outline::repos::gate::RELEASED_LEARN_PLAN_VERIFIED_SLUG,
+        label: "Every plan step of the released phase done and verified?",
+        sort_order: 2,
     },
     // learn → done
     GateCriterionSeed {

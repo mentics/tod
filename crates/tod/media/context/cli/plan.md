@@ -3,8 +3,8 @@
 ```
 tod-cli --data-root <DATA_ROOT> plan list      [--node <NODE_UUID>] [--search <TEXT>]
 tod-cli --data-root <DATA_ROOT> plan show      <STEP_ID>
-tod-cli --data-root <DATA_ROOT> plan add       --node <NODE_UUID> --body <TEXT> [--after <STEP_ID>] [--before] [--depends-on <STEP_ID>] [--satisfies <OBLIGATION_ID>]
-tod-cli --data-root <DATA_ROOT> plan update    <STEP_ID> [--body <TEXT>] [--status pending|ready|in_progress|implemented|verified|failed|partial|blocked] [--reason conflict|decision|access] [--why <TEXT>] [--did <TEXT>] [--cites <OBLIGATION_ID>]... [--option <TEXT>]... [--needs <TEXT>] [--tried <TEXT>] [--note <TEXT>]
+tod-cli --data-root <DATA_ROOT> plan add       --node <NODE_UUID> --body <TEXT> [--phase active|verifying|merged|released] [--after <STEP_ID>] [--before] [--depends-on <STEP_ID>] [--satisfies <OBLIGATION_ID>]
+tod-cli --data-root <DATA_ROOT> plan update    <STEP_ID> [--body <TEXT>] [--phase active|verifying|merged|released] [--status pending|ready|in_progress|implemented|verified|failed|partial|blocked] [--reason conflict|decision|access] [--why <TEXT>] [--did <TEXT>] [--cites <OBLIGATION_ID>]... [--option <TEXT>]... [--needs <TEXT>] [--tried <TEXT>] [--note <TEXT>]
 tod-cli --data-root <DATA_ROOT> plan delete    <STEP_ID>
 tod-cli --data-root <DATA_ROOT> plan depend    <STEP_ID> --on <STEP_ID>
 tod-cli --data-root <DATA_ROOT> plan undepend  <STEP_ID> --on <STEP_ID>
@@ -22,7 +22,19 @@ shown in listings. `satisfy`/`unsatisfy` link a step to the requirement or
 constraint it fulfills — use `obligations list --node <NODE_UUID>` to find the
 obligation id if you weren't given it. `ready` lists the steps eligible to
 start now (status `ready`, or `pending` with every dependency
-`implemented`/`verified`).
+`implemented`/`verified`) that are due by the node's lifecycle state.
+
+A step is an action: something done, which can then be checked. `--phase` is
+the lifecycle state whose agent takes it. `active`, the default, is
+implementation. `verifying`, `merged`, and `released` are for an action only
+that phase can take: `merged` for part of releasing (a migration that must
+precede the deploy, a production setting, a feature flag), `released` for one
+that needs the release in place (a backfill against production data). The
+phase that takes such a step also verifies it: it sets the step
+`implemented`, then `verified` once it has checked the action took effect.
+A step may depend only on steps of its own phase or an earlier one; `add`,
+`update`, and `depend` refuse the reverse. `list` and `show` print a step's
+phase when it is not `active`.
 
 `--status partial` and `--status blocked` hand the step to the user, so each
 requires `--reason` and `--why`, and the reason names what the user does.

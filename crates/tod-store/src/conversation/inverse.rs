@@ -91,6 +91,7 @@ pub fn inverse(action: &ActionRow) -> Result<Vec<OutlineMutation>> {
         }
         M::UpdatePlanStepBody { .. }
         | M::UpdatePlanStepStatus { .. }
+        | M::SetPlanStepPhase { .. }
         | M::AddPlanStepDependency { .. }
         | M::RemovePlanStepDependency { .. }
         | M::LinkPlanStepObligation { .. }
@@ -102,6 +103,7 @@ pub fn inverse(action: &ActionRow) -> Result<Vec<OutlineMutation>> {
                 reason,
                 depends_on,
                 satisfies,
+                phase,
                 ..
             } = before()?
             else {
@@ -109,6 +111,7 @@ pub fn inverse(action: &ActionRow) -> Result<Vec<OutlineMutation>> {
             };
             match &action.mutation {
                 M::UpdatePlanStepBody { .. } => M::UpdatePlanStepBody { step_id: id, body },
+                M::SetPlanStepPhase { .. } => M::SetPlanStepPhase { step_id: id, phase },
                 M::UpdatePlanStepStatus { .. } => M::UpdatePlanStepStatus {
                     step_id: id,
                     status,

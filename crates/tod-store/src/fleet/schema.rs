@@ -487,8 +487,12 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
         migrate_v75_to_v76(conn)?;
         conn.pragma_update(None, "user_version", 76)?;
     }
-    // 77 is the plan-step phase column (`node_plan_steps.phase`), added on
-    // another branch at the same time.
+    if version < 77 {
+        // The lifecycle phase whose agent does each plan step
+        // (`doc/lifecycle/plan-step-phases.md`).
+        ensure_plan_step_phase(conn)?;
+        conn.pragma_update(None, "user_version", 77)?;
+    }
     if version < 78 {
         // A node has one ticket, `node_fields.ticket`, and generators find
         // their nodes by it; `managed_node_links` is folded in and dropped.
@@ -1307,6 +1311,23 @@ fn migrate_v40_to_v41(conn: &Connection) -> Result<()> {
     }
     tx.commit()?;
     conn.execute_batch("PRAGMA foreign_keys=ON;")?;
+    Ok(())
+}
+
+/// Plan steps: the phase whose agent does each (`active` for every step
+/// written before phases); a no-op when the column is already there.
+fn ensure_plan_step_phase(conn: &Connection) -> Result<()> {
+    let has_phase: bool = conn.query_row(
+        "SELECT COUNT(*) > 0 FROM pragma_table_info('node_plan_steps') WHERE name = 'phase'",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_phase {
+        conn.execute_batch(
+            "ALTER TABLE node_plan_steps ADD COLUMN phase TEXT NOT NULL DEFAULT 'active'
+                 CHECK (phase IN ('active', 'verifying', 'merged', 'released'));",
+        )?;
+    }
     Ok(())
 }
 
@@ -5031,7 +5052,10 @@ mod plan_step_migration_tests {
             ",
         )
         .unwrap();
-        for sql in &dependent_sql {
+        // The sync triggers read every column, `phase` (v77) among them:
+        // they come back below, as `sync::install` puts them back after
+        // migrating.
+        for sql in dependent_sql.iter().filter(|sql| !sql.contains("phase")) {
             conn.execute_batch(sql).unwrap();
         }
         let node_id = uuid::Uuid::new_v4();
@@ -5054,6 +5078,8 @@ mod plan_step_migration_tests {
         migrate_v40_to_v41(&conn).unwrap();
         migrate_v41_to_v42(&conn).unwrap();
         migrate_v41_to_v42(&conn).unwrap();
+        ensure_plan_step_phase(&conn).unwrap();
+        crate::sync::install(&conn).unwrap();
 
         assert_eq!(dependents(&conn), before);
         let row: (String, String, Option<String>) = conn
@@ -5073,6 +5099,9 @@ mod plan_step_migration_tests {
         // v43: `failed`, and the note history seeded from each step's note.
         migrate_v42_to_v43(&conn).unwrap();
         migrate_v42_to_v43(&conn).unwrap();
+        // v43 rebuilt the table as it was then; v77 adds `phase` back.
+        ensure_plan_step_phase(&conn).unwrap();
+        ensure_plan_step_phase(&conn).unwrap();
         assert_eq!(dependents(&conn), before);
         let history: Vec<(String, String)> = conn
             .prepare("SELECT status, body FROM node_plan_step_notes WHERE step_id = ?1")

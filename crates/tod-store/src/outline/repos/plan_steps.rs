@@ -8,6 +8,7 @@ use crate::outline::uuid_blob::{blob_to_uuid_sql, now_ms, uuid_to_blob};
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use uuid::Uuid;
 
 pub const STATUS_PENDING: &str = "pending";
@@ -34,6 +35,37 @@ pub const PLAN_STEP_STATUSES: [&str; 8] = [
     STATUS_PARTIAL,
     STATUS_BLOCKED,
 ];
+
+/// The lifecycle state whose agent does a step (`doc/lifecycle/plan-step-phases.md`).
+/// Most steps are implementation work; a later phase's step is an action only
+/// that phase can take (e.g. a backfill once the release is in place), which
+/// the same phase also verifies.
+pub const PHASE_ACTIVE: &str = "active";
+pub const PHASE_VERIFYING: &str = "verifying";
+pub const PHASE_MERGED: &str = "merged";
+pub const PHASE_RELEASED: &str = "released";
+
+/// In lifecycle order.
+pub const PLAN_STEP_PHASES: [&str; 4] = [PHASE_ACTIVE, PHASE_VERIFYING, PHASE_MERGED, PHASE_RELEASED];
+
+fn state_rank(state: &str) -> usize {
+    crate::settings::VALID_LIFECYCLE_STATES
+        .iter()
+        .position(|s| *s == state)
+        .unwrap_or(usize::MAX)
+}
+
+/// Whether a step of `phase` is due by the time a node is in `state`: its
+/// phase is `state` or an earlier one. Gates and loops count only these.
+pub fn due_by(phase: &str, state: &str) -> bool {
+    state_rank(phase) <= state_rank(state)
+}
+
+/// Whether a step of `phase` may depend on a step of `depends_on_phase`:
+/// only when the step it waits on is done in the same phase or earlier.
+pub fn dependency_allowed(phase: &str, depends_on_phase: &str) -> bool {
+    due_by(depends_on_phase, phase)
+}
 
 /// A status that hands the step back to the user, with a note saying why.
 pub fn needs_user(status: &str) -> bool {
@@ -130,6 +162,15 @@ pub struct PlanStep {
     /// Why a `partial` or `blocked` step needs the user; set and cleared with
     /// the note. Steps handed back before reasons existed have a note alone.
     pub reason: Option<HandoffReason>,
+    /// One of [`PLAN_STEP_PHASES`]: the lifecycle state whose agent does it.
+    pub phase: String,
+}
+
+impl PlanStep {
+    /// Whether this step is due by the time its node is in `state`.
+    pub fn due_by(&self, state: &str) -> bool {
+        due_by(&self.phase, state)
+    }
 }
 
 /// One note a step was given, with the status it was given with. A later note
@@ -154,7 +195,7 @@ impl<'a> PlanStepRepo<'a> {
 
     pub fn get(&self, id: Uuid) -> Result<Option<PlanStep>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, node_id, ordinal, body, status, note, reason FROM node_plan_steps WHERE id = ?1",
+            "SELECT id, node_id, ordinal, body, status, note, reason, phase FROM node_plan_steps WHERE id = ?1",
         )?;
         let row = stmt
             .query_row(params![uuid_to_blob(id)], map_plan_step)
@@ -164,7 +205,7 @@ impl<'a> PlanStepRepo<'a> {
 
     pub fn list_for_node(&self, node_id: Uuid) -> Result<Vec<PlanStep>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, node_id, ordinal, body, status, note, reason FROM node_plan_steps
+            "SELECT id, node_id, ordinal, body, status, note, reason, phase FROM node_plan_steps
              WHERE node_id = ?1 ORDER BY ordinal",
         )?;
         let rows = stmt
@@ -177,7 +218,7 @@ impl<'a> PlanStepRepo<'a> {
     /// Backs the project-wide `tod-cli plan list`.
     pub fn list_all(&self) -> Result<Vec<PlanStep>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, node_id, ordinal, body, status, note, reason FROM node_plan_steps
+            "SELECT id, node_id, ordinal, body, status, note, reason, phase FROM node_plan_steps
              ORDER BY node_id, ordinal",
         )?;
         let rows = stmt
@@ -196,7 +237,7 @@ impl<'a> PlanStepRepo<'a> {
         }
         let placeholders = node_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
         let sql = format!(
-            "SELECT id, node_id, ordinal, body, status, note, reason, updated_at
+            "SELECT id, node_id, ordinal, body, status, note, reason, phase, updated_at
              FROM node_plan_steps
              WHERE status IN ('partial', 'blocked') AND node_id IN ({placeholders})
              ORDER BY updated_at"
@@ -205,7 +246,7 @@ impl<'a> PlanStepRepo<'a> {
         let params: Vec<Vec<u8>> = node_ids.iter().copied().map(uuid_to_blob).collect();
         let rows = stmt
             .query_map(rusqlite::params_from_iter(params.iter()), |row| {
-                Ok((map_plan_step(row)?, row.get::<_, i64>(7)?))
+                Ok((map_plan_step(row)?, row.get::<_, i64>(8)?))
             })?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
@@ -258,6 +299,40 @@ impl<'a> PlanStepRepo<'a> {
         Ok(())
     }
 
+    /// Move `id` to another phase. Refused when a dependency, either way,
+    /// would then wait on work done in a later phase.
+    pub fn set_phase(&self, id: Uuid, phase: &str) -> Result<()> {
+        anyhow::ensure!(
+            PLAN_STEP_PHASES.contains(&phase),
+            "unknown plan step phase `{phase}` (expected: {})",
+            PLAN_STEP_PHASES.join(", ")
+        );
+        for dep in self.list_dependencies(id)? {
+            let dep = self.get(dep)?.context("plan step dependency not found")?;
+            anyhow::ensure!(
+                dependency_allowed(phase, &dep.phase),
+                "a `{phase}` step cannot depend on a `{}` step: it would wait on work done after it",
+                dep.phase
+            );
+        }
+        for dependent in self.list_dependents(id)? {
+            let dependent = self.get(dependent)?.context("plan step dependent not found")?;
+            anyhow::ensure!(
+                dependency_allowed(&dependent.phase, phase),
+                "a `{}` step depends on this one, so it cannot move to `{phase}`: it would wait on work done after it",
+                dependent.phase
+            );
+        }
+        let n = self.conn.execute(
+            "UPDATE node_plan_steps SET phase = ?1, updated_at = ?2 WHERE id = ?3",
+            params![phase, now_ms(), uuid_to_blob(id)],
+        )?;
+        if n == 0 {
+            anyhow::bail!("plan step not found");
+        }
+        Ok(())
+    }
+
     /// Set `id`'s status, note, and reason (`None` clears them) and, when it becomes
     /// `implemented`/`verified`, promote any `pending` dependent whose other
     /// dependencies are now all satisfied to `ready`.
@@ -291,16 +366,19 @@ impl<'a> PlanStepRepo<'a> {
             self.record_note(id, status, note)?;
         }
         if status == STATUS_IMPLEMENTED {
-            // The code changed under whatever verification had confirmed.
-            let node: Vec<u8> = self.conn.query_row(
-                "SELECT node_id FROM node_plan_steps WHERE id = ?1",
+            // The code changed under whatever verification had confirmed. A
+            // later phase's action (a backfill, a flag) changes no code.
+            let (node, phase): (Vec<u8>, String) = self.conn.query_row(
+                "SELECT node_id, phase FROM node_plan_steps WHERE id = ?1",
                 params![uuid_to_blob(id)],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )?;
-            crate::verification::VerdictRepo::new(self.conn).reopen_verified(
-                blob_to_uuid_sql(&node)?,
-                "A plan step was implemented again after this was verified.",
-            )?;
+            if phase == PHASE_ACTIVE {
+                crate::verification::VerdictRepo::new(self.conn).reopen_verified(
+                    blob_to_uuid_sql(&node)?,
+                    "A plan step was implemented again after this was verified.",
+                )?;
+            }
         }
         if satisfies_dependency(status) {
             for dependent in self.list_dependents(id)? {
@@ -311,19 +389,22 @@ impl<'a> PlanStepRepo<'a> {
     }
 
     /// Withdraw everything verification confirmed on `node_id`, because its
-    /// code changed since: each `verified` step goes back to `implemented`
-    /// (its note stays), and each `verified` verdict is reopened with `why`.
+    /// code changed since: each `verified` step of `active` or `verifying`
+    /// goes back to `implemented` (its note stays), and each `verified`
+    /// verdict is reopened with `why`. A later phase's steps have not run yet.
     /// Failed steps and verdicts stay: they are what the change was fixing.
     /// Returns how many steps and verdicts were reopened.
     pub fn reopen_verification(&self, node_id: Uuid, why: &str) -> Result<(usize, usize)> {
         let steps = self.conn.execute(
             "UPDATE node_plan_steps SET status = ?1, updated_at = ?2
-             WHERE node_id = ?3 AND status = ?4",
+             WHERE node_id = ?3 AND status = ?4 AND phase IN (?5, ?6)",
             params![
                 STATUS_IMPLEMENTED,
                 now_ms(),
                 uuid_to_blob(node_id),
-                STATUS_VERIFIED
+                STATUS_VERIFIED,
+                PHASE_ACTIVE,
+                PHASE_VERIFYING
             ],
         )?;
         let verdicts =
@@ -471,6 +552,14 @@ impl<'a> PlanStepRepo<'a> {
             |row| row.get(0),
         )?;
         anyhow::ensure!(reaches == 0, "that dependency would create a cycle");
+        let step = self.get(step_id)?.context("plan step not found")?;
+        let on = self.get(depends_on_step_id)?.context("plan step not found")?;
+        anyhow::ensure!(
+            dependency_allowed(&step.phase, &on.phase),
+            "a `{}` step cannot depend on a `{}` step: it would wait on work done after it",
+            step.phase,
+            on.phase
+        );
         self.conn.execute(
             "INSERT OR IGNORE INTO node_plan_step_deps (step_id, depends_on_step_id) VALUES (?1, ?2)",
             params![uuid_to_blob(step_id), uuid_to_blob(depends_on_step_id)],
@@ -528,11 +617,39 @@ impl<'a> PlanStepRepo<'a> {
         Ok(())
     }
 
+    /// The phase each of `node_id`'s obligations is done by: the latest
+    /// phase among the steps that satisfy it. An obligation missing from the
+    /// map has no step and is due with the implementation (`active`).
+    pub fn obligation_phases(&self, node_id: Uuid) -> Result<HashMap<Uuid, String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT l.obligation_id, s.phase FROM node_plan_step_obligations l
+             JOIN node_plan_steps s ON s.id = l.step_id WHERE s.node_id = ?1",
+        )?;
+        let rows = stmt
+            .query_map(params![uuid_to_blob(node_id)], |row| {
+                let blob: Vec<u8> = row.get(0)?;
+                Ok((blob_to_uuid_sql(&blob)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut phases: HashMap<Uuid, String> = HashMap::new();
+        for (obligation, phase) in rows {
+            let latest = phases.entry(obligation).or_insert_with(|| phase.clone());
+            if state_rank(&phase) > state_rank(latest) {
+                *latest = phase;
+            }
+        }
+        Ok(phases)
+    }
+
     /// Steps eligible to start now: `pending` with every dependency
-    /// `implemented`/`verified`, plus any already marked `ready`.
-    pub fn ready_steps(&self, node_id: Uuid) -> Result<Vec<Uuid>> {
+    /// `implemented`/`verified`, plus any already marked `ready`. With
+    /// `state`, only steps due by then (see [`due_by`]).
+    pub fn ready_steps(&self, node_id: Uuid, state: Option<&str>) -> Result<Vec<Uuid>> {
         let mut out = Vec::new();
         for step in self.list_for_node(node_id)? {
+            if state.is_some_and(|state| !step.due_by(state)) {
+                continue;
+            }
             if step.status == STATUS_READY {
                 out.push(step.id);
                 continue;
@@ -598,5 +715,6 @@ fn map_plan_step(row: &rusqlite::Row<'_>) -> rusqlite::Result<PlanStep> {
         reason: row
             .get::<_, Option<String>>(6)?
             .and_then(|json| serde_json::from_str(&json).ok()),
+        phase: row.get(7)?,
     })
 }

@@ -28,13 +28,13 @@ pub const READY_ACTIVE_ACTION_CONFIG_SLUG: &str = "ready-active.action-config-co
 pub const PLANNING_READY_REQUIREMENTS_TRACEABLE_SLUG: &str =
     "planning-ready.requirements-traceable";
 
-/// `active` → `verifying`: no plan step is still open work — each is `implemented` (or
+/// `active` → `verifying`: no `active` plan step is still open work — each is `implemented` (or
 /// already `verified`). The app answers this one itself (`tod_core::gate::derived`); it
 /// never goes to an agent, because whether the work is real is what verification is for.
 pub const ACTIVE_VERIFYING_PLAN_IMPLEMENTED_SLUG: &str = "active-verifying.plan-steps-implemented";
 
-/// `verifying` → `review`: every plan step is `verified`, none `failed` or
-/// unchecked. The app answers this one itself from the steps' statuses
+/// `verifying` → `review`: every `active` and `verifying` plan step is
+/// `verified`, none `failed` or unchecked. The app answers this one itself from the steps' statuses
 /// (`tod_core::gate::derived`); it never goes to an agent.
 pub const VERIFYING_REVIEW_PLAN_VERIFIED_SLUG: &str = "verifying-review.plan-steps-verified";
 
@@ -69,6 +69,12 @@ pub const DESIGN_PLANNING_PHASE_CERTIFIED_SLUG: &str = "design-planning.phase-ce
 pub const PLANNING_READY_PHASE_CERTIFIED_SLUG: &str = "planning-ready.phase-certified";
 pub const MERGED_RELEASED_PHASE_CERTIFIED_SLUG: &str = "merged-released.phase-certified";
 pub const RELEASED_LEARN_PHASE_CERTIFIED_SLUG: &str = "released-learn.phase-certified";
+/// `merged` → `released` and `released` → `learn`: every plan step due by
+/// the state (`plan_steps::due_by`) is `verified`. A later phase's step is
+/// done and checked by that phase itself; no separate verification follows
+/// it. App-answered; a node with no step of that phase passes.
+pub const MERGED_RELEASED_PLAN_VERIFIED_SLUG: &str = "merged-released.plan-steps-verified";
+pub const RELEASED_LEARN_PLAN_VERIFIED_SLUG: &str = "released-learn.plan-steps-verified";
 /// `learn` → `done`: the learn phase recorded its retrospective in this stay
 /// (`crate::learn`).
 pub const LEARN_DONE_LEARN_RECORDED_SLUG: &str = "learn-done.learn-recorded";
@@ -103,7 +109,9 @@ pub const DERIVED_CRITERION_SLUGS: &[&str] = &[
     PR_APPROVED_MERGEABLE_SLUG,
     APPROVED_MERGED_PR_MERGED_SLUG,
     MERGED_RELEASED_PHASE_CERTIFIED_SLUG,
+    MERGED_RELEASED_PLAN_VERIFIED_SLUG,
     RELEASED_LEARN_PHASE_CERTIFIED_SLUG,
+    RELEASED_LEARN_PLAN_VERIFIED_SLUG,
     LEARN_DONE_LEARN_RECORDED_SLUG,
 ];
 

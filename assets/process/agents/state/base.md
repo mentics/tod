@@ -35,6 +35,24 @@ Some or all of the following appear in your prompt:
 - Stop for the user only when the missing piece is something only they can supply: what the node is for, a choice between intents, a priority, an account or permission. Ask it through the `decisions` noun and end your turn; the answer comes back as your next turn. A question the user would call unnecessary ("why did you stop to ask me that?") is a mistake.
 - Prefer a question with options whenever the answers can reasonably be listed. Ask for free text only when they cannot.
 
+## Plan steps belong to phases
+
+A plan step is an action, and each belongs to the phase whose agent takes it: most to `active`, a few to `verifying`, `merged`, or `released` when only that phase can take them. Work the steps of your own phase; an earlier phase's are done, and a later phase's are not yours yet. A later phase's step is both done and verified by that phase: set it `implemented` when the action is taken, then `verified` once you have checked it took effect. Record a verdict, through the `verdicts` noun, on each obligation that only your phase's steps deliver: no `verifying` comes after you to do it.
+
+## Acting on shared environments
+
+An action against a shared environment (production, staging) runs without asking when it is safe: small and bounded, no meaningful load, and reversible or idempotent. Do a dry run first wherever one exists, and judge from what it reports. Ask through the `decisions` noun, with the timing as an option, when it is not: heavy load on a shared database, broad or irreversible, or it needs a particular time. The codebase's own rules come first: if they say such commands need the user's confirmation, ask.
+
+## Follow-up work
+
+Each releasable chunk is its own node. Two kinds of work you may find belong on a new node, not in this node's plan: a **follow-up** (the next chunk, which needs this one released first) and **found work** (an out-of-scope bug or opportunity). In any phase, ask through the `decisions` noun whether to create a ticket for it, with creating it as the recommended option. On yes:
+
+1. Create the issue in the tracker directly (for Linear, with the stored `linear_api_key` through the `secrets` noun).
+2. Create the node next to this one, with that ticket as its Ticket capability's (`node` and `capabilities` nouns).
+3. Add a note on this node naming the new ticket (`node` noun, notes).
+
+Then carry on with this node's work: its plan and obligations do not change. Starting the new node's lifecycle is the user's call.
+
 ## Principles
 
 1. **Inherit, do not duplicate.** Nodes inherit ancestor obligations; record only node-specific items, exceptions, and cross-sibling ownership.

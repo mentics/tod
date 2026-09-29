@@ -1054,10 +1054,15 @@ fn an_implementation_loops_on_recorded_state_until_the_plan_is_done() {
             capabilities: vec![tod_store::outline::Capability::Files],
         })
         .unwrap();
+    fx.fleet.writer().flush().unwrap();
     fx.fleet
-        .enqueue(tod_store::fleet::FleetMutation::UpdateTaskRepo {
-            id: fx.node.to_string(),
+        // The workspace itself: a worktree of its own would need a data root.
+        .enqueue_outline(OutlineMutation::SetNodeFiles {
+            node_id: fx.node,
             repo: Some(workspace.display().to_string()),
+            branch: None,
+            use_worktree: false,
+            dev_container: None,
         })
         .unwrap();
     for n in 0..2 {
@@ -1134,10 +1139,15 @@ fn a_verification_loops_until_every_step_has_a_verdict() {
             capabilities: vec![tod_store::outline::Capability::Files],
         })
         .unwrap();
+    fx.fleet.writer().flush().unwrap();
     fx.fleet
-        .enqueue(tod_store::fleet::FleetMutation::UpdateTaskRepo {
-            id: fx.node.to_string(),
+        // The workspace itself: a worktree of its own would need a data root.
+        .enqueue_outline(OutlineMutation::SetNodeFiles {
+            node_id: fx.node,
             repo: Some(workspace.display().to_string()),
+            branch: None,
+            use_worktree: false,
+            dev_container: None,
         })
         .unwrap();
     for n in 0..2 {
@@ -1215,10 +1225,15 @@ fn a_review_loops_until_it_is_recorded_done() {
             capabilities: vec![tod_store::outline::Capability::Files],
         })
         .unwrap();
+    fx.fleet.writer().flush().unwrap();
     fx.fleet
-        .enqueue(tod_store::fleet::FleetMutation::UpdateTaskRepo {
-            id: fx.node.to_string(),
+        // The workspace itself: a worktree of its own would need a data root.
+        .enqueue_outline(OutlineMutation::SetNodeFiles {
+            node_id: fx.node,
             repo: Some(workspace.display().to_string()),
+            branch: None,
+            use_worktree: false,
+            dev_container: None,
         })
         .unwrap();
     fx.fleet.writer().flush().unwrap();
@@ -1270,10 +1285,15 @@ fn a_fix_loops_until_no_finding_is_open() {
             capabilities: vec![tod_store::outline::Capability::Files],
         })
         .unwrap();
+    fx.fleet.writer().flush().unwrap();
     fx.fleet
-        .enqueue(tod_store::fleet::FleetMutation::UpdateTaskRepo {
-            id: fx.node.to_string(),
+        // The workspace itself: a worktree of its own would need a data root.
+        .enqueue_outline(OutlineMutation::SetNodeFiles {
+            node_id: fx.node,
             repo: Some(workspace.display().to_string()),
+            branch: None,
+            use_worktree: false,
+            dev_container: None,
         })
         .unwrap();
     fx.fleet.writer().flush().unwrap();

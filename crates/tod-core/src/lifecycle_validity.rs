@@ -180,6 +180,16 @@ pub fn regression(conn: &Connection, node_id: Uuid) -> Result<Option<Regression>
                     "planning",
                     format!("Plan step [{}] was reworded: {}", short_id(s.id), s.body),
                 )),
+                Some(s) if s.phase != before.phase => findings.push((
+                    "planning",
+                    format!(
+                        "Plan step [{}] moved from the {} phase to {}: {}",
+                        short_id(s.id),
+                        before.phase,
+                        s.phase,
+                        s.body
+                    ),
+                )),
                 Some(_) => {}
             }
         }
@@ -187,7 +197,9 @@ pub fn regression(conn: &Connection, node_id: Uuid) -> Result<Option<Regression>
 
     if rank >= lifecycle_rank("verifying") {
         let reviewing = rank >= lifecycle_rank("review");
-        for s in &steps {
+        // A later phase's steps and the obligations only they deliver are
+        // not due yet: those phases come after `approved`.
+        for s in steps.iter().filter(|s| s.due_by("verifying")) {
             if s.status == STATUS_VERIFIED {
                 continue;
             }
@@ -205,7 +217,11 @@ pub fn regression(conn: &Connection, node_id: Uuid) -> Result<Option<Regression>
                 format!("Plan step [{}] is {}: {}", short_id(s.id), s.status, s.body),
             ));
         }
-        for standing in VerdictRepo::new(conn).standings(node_id)? {
+        for standing in VerdictRepo::new(conn)
+            .standings(node_id)?
+            .into_iter()
+            .filter(|standing| standing.due_by("verifying"))
+        {
             let o = &standing.obligation;
             if standing.is_failed() {
                 findings.push((

@@ -213,6 +213,10 @@ pub enum EntitySnapshot {
         depends_on: Vec<Uuid>,
         /// Obligations this step is linked to. Sorted.
         satisfies: Vec<Uuid>,
+        /// The lifecycle phase whose agent does it; `active` in snapshots
+        /// taken before phases.
+        #[serde(default = "default_plan_step_phase")]
+        phase: String,
     },
     /// A node's capabilities and their settings.
     Capabilities {
@@ -686,4 +690,8 @@ where
 {
     let value = Option::<serde_json::Value>::deserialize(de)?;
     Ok(value.and_then(|v| serde_json::from_value(v).ok()))
+}
+
+fn default_plan_step_phase() -> String {
+    crate::outline::repos::plan_steps::PHASE_ACTIVE.to_string()
 }

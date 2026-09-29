@@ -37,6 +37,13 @@ pub struct BaselineObligation {
 pub struct BaselineStep {
     pub id: Uuid,
     pub body: String,
+    /// `active` in snapshots taken before steps had phases.
+    #[serde(default = "active_phase")]
+    pub phase: String,
+}
+
+fn active_phase() -> String {
+    crate::outline::repos::plan_steps::PHASE_ACTIVE.to_string()
 }
 
 /// The node's own obligations and plan steps at the moment it entered `ready`.
@@ -84,6 +91,7 @@ impl<'a> BaselineRepo<'a> {
                 .map(|s| BaselineStep {
                     id: s.id,
                     body: s.body,
+                    phase: s.phase,
                 })
                 .collect(),
             checked_actions: Vec::new(),

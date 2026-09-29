@@ -143,8 +143,13 @@ pub fn plan_step_line(step: &PlanStep, deps: &[Uuid], obligations: &[Uuid]) -> S
         Some(note) => format!(" (note: {})", one_line(note)),
         None => String::new(),
     };
+    let phase = if step.phase == tod_store::outline::repos::plan_steps::PHASE_ACTIVE {
+        String::new()
+    } else {
+        format!(" phase={}", step.phase)
+    };
     format!(
-        "[{}] {}{deps}{satisfies}: {}{reason}{note}",
+        "[{}] {}{phase}{deps}{satisfies}: {}{reason}{note}",
         short_id(step.id),
         step.status,
         one_line(&step.body)

@@ -216,6 +216,7 @@ fn every_mutation() -> Vec<(M, Option<ActionKind>)> {
         reason: None,
         depends_on: vec![],
         satisfies: vec![],
+        phase: "active".into(),
     };
     vec![
         (
@@ -441,6 +442,13 @@ fn every_mutation() -> Vec<(M, Option<ActionKind>)> {
             },
             Some(Edit),
         ),
+        (
+            M::SetPlanStepPhase {
+                step_id: id(),
+                phase: "released".into(),
+            },
+            Some(Edit),
+        ),
         (M::DeletePlanStep { step_id: id() }, Some(Delete)),
         (
             M::ReorderPlanStep {
@@ -609,6 +617,7 @@ fn classify_covers_every_mutation_kind() {
                 M::CreatePlanStep { .. }
                 | M::UpdatePlanStepBody { .. }
                 | M::UpdatePlanStepStatus { .. }
+                | M::SetPlanStepPhase { .. }
                 | M::DeletePlanStep { .. }
                 | M::ReorderPlanStep { .. }
                 | M::PlacePlanStep { .. }

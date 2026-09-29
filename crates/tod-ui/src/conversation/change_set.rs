@@ -313,6 +313,7 @@ pub(crate) fn field_diffs(
                 reason: r0,
                 depends_on: d0,
                 satisfies: sa0,
+                phase: p0,
             }),
             Some(S::PlanStep {
                 node_id: n1,
@@ -323,10 +324,12 @@ pub(crate) fn field_diffs(
                 reason: r1,
                 depends_on: d1,
                 satisfies: sa1,
+                phase: p1,
             }),
         ) => {
             field("Text", b0.clone(), b1.clone());
             field("Status", st0.clone(), st1.clone());
+            field("Phase", p0.clone(), p1.clone());
             field("Note", opt(no0), opt(no1));
             let reason = |r: &Option<HandoffReason>| opt(&r.as_ref().map(HandoffReason::describe));
             field("Reason", reason(r0), reason(r1));
@@ -373,6 +376,7 @@ pub(crate) fn plan_step_of(change: &NetChange) -> Option<PlanStep> {
             status,
             note,
             reason,
+            phase,
             ..
         } => Some(PlanStep {
             id: change.id,
@@ -382,6 +386,7 @@ pub(crate) fn plan_step_of(change: &NetChange) -> Option<PlanStep> {
             status: status.clone(),
             note: note.clone(),
             reason: reason.clone(),
+            phase: phase.clone(),
         }),
         _ => None,
     }

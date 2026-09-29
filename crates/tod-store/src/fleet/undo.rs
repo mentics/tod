@@ -419,6 +419,7 @@ fn capture_outline_inverse(conn: &Connection, m: &OutlineMutation) -> Result<Opt
         | OutlineMutation::CreatePlanStep { .. }
         | OutlineMutation::UpdatePlanStepBody { .. }
         | OutlineMutation::UpdatePlanStepStatus { .. }
+        | OutlineMutation::SetPlanStepPhase { .. }
         | OutlineMutation::DeletePlanStep { .. }
         | OutlineMutation::ReorderPlanStep { .. }
         | OutlineMutation::AddPlanStepDependency { .. }

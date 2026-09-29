@@ -186,6 +186,18 @@ struct InMedia {
 struct InStep {
     id: Uuid,
     body: String,
+    /// Left out for `active`, so certificates taken before steps had phases
+    /// keep their digest.
+    #[serde(default = "active_phase", skip_serializing_if = "is_active_phase")]
+    phase: String,
+}
+
+fn active_phase() -> String {
+    crate::outline::repos::plan_steps::PHASE_ACTIVE.to_string()
+}
+
+fn is_active_phase(phase: &str) -> bool {
+    phase == crate::outline::repos::plan_steps::PHASE_ACTIVE
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -225,7 +237,7 @@ struct Inputs {
 ///   Linear issue, and the task editor shows it); no agent is given it, so
 ///   no design turns on it, and a refresh that only touches it must not
 ///   send the phase back.
-/// - `planning`: own obligations, plan steps (id, body), and which step
+/// - `planning`: own obligations, plan steps (id, body, phase), and which step
 ///   satisfies which obligation.
 /// - `merged`, `released`: `{}` — the certificate is a check mark for the stay.
 pub fn phase_inputs(conn: &Connection, node_id: Uuid, state: &str) -> Result<Option<Value>> {
@@ -337,12 +349,14 @@ fn media(conn: &Connection, node_id: Uuid) -> Result<Vec<InMedia>> {
 }
 
 fn plan_steps(conn: &Connection, node_id: Uuid) -> Result<Vec<InStep>> {
-    let mut stmt = conn.prepare("SELECT id, body FROM node_plan_steps WHERE node_id = ?1")?;
+    let mut stmt =
+        conn.prepare("SELECT id, body, phase FROM node_plan_steps WHERE node_id = ?1")?;
     let rows = stmt
         .query_map(params![uuid_to_blob(node_id)], |row| {
             Ok(InStep {
                 id: blob_to_uuid_sql(&row.get::<_, Vec<u8>>(0)?)?,
                 body: row.get(1)?,
+                phase: row.get(2)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -424,7 +438,13 @@ pub fn describe_changes(before: &Value, after: &Value) -> Vec<String> {
         after.plan_steps.as_deref().unwrap_or_default(),
         |s| (s.id, short_id(s.id)),
         |id| format!("plan step {id}"),
-        |_, _| "reworded",
+        |a, b| {
+            if a.phase != b.phase {
+                "moved to another phase"
+            } else {
+                "reworded"
+            }
+        },
     );
     let before_links = before.step_obligations.unwrap_or_default();
     let after_links = after.step_obligations.unwrap_or_default();

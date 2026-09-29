@@ -67,6 +67,7 @@ pub fn snapshot(conn: &Connection, entity: Entity, id: Uuid) -> Result<Option<En
                 reason: step.reason,
                 depends_on,
                 satisfies,
+                phase: step.phase,
             })
         }
         Entity::Capabilities => capabilities_snapshot(conn, id)?,
@@ -142,6 +143,7 @@ pub fn classify(mutation: &OutlineMutation) -> Option<(ActionKind, Entity, Uuid)
         }
         M::UpdatePlanStepBody { step_id, .. }
         | M::UpdatePlanStepStatus { step_id, .. }
+        | M::SetPlanStepPhase { step_id, .. }
         | M::AddPlanStepDependency { step_id, .. }
         | M::RemovePlanStepDependency { step_id, .. }
         | M::LinkPlanStepObligation { step_id, .. }

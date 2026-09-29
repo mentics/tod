@@ -219,6 +219,13 @@ pub enum OutlineMutation {
         #[serde(default, deserialize_with = "crate::conversation::lenient_reason")]
         reason: Option<crate::outline::repos::plan_steps::HandoffReason>,
     },
+    /// Move a step to the lifecycle phase whose agent does it (one of
+    /// `PLAN_STEP_PHASES`). Rejected if a dependency would then wait on a
+    /// later phase.
+    SetPlanStepPhase {
+        step_id: Uuid,
+        phase: String,
+    },
     DeletePlanStep {
         step_id: Uuid,
     },
@@ -415,6 +422,7 @@ impl OutlineMutation {
                 | OutlineMutation::CreatePlanStep { .. }
                 | OutlineMutation::UpdatePlanStepBody { .. }
                 | OutlineMutation::UpdatePlanStepStatus { .. }
+                | OutlineMutation::SetPlanStepPhase { .. }
                 | OutlineMutation::DeletePlanStep { .. }
                 | OutlineMutation::ReorderPlanStep { .. }
                 | OutlineMutation::AddPlanStepDependency { .. }
@@ -723,6 +731,9 @@ impl OutlineMutation {
                     note.as_deref(),
                     reason.as_ref(),
                 )?;
+            }
+            OutlineMutation::SetPlanStepPhase { step_id, phase } => {
+                PlanStepRepo::new(conn).set_phase(*step_id, phase)?;
             }
             OutlineMutation::DeletePlanStep { step_id } => {
                 PlanStepRepo::new(conn).delete(*step_id)?;
@@ -1099,6 +1110,7 @@ fn restore_plan_step(
         reason,
         depends_on,
         satisfies,
+        phase,
     } = snapshot
     else {
         anyhow::bail!("not a plan step snapshot");
@@ -1118,13 +1130,14 @@ fn restore_plan_step(
     repo.insert_at(id, *node_id, index_from_ordinal(*ordinal), body)?;
     // Set directly: restoring is not a status change, so nothing is promoted.
     conn.execute(
-        "UPDATE node_plan_steps SET status = ?1, note = ?2, reason = ?3 WHERE id = ?4",
+        "UPDATE node_plan_steps SET status = ?1, note = ?2, reason = ?3, phase = ?4 WHERE id = ?5",
         params![
             status,
             note,
             reason
                 .as_ref()
                 .map(|reason| serde_json::to_string(reason).expect("a handoff reason serializes")),
+            phase,
             uuid_to_blob(id)
         ],
     )?;

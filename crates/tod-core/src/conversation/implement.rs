@@ -29,7 +29,7 @@ use tod_store::interview::short_id;
 use tod_store::outline::EXTRA_CONTENT_DETAILS;
 use tod_store::outline::PlanStep;
 use tod_store::outline::repos::plan_steps::{
-    HandoffReason, STATUS_FAILED, STATUS_IMPLEMENTED, STATUS_VERIFIED, needs_user,
+    HandoffReason, PHASE_ACTIVE, STATUS_FAILED, STATUS_IMPLEMENTED, STATUS_VERIFIED, needs_user,
 };
 use tod_store::outline::repos::{NodeRepo, PlanStepRepo};
 use uuid::Uuid;
@@ -148,7 +148,7 @@ impl Protocol for ImplementationProtocol {
             .get_extra_content(node_id, EXTRA_CONTENT_DETAILS)
             .ok()
             .flatten();
-        let plan_steps = open_plan_steps(plan_steps(fleet, node_id));
+        let plan_steps = open_plan_steps(implement_steps(fleet, node_id));
         let obligations = fleet.list_obligations_for_node(node_id).unwrap_or_default();
         let ancestor_context = fleet
             .read(|conn| {
@@ -209,7 +209,7 @@ impl Protocol for ImplementationProtocol {
     /// moves neither is getting nowhere.
     fn progress(&self, env: &ProtocolEnv<'_>) -> Result<Option<String>> {
         let node = node_id(env)?;
-        let mut marks: Vec<String> = plan_steps(env.fleet, node)
+        let mut marks: Vec<String> = implement_steps(env.fleet, node)
             .iter()
             .map(|linked| format!("{}={}", linked.step.id, linked.step.status))
             .collect();
@@ -230,7 +230,7 @@ impl Protocol for ImplementationProtocol {
             return Ok(done);
         }
         let node = node_id(turn.env)?;
-        let steps = plan_steps(turn.env.fleet, node);
+        let steps = implement_steps(turn.env.fleet, node);
         let open: Vec<&PlanStepWithLinks> = steps
             .iter()
             .filter(|linked| step_is_open(&linked.step.status))
@@ -447,7 +447,12 @@ pub enum PlanProgress {
 }
 
 pub fn plan_progress(fleet: &FleetStore, node_id: Uuid) -> PlanProgress {
-    let steps = fleet.list_plan_steps_for_node(node_id).unwrap_or_default();
+    let steps: Vec<_> = fleet
+        .list_plan_steps_for_node(node_id)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|step| step.phase == PHASE_ACTIVE)
+        .collect();
     let total = steps.len();
     let remaining = steps
         .iter()
@@ -464,6 +469,15 @@ pub(super) fn node_id(env: &ProtocolEnv<'_>) -> Result<Uuid> {
     env.focus
         .node_id()
         .context("an implementation conversation without a node")
+}
+
+/// The node's `active` plan steps: implementation's work. A later phase's
+/// steps wait for that phase, and none of these depends on one.
+pub fn implement_steps(fleet: &FleetStore, node_id: Uuid) -> Vec<PlanStepWithLinks> {
+    plan_steps(fleet, node_id)
+        .into_iter()
+        .filter(|linked| linked.step.phase == PHASE_ACTIVE)
+        .collect()
 }
 
 /// The node's plan steps, as the agent is shown them. An open step whose
@@ -593,7 +607,7 @@ fn commit_message(env: &ProtocolEnv<'_>, node: Uuid, what: &str) -> String {
             Ok((runs, repo.latest_report(env.conversation_id)?))
         })
         .unwrap_or_default();
-    let steps = plan_steps(env.fleet, node);
+    let steps = implement_steps(env.fleet, node);
     let done = steps
         .iter()
         .filter(|s| step_is_done(&s.step.status))
@@ -777,7 +791,9 @@ pub fn mock_turn(
     let steps = access.read(|conn| {
         Ok(tod_store::outline::repos::PlanStepRepo::new(conn).list_for_node(node_id)?)
     })?;
-    if let Some(step) = steps.iter().find(|step| !step_is_done(&step.status))
+    if let Some(step) = steps
+        .iter()
+        .find(|step| step.phase == PHASE_ACTIVE && !step_is_done(&step.status))
         && let Some(secs) = mock_wait_secs(&step.body)
     {
         let waited = access.read(|conn| Ok(!tod_store::waits::WaitRepo::new(conn).list_for_node(node_id)?.is_empty()))?;
@@ -793,7 +809,9 @@ pub fn mock_turn(
             return Ok(String::new());
         }
     }
-    if let Some(step) = steps.iter().find(|step| !step_is_done(&step.status)) {
+    if let Some(step) = steps
+        .iter()
+        .find(|step| step.phase == PHASE_ACTIVE && !step_is_done(&step.status)) {
         for (path, text) in mock_writes(&step.body) {
             mock_write(place.cwd, path, text)?;
         }
@@ -1152,6 +1170,7 @@ mod tests {
                 status: STATUS_BLOCKED.into(),
                 note: Some("The form outgrew ConfigSchema.".into()),
                 reason: Some(reason),
+                phase: PHASE_ACTIVE.into(),
             }
         }
 

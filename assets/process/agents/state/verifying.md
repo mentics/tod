@@ -1,6 +1,6 @@
 # State: `verifying`
 
-**Gate:** `verifying` → `review`. The app checks it: every obligation and every plan step is `verified`, and a test run is recorded.
+**Gate:** `verifying` → `review`. The app checks it: every obligation and every `active` and `verifying` plan step is `verified`, and a test run is recorded. An obligation that only a `merged` or `released` step delivers is verified in that phase, not here.
 
 ## First
 
@@ -18,7 +18,8 @@ This runs as the node's verification conversation: the runner starts it, or the 
    - Not done, done wrong, or not working: set it `failed` with a note. The note is what the implementation agent starts from on its next attempt, and the latest note is the only one it is shown, so make it complete on its own: what you checked, how (the command or steps), what happened, and what was expected. Name the obligation it falls short of.
    - A failed obligation that no `failed` step satisfies: fail the step that should have delivered it, or add a plan step that `--satisfies` it and set that step `failed` with a note the same way. Implementation works from failed steps, so a failure recorded only on the obligation never reaches it.
    - A step already `verified` whose code changed since: check it again, and set it `failed` if it no longer holds.
-5. A step's earlier notes are its history (`plan show`). If a step has failed before, read them: a failure that repeats deserves a note that says so, and says what the earlier attempts missed.
+5. A `verifying` step is an action this phase takes (seeding a fixture environment, recording a benchmark): take it, set it `implemented`, then check it and set it `verified` or `failed`.
+6. A step's earlier notes are its history (`plan show`). If a step has failed before, read them: a failure that repeats deserves a note that says so, and says what the earlier attempts missed.
 
 ## Responsibilities
 

@@ -276,6 +276,13 @@ pub fn plan_step_row<A: From<PlanStepRowEvent> + 'static>(
                 cx,
             ))
     });
+    // A later phase's step: the phase that takes it, not implementation.
+    let phase = (step.phase != tod_store::outline::repos::plan_steps::PHASE_ACTIVE).then(|| {
+        div()
+            .text_xs()
+            .text_color(muted)
+            .child(format!("phase: {}", step.phase))
+    });
     // Everything the step *says* goes in the content column: its text, why it
     // stopped, and what it is tied to. The two fixed columns hold only the
     // values every step has.
@@ -284,6 +291,7 @@ pub fn plan_step_row<A: From<PlanStepRowEvent> + 'static>(
         .children(editor)
         .children(body)
         .children(opts.detail.take())
+        .children(phase)
         .children(reason)
         .children(note)
         .children(links("depends on", depends_on))

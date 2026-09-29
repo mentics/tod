@@ -114,7 +114,7 @@ impl Protocol for VerificationProtocol {
                     body,
                     lifecycle: Some(node.lifecycle.clone()),
                 },
-                plan_steps: plan_steps(fleet, node_id),
+                plan_steps: verify_steps(fleet, node_id),
                 obligations,
                 ancestor_context,
                 verdicts: current_verdicts(fleet, node_id),
@@ -151,7 +151,7 @@ impl Protocol for VerificationProtocol {
     /// nowhere.
     fn progress(&self, env: &ProtocolEnv<'_>) -> Result<Option<String>> {
         let node = node_id(env)?;
-        let verdicts = standings(env.fleet, node).into_iter().map(|standing| {
+        let verdicts = due_standings(env.fleet, node).into_iter().map(|standing| {
             format!(
                 "{}={}#{}",
                 standing.obligation.id,
@@ -159,7 +159,7 @@ impl Protocol for VerificationProtocol {
                 standing.verdict.as_ref().map(|v| v.id).unwrap_or_default()
             )
         });
-        let mut marks: Vec<String> = plan_steps(env.fleet, node)
+        let mut marks: Vec<String> = verify_steps(env.fleet, node)
             .iter()
             .map(|linked| {
                 format!(
@@ -185,8 +185,8 @@ impl Protocol for VerificationProtocol {
             return Ok(done);
         }
         let node = node_id(turn.env)?;
-        let steps = plan_steps(turn.env.fleet, node);
-        let standings = standings(turn.env.fleet, node);
+        let steps = verify_steps(turn.env.fleet, node);
+        let standings = due_standings(turn.env.fleet, node);
         let owed = Owed {
             obligations: standings.iter().filter(|s| s.is_unchecked()).collect(),
             stranded: stranded_failures(&standings, &steps),
@@ -207,6 +207,24 @@ impl Protocol for VerificationProtocol {
             reason: owed.reason(),
         })
     }
+}
+
+/// The plan steps verification rules on: `active` ones and its own. A later
+/// phase's steps are done and checked by that phase.
+fn verify_steps(fleet: &FleetStore, node_id: Uuid) -> Vec<PlanStepWithLinks> {
+    plan_steps(fleet, node_id)
+        .into_iter()
+        .filter(|linked| linked.step.due_by(VERIFYING))
+        .collect()
+}
+
+/// The obligations verification rules on: those not delivered only by a
+/// later phase's steps.
+fn due_standings(fleet: &FleetStore, node_id: Uuid) -> Vec<ObligationStanding> {
+    standings(fleet, node_id)
+        .into_iter()
+        .filter(|standing| standing.due_by(VERIFYING))
+        .collect()
 }
 
 /// The node's own obligations with verification's current verdict on each.
@@ -376,7 +394,7 @@ pub fn mock_turn(
     let unchecked: Vec<Uuid> = access
         .read(|conn| VerdictRepo::new(conn).standings(node_id))?
         .iter()
-        .filter(|standing| standing.is_unchecked())
+        .filter(|standing| standing.due_by(VERIFYING) && standing.is_unchecked())
         .map(|standing| standing.obligation.id)
         .collect();
     for obligation_id in unchecked {
@@ -393,7 +411,10 @@ pub fn mock_turn(
     let steps = access.read(|conn| {
         Ok(tod_store::outline::repos::PlanStepRepo::new(conn).list_for_node(node_id)?)
     })?;
-    if let Some(step) = steps.iter().find(|step| !has_verdict(&step.status)) {
+    if let Some(step) = steps
+        .iter()
+        .find(|step| step.due_by(VERIFYING) && !has_verdict(&step.status))
+    {
         access.interview(tod_store::interview::InterviewCommand::Outline {
             mutation: tod_store::outline::OutlineMutation::UpdatePlanStepStatus {
                 step_id: step.id,

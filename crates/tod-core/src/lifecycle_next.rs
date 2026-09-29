@@ -19,6 +19,7 @@ use anyhow::Result;
 use rusqlite::Connection;
 use tod_store::outline::repos::PlanStepRepo;
 use tod_store::outline::repos::plan_steps::{
+    PHASE_ACTIVE,
     STATUS_FAILED, STATUS_IMPLEMENTED, STATUS_VERIFIED, needs_user,
 };
 use tod_store::review::ReviewRepo;
@@ -81,8 +82,18 @@ impl Standing {
     /// Read `node_id`'s standing from the store. `lifecycle` is its current
     /// state.
     pub fn load(conn: &Connection, node_id: Uuid, lifecycle: &str) -> Result<Self> {
-        let steps = PlanStepRepo::new(conn).list_for_node(node_id)?;
-        let standings = VerdictRepo::new(conn).standings(node_id)?;
+        // Implementation's steps, and any later phase's once the node has
+        // reached it; the rest are not due yet.
+        let steps: Vec<_> = PlanStepRepo::new(conn)
+            .list_for_node(node_id)?
+            .into_iter()
+            .filter(|s| s.phase == PHASE_ACTIVE || s.due_by(lifecycle))
+            .collect();
+        let standings: Vec<_> = VerdictRepo::new(conn)
+            .standings(node_id)?
+            .into_iter()
+            .filter(|s| s.phase == PHASE_ACTIVE || s.due_by(lifecycle))
+            .collect();
         let reviewing = lifecycle == "review";
         let open_findings = if reviewing {
             ReviewRepo::new(conn)

@@ -1,6 +1,6 @@
 # State: `active`
 
-**Gate:** `active` → `verifying`. The app checks it: every plan step implemented and a green test run recorded. The implementation conversation loops until then.
+**Gate:** `active` → `verifying`. The app checks it: every `active` plan step implemented and a green test run recorded. Steps of a later phase (`verifying`, `merged`, `released`) are not yours: that phase takes them. The implementation conversation loops until then.
 
 ## First
 
