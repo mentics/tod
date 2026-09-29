@@ -248,6 +248,7 @@ pub struct UnifiedView {
     restoring_selection: Option<Uuid>,
     _task_list_subscription: Subscription,
     _agent_runs_subscription: Subscription,
+    _runners_subscription: Subscription,
     _chat_drawer_subscription: Subscription,
     _attention_poll: gpui::Task<()>,
 }
@@ -293,6 +294,7 @@ impl UnifiedView {
             let (fleet, agent, agent_runs) = (fleet.clone(), agent.clone(), agent_runs.clone());
             cx.new(|cx| runners::NodeRunners::new(fleet, agent, agent_runs, cx))
         };
+        let _runners_subscription = cx.observe(&runners, |this, _, cx| this.apply_running_nodes(cx));
         let _attention_poll = Self::spawn_attention_poll(fleet.clone(), window, cx);
         let mut this = Self {
             fleet,
@@ -315,6 +317,7 @@ impl UnifiedView {
             restoring_selection: None,
             _task_list_subscription,
             _agent_runs_subscription,
+            _runners_subscription,
             _chat_drawer_subscription,
             _attention_poll,
         };
@@ -435,11 +438,21 @@ impl UnifiedView {
         });
     }
 
+    /// Tells the tree which nodes the lifecycle processor is working on: a
+    /// runner with a run in progress, or a lifecycle conversation mid-turn.
+    fn apply_running_nodes(&mut self, cx: &mut Context<Self>) {
+        let mut nodes = self.agent_runs.read(cx).running_lifecycle_nodes();
+        nodes.extend(self.runners.read(cx).running_nodes());
+        let set: std::collections::HashSet<String> = nodes.iter().map(|n| n.to_string()).collect();
+        self.task_list.update(cx, |task_list, cx| task_list.set_running_nodes(set, cx));
+    }
+
     /// Recomputes every running node's status label (W11) from
     /// [`AgentRuns`] and hands the map to `TaskListView` in one call — never
     /// per row per frame, since `AgentRuns::running_status_labels` reads
     /// each running slot's conversation row.
     fn apply_status_overrides(&mut self, cx: &mut Context<Self>) {
+        self.apply_running_nodes(cx);
         let fleet = self.fleet.clone();
         let map = self.agent_runs.read(cx).running_status_labels(|node| {
             fleet

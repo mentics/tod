@@ -376,6 +376,8 @@ pub struct TaskListView {
     /// `set_status_overrides` changed `all_tasks` and needs a rebuild;
     /// applied the same way `pending_attention_apply` is.
     pending_status_override_apply: bool,
+    /// Nodes the lifecycle processor is working on, as the host last said.
+    running_nodes: std::collections::HashSet<String>,
 }
 
 impl TaskListView {
@@ -537,6 +539,7 @@ impl TaskListView {
             attention: std::collections::HashMap::new(),
             pending_attention_apply: false,
             pending_status_override_apply: false,
+            running_nodes: std::collections::HashSet::new(),
         };
 
         cx.defer_in(window, move |this, window, cx| {
@@ -1749,6 +1752,7 @@ impl TaskListView {
             }
         }
         Self::apply_attention_map(&mut tasks, &self.attention);
+        Self::apply_running(&mut tasks, &self.running_nodes);
         self.all_tasks = tasks;
     }
 
@@ -1766,6 +1770,12 @@ impl TaskListView {
                 .unwrap_or((0, None));
             task.needs_you_count = count;
             task.waiting_since = waiting_since;
+        }
+    }
+
+    fn apply_running(tasks: &mut [TaskItem], running: &std::collections::HashSet<String>) {
+        for task in tasks.iter_mut() {
+            task.lifecycle_running = running.contains(&task.id);
         }
     }
 
@@ -1795,6 +1805,7 @@ impl TaskListView {
         }
         let mut tasks = snapshot.tasks;
         Self::apply_attention_map(&mut tasks, &self.attention);
+        Self::apply_running(&mut tasks, &self.running_nodes);
         if tasks == self.all_tasks {
             return;
         }
@@ -2801,6 +2812,23 @@ impl TaskListView {
         cx.notify();
     }
 
+    /// The host reports which nodes the lifecycle processor is working on.
+    /// Their rows show the running icon and title colour; a node leaving the
+    /// set goes back to normal.
+    pub fn set_running_nodes(
+        &mut self,
+        nodes: std::collections::HashSet<String>,
+        cx: &mut Context<Self>,
+    ) {
+        if nodes == self.running_nodes {
+            return;
+        }
+        self.running_nodes = nodes;
+        Self::apply_running(&mut self.all_tasks, &self.running_nodes);
+        self.pending_status_override_apply = true;
+        cx.notify();
+    }
+
     /// Records toggling a "Needs you" / "Running" tree filter chip as a
     /// journey `UserAction`, on the project (the toggle isn't about one node).
     fn record_quick_filter_toggle(&self, chip: &str, on: bool, cx: &mut Context<Self>) {
@@ -3221,7 +3249,7 @@ impl TaskListView {
         let running_nodes = self
             .all_tasks
             .iter()
-            .filter(|t| t.live_run_count > 0)
+            .filter(|t| t.lifecycle_running)
             .count();
         if pending_nodes == 0
             && needs_you_nodes == 0

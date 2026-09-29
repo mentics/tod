@@ -352,6 +352,26 @@ impl AgentRuns {
         self.slots.iter().filter(|s| s.status.running)
     }
 
+    /// Nodes with a lifecycle-processor conversation (anything but a chat or
+    /// the outline) running right now.
+    pub fn running_lifecycle_nodes(&self) -> std::collections::HashSet<Uuid> {
+        use tod_store::conversation::ProtocolKind;
+        self.slots
+            .iter()
+            .filter(|s| {
+                s.status.running
+                    && !matches!(
+                        s.protocol,
+                        ProtocolKind::Chat | ProtocolKind::Outline | ProtocolKind::VisualDesign
+                    )
+            })
+            .filter_map(|s| match s.focus {
+                Focus::Node(id) => Some(id),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// The status label (W11, `unified::status_label`) for every node with a
     /// gate check or on-entry run in flight, keyed by node id. Nodes with
     /// nothing running are left out — the tree row falls back to its own

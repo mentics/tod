@@ -133,6 +133,11 @@ impl NodeRunners {
         runner.outcome.as_ref().map(Runner::Ended)
     }
 
+    /// Every node with a run in progress.
+    pub fn running_nodes(&self) -> impl Iterator<Item = Uuid> + '_ {
+        self.runners.iter().filter(|(_, r)| r.run.is_some()).map(|(n, _)| *n)
+    }
+
     pub fn is_running(&self, node: Uuid) -> bool {
         self.runners.get(&node).is_some_and(|r| r.run.is_some())
     }

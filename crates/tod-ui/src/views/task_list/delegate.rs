@@ -605,7 +605,7 @@ impl ListDelegate for TaskListDelegate {
             } else if item.needs_you_count > 0 {
                 // `styles.node-title-needs-you`
                 crate::ui::style::color::node_needs_you_text()
-            } else if item.live_run_count > 0 {
+            } else if item.lifecycle_running {
                 // `styles.node-title-running`
                 crate::ui::style::color::node_running_text()
             } else if item.has_copies {
@@ -627,7 +627,7 @@ impl ListDelegate for TaskListDelegate {
                     display_title.clone(),
                     selected,
                     managed,
-                    item.incoming_count > 0 && item.needs_you_count == 0 && item.live_run_count == 0,
+                    item.incoming_count > 0 && item.needs_you_count == 0 && !item.lifecycle_running,
                     item.id.clone(),
                     sink.clone(),
                 ),
@@ -738,7 +738,7 @@ impl ListDelegate for TaskListDelegate {
             })
             .child(status_icon_cell(
                 item.needs_you_count > 0,
-                item.live_run_count > 0,
+                item.lifecycle_running,
             ))
             .child(title_line)
             .when_some(menu_at, |el, (at, menu)| el.child(popup_at(at, menu)));

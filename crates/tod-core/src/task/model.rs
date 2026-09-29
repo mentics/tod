@@ -75,6 +75,9 @@ pub struct TaskItem {
     /// per row) since building it touches `AgentRuns::runs_for_node`, a
     /// `fleet.read`.
     pub status_override: Option<String>,
+    /// The lifecycle processor is working on this node right now (fed by the
+    /// host via `TaskListView::set_running_nodes`).
+    pub lifecycle_running: bool,
 }
 
 impl TaskItem {
@@ -521,7 +524,7 @@ pub fn filter_and_sort_tasks(
         .then(|| matching_with_ancestors(tasks, &by_id, |t| t.needs_you_count > 0));
     let running = working_set
         .running_only
-        .then(|| matching_with_ancestors(tasks, &by_id, |t| t.live_run_count > 0));
+        .then(|| matching_with_ancestors(tasks, &by_id, |t| t.lifecycle_running));
     let filtered: Vec<TaskItem> = tasks
         .iter()
         .filter(|t| {
@@ -657,6 +660,7 @@ mod tests {
             needs_you_count: 0,
             waiting_since: None,
             status_override: None,
+            lifecycle_running: false,
         }
     }
 
@@ -717,7 +721,7 @@ mod tests {
         let root = sample("root", "Root", "ready", &[]);
         let mut leaf = sample("leaf", "Leaf", "ready", &[]);
         leaf.parent_id = Some("root".into());
-        leaf.live_run_count = 1;
+        leaf.lifecycle_running = true;
         let mut other = sample("other", "Other", "ready", &[]);
         other.parent_id = Some("root".into());
         let tasks = vec![root, leaf, other];
