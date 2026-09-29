@@ -507,10 +507,16 @@ impl ChatDrawer {
     }
 
     fn refresh_status(&mut self, cx: &mut Context<Self>) {
-        let status = self
+        let mut status = self
             .current_index(cx)
             .and_then(|ix| self.agent_runs.read(cx).status_at(ix))
             .unwrap_or_default();
+        // The slot is dropped when its turn ends; what it spent is kept.
+        if status.live_usage.is_none() {
+            status.live_usage = self
+                .conversation_id
+                .and_then(|id| self.agent_runs.read(cx).live_usage(id));
+        }
         if status != self.status {
             // A turn ended: what it spent is in the session log now.
             if self.status.running && !status.running {
@@ -1058,6 +1064,33 @@ mod tests {
                 .any(|e| e.kind == EntryKind::Agent)
         });
         assert!(has_reply, "the mock agent's reply should be in the transcript");
+    }
+
+    /// The conversation view's poll drops a finished turn's slot (its driver
+    /// took the live usage with it); the drawer still shows what was spent.
+    #[gpui::test]
+    fn the_usage_line_survives_the_finished_turns_slot_being_dropped(cx: &mut TestAppContext) {
+        let fixture = Fixture::new();
+        let agent = mock_agent();
+        let (drawer, runs, cx) = open_drawer(&fixture, agent.clone(), cx);
+        drawer.update(cx, |d, cx| d.set_focus(Focus::Node(fixture.node_id), cx));
+        cx.update_window(cx.window_handle(), |_, window, cx| {
+            drawer.update(cx, |d, cx| d.send("think Hello there", Vec::new(), window, cx));
+        })
+        .unwrap();
+        cx.run_until_parked();
+        drain(&runs, &fixture.store, &agent, cx);
+
+        runs.update(cx, |runs, cx| {
+            runs.retain(|slot| slot.status.running);
+            cx.notify();
+        });
+        drawer.update(cx, |d, cx| d.on_agent_runs_changed(cx));
+        cx.run_until_parked();
+
+        let line = drawer.read_with(cx, |d, cx| d.transcript.read(cx).usage_line());
+        let line = line.expect("a line under the title");
+        assert!(line.contains("Tokens:") && line.contains("context"), "{line}");
     }
 
     #[gpui::test]

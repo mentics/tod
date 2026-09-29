@@ -20,7 +20,9 @@ use crate::interview::agent::SharedAgent;
 use crate::interview::{TodPaths, TodSettings};
 use anyhow::Context as _;
 use gpui::Context;
+use std::collections::HashMap;
 use std::sync::Arc;
+use tod_agent::TokenUsage;
 use tod_core::conversation::implement::{HandoffAnswer, handoff_answer_message};
 use tod_core::conversation::{ConversationConfig, ConversationDriver, ConversationStatus, SharedAgentAccess};
 use tod_store::conversation::{Conversation, ConversationRepo, Focus, ProtocolKind};
@@ -97,6 +99,11 @@ pub struct AgentRuns {
     slots: Vec<DriverSlot>,
     /// The next [`DriverSlot::id`].
     next_slot: u64,
+    /// What each conversation's agent last reported spending live. A slot is
+    /// dropped once its turn ends and nobody shows its conversation
+    /// ([`AgentRuns::retain`]), and its driver's copy goes with it; a view
+    /// showing the conversation elsewhere (the chat drawer) still wants it.
+    live_usage: HashMap<Uuid, TokenUsage>,
 }
 
 impl AgentRuns {
@@ -106,6 +113,7 @@ impl AgentRuns {
             agent,
             slots: Vec::new(),
             next_slot: 0,
+            live_usage: HashMap::new(),
         }
     }
 
@@ -220,7 +228,16 @@ impl AgentRuns {
     pub fn put_back(&mut self, id: u64, driver: ConversationDriver) {
         if let Some(slot) = self.slots.iter_mut().find(|s| s.id == id) {
             slot.put_back(driver);
+            if let (Some(conversation), Some(usage)) = (slot.conversation_id, &slot.status.live_usage) {
+                self.live_usage.insert(conversation, usage.clone());
+            }
         }
+    }
+
+    /// What `conversation`'s agent last reported spending, kept after its
+    /// slot is gone.
+    pub fn live_usage(&self, conversation: Uuid) -> Option<TokenUsage> {
+        self.live_usage.get(&conversation).cloned()
     }
 
     /// The slot `id`'s driver, when it is here (not away on the background

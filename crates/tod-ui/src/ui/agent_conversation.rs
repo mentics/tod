@@ -426,6 +426,12 @@ impl AgentConversationPanel {
         }
     }
 
+    /// The line under the title, for tests.
+    #[cfg(test)]
+    pub fn usage_line(&self) -> Option<String> {
+        self.usage.as_ref().map(|(line, _)| line.to_string())
+    }
+
     /// The host's status lines above the input, top to bottom.
     pub fn set_notices(&mut self, notices: Vec<PanelNotice>, cx: &mut Context<Self>) {
         if notices != self.notices {
