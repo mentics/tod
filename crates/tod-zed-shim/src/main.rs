@@ -76,6 +76,7 @@ fn real_program(name: &str) -> PathBuf {
 }
 
 fn run_real(name: &str, args: &[String], extra: &[String]) -> ! {
+    log(&format!("passing {name} {args:?} to the real one"));
     let status = Command::new(real_program(name)).args(extra).args(args).status();
     match status {
         Ok(s) => std::process::exit(s.code().unwrap_or(255)),
@@ -312,11 +313,12 @@ fn main() {
 
     let parsed = parse_args(&args);
     if let Some(container) = parsed.dest.as_deref().and_then(container_for_host) {
-        log(&format!("{container}: ssh through docker exec sshd -i"));
+        log(&format!("{container}: ssh through docker exec sshd -i {args:?}"));
         let marker = hold_connection_marker(&format!("docker-{container}"));
         let extra = container_ssh_options(container, &exe_dir().join(CONTAINER_KEY_FILE));
         let status = Command::new(real_program("ssh")).args(&extra).args(&args).status();
         release_connection_marker(marker);
+        log(&format!("{container}: ssh ended: {status:?}"));
         match status {
             Ok(s) => std::process::exit(s.code().unwrap_or(255)),
             Err(e) => fail(&format!("could not run the real ssh: {e}")),
