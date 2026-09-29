@@ -688,6 +688,11 @@ pub const SSHD_DIR: &str = "/tmp/tod-sshd";
 /// The `sshd -i` command line the zed shim's ProxyCommand runs.
 pub const SSHD_CONFIG: &str = "/tmp/tod-sshd/sshd_config";
 
+/// What the zed shim's ProxyCommand runs (`sh {SSHD_RUN}`): `sshd -i` with
+/// [`SSHD_CONFIG`], and a short resolver timeout for PAM's lookup of `UNKNOWN`
+/// (see [`SSHD_PREP_SCRIPT`]).
+pub const SSHD_RUN: &str = "/tmp/tod-sshd/run";
+
 /// Makes `sshd -i -f {SSHD_CONFIG}` over a pipe usable, as root, writing only
 /// under [`SSHD_DIR`]: a host key, a config naming it and an authorized-keys
 /// file holding public key `$2` (for any user; `$1` must exist), and `UsePAM
@@ -695,7 +700,9 @@ pub const SSHD_CONFIG: &str = "/tmp/tod-sshd/sshd_config";
 /// accounts with a locked password, such as `vscode`), and sshd's
 /// privilege separation directory. A hosts entry for `UNKNOWN` (PAM otherwise
 /// waits ~13s on Docker Desktop's DNS for every connection) is best effort:
-/// `/etc/hosts` may be read-only. Idempotent.
+/// `/etc/hosts` may be read-only, in which case that lookup takes seconds:
+/// the launcher script `run` caps the resolver's timeout to keep it short.
+/// Idempotent.
 const SSHD_PREP_SCRIPT: &str = r#"
 [ -x /usr/sbin/sshd ] || exit 3
 grep -q "^$1:" /etc/passwd || exit 4
@@ -706,6 +713,10 @@ chmod 755 "$d"
 printf '%s
 ' "$2" > "$d/authorized_keys" || exit 1
 chmod 644 "$d/authorized_keys"
+cat > "$d/run" <<'RUN'
+#!/bin/sh
+RES_OPTIONS='timeout:1 attempts:1' exec /usr/sbin/sshd -i -f /tmp/tod-sshd/sshd_config
+RUN
 cat > "$d/sshd_config" <<CONF
 HostKey $d/host_ed25519
 AuthorizedKeysFile $d/authorized_keys
