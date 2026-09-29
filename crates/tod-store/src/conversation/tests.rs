@@ -309,7 +309,7 @@ fn every_mutation() -> Vec<(M, Option<ActionKind>)> {
         (
             M::SetNodeTicket {
                 node_id: id(),
-                linked_issues: vec![],
+                ticket: None,
                 linked_prs: vec![],
             },
             Some(Edit),
@@ -539,8 +539,6 @@ fn every_mutation() -> Vec<(M, Option<ActionKind>)> {
                 parent_id: id(),
                 title: String::new(),
                 external_id: String::new(),
-                source_type: String::new(),
-                generator_node_id: id(),
                 tags: vec![],
                 body: String::new(),
                 metadata: None,
@@ -564,28 +562,6 @@ fn every_mutation() -> Vec<(M, Option<ActionKind>)> {
             None,
         ),
         (M::DeleteManagedNode { node_id: id() }, None),
-        (
-            M::SetManagedNodeLink {
-                node_id: id(),
-                generator_node_id: id(),
-                external_id: String::new(),
-                source_type: String::new(),
-            },
-            None,
-        ),
-        (
-            M::ClearManagedNodeLinks {
-                generator_node_id: id(),
-            },
-            None,
-        ),
-        (
-            M::ClearStaleCopyLinks {
-                generator_node_id: id(),
-                external_id: String::new(),
-            },
-            None,
-        ),
         (
             M::RefreshLinkedCopy {
                 node_id: id(),

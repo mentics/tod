@@ -99,7 +99,7 @@ fn capabilities_snapshot(conn: &Connection, node_id: Uuid) -> Result<Option<Enti
         settings.repo = task.repo;
         settings.branch = task.branch;
         settings.tags = task.tags;
-        settings.linked_issues = task.linked_issues;
+        settings.ticket = task.ticket;
         settings.linked_prs = task.linked_prs;
     }
     if let Some(files) = NodeFilesRepo::new(conn).get(&id)? {
@@ -185,9 +185,6 @@ pub fn classify(mutation: &OutlineMutation) -> Option<(ActionKind, Entity, Uuid)
         | M::UpdateManagedNode { .. }
         | M::DeleteManagedNodes { .. }
         | M::DeleteManagedNode { .. }
-        | M::SetManagedNodeLink { .. }
-        | M::ClearManagedNodeLinks { .. }
-        | M::ClearStaleCopyLinks { .. }
         | M::RefreshLinkedCopy { .. }
         | M::PasteManagedNodeCopy { .. }
         | M::SetGeneratorAcceptConfig { .. }

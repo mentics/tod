@@ -69,9 +69,9 @@ pub fn apply_linear_fields_to_node(
             .map_err(|err| err.to_string())?;
     }
     fleet
-        .enqueue(FleetMutation::UpdateTaskLinkedIssues {
+        .enqueue(FleetMutation::UpdateTaskTicket {
             id: node_id.to_string(),
-            linked_issues: vec![ticket.to_string()],
+            ticket: Some(ticket.to_string()),
         })
         .map_err(|err| err.to_string())?;
     if let Some(tags) = tags {

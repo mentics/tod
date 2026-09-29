@@ -9,15 +9,18 @@ tod-cli --data-root <DATA_ROOT> capabilities enable  <NODE> <CAP>...
 tod-cli --data-root <DATA_ROOT> capabilities disable <NODE> <CAP>
 tod-cli --data-root <DATA_ROOT> capabilities set     <NODE> agent [--platform claude|cursor] [--model <TEXT>] [--effort <TEXT>]
 tod-cli --data-root <DATA_ROOT> capabilities set     <NODE> files [--dir <PATH>] [--branch <TEXT>] [--worktree on|off] [--container <NAME|ID>] [--mounted on|off] [--sandbox image[:<IMAGE>]|fork:<NAME>]
-tod-cli --data-root <DATA_ROOT> capabilities set     <NODE> ticket [--ticket <ID>]... [--pr <URL>]...
+tod-cli --data-root <DATA_ROOT> capabilities set     <NODE> ticket [--ticket <ID>] [--pr <URL>]...
 tod-cli --data-root <DATA_ROOT> capabilities set     <NODE> tags (--tags <A,B,..> | --add <TAG> | --remove <TAG>)
 tod-cli --data-root <DATA_ROOT> capabilities set     <NODE> generator --source <TYPE> --config <JSON>
 ```
 
 `<NODE>` is a slug or full UUID. `enable` adds capabilities with their
 defaults; generator and lifecycle cannot both be on. `set` changes only the
-settings you pass (an empty value clears one; `--ticket`/`--pr` replace the
-whole list) and needs the capability enabled first.
+settings you pass (an empty value clears one; `--pr` replaces the whole
+list) and needs the capability enabled first. A node is at most one ticket:
+`--ticket` replaces it, and related tickets go in the node's notes.
+Refreshing a generator updates every node that is one of its tickets,
+wherever that node came from.
 
 `files --container` runs the node's agents, terminals, and git in that
 running dev container (`--container ''` moves them back to this machine).

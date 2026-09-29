@@ -825,7 +825,22 @@ Second."), "{listed}");
             "{listed}"
         );
         assert!(listed.contains("tags: ui"), "{listed}");
-        assert!(listed.contains("ticket: tickets ABC-1;"), "{listed}");
+        assert!(listed.contains("ticket: ticket ABC-1;"), "{listed}");
+
+        // One ticket per node: a second replaces it, two at once are refused,
+        // and an empty one clears it.
+        cli(&root, &["capabilities", "set", &node, "ticket", "--ticket", "ABC-2"]).unwrap();
+        let listed = cli(&root, &["capabilities", "list", &node]).unwrap();
+        assert!(listed.contains("ticket: ticket ABC-2;"), "{listed}");
+        let err = cli(
+            &root,
+            &["capabilities", "set", &node, "ticket", "--ticket", "A-1", "--ticket", "A-2"],
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("at most one ticket"), "{err}");
+        cli(&root, &["capabilities", "set", &node, "ticket", "--ticket", ""]).unwrap();
+        let listed = cli(&root, &["capabilities", "list", &node]).unwrap();
+        assert!(listed.contains("ticket: ticket (none);"), "{listed}");
         let _ = std::fs::remove_dir_all(root);
     }
 

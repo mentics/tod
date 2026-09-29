@@ -1,4 +1,10 @@
-//! Generator repository — generator config, managed nodes, data-source links.
+//! Generator repository — generator config, managed nodes, and ticket links.
+//!
+//! Nothing stores which node came from which generator: a node *is* ticket T
+//! when its `node_fields.ticket` is T, and every link is found by that id
+//! (`doc/lifecycle/plan-step-phases.md`, section 4). A managed node's
+//! generator is its nearest generator ancestor; a non-managed node with
+//! ticket T receives what any generator returning T fetches.
 
 use crate::outline::types::Capability;
 use crate::outline::uuid_blob::{blob_to_uuid_sql, now_ms, uuid_to_blob};
@@ -26,7 +32,8 @@ pub struct GeneratorConfig {
     pub accept_capabilities: Vec<Capability>,
 }
 
-/// Data-source link on a managed or copied-out node.
+/// A managed node's link to its data source, derived from its ticket and its
+/// nearest generator ancestor.
 #[derive(Debug, Clone)]
 pub struct ManagedNodeLink {
     pub node_id: Uuid,
@@ -50,12 +57,25 @@ impl ManagedNodeLink {
     /// shows the external id beside it: its title carries it, unless the
     /// copy's Ticket capability already does.
     pub fn copy_title(&self, title: &str) -> String {
-        if self.is_ticket() {
-            title.to_string()
-        } else {
-            format!("{}: {}", self.external_id, title)
-        }
+        copy_title(&self.source_type, &self.external_id, title)
     }
+}
+
+/// See [`ManagedNodeLink::copy_title`].
+pub fn copy_title(source_type: &str, external_id: &str, title: &str) -> String {
+    if source_type == SOURCE_TYPE_LINEAR {
+        title.to_string()
+    } else {
+        format!("{external_id}: {title}")
+    }
+}
+
+/// A non-managed node that is some ticket: a refresh returning that ticket
+/// pushes its fields here, except those the user has edited.
+#[derive(Debug, Clone)]
+pub struct TicketHolder {
+    pub node_id: Uuid,
+    pub user_modified_fields: Vec<String>,
 }
 
 impl<'a> GeneratorRepo<'a> {
@@ -243,107 +263,109 @@ impl<'a> GeneratorRepo<'a> {
         Ok(None)
     }
 
-    // ── Data-source links ───────────────────────────────────────────────
+    // ── Ticket links ────────────────────────────────────────────────────
 
-    pub fn set_link(
-        &self,
-        node_id: Uuid,
-        generator_node_id: Uuid,
-        external_id: &str,
-        source_type: &str,
-    ) -> Result<()> {
-        self.conn.execute(
-            "INSERT INTO managed_node_links (node_id, generator_node_id, external_id, source_type, user_modified_fields)
-             VALUES (?1, ?2, ?3, ?4, '[]')
-             ON CONFLICT(node_id) DO UPDATE SET
-                generator_node_id = excluded.generator_node_id,
-                external_id = excluded.external_id,
-                source_type = excluded.source_type",
-            params![
-                uuid_to_blob(node_id),
-                uuid_to_blob(generator_node_id),
-                external_id,
-                source_type,
-            ],
-        )?;
-        Ok(())
-    }
-
+    /// The link of a managed node: its ticket, and the generator it sits
+    /// under. `None` for a node that is not managed, has no ticket, or has
+    /// no generator above it.
     pub fn get_link(&self, node_id: Uuid) -> Result<Option<ManagedNodeLink>> {
-        self.conn
-            .query_row(
-                "SELECT node_id, generator_node_id, external_id, source_type, user_modified_fields
-                 FROM managed_node_links WHERE node_id = ?1",
-                params![uuid_to_blob(node_id)],
-                row_to_link,
-            )
-            .optional()
-            .map_err(Into::into)
+        if !self.is_managed(node_id).unwrap_or(false) {
+            return Ok(None);
+        }
+        let Some((external_id, user_modified_fields)) = self.ticket_row(node_id)? else {
+            return Ok(None);
+        };
+        let Some(generator_node_id) = self.find_generator_ancestor(node_id)? else {
+            return Ok(None);
+        };
+        let source_type = self
+            .get_config(generator_node_id)?
+            .map(|config| config.data_source_type)
+            .unwrap_or_default();
+        Ok(Some(ManagedNodeLink {
+            node_id,
+            generator_node_id,
+            external_id,
+            source_type,
+            user_modified_fields,
+        }))
     }
 
-    pub fn delete_link(&self, node_id: Uuid) -> Result<()> {
-        self.conn.execute(
-            "DELETE FROM managed_node_links WHERE node_id = ?1",
-            params![uuid_to_blob(node_id)],
-        )?;
-        Ok(())
-    }
-
-    /// Delete all data-source links that originated from a given generator node.
-    pub fn clear_links_for_generator(&self, generator_node_id: Uuid) -> Result<()> {
-        self.conn.execute(
-            "DELETE FROM managed_node_links WHERE generator_node_id = ?1",
-            params![uuid_to_blob(generator_node_id)],
-        )?;
-        Ok(())
-    }
-
-    /// List links on copied-out (non-managed) nodes matching a generator and
-    /// external id — the set of copies a refresh should push field updates to.
-    pub fn copy_links_for(
-        &self,
-        generator_node_id: Uuid,
-        external_id: &str,
-    ) -> Result<Vec<ManagedNodeLink>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT l.node_id, l.generator_node_id, l.external_id, l.source_type, l.user_modified_fields
-             FROM managed_node_links l
-             JOIN nodes n ON n.id = l.node_id
-             WHERE l.generator_node_id = ?1 AND l.external_id = ?2 AND n.managed = 0",
-        )?;
-        let links = stmt
-            .query_map(
-                params![uuid_to_blob(generator_node_id), external_id],
-                row_to_link,
-            )?
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(links)
-    }
-
-    /// Clear the data-source link on any copied-out node (not the managed node
-    /// itself, which reconciliation deletes separately) still referencing an
-    /// external item that a generator's refresh determined no longer exists.
-    /// The node keeps its title and content but stops receiving updates.
-    pub fn clear_stale_copy_links(&self, generator_node_id: Uuid, external_id: &str) -> Result<()> {
-        self.conn.execute(
-            "DELETE FROM managed_node_links
-             WHERE generator_node_id = ?1 AND external_id = ?2
-               AND node_id IN (SELECT id FROM nodes WHERE managed = 0)",
-            params![uuid_to_blob(generator_node_id), external_id],
-        )?;
-        Ok(())
-    }
-
-    /// List all links for managed nodes under a generator.
+    /// Links of every managed node under a generator that has a ticket.
     pub fn links_for_generator(&self, generator_node_id: Uuid) -> Result<Vec<ManagedNodeLink>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT node_id, generator_node_id, external_id, source_type, user_modified_fields
-             FROM managed_node_links WHERE generator_node_id = ?1",
-        )?;
-        let links = stmt
-            .query_map(params![uuid_to_blob(generator_node_id)], row_to_link)?
-            .collect::<Result<Vec<_>, _>>()?;
+        let source_type = self
+            .get_config(generator_node_id)?
+            .map(|config| config.data_source_type)
+            .unwrap_or_default();
+        let mut links = Vec::new();
+        for node_id in self.collect_managed_descendants(generator_node_id)? {
+            if let Some((external_id, user_modified_fields)) = self.ticket_row(node_id)? {
+                links.push(ManagedNodeLink {
+                    node_id,
+                    generator_node_id,
+                    external_id,
+                    source_type: source_type.clone(),
+                    user_modified_fields,
+                });
+            }
+        }
         Ok(links)
+    }
+
+    /// Every non-managed node that is `ticket`, whichever generator (if any)
+    /// it was accepted from: the nodes a refresh returning it updates.
+    pub fn holders_of(&self, ticket: &str) -> Result<Vec<TicketHolder>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT f.node_id, f.ticket_modified_fields
+             FROM node_fields f JOIN nodes n ON n.id = f.node_id
+             WHERE f.ticket = ?1 AND n.managed = 0",
+        )?;
+        let holders = stmt
+            .query_map(params![ticket], |row| {
+                let id_blob: Vec<u8> = row.get(0)?;
+                let fields: String = row.get(1)?;
+                Ok(TicketHolder {
+                    node_id: blob_to_uuid_sql(&id_blob)?,
+                    user_modified_fields: serde_json::from_str(&fields).unwrap_or_default(),
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(holders)
+    }
+
+    /// Whether some non-managed node is `ticket`: the generator's
+    /// "already accepted" marker.
+    pub fn is_accepted(&self, ticket: &str) -> Result<bool> {
+        Ok(self
+            .conn
+            .prepare(
+                "SELECT 1 FROM node_fields f JOIN nodes n ON n.id = f.node_id
+                 WHERE f.ticket = ?1 AND n.managed = 0",
+            )?
+            .exists(params![ticket])?)
+    }
+
+    /// The fields a refresh must leave alone on a node that is a ticket.
+    pub fn user_modified_fields(&self, node_id: Uuid) -> Result<Vec<String>> {
+        Ok(self
+            .ticket_row(node_id)?
+            .map(|(_, fields)| fields)
+            .unwrap_or_default())
+    }
+
+    /// A node's ticket and the fields a refresh must leave alone.
+    fn ticket_row(&self, node_id: Uuid) -> Result<Option<(String, Vec<String>)>> {
+        let row: Option<(Option<String>, String)> = self
+            .conn
+            .query_row(
+                "SELECT ticket, ticket_modified_fields FROM node_fields WHERE node_id = ?1",
+                params![uuid_to_blob(node_id)],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        Ok(row.and_then(|(ticket, fields)| {
+            Some((ticket?, serde_json::from_str(&fields).unwrap_or_default()))
+        }))
     }
 
     /// Delete all managed child nodes under a generator node (recursive).
@@ -368,10 +390,6 @@ impl<'a> GeneratorRepo<'a> {
     }
 
     fn delete_node_row(&self, id: Uuid) -> Result<()> {
-        self.conn.execute(
-            "DELETE FROM managed_node_links WHERE node_id = ?1",
-            params![uuid_to_blob(id)],
-        )?;
         self.conn.execute(
             "DELETE FROM outline_entries WHERE node_id = ?1",
             params![uuid_to_blob(id)],
@@ -415,22 +433,21 @@ impl<'a> GeneratorRepo<'a> {
     pub fn update_user_modified_fields(&self, node_id: Uuid, fields: &[String]) -> Result<()> {
         let json = serde_json::to_string(fields)?;
         self.conn.execute(
-            "UPDATE managed_node_links SET user_modified_fields = ?2 WHERE node_id = ?1",
+            "UPDATE node_fields SET ticket_modified_fields = ?2 WHERE node_id = ?1",
             params![uuid_to_blob(node_id), json],
         )?;
         Ok(())
     }
 
-    /// Mark a single field as user-modified on a linked node, if it has a
-    /// data-source link. No-op if the node has no link (e.g. a plain node).
+    /// Mark a single field as user-modified on a node that is a ticket, so a
+    /// refresh leaves it alone. No-op if the node has no ticket.
     pub fn mark_field_modified(&self, node_id: Uuid, field: &str) -> Result<()> {
-        let Some(link) = self.get_link(node_id)? else {
+        let Some((_, mut fields)) = self.ticket_row(node_id)? else {
             return Ok(());
         };
-        if link.user_modified_fields.iter().any(|f| f == field) {
+        if fields.iter().any(|f| f == field) {
             return Ok(());
         }
-        let mut fields = link.user_modified_fields;
         fields.push(field.to_string());
         self.update_user_modified_fields(node_id, &fields)
     }
@@ -450,19 +467,5 @@ fn row_to_config(row: &rusqlite::Row<'_>) -> rusqlite::Result<GeneratorConfig> {
         last_refresh_at: row.get(5)?,
         accept_destination_node_id: dest_blob.map(|b| blob_to_uuid_sql(&b)).transpose()?,
         accept_capabilities,
-    })
-}
-
-fn row_to_link(row: &rusqlite::Row<'_>) -> rusqlite::Result<ManagedNodeLink> {
-    let id_blob: Vec<u8> = row.get(0)?;
-    let gen_blob: Vec<u8> = row.get(1)?;
-    let fields_json: String = row.get(4)?;
-    let fields: Vec<String> = serde_json::from_str(&fields_json).unwrap_or_default();
-    Ok(ManagedNodeLink {
-        node_id: blob_to_uuid_sql(&id_blob)?,
-        generator_node_id: blob_to_uuid_sql(&gen_blob)?,
-        external_id: row.get(2)?,
-        source_type: row.get(3)?,
-        user_modified_fields: fields,
     })
 }

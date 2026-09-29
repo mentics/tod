@@ -1318,7 +1318,7 @@ impl TaskEditView {
         // Show generator detail view by default for configured generators
         self.generator_show_detail = self.generator_data_source_type.is_some()
             && self.capability_enabled(Capability::Generator);
-        let linear = task.linked_issues.first().cloned().unwrap_or_default();
+        let linear = task.ticket.clone().unwrap_or_default();
         let github_pr = task.linked_prs.first().cloned().unwrap_or_default();
         let repo = self.loaded_repo.clone();
         let branch = self.loaded_branch.clone();
@@ -3167,24 +3167,24 @@ impl TaskEditView {
         };
         let raw_ticket = raw_ticket.trim();
         if raw_ticket.is_empty() {
-            let _ = self.fleet.enqueue(FleetMutation::UpdateTaskLinkedIssues {
+            let _ = self.fleet.enqueue(FleetMutation::UpdateTaskTicket {
                 id,
-                linked_issues: Vec::new(),
+                ticket: None,
             });
             return;
         }
         let Some(ticket) = parse_ticket_reference(raw_ticket) else {
-            let _ = self.fleet.enqueue(FleetMutation::UpdateTaskLinkedIssues {
+            let _ = self.fleet.enqueue(FleetMutation::UpdateTaskTicket {
                 id,
-                linked_issues: vec![raw_ticket.to_string()],
+                ticket: Some(raw_ticket.to_string()),
             });
             return;
         };
         let store = CredentialStore::from_data_root(self.fleet.paths().root());
         let Some(api_key) = resolve_linear_api_key(&store) else {
-            let _ = self.fleet.enqueue(FleetMutation::UpdateTaskLinkedIssues {
+            let _ = self.fleet.enqueue(FleetMutation::UpdateTaskTicket {
                 id,
-                linked_issues: vec![ticket.clone()],
+                ticket: Some(ticket.clone()),
             });
             self.pending_toast = Some(
                 "Linear API key not configured — linked ticket only; description not imported"
@@ -3277,9 +3277,9 @@ impl TaskEditView {
                 }
             }
             Err(err) => {
-                let _ = self.fleet.enqueue(FleetMutation::UpdateTaskLinkedIssues {
+                let _ = self.fleet.enqueue(FleetMutation::UpdateTaskTicket {
                     id: pending.node_id.to_string(),
-                    linked_issues: vec![pending.ticket.clone()],
+                    ticket: Some(pending.ticket.clone()),
                 });
                 self.pending_toast = Some(format!(
                     "Failed to fetch {} from Linear: {err}",

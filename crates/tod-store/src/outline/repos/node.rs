@@ -200,7 +200,7 @@ impl<'a> NodeRepo<'a> {
             .optional()?
             .is_some();
         if !has_fields {
-            self.set_fields(node_id, None, None, None, &[], &[])?;
+            self.set_fields(node_id, None, None, None, None, &[])?;
         }
         Ok(())
     }
@@ -280,25 +280,24 @@ impl<'a> NodeRepo<'a> {
         repo: Option<&str>,
         branch: Option<&str>,
         notes: Option<&str>,
-        linked_issues: &[String],
+        ticket: Option<&str>,
         linked_prs: &[String],
     ) -> Result<()> {
         let now = now_ms();
-        let issues_json = serde_json::to_string(linked_issues)?;
         let prs_json = serde_json::to_string(linked_prs)?;
         self.conn.execute(
-            "INSERT INTO node_fields (node_id, repo, branch, notes, linked_issues, linked_prs, updated_at)
+            "INSERT INTO node_fields (node_id, repo, branch, notes, ticket, linked_prs, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT(node_id) DO UPDATE SET
                repo = excluded.repo, branch = excluded.branch, notes = excluded.notes,
-               linked_issues = excluded.linked_issues,
+               ticket = excluded.ticket,
                linked_prs = excluded.linked_prs, updated_at = excluded.updated_at",
             params![
                 uuid_to_blob(node_id),
                 repo,
                 branch,
                 notes,
-                issues_json,
+                crate::fleet::repos::task::normalize_ticket(ticket),
                 prs_json,
                 now
             ],
@@ -331,19 +330,17 @@ impl<'a> NodeRepo<'a> {
             .unwrap_or_default())
     }
 
+    /// The node's ticket (`node_fields.ticket`), if it has one.
     pub fn get_ticket_id(&self, node_id: Uuid) -> Result<Option<String>> {
-        let raw: Option<String> = self
+        Ok(self
             .conn
             .query_row(
-                "SELECT linked_issues FROM node_fields WHERE node_id = ?1",
+                "SELECT ticket FROM node_fields WHERE node_id = ?1",
                 params![uuid_to_blob(node_id)],
-                |row| row.get(0),
+                |row| row.get::<_, Option<String>>(0),
             )
-            .optional()?;
-        let issues: Vec<String> = raw
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default();
-        Ok(issues.into_iter().next())
+            .optional()?
+            .flatten())
     }
 
     pub fn get_repo(&self, node_id: Uuid) -> Result<Option<String>> {
@@ -514,7 +511,8 @@ impl<'a> NodeRepo<'a> {
             }
             Capability::Ticket => {
                 self.conn.execute(
-                    "UPDATE node_fields SET linked_issues = '[]', linked_prs = '[]', updated_at = ?2
+                    "UPDATE node_fields SET ticket = NULL, ticket_modified_fields = '[]',
+                         linked_prs = '[]', updated_at = ?2
                      WHERE node_id = ?1",
                     params![blob, now_ms()],
                 )?;
@@ -525,8 +523,9 @@ impl<'a> NodeRepo<'a> {
             }
             Capability::Generator => {
                 let gen_repo = crate::outline::repos::GeneratorRepo::new(self.conn);
+                // Nodes accepted from it keep their tickets: they are linked
+                // by ticket id, not to this generator.
                 gen_repo.delete_managed_children(node_id)?;
-                gen_repo.clear_links_for_generator(node_id)?;
                 gen_repo.delete_config(node_id)?;
             }
         }

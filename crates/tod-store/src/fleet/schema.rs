@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Current fleet schema epoch stored in `PRAGMA user_version`.
-pub const CURRENT_USER_VERSION: i32 = 76;
+pub const CURRENT_USER_VERSION: i32 = 78;
 
 const BUSY_TIMEOUT_MS: i64 = 5000;
 
@@ -487,6 +487,14 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
         migrate_v75_to_v76(conn)?;
         conn.pragma_update(None, "user_version", 76)?;
     }
+    // 77 is the plan-step phase column (`node_plan_steps.phase`), added on
+    // another branch at the same time.
+    if version < 78 {
+        // A node has one ticket, `node_fields.ticket`, and generators find
+        // their nodes by it; `managed_node_links` is folded in and dropped.
+        migrate_v77_to_v78(conn)?;
+        conn.pragma_update(None, "user_version", 78)?;
+    }
     // Other branches (the task panel) numbered their own steps 66–67 at the
     // same time as 66–70 above, so a store may be past a version without
     // having these. Every one is idempotent: make sure of them all.
@@ -910,6 +918,108 @@ fn migrate_v75_to_v76(conn: &Connection) -> Result<()> {
         prs.add(node_id, &pr)?;
     }
     tx.execute_batch("DROP TABLE node_pr;")?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// A node has at most one ticket, and every link between a generator and a
+/// node is found by that id (`doc/lifecycle/plan-step-phases.md`, section 4):
+///
+/// - `node_fields.ticket` (indexed) replaces the `linked_issues` array. A
+///   node with several keeps the first; the rest go into a note, "Related
+///   tickets: A, B".
+/// - Each `managed_node_links` row gives its node the link's external id as
+///   its ticket (managed nodes never had one; a copy keeps its own) and its
+///   `user_modified_fields` as `node_fields.ticket_modified_fields`. Then the
+///   table goes, with its journey and sync triggers.
+///
+/// Every step checks before it acts, so running it twice is harmless.
+fn migrate_v77_to_v78(conn: &Connection) -> Result<()> {
+    use crate::outline::uuid_blob::now_ms;
+    use rusqlite::params;
+
+    let has_column = |column: &str| -> Result<bool> {
+        Ok(conn
+            .prepare("SELECT 1 FROM pragma_table_info('node_fields') WHERE name = ?1")?
+            .exists([column])?)
+    };
+    let has_links = conn
+        .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'managed_node_links'")?
+        .exists([])?;
+    let tx = conn.unchecked_transaction()?;
+    if !has_column("ticket")? {
+        tx.execute_batch("ALTER TABLE node_fields ADD COLUMN ticket TEXT;")?;
+    }
+    if !has_column("ticket_modified_fields")? {
+        tx.execute_batch(
+            "ALTER TABLE node_fields ADD COLUMN ticket_modified_fields TEXT NOT NULL DEFAULT '[]';",
+        )?;
+    }
+    tx.execute_batch("CREATE INDEX IF NOT EXISTS idx_node_fields_ticket ON node_fields(ticket);")?;
+
+    if has_column("linked_issues")? {
+        let rows: Vec<(Vec<u8>, String)> = tx
+            .prepare(
+                "SELECT f.node_id, f.linked_issues FROM node_fields f
+                 JOIN nodes n ON n.id = f.node_id
+                 WHERE f.linked_issues != '[]'",
+            )?
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        let tasks = crate::fleet::repos::task::TaskRepo::new(&tx);
+        for (node_id, raw) in rows {
+            let mut tickets = Vec::<String>::new();
+            for ticket in serde_json::from_str::<Vec<String>>(&raw).unwrap_or_default() {
+                let ticket = ticket.trim();
+                if !ticket.is_empty() && !tickets.iter().any(|t| t == ticket) {
+                    tickets.push(ticket.to_string());
+                }
+            }
+            let Some((first, rest)) = tickets.split_first() else {
+                continue;
+            };
+            tx.execute(
+                "UPDATE node_fields SET ticket = ?2 WHERE node_id = ?1 AND ticket IS NULL",
+                params![node_id, first],
+            )?;
+            if !rest.is_empty() {
+                let node_id = crate::outline::uuid_blob::blob_to_uuid(&node_id)?;
+                tasks.append_note(node_id, &format!("Related tickets: {}", rest.join(", ")))?;
+            }
+        }
+        // The sync triggers name every column, and `DROP COLUMN` refuses
+        // while any trigger does; `crate::sync::install` recreates them.
+        tx.execute_batch(
+            "DROP TRIGGER IF EXISTS trg_sync_node_fields_insert;
+             DROP TRIGGER IF EXISTS trg_sync_node_fields_update;
+             DROP TRIGGER IF EXISTS trg_sync_node_fields_delete;
+             ALTER TABLE node_fields DROP COLUMN linked_issues;",
+        )?;
+    }
+
+    if has_links {
+        let rows: Vec<(Vec<u8>, String, String)> = tx
+            .prepare(
+                "SELECT l.node_id, l.external_id, l.user_modified_fields FROM managed_node_links l
+                 JOIN nodes n ON n.id = l.node_id",
+            )?
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        for (node_id, external_id, modified) in rows {
+            tx.execute(
+                "INSERT OR IGNORE INTO node_fields (node_id, linked_prs, updated_at)
+                 VALUES (?1, '[]', ?2)",
+                params![node_id, now_ms()],
+            )?;
+            tx.execute(
+                "UPDATE node_fields
+                 SET ticket = COALESCE(ticket, NULLIF(TRIM(?2), '')), ticket_modified_fields = ?3
+                 WHERE node_id = ?1",
+                params![node_id, external_id, modified],
+            )?;
+        }
+        tx.execute_batch("DROP TABLE managed_node_links;")?;
+    }
     tx.commit()?;
     Ok(())
 }
@@ -1776,8 +1886,8 @@ fn migrate_v28_to_v29(conn: &Connection) -> Result<()> {
             INSERT OR IGNORE INTO node_agent (node_id, platform, model, effort, updated_at)
             SELECT node_id, platform, model, effort, {NOW} FROM v29_chosen_config;
 
-            INSERT OR IGNORE INTO node_fields (node_id, linked_issues, linked_prs, updated_at)
-            SELECT node_id, '[]', '[]', {NOW} FROM v29_chosen_config;
+            INSERT OR IGNORE INTO node_fields (node_id, linked_prs, updated_at)
+            SELECT node_id, '[]', {NOW} FROM v29_chosen_config;
 
             UPDATE node_fields
             SET repo = (SELECT c.work_directory FROM v29_chosen_config c WHERE c.node_id = node_fields.node_id)
@@ -1794,6 +1904,13 @@ fn migrate_v28_to_v29(conn: &Connection) -> Result<()> {
     }
 
     // ── 4. Files / Ticket for existing Agent nodes ──
+    // A store replayed from here after v78 has `ticket` in place of
+    // `linked_issues`.
+    let has_ticket = if column_exists("node_fields", "linked_issues")? {
+        "nf.linked_issues != '[]'"
+    } else {
+        "nf.ticket IS NOT NULL"
+    };
     tx.execute_batch(&format!(
         "
         INSERT OR IGNORE INTO node_capabilities (node_id, capability, enabled_at)
@@ -1804,7 +1921,7 @@ fn migrate_v28_to_v29(conn: &Connection) -> Result<()> {
         INSERT OR IGNORE INTO node_capabilities (node_id, capability, enabled_at)
         SELECT nc.node_id, 'ticket', {NOW}
         FROM node_capabilities nc JOIN node_fields nf ON nf.node_id = nc.node_id
-        WHERE nc.capability = 'agent' AND (nf.linked_issues != '[]' OR nf.linked_prs != '[]');
+        WHERE nc.capability = 'agent' AND ({has_ticket} OR nf.linked_prs != '[]');
 
         INSERT OR IGNORE INTO node_files (node_id, use_worktree, updated_at)
         SELECT node_id, 0, {NOW} FROM node_capabilities WHERE capability = 'files';
@@ -1812,8 +1929,8 @@ fn migrate_v28_to_v29(conn: &Connection) -> Result<()> {
         INSERT OR IGNORE INTO node_agent (node_id, updated_at)
         SELECT node_id, {NOW} FROM node_capabilities WHERE capability = 'agent';
 
-        INSERT OR IGNORE INTO node_fields (node_id, linked_issues, linked_prs, updated_at)
-        SELECT node_id, '[]', '[]', {NOW} FROM node_capabilities WHERE capability IN ('files', 'ticket');
+        INSERT OR IGNORE INTO node_fields (node_id, linked_prs, updated_at)
+        SELECT node_id, '[]', {NOW} FROM node_capabilities WHERE capability IN ('files', 'ticket');
         "
     ))?;
 
@@ -3940,6 +4057,18 @@ mod tests {
             params![generator_id],
         )
         .unwrap();
+        // A current store has no `managed_node_links` (v78 folded it into
+        // `node_fields.ticket`); put back the v19 table the repair reads.
+        conn.execute_batch(
+            "CREATE TABLE managed_node_links (
+                node_id BLOB PRIMARY KEY NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+                generator_node_id BLOB NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+                external_id TEXT NOT NULL,
+                source_type TEXT NOT NULL,
+                user_modified_fields TEXT NOT NULL DEFAULT '[]'
+            );",
+        )
+        .unwrap();
         conn.execute(
             "INSERT INTO managed_node_links (node_id, generator_node_id, external_id, source_type, user_modified_fields)
              VALUES (?1, ?2, 'ext-1', 'linear', '[]')",
@@ -4363,6 +4492,85 @@ mod tests {
             .exists([])
             .unwrap();
         assert!(!table, "node_pr is dropped");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// A node with several tickets keeps the first and notes the rest; each
+    /// `managed_node_links` row gives its node the link's id as a ticket
+    /// (unless it has one) and its user-modified fields. Running it again
+    /// changes nothing.
+    #[test]
+    fn migrate_v77_to_v78_makes_one_ticket_per_node_and_folds_links() {
+        let (dir, conn) = temp_db();
+        let several = insert_node(&conn, "several");
+        let managed = insert_node(&conn, "managed");
+        let copy = insert_node(&conn, "copy");
+        let generator = insert_node(&conn, "generator");
+        // Back to the v76 shape: `linked_issues`, and the links table.
+        conn.execute_batch(
+            "ALTER TABLE node_fields ADD COLUMN linked_issues TEXT NOT NULL DEFAULT '[]';
+             CREATE TABLE managed_node_links (
+                node_id BLOB PRIMARY KEY NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+                generator_node_id BLOB NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+                external_id TEXT NOT NULL,
+                source_type TEXT NOT NULL,
+                user_modified_fields TEXT NOT NULL DEFAULT '[]'
+             );",
+        )
+        .unwrap();
+        conn.execute("UPDATE nodes SET managed = 1 WHERE id = ?1", params![managed.as_bytes().as_slice()])
+            .unwrap();
+        for (node, issues) in [(several, r#"["ENG-1", "ENG-2", " ENG-3 ", "ENG-1"]"#), (copy, r#"["ENG-7"]"#)] {
+            conn.execute(
+                "INSERT INTO node_fields (node_id, linked_issues, linked_prs, updated_at)
+                 VALUES (?1, ?2, '[]', 0)",
+                params![node.as_bytes().as_slice(), issues],
+            )
+            .unwrap();
+        }
+        for (node, external_id, modified) in [(managed, "EXT-5", r#"["title"]"#), (copy, "OTHER-1", r#"["body"]"#)] {
+            conn.execute(
+                "INSERT INTO managed_node_links VALUES (?1, ?2, ?3, 'linear', ?4)",
+                params![
+                    node.as_bytes().as_slice(),
+                    generator.as_bytes().as_slice(),
+                    external_id,
+                    modified
+                ],
+            )
+            .unwrap();
+        }
+        conn.pragma_update(None, "user_version", 76).unwrap();
+        apply_migrations(&conn).unwrap();
+        // Idempotent: a second run notes nothing twice.
+        conn.pragma_update(None, "user_version", 77).unwrap();
+        apply_migrations(&conn).unwrap();
+
+        let fields = |node: uuid::Uuid| -> (Option<String>, String) {
+            conn.query_row(
+                "SELECT ticket, ticket_modified_fields FROM node_fields WHERE node_id = ?1",
+                params![node.as_bytes().as_slice()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+        };
+        assert_eq!(fields(several), (Some("ENG-1".into()), "[]".into()));
+        let notes = crate::fleet::repos::task::TaskRepo::new(&conn).notes(several).unwrap();
+        let texts: Vec<_> = notes.iter().map(|n| n.text.as_str()).collect();
+        assert_eq!(texts, vec!["Related tickets: ENG-2, ENG-3"]);
+        // A managed node had no ticket of its own: its link's id is it.
+        assert_eq!(fields(managed), (Some("EXT-5".into()), r#"["title"]"#.into()));
+        // A copy keeps the ticket it shows, and its edited fields.
+        assert_eq!(fields(copy), (Some("ENG-7".into()), r#"["body"]"#.into()));
+
+        let exists = |sql: &str| conn.prepare(sql).unwrap().exists([]).unwrap();
+        assert!(!exists("SELECT 1 FROM sqlite_master WHERE name = 'managed_node_links'"));
+        assert!(!exists("SELECT 1 FROM pragma_table_info('node_fields') WHERE name = 'linked_issues'"));
+        assert!(exists("SELECT 1 FROM sqlite_master WHERE name = 'idx_node_fields_ticket'"));
+        assert!(
+            exists("SELECT 1 FROM sqlite_master WHERE name = 'trg_sync_node_fields_update'"),
+            "the sync triggers dropped for the column come back"
+        );
         let _ = fs::remove_dir_all(dir);
     }
 

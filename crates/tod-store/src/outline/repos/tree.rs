@@ -23,9 +23,10 @@ impl<'a> TreeLoader<'a> {
         }
 
         let by_parent = group_by_parent(&entries);
-        let data = TreeData::load(self.conn, list_id)?;
+        let mut data = TreeData::load(self.conn, list_id)?;
+        data.count_managed(&by_parent, None, None);
         let mut out = Vec::new();
-        walk(&by_parent, &data, None, 0, &mut out);
+        walk(&by_parent, &data, None, None, 0, &mut out);
         Ok(out)
     }
 }
@@ -43,22 +44,25 @@ struct TreeData {
     capabilities: HashMap<Uuid, Vec<Capability>>,
     lifecycle: HashMap<Uuid, String>,
     tags: HashMap<Uuid, Vec<String>>,
+    /// Each node's ticket. A managed node's is its external id.
     ticket_ids: HashMap<Uuid, String>,
-    /// Link on the node itself: (external id, source type, generator node id).
-    links: HashMap<Uuid, (String, String, Uuid)>,
-    /// How many nodes each generator node owns. Not scoped to the list: a
-    /// generator's count is of everything it produced.
+    /// How many managed nodes each generator node has under it (managed
+    /// nodes sit in their generator's list, so this is complete).
     managed_counts: HashMap<Uuid, usize>,
+    /// Generator node → its data source type.
+    source_types: HashMap<Uuid, String>,
     /// Generator node → (last refresh status, last refresh error).
     generator_status: HashMap<Uuid, (Option<String>, Option<String>)>,
     /// Generator node → quick-accept destination, when configured.
     accept_destinations: HashMap<Uuid, Uuid>,
-    /// External ids some non-managed node is a linked copy of. A managed node
-    /// with one of these ids `has_copies`, whichever generator the copy came
-    /// from. Read live from the links table, so it clears as soon as the last
-    /// copy is deleted and survives rebuilds that keep the external id. Not
-    /// scoped to the list: a copy may live anywhere.
+    /// Tickets some non-managed node is. A managed node with one of these
+    /// `has_copies`, whichever generator it came from: it was accepted. Read
+    /// live from `node_fields.ticket`, so it clears as soon as the last such
+    /// node is deleted. Not scoped to the list: a copy may live anywhere.
     copied: HashSet<String>,
+    /// Tickets some managed node is: a non-managed node with one of these is
+    /// a linked copy, which refreshes update. Not scoped to the list either.
+    generated: HashSet<String>,
 }
 
 impl TreeData {
@@ -138,68 +142,28 @@ impl TreeData {
         })
         .collect();
 
-        // A node's ticket id is the first of its linked issues.
         let ticket_ids = string_map(
             conn,
             &list_blob,
-            "SELECT f.node_id, f.linked_issues
+            "SELECT f.node_id, f.ticket
              FROM node_fields f JOIN outline_entries e ON e.node_id = f.node_id
-             WHERE e.list_id = ?1",
-        )?
-        .into_iter()
-        .filter_map(|(id, raw)| {
-            serde_json::from_str::<Vec<String>>(&raw)
-                .ok()?
-                .into_iter()
-                .next()
-                .map(|ticket| (id, ticket))
-        })
-        .collect();
-
-        let mut links = HashMap::new();
-        let mut stmt = conn.prepare(
-            "SELECT l.node_id, l.external_id, l.source_type, l.generator_node_id
-             FROM managed_node_links l JOIN outline_entries e ON e.node_id = l.node_id
-             WHERE e.list_id = ?1",
+             WHERE e.list_id = ?1 AND f.ticket IS NOT NULL",
         )?;
-        let mut rows = stmt.query(params![list_blob])?;
-        while let Some(row) = rows.next()? {
-            let id_blob: Vec<u8> = row.get(0)?;
-            let gen_blob: Vec<u8> = row.get(3)?;
-            links.insert(
-                blob_to_uuid_sql(&id_blob)?,
-                (row.get(1)?, row.get(2)?, blob_to_uuid_sql(&gen_blob)?),
-            );
-        }
-        drop(rows);
-        drop(stmt);
 
         let mut accept_destinations = HashMap::new();
+        let mut source_types = HashMap::new();
         let mut stmt = conn.prepare(
-            "SELECT node_id, accept_destination_node_id FROM node_generator_config
-             WHERE accept_destination_node_id IS NOT NULL",
+            "SELECT node_id, data_source_type, accept_destination_node_id
+             FROM node_generator_config",
         )?;
         let mut rows = stmt.query([])?;
         while let Some(row) = rows.next()? {
             let id_blob: Vec<u8> = row.get(0)?;
-            let dest_blob: Vec<u8> = row.get(1)?;
-            accept_destinations.insert(blob_to_uuid_sql(&id_blob)?, blob_to_uuid_sql(&dest_blob)?);
-        }
-        drop(rows);
-        drop(stmt);
-
-        let mut managed_counts = HashMap::new();
-        let mut stmt = conn.prepare(
-            "SELECT l.generator_node_id, COUNT(*)
-             FROM managed_node_links l JOIN nodes n ON n.id = l.node_id
-             WHERE n.managed = 1
-             GROUP BY l.generator_node_id",
-        )?;
-        let mut rows = stmt.query([])?;
-        while let Some(row) = rows.next()? {
-            let id_blob: Vec<u8> = row.get(0)?;
-            let count: i64 = row.get(1)?;
-            managed_counts.insert(blob_to_uuid_sql(&id_blob)?, count as usize);
+            let id = blob_to_uuid_sql(&id_blob)?;
+            source_types.insert(id, row.get(1)?);
+            if let Some(dest_blob) = row.get::<_, Option<Vec<u8>>>(2)? {
+                accept_destinations.insert(id, blob_to_uuid_sql(&dest_blob)?);
+            }
         }
         drop(rows);
         drop(stmt);
@@ -219,14 +183,20 @@ impl TreeData {
         drop(stmt);
 
         let mut copied = HashSet::new();
+        let mut generated = HashSet::new();
         let mut stmt = conn.prepare(
-            "SELECT DISTINCT l.external_id
-             FROM managed_node_links l JOIN nodes n ON n.id = l.node_id
-             WHERE n.managed = 0",
+            "SELECT DISTINCT f.ticket, n.managed
+             FROM node_fields f JOIN nodes n ON n.id = f.node_id
+             WHERE f.ticket IS NOT NULL",
         )?;
         let mut rows = stmt.query([])?;
         while let Some(row) = rows.next()? {
-            copied.insert(row.get(0)?);
+            let ticket: String = row.get(0)?;
+            if row.get::<_, i32>(1)? != 0 {
+                generated.insert(ticket);
+            } else {
+                copied.insert(ticket);
+            }
         }
         drop(rows);
         drop(stmt);
@@ -238,12 +208,40 @@ impl TreeData {
             lifecycle,
             tags,
             ticket_ids,
-            links,
-            managed_counts,
+            managed_counts: HashMap::new(),
+            source_types,
             generator_status,
             accept_destinations,
             copied,
+            generated,
         })
+    }
+
+    /// Count each generator's managed nodes: every managed node below it,
+    /// collapsed or not, down to the next generator.
+    fn count_managed(
+        &mut self,
+        by_parent: &HashMap<Option<Uuid>, Vec<&OutlineEntry>>,
+        parent_id: Option<Uuid>,
+        generator: Option<Uuid>,
+    ) {
+        let Some(children) = by_parent.get(&parent_id) else {
+            return;
+        };
+        for entry in children {
+            let id = entry.node_id;
+            if let Some(generator) = generator.filter(|_| self.managed.contains(&id)) {
+                *self.managed_counts.entry(generator).or_default() += 1;
+            }
+            let generator = if self.is_generator(id) { Some(id) } else { generator };
+            self.count_managed(by_parent, Some(id), generator);
+        }
+    }
+
+    fn is_generator(&self, id: Uuid) -> bool {
+        self.capabilities
+            .get(&id)
+            .is_some_and(|caps| caps.contains(&Capability::Generator))
     }
 }
 
@@ -263,10 +261,13 @@ fn string_map(
     Ok(map)
 }
 
+/// `generator` is the nearest generator above `parent_id`'s children: a
+/// managed node's source.
 fn walk(
     by_parent: &HashMap<Option<Uuid>, Vec<&OutlineEntry>>,
     data: &TreeData,
     parent_id: Option<Uuid>,
+    generator: Option<Uuid>,
     depth: usize,
     out: &mut Vec<FlatNodeRow>,
 ) {
@@ -290,11 +291,19 @@ fn walk(
             .map(|c| !c.is_empty())
             .unwrap_or(false);
         let managed = data.managed.contains(&entry.node_id);
-        let link = if managed {
-            data.links.get(&entry.node_id)
-        } else {
-            None
-        };
+        let ticket = data.ticket_ids.get(&entry.node_id);
+        // A managed node's link: (external id, source type, generator node id).
+        let link = ticket
+            .zip(generator)
+            .filter(|_| managed)
+            .map(|(external_id, generator_node_id)| {
+                let source_type = data
+                    .source_types
+                    .get(&generator_node_id)
+                    .cloned()
+                    .unwrap_or_default();
+                (external_id, source_type, generator_node_id)
+            });
         let (managed_count, generator_status, generator_error) =
             if capabilities.contains(&Capability::Generator) {
                 let (status, error) = data
@@ -316,10 +325,12 @@ fn walk(
                 (None, None, None)
             };
         let accept_ready = link
-            .map(|(_, _, generator_node_id)| data.accept_destinations.contains_key(generator_node_id))
-            .unwrap_or(false);
-        let linked_copy = !managed && data.links.contains_key(&entry.node_id);
-        let has_copies = link.is_some_and(|(external_id, _, _)| data.copied.contains(external_id));
+            .as_ref()
+            .is_some_and(|(_, _, generator_node_id)| data.accept_destinations.contains_key(generator_node_id));
+        let linked_copy = !managed && ticket.is_some_and(|t| data.generated.contains(t));
+        let has_copies = link
+            .as_ref()
+            .is_some_and(|(external_id, _, _)| data.copied.contains(*external_id));
         out.push(FlatNodeRow {
             node,
             depth,
@@ -327,13 +338,14 @@ fn walk(
             capabilities,
             lifecycle: data.lifecycle.get(&entry.node_id).cloned(),
             tags: data.tags.get(&entry.node_id).cloned().unwrap_or_default(),
-            ticket_id: data.ticket_ids.get(&entry.node_id).cloned(),
+            // A managed node shows its id as its external id instead.
+            ticket_id: if managed { None } else { ticket.cloned() },
             tree_ordinal: out.len(),
             collapsed: entry.collapsed,
             has_children,
             managed,
-            external_id: link.map(|(external_id, _, _)| external_id.clone()),
-            source_type: link.map(|(_, source_type, _)| source_type.clone()),
+            external_id: link.as_ref().map(|(external_id, _, _)| (*external_id).clone()),
+            source_type: link.as_ref().map(|(_, source_type, _)| source_type.clone()),
             managed_count,
             generator_status,
             generator_error,
@@ -342,7 +354,12 @@ fn walk(
             has_copies,
         });
         if !entry.collapsed {
-            walk(by_parent, data, Some(entry.node_id), depth + 1, out);
+            let generator = if data.is_generator(entry.node_id) {
+                Some(entry.node_id)
+            } else {
+                generator
+            };
+            walk(by_parent, data, Some(entry.node_id), generator, depth + 1, out);
         }
     }
 }

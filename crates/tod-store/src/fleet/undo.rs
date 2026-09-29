@@ -103,19 +103,19 @@ pub fn capture_inverse_before(
                 }],
             }))
         }
-        FleetMutation::UpdateTaskLinkedIssues { id, linked_issues } => {
-            let old = task_field(conn, id, |t| t.linked_issues.clone())?;
-            if old.as_deref() == Some(linked_issues) {
+        FleetMutation::UpdateTaskTicket { id, ticket } => {
+            let old = task_field(conn, id, |t| t.ticket.clone())?.flatten();
+            if old == crate::fleet::repos::task::normalize_ticket(ticket.as_deref()) {
                 return Ok(None);
             }
             Ok(Some(CommandEntry {
                 id: Uuid::new_v4(),
-                label: "Updated linked issues".into(),
+                label: "Updated ticket".into(),
                 created_at: crate::outline::uuid_blob::now_ms(),
                 action_id: None,
-                inverses: vec![FleetMutation::UpdateTaskLinkedIssues {
+                inverses: vec![FleetMutation::UpdateTaskTicket {
                     id: id.clone(),
-                    linked_issues: old.unwrap_or_default(),
+                    ticket: old,
                 }],
             }))
         }
@@ -434,9 +434,6 @@ fn capture_outline_inverse(conn: &Connection, m: &OutlineMutation) -> Result<Opt
         | OutlineMutation::UpdateManagedNode { .. }
         | OutlineMutation::DeleteManagedNodes { .. }
         | OutlineMutation::DeleteManagedNode { .. }
-        | OutlineMutation::SetManagedNodeLink { .. }
-        | OutlineMutation::ClearManagedNodeLinks { .. }
-        | OutlineMutation::ClearStaleCopyLinks { .. }
         | OutlineMutation::RefreshLinkedCopy { .. }
         | OutlineMutation::PasteManagedNodeCopy { .. }
         | OutlineMutation::SetGeneratorAcceptConfig { .. }

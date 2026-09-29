@@ -105,7 +105,6 @@ pub const SYNCED_TABLES: &[&str] = &[
     "node_plan_step_obligations",
     "node_plan_step_notes",
     "node_generator_config",
-    "managed_node_links",
     "node_files",
     "node_agent",
     "obligation_verdicts",

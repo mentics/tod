@@ -37,7 +37,9 @@ pub struct FleetTask {
     pub branch: Option<String>,
     pub notes: Vec<NoteItem>,
     pub tags: Vec<String>,
-    pub linked_issues: Vec<String>,
+    /// The Ticket capability's ticket: a node has at most one, and a node
+    /// *is* that ticket wherever tickets are matched (generators included).
+    pub ticket: Option<String>,
     pub linked_prs: Vec<String>,
 }
 
@@ -52,7 +54,7 @@ impl FleetTask {
             branch: None,
             notes: Vec::new(),
             tags: Vec::new(),
-            linked_issues: Vec::new(),
+            ticket: None,
             linked_prs: Vec::new(),
         }
     }
@@ -107,14 +109,14 @@ impl<'a> TaskRepo<'a> {
             params![blob, task.lifecycle, now],
         )?;
         self.conn.execute(
-            "INSERT INTO node_fields (node_id, repo, branch, notes, linked_issues, linked_prs, updated_at)
+            "INSERT INTO node_fields (node_id, repo, branch, notes, ticket, linked_prs, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 blob,
                 task.repo,
                 task.branch,
                 json_notes(&task.notes)?,
-                json_array(&task.linked_issues)?,
+                normalize_ticket(task.ticket.as_deref()),
                 json_array(&task.linked_prs)?,
                 now
             ],
@@ -220,16 +222,13 @@ impl<'a> TaskRepo<'a> {
         Ok(())
     }
 
-    pub fn update_linked_issues(
-        &self,
-        id: &str,
-        linked_issues: &[String],
-    ) -> Result<(), TaskRepoError> {
+    /// Set (or, with `None` or an empty id, clear) the node's one ticket.
+    pub fn update_ticket(&self, id: &str, ticket: Option<&str>) -> Result<(), TaskRepoError> {
         let node_id = Self::parse_node_id(id)?;
         self.ensure_fields_row(node_id)?;
         self.conn.execute(
-            "UPDATE node_fields SET linked_issues = ?2, updated_at = ?3 WHERE node_id = ?1",
-            params![uuid_to_blob(node_id), json_array(linked_issues)?, now_ms()],
+            "UPDATE node_fields SET ticket = ?2, updated_at = ?3 WHERE node_id = ?1",
+            params![uuid_to_blob(node_id), normalize_ticket(ticket), now_ms()],
         )?;
         Ok(())
     }
@@ -250,7 +249,7 @@ impl<'a> TaskRepo<'a> {
             .query_row(
                 "SELECT n.id, n.title, n.slug,
                         COALESCE(l.state, 'proposed'),
-                        f.repo, f.branch, f.notes, t.tags, f.linked_issues, f.linked_prs
+                        f.repo, f.branch, f.notes, t.tags, f.ticket, f.linked_prs
                  FROM nodes n
                  INNER JOIN node_capabilities c ON c.node_id = n.id AND c.capability = 'agent'
                  LEFT JOIN node_lifecycle l ON l.node_id = n.id
@@ -271,7 +270,7 @@ impl<'a> TaskRepo<'a> {
             .query_row(
                 "SELECT n.id, n.title, n.slug,
                         COALESCE(l.state, 'proposed'),
-                        f.repo, f.branch, f.notes, t.tags, f.linked_issues, f.linked_prs
+                        f.repo, f.branch, f.notes, t.tags, f.ticket, f.linked_prs
                  FROM nodes n
                  LEFT JOIN node_lifecycle l ON l.node_id = n.id
                  LEFT JOIN node_fields f ON f.node_id = n.id
@@ -288,7 +287,7 @@ impl<'a> TaskRepo<'a> {
         let mut stmt = self.conn.prepare(
             "SELECT n.id, n.title, n.slug,
                     COALESCE(l.state, 'proposed'),
-                    f.repo, f.branch, f.notes, t.tags, f.linked_issues, f.linked_prs
+                    f.repo, f.branch, f.notes, t.tags, f.ticket, f.linked_prs
              FROM nodes n
              INNER JOIN node_capabilities c ON c.node_id = n.id AND c.capability = 'agent'
              LEFT JOIN node_lifecycle l ON l.node_id = n.id
@@ -329,8 +328,8 @@ impl<'a> TaskRepo<'a> {
     fn ensure_fields_row(&self, node_id: Uuid) -> Result<(), TaskRepoError> {
         let now = now_ms();
         self.conn.execute(
-            "INSERT OR IGNORE INTO node_fields (node_id, linked_issues, linked_prs, updated_at)
-             VALUES (?1, '[]', '[]', ?2)",
+            "INSERT OR IGNORE INTO node_fields (node_id, linked_prs, updated_at)
+             VALUES (?1, '[]', ?2)",
             params![uuid_to_blob(node_id), now],
         )?;
         Ok(())
@@ -349,9 +348,14 @@ fn row_to_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<FleetTask> {
         branch: row.get(5)?,
         notes: parse_notes(row.get::<_, Option<String>>(6)?),
         tags: parse_json_array(row.get::<_, Option<String>>(7)?),
-        linked_issues: parse_json_array(row.get::<_, Option<String>>(8)?),
+        ticket: row.get(8)?,
         linked_prs: parse_json_array(row.get::<_, Option<String>>(9)?),
     })
+}
+
+/// A ticket id as stored: trimmed, and `None` rather than empty.
+pub(crate) fn normalize_ticket(ticket: Option<&str>) -> Option<String> {
+    ticket.map(str::trim).filter(|t| !t.is_empty()).map(String::from)
 }
 
 fn json_array(values: &[String]) -> Result<String> {
@@ -404,7 +408,7 @@ mod tests {
             branch: Some("main".into()),
             notes: vec![NoteItem::new("notes body")],
             tags: vec!["ui".into(), "backend".into()],
-            linked_issues: vec!["TOD-1".into()],
+            ticket: Some("TOD-1".into()),
             linked_prs: vec!["#42".into()],
         };
         repo.insert(&task).unwrap();

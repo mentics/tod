@@ -58,7 +58,7 @@ fn deterministic_task(index: usize) -> FleetTask {
             "notes for task {index}"
         ))],
         tags: vec![format!("tag-{}", index % 5), "scale".into()],
-        linked_issues: vec![format!("TOD-{index}")],
+        ticket: Some(format!("TOD-{index}")),
         linked_prs: vec![format!("#{index}")],
     }
 }

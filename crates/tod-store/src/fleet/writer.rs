@@ -54,9 +54,10 @@ pub enum FleetMutation {
         id: String,
         tags: Vec<String>,
     },
-    UpdateTaskLinkedIssues {
+    /// Set the node's one ticket; `None` clears it.
+    UpdateTaskTicket {
         id: String,
-        linked_issues: Vec<String>,
+        ticket: Option<String>,
     },
     UpdateTaskLinkedPrs {
         id: String,
@@ -263,8 +264,8 @@ impl FleetMutation {
                         .mark_field_modified(node_id, "tags")?;
                 }
             }
-            FleetMutation::UpdateTaskLinkedIssues { id, linked_issues } => {
-                TaskRepo::new(conn).update_linked_issues(id, linked_issues)?;
+            FleetMutation::UpdateTaskTicket { id, ticket } => {
+                TaskRepo::new(conn).update_ticket(id, ticket.as_deref())?;
             }
             FleetMutation::UpdateTaskLinkedPrs { id, linked_prs } => {
                 TaskRepo::new(conn).update_linked_prs(id, linked_prs)?;

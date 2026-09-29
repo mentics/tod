@@ -1312,6 +1312,7 @@ fn create_managed_node_of_type(
     title: &str,
     source_type: &str,
 ) -> Uuid {
+    ensure_generator(store, generator_node_id, source_type);
     let node_id = Uuid::new_v4();
     store
         .enqueue_outline(OutlineMutation::CreateManagedNode {
@@ -1320,8 +1321,6 @@ fn create_managed_node_of_type(
             parent_id,
             title: title.into(),
             external_id: external_id.into(),
-            source_type: source_type.into(),
-            generator_node_id,
             tags: vec![],
             body: String::new(),
             metadata: None,
@@ -1329,6 +1328,51 @@ fn create_managed_node_of_type(
         .unwrap();
     store.writer().flush().unwrap();
     node_id
+}
+
+/// Make `node_id` a generator of `source_type`, unless it is one already:
+/// a managed node's source type is its generator's.
+fn ensure_generator(store: &FleetStore, node_id: Uuid, source_type: &str) {
+    let configured = store
+        .read(move |conn| Ok(crate::outline::repos::GeneratorRepo::new(conn).get_config(node_id)?.is_some()))
+        .unwrap();
+    if configured {
+        return;
+    }
+    store
+        .enqueue_outline(OutlineMutation::EnableCapabilities {
+            node_id,
+            capabilities: vec![Capability::Generator],
+        })
+        .unwrap();
+    store.writer().flush().unwrap();
+    store
+        .enqueue_outline(OutlineMutation::SetGeneratorConfig {
+            node_id,
+            data_source_type: source_type.into(),
+            config_json: "{}".into(),
+        })
+        .unwrap();
+    store.writer().flush().unwrap();
+}
+
+/// Give a plain node ticket `ticket` through its Ticket capability.
+fn set_ticket(store: &FleetStore, node_id: Uuid, ticket: &str) {
+    store
+        .enqueue_outline(OutlineMutation::EnableCapabilities {
+            node_id,
+            capabilities: vec![Capability::Ticket],
+        })
+        .unwrap();
+    store.writer().flush().unwrap();
+    store
+        .enqueue_outline(OutlineMutation::SetNodeTicket {
+            node_id,
+            ticket: Some(ticket.into()),
+            linked_prs: vec![],
+        })
+        .unwrap();
+    store.writer().flush().unwrap();
 }
 
 fn paste_copy_of(store: &FleetStore, list_id: Uuid, source: Uuid, parent: Uuid) -> Uuid {
@@ -1357,6 +1401,7 @@ fn paste_copy_of(store: &FleetStore, list_id: Uuid, source: Uuid, parent: Uuid) 
 fn pasted_linear_copy_carries_its_id_as_a_ticket_not_in_its_title() {
     let (store, root, list_id) = setup_store_with_list();
     let generator_id = create_node_in(&store, list_id, None, "Generator");
+    let mock_generator = create_node_in(&store, list_id, None, "Mock generator");
     let outside = create_node_in(&store, list_id, None, "Outside");
     let linear = create_managed_node_of_type(
         &store,
@@ -1367,8 +1412,14 @@ fn pasted_linear_copy_carries_its_id_as_a_ticket_not_in_its_title() {
         "Fix it",
         "linear",
     );
-    let other =
-        create_managed_node_for_test(&store, list_id, generator_id, generator_id, "EXT-1", "Other");
+    let other = create_managed_node_for_test(
+        &store,
+        list_id,
+        mock_generator,
+        mock_generator,
+        "EXT-1",
+        "Other",
+    );
 
     let linear_copy = paste_copy_of(&store, list_id, linear, outside);
     store
@@ -1387,6 +1438,8 @@ fn pasted_linear_copy_carries_its_id_as_a_ticket_not_in_its_title() {
             let nodes = NodeRepo::new(conn);
             assert_eq!(nodes.get(other_copy)?.unwrap().title, "EXT-1: Other");
             assert!(!nodes.list_capabilities(other_copy)?.contains(&Capability::Ticket));
+            // Still that ticket, so refreshes reach it.
+            assert_eq!(nodes.get_ticket_id(other_copy)?.as_deref(), Some("EXT-1"));
             Ok(())
         })
         .unwrap();
@@ -1590,16 +1643,7 @@ fn editing_title_on_linked_node_marks_it_dirty() {
     let (store, root, list_id) = setup_store_with_list();
     let outside_parent = create_node_in(&store, list_id, None, "Outside");
     let node_id = create_node_in(&store, list_id, Some(outside_parent), "Original title");
-    let generator_id = create_node_in(&store, list_id, None, "Generator");
-    store
-        .enqueue_outline(OutlineMutation::SetManagedNodeLink {
-            node_id,
-            generator_node_id: generator_id,
-            external_id: "EXT-9".into(),
-            source_type: "mock".into(),
-        })
-        .unwrap();
-    store.writer().flush().unwrap();
+    set_ticket(&store, node_id, "EXT-9");
 
     store
         .enqueue_outline(OutlineMutation::UpdateNodeTitle {
@@ -1611,11 +1655,8 @@ fn editing_title_on_linked_node_marks_it_dirty() {
 
     store
         .read(|conn| {
-            let link = crate::outline::repos::GeneratorRepo::new(conn)
-                .get_link(node_id)
-                .unwrap()
-                .unwrap();
-            assert_eq!(link.user_modified_fields, vec!["title".to_string()]);
+            let fields = crate::outline::repos::GeneratorRepo::new(conn).user_modified_fields(node_id)?;
+            assert_eq!(fields, vec!["title".to_string()]);
             Ok(())
         })
         .unwrap();
@@ -1630,11 +1671,8 @@ fn editing_title_on_linked_node_marks_it_dirty() {
     store.writer().flush().unwrap();
     store
         .read(|conn| {
-            let link = crate::outline::repos::GeneratorRepo::new(conn)
-                .get_link(node_id)
-                .unwrap()
-                .unwrap();
-            assert_eq!(link.user_modified_fields, vec!["title".to_string()]);
+            let fields = crate::outline::repos::GeneratorRepo::new(conn).user_modified_fields(node_id)?;
+            assert_eq!(fields, vec!["title".to_string()]);
             Ok(())
         })
         .unwrap();
@@ -1647,16 +1685,7 @@ fn editing_title_on_linked_node_marks_it_dirty() {
 fn editing_body_on_linked_node_marks_it_dirty_independently_of_title() {
     let (store, root, list_id) = setup_store_with_list();
     let node_id = create_node_in(&store, list_id, None, "Node");
-    let generator_id = create_node_in(&store, list_id, None, "Generator");
-    store
-        .enqueue_outline(OutlineMutation::SetManagedNodeLink {
-            node_id,
-            generator_node_id: generator_id,
-            external_id: "EXT-10".into(),
-            source_type: "mock".into(),
-        })
-        .unwrap();
-    store.writer().flush().unwrap();
+    set_ticket(&store, node_id, "EXT-10");
 
     store
         .enqueue_outline(OutlineMutation::SetExtraContent {
@@ -1669,11 +1698,8 @@ fn editing_body_on_linked_node_marks_it_dirty_independently_of_title() {
 
     store
         .read(|conn| {
-            let link = crate::outline::repos::GeneratorRepo::new(conn)
-                .get_link(node_id)
-                .unwrap()
-                .unwrap();
-            assert_eq!(link.user_modified_fields, vec!["body".to_string()]);
+            let fields = crate::outline::repos::GeneratorRepo::new(conn).user_modified_fields(node_id)?;
+            assert_eq!(fields, vec!["body".to_string()]);
             Ok(())
         })
         .unwrap();
@@ -1736,6 +1762,37 @@ fn copying_out_a_managed_node_greys_out_the_original_and_clears_on_delete() {
         !tree_row(&store, list_id, managed_id).has_copies,
         "copied state should clear immediately once the last copy is deleted"
     );
+
+    drop(store);
+    let _ = fs::remove_dir_all(root);
+}
+
+/// A node is a ticket by having it, however it was made: one given the
+/// ticket by hand counts as accepted, and is a linked copy that refreshes
+/// reach, just as a pasted copy is.
+#[test]
+fn a_node_given_a_generated_ticket_by_hand_is_accepted() {
+    let (store, root, list_id) = setup_store_with_list();
+    let generator = create_node_in(&store, list_id, None, "Generator");
+    let managed = create_managed_node_for_test(&store, list_id, generator, generator, "ENG-7", "Item");
+    let by_hand = create_node_in(&store, list_id, None, "By hand");
+    assert!(!tree_row(&store, list_id, managed).has_copies);
+
+    set_ticket(&store, by_hand, "ENG-7");
+
+    assert!(tree_row(&store, list_id, managed).has_copies);
+    let row = tree_row(&store, list_id, by_hand);
+    assert!(row.linked_copy && !row.managed);
+    assert_eq!(row.ticket_id.as_deref(), Some("ENG-7"));
+    store
+        .read(|conn| {
+            let generators = crate::outline::repos::GeneratorRepo::new(conn);
+            assert!(generators.is_accepted("ENG-7")?);
+            let holders: Vec<_> = generators.holders_of("ENG-7")?.into_iter().map(|h| h.node_id).collect();
+            assert_eq!(holders, vec![by_hand]);
+            Ok(())
+        })
+        .unwrap();
 
     drop(store);
     let _ = fs::remove_dir_all(root);
@@ -1804,7 +1861,7 @@ fn tree_row(store: &FleetStore, list_id: Uuid, node_id: Uuid) -> crate::outline:
 }
 
 #[test]
-fn deleting_generator_clears_links_on_copies_but_keeps_their_titles() {
+fn deleting_generator_keeps_copies_their_titles_and_tickets() {
     let (store, root, list_id) = setup_store_with_list();
     let (generator_id, managed_id, _child_id) = setup_generator_with_managed_tree(&store, list_id);
     let outside_parent = create_node_in(&store, list_id, None, "Outside");
@@ -1839,14 +1896,19 @@ fn deleting_generator_clears_links_on_copies_but_keeps_their_titles() {
         .unwrap();
     store.writer().flush().unwrap();
 
+    assert!(
+        !tree_row(&store, list_id, copy_id).linked_copy,
+        "no generator has the ticket any more"
+    );
     store
         .read(|conn| {
             let gen_repo = crate::outline::repos::GeneratorRepo::new(conn);
             let node_repo = crate::outline::repos::NodeRepo::new(conn);
-            assert!(
-                gen_repo.get_link(copy_id).unwrap().is_none(),
-                "copy must lose its data-source link"
-            );
+            // Nothing tied it to that generator: it is still the ticket,
+            // and any generator that returns it reaches it.
+            assert_eq!(node_repo.get_ticket_id(copy_id)?.as_deref(), Some("EXT-1"));
+            let holders = gen_repo.holders_of("EXT-1")?;
+            assert!(holders.iter().any(|h| h.node_id == copy_id));
             let copy_node = node_repo.get(copy_id).unwrap().unwrap();
             assert_eq!(
                 copy_node.title, "EXT-1: Fix the bug",
@@ -1919,10 +1981,9 @@ fn generator_state_survives_store_restart() {
             assert!(gen_repo.is_managed(child_id).unwrap());
             assert!(node_repo.get(managed_id).unwrap().is_some());
 
-            let copy_link = gen_repo.get_link(copy_id).unwrap().unwrap();
-            assert_eq!(
-                copy_link.external_id, "EXT-1",
-                "copied-out node's data-source link persists"
+            assert!(
+                gen_repo.holders_of("EXT-1")?.iter().any(|h| h.node_id == copy_id),
+                "copied-out node is still the ticket"
             );
             assert!(!gen_repo.is_managed(copy_id).unwrap());
 
@@ -1972,8 +2033,6 @@ fn setup_generator_with_managed_tree(store: &FleetStore, list_id: Uuid) -> (Uuid
             parent_id,
             title: "Sub item".into(),
             external_id: "EXT-2".into(),
-            source_type: "mock".into(),
-            generator_node_id: generator_id,
             tags: vec!["urgent".into()],
             body: "child body".into(),
             metadata: None,
@@ -2029,10 +2088,12 @@ fn paste_managed_node_copy_deep_copies_and_converts_to_normal() {
                 !gen_repo.is_managed(copy_id).unwrap(),
                 "copy must be a normal editable node"
             );
-            let link = gen_repo.get_link(copy_id).unwrap().unwrap();
-            assert_eq!(link.external_id, "EXT-1");
-            assert_eq!(link.generator_node_id, generator_id);
-            assert!(link.user_modified_fields.is_empty());
+            // Linked by being the same ticket; the original's generator is
+            // found from where the original sits.
+            assert_eq!(node_repo.get_ticket_id(copy_id)?.as_deref(), Some("EXT-1"));
+            assert!(gen_repo.user_modified_fields(copy_id)?.is_empty());
+            assert!(gen_repo.get_link(copy_id)?.is_none(), "a copy is not managed");
+            assert_eq!(gen_repo.get_link(managed_id)?.unwrap().generator_node_id, generator_id);
 
             let original = node_repo.get(managed_id).unwrap().unwrap();
             assert!(

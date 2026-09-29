@@ -244,8 +244,10 @@ pub struct CapabilitySettings {
     /// `Some` when the node's launches run in a dev container.
     #[serde(default)]
     pub dev_container: Option<crate::fleet::repos::node_files::DevContainerSetting>,
-    #[serde(default)]
-    pub linked_issues: Vec<String>,
+    /// Recorded before a node had one ticket as `linked_issues`, an array
+    /// whose first id is the ticket.
+    #[serde(default, alias = "linked_issues", deserialize_with = "ticket_or_first")]
+    pub ticket: Option<String>,
     #[serde(default)]
     pub linked_prs: Vec<String>,
     #[serde(default)]
@@ -257,6 +259,20 @@ pub struct CapabilitySettings {
     pub obligations: usize,
     #[serde(default)]
     pub managed_nodes: usize,
+}
+
+/// [`CapabilitySettings::ticket`] from either shape it was recorded in.
+fn ticket_or_first<'de, D: serde::Deserializer<'de>>(de: D) -> Result<Option<String>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Shape {
+        One(Option<String>),
+        Many(Vec<String>),
+    }
+    Ok(match Shape::deserialize(de)? {
+        Shape::One(ticket) => ticket,
+        Shape::Many(tickets) => tickets.into_iter().next(),
+    })
 }
 
 /// Where a Files capability's launches run, for the change set.
@@ -363,7 +379,8 @@ pub fn capabilities_changes(
         );
     }
     if both(Capability::Ticket) {
-        setting("tickets", list(&old.linked_issues), list(&new.linked_issues));
+        let none = |v: &Option<String>| v.clone().unwrap_or_else(|| "none".into());
+        setting("ticket", none(&old.ticket), none(&new.ticket));
         setting("pull requests", list(&old.linked_prs), list(&new.linked_prs));
     }
     if both(Capability::Tags) {

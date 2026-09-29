@@ -23,7 +23,7 @@
 //! - `interview_sessions`
 //! - `node_gate_evaluations`
 //! - `node_plan_steps`
-//! - `node_generator_config`, `managed_node_links`
+//! - `node_generator_config`
 //! - `node_files`, `node_agent`
 //! - `obligation_verdicts` (`tod_store::verification`; insert-only, the
 //!   history is append-only)
@@ -228,9 +228,6 @@ pub fn create_triggers_sql() -> String {
         END;
         "
     ));
-
-    // managed_node_links: PK is node_id.
-    sql.push_str(&node_keyed_triggers("managed_node_links"));
 
     // obligation_verdicts: append-only history; insert-only trigger. Row id
     // is an autoincrement integer.

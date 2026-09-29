@@ -14,6 +14,7 @@ pub use tod_integration::{
 };
 use tod_store::credentials::{CredentialStore, resolve_linear_api_key};
 use tod_store::fleet::FleetStore;
+use tod_store::outline::repos::generator::copy_title;
 use tod_store::outline::repos::{GeneratorRepo, NodeRepo, OutlineRepo};
 use tod_store::outline::{EXTRA_CONTENT_DETAILS, OutlineMutation};
 use uuid::Uuid;
@@ -387,9 +388,9 @@ fn run_with_deadline<T: Send + 'static>(
 /// trigger that arrives while this process is already refreshing the node is
 /// silently ignored rather than erroring, so concurrent triggers collapse
 /// onto the one in flight (see [`InFlightRefresh`]). Fields a user has
-/// edited on a copied-out/managed node (tracked in
-/// [`tod_store::outline::repos::generator::ManagedNodeLink::user_modified_fields`])
-/// are preserved rather than overwritten by the fetched value. Tags are
+/// edited on a copied-out/managed node (tracked in its
+/// `node_fields.ticket_modified_fields`, read through
+/// [`GeneratorRepo::user_modified_fields`]) are preserved rather than overwritten by the fetched value. Tags are
 /// written directly onto each node's `node_fields.tags`; there is no
 /// separate tag-pool table to update — anything that lists tags across a
 /// list already derives them by scanning nodes, so a new tag becomes visible
@@ -434,13 +435,9 @@ fn refresh_with_fetch(
             let node_repo = NodeRepo::new(conn);
             let links = gen_repo.links_for_generator(node_id)?;
             let mut existing = HashMap::new();
+            // Only managed nodes: a copy accepted out of the tree is the
+            // same ticket, but it is not this generator's to reconcile.
             for link in links {
-                if !gen_repo.is_managed(link.node_id)? {
-                    // Copied-out nodes share the generator_node_id/external_id of
-                    // their source but are no longer part of the managed tree —
-                    // reconciliation must not treat them as managed items.
-                    continue;
-                }
                 let Some(node) = node_repo.get(link.node_id)? else {
                     continue;
                 };
@@ -567,27 +564,22 @@ fn fetch_and_reconcile(
         &items,
         node_id,
         list_id,
-        node_id,
-        &config.data_source_type,
         existing,
         &mut visited,
         &mut mutations,
     );
     for (external_id, existing_item) in existing {
         if !visited.contains(external_id) {
+            // The external item is gone from the source. Nodes accepted from
+            // it keep their ticket, title, and content; nothing refreshes
+            // them until some generator returns that ticket again.
             mutations.push(OutlineMutation::DeleteManagedNode {
                 node_id: existing_item.node_id,
             });
-            // The external item is gone from the source — any copies of it
-            // living outside the generator subtree become stale; they keep
-            // their title/content but stop receiving refresh updates.
-            mutations.push(OutlineMutation::ClearStaleCopyLinks {
-                generator_node_id: node_id,
-                external_id: external_id.clone(),
-            });
         }
     }
-    let updated_copy_ids = collect_linked_copy_updates(fleet, node_id, &items, &mut mutations)?;
+    let updated_copy_ids =
+        collect_linked_copy_updates(fleet, &config.data_source_type, &items, &mut mutations)?;
 
     mutations.push(OutlineMutation::SetRefreshStatus {
         node_id,
@@ -604,27 +596,28 @@ fn fetch_and_reconcile(
     Ok(updated_copy_ids)
 }
 
-/// Push field updates for every already-copied-out (non-managed, linked) node
-/// whose external item is still present in this refresh's results. Each
-/// copy's individual `user_modified_fields` are respected — locally edited
-/// fields are left untouched, descendant linked nodes are updated
-/// independently of their ancestor.
+/// Push field updates for every non-managed node that is the ticket of an
+/// item in this refresh's results: whether it was accepted from this
+/// generator, another one, or given the ticket by hand, since nothing records
+/// where a ticket came from (`doc/lifecycle/plan-step-phases.md`, section 4).
+/// Each node's own `ticket_modified_fields` are respected — locally edited
+/// fields are left untouched, descendant nodes are updated independently of
+/// their ancestor.
 fn collect_linked_copy_updates(
     fleet: &FleetStore,
-    generator_node_id: Uuid,
+    source_type: &str,
     items: &[DataSourceItem],
     mutations: &mut Vec<OutlineMutation>,
 ) -> Result<Vec<Uuid>, String> {
     let mut updated = Vec::new();
     for item in items {
-        let links = fleet
-            .read(|conn| {
-                GeneratorRepo::new(conn).copy_links_for(generator_node_id, &item.external_id)
-            })
+        let holders = fleet
+            .read(|conn| GeneratorRepo::new(conn).holders_of(&item.external_id))
             .map_err(|err| err.to_string())?;
-        for link in links {
+        for link in holders {
             let dirty = |field: &str| link.user_modified_fields.iter().any(|f| f == field);
-            let title = (!dirty("title")).then(|| link.copy_title(&item.title));
+            let title = (!dirty("title"))
+                .then(|| copy_title(source_type, &item.external_id, &item.title));
             let tags = (!dirty("tags")).then(|| item.tags.clone());
             let body = (!dirty("body")).then(|| item.body.clone());
             if title.is_some() || tags.is_some() || body.is_some() {
@@ -639,7 +632,7 @@ fn collect_linked_copy_updates(
         }
         updated.extend(collect_linked_copy_updates(
             fleet,
-            generator_node_id,
+            source_type,
             &item.children,
             mutations,
         )?);
@@ -647,13 +640,10 @@ fn collect_linked_copy_updates(
     Ok(updated)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn reconcile_level(
     items: &[DataSourceItem],
     parent_id: Uuid,
     list_id: Uuid,
-    generator_node_id: Uuid,
-    source_type: &str,
     existing: &HashMap<String, ExistingManaged>,
     visited: &mut std::collections::HashSet<String>,
     mutations: &mut Vec<OutlineMutation>,
@@ -699,8 +689,6 @@ fn reconcile_level(
                 parent_id,
                 title: item.title.clone(),
                 external_id: item.external_id.clone(),
-                source_type: source_type.to_string(),
-                generator_node_id,
                 tags: item.tags.clone(),
                 body: item.body.clone(),
                 metadata: item.metadata.clone(),
@@ -711,8 +699,6 @@ fn reconcile_level(
             &item.children,
             node_id,
             list_id,
-            generator_node_id,
-            source_type,
             existing,
             visited,
             mutations,
@@ -1071,7 +1057,7 @@ mod tests {
     }
 
     #[test]
-    fn refresh_clears_link_on_copy_when_external_item_is_removed_from_source() {
+    fn a_copy_keeps_its_ticket_when_the_item_is_removed_from_source() {
         let (root, fleet) = setup();
         let list_id = fleet.list_outline_lists().unwrap()[0].id;
         let node_id = create_generator_node(&fleet, list_id);
@@ -1128,32 +1114,30 @@ mod tests {
             })
             .unwrap();
 
-        fleet
-            .read(|conn| {
-                let gen_repo = tod_store::outline::repos::GeneratorRepo::new(conn);
-                assert!(gen_repo.get_link(copy_id).unwrap().is_some());
-                Ok(())
-            })
-            .unwrap();
-
         ds.set_items(vec![]);
         refresh_generator_with(&fleet, node_id, &ds, &HashMap::new()).unwrap();
 
         fleet
             .read(|conn| {
-                let gen_repo = tod_store::outline::repos::GeneratorRepo::new(conn);
                 let node_repo = tod_store::outline::repos::NodeRepo::new(conn);
-                assert!(
-                    gen_repo.get_link(copy_id).unwrap().is_none(),
-                    "copy should lose its link once the external item is gone from the source"
-                );
                 assert!(
                     node_repo.get(copy_id).unwrap().is_some(),
                     "copy remains as a plain normal node"
                 );
+                assert_eq!(
+                    node_repo.get_ticket_id(copy_id)?.as_deref(),
+                    Some("EXT-1"),
+                    "it is still that ticket"
+                );
                 Ok(())
             })
             .unwrap();
+
+        // Nothing refreshes it while no generator returns the ticket; once
+        // one does again, it is updated like any other holder.
+        ds.set_items(vec![item("EXT-1", "Back again", vec![])]);
+        let updated = refresh_generator_with(&fleet, node_id, &ds, &HashMap::new()).unwrap();
+        assert_eq!(updated, vec![copy_id]);
 
         drop(fleet);
         let _ = fs::remove_dir_all(root);
@@ -1212,6 +1196,111 @@ mod tests {
                     .node_id)
             })
             .unwrap()
+    }
+
+    /// Give a plain node ticket `ticket` by hand, through its Ticket
+    /// capability, as the user or `tod-cli capabilities set` would.
+    fn give_ticket(fleet: &FleetStore, node_id: Uuid, ticket: &str) {
+        fleet
+            .enqueue_outline(OutlineMutation::EnableCapabilities {
+                node_id,
+                capabilities: vec![Capability::Ticket],
+            })
+            .unwrap();
+        fleet.writer().flush().unwrap();
+        fleet
+            .enqueue_outline(OutlineMutation::SetNodeTicket {
+                node_id,
+                ticket: Some(ticket.into()),
+                linked_prs: vec![],
+            })
+            .unwrap();
+        fleet.writer().flush().unwrap();
+    }
+
+    fn has_copies(fleet: &FleetStore, list_id: Uuid, managed_id: Uuid) -> bool {
+        fleet
+            .flatten_outline(list_id)
+            .unwrap()
+            .into_iter()
+            .find(|r| r.node.id == managed_id)
+            .expect("managed row visible")
+            .has_copies
+    }
+
+    fn title_of(fleet: &FleetStore, node_id: Uuid) -> String {
+        fleet
+            .read(|conn| Ok(tod_store::outline::repos::NodeRepo::new(conn).get(node_id)?.unwrap().title))
+            .unwrap()
+    }
+
+    #[test]
+    fn a_node_given_a_ticket_by_hand_is_accepted_and_refreshed() {
+        let (root, fleet) = setup();
+        let list_id = fleet.list_outline_lists().unwrap()[0].id;
+        let node_id = create_generator_node(&fleet, list_id);
+        set_generator_config(&fleet, node_id, DATA_SOURCE_MOCK, "{}").unwrap();
+
+        let ds = MockDataSource::new().with_items(vec![item("EXT-1", "Original", vec![])]);
+        refresh_generator_with(&fleet, node_id, &ds, &HashMap::new()).unwrap();
+        let managed_id = managed_children(&fleet, list_id, node_id)[0].0;
+        assert!(!has_copies(&fleet, list_id, managed_id));
+
+        // Never pasted from the generator: it is simply that ticket.
+        let by_hand = make_outside_parent(&fleet, list_id, &[node_id]);
+        give_ticket(&fleet, by_hand, "EXT-1");
+        assert!(
+            has_copies(&fleet, list_id, managed_id),
+            "a node that is the ticket counts as accepted"
+        );
+
+        ds.set_items(vec![item("EXT-1", "Updated from source", vec![])]);
+        let updated = refresh_generator_with(&fleet, node_id, &ds, &HashMap::new()).unwrap();
+        assert_eq!(updated, vec![by_hand]);
+        assert_eq!(title_of(&fleet, by_hand), "EXT-1: Updated from source");
+
+        drop(fleet);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn two_generators_returning_one_ticket_both_update_its_holder() {
+        let (root, fleet) = setup();
+        let list_id = fleet.list_outline_lists().unwrap()[0].id;
+        let first = create_generator_node(&fleet, list_id);
+        set_generator_config(&fleet, first, DATA_SOURCE_MOCK, "{}").unwrap();
+        let second = create_generator_node(&fleet, list_id);
+        set_generator_config(&fleet, second, DATA_SOURCE_MOCK, "{}").unwrap();
+
+        let first_ds = MockDataSource::new().with_items(vec![item("EXT-1", "Seen by first", vec![])]);
+        let second_ds =
+            MockDataSource::new().with_items(vec![item("EXT-1", "Seen by second", vec![])]);
+        refresh_generator_with(&fleet, first, &first_ds, &HashMap::new()).unwrap();
+        refresh_generator_with(&fleet, second, &second_ds, &HashMap::new()).unwrap();
+        let first_managed = managed_children(&fleet, list_id, first)[0].0;
+        let second_managed = managed_children(&fleet, list_id, second)[0].0;
+
+        // Accepted from the first generator only.
+        let outside_id = make_outside_parent(&fleet, list_id, &[first, second]);
+        let copy_id = make_copy(&fleet, list_id, first_managed, outside_id);
+        assert!(has_copies(&fleet, list_id, first_managed));
+        assert!(
+            has_copies(&fleet, list_id, second_managed),
+            "accepted is a fact about the ticket, not where it was taken from"
+        );
+
+        second_ds.set_items(vec![item("EXT-1", "Second's update", vec![])]);
+        let updated = refresh_generator_with(&fleet, second, &second_ds, &HashMap::new()).unwrap();
+        assert_eq!(updated, vec![copy_id]);
+        assert_eq!(title_of(&fleet, copy_id), "EXT-1: Second's update");
+
+        first_ds.set_items(vec![item("EXT-1", "First's update", vec![])]);
+        let updated = refresh_generator_with(&fleet, first, &first_ds, &HashMap::new()).unwrap();
+        assert_eq!(updated, vec![copy_id]);
+        assert_eq!(title_of(&fleet, copy_id), "EXT-1: First's update");
+
+        drop(fleet);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

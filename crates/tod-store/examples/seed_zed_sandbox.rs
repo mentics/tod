@@ -40,7 +40,7 @@ fn main() -> anyhow::Result<()> {
             branch: Some("main".into()),
             notes: Vec::new(),
             tags: vec![],
-            linked_issues: vec![],
+            ticket: None,
             linked_prs: vec![],
         },
     })?;

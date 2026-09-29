@@ -26,7 +26,7 @@ COMMANDS:
     set     <NODE> files [--dir <PATH>] [--branch <TEXT>] [--worktree on|off]
                          [--container <NAME|ID>] [--mounted on|off]
                          [--sandbox image[:<IMAGE>]|fork:<NAME>]
-    set     <NODE> ticket [--ticket <ID>]... [--pr <URL>]...
+    set     <NODE> ticket [--ticket <ID>] [--pr <URL>]...
     set     <NODE> tags (--tags <A,B,..> | --add <TAG> | --remove <TAG>)
     set     <NODE> generator --source <TYPE> --config <JSON>
 
@@ -36,8 +36,9 @@ capabilities with their defaults; generator and lifecycle cannot both be on.
 obligations and details, a generator's generated nodes, ...); it is archived,
 so it can be reversed, and refused while something still runs off it (a live
 agent, an open shell, a worktree). `set` changes only the settings given; an
-empty value (`--model ''`) clears one. `--ticket`/`--pr` replace the whole
-list when given. The capability must already be enabled. A node's lifecycle
+empty value (`--model ''`) clears one. A node is at most one ticket:
+`--ticket` replaces it (`--ticket ''` clears it); note any related tickets
+on the node instead. `--pr` replaces the whole list when given. The capability must already be enabled. A node's lifecycle
 state cannot be set here.
 
 `--container` runs the node's agents, terminals, and git inside that running
@@ -222,8 +223,8 @@ fn list(inv: &Invocation, node: Uuid) -> anyhow::Result<String> {
                 tod_store::conversation::runs_in(&s.dev_container),
             ),
             Capability::Ticket => format!(
-                "ticket: tickets {}; pull requests {}",
-                list(&s.linked_issues),
+                "ticket: ticket {}; pull requests {}",
+                or_none(&s.ticket),
                 list(&s.linked_prs)
             ),
             Capability::Tags => format!("tags: {}", list(&s.tags)),
@@ -339,6 +340,11 @@ fn set(inv: &Invocation, node: Uuid, args: &Args) -> anyhow::Result<String> {
             }
         }
         Capability::Ticket => {
+            if args.get_all("--ticket").len() > 1 {
+                anyhow::bail!(
+                    "a node is at most one ticket: give --ticket once, and put related tickets in its notes"
+                );
+            }
             let given = |flag: &str, old: Vec<String>| {
                 let values: Vec<String> = args
                     .get_all(flag)
@@ -351,7 +357,7 @@ fn set(inv: &Invocation, node: Uuid, args: &Args) -> anyhow::Result<String> {
             };
             OutlineMutation::SetNodeTicket {
                 node_id: node,
-                linked_issues: given("--ticket", s.linked_issues),
+                ticket: merged(args, "--ticket", s.ticket),
                 linked_prs: given("--pr", s.linked_prs),
             }
         }

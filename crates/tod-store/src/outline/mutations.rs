@@ -92,10 +92,11 @@ pub enum OutlineMutation {
         #[serde(default)]
         dev_container: Option<crate::fleet::repos::node_files::DevContainerSetting>,
     },
-    /// The Ticket capability's linked issues and pull requests.
+    /// The Ticket capability's ticket (at most one; `None` clears it) and
+    /// pull requests.
     SetNodeTicket {
         node_id: Uuid,
-        linked_issues: Vec<String>,
+        ticket: Option<String>,
         linked_prs: Vec<String>,
     },
     /// The Tags capability's tags.
@@ -312,25 +313,24 @@ pub enum OutlineMutation {
     },
     /// Quick-accept a generator-managed ticket: copy it (and its managed
     /// descendants) out to its generator's configured accept destination,
-    /// following the same copy-and-link path as [`OutlineMutation::PasteManagedNodeCopy`],
+    /// following the same copy path as [`OutlineMutation::PasteManagedNodeCopy`],
     /// then enable the generator's configured accept capabilities on the
-    /// new root node. A no-op if the source has no data-source link or its
-    /// generator has no destination configured.
+    /// new root node. A no-op if the source has no ticket or its generator
+    /// has no destination configured.
     AcceptGeneratedTicket {
         source_node_id: Uuid,
         /// The UI assigns this up front so it can select the new node
         /// reliably as soon as the mutation is flushed.
         new_node_id: Uuid,
     },
-    /// Create a managed node under a generator parent with a data-source link.
+    /// Create a managed node under a generator parent. `external_id` becomes
+    /// its ticket, which is all that links it to its source.
     CreateManagedNode {
         node_id: Option<Uuid>,
         list_id: Uuid,
         parent_id: Uuid,
         title: String,
         external_id: String,
-        source_type: String,
-        generator_node_id: Uuid,
         tags: Vec<String>,
         body: String,
         metadata: Option<serde_json::Value>,
@@ -352,27 +352,9 @@ pub enum OutlineMutation {
     DeleteManagedNode {
         node_id: Uuid,
     },
-    /// Create or update a data-source link on a copied-out node.
-    SetManagedNodeLink {
-        node_id: Uuid,
-        generator_node_id: Uuid,
-        external_id: String,
-        source_type: String,
-    },
-    /// Clear all data-source links originating from a generator (on generator delete).
-    ClearManagedNodeLinks {
-        generator_node_id: Uuid,
-    },
-    /// Clear the link on any copied-out node still referencing an external
-    /// item a refresh determined no longer exists (stale link). The node
-    /// keeps its title/content and becomes a plain normal node.
-    ClearStaleCopyLinks {
-        generator_node_id: Uuid,
-        external_id: String,
-    },
-    /// Refresh already-copied-out (linked, non-managed) nodes with fresh
-    /// source data. Each field is `None` when the user has locally modified
-    /// it and refresh must leave it alone.
+    /// Refresh a non-managed node that is a fetched ticket with fresh source
+    /// data. Each field is `None` when the user has locally modified it and
+    /// refresh must leave it alone.
     RefreshLinkedCopy {
         node_id: Uuid,
         title: Option<String>,
@@ -381,8 +363,8 @@ pub enum OutlineMutation {
     },
     /// Deep-copy a managed node (and its managed descendants) out of a generator
     /// subtree into a plain, editable subtree elsewhere in the outline. Each
-    /// copied node keeps a data-source link (for future refresh updates) but is
-    /// no longer `managed` — title/tags/body become user-editable.
+    /// copied node takes the source's ticket (so refreshes keep reaching it)
+    /// but is no longer `managed` — title/tags/body become user-editable.
     PasteManagedNodeCopy {
         source_node_id: Uuid,
         list_id: Uuid,
@@ -450,9 +432,6 @@ impl OutlineMutation {
                 | OutlineMutation::UpdateManagedNode { .. }
                 | OutlineMutation::DeleteManagedNodes { .. }
                 | OutlineMutation::DeleteManagedNode { .. }
-                | OutlineMutation::SetManagedNodeLink { .. }
-                | OutlineMutation::ClearManagedNodeLinks { .. }
-                | OutlineMutation::ClearStaleCopyLinks { .. }
                 | OutlineMutation::RefreshLinkedCopy { .. }
                 | OutlineMutation::PasteManagedNodeCopy { .. }
                 | OutlineMutation::SetRefreshStatus { .. }
@@ -572,13 +551,13 @@ impl OutlineMutation {
             }
             OutlineMutation::SetNodeTicket {
                 node_id,
-                linked_issues,
+                ticket,
                 linked_prs,
             } => {
                 require_capability(conn, *node_id, Capability::Ticket)?;
                 let id = node_id.to_string();
                 let tasks = crate::fleet::repos::task::TaskRepo::new(conn);
-                tasks.update_linked_issues(&id, linked_issues)?;
+                tasks.update_ticket(&id, ticket.as_deref())?;
                 tasks.update_linked_prs(&id, linked_prs)?;
             }
             OutlineMutation::SetNodeTags { node_id, tags } => {
@@ -674,12 +653,9 @@ impl OutlineMutation {
             }
             OutlineMutation::DeleteNode { node_id } => {
                 guard_not_managed(conn, *node_id)?;
-                // If this node is a generator, its copied-out nodes (living outside
-                // the subtree being deleted) lose their data-source link and become
-                // plain normal nodes — they keep their title/content, just no more
-                // refresh updates. Managed descendants are removed by the archive
-                // below along with their own links (FK cascade).
-                GeneratorRepo::new(conn).clear_links_for_generator(*node_id)?;
+                // Nodes accepted from a generator being deleted keep their
+                // tickets; they are linked by id, so another generator
+                // returning the same ticket still reaches them.
                 let (archive_id, _) =
                     crate::outline::archive::delete_subtree_archived(conn, *node_id)?;
                 return Ok(Some(archive_id));
@@ -867,8 +843,6 @@ impl OutlineMutation {
                 parent_id,
                 title,
                 external_id,
-                source_type,
-                generator_node_id,
                 tags,
                 body,
                 metadata,
@@ -880,8 +854,6 @@ impl OutlineMutation {
                     *parent_id,
                     title,
                     external_id,
-                    source_type,
-                    *generator_node_id,
                     tags,
                     body,
                     metadata.as_ref(),
@@ -902,28 +874,6 @@ impl OutlineMutation {
             }
             OutlineMutation::DeleteManagedNode { node_id } => {
                 GeneratorRepo::new(conn).delete_managed_node(*node_id)?;
-            }
-            OutlineMutation::SetManagedNodeLink {
-                node_id,
-                generator_node_id,
-                external_id,
-                source_type,
-            } => {
-                GeneratorRepo::new(conn).set_link(
-                    *node_id,
-                    *generator_node_id,
-                    external_id,
-                    source_type,
-                )?;
-            }
-            OutlineMutation::ClearManagedNodeLinks { generator_node_id } => {
-                GeneratorRepo::new(conn).clear_links_for_generator(*generator_node_id)?;
-            }
-            OutlineMutation::ClearStaleCopyLinks {
-                generator_node_id,
-                external_id,
-            } => {
-                GeneratorRepo::new(conn).clear_stale_copy_links(*generator_node_id, external_id)?;
             }
             OutlineMutation::RefreshLinkedCopy {
                 node_id,
@@ -1535,8 +1485,6 @@ fn create_managed_node(
     parent_id: Uuid,
     title: &str,
     external_id: &str,
-    source_type: &str,
-    generator_node_id: Uuid,
     tags: &[String],
     body: &str,
     metadata: Option<&serde_json::Value>,
@@ -1563,8 +1511,9 @@ fn create_managed_node(
         collapsed: false,
     })?;
 
-    // Create data-source link.
-    gen_repo.set_link(node.id, generator_node_id, external_id, source_type)?;
+    // Its ticket is its link to the source.
+    crate::fleet::repos::task::TaskRepo::new(conn)
+        .update_ticket(&node.id.to_string(), Some(external_id))?;
 
     // Store body as extra content (details).
     if !body.is_empty() {
@@ -1634,7 +1583,7 @@ fn paste_managed_node_copy(
     let gen_repo = GeneratorRepo::new(conn);
     let link = gen_repo
         .get_link(source_node_id)?
-        .context("source node has no data-source link — not a managed node")?;
+        .context("source node has no ticket — not a managed node")?;
 
     bump_ordinals_after(conn, list_id, parent_id, ordinal)?;
     let new_root_id = copy_managed_node_recursive(
@@ -1652,8 +1601,8 @@ fn paste_managed_node_copy(
 
 /// Quick-accept: copy a managed ticket node out to its generator's
 /// configured accept destination and enable the configured accept
-/// capabilities on it. `Ok(None)` if the source has no data-source link or
-/// its generator has no destination configured — the caller treats that as
+/// capabilities on it. `Ok(None)` if the source has no ticket or its
+/// generator has no destination configured — the caller treats that as
 /// inert, not an error.
 fn accept_generated_ticket(
     conn: &Connection,
@@ -1738,18 +1687,14 @@ fn copy_managed_node_recursive(
     if !tags.is_empty() {
         write_managed_tags(&node_repo, new_node.id, &tags)?;
     }
+    // The copy is the same ticket, which is what keeps refreshes reaching
+    // it. Only a ticket source shows it in the Ticket capability; the others
+    // carry the id in the title.
     if link.is_ticket() {
         node_repo.enable_capability(new_node.id, Capability::Ticket)?;
-        crate::fleet::repos::task::TaskRepo::new(conn)
-            .update_linked_issues(&new_node.id.to_string(), &[link.external_id.clone()])?;
     }
-
-    gen_repo.set_link(
-        new_node.id,
-        link.generator_node_id,
-        &link.external_id,
-        &link.source_type,
-    )?;
+    crate::fleet::repos::task::TaskRepo::new(conn)
+        .update_ticket(&new_node.id.to_string(), Some(&link.external_id))?;
 
     let mut stmt = conn.prepare(
         "SELECT e.node_id FROM outline_entries e
@@ -1771,9 +1716,10 @@ fn copy_managed_node_recursive(
     drop(stmt);
 
     for child_id in child_ids {
-        let child_link = gen_repo
-            .get_link(child_id)?
-            .context("managed child has no data-source link")?;
+        let Some(child_link) = gen_repo.get_link(child_id)? else {
+            // A managed node with no ticket has no source to follow.
+            continue;
+        };
         copy_managed_node_recursive(
             conn,
             child_id,

@@ -65,9 +65,38 @@ pub struct ArchivedFields {
     pub repo: Option<String>,
     pub branch: Option<String>,
     pub notes: Option<String>,
-    pub linked_issues: String,
+    #[serde(default)]
+    pub ticket: Option<String>,
+    #[serde(default = "empty_json_array")]
+    pub ticket_modified_fields: String,
+    /// Archives written while a node could have several tickets hold them
+    /// here, a JSON array; the first becomes the ticket on restore.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub linked_issues: Option<String>,
     pub linked_prs: String,
     pub updated_at: i64,
+}
+
+impl ArchivedFields {
+    /// The ticket, from an archive of either shape.
+    fn ticket(&self) -> Option<String> {
+        self.ticket
+            .clone()
+            .or_else(|| first_ticket(self.linked_issues.as_deref()))
+    }
+}
+
+fn empty_json_array() -> String {
+    "[]".into()
+}
+
+/// The first id of a legacy `linked_issues` JSON array.
+fn first_ticket(linked_issues: Option<&str>) -> Option<String> {
+    serde_json::from_str::<Vec<String>>(linked_issues?)
+        .ok()?
+        .into_iter()
+        .map(|t| t.trim().to_string())
+        .find(|t| !t.is_empty())
 }
 
 /// Files capability row (`node_files`).
@@ -293,7 +322,7 @@ fn validate_delete(conn: &Connection, root_id: Uuid) -> Result<()> {
 
 fn snapshot_fields(conn: &Connection, node_id: Uuid) -> Result<Option<ArchivedFields>> {
     conn.query_row(
-        "SELECT repo, branch, notes, linked_issues, linked_prs, updated_at
+        "SELECT repo, branch, notes, ticket, ticket_modified_fields, linked_prs, updated_at
          FROM node_fields WHERE node_id = ?1",
         params![uuid_to_blob(node_id)],
         |row| {
@@ -301,9 +330,11 @@ fn snapshot_fields(conn: &Connection, node_id: Uuid) -> Result<Option<ArchivedFi
                 repo: row.get(0)?,
                 branch: row.get(1)?,
                 notes: row.get(2)?,
-                linked_issues: row.get(3)?,
-                linked_prs: row.get(4)?,
-                updated_at: row.get(5)?,
+                ticket: row.get(3)?,
+                ticket_modified_fields: row.get(4)?,
+                linked_issues: None,
+                linked_prs: row.get(5)?,
+                updated_at: row.get(6)?,
             })
         },
     )
@@ -525,8 +556,12 @@ pub struct CapabilityArchive {
     pub repo: Option<String>,
     #[serde(default)]
     pub branch: Option<String>,
-    /// Ticket: `node_fields.linked_issues` / `linked_prs` (JSON arrays).
+    /// Ticket: `node_fields.ticket` and `linked_prs` (a JSON array).
     #[serde(default)]
+    pub ticket: Option<String>,
+    /// Archives written while a node could have several tickets: a JSON
+    /// array whose first id is the ticket.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub linked_issues: Option<String>,
     #[serde(default)]
     pub linked_prs: Option<String>,
@@ -575,6 +610,7 @@ pub fn build_capability_archive(
         rows: Vec::new(),
         repo: None,
         branch: None,
+        ticket: None,
         linked_issues: None,
         linked_prs: None,
     };
@@ -598,7 +634,7 @@ pub fn build_capability_archive(
             archive.branch = fields.as_ref().and_then(|f| f.branch.clone());
         }
         Capability::Ticket => {
-            archive.linked_issues = fields.as_ref().map(|f| f.linked_issues.clone());
+            archive.ticket = fields.as_ref().and_then(|f| f.ticket.clone());
             archive.linked_prs = fields.as_ref().map(|f| f.linked_prs.clone());
         }
         Capability::Tags => collect_cascade(conn, "node_tags", "node_id", &node, &mut seen, &mut rows)?,
@@ -610,16 +646,9 @@ pub fn build_capability_archive(
                 .into_iter()
                 .map(|id| rusqlite::types::Value::Blob(uuid_to_blob(id)))
                 .collect();
+            // Their tickets are in their `node_fields` rows, which cascade.
+            // Nodes accepted from it keep theirs: nothing ties them to it.
             collect_cascade(conn, "nodes", "id", &managed, &mut seen, &mut rows)?;
-            // Links on nodes copied out of this generator.
-            collect_cascade(
-                conn,
-                "managed_node_links",
-                "generator_node_id",
-                &node,
-                &mut seen,
-                &mut rows,
-            )?;
         }
     }
     archive.rows = rows;
@@ -672,16 +701,15 @@ pub fn restore_capability(conn: &Connection, archive_id: Uuid) -> Result<(Uuid, 
             )?;
         }
         Capability::Ticket => {
+            let ticket = archive
+                .ticket
+                .clone()
+                .or_else(|| first_ticket(archive.linked_issues.as_deref()));
             conn.execute(
-                "UPDATE node_fields SET linked_issues = COALESCE(?2, linked_issues),
+                "UPDATE node_fields SET ticket = COALESCE(?2, ticket),
                      linked_prs = COALESCE(?3, linked_prs), updated_at = ?4
                  WHERE node_id = ?1",
-                params![
-                    uuid_to_blob(node_id),
-                    archive.linked_issues,
-                    archive.linked_prs,
-                    now_ms()
-                ],
+                params![uuid_to_blob(node_id), ticket, archive.linked_prs, now_ms()],
             )?;
         }
         // Its config and children came back with the rows; enabling again
@@ -737,14 +765,16 @@ fn restore_node(conn: &Connection, archived: &ArchivedNode) -> Result<()> {
     }
     if let Some(fields) = &archived.fields {
         conn.execute(
-            "INSERT OR IGNORE INTO node_fields (node_id, repo, branch, notes, linked_issues, linked_prs, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT OR IGNORE INTO node_fields
+               (node_id, repo, branch, notes, ticket, ticket_modified_fields, linked_prs, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 blob,
                 fields.repo,
                 fields.branch,
                 fields.notes,
-                fields.linked_issues,
+                fields.ticket(),
+                fields.ticket_modified_fields,
                 fields.linked_prs,
                 fields.updated_at,
             ],

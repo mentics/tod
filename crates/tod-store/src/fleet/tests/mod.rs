@@ -395,7 +395,7 @@ fn task_round_trip_survives_store_close_and_reopen() {
         branch: Some("main".into()),
         notes: vec![NoteItem::new("persist me")],
         tags: vec!["ui".into(), "persistence".into()],
-        linked_issues: vec!["TOD-99".into()],
+        ticket: Some("TOD-99".into()),
         linked_prs: vec!["#7".into()],
     };
 

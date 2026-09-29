@@ -238,7 +238,7 @@ fn capabilities_inverse(action: &ActionRow) -> Result<Vec<OutlineMutation>> {
         }],
         M::SetNodeTicket { .. } => vec![M::SetNodeTicket {
             node_id,
-            linked_issues: s.linked_issues,
+            ticket: s.ticket,
             linked_prs: s.linked_prs,
         }],
         M::SetNodeTags { .. } => vec![M::SetNodeTags {

@@ -1,28 +1,17 @@
-//! Benchmark: cost of joining generator tables into the tree projection at
-//! scale, to decide between eager-joining `node_generator_config` /
-//! `managed_node_links` into the tree query versus fetching them on demand
-//! (the pattern [`TreeLoader`](super::tree::TreeLoader) already uses for
-//! capabilities/lifecycle/tags — one query per attribute per row).
+//! Benchmark: cost of finding a generator's nodes by ticket id at scale.
 //!
-//! Decision: **on-demand stays, for now.** At 5,000 nodes across 50
-//! generators (every non-generator node managed and linked), a single eager
-//! query with two `LEFT JOIN`s is roughly 8x faster in wall-clock terms than
-//! one query per node per generator table (~8ms vs ~66ms on a dev machine —
-//! see the printed timings from this test). That ratio favors the eager
-//! join, but both numbers are already far below a UI frame budget at this
-//! scale, and `flatten_visible` only needs generator/managed-link data for
-//! the (typically small) subset of rows that actually have it — eager
-//! joining would pull two extra columns for every plain node in trees that
-//! don't use the generator feature at all. Given the absolute cost is
-//! negligible either way at realistic list sizes, keep `TreeLoader` on the
-//! on-demand pattern it already uses for capabilities/lifecycle/tags rather
-//! than adding join complexity now. Revisit if a future profile shows
-//! outline loading actually bottlenecked on this (e.g. tens of thousands of
-//! managed nodes in one list), at which point switch
-//! `TreeLoader::flatten_visible` to the eager join wholesale.
+//! Nothing stores which node came from which generator: a node is ticket T
+//! when its `node_fields.ticket` is T (`doc/lifecycle/plan-step-phases.md`,
+//! section 4). A refresh asks, for every ticket it fetched, which
+//! non-managed nodes are T ([`GeneratorRepo::holders_of`](super::GeneratorRepo::holders_of)),
+//! and the tree asks which tickets have been accepted. Both are lookups on
+//! `node_fields.ticket`, which is indexed; this checks the index is used and
+//! that a refresh's worth of lookups over 5,000 nodes stays far inside a UI
+//! frame budget.
 #[cfg(test)]
 mod tests {
     use crate::fleet::schema::{open_read_connection, open_writer_connection};
+    use crate::outline::repos::GeneratorRepo;
     use crate::outline::uuid_blob::uuid_to_blob;
     use rusqlite::params;
     use std::time::Instant;
@@ -30,6 +19,8 @@ mod tests {
 
     const NODE_COUNT: usize = 5_000;
     const GENERATOR_COUNT: usize = 50;
+    /// Every this-many managed nodes has an accepted copy elsewhere.
+    const COPY_EVERY: usize = 10;
 
     fn build_dataset() -> std::path::PathBuf {
         let root = std::env::temp_dir().join(format!("tod-gen-bench-{}", Uuid::new_v4()));
@@ -45,21 +36,12 @@ mod tests {
         .unwrap();
 
         let tx = conn.unchecked_transaction().unwrap();
-        let mut generator_ids = Vec::with_capacity(GENERATOR_COUNT);
-        let mut managed = Vec::with_capacity(NODE_COUNT);
-        for i in 0..NODE_COUNT {
+        let insert_node = |i: usize, slug: &str, managed: bool| {
             let node_id = Uuid::new_v4();
-            let slug = format!("bench-node-{i}");
-            let is_generator = i % GENERATOR_COUNT == 0;
             tx.execute(
                 "INSERT INTO nodes (id, slug, title, created_at, updated_at, managed)
                  VALUES (?1, ?2, ?3, 0, 0, ?4)",
-                params![
-                    uuid_to_blob(node_id),
-                    slug,
-                    format!("Node {i}"),
-                    !is_generator
-                ],
+                params![uuid_to_blob(node_id), slug, format!("Node {i}"), managed],
             )
             .unwrap();
             tx.execute(
@@ -67,7 +49,19 @@ mod tests {
                 params![uuid_to_blob(node_id), uuid_to_blob(list_id), i as i64],
             )
             .unwrap();
-
+            node_id
+        };
+        let set_ticket = |node_id: Uuid, ticket: &str| {
+            tx.execute(
+                "INSERT INTO node_fields (node_id, ticket, linked_prs, updated_at)
+                 VALUES (?1, ?2, '[]', 0)",
+                params![uuid_to_blob(node_id), ticket],
+            )
+            .unwrap();
+        };
+        for i in 0..NODE_COUNT {
+            let is_generator = i % GENERATOR_COUNT == 0;
+            let node_id = insert_node(i, &format!("bench-node-{i}"), !is_generator);
             if is_generator {
                 tx.execute(
                     "INSERT INTO node_capabilities (node_id, capability, enabled_at) VALUES (?1, 'generator', 0)",
@@ -80,101 +74,57 @@ mod tests {
                     params![uuid_to_blob(node_id)],
                 )
                 .unwrap();
-                generator_ids.push(node_id);
-            } else {
-                managed.push((node_id, i));
+                continue;
             }
-        }
-        for (node_id, i) in managed {
-            let generator_id = generator_ids[i % generator_ids.len()];
-            tx.execute(
-                "INSERT INTO managed_node_links (node_id, generator_node_id, external_id, source_type, user_modified_fields)
-                 VALUES (?1, ?2, ?3, 'mock', '[]')",
-                params![uuid_to_blob(node_id), uuid_to_blob(generator_id), format!("EXT-{i}")],
-            )
-            .unwrap();
+            let ticket = format!("EXT-{i}");
+            set_ticket(node_id, &ticket);
+            if i % COPY_EVERY == 1 {
+                let copy = insert_node(NODE_COUNT + i, &format!("bench-copy-{i}"), false);
+                set_ticket(copy, &ticket);
+            }
         }
         tx.commit().unwrap();
         root
     }
 
     #[test]
-    fn benchmark_eager_join_vs_on_demand() {
+    fn ticket_lookups_use_the_index_and_stay_fast() {
         let root = build_dataset();
         let db_path = root.join("tod.db");
         let conn = open_read_connection(&db_path).unwrap();
 
-        // Eager: one query, LEFT JOIN both generator tables in.
-        let start = Instant::now();
-        let mut stmt = conn
+        let plan: Vec<String> = conn
             .prepare(
-                "SELECT n.id, gc.data_source_type, ml.external_id
-                 FROM nodes n
-                 LEFT JOIN node_generator_config gc ON gc.node_id = n.id
-                 LEFT JOIN managed_node_links ml ON ml.node_id = n.id",
+                "EXPLAIN QUERY PLAN
+                 SELECT f.node_id FROM node_fields f JOIN nodes n ON n.id = f.node_id
+                 WHERE f.ticket = ?1 AND n.managed = 0",
             )
-            .unwrap();
-        let eager_rows: Vec<(Vec<u8>, Option<String>, Option<String>)> = stmt
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .query_map(params!["EXT-1"], |row| row.get(3))
             .unwrap()
             .collect::<Result<_, _>>()
             .unwrap();
-        let eager_elapsed = start.elapsed();
-        assert_eq!(eager_rows.len(), NODE_COUNT);
+        assert!(
+            plan.iter().any(|step| step.contains("idx_node_fields_ticket")),
+            "ticket lookup does not use the index: {plan:?}"
+        );
 
-        // On-demand: one query per node per generator table (today's pattern
-        // for capabilities/lifecycle/tags in TreeLoader::walk).
-        let ids: Vec<Vec<u8>> = eager_rows.iter().map(|(id, _, _)| id.clone()).collect();
+        // A refresh returning every ticket asks once per ticket.
+        let generators = GeneratorRepo::new(&conn);
         let start = Instant::now();
-        for id in &ids {
-            let _: Option<String> = conn
-                .query_row(
-                    "SELECT data_source_type FROM node_generator_config WHERE node_id = ?1",
-                    params![id],
-                    |row| row.get(0),
-                )
-                .optional_or_none();
-            let _: Option<String> = conn
-                .query_row(
-                    "SELECT external_id FROM managed_node_links WHERE node_id = ?1",
-                    params![id],
-                    |row| row.get(0),
-                )
-                .optional_or_none();
+        let mut holders = 0;
+        for i in 0..NODE_COUNT {
+            holders += generators.holders_of(&format!("EXT-{i}")).unwrap().len();
         }
-        let on_demand_elapsed = start.elapsed();
-
+        let elapsed = start.elapsed();
+        let managed = NODE_COUNT - NODE_COUNT / GENERATOR_COUNT;
+        assert_eq!(holders, (1..NODE_COUNT).filter(|i| i % COPY_EVERY == 1).count());
         eprintln!(
-            "generator join benchmark ({NODE_COUNT} nodes, {GENERATOR_COUNT} generators): \
-             eager={eager_elapsed:?} on_demand={on_demand_elapsed:?}"
+            "ticket lookup benchmark ({NODE_COUNT} nodes, {managed} managed, {holders} copies): \
+             {NODE_COUNT} lookups in {elapsed:?}"
         );
-
-        // Both complete comfortably within a UI frame budget many times over;
-        // this asserts the benchmark ran to completion rather than pinning an
-        // exact ratio (timings are machine-dependent).
-        assert!(
-            eager_elapsed.as_secs() < 2,
-            "eager join too slow: {eager_elapsed:?}"
-        );
-        assert!(
-            on_demand_elapsed.as_secs() < 2,
-            "on-demand queries too slow: {on_demand_elapsed:?}"
-        );
+        assert!(elapsed.as_secs() < 2, "ticket lookups too slow: {elapsed:?}");
 
         let _ = std::fs::remove_dir_all(root);
-    }
-
-    trait OptionalOrNone<T> {
-        fn optional_or_none(self) -> Option<T>;
-    }
-
-    impl<T> OptionalOrNone<T> for rusqlite::Result<T> {
-        fn optional_or_none(self) -> Option<T> {
-            match self {
-                Ok(v) => Some(v),
-                Err(rusqlite::Error::QueryReturnedNoRows) => None,
-                Err(err) => panic!("unexpected query error: {err}"),
-            }
-        }
     }
 }
