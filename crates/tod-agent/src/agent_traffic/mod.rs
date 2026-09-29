@@ -85,6 +85,9 @@ pub struct AgentTrafficLog {
     entries: Vec<TrafficEntry>,
     next_sequence: u64,
     max_entries: usize,
+    /// Watchers told, once per entry, that the log grew; a watcher whose
+    /// receiver was dropped is forgotten on the next entry.
+    watchers: Vec<std::sync::mpsc::Sender<()>>,
 }
 
 impl AgentTrafficLog {
@@ -93,7 +96,16 @@ impl AgentTrafficLog {
             entries: Vec::new(),
             next_sequence: 1,
             max_entries: DEFAULT_MAX_ENTRIES,
+            watchers: Vec::new(),
         }
+    }
+
+    /// A receiver that gets a message for every entry recorded from now on,
+    /// so a view can follow the log without re-reading it on a timer.
+    pub fn subscribe(&mut self) -> std::sync::mpsc::Receiver<()> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.watchers.push(tx);
+        rx
     }
 
     pub fn record(
@@ -119,6 +131,7 @@ impl AgentTrafficLog {
             let drop = self.entries.len() - self.max_entries;
             self.entries.drain(0..drop);
         }
+        self.watchers.retain(|tx| tx.send(()).is_ok());
     }
 
     pub fn record_fleet_request(&mut self, agent_id: &str, content: &str) {

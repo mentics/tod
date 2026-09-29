@@ -48,7 +48,7 @@ use gpui_component::menu::PopupMenuItem;
 use tod_journey::{Presented, PresentedAction};
 use crate::unified::runners::NodeRunners;
 use crate::views::cloud_node::CloudUpdate;
-use tod_store::conversation::Focus;
+use tod_store::conversation::{Focus, ProtocolKind};
 
 use crate::ui::agent_runs::AgentRuns;
 use crate::unified::columns::PanelKind;
@@ -505,7 +505,11 @@ impl TaskPanel {
         let mut ix = 0;
         while let Some(slot) = runs.slot_by_index(ix) {
             ix += 1;
-            if slot.focus != focus {
+            // Chat-panel conversations are not the lifecycle processor's:
+            // their status never shows here.
+            if slot.focus != focus
+                || matches!(slot.protocol, ProtocolKind::Outline | ProtocolKind::Chat)
+            {
                 continue;
             }
             if slot.status.running {
@@ -516,6 +520,29 @@ impl TaskPanel {
             }
         }
         failed
+    }
+
+    /// The lifecycle conversation to watch: the one running (or failed) now,
+    /// else the most recently updated one. Chat-panel conversations are not
+    /// the lifecycle processor's.
+    fn watch_target(&self, cx: &App) -> Option<uuid::Uuid> {
+        let runs = self.agent_runs.read(cx);
+        if let Some((id, _)) = self.node_slot(cx) {
+            if let Some(conversation) = runs.slot_by_id(id).and_then(|s| s.conversation_id) {
+                return Some(conversation);
+            }
+        }
+        let node = self.node_id;
+        self.fleet
+            .read(|conn| {
+                tod_store::conversation::ConversationRepo::new(conn).list_for_focus(Focus::Node(node))
+            })
+            .ok()?
+            .into_iter()
+            .map(|s| s.conversation)
+            .filter(|c| !matches!(c.protocol, ProtocolKind::Outline | ProtocolKind::Chat))
+            .max_by_key(|c| c.updated_at)
+            .map(|c| c.id)
     }
 
     /// Note when this node's conversation started running, for the elapsed
@@ -828,8 +855,23 @@ impl TaskPanel {
             line = line.child(sep()).child(el.child(selectable_text("unified-task-runner-note", note, window, cx)));
         }
         let actions = self.runner_actions(&status, cx);
-        if let Some(button) = self.render_runner_button(actions, cx) {
-            line = line.child(div().flex_1()).child(button);
+        let watch = self.watch_target(cx).map(|conversation| {
+            Button::new("unified-task-runner-watch")
+                .label("Watch")
+                .small()
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.open(PanelKind::Transcript(conversation), false, cx)
+                }))
+        });
+        let button = self.render_runner_button(actions, cx);
+        if watch.is_some() || button.is_some() {
+            line = line.child(div().flex_1());
+        }
+        if let Some(watch) = watch {
+            line = line.child(watch);
+        }
+        if let Some(button) = button {
+            line = line.child(button);
         }
         Some(line.id("unified-task-runner-line").into_any_element())
     }

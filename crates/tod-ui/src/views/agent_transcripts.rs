@@ -244,6 +244,9 @@ pub struct AgentTranscriptsView {
     /// Every usage figure is shown, not just the one-line summary.
     usage_expanded: bool,
     _transcript_subscription: Subscription,
+    /// Follows the store and the traffic log, so a running session's
+    /// transcript grows as it goes by.
+    _live: gpui::Task<()>,
 }
 
 #[derive(Debug, Clone)]
@@ -288,7 +291,9 @@ impl AgentTranscriptsView {
             toggled: HashMap::new(),
             usage_expanded: false,
             _transcript_subscription: subscription,
+            _live: gpui::Task::ready(()),
         };
+        this._live = this.follow_live(cx);
         this.reload_agents();
         if let Some(first) = this.first_agent_id() {
             this.select_agent(first, cx);
@@ -298,6 +303,54 @@ impl AgentTranscriptsView {
             focus.focus(window, cx);
         });
         this
+    }
+
+    /// Refresh on every store change and every entry the traffic log gets,
+    /// at most every 200ms: the list and the selected transcript keep the
+    /// cursor and what the user expanded, and the platform's stored record is
+    /// not re-read (that happens when a session is picked).
+    fn follow_live(&self, cx: &mut Context<Self>) -> gpui::Task<()> {
+        let mut fleet_rx = self.fleet.subscribe_changes();
+        let traffic_rx = self.traffic_log.lock().ok().map(|mut log| log.subscribe());
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(200))
+                    .await;
+                let mut changed = false;
+                while fleet_rx.try_recv().is_ok() {
+                    changed = true;
+                }
+                if let Some(rx) = &traffic_rx {
+                    while rx.try_recv().is_ok() {
+                        changed = true;
+                    }
+                }
+                if changed && this.update(cx, |this, cx| this.refresh_live(cx)).is_err() {
+                    break;
+                }
+            }
+        })
+    }
+
+    fn refresh_live(&mut self, cx: &mut Context<Self>) {
+        self.reload_agents();
+        let Some(id) = self.selected_agent_id.clone() else {
+            if let Some(first) = self.first_agent_id() {
+                self.select_agent(first, cx);
+            }
+            return;
+        };
+        self.turns = self
+            .agents
+            .iter()
+            .find(|agent| agent.id == id)
+            .and_then(|row| row.traffic_key.as_deref())
+            .map(|key| self.load_turns(key))
+            .unwrap_or_default();
+        self.set_header(&id);
+        self.sync_transcript(cx);
+        cx.notify();
     }
 
     fn focus(&mut self, window: &mut Window, cx: &mut gpui::App) {

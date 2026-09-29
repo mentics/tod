@@ -47,6 +47,9 @@ pub struct TranscriptPanel {
     focus_handle: FocusHandle,
     panel: Entity<AgentConversationPanel>,
     _subscription: Subscription,
+    /// Reloads the turns when the store changes, so a running conversation
+    /// is watched as it goes.
+    _follow: gpui::Task<()>,
 }
 
 impl TranscriptPanel {
@@ -70,7 +73,23 @@ impl TranscriptPanel {
             focus_handle: cx.focus_handle(),
             panel,
             _subscription,
+            _follow: gpui::Task::ready(()),
         };
+        let mut fleet_rx = this.fleet.subscribe_changes();
+        this._follow = cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(200))
+                    .await;
+                let mut changed = false;
+                while fleet_rx.try_recv().is_ok() {
+                    changed = true;
+                }
+                if changed && this.update(cx, |this, cx| this.reload(cx)).is_err() {
+                    break;
+                }
+            }
+        });
         this.reload(cx);
         this
     }

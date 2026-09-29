@@ -283,12 +283,17 @@ impl AgentRuns {
         self.slots.retain(|s| s.id != id);
     }
 
-    /// Whether a conversation this registry drives is working on `node`
-    /// (not counting ones hosted for another owner).
+    /// Whether a lifecycle conversation this registry drives is working on
+    /// `node` (not counting ones hosted for another owner). Chat-panel
+    /// conversations are separate from the lifecycle processor and never
+    /// count.
     pub fn driving_on_node(&self, node: Uuid) -> bool {
-        self.slots
-            .iter()
-            .any(|s| s.focus == Focus::Node(node) && s.status.running && !s.is_hosted_elsewhere())
+        self.slots.iter().any(|s| {
+            s.focus == Focus::Node(node)
+                && s.status.running
+                && !s.is_hosted_elsewhere()
+                && !matches!(s.protocol, ProtocolKind::Outline | ProtocolKind::Chat)
+        })
     }
 
     /// Drop every slot `keep` says no to; used to drop idle slots for a
