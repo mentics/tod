@@ -252,36 +252,6 @@ impl ListDelegate for TaskListDelegate {
             });
 
         let mut chips = h_flex().gap_1().items_center().ml_auto();
-        if item.needs_you_count > 0 {
-            let task_id_badge = item.id.clone();
-            let sink_badge = sink.clone();
-            let warning_text = crate::ui::style::color::callout_warning_text();
-            let warning_fill = crate::ui::style::color::callout_warning_fill();
-            let warning_edge = crate::ui::style::color::callout_warning_edge();
-            chips = chips.child(
-                div()
-                    .px_2()
-                    .py_0p5()
-                    .rounded_md()
-                    .text_xs()
-                    .cursor_pointer()
-                    .border_1()
-                    .border_color(warning_edge)
-                    .bg(warning_fill)
-                    .text_color(warning_text)
-                    .child(format!("Needs you · {}", item.needs_you_count))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |_, _, _, cx| {
-                            cx.stop_propagation();
-                            sink_badge.borrow_mut().push(RowAction::OpenTaskPanel {
-                                task_id: task_id_badge.clone(),
-                            });
-                            cx.notify();
-                        }),
-                    ),
-            );
-        }
         if item.linked_copy && self.recently_updated.contains(&item.id) {
             chips = chips.child(
                 div()
@@ -632,6 +602,12 @@ impl ListDelegate for TaskListDelegate {
         } else {
             let title_color = if item.title.is_empty() {
                 muted_foreground
+            } else if item.needs_you_count > 0 {
+                // `styles.node-title-needs-you`
+                crate::ui::style::color::node_needs_you_text()
+            } else if item.live_run_count > 0 {
+                // `styles.node-title-running`
+                crate::ui::style::color::node_running_text()
             } else if item.has_copies {
                 // `styles.node-title-has-copies`
                 crate::ui::style::color::linked_source_text()
@@ -651,7 +627,7 @@ impl ListDelegate for TaskListDelegate {
                     display_title.clone(),
                     selected,
                     managed,
-                    item.incoming_count > 0,
+                    item.incoming_count > 0 && item.needs_you_count == 0 && item.live_run_count == 0,
                     item.id.clone(),
                     sink.clone(),
                 ),
@@ -760,6 +736,10 @@ impl ListDelegate for TaskListDelegate {
             .when(!has_spec, |el| {
                 el.drag_over::<ItemDrag>(|style, _, _, _| style.cursor_not_allowed())
             })
+            .child(status_icon_cell(
+                item.needs_you_count > 0,
+                item.live_run_count > 0,
+            ))
             .child(title_line)
             .when_some(menu_at, |el, (at, menu)| el.child(popup_at(at, menu)));
 
@@ -787,6 +767,36 @@ impl ListDelegate for TaskListDelegate {
         _cx: &mut Context<ListState<Self>>,
     ) {
     }
+}
+
+/// The fixed-width cell at the left of a row: an alert icon when the node
+/// waits on the user, else a play icon while its lifecycle processor runs.
+/// Static on purpose (a tree of animated rows would distract), and always
+/// reserved so rows do not shift when a run starts or stops.
+fn status_icon_cell(needs_you: bool, running: bool) -> gpui::Div {
+    let cell = div()
+        .w(px(16.0))
+        .flex_shrink_0()
+        .flex()
+        .items_center();
+    let (name, color) = if needs_you {
+        (
+            gpui_kit_assets::IconName::TriangleAlert,
+            crate::ui::style::color::node_needs_you_text(),
+        )
+    } else if running {
+        (
+            gpui_kit_assets::IconName::Play,
+            crate::ui::style::color::node_running_text(),
+        )
+    } else {
+        return cell;
+    };
+    cell.child(
+        gpui_component::Icon::new(name)
+            .xsmall()
+            .text_color(color),
+    )
 }
 
 fn title_label(

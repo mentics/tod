@@ -393,6 +393,14 @@ styles:
     # A tree row copied out of a generator that still receives its source
     # item's updates.
     color: linked-copy-text
+  node-title-running:
+    # A tree row whose node the lifecycle processor is running. Never color
+    # alone: the row also carries a play icon; both go when the run stops.
+    color: node-running-text
+  node-title-needs-you:
+    # A tree row waiting on the user (replaces the "Needs you" chip). Also
+    # carries an alert icon. Wins over running.
+    color: node-needs-you-text
   node-title-has-copies:
     # A generator-managed row with a linked copy elsewhere: the copy's
     # amber, faded as far as text-muted is from text.
@@ -505,6 +513,10 @@ tokens:
     incoming-text: "#facc15"
     linked-copy-text: "#f59e0b"
     linked-source-text: "#a06707"
+    # Amber's neighbors: a soft olive-green for a node the lifecycle
+    # processor is running, a soft coral for one waiting on the user.
+    node-running-text: "#a8c060"
+    node-needs-you-text: "#f0805a"
     notice-fill: "#ffff00"
     notice-text: "#000000"
     badge-fill: "#262626"

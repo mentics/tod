@@ -96,6 +96,12 @@ pub mod color {
     pub fn linked_copy_text() -> Hsla {
         hex(0xf59e0bff)
     }
+    pub fn node_running_text() -> Hsla {
+        hex(0xa8c060ff)
+    }
+    pub fn node_needs_you_text() -> Hsla {
+        hex(0xf0805aff)
+    }
     pub fn linked_source_text() -> Hsla {
         hex(0xa06707ff)
     }
