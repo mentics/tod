@@ -470,11 +470,12 @@ Nothing starts or builds a container; tod only uses a running one.
   (`code_editor::zed::open_in_container`; a file opens in a second call,
   since Zed takes one `ssh://` URL per call). `tod-zed-shim` routes
   `.docker.tod` hosts (before sandboxes' `.tod`) to the real `ssh` with a
-  ProxyCommand of `docker exec -i -u root <c> /usr/sbin/sshd -i` and tod's own
+  ProxyCommand of `docker exec -i -u root <c> /usr/sbin/sshd -i -f /tmp/tod-sshd/sshd_config` and tod's own
   key (`<data root>/zed-shim/docker_ed25519`). Beforehand,
-  `devcontainer::prepare_sshd` (off the UI thread) runs `ssh-keygen -A`,
-  makes `/run/sshd`, maps `UNKNOWN` to 127.0.0.1 in `/etc/hosts` (PAM's
-  ~13s DNS wait), and authorizes the key; it installs nothing, and a
+  `devcontainer::prepare_sshd` (off the UI thread) writes
+  only under `/tmp/tod-sshd` (host key, sshd config, authorized key: the
+  container's home and `/etc` may be read-only) and, best effort, maps
+  `UNKNOWN` to 127.0.0.1 in `/etc/hosts` (PAM's ~13s DNS wait); it installs nothing, and a
   container without `sshd` gets an error saying to install it. A mounted
   repository opens on this machine. On Windows the real `ssh` may be Git's
   MSYS build, which rewrites an absolute path in a ProxyCommand, so the shim

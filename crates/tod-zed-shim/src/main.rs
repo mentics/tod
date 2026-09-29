@@ -208,7 +208,8 @@ fn container_for_host(dest: &str) -> Option<&str> {
 /// Options put ahead of Zed's own (ssh keeps the first value it gets for
 /// each): the transport is `sshd -i` in the container over `docker exec`,
 /// so there is no port, and tod prepared the container to accept its key
-/// (`tod_agent::devcontainer::prepare_sshd`). Host keys are not checked:
+/// (`tod_agent::devcontainer::prepare_sshd`, which writes the config named
+/// here; keep the two paths in step). Host keys are not checked:
 /// the connection never leaves this machine, and a rebuilt container gets
 /// new ones.
 ///
@@ -219,9 +220,13 @@ fn container_for_host(dest: &str) -> Option<&str> {
 /// which both Windows' OpenSSH and MSYS read as the null device; MSYS takes
 /// `NUL` for a file of that name in the working directory.
 fn container_ssh_options(container: &str, key: &Path) -> Vec<String> {
-    let sshd = if cfg!(windows) { "//usr/sbin/sshd" } else { "/usr/sbin/sshd" };
+    let (sshd, config) = if cfg!(windows) {
+        ("//usr/sbin/sshd", "//tmp/tod-sshd/sshd_config")
+    } else {
+        ("/usr/sbin/sshd", "/tmp/tod-sshd/sshd_config")
+    };
     [
-        format!("ProxyCommand=docker exec -i -u root {container} {sshd} -i"),
+        format!("ProxyCommand=docker exec -i -u root {container} {sshd} -i -f {config}"),
         "IdentitiesOnly=yes".to_string(),
         "PreferredAuthentications=publickey".to_string(),
         "BatchMode=yes".to_string(),
@@ -586,7 +591,11 @@ mod tests {
     fn container_options_proxy_through_sshd() {
         let opts = container_ssh_options("my-dev", Path::new("/data/zed-shim/docker_ed25519"));
         assert!(opts.chunks(2).all(|pair| pair[0] == "-o" || pair[0] == "-i"));
-        let sshd = if cfg!(windows) { "//usr/sbin/sshd" } else { "/usr/sbin/sshd" };
+        let (sshd, config) = if cfg!(windows) {
+        ("//usr/sbin/sshd", "//tmp/tod-sshd/sshd_config")
+    } else {
+        ("/usr/sbin/sshd", "/tmp/tod-sshd/sshd_config")
+    };
         assert!(opts.contains(&format!("ProxyCommand=docker exec -i -u root my-dev {sshd} -i")));
         assert!(opts.ends_with(&["-i".to_string(), "/data/zed-shim/docker_ed25519".to_string()]));
     }

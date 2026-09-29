@@ -679,23 +679,40 @@ const NO_SSHD: i32 = 3;
 /// Exit code of [`SSHD_PREP_SCRIPT`] when the user is not in `/etc/passwd`.
 const NO_USER: i32 = 4;
 
-/// Makes `sshd -i` over a pipe usable, as root: host keys, its privilege
-/// separation directory, a hosts entry for `UNKNOWN` (PAM otherwise waits
-/// ~13s on Docker Desktop's DNS resolving it for every connection), and the
-/// public key `$2` in user `$1`'s `authorized_keys`. Idempotent.
+/// Where tod keeps its own `sshd` configuration, host key, and authorized
+/// key inside the container. `/tmp` is writable when the image's `/home`,
+/// `/etc`, and `/root` are read-only or mounted, so nothing of the user's is
+/// touched.
+pub const SSHD_DIR: &str = "/tmp/tod-sshd";
+
+/// The `sshd -i` command line the zed shim's ProxyCommand runs.
+pub const SSHD_CONFIG: &str = "/tmp/tod-sshd/sshd_config";
+
+/// Makes `sshd -i -f {SSHD_CONFIG}` over a pipe usable, as root, writing only
+/// under [`SSHD_DIR`]: a host key, a config naming it and an authorized-keys
+/// file holding public key `$2` (for any user; `$1` must exist), and sshd's
+/// privilege separation directory. A hosts entry for `UNKNOWN` (PAM otherwise
+/// waits ~13s on Docker Desktop's DNS for every connection) is best effort:
+/// `/etc/hosts` may be read-only. Idempotent.
 const SSHD_PREP_SCRIPT: &str = r#"
 [ -x /usr/sbin/sshd ] || exit 3
-ssh-keygen -A >/dev/null || exit 1
-mkdir -p /run/sshd
-grep -qx '127.0.0.1 UNKNOWN' /etc/hosts || echo '127.0.0.1 UNKNOWN' >> /etc/hosts
-home=$(grep "^$1:" /etc/passwd | cut -d: -f6)
-[ -n "$home" ] || exit 4
-mkdir -p "$home/.ssh"
-touch "$home/.ssh/authorized_keys"
-grep -qxF "$2" "$home/.ssh/authorized_keys" || echo "$2" >> "$home/.ssh/authorized_keys"
-chown "$1" "$home/.ssh" "$home/.ssh/authorized_keys"
-chmod 700 "$home/.ssh"
-chmod 600 "$home/.ssh/authorized_keys"
+grep -q "^$1:" /etc/passwd || exit 4
+d=/tmp/tod-sshd
+mkdir -p "$d" || exit 1
+chmod 755 "$d"
+[ -f "$d/host_ed25519" ] || ssh-keygen -q -t ed25519 -N '' -f "$d/host_ed25519" || exit 1
+printf '%s
+' "$2" > "$d/authorized_keys" || exit 1
+chmod 644 "$d/authorized_keys"
+cat > "$d/sshd_config" <<CONF
+HostKey $d/host_ed25519
+AuthorizedKeysFile $d/authorized_keys
+StrictModes no
+PidFile none
+CONF
+[ -d /run/sshd ] || mkdir -p /run/sshd 2>/dev/null || true
+{ grep -qx '127.0.0.1 UNKNOWN' /etc/hosts || echo '127.0.0.1 UNKNOWN' >> /etc/hosts; } 2>/dev/null || true
+exit 0
 "#;
 
 /// A container has no OpenSSH server, which Zed reaches it through.
@@ -805,11 +822,11 @@ mod tests {
         prepare_sshd(&container, "root", key).unwrap();
         let out = output(docker_command().unwrap().args([
             "exec", "-u", "0", &container, "sh", "-c",
-            "grep -cxF \"$1\" /root/.ssh/authorized_keys; grep -c '^127.0.0.1 UNKNOWN$' /etc/hosts; test -d /run/sshd && echo dir",
+            "grep -cxF \"$1\" /tmp/tod-sshd/authorized_keys; test -f /tmp/tod-sshd/sshd_config && test -f /tmp/tod-sshd/host_ed25519 && echo files",
             "sh", key,
         ]))
         .unwrap();
-        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "1\n1\ndir");
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "1\nfiles");
     }
 
     fn info(mounts: &[(&str, &str)]) -> ContainerInfo {
