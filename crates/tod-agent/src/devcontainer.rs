@@ -690,7 +690,9 @@ pub const SSHD_CONFIG: &str = "/tmp/tod-sshd/sshd_config";
 
 /// Makes `sshd -i -f {SSHD_CONFIG}` over a pipe usable, as root, writing only
 /// under [`SSHD_DIR`]: a host key, a config naming it and an authorized-keys
-/// file holding public key `$2` (for any user; `$1` must exist), and sshd's
+/// file holding public key `$2` (for any user; `$1` must exist), and `UsePAM
+/// yes` (a `-f` config drops the distribution's: without it sshd refuses
+/// accounts with a locked password, such as `vscode`), and sshd's
 /// privilege separation directory. A hosts entry for `UNKNOWN` (PAM otherwise
 /// waits ~13s on Docker Desktop's DNS for every connection) is best effort:
 /// `/etc/hosts` may be read-only. Idempotent.
@@ -709,6 +711,7 @@ HostKey $d/host_ed25519
 AuthorizedKeysFile $d/authorized_keys
 StrictModes no
 PidFile none
+UsePAM yes
 CONF
 [ -d /run/sshd ] || mkdir -p /run/sshd 2>/dev/null || true
 { grep -qx '127.0.0.1 UNKNOWN' /etc/hosts || echo '127.0.0.1 UNKNOWN' >> /etc/hosts; } 2>/dev/null || true
