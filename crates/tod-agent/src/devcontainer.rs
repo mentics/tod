@@ -698,6 +698,59 @@ chmod 700 "$home/.ssh"
 chmod 600 "$home/.ssh/authorized_keys"
 "#;
 
+/// A container has no OpenSSH server, which Zed reaches it through.
+/// [`install_sshd`] can fix it; callers find it with `downcast_ref`.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "Dev container `{container}` has no OpenSSH server ({SSHD_PATH}), which Zed reaches it through.      Install it in the container's image (e.g. `openssh-server` on Debian/Ubuntu, `openssh` on Alpine), then try again"
+)]
+pub struct NoSshd {
+    pub container: String,
+}
+
+/// Installs an OpenSSH server in `container` (as root, with whichever of
+/// apt, apk, dnf, yum, or zypper it has). It lasts until the container is
+/// recreated from its image. Talks to Docker and the network: never call it
+/// on the UI thread.
+pub fn install_sshd(container: &str) -> Result<()> {
+    validate_container_ref(container)?;
+    let out = output(docker_command()?.args([
+        "exec", "-u", "0", container, "sh", "-c", SSHD_INSTALL_SCRIPT,
+    ]))?;
+    if out.status.success() {
+        return Ok(());
+    }
+    if out.status.code() == Some(NO_PACKAGE_MANAGER) {
+        bail!(
+            "Dev container `{container}` has no supported package manager; install an OpenSSH server in its image"
+        );
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let tail: Vec<&str> = stderr.lines().rev().take(5).collect();
+    bail!(
+        "install OpenSSH in dev container `{container}`: {}",
+        tail.into_iter().rev().collect::<Vec<_>>().join("
+")
+    )
+}
+
+/// Exit code of [`SSHD_INSTALL_SCRIPT`] when no package manager is found.
+const NO_PACKAGE_MANAGER: i32 = 5;
+
+const SSHD_INSTALL_SCRIPT: &str = r#"
+[ -x /usr/sbin/sshd ] && exit 0
+if command -v apt-get >/dev/null; then
+  export DEBIAN_FRONTEND=noninteractive
+  { apt-get update && apt-get install -y --no-install-recommends openssh-server; } >&2
+elif command -v apk >/dev/null; then apk add --no-cache openssh-server >&2
+elif command -v dnf >/dev/null; then dnf install -y openssh-server >&2
+elif command -v yum >/dev/null; then yum install -y openssh-server >&2
+elif command -v zypper >/dev/null; then zypper --non-interactive install openssh >&2
+else exit 5
+fi
+[ -x /usr/sbin/sshd ]
+"#;
+
 /// Prepare `container` so an `ssh` whose ProxyCommand is `sshd -i` in it can
 /// log in as `user` with `public_key` (one `authorized_keys` line). Runs as
 /// root and installs nothing: a container without an OpenSSH server gets an
@@ -716,10 +769,10 @@ pub fn prepare_sshd(container: &str, user: &str, public_key: &str) -> Result<()>
     ]))?;
     match out.status.code() {
         Some(0) => Ok(()),
-        Some(NO_SSHD) => bail!(
-            "Dev container `{container}` has no OpenSSH server ({SSHD_PATH}), which Zed reaches it through. \
-             Install it in the container's image (e.g. `openssh-server` on Debian/Ubuntu, `openssh` on Alpine), then try again"
-        ),
+        Some(NO_SSHD) => Err(NoSshd {
+            container: container.to_string(),
+        }
+        .into()),
         Some(NO_USER) => bail!("Dev container `{container}` has no user `{user}` in /etc/passwd"),
         _ => bail!(
             "prepare sshd in dev container `{container}`: {}",

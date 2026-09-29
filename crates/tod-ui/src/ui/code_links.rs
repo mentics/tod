@@ -8,6 +8,7 @@
 //! tree's selection). A relative path is resolved against that node's Files
 //! directory.
 
+use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui::{App, AppContext as _, ClickEvent, MouseButton, SharedString, Window};
@@ -16,7 +17,9 @@ use tod_store::fleet::{
 };
 use uuid::Uuid;
 
-use crate::ui::toast::error_toast;
+use tod_agent::devcontainer::{NoSshd, install_sshd};
+
+use crate::ui::toast::{error_toast, error_toast_with_action, info_toast};
 
 /// Open a code reference clicked in text. Dispatched by the link, handled by
 /// the view that knows the node; never bound to a key.
@@ -75,9 +78,37 @@ pub fn open_code_ref(
         .spawn(cx, async move |cx| {
             if let Err(err) = task.await {
                 let _ = cx.update(|window, cx| {
-                    error_toast(window, cx, format!("Open code failed: {err:#}"));
+                    let message = format!("Open code failed: {err:#}");
+                    let Some(missing) = err.downcast_ref::<NoSshd>() else {
+                        return error_toast(window, cx, message);
+                    };
+                    let container = missing.container.clone();
+                    let action: Rc<dyn Fn(&mut Window, &mut App)> = Rc::new(move |window, cx| {
+                        install_sshd_in(container.clone(), window, cx);
+                    });
+                    error_toast_with_action(
+                        window,
+                        cx,
+                        message,
+                        Some(("Install OpenSSH in the container".into(), action)),
+                    );
                 });
             }
+        })
+        .detach();
+}
+
+/// Install OpenSSH in `container` off the UI thread, and say how it went.
+fn install_sshd_in(container: String, window: &mut Window, cx: &mut App) {
+    info_toast(window, cx, "Installing OpenSSH in the container…");
+    let task = cx.background_spawn(async move { install_sshd(&container) });
+    window
+        .spawn(cx, async move |cx| {
+            let result = task.await;
+            let _ = cx.update(|window, cx| match result {
+                Ok(()) => info_toast(window, cx, "OpenSSH installed. Open the code again."),
+                Err(err) => error_toast(window, cx, format!("{err:#}")),
+            });
         })
         .detach();
 }

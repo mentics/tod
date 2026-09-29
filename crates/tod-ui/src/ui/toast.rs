@@ -50,6 +50,17 @@ pub fn notification_overlay(window: &mut Window, cx: &mut App) -> Option<impl In
 
 /// Prominent red error banner in the top-right corner.
 pub fn error_toast(window: &mut Window, cx: &mut App, message: impl Into<SharedString>) {
+    error_toast_with_action(window, cx, message, None);
+}
+
+/// [`error_toast`] with a button under the message that runs `action`
+/// (its label, and what it does) and dismisses the banner.
+pub fn error_toast_with_action(
+    window: &mut Window,
+    cx: &mut App,
+    message: impl Into<SharedString>,
+    action: Option<(SharedString, Rc<dyn Fn(&mut Window, &mut App)>)>,
+) {
     let message = message.into();
     window.push_notification(
         Notification::new()
@@ -75,11 +86,25 @@ pub fn error_toast(window: &mut Window, cx: &mut App, message: impl Into<SharedS
                         // Leave the top-right corner clear: the notification
                         // wrapper draws its own close button there on hover,
                         // so this banner must not add a second one.
-                        div().flex_1().min_w_0().pr_5().child(
-                            selectable_text("error-banner-text", message.clone(), window, cx)
-                                .text_sm()
-                                .text_color(gpui::white()),
-                        ),
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .pr_5()
+                            .child(
+                                selectable_text("error-banner-text", message.clone(), window, cx)
+                                    .text_sm()
+                                    .text_color(gpui::white()),
+                            )
+                            .children(action.clone().map(|(label, run)| {
+                                div().mt_2().child(
+                                    Button::new("error-banner-action").label(label).on_click(
+                                        cx.listener(move |note, _, window, cx| {
+                                            note.dismiss(window, cx);
+                                            run(window, cx);
+                                        }),
+                                    ),
+                                )
+                            })),
                     )
                     .into_any_element()
             }),

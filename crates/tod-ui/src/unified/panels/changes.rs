@@ -20,6 +20,8 @@ use gpui::{
     IntoElement, MouseButton, ParentElement, Render, SharedString, StatefulInteractiveElement,
     Styled, WeakEntity, Window, div,
 };
+use gpui_component::Disableable;
+use gpui_component::button::Button;
 use tod_store::fleet::FleetStore;
 use tod_store::fleet::changes::{BranchChanges, ChangesTrigger, changes_trigger, node_branch_changes};
 use uuid::Uuid;
@@ -168,6 +170,10 @@ pub struct ChangesPanel {
     watch: ChangesWatch,
     /// The last open-in-editor failure, shown under the list.
     open_error: Option<String>,
+    /// Set when the failure was a container with no OpenSSH server, which
+    /// the button under the error installs.
+    sshd_missing: Option<String>,
+    installing_sshd: bool,
     focus_handle: FocusHandle,
 }
 
@@ -185,6 +191,8 @@ impl ChangesPanel {
             fleet,
             watch,
             open_error: None,
+            sshd_missing: None,
+            installing_sshd: false,
             focus_handle: cx.focus_handle(),
         };
         ChangesWatch::recompute(&mut this, node_id, cx);
@@ -199,6 +207,7 @@ impl ChangesPanel {
         let dir = changes.dir.clone();
         let fleet = self.fleet.clone();
         self.open_error = None;
+        self.sshd_missing = None;
         cx.spawn(async move |this, cx: &mut AsyncApp| {
             let result = cx
                 .background_executor()
@@ -208,6 +217,9 @@ impl ChangesPanel {
                 .await;
             if let Err(err) = result {
                 let _ = this.update(cx, |this: &mut ChangesPanel, cx| {
+                    this.sshd_missing = err
+                        .downcast_ref::<tod_agent::devcontainer::NoSshd>()
+                        .map(|missing| missing.container.clone());
                     this.open_error = Some(format!("{err:#}"));
                     cx.notify();
                 });
@@ -215,6 +227,34 @@ impl ChangesPanel {
         })
         .detach();
         cx.notify();
+    }
+
+    /// Install OpenSSH in the container, off the UI thread, then reopen
+    /// nothing: the user clicks the file again.
+    fn install_sshd(&mut self, container: String, cx: &mut Context<Self>) {
+        if self.installing_sshd {
+            return;
+        }
+        self.installing_sshd = true;
+        cx.notify();
+        cx.spawn(async move |this, cx: &mut AsyncApp| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { tod_agent::devcontainer::install_sshd(&container) })
+                .await;
+            let _ = this.update(cx, |this: &mut ChangesPanel, cx| {
+                this.installing_sshd = false;
+                match result {
+                    Ok(()) => {
+                        this.sshd_missing = None;
+                        this.open_error = Some("OpenSSH installed. Open the file again.".into());
+                    }
+                    Err(err) => this.open_error = Some(format!("{err:#}")),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 }
 
@@ -292,6 +332,21 @@ impl Render for ChangesPanel {
                     window,
                     cx,
                 ))
+            }))
+            .children(self.sshd_missing.clone().map(|container| {
+                let installing = self.installing_sshd;
+                div().mt_2().child(
+                    Button::new("unified-changes-install-sshd")
+                        .label(if installing {
+                            "Installing OpenSSH…"
+                        } else {
+                            "Install OpenSSH in the container"
+                        })
+                        .disabled(installing)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.install_sshd(container.clone(), cx);
+                        })),
+                )
             }))
     }
 }
