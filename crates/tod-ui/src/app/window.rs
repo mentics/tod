@@ -370,6 +370,30 @@ impl Shell {
         cx.notify();
     }
 
+    /// Keyboard actions reach the shell only through the focused element's
+    /// ancestors. When the focused element is removed (a button in a panel
+    /// that a click replaced, say) nothing is focused and every shortcut,
+    /// Alt+Left included, goes nowhere until the user clicks something.
+    /// Put focus back on the active view when that happens.
+    fn restore_lost_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if window.focused(cx).is_some() || !window.is_window_active() {
+            return;
+        }
+        match self.active_view {
+            ShellView::Tasks => self.task_list.read(cx).focus_handle(cx).focus(window, cx),
+            ShellView::Interview => self
+                .sessions
+                .update(cx, |sessions, cx| sessions.focus(window, cx)),
+            ShellView::Conversation => self.conversation.read(cx).focus_handle(cx).focus(window, cx),
+            ShellView::Settings => self.settings.read(cx).focus_handle(cx).focus(window, cx),
+            ShellView::Database => self.database.read(cx).focus_handle(cx).focus(window, cx),
+            ShellView::PullRequests => self.pull_requests.read(cx).focus_handle(cx).focus(window, cx),
+            ShellView::Unified => self
+                .unified
+                .update(cx, |unified, cx| unified.restore_focus(window, cx)),
+        }
+    }
+
     fn queue_open_interview(
         &mut self,
         task_id: String,
@@ -1324,6 +1348,7 @@ impl Render for Shell {
         self.drain_pending_error_toast(window, cx);
         crate::ui::agent_permission::drain_queued_requests(window, cx);
         self.note_location(cx);
+        self.restore_lost_focus(window, cx);
 
         div()
             .v_flex()

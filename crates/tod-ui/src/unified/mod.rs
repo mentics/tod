@@ -964,6 +964,12 @@ impl UnifiedView {
         self.sync_window_focus(window, cx);
     }
 
+    /// Give focus back to the focused column (or the tree) after whatever
+    /// held it went away, so key bindings still reach the shell.
+    pub fn restore_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.sync_window_focus(window, cx);
+    }
+
     fn sync_window_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         match self.columns.focused_index() {
             Some(ix) => {
