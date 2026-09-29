@@ -4,7 +4,7 @@
 //! manifest). Both are formatting-only and have no callers outside the mock
 //! provider, which simulates the files a real agent writes to a scratchpad.
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 /// Normalize a path for durable storage (strip Windows `\?\` prefix when present).
 pub fn path_for_storage(path: &Path) -> String {
@@ -18,13 +18,60 @@ pub fn path_for_storage(path: &Path) -> String {
     raw.into_owned()
 }
 
-/// Best-effort absolute form; falls back to the input when canonicalization fails.
+/// Absolute form with `.`/`..` resolved and the deepest existing ancestor
+/// canonicalized, so a file that does not exist yet (one about to be written)
+/// normalizes the same way as the directory it will be created in. Windows'
+/// verbatim `\\?\` prefix is dropped, so both forms of a path compare equal.
 pub fn normalize_absolute(path: &Path) -> std::io::Result<PathBuf> {
-    match std::fs::canonicalize(path) {
-        Ok(p) => Ok(p),
-        Err(_) if path.is_absolute() => Ok(path.to_path_buf()),
-        Err(err) => Err(err),
+    let mut lexical = PathBuf::new();
+    for part in path.components() {
+        match part {
+            Component::ParentDir => {
+                lexical.pop();
+            }
+            Component::CurDir => {}
+            other => lexical.push(other.as_os_str()),
+        }
     }
+    if !lexical.is_absolute() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "path is not absolute",
+        ));
+    }
+    // Canonicalize the longest existing prefix (resolving symlinks), then put
+    // the not-yet-existing tail back.
+    let mut tail = Vec::new();
+    let mut existing = lexical.as_path();
+    let base = loop {
+        if let Ok(canonical) = std::fs::canonicalize(existing) {
+            break canonical;
+        }
+        match (existing.parent(), existing.file_name()) {
+            (Some(parent), Some(name)) => {
+                tail.push(name.to_os_string());
+                existing = parent;
+            }
+            _ => break existing.to_path_buf(),
+        }
+    };
+    let mut resolved = strip_verbatim_prefix(base);
+    resolved.extend(tail.iter().rev());
+    Ok(resolved)
+}
+
+fn strip_verbatim_prefix(path: PathBuf) -> PathBuf {
+    #[cfg(windows)]
+    {
+        if let Some(rest) = path.to_str().and_then(|s| s.strip_prefix(r"\\?\")) {
+            // `\\?\UNC\server\share` is `\\server\share`.
+            return match rest.strip_prefix(r"UNC\") {
+                Some(unc) => PathBuf::from(format!(r"\\{unc}")),
+                None => PathBuf::from(rest),
+            };
+        }
+    }
+    path
 }
 
 /// True when `path` resolves under `root` (both normalized to absolute paths).
@@ -32,7 +79,27 @@ pub fn path_is_under(root: &Path, path: &Path) -> bool {
     let (Ok(root), Ok(path)) = (normalize_absolute(root), normalize_absolute(path)) else {
         return false;
     };
+    if cfg!(windows) {
+        // Windows paths are case-insensitive.
+        let lower = |p: &Path| PathBuf::from(p.to_string_lossy().to_lowercase());
+        return lower(&path).starts_with(lower(&root));
+    }
     path.starts_with(root)
+}
+
+#[cfg(test)]
+mod path_tests {
+    use super::*;
+
+    #[test]
+    fn a_file_not_yet_written_is_under_its_existing_root() {
+        let root = std::env::temp_dir().join(format!("tod-agent-under-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("scratch")).unwrap();
+        assert!(path_is_under(&root, &root.join("scratch").join("new").join("a.md")));
+        assert!(!path_is_under(&root, &root.join("scratch").join("..").join("..").join("x")));
+        assert!(!path_is_under(&root.join("scratch"), &root.join("other.md")));
+        let _ = std::fs::remove_dir_all(root);
+    }
 }
 
 /// Build a transcript filename per the interview SKILL naming rules.
