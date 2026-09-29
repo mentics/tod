@@ -792,6 +792,9 @@ impl TaskListView {
             RowAction::OpenExternal { task_id } => {
                 self.open_external_for(&task_id, cx);
             }
+            RowAction::OpenTicket { task_id } => {
+                self.open_ticket_for(&task_id, cx);
+            }
             RowAction::CycleGeneratorSort { task_id } => {
                 self.cycle_generator_sort(&task_id, window, cx);
             }
@@ -952,6 +955,30 @@ impl TaskListView {
             cx.defer_in(window, |this, window, cx| {
                 this.rebuild_visible_list(window, cx);
             });
+        }
+    }
+
+    /// Opens the ticket id shown on the row, wherever the node came from.
+    fn open_ticket_for(&mut self, task_id: &str, cx: &mut Context<Self>) {
+        let Some(ticket) = self
+            .all_tasks
+            .iter()
+            .find(|t| t.id == task_id)
+            .and_then(|t| t.ticket_id.clone())
+        else {
+            return;
+        };
+        let metadata = uuid::Uuid::parse_str(task_id).ok().and_then(|node_id| {
+            self.fleet
+                .get_extra_content(node_id, tod_store::outline::types::EXTRA_CONTENT_METADATA)
+                .ok()
+                .flatten()
+                .and_then(|json_str| serde_json::from_str::<serde_json::Value>(&json_str).ok())
+        });
+        if let Some(url) =
+            tod_integration::linear_issue_url(metadata.as_ref(), &self.config_dir, &ticket)
+        {
+            cx.open_url(&url);
         }
     }
 
