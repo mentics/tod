@@ -1,6 +1,6 @@
 # State: `verifying`
 
-**Gate:** `verifying` → `review`. The app checks it: every obligation and every `active` and `verifying` plan step is `verified`, and a test run is recorded. An obligation that only a `merged` or `released` step delivers is verified in that phase, not here.
+**Gate:** `verifying` → `review`. The app checks it: every obligation and every `active` and `verifying` plan step is `verified`, and a test run is recorded. An obligation that acts in `merged` or `released`, or that only such a step delivers, is verified in that phase, not here. One that acts in `design` is not ruled on directly: the design obligations that refine it are.
 
 ## First
 

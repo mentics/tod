@@ -76,16 +76,22 @@ pub struct ObligationStanding {
     pub obligation: NodeObligation,
     /// `None` until verification has ruled on it.
     pub verdict: Option<ObligationVerdict>,
-    /// The phase it is verified in: the latest phase of a plan step that
-    /// satisfies it (`PlanStepRepo::obligation_phases`). An obligation only a
-    /// `released` step delivers cannot be checked before the release.
+    /// The phase it is verified in: the later of where the obligation itself
+    /// acts (`NodeObligation::acts_in`) and the latest phase of a plan step
+    /// that satisfies it (`PlanStepRepo::obligation_phases`). An obligation
+    /// only a `released` step delivers cannot be checked before the release.
+    /// `design` for one the design phase carries out: verification does not
+    /// rule on it (see [`Self::due_by`]).
     pub phase: String,
 }
 
 impl ObligationStanding {
-    /// Whether it is owed a verdict by the time its node is in `state`.
+    /// Whether it is owed a verdict by the time its node is in `state`. One
+    /// that acts in `design` never is: the design obligations that carry it
+    /// out are verified instead.
     pub fn due_by(&self, state: &str) -> bool {
-        crate::outline::repos::plan_steps::due_by(&self.phase, state)
+        self.obligation.acts_in != crate::outline::ACTS_IN_DESIGN
+            && crate::outline::repos::plan_steps::due_by(&self.phase, state)
     }
 
     pub fn is_verified(&self) -> bool {
@@ -252,12 +258,15 @@ impl<'a> VerdictRepo<'a> {
         Ok(ObligationRepo::new(self.conn)
             .list_for_node(node_id)?
             .into_iter()
-            .map(|obligation| ObligationStanding {
-                verdict: latest.remove(&obligation.id),
-                phase: phases
+            .map(|obligation| {
+                let by_steps = phases
                     .remove(&obligation.id)
-                    .unwrap_or_else(|| PHASE_ACTIVE.to_string()),
-                obligation,
+                    .unwrap_or_else(|| PHASE_ACTIVE.to_string());
+                ObligationStanding {
+                    verdict: latest.remove(&obligation.id),
+                    phase: later_phase(&obligation.acts_in, by_steps),
+                    obligation,
+                }
             })
             .collect())
     }
@@ -271,6 +280,18 @@ impl<'a> VerdictRepo<'a> {
             .query_map(params![uuid_to_blob(node_id)], map_row)?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+}
+
+/// Where an obligation is verified: the later of where it acts and where its
+/// plan steps are done. One acting in `design` stays there: its steps, if it
+/// has any, do not make it verifiable.
+fn later_phase(acts_in: &str, by_steps: String) -> String {
+    use crate::outline::repos::plan_steps::due_by;
+    if acts_in == crate::outline::ACTS_IN_DESIGN || !due_by(acts_in, &by_steps) {
+        acts_in.to_string()
+    } else {
+        by_steps
     }
 }
 

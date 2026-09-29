@@ -195,6 +195,10 @@ pub enum EntitySnapshot {
         section: Option<String>,
         body: String,
         phase: String,
+        /// Where it is acted on; `active` in snapshots taken before that
+        /// was a field of its own.
+        #[serde(default = "default_acts_in")]
+        acts_in: String,
         ordinal: i32,
         visual_design_path: Option<String>,
     },
@@ -694,4 +698,8 @@ where
 
 fn default_plan_step_phase() -> String {
     crate::outline::repos::plan_steps::PHASE_ACTIVE.to_string()
+}
+
+fn default_acts_in() -> String {
+    crate::outline::ACTS_IN_ACTIVE.to_string()
 }

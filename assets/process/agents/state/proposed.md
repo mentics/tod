@@ -12,6 +12,7 @@ Turn whatever the node says it is for into requirements-phase obligations: the c
 
 - **Inherit, do not duplicate.** Record only node-specific requirements and exceptions. Never copy or paraphrase inherited obligations here.
 - Obligations are in effect as soon as they are written; never ask the user to confirm them.
+- Every obligation you write here is introduced in the requirements phase (`--phase requirements`). Leave where it acts as `active`, unless nothing has to be built for it: one that only needs checking acts in `verifying`, and one only the release can deliver acts in `merged` or `released`.
 - Anything about *how* it gets built stays a requirement as the user said it; design refines it.
 - Never invent product intent. A node with no stated purpose gets a question, not guessed requirements.
 

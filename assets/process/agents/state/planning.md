@@ -1,6 +1,6 @@
 # State: `planning`
 
-**Gate:** `planning` → `ready`. The app checks it: every requirement is traced to a plan step, and the phase is certified. The certificate covers the node's own obligations and its plan steps with their obligation links; any change to them makes it stale.
+**Gate:** `planning` → `ready`. The app checks it: every requirement that acts in `active`, `merged`, or `released` is traced to a plan step, and the phase is certified. The certificate covers the node's own obligations and its plan steps with their obligation links; any change to them makes it stale.
 
 ## Your work
 
@@ -8,7 +8,7 @@
 2. Write the plan yourself with the `plan` noun: a dependency graph of plan steps, not a flat document. Most of a plan follows mechanically from settled obligations; write everything you can determine.
    - Each step is a discrete, well-scoped unit of work, named after the constructions design decided, where any exist.
    - Each step is an **action**, never a check: checking that the steps were done and the obligations hold is what `verifying` and `released` are for, so "verify X" is not a step.
-   - Give each step the **phase** that can actually take it (`plan` noun, `--phase`). Most are `active`: implementation. An action only a later phase can take goes to that phase: `merged` for part of the release (a migration that must precede the deploy, a production setting, a feature flag), `released` for one that needs the release in place (a backfill against production data), `verifying` for an action verification needs beyond checking. Nothing in `active` may need the merge, a deploy, or production: implementation has to finish before any of those happen. An obligation that only a later phase's step delivers is verified in that phase.
+   - Give each step the **phase** that can actually take it (`plan` noun, `--phase`). Most are `active`: implementation. An action only a later phase can take goes to that phase: `merged` for part of the release (a migration that must precede the deploy, a production setting, a feature flag), `released` for one that needs the release in place (a backfill against production data), `verifying` for an action verification needs beyond checking. Nothing in `active` may need the merge, a deploy, or production: implementation has to finish before any of those happen. An obligation that only a later phase's step delivers is verified in that phase, and the obligation says which phase that is (where it acts, `merged` or `released`): give it a step of that phase. An obligation that acts in `verifying` or `design` needs no step.
    - Express ordering only where it is real (`depends-on`). Independent steps get no dependency between them, so they can run in parallel.
    - Link each step to the requirement(s) it delivers (`satisfies`). Its `verified` status later stands in for the check of that link.
    - List assumptions explicitly: as plan steps when they are work, as obligations when they are requirements.

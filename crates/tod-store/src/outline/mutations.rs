@@ -147,6 +147,12 @@ pub enum OutlineMutation {
         obligation_id: Uuid,
         phase: String,
     },
+    /// Change the lifecycle state whose agent acts on an obligation (one of
+    /// `OBLIGATION_ACTS_IN`), apart from the state it was introduced in.
+    UpdateObligationActsIn {
+        obligation_id: Uuid,
+        acts_in: String,
+    },
     /// Bulk-rename every obligation in `node_id`/`kind` whose section is
     /// `old_section` (`None` meaning the implicit "no section" bucket) to
     /// `new_section`.
@@ -407,6 +413,7 @@ impl OutlineMutation {
                 | OutlineMutation::UpdateObligationVisualDesign { .. }
                 | OutlineMutation::UpdateObligationSection { .. }
                 | OutlineMutation::UpdateObligationPhase { .. }
+                | OutlineMutation::UpdateObligationActsIn { .. }
                 | OutlineMutation::RenameObligationSection { .. }
                 | OutlineMutation::DeleteObligation { .. }
                 | OutlineMutation::RestoreObligation { .. }
@@ -627,6 +634,13 @@ impl OutlineMutation {
             } => {
                 let phase = parse_obligation_phase(phase, true)?;
                 ObligationRepo::new(conn).update_phase(*obligation_id, phase)?;
+            }
+            OutlineMutation::UpdateObligationActsIn {
+                obligation_id,
+                acts_in,
+            } => {
+                let acts_in = parse_obligation_acts_in(acts_in)?;
+                ObligationRepo::new(conn).update_acts_in(*obligation_id, acts_in)?;
             }
             OutlineMutation::RenameObligationSection {
                 node_id,
@@ -1065,6 +1079,7 @@ fn restore_obligation_row(
         section,
         body,
         phase,
+        acts_in,
         ordinal,
         visual_design_path,
     } = snapshot
@@ -1090,6 +1105,7 @@ fn restore_obligation_row(
         body,
         phase,
     )?;
+    repo.update_acts_in(id, acts_in)?;
     if visual_design_path.is_some() {
         repo.update_visual_design_path(id, visual_design_path.as_deref())?;
     }
@@ -1274,9 +1290,20 @@ fn parse_obligation_phase(phase: &str, allow_unknown: bool) -> Result<&'static s
         }
         Some(p) => Ok(*p),
         None => {
-            anyhow::bail!("unknown phase `{phase}` (expected requirements|design|verification)")
+            anyhow::bail!("unknown phase `{phase}` (expected requirements|design)")
         }
     }
+}
+
+/// Validate where an obligation is acted on.
+fn parse_obligation_acts_in(acts_in: &str) -> Result<&'static str> {
+    crate::outline::OBLIGATION_ACTS_IN
+        .iter()
+        .find(|a| **a == acts_in)
+        .copied()
+        .with_context(|| {
+            format!("unknown acts_in `{acts_in}` (expected design|active|verifying|merged|released)")
+        })
 }
 
 fn parse_extra_content_type(content_type: &str) -> Result<&'static str> {

@@ -248,14 +248,17 @@ fn implementation_setup_outcome(conn: &Connection, node_id: Uuid) -> Result<Deri
     })
 }
 
-/// Every requirement of the node is satisfied by at least one of its plan
-/// steps. A requirement added after planning (say, in a conversation) has no
-/// step yet, so this is what sends the node back through planning for it.
+/// Every requirement of the node that plan steps deliver is satisfied by at
+/// least one of them. A requirement added after planning (say, in a
+/// conversation) has no step yet, so this is what sends the node back through
+/// planning for it. Which requirements those are is their `acts_in`: one that
+/// acts in `design` is carried out by design obligations and one that acts in
+/// `verifying` only needs checking (`NodeObligation::needs_plan_step`).
 fn requirements_traceable_outcome(conn: &Connection, node_id: Uuid) -> Result<DerivedOutcome> {
     let requirements: Vec<_> = ObligationRepo::new(conn)
         .list_for_node(node_id)?
         .into_iter()
-        .filter(|o| o.kind == KIND_REQUIREMENT)
+        .filter(|o| o.kind == KIND_REQUIREMENT && o.needs_plan_step())
         .collect();
     let steps = PlanStepRepo::new(conn);
     let mut unplanned = Vec::new();
@@ -326,12 +329,6 @@ fn plan_verified_outcome(conn: &Connection, node_id: Uuid, state: &str) -> Resul
         .into_iter()
         .filter(|s| s.due_by(state))
         .collect();
-    if state != "verifying" && !steps.iter().any(|s| s.phase == state) {
-        return Ok(DerivedOutcome {
-            outcome: OUTCOME_PASS,
-            detail: format!("No plan steps belong to the {state} phase."),
-        });
-    }
     let owed_obligations: Vec<String> = if state == "verifying" {
         Vec::new()
     } else {
@@ -342,7 +339,18 @@ fn plan_verified_outcome(conn: &Connection, node_id: Uuid, state: &str) -> Resul
             .map(|s| format!("[{}] {}", short_id(s.obligation.id), s.obligation.body))
             .collect()
     };
-    if steps.is_empty() {
+    // Steps and obligations of a later phase are the exception: a node with
+    // neither in this one has nothing to do here.
+    if state != "verifying"
+        && owed_obligations.is_empty()
+        && !steps.iter().any(|s| s.phase == state)
+    {
+        return Ok(DerivedOutcome {
+            outcome: OUTCOME_PASS,
+            detail: format!("Nothing belongs to the {state} phase."),
+        });
+    }
+    if state == "verifying" && steps.is_empty() {
         return Ok(fail(
             "This node has no plan steps, so nothing traces to a verified step.",
         ));
@@ -787,6 +795,66 @@ mod tests {
 
     /// Verified steps are not enough: each obligation has to have been
     /// exercised and found to hold, and reimplementing reopens it.
+    /// Where an obligation acts, not where it was introduced, decides what the
+    /// gates ask of it.
+    #[test]
+    fn gates_follow_where_an_obligation_acts() {
+        let (store, node) = store_with_node();
+        enable(&store, node, vec![Capability::Spec]);
+        let add = |body: &str, acts_in: &str| {
+            let id = Uuid::new_v4();
+            store
+                .enqueue_outline(OutlineMutation::CreateObligation {
+                    obligation_id: Some(id),
+                    node_id: node,
+                    kind: "requirement".into(),
+                    after_id: None,
+                    before: false,
+                    section: None,
+                    body: body.into(),
+                    phase: "requirements".into(),
+                })
+                .unwrap();
+            store
+                .enqueue_outline(OutlineMutation::UpdateObligationActsIn {
+                    obligation_id: id,
+                    acts_in: acts_in.into(),
+                })
+                .unwrap();
+            store.writer().flush().unwrap();
+            id
+        };
+        let trace = PLANNING_READY_REQUIREMENTS_TRACEABLE_SLUG;
+        let verified = VERIFYING_REVIEW_OBLIGATIONS_VERIFIED_SLUG;
+
+        // Only checked, or carried out by the design work: no step delivers
+        // them, and design ones are not ruled on directly.
+        add("Watch the sync under load", "verifying");
+        add("Sync is reliable", "design");
+        let outcome = evaluate(&store, node, trace).unwrap();
+        assert_eq!(outcome.outcome, OUTCOME_PASS, "{}", outcome.detail);
+        let outcome = evaluate(&store, node, verified).unwrap();
+        assert_eq!(outcome.outcome, OUTCOME_FAIL, "the verifying one is owed");
+        assert!(outcome.detail.contains("1 not verified yet"), "{}", outcome.detail);
+
+        // One that acts in `released` waits for the release, and needs a step.
+        let released = add("Backfill ran in prod", "released");
+        let outcome = evaluate(&store, node, trace).unwrap();
+        assert_eq!(outcome.outcome, OUTCOME_FAIL, "{}", outcome.detail);
+        assert!(outcome.detail.contains("Backfill ran in prod"), "{}", outcome.detail);
+        let outcome = evaluate(&store, node, verified).unwrap();
+        assert!(outcome.detail.contains("1 not verified yet"), "{}", outcome.detail);
+        let outcome = evaluate(&store, node, RELEASED_LEARN_PLAN_VERIFIED_SLUG).unwrap();
+        assert_eq!(outcome.outcome, OUTCOME_FAIL, "owed in the released phase");
+        assert!(outcome.detail.contains("Backfill ran in prod"), "{}", outcome.detail);
+
+        // Acting in `active` is the default and is traced like before.
+        let built = add("Tickets sync", "active");
+        let outcome = evaluate(&store, node, trace).unwrap();
+        assert!(outcome.detail.contains("Tickets sync"), "{}", outcome.detail);
+        let _ = (released, built);
+    }
+
     #[test]
     fn verification_passes_only_when_every_obligation_is_verified() {
         let slug = VERIFYING_REVIEW_OBLIGATIONS_VERIFIED_SLUG;

@@ -32,7 +32,9 @@ pub use repos::gate::{
     PR_APPROVED_MERGEABLE_SLUG, RELEASED_LEARN_PHASE_CERTIFIED_SLUG, phase_certified_slug,
 };
 pub use repos::obligations::{
-    KIND_CONSTRAINT, KIND_REQUIREMENT, NodeObligation, ObligationCounts, ObligationRepo,
+    ACTS_IN_ACTIVE, ACTS_IN_DESIGN, ACTS_IN_MERGED, ACTS_IN_RELEASED, ACTS_IN_VERIFYING,
+    KIND_CONSTRAINT, KIND_REQUIREMENT, NodeObligation, OBLIGATION_ACTS_IN, ObligationCounts,
+    ObligationRepo,
 };
 pub use repos::NodeSummary;
 pub use repos::plan_steps::{PLAN_STEP_PHASES, PLAN_STEP_STATUSES, PlanStep, PlanStepRepo};

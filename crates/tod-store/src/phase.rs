@@ -155,6 +155,18 @@ struct InObligation {
     id: Uuid,
     kind: String,
     body: String,
+    /// Left out for `active`, so certificates taken before obligations had
+    /// this keep their digest.
+    #[serde(default = "acts_in_active", skip_serializing_if = "is_acts_in_active")]
+    acts_in: String,
+}
+
+fn acts_in_active() -> String {
+    crate::outline::ACTS_IN_ACTIVE.to_string()
+}
+
+fn is_acts_in_active(acts_in: &str) -> bool {
+    acts_in == crate::outline::ACTS_IN_ACTIVE
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -273,7 +285,7 @@ pub fn digest(inputs: &Value) -> String {
 
 fn obligations(conn: &Connection, node_id: Uuid) -> Result<Vec<InObligation>> {
     let mut stmt = conn.prepare(
-        "SELECT id, kind, body FROM node_obligations WHERE node_id = ?1 ORDER BY id",
+        "SELECT id, kind, body, acts_in FROM node_obligations WHERE node_id = ?1 ORDER BY id",
     )?;
     let rows = stmt
         .query_map(params![uuid_to_blob(node_id)], |row| {
@@ -281,6 +293,7 @@ fn obligations(conn: &Connection, node_id: Uuid) -> Result<Vec<InObligation>> {
                 id: blob_to_uuid_sql(&row.get::<_, Vec<u8>>(0)?)?,
                 kind: row.get(1)?,
                 body: row.get(2)?,
+                acts_in: row.get(3)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -403,6 +416,8 @@ pub fn describe_changes(before: &Value, after: &Value) -> Vec<String> {
         |a, b| {
             if a.kind != b.kind {
                 "changed kind"
+            } else if a.acts_in != b.acts_in {
+                "changed where it is acted on"
             } else {
                 "reworded"
             }

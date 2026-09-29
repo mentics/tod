@@ -149,6 +149,17 @@ pub fn regression(conn: &Connection, node_id: Uuid) -> Result<Option<Regression>
                         o.body
                     ),
                 )),
+                Some(o) if o.acts_in != before.acts_in => findings.push((
+                    "planning",
+                    format!(
+                        "{} [{}] moved from acting in {} to {}: {}",
+                        capitalized(&o.kind),
+                        short_id(o.id),
+                        before.acts_in,
+                        o.acts_in,
+                        o.body
+                    ),
+                )),
                 Some(_) => {}
             }
         }

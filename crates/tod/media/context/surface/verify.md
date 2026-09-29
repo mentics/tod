@@ -52,8 +52,10 @@ Work in this order:
    the obligation and fail that. The app sends you back until this is so.
 
 If verifying shows the work must also do something no obligation states, you
-may add it as an obligation. Give it `--phase verification`: it is a check you
-found, not a requirement or design decision the user made.
+may add it as an obligation. It is a design obligation (`--phase design`), not
+a requirement the user made. If the work must be changed to meet it, leave
+where it acts as `active`, so it gets a plan step; if it only needs checking,
+set `--acts-in verifying` and record its verdict now.
 
 The app reads the verdicts and the plan steps, not your reply — a finding
 that is only in your reply is lost. A `failed` step's note is what the

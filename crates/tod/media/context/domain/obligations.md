@@ -38,17 +38,35 @@ steps here, look the node up by its slug and list its obligations with
 `tod-cli`.
 
 
-## Phase
+## Two phases
 
-Every obligation belongs to one phase, the one whose work it belongs to, and
-the app shows it beside the obligation. Choose it when you add one:
+Every obligation carries two lifecycle states. They answer different
+questions and are set separately; the app shows both.
 
-- `requirements` — what the work must achieve, from the user's point of view.
-- `design` — how it is to look or be built: interface, structure, technology.
-- `verification` — a check on the finished work that the requirements and
-  design did not already state: something you found while verifying that the
-  running work must also do. It is not a restatement of a requirement; a
-  requirement you are verifying keeps its own phase.
+- **Introduced in** (`phase`): the state whose work wrote it. Always
+  `requirements` (written while the node is `proposed`: what the user wants,
+  high level) or `design` (written in `design`, or later when verification or
+  review turns up something the spec left out: how it is to be built and what
+  the work must do). It records where the obligation came from and is not
+  changed to say where it is acted on. A design obligation refines the requirements
+  it is written for.
+- **Acts in** (`acts_in`): the state whose agent takes action on it, which is
+  what the gates count. It is one of `design`, `active`, `verifying`, `merged`,
+  or `released`.
+  - `active` (the default, and nearly always right): the work is built, so it
+    needs a plan step and a verdict.
+  - `verifying`: it needs no building, only checking, because the
+    obligation is known in advance to be tricky and must not be missed. It
+    needs no plan step; verification rules on it.
+  - `merged`, `released`: only that phase can deliver it (a migration that must
+    precede the deploy; a backfill against production). It needs a plan step of
+    that phase, and is verified by that phase rather than by `verifying`.
+  - `design`: a high-level obligation that the design phase carries out through
+    design obligations that refine it. No plan step delivers it and
+    verification does not rule on it; the design obligations that refine it are
+    what get built and verified. Use it only when refining obligations exist.
 
-Do not default to `requirements`. If you cannot say which phase it is, it is
-probably not an obligation yet.
+Set `--phase` to the state you are working in. Set `--acts-in` only when it is
+not `active`. Do not leave it `active` for something no plan step can build
+(an obligation to check a thing, or one only a later phase can deliver): it
+will fail the planning trace, or wait for a step that cannot exist.
