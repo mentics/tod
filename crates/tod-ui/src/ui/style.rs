@@ -57,6 +57,12 @@ pub mod color {
     pub fn link() -> Hsla {
         hex(0xfafafaff)
     }
+    pub fn link_external() -> Hsla {
+        hex(0xbfdbfeff)
+    }
+    pub fn link_external_hover() -> Hsla {
+        hex(0x93c5fdff)
+    }
     pub fn toggle_on_fill() -> Hsla {
         hex(0x1d4ed8ff)
     }
@@ -270,6 +276,16 @@ pub fn text_error<E: Styled>(el: E) -> E {
 /// `styles.text-link`.
 pub fn text_link<E: Styled>(el: E) -> E {
     text(el).text_color(color::link())
+}
+
+/// `styles.text-link-external`: underlined, blue-tinted, pointer cursor, with
+/// `states.hover-link-external`. Needs an element id for the hover state.
+pub fn text_link_external<E: Styled + gpui::StatefulInteractiveElement>(el: E) -> E {
+    text(el)
+        .text_color(color::link_external())
+        .underline()
+        .cursor_pointer()
+        .hover(|s| s.text_color(color::link_external_hover()))
 }
 
 /// `styles.empty-message`: muted text, centered.

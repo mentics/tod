@@ -46,6 +46,15 @@ styles:
   text-link:
     extends: text
     color: link
+  # Anything that opens in the browser when clicked (a ticket id, a pull
+  # request). Underlined, not marked with an icon, which costs more space;
+  # tinted slightly blue; pointer cursor on hover.
+  text-link-external:
+    extends: text
+    color: link-external
+    text-decoration: underline
+    cursor: pointer
+    hover: hover-link-external
 
   # Buttons
   button:
@@ -413,6 +422,8 @@ states:
   column-focused:
     background: highlight-faint
     border-top: highlight-edge
+  hover-link-external:
+    color: link-external-hover
   disabled:
     color: text-muted
   toggle-on:
@@ -460,6 +471,8 @@ properties:
   selected: state
   focused: state
   font-weight: "regular | semibold"
+  text-decoration: "underline"
+  cursor: "pointer (the hand shown over anything clickable that is not a button)"
   dragging: state
 
 tokens:
@@ -515,6 +528,9 @@ tokens:
     toggle-on-edge: "#93c5fd"
     accent: "#1d4ed88c"
     link: "#fafafa"
+    # A light blue tint, subtle: still reads as text.
+    link-external: "#bfdbfe"
+    link-external-hover: "#93c5fd"
     drag-edge: "#fafafaa6"
     scrim: "#00000073"
   font:
