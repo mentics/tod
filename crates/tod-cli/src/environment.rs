@@ -39,6 +39,7 @@ which hosts it is for. Variables show their values; secrets never do.
 `request` is how you ask the user for a credential you need and lack: it adds
 the secret to this node's environment, unset, and asks the user to provide it
 with --why saying what for. Use a --preset when one fits the service.
+A secret needs a host (from the preset, or --host): without one it is refused.
 `add-secret` and `set-variable` define an entry on the node (Environment must
 be enabled there). `set-secret` stores a secret's value, from stdin when VALUE
 is omitted so it stays out of shell history; it is the user's to run, not

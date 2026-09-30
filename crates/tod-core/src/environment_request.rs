@@ -125,6 +125,11 @@ pub fn answer_message(name: &str, provided: bool) -> String {
     }
 }
 
+/// What Retry says when the credential is still not stored.
+pub fn still_unset_message(name: &str) -> String {
+    format!("`{name}` is still not set. Enter its value (Save), or set it in the Environment editor, then Retry.")
+}
+
 /// Whether an answered request was a yes.
 pub fn was_provided(decision: &Decision, option: Option<i64>) -> bool {
     option
@@ -155,5 +160,6 @@ mod tests {
         assert!(answer_message("gb", true).contains("now set"));
         assert!(answer_message("gb", true).contains("Retry"));
         assert!(answer_message("gb", false).contains("cannot provide"));
+        assert!(still_unset_message("gb").contains("still not set"));
     }
 }

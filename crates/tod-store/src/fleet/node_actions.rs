@@ -616,6 +616,7 @@ mod tests {
             tree.store.writer().flush().unwrap();
         };
         let mut gb = Entry::secret("growthbook");
+        gb.hosts = vec!["api.growthbook.io".into()];
         gb.description = Some("prod flags".into());
         set(tree.grandparent, vec![gb, Entry::variable("region", "eu")]);
         // The child redefines `region` and, with the parent lacking the

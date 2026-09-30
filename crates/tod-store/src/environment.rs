@@ -194,6 +194,9 @@ impl Entry {
             }
             _ => {}
         }
+        if self.kind == EntryKind::Secret && self.hosts.is_empty() {
+            bail!("a credential needs the host it is used with, e.g. api.example.com");
+        }
         for host in &self.hosts {
             if host.trim().is_empty() || host.contains(['*', '/', ' ']) {
                 bail!("{host:?} is not an exact host name (no wildcards, paths, or spaces)");
@@ -257,8 +260,13 @@ pub fn entries(conn: &Connection, node_id: Uuid) -> Result<Vec<Entry>> {
 /// Replace the entries on `node_id`. Validates each and rejects duplicates.
 pub fn set_entries(conn: &Connection, node_id: Uuid, list: &[Entry]) -> Result<()> {
     let mut seen = std::collections::HashSet::new();
+    // An entry stored before a rule existed stays as it is (it shows as
+    // invalid) rather than blocking changes to the others.
+    let stored = entries(conn, node_id).unwrap_or_default();
     for entry in list {
-        entry.validate()?;
+        if !stored.contains(entry) {
+            entry.validate()?;
+        }
         if !seen.insert(entry.name.to_ascii_lowercase()) {
             bail!("{} is defined twice on this node", entry.name);
         }
@@ -306,33 +314,33 @@ impl Resolved {
     }
 }
 
-/// The node's Environment for a cloud sandbox: secrets with hosts become
-/// proxy credentials (the agent never has the value); variables and
-/// host-less secrets are returned as environment pairs. Unset secrets are
-/// left out. Reads the credential store: never on the UI thread.
+/// The node's credentials for a cloud sandbox's proxy: secrets with hosts
+/// (the agent never has the value). Variables reach agents through the
+/// Environment context block, never the sandbox's environment. Unset and
+/// host-less (invalid) secrets are left out. Reads the credential store:
+/// never on the UI thread.
 pub fn sandbox_credentials(
     conn: &Connection,
     creds: &CredentialStore,
     node: Uuid,
-) -> Result<(Vec<tod_sandbox::node::CustomCredential>, Vec<(String, String)>)> {
-    let (mut custom, mut env) = (Vec::new(), Vec::new());
+) -> Result<Vec<tod_sandbox::node::CustomCredential>> {
+    let mut custom = Vec::new();
     for r in resolve(conn, node)? {
-        let Some(value) = r.value(creds) else { continue };
         let e = &r.entry;
-        if e.kind == EntryKind::Secret && e.proxied() {
-            let (header, template) = e.proxy_header();
-            custom.push(tod_sandbox::node::CustomCredential {
-                name: e.name.clone(),
-                hosts: e.hosts.clone(),
-                header,
-                template,
-                secret_value: e.auth.proxy_secret(&value),
-            });
-        } else {
-            env.push((e.env_name().to_string(), value));
+        if !e.proxied() {
+            continue;
         }
+        let Some(value) = r.value(creds) else { continue };
+        let (header, template) = e.proxy_header();
+        custom.push(tod_sandbox::node::CustomCredential {
+            name: e.name.clone(),
+            hosts: e.hosts.clone(),
+            header,
+            template,
+            secret_value: e.auth.proxy_secret(&value),
+        });
     }
-    Ok((custom, env))
+    Ok(custom)
 }
 
 /// Remove a secret's stored value (when its entry is removed or renamed).
@@ -362,14 +370,20 @@ mod tests {
 
     #[test]
     fn validation() {
-        assert!(Entry::secret("gb").validate().is_ok());
-        assert!(Entry::secret("bad name").validate().is_err());
-        assert!(Entry::secret("tod_thing").validate().is_err(), "TOD_ is reserved");
+        assert!(Entry::secret("gb").validate().is_err(), "a secret needs a host");
+        let with_host = |name: &str| {
+            let mut e = Entry::secret(name);
+            e.hosts = vec!["api.example.com".into()];
+            e
+        };
+        assert!(with_host("gb").validate().is_ok());
+        assert!(with_host("bad name").validate().is_err());
+        assert!(with_host("tod_thing").validate().is_err(), "TOD_ is reserved");
         assert!(Entry::variable("host", "x").validate().is_ok());
         let mut v = Entry::variable("host", "x");
         v.value = None;
         assert!(v.validate().is_err());
-        let mut s = Entry::secret("gb");
+        let mut s = with_host("gb");
         s.value = Some("leak".into());
         assert!(s.validate().is_err(), "a secret never carries its value");
         s.value = None;
@@ -377,6 +391,31 @@ mod tests {
         assert!(s.validate().is_err(), "no wildcards");
         s.hosts = vec!["api.example.com".into()];
         assert!(s.validate().is_ok() && s.proxied());
+    }
+
+    #[test]
+    fn a_hostless_secret_stored_earlier_loads_and_does_not_block_other_changes() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = OFF; CREATE TABLE nodes (id BLOB PRIMARY KEY);").unwrap();
+        conn.execute_batch(CREATE_TABLE).unwrap();
+        let node = Uuid::new_v4();
+        let old = Entry::secret("old");
+        conn.execute(
+            "INSERT INTO node_environment (node_id, entries, updated_at) VALUES (?1, ?2, 0)",
+            params![uuid_to_blob(node), serde_json::to_string(&[&old]).unwrap()],
+        )
+        .unwrap();
+        let loaded = entries(&conn, node).unwrap();
+        assert_eq!(loaded, [old.clone()]);
+        assert!(loaded[0].validate().is_err(), "shown as invalid");
+        assert!(!loaded[0].proxied(), "never given to a sandbox");
+        let mut list = loaded;
+        list.push(Entry::variable("region", "eu"));
+        set_entries(&conn, node, &list).unwrap();
+        let mut changed = Entry::secret("new");
+        changed.hosts.clear();
+        list.push(changed);
+        assert!(set_entries(&conn, node, &list).is_err(), "a new host-less secret is refused");
     }
 
     #[test]

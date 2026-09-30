@@ -70,10 +70,6 @@ pub struct NodeCredentials {
     pub claude_oauth_token: Option<String>,
     /// Credentials the user defined in the node's Environment, with hosts.
     pub custom: Vec<CustomCredential>,
-    /// Environment variables for the supervisor and so the agent: the node's
-    /// variables, and its host-less secrets (which the agent can therefore
-    /// read; the Environment editor warns about that).
-    pub env: Vec<(String, String)>,
 }
 
 /// The label a node sandbox carries with [`env_fingerprint`] of the custom
@@ -224,7 +220,6 @@ pub fn supervisor_env(creds: &NodeCredentials, claude_via: ClaudeTokenVia) -> Ve
     if let (ClaudeTokenVia::Env, Some(token)) = (claude_via, claude_token(creds)) {
         out.push((CLAUDE_TOKEN_ENV.to_string(), token.to_string()));
     }
-    out.extend(creds.env.iter().cloned());
     out
 }
 
@@ -736,7 +731,6 @@ mod tests {
             blaxel_token: "bl_z".into(),
             claude_oauth_token: Some("sk-ant-oat01-real".into()),
             custom: Vec::new(),
-            env: Vec::new(),
         }
     }
 
@@ -932,7 +926,7 @@ mod tests {
     }
 
     #[test]
-    fn custom_credentials_become_proxy_rules_and_variables_reach_the_supervisor() {
+    fn custom_credentials_become_proxy_rules_and_nothing_reaches_the_supervisor() {
         let creds = NodeCredentials {
             custom: vec![CustomCredential {
                 name: "grow-book".into(),
@@ -941,7 +935,6 @@ mod tests {
                 template: "Bearer {value}".into(),
                 secret_value: "gb_secret".into(),
             }],
-            env: vec![("GROWTHBOOK_HOST".into(), "https://gb.example.com".into())],
             ..creds()
         };
         let rules = proxy_rules(&creds, "orch.example", ClaudeTokenVia::Proxy);
@@ -950,7 +943,7 @@ mod tests {
         assert_eq!(r.value, "Bearer {{SECRET:env_grow_book}}");
         assert_eq!(r.secret_value, "gb_secret");
         let sup = supervisor_env(&creds, ClaudeTokenVia::Proxy);
-        assert_eq!(sup, [("GROWTHBOOK_HOST".to_string(), "https://gb.example.com".to_string())]);
+        assert!(sup.is_empty());
     }
 
     #[test]

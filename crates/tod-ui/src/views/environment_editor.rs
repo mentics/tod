@@ -30,7 +30,7 @@ use tod_store::CredentialStore;
 use uuid::Uuid;
 
 const AUTH_STYLES: [&str; 4] = ["Bearer token", "API key in a header", "Basic auth", "Custom"];
-const NO_HOST_WARNING: &str = "No host set: this secret is passed into cloud sandboxes as an environment variable the agent can read.";
+const NO_HOST_INVALID: &str = "Invalid: a credential needs the host it is used with (edit it and add one).";
 
 pub struct EnvironmentEditor {
     fleet: Arc<FleetStore>,
@@ -301,7 +301,6 @@ impl EnvironmentEditor {
         let Some(form) = self.form.as_mut() else { return };
         let original = form.original.clone();
         let typed = (entry.kind == EntryKind::Secret).then(|| text(&form.secret_value, cx)).filter(|v| !v.is_empty());
-        let value_changed = typed.is_some();
         form.saving = true;
         let mut list = self.own_entries();
         list.retain(|e| Some(&e.name) != original.as_ref());
@@ -316,7 +315,6 @@ impl EnvironmentEditor {
         list.push(entry.clone());
         self.error = None;
         let (fleet, root, node) = (self.fleet.clone(), self.data_root.clone(), self.node);
-        let fleet_for_cloud = fleet.clone();
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
@@ -341,7 +339,6 @@ impl EnvironmentEditor {
                         .map_err(|e| e.to_string())
                 })
                 .await;
-            let saved = result.is_ok();
             let _ = this.update(cx, |this, cx| {
                 match result {
                     Ok(()) => this.form = None,
@@ -355,33 +352,6 @@ impl EnvironmentEditor {
                 this.reload(cx);
                 cx.notify();
             });
-            if saved && value_changed {
-                // A cloud sandbox's proxy has the credentials it was made
-                // with: a new or changed value means making it again.
-                let (fleet, node) = (fleet_for_cloud, node);
-                let note = cx
-                    .background_executor()
-                    .spawn(async move {
-                        let _ = fleet.writer().flush();
-                        match tod_core::cloud_sync::lost::refresh_credentials(&fleet, &node.to_string(), false) {
-                            Ok(tod_core::cloud_sync::lost::Refresh::NotNeeded) => None,
-                            Ok(tod_core::cloud_sync::lost::Refresh::Recreated(name)) => {
-                                Some(format!("Recreated the cloud sandbox {name} so it has this credential."))
-                            }
-                            Ok(tod_core::cloud_sync::lost::Refresh::NeedsConfirmation(why)) => Some(format!(
-                                "Saved, but the cloud sandbox was not recreated ({why}). It does not have the new value until it is."
-                            )),
-                            Err(err) => Some(format!("Saved, but recreating the cloud sandbox failed: {err:#}")),
-                        }
-                    })
-                    .await;
-                if let Some(note) = note {
-                    let _ = this.update(cx, |this, cx| {
-                        this.error = Some(note);
-                        cx.notify();
-                    });
-                }
-            }
         })
         .detach();
     }
@@ -541,7 +511,7 @@ impl EnvironmentEditor {
                 )))
             })
             .when(secret && e.hosts.is_empty(), |el| {
-                el.child(div().text_xs().text_color(warn).child(NO_HOST_WARNING))
+                el.child(div().text_xs().text_color(warn).child(NO_HOST_INVALID))
             })
             .into_any_element()
     }
@@ -601,8 +571,8 @@ impl EnvironmentEditor {
                     if form.original.is_some() { "Value (leave empty to keep the stored one)" } else { "Value" },
                     Input::new(&form.secret_value),
                 ))
-                .child(Self::field("Host or URL", Input::new(&form.host)))
-                .when(hosts_empty, |el| el.child(div().text_xs().text_color(warn).child(NO_HOST_WARNING)))
+                .child(Self::field("Host or URL (required)", Input::new(&form.host)))
+                .when(hosts_empty, |el| el.child(div().text_xs().text_color(warn).child("A credential needs the host it is used with, e.g. api.example.com")))
                 .child(Self::field(
                     "Sent as",
                     Select::new(&form.auth_select).small(),

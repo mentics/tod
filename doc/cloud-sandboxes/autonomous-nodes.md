@@ -404,6 +404,22 @@ beta; when it is not, transcripts can move to cheaper object storage (or the
 orchestrator's volume) without changing anything but where the supervisor
 writes them.
 
+### Interactive sandboxes
+
+A Files "Cloud sandbox" node has no supervisor, so the app keeps the agent's
+session logs itself (`tod_store::fleet::session_log`). Claude writes a session
+to `<claude dir>/projects/<cwd with every non-alphanumeric replaced by
+'-'>/<session id>.jsonl` (`/workspace/repo` -> `-workspace-repo`). After each
+turn the app copies the new complete lines out of the sandbox (over the relay,
+off the UI thread) into `<data root>/sandbox-sessions/<node>/<project>__<id>.jsonl`,
+and once more before it deletes the sandbox to recreate it
+(`provision::refresh_sandbox_proxy`). Any sandbox it makes for the node
+(`make_sandbox`: a changed credential, a lost sandbox replaced) gets the logs
+back at the same `projects/<project>/` path, so the conversation's recorded
+`agent_session_id` resumes the same session. If the restore fails the
+conversation falls back to a fresh session (rotation). A turn still running
+when a sandbox is lost is not mirrored; Agent Drive is not used for these yet.
+
 ## Crash guards
 
 - **The hold expires.** See above; the supervisor's hold is a lease it must

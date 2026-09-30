@@ -145,6 +145,9 @@ struct Run {
     title: String,
     /// The session's id is stored on the conversation.
     session_saved: bool,
+    /// The cloud sandbox the agent runs in, whose session logs are kept
+    /// outside it (`tod_store::fleet::session_log`).
+    sandbox: Option<String>,
 }
 
 pub struct ConversationDriver {
@@ -530,6 +533,15 @@ impl ConversationDriver {
                 )?;
                 // With parts, the turn's body is the answer alone: the
                 // narration around the work stays in the parts.
+                // The agent's session log leaves the sandbox with each turn,
+                // so a recreated sandbox can resume this session.
+                if let (Some(sandbox), Some(node)) = (run.sandbox.clone(), self.focus.node_id()) {
+                    tod_store::fleet::session_log::pull_node_in_background(
+                        fleet.paths().root().to_path_buf(),
+                        node.to_string(),
+                        sandbox,
+                    );
+                }
                 let body = if parts.is_empty() {
                     reply.to_string()
                 } else {
@@ -876,6 +888,10 @@ impl ConversationDriver {
             context.map(|context| crate::codebase_rules::with_codebase_rules_in(context, &cwd));
         // An agent inside a dev container or sandbox is started from the
         // data root here.
+        let sandbox = match &cwd {
+            Workdir::Sandbox { sandbox, .. } => Some(sandbox.clone()),
+            _ => None,
+        };
         let cwd = match cwd {
             Workdir::Host(path) => path,
             Workdir::Container { .. } | Workdir::Sandbox { .. } => fleet.paths().root().to_path_buf(),
@@ -928,6 +944,7 @@ impl ConversationDriver {
             chars_at_start,
             title,
             session_saved: false,
+            sandbox,
         });
         crate::journey::record(
             self.journey_key(),

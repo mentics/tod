@@ -46,6 +46,7 @@ use crate::ui::selectable_text::selectable_text;
 const JOURNEY_SURFACE: &str = "credential_request";
 const ACT_SAVE: &str = "save";
 const ACT_TEST: &str = "test";
+const ACT_RETRY: &str = "retry";
 const ACT_DECLINE: &str = "decline";
 const ACT_LATER: &str = "later";
 const ACT_RECREATE: &str = "recreate_anyway";
@@ -122,7 +123,20 @@ pub fn drain_queued(window: &mut Window, cx: &mut App) {
 
 /// Open the dialog for `decision` (a credential request).
 pub fn open(window: &mut Window, cx: &mut App, ctx: Ctx, decision: Decision) {
+    open_with(window, cx, ctx, decision, false);
+}
+
+/// Open the dialog and go straight to Retry: the credential may already be
+/// set (in the Environment editor), so nothing is typed.
+pub fn open_and_retry(window: &mut Window, cx: &mut App, ctx: Ctx, decision: Decision) {
+    open_with(window, cx, ctx, decision, true);
+}
+
+fn open_with(window: &mut Window, cx: &mut App, ctx: Ctx, decision: Decision, retry: bool) {
     let view = cx.new(|cx| CredentialDialog::new(ctx, decision, window, cx));
+    if retry {
+        view.update(cx, |this, cx| this.retry(window, cx));
+    }
     window.open_dialog(cx, move |d, _, _| {
         d.title("A credential is needed")
             .w(px(520.))
@@ -198,6 +212,7 @@ impl CredentialDialog {
             if self.can_test() {
                 actions.push(action(ACT_TEST, "Test", false));
             }
+            actions.push(action(ACT_RETRY, "Retry", false));
             actions.push(action(ACT_DECLINE, "I can't provide it", false));
             actions.push(action(ACT_LATER, "Later", false));
         }
@@ -247,6 +262,54 @@ impl CredentialDialog {
                 this.status = Some((outcome.ok, outcome.message));
                 cx.notify();
             });
+        })
+        .detach();
+    }
+
+    /// Retry without entering a value: re-check that the credential is now
+    /// set, recreate the sandbox if its proxy is stale (as Save does), then
+    /// answer the agent so it retries. Still unset: say so and stay pending.
+    fn retry(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.record(ACT_RETRY, cx);
+        self.phase = Phase::Working("Checking the credential…".into());
+        self.status = None;
+        cx.notify();
+        let (fleet, root, decision) =
+            (self.ctx.fleet.clone(), self.ctx.data_root.clone(), self.decision.clone());
+        let node = decision.node_id;
+        cx.spawn_in(window, async move |this, cx| {
+            let (fleet_read, asked) = (fleet.clone(), decision.clone());
+            let set = cx
+                .background_executor()
+                .spawn(async move {
+                    let store = tod_store::CredentialStore::from_data_root(&root);
+                    fleet_read
+                        .read(|conn| environment_request::info(conn, &store, &asked))
+                        .ok()
+                        .flatten()
+                        .is_some_and(|i| i.already_set)
+                })
+                .await;
+            if !set {
+                let name = environment_request::parse_question(&decision.question)
+                    .map(|(n, _)| n)
+                    .unwrap_or_default();
+                let _ = this.update(cx, |this, cx| {
+                    this.phase = Phase::Entering;
+                    this.status = Some((false, environment_request::still_unset_message(&name)));
+                    cx.notify();
+                });
+                return;
+            }
+            let _ = this.update(cx, |this, cx| {
+                this.phase = Phase::Working("Set. Checking the node's cloud sandbox…".into());
+                cx.notify();
+            });
+            let outcome = cx
+                .background_executor()
+                .spawn(async move { lost::refresh_credentials(&fleet, &node.to_string(), false) })
+                .await;
+            Self::settle(this, outcome, cx).await;
         })
         .detach();
     }
@@ -416,6 +479,12 @@ impl CredentialDialog {
                         .label("Later")
                         .disabled(busy)
                         .on_click(cx.listener(|this, _, window, cx| this.later(window, cx))),
+                )
+                .child(
+                    Button::new("cred-retry")
+                        .label("Retry")
+                        .disabled(busy)
+                        .on_click(cx.listener(|this, _, window, cx| this.retry(window, cx))),
                 )
                 .child(
                     Button::new("cred-decline")

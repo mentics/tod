@@ -579,19 +579,27 @@ impl Requests {
 
     /// Open the dialog that takes a requested credential's value.
     fn provide_credential(&mut self, decision: &Decision, window: &mut Window, cx: &mut Context<Self>) {
-        let ctx = crate::ui::credential_request::Ctx {
+        crate::ui::credential_request::open(window, cx, self.credential_ctx(), decision.clone());
+    }
+
+    /// Retry without entering a value (the credential may already be set).
+    fn retry_credential(&mut self, decision: &Decision, window: &mut Window, cx: &mut Context<Self>) {
+        crate::ui::credential_request::open_and_retry(window, cx, self.credential_ctx(), decision.clone());
+    }
+
+    fn credential_ctx(&self) -> crate::ui::credential_request::Ctx {
+        crate::ui::credential_request::Ctx {
             fleet: self.fleet.clone(),
             data_root: self.fleet.paths().root().to_path_buf(),
             agent_runs: self.agent_runs.clone(),
-        };
-        crate::ui::credential_request::open(window, cx, ctx, decision.clone());
+        }
     }
 
     /// The card's buttons for a credential request: Provide opens the dialog
     /// (the value is typed there, never in the request), and the other answers
     /// that it cannot be provided.
     fn render_credential_buttons(&self, decision: &Decision, cx: &mut Context<Self>) -> impl IntoElement {
-        let (provide, decline) = (decision.clone(), decision.clone());
+        let (provide, retry, decline) = (decision.clone(), decision.clone(), decision.clone());
         div()
             .flex()
             .flex_wrap()
@@ -601,6 +609,12 @@ impl Requests {
                     .label("1. Provide…")
                     .small()
                     .on_click(cx.listener(move |this, _, window, cx| this.provide_credential(&provide, window, cx))),
+            )
+            .child(
+                Button::new(SharedString::from(format!("unified-decisions-retry-{}", decision.id)))
+                    .label("Retry")
+                    .small()
+                    .on_click(cx.listener(move |this, _, window, cx| this.retry_credential(&retry, window, cx))),
             )
             .child(
                 Button::new(SharedString::from(format!("unified-decisions-decline-{}", decision.id)))
