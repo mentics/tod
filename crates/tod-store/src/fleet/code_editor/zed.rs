@@ -457,18 +457,26 @@ pub fn zed_env(data_root: &Path) -> Result<Vec<(String, OsString)>> {
         if std::fs::read(&target).is_ok_and(|current| current == bytes) {
             continue;
         }
-        // A running Zed holds the old copy open on Windows; it is replaced
-        // the next time Zed is not running.
-        if let Err(err) = std::fs::write(&target, &bytes) {
+        // Written beside it and renamed over it, never rewritten in place:
+        // macOS caches a binary's code signature by file, and kills (SIGKILL)
+        // a signed binary whose bytes changed under it. A running Zed holds
+        // the old copy open on Windows; it is replaced the next time Zed is
+        // not running.
+        let staged = dir.join(format!(".{}.new", exe_name(name)));
+        let installed = std::fs::write(&staged, &bytes).and_then(|()| {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755))?;
+            }
+            std::fs::rename(&staged, &target)
+        });
+        if let Err(err) = installed {
+            let _ = std::fs::remove_file(&staged);
             if !target.is_file() {
                 return Err(err).with_context(|| format!("install {}", target.display()));
             }
             tracing::warn!("keeping the older {}: {err}", target.display());
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755));
         }
     }
     let mut path = OsString::from(dir.as_os_str());
