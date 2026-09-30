@@ -112,12 +112,27 @@ pub fn start_watcher(ctx: Ctx, cx: &mut App) {
     .detach();
 }
 
-/// Open a dialog for every request queued since the last drain. Called once
-/// per frame by the app shell.
+/// Open the next queued request, unless a dialog is already open: requests
+/// show one at a time (stacked dialogs overlap), each when the one before is
+/// answered or set aside. Called once per frame by the app shell; while any
+/// wait, frames keep coming so the next opens as soon as there is room.
 pub fn drain_queued(window: &mut Window, cx: &mut App) {
-    let queued = QUEUE.with(|q| std::mem::take(&mut *q.borrow_mut()));
-    for (ctx, decision) in queued {
+    if QUEUE.with(|q| q.borrow().is_empty()) {
+        return;
+    }
+    if window.has_active_dialog(cx) {
+        window.request_animation_frame();
+        return;
+    }
+    let next = QUEUE.with(|q| {
+        let mut q = q.borrow_mut();
+        (!q.is_empty()).then(|| q.remove(0))
+    });
+    if let Some((ctx, decision)) = next {
         open(window, cx, ctx, decision);
+        if QUEUE.with(|q| !q.borrow().is_empty()) {
+            window.request_animation_frame();
+        }
     }
 }
 

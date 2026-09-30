@@ -1096,4 +1096,75 @@ mod tests {
         assert!(body.contains("per line"), "{body}");
         assert!(body.contains("per invoice"), "{body}");
     }
+
+    /// Declining a credential request tells the asking conversation it was
+    /// declined (and only that), as providing tells it the credential is set.
+    #[gpui::test]
+    fn a_declined_credential_request_reaches_the_conversation(cx: &mut TestAppContext) {
+        let fixture = Fixture::new();
+        tod_store::paths::set_data_root(fixture.store.paths().root().to_path_buf());
+        let node = fixture.node_id;
+        let agent: SharedAgent = Arc::new(Mutex::new(Box::new(RecordingAgent::new())));
+        let registry = cx.new(|_| AgentRuns::new(fixture.store.clone(), agent));
+        let conversation_id = Uuid::new_v4();
+        fixture
+            .store
+            .interview(
+                tod_store::interview::ACTOR_USER,
+                tod_store::interview::InterviewCommand::CreateConversation {
+                    id: conversation_id,
+                    focus: Focus::Node(node),
+                    protocol: ProtocolKind::Outline,
+                    platform: None,
+                    model: None,
+                    effort: None,
+                },
+            )
+            .unwrap();
+        let decision_id = fixture
+            .store
+            .interview(
+                tod_store::interview::ACTOR_USER,
+                tod_store::interview::InterviewCommand::AskDecision {
+                    node_id: node,
+                    conversation_id: Some(conversation_id),
+                    protocol: Some(tod_core::environment_request::PROTOCOL.to_string()),
+                    decision: tod_store::decisions::NewDecision {
+                        question: tod_core::environment_request::question("widget_key", "to call the widget API"),
+                        options: tod_core::environment_request::options(),
+                        evidence: Vec::new(),
+                        ..Default::default()
+                    },
+                },
+            )
+            .unwrap()
+            .get("id")
+            .and_then(|v| v.as_str())
+            .and_then(|raw| Uuid::parse_str(raw).ok())
+            .unwrap();
+        // The decline is the second option.
+        registry
+            .update(cx, |registry, cx| registry.answer_decision(decision_id, Some(2), None, cx))
+            .unwrap();
+        cx.run_until_parked();
+        registry.update(cx, |registry, cx| {
+            let agent = registry.agent().clone();
+            let fleet = registry.fleet().clone();
+            for (id, mut driver) in registry.take_running() {
+                driver.tick(&fleet, &mut SharedAgentAccess(&agent));
+                registry.put_back(id, driver);
+            }
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let turns = fixture
+            .store
+            .read(|conn| ConversationRepo::new(conn).turns(conversation_id))
+            .unwrap();
+        assert!(
+            turns.iter().any(|t| t.body.contains("cannot provide the credential `widget_key`")),
+            "expected the decline message: {turns:?}"
+        );
+        assert!(!turns.iter().any(|t| t.body.contains("It is now set")), "{turns:?}");
+    }
 }
