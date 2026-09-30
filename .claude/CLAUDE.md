@@ -137,6 +137,21 @@ protocol kinds remain only so old conversations load, and run
 (`tod-cli decisions ask`, free text with no `--option`) only for what only
 the user can supply.
 
+**PR babysitter** (`doc/lifecycle/pr-readiness.md`). In `pr` the autopilot's
+`babysit` (`autopilot/mod.rs`) drives the pull request until only the human
+review is missing: `tod_core::pr_readiness` reads it from GitHub
+(`Assessment`: open review threads, the branch behind its base, failing
+checks, a review bot's score for the current head) and says what is *work*
+(the `Pr` protocol's agent fixes, merges the base in, and answers threads
+with `tod-cli pr threads answer`, which posts the reply and resolves the
+thread) and what is only *waiting* (a bot's review, CI), which the run does
+itself by polling, asking an overdue bot to review (`@greptileai review
+this`, or `... this draft`). The project's bots and round limits are
+`pr_readiness` in `tod.yml`. The same assessment answers the `pr →
+approved` criteria (`pr-approved.up-to-date`, `.threads-resolved`,
+`.review-current`, `.review-score`). Tests replace GitHub with
+`pr_readiness::set_feed_override`.
+
 **Permissions while unattended** (`tod_core::permission`). A permission an agent asks for that
 nobody has granted is recorded as a pending decision on the node (protocol `permission`,
 reason `access`), so it survives a restart and is answered where requests are. Answering it
