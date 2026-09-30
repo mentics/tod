@@ -235,11 +235,13 @@ pub fn relay_env(supervisor_env: &[(String, String)]) -> Vec<(String, String)> {
 
 /// `spec.network.proxy` for [`proxy_rules`].
 ///
-/// TODO(W6): Blaxel's proxy routing is in public preview and its request
-/// shape is not documented in this repository; this is our best reading of
-/// the design doc (routing rules per destination adding headers, secrets
-/// given with the rule and referenced as `{{SECRET:name}}`, omitted from the
-/// stored spec). Verify against a live workspace and adjust only here.
+/// Verified live against a Blaxel workspace (2026-09-30, `e2e_env_proxy`
+/// example in `tod-store`): a sandbox created with this shape (routing rules
+/// per destination adding a header, the secret given with the rule and
+/// referenced as `{{SECRET:name}}`) is accepted, a request from inside it to a
+/// header-echo host arrives carrying the injected header, the secret is in
+/// none of the sandbox's environment or files, and traffic to other hosts
+/// (github.com, pypi.org) is unaffected.
 pub fn proxy_spec(rules: &[ProxyRule]) -> Value {
     let routing: Vec<Value> = rules
         .iter()
