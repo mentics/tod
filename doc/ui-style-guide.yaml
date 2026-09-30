@@ -394,9 +394,15 @@ styles:
     # item's updates.
     color: linked-copy-text
   node-title-running:
-    # A tree row whose node the lifecycle processor is running. Never color
-    # alone: the row also carries a play icon; both go when the run stops.
+    # A tree row whose node the lifecycle processor is running (play icon) or
+    # only the chat panel is (square icon; the processor wins when both). Never
+    # color alone; both go when the run stops.
     color: node-running-text
+  node-title-finished:
+    # A tree row whose run stopped since the user last selected it: orange,
+    # its icon (play or square) ringed in a circle. Temporary: selecting the
+    # row, or Alt+Q landing on it, clears it. Wins over running.
+    color: node-finished-text
   node-title-needs-you:
     # A tree row waiting on the user (replaces the "Needs you" chip). Also
     # carries an alert icon. Wins over running.
@@ -516,6 +522,7 @@ tokens:
     # Amber's neighbors: a soft olive-green for a node the lifecycle
     # processor is running, a soft coral for one waiting on the user.
     node-running-text: "#a8c060"
+    node-finished-text: "#fb923c"
     node-needs-you-text: "#f0805a"
     notice-fill: "#ffff00"
     notice-text: "#000000"

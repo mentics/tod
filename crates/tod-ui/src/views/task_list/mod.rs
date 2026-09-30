@@ -49,6 +49,7 @@ use gpui_component::{ActiveTheme, Disableable, Sizable, StyledExt};
 use model::{ListWorkingSet as WorkingSet, filter_and_sort_tasks, nearest_visible_id};
 use row_menu::RowMenuKind;
 use tod_core::process::interview_phase_for_lifecycle;
+use tod_core::task::model::RunSource;
 use tod_store::fleet::{FleetStore, code_editors, validate_interview_workspace};
 use tod_store::outline::{CreatePosition, OutlineMutation, ReorderDirection};
 use working_set::{load_working_set, save_working_set};
@@ -198,6 +199,15 @@ pub fn register_task_list_keyboard_bindings(cx: &mut App) {
     // Left/Right drive the tree here, so crossing to the right drawer uses Ctrl+arrows.
     bind_modified_pane_nav(cx, TASK_LIST_CONTEXT);
     key_context::bind_panel_escape(cx, TaskListDismissOverlay, TASK_LIST_CONTEXT);
+}
+
+/// What `set_running_nodes` last reported: who is working on each node now,
+/// and which nodes stopped since the user last selected them.
+#[derive(Default, PartialEq)]
+struct RunFeed {
+    lifecycle: std::collections::HashSet<String>,
+    chat: std::collections::HashSet<String>,
+    finished: std::collections::HashMap<String, RunSource>,
 }
 
 /// What a node is waiting on the user for, as the host (W6's attention
@@ -376,8 +386,8 @@ pub struct TaskListView {
     /// `set_status_overrides` changed `all_tasks` and needs a rebuild;
     /// applied the same way `pending_attention_apply` is.
     pending_status_override_apply: bool,
-    /// Nodes the lifecycle processor is working on, as the host last said.
-    running_nodes: std::collections::HashSet<String>,
+    /// What is acting on, or just stopped acting on, each node, as the host last said.
+    running_nodes: RunFeed,
 }
 
 impl TaskListView {
@@ -539,7 +549,7 @@ impl TaskListView {
             attention: std::collections::HashMap::new(),
             pending_attention_apply: false,
             pending_status_override_apply: false,
-            running_nodes: std::collections::HashSet::new(),
+            running_nodes: RunFeed::default(),
         };
 
         cx.defer_in(window, move |this, window, cx| {
@@ -1800,9 +1810,11 @@ impl TaskListView {
         }
     }
 
-    fn apply_running(tasks: &mut [TaskItem], running: &std::collections::HashSet<String>) {
+    fn apply_running(tasks: &mut [TaskItem], feed: &RunFeed) {
         for task in tasks.iter_mut() {
-            task.lifecycle_running = running.contains(&task.id);
+            task.lifecycle_running = feed.lifecycle.contains(&task.id);
+            task.chat_running = feed.chat.contains(&task.id);
+            task.finished_run = feed.finished.get(&task.id).copied();
         }
     }
 
@@ -2839,18 +2851,22 @@ impl TaskListView {
         cx.notify();
     }
 
-    /// The host reports which nodes the lifecycle processor is working on.
-    /// Their rows show the running icon and title colour; a node leaving the
-    /// set goes back to normal.
+    /// The host reports which nodes the lifecycle processor is working on,
+    /// which only the chat panel is, and which stopped since the user last
+    /// selected them. Their rows show the matching icon and title colour; a
+    /// node leaving a set goes back to normal.
     pub fn set_running_nodes(
         &mut self,
-        nodes: std::collections::HashSet<String>,
+        lifecycle: std::collections::HashSet<String>,
+        chat: std::collections::HashSet<String>,
+        finished: std::collections::HashMap<String, RunSource>,
         cx: &mut Context<Self>,
     ) {
-        if nodes == self.running_nodes {
+        let feed = RunFeed { lifecycle, chat, finished };
+        if feed == self.running_nodes {
             return;
         }
-        self.running_nodes = nodes;
+        self.running_nodes = feed;
         Self::apply_running(&mut self.all_tasks, &self.running_nodes);
         self.pending_status_override_apply = true;
         cx.notify();

@@ -17,7 +17,7 @@ use gpui_component::tag::Tag;
 use gpui_component::{ActiveTheme, Sizable, StyledExt, h_flex};
 
 use super::TaskListView;
-use super::model::TaskItem;
+use super::model::{RunSource, TaskItem};
 use super::row_menu::{RowMenuKind, popup_anchor, popup_at, row_menu_anchor};
 
 /// Checkvist-style uniform tree row height.
@@ -624,7 +624,10 @@ impl ListDelegate for TaskListDelegate {
             } else if item.needs_you_count > 0 {
                 // `styles.node-title-needs-you`
                 crate::ui::style::color::node_needs_you_text()
-            } else if item.lifecycle_running {
+            } else if item.finished_run.is_some() {
+                // `styles.node-title-finished`
+                crate::ui::style::color::node_finished_text()
+            } else if item.lifecycle_running || item.chat_running {
                 // `styles.node-title-running`
                 crate::ui::style::color::node_running_text()
             } else if item.has_copies {
@@ -646,7 +649,11 @@ impl ListDelegate for TaskListDelegate {
                     display_title.clone(),
                     selected,
                     managed,
-                    item.incoming_count > 0 && item.needs_you_count == 0 && !item.lifecycle_running,
+                    item.incoming_count > 0
+                        && item.needs_you_count == 0
+                        && !item.lifecycle_running
+                        && !item.chat_running
+                        && item.finished_run.is_none(),
                     item.id.clone(),
                     sink.clone(),
                 ),
@@ -758,6 +765,8 @@ impl ListDelegate for TaskListDelegate {
             .child(status_icon_cell(
                 item.needs_you_count > 0,
                 item.lifecycle_running,
+                item.chat_running,
+                item.finished_run,
             ))
             .child(title_line)
             .when_some(menu_at, |el, (at, menu)| el.child(popup_at(at, menu)));
@@ -789,32 +798,61 @@ impl ListDelegate for TaskListDelegate {
 }
 
 /// The fixed-width cell at the left of a row: an alert icon when the node
-/// waits on the user, else a play icon while its lifecycle processor runs.
+/// waits on the user; else, for something that stopped since the row was last
+/// selected, its icon in a circle; else a play icon while its lifecycle
+/// processor runs, or a square while only the chat panel does. The shape
+/// says which: play for the lifecycle processor, square for the chat panel.
 /// Static on purpose (a tree of animated rows would distract), and always
 /// reserved so rows do not shift when a run starts or stops.
-fn status_icon_cell(needs_you: bool, running: bool) -> gpui::Div {
+fn status_icon_cell(
+    needs_you: bool,
+    lifecycle_running: bool,
+    chat_running: bool,
+    finished: Option<RunSource>,
+) -> gpui::Div {
+    use gpui_kit_assets::IconName;
     let cell = div()
         .w(px(16.0))
         .flex_shrink_0()
         .flex()
         .items_center();
-    let (name, color) = if needs_you {
-        (
-            gpui_kit_assets::IconName::TriangleAlert,
-            crate::ui::style::color::node_needs_you_text(),
-        )
-    } else if running {
-        (
-            gpui_kit_assets::IconName::Play,
-            crate::ui::style::color::node_running_text(),
-        )
+    let source_icon = |source| match source {
+        RunSource::Lifecycle => IconName::Play,
+        RunSource::Chat => IconName::Square,
+    };
+    if needs_you {
+        return cell.child(
+            gpui_component::Icon::new(IconName::TriangleAlert)
+                .xsmall()
+                .text_color(crate::ui::style::color::node_needs_you_text()),
+        );
+    }
+    if let Some(source) = finished {
+        // `styles.node-title-finished`: the icon keeps its shape, ringed.
+        let color = crate::ui::style::color::node_finished_text();
+        return cell.child(
+            div()
+                .size(px(14.0))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded_full()
+                .border_1()
+                .border_color(color)
+                .child(gpui_component::Icon::new(source_icon(source)).size(px(8.0)).text_color(color)),
+        );
+    }
+    let source = if lifecycle_running {
+        RunSource::Lifecycle
+    } else if chat_running {
+        RunSource::Chat
     } else {
         return cell;
     };
     cell.child(
-        gpui_component::Icon::new(name)
+        gpui_component::Icon::new(source_icon(source))
             .xsmall()
-            .text_color(color),
+            .text_color(crate::ui::style::color::node_running_text()),
     )
 }
 

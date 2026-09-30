@@ -20,7 +20,8 @@ gpui_kit_assets::icon_assets!(
         Wrench,
         Terminal,
         RotateCcwClock,
-        SquarePen
+        SquarePen,
+        Square
     ]
 );
 
@@ -68,6 +69,11 @@ mod tests {
     fn chat_drawer_session_icons_are_bundled() {
         assert!(serves(&gpui_kit_assets::IconName::RotateCcwClock.path()));
         assert!(serves(&gpui_kit_assets::IconName::SquarePen.path()));
+    }
+
+    #[test]
+    fn chat_running_square_icon_is_bundled() {
+        assert!(serves(&gpui_kit_assets::IconName::Square.path()));
     }
 
     #[test]
