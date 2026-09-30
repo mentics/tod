@@ -59,6 +59,63 @@ impl Default for LifecycleSettings {
     }
 }
 
+fn default_min_score() -> u8 {
+    4
+}
+
+fn default_rerun_after_minutes() -> u64 {
+    10
+}
+
+fn default_max_thread_rounds() -> u32 {
+    3
+}
+
+fn default_max_rounds() -> u32 {
+    4
+}
+
+/// A review bot whose reviews gate a pull request
+/// (`doc/lifecycle/pr-readiness.md`). Only built-in bots exist; `name`
+/// selects one (`greptile`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrReviewBotSettings {
+    pub name: String,
+    /// The lowest score that passes.
+    #[serde(default = "default_min_score")]
+    pub min_score: u8,
+    /// How long after a push the bot may take to review on its own before
+    /// the app asks it to.
+    #[serde(default = "default_rerun_after_minutes")]
+    pub rerun_after_minutes: u64,
+}
+
+/// What makes a pull request ready, and how far the babysitter goes to get it
+/// there (`doc/lifecycle/pr-readiness.md`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrReadinessSettings {
+    /// Review bots whose current review, at or above `min_score`, is
+    /// required. None by default.
+    #[serde(default)]
+    pub bots: Vec<PrReviewBotSettings>,
+    /// Rounds on one review thread before the babysitter hands it to the user.
+    #[serde(default = "default_max_thread_rounds")]
+    pub max_thread_rounds: u32,
+    /// Fix-and-push rounds on the whole PR before the babysitter stops.
+    #[serde(default = "default_max_rounds")]
+    pub max_rounds: u32,
+}
+
+impl Default for PrReadinessSettings {
+    fn default() -> Self {
+        Self {
+            bots: Vec::new(),
+            max_thread_rounds: default_max_thread_rounds(),
+            max_rounds: default_max_rounds(),
+        }
+    }
+}
+
 /// Whether, and how, per-node/project journeys are recorded and can be sent
 /// for review (`doc/journeys/spec.md`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -525,6 +582,9 @@ pub struct TodSettings {
     /// How lifecycle phases are judged done.
     #[serde(default)]
     pub lifecycle: LifecycleSettings,
+    /// What makes a pull request ready, and how the babysitter gets it there.
+    #[serde(default)]
+    pub pr_readiness: PrReadinessSettings,
     /// How long idle connections to cloud sandboxes stay open.
     #[serde(default)]
     pub sandbox_idle: SandboxIdleSettings,
@@ -557,6 +617,7 @@ impl Default for TodSettings {
             window_geometry: None,
             journeys: JourneySettings::default(),
             lifecycle: LifecycleSettings::default(),
+            pr_readiness: PrReadinessSettings::default(),
             sandbox_idle: SandboxIdleSettings::default(),
         }
     }
@@ -916,6 +977,15 @@ mod tests {
             journeys: JourneySettings::default(),
             lifecycle: LifecycleSettings {
                 independent_evaluation: false,
+            },
+            pr_readiness: PrReadinessSettings {
+                bots: vec![PrReviewBotSettings {
+                    name: "greptile".into(),
+                    min_score: 4,
+                    rerun_after_minutes: 10,
+                }],
+                max_thread_rounds: 3,
+                max_rounds: 4,
             },
             sandbox_idle: SandboxIdleSettings::default(),
         };

@@ -49,6 +49,15 @@ pub struct PrStatus {
     /// `failure` if any failed, else `pending` if any is still running, else
     /// `success`. `None` when it has none (or they could not be read).
     pub checks: Option<String>,
+    /// The head commit's SHA.
+    pub head_sha: Option<String>,
+    /// When the head commit was committed (RFC 3339); filled by
+    /// [`Github::get_pr_snapshot`], `None` from [`Github::get_pr_status`].
+    pub head_committed_at: Option<String>,
+    /// The PR is a draft.
+    pub draft: bool,
+    /// The branch the PR merges into.
+    pub base_ref: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -227,6 +236,10 @@ impl Github {
             mergeable_state: raw.mergeable_state,
             merged: raw.merged.unwrap_or(false),
             checks,
+            head_sha: raw.head.as_ref().map(|h| h.sha.clone()),
+            head_committed_at: None,
+            draft: raw.draft.unwrap_or(false),
+            base_ref: raw.base.map(|b| b.name),
         })
     }
 
@@ -263,6 +276,231 @@ impl Github {
         )?;
         Ok(())
     }
+
+    /// `POST <api>/graphql`; GraphQL reports failures in an `errors` array
+    /// alongside a 200 status.
+    fn graphql<T: serde::de::DeserializeOwned>(
+        &self,
+        query: &str,
+        variables: serde_json::Value,
+    ) -> Result<T, GithubError> {
+        let reply: GraphqlReply<T> =
+            self.post_json("/graphql", serde_json::json!({ "query": query, "variables": variables }))?;
+        if let Some(errors) = reply.errors.filter(|e| !e.is_empty()) {
+            let message = errors.into_iter().map(|e| e.message).collect::<Vec<_>>().join("; ");
+            return Err(GithubError::Api(message));
+        }
+        reply.data.ok_or_else(|| GithubError::Api("GitHub returned no data".into()))
+    }
+
+    /// Every review thread on the pull request (the first 100), with its
+    /// comments (the first 50 each). REST does not say whether a thread is
+    /// resolved; GraphQL does.
+    pub fn list_review_threads(&self, owner: &str, repo: &str, number: i64) -> Result<Vec<ReviewThread>, GithubError> {
+        const QUERY: &str = "query($owner: String!, $repo: String!, $number: Int!) { repository(owner: $owner, name: $repo) { pullRequest(number: $number) { reviewThreads(first: 100) { nodes { id isResolved isOutdated path line comments(first: 50) { nodes { databaseId body createdAt author { login } diffHunk } } } } } } }";
+        let data: ThreadsData =
+            self.graphql(QUERY, serde_json::json!({ "owner": owner, "repo": repo, "number": number }))?;
+        let pull = data.repository.and_then(|r| r.pull_request).ok_or(GithubError::NotFound)?;
+        Ok(pull
+            .review_threads
+            .nodes
+            .into_iter()
+            .map(|t| ReviewThread {
+                id: t.id,
+                resolved: t.is_resolved,
+                outdated: t.is_outdated,
+                path: t.path,
+                line: t.line,
+                comments: t
+                    .comments
+                    .nodes
+                    .into_iter()
+                    .map(|c| ThreadComment {
+                        id: c.database_id.unwrap_or_default(),
+                        author: c.author.map(|a| a.login),
+                        body: c.body,
+                        created_at: c.created_at,
+                        diff_hunk: c.diff_hunk,
+                    })
+                    .collect(),
+            })
+            .collect())
+    }
+
+    /// Reply in a review thread (by the thread's GraphQL id).
+    pub fn reply_to_thread(&self, thread_id: &str, body: &str) -> Result<(), GithubError> {
+        const MUTATION: &str = "mutation($thread: ID!, $body: String!) { addPullRequestReviewThreadReply(input: {pullRequestReviewThreadId: $thread, body: $body}) { comment { id } } }";
+        self.graphql::<serde_json::Value>(MUTATION, serde_json::json!({ "thread": thread_id, "body": body }))?;
+        Ok(())
+    }
+
+    /// Mark a review thread resolved.
+    pub fn resolve_thread(&self, thread_id: &str) -> Result<(), GithubError> {
+        const MUTATION: &str = "mutation($thread: ID!) { resolveReviewThread(input: {threadId: $thread}) { thread { id } } }";
+        self.graphql::<serde_json::Value>(MUTATION, serde_json::json!({ "thread": thread_id }))?;
+        Ok(())
+    }
+
+    /// The pull request's top-level comments, oldest first (the first 300).
+    pub fn list_issue_comments(&self, owner: &str, repo: &str, number: i64) -> Result<Vec<IssueComment>, GithubError> {
+        let mut all = Vec::new();
+        for page in 1..=3 {
+            let raw: Vec<IssueCommentRaw> = self.get_json(&format!(
+                "/repos/{owner}/{repo}/issues/{number}/comments?per_page=100&page={page}"
+            ))?;
+            let last = raw.len() < 100;
+            all.extend(raw.into_iter().map(|c| IssueComment {
+                id: c.id,
+                author: c.user.map(|u| u.login),
+                body: c.body,
+                created_at: c.created_at,
+                updated_at: c.updated_at,
+            }));
+            if last {
+                break;
+            }
+        }
+        Ok(all)
+    }
+
+    /// When a commit was committed (RFC 3339).
+    pub fn commit_date(&self, owner: &str, repo: &str, sha: &str) -> Result<Option<String>, GithubError> {
+        let raw: CommitRaw = self.get_json(&format!("/repos/{owner}/{repo}/commits/{sha}"))?;
+        Ok(raw.commit.committer.map(|c| c.date))
+    }
+
+    /// Everything readiness is decided from, read together.
+    pub fn get_pr_snapshot(&self, owner: &str, repo: &str, number: i64) -> Result<PrSnapshot, GithubError> {
+        let mut status = self.get_pr_status(owner, repo, number)?;
+        if let Some(sha) = status.head_sha.clone() {
+            status.head_committed_at = self.commit_date(owner, repo, &sha).ok().flatten();
+        }
+        let threads = self.list_review_threads(owner, repo, number)?;
+        let comments = self.list_issue_comments(owner, repo, number)?;
+        Ok(PrSnapshot { status, threads, comments })
+    }
+}
+
+/// A review thread on a pull request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewThread {
+    /// The thread's GraphQL node id (what replying and resolving take).
+    pub id: String,
+    pub resolved: bool,
+    /// The code it was about has since changed.
+    pub outdated: bool,
+    pub path: Option<String>,
+    pub line: Option<i64>,
+    pub comments: Vec<ThreadComment>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThreadComment {
+    pub id: i64,
+    pub author: Option<String>,
+    pub body: String,
+    pub created_at: String,
+    pub diff_hunk: Option<String>,
+}
+
+/// A top-level comment on a pull request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IssueComment {
+    pub id: i64,
+    pub author: Option<String>,
+    pub body: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// A pull request as read for readiness: its status, review threads, and
+/// top-level comments.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrSnapshot {
+    pub status: PrStatus,
+    pub threads: Vec<ReviewThread>,
+    pub comments: Vec<IssueComment>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GraphqlReply<T> {
+    data: Option<T>,
+    errors: Option<Vec<GraphqlError>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GraphqlError {
+    message: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ThreadsData {
+    repository: Option<ThreadsRepo>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ThreadsRepo {
+    #[serde(rename = "pullRequest")]
+    pull_request: Option<ThreadsPull>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ThreadsPull {
+    #[serde(rename = "reviewThreads")]
+    review_threads: Nodes<ThreadRaw>,
+}
+
+#[derive(Debug, Deserialize)]
+struct Nodes<T> {
+    nodes: Vec<T>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ThreadRaw {
+    id: String,
+    #[serde(rename = "isResolved")]
+    is_resolved: bool,
+    #[serde(rename = "isOutdated")]
+    is_outdated: bool,
+    path: Option<String>,
+    line: Option<i64>,
+    comments: Nodes<ThreadCommentRaw>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ThreadCommentRaw {
+    #[serde(rename = "databaseId")]
+    database_id: Option<i64>,
+    body: String,
+    #[serde(rename = "createdAt")]
+    created_at: String,
+    author: Option<UserRaw>,
+    #[serde(rename = "diffHunk")]
+    diff_hunk: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct IssueCommentRaw {
+    id: i64,
+    body: String,
+    user: Option<UserRaw>,
+    created_at: String,
+    updated_at: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CommitRaw {
+    commit: CommitInnerRaw,
+}
+
+#[derive(Debug, Deserialize)]
+struct CommitInnerRaw {
+    committer: Option<CommitterRaw>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CommitterRaw {
+    date: String,
 }
 
 /// The reply's JSON, or the error its status says.
@@ -458,7 +696,9 @@ struct PrDetailRaw {
     mergeable: Option<bool>,
     mergeable_state: Option<String>,
     merged: Option<bool>,
+    draft: Option<bool>,
     head: Option<HeadRaw>,
+    base: Option<RefRaw>,
 }
 
 #[derive(Debug, Deserialize)]

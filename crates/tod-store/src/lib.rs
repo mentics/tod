@@ -54,7 +54,7 @@ pub use paths::{
 };
 pub use settings::{
     AgentLaunchByPlatform, AgentPlatform, AgentRole, AgentRoleSettings, ChatLaunchMode,
-    DEFAULT_LOG_MAX_SIZE_KB, InterviewContextSettings, JourneySettings, LifecycleSettings, MAX_LOG_MAX_SIZE_KB,
+    DEFAULT_LOG_MAX_SIZE_KB, InterviewContextSettings, JourneySettings, LifecycleSettings, MAX_LOG_MAX_SIZE_KB, PrReadinessSettings, PrReviewBotSettings,
     MIN_LOG_MAX_SIZE_KB, PlatformLaunchSettings, QuestionMakerSettings, TerminalSettings,
     TodSettings, WindowGeometry, WorktreeBackend,
 };

@@ -46,6 +46,7 @@ pub mod permission;
 pub mod phase;
 pub mod process;
 pub mod process_bundle;
+pub mod pr_readiness;
 pub mod pull_requests;
 pub mod run_transcript;
 pub mod runner_status;
