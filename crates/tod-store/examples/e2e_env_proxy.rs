@@ -4,7 +4,16 @@
 //! the credential store, and `TOD_RELAY_BIN`. Uses a dummy secret, prints no
 //! credential, and deletes the sandbox at the end.
 use tod_sandbox::node::CustomCredential;
-use tod_store::fleet::sandbox::{NewSandboxSource, Sandboxes, proxy_is_current, set_data_root};
+use tod_store::fleet::sandbox::{NewSandboxSource, Sandboxes, interactive_proxy_is_current, set_data_root};
+
+/// Only the Environment's credentials (no GitHub/Linear/Claude) in the proxy.
+fn nc(custom: &[CustomCredential]) -> tod_sandbox::node::NodeCredentials {
+    tod_sandbox::node::NodeCredentials { custom: custom.to_vec(), ..Default::default() }
+}
+
+fn proxy_is_current(info: &tod_sandbox::blaxel::SandboxInfo, custom: &[CustomCredential]) -> bool {
+    interactive_proxy_is_current(info, &nc(custom), Default::default())
+}
 
 fn main() -> anyhow::Result<()> {
     let mut a = std::env::args().skip(1);
@@ -22,10 +31,10 @@ fn main() -> anyhow::Result<()> {
         secret_value: dummy.into(),
     }];
     let mut p = |s: &str| eprintln!("progress: {s}");
-    let url = sb.create_with_proxy(&name, &NewSandboxSource::Image(String::new()), false, false, &custom, &mut p)?;
+    let url = sb.create_with_proxy(&name, &NewSandboxSource::Image(String::new()), false, false, &nc(&custom), &mut p)?;
     let bx = sb.blaxel()?;
     let info = bx.get(&name)?.expect("exists");
-    println!("tod-env label present: {:?}; proxy_is_current: {}", info.label("tod-env").is_some(), proxy_is_current(&info, &custom));
+    println!("tod-creds label present: {:?}; proxy_is_current: {}", info.label("tod-creds").is_some(), proxy_is_current(&info, &custom));
     let run = |cmd: &str| -> anyhow::Result<()> {
         let r = bx.run(&url, cmd, 90)?;
         let out = r.output().replace(dummy, "<<LEAKED-VALUE>>");

@@ -308,3 +308,16 @@ token changed later reaches a node when its sandbox is next created.
 `claude_token_via = "env"` under `[blaxel]` in `sandboxes.toml` puts the
 token in the supervisor's environment instead (see
 [autonomous-nodes.md](autonomous-nodes.md), Credentials).
+
+**Interactive nodes** (Files "Cloud sandbox", where the app's own agent runs
+in the sandbox through `tod-sandbox agent`) use the same token and the same
+rules: their proxy holds GitHub (`api.github.com` Bearer, `github.com`
+Basic), Linear, and, with `claude_token_via = "proxy"`, `api.anthropic.com`,
+beside the node's Environment secrets (no Blaxel rules; no supervisor runs
+there). The agent process is launched with `CLAUDE_CODE_OAUTH_TOKEN` set to
+the placeholder, `GH_TOKEN` a placeholder, `TOD_GITHUB_AUTH=proxy`, and
+`NODE_USE_ENV_PROXY=1`; with `"env"` it gets the real token on the agent
+process alone (never stored in the sandbox). A missing token just leaves its
+rule out, with a warning. The sandbox carries a `tod-creds` label, a hash of
+every rule and secret, so a credential changed or added later recreates the
+sandbox (after pushing its branch, asking first when work would be lost).

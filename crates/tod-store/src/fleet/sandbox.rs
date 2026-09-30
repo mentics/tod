@@ -179,6 +179,28 @@ pub enum NewSandboxSource {
 }
 
 impl Sandboxes {
+    /// The user's credentials for an interactive sandbox's proxy and agent
+    /// launch, as autonomous nodes get them: GitHub, Linear, and the Claude
+    /// subscription token from the credential store, with `custom` (the
+    /// node's Environment secrets with hosts). There is no Blaxel token: no
+    /// supervisor runs there. Reads the credential store (the OS keyring):
+    /// never on the UI thread.
+    pub fn node_credentials(&self, custom: Vec<tod_sandbox::node::CustomCredential>) -> tod_sandbox::node::NodeCredentials {
+        let store = self.credentials();
+        tod_sandbox::node::NodeCredentials {
+            github_token: store.get(CredentialKind::GithubToken),
+            linear_api_key: store.get(CredentialKind::LinearApiKey),
+            blaxel_token: String::new(),
+            claude_oauth_token: store.get(CredentialKind::ClaudeOauthToken),
+            custom,
+        }
+    }
+
+    /// Where the Claude token goes (`claude_token_via`); the proxy by default.
+    pub fn claude_token_via(&self) -> tod_sandbox::config::ClaudeTokenVia {
+        self.config.blaxel.as_ref().map(|a| a.claude_token_via).unwrap_or_default()
+    }
+
     /// Create sandbox `name` from `source`, wait for it, and make it ready
     /// for tod. Returns its URL. Slow (seconds for a fork or a baked image,
     /// a minute or more when an image is wrapped and set up): never on the UI
@@ -192,28 +214,31 @@ impl Sandboxes {
         inherit_output: bool,
         progress: &mut dyn FnMut(&str),
     ) -> Result<String> {
-        self.create_with_proxy(name, source, agents, inherit_output, &[], progress)
+        self.create_with_proxy(name, source, agents, inherit_output, &Default::default(), progress)
     }
 
-    /// [`Self::create`] with the node's Environment credentials (secrets
-    /// with hosts) as proxy rules, so the agent calls those hosts without
-    /// ever holding the value. Proxy rules are fixed when a sandbox is made,
+    /// [`Self::create`] with `creds` as proxy rules (see
+    /// [`Self::node_credentials`]: the user's GitHub, Linear, and Claude
+    /// tokens as autonomous nodes get them, and the node's Environment
+    /// secrets with hosts), so the agent calls those hosts without ever
+    /// holding the value. Proxy rules are fixed when a sandbox is made,
     /// and a fork carries its source's proxy and cannot be given another, so
     /// with credentials a fork source is made from the source's image
     /// instead (the image must hold the repository, as a fork's source
-    /// does). The sandbox is labelled [`tod_sandbox::node::ENV_LABEL`] with
-    /// the credentials' fingerprint, which [`proxy_is_current`] compares.
+    /// does). The sandbox is labelled [`tod_sandbox::node::CREDS_LABEL`] with
+    /// the rules' fingerprint, which [`interactive_proxy_is_current`] compares.
     pub fn create_with_proxy(
         &mut self,
         name: &str,
         source: &NewSandboxSource,
         agents: bool,
         inherit_output: bool,
-        custom: &[tod_sandbox::node::CustomCredential],
+        creds: &tod_sandbox::node::NodeCredentials,
         progress: &mut dyn FnMut(&str),
     ) -> Result<String> {
         validate_name(name)?;
         let acct = self.account()?.clone();
+        let rules = tod_sandbox::node::credential_rules(creds, acct.claude_token_via);
         let bx = self.blaxel()?;
         if let Some(info) = bx.get(name)?
             && info.status != "TERMINATED"
@@ -223,7 +248,7 @@ impl Sandboxes {
         let started = Instant::now();
         let from_image;
         let source = match source {
-            NewSandboxSource::Fork(base) if !custom.is_empty() => {
+            NewSandboxSource::Fork(base) if !rules.is_empty() => {
                 validate_name(base)?;
                 let image = bx
                     .get(base)?
@@ -261,17 +286,15 @@ impl Sandboxes {
                     format!("sandbox/{wrapped}:latest")
                 };
                 let owner = acct.owner.as_deref().map(label_value).unwrap_or_default();
-                let fingerprint = tod_sandbox::node::env_fingerprint(custom);
-                let mut labels = vec![("tod", "1"), (tod_sandbox::node::ENV_LABEL, fingerprint.as_str())];
+                let fingerprint = tod_sandbox::node::rules_fingerprint(&rules);
+                let mut labels = vec![("tod", "1"), (tod_sandbox::node::CREDS_LABEL, fingerprint.as_str())];
                 if !owner.is_empty() {
                     labels.push(("tod-owner", owner.as_str()));
                 }
-                // The proxy also carries the GitHub/Blaxel rules of
-                // autonomous nodes; here only the Environment's, so
-                // nothing else is routed through it.
-                let proxy = (!custom.is_empty()).then(|| {
-                    tod_sandbox::node::proxy_spec(&tod_sandbox::node::custom_proxy_rules(custom))
-                });
+                // The same rules an autonomous node's proxy has for the
+                // user's own credentials, without the Blaxel ones (there is
+                // no supervisor here); nothing else is routed through it.
+                let proxy = (!rules.is_empty()).then(|| tod_sandbox::node::proxy_spec(&rules));
                 progress(&format!("creating {name} from {runtime_image}…"));
                 bx.create(&NewSandbox {
                     name,
@@ -350,8 +373,21 @@ impl Sandboxes {
     }
 }
 
+/// Whether an interactive sandbox's proxy was made with exactly the rules
+/// `creds` gives now (its `tod-creds` label, a fingerprint of every rule
+/// and secret; a sandbox from before the label counts as having none).
+pub fn interactive_proxy_is_current(
+    info: &tod_sandbox::blaxel::SandboxInfo,
+    creds: &tod_sandbox::node::NodeCredentials,
+    claude_via: tod_sandbox::config::ClaudeTokenVia,
+) -> bool {
+    info.label(tod_sandbox::node::CREDS_LABEL).unwrap_or("none")
+        == tod_sandbox::node::credentials_fingerprint(creds, claude_via)
+}
+
 /// Whether `info`'s proxy was made with exactly `custom` (its `tod-env`
-/// label; a sandbox from before the label counts as having none).
+/// label; a sandbox from before the label counts as having none). For
+/// autonomous nodes, whose proxy is made by `tod_sandbox::node::create`.
 pub fn proxy_is_current(info: &tod_sandbox::blaxel::SandboxInfo, custom: &[tod_sandbox::node::CustomCredential]) -> bool {
     info.label(tod_sandbox::node::ENV_LABEL).unwrap_or("none") == tod_sandbox::node::env_fingerprint(custom)
 }
@@ -810,6 +846,35 @@ pub fn validate_name(name: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_interactive_proxy_is_current_only_with_all_its_credentials() {
+        use tod_sandbox::config::ClaudeTokenVia::Proxy;
+        use tod_sandbox::node::{CREDS_LABEL, NodeCredentials, credentials_fingerprint};
+        let creds = NodeCredentials {
+            github_token: Some("ghp_a".into()),
+            claude_oauth_token: Some("sk-ant-oat01-a".into()),
+            ..Default::default()
+        };
+        let mut info = tod_sandbox::blaxel::SandboxInfo {
+            name: "tod-x".into(),
+            status: "DEPLOYED".into(),
+            state: None,
+            url: None,
+            image: String::new(),
+            labels: Vec::new(),
+            volumes: Vec::new(),
+            node_env: Vec::new(),
+        };
+        assert!(interactive_proxy_is_current(&info, &NodeCredentials::default(), Proxy));
+        assert!(!interactive_proxy_is_current(&info, &creds, Proxy), "no label, but credentials now");
+        info.labels = vec![(CREDS_LABEL.to_string(), credentials_fingerprint(&creds, Proxy))];
+        assert!(interactive_proxy_is_current(&info, &creds, Proxy));
+        let changed = NodeCredentials { claude_oauth_token: Some("sk-ant-oat01-b".into()), ..creds.clone() };
+        assert!(!interactive_proxy_is_current(&info, &changed, Proxy));
+        let added = NodeCredentials { linear_api_key: Some("lin".into()), ..creds };
+        assert!(!interactive_proxy_is_current(&info, &added, Proxy));
+    }
+
     #[test]
     fn an_interactive_sandbox_proxy_is_current_only_with_its_credentials() {
         use tod_sandbox::node::{CustomCredential, ENV_LABEL, custom_proxy_rules, env_fingerprint, proxy_spec};

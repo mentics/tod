@@ -77,17 +77,24 @@ pub fn launch_for(
 /// The sandbox launch for a process that runs in `cwd`, when that is in a
 /// cloud sandbox: through `tod-sandbox` beside this executable, with the
 /// sandbox's `tod-cli` carried back to the relay. Starts the relay.
+/// The process gets what its sandbox's proxy needs to use the user's
+/// credentials ([`tod_sandbox::node::agent_env`]: placeholders, or with
+/// `claude_token_via = "env"` the Claude token itself), on the agent process
+/// alone. Reads the credential store: never on the UI thread.
 pub fn sandbox_launch_for(cwd: &Workdir, data_root: &Path) -> Result<Option<SandboxLaunch>> {
     let Workdir::Sandbox { sandbox, path } = cwd else {
         return Ok(None);
     };
     let relay = cli_relay::ensure_started(data_root)?;
+    let env = crate::fleet::sandbox::Sandboxes::load(data_root)
+        .map(|sandboxes| tod_sandbox::node::agent_env(&sandboxes.node_credentials(Vec::new()), sandboxes.claude_token_via()))
+        .unwrap_or_default();
     Ok(Some(SandboxLaunch {
         launcher: crate::fleet::sandbox::sibling_exe("tod-sandbox"),
         data_root: data_root.to_path_buf(),
         sandbox: sandbox.clone(),
         directory: path.clone(),
-        env: Vec::new(),
+        env,
         cli_relay: relay.env(),
     }))
 }

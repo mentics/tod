@@ -226,16 +226,36 @@ fn free_sandbox_name(fleet: &FleetStore, root: &std::path::Path, slug: &str, ski
     unreachable!()
 }
 
-/// The node's Environment credentials that belong in a sandbox's proxy.
-/// Reads the credential store: never on the UI thread.
+/// Everything that belongs in an interactive sandbox's proxy: the user's
+/// GitHub, Linear, and Claude tokens (as autonomous nodes get them) and the
+/// node's Environment secrets with hosts. A failure reading the Environment
+/// is reported through `progress` and leaves those out. Reads the credential
+/// store: never on the UI thread.
 fn sandbox_proxy_credentials(
     fleet: &FleetStore,
     sandboxes: &Sandboxes,
     node_id: &str,
-) -> Result<Vec<tod_sandbox::node::CustomCredential>> {
+    progress: &mut dyn FnMut(&str),
+) -> Result<tod_sandbox::node::NodeCredentials> {
     let node: uuid::Uuid = node_id.parse().context("node id")?;
-    let creds = sandboxes.credentials();
-    fleet.read(|conn| crate::environment::sandbox_credentials(conn, &creds, node))
+    let store = sandboxes.credentials();
+    let custom = match fleet.read(|conn| crate::environment::sandbox_credentials(conn, &store, node)) {
+        Ok(custom) => custom,
+        Err(err) => {
+            progress(&format!("warning: the node's Environment was not applied: {err:#}"));
+            Vec::new()
+        }
+    };
+    let creds = sandboxes.node_credentials(custom);
+    if creds.github_token.is_none() {
+        progress("warning: no GitHub token stored; the sandbox's agent cannot push or open a pull request");
+    }
+    if creds.claude_oauth_token.as_deref().is_none_or(|t| t.trim().is_empty()) {
+        progress(
+            "warning: no Claude subscription token stored; Claude Code in the sandbox is not signed in              (Settings → Cloud sandboxes → Claude subscription)",
+        );
+    }
+    Ok(creds)
 }
 
 /// What [`refresh_sandbox_proxy`] did.
@@ -277,8 +297,8 @@ pub fn refresh_sandbox_proxy(
     if matches!(info.status.to_ascii_uppercase().as_str(), "FAILED" | "TERMINATED" | "DELETING" | "DELETED") {
         return Ok(SandboxRefresh::NotNeeded);
     }
-    let custom = sandbox_proxy_credentials(fleet, &sandboxes, node_id)?;
-    if sandbox::proxy_is_current(&info, &custom) {
+    let creds = sandbox_proxy_credentials(fleet, &sandboxes, node_id, progress)?;
+    if sandbox::interactive_proxy_is_current(&info, &creds, sandboxes.claude_token_via()) {
         return Ok(SandboxRefresh::NotNeeded);
     }
     let lock = node_lock(node_id);
@@ -354,11 +374,11 @@ fn make_sandbox(
     let source = dev.sandbox_from.source();
     // The node's Environment: secrets with hosts go in the sandbox's proxy,
     // so the agent calls those hosts without holding the value.
-    let custom = match sandbox_proxy_credentials(fleet, &sandboxes, &files.node_id) {
+    let custom = match sandbox_proxy_credentials(fleet, &sandboxes, &files.node_id, progress) {
         Ok(custom) => custom,
         Err(err) => {
-            progress(&format!("warning: the node's Environment was not applied: {err:#}"));
-            Vec::new()
+            progress(&format!("warning: the node's credentials were not applied: {err:#}"));
+            sandboxes.node_credentials(Vec::new())
         }
     };
     let mut attempt = 0;
