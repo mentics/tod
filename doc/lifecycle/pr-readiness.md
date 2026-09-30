@@ -193,8 +193,7 @@ together after the push so replies can cite the pushed commit.
 it is outward-facing, so it is bounded:
 
 - Replies are posted as the user's GitHub identity, by the same credentials
-  the app already uses for PR reads. They are prefixed by a fixed marker
-  (`🤖 tod:`) so a human can tell them apart.
+  the app already uses for PR reads. They carry no marker.
 - Human reviewers' threads are handled exactly like a bot's. When the agent
   judges it has addressed a thread, or has a justification for not acting,
   it posts an appropriate reply and resolves the thread, autonomously. A
@@ -271,13 +270,14 @@ it is outward-facing, so it is bounded:
 Where the code differs from the design above:
 
 - **Answering a thread is one CLI call, not a stored answer.** `tod-cli pr
-  threads answer` posts the reply (prefixed with `TOD_MARKER`), resolves the
+  threads answer` posts the reply, resolves the
   thread, and returns; there is no `pr_thread_answers` table and the app does
   not post after the push. The agent pushes first, as its instructions say.
   A thread it cannot decide is a decision (`tod-cli decisions ask`); there is
   no `needs-user` status.
-- **Rounds are read from GitHub or counted from turns.** Rounds on a thread
-  are the replies of ours already in it (`pr_readiness::rounds`). Rounds on
+- **Rounds are approximate.** Replies carry no marker, so rounds on a thread
+  are estimated as its comments divided by two (`pr_readiness::rounds`); the
+  aim is only to stop a loop that never settles. Rounds on
   the PR are the agent turns of its conversation since the run began counting
   (`AutopilotState::pr_turns_base`, reset by renewing the budget). Both limits
   are `pr_readiness.max_thread_rounds` / `max_rounds`.

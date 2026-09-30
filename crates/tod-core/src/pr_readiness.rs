@@ -12,10 +12,6 @@ use chrono::{DateTime, Utc};
 use tod_store::github::{PrSnapshot, ReviewThread};
 use tod_store::settings::{PrReadinessSettings, PrReviewBotSettings};
 
-/// Starts every reply the babysitter posts, so a person can tell it from
-/// their own, and so rounds on a thread can be counted from GitHub alone.
-pub const TOD_MARKER: &str = "🤖 tod:";
-
 /// A review bot whose comment carries a score. Built in; the project's
 /// settings only choose and tune them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -309,9 +305,11 @@ fn wants_answer(thread: &ReviewThread) -> bool {
     !thread.resolved && !thread.outdated
 }
 
-/// How many replies of ours `thread` holds: the rounds spent on it.
+/// About how many rounds have been spent on `thread`: one per exchange, a
+/// comment and the reply to it. Only a rough count, to stop a thread that
+/// never settles; our replies are not marked, so it cannot tell whose is whose.
 pub fn rounds(thread: &ReviewThread) -> u32 {
-    thread.comments.iter().filter(|c| c.body.trim_start().starts_with(TOD_MARKER)).count() as u32
+    (thread.comments.len() / 2) as u32
 }
 
 fn open_thread(thread: &ReviewThread) -> OpenThread {
@@ -453,7 +451,7 @@ mod live {
         }
         // `TOD_TEST_ANSWER_THREAD=<id>` also replies to that thread and resolves it.
         if let Ok(id) = std::env::var("TOD_TEST_ANSWER_THREAD") {
-            gh.reply_to_thread(&id, &format!("{TOD_MARKER} live test reply")).unwrap();
+            gh.reply_to_thread(&id, "live test reply").unwrap();
             gh.resolve_thread(&id).unwrap();
             let after = gh.list_review_threads(owner, repo, number.parse().unwrap()).unwrap();
             let t = after.iter().find(|t| t.id == id).unwrap();
@@ -730,8 +728,8 @@ Not safe.
     }
 
     #[test]
-    fn rounds_on_a_thread_are_our_replies_in_it() {
-        let t = thread("t", false, &["please fix", "🤖 tod: fixed in abc", "still wrong", "🤖 tod: fixed again"]);
+    fn rounds_on_a_thread_are_its_exchanges() {
+        let t = thread("t", false, &["please fix", "fixed in abc", "still wrong", "fixed again", "no"]);
         let none = PrReadinessSettings::default();
         let a = Assessment::of(&snap(status("blocked", "success"), vec![t], vec![]), &none, now());
         assert_eq!(a.open_threads[0].rounds, 2);

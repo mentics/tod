@@ -18,8 +18,8 @@ tod-cli --data-root <DATA_ROOT> pr blocked                           --why <TEXT
 
 - `open` refuses when a PR is already linked in that repository; run `status` first.
 - `threads` lists open review threads, human and bot, with code, comments and
-  how often you answered. `threads answer` posts `--reply` (what you did, or
-  why not), signs it as tod's, and resolves the thread. `--fixed`: push first
+  roughly how many rounds each has had. `threads answer` posts `--reply` (what
+  you did, or why not) and resolves the thread. `--fixed`: push first
   so the reply can name the commit. `--rejected`: you changed nothing.
 - `blocked --why` hands back to the user when you cannot proceed.
 - `mergeable` and `merged` only record; the gates are the app's own checks.

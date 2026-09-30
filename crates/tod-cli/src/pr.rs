@@ -56,10 +56,10 @@ and merged flag.
 (shown by GitHub, not tod's short ids), on the linked PR --pr names (its URL
 or <OWNER>/<REPO>#<NUMBER>) — needed only when the node links more than one.
 `threads` lists the review threads still open (human and bot alike, with the
-file and line, every comment, and how many times you have already answered
-it), or all of them with --all. `threads answer` answers one by its id: it
-posts --reply (which must say what you did, or why you did not), signs it as
-tod's own, and resolves the thread, all as the user. --fixed says you changed
+file and line, every comment, and roughly how many rounds it has had),
+or all of them with --all. `threads answer` answers one by its id: it
+posts --reply (which must say what you did, or why you did not) and resolves
+the thread, all as the user. --fixed says you changed
 code for it (push first, so the reply can name the commit); --rejected says
 you did not, and why. If you cannot decide a thread, ask the user with
 `decisions ask` instead.
@@ -492,7 +492,7 @@ fn answer_thread(inv: &Invocation, rest: &[String]) -> anyhow::Result<String> {
         return Ok(format!("thread {thread_id} is already resolved"));
     }
     github
-        .reply_to_thread(thread_id, &format!("{} {reply}", tod_core::pr_readiness::TOD_MARKER))
+        .reply_to_thread(thread_id, reply)
         .map_err(|err| anyhow::anyhow!("GitHub (reply): {err}"))?;
     github
         .resolve_thread(thread_id)
