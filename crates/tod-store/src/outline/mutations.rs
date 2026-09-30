@@ -104,6 +104,13 @@ pub enum OutlineMutation {
         node_id: Uuid,
         tags: Vec<String>,
     },
+    /// The Environment capability's entries. Secrets' values are not here:
+    /// they are in the credential store, so this is not recorded in a
+    /// conversation's change set and reversing one cannot restore a value.
+    SetNodeEnvironment {
+        node_id: Uuid,
+        entries: Vec<crate::environment::Entry>,
+    },
     CreateObligation {
         obligation_id: Option<Uuid>,
         node_id: Uuid,
@@ -404,6 +411,7 @@ impl OutlineMutation {
                 | OutlineMutation::SetNodeFiles { .. }
                 | OutlineMutation::SetNodeTicket { .. }
                 | OutlineMutation::SetNodeTags { .. }
+                | OutlineMutation::SetNodeEnvironment { .. }
                 | OutlineMutation::UpdateNodeTitle { .. }
                 | OutlineMutation::ReorderSibling { .. }
                 | OutlineMutation::ReparentNode { .. }
@@ -582,6 +590,10 @@ impl OutlineMutation {
                 crate::fleet::repos::task::TaskRepo::new(conn)
                     .update_tags(&node_id.to_string(), tags)?;
                 GeneratorRepo::new(conn).mark_field_modified(*node_id, "tags")?;
+            }
+            OutlineMutation::SetNodeEnvironment { node_id, entries } => {
+                require_capability(conn, *node_id, Capability::Environment)?;
+                crate::environment::set_entries(conn, *node_id, entries)?;
             }
             OutlineMutation::CreateObligation {
                 obligation_id,

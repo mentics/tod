@@ -1347,6 +1347,7 @@ impl Render for Shell {
         self.drain_pending_task_list(window, cx);
         self.drain_pending_error_toast(window, cx);
         crate::ui::agent_permission::drain_queued_requests(window, cx);
+        crate::ui::credential_request::drain_queued(window, cx);
         self.note_location(cx);
         self.restore_lost_focus(window, cx);
 
@@ -2140,6 +2141,14 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                         });
                         let agent_for_conversation = agent.clone();
                         let agent_runs = cx.new(|_| AgentRuns::new(fleet.clone(), agent.clone()));
+                        crate::ui::credential_request::start_watcher(
+                            crate::ui::credential_request::Ctx {
+                                fleet: fleet.clone(),
+                                data_root: paths.data_root().to_path_buf(),
+                                agent_runs: agent_runs.clone(),
+                            },
+                            cx,
+                        );
                         let conversation = cx.new(|cx| {
                             ConversationView::new(
                                 window,

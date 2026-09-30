@@ -68,6 +68,52 @@ pub struct NodeCredentials {
     /// The user's Claude subscription token (`claude setup-token`), for the
     /// node's Claude Code. Where it goes is [`ClaudeTokenVia`].
     pub claude_oauth_token: Option<String>,
+    /// Credentials the user defined in the node's Environment, with hosts.
+    pub custom: Vec<CustomCredential>,
+    /// Environment variables for the supervisor and so the agent: the node's
+    /// variables, and its host-less secrets (which the agent can therefore
+    /// read; the Environment editor warns about that).
+    pub env: Vec<(String, String)>,
+}
+
+/// The label a node sandbox carries with [`env_fingerprint`] of the custom
+/// credentials its proxy was made with, so the app can tell when the user's
+/// Environment has a credential the proxy lacks (proxy rules are fixed when
+/// the sandbox is created).
+pub const ENV_LABEL: &str = "tod-env";
+
+/// A short fingerprint of `custom` (names, hosts, header, template, and
+/// values: a changed value changes it); `none` without any. Safe as a label
+/// value, and reveals nothing of the values.
+pub fn env_fingerprint(custom: &[CustomCredential]) -> String {
+    use sha2::{Digest, Sha256};
+    if custom.is_empty() {
+        return "none".to_string();
+    }
+    let mut sorted: Vec<&CustomCredential> = custom.iter().collect();
+    sorted.sort_by(|a, b| a.name.cmp(&b.name));
+    let mut h = Sha256::new();
+    for c in sorted {
+        for part in [c.name.as_str(), &c.hosts.join(","), &c.header, &c.template, &c.secret_value] {
+            h.update((part.len() as u64).to_le_bytes());
+            h.update(part.as_bytes());
+        }
+    }
+    let digest = h.finalize();
+    digest.iter().take(8).map(|b| format!("{b:02x}")).collect()
+}
+
+/// A user-defined credential applied by the proxy on `hosts`.
+#[derive(Clone)]
+pub struct CustomCredential {
+    /// Unique among the node's credentials; names the proxy secret.
+    pub name: String,
+    pub hosts: Vec<String>,
+    pub header: String,
+    /// The header value with `{value}` for the secret.
+    pub template: String,
+    /// What the proxy substitutes (already encoded for the auth style).
+    pub secret_value: String,
 }
 
 impl std::fmt::Debug for NodeCredentials {
@@ -85,7 +131,7 @@ impl std::fmt::Debug for NodeCredentials {
 #[derive(Clone, PartialEq, Eq)]
 pub struct ProxyRule {
     pub destination: String,
-    pub header: &'static str,
+    pub header: String,
     /// The header value template, e.g. `Bearer {{SECRET:github}}`.
     pub value: String,
     pub secret_name: String,
@@ -106,7 +152,7 @@ impl std::fmt::Debug for ProxyRule {
 fn rule(destination: &str, secret: &str, value_prefix: &str, secret_value: String) -> ProxyRule {
     ProxyRule {
         destination: destination.to_string(),
-        header: "Authorization",
+        header: "Authorization".to_string(),
         value: format!("{value_prefix}{{{{SECRET:{secret}}}}}"),
         secret_name: secret.to_string(),
         secret_value,
@@ -135,6 +181,23 @@ pub fn proxy_rules(creds: &NodeCredentials, orchestrator_host: &str, claude_via:
     {
         rules.push(rule("api.anthropic.com", "claude", "Bearer ", token.to_string()));
     }
+    for c in &creds.custom {
+        let secret: String = c
+            .name
+            .chars()
+            .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
+            .collect();
+        let secret = format!("env_{secret}");
+        for host in &c.hosts {
+            rules.push(ProxyRule {
+                destination: host.clone(),
+                header: c.header.clone(),
+                value: c.template.replace("{value}", &format!("{{{{SECRET:{secret}}}}}")),
+                secret_name: secret.clone(),
+                secret_value: c.secret_value.clone(),
+            });
+        }
+    }
     rules.push(rule("api.blaxel.ai", "blaxel", "Bearer ", creds.blaxel_token.clone()));
     rules.push(rule(orchestrator_host, "blaxel", "Bearer ", creds.blaxel_token.clone()));
     rules
@@ -148,17 +211,19 @@ fn claude_token(creds: &NodeCredentials) -> Option<&str> {
 /// token with [`ClaudeTokenVia::Env`] (Claude Code, the supervisor's child,
 /// inherits it); nothing with the proxy, or without a token. The relay is
 /// given these as `TOD_SUPERVISOR_ENV_<NAME>` ([`relay_env`]).
-pub fn supervisor_env(creds: &NodeCredentials, claude_via: ClaudeTokenVia) -> Vec<(&'static str, String)> {
-    match (claude_via, claude_token(creds)) {
-        (ClaudeTokenVia::Env, Some(token)) => vec![(CLAUDE_TOKEN_ENV, token.to_string())],
-        _ => Vec::new(),
+pub fn supervisor_env(creds: &NodeCredentials, claude_via: ClaudeTokenVia) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    if let (ClaudeTokenVia::Env, Some(token)) = (claude_via, claude_token(creds)) {
+        out.push((CLAUDE_TOKEN_ENV.to_string(), token.to_string()));
     }
+    out.extend(creds.env.iter().cloned());
+    out
 }
 
 /// The relay process's own environment for [`supervisor_env`]: each variable
 /// under [`RELAY_SUPERVISOR_ENV_PREFIX`], which the relay passes on to the
 /// supervisor alone.
-pub fn relay_env(supervisor_env: &[(&str, String)]) -> Vec<(String, String)> {
+pub fn relay_env(supervisor_env: &[(String, String)]) -> Vec<(String, String)> {
     supervisor_env
         .iter()
         .map(|(name, value)| (format!("{RELAY_SUPERVISOR_ENV_PREFIX}{name}"), value.clone()))
@@ -178,7 +243,7 @@ pub fn proxy_spec(rules: &[ProxyRule]) -> Value {
         .map(|r| {
             json!({
                 "destinations": [r.destination],
-                "headers": { r.header: r.value },
+                "headers": { r.header.clone(): r.value },
                 "secrets": { r.secret_name.clone(): r.secret_value },
             })
         })
@@ -269,6 +334,7 @@ pub fn create_body(spec: &NodeSandboxSpec, creds: &NodeCredentials) -> Value {
                 "tod-kind": if spec.node.is_empty() { "node-base" } else { "node" },
                 "tod-user": spec.user,
                 "tod-node": spec.node,
+                ENV_LABEL: env_fingerprint(&creds.custom),
             },
         },
         "spec": {
@@ -314,7 +380,7 @@ pub struct NodePayload<'a> {
     pub bundles: &'a [(String, Vec<u8>)],
     /// [`supervisor_env`]: handed to the relay at each start, which gives it
     /// to the supervisor alone. Kept off every command line.
-    pub supervisor_env: &'a [(&'static str, String)],
+    pub supervisor_env: &'a [(String, String)],
 }
 
 /// Every file under `dir`, as `(prefix/relative/path, contents)`, for
@@ -661,6 +727,8 @@ mod tests {
             linear_api_key: Some("lin_y".into()),
             blaxel_token: "bl_z".into(),
             claude_oauth_token: Some("sk-ant-oat01-real".into()),
+            custom: Vec::new(),
+            env: Vec::new(),
         }
     }
 
@@ -833,11 +901,48 @@ mod tests {
         assert!(!body.to_string().contains("sk-ant-oat01-real"));
         assert!(!body.to_string().contains("api.anthropic.com"));
         let sup = supervisor_env(&creds(), ClaudeTokenVia::Env);
-        assert_eq!(sup, [(CLAUDE_TOKEN_ENV, "sk-ant-oat01-real".to_string())]);
+        assert_eq!(sup, [(CLAUDE_TOKEN_ENV.to_string(), "sk-ant-oat01-real".to_string())]);
         assert_eq!(
             relay_env(&sup),
             [("TOD_SUPERVISOR_ENV_CLAUDE_CODE_OAUTH_TOKEN".to_string(), "sk-ant-oat01-real".to_string())]
         );
+    }
+
+    #[test]
+    fn the_env_fingerprint_follows_credentials_and_hides_values() {
+        let c = |value: &str| CustomCredential {
+            name: "a".into(),
+            hosts: vec!["h.io".into()],
+            header: "Authorization".into(),
+            template: "Bearer {value}".into(),
+            secret_value: value.into(),
+        };
+        assert_eq!(env_fingerprint(&[]), "none");
+        assert_eq!(env_fingerprint(&[c("x")]), env_fingerprint(&[c("x")]));
+        assert_ne!(env_fingerprint(&[c("x")]), env_fingerprint(&[c("y")]));
+        assert!(!env_fingerprint(&[c("x")]).contains('x') || env_fingerprint(&[c("x")]).len() == 16);
+    }
+
+    #[test]
+    fn custom_credentials_become_proxy_rules_and_variables_reach_the_supervisor() {
+        let creds = NodeCredentials {
+            custom: vec![CustomCredential {
+                name: "grow-book".into(),
+                hosts: vec!["api.growthbook.io".into()],
+                header: "Authorization".into(),
+                template: "Bearer {value}".into(),
+                secret_value: "gb_secret".into(),
+            }],
+            env: vec![("GROWTHBOOK_HOST".into(), "https://gb.example.com".into())],
+            ..creds()
+        };
+        let rules = proxy_rules(&creds, "orch.example", ClaudeTokenVia::Proxy);
+        let r = rules.iter().find(|r| r.destination == "api.growthbook.io").unwrap();
+        assert_eq!(r.header, "Authorization");
+        assert_eq!(r.value, "Bearer {{SECRET:env_grow_book}}");
+        assert_eq!(r.secret_value, "gb_secret");
+        let sup = supervisor_env(&creds, ClaudeTokenVia::Proxy);
+        assert_eq!(sup, [("GROWTHBOOK_HOST".to_string(), "https://gb.example.com".to_string())]);
     }
 
     #[test]

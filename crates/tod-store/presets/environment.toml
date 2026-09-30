@@ -1,0 +1,56 @@
+# Service presets for the Environment capability: what a credential for a
+# service needs, so the user only pastes the value. Shipped with tod; a file
+# named `environment-presets.toml` in the data root adds presets or replaces
+# one with the same `id` (see Settings -> Environment presets).
+#
+#   id              stable name; a user preset with the same id replaces this one
+#   label           shown in the picker
+#   description     the agent sees it beside the credential
+#   hosts           exact API hosts the secret is for (no wildcards). The first
+#                   is the default; self-hosted services are changed per entry
+#   auth            bearer | header:<Header-Name> | basic:<username>
+#   name, env_var   suggested entry name and environment variable
+#   test_url        a harmless GET that proves the credential works; {host}
+#                   stands for the entry's first host. The key is only ever
+#                   sent to a host the entry lists.
+#   variables       plain variables the service usually needs, name = default
+
+[[preset]]
+id = "growthbook"
+label = "GrowthBook"
+description = "GrowthBook REST API: feature flags, experiments and metrics"
+hosts = ["api.growthbook.io"]
+auth = "bearer"
+name = "growthbook"
+env_var = "GROWTHBOOK_API_KEY"
+test_url = "https://{host}/api/v1/features?limit=1"
+
+[[preset]]
+id = "openai"
+label = "OpenAI"
+description = "OpenAI API"
+hosts = ["api.openai.com"]
+auth = "bearer"
+name = "openai"
+env_var = "OPENAI_API_KEY"
+test_url = "https://{host}/v1/models"
+
+[[preset]]
+id = "sentry"
+label = "Sentry"
+description = "Sentry API: issues and releases"
+hosts = ["sentry.io"]
+auth = "bearer"
+name = "sentry"
+env_var = "SENTRY_AUTH_TOKEN"
+test_url = "https://{host}/api/0/"
+
+[[preset]]
+id = "stripe"
+label = "Stripe (test mode)"
+description = "Stripe API, test-mode secret key"
+hosts = ["api.stripe.com"]
+auth = "bearer"
+name = "stripe"
+env_var = "STRIPE_API_KEY"
+test_url = "https://{host}/v1/balance"

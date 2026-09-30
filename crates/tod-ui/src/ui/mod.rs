@@ -4,6 +4,7 @@ pub mod agent_runs;
 pub mod claude_adapter;
 pub mod agent_conversation;
 pub mod agent_permission;
+pub mod credential_request;
 pub mod app_nav;
 pub mod code_links;
 pub mod files_impact;

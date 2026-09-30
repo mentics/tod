@@ -33,13 +33,14 @@ const SIDEBAR_MIN: f32 = 140.0;
 const PANEL_MIN: f32 = 320.0;
 const SETTINGS_CONTEXT: &str = "Settings";
 
-const SECTIONS: [SettingsSection; 9] = [
+const SECTIONS: [SettingsSection; 10] = [
     SettingsSection::Agents,
     SettingsSection::Lifecycle,
     SettingsSection::QuestionMaker,
     SettingsSection::AnswerProcessor,
     SettingsSection::Workspaces,
     SettingsSection::CloudSandboxes,
+    SettingsSection::EnvironmentPresets,
     SettingsSection::Logging,
     SettingsSection::Journeys,
     SettingsSection::Advanced,
@@ -116,6 +117,7 @@ enum SettingsSection {
     AnswerProcessor,
     Workspaces,
     CloudSandboxes,
+    EnvironmentPresets,
     Logging,
     Journeys,
     Advanced,
@@ -130,6 +132,7 @@ impl SettingsSection {
             Self::AnswerProcessor => "Agent context",
             Self::Workspaces => "Workspaces",
             Self::CloudSandboxes => "Cloud sandboxes",
+            Self::EnvironmentPresets => "Environment presets",
             Self::Logging => "Logging",
             Self::Journeys => "Journeys",
             Self::Advanced => "Advanced",
@@ -144,6 +147,7 @@ impl SettingsSection {
             Self::AnswerProcessor => "answer-processor",
             Self::Workspaces => "workspaces",
             Self::CloudSandboxes => "cloud-sandboxes",
+            Self::EnvironmentPresets => "environment-presets",
             Self::Logging => "logging",
             Self::Journeys => "journeys",
             Self::Advanced => "advanced",
@@ -179,6 +183,7 @@ impl SettingsSection {
                 SandboxClaudeGetToken,
                 SandboxClaudeClear,
             ],
+            Self::EnvironmentPresets => &[EnvironmentPresetsFile],
             Self::Logging => &[LogLevel, LogMaxSize],
             Self::Journeys => &[
                 JourneysSend,
@@ -207,6 +212,8 @@ enum SettingField {
     TreehouseExecutable,
     TreehouseWorktreesRoot,
     TerminalProgram,
+    /// The user's environment presets file (edited by `PresetsEditor`).
+    EnvironmentPresetsFile,
     /// The Blaxel workspace cloud sandboxes live in (`sandboxes.toml`).
     SandboxWorkspace,
     /// An API key or `bl login`.
@@ -258,6 +265,7 @@ impl SettingField {
             Self::TreehouseWorktreesRoot => "treehouse-worktrees-root",
             Self::TerminalProgram => "terminal-program",
             Self::SandboxWorkspace => "sandbox-workspace",
+            Self::EnvironmentPresetsFile => "environment-presets-file",
             Self::SandboxSignIn => "sandbox-sign-in",
             Self::SandboxApiKey => "sandbox-api-key",
             Self::SandboxDefaultImage => "sandbox-default-image",
@@ -407,6 +415,7 @@ pub struct SettingsView {
     app_nav: AppNavMenu,
     focus_region: SettingsFocus,
     active_section: SettingsSection,
+    presets_editor: Entity<crate::views::environment_editor::PresetsEditor>,
     selected_field_index: usize,
     terminal_program_editing: bool,
     treehouse_worktrees_root_editing: bool,
@@ -433,6 +442,7 @@ pub struct SettingsView {
 impl SettingsView {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let paths = TodPaths::discover().expect("failed to resolve tod paths");
+        let presets_root = paths.data_root().to_path_buf();
         let settings = TodSettings::load(&paths).expect("failed to load tod settings");
         let log_dir_display = SharedString::from(
             logging::absolute_log_dir(&paths.log_dir())
@@ -619,6 +629,10 @@ impl SettingsView {
             app_nav: AppNavMenu::default(),
             focus_region: SettingsFocus::Panel,
             active_section: SettingsSection::Agents,
+            presets_editor: {
+                let root = presets_root;
+                cx.new(|cx| crate::views::environment_editor::PresetsEditor::new(root, window, cx))
+            },
             selected_field_index: 0,
             terminal_program_editing: false,
             treehouse_worktrees_root_editing: false,
@@ -1116,6 +1130,7 @@ impl SettingsView {
             return;
         }
         match self.selected_field() {
+            SettingField::EnvironmentPresetsFile => {}
             SettingField::Agent(role) => self.cycle_platform_for(role, delta, cx),
             SettingField::ReplenishThreshold => self.step_replenish(delta, cx),
             SettingField::ContextBudget => self.step_context_budget(delta, cx),
@@ -1184,6 +1199,10 @@ impl SettingsView {
             return;
         }
         match self.selected_field() {
+            SettingField::EnvironmentPresetsFile => {
+                let editor = self.presets_editor.clone();
+                editor.update(cx, |e, cx| e.focus(window, cx));
+            }
             SettingField::TerminalProgram => self.enter_terminal_edit(window, cx),
             SettingField::TreehouseWorktreesRoot => {
                 self.enter_treehouse_worktrees_root_edit(window, cx)
@@ -2515,6 +2534,7 @@ impl SettingsView {
                     |this, _, cx| this.step_log_max_size(1024, cx),
                 ))
                 .into_any_element(),
+            SettingsSection::EnvironmentPresets => self.presets_editor.clone().into_any_element(),
             SettingsSection::Lifecycle => v_flex()
                 .gap_1()
                 .child(toggle_row(

@@ -228,6 +228,9 @@ fn list(inv: &Invocation, node: Uuid) -> anyhow::Result<String> {
                 list(&s.linked_prs)
             ),
             Capability::Tags => format!("tags: {}", list(&s.tags)),
+            Capability::Environment => {
+                "environment: see `tod-cli environment list`".to_string()
+            }
             Capability::Generator => match &s.generator {
                 Some((source, config)) => format!(
                     "generator: source {source}, {} generated node(s), config {config}",
@@ -400,6 +403,9 @@ fn set(inv: &Invocation, node: Uuid, args: &Args) -> anyhow::Result<String> {
                 config_json: parsed.to_string(),
             }
         }
+        Capability::Environment => anyhow::bail!(
+            "environment entries are managed with `tod-cli environment`, not `capabilities set`"
+        ),
         Capability::Spec | Capability::Lifecycle => anyhow::bail!(
             "{} has no settings to set here",
             cap.as_str()

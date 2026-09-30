@@ -30,7 +30,7 @@ see `tod-cli batch --help`.
 Only some nouns are documented below. All of them:
 
 `node` `obligations` `plan` `content` `capabilities` `changeset` `tests`
-`review` `pr` `verdicts` `incoming` `learn` `secrets` `decisions` `phase`
+`review` `pr` `verdicts` `incoming` `learn` `secrets` `environment` `decisions` `phase`
 `wait` `batch` `questions` `memory` `interview` `visual-design`
 
 For a noun's commands and rules run `tod-cli <noun> --help`; to find a command

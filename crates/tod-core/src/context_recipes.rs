@@ -139,6 +139,7 @@ pub const IMPLEMENT_SESSION: ContextRecipe = ContextRecipe {
         "cli/plan",
         "cli/tests",
         "cli/secrets",
+        "cli/environment",
         "cli/decisions",
         "cli/wait",
         "surface/implement",
@@ -176,6 +177,7 @@ pub const VERIFY_SESSION: ContextRecipe = ContextRecipe {
         "cli/verdicts",
         "cli/tests",
         "cli/secrets",
+        "cli/environment",
         "cli/decisions",
         "cli/wait",
         "surface/verify",
@@ -250,6 +252,7 @@ pub const FIX_SESSION: ContextRecipe = ContextRecipe {
         "cli/review",
         "cli/tests",
         "cli/secrets",
+        "cli/environment",
         "cli/decisions",
         "cli/wait",
         "surface/fix",
@@ -396,9 +399,10 @@ pub const CONVERSATION: ContextRecipe = ContextRecipe {
         "cli/node",
         "cli/changeset",
         "cli/secrets",
+        "cli/environment",
         "surface/conversation",
     ],
-    blocks: &[DynamicBlock::DataRoot, DynamicBlock::Focus],
+    blocks: &[DynamicBlock::DataRoot, DynamicBlock::Focus, DynamicBlock::Environment],
 };
 
 /// A general conversation: whatever the user asks, on any focus. It has the
@@ -419,9 +423,10 @@ pub const CHAT: ContextRecipe = ContextRecipe {
         "cli/node",
         "cli/changeset",
         "cli/secrets",
+        "cli/environment",
         "surface/chat",
     ],
-    blocks: &[DynamicBlock::DataRoot, DynamicBlock::Focus],
+    blocks: &[DynamicBlock::DataRoot, DynamicBlock::Focus, DynamicBlock::Environment],
 };
 
 /// An incoming-changes check (`crate::incoming`): one short-lived session

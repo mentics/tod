@@ -559,7 +559,20 @@ impl AgentRuns {
         };
 
         let chosen = Self::describe_answer(&after.decision, option_index, text.as_deref());
-        let message = match before.answers.last() {
+        // A credential request: the agent is told whether it is now set,
+        // never anything of its value (`tod_core::environment_request`).
+        let credential = tod_core::environment_request::is_request(&after.decision)
+            .then(|| tod_core::environment_request::parse_question(&after.decision.question))
+            .flatten()
+            .map(|(name, _)| {
+                tod_core::environment_request::answer_message(
+                    &name,
+                    tod_core::environment_request::was_provided(&after.decision, option_index),
+                )
+            });
+        let message = match credential {
+            Some(message) => message,
+            None => match before.answers.last() {
             Some(prev) => {
                 let previous =
                     Self::describe_answer(&after.decision, prev.option, prev.text.as_deref());
@@ -574,6 +587,7 @@ impl AgentRuns {
                 "Decision answered: {}\n\nThe user answered {chosen}.",
                 after.decision.question
             ),
+            },
         };
 
         self.ensure_for_conversation(conversation_id)?;

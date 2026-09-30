@@ -161,6 +161,95 @@ pub fn check(fleet: &FleetStore, check: Check) -> Result<usize> {
     Ok(replaced)
 }
 
+/// What [`refresh_credentials`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Refresh {
+    /// The node has no live cloud sandbox, or its proxy already has every
+    /// credential the Environment defines.
+    NotNeeded,
+    /// The sandbox was deleted and made again with the credentials.
+    Recreated(String),
+    /// It was left alone because deleting it could lose work; the text says
+    /// why. `force` recreates it anyway.
+    NeedsConfirmation(String),
+}
+
+/// Whether `info`'s proxy was made with exactly `custom` (its `tod-env`
+/// label; a sandbox from before the label counts as having none).
+pub fn proxy_is_current(info: &SandboxInfo, custom: &[tod_sandbox::node::CustomCredential]) -> bool {
+    let have = info.label(tod_sandbox::node::ENV_LABEL).unwrap_or("none");
+    have == tod_sandbox::node::env_fingerprint(custom)
+}
+
+/// Proxy rules are fixed when a sandbox is created, so a credential the user
+/// provides (or changes) after that does not reach a node already running in
+/// the cloud. When `node_id` has a live sandbox whose proxy differs from the
+/// node's Environment, push its branch and delete the sandbox, then make it
+/// again through [`ensure_node_sandbox`] (as for a lost sandbox). Uncommitted
+/// changes or a failed push make it [`Refresh::NeedsConfirmation`] unless
+/// `force`. Blocks on the network: never on the UI thread.
+pub fn refresh_credentials(fleet: &FleetStore, node_id: &str, force: bool) -> Result<Refresh> {
+    let root = fleet.paths().root().to_path_buf();
+    let uuid = uuid::Uuid::parse_str(node_id).with_context(|| format!("node id {node_id}"))?;
+    let Some(row) = fleet.read(|c| cloud_nodes::get(c, uuid))? else {
+        return Ok(Refresh::NotNeeded);
+    };
+    let mut sandboxes = tod_store::fleet::sandbox::Sandboxes::load(&root)?;
+    let bx = sandboxes.blaxel()?;
+    let Some(info) = bx.get(&row.sandbox)? else {
+        return Ok(Refresh::NotNeeded);
+    };
+    if sandbox_is_dead(&info) {
+        return Ok(Refresh::NotNeeded);
+    }
+    let creds = tod_store::CredentialStore::from_data_root(&root);
+    let (custom, _) = super::environment_credentials(fleet, &creds, node_id)?;
+    if proxy_is_current(&info, &custom) {
+        return Ok(Refresh::NotNeeded);
+    }
+    if !force && let Some(url) = info.url.as_deref() {
+        let script = format!(
+            "cd {dir} || exit 3; if [ -n \"$(git status --porcelain)\" ]; then echo DIRTY; exit 4; fi;              git push origin HEAD 2>&1 || {{ echo PUSHFAIL; exit 5; }}",
+            dir = tod_sandbox::node::WORKSPACE_DIR
+        );
+        let cmd = format!("sh -c {} 2>&1", tod_sandbox::relay::shell_quote(&script));
+        match bx.run(url, &cmd, 120) {
+            Ok(res) if res.exit_code == 0 => {}
+            Ok(res) if res.exit_code == 4 => {
+                return Ok(Refresh::NeedsConfirmation(format!(
+                    "{} holds uncommitted changes that recreating it would lose",
+                    row.sandbox
+                )));
+            }
+            Ok(_) | Err(_) => {
+                return Ok(Refresh::NeedsConfirmation(format!(
+                    "the branch could not be pushed from {}, so recreating it could lose commits",
+                    row.sandbox
+                )));
+            }
+        }
+    }
+    set_note(node_id, Some("A credential was provided; recreating its sandbox so the proxy has it…".into()));
+    sandboxes.delete(&bx, &row.sandbox).with_context(|| format!("delete sandbox {}", row.sandbox))?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    while bx.get(&row.sandbox)?.is_some() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_secs(2));
+    }
+    let mut progress = |msg: &str| tracing::info!("cloud: recreating {}: {msg}", row.sandbox);
+    let result = ensure_node_sandbox(fleet, &root, node_id, &row.user, &mut progress)
+        .and_then(|name| record_cloud_node(fleet, node_id, name, &row.user));
+    match result {
+        Ok(node) => {
+            set_note(node_id, Some(format!("Recreated {} with the node's credentials.", node.sandbox)));
+            Ok(Refresh::Recreated(node.sandbox))
+        }
+        Err(err) => {
+            set_note(node_id, Some(format!("Its sandbox was deleted for a new credential and could not be recreated: {err:#}")));
+            Err(err)
+        }
+    }
+}
+
 static CHECKING: AtomicBool = AtomicBool::new(false);
 
 /// [`check`] on a thread of its own; a check already running makes this a
@@ -240,6 +329,25 @@ mod tests {
             volumes: Vec::new(),
             node_env: Vec::new(),
         }
+    }
+
+    #[test]
+    fn a_proxy_is_current_when_its_label_matches_the_credentials() {
+        let mut info = sandbox("node-a", "DEPLOYED");
+        assert!(proxy_is_current(&info, &[]));
+        let cred = tod_sandbox::node::CustomCredential {
+            name: "gb".into(),
+            hosts: vec!["api.growthbook.io".into()],
+            header: "Authorization".into(),
+            template: "Bearer {value}".into(),
+            secret_value: "v".into(),
+        };
+        assert!(!proxy_is_current(&info, std::slice::from_ref(&cred)));
+        info.labels = vec![(
+            tod_sandbox::node::ENV_LABEL.to_string(),
+            tod_sandbox::node::env_fingerprint(std::slice::from_ref(&cred)),
+        )];
+        assert!(proxy_is_current(&info, std::slice::from_ref(&cred)));
     }
 
     #[test]

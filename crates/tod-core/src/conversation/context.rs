@@ -175,6 +175,12 @@ pub fn opening_with(
         .get(conversation_id)?
         .with_context(|| format!("conversation {conversation_id} not found"))?;
     let focus = focus_selection(conn, conversation.focus)?;
+    let environment = conversation
+        .focus
+        .node_id()
+        .map(|node| crate::environment_context::render(conn, data_root, node))
+        .transpose()?
+        .unwrap_or_default();
     let extra = if recipe.situational {
         situational_cli(conn, conversation.focus)?
     } else {
@@ -188,6 +194,7 @@ pub fn opening_with(
         &DynamicContext {
             data_root: Some(data_root),
             focus: Some(&focus),
+            environment: &environment,
             ..Default::default()
         },
         "",

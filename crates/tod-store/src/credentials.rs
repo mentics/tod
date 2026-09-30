@@ -153,11 +153,11 @@ impl CredentialStore {
     /// GitHub token is [`GITHUB_PROXY_PLACEHOLDER`]: a command given it
     /// (`tod-cli secrets run`) sends it through the proxy, which replaces it.
     pub fn get(&self, kind: CredentialKind) -> Option<String> {
-        match self.get_from_keyring(kind) {
+        match self.get_from_keyring(kind.keyring_account()) {
             Ok(Some(value)) => return Some(value),
             Ok(None) | Err(_) => {}
         }
-        if let Ok(value) = self.get_from_file(kind) {
+        if let Ok(value) = self.get_from_file(kind.file_name()) {
             return Some(value);
         }
         if self.proxied(kind) {
@@ -170,10 +170,10 @@ impl CredentialStore {
     }
 
     pub fn backend(&self, kind: CredentialKind) -> Option<CredentialBackend> {
-        if self.get_from_keyring(kind).ok().flatten().is_some() {
+        if self.get_from_keyring(kind.keyring_account()).ok().flatten().is_some() {
             return Some(CredentialBackend::Keyring);
         }
-        if self.file_path(kind).is_file() {
+        if self.file_path(kind.file_name()).is_file() {
             return Some(CredentialBackend::EncryptedFile);
         }
         if self.proxied(kind) {
@@ -202,34 +202,34 @@ impl CredentialStore {
             ));
         }
 
-        if self.set_in_keyring(kind, secret).is_ok()
+        if self.set_in_keyring(kind.keyring_account(), secret).is_ok()
             && self
-                .get_from_keyring(kind)
+                .get_from_keyring(kind.keyring_account())
                 .ok()
                 .flatten()
                 .is_some_and(|stored| stored == secret)
         {
-            let _ = self.remove_file(kind);
+            let _ = self.remove_file(kind.file_name());
             return Ok(CredentialBackend::Keyring);
         }
 
-        self.set_in_file(kind, secret)?;
+        self.set_in_file(kind.file_name(), secret)?;
         Ok(CredentialBackend::EncryptedFile)
     }
 
     pub fn delete(&self, kind: CredentialKind) -> Result<(), CredentialError> {
-        let _ = self.delete_from_keyring(kind);
-        let _ = self.remove_file(kind);
+        let _ = self.delete_from_keyring(kind.keyring_account());
+        let _ = self.remove_file(kind.file_name());
         Ok(())
     }
 
-    fn keyring_entry(&self, kind: CredentialKind) -> Result<keyring::Entry, CredentialError> {
-        keyring::Entry::new(&self.keyring_service, kind.keyring_account())
+    fn keyring_entry(&self, account: &str) -> Result<keyring::Entry, CredentialError> {
+        keyring::Entry::new(&self.keyring_service, account)
             .map_err(|err| CredentialError::Message(err.to_string()))
     }
 
-    fn get_from_keyring(&self, kind: CredentialKind) -> Result<Option<String>, CredentialError> {
-        let entry = self.keyring_entry(kind)?;
+    fn get_from_keyring(&self, account: &str) -> Result<Option<String>, CredentialError> {
+        let entry = self.keyring_entry(account)?;
         match entry.get_password() {
             Ok(value) => {
                 let value = value.trim().to_string();
@@ -244,27 +244,27 @@ impl CredentialStore {
         }
     }
 
-    fn set_in_keyring(&self, kind: CredentialKind, secret: &str) -> Result<(), CredentialError> {
-        let entry = self.keyring_entry(kind)?;
+    fn set_in_keyring(&self, account: &str, secret: &str) -> Result<(), CredentialError> {
+        let entry = self.keyring_entry(account)?;
         entry
             .set_password(secret)
             .map_err(|err| CredentialError::Message(err.to_string()))
     }
 
-    fn delete_from_keyring(&self, kind: CredentialKind) -> Result<(), CredentialError> {
-        let entry = self.keyring_entry(kind)?;
+    fn delete_from_keyring(&self, account: &str) -> Result<(), CredentialError> {
+        let entry = self.keyring_entry(account)?;
         match entry.delete_credential() {
             Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
             Err(err) => Err(CredentialError::Message(err.to_string())),
         }
     }
 
-    fn file_path(&self, kind: CredentialKind) -> PathBuf {
-        self.credentials_dir.join(kind.file_name())
+    fn file_path(&self, file_name: &str) -> PathBuf {
+        self.credentials_dir.join(file_name)
     }
 
-    fn get_from_file(&self, kind: CredentialKind) -> Result<String, CredentialError> {
-        let path = self.file_path(kind);
+    fn get_from_file(&self, file_name: &str) -> Result<String, CredentialError> {
+        let path = self.file_path(file_name);
         let bytes = fs::read(&path).map_err(|err| {
             if err.kind() == std::io::ErrorKind::NotFound {
                 CredentialError::NotFound
@@ -283,21 +283,21 @@ impl CredentialStore {
         }
     }
 
-    fn set_in_file(&self, kind: CredentialKind, secret: &str) -> Result<(), CredentialError> {
+    fn set_in_file(&self, file_name: &str, secret: &str) -> Result<(), CredentialError> {
         fs::create_dir_all(&self.credentials_dir).map_err(|err| {
             CredentialError::Message(format!(
                 "create credentials dir {}: {err}",
                 self.credentials_dir.display()
             ))
         })?;
-        let path = self.file_path(kind);
+        let path = self.file_path(file_name);
         let blob = encrypt_blob(secret.as_bytes()).map_err(|err| CredentialError::Message(err))?;
         write_secret_file(&path, &blob)?;
         Ok(())
     }
 
-    fn remove_file(&self, kind: CredentialKind) -> Result<(), CredentialError> {
-        let path = self.file_path(kind);
+    fn remove_file(&self, file_name: &str) -> Result<(), CredentialError> {
+        let path = self.file_path(file_name);
         match fs::remove_file(&path) {
             Ok(()) => Ok(()),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -307,6 +307,53 @@ impl CredentialStore {
             ))),
         }
     }
+
+    /// A secret the user defined, found by `account` (an opaque name, e.g.
+    /// `env/<node>/<name>`): the keyring first, else the encrypted file.
+    /// Unlike a [`CredentialKind`] there is no environment fallback.
+    pub fn get_named(&self, account: &str) -> Option<String> {
+        if let Ok(Some(value)) = self.get_from_keyring(account) {
+            return Some(value);
+        }
+        self.get_from_file(&named_file_name(account)).ok()
+    }
+
+    pub fn has_named(&self, account: &str) -> bool {
+        self.get_named(account).is_some()
+    }
+
+    pub fn set_named(&self, account: &str, secret: &str) -> Result<CredentialBackend, CredentialError> {
+        let secret = secret.trim();
+        if secret.is_empty() {
+            return Err(CredentialError::Message("credential cannot be empty".into()));
+        }
+        let file = named_file_name(account);
+        if self.set_in_keyring(account, secret).is_ok()
+            && self
+                .get_from_keyring(account)
+                .ok()
+                .flatten()
+                .is_some_and(|stored| stored == secret)
+        {
+            let _ = self.remove_file(&file);
+            return Ok(CredentialBackend::Keyring);
+        }
+        self.set_in_file(&file, secret)?;
+        Ok(CredentialBackend::EncryptedFile)
+    }
+
+    pub fn delete_named(&self, account: &str) {
+        let _ = self.delete_from_keyring(account);
+        let _ = self.remove_file(&named_file_name(account));
+    }
+}
+
+/// The encrypted file for a user-defined secret: a hash of its account, so
+/// any name is a safe file name.
+fn named_file_name(account: &str) -> String {
+    let digest = Sha256::digest(account.as_bytes());
+    let hex: String = digest.iter().take(16).map(|b| format!("{b:02x}")).collect();
+    format!("named-{hex}.enc")
 }
 
 fn write_secret_file(path: &Path, bytes: &[u8]) -> Result<(), CredentialError> {
@@ -558,7 +605,7 @@ mod tests {
         let isolated = IsolatedStore::new();
         let store = &isolated.store;
         store
-            .set_in_file(CredentialKind::LinearApiKey, "lin_api_test")
+            .set_in_file(CredentialKind::LinearApiKey.file_name(), "lin_api_test")
             .unwrap();
         assert_eq!(
             store.get(CredentialKind::LinearApiKey).as_deref(),
@@ -567,12 +614,12 @@ mod tests {
         store.delete(CredentialKind::LinearApiKey).unwrap();
         // Check the backends directly: `get` would also consult LINEAR_API_KEY.
         assert!(matches!(
-            store.get_from_file(CredentialKind::LinearApiKey),
+            store.get_from_file(CredentialKind::LinearApiKey.file_name()),
             Err(CredentialError::NotFound)
         ));
         assert!(
             store
-                .get_from_keyring(CredentialKind::LinearApiKey)
+                .get_from_keyring(CredentialKind::LinearApiKey.keyring_account())
                 .ok()
                 .flatten()
                 .is_none()
@@ -593,8 +640,8 @@ mod tests {
         // persist by service/user identity, not in-memory on the Entry handle.
         let isolated = IsolatedStore::new();
         let kind = CredentialKind::LinearApiKey;
-        let set_entry = isolated.store.keyring_entry(kind).unwrap();
-        let get_entry = isolated.store.keyring_entry(kind).unwrap();
+        let set_entry = isolated.store.keyring_entry(kind.keyring_account()).unwrap();
+        let get_entry = isolated.store.keyring_entry(kind.keyring_account()).unwrap();
         set_entry.set_password("separate-entry-roundtrip").unwrap();
         assert_eq!(
             get_entry.get_password().unwrap(),
@@ -631,7 +678,7 @@ mod tests {
     #[test]
     fn the_proxy_wins_over_a_stored_token() {
         let isolated = IsolatedStore::new();
-        isolated.store.set_in_file(CredentialKind::GithubToken, "ghp_stored").unwrap();
+        isolated.store.set_in_file(CredentialKind::GithubToken.file_name(), "ghp_stored").unwrap();
         let proxied = isolated.store.clone().with_github_via_proxy(true);
         assert_eq!(resolve_github_auth(&proxied), Some(crate::github::GithubAuth::Proxy));
         let direct = isolated.store.clone().with_github_via_proxy(false);

@@ -193,6 +193,7 @@ pub fn classify(mutation: &OutlineMutation) -> Option<(ActionKind, Entity, Uuid)
         | M::PasteManagedNodeCopy { .. }
         | M::SetGeneratorAcceptConfig { .. }
         | M::AcceptGeneratedTicket { .. }
+        | M::SetNodeEnvironment { .. }
         | M::SetRefreshStatus { .. } => return None,
     })
 }

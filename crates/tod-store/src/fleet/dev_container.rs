@@ -57,7 +57,9 @@ pub fn launch_for(
             (container.to_string(), host_cwd.clone(), None)
         }
     };
-    let relay = cli_relay::ensure_started(data_root)?;
+    // A token of its own for this container, so `secrets run` starts its
+    // command here and not on the host.
+    let relay = cli_relay::endpoint_for_container(data_root, &container)?;
     Ok(Some(DevContainerLaunch {
         container,
         host_dir,

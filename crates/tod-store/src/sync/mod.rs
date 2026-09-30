@@ -107,6 +107,7 @@ pub const SYNCED_TABLES: &[&str] = &[
     "node_generator_config",
     "node_files",
     "node_agent",
+    "node_environment",
     "obligation_verdicts",
     "review_findings",
     "node_subtree_archives",

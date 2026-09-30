@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Current fleet schema epoch stored in `PRAGMA user_version`.
-pub const CURRENT_USER_VERSION: i32 = 79;
+pub const CURRENT_USER_VERSION: i32 = 80;
 
 const BUSY_TIMEOUT_MS: i64 = 5000;
 
@@ -505,9 +505,16 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
         ensure_obligation_acts_in(conn)?;
         conn.pragma_update(None, "user_version", 79)?;
     }
+    if version < 80 {
+        // The Environment capability's variables and credentials.
+        migrate_v79_to_v80(conn)?;
+        conn.pragma_update(None, "user_version", 80)?;
+    }
     // Other branches (the task panel) numbered their own steps 66–67 at the
     // same time as 66–70 above, so a store may be past a version without
     // having these. Every one is idempotent: make sure of them all.
+    conn.execute_batch(crate::environment::CREATE_TABLE)?;
+    conn.execute_batch(&crate::journey_changes::environment_triggers_sql())?;
     conn.execute_batch(crate::waits::CREATE_TABLE)?;
     conn.execute_batch(&crate::journey_changes::waits_triggers_sql())?;
     conn.execute_batch(crate::cloud_nodes::CREATE_TABLE)?;
@@ -528,6 +535,51 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
     // first seeded it (`INSERT OR IGNORE` alone would never update labels
     // on an install that already ran that migration long ago).
     crate::outline::gate_criteria_seed::seed_gate_criteria(conn)?;
+    Ok(())
+}
+
+/// The Environment capability: its table, and the capability CHECKs on
+/// `node_capabilities` and `capability_archives` (SQLite cannot alter a
+/// CHECK, so both are rebuilt).
+fn migrate_v79_to_v80(conn: &Connection) -> Result<()> {
+    conn.execute_batch("PRAGMA foreign_keys=OFF;")?;
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch(
+        "
+        CREATE TABLE node_capabilities_v80 (
+            node_id     BLOB NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+            capability  TEXT NOT NULL CHECK (capability IN ('spec', 'lifecycle', 'agent', 'generator', 'tags', 'files', 'ticket', 'environment')),
+            enabled_at  INTEGER NOT NULL,
+            PRIMARY KEY (node_id, capability)
+        );
+        INSERT INTO node_capabilities_v80 SELECT node_id, capability, enabled_at FROM node_capabilities;
+        DROP TABLE node_capabilities;
+        PRAGMA legacy_alter_table = ON;
+        ALTER TABLE node_capabilities_v80 RENAME TO node_capabilities;
+        PRAGMA legacy_alter_table = OFF;
+
+        CREATE TABLE capability_archives_v80 (
+            id              BLOB PRIMARY KEY NOT NULL,
+            node_id         BLOB NOT NULL,
+            capability      TEXT NOT NULL CHECK (capability IN ('spec', 'lifecycle', 'agent', 'generator', 'tags', 'files', 'ticket', 'environment')),
+            archived_at     INTEGER NOT NULL,
+            payload         TEXT NOT NULL
+        );
+        INSERT INTO capability_archives_v80 SELECT id, node_id, capability, archived_at, payload FROM capability_archives;
+        DROP INDEX IF EXISTS idx_capability_archives_node;
+        DROP TABLE capability_archives;
+        PRAGMA legacy_alter_table = ON;
+        ALTER TABLE capability_archives_v80 RENAME TO capability_archives;
+        PRAGMA legacy_alter_table = OFF;
+        CREATE INDEX IF NOT EXISTS idx_capability_archives_node ON capability_archives(node_id, archived_at);
+        ",
+    )?;
+    tx.execute_batch(crate::environment::CREATE_TABLE)?;
+    tx.commit()?;
+    conn.execute_batch("PRAGMA foreign_keys=ON;")?;
+    // The rebuilt tables lost their journey triggers.
+    conn.execute_batch(&crate::journey_changes::create_triggers_sql())?;
+    conn.execute_batch(&crate::journey_changes::environment_triggers_sql())?;
     Ok(())
 }
 

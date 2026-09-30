@@ -24,6 +24,7 @@ mod phase;
 mod plan;
 mod pr;
 mod review;
+mod environment;
 mod secrets;
 mod test_runs;
 mod verdicts;
@@ -63,6 +64,7 @@ NOUNS:
     incoming               Changes a node inherits, and the verdict that resolves them
     learn                  A node's retrospective, stored once per pass
     secrets                Run a command with stored secrets, without seeing them
+    environment            Variables and credentials defined for this work; ask the user for one
     decisions              What the user answers: ask, list, show
     phase                  Whether a node's lifecycle phase is done: status, ready, certify, reject
     wait                   What a node waits on between sessions: a time, an event, a check
@@ -92,6 +94,7 @@ const NOUNS: &[(&str, &str)] = &[
     ("incoming", crate::incoming::USAGE),
     ("learn", crate::learn::USAGE),
     ("secrets", crate::secrets::USAGE),
+    ("environment", crate::environment::USAGE),
     ("decisions", crate::decisions::USAGE),
     ("phase", crate::phase::USAGE),
     ("wait", crate::wait::USAGE),
@@ -215,12 +218,13 @@ fn run(args: &[String]) -> anyhow::Result<String> {
         "incoming" => incoming::run(invocation),
         "learn" => learn::run(invocation),
         "secrets" => secrets::run(invocation),
+        "environment" => environment::run(invocation),
         "decisions" => decisions::run(invocation),
         "phase" => phase::run(invocation),
         "wait" => wait::run(invocation),
         "batch" => batch::run(invocation),
         other => anyhow::bail!(
-            "unknown noun `{other}` (expected: node, obligations, content, plan, questions, memory, interview, visual-design, capabilities, changeset, tests, review, pr, verdicts, incoming, learn, secrets, decisions, phase, wait, batch)"
+            "unknown noun `{other}` (expected: node, obligations, content, plan, questions, memory, interview, visual-design, capabilities, changeset, tests, review, pr, verdicts, incoming, learn, secrets, environment, decisions, phase, wait, batch)"
         ),
     }
 }
