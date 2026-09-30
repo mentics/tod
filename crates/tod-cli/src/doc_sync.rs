@@ -58,6 +58,20 @@ mod tests {
         std::fs::read_to_string(path).ok()
     }
 
+    /// The intro lists every noun, so an agent can find one no recipe carries.
+    #[test]
+    fn the_intro_names_every_noun() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../tod/media/context/cli/intro.md");
+        let intro = std::fs::read_to_string(root).unwrap();
+        for &(noun, _) in nouns() {
+            assert!(
+                intro.contains(&format!("`{noun}`")),
+                "cli/intro.md does not list the `{noun}` noun"
+            );
+        }
+    }
+
     /// Every noun the binary dispatches has a fragment a surface can opt into.
     /// Without one, a recipe has no way to tell an agent the noun exists.
     #[test]
