@@ -1,7 +1,7 @@
 # PR readiness and the PR babysitter
 
-Status: proposed design. Extends the `pr` state in
-[phase-agents.md](phase-agents.md).
+Status: implemented, with the differences listed under "As built". Extends
+the `pr` state in [phase-agents.md](phase-agents.md).
 
 ## Problem
 
@@ -265,3 +265,37 @@ it is outward-facing, so it is bounded:
 
 - Whether the stored credentials' scopes allow posting and resolving; a
   check at the first post should fail with a clear message, not silently.
+
+## As built
+
+Where the code differs from the design above:
+
+- **Answering a thread is one CLI call, not a stored answer.** `tod-cli pr
+  threads answer` posts the reply (prefixed with `TOD_MARKER`), resolves the
+  thread, and returns; there is no `pr_thread_answers` table and the app does
+  not post after the push. The agent pushes first, as its instructions say.
+  A thread it cannot decide is a decision (`tod-cli decisions ask`); there is
+  no `needs-user` status.
+- **Rounds are read from GitHub or counted from turns.** Rounds on a thread
+  are the replies of ours already in it (`pr_readiness::rounds`). Rounds on
+  the PR are the agent turns of its conversation since the run began counting
+  (`AutopilotState::pr_turns_base`, reset by renewing the budget). Both limits
+  are `pr_readiness.max_thread_rounds` / `max_rounds`.
+- **The pull request protocol keeps looping while there is work**
+  (`conversation::pr`): after each turn it reads the PR and continues with
+  the work, so the conversation view's Pr step also babysits. The autopilot's
+  `babysit` (`autopilot/mod.rs`) wraps it: it opens the PR, reads it, runs
+  the agent while there is work, asks an overdue bot to review, and polls
+  GitHub while it waits. The poller is that loop; it runs on the run's own
+  thread and sleeps in half-second slices so Pause is heard, and time asleep
+  is not time worked. It does not push a store event; the task panel's runner
+  line shows "waiting for greptile review" through `StepHook::waiting`.
+- **The poll is fixed at 60 s, then 5 min after an hour**, not configurable.
+- **Not built:** the Settings UI for bots (edit `pr_readiness` in `tod.yml`);
+  `WaitingOn` in the task panel beyond the runner line; the `--agent mock`
+  directive support for a fake babysat PR (autopilot tests use a fake
+  `PrFeed`).
+- The gate criteria are `pr-approved.up-to-date`, `.threads-resolved`,
+  `.review-current`, `.review-score`, beside `.mergeable`. The two review
+  criteria pass when no bot is configured. A waiver is the existing per-node
+  waiver; it is not cleared when the head changes.

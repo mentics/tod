@@ -234,18 +234,21 @@ fn live_prs(
     crate::pr_readiness::live(feed.as_ref(), prs, &pr_settings_at(data_root)).ok()
 }
 
+/// How to go about the work, after what it is.
+const WORK_GUIDANCE: &str = "
+Do it now, in order: bring the branch up to date, fix what the feedback needs, run the tests, push, and only then answer each thread with `tod-cli pr threads answer` (which posts your reply and resolves it).
+
+Stay within what this node set out to do. Fix a problem this change introduces. Reject, giving the reason, one that was already there or would enlarge the scope. A thread you cannot decide goes to the user with `tod-cli decisions ask`.
+
+Your reply, when you stop, is at most a sentence or two, or nothing.";
+
 /// What the agent is sent for a turn: the work, then how to go about it.
 pub fn work_message(live: &[crate::pr_readiness::LivePr]) -> String {
     let mut out = String::new();
     for p in live.iter().filter(|p| !p.assessment.work().is_empty()) {
         out.push_str(&crate::pr_readiness::render_work(&p.pr.url, &p.assessment));
     }
-    out.push_str(
-        "
-Do it now, in order: bring the branch up to date, fix what the feedback needs,          run the tests, push, and only then answer each thread with `tod-cli pr threads          answer` (which posts your reply and resolves it). Stay within what this node set          out to do: fix a problem this change introduces; reject, with the reason, one          that was already there or would enlarge the scope. A thread you cannot decide          goes to the user with `tod-cli decisions ask`.
-
-         Your reply, when you stop, is at most a sentence or two, or nothing.",
-    );
+    out.push_str(WORK_GUIDANCE);
     out
 }
 
@@ -431,17 +434,99 @@ open pr: Cloud test"), Some("Cloud test"));
         assert!(matches!(decide(Some(merged_report(None)), 0, true), Next::Done(Stop::Complete)));
     }
 
-    #[test]
-    fn not_yet_mergeable_keeps_the_loop_going() {
-        let Next::Continue { message, .. } = decide(None, 0, true) else {
-            panic!("a PR not yet mergeable should continue");
+    struct Fake {
+        open_thread: bool,
+    }
+
+    impl crate::pr_readiness::PrFeed for Fake {
+        fn snapshot(&self, _: &tod_store::github::NodePr) -> Result<tod_store::github::PrSnapshot, String> {
+            use tod_store::github::{PrSnapshot, PrStatus, ReviewThread};
+            Ok(PrSnapshot {
+                status: PrStatus {
+                    mergeable: Some(true),
+                    mergeable_state: Some("blocked".into()),
+                    merged: false,
+                    checks: Some("success".into()),
+                    head_sha: Some("abcdef1".into()),
+                    head_committed_at: None,
+                    draft: false,
+                    base_ref: None,
+                },
+                threads: self
+                    .open_thread
+                    .then(|| ReviewThread {
+                        id: "PRRT_1".into(),
+                        resolved: false,
+                        outdated: false,
+                        path: Some("src/a.rs".into()),
+                        line: Some(4),
+                        comments: vec![],
+                    })
+                    .into_iter()
+                    .collect(),
+                comments: vec![],
+            })
+        }
+
+        fn comment(&self, _: &tod_store::github::NodePr, _: &str) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    /// [`decide`] on a node that links a pull request `open_thread` says is
+    /// waiting on an answer.
+    fn decide_live(open_thread: bool, continuations: u32, progressed: bool) -> Next {
+        let fx = fixture();
+        fx.fleet
+            .interview(
+                "test",
+                tod_store::interview::InterviewCommand::RecordNodePr {
+                    node_id: fx.node,
+                    owner: "o".into(),
+                    repo: "r".into(),
+                    pr_number: 1,
+                    url: "https://github.com/o/r/pull/1".into(),
+                },
+            )
+            .unwrap();
+        crate::pr_readiness::set_feed_override(Some(std::sync::Arc::new(Fake { open_thread })));
+        let media = MediaPaths::discover().expect("media paths");
+        let env = ProtocolEnv {
+            fleet: &fx.fleet,
+            media: &media,
+            data_root: &fx.root,
+            conversation_id: Uuid::new_v4(),
+            focus: Focus::Node(fx.node),
         };
-        assert!(message.starts_with("The PR is not recorded as mergeable"), "{message}");
+        let next = PrProtocol
+            .next(&TurnContext { env: &env, report: None, continuations, progressed })
+            .expect("a decision");
+        crate::pr_readiness::set_feed_override(None);
+        next
+    }
+
+    #[test]
+    fn feedback_still_open_keeps_the_loop_going() {
+        let Next::Continue { message, .. } = decide_live(true, 0, true) else {
+            panic!("an open review thread should continue");
+        };
+        assert!(message.contains("1 review thread(s) are open"), "{message}");
+        assert!(message.contains("tod-cli pr threads answer"), "{message}");
+    }
+
+    #[test]
+    fn nothing_left_for_the_agent_hands_back() {
+        assert!(matches!(decide_live(false, 0, true), Next::Done(Stop::Complete)));
+    }
+
+    #[test]
+    fn a_pr_that_cannot_be_read_is_left_to_the_gate() {
+        assert!(matches!(decide(None, 0, true), Next::Done(Stop::Complete)));
     }
 
     #[test]
     fn the_cap_or_a_turn_that_changed_nothing_stops_the_loop() {
-        assert!(matches!(decide(None, CONTINUATION_CAP, true), Next::Done(Stop::ContinuationCap)));
-        assert!(matches!(decide(None, 1, false), Next::Done(Stop::NoProgress)));
+        assert!(matches!(decide_live(true, CONTINUATION_CAP, true), Next::Done(Stop::ContinuationCap)));
+        assert!(matches!(decide_live(true, 1, false), Next::Done(Stop::NoProgress)));
     }
 }

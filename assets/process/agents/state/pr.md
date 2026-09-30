@@ -1,32 +1,49 @@
 # State: `pr`
 
-**Gate:** `pr` → `approved`. The app checks it against GitHub: the PR is approved and its checks are green.
+**Gate:** `pr` → `approved`. The app checks it against GitHub; no agent evaluates it: the PR is mergeable (approved, checks green), its branch is up to date with its base, every review thread is resolved, and every review bot the project names has reviewed the current head and scored it high enough.
 
 ## First
 
-The PR is driven as the node's `pr` conversation, started from the conversation view's **Pr** step alongside Send.
+The PR is driven as the node's `pr` conversation. The lifecycle runner sends you into it when there is something to do, and tells you what: the open threads, the failing check, the branch behind its base.
 
 1. Read lifecycle state, obligations, plan, and the review's findings and their answers.
-2. Check `tod-cli pr status` before doing anything else — an earlier session may already have opened the PR.
+2. Check the pull request's status before doing anything else — an earlier session may already have opened the PR.
 
 ## Responsibilities
 
-Open the PR if none exists yet (`tod-cli pr open`), then watch it until it is mergeable:
+Open the PR if none exists yet, then **babysit** it: get it to a state that is 100% mergeable except for the human review, which you cannot do and do not wait on.
 
-- Watch CI checks, review comments, and requested changes.
-- Push fixes for a failing check or a requested change; reply to comments through `tod-cli pr comment reply`.
-- Record the current status through `tod-cli pr status` / `tod-cli pr mergeable` each time something changes.
+- **Keep the branch current.** When the base branch has moved on, merge it into the branch (a merge, never a rebase or a force-push, so review history stays intact), resolve conflicts, and run the tests.
+- **Answer every review thread**, human or bot, with the same care. Read the thread with its code. Then either fix it, or decline with a reason, and answer the thread so the reply is posted and the thread resolved. Push before you answer, so the reply can name the commit.
+- **Fix failing checks** the change caused.
+- **Fix what a review bot found** when its score is under the threshold: its summary comment says what.
 
-Your job ends at **mergeable**, not **approved** — the forward gate is the app's own live check against GitHub, not something you decide.
+You never ask a bot to review and you never wait for one: the app does both, and calls you back when there is something new.
 
-If you cannot make further progress without the user (a merge conflict you cannot resolve, a requested change you cannot judge), record it blocked with why and stop.
+### Scope
+
+Do not grow the PR. For each piece of feedback ask:
+
+- **Does this change introduce the problem?** Then it is in scope. Fix it. No exceptions.
+- **Was the problem already there, and is fixing it not what this node is for?** Then it is out of scope: decline, say it predates the change, and where it is worth keeping, record it as a new task under the project so it is not lost.
+- **Would fixing it enlarge what the node set out to do** (new behaviour, a refactor past what the change touches)? Out of scope, same handling.
+- A real concern (correctness, security, data loss) is never declined for scope alone. If a problem that was already there makes this change unsafe, fixing it is in scope.
+
+Always give the reason in the reply, so the reviewer can disagree. If you cannot tell whether something is in scope, that is a question for the user, not a guess.
+
+### Rounds
+
+A thread you have answered three times that is still open, or four rounds of fixing and reviewing on the PR as a whole, mean something unusual is going on. Stop and hand back with what keeps coming back; the app stops the run on the same limits.
 
 ## Done when
 
-The app checks this gate itself from GitHub's live status; no agent evaluates it:
+The app checks the gate itself from GitHub; you are done when nothing on the PR needs you:
 
-- The PR is approved (per GitHub's review decision) and its checks are green.
+- Every review thread is answered and resolved.
+- The branch contains its base and does not conflict with it.
+- Checks that the change affects are passing.
+- Any review bot's score for the current head meets its threshold.
 
 ## Blockers
 
-CI failure you cannot fix, a merge conflict you cannot resolve, or a requested change you cannot judge → record blocked and hand back.
+A conflict you cannot resolve, a request you cannot judge, a failing check you cannot fix, a question of scope you cannot settle → ask the user, or record blocked with why, and stop.
