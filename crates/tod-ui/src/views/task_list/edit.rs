@@ -94,6 +94,8 @@ pub(super) fn insert_draft_row(tasks: &mut Vec<TaskItem>, draft: &DraftRow) {
             waiting_since: None,
             status_override: None,
             lifecycle_running: false,
+            chat_running: false,
+            finished_run: None,
         },
     );
     for (ordinal, task) in tasks.iter_mut().enumerate() {

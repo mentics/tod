@@ -99,6 +99,9 @@ pub mod color {
     pub fn node_running_text() -> Hsla {
         hex(0xa8c060ff)
     }
+    pub fn node_finished_text() -> Hsla {
+        hex(0xfb923cff)
+    }
     pub fn node_needs_you_text() -> Hsla {
         hex(0xf0805aff)
     }

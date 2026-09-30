@@ -41,6 +41,7 @@ use gpui::{
 use gpui_component::button::Button;
 use gpui_component::{ActiveTheme, IconName, Selectable, Sizable};
 use tod_core::attention::NodeAttention;
+use tod_core::task::model::RunSource;
 use tod_core::workbench_layout::{self, WorkbenchLayout};
 use tod_store::conversation::Focus;
 use tod_store::fleet::FleetStore;
@@ -247,6 +248,16 @@ pub struct UnifiedView {
     /// `SelectionChanged`, delivered later, must not open the node's default
     /// panel over the columns that were restored with it.
     restoring_selection: Option<Uuid>,
+    /// Who was working on each node when the tree was last told: the
+    /// lifecycle processor, and only the chat panel. A node leaving both
+    /// has stopped, and lands in [`Self::finished`].
+    last_lifecycle_running: std::collections::HashSet<Uuid>,
+    last_chat_running: std::collections::HashSet<Uuid>,
+    /// Nodes whose run stopped since the user last selected them, oldest
+    /// first, and which kind stopped. The tree marks them (orange, ringed
+    /// icon) and Alt+Q visits them after the nodes waiting on the user;
+    /// selecting one (by click or by Alt+Q) clears it.
+    finished: Vec<(Uuid, RunSource)>,
     _task_list_subscription: Subscription,
     _agent_runs_subscription: Subscription,
     _runners_subscription: Subscription,
@@ -316,6 +327,9 @@ impl UnifiedView {
             attention: HashMap::new(),
             last_default: Cell::new(None),
             restoring_selection: None,
+            last_lifecycle_running: std::collections::HashSet::new(),
+            last_chat_running: std::collections::HashSet::new(),
+            finished: Vec::new(),
             _task_list_subscription,
             _agent_runs_subscription,
             _runners_subscription,
@@ -439,13 +453,64 @@ impl UnifiedView {
         });
     }
 
-    /// Tells the tree which nodes the lifecycle processor is working on: a
-    /// runner with a run in progress, or a lifecycle conversation mid-turn.
+    /// Tells the tree which nodes the lifecycle processor is working on (a
+    /// runner with a run in progress, or a lifecycle conversation mid-turn),
+    /// which only a chat is, and which stopped since the user last selected
+    /// them. A node that stops while the user already has it selected is not
+    /// marked: they are looking at it.
     fn apply_running_nodes(&mut self, cx: &mut Context<Self>) {
-        let mut nodes = self.agent_runs.read(cx).running_lifecycle_nodes();
-        nodes.extend(self.runners.read(cx).running_nodes());
-        let set: std::collections::HashSet<String> = nodes.iter().map(|n| n.to_string()).collect();
-        self.task_list.update(cx, |task_list, cx| task_list.set_running_nodes(set, cx));
+        let mut lifecycle = self.agent_runs.read(cx).running_lifecycle_nodes();
+        lifecycle.extend(self.runners.read(cx).running_nodes());
+        let chat = self.agent_runs.read(cx).running_chat_nodes();
+        let selected = self.task_list.read(cx).selected_node_id();
+        let was_active: Vec<Uuid> = self
+            .last_lifecycle_running
+            .iter()
+            .chain(&self.last_chat_running)
+            .copied()
+            .collect();
+        for node in was_active {
+            if lifecycle.contains(&node) || chat.contains(&node) || selected == Some(node) {
+                continue;
+            }
+            let source = if self.last_lifecycle_running.contains(&node) {
+                RunSource::Lifecycle
+            } else {
+                RunSource::Chat
+            };
+            self.finished.retain(|(id, _)| *id != node);
+            self.finished.push((node, source));
+        }
+        // A node working again is no longer "finished".
+        self.finished
+            .retain(|(id, _)| !lifecycle.contains(id) && !chat.contains(id));
+        self.last_lifecycle_running = lifecycle;
+        self.last_chat_running = chat;
+        self.feed_running_nodes(cx);
+    }
+
+    fn feed_running_nodes(&mut self, cx: &mut Context<Self>) {
+        let ids = |set: &std::collections::HashSet<Uuid>| -> std::collections::HashSet<String> {
+            set.iter().map(|n| n.to_string()).collect()
+        };
+        let lifecycle = ids(&self.last_lifecycle_running);
+        let chat = ids(&self.last_chat_running);
+        let finished = self
+            .finished
+            .iter()
+            .map(|(id, source)| (id.to_string(), *source))
+            .collect();
+        self.task_list
+            .update(cx, |task_list, cx| task_list.set_running_nodes(lifecycle, chat, finished, cx));
+    }
+
+    /// The user has seen `node`: drop its "finished" marker.
+    fn clear_finished(&mut self, node: Uuid, cx: &mut Context<Self>) {
+        let before = self.finished.len();
+        self.finished.retain(|(id, _)| *id != node);
+        if self.finished.len() != before {
+            self.feed_running_nodes(cx);
+        }
     }
 
     /// Recomputes every running node's status label (W11) from
@@ -480,6 +545,7 @@ impl UnifiedView {
                 let node_id = task_id.as_deref().and_then(|id| Uuid::parse_str(id).ok());
                 let restored = self.restoring_selection.take();
                 if let Some(id) = node_id {
+                    self.clear_finished(id, cx);
                     // A selection Back or Forward made brings its own columns.
                     if restored != Some(id) {
                         // The node tree (column 1) always counts as pinned, so a
@@ -907,7 +973,16 @@ impl UnifiedView {
     }
 
     fn next_waiting_node(&self, forward: bool, cx: &Context<Self>) -> Option<Uuid> {
-        let order = attention_feed::waiting_order(&self.attention);
+        // Nodes waiting on the user come first; then those whose run stopped
+        // unseen, oldest first.
+        let mut order = attention_feed::waiting_order(&self.attention);
+        let unseen: Vec<Uuid> = self
+            .finished
+            .iter()
+            .map(|(id, _)| *id)
+            .filter(|id| !order.contains(id))
+            .collect();
+        order.extend(unseen);
         if order.is_empty() {
             return None;
         }
@@ -935,6 +1010,7 @@ impl UnifiedView {
             return;
         };
         let task_id = target.to_string();
+        self.clear_finished(target, cx);
         self.task_list
             .update(cx, |task_list, cx| task_list.reveal_node(&task_id, window, cx));
         // Selecting in the tree opens the default panel too (through

@@ -78,6 +78,19 @@ pub struct TaskItem {
     /// The lifecycle processor is working on this node right now (fed by the
     /// host via `TaskListView::set_running_nodes`).
     pub lifecycle_running: bool,
+    /// Only the chat panel (not the lifecycle processor) is working on this
+    /// node right now. Ignored while `lifecycle_running`, which wins.
+    pub chat_running: bool,
+    /// Something stopped on this node since the user last selected it; the
+    /// row says which kind did (fed by `TaskListView::set_finished_nodes`).
+    pub finished_run: Option<RunSource>,
+}
+
+/// What was acting on a node: the lifecycle processor, or only the chat panel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunSource {
+    Lifecycle,
+    Chat,
 }
 
 impl TaskItem {
@@ -661,6 +674,8 @@ mod tests {
             waiting_since: None,
             status_override: None,
             lifecycle_running: false,
+            chat_running: false,
+            finished_run: None,
         }
     }
 

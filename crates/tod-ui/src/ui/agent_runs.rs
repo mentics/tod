@@ -372,6 +372,21 @@ impl AgentRuns {
             .collect()
     }
 
+    /// Nodes a chat (the chat drawer, the freeform conversation) is working
+    /// on right now: the complement of [`Self::running_lifecycle_nodes`].
+    pub fn running_chat_nodes(&self) -> std::collections::HashSet<Uuid> {
+        self.slots
+            .iter()
+            .filter(|s| {
+                s.status.running && matches!(s.protocol, ProtocolKind::Chat | ProtocolKind::Outline)
+            })
+            .filter_map(|s| match s.focus {
+                Focus::Node(id) => Some(id),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// The status label (W11, `unified::status_label`) for every node with a
     /// gate check or on-entry run in flight, keyed by node id. Nodes with
     /// nothing running are left out — the tree row falls back to its own
