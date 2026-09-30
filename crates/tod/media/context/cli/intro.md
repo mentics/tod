@@ -19,13 +19,19 @@ Any text flag (`--body`, `--why`, `--detail`) takes `-` to read its text from
 stdin, for long or multi-line text passed with a heredoc. Only one flag per
 command can read stdin.
 
+## Many changes at once
+
+Do not make one call per change when you have many. `tod-cli batch run` takes
+a script of commands, one per line, and reports only the ones that failed;
+see `tod-cli batch --help`.
+
 ## Nouns
 
 Only some nouns are documented below. All of them:
 
 `node` `obligations` `plan` `content` `capabilities` `changeset` `tests`
 `review` `pr` `verdicts` `incoming` `learn` `secrets` `decisions` `phase`
-`wait` `questions` `memory` `interview` `visual-design`
+`wait` `batch` `questions` `memory` `interview` `visual-design`
 
 For a noun's commands and rules run `tod-cli <noun> --help`; to find a command
 by topic run `tod-cli help <WORDS>` (e.g. `tod-cli help lifecycle`). Search
