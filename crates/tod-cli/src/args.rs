@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use uuid::Uuid;
 
 /// Flags that never take a value.
-const SWITCHES: &[&str] = &["--before", "--append", "--inherited", "--open", "--unchecked", "--all-open", "--all"];
+const SWITCHES: &[&str] = &["--before", "--append", "--inherited", "--open", "--unchecked", "--all-open", "--all", "--fixed", "--rejected"];
 
 #[derive(Default)]
 pub struct Args {
@@ -164,6 +164,21 @@ mod tests {
 
     fn parse(args: &[&str]) -> anyhow::Result<Args> {
         Args::parse(&args.iter().map(|a| a.to_string()).collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn a_thread_answer_takes_its_verdict_as_a_switch_in_any_position() {
+        for args in [
+            ["THREAD", "--fixed", "--reply", "done", "--node", "n"],
+            ["THREAD", "--reply", "done", "--fixed", "--node", "n"],
+            ["THREAD", "--reply", "done", "--node", "n", "--fixed"],
+        ] {
+            let args = parse(&args).unwrap();
+            assert!(args.has("--fixed"));
+            assert_eq!(args.get("--reply"), Some("done"));
+            assert_eq!(args.get("--node"), Some("n"));
+        }
+        assert!(parse(&["T", "--rejected", "--reply", "no"]).unwrap().has("--rejected"));
     }
 
     #[test]
