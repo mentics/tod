@@ -492,7 +492,7 @@ fn answer_thread(inv: &Invocation, rest: &[String]) -> anyhow::Result<String> {
         return Ok(format!("thread {thread_id} is already resolved"));
     }
     github
-        .reply_to_thread(thread_id, reply)
+        .reply_to_thread(thread_id, &reply)
         .map_err(|err| anyhow::anyhow!("GitHub (reply): {err}"))?;
     github
         .resolve_thread(thread_id)
