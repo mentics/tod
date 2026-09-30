@@ -153,6 +153,7 @@ pub fn register_unified_keyboard_bindings(cx: &mut App) {
         KeyBinding::new("ctrl-w", UnifiedCloseFocusedColumn, context),
     ]);
     register_chat_drawer_keyboard_bindings(cx);
+    panels::transcript::register_transcript_panel_bindings(cx);
 }
 
 /// A column-2+ slot: the model's bookkeeping plus the panel entity backing

@@ -21,6 +21,10 @@ actions!(
         ConversationUp,
         /// Move the highlight down.
         ConversationDown,
+        /// Scroll the transcript up one screen, taking its highlight along.
+        ConversationPageUp,
+        /// Scroll the transcript down one screen, taking its highlight along.
+        ConversationPageDown,
         /// Select or unselect the highlighted change.
         ConversationToggleSelect,
         /// Activate the highlighted stop, picker entry, or confirmation; expand
@@ -64,6 +68,8 @@ pub fn register_conversation_keyboard_bindings(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("up", ConversationUp, nav),
         KeyBinding::new("down", ConversationDown, nav),
+        KeyBinding::new("pageup", ConversationPageUp, nav),
+        KeyBinding::new("pagedown", ConversationPageDown, nav),
         KeyBinding::new("space", ConversationToggleSelect, nav),
         KeyBinding::new("enter", ConversationActivate, nav),
         KeyBinding::new("r", ConversationReverse, nav),

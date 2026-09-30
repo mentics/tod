@@ -1396,6 +1396,15 @@ impl ConversationView {
 
     // ----- the message input ---------------------------------------------
 
+    /// Whether the transcript is what the arrow keys are on.
+    fn transcript_focused(&self) -> bool {
+        self.pane == Pane::Transcript
+            && self.stop == Stop::Transcript
+            && self.confirm.is_none()
+            && self.picker.is_none()
+            && !self.text_editing()
+    }
+
     fn text_editing(&self) -> bool {
         self.input_editing || self.editing.is_some()
     }
@@ -2097,6 +2106,11 @@ impl Render for ConversationView {
                 if this.nav_collapse(cx) {
                     return;
                 }
+                if this.transcript_focused()
+                    && this.transcript.update(cx, |panel, cx| panel.collapse_highlight(cx))
+                {
+                    return;
+                }
                 if !this.text_editing() && this.collapse_change_group(cx) {
                     return;
                 }
@@ -2106,6 +2120,11 @@ impl Render for ConversationView {
             }))
             .on_action(cx.listener(|this, _: &ConversationLinkRight, _, cx| {
                 if this.nav_expand(cx) {
+                    return;
+                }
+                if this.transcript_focused()
+                    && this.transcript.update(cx, |panel, cx| panel.expand_highlight(cx))
+                {
                     return;
                 }
                 if !this.text_editing() && this.expand_change_group(cx) {
@@ -2119,6 +2138,16 @@ impl Render for ConversationView {
             .move_highlight(-1, cx));
         let root = nav_action!(root, cx, ConversationDown, |this, window, cx| this
             .move_highlight(1, cx));
+        let root = nav_action!(root, cx, ConversationPageUp, |this, window, cx| {
+            if this.transcript_focused() {
+                this.transcript.update(cx, |panel, cx| panel.page(false, cx));
+            }
+        });
+        let root = nav_action!(root, cx, ConversationPageDown, |this, window, cx| {
+            if this.transcript_focused() {
+                this.transcript.update(cx, |panel, cx| panel.page(true, cx));
+            }
+        });
         let root = nav_action!(root, cx, ConversationActivate, |this, window, cx| this
             .activate(window, cx));
         let root = nav_action!(root, cx, ConversationBack, |this, window, cx| this
