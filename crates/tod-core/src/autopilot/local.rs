@@ -126,6 +126,7 @@ impl LocalRun {
                     on_event: &mut on_event,
                     last: None,
                     last_at: None,
+                    waiting: false,
                 };
                 let result = (|| {
                     let mut pilot = Autopilot::new(config, node, budget)?;
@@ -201,6 +202,9 @@ struct Hook<'a, F: FnMut(LocalEvent)> {
     /// The last [`Live`] reported, so an unchanged one is not sent again.
     last: Option<Live>,
     last_at: Option<std::time::Instant>,
+    /// The run is waiting on something outside (`StepHook::waiting`), so
+    /// reaching a step boundary does not show it as idle.
+    waiting: bool,
 }
 
 impl<F: FnMut(LocalEvent)> Hook<'_, F> {
@@ -236,7 +240,7 @@ impl<F: FnMut(LocalEvent)> Hook<'_, F> {
 
 impl<F: FnMut(LocalEvent)> StepHook for Hook<'_, F> {
     fn at(&mut self, _: &FleetStore, boundary: Boundary) -> Result<Option<String>> {
-        if boundary == Boundary::Step {
+        if boundary == Boundary::Step && !self.waiting {
             self.report(Live::default());
         }
         Ok(match self.requested() {
@@ -244,6 +248,21 @@ impl<F: FnMut(LocalEvent)> StepHook for Hook<'_, F> {
             Request::Pause => Some(PAUSED.to_string()),
             Request::StopNow => Some(STOPPED.to_string()),
         })
+    }
+
+    fn waiting(&mut self, on: Option<&str>) {
+        self.waiting = on.is_some();
+        if let Some(on) = on {
+            self.report(Live {
+                protocol: Some(ProtocolKind::Pr),
+                conversation_id: None,
+                status: ConversationStatus {
+                    running: true,
+                    activity: Some(on.to_string()),
+                    ..Default::default()
+                },
+            });
+        }
     }
 
     fn watch(&mut self, turn: Turn<'_>) -> Option<String> {

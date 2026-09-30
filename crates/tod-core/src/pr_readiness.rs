@@ -622,3 +622,114 @@ mod tests {
         assert_eq!(a.next(), Next::Merged);
     }
 }
+
+/// Where the babysitter reads a pull request from and posts to: GitHub, or a
+/// fake in tests ([`set_feed_override`]).
+pub trait PrFeed: Send + Sync {
+    fn snapshot(&self, pr: &tod_store::github::NodePr) -> Result<PrSnapshot, String>;
+    /// A top-level comment on the pull request.
+    fn comment(&self, pr: &tod_store::github::NodePr, body: &str) -> Result<(), String>;
+}
+
+/// [`PrFeed`] over the GitHub API, with the credentials the app itself uses.
+pub struct GithubFeed(pub tod_store::github::Github);
+
+impl PrFeed for GithubFeed {
+    fn snapshot(&self, pr: &tod_store::github::NodePr) -> Result<PrSnapshot, String> {
+        cached_snapshot(&self.0, pr).map_err(|err| err.to_string())
+    }
+
+    fn comment(&self, pr: &tod_store::github::NodePr, body: &str) -> Result<(), String> {
+        self.0.post_issue_comment(&pr.owner, &pr.repo, pr.pr_number, body).map_err(|err| err.to_string())
+    }
+}
+
+thread_local! {
+    static FEED_OVERRIDE: std::cell::RefCell<Option<std::sync::Arc<dyn PrFeed>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Replaces GitHub with `feed` for callers on this thread (tests, which run
+/// the autopilot synchronously). `None` puts GitHub back.
+pub fn set_feed_override(feed: Option<std::sync::Arc<dyn PrFeed>>) {
+    FEED_OVERRIDE.with(|cell| *cell.borrow_mut() = feed);
+}
+
+/// The feed for the app whose data lives at `data_root`: the override, else
+/// GitHub with the stored credentials; `None` without any.
+pub fn feed_for(data_root: &std::path::Path) -> Option<std::sync::Arc<dyn PrFeed>> {
+    if let Some(feed) = FEED_OVERRIDE.with(|cell| cell.borrow().clone()) {
+        return Some(feed);
+    }
+    let store = tod_store::credentials::CredentialStore::from_data_root(data_root);
+    let auth = tod_store::credentials::resolve_github_auth(&store)?;
+    Some(std::sync::Arc::new(GithubFeed(tod_store::github::Github::new(auth))))
+}
+
+/// The project's readiness settings; the defaults when unreadable.
+pub fn settings_at(data_root: &std::path::Path) -> PrReadinessSettings {
+    tod_store::TodSettings::load(&tod_store::TodPaths::at(data_root))
+        .map(|settings| settings.pr_readiness)
+        .unwrap_or_default()
+}
+
+/// One linked pull request as it stands now.
+#[derive(Debug, Clone)]
+pub struct LivePr {
+    pub pr: tod_store::github::NodePr,
+    pub draft: bool,
+    pub assessment: Assessment,
+    /// Head commit and open threads: changes when a turn did something.
+    pub fingerprint: String,
+}
+
+/// Every linked pull request, read and assessed. `Err` says why one could
+/// not be read (no credentials, GitHub down): the caller leaves that to the
+/// gate, which reports it.
+pub fn live(
+    feed: &dyn PrFeed,
+    prs: &[tod_store::github::NodePr],
+    settings: &PrReadinessSettings,
+) -> Result<Vec<LivePr>, String> {
+    let now = Utc::now();
+    prs.iter()
+        .map(|pr| {
+            let snapshot = feed.snapshot(pr).map_err(|err| format!("{}: {err}", pr.url))?;
+            let assessment = Assessment::of(&snapshot, settings, now);
+            let mut open: Vec<&str> = assessment.open_threads.iter().map(|t| t.id.as_str()).collect();
+            open.sort_unstable();
+            let fingerprint = format!(
+                "{}|{}|{}|{}",
+                snapshot.status.head_sha.as_deref().unwrap_or(""),
+                snapshot.status.mergeable_state.as_deref().unwrap_or(""),
+                snapshot.comments.len(),
+                open.join(",")
+            );
+            Ok(LivePr { pr: pr.clone(), draft: snapshot.status.draft, assessment, fingerprint })
+        })
+        .collect()
+}
+
+/// What the babysitter does next across `prs`: the first work, else the
+/// waits together, else clear; merged only when every one is.
+pub fn overall(prs: &[LivePr]) -> Next {
+    if prs.iter().all(|p| p.assessment.merged) {
+        return Next::Merged;
+    }
+    let mut work = Vec::new();
+    let mut waits = Vec::new();
+    for p in prs {
+        match p.assessment.next() {
+            Next::Work(w) => work.extend(w),
+            Next::Wait(w) => waits.extend(w),
+            Next::Merged | Next::Clear => {}
+        }
+    }
+    if !work.is_empty() {
+        Next::Work(work)
+    } else if !waits.is_empty() {
+        Next::Wait(waits)
+    } else {
+        Next::Clear
+    }
+}

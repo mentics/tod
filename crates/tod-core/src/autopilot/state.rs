@@ -41,6 +41,10 @@ pub struct AutopilotState {
     pub steps: Vec<StepRecord>,
     /// How the last run stopped; `None` while one runs.
     pub outcome: Option<Outcome>,
+    /// The pull request conversation's agent turns when rounds on it began
+    /// to count (`doc/lifecycle/pr-readiness.md`); `None` until the first.
+    #[serde(default)]
+    pub pr_turns_base: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -74,6 +78,7 @@ impl AutopilotState {
             current: None,
             steps: Vec::new(),
             outcome: None,
+            pr_turns_base: None,
         }
     }
 

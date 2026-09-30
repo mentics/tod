@@ -15,7 +15,11 @@
 
 use tod_store::fleet::Workdir;
 use super::implement::{IMPLEMENT_CONVERSATION_ENV, IMPLEMENT_NODE_ENV, node_id, plan_steps};
-use super::protocol::{Next, Protocol, ProtocolEnv, Stop, TurnContext, cap_or_stall};
+use super::protocol::{
+    Next, Protocol, ProtocolEnv, Stop, TurnContext, cap_or_stall, hand_back_for_pending_decision,
+};
+use crate::pr_readiness::{Next as PrNext, overall as pr_overall};
+use tod_store::conversation::{ConversationRepo, TurnRole};
 use crate::agent_context::{ImplementRequest, NodeSelection, build_pr_message};
 use crate::process_bundle::{ProcessManifest, TodInstallPaths, state_role_doc};
 use anyhow::{Context, Result};
@@ -158,44 +162,116 @@ impl Protocol for PrProtocol {
         true
     }
 
-    /// Fingerprint of the PR's live state — what comments exist and their
-    /// status, whether it is mergeable, and its check conclusion — so a
-    /// continuation that changed nothing stops the loop rather than re-poll.
+    /// Fingerprint of the PR's live state (its head commit, mergeability,
+    /// comment count, and open threads), so a turn that changed none of it
+    /// stops the loop rather than going round again. Before any of it can be
+    /// read, the PR links alone.
     fn progress(&self, env: &ProtocolEnv<'_>) -> Result<Option<String>> {
         let node = node_id(env)?;
         let prs = env.fleet.read(|conn| NodePrRepo::new(conn).read(node))?.prs;
-        Ok((!prs.is_empty()).then(|| {
+        if prs.is_empty() {
+            return Ok(None);
+        }
+        if let Some(live) = live_prs(env.data_root, &prs) {
+            return Ok(Some(live.iter().map(|p| p.fingerprint.clone()).collect::<Vec<_>>().join(" ")));
+        }
+        Ok(Some(
             prs.iter()
                 .map(|pr| format!("{}/{}#{}", pr.owner, pr.repo, pr.pr_number))
                 .collect::<Vec<_>>()
-                .join(" ")
-        }))
+                .join(" "),
+        ))
     }
 
-    /// Done when this turn recorded the PR mergeable or merged. Otherwise
-    /// another turn goes out, until the cap or a turn that recorded nothing.
+    /// Done when the pull request needs nothing more from the agent: every
+    /// review thread answered, the branch current, checks passing, any bot's
+    /// score met. What is left is waiting (a bot's review, CI, a human
+    /// reviewer), which the app does itself — polling GitHub, not an agent
+    /// turn — and the gate then checks. While there is work, another turn
+    /// goes out, until the cap or a turn that changed nothing.
     fn next(&self, turn: &TurnContext<'_>) -> Result<Next> {
+        if let Some(next) = hand_back_for_pending_decision(turn)? {
+            return Ok(next);
+        }
         if turn.report.is_some_and(is_done_report) {
             return Ok(Next::Done(Stop::Complete));
+        }
+        let node = node_id(turn.env)?;
+        let prs = turn.env.fleet.read(|conn| NodePrRepo::new(conn).read(node))?.prs;
+        let Some(live) = live_prs(turn.env.data_root, &prs) else {
+            return Ok(Next::Done(Stop::Complete));
+        };
+        let PrNext::Work(work) = pr_overall(&live) else {
+            return Ok(Next::Done(Stop::Complete));
+        };
+        let settings = pr_settings_at(turn.env.data_root);
+        let turns = turn
+            .env
+            .fleet
+            .read(|conn| ConversationRepo::new(conn).turns(turn.env.conversation_id))?
+            .iter()
+            .filter(|t| t.role == TurnRole::Agent)
+            .count() as u32;
+        if let Some(why) = pr_stuck(&live, &settings, turns.saturating_sub(1)) {
+            return Ok(Next::Done(Stop::HandBack(why)));
         }
         if let Some(done) = cap_or_stall(turn) {
             return Ok(done);
         }
         Ok(Next::Continue {
-            message: continuation_message(),
-            reason: "the PR is not recorded as mergeable yet".to_string(),
+            message: work_message(&live),
+            reason: format!("{} thing(s) still to do on the pull request", work.len()),
         })
     }
 }
 
-fn continuation_message() -> String {
-    "The PR is not recorded as mergeable yet. Check its status now (`tod-cli pr status`), \
-     push any fix a failing check or requested change needs, reply to open comments, and \
-     record `tod-cli pr mergeable` once it is ready — or `pr merged` if it was merged \
-     already.\n\n\
-     Your reply, when you stop, is at most a sentence or two, or nothing: the user already \
-     sees the PR's status."
-        .to_string()
+/// Every linked pull request as it stands now; `None` when none can be read.
+fn live_prs(
+    data_root: &std::path::Path,
+    prs: &[tod_store::github::NodePr],
+) -> Option<Vec<crate::pr_readiness::LivePr>> {
+    let feed = crate::pr_readiness::feed_for(data_root)?;
+    crate::pr_readiness::live(feed.as_ref(), prs, &pr_settings_at(data_root)).ok()
+}
+
+/// What the agent is sent for a turn: the work, then how to go about it.
+pub fn work_message(live: &[crate::pr_readiness::LivePr]) -> String {
+    let mut out = String::new();
+    for p in live.iter().filter(|p| !p.assessment.work().is_empty()) {
+        out.push_str(&crate::pr_readiness::render_work(&p.pr.url, &p.assessment));
+    }
+    out.push_str(
+        "
+Do it now, in order: bring the branch up to date, fix what the feedback needs,          run the tests, push, and only then answer each thread with `tod-cli pr threads          answer` (which posts your reply and resolves it). Stay within what this node set          out to do: fix a problem this change introduces; reject, with the reason, one          that was already there or would enlarge the scope. A thread you cannot decide          goes to the user with `tod-cli decisions ask`.
+
+         Your reply, when you stop, is at most a sentence or two, or nothing.",
+    );
+    out
+}
+
+/// Why the babysitter must hand back rather than go on: a thread answered
+/// as often as allowed and still open, or as many rounds as allowed.
+pub fn pr_stuck(
+    live: &[crate::pr_readiness::LivePr],
+    settings: &tod_store::PrReadinessSettings,
+    rounds: u32,
+) -> Option<String> {
+    for p in live {
+        if let Some(thread) = p.assessment.stuck_thread(settings.max_thread_rounds) {
+            return Some(format!(
+                "{} rounds on one review thread ({}) and it is still open",
+                thread.rounds,
+                thread.path.as_deref().unwrap_or("no file")
+            ));
+        }
+    }
+    (rounds >= settings.max_rounds).then(|| {
+        format!("{rounds} rounds of fixing and reviewing and the pull request still is not clear")
+    })
+}
+
+fn pr_settings_at(data_root: &std::path::Path) -> tod_store::PrReadinessSettings {
+    crate::pr_readiness::settings_at(data_root)
 }
 
 /// Plays the pr agent for `--agent mock`: the first turn opens the PR and

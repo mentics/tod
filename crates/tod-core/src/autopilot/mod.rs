@@ -34,7 +34,6 @@ pub use state::{AutopilotState, CurrentStep, StepRecord, state_path};
 use crate::conversation::driver::{
     AgentAccess, ConversationConfig, ConversationDriver, ConversationEvent, ConversationStatus,
 };
-use crate::conversation::pr::is_done_report;
 use crate::conversation::protocol::protocol_for;
 use crate::lifecycle;
 use crate::lifecycle_next::{NextStep, Standing, next_step};
@@ -119,6 +118,10 @@ pub trait StepHook {
     fn watch(&mut self, _turn: Turn<'_>) -> Option<String> {
         None
     }
+
+    /// The run is waiting on something outside (a bot's review, CI) and no
+    /// agent is working: `Some(what)` while it waits, `None` when it stops.
+    fn waiting(&mut self, _on: Option<&str>) {}
 }
 
 /// No hook: never stops.
@@ -156,6 +159,11 @@ pub enum NeedsHuman {
     EvaluationStuck { fixes: Vec<String> },
     /// The pull request's agent handed back.
     PrBlocked { why: String },
+    /// The pull request keeps needing work: a review thread answered as
+    /// often as allowed and still open, too many rounds of fixing and
+    /// reviewing, or a turn that changed nothing twice running. Something
+    /// unusual is going on (`doc/lifecycle/pr-readiness.md`).
+    PrStuck { why: String },
     /// The agent asked for a permission nobody is here to grant.
     Permission { title: String },
     /// A turn failed.
@@ -195,6 +203,7 @@ impl NeedsHuman {
                 fixes.join("; ")
             ),
             Self::PrBlocked { why } => format!("the pull request is blocked: {why}"),
+            Self::PrStuck { why } => format!("the pull request needs a person: {why}"),
             Self::Permission { title } => format!("the agent asked for permission: {title}"),
             Self::AgentFailed { error } => format!("the agent's turn failed: {error}"),
             Self::NoProgress { step } => format!("{step} changed nothing"),
@@ -226,8 +235,17 @@ pub struct Autopilot {
     node: Uuid,
     budget: Budget,
     poll: Duration,
+    /// How often a pull request is read again while the run waits on it.
+    pr_poll: Duration,
     state: AutopilotState,
 }
+
+/// How often a waiting pull request is read again, at first.
+pub const PR_POLL: Duration = Duration::from_secs(60);
+/// After waiting this long the pull request is read [`PR_SLOW_FACTOR`] times
+/// less often.
+const PR_SLOW_AFTER: Duration = Duration::from_secs(60 * 60);
+const PR_SLOW_FACTOR: u32 = 5;
 
 impl Autopilot {
     /// The autopilot for `node`, continuing whatever run its saved state
@@ -239,8 +257,15 @@ impl Autopilot {
             node,
             budget,
             poll: Duration::from_millis(500),
+            pr_poll: PR_POLL,
             state,
         })
+    }
+
+    /// How often a pull request being waited on is read again.
+    pub fn with_pr_poll_interval(mut self, pr_poll: Duration) -> Self {
+        self.pr_poll = pr_poll;
+        self
     }
 
     /// How long to wait between polls of a turn in flight.
@@ -272,6 +297,9 @@ impl Autopilot {
         self.state.active_ms = 0;
         self.state.active_since_ms = None;
         self.state.sessions = 0;
+        // Rounds on the pull request count from here: the user has seen why
+        // it stopped and wants it to go on.
+        self.state.pr_turns_base = None;
         self.save()
     }
 
@@ -395,29 +423,12 @@ impl Autopilot {
         hook: &mut H,
         from: &str,
     ) -> Result<Option<Outcome>> {
-        // In `pr`, the pull request's own agent comes first: the gate only
-        // asks GitHub what it made of it.
-        if from == "pr" {
-            if matches!(self.pr_report(fleet)?, PrStanding::Open)
-                && let Some(outcome) = self.converse(fleet, agent, hook, ProtocolKind::Pr, None)?
-            {
-                return Ok(Some(outcome));
-            }
-            match self.pr_report(fleet)? {
-                PrStanding::Blocked(why) => {
-                    return Ok(Some(Outcome::NeedsHuman {
-                        reason: NeedsHuman::PrBlocked { why },
-                    }));
-                }
-                PrStanding::Open => {
-                    return Ok(Some(Outcome::NeedsHuman {
-                        reason: NeedsHuman::NoProgress {
-                            step: protocol_name(ProtocolKind::Pr).to_string(),
-                        },
-                    }));
-                }
-                PrStanding::Done => {}
-            }
+        // In `pr`, the babysitter comes first: it gets the pull request to
+        // where only the human review is missing, then the gate checks it.
+        if from == "pr"
+            && let Some(outcome) = self.babysit(fleet, agent, hook)?
+        {
+            return Ok(Some(outcome));
         }
         let gate = settle_gate(fleet, self.node)?;
         if !gate.clear() {
@@ -498,27 +509,231 @@ impl Autopilot {
         Ok(None)
     }
 
-    fn pr_report(&self, fleet: &FleetStore) -> Result<PrStanding> {
-        let report = fleet.read(|conn| {
+    /// The latest report the node's pull request conversation recorded.
+    fn pr_report(&self, fleet: &FleetStore) -> Result<Option<serde_json::Value>> {
+        fleet.read(|conn| {
             let repo = ConversationRepo::new(conn);
             match repo.latest_for_focus_with_protocol(Focus::Node(self.node), ProtocolKind::Pr)? {
                 Some(conversation) => Ok(repo.latest_report(conversation.id)?),
                 None => Ok(None),
             }
-        })?;
-        Ok(match report {
-            Some(report) if report.get("pr").and_then(|v| v.as_str()) == Some("blocked") => {
-                PrStanding::Blocked(
-                    report
-                        .get("why")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or_default()
-                        .to_string(),
-                )
-            }
-            Some(report) if is_done_report(&report) => PrStanding::Done,
-            _ => PrStanding::Open,
         })
+    }
+
+    /// Agent turns the node's pull request conversation has had.
+    fn pr_agent_turns(&self, fleet: &FleetStore) -> Result<u32> {
+        fleet.read(|conn| {
+            let repo = ConversationRepo::new(conn);
+            match repo.latest_for_focus_with_protocol(Focus::Node(self.node), ProtocolKind::Pr)? {
+                Some(c) => Ok(repo
+                    .turns(c.id)?
+                    .iter()
+                    .filter(|t| t.role == tod_store::conversation::TurnRole::Agent)
+                    .count() as u32),
+                None => Ok(0),
+            }
+        })
+    }
+
+    /// The `blocked` reason the pull request's agent recorded, if its latest
+    /// report is one.
+    fn blocked_report(&self, fleet: &FleetStore) -> Result<Option<String>> {
+        Ok(self.pr_report(fleet)?.as_ref().and_then(blocked_why))
+    }
+
+    /// Babysit the node's pull request until nothing is left that an agent
+    /// or the app can do: the `pr` state's work (`doc/lifecycle/pr-readiness.md`).
+    ///
+    /// Each round reads the pull request. Work (open review threads, a failing
+    /// check, a branch behind its base, a bot's low score) goes to the pull
+    /// request's agent. Waiting (a bot has not reviewed the new head, checks
+    /// are running) is done here, without an agent: a bot overdue is asked to
+    /// review, then GitHub is read again every [`PR_POLL`] until it moves.
+    /// `None` when the pull request is clear (or cannot be read: the gate
+    /// says why), so the gate checks it. What is left after that, a human
+    /// review, stops the run at the gate as a request.
+    fn babysit<A: AgentAccess + ?Sized, H: StepHook + ?Sized>(
+        &mut self,
+        fleet: &FleetStore,
+        agent: &mut A,
+        hook: &mut H,
+    ) -> Result<Option<Outcome>> {
+        use crate::pr_readiness::{self, Next as PrNext, Wait};
+        let mut waited_since: Option<std::time::Instant> = None;
+        let mut unchanged = 0u32;
+        loop {
+            if let Some(reason) = hook.at(fleet, Boundary::Step)? {
+                hook.waiting(None);
+                return Ok(Some(Outcome::Stopped { reason }));
+            }
+            if let Some(limit) = self.over_budget() {
+                hook.waiting(None);
+                return Ok(Some(Outcome::BudgetExhausted { limit }));
+            }
+            let pending = fleet
+                .read(|conn| Ok(DecisionRepo::new(conn).list_pending_for_node(self.node)?))?
+                .len();
+            if pending > 0 {
+                hook.waiting(None);
+                return Ok(Some(Outcome::NeedsHuman {
+                    reason: NeedsHuman::Decision { pending },
+                }));
+            }
+            let links = fleet.read(|conn| tod_store::github::NodePrRepo::new(conn).read(self.node))?;
+            if links.prs.is_empty() {
+                // The agent opens it.
+                hook.waiting(None);
+                if let Some(outcome) = self.converse(fleet, agent, hook, ProtocolKind::Pr, None)? {
+                    return Ok(Some(outcome));
+                }
+                let opened = fleet.read(|conn| tod_store::github::NodePrRepo::new(conn).read(self.node))?;
+                if opened.prs.is_empty() {
+                    return Ok(Some(match self.blocked_report(fleet)? {
+                        Some(why) => Outcome::NeedsHuman { reason: NeedsHuman::PrBlocked { why } },
+                        None => Outcome::NeedsHuman {
+                            reason: NeedsHuman::NoProgress {
+                                step: protocol_name(ProtocolKind::Pr).to_string(),
+                            },
+                        },
+                    }));
+                }
+                continue;
+            }
+            let Some(feed) = pr_readiness::feed_for(&self.config.data_root) else {
+                hook.waiting(None);
+                return Ok(None);
+            };
+            let settings = pr_readiness::settings_at(&self.config.data_root);
+            let live = match pr_readiness::live(feed.as_ref(), &links.prs, &settings) {
+                Ok(live) => live,
+                Err(err) => {
+                    tracing::info!(node = %self.node, %err, "pull request not readable; leaving it to the gate");
+                    hook.waiting(None);
+                    return Ok(None);
+                }
+            };
+            match pr_readiness::overall(&live) {
+                PrNext::Merged | PrNext::Clear => {
+                    hook.waiting(None);
+                    return Ok(None);
+                }
+                PrNext::Work(_) => {
+                    waited_since = None;
+                    hook.waiting(None);
+                    let turns = self.pr_agent_turns(fleet)?;
+                    let base = *self.state.pr_turns_base.get_or_insert(turns);
+                    // The first turn opens the pull request: it is not a round.
+                    let rounds = turns.saturating_sub(base);
+                    if let Some(why) = crate::conversation::pr::pr_stuck(&live, &settings, rounds) {
+                        return Ok(Some(Outcome::NeedsHuman { reason: NeedsHuman::PrStuck { why } }));
+                    }
+                    let before = self.pr_report(fleet)?;
+                    let fingerprint: Vec<String> = live.iter().map(|p| p.fingerprint.clone()).collect();
+                    let reopen = self.pr_reopen(fleet, &live)?;
+                    if let Some(outcome) = self.converse(fleet, agent, hook, ProtocolKind::Pr, reopen)? {
+                        return Ok(Some(outcome));
+                    }
+                    let after = self.pr_report(fleet)?;
+                    if after != before
+                        && let Some(why) = after.as_ref().and_then(blocked_why)
+                    {
+                        return Ok(Some(Outcome::NeedsHuman { reason: NeedsHuman::PrBlocked { why } }));
+                    }
+                    // A turn that left the pull request exactly as it was,
+                    // twice: another would do the same.
+                    let now = pr_readiness::live(feed.as_ref(), &links.prs, &settings).ok();
+                    let same = now.as_ref().is_some_and(|n| {
+                        n.iter().map(|p| p.fingerprint.clone()).collect::<Vec<_>>() == fingerprint
+                    });
+                    unchanged = if same { unchanged + 1 } else { 0 };
+                    if unchanged >= 2 {
+                        return Ok(Some(Outcome::NeedsHuman {
+                            reason: NeedsHuman::PrStuck {
+                                why: "two turns in a row changed nothing on the pull request".to_string(),
+                            },
+                        }));
+                    }
+                }
+                PrNext::Wait(waits) => {
+                    // A bot that has had its time and not been asked is asked.
+                    let mut asked = false;
+                    for p in &live {
+                        let due = p.assessment.waits();
+                        for report in &p.assessment.bots {
+                            let ask = due.iter().any(|w| {
+                                matches!(w, Wait::BotReview { bot, ask: true } if *bot == report.settings.name)
+                            });
+                            if ask {
+                                match feed.comment(&p.pr, report.bot.rereview_comment(p.draft)) {
+                                    Ok(()) => asked = true,
+                                    Err(err) => tracing::warn!(
+                                        node = %self.node, %err,
+                                        "could not ask {} to review", report.settings.name
+                                    ),
+                                }
+                            }
+                        }
+                    }
+                    if asked {
+                        continue;
+                    }
+                    let since = *waited_since.get_or_insert_with(std::time::Instant::now);
+                    let what = wait_description(&waits);
+                    hook.waiting(Some(&what));
+                    let interval = if since.elapsed() >= PR_SLOW_AFTER {
+                        self.pr_poll * PR_SLOW_FACTOR
+                    } else {
+                        self.pr_poll
+                    };
+                    if let Some(reason) = self.sleep_watching(fleet, hook, interval)? {
+                        hook.waiting(None);
+                        return Ok(Some(Outcome::Stopped { reason }));
+                    }
+                }
+            }
+        }
+    }
+
+    /// The pull request conversation of this stay in `pr`, to send it the
+    /// work in; `None` starts a new one.
+    fn pr_reopen(
+        &self,
+        fleet: &FleetStore,
+        live: &[crate::pr_readiness::LivePr],
+    ) -> Result<Option<(Uuid, String)>> {
+        let node = self.node;
+        let conversation = fleet.read(|conn| {
+            let since = PhaseRepo::new(conn).stay_started_at(node)?;
+            let conversation = ConversationRepo::new(conn)
+                .latest_for_focus_with_protocol(Focus::Node(node), ProtocolKind::Pr)?;
+            Ok(conversation.filter(|c| since.is_none_or(|since| c.created_at >= since)))
+        })?;
+        Ok(conversation.map(|c| (c.id, crate::conversation::pr::work_message(live))))
+    }
+
+    /// Sleep `interval` in slices, so a pause or stop is heard within a
+    /// second; time asleep is not time worked. `Some(reason)` when asked to stop.
+    fn sleep_watching<H: StepHook + ?Sized>(
+        &mut self,
+        fleet: &FleetStore,
+        hook: &mut H,
+        interval: Duration,
+    ) -> Result<Option<String>> {
+        self.state.end_active();
+        self.save()?;
+        let start = std::time::Instant::now();
+        let slice = Duration::from_millis(500).min(interval);
+        let mut stop = None;
+        while start.elapsed() < interval {
+            if let Some(reason) = hook.at(fleet, Boundary::Step)? {
+                stop = Some(reason);
+                break;
+            }
+            std::thread::sleep(slice);
+        }
+        self.state.begin_active();
+        self.save()?;
+        Ok(stop)
     }
 
     /// Run `kind`'s conversation on the node until its protocol says it is
@@ -746,9 +961,23 @@ fn close_session<A: AgentAccess + ?Sized>(agent: &mut A, conversation_id: Option
     }
 }
 
-enum PrStanding {
-    /// No pull request agent has finished yet.
-    Open,
-    Blocked(String),
-    Done,
+/// The reason in a `blocked` pull request report.
+fn blocked_why(report: &serde_json::Value) -> Option<String> {
+    (report.get("pr").and_then(|v| v.as_str()) == Some("blocked")).then(|| {
+        report.get("why").and_then(|v| v.as_str()).unwrap_or_default().to_string()
+    })
+}
+
+/// What a wait is for, in a few words.
+fn wait_description(waits: &[crate::pr_readiness::Wait]) -> String {
+    use crate::pr_readiness::Wait;
+    let parts: Vec<String> = waits
+        .iter()
+        .map(|w| match w {
+            Wait::BotReview { bot, .. } => format!("{bot} review"),
+            Wait::ChecksRunning => "checks to finish".to_string(),
+            Wait::GitHub => "GitHub".to_string(),
+        })
+        .collect();
+    format!("waiting for {}", parts.join(", "))
 }

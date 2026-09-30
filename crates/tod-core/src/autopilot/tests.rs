@@ -27,6 +27,8 @@ struct FakeAgent {
     runs: HashMap<RunId, AgentRunState>,
     sessions: HashMap<String, String>,
     turns: usize,
+    /// Every turn played, counted where a fake pull request can see it.
+    shared_turns: Option<Arc<std::sync::atomic::AtomicUsize>>,
 }
 
 impl FakeAgent {
@@ -36,6 +38,7 @@ impl FakeAgent {
             runs: HashMap::new(),
             sessions: HashMap::new(),
             turns: 0,
+            shared_turns: None,
         }
     }
 
@@ -95,6 +98,9 @@ impl AgentProvider for FakeAgent {
             Err(err) => AgentRunState::Failure(format!("{err:#}")),
         };
         self.turns += 1;
+        if let Some(shared) = &self.shared_turns {
+            shared.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
         self.runs.insert(id, state);
         Ok(AgentRunHandle { id })
     }
@@ -181,8 +187,23 @@ fn setup() -> Fixture {
     fx
 }
 
+/// GitHub as a test has it: unreachable, so the pull request is left to the
+/// gate.
+struct NoGithub;
+
+impl crate::pr_readiness::PrFeed for NoGithub {
+    fn snapshot(&self, _: &tod_store::github::NodePr) -> Result<tod_store::github::PrSnapshot, String> {
+        Err("no GitHub in this test".to_string())
+    }
+
+    fn comment(&self, _: &tod_store::github::NodePr, _: &str) -> Result<(), String> {
+        Err("no GitHub in this test".to_string())
+    }
+}
+
 /// A node with a workspace and nothing else: no requirements, no plan.
 fn bare() -> Fixture {
+    crate::pr_readiness::set_feed_override(Some(Arc::new(NoGithub)));
     let fx = fixture();
     let workspace = fx.root.join("workspace");
     std::fs::create_dir_all(&workspace).unwrap();
@@ -625,4 +646,154 @@ fn an_evaluator_that_keeps_rejecting_the_same_work_stops_the_run() {
     assert_eq!(lifecycle::current_state(&fx.fleet, fx.node).unwrap(), "proposed");
     let steps: Vec<_> = pilot.state().steps.iter().map(|s| s.step.clone()).collect();
     assert_eq!(steps, ["phase", "evaluate", "phase", "evaluate"], "{steps:?}");
+}
+
+/// A pull request that changes as the agent takes turns: it opens with an
+/// unanswered review thread; once the agent has taken a turn the thread is
+/// answered and the head is new, and the review bot has not looked at it
+/// until it is asked and has been polled a couple of times.
+struct Sim {
+    turns: Arc<std::sync::atomic::AtomicUsize>,
+    base: std::sync::Mutex<Option<usize>>,
+    posted: std::sync::Mutex<Vec<String>>,
+    polls_after_ask: std::sync::atomic::AtomicUsize,
+}
+
+impl crate::pr_readiness::PrFeed for Sim {
+    fn snapshot(&self, _: &tod_store::github::NodePr) -> Result<tod_store::github::PrSnapshot, String> {
+        use std::sync::atomic::Ordering::SeqCst;
+        use tod_store::github::{IssueComment, PrSnapshot, PrStatus, ReviewThread};
+        let turns = self.turns.load(SeqCst);
+        let base = *self.base.lock().unwrap().get_or_insert(turns);
+        let round = turns - base;
+        let asked = !self.posted.lock().unwrap().is_empty();
+        if asked {
+            self.polls_after_ask.fetch_add(1, SeqCst);
+        }
+        let mut comments = Vec::new();
+        if asked {
+            comments.push(IssueComment {
+                id: 1,
+                author: Some("someone".into()),
+                body: self.posted.lock().unwrap()[0].clone(),
+                created_at: "2020-01-02T00:00:00Z".into(),
+                updated_at: "2020-01-02T00:00:00Z".into(),
+            });
+        }
+        if self.polls_after_ask.load(SeqCst) >= 3 {
+            comments.push(IssueComment {
+                id: 2,
+                author: Some("greptile-apps".into()),
+                body: "Confidence Score: 5/5\n".into(),
+                created_at: "2021-01-01T00:00:00Z".into(),
+                updated_at: "2021-01-01T00:00:00Z".into(),
+            });
+        }
+        Ok(PrSnapshot {
+            status: PrStatus {
+                mergeable: Some(true),
+                mergeable_state: Some("blocked".into()),
+                merged: false,
+                checks: Some("success".into()),
+                head_sha: Some(format!("{:07}", round.min(1) + 1)),
+                head_committed_at: Some("2020-01-01T00:00:00Z".into()),
+                draft: false,
+                base_ref: Some("main".into()),
+            },
+            threads: if round == 0 {
+                vec![ReviewThread {
+                    id: "PRRT_1".into(),
+                    resolved: false,
+                    outdated: false,
+                    path: Some("src/a.rs".into()),
+                    line: Some(1),
+                    comments: vec![],
+                }]
+            } else {
+                Vec::new()
+            },
+            comments,
+        })
+    }
+
+    fn comment(&self, _: &tod_store::github::NodePr, body: &str) -> Result<(), String> {
+        self.posted.lock().unwrap().push(body.to_string());
+        Ok(())
+    }
+}
+
+#[test]
+fn babysits_a_pull_request_through_feedback_and_a_bots_review() {
+    let fx = setup();
+    retire_outside_criteria(&fx);
+    std::fs::write(
+        fx.root.join("tod.yml"),
+        "pr_readiness:\n  bots:\n    - name: greptile\n",
+    )
+    .unwrap();
+    let turns = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let sim = Arc::new(Sim {
+        turns: turns.clone(),
+        base: std::sync::Mutex::new(None),
+        posted: std::sync::Mutex::new(Vec::new()),
+        polls_after_ask: std::sync::atomic::AtomicUsize::new(0),
+    });
+    crate::pr_readiness::set_feed_override(Some(sim.clone()));
+    lifecycle::set_lifecycle(&fx.fleet, fx.node, "pr").unwrap();
+    let mut agent = FakeAgent::new(&fx.fleet);
+    agent.shared_turns = Some(turns);
+    let mut pilot = autopilot(&fx, Budget::default()).with_pr_poll_interval(Duration::ZERO);
+    let outcome = pilot.run(&fx.fleet, &mut agent).unwrap();
+    let steps: Vec<_> = pilot.state().steps.iter().map(|s| format!("{} {}->{}", s.step, s.from, s.to)).collect();
+    assert_eq!(outcome, Outcome::Done, "{steps:#?}");
+    // The agent opened the PR, then took another turn for the open thread.
+    assert!(steps.iter().any(|s| s.starts_with("pr ")), "{steps:#?}");
+    assert!(agent.turns >= 2 + 1, "turns: {}", agent.turns);
+    // The bot had not reviewed the new head: it was asked, once, and waited for.
+    assert_eq!(*sim.posted.lock().unwrap(), vec!["@greptileai review this".to_string()]);
+    assert!(sim.polls_after_ask.load(std::sync::atomic::Ordering::SeqCst) >= 3);
+}
+
+#[test]
+fn a_pull_request_that_never_changes_stops_for_a_person() {
+    let fx = setup();
+    retire_outside_criteria(&fx);
+    struct Stuck;
+    impl crate::pr_readiness::PrFeed for Stuck {
+        fn snapshot(&self, _: &tod_store::github::NodePr) -> Result<tod_store::github::PrSnapshot, String> {
+            use tod_store::github::{PrSnapshot, PrStatus, ReviewThread};
+            Ok(PrSnapshot {
+                status: PrStatus {
+                    mergeable: Some(true),
+                    mergeable_state: Some("blocked".into()),
+                    merged: false,
+                    checks: Some("success".into()),
+                    head_sha: Some("abcdef1".into()),
+                    head_committed_at: Some("2020-01-01T00:00:00Z".into()),
+                    draft: false,
+                    base_ref: None,
+                },
+                threads: vec![ReviewThread {
+                    id: "PRRT_1".into(),
+                    resolved: false,
+                    outdated: false,
+                    path: None,
+                    line: None,
+                    comments: vec![],
+                }],
+                comments: vec![],
+            })
+        }
+        fn comment(&self, _: &tod_store::github::NodePr, _: &str) -> Result<(), String> {
+            Ok(())
+        }
+    }
+    crate::pr_readiness::set_feed_override(Some(Arc::new(Stuck)));
+    lifecycle::set_lifecycle(&fx.fleet, fx.node, "pr").unwrap();
+    let mut agent = FakeAgent::new(&fx.fleet);
+    let outcome = autopilot(&fx, Budget::default()).run(&fx.fleet, &mut agent).unwrap();
+    assert!(
+        matches!(&outcome, Outcome::NeedsHuman { reason: NeedsHuman::PrStuck { .. } }),
+        "{outcome:?}"
+    );
 }
