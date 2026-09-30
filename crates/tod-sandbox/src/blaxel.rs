@@ -77,6 +77,8 @@ pub struct NewSandbox<'a> {
     pub region: &'a str,
     pub memory_mb: u32,
     pub labels: &'a [(&'a str, &'a str)],
+    /// `spec.network.proxy` (see `node::proxy_spec`); fixed at creation.
+    pub proxy: Option<&'a Value>,
 }
 
 fn parse_info(v: &Value) -> SandboxInfo {
@@ -184,7 +186,7 @@ impl Blaxel {
     pub fn create(&self, spec: &NewSandbox) -> Result<()> {
         let labels: serde_json::Map<String, Value> =
             spec.labels.iter().map(|(k, v)| (k.to_string(), json!(v))).collect();
-        let body = json!({
+        let mut body = json!({
             "metadata": { "name": spec.name, "labels": labels },
             "spec": {
                 "region": spec.region,
@@ -195,6 +197,9 @@ impl Blaxel {
                 },
             },
         });
+        if let Some(proxy) = spec.proxy {
+            body["spec"]["network"] = json!({ "proxy": proxy });
+        }
         let mut resp =
             self.auth(self.agent.post(&format!("{API}/sandboxes"))).send_json(&body).context("Blaxel API")?;
         check(&mut resp, "create sandbox")

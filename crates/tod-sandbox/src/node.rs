@@ -181,7 +181,17 @@ pub fn proxy_rules(creds: &NodeCredentials, orchestrator_host: &str, claude_via:
     {
         rules.push(rule("api.anthropic.com", "claude", "Bearer ", token.to_string()));
     }
-    for c in &creds.custom {
+    rules.extend(custom_proxy_rules(&creds.custom));
+    rules.push(rule("api.blaxel.ai", "blaxel", "Bearer ", creds.blaxel_token.clone()));
+    rules.push(rule(orchestrator_host, "blaxel", "Bearer ", creds.blaxel_token.clone()));
+    rules
+}
+
+/// The rules for the Environment's credentials (`NodeCredentials::custom`) alone (the Environment's
+/// secrets with hosts), for a sandbox whose proxy holds nothing else.
+pub fn custom_proxy_rules(custom: &[CustomCredential]) -> Vec<ProxyRule> {
+    let mut rules = Vec::new();
+    for c in custom {
         let secret: String = c
             .name
             .chars()
@@ -198,8 +208,6 @@ pub fn proxy_rules(creds: &NodeCredentials, orchestrator_host: &str, claude_via:
             });
         }
     }
-    rules.push(rule("api.blaxel.ai", "blaxel", "Bearer ", creds.blaxel_token.clone()));
-    rules.push(rule(orchestrator_host, "blaxel", "Bearer ", creds.blaxel_token.clone()));
     rules
 }
 

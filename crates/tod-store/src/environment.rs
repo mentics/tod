@@ -306,6 +306,35 @@ impl Resolved {
     }
 }
 
+/// The node's Environment for a cloud sandbox: secrets with hosts become
+/// proxy credentials (the agent never has the value); variables and
+/// host-less secrets are returned as environment pairs. Unset secrets are
+/// left out. Reads the credential store: never on the UI thread.
+pub fn sandbox_credentials(
+    conn: &Connection,
+    creds: &CredentialStore,
+    node: Uuid,
+) -> Result<(Vec<tod_sandbox::node::CustomCredential>, Vec<(String, String)>)> {
+    let (mut custom, mut env) = (Vec::new(), Vec::new());
+    for r in resolve(conn, node)? {
+        let Some(value) = r.value(creds) else { continue };
+        let e = &r.entry;
+        if e.kind == EntryKind::Secret && e.proxied() {
+            let (header, template) = e.proxy_header();
+            custom.push(tod_sandbox::node::CustomCredential {
+                name: e.name.clone(),
+                hosts: e.hosts.clone(),
+                header,
+                template,
+                secret_value: e.auth.proxy_secret(&value),
+            });
+        } else {
+            env.push((e.env_name().to_string(), value));
+        }
+    }
+    Ok((custom, env))
+}
+
 /// Remove a secret's stored value (when its entry is removed or renamed).
 pub fn forget_secret(store: &CredentialStore, node: Uuid, name: &str) {
     store.delete_named(&secret_account(node, name));

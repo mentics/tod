@@ -43,7 +43,9 @@ pub fn render_entries(entries: &[Resolved], store: &CredentialStore) -> String {
     if !secrets.is_empty() {
         out.push_str(
             "Credentials (you never see the value; run a command with one using \
-             `tod-cli secrets run --env <VAR>=<name> -- <command>`):\n\n",
+             `tod-cli secrets run --env <VAR>=<name> -- <command>`. In a cloud sandbox a credential \
+             with hosts is applied automatically to requests to those hosts: call the API \
+             directly, without `secrets run`):\n\n",
         );
         for r in secrets {
             let e = &r.entry;

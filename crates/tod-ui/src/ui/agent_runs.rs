@@ -99,6 +99,19 @@ pub struct AgentRuns {
     next_slot: u64,
 }
 
+/// Drop the provider's live agent sessions `keys`. The conversations keep
+/// their recorded agent session ids: the next message starts the agent again
+/// and resumes by id, and when the agent cannot (a recreated sandbox has no
+/// session log) the driver starts a fresh session seeded with a snapshot
+/// (`ConversationDriver`'s cold-resume rotation). Takes the agent lock:
+/// call it off the UI thread.
+pub fn close_sessions(agent: &SharedAgent, keys: &[String]) {
+    let mut access = SharedAgentAccess(agent);
+    for key in keys {
+        tod_core::conversation::AgentAccess::with(&mut access, |a| a.close_session(key));
+    }
+}
+
 impl AgentRuns {
     pub fn new(fleet: Arc<FleetStore>, agent: SharedAgent) -> Self {
         Self {
@@ -343,6 +356,18 @@ impl AgentRuns {
                     to_state,
                 }
             })
+            .collect()
+    }
+
+    /// The agent session keys of every conversation this registry holds on
+    /// `node`, for [`close_sessions`]: their live agent processes ran in a
+    /// sandbox that was deleted and made again.
+    pub fn node_session_keys(&self, node: Uuid) -> Vec<String> {
+        self.slots
+            .iter()
+            .filter(|s| s.focus == Focus::Node(node))
+            .filter_map(|s| s.conversation_id)
+            .map(ConversationDriver::session_key)
             .collect()
     }
 

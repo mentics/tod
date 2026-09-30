@@ -113,7 +113,9 @@ pub fn answer_message(name: &str, provided: bool) -> String {
     if provided {
         format!(
             "The user provided the credential `{name}`. It is now set: use it through \
-             `tod-cli secrets run` (see `tod-cli environment list`). You cannot read its value."
+             `tod-cli secrets run` (see `tod-cli environment list`), or, in a cloud sandbox, just \
+             call the API it is for, which the sandbox's proxy signs. You cannot read its value. \
+             Retry what you were doing when you asked for it."
         )
     } else {
         format!(
@@ -151,6 +153,7 @@ mod tests {
     #[test]
     fn messages_never_carry_a_value() {
         assert!(answer_message("gb", true).contains("now set"));
+        assert!(answer_message("gb", true).contains("Retry"));
         assert!(answer_message("gb", false).contains("cannot provide"));
     }
 }
