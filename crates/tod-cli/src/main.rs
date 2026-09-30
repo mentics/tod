@@ -9,6 +9,7 @@
 //! that changed since the session's context was built.
 
 mod args;
+mod batch;
 mod capabilities;
 mod decisions;
 mod help;
@@ -65,6 +66,7 @@ NOUNS:
     decisions              What the user answers: ask, list, show
     phase                  Whether a node's lifecycle phase is done: status, ready, certify, reject
     wait                   What a node waits on between sessions: a time, an event, a check
+    batch                  Run many commands in one call; the reply lists only the failures
 
 Run `tod-cli <NOUN> --help` for that noun's commands, or
 `tod-cli help <WORDS>` to find the commands that mention them
@@ -93,6 +95,7 @@ const NOUNS: &[(&str, &str)] = &[
     ("decisions", crate::decisions::USAGE),
     ("phase", crate::phase::USAGE),
     ("wait", crate::wait::USAGE),
+    ("batch", crate::batch::USAGE),
 ];
 
 fn main() -> ExitCode {
@@ -215,8 +218,9 @@ fn run(args: &[String]) -> anyhow::Result<String> {
         "decisions" => decisions::run(invocation),
         "phase" => phase::run(invocation),
         "wait" => wait::run(invocation),
+        "batch" => batch::run(invocation),
         other => anyhow::bail!(
-            "unknown noun `{other}` (expected: node, obligations, content, plan, questions, memory, interview, visual-design, capabilities, changeset, tests, review, pr, verdicts, incoming, learn, secrets, decisions, phase, wait)"
+            "unknown noun `{other}` (expected: node, obligations, content, plan, questions, memory, interview, visual-design, capabilities, changeset, tests, review, pr, verdicts, incoming, learn, secrets, decisions, phase, wait, batch)"
         ),
     }
 }
@@ -410,6 +414,38 @@ Second."), "{listed}");
             cli(&root, &["obligations", "list", "--node", &node]).unwrap(),
             "(none)"
         );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A batch applies every line it can, binds `$name` to what a line
+    /// created, and reports only the line that failed.
+    #[test]
+    fn batch_applies_what_it_can_and_reports_only_failures() {
+        let (root, node, _) = data_root();
+        let slug = {
+            let out = cli(&root, &["--json", "node", "show", &node.to_string()]).unwrap();
+            let json: serde_json::Value = serde_json::from_str(&out).unwrap();
+            json["slug"].as_str().unwrap().to_string()
+        };
+        let script = root.join("script.txt");
+        std::fs::write(
+            &script,
+            format!(
+                "$a = node create --parent {slug} --title \"Batch Parent\"
+                 node create --parent $a --title Kid
+                 node rename no-such-node --title Nope
+                 node list --parent $a
+"
+            ),
+        )
+        .unwrap();
+        let err = cli(&root, &["batch", "run", "--file", script.to_str().unwrap()]).unwrap_err();
+        let report = format!("{err:#}");
+        assert!(report.starts_with("batch: 3 applied, 1 failed"), "{report}");
+        assert!(report.contains("[3] FAILED node rename no-such-node"), "{report}");
+        assert!(!report.contains("[2]"), "{report}");
+        assert!(report.contains("[4] node list --parent $a"), "{report}");
+        assert!(report.contains("kid"), "{report}");
         let _ = std::fs::remove_dir_all(root);
     }
 

@@ -19,6 +19,12 @@ Any text flag (`--body`, `--why`, `--detail`) takes `-` to read its text from
 stdin, for long or multi-line text passed with a heredoc. Only one flag per
 command can read stdin.
 
+## Many changes at once
+
+Do not make one call per change when you have many. `tod-cli batch run` takes
+a script of commands, one per line, and reports only the ones that failed;
+see `tod-cli batch --help`.
+
 ## Finding a command
 
 The sections that follow document only the commands you are most likely to
