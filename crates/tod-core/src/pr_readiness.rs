@@ -451,6 +451,16 @@ mod live {
         for c in &snap.comments {
             println!("comment {} by {:?}: {}", c.id, c.author, c.body.lines().next().unwrap_or(""));
         }
+        // `TOD_TEST_ANSWER_THREAD=<id>` also replies to that thread and resolves it.
+        if let Ok(id) = std::env::var("TOD_TEST_ANSWER_THREAD") {
+            gh.reply_to_thread(&id, &format!("{TOD_MARKER} live test reply")).unwrap();
+            gh.resolve_thread(&id).unwrap();
+            let after = gh.list_review_threads(owner, repo, number.parse().unwrap()).unwrap();
+            let t = after.iter().find(|t| t.id == id).unwrap();
+            println!("answered: resolved={} rounds={}", t.resolved, rounds(t));
+            assert!(t.resolved);
+            assert_eq!(rounds(t), 1);
+        }
         let settings = PrReadinessSettings {
             bots: vec![tod_store::PrReviewBotSettings {
                 name: "greptile".into(),
