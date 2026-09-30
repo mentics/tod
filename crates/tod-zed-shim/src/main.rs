@@ -48,6 +48,18 @@ fn log(msg: &str) {
     }
 }
 
+/// Closes this process's stdout, so a reader sees EOF while it keeps running.
+#[cfg(unix)]
+fn close_stdout() {
+    use std::os::fd::FromRawFd;
+    // SAFETY: nothing writes to stdout after this; dropping closes fd 1.
+    drop(unsafe { std::os::fd::OwnedFd::from_raw_fd(1) });
+}
+
+/// Zed on Windows reads its own marker line rather than waiting for EOF.
+#[cfg(not(unix))]
+fn close_stdout() {}
+
 fn fail(msg: &str) -> ! {
     log(msg);
     eprintln!("tod ssh: {msg}");
@@ -315,13 +327,24 @@ fn main() {
         let marker = hold_connection_marker(&format!("docker-{container}"));
         let extra = container_ssh_options(container, &exe_dir().join(CONTAINER_KEY_FILE));
         // ssh's stderr is passed on and also logged: a failed connection
-        // otherwise leaves only its exit status.
+        // otherwise leaves only its exit status. Its stdout is copied, not
+        // inherited, so this process's own copy closes when ssh's does: Zed
+        // takes that EOF from its `-N` master as "connected", and would
+        // otherwise wait on the copy held here until it times out.
         let status = Command::new(real_program("ssh"))
             .args(&extra)
             .args(&args)
+            .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()
             .and_then(|mut child| {
+                if let Some(mut out) = child.stdout.take() {
+                    std::thread::spawn(move || {
+                        let _ = std::io::copy(&mut out, &mut std::io::stdout());
+                        let _ = std::io::stdout().flush();
+                        close_stdout();
+                    });
+                }
                 let copier = child.stderr.take().map(|err| {
                     std::thread::spawn(move || {
                         for line in std::io::BufRead::lines(std::io::BufReader::new(err)).map_while(Result::ok) {
