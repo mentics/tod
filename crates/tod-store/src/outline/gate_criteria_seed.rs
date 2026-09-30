@@ -395,6 +395,38 @@ pub const GATE_CRITERIA: &[GateCriterionSeed] = &[
         label: "PR approved and checks green?",
         sort_order: 1,
     },
+    GateCriterionSeed {
+        id_str: "a1000006-0006-4006-8006-000000000005",
+        from_state: "pr",
+        to_state: "approved",
+        slug: crate::outline::repos::gate::PR_APPROVED_UP_TO_DATE_SLUG,
+        label: "Branch up to date with its base, no conflicts?",
+        sort_order: 2,
+    },
+    GateCriterionSeed {
+        id_str: "a1000006-0006-4006-8006-000000000006",
+        from_state: "pr",
+        to_state: "approved",
+        slug: crate::outline::repos::gate::PR_APPROVED_THREADS_RESOLVED_SLUG,
+        label: "Every review thread resolved?",
+        sort_order: 3,
+    },
+    GateCriterionSeed {
+        id_str: "a1000006-0006-4006-8006-000000000007",
+        from_state: "pr",
+        to_state: "approved",
+        slug: crate::outline::repos::gate::PR_APPROVED_REVIEW_CURRENT_SLUG,
+        label: "Review bots have reviewed the current head?",
+        sort_order: 4,
+    },
+    GateCriterionSeed {
+        id_str: "a1000006-0006-4006-8006-000000000008",
+        from_state: "pr",
+        to_state: "approved",
+        slug: crate::outline::repos::gate::PR_APPROVED_REVIEW_SCORE_SLUG,
+        label: "Review bot scores meet the threshold?",
+        sort_order: 5,
+    },
     // approved → merged — app-checked: the PR has actually been merged.
     // `tod_core::gate::pr_merged_outcome`.
     GateCriterionSeed {

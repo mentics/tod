@@ -353,6 +353,32 @@ fn mentions_commit(body: &str) -> bool {
     body.to_ascii_lowercase().contains("last reviewed commit")
 }
 
+/// [`Github::get_pr_snapshot`], reused for a few seconds: the gate answers
+/// four criteria in a row from the same pull request, and each read is
+/// several requests.
+pub fn cached_snapshot(
+    github: &tod_store::github::Github,
+    pr: &tod_store::github::NodePr,
+) -> Result<PrSnapshot, tod_store::github::GithubError> {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+    static CACHE: Mutex<Option<HashMap<String, (Instant, PrSnapshot)>>> = Mutex::new(None);
+    const TTL: Duration = Duration::from_secs(5);
+    let key = format!("{}/{}#{}", pr.owner, pr.repo, pr.pr_number);
+    if let Ok(cache) = CACHE.lock()
+        && let Some((at, snapshot)) = cache.as_ref().and_then(|c| c.get(&key))
+        && at.elapsed() < TTL
+    {
+        return Ok(snapshot.clone());
+    }
+    let snapshot = github.get_pr_snapshot(&pr.owner, &pr.repo, pr.pr_number)?;
+    if let Ok(mut cache) = CACHE.lock() {
+        cache.get_or_insert_with(HashMap::new).insert(key, (Instant::now(), snapshot.clone()));
+    }
+    Ok(snapshot)
+}
+
 /// The babysitter's opening message for a turn: what to do about this pull
 /// request now. Live data the agent is told, not asked to fetch.
 pub fn render_work(url: &str, assessment: &Assessment) -> String {

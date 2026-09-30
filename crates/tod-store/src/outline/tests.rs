@@ -879,7 +879,16 @@ fn gate_criteria_seed_on_migration() {
         slugs("review", "pr"),
         [REVIEW_APPROVED_REVIEW_DONE_SLUG, REVIEW_APPROVED_FINDINGS_ANSWERED_SLUG]
     );
-    assert_eq!(slugs("pr", "approved"), [PR_APPROVED_MERGEABLE_SLUG]);
+    assert_eq!(
+        slugs("pr", "approved"),
+        [
+            PR_APPROVED_MERGEABLE_SLUG,
+            PR_APPROVED_UP_TO_DATE_SLUG,
+            PR_APPROVED_THREADS_RESOLVED_SLUG,
+            PR_APPROVED_REVIEW_CURRENT_SLUG,
+            PR_APPROVED_REVIEW_SCORE_SLUG
+        ]
+    );
     assert_eq!(slugs("approved", "merged"), [APPROVED_MERGED_PR_MERGED_SLUG]);
     assert_eq!(
         slugs("merged", "released"),

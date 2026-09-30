@@ -26,6 +26,10 @@ use tod_store::outline::{
 
 pub use tod_store::outline::{APPROVED_MERGED_PR_MERGED_SLUG, PR_APPROVED_MERGEABLE_SLUG};
 use tod_store::outline::{
+    PR_APPROVED_REVIEW_CURRENT_SLUG, PR_APPROVED_REVIEW_SCORE_SLUG, PR_APPROVED_THREADS_RESOLVED_SLUG,
+    PR_APPROVED_UP_TO_DATE_SLUG,
+};
+use tod_store::outline::{
     DERIVED_CRITERION_SLUGS, DESIGN_PLANNING_PHASE_CERTIFIED_SLUG, LEARN_DONE_LEARN_RECORDED_SLUG,
     MERGED_RELEASED_PHASE_CERTIFIED_SLUG, MERGED_RELEASED_PLAN_VERIFIED_SLUG,
     PLANNING_READY_PHASE_CERTIFIED_SLUG, PROPOSED_DESIGN_HAS_REQUIREMENTS_SLUG,
@@ -82,6 +86,14 @@ pub fn evaluate_derived_criterion(
         }
         PR_APPROVED_MERGEABLE_SLUG => pr_mergeable_outcome(conn, node_id).map(Some),
         APPROVED_MERGED_PR_MERGED_SLUG => pr_merged_outcome(conn, node_id).map(Some),
+        PR_APPROVED_UP_TO_DATE_SLUG => pr_readiness_outcome(conn, node_id, Readiness::UpToDate).map(Some),
+        PR_APPROVED_THREADS_RESOLVED_SLUG => {
+            pr_readiness_outcome(conn, node_id, Readiness::ThreadsResolved).map(Some)
+        }
+        PR_APPROVED_REVIEW_CURRENT_SLUG => {
+            pr_readiness_outcome(conn, node_id, Readiness::ReviewCurrent).map(Some)
+        }
+        PR_APPROVED_REVIEW_SCORE_SLUG => pr_readiness_outcome(conn, node_id, Readiness::ReviewScore).map(Some),
         PROPOSED_DESIGN_HAS_REQUIREMENTS_SLUG => has_requirements_outcome(conn, node_id).map(Some),
         PROPOSED_DESIGN_PHASE_CERTIFIED_SLUG => {
             phase_certified_outcome(conn, node_id, "proposed").map(Some)
@@ -567,6 +579,104 @@ fn pr_mergeable_outcome(conn: &Connection, node_id: Uuid) -> Result<DerivedOutco
         outcome: OUTCOME_PASS,
         detail: passed.join(" "),
     })
+}
+
+/// Which of the readiness criteria to answer (`doc/lifecycle/pr-readiness.md`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Readiness {
+    UpToDate,
+    ThreadsResolved,
+    ReviewCurrent,
+    ReviewScore,
+}
+
+/// The project's PR readiness settings, from the data root beside `conn`'s
+/// database; the defaults when they cannot be read.
+fn readiness_settings(conn: &Connection) -> tod_store::PrReadinessSettings {
+    let Some(db_path) = conn.path() else {
+        return Default::default();
+    };
+    let Some(data_root) = std::path::Path::new(db_path).parent() else {
+        return Default::default();
+    };
+    tod_store::TodSettings::load(&tod_store::TodPaths::at(data_root))
+        .map(|settings| settings.pr_readiness)
+        .unwrap_or_default()
+}
+
+/// One readiness criterion over every linked PR.
+fn pr_readiness_outcome(conn: &Connection, node_id: Uuid, which: Readiness) -> Result<DerivedOutcome> {
+    let (prs, github) = match linked_prs(conn, node_id)? {
+        Ok(found) => found,
+        Err(outcome) => return Ok(outcome),
+    };
+    let settings = readiness_settings(conn);
+    let now = chrono::Utc::now();
+    let mut assessed = Vec::new();
+    for pr in &prs {
+        let snapshot = match crate::pr_readiness::cached_snapshot(&github, pr) {
+            Ok(snapshot) => snapshot,
+            Err(err) => return Ok(fail(format!("Could not read {}: {err}", pr.url))),
+        };
+        assessed.push((pr.url.clone(), crate::pr_readiness::Assessment::of(&snapshot, &settings, now)));
+    }
+    Ok(readiness_outcome(which, &assessed))
+}
+
+/// [`pr_readiness_outcome`] over assessments already made.
+fn readiness_outcome(which: Readiness, assessed: &[(String, crate::pr_readiness::Assessment)]) -> DerivedOutcome {
+    use crate::pr_readiness::BotStanding;
+    let mut passed = Vec::new();
+    for (url, a) in assessed {
+        if a.merged {
+            passed.push(format!("{url} is already merged."));
+            continue;
+        }
+        match which {
+            Readiness::UpToDate => {
+                if a.conflicted() {
+                    return fail(format!("{url} conflicts with its base branch."));
+                }
+                if a.behind() {
+                    return fail(format!("{url} is behind its base branch."));
+                }
+                passed.push(format!("{url} is up to date with its base."));
+            }
+            Readiness::ThreadsResolved => {
+                if !a.open_threads.is_empty() {
+                    let n = a.open_threads.len();
+                    return fail(format!("{url} has {n} unresolved review thread{}.", if n == 1 { "" } else { "s" }));
+                }
+                passed.push(format!("{url} has no unresolved review threads."));
+            }
+            Readiness::ReviewCurrent => {
+                for r in &a.bots {
+                    if !matches!(r.standing, BotStanding::Current { .. }) {
+                        return fail(format!("{} has not reviewed the current head of {url}.", r.settings.name));
+                    }
+                }
+                passed.push(format!("{url}: every review bot has reviewed the current head."));
+            }
+            Readiness::ReviewScore => {
+                for r in &a.bots {
+                    match r.standing {
+                        BotStanding::Current { score } if score >= r.settings.min_score => {}
+                        BotStanding::Current { score } => {
+                            return fail(format!(
+                                "{} scored {url} {score}/5, under the {}/5 needed.",
+                                r.settings.name, r.settings.min_score
+                            ));
+                        }
+                        _ => {
+                            return fail(format!("{} has not reviewed the current head of {url}.", r.settings.name));
+                        }
+                    }
+                }
+                passed.push(format!("{url}: review scores meet the threshold."));
+            }
+        }
+    }
+    pass(passed.join(" "))
 }
 
 /// Every linked PR has actually been merged.
@@ -1255,5 +1365,75 @@ mod tests {
             .unwrap();
         let outcome = evaluate(&store, node, released).unwrap();
         assert_eq!(outcome.outcome, OUTCOME_PASS, "{}", outcome.detail);
+    }
+}
+
+#[cfg(test)]
+mod readiness_tests {
+    use super::*;
+    use crate::pr_readiness::Assessment;
+    use tod_store::github::{IssueComment, PrSnapshot, PrStatus, ReviewThread};
+    use tod_store::{PrReadinessSettings, PrReviewBotSettings};
+
+    fn assessed(state: &str, threads: Vec<ReviewThread>, review: Option<&str>) -> Vec<(String, Assessment)> {
+        let snapshot = PrSnapshot {
+            status: PrStatus {
+                mergeable: Some(true),
+                mergeable_state: Some(state.into()),
+                merged: false,
+                checks: Some("success".into()),
+                head_sha: Some("abcdef1234".into()),
+                head_committed_at: Some("2026-01-01T10:00:00Z".into()),
+                draft: false,
+                base_ref: Some("main".into()),
+            },
+            threads,
+            comments: review
+                .map(|body| IssueComment {
+                    id: 1,
+                    author: Some("greptile-apps".into()),
+                    body: body.into(),
+                    created_at: "2026-01-01T11:00:00Z".into(),
+                    updated_at: "2026-01-01T11:00:00Z".into(),
+                })
+                .into_iter()
+                .collect(),
+        };
+        let settings = PrReadinessSettings {
+            bots: vec![PrReviewBotSettings { name: "greptile".into(), min_score: 4, rerun_after_minutes: 10 }],
+            ..Default::default()
+        };
+        let now = chrono::DateTime::parse_from_rfc3339("2026-01-01T12:00:00Z").unwrap().with_timezone(&chrono::Utc);
+        vec![("https://github.com/o/r/pull/1".into(), Assessment::of(&snapshot, &settings, now))]
+    }
+
+    fn open_thread() -> ReviewThread {
+        ReviewThread { id: "t".into(), resolved: false, outdated: false, path: None, line: None, comments: vec![] }
+    }
+
+    #[test]
+    fn each_criterion_names_what_fails() {
+        let bad = assessed("behind", vec![open_thread()], Some("Confidence Score: 3/5"));
+        let up = readiness_outcome(Readiness::UpToDate, &bad);
+        assert_eq!(up.outcome, OUTCOME_FAIL);
+        assert!(up.detail.contains("behind"), "{}", up.detail);
+        assert!(readiness_outcome(Readiness::ThreadsResolved, &bad).detail.contains("1 unresolved review thread."));
+        assert_eq!(readiness_outcome(Readiness::ReviewCurrent, &bad).outcome, OUTCOME_PASS);
+        assert!(readiness_outcome(Readiness::ReviewScore, &bad).detail.contains("3/5"));
+    }
+
+    #[test]
+    fn a_ready_pr_passes_all_four() {
+        let good = assessed("clean", vec![], Some("Confidence Score: 5/5"));
+        for which in [Readiness::UpToDate, Readiness::ThreadsResolved, Readiness::ReviewCurrent, Readiness::ReviewScore] {
+            assert_eq!(readiness_outcome(which, &good).outcome, OUTCOME_PASS, "{which:?}");
+        }
+    }
+
+    #[test]
+    fn a_missing_review_fails_both_review_criteria() {
+        let none = assessed("clean", vec![], None);
+        assert_eq!(readiness_outcome(Readiness::ReviewCurrent, &none).outcome, OUTCOME_FAIL);
+        assert_eq!(readiness_outcome(Readiness::ReviewScore, &none).outcome, OUTCOME_FAIL);
     }
 }

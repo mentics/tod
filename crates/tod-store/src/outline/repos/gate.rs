@@ -57,6 +57,18 @@ pub const REVIEW_APPROVED_FINDINGS_ANSWERED_SLUG: &str = "review-approved.findin
 
 /// `pr` → `approved`: the PR is mergeable (checks green, reviews satisfied).
 pub const PR_APPROVED_MERGEABLE_SLUG: &str = "pr-approved.mergeable";
+/// `pr` → `approved`: the branch contains its base branch's tip, with no
+/// conflict (`doc/lifecycle/pr-readiness.md`).
+pub const PR_APPROVED_UP_TO_DATE_SLUG: &str = "pr-approved.up-to-date";
+/// `pr` → `approved`: every review thread, human or bot, is resolved or
+/// outdated.
+pub const PR_APPROVED_THREADS_RESOLVED_SLUG: &str = "pr-approved.threads-resolved";
+/// `pr` → `approved`: each configured review bot has reviewed the PR's
+/// current head. Passes when none is configured.
+pub const PR_APPROVED_REVIEW_CURRENT_SLUG: &str = "pr-approved.review-current";
+/// `pr` → `approved`: each configured review bot's current review scores at
+/// least its threshold. Passes when none is configured.
+pub const PR_APPROVED_REVIEW_SCORE_SLUG: &str = "pr-approved.review-score";
 /// `approved` → `merged`: the PR has actually been merged.
 pub const APPROVED_MERGED_PR_MERGED_SLUG: &str = "approved-merged.pr-merged";
 
@@ -107,6 +119,10 @@ pub const DERIVED_CRITERION_SLUGS: &[&str] = &[
     REVIEW_APPROVED_REVIEW_DONE_SLUG,
     REVIEW_APPROVED_FINDINGS_ANSWERED_SLUG,
     PR_APPROVED_MERGEABLE_SLUG,
+    PR_APPROVED_UP_TO_DATE_SLUG,
+    PR_APPROVED_THREADS_RESOLVED_SLUG,
+    PR_APPROVED_REVIEW_CURRENT_SLUG,
+    PR_APPROVED_REVIEW_SCORE_SLUG,
     APPROVED_MERGED_PR_MERGED_SLUG,
     MERGED_RELEASED_PHASE_CERTIFIED_SLUG,
     MERGED_RELEASED_PLAN_VERIFIED_SLUG,
