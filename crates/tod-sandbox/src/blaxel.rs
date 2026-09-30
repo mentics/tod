@@ -174,6 +174,17 @@ impl Blaxel {
         Ok(Some(parse_info(&v)))
     }
 
+    /// The sandbox's whole record as Blaxel returns it (for live checks of
+    /// its `spec.network.proxy`; may hold rule values: never print it as is).
+    pub fn get_json(&self, name: &str) -> Result<Option<Value>> {
+        let mut resp = self.auth(self.agent.get(&format!("{API}/sandboxes/{name}"))).call().context("Blaxel API")?;
+        if resp.status().as_u16() == 404 {
+            return Ok(None);
+        }
+        check(&mut resp, "get sandbox")?;
+        Ok(Some(resp.body_mut().read_json()?))
+    }
+
     pub fn list(&self) -> Result<Vec<SandboxInfo>> {
         let mut resp = self.auth(self.agent.get(&format!("{API}/sandboxes"))).call().context("Blaxel API")?;
         check(&mut resp, "list sandboxes")?;
