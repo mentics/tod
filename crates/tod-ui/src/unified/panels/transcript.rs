@@ -13,10 +13,18 @@ use tod_store::fleet::FleetStore;
 use uuid::Uuid;
 
 use crate::ui::agent_conversation::{
-    AgentConversationEvent, AgentConversationPanel, Entry, EntryKind,
+    AgentConversationEvent, AgentConversationPanel, Entry, EntryKind, bind_panel_host_keys,
+    forward_panel_keys,
 };
 use crate::ui::agent_runs::AgentRuns;
 use crate::unified::panel::ColumnPanel;
+
+pub const TRANSCRIPT_PANEL_CONTEXT: &str = "TranscriptPanel";
+
+/// Up/Down, Page Up/Down, and Left/Right (expand/collapse) on the turns.
+pub fn register_transcript_panel_bindings(cx: &mut App) {
+    bind_panel_host_keys(cx, TRANSCRIPT_PANEL_CONTEXT);
+}
 
 /// What the transcript panel shows about a turn — mirrors
 /// `conversation/transcript.rs::entry_of`, without the gate-check YAML
@@ -240,9 +248,12 @@ impl Focusable for TranscriptPanel {
 }
 
 impl Render for TranscriptPanel {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        div()
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let focused = self.focus_handle.contains_focused(window, cx);
+        self.panel.update(cx, |panel, cx| panel.set_active(focused, cx));
+        forward_panel_keys(div(), &self.panel, true)
             .size_full()
+            .key_context(TRANSCRIPT_PANEL_CONTEXT)
             .track_focus(&self.focus_handle)
             .child(self.panel.clone())
     }

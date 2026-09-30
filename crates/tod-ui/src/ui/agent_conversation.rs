@@ -66,8 +66,114 @@ actions!(
         AgentConversationSubmit,
         /// Stop writing; focus returns to the host.
         AgentConversationEscape,
+        /// Keys a host that owns focus forwards to the panel; see
+        /// [`bind_panel_host_keys`].
+        PanelUp,
+        PanelDown,
+        PanelPageUp,
+        PanelPageDown,
+        PanelLeft,
+        PanelRight,
+        PanelActivate,
     ]
 );
+
+/// A navigation key a host forwards to the panel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PanelKey {
+    Up,
+    Down,
+    PageUp,
+    PageDown,
+    Left,
+    Right,
+    Activate,
+}
+
+/// Bind the navigation keys in a host's `context`, outside text input. The
+/// host attaches them with [`forward_panel_keys`].
+pub fn bind_panel_host_keys(cx: &mut App, context: &str) {
+    let nav = Some(key_context::excluding_input(context));
+    cx.bind_keys([
+        KeyBinding::new("up", PanelUp, nav),
+        KeyBinding::new("down", PanelDown, nav),
+        KeyBinding::new("pageup", PanelPageUp, nav),
+        KeyBinding::new("pagedown", PanelPageDown, nav),
+        KeyBinding::new("left", PanelLeft, nav),
+        KeyBinding::new("right", PanelRight, nav),
+        KeyBinding::new("enter", PanelActivate, nav),
+    ]);
+}
+
+/// Send the keys bound by [`bind_panel_host_keys`] to `panel`. A key the
+/// panel has nothing to do with propagates. `chunks_only` is for a read-only
+/// transcript: the highlight stays on the transcript's chunks, and Enter only
+/// expands or collapses.
+pub fn forward_panel_keys<E: InteractiveElement>(
+    el: E,
+    panel: &Entity<AgentConversationPanel>,
+    chunks_only: bool,
+) -> E {
+    // `on_action` returns `Self`, so the chain keeps the element's type.
+    let el = el
+        .on_action({
+            let panel = panel.clone();
+            move |_: &PanelUp, window, cx| {
+                if !panel.update(cx, |p, cx| p.handle_key(PanelKey::Up, chunks_only, window, cx)) {
+                    cx.propagate();
+                }
+            }
+        })
+        .on_action({
+            let panel = panel.clone();
+            move |_: &PanelDown, window, cx| {
+                if !panel.update(cx, |p, cx| p.handle_key(PanelKey::Down, chunks_only, window, cx)) {
+                    cx.propagate();
+                }
+            }
+        })
+        .on_action({
+            let panel = panel.clone();
+            move |_: &PanelPageUp, window, cx| {
+                if !panel.update(cx, |p, cx| p.handle_key(PanelKey::PageUp, chunks_only, window, cx)) {
+                    cx.propagate();
+                }
+            }
+        })
+        .on_action({
+            let panel = panel.clone();
+            move |_: &PanelPageDown, window, cx| {
+                if !panel.update(cx, |p, cx| p.handle_key(PanelKey::PageDown, chunks_only, window, cx)) {
+                    cx.propagate();
+                }
+            }
+        })
+        .on_action({
+            let panel = panel.clone();
+            move |_: &PanelLeft, window, cx| {
+                if !panel.update(cx, |p, cx| p.handle_key(PanelKey::Left, chunks_only, window, cx)) {
+                    cx.propagate();
+                }
+            }
+        })
+        .on_action({
+            let panel = panel.clone();
+            move |_: &PanelRight, window, cx| {
+                if !panel.update(cx, |p, cx| p.handle_key(PanelKey::Right, chunks_only, window, cx)) {
+                    cx.propagate();
+                }
+            }
+        })
+        .on_action({
+            let panel = panel.clone();
+            move |_: &PanelActivate, window, cx| {
+                if !panel.update(cx, |p, cx| p.handle_key(PanelKey::Activate, chunks_only, window, cx)) {
+                    cx.propagate();
+                }
+            }
+        });
+    el
+}
 
 /// Register after the host's bindings, so these are tried first; each
 /// propagates when the panel is not being written in.
@@ -611,6 +717,104 @@ impl AgentConversationPanel {
         }
         self.set_highlight(stops[next as usize], cx);
         true
+    }
+
+    /// A navigation key forwarded by the host that owns focus. False when the
+    /// panel has nothing to do with it, so the host can let it propagate.
+    pub fn handle_key(
+        &mut self,
+        key: PanelKey,
+        chunks_only: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.editing {
+            return false;
+        }
+        let on_chunk = matches!(self.highlight, PanelStop::Chunk(_));
+        match key {
+            PanelKey::Up | PanelKey::Down => {
+                let delta = if key == PanelKey::Up { -1 } else { 1 };
+                let stops = self.stops();
+                if chunks_only {
+                    let chunks: Vec<PanelStop> = stops
+                        .into_iter()
+                        .filter(|s| matches!(s, PanelStop::Chunk(_)))
+                        .collect();
+                    let target = match chunks.iter().position(|s| *s == self.highlight) {
+                        Some(ix) => ix.checked_add_signed(delta).and_then(|ix| chunks.get(ix)),
+                        None if delta < 0 => chunks.last(),
+                        None => chunks.first(),
+                    };
+                    match target.copied() {
+                        Some(stop) => {
+                            self.set_highlight(stop, cx);
+                            true
+                        }
+                        None => false,
+                    }
+                } else {
+                    self.move_highlight(delta, cx)
+                }
+            }
+            PanelKey::PageUp | PanelKey::PageDown => {
+                self.page(key == PanelKey::PageDown, cx);
+                true
+            }
+            PanelKey::Left => self.collapse_highlight(cx),
+            PanelKey::Right => self.expand_highlight(cx),
+            PanelKey::Activate => {
+                if chunks_only && !on_chunk {
+                    return false;
+                }
+                self.activate(window, cx);
+                true
+            }
+        }
+    }
+
+    /// Page Up / Page Down: scroll the transcript one screen, and carry a
+    /// highlighted chunk along so the selection stays on screen.
+    pub fn page(&mut self, down: bool, cx: &mut Context<Self>) {
+        let from = match self.highlight {
+            PanelStop::Chunk(id) => Some(id),
+            _ => None,
+        };
+        let moved = self.list.update(cx, |list, cx| list.page(down, from, cx));
+        if let Some(id) = moved {
+            self.set_highlight(PanelStop::Chunk(id), cx);
+        }
+    }
+
+    /// Left on a chunk: collapse it, or when it is already collapsed (or has
+    /// nothing to collapse) go to the reply it is a piece of. False, having
+    /// done nothing, when the highlight is not on a chunk that can.
+    pub fn collapse_highlight(&mut self, cx: &mut Context<Self>) -> bool {
+        let PanelStop::Chunk(id) = self.highlight else {
+            return false;
+        };
+        if self.is_expanded(id) {
+            self.toggle(id, cx);
+            return true;
+        }
+        match id.part {
+            Some(_) => {
+                self.set_highlight(PanelStop::Chunk(ChunkId { entry: id.entry, part: None }), cx);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Right on a chunk: expand it. False when it is not a collapsed chunk.
+    pub fn expand_highlight(&mut self, cx: &mut Context<Self>) -> bool {
+        match self.highlight {
+            PanelStop::Chunk(id) if !self.is_expanded(id) => {
+                self.toggle(id, cx);
+                true
+            }
+            _ => false,
+        }
     }
 
     pub fn set_highlight(&mut self, stop: PanelStop, cx: &mut Context<Self>) {

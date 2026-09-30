@@ -146,6 +146,10 @@ actions!(
     [
         AgentTranscriptsClose,
         AgentTranscriptsRefresh,
+        /// Move the keyboard from the session list to the transcript.
+        AgentTranscriptsIntoTranscript,
+        /// Move the keyboard back to the session list.
+        AgentTranscriptsIntoList,
         AgentTranscriptsPick1,
         AgentTranscriptsPick2,
         AgentTranscriptsPick3,
@@ -167,6 +171,8 @@ pub fn register_agent_transcripts_keyboard_bindings(cx: &mut App) {
     let context = Some(key_context::excluding_input(AGENT_TRANSCRIPTS_CONTEXT));
     cx.bind_keys([
         KeyBinding::new("r", AgentTranscriptsRefresh, context),
+        KeyBinding::new("ctrl-right", AgentTranscriptsIntoTranscript, context),
+        KeyBinding::new("ctrl-left", AgentTranscriptsIntoList, context),
         KeyBinding::new("1", AgentTranscriptsPick1, context),
         KeyBinding::new("2", AgentTranscriptsPick2, context),
         KeyBinding::new("3", AgentTranscriptsPick3, context),
@@ -178,6 +184,18 @@ pub fn register_agent_transcripts_keyboard_bindings(cx: &mut App) {
         KeyBinding::new("9", AgentTranscriptsPick9, context),
     ]);
     key_context::bind_panel_escape(cx, AgentTranscriptsClose, AGENT_TRANSCRIPTS_CONTEXT);
+}
+
+/// A navigation key while the keyboard is in the transcript.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TranscriptKey {
+    Up,
+    Down,
+    Home,
+    End,
+    Page(bool),
+    Collapse,
+    Expand,
 }
 
 /// What the user did in the session list, queued for the view to apply.
@@ -241,6 +259,10 @@ pub struct AgentTranscriptsView {
     entries: Vec<Entry>,
     /// Chunks the user toggled away from how they start.
     toggled: HashMap<ChunkId, bool>,
+    /// Whether the keyboard is in the transcript rather than the session
+    /// list, and the chunk it is on there.
+    transcript_focused: bool,
+    highlight: Option<ChunkId>,
     /// Every usage figure is shown, not just the one-line summary.
     usage_expanded: bool,
     _transcript_subscription: Subscription,
@@ -269,7 +291,11 @@ impl AgentTranscriptsView {
         // turns that matter, not by scrolling past all of them.
         let transcript = cx.new(|_| TranscriptList::starting(StartState::Collapsed));
         let subscription = cx.subscribe(&transcript, |this, _, event, cx| match event {
-            TranscriptListEvent::ChunkClicked(id) => this.toggle(*id, cx),
+            TranscriptListEvent::ChunkClicked(id) => {
+                let focused = this.transcript_focused;
+                this.set_transcript_cursor(Some(*id), focused, cx);
+                this.toggle(*id, cx)
+            }
         });
         let mut this = Self {
             fleet,
@@ -289,6 +315,8 @@ impl AgentTranscriptsView {
             transcript,
             entries: Vec::new(),
             toggled: HashMap::new(),
+            transcript_focused: false,
+            highlight: None,
             usage_expanded: false,
             _transcript_subscription: subscription,
             _live: gpui::Task::ready(()),
@@ -428,6 +456,69 @@ impl AgentTranscriptsView {
         self.rebuild_rows();
     }
 
+    /// The transcript's chunks in display order.
+    fn chunks(&self) -> Vec<ChunkId> {
+        transcript_list::chunks(&self.entries, &self.toggled, StartState::Collapsed)
+    }
+
+    fn set_transcript_cursor(
+        &mut self,
+        highlight: Option<ChunkId>,
+        focused: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.highlight = highlight;
+        self.transcript_focused = focused;
+        self.transcript.update(cx, |list, cx| {
+            list.set_highlight(highlight, cx);
+            list.set_active(focused, cx);
+        });
+        cx.notify();
+    }
+
+    /// A navigation key while the keyboard is in the transcript.
+    fn transcript_key(&mut self, key: TranscriptKey, cx: &mut Context<Self>) {
+        let chunks = self.chunks();
+        let at = self.highlight.and_then(|h| chunks.iter().position(|c| *c == h));
+        let last = chunks.len().saturating_sub(1);
+        let target = match key {
+            TranscriptKey::Up => at.map_or(chunks.last(), |ix| chunks.get(ix.saturating_sub(1))),
+            TranscriptKey::Down => at.map_or(chunks.first(), |ix| chunks.get((ix + 1).min(last))),
+            TranscriptKey::Home => chunks.first(),
+            TranscriptKey::End => chunks.last(),
+            TranscriptKey::Page(down) => {
+                let from = self.highlight;
+                let moved = self.transcript.update(cx, |list, cx| list.page(down, from, cx));
+                let target = moved.or_else(|| {
+                    if down {
+                        chunks.last().copied()
+                    } else {
+                        chunks.first().copied()
+                    }
+                });
+                self.set_transcript_cursor(target, true, cx);
+                return;
+            }
+            TranscriptKey::Collapse | TranscriptKey::Expand => {
+                let Some(id) = self.highlight else { return };
+                let start = StartState::Collapsed;
+                let open = transcript_list::is_expanded(&self.entries, &self.toggled, id, start);
+                if key == TranscriptKey::Collapse {
+                    if open {
+                        self.toggle(id, cx);
+                    } else if id.part.is_some() {
+                        let reply = ChunkId { entry: id.entry, part: None };
+                        self.set_transcript_cursor(Some(reply), true, cx);
+                    }
+                } else if !open {
+                    self.toggle(id, cx);
+                }
+                return;
+            }
+        };
+        self.set_transcript_cursor(target.copied(), true, cx);
+    }
+
     /// Expand or collapse one chunk.
     fn toggle(&mut self, id: ChunkId, cx: &mut Context<Self>) {
         let start = StartState::Collapsed;
@@ -453,9 +544,16 @@ impl AgentTranscriptsView {
             .selected_agent_id
             .as_ref()
             .is_some_and(|id| self.reading.contains(id));
+        let chunks = self.chunks();
+        if self.highlight.is_some_and(|h| !chunks.contains(&h)) {
+            self.highlight = None;
+        }
+        let (highlight, active) = (self.highlight, self.transcript_focused);
         self.transcript.update(cx, |list, cx| {
             list.set_entries(entries, cx);
             list.set_toggled(toggled, cx);
+            list.set_highlight(highlight, cx);
+            list.set_active(active, cx);
             list.set_status(
                 reading,
                 reading.then(|| "reading the transcript".to_string()),
@@ -721,36 +819,57 @@ impl AgentTranscriptsView {
     }
 
     fn on_arrow_up(&mut self, _: &ItemListUp, _: &mut Window, cx: &mut Context<Self>) {
+        if self.transcript_focused {
+            return self.transcript_key(TranscriptKey::Up, cx);
+        }
         self.move_cursor(-1, cx);
     }
 
     fn on_arrow_down(&mut self, _: &ItemListDown, _: &mut Window, cx: &mut Context<Self>) {
+        if self.transcript_focused {
+            return self.transcript_key(TranscriptKey::Down, cx);
+        }
         self.move_cursor(1, cx);
     }
 
     fn on_page_up(&mut self, _: &ItemListPageUp, window: &mut Window, cx: &mut Context<Self>) {
+        if self.transcript_focused {
+            return self.transcript_key(TranscriptKey::Page(false), cx);
+        }
         let page = ItemList::<AgentRow>::page_rows(window.viewport_size().height) as i32;
         self.move_cursor(-page, cx);
     }
 
     fn on_page_down(&mut self, _: &ItemListPageDown, window: &mut Window, cx: &mut Context<Self>) {
+        if self.transcript_focused {
+            return self.transcript_key(TranscriptKey::Page(true), cx);
+        }
         let page = ItemList::<AgentRow>::page_rows(window.viewport_size().height) as i32;
         self.move_cursor(page, cx);
     }
 
     fn on_home(&mut self, _: &ItemListHome, _: &mut Window, cx: &mut Context<Self>) {
+        if self.transcript_focused {
+            return self.transcript_key(TranscriptKey::Home, cx);
+        }
         if self.list.cursor_home() {
             self.follow_cursor(cx);
         }
     }
 
     fn on_end(&mut self, _: &ItemListEnd, _: &mut Window, cx: &mut Context<Self>) {
+        if self.transcript_focused {
+            return self.transcript_key(TranscriptKey::End, cx);
+        }
         if self.list.cursor_end() {
             self.follow_cursor(cx);
         }
     }
 
     fn on_collapse(&mut self, _: &ItemListCollapse, _: &mut Window, cx: &mut Context<Self>) {
+        if self.transcript_focused {
+            return self.transcript_key(TranscriptKey::Collapse, cx);
+        }
         match self.list.collapse_step() {
             CollapseStep::Collapsed => {
                 self.rebuild_rows();
@@ -762,6 +881,9 @@ impl AgentTranscriptsView {
     }
 
     fn on_expand(&mut self, _: &ItemListExpand, _: &mut Window, cx: &mut Context<Self>) {
+        if self.transcript_focused {
+            return self.transcript_key(TranscriptKey::Expand, cx);
+        }
         if self.list.expand_step() {
             self.rebuild_rows();
             cx.notify();
@@ -1027,6 +1149,14 @@ impl Render for AgentTranscriptsView {
             }))
             .on_action(cx.listener(|this, _: &AgentTranscriptsRefresh, _, cx| {
                 this.refresh(cx);
+            }))
+            .on_action(cx.listener(|this, _: &AgentTranscriptsIntoTranscript, _, cx| {
+                let first = this.highlight.or_else(|| this.chunks().first().copied());
+                this.set_transcript_cursor(first, true, cx);
+            }))
+            .on_action(cx.listener(|this, _: &AgentTranscriptsIntoList, _, cx| {
+                let highlight = this.highlight;
+                this.set_transcript_cursor(highlight, false, cx);
             }))
             .on_action(cx.listener(Self::on_arrow_up))
             .on_action(cx.listener(Self::on_arrow_down))

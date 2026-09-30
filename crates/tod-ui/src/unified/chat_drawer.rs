@@ -49,7 +49,7 @@ use tod_store::fleet::FleetStore;
 use crate::conversation::format_time;
 use crate::interview::agent::SharedAgent;
 use crate::interview::{TodPaths, TodSettings};
-use crate::ui::agent_conversation::{AgentConversationEvent, AgentConversationPanel, Entry, EntryKind};
+use crate::ui::agent_conversation::{bind_panel_host_keys, forward_panel_keys, AgentConversationEvent, AgentConversationPanel, Entry, EntryKind};
 use crate::ui::agent_runs::AgentRuns;
 use crate::ui::key_context;
 use crate::ui::session_info::SessionInfo;
@@ -82,6 +82,7 @@ pub fn register_chat_drawer_keyboard_bindings(cx: &mut App) {
         KeyBinding::new("ctrl-n", ChatDrawerNewConversation, nav),
         KeyBinding::new("ctrl-n", ChatDrawerNewConversation, input),
     ]);
+    bind_panel_host_keys(cx, CHAT_DRAWER_CONTEXT);
 }
 
 fn entry_of(turn: &Turn, root: &std::path::Path) -> Entry {
@@ -143,6 +144,7 @@ impl ChatDrawer {
         agent_runs: Entity<AgentRuns>,
         height: Option<Pixels>,
     ) -> Self {
+        let focus_handle = cx.focus_handle();
         let transcript = cx.new(|cx| {
             let mut panel = AgentConversationPanel::new(
                 "Chat",
@@ -150,6 +152,9 @@ impl ChatDrawer {
                 window,
                 cx,
             );
+            // Escape while writing returns the keyboard to the drawer, where
+            // the arrow keys walk the transcript.
+            panel.set_return_focus(focus_handle.clone());
             panel.set_extra_hint("Ctrl+N new conversation");
             // The drawer's own header line shows the title, beside its
             // collapse chevron.
@@ -176,7 +181,7 @@ impl ChatDrawer {
             transcript,
             _transcript_events: transcript_events,
             _agent_runs_sub: agent_runs_sub,
-            focus_handle: cx.focus_handle(),
+            focus_handle,
         };
         drawer.reload(cx);
         drawer.load_sessions(cx);
@@ -717,7 +722,10 @@ impl Render for ChatDrawer {
             )
             .child(Icon::new(IconName::ChevronDown).small().text_color(muted));
 
-        div()
+        // The highlight shows only while the keyboard is in the drawer.
+        self.transcript.update(cx, |panel, cx| panel.set_active(focused, cx));
+        let transcript = self.transcript.clone();
+        forward_panel_keys(div(), &transcript, false)
             .id("chat-drawer")
             .key_context(CHAT_DRAWER_CONTEXT)
             .track_focus(&self.focus_handle)

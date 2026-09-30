@@ -455,6 +455,38 @@ impl TranscriptList {
         }
     }
 
+    /// Scroll one screen (a little less, so a line of context carries over),
+    /// and say which chunk a highlight that was on `from` should move to: the
+    /// first chunk at the new top of the screen, or the end of the transcript
+    /// when there is no further to go. `None` when `from` is not in this list.
+    pub fn page(&mut self, down: bool, from: Option<ChunkId>, cx: &mut Context<Self>) -> Option<ChunkId> {
+        let height = self.list.viewport_bounds().size.height;
+        let distance = if height > px(0.) { height * 0.9 } else { px(400.) };
+        self.list.scroll_by(if down { distance } else { -distance });
+        cx.notify();
+
+        let chunk_rows: Vec<(usize, ChunkId)> = self
+            .rows
+            .iter()
+            .enumerate()
+            .filter_map(|(ix, row)| row.chunk().map(|chunk| (ix, chunk)))
+            .collect();
+        let old = chunk_rows.iter().position(|(_, chunk)| Some(*chunk) == from)?;
+        let top = self.list.logical_scroll_top();
+        // A row cut off by the top edge is not yet the first one in view.
+        let top_ix = top.item_ix + usize::from(top.offset_in_item > px(0.));
+        let at_top = chunk_rows.iter().position(|(ix, _)| *ix >= top_ix);
+        let target = if down {
+            match at_top {
+                Some(ix) if ix > old => ix,
+                _ => chunk_rows.len() - 1,
+            }
+        } else {
+            at_top.unwrap_or(old).min(old.saturating_sub(1))
+        };
+        Some(chunk_rows[target].1)
+    }
+
     pub fn set_active(&mut self, active: bool, cx: &mut Context<Self>) {
         if active != self.active {
             self.active = active;

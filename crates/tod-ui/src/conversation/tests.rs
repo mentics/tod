@@ -615,6 +615,30 @@ fn a_reply_shows_its_answer_with_the_work_collapsed(cx: &mut TestAppContext) {
     draw(cx);
     assert!(expanded(&view, chunk(Some(2)), cx));
 
+    // Left collapses the highlighted chunk; Left again goes to its reply,
+    // and Right opens it.
+    cx.dispatch_action(ConversationLinkLeft);
+    draw(cx);
+    assert!(!expanded(&view, chunk(Some(2)), cx));
+    cx.dispatch_action(ConversationLinkLeft);
+    assert_eq!(
+        view.read_with(cx, |v, cx| v.transcript.read(cx).highlight()),
+        PanelStop::Chunk(chunk(None))
+    );
+    cx.dispatch_action(ConversationPageDown);
+    cx.dispatch_action(ConversationPageUp);
+    assert!(matches!(
+        view.read_with(cx, |v, cx| v.transcript.read(cx).highlight()),
+        PanelStop::Chunk(_)
+    ));
+    view.update(cx, |v, cx| {
+        v.transcript
+            .update(cx, |p, cx| p.set_highlight(PanelStop::Chunk(chunk(Some(2))), cx))
+    });
+    cx.dispatch_action(ConversationLinkRight);
+    draw(cx);
+    assert!(expanded(&view, chunk(Some(2)), cx));
+
     // Collapsing the reply hides its pieces from the keyboard too.
     for _ in 0..3 {
         cx.dispatch_action(ConversationUp);
