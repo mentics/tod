@@ -12,7 +12,7 @@
 //! Spec: `doc/conversation/protocols.md` §4c.
 
 use tod_store::fleet::Workdir;
-use super::implement::{IMPLEMENT_CONVERSATION_ENV, IMPLEMENT_NODE_ENV, node_id, plan_steps};
+use super::implement::{IMPLEMENT_CONVERSATION_ENV, IMPLEMENT_NODE_ENV, node_id};
 use super::protocol::{Next, Protocol, ProtocolEnv, Stop, TurnContext, cap_or_stall};
 use crate::agent_context::{ImplementRequest, NodeSelection, build_review_message};
 use crate::process_bundle::{ProcessManifest, TodInstallPaths, state_role_doc};
@@ -126,7 +126,8 @@ impl Protocol for ReviewProtocol {
                     body,
                     lifecycle: Some(node.lifecycle.clone()),
                 },
-                plan_steps: plan_steps(fleet, node_id),
+                // A review judges the change against the obligations only.
+                plan_steps: Vec::new(),
                 obligations,
                 ancestor_context,
                 verdicts: super::verify::current_verdicts(fleet, node_id),

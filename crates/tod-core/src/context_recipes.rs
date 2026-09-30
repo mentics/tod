@@ -197,16 +197,25 @@ pub const REVIEW_SESSION: ContextRecipe = ContextRecipe {
         "stance/autonomous-session",
         "domain/outline",
         "domain/obligations",
-        "domain/plan",
         "domain/lifecycle",
         "cli/intro",
         "cli/obligations",
-        "cli/plan",
         "cli/review",
         "cli/decisions",
         "surface/review",
     ],
-    blocks: IMPLEMENT_SESSION.blocks,
+    // The implementation blocks without the plan: a reviewer judges the change
+    // against the obligations, not against how it was broken into steps.
+    blocks: &[
+        DynamicBlock::WorkingDirectory,
+        DynamicBlock::DataRoot,
+        DynamicBlock::Node,
+        DynamicBlock::NodeObligations {
+            note: OWN_OBLIGATIONS_NOTE,
+        },
+        DynamicBlock::AncestorContext,
+        DynamicBlock::ObligationVerdicts,
+    ],
 };
 
 /// A pr session: an agent opening and driving a node's pull request. The `pr`

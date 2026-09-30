@@ -28,7 +28,7 @@ was branched from; use git to find it.
 
 ## What to look for
 
-Correctness first: defects the node's obligations and plan steps would count
+Correctness first: defects the node's obligations would count
 as wrong, and bugs in the code the change touches — wrong results, crashes,
 races, lost data, security holes, broken error paths. Then what will cause
 one: a missing test for behavior an obligation requires, a hazard the next
