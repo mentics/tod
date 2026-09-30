@@ -55,6 +55,7 @@ enum UiRequest {
     Text(String),
     /// Yield one frame so layout/paint after input is visible to `shot`.
     Sync,
+    Quit,
     Transcripts(TranscriptsCommand),
     AgentPlatform(AgentPlatformSocketCommand),
 }
@@ -167,6 +168,7 @@ fn handle_client(
                     .map(|()| "ok".to_string())
             }
             Ok(Command::Sync) => dispatch_ui(&tx, UiRequest::Sync),
+            Ok(Command::Quit) => dispatch_ui(&tx, UiRequest::Quit),
             Ok(Command::Transcripts(action)) => dispatch_ui(&tx, UiRequest::Transcripts(action)),
             Ok(Command::AgentPlatform(action)) => {
                 dispatch_ui(&tx, UiRequest::AgentPlatform(action))
@@ -245,6 +247,15 @@ fn handle_ui_request(
 ) -> Result<String, String> {
     match request {
         UiRequest::Sync => Ok("ok".into()),
+        UiRequest::Quit => Ok(cx
+            .update(|app| {
+                // Closing the last window quits the app (`app::mod`), the
+                // same path as the user closing it.
+                for window in app.windows() {
+                    let _ = window.update(app, |_, window, _| window.remove_window());
+                }
+                "ok".to_string()
+            })),
         UiRequest::Key(keystroke) => apply_key(cx, window, keystroke).map(|()| "ok".into()),
         UiRequest::Text(text) => apply_text(cx, window, text).map(|()| "ok".into()),
         UiRequest::Transcripts(action) => apply_transcripts(cx, transcript_window, action),

@@ -48,6 +48,8 @@ pub enum Command {
     },
     /// Wait one UI frame (layout/paint) before the next observation.
     Sync,
+    /// Close every window, as the user would: the app then quits itself.
+    Quit,
     Transcripts(TranscriptsCommand),
     AgentPlatform(AgentPlatformSocketCommand),
 }
@@ -146,6 +148,12 @@ pub fn parse_line(line: &str) -> Result<Command, String> {
                 path: PathBuf::from(path),
                 crop,
             })
+        }
+        "quit" => {
+            if parts.next().is_some() {
+                return Err("quit takes no arguments".into());
+            }
+            Ok(Command::Quit)
         }
         "sync" => {
             if parts.next().is_some() {
@@ -263,6 +271,8 @@ mod tests {
             _ => panic!(),
         }
         assert!(matches!(parse_line("sync").unwrap(), Command::Sync));
+        assert!(matches!(parse_line("quit").unwrap(), Command::Quit));
+        assert!(parse_line("quit now").is_err());
     }
 
     #[test]

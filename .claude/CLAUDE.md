@@ -573,6 +573,29 @@ Any multi-column view moves the focused panel with Left/Right. Where those keys 
 
 Drawer panels in the Tasks view do not move focus themselves — they emit a `FocusTaskList` event and the shell (`crates/tod-ui/src/app/window.rs`) routes it, mirroring how `Close` is handled.
 
+### Stopping a `tod` you launched
+
+Stop an instance you started yourself when you are done with it, and only that
+one: other `tod` processes are the user's or another session's. Ask it to quit
+through its control socket, which closes its windows the way the user would
+(so it shuts down cleanly):
+
+```bash
+python -c "import socket;s=socket.create_connection(('127.0.0.1',PORT));s.sendall(b'quit
+')"
+```
+
+Only if it does not exit, kill it, and find it by what is unique to your
+launch — its `--data-root` or `--agent-socket-port` on the command line — never
+by name (`taskkill /IM tod.exe` and `pkill tod` hit every instance):
+
+```powershell
+Get-CimInstance Win32_Process -Filter "Name='tod.exe'" | Where-Object { $_.CommandLine -like '*<your data root>*' } | Stop-Process
+```
+
+(`pkill -f -- '--data-root <your data root>'` on Linux and macOS.) Give every
+launch its own data root and port so this is unambiguous.
+
 ### Feature flags
 
 `agent-socket` (default-on) compiles the TCP UI-automation control socket into dev/CI builds; release builds should use `--no-default-features` so that code isn't present in the shipped binary at all (not just disabled at runtime).

@@ -16,7 +16,7 @@ Open the PR if none exists yet, then **babysit** it: get it to a state that is 1
 - **Keep the branch current.** When the base branch has moved on, merge it into the branch (a merge, never a rebase or a force-push, so review history stays intact), resolve conflicts, and run the tests.
 - **Answer every review thread**, human or bot, with the same care. Read the thread with its code. Then either fix it, or decline with a reason, and answer the thread so the reply is posted and the thread resolved. Push before you answer, so the reply can name the commit.
 - **Fix failing checks** the change caused.
-- **Fix what a review bot found** when its score is under the threshold: its summary comment says what.
+- **Fix what a review bot found**, whatever its score: a score at or above the threshold does not make a real problem acceptable. Its threads and its summary say what; apply the scope rule below to each.
 
 You never ask a bot to review and you never wait for one: the app does both, and calls you back when there is something new.
 
