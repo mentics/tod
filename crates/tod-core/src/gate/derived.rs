@@ -1386,6 +1386,7 @@ mod readiness_tests {
                 head_committed_at: Some("2026-01-01T10:00:00Z".into()),
                 draft: false,
                 base_ref: Some("main".into()),
+                body: None,
             },
             threads,
             comments: review

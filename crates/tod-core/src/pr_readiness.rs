@@ -49,6 +49,12 @@ impl ReviewBot {
     /// The score in a comment, from a `Confidence Score: N/5` line near the
     /// top (markdown emphasis and HTML around it are ignored). `None` when
     /// the comment has no such line: it is not a review.
+    /// Whether `login` is this bot. GitHub names an app's account with a `[bot]`
+    /// suffix (`greptile-apps[bot]`).
+    pub fn is_author(&self, login: &str) -> bool {
+        login.trim_end_matches("[bot]").eq_ignore_ascii_case(self.author)
+    }
+
     pub fn parse_score(&self, body: &str) -> Option<u8> {
         for line in body.lines().map(str::trim).filter(|l| !l.is_empty()).take(12) {
             let plain: String = strip_markup(line);
@@ -331,26 +337,42 @@ fn bot_standing(
     sha: Option<&str>,
     head_at: Option<DateTime<Utc>>,
 ) -> BotStanding {
-    let newest = snapshot
+    // Where a bot keeps its summary varies: a comment of its own, or its own
+    // section of the pull request's description, edited in place (Greptile).
+    // A description carries no edit time of its own, so it counts only when
+    // it names the commit.
+    let from_comments = snapshot
         .comments
         .iter()
-        .filter(|c| c.author.as_deref().is_some_and(|a| a.eq_ignore_ascii_case(bot.author)))
-        .filter_map(|c| bot.parse_score(&c.body).map(|score| (c, score)))
-        .max_by_key(|(c, _)| parse_time(&c.updated_at));
-    let Some((comment, score)) = newest else {
-        return BotStanding::Missing;
+        .filter(|c| c.author.as_deref().is_some_and(|a| bot.is_author(a)))
+        .filter_map(|c| bot.parse_score(&c.body).map(|score| (c.body.as_str(), c.updated_at.as_str(), score)));
+    let from_description = snapshot.status.body.as_deref().into_iter().filter_map(|body| {
+        let section = body.find("<!-- greptile_comment -->").map_or(body, |at| &body[at..]);
+        bot.parse_score(section).map(|score| (section, "", score))
+    });
+    let mut candidates: Vec<_> = from_comments.chain(from_description).collect();
+    candidates.sort_by_key(|(_, updated, _)| parse_time(updated));
+    let standing = |(text, updated_at, score): &(&str, &str, u8)| {
+        let names_head = sha.is_some_and(|sha| sha.len() >= 7 && text.contains(&sha[..7]));
+        let names_other = !names_head && mentions_commit(text);
+        let after_head = match (parse_time(updated_at), head_at) {
+            (Some(updated), Some(head)) => updated >= head,
+            _ => false,
+        };
+        if names_head || (after_head && !names_other) {
+            BotStanding::Current { score: *score }
+        } else {
+            BotStanding::Stale { last_score: Some(*score) }
+        }
     };
-    let names_head = sha.is_some_and(|sha| sha.len() >= 7 && comment.body.contains(&sha[..7]));
-    let names_other = !names_head && mentions_commit(&comment.body);
-    let after_head = match (parse_time(&comment.updated_at), head_at) {
-        (Some(updated), Some(head)) => updated >= head,
-        _ => false,
-    };
-    if names_head || (after_head && !names_other) {
-        BotStanding::Current { score }
-    } else {
-        BotStanding::Stale { last_score: Some(score) }
-    }
+    // A summary for the current head wins over an older one kept elsewhere.
+    candidates
+        .iter()
+        .rev()
+        .map(standing)
+        .find(|s| matches!(s, BotStanding::Current { .. }))
+        .or_else(|| candidates.last().map(standing))
+        .unwrap_or(BotStanding::Missing)
 }
 
 /// The comment says which commit it last reviewed (`Last reviewed commit:`).
@@ -402,6 +424,48 @@ pub fn render_work(url: &str, assessment: &Assessment) -> String {
     out
 }
 
+/// Reads a real pull request, for checking the GitHub side by hand:
+/// `TOD_TEST_GITHUB_TOKEN=$(gh auth token) TOD_TEST_PR=owner/repo#N cargo test
+/// -p tod-core live_pr -- --nocapture`. Skipped when either is unset.
+#[cfg(test)]
+mod live {
+    use super::*;
+    use tod_store::github::{Github, GithubAuth};
+
+    #[test]
+    fn live_pr_is_assessed() {
+        let (Ok(token), Ok(pr)) = (
+            std::env::var("TOD_TEST_GITHUB_TOKEN"),
+            std::env::var("TOD_TEST_PR"),
+        ) else {
+            return;
+        };
+        let (repo, number) = pr.split_once('#').expect("owner/repo#N");
+        let (owner, repo) = repo.split_once('/').expect("owner/repo#N");
+        let gh = Github::new(GithubAuth::Token(token));
+        let snap = gh.get_pr_snapshot(owner, repo, number.parse().unwrap()).unwrap();
+        println!("status: {:?}", snap.status);
+        for t in &snap.threads {
+            println!("thread {} resolved={} {:?}:{:?}", t.id, t.resolved, t.path, t.line);
+        }
+        for c in &snap.comments {
+            println!("comment {} by {:?}: {}", c.id, c.author, c.body.lines().next().unwrap_or(""));
+        }
+        let settings = PrReadinessSettings {
+            bots: vec![tod_store::PrReviewBotSettings {
+                name: "greptile".into(),
+                min_score: 4,
+                rerun_after_minutes: 10,
+            }],
+            ..Default::default()
+        };
+        let a = Assessment::of(&snap, &settings, Utc::now());
+        println!("bots: {:#?}
+open threads: {}
+next: {:?}", a.bots, a.open_threads.len(), a.next());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -423,7 +487,51 @@ mod tests {
             head_committed_at: Some("2026-01-01T10:00:00Z".into()),
             draft: false,
             base_ref: Some("main".into()),
+            body: None,
         }
+    }
+
+    /// What Greptile really writes: its summary lives in the pull request's
+    /// description, as HTML, and names the commit it reviewed by link.
+    const DESCRIPTION: &str = "Test PR.
+
+<!-- greptile_comment -->
+
+<!-- greptile_summary -->
+
+<h2><a href=\"https://app.greptile.com/api/retrigger?id=1\"><picture><img alt=\"Retrigger\" align=\"right\"></picture></a>Confidence Score: 2/5</h2>
+
+Not safe.
+
+<sub>Reviews (1) · Last reviewed commit: [\"Add\"](https://github.com/o/r/commit/abcdef1234567)</sub>
+
+<!-- /greptile_comment -->";
+
+    fn snapshot_with_description(body: &str) -> PrSnapshot {
+        let mut snap = PrSnapshot { status: status("blocked", "success"), threads: vec![], comments: vec![] };
+        snap.status.body = Some(body.into());
+        snap
+    }
+
+    fn greptile_settings() -> tod_store::PrReadinessSettings {
+        tod_store::PrReadinessSettings {
+            bots: vec![tod_store::PrReviewBotSettings { name: "greptile".into(), min_score: 4, rerun_after_minutes: 10 }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_summary_kept_in_the_description_is_read_when_it_names_the_head() {
+        let snap = snapshot_with_description(DESCRIPTION);
+        let a = Assessment::of(&snap, &greptile_settings(), now());
+        assert_eq!(a.bots[0].standing, BotStanding::Current { score: 2 });
+    }
+
+    #[test]
+    fn a_description_summary_for_an_earlier_commit_is_stale() {
+        let snap = snapshot_with_description(&DESCRIPTION.replace("abcdef1234567", "1111111222222"));
+        let a = Assessment::of(&snap, &greptile_settings(), now());
+        assert_eq!(a.bots[0].standing, BotStanding::Stale { last_score: Some(2) });
     }
 
     fn comment(author: &str, body: &str, at: &str) -> IssueComment {
@@ -460,6 +568,13 @@ mod tests {
 
     fn snap(status: PrStatus, threads: Vec<ReviewThread>, comments: Vec<IssueComment>) -> PrSnapshot {
         PrSnapshot { status, threads, comments }
+    }
+
+    #[test]
+    fn a_bot_account_is_named_with_a_bot_suffix() {
+        assert!(GREPTILE.is_author("greptile-apps[bot]"));
+        assert!(GREPTILE.is_author("greptile-apps"));
+        assert!(!GREPTILE.is_author("someone"));
     }
 
     #[test]

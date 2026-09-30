@@ -58,6 +58,9 @@ pub struct PrStatus {
     pub draft: bool,
     /// The branch the PR merges into.
     pub base_ref: Option<String>,
+    /// The description. A review bot may keep its summary here, edited in
+    /// place, rather than in a comment.
+    pub body: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -240,6 +243,7 @@ impl Github {
             head_committed_at: None,
             draft: raw.draft.unwrap_or(false),
             base_ref: raw.base.map(|b| b.name),
+            body: raw.body,
         })
     }
 
@@ -699,6 +703,7 @@ struct PrDetailRaw {
     draft: Option<bool>,
     head: Option<HeadRaw>,
     base: Option<RefRaw>,
+    body: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

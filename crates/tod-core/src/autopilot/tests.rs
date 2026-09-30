@@ -699,6 +699,7 @@ impl crate::pr_readiness::PrFeed for Sim {
                 head_committed_at: Some("2020-01-01T00:00:00Z".into()),
                 draft: false,
                 base_ref: Some("main".into()),
+                body: None,
             },
             threads: if round == 0 {
                 vec![ReviewThread {
@@ -772,6 +773,7 @@ fn a_pull_request_that_never_changes_stops_for_a_person() {
                     head_committed_at: Some("2020-01-01T00:00:00Z".into()),
                     draft: false,
                     base_ref: None,
+                    body: None,
                 },
                 threads: vec![ReviewThread {
                     id: "PRRT_1".into(),

@@ -451,6 +451,7 @@ open pr: Cloud test"), Some("Cloud test"));
                     head_committed_at: None,
                     draft: false,
                     base_ref: None,
+                    body: None,
                 },
                 threads: self
                     .open_thread
