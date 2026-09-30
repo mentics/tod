@@ -19,7 +19,9 @@ tod-cli --data-root <DATA_ROOT> environment remove <NAME> [--node <NODE>]
 
 Use a variable as it is (it is in your process environment). Use a credential
 with `tod-cli secrets run --env <VAR>=<name> -- <command>`: the command gets
-the value, you never do.
+the value, you never do. In a cloud sandbox, a credential with hosts needs no
+`secrets run`: the sandbox's proxy adds it to every request to those hosts, so
+call the API directly.
 
 - `list` shows what is defined, including what was inherited from ancestors.
 - `presets` lists the services tod knows how to set up.

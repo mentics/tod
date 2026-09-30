@@ -29,6 +29,11 @@ manages them). `--env GROWTHBOOK_API_KEY=growthbook` works the same for one of
 those. If you need one that is not there, ask for it with `tod-cli environment
 request`.
 
+In a cloud sandbox `secrets run` is refused: a credential that has hosts (the
+Environment block says which) is applied by the sandbox's proxy to every
+request to those hosts, so call the API directly (curl, your client library)
+without a key. If one is missing, ask with `tod-cli environment request`.
+
 In an autonomous node's cloud sandbox, `github_token` shows as set by the
 sandbox's proxy: `run` gives the command a placeholder, which the proxy
 replaces with the real token on every request to GitHub.

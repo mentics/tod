@@ -226,6 +226,114 @@ fn free_sandbox_name(fleet: &FleetStore, root: &std::path::Path, slug: &str, ski
     unreachable!()
 }
 
+/// The node's Environment credentials that belong in a sandbox's proxy.
+/// Reads the credential store: never on the UI thread.
+fn sandbox_proxy_credentials(
+    fleet: &FleetStore,
+    sandboxes: &Sandboxes,
+    node_id: &str,
+) -> Result<Vec<tod_sandbox::node::CustomCredential>> {
+    let node: uuid::Uuid = node_id.parse().context("node id")?;
+    let creds = sandboxes.credentials();
+    Ok(fleet
+        .read(|conn| crate::environment::sandbox_credentials(conn, &creds, node))?
+        .0)
+}
+
+/// What [`refresh_sandbox_proxy`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SandboxRefresh {
+    /// No live sandbox of its own, or its proxy already has every credential.
+    NotNeeded,
+    /// Deleted and made again (this is the new one's name).
+    Recreated(String),
+    /// Left alone because deleting it could lose work; `force` goes on.
+    NeedsConfirmation(String),
+}
+
+/// A node's own Files sandbox has the proxy it was made with, so a credential
+/// provided or changed afterwards does not reach it. When its `tod-env` label
+/// differs from the node's Environment: push its branch (uncommitted changes
+/// or a failed push need `force`), delete it, forget the location, and make
+/// it again ([`resolve_launch_cwd_with`]), which puts the current credentials
+/// in the new proxy. The node keeps its own sandbox and branch. Anything
+/// running inside it (an agent) is gone: the caller closes its live sessions.
+/// Blocks on the network and git: never on the UI thread.
+pub fn refresh_sandbox_proxy(
+    fleet: &FleetStore,
+    node_id: &str,
+    force: bool,
+    progress: &mut dyn FnMut(&str),
+) -> Result<SandboxRefresh> {
+    let Some(location) = node_location(fleet, node_id)? else {
+        return Ok(SandboxRefresh::NotNeeded);
+    };
+    let Some(name) = location.sandbox().map(str::to_string) else {
+        return Ok(SandboxRefresh::NotNeeded);
+    };
+    let mut sandboxes = Sandboxes::load(fleet.paths().root())?;
+    let bx = sandboxes.blaxel()?;
+    let Some(info) = bx.get(&name)? else {
+        return Ok(SandboxRefresh::NotNeeded);
+    };
+    if matches!(info.status.to_ascii_uppercase().as_str(), "FAILED" | "TERMINATED" | "DELETING" | "DELETED") {
+        return Ok(SandboxRefresh::NotNeeded);
+    }
+    let custom = sandbox_proxy_credentials(fleet, &sandboxes, node_id)?;
+    if sandbox::proxy_is_current(&info, &custom) {
+        return Ok(SandboxRefresh::NotNeeded);
+    }
+    let lock = node_lock(node_id);
+    let _held = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(dir) = location.directory() {
+        // Work the delete would lose: uncommitted files, or a branch that
+        // will not push. The agent itself is running here, so a blocker
+        // (`location_blocker`) is not a reason to refuse.
+        let dirty = dir
+            .git(&["status", "--porcelain", "--ignore-submodules=all"])
+            .map(|out| out.lines().any(|l| !l.trim().is_empty()));
+        if !force {
+            match dirty {
+                Ok(true) => {
+                    return Ok(SandboxRefresh::NeedsConfirmation(format!(
+                        "{name} holds uncommitted changes that recreating it would lose"
+                    )));
+                }
+                Ok(false) => {
+                    progress(&format!("pushing the branch in {name}…"));
+                    if push_branches(&dir).is_err() {
+                        return Ok(SandboxRefresh::NeedsConfirmation(format!(
+                            "the branch could not be pushed from {name}, so recreating it could lose commits"
+                        )));
+                    }
+                }
+                Err(_) => {
+                    return Ok(SandboxRefresh::NeedsConfirmation(format!(
+                        "{name} could not be checked for unpushed work"
+                    )));
+                }
+            }
+        } else if matches!(dirty, Ok(false)) {
+            let _ = push_branches(&dir);
+        }
+    }
+    progress(&format!("deleting {name} to give it the node's credentials…"));
+    sandboxes.delete(&bx, &name).with_context(|| format!("delete sandbox {name}"))?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    while bx.get(&name)?.is_some() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_secs(2));
+    }
+    fleet.enqueue(FleetMutation::DeleteFilesLocation { node_id: node_id.to_string() })?;
+    fleet.writer().flush()?;
+    fleet.reload_if_stale()?;
+    drop(_held);
+    let (dir, _warnings) = resolve_launch_cwd_with(fleet, node_id, progress)?;
+    let made = node_location(fleet, node_id)?
+        .and_then(|l| l.sandbox().map(str::to_string))
+        .unwrap_or_else(|| dir.to_string());
+    Ok(SandboxRefresh::Recreated(made))
+}
+
 fn make_sandbox(
     fleet: &FleetStore,
     files: &ResolvedFiles,
@@ -240,11 +348,20 @@ fn make_sandbox(
         .ok_or_else(|| anyhow!("no node {}", files.node_id))?;
     let mut sandboxes = Sandboxes::load(&root)?;
     let source = dev.sandbox_from.source();
+    // The node's Environment: secrets with hosts go in the sandbox's proxy,
+    // so the agent calls those hosts without holding the value.
+    let custom = match sandbox_proxy_credentials(fleet, &sandboxes, &files.node_id) {
+        Ok(custom) => custom,
+        Err(err) => {
+            progress(&format!("warning: the node's Environment was not applied: {err:#}"));
+            Vec::new()
+        }
+    };
     let mut attempt = 0;
     let name = loop {
         let name = free_sandbox_name(fleet, &root, &node.slug, attempt)?;
         progress(&format!("making sandbox {name} from {}…", dev.sandbox_from.describe()));
-        match sandboxes.create(&name, &source, true, false, progress) {
+        match sandboxes.create_with_proxy(&name, &source, true, false, &custom, progress) {
             Ok(_) => break name,
             // Blaxel has one by that name that this data root doesn't know.
             Err(err) if attempt < 5 && format!("{err:#}").contains("already exists") => attempt += 1,

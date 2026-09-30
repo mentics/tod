@@ -25,6 +25,7 @@ use std::sync::{Arc, Mutex};
 use tod_sandbox::blaxel::SandboxInfo;
 use tod_store::cloud_nodes::{self, CloudNodeRow};
 use tod_store::fleet::FleetStore;
+use tod_store::fleet::provision::SandboxRefresh;
 
 /// Which cloud nodes a check looks at.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -177,8 +178,7 @@ pub enum Refresh {
 /// Whether `info`'s proxy was made with exactly `custom` (its `tod-env`
 /// label; a sandbox from before the label counts as having none).
 pub fn proxy_is_current(info: &SandboxInfo, custom: &[tod_sandbox::node::CustomCredential]) -> bool {
-    let have = info.label(tod_sandbox::node::ENV_LABEL).unwrap_or("none");
-    have == tod_sandbox::node::env_fingerprint(custom)
+    tod_store::fleet::sandbox::proxy_is_current(info, custom)
 }
 
 /// Proxy rules are fixed when a sandbox is created, so a credential the user
@@ -192,7 +192,17 @@ pub fn refresh_credentials(fleet: &FleetStore, node_id: &str, force: bool) -> Re
     let root = fleet.paths().root().to_path_buf();
     let uuid = uuid::Uuid::parse_str(node_id).with_context(|| format!("node id {node_id}"))?;
     let Some(row) = fleet.read(|c| cloud_nodes::get(c, uuid))? else {
-        return Ok(Refresh::NotNeeded);
+        // Not an autonomous cloud node: maybe an interactive one, in a
+        // sandbox of its own made from its Files settings.
+        let mut progress = |msg: &str| tracing::info!("files sandbox for {node_id}: {msg}");
+        return Ok(match tod_store::fleet::provision::refresh_sandbox_proxy(fleet, node_id, force, &mut progress)? {
+            SandboxRefresh::NotNeeded => Refresh::NotNeeded,
+            SandboxRefresh::Recreated(name) => {
+                set_note(node_id, Some(format!("Recreated {name} with the node's credentials.")));
+                Refresh::Recreated(name)
+            }
+            SandboxRefresh::NeedsConfirmation(why) => Refresh::NeedsConfirmation(why),
+        });
     };
     let mut sandboxes = tod_store::fleet::sandbox::Sandboxes::load(&root)?;
     let bx = sandboxes.blaxel()?;

@@ -523,27 +523,8 @@ pub(crate) fn environment_credentials(
     creds: &CredentialStore,
     node_id: &str,
 ) -> Result<(Vec<tod_sandbox::node::CustomCredential>, Vec<(String, String)>)> {
-    use tod_store::environment::EntryKind;
     let node: uuid::Uuid = node_id.parse().context("node id")?;
-    let entries = fleet.read(|conn| tod_store::environment::resolve(conn, node))?;
-    let (mut custom, mut env) = (Vec::new(), Vec::new());
-    for r in entries {
-        let Some(value) = r.value(creds) else { continue };
-        let e = &r.entry;
-        if e.kind == EntryKind::Secret && e.proxied() {
-            let (header, template) = e.proxy_header();
-            custom.push(tod_sandbox::node::CustomCredential {
-                name: e.name.clone(),
-                hosts: e.hosts.clone(),
-                header,
-                template,
-                secret_value: e.auth.proxy_secret(&value),
-            });
-        } else {
-            env.push((e.env_name().to_string(), value));
-        }
-    }
-    Ok((custom, env))
+    fleet.read(|conn| tod_store::environment::sandbox_credentials(conn, creds, node))
 }
 
 /// Where a node's code comes from: its repository as an HTTPS URL, and branch.

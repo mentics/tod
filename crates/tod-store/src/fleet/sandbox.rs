@@ -192,6 +192,26 @@ impl Sandboxes {
         inherit_output: bool,
         progress: &mut dyn FnMut(&str),
     ) -> Result<String> {
+        self.create_with_proxy(name, source, agents, inherit_output, &[], progress)
+    }
+
+    /// [`Self::create`] with the node's Environment credentials (secrets
+    /// with hosts) as proxy rules, so the agent calls those hosts without
+    /// ever holding the value. Proxy rules are fixed when a sandbox is made,
+    /// and a fork carries its source's proxy and cannot be given another, so
+    /// with credentials a fork source is made from the source's image
+    /// instead (the image must hold the repository, as a fork's source
+    /// does). The sandbox is labelled [`tod_sandbox::node::ENV_LABEL`] with
+    /// the credentials' fingerprint, which [`proxy_is_current`] compares.
+    pub fn create_with_proxy(
+        &mut self,
+        name: &str,
+        source: &NewSandboxSource,
+        agents: bool,
+        inherit_output: bool,
+        custom: &[tod_sandbox::node::CustomCredential],
+        progress: &mut dyn FnMut(&str),
+    ) -> Result<String> {
         validate_name(name)?;
         let acct = self.account()?.clone();
         let bx = self.blaxel()?;
@@ -201,6 +221,22 @@ impl Sandboxes {
             bail!("a sandbox named {name} already exists ({})", info.status);
         }
         let started = Instant::now();
+        let from_image;
+        let source = match source {
+            NewSandboxSource::Fork(base) if !custom.is_empty() => {
+                validate_name(base)?;
+                let image = bx
+                    .get(base)?
+                    .ok_or_else(|| anyhow!("no sandbox named {base} to fork"))?
+                    .image;
+                progress(&format!(
+                    "{base}'s proxy cannot carry this node's credentials; making {name} from its image instead…"
+                ));
+                from_image = NewSandboxSource::Image(image);
+                &from_image
+            }
+            other => other,
+        };
         let image = match source {
             NewSandboxSource::Image(image) => {
                 let image = match image.trim() {
@@ -225,10 +261,17 @@ impl Sandboxes {
                     format!("sandbox/{wrapped}:latest")
                 };
                 let owner = acct.owner.as_deref().map(label_value).unwrap_or_default();
-                let mut labels = vec![("tod", "1")];
+                let fingerprint = tod_sandbox::node::env_fingerprint(custom);
+                let mut labels = vec![("tod", "1"), (tod_sandbox::node::ENV_LABEL, fingerprint.as_str())];
                 if !owner.is_empty() {
                     labels.push(("tod-owner", owner.as_str()));
                 }
+                // The proxy also carries the GitHub/Blaxel rules of
+                // autonomous nodes; here only the Environment's, so
+                // nothing else is routed through it.
+                let proxy = (!custom.is_empty()).then(|| {
+                    tod_sandbox::node::proxy_spec(&tod_sandbox::node::custom_proxy_rules(custom))
+                });
                 progress(&format!("creating {name} from {runtime_image}…"));
                 bx.create(&NewSandbox {
                     name,
@@ -236,6 +279,7 @@ impl Sandboxes {
                     region: &acct.region,
                     memory_mb: acct.memory_mb,
                     labels: &labels,
+                    proxy: proxy.as_ref(),
                 })?;
                 runtime_image
             }
@@ -304,6 +348,12 @@ impl Sandboxes {
         let _ = std::fs::remove_dir_all(dir);
         Ok(())
     }
+}
+
+/// Whether `info`'s proxy was made with exactly `custom` (its `tod-env`
+/// label; a sandbox from before the label counts as having none).
+pub fn proxy_is_current(info: &tod_sandbox::blaxel::SandboxInfo, custom: &[tod_sandbox::node::CustomCredential]) -> bool {
+    info.label(tod_sandbox::node::ENV_LABEL).unwrap_or("none") == tod_sandbox::node::env_fingerprint(custom)
 }
 
 /// A fresh directory to build an image in.
@@ -760,6 +810,39 @@ pub fn validate_name(name: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_interactive_sandbox_proxy_is_current_only_with_its_credentials() {
+        use tod_sandbox::node::{CustomCredential, ENV_LABEL, custom_proxy_rules, env_fingerprint, proxy_spec};
+        let cred = CustomCredential {
+            name: "growth-book".into(),
+            hosts: vec!["api.growthbook.io".into()],
+            header: "Authorization".into(),
+            template: "Bearer {value}".into(),
+            secret_value: "sekrit".into(),
+        };
+        let mut info = tod_sandbox::blaxel::SandboxInfo {
+            name: "tod-x".into(),
+            status: "DEPLOYED".into(),
+            state: None,
+            url: None,
+            image: String::new(),
+            labels: Vec::new(),
+            volumes: Vec::new(),
+            node_env: Vec::new(),
+        };
+        assert!(proxy_is_current(&info, &[]), "a sandbox with no label has no credentials");
+        assert!(!proxy_is_current(&info, std::slice::from_ref(&cred)));
+        info.labels = vec![(ENV_LABEL.to_string(), env_fingerprint(std::slice::from_ref(&cred)))];
+        assert!(proxy_is_current(&info, std::slice::from_ref(&cred)));
+        // The proxy holds only the Environment's rule, secret out of the headers.
+        let spec = proxy_spec(&custom_proxy_rules(std::slice::from_ref(&cred)));
+        let routing = spec["routing"].as_array().unwrap();
+        assert_eq!(routing.len(), 1);
+        assert_eq!(routing[0]["destinations"][0], "api.growthbook.io");
+        assert_eq!(routing[0]["headers"]["Authorization"], "Bearer {{SECRET:env_growth_book}}");
+        assert_eq!(routing[0]["secrets"]["env_growth_book"], "sekrit");
+    }
+
     use super::*;
 
     #[test]

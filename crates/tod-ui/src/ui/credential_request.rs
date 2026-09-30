@@ -316,9 +316,34 @@ impl CredentialDialog {
                 .background_executor()
                 .spawn(async move { lost::refresh_credentials(&fleet, &node.to_string(), false) })
                 .await;
-            let _ = this.update_in(cx, |this, window, cx| this.after_refresh(outcome, window, cx));
+            Self::settle(this, outcome, cx).await;
         })
         .detach();
+    }
+
+    /// A recreated sandbox took its agent processes with it: drop the live
+    /// sessions of the node's conversations (off the UI thread), so the answer
+    /// that follows starts the agent again and resumes, or rotates.
+    async fn settle(
+        this: gpui::WeakEntity<Self>,
+        outcome: anyhow::Result<Refresh>,
+        cx: &mut gpui::AsyncWindowContext,
+    ) {
+        if matches!(outcome, Ok(Refresh::Recreated(_))) {
+            let closing = this
+                .update(cx, |this, cx| {
+                    let node = this.decision.node_id;
+                    let runs = this.ctx.agent_runs.read(cx);
+                    (runs.agent().clone(), runs.node_session_keys(node))
+                })
+                .ok();
+            if let Some((agent, keys)) = closing {
+                cx.background_executor()
+                    .spawn(async move { crate::ui::agent_runs::close_sessions(&agent, &keys) })
+                    .await;
+            }
+        }
+        let _ = this.update_in(cx, |this, window, cx| this.after_refresh(outcome, window, cx));
     }
 
     /// The value is stored; settle the sandbox question, then answer.
@@ -354,7 +379,7 @@ impl CredentialDialog {
                 .background_executor()
                 .spawn(async move { lost::refresh_credentials(&fleet, &node.to_string(), true) })
                 .await;
-            let _ = this.update_in(cx, |this, window, cx| this.after_refresh(outcome, window, cx));
+            Self::settle(this, outcome, cx).await;
         })
         .detach();
     }

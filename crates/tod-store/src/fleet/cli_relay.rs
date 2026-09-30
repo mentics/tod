@@ -103,6 +103,9 @@ exit "$code"
 pub const ORCHESTRATOR_CLI_URL_ENV: &str = "TOD_ORCHESTRATOR_CLI_URL";
 /// The user whose database the orchestrator uses (`X-Tod-User`).
 pub const USER_ENV: &str = "TOD_USER";
+/// What `secrets run` says in a cloud sandbox, where it cannot run.
+pub const SANDBOX_SECRETS_RUN_REFUSAL: &str = "tod-cli: `secrets run` is not used in a cloud sandbox. A credential with hosts is applied automatically by the sandbox's proxy to requests to those hosts: call the API directly (curl, your client library) with no key, and never add the credential's value yourself. If a credential you need is missing, ask the user for it with `tod-cli environment request`.\n";
+
 /// The node the sandbox works on (`X-Tod-Node`).
 pub const NODE_ENV: &str = "TOD_NODE";
 pub const USER_HEADER: &str = "X-Tod-User";
@@ -447,7 +450,7 @@ fn serve(stream: TcpStream, data_root: &Path, cli: &Path, token: &str) -> Result
             None => {
                 // A sandbox's tunnel shares the app's token and names no
                 // container: running the command here would be on the host.
-                let stderr = b"tod-cli: `secrets run` must start its command where the agent is, and this shell has no dev container to do that in; it is not run on the host.\n";
+                let stderr = SANDBOX_SECRETS_RUN_REFUSAL.as_bytes();
                 let mut stream = stream;
                 stream.write_all(format!("70 0 {}\n", stderr.len()).as_bytes())?;
                 stream.write_all(stderr)?;
@@ -887,6 +890,7 @@ mod tests {
         assert_eq!(String::from_utf8_lossy(&reply.stdout), "c=dev-x cwd=/work\n");
         let refused = call(&shared.token);
         assert_eq!(refused.code, 70);
+        assert!(String::from_utf8_lossy(&refused.stderr).contains("proxy"));
         assert!(refused.stdout.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
