@@ -290,6 +290,11 @@ pub fn cloud_nodes_triggers_sql() -> String {
     node_keyed_triggers("cloud_nodes")
 }
 
+/// Triggers for `node_environment` (one row per node).
+pub fn environment_triggers_sql() -> String {
+    node_keyed_triggers("node_environment")
+}
+
 /// Triggers for `node_files_locations` (one row per node).
 pub fn files_locations_triggers_sql() -> String {
     node_keyed_triggers("node_files_locations")

@@ -101,6 +101,7 @@ fn field_anchor_id(field: TaskEditField) -> &'static str {
         TaskEditField::Capability(Capability::Lifecycle) => "task-edit-field-cap-lifecycle",
         TaskEditField::Capability(Capability::Generator) => "task-edit-field-cap-generator",
         TaskEditField::Capability(Capability::Tags) => "task-edit-field-cap-tags",
+        TaskEditField::Capability(Capability::Environment) => "task-edit-field-cap-environment",
         TaskEditField::GeneratorSource => "task-edit-field-gen-source",
         TaskEditField::GeneratorField(_) => "task-edit-field-gen-field",
         TaskEditField::LinearQuery => "task-edit-field-linear-query",
@@ -340,6 +341,7 @@ pub struct TaskEditView {
     loaded_summary: Option<NodeSummary>,
     /// The store changed; reload what other writers (agents) may have touched.
     pending_live_refresh: bool,
+    env_editor: Option<Entity<crate::views::environment_editor::EnvironmentEditor>>,
     /// Hosted in another view (the workbench's Settings column): Left and
     /// Ctrl+Left (`PaneFocusLeft`) go to the host instead of emitting
     /// `FocusTaskList`.
@@ -686,6 +688,7 @@ impl TaskEditView {
             loaded_details: String::new(),
             loaded_summary: None,
             pending_live_refresh: false,
+            env_editor: None,
             embedded: false,
             notes: Vec::new(),
             details_collapsed: false,
@@ -1256,6 +1259,9 @@ impl TaskEditView {
             return;
         };
         let _ = self.fleet.reload_if_stale();
+        if let Some(editor) = &self.env_editor {
+            editor.update(cx, |e, cx| e.reload(cx));
+        }
         self.load_summary();
         self.load_obligation_counts(&task_id);
         if self.editing_note_id.is_none()
@@ -4539,6 +4545,27 @@ impl TaskEditView {
         )
     }
 
+    fn render_environment_section(
+        &self,
+        cap_index: usize,
+        background: gpui::Hsla,
+        border: gpui::Hsla,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let cap = Capability::Environment;
+        let enabled = self.capability_enabled(cap);
+        let body = self.env_editor.as_ref().map(|editor| {
+            if let Some(node) = self.node_uuid() {
+                editor.update(cx, |e, cx| e.sync(node, enabled, cx));
+            }
+            editor.clone().into_any_element()
+        });
+        let legend = self
+            .render_section_legend(cap, cap_index, background, cx)
+            .into_any_element();
+        Self::render_legend_border_section(border, legend, body)
+    }
+
     fn render_tags_section(
         &self,
         cap_index: usize,
@@ -5879,6 +5906,9 @@ impl TaskEditView {
             Capability::Tags => self
                 .render_tags_section(cap_index, background, border, window, cx)
                 .into_any_element(),
+            Capability::Environment => self
+                .render_environment_section(cap_index, background, border, cx)
+                .into_any_element(),
         }
     }
 
@@ -5918,6 +5948,14 @@ impl Render for TaskEditView {
             return self.render_generator_detail(window, cx);
         }
 
+        if self.env_editor.is_none()
+            && let Some(node) = self.node_uuid()
+        {
+            let (fleet, root) = (self.fleet.clone(), self.paths.data_root().to_path_buf());
+            self.env_editor = Some(cx.new(|cx| {
+                crate::views::environment_editor::EnvironmentEditor::new(fleet, root, node, cx)
+            }));
+        }
         self.sync_input_tab_stops(cx);
         self.reconcile_input_focus(window, cx);
 

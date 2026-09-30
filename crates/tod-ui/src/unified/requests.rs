@@ -560,7 +560,12 @@ impl Requests {
         match top.kind {
             AttentionKind::Decision => {
                 if let Some(decision) = self.loaded.pending.iter().find(|d| d.id == top.id).cloned() {
-                    self.answer(decision, Some(action.0), None, Source::Keyboard, cx);
+                    // "I've provided it" is the dialog's Save, never a bare pick.
+                    if tod_core::environment_request::is_request(&decision) && action.0 == 1 {
+                        self.provide_credential(&decision, _window, cx);
+                    } else {
+                        self.answer(decision, Some(action.0), None, Source::Keyboard, cx);
+                    }
                 }
             }
             AttentionKind::PlanStep => {
@@ -570,6 +575,39 @@ impl Requests {
             }
             AttentionKind::Finding => {}
         }
+    }
+
+    /// Open the dialog that takes a requested credential's value.
+    fn provide_credential(&mut self, decision: &Decision, window: &mut Window, cx: &mut Context<Self>) {
+        let ctx = crate::ui::credential_request::Ctx {
+            fleet: self.fleet.clone(),
+            data_root: self.fleet.paths().root().to_path_buf(),
+            agent_runs: self.agent_runs.clone(),
+        };
+        crate::ui::credential_request::open(window, cx, ctx, decision.clone());
+    }
+
+    /// The card's buttons for a credential request: Provide opens the dialog
+    /// (the value is typed there, never in the request), and the other answers
+    /// that it cannot be provided.
+    fn render_credential_buttons(&self, decision: &Decision, cx: &mut Context<Self>) -> impl IntoElement {
+        let (provide, decline) = (decision.clone(), decision.clone());
+        div()
+            .flex()
+            .flex_wrap()
+            .gap_1()
+            .child(
+                Button::new(SharedString::from(format!("unified-decisions-provide-{}", decision.id)))
+                    .label("1. Provide…")
+                    .small()
+                    .on_click(cx.listener(move |this, _, window, cx| this.provide_credential(&provide, window, cx))),
+            )
+            .child(
+                Button::new(SharedString::from(format!("unified-decisions-decline-{}", decision.id)))
+                    .label("2. I can't provide it")
+                    .small()
+                    .on_click(cx.listener(move |this, _, _, cx| this.click_option(decline.clone(), 2, cx))),
+            )
     }
 
     pub(crate) fn click_option(&mut self, decision: Decision, option: usize, cx: &mut Context<Self>) {
@@ -1240,8 +1278,16 @@ impl Requests {
                 window,
                 cx,
             ))
-            .when(!decision.options.is_empty(), |el| el.child(self.render_options(&decision, cx)))
-            .child(self.render_freeform(decision.id, decision.options.is_empty(), cx))
+            .when(tod_core::environment_request::is_request(&decision), |el| {
+                el.child(self.render_credential_buttons(&decision, cx))
+            })
+            .when(
+                !decision.options.is_empty() && !tod_core::environment_request::is_request(&decision),
+                |el| el.child(self.render_options(&decision, cx)),
+            )
+            .when(!tod_core::environment_request::is_request(&decision), |el| {
+                el.child(self.render_freeform(decision.id, decision.options.is_empty(), cx))
+            })
             .child(footer)
             .into_any_element()
     }

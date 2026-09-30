@@ -71,6 +71,8 @@ for arg in "$@"; do
 done
 if [ -n "$questions" ] && [ -n "$add" ]; then reads_stdin=1; fi
 if [ -n "$reads_stdin" ]; then cat > "$tmp/in"; fi
+# `secrets run` starts its command in this container, here and with this PATH.
+export TOD_SHIM_CWD="$PWD" TOD_SHIM_PATH="$PATH"
 names=()
 for name in $(compgen -e); do
   case "$name" in
@@ -352,13 +354,19 @@ pub fn encode_request(token: &str, request: &RelayRequest) -> Vec<u8> {
 /// orchestrator, which has no token). Non-`TOD_*` and `TOD_CLI_RELAY_*`
 /// variables are dropped.
 pub fn decode_request(reader: &mut impl BufRead, expected_token: Option<&str>) -> Result<RelayRequest> {
+    decode_request_with(reader, |given| match expected_token {
+        Some(token) => constant_time_eq(given.as_bytes(), token.as_bytes()),
+        None => true,
+    })
+}
+
+/// [`decode_request`] with the token judged by `accept`.
+fn decode_request_with(reader: &mut impl BufRead, accept: impl FnOnce(&str) -> bool) -> Result<RelayRequest> {
     if read_line(reader)? != "tod-cli-relay 1" {
         bail!("not a tod-cli relay request");
     }
     let given = read_line(reader)?;
-    if let Some(token) = expected_token
-        && !constant_time_eq(given.as_bytes(), token.as_bytes())
-    {
+    if !accept(&given) {
         bail!("tod-cli relay request with a wrong token");
     }
     let mut env = Vec::new();
@@ -408,11 +416,50 @@ pub fn decode_reply(bytes: &[u8]) -> Result<RelayReply> {
 fn serve(stream: TcpStream, data_root: &Path, cli: &Path, token: &str) -> Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(30)))?;
     let mut reader = BufReader::new(stream.try_clone()?);
-    let request = read_request(&mut reader, token)?;
+    let mut target: Option<String> = None;
+    let request = decode_request_with(&mut reader, |given| {
+        if constant_time_eq(given.as_bytes(), token.as_bytes()) {
+            return true;
+        }
+        match container_for_token(given) {
+            Some(container) => {
+                target = Some(container);
+                true
+            }
+            None => false,
+        }
+    })?;
+    let mut request = request;
+    let mut env_for_cli = std::mem::take(&mut request.env);
+    let lookup = |key: &str| env_for_cli.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone());
+    let (shim_cwd, shim_path) = (lookup(SHIM_CWD_ENV), lookup(SHIM_PATH_ENV));
+    // The agent never picks where a command runs: these come from the relay.
+    env_for_cli.retain(|(key, _)| !key.starts_with("TOD_SECRETS_EXEC_"));
+    if is_secrets_run(&request.args) {
+        match &target {
+            Some(container) => {
+                env_for_cli.push((EXEC_CONTAINER_ENV.to_string(), container.clone()));
+                env_for_cli.push((EXEC_CWD_ENV.to_string(), shim_cwd.unwrap_or_else(|| "/".into())));
+                if let Some(path) = shim_path {
+                    env_for_cli.push((EXEC_PATH_ENV.to_string(), path));
+                }
+            }
+            None => {
+                // A sandbox's tunnel shares the app's token and names no
+                // container: running the command here would be on the host.
+                let stderr = b"tod-cli: `secrets run` must start its command where the agent is, and this shell has no dev container to do that in; it is not run on the host.\n";
+                let mut stream = stream;
+                stream.write_all(format!("70 0 {}\n", stderr.len()).as_bytes())?;
+                stream.write_all(stderr)?;
+                stream.flush()?;
+                return Ok(());
+            }
+        }
+    }
     let mut command = Command::new(cli);
     command
         .args(with_data_root(request.args, data_root))
-        .envs(request.env)
+        .envs(env_for_cli)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -447,6 +494,117 @@ fn serve(stream: TcpStream, data_root: &Path, cli: &Path, token: &str) -> Result
     Ok(())
 }
 
+/// Whether `args` (as the shim got them) are `secrets run`.
+fn is_secrets_run(args: &[String]) -> bool {
+    let mut words = Vec::new();
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--data-root" => {
+                iter.next();
+            }
+            "--json" => {}
+            a if a.starts_with("--data-root=") => {}
+            _ => words.push(arg.as_str()),
+        }
+        if words.len() == 2 {
+            break;
+        }
+    }
+    words == ["secrets", "run"]
+}
+
+/// The shim's working directory and `PATH`, which `secrets run` uses to
+/// start its command the way the agent was started.
+pub const SHIM_CWD_ENV: &str = "TOD_SHIM_CWD";
+pub const SHIM_PATH_ENV: &str = "TOD_SHIM_PATH";
+/// Set by the relay (never by a request) on the host `tod-cli` running
+/// `secrets run` for a container: run the command in this container.
+pub const EXEC_CONTAINER_ENV: &str = "TOD_SECRETS_EXEC_CONTAINER";
+pub const EXEC_CWD_ENV: &str = "TOD_SECRETS_EXEC_CWD";
+pub const EXEC_PATH_ENV: &str = "TOD_SECRETS_EXEC_PATH";
+
+type Targets = std::collections::HashMap<String, String>;
+
+fn targets() -> &'static Mutex<Targets> {
+    static TARGETS: OnceLock<Mutex<Targets>> = OnceLock::new();
+    TARGETS.get_or_init(Default::default)
+}
+
+fn container_for_token(token: &str) -> Option<String> {
+    let map = targets().lock().unwrap_or_else(|e| e.into_inner());
+    // Constant time over every registered token.
+    let mut found = None;
+    for (known, container) in map.iter() {
+        if constant_time_eq(known.as_bytes(), token.as_bytes()) {
+            found = Some(container.clone());
+        }
+    }
+    found
+}
+
+/// A relay endpoint for processes in `container`: the app's relay, with a
+/// token of its own that says which container it serves, so `secrets run`
+/// can start its command there (and nowhere else).
+pub fn endpoint_for_container(data_root: &Path, container: &str) -> Result<RelayEndpoint> {
+    let shared = ensure_started(data_root)?;
+    let token = format!("{}{}", uuid::Uuid::new_v4().simple(), uuid::Uuid::new_v4().simple());
+    targets()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(token.clone(), container.to_string());
+    Ok(RelayEndpoint { port: shared.port, token })
+}
+
+/// `docker exec` arguments (after `exec`) for `secrets run` in a container:
+/// values are passed by name (`-e VAR`) and must be set on the `docker`
+/// process, so they never appear on a command line. `path` is not secret.
+pub fn secrets_exec_args(
+    container_id: &str,
+    user: Option<&str>,
+    cwd: &str,
+    path: Option<&str>,
+    vars: &[String],
+    command: &[String],
+) -> Vec<String> {
+    let mut args = vec!["exec".to_string(), "-i".to_string()];
+    if let Some(user) = user {
+        args.extend(["-u".to_string(), user.to_string()]);
+    }
+    args.extend(["-w".to_string(), cwd.to_string()]);
+    if let Some(path) = path {
+        args.extend(["-e".to_string(), format!("PATH={path}")]);
+    }
+    for var in vars {
+        args.extend(["-e".to_string(), var.clone()]);
+    }
+    args.push(container_id.to_string());
+    args.extend(command.iter().cloned());
+    args
+}
+
+/// The `docker exec` that runs `command` in the container the relay named
+/// (see [`EXEC_CONTAINER_ENV`]) as the user and in the directory the agent
+/// has, or `None` when this `tod-cli` was not started for a container. The
+/// caller sets the secret values as this command's environment.
+pub fn secrets_exec_command(vars: &[String], command: &[String]) -> Option<Result<Command>> {
+    let container = std::env::var(EXEC_CONTAINER_ENV).ok().filter(|c| !c.is_empty())?;
+    Some((|| {
+        let exec = tod_agent::devcontainer::ContainerExec::connect(&container)?;
+        let cwd = std::env::var(EXEC_CWD_ENV).unwrap_or_else(|_| "/".into());
+        let path = std::env::var(EXEC_PATH_ENV).ok();
+        let mut docker = Command::new(tod_agent::devcontainer::docker_bin());
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            docker.creation_flags(0x0800_0000);
+        }
+        docker.args(secrets_exec_args(&exec.id, exec.user.as_deref(), &cwd, path.as_deref(), vars, command));
+        Ok(docker)
+    })())
+}
+
+#[cfg(test)]
 fn read_request(reader: &mut impl BufRead, token: &str) -> Result<RelayRequest> {
     decode_request(reader, Some(token))
 }
@@ -642,6 +800,114 @@ mod tests {
         assert!(remote, "{out}");
         assert!(!out.contains("local:"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn secrets_run_is_recognized_past_global_flags() {
+        let a = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(is_secrets_run(&a(&["secrets", "run", "--env", "A=b", "--", "x"])));
+        assert!(is_secrets_run(&a(&["--data-root", "C:x", "--json", "secrets", "run"])));
+        assert!(!is_secrets_run(&a(&["secrets", "list"])));
+        assert!(!is_secrets_run(&a(&["node", "run"])));
+    }
+
+    #[test]
+    fn the_docker_exec_names_variables_but_never_carries_values() {
+        let args = secrets_exec_args(
+            "abc123",
+            Some("vscode"),
+            "/work/repo",
+            Some("/tmp/tod-cli-relay:/usr/bin"),
+            &["GH_TOKEN".to_string()],
+            &["gh".to_string(), "pr".to_string(), "list".to_string()],
+        );
+        assert_eq!(
+            args,
+            [
+                "exec", "-i", "-u", "vscode", "-w", "/work/repo", "-e", "PATH=/tmp/tod-cli-relay:/usr/bin", "-e",
+                "GH_TOKEN", "abc123", "gh", "pr", "list"
+            ]
+        );
+        assert!(args.iter().all(|a| !a.contains("GH_TOKEN=")));
+    }
+
+    #[test]
+    fn a_container_token_names_its_container_and_others_are_refused() {
+        let root = std::env::temp_dir().join(format!("tod-relay-tok-{}", uuid::Uuid::new_v4()));
+        let endpoint = endpoint_for_container(&root, "dev-1").unwrap();
+        assert_eq!(container_for_token(&endpoint.token).as_deref(), Some("dev-1"));
+        assert_eq!(container_for_token("nope"), None);
+        let other = endpoint_for_container(&root, "dev-2").unwrap();
+        assert_ne!(endpoint.token, other.token);
+        assert_eq!(container_for_token(&other.token).as_deref(), Some("dev-2"));
+    }
+
+    #[test]
+    fn the_shim_sends_its_directory_and_path() {
+        assert!(SHIM_SCRIPT.contains(r#"export TOD_SHIM_CWD="$PWD" TOD_SHIM_PATH="$PATH""#));
+    }
+
+    /// Serves one `secrets run` over the wire with a fake `tod-cli` that
+    /// prints the placement it was given: a container token gets its
+    /// container, a request's own `TOD_SECRETS_EXEC_*` is dropped, and the
+    /// app's shared token (a sandbox tunnel) is refused, not run on the host.
+    #[cfg(unix)]
+    #[test]
+    fn serve_places_secrets_run_in_the_tokens_container() {
+        use std::io::Read;
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("tod-relay-serve-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cli = dir.join("fake-cli");
+        std::fs::write(&cli, "#!/bin/sh\necho \"c=$TOD_SECRETS_EXEC_CONTAINER cwd=$TOD_SECRETS_EXEC_CWD\"\n").unwrap();
+        std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let endpoint = endpoint_for_container(&dir, "dev-x").unwrap();
+        let shared = ensure_started(&dir).unwrap();
+        let call = |token: &str| {
+            let request = RelayRequest {
+                env: vec![
+                    (SHIM_CWD_ENV.into(), "/work".into()),
+                    (EXEC_CONTAINER_ENV.into(), "evil".into()),
+                ],
+                args: vec!["secrets".into(), "run".into(), "--env".into(), "A=b".into(), "--".into(), "x".into()],
+                stdin: Vec::new(),
+            };
+            let (mut a, b) = {
+                let l = TcpListener::bind("127.0.0.1:0").unwrap();
+                let c = TcpStream::connect(l.local_addr().unwrap()).unwrap();
+                (c, l.accept().unwrap().0)
+            };
+            a.write_all(&encode_request(token, &request)).unwrap();
+            serve(b, &dir, &cli, &shared.token).unwrap();
+            let mut out = Vec::new();
+            a.read_to_end(&mut out).unwrap();
+            decode_reply(&out).unwrap()
+        };
+        let reply = call(&endpoint.token);
+        assert_eq!(String::from_utf8_lossy(&reply.stdout), "c=dev-x cwd=/work\n");
+        let refused = call(&shared.token);
+        assert_eq!(refused.code, 70);
+        assert!(refused.stdout.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `secrets run` in a real container puts the value in the command's
+    /// environment there (masked in the output). Needs `TOD_TEST_DEV_CONTAINER`.
+    #[test]
+    fn a_container_runs_secrets_commands_inside() {
+        let Ok(container) = std::env::var("TOD_TEST_DEV_CONTAINER") else {
+            return;
+        };
+        let exec = tod_agent::devcontainer::ContainerExec::connect(&container).unwrap();
+        let args = secrets_exec_args(&exec.id, exec.user.as_deref(), "/", None, &["TOD_T".into()], &["sh".into(), "-c".into(), "echo $TOD_T; hostname".into()]);
+        let out = Command::new(tod_agent::devcontainer::docker_bin())
+            .args(args)
+            .env("TOD_T", "s3cret")
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(text.starts_with("s3cret\n"), "{text}");
+        assert!(text.contains(&exec.id[..12]), "ran in the container: {text}");
     }
 
     #[test]

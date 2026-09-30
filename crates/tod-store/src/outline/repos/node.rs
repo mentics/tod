@@ -180,6 +180,12 @@ impl<'a> NodeRepo<'a> {
                 }
             }
             Capability::Spec => {}
+            Capability::Environment => {
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO node_environment (node_id, entries, updated_at) VALUES (?1, '[]', ?2)",
+                    params![&blob, now_ms()],
+                )?;
+            }
             Capability::Generator => {
                 // No additional initialization needed at enable time.
                 // Configuration is saved separately via SetGeneratorConfig mutation.
@@ -520,6 +526,10 @@ impl<'a> NodeRepo<'a> {
             Capability::Tags => {
                 self.conn
                     .execute("DELETE FROM node_tags WHERE node_id = ?1", params![blob])?;
+            }
+            Capability::Environment => {
+                self.conn
+                    .execute("DELETE FROM node_environment WHERE node_id = ?1", params![blob])?;
             }
             Capability::Generator => {
                 let gen_repo = crate::outline::repos::GeneratorRepo::new(self.conn);

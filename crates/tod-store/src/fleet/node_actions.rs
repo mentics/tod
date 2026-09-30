@@ -604,6 +604,46 @@ mod tests {
     }
 
     #[test]
+    fn environment_merges_down_the_tree_nearest_wins() {
+        use crate::environment::{Entry, resolve};
+        let tree = setup_tree();
+        let set = |node: Uuid, entries: Vec<Entry>| {
+            enable(&tree.store, node, vec![Capability::Environment]);
+            tree.store.reload_if_stale().ok();
+            tree.store
+                .enqueue_outline(OutlineMutation::SetNodeEnvironment { node_id: node, entries })
+                .unwrap();
+            tree.store.writer().flush().unwrap();
+        };
+        let mut gb = Entry::secret("growthbook");
+        gb.description = Some("prod flags".into());
+        set(tree.grandparent, vec![gb, Entry::variable("region", "eu")]);
+        // The child redefines `region` and, with the parent lacking the
+        // capability, still inherits `growthbook` across it.
+        set(tree.child, vec![Entry::variable("region", "us")]);
+        let env = tree.store.read(|conn| resolve(conn, tree.child)).unwrap();
+        let names: Vec<_> = env.iter().map(|r| r.entry.name.as_str()).collect();
+        assert_eq!(names, ["growthbook", "region"]);
+        let region = env.iter().find(|r| r.entry.name == "region").unwrap();
+        assert_eq!(region.entry.value.as_deref(), Some("us"));
+        assert!(!region.inherited);
+        let gb = env.iter().find(|r| r.entry.name == "growthbook").unwrap();
+        assert!(gb.inherited);
+        assert_eq!(gb.source_node, tree.grandparent);
+        assert_eq!(gb.entry.description(), Some("prod flags"));
+        // A mutation on a node without the capability is refused.
+        assert!(
+            tree.store
+                .enqueue_outline(OutlineMutation::SetNodeEnvironment { node_id: tree.parent, entries: vec![] })
+                .is_err()
+                || tree.store.writer().flush().is_err()
+                || tree.store.read(|c| crate::environment::entries(c, tree.parent)).unwrap().is_empty()
+        );
+        drop(tree.store);
+        cleanup_fleet_root(&tree.root);
+    }
+
+    #[test]
     fn no_capability_in_chain_resolves_nothing() {
         let tree = setup_tree();
         assert!(

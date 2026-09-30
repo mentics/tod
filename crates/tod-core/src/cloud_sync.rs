@@ -515,6 +515,37 @@ fn git_identity(repo: Option<&str>) -> tod_sandbox::node::GitIdentity {
     }
 }
 
+/// The node's Environment for its sandbox: secrets with hosts become proxy
+/// credentials (the agent never has the value); variables and host-less
+/// secrets go in the environment. Unset secrets are left out.
+pub(crate) fn environment_credentials(
+    fleet: &FleetStore,
+    creds: &CredentialStore,
+    node_id: &str,
+) -> Result<(Vec<tod_sandbox::node::CustomCredential>, Vec<(String, String)>)> {
+    use tod_store::environment::EntryKind;
+    let node: uuid::Uuid = node_id.parse().context("node id")?;
+    let entries = fleet.read(|conn| tod_store::environment::resolve(conn, node))?;
+    let (mut custom, mut env) = (Vec::new(), Vec::new());
+    for r in entries {
+        let Some(value) = r.value(creds) else { continue };
+        let e = &r.entry;
+        if e.kind == EntryKind::Secret && e.proxied() {
+            let (header, template) = e.proxy_header();
+            custom.push(tod_sandbox::node::CustomCredential {
+                name: e.name.clone(),
+                hosts: e.hosts.clone(),
+                header,
+                template,
+                secret_value: e.auth.proxy_secret(&value),
+            });
+        } else {
+            env.push((e.env_name().to_string(), value));
+        }
+    }
+    Ok((custom, env))
+}
+
 /// Where a node's code comes from: its repository as an HTTPS URL, and branch.
 fn node_source(fleet: &FleetStore, node_id: &str) -> Result<(tod_store::fleet::FleetTask, String, String)> {
     let task = fleet.get_node(node_id)?.ok_or_else(|| anyhow!("no node {node_id}"))?;
@@ -616,7 +647,17 @@ pub fn ensure_node_sandbox(
         linear_api_key: creds.get(CredentialKind::LinearApiKey),
         blaxel_token: bx.token().to_string(),
         claude_oauth_token,
+        custom: Vec::new(),
+        env: Vec::new(),
     };
+    let mut credentials = credentials;
+    match environment_credentials(fleet, &creds, node_id) {
+        Ok((custom, env)) => {
+            credentials.custom = custom;
+            credentials.env = env;
+        }
+        Err(err) => progress(&format!("warning: the node's Environment was not applied: {err:#}")),
+    }
     if credentials.github_token.is_none() {
         progress("warning: no GitHub token stored; the node cannot push or open a pull request");
     }
@@ -682,7 +723,11 @@ pub fn ensure_node_sandbox(
     }
     let mut forked = false;
     if existing.as_ref().is_none_or(sandbox_is_dead) {
-        if let Some(base) = account.node_base.as_deref().filter(|b| !b.is_empty()) {
+        // A fork has the base's proxy, which lacks the node's own
+        // credentials (Environment), so such a node is made from scratch.
+        if let Some(base) =
+            account.node_base.as_deref().filter(|b| !b.is_empty() && credentials.custom.is_empty())
+        {
             match fork_from_base(&bx, root, base, &spec, &credentials, &payload, progress) {
                 Ok(()) => forked = true,
                 Err(err) => {

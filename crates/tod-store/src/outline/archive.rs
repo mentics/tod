@@ -645,6 +645,9 @@ pub fn build_capability_archive(
             archive.linked_prs = fields.as_ref().map(|f| f.linked_prs.clone());
         }
         Capability::Tags => collect_cascade(conn, "node_tags", "node_id", &node, &mut seen, &mut rows)?,
+        Capability::Environment => {
+            collect_cascade(conn, "node_environment", "node_id", &node, &mut seen, &mut rows)?
+        }
         Capability::Generator => {
             collect_cascade(conn, "node_generator_config", "node_id", &node, &mut seen, &mut rows)?;
             // Managed children, with everything hanging off them.

@@ -26,6 +26,8 @@ COMMANDS:
 falling back to an encrypted file under the data root. VALUE can be given as
 an argument, but reading it from stdin (no VALUE, pipe or type it, `-` also
 means stdin) keeps it out of shell history.
+A SECRET is one of tod's own kinds or a credential or variable defined for
+this work (`tod-cli environment list`); `list` shows both.
 `run` starts COMMAND with each named secret in environment variable VAR,
 prints its output with every secret value replaced by `***`, and exits with
 its exit code. A secret that is not set is an error saying how the user can
@@ -46,7 +48,7 @@ pub fn run(inv: Invocation) -> anyhow::Result<String> {
         "list" => Ok(list(&inv, &store)),
         "set" => set(&rest, &store),
         "run" => {
-            let code = run_with_secrets(&store, &rest)?;
+            let code = run_with_secrets(&inv, &store, &rest)?;
             let _ = std::io::stdout().flush();
             let _ = std::io::stderr().flush();
             if code != 0 {
@@ -74,9 +76,17 @@ fn list(inv: &Invocation, store: &CredentialStore) -> String {
                 serde_json::json!({ "name": kind.name(), "label": kind.label(), "set": set, "via_proxy": proxy })
             })
             .collect();
+        let mut rows = rows;
+        rows.extend(environment_entries(inv).iter().map(|r| {
+            serde_json::json!({
+                "name": r.entry.name, "label": r.entry.description(), "set": r.is_set(store),
+                "via_proxy": false, "user_defined": true
+            })
+        }));
         return serde_json::to_string_pretty(&rows).unwrap_or_default();
     }
-    rows.iter()
+    let mut lines: Vec<String> = rows
+        .iter()
         .map(|(kind, set, proxy)| {
             let state = match (*set, *proxy) {
                 (_, true) => "set (added by the sandbox's proxy; commands get a placeholder)",
@@ -85,8 +95,24 @@ fn list(inv: &Invocation, store: &CredentialStore) -> String {
             };
             format!("{} ({}): {state}", kind.name(), kind.label())
         })
-        .collect::<Vec<_>>()
-        .join("\n")
+        .collect();
+    lines.extend(environment_entries(inv).iter().map(|r| {
+        let state = if r.is_set(store) { "set" } else { "not set" };
+        let what = r.entry.description().map(|d| format!(": {d}")).unwrap_or_default();
+        format!("{} (user-defined, {state}){what}", r.entry.name)
+    }));
+    lines.join("\n")
+}
+
+/// The secrets and variables defined for the node this work is on (none
+/// when no node can be told, or the store cannot be read).
+fn environment_entries(inv: &Invocation) -> Vec<tod_store::environment::Resolved> {
+    let Ok(Some(node)) = crate::environment::node_from_environment(inv) else {
+        return Vec::new();
+    };
+    inv.client()
+        .read(|conn| tod_store::environment::resolve(conn, node))
+        .unwrap_or_default()
 }
 
 /// `set <NAME> [VALUE]` — VALUE from stdin (or `-`) when omitted, so it
@@ -146,7 +172,7 @@ fn how_to_set(kind: CredentialKind) -> &'static str {
 
 /// `--env VAR=SECRET` pairs, then `--`, then the command.
 struct RunArgs {
-    env: Vec<(String, CredentialKind)>,
+    env: Vec<(String, String)>,
     command: Vec<String>,
 }
 
@@ -170,16 +196,7 @@ fn parse_run(args: &[String]) -> anyhow::Result<RunArgs> {
                     .split_once('=')
                     .filter(|(var, name)| !var.is_empty() && !name.is_empty())
                     .ok_or_else(|| anyhow::anyhow!("--env takes <VAR>=<SECRET> (got `{pair}`)"))?;
-                let kind = CredentialKind::from_name(name).ok_or_else(|| {
-                    let known: Vec<&str> =
-                        CredentialKind::ALL.iter().map(|kind| kind.name()).collect();
-                    anyhow::anyhow!(
-                        "no secret named `{name}` (tod stores: {}). Only the user can add \
-                         a new kind of secret",
-                        known.join(", ")
-                    )
-                })?;
-                env.push((var.to_string(), kind));
+                env.push((var.to_string(), name.to_string()));
             }
             other => anyhow::bail!("unexpected `{other}`: the command goes after `--`"),
         }
@@ -188,10 +205,11 @@ fn parse_run(args: &[String]) -> anyhow::Result<RunArgs> {
     anyhow::bail!("missing `--` before the command to run")
 }
 
-fn run_with_secrets(store: &CredentialStore, args: &[String]) -> anyhow::Result<i32> {
-    let RunArgs { env, command } = parse_run(args)?;
-    let mut values: Vec<(String, String)> = Vec::new();
-    for (var, kind) in env {
+/// What `--env VAR=<name>` stands for: one of tod's own kinds, else an entry
+/// in the work's environment. Returns the value and whether to mask it (a
+/// variable is plain text).
+fn resolve_value(inv: &Invocation, store: &CredentialStore, name: &str) -> anyhow::Result<(String, bool)> {
+    if let Some(kind) = CredentialKind::from_name(name) {
         let value = store.get(kind).ok_or_else(|| {
             anyhow::anyhow!(
                 "secret `{}` ({}) is not set. The user can add it: {}.",
@@ -200,16 +218,52 @@ fn run_with_secrets(store: &CredentialStore, args: &[String]) -> anyhow::Result<
                 how_to_set(kind)
             )
         })?;
+        return Ok((value, true));
+    }
+    let entries = environment_entries(inv);
+    let Some(found) = entries.iter().find(|r| r.entry.name.eq_ignore_ascii_case(name)) else {
+        let mut known: Vec<String> = CredentialKind::ALL.iter().map(|kind| kind.name().to_string()).collect();
+        known.extend(entries.iter().map(|r| r.entry.name.clone()));
+        anyhow::bail!(
+            "no secret named `{name}` (available: {}). If you need one, ask the user with \
+             `tod-cli environment request {name} --why <what for>`",
+            known.join(", ")
+        );
+    };
+    let value = found.value(store).ok_or_else(|| {
+        anyhow::anyhow!(
+            "secret `{name}` is defined but not set yet. The user can store it with \
+             `tod-cli environment set-secret {name}` or in the node's Environment section; \
+             `tod-cli environment request {name} --why <what for>` asks them"
+        )
+    })?;
+    Ok((value, found.entry.kind == tod_store::environment::EntryKind::Secret))
+}
+
+fn run_with_secrets(inv: &Invocation, store: &CredentialStore, args: &[String]) -> anyhow::Result<i32> {
+    let RunArgs { env, command } = parse_run(args)?;
+    let mut values: Vec<(String, String)> = Vec::new();
+    let mut secrets: Vec<Vec<u8>> = Vec::new();
+    for (var, name) in env {
+        let (value, mask) = resolve_value(inv, store, &name)?;
+        if mask && !value.is_empty() {
+            secrets.push(value.as_bytes().to_vec());
+        }
         values.push((var, value));
     }
-    let secrets: Vec<Vec<u8>> = values
-        .iter()
-        .map(|(_, value)| value.as_bytes().to_vec())
-        .filter(|value| !value.is_empty())
-        .collect();
 
-    let mut child = Command::new(&command[0])
-        .args(&command[1..])
+    // For a dev container, the command runs in it (`docker exec`), with the
+    // values in docker's own environment, passed by name; never here.
+    let vars: Vec<String> = values.iter().map(|(var, _)| var.clone()).collect();
+    let mut process = match tod_store::fleet::cli_relay::secrets_exec_command(&vars, &command) {
+        Some(docker) => docker.map_err(|err| anyhow::anyhow!("could not reach the dev container: {err:#}"))?,
+        None => {
+            let mut local = Command::new(&command[0]);
+            local.args(&command[1..]);
+            local
+        }
+    };
+    let mut child = process
         .envs(values.iter().map(|(var, value)| (var, value)))
         .stdin(Stdio::inherit())
         .stdout(Stdio::piped())
@@ -321,17 +375,12 @@ mod tests {
         .unwrap();
         assert_eq!(
             parsed.env,
-            vec![("LINEAR_API_KEY".to_string(), CredentialKind::LinearApiKey)]
+            vec![("LINEAR_API_KEY".to_string(), "linear_api_key".to_string())]
         );
         assert_eq!(parsed.command, strings(&["python", "--json"]));
 
         assert!(parse_run(&strings(&["--", "python"])).is_err());
         assert!(parse_run(&strings(&["--env", "X=linear_api_key"])).is_err());
         assert!(parse_run(&strings(&["--env", "X=linear_api_key", "--"])).is_err());
-        let unknown = parse_run(&strings(&["--env", "X=bogus_credential", "--", "sh"]))
-            .err()
-            .unwrap()
-            .to_string();
-        assert!(unknown.contains("linear_api_key"), "{unknown}");
     }
 }

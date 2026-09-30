@@ -38,6 +38,7 @@ pub const ROW_KEYS: &[(&str, &[(&str, KeyKind)])] = &[
     ("node_files", &[("node_id", Blob)]),
     ("node_files_locations", &[("node_id", Blob)]),
     ("node_agent", &[("node_id", Blob)]),
+    ("node_environment", &[("node_id", Blob)]),
     ("outline_entries", &[("node_id", Blob)]),
     ("node_capabilities", &[("node_id", Blob), ("capability", Text)]),
     ("capability_archives", &[("id", Blob)]),

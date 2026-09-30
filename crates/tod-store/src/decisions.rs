@@ -250,6 +250,16 @@ impl<'a> DecisionRepo<'a> {
         Ok(rows)
     }
 
+    /// Pending decisions of one `protocol` on any node, oldest first.
+    pub fn list_pending_by_protocol(&self, protocol: &str) -> Result<Vec<Decision>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {DECISION_COLUMNS} FROM decisions
+             WHERE status = 'pending' AND protocol = ?1 ORDER BY created_at"
+        ))?;
+        let rows = stmt.query_map(params![protocol], map_decision)?.collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     /// Pending decisions on one node, oldest first.
     pub fn list_pending_for_node(&self, node_id: Uuid) -> Result<Vec<Decision>> {
         let mut stmt = self.conn.prepare(&format!(

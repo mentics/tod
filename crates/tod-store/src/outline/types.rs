@@ -12,6 +12,7 @@ pub enum Capability {
     Tags,
     Files,
     Ticket,
+    Environment,
 }
 
 impl Capability {
@@ -24,6 +25,7 @@ impl Capability {
             Self::Tags => "tags",
             Self::Files => "files",
             Self::Ticket => "ticket",
+            Self::Environment => "environment",
         }
     }
 
@@ -36,16 +38,18 @@ impl Capability {
             "tags" => Some(Self::Tags),
             "files" => Some(Self::Files),
             "ticket" => Some(Self::Ticket),
+            "environment" => Some(Self::Environment),
             _ => None,
         }
     }
 
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Spec,
         Self::Lifecycle,
         Self::Agent,
         Self::Files,
         Self::Ticket,
+        Self::Environment,
         Self::Generator,
         Self::Tags,
     ];
@@ -59,6 +63,7 @@ impl Capability {
             Self::Tags => "Tags",
             Self::Files => "Files",
             Self::Ticket => "Ticket",
+            Self::Environment => "Environment",
         }
     }
 
@@ -73,6 +78,7 @@ impl Capability {
                 "Automatically produce and manage descendant nodes from an external data source"
             }
             Self::Tags => "Freeform labels for organizing and filtering nodes",
+            Self::Environment => "Variables and credentials the agents working below this node can use",
         }
     }
 
@@ -95,6 +101,9 @@ impl Capability {
                 "Disabling Generator will permanently delete all managed child nodes under this node."
             }
             Self::Tags => "Disabling Tags will remove this node's tags.",
+            Self::Environment => {
+                "Disabling Environment will remove the variables and credentials defined on this node."
+            }
         }
     }
 

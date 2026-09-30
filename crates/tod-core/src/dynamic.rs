@@ -135,6 +135,9 @@ pub enum DynamicBlock {
     /// What a conversation is about: its kind, path, title, and (by kind) its
     /// full text, its obligations and plan steps, or the top-level nodes.
     Focus,
+    /// The variables and credentials defined for the node the work is on
+    /// (pre-rendered; see `crate::environment_context`). Omitted when none.
+    Environment,
 }
 
 /// Everything any block might need. A surface fills in what its blocks use and
@@ -156,6 +159,7 @@ pub struct DynamicContext<'a> {
     pub working_dir: Option<&'a Path>,
     pub focus: Option<&'a FocusSelection>,
     pub incoming: &'a [IncomingChangeItem],
+    pub environment: &'a str,
 }
 
 /// One finding as a fix session is shown it: a line with its id, severity,
@@ -438,6 +442,12 @@ fn render_block(block: DynamicBlock, ctx: &DynamicContext<'_>, out: &mut String)
                     out.push_str(line);
                     out.push('\n');
                 }
+            }
+        }
+
+        DynamicBlock::Environment => {
+            if !ctx.environment.is_empty() {
+                out.push_str(ctx.environment);
             }
         }
 
