@@ -352,9 +352,13 @@ fn request(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
     }
     let result = inv.client().interview(InterviewCommand::AskDecision {
         node_id: node,
+        // A protocol's conversation is named in the environment; a plain chat's
+        // is the actor this process writes as. Without either, nobody is told
+        // the answer.
         conversation_id: std::env::var(tod_core::conversation::implement::IMPLEMENT_CONVERSATION_ENV)
             .ok()
-            .and_then(|raw| Uuid::parse_str(raw.trim()).ok()),
+            .and_then(|raw| Uuid::parse_str(raw.trim()).ok())
+            .or_else(|| tod_store::conversation::actor_conversation(inv.client().actor())),
         protocol: Some(tod_core::environment_request::PROTOCOL.into()),
         decision: NewDecision {
             question: tod_core::environment_request::question(name, &why),
