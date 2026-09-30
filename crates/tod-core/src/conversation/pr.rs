@@ -466,6 +466,7 @@ open pr: Cloud test"), Some("Cloud test"));
                     .into_iter()
                     .collect(),
                 comments: vec![],
+                reviews: vec![],
             })
         }
 

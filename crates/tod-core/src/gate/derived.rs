@@ -1399,6 +1399,7 @@ mod readiness_tests {
                 })
                 .into_iter()
                 .collect(),
+                reviews: vec![],
         };
         let settings = PrReadinessSettings {
             bots: vec![PrReviewBotSettings { name: "greptile".into(), min_score: 4, rerun_after_minutes: 10 }],

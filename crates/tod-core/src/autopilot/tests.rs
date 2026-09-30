@@ -714,6 +714,7 @@ impl crate::pr_readiness::PrFeed for Sim {
                 Vec::new()
             },
             comments,
+            reviews: vec![],
         })
     }
 
@@ -784,6 +785,7 @@ fn a_pull_request_that_never_changes_stops_for_a_person() {
                     comments: vec![],
                 }],
                 comments: vec![],
+                reviews: vec![],
             })
         }
         fn comment(&self, _: &tod_store::github::NodePr, _: &str) -> Result<(), String> {

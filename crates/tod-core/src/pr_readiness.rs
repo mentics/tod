@@ -188,17 +188,53 @@ impl Assessment {
             .iter()
             .filter_map(|configured| {
                 let bot = builtin_bot(&configured.name)?;
-                let standing = bot_standing(bot, snapshot, sha, head_at);
-                let asked = snapshot.comments.iter().any(|c| {
-                    let body = c.body.trim();
-                    let is_ask =
-                        body.eq_ignore_ascii_case(bot.rereview) || body.eq_ignore_ascii_case(bot.rereview_draft);
-                    is_ask && matches!((parse_time(&c.created_at), head_at), (Some(a), Some(h)) if a >= h)
-                });
-                let overdue = head_at.is_none_or(|h| {
+                let mut standing = bot_standing(bot, snapshot, sha, head_at);
+                let ask_times: Vec<DateTime<Utc>> = snapshot
+                    .comments
+                    .iter()
+                    .filter(|c| {
+                        let body = c.body.trim();
+                        body.eq_ignore_ascii_case(bot.rereview) || body.eq_ignore_ascii_case(bot.rereview_draft)
+                    })
+                    .filter_map(|c| parse_time(&c.created_at))
+                    .collect();
+                let mut asked = ask_times.iter().any(|a| head_at.is_some_and(|h| *a >= h));
+                let mut overdue = head_at.is_none_or(|h| {
                     now.signed_duration_since(h)
                         >= chrono::Duration::minutes(configured.rerun_after_minutes as i64)
                 });
+                // A bot reviews on a push, not on a reply. When it reviewed
+                // the current head (a review of the head that raised threads)
+                // and replies have been posted since, a round that changed
+                // nothing, its review is out of date, and the app asks for
+                // another at once rather than after a push's delay. A review
+                // that raised nothing leaves no review behind, so an ask
+                // counts as answered once the usual wait has passed.
+                let last_review = snapshot
+                    .reviews
+                    .iter()
+                    .filter(|r| r.author.as_deref().is_some_and(|a| bot.is_author(a)))
+                    .filter_map(|r| parse_time(&r.submitted_at))
+                    .max();
+                let last_reply = snapshot
+                    .threads
+                    .iter()
+                    .flat_map(|t| &t.comments)
+                    .filter(|c| !c.author.as_deref().is_some_and(|a| bot.is_author(a)))
+                    .filter_map(|c| parse_time(&c.created_at))
+                    .max();
+                if let (BotStanding::Current { score }, Some(reply), Some(review)) = (&standing, last_reply, last_review)
+                    && reply > review
+                    && head_at.is_some_and(|h| review > h)
+                {
+                    let ask = ask_times.iter().filter(|a| **a > reply).max();
+                    let wait = chrono::Duration::minutes(configured.rerun_after_minutes as i64);
+                    if ask.is_none_or(|a| now.signed_duration_since(*a) < wait) {
+                        standing = BotStanding::Stale { last_score: Some(*score) };
+                        asked = ask.is_some();
+                        overdue = true;
+                    }
+                }
                 Some(BotReport { settings: configured.clone(), bot, standing, asked, overdue })
             })
             .collect();
@@ -516,7 +552,7 @@ Not safe.
 <!-- /greptile_comment -->";
 
     fn snapshot_with_description(body: &str) -> PrSnapshot {
-        let mut snap = PrSnapshot { status: status("blocked", "success"), threads: vec![], comments: vec![] };
+        let mut snap = PrSnapshot { status: status("blocked", "success"), threads: vec![], comments: vec![], reviews: vec![] };
         snap.status.body = Some(body.into());
         snap
     }
@@ -567,6 +603,75 @@ Not safe.
         }
     }
 
+    /// A pull request whose head the bot reviewed at 11:00, with a thread
+    /// answered (a person's or our reply) at `reply_at`.
+    fn reviewed_then_replied(reply_at: &str, ask_at: Option<&str>, rereview_at: Option<&str>) -> PrSnapshot {
+        let mut snap = snapshot_with_description(DESCRIPTION);
+        let mut reviews = vec![tod_store::github::PrReview {
+            author: Some("greptile-apps[bot]".into()),
+            submitted_at: "2026-01-01T11:00:00Z".into(),
+        }];
+        if let Some(at) = rereview_at {
+            reviews.push(tod_store::github::PrReview { author: Some("greptile-apps[bot]".into()), submitted_at: at.into() });
+        }
+        snap.reviews = reviews;
+        let mut t = thread("t", true, &["bot finding", "we declined, here is why"]);
+        t.comments[0].author = Some("greptile-apps[bot]".into());
+        t.comments[0].created_at = "2026-01-01T11:00:00Z".into();
+        t.comments[1].created_at = reply_at.into();
+        snap.threads = vec![t];
+        if let Some(at) = ask_at {
+            snap.comments = vec![comment("someone", "@greptileai review this", at)];
+        }
+        snap
+    }
+
+    #[test]
+    fn a_reply_after_the_bots_review_asks_it_to_review_again_at_once() {
+        let snap = reviewed_then_replied("2026-01-01T11:30:00Z", None, None);
+        let a = Assessment::of(&snap, &greptile_settings(), now());
+        assert_eq!(a.bots[0].standing, BotStanding::Stale { last_score: Some(2) });
+        assert_eq!(a.next(), Next::Wait(vec![Wait::BotReview { bot: "greptile".into(), ask: true }]));
+    }
+
+    #[test]
+    fn once_asked_it_only_waits() {
+        let snap = reviewed_then_replied("2026-01-01T11:30:00Z", Some("2026-01-01T11:55:00Z"), None);
+        let a = Assessment::of(&snap, &greptile_settings(), now());
+        assert_eq!(a.next(), Next::Wait(vec![Wait::BotReview { bot: "greptile".into(), ask: false }]));
+    }
+
+    #[test]
+    fn a_later_reply_is_asked_about_again() {
+        let snap = reviewed_then_replied("2026-01-01T11:50:00Z", Some("2026-01-01T11:40:00Z"), None);
+        let a = Assessment::of(&snap, &greptile_settings(), now());
+        assert_eq!(a.next(), Next::Wait(vec![Wait::BotReview { bot: "greptile".into(), ask: true }]));
+    }
+
+    #[test]
+    fn an_ask_a_review_never_answered_is_let_go() {
+        let snap = reviewed_then_replied("2026-01-01T10:10:00Z", Some("2026-01-01T10:20:00Z"), None);
+        let a = Assessment::of(&snap, &greptile_settings(), now());
+        assert_eq!(a.bots[0].standing, BotStanding::Current { score: 2 });
+    }
+
+    #[test]
+    fn replies_after_a_push_are_not_a_round_without_a_change() {
+        // The bot's only review predates the head commit (10:00): the head
+        // has not been reviewed with threads, so the reply proves nothing.
+        let mut snap = reviewed_then_replied("2026-01-01T11:30:00Z", None, None);
+        snap.reviews[0].submitted_at = "2026-01-01T09:00:00Z".into();
+        let a = Assessment::of(&snap, &greptile_settings(), now());
+        assert_eq!(a.bots[0].standing, BotStanding::Current { score: 2 });
+    }
+
+    #[test]
+    fn a_review_after_the_reply_settles_it() {
+        let snap = reviewed_then_replied("2026-01-01T11:30:00Z", Some("2026-01-01T11:40:00Z"), Some("2026-01-01T11:50:00Z"));
+        let a = Assessment::of(&snap, &greptile_settings(), now());
+        assert_eq!(a.bots[0].standing, BotStanding::Current { score: 2 });
+    }
+
     fn settings() -> PrReadinessSettings {
         PrReadinessSettings {
             bots: vec![PrReviewBotSettings { name: "greptile".into(), min_score: 4, rerun_after_minutes: 10 }],
@@ -575,7 +680,7 @@ Not safe.
     }
 
     fn snap(status: PrStatus, threads: Vec<ReviewThread>, comments: Vec<IssueComment>) -> PrSnapshot {
-        PrSnapshot { status, threads, comments }
+        PrSnapshot { status, threads, comments, reviews: vec![] }
     }
 
     #[test]

@@ -281,6 +281,11 @@ Where the code differs from the design above:
   the PR are the agent turns of its conversation since the run began counting
   (`AutopilotState::pr_turns_base`, reset by renewing the budget). Both limits
   are `pr_readiness.max_thread_rounds` / `max_rounds`.
+- **A round that changes no code still gets a fresh review.** A bot reviews
+  on a push, not on a reply, so when replies (declining a finding, say) have been
+  posted since the bot's latest review of the current head, its review counts as
+  out of date and the app asks for another at once (`Assessment::of`, from the
+  PR's reviews and its thread comments), asking again for each later reply.
 - **The pull request protocol keeps looping while there is work**
   (`conversation::pr`): after each turn it reads the PR and continues with
   the work, so the conversation view's Pr step also babysits. The autopilot's

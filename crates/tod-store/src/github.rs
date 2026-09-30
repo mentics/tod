@@ -374,6 +374,17 @@ impl Github {
     }
 
     /// Everything readiness is decided from, read together.
+    /// The reviews submitted on a pull request (a review bot's each run).
+    pub fn list_reviews(&self, owner: &str, repo: &str, number: i64) -> Result<Vec<PrReview>, GithubError> {
+        let raw: Vec<ReviewRaw> = self.get_json(&format!("/repos/{owner}/{repo}/pulls/{number}/reviews?per_page=100"))?;
+        Ok(raw
+            .into_iter()
+            .filter_map(|r| {
+                Some(PrReview { author: r.user.map(|u| u.login), submitted_at: r.submitted_at? })
+            })
+            .collect())
+    }
+
     pub fn get_pr_snapshot(&self, owner: &str, repo: &str, number: i64) -> Result<PrSnapshot, GithubError> {
         let mut status = self.get_pr_status(owner, repo, number)?;
         if let Some(sha) = status.head_sha.clone() {
@@ -381,7 +392,8 @@ impl Github {
         }
         let threads = self.list_review_threads(owner, repo, number)?;
         let comments = self.list_issue_comments(owner, repo, number)?;
-        Ok(PrSnapshot { status, threads, comments })
+        let reviews = self.list_reviews(owner, repo, number)?;
+        Ok(PrSnapshot { status, threads, comments, reviews })
     }
 }
 
@@ -424,6 +436,15 @@ pub struct PrSnapshot {
     pub status: PrStatus,
     pub threads: Vec<ReviewThread>,
     pub comments: Vec<IssueComment>,
+    pub reviews: Vec<PrReview>,
+}
+
+/// A review submitted on a pull request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrReview {
+    pub author: Option<String>,
+    /// RFC 3339.
+    pub submitted_at: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -481,6 +502,12 @@ struct ThreadCommentRaw {
     author: Option<UserRaw>,
     #[serde(rename = "diffHunk")]
     diff_hunk: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReviewRaw {
+    user: Option<UserRaw>,
+    submitted_at: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
