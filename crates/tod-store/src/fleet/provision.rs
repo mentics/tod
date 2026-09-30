@@ -235,9 +235,7 @@ fn sandbox_proxy_credentials(
 ) -> Result<Vec<tod_sandbox::node::CustomCredential>> {
     let node: uuid::Uuid = node_id.parse().context("node id")?;
     let creds = sandboxes.credentials();
-    Ok(fleet
-        .read(|conn| crate::environment::sandbox_credentials(conn, &creds, node))?
-        .0)
+    fleet.read(|conn| crate::environment::sandbox_credentials(conn, &creds, node))
 }
 
 /// What [`refresh_sandbox_proxy`] did.
@@ -317,6 +315,12 @@ pub fn refresh_sandbox_proxy(
             let _ = push_branches(&dir);
         }
     }
+    // Its agent's session logs outlive it: the new sandbox gets them back
+    // ([`make_sandbox`]), so the conversation resumes the same session.
+    progress(&format!("saving {name}'s agent session logs…"));
+    if let Err(err) = super::session_log::pull_node(fleet.paths().root(), node_id, &name) {
+        progress(&format!("warning: the session logs were not saved ({err:#}); the conversation starts a new session"));
+    }
     progress(&format!("deleting {name} to give it the node's credentials…"));
     sandboxes.delete(&bx, &name).with_context(|| format!("delete sandbox {name}"))?;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
@@ -393,6 +397,17 @@ fn make_sandbox(
         warnings.push(format!("{err:#}"));
     }
     warnings.extend(worktree::branch_submodules(&dir, branch)?);
+    // A sandbox replacing one (a changed credential, a lost sandbox) gets the
+    // agent's session logs back where Claude resumes from, so the
+    // conversation's recorded session id resumes the same session. Without
+    // them it falls back to a fresh session (rotation).
+    match super::session_log::restore_node(&root, &files.node_id, &name) {
+        Ok(0) => {}
+        Ok(n) => progress(&format!("restored {n} agent session log(s) in {name}")),
+        Err(err) => warnings.push(format!(
+            "the agent's session logs could not be restored ({err:#}); its conversations start a new session"
+        )),
+    }
     Ok((location, warnings))
 }
 

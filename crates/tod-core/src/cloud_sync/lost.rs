@@ -213,7 +213,7 @@ pub fn refresh_credentials(fleet: &FleetStore, node_id: &str, force: bool) -> Re
         return Ok(Refresh::NotNeeded);
     }
     let creds = tod_store::CredentialStore::from_data_root(&root);
-    let (custom, _) = super::environment_credentials(fleet, &creds, node_id)?;
+    let custom = super::environment_credentials(fleet, &creds, node_id)?;
     if proxy_is_current(&info, &custom) {
         return Ok(Refresh::NotNeeded);
     }

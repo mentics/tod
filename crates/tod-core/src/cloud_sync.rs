@@ -515,14 +515,14 @@ fn git_identity(repo: Option<&str>) -> tod_sandbox::node::GitIdentity {
     }
 }
 
-/// The node's Environment for its sandbox: secrets with hosts become proxy
-/// credentials (the agent never has the value); variables and host-less
-/// secrets go in the environment. Unset secrets are left out.
+/// The node's Environment credentials for its sandbox's proxy: secrets with
+/// hosts (the agent never has the value). Variables reach the agent through
+/// its context, not the sandbox. Unset secrets are left out.
 pub(crate) fn environment_credentials(
     fleet: &FleetStore,
     creds: &CredentialStore,
     node_id: &str,
-) -> Result<(Vec<tod_sandbox::node::CustomCredential>, Vec<(String, String)>)> {
+) -> Result<Vec<tod_sandbox::node::CustomCredential>> {
     let node: uuid::Uuid = node_id.parse().context("node id")?;
     fleet.read(|conn| tod_store::environment::sandbox_credentials(conn, creds, node))
 }
@@ -629,14 +629,10 @@ pub fn ensure_node_sandbox(
         blaxel_token: bx.token().to_string(),
         claude_oauth_token,
         custom: Vec::new(),
-        env: Vec::new(),
     };
     let mut credentials = credentials;
     match environment_credentials(fleet, &creds, node_id) {
-        Ok((custom, env)) => {
-            credentials.custom = custom;
-            credentials.env = env;
-        }
+        Ok(custom) => credentials.custom = custom,
         Err(err) => progress(&format!("warning: the node's Environment was not applied: {err:#}")),
     }
     if credentials.github_token.is_none() {

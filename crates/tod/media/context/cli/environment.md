@@ -28,7 +28,8 @@ call the API directly.
 - `request` is how you ask the user for a credential: it adds the credential,
   unset, and asks them to provide it. Say in `--why` what you need it for. Pass
   `--preset` when one fits the service (`environment presets`), or `--host` and
-  `--description` when none does. Carry on with whatever does not need it.
+  `--description` when none does. A credential always needs the host it is
+  used with (a preset supplies it); one without a host is refused. Carry on with whatever does not need it.
 - `add-secret` and `set-variable` define an entry on the node; Environment
   must be enabled there. They are for when the user has asked you to set
   something up.
