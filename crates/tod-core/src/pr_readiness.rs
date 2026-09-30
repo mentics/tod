@@ -303,12 +303,17 @@ fn wants_answer(thread: &ReviewThread) -> bool {
     !thread.resolved && !thread.outdated
 }
 
+/// How many replies of ours `thread` holds: the rounds spent on it.
+pub fn rounds(thread: &ReviewThread) -> u32 {
+    thread.comments.iter().filter(|c| c.body.trim_start().starts_with(TOD_MARKER)).count() as u32
+}
+
 fn open_thread(thread: &ReviewThread) -> OpenThread {
     OpenThread {
         id: thread.id.clone(),
         path: thread.path.clone(),
         line: thread.line,
-        rounds: thread.comments.iter().filter(|c| c.body.trim_start().starts_with(TOD_MARKER)).count() as u32,
+        rounds: rounds(thread),
         reviewer: thread.comments.first().and_then(|c| c.author.clone()),
     }
 }

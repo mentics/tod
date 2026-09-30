@@ -32,6 +32,8 @@ COMMANDS:
     open                              [--node <UUID>] --owner <OWNER> --repo <REPO> --head <BRANCH> --base <BRANCH> --title <TEXT> [--body <TEXT>]
     status                            [--node <UUID>]
     comment reply <COMMENT_ID> <TEXT> [--node <UUID>] [--pr <LINK>]
+    threads                           [--node <UUID>] [--pr <LINK>] [--all]
+    threads answer <THREAD_ID>        (--fixed | --rejected) --reply <TEXT> [--node <UUID>] [--pr <LINK>]
     mergeable                         [--note <TEXT>]
     merged                            [--note <TEXT>]
     blocked                           --why <TEXT>
@@ -53,6 +55,14 @@ and merged flag.
 `comment reply` posts a reply to a review comment thread by its numeric id
 (shown by GitHub, not tod's short ids), on the linked PR --pr names (its URL
 or <OWNER>/<REPO>#<NUMBER>) — needed only when the node links more than one.
+`threads` lists the review threads still open (human and bot alike, with the
+file and line, every comment, and how many times you have already answered
+it), or all of them with --all. `threads answer` answers one by its id: it
+posts --reply (which must say what you did, or why you did not), signs it as
+tod's own, and resolves the thread, all as the user. --fixed says you changed
+code for it (push first, so the reply can name the commit); --rejected says
+you did not, and why. If you cannot decide a thread, ask the user with
+`decisions ask` instead.
 `mergeable` records that the PR is ready for the `pr → approved` gate to
 check (checks green, reviews satisfied) — it does not itself approve
 anything. `blocked` records that you cannot make further progress without the
@@ -82,6 +92,7 @@ pub fn run(inv: Invocation) -> anyhow::Result<String> {
             status(&inv, &args)
         }
         "comment" => comment(&inv, &rest),
+        "threads" => threads(&inv, &rest),
         "mergeable" => {
             let args = Args::parse(&rest)?;
             mergeable(&inv, &args)
@@ -367,6 +378,126 @@ fn comment(inv: &Invocation, rest: &[String]) -> anyhow::Result<String> {
         .reply_to_comment(&pr.owner, &pr.repo, pr.pr_number, comment_id, &text)
         .map_err(|err| anyhow::anyhow!("GitHub: {err}"))?;
     Ok("ok".to_string())
+}
+
+/// The one linked pull request `--pr` names, or the only one linked.
+fn pick_pr(
+    mut prs: Vec<tod_store::github::NodePr>,
+    args: &Args,
+    node: Uuid,
+) -> anyhow::Result<tod_store::github::NodePr> {
+    match args.get("--pr") {
+        Some(link) => {
+            let wanted = parse_pr_link(link).ok_or_else(|| {
+                anyhow::anyhow!("--pr `{link}` is not a pull request URL or <OWNER>/<REPO>#<NUMBER>")
+            })?;
+            prs.into_iter()
+                .find(|pr| pr.same_as(&wanted))
+                .ok_or_else(|| anyhow::anyhow!("node {node} does not link {}", wanted.url))
+        }
+        None if prs.len() == 1 => Ok(prs.remove(0)),
+        None => anyhow::bail!("node {node} links {} pull requests — say which with --pr <LINK>", prs.len()),
+    }
+}
+
+fn threads(inv: &Invocation, rest: &[String]) -> anyhow::Result<String> {
+    if rest.first().map(String::as_str) == Some("answer") {
+        return answer_thread(inv, &rest[1..]);
+    }
+    let args = Args::parse(rest)?;
+    let node = node(&args)?;
+    let pr = pick_pr(linked(inv, node)?.prs, &args, node)?;
+    let all = args.has("--all");
+    let found = github(inv)?
+        .list_review_threads(&pr.owner, &pr.repo, pr.pr_number)
+        .map_err(|err| anyhow::anyhow!("GitHub: {err}"))?;
+    let shown: Vec<_> = found.iter().filter(|t| all || (!t.resolved && !t.outdated)).collect();
+    if inv.json {
+        let list: Vec<_> = shown
+            .iter()
+            .map(|t| {
+                serde_json::json!({
+                    "id": t.id,
+                    "resolved": t.resolved,
+                    "outdated": t.outdated,
+                    "path": t.path,
+                    "line": t.line,
+                    "rounds": tod_core::pr_readiness::rounds(t),
+                    "comments": t.comments.iter().map(|c| serde_json::json!({
+                        "author": c.author,
+                        "body": c.body,
+                        "created_at": c.created_at,
+                    })).collect::<Vec<_>>(),
+                })
+            })
+            .collect();
+        return Ok(serde_json::to_string(&list)?);
+    }
+    if shown.is_empty() {
+        return Ok(format!("no open review threads on {}", pr.url));
+    }
+    let mut out = Vec::new();
+    for t in shown {
+        let state = if t.resolved { "resolved" } else if t.outdated { "outdated" } else { "open" };
+        out.push(format!(
+            "thread {}  {}  {}:{}  answered {}x",
+            t.id,
+            state,
+            t.path.as_deref().unwrap_or("(no file)"),
+            t.line.map_or_else(|| "?".to_string(), |l| l.to_string()),
+            tod_core::pr_readiness::rounds(t)
+        ));
+        if let Some(hunk) = t.comments.first().and_then(|c| c.diff_hunk.as_deref()) {
+            out.push(format!("  code:\n{}", indent(hunk, "    ")));
+        }
+        for c in &t.comments {
+            out.push(format!(
+                "  {}:\n{}",
+                c.author.as_deref().unwrap_or("?"),
+                indent(c.body.trim(), "    ")
+            ));
+        }
+    }
+    Ok(out.join("\n"))
+}
+
+fn indent(text: &str, prefix: &str) -> String {
+    text.lines().map(|l| format!("{prefix}{l}")).collect::<Vec<_>>().join("\n")
+}
+
+fn answer_thread(inv: &Invocation, rest: &[String]) -> anyhow::Result<String> {
+    let Some(thread_id) = rest.first().filter(|a| !a.starts_with("--")) else {
+        anyhow::bail!("usage: pr threads answer <THREAD_ID> (--fixed | --rejected) --reply <TEXT>");
+    };
+    let args = Args::parse(&rest[1..])?;
+    let fixed = args.has("--fixed");
+    if fixed == args.has("--rejected") {
+        anyhow::bail!("say which: --fixed (you changed code) or --rejected (you did not)");
+    }
+    let reply = args.require("--reply")?.trim().to_string();
+    if reply.is_empty() {
+        anyhow::bail!("--reply must say what you did, or why you did not");
+    }
+    let node = node(&args)?;
+    let pr = pick_pr(linked(inv, node)?.prs, &args, node)?;
+    let github = github(inv)?;
+    let found = github
+        .list_review_threads(&pr.owner, &pr.repo, pr.pr_number)
+        .map_err(|err| anyhow::anyhow!("GitHub: {err}"))?;
+    let thread = found
+        .iter()
+        .find(|t| &t.id == thread_id)
+        .ok_or_else(|| anyhow::anyhow!("{} has no review thread {thread_id}", pr.url))?;
+    if thread.resolved {
+        return Ok(format!("thread {thread_id} is already resolved"));
+    }
+    github
+        .reply_to_thread(thread_id, &format!("{} {reply}", tod_core::pr_readiness::TOD_MARKER))
+        .map_err(|err| anyhow::anyhow!("GitHub (reply): {err}"))?;
+    github
+        .resolve_thread(thread_id)
+        .map_err(|err| anyhow::anyhow!("replied, but could not resolve the thread: GitHub: {err}"))?;
+    Ok(format!("ok {} ({})", thread_id, if fixed { "fixed" } else { "rejected" }))
 }
 
 fn conversation(inv: &Invocation) -> anyhow::Result<Uuid> {

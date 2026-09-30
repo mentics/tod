@@ -8,6 +8,8 @@ tod-cli --data-root <DATA_ROOT> pr list                              [--node <NO
 tod-cli --data-root <DATA_ROOT> pr open                              [--node <NODE_UUID>] --owner <OWNER> --repo <REPO> --head <BRANCH> --base <BRANCH> --title <TEXT> [--body <TEXT>]
 tod-cli --data-root <DATA_ROOT> pr status                            [--node <NODE_UUID>]
 tod-cli --data-root <DATA_ROOT> pr comment reply <COMMENT_ID> <TEXT> [--node <NODE_UUID>] [--pr <LINK>]
+tod-cli --data-root <DATA_ROOT> pr threads                           [--node <NODE_UUID>] [--pr <LINK>] [--all]
+tod-cli --data-root <DATA_ROOT> pr threads answer <THREAD_ID>        (--fixed | --rejected) --reply <TEXT> [--node <NODE_UUID>] [--pr <LINK>]
 tod-cli --data-root <DATA_ROOT> pr mergeable                         [--note <TEXT>]
 tod-cli --data-root <DATA_ROOT> pr merged                            [--note <TEXT>]
 tod-cli --data-root <DATA_ROOT> pr blocked                           --why <TEXT>
@@ -35,6 +37,15 @@ reply` answers a review comment thread by its GitHub numeric id (shown in
 `status` or in the comment itself, not tod's short ids); `--pr` (the PR's URL
 or `<OWNER>/<REPO>#<NUMBER>`) says which PR, needed only when the node links
 more than one.
+
+`threads` lists the review threads still open (human and bot alike) with the
+file and line, the code, every comment, and how many times you have answered
+it; `--all` lists resolved ones too. `threads answer` answers one by its id: it
+posts `--reply` (say what you did, or why you did not), signs it as tod's own,
+and resolves the thread, as the user. `--fixed` says you changed code for it,
+so push first and the reply can name the commit; `--rejected` says you did
+not, and why. A thread you cannot decide is not answered: ask the user with
+`decisions ask`.
 
 `mergeable` records that the PR is ready — checks green, requested changes
 addressed — for the `pr → approved` gate to confirm; it does not approve
