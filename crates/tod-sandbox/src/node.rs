@@ -163,6 +163,71 @@ fn rule(destination: &str, secret: &str, value_prefix: &str, secret_value: Strin
 /// headers would hand the secret back. A missing GitHub, Linear, or Claude
 /// credential just leaves its rule out.
 pub fn proxy_rules(creds: &NodeCredentials, orchestrator_host: &str, claude_via: ClaudeTokenVia) -> Vec<ProxyRule> {
+    let mut rules = credential_rules(creds, claude_via);
+    rules.push(rule("api.blaxel.ai", "blaxel", "Bearer ", creds.blaxel_token.clone()));
+    rules.push(rule(orchestrator_host, "blaxel", "Bearer ", creds.blaxel_token.clone()));
+    rules
+}
+
+/// The label an interactive (Files) sandbox carries with
+/// [`credentials_fingerprint`] of everything its proxy was made with.
+pub const CREDS_LABEL: &str = "tod-creds";
+
+/// A short fingerprint of `rules` (destinations, headers, templates, secret
+/// values: a changed value changes it); `none` without any. Safe as a label
+/// value, and reveals nothing of the values.
+pub fn rules_fingerprint(rules: &[ProxyRule]) -> String {
+    use sha2::{Digest, Sha256};
+    if rules.is_empty() {
+        return "none".to_string();
+    }
+    let mut sorted: Vec<&ProxyRule> = rules.iter().collect();
+    sorted.sort_by(|a, b| (&a.destination, &a.secret_name).cmp(&(&b.destination, &b.secret_name)));
+    let mut h = Sha256::new();
+    for r in sorted {
+        for part in [&r.destination, &r.header, &r.value, &r.secret_name, &r.secret_value] {
+            h.update((part.len() as u64).to_le_bytes());
+            h.update(part.as_bytes());
+        }
+    }
+    let digest = h.finalize();
+    digest.iter().take(8).map(|b| format!("{b:02x}")).collect()
+}
+
+/// [`rules_fingerprint`] of [`credential_rules`]: what an interactive
+/// sandbox's proxy holds.
+pub fn credentials_fingerprint(creds: &NodeCredentials, claude_via: ClaudeTokenVia) -> String {
+    rules_fingerprint(&credential_rules(creds, claude_via))
+}
+
+/// The environment an agent launched in an interactive sandbox (not a
+/// supervised node) needs to use [`credential_rules`]: `NODE_USE_ENV_PROXY`
+/// (Node's fetch otherwise ignores the proxy), the GitHub placeholders, and
+/// the Claude token: a placeholder with [`ClaudeTokenVia::Proxy`], the real
+/// token with [`ClaudeTokenVia::Env`]. Passed to the agent process alone
+/// (`tod-sandbox agent --env`), never stored in the sandbox.
+pub fn agent_env(creds: &NodeCredentials, claude_via: ClaudeTokenVia) -> Vec<(String, String)> {
+    let mut env = Vec::new();
+    if !credential_rules(creds, claude_via).is_empty() {
+        env.push(("NODE_USE_ENV_PROXY".to_string(), "1".to_string()));
+    }
+    if github_token(creds).is_some() {
+        env.push(("GH_TOKEN".to_string(), GH_TOKEN_PLACEHOLDER.to_string()));
+        env.push((GITHUB_AUTH_ENV.to_string(), GITHUB_AUTH_PROXY.to_string()));
+    }
+    if let Some(token) = claude_token(creds) {
+        match claude_via {
+            ClaudeTokenVia::Proxy => env.push((CLAUDE_TOKEN_ENV.to_string(), CLAUDE_TOKEN_PLACEHOLDER.to_string())),
+            ClaudeTokenVia::Env => env.push((CLAUDE_TOKEN_ENV.to_string(), token.to_string())),
+        }
+    }
+    env
+}
+
+/// The rules for the user's own credentials: GitHub, Linear, Claude (with
+/// the proxy), and the node's Environment. Everything [`proxy_rules`] has
+/// except the Blaxel ones, which only a supervised node needs.
+pub fn credential_rules(creds: &NodeCredentials, claude_via: ClaudeTokenVia) -> Vec<ProxyRule> {
     let mut rules = Vec::new();
     if let Some(token) = github_token(creds) {
         rules.push(rule("api.github.com", "github", "Bearer ", token.to_string()));
@@ -178,8 +243,6 @@ pub fn proxy_rules(creds: &NodeCredentials, orchestrator_host: &str, claude_via:
         rules.push(rule("api.anthropic.com", "claude", "Bearer ", token.to_string()));
     }
     rules.extend(custom_proxy_rules(&creds.custom));
-    rules.push(rule("api.blaxel.ai", "blaxel", "Bearer ", creds.blaxel_token.clone()));
-    rules.push(rule(orchestrator_host, "blaxel", "Bearer ", creds.blaxel_token.clone()));
     rules
 }
 
@@ -925,6 +988,49 @@ mod tests {
         assert_eq!(env_fingerprint(&[c("x")]), env_fingerprint(&[c("x")]));
         assert_ne!(env_fingerprint(&[c("x")]), env_fingerprint(&[c("y")]));
         assert!(!env_fingerprint(&[c("x")]).contains('x') || env_fingerprint(&[c("x")]).len() == 16);
+    }
+
+    #[test]
+    fn an_interactive_sandbox_gets_the_builtin_rules_without_blaxel_ones() {
+        let rules = credential_rules(&creds(), ClaudeTokenVia::Proxy);
+        let dests: Vec<&str> = rules.iter().map(|r| r.destination.as_str()).collect();
+        assert_eq!(dests, ["api.github.com", "github.com", "api.linear.app", "api.anthropic.com"]);
+        let env_mode = credential_rules(&creds(), ClaudeTokenVia::Env);
+        assert!(!env_mode.iter().any(|r| r.destination == "api.anthropic.com"));
+        // proxy_rules is these plus the two Blaxel ones.
+        assert_eq!(proxy_rules(&creds(), "o.bl.run", ClaudeTokenVia::Proxy).len(), rules.len() + 2);
+    }
+
+    #[test]
+    fn the_credentials_fingerprint_covers_builtin_secrets_and_hides_them() {
+        let via = ClaudeTokenVia::Proxy;
+        assert_eq!(credentials_fingerprint(&NodeCredentials::default(), via), "none");
+        let base = credentials_fingerprint(&creds(), via);
+        assert_eq!(base.len(), 16);
+        assert!(!base.contains("ghp"));
+        let changed = NodeCredentials { claude_oauth_token: Some("sk-ant-oat01-new".into()), ..creds() };
+        assert_ne!(base, credentials_fingerprint(&changed, via));
+        let no_gh = NodeCredentials { github_token: None, ..creds() };
+        assert_ne!(base, credentials_fingerprint(&no_gh, via));
+        // Env mode keeps the token out of the proxy, so its change is not a recreate.
+        assert_eq!(
+            credentials_fingerprint(&creds(), ClaudeTokenVia::Env),
+            credentials_fingerprint(&changed, ClaudeTokenVia::Env)
+        );
+    }
+
+    #[test]
+    fn an_interactive_agent_gets_placeholders_or_the_token_by_mode() {
+        let get = |env: &[(String, String)], k: &str| env.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
+        let proxy = agent_env(&creds(), ClaudeTokenVia::Proxy);
+        assert_eq!(get(&proxy, CLAUDE_TOKEN_ENV).as_deref(), Some(CLAUDE_TOKEN_PLACEHOLDER));
+        assert_eq!(get(&proxy, "GH_TOKEN").as_deref(), Some(GH_TOKEN_PLACEHOLDER));
+        assert_eq!(get(&proxy, GITHUB_AUTH_ENV).as_deref(), Some(GITHUB_AUTH_PROXY));
+        assert_eq!(get(&proxy, "NODE_USE_ENV_PROXY").as_deref(), Some("1"));
+        assert!(!proxy.iter().any(|(_, v)| v.contains("real") || v == "ghp_x"));
+        let env = agent_env(&creds(), ClaudeTokenVia::Env);
+        assert_eq!(get(&env, CLAUDE_TOKEN_ENV).as_deref(), Some("sk-ant-oat01-real"));
+        assert!(agent_env(&NodeCredentials::default(), ClaudeTokenVia::Proxy).is_empty());
     }
 
     #[test]

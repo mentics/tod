@@ -3,7 +3,16 @@
 //! `e2e_env_recreate <data root> <sandbox name>`. Dummy values only; deletes
 //! the sandbox at the end.
 use tod_sandbox::node::CustomCredential;
-use tod_store::fleet::sandbox::{NewSandboxSource, Sandboxes, proxy_is_current, set_data_root};
+use tod_store::fleet::sandbox::{NewSandboxSource, Sandboxes, interactive_proxy_is_current, set_data_root};
+
+/// Only the Environment's credentials (no GitHub/Linear/Claude) in the proxy.
+fn nc(custom: &[CustomCredential]) -> tod_sandbox::node::NodeCredentials {
+    tod_sandbox::node::NodeCredentials { custom: custom.to_vec(), ..Default::default() }
+}
+
+fn proxy_is_current(info: &tod_sandbox::blaxel::SandboxInfo, custom: &[CustomCredential]) -> bool {
+    interactive_proxy_is_current(info, &nc(custom), Default::default())
+}
 use tod_store::fleet::session_log;
 
 fn cred(v: &str) -> Vec<CustomCredential> {
@@ -23,7 +32,7 @@ fn main() -> anyhow::Result<()> {
     set_data_root(&root);
     let mut sb = Sandboxes::load(&root)?;
     let bx = sb.blaxel()?;
-    sb.create_with_proxy(&name, &NewSandboxSource::Image(String::new()), false, false, &cred("DUMMY-proxy-secret-e2e-424242"), &mut |s| eprintln!("progress: {s}"))?;
+    sb.create_with_proxy(&name, &NewSandboxSource::Image(String::new()), false, false, &nc(&cred("DUMMY-proxy-secret-e2e-424242")), &mut |s| eprintln!("progress: {s}"))?;
     let url = sb.url(&bx, &name)?;
     let sid = "11111111-2222-4333-8444-555555555555";
     // Where Claude writes its log: ${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects/<cwd, non-alphanumerics as dashes>/<id>.jsonl
@@ -48,7 +57,7 @@ fn main() -> anyhow::Result<()> {
     for _ in 0..60 { if bx.get(&name)?.is_none_or(|i| i.status.eq_ignore_ascii_case("TERMINATED")) { break; } std::thread::sleep(std::time::Duration::from_secs(3)); }
     println!("deleted; recreating with the changed credential");
     let changed = cred("DUMMY-changed-e2e-999");
-    let url = sb.create_with_proxy(&name, &NewSandboxSource::Image(String::new()), false, false, &changed, &mut |s| eprintln!("progress: {s}"))?;
+    let url = sb.create_with_proxy(&name, &NewSandboxSource::Image(String::new()), false, false, &nc(&changed), &mut |s| eprintln!("progress: {s}"))?;
     let info = bx.get(&name)?.unwrap();
     println!("recreated; proxy_is_current(changed)={}", proxy_is_current(&info, &changed));
     let before = bx.run(&url, "ls ${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects 2>&1 | head -3; echo end", 60)?;
