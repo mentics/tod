@@ -67,6 +67,23 @@ Xvfb_screen0 shot.png`. Quit it with `quit` on the socket, as on any machine.
 ## A real Claude
 
 Claude needs a credential in each place. Use a token made for tests
-(`claude setup-token`), never your own sign-in, and pass it only as the
-environment variable `CLAUDE_CODE_OAUTH_TOKEN` of the command that needs it.
-The gated tests read it from `TOD_TEST_CLAUDE_TOKEN`.
+(`claude setup-token`), never your own sign-in. Put `TOD_TEST_CLAUDE_TOKEN=...`
+in the git-ignored `.env` at the repository root and load it into the
+environment that runs the tests (`set -a; . ./.env; set +a`); the tests give
+it to Claude only as `CLAUDE_CODE_OAUTH_TOKEN`. Note that in a sandbox the
+token travels in the command sent to the sandbox, so use a token you can
+revoke.
+
+The gated tests in `crates/tod-store/src/fleet/session_log.rs`
+(`a_real_claude_resumes_a_session_moved_into_a_dev_container` and `..._cloud_sandbox`)
+start a real session on the host, copy its log into the place under that
+place's own working-directory name, resume it there with `claude --resume`
+(it must know what it was told on the host), then copy the log back and
+resume on the host (it must know what it was told in the place). A run costs
+about three turns. For the container: `TOD_TEST_DEV_CONTAINER=<a container
+from tod-test:base>`. For the sandbox: `TOD_TEST_SANDBOX=<one made with
+--agents>` and `TOD_TEST_SANDBOX_ROOT`, and `TOD_RELAY_BIN` if the relay is
+not beside the build.
+
+Both pass (`ubuntu:24.04` with `--agents` for the sandbox, `tod-test:base`
+for the container).

@@ -899,4 +899,121 @@ mod transfer_tests {
         run_move_matrix(&host, &[("container", &c, "-in-container"), ("sandbox", &s, "-in-sandbox")]);
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// One `claude -p` turn with `args`, run by `run` (which knows where),
+    /// returning the reply. The token is `TOD_TEST_CLAUDE_TOKEN`, given to
+    /// Claude only as `CLAUDE_CODE_OAUTH_TOKEN`.
+    fn claude_turn(
+        run: &dyn Fn(&[String]) -> Result<std::process::Output>,
+        token: &str,
+        prompt: &str,
+        session_arg: [&str; 2],
+    ) -> String {
+        let args: Vec<String> = ["env".to_string(), format!("CLAUDE_CODE_OAUTH_TOKEN={token}"), "claude".into()]
+            .into_iter()
+            .chain(["-p", prompt, session_arg[0], session_arg[1], "--output-format", "json"].map(String::from))
+            .collect();
+        let out = run(&args).unwrap();
+        let text = String::from_utf8_lossy(&out.stdout).to_string();
+        let reply: serde_json::Value = serde_json::from_str(text.trim())
+            .unwrap_or_else(|_| panic!("claude said: {text} {}", String::from_utf8_lossy(&out.stderr).replace(token, "<token>")));
+        assert_eq!(reply["is_error"], false, "claude failed: {reply}");
+        reply["result"].as_str().unwrap_or_default().to_string()
+    }
+
+    /// A real Claude session started on this machine, resumed in `place`
+    /// from the copied log, then resumed here again: each side must know what
+    /// the other was told. `run_there` runs a command in `place` at `cwd`.
+    fn real_claude_move(
+        place: &dyn Remote,
+        cwd: &str,
+        run_there: &dyn Fn(&[String]) -> Result<std::process::Output>,
+        token: &str,
+    ) {
+        let dir = std::env::temp_dir().join(format!("tod-real-claude-{}", uuid::Uuid::new_v4()));
+        let work = dir.join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        let cfg = dir.join("cfg");
+        let host = HostRemote::at(&cfg);
+        let host_project = project_dir_name(&work.to_string_lossy());
+        let id = uuid::Uuid::new_v4().to_string();
+        let on_host = |prompt: &str, session_arg: [&str; 2]| -> String {
+            let program = if cfg!(windows) { "claude.cmd" } else { "claude" };
+            let out = std::process::Command::new(program)
+                .args(["-p", prompt, session_arg[0], session_arg[1], "--output-format", "json"])
+                .current_dir(&work)
+                .env("CLAUDE_CONFIG_DIR", &cfg)
+                .env("CLAUDE_CODE_OAUTH_TOKEN", token)
+                .output()
+                .unwrap();
+            let text = String::from_utf8_lossy(&out.stdout).to_string();
+            let reply: serde_json::Value = serde_json::from_str(text.trim()).unwrap_or_else(|_| {
+                panic!("claude said: {text} {}", String::from_utf8_lossy(&out.stderr).replace(token, "<token>"))
+            });
+            assert_eq!(reply["is_error"], false, "claude failed: {reply}");
+            reply["result"].as_str().unwrap_or_default().to_string()
+        };
+
+        on_host("Remember the secret word PINEAPPLE. Reply with just OK.", ["--session-id", &id]);
+        assert!(host.read_from(&host_project, &id, 0).unwrap().len() > 0, "no log on the host");
+
+        // To the place, under its own working directory's project name.
+        let there = project_dir_name(cwd);
+        assert!(transfer(&host, place, &id, &there).unwrap());
+        let reply = claude_turn(
+            run_there,
+            token,
+            "What secret word did I ask you to remember? Then also remember BANANA. Reply with the first word, then OK.",
+            ["--resume", &id],
+        );
+        assert!(reply.to_uppercase().contains("PINEAPPLE"), "in the place, claude forgot the word: {reply}");
+
+        // Back here: the host has not seen that turn until the log comes back.
+        assert!(transfer(place, &host, &id, &host_project).unwrap());
+        let reply = on_host("List every secret word I asked you to remember, in capitals, separated by commas.", ["--resume", &id]);
+        let upper = reply.to_uppercase();
+        assert!(upper.contains("PINEAPPLE") && upper.contains("BANANA"), "back on the host, claude lost a word: {reply}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Needs `TOD_TEST_CLAUDE_TOKEN` (a token made for tests) and a running
+    /// container made from `tod-test:base` (`TOD_TEST_DEV_CONTAINER`).
+    #[test]
+    fn a_real_claude_resumes_a_session_moved_into_a_dev_container() {
+        let (Ok(token), Ok(container)) = (std::env::var("TOD_TEST_CLAUDE_TOKEN"), std::env::var("TOD_TEST_DEV_CONTAINER")) else {
+            eprintln!("skipped: set TOD_TEST_CLAUDE_TOKEN and TOD_TEST_DEV_CONTAINER (tod-test:base)");
+            return;
+        };
+        let remote = ContainerRemote::new(&container).unwrap();
+        let cwd = "/root/work";
+        remote.exec.output("/", "mkdir", &["-p", cwd]).unwrap();
+        let run = |args: &[String]| -> Result<std::process::Output> {
+            let refs: Vec<&str> = args.iter().skip(1).map(String::as_str).collect();
+            remote.exec.output(cwd, &args[0], &refs)
+        };
+        real_claude_move(&remote, cwd, &run, &token);
+    }
+
+    /// Needs `TOD_TEST_CLAUDE_TOKEN` and a sandbox made with `--agents`
+    /// (`TOD_TEST_SANDBOX`, `TOD_TEST_SANDBOX_ROOT`).
+    #[test]
+    fn a_real_claude_resumes_a_session_moved_into_a_cloud_sandbox() {
+        let (Ok(token), Ok(name), Ok(root)) = (
+            std::env::var("TOD_TEST_CLAUDE_TOKEN"),
+            std::env::var("TOD_TEST_SANDBOX"),
+            std::env::var("TOD_TEST_SANDBOX_ROOT"),
+        ) else {
+            eprintln!("skipped: set TOD_TEST_CLAUDE_TOKEN, TOD_TEST_SANDBOX, TOD_TEST_SANDBOX_ROOT");
+            return;
+        };
+        crate::fleet::sandbox::set_data_root(&std::fs::canonicalize(root).unwrap());
+        let remote = SandboxRemote::new(&name);
+        let cwd = "/root/work";
+        remote.exec.output("/", "mkdir", &["-p", cwd]).unwrap();
+        let run = |args: &[String]| -> Result<std::process::Output> {
+            let refs: Vec<&str> = args.iter().skip(1).map(String::as_str).collect();
+            remote.exec.output(cwd, &args[0], &refs)
+        };
+        real_claude_move(&remote, cwd, &run, &token);
+    }
 }
