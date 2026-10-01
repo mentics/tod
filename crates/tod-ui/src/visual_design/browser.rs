@@ -104,4 +104,16 @@ mod tests {
             Err(BrowserError::NotFound { browser: "chrome" })
         ));
     }
+
+    #[test]
+    fn an_override_path_is_honoured_and_a_bogus_one_is_not_found() {
+        let exe = std::env::current_exe().unwrap();
+        let ok = registry_with_override(Some(exe.clone()));
+        assert_eq!(first_available(&ok).map(|(_, p)| p), Ok(exe));
+        let bogus = registry_with_override(Some("/definitely/not/a/browser".into()));
+        assert!(matches!(
+            first_available(&bogus),
+            Err(BrowserError::NotFound { browser: "chrome" })
+        ));
+    }
 }

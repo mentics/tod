@@ -404,6 +404,8 @@ impl ConversationDriver {
 
         let mut images = images;
         let mut note = String::new();
+        // The retry below rotates again; the marker is written once.
+        let mut rotated = false;
         let started = loop {
             let text_now = format!("{text}{note}");
             let text = text_now.as_str();
@@ -425,6 +427,8 @@ impl ConversationDriver {
                 } else {
                     "over budget"
                 };
+                let announce = !rotated;
+                rotated = true;
                 self.rotate_and_start(
                     fleet,
                     agent,
@@ -434,6 +438,7 @@ impl ConversationDriver {
                     text,
                     images.clone(),
                     reason,
+                    announce,
                 )
             } else {
                 // The first turn: the opening context, then the message.
@@ -623,6 +628,7 @@ impl ConversationDriver {
                     &text,
                     images,
                     "cold resume failed",
+                    true,
                 )?;
                 events.push(ConversationEvent::Rotated);
             }
@@ -842,18 +848,21 @@ impl ConversationDriver {
         text: &str,
         images: Vec<PromptImage>,
         reason: &str,
+        announce: bool,
     ) -> Result<()> {
         let id = conversation.id;
         agent.with(|a| a.close_session(&Self::session_key(id)));
-        self.append(fleet, id, TurnRole::Rotation, ROTATION_NOTE)?;
-        crate::journey::record(
-            self.journey_key(),
-            Actor::App,
-            Event::SessionRotated {
-                conversation: id,
-                reason: reason.to_string(),
-            },
-        );
+        if announce {
+            self.append(fleet, id, TurnRole::Rotation, ROTATION_NOTE)?;
+            crate::journey::record(
+                self.journey_key(),
+                Actor::App,
+                Event::SessionRotated {
+                    conversation: id,
+                    reason: reason.to_string(),
+                },
+            );
+        }
         fleet.interview(
             ACTOR_USER,
             InterviewCommand::SetConversationSession {
