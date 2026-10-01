@@ -378,27 +378,46 @@ impl Remote for MirrorRemote {
     }
 }
 
-/// Make sure `target` holds `session`'s log under `to_project`, copying it
-/// from the first of `sources` that has one. `true` when it is there after.
-/// A log the target already has is left alone: it is that environment's own,
-/// and at least as new as what it last wrote.
+/// Make sure `target` holds `session`'s newest log under `to_project`,
+/// copying it from whichever of `sources` has the longest one. `true` when it
+/// is there after. A log only grows, so the longest is the newest: the
+/// target's own copy from an earlier visit is replaced when another place
+/// has since added to the session, and never when it is the longest.
 pub fn ensure_session(
     target: &dyn Remote,
     sources: &[&dyn Remote],
     session: &str,
     to_project: &str,
 ) -> Result<bool> {
-    if target.list()?.iter().any(|l| l.session == session && l.project == to_project && l.size > 0) {
-        return Ok(true);
-    }
+    let held = target
+        .list()?
+        .iter()
+        .filter(|l| l.session == session && l.project == to_project)
+        .map(|l| l.size)
+        .max()
+        .unwrap_or(0);
+    let mut best: Option<(&dyn Remote, u64)> = None;
     for source in sources {
-        match transfer(*source, target, session, to_project) {
-            Ok(true) => return Ok(true),
-            Ok(false) => {}
-            Err(err) => tracing::warn!("copying session {session}: {err:#}"),
+        match source.list() {
+            Ok(logs) => {
+                let size = logs.iter().filter(|l| l.session == session).map(|l| l.size).max().unwrap_or(0);
+                if size > best.map_or(0, |(_, s)| s) {
+                    best = Some((*source, size));
+                }
+            }
+            Err(err) => tracing::warn!("listing logs for session {session}: {err:#}"),
         }
     }
-    Ok(false)
+    if let Some((source, size)) = best {
+        if size > held {
+            match transfer(source, target, session, to_project) {
+                Ok(true) => return Ok(true),
+                Ok(false) => {}
+                Err(err) => tracing::warn!("copying session {session}: {err:#}"),
+            }
+        }
+    }
+    Ok(held > 0)
 }
 
 /// Move one session's log from one environment to another for a node that is
@@ -798,5 +817,86 @@ mod transfer_tests {
         };
         crate::fleet::sandbox::set_data_root(&std::fs::canonicalize(root).unwrap());
         round_trip_through(&SandboxRemote::new(&name), "sandbox");
+    }
+
+    /// One turn in `place`: the agent adds a line to its log there.
+    fn take_turn(place: &dyn Remote, project: &str, session: &str, n: usize) {
+        let mut log = place.read_from(project, session, 0).unwrap_or_default();
+        log.extend_from_slice(format!("{{\"turn\":{n}}}
+").as_bytes());
+        place.write(project, session, &log).unwrap();
+    }
+
+    fn turns_in(place: &dyn Remote, project: &str, session: &str) -> usize {
+        place.read_from(project, session, 0).map_or(0, |b| b.iter().filter(|c| **c == b'\n').count())
+    }
+
+    /// The move matrix for one session as the driver does it: before each
+    /// turn the log is brought to where the node now runs (the longest of the
+    /// host's and the mirror's), the turn adds a line, and the log is kept in
+    /// the mirror. The session must never lose a turn on any hop, in
+    /// particular a return to a place it already visited.
+    fn run_move_matrix(host: &dyn Remote, others: &[(&str, &dyn Remote, &str)]) {
+        let dir = std::env::temp_dir().join(format!("tod-session-matrix-{}", uuid::Uuid::new_v4()));
+        let mirror_dir = local_dir(&dir, "node");
+        let session = "dddddddd-2222-3333-4444-555555555555";
+        let host_project = "-on-host";
+        let mut turns = 0;
+        // The route: host, each other place, host again, each place again.
+        let mut route: Vec<(&str, &dyn Remote, &str)> = vec![("host", host, host_project)];
+        route.extend(others.iter().copied());
+        route.push(("host", host, host_project));
+        route.extend(others.iter().copied());
+        route.push(("host", host, host_project));
+        for (name, place, project) in route {
+            let mirror = MirrorRemote::new(&dir, "node");
+            let mut sources: Vec<&dyn Remote> = Vec::new();
+            if name != "host" {
+                sources.push(host);
+            }
+            sources.push(&mirror);
+            if turns > 0 {
+                assert!(ensure_session(place, &sources, session, project).unwrap(), "no log reached the {name}");
+            }
+            assert_eq!(turns_in(place, project, session), turns, "the {name} resumes with a log of {turns} turns");
+            turns += 1;
+            take_turn(place, project, session, turns);
+            keep_session(place, &mirror_dir, session).unwrap();
+            assert_eq!(
+                MirrorRemote::new(&dir, "node").read_from(project, session, 0).unwrap().iter().filter(|c| **c == b'\n').count(),
+                turns,
+                "the mirror keeps the {name}'s turn"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_session_loses_no_turn_moving_between_places_and_back() {
+        let dir = std::env::temp_dir().join(format!("tod-session-matrix-places-{}", uuid::Uuid::new_v4()));
+        let host = HostRemote::at(dir.join("host"));
+        let a = HostRemote::at(dir.join("a"));
+        let b = HostRemote::at(dir.join("b"));
+        run_move_matrix(&host, &[("a", &a, "-in-a"), ("b", &b, "-in-b")]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_move_across_a_real_container_and_a_real_sandbox_loses_no_turn() {
+        let (Ok(container), Ok(name), Ok(root)) = (
+            std::env::var("TOD_TEST_DEV_CONTAINER"),
+            std::env::var("TOD_TEST_SANDBOX"),
+            std::env::var("TOD_TEST_SANDBOX_ROOT"),
+        ) else {
+            eprintln!("skipped: set TOD_TEST_DEV_CONTAINER, TOD_TEST_SANDBOX, TOD_TEST_SANDBOX_ROOT");
+            return;
+        };
+        crate::fleet::sandbox::set_data_root(&std::fs::canonicalize(root).unwrap());
+        let dir = std::env::temp_dir().join(format!("tod-session-matrix-real-{}", uuid::Uuid::new_v4()));
+        let host = HostRemote::at(&dir);
+        let c = ContainerRemote::new(&container).unwrap();
+        let s = SandboxRemote::new(&name);
+        run_move_matrix(&host, &[("container", &c, "-in-container"), ("sandbox", &s, "-in-sandbox")]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

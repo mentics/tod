@@ -594,10 +594,15 @@ Scope: the workbench only (decision 3).
   relay is not beside the build): a 330 KB log goes host → place under the
   place's own project name and comes back byte-identical, for a Docker
   container and for a Blaxel sandbox. That found one bug, fixed: on Windows
-  a 48 KB chunk overran the 32 K command line (now 16 KB). Not run: a real
-  Claude resuming inside the container or sandbox (neither has one), and the
-  whole-node moves of the acceptance test, which would need the mock agent
-  to write session logs.
+  a 48 KB chunk overran the 32 K command line (now 16 KB). The move chain
+  (host, container, sandbox, host, container, sandbox, host; each hop brings
+  the log, a turn adds a line, the mirror keeps it) ran against both real
+  places without losing a turn; it found that a return to a place already
+  visited kept its stale log, so `ensure_session` now takes the longest log
+  among the sources. Not run: a real Claude resuming inside the container or
+  sandbox (neither has one), and moves of a whole node's lifecycle state,
+  plan and wait: those live in the store, which does not move, so only the
+  conversation's session log travels.
 - **Test suite notes.** `tod-store --lib` passes module by module except
   three that fail or hang on this Windows machine and did so before the
   daemon work (the hang reproduced on the commit before it):
