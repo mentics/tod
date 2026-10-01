@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Builds tod in release mode and installs it (binaries + process/media bundles)
 # into a target directory, with cloud-sandbox support (tod-sandbox, Zed's ssh
-# shim, and the Linux relay that runs in each sandbox).
+# shim, and the Linux relay, supervisor (agent daemon), and orchestrator
+# binaries that run in sandboxes).
 #
 # Usage:
 #   scripts/install.sh /path/to/install
@@ -108,26 +109,38 @@ if [[ "$(uname -s)" == Linux ]]; then
     install_desktop_entry
 fi
 
-# The relay runs inside Linux sandboxes: a static binary cross-built from this
-# machine (rust-lld links it; see .cargo/config.toml). A failure here leaves tod
-# installed without cloud-sandbox support.
-install_sandbox_relay() {
-    local target=x86_64-unknown-linux-musl
-    if ! rustup target add "$target" >/dev/null; then
-        echo "warning: rustup could not add $target; cloud sandboxes will not work" >&2
-        return
-    fi
-    echo "Building: cargo build --release -p tod-relay --target $target"
-    if ! cargo build --release -p tod-relay --target "$target"; then
-        echo "warning: building tod-relay failed; cloud sandboxes will not work" >&2
+# The Linux binaries that run inside cloud sandboxes: the relay, the node
+# supervisor (the agent daemon that runs a node's lifecycle on its own), the
+# orchestrator, the sandbox's tod-cli, and the hourly watchdog. They are built
+# by scripts/build-sandbox-binaries.sh (Docker, else cargo zigbuild, for the
+# ones that bundle SQLite) into target/sandbox/ and installed to sandbox/,
+# where tod-sandbox and tod find them. A failure leaves tod installed with
+# whichever of them were built.
+install_sandbox_binaries() {
+    if ! "$REPO_ROOT/scripts/build-sandbox-binaries.sh" --release; then
+        echo "warning: building the sandbox binaries failed; cloud sandboxes will not work" >&2
         return
     fi
     mkdir -p "$TARGET_DIR/sandbox"
-    cp -f "$REPO_ROOT/target/$target/release/tod-relay" "$TARGET_DIR/sandbox/tod-relay"
-    echo "Installed sandbox/tod-relay"
+    local bin
+    for bin in tod-relay tod-supervisor tod-orchestrator tod-cli tod-watchdog; do
+        local src="$REPO_ROOT/target/sandbox/$bin"
+        if [[ -f "$src" ]]; then
+            cp -f "$src" "$TARGET_DIR/sandbox/$bin"
+            echo "Installed sandbox/$bin"
+        else
+            echo "warning: sandbox/$bin was not built; $(case $bin in
+                tod-relay) echo "cloud sandboxes will not work" ;;
+                tod-supervisor) echo "autonomous nodes will not run on their own" ;;
+                tod-orchestrator) echo "the team orchestrator cannot be deployed" ;;
+                tod-cli) echo "tod-cli pr will not work in a node" ;;
+                *) echo "the watchdog cannot be deployed" ;;
+            esac)" >&2
+        fi
+    done
 }
 if [[ $SANDBOX == 1 ]]; then
-    install_sandbox_relay
+    install_sandbox_binaries
 fi
 
 echo
