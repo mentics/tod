@@ -242,6 +242,10 @@ fn execute(shared: &Shared, command: Command) -> Response {
             Err(err) => failed(&format!("{err:#}")),
         },
         Command::Subscribe => Response::ok(),
+        Command::History => {
+            let summaries = store.command_log().lock().expect("command log mutex").summaries();
+            Response::value(serde_json::to_value(summaries).unwrap_or_default())
+        }
         Command::RunnerStart { node, renew_budget } => match shared.runners.start(node, renew_budget) {
             Ok(()) => Response::ok(),
             Err(err) => failed(&format!("{err:#}")),

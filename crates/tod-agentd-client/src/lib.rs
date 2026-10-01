@@ -131,6 +131,8 @@ pub enum Command {
     /// Turn this connection into a feed: after the reply, the daemon sends an
     /// [`Event`] line each time the store changes.
     Subscribe,
+    /// The undo history, as the `value` (a list of `EntrySummary`).
+    History,
     /// Start a node's runner, or continue its last run.
     RunnerStart { node: Uuid, renew_budget: bool },
     /// Stop a node's run once the agent's turn ends.

@@ -133,6 +133,12 @@ impl DaemonWriter {
         Ok(())
     }
 
+    /// The daemon's undo history, oldest first.
+    pub fn history(&self) -> Result<Vec<tod_store::fleet::command_log::EntrySummary>> {
+        let response = self.call(Command::History)?;
+        Ok(serde_json::from_value(response.value.unwrap_or_default()).unwrap_or_default())
+    }
+
     /// Every node's runner state, as the daemon's JSON.
     pub fn runner_snapshot(&self) -> Result<serde_json::Value> {
         let response = self.call(Command::RunnerSnapshot)?;
@@ -180,6 +186,16 @@ fn broadcast(event: &Event) {
 /// every reconnect (a change may have been missed while it was down). Ends
 /// when `notify` is dropped. It never starts a daemon: only a write does.
 pub fn follow_changes(data_root: &Path, notify: &Arc<tokio::sync::Notify>) -> Result<()> {
+    follow_changes_with(data_root, notify, None)
+}
+
+/// [`follow_changes`] that also mirrors the daemon's undo history into
+/// `history` before each notification.
+pub fn follow_changes_with(
+    data_root: &Path,
+    notify: &Arc<tokio::sync::Notify>,
+    history: Option<Arc<Mutex<tod_store::fleet::command_log::CommandLog>>>,
+) -> Result<()> {
     let writer = DaemonWriter::new(data_root, None);
     let notify = Arc::downgrade(notify);
     std::thread::Builder::new()
@@ -191,6 +207,11 @@ pub fn follow_changes(data_root: &Path, notify: &Arc<tokio::sync::Notify>) -> Re
                         while let Some(event) = connection.next_event() {
                             match event {
                                 Event::Changed { .. } => {
+                                    if let Some(log) = &history {
+                                        if let Ok(summaries) = writer.history() {
+                                            log.lock().expect("command log mutex").replace_with_summaries(summaries);
+                                        }
+                                    }
                                     let Some(notify) = notify.upgrade() else { return };
                                     notify.notify_waiters();
                                 }
@@ -221,6 +242,7 @@ pub fn open_store(data_root: &Path, executable: Option<&Path>) -> Result<FleetSt
     }
     let notify = Arc::new(tokio::sync::Notify::new());
     let writer = Arc::new(DaemonWriter::new(data_root, executable.map(Path::to_path_buf)));
-    follow_changes(data_root, &notify)?;
-    FleetStore::open_client(data_root, writer, notify).map_err(|err| anyhow!("{err}"))
+    let store = FleetStore::open_client(data_root, writer, notify.clone()).map_err(|err| anyhow!("{err}"))?;
+    follow_changes_with(data_root, &notify, Some(store.command_log()))?;
+    Ok(store)
 }

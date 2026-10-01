@@ -161,3 +161,28 @@ fn the_daemon_hosts_runners_and_pushes_their_state() {
     drop(store);
     stop(&root);
 }
+
+#[test]
+fn a_client_mirrors_the_daemons_undo_history() {
+    let root = root("history");
+    let store = remote::open_store(&root, Some(&exe())).unwrap();
+    let id = uuid::Uuid::new_v4().to_string();
+    store
+        .enqueue(FleetMutation::InsertTask { task: FleetTask::new(&id, "History", "history") })
+        .unwrap();
+    store.writer().flush().unwrap();
+    store
+        .enqueue(FleetMutation::UpdateTaskTitle { id: id.clone(), title: "Renamed".into() })
+        .unwrap();
+    store.writer().flush().unwrap();
+    let log = store.command_log();
+    wait_for("the history to be mirrored", || !log.lock().unwrap().entries().is_empty());
+    let entry = log.lock().unwrap().entries().last().cloned().unwrap();
+    // Undoing by that entry goes through the daemon, and the mirror follows.
+    store.undo_through(entry.id).unwrap();
+    wait_for("the entry to leave the mirror", || {
+        !log.lock().unwrap().entries().iter().any(|e| e.id == entry.id)
+    });
+    drop(store);
+    stop(&root);
+}
