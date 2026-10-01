@@ -41,6 +41,7 @@ pub fn load_working_set(config_dir: &Path) -> ListWorkingSet {
         pending_changes_only: false,
         needs_you_only: false,
         running_only: false,
+        awaiting_only: false,
         generator_sorts: persisted
             .generator_sorts
             .into_iter()

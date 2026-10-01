@@ -3339,9 +3339,12 @@ impl TaskListView {
             .iter()
             .filter(|t| t.lifecycle_running)
             .count();
+        let awaiting_nodes = self.all_tasks.iter().filter(|t| t.awaiting).count();
         if pending_nodes == 0
             && needs_you_nodes == 0
             && running_nodes == 0
+            && awaiting_nodes == 0
+            && !self.working_set.awaiting_only
             && !self.working_set.pending_changes_only
             && !self.working_set.needs_you_only
             && !self.working_set.running_only
@@ -3427,6 +3430,22 @@ impl TaskListView {
                             this.rebuild_visible_list(window, cx);
                         })),
                     self.working_set.running_only,
+                ))
+                .child(crate::ui::style::button_toggle(
+                    Button::new("awaiting-filter")
+                        .label(format!("Waiting ({awaiting_nodes})"))
+                        .ghost()
+                        .small()
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.working_set.awaiting_only = !this.working_set.awaiting_only;
+                            this.record_quick_filter_toggle(
+                                "awaiting-filter",
+                                this.working_set.awaiting_only,
+                                cx,
+                            );
+                            this.rebuild_visible_list(window, cx);
+                        })),
+                    self.working_set.awaiting_only,
                 ))
                 .child(check_button)
                 .children(clear_marks)

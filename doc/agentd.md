@@ -576,13 +576,18 @@ Scope: the workbench only (decision 3).
   stops `tod-cli` starting one (tests on throwaway roots).
 - **5** done as a recess, not a group: a node whose run ended to wait shows
   `<state> · waiting` and a muted title in the tree (checked in the running
-  app against a saved wait); the runner line says what and when. A Waiting
-  filter chip and a glyph are not built.
-- **6** partly. A resumed conversation brings its session log to where it now
-  runs (`ConversationDriver::bring_session`: host, or sandbox; from the host
-  or the node's mirror, filed under that working directory's project name,
-  complete lines only; `session_log::ensure_session`/`transfer`, unit-tested
-  between two host directories). Not done: a dev container is neither a
-  source nor a target; whether Claude resumes from the renamed project
-  directory (not run against a real Claude); and the acceptance matrix
-  (needs Docker and a sandbox, neither available where this was built).
+  app against a saved wait); the runner line says what and when. A "Waiting
+  (n)" chip in the tree's quick filters (`awaiting_only`) keeps those nodes
+  and their ancestors. A glyph is not built.
+- **6** mostly. A resumed conversation brings its session log to where it now
+  runs (`ConversationDriver::bring_session`: host, dev container, or
+  sandbox; from the host or the node's mirror, filed under that working
+  directory's project name, complete lines only; `session_log::ensure_session`
+  /`transfer` over a `Remote` per place). Every turn also keeps its log in
+  the node's mirror (`keep_session_in_background`; a sandbox is pulled), so a
+  move from any place has a source. Verified with a real Claude: `--resume
+  <id>` works from a jsonl copied under another working directory's project
+  dir. The shell scripts of the container remote are tested locally through
+  `sh`, not against a real container. Not done: the acceptance matrix across
+  host, container, and sandbox (needs Docker and a sandbox, neither available
+  where this was built).

@@ -212,6 +212,8 @@ pub struct ListWorkingSet {
     pub needs_you_only: bool,
     /// Show only nodes with `live_run_count > 0`, plus their ancestors.
     pub running_only: bool,
+    /// Show only nodes whose run ended to wait (`awaiting`), plus their ancestors.
+    pub awaiting_only: bool,
 }
 
 impl ListWorkingSet {
@@ -226,6 +228,7 @@ impl ListWorkingSet {
             pending_changes_only: false,
             needs_you_only: false,
             running_only: false,
+            awaiting_only: false,
         }
     }
 
@@ -541,6 +544,9 @@ pub fn filter_and_sort_tasks(
     let running = working_set
         .running_only
         .then(|| matching_with_ancestors(tasks, &by_id, |t| t.lifecycle_running));
+    let awaiting = working_set
+        .awaiting_only
+        .then(|| matching_with_ancestors(tasks, &by_id, |t| t.awaiting));
     let filtered: Vec<TaskItem> = tasks
         .iter()
         .filter(|t| {
@@ -551,6 +557,9 @@ pub fn filter_and_sort_tasks(
                     .as_ref()
                     .is_none_or(|ids| ids.contains(t.id.as_str()))
                 && running
+                    .as_ref()
+                    .is_none_or(|ids| ids.contains(t.id.as_str()))
+                && awaiting
                     .as_ref()
                     .is_none_or(|ids| ids.contains(t.id.as_str()))
                 && task_matches_tag_filter(t, working_set.tag_filter.as_deref())
@@ -619,6 +628,7 @@ pub fn nearest_visible_id(
             pending_changes_only: working_set.pending_changes_only,
             needs_you_only: working_set.needs_you_only,
             running_only: working_set.running_only,
+            awaiting_only: working_set.awaiting_only,
         },
     );
     let prev_ix = match all.iter().position(|t| t.id == previous_id) {
@@ -752,6 +762,20 @@ mod tests {
             .into_iter()
             .map(|t| t.id)
             .collect();
+        assert_eq!(ids, vec!["root", "leaf"]);
+    }
+
+    #[test]
+    fn awaiting_filter_keeps_waiting_nodes_and_their_ancestors() {
+        let root = sample("root", "Root", "ready", &[]);
+        let mut leaf = sample("leaf", "Leaf", "ready", &[]);
+        leaf.parent_id = Some("root".into());
+        leaf.awaiting = true;
+        let mut other = sample("other", "Other", "ready", &[]);
+        other.parent_id = Some("root".into());
+        let tasks = vec![root, leaf, other];
+        let ws = ListWorkingSet { awaiting_only: true, ..Default::default() };
+        let ids: Vec<String> = filter_and_sort_tasks(&tasks, "", &ws).into_iter().map(|t| t.id).collect();
         assert_eq!(ids, vec!["root", "leaf"]);
     }
 
