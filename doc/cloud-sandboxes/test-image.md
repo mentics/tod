@@ -87,3 +87,34 @@ not beside the build.
 
 Both pass (`ubuntu:24.04` with `--agents` for the sandbox, `tod-test:base`
 for the container).
+
+## Moving a node through the app (3 legs)
+
+`crates/tod-core/examples/e2e_move_node.rs` drives one conversation about one
+node with a real Claude through `ConversationDriver`, changing the node's
+Files settings between turns: host -> dev container -> cloud sandbox -> host.
+Between legs it removes the old location the way the Files impact dialog does
+(`provision::remove_location`, which pushes the branch first). Each turn asks
+about what was said in the earlier ones and where the agent is running; it
+fails if a reply forgets, the working directory is wrong, or a fresh session
+was started.
+
+Setup (all throwaway): a fresh data root holding only a `sandboxes.toml`
+(Blaxel account, no stored token), a host git repo with an `origin`, a running
+`tod-test:base` container started with `-e CLAUDE_CODE_OAUTH_TOKEN` and a repo
+at `/work` with an `origin`, and a sandbox image from `e2e_env_bake` (a repo at
+`/root/app`; pass it as `sandbox/<name>:latest`). `tod-sandbox` and `tod-cli`
+must sit beside the example binary.
+
+```sh
+set -a; . ./.env; set +a
+TOD_RELAY_BIN=target/sandbox/tod-relay target/debug/examples/e2e_move_node   <data root> <container> sandbox/<image>:latest <host repo>
+```
+
+All three legs pass, the session id is the same throughout, and no fresh
+session was started. What the test found: a live agent session stays where
+it started, so after a Files change the next turn kept running in the old
+place. The driver now closes it and resumes the same session in the new one
+(`ConversationDriver::session_place`). Also, a node whose files cannot be
+made falls back to a scratch directory; that is now logged as a warning.
+

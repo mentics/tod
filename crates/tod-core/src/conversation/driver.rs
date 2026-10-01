@@ -178,6 +178,10 @@ pub struct ConversationDriver {
     last_error: Option<String>,
     live_usage: Option<TokenUsage>,
     launched: Option<AgentLaunchOptions>,
+    /// Where this driver last started a turn (this machine, a dev container,
+    /// a sandbox). A live agent session stays where it started, so a turn
+    /// that now belongs elsewhere closes it and resumes it there.
+    session_place: Option<Workdir>,
 }
 
 impl ConversationDriver {
@@ -200,6 +204,7 @@ impl ConversationDriver {
             last_error: None,
             live_usage: None,
             launched: None,
+            session_place: None,
         }
     }
 
@@ -940,6 +945,21 @@ impl ConversationDriver {
             )
         };
         let environment = launch_environment(fleet, self.focus, &cwd)?;
+        // The node moved while its session was live: the agent process is
+        // still where it began, so end it and resume the same session here
+        // (`doc/agentd.md`, "Moving a node").
+        let mut resume = resume;
+        if resume.is_none()
+            && context.is_none()
+            && self.session_place.as_ref().is_some_and(|place| *place != cwd)
+        {
+            resume = agent.with(|a| {
+                let session = a.session_id(&key);
+                a.close_session(&key);
+                session
+            });
+        }
+        self.session_place = Some(cwd.clone());
         if let Some(session) = &resume {
             self.bring_session(fleet, &cwd, session);
         }

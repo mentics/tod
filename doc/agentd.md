@@ -612,3 +612,9 @@ Scope: the workbench only (decision 3).
   `fleet::migration` hangs in its second test, and
   `fleet::changes::trigger_changes_when_files_settings_change` and
   `fleet::terminal::open_shell_for_node_registers_live_process` fail.
+- **Moves through the app, with a real Claude (verified).** `tod-core`'s
+  example `e2e_move_node` runs host -> dev container -> cloud sandbox -> host
+  on one conversation through `ConversationDriver`; each turn remembered what
+  the earlier ones said, in the same session, with no fresh session. It found
+  and fixed that a live session stayed in its old place after a Files change
+  (`session_place` in the driver). See `doc/cloud-sandboxes/test-image.md`.
