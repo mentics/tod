@@ -598,3 +598,9 @@ Scope: the workbench only (decision 3).
   Claude resuming inside the container or sandbox (neither has one), and the
   whole-node moves of the acceptance test, which would need the mock agent
   to write session logs.
+- **Test suite notes.** `tod-store --lib` passes module by module except
+  three that fail or hang on this Windows machine and did so before the
+  daemon work (the hang reproduced on the commit before it):
+  `fleet::migration` hangs in its second test, and
+  `fleet::changes::trigger_changes_when_files_settings_change` and
+  `fleet::terminal::open_shell_for_node_registers_live_process` fail.
