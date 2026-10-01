@@ -20,7 +20,7 @@ use super::protocol::{
 use crate::context_recipes::{EVALUATE, PHASE};
 use crate::gate::context::build_phase_message;
 use crate::phase::{PhaseStanding, PhaseStep, independent_evaluation, render_status};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use rusqlite::Connection;
 use tod_store::conversation::{Focus, ProtocolKind, actor_for};
 use tod_store::decisions::{DECISION_ANSWERED, DecisionRepo, NewDecision, REASON_INTENT};
@@ -65,32 +65,32 @@ fn build_request<'a>(
     let node_row = fleet
         .get_node(&node.to_string())?
         .ok_or_else(|| anyhow::anyhow!("node {node} not found"))?;
-    let obligations = fleet.list_obligations_for_node(node).unwrap_or_default();
+    let obligations = fleet.list_obligations_for_node(node).context("could not read the node's obligations")?;
     let ancestor_context = fleet
         .read(|conn| {
             crate::node_context::render_inherited_context(conn, &NodeRepo::new(conn), node, None)
         })
-        .unwrap_or_default();
+        .context("could not read the inherited context")?;
     let plan_steps = fleet
         .list_plan_steps_for_node(node)
-        .unwrap_or_default()
+        .context("could not read the plan")?
         .into_iter()
         .map(|step| {
-            let depends_on = fleet.list_plan_step_dependencies(step.id).unwrap_or_default();
-            let satisfies = fleet.list_plan_step_obligations(step.id).unwrap_or_default();
-            crate::gate::PlanStepWithLinks {
+            let depends_on = fleet.list_plan_step_dependencies(step.id)?;
+            let satisfies = fleet.list_plan_step_obligations(step.id)?;
+            Ok(crate::gate::PlanStepWithLinks {
                 step,
                 depends_on,
                 satisfies,
-            }
+            })
         })
-        .collect();
+        .collect::<Result<Vec<_>>>()?;
     // The retrospective is the one state agent that has to know what went
     // wrong along the way; the plan and obligations only show how it ended.
     let work_history = if from == "learn" {
         fleet
             .read(|conn| crate::node_context::render_work_history(conn, node))
-            .unwrap_or_default()
+            .context("could not read the node's work history")?
     } else {
         String::new()
     };

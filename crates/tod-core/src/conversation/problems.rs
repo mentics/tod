@@ -46,3 +46,17 @@ fn record(fleet: &FleetStore, node: Uuid, message: &str) {
         Err(err) => tracing::warn!(%node, "could not find the conversation for a problem: {err:#}"),
     }
 }
+
+/// A read the caller cannot fail on (a loop's progress check, a pane's list):
+/// a failure is reported to the user through the same queue as a background
+/// one, and the caller gets the empty answer, instead of a failed read
+/// passing for "nothing there".
+pub fn or_report<T: Default>(node: Uuid, what: &str, result: anyhow::Result<T>) -> T {
+    result.unwrap_or_else(|err| {
+        tod_store::fleet::session_log::report_problem(
+            &node.to_string(),
+            format!("Could not read {what}: {err:#}"),
+        );
+        T::default()
+    })
+}

@@ -20,6 +20,7 @@ use super::implement::{
     IMPLEMENT_CONVERSATION_ENV, IMPLEMENT_NODE_ENV, TestRun, commit_run, node_id, plan_steps,
     prepare_submodules, reopen_verification_after_change, worktree_fingerprint,
 };
+use super::problems::or_report;
 use super::protocol::{Next, Protocol, ProtocolEnv, RunNotice, Stop, TurnContext, cap_or_stall};
 use crate::agent_context::{ImplementRequest, NodeSelection, build_fix_message};
 use crate::dynamic::review_finding_lines;
@@ -37,9 +38,7 @@ use uuid::Uuid;
 /// The node's findings nobody has answered yet, in the order they were
 /// recorded.
 pub fn open_findings(fleet: &FleetStore, node_id: Uuid) -> Vec<ReviewFinding> {
-    fleet
-        .read(|conn| ReviewRepo::new(conn).list_for_node(node_id))
-        .unwrap_or_default()
+    or_report(node_id, "the review findings", fleet.read(|conn| ReviewRepo::new(conn).list_for_node(node_id)))
         .into_iter()
         .filter(ReviewFinding::is_open)
         .collect()

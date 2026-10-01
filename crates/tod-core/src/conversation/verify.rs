@@ -22,6 +22,7 @@ use tod_store::fleet::Workdir;
 use super::implement::{
     IMPLEMENT_CONVERSATION_ENV, IMPLEMENT_NODE_ENV, TestRun, node_id, plan_steps,
 };
+use super::problems::or_report;
 use super::protocol::{Next, Protocol, ProtocolEnv, Stop, TurnContext, cap_or_stall};
 use crate::agent_context::{ImplementRequest, NodeSelection, build_verify_message};
 use crate::gate::PlanStepWithLinks;
@@ -229,18 +230,18 @@ fn due_standings(fleet: &FleetStore, node_id: Uuid) -> Vec<ObligationStanding> {
 
 /// The node's own obligations with verification's current verdict on each.
 pub fn standings(fleet: &FleetStore, node_id: Uuid) -> Vec<ObligationStanding> {
-    fleet
-        .read(|conn| VerdictRepo::new(conn).standings(node_id))
-        .unwrap_or_default()
+    or_report(node_id, "the verdicts", fleet.read(|conn| VerdictRepo::new(conn).standings(node_id)))
 }
 
 /// Every current verdict on the node, own obligations and inherited alike, in
 /// the order they were recorded.
 pub fn current_verdicts(fleet: &FleetStore, node_id: Uuid) -> Vec<ObligationVerdict> {
-    let mut verdicts: Vec<ObligationVerdict> = fleet
-        .read(|conn| VerdictRepo::new(conn).latest_for_node(node_id))
-        .unwrap_or_default()
-        .into_values()
+    let mut verdicts: Vec<ObligationVerdict> = or_report(
+        node_id,
+        "the verdicts",
+        fleet.read(|conn| VerdictRepo::new(conn).latest_for_node(node_id)),
+    )
+    .into_values()
         .collect();
     verdicts.sort_by_key(|verdict| verdict.id);
     verdicts
