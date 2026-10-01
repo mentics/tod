@@ -1676,3 +1676,30 @@ fn a_visual_design_opening_carries_inherited_constraints_and_the_draft() {
     assert!(text.contains("mockup.html"), "{text}");
     assert!(text.contains("none linked yet"), "{text}");
 }
+
+#[test]
+fn a_rotation_followed_by_an_image_refusal_retry_marks_one_fresh_session() {
+    let fx = fixture();
+    let mut agent = FakeAgent::new(&fx.fleet);
+    let mut driver = ConversationDriver::new(
+        config(&fx, 1),
+        Focus::Node(fx.node),
+        ProtocolKind::VisualDesign,
+    );
+    say(&mut driver, &fx, &mut agent, "ask First?");
+    let id = driver.conversation_id().unwrap();
+    agent.refuse_images = true;
+    let image = tod_agent::PromptImage {
+        mime_type: "image/png".into(),
+        data: b"not really a png".to_vec(),
+    };
+    driver
+        .send_with_images(&fx.fleet, &mut agent, "ask Page feedback", vec![image])
+        .unwrap();
+    assert_eq!(driver.tick(&fx.fleet, &mut agent), [DONE]);
+    let rotations = turns(&fx, id)
+        .into_iter()
+        .filter(|(r, _)| *r == TurnRole::Rotation)
+        .count();
+    assert_eq!(rotations, 1);
+}
