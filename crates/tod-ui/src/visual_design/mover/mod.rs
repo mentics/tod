@@ -45,6 +45,13 @@ pub trait WindowMover: Send + Sync {
     fn find(&self, title_prefix: &str) -> Option<WindowHandle>;
     fn move_to(&self, window: &WindowHandle, rect: NativeRect) -> Result<(), MoverError>;
     fn focus(&self, window: &WindowHandle) -> Result<(), MoverError>;
+    /// Hide the window without closing it (fast; the page keeps running).
+    /// `find` still finds a hidden window.
+    fn hide(&self, window: &WindowHandle) -> Result<(), MoverError>;
+    /// Show a hidden (or minimised) window again, without moving it.
+    fn show(&self, window: &WindowHandle) -> Result<(), MoverError>;
+    /// Ask the window to close, as the user's close button would.
+    fn close(&self, window: &WindowHandle) -> Result<(), MoverError>;
 }
 
 /// The mover for this OS.
@@ -80,6 +87,15 @@ impl WindowMover for UnsupportedMover {
     fn focus(&self, _: &WindowHandle) -> Result<(), MoverError> {
         Err(MoverError::Unsupported("no window mover on this OS".into()))
     }
+    fn hide(&self, _: &WindowHandle) -> Result<(), MoverError> {
+        Err(MoverError::Unsupported("no window mover on this OS".into()))
+    }
+    fn show(&self, _: &WindowHandle) -> Result<(), MoverError> {
+        Err(MoverError::Unsupported("no window mover on this OS".into()))
+    }
+    fn close(&self, _: &WindowHandle) -> Result<(), MoverError> {
+        Err(MoverError::Unsupported("no window mover on this OS".into()))
+    }
 }
 
 /// Test double: holds one window, records moves and focuses.
@@ -93,6 +109,10 @@ struct FakeState {
     window: Option<WindowHandle>,
     moves: Vec<NativeRect>,
     focuses: usize,
+    hides: usize,
+    shows: usize,
+    closes: usize,
+    hidden: bool,
     error: Option<MoverError>,
 }
 
@@ -118,6 +138,18 @@ impl FakeMover {
     pub fn focus_count(&self) -> usize {
         self.state.lock().unwrap().focuses
     }
+    pub fn hide_count(&self) -> usize {
+        self.state.lock().unwrap().hides
+    }
+    pub fn show_count(&self) -> usize {
+        self.state.lock().unwrap().shows
+    }
+    pub fn close_count(&self) -> usize {
+        self.state.lock().unwrap().closes
+    }
+    pub fn is_hidden(&self) -> bool {
+        self.state.lock().unwrap().hidden
+    }
 }
 
 impl WindowMover for FakeMover {
@@ -142,6 +174,33 @@ impl WindowMover for FakeMover {
             return Err(e);
         }
         s.focuses += 1;
+        Ok(())
+    }
+    fn hide(&self, _: &WindowHandle) -> Result<(), MoverError> {
+        let mut s = self.state.lock().unwrap();
+        if let Some(e) = s.error.clone() {
+            return Err(e);
+        }
+        s.hides += 1;
+        s.hidden = true;
+        Ok(())
+    }
+    fn show(&self, _: &WindowHandle) -> Result<(), MoverError> {
+        let mut s = self.state.lock().unwrap();
+        if let Some(e) = s.error.clone() {
+            return Err(e);
+        }
+        s.shows += 1;
+        s.hidden = false;
+        Ok(())
+    }
+    fn close(&self, _: &WindowHandle) -> Result<(), MoverError> {
+        let mut s = self.state.lock().unwrap();
+        if let Some(e) = s.error.clone() {
+            return Err(e);
+        }
+        s.closes += 1;
+        s.window = None;
         Ok(())
     }
 }

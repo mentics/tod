@@ -90,8 +90,16 @@ fn register_app_lifecycle(cx: &mut gpui::App) {
             );
             #[cfg(feature = "agent-socket")]
             crate::agent_socket::shutdown();
+            crate::visual_design::launcher::shutdown_all();
             cx.quit();
         }
+    })
+    .detach();
+    // Any other way out (the control socket's quit, the OS) closes the design
+    // window too, so no browser is left behind.
+    cx.on_app_quit(|_| {
+        crate::visual_design::launcher::shutdown_all();
+        async {}
     })
     .detach();
 }

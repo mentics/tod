@@ -51,28 +51,82 @@ impl Dock {
     }
 }
 
+/// The browser process this launcher started.
+pub trait SpawnedChild: Send + Sync {
+    /// Kills the process (the fallback when the window will not close).
+    fn kill(&self);
+    fn exited(&self) -> bool;
+}
+
 /// Starts the browser process. Injectable for tests.
 pub trait Spawner: Send + Sync {
-    fn spawn(&self, exe: &Path, args: &[OsString]) -> std::io::Result<()>;
+    fn spawn(&self, exe: &Path, args: &[OsString]) -> std::io::Result<Box<dyn SpawnedChild>>;
 }
 
 pub struct ProcessSpawner;
 
+struct ProcessChild(Arc<Mutex<std::process::Child>>);
+
+impl SpawnedChild for ProcessChild {
+    fn kill(&self) {
+        let mut c = self.0.lock().unwrap();
+        // Chrome's other processes exit with the browser process.
+        let _ = c.kill();
+        let _ = c.wait();
+    }
+    fn exited(&self) -> bool {
+        !matches!(self.0.lock().unwrap().try_wait(), Ok(None))
+    }
+}
+
 impl Spawner for ProcessSpawner {
-    fn spawn(&self, exe: &Path, args: &[OsString]) -> std::io::Result<()> {
-        let mut child = std::process::Command::new(exe)
+    fn spawn(&self, exe: &Path, args: &[OsString]) -> std::io::Result<Box<dyn SpawnedChild>> {
+        let child = std::process::Command::new(exe)
             .args(args)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()?;
-        // Reap it when it exits; the window outlives this call.
+        let child = Arc::new(Mutex::new(child));
+        // Reap it when it exits (the window outlives this call).
+        let weak = Arc::downgrade(&child);
         std::thread::spawn(move || {
-            let _ = child.wait();
+            while let Some(c) = weak.upgrade() {
+                if !matches!(c.lock().unwrap().try_wait(), Ok(None)) {
+                    break;
+                }
+                drop(c);
+                std::thread::sleep(Duration::from_millis(500));
+            }
         });
-        Ok(())
+        Ok(Box::new(ProcessChild(child)))
     }
 }
+
+/// Launchers `system` made, so quitting the app can close every window.
+static ALL: Mutex<Vec<std::sync::Weak<Launcher>>> = Mutex::new(Vec::new());
+
+/// Closes the design window and its browser for every launcher. Call when
+/// the app quits.
+pub fn shutdown_all() {
+    let all: Vec<_> = ALL.lock().unwrap().drain(..).collect();
+    for l in all.iter().filter_map(|w| w.upgrade()) {
+        l.shutdown();
+    }
+}
+
+/// Registers a launcher for [`shutdown_all`].
+pub fn register(l: &Arc<Launcher>) {
+    let mut all = ALL.lock().unwrap();
+    all.retain(|w| w.strong_count() > 0);
+    all.push(Arc::downgrade(l));
+}
+
+/// How long a closed window gets to take its browser down before it is killed.
+#[cfg(not(test))]
+const CLOSE_WAIT: Duration = Duration::from_millis(2500);
+#[cfg(test)]
+const CLOSE_WAIT: Duration = Duration::from_millis(60);
 
 struct Live {
     url: String,
@@ -94,6 +148,17 @@ pub struct Launcher {
     /// Given to every server this launcher starts.
     feedback: Mutex<Option<super::server::FeedbackHandler>>,
     live: Mutex<Option<Live>>,
+    child: Mutex<Option<Box<dyn SpawnedChild>>>,
+    /// The window was hidden by [`Launcher::hide`] and not shown since.
+    hidden: Mutex<bool>,
+    /// Serialises hide and show, so a quick leave-and-return ends visible.
+    visibility: Mutex<()>,
+}
+
+impl Drop for Launcher {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
 }
 
 impl Launcher {
@@ -127,6 +192,9 @@ impl Launcher {
             server: Mutex::new(None),
             feedback: Mutex::new(None),
             live: Mutex::new(None),
+            child: Mutex::new(None),
+            hidden: Mutex::new(false),
+            visibility: Mutex::new(()),
         };
         (l, rx)
     }
@@ -179,6 +247,9 @@ impl Launcher {
     pub fn open_or_redock(&self, mockup: &Path, dock: &Dock) -> bool {
         if let Some((url, prefix)) = self.current() {
             if self.window_exists(&url, &prefix) {
+                if self.is_hidden() {
+                    self.set_hidden(false);
+                }
                 if let Some(s) = self.server.lock().unwrap().as_ref() {
                     s.set_path(&url, mockup);
                 }
@@ -304,14 +375,19 @@ impl Launcher {
         });
         let mut args = browser.launch_args(&url, &self.profile, placement);
         args.extend(browser.debug_args());
-        if let Err(e) = self.spawner.spawn(&exe, &args) {
+        let child = match self.spawner.spawn(&exe, &args) {
+            Ok(c) => c,
+            Err(e) => {
             self.end_session_for(&url);
             self.emit(LauncherEvent::Failed(format!(
                 "cannot start {}: {e}",
                 browser.id()
             )));
             return false;
-        }
+            }
+        };
+        *self.child.lock().unwrap() = Some(child);
+        *self.hidden.lock().unwrap() = false;
         let token = url
             .split("/d/")
             .nth(1)
@@ -372,14 +448,70 @@ impl Launcher {
         }
     }
 
-    /// Drops the session (the page is told to close) and frees the server.
+    /// Really closes the window (and its browser) and ends the session.
     pub fn close_window(&self) {
         self.end_session(true);
+    }
+
+    /// Hides the open window without closing it. False when there is none.
+    pub fn hide(&self) -> bool {
+        self.set_hidden(true)
+    }
+
+    /// Shows a window [`Launcher::hide`] hid. False when there is none.
+    pub fn show(&self) -> bool {
+        self.set_hidden(false)
+    }
+
+    pub fn is_hidden(&self) -> bool {
+        *self.hidden.lock().unwrap()
+    }
+
+    fn set_hidden(&self, hide: bool) -> bool {
+        let _serial = self.visibility.lock().unwrap();
+        let Some((_, prefix)) = self.current() else { return false };
+        let Some(handle) = self.mover.find(&prefix) else { return false };
+        let r = if hide { self.mover.hide(&handle) } else { self.mover.show(&handle) };
+        match r {
+            Ok(()) => {
+                *self.hidden.lock().unwrap() = hide;
+                true
+            }
+            Err(e) => {
+                self.report_mover(e);
+                false
+            }
+        }
+    }
+
+    /// Closes the window and the browser, silently. For quitting the app.
+    pub fn shutdown(&self) {
+        self.end_session(false);
+    }
+
+    /// Closes the window the way the user's close button would, then makes
+    /// sure the browser process is gone (kills it when it lingers).
+    fn close_browser(&self, prefix: &str) {
+        if let Some(handle) = self.mover.find(prefix) {
+            let _ = self.mover.close(&handle);
+        }
+        let child = self.child.lock().unwrap().take();
+        if let Some(child) = child {
+            let deadline = Instant::now() + CLOSE_WAIT;
+            while !child.exited() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            if !child.exited() {
+                child.kill();
+            }
+        }
+        *self.hidden.lock().unwrap() = false;
     }
 
     fn end_session(&self, announce: bool) {
         let Some(l) = self.live.lock().unwrap().take() else { return };
         self.end_session_for(&l.url);
+        self.close_browser(&l.title_prefix);
         if announce {
             self.emit(LauncherEvent::Closed);
         }
@@ -424,11 +556,20 @@ mod tests {
     }
 
     #[derive(Default)]
-    struct FakeSpawner(Mutex<Vec<Vec<OsString>>>);
+    struct FakeSpawner(Mutex<Vec<Vec<OsString>>>, Arc<std::sync::atomic::AtomicUsize>);
+    struct FakeChild(Arc<std::sync::atomic::AtomicUsize>);
+    impl SpawnedChild for FakeChild {
+        fn kill(&self) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        fn exited(&self) -> bool {
+            false
+        }
+    }
     impl Spawner for FakeSpawner {
-        fn spawn(&self, _: &Path, args: &[OsString]) -> std::io::Result<()> {
+        fn spawn(&self, _: &Path, args: &[OsString]) -> std::io::Result<Box<dyn SpawnedChild>> {
             self.0.lock().unwrap().push(args.to_vec());
-            Ok(())
+            Ok(Box::new(FakeChild(self.1.clone())))
         }
     }
 
@@ -551,9 +692,52 @@ mod tests {
         assert!(!l.has_server());
     }
 
+    #[test]
+    fn hide_and_show_use_the_mover_and_keep_the_session() {
+        let (l, rx, mover, spawner, m) = setup(Some("chrome"));
+        assert!(!l.hide(), "nothing to hide yet");
+        l.open_or_redock(&m, &dock());
+        drain(&rx);
+        assert!(!l.hide(), "window not found");
+        mover.open(&format!("{} - Chrome", l.current().unwrap().1));
+        assert!(l.hide());
+        assert!(mover.is_hidden() && l.is_hidden());
+        assert!(l.show());
+        assert!(!mover.is_hidden() && !l.is_hidden());
+        assert_eq!((mover.hide_count(), mover.show_count()), (1, 1));
+        assert_eq!(spawner.0.lock().unwrap().len(), 1, "no relaunch");
+        assert!(l.has_server());
+    }
+
+    #[test]
+    fn close_window_closes_the_window_and_kills_a_lingering_process() {
+        let (l, rx, mover, spawner, m) = setup(Some("chrome"));
+        l.open_or_redock(&m, &dock());
+        mover.open(&format!("{} - Chrome", l.current().unwrap().1));
+        drain(&rx);
+        l.close_window();
+        assert_eq!(mover.close_count(), 1);
+        assert_eq!(spawner.1.load(std::sync::atomic::Ordering::SeqCst), 1, "killed");
+        assert_eq!(drain(&rx), vec![LauncherEvent::Closed]);
+    }
+
+    #[test]
+    fn shutdown_closes_quietly_and_a_second_call_is_harmless() {
+        let (l, rx, mover, spawner, m) = setup(Some("chrome"));
+        l.open_or_redock(&m, &dock());
+        mover.open(&format!("{} - Chrome", l.current().unwrap().1));
+        drain(&rx);
+        l.shutdown();
+        l.shutdown();
+        assert_eq!(mover.close_count(), 1);
+        assert_eq!(spawner.1.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(drain(&rx).is_empty());
+        assert!(!l.has_server());
+    }
+
     /// Real Chrome and window mover. Run by hand:
     /// `cargo test -p tod-ui --lib launcher::tests::real_run -- --ignored --nocapture`.
-    /// Leaves its Chrome window open (profile in a temp dir); close it afterward.
+    /// Opens, hides, shows, then closes the window and checks nothing is left.
     #[test]
     #[ignore]
     fn real_run() {
@@ -574,5 +758,23 @@ mod tests {
         let ok = l.open_or_redock(&mockup, &d2);
         println!("redock {ok}: {:?}", drain(&rx));
         assert!(ok);
+        #[cfg(windows)]
+        {
+            use super::super::mover::windows::WindowsMover;
+            let prefix = l.current().unwrap().1;
+            let m = WindowsMover;
+            let h = m.find(&prefix).expect("found");
+            assert!(m.is_visible(&h), "visible after open");
+            assert!(l.hide());
+            std::thread::sleep(Duration::from_millis(300));
+            let h = m.find(&prefix).expect("hidden window still found by title");
+            assert!(!m.is_visible(&h), "hidden");
+            assert!(l.show());
+            std::thread::sleep(Duration::from_millis(300));
+            assert!(m.is_visible(&m.find(&prefix).unwrap()), "visible after show");
+            l.close_window();
+            std::thread::sleep(Duration::from_millis(500));
+            assert!(m.find(&prefix).is_none(), "window gone after close");
+        }
     }
 }

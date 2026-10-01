@@ -650,3 +650,10 @@ Run from `.local/agent/scratchpad/vd-spike/spike.py`: a local page, `chrome
   protocols spec); not part of this design but it gates the cleanup.
 - Resolved: feedback goes to the most recent `VisualDesign` conversation for the
   obligation, which is also the one that carries on after a session rotation.
+
+### 6.6 Lifecycle
+
+- The window is never opened proactively: Open (or starting a design) brings it up.
+- Leaving the visual-design conversation view (the shell switches view, or the conversation is not a design) **hides** the window (`WindowMover::hide`); returning **shows** it (`show`). Hiding is quick and the page keeps running; the window is not closed and relaunched. `find` still finds a hidden window.
+- **Close window** really closes it: `WindowMover::close` (WM_CLOSE on Windows), then the browser process is killed if it lingers, and the session ends.
+- When tod quits, `launcher::shutdown_all` (window-closed and app-quit hooks) closes every design window and browser process.
