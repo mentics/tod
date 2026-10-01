@@ -44,7 +44,28 @@ pub fn resolve_launch_cwd_with(
 ) -> Result<(Workdir, Vec<String>)> {
     let files = resolve_files(fleet, node_id)?;
     match files.directory() {
-        FilesDirectory::Ready(dir) => Ok((dir, Vec::new())),
+        FilesDirectory::Ready(dir) => {
+            // A submodule can lose the branch after the location was made (a
+            // base merge, `git submodule update`, a pull request's work that
+            // started elsewhere), so every launch puts it back. This is what a
+            // shell or editor opened on the node relies on.
+            let warnings = if files.per_node() {
+                let branch = files
+                    .branch()
+                    .map(str::to_string)
+                    .filter(|b| !b.is_empty())
+                    .or_else(|| worktree::current_branch(&dir));
+                match branch {
+                    Some(branch) => worktree::branch_submodules(&dir, &branch).unwrap_or_else(|err| {
+                        vec![format!("{err:#}")]
+                    }),
+                    None => Vec::new(),
+                }
+            } else {
+                Vec::new()
+            };
+            Ok((dir, warnings))
+        }
         FilesDirectory::Missing(reason) => bail!("{reason}"),
         FilesDirectory::NotMade => {
             let paths = TodPaths::discover()?;

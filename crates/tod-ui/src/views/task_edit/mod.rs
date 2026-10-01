@@ -856,6 +856,13 @@ impl TaskEditView {
             // still be removed.
             stops.push(TaskEditField::WorktreeAction);
         }
+        if !self.capability_enabled(Capability::Files)
+            && self.resolved_files.as_ref().is_some_and(|f| f.inherited)
+        {
+            // The branch is the node's own even when the recipe is inherited.
+            let at = stops.len() - usize::from(self.worktree_action().is_some());
+            stops.insert(at, TaskEditField::Branch);
+        }
         if self.capability_enabled(Capability::Ticket) {
             stops.extend([TaskEditField::LinearLink, TaskEditField::GithubPr]);
         }
@@ -1401,9 +1408,13 @@ impl TaskEditView {
             .filter(|files| !files.inherited)
     }
 
-    /// This node has a worktree or sandbox made for it from its own Files.
+    /// This node has a worktree or sandbox of its own, made from its own
+    /// Files or from an ancestor's (an inheriting node's location is still
+    /// its own).
     fn has_own_worktree(&self) -> bool {
-        self.own_files().is_some_and(|files| files.location.is_some())
+        self.resolved_files
+            .as_ref()
+            .is_some_and(|files| files.location.is_some())
     }
 
     /// The worktree or sandbox made for this node, current or stale: what
@@ -4236,9 +4247,27 @@ impl TaskEditView {
                         window,
                         cx,
                     ));
+                let branch_row = self.apply_focus_scroll_anchor(
+                    TaskEditField::Branch,
+                    v_flex()
+                        .id(field_anchor_id(TaskEditField::Branch))
+                        .gap_1()
+                        .px_3()
+                        .pb_2()
+                        .w(px(280.))
+                        .child(Self::render_field_label("Branch (this node's own)", cx))
+                        .child(self.render_nav_input(
+                            TaskEditField::Branch,
+                            self.branch_input.clone(),
+                            None,
+                            window,
+                            cx,
+                        )),
+                );
                 return Some(
                     v_flex()
                         .child(hint)
+                        .child(branch_row)
                         .when(self.worktree_action().is_some(), |el| {
                             el.child(h_flex().px_3().pb_2().child(self.render_remove_location(cx)))
                         })
