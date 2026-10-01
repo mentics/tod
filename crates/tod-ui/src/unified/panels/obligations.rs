@@ -47,6 +47,7 @@ pub struct ObligationsPanel {
     /// `PanelFocusSelected`, so a re-render only emits again when the
     /// selection actually changed.
     last_reported: Option<Uuid>,
+    _design_subscription: gpui::Subscription,
 }
 
 impl ObligationsPanel {
@@ -63,11 +64,39 @@ impl ObligationsPanel {
             view.open(node_id, &title, None, window, cx);
             view
         });
+        // The Design affordance opens the obligation's visual-design
+        // conversation in the conversation view (the shell handles
+        // `OpenConversation`), as the Tasks view and the conversation view's
+        // own side pane do.
+        let design_subscription = cx.subscribe_in(
+            &inner,
+            window,
+            |_, _, event: &crate::views::obligations::ObligationsEvent, window, cx| {
+                if let crate::views::obligations::ObligationsEvent::OpenVisualDesign {
+                    node_id,
+                    obligation_id,
+                } = event
+                {
+                    window.dispatch_action(
+                        Box::new(crate::ui::agent_chat::OpenConversation {
+                            focus: Focus::Obligation {
+                                node: *node_id,
+                                id: *obligation_id,
+                            },
+                            protocol: tod_store::conversation::ProtocolKind::VisualDesign,
+                            start: false,
+                        }),
+                        cx,
+                    );
+                }
+            },
+        );
         Self {
             fleet,
             node_id,
             inner,
             last_reported: None,
+            _design_subscription: design_subscription,
         }
     }
 

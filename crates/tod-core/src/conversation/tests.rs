@@ -37,6 +37,7 @@ struct FakeAgent {
     parts: HashMap<String, Vec<tod_agent::ReplyPart>>,
     /// Refuse to resume a recorded session (as after it expired).
     fail_resume: bool,
+    refuse_images: bool,
 }
 
 impl FakeAgent {
@@ -49,6 +50,7 @@ impl FakeAgent {
             chars: HashMap::new(),
             parts: HashMap::new(),
             fail_resume: false,
+            refuse_images: false,
         }
     }
 
@@ -71,6 +73,9 @@ impl AgentProvider for FakeAgent {
     }
 
     fn send_session_turn(&mut self, turn: SessionTurn) -> anyhow::Result<AgentRunHandle> {
+        if self.refuse_images && !turn.images.is_empty() {
+            anyhow::bail!("this agent does not accept images; send the message without them");
+        }
         let id = RunId::new();
         let state = if self.fail_resume
             && turn.resume_session_id.is_some()
@@ -714,6 +719,69 @@ fn attached_images_are_kept_with_the_turn_and_sent_again_after_a_failed_resume()
     };
     assert_eq!(attachment.mime_type, "image/png");
     assert_eq!(attachment.read(fx.fleet.paths().root()).unwrap(), image.data);
+}
+
+#[test]
+fn an_agent_that_refuses_images_still_gets_the_message_with_one_user_turn() {
+    let fx = fixture();
+    let mut agent = FakeAgent::new(&fx.fleet);
+    agent.refuse_images = true;
+    let mut driver = ConversationDriver::new(
+        config(&fx, 100_000),
+        Focus::Node(fx.node),
+        ProtocolKind::VisualDesign,
+    );
+    let image = tod_agent::PromptImage {
+        mime_type: "image/png".into(),
+        data: b"not really a png".to_vec(),
+    };
+    driver
+        .send_with_images(&fx.fleet, &mut agent, "ask Is this the card?", vec![image])
+        .unwrap();
+    assert_eq!(driver.tick(&fx.fleet, &mut agent), [DONE]);
+    let id = driver.conversation_id().unwrap();
+    let roles: Vec<TurnRole> = turns(&fx, id).into_iter().map(|(r, _)| r).collect();
+    assert_eq!(roles, [TurnRole::User, TurnRole::Agent], "no duplicate, no error turn");
+    assert_eq!(turns(&fx, id)[0].1, "ask Is this the card?");
+    assert_eq!(agent.turns.len(), 1);
+    assert!(agent.last().images.is_empty());
+    assert!(
+        agent.last().message.contains("does not accept images"),
+        "{}",
+        agent.last().message
+    );
+}
+
+#[test]
+fn a_rotation_keeps_the_conversation_a_later_image_turn_goes_to() {
+    let fx = fixture();
+    let mut agent = FakeAgent::new(&fx.fleet);
+    // Any opening already exceeds this budget.
+    let mut driver = ConversationDriver::new(
+        config(&fx, 1),
+        Focus::Node(fx.node),
+        ProtocolKind::VisualDesign,
+    );
+    say(&mut driver, &fx, &mut agent, "ask First?");
+    let id = driver.conversation_id().unwrap();
+    let image = tod_agent::PromptImage {
+        mime_type: "image/png".into(),
+        data: b"not really a png".to_vec(),
+    };
+    driver
+        .send_with_images(&fx.fleet, &mut agent, "ask Page feedback", vec![image.clone()])
+        .unwrap();
+    assert_eq!(driver.tick(&fx.fleet, &mut agent), [DONE]);
+    assert_eq!(driver.conversation_id(), Some(id), "same conversation after rotating");
+    let roles: Vec<TurnRole> = turns(&fx, id).into_iter().map(|(r, _)| r).collect();
+    assert!(roles.contains(&TurnRole::Rotation), "{roles:?}");
+    assert_eq!(agent.last().images, [image]);
+    let stored = fx
+        .fleet
+        .read(|conn| ConversationRepo::new(conn).get(id))
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.protocol, ProtocolKind::VisualDesign);
 }
 
 #[test]

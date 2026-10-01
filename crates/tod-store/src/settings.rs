@@ -36,6 +36,15 @@ fn default_journey_storage_cap_mb() -> u64 {
     DEFAULT_JOURNEY_STORAGE_CAP_MB
 }
 
+/// The visual-design window (`doc/ui/visual-design-browser.md`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VisualDesignSettings {
+    /// Path of the browser to open the design window in, replacing discovery
+    /// (`visual_design.browser`). Edited in `tod.yml`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub browser: Option<String>,
+}
+
 fn default_independent_evaluation() -> bool {
     true
 }
@@ -549,6 +558,9 @@ pub struct TodSettings {
     /// How lifecycle phases are judged done.
     #[serde(default)]
     pub lifecycle: LifecycleSettings,
+    /// The visual-design window.
+    #[serde(default)]
+    pub visual_design: VisualDesignSettings,
     /// What makes a pull request ready, and how the babysitter gets it there.
     #[serde(default)]
     pub pr_readiness: PrReadinessSettings,
@@ -583,6 +595,7 @@ impl Default for TodSettings {
             window_geometry: None,
             journeys: JourneySettings::default(),
             lifecycle: LifecycleSettings::default(),
+            visual_design: VisualDesignSettings::default(),
             pr_readiness: PrReadinessSettings::default(),
             sandbox_idle: SandboxIdleSettings::default(),
         }
@@ -942,6 +955,9 @@ mod tests {
             journeys: JourneySettings::default(),
             lifecycle: LifecycleSettings {
                 independent_evaluation: false,
+            },
+            visual_design: VisualDesignSettings {
+                browser: Some("C:/chrome/chrome.exe".into()),
             },
             pr_readiness: PrReadinessSettings {
                 bots: vec![PrReviewBotSettings {

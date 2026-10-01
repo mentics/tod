@@ -80,7 +80,13 @@ impl Designer {
         if let Some(l) = &self.launcher {
             return l.clone();
         }
-        let (launcher, events) = Launcher::system(data_root, None);
+        // `visual_design.browser` in tod.yml overrides browser discovery.
+        let browser = crate::interview::TodSettings::load(&crate::interview::TodPaths::at(data_root))
+            .ok()
+            .and_then(|s| s.visual_design.browser)
+            .filter(|b| !b.trim().is_empty())
+            .map(PathBuf::from);
+        let (launcher, events) = Launcher::system(data_root, browser);
         let launcher = Arc::new(launcher);
         crate::visual_design::launcher::register(&launcher);
         // Detects a window the user closed; ends with the launcher.
