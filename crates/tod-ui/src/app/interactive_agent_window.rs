@@ -20,7 +20,7 @@ use gpui_component::Root;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use tod_agent::{SharedEngagementRegistry, shared_engagement_registry};
+use tod_agent::SharedEngagementRegistry;
 use tod_store::fleet::FleetStore;
 use tod_store::fleet::terminal::open_terminal_agent_for_node;
 use tod_store::fleet::writer::FleetMutation;
@@ -83,14 +83,14 @@ pub struct InteractiveAgentWindowControl {
 }
 
 impl InteractiveAgentWindowControl {
-    pub fn new() -> Self {
+    pub fn new(engagement: SharedEngagementRegistry) -> Self {
         Self {
             handles: Arc::new(Mutex::new(HashMap::new())),
             fleet: Arc::new(Mutex::new(None)),
             agent: Arc::new(Mutex::new(None)),
             paths: Arc::new(Mutex::new(None)),
             settings: Arc::new(Mutex::new(None)),
-            engagement: shared_engagement_registry(),
+            engagement,
         }
     }
 

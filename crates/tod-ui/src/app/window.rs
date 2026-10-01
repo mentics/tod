@@ -148,6 +148,7 @@ pub struct Shell {
     traffic_log: SharedAgentTrafficLog,
     transcript_window: TranscriptWindowControl,
     _interactive_agent_window: InteractiveAgentWindowControl,
+    engagement: tod_agent::SharedEngagementRegistry,
     history_window: HistoryWindowControl,
     agent_status_text: SharedString,
     paths: TodPaths,
@@ -516,7 +517,7 @@ impl Shell {
 
     fn compute_status_groups(&self) -> AgentStatusGroups {
         let mut groups = AgentStatusGroups::default();
-        if let Ok(registry) = self._interactive_agent_window.engagement().lock() {
+        if let Ok(registry) = self.engagement.lock() {
             groups.fleet.total = registry.len() as u32;
             groups.fleet.processing = registry
                 .values()
@@ -1945,7 +1946,8 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
     };
 
     let transcript_window = TranscriptWindowControl::new();
-    let interactive_agent_window = InteractiveAgentWindowControl::new();
+    let engagement = tod_agent::shared_engagement_registry();
+    let interactive_agent_window = InteractiveAgentWindowControl::new(engagement.clone());
     let history_window = HistoryWindowControl::new();
     #[cfg(feature = "agent-socket")]
     let transcript_for_socket = transcript_window.clone();
@@ -2132,7 +2134,7 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                 cx,
                                 fleet.clone(),
                                 agent.clone(),
-                                interactive_agent_window.clone(),
+                                engagement.clone(),
                             )
                         });
                         let agent_for_sessions = agent.clone();
@@ -2537,6 +2539,7 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                 traffic_log: traffic_log.clone(),
                                 transcript_window: transcript_window.clone(),
                                 _interactive_agent_window: interactive_agent_window.clone(),
+                                engagement: engagement.clone(),
                                 history_window: history_window.clone(),
                                 agent_status_text,
                                 paths: paths.clone(),
