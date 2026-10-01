@@ -196,6 +196,14 @@ mod tests {
                 repo: Some(repo.display().to_string()),
             })
             .unwrap();
+        // A Files node gets its own worktree by default, which is not made
+        // here; this checks the workspace directory being ready.
+        store
+            .enqueue(FleetMutation::SetNodeUseWorktree {
+                node_id: node.to_string(),
+                use_worktree: false,
+            })
+            .unwrap();
         store.writer().flush().unwrap();
         let ready = read();
         assert_ne!(ready, enabled);

@@ -427,6 +427,15 @@ mod tests {
                 repo: Some(repo.display().to_string()),
             })
             .unwrap();
+        // A Files node gets its own worktree by default, which is not made
+        // here; the test counts changes in the workspace directory itself.
+        fixture
+            .store
+            .enqueue(FleetMutation::SetNodeUseWorktree {
+                node_id: node.to_string(),
+                use_worktree: false,
+            })
+            .unwrap();
         fixture.store.writer().flush().unwrap();
         // What the app's store watcher does after a commit: the change is
         // announced. The writer commits on its own thread, so this repeats

@@ -39,9 +39,8 @@ tod-cli visual-design save --obligation <obligation-id> --html-file <path-to-htm
 ```
 
 using the obligation id from your context. This writes the file under the data root and links it from that
-obligation (replacing whatever mockup was linked there before) — the
-`design-planning.visual-packages-accepted-or-waived` gate criterion is satisfied by at least one design-phase
-obligation carrying a linked mockup (or by an explicit waiver noted in interview memory).
+obligation (replacing whatever mockup was linked there before). No gate reads the mockup: gates are app checks,
+and the design phase agent reads the linked mockup when it certifies the phase.
 
 Do not write mockup files directly to the data root or invent a storage path yourself — always go through
 `tod-cli visual-design save`, the same way obligations are only ever written through `tod-cli obligations`.
