@@ -9,6 +9,7 @@ mod from_ticket;
 use from_ticket::PendingTicketImport;
 pub(crate) use tod_core::task::model;
 mod row_menu;
+mod writes;
 pub(crate) use tod_core::task::working_set;
 
 pub use model::SortKey;
@@ -349,6 +350,10 @@ pub struct TaskListView {
     status_line: String,
     config_dir: PathBuf,
     fleet: Arc<FleetStore>,
+    /// Serial worker the outline writes run on, off the UI thread.
+    writes: writes::WriteQueue,
+    /// Nodes whose creation is committing: shown (titled) until it lands.
+    creating: Vec<(edit::DraftRow, String)>,
     active_list_id: Option<uuid::Uuid>,
     outline_lists: Vec<tod_store::outline::types::OutlineList>,
     app_nav: AppNavMenu,
@@ -490,6 +495,8 @@ impl TaskListView {
         });
 
         let view = Self {
+            writes: writes::WriteQueue::new(),
+            creating: Vec::new(),
             all_tasks,
             working_set,
             search_query: String::new(),
@@ -789,12 +796,15 @@ impl TaskListView {
                 let Ok(node_id) = uuid::Uuid::parse_str(&task_id) else {
                     return;
                 };
-                let _ = self.fleet.enqueue_outline(OutlineMutation::MoveObligation {
-                    obligation_id,
-                    target_node_id: node_id,
-                });
-                let _ = self.fleet.writer().flush();
-                self.live_refresh(window, cx);
+                self.write_outline(
+                    OutlineMutation::MoveObligation {
+                        obligation_id,
+                        target_node_id: node_id,
+                    },
+                    window,
+                    cx,
+                    |this, _result, window, cx| this.live_refresh(window, cx),
+                );
             }
             RowAction::RefreshGenerator { task_id } => {
                 self.refresh_generator_for(&task_id, window, cx);
@@ -1123,11 +1133,12 @@ impl TaskListView {
         if task.collapsed == collapsed {
             return;
         }
-        let _ = self
-            .fleet
-            .enqueue_outline(OutlineMutation::SetNodeCollapsed { node_id, collapsed });
-        let _ = self.fleet.writer().flush();
-        self.live_refresh(window, cx);
+        self.write_outline(
+            OutlineMutation::SetNodeCollapsed { node_id, collapsed },
+            window,
+            cx,
+            |this, _result, window, cx| this.live_refresh(window, cx),
+        );
     }
 
     fn toggle_collapsed(&mut self, task_id: &str, window: &mut Window, cx: &mut Context<Self>) {
@@ -1169,31 +1180,33 @@ impl TaskListView {
         let n = self.outline_lists.len() + 1;
         let slug = format!("list-{n}");
         let title = format!("List {n}");
-        if self
-            .fleet
-            .enqueue_outline(OutlineMutation::CreateList {
+        self.write_outline(
+            OutlineMutation::CreateList {
                 slug: slug.clone(),
                 title: title.clone(),
-            })
-            .is_err()
-        {
-            self.show_error("Failed to create list", window, cx);
-            return;
-        }
-        let _ = self.fleet.writer().flush();
-        let _ = self.fleet.reload_if_stale();
-        self.reload_outline_lists();
-        let Some(new_id) = self
-            .outline_lists
-            .iter()
-            .find(|l| l.slug == slug)
-            .map(|l| l.id)
-        else {
-            self.show_error("List created but not found", window, cx);
-            return;
-        };
-        self.switch_active_list(new_id, window, cx);
-        self.set_status_line(format!("Created {title}"), cx);
+            },
+            window,
+            cx,
+            move |this, result, window, cx| {
+                if result.is_err() {
+                    this.show_error("Failed to create list", window, cx);
+                    return;
+                }
+                let _ = this.fleet.reload_if_stale();
+                this.reload_outline_lists();
+                let Some(new_id) = this
+                    .outline_lists
+                    .iter()
+                    .find(|l| l.slug == slug)
+                    .map(|l| l.id)
+                else {
+                    this.show_error("List created but not found", window, cx);
+                    return;
+                };
+                this.switch_active_list(new_id, window, cx);
+                this.set_status_line(format!("Created {title}"), cx);
+            },
+        );
     }
 
     fn switch_active_list(
@@ -1716,14 +1729,16 @@ impl TaskListView {
             self.show_delete_error("invalid node id", window, cx);
             return;
         };
-        if let Err(err) = self
-            .fleet
-            .enqueue_outline(OutlineMutation::DeleteNode { node_id })
-        {
-            self.show_delete_error(err, window, cx);
-            return;
-        }
-        self.finish_node_removal(task_id, window, cx);
+        let task_id = task_id.to_string();
+        self.write_outline(
+            OutlineMutation::DeleteNode { node_id },
+            window,
+            cx,
+            move |this, result, window, cx| match result {
+                Ok(()) => this.finish_node_removal(&task_id, window, cx),
+                Err(err) => this.show_delete_error(err, window, cx),
+            },
+        );
     }
 
     fn show_delete_error(
@@ -1747,10 +1762,6 @@ impl TaskListView {
     }
 
     fn finish_node_removal(&mut self, task_id: &str, window: &mut Window, cx: &mut Context<Self>) {
-        if let Err(err) = self.fleet.writer().flush() {
-            self.show_delete_error(err, window, cx);
-            return;
-        }
         let _ = self.fleet.reload_if_stale();
 
         let visible_before =
@@ -1786,6 +1797,16 @@ impl TaskListView {
         if let Some(draft) = &self.draft {
             if Some(draft.list_id) == self.active_list_id {
                 edit::insert_draft_row(&mut tasks, draft);
+            }
+        }
+        for (pending, title) in &self.creating {
+            if Some(pending.list_id) == self.active_list_id
+                && !tasks.iter().any(|t| t.id == pending.id.to_string())
+            {
+                edit::insert_draft_row(&mut tasks, pending);
+                if let Some(row) = tasks.iter_mut().find(|t| t.id == pending.id.to_string()) {
+                    row.title = title.clone();
+                }
             }
         }
         Self::apply_attention_map(&mut tasks, &self.attention);
@@ -1836,6 +1857,7 @@ impl TaskListView {
         // A draft row lives only in memory, and the active list may have moved
         // on while the read was in flight; neither is this path's to reconcile.
         if self.draft.is_some()
+            || !self.creating.is_empty()
             || self.active_list_id != loaded_for
             || snapshot.lists != self.outline_lists
         {
@@ -2043,19 +2065,19 @@ impl TaskListView {
         let Ok(node_id) = uuid::Uuid::parse_str(&task_id) else {
             return;
         };
-        if let Err(err) = self
-            .fleet
-            .enqueue_outline(OutlineMutation::ReorderSibling { node_id, direction })
-        {
-            self.show_error(format!("Failed to move item: {err}"), window, cx);
-            return;
-        }
-        if let Err(err) = self.fleet.writer().flush() {
-            self.show_error(format!("Failed to move item: {err}"), window, cx);
-            return;
-        }
-        self.live_refresh(window, cx);
-        self.select_task_by_id(&task_id, window, cx);
+        self.write_outline(
+            OutlineMutation::ReorderSibling { node_id, direction },
+            window,
+            cx,
+            move |this, result, window, cx| {
+                if let Err(err) = result {
+                    this.show_error(format!("Failed to move item: {err}"), window, cx);
+                    return;
+                }
+                this.live_refresh(window, cx);
+                this.select_task_by_id(&task_id, window, cx);
+            },
+        );
     }
 
     fn on_new_list(&mut self, _: &TaskListNewList, window: &mut Window, cx: &mut Context<Self>) {
@@ -2295,23 +2317,23 @@ impl TaskListView {
             return;
         }
         let parent_id = uuid::Uuid::parse_str(&task.id).ok();
-        if let Err(err) = self
-            .fleet
-            .enqueue_outline(OutlineMutation::PasteManagedNodeCopy {
+        self.write_outline(
+            OutlineMutation::PasteManagedNodeCopy {
                 source_node_id,
                 list_id,
                 parent_id,
                 ordinal: 0,
-            })
-        {
-            self.show_error(format!("Paste failed: {err}"), window, cx);
-            return;
-        }
-        if let Err(err) = self.fleet.writer().flush() {
-            self.show_error(format!("Paste failed: {err}"), window, cx);
-            return;
-        }
-        self.live_refresh(window, cx);
+            },
+            window,
+            cx,
+            |this, result, window, cx| {
+                if let Err(err) = result {
+                    this.show_error(format!("Paste failed: {err}"), window, cx);
+                    return;
+                }
+                this.live_refresh(window, cx);
+            },
+        );
     }
 
     fn on_tag_digit(&mut self, digit: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -2695,13 +2717,16 @@ impl TaskListView {
                 (grandparent, ord)
             }
         };
-        let _ = self.fleet.enqueue_outline(OutlineMutation::ReparentNode {
-            node_id,
-            parent_id: new_parent,
-            ordinal,
-        });
-        let _ = self.fleet.writer().flush();
-        self.live_refresh(window, cx);
+        self.write_outline(
+            OutlineMutation::ReparentNode {
+                node_id,
+                parent_id: new_parent,
+                ordinal,
+            },
+            window,
+            cx,
+            |this, _result, window, cx| this.live_refresh(window, cx),
+        );
     }
 
     fn on_row_edit(&mut self, _: &TaskListRowEdit, window: &mut Window, cx: &mut Context<Self>) {
@@ -2978,19 +3003,22 @@ impl TaskListView {
             },
         );
         let new_node_id = uuid::Uuid::new_v4();
-        if let Err(err) = self.fleet.enqueue_outline(OutlineMutation::AcceptGeneratedTicket {
-            source_node_id,
-            new_node_id,
-        }) {
-            self.show_error(format!("Accept failed: {err}"), window, cx);
-            return;
-        }
-        if let Err(err) = self.fleet.writer().flush() {
-            self.show_error(format!("Accept failed: {err}"), window, cx);
-            return;
-        }
-        self.live_refresh(window, cx);
-        self.select_created_task(&new_node_id.to_string(), window, cx);
+        self.write_outline(
+            OutlineMutation::AcceptGeneratedTicket {
+                source_node_id,
+                new_node_id,
+            },
+            window,
+            cx,
+            move |this, result, window, cx| {
+                if let Err(err) = result {
+                    this.show_error(format!("Accept failed: {err}"), window, cx);
+                    return;
+                }
+                this.live_refresh(window, cx);
+                this.select_created_task(&new_node_id.to_string(), window, cx);
+            },
+        );
     }
 
     /// The nodes "Check incoming changes" acts on: the marked rows, else

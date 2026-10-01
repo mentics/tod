@@ -81,23 +81,24 @@ impl TaskListView {
         let Ok(node_id) = Uuid::parse_str(&id) else {
             return;
         };
-        if let Err(err) = self
-            .fleet
-            .enqueue_outline(OutlineMutation::EnableCapabilities {
+        let title = title.to_string();
+        self.write_outline(
+            OutlineMutation::EnableCapabilities {
                 node_id,
                 capabilities: vec![Capability::Spec, Capability::Lifecycle],
-            })
-        {
-            self.show_error(format!("Failed to create task: {err}"), window, cx);
-            return;
-        }
-        if let Err(err) = self.fleet.writer().flush() {
-            self.show_error(format!("Failed to create task: {err}"), window, cx);
-            return;
-        }
-        self.live_refresh(window, cx);
-        self.select_created_task(&id, window, cx);
-        self.status_line = format!("Created task: {title}");
+            },
+            window,
+            cx,
+            move |this, result, window, cx| {
+                if let Err(err) = result {
+                    this.show_error(format!("Failed to create task: {err}"), window, cx);
+                    return;
+                }
+                this.live_refresh(window, cx);
+                this.select_created_task(&id, window, cx);
+                this.status_line = format!("Created task: {title}");
+            },
+        );
     }
 
     pub(super) fn apply_pending_ticket_import(

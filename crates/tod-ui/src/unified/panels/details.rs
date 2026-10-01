@@ -329,18 +329,34 @@ impl DetailsPanel {
             self.drafts.remove(&self.node_id);
             return;
         }
-        if self
-            .fleet
-            .enqueue_outline(OutlineMutation::SetExtraContent {
-                node_id: self.node_id,
-                content_type: EXTRA_CONTENT_DETAILS.to_string(),
-                body: value.clone(),
-            })
-            .is_ok()
-        {
-            self.loaded.details = value;
-            self.drafts.remove(&self.node_id);
-        }
+        let node_id = self.node_id;
+        let previous = std::mem::replace(&mut self.loaded.details, value.clone());
+        let draft = self.drafts.remove(&node_id);
+        let fleet = self.fleet.clone();
+        crate::ui::off_thread::off_thread(
+            cx,
+            move || {
+                fleet
+                    .enqueue_outline(OutlineMutation::SetExtraContent {
+                        node_id,
+                        content_type: EXTRA_CONTENT_DETAILS.to_string(),
+                        body: value,
+                    })
+                    .is_ok()
+            },
+            move |this, saved, cx| {
+                if !saved {
+                    // Not stored: show the stored text again, and keep the draft.
+                    if this.node_id == node_id {
+                        this.loaded.details = previous;
+                    }
+                    if let Some(draft) = draft {
+                        this.drafts.insert(node_id, draft);
+                    }
+                    cx.notify();
+                }
+            },
+        );
     }
 
     fn open(&self, target: PanelKind, cx: &mut Context<Self>) {
@@ -974,6 +990,8 @@ mod tests {
             assert_eq!(view.loaded.details, draft_text);
             assert!(!view.has_draft());
         });
+        // The write runs off the UI thread.
+        cx.run_until_parked();
         let stored = fixture
             .store
             .get_extra_content(fixture.node_id, EXTRA_CONTENT_DETAILS)

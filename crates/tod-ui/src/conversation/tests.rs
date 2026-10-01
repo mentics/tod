@@ -2092,6 +2092,8 @@ fn the_gate_check_waive_and_advance_run_from_the_conversation(cx: &mut TestAppCo
             )
         });
     }
+    cx.executor().allow_parking();
+    cx.run_until_parked();
     draw(cx);
     assert_eq!(
         lifecycle_labels(&view, cx),
@@ -2099,6 +2101,8 @@ fn the_gate_check_waive_and_advance_run_from_the_conversation(cx: &mut TestAppCo
     );
 
     press_lifecycle(&view, "Advance to active", cx);
+    cx.executor().allow_parking();
+    cx.run_until_parked();
     let lifecycle = fixture
         .store
         .get_node(&fixture.node_id.to_string())

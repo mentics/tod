@@ -860,6 +860,33 @@ impl ObligationsView {
         self.rebuild_visible(window, cx);
     }
 
+    /// Write `mutations` to the store in the background (never on the UI
+    /// thread), then run `done` with the outcome on the view.
+    fn write_then(
+        &self,
+        mutations: Vec<OutlineMutation>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        done: impl FnOnce(&mut Self, Result<(), String>, &mut Window, &mut Context<Self>) + 'static,
+    ) {
+        let fleet = self.fleet.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    for mutation in mutations {
+                        fleet
+                            .enqueue_outline(mutation)
+                            .map_err(|err| format!("{err}"))?;
+                    }
+                    fleet.writer().flush().map_err(|err| format!("{err}"))
+                })
+                .await;
+            let _ = this.update_in(cx, |this, window, cx| done(this, result, window, cx));
+        })
+        .detach();
+    }
+
     fn abandon_inline_edit(
         &mut self,
         window: &mut Window,
@@ -874,14 +901,17 @@ impl ObligationsView {
 
         if is_draft && (force_delete_draft || body.is_empty()) {
             self.clear_inline_edit_state(window, cx);
-            let _ = self
-                .fleet
-                .enqueue_outline(OutlineMutation::DeleteObligation {
+            self.write_then(
+                vec![OutlineMutation::DeleteObligation {
                     obligation_id: editing_id,
-                });
-            let _ = self.fleet.writer().flush();
-            self.reload(window, cx);
-            self.focus_list(window, cx);
+                }],
+                window,
+                cx,
+                |this, _result, window, cx| {
+                    this.reload(window, cx);
+                    this.focus_list(window, cx);
+                },
+            );
             return;
         }
 
@@ -908,14 +938,17 @@ impl ObligationsView {
         if body.is_empty() {
             if self.is_draft_edit() {
                 self.clear_inline_edit_state(window, cx);
-                let _ = self
-                    .fleet
-                    .enqueue_outline(OutlineMutation::DeleteObligation {
+                self.write_then(
+                    vec![OutlineMutation::DeleteObligation {
                         obligation_id: editing_id,
-                    });
-                let _ = self.fleet.writer().flush();
-                self.reload(window, cx);
-                self.focus_list(window, cx);
+                    }],
+                    window,
+                    cx,
+                    |this, _result, window, cx| {
+                        this.reload(window, cx);
+                        this.focus_list(window, cx);
+                    },
+                );
                 return true;
             }
             crate::ui::toast::error_toast(window, cx, "Obligation cannot be empty");
@@ -924,28 +957,30 @@ impl ObligationsView {
             });
             return false;
         }
-        if let Err(err) = self
-            .fleet
-            .enqueue_outline(OutlineMutation::UpdateObligationBody {
-                obligation_id: editing_id,
-                body: body.clone(),
-            })
-        {
-            crate::ui::toast::error_toast(window, cx, format!("Save failed: {err}"));
-            return false;
-        }
-        if let Err(err) = self.fleet.writer().flush() {
-            crate::ui::toast::error_toast(window, cx, format!("Save failed: {err}"));
-            return false;
-        }
+        // Shown as saved at once; the store is written in the background and
+        // the list is reloaded from it when that is done.
         if let Some(item) = self.items.iter_mut().find(|o| o.id == editing_id) {
-            item.body = body;
+            item.body = body.clone();
         }
         self.draft_id = None;
         self.clear_inline_edit_state(window, cx);
         self.list.set_cursor_key(Some(editing_id.to_string()));
-        self.reload(window, cx);
+        self.rebuild_visible(window, cx);
         self.focus_list(window, cx);
+        self.write_then(
+            vec![OutlineMutation::UpdateObligationBody {
+                obligation_id: editing_id,
+                body,
+            }],
+            window,
+            cx,
+            |this, result, window, cx| {
+                if let Err(err) = result {
+                    crate::ui::toast::error_toast(window, cx, format!("Save failed: {err}"));
+                }
+                this.reload(window, cx);
+            },
+        );
         true
     }
 
@@ -1045,9 +1080,12 @@ impl ObligationsView {
                 return false;
             };
             let obligation_id = Uuid::new_v4();
-            if let Err(err) = self
-                .fleet
-                .enqueue_outline(OutlineMutation::CreateObligation {
+            self.new_section_kind = None;
+            self.section_edit_input.update(cx, |input, cx| {
+                input.set_value("", window, cx);
+            });
+            self.write_then(
+                vec![OutlineMutation::CreateObligation {
                     obligation_id: Some(obligation_id),
                     node_id,
                     kind: kind.to_string(),
@@ -1056,22 +1094,19 @@ impl ObligationsView {
                     section: Some(new_name),
                     body: String::new(),
                     phase,
-                })
-            {
-                crate::ui::toast::error_toast(window, cx, format!("Create failed: {err}"));
-                return false;
-            }
-            if let Err(err) = self.fleet.writer().flush() {
-                crate::ui::toast::error_toast(window, cx, format!("Create failed: {err}"));
-                return false;
-            }
-            self.new_section_kind = None;
-            self.section_edit_input.update(cx, |input, cx| {
-                input.set_value("", window, cx);
-            });
-            self.draft_id = Some(obligation_id);
-            self.reload(window, cx);
-            self.start_inline_edit(obligation_id, window, cx);
+                }],
+                window,
+                cx,
+                move |this, result, window, cx| {
+                    if let Err(err) = result {
+                        crate::ui::toast::error_toast(window, cx, format!("Create failed: {err}"));
+                        return;
+                    }
+                    this.draft_id = Some(obligation_id);
+                    this.reload(window, cx);
+                    this.start_inline_edit(obligation_id, window, cx);
+                },
+            );
             return true;
         }
 
@@ -1100,22 +1135,22 @@ impl ObligationsView {
         // Renaming a section spans every obligation in `node_id`/`kind` with
         // that name, regardless of phase — sections are user-defined labels,
         // not phase-scoped, so this intentionally isn't filtered by phase.
-        if let Err(err) = self
-            .fleet
-            .enqueue_outline(OutlineMutation::RenameObligationSection {
+        self.write_then(
+            vec![OutlineMutation::RenameObligationSection {
                 node_id,
                 kind: kind.to_string(),
                 old_section: old_section_opt,
                 new_section: new_name.clone(),
-            })
-        {
-            crate::ui::toast::error_toast(window, cx, format!("Rename failed: {err}"));
-            return false;
-        }
-        if let Err(err) = self.fleet.writer().flush() {
-            crate::ui::toast::error_toast(window, cx, format!("Rename failed: {err}"));
-            return false;
-        }
+            }],
+            window,
+            cx,
+            |this, result, window, cx| {
+                if let Err(err) = result {
+                    crate::ui::toast::error_toast(window, cx, format!("Rename failed: {err}"));
+                }
+                this.reload(window, cx);
+            },
+        );
         self.list.rekey_collapsed(
             &section_row_key(&phase, kind, &old_section),
             section_row_key(&phase, kind, &new_name),
@@ -1126,7 +1161,6 @@ impl ObligationsView {
         });
         self.list
             .set_cursor_key(Some(section_row_key(&phase, kind, &new_name)));
-        self.reload(window, cx);
         self.focus_list(window, cx);
         true
     }
@@ -1156,9 +1190,8 @@ impl ObligationsView {
         self.list
             .set_collapsed(section_row_key(phase, kind, NO_SECTION), false);
         let obligation_id = Uuid::new_v4();
-        if let Err(err) = self
-            .fleet
-            .enqueue_outline(OutlineMutation::CreateObligation {
+        self.write_then(
+            vec![OutlineMutation::CreateObligation {
                 obligation_id: Some(obligation_id),
                 node_id,
                 kind: kind.to_string(),
@@ -1167,18 +1200,19 @@ impl ObligationsView {
                 section: None,
                 body: String::new(),
                 phase: phase.to_string(),
-            })
-        {
-            crate::ui::toast::error_toast(window, cx, format!("Create failed: {err}"));
-            return;
-        }
-        if let Err(err) = self.fleet.writer().flush() {
-            crate::ui::toast::error_toast(window, cx, format!("Create failed: {err}"));
-            return;
-        }
-        self.draft_id = Some(obligation_id);
-        self.reload(window, cx);
-        self.start_inline_edit(obligation_id, window, cx);
+            }],
+            window,
+            cx,
+            move |this, result, window, cx| {
+                if let Err(err) = result {
+                    crate::ui::toast::error_toast(window, cx, format!("Create failed: {err}"));
+                    return;
+                }
+                this.draft_id = Some(obligation_id);
+                this.reload(window, cx);
+                this.start_inline_edit(obligation_id, window, cx);
+            },
+        );
     }
 
     fn create_relative(&mut self, before: bool, window: &mut Window, cx: &mut Context<Self>) {
@@ -1296,20 +1330,19 @@ impl ObligationsView {
             return;
         }
         let next_key = self.key_after_deleting(&ids);
-        for id in &ids {
-            if let Err(err) = self
-                .fleet
-                .enqueue_outline(OutlineMutation::DeleteObligation { obligation_id: *id })
-            {
-                crate::ui::toast::error_toast(window, cx, format!("Delete failed: {err}"));
-                return;
-            }
-        }
-        let _ = self.fleet.writer().flush();
+        let mutations = ids
+            .iter()
+            .map(|id| OutlineMutation::DeleteObligation { obligation_id: *id })
+            .collect();
         self.list.clear_marks();
         self.list.set_cursor_key(next_key);
-        self.reload(window, cx);
-        self.focus_list(window, cx);
+        self.write_then(mutations, window, cx, |this, result, window, cx| {
+            if let Err(err) = result {
+                crate::ui::toast::error_toast(window, cx, format!("Delete failed: {err}"));
+            }
+            this.reload(window, cx);
+            this.focus_list(window, cx);
+        });
     }
 
     /// Where the cursor lands once `ids` are gone: the next obligation in the
@@ -1382,16 +1415,14 @@ impl ObligationsView {
             // `PlaceObligation` counts from 1; the landing index from 0.
             ordinal: index as i32 + 1,
         });
-        for mutation in mutations {
-            if let Err(err) = self.fleet.enqueue_outline(mutation) {
-                crate::ui::toast::error_toast(window, cx, format!("Move failed: {err}"));
-                return;
-            }
-        }
-        let _ = self.fleet.writer().flush();
         self.list.set_cursor_key(Some(id.to_string()));
-        self.reload(window, cx);
-        self.focus_list(window, cx);
+        self.write_then(mutations, window, cx, |this, result, window, cx| {
+            if let Err(err) = result {
+                crate::ui::toast::error_toast(window, cx, format!("Move failed: {err}"));
+            }
+            this.reload(window, cx);
+            this.focus_list(window, cx);
+        });
     }
 
     fn move_selected(
@@ -1407,20 +1438,22 @@ impl ObligationsView {
             return;
         }
         let id = item.obligation.id;
-        if let Err(err) = self
-            .fleet
-            .enqueue_outline(OutlineMutation::ReorderObligation {
+        self.list.set_cursor_key(Some(id.to_string()));
+        self.write_then(
+            vec![OutlineMutation::ReorderObligation {
                 obligation_id: id,
                 direction,
-            })
-        {
-            crate::ui::toast::error_toast(window, cx, format!("Move failed: {err}"));
-            return;
-        }
-        let _ = self.fleet.writer().flush();
-        self.list.set_cursor_key(Some(id.to_string()));
-        self.reload(window, cx);
-        self.focus_list(window, cx);
+            }],
+            window,
+            cx,
+            |this, result, window, cx| {
+                if let Err(err) = result {
+                    crate::ui::toast::error_toast(window, cx, format!("Move failed: {err}"));
+                }
+                this.reload(window, cx);
+                this.focus_list(window, cx);
+            },
+        );
     }
 
     fn move_selection(&mut self, delta: i32, _window: &mut Window, cx: &mut Context<Self>) {
@@ -2144,6 +2177,9 @@ mod tests {
             v.select_row(ix.unwrap(), cx);
             v.on_smart_enter(window, cx);
         });
+        // The create is written in the background.
+        cx.executor().allow_parking();
+        cx.run_until_parked();
         draw(cx);
         view.read_with(cx, |v, _| {
             let draft = v.draft_id.expect("a draft was started");

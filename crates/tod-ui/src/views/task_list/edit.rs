@@ -284,20 +284,20 @@ impl TaskListView {
             let Ok(node_id) = uuid::Uuid::parse_str(&task_id) else {
                 return false;
             };
-            if let Err(err) = self
-                .fleet
-                .enqueue_outline(OutlineMutation::UpdateNodeTitle {
+            self.write_outline(
+                OutlineMutation::UpdateNodeTitle {
                     node_id,
                     title: title.clone(),
-                })
-            {
-                self.show_error(format!("Failed to save title: {err}"), window, cx);
-                return false;
-            }
-            if let Err(err) = self.fleet.writer().flush() {
-                self.show_error(format!("Failed to save title: {err}"), window, cx);
-                return false;
-            }
+                },
+                window,
+                cx,
+                |this, result, window, cx| {
+                    if let Err(err) = result {
+                        this.show_error(format!("Failed to save title: {err}"), window, cx);
+                        this.live_refresh(window, cx);
+                    }
+                },
+            );
             if let Some(task) = self.all_tasks.iter_mut().find(|t| t.id == task_id) {
                 task.title = title;
             }
@@ -430,24 +430,30 @@ impl TaskListView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<String> {
-        if let Err(err) = self.fleet.enqueue_outline(OutlineMutation::CreateNode {
-            node_id: Some(draft.id),
-            list_id: draft.list_id,
-            parent_id: draft.parent_id,
-            anchor_id: draft.anchor_id,
-            position: draft.position,
-            title: title.to_string(),
-        }) {
-            self.show_error(format!("Failed to create item: {err}"), window, cx);
-            return None;
-        }
-        if let Err(err) = self.fleet.writer().flush() {
-            self.show_error(format!("Failed to create item: {err}"), window, cx);
-            return None;
-        }
-        self.live_refresh(window, cx);
         let id = draft.id.to_string();
+        self.creating.push((draft.clone(), title.to_string()));
+        self.reload_all_tasks();
         self.select_created_task(&id, window, cx);
+        let pending = draft.id;
+        self.write_outline(
+            OutlineMutation::CreateNode {
+                node_id: Some(draft.id),
+                list_id: draft.list_id,
+                parent_id: draft.parent_id,
+                anchor_id: draft.anchor_id,
+                position: draft.position,
+                title: title.to_string(),
+            },
+            window,
+            cx,
+            move |this, result, window, cx| {
+                this.creating.retain(|(d, _)| d.id != pending);
+                if let Err(err) = result {
+                    this.show_error(format!("Failed to create item: {err}"), window, cx);
+                }
+                this.live_refresh(window, cx);
+            },
+        );
         Some(id)
     }
 

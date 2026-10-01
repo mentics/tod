@@ -222,9 +222,7 @@ impl TaskEditView {
         // What was listed is the other kind's.
         self.dev.containers.clear();
         self.dev.sandboxes.clear();
-        if self.save_dev_container(next, cx) && turning_on {
-            self.refresh_containers(cx);
-        }
+        self.save_dev_container_then_list(next, turning_on, cx);
     }
 
     /// Whether this node's own work runs in a cloud sandbox.
@@ -356,6 +354,17 @@ impl TaskEditView {
         setting: Option<DevContainerSetting>,
         cx: &mut Context<Self>,
     ) -> bool {
+        self.save_dev_container_then_list(setting, false, cx)
+    }
+
+    /// As [`Self::save_dev_container`]; with `list_after`, the containers (or
+    /// sandboxes) are listed once the setting is stored.
+    fn save_dev_container_then_list(
+        &mut self,
+        setting: Option<DevContainerSetting>,
+        list_after: bool,
+        cx: &mut Context<Self>,
+    ) -> bool {
         let normalize = |dev: Option<DevContainerSetting>| {
             dev.map(|dev| DevContainerSetting {
                 container: if dev.sandbox {
@@ -374,6 +383,9 @@ impl TaskEditView {
         };
         let setting = normalize(setting);
         if normalize(self.own_dev_container()) == setting {
+            if list_after {
+                self.refresh_containers(cx);
+            }
             return true;
         }
         let (repo, use_worktree, _) = self.files_settings();
@@ -396,41 +408,56 @@ impl TaskEditView {
                 intro,
                 "Remove and change",
                 move |this, window, cx| {
-                    if this.write_dev_container(setting, cx) && listing {
-                        this.refresh_containers(cx);
-                    }
+                    this.write_dev_container(setting, listing, cx);
                     this.load_dev_container(window, cx);
                 },
                 cx,
             );
             return false;
         }
-        self.write_dev_container(setting, cx)
+        self.write_dev_container(setting, list_after, cx);
+        true
     }
 
+    /// Store `setting` off the UI thread, then reload what depends on it.
     fn write_dev_container(
         &mut self,
         setting: Option<DevContainerSetting>,
+        list_after: bool,
         cx: &mut Context<Self>,
-    ) -> bool {
+    ) {
         let Some(node_id) = self.task_id() else {
-            return false;
+            return;
         };
-        if let Err(err) = self.fleet.enqueue(FleetMutation::SetNodeDevContainer {
-            node_id,
-            dev_container: setting,
-        }) {
-            self.pending_toast = Some(format!("Failed to save where the node runs: {err}"));
-            cx.notify();
-            return false;
-        }
-        let _ = self.fleet.writer().flush();
-        let _ = self.fleet.reload_if_stale();
-        self.load_action_capabilities();
-        self.clamp_focus_index();
-        self.check_dev_container(cx);
-        self.notify_changed(cx);
-        true
+        let fleet = self.fleet.clone();
+        crate::ui::off_thread::off_thread(
+            cx,
+            move || {
+                fleet
+                    .enqueue(FleetMutation::SetNodeDevContainer {
+                        node_id,
+                        dev_container: setting,
+                    })
+                    .map_err(|err| format!("Failed to save where the node runs: {err}"))?;
+                let _ = fleet.writer().flush();
+                let _ = fleet.reload_if_stale();
+                Ok::<(), String>(())
+            },
+            move |this, result, cx| {
+                if let Err(message) = result {
+                    this.pending_toast = Some(message);
+                    cx.notify();
+                    return;
+                }
+                this.load_action_capabilities();
+                this.clamp_focus_index();
+                this.check_dev_container(cx);
+                this.notify_changed(cx);
+                if list_after {
+                    this.refresh_containers(cx);
+                }
+            },
+        );
     }
 
     /// `docker ps`, or the workspace's sandboxes, off the UI thread. A

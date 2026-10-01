@@ -222,20 +222,37 @@ impl PlanStepsView {
         self.router = router;
     }
 
-    /// Run `mutation` the way the host asked for.
-    fn apply(&self, mutation: OutlineMutation) -> Result<(), String> {
-        match &self.router {
-            Some(route) => self
-                .fleet
-                .interview(ACTOR_USER, route(mutation))
-                .map(|_| ())
-                .map_err(|err| format!("{err}")),
-            None => self
-                .fleet
-                .enqueue_outline(mutation)
-                .map_err(|err| format!("{err}"))
-                .and_then(|_| self.fleet.writer().flush().map_err(|err| format!("{err}"))),
-        }
+    /// Run `mutation` the way the host asked for, in the background (never on
+    /// the UI thread), then `done` with the outcome on the view.
+    fn write_then(
+        &self,
+        mutation: OutlineMutation,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        done: impl FnOnce(&mut Self, Result<(), String>, &mut Window, &mut Context<Self>) + 'static,
+    ) {
+        let fleet = self.fleet.clone();
+        // The router is not `Send`; it only builds the command.
+        let command = self.router.as_ref().map(|route| route(mutation.clone()));
+        cx.spawn_in(window, async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    match command {
+                        Some(command) => fleet
+                            .interview(ACTOR_USER, command)
+                            .map(|_| ())
+                            .map_err(|err| format!("{err}")),
+                        None => fleet
+                            .enqueue_outline(mutation)
+                            .map_err(|err| format!("{err}"))
+                            .and_then(|_| fleet.writer().flush().map_err(|err| format!("{err}"))),
+                    }
+                })
+                .await;
+            let _ = this.update_in(cx, |this, window, cx| done(this, result, window, cx));
+        })
+        .detach();
     }
 
     /// The steps the list is showing, in order.
@@ -586,11 +603,17 @@ impl PlanStepsView {
 
         if is_draft && (force_delete_draft || body.is_empty()) {
             self.clear_inline_edit_state(window, cx);
-            let _ = self.apply(OutlineMutation::DeletePlanStep {
-                step_id: editing_id,
-            });
-            self.reload(window, cx);
-            self.focus_list(window, cx);
+            self.write_then(
+                OutlineMutation::DeletePlanStep {
+                    step_id: editing_id,
+                },
+                window,
+                cx,
+                |this, _result, window, cx| {
+                    this.reload(window, cx);
+                    this.focus_list(window, cx);
+                },
+            );
             return;
         }
 
@@ -617,11 +640,17 @@ impl PlanStepsView {
         if body.is_empty() {
             if self.is_draft_edit() {
                 self.clear_inline_edit_state(window, cx);
-                let _ = self.apply(OutlineMutation::DeletePlanStep {
-                    step_id: editing_id,
-                });
-                self.reload(window, cx);
-                self.focus_list(window, cx);
+                self.write_then(
+                    OutlineMutation::DeletePlanStep {
+                        step_id: editing_id,
+                    },
+                    window,
+                    cx,
+                    |this, _result, window, cx| {
+                        this.reload(window, cx);
+                        this.focus_list(window, cx);
+                    },
+                );
                 return true;
             }
             crate::ui::toast::error_toast(window, cx, "Plan step cannot be empty");
@@ -630,21 +659,30 @@ impl PlanStepsView {
             });
             return false;
         }
-        if let Err(err) = self.apply(OutlineMutation::UpdatePlanStepBody {
-            step_id: editing_id,
-            body: body.clone(),
-        }) {
-            crate::ui::toast::error_toast(window, cx, format!("Save failed: {err}"));
-            return false;
-        }
+        // Shown as saved at once; the store is written in the background and
+        // the list is reloaded from it when that is done.
         if let Some(item) = self.items.iter_mut().find(|s| s.id == editing_id) {
-            item.body = body;
+            item.body = body.clone();
         }
         self.draft_id = None;
         self.clear_inline_edit_state(window, cx);
         self.list.set_cursor_key(Some(editing_id.to_string()));
-        self.reload(window, cx);
+        self.rebuild_visible(window, cx);
         self.focus_list(window, cx);
+        self.write_then(
+            OutlineMutation::UpdatePlanStepBody {
+                step_id: editing_id,
+                body,
+            },
+            window,
+            cx,
+            |this, result, window, cx| {
+                if let Err(err) = result {
+                    crate::ui::toast::error_toast(window, cx, format!("Save failed: {err}"));
+                }
+                this.reload(window, cx);
+            },
+        );
         true
     }
 
@@ -659,19 +697,26 @@ impl PlanStepsView {
             return;
         };
         let step_id = Uuid::new_v4();
-        if let Err(err) = self.apply(OutlineMutation::CreatePlanStep {
-            step_id: Some(step_id),
-            node_id,
-            after_id: after,
-            before,
-            body: String::new(),
-        }) {
-            crate::ui::toast::error_toast(window, cx, format!("Create failed: {err}"));
-            return;
-        }
-        self.draft_id = Some(step_id);
-        self.reload(window, cx);
-        self.start_inline_edit(step_id, window, cx);
+        self.write_then(
+            OutlineMutation::CreatePlanStep {
+                step_id: Some(step_id),
+                node_id,
+                after_id: after,
+                before,
+                body: String::new(),
+            },
+            window,
+            cx,
+            move |this, result, window, cx| {
+                if let Err(err) = result {
+                    crate::ui::toast::error_toast(window, cx, format!("Create failed: {err}"));
+                    return;
+                }
+                this.draft_id = Some(step_id);
+                this.reload(window, cx);
+                this.start_inline_edit(step_id, window, cx);
+            },
+        );
     }
 
     fn on_smart_enter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -710,13 +755,19 @@ impl PlanStepsView {
                     .last()
                     .map(|s| s.id.to_string())
             });
-        if let Err(err) = self.apply(OutlineMutation::DeletePlanStep { step_id: id }) {
-            crate::ui::toast::error_toast(window, cx, format!("Delete failed: {err}"));
-            return;
-        }
         self.list.set_cursor_key(next_key);
-        self.reload(window, cx);
-        self.focus_list(window, cx);
+        self.write_then(
+            OutlineMutation::DeletePlanStep { step_id: id },
+            window,
+            cx,
+            |this, result, window, cx| {
+                if let Err(err) = result {
+                    crate::ui::toast::error_toast(window, cx, format!("Delete failed: {err}"));
+                }
+                this.reload(window, cx);
+                this.focus_list(window, cx);
+            },
+        );
     }
 
     /// Carry out a dragged step: it lands ahead of the step it was dropped on,
@@ -742,16 +793,22 @@ impl PlanStepsView {
             .and_then(|before| order.iter().position(|step| *step == before))
             .unwrap_or(order.len());
         // `PlacePlanStep` counts from 1; the landing index from 0.
-        if let Err(err) = self.apply(OutlineMutation::PlacePlanStep {
-            id,
-            ordinal: index as i32 + 1,
-        }) {
-            crate::ui::toast::error_toast(window, cx, format!("Move failed: {err}"));
-            return;
-        }
         self.list.set_cursor_key(Some(id.to_string()));
-        self.reload(window, cx);
-        self.focus_list(window, cx);
+        self.write_then(
+            OutlineMutation::PlacePlanStep {
+                id,
+                ordinal: index as i32 + 1,
+            },
+            window,
+            cx,
+            |this, result, window, cx| {
+                if let Err(err) = result {
+                    crate::ui::toast::error_toast(window, cx, format!("Move failed: {err}"));
+                }
+                this.reload(window, cx);
+                this.focus_list(window, cx);
+            },
+        );
     }
 
     fn move_selected(
@@ -764,16 +821,22 @@ impl PlanStepsView {
             return;
         };
         let id = step.id;
-        if let Err(err) = self.apply(OutlineMutation::ReorderPlanStep {
-            step_id: id,
-            direction,
-        }) {
-            crate::ui::toast::error_toast(window, cx, format!("Move failed: {err}"));
-            return;
-        }
         self.list.set_cursor_key(Some(id.to_string()));
-        self.reload(window, cx);
-        self.focus_list(window, cx);
+        self.write_then(
+            OutlineMutation::ReorderPlanStep {
+                step_id: id,
+                direction,
+            },
+            window,
+            cx,
+            |this, result, window, cx| {
+                if let Err(err) = result {
+                    crate::ui::toast::error_toast(window, cx, format!("Move failed: {err}"));
+                }
+                this.reload(window, cx);
+                this.focus_list(window, cx);
+            },
+        );
     }
 
     /// Open the status dropdown on `step`, highlighting the status it has.
@@ -813,18 +876,20 @@ impl PlanStepsView {
         // A step left for the user keeps the note and reason saying why; any
         // other status has none.
         let kept = needs_user(status).then_some(&current);
-        if let Err(err) = self.apply(OutlineMutation::UpdatePlanStepStatus {
+        let mutation = OutlineMutation::UpdatePlanStepStatus {
             step_id: step,
             status: status.to_string(),
             note: kept.and_then(|s| s.note.clone()),
             reason: kept.and_then(|s| s.reason.clone()),
-        }) {
-            crate::ui::toast::error_toast(window, cx, format!("Status update failed: {err}"));
-            return;
-        }
+        };
         self.list.set_cursor_key(Some(step.to_string()));
-        self.reload(window, cx);
-        self.focus_list(window, cx);
+        self.write_then(mutation, window, cx, |this, result, window, cx| {
+            if let Err(err) = result {
+                crate::ui::toast::error_toast(window, cx, format!("Status update failed: {err}"));
+            }
+            this.reload(window, cx);
+            this.focus_list(window, cx);
+        });
     }
 
     fn move_selection(&mut self, delta: i32, _window: &mut Window, cx: &mut Context<Self>) {

@@ -1114,7 +1114,30 @@ impl Shell {
     }
 
     fn undo_last(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        match self.fleet.undo_last() {
+        // The undo log's suppress flag is global, so a second undo while one
+        // is running is dropped rather than interleaved.
+        if !crate::views::command_history::begin_undo() {
+            return;
+        }
+        let fleet = self.fleet.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { fleet.undo_last().map_err(|err| err.to_string()) })
+                .await;
+            crate::views::command_history::end_undo();
+            let _ = this.update_in(cx, |this, window, cx| this.finish_undo_last(result, window, cx));
+        })
+        .detach();
+    }
+
+    fn finish_undo_last(
+        &mut self,
+        result: Result<Option<String>, String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match result {
             Ok(Some(label)) => {
                 self.task_list.update(cx, |list, cx| {
                     list.set_status_message(format!("Undid: {label}"), cx);

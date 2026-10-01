@@ -1528,24 +1528,35 @@ impl TaskEditView {
         let Some(node_id) = self.task_id() else {
             return;
         };
-        if let Err(err) = self.fleet.enqueue(FleetMutation::UpsertNodeAgent {
-            node_id,
-            platform: agent.platform,
-            model: agent.model,
-            effort: agent.effort,
-        }) {
-            self.pending_toast = Some(format!("Failed to save agent settings: {err}"));
-            cx.notify();
-            return;
-        }
-        if self.fleet.writer().flush().is_err() {
-            self.pending_toast = Some("Failed to save agent settings".into());
-            cx.notify();
-            return;
-        }
-        let _ = self.fleet.reload_if_stale();
-        self.load_action_capabilities();
-        self.notify_changed(cx);
+        let fleet = self.fleet.clone();
+        crate::ui::off_thread::off_thread(
+            cx,
+            move || {
+                fleet
+                    .enqueue(FleetMutation::UpsertNodeAgent {
+                        node_id,
+                        platform: agent.platform,
+                        model: agent.model,
+                        effort: agent.effort,
+                    })
+                    .map_err(|err| format!("Failed to save agent settings: {err}"))?;
+                fleet
+                    .writer()
+                    .flush()
+                    .map_err(|_| "Failed to save agent settings".to_string())?;
+                let _ = fleet.reload_if_stale();
+                Ok::<(), String>(())
+            },
+            |this, result, cx| {
+                if let Err(message) = result {
+                    this.pending_toast = Some(message);
+                    cx.notify();
+                    return;
+                }
+                this.load_action_capabilities();
+                this.notify_changed(cx);
+            },
+        );
     }
 
     fn toggle_use_worktree(&mut self, cx: &mut Context<Self>) {
@@ -1579,27 +1590,38 @@ impl TaskEditView {
         let Some(node_id) = self.task_id() else {
             return;
         };
-        if let Err(err) = self.fleet.enqueue(FleetMutation::SetNodeUseWorktree {
-            node_id,
-            use_worktree,
-        }) {
-            self.pending_toast = Some(format!("Failed to save worktree setting: {err}"));
-            cx.notify();
-            return;
-        }
-        if self.fleet.writer().flush().is_err() {
-            self.pending_toast = Some("Failed to save worktree setting".into());
-            cx.notify();
-            return;
-        }
-        let _ = self.fleet.reload_if_stale();
-        self.load_action_capabilities();
-        self.clamp_focus_index();
-        if self.repo_in_container() {
-            // Whether the directory must be a git repository changed.
-            self.check_dev_container(cx);
-        }
-        self.notify_changed(cx);
+        let fleet = self.fleet.clone();
+        crate::ui::off_thread::off_thread(
+            cx,
+            move || {
+                fleet
+                    .enqueue(FleetMutation::SetNodeUseWorktree {
+                        node_id,
+                        use_worktree,
+                    })
+                    .map_err(|err| format!("Failed to save worktree setting: {err}"))?;
+                fleet
+                    .writer()
+                    .flush()
+                    .map_err(|_| "Failed to save worktree setting".to_string())?;
+                let _ = fleet.reload_if_stale();
+                Ok::<(), String>(())
+            },
+            |this, result, cx| {
+                if let Err(message) = result {
+                    this.pending_toast = Some(message);
+                    cx.notify();
+                    return;
+                }
+                this.load_action_capabilities();
+                this.clamp_focus_index();
+                if this.repo_in_container() {
+                    // Whether the directory must be a git repository changed.
+                    this.check_dev_container(cx);
+                }
+                this.notify_changed(cx);
+            },
+        );
     }
 
     /// Open a shell/terminal at the node's resolved directory, off the UI thread.
@@ -2752,26 +2774,32 @@ impl TaskEditView {
         cx.notify();
 
         let capabilities = self.generator_accept_capabilities.clone();
-        if let Err(err) = self.fleet.enqueue_outline(OutlineMutation::SetGeneratorAcceptConfig {
-            node_id,
-            destination_node_id,
-            capabilities: capabilities.clone(),
-        }) {
-            self.generator_accept_busy = false;
-            self.generator_accept_error = Some(err.to_string());
-            cx.notify();
-            return;
-        }
-        if let Err(err) = self.fleet.writer().flush() {
-            self.generator_accept_busy = false;
-            self.generator_accept_error = Some(err.to_string());
-            cx.notify();
-            return;
-        }
-        self.generator_accept_busy = false;
-        self.generator_accept_destination_saved = Some(destination_text);
-        self.generator_accept_capabilities_saved = capabilities;
-        self.notify_changed(cx);
+        let fleet = self.fleet.clone();
+        let sent = capabilities.clone();
+        crate::ui::off_thread::off_thread(
+            cx,
+            move || {
+                fleet
+                    .enqueue_outline(OutlineMutation::SetGeneratorAcceptConfig {
+                        node_id,
+                        destination_node_id,
+                        capabilities: sent,
+                    })
+                    .map_err(|err| err.to_string())?;
+                fleet.writer().flush().map_err(|err| err.to_string())
+            },
+            move |this, result, cx| {
+                this.generator_accept_busy = false;
+                if let Err(err) = result {
+                    this.generator_accept_error = Some(err);
+                    cx.notify();
+                    return;
+                }
+                this.generator_accept_destination_saved = Some(destination_text);
+                this.generator_accept_capabilities_saved = capabilities;
+                this.notify_changed(cx);
+            },
+        );
     }
 
     /// Quick-accept edits save themselves after a short pause, like the
@@ -2935,23 +2963,44 @@ impl TaskEditView {
                 self.persist_repo(cx);
             }
         }
-        if let Err(err) = self
-            .fleet
-            .enqueue_outline(OutlineMutation::EnableCapabilities {
-                node_id,
-                capabilities: vec![cap],
-            })
-        {
-            self.pending_toast = Some(format!("Failed to enable {}: {err}", cap.label()));
+        let fleet = self.fleet.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    fleet
+                        .enqueue_outline(OutlineMutation::EnableCapabilities {
+                            node_id,
+                            capabilities: vec![cap],
+                        })
+                        .map_err(|err| format!("Failed to enable {}: {err}", cap.label()))?;
+                    fleet
+                        .writer()
+                        .flush()
+                        .map_err(|_| format!("Failed to save {} capability", cap.label()))?;
+                    let _ = fleet.reload_if_stale();
+                    Ok::<(), String>(())
+                })
+                .await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.finish_enable_capability(cap, result, window, cx)
+            });
+        })
+        .detach();
+    }
+
+    fn finish_enable_capability(
+        &mut self,
+        cap: Capability,
+        result: Result<(), String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Err(message) = result {
+            self.pending_toast = Some(message);
             cx.notify();
             return;
         }
-        if self.fleet.writer().flush().is_err() {
-            self.pending_toast = Some(format!("Failed to save {} capability", cap.label()));
-            cx.notify();
-            return;
-        }
-        let _ = self.fleet.reload_if_stale();
         self.capabilities.insert(cap);
         self.load_action_capabilities();
         if let Some(task_id) = self.task_id() {
@@ -3058,23 +3107,44 @@ impl TaskEditView {
         let Some(node_id) = self.node_uuid() else {
             return;
         };
-        if let Err(err) = self
-            .fleet
-            .enqueue_outline(OutlineMutation::DisableCapability {
-                node_id,
-                capability: cap,
-            })
-        {
-            self.pending_toast = Some(format!("Failed to disable {}: {err}", cap.label()));
+        let fleet = self.fleet.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    fleet
+                        .enqueue_outline(OutlineMutation::DisableCapability {
+                            node_id,
+                            capability: cap,
+                        })
+                        .map_err(|err| format!("Failed to disable {}: {err}", cap.label()))?;
+                    fleet
+                        .writer()
+                        .flush()
+                        .map_err(|_| format!("Failed to save {} disable", cap.label()))?;
+                    let _ = fleet.reload_if_stale();
+                    Ok::<(), String>(())
+                })
+                .await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.finish_disable_capability(cap, result, window, cx)
+            });
+        })
+        .detach();
+    }
+
+    fn finish_disable_capability(
+        &mut self,
+        cap: Capability,
+        result: Result<(), String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Err(message) = result {
+            self.pending_toast = Some(message);
             cx.notify();
             return;
         }
-        if self.fleet.writer().flush().is_err() {
-            self.pending_toast = Some(format!("Failed to save {} disable", cap.label()));
-            cx.notify();
-            return;
-        }
-        let _ = self.fleet.reload_if_stale();
         self.capabilities.remove(&cap);
         self.load_action_capabilities();
         if let Some(task_id) = self.task_id() {
@@ -3394,24 +3464,34 @@ impl TaskEditView {
         } else {
             Some(value.clone())
         };
-        if let Err(err) = self
-            .fleet
-            .enqueue(FleetMutation::UpdateTaskRepo { id, repo })
-        {
-            self.pending_toast = Some(format!("Failed to save repository: {err}"));
-            self.pending_repo_revert = true;
-            cx.notify();
-            return;
-        }
-        self.loaded_repo = value;
-        let _ = self.fleet.writer().flush();
-        let _ = self.fleet.reload_if_stale();
-        self.load_action_capabilities();
-        self.clamp_focus_index();
-        if self.repo_in_container() {
-            self.check_dev_container(cx);
-        }
-        cx.notify();
+        let previous = std::mem::replace(&mut self.loaded_repo, value);
+        let fleet = self.fleet.clone();
+        crate::ui::off_thread::off_thread(
+            cx,
+            move || {
+                fleet
+                    .enqueue(FleetMutation::UpdateTaskRepo { id, repo })
+                    .map_err(|err| format!("Failed to save repository: {err}"))?;
+                let _ = fleet.writer().flush();
+                let _ = fleet.reload_if_stale();
+                Ok::<(), String>(())
+            },
+            move |this, result, cx| {
+                if let Err(message) = result {
+                    this.loaded_repo = previous;
+                    this.pending_toast = Some(message);
+                    this.pending_repo_revert = true;
+                    cx.notify();
+                    return;
+                }
+                this.load_action_capabilities();
+                this.clamp_focus_index();
+                if this.repo_in_container() {
+                    this.check_dev_container(cx);
+                }
+                cx.notify();
+            },
+        );
     }
 
     fn persist_branch(&mut self, cx: &mut Context<Self>) {
@@ -3444,20 +3524,30 @@ impl TaskEditView {
         } else {
             Some(value.clone())
         };
-        if let Err(err) = self
-            .fleet
-            .enqueue(FleetMutation::UpdateTaskBranch { id, branch })
-        {
-            self.pending_toast = Some(format!("Failed to save branch: {err}"));
-            self.pending_branch_revert = true;
-            cx.notify();
-            return;
-        }
-        self.loaded_branch = value;
-        let _ = self.fleet.writer().flush();
-        let _ = self.fleet.reload_if_stale();
-        self.load_action_capabilities();
-        cx.notify();
+        let previous = std::mem::replace(&mut self.loaded_branch, value);
+        let fleet = self.fleet.clone();
+        crate::ui::off_thread::off_thread(
+            cx,
+            move || {
+                fleet
+                    .enqueue(FleetMutation::UpdateTaskBranch { id, branch })
+                    .map_err(|err| format!("Failed to save branch: {err}"))?;
+                let _ = fleet.writer().flush();
+                let _ = fleet.reload_if_stale();
+                Ok::<(), String>(())
+            },
+            move |this, result, cx| {
+                if let Err(message) = result {
+                    this.loaded_branch = previous;
+                    this.pending_toast = Some(message);
+                    this.pending_branch_revert = true;
+                    cx.notify();
+                    return;
+                }
+                this.load_action_capabilities();
+                cx.notify();
+            },
+        );
     }
 
     /// With a worktree set up, a new branch name renames the branch in place
@@ -3579,20 +3669,27 @@ impl TaskEditView {
         if value == self.loaded_details {
             return;
         }
-        if let Err(err) = self
-            .fleet
-            .enqueue_outline(OutlineMutation::SetExtraContent {
-                node_id,
-                content_type: EXTRA_CONTENT_DETAILS.to_string(),
-                body: value.clone(),
-            })
-        {
-            self.pending_toast = Some(format!("Failed to save details: {err}"));
-            cx.notify();
-            return;
-        }
-        self.loaded_details = value;
-        cx.emit(TaskEditEvent::Changed);
+        let previous = std::mem::replace(&mut self.loaded_details, value.clone());
+        let fleet = self.fleet.clone();
+        crate::ui::off_thread::off_thread(
+            cx,
+            move || {
+                fleet.enqueue_outline(OutlineMutation::SetExtraContent {
+                    node_id,
+                    content_type: EXTRA_CONTENT_DETAILS.to_string(),
+                    body: value,
+                })
+            },
+            move |this, result, cx| {
+                if let Err(err) = result {
+                    this.loaded_details = previous;
+                    this.pending_toast = Some(format!("Failed to save details: {err}"));
+                    cx.notify();
+                    return;
+                }
+                cx.emit(TaskEditEvent::Changed);
+            },
+        );
     }
 
     fn persist_tags(&mut self, _cx: &mut Context<Self>) {
