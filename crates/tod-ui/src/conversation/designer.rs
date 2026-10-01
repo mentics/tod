@@ -71,6 +71,8 @@ pub(super) struct Designer {
     draft_differs: bool,
     /// The draft the window was last pointed at.
     pointed_at: Option<PathBuf>,
+    /// The shell is showing the conversation view.
+    view_shown: bool,
 }
 
 impl Designer {
@@ -80,6 +82,7 @@ impl Designer {
         }
         let (launcher, events) = Launcher::system(data_root, None);
         let launcher = Arc::new(launcher);
+        crate::visual_design::launcher::register(&launcher);
         // Detects a window the user closed; ends with the launcher.
         let weak = Arc::downgrade(&launcher);
         std::thread::spawn(move || {
@@ -220,10 +223,43 @@ impl ConversationView {
         }
     }
 
+    /// The shell shows or leaves the conversation view: the design window is
+    /// hidden while the view is away and restored when it returns.
+    pub(crate) fn designer_set_view_shown(&mut self, shown: bool, cx: &mut Context<Self>) {
+        self.designer.view_shown = shown;
+        self.designer_sync_visibility(cx);
+    }
+
+    /// The window is shown only while the conversation view is on screen and
+    /// holds a visual-design conversation. Hide and show are quick, so the
+    /// browser is never closed for this; they run off the UI thread.
+    fn designer_sync_visibility(&mut self, cx: &mut Context<Self>) {
+        let Some(launcher) = self.designer.launcher.clone() else {
+            return;
+        };
+        if !self.designer.window_open {
+            return;
+        }
+        let want_shown = self.designer.view_shown && self.is_designer();
+        if want_shown != launcher.is_hidden() {
+            return;
+        }
+        cx.background_executor()
+            .spawn(async move {
+                if want_shown {
+                    launcher.show();
+                } else {
+                    launcher.hide();
+                }
+            })
+            .detach();
+    }
+
     /// Called when the store committed or a turn finished (and when the view
     /// switches conversation): compare the draft with the saved mockup, and
     /// point an open window at this conversation's draft. Off the UI thread.
     pub(super) fn designer_refresh(&mut self, cx: &mut Context<Self>) {
+        self.designer_sync_visibility(cx);
         if !self.is_designer() {
             return;
         }

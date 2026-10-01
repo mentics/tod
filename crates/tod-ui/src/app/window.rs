@@ -323,6 +323,11 @@ impl Shell {
         }
         let previous = self.active_view;
         self.active_view = view;
+        if (previous == ShellView::Conversation) != (view == ShellView::Conversation) {
+            let shown = view == ShellView::Conversation;
+            self.conversation
+                .update(cx, |conversation, cx| conversation.designer_set_view_shown(shown, cx));
+        }
         crate::ui::journey::record_nav(
             cx,
             tod_journey::NavEvent::ViewSelected {
@@ -418,6 +423,10 @@ impl Shell {
                 drawer: "interview".into(),
             },
         );
+        if self.active_view == ShellView::Conversation {
+            self.conversation
+                .update(cx, |conversation, cx| conversation.designer_set_view_shown(false, cx));
+        }
         self.active_view = ShellView::Interview;
         self.pending_open_interview = Some(PendingOpenInterview {
             task_id,

@@ -2,29 +2,36 @@
 
 use super::{MoverError, WindowHandle, WindowMover};
 use crate::visual_design::placement::NativeRect;
-use windows::Win32::Foundation::{BOOL, HWND, LPARAM, RECT};
+use windows::Win32::Foundation::{BOOL, HWND, LPARAM, RECT, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetWindowRect, GetWindowTextLengthW, GetWindowTextW, IsIconic, IsWindowVisible,
-    SetForegroundWindow, SetWindowPos, ShowWindow, SWP_NOACTIVATE, SWP_NOZORDER, SW_RESTORE,
+    PostMessageW, SetForegroundWindow, SetWindowPos, ShowWindow, SWP_NOACTIVATE, SWP_NOZORDER,
+    SW_HIDE, SW_RESTORE, SW_SHOW, WM_CLOSE,
 };
 
 pub struct WindowsMover;
 
 struct Search {
     prefix: String,
+    /// A visible match wins; a hidden one is kept as the fallback.
     found: Option<WindowHandle>,
+    hidden: Option<WindowHandle>,
 }
 
 unsafe extern "system" fn visit(hwnd: HWND, lparam: LPARAM) -> BOOL {
     let search = &mut *(lparam.0 as *mut Search);
     let n = GetWindowTextLengthW(hwnd);
-    if n > 0 && IsWindowVisible(hwnd).as_bool() {
+    if n > 0 {
         let mut buf = vec![0u16; n as usize + 1];
         let got = GetWindowTextW(hwnd, &mut buf);
         let title = String::from_utf16_lossy(&buf[..got.max(0) as usize]);
         if title.starts_with(&search.prefix) {
-            search.found = Some(WindowHandle { id: hwnd.0 as usize as u64, title });
-            return BOOL(0);
+            let handle = WindowHandle { id: hwnd.0 as usize as u64, title };
+            if IsWindowVisible(hwnd).as_bool() {
+                search.found = Some(handle);
+                return BOOL(0);
+            }
+            search.hidden.get_or_insert(handle);
         }
     }
     BOOL(1)
@@ -36,6 +43,10 @@ fn hwnd(w: &WindowHandle) -> HWND {
 
 impl WindowsMover {
     /// The window's outer rectangle in screen pixels.
+    pub fn is_visible(&self, w: &WindowHandle) -> bool {
+        unsafe { IsWindowVisible(hwnd(w)).as_bool() }
+    }
+
     pub fn rect(&self, w: &WindowHandle) -> Option<NativeRect> {
         let mut r = RECT::default();
         unsafe { GetWindowRect(hwnd(w), &mut r).ok()? };
@@ -45,10 +56,11 @@ impl WindowsMover {
 
 impl WindowMover for WindowsMover {
     fn find(&self, title_prefix: &str) -> Option<WindowHandle> {
-        let mut s = Search { prefix: title_prefix.to_string(), found: None };
+        let mut s = Search { prefix: title_prefix.to_string(), found: None, hidden: None };
         // EnumWindows reports an error when the callback stops it early.
         let _ = unsafe { EnumWindows(Some(visit), LPARAM(&mut s as *mut Search as isize)) };
-        s.found
+        // Hidden windows (ours, after `hide`) are found too.
+        s.found.or(s.hidden)
     }
 
     fn move_to(&self, window: &WindowHandle, r: NativeRect) -> Result<(), MoverError> {
@@ -57,6 +69,30 @@ impl WindowMover for WindowsMover {
                 let _ = ShowWindow(hwnd(window), SW_RESTORE);
             }
             SetWindowPos(hwnd(window), HWND(0), r.x, r.y, r.w, r.h, SWP_NOZORDER | SWP_NOACTIVATE)
+                .map_err(|e| MoverError::Failed(e.to_string()))
+        }
+    }
+
+    fn hide(&self, window: &WindowHandle) -> Result<(), MoverError> {
+        unsafe {
+            let _ = ShowWindow(hwnd(window), SW_HIDE);
+        }
+        Ok(())
+    }
+
+    fn show(&self, window: &WindowHandle) -> Result<(), MoverError> {
+        unsafe {
+            let _ = ShowWindow(hwnd(window), SW_SHOW);
+            if IsIconic(hwnd(window)).as_bool() {
+                let _ = ShowWindow(hwnd(window), SW_RESTORE);
+            }
+        }
+        Ok(())
+    }
+
+    fn close(&self, window: &WindowHandle) -> Result<(), MoverError> {
+        unsafe {
+            PostMessageW(hwnd(window), WM_CLOSE, WPARAM(0), LPARAM(0))
                 .map_err(|e| MoverError::Failed(e.to_string()))
         }
     }

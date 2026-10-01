@@ -86,6 +86,37 @@ impl WindowMover for LinuxMover {
         }
     }
 
+    fn hide(&self, w: &WindowHandle) -> Result<(), MoverError> {
+        if let Some(e) = unsupported() {
+            return Err(e);
+        }
+        if have("xdotool") {
+            return run(Command::new("xdotool").args(["windowunmap", &w.id.to_string()])).map(|_| ());
+        }
+        run(Command::new("wmctrl").args(["-i", "-r", &format!("0x{:x}", w.id), "-b", "add,hidden"])).map(|_| ())
+    }
+
+    fn show(&self, w: &WindowHandle) -> Result<(), MoverError> {
+        if let Some(e) = unsupported() {
+            return Err(e);
+        }
+        if have("xdotool") {
+            return run(Command::new("xdotool").args(["windowmap", &w.id.to_string()])).map(|_| ());
+        }
+        run(Command::new("wmctrl").args(["-i", "-r", &format!("0x{:x}", w.id), "-b", "remove,hidden"])).map(|_| ())
+    }
+
+    fn close(&self, w: &WindowHandle) -> Result<(), MoverError> {
+        if let Some(e) = unsupported() {
+            return Err(e);
+        }
+        if have("wmctrl") {
+            run(Command::new("wmctrl").args(["-i", "-c", &format!("0x{:x}", w.id)])).map(|_| ())
+        } else {
+            run(Command::new("xdotool").args(["windowclose", &w.id.to_string()])).map(|_| ())
+        }
+    }
+
     fn focus(&self, w: &WindowHandle) -> Result<(), MoverError> {
         if let Some(e) = unsupported() {
             return Err(e);

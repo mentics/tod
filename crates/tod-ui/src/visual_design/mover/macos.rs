@@ -55,4 +55,31 @@ impl WindowMover for MacMover {
         ))
         .map(|_| ())
     }
+
+    fn hide(&self, w: &WindowHandle) -> Result<(), MoverError> {
+        set_process_visible(w, false)
+    }
+
+    fn show(&self, w: &WindowHandle) -> Result<(), MoverError> {
+        set_process_visible(w, true)
+    }
+
+    fn close(&self, w: &WindowHandle) -> Result<(), MoverError> {
+        let t = escape(&w.title);
+        run(&format!(
+            "tell application \"System Events\"\nrepeat with p in (processes whose visible is true)\nif exists (window \"{t}\" of p) then\nclick (first button of window \"{t}\" of p whose subrole is \"AXCloseButton\")\nend if\nend repeat\nend tell"
+        ))
+        .map(|_| ())
+    }
+}
+
+/// Hides or shows the process that owns the window titled `w.title`. A hidden
+/// process drops out of `processes whose visible is true`, so this looks
+/// through every process.
+fn set_process_visible(w: &WindowHandle, visible: bool) -> Result<(), MoverError> {
+    let t = escape(&w.title);
+    run(&format!(
+        "tell application \"System Events\"\nrepeat with p in processes\nif exists (window \"{t}\" of p) then\nset visible of p to {visible}\nend if\nend repeat\nend tell"
+    ))
+    .map(|_| ())
 }
