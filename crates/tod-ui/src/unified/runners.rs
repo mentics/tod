@@ -165,6 +165,15 @@ impl NodeRunners {
         self.runners.iter().filter(|(_, r)| r.running).map(|(n, _)| *n)
     }
 
+    /// The nodes whose last run ended to wait, and no run is going.
+    pub fn awaiting_nodes(&self) -> Vec<Uuid> {
+        self.runners
+            .iter()
+            .filter(|(_, r)| !r.running && matches!(r.outcome, Some(Outcome::Waiting { .. })))
+            .map(|(node, _)| *node)
+            .collect()
+    }
+
     pub fn is_running(&self, node: Uuid) -> bool {
         self.runners.get(&node).is_some_and(|r| r.running)
     }
