@@ -651,7 +651,9 @@ impl TaskListView {
             .and_then(|id| visible.iter().position(|t| &t.id == id))
             .map(IndexPath::new);
 
-        let selection_moved_from = self.last_selected;
+        // Compare the selected node, not its row: expanding or collapsing a
+        // row above it shifts its index without the selection moving.
+        let selection_moved = next_id != previous_id;
         self.list_state.update(cx, |state, cx| {
             state.delegate_mut().set_items(visible);
             state
@@ -671,7 +673,7 @@ impl TaskListView {
             // Only chase the selection when it actually moved. A rebuild the
             // user did not ask for (a background change to the tree) must not
             // yank the viewport back from wherever they scrolled to.
-            if selected_ix.is_some() && selected_ix != selection_moved_from {
+            if selected_ix.is_some() && selection_moved {
                 state.scroll_to_selected_item(window, cx);
             }
             cx.notify();
