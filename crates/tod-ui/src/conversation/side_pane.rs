@@ -85,6 +85,8 @@ pub(super) enum SideList {
     Obligations,
     /// A gate check on a node with no lifecycle state to go by.
     Gate,
+    /// A visual-design conversation's draft, Accept, and design window.
+    Designer,
     Empty(&'static str, &'static str),
 }
 
@@ -462,6 +464,7 @@ impl ConversationView {
             SideList::Plan => self.render_plan_pane(window, cx),
             SideList::Findings => self.render_review_pane(window, cx),
             SideList::Obligations => self.render_obligations_pane(window, cx),
+            SideList::Designer => self.render_designer_pane(window, cx),
             SideList::Gate => return self.render_gate_pane(window, cx),
             SideList::Empty(title, message) => self.render_empty_pane(title, message),
         };
@@ -518,12 +521,7 @@ impl ConversationView {
                 }
             }
             ProtocolKind::Incoming => SideList::Obligations,
-            // A stub until the designer is rebuilt as this pane. The working
-            // designer is still `views::visual_design_panel`.
-            ProtocolKind::VisualDesign => SideList::Empty(
-                "Visual design",
-                "The visual designer is not available in conversations yet.",
-            ),
+            ProtocolKind::VisualDesign => SideList::Designer,
         }
     }
 

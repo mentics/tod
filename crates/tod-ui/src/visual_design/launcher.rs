@@ -177,6 +177,19 @@ impl Launcher {
         self.launch(mockup, dock)
     }
 
+    /// Points the open window at another mockup without moving it; false when
+    /// no window is open.
+    pub fn navigate(&self, mockup: &Path) -> bool {
+        let Some((url, _)) = self.current() else { return false };
+        match self.server.lock().unwrap().as_ref() {
+            Some(s) => {
+                s.set_path(&url, mockup);
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Re-docks an open window without changing its page.
     pub fn redock_only(&self, dock: &Dock) -> bool {
         match self.current() {
