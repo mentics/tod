@@ -128,7 +128,9 @@ impl InterviewClient {
     /// Start the daemon for this data root (no process answered for it), if
     /// there is one beside this program and starting is allowed.
     fn started_daemon(&self) -> Option<DaemonWriter> {
-        if !self.start_daemon {
+        // `TOD_NO_DAEMON` is for tests that run `tod-cli` on a throwaway data
+        // root: a daemon started for it would outlive the test.
+        if !self.start_daemon || std::env::var_os("TOD_NO_DAEMON").is_some_and(|v| !v.is_empty()) {
             return None;
         }
         // No daemon beside this program: write the old way.
