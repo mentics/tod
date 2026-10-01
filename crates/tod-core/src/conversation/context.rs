@@ -250,13 +250,7 @@ fn visual_design_state(
         .get(id)?
         .and_then(|o| o.visual_design_path);
     let draft = visual_design_draft_path(data_root, conversation_id);
-    let differs = match std::fs::read(&draft) {
-        Err(_) => false,
-        Ok(draft_bytes) => match saved_path.as_deref().map(std::fs::read) {
-            Some(Ok(saved_bytes)) => saved_bytes != draft_bytes,
-            _ => true,
-        },
-    };
+    let differs = crate::visual_design::draft_differs(&draft, saved_path.as_deref());
     Ok(Some(VisualDesignState {
         saved_path,
         draft_path: draft.display().to_string(),
@@ -538,9 +532,19 @@ fn describe_state(state: Option<&EntitySnapshot>) -> String {
     match state {
         None => "gone".to_string(),
         Some(EntitySnapshot::Node { title, .. }) => format!("titled \"{}\"", one_line(title)),
-        Some(EntitySnapshot::Obligation { kind, body, .. }) => {
-            format!("{kind} \"{}\"", one_line(body))
-        }
+        Some(EntitySnapshot::Obligation {
+            kind,
+            body,
+            visual_design_path,
+            ..
+        }) => match visual_design_path {
+            // An accepted mockup is how the agent learns of an accept.
+            Some(path) => format!(
+                "{kind} \"{}\" with the accepted mockup {path}",
+                one_line(body)
+            ),
+            None => format!("{kind} \"{}\"", one_line(body)),
+        },
         Some(EntitySnapshot::PlanStep { status, body, .. }) => {
             format!("{status} \"{}\"", one_line(body))
         }
