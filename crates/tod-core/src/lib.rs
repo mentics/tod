@@ -57,6 +57,7 @@ pub mod scheduler;
 pub mod session_name;
 pub mod stop_questions;
 pub mod task;
+pub mod visual_design;
 pub mod workbench_layout;
 
 pub use interview::{TodPaths, set_data_root};

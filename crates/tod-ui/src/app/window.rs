@@ -8,9 +8,6 @@ use crate::agent_socket;
 #[cfg(feature = "agent-socket")]
 use crate::agent_socket::commands::AgentPlatformSocketCommand;
 use crate::app::history_window::HistoryWindowControl;
-use crate::app::interactive_agent_window::{
-    InteractiveAgentOpenParams, InteractiveAgentWindowControl,
-};
 use crate::app::transcript_window::TranscriptWindowControl;
 use crate::cli::LaunchOptions;
 use crate::conversation::{ConversationView, ConversationViewEvent};
@@ -48,9 +45,6 @@ use crate::ui::nav_history::{
     NavHistory, NavigateBack, NavigateForward, register_nav_history_bindings,
 };
 use crate::unified::{UnifiedView, WorkbenchPlace};
-use crate::views::visual_design_panel::{
-    EmbeddedChatParams, VisualDesignPanelEvent, VisualDesignPanelView,
-};
 use gpui::prelude::FluentBuilder;
 use gpui::*;
 use gpui_component::button::{Button, ButtonVariants};
@@ -147,7 +141,7 @@ pub struct Shell {
     agent: SharedAgent,
     traffic_log: SharedAgentTrafficLog,
     transcript_window: TranscriptWindowControl,
-    _interactive_agent_window: InteractiveAgentWindowControl,
+    engagement: tod_agent::SharedEngagementRegistry,
     history_window: HistoryWindowControl,
     agent_status_text: SharedString,
     paths: TodPaths,
@@ -159,6 +153,9 @@ pub struct Shell {
     pending_open_interview_for_task: Option<(String, String)>,
     /// A conversation to open once `window` is available (panel events have none).
     pending_open_conversation: Option<Focus>,
+    /// A Design affordance pressed in an event handler: open (or start) the
+    /// obligation's visual-design conversation.
+    pending_open_visual_design: Option<Focus>,
     pending_report_dialog: Option<JourneyKey>,
     /// The conversation view asked to return to where the user came from.
     pending_leave_conversation: bool,
@@ -186,7 +183,6 @@ pub struct Shell {
     _obligations_subscription: Subscription,
     _plan_subscription: Subscription,
     _lifecycle_panel_subscription: Subscription,
-    _visual_design_panel_subscription: Subscription,
     _action_panel_subscription: Subscription,
     _sessions_subscription: Subscription,
     _conversation_subscription: Subscription,
@@ -319,6 +315,11 @@ impl Shell {
         }
         let previous = self.active_view;
         self.active_view = view;
+        if (previous == ShellView::Conversation) != (view == ShellView::Conversation) {
+            let shown = view == ShellView::Conversation;
+            self.conversation
+                .update(cx, |conversation, cx| conversation.designer_set_view_shown(shown, cx));
+        }
         crate::ui::journey::record_nav(
             cx,
             tod_journey::NavEvent::ViewSelected {
@@ -414,6 +415,10 @@ impl Shell {
                 drawer: "interview".into(),
             },
         );
+        if self.active_view == ShellView::Conversation {
+            self.conversation
+                .update(cx, |conversation, cx| conversation.designer_set_view_shown(false, cx));
+        }
         self.active_view = ShellView::Interview;
         self.pending_open_interview = Some(PendingOpenInterview {
             task_id,
@@ -516,7 +521,7 @@ impl Shell {
 
     fn compute_status_groups(&self) -> AgentStatusGroups {
         let mut groups = AgentStatusGroups::default();
-        if let Ok(registry) = self._interactive_agent_window.engagement().lock() {
+        if let Ok(registry) = self.engagement.lock() {
             groups.fleet.total = registry.len() as u32;
             groups.fleet.processing = registry
                 .values()
@@ -692,12 +697,6 @@ impl Shell {
                     });
                 }
             }
-            DrawerRequest::OpenVisualDesign {
-                node_id,
-                obligation_id,
-            } => {
-                self.open_visual_design_panel(node_id, obligation_id, window, cx);
-            }
             DrawerRequest::OpenActionPanel { task_id } => {
                 self.drawer
                     .close_except(Some(DrawerKind::Action), window, cx);
@@ -783,6 +782,9 @@ impl Shell {
     fn drain_pending_conversation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(focus) = self.pending_open_conversation.take() {
             self.open_conversation(focus, window, cx);
+        }
+        if let Some(focus) = self.pending_open_visual_design.take() {
+            self.open_conversation_with(focus, ProtocolKind::VisualDesign, false, window, cx);
         }
         if let Some(key) = self.pending_report_dialog.take() {
             self.on_open_report_dialog(
@@ -1037,45 +1039,12 @@ impl Shell {
         .detach();
     }
 
-    /// A — open the node's most recent chat session, or start a new one.
+    /// A — open the node's conversation (chat runs in the conversation view).
     fn handle_launch_or_focus_agent(&mut self, task_id: String, cx: &mut Context<Self>) {
-        let _ = self.fleet.reload_if_stale();
-        let latest = self
-            .fleet
-            .list_interactive_sessions_for_node(&task_id)
-            .unwrap_or_default()
-            .into_iter()
-            .next();
-        let result = match latest {
-            Some(run) => self._interactive_agent_window.open_session(
-                InteractiveAgentOpenParams {
-                    node_id: task_id.clone(),
-                    session_run_id: run.id,
-                    initial_context: None,
-                    auto_submit_message: None,
-                },
-                cx,
-            ),
-            None => self
-                ._interactive_agent_window
-                .create_and_open_session(&task_id, None, None, cx)
-                .map(|_| ()),
-        };
-        match result {
-            Ok(()) => {
-                let _ = self.fleet.reload_if_stale();
-                self.task_list.update(cx, |list, cx| {
-                    list.set_status_message("Opened agent chat".to_string(), cx);
-                    list.request_live_refresh(cx);
-                });
-            }
-            Err(err) => {
-                self.queue_error_toast(format!("Agent chat failed: {err}"), cx);
-            }
+        if let Ok(node_id) = Uuid::parse_str(&task_id) {
+            self.queue_open_conversation(Focus::Node(node_id), cx);
         }
-        cx.notify();
     }
-
     fn handle_open_code_editor(
         &mut self,
         task_id: String,
@@ -1504,144 +1473,6 @@ impl Shell {
             .right(div().id("tasks-right-drawer").size_full().child(drawer))
     }
 
-    /// Open the visual design panel (mockup `WebView` + embedded agent chat)
-    /// for one design-phase obligation, from the "Design"/"+ Design"
-    /// affordance on its row in the Obligations panel.
-    ///
-    /// Constructs the chat in-process via
-    /// `InteractiveAgentWindowControl::create_embedded_session` instead of
-    /// opening a standalone window, so it can sit inside the panel next to the
-    /// mockup preview.
-    fn open_visual_design_panel(
-        &mut self,
-        node_id: uuid::Uuid,
-        obligation_id: uuid::Uuid,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let task_id = node_id.to_string();
-        let Some(obligation) = self.fleet.get_obligation(obligation_id).ok().flatten() else {
-            return;
-        };
-        let (fleet, agent, workspace_cwd, settings, session_run_id) = match self
-            ._interactive_agent_window
-            .create_embedded_session(&task_id, Some("design/visual-design"))
-        {
-            Ok(session) => session,
-            Err(err) => {
-                self.queue_error_toast(err, cx);
-                return;
-            }
-        };
-        let initial_context = match self.build_visual_design_agent_context(node_id, obligation_id) {
-            Ok(text) => Some(text),
-            Err(err) => {
-                tracing::warn!(
-                    event = "agent_chat",
-                    action = "context_unavailable",
-                    error = %err,
-                    "opening visual design chat without app context"
-                );
-                None
-            }
-        };
-
-        let title = obligation
-            .body
-            .lines()
-            .next()
-            .filter(|line| !line.is_empty())
-            .unwrap_or("Visual design")
-            .to_string();
-
-        self.drawer
-            .close_except(Some(DrawerKind::VisualDesign), window, cx);
-        self.drawer.visual_design.update(cx, |panel, cx| {
-            panel.open(
-                node_id,
-                obligation_id,
-                &title,
-                EmbeddedChatParams {
-                    node_id: task_id.clone(),
-                    session_run_id,
-                    fleet,
-                    agent,
-                    workspace_cwd,
-                    settings,
-                    window_control: self._interactive_agent_window.clone(),
-                    initial_context,
-                },
-                window,
-                cx,
-            );
-        });
-    }
-
-    /// Assemble the visual-design agent's first message: bundled context docs
-    /// plus the live obligation selection.
-    fn build_visual_design_agent_context(
-        &self,
-        node_id: uuid::Uuid,
-        obligation_id: uuid::Uuid,
-    ) -> anyhow::Result<String> {
-        use tod_core::agent_context::{
-            ContextRequest, NodeSelection, ObligationSelection, build_first_message,
-        };
-        use tod_core::media::MediaPaths;
-
-        let media = MediaPaths::discover()?;
-        let node = self
-            .fleet
-            .get_node(&node_id.to_string())
-            .ok()
-            .flatten()
-            .ok_or_else(|| anyhow::anyhow!("node {node_id} not found"))?;
-        let body = self
-            .fleet
-            .get_extra_content(node_id, tod_store::outline::EXTRA_CONTENT_DETAILS)
-            .ok()
-            .flatten();
-        let obligation = self
-            .fleet
-            .get_obligation(obligation_id)
-            .ok()
-            .flatten()
-            .ok_or_else(|| anyhow::anyhow!("obligation {obligation_id} not found"))?;
-        let ancestor_context = self
-            .fleet
-            .read(|conn| {
-                tod_core::node_context::render_inherited_context(
-                    conn,
-                    &tod_store::outline::repos::NodeRepo::new(conn),
-                    node_id,
-                    None,
-                )
-            })
-            .unwrap_or_default();
-
-        build_first_message(
-            &media,
-            &ContextRequest {
-                recipe: tod_core::agent_context::VISUAL_DESIGN_RECIPE,
-                data_root: self.paths.data_root(),
-                node: NodeSelection {
-                    id: node_id,
-                    slug: Some(node.slug.clone()),
-                    title: node.title,
-                    body,
-                    lifecycle: Some(node.lifecycle),
-                },
-                obligation: Some(ObligationSelection {
-                    id: obligation.id,
-                    kind: obligation.kind,
-                    body: obligation.body,
-                    visual_design_path: obligation.visual_design_path,
-                }),
-                ancestor_context,
-            },
-        )
-    }
-
     fn drain_pending_task_list(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.pending_refocus_task_list {
             self.pending_refocus_task_list = false;
@@ -1945,7 +1776,7 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
     };
 
     let transcript_window = TranscriptWindowControl::new();
-    let interactive_agent_window = InteractiveAgentWindowControl::new();
+    let engagement = tod_agent::shared_engagement_registry();
     let history_window = HistoryWindowControl::new();
     #[cfg(feature = "agent-socket")]
     let transcript_for_socket = transcript_window.clone();
@@ -1983,7 +1814,6 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
         {
             let paths = paths.clone();
             let transcript_window = transcript_window.clone();
-            let interactive_agent_window = interactive_agent_window.clone();
             let history_window = history_window.clone();
             #[cfg(feature = "agent-socket")]
             let shell_for_socket = shell_for_socket.clone();
@@ -1991,14 +1821,12 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                 let paths_for_geometry = paths.clone();
                 let transcript_for_close = transcript_window.clone();
                 let history_for_close = history_window.clone();
-                let interactive_for_close = interactive_agent_window.clone();
                 match fleet_open {
                     Err((error, resolved_root)) => {
                         window.on_window_should_close(cx, move |window, cx| {
                             persist_window_geometry(window, &paths_for_geometry);
                             let _ = transcript_for_close.close(cx);
                             history_for_close.close(cx);
-                            interactive_for_close.close_all(cx);
                             true
                         });
                         let view =
@@ -2091,13 +1919,6 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                         report_problem::set_available_from(&app_settings.journeys, cx);
                         transcript_window.bind(fleet.clone(), traffic_log.clone());
                         history_window.bind(fleet.clone());
-                        let app_settings = TodSettings::load(&paths).unwrap_or_default();
-                        interactive_agent_window.bind(
-                            fleet.clone(),
-                            agent.clone(),
-                            paths.clone(),
-                            app_settings,
-                        );
                         let _ = crate::interview::bootstrap(fleet.clone());
                         // Before the tree is built, so no row is ever drawn as
                         // "refreshing…" for a refresh the last run never finished.
@@ -2125,14 +1946,12 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                 incoming_check.clone(),
                             )
                         });
-                        let visual_design_panel =
-                            cx.new(|cx| VisualDesignPanelView::new(fleet.clone(), cx));
                         let action_panel = cx.new(|cx| {
                             ActionPanelView::new(
                                 cx,
                                 fleet.clone(),
                                 agent.clone(),
-                                interactive_agent_window.clone(),
+                                engagement.clone(),
                             )
                         });
                         let agent_for_sessions = agent.clone();
@@ -2357,13 +2176,12 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                             node_id,
                                             obligation_id,
                                         } => {
-                                            this.queue_drawer(
-                                                DrawerRequest::OpenVisualDesign {
-                                                    node_id: *node_id,
-                                                    obligation_id: *obligation_id,
-                                                },
-                                                cx,
-                                            );
+                                            this.pending_open_visual_design =
+                                                Some(Focus::Obligation {
+                                                    node: *node_id,
+                                                    id: *obligation_id,
+                                                });
+                                            cx.notify();
                                         }
                                     }
                                 });
@@ -2404,18 +2222,6 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                         }
                                     }
                                 });
-                            let _visual_design_panel_subscription = cx.subscribe(
-                                &visual_design_panel,
-                                |this: &mut Shell, _, event, cx| match event {
-                                    VisualDesignPanelEvent::Close => {
-                                        this.on_drawer_panel_closed(cx);
-                                    }
-                                    VisualDesignPanelEvent::FocusTaskList => {
-                                        this.pending_refocus_task_list = true;
-                                        cx.notify();
-                                    }
-                                },
-                            );
                             let _action_panel_subscription =
                                 cx.subscribe(&action_panel, |this: &mut Shell, _, event, cx| {
                                     match event {
@@ -2520,7 +2326,6 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                     obligations,
                                     plan,
                                     lifecycle: lifecycle_panel,
-                                    visual_design: visual_design_panel,
                                     action: action_panel,
                                 },
                                 sessions,
@@ -2536,7 +2341,7 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                 agent: agent.clone(),
                                 traffic_log: traffic_log.clone(),
                                 transcript_window: transcript_window.clone(),
-                                _interactive_agent_window: interactive_agent_window.clone(),
+                                engagement: engagement.clone(),
                                 history_window: history_window.clone(),
                                 agent_status_text,
                                 paths: paths.clone(),
@@ -2544,6 +2349,7 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                 pending_open_interview: None,
                                 pending_open_interview_for_task: None,
                                 pending_open_conversation: None,
+                                pending_open_visual_design: None,
                                 pending_report_dialog: None,
                                 pending_go_to_tasks: None,
                                 pending_gate_check: None,
@@ -2563,7 +2369,6 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                 _obligations_subscription,
                                 _plan_subscription,
                                 _lifecycle_panel_subscription,
-                                _visual_design_panel_subscription,
                                 _action_panel_subscription,
                                 _sessions_subscription,
                                 _conversation_subscription,
@@ -2646,13 +2451,11 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                 persist_window_geometry(window, &paths_for_geometry);
                                 let _ = transcript_for_close.close(cx);
                                 history_for_close.close(cx);
-                                interactive_for_close.close_all(cx);
                                 true
                             } else {
                                 let paths_for_force = paths_for_geometry.clone();
                                 let transcript_for_force = transcript_for_close.clone();
                                 let history_for_force = history_for_close.clone();
-                                let interactive_for_force = interactive_for_close.clone();
                                 crate::ui::toast::close_guard_toast(
                                     window,
                                     cx,
@@ -2661,7 +2464,6 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                         persist_window_geometry(window, &paths_for_force);
                                         let _ = transcript_for_force.close(cx);
                                         history_for_force.close(cx);
-                                        interactive_for_force.close_all(cx);
                                         window.remove_window();
                                     },
                                 );

@@ -36,6 +36,15 @@ fn default_journey_storage_cap_mb() -> u64 {
     DEFAULT_JOURNEY_STORAGE_CAP_MB
 }
 
+/// The visual-design window (`doc/ui/visual-design-browser.md`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VisualDesignSettings {
+    /// Path of the browser to open the design window in, replacing discovery
+    /// (`visual_design.browser`). Edited in `tod.yml`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub browser: Option<String>,
+}
+
 fn default_independent_evaluation() -> bool {
     true
 }
@@ -430,36 +439,6 @@ pub struct TerminalSettings {
     pub program: Option<String>,
 }
 
-/// Where "chat with agent" opens a session: the app's own window, or an
-/// external terminal running the platform CLI directly.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ChatLaunchMode {
-    Window,
-    Terminal,
-}
-
-impl ChatLaunchMode {
-    pub const ALL: [ChatLaunchMode; 2] = [Self::Window, Self::Terminal];
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Window => "App window",
-            Self::Terminal => "Terminal",
-        }
-    }
-}
-
-impl Default for ChatLaunchMode {
-    fn default() -> Self {
-        Self::Window
-    }
-}
-
-fn default_chat_launch_mode() -> ChatLaunchMode {
-    ChatLaunchMode::default()
-}
-
 /// Default for [`TodSettings::max_parallel_agent_sessions`].
 pub const DEFAULT_MAX_PARALLEL_AGENT_SESSIONS: u32 = 4;
 /// Bounds for [`TodSettings::max_parallel_agent_sessions`].
@@ -551,9 +530,6 @@ pub struct TodSettings {
     /// Platform / model / effort for "chat with agent", where the node's Agent capability leaves them unset.
     #[serde(default)]
     pub chat_agent: AgentRoleSettings,
-    /// Where "chat with agent" opens a session: app window or external terminal.
-    #[serde(default = "default_chat_launch_mode")]
-    pub chat_launch_mode: ChatLaunchMode,
     /// How many agent sessions batch work (checking incoming changes on
     /// several nodes) runs at once.
     #[serde(default = "default_max_parallel_agent_sessions")]
@@ -582,6 +558,9 @@ pub struct TodSettings {
     /// How lifecycle phases are judged done.
     #[serde(default)]
     pub lifecycle: LifecycleSettings,
+    /// The visual-design window.
+    #[serde(default)]
+    pub visual_design: VisualDesignSettings,
     /// What makes a pull request ready, and how the babysitter gets it there.
     #[serde(default)]
     pub pr_readiness: PrReadinessSettings,
@@ -607,7 +586,6 @@ impl Default for TodSettings {
             treehouse_executable: None,
             default_agent: AgentRoleSettings::default(),
             chat_agent: AgentRoleSettings::default(),
-            chat_launch_mode: ChatLaunchMode::default(),
             max_parallel_agent_sessions: DEFAULT_MAX_PARALLEL_AGENT_SESSIONS,
             agent_platform: AgentPlatform::default(),
             agent_launch: AgentLaunchByPlatform::default(),
@@ -617,6 +595,7 @@ impl Default for TodSettings {
             window_geometry: None,
             journeys: JourneySettings::default(),
             lifecycle: LifecycleSettings::default(),
+            visual_design: VisualDesignSettings::default(),
             pr_readiness: PrReadinessSettings::default(),
             sandbox_idle: SandboxIdleSettings::default(),
         }
@@ -952,7 +931,6 @@ mod tests {
                 },
             },
             chat_agent: AgentRoleSettings::default(),
-            chat_launch_mode: ChatLaunchMode::Terminal,
             max_parallel_agent_sessions: 2,
             agent_platform: AgentPlatform::Claude,
             agent_launch: AgentLaunchByPlatform {
@@ -977,6 +955,9 @@ mod tests {
             journeys: JourneySettings::default(),
             lifecycle: LifecycleSettings {
                 independent_evaluation: false,
+            },
+            visual_design: VisualDesignSettings {
+                browser: Some("C:/chrome/chrome.exe".into()),
             },
             pr_readiness: PrReadinessSettings {
                 bots: vec![PrReviewBotSettings {

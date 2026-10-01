@@ -5,6 +5,7 @@ mod interview;
 mod ui;
 pub(crate) mod unified;
 mod views;
+pub mod visual_design;
 
 #[cfg(feature = "agent-socket")]
 mod agent_socket;

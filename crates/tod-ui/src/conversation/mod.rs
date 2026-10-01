@@ -20,6 +20,7 @@ mod context_panel;
 pub(crate) mod driver_slot;
 mod header;
 pub(crate) use header::format_time;
+mod designer;
 mod keyboard;
 mod lifecycle;
 mod nav;
@@ -31,13 +32,22 @@ mod transcript;
 /// `active` and has a plan to work through — the same conditions the lifecycle
 /// panel's Implement checks — and a verification one a node that is
 /// `verifying` and has a plan to check. A review, and a fix of what it found,
-/// need a node in `review`. Visual design is not offered until its protocol exists.
+/// need a node in `review`. Visual design is offered on a design-phase
+/// obligation.
 fn new_kinds(
     conn: &rusqlite::Connection,
     node: Option<Uuid>,
     focus: Focus,
 ) -> anyhow::Result<Vec<ProtocolKind>> {
     let mut kinds = vec![ProtocolKind::Outline, ProtocolKind::Chat];
+    if let Focus::Obligation { id, .. } = focus {
+        let design = ObligationRepo::new(conn)
+            .get(id)?
+            .is_some_and(|o| o.phase == tod_store::interview::PHASE_DESIGN);
+        if design {
+            kinds.push(ProtocolKind::VisualDesign);
+        }
+    }
     if let (Focus::Node(_), Some(node)) = (focus, node) {
         let lifecycle = NodeRepo::new(conn).get_lifecycle(node)?;
         let planned = !PlanStepRepo::new(conn).list_for_node(node)?.is_empty();
@@ -58,7 +68,7 @@ pub use keyboard::register_conversation_keyboard_bindings;
 
 use crate::interview::agent::SharedAgent;
 use crate::interview::{TodPaths, TodSettings};
-use crate::ui::agent_chat::OpenAgentChat;
+use crate::ui::agent_chat::{OpenAgentChat, OpenConversation};
 use crate::ui::agent_runs::AgentRuns;
 use crate::ui::report_problem::{OpenReportDialog, ReportProblem};
 use crate::ui::session_info::SessionInfo;
@@ -383,6 +393,8 @@ pub(crate) struct Snapshot {
     /// Where the focused node's lifecycle stands; `None` unless the focus is
     /// a node with one.
     pub lifecycle: Option<lifecycle::LifecycleSnapshot>,
+    /// The focus obligation, for a visual-design conversation's pane.
+    pub design: Option<designer::DesignSnapshot>,
 }
 
 /// An underline tab bar whose underline moves in the same frame as the
@@ -479,6 +491,9 @@ pub struct ConversationView {
     /// embedded, so a step affords the same actions here as it does on the
     /// node tree.
     side_plan: Entity<PlanStepsView>,
+    /// The visual-design pane's launcher and state.
+    designer: designer::Designer,
+    _side_obligation_events: Subscription,
 
     /// Runs gate checks and lifecycle moves; shared with the lifecycle panel.
     lifecycle: Entity<LifecycleController>,
@@ -608,7 +623,34 @@ impl ConversationView {
             view.set_embedded(true, cx);
             view
         });
+        // The Design affordance on an obligation in the side pane opens that
+        // obligation's visual-design conversation, as it does on the tree.
+        let side_obligation_events = cx.subscribe_in(
+            &side_obligations,
+            window,
+            |_, _, event: &crate::views::obligations::ObligationsEvent, window, cx| {
+                if let crate::views::obligations::ObligationsEvent::OpenVisualDesign {
+                    node_id,
+                    obligation_id,
+                } = event
+                {
+                    window.dispatch_action(
+                        Box::new(OpenConversation {
+                            focus: Focus::Obligation {
+                                node: *node_id,
+                                id: *obligation_id,
+                            },
+                            protocol: ProtocolKind::VisualDesign,
+                            start: false,
+                        }),
+                        cx,
+                    );
+                }
+            },
+        );
         Self {
+            designer: designer::Designer::default(),
+            _side_obligation_events: side_obligation_events,
             host: RowHost::for_entity(cx.weak_entity()),
             fleet,
             agent,
@@ -811,6 +853,7 @@ impl ConversationView {
             self.transcript.update(cx, |panel, cx| panel.reset(cx));
         }
         self.reload();
+        self.designer_refresh(cx);
         self.load_lifecycle_state(cx);
         self.status = self.current_status(cx).unwrap_or_default();
         self.publish_status(cx);
@@ -1061,6 +1104,13 @@ impl ConversationView {
         if (committed || finished) && self.reload() {
             changed = true;
         }
+        if self.designer_drain() {
+            changed = true;
+        }
+        self.designer_deliver_feedback(cx);
+        if committed || finished {
+            self.designer_refresh(cx);
+        }
         (changed, want_files)
     }
 
@@ -1225,7 +1275,17 @@ impl ConversationView {
                 }
             }
             let new_kinds = new_kinds(conn, selection.node, focus)?;
+            let design = match (protocol, focus) {
+                (ProtocolKind::VisualDesign, Focus::Obligation { id, .. }) => {
+                    ObligationRepo::new(conn).get(id)?.map(|o| designer::DesignSnapshot {
+                        obligation: o.body.lines().next().unwrap_or_default().to_string(),
+                        saved: o.visual_design_path,
+                    })
+                }
+                _ => None,
+            };
             Ok(Snapshot {
+                design,
                 planned,
                 new_kinds,
                 lifecycle: None,
@@ -1526,6 +1586,8 @@ impl ConversationView {
             let (driver, text, images, result) = cx
                 .background_executor()
                 .spawn(async move {
+                    // The driver itself retries without the images when the
+                    // agent takes none (one user turn, never two).
                     let result = driver
                         .send_with_images(
                             &fleet,
