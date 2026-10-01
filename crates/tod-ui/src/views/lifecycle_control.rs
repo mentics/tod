@@ -16,6 +16,7 @@
 //! Observers are notified whenever anything shown changes, including the
 //! node's lifecycle, so they re-read it from the store.
 
+use crate::ui::off_thread::off_thread;
 use gpui::Context;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -214,10 +215,16 @@ impl LifecycleController {
     /// Advance the node to the next lifecycle state directly, bypassing the
     /// gate criteria. First call arms; a second call while armed applies it,
     /// returning the state entered.
-    pub fn force_advance(&mut self, task_id: &str, cx: &mut Context<Self>) -> Option<&'static str> {
-        let (lifecycle, _) = self.node(task_id)?;
-        let next = next_lifecycle(&lifecycle)?;
-        let node_id = Uuid::parse_str(task_id).ok()?;
+    pub fn force_advance(&mut self, task_id: &str, cx: &mut Context<Self>) {
+        let Some((lifecycle, _)) = self.node(task_id) else {
+            return;
+        };
+        let Some(next) = next_lifecycle(&lifecycle) else {
+            return;
+        };
+        let Ok(node_id) = Uuid::parse_str(task_id) else {
+            return;
+        };
         let state = self.gate_states.entry(task_id.to_string()).or_default();
         if !state.force_advance_armed {
             state.force_advance_armed = true;
@@ -226,21 +233,26 @@ impl LifecycleController {
                 "Click Force advance again to confirm — skips the gate criteria, moves to {next}."
             );
             cx.notify();
-            return None;
+            return;
         }
         state.force_advance_armed = false;
-        if let Err(err) = self.set_lifecycle(node_id, next) {
-            let state = self.gate_states.entry(task_id.to_string()).or_default();
-            state.gate_error = Some(format!("Failed to advance lifecycle: {err}"));
-            cx.notify();
-            return None;
-        }
-        if let Some(state) = self.gate_states.get_mut(task_id) {
-            state.gate_status = format!("Advanced to {next} (gate bypassed).");
-            state.criteria_detail.clear();
-        }
-        cx.notify();
-        Some(next)
+        let fleet = self.fleet.clone();
+        let task_id = task_id.to_string();
+        off_thread(
+            cx,
+            move || tod_core::lifecycle::set_lifecycle(&fleet, node_id, next).map_err(|e| format!("{e:#}")),
+            move |this, result, cx| {
+                let state = this.gate_states.entry(task_id).or_default();
+                match result {
+                    Ok(()) => {
+                        state.gate_status = format!("Advanced to {next} (gate bypassed).");
+                        state.criteria_detail.clear();
+                    }
+                    Err(err) => state.gate_error = Some(format!("Failed to advance lifecycle: {err}")),
+                }
+                cx.notify();
+            },
+        );
     }
 
     /// Move the node one lifecycle state back, bypassing the forward gate —
@@ -266,22 +278,29 @@ impl LifecycleController {
             return;
         }
         state.revert_armed = false;
-        if let Err(err) = self.set_lifecycle(node_id, prev) {
-            let state = self.gate_states.entry(task_id.to_string()).or_default();
-            state.gate_error = Some(format!("Failed to revert lifecycle: {err}"));
-            cx.notify();
-            return;
-        }
-        if let Some(state) = self.gate_states.get_mut(task_id) {
-            state.gate_status = format!("Reverted to {prev}.");
-            state.criteria_detail.clear();
-        }
-        cx.notify();
+        let fleet = self.fleet.clone();
+        let task_id = task_id.to_string();
+        off_thread(
+            cx,
+            move || tod_core::lifecycle::set_lifecycle(&fleet, node_id, prev).map_err(|e| format!("{e:#}")),
+            move |this, result, cx| {
+                let state = this.gate_states.entry(task_id).or_default();
+                match result {
+                    Ok(()) => {
+                        state.gate_status = format!("Reverted to {prev}.");
+                        state.criteria_detail.clear();
+                    }
+                    Err(err) => state.gate_error = Some(format!("Failed to revert lifecycle: {err}")),
+                }
+                cx.notify();
+            },
+        );
     }
 
     /// Move the node one lifecycle state back at once, with no confirmation:
     /// for a caller whose own button already says what it does. `true` when
-    /// the node moved.
+    /// the node moved. Blocks on the store: for the conversation view, which
+    /// acts on the answer at once; the workbench uses [`Self::revert`].
     pub fn revert_now(&mut self, task_id: &str, cx: &mut Context<Self>) -> bool {
         let Some((lifecycle, _)) = self.node(task_id) else {
             return false;
@@ -311,8 +330,37 @@ impl LifecycleController {
     /// Move the node straight back to `target`, several states if need be,
     /// with no confirmation: the caller's button names the state, and it is
     /// only offered when the node's current state no longer holds
-    /// (`tod_core::lifecycle_validity`). `true` when the node moved.
-    pub fn revert_to(&mut self, task_id: &str, target: &str, cx: &mut Context<Self>) -> bool {
+    /// (`tod_core::lifecycle_validity`). The write is made off the UI thread.
+    pub fn revert_to(&mut self, task_id: &str, target: &'static str, cx: &mut Context<Self>) {
+        let Ok(node_id) = Uuid::parse_str(task_id) else {
+            return;
+        };
+        let state = self.gate_states.entry(task_id.to_string()).or_default();
+        state.revert_armed = false;
+        state.force_advance_armed = false;
+        let fleet = self.fleet.clone();
+        let task_id = task_id.to_string();
+        off_thread(
+            cx,
+            move || tod_core::lifecycle::set_lifecycle(&fleet, node_id, target).map_err(|e| format!("{e:#}")),
+            move |this, result, cx| {
+                let state = this.gate_states.entry(task_id).or_default();
+                match result {
+                    Ok(()) => {
+                        state.gate_error = None;
+                        state.gate_status = format!("Moved back to {target}.");
+                        state.criteria_detail.clear();
+                    }
+                    Err(err) => state.gate_error = Some(format!("Failed to move back: {err}")),
+                }
+                cx.notify();
+            },
+        );
+    }
+
+    /// [`Self::revert_to`], waiting for the store and saying whether the node
+    /// moved: for a caller that moves several nodes and counts them.
+    pub fn revert_to_blocking(&mut self, task_id: &str, target: &str, cx: &mut Context<Self>) -> bool {
         let Ok(node_id) = Uuid::parse_str(task_id) else {
             return false;
         };
@@ -351,53 +399,64 @@ impl LifecycleController {
         row.outcome = OUTCOME_WAIVED.to_string();
         row.detail = Some(tod_core::lifecycle::WAIVED_DETAIL.to_string());
 
-        let saved = tod_core::lifecycle::waive(&self.fleet, node_id, criterion_id);
-        let Some(state) = self.gate_states.get_mut(task_id) else {
-            return;
-        };
-        match saved {
-            Ok(()) => {
-                state.gate_status = if state.all_clear() {
-                    "All criteria satisfied — advance when ready.".into()
-                } else {
-                    "Criterion waived.".into()
-                };
-            }
-            Err(err) => state.gate_error = Some(format!("Failed to waive criterion: {err:#}")),
-        }
         cx.notify();
+        let fleet = self.fleet.clone();
+        let task_id = task_id.to_string();
+        off_thread(
+            cx,
+            move || tod_core::lifecycle::waive(&fleet, node_id, criterion_id).map_err(|e| format!("{e:#}")),
+            move |this, saved, cx| {
+                if let Some(state) = this.gate_states.get_mut(&task_id) {
+                    match saved {
+                        Ok(()) => {
+                            state.gate_status = if state.all_clear() {
+                                "All criteria satisfied — advance when ready.".into()
+                            } else {
+                                "Criterion waived.".into()
+                            };
+                        }
+                        Err(err) => state.gate_error = Some(format!("Failed to waive criterion: {err}")),
+                    }
+                }
+                cx.notify();
+            },
+        );
     }
 
     /// Advance the node to its next lifecycle state once every recorded
     /// criterion reads pass/waived; does nothing otherwise. A pure lifecycle
     /// write — the criteria results are already recorded. Returns the state
     /// entered.
-    pub fn advance_after_criteria(
-        &mut self,
-        task_id: &str,
-        cx: &mut Context<Self>,
-    ) -> Option<&'static str> {
+    pub fn advance_after_criteria(&mut self, task_id: &str, cx: &mut Context<Self>) {
         if !self.state(task_id).is_some_and(GateCheckState::all_clear) {
-            return None;
+            return;
         }
-        let node_id = Uuid::parse_str(task_id).ok()?;
-        let next = match tod_core::lifecycle::advance(&self.fleet, node_id) {
-            Ok(next) => next?,
-            Err(err) => {
-                if let Some(state) = self.gate_states.get_mut(task_id) {
-                    state.gate_error = Some(format!("Failed to advance lifecycle: {err:#}"));
+        let Ok(node_id) = Uuid::parse_str(task_id) else {
+            return;
+        };
+        let fleet = self.fleet.clone();
+        let task_id = task_id.to_string();
+        off_thread(
+            cx,
+            move || tod_core::lifecycle::advance(&fleet, node_id).map_err(|e| format!("{e:#}")),
+            move |this, advanced, cx| {
+                match advanced {
+                    Ok(Some(next)) => {
+                        if let Some(state) = this.gate_states.get_mut(&task_id) {
+                            state.gate_status = format!("Advanced to {next}.");
+                            state.criteria_detail.clear();
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(err) => {
+                        if let Some(state) = this.gate_states.get_mut(&task_id) {
+                            state.gate_error = Some(format!("Failed to advance lifecycle: {err}"));
+                        }
+                    }
                 }
                 cx.notify();
-                return None;
-            }
-        };
-
-        if let Some(state) = self.gate_states.get_mut(task_id) {
-            state.gate_status = format!("Advanced to {next}.");
-            state.criteria_detail.clear();
-        }
-        cx.notify();
-        Some(next)
+            },
+        );
     }
 
     /// Repopulate `criteria_detail` for `task_id` from the most recently

@@ -56,6 +56,7 @@ use tod_store::request_feedback::{
 use tod_store::review::{FINDING_DECLINED, FINDING_FIXED, FINDING_OUT_OF_SCOPE, ReviewFinding, ReviewRepo};
 use uuid::Uuid;
 
+use crate::ui::off_thread::off_thread;
 use crate::ui::agent_runs::AgentRuns;
 use crate::ui::journey::{Source, record_action};
 use crate::ui::key_context;
@@ -541,11 +542,19 @@ impl Requests {
             Self::presented_for(&decision),
         );
         let decision_id = decision.id;
-        let result = self.agent_runs.update(cx, |runs, cx| runs.answer_decision(decision_id, option, text, cx));
-        self.set_error("record answer", result.map(|_| ()));
+        // The answer is recorded off the UI thread; what was being edited
+        // closes now, and the list reloads when it is in.
         self.freeform_editing = None;
         self.changing = None;
-        self.reload(cx);
+        let this = cx.weak_entity();
+        self.agent_runs.update(cx, |runs, cx| {
+            runs.answer_decision_then(decision_id, option, text, cx, move |result, cx| {
+                let _ = this.update(cx, |this, cx| {
+                    this.set_error("record answer", result);
+                    this.reload(cx);
+                });
+            })
+        });
     }
 
     /// Answer the *top* request with option `n` (1-based), when it has
@@ -674,9 +683,15 @@ impl Requests {
             Self::presented_for_step(step),
         );
         let step_id = step.id;
-        let result = self.agent_runs.update(cx, |runs, cx| runs.answer_plan_step_handoff(step_id, answer, cx));
-        self.set_error("answer plan step", result.map(|_| ()));
-        self.reload(cx);
+        let this = cx.weak_entity();
+        self.agent_runs.update(cx, |runs, cx| {
+            runs.answer_plan_step_handoff_then(step_id, answer, cx, move |result, cx| {
+                let _ = this.update(cx, |this, cx| {
+                    this.set_error("answer plan step", result);
+                    this.reload(cx);
+                });
+            })
+        });
     }
 
     fn presented_for_finding(finding: &ReviewFinding) -> Presented {
@@ -707,9 +722,15 @@ impl Requests {
         );
         let finding_id = finding.id;
         let status = status.to_string();
-        let result = self.agent_runs.update(cx, |runs, _| runs.respond_review_finding(finding_id, &status));
-        self.set_error("answer finding", result.map(|_| ()));
-        self.reload(cx);
+        let fleet = self.fleet.clone();
+        off_thread(
+            cx,
+            move || AgentRuns::respond_finding_on(&fleet, finding_id, &status),
+            |this, result, cx| {
+                this.set_error("answer finding", result);
+                this.reload(cx);
+            },
+        );
     }
 
     /// The feedback given on request `id` in this session, if any.
@@ -1187,17 +1208,20 @@ impl Requests {
             },
         );
         let id = item.id;
-        let result = match item.kind {
-            AttentionKind::Decision => {
-                self.agent_runs.update(cx, |runs, _| runs.resolve_decision_elsewhere(id))
-            }
-            AttentionKind::PlanStep => {
-                self.agent_runs.update(cx, |runs, _| runs.resolve_plan_step_elsewhere(id))
-            }
-            AttentionKind::Finding => Ok(()),
-        };
-        self.set_error("dismiss the request", result);
-        self.reload(cx);
+        let kind = item.kind;
+        let fleet = self.fleet.clone();
+        off_thread(
+            cx,
+            move || match kind {
+                AttentionKind::Decision => AgentRuns::resolve_decision_on(&fleet, id),
+                AttentionKind::PlanStep => AgentRuns::resolve_plan_step_on(&fleet, id),
+                AttentionKind::Finding => Ok(()),
+            },
+            |this, result, cx| {
+                this.set_error("dismiss the request", result);
+                this.reload(cx);
+            },
+        );
     }
 
     /// Open a terminal resuming `conversation`'s agent session

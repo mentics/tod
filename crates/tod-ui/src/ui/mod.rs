@@ -1,6 +1,7 @@
 pub mod actionable;
 pub mod agent_chat;
 pub mod agent_runs;
+pub mod off_thread;
 pub mod claude_adapter;
 pub mod agent_conversation;
 pub mod agent_permission;

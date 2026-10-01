@@ -355,7 +355,7 @@ impl IncomingCheck {
             let id = affected.node.to_string();
             let ok = self
                 .lifecycle
-                .update(cx, |c, cx| c.revert_to(&id, found.target, cx));
+                .update(cx, |c, cx| c.revert_to_blocking(&id, found.target, cx));
             if ok {
                 moved.push(format!("{} → {}", affected.title, found.target));
             } else {
