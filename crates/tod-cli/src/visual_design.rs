@@ -65,26 +65,14 @@ fn save(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
     }
     let html = std::fs::read_to_string(html_path)
         .map_err(|err| anyhow::anyhow!("failed to read {}: {err}", html_path.display()))?;
-    if html.to_ascii_lowercase().contains("<script") {
-        anyhow::bail!(
-            "visual design mockups must not contain <script> tags (self-contained HTML+CSS only)"
-        );
-    }
-
-    // Mirrors `TodPaths::visual_design_dir` (tod-store), built directly from
-    // `inv.data_root` since tod-cli doesn't go through the `TodPaths`
-    // global-override machinery. One file per obligation, named by its id, so
-    // saving again for the same obligation deterministically overwrites it.
-    let dir = inv
-        .data_root
-        .join("visual-design")
-        .join(obligation.node_id.to_string());
-    std::fs::create_dir_all(&dir)
-        .map_err(|err| anyhow::anyhow!("failed to create {}: {err}", dir.display()))?;
-    let dest = dir.join(format!("{}.html", obligation.id));
-    std::fs::write(&dest, &html)
-        .map_err(|err| anyhow::anyhow!("failed to write {}: {err}", dest.display()))?;
-    let dest = tod_store::path_util::canonicalize_if_possible(&dest);
+    // One implementation with the app's Accept (`tod_core::visual_design`):
+    // validates, writes the file under the data root, returns the path.
+    let dest = tod_core::visual_design::stage_mockup(
+        &inv.data_root,
+        obligation.node_id,
+        obligation.id,
+        &html,
+    )?;
     let dest_str = dest.display().to_string();
 
     inv.client().interview(tod_store::interview::InterviewCommand::Outline {
