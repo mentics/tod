@@ -545,3 +545,29 @@ Scope: the workbench only (decision 3).
    leases; remove `LocalRun`.
 5. The waiting visuals (the group, the glyph, the runner line).
 6. Moves: copying the session file, and the acceptance test.
+
+### Status and deviations
+
+- **1, 2** done. **3** done except: cloud sync, `cloud_nodes`, `node_events`
+  and the orchestrator/supervisor side connections still write over their
+  own WAL connections beside the daemon's writer (an interim; the daemon's
+  writer is the only one that records undo or announces changes), and the
+  notify-log cursor / command-history mirror are not yet served in client
+  mode.
+- **The writer is pluggable, not rewritten.** `FleetWriter` has a local
+  backend (a thread) and a remote one (`RemoteWriter`, implemented by
+  `tod-agentd-client`'s `DaemonWriter`); the app opens the store as a client
+  (`FleetStore::open_client`), so its ~90 call sites did not change. The
+  protocol retries under one request id, which the daemon answers once.
+- **4: the daemon hosts the runs itself.** Instead of spawning
+  `tod-supervisor wake` in direct mode, `tod_agentd::runners::Runners` keeps
+  one `LocalRun` thread per node inside the daemon, wakes `Outcome::Waiting`
+  runs when due (read against the clock every 5 s, so a machine that slept
+  wakes them), continues a run whose request was answered, and starts again
+  the runs a stopped daemon left without an outcome. The app's `NodeRunners`
+  is a proxy: it sends start/pause/stop and shows the `RunnerState` the
+  daemon pushes (`Event::Runner`). The cloud supervisor is unchanged.
+- The daemon runs from a copy, so programs beside it are found through
+  `TOD_PROGRAM_DIR` (`tod_store::install::program_dir`).
+- Left: 5 (the group and glyph), 6 (moves and the acceptance matrix), and
+  pushing the branch from the local runner.

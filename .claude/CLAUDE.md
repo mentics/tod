@@ -32,7 +32,9 @@ cargo build --release -p tod --no-default-features
 tod --verify-process-bundle
 ```
 
-`cargo run -p tod` rebuilds only `tod`, never the `tod-cli` beside it. After
+`cargo build -p tod` builds `tod` and the resident `tod-agentd` beside it (the
+app starts it, owns nothing itself, and hosts no runs: see `doc/agentd.md`; a
+stale `tod-agentd` is refused with the command to rebuild it). `cargo run -p tod` rebuilds only `tod`, never the `tod-cli` beside it. After
 changing anything `tod-cli` is built from, run `cargo build -p tod-cli` too: a
 conversation refuses to send a turn when the two were built from different
 source (`tod_core::CLI_BUILD_STAMP`), rather than let the agent work from
