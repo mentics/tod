@@ -100,7 +100,7 @@ impl Protocol for ReviewProtocol {
             .get_extra_content(node_id, EXTRA_CONTENT_DETAILS)
             .ok()
             .flatten();
-        let obligations = fleet.list_obligations_for_node(node_id).unwrap_or_default();
+        let obligations = fleet.list_obligations_for_node(node_id).context("could not read the node's obligations")?;
         let ancestor_context = fleet
             .read(|conn| {
                 crate::node_context::render_inherited_context(
@@ -110,7 +110,7 @@ impl Protocol for ReviewProtocol {
                     None,
                 )
             })
-            .unwrap_or_default();
+            .context("could not read the inherited context")?;
         let manifest = ProcessManifest::load(&TodInstallPaths::discover()?)?;
         let role_doc = state_role_doc(&manifest, REVIEW)?;
         let working_dir = PathBuf::from(self.cwd(env)?.path_text());
