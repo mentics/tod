@@ -172,6 +172,7 @@ impl SettingsSection {
                 TreehouseExecutable,
                 TreehouseWorktreesRoot,
                 TerminalProgram,
+                VisualDesignBrowser,
             ],
             Self::CloudSandboxes => &[
                 SandboxWorkspace,
@@ -211,6 +212,8 @@ enum SettingField {
     TreehouseExecutable,
     TreehouseWorktreesRoot,
     TerminalProgram,
+    /// `visual_design.browser`: the browser the design window opens in.
+    VisualDesignBrowser,
     /// The user's environment presets file (edited by `PresetsEditor`).
     EnvironmentPresetsFile,
     /// The Blaxel workspace cloud sandboxes live in (`sandboxes.toml`).
@@ -262,6 +265,7 @@ impl SettingField {
             Self::TreehouseExecutable => "treehouse-executable",
             Self::TreehouseWorktreesRoot => "treehouse-worktrees-root",
             Self::TerminalProgram => "terminal-program",
+            Self::VisualDesignBrowser => "visual-design-browser",
             Self::SandboxWorkspace => "sandbox-workspace",
             Self::EnvironmentPresetsFile => "environment-presets-file",
             Self::SandboxSignIn => "sandbox-sign-in",
@@ -382,6 +386,7 @@ pub struct SettingsView {
     settings: TodSettings,
     log_dir_display: SharedString,
     terminal_program_input: Entity<InputState>,
+    visual_design_browser_input: Entity<InputState>,
     treehouse_worktrees_root_input: Entity<InputState>,
     treehouse_executable_input: Entity<InputState>,
     relay_code_input: Entity<InputState>,
@@ -415,6 +420,7 @@ pub struct SettingsView {
     presets_editor: Entity<crate::views::environment_editor::PresetsEditor>,
     selected_field_index: usize,
     terminal_program_editing: bool,
+    visual_design_browser_editing: bool,
     treehouse_worktrees_root_editing: bool,
     treehouse_executable_editing: bool,
     relay_code_editing: bool,
@@ -429,6 +435,7 @@ pub struct SettingsView {
     journeys_test_status: Option<Result<SharedString, SharedString>>,
     journeys_test_sending: bool,
     _terminal_subscription: Subscription,
+    _visual_design_browser_subscription: Subscription,
     _treehouse_worktrees_root_subscription: Subscription,
     _treehouse_executable_subscription: Subscription,
     _relay_code_subscription: Subscription,
@@ -531,6 +538,23 @@ impl SettingsView {
                 .placeholder("Enter to edit · Auto (OS default)")
                 .default_value(settings.terminal.program.clone().unwrap_or_default())
         });
+        let visual_design_browser_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Enter to edit · Default: find Chrome")
+                .default_value(settings.visual_design.browser.clone().unwrap_or_default())
+        });
+        let _visual_design_browser_subscription =
+            cx.subscribe(&visual_design_browser_input, |this, input, event, cx| {
+                if matches!(event, InputEvent::Blur | InputEvent::PressEnter { .. }) {
+                    let text = input.read(cx).text().to_string();
+                    let trimmed = text.trim();
+                    let next = (!trimmed.is_empty()).then(|| trimmed.to_string());
+                    if this.settings.visual_design.browser != next {
+                        this.settings.visual_design.browser = next;
+                        this.schedule_save("visual_design.browser", cx);
+                    }
+                }
+            });
         let _terminal_subscription =
             cx.subscribe(&terminal_program_input, |this, input, event, cx| {
                 if matches!(event, InputEvent::Blur | InputEvent::PressEnter { .. }) {
@@ -606,6 +630,7 @@ impl SettingsView {
             settings,
             log_dir_display,
             terminal_program_input,
+            visual_design_browser_input,
             treehouse_worktrees_root_input,
             treehouse_executable_input,
             sandbox_workspace_input,
@@ -632,6 +657,7 @@ impl SettingsView {
             },
             selected_field_index: 0,
             terminal_program_editing: false,
+            visual_design_browser_editing: false,
             treehouse_worktrees_root_editing: false,
             treehouse_executable_editing: false,
             relay_code_editing: false,
@@ -643,6 +669,7 @@ impl SettingsView {
             journeys_test_status: None,
             journeys_test_sending: false,
             _terminal_subscription,
+            _visual_design_browser_subscription,
             _treehouse_worktrees_root_subscription,
             _treehouse_executable_subscription,
             _relay_code_subscription,
@@ -713,6 +740,7 @@ impl SettingsView {
     fn text_editing(&self) -> bool {
         self.sandbox_editing.is_some()
             || self.terminal_program_editing
+            || self.visual_design_browser_editing
             || self.treehouse_worktrees_root_editing
             || self.treehouse_executable_editing
             || self.relay_code_editing
@@ -727,6 +755,7 @@ impl SettingsView {
             self.treehouse_worktrees_root_editing = false;
         }
         self.treehouse_executable_editing = false;
+        self.visual_design_browser_editing = false;
         self.relay_code_editing = false;
         self.milestone_states_editing = false;
         if let Some(field) = self.sandbox_editing.take() {
@@ -983,6 +1012,7 @@ impl SettingsView {
         self.terminal_program_editing = false;
         self.treehouse_worktrees_root_editing = false;
         self.treehouse_executable_editing = false;
+        self.visual_design_browser_editing = false;
         self.relay_code_editing = false;
         self.milestone_states_editing = false;
         if let Some(field) = self.sandbox_editing.take() {
@@ -1047,6 +1077,7 @@ impl SettingsView {
         self.terminal_program_editing = false;
         self.treehouse_worktrees_root_editing = false;
         self.treehouse_executable_editing = false;
+        self.visual_design_browser_editing = false;
         self.relay_code_editing = false;
         self.milestone_states_editing = false;
         self.active_section = SECTIONS[next];
@@ -1138,6 +1169,7 @@ impl SettingsView {
             SettingField::TreehouseExecutable
             | SettingField::TreehouseWorktreesRoot
             | SettingField::TerminalProgram
+            | SettingField::VisualDesignBrowser
             | SettingField::SandboxWorkspace
             | SettingField::SandboxApiKey
             | SettingField::SandboxDefaultImage
@@ -1200,6 +1232,7 @@ impl SettingsView {
                 editor.update(cx, |e, cx| e.focus(window, cx));
             }
             SettingField::TerminalProgram => self.enter_terminal_edit(window, cx),
+            SettingField::VisualDesignBrowser => self.enter_visual_design_browser_edit(window, cx),
             SettingField::TreehouseWorktreesRoot => {
                 self.enter_treehouse_worktrees_root_edit(window, cx)
             }
@@ -1317,6 +1350,7 @@ impl SettingsView {
         self.focus_region = SettingsFocus::Panel;
         self.terminal_program_editing = false;
         self.treehouse_executable_editing = false;
+        self.visual_design_browser_editing = false;
         self.treehouse_worktrees_root_editing = true;
         cx.notify();
         let input = self.treehouse_worktrees_root_input.clone();
@@ -1344,6 +1378,24 @@ impl SettingsView {
         });
     }
 
+    fn enter_visual_design_browser_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !matches!(self.selected_field(), SettingField::VisualDesignBrowser) {
+            return;
+        }
+        self.focus_region = SettingsFocus::Panel;
+        self.terminal_program_editing = false;
+        self.treehouse_worktrees_root_editing = false;
+        self.treehouse_executable_editing = false;
+        self.visual_design_browser_editing = true;
+        cx.notify();
+        let input = self.visual_design_browser_input.clone();
+        cx.on_next_frame(window, move |_, window, cx| {
+            input.update(cx, |input, cx| {
+                input.focus(window, cx);
+            });
+        });
+    }
+
     fn enter_terminal_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !matches!(self.selected_field(), SettingField::TerminalProgram) {
             return;
@@ -1351,6 +1403,7 @@ impl SettingsView {
         self.focus_region = SettingsFocus::Panel;
         self.treehouse_worktrees_root_editing = false;
         self.treehouse_executable_editing = false;
+        self.visual_design_browser_editing = false;
         self.terminal_program_editing = true;
         cx.notify();
         let input = self.terminal_program_input.clone();
@@ -1933,6 +1986,20 @@ impl Render for SettingsView {
             cx,
         );
         key_context::set_input_tab_stop(
+            &self.visual_design_browser_input,
+            self.visual_design_browser_editing,
+            cx,
+        );
+        if !self.visual_design_browser_editing
+            && self
+                .visual_design_browser_input
+                .read(cx)
+                .focus_handle(cx)
+                .is_focused(window)
+        {
+            self.enter_visual_design_browser_edit(window, cx);
+        }
+        key_context::set_input_tab_stop(
             &self.treehouse_worktrees_root_input,
             self.treehouse_worktrees_root_editing,
             cx,
@@ -2296,6 +2363,16 @@ impl SettingsView {
                     default_terminal_hint(),
                     &self.terminal_program_input,
                     self.terminal_program_editing,
+                    theme,
+                ))
+                .child(text_input_row(
+                    cx,
+                    self,
+                    SettingField::VisualDesignBrowser,
+                    "Design browser",
+                    "Path of the browser the visual-design window opens in (Chrome). Empty finds Chrome automatically.",
+                    &self.visual_design_browser_input,
+                    self.visual_design_browser_editing,
                     theme,
                 ))
                 .into_any_element(),
@@ -2839,6 +2916,11 @@ fn text_input_row(
                     SettingField::TreehouseWorktreesRoot => {
                         if !this.treehouse_worktrees_root_editing {
                             this.enter_treehouse_worktrees_root_edit(window, cx);
+                        }
+                    }
+                    SettingField::VisualDesignBrowser => {
+                        if !this.visual_design_browser_editing {
+                            this.enter_visual_design_browser_edit(window, cx);
                         }
                     }
                     SettingField::TreehouseExecutable => {
