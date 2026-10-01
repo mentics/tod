@@ -466,24 +466,16 @@ static PROBLEMS: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
 /// A background copy failed: logged, and held for the app to show the user
 /// ([`take_problems`]), since a move later would otherwise lose turns without
 /// a word.
-fn report_problem(node_id: &str, message: String) {
+pub fn report_problem(node_id: &str, message: String) {
     tracing::warn!("{message}");
     PROBLEMS.lock().unwrap_or_else(|e| e.into_inner()).push((node_id.to_string(), message));
 }
 
-/// Every node's failures since the last call, for a view that polls with no
-/// run in flight (the copy fails after the turn that started it ended).
-pub fn take_all_problems() -> Vec<String> {
-    std::mem::take(&mut *PROBLEMS.lock().unwrap_or_else(|e| e.into_inner())).into_iter().map(|(_, m)| m).collect()
-}
-
-/// The failures of `node_id`'s background session-log copies since the last
-/// call.
-pub fn take_problems(node_id: &str) -> Vec<String> {
-    let mut all = PROBLEMS.lock().unwrap_or_else(|e| e.into_inner());
-    let (mine, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut *all).into_iter().partition(|(node, _)| node == node_id);
-    *all = rest;
-    mine.into_iter().map(|(_, message)| message).collect()
+/// Every node's failures since the last call, as (node id, message). Taken by
+/// `tod_core::conversation::problems`, which records each in the node's
+/// conversation and tells the user.
+pub fn take_problems() -> Vec<(String, String)> {
+    std::mem::take(&mut *PROBLEMS.lock().unwrap_or_else(|e| e.into_inner()))
 }
 
 /// [`pull_node`] on a thread of its own (after a turn); a failure is

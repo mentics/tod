@@ -667,11 +667,12 @@ fn a_session_that_cannot_be_resumed_rotates_and_resends() {
             TurnRole::User,
             TurnRole::Agent,
             TurnRole::User,
+            TurnRole::Error,
             TurnRole::Rotation,
             TurnRole::Agent,
         ]
     );
-    assert_eq!(turns(&fx, id)[4].1, "Are you back?");
+    assert_eq!(turns(&fx, id)[5].1, "Are you back?");
     assert_eq!(driver.status().last_error, None);
 }
 
@@ -1601,4 +1602,23 @@ fn a_node_whose_files_are_missing_is_an_error_not_a_scratch_directory() {
     let id = driver.conversation_id().unwrap();
     assert!(turns(&fx, id).iter().any(|(role, body)| *role == TurnRole::Error && body.contains("not-there")));
     assert!(driver.status().last_error.is_some());
+}
+
+/// A copy of the session's log that fails after its turn is written into the
+/// node's conversation (so an unattended run shows it), once.
+#[test]
+fn a_background_failure_is_recorded_in_the_nodes_conversation_once() {
+    let fx = fixture();
+    let mut agent = FakeAgent::new(&fx.fleet);
+    let mut driver = ConversationDriver::new(config(&fx, 100_000), Focus::Node(fx.node), ProtocolKind::Outline);
+    say(&mut driver, &fx, &mut agent, "think hello");
+    let id = driver.conversation_id().unwrap();
+    let message = format!("test problem {id}");
+    tod_store::fleet::session_log::report_problem(&fx.node.to_string(), message.clone());
+    // Whoever polls first takes it (a parallel test's driver may); it is
+    // recorded either way, and not again.
+    super::problems::record_pending(&fx.fleet);
+    super::problems::record_pending(&fx.fleet);
+    let errors = turns(&fx, id).into_iter().filter(|(role, body)| *role == TurnRole::Error && *body == message).count();
+    assert_eq!(errors, 1);
 }

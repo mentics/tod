@@ -18,6 +18,7 @@ pub mod launch;
 pub mod mock;
 pub mod phase;
 pub mod pr;
+pub mod problems;
 pub mod protocol;
 pub mod review;
 pub mod verify;

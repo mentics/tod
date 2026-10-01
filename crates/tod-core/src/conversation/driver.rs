@@ -256,7 +256,7 @@ impl ConversationDriver {
     /// sandbox), copy it here from where it is, under this working
     /// directory's project name (`doc/agentd.md`, "Moving a node"). A failure
     /// is logged: the resume then fails and the driver's recovery runs.
-    fn bring_session(&mut self, fleet: &FleetStore, cwd: &Workdir, session: &str, moved: bool) {
+    fn bring_session(&mut self, fleet: &FleetStore, conversation: Uuid, cwd: &Workdir, session: &str, moved: bool) {
         use tod_store::fleet::session_log::{self as log, ContainerRemote, HostRemote, MirrorRemote, SandboxRemote};
         let result = (|| -> anyhow::Result<bool> {
             let host = HostRemote::new()?;
@@ -292,13 +292,22 @@ impl ConversationDriver {
                 "This node moved: the agent's session continues in {cwd}."
             ))),
             Ok(true) => {}
-            Ok(false) => self.notices.push(RunNotice::Error(format!(
+            Ok(false) => self.fail_visibly(fleet, conversation, format!(
                 "There is no copy of the agent's session log to bring to {cwd}, so it cannot continue there; a fresh session will be started."
-            ))),
-            Err(err) => self.notices.push(RunNotice::Error(format!(
+            )),
+            Err(err) => self.fail_visibly(fleet, conversation, format!(
                 "Could not bring the agent's session log to {cwd}, so a fresh session will be started: {err:#}"
-            ))),
+            )),
         }
+    }
+
+    /// Tell the user: a notice, and an error turn in the transcript (which an
+    /// unattended run's transcript shows too).
+    fn fail_visibly(&mut self, fleet: &FleetStore, conversation: Uuid, message: String) {
+        if let Err(err) = self.append(fleet, conversation, TurnRole::Error, &message) {
+            tracing::warn!("could not record an error in the transcript: {err:#}");
+        }
+        self.notices.push(RunNotice::Error(message));
     }
 
     /// The stored conversation, once the first send created it.
@@ -525,11 +534,10 @@ impl ConversationDriver {
         agent: &mut A,
     ) -> Vec<ConversationEvent> {
         let mut events = Vec::new();
-        // Background session-log copies that failed since the last tick.
-        if let Some(node) = self.focus.node_id() {
-            for problem in tod_store::fleet::session_log::take_problems(&node.to_string()) {
-                self.notices.push(RunNotice::Error(problem));
-            }
+        // Background session-log copies that failed since the last tick: put
+        // in the transcript, so an unattended run shows them too.
+        for problem in crate::conversation::problems::record_pending(fleet) {
+            self.notices.push(RunNotice::Error(problem));
         }
         for notice in std::mem::take(&mut self.notices) {
             events.push(ConversationEvent::Notice(notice));
@@ -1008,7 +1016,7 @@ impl ConversationDriver {
         }
         self.session_place = Some(cwd.clone());
         if let Some(session) = &resume {
-            self.bring_session(fleet, &cwd, session, moved);
+            self.bring_session(fleet, id, &cwd, session, moved);
         }
         self.progress_before = progress;
         // Whatever the protocol, an agent running in a codebase gets its rules.

@@ -561,14 +561,20 @@ impl ConversationView {
                         })
                         .await
                 };
+                // Failures of background copies (they happen after the turn
+                // that started them); recorded off the main thread.
+                let problems = {
+                    let fleet = poll_fleet.clone();
+                    cx.background_executor()
+                        .spawn(async move { tod_core::conversation::problems::record_pending(&fleet) })
+                        .await
+                };
                 let Ok(want_files) = this.update(cx, |this, cx| {
                     let (changed, want_files) = this.poll(committed, ticked, cx);
                     this.refresh_session_info(cx);
                     this.publish_status(cx);
                     this.pending_notices.extend(
-                        tod_store::fleet::session_log::take_all_problems()
-                            .into_iter()
-                            .map(RunNotice::Error),
+                        problems.into_iter().map(RunNotice::Error),
                     );
                     for notice in std::mem::take(&mut this.pending_notices) {
                         cx.emit(ConversationViewEvent::Notice(notice));

@@ -871,7 +871,8 @@ impl Autopilot {
                         turn_ended = true;
                     }
                     ConversationEvent::Notice(notice) => {
-                        tracing::info!(node = %self.node, ?notice, "autopilot notice");
+                        // Errors are also in the conversation's transcript.
+                        tracing::warn!(node = %self.node, ?notice, "autopilot notice");
                     }
                     ConversationEvent::Continued => turn_ended = true,
                     ConversationEvent::Rotated => {}
