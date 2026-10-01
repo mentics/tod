@@ -41,6 +41,7 @@ pub mod lifecycle;
 pub mod lifecycle_next;
 pub mod lifecycle_validity;
 pub mod linear_import;
+pub mod linear_sync;
 pub mod logging;
 pub mod media;
 pub mod node_context;

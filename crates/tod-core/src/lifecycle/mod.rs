@@ -40,7 +40,15 @@ pub fn set_lifecycle(fleet: &FleetStore, node: Uuid, state: &str) -> Result<()> 
         })
         .map_err(|err| anyhow::anyhow!("{err:#}"))?;
     let _ = fleet.writer().flush();
+    push_to_ticket(fleet, node, state);
     Ok(())
+}
+
+/// Brings the node's Linear ticket up to the state it entered.
+fn push_to_ticket(fleet: &FleetStore, node: Uuid, state: &str) {
+    if let Some(milestone) = crate::linear_sync::Milestone::for_lifecycle(state) {
+        crate::linear_sync::push(fleet, node, milestone);
+    }
 }
 
 /// Move the node to its next state, bypassing the gate criteria. Returns the
@@ -104,6 +112,7 @@ pub fn advance(fleet: &FleetStore, node: Uuid) -> Result<Option<&'static str>> {
         })
         .map_err(|err| anyhow::anyhow!("{err:#}"))?;
     let _ = fleet.writer().flush();
+    push_to_ticket(fleet, node, next);
     Ok(Some(next))
 }
 

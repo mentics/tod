@@ -3006,6 +3006,8 @@ impl TaskListView {
             self.show_error(format!("Accept failed: {err}"), window, cx);
             return;
         }
+        // The copy is the same ticket: make sure Linear has it at least up next.
+        tod_core::linear_sync::push(&self.fleet, new_node_id, tod_core::linear_sync::Milestone::Accepted);
         self.live_refresh(window, cx);
         self.select_created_task(&new_node_id.to_string(), window, cx);
     }
