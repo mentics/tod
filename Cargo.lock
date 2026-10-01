@@ -9041,9 +9041,12 @@ dependencies = [
  "fs2",
  "serde",
  "serde_json",
+ "tod-agent",
  "tod-agentd-client",
+ "tod-core",
  "tod-store",
  "tokio",
+ "tracing",
  "uuid",
 ]
 
@@ -9290,6 +9293,7 @@ dependencies = [
  "sysinfo 0.37.2",
  "thiserror 2.0.20",
  "tod-agent",
+ "tod-agentd",
  "tod-agentd-client",
  "tod-core",
  "tod-integration",
