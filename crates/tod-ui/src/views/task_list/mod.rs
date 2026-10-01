@@ -2055,6 +2055,21 @@ impl TaskListView {
             return;
         }
         self.live_refresh(window, cx);
+        // A move across parents can land in a collapsed one; open every
+        // collapsed ancestor so the moved node stays visible.
+        let mut collapsed_ancestors = Vec::new();
+        let mut current = self.all_tasks.iter().find(|t| t.id == task_id);
+        while let Some(parent_id) = current.and_then(|t| t.parent_id.as_deref()) {
+            current = self.all_tasks.iter().find(|t| t.id == parent_id);
+            match current {
+                Some(parent) if parent.collapsed => collapsed_ancestors.push(parent.id.clone()),
+                Some(_) => {}
+                None => break,
+            }
+        }
+        for ancestor in &collapsed_ancestors {
+            self.set_collapsed(ancestor, false, window, cx);
+        }
         self.select_task_by_id(&task_id, window, cx);
     }
 
