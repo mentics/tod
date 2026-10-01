@@ -1,7 +1,8 @@
 //! Local HTTP server that serves a mockup and its live-reload stream.
 //! Design: `doc/ui/visual-design-browser.md` section 4. One server per app
 //! run on `127.0.0.1` (port 0); a session is a mockup path plus a random token
-//! that sits in the URL path. No feedback route yet (item F1).
+//! that sits in the URL path. `POST /d/<token>/__tod/feedback` (item F1) hands a
+//! validated [`Feedback`] to the callback set with `on_feedback`.
 
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::HashMap;
@@ -14,6 +15,61 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 const BRIDGE_JS: &str = include_str!("bridge.js");
+const SELECTION_JS: &str = include_str!("selection.js");
+const OVERLAY_JS: &str = include_str!("overlay.js");
+/// Largest feedback body accepted (outerHtml is capped client side too).
+const MAX_FEEDBACK: usize = 256 * 1024;
+
+#[derive(Clone, Debug, Default, PartialEq, serde::Deserialize)]
+pub struct Rect {
+    pub x: f64,
+    pub y: f64,
+    pub w: f64,
+    pub h: f64,
+}
+
+#[derive(Clone, Debug, PartialEq, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Selection {
+    pub selector: String,
+    pub tag: String,
+    #[serde(default)]
+    pub classes: Vec<String>,
+    #[serde(default)]
+    pub text: String,
+    pub rect: Rect,
+    #[serde(default)]
+    pub scope: String,
+    #[serde(default)]
+    pub outer_html: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Viewport {
+    pub w: f64,
+    pub h: f64,
+    #[serde(default)]
+    pub scroll_x: f64,
+    #[serde(default)]
+    pub scroll_y: f64,
+}
+
+/// What the page posts (design 7.2).
+#[derive(Clone, Debug, PartialEq, serde::Deserialize)]
+pub struct Feedback {
+    #[serde(default)]
+    pub comment: String,
+    #[serde(default)]
+    pub selections: Vec<Selection>,
+    #[serde(default, rename = "box")]
+    pub boxed: Option<Rect>,
+    pub viewport: Viewport,
+}
+
+/// Called with the session token and the feedback, on a server thread.
+pub type FeedbackHandler = Arc<dyn Fn(&str, Feedback) + Send + Sync>;
+type Handler = Arc<Mutex<Option<FeedbackHandler>>>;
 const DEBOUNCE: Duration = Duration::from_millis(150);
 const KEEPALIVE: Duration = Duration::from_secs(15);
 
@@ -47,6 +103,7 @@ pub struct DesignServer {
     port: u16,
     sessions: Sessions,
     stop: Arc<AtomicBool>,
+    handler: Handler,
 }
 
 impl DesignServer {
@@ -55,21 +112,27 @@ impl DesignServer {
         let port = listener.local_addr()?.port();
         let sessions: Sessions = Arc::default();
         let stop = Arc::new(AtomicBool::new(false));
-        let (s, st) = (sessions.clone(), stop.clone());
+        let handler: Handler = Arc::default();
+        let (s, st, hd) = (sessions.clone(), stop.clone(), handler.clone());
         std::thread::spawn(move || {
             for conn in listener.incoming() {
                 if st.load(Ordering::SeqCst) {
                     break;
                 }
                 if let Ok(conn) = conn {
-                    let s = s.clone();
+                    let (s, hd) = (s.clone(), hd.clone());
                     std::thread::spawn(move || {
-                        let _ = handle(conn, port, &s);
+                        let _ = handle(conn, port, &s, &hd);
                     });
                 }
             }
         });
-        Ok(Self { port, sessions, stop })
+        Ok(Self { port, sessions, stop, handler })
+    }
+
+    /// Registers the callback that receives validated feedback.
+    pub fn on_feedback(&self, f: impl Fn(&str, Feedback) + Send + Sync + 'static) {
+        *self.handler.lock().unwrap() = Some(Arc::new(f));
     }
 
     pub fn port(&self) -> u16 {
@@ -190,6 +253,8 @@ struct Request {
     target: String,
     host: Option<String>,
     origin: Option<String>,
+    content_length: Option<usize>,
+    body: Vec<u8>,
 }
 
 fn read_request(conn: &mut TcpStream) -> Option<Request> {
@@ -210,17 +275,29 @@ fn read_request(conn: &mut TcpStream) -> Option<Request> {
     let mut lines = head.split("\r\n");
     let mut first = lines.next()?.split(' ');
     let (method, target) = (first.next()?.to_string(), first.next()?.to_string());
-    let (mut host, mut origin) = (None, None);
+    let (mut host, mut origin, mut content_length) = (None, None, None);
     for l in lines {
         if let Some((k, v)) = l.split_once(':') {
             match k.trim().to_ascii_lowercase().as_str() {
                 "host" => host = Some(v.trim().to_string()),
                 "origin" => origin = Some(v.trim().to_string()),
+                "content-length" => content_length = v.trim().parse().ok(),
                 _ => {}
             }
         }
     }
-    Some(Request { method, target, host, origin })
+    let split = buf.windows(4).position(|w| w == b"\r\n\r\n")? + 4;
+    let mut body = buf[split..].to_vec();
+    if let Some(n) = content_length.filter(|n| *n <= MAX_FEEDBACK) {
+        while body.len() < n {
+            let r = conn.read(&mut chunk).ok()?;
+            if r == 0 {
+                return None;
+            }
+            body.extend_from_slice(&chunk[..r]);
+        }
+    }
+    Some(Request { method, target, host, origin, content_length, body })
 }
 
 fn respond(conn: &mut TcpStream, status: &str, ctype: &str, body: &[u8]) -> std::io::Result<()> {
@@ -250,7 +327,7 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-fn handle(mut conn: TcpStream, port: u16, sessions: &Sessions) -> std::io::Result<()> {
+fn handle(mut conn: TcpStream, port: u16, sessions: &Sessions, handler: &Handler) -> std::io::Result<()> {
     let Some(req) = read_request(&mut conn) else {
         return respond(&mut conn, "400 Bad Request", "text/plain", b"bad request");
     };
@@ -262,12 +339,21 @@ fn handle(mut conn: TcpStream, port: u16, sessions: &Sessions) -> std::io::Resul
             return respond(&mut conn, "403 Forbidden", "text/plain", b"bad origin");
         }
     }
+    let path = req.target.split(['?', '#']).next().unwrap_or("");
+    if req.method == "POST" {
+        return post_feedback(&mut conn, &req, path, port, sessions, handler);
+    }
     if req.method != "GET" {
         return respond(&mut conn, "405 Method Not Allowed", "text/plain", b"GET only");
     }
-    let path = req.target.split(['?', '#']).next().unwrap_or("");
     if path == "/__tod/bridge.js" {
         return respond(&mut conn, "200 OK", "text/javascript", BRIDGE_JS.as_bytes());
+    }
+    if path == "/__tod/selection.js" {
+        return respond(&mut conn, "200 OK", "text/javascript", SELECTION_JS.as_bytes());
+    }
+    if path == "/__tod/overlay.js" {
+        return respond(&mut conn, "200 OK", "text/javascript", OVERLAY_JS.as_bytes());
     }
     let Some(rest) = path.strip_prefix("/d/") else {
         return respond(&mut conn, "404 Not Found", "text/plain", b"not found");
@@ -295,6 +381,55 @@ fn handle(mut conn: TcpStream, port: u16, sessions: &Sessions) -> std::io::Resul
         respond(&mut conn, "200 OK", "text/html; charset=utf-8", html.as_bytes())
     } else {
         respond(&mut conn, "200 OK", content_type(&file), &bytes)
+    }
+}
+
+/// `POST /d/<token>/__tod/feedback`: the token must name a live session, the
+/// Origin must be present and ours, and the body must fit the cap and parse.
+fn post_feedback(
+    conn: &mut TcpStream,
+    req: &Request,
+    path: &str,
+    port: u16,
+    sessions: &Sessions,
+    handler: &Handler,
+) -> std::io::Result<()> {
+    let token = path
+        .strip_prefix("/d/")
+        .and_then(|r| r.strip_suffix("/__tod/feedback"))
+        .filter(|t| !t.contains('/'));
+    let Some(token) = token else {
+        return respond(conn, "404 Not Found", "text/plain", b"not found");
+    };
+    if !sessions.lock().unwrap().contains_key(token) {
+        return respond(conn, "404 Not Found", "text/plain", b"not found");
+    }
+    if req.origin.as_deref() != Some(&format!("http://127.0.0.1:{port}")) {
+        return respond(conn, "403 Forbidden", "text/plain", b"bad origin");
+    }
+    match req.content_length {
+        None => return respond(conn, "411 Length Required", "text/plain", b"length required"),
+        Some(n) if n > MAX_FEEDBACK => {
+            return respond(conn, "413 Payload Too Large", "text/plain", b"too large")
+        }
+        Some(n) if n != req.body.len() => {
+            return respond(conn, "400 Bad Request", "text/plain", b"bad body")
+        }
+        _ => {}
+    }
+    let Ok(fb) = serde_json::from_slice::<Feedback>(&req.body) else {
+        return respond(conn, "400 Bad Request", "text/plain", b"bad feedback");
+    };
+    if fb.comment.trim().is_empty() && fb.selections.is_empty() {
+        return respond(conn, "400 Bad Request", "text/plain", b"empty feedback");
+    }
+    let cb = handler.lock().unwrap().clone();
+    match cb {
+        Some(cb) => {
+            cb(token, fb);
+            respond(conn, "204 No Content", "text/plain", b"")
+        }
+        None => respond(conn, "503 Service Unavailable", "text/plain", b"no handler"),
     }
 }
 
@@ -403,6 +538,73 @@ mod tests {
         let _ = c.read_to_string(&mut s);
         let (head, body) = s.split_once("\r\n\r\n").unwrap_or((&s, ""));
         (head.lines().next().unwrap_or("").to_string(), body.to_string())
+    }
+
+    fn post(port: u16, target: &str, origin: Option<&str>, len: Option<usize>, body: &str) -> String {
+        let mut c = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut h = format!("POST {target} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n");
+        if let Some(o) = origin {
+            h += &format!("Origin: {o}\r\n");
+        }
+        if let Some(l) = len {
+            h += &format!("Content-Length: {l}\r\n");
+        }
+        write!(c, "{h}\r\n{body}").unwrap();
+        let mut s = String::new();
+        let _ = c.read_to_string(&mut s);
+        s.lines().next().unwrap_or("").to_string()
+    }
+
+    #[test]
+    fn feedback_route_validates_and_delivers() {
+        let dir = tmp();
+        std::fs::write(dir.join("m.html"), "<body>x</body>").unwrap();
+        let srv = DesignServer::start().unwrap();
+        let got: Arc<Mutex<Vec<(String, Feedback)>>> = Arc::default();
+        let g = got.clone();
+        let url = srv.open(&dir.join("m.html"));
+        let p = format!("{}__tod/feedback", path_of(&url));
+        let port = srv.port();
+        let ok = format!("http://127.0.0.1:{port}");
+        let body = r#"{"comment":"same height","selections":[{"selector":"main > .card","tag":"div","classes":["card"],"text":"t","rect":{"x":1,"y":2,"w":3,"h":4},"scope":"element","outerHtml":"<div>"}],"box":{"x":0,"y":0,"w":9,"h":9},"viewport":{"w":800,"h":600,"scrollX":0,"scrollY":5}}"#;
+        // No handler registered yet.
+        assert!(post(port, &p, Some(&ok), Some(body.len()), body).contains("503"));
+        srv.on_feedback(move |t, f| g.lock().unwrap().push((t.to_string(), f)));
+        assert!(post(port, &p, Some(&ok), Some(body.len()), body).contains("204"));
+        {
+            let v = got.lock().unwrap();
+            assert_eq!(v.len(), 1);
+            assert_eq!(v[0].0, token_of(&url));
+            assert_eq!(v[0].1.comment, "same height");
+            assert_eq!(v[0].1.selections[0].outer_html, "<div>");
+            assert_eq!(v[0].1.boxed.as_ref().unwrap().w, 9.0);
+            assert_eq!(v[0].1.viewport.scroll_y, 5.0);
+        }
+        let bad_tok = format!("/d/{}/__tod/feedback", "0".repeat(64));
+        assert!(post(port, &bad_tok, Some(&ok), Some(body.len()), body).contains("404"));
+        assert!(post(port, &p, None, Some(body.len()), body).contains("403"));
+        assert!(post(port, &p, Some("http://evil.example"), Some(body.len()), body).contains("403"));
+        assert!(post(port, &p, Some(&ok), None, body).contains("411"));
+        assert!(post(port, &p, Some(&ok), Some(MAX_FEEDBACK + 1), "").contains("413"));
+        assert!(post(port, &p, Some(&ok), Some(5), "{nope").contains("400"));
+        let empty = r#"{"comment":" ","selections":[],"viewport":{"w":1,"h":1}}"#;
+        assert!(post(port, &p, Some(&ok), Some(empty.len()), empty).contains("400"));
+        assert_eq!(got.lock().unwrap().len(), 1);
+        let (st, body) = get(port, "/__tod/selection.js", None);
+        assert!(st.contains("200") && body.contains("outermostInside"));
+        let (st, body) = get(port, "/__tod/overlay.js", None);
+        assert!(st.contains("200") && body.contains("attachShadow"));
+    }
+
+    /// Runs the JS logic tests when `node` is installed; skipped otherwise.
+    #[test]
+    fn selection_logic_js_passes_under_node() {
+        let file = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/visual_design/selection.test.js");
+        match std::process::Command::new("node").arg(&file).output() {
+            Ok(out) => assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr)),
+            Err(_) => eprintln!("node not found; skipping"),
+        }
     }
 
     fn path_of(url: &str) -> String {
