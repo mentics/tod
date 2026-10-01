@@ -384,7 +384,7 @@ This design is the rebuild's browser half; the conversation half is a separate
 piece of work, specified here only where they meet. (The earlier protocols spec,
 `doc/conversation/protocols.md`, was deleted in commit `1e13f79`, "cleanup doc
 dir"; `git show 1e13f79^:doc/conversation/protocols.md` recovers it. The old
-panel's header comment still points at it.)
+panel, and its header comment, have since been deleted.)
 
 **Associated with the obligation, like any chat.** A visual-design conversation
 is a row in `conversations` with `focus = Obligation { node, id }` and

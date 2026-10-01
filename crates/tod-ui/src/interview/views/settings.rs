@@ -1,7 +1,7 @@
 use crate::interview::TodPaths;
 use crate::interview::agent::AgentPlatform;
 use crate::interview::settings::{
-    ChatLaunchMode, MAX_LOG_MAX_SIZE_KB, MIN_LOG_MAX_SIZE_KB, TodSettings, WorktreeBackend,
+    MAX_LOG_MAX_SIZE_KB, MIN_LOG_MAX_SIZE_KB, TodSettings, WorktreeBackend,
 };
 use crate::ui::app_nav::{AppDestination, AppNavMenu, HasAppNav};
 use crate::ui::key_context;
@@ -162,7 +162,6 @@ impl SettingsSection {
                 Agent(AgentRole::Chat),
                 Agent(AgentRole::Interview),
                 ClaudeAdapter,
-                ChatLaunchMode,
                 MaxParallelSessions,
             ],
             Self::Lifecycle => &[LifecycleIndependentEvaluation],
@@ -231,7 +230,6 @@ enum SettingField {
     SandboxClaudeClear,
     LogLevel,
     LogMaxSize,
-    ChatLaunchMode,
     MaxParallelSessions,
     JourneysSend,
     JourneysIncludeTranscripts,
@@ -274,7 +272,6 @@ impl SettingField {
             Self::SandboxClaudeClear => "sandbox-claude-clear",
             Self::LogLevel => "log-level",
             Self::LogMaxSize => "log-max-size",
-            Self::ChatLaunchMode => "chat-launch-mode",
             Self::MaxParallelSessions => "max-parallel-sessions",
             Self::JourneysSend => "journeys-send",
             Self::JourneysIncludeTranscripts => "journeys-include-transcripts",
@@ -1137,7 +1134,6 @@ impl SettingsView {
             SettingField::PromptCacheIdle => self.step_prompt_cache_idle(delta, cx),
             SettingField::AnsweredHistoryCap => self.step_answered_history_cap(delta, cx),
             SettingField::WorktreeBackend => self.cycle_worktree_backend(delta, cx),
-            SettingField::ChatLaunchMode => self.cycle_chat_launch_mode(delta, cx),
             SettingField::MaxParallelSessions => self.step_max_parallel_sessions(delta, cx),
             SettingField::TreehouseExecutable
             | SettingField::TreehouseWorktreesRoot
@@ -1721,18 +1717,6 @@ impl SettingsView {
         }
     }
 
-    fn cycle_chat_launch_mode(&mut self, delta: i32, cx: &mut Context<Self>) {
-        const ORDER: [ChatLaunchMode; 2] = [ChatLaunchMode::Window, ChatLaunchMode::Terminal];
-        let idx = ORDER
-            .iter()
-            .position(|m| *m == self.settings.chat_launch_mode)
-            .unwrap_or(0);
-        let len = ORDER.len() as i32;
-        let next = ((idx as i32 + delta).rem_euclid(len)) as usize;
-        self.settings.chat_launch_mode = ORDER[next];
-        self.schedule_save("chat_launch_mode", cx);
-        cx.notify();
-    }
 }
 
 /// Sign in to the workspace and say what came back. Network, and maybe
@@ -2199,17 +2183,6 @@ impl SettingsView {
                     rows = rows.child(agent_role_row(cx, self, role, theme));
                 }
                 rows = rows.child(claude_adapter_row(window, cx, self, theme));
-                rows = rows.child(cycle_row(
-                    cx,
-                    self,
-                    SettingField::ChatLaunchMode,
-                    self.settings.chat_launch_mode.label(),
-                    "Chat with agent opens in",
-                    "Where \"chat with agent\" starts a session: the app's own window, or an external terminal running the platform CLI directly (using the terminal program configured under Workspaces).",
-                    theme,
-                    |this, _, cx| this.cycle_chat_launch_mode(-1, cx),
-                    |this, _, cx| this.cycle_chat_launch_mode(1, cx),
-                ));
                 rows = rows.child(stepper_row(
                     cx,
                     self,

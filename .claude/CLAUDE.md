@@ -207,13 +207,14 @@ cloud sandbox (`tod_core::conversation::handoff`,
 conversation's actor, so its outline writes stay in the change set; the app
 closes its own session first and resumes it by id on the next Send.
 
-Implement, Verify, Review, and the action panel's Chat now run in the conversation view (see
-**Protocols** below). The one chat left on the old path is the visual-design
-panel's embedded chat, which uses `InteractiveAgentView`; it, the view, and
-`InteractiveAgentWindow` are slated for deletion once visual design is rebuilt
-as a protocol. What follows describes that old path. Its context is assembled by
-`tod_core::agent_context` and held until the user submits their first message —
-nothing reaches the agent before then. A chat window holds one long-lived agent session
+Every agent chat runs in the conversation view (see **Protocols** below):
+Implement, Verify, Review, the action panel's Chat, and visual design (the
+`visual_design` protocol, whose browser half is `visual_design/`;
+`doc/ui/visual-design-browser.md`). The old standalone chat window and the
+visual-design panel's embedded chat are gone. A surface's context is assembled
+by `tod_core::context_recipes::build_message` (via
+`tod_core::agent_context`) and held until the user submits their first
+message — nothing reaches the agent before then. A chat holds one long-lived agent session
 (`AgentProvider::send_session_turn`):
 the first message opens it — the context and the message go out together as one
 turn, and the session is given its name (for Claude, a `custom-title` record
@@ -355,8 +356,10 @@ beside Review): given the open findings, the agent answers each `fixed` or
 until none is open and a test run is green. The `review` → `pr` gate is app-checked
 (`tod_core::gate::derived`): review recorded done, no finding still open. `tod_ui::conversation::side_pane` picks the pane, and the picker offers a
 "New …" entry per kind the focus can start. Adding a kind means a
-`ProtocolKind` variant, an impl, a registry arm, and a side pane. Spec:
-`doc/conversation/protocols.md`.
+`ProtocolKind` variant, an impl, a registry arm, and a side pane. The spec,
+`doc/conversation/protocols.md`, was deleted in commit `1e13f79` ("cleanup doc
+dir") and is recoverable from that commit's parent; the module comments in
+`tod_core::conversation` are the current description.
 
 `tod_core::conversation` runs it: `driver.rs` (`ConversationDriver`: send, tick,
 resume, rotation), `context.rs` (opening message, per-turn delta, rotation

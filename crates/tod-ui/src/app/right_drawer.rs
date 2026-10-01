@@ -19,7 +19,6 @@ use crate::views::lifecycle_panel::LifecyclePanelView;
 use crate::views::obligations::ObligationsView;
 use crate::views::plan_steps::PlanStepsView;
 use crate::views::task_edit::TaskEditView;
-use crate::views::visual_design_panel::VisualDesignPanelView;
 use gpui::{AnyElement, App, Entity, Focusable, IntoElement, Window};
 use tod_store::fleet::FleetStore;
 use uuid::Uuid;
@@ -30,16 +29,14 @@ pub(crate) enum DrawerKind {
     Obligations,
     Plan,
     Lifecycle,
-    VisualDesign,
     Action,
 }
 
-const ALL_KINDS: [DrawerKind; 6] = [
+const ALL_KINDS: [DrawerKind; 5] = [
     DrawerKind::TaskEdit,
     DrawerKind::Obligations,
     DrawerKind::Plan,
     DrawerKind::Lifecycle,
-    DrawerKind::VisualDesign,
     DrawerKind::Action,
 ];
 
@@ -61,10 +58,6 @@ pub(crate) enum DrawerRequest {
     OpenLifecycle {
         task_id: String,
     },
-    OpenVisualDesign {
-        node_id: Uuid,
-        obligation_id: Uuid,
-    },
     OpenActionPanel {
         task_id: String,
     },
@@ -81,7 +74,6 @@ pub(crate) struct RightDrawer {
     pub obligations: Entity<ObligationsView>,
     pub plan: Entity<PlanStepsView>,
     pub lifecycle: Entity<LifecyclePanelView>,
-    pub visual_design: Entity<VisualDesignPanelView>,
     pub action: Entity<ActionPanelView>,
 }
 
@@ -92,7 +84,6 @@ impl RightDrawer {
             DrawerKind::Obligations => self.obligations.read(cx).is_open(),
             DrawerKind::Plan => self.plan.read(cx).is_open(),
             DrawerKind::Lifecycle => self.lifecycle.read(cx).is_open(),
-            DrawerKind::VisualDesign => self.visual_design.read(cx).is_open(),
             DrawerKind::Action => self.action.read(cx).is_open(),
         }
     }
@@ -122,9 +113,6 @@ impl RightDrawer {
                     .update(cx, |panel, cx| panel.close(window, cx)),
                 DrawerKind::Plan => self.plan.update(cx, |panel, cx| panel.close(window, cx)),
                 DrawerKind::Lifecycle => self.lifecycle.update(cx, |panel, cx| panel.close(cx)),
-                DrawerKind::VisualDesign => {
-                    self.visual_design.update(cx, |panel, cx| panel.close(cx))
-                }
                 DrawerKind::Action => self.action.update(cx, |panel, cx| panel.close(cx)),
             }
         }
@@ -155,17 +143,6 @@ impl RightDrawer {
             DrawerKind::Lifecycle => {
                 self.lifecycle
                     .update(cx, |panel, cx| panel.retarget(task_id, cx));
-            }
-            DrawerKind::VisualDesign => {
-                // A visual design session belongs to one obligation, which a
-                // different node does not have — show that node's obligations,
-                // the list design sessions are opened from.
-                let same_node = Uuid::parse_str(task_id)
-                    .is_ok_and(|id| self.visual_design.read(cx).node_id() == Some(id));
-                if !same_node {
-                    self.show_obligations(task_id, fleet, window, cx);
-                    self.close_except(Some(DrawerKind::Obligations), window, cx);
-                }
             }
             DrawerKind::Action => {
                 self.action
@@ -202,11 +179,6 @@ impl RightDrawer {
             Some(DrawerKind::Lifecycle) => self
                 .lifecycle
                 .update(cx, |panel, cx| panel.focus(window, cx)),
-            Some(DrawerKind::VisualDesign) => self
-                .visual_design
-                .read(cx)
-                .focus_handle(cx)
-                .focus(window, cx),
             Some(DrawerKind::Action) => self.action.read(cx).focus_handle(cx).focus(window, cx),
             None => {}
         }
@@ -218,7 +190,6 @@ impl RightDrawer {
             DrawerKind::Obligations => self.obligations.clone().into_any_element(),
             DrawerKind::Plan => self.plan.clone().into_any_element(),
             DrawerKind::Lifecycle => self.lifecycle.clone().into_any_element(),
-            DrawerKind::VisualDesign => self.visual_design.clone().into_any_element(),
             DrawerKind::Action => self.action.clone().into_any_element(),
         })
     }

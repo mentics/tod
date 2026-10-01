@@ -95,29 +95,7 @@ const OWN_OBLIGATIONS_NOTE: &str = "This node's own. They define what is in scop
      ancestor context below, whose requirements are settled and whose \
      constraints still bind.";
 
-/// The visual-design chat. It mutates through exactly one command, so it loads
-/// `cli/visual-design` and none of the other nouns. An obligation is always
-/// selected here (the chat is scoped to one), hence no fallback.
-pub const VISUAL_DESIGN_CHAT: ContextRecipe = ContextRecipe {
-    name: "visual-design chat",
-    situational: false,
-    layers: &[
-        "stance/interactive-chat",
-        "domain/outline",
-        "domain/obligations",
-        "cli/intro",
-        "cli/visual-design",
-        "surface/visual-design",
-    ],
-    blocks: &[
-        DynamicBlock::DataRoot,
-        DynamicBlock::Node,
-        DynamicBlock::AncestorContext,
-        DynamicBlock::SelectedObligation { fallback: "" },
-    ],
-};
-
-/// The visual-design conversation protocol's recipe. Like the chat, it records
+/// The visual-design conversation protocol's recipe. It records
 /// its writes in the conversation's change set (`cli/changeset`) and may record
 /// an obligation (`cli/obligations`) when page feedback justifies one; it has
 /// no plan or lifecycle fragments. Accepting a mockup is the app's own button.
@@ -436,7 +414,11 @@ pub const CONVERSATION: ContextRecipe = ContextRecipe {
         "cli/environment",
         "surface/conversation",
     ],
-    blocks: &[DynamicBlock::DataRoot, DynamicBlock::Focus, DynamicBlock::Environment],
+    blocks: &[
+        DynamicBlock::DataRoot,
+        DynamicBlock::Focus,
+        DynamicBlock::Environment,
+    ],
 };
 
 /// A general conversation: whatever the user asks, on any focus. It has the
@@ -460,7 +442,11 @@ pub const CHAT: ContextRecipe = ContextRecipe {
         "cli/environment",
         "surface/chat",
     ],
-    blocks: &[DynamicBlock::DataRoot, DynamicBlock::Focus, DynamicBlock::Environment],
+    blocks: &[
+        DynamicBlock::DataRoot,
+        DynamicBlock::Focus,
+        DynamicBlock::Environment,
+    ],
 };
 
 /// An incoming-changes check (`crate::incoming`): one short-lived session
@@ -497,7 +483,6 @@ pub const ALL_RECIPES: &[ContextRecipe] = &[
     INCOMING_CHANGES,
     CONVERSATION,
     CHAT,
-    VISUAL_DESIGN_CHAT,
     VISUAL_DESIGN,
     IMPLEMENT_SESSION,
     VERIFY_SESSION,
@@ -576,7 +561,10 @@ mod tests {
             .chain(SITUATIONAL_CLI.iter().copied())
             .chain(["workspace/codebase"])
             .collect();
-        for key in all_fragments(&root).into_iter().filter(|k| !k.starts_with("cli/")) {
+        for key in all_fragments(&root)
+            .into_iter()
+            .filter(|k| !k.starts_with("cli/"))
+        {
             assert!(
                 used.contains(key.as_str()),
                 "fragment {key:?} is not used by any recipe"
@@ -766,7 +754,5 @@ mod tests {
         }
         assert!(VISUAL_DESIGN.blocks.contains(&DynamicBlock::VisualDesign));
         assert!(ALL_RECIPES.iter().any(|r| r.name == VISUAL_DESIGN.name));
-        // The old chat recipe still exists until it is deleted.
-        assert!(ALL_RECIPES.iter().any(|r| r.name == VISUAL_DESIGN_CHAT.name));
     }
 }
