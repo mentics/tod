@@ -27,7 +27,15 @@
     try { sessionStorage.removeItem(KEY); } catch (e) {}
     location.href = base;
   });
-  es.addEventListener("closed", function () { es.close(); });
+  es.addEventListener("closed", function () {
+    es.close();
+    var bar = document.createElement("div");
+    bar.textContent = "Session ended";
+    bar.style.cssText =
+      "position:fixed;top:0;left:0;right:0;z-index:2147483647;padding:6px;" +
+      "background:#333;color:#fff;font:13px sans-serif;text-align:center";
+    document.body.appendChild(bar);
+  });
   // Selection overlay (F1): load the logic module, then the overlay.
   function load(src, next) {
     var s = document.createElement("script");
