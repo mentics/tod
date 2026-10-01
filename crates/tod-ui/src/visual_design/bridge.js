@@ -28,4 +28,13 @@
     location.href = base;
   });
   es.addEventListener("closed", function () { es.close(); });
+  // Selection overlay (F1): load the logic module, then the overlay.
+  function load(src, next) {
+    var s = document.createElement("script");
+    s.src = src; s.onload = next;
+    document.head.appendChild(s);
+  }
+  load("/__tod/selection.js", function () {
+    load("/__tod/overlay.js", function () { window.TodOverlay.start(base); });
+  });
 })();
