@@ -25,6 +25,7 @@ tod-integration = { path = "../tod-integration" }
 tod-journey = { path = "../tod-journey" }
 tod-sandbox = { path = "../tod-sandbox" }
 tod-store = { path = "../tod-store" }
+tod-agentd-client = { path = "../tod-agentd-client" }
 tokio = { version = "1", features = ["sync"] }
 tracing = "0.1"
 tracing-appender = "0.2"

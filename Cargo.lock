@@ -9008,7 +9008,12 @@ name = "tod"
 version = "0.1.0"
 dependencies = [
  "embed-resource",
+ "serde_json",
+ "tod-agentd",
+ "tod-agentd-client",
+ "tod-store",
  "tod-ui",
+ "uuid",
 ]
 
 [[package]]
@@ -9085,6 +9090,7 @@ dependencies = [
  "serde_yaml",
  "thiserror 2.0.20",
  "tod-agent",
+ "tod-agentd-client",
  "tod-integration",
  "tod-journey",
  "tod-orchestrator",
@@ -9284,6 +9290,7 @@ dependencies = [
  "sysinfo 0.37.2",
  "thiserror 2.0.20",
  "tod-agent",
+ "tod-agentd-client",
  "tod-core",
  "tod-integration",
  "tod-journey",

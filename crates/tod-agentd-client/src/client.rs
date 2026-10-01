@@ -157,17 +157,14 @@ impl std::fmt::Display for DaemonNewer {
 
 impl std::error::Error for DaemonNewer {}
 
-/// The `tod-agentd` executable beside the running program.
+/// The `tod-agentd` executable beside the running program. Only there: a
+/// test binary (in `deps/`) must not find, and start, a daemon of its own.
 pub fn locate_executable() -> Result<PathBuf> {
     let me = std::env::current_exe()?;
     let name = format!("tod-agentd{}", std::env::consts::EXE_SUFFIX);
-    let beside = me.parent().map(|dir| dir.join(&name));
-    // Test binaries live one level down in `deps/`.
-    let above = me.parent().and_then(Path::parent).map(|dir| dir.join(&name));
-    [beside, above]
-        .into_iter()
-        .flatten()
-        .find(|p| p.is_file())
+    me.parent()
+        .map(|dir| dir.join(&name))
+        .filter(|path| path.is_file())
         .ok_or_else(|| anyhow!("{name} was not found beside {}", me.display()))
 }
 
@@ -175,7 +172,24 @@ pub fn locate_executable() -> Result<PathBuf> {
 /// replace an older one, or start one. `executable` is the `tod-agentd` to
 /// copy and run.
 pub fn ensure_running(data_root: &Path, executable: &Path) -> Result<Ensured> {
-    ensure_running_as(data_root, executable, &Identity::this())
+    let me = Identity::this();
+    // A `tod-agentd` left over from an older build would start, be found
+    // older, and be replaced by the next caller's, over and over.
+    if !matches!(Info::read(&Paths::new(data_root)), Some(i) if i.stamp == me.stamp) {
+        let built = std::process::Command::new(executable)
+            .arg("--build-stamp")
+            .output()
+            .with_context(|| format!("run {}", executable.display()))?;
+        let built = String::from_utf8_lossy(&built.stdout).trim().to_string();
+        if built != me.stamp {
+            bail!(
+                "{} is from a different build than this program ({built}, not {});                  build tod-agentd too (cargo build -p tod-agentd)",
+                executable.display(),
+                me.stamp
+            );
+        }
+    }
+    ensure_running_as(data_root, executable, &me)
 }
 
 pub fn ensure_running_as(data_root: &Path, executable: &Path, me: &Identity) -> Result<Ensured> {

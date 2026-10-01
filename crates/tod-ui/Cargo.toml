@@ -41,6 +41,7 @@ tod-core = { path = "../tod-core" }
 tod-integration = { path = "../tod-integration" }
 tod-journey = { path = "../tod-journey" }
 tod-store = { path = "../tod-store" }
+tod-agentd-client = { path = "../tod-agentd-client" }
 tracing = "0.1"
 tracing-appender = "0.2"
 tracing-rolling-file = { version = "0.1.3", features = ["non-blocking"] }

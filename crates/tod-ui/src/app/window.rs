@@ -1909,7 +1909,13 @@ fn open_fleet_store(
     // identity and probes whether its process is still alive, which does not need to finish
     // before the window can be shown. `run_launch_hooks` runs afterward on a background
     // thread (see the `open()` caller below) so it can never delay first paint.
-    let mut store = FleetStore::open_without_reattach(&root).map_err(|err| (err, root.clone()))?;
+    // The daemon owns the store; this process reads it and asks the daemon to
+    // write (`doc/agentd.md`). It is started here when none runs, and an older
+    // one is replaced.
+    let executable = tod_agentd_client::client::locate_executable()
+        .map_err(|err| (FleetLaunchError::Other(err), root.clone()))?;
+    let mut store = tod_agentd_client::remote::open_store(&root, Some(&executable))
+        .map_err(|err| (FleetLaunchError::Other(err), root.clone()))?;
     store.set_traffic_log(traffic_log);
     Ok(Arc::new(store))
 }
@@ -2087,14 +2093,20 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                         // Only the one long-lived GUI process should run this listener, so it
                         // starts here rather than inside `FleetStore::open` (which `tod-cli`
                         // also calls, as a one-shot process, when no GUI instance is running).
-                        let mutation_socket = tod_store::fleet::mutation_socket::start(
-                            fleet.clone(),
-                            fleet.paths().root(),
-                        )
-                        .inspect_err(|err| {
-                            tracing::error!("mutation socket failed to start: {err:#}");
-                        })
-                        .ok();
+                        // Not when the daemon owns the store: `tod-cli` reaches the
+                        // daemon itself.
+                        let mutation_socket = (!fleet.is_client())
+                            .then(|| {
+                                tod_store::fleet::mutation_socket::start(
+                                    fleet.clone(),
+                                    fleet.paths().root(),
+                                )
+                                .inspect_err(|err| {
+                                    tracing::error!("mutation socket failed to start: {err:#}");
+                                })
+                                .ok()
+                            })
+                            .flatten();
                         if agent_backend == AgentBackend::Mock {
                             // Mock interview agents write through the socket just started,
                             // the same path `tod-cli` gives real agents.
