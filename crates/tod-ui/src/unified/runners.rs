@@ -105,7 +105,12 @@ impl NodeRunners {
                             tracing::info!(%node, "resuming the runner the app was closed on");
                             let _ = this.start(node, false, cx);
                         }
-                        Some(outcome) => this.runners.entry(node).or_default().outcome = Some(outcome),
+                        Some(outcome) => {
+                            if let Outcome::Waiting { due_at_ms, .. } = &outcome {
+                                this.arm_wake(node, *due_at_ms, cx);
+                            }
+                            this.runners.entry(node).or_default().outcome = Some(outcome);
+                        }
                     }
                 }
                 cx.notify();
@@ -261,10 +266,38 @@ impl NodeRunners {
                         reason: format!("{}{error}", tod_core::autopilot::local::FAILED_PREFIX),
                     },
                 });
+                if let Some(Outcome::Waiting { due_at_ms, .. }) = &runner.outcome {
+                    let due = *due_at_ms;
+                    self.arm_wake(node, due, cx);
+                }
                 self.show_conversation(node, cx);
             }
         }
         cx.notify();
+    }
+
+    /// Start the node's run again at `due_at_ms`, when it ended to wait for
+    /// something outside (a review). The clock is read in short slices so a
+    /// machine that slept wakes the run when it wakes. A run the user has
+    /// started meanwhile, or one that ended some other way, is left alone.
+    fn arm_wake(&mut self, node: Uuid, due_at_ms: i64, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            while now_ms() < due_at_ms {
+                let left = std::time::Duration::from_millis((due_at_ms - now_ms()).max(0) as u64);
+                cx.background_executor().timer(left.min(std::time::Duration::from_secs(30))).await;
+            }
+            let _ = this.update(cx, |this, cx| {
+                let still_waiting = this.runners.get(&node).is_some_and(|r| {
+                    r.run.is_none()
+                        && matches!(&r.outcome, Some(Outcome::Waiting { due_at_ms: d, .. }) if *d == due_at_ms)
+                });
+                if still_waiting {
+                    tracing::info!(%node, "the wait is due; checking again");
+                    let _ = this.start(node, false, cx);
+                }
+            });
+        })
+        .detach();
     }
 
     /// Keep the run's conversation, and only it, shown in [`AgentRuns`].

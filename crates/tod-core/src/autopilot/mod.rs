@@ -83,6 +83,11 @@ pub enum Outcome {
     /// supervisor was asked to stop). Whatever conversation was in progress
     /// stays current, so the next run reopens it.
     Stopped { reason: String },
+    /// Nothing to do until `due_at_ms` (or an event that wakes it sooner):
+    /// the run ends instead of sleeping, so whoever runs it (the app, a
+    /// cloud sandbox's scheduler) wakes it again then. The node's pending
+    /// `event` wait carries the same time.
+    Waiting { what: String, due_at_ms: i64 },
 }
 
 /// Where a run is when it calls its [`StepHook`].
@@ -677,6 +682,12 @@ impl Autopilot {
                     if asked {
                         continue;
                     }
+                    if waits.iter().any(|w| matches!(w, Wait::HumanReview)) {
+                        // Hours or days: the run ends, and is woken at the
+                        // time recorded (or by the review's webhook).
+                        hook.waiting(None);
+                        return Ok(Some(self.wait_for_review(fleet, &live, &settings)?));
+                    }
                     let since = *waited_since.get_or_insert_with(std::time::Instant::now);
                     let what = wait_description(&waits);
                     hook.waiting(Some(&what));
@@ -692,6 +703,50 @@ impl Autopilot {
                 }
             }
         }
+    }
+
+    /// Records the wait for a person's review of the pull request: an
+    /// `event` wait on its reviews, whose deadline is the next scheduled
+    /// look (`crate::wait_cadence`). A webhook for a review satisfies it
+    /// sooner. Either way, waking re-reads the pull request.
+    fn wait_for_review(
+        &mut self,
+        fleet: &FleetStore,
+        live: &[crate::pr_readiness::LivePr],
+        settings: &tod_store::PrReadinessSettings,
+    ) -> Result<Outcome> {
+        use crate::pr_readiness::Wait;
+        use tod_store::interview::InterviewCommand;
+        use tod_store::waits::{NewWait, WaitRepo};
+        const ACTOR: &str = "autopilot";
+        let due = crate::wait_cadence::next_check(chrono::Utc::now(), &settings.review_schedule);
+        let due_at_ms = due.timestamp_millis();
+        let waiting_on = live
+            .iter()
+            .find(|p| p.assessment.waits().iter().any(|w| matches!(w, Wait::HumanReview)))
+            .map(|p| p.pr.clone());
+        let spec = waiting_on
+            .as_ref()
+            .map(|pr| format!("github:pr:{}:review", pr.pr_number))
+            .unwrap_or_else(|| "github:pr:review".to_string());
+        // Replace the last look's wait.
+        let old = fleet.read(|conn| WaitRepo::new(conn).list_pending_for_node(self.node))?;
+        for wait in old.iter().filter(|w| w.match_spec.starts_with("github:pr:")) {
+            fleet
+                .interview(ACTOR, InterviewCommand::SetWaitState { wait_id: wait.id, state: "cancelled".into() })
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+        }
+        fleet
+            .interview(
+                ACTOR,
+                InterviewCommand::RecordWait { node_id: self.node, wait: NewWait::event(spec, due_at_ms) },
+            )
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let what = match &waiting_on {
+            Some(pr) => format!("a review of {}", pr.url),
+            None => "a review".to_string(),
+        };
+        Ok(Outcome::Waiting { what, due_at_ms })
     }
 
     /// The pull request conversation of this stay in `pr`, to send it the
@@ -977,6 +1032,7 @@ fn wait_description(waits: &[crate::pr_readiness::Wait]) -> String {
             Wait::BotReview { bot, .. } => format!("{bot} review"),
             Wait::ChecksRunning => "checks to finish".to_string(),
             Wait::GitHub => "GitHub".to_string(),
+            Wait::HumanReview => "a review".to_string(),
         })
         .collect();
     format!("waiting for {}", parts.join(", "))

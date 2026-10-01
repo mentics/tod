@@ -380,7 +380,7 @@ impl Github {
         Ok(raw
             .into_iter()
             .filter_map(|r| {
-                Some(PrReview { author: r.user.map(|u| u.login), submitted_at: r.submitted_at? })
+                Some(PrReview { author: r.user.map(|u| u.login), submitted_at: r.submitted_at?, state: r.state })
             })
             .collect())
     }
@@ -445,6 +445,9 @@ pub struct PrReview {
     pub author: Option<String>,
     /// RFC 3339.
     pub submitted_at: String,
+    /// GitHub's state for the review: `APPROVED`, `CHANGES_REQUESTED`,
+    /// `COMMENTED`, `DISMISSED` or `PENDING`. Empty when not known.
+    pub state: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -508,6 +511,8 @@ struct ThreadCommentRaw {
 struct ReviewRaw {
     user: Option<UserRaw>,
     submitted_at: Option<String>,
+    #[serde(default)]
+    state: String,
 }
 
 #[derive(Debug, Deserialize)]

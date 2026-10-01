@@ -887,6 +887,19 @@ impl TaskPanel {
                             .child(format!("waiting {}", elapsed.unwrap_or_default())),
                     );
                 }
+                RunnerStatus::Awaiting { what, due_at_ms } => {
+                    let next = chrono::DateTime::from_timestamp_millis(*due_at_ms)
+                        .map(|t| t.with_timezone(&chrono::Local).format("%a %H:%M").to_string())
+                        .unwrap_or_default();
+                    line = line.child(sep()).child(style::text_muted(div().flex_1().min_w_0()).child(
+                        selectable_text(
+                            "unified-task-runner-awaiting",
+                            format!("waiting for {what}; next check {next}"),
+                            window,
+                            cx,
+                        ),
+                    ));
+                }
                 RunnerStatus::Failed { error } => {
                     line = line.child(sep()).child(style::text_error(div().flex_1().min_w_0()).child(
                         selectable_text("unified-task-runner-error", error.clone(), window, cx),

@@ -104,6 +104,10 @@ pub struct PrReadinessSettings {
     /// Fix-and-push rounds on the whole PR before the babysitter stops.
     #[serde(default = "default_max_rounds")]
     pub max_rounds: u32,
+    /// When the babysitter looks again at a pull request waiting for a
+    /// person's review.
+    #[serde(default)]
+    pub review_schedule: ReviewSchedule,
 }
 
 impl Default for PrReadinessSettings {
@@ -112,6 +116,61 @@ impl Default for PrReadinessSettings {
             bots: Vec::new(),
             max_thread_rounds: default_max_thread_rounds(),
             max_rounds: default_max_rounds(),
+            review_schedule: ReviewSchedule::default(),
+        }
+    }
+}
+
+/// How often a pull request waiting for a human review is read again:
+/// every hour or two in the working day, rarely outside it
+/// (`tod_core::wait_cadence`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewSchedule {
+    /// The reviewers' offset from UTC in minutes; this machine's when unset.
+    #[serde(default)]
+    pub utc_offset_minutes: Option<i32>,
+    /// First hour (0-23) of the working day, local time.
+    #[serde(default = "default_review_start_hour")]
+    pub start_hour: u32,
+    /// Hour (1-24) the working day ends.
+    #[serde(default = "default_review_end_hour")]
+    pub end_hour: u32,
+    /// Whether Saturday and Sunday count as outside the working day.
+    #[serde(default = "default_true")]
+    pub weekdays_only: bool,
+    /// Minutes between checks in the working day.
+    #[serde(default = "default_review_interval_minutes")]
+    pub interval_minutes: u32,
+    /// Longest minutes between checks outside it.
+    #[serde(default = "default_review_off_hours_minutes")]
+    pub off_hours_interval_minutes: u32,
+}
+
+fn default_review_start_hour() -> u32 {
+    8
+}
+fn default_review_end_hour() -> u32 {
+    19
+}
+fn default_true() -> bool {
+    true
+}
+fn default_review_interval_minutes() -> u32 {
+    90
+}
+fn default_review_off_hours_minutes() -> u32 {
+    720
+}
+
+impl Default for ReviewSchedule {
+    fn default() -> Self {
+        Self {
+            utc_offset_minutes: None,
+            start_hour: default_review_start_hour(),
+            end_hour: default_review_end_hour(),
+            weekdays_only: true,
+            interval_minutes: default_review_interval_minutes(),
+            off_hours_interval_minutes: default_review_off_hours_minutes(),
         }
     }
 }
@@ -986,6 +1045,7 @@ mod tests {
                 }],
                 max_thread_rounds: 3,
                 max_rounds: 4,
+                review_schedule: ReviewSchedule { start_hour: 9, ..ReviewSchedule::default() },
             },
             sandbox_idle: SandboxIdleSettings::default(),
         };

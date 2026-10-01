@@ -714,7 +714,16 @@ impl crate::pr_readiness::PrFeed for Sim {
                 Vec::new()
             },
             comments,
-            reviews: vec![],
+            // A person approves once the bot has been through.
+            reviews: if self.polls_after_ask.load(SeqCst) >= 3 {
+                vec![tod_store::github::PrReview {
+                    author: Some("alice".into()),
+                    submitted_at: "2021-06-01T00:00:00Z".into(),
+                    state: "APPROVED".into(),
+                }]
+            } else {
+                vec![]
+            },
         })
     }
 
@@ -754,6 +763,54 @@ fn babysits_a_pull_request_through_feedback_and_a_bots_review() {
     // The bot had not reviewed the new head: it was asked, once, and waited for.
     assert_eq!(*sim.posted.lock().unwrap(), vec!["@greptileai review this".to_string()]);
     assert!(sim.polls_after_ask.load(std::sync::atomic::Ordering::SeqCst) >= 3);
+}
+
+#[test]
+fn a_pull_request_waiting_for_a_person_ends_the_run_with_a_timed_wait() {
+    let fx = setup();
+    retire_outside_criteria(&fx);
+    struct Pending;
+    impl crate::pr_readiness::PrFeed for Pending {
+        fn snapshot(&self, _: &tod_store::github::NodePr) -> Result<tod_store::github::PrSnapshot, String> {
+            use tod_store::github::{PrSnapshot, PrStatus};
+            Ok(PrSnapshot {
+                status: PrStatus {
+                    mergeable: Some(true),
+                    mergeable_state: Some("blocked".into()),
+                    merged: false,
+                    checks: Some("success".into()),
+                    head_sha: Some("abcdef1".into()),
+                    head_committed_at: Some("2020-01-01T00:00:00Z".into()),
+                    draft: false,
+                    base_ref: None,
+                    body: None,
+                },
+                threads: vec![],
+                comments: vec![],
+                reviews: vec![],
+            })
+        }
+        fn comment(&self, _: &tod_store::github::NodePr, _: &str) -> Result<(), String> {
+            Ok(())
+        }
+    }
+    crate::pr_readiness::set_feed_override(Some(Arc::new(Pending)));
+    lifecycle::set_lifecycle(&fx.fleet, fx.node, "pr").unwrap();
+    let mut agent = FakeAgent::new(&fx.fleet);
+    let before = chrono::Utc::now().timestamp_millis();
+    let outcome = autopilot(&fx, Budget::default()).run(&fx.fleet, &mut agent).unwrap();
+    let Outcome::Waiting { due_at_ms, .. } = outcome else {
+        panic!("expected Waiting, got {outcome:?}");
+    };
+    assert!(due_at_ms > before, "the next look is in the future");
+    // The wait is recorded, so a scheduler (and a webhook) can wake the node.
+    let waits = fx
+        .fleet
+        .read(|conn| tod_store::waits::WaitRepo::new(conn).list_pending_for_node(fx.node))
+        .unwrap();
+    assert_eq!(waits.len(), 1, "{waits:?}");
+    assert!(waits[0].match_spec.starts_with("github:pr:"), "{waits:?}");
+    assert_eq!(waits[0].due_at, due_at_ms);
 }
 
 #[test]

@@ -53,6 +53,7 @@ pub mod pull_requests;
 pub mod run_transcript;
 pub mod runner_status;
 pub mod scheduler;
+pub mod wait_cadence;
 pub mod session_name;
 pub mod stop_questions;
 pub mod task;
