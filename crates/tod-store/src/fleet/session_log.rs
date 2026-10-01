@@ -450,6 +450,60 @@ pub fn pull_node_in_background(data_root: PathBuf, node_id: String, sandbox: Str
     }
 }
 
+/// Copy what `remote` has beyond the mirror for the one `session` (not every
+/// log: a machine's Claude directory holds the user's other work too).
+pub fn keep_session(remote: &dyn Remote, local: &Path, session: &str) -> Result<u64> {
+    let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut copied = 0;
+    for log in remote.list()?.into_iter().filter(|l| l.session == session) {
+        let Some(name) = file_name(&log.project, &log.session) else { continue };
+        let path = local.join(name);
+        let have = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        if log.size <= have {
+            continue;
+        }
+        let mut bytes = remote.read_from(&log.project, &log.session, have)?;
+        match bytes.iter().rposition(|b| *b == b'\n') {
+            Some(end) => bytes.truncate(end + 1),
+            None => continue,
+        }
+        std::fs::create_dir_all(local)?;
+        let mut file = std::fs::OpenOptions::new().create(true).append(true).open(&path)?;
+        file.write_all(&bytes)?;
+        copied += bytes.len() as u64;
+    }
+    Ok(copied)
+}
+
+/// [`keep_session`] for the session of a conversation that ran in `workdir`,
+/// on a thread of its own, logging a failure. A sandbox's logs are kept by
+/// [`pull_node_in_background`].
+pub fn keep_session_in_background(
+    data_root: PathBuf,
+    node_id: String,
+    session: String,
+    workdir: super::workdir::Workdir,
+) {
+    let spawned = std::thread::Builder::new().name("tod-session-log".into()).spawn(move || {
+        let local = local_dir(&data_root, &node_id);
+        let result = match &workdir {
+            super::workdir::Workdir::Host(_) => {
+                HostRemote::new().and_then(|remote| keep_session(&remote, &local, &session))
+            }
+            super::workdir::Workdir::Container { container, .. } => {
+                ContainerRemote::new(container).and_then(|remote| keep_session(&remote, &local, &session))
+            }
+            super::workdir::Workdir::Sandbox { .. } => return,
+        };
+        if let Err(err) = result {
+            tracing::warn!("keeping session {session}'s log: {err:#}");
+        }
+    });
+    if let Err(err) = spawned {
+        tracing::warn!("the session log copy did not start: {err}");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -615,6 +669,31 @@ mod transfer_tests {
         assert!(transfer(&from, &to, id, &target).unwrap());
         // A session the source does not have is reported, not invented.
         assert!(!transfer(&from, &to, "no-such-session", &target).unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn keep_session_copies_only_that_session_and_only_whole_lines() {
+        let dir = std::env::temp_dir().join(format!("tod-session-keep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let host = HostRemote::at(dir.join("claude"));
+        let id = "cccccccc-2222-3333-4444-555555555555";
+        host.write("-p", id, b"{\"a\":1}
+{\"b\"").unwrap();
+        host.write("-p", "dddddddd-2222-3333-4444-555555555555", b"{\"other\":1}
+").unwrap();
+        let mirror = dir.join("mirror");
+        assert_eq!(keep_session(&host, &mirror, id).unwrap(), 8);
+        let kept = MirrorRemote { dir: mirror.clone() };
+        assert_eq!(kept.list().unwrap().len(), 1);
+        // The rest arrives once the line is whole.
+        host.write("-p", id, b"{\"a\":1}
+{\"b\":2}
+").unwrap();
+        keep_session(&host, &mirror, id).unwrap();
+        assert_eq!(kept.read_from("-p", id, 0).unwrap(), b"{\"a\":1}
+{\"b\":2}
+");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -152,6 +152,8 @@ struct Run {
     /// The cloud sandbox the agent runs in, whose session logs are kept
     /// outside it (`tod_store::fleet::session_log`).
     sandbox: Option<String>,
+    /// Where the agent runs, so its session log can be kept for a move.
+    workdir: Workdir,
 }
 
 pub struct ConversationDriver {
@@ -586,6 +588,17 @@ impl ConversationDriver {
                         node.to_string(),
                         sandbox,
                     );
+                } else if let (Some(node), Some(session)) =
+                    (self.focus.node_id(), agent.with(|a| a.session_id(&run.key)))
+                {
+                    // On this machine or in a dev container the log is kept
+                    // too, so a move to another environment has it to copy.
+                    tod_store::fleet::session_log::keep_session_in_background(
+                        fleet.paths().root().to_path_buf(),
+                        node.to_string(),
+                        session,
+                        run.workdir.clone(),
+                    );
                 }
                 let body = if parts.is_empty() {
                     reply.to_string()
@@ -936,6 +949,7 @@ impl ConversationDriver {
             context.map(|context| crate::codebase_rules::with_codebase_rules_in(context, &cwd));
         // An agent inside a dev container or sandbox is started from the
         // data root here.
+        let workdir = cwd.clone();
         let sandbox = match &cwd {
             Workdir::Sandbox { sandbox, .. } => Some(sandbox.clone()),
             _ => None,
@@ -993,6 +1007,7 @@ impl ConversationDriver {
             title,
             session_saved: false,
             sandbox,
+            workdir,
         });
         crate::journey::record(
             self.journey_key(),
