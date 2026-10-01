@@ -2088,8 +2088,11 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                 let _ = format_tx.send_blocking(notice);
                             });
                         });
-                        tod_core::cloud_sync::sync_on_start(fleet.clone());
-                        tod_core::cloud_notify::start(fleet.clone());
+                        // Not when the daemon owns the store: it syncs.
+                        if !fleet.is_client() {
+                            tod_core::cloud_sync::sync_on_start(fleet.clone());
+                            tod_core::cloud_notify::start(fleet.clone());
+                        }
                         // Only the one long-lived GUI process should run this listener, so it
                         // starts here rather than inside `FleetStore::open` (which `tod-cli`
                         // also calls, as a one-shot process, when no GUI instance is running).

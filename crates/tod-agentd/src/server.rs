@@ -109,6 +109,10 @@ pub fn run(data_root: &Path) -> Result<bool> {
         tod_core::interview::mock::install_mock_interview_handler(data_root.to_path_buf());
     }
     shared.runners.resume_saved();
+    // The cloud: the outbox and the lost-sandbox check, and the orchestrator's
+    // notifications. One process holds them, whoever has the app open.
+    tod_core::cloud_sync::sync_on_start(shared.store.clone());
+    tod_core::cloud_notify::start(shared.store.clone());
     for stream in listener.incoming() {
         if shared.quit.load(Ordering::SeqCst) {
             break;

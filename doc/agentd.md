@@ -548,17 +548,17 @@ Scope: the workbench only (decision 3).
 
 ### Status and deviations
 
-- **1, 2** done. **3** done except: cloud sync, `cloud_nodes`, `node_events`
-  and the orchestrator/supervisor side connections still write over their
-  own WAL connections beside the daemon's writer (an interim; the daemon's
-  writer is the only one that records undo or announces changes), and the
-  notify-log cursor / command-history mirror are not yet served in client
-  mode.
-- **The writer is pluggable, not rewritten.** `FleetWriter` has a local
-  backend (a thread) and a remote one (`RemoteWriter`, implemented by
-  `tod-agentd-client`'s `DaemonWriter`); the app opens the store as a client
-  (`FleetStore::open_client`), so its ~90 call sites did not change. The
-  protocol retries under one request id, which the daemon answers once.
+- **1, 2, 3 done.** The writer is pluggable, not rewritten: `FleetWriter` has a
+  local backend (a thread) and a remote one (`RemoteWriter`, implemented by
+  `tod-agentd-client`'s `DaemonWriter`); the app and `tod-cli` open the store
+  as clients (`FleetStore::open_client`), so the ~90 call sites did not
+  change. The protocol retries under one request id, which the daemon
+  answers once. Undo is the daemon's, for the user's changes only; a client
+  mirrors the history (`Command::History`). The daemon starts the cloud
+  outbox/lost-sandbox check and the orchestrator notifications. Still on
+  their own WAL connections beside the daemon's writer: the cloud actions the
+  user starts in the app (`run_in_cloud` and the like, `cloud_nodes`), and
+  the orchestrator/supervisor processes.
 - **4: the daemon hosts the runs itself.** Instead of spawning
   `tod-supervisor wake` in direct mode, `tod_agentd::runners::Runners` keeps
   one `LocalRun` thread per node inside the daemon, wakes `Outcome::Waiting`
@@ -566,17 +566,23 @@ Scope: the workbench only (decision 3).
   wakes them), continues a run whose request was answered, and starts again
   the runs a stopped daemon left without an outcome. The app's `NodeRunners`
   is a proxy: it sends start/pause/stop and shows the `RunnerState` the
-  daemon pushes (`Event::Runner`). The cloud supervisor is unchanged.
+  daemon pushes (`Event::Runner`; the client keeps the latest per node for a
+  late subscriber). The cloud supervisor is unchanged. A run pushes the
+  node's own branch at each step boundary and before it stops
+  (`provision::push_node_branch`; never a default branch; nothing for a node
+  with no checkout of its own).
 - The daemon runs from a copy, so programs beside it are found through
-  `TOD_PROGRAM_DIR` (`tod_store::install::program_dir`).
-- **5** partly: a node whose run ended to wait shows `<state> · waiting` in
-  the tree (the runner line already says what and when). Not yet: a Waiting
-  group and a glyph.
-- **6** partly: `fleet::session_log::transfer` moves one session's log between
-  any two environments (`Remote`: `HostRemote`, `SandboxRemote`; a dev
-  container's is not written) into the target working directory's project
-  name, complete lines only. Not yet: calling it when a node's location
-  changes, whether Claude resumes from the renamed project directory (not
-  run against a real Claude), and the acceptance matrix (needs Docker and a
-  sandbox).
-- Left besides: pushing the branch from the local runner.
+  `TOD_PROGRAM_DIR` (`tod_store::install::program_dir`). `TOD_NO_DAEMON`
+  stops `tod-cli` starting one (tests on throwaway roots).
+- **5** done as a recess, not a group: a node whose run ended to wait shows
+  `<state> · waiting` and a muted title in the tree (checked in the running
+  app against a saved wait); the runner line says what and when. A Waiting
+  filter chip and a glyph are not built.
+- **6** partly. A resumed conversation brings its session log to where it now
+  runs (`ConversationDriver::bring_session`: host, or sandbox; from the host
+  or the node's mirror, filed under that working directory's project name,
+  complete lines only; `session_log::ensure_session`/`transfer`, unit-tested
+  between two host directories). Not done: a dev container is neither a
+  source nor a target; whether Claude resumes from the renamed project
+  directory (not run against a real Claude); and the acceptance matrix
+  (needs Docker and a sandbox, neither available where this was built).
