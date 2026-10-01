@@ -442,7 +442,7 @@ fn exe_name(stem: &str) -> String {
 /// through `TOD_SANDBOX_BIN` and `TOD_DATA_ROOT`. Without an installed shim
 /// the environment is empty and Zed starts as it always did.
 pub fn zed_env(data_root: &Path) -> Result<Vec<(String, OsString)>> {
-    let Some(exe_dir) = std::env::current_exe().ok().and_then(|e| e.parent().map(Path::to_path_buf)) else {
+    let Some(exe_dir) = crate::install::program_dir() else {
         return Ok(Vec::new());
     };
     let shim = exe_dir.join(exe_name("tod-zed-shim"));

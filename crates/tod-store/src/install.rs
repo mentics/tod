@@ -46,6 +46,20 @@ pub fn claude_adapter_dir() -> Option<PathBuf> {
     Some(base.join("claude-agent-acp"))
 }
 
+/// The environment variable the daemon is started with: the directory of the
+/// installed programs, since it runs from a copy (`doc/agentd.md`) and the
+/// directory it runs from holds none of its siblings.
+pub const TOD_PROGRAM_DIR_ENV: &str = "TOD_PROGRAM_DIR";
+
+/// The directory the tod programs are installed in (`tod-cli`, `process/`,
+/// `media/`, the Zed shim): `TOD_PROGRAM_DIR`, else the running executable's.
+pub fn program_dir() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os(TOD_PROGRAM_DIR_ENV).filter(|v| !v.is_empty()) {
+        return Some(PathBuf::from(dir));
+    }
+    std::env::current_exe().ok().and_then(|exe| exe.parent().map(PathBuf::from))
+}
+
 /// Suggested default data root on first launch (same directory as `install.toml`).
 pub fn default_data_root() -> Result<PathBuf> {
     app_config_dir()

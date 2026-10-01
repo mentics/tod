@@ -625,10 +625,7 @@ pub(crate) fn no_window(command: &mut Command) {
 pub(crate) fn no_window(_command: &mut Command) {}
 
 fn exe_dir() -> PathBuf {
-    std::env::current_exe()
-        .ok()
-        .and_then(|e| e.parent().map(Path::to_path_buf))
-        .unwrap_or_default()
+    crate::install::program_dir().unwrap_or_default()
 }
 
 /// A tod executable installed next to the running one (`tod-sandbox`,

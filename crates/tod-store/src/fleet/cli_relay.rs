@@ -262,9 +262,8 @@ impl RelayEndpoint {
 /// The `tod-cli` installed next to this executable.
 pub fn tod_cli_path() -> PathBuf {
     let name = if cfg!(windows) { "tod-cli.exe" } else { "tod-cli" };
-    std::env::current_exe()
-        .ok()
-        .and_then(|exe| exe.parent().map(|dir| dir.join(name)))
+    crate::install::program_dir()
+        .map(|dir| dir.join(name))
         .unwrap_or_else(|| PathBuf::from(name))
 }
 

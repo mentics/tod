@@ -274,6 +274,7 @@ fn spawn(paths: &Paths, executable: &Path, me: &Identity) -> Result<Info> {
         command
             .arg("--data-root")
             .arg(data_root)
+            .env("TOD_PROGRAM_DIR", executable.parent().unwrap_or(Path::new(".")))
             .env("TOD_AGENTD_TEST_STAMP", &me.stamp)
             .env("TOD_AGENTD_TEST_BUILT_AT", me.built_at.to_string())
             .stdin(std::process::Stdio::null())

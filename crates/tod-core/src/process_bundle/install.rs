@@ -22,12 +22,10 @@ impl TodInstallPaths {
             return Self::from_process_root(root);
         }
 
-        if let Ok(exe) = std::env::current_exe() {
-            if let Some(dir) = exe.parent() {
-                let candidate = dir.join("process");
-                if candidate.join("README.md").is_file() {
-                    return Self::from_process_root(candidate);
-                }
+        if let Some(dir) = tod_store::install::program_dir() {
+            let candidate = dir.join("process");
+            if candidate.join("README.md").is_file() {
+                return Self::from_process_root(candidate);
             }
         }
 
