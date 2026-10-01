@@ -11,7 +11,6 @@
 //! Nothing runs on its own: there are no automatic turns, no backoff, and no
 //! summaries. A turn starts only from [`ConversationDriver::send`].
 
-use tod_store::fleet::Workdir;
 use crate::conversation::context::{ReportedStale, focus_selection, last_action_at};
 use crate::conversation::protocol::{
     Next, Protocol, ProtocolEnv, RunNotice, TurnContext, protocol_for,
@@ -25,14 +24,15 @@ use tod_agent::{
     AgentLaunchOptions, AgentProvider, AgentRunState, PermissionRequest, PromptImage, RunId,
     SessionOpening, SessionTurn, SharedAgent, TokenUsage,
 };
+use tod_journey::{Actor, Decision, Event, JourneyKey, TurnPhase};
 use tod_store::conversation::{
     Conversation, ConversationRepo, Focus, ProtocolKind, ReplyPart, TurnAttachment, TurnRole,
     reply_answer,
 };
 use tod_store::fleet::FleetStore;
+use tod_store::fleet::Workdir;
 use tod_store::interview::{ACTOR_USER, InterviewCommand};
 use tod_store::settings::InterviewContextSettings;
-use tod_journey::{Actor, Decision, Event, JourneyKey, TurnPhase};
 use uuid::Uuid;
 
 /// How the driver reaches the agent: for one provider call at a time.
@@ -348,7 +348,11 @@ impl ConversationDriver {
         let kind = self.protocol.kind();
         match &self.config.settings_path {
             Some(path) => crate::conversation::launch::resolve_from(fleet, path, self.focus, kind),
-            None => crate::conversation::launch::for_focus(fleet, self.focus, self.config.launch.clone()),
+            None => crate::conversation::launch::for_focus(
+                fleet,
+                self.focus,
+                self.config.launch.clone(),
+            ),
         }
     }
 
@@ -368,7 +372,11 @@ impl ConversationDriver {
 
     /// Stop the turn in flight. Its user turn stays in the transcript with an
     /// error turn after it.
-    pub fn cancel<A: AgentAccess + ?Sized>(&mut self, fleet: &FleetStore, agent: &mut A) -> Result<()> {
+    pub fn cancel<A: AgentAccess + ?Sized>(
+        &mut self,
+        fleet: &FleetStore,
+        agent: &mut A,
+    ) -> Result<()> {
         let Some(run) = self.run.take() else {
             return Ok(());
         };
@@ -477,52 +485,75 @@ impl ConversationDriver {
         }
         let over_budget = self.session_tokens.is_some_and(|t| t > budget);
 
-        let started = if resumable && !over_budget {
-            let message = join(&changes, text);
-            self.start(
-                fleet,
-                agent,
-                &conversation,
-                user_seq,
-                None,
-                message,
-                images,
-                conversation.agent_session_id.clone().filter(|_| !live),
-            )
-        } else if has_history {
-            let reason = if !resumable { "not resumable" } else { "over budget" };
-            self.rotate_and_start(
-                fleet,
-                agent,
-                &conversation,
-                user_seq,
-                &changes,
-                text,
-                images,
-                reason,
-            )
-        } else {
-            // The first turn: the opening context, then the message.
-            let context = self.protocol.opening(&self.env(fleet, id))?;
-            // Kept so the user can read what the agent was given.
-            fleet.interview(
-                ACTOR_USER,
-                InterviewCommand::SetConversationOpeningContext {
-                    conversation_id: id,
-                    context: context.clone(),
-                },
-            )?;
-            self.session_tokens = Some(0);
-            self.start(
-                fleet,
-                agent,
-                &conversation,
-                user_seq,
-                Some(context),
-                join(&changes, text),
-                images,
-                None,
-            )
+        let mut images = images;
+        let mut note = String::new();
+        let started = loop {
+            let text_now = format!("{text}{note}");
+            let text = text_now.as_str();
+            let attempt = if resumable && !over_budget {
+                let message = join(&changes, text);
+                self.start(
+                    fleet,
+                    agent,
+                    &conversation,
+                    user_seq,
+                    None,
+                    message,
+                    images.clone(),
+                    conversation.agent_session_id.clone().filter(|_| !live),
+                )
+            } else if has_history {
+                let reason = if !resumable {
+                    "not resumable"
+                } else {
+                    "over budget"
+                };
+                self.rotate_and_start(
+                    fleet,
+                    agent,
+                    &conversation,
+                    user_seq,
+                    &changes,
+                    text,
+                    images.clone(),
+                    reason,
+                )
+            } else {
+                // The first turn: the opening context, then the message.
+                let context = self.protocol.opening(&self.env(fleet, id))?;
+                // Kept so the user can read what the agent was given.
+                fleet.interview(
+                    ACTOR_USER,
+                    InterviewCommand::SetConversationOpeningContext {
+                        conversation_id: id,
+                        context: context.clone(),
+                    },
+                )?;
+                self.session_tokens = Some(0);
+                self.start(
+                    fleet,
+                    agent,
+                    &conversation,
+                    user_seq,
+                    Some(context),
+                    join(&changes, text),
+                    images.clone(),
+                    None,
+                )
+            };
+            // An agent that takes no images still gets the message: the same
+            // user turn is kept (it is already recorded), never added twice.
+            if let Err(e) = &attempt {
+                if !images.is_empty() && e.to_string().contains(IMAGES_REFUSED) {
+                    images.clear();
+                    note = "
+
+(A screenshot was taken but this agent does not accept images.)"
+                        .into();
+                    continue;
+                }
+            }
+            break attempt;
         };
         started.map(|()| user_seq)
     }
@@ -1031,7 +1062,9 @@ impl ConversationDriver {
         };
         let cwd = match cwd {
             Workdir::Host(path) => path,
-            Workdir::Container { .. } | Workdir::Sandbox { .. } => fleet.paths().root().to_path_buf(),
+            Workdir::Container { .. } | Workdir::Sandbox { .. } => {
+                fleet.paths().root().to_path_buf()
+            }
         };
         let opening = context.as_ref().map(|context| SessionOpening {
             context: Some(context.clone()),
@@ -1051,6 +1084,7 @@ impl ConversationDriver {
             }
         };
         self.launched = Some(options.clone());
+        let turn_had_images = !images.is_empty();
         let turn = SessionTurn {
             key: key.clone(),
             owner_id: id.to_string(),
@@ -1074,7 +1108,10 @@ impl ConversationDriver {
             Ok(handle) => handle,
             Err(err) => {
                 let message = format!("{err:#}");
-                self.append(fleet, id, TurnRole::Error, &message)?;
+                // The caller retries without the images; nothing to report.
+                if !turn_had_images || !message.contains(IMAGES_REFUSED) {
+                    self.append(fleet, id, TurnRole::Error, &message)?;
+                }
                 self.last_error = Some(message);
                 return Err(err);
             }
@@ -1108,7 +1145,11 @@ impl ConversationDriver {
     /// Store the session's id on the conversation as soon as the agent has
     /// given one, not when the turn ends: a turn that never ends still leaves
     /// the session resumable.
-    fn save_session_id<A: AgentAccess + ?Sized>(&mut self, fleet: &FleetStore, agent: &mut A) -> Result<()> {
+    fn save_session_id<A: AgentAccess + ?Sized>(
+        &mut self,
+        fleet: &FleetStore,
+        agent: &mut A,
+    ) -> Result<()> {
         let (Some(run), Some(id)) = (self.run.as_mut(), self.conversation_id) else {
             return Ok(());
         };
@@ -1184,6 +1225,9 @@ pub(crate) fn launch_environment(
 
 /// About what one attached image adds to a session's context.
 const IMAGE_TOKENS: i64 = 1_600;
+
+/// What an agent without image support says (`tod_agent`'s ACP provider).
+const IMAGES_REFUSED: &str = "does not accept images";
 
 /// The delta (if any), then the user's message.
 fn join(changes: &str, text: &str) -> String {

@@ -41,6 +41,7 @@ pub mod lifecycle;
 pub mod lifecycle_next;
 pub mod lifecycle_validity;
 pub mod linear_import;
+pub mod linear_sync;
 pub mod logging;
 pub mod media;
 pub mod node_context;
@@ -57,6 +58,7 @@ pub mod wait_cadence;
 pub mod session_name;
 pub mod stop_questions;
 pub mod task;
+pub mod visual_design;
 pub mod workbench_layout;
 
 pub use interview::{TodPaths, set_data_root};

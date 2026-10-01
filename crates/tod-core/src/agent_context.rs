@@ -7,9 +7,7 @@
 //! [`crate::context_recipes::build_message`]. This module's job is turning the
 //! caller's request into a [`DynamicContext`].
 
-use crate::context_recipes::{
-    FIX_SESSION, IMPLEMENT_SESSION, REVIEW_SESSION, VERIFY_SESSION, VISUAL_DESIGN_CHAT,
-};
+use crate::context_recipes::{FIX_SESSION, IMPLEMENT_SESSION, REVIEW_SESSION, VERIFY_SESSION};
 use crate::dynamic::DynamicContext;
 use crate::gate::PlanStepWithLinks;
 use crate::media::MediaPaths;
@@ -35,9 +33,6 @@ pub struct ContextRequest<'a> {
     /// inherits, each Spec ancestor's summary and constraints.
     pub ancestor_context: String,
 }
-
-/// The recipe for a chat opened from the visual-design panel.
-pub const VISUAL_DESIGN_RECIPE: &ContextRecipe = &VISUAL_DESIGN_CHAT;
 
 /// Build the full first message: static fragments, then the live selection.
 pub fn build_first_message(paths: &MediaPaths, request: &ContextRequest<'_>) -> Result<String> {
@@ -121,7 +116,12 @@ pub fn build_pr_message(
     request: &ImplementRequest<'_>,
     role_doc: &str,
 ) -> Result<String> {
-    build_plan_session_message(paths, &crate::context_recipes::PR_SESSION, Some(role_doc), request)
+    build_plan_session_message(
+        paths,
+        &crate::context_recipes::PR_SESSION,
+        Some(role_doc),
+        request,
+    )
 }
 
 /// Build the full fix-session first message: what an implementation session
@@ -238,8 +238,8 @@ mod tests {
             data_root: Path::new("/data/tod"),
             node: node(),
             obligation: None,
-            ancestor_context: "\n## Inherited context (ancestors)\n\n### From \"Product\"\nShips it.\n"
-                .into(),
+            ancestor_context:
+                "\n## Inherited context (ancestors)\n\n### From \"Product\"\nShips it.\n".into(),
         };
         let text = dynamic_for(&req);
         assert!(
@@ -254,7 +254,7 @@ mod tests {
     #[test]
     fn another_surface_omits_the_obligations_panel_wording() {
         let req = ContextRequest {
-            recipe: VISUAL_DESIGN_RECIPE,
+            recipe: &crate::context_recipes::VISUAL_DESIGN,
             data_root: Path::new("/data/tod"),
             node: node(),
             obligation: None,

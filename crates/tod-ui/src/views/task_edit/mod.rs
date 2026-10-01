@@ -403,6 +403,13 @@ pub struct TaskEditView {
     /// The quick-accept destination text as last saved, so "unsaved changes"
     /// compares like with like.
     generator_accept_destination_saved: Option<String>,
+    /// Title of the node the destination text names (slug or id), shown
+    /// beside the field.
+    generator_accept_destination_title: Option<String>,
+    /// Nodes (slug, title) matching what is typed, best first, offered
+    /// while the text names no node yet.
+    generator_accept_destination_suggestions: Vec<(String, String)>,
+    _generator_accept_destination_subscription: gpui::Subscription,
     /// The quick-accept form an autosave is scheduled (or was last attempted)
     /// for, and its debounce task.
     generator_accept_autosave_pending: Option<(String, Vec<Capability>)>,
@@ -506,6 +513,12 @@ impl TaskEditView {
         let generator_accept_destination_input = cx.new(|cx| {
             InputState::new(window, cx).placeholder("Enter to edit · Destination node slug")
         });
+        let _generator_accept_destination_subscription =
+            cx.subscribe(&generator_accept_destination_input, |this, _, event, cx| {
+                if matches!(event, InputEvent::Change) {
+                    this.refresh_accept_destination_hints(cx);
+                }
+            });
         let linear_preset_name_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("Preset name…"));
         let linear_preset_select = cx.new(|cx| {
@@ -641,6 +654,9 @@ impl TaskEditView {
             generator_show_detail: false,
             generator_accept_destination_input,
             generator_accept_destination_saved: None,
+            generator_accept_destination_title: None,
+            generator_accept_destination_suggestions: Vec::new(),
+            _generator_accept_destination_subscription,
             generator_accept_autosave_pending: None,
             _generator_accept_autosave_task: None,
             generator_accept_capabilities: Vec::new(),
@@ -855,6 +871,13 @@ impl TaskEditView {
             // Inherited Files: this node's own worktree or sandbox can
             // still be removed.
             stops.push(TaskEditField::WorktreeAction);
+        }
+        if !self.capability_enabled(Capability::Files)
+            && self.resolved_files.as_ref().is_some_and(|f| f.inherited)
+        {
+            // The branch is the node's own even when the recipe is inherited.
+            let at = stops.len() - usize::from(self.worktree_action().is_some());
+            stops.insert(at, TaskEditField::Branch);
         }
         if self.capability_enabled(Capability::Ticket) {
             stops.extend([TaskEditField::LinearLink, TaskEditField::GithubPr]);
@@ -1401,9 +1424,13 @@ impl TaskEditView {
             .filter(|files| !files.inherited)
     }
 
-    /// This node has a worktree or sandbox made for it from its own Files.
+    /// This node has a worktree or sandbox of its own, made from its own
+    /// Files or from an ancestor's (an inheriting node's location is still
+    /// its own).
     fn has_own_worktree(&self) -> bool {
-        self.own_files().is_some_and(|files| files.location.is_some())
+        self.resolved_files
+            .as_ref()
+            .is_some_and(|files| files.location.is_some())
     }
 
     /// The worktree or sandbox made for this node, current or stale: what
@@ -2000,6 +2027,7 @@ impl TaskEditView {
                 });
                 self.generator_accept_destination_saved =
                     config.accept_destination_node_id.map(|id| id.to_string());
+                self.refresh_accept_destination_hints(cx);
                 self.generator_accept_capabilities = config.accept_capabilities.clone();
                 self.generator_accept_capabilities_saved = config.accept_capabilities;
                 self.generator_accept_error = None;
@@ -2017,6 +2045,7 @@ impl TaskEditView {
                     input.set_value("", window, cx);
                 });
                 self.generator_accept_destination_saved = None;
+                self.refresh_accept_destination_hints(cx);
                 self.generator_accept_capabilities.clear();
                 self.generator_accept_capabilities_saved.clear();
                 self.generator_accept_error = None;
@@ -2748,6 +2777,62 @@ impl TaskEditView {
         }
     }
 
+    /// Recompute the destination field's title and suggestions from what is
+    /// typed. Text naming a node (slug or id) shows that node's title; any
+    /// other text is fuzzy-matched against every node's title and slug, with
+    /// the node tree's own matcher.
+    fn refresh_accept_destination_hints(&mut self, cx: &mut Context<Self>) {
+        let text = input_text(&self.generator_accept_destination_input, cx)
+            .trim()
+            .to_string();
+        self.generator_accept_destination_title = None;
+        self.generator_accept_destination_suggestions.clear();
+        if text.is_empty() {
+            cx.notify();
+            return;
+        }
+        let nodes = self
+            .fleet
+            .read(|conn| tod_store::outline::repos::NodeRepo::new(conn).list_all())
+            .unwrap_or_default();
+        let exact = nodes.iter().find(|node| {
+            node.slug.eq_ignore_ascii_case(&text) || node.id.to_string().eq_ignore_ascii_case(&text)
+        });
+        if let Some(node) = exact {
+            self.generator_accept_destination_title = Some(node.title.clone());
+        } else {
+            let mut scored: Vec<(i32, &tod_store::outline::Node)> = nodes
+                .iter()
+                .filter_map(|node| {
+                    let by_title = tod_core::fuzzy::fuzzy_score(&node.title, &text);
+                    let by_slug = tod_core::fuzzy::fuzzy_score(&node.slug, &text);
+                    by_title.into_iter().chain(by_slug).max().map(|s| (s, node))
+                })
+                .collect();
+            scored.sort_by(|a, b| b.0.cmp(&a.0));
+            self.generator_accept_destination_suggestions = scored
+                .into_iter()
+                .take(8)
+                .map(|(_, node)| (node.slug.clone(), node.title.clone()))
+                .collect();
+        }
+        cx.notify();
+    }
+
+    /// Choose a suggested node: its slug goes into the field.
+    fn accept_destination_suggestion(
+        &mut self,
+        slug: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.generator_accept_destination_input
+            .update(cx, |input, cx| input.set_value(slug, window, cx));
+        self.refresh_accept_destination_hints(cx);
+        // Choosing a node finishes the field, so it saves now.
+        self.exit_edit(window, cx);
+    }
+
     /// Save the quick-accept destination and capabilities. Both are optional
     /// — clearing the destination field turns accept back off for this
     /// generator.
@@ -2821,6 +2906,15 @@ impl TaskEditView {
         {
             self.generator_accept_autosave_pending = None;
             self._generator_accept_autosave_task = None;
+            return;
+        }
+        // The destination is validated (it must name a node), so it is saved
+        // when the user is done with the field, never mid-typing.
+        if self.editing == Some(TaskEditField::GeneratorAcceptDestination)
+            && form.0 != saved_destination
+        {
+            self._generator_accept_autosave_task = None;
+            self.generator_accept_autosave_pending = None;
             return;
         }
         if self.generator_accept_autosave_pending.as_ref() == Some(&form) {
@@ -4333,9 +4427,27 @@ impl TaskEditView {
                         window,
                         cx,
                     ));
+                let branch_row = self.apply_focus_scroll_anchor(
+                    TaskEditField::Branch,
+                    v_flex()
+                        .id(field_anchor_id(TaskEditField::Branch))
+                        .gap_1()
+                        .px_3()
+                        .pb_2()
+                        .w(px(280.))
+                        .child(Self::render_field_label("Branch (this node's own)", cx))
+                        .child(self.render_nav_input(
+                            TaskEditField::Branch,
+                            self.branch_input.clone(),
+                            None,
+                            window,
+                            cx,
+                        )),
+                );
                 return Some(
                     v_flex()
                         .child(hint)
+                        .child(branch_row)
                         .when(self.worktree_action().is_some(), |el| {
                             el.child(h_flex().px_3().pb_2().child(self.render_remove_location(cx)))
                         })
@@ -4808,11 +4920,86 @@ impl TaskEditView {
                     )
                     .child(Self::render_field_label("Destination node slug", cx))
                     .child(
-                        Input::new(&self.generator_accept_destination_input)
+                        h_flex()
+                            .gap_2()
+                            .items_center()
                             .w_full()
-                            .disabled(
-                                self.editing != Some(TaskEditField::GeneratorAcceptDestination),
+                            .child(
+                                div().w(gpui::rems(20.)).flex_shrink_0().child(
+                                    Input::new(&self.generator_accept_destination_input)
+                                        .w_full()
+                                        .disabled(
+                                            self.editing
+                                                != Some(TaskEditField::GeneratorAcceptDestination),
+                                        ),
+                                ),
+                            )
+                            .when_some(
+                                self.generator_accept_destination_title.clone(),
+                                |row, title| {
+                                    row.child(
+                                        div()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .overflow_hidden()
+                                            .whitespace_nowrap()
+                                            .text_ellipsis()
+                                            .text_sm()
+                                            .text_color(muted)
+                                            .child(title),
+                                    )
+                                },
                             ),
+                    )
+                    .when(
+                        self.editing == Some(TaskEditField::GeneratorAcceptDestination)
+                            && !self.generator_accept_destination_suggestions.is_empty(),
+                        |el| {
+                            let (list_hover, popover, border) = {
+                                let theme = cx.theme();
+                                (theme.list_hover, theme.popover, theme.border)
+                            };
+                            el.child(
+                                v_flex()
+                                    .w(gpui::rems(20.))
+                                    .p_1()
+                                    .bg(popover)
+                                    .border_1()
+                                    .border_color(border)
+                                    .rounded_md()
+                                    .children(
+                                        self.generator_accept_destination_suggestions
+                                            .iter()
+                                            .enumerate()
+                                            .map(|(index, (slug, title))| {
+                                                let slug = slug.clone();
+                                                div()
+                                                    .id(("task-edit-accept-dest-suggestion", index))
+                                                    .px_2()
+                                                    .py_0p5()
+                                                    .rounded_sm()
+                                                    .cursor_pointer()
+                                                    .text_sm()
+                                                    .overflow_hidden()
+                                                    .whitespace_nowrap()
+                                                    .text_ellipsis()
+                                                    .hover(|el| el.bg(list_hover))
+                                                    .on_mouse_down(
+                                                        MouseButton::Left,
+                                                        cx.listener(move |this, _, window, cx| {
+                                                            cx.stop_propagation();
+                                                            this.accept_destination_suggestion(
+                                                                slug.clone(),
+                                                                window,
+                                                                cx,
+                                                            );
+                                                        }),
+                                                    )
+                                                    .child(title.clone())
+                                            }),
+                                    ),
+                            )
+                        },
                     ),
             ),
         );

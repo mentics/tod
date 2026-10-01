@@ -133,6 +133,8 @@ impl LocalRun {
         mut on_event: impl FnMut(LocalEvent) + Send + 'static,
     ) -> Result<Self> {
         let request = Arc::new(AtomicU8::new(Request::Run as u8));
+        // Starting the node is starting its ticket.
+        crate::linear_sync::push(&fleet, node, crate::linear_sync::Milestone::Started);
         let data_root = config.data_root.clone();
         let hook_request = request.clone();
         let thread = std::thread::Builder::new()

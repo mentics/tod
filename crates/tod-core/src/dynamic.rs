@@ -76,6 +76,18 @@ pub struct FocusSelection {
     pub sections: Vec<(String, Vec<String>)>,
 }
 
+/// The mockup state of a visual-design conversation, for
+/// [`DynamicBlock::VisualDesign`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VisualDesignState {
+    /// The saved mockup linked from the obligation, if any.
+    pub saved_path: Option<String>,
+    /// The conversation's working draft, which the agent edits in place.
+    pub draft_path: String,
+    /// Whether the draft exists and differs from the saved mockup.
+    pub differs: bool,
+}
+
 /// One change a node inherits and has not been checked against, as an agent
 /// is shown it. Built by `crate::incoming::describe`; the block renders it
 /// without knowing where it came from.
@@ -138,6 +150,9 @@ pub enum DynamicBlock {
     /// The variables and credentials defined for the node the work is on
     /// (pre-rendered; see `crate::environment_context`). Omitted when none.
     Environment,
+    /// The saved mockup's path, the working draft's path, and whether they
+    /// differ. Omitted when the surface supplied no state.
+    VisualDesign,
 }
 
 /// Everything any block might need. A surface fills in what its blocks use and
@@ -160,6 +175,7 @@ pub struct DynamicContext<'a> {
     pub focus: Option<&'a FocusSelection>,
     pub incoming: &'a [IncomingChangeItem],
     pub environment: &'a str,
+    pub visual_design: Option<&'a VisualDesignState>,
 }
 
 /// One finding as a fix session is shown it: a line with its id, severity,
@@ -329,6 +345,27 @@ fn render_block(block: DynamicBlock, ctx: &DynamicContext<'_>, out: &mut String)
                     out.push_str("- ");
                     out.push_str(&obligation_line(o));
                     out.push('\n');
+                }
+            }
+        }
+
+        DynamicBlock::VisualDesign => {
+            if let Some(state) = ctx.visual_design {
+                out.push_str("\n## Mockup\n\n");
+                out.push_str(&format!(
+                    "- **Working draft (edit this file):** `{}`\n",
+                    state.draft_path
+                ));
+                match state.saved_path.as_deref() {
+                    Some(saved) => {
+                        out.push_str(&format!("- **Saved mockup:** `{saved}`\n"));
+                        out.push_str(if state.differs {
+                            "- The draft differs from the saved mockup.\n"
+                        } else {
+                            "- The draft matches the saved mockup.\n"
+                        });
+                    }
+                    None => out.push_str("- **Saved mockup:** none linked yet.\n"),
                 }
             }
         }

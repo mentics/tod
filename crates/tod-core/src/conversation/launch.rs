@@ -16,12 +16,11 @@ use tod_store::{AgentRole, TodSettings};
 /// capability leaves a value unset.
 pub fn role_for(kind: ProtocolKind) -> AgentRole {
     match kind {
-        ProtocolKind::Outline | ProtocolKind::Chat => AgentRole::Chat,
+        ProtocolKind::Outline | ProtocolKind::Chat | ProtocolKind::VisualDesign => AgentRole::Chat,
         ProtocolKind::Implementation
         | ProtocolKind::Verification
         | ProtocolKind::Review
         | ProtocolKind::Fix
-        | ProtocolKind::VisualDesign
         | ProtocolKind::GateCheck
         | ProtocolKind::OnEntry
         | ProtocolKind::Phase

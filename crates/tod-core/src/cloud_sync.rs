@@ -731,6 +731,15 @@ pub fn ensure_node_sandbox(
     let url = info.url.clone().ok_or_else(|| anyhow!("sandbox {name} has no URL"))?;
     progress(&format!("{name} is up after {:.1}s", started.elapsed().as_secs_f64()));
 
+    // Before the supervisor starts, which mirrors into the mount when it is
+    // there. A fork does not keep its source's mounts, so this is every time.
+    match tod_sandbox::drive::mount_for_node(&bx, &url, &account.region, user, node_id) {
+        Ok(()) => progress("mounted Agent Drive for the node's transcripts"),
+        Err(err) => progress(&format!(
+            "warning: no Agent Drive ({err:#}); the node's transcripts go to the orchestrator instead"
+        )),
+    }
+
     if forked {
         // The base has everything but the node's own checkout and processes.
         node::start(&bx, &url, &payload, progress)?;

@@ -98,6 +98,7 @@ fn run_osascript(script: &str) -> Result<()> {
     let status = Command::new("osascript")
         .arg("-e")
         .arg(script)
+        .stdout(std::process::Stdio::null())
         .status()
         .context("run osascript")?;
     if status.success() {

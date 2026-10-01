@@ -658,7 +658,9 @@ impl TaskListView {
             .and_then(|id| visible.iter().position(|t| &t.id == id))
             .map(IndexPath::new);
 
-        let selection_moved_from = self.last_selected;
+        // Compare the selected node, not its row: expanding or collapsing a
+        // row above it shifts its index without the selection moving.
+        let selection_moved = next_id != previous_id;
         self.list_state.update(cx, |state, cx| {
             state.delegate_mut().set_items(visible);
             state
@@ -678,7 +680,7 @@ impl TaskListView {
             // Only chase the selection when it actually moved. A rebuild the
             // user did not ask for (a background change to the tree) must not
             // yank the viewport back from wherever they scrolled to.
-            if selected_ix.is_some() && selected_ix != selection_moved_from {
+            if selected_ix.is_some() && selection_moved {
                 state.scroll_to_selected_item(window, cx);
             }
             cx.notify();
@@ -2075,6 +2077,21 @@ impl TaskListView {
                     return;
                 }
                 this.live_refresh(window, cx);
+                // A move across parents can land in a collapsed one; open every
+                // collapsed ancestor so the moved node stays visible.
+                let mut collapsed_ancestors = Vec::new();
+                let mut current = this.all_tasks.iter().find(|t| t.id == task_id);
+                while let Some(parent_id) = current.and_then(|t| t.parent_id.as_deref()) {
+                    current = this.all_tasks.iter().find(|t| t.id == parent_id);
+                    match current {
+                        Some(parent) if parent.collapsed => collapsed_ancestors.push(parent.id.clone()),
+                        Some(_) => {}
+                        None => break,
+                    }
+                }
+                for ancestor in &collapsed_ancestors {
+                    this.set_collapsed(ancestor, false, window, cx);
+                }
                 this.select_task_by_id(&task_id, window, cx);
             },
         );
@@ -3032,6 +3049,8 @@ impl TaskListView {
                     this.show_error(format!("Accept failed: {err}"), window, cx);
                     return;
                 }
+                // The copy is the same ticket: make sure Linear has it at least up next.
+                tod_core::linear_sync::push(&this.fleet, new_node_id, tod_core::linear_sync::Milestone::Accepted);
                 this.live_refresh(window, cx);
                 this.select_created_task(&new_node_id.to_string(), window, cx);
             },

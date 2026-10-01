@@ -6,8 +6,9 @@
 //! (`<claude dir>` is `$CLAUDE_CONFIG_DIR`, else `~/.claude`). Each file is
 //! mirrored under the name `<project>__<id>`, appending complete lines only,
 //! at the offset the copy is known to have, so a retried append is never
-//! written twice. Where the copies go is a [`TranscriptStore`]: the
-//! orchestrator today; Agent Drive where the account has it.
+//! written twice. Where the copies go is a [`TranscriptStore`]: Agent Drive
+//! ([`DirStore`], over the mount `tod_sandbox::drive` makes) where the
+//! sandbox has it, else the orchestrator.
 
 use crate::orchestrator::Orchestrator;
 use anyhow::Result;
@@ -38,6 +39,74 @@ impl TranscriptStore for Orchestrator {
     fn append(&self, name: &str, offset: u64, bytes: &[u8]) -> Result<std::result::Result<u64, u64>> {
         self.append_transcript(name, offset, bytes)
     }
+}
+
+/// Copies kept as `<dir>/<name>.jsonl` in a directory: the node's folder on
+/// Agent Drive, mounted in the sandbox (`tod_sandbox::drive`). The mount is
+/// an ordinary POSIX filesystem, so an append is an append.
+pub struct DirStore {
+    dir: PathBuf,
+}
+
+impl DirStore {
+    pub fn new(dir: PathBuf) -> Self {
+        Self { dir }
+    }
+
+    fn path(&self, name: &str) -> Result<PathBuf> {
+        anyhow::ensure!(split_name(name).is_some() && !name.contains(['/', '\\']), "bad transcript name {name:?}");
+        Ok(self.dir.join(format!("{name}.jsonl")))
+    }
+}
+
+impl TranscriptStore for DirStore {
+    fn list(&self) -> Result<Vec<(String, u64)>> {
+        let Ok(entries) = std::fs::read_dir(&self.dir) else { return Ok(Vec::new()) };
+        Ok(entries
+            .flatten()
+            .filter_map(|e| {
+                let name = e.file_name().to_string_lossy().strip_suffix(".jsonl")?.to_string();
+                Some((name, e.metadata().ok()?.len()))
+            })
+            .collect())
+    }
+
+    fn fetch(&self, name: &str) -> Result<Vec<u8>> {
+        Ok(std::fs::read(self.path(name)?).unwrap_or_default())
+    }
+
+    fn append(&self, name: &str, offset: u64, bytes: &[u8]) -> Result<std::result::Result<u64, u64>> {
+        use std::io::Write;
+        let path = self.path(name)?;
+        let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        if size != offset {
+            return Ok(Err(size));
+        }
+        std::fs::create_dir_all(&self.dir)?;
+        let mut file = std::fs::OpenOptions::new().create(true).append(true).open(&path)?;
+        file.write_all(bytes)?;
+        Ok(Ok(size + bytes.len() as u64))
+    }
+}
+
+/// Where Agent Drive is mounted in a node's sandbox
+/// (`tod_sandbox::drive::MOUNT_PATH`).
+pub const DRIVE_MOUNT: &str = "/mnt/tod-transcripts";
+
+/// The directory to mirror transcripts into instead of the orchestrator:
+/// `$TOD_TRANSCRIPTS_DIR`, else [`DRIVE_MOUNT`] when something is mounted
+/// there (`/proc/mounts`). A sandbox whose drive could not be mounted has
+/// neither, and its transcripts go to the orchestrator.
+pub fn drive_dir() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os("TOD_TRANSCRIPTS_DIR").filter(|d| !d.is_empty()) {
+        return Some(PathBuf::from(dir));
+    }
+    let mounts = std::fs::read_to_string("/proc/mounts").ok()?;
+    mounted_at(&mounts, DRIVE_MOUNT).then(|| PathBuf::from(DRIVE_MOUNT))
+}
+
+fn mounted_at(proc_mounts: &str, path: &str) -> bool {
+    proc_mounts.lines().any(|l| l.split_whitespace().nth(1) == Some(path))
 }
 
 /// `$CLAUDE_CONFIG_DIR/projects`, else `~/.claude/projects`.
@@ -258,6 +327,28 @@ mod tests {
         assert_eq!(mirror.sync_once().unwrap(), 0);
         let _ = std::fs::remove_dir_all(projects);
         let _ = std::fs::remove_dir_all(fresh);
+    }
+
+    #[test]
+    fn a_directory_store_appends_at_the_offset_it_has() {
+        let dir = temp("dir").join("nested");
+        let store = DirStore::new(dir.clone());
+        assert_eq!(store.append("p__s", 0, b"1\n").unwrap(), Ok(2));
+        assert_eq!(store.append("p__s", 2, b"2\n").unwrap(), Ok(4));
+        // A retry of the first append is refused, and says how long the copy is.
+        assert_eq!(store.append("p__s", 0, b"1\n").unwrap(), Err(4));
+        assert_eq!(store.fetch("p__s").unwrap(), b"1\n2\n");
+        assert_eq!(store.list().unwrap(), vec![("p__s".to_string(), 4)]);
+        assert!(store.append("../escape__x", 0, b"x").is_err());
+        assert!(store.append("noseparator", 0, b"x").is_err());
+        let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+    }
+
+    #[test]
+    fn the_drive_is_used_when_it_is_mounted() {
+        let mounts = "overlay / overlay rw 0 0\n1.2.3.4:/b/users/u/nodes/n/transcripts /mnt/tod-transcripts fuse.blfs rw 0 0\n";
+        assert!(mounted_at(mounts, DRIVE_MOUNT));
+        assert!(!mounted_at("overlay / overlay rw 0 0\n", DRIVE_MOUNT));
     }
 
     #[test]

@@ -6,7 +6,6 @@
 //! Agents section shows when the node resolves Agent, and the Shells and Code
 //! editors sections show when it resolves Files.
 
-use crate::app::InteractiveAgentWindowControl;
 use crate::interview::TodPaths;
 use crate::interview::agent::{AgentRunState, RunId, SharedAgent};
 use crate::interview::settings::TodSettings;
@@ -69,7 +68,7 @@ struct InFlightFleetRun {
 pub struct ActionPanelView {
     fleet: Arc<FleetStore>,
     agent: SharedAgent,
-    interactive_window: InteractiveAgentWindowControl,
+    engagement: SharedEngagementRegistry,
     paths: TodPaths,
     settings: TodSettings,
     install: TodInstallPaths,
@@ -93,7 +92,7 @@ impl ActionPanelView {
         cx: &mut Context<Self>,
         fleet: Arc<FleetStore>,
         agent: SharedAgent,
-        interactive_window: InteractiveAgentWindowControl,
+        engagement: SharedEngagementRegistry,
     ) -> Self {
         let paths = TodPaths::discover().expect("data root must be configured");
         let settings = TodSettings::load(&paths).unwrap_or_default();
@@ -107,7 +106,7 @@ impl ActionPanelView {
         Self {
             fleet,
             agent,
-            interactive_window,
+            engagement,
             paths,
             settings,
             install,
@@ -280,7 +279,7 @@ impl ActionPanelView {
         if self.in_flight.is_empty() {
             return;
         }
-        let engagement = self.interactive_window.engagement();
+        let engagement = self.engagement.clone();
         let mut finished = Vec::new();
         let mut permission_requests = Vec::new();
         let mut session_ids = Vec::new();
@@ -884,7 +883,7 @@ impl ActionPanelView {
             options.effort
         );
 
-        let engagement = self.interactive_window.engagement();
+        let engagement = self.engagement.clone();
 
         let mut section = Self::render_section("Agents", cx).child(
             selectable_text("action-panel-agent-summary", agent_summary, window, cx)

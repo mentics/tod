@@ -115,7 +115,24 @@ fn parse_info(v: &Value) -> SandboxInfo {
     }
 }
 
-fn check(resp: &mut ureq::http::Response<ureq::Body>, what: &str) -> Result<()> {
+/// An Agent Drive.
+#[derive(Debug, Clone)]
+pub struct DriveInfo {
+    pub name: String,
+    pub region: String,
+    /// `{endpoint}/{bucket}`: the drive's S3 endpoint, path-style.
+    pub s3_url: Option<String>,
+}
+
+fn parse_drive(v: &Value) -> DriveInfo {
+    DriveInfo {
+        name: v["metadata"]["name"].as_str().unwrap_or_default().to_string(),
+        region: v["spec"]["region"].as_str().unwrap_or_default().to_string(),
+        s3_url: v["state"]["s3Url"].as_str().map(str::to_string),
+    }
+}
+
+fn check(resp:&mut ureq::http::Response<ureq::Body>, what: &str) -> Result<()> {
     let status = resp.status();
     if status.is_success() {
         return Ok(());
@@ -357,6 +374,57 @@ impl Blaxel {
 
     pub fn delete_volume(&self, name: &str) -> Result<()> {
         self.delete_path(&format!("/volumes/{name}"), "delete volume")
+    }
+
+    /// An Agent Drive by name, if it exists.
+    pub fn get_drive(&self, name: &str) -> Result<Option<DriveInfo>> {
+        Ok(self.get_path(&format!("/drives/{name}"), "get drive")?.map(|v| parse_drive(&v)))
+    }
+
+    /// The drive `name`, created in `region` when there is none. Errs where
+    /// the workspace lacks Agent Drive (a 403) or `region` has none.
+    pub fn ensure_drive(&self, name: &str, region: &str) -> Result<DriveInfo> {
+        if let Some(drive) = self.get_drive(name)? {
+            return Ok(drive);
+        }
+        let body = json!({ "metadata": { "name": name }, "spec": { "region": region } });
+        let mut resp =
+            self.auth(self.agent.post(&format!("{API}/drives"))).send_json(&body).context("Blaxel API")?;
+        // Another node's provisioning made it first.
+        if resp.status().as_u16() != 409 {
+            check(&mut resp, &format!("create drive {name}"))?;
+        }
+        self.get_drive(name)?.with_context(|| format!("drive {name} is not there after creating it"))
+    }
+
+    /// A short-lived token (and its lifetime in seconds) for the drive's S3
+    /// endpoint, sent as `Authorization: Bearer` (see [`crate::drive`]).
+    pub fn drive_access_token(&self, name: &str) -> Result<(String, u64)> {
+        let mut resp = self
+            .auth(self.agent.post(&format!("{API}/drives/{name}/access-token")))
+            .send_empty()
+            .context("Blaxel API")?;
+        check(&mut resp, "drive access token")?;
+        let v: Value = resp.body_mut().read_json()?;
+        let token = v["access_token"].as_str().context("drive access token: none in the reply")?;
+        Ok((token.to_string(), v["expires_in"].as_u64().unwrap_or(0)))
+    }
+
+    /// Mounts `drive_path` of the drive at `mount_path` in the sandbox at
+    /// `url` (this wakes it). Nothing needs to exist first, and mounting what
+    /// is already mounted is fine, so a fork or a restarted sandbox just does
+    /// it again. The mount survives standby.
+    pub fn mount_drive(&self, url: &str, drive: &str, mount_path: &str, drive_path: &str) -> Result<()> {
+        let body = json!({ "driveName": drive, "mountPath": mount_path, "drivePath": drive_path });
+        let mut resp = self
+            .auth(self.agent.post(&format!("{url}/drives/mount")))
+            .send_json(&body)
+            .context("sandbox drive API")?;
+        check(&mut resp, "mount drive")
+    }
+
+    pub fn delete_drive(&self, name: &str) -> Result<()> {
+        self.delete_path(&format!("/drives/{name}"), "delete drive")
     }
 
     pub fn delete(&self, name: &str) -> Result<()> {

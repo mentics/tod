@@ -95,11 +95,12 @@ const OWN_OBLIGATIONS_NOTE: &str = "This node's own. They define what is in scop
      ancestor context below, whose requirements are settled and whose \
      constraints still bind.";
 
-/// The visual-design chat. It mutates through exactly one command, so it loads
-/// `cli/visual-design` and none of the other nouns. An obligation is always
-/// selected here (the chat is scoped to one), hence no fallback.
-pub const VISUAL_DESIGN_CHAT: ContextRecipe = ContextRecipe {
-    name: "visual-design chat",
+/// The visual-design conversation protocol's recipe. It records
+/// its writes in the conversation's change set (`cli/changeset`) and may record
+/// an obligation (`cli/obligations`) when page feedback justifies one; it has
+/// no plan or lifecycle fragments. Accepting a mockup is the app's own button.
+pub const VISUAL_DESIGN: ContextRecipe = ContextRecipe {
+    name: "visual design",
     situational: false,
     layers: &[
         "stance/interactive-chat",
@@ -107,13 +108,15 @@ pub const VISUAL_DESIGN_CHAT: ContextRecipe = ContextRecipe {
         "domain/obligations",
         "cli/intro",
         "cli/visual-design",
+        "cli/obligations",
+        "cli/changeset",
         "surface/visual-design",
     ],
     blocks: &[
         DynamicBlock::DataRoot,
-        DynamicBlock::Node,
+        DynamicBlock::Focus,
         DynamicBlock::AncestorContext,
-        DynamicBlock::SelectedObligation { fallback: "" },
+        DynamicBlock::VisualDesign,
     ],
 };
 
@@ -411,7 +414,11 @@ pub const CONVERSATION: ContextRecipe = ContextRecipe {
         "cli/environment",
         "surface/conversation",
     ],
-    blocks: &[DynamicBlock::DataRoot, DynamicBlock::Focus, DynamicBlock::Environment],
+    blocks: &[
+        DynamicBlock::DataRoot,
+        DynamicBlock::Focus,
+        DynamicBlock::Environment,
+    ],
 };
 
 /// A general conversation: whatever the user asks, on any focus. It has the
@@ -435,7 +442,11 @@ pub const CHAT: ContextRecipe = ContextRecipe {
         "cli/environment",
         "surface/chat",
     ],
-    blocks: &[DynamicBlock::DataRoot, DynamicBlock::Focus, DynamicBlock::Environment],
+    blocks: &[
+        DynamicBlock::DataRoot,
+        DynamicBlock::Focus,
+        DynamicBlock::Environment,
+    ],
 };
 
 /// An incoming-changes check (`crate::incoming`): one short-lived session
@@ -472,7 +483,7 @@ pub const ALL_RECIPES: &[ContextRecipe] = &[
     INCOMING_CHANGES,
     CONVERSATION,
     CHAT,
-    VISUAL_DESIGN_CHAT,
+    VISUAL_DESIGN,
     IMPLEMENT_SESSION,
     VERIFY_SESSION,
     REVIEW_SESSION,
@@ -550,7 +561,10 @@ mod tests {
             .chain(SITUATIONAL_CLI.iter().copied())
             .chain(["workspace/codebase"])
             .collect();
-        for key in all_fragments(&root).into_iter().filter(|k| !k.starts_with("cli/")) {
+        for key in all_fragments(&root)
+            .into_iter()
+            .filter(|k| !k.starts_with("cli/"))
+        {
             assert!(
                 used.contains(key.as_str()),
                 "fragment {key:?} is not used by any recipe"
@@ -723,5 +737,22 @@ mod tests {
                 recipe.name
             );
         }
+    }
+
+    /// The visual-design protocol's recipe: its own mockup command, the
+    /// obligation and change-set nouns, and nothing about plans or lifecycle.
+    #[test]
+    fn the_visual_design_recipe_has_its_cli_nouns_and_no_plan_or_lifecycle() {
+        for layer in ["cli/visual-design", "cli/obligations", "cli/changeset"] {
+            assert!(VISUAL_DESIGN.layers.contains(&layer), "{layer}");
+        }
+        for layer in VISUAL_DESIGN.layers {
+            assert!(
+                !layer.contains("plan") && !layer.contains("lifecycle"),
+                "{layer}"
+            );
+        }
+        assert!(VISUAL_DESIGN.blocks.contains(&DynamicBlock::VisualDesign));
+        assert!(ALL_RECIPES.iter().any(|r| r.name == VISUAL_DESIGN.name));
     }
 }

@@ -234,9 +234,7 @@ pub fn protocol_for(kind: ProtocolKind) -> &'static dyn Protocol {
         ProtocolKind::Phase => &super::phase::PhaseProtocol,
         ProtocolKind::Evaluate => &super::phase::EvaluateProtocol,
         ProtocolKind::Chat => &ChatProtocol,
-        // Until the visual designer has its own protocol and side pane, a
-        // visual-design conversation behaves as a plain chat.
-        ProtocolKind::VisualDesign => &ChatProtocol,
+        ProtocolKind::VisualDesign => &VisualDesignProtocol,
     }
 }
 
@@ -409,6 +407,74 @@ impl Protocol for ChatProtocol {
     }
 }
 
+/// A conversation about one design-phase obligation's mockup. It behaves as
+/// [`ChatProtocol`] (actor, change-set delta, rotation snapshot) with its own
+/// recipe, and works in a per-conversation scratch directory holding the
+/// working draft, so drafts never land in the user's repository.
+pub struct VisualDesignProtocol;
+
+impl Protocol for VisualDesignProtocol {
+    fn kind(&self) -> ProtocolKind {
+        ProtocolKind::VisualDesign
+    }
+
+    fn surface(&self) -> &'static str {
+        crate::session_name::VISUAL_DESIGN_SURFACE
+    }
+
+    fn cwd(&self, env: &ProtocolEnv<'_>) -> Result<Workdir> {
+        use anyhow::Context;
+        let dir = super::context::visual_design_dir(env.data_root, env.conversation_id);
+        std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+        Ok(Workdir::Host(dir))
+    }
+
+    fn turn_env(&self, env: &ProtocolEnv<'_>) -> Vec<(String, String)> {
+        vec![(ACTOR_ENV.to_string(), actor_for(env.conversation_id))]
+    }
+
+    fn opening(&self, env: &ProtocolEnv<'_>) -> Result<String> {
+        env.fleet.read(|conn| {
+            opening_with(
+                conn,
+                env.media,
+                env.data_root,
+                env.conversation_id,
+                &crate::context_recipes::VISUAL_DESIGN,
+            )
+        })
+    }
+
+    fn delta(
+        &self,
+        env: &ProtocolEnv<'_>,
+        since_action_id: i64,
+        reported: &mut ReportedStale,
+    ) -> Result<String> {
+        env.fleet
+            .read(|conn| delta(conn, env.conversation_id, since_action_id, reported))
+    }
+
+    fn resume_snapshot(
+        &self,
+        env: &ProtocolEnv<'_>,
+        budget_tokens: i64,
+        before_seq: Option<i64>,
+    ) -> Result<String> {
+        env.fleet.read(|conn| {
+            resume_snapshot_with(
+                conn,
+                env.media,
+                env.data_root,
+                env.conversation_id,
+                budget_tokens,
+                before_seq,
+                &crate::context_recipes::VISUAL_DESIGN,
+            )
+        })
+    }
+}
+
 /// A conversation-owned directory under the data root.
 /// The focus node's Files directory (its own or inherited) when it resolves,
 /// else the scratch directory `name`. The agent CLI discovers the workspace's
@@ -445,8 +511,6 @@ mod tests {
 
     /// Every kind resolves to the protocol that claims it — the one place a
     /// new protocol can be added to the enum and forgotten in the registry.
-    /// `VisualDesign` is the exception until it has a protocol of its own: it
-    /// borrows [`ChatProtocol`], which reports itself as `Chat`.
     #[test]
     fn every_kind_resolves_to_its_own_protocol() {
         for kind in [
@@ -462,13 +526,10 @@ mod tests {
             ProtocolKind::Phase,
             ProtocolKind::Evaluate,
             ProtocolKind::Chat,
+            ProtocolKind::VisualDesign,
         ] {
             assert_eq!(protocol_for(kind).kind(), kind, "{kind:?}");
         }
-        assert_eq!(
-            protocol_for(ProtocolKind::VisualDesign).kind(),
-            ProtocolKind::Chat
-        );
     }
 
     /// A chat's outline writes are recorded, so its agent gets the

@@ -69,6 +69,14 @@ const PRIORITIES: [(&str, i64); 5] =
 const PRIORITY_NAMES: [&str; 5] = ["urgent", "high", "medium", "low", "noPriority"];
 const STATE_TYPES: [&str; 6] = ["triage", "backlog", "unstarted", "started", "completed", "canceled"];
 const RELATIVE_DATES: [&str; 6] = ["-P1D", "-P1W", "-P2W", "-P1M", "-P3M", "-P1Y"];
+/// The value that stands for the team's active cycle (Linear's
+/// `cycle.isActive`) rather than a cycle's name.
+const CURRENT_CYCLE: &str = "current";
+const CYCLE_VALUES: [&str; 1] = [CURRENT_CYCLE];
+
+fn is_current_cycle(field: &QueryField, value: &str) -> bool {
+    field.filter_key == "cycle" && value.eq_ignore_ascii_case(CURRENT_CYCLE)
+}
 
 const fn relation(path: &'static [&'static str], nullable: bool) -> FieldKind {
     FieldKind::Relation { path, nullable }
@@ -82,7 +90,7 @@ const KNOWN_FIELDS: [(&str, &str, FieldKind, Values, &str); 19] = [
     ("assignee", "assignee", relation(&["displayName"], true), Values::Cache("assignee"), "Assigned user"),
     ("creator", "creator", relation(&["displayName"], true), Values::Cache("assignee"), "User who created it"),
     ("project", "project", relation(&["name"], true), Values::Cache("project"), "Project"),
-    ("cycle", "cycle", relation(&["name"], true), Values::None, "Cycle"),
+    ("cycle", "cycle", relation(&["name"], true), Values::Static(&CYCLE_VALUES), "Cycle (`current` is the active one)"),
     ("labels", "labels", FieldKind::Labels, Values::Cache("labels"), "Labels"),
     ("priority", "priority", FieldKind::Priority, Values::Static(&PRIORITY_NAMES), "Priority"),
     ("estimate", "estimate", FieldKind::Number { nullable: true }, Values::None, "Estimate"),
@@ -559,6 +567,7 @@ impl Parser<'_> {
             return Err(self.error("Expected `(` to start the list of values"));
         }
         self.pos += 1;
+        let first = self.pos;
         let mut values = vec![self.value(field)?];
         loop {
             match self.peek().map(|t| &t.tok) {
@@ -567,6 +576,10 @@ impl Parser<'_> {
                     values.push(self.value(field)?);
                 }
                 Some(Tok::RParen) => {
+                    if values.iter().any(|v| is_current_cycle(field, v)) {
+                        self.pos = first;
+                        return Err(self.error("`current` cannot be in a list; use `cycle IS current`"));
+                    }
                     self.pos += 1;
                     return Ok(values);
                 }
@@ -698,6 +711,11 @@ fn cond_to_json(field: &QueryField, op: Op, values: &[String]) -> Value {
         Arity::List => Value::Array(values.iter().map(|v| scalar(v)).collect()),
     };
     let body = match field.kind {
+        FieldKind::Relation { .. }
+            if matches!(op, Op::Is | Op::IsNot) && is_current_cycle(field, &values[0]) =>
+        {
+            json!({ "isActive": { "eq": op == Op::Is } })
+        }
         // Linear's numbers run the other way, so `>= high` is the set of
         // priorities at least that urgent, not a number comparison.
         FieldKind::Priority if matches!(op, Op::Lt | Op::Lte | Op::Gt | Op::Gte) => {
@@ -792,6 +810,14 @@ fn json_to_cond(field: &QueryField, value: &Value) -> Option<Expr> {
         Some(Expr::Cond { field: field.name.clone(), op, values })
     };
     let (mut key, mut inner) = single(value)?;
+    if key == "isActive" && field.filter_key == "cycle" {
+        let (comparator, active) = single(inner)?;
+        if comparator != "eq" {
+            return None;
+        }
+        let op = if active.as_bool()? { Op::Is } else { Op::IsNot };
+        return cond(op, vec![CURRENT_CYCLE.to_string()]);
+    }
     if key == "null" && field.nullable() {
         return cond(if inner.as_bool()? { Op::IsEmpty } else { Op::IsNotEmpty }, Vec::new());
     }
@@ -1237,6 +1263,7 @@ fn value_detail(value: &str) -> Option<&'static str> {
         "-P1M" => "1 month ago",
         "-P3M" => "3 months ago",
         "-P1Y" => "1 year ago",
+        CURRENT_CYCLE => "The active cycle",
         _ => return None,
     })
 }
@@ -1315,6 +1342,21 @@ mod tests {
         assert_eq!(compile_ok("labels IS NONE OF (bug)"), json!({ "labels": { "every": { "name": { "nin": ["bug"] } } } }));
         assert_eq!(compile_ok("stateType = started"), json!({ "state": { "type": { "eq": "started" } } }));
         assert_eq!(compile_ok(""), json!({}));
+    }
+
+    #[test]
+    fn the_current_cycle_is_the_active_one() {
+        let fields = fields(None);
+        let active = json!({ "cycle": { "isActive": { "eq": true } } });
+        assert_eq!(compile_ok("cycle IS current"), active);
+        assert_eq!(compile_ok("cycle IS NOT current"), json!({ "cycle": { "isActive": { "eq": false } } }));
+        assert_eq!(compile_ok("cycle IS Sprint"), json!({ "cycle": { "name": { "eq": "Sprint" } } }));
+        assert_eq!(decompile(&active, &fields).as_deref(), Some("cycle IS current"));
+        assert!(compile("cycle IS ANY OF (current, Sprint)", &fields).is_err());
+        let c = complete("cycle IS ", 9, &fields, None);
+        assert!(labels(&c).contains(&"current"));
+        let c = complete("cycle IS cu", 11, &fields, None);
+        assert_eq!(labels(&c), ["current"]);
     }
 
     #[test]

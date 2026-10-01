@@ -1,7 +1,7 @@
 //! gpui-specific helpers for persisted settings (core types live in `tod-store`).
 
 pub use tod_store::settings::{
-    ChatLaunchMode, MAX_LOG_MAX_SIZE_KB, MIN_LOG_MAX_SIZE_KB, TodSettings, WindowGeometry,
+    MAX_LOG_MAX_SIZE_KB, MIN_LOG_MAX_SIZE_KB, TodSettings, WindowGeometry,
     WorktreeBackend,
 };
 

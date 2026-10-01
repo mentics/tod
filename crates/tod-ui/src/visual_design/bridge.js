@@ -1,0 +1,48 @@
+// Injected into every served mockup. Reloads on `reload`, keeps scroll across
+// reloads, follows `navigate`. Design: doc/ui/visual-design-browser.md section 4.
+(function () {
+  var script = document.currentScript;
+  var base = script && script.getAttribute("data-base");
+  if (!base) return;
+  var KEY = "tod-design-scroll:" + base;
+  try {
+    var saved = sessionStorage.getItem(KEY);
+    if (saved) {
+      sessionStorage.removeItem(KEY);
+      var p = JSON.parse(saved);
+      var restore = function () { window.scrollTo(p.x, p.y); };
+      restore();
+      window.addEventListener("load", restore);
+    }
+  } catch (e) {}
+  function reload() {
+    try {
+      sessionStorage.setItem(KEY, JSON.stringify({ x: window.scrollX, y: window.scrollY }));
+    } catch (e) {}
+    location.reload();
+  }
+  var es = new EventSource(base + "__tod/events");
+  es.addEventListener("reload", reload);
+  es.addEventListener("navigate", function () {
+    try { sessionStorage.removeItem(KEY); } catch (e) {}
+    location.href = base;
+  });
+  es.addEventListener("closed", function () {
+    es.close();
+    var bar = document.createElement("div");
+    bar.textContent = "Session ended";
+    bar.style.cssText =
+      "position:fixed;top:0;left:0;right:0;z-index:2147483647;padding:6px;" +
+      "background:#333;color:#fff;font:13px sans-serif;text-align:center";
+    document.body.appendChild(bar);
+  });
+  // Selection overlay (F1): load the logic module, then the overlay.
+  function load(src, next) {
+    var s = document.createElement("script");
+    s.src = src; s.onload = next;
+    document.head.appendChild(s);
+  }
+  load("/__tod/selection.js", function () {
+    load("/__tod/overlay.js", function () { window.TodOverlay.start(base); });
+  });
+})();

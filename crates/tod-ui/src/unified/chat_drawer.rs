@@ -54,7 +54,7 @@ use crate::ui::agent_runs::AgentRuns;
 use crate::ui::key_context;
 use crate::ui::session_info::SessionInfo;
 use crate::ui::style;
-use crate::ui::terminal_handoff::{self, CONTINUE_IN_TERMINAL, OPEN_SHELL};
+use crate::ui::terminal_handoff::{self, CONTINUE_IN_TERMINAL, OPEN_IN_ZED, OPEN_SHELL};
 use crate::unified::resize::{CHAT_START_HEIGHT, ChatDrawerEdge, DIVIDER_WIDTH, DividerDrag};
 use uuid::Uuid;
 
@@ -278,7 +278,21 @@ impl ChatDrawer {
                 .spawn(async move {
                     fleet
                         .read(|conn| {
-                            ConversationRepo::new(conn).list_for_focus_with_protocol(focus, FREEFORM)
+                            let repo = ConversationRepo::new(conn);
+                            let mut all = repo.list_for_focus_with_protocol(focus, FREEFORM)?;
+                            // An obligation's visual designs are listed with
+                            // its chats, labelled; they open in the
+                            // conversation view, which hosts their pane.
+                            if matches!(focus, Focus::Obligation { .. }) {
+                                all.extend(repo.list_for_focus_with_protocol(
+                                    focus,
+                                    ProtocolKind::VisualDesign,
+                                )?);
+                                all.sort_by(|a, b| {
+                                    b.conversation.updated_at.cmp(&a.conversation.updated_at)
+                                });
+                            }
+                            Ok(all)
                         })
                         .unwrap_or_default()
                 })
@@ -366,6 +380,9 @@ impl ChatDrawer {
                     window,
                     cx,
                 )
+            }
+            AgentConversationEvent::Action(id, _) if id.as_ref() == OPEN_IN_ZED => {
+                terminal_handoff::open_in_zed(self.fleet.clone(), self.focus.node_id(), window, cx)
             }
             AgentConversationEvent::Action(id, _) if id.as_ref() == OPEN_SHELL => {
                 terminal_handoff::open_shell(self.fleet.clone(), self.focus.node_id(), window, cx)
@@ -783,6 +800,7 @@ impl ChatDrawer {
         }
         for summary in &self.sessions {
             let id = summary.conversation.id;
+            let visual_design = summary.conversation.protocol == ProtocolKind::VisualDesign;
             let opening = if summary.opening.is_empty() {
                 "(no messages)".to_string()
             } else {
@@ -799,9 +817,23 @@ impl ChatDrawer {
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |this, _: &MouseDownEvent, window, cx| {
-                        this.open_session(id, window, cx)
+                        if visual_design {
+                            window.dispatch_action(
+                                Box::new(crate::ui::agent_chat::OpenConversation {
+                                    focus: this.focus,
+                                    protocol: ProtocolKind::VisualDesign,
+                                    start: false,
+                                }),
+                                cx,
+                            );
+                        } else {
+                            this.open_session(id, window, cx)
+                        }
                     }),
                 )
+                .children(visual_design.then(|| {
+                    style::badge(div()).flex_shrink_0().child("visual design")
+                }))
                 .child(
                     style::text_dense_muted(div())
                         .flex_shrink_0()
