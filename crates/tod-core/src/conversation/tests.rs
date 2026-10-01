@@ -1528,3 +1528,70 @@ mod pending_decision_hand_back {
         }
     }
 }
+
+/// A visual-design opening on an obligation carries the inherited context
+/// (the parent's summary) and the mockup block with the draft path.
+#[test]
+fn a_visual_design_opening_carries_inherited_constraints_and_the_draft() {
+    use tod_store::outline::CreatePosition;
+    let fx = fixture();
+    fx.outline(OutlineMutation::SetExtraContent {
+        node_id: fx.node,
+        content_type: "summary".into(),
+        body: "Parent constraint: dark theme only.".into(),
+    });
+    let child = Uuid::new_v4();
+    fx.outline(OutlineMutation::CreateNode {
+        node_id: Some(child),
+        list_id: fx.fleet.list_outline_lists().unwrap()[0].id,
+        parent_id: Some(fx.node),
+        anchor_id: None,
+        position: CreatePosition::Child,
+        title: "Child".into(),
+    });
+    fx.outline(OutlineMutation::EnableCapabilities {
+        node_id: child,
+        capabilities: vec![tod_store::outline::Capability::Spec],
+    });
+    fx.fleet.writer().flush().unwrap();
+    let obligation = Uuid::new_v4();
+    fx.outline(OutlineMutation::CreateObligation {
+        obligation_id: Some(obligation),
+        node_id: child,
+        kind: tod_store::outline::KIND_REQUIREMENT.into(),
+        after_id: None,
+        before: false,
+        section: None,
+        body: "A settings screen.".into(),
+        phase: tod_store::interview::PHASE_DESIGN.into(),
+    });
+    let id = Uuid::new_v4();
+    fx.user(InterviewCommand::CreateConversation {
+        id,
+        focus: Focus::Obligation {
+            node: child,
+            id: obligation,
+        },
+        protocol: ProtocolKind::VisualDesign,
+        platform: None,
+        model: None,
+        effort: None,
+    });
+    let text = fx
+        .fleet
+        .read(|conn| {
+            super::context::opening_with(
+                conn,
+                &media(),
+                &fx.root,
+                id,
+                &crate::context_recipes::VISUAL_DESIGN,
+            )
+        })
+        .unwrap();
+    assert!(text.contains("Parent constraint: dark theme only."), "{text}");
+    assert!(text.contains("A settings screen."), "{text}");
+    assert!(text.contains("## Mockup"), "{text}");
+    assert!(text.contains("mockup.html"), "{text}");
+    assert!(text.contains("none linked yet"), "{text}");
+}

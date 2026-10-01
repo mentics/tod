@@ -3,7 +3,7 @@
 //! the snapshot a fresh session gets when the driver rotates.
 
 use crate::context_recipes::{CONVERSATION, ContextRecipe, build_message_with};
-use crate::dynamic::{DynamicContext, FocusSelection};
+use crate::dynamic::{DynamicBlock, DynamicContext, FocusSelection, VisualDesignState};
 use crate::interview::context::estimate_tokens;
 use crate::media::MediaPaths;
 use crate::node_context::{obligation_line, one_line, plan_step_line};
@@ -186,6 +186,23 @@ pub fn opening_with(
     } else {
         Vec::new()
     };
+    let ancestor_context = match (
+        recipe.blocks.contains(&DynamicBlock::AncestorContext),
+        conversation.focus.node_id(),
+    ) {
+        (true, Some(node)) => crate::node_context::render_inherited_context(
+            conn,
+            &NodeRepo::new(conn),
+            node,
+            None,
+        )?,
+        _ => String::new(),
+    };
+    let visual_design = if recipe.blocks.contains(&DynamicBlock::VisualDesign) {
+        visual_design_state(conn, data_root, conversation_id, conversation.focus)?
+    } else {
+        None
+    };
     build_message_with(
         media,
         recipe,
@@ -195,10 +212,56 @@ pub fn opening_with(
             data_root: Some(data_root),
             focus: Some(&focus),
             environment: &environment,
+            ancestor_context: &ancestor_context,
+            visual_design: visual_design.as_ref(),
             ..Default::default()
         },
         "",
     )
+}
+
+/// The conversation's scratch directory: the visual-design agent's working
+/// directory, holding its working draft.
+pub fn visual_design_dir(data_root: &Path, conversation_id: Uuid) -> std::path::PathBuf {
+    data_root
+        .join("agent")
+        .join("visual-design")
+        .join(conversation_id.to_string())
+}
+
+/// The working draft the visual-design agent edits in place.
+pub fn visual_design_draft_path(data_root: &Path, conversation_id: Uuid) -> std::path::PathBuf {
+    visual_design_dir(data_root, conversation_id).join("mockup.html")
+}
+
+/// The mockup state for [`DynamicBlock::VisualDesign`]: the focus
+/// obligation's saved mockup, the draft's path, and whether they differ.
+/// `None` when the focus is not an obligation.
+fn visual_design_state(
+    conn: &Connection,
+    data_root: &Path,
+    conversation_id: Uuid,
+    focus: Focus,
+) -> Result<Option<VisualDesignState>> {
+    let Focus::Obligation { id, .. } = focus else {
+        return Ok(None);
+    };
+    let saved_path = ObligationRepo::new(conn)
+        .get(id)?
+        .and_then(|o| o.visual_design_path);
+    let draft = visual_design_draft_path(data_root, conversation_id);
+    let differs = match std::fs::read(&draft) {
+        Err(_) => false,
+        Ok(draft_bytes) => match saved_path.as_deref().map(std::fs::read) {
+            Some(Ok(saved_bytes)) => saved_bytes != draft_bytes,
+            _ => true,
+        },
+    };
+    Ok(Some(VisualDesignState {
+        saved_path,
+        draft_path: draft.display().to_string(),
+        differs,
+    }))
 }
 
 /// The `cli/` nouns a conversation on `focus` is likely to need, beyond the
