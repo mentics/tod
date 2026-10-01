@@ -14,7 +14,7 @@
 //! draft. The browser reloads itself when the file changes (the server
 //! watches it).
 
-use super::ConversationView;
+use super::{AfterSend, ConversationView};
 use crate::ui::agent_conversation::NoticeTone;
 use crate::ui::journey::{Source, record_action};
 use crate::ui::selectable_text::selectable_text;
@@ -59,6 +59,9 @@ pub(crate) struct DesignSnapshot {
 pub(super) struct Designer {
     launcher: Option<Arc<Launcher>>,
     events: Option<Receiver<LauncherEvent>>,
+    /// Feedback posted by the page, waiting for the agent to be free.
+    feedback_rx: Option<Receiver<crate::visual_design::server::Feedback>>,
+    pub(super) feedback_queue: std::collections::VecDeque<crate::visual_design::server::Feedback>,
     window_open: bool,
     /// An action is running off the UI thread.
     busy: Option<&'static str>,
@@ -86,6 +89,12 @@ impl Designer {
                 std::thread::sleep(TICK);
             }
         });
+        let (tx, rx) = std::sync::mpsc::channel();
+        let tx = std::sync::Mutex::new(tx);
+        launcher.set_feedback_handler(Arc::new(move |_token, fb| {
+            let _ = tx.lock().unwrap().send(fb);
+        }));
+        self.feedback_rx = Some(rx);
         self.events = Some(events);
         self.launcher = Some(launcher.clone());
         launcher
@@ -170,6 +179,28 @@ impl ConversationView {
             }
         }
         changed
+    }
+
+    /// Send what the page posted as a user turn of this conversation (the
+    /// one the window is pointed at), off the UI thread via `deliver`. A turn
+    /// the agent is too busy for waits for the next poll. `images` is the
+    /// hook for F3's screenshot (the pasted-image path).
+    pub(super) fn designer_deliver_feedback(&mut self, cx: &mut Context<Self>) {
+        if let Some(rx) = self.designer.feedback_rx.as_ref() {
+            while let Ok(fb) = rx.try_recv() {
+                self.designer.feedback_queue.push_back(fb);
+            }
+        }
+        if !self.is_designer() {
+            return;
+        }
+        while let Some(fb) = self.designer.feedback_queue.front() {
+            let text = crate::visual_design::feedback::render(fb);
+            if !self.deliver(&text, Vec::new(), AfterSend::Retry, cx) {
+                break;
+            }
+            self.designer.feedback_queue.pop_front();
+        }
     }
 
     /// Called when the store committed or a turn finished (and when the view

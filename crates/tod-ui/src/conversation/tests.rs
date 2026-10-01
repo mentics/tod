@@ -2634,3 +2634,49 @@ fn a_visual_design_conversation_shows_its_designer_pane(cx: &mut TestAppContext)
         assert!(buttons[2].3, "no window to close");
     });
 }
+
+#[gpui::test]
+fn page_feedback_becomes_a_user_turn_and_the_agent_replies(cx: &mut TestAppContext) {
+    use crate::visual_design::server::{Feedback, Rect as FRect, Viewport};
+    let fixture = Fixture::new();
+    let focus = Focus::Obligation {
+        node: fixture.node_id,
+        id: fixture.design_obligation,
+    };
+    tod_agent::set_mock_interview_handler(Arc::new(|_| Ok("Noted.".to_string().into())));
+    tod_store::paths::set_data_root(fixture.store.paths().root().to_path_buf());
+    let (view, _, cx) = open_view(&fixture, focus, cx);
+    view.update_in(cx, |view, window, cx| {
+        view.open_with(focus, ProtocolKind::VisualDesign, false, window, cx)
+    });
+    draw(cx);
+    view.update(cx, |view, cx| {
+        view.designer.feedback_queue.push_back(Feedback {
+            comment: "think the heading is too small".into(),
+            selections: vec![],
+            boxed: Some(FRect { x: 0.0, y: 0.0, w: 200.0, h: 120.0 }),
+            viewport: Viewport::default(),
+        });
+        view.designer_deliver_feedback(cx);
+    });
+    for _ in 0..50 {
+        cx.executor().advance_clock(std::time::Duration::from_millis(500));
+        cx.run_until_parked();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        view.update(cx, |v, _| {
+            v.reload();
+        });
+        let done = view.read_with(cx, |v, _| {
+            v.data.turns.iter().any(|t| matches!(t.role, TurnRole::Agent))
+        });
+        if done {
+            break;
+        }
+    }
+    view.read_with(cx, |v, _| {
+        assert!(v.designer.feedback_queue.is_empty(), "error: {:?}", v.error);
+        assert!(v.data.turns.iter().any(|t| matches!(t.role, TurnRole::User)
+            && t.body.starts_with("think the heading is too small")));
+        assert!(v.data.turns.iter().any(|t| matches!(t.role, TurnRole::Agent)), "{:?}", v.data.turns.iter().map(|t| (format!("{:?}", t.role), t.body.clone())).collect::<Vec<_>>());
+    });
+}
