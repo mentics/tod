@@ -297,10 +297,6 @@ impl UnifiedView {
             });
         let _agent_runs_subscription = cx.observe(&agent_runs, |this, _, cx| {
             this.apply_status_overrides(cx);
-            // A turn answering a runner's request has finished.
-            let attention = std::mem::take(&mut this.attention);
-            this.runners.update(cx, |runners, cx| runners.on_attention(&attention, cx));
-            this.attention = attention;
         });
         let runners = {
             let (fleet, agent, agent_runs) = (fleet.clone(), agent.clone(), agent_runs.clone());
@@ -446,7 +442,6 @@ impl UnifiedView {
         cx: &mut Context<Self>,
     ) {
         let for_tree = attention_feed::to_task_list_map(&map);
-        self.runners.update(cx, |runners, cx| runners.on_attention(&map, cx));
         self.attention = map;
         self.task_list.update(cx, |task_list, cx| {
             task_list.set_attention(for_tree, cx);

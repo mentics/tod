@@ -10,6 +10,9 @@ use std::net::{TcpListener, TcpStream};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use crate::runners::Runners;
+use tod_agent::AgentBackend;
+use tod_core::autopilot::local::RunnerState;
 use tod_store::fleet::store::FleetStore;
 use uuid::Uuid;
 
@@ -32,6 +35,7 @@ const REMEMBERED: usize = 512;
 struct Shared {
     info: Info,
     store: Arc<FleetStore>,
+    runners: Runners,
     quit: AtomicBool,
     /// Bumped on every change the store announces.
     seq: AtomicU64,
@@ -60,6 +64,21 @@ pub fn run(data_root: &Path) -> Result<bool> {
             .map_err(|err| anyhow::anyhow!("open the store at {}: {err}", data_root.display()))?,
     );
 
+    // Everything that finds the data root on its own (the runs' settings, the
+    // sandbox helpers) finds this one.
+    tod_store::paths::set_data_root(data_root.to_path_buf());
+    tod_store::fleet::sandbox::set_data_root(data_root);
+    tod_agent::claude_adapter::set_local_dir(tod_store::install::claude_adapter_dir());
+    let mock = std::env::var("TOD_AGENTD_AGENT").is_ok_and(|v| v.eq_ignore_ascii_case("mock"));
+    let backend = if mock {
+        AgentBackend::Mock
+    } else {
+        let paths = tod_core::interview::TodPaths::at(data_root);
+        let settings = tod_core::interview::TodSettings::load(&paths).unwrap_or_default();
+        AgentBackend::from_platform(settings.agent_platform)
+    };
+    let runners = Runners::new(store.clone(), backend.create(tod_agent::agent_traffic::shared_log()));
+
     let listener = TcpListener::bind("127.0.0.1:0")?;
     let (stamp, built_at) = identity();
     let info = Info {
@@ -80,10 +99,16 @@ pub fn run(data_root: &Path) -> Result<bool> {
     let shared = Arc::new(Shared {
         info,
         store,
+        runners,
         quit: AtomicBool::new(false),
         seq: AtomicU64::new(0),
         answered: Mutex::new(VecDeque::new()),
     });
+    // Clients can write now, which a mock agent's own writes need.
+    if mock {
+        tod_core::interview::mock::install_mock_interview_handler(data_root.to_path_buf());
+    }
+    shared.runners.resume_saved();
     for stream in listener.incoming() {
         if shared.quit.load(Ordering::SeqCst) {
             break;
@@ -101,6 +126,8 @@ pub fn run(data_root: &Path) -> Result<bool> {
             })?;
     }
 
+    // Runs stop at their next boundary first (they write as they end).
+    shared.runners.drain();
     // Drain: commit what is queued before the info file goes, so the next
     // daemon starts from everything this one accepted.
     if let Err(err) = shared.store.flush_on_quit() {
@@ -215,17 +242,47 @@ fn execute(shared: &Shared, command: Command) -> Response {
             Err(err) => failed(&format!("{err:#}")),
         },
         Command::Subscribe => Response::ok(),
+        Command::RunnerStart { node, renew_budget } => match shared.runners.start(node, renew_budget) {
+            Ok(()) => Response::ok(),
+            Err(err) => failed(&format!("{err:#}")),
+        },
+        Command::RunnerPause { node } => {
+            shared.runners.pause(node);
+            Response::ok()
+        }
+        Command::RunnerStop { node } => {
+            shared.runners.stop_now(node);
+            Response::ok()
+        }
+        Command::RunnerSnapshot => {
+            let states: Vec<RunnerState> = shared.runners.snapshot();
+            Response::value(serde_json::to_value(states).unwrap_or_default())
+        }
     }
 }
 
-/// Send an [`Event`] each time the store changes, until the client goes away
-/// or the daemon quits.
+/// Send an [`Event`] each time the store changes, and each time a runner's
+/// state does, until the client goes away or the daemon quits.
 fn feed(writer: &mut TcpStream, shared: &Shared) {
+    let Ok(second) = writer.try_clone() else { return };
+    let out = Arc::new(Mutex::new(second));
+    // Every node's runner state now, then each change.
+    let runner_events = shared.runners.subscribe();
+    {
+        let out = out.clone();
+        let _ = std::thread::Builder::new().name("tod-agentd-runner-feed".into()).spawn(move || {
+            while let Ok(event) = runner_events.recv() {
+                if send(&mut *out.lock().expect("feed stream"), &event).is_err() {
+                    return;
+                }
+            }
+        });
+    }
     let mut changes = shared.store.subscribe_changes();
     // A client that subscribes has missed what came before: tell it now.
     let mut seq = shared.seq.fetch_add(1, Ordering::SeqCst) + 1;
     loop {
-        if send(writer, &Event::Changed { seq }).is_err() {
+        if send(&mut *out.lock().expect("feed stream"), &Event::Changed { seq }).is_err() {
             return;
         }
         match changes.blocking_recv() {

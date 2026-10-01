@@ -92,7 +92,8 @@ pub struct ConversationConfig {
 }
 
 /// What the view shows about the turn in flight.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct ConversationStatus {
     /// A turn is in flight.
     pub running: bool,
@@ -100,6 +101,8 @@ pub struct ConversationStatus {
     pub activity: Option<String>,
     /// The turn in flight so far, part by part (text, thoughts, tool calls),
     /// when the provider streams them. Empty when no turn is in flight.
+    /// Not sent to the app by the daemon: too chatty for a feed.
+    #[serde(skip)]
     pub parts: Vec<ReplyPart>,
     /// The agent is blocked on a permission decision; answer it through the
     /// provider (`respond_to_permission`) with this request's run.
@@ -112,6 +115,7 @@ pub struct ConversationStatus {
     pub live_usage: Option<TokenUsage>,
     /// What the latest turn this driver started launched with: the platform,
     /// model, and effort asked for. `None` until it starts one.
+    #[serde(skip)]
     pub launch: Option<AgentLaunchOptions>,
 }
 

@@ -117,6 +117,48 @@ impl RemoteWriter for DaemonWriter {
     }
 }
 
+impl DaemonWriter {
+    pub fn runner_start(&self, node: Uuid, renew_budget: bool) -> Result<()> {
+        self.call(Command::RunnerStart { node, renew_budget })?;
+        Ok(())
+    }
+
+    pub fn runner_pause(&self, node: Uuid) -> Result<()> {
+        self.call(Command::RunnerPause { node })?;
+        Ok(())
+    }
+
+    pub fn runner_stop(&self, node: Uuid) -> Result<()> {
+        self.call(Command::RunnerStop { node })?;
+        Ok(())
+    }
+
+    /// Every node's runner state, as the daemon's JSON.
+    pub fn runner_snapshot(&self) -> Result<serde_json::Value> {
+        let response = self.call(Command::RunnerSnapshot)?;
+        Ok(response.value.unwrap_or(serde_json::Value::Null))
+    }
+}
+
+type Hub = std::sync::Mutex<Vec<std::sync::mpsc::Sender<Event>>>;
+
+fn hub() -> &'static Hub {
+    static HUB: std::sync::OnceLock<Hub> = std::sync::OnceLock::new();
+    HUB.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+/// The daemon's runner events (`Event::Runner`), as [`follow_changes`] sees
+/// them: every node's state after each (re)connect, then each change.
+pub fn events() -> std::sync::mpsc::Receiver<Event> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    hub().lock().expect("event hub").push(tx);
+    rx
+}
+
+fn broadcast(event: &Event) {
+    hub().lock().expect("event hub").retain(|tx| tx.send(event.clone()).is_ok());
+}
+
 /// Call `notify` each time the daemon says the store changed, and once after
 /// every reconnect (a change may have been missed while it was down). Ends
 /// when `notify` is dropped. It never starts a daemon: only a write does.
@@ -129,9 +171,14 @@ pub fn follow_changes(data_root: &Path, notify: &Arc<tokio::sync::Notify>) -> Re
             loop {
                 if let Ok(mut connection) = writer.reconnect() {
                     if connection.request(Command::Subscribe).is_ok() {
-                        while let Some(Event::Changed { .. }) = connection.next_event() {
-                            let Some(notify) = notify.upgrade() else { return };
-                            notify.notify_waiters();
+                        while let Some(event) = connection.next_event() {
+                            match event {
+                                Event::Changed { .. } => {
+                                    let Some(notify) = notify.upgrade() else { return };
+                                    notify.notify_waiters();
+                                }
+                                runner @ Event::Runner { .. } => broadcast(&runner),
+                            }
                         }
                     }
                 }

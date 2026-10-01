@@ -124,3 +124,40 @@ fn a_restarted_daemon_is_found_again() {
     drop(store);
     stop(&root);
 }
+
+#[test]
+fn the_daemon_hosts_runners_and_pushes_their_state() {
+    let root = root("runners");
+    // SAFETY: set before any thread of this test reads them; the daemon the
+    // test starts inherits them.
+    unsafe {
+        std::env::set_var("TOD_AGENTD_AGENT", "mock");
+        std::env::set_var("TOD_MEDIA_ROOT", concat!(env!("CARGO_MANIFEST_DIR"), "/media"));
+    }
+    let store = remote::open_store(&root, Some(&exe())).unwrap();
+    let events = remote::events();
+    let writer = remote::DaemonWriter::new(&root, Some(exe()));
+
+    // No runs yet.
+    let snapshot = writer.runner_snapshot().unwrap();
+    assert_eq!(snapshot.as_array().map(Vec::len), Some(0), "{snapshot}");
+
+    // A run for a node that does not exist is refused or ends at once; either
+    // way the daemon answers and reports the node's state.
+    let node = uuid::Uuid::new_v4();
+    let _ = writer.runner_start(node, false);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut seen = false;
+    while Instant::now() < deadline {
+        if let Ok(tod_agentd_client::Event::Runner { state }) = events.recv_timeout(Duration::from_millis(200)) {
+            if state["node"] == node.to_string() {
+                seen = true;
+                break;
+            }
+        }
+    }
+    let snapshot = writer.runner_snapshot().unwrap();
+    assert!(seen || snapshot.to_string().contains(&node.to_string()), "no state for the node: {snapshot}");
+    drop(store);
+    stop(&root);
+}

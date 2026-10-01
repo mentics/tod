@@ -18,4 +18,7 @@ serde_json = "1.0"
 uuid = { version = "1.0", features = ["v4", "serde"] }
 tod-agentd-client = { path = "../tod-agentd-client" }
 tod-store = { path = "../tod-store" }
+tod-core = { path = "../tod-core" }
+tod-agent = { path = "../tod-agent" }
+tracing = "0.1"
 tokio = { version = "1", features = ["sync"] }

@@ -131,6 +131,14 @@ pub enum Command {
     /// Turn this connection into a feed: after the reply, the daemon sends an
     /// [`Event`] line each time the store changes.
     Subscribe,
+    /// Start a node's runner, or continue its last run.
+    RunnerStart { node: Uuid, renew_budget: bool },
+    /// Stop a node's run once the agent's turn ends.
+    RunnerPause { node: Uuid },
+    /// Cancel the turn in flight and stop.
+    RunnerStop { node: Uuid },
+    /// Every node's runner state, as the `value` (a list of `RunnerState`).
+    RunnerSnapshot,
 }
 
 /// A line the daemon pushes down a subscribed connection.
@@ -139,6 +147,10 @@ pub enum Command {
 pub enum Event {
     /// Something in the store changed (a commit, or a reload).
     Changed { seq: u64 },
+    /// A node's runner changed; `state` is a `tod_core` `RunnerState` (this
+    /// crate does not know the type). A new subscriber is first sent every
+    /// node's state.
+    Runner { state: serde_json::Value },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

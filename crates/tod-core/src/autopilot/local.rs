@@ -62,7 +62,8 @@ impl Request {
 const PARTS_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// What the run is doing right now.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct Live {
     /// The conversation's protocol; `None` between conversations.
     pub protocol: Option<ProtocolKind>,
@@ -70,6 +71,22 @@ pub struct Live {
     /// The turn in flight, with its streamed parts (sent at most every
     /// [`PARTS_INTERVAL`] while only they change).
     pub status: ConversationStatus,
+}
+
+/// One node's runner as the host of its runs reports it: what the app shows
+/// and what it is pushed when it changes.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RunnerState {
+    pub node: Uuid,
+    /// A run is in progress.
+    pub running: bool,
+    /// A pause or stop was asked for and the run has not ended yet.
+    pub pausing: bool,
+    /// When the run in progress started (ms since the epoch).
+    pub since: i64,
+    pub live: Live,
+    /// How the last run ended.
+    pub outcome: Option<Outcome>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

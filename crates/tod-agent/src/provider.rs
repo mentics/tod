@@ -24,7 +24,7 @@ pub struct SessionStarted {
 /// learned of it. Keep it quick: that thread is driving the agent.
 pub type SessionObserver = Arc<dyn Fn(SessionStarted) + Send + Sync>;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct RunId(Uuid);
 
 impl RunId {
@@ -98,7 +98,7 @@ impl SessionPurpose {
 
 /// One choice offered by an agent's permission request (e.g. "Allow once",
 /// "Deny").
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PermissionOption {
     pub id: String,
     pub label: String,
@@ -107,7 +107,7 @@ pub struct PermissionOption {
 /// An agent is blocked waiting for the user to allow or deny an action. The
 /// run stays `NeedsPermission` until [`AgentProvider::respond_to_permission`]
 /// is called with one of `options`' ids.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PermissionRequest {
     pub run: RunId,
     /// Human-readable description of the action the agent wants to take.
