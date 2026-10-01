@@ -403,6 +403,13 @@ pub struct TaskEditView {
     /// The quick-accept destination text as last saved, so "unsaved changes"
     /// compares like with like.
     generator_accept_destination_saved: Option<String>,
+    /// Title of the node the destination text names (slug or id), shown
+    /// beside the field.
+    generator_accept_destination_title: Option<String>,
+    /// Nodes (slug, title) matching what is typed, best first, offered
+    /// while the text names no node yet.
+    generator_accept_destination_suggestions: Vec<(String, String)>,
+    _generator_accept_destination_subscription: gpui::Subscription,
     /// The quick-accept form an autosave is scheduled (or was last attempted)
     /// for, and its debounce task.
     generator_accept_autosave_pending: Option<(String, Vec<Capability>)>,
@@ -506,6 +513,12 @@ impl TaskEditView {
         let generator_accept_destination_input = cx.new(|cx| {
             InputState::new(window, cx).placeholder("Enter to edit · Destination node slug")
         });
+        let _generator_accept_destination_subscription =
+            cx.subscribe(&generator_accept_destination_input, |this, _, event, cx| {
+                if matches!(event, InputEvent::Change) {
+                    this.refresh_accept_destination_hints(cx);
+                }
+            });
         let linear_preset_name_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("Preset name…"));
         let linear_preset_select = cx.new(|cx| {
@@ -641,6 +654,9 @@ impl TaskEditView {
             generator_show_detail: false,
             generator_accept_destination_input,
             generator_accept_destination_saved: None,
+            generator_accept_destination_title: None,
+            generator_accept_destination_suggestions: Vec::new(),
+            _generator_accept_destination_subscription,
             generator_accept_autosave_pending: None,
             _generator_accept_autosave_task: None,
             generator_accept_capabilities: Vec::new(),
@@ -1989,6 +2005,7 @@ impl TaskEditView {
                 });
                 self.generator_accept_destination_saved =
                     config.accept_destination_node_id.map(|id| id.to_string());
+                self.refresh_accept_destination_hints(cx);
                 self.generator_accept_capabilities = config.accept_capabilities.clone();
                 self.generator_accept_capabilities_saved = config.accept_capabilities;
                 self.generator_accept_error = None;
@@ -2006,6 +2023,7 @@ impl TaskEditView {
                     input.set_value("", window, cx);
                 });
                 self.generator_accept_destination_saved = None;
+                self.refresh_accept_destination_hints(cx);
                 self.generator_accept_capabilities.clear();
                 self.generator_accept_capabilities_saved.clear();
                 self.generator_accept_error = None;
@@ -2735,6 +2753,60 @@ impl TaskEditView {
             Some(node) => Ok(Some(node.id)),
             None => Err(format!("No node with slug \"{slug}\"")),
         }
+    }
+
+    /// Recompute the destination field's title and suggestions from what is
+    /// typed. Text naming a node (slug or id) shows that node's title; any
+    /// other text is fuzzy-matched against every node's title and slug, with
+    /// the node tree's own matcher.
+    fn refresh_accept_destination_hints(&mut self, cx: &mut Context<Self>) {
+        let text = input_text(&self.generator_accept_destination_input, cx)
+            .trim()
+            .to_string();
+        self.generator_accept_destination_title = None;
+        self.generator_accept_destination_suggestions.clear();
+        if text.is_empty() {
+            cx.notify();
+            return;
+        }
+        let nodes = self
+            .fleet
+            .read(|conn| tod_store::outline::repos::NodeRepo::new(conn).list_all())
+            .unwrap_or_default();
+        let exact = nodes.iter().find(|node| {
+            node.slug.eq_ignore_ascii_case(&text) || node.id.to_string().eq_ignore_ascii_case(&text)
+        });
+        if let Some(node) = exact {
+            self.generator_accept_destination_title = Some(node.title.clone());
+        } else {
+            let mut scored: Vec<(i32, &tod_store::outline::Node)> = nodes
+                .iter()
+                .filter_map(|node| {
+                    let by_title = tod_core::fuzzy::fuzzy_score(&node.title, &text);
+                    let by_slug = tod_core::fuzzy::fuzzy_score(&node.slug, &text);
+                    by_title.into_iter().chain(by_slug).max().map(|s| (s, node))
+                })
+                .collect();
+            scored.sort_by(|a, b| b.0.cmp(&a.0));
+            self.generator_accept_destination_suggestions = scored
+                .into_iter()
+                .take(8)
+                .map(|(_, node)| (node.slug.clone(), node.title.clone()))
+                .collect();
+        }
+        cx.notify();
+    }
+
+    /// Choose a suggested node: its slug goes into the field.
+    fn accept_destination_suggestion(
+        &mut self,
+        slug: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.generator_accept_destination_input
+            .update(cx, |input, cx| input.set_value(slug, window, cx));
+        self.refresh_accept_destination_hints(cx);
     }
 
     /// Save the quick-accept destination and capabilities. Both are optional
@@ -4740,11 +4812,86 @@ impl TaskEditView {
                     )
                     .child(Self::render_field_label("Destination node slug", cx))
                     .child(
-                        Input::new(&self.generator_accept_destination_input)
+                        h_flex()
+                            .gap_2()
+                            .items_center()
                             .w_full()
-                            .disabled(
-                                self.editing != Some(TaskEditField::GeneratorAcceptDestination),
+                            .child(
+                                div().w(gpui::rems(20.)).flex_shrink_0().child(
+                                    Input::new(&self.generator_accept_destination_input)
+                                        .w_full()
+                                        .disabled(
+                                            self.editing
+                                                != Some(TaskEditField::GeneratorAcceptDestination),
+                                        ),
+                                ),
+                            )
+                            .when_some(
+                                self.generator_accept_destination_title.clone(),
+                                |row, title| {
+                                    row.child(
+                                        div()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .overflow_hidden()
+                                            .whitespace_nowrap()
+                                            .text_ellipsis()
+                                            .text_sm()
+                                            .text_color(muted)
+                                            .child(title),
+                                    )
+                                },
                             ),
+                    )
+                    .when(
+                        self.editing == Some(TaskEditField::GeneratorAcceptDestination)
+                            && !self.generator_accept_destination_suggestions.is_empty(),
+                        |el| {
+                            let (list_hover, popover, border) = {
+                                let theme = cx.theme();
+                                (theme.list_hover, theme.popover, theme.border)
+                            };
+                            el.child(
+                                v_flex()
+                                    .w(gpui::rems(20.))
+                                    .p_1()
+                                    .bg(popover)
+                                    .border_1()
+                                    .border_color(border)
+                                    .rounded_md()
+                                    .children(
+                                        self.generator_accept_destination_suggestions
+                                            .iter()
+                                            .enumerate()
+                                            .map(|(index, (slug, title))| {
+                                                let slug = slug.clone();
+                                                div()
+                                                    .id(("task-edit-accept-dest-suggestion", index))
+                                                    .px_2()
+                                                    .py_0p5()
+                                                    .rounded_sm()
+                                                    .cursor_pointer()
+                                                    .text_sm()
+                                                    .overflow_hidden()
+                                                    .whitespace_nowrap()
+                                                    .text_ellipsis()
+                                                    .hover(|el| el.bg(list_hover))
+                                                    .on_mouse_down(
+                                                        MouseButton::Left,
+                                                        cx.listener(move |this, _, window, cx| {
+                                                            cx.stop_propagation();
+                                                            this.accept_destination_suggestion(
+                                                                slug.clone(),
+                                                                window,
+                                                                cx,
+                                                            );
+                                                        }),
+                                                    )
+                                                    .child(title.clone())
+                                            }),
+                                    ),
+                            )
+                        },
                     ),
             ),
         );
