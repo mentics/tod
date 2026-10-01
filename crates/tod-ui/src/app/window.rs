@@ -160,6 +160,9 @@ pub struct Shell {
     pending_open_interview_for_task: Option<(String, String)>,
     /// A conversation to open once `window` is available (panel events have none).
     pending_open_conversation: Option<Focus>,
+    /// A Design affordance pressed in an event handler: open (or start) the
+    /// obligation's visual-design conversation.
+    pending_open_visual_design: Option<Focus>,
     pending_report_dialog: Option<JourneyKey>,
     /// The conversation view asked to return to where the user came from.
     pending_leave_conversation: bool,
@@ -784,6 +787,9 @@ impl Shell {
     fn drain_pending_conversation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(focus) = self.pending_open_conversation.take() {
             self.open_conversation(focus, window, cx);
+        }
+        if let Some(focus) = self.pending_open_visual_design.take() {
+            self.open_conversation_with(focus, ProtocolKind::VisualDesign, false, window, cx);
         }
         if let Some(key) = self.pending_report_dialog.take() {
             self.on_open_report_dialog(
@@ -2359,13 +2365,12 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                             node_id,
                                             obligation_id,
                                         } => {
-                                            this.queue_drawer(
-                                                DrawerRequest::OpenVisualDesign {
-                                                    node_id: *node_id,
-                                                    obligation_id: *obligation_id,
-                                                },
-                                                cx,
-                                            );
+                                            this.pending_open_visual_design =
+                                                Some(Focus::Obligation {
+                                                    node: *node_id,
+                                                    id: *obligation_id,
+                                                });
+                                            cx.notify();
                                         }
                                     }
                                 });
@@ -2547,6 +2552,7 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                 pending_open_interview: None,
                                 pending_open_interview_for_task: None,
                                 pending_open_conversation: None,
+                                pending_open_visual_design: None,
                                 pending_report_dialog: None,
                                 pending_go_to_tasks: None,
                                 pending_gate_check: None,

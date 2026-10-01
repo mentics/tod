@@ -16,6 +16,7 @@
 //! ask <question> | <option> | <option> ...
 //! ask <question> |
 //! think <text>
+//! draft <html>
 //! permission <title>
 //! ```
 //!
@@ -231,6 +232,18 @@ fn directive(client: &impl Access, conversation: Uuid, line: &str) -> Result<Opt
             target: None,
         })
     };
+    // The visual-design agent's working draft: written where `tod-cli
+    // visual-design` and the designer pane look for it. A literal backslash-n in the line is a
+    // newline, since a directive is one line.
+    if let Some(html) = line.strip_prefix("draft ") {
+        let path = super::context::visual_design_draft_path(&client.data_root(), conversation);
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+        }
+        std::fs::write(&path, html.trim().replace("\\n", "\n"))
+            .with_context(|| format!("write {}", path.display()))?;
+        return Ok(None);
+    }
     if let Some(text) = line.strip_prefix("ask ") {
         let text = text.trim();
         // `ask <question> | <option> | <option> ...` records a decision on

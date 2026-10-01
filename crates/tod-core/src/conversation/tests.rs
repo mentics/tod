@@ -843,6 +843,19 @@ fn net_changes_first(fx: &Fixture, id: Uuid) -> Uuid {
 }
 
 #[test]
+fn the_mock_writes_the_visual_design_draft() {
+    let fx = fixture();
+    let mut agent = FakeAgent::new(&fx.fleet);
+    let mut driver =
+        ConversationDriver::new(config(&fx, 100_000), Focus::Project, ProtocolKind::Outline);
+    say(&mut driver, &fx, &mut agent, r"draft <h1>One</h1>\n<p>two</p>");
+    let id = driver.conversation_id().unwrap();
+    let path = super::context::visual_design_draft_path(fx.fleet.paths().root(), id);
+    assert_eq!(std::fs::read_to_string(path).unwrap(), "<h1>One</h1>
+<p>two</p>");
+}
+
+#[test]
 fn the_mock_carries_out_every_directive() {
     let fx = fixture();
     let mut agent = FakeAgent::new(&fx.fleet);
