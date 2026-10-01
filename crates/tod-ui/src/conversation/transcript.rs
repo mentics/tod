@@ -6,7 +6,7 @@ use crate::ui::agent_conversation::{
     AgentConversationEvent, AgentConversationPanel, Entry, EntryKind, NoticeTone, PanelAction,
     PanelNotice,
 };
-use crate::ui::terminal_handoff::{self, CONTINUE_IN_TERMINAL, OPEN_SHELL};
+use crate::ui::terminal_handoff::{self, CONTINUE_IN_TERMINAL, OPEN_IN_ZED, OPEN_SHELL};
 use gpui::{
     AnyElement, AppContext, ClipboardItem, Context, Entity, IntoElement, Subscription, Window,
 };
@@ -103,6 +103,9 @@ impl ConversationView {
                     window,
                     cx,
                 )
+            }
+            AgentConversationEvent::Action(id, _) if id.as_ref() == OPEN_IN_ZED => {
+                terminal_handoff::open_in_zed(self.fleet.clone(), self.focus.node_id(), window, cx)
             }
             AgentConversationEvent::Action(id, _) if id.as_ref() == OPEN_SHELL => {
                 terminal_handoff::open_shell(self.fleet.clone(), self.focus.node_id(), window, cx)
