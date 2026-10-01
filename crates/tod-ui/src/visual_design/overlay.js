@@ -106,6 +106,13 @@
       e.stopPropagation();
       if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); submit(); }
       else if (e.key === "Escape") { e.preventDefault(); closeComment(); }
+      // The comment box takes focus on every selection, so while it is still
+      // empty [ and ] keep their meaning (widen, narrow) rather than being typed.
+      else if (!ta.value && !e.ctrlKey && !e.metaKey && !e.altKey && (e.key === "[" || e.key === "]")) {
+        e.preventDefault();
+        if (e.key === "[") widen(); else narrow();
+        openComment();
+      }
     });
     document.addEventListener("keydown", function (e) {
       if (e.altKey && (e.key === "p" || e.key === "P")) { e.preventDefault(); setPick(!picking); return; }
@@ -122,7 +129,7 @@
       } else { hover = target(e.clientX, e.clientY); render(); }
     }, true);
     document.addEventListener("mousedown", function (e) {
-      if (!picking || e.button !== 0 || ours(e.target) || cm.style.display === "block") return;
+      if (!picking || e.button !== 0 || ours(e.target)) return;
       e.preventDefault(); drag = { x: e.clientX, y: e.clientY }; boxRect = null;
     }, true);
     document.addEventListener("mouseup", function (e) {
