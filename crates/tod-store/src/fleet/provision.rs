@@ -331,8 +331,10 @@ pub fn refresh_sandbox_proxy(
                     )));
                 }
             }
-        } else if matches!(dirty, Ok(false)) {
-            let _ = push_branches(&dir);
+        } else if matches!(dirty, Ok(false)) && push_branches(&dir).is_err() {
+            return Ok(SandboxRefresh::NeedsConfirmation(format!(
+                "the branch could not be pushed from {name}, so recreating it could lose commits"
+            )));
         }
     }
     // Its agent's session logs outlive it: the new sandbox gets them back

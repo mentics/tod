@@ -99,6 +99,9 @@ about what was said in the earlier ones and where the agent is running; it
 fails if a reply forgets, the working directory is wrong, or a fresh session
 was started.
 
+`scripts/e2e-move.sh <data root with sandboxes.toml>` makes all of the setup
+below, runs it, and removes it (the baked sandbox image stays in Blaxel).
+
 Setup (all throwaway): a fresh data root holding only a `sandboxes.toml`
 (Blaxel account, no stored token), a host git repo with an `origin`, a running
 `tod-test:base` container started with `-e CLAUDE_CODE_OAUTH_TOKEN` and a repo
@@ -115,6 +118,16 @@ All three legs pass, the session id is the same throughout, and no fresh
 session was started. What the test found: a live agent session stays where
 it started, so after a Files change the next turn kept running in the old
 place. The driver now closes it and resumes the same session in the new one
-(`ConversationDriver::session_place`). Also, a node whose files cannot be
-made falls back to a scratch directory; that is now logged as a warning.
+(`ConversationDriver::session_place`), and tells the user ("This node moved:
+the agent's session continues in …", or an error when the session's log could
+not be brought). Also, a node whose files cannot be made used to fall back to
+a scratch directory silently; it is now an error in the transcript and the
+turn is not sent. Failed background log copies (`session_log::take_problems`)
+and an unreadable Agent capability or settings file are errors the user sees
+too, rather than log lines.
+
+An agent in a dev container is signed in by the user inside it. With
+`claude_token_via = "env"` (the same setting as for sandboxes) the stored
+Claude token is also given to the agent process there, by name, never on a
+command line.
 

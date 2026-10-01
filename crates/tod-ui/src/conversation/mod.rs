@@ -565,6 +565,11 @@ impl ConversationView {
                     let (changed, want_files) = this.poll(committed, ticked, cx);
                     this.refresh_session_info(cx);
                     this.publish_status(cx);
+                    this.pending_notices.extend(
+                        tod_store::fleet::session_log::take_all_problems()
+                            .into_iter()
+                            .map(RunNotice::Error),
+                    );
                     for notice in std::mem::take(&mut this.pending_notices) {
                         cx.emit(ConversationViewEvent::Notice(notice));
                     }

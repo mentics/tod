@@ -461,15 +461,42 @@ pub fn restore_node(data_root: &Path, node_id: &str, sandbox: &str) -> Result<us
     restore(&SandboxRemote::new(sandbox), &local)
 }
 
-/// [`pull_node`] on a thread of its own (after a turn), logging a failure.
+static PROBLEMS: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
+
+/// A background copy failed: logged, and held for the app to show the user
+/// ([`take_problems`]), since a move later would otherwise lose turns without
+/// a word.
+fn report_problem(node_id: &str, message: String) {
+    tracing::warn!("{message}");
+    PROBLEMS.lock().unwrap_or_else(|e| e.into_inner()).push((node_id.to_string(), message));
+}
+
+/// Every node's failures since the last call, for a view that polls with no
+/// run in flight (the copy fails after the turn that started it ended).
+pub fn take_all_problems() -> Vec<String> {
+    std::mem::take(&mut *PROBLEMS.lock().unwrap_or_else(|e| e.into_inner())).into_iter().map(|(_, m)| m).collect()
+}
+
+/// The failures of `node_id`'s background session-log copies since the last
+/// call.
+pub fn take_problems(node_id: &str) -> Vec<String> {
+    let mut all = PROBLEMS.lock().unwrap_or_else(|e| e.into_inner());
+    let (mine, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut *all).into_iter().partition(|(node, _)| node == node_id);
+    *all = rest;
+    mine.into_iter().map(|(_, message)| message).collect()
+}
+
+/// [`pull_node`] on a thread of its own (after a turn); a failure is
+/// reported ([`take_problems`]).
 pub fn pull_node_in_background(data_root: PathBuf, node_id: String, sandbox: String) {
+    let node = node_id.clone();
     let spawned = std::thread::Builder::new().name("tod-session-log".into()).spawn(move || {
         if let Err(err) = pull_node(&data_root, &node_id, &sandbox) {
-            tracing::warn!("keeping {sandbox}'s session logs: {err:#}");
+            report_problem(&node_id, format!("Could not keep {sandbox}'s agent session log, so a move could lose turns: {err:#}"));
         }
     });
     if let Err(err) = spawned {
-        tracing::warn!("the session log copy did not start: {err}");
+        report_problem(&node, format!("The agent session log copy did not start: {err}"));
     }
 }
 
@@ -507,6 +534,7 @@ pub fn keep_session_in_background(
     session: String,
     workdir: super::workdir::Workdir,
 ) {
+    let node = node_id.clone();
     let spawned = std::thread::Builder::new().name("tod-session-log".into()).spawn(move || {
         let local = local_dir(&data_root, &node_id);
         let result = match &workdir {
@@ -519,11 +547,11 @@ pub fn keep_session_in_background(
             super::workdir::Workdir::Sandbox { .. } => return,
         };
         if let Err(err) = result {
-            tracing::warn!("keeping session {session}'s log: {err:#}");
+            report_problem(&node_id, format!("Could not keep the agent session's log, so a move could lose turns: {err:#}"));
         }
     });
     if let Err(err) = spawned {
-        tracing::warn!("the session log copy did not start: {err}");
+        report_problem(&node, format!("The agent session log copy did not start: {err}"));
     }
 }
 

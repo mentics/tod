@@ -32,17 +32,30 @@ pub fn role_for(kind: ProtocolKind) -> AgentRole {
 }
 
 /// `fallback` with whatever the focus node's Agent capability sets over it.
+/// A failure to read it is logged and `fallback` used: for showing what a
+/// launch would be. A launch itself uses [`try_for_focus`].
 pub fn for_focus(fleet: &FleetStore, focus: Focus, fallback: AgentLaunchOptions) -> AgentLaunchOptions {
+    try_for_focus(fleet, focus, fallback.clone()).unwrap_or_else(|err| {
+        tracing::warn!("{err:#}");
+        fallback
+    })
+}
+
+/// [`for_focus`], refusing when the node's Agent capability cannot be read:
+/// launching with other settings than the node's would be a silent change of
+/// model or platform.
+pub fn try_for_focus(
+    fleet: &FleetStore,
+    focus: Focus,
+    fallback: AgentLaunchOptions,
+) -> anyhow::Result<AgentLaunchOptions> {
     let Some(node) = focus.node_id() else {
-        return fallback;
+        return Ok(fallback);
     };
     match fleet.resolve_agent_for_node(&node.to_string()) {
-        Ok(Some(resolved)) => resolved.agent.launch_options(&fallback),
-        Ok(None) => fallback,
-        Err(err) => {
-            tracing::warn!("reading node {node}'s Agent capability: {err:#}");
-            fallback
-        }
+        Ok(Some(resolved)) => Ok(resolved.agent.launch_options(&fallback)),
+        Ok(None) => Ok(fallback),
+        Err(err) => Err(err.context(format!("reading node {node}'s Agent capability"))),
     }
 }
 
@@ -56,8 +69,8 @@ pub fn resolve(
     for_focus(fleet, focus, settings.launch_options_for(role_for(kind)))
 }
 
-/// [`resolve`] with the settings read from `settings_path`; the defaults when
-/// they cannot be read.
+/// [`resolve`] with the settings read from `settings_path`; the defaults
+/// (logged) when they cannot be read. A launch uses [`try_resolve_from`].
 pub fn resolve_from(
     fleet: &FleetStore,
     settings_path: &Path,
@@ -69,6 +82,19 @@ pub fn resolve_from(
         TodSettings::default()
     });
     resolve(fleet, &settings, focus, kind)
+}
+
+/// [`resolve_from`] that fails when the settings or the node's Agent
+/// capability cannot be read.
+pub fn try_resolve_from(
+    fleet: &FleetStore,
+    settings_path: &Path,
+    focus: Focus,
+    kind: ProtocolKind,
+) -> anyhow::Result<AgentLaunchOptions> {
+    let settings = TodSettings::load_from_path(settings_path)
+        .map_err(|err| err.context("reading the settings for the agent's launch"))?;
+    try_for_focus(fleet, focus, settings.launch_options_for(role_for(kind)))
 }
 
 #[cfg(test)]
