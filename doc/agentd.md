@@ -587,7 +587,12 @@ Scope: the workbench only (decision 3).
   the node's mirror (`keep_session_in_background`; a sandbox is pulled), so a
   move from any place has a source. Verified with a real Claude: `--resume
   <id>` works from a jsonl copied under another working directory's project
-  dir. The shell scripts of the container remote are tested locally through
-  `sh`, not against a real container. Not done: the acceptance matrix across
-  host, container, and sandbox (needs Docker and a sandbox, neither available
-  where this was built).
+  dir. Run against real places (`TOD_TEST_DEV_CONTAINER`;
+  `TOD_TEST_SANDBOX` + `TOD_TEST_SANDBOX_ROOT`, and `TOD_RELAY_BIN` if the
+  relay is not beside the build): a 330 KB log goes host → place under the
+  place's own project name and comes back byte-identical, for a Docker
+  container and for a Blaxel sandbox. That found one bug, fixed: on Windows
+  a 48 KB chunk overran the 32 K command line (now 16 KB). Not run: a real
+  Claude resuming inside the container or sandbox (neither has one), and the
+  whole-node moves of the acceptance test, which would need the mock agent
+  to write session logs.

@@ -167,7 +167,11 @@ impl SandboxRemote {
 const PROJECTS: &str = r#"d="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects""#;
 /// The most raw bytes sent in one command (base64 makes it a third more, and
 /// one argument is limited to 128 KiB).
+#[cfg(not(windows))]
 const CHUNK: usize = 48 * 1024;
+/// A Windows command line is limited to 32 K characters in all.
+#[cfg(windows)]
+const CHUNK: usize = 16 * 1024;
 
 fn list_script() -> String {
     format!(r#"{PROJECTS}; for f in "$d"/*/*.jsonl; do [ -f "$f" ] && echo "$(wc -c < "$f") $f"; done; exit 0"#)
@@ -749,5 +753,50 @@ mod transfer_tests {
         assert_eq!(logs, vec![RemoteLog { project: "-proj".into(), session: id.into(), size: body.len() as u64 }]);
         assert_eq!(sh_read_from(&run, "-proj", id, 8).unwrap(), body[8..].to_vec());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The move matrix's session-log leg against a real place: a log goes
+    /// host → place under the place's own project name, and comes back
+    /// unchanged. `place` is the remote under test.
+    fn round_trip_through(place: &dyn Remote, tag: &str) {
+        let dir = std::env::temp_dir().join(format!("tod-session-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let host = HostRemote::at(&dir);
+        let id = format!("cccccccc-{}-3333-4444-555555555555", &format!("{:04x}", std::process::id() & 0xffff));
+        let body = b"{\"type\":\"user\",\"n\":1}
+{\"type\":\"assistant\",\"n\":2}
+".repeat(3000);
+        host.write("-from-host", &id, &body).unwrap();
+        // host -> place
+        assert!(transfer(&host, place, &id, "-in-place").unwrap(), "nothing moved to the {tag}");
+        let logs = place.list().unwrap();
+        assert!(
+            logs.iter().any(|l| l.project == "-in-place" && l.session == id && l.size == body.len() as u64),
+            "the {tag} does not list the log: {logs:?}"
+        );
+        // place -> host, under a third name
+        assert!(transfer(place, &host, &id, "-back-home").unwrap());
+        assert_eq!(host.read_from("-back-home", &id, 0).unwrap(), body);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_log_round_trips_through_a_real_dev_container() {
+        let Ok(container) = std::env::var("TOD_TEST_DEV_CONTAINER") else {
+            eprintln!("skipped: set TOD_TEST_DEV_CONTAINER");
+            return;
+        };
+        round_trip_through(&ContainerRemote::new(&container).unwrap(), "container");
+    }
+
+    /// Needs `TOD_TEST_SANDBOX` and `TOD_TEST_SANDBOX_ROOT`, as `fleet::sandbox`'s smoke test does.
+    #[test]
+    fn a_log_round_trips_through_a_real_cloud_sandbox() {
+        let (Ok(name), Ok(root)) = (std::env::var("TOD_TEST_SANDBOX"), std::env::var("TOD_TEST_SANDBOX_ROOT")) else {
+            eprintln!("skipped: set TOD_TEST_SANDBOX and TOD_TEST_SANDBOX_ROOT");
+            return;
+        };
+        crate::fleet::sandbox::set_data_root(&std::fs::canonicalize(root).unwrap());
+        round_trip_through(&SandboxRemote::new(&name), "sandbox");
     }
 }
