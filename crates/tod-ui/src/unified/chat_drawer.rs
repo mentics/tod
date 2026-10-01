@@ -54,7 +54,7 @@ use crate::ui::agent_runs::AgentRuns;
 use crate::ui::key_context;
 use crate::ui::session_info::SessionInfo;
 use crate::ui::style;
-use crate::ui::terminal_handoff::{self, CONTINUE_IN_TERMINAL, OPEN_SHELL};
+use crate::ui::terminal_handoff::{self, CONTINUE_IN_TERMINAL, OPEN_IN_ZED, OPEN_SHELL};
 use crate::unified::resize::{CHAT_START_HEIGHT, ChatDrawerEdge, DIVIDER_WIDTH, DividerDrag};
 use uuid::Uuid;
 
@@ -366,6 +366,9 @@ impl ChatDrawer {
                     window,
                     cx,
                 )
+            }
+            AgentConversationEvent::Action(id, _) if id.as_ref() == OPEN_IN_ZED => {
+                terminal_handoff::open_in_zed(self.fleet.clone(), self.focus.node_id(), window, cx)
             }
             AgentConversationEvent::Action(id, _) if id.as_ref() == OPEN_SHELL => {
                 terminal_handoff::open_shell(self.fleet.clone(), self.focus.node_id(), window, cx)

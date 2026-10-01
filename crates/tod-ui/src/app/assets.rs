@@ -19,6 +19,7 @@ gpui_kit_assets::icon_assets!(
         Brain,
         Wrench,
         Terminal,
+        FolderCode,
         RotateCcwClock,
         SquarePen,
         Square

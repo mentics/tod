@@ -11,13 +11,16 @@ use crate::interview::agent::SharedAgent;
 use crate::interview::{TodPaths, TodSettings};
 use crate::ui::agent_conversation::PanelTool;
 use crate::ui::toast::{error_toast, info_toast};
+use anyhow::Context as _;
 use gpui::{Context, Window};
 use gpui_component::IconName;
 use std::sync::Arc;
 use tod_core::conversation::handoff::{release_session, terminal_handoff};
 use tod_core::conversation::{ConversationConfig, SharedAgentAccess};
 use tod_store::conversation::{Focus, ProtocolKind};
-use tod_store::fleet::{FleetStore, open_shell_for_node, open_terminal_command};
+use tod_store::fleet::{
+    FleetStore, code_editor, open_code_editor_for_node, open_shell_for_node, open_terminal_command,
+};
 use uuid::Uuid;
 
 /// The tool's id in [`crate::ui::agent_conversation::AgentConversationEvent::Action`].
@@ -26,10 +29,51 @@ pub const CONTINUE_IN_TERMINAL: &str = "continue-in-terminal";
 /// The shell tool's id in [`crate::ui::agent_conversation::AgentConversationEvent::Action`].
 pub const OPEN_SHELL: &str = "open-shell";
 
-/// Both icons left of Send, the shell first: the one for the conversation's
-/// node (`None` for the project, which has no Files directory).
+/// The open-in-Zed tool's id in [`crate::ui::agent_conversation::AgentConversationEvent::Action`].
+pub const OPEN_IN_ZED: &str = "open-in-zed";
+
+/// The icons left of Send, the shell first, then Zed: the ones for the
+/// conversation's node (`None` for the project, which has no Files directory).
 pub fn tools(node: Option<Uuid>, running: bool) -> Vec<PanelTool> {
-    vec![shell_tool(node), tool(running)]
+    vec![shell_tool(node), zed_tool(node), tool(running)]
+}
+
+/// The Zed icon, enabled when the conversation is about a node.
+pub fn zed_tool(node: Option<Uuid>) -> PanelTool {
+    let tooltip = if node.is_some() {
+        "Open this node's files in Zed"
+    } else {
+        "Open in Zed (on a node, not the project)"
+    };
+    PanelTool::new(OPEN_IN_ZED, gpui_kit_assets::IconName::FolderCode, tooltip)
+        .disabled(node.is_none())
+}
+
+/// Open the node's Files directory in Zed off the UI thread (a dev container
+/// or sandbox is prepared first), and say how it went in a toast.
+pub fn open_in_zed<T: 'static>(
+    fleet: Arc<FleetStore>,
+    node: Option<Uuid>,
+    window: &mut Window,
+    cx: &mut Context<T>,
+) {
+    let Some(node) = node else {
+        return;
+    };
+    cx.spawn_in(window, async move |_, cx| {
+        let opened = cx
+            .background_executor()
+            .spawn(async move {
+                let editor = code_editor("zed").context("Zed is not supported here")?;
+                open_code_editor_for_node(&fleet, editor, &node.to_string())
+            })
+            .await;
+        let _ = cx.update(|window, cx| match opened {
+            Ok(dir) => info_toast(window, cx, format!("Opened {} in Zed", dir.display())),
+            Err(err) => error_toast(window, cx, format!("Could not open Zed: {err:#}")),
+        });
+    })
+    .detach();
 }
 
 /// The shell icon, enabled when the conversation is about a node.
