@@ -91,6 +91,8 @@ pub struct Launcher {
     /// Discovery runs once; (index into `browsers`, executable) or the error.
     discovered: Mutex<Option<Result<(usize, PathBuf), BrowserError>>>,
     server: Mutex<Option<DesignServer>>,
+    /// Given to every server this launcher starts.
+    feedback: Mutex<Option<super::server::FeedbackHandler>>,
     live: Mutex<Option<Live>>,
 }
 
@@ -123,9 +125,20 @@ impl Launcher {
             events: tx,
             discovered: Mutex::new(None),
             server: Mutex::new(None),
+            feedback: Mutex::new(None),
             live: Mutex::new(None),
         };
         (l, rx)
+    }
+
+    /// Where feedback posted by the page goes (on a server thread); applies
+    /// to the running server and to any started later.
+    pub fn set_feedback_handler(&self, f: super::server::FeedbackHandler) {
+        if let Some(s) = self.server.lock().unwrap().as_ref() {
+            let f = f.clone();
+            s.on_feedback(move |t, fb| f(t, fb));
+        }
+        *self.feedback.lock().unwrap() = Some(f);
     }
 
     pub fn profile_dir(&self) -> &Path {
@@ -265,7 +278,12 @@ impl Launcher {
             let mut server = self.server.lock().unwrap();
             if server.is_none() {
                 match DesignServer::start() {
-                    Ok(s) => *server = Some(s),
+                    Ok(s) => {
+                        if let Some(f) = self.feedback.lock().unwrap().clone() {
+                            s.on_feedback(move |t, fb| f(t, fb));
+                        }
+                        *server = Some(s)
+                    }
                     Err(e) => {
                         drop(server);
                         self.emit(LauncherEvent::Failed(format!(

@@ -1107,6 +1107,7 @@ impl ConversationView {
         if self.designer_drain() {
             changed = true;
         }
+        self.designer_deliver_feedback(cx);
         if committed || finished {
             self.designer_refresh(cx);
         }

@@ -8,6 +8,7 @@
 
 pub mod browser;
 pub mod chrome;
+pub mod feedback;
 pub mod launcher;
 pub mod mover;
 pub mod placement;
