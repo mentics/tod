@@ -55,7 +55,7 @@ pub use paths::{
     resolve_startup_data_root, set_data_root,
 };
 pub use settings::{
-    AgentLaunchByPlatform, AgentPlatform, AgentRole, AgentRoleSettings, ChatLaunchMode,
+    AgentLaunchByPlatform, AgentPlatform, AgentRole, AgentRoleSettings,
     DEFAULT_LOG_MAX_SIZE_KB, InterviewContextSettings, JourneySettings, LifecycleSettings, MAX_LOG_MAX_SIZE_KB, PrReadinessSettings, PrReviewBotSettings,
     MIN_LOG_MAX_SIZE_KB, PlatformLaunchSettings, QuestionMakerSettings, TerminalSettings,
     TodSettings, WindowGeometry, WorktreeBackend,
