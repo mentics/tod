@@ -188,6 +188,27 @@ mod tests {
     }
 
     #[test]
+    fn the_visual_package_gate_criterion_is_retired_so_accept_has_nothing_to_satisfy() {
+        // The app answers only derived criteria (a gate runs no agent), and
+        // this one has no derived check: it is inactive, so it is not on the
+        // design gate before or after an accept. The accepted mockup is read
+        // by the design phase agent, which certifies the phase.
+        let s = setup();
+        let on_gate = |s: &Fx| {
+            s.fx.fleet
+                .read(|c| crate::phase::check_gate(c, s.fx.node, "design"))
+                .unwrap()
+                .criteria
+                .iter()
+                .any(|c| c.criterion.slug == "design-planning.visual-packages-accepted-or-waived")
+        };
+        assert!(!on_gate(&s));
+        write_draft(&s, "<p>one</p>");
+        accept(&s).unwrap();
+        assert!(!on_gate(&s));
+    }
+
+    #[test]
     fn accept_twice_overwrites_the_one_file() {
         let s = setup();
         write_draft(&s, "<p>one</p>");
