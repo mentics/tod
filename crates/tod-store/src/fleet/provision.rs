@@ -606,6 +606,29 @@ fn push_named_branch(dir: &Workdir, branch: &str) -> Result<()> {
     Ok(())
 }
 
+/// Push `node_id`'s own branch (`doc/agentd.md`, "Pushing the branch"): at a
+/// step boundary, before a run stops, before the node moves. `None` when the
+/// node has no checkout of its own (it shares the workspace, so whatever is
+/// checked out there is not its branch). Refuses a default branch. Runs git
+/// and the network: never on the UI thread.
+pub fn push_node_branch(fleet: &FleetStore, node_id: &str) -> Result<Option<String>> {
+    let Some(location) = node_location(fleet, node_id)? else {
+        return Ok(None);
+    };
+    let dir = location_dir(&location)?;
+    let branch = worktree::current_branch(&dir)
+        .context("its checkout is on a detached HEAD, so there is no branch to push")?;
+    let default = dir
+        .git(&["symbolic-ref", "--short", "-q", "refs/remotes/origin/HEAD"])
+        .ok()
+        .map(|r| r.trim().trim_start_matches("origin/").to_string());
+    if matches!(branch.as_str(), "main" | "master") || default.as_deref() == Some(branch.as_str()) {
+        bail!("{branch} is a default branch; a node pushes only its own");
+    }
+    push_branches(&dir)?;
+    Ok(Some(branch))
+}
+
 /// Push the branch of `dir` and of each submodule that is on one (a
 /// submodule left on a detached HEAD has nothing of its own to push), the
 /// submodules first.

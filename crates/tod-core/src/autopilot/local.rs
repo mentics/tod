@@ -139,6 +139,7 @@ impl LocalRun {
             .name(format!("autopilot-{node}"))
             .spawn(move || {
                 let mut hook = Hook {
+                    node,
                     request: hook_request,
                     on_event: &mut on_event,
                     last: None,
@@ -153,7 +154,10 @@ impl LocalRun {
                     if renew_budget {
                         pilot.renew_budget()?;
                     }
-                    pilot.run_with(&fleet, &mut SharedAgentAccess(&agent), &mut hook)
+                    let outcome = pilot.run_with(&fleet, &mut SharedAgentAccess(&agent), &mut hook);
+                    // Before the run stops for a wait, a request, or the end.
+                    push_branch(&fleet, node);
+                    outcome
                 })();
                 let result = result.map_err(|err| {
                     let error = format!("{err:#}");
@@ -214,6 +218,7 @@ impl LocalRun {
 }
 
 struct Hook<'a, F: FnMut(LocalEvent)> {
+    node: Uuid,
     request: Arc<AtomicU8>,
     on_event: &'a mut F,
     /// The last [`Live`] reported, so an unchanged one is not sent again.
@@ -255,10 +260,23 @@ impl<F: FnMut(LocalEvent)> Hook<'_, F> {
     }
 }
 
+/// Push the node's own branch, so finished work is on the remote and the next
+/// machine has it. A failure is logged, not fatal.
+fn push_branch(fleet: &FleetStore, node: Uuid) {
+    match tod_store::fleet::provision::push_node_branch(fleet, &node.to_string()) {
+        Ok(Some(branch)) => tracing::debug!(%node, %branch, "pushed the branch"),
+        Ok(None) => {}
+        Err(err) => tracing::warn!(%node, "pushing the branch: {err:#}"),
+    }
+}
+
 impl<F: FnMut(LocalEvent)> StepHook for Hook<'_, F> {
-    fn at(&mut self, _: &FleetStore, boundary: Boundary) -> Result<Option<String>> {
-        if boundary == Boundary::Step && !self.waiting {
-            self.report(Live::default());
+    fn at(&mut self, fleet: &FleetStore, boundary: Boundary) -> Result<Option<String>> {
+        if boundary == Boundary::Step {
+            push_branch(fleet, self.node);
+            if !self.waiting {
+                self.report(Live::default());
+            }
         }
         Ok(match self.requested() {
             Request::Run => None,
