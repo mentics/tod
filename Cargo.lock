@@ -9029,6 +9029,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "tod-agentd"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "fs2",
+ "serde",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
 name = "tod-cli"
 version = "0.1.0"
 dependencies = [
