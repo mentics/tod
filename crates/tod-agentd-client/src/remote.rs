@@ -140,23 +140,40 @@ impl DaemonWriter {
     }
 }
 
-type Hub = std::sync::Mutex<Vec<std::sync::mpsc::Sender<Event>>>;
+#[derive(Default)]
+struct Hub {
+    subscribers: Vec<std::sync::mpsc::Sender<Event>>,
+    /// The latest runner event per node, replayed to a new subscriber: the
+    /// daemon sends every node's state once when the feed connects, which may
+    /// be before anything listens.
+    latest: std::collections::HashMap<String, Event>,
+}
 
-fn hub() -> &'static Hub {
-    static HUB: std::sync::OnceLock<Hub> = std::sync::OnceLock::new();
-    HUB.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+fn hub() -> &'static Mutex<Hub> {
+    static HUB: std::sync::OnceLock<Mutex<Hub>> = std::sync::OnceLock::new();
+    HUB.get_or_init(Default::default)
 }
 
 /// The daemon's runner events (`Event::Runner`), as [`follow_changes`] sees
-/// them: every node's state after each (re)connect, then each change.
+/// them: every node's latest state first, then each change.
 pub fn events() -> std::sync::mpsc::Receiver<Event> {
     let (tx, rx) = std::sync::mpsc::channel();
-    hub().lock().expect("event hub").push(tx);
+    let mut hub = hub().lock().expect("event hub");
+    for event in hub.latest.values() {
+        let _ = tx.send(event.clone());
+    }
+    hub.subscribers.push(tx);
     rx
 }
 
 fn broadcast(event: &Event) {
-    hub().lock().expect("event hub").retain(|tx| tx.send(event.clone()).is_ok());
+    let mut hub = hub().lock().expect("event hub");
+    if let Event::Runner { state } = event {
+        if let Some(node) = state.get("node").and_then(|n| n.as_str()) {
+            hub.latest.insert(node.to_string(), event.clone());
+        }
+    }
+    hub.subscribers.retain(|tx| tx.send(event.clone()).is_ok());
 }
 
 /// Call `notify` each time the daemon says the store changed, and once after

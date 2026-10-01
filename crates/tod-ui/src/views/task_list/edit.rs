@@ -94,6 +94,7 @@ pub(super) fn insert_draft_row(tasks: &mut Vec<TaskItem>, draft: &DraftRow) {
             waiting_since: None,
             status_override: None,
             lifecycle_running: false,
+            awaiting: false,
             chat_running: false,
             finished_run: None,
         },

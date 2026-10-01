@@ -630,6 +630,9 @@ impl ListDelegate for TaskListDelegate {
             } else if item.lifecycle_running || item.chat_running {
                 // `styles.node-title-running`
                 crate::ui::style::color::node_running_text()
+            } else if item.awaiting {
+                // A wait nobody owes anything to: out of the way.
+                muted_foreground
             } else if item.has_copies {
                 // `styles.node-title-has-copies`
                 crate::ui::style::color::linked_source_text()

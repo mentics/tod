@@ -2876,6 +2876,23 @@ impl TaskListView {
         cx.notify();
     }
 
+    /// The host reports which nodes' runs ended to wait for something outside;
+    /// their rows recede. A node leaving the set goes back to normal.
+    pub fn set_awaiting(&mut self, nodes: std::collections::HashSet<String>, cx: &mut Context<Self>) {
+        let mut changed = false;
+        for task in self.all_tasks.iter_mut() {
+            let next = nodes.contains(&task.id);
+            if task.awaiting != next {
+                task.awaiting = next;
+                changed = true;
+            }
+        }
+        if changed {
+            self.pending_status_override_apply = true;
+            cx.notify();
+        }
+    }
+
     /// The host reports which nodes the lifecycle processor is working on,
     /// which only the chat panel is, and which stopped since the user last
     /// selected them. Their rows show the matching icon and title colour; a

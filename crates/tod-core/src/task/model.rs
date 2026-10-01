@@ -78,6 +78,9 @@ pub struct TaskItem {
     /// The lifecycle processor is working on this node right now (fed by the
     /// host via `TaskListView::set_running_nodes`).
     pub lifecycle_running: bool,
+    /// The node's run ended to wait for something outside (a review): out of
+    /// the way until it settles (`doc/agentd.md`, "Waiting, visually").
+    pub awaiting: bool,
     /// Only the chat panel (not the lifecycle processor) is working on this
     /// node right now. Ignored while `lifecycle_running`, which wins.
     pub chat_running: bool,
@@ -674,6 +677,7 @@ mod tests {
             waiting_since: None,
             status_override: None,
             lifecycle_running: false,
+            awaiting: false,
             chat_running: false,
             finished_run: None,
         }

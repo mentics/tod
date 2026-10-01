@@ -522,11 +522,14 @@ impl UnifiedView {
                 .flatten()
                 .map(|task| task.lifecycle)
         });
+        let awaiting = self.runners.read(cx).awaiting_nodes();
+        let ids: std::collections::HashSet<String> = awaiting.iter().map(|n| n.to_string()).collect();
+        self.task_list.update(cx, |task_list, cx| task_list.set_awaiting(ids, cx));
         let mut map: std::collections::HashMap<String, String> =
             map.into_iter().map(|(id, label)| (id.to_string(), label)).collect();
         // A node whose run ended to wait (for a review, say) is out of the
         // way: nobody owes it anything, time has to pass.
-        for node in self.runners.read(cx).awaiting_nodes() {
+        for node in awaiting {
             let id = node.to_string();
             if map.contains_key(&id) {
                 continue;
