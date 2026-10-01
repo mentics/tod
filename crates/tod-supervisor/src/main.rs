@@ -12,7 +12,7 @@ use tod_core::autopilot::Budget;
 use tod_supervisor::agent::AgentKind;
 use tod_supervisor::hold::RelayHolder;
 use tod_supervisor::orchestrator::{Orchestrator, base_from_cli_url};
-use tod_supervisor::transcripts::{TranscriptStore, default_projects_dir};
+use tod_supervisor::transcripts::{DirStore, TranscriptStore, default_projects_dir, drive_dir};
 use tod_supervisor::{Config, Woke, wake};
 
 const USAGE: &str = "usage: tod-supervisor wake [--workspace DIR] [--agent claude|mock] [--state-dir DIR]
@@ -96,7 +96,14 @@ fn run(args: &[String]) -> Result<()> {
     }
     .map_err(|e| anyhow::anyhow!("media bundle: {e}"))?;
     let transcripts = transcripts.then(default_projects_dir).flatten().map(|projects| {
-        let sink: Arc<dyn TranscriptStore> = Arc::new(orchestrator.clone());
+        // Agent Drive when the sandbox has it mounted, else the orchestrator.
+        let sink: Arc<dyn TranscriptStore> = match drive_dir() {
+            Some(dir) => {
+                tracing::info!("mirroring transcripts to Agent Drive ({})", dir.display());
+                Arc::new(DirStore::new(dir))
+            }
+            None => Arc::new(orchestrator.clone()),
+        };
         (projects, sink)
     });
     let config = Config {

@@ -391,18 +391,45 @@ That directory stays on the sandbox's disk; it is not mounted from the drive,
 and neither is `CLAUDE_CONFIG_DIR`, which also holds the subscription's
 credentials.
 
-The supervisor mirrors each session file to Agent Drive
-(`users/<user>/nodes/<node>/transcripts/`) **as it is written**: it follows
-the file and appends each new line to the copy. A user looking at a node sees
-what the agent is doing now, not as of the last turn. If the network
-filesystem cannot keep up with that, the fallback is batching (every few
-seconds, and at the end of each turn); nothing else changes.
+The supervisor mirrors each session file to Agent Drive **as it is written**:
+it follows the file and appends each new complete line to the copy. A user
+looking at a node sees what the agent is doing now, not as of the last turn.
 
-The app reads transcripts from the drive's S3 endpoint, which does not wake
-anything. Finished sessions are compressed. Agent Drive is free during its
-beta; when it is not, transcripts can move to cheaper object storage (or the
-orchestrator's volume) without changing anything but where the supervisor
-writes them.
+One drive per workspace (`tod-transcripts`, `tod_sandbox::drive`) holds every
+node's transcripts at `users/<user>/nodes/<node>/transcripts/<name>.jsonl`.
+Provisioning (`cloud_sync`) creates the drive if it is missing and mounts
+**only that node's folder** at `/mnt/tod-transcripts` (the mount is POSIX, so
+an append is an append; the S3 endpoint has no append). The supervisor uses
+the mount when `/proc/mounts` shows it (`transcripts::drive_dir`, or
+`TOD_TRANSCRIPTS_DIR`), and otherwise the orchestrator's transcript store as
+before, so an account or region without Agent Drive keeps working; provisioning
+says so as a warning. On a new sandbox for the node the supervisor restores
+its sessions from the drive first, so a session resumes by id even after the
+sandbox was deleted.
+
+The app reads transcripts from the drive's S3 endpoint
+(`tod_sandbox::drive::DriveReader`: list, and read from a byte offset), which
+does not wake the sandbox. It authenticates with the JWT from the drive's
+`access-token` endpoint sent as `Authorization: Bearer` (30 minutes, renewed
+by the reader); no SigV4 signing or API-key id is needed. Drive permission
+rules are not enforced for S3 today, so the per-node mount is the only
+isolation between nodes' folders.
+
+Verified live (2026-09-30, `e2e_drive` example in `tod-sandbox`): a mount
+survives the sandbox's standby; mounting a folder that does not exist creates
+it; mounting again is fine (a fork does not keep its source's mounts, so every
+provisioning mounts); a line appended through the mount is readable over S3
+while the sandbox is in standby, whole or from a byte offset (206).
+
+A real Claude node (2026-10-01, `cloud_dev` on a node of `mentics/test-repo`,
+Claude through the proxy): its sandbox mounted the drive during
+provisioning, and its sessions appeared on the drive within a minute and grew
+as the agent worked. Four sessions on the drive were byte-identical to the
+sandbox's own files (size and md5), every line valid JSON. After the sandbox
+was deleted and the node run again, the new sandbox restored all four
+sessions at the same sizes before the agent started, and the session it then
+began was mirrored in full too. Not yet checked: that a restored session
+resumes by id, and the mount under a long run with many small appends.
 
 ### Interactive sandboxes
 
@@ -418,7 +445,7 @@ and once more before it deletes the sandbox to recreate it
 back at the same `projects/<project>/` path, so the conversation's recorded
 `agent_session_id` resumes the same session. If the restore fails the
 conversation falls back to a fresh session (rotation). A turn still running
-when a sandbox is lost is not mirrored; Agent Drive is not used for these yet.
+when a sandbox is lost is not mirrored. Moving these onto Agent Drive is not done yet.
 
 ## Crash guards
 
@@ -717,13 +744,12 @@ chosen per account in `sandboxes.toml`, so the same code runs everywhere:
      to its first step in **0.68 s** and **0.85 s**, and had scheduled its
      wake 3.4 s and 4 s after it started. Creating and provisioning each
      sandbox (baked image) took 29.5 s and 30.3 s.
-2. **Agent Drive.** Private preview, and only in `us-was-1`, which is also
-   the region the team will use (tod's default region is now `us-was-1`).
-   Check that a mount survives standby, and how it behaves with a line
-   appended per transcript write. Not testable yet (2026-09-28): the
-   development workspace does not have it (`GET /v0/drives` answers 403
-   "Drives feature is not enabled for this workspace"); it has to be
-   requested from Blaxel for the workspace first.
+2. **Agent Drive.** Private preview, and only in `us-was-1` (tod's default
+   region). Enabled on the development workspace (2026-09-30; it answered
+   403 before). Used for node transcripts: see Transcripts above for what was
+   checked (standby, appends, S3 reads). A real node's Claude sessions
+   were mirrored through the mount and restored on a recreated sandbox
+   (2026-10-01). Not yet measured: a long run with many small appends.
 3. **Volumes.** Verified on the development workspace (2026-09-27): an
    orchestrator's `/data` moved onto a volume with `--move-data`, then the
    sandbox deleted and redeployed with `tod-sandbox orchestrator`: the

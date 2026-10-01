@@ -1,6 +1,7 @@
 //! Cloud sandboxes for tod (Blaxel today).
 //!
 //! - [`blaxel`]: the provider's control plane and each sandbox's own API.
+//! - [`drive`]: Agent Drive, where a node's transcripts live.
 //! - [`relay`]: the client for `tod-relay`, the one server tod runs in a sandbox.
 //! - [`provision`]: making a sandbox ready, idempotently.
 //! - [`terminal`]: interactive terminals that let the sandbox sleep when idle.
@@ -14,6 +15,7 @@
 pub mod agent;
 pub mod blaxel;
 pub mod config;
+pub mod drive;
 pub mod edge;
 pub mod node;
 pub mod orchestrator;
