@@ -2579,3 +2579,58 @@ fn pressing_a_lifecycle_button_records_the_presented_snapshot(cx: &mut TestAppCo
         other => panic!("expected a UserAction, got {other:?}"),
     }
 }
+
+#[gpui::test]
+fn a_visual_design_conversation_shows_its_designer_pane(cx: &mut TestAppContext) {
+    let fixture = Fixture::new();
+    let focus = Focus::Obligation {
+        node: fixture.node_id,
+        id: fixture.design_obligation,
+    };
+    let (view, _, cx) = open_view(&fixture, focus, cx);
+    // A design-phase obligation offers a new visual design in the picker.
+    view.read_with(cx, |view, _| {
+        assert!(view.data.new_kinds.contains(&ProtocolKind::VisualDesign));
+    });
+    view.update_in(cx, |view, window, cx| {
+        view.open_with(focus, ProtocolKind::VisualDesign, false, window, cx)
+    });
+    draw(cx);
+    view.read_with(cx, |view, _| {
+        assert_eq!(view.side_list(), super::side_pane::SideList::Designer);
+    });
+    // Saved, with a draft the agent wrote: the pane compares them off the UI
+    // thread and offers Accept.
+    let id = Uuid::new_v4();
+    fixture
+        .store
+        .interview(
+            ACTOR_USER,
+            InterviewCommand::CreateConversation {
+                id,
+                protocol: ProtocolKind::VisualDesign,
+                focus,
+                platform: None,
+                model: None,
+                effort: None,
+            },
+        )
+        .unwrap();
+    view.update(cx, |view, cx| view.show(focus, Some(id), false, cx));
+    let draft = tod_core::conversation::context::visual_design_draft_path(
+        fixture.store.paths().root(),
+        id,
+    );
+    std::fs::create_dir_all(draft.parent().unwrap()).unwrap();
+    std::fs::write(&draft, "<h1>Hi</h1>").unwrap();
+    view.update(cx, |view, cx| view.designer_refresh(cx));
+    cx.run_until_parked();
+    draw(cx);
+    view.read_with(cx, |view, _| {
+        assert!(view.data.design.is_some());
+        let buttons = view.designer_buttons();
+        assert_eq!(buttons[0].0, "visual-design.accept");
+        assert!(buttons[0].2 && !buttons[0].3, "Accept is primary and enabled");
+        assert!(buttons[2].3, "no window to close");
+    });
+}

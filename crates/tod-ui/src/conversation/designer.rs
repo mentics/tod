@@ -214,7 +214,7 @@ impl ConversationView {
     }
 
     /// The buttons on offer right now: id, label, primary, disabled.
-    fn designer_buttons(&self) -> [(&'static str, &'static str, bool, bool); 3] {
+    pub(super) fn designer_buttons(&self) -> [(&'static str, &'static str, bool, bool); 3] {
         let d = &self.designer;
         let idle = d.busy.is_none();
         let can_accept = self.conversation_id.is_some()
