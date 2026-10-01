@@ -3,7 +3,6 @@ name = "tod-agentd"
 version = "0.1.0"
 edition = "2024"
 publish = false
-build = "build.rs"
 
 [lib]
 path = "src/lib.rs"
@@ -12,12 +11,14 @@ path = "src/lib.rs"
 name = "tod-agentd"
 path = "src/main.rs"
 
-# The resident daemon (`doc/agentd.md`). The library is what `tod` and
-# `tod-cli` link to find, start, and talk to it, so it stays small: no GPUI,
-# no agent transport.
+# The resident daemon (`doc/agentd.md`). Its build stamp is computed by
+# `tod-agentd-client`'s build script, over this crate's source too.
 [dependencies]
 anyhow = "1.0"
 fs2 = "0.4"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-uuid = { version = "1.0", features = ["v4"] }
+uuid = { version = "1.0", features = ["v4", "serde"] }
+tod-agentd-client = { path = "../tod-agentd-client" }
+tod-store = { path = "../tod-store" }
+tokio = { version = "1", features = ["sync"] }

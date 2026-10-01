@@ -43,7 +43,9 @@ use tokio::sync::broadcast;
 /// App-held handle for fleet persistence (writer + projection + lock + runtime state).
 pub struct FleetStore {
     paths: FleetPaths,
-    _lock: FleetLock,
+    /// Held by the store that owns the database: the daemon, or a process
+    /// with no daemon. A client of the daemon holds none.
+    _lock: Option<FleetLock>,
     writer: FleetWriter,
     command_log: Arc<Mutex<crate::fleet::command_log::CommandLog>>,
     projection: Arc<Mutex<FleetProjection>>,
@@ -92,9 +94,11 @@ impl FleetStore {
     /// agent/shell runtime status eventually gets reconciled.
     pub fn open_without_reattach(root: impl AsRef<Path>) -> Result<Self, FleetLaunchError> {
         let paths = FleetPaths::new(root)?;
+        // The lock comes first: recovery and migrations write, and only the
+        // one store that owns the database may.
+        let lock = FleetLock::try_acquire(paths.root()).map_err(map_lock_error)?;
         recover_incomplete_storage_migration(&paths).map_err(FleetLaunchError::Other)?;
         FleetLaunch::prepare(&paths)?;
-        let lock = FleetLock::try_acquire(paths.root()).map_err(map_lock_error)?;
         // One app per data root: its cloud sandboxes are this root's.
         crate::fleet::sandbox::set_data_root(paths.root());
         let command_log = CommandLog::shared();
@@ -117,7 +121,7 @@ impl FleetStore {
 
         Ok(Self {
             paths,
-            _lock: lock,
+            _lock: Some(lock),
             writer,
             command_log,
             projection,
@@ -129,11 +133,56 @@ impl FleetStore {
         })
     }
 
+    /// Open the store as a client of the daemon that owns it: reads come from
+    /// this process's read-only projection, writes go to `remote`, and
+    /// `commit_notify` is signalled when the daemon reports a change. Takes no
+    /// lock and runs no migration; the daemon did both.
+    pub fn open_client(
+        root: impl AsRef<Path>,
+        remote: Arc<dyn crate::fleet::writer::RemoteWriter>,
+        commit_notify: Arc<tokio::sync::Notify>,
+    ) -> Result<Self, FleetLaunchError> {
+        let paths = FleetPaths::new(root)?;
+        crate::fleet::sandbox::set_data_root(paths.root());
+        let writer = FleetWriter::remote(paths.db(), remote, commit_notify.clone());
+        let projection = Arc::new(Mutex::new(
+            FleetProjection::open(paths.db()).map_err(FleetLaunchError::Other)?,
+        ));
+        let change_tx = projection.lock().expect("fleet projection mutex").change_sender();
+        let background_shutdown = Arc::new(AtomicBool::new(false));
+        crate::fleet::projection::spawn_commit_reloader(
+            projection.clone(),
+            commit_notify,
+            background_shutdown.clone(),
+        );
+        Ok(Self {
+            paths,
+            _lock: None,
+            command_log: writer.command_log(),
+            writer,
+            projection,
+            change_tx,
+            notices: FleetNoticeHooks::new(),
+            migration: None,
+            traffic_log: None,
+            background_shutdown,
+        })
+    }
+
+    /// Whether the daemon owns this store's database.
+    pub fn is_client(&self) -> bool {
+        self.writer.remote_backend().is_some()
+    }
+
     /// Run launch-time reattach (stale agent/shell liveness reconciliation) plus the legacy
     /// interview-session migration check. Safe to call from a background thread after the store
     /// is already in use — it only enqueues writes through the normal writer and reloads the
     /// projection, both of which are already safe for concurrent readers.
     pub fn run_launch_hooks(&self, guest: &dyn GuestLivenessCheck) -> Result<(), FleetLaunchError> {
+        // The daemon reconciled runtime state when it opened the store.
+        if self.is_client() {
+            return Ok(());
+        }
         self.run_reattach(guest)?;
         if let Ok(paths) = crate::paths::TodPaths::discover() {
             let projection = self.projection.lock().expect("fleet projection mutex");
@@ -175,6 +224,9 @@ impl FleetStore {
 
     /// Undo the most recent command-log entry.
     pub fn undo_last(&self) -> Result<Option<String>, FleetWriterError> {
+        if let Some(remote) = self.writer.remote_backend() {
+            return Ok(remote.undo_last()?);
+        }
         let entry = self
             .command_log
             .lock()
@@ -189,6 +241,9 @@ impl FleetStore {
 
     /// Undo back through `entry_id` (inclusive), returning labels undone newest-first.
     pub fn undo_through(&self, entry_id: uuid::Uuid) -> Result<Vec<String>, FleetWriterError> {
+        if let Some(remote) = self.writer.remote_backend() {
+            return Ok(remote.undo_through(entry_id)?);
+        }
         let entries = self
             .command_log
             .lock()
@@ -254,6 +309,11 @@ impl FleetStore {
     /// own short-lived connection, like `backup_database` — it does not need
     /// the debounced `FleetMutation` queue.
     pub fn prune_journey_changes_through(&self, through_id: i64) -> Result<()> {
+        if let Some(remote) = self.writer.remote_backend() {
+            let op = crate::fleet::maintenance::Maintenance::PruneJourneyChanges { through_id };
+            remote.maintenance(op)?;
+            return Ok(());
+        }
         let conn = rusqlite::Connection::open(self.writer.db_path())?;
         crate::journey_changes::prune_through(&conn, through_id)
     }
@@ -272,6 +332,15 @@ impl FleetStore {
         seq: i64,
         reason: &str,
     ) -> Result<crate::journey_submissions::SubmissionEntry> {
+        if let Some(remote) = self.writer.remote_backend() {
+            let op = crate::fleet::maintenance::Maintenance::QueueJourneySubmission {
+                bundle_id,
+                node_id,
+                seq,
+                reason: reason.to_string(),
+            };
+            return Ok(serde_json::from_value(remote.maintenance(op)?)?);
+        }
         let conn = rusqlite::Connection::open(self.writer.db_path())?;
         let entry = crate::journey_submissions::JourneySubmissionRepo::new(&conn)
             .insert_queued(bundle_id, node_id, seq, reason)?;
@@ -288,6 +357,14 @@ impl FleetStore {
         bundle_id: uuid::Uuid,
         status: &str,
     ) -> Result<()> {
+        if let Some(remote) = self.writer.remote_backend() {
+            let op = crate::fleet::maintenance::Maintenance::SetJourneySubmissionStatus {
+                bundle_id,
+                status: status.to_string(),
+            };
+            remote.maintenance(op)?;
+            return Ok(());
+        }
         let conn = rusqlite::Connection::open(self.writer.db_path())?;
         crate::journey_submissions::JourneySubmissionRepo::new(&conn).set_status(bundle_id, status)
     }

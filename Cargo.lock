@@ -9036,6 +9036,23 @@ dependencies = [
  "fs2",
  "serde",
  "serde_json",
+ "tod-agentd-client",
+ "tod-store",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "tod-agentd-client"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "fs2",
+ "serde",
+ "serde_json",
+ "tod-store",
+ "tokio",
+ "tracing",
  "uuid",
 ]
 

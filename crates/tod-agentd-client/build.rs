@@ -8,7 +8,7 @@ use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
 /// The crates the daemon is compiled from, relative to this one.
-const SOURCES: &[&str] = &[".", "../tod-core", "../tod-store", "../tod-agent"];
+const SOURCES: &[&str] = &[".", "../tod-agentd", "../tod-core", "../tod-store", "../tod-agent"];
 
 fn main() {
     let here = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());

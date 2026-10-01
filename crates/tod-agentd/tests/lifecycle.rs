@@ -2,8 +2,8 @@
 //! binary.
 
 use std::path::{Path, PathBuf};
-use tod_agentd::client::{self, DaemonNewer, Identity};
-use tod_agentd::{Command, Paths};
+use tod_agentd_client::client::{self, DaemonNewer, Identity};
+use tod_agentd_client::{Command, Paths};
 
 fn exe() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_tod-agentd"))
@@ -76,13 +76,13 @@ fn a_stale_info_file_is_not_a_daemon() {
     let root = root("stale");
     let paths = Paths::new(&root);
     std::fs::create_dir_all(paths.dir()).unwrap();
-    let stale = tod_agentd::Info {
+    let stale = tod_agentd_client::Info {
         pid: 1,
         port: 9, // nothing listens
         token: "x".into(),
         stamp: "dead".into(),
         built_at: 1,
-        protocol: tod_agentd::PROTOCOL,
+        protocol: tod_agentd_client::PROTOCOL,
     };
     std::fs::write(paths.info(), serde_json::to_vec(&stale).unwrap()).unwrap();
     assert!(client::connect(&paths).is_none());

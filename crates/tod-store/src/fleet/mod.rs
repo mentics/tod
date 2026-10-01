@@ -8,6 +8,7 @@ pub mod dev_container;
 pub mod explore;
 pub mod launch;
 pub mod lock;
+pub mod maintenance;
 pub mod migration;
 pub mod mutation_socket;
 pub mod node_actions;

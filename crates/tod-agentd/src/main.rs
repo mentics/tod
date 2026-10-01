@@ -8,7 +8,7 @@ fn main() {
         match arg.as_str() {
             "--data-root" => root = args.next().map(std::path::PathBuf::from),
             "--build-stamp" => {
-                println!("{}", tod_agentd::BUILD_STAMP);
+                println!("{}", tod_agentd_client::BUILD_STAMP);
                 return;
             }
             other => {

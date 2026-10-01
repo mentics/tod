@@ -486,11 +486,41 @@ enum WriterCommand {
     Shutdown,
 }
 
-/// Single in-process async writer with debounced and immediate flush paths.
-pub struct FleetWriter {
-    db_path: PathBuf,
+/// Where a writer's writes go when it is not this process's own thread: the
+/// resident daemon (`tod-agentd`), which owns the store. Defined here so the
+/// store does not depend on the daemon crate; the daemon's client implements
+/// it. Every method is one blocking request/response.
+pub trait RemoteWriter: Send + Sync {
+    fn enqueue(&self, actor: &str, mutation: FleetMutation) -> Result<()>;
+    fn flush(&self) -> Result<()>;
+    fn interview(&self, actor: &str, command: InterviewCommand) -> Result<serde_json::Value>;
+    /// Undo the user's most recent undoable change; its label.
+    fn undo_last(&self) -> Result<Option<String>>;
+    /// Undo back through `entry_id`, labels newest-first.
+    fn undo_through(&self, entry_id: Uuid) -> Result<Vec<String>>;
+    fn switch_database(&self, path: &Path) -> Result<()>;
+    /// A write that does not go through the mutation queue
+    /// ([`crate::fleet::maintenance::Maintenance`]); its result.
+    fn maintenance(&self, op: crate::fleet::maintenance::Maintenance) -> Result<serde_json::Value>;
+}
+
+/// The writer thread that lives in this process.
+struct LocalWriter {
     tx: mpsc::UnboundedSender<WriterCommand>,
     runtime: Arc<tokio::runtime::Runtime>,
+}
+
+enum Backend {
+    Local(LocalWriter),
+    Remote(Arc<dyn RemoteWriter>),
+}
+
+/// The single async writer, with debounced and immediate flush paths: a
+/// thread in this process, or (for the app and `tod-cli`) a client of the
+/// daemon that owns the store. The API is the same either way.
+pub struct FleetWriter {
+    db_path: PathBuf,
+    backend: Backend,
     commit_notify: Arc<tokio::sync::Notify>,
     command_log: Arc<Mutex<CommandLog>>,
 }
@@ -543,11 +573,42 @@ impl FleetWriter {
 
         Ok(Self {
             db_path,
-            tx,
-            runtime,
+            backend: Backend::Local(LocalWriter { tx, runtime }),
             commit_notify,
             command_log,
         })
+    }
+
+    /// A writer whose writes are made by another process. `commit_notify` is
+    /// signalled by whoever hears that process's changes.
+    pub fn remote(
+        db_path: impl AsRef<Path>,
+        remote: Arc<dyn RemoteWriter>,
+        commit_notify: Arc<tokio::sync::Notify>,
+    ) -> Self {
+        Self {
+            db_path: db_path.as_ref().to_path_buf(),
+            backend: Backend::Remote(remote),
+            commit_notify,
+            command_log: CommandLog::shared(),
+        }
+    }
+
+    /// The daemon-side writer, when this one is a client of it.
+    pub fn remote_backend(&self) -> Option<&Arc<dyn RemoteWriter>> {
+        match &self.backend {
+            Backend::Remote(remote) => Some(remote),
+            Backend::Local(_) => None,
+        }
+    }
+
+    fn local(&self) -> Result<&LocalWriter, FleetWriterError> {
+        match &self.backend {
+            Backend::Local(local) => Ok(local),
+            Backend::Remote(_) => Err(FleetWriterError::Write(anyhow::anyhow!(
+                "this operation needs the store's own writer, not a client of the daemon"
+            ))),
+        }
     }
 
     pub fn command_log(&self) -> Arc<Mutex<CommandLog>> {
@@ -565,21 +626,28 @@ impl FleetWriter {
     /// Enqueue `mutation`, attributing its interview change-log entries to
     /// `actor`. Debounced mutations are always attributed to the user.
     pub fn enqueue_as(&self, actor: &str, mutation: FleetMutation) -> Result<(), FleetWriterError> {
+        if let Backend::Remote(remote) = &self.backend {
+            return Ok(remote.enqueue(actor, mutation)?);
+        }
+        let local = self.local()?;
         if mutation.is_immediate() {
             let (respond, rx) = oneshot::channel();
-            self.tx
+            local
+                .tx
                 .send(WriterCommand::MutationSync {
                     mutation,
                     actor: actor.to_string(),
                     respond,
                 })
                 .map_err(|_| FleetWriterError::Closed)?;
-            self.runtime
+            local
+                .runtime
                 .block_on(rx)
                 .map_err(|_| FleetWriterError::Closed)??;
             return Ok(());
         }
-        self.tx
+        local
+            .tx
             .send(WriterCommand::Mutation(mutation))
             .map_err(|_| FleetWriterError::Closed)?;
         Ok(())
@@ -587,11 +655,17 @@ impl FleetWriter {
 
     /// Block until all pending debounced mutations are flushed.
     pub fn flush(&self) -> Result<(), FleetWriterError> {
+        if let Backend::Remote(remote) = &self.backend {
+            return Ok(remote.flush()?);
+        }
+        let local = self.local()?;
         let (respond, rx) = oneshot::channel();
-        self.tx
+        local
+            .tx
             .send(WriterCommand::Flush(respond))
             .map_err(|_| FleetWriterError::Closed)?;
-        self.runtime
+        local
+            .runtime
             .block_on(rx)
             .map_err(|_| FleetWriterError::Closed)??;
         Ok(())
@@ -603,15 +677,20 @@ impl FleetWriter {
         actor: &str,
         command: InterviewCommand,
     ) -> Result<serde_json::Value, FleetWriterError> {
+        if let Backend::Remote(remote) = &self.backend {
+            return Ok(remote.interview(actor, command)?);
+        }
+        let local = self.local()?;
         let (respond, rx) = oneshot::channel();
-        self.tx
+        local
+            .tx
             .send(WriterCommand::Interview {
                 command,
                 actor: actor.to_string(),
                 respond,
             })
             .map_err(|_| FleetWriterError::Closed)?;
-        Ok(self
+        Ok(local
             .runtime
             .block_on(rx)
             .map_err(|_| FleetWriterError::Closed)??)
@@ -625,15 +704,18 @@ impl FleetWriter {
         inverses: Vec<FleetMutation>,
         reverses: Option<i64>,
     ) -> Result<(), FleetWriterError> {
+        let local = self.local()?;
         let (respond, rx) = oneshot::channel();
-        self.tx
+        local
+            .tx
             .send(WriterCommand::Undo {
                 inverses,
                 reverses,
                 respond,
             })
             .map_err(|_| FleetWriterError::Closed)?;
-        self.runtime
+        local
+            .runtime
             .block_on(rx)
             .map_err(|_| FleetWriterError::Closed)??;
         Ok(())
@@ -650,14 +732,20 @@ impl FleetWriter {
 
     /// Close the current database and open `path` on the writer task.
     pub fn switch_database(&self, path: impl AsRef<Path>) -> Result<(), FleetWriterError> {
+        if let Backend::Remote(remote) = &self.backend {
+            return Ok(remote.switch_database(path.as_ref())?);
+        }
+        let local = self.local()?;
         let (respond, rx) = oneshot::channel();
-        self.tx
+        local
+            .tx
             .send(WriterCommand::SwitchDatabase {
                 path: path.as_ref().to_path_buf(),
                 respond,
             })
             .map_err(|_| FleetWriterError::Closed)?;
-        self.runtime
+        local
+            .runtime
             .block_on(rx)
             .map_err(|_| FleetWriterError::Closed)??;
         Ok(())
@@ -670,15 +758,19 @@ impl FleetWriter {
 
     /// Stop the writer thread without consuming this handle (for app shutdown).
     pub fn signal_shutdown(&self) {
-        let _ = self.tx.send(WriterCommand::Shutdown);
+        // A client of the daemon leaves the daemon's writer running.
+        if let Backend::Local(local) = &self.backend {
+            let _ = local.tx.send(WriterCommand::Shutdown);
+        }
     }
 
     /// Simulate abrupt process exit without flushing debounced mutations (verification only).
     #[cfg(test)]
     pub fn abandon_without_flush(self) {
-        let Self { tx, runtime, .. } = self;
-        std::mem::forget(tx);
-        std::mem::forget(runtime);
+        if let Backend::Local(LocalWriter { tx, runtime }) = self.backend {
+            std::mem::forget(tx);
+            std::mem::forget(runtime);
+        }
     }
 }
 
@@ -855,7 +947,8 @@ fn flush_batch(
         };
         set_actor(&guard, ACTOR_USER)?;
         tx.commit()?;
-        if suppressed {
+        // Ctrl+Z undoes what the user did, never an agent's work.
+        if suppressed || actor != ACTOR_USER {
             continue;
         }
         let entry = if let Some(entry) = pre_undo {

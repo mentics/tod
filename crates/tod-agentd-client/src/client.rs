@@ -9,6 +9,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
+use uuid::Uuid;
 
 /// Which build is asking.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,16 +55,56 @@ pub struct Connection {
 }
 
 impl Connection {
+    /// Read one pushed line ([`crate::Event`]) from a subscribed connection,
+    /// waiting as long as it takes. `None` when the connection ends.
+    pub fn next_event(&mut self) -> Option<crate::Event> {
+        let _ = self.writer.set_read_timeout(None);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match self.reader.read_line(&mut line) {
+                Ok(0) | Err(_) => return None,
+                Ok(_) => {}
+            }
+            if let Ok(event) = serde_json::from_str(&line) {
+                return Some(event);
+            }
+        }
+    }
+}
+
+/// The connection to the daemon failed, so whether the daemon got the request
+/// is unknown. A request sent under an id can be sent again on a new
+/// connection (`Connection::request_with_id`).
+#[derive(Debug)]
+pub struct ConnectionLost(pub String);
+
+impl std::fmt::Display for ConnectionLost {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "lost the connection to tod-agentd: {}", self.0)
+    }
+}
+
+impl std::error::Error for ConnectionLost {}
+
+impl Connection {
     /// Send `command` and read its reply.
     pub fn request(&mut self, command: Command) -> Result<Response> {
-        let request = Request { token: self.info.token.clone(), command };
+        self.request_with_id(None, command)
+    }
+
+    /// [`Self::request`] under `id`, so that sending it again after a lost
+    /// connection is answered rather than applied twice.
+    pub fn request_with_id(&mut self, id: Option<Uuid>, command: Command) -> Result<Response> {
+        let request = Request { token: self.info.token.clone(), id, command };
         let mut text = serde_json::to_string(&request)?;
         text.push('\n');
-        self.writer.write_all(text.as_bytes())?;
-        self.writer.flush()?;
+        let lost = |err: std::io::Error| ConnectionLost(err.to_string());
+        self.writer.write_all(text.as_bytes()).map_err(lost)?;
+        self.writer.flush().map_err(lost)?;
         let mut line = String::new();
-        if self.reader.read_line(&mut line)? == 0 {
-            bail!("the daemon closed the connection");
+        if self.reader.read_line(&mut line).map_err(lost)? == 0 {
+            return Err(ConnectionLost("the daemon closed the connection".into()).into());
         }
         let response: Response = serde_json::from_str(&line).context("the daemon's reply")?;
         if response.ok {
@@ -80,7 +121,7 @@ pub fn connect(paths: &Paths) -> Option<Connection> {
     let info = Info::read(paths)?;
     let addr = SocketAddr::from(([127, 0, 0, 1], info.port));
     let stream = TcpStream::connect_timeout(&addr, Duration::from_millis(1000)).ok()?;
-    stream.set_read_timeout(Some(Duration::from_secs(10))).ok()?;
+    stream.set_read_timeout(Some(Duration::from_secs(120))).ok()?;
     let _ = stream.set_nodelay(true);
     let writer = stream.try_clone().ok()?;
     let mut connection = Connection { info: info.clone(), reader: BufReader::new(stream), writer };
@@ -237,7 +278,7 @@ fn spawn(paths: &Paths, executable: &Path, me: &Identity) -> Result<Info> {
         }
     };
 
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + Duration::from_secs(60);
     while Instant::now() < deadline {
         if let Some(connection) = connect(paths) {
             return Ok(connection.info);
@@ -251,7 +292,7 @@ fn spawn(paths: &Paths, executable: &Path, me: &Identity) -> Result<Info> {
         }
         std::thread::sleep(Duration::from_millis(50));
     }
-    bail!("tod-agentd did not answer within 15s; see {}", paths.log().display())
+    bail!("tod-agentd did not answer within 60s; see {}", paths.log().display())
 }
 
 #[derive(Clone, Copy)]
