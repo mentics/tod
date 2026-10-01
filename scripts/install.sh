@@ -45,7 +45,7 @@ mkdir -p "$TARGET_DIR"
 
 RELEASE_DIR="$REPO_ROOT/target/release"
 
-BINS=(tod tod-cli)
+BINS=(tod tod-cli tod-agentd)
 if [[ $SANDBOX == 1 ]]; then
     BINS+=(tod-sandbox tod-zed-shim)
 fi
