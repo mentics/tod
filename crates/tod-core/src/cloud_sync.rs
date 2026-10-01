@@ -31,7 +31,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tod_store::credentials::{CredentialKind, CredentialStore};
-use tod_store::fleet::FleetStore;
+use tod_store::fleet::{FleetMutation, FleetStore};
 use tod_store::sync::{self, ApplyReport, Change};
 
 /// The app's cloud-sync record, under the data root.
@@ -805,14 +805,14 @@ fn record_cloud_node(fleet: &FleetStore, node_id: &str, sandbox: String, user: &
         lost_at: None,
     };
     let node_uuid = uuid::Uuid::parse_str(node_id).with_context(|| format!("node id {node_id}"))?;
-    let _ = fleet.flush_on_quit();
-    tod_store::cloud_nodes::upsert(
-        &connect(fleet.paths().db())?,
-        node_uuid,
-        &record.sandbox,
-        &record.user,
-        record.accepted_at_ms,
-    )?;
+    // Through the writer (the daemon's, in the app), not a connection of its own.
+    fleet.enqueue(FleetMutation::CloudNodeUpsert {
+        node: node_uuid,
+        sandbox: record.sandbox.clone(),
+        user: record.user.clone(),
+        accepted_at: record.accepted_at_ms,
+    })?;
+    fleet.writer().flush()?;
     let _ = fleet.reload_if_stale();
     Ok(record)
 }

@@ -178,6 +178,18 @@ pub enum FleetMutation {
     ClearShellReconnect {
         id: String,
     },
+    // --- Cloud nodes (immediate) ---
+    /// The node runs in the cloud, in this sandbox (`cloud_nodes`).
+    CloudNodeUpsert {
+        node: uuid::Uuid,
+        sandbox: String,
+        user: String,
+        accepted_at: i64,
+    },
+    /// The node no longer runs in the cloud.
+    CloudNodeRemove {
+        node: uuid::Uuid,
+    },
     // --- Outline (tree / lists) ---
     Outline(OutlineMutation),
     // --- Interview sessions (immediate) ---
@@ -229,6 +241,8 @@ impl FleetMutation {
                 | FleetMutation::InsertInterviewSession { .. }
                 | FleetMutation::UpdateInterviewSessionScaffolding { .. }
                 | FleetMutation::SetInterviewSessionStatus { .. }
+                | FleetMutation::CloudNodeUpsert { .. }
+                | FleetMutation::CloudNodeRemove { .. }
         )
     }
 
@@ -444,6 +458,12 @@ impl FleetMutation {
                 };
                 let status = InterviewSessionStatus::from_str(status)?;
                 InterviewSessionRepo::new(conn).set_status(*id, status)?;
+            }
+            FleetMutation::CloudNodeUpsert { node, sandbox, user, accepted_at } => {
+                crate::cloud_nodes::upsert(conn, *node, sandbox, user, *accepted_at)?;
+            }
+            FleetMutation::CloudNodeRemove { node } => {
+                crate::cloud_nodes::remove(conn, *node)?;
             }
             FleetMutation::Outline(_) => {}
         }

@@ -555,10 +555,12 @@ Scope: the workbench only (decision 3).
   change. The protocol retries under one request id, which the daemon
   answers once. Undo is the daemon's, for the user's changes only; a client
   mirrors the history (`Command::History`). The daemon starts the cloud
-  outbox/lost-sandbox check and the orchestrator notifications. Still on
-  their own WAL connections beside the daemon's writer: the cloud actions the
-  user starts in the app (`run_in_cloud` and the like, `cloud_nodes`), and
-  the orchestrator/supervisor processes.
+  outbox/lost-sandbox check and the orchestrator notifications. The cloud
+  actions the user starts in the app (`run_in_cloud`, stopping one,
+  retiring a finished node, adopting old records) write `cloud_nodes`
+  through the writer (`CloudNodeUpsert`/`CloudNodeRemove`). The
+  orchestrator and supervisor run in the cloud on stores of their own, so
+  they are not writers beside this daemon.
 - **4: the daemon hosts the runs itself.** Instead of spawning
   `tod-supervisor wake` in direct mode, `tod_agentd::runners::Runners` keeps
   one `LocalRun` thread per node inside the daemon, wakes `Outcome::Waiting`

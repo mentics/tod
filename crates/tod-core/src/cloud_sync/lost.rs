@@ -17,14 +17,14 @@
 //! Everything here blocks on the network or the database: never call it on
 //! the UI thread ([`spawn_check`] runs on a thread of its own).
 
-use super::{CloudSyncState, connect, ensure_node_sandbox, record_cloud_node, resolve, sandbox_is_dead, sync};
+use super::{CloudSyncState, ensure_node_sandbox, record_cloud_node, resolve, sandbox_is_dead, sync};
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tod_sandbox::blaxel::SandboxInfo;
 use tod_store::cloud_nodes::{self, CloudNodeRow};
-use tod_store::fleet::FleetStore;
+use tod_store::fleet::{FleetMutation, FleetStore};
 use tod_store::fleet::provision::SandboxRefresh;
 
 /// Which cloud nodes a check looks at.
@@ -77,17 +77,20 @@ pub fn adopt_legacy_records(fleet: &FleetStore) -> Result<usize> {
     if state.nodes.is_empty() {
         return Ok(0);
     }
-    let _ = fleet.flush_on_quit();
-    let conn = connect(fleet.paths().db())?;
     let mut adopted = 0;
     for (id, node) in &state.nodes {
         let Ok(uuid) = uuid::Uuid::parse_str(id) else { continue };
-        if cloud_nodes::get(&conn, uuid)?.is_none() && fleet.get_node(id)?.is_some() {
-            cloud_nodes::upsert(&conn, uuid, &node.sandbox, &node.user, node.accepted_at_ms)?;
+        if fleet.read(|c| cloud_nodes::get(c, uuid))?.is_none() && fleet.get_node(id)?.is_some() {
+            fleet.enqueue(FleetMutation::CloudNodeUpsert {
+                node: uuid,
+                sandbox: node.sandbox.clone(),
+                user: node.user.clone(),
+                accepted_at: node.accepted_at_ms,
+            })?;
             adopted += 1;
         }
     }
-    drop(conn);
+    fleet.writer().flush()?;
     state.nodes.clear();
     state.save(root)?;
     let _ = fleet.reload_if_stale();
@@ -106,12 +109,10 @@ pub fn retire_done(fleet: &FleetStore) -> Result<usize> {
     if done.is_empty() {
         return Ok(0);
     }
-    let _ = fleet.flush_on_quit();
-    let conn = connect(fleet.paths().db())?;
     for node in &done {
-        cloud_nodes::remove(&conn, *node)?;
+        fleet.enqueue(FleetMutation::CloudNodeRemove { node: *node })?;
     }
-    drop(conn);
+    fleet.writer().flush()?;
     let _ = fleet.reload_if_stale();
     Ok(done.len())
 }
@@ -294,8 +295,8 @@ pub fn stop_running_in_cloud(fleet: &FleetStore, node_id: &str, delete_sandbox: 
     let root = fleet.paths().root().to_path_buf();
     let uuid = uuid::Uuid::parse_str(node_id).with_context(|| format!("node id {node_id}"))?;
     let row = fleet.read(|c| cloud_nodes::get(c, uuid))?;
-    let _ = fleet.flush_on_quit();
-    cloud_nodes::remove(&connect(fleet.paths().db())?, uuid)?;
+    fleet.enqueue(FleetMutation::CloudNodeRemove { node: uuid })?;
+    fleet.writer().flush()?;
     let _ = fleet.reload_if_stale();
     set_note(node_id, None);
     let mut message = "No longer runs in the cloud.".to_string();
