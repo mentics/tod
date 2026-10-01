@@ -2807,6 +2807,8 @@ impl TaskEditView {
         self.generator_accept_destination_input
             .update(cx, |input, cx| input.set_value(slug, window, cx));
         self.refresh_accept_destination_hints(cx);
+        // Choosing a node finishes the field, so it saves now.
+        self.exit_edit(window, cx);
     }
 
     /// Save the quick-accept destination and capabilities. Both are optional
@@ -2876,6 +2878,15 @@ impl TaskEditView {
         {
             self.generator_accept_autosave_pending = None;
             self._generator_accept_autosave_task = None;
+            return;
+        }
+        // The destination is validated (it must name a node), so it is saved
+        // when the user is done with the field, never mid-typing.
+        if self.editing == Some(TaskEditField::GeneratorAcceptDestination)
+            && form.0 != saved_destination
+        {
+            self._generator_accept_autosave_task = None;
+            self.generator_accept_autosave_pending = None;
             return;
         }
         if self.generator_accept_autosave_pending.as_ref() == Some(&form) {
