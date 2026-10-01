@@ -33,7 +33,7 @@ use std::sync::Arc;
 use gpui::{
     AnyElement, App, AppContext, Context, Entity, EventEmitter, FocusHandle, InteractiveElement,
     IntoElement, KeyBinding, MouseButton, MouseDownEvent, ParentElement, Render, SharedString,
-    Stateful, Styled, Subscription, Window, actions, div,
+    Stateful, StatefulInteractiveElement, Styled, Subscription, Window, actions, div,
     prelude::FluentBuilder,
 };
 use gpui_component::button::{Button, ButtonVariants};
@@ -1019,14 +1019,28 @@ impl Requests {
 
     fn render_options(&self, decision: &Decision, cx: &mut Context<Self>) -> impl IntoElement {
         let decision = decision.clone();
-        div().flex().flex_wrap().gap_1().children(decision.options.clone().into_iter().enumerate().map(
+        let border = cx.theme().border;
+        let hover = cx.theme().secondary_hover;
+        let radius = cx.theme().radius;
+        // One option per row, wrapping: a long option must stay readable, not
+        // run off the edge as a one-line button label would.
+        div().flex().flex_col().gap_1().children(decision.options.clone().into_iter().enumerate().map(
             |(ix, label)| {
                 let option = ix + 1;
                 let decision = decision.clone();
-                Button::new(SharedString::from(format!("unified-decisions-option-{}-{option}", decision.id)))
-                    .label(format!("{option}. {label}"))
-                    .small()
+                div()
+                    .id(SharedString::from(format!("unified-decisions-option-{}-{option}", decision.id)))
+                    .w_full()
+                    .px_2()
+                    .py_1()
+                    .text_sm()
+                    .border_1()
+                    .border_color(border)
+                    .rounded(radius)
+                    .cursor_pointer()
+                    .hover(move |el| el.bg(hover))
                     .on_click(cx.listener(move |this, _, _, cx| this.click_option(decision.clone(), option, cx)))
+                    .child(format!("{option}. {label}"))
             },
         ))
     }
