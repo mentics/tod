@@ -217,6 +217,101 @@ impl Remote for SandboxRemote {
     }
 }
 
+/// This machine's logs, under a Claude config directory (`CLAUDE_CONFIG_DIR`,
+/// else `~/.claude`) or one given.
+pub struct HostRemote {
+    projects: PathBuf,
+}
+
+impl HostRemote {
+    pub fn new() -> Result<Self> {
+        let base = match std::env::var_os("CLAUDE_CONFIG_DIR").filter(|v| !v.is_empty()) {
+            Some(dir) => PathBuf::from(dir),
+            None => dirs::home_dir().context("no home directory")?.join(".claude"),
+        };
+        Ok(Self::at(base))
+    }
+
+    /// Logs under `<claude_dir>/projects`.
+    pub fn at(claude_dir: impl Into<PathBuf>) -> Self {
+        Self { projects: claude_dir.into().join("projects") }
+    }
+
+    fn path(&self, project: &str, session: &str) -> Result<PathBuf> {
+        file_name(project, session).context("not a session log name")?;
+        Ok(self.projects.join(project).join(format!("{session}.jsonl")))
+    }
+}
+
+impl Remote for HostRemote {
+    fn list(&self) -> Result<Vec<RemoteLog>> {
+        let mut logs = Vec::new();
+        let Ok(projects) = std::fs::read_dir(&self.projects) else { return Ok(logs) };
+        for project in projects.flatten() {
+            let Ok(files) = std::fs::read_dir(project.path()) else { continue };
+            for file in files.flatten() {
+                let name = file.file_name().to_string_lossy().into_owned();
+                let Some(session) = name.strip_suffix(".jsonl") else { continue };
+                let project = project.file_name().to_string_lossy().into_owned();
+                if file_name(&project, session).is_none() {
+                    continue;
+                }
+                let size = file.metadata().map(|m| m.len()).unwrap_or(0);
+                logs.push(RemoteLog { project, session: session.to_string(), size });
+            }
+        }
+        Ok(logs)
+    }
+
+    fn read_from(&self, project: &str, session: &str, offset: u64) -> Result<Vec<u8>> {
+        use std::io::{Read, Seek, SeekFrom};
+        let path = self.path(project, session)?;
+        let mut file = std::fs::File::open(&path).with_context(|| format!("open {}", path.display()))?;
+        file.seek(SeekFrom::Start(offset))?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        Ok(bytes)
+    }
+
+    fn write(&self, project: &str, session: &str, bytes: &[u8]) -> Result<()> {
+        let path = self.path(project, session)?;
+        let dir = path.parent().context("no project directory")?;
+        std::fs::create_dir_all(dir)?;
+        // Into a file of its own first, so a cut-off copy is never a log.
+        let tmp = path.with_extension("jsonl.restoring");
+        std::fs::write(&tmp, bytes)?;
+        std::fs::rename(&tmp, &path)?;
+        Ok(())
+    }
+}
+
+/// Move one session's log from one environment to another for a node that is
+/// moving (`doc/agentd.md`, "Moving a node"): the whole log, complete lines
+/// only, written where `to_project` (the target's working directory, as
+/// [`project_dir_name`]) makes Claude look for it, so the same session id
+/// resumes there. `false` when `from` has no log for `session`. The copy
+/// there is replaced only if `from`'s is longer.
+pub fn transfer(from: &dyn Remote, to: &dyn Remote, session: &str, to_project: &str) -> Result<bool> {
+    let Some(log) = from.list()?.into_iter().filter(|l| l.session == session).max_by_key(|l| l.size) else {
+        return Ok(false);
+    };
+    let held = to
+        .list()?
+        .into_iter()
+        .find(|l| l.session == session && l.project == to_project)
+        .map_or(0, |l| l.size);
+    if held >= log.size {
+        return Ok(true);
+    }
+    let mut bytes = from.read_from(&log.project, session, 0)?;
+    match bytes.iter().rposition(|b| *b == b'\n') {
+        Some(end) => bytes.truncate(end + 1),
+        None => return Ok(false),
+    }
+    to.write(to_project, session, &bytes)?;
+    Ok(true)
+}
+
 /// Copy `sandbox`'s session logs into `node_id`'s local copies.
 pub fn pull_node(data_root: &Path, node_id: &str, sandbox: &str) -> Result<u64> {
     pull(&SandboxRemote::new(sandbox), &local_dir(data_root, node_id))
@@ -375,5 +470,39 @@ mod tests {
         let local = Fs::new("empty");
         assert_eq!(restore(&Never, &local.0).unwrap(), 0);
         assert_eq!(restore(&Never, &local.0.join("missing")).unwrap(), 0);
+    }
+}
+
+#[cfg(test)]
+mod transfer_tests {
+    use super::*;
+
+    #[test]
+    fn a_session_moves_under_the_target_working_directory() {
+        let dir = std::env::temp_dir().join(format!("tod-session-transfer-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let from = HostRemote::at(dir.join("a"));
+        let to = HostRemote::at(dir.join("b"));
+        let id = "11111111-2222-3333-4444-555555555555";
+        let source = project_dir_name("/home/me/repo/.worktrees/task-x");
+        let target = project_dir_name("/workspace/repo/.worktrees/task-x");
+        // The last line is still being written, so it does not travel.
+        from.write(&source, id, b"{\"a\":1}
+{\"b\":2}
+{\"c\"").unwrap();
+
+        assert!(transfer(&from, &to, id, &target).unwrap());
+        let logs = to.list().unwrap();
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].project, target);
+        assert_eq!(to.read_from(&target, id, 0).unwrap(), b"{\"a\":1}
+{\"b\":2}
+");
+
+        // Moving again with nothing new is a no-op that still succeeds.
+        assert!(transfer(&from, &to, id, &target).unwrap());
+        // A session the source does not have is reported, not invented.
+        assert!(!transfer(&from, &to, "no-such-session", &target).unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

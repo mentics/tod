@@ -569,5 +569,14 @@ Scope: the workbench only (decision 3).
   daemon pushes (`Event::Runner`). The cloud supervisor is unchanged.
 - The daemon runs from a copy, so programs beside it are found through
   `TOD_PROGRAM_DIR` (`tod_store::install::program_dir`).
-- Left: 5 (the group and glyph), 6 (moves and the acceptance matrix), and
-  pushing the branch from the local runner.
+- **5** partly: a node whose run ended to wait shows `<state> · waiting` in
+  the tree (the runner line already says what and when). Not yet: a Waiting
+  group and a glyph.
+- **6** partly: `fleet::session_log::transfer` moves one session's log between
+  any two environments (`Remote`: `HostRemote`, `SandboxRemote`; a dev
+  container's is not written) into the target working directory's project
+  name, complete lines only. Not yet: calling it when a node's location
+  changes, whether Claude resumes from the renamed project directory (not
+  run against a real Claude), and the acceptance matrix (needs Docker and a
+  sandbox).
+- Left besides: pushing the branch from the local runner.
