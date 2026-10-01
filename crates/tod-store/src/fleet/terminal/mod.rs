@@ -1607,6 +1607,17 @@ mod tests {
             })
             .unwrap();
         store.writer().flush().unwrap();
+        // These tests run in `cwd` itself, not a worktree of it.
+        store
+            .enqueue_outline(OutlineMutation::SetNodeFiles {
+                node_id: uuid::Uuid::parse_str(&task_id).unwrap(),
+                repo: Some(cwd.display().to_string()),
+                branch: None,
+                use_worktree: false,
+                dev_container: None,
+            })
+            .unwrap();
+        store.writer().flush().unwrap();
         let _ = store.reload_if_stale();
         task_id
     }

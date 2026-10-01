@@ -416,9 +416,17 @@ impl Protocol for ChatProtocol {
 /// conversation about a node the docs of the workspace that node lives in.
 pub(super) fn focus_cwd_or_scratch(env: &ProtocolEnv<'_>, name: &str) -> Result<Workdir> {
     if let Some(node) = env.focus.node_id() {
-        match tod_store::fleet::provision::resolve_launch_cwd(env.fleet, &node.to_string()) {
-            Ok(dir) => return Ok(dir),
-            Err(err) => tracing::warn!(%node, "the node's files are not available, working in a scratch directory: {err:#}"),
+        let node = node.to_string();
+        // Only a node with no files set up works in the scratch directory. A
+        // node that has them but cannot get to them is an error the user
+        // sees, never a quiet change of where the agent works.
+        let has_files = env
+            .fleet
+            .resolve_files_for_node(&node)?
+            .is_some_and(|files| files.repo().is_some());
+        if has_files {
+            return tod_store::fleet::provision::resolve_launch_cwd(env.fleet, &node)
+                .map_err(|err| err.context("this node's files are not available"));
         }
     }
     scratch_dir(env.data_root, name).map(Workdir::Host)

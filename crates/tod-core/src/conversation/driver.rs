@@ -933,13 +933,27 @@ impl ConversationDriver {
         check_tod_cli()?;
         let (cwd, turn_env, progress) = {
             let env = self.env(fleet, id);
+            let cwd = match self.protocol.cwd(&env) {
+                Ok(cwd) => cwd,
+                Err(err) => {
+                    // Shown in the transcript and the view: the turn is not sent.
+                    let message = format!("{err:#}");
+                    self.append(fleet, id, TurnRole::Error, &message)?;
+                    self.last_error = Some(message);
+                    return Err(err);
+                }
+            };
             if let Err(err) = self.protocol.prepare(&env) {
-                tracing::warn!("preparing the working directory: {err:#}");
+                let err = err.context("preparing the working directory");
+                let message = format!("{err:#}");
+                self.append(fleet, id, TurnRole::Error, &message)?;
+                self.last_error = Some(message);
+                return Err(err);
             }
             let mut turn_env = self.protocol.turn_env(&env);
             turn_env.extend(tod_cli_path_env());
             (
-                self.protocol.cwd(&env)?,
+                cwd,
                 turn_env,
                 self.protocol.progress(&env).ok().flatten(),
             )

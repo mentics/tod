@@ -606,12 +606,10 @@ Scope: the workbench only (decision 3).
   (`doc/cloud-sandboxes/test-image.md`). Moves of a whole node's lifecycle
   state, plan and wait are not tested as such: those live in the store,
   which does not move, so only the conversation's session log travels.
-- **Test suite notes.** `tod-store --lib` passes module by module except
-  three that fail or hang on this Windows machine and did so before the
-  daemon work (the hang reproduced on the commit before it):
-  `fleet::migration` hangs in its second test, and
-  `fleet::changes::trigger_changes_when_files_settings_change` and
-  `fleet::terminal::open_shell_for_node_registers_live_process` fail.
+- **Test suite notes.** `tod-store --lib` passes whole (411 tests, about ten
+  minutes on this Windows machine: it is slow, not hung; `fleet::migration`
+  alone takes 17s). Two tests had gone stale when Files began giving each node
+  a worktree by default, and now say so.
 - **Moves through the app, with a real Claude (verified).** `tod-core`'s
   example `e2e_move_node` runs host -> dev container -> cloud sandbox -> host
   on one conversation through `ConversationDriver`; each turn remembered what
