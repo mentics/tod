@@ -247,7 +247,7 @@ impl ConversationDriver {
     /// directory's project name (`doc/agentd.md`, "Moving a node"). A failure
     /// is logged: the resume then fails and the driver's recovery runs.
     fn bring_session(&self, fleet: &FleetStore, cwd: &Workdir, session: &str) {
-        use tod_store::fleet::session_log::{self as log, HostRemote, MirrorRemote, SandboxRemote};
+        use tod_store::fleet::session_log::{self as log, ContainerRemote, HostRemote, MirrorRemote, SandboxRemote};
         let result = (|| -> anyhow::Result<bool> {
             let host = HostRemote::new()?;
             let mirror = match self.focus {
@@ -267,8 +267,12 @@ impl ConversationDriver {
                     sources.extend(mirror.iter().map(|m| m as &dyn log::Remote));
                     log::ensure_session(&target, &sources, session, &log::project_dir_name(path))
                 }
-                // Docker is not reached from here.
-                Workdir::Container { .. } => Ok(true),
+                Workdir::Container { container, path } => {
+                    let target = ContainerRemote::new(container)?;
+                    let mut sources: Vec<&dyn log::Remote> = vec![&host];
+                    sources.extend(mirror.iter().map(|m| m as &dyn log::Remote));
+                    log::ensure_session(&target, &sources, session, &log::project_dir_name(path))
+                }
             }
         })();
         match result {

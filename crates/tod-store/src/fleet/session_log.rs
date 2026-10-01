@@ -188,32 +188,81 @@ fn parse_listing(out: &str) -> Vec<RemoteLog> {
         .collect()
 }
 
+type Run<'a> = &'a dyn Fn(&str, &[&str]) -> Result<Vec<u8>>;
+
+fn sh_list(run: Run) -> Result<Vec<RemoteLog>> {
+    let out = run(&list_script(), &[])?;
+    Ok(parse_listing(&String::from_utf8_lossy(&out)))
+}
+
+fn sh_read_from(run: Run, project: &str, session: &str, offset: u64) -> Result<Vec<u8>> {
+    let script = format!(r#"{PROJECTS}; tail -c +"$(( $1 + 1 ))" "$d/$2/$3.jsonl""#);
+    run(&script, &[&offset.to_string(), project, session])
+}
+
+fn sh_write(run: Run, project: &str, session: &str, bytes: &[u8]) -> Result<()> {
+    // Into a file of its own first, so a cut-off copy is never a log.
+    for (n, chunk) in bytes.chunks(CHUNK).enumerate() {
+        let encoded = base64::engine::general_purpose::STANDARD.encode(chunk);
+        let redirect = if n == 0 { ">" } else { ">>" };
+        let script = format!(
+            r#"{PROJECTS}; mkdir -p "$d/$1" && printf %s "$3" | base64 -d {redirect} "$d/$1/$2.jsonl.restoring""#
+        );
+        run(&script, &[project, session, &encoded])?;
+    }
+    let script = format!(
+        r#"{PROJECTS}; if [ -f "$d/$1/$2.jsonl.restoring" ]; then mv "$d/$1/$2.jsonl.restoring" "$d/$1/$2.jsonl"; else : > "$d/$1/$2.jsonl"; fi"#
+    );
+    run(&script, &[project, session])?;
+    Ok(())
+}
+
 impl Remote for SandboxRemote {
     fn list(&self) -> Result<Vec<RemoteLog>> {
-        let out = self.sh(&list_script(), &[])?;
-        Ok(parse_listing(&String::from_utf8_lossy(&out)))
+        sh_list(&|script, args| self.sh(script, args))
     }
 
     fn read_from(&self, project: &str, session: &str, offset: u64) -> Result<Vec<u8>> {
-        let script = format!(r#"{PROJECTS}; tail -c +"$(( $1 + 1 ))" "$d/$2/$3.jsonl""#);
-        self.sh(&script, &[&offset.to_string(), project, session])
+        sh_read_from(&|script, args| self.sh(script, args), project, session, offset)
     }
 
     fn write(&self, project: &str, session: &str, bytes: &[u8]) -> Result<()> {
-        // Into a file of its own first, so a cut-off copy is never a log.
-        for (n, chunk) in bytes.chunks(CHUNK).enumerate() {
-            let encoded = base64::engine::general_purpose::STANDARD.encode(chunk);
-            let redirect = if n == 0 { ">" } else { ">>" };
-            let script = format!(
-                r#"{PROJECTS}; mkdir -p "$d/$1" && printf %s "$3" | base64 -d {redirect} "$d/$1/$2.jsonl.restoring""#
-            );
-            self.sh(&script, &[project, session, &encoded])?;
+        sh_write(&|script, args| self.sh(script, args), project, session, bytes)
+    }
+}
+
+/// A running dev container's logs, as the container's user sees them.
+pub struct ContainerRemote {
+    exec: tod_agent::devcontainer::ContainerExec,
+}
+
+impl ContainerRemote {
+    pub fn new(container: &str) -> Result<Self> {
+        Ok(Self { exec: tod_agent::devcontainer::ContainerExec::connect(container)? })
+    }
+
+    fn sh(&self, script: &str, args: &[&str]) -> Result<Vec<u8>> {
+        let mut all = vec!["-c", script, "sh"];
+        all.extend_from_slice(args);
+        let out = self.exec.output("/", "sh", &all)?;
+        if !out.status.success() {
+            bail!("in container {}: {}", self.exec.name, String::from_utf8_lossy(&out.stderr).trim());
         }
-        let script = format!(
-            r#"{PROJECTS}; if [ -f "$d/$1/$2.jsonl.restoring" ]; then mv "$d/$1/$2.jsonl.restoring" "$d/$1/$2.jsonl"; else : > "$d/$1/$2.jsonl"; fi"#
-        );
-        self.sh(&script, &[project, session])?;
-        Ok(())
+        Ok(out.stdout)
+    }
+}
+
+impl Remote for ContainerRemote {
+    fn list(&self) -> Result<Vec<RemoteLog>> {
+        sh_list(&|script, args| self.sh(script, args))
+    }
+
+    fn read_from(&self, project: &str, session: &str, offset: u64) -> Result<Vec<u8>> {
+        sh_read_from(&|script, args| self.sh(script, args), project, session, offset)
+    }
+
+    fn write(&self, project: &str, session: &str, bytes: &[u8]) -> Result<()> {
+        sh_write(&|script, args| self.sh(script, args), project, session, bytes)
     }
 }
 
@@ -590,6 +639,36 @@ mod transfer_tests {
 {\"y\":2}
 ");
         assert!(!ensure_session(&to, &[&from], "nothing", "-new").unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The shell scripts the sandbox and container remotes share, run by a
+    /// local `sh` against a throwaway Claude directory.
+    #[test]
+    fn the_shell_remote_scripts_round_trip_a_log() {
+        let Ok(probe) = std::process::Command::new("sh").arg("-c").arg("command -v base64").output() else { return };
+        if !probe.status.success() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("tod-session-sh-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let claude = dir.to_string_lossy().replace(std::path::MAIN_SEPARATOR, "/");
+        let run = |script: &str, args: &[&str]| -> Result<Vec<u8>> {
+            let mut all = vec!["-c", script, "sh"];
+            all.extend_from_slice(args);
+            let out = std::process::Command::new("sh").args(all).env("CLAUDE_CONFIG_DIR", &claude).output()?;
+            anyhow::ensure!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+            Ok(out.stdout)
+        };
+        let id = "bbbbbbbb-2222-3333-4444-555555555555";
+        let body = b"{\"a\":1}
+{\"b\":2}
+".repeat(1000);
+        sh_write(&run, "-proj", id, &body).unwrap();
+        let logs = sh_list(&run).unwrap();
+        assert_eq!(logs, vec![RemoteLog { project: "-proj".into(), session: id.into(), size: body.len() as u64 }]);
+        assert_eq!(sh_read_from(&run, "-proj", id, 8).unwrap(), body[8..].to_vec());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
