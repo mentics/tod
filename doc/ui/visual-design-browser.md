@@ -474,8 +474,9 @@ the user should see each revision as it is made.
 - **Accepting is done by the app, not the agent.** The side pane's **Accept**
   button performs the same operation `tod-cli visual-design save` wraps (copy the
   draft under the data root and link it from the obligation with
-  `OutlineMutation::UpdateObligationVisualDesign`, which is what the
-  `design-planning.visual-packages-accepted-or-waived` gate reads), directly, in the
+  `OutlineMutation::UpdateObligationVisualDesign`; no gate reads it, since the
+  old `design-planning.visual-packages-accepted-or-waived` criterion is retired
+  and the design phase agent reads the linked mockup instead), directly, in the
   background, with no agent turn. The rule throughout: whatever the app can do
   itself it does itself, and the agent is engaged only for what only an agent can
   do (revising the mockup, judging feedback). The conversation records the accept
