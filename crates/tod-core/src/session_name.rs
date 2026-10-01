@@ -22,6 +22,9 @@ pub const CONVERSATION_SURFACE: &str = "conversation";
 pub const CHAT_SURFACE: &str = "chat";
 
 /// The surface label an implementation session is named with.
+/// A visual-design conversation.
+pub const VISUAL_DESIGN_SURFACE: &str = "visual design";
+
 pub const IMPLEMENT_SURFACE: &str = "implement";
 
 /// The surface label a verification session is named with.

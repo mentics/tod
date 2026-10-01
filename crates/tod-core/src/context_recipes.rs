@@ -117,6 +117,31 @@ pub const VISUAL_DESIGN_CHAT: ContextRecipe = ContextRecipe {
     ],
 };
 
+/// The visual-design conversation protocol's recipe. Like the chat, it records
+/// its writes in the conversation's change set (`cli/changeset`) and may record
+/// an obligation (`cli/obligations`) when page feedback justifies one; it has
+/// no plan or lifecycle fragments. Accepting a mockup is the app's own button.
+pub const VISUAL_DESIGN: ContextRecipe = ContextRecipe {
+    name: "visual design",
+    situational: false,
+    layers: &[
+        "stance/interactive-chat",
+        "domain/outline",
+        "domain/obligations",
+        "cli/intro",
+        "cli/visual-design",
+        "cli/obligations",
+        "cli/changeset",
+        "surface/visual-design",
+    ],
+    blocks: &[
+        DynamicBlock::DataRoot,
+        DynamicBlock::Focus,
+        DynamicBlock::AncestorContext,
+        DynamicBlock::VisualDesign,
+    ],
+};
+
 /// An implementation session, launched from the lifecycle panel's Active-phase
 /// "Implement" button (see `crate::gate` for the transition gate that requires
 /// Agent and Files before a node can reach `active` at all).
@@ -473,6 +498,7 @@ pub const ALL_RECIPES: &[ContextRecipe] = &[
     CONVERSATION,
     CHAT,
     VISUAL_DESIGN_CHAT,
+    VISUAL_DESIGN,
     IMPLEMENT_SESSION,
     VERIFY_SESSION,
     REVIEW_SESSION,
@@ -723,5 +749,24 @@ mod tests {
                 recipe.name
             );
         }
+    }
+
+    /// The visual-design protocol's recipe: its own mockup command, the
+    /// obligation and change-set nouns, and nothing about plans or lifecycle.
+    #[test]
+    fn the_visual_design_recipe_has_its_cli_nouns_and_no_plan_or_lifecycle() {
+        for layer in ["cli/visual-design", "cli/obligations", "cli/changeset"] {
+            assert!(VISUAL_DESIGN.layers.contains(&layer), "{layer}");
+        }
+        for layer in VISUAL_DESIGN.layers {
+            assert!(
+                !layer.contains("plan") && !layer.contains("lifecycle"),
+                "{layer}"
+            );
+        }
+        assert!(VISUAL_DESIGN.blocks.contains(&DynamicBlock::VisualDesign));
+        assert!(ALL_RECIPES.iter().any(|r| r.name == VISUAL_DESIGN.name));
+        // The old chat recipe still exists until it is deleted.
+        assert!(ALL_RECIPES.iter().any(|r| r.name == VISUAL_DESIGN_CHAT.name));
     }
 }
