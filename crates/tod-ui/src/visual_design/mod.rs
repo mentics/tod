@@ -7,6 +7,7 @@
 //! hold no GPUI types, so they can move to `tod-core` later if that changes.
 
 pub mod browser;
+pub mod cdp;
 pub mod chrome;
 pub mod feedback;
 pub mod launcher;

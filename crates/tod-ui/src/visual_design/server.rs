@@ -56,7 +56,7 @@ pub struct Viewport {
 }
 
 /// What the page posts (design 7.2).
-#[derive(Clone, Debug, PartialEq, serde::Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, serde::Deserialize)]
 pub struct Feedback {
     #[serde(default)]
     pub comment: String,
@@ -65,6 +65,15 @@ pub struct Feedback {
     #[serde(default, rename = "box")]
     pub boxed: Option<Rect>,
     pub viewport: Viewport,
+    /// The full-page button: capture the whole page, no selection needed.
+    #[serde(default, rename = "fullPage")]
+    pub full_page: bool,
+    /// Filled in by the handler (never by the page): the PNG Chrome returned.
+    #[serde(skip)]
+    pub screenshot: Option<Vec<u8>>,
+    /// Filled in by the handler: why there is no screenshot, if it failed.
+    #[serde(skip)]
+    pub note: Option<String>,
 }
 
 /// Called with the session token and the feedback, on a server thread.
@@ -420,7 +429,7 @@ fn post_feedback(
     let Ok(fb) = serde_json::from_slice::<Feedback>(&req.body) else {
         return respond(conn, "400 Bad Request", "text/plain", b"bad feedback");
     };
-    if fb.comment.trim().is_empty() && fb.selections.is_empty() {
+    if fb.comment.trim().is_empty() && fb.selections.is_empty() && !fb.full_page {
         return respond(conn, "400 Bad Request", "text/plain", b"empty feedback");
     }
     let cb = handler.lock().unwrap().clone();

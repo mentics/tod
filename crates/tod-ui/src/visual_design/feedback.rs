@@ -12,7 +12,9 @@ pub fn render(fb: &Feedback) -> String {
         out.push_str(comment);
         out.push_str("\n\n");
     }
-    if fb.selections.is_empty() && fb.boxed.is_none() {
+    if fb.full_page {
+        out.push_str("(Full-page screenshot.)\n");
+    } else if fb.selections.is_empty() && fb.boxed.is_none() {
         out.push_str("(No element selected.)\n");
     }
     for s in &fb.selections {
@@ -36,6 +38,9 @@ pub fn render(fb: &Feedback) -> String {
             "Region: {:.0} x {:.0} at ({:.0}, {:.0})\n",
             b.w, b.h, b.x, b.y
         ));
+    }
+    if let Some(note) = &fb.note {
+        out.push_str(&format!("({note})\n"));
     }
     out.push_str(&format!(
         "Viewport: {:.0} x {:.0}\n",
@@ -64,6 +69,7 @@ mod tests {
             }],
             boxed: None,
             viewport: Viewport { w: 800.0, h: 600.0, scroll_x: 0.0, scroll_y: 0.0 },
+            ..Default::default()
         };
         let t = render(&fb);
         assert!(t.starts_with("Make it bigger"));

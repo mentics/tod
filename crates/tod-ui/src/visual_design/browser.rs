@@ -45,6 +45,11 @@ pub trait Browser: Send + Sync {
     /// Where it is installed on this machine, or None.
     fn discover(&self) -> Option<PathBuf>;
     fn capabilities(&self) -> Capabilities;
+    /// Extra flags that let tod read the page back (screenshots): remote
+    /// debugging on a port the browser picks, written to its profile.
+    fn debug_args(&self) -> Vec<OsString> {
+        Vec::new()
+    }
     /// The command line that opens `url` as a standalone window using
     /// `profile`. `placement` is Some only on a first launch.
     fn launch_args(

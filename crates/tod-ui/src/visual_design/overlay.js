@@ -15,7 +15,7 @@
       ".bar button{font:inherit;cursor:pointer}.crumb{position:fixed;left:12px;bottom:12px;font:12px ui-monospace,monospace;background:#111;color:#9cf;padding:4px 8px;border-radius:6px;pointer-events:none;display:none}" +
       ".cm{position:fixed;width:280px;pointer-events:auto;font:12px system-ui;background:#111;color:#eee;padding:6px;border-radius:6px;display:none}" +
       ".cm textarea{width:100%;height:60px;box-sizing:border-box}</style>" +
-      '<div class="crumb"></div><div class="bar"><button class="pick">Pick (Alt+P)</button><button class="wide">[ widen</button><button class="narrow">] narrow</button></div>' +
+      '<div class="crumb"></div><div class="bar"><button class="pick">Pick (Alt+P)</button><button class="wide">[ widen</button><button class="narrow">] narrow</button><button class="full">Full page</button></div>' +
       '<div class="cm"><textarea placeholder="Comment, Ctrl+Enter to send, Esc to cancel"></textarea></div>';
     document.documentElement.appendChild(host);
     var crumb = root.querySelector(".crumb"), pickBtn = root.querySelector(".pick");
@@ -71,6 +71,16 @@
     function widen() { var i = selected.length - 1; if (i >= 0) { selected[i] = S.widen(selected[i]); render(); } }
     function narrow() { var i = selected.length - 1; if (i >= 0) { selected[i] = S.narrow(selected[i], anchor); render(); } }
     function text(el) { return (el.textContent || "").replace(/\s+/g, " ").trim().slice(0, 200); }
+    // Hide the overlay and wait two frames so it is not in the capture, post,
+    // then show it again.
+    function post(body) {
+      host.style.visibility = "hidden";
+      var shown = function () { host.style.visibility = ""; };
+      requestAnimationFrame(function () { requestAnimationFrame(function () {
+        fetch(base + "__tod/feedback", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) })
+          .then(function () { clear(); shown(); }, shown);
+      }); });
+    }
     function submit() {
       var body = {
         comment: ta.value,
@@ -81,13 +91,17 @@
         viewport: { w: innerWidth, h: innerHeight, scrollX: scrollX, scrollY: scrollY }
       };
       if (sentBox) body.box = sentBox;
-      fetch(base + "__tod/feedback", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) })
-        .then(function () { clear(); });
+      post(body);
+    }
+    function submitFullPage() {
+      post({ comment: ta.value, selections: [], fullPage: true,
+        viewport: { w: innerWidth, h: innerHeight, scrollX: scrollX, scrollY: scrollY } });
     }
 
     pickBtn.addEventListener("click", function () { setPick(!picking); });
     root.querySelector(".wide").addEventListener("click", widen);
     root.querySelector(".narrow").addEventListener("click", narrow);
+    root.querySelector(".full").addEventListener("click", submitFullPage);
     ta.addEventListener("keydown", function (e) {
       e.stopPropagation();
       if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); submit(); }
