@@ -241,6 +241,43 @@ impl ConversationDriver {
         }
     }
 
+    /// A conversation resumes by its session id, which only works where the
+    /// session's log is: when the node has moved (this machine, a cloud
+    /// sandbox), copy it here from where it is, under this working
+    /// directory's project name (`doc/agentd.md`, "Moving a node"). A failure
+    /// is logged: the resume then fails and the driver's recovery runs.
+    fn bring_session(&self, fleet: &FleetStore, cwd: &Workdir, session: &str) {
+        use tod_store::fleet::session_log::{self as log, HostRemote, MirrorRemote, SandboxRemote};
+        let result = (|| -> anyhow::Result<bool> {
+            let host = HostRemote::new()?;
+            let mirror = match self.focus {
+                Focus::Node(node) | Focus::Obligation { node, .. } | Focus::PlanStep { node, .. } => {
+                    Some(MirrorRemote::new(fleet.paths().root(), &node.to_string()))
+                }
+                Focus::Project => None,
+            };
+            match cwd {
+                Workdir::Host(path) => {
+                    let sources: Vec<&dyn log::Remote> = mirror.iter().map(|m| m as &dyn log::Remote).collect();
+                    log::ensure_session(&host, &sources, session, &log::project_dir_name(&path.to_string_lossy()))
+                }
+                Workdir::Sandbox { sandbox, path } => {
+                    let target = SandboxRemote::new(sandbox);
+                    let mut sources: Vec<&dyn log::Remote> = vec![&host];
+                    sources.extend(mirror.iter().map(|m| m as &dyn log::Remote));
+                    log::ensure_session(&target, &sources, session, &log::project_dir_name(path))
+                }
+                // Docker is not reached from here.
+                Workdir::Container { .. } => Ok(true),
+            }
+        })();
+        match result {
+            Ok(true) => {}
+            Ok(false) => tracing::info!(%session, "no copy of the session's log to bring here"),
+            Err(err) => tracing::warn!(%session, "bringing the session's log here: {err:#}"),
+        }
+    }
+
     /// The stored conversation, once the first send created it.
     pub fn conversation_id(&self) -> Option<Uuid> {
         self.conversation_id
@@ -886,6 +923,9 @@ impl ConversationDriver {
             )
         };
         let environment = launch_environment(fleet, self.focus, &cwd)?;
+        if let Some(session) = &resume {
+            self.bring_session(fleet, &cwd, session);
+        }
         self.progress_before = progress;
         // Whatever the protocol, an agent running in a codebase gets its rules.
         let context =

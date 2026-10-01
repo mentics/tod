@@ -285,6 +285,69 @@ impl Remote for HostRemote {
     }
 }
 
+/// A node's mirror directory (`<data root>/sandbox-sessions/<node>/`, files
+/// `<project>__<session>.jsonl`) as a place logs are read from.
+pub struct MirrorRemote {
+    dir: PathBuf,
+}
+
+impl MirrorRemote {
+    pub fn new(data_root: &Path, node_id: &str) -> Self {
+        Self { dir: local_dir(data_root, node_id) }
+    }
+}
+
+impl Remote for MirrorRemote {
+    fn list(&self) -> Result<Vec<RemoteLog>> {
+        let mut logs = Vec::new();
+        let Ok(entries) = std::fs::read_dir(&self.dir) else { return Ok(logs) };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if let Some((project, session)) = split_file_name(&name) {
+                logs.push(RemoteLog { project, session, size: entry.metadata().map(|m| m.len()).unwrap_or(0) });
+            }
+        }
+        Ok(logs)
+    }
+
+    fn read_from(&self, project: &str, session: &str, offset: u64) -> Result<Vec<u8>> {
+        use std::io::{Read, Seek, SeekFrom};
+        let name = file_name(project, session).context("not a session log name")?;
+        let mut file = std::fs::File::open(self.dir.join(name))?;
+        file.seek(SeekFrom::Start(offset))?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        Ok(bytes)
+    }
+
+    fn write(&self, _: &str, _: &str, _: &[u8]) -> Result<()> {
+        bail!("the mirror is only read through this")
+    }
+}
+
+/// Make sure `target` holds `session`'s log under `to_project`, copying it
+/// from the first of `sources` that has one. `true` when it is there after.
+/// A log the target already has is left alone: it is that environment's own,
+/// and at least as new as what it last wrote.
+pub fn ensure_session(
+    target: &dyn Remote,
+    sources: &[&dyn Remote],
+    session: &str,
+    to_project: &str,
+) -> Result<bool> {
+    if target.list()?.iter().any(|l| l.session == session && l.project == to_project && l.size > 0) {
+        return Ok(true);
+    }
+    for source in sources {
+        match transfer(*source, target, session, to_project) {
+            Ok(true) => return Ok(true),
+            Ok(false) => {}
+            Err(err) => tracing::warn!("copying session {session}: {err:#}"),
+        }
+    }
+    Ok(false)
+}
+
 /// Move one session's log from one environment to another for a node that is
 /// moving (`doc/agentd.md`, "Moving a node"): the whole log, complete lines
 /// only, written where `to_project` (the target's working directory, as
@@ -503,6 +566,30 @@ mod transfer_tests {
         assert!(transfer(&from, &to, id, &target).unwrap());
         // A session the source does not have is reported, not invented.
         assert!(!transfer(&from, &to, "no-such-session", &target).unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ensure_session_copies_only_what_the_target_lacks() {
+        let dir = std::env::temp_dir().join(format!("tod-session-ensure-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let from = HostRemote::at(dir.join("a"));
+        let to = HostRemote::at(dir.join("b"));
+        let id = "aaaaaaaa-2222-3333-4444-555555555555";
+        from.write("-old", id, b"{\"x\":1}
+").unwrap();
+        assert!(ensure_session(&to, &[&from], id, "-new").unwrap());
+        assert_eq!(to.read_from("-new", id, 0).unwrap(), b"{\"x\":1}
+");
+        // The target's own, longer log is not replaced.
+        to.write("-new", id, b"{\"x\":1}
+{\"y\":2}
+").unwrap();
+        assert!(ensure_session(&to, &[&from], id, "-new").unwrap());
+        assert_eq!(to.read_from("-new", id, 0).unwrap(), b"{\"x\":1}
+{\"y\":2}
+");
+        assert!(!ensure_session(&to, &[&from], "nothing", "-new").unwrap());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
