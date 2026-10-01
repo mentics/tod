@@ -562,6 +562,8 @@ fn spawn_macos_terminal(
 fn run_osascript(script: &str) -> Result<()> {
     let status = Command::new("osascript")
         .args(["-e", script])
+        // `do script` returns a reference ("tab 1 of window id N"); nothing reads it.
+        .stdout(std::process::Stdio::null())
         .status()
         .context("run osascript")?;
     if status.success() {
