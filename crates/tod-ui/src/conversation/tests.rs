@@ -2656,6 +2656,7 @@ fn page_feedback_becomes_a_user_turn_and_the_agent_replies(cx: &mut TestAppConte
             selections: vec![],
             boxed: Some(FRect { x: 0.0, y: 0.0, w: 200.0, h: 120.0 }),
             viewport: Viewport::default(),
+            ..Default::default()
         });
         view.designer_deliver_feedback(cx);
     });

@@ -91,7 +91,16 @@ impl Designer {
         });
         let (tx, rx) = std::sync::mpsc::channel();
         let tx = std::sync::Mutex::new(tx);
-        launcher.set_feedback_handler(Arc::new(move |_token, fb| {
+        let weak_launcher = Arc::downgrade(&launcher);
+        launcher.set_feedback_handler(Arc::new(move |_token, mut fb| {
+            // Runs on a server thread, so waiting on the browser is fine.
+            if let Some(clip) = crate::visual_design::cdp::clip_for(&fb) {
+                match weak_launcher.upgrade().map(|l| l.capture(clip)) {
+                    Some(Ok(png)) => fb.screenshot = Some(png),
+                    Some(Err(e)) => fb.note = Some(format!("Screenshot unavailable: {e}")),
+                    None => {}
+                }
+            }
             let _ = tx.lock().unwrap().send(fb);
         }));
         self.feedback_rx = Some(rx);
@@ -196,7 +205,15 @@ impl ConversationView {
         }
         while let Some(fb) = self.designer.feedback_queue.front() {
             let text = crate::visual_design::feedback::render(fb);
-            if !self.deliver(&text, Vec::new(), AfterSend::Retry, cx) {
+            let images: Vec<tod_agent::PromptImage> = fb
+                .screenshot
+                .iter()
+                .map(|png| tod_agent::PromptImage {
+                    mime_type: "image/png".into(),
+                    data: png.clone(),
+                })
+                .collect();
+            if !self.deliver(&text, images, AfterSend::Retry, cx) {
                 break;
             }
             self.designer.feedback_queue.pop_front();

@@ -178,6 +178,10 @@ impl Browser for Chrome {
         }
     }
 
+    fn debug_args(&self) -> Vec<OsString> {
+        vec!["--remote-debugging-port=0".into()]
+    }
+
     fn launch_args(
         &self,
         url: &str,

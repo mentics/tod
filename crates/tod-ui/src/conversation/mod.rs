@@ -1586,7 +1586,7 @@ impl ConversationView {
             let (driver, text, images, result) = cx
                 .background_executor()
                 .spawn(async move {
-                    let result = driver
+                    let mut result = driver
                         .send_with_images(
                             &fleet,
                             &mut SharedAgentAccess(&agent),
@@ -1594,6 +1594,17 @@ impl ConversationView {
                             images.clone(),
                         )
                         .map_err(|e| format!("{e:#}"));
+                    let mut images = images;
+                    // An agent that takes no images still gets the message.
+                    if !images.is_empty()
+                        && result.as_ref().is_err_and(|e| e.contains("does not accept images"))
+                    {
+                        images.clear();
+                        let noted = format!("{text}\n\n(A screenshot was taken but this agent does not accept images.)");
+                        result = driver
+                            .send_with_images(&fleet, &mut SharedAgentAccess(&agent), &noted, Vec::new())
+                            .map_err(|e| format!("{e:#}"));
+                    }
                     (driver, text, images, result)
                 })
                 .await;

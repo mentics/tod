@@ -302,7 +302,8 @@ impl Launcher {
             w: r.w.round() as i32,
             h: r.h.round() as i32,
         });
-        let args = browser.launch_args(&url, &self.profile, placement);
+        let mut args = browser.launch_args(&url, &self.profile, placement);
+        args.extend(browser.debug_args());
         if let Err(e) = self.spawner.spawn(&exe, &args) {
             self.end_session_for(&url);
             self.emit(LauncherEvent::Failed(format!(
@@ -324,6 +325,22 @@ impl Launcher {
         });
         self.emit(LauncherEvent::Opened);
         true
+    }
+
+    /// A PNG of the open window's page (`None` region: the whole page).
+    /// Blocks on the browser: call off the UI thread.
+    pub fn capture(
+        &self,
+        region: Option<super::cdp::Clip>,
+    ) -> Result<Vec<u8>, super::cdp::CdpError> {
+        let prefix = self
+            .live
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|l| l.title_prefix.clone())
+            .ok_or(super::cdp::CdpError::NoWindow)?;
+        super::cdp::capture_png(&self.profile, &prefix, region)
     }
 
     /// Call periodically (off the UI thread). Detects a closed window by the
