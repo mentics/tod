@@ -63,9 +63,28 @@ pub struct TranscriptPanel {
     /// whichever of the node's conversations is running, and shows the turn
     /// in flight as it streams.
     watching: Option<Watching>,
-    /// The stored turns, as entries.
-    stored: Vec<Entry>,
+    /// The stored turns, as entries. Shared so a load can compare against
+    /// them off the UI thread.
+    stored: Arc<Vec<Entry>>,
+    /// `stored` changed since the panel was last given it whole.
+    stored_dirty: bool,
+    /// The turns have been read at least once.
+    loaded: bool,
+    /// A load is running; a change meanwhile asks for one more after it.
+    loading: bool,
+    reload_again: bool,
+    /// Looking for the node's latest conversation.
+    searching: bool,
+    /// A `sync_watch` is waiting out its throttle.
+    sync_scheduled: bool,
+    _load: gpui::Task<()>,
+    _search: gpui::Task<()>,
+    _sync: gpui::Task<()>,
 }
+
+/// The longest a streamed update waits to be shown, so a burst of them is
+/// shown as one.
+const WATCH_THROTTLE: std::time::Duration = std::time::Duration::from_millis(60);
 
 struct Watching {
     node: Uuid,
@@ -98,7 +117,16 @@ impl TranscriptPanel {
             _subscription,
             _follow: gpui::Task::ready(()),
             watching: None,
-            stored: Vec::new(),
+            stored: Arc::new(Vec::new()),
+            stored_dirty: false,
+            loaded: false,
+            loading: false,
+            reload_again: false,
+            searching: false,
+            sync_scheduled: false,
+            _load: gpui::Task::ready(()),
+            _search: gpui::Task::ready(()),
+            _sync: gpui::Task::ready(()),
         };
         let mut fleet_rx = this.fleet.subscribe_changes();
         this._follow = cx.spawn(async move |this, cx| {
@@ -129,10 +157,63 @@ impl TranscriptPanel {
         cx: &mut Context<Self>,
     ) -> Self {
         let mut this = Self::new(Uuid::nil(), fleet, window, cx);
-        let _sub = cx.observe(&runs, |this, _, cx| this.sync_watch(cx));
+        let _sub = cx.observe(&runs, |this, _, cx| this.schedule_sync(cx));
         this.watching = Some(Watching { node, runs, live: Vec::new(), _sub });
         this.sync_watch(cx);
         this
+    }
+
+    /// `sync_watch`, at most once per [`WATCH_THROTTLE`]: the run notifies on
+    /// every streamed chunk, and each sync copies the reply so far.
+    fn schedule_sync(&mut self, cx: &mut Context<Self>) {
+        if self.sync_scheduled {
+            return;
+        }
+        self.sync_scheduled = true;
+        self._sync = cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(WATCH_THROTTLE).await;
+            this.update(cx, |this, cx| {
+                this.sync_scheduled = false;
+                this.sync_watch(cx);
+            })
+            .ok();
+        });
+    }
+
+    /// Find the node's latest conversation off the UI thread, and move to it
+    /// unless the panel has found one meanwhile.
+    fn find_latest(&mut self, node: Uuid, cx: &mut Context<Self>) {
+        if self.searching {
+            return;
+        }
+        self.searching = true;
+        let fleet = self.fleet.clone();
+        self._search = cx.spawn(async move |this, cx| {
+            let latest = cx
+                .background_executor()
+                .spawn(async move {
+                    fleet
+                        .read(|conn| ConversationRepo::new(conn).list_for_focus(Focus::Node(node)))
+                        .ok()
+                        .and_then(|list| {
+                            list.into_iter()
+                                .map(|s| s.conversation)
+                                .filter(|c| !matches!(c.protocol, ProtocolKind::Outline | ProtocolKind::Chat))
+                                .max_by_key(|c| c.updated_at)
+                                .map(|c| c.id)
+                        })
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                this.searching = false;
+                if this.conversation_id.is_nil()
+                    && let Some(id) = latest
+                {
+                    this.retarget(id, cx);
+                }
+            })
+            .ok();
+        });
     }
 
     /// Move to the node's running conversation (else, when none is showing
@@ -163,18 +244,8 @@ impl TranscriptPanel {
         let (target, live) = match running {
             Some((conversation, parts)) => (Some(conversation), parts),
             None if self.conversation_id.is_nil() => {
-                let latest = self
-                    .fleet
-                    .read(|conn| ConversationRepo::new(conn).list_for_focus(focus))
-                    .ok()
-                    .and_then(|list| {
-                        list.into_iter()
-                            .map(|s| s.conversation)
-                            .filter(|c| !matches!(c.protocol, ProtocolKind::Outline | ProtocolKind::Chat))
-                            .max_by_key(|c| c.updated_at)
-                            .map(|c| c.id)
-                    });
-                (latest, Vec::new())
+                self.find_latest(node, cx);
+                (None, Vec::new())
             }
             None => (None, Vec::new()),
         };
@@ -197,35 +268,94 @@ impl TranscriptPanel {
         self.reload(cx);
     }
 
+    /// Read the turns on the background executor, and show them if they
+    /// differ from what is shown. Asking while a read is running asks for one
+    /// more after it, not one each, so a busy store costs one read at a time.
     fn reload(&mut self, cx: &mut Context<Self>) {
         let id = self.conversation_id;
-        let (turns, session_name) = self
-            .fleet
-            .read(|conn| {
-                let repo = ConversationRepo::new(conn);
-                let turns = repo.turns(id)?;
-                let session_name = repo.get(id)?.and_then(|c| c.session_name);
-                anyhow::Ok((turns, session_name))
-            })
-            .unwrap_or_default();
-        let root = self.fleet.paths().root();
-        self.stored = turns.iter().map(|turn| entry_of(turn, root)).collect();
-        self.title = session_name.unwrap_or_else(|| "Transcript".to_string()).into();
-        self.show(cx);
+        if id.is_nil() {
+            // Nothing to read yet: a watching panel is still looking.
+            self.loaded = true;
+            self.show(cx);
+            return;
+        }
+        if self.loading {
+            self.reload_again = true;
+            return;
+        }
+        self.loading = true;
+        let fleet = self.fleet.clone();
+        let known = self.stored.clone();
+        self._load = cx.spawn(async move |this, cx| {
+            let (entries, session_name) = cx
+                .background_executor()
+                .spawn(async move {
+                    let (turns, session_name) = fleet
+                        .read(|conn| {
+                            let repo = ConversationRepo::new(conn);
+                            let turns = repo.turns(id)?;
+                            let session_name = repo.get(id)?.and_then(|c| c.session_name);
+                            anyhow::Ok((turns, session_name))
+                        })
+                        .unwrap_or_default();
+                    let root = fleet.paths().root();
+                    let entries: Vec<Entry> = turns.iter().map(|turn| entry_of(turn, root)).collect();
+                    // `None`: the same turns as are shown.
+                    ((*known != entries).then_some(entries), session_name)
+                })
+                .await;
+            this.update(cx, |this, cx| this.loaded_turns(id, entries, session_name, cx)).ok();
+        });
     }
 
-    /// Push the stored turns, and the turn in flight, to the panel.
-    fn show(&mut self, cx: &mut Context<Self>) {
-        let mut entries = self.stored.clone();
-        if let Some(watching) = &self.watching
-            && !watching.live.is_empty()
-        {
-            entries.push(Entry::live_reply(watching.live.clone()));
+    fn loaded_turns(
+        &mut self,
+        id: Uuid,
+        entries: Option<Vec<Entry>>,
+        session_name: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.loading = false;
+        if id == self.conversation_id {
+            self.loaded = true;
+            if let Some(entries) = entries {
+                self.stored = Arc::new(entries);
+                self.stored_dirty = true;
+            }
+            self.title = session_name.unwrap_or_else(|| "Transcript".to_string()).into();
+            self.show(cx);
+        } else {
+            // Pointed elsewhere while it read.
+            self.reload_again = true;
         }
+        if std::mem::take(&mut self.reload_again) {
+            self.reload(cx);
+        }
+    }
+
+    /// Push the stored turns, and the turn in flight, to the panel. The
+    /// stored turns go whole only when they changed; a streamed update sends
+    /// just the reply in flight.
+    fn show(&mut self, cx: &mut Context<Self>) {
+        let live = self
+            .watching
+            .as_ref()
+            .filter(|watching| !watching.live.is_empty())
+            .map(|watching| Entry::live_reply(watching.live.clone()));
+        let message = if self.loaded { "No turns recorded yet." } else { "Loading…" };
+        let whole = std::mem::take(&mut self.stored_dirty);
+        let stored = self.stored.clone();
         self.panel.update(cx, |panel, cx| {
             panel.set_title(self.title.clone(), cx);
-            panel.set_entries(entries, cx);
-            panel.set_empty_message("No turns recorded yet.", cx);
+            if whole {
+                let mut entries = Vec::with_capacity(stored.len() + 1);
+                entries.extend(stored.iter().cloned());
+                entries.extend(live);
+                panel.set_entries(entries, cx);
+            } else {
+                panel.set_tail(stored.len(), live, cx);
+            }
+            panel.set_empty_message(message, cx);
         });
         cx.notify();
     }
@@ -332,10 +462,20 @@ mod tests {
             Root::new(view, window, cx)
         });
         let view = slot.borrow_mut().take().unwrap();
+        // The turns are read off the UI thread.
+        cx.run_until_parked();
         cx.update(|window, cx| {
             let _ = window.draw(cx);
         });
         (view, cx)
+    }
+
+    /// Let the throttle and the background reads finish.
+    fn settle(cx: &mut VisualTestContext) {
+        for _ in 0..3 {
+            cx.executor().advance_clock(WATCH_THROTTLE * 2);
+            cx.run_until_parked();
+        }
     }
 
     #[gpui::test]
@@ -384,7 +524,7 @@ mod tests {
             cx.notify();
             runs.host_elsewhere(Focus::Node(node), ProtocolKind::Phase, first, live("working")).unwrap()
         });
-        cx.run_until_parked();
+        settle(cx);
         view.read_with(cx, |view, cx| {
             assert_eq!(view.conversation_id(), first);
             // Two stored turns and the reply in flight.
@@ -397,7 +537,7 @@ mod tests {
             runs.release_elsewhere(slot_id);
             runs.host_elsewhere(Focus::Node(node), ProtocolKind::Evaluate, second, live("evaluating")).unwrap();
         });
-        cx.run_until_parked();
+        settle(cx);
         view.read_with(cx, |view, cx| {
             assert_eq!(view.conversation_id(), second);
             assert_eq!(view.panel.read(cx).entries().len(), 3);

@@ -410,21 +410,50 @@ impl TranscriptList {
     }
 
     pub fn set_entries(&mut self, entries: Vec<Entry>, cx: &mut Context<Self>) {
-        if entries != self.entries {
-            let changed: HashSet<usize> = (0..entries.len().max(self.entries.len()))
-                .filter(|ix| entries.get(*ix) != self.entries.get(*ix))
-                .collect();
-            // A live reply grows in place; keep its newest step in view
-            // unless the user has scrolled away from the end.
-            let follow = entries.last().is_some_and(|e| e.live)
-                && self.list.is_scrolled_to_end().unwrap_or(true);
-            self.entries = entries;
-            self.sync_rows(&changed);
-            if follow {
-                self.list.scroll_to_end();
-            }
-            cx.notify();
+        // One pass: the changed set is empty exactly when nothing differs.
+        let changed: HashSet<usize> = (0..entries.len().max(self.entries.len()))
+            .filter(|ix| entries.get(*ix) != self.entries.get(*ix))
+            .collect();
+        if !changed.is_empty() {
+            self.apply_entries(entries, changed, cx);
         }
+    }
+
+    /// Replace everything after the first `keep` entries with `tail`, which
+    /// is at most one entry (a live reply). The first `keep` entries are
+    /// taken as unchanged, so only the tail is compared: a streamed reply
+    /// costs what it holds, not what the whole transcript holds.
+    pub fn set_tail(&mut self, keep: usize, tail: Option<Entry>, cx: &mut Context<Self>) {
+        let keep = keep.min(self.entries.len());
+        let same = match (&tail, self.entries.get(keep)) {
+            (None, None) => true,
+            (Some(new), Some(old)) => new == old && self.entries.len() == keep + 1,
+            _ => false,
+        };
+        if same {
+            return;
+        }
+        let follow = tail.as_ref().is_some_and(|e| e.live) && self.list.is_scrolled_to_end().unwrap_or(true);
+        let changed: HashSet<usize> = (keep..self.entries.len().max(keep + tail.is_some() as usize)).collect();
+        self.entries.truncate(keep);
+        self.entries.extend(tail);
+        self.sync_rows(&changed);
+        if follow {
+            self.list.scroll_to_end();
+        }
+        cx.notify();
+    }
+
+    fn apply_entries(&mut self, entries: Vec<Entry>, changed: HashSet<usize>, cx: &mut Context<Self>) {
+        // A live reply grows in place; keep its newest step in view
+        // unless the user has scrolled away from the end.
+        let follow = entries.last().is_some_and(|e| e.live) && self.list.is_scrolled_to_end().unwrap_or(true);
+        self.entries = entries;
+        self.sync_rows(&changed);
+        if follow {
+            self.list.scroll_to_end();
+        }
+        cx.notify();
     }
 
     /// Mirror the host's expansion state.
