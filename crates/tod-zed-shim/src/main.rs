@@ -340,8 +340,21 @@ fn main() {
             .and_then(|mut child| {
                 if let Some(mut out) = child.stdout.take() {
                     std::thread::spawn(move || {
-                        let _ = std::io::copy(&mut out, &mut std::io::stdout());
-                        let _ = std::io::stdout().flush();
+                        // `std::io::stdout()` is a `LineWriter`: it holds back
+                        // everything after the last newline until the next
+                        // one, which stalls a binary stream. Flush every chunk.
+                        let mut buf = [0u8; 16 * 1024];
+                        let mut stdout = std::io::stdout();
+                        loop {
+                            match std::io::Read::read(&mut out, &mut buf) {
+                                Ok(0) | Err(_) => break,
+                                Ok(n) => {
+                                    if stdout.write_all(&buf[..n]).and_then(|_| stdout.flush()).is_err() {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
                         close_stdout();
                     });
                 }
