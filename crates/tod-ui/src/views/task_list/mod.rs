@@ -2054,22 +2054,42 @@ impl TaskListView {
             self.show_error(format!("Failed to move item: {err}"), window, cx);
             return;
         }
-        self.live_refresh(window, cx);
-        // A move across parents can land in a collapsed one; open every
-        // collapsed ancestor so the moved node stays visible.
-        let mut collapsed_ancestors = Vec::new();
-        let mut current = self.all_tasks.iter().find(|t| t.id == task_id);
-        while let Some(parent_id) = current.and_then(|t| t.parent_id.as_deref()) {
-            current = self.all_tasks.iter().find(|t| t.id == parent_id);
-            match current {
-                Some(parent) if parent.collapsed => collapsed_ancestors.push(parent.id.clone()),
-                Some(_) => {}
-                None => break,
+        // A move across parents can land in a collapsed one, which hides the
+        // node from `all_tasks` entirely, so read the ancestors from the store
+        // and open every collapsed one before refreshing.
+        let _ = self.fleet.reload_if_stale();
+        let collapsed_ancestors = {
+            let projection = self.fleet.projection();
+            let guard = projection.lock().unwrap();
+            let conn = guard.connection();
+            let outline = tod_store::outline::repos::OutlineRepo::new(&conn);
+            let mut found = Vec::new();
+            let mut parent = outline
+                .get_entry(node_id)
+                .ok()
+                .flatten()
+                .and_then(|e| e.parent_id);
+            while let Some(id) = parent {
+                let Some(entry) = outline.get_entry(id).ok().flatten() else {
+                    break;
+                };
+                if entry.collapsed {
+                    found.push(id);
+                }
+                parent = entry.parent_id;
             }
+            found
+        };
+        for ancestor in collapsed_ancestors {
+            let _ = self.fleet.enqueue_outline(OutlineMutation::SetNodeCollapsed {
+                node_id: ancestor,
+                collapsed: false,
+            });
         }
-        for ancestor in &collapsed_ancestors {
-            self.set_collapsed(ancestor, false, window, cx);
+        if let Err(err) = self.fleet.writer().flush() {
+            self.show_error(format!("Failed to expand parent: {err}"), window, cx);
         }
+        self.live_refresh(window, cx);
         self.select_task_by_id(&task_id, window, cx);
     }
 
