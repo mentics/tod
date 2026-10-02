@@ -500,7 +500,7 @@ impl ConversationView {
 }
 
 /// A kind of conversation, as the picker badges it.
-pub(super) fn kind_label(kind: ProtocolKind) -> &'static str {
+pub(crate) fn kind_label(kind: ProtocolKind) -> &'static str {
     match kind {
         ProtocolKind::Outline => "outline",
         ProtocolKind::Implementation => "implementation",

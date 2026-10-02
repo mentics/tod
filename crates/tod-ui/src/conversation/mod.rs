@@ -19,6 +19,7 @@ mod change_set;
 mod context_panel;
 pub(crate) mod driver_slot;
 mod header;
+pub(crate) use header::kind_label;
 pub(crate) use header::format_time;
 mod designer;
 mod keyboard;
