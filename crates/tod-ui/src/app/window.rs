@@ -206,7 +206,7 @@ fn collect_running_work(
     sessions: &Entity<SessionsView>,
     conversation: &Entity<ConversationView>,
     cx: &App,
-) -> Vec<SharedString> {
+) -> crate::ui::toast::CloseGuardWork {
     let mut items = Vec::new();
     if let Ok(runs) = fleet.list_unended_runs() {
         for run in runs {
@@ -233,10 +233,12 @@ fn collect_running_work(
     for item in sessions.read(cx).running_interview_work() {
         items.push(SharedString::from(item));
     }
-    for item in conversation.read(cx).running_work(cx) {
-        items.push(SharedString::from(item));
+    let (affected, continuing) = conversation.read(cx).running_work_split(cx);
+    items.extend(affected.into_iter().map(SharedString::from));
+    crate::ui::toast::CloseGuardWork {
+        affected: items,
+        continuing: continuing.into_iter().map(SharedString::from).collect(),
     }
-    items
 }
 
 impl Shell {
