@@ -304,3 +304,31 @@ Where the code differs from the design above:
   `.review-current`, `.review-score`, beside `.mergeable`. The two review
   criteria pass when no bot is configured. A waiver is the existing per-node
   waiver; it is not cleared when the head changes.
+
+## Waiting on GitHub after the review: the merge, then the release
+
+`autopilot/github_wait.rs`. Once the gate lets a node into `approved`, a
+person merges the pull request, and some time after that a release carries
+it. Neither is agent work, so the run waits, the same way it waits for a
+person's review:
+
+- **`approved`** — until every linked pull request is merged. The run ends as
+  `Outcome::Waiting` with an `event` wait on `github:pr:<n>:merged`.
+- **`merged`** — before the phase agent runs, until a published release's
+  notes name each linked pull request. The wait is on
+  `github:release:published`. The next release is not assumed to include the
+  change (a cherry-pick or another release branch breaks that), so the notes
+  are searched (`release_watch::release_carrying`): the pull request's title
+  (case and spacing ignored), its link, or its `#number`, in a release
+  published after the merge. Drafts and pre-releases do not count. The phase
+  agent then runs with the release already out and records its evidence. A
+  node with no linked pull request waits for nothing: its phase agent drives
+  the release.
+
+The deadline of each wait is the next scheduled look (`review_schedule`), at
+which the scheduler wakes the node; a GitHub webhook for the merge, or for a
+published release (subscribe the webhook to *Releases*), satisfies the wait
+sooner. Waking runs the autopilot again, which reads GitHub afresh, so a late
+or duplicate wake is harmless. A pull request that cannot be read (no
+credentials, GitHub down) is not waited on: the run goes to the gate, which
+says why it fails.

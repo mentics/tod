@@ -2,6 +2,10 @@
 
 **Gate:** `merged` → `released`. The app checks it: the phase is certified, and every `merged` plan step is `verified` along with the obligations only those steps deliver. The certificate here is a check mark for this stay in `merged`; its note carries the release evidence.
 
+## Before you run
+
+When the node has a linked pull request, the app holds this state until a published GitHub release's notes name that pull request (by its title, link, or number); the release is not assumed to be the next one. You run once it has, so the release already exists: find its tag in the project's releases and record it as evidence. With no linked pull request nothing is awaited, and you drive the release yourself.
+
 ## Your work
 
 1. First, read the merge evidence.

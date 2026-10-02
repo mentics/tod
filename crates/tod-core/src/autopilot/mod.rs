@@ -23,6 +23,7 @@
 //! file under the data root (`autopilot/<node>.json`). A restart reopens the
 //! conversation that was in progress instead of starting another.
 
+mod github_wait;
 pub mod local;
 mod state;
 
@@ -377,6 +378,11 @@ impl Autopilot {
                     reason: NeedsHuman::Decision { pending },
                 });
             }
+            // `approved` waits for the merge and `merged` for the release.
+            if let Some(outcome) = self.hold_for_github(fleet, &lifecycle)? {
+                hook.waiting(None);
+                return self.finish(outcome);
+            }
             let standing = fleet.read(|conn| Standing::load(conn, self.node, &lifecycle))?;
             let Some(step) = next_step(&standing) else {
                 let reason = if standing.steps_need_user > 0 {
@@ -716,11 +722,6 @@ impl Autopilot {
         settings: &tod_store::PrReadinessSettings,
     ) -> Result<Outcome> {
         use crate::pr_readiness::Wait;
-        use tod_store::interview::InterviewCommand;
-        use tod_store::waits::{NewWait, WaitRepo};
-        const ACTOR: &str = "autopilot";
-        let due = crate::wait_cadence::next_check(chrono::Utc::now(), &settings.review_schedule);
-        let due_at_ms = due.timestamp_millis();
         let waiting_on = live
             .iter()
             .find(|p| p.assessment.waits().iter().any(|w| matches!(w, Wait::HumanReview)))
@@ -729,19 +730,7 @@ impl Autopilot {
             .as_ref()
             .map(|pr| format!("github:pr:{}:review", pr.pr_number))
             .unwrap_or_else(|| "github:pr:review".to_string());
-        // Replace the last look's wait.
-        let old = fleet.read(|conn| WaitRepo::new(conn).list_pending_for_node(self.node))?;
-        for wait in old.iter().filter(|w| w.match_spec.starts_with("github:pr:")) {
-            fleet
-                .interview(ACTOR, InterviewCommand::SetWaitState { wait_id: wait.id, state: "cancelled".into() })
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
-        }
-        fleet
-            .interview(
-                ACTOR,
-                InterviewCommand::RecordWait { node_id: self.node, wait: NewWait::event(spec, due_at_ms) },
-            )
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let due_at_ms = self.record_github_wait(fleet, spec, "github:pr:", settings)?;
         let what = match &waiting_on {
             Some(pr) => format!("a review of {}", pr.url),
             None => "a review".to_string(),

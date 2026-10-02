@@ -858,3 +858,140 @@ fn a_pull_request_that_never_changes_stops_for_a_person() {
         "{outcome:?}"
     );
 }
+
+/// GitHub after the review: whether the pull request is merged yet, and the
+/// notes of the one release (if any) published since.
+struct AfterReview {
+    merged: std::sync::atomic::AtomicBool,
+    notes: std::sync::Mutex<Option<String>>,
+}
+
+impl AfterReview {
+    fn new() -> Arc<Self> {
+        Arc::new(Self { merged: Default::default(), notes: Default::default() })
+    }
+}
+
+impl crate::pr_readiness::PrFeed for AfterReview {
+    fn snapshot(&self, _: &tod_store::github::NodePr) -> Result<tod_store::github::PrSnapshot, String> {
+        Err("not read after the review".to_string())
+    }
+
+    fn comment(&self, _: &tod_store::github::NodePr, _: &str) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn merge(&self, _: &tod_store::github::NodePr) -> Result<tod_store::github::PrMerge, String> {
+        let merged = self.merged.load(std::sync::atomic::Ordering::SeqCst);
+        Ok(tod_store::github::PrMerge {
+            title: "Add the widget".into(),
+            merged,
+            merged_at: merged.then(|| "2026-03-01T00:00:00Z".to_string()),
+        })
+    }
+
+    fn releases(&self, _: &tod_store::github::NodePr) -> Result<Vec<tod_store::github::Release>, String> {
+        Ok(self
+            .notes
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|body| tod_store::github::Release {
+                tag: "v1.0.0".into(),
+                name: None,
+                body: body.clone(),
+                url: "https://github.com/acme/app/releases/tag/v1.0.0".into(),
+                published_at: Some("2026-03-02T00:00:00Z".into()),
+            })
+            .collect())
+    }
+}
+
+/// A node with the pull request linked, at `lifecycle`.
+fn linked_to_pr(fx: &Fixture, lifecycle: &str) {
+    fx.fleet
+        .enqueue_outline(OutlineMutation::EnableCapabilities {
+            node_id: fx.node,
+            capabilities: vec![Capability::Ticket],
+        })
+        .unwrap();
+    fx.fleet.writer().flush().unwrap();
+    fx.fleet
+        .enqueue(tod_store::fleet::FleetMutation::UpdateTaskLinkedPrs {
+            id: fx.node.to_string(),
+            linked_prs: vec!["https://github.com/acme/app/pull/42".into()],
+        })
+        .unwrap();
+    fx.fleet.writer().flush().unwrap();
+    fx.fleet.reload_if_stale().ok();
+    lifecycle::set_lifecycle(&fx.fleet, fx.node, lifecycle).unwrap();
+}
+
+fn pending_specs(fx: &Fixture) -> Vec<String> {
+    fx.fleet
+        .read(|conn| tod_store::waits::WaitRepo::new(conn).list_pending_for_node(fx.node))
+        .unwrap()
+        .into_iter()
+        .map(|w| w.match_spec)
+        .collect()
+}
+
+#[test]
+fn an_approved_node_waits_for_the_merge_then_for_the_release() {
+    let fx = bare();
+    retire_outside_criteria(&fx);
+    let github = AfterReview::new();
+    crate::pr_readiness::set_feed_override(Some(github.clone()));
+    linked_to_pr(&fx, "approved");
+    let mut agent = FakeAgent::new(&fx.fleet);
+
+    // Not merged: the run ends with a timed wait a scheduler can wake.
+    let before = chrono::Utc::now().timestamp_millis();
+    let outcome = autopilot(&fx, Budget::default()).run(&fx.fleet, &mut agent).unwrap();
+    let Outcome::Waiting { due_at_ms, what } = outcome else {
+        panic!("expected Waiting, got {outcome:?}");
+    };
+    assert!(due_at_ms > before && what.contains("merged"), "{what}");
+    assert_eq!(pending_specs(&fx), ["github:pr:42:merged"]);
+    assert_eq!(lifecycle::current_state(&fx.fleet, fx.node).unwrap(), "approved");
+    assert_eq!(agent.turns, 0, "waiting uses no agent");
+
+    // A wake before the merge waits again, replacing the wait.
+    let outcome = autopilot(&fx, Budget::default()).run(&fx.fleet, &mut agent).unwrap();
+    assert!(matches!(outcome, Outcome::Waiting { .. }), "{outcome:?}");
+    assert_eq!(pending_specs(&fx), ["github:pr:42:merged"]);
+
+    // Merged: it goes on, and now waits for a release.
+    github.merged.store(true, std::sync::atomic::Ordering::SeqCst);
+    let outcome = autopilot(&fx, Budget::default()).run(&fx.fleet, &mut agent).unwrap();
+    let Outcome::Waiting { what, .. } = outcome else {
+        panic!("expected Waiting, got {outcome:?}");
+    };
+    assert!(what.contains("release"), "{what}");
+    assert_eq!(lifecycle::current_state(&fx.fleet, fx.node).unwrap(), "merged");
+    assert_eq!(pending_specs(&fx), ["github:release:published"]);
+    assert_eq!(agent.turns, 0, "the release is not driven while it is awaited");
+
+    // A release whose notes do not name the pull request is not its release.
+    *github.notes.lock().unwrap() = Some("* Something else by @bob in #7".into());
+    let outcome = autopilot(&fx, Budget::default()).run(&fx.fleet, &mut agent).unwrap();
+    assert!(matches!(outcome, Outcome::Waiting { .. }), "{outcome:?}");
+
+    // One that does lets the lifecycle go on as normal, and clears the wait.
+    *github.notes.lock().unwrap() = Some("* Add the widget by @ann in #42".into());
+    let outcome = autopilot(&fx, Budget::default()).run(&fx.fleet, &mut agent).unwrap();
+    assert_eq!(outcome, Outcome::Done, "{outcome:?}");
+    assert!(pending_specs(&fx).is_empty(), "{:?}", pending_specs(&fx));
+}
+
+#[test]
+fn an_unreadable_pull_request_is_left_to_the_gate() {
+    let fx = bare();
+    retire_outside_criteria(&fx);
+    // `NoGithub` reads nothing: there is nothing to wait on.
+    linked_to_pr(&fx, "approved");
+    let mut agent = FakeAgent::new(&fx.fleet);
+    let outcome = autopilot(&fx, Budget::default()).run(&fx.fleet, &mut agent).unwrap();
+    assert!(!matches!(outcome, Outcome::Waiting { .. }), "{outcome:?}");
+    assert!(pending_specs(&fx).is_empty());
+}

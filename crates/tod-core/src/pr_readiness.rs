@@ -994,12 +994,29 @@ pub trait PrFeed: Send + Sync {
     fn snapshot(&self, pr: &tod_store::github::NodePr) -> Result<PrSnapshot, String>;
     /// A top-level comment on the pull request.
     fn comment(&self, pr: &tod_store::github::NodePr, body: &str) -> Result<(), String>;
+    /// The pull request's title and merge: what `crate::release_watch` looks
+    /// for in a release's notes. Unsupported unless a feed says otherwise.
+    fn merge(&self, _pr: &tod_store::github::NodePr) -> Result<tod_store::github::PrMerge, String> {
+        Err("this feed does not read merges".to_string())
+    }
+    /// The published releases of the pull request's repository, newest first.
+    fn releases(&self, _pr: &tod_store::github::NodePr) -> Result<Vec<tod_store::github::Release>, String> {
+        Err("this feed does not read releases".to_string())
+    }
 }
 
 /// [`PrFeed`] over the GitHub API, with the credentials the app itself uses.
 pub struct GithubFeed(pub tod_store::github::Github);
 
 impl PrFeed for GithubFeed {
+    fn merge(&self, pr: &tod_store::github::NodePr) -> Result<tod_store::github::PrMerge, String> {
+        self.0.get_pr_merge(&pr.owner, &pr.repo, pr.pr_number).map_err(|err| err.to_string())
+    }
+
+    fn releases(&self, pr: &tod_store::github::NodePr) -> Result<Vec<tod_store::github::Release>, String> {
+        self.0.list_releases(&pr.owner, &pr.repo).map_err(|err| err.to_string())
+    }
+
     fn snapshot(&self, pr: &tod_store::github::NodePr) -> Result<PrSnapshot, String> {
         cached_snapshot(&self.0, pr).map_err(|err| err.to_string())
     }
