@@ -1011,6 +1011,11 @@ impl ConversationView {
         self.agent_runs.read(cx).running_work()
     }
 
+    /// [`Self::running_work`] as (stopped by closing, kept running by the daemon).
+    pub fn running_work_split(&self, cx: &App) -> (Vec<String>, Vec<String>) {
+        self.agent_runs.read(cx).running_work_split()
+    }
+
     /// The drivers with a turn in flight, taken to be ticked off the main
     /// thread; [`Self::poll`] puts them back.
     fn take_running(&mut self, cx: &mut Context<Self>) -> Vec<(u64, ConversationDriver)> {

@@ -1,3 +1,4 @@
+use gpui::prelude::FluentBuilder as _;
 use gpui::{
     App, InteractiveElement, IntoElement, ParentElement, SharedString, Styled, Window, div, px,
 };
@@ -213,16 +214,32 @@ pub fn confirm_toast(
     );
 }
 
+/// What is running when the user tries to exit, split by what exiting does.
+#[derive(Default)]
+pub struct CloseGuardWork {
+    /// Cancelled, blocked, or otherwise affected by closing the app.
+    pub affected: Vec<SharedString>,
+    /// Hosted by the resident daemon, so it carries on with the app closed.
+    pub continuing: Vec<SharedString>,
+}
+
+impl CloseGuardWork {
+    pub fn is_empty(&self) -> bool {
+        self.affected.is_empty() && self.continuing.is_empty()
+    }
+}
+
 /// Warns that background work (agent runs, gate checks, etc.) is still
 /// active before letting the window close. `on_force_exit` performs the
 /// actual close, bypassing whatever guard raised this toast.
 pub fn close_guard_toast(
     window: &mut Window,
     cx: &mut App,
-    running: Vec<SharedString>,
+    running: CloseGuardWork,
     on_force_exit: impl Fn(&mut Window, &mut App) + 'static,
 ) {
     let on_force_exit = Rc::new(on_force_exit);
+    let running = Rc::new(running);
 
     window.push_notification(
         Notification::new()
@@ -243,9 +260,13 @@ pub fn close_guard_toast(
                     .gap_1()
                     .flex()
                     .flex_col()
-                    // Dim reddish-gray so the warning reads clearly without
-                    // the alarm of a full red banner.
-                    .bg(gpui::rgb(0x3a2c2c))
+                    // Red when closing would interrupt something; yellow when
+                    // everything running carries on in the background.
+                    .bg(if running.affected.is_empty() {
+                        gpui::rgb(0x6b5a14)
+                    } else {
+                        gpui::rgb(0x5a1f1f)
+                    })
                     .rounded_lg()
                     .shadow_lg()
                     // Interacting with anything else means the user isn't
@@ -266,7 +287,7 @@ pub fn close_guard_toast(
                             .child(
                                 selectable_text(
                                     "close-guard-title",
-                                    "Background work is still running",
+                                    if running.affected.is_empty() { "Work will continue in the background" } else { "Exiting will interrupt running work" },
                                     window,
                                     cx,
                                 )
@@ -275,18 +296,66 @@ pub fn close_guard_toast(
                                 .text_color(gpui::white()),
                             ),
                     )
-                    .child(gpui::div().flex().flex_col().gap_0p5().children(
-                        running.iter().enumerate().map(|(i, item)| {
-                            selectable_text(
-                                SharedString::from(format!("close-guard-item-{i}")),
-                                item.clone(),
-                                window,
-                                cx,
+                    // What closing the app would cancel or affect, first and
+                    // highlighted: these are the ones that may be a problem.
+                    .when(!running.affected.is_empty(), |this| this.child(
+                        gpui::div()
+                            .flex()
+                            .flex_col()
+                            .gap_0p5()
+                            .px_2()
+                            .py_1p5()
+                            .rounded_md()
+                            .bg(gpui::rgb(0x6b2222))
+                            .border_1()
+                            .border_color(gpui::rgb(0xf0a0a0))
+                            .child(
+                                gpui::div()
+                                    .text_xs()
+                                    .font_semibold()
+                                    .text_color(gpui::rgb(0xffc4c4))
+                                    .child("Will be stopped or interrupted"),
                             )
-                            .text_xs()
-                            .text_color(gpui::hsla(0., 0., 0.85, 1.))
-                        }),
+                            .children(running.affected.iter().enumerate().map(|(i, item)| {
+                                selectable_text(
+                                    SharedString::from(format!("close-guard-item-{i}")),
+                                    item.clone(),
+                                    window,
+                                    cx,
+                                )
+                                .text_xs()
+                                .font_semibold()
+                                .text_color(gpui::white())
+                            })),
                     ))
+                    .when(!running.continuing.is_empty(), |this| {
+                        this.child(
+                            gpui::div()
+                                .flex()
+                                .flex_col()
+                                .gap_0p5()
+                                .mt_1()
+                                .child(
+                                    gpui::div()
+                                        .text_xs()
+                                        .font_semibold()
+                                        .text_color(gpui::rgb(0xa8d8a8))
+                                        .child("Will keep running in the background"),
+                                )
+                                .children(running.continuing.iter().enumerate().map(
+                                    |(i, item)| {
+                                        selectable_text(
+                                            SharedString::from(format!("close-guard-keep-{i}")),
+                                            item.clone(),
+                                            window,
+                                            cx,
+                                        )
+                                        .text_xs()
+                                        .text_color(gpui::hsla(0., 0., 0.75, 1.))
+                                    },
+                                )),
+                        )
+                    })
                     .child(
                         h_flex()
                             .gap_2()

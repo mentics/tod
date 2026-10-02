@@ -317,17 +317,29 @@ impl AgentRuns {
 
     /// Work in flight, for the close-window warning.
     pub fn running_work(&self) -> Vec<String> {
-        self.slots
-            .iter()
-            .filter(|d| d.status.running)
-            .map(|d| {
-                let id = d
-                    .conversation_id
-                    .map(tod_store::interview::short_id)
-                    .unwrap_or_default();
-                format!("Conversation agent running: {id}")
-            })
-            .collect()
+        let (mut affected, continuing) = self.running_work_split();
+        affected.extend(continuing);
+        affected
+    }
+
+    /// Work in flight, split for the close-window warning: what closing the
+    /// app would cut off, and what the resident daemon keeps running (a
+    /// conversation a node's runner drives there).
+    pub fn running_work_split(&self) -> (Vec<String>, Vec<String>) {
+        let daemon = self.fleet.is_client();
+        let (mut affected, mut continuing) = (Vec::new(), Vec::new());
+        for d in self.slots.iter().filter(|d| d.status.running) {
+            let id = d
+                .conversation_id
+                .map(tod_store::interview::short_id)
+                .unwrap_or_default();
+            if daemon && d.is_hosted_elsewhere() {
+                continuing.push(format!("Conversation agent running: {id}"));
+            } else {
+                affected.push(format!("Conversation agent running: {id}"));
+            }
+        }
+        (affected, continuing)
     }
 
     /// Every run on `node`: what the status label (`state` / `state →` /
