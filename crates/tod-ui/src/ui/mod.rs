@@ -28,4 +28,5 @@ pub mod terminal_handoff;
 pub mod toast;
 pub mod session_info;
 pub mod token_usage;
+pub mod row_scrollbar;
 pub mod transcript_list;
