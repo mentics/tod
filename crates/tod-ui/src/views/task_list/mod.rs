@@ -124,7 +124,7 @@ pub fn register_task_list_keyboard_bindings(cx: &mut App) {
         KeyBinding::new("n", TaskListCreateBelow, context),
         KeyBinding::new("/", TaskListFocusSearch, context),
         KeyBinding::new("s", TaskListSortToggle, context),
-        KeyBinding::new("cmd-shift-t", TaskListClearTagFilter, context),
+        KeyBinding::new("secondary-shift-t", TaskListClearTagFilter, context),
         KeyBinding::new("a", TaskListRowAgents, context),
         KeyBinding::new("l", TaskListRowLifecycle, context),
         KeyBinding::new("t", TaskListRowShells, context),
@@ -139,7 +139,7 @@ pub fn register_task_list_keyboard_bindings(cx: &mut App) {
         // would, beside the current column rather than replacing it
         // (`doc/ui/unified-view.md` "Keys"). The plain Tasks view has no
         // columns, so it treats this the same as `e`.
-        KeyBinding::new("ctrl-e", TaskListOpenEditPanelCtrl, context),
+        KeyBinding::new("secondary-e", TaskListOpenEditPanelCtrl, context),
         KeyBinding::new("f2", TaskListRowEdit, context),
         KeyBinding::new("1", TaskListTag1, context),
         KeyBinding::new("2", TaskListTag2, context),
@@ -174,17 +174,17 @@ pub fn register_task_list_keyboard_bindings(cx: &mut App) {
             Some(key_context::including_input(TASK_LIST_CONTEXT)),
         ),
         KeyBinding::new("alt-enter", TaskListCreateAbove, context),
-        KeyBinding::new("ctrl-shift-l", TaskListNewList, context),
+        KeyBinding::new("secondary-shift-l", TaskListNewList, context),
         KeyBinding::new("ctrl-tab", TaskListNextList, context),
         KeyBinding::new("ctrl-shift-tab", TaskListPrevList, context),
         KeyBinding::new("secondary-up", TaskListMoveUp, context),
         KeyBinding::new("secondary-down", TaskListMoveDown, context),
         KeyBinding::new("delete", TaskListDelete, context),
         KeyBinding::new("backspace", TaskListDelete, context),
-        KeyBinding::new("ctrl-c", TaskListCopy, context),
+        KeyBinding::new("secondary-c", TaskListCopy, context),
         KeyBinding::new("space", TaskListToggleMark, context),
         KeyBinding::new("i", TaskListCheckIncoming, context),
-        KeyBinding::new("ctrl-v", TaskListPaste, context),
+        KeyBinding::new("secondary-v", TaskListPaste, context),
         // Inline title edit: Escape cancels; arrows leave the field and move selection.
         KeyBinding::new(
             "up",

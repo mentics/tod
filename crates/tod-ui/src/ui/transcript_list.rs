@@ -23,6 +23,7 @@
 //! are measured when first shown and remeasured only when their entry or its
 //! expansion changes.
 
+use crate::ui::row_scrollbar::RowScrollbar;
 use crate::ui::selectable_text::{selectable_markdown, selectable_text};
 use crate::ui::style;
 use gpui::prelude::FluentBuilder;
@@ -965,7 +966,7 @@ impl Render for TranscriptList {
                     .right_0()
                     .bottom_0()
                     .w(px(16.))
-                    .child(Scrollbar::vertical(&self.list)),
+                    .child(Scrollbar::vertical(&RowScrollbar::new(&self.list))),
             )
     }
 }

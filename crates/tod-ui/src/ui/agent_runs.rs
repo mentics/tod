@@ -315,6 +315,29 @@ impl AgentRuns {
         self.slots.retain(keep);
     }
 
+    /// What a running slot is doing, in words the user can place: the kind of
+    /// conversation and the node (or project) it is about, never its id.
+    fn describe_slot(&self, slot: &DriverSlot) -> String {
+        let kind = crate::conversation::kind_label(slot.protocol);
+        let node = match slot.focus {
+            Focus::Project => None,
+            Focus::Node(node) | Focus::Obligation { node, .. } | Focus::PlanStep { node, .. } => Some(node),
+        };
+        let title = node.and_then(|node| {
+            self.fleet
+                .get_task(&node.to_string())
+                .ok()
+                .flatten()
+                .map(|t| t.title)
+                .filter(|t| !t.trim().is_empty())
+        });
+        match (title, node) {
+            (Some(title), _) => format!("Agent running ({kind}): {title}"),
+            (None, Some(_)) => format!("Agent running ({kind}): a node that is no longer in the outline"),
+            (None, None) => format!("Agent running ({kind}): the whole project"),
+        }
+    }
+
     /// Work in flight, for the close-window warning.
     pub fn running_work(&self) -> Vec<String> {
         let (mut affected, continuing) = self.running_work_split();
@@ -329,14 +352,11 @@ impl AgentRuns {
         let daemon = self.fleet.is_client();
         let (mut affected, mut continuing) = (Vec::new(), Vec::new());
         for d in self.slots.iter().filter(|d| d.status.running) {
-            let id = d
-                .conversation_id
-                .map(tod_store::interview::short_id)
-                .unwrap_or_default();
+            let what = self.describe_slot(d);
             if daemon && d.is_hosted_elsewhere() {
-                continuing.push(format!("Conversation agent running: {id}"));
+                continuing.push(what);
             } else {
-                affected.push(format!("Conversation agent running: {id}"));
+                affected.push(what);
             }
         }
         (affected, continuing)
