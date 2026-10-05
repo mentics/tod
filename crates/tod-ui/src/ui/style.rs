@@ -105,6 +105,9 @@ pub mod color {
     pub fn node_needs_you_text() -> Hsla {
         hex(0xf0805aff)
     }
+    pub fn node_chat_text() -> Hsla {
+        hex(0x60a5faff)
+    }
     pub fn linked_source_text() -> Hsla {
         hex(0xa06707ff)
     }
