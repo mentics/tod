@@ -323,17 +323,18 @@ impl AgentRuns {
             Focus::Project => None,
             Focus::Node(node) | Focus::Obligation { node, .. } | Focus::PlanStep { node, .. } => Some(node),
         };
-        let title = node.and_then(|node| {
-            self.fleet
-                .get_task(&node.to_string())
-                .ok()
-                .flatten()
-                .map(|t| t.title)
-                .filter(|t| !t.trim().is_empty())
-        });
-        match (title, node) {
+        // `get_node`, not `get_task`: the latter only finds nodes with the
+        // Agent capability, so a plain node would read as deleted.
+        let found = node.map(|node| self.fleet.get_node(&node.to_string()).ok().flatten());
+        let title = found
+            .clone()
+            .flatten()
+            .map(|t| t.title)
+            .filter(|t| !t.trim().is_empty());
+        match (title, found) {
             (Some(title), _) => format!("Agent running ({kind}): {title}"),
-            (None, Some(_)) => format!("Agent running ({kind}): a node that is no longer in the outline"),
+            (None, Some(Some(_))) => format!("Agent running ({kind}): an untitled node"),
+            (None, Some(None)) => format!("Agent running ({kind}): a node that is no longer in the outline"),
             (None, None) => format!("Agent running ({kind}): the whole project"),
         }
     }
