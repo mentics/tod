@@ -1367,9 +1367,9 @@ impl Requests {
             .flatten()
             .collect::<Vec<_>>();
             if !why.is_empty() {
-                card = card.child(style::text_muted(div().text_sm()).child(selectable_text(
+                card = card.child(style::text_muted(div().text_sm()).child(selectable_markdown(
                     SharedString::from(format!("unified-decisions-plan-step-why-{}", item.id)),
-                    why.join("\n"),
+                    why.join("\n\n"),
                     window,
                     cx,
                 )));
@@ -1476,7 +1476,7 @@ impl Requests {
             .p_2()
             .border_b_1()
             .border_color(border)
-            .child(div().text_sm().child(selectable_text(
+            .child(div().text_sm().child(selectable_markdown(
                 ("unified-decisions-log-question", entry.answer.id as u64),
                 decision.question.clone(),
                 window,

@@ -117,6 +117,41 @@ pub fn selectable_text_with_menu(
     with_copy_menu(id, view, own_menu)
 }
 
+/// Agents write plain prose with single newlines, which Markdown folds into
+/// one run-on paragraph. Make each such newline a hard break (two trailing
+/// spaces) so the layout the agent wrote survives. Fenced code and lines that
+/// already break are left alone.
+fn keep_line_breaks(markdown: &str) -> String {
+    let lines: Vec<&str> = markdown.split('\n').collect();
+    let is_fence = |l: &str| {
+        let t = l.trim_start();
+        t.starts_with("```") || t.starts_with("~~~")
+    };
+    let mut out = String::with_capacity(markdown.len() + 16);
+    let mut in_fence = false;
+    for (i, line) in lines.iter().enumerate() {
+        let line = line.trim_end_matches('\r');
+        out.push_str(line);
+        if i + 1 < lines.len() {
+            let fence_line = is_fence(line);
+            let next = lines[i + 1].trim_end_matches('\r');
+            if fence_line {
+                in_fence = !in_fence;
+            } else if !in_fence
+                && !line.trim().is_empty()
+                && !next.trim().is_empty()
+                && !is_fence(next)
+                && !line.ends_with("  ")
+                && !line.ends_with('\\')
+            {
+                out.push_str("  ");
+            }
+            out.push('\n');
+        }
+    }
+    out
+}
+
 /// Markdown text the user can drag-select and copy (Ctrl/Cmd+C or right-click).
 pub fn selectable_markdown(
     id: impl Into<ElementId>,
@@ -125,7 +160,7 @@ pub fn selectable_markdown(
     cx: &mut App,
 ) -> SelectableText {
     let id = id.into();
-    let view = TextView::markdown(id.clone(), linkify_markdown(&markdown.into()))
+    let view = TextView::markdown(id.clone(), linkify_markdown(&keep_line_breaks(&markdown.into())))
         .on_link_click(on_link_click)
         .style(
             TextViewStyle::default()
