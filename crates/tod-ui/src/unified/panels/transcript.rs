@@ -258,6 +258,7 @@ impl TranscriptPanel {
         }
     }
 
+    #[cfg(test)]
     pub fn conversation_id(&self) -> Uuid {
         self.conversation_id
     }
@@ -366,9 +367,6 @@ impl ColumnPanel for TranscriptPanel {
         "Transcript".into()
     }
 
-    fn target_label(&self, _cx: &App) -> SharedString {
-        self.title.clone()
-    }
 }
 
 impl Focusable for TranscriptPanel {

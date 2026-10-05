@@ -12,8 +12,6 @@ pub trait ColumnPanel {
     /// The column header's title for this panel.
     fn title(&self, cx: &App) -> SharedString;
 
-    /// What this panel is showing, for the column header's subtitle.
-    fn target_label(&self, cx: &App) -> SharedString;
 }
 
 /// Emitted when the user activates a link inside a panel — a click, ctrl

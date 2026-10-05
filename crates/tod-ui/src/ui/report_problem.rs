@@ -34,13 +34,6 @@ pub struct OpenReportDialog {
 }
 
 impl OpenReportDialog {
-    pub fn project() -> Self {
-        Self {
-            key: JourneyKey::Project,
-            conversation: None,
-        }
-    }
-
     pub fn node(id: Uuid) -> Self {
         Self {
             key: JourneyKey::Node(id),

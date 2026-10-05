@@ -110,7 +110,7 @@ fn exec(name: &str, script: &str) -> String {
     }
 }
 
-fn run_checks(root: &std::path::Path, store: &FleetStore, nid: &str, name: &str, host: Host) -> anyhow::Result<()> {
+fn run_checks(root: &std::path::Path, store: &FleetStore, nid: &str, name: &str, _host: Host) -> anyhow::Result<()> {
     let sb = Sandboxes::load(root)?;
     let bx = sb.blaxel()?;
     let custom = |v: &str| {

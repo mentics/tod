@@ -133,15 +133,9 @@ impl FindingsPanel {
         this
     }
 
+    #[cfg(test)]
     pub fn node_id(&self) -> Uuid {
         self.node_id
-    }
-
-    /// Point this column at a different node, in place.
-    pub fn retarget(&mut self, node_id: Uuid, cx: &mut Context<Self>) {
-        self.node_id = node_id;
-        self.status_menu = None;
-        self.reload(cx);
     }
 
     fn reload(&mut self, cx: &mut Context<Self>) {
@@ -340,9 +334,6 @@ impl ColumnPanel for FindingsPanel {
         "Findings".into()
     }
 
-    fn target_label(&self, _cx: &App) -> SharedString {
-        node_title(&self.fleet, self.node_id).into()
-    }
 }
 
 impl EventEmitter<PanelOpenRequest> for FindingsPanel {}

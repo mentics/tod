@@ -1,7 +1,6 @@
 use crate::ui::screenshot::write_png_fast;
 use image::DynamicImage;
 #[cfg(windows)]
-use image::RgbaImage;
 use std::path::Path;
 
 #[cfg(windows)]

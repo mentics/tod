@@ -826,6 +826,7 @@ impl TaskListView {
             RowAction::OpenContextMenu { task_id, position } => {
                 self.open_context_menu(&task_id, Some(position), window, cx);
             }
+            #[cfg(test)]
             RowAction::OpenTaskPanel { task_id } => {
                 self.select_task_by_id(&task_id, window, cx);
                 cx.emit(TaskListEvent::OpenTaskPanel {
