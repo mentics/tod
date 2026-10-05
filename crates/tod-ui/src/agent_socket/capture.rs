@@ -1,10 +1,9 @@
-use crate::ui::screenshot::write_png_fast;
-use image::DynamicImage;
-#[cfg(windows)]
 use std::path::Path;
 
 #[cfg(windows)]
-use crate::ui::screenshot::{capture_client_rgba, main_hwnd};
+use crate::ui::screenshot::{capture_client_rgba, main_hwnd, write_png_fast};
+#[cfg(windows)]
+use image::DynamicImage;
 
 /// Capture the app window, scale to logical `width`×`height`, optional crop, write PNG.
 ///
@@ -73,6 +72,7 @@ fn capture_windows(
     write_png_fast(path, &out)
 }
 
+#[cfg(windows)]
 fn clamp_crop(
     x0: f32,
     y0: f32,
