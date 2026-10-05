@@ -635,15 +635,6 @@ impl ListDelegate for TaskListDelegate {
         } else {
             let title_color = if item.title.is_empty() {
                 muted_foreground
-            } else if item.needs_you_count > 0 {
-                // `styles.node-title-needs-you`
-                crate::ui::style::color::node_needs_you_text()
-            } else if item.finished_run.is_some() {
-                // `styles.node-title-finished`
-                crate::ui::style::color::node_finished_text()
-            } else if item.lifecycle_running || item.chat_running {
-                // `styles.node-title-running`
-                crate::ui::style::color::node_running_text()
             } else if item.awaiting {
                 // A wait nobody owes anything to: out of the way.
                 muted_foreground
@@ -660,11 +651,6 @@ impl ListDelegate for TaskListDelegate {
                     display_title.clone(),
                     selected,
                     managed,
-                    item.incoming_count > 0
-                        && item.needs_you_count == 0
-                        && !item.lifecycle_running
-                        && !item.chat_running
-                        && item.finished_run.is_none(),
                     item.id.clone(),
                     sink.clone(),
                 ),
@@ -778,6 +764,7 @@ impl ListDelegate for TaskListDelegate {
                 item.lifecycle_running,
                 item.chat_running,
                 item.finished_run,
+                item.incoming_count > 0,
             ))
             .child(title_line)
             .when_some(menu_at, |el, (at, menu)| el.child(popup_at(at, menu)));
@@ -820,6 +807,7 @@ fn status_icon_cell(
     lifecycle_running: bool,
     chat_running: bool,
     finished: Option<RunSource>,
+    pending_changes: bool,
 ) -> gpui::Div {
     use gpui_kit_assets::IconName;
     let cell = div()
@@ -839,7 +827,7 @@ fn status_icon_cell(
         );
     }
     if let Some(source) = finished {
-        // `styles.node-title-finished`: the icon keeps its shape, ringed.
+        // `styles.node-status-finished`: the icon keeps its shape, ringed.
         let color = crate::ui::style::color::node_finished_text();
         return cell.child(
             div()
@@ -857,6 +845,14 @@ fn status_icon_cell(
         RunSource::Lifecycle
     } else if chat_running {
         RunSource::Chat
+    } else if pending_changes {
+        // `styles.node-status-pending-changes`: incoming changes not yet
+        // checked against; rare, so it stands out from the other rows.
+        return cell.child(
+            gpui_component::Icon::new(IconName::CircleDot)
+                .xsmall()
+                .text_color(crate::ui::style::color::incoming_text()),
+        );
     } else {
         return cell;
     };
@@ -874,7 +870,6 @@ fn title_label(
     title: String,
     selected: bool,
     managed: bool,
-    pending_changes: bool,
     task_id: String,
     sink: Rc<RefCell<Vec<RowAction>>>,
 ) -> impl gpui::IntoElement {
@@ -883,17 +878,15 @@ fn title_label(
         .flex_1()
         .min_w_0()
         .when(selected, |el| el.cursor_pointer())
-        .child(if pending_changes {
-            crate::ui::style::node_title_pending_changes(div()).child(title)
-        } else {
+        .child(
             div()
                 .text_sm()
                 .font_medium()
                 .text_color(foreground)
                 .overflow_hidden()
                 .text_ellipsis()
-                .child(title)
-        })
+                .child(title),
+        )
         .when(selected, |el| {
             el.on_mouse_down(MouseButton::Left, {
                 let task_id = task_id.clone();

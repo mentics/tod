@@ -454,12 +454,6 @@ pub fn callout_warning_title<E: Styled>(el: E) -> E {
         .text_color(color::callout_warning_text())
 }
 
-/// `styles.node-title-pending-changes`: a tree row title whose node has
-/// incoming changes it has not been checked against.
-pub fn node_title_pending_changes<E: Styled>(el: E) -> E {
-    text_title(el).text_color(color::incoming_text())
-}
-
 /// `styles.scrim`.
 pub fn scrim<E: Styled>(el: E) -> E {
     el.bg(color::scrim())

@@ -386,15 +386,28 @@ styles:
     text-end: no-period
   # RULE: a row's title text color is the user's to set, for their own
   # purposes (planned: a per-row color the user picks). The app must not use
-  # title color to signal anything else; state is shown with icons, chips, and
-  # the ticket id (node-ticket-*). The node-title-* entries below that color
-  # the title (pending-changes, running, finished, needs-you) predate this
-  # rule and are to move off the title text.
-  node-title-pending-changes:
-    # A tree row whose node has incoming changes it has not been checked
-    # against: rare, so it must stand out from every other row.
-    extends: text-title
+  # title color to signal anything else; state is shown with the status icon
+  # (node-status-*) and the ticket id (node-ticket-*).
+  node-status-pending-changes:
+    # The status icon (circle dot) of a tree row whose node has incoming
+    # changes it has not been checked against: rare, so it must stand out
+    # from every other row. Shown only when no other status icon is.
     color: incoming-text
+  node-status-running:
+    # The status icon of a tree row whose node the lifecycle processor is
+    # running (play icon) or only the chat panel is (square icon; the
+    # processor wins when both). Both go when the run stops.
+    color: node-running-text
+  node-status-finished:
+    # The status icon of a tree row whose run stopped since the user last
+    # selected it: orange, the icon (play or square) ringed in a circle.
+    # Temporary: selecting the row, or Alt+Q landing on it, clears it. Wins
+    # over running.
+    color: node-finished-text
+  node-status-needs-you:
+    # The alert icon of a tree row waiting on the user (replaces the "Needs
+    # you" chip). Wins over running.
+    color: node-needs-you-text
   node-ticket-linked-copy:
     # The ticket id of a tree row copied out of a generator that still
     # receives its source item's updates (the title keeps its own color).
