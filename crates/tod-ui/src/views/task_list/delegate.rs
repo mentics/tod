@@ -799,13 +799,15 @@ impl ListDelegate for TaskListDelegate {
     }
 }
 
-/// The fixed-width cell at the left of a row: an alert icon when the node
-/// waits on the user; else, for something that stopped since the row was last
-/// selected, its icon in a circle; else a play icon while its lifecycle
-/// processor runs, or a square while only the chat panel does. The shape
-/// says which: play for the lifecycle processor, square for the chat panel.
-/// Static on purpose (a tree of animated rows would distract), and always
-/// reserved so rows do not shift when a run starts or stops.
+/// The fixed-width cell at the left of a row. Three live states nest in one
+/// 16px glyph so any combination shows at once without taking more room: a
+/// circle while the lifecycle processor runs, a triangle while the node waits
+/// on the user, a square while a chat session is active (the triangle's
+/// corners stay visible around the square). With none of those, an
+/// icon ringed in a circle for something that stopped since the row was last
+/// selected, else the incoming-changes dot. Static on purpose (a tree of
+/// animated rows would distract), and always reserved so rows do not shift
+/// when a run starts or stops.
 fn status_icon_cell(
     needs_you: bool,
     lifecycle_running: bool,
@@ -819,20 +821,16 @@ fn status_icon_cell(
         .flex_shrink_0()
         .flex()
         .items_center();
-    let source_icon = |source| match source {
-        RunSource::Lifecycle => IconName::Play,
-        RunSource::Chat => IconName::Square,
-    };
-    if needs_you {
-        return cell.child(
-            gpui_component::Icon::new(IconName::TriangleAlert)
-                .xsmall()
-                .text_color(crate::ui::style::color::node_needs_you_text()),
-        );
+    if needs_you || lifecycle_running || chat_running {
+        return cell.child(nested_status_glyph(needs_you, lifecycle_running, chat_running));
     }
     if let Some(source) = finished {
         // `styles.node-status-finished`: the icon keeps its shape, ringed.
         let color = crate::ui::style::color::node_finished_text();
+        let icon = match source {
+            RunSource::Lifecycle => IconName::Play,
+            RunSource::Chat => IconName::Square,
+        };
         return cell.child(
             div()
                 .size(px(14.0))
@@ -842,14 +840,10 @@ fn status_icon_cell(
                 .rounded_full()
                 .border_1()
                 .border_color(color)
-                .child(gpui_component::Icon::new(source_icon(source)).size(px(8.0)).text_color(color)),
+                .child(gpui_component::Icon::new(icon).size(px(8.0)).text_color(color)),
         );
     }
-    let source = if lifecycle_running {
-        RunSource::Lifecycle
-    } else if chat_running {
-        RunSource::Chat
-    } else if pending_changes {
+    if pending_changes {
         // `styles.node-status-pending-changes`: incoming changes not yet
         // checked against; rare, so it stands out from the other rows.
         return cell.child(
@@ -857,14 +851,65 @@ fn status_icon_cell(
                 .xsmall()
                 .text_color(crate::ui::style::color::incoming_text()),
         );
+    }
+    cell
+}
+
+/// `styles.node-status-nested`: circle (lifecycle running) outside, filled
+/// triangle (needs the user) inside it, square (chat active) at the centre.
+/// Each layer is drawn only when its state holds, in the same place.
+fn nested_status_glyph(needs_you: bool, lifecycle_running: bool, chat_running: bool) -> gpui::Div {
+    use gpui::{canvas, point, PathBuilder};
+    let glyph = div().relative().size(px(16.0)).flex_shrink_0();
+    let glyph = if lifecycle_running {
+        glyph.child(
+            div()
+                .absolute()
+                .top(px(1.0))
+                .left(px(1.0))
+                .size(px(14.0))
+                .rounded_full()
+                .border(px(1.5))
+                .border_color(crate::ui::style::color::node_running_text()),
+        )
     } else {
-        return cell;
+        glyph
     };
-    cell.child(
-        gpui_component::Icon::new(source_icon(source))
-            .xsmall()
-            .text_color(crate::ui::style::color::node_running_text()),
-    )
+    let glyph = if needs_you {
+        glyph.child(
+            canvas(
+                |_, _, _| {},
+                |bounds, _, window, _| {
+                    let at = |x: f32, y: f32| point(bounds.origin.x + px(x), bounds.origin.y + px(y));
+                    let mut path = PathBuilder::fill();
+                    path.move_to(at(8.0, 2.6));
+                    path.line_to(at(13.6, 12.4));
+                    path.line_to(at(2.4, 12.4));
+                    path.close();
+                    if let Ok(path) = path.build() {
+                        window.paint_path(path, crate::ui::style::color::node_needs_you_text());
+                    }
+                },
+            )
+            .absolute()
+            .size_full(),
+        )
+    } else {
+        glyph
+    };
+    if chat_running {
+        glyph.child(
+            div()
+                .absolute()
+                .top(px(5.0))
+                .left(px(5.0))
+                .size(px(6.0))
+                .rounded(px(1.0))
+                .bg(crate::ui::style::color::node_chat_text()),
+        )
+    } else {
+        glyph
+    }
 }
 
 fn title_label(

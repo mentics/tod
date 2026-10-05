@@ -388,6 +388,16 @@ styles:
   # purposes (planned: a per-row color the user picks). The app must not use
   # title color to signal anything else; state is shown with the status icon
   # (node-status-*) and the ticket id (node-ticket-*).
+  node-status-nested:
+    # The status glyph of a tree row, one 16px slot for three live states
+    # that can hold at once, nested: a circle (node-running-text) while the
+    # lifecycle processor runs, a filled triangle (node-needs-you-text) while
+    # the node waits on the user, a square (node-chat-text) while a chat
+    # session is active. Each is drawn only when its state holds, in the same
+    # place, so every combination is one glyph and rows never shift. The
+    # square keeps its size with the triangle shown; the triangle's corners
+    # stay visible. Wins over finished and pending-changes.
+    color: node-running-text
   node-status-pending-changes:
     # The status icon (circle dot) of a tree row whose node has incoming
     # changes it has not been checked against: rare, so it must stand out
@@ -541,6 +551,7 @@ tokens:
     # Amber's neighbors: a soft olive-green for a node the lifecycle
     # processor is running, a soft coral for one waiting on the user.
     node-running-text: "#a8c060"
+    node-chat-text: "#60a5fa"
     node-finished-text: "#fb923c"
     node-needs-you-text: "#f0805a"
     notice-fill: "#ffff00"
