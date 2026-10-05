@@ -577,6 +577,13 @@ impl ListDelegate for TaskListDelegate {
             .pl(depth_indent)
             .child(chevron_cell)
             .when_some(item.ticket_id.clone(), |row, ticket| {
+                // The generator link colors the ticket id, not the title.
+                let ticket_color = if item.linked_copy {
+                    // `styles.node-ticket-linked-copy`
+                    crate::ui::style::color::linked_copy_text()
+                } else {
+                    link_color
+                };
                 let sink = sink.clone();
                 let task_id_ticket = item.id.clone();
                 row.child(
@@ -584,7 +591,7 @@ impl ListDelegate for TaskListDelegate {
                         .id(SharedString::from(format!("row-ticket-{}", item.id)))
                         .text_xs()
                         .font_semibold()
-                        .text_color(link_color)
+                        .text_color(ticket_color)
                         .underline()
                         .cursor_pointer()
                         .flex_shrink_0()
@@ -603,11 +610,18 @@ impl ListDelegate for TaskListDelegate {
             })
             .when(item.ticket_id.is_none(), |row| {
                 row.when_some(item.external_id.clone(), |row, external_id| {
+                    // A managed row with a linked copy colors its ticket id.
+                    let external_color = if item.has_copies {
+                        // `styles.node-ticket-has-copies`
+                        crate::ui::style::color::linked_source_text()
+                    } else {
+                        muted_foreground
+                    };
                     row.child(
                         div()
                             .text_xs()
                             .font_semibold()
-                            .text_color(muted_foreground)
+                            .text_color(external_color)
                             .flex_shrink_0()
                             .child(format!("{external_id}: ")),
                     )
@@ -633,14 +647,8 @@ impl ListDelegate for TaskListDelegate {
             } else if item.awaiting {
                 // A wait nobody owes anything to: out of the way.
                 muted_foreground
-            } else if item.has_copies {
-                // `styles.node-title-has-copies`
-                crate::ui::style::color::linked_source_text()
             } else if managed {
                 muted_foreground
-            } else if item.linked_copy {
-                // `styles.node-title-linked-copy`
-                crate::ui::style::color::linked_copy_text()
             } else {
                 foreground
             };

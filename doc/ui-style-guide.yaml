@@ -384,14 +384,20 @@ styles:
     font: title
     text-case: sentence
     text-end: no-period
+  # RULE: a row's title text color is the user's to set, for their own
+  # purposes (planned: a per-row color the user picks). The app must not use
+  # title color to signal anything else; state is shown with icons, chips, and
+  # the ticket id (node-ticket-*). The node-title-* entries below that color
+  # the title (pending-changes, running, finished, needs-you) predate this
+  # rule and are to move off the title text.
   node-title-pending-changes:
     # A tree row whose node has incoming changes it has not been checked
     # against: rare, so it must stand out from every other row.
     extends: text-title
     color: incoming-text
-  node-title-linked-copy:
-    # A tree row copied out of a generator that still receives its source
-    # item's updates.
+  node-ticket-linked-copy:
+    # The ticket id of a tree row copied out of a generator that still
+    # receives its source item's updates (the title keeps its own color).
     color: linked-copy-text
   node-title-running:
     # A tree row whose node the lifecycle processor is running (play icon) or
@@ -407,9 +413,9 @@ styles:
     # A tree row waiting on the user (replaces the "Needs you" chip). Also
     # carries an alert icon. Wins over running.
     color: node-needs-you-text
-  node-title-has-copies:
-    # A generator-managed row with a linked copy elsewhere: the copy's
-    # amber, faded as far as text-muted is from text.
+  node-ticket-has-copies:
+    # The ticket id of a generator-managed row with a linked copy elsewhere:
+    # the copy's amber, faded as far as text-muted is from text.
     color: linked-source-text
   scrim:
     background: scrim
