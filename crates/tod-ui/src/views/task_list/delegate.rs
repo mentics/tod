@@ -90,6 +90,7 @@ pub enum RowAction {
         position: gpui::Point<gpui::Pixels>,
     },
     /// The row's attention badge (needs-you count).
+    #[cfg(test)]
     OpenTaskPanel {
         task_id: String,
     },

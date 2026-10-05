@@ -19,19 +19,21 @@ struct Search {
 }
 
 unsafe extern "system" fn visit(hwnd: HWND, lparam: LPARAM) -> BOOL {
-    let search = &mut *(lparam.0 as *mut Search);
-    let n = GetWindowTextLengthW(hwnd);
-    if n > 0 {
-        let mut buf = vec![0u16; n as usize + 1];
-        let got = GetWindowTextW(hwnd, &mut buf);
-        let title = String::from_utf16_lossy(&buf[..got.max(0) as usize]);
-        if title.starts_with(&search.prefix) {
-            let handle = WindowHandle { id: hwnd.0 as usize as u64, title };
-            if IsWindowVisible(hwnd).as_bool() {
-                search.found = Some(handle);
-                return BOOL(0);
+    unsafe {
+        let search = &mut *(lparam.0 as *mut Search);
+        let n = GetWindowTextLengthW(hwnd);
+        if n > 0 {
+            let mut buf = vec![0u16; n as usize + 1];
+            let got = GetWindowTextW(hwnd, &mut buf);
+            let title = String::from_utf16_lossy(&buf[..got.max(0) as usize]);
+            if title.starts_with(&search.prefix) {
+                let handle = WindowHandle { id: hwnd.0 as usize as u64, title };
+                if IsWindowVisible(hwnd).as_bool() {
+                    search.found = Some(handle);
+                    return BOOL(0);
+                }
+                search.hidden.get_or_insert(handle);
             }
-            search.hidden.get_or_insert(handle);
         }
     }
     BOOL(1)
