@@ -348,6 +348,10 @@ pub struct Requests {
     /// newer one.
     generation: u64,
     freeform_editing: Option<Uuid>,
+    /// The decision whose unsent text `freeform_input` holds.
+    freeform_draft_for: Option<Uuid>,
+    /// Unsent text of every other decision, kept in memory until it is dealt with.
+    freeform_drafts: HashMap<Uuid, String>,
     freeform_input: Entity<InputState>,
     /// A log entry's decision the user asked to change.
     pub(crate) changing: Option<Uuid>,
@@ -415,6 +419,8 @@ impl Requests {
             loaded: Loaded::default(),
             generation: 0,
             freeform_editing: None,
+            freeform_draft_for: None,
+            freeform_drafts: HashMap::new(),
             freeform_input,
             changing: None,
             selected_link: 0,
@@ -545,6 +551,10 @@ impl Requests {
         // The answer is recorded off the UI thread; what was being edited
         // closes now, and the list reloads when it is in.
         self.freeform_editing = None;
+        self.freeform_drafts.remove(&decision.id);
+        if self.freeform_draft_for == Some(decision.id) {
+            self.freeform_draft_for = None;
+        }
         self.changing = None;
         let this = cx.weak_entity();
         self.agent_runs.update(cx, |runs, cx| {
@@ -942,7 +952,21 @@ impl Requests {
 
     fn begin_freeform_edit(&mut self, decision_id: Uuid, window: &mut Window, cx: &mut Context<Self>) {
         self.freeform_editing = Some(decision_id);
-        self.freeform_input.update(cx, |input, cx| input.set_value(String::new(), window, cx));
+        // The one input is shared by every decision: stash what it holds for
+        // its owner, and load what was typed for this one.
+        if self.freeform_draft_for != Some(decision_id) {
+            if let Some(owner) = self.freeform_draft_for {
+                let text = self.freeform_input.read(cx).text().to_string();
+                if text.is_empty() {
+                    self.freeform_drafts.remove(&owner);
+                } else {
+                    self.freeform_drafts.insert(owner, text);
+                }
+            }
+            self.freeform_draft_for = Some(decision_id);
+            let text = self.freeform_drafts.remove(&decision_id).unwrap_or_default();
+            self.freeform_input.update(cx, |input, cx| input.set_value(text, window, cx));
+        }
         cx.notify();
         let input = self.freeform_input.clone();
         cx.on_next_frame(window, move |_, window, cx| {
@@ -1298,11 +1322,20 @@ impl Requests {
             .child(if editing {
                 Input::new(&self.freeform_input).small().into_any_element()
             } else {
-                div()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(if only { "Enter to type your answer…" } else { "Enter to answer freely…" })
-                    .into_any_element()
+                let draft = if self.freeform_draft_for == Some(decision_id) {
+                    Some(self.freeform_input.read(cx).text().to_string())
+                } else {
+                    self.freeform_drafts.get(&decision_id).cloned()
+                }
+                .filter(|text| !text.trim().is_empty());
+                match draft {
+                    Some(draft) => div().text_xs().child(draft).into_any_element(),
+                    None => div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(if only { "Enter to type your answer…" } else { "Enter to answer freely…" })
+                        .into_any_element(),
+                }
             })
     }
 
