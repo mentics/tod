@@ -1008,6 +1008,7 @@ impl ConversationView {
     }
 
     /// Work in flight, for the close-window warning.
+    #[cfg(test)]
     pub fn running_work(&self, cx: &App) -> Vec<String> {
         self.agent_runs.read(cx).running_work()
     }

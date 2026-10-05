@@ -378,9 +378,6 @@ impl ColumnPanel for DetailsPanel {
         "Details".into()
     }
 
-    fn target_label(&self, _cx: &App) -> SharedString {
-        self.loaded.title.clone().into()
-    }
 }
 
 impl EventEmitter<PanelOpenRequest> for DetailsPanel {}

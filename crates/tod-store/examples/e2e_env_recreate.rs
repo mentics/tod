@@ -33,7 +33,7 @@ fn main() -> anyhow::Result<()> {
     let mut sb = Sandboxes::load(&root)?;
     let bx = sb.blaxel()?;
     sb.create_with_proxy(&name, &NewSandboxSource::Image(String::new()), false, false, &nc(&cred("DUMMY-proxy-secret-e2e-424242")), &mut |s| eprintln!("progress: {s}"))?;
-    let url = sb.url(&bx, &name)?;
+    sb.url(&bx, &name)?;
     let sid = "11111111-2222-4333-8444-555555555555";
     // Where Claude writes its log: ${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects/<cwd, non-alphanumerics as dashes>/<id>.jsonl
     let exec = tod_store::fleet::sandbox::SandboxExec::new(&name);

@@ -1069,9 +1069,6 @@ impl ColumnPanel for TaskPanel {
         "Task".into()
     }
 
-    fn target_label(&self, _cx: &App) -> SharedString {
-        self.header.title.clone().into()
-    }
 }
 
 impl EventEmitter<PanelOpenRequest> for TaskPanel {}

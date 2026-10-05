@@ -23,7 +23,7 @@ use crate::visual_design::launcher::{Dock, Launcher, LauncherEvent};
 use crate::visual_design::placement::Rect;
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    AnyElement, App, Context, ElementId, InteractiveElement, IntoElement, ParentElement, Pixels,
+    AnyElement, App, Context, ElementId, IntoElement, ParentElement, Pixels,
     Styled, Window, div,
 };
 use gpui_component::button::{Button, ButtonVariants};

@@ -323,22 +323,24 @@ impl AgentRuns {
             Focus::Project => None,
             Focus::Node(node) | Focus::Obligation { node, .. } | Focus::PlanStep { node, .. } => Some(node),
         };
-        let title = node.and_then(|node| {
-            self.fleet
-                .get_task(&node.to_string())
-                .ok()
-                .flatten()
-                .map(|t| t.title)
-                .filter(|t| !t.trim().is_empty())
-        });
-        match (title, node) {
+        // `get_node`, not `get_task`: the latter only finds nodes with the
+        // Agent capability, so a plain node would read as deleted.
+        let found = node.map(|node| self.fleet.get_node(&node.to_string()).ok().flatten());
+        let title = found
+            .clone()
+            .flatten()
+            .map(|t| t.title)
+            .filter(|t| !t.trim().is_empty());
+        match (title, found) {
             (Some(title), _) => format!("Agent running ({kind}): {title}"),
-            (None, Some(_)) => format!("Agent running ({kind}): a node that is no longer in the outline"),
+            (None, Some(Some(_))) => format!("Agent running ({kind}): an untitled node"),
+            (None, Some(None)) => format!("Agent running ({kind}): a node that is no longer in the outline"),
             (None, None) => format!("Agent running ({kind}): the whole project"),
         }
     }
 
     /// Work in flight, for the close-window warning.
+    #[cfg(test)]
     pub fn running_work(&self) -> Vec<String> {
         let (mut affected, continuing) = self.running_work_split();
         affected.extend(continuing);
@@ -401,12 +403,6 @@ impl AgentRuns {
             .filter_map(|s| s.conversation_id)
             .map(ConversationDriver::session_key)
             .collect()
-    }
-
-    /// Every run currently in flight, across every focus (for a future
-    /// "agents running" indicator).
-    pub fn running(&self) -> impl Iterator<Item = &DriverSlot> {
-        self.slots.iter().filter(|s| s.status.running)
     }
 
     /// Nodes with a lifecycle-processor conversation (anything but a chat or
@@ -720,10 +716,6 @@ impl AgentRuns {
         Ok(())
     }
 
-    fn latest_handoff_conversation(&self, focus: Focus) -> anyhow::Result<Option<Uuid>> {
-        Self::latest_handoff_conversation_in(&self.fleet, focus)
-    }
-
     fn latest_handoff_conversation_in(fleet: &FleetStore, focus: Focus) -> anyhow::Result<Option<Uuid>> {
         Ok(fleet.read(|conn| latest_handoff_conversation(conn, focus))?.map(|c| c.id))
     }
@@ -739,58 +731,6 @@ impl AgentRuns {
     /// The config a driver started from the app gets.
     pub fn conversation_config(&self) -> Result<ConversationConfig, String> {
         self.driver_config()
-    }
-
-    /// Answer a plan step the agent handed back to the user (`HandoffReason`),
-    /// from outside the conversation view — the unified task panel's
-    /// `PlanStep` items (`crate::unified::panels::decisions`). Sends the same
-    /// message `conversation::side_pane::answer_handoff` sends, to whichever
-    /// implementation/verification conversation on the step's node most
-    /// recently handed work back, then sets the step back to `in_progress`
-    /// as a `ConversationEdit` under that conversation — the same mutation
-    /// `ConversationView::choose_status` makes after a handoff answer, so it
-    /// is reversible and the agent hears of it.
-    pub fn answer_plan_step_handoff(
-        &mut self,
-        step_id: Uuid,
-        answer: HandoffAnswer,
-        cx: &mut Context<Self>,
-    ) -> anyhow::Result<()> {
-        let step = self
-            .fleet
-            .read(|conn| PlanStepRepo::new(conn).get(step_id))?
-            .with_context(|| format!("plan step {step_id} not found"))?;
-        let focus = Focus::Node(step.node_id);
-        let conversation_id = self
-            .latest_handoff_conversation(focus)?
-            .context(
-                "No implement or verify conversation has worked on this node, so there is no \
-                agent to send the answer to. Start one, or change the step yourself in the \
-                Plan panel.",
-            )?;
-
-        let message = handoff_answer_message(&step, &answer);
-        self.ensure_for_conversation(conversation_id)?;
-        // As in the conversation view, the step goes back to `in_progress`
-        // only once the answer has gone out: otherwise it would read as
-        // answered while the agent never heard it.
-        if !self.send_to_conversation(conversation_id, &message, cx) {
-            anyhow::bail!("the agent is busy; the answer was not sent");
-        }
-
-        self.fleet.interview(
-            ACTOR_USER,
-            InterviewCommand::ConversationEdit {
-                conversation_id,
-                mutation: OutlineMutation::UpdatePlanStepStatus {
-                    step_id,
-                    status: STATUS_IN_PROGRESS.to_string(),
-                    note: None,
-                    reason: None,
-                },
-            },
-        )?;
-        Ok(())
     }
 
     /// [`Self::answer_plan_step_handoff`] without blocking the UI thread:
@@ -881,10 +821,6 @@ impl AgentRuns {
         Ok(())
     }
 
-    pub fn resolve_decision_elsewhere(&mut self, decision_id: Uuid) -> anyhow::Result<()> {
-        Self::resolve_decision_on(&self.fleet, decision_id)
-    }
-
     /// Put a plan step the agent handed back to `in_progress` without
     /// sending an answer: the user settled it outside the app, in the agent's
     /// own session. Recorded under the conversation that handed it back,
@@ -914,10 +850,6 @@ impl AgentRuns {
         Ok(())
     }
 
-    pub fn resolve_plan_step_elsewhere(&mut self, step_id: Uuid) -> anyhow::Result<()> {
-        Self::resolve_plan_step_on(&self.fleet, step_id)
-    }
-
     /// Answer an open review finding, from outside the conversation view —
     /// the unified task panel's `Finding` items. Mirrors
     /// `conversation::side_pane::respond_to_finding`: a pure status write,
@@ -940,9 +872,6 @@ impl AgentRuns {
         Ok(())
     }
 
-    pub fn respond_review_finding(&mut self, finding_id: Uuid, status: &str) -> anyhow::Result<()> {
-        Self::respond_finding_on(&self.fleet, finding_id, status)
-    }
 }
 
 #[cfg(test)]

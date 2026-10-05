@@ -96,13 +96,11 @@ impl AppJourney {
         self.entries.iter().cloned().collect()
     }
 
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.entries.len()
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
-    }
 }
 
 struct JourneyGlobal(Entity<AppJourney>);
