@@ -17,6 +17,8 @@ use std::rc::Rc;
 const ROW_UNIT: f32 = 24.;
 /// Row height assumed when the row at the top has not been laid out.
 const FALLBACK_ROW_HEIGHT: f32 = 80.;
+/// Shortest track the thumb can travel while the list overflows at all.
+const MIN_TRAVEL: f32 = 1.;
 /// Closer than this to the last scroll position counts as the end.
 const END_EPSILON: f32 = 1e-3;
 
@@ -47,10 +49,17 @@ impl RowScrollbar {
     /// The last row-position the top of the viewport can have: the rows that
     /// do not fit on one screen.
     fn max_position(&self) -> f32 {
+        // The list's own measure says whether there is anything to scroll.
+        // The estimate below depends on the height of whichever row is on
+        // top, which changes as it is dragged; it must never decide that
+        // there is nothing to scroll, or the scrollbar disappears mid-drag.
+        if self.list.max_offset_for_scrollbar().y.as_f32() <= 0. {
+            return 0.;
+        }
         let viewport = self.list.viewport_bounds().size.height.as_f32();
         let top = self.list.logical_scroll_top().item_ix;
         let visible = viewport / self.row_height(top);
-        (self.list.item_count() as f32 - visible).max(0.)
+        (self.list.item_count() as f32 - visible).max(MIN_TRAVEL)
     }
 }
 
