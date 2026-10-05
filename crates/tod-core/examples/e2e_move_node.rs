@@ -83,7 +83,7 @@ fn main() -> anyhow::Result<()> {
     let agent = AgentBackend::Claude.create(tod_agent::agent_traffic::shared_log());
     let mut driver = ConversationDriver::new(config, Focus::Node(node_id), ProtocolKind::Outline);
 
-    let mut turn = |driver: &mut ConversationDriver, text: &str| -> anyhow::Result<String> {
+    let turn = |driver: &mut ConversationDriver, text: &str| -> anyhow::Result<String> {
         // What the driver is about to ask for, so a failure is not hidden by its scratch fallback.
         match provision::resolve_launch_cwd_with(&store, &nid, &mut |m| println!("    {m}")) {
             Ok((dir, warnings)) => println!("  the agent will run in {dir} {warnings:?}"),

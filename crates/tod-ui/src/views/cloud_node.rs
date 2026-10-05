@@ -20,6 +20,7 @@ pub enum CloudUpdate {
 
 /// The line shown instead of a cloud node's lifecycle buttons: where it
 /// runs and what the supervisor last did, as far as the synced data says.
+#[cfg(test)]
 pub fn status_line(cloud: &CloudNode, lifecycle: &str) -> String {
     status_line_with(cloud, lifecycle, None)
 }

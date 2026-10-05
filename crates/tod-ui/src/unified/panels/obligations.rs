@@ -100,6 +100,7 @@ impl ObligationsPanel {
         }
     }
 
+    #[cfg(test)]
     pub fn node_id(&self) -> Uuid {
         self.node_id
     }
@@ -119,16 +120,6 @@ impl ObligationsPanel {
         // As a click on the row would.
         let handle = self.inner.focus_handle(cx);
         window.focus(&handle, cx);
-    }
-
-    /// Point this column at a different node, in place.
-    pub fn retarget(&mut self, node_id: Uuid, window: &mut Window, cx: &mut Context<Self>) {
-        self.node_id = node_id;
-        let title = node_title(&self.fleet, node_id);
-        self.inner.update(cx, |view, cx| {
-            view.retarget(node_id, &title, None, false, window, cx);
-        });
-        cx.notify();
     }
 
     /// `E`: open the selected obligation's own transcript — the conversation
@@ -179,9 +170,6 @@ impl ColumnPanel for ObligationsPanel {
         "Obligations".into()
     }
 
-    fn target_label(&self, _cx: &App) -> SharedString {
-        node_title(&self.fleet, self.node_id).into()
-    }
 }
 
 impl EventEmitter<PanelOpenRequest> for ObligationsPanel {}
