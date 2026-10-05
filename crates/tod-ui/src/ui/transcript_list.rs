@@ -373,6 +373,8 @@ pub struct TranscriptList {
     activity: Option<SharedString>,
     empty_message: SharedString,
     list: ListState,
+    /// Kept across frames: it remembers a drag in progress.
+    scrollbar: RowScrollbar,
     /// Entries shown last render; more means scroll to the newest.
     rendered_entries: usize,
     /// Scroll the highlighted chunk into view on the next render.
@@ -394,6 +396,7 @@ impl TranscriptList {
 
     /// A list whose chunks start as `start` says.
     pub fn starting(start: StartState) -> Self {
+        let list = ListState::new(0, ListAlignment::Top, px(1000.));
         Self {
             entries: Vec::new(),
             toggled: HashMap::new(),
@@ -404,10 +407,21 @@ impl TranscriptList {
             running: false,
             activity: None,
             empty_message: SharedString::default(),
-            list: ListState::new(0, ListAlignment::Top, px(1000.)),
+            scrollbar: RowScrollbar::new(&list),
+            list,
             rendered_entries: 0,
             scroll_to_highlight: false,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn list_state(&self) -> ListState {
+        self.list.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn scrollbar_handle(&self) -> RowScrollbar {
+        self.scrollbar.clone()
     }
 
     pub fn set_entries(&mut self, entries: Vec<Entry>, cx: &mut Context<Self>) {
@@ -966,7 +980,7 @@ impl Render for TranscriptList {
                     .right_0()
                     .bottom_0()
                     .w(px(16.))
-                    .child(Scrollbar::vertical(&RowScrollbar::new(&self.list))),
+                    .child(Scrollbar::vertical(&self.scrollbar)),
             )
     }
 }

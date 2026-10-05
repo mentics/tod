@@ -29,4 +29,6 @@ pub mod toast;
 pub mod session_info;
 pub mod token_usage;
 pub mod row_scrollbar;
+#[cfg(test)]
+mod scrollbar_harness;
 pub mod transcript_list;
