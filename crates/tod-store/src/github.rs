@@ -698,6 +698,12 @@ impl PullState {
             Self::Closed => "closed",
         }
     }
+
+    /// Merged or closed: the pull request is over, so it is shown struck
+    /// through wherever it is named.
+    pub const fn is_terminal(self) -> bool {
+        matches!(self, Self::Merged | Self::Closed)
+    }
 }
 
 /// One pull request, as a list of them shows it.

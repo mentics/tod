@@ -63,6 +63,8 @@ struct TreeData {
     /// Tickets some managed node is: a non-managed node with one of these is
     /// a linked copy, which refreshes update. Not scoped to the list either.
     generated: HashSet<String>,
+    /// Nodes whose ticket is in a terminal state, from their synced metadata.
+    ticket_terminal: HashSet<Uuid>,
 }
 
 impl TreeData {
@@ -201,6 +203,21 @@ impl TreeData {
         drop(rows);
         drop(stmt);
 
+        let ticket_terminal = string_map(
+            conn,
+            &list_blob,
+            "SELECT x.node_id, x.body
+             FROM node_extra_content x JOIN outline_entries e ON e.node_id = x.node_id
+             WHERE e.list_id = ?1 AND x.content_type = 'metadata'",
+        )?
+        .into_iter()
+        .filter(|(_, body)| {
+            serde_json::from_str::<serde_json::Value>(body)
+                .is_ok_and(|meta| crate::outline::types::ticket_is_terminal(&meta))
+        })
+        .map(|(id, _)| id)
+        .collect();
+
         Ok(Self {
             nodes,
             managed,
@@ -214,6 +231,7 @@ impl TreeData {
             accept_destinations,
             copied,
             generated,
+            ticket_terminal,
         })
     }
 
@@ -352,6 +370,7 @@ fn walk(
             accept_ready,
             linked_copy,
             has_copies,
+            ticket_terminal: ticket.is_some() && data.ticket_terminal.contains(&entry.node_id),
         });
         if !entry.collapsed {
             let generator = if data.is_generator(entry.node_id) {

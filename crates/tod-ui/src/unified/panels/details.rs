@@ -57,6 +57,8 @@ struct Loaded {
     ticket_id: Option<String>,
     /// The ticket's browser URL, when it can be worked out.
     ticket_url: Option<String>,
+    /// The ticket is done or canceled: its id is struck through.
+    ticket_terminal: bool,
     lifecycle: String,
     details: String,
     obligation_count: usize,
@@ -73,6 +75,7 @@ impl Loaded {
             title: String::new(),
             ticket_id: None,
             ticket_url: None,
+            ticket_terminal: false,
             lifecycle: String::new(),
             details: String::new(),
             obligation_count: 0,
@@ -106,6 +109,9 @@ fn load(fleet: &FleetStore, node_id: Uuid) -> Loaded {
             .and_then(|json_str| serde_json::from_str::<serde_json::Value>(&json_str).ok());
         loaded.ticket_url =
             tod_integration::linear_issue_url(metadata.as_ref(), fleet.paths().root(), ticket);
+        loaded.ticket_terminal = metadata
+            .as_ref()
+            .is_some_and(tod_store::outline::types::ticket_is_terminal);
     }
     loaded.details = fleet
         .get_extra_content(node_id, EXTRA_CONTENT_DETAILS)
@@ -443,9 +449,13 @@ impl Render for DetailsPanel {
                                     gpui::MouseButton::Left,
                                     move |_, _, cx| cx.open_url(&url),
                                 )
+                                .when(self.loaded.ticket_terminal, |el| el.line_through())
                                 .child(ticket)
                                 .into_any_element(),
-                                None => style::text_muted(div()).child(ticket).into_any_element(),
+                                None => style::text_muted(div())
+                                    .when(self.loaded.ticket_terminal, |el| el.line_through())
+                                    .child(ticket)
+                                    .into_any_element(),
                             },
                         ))
                     }),

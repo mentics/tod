@@ -593,6 +593,8 @@ impl ListDelegate for TaskListDelegate {
                         .font_semibold()
                         .text_color(ticket_color)
                         .underline()
+                        // A done or canceled ticket is struck through.
+                        .when(item.ticket_terminal, |el| el.line_through())
                         .cursor_pointer()
                         .flex_shrink_0()
                         .child(format!("{ticket}: "))
@@ -622,6 +624,7 @@ impl ListDelegate for TaskListDelegate {
                             .text_xs()
                             .font_semibold()
                             .text_color(external_color)
+                            .when(item.ticket_terminal, |el| el.line_through())
                             .flex_shrink_0()
                             .child(format!("{external_id}: ")),
                     )

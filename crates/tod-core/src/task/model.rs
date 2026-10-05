@@ -62,6 +62,8 @@ pub struct TaskItem {
     pub linked_copy: bool,
     /// True for a managed node that has at least one linked copy elsewhere.
     pub has_copies: bool,
+    /// True when the node's ticket is done or canceled (shown struck through).
+    pub ticket_terminal: bool,
     /// Pending decisions waiting on the user for this node (fed by the
     /// host via `TaskListView::set_attention`; zero until it calls in).
     pub needs_you_count: usize,
@@ -683,6 +685,7 @@ mod tests {
             accept_ready: false,
             linked_copy: false,
             has_copies: false,
+            ticket_terminal: false,
             needs_you_count: 0,
             waiting_since: None,
             status_override: None,

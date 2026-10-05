@@ -88,6 +88,7 @@ pub fn load_tasks_from_store(store: &FleetStore, list_id: Option<Uuid>) -> Vec<T
                 accept_ready: row.accept_ready,
                 linked_copy: row.linked_copy,
                 has_copies: row.has_copies,
+                ticket_terminal: row.ticket_terminal,
                 // Filled in by `TaskListView::set_attention`, not the store load.
                 needs_you_count: 0,
                 waiting_since: None,
@@ -145,6 +146,7 @@ pub fn large_fixture_set(base_count: usize) -> Vec<TaskItem> {
             accept_ready: false,
             linked_copy: false,
             has_copies: false,
+            ticket_terminal: false,
             needs_you_count: 0,
             waiting_since: None,
             status_override: None,

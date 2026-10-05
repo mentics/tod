@@ -13,13 +13,17 @@
 //! Everything here runs git and calls GitHub: call it off the UI thread.
 
 use rusqlite::Connection;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 use tod_store::credentials::{CredentialStore, resolve_github_auth};
 use tod_store::fleet::ResolvedFiles;
 use tod_store::fleet::node_actions::resolve_files_for_node;
 use tod_store::fleet::repositories::{NodeRepositories, node_repositories};
-use tod_store::github::{self, GithubError, GithubRepo, NodePr, NodePrRepo, PullSummary};
+use tod_store::github::{
+    self, GithubError, GithubRepo, NodePr, NodePrRepo, PullState, PullSummary,
+};
 use tod_store::outline::repos::NodeRepo;
 use uuid::Uuid;
 
@@ -234,6 +238,11 @@ fn collect(
             })
             .collect()
     });
+    for section in &sections {
+        if let (Some(repo), RepoPulls::Listed(pulls)) = (&section.github, &section.pulls) {
+            remember_pull_states(repo, pulls);
+        }
+    }
     let mut warnings = repos.warnings;
     // Listing every open one, a linked one is shown if it is open.
     if scope == PullScope::Branch {
@@ -293,6 +302,80 @@ fn fold_in_linked(
             pulls: RepoPulls::Listed(vec![pull]),
         }),
     }
+}
+
+/// The last state read for each linked pull request, so a view can show a
+/// finished one struck through without calling GitHub while it draws.
+static STATES: Mutex<Option<HashMap<String, (PullState, Instant)>>> = Mutex::new(None);
+
+/// How long an open pull request's state is trusted. A merged or closed one
+/// is not asked about again.
+const STATE_TTL: Duration = Duration::from_secs(120);
+
+fn state_key(pr: &NodePr) -> String {
+    format!(
+        "{}/{}#{}",
+        pr.owner.to_ascii_lowercase(),
+        pr.repo.to_ascii_lowercase(),
+        pr.pr_number
+    )
+}
+
+/// The state last read for `pr`, if any. Never calls GitHub.
+pub fn cached_pull_state(pr: &NodePr) -> Option<PullState> {
+    let states = STATES.lock().ok()?;
+    states.as_ref()?.get(&state_key(pr)).map(|(state, _)| *state)
+}
+
+/// Whether `pr`'s state is unknown or may have changed since it was read.
+pub fn pull_state_stale(pr: &NodePr) -> bool {
+    let Ok(states) = STATES.lock() else {
+        return false;
+    };
+    match states.as_ref().and_then(|map| map.get(&state_key(pr))) {
+        None => true,
+        Some((state, _)) if state.is_terminal() => false,
+        Some((_, read_at)) => read_at.elapsed() > STATE_TTL,
+    }
+}
+
+/// Remember the state of every pull request in `pulls` (as listed by
+/// GitHub for `repo`), so the views that only know a link show it right.
+pub fn remember_pull_states(repo: &GithubRepo, pulls: &[PullSummary]) {
+    if let Ok(mut states) = STATES.lock() {
+        let map = states.get_or_insert_with(HashMap::new);
+        for pull in pulls {
+            let pr = NodePr::new(&repo.owner, &repo.repo, pull.number);
+            map.insert(state_key(&pr), (pull.state, Instant::now()));
+        }
+    }
+}
+
+/// Read the state of each of `prs` that is [`pull_state_stale`] from GitHub
+/// into the cache. Returns whether any state changed. Calls GitHub: run it
+/// off the UI thread.
+pub fn refresh_pull_states(data_root: &Path, prs: &[NodePr]) -> bool {
+    let stale: Vec<&NodePr> = prs.iter().filter(|pr| pull_state_stale(pr)).collect();
+    if stale.is_empty() {
+        return false;
+    }
+    let Some(source) = GithubPulls::from_data_root(data_root) else {
+        return false;
+    };
+    let mut changed = false;
+    for pr in stale {
+        let repo = GithubRepo {
+            owner: pr.owner.clone(),
+            repo: pr.repo.clone(),
+        };
+        let Ok(pull) = source.pull(&repo, pr.pr_number) else {
+            continue;
+        };
+        let before = cached_pull_state(pr);
+        remember_pull_states(&repo, std::slice::from_ref(&pull));
+        changed |= before != Some(pull.state);
+    }
+    changed
 }
 
 #[cfg(test)]
