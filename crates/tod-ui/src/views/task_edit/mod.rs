@@ -94,6 +94,11 @@ fn field_anchor_id(field: TaskEditField) -> &'static str {
         TaskEditField::NewSandboxSource => "task-edit-field-new-sandbox-source",
         TaskEditField::NewSandboxImage => "task-edit-field-new-sandbox-image",
         TaskEditField::NewSandboxForkSource => "task-edit-field-new-sandbox-fork",
+        TaskEditField::NewSandboxBuild => "task-edit-field-new-sandbox-build",
+        TaskEditField::BuildImageBase => "task-edit-field-build-image-base",
+        TaskEditField::BuildImageName => "task-edit-field-build-image-name",
+        TaskEditField::BuildImageRepos => "task-edit-field-build-image-repos",
+        TaskEditField::BuildImageRun => "task-edit-field-build-image-run",
         TaskEditField::Capability(Capability::Agent) => "task-edit-field-cap-agent",
         TaskEditField::Capability(Capability::Files) => "task-edit-field-cap-files",
         TaskEditField::Capability(Capability::Ticket) => "task-edit-field-cap-ticket",
@@ -169,6 +174,16 @@ enum TaskEditField {
     NewSandboxImage,
     /// Sandboxes: the one to fork (Enter takes the next listed one).
     NewSandboxForkSource,
+    /// Sandboxes: opens or closes the form that builds an image holding repositories.
+    NewSandboxBuild,
+    /// The image form: the image it is built on.
+    BuildImageBase,
+    /// The image form: the new image's name.
+    BuildImageName,
+    /// The image form: the repositories to clone into it, one per line.
+    BuildImageRepos,
+    /// The image form: Enter builds it.
+    BuildImageRun,
     /// Generator capability: pick the data source (only until one is saved).
     GeneratorSource,
     /// One field of the generator's configuration form, by index into
@@ -206,6 +221,8 @@ impl TaskEditField {
                 | Self::ContainerChoice(_)
                 | Self::NewSandboxSource
                 | Self::NewSandboxForkSource
+                | Self::NewSandboxBuild
+                | Self::BuildImageRun
                 | Self::GeneratorSource
                 | Self::GeneratorRefresh
                 | Self::GeneratorAcceptCapability(_)
@@ -843,6 +860,15 @@ impl TaskEditView {
                         stops.extend(listed());
                     } else {
                         stops.push(TaskEditField::NewSandboxImage);
+                        stops.push(TaskEditField::NewSandboxBuild);
+                        if self.dev.build_open() {
+                            stops.extend([
+                                TaskEditField::BuildImageBase,
+                                TaskEditField::BuildImageName,
+                                TaskEditField::BuildImageRepos,
+                                TaskEditField::BuildImageRun,
+                            ]);
+                        }
                     }
                 } else {
                     stops.extend([
@@ -989,6 +1015,9 @@ impl TaskEditView {
             TaskEditField::Details => self.details_input.clone().into(),
             TaskEditField::ContainerName => self.dev.container_input.clone().into(),
             TaskEditField::NewSandboxImage => self.dev.new_image_input.clone().into(),
+            TaskEditField::BuildImageBase => self.dev.build_base_input.clone().into(),
+            TaskEditField::BuildImageName => self.dev.build_name_input.clone().into(),
+            TaskEditField::BuildImageRepos => self.dev.build_repos_input.clone().into(),
             TaskEditField::GeneratorAcceptDestination => {
                 self.generator_accept_destination_input.clone().into()
             }
@@ -999,6 +1028,8 @@ impl TaskEditView {
             | TaskEditField::ContainerChoice(_)
             | TaskEditField::NewSandboxSource
             | TaskEditField::NewSandboxForkSource
+            | TaskEditField::NewSandboxBuild
+            | TaskEditField::BuildImageRun
             | TaskEditField::AgentPlatform
             | TaskEditField::AgentModel
             | TaskEditField::AgentEffort
@@ -1030,6 +1061,18 @@ impl TaskEditView {
             (
                 TaskEditField::NewSandboxImage,
                 self.dev.new_image_input.clone().into(),
+            ),
+            (
+                TaskEditField::BuildImageBase,
+                self.dev.build_base_input.clone().into(),
+            ),
+            (
+                TaskEditField::BuildImageName,
+                self.dev.build_name_input.clone().into(),
+            ),
+            (
+                TaskEditField::BuildImageRepos,
+                self.dev.build_repos_input.clone().into(),
             ),
             (
                 TaskEditField::GeneratorAcceptDestination,
@@ -1135,6 +1178,14 @@ impl TaskEditView {
             }
             TaskEditField::NewSandboxForkSource => {
                 self.cycle_fork_source(cx);
+                return;
+            }
+            TaskEditField::NewSandboxBuild => {
+                self.toggle_image_build(cx);
+                return;
+            }
+            TaskEditField::BuildImageRun => {
+                self.build_image(window, cx);
                 return;
             }
             _ => {

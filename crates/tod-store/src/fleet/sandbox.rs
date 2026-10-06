@@ -26,7 +26,7 @@ use tod_sandbox::provision::{self, Payload};
 use tod_sandbox::relay;
 
 pub use tod_sandbox::config::{AuthMode, DEFAULT_IMAGE};
-pub use tod_sandbox::provision::{TOD_CLI_PATH, TUNNEL_PORT};
+pub use tod_sandbox::provision::{BakeRepo, TOD_CLI_PATH, TUNNEL_PORT, parse_bake_repos};
 
 /// Installs what tod needs in any image (see `assets/sandbox/`).
 pub const BOOTSTRAP: &[u8] = include_bytes!("../../../../assets/sandbox/bootstrap.sh");
@@ -323,6 +323,38 @@ impl Sandboxes {
         self.save()?;
         forget(name);
         self.ensure(&bx, name, progress)
+    }
+
+    /// Builds `base_image` with tod's dependencies installed and `repos`
+    /// cloned into it, as the workspace image `sandbox/<name>:latest`, which
+    /// is returned. The build runs on Blaxel (see [`Self::bl_push`]).
+    pub fn bake(
+        &self,
+        base_image: &str,
+        name: &str,
+        agents: bool,
+        repos: &[provision::BakeRepo],
+        inherit_output: bool,
+        progress: &mut dyn FnMut(&str),
+    ) -> Result<String> {
+        validate_name(name)?;
+        let acct = self.account()?;
+        let relay_bin = relay_binary()?;
+        let payload = payload(&relay_bin, agents);
+        let dir = build_dir(name)?;
+        std::fs::write(dir.join("Dockerfile"), provision::bake_dockerfile_with_repos(base_image, &payload, repos))?;
+        std::fs::write(dir.join("bootstrap.sh"), BOOTSTRAP)?;
+        std::fs::write(dir.join("tod-relay"), &relay_bin)?;
+        std::fs::write(dir.join("tod-cli"), payload.tod_cli)?;
+        std::fs::write(dir.join("blaxel.toml"), provision::blaxel_toml(name, acct.memory_mb))?;
+        let with = match repos.len() {
+            0 => String::new(),
+            1 => " and 1 repository".to_string(),
+            n => format!(" and {n} repositories"),
+        };
+        progress(&format!("baking {base_image} with tod's dependencies{with} into sandbox/{name}…"));
+        self.bl_push(&dir, inherit_output, progress)?;
+        Ok(format!("sandbox/{name}:latest"))
     }
 
     /// Build `dir` (a Dockerfile and blaxel.toml) into the workspace's

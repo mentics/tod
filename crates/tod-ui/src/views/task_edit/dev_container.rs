@@ -22,7 +22,7 @@ use gpui::{
     StatefulInteractiveElement, Styled, Subscription, Task, Window, div,
 };
 use gpui_component::button::Button;
-use gpui_component::input::{InputEvent, InputState};
+use gpui_component::input::{AnyInputState, InputEvent, InputState, TextareaState};
 use gpui_component::{ActiveTheme, Disableable, h_flex, v_flex};
 use std::time::Duration;
 use tod_agent::devcontainer::{self, ContainerSummary};
@@ -47,6 +47,15 @@ pub(super) struct DevContainerPanel {
     pub(super) new_image_input: Entity<InputState>,
     /// Why the chosen fork source cannot be used.
     create_error: Option<String>,
+    /// The form that builds an image holding repositories: whether it is
+    /// open, its inputs, whether a build is running, and how the last one
+    /// went (`Ok` is what to tell the user, `Err` what went wrong).
+    build_open: bool,
+    pub(super) build_base_input: Entity<InputState>,
+    pub(super) build_name_input: Entity<InputState>,
+    pub(super) build_repos_input: Entity<TextareaState>,
+    building: bool,
+    build_result: Option<Result<String, String>>,
     /// The default image from Settings, shown under the image field.
     default_image: String,
     /// Where launches would run, or why they cannot, per the last check.
@@ -77,6 +86,18 @@ impl DevContainerPanel {
             InputState::new(window, cx).placeholder("Enter to edit · Empty uses the default")
         });
         let _subscriptions = [subscribe(&container_input, cx), subscribe(&new_image_input, cx)];
+        let build_base_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Enter to edit · An image to build on, e.g. ubuntu:24.04")
+        });
+        let build_name_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("Enter to edit · Name for the new image")
+        });
+        let build_repos_input = cx.new(|cx| {
+            TextareaState::new(window, cx).rows(4).placeholder(
+                "Enter to edit · One per line: https://github.com/owner/repo [/directory]",
+            )
+        });
         Self {
             container_input,
             containers: Vec::new(),
@@ -86,6 +107,12 @@ impl DevContainerPanel {
             list_generation: 0,
             new_image_input,
             create_error: None,
+            build_open: false,
+            build_base_input,
+            build_name_input,
+            build_repos_input,
+            building: false,
+            build_result: None,
             default_image: String::new(),
             check: None,
             checking: false,
@@ -97,6 +124,11 @@ impl DevContainerPanel {
 
     pub(super) fn container_count(&self) -> usize {
         self.containers.len()
+    }
+
+    /// Whether the image-building form is showing.
+    pub(super) fn build_open(&self) -> bool {
+        self.build_open
     }
 }
 
@@ -179,6 +211,78 @@ impl TaskEditView {
         self.save_sandbox_from(next, cx);
         self.clamp_focus_index();
         cx.notify();
+    }
+
+    /// Open or close the form that builds an image holding repositories.
+    pub(super) fn toggle_image_build(&mut self, cx: &mut Context<Self>) {
+        self.dev.build_open = !self.dev.build_open;
+        self.clamp_focus_index();
+        cx.notify();
+    }
+
+    /// Build the image the form describes on Blaxel (a minute or more, so
+    /// off the UI thread), then make it what each node's sandbox starts from.
+    pub(super) fn build_image(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.dev.building {
+            return;
+        }
+        let base = input_text(&self.dev.build_base_input, cx).trim().to_string();
+        let name = input_text(&self.dev.build_name_input, cx).trim().to_string();
+        let repos_text = input_text(&self.dev.build_repos_input, cx);
+        let checked = (|| -> anyhow::Result<_> {
+            if base.is_empty() || base.contains(char::is_whitespace) {
+                anyhow::bail!("Give the image to build on, such as ubuntu:24.04");
+            }
+            if sandboxes::runs_as_is(&base) {
+                anyhow::bail!("Build on a plain base image such as ubuntu:24.04, not on one built for Blaxel");
+            }
+            sandboxes::validate_name(&name)?;
+            let repos = sandboxes::parse_bake_repos(&repos_text)?;
+            if repos.is_empty() {
+                anyhow::bail!("Add at least one repository (one https:// URL per line)");
+            }
+            Ok(repos)
+        })();
+        let repos = match checked {
+            Ok(repos) => repos,
+            Err(err) => {
+                self.dev.build_result = Some(Err(format!("{err:#}")));
+                cx.notify();
+                return;
+            }
+        };
+        self.dev.building = true;
+        self.dev.build_result = None;
+        cx.notify();
+        let root = self.fleet.paths().root().to_path_buf();
+        let dirs = repos.iter().map(|r| r.dir.clone()).collect::<Vec<_>>().join(", ");
+        cx.spawn_in(window, async move |this, cx| {
+            let built = cx
+                .background_spawn(async move {
+                    sandboxes::Sandboxes::load(&root)?.bake(&base, &name, true, &repos, false, &mut |_| {})
+                })
+                .await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.dev.building = false;
+                match built {
+                    Ok(image) => {
+                        this.dev.new_image_input.update(cx, |input, cx| {
+                            input.set_value(image.clone(), window, cx)
+                        });
+                        this.save_sandbox_from(SandboxFrom::Image(image.clone()), cx);
+                        this.dev.build_open = false;
+                        this.dev.build_result = Some(Ok(format!(
+                            "Built {image}, now what each node's sandbox starts from. Cloned: {dirs}. \
+                             Use one of those as the workspace directory."
+                        )));
+                    }
+                    Err(err) => this.dev.build_result = Some(Err(format!("{err:#}"))),
+                }
+                this.clamp_focus_index();
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// Fork the next listed sandbox.
@@ -945,10 +1049,12 @@ impl TaskEditView {
                 )))
                 .into_any_element(),
         };
+        let build = matches!(from, SandboxFrom::Image(_)).then(|| self.render_image_build(muted, window, cx));
         v_flex()
             .gap_2()
             .child(source)
             .child(detail)
+            .when_some(build, |el, build| el.child(build))
             .when_some(self.dev.create_error.clone(), |el, err| {
                 el.child(div().text_xs().text_color(danger).child(selectable_text(
                     "task-edit-new-sandbox-status",
@@ -957,6 +1063,135 @@ impl TaskEditView {
                     cx,
                 )))
             })
+    }
+}
+
+impl TaskEditView {
+    /// "Image with repositories": one image holding every repository the
+    /// nodes' sandboxes work in, including source they depend on, so one
+    /// base serves many repositories.
+    fn render_image_build(
+        &self,
+        muted: gpui::Hsla,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let active = cx.theme().list_active;
+        let active_border = cx.theme().list_active_border;
+        let danger = cx.theme().danger;
+        let open = self.dev.build_open;
+        let toggle_focused = self.field_nav_focused(TaskEditField::NewSandboxBuild);
+        let toggle = self.apply_focus_scroll_anchor(
+            TaskEditField::NewSandboxBuild,
+            h_flex()
+                .id(super::field_anchor_id(TaskEditField::NewSandboxBuild))
+                .items_center()
+                .gap_2()
+                .px_1()
+                .rounded_md()
+                .cursor_pointer()
+                .when(toggle_focused, |el| el.bg(active).border_1().border_color(active_border))
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.enter_field_edit(TaskEditField::NewSandboxBuild, window, cx);
+                }))
+                .child(Self::render_field_label("Image with repositories", cx))
+                .child(div().text_xs().text_color(muted).child(if open {
+                    "Enter or click to close"
+                } else {
+                    "Enter or click to build one"
+                })),
+        );
+        let labeled_input = |field: TaskEditField,
+                             label: &'static str,
+                             input: AnyInputState,
+                             rows: Option<f32>,
+                             window: &mut Window,
+                             cx: &mut Context<Self>| {
+            self.apply_focus_scroll_anchor(
+                field,
+                v_flex()
+                    .id(super::field_anchor_id(field))
+                    .gap_1()
+                    .w(gpui::px(420.))
+                    .child(Self::render_field_label(label, cx))
+                    .child(self.render_nav_input(field, input, rows, window, cx)),
+            )
+        };
+        let run_focused = self.field_nav_focused(TaskEditField::BuildImageRun);
+        let form = open.then(|| {
+            v_flex()
+                .gap_2()
+                .pl_3()
+                .child(div().text_xs().text_color(muted).child(
+                    "Clones each repository into one image, so nodes start with them already there \
+                     (a sandbox can work in any of them; list source it depends on too). Public \
+                     https:// URLs only: credentials in a URL would be kept in the image.",
+                ))
+                .child(labeled_input(
+                    TaskEditField::BuildImageBase,
+                    "Built on",
+                    self.dev.build_base_input.clone().into(),
+                    None,
+                    window,
+                    cx,
+                ))
+                .child(labeled_input(
+                    TaskEditField::BuildImageName,
+                    "Image name",
+                    self.dev.build_name_input.clone().into(),
+                    None,
+                    window,
+                    cx,
+                ))
+                .child(labeled_input(
+                    TaskEditField::BuildImageRepos,
+                    "Repositories",
+                    self.dev.build_repos_input.clone().into(),
+                    Some(96.),
+                    window,
+                    cx,
+                ))
+                .child(self.apply_focus_scroll_anchor(
+                    TaskEditField::BuildImageRun,
+                    div()
+                        .id(super::field_anchor_id(TaskEditField::BuildImageRun))
+                        .rounded_md()
+                        .w_24()
+                        .when(run_focused, |el| el.bg(active).border_1().border_color(active_border))
+                        .child(
+                            Button::new("task-edit-build-image")
+                                .label(if self.dev.building { "Building…" } else { "Build image" })
+                                .outline()
+                                .compact()
+                                .disabled(self.dev.building)
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.enter_field_edit(TaskEditField::BuildImageRun, window, cx);
+                                })),
+                        ),
+                ))
+                .when(self.dev.building, |el| {
+                    el.child(div().text_xs().text_color(muted).child(
+                        "Building on Blaxel; a minute or more. You can keep working.",
+                    ))
+                })
+        });
+        let result = self.dev.build_result.clone().map(|result| {
+            let (text, color) = match result {
+                Ok(text) => (text, muted),
+                Err(text) => (text, danger),
+            };
+            div().text_xs().text_color(color).child(selectable_text(
+                "task-edit-build-image-result",
+                text,
+                window,
+                cx,
+            ))
+        });
+        v_flex()
+            .gap_2()
+            .child(toggle)
+            .when_some(form, |el, form| el.child(form))
+            .when_some(result, |el, result| el.child(result))
     }
 }
 
