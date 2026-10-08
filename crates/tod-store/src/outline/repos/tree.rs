@@ -17,6 +17,16 @@ impl<'a> TreeLoader<'a> {
     }
 
     pub fn flatten_visible(&self, list_id: Uuid) -> Result<Vec<FlatNodeRow>> {
+        self.flatten(list_id, false)
+    }
+
+    /// Every node in tree order, including those under collapsed parents.
+    /// Rows carry their `collapsed` flag so a caller can hide what they hold.
+    pub fn flatten_all(&self, list_id: Uuid) -> Result<Vec<FlatNodeRow>> {
+        self.flatten(list_id, true)
+    }
+
+    fn flatten(&self, list_id: Uuid, include_collapsed: bool) -> Result<Vec<FlatNodeRow>> {
         let entries = crate::outline::repos::OutlineRepo::new(self.conn).list_for_list(list_id)?;
         if entries.is_empty() {
             return Ok(Vec::new());
@@ -26,7 +36,7 @@ impl<'a> TreeLoader<'a> {
         let mut data = TreeData::load(self.conn, list_id)?;
         data.count_managed(&by_parent, None, None);
         let mut out = Vec::new();
-        walk(&by_parent, &data, None, None, 0, &mut out);
+        walk(&by_parent, &data, None, None, 0, include_collapsed, &mut out);
         Ok(out)
     }
 }
@@ -287,6 +297,7 @@ fn walk(
     parent_id: Option<Uuid>,
     generator: Option<Uuid>,
     depth: usize,
+    include_collapsed: bool,
     out: &mut Vec<FlatNodeRow>,
 ) {
     let Some(children) = by_parent.get(&parent_id) else {
@@ -372,13 +383,21 @@ fn walk(
             has_copies,
             ticket_terminal: ticket.is_some() && data.ticket_terminal.contains(&entry.node_id),
         });
-        if !entry.collapsed {
+        if include_collapsed || !entry.collapsed {
             let generator = if data.is_generator(entry.node_id) {
                 Some(entry.node_id)
             } else {
                 generator
             };
-            walk(by_parent, data, Some(entry.node_id), generator, depth + 1, out);
+            walk(
+                by_parent,
+                data,
+                Some(entry.node_id),
+                generator,
+                depth + 1,
+                include_collapsed,
+                out,
+            );
         }
     }
 }

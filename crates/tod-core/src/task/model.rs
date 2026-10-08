@@ -472,6 +472,25 @@ fn matching_with_ancestors<'a>(
     ids
 }
 
+/// Ids of the nodes with a collapsed ancestor.
+fn hidden_by_collapsed_ancestor<'a>(
+    tasks: &'a [TaskItem],
+    by_id: &HashMap<&str, &'a TaskItem>,
+) -> HashSet<&'a str> {
+    let mut hidden = HashSet::new();
+    for task in tasks {
+        let mut cur = task.parent_id.as_deref().and_then(|p| by_id.get(p).copied());
+        while let Some(parent) = cur {
+            if parent.collapsed {
+                hidden.insert(task.id.as_str());
+                break;
+            }
+            cur = parent.parent_id.as_deref().and_then(|p| by_id.get(p).copied());
+        }
+    }
+    hidden
+}
+
 fn task_matches_generator_filter(
     task: &TaskItem,
     by_id: &HashMap<&str, &TaskItem>,
@@ -517,6 +536,7 @@ fn flatten_sorted_tree(
     children: &HashMap<Option<String>, Vec<usize>>,
     tasks: &[TaskItem],
     parent_key: Option<&str>,
+    searching: bool,
     out: &mut Vec<TaskItem>,
 ) {
     let key = parent_key.map(String::from);
@@ -524,8 +544,8 @@ fn flatten_sorted_tree(
         for &idx in indices {
             let task = tasks[idx].clone();
             out.push(task.clone());
-            if !task.collapsed {
-                flatten_sorted_tree(children, tasks, Some(&task.id), out);
+            if searching || !task.collapsed {
+                flatten_sorted_tree(children, tasks, Some(&task.id), searching, out);
             }
         }
     }
@@ -537,6 +557,14 @@ pub fn filter_and_sort_tasks(
     working_set: &ListWorkingSet,
 ) -> Vec<TaskItem> {
     let by_id: HashMap<&str, &TaskItem> = tasks.iter().map(|t| (t.id.as_str(), t)).collect();
+    // Searching looks at every node, whether or not a collapsed ancestor hides
+    // it in the tree; without a query the collapsed subtrees stay hidden.
+    let searching = !search_query.trim().is_empty();
+    let hidden = if searching {
+        HashSet::new()
+    } else {
+        hidden_by_collapsed_ancestor(tasks, &by_id)
+    };
     let pending = working_set
         .pending_changes_only
         .then(|| matching_with_ancestors(tasks, &by_id, |t| t.incoming_count > 0));
@@ -552,8 +580,9 @@ pub fn filter_and_sort_tasks(
     let filtered: Vec<TaskItem> = tasks
         .iter()
         .filter(|t| {
-            pending
-                .as_ref()
+            !hidden.contains(t.id.as_str())
+                && pending
+                    .as_ref()
                 .is_none_or(|ids| ids.contains(t.id.as_str()))
                 && needs_you
                     .as_ref()
@@ -579,7 +608,7 @@ pub fn filter_and_sort_tasks(
     let mut children = build_children_map(&filtered, &visible_ids);
     sort_sibling_groups(&mut children, &filtered, &filtered_by_id, working_set);
     let mut visible = Vec::new();
-    flatten_sorted_tree(&children, &filtered, None, &mut visible);
+    flatten_sorted_tree(&children, &filtered, None, searching, &mut visible);
     visible
 }
 
@@ -831,6 +860,24 @@ mod tests {
         let visible = filter_and_sort_tasks(&tasks, "login", &ws);
         assert_eq!(visible.len(), 1);
         assert_eq!(visible[0].id, "m1");
+    }
+
+    #[test]
+    fn search_reaches_nodes_under_collapsed_parents() {
+        let mut generator = generator_sample("gen", "Generator");
+        generator.collapsed = true;
+        let managed = managed_sample("m1", "Fix login bug", "gen", 1);
+        let tasks = vec![generator, managed];
+        for ws in [ListWorkingSet::default_sort(), ListWorkingSet::default()] {
+            let ids = |q: &str| -> Vec<String> {
+                filter_and_sort_tasks(&tasks, q, &ws)
+                    .into_iter()
+                    .map(|t| t.id)
+                    .collect()
+            };
+            assert_eq!(ids(""), vec!["gen"]);
+            assert_eq!(ids("login"), vec!["m1"]);
+        }
     }
 
     #[test]
