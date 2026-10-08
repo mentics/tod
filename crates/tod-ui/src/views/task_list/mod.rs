@@ -362,6 +362,8 @@ pub struct TaskListView {
     generator_filter_input: Entity<InputState>,
     /// Managed node id copied via Ctrl+C, pending a Ctrl+V paste-out.
     copied_managed_node_id: Option<uuid::Uuid>,
+    /// Whether the copied node is generator-managed (pastes via its ticket).
+    copied_node_managed: bool,
     /// Copied-out (linked) node ids that received a field update from the
     /// most recent refresh — session-only, cleared on restart or once the
     /// node is selected.
@@ -544,6 +546,7 @@ impl TaskListView {
             generator_filter_open: None,
             generator_filter_input,
             copied_managed_node_id: None,
+            copied_node_managed: false,
             recently_updated_copy_ids: std::collections::HashSet::new(),
             _list_subscription,
             _list_observation,
@@ -2328,13 +2331,11 @@ impl TaskListView {
         let Some(task) = self.selected_task(cx) else {
             return;
         };
-        if !task.managed {
-            return;
-        }
         let Ok(node_id) = uuid::Uuid::parse_str(&task.id) else {
             return;
         };
         self.copied_managed_node_id = Some(node_id);
+        self.copied_node_managed = task.managed;
         self.set_status_line(format!("Copied {}", task.title), cx);
         let _ = window;
     }
@@ -2358,13 +2359,23 @@ impl TaskListView {
             return;
         }
         let parent_id = uuid::Uuid::parse_str(&task.id).ok();
-        self.write_outline(
+        let mutation = if self.copied_node_managed {
             OutlineMutation::PasteManagedNodeCopy {
                 source_node_id,
                 list_id,
                 parent_id,
                 ordinal: 0,
-            },
+            }
+        } else {
+            OutlineMutation::CopyNodeSubtree {
+                source_node_id,
+                list_id,
+                parent_id,
+                ordinal: 0,
+            }
+        };
+        self.write_outline(
+            mutation,
             window,
             cx,
             |this, result, window, cx| {

@@ -391,6 +391,16 @@ pub enum OutlineMutation {
         parent_id: Option<Uuid>,
         ordinal: i32,
     },
+    /// Deep-copy an ordinary node (title, details, tags, capabilities and
+    /// their settings, obligations) and all its descendants to a new place in
+    /// the outline. The copy is a fresh node with its own slug. See
+    /// `copy_capabilities` for what it deliberately starts without.
+    CopyNodeSubtree {
+        source_node_id: Uuid,
+        list_id: Uuid,
+        parent_id: Option<Uuid>,
+        ordinal: i32,
+    },
     /// Update the refresh status on a generator node.
     SetRefreshStatus {
         node_id: Uuid,
@@ -457,6 +467,7 @@ impl OutlineMutation {
                 | OutlineMutation::DeleteManagedNode { .. }
                 | OutlineMutation::RefreshLinkedCopy { .. }
                 | OutlineMutation::PasteManagedNodeCopy { .. }
+                | OutlineMutation::CopyNodeSubtree { .. }
                 | OutlineMutation::SetRefreshStatus { .. }
         )
     }
@@ -938,6 +949,22 @@ impl OutlineMutation {
             } => {
                 guard_not_in_generator_subtree(conn, *parent_id)?;
                 paste_managed_node_copy(conn, *source_node_id, *list_id, *parent_id, *ordinal)?;
+            }
+            OutlineMutation::CopyNodeSubtree {
+                source_node_id,
+                list_id,
+                parent_id,
+                ordinal,
+            } => {
+                guard_not_in_generator_subtree(conn, *parent_id)?;
+                bump_ordinals_after(conn, *list_id, *parent_id, *ordinal)?;
+                copy_node_subtree(
+                    conn,
+                    *source_node_id,
+                    *list_id,
+                    *parent_id,
+                    Some(*ordinal),
+                )?;
             }
             OutlineMutation::SetRefreshStatus {
                 node_id,
@@ -1706,6 +1733,148 @@ fn accept_generated_ticket(
     }
 
     Ok(Some(new_id))
+}
+
+/// Give `new_id` the capabilities of `source_id` and their settings. What a
+/// copy starts fresh instead, because carrying it over would mislead:
+/// lifecycle state and plan (the copy's work has not begun), a ticket and its
+/// pull requests (the same ticket on two nodes would be refreshed into both),
+/// an explicit branch (two nodes would share one), a visual-design file
+/// (saving would overwrite the original's), secret values (they stay with the
+/// source), and a generator's managed children and refresh status.
+fn copy_capabilities(conn: &Connection, source_id: Uuid, new_id: Uuid) -> Result<()> {
+    let node_repo = NodeRepo::new(conn);
+    let caps = node_repo.list_capabilities(source_id)?;
+    let (src, dst) = (source_id.to_string(), new_id.to_string());
+    for cap in &caps {
+        if !node_repo.list_capabilities(new_id)?.contains(cap) {
+            node_repo.enable_capability(new_id, *cap)?;
+        }
+        match cap {
+            Capability::Spec => {
+                let repo = ObligationRepo::new(conn);
+                for mut ob in repo.list_for_node(source_id)? {
+                    ob.id = Uuid::new_v4();
+                    ob.node_id = new_id;
+                    ob.visual_design_path = None;
+                    repo.insert(&ob)?;
+                }
+            }
+            Capability::Agent => {
+                use crate::fleet::repos::node_agent::NodeAgentRepo;
+                let repo = NodeAgentRepo::new(conn);
+                if let Some(a) = repo.get(&src)? {
+                    repo.upsert(
+                        &dst,
+                        a.platform.as_deref(),
+                        a.model.as_deref(),
+                        a.effort.as_deref(),
+                    )?;
+                }
+            }
+            Capability::Files => {
+                use crate::fleet::repos::node_files::NodeFilesRepo;
+                let tasks = crate::fleet::repos::task::TaskRepo::new(conn);
+                if let Some(t) = tasks.get_node(&src)? {
+                    tasks.update_repo(&dst, t.repo.as_deref())?;
+                }
+                let files = NodeFilesRepo::new(conn);
+                if let Some(f) = files.get(&src)? {
+                    files.set_use_worktree(&dst, f.use_worktree)?;
+                    files.set_dev_container(&dst, f.dev_container.as_ref())?;
+                }
+            }
+            Capability::Environment => {
+                let entries = crate::environment::entries(conn, source_id)?;
+                if !entries.is_empty() {
+                    crate::environment::set_entries(conn, new_id, &entries)?;
+                }
+            }
+            Capability::Generator => {
+                let gen_repo = GeneratorRepo::new(conn);
+                if let Some(config) = gen_repo.get_config(source_id)? {
+                    gen_repo.set_config(new_id, &config.data_source_type, &config.config_json)?;
+                    gen_repo.set_accept_config(
+                        new_id,
+                        config.accept_destination_node_id,
+                        &config.accept_capabilities,
+                    )?;
+                }
+            }
+            // Tags are copied by the caller; lifecycle starts at its first
+            // state; a ticket is not shared.
+            Capability::Tags | Capability::Lifecycle | Capability::Ticket => {}
+        }
+    }
+    Ok(())
+}
+
+fn copy_node_subtree(
+    conn: &Connection,
+    source_node_id: Uuid,
+    list_id: Uuid,
+    parent_id: Option<Uuid>,
+    ordinal: Option<i32>,
+) -> Result<Uuid> {
+    let node_repo = NodeRepo::new(conn);
+    let outline = OutlineRepo::new(conn);
+
+    let source = node_repo
+        .get(source_node_id)?
+        .context("source node not found")?;
+    let tags = node_repo.get_tags(source_node_id)?;
+    let body = node_repo
+        .get_extra_content(source_node_id, EXTRA_CONTENT_DETAILS)?
+        .unwrap_or_default();
+
+    let new_id = Uuid::new_v4();
+    let base = crate::outline::slug::derive_node_slug(&source.title, None);
+    let slug = crate::outline::slug::allocate_unique_slug(conn, &base, Some(new_id))?;
+    node_repo.create_with_id(new_id, &slug, &source.title)?;
+
+    let ordinal = match ordinal {
+        Some(o) => o,
+        None => outline.next_ordinal(list_id, parent_id)?,
+    };
+    outline.insert(&OutlineEntry {
+        node_id: new_id,
+        list_id,
+        parent_id,
+        ordinal,
+        collapsed: false,
+    })?;
+
+    if !body.is_empty() {
+        node_repo.set_extra_content(new_id, EXTRA_CONTENT_DETAILS, &body)?;
+    }
+    if !tags.is_empty() {
+        write_managed_tags(&node_repo, new_id, &tags)?;
+    }
+    copy_capabilities(conn, source_node_id, new_id)?;
+
+    let mut stmt = conn.prepare(
+        "SELECT e.node_id FROM outline_entries e JOIN nodes n ON n.id = e.node_id
+         WHERE e.parent_id = ?1 AND e.list_id = ?2 AND n.managed = 0
+         ORDER BY e.ordinal",
+    )?;
+    let child_ids: Vec<Uuid> = stmt
+        .query_map(
+            params![
+                crate::outline::uuid_blob::uuid_to_blob(source_node_id),
+                crate::outline::uuid_blob::uuid_to_blob(list_id)
+            ],
+            |row| row.get::<_, Vec<u8>>(0),
+        )?
+        .collect::<std::result::Result<Vec<_>, _>>()?
+        .into_iter()
+        .map(|b| crate::outline::uuid_blob::blob_to_uuid_sql(&b))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    drop(stmt);
+
+    for child_id in child_ids {
+        copy_node_subtree(conn, child_id, list_id, Some(new_id), None)?;
+    }
+    Ok(new_id)
 }
 
 fn copy_managed_node_recursive(
