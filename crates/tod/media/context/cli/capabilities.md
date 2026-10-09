@@ -12,6 +12,7 @@ tod-cli --data-root <DATA_ROOT> capabilities set     <NODE> files [--dir <PATH>]
 tod-cli --data-root <DATA_ROOT> capabilities set     <NODE> ticket [--ticket <ID>] [--pr <URL>]...
 tod-cli --data-root <DATA_ROOT> capabilities set     <NODE> tags (--tags <A,B,..> | --add <TAG> | --remove <TAG>)
 tod-cli --data-root <DATA_ROOT> capabilities set     <NODE> generator --source <TYPE> --config <JSON>
+tod-cli --data-root <DATA_ROOT> capabilities set     <NODE> lifecycle-config (--phase <PHASE> --skills <A,B,..> | --clear <PHASE>)
 ```
 
 `<NODE>` is a slug or full UUID. `enable` adds capabilities with their
@@ -21,6 +22,13 @@ list) and needs the capability enabled first. A node is at most one ticket:
 `--ticket` replaces it, and related tickets go in the node's notes.
 Refreshing a generator updates every node that is one of its tickets,
 wherever that node came from.
+
+`lifecycle-config` sets the skills the agent for a phase uses, for the node and
+everything below it. `<PHASE>` is one of proposed, design, planning, implement,
+verify, review, fix, pr, merged, released, learn. `--skills` replaces that
+phase's list (`--skills ''` means none, even where an ancestor sets some);
+`--clear` removes the phase from this node so the nearest ancestor's applies
+again. Other phases are untouched.
 
 `files --container` runs the node's agents, terminals, and git in that
 running dev container (`--container ''` moves them back to this machine).

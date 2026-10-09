@@ -13,6 +13,7 @@ pub enum Capability {
     Files,
     Ticket,
     Environment,
+    LifecycleConfig,
 }
 
 impl Capability {
@@ -26,6 +27,7 @@ impl Capability {
             Self::Files => "files",
             Self::Ticket => "ticket",
             Self::Environment => "environment",
+            Self::LifecycleConfig => "lifecycle_config",
         }
     }
 
@@ -39,17 +41,19 @@ impl Capability {
             "files" => Some(Self::Files),
             "ticket" => Some(Self::Ticket),
             "environment" => Some(Self::Environment),
+            "lifecycle_config" | "lifecycle-config" => Some(Self::LifecycleConfig),
             _ => None,
         }
     }
 
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::Spec,
         Self::Lifecycle,
         Self::Agent,
         Self::Files,
         Self::Ticket,
         Self::Environment,
+        Self::LifecycleConfig,
         Self::Generator,
         Self::Tags,
     ];
@@ -64,6 +68,7 @@ impl Capability {
             Self::Files => "Files",
             Self::Ticket => "Ticket",
             Self::Environment => "Environment",
+            Self::LifecycleConfig => "Lifecycle config",
         }
     }
 
@@ -79,6 +84,7 @@ impl Capability {
             }
             Self::Tags => "Freeform labels for organizing and filtering nodes",
             Self::Environment => "Variables and credentials the agents working below this node can use",
+            Self::LifecycleConfig => "Skills the agent for each lifecycle phase uses, for this node and everything below it",
         }
     }
 
@@ -103,6 +109,9 @@ impl Capability {
             Self::Tags => "Disabling Tags will remove this node's tags.",
             Self::Environment => {
                 "Disabling Environment will remove the variables and credentials defined on this node."
+            }
+            Self::LifecycleConfig => {
+                "Disabling Lifecycle config will remove the per-phase skills set on this node."
             }
         }
     }

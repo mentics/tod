@@ -111,6 +111,11 @@ pub enum OutlineMutation {
         node_id: Uuid,
         entries: Vec<crate::environment::Entry>,
     },
+    /// The Lifecycle config capability's skills by phase.
+    SetNodeLifecycleConfig {
+        node_id: Uuid,
+        skills: crate::lifecycle_config::Skills,
+    },
     CreateObligation {
         obligation_id: Option<Uuid>,
         node_id: Uuid,
@@ -422,6 +427,7 @@ impl OutlineMutation {
                 | OutlineMutation::SetNodeTicket { .. }
                 | OutlineMutation::SetNodeTags { .. }
                 | OutlineMutation::SetNodeEnvironment { .. }
+                | OutlineMutation::SetNodeLifecycleConfig { .. }
                 | OutlineMutation::UpdateNodeTitle { .. }
                 | OutlineMutation::ReorderSibling { .. }
                 | OutlineMutation::ReparentNode { .. }
@@ -605,6 +611,10 @@ impl OutlineMutation {
             OutlineMutation::SetNodeEnvironment { node_id, entries } => {
                 require_capability(conn, *node_id, Capability::Environment)?;
                 crate::environment::set_entries(conn, *node_id, entries)?;
+            }
+            OutlineMutation::SetNodeLifecycleConfig { node_id, skills } => {
+                require_capability(conn, *node_id, Capability::LifecycleConfig)?;
+                crate::lifecycle_config::set_skills(conn, *node_id, skills)?;
             }
             OutlineMutation::CreateObligation {
                 obligation_id,
@@ -1788,6 +1798,12 @@ fn copy_capabilities(conn: &Connection, source_id: Uuid, new_id: Uuid) -> Result
                 let entries = crate::environment::entries(conn, source_id)?;
                 if !entries.is_empty() {
                     crate::environment::set_entries(conn, new_id, &entries)?;
+                }
+            }
+            Capability::LifecycleConfig => {
+                let skills = crate::lifecycle_config::skills(conn, source_id)?;
+                if !skills.is_empty() {
+                    crate::lifecycle_config::set_skills(conn, new_id, &skills)?;
                 }
             }
             Capability::Generator => {

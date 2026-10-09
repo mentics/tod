@@ -28,6 +28,7 @@ pub mod context_recipes;
 pub mod conversation;
 pub mod dynamic;
 pub mod environment_context;
+pub mod skills_context;
 pub mod environment_request;
 pub mod fuzzy;
 pub mod gate;

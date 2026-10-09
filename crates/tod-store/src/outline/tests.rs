@@ -2690,3 +2690,116 @@ fn copy_node_subtree_copies_capability_settings_and_obligations() {
     drop(store);
     let _ = fs::remove_dir_all(root);
 }
+
+#[test]
+fn lifecycle_config_resolves_per_phase_from_the_nearest_node() {
+    use crate::lifecycle_config::{self, Skills};
+    let (store, root, list_id) = setup_store_with_list();
+    let top = create_node_in(&store, list_id, None, "Top");
+    let mid = create_node_in(&store, list_id, Some(top), "Mid");
+    let leaf = create_node_in(&store, list_id, Some(mid), "Leaf");
+    for node in [top, mid] {
+        store
+            .enqueue_outline(OutlineMutation::EnableCapabilities {
+                node_id: node,
+                capabilities: vec![Capability::LifecycleConfig],
+            })
+            .unwrap();
+    }
+    store.writer().flush().unwrap();
+    let skills = |pairs: &[(&str, &[&str])]| -> Skills {
+        pairs
+            .iter()
+            .map(|(p, s)| (p.to_string(), s.iter().map(|n| n.to_string()).collect()))
+            .collect()
+    };
+    for (node, config) in [
+        (top, skills(&[("review", &["a", " b ", "a", ""]), ("learn", &["l"])])),
+        (mid, skills(&[("review", &[])])),
+    ] {
+        store
+            .enqueue_outline(OutlineMutation::SetNodeLifecycleConfig { node_id: node, skills: config })
+            .unwrap();
+    }
+    // An unknown phase is refused.
+    store.writer().flush().unwrap();
+    assert!(
+        store
+            .enqueue_outline(OutlineMutation::SetNodeLifecycleConfig {
+                node_id: top,
+                skills: skills(&[("ready", &["x"])]),
+            })
+            .is_err()
+    );
+
+    store
+        .read(|conn| {
+            let top_skills = lifecycle_config::skills(conn, top)?;
+            assert_eq!(top_skills["review"], ["a", "b"], "trimmed and de-duplicated");
+            assert!(!top_skills.contains_key("ready"));
+            // An empty list overrides the ancestor's, only for its phase.
+            let review = lifecycle_config::resolve(conn, leaf, "review")?.unwrap();
+            assert!(review.skills.is_empty());
+            assert_eq!((review.source_node, review.inherited), (mid, true));
+            let learn = lifecycle_config::resolve(conn, leaf, "learn")?.unwrap();
+            assert_eq!(learn.skills, ["l"]);
+            assert_eq!(learn.source_node, top);
+            assert!(lifecycle_config::resolve(conn, leaf, "design")?.is_none());
+            Ok(())
+        })
+        .unwrap();
+
+    // Disabling removes the node's skills, so the ancestor's apply again.
+    store
+        .enqueue_outline(OutlineMutation::DisableCapability { node_id: mid, capability: Capability::LifecycleConfig })
+        .unwrap();
+    store.writer().flush().unwrap();
+    store
+        .read(|conn| {
+            let review = lifecycle_config::resolve(conn, leaf, "review")?.unwrap();
+            assert_eq!(review.skills, ["a", "b"]);
+            assert_eq!(review.source_node, top);
+            Ok(())
+        })
+        .unwrap();
+
+    drop(store);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn lifecycle_config_is_copied_with_a_subtree() {
+    let (store, root, list_id) = setup_store_with_list();
+    let src = create_node_in(&store, list_id, None, "Source");
+    store
+        .enqueue_outline(OutlineMutation::EnableCapabilities {
+            node_id: src,
+            capabilities: vec![Capability::LifecycleConfig],
+        })
+        .unwrap();
+    store.writer().flush().unwrap();
+    store
+        .enqueue_outline(OutlineMutation::SetNodeLifecycleConfig {
+            node_id: src,
+            skills: [("fix".to_string(), vec!["f".to_string()])].into(),
+        })
+        .unwrap();
+    store
+        .enqueue_outline(OutlineMutation::CopyNodeSubtree {
+            source_node_id: src,
+            list_id,
+            parent_id: None,
+            ordinal: 9,
+        })
+        .unwrap();
+    store.writer().flush().unwrap();
+    store
+        .read(|conn| {
+            let rows: i64 = conn.query_row("SELECT COUNT(*) FROM node_lifecycle_config WHERE skills LIKE '%\"f\"%'", [], |r| r.get(0))?;
+            assert_eq!(rows, 2);
+            Ok(())
+        })
+        .unwrap();
+    drop(store);
+    let _ = fs::remove_dir_all(root);
+}

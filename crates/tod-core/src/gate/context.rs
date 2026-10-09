@@ -50,6 +50,8 @@ pub struct GateCheckRequest<'a> {
     /// `tod_core::node_context::render_work_history`. Only the `learn`
     /// retrospective is given it; empty for every other state.
     pub work_history: String,
+    /// The skills block for the state's phase (`crate::skills_context`).
+    pub skills: String,
     pub from_state: String,
     pub to_state: String,
     /// Criteria for this transition paired with the node's most recent
@@ -106,6 +108,7 @@ fn dynamic_context<'a>(
         ancestor_context: &request.ancestor_context,
         plan_steps: &request.plan_steps,
         work_history: &request.work_history,
+        skills: &request.skills,
         ..Default::default()
     }
 }
@@ -127,6 +130,7 @@ mod tests {
             ancestor_context: String::new(),
             plan_steps: Vec::new(),
             work_history: String::new(),
+            skills: String::new(),
             from_state: "design".into(),
             to_state: "planning".into(),
             criteria: Vec::new(),

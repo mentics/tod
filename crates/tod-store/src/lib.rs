@@ -5,6 +5,7 @@ pub mod conversation;
 pub mod credentials;
 pub mod decisions;
 pub mod environment;
+pub mod lifecycle_config;
 pub mod environment_presets;
 pub mod fleet;
 pub mod incoming;
