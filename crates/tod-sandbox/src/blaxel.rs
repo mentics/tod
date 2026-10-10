@@ -77,7 +77,8 @@ pub struct NewSandbox<'a> {
     pub region: &'a str,
     pub memory_mb: u32,
     pub labels: &'a [(&'a str, &'a str)],
-    /// `spec.network.proxy` (see `node::proxy_spec`); fixed at creation.
+    /// `spec.network.proxy` (see `node::proxy_spec`). Its presence is fixed at creation; the
+    /// rules and secrets can be replaced later ([`Blaxel::update_proxy`]).
     pub proxy: Option<&'a Value>,
 }
 
@@ -130,6 +131,24 @@ fn parse_drive(v: &Value) -> DriveInfo {
         region: v["spec"]["region"].as_str().unwrap_or_default().to_string(),
         s3_url: v["state"]["s3Url"].as_str().map(str::to_string),
     }
+}
+
+/// The body of a `PUT /sandboxes/<name>` that sets `proxy` and `labels` on
+/// `current` (its `GET` record) and nothing else. `PUT` replaces the whole
+/// spec: a body of only the network clears `runtime.image` and the sandbox
+/// ends `FAILED`, so everything else `GET` returned goes back. Env values come
+/// back masked (`****`), which Blaxel keeps as they are.
+fn update_proxy_body(current: &Value, proxy: &Value, labels: &[(&str, &str)]) -> Value {
+    let mut spec = current["spec"].clone();
+    if !spec["network"].is_object() {
+        spec["network"] = json!({});
+    }
+    spec["network"]["proxy"] = proxy.clone();
+    let mut merged = current["metadata"]["labels"].as_object().cloned().unwrap_or_default();
+    for (k, v) in labels {
+        merged.insert(k.to_string(), json!(v));
+    }
+    json!({ "metadata": { "name": current["metadata"]["name"], "labels": merged }, "spec": spec })
 }
 
 fn check(resp:&mut ureq::http::Response<ureq::Body>, what: &str) -> Result<()> {
@@ -248,6 +267,20 @@ impl Blaxel {
         }
         check(&mut resp, what)?;
         Ok(Some(resp.body_mut().read_json()?))
+    }
+
+    /// Replaces the proxy rules (and their secrets) of a sandbox that is
+    /// running, and sets `labels` on it, without redeploying it: measured, the
+    /// new secret is in effect within a second, the status stays `DEPLOYED`,
+    /// and the disk and processes are untouched. `proxy` is `node::proxy_spec`
+    /// with **every** rule and secret value wanted afterwards (the update
+    /// replaces the whole `network`, and a `GET` never returns secret values).
+    /// The proxy itself cannot be turned on or off this way: only a sandbox
+    /// made with one can take it.
+    pub fn update_proxy(&self, name: &str, proxy: &Value, labels: &[(&str, &str)]) -> Result<()> {
+        let current = self.get_json(name)?.ok_or_else(|| anyhow::anyhow!("no sandbox named {name}"))?;
+        let body = update_proxy_body(&current, proxy, labels);
+        self.put_json(&format!("/sandboxes/{name}"), &body, "update the sandbox's proxy")
     }
 
     /// `PUT {API}{path}` with a JSON body, for calls this type has no method for.
@@ -690,6 +723,26 @@ pub fn jwt_expiry(token: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_proxy_update_keeps_the_rest_of_the_spec() {
+        let current = json!({
+            "metadata": { "name": "s", "labels": { "tod": "1", "tod-creds": "old" }, "url": "https://x" },
+            "spec": {
+                "region": "us-pdx-1",
+                "runtime": { "image": "img", "memory": 2048, "envs": [{ "name": "A", "value": "****" }] },
+                "network": { "allowedDomains": ["a.com"], "proxy": { "routing": [] } },
+            },
+        });
+        let proxy = json!({ "enabled": true, "routing": [{ "destinations": ["h"] }] });
+        let body = update_proxy_body(&current, &proxy, &[("tod-creds", "new")]);
+        assert_eq!(body["spec"]["runtime"], current["spec"]["runtime"], "a PUT without the image fails the sandbox");
+        assert_eq!(body["spec"]["region"], "us-pdx-1");
+        assert_eq!(body["spec"]["network"]["allowedDomains"], json!(["a.com"]));
+        assert_eq!(body["spec"]["network"]["proxy"], proxy);
+        assert_eq!(body["metadata"]["labels"], json!({ "tod": "1", "tod-creds": "new" }));
+        assert_eq!(body["metadata"]["name"], "s");
+    }
 
     #[test]
     fn schedules_are_found_by_their_process_name() {

@@ -74,8 +74,8 @@ pub struct NodeCredentials {
 
 /// The label a node sandbox carries with [`env_fingerprint`] of the custom
 /// credentials its proxy was made with, so the app can tell when the user's
-/// Environment has a credential the proxy lacks (proxy rules are fixed when
-/// the sandbox is created).
+/// Environment has a credential the proxy lacks (tod does not yet update an
+/// autonomous node's proxy in place, as it does a Files sandbox's).
 pub const ENV_LABEL: &str = "tod-env";
 
 /// A short fingerprint of `custom` (names, hosts, header, template, and
@@ -418,8 +418,8 @@ pub fn create_body(spec: &NodeSandboxSpec, creds: &NodeCredentials) -> Value {
     })
 }
 
-/// Creates a node's sandbox. The proxy cannot be added later, so this is the
-/// only way a node's sandbox is made. Wait with [`Blaxel::wait_deployed`].
+/// Creates a node's sandbox. The proxy cannot be added later, so a node's
+/// sandbox is always made with one. Wait with [`Blaxel::wait_deployed`].
 pub fn create(bx: &Blaxel, spec: &NodeSandboxSpec, creds: &NodeCredentials) -> Result<()> {
     bx.create_from_body(&create_body(spec, creds))
 }

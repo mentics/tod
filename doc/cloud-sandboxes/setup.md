@@ -337,5 +337,8 @@ the placeholder, `GH_TOKEN` a placeholder, `TOD_GITHUB_AUTH=proxy`, and
 `NODE_USE_ENV_PROXY=1`; with `"env"` it gets the real token on the agent
 process alone (never stored in the sandbox). A missing token just leaves its
 rule out, with a warning. The sandbox carries a `tod-creds` label, a hash of
-every rule and secret, so a credential changed or added later recreates the
-sandbox (after pushing its branch, asking first when work would be lost).
+every rule and secret, so a credential changed or added later replaces the
+proxy's rules in place (Blaxel's network update: in effect within a second,
+no restart, nothing lost). Only a sandbox made without any proxy, which can
+never get one, is recreated instead (after pushing its branch, asking first
+when work would be lost).
