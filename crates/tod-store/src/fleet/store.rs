@@ -93,6 +93,20 @@ impl FleetStore {
     /// is responsible for calling [`Self::run_launch_hooks`] at some point afterward so stale
     /// agent/shell runtime status eventually gets reconciled.
     pub fn open_without_reattach(root: impl AsRef<Path>) -> Result<Self, FleetLaunchError> {
+        Self::open_inner(root, true)
+    }
+
+    /// Open without the thread that reloads the read projection after each
+    /// commit. For tests that only write and read the database directly: the
+    /// reload rebuilds the whole projection every time, which dominates them.
+    #[cfg(test)]
+    pub(crate) fn open_without_reload(root: impl AsRef<Path>) -> Result<Self, FleetLaunchError> {
+        let store = Self::open_inner(root, false)?;
+        store.run_launch_hooks(&NoopGuestLiveness)?;
+        Ok(store)
+    }
+
+    fn open_inner(root: impl AsRef<Path>, reload: bool) -> Result<Self, FleetLaunchError> {
         let paths = FleetPaths::new(root)?;
         // The lock comes first: recovery and migrations write, and only the
         // one store that owns the database may.
@@ -113,11 +127,13 @@ impl FleetStore {
         ));
         let change_tx = projection.lock().expect("fleet projection mutex").change_sender();
         let background_shutdown = Arc::new(AtomicBool::new(false));
-        crate::fleet::projection::spawn_commit_reloader(
-            projection.clone(),
-            writer.commit_notify(),
-            background_shutdown.clone(),
-        );
+        if reload {
+            crate::fleet::projection::spawn_commit_reloader(
+                projection.clone(),
+                writer.commit_notify(),
+                background_shutdown.clone(),
+            );
+        }
 
         Ok(Self {
             paths,
