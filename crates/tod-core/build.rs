@@ -55,19 +55,36 @@ fn emit_git_identity(manifest_dir: &Path) {
     println!("cargo:rustc-env=TOD_GIT_COMMIT={commit}");
     println!("cargo:rustc-env=TOD_GIT_DIRTY={dirty}");
 
-    // Rerun only when HEAD (or the ref/commit it points to) changes, not on
-    // every build.
-    if let Some(git_dir) = find_git_dir(manifest_dir) {
-        let head = git_dir.join("HEAD");
-        if head.is_file() {
-            println!("cargo:rerun-if-changed={}", head.display());
-            if let Ok(contents) = std::fs::read_to_string(&head) {
-                if let Some(rest) = contents.trim().strip_prefix("ref: ") {
-                    let ref_path = git_dir.join(rest);
-                    println!("cargo:rerun-if-changed={}", ref_path.display());
-                }
-            }
-        }
+    // A release build records the commit it was made from, so rerun when HEAD
+    // moves. A dev build does not: a commit would otherwise recompile this
+    // crate and everything above it, and the stamp above already reruns this
+    // script whenever the source changes, which is when the commit matters.
+    if std::env::var("PROFILE").is_ok_and(|p| p == "release") {
+        track_git_head(manifest_dir);
+    }
+}
+
+/// Reruns the build script when HEAD, or the ref it points to, changes. Paths
+/// come from `git rev-parse --git-path`, so they are right in a linked
+/// worktree (whose refs live in the common git dir, not its own) and a ref
+/// that is only in `packed-refs` is not a missing file that is always dirty.
+fn track_git_head(dir: &Path) {
+    let path_of = |what: &str| -> Option<PathBuf> {
+        let out = run_git(dir, &["rev-parse", "--git-path", what])?;
+        let path = PathBuf::from(out.trim());
+        Some(if path.is_absolute() { path } else { dir.join(path) })
+    };
+    if let Some(head) = path_of("HEAD").filter(|p| p.is_file()) {
+        println!("cargo:rerun-if-changed={}", head.display());
+    }
+    let Some(branch) = run_git(dir, &["symbolic-ref", "-q", "HEAD"]) else {
+        return;
+    };
+    if let Some(reference) = path_of(branch.trim()).filter(|p| p.is_file()) {
+        println!("cargo:rerun-if-changed={}", reference.display());
+    }
+    if let Some(packed) = path_of("packed-refs").filter(|p| p.is_file()) {
+        println!("cargo:rerun-if-changed={}", packed.display());
     }
 }
 
@@ -82,33 +99,6 @@ fn run_git(dir: &Path, args: &[&str]) -> Option<String> {
         return None;
     }
     String::from_utf8(output.stdout).ok()
-}
-
-/// Locates the `.git` directory for `dir`, following `.git` files used by
-/// worktrees (which contain `gitdir: <path>`) up to a real directory.
-fn find_git_dir(dir: &Path) -> Option<PathBuf> {
-    let mut current = Some(dir.to_path_buf());
-    while let Some(d) = current {
-        let candidate = d.join(".git");
-        if candidate.is_dir() {
-            return Some(candidate);
-        }
-        if candidate.is_file() {
-            if let Ok(contents) = std::fs::read_to_string(&candidate) {
-                if let Some(rest) = contents.trim().strip_prefix("gitdir: ") {
-                    let gitdir = PathBuf::from(rest);
-                    let gitdir = if gitdir.is_absolute() {
-                        gitdir
-                    } else {
-                        d.join(gitdir)
-                    };
-                    return Some(gitdir);
-                }
-            }
-        }
-        current = d.parent().map(Path::to_path_buf);
-    }
-    None
 }
 
 fn collect(path: &Path, out: &mut Vec<PathBuf>) {

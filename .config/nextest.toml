@@ -1,0 +1,6 @@
+# `cargo nextest run --workspace` runs every test in its own process, all
+# binaries at once, which is several times faster than `cargo test` (one
+# binary after another). Hung tests (a spawned process, a port, a wait on
+# stdin) are killed after three minutes instead of blocking the run.
+[profile.default]
+slow-timeout = { period = "60s", terminate-after = 3 }
