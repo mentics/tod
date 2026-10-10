@@ -63,8 +63,12 @@ pub fn peek_user_version(path: &Path) -> Result<i32> {
 /// Copy a fleet database using the SQLite Online Backup API, a few pages
 /// at a time with a pause between (so a live database's writers are not
 /// held off for the whole copy): about 40 s for an 8 MB database.
+///
+/// The pause protects a live database's writers, so this crate's own tests,
+/// which copy idle ones, do without it (it made each take several seconds).
 pub fn backup_database(from: &Path, to: &Path) -> Result<()> {
-    copy_with_backup(from, to, 5, Duration::from_millis(100))
+    let pause = if cfg!(test) { Duration::ZERO } else { Duration::from_millis(100) };
+    copy_with_backup(from, to, 5, pause)
 }
 
 /// Copy a fleet database in one step of the SQLite Online Backup API
