@@ -169,6 +169,8 @@ pub enum Refresh {
     /// The node has no live cloud sandbox, or its proxy already has every
     /// credential the Environment defines.
     NotNeeded,
+    /// The sandbox's proxy was given the credentials in place (its name).
+    Updated(String),
     /// The sandbox was deleted and made again with the credentials.
     Recreated(String),
     /// It was left alone because deleting it could lose work; the text says
@@ -182,10 +184,11 @@ pub fn proxy_is_current(info: &SandboxInfo, custom: &[tod_sandbox::node::CustomC
     tod_store::fleet::sandbox::proxy_is_current(info, custom)
 }
 
-/// Proxy rules are fixed when a sandbox is created, so a credential the user
-/// provides (or changes) after that does not reach a node already running in
-/// the cloud. When `node_id` has a live sandbox whose proxy differs from the
-/// node's Environment, push its branch and delete the sandbox, then make it
+/// A credential the user provides (or changes) after a node's sandbox was
+/// made does not reach its proxy by itself. A Files sandbox's proxy is updated
+/// in place ([`Refresh::Updated`]). For an autonomous node, when its live
+/// sandbox's proxy differs from the node's Environment, push its branch and
+/// delete the sandbox, then make it
 /// again through [`ensure_node_sandbox`] (as for a lost sandbox). Uncommitted
 /// changes or a failed push make it [`Refresh::NeedsConfirmation`] unless
 /// `force`. Blocks on the network: never on the UI thread.
@@ -198,6 +201,10 @@ pub fn refresh_credentials(fleet: &FleetStore, node_id: &str, force: bool) -> Re
         let mut progress = |msg: &str| tracing::info!("files sandbox for {node_id}: {msg}");
         return Ok(match tod_store::fleet::provision::refresh_sandbox_proxy(fleet, node_id, force, &mut progress)? {
             SandboxRefresh::NotNeeded => Refresh::NotNeeded,
+            SandboxRefresh::Updated(name) => {
+                set_note(node_id, Some(format!("Updated {name}'s proxy with the node's credentials.")));
+                Refresh::Updated(name)
+            }
             SandboxRefresh::Recreated(name) => {
                 set_note(node_id, Some(format!("Recreated {name} with the node's credentials.")));
                 Refresh::Recreated(name)

@@ -221,8 +221,8 @@ impl Sandboxes {
     /// [`Self::node_credentials`]: the user's GitHub, Linear, and Claude
     /// tokens as autonomous nodes get them, and the node's Environment
     /// secrets with hosts), so the agent calls those hosts without ever
-    /// holding the value. Proxy rules are fixed when a sandbox is made,
-    /// and a fork carries its source's proxy and cannot be given another, so
+    /// holding the value. A fork carries its source's proxy and, being
+    /// made rather than updated, cannot be given another, so
     /// with credentials a fork source is made from the source's image
     /// instead (the image must hold the repository, as a fork's source
     /// does). The sandbox is labelled [`tod_sandbox::node::CREDS_LABEL`] with

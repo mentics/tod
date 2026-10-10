@@ -284,6 +284,8 @@ fn sandbox_proxy_credentials(
 pub enum SandboxRefresh {
     /// No live sandbox of its own, or its proxy already has every credential.
     NotNeeded,
+    /// Its proxy rules were replaced in place (this is the sandbox's name).
+    Updated(String),
     /// Deleted and made again (this is the new one's name).
     Recreated(String),
     /// Left alone because deleting it could lose work; `force` goes on.
@@ -291,13 +293,20 @@ pub enum SandboxRefresh {
 }
 
 /// A node's own Files sandbox has the proxy it was made with, so a credential
-/// provided or changed afterwards does not reach it. When its `tod-env` label
-/// differs from the node's Environment: push its branch (uncommitted changes
-/// or a failed push need `force`), delete it, forget the location, and make
-/// it again ([`resolve_launch_cwd_with`]), which puts the current credentials
-/// in the new proxy. The node keeps its own sandbox and branch. Anything
-/// running inside it (an agent) is gone: the caller closes its live sessions.
-/// Blocks on the network and git: never on the UI thread.
+/// provided or changed afterwards does not reach it. When its `tod-creds`
+/// label differs from the node's credentials, its proxy rules are replaced in
+/// place ([`Blaxel::update_proxy`]): the new secrets are in effect within a
+/// second, and the checkout, the processes, and the sandbox's name and URL
+/// are untouched, so nothing is lost and nothing needs confirming.
+///
+/// Only when that update is refused (a sandbox made without a proxy cannot
+/// take one) does it fall back to deleting the sandbox and making it again:
+/// push its branch (uncommitted changes or a failed push need `force`),
+/// delete it, forget the location, and make it again
+/// ([`resolve_launch_cwd_with`]). Anything running inside it is then gone.
+/// Either way the caller closes the node's live agent sessions, since an
+/// agent's environment depends on which credentials exist. Blocks on the
+/// network and git: never on the UI thread.
 pub fn refresh_sandbox_proxy(
     fleet: &FleetStore,
     node_id: &str,
@@ -324,6 +333,23 @@ pub fn refresh_sandbox_proxy(
     }
     let lock = node_lock(node_id);
     let _held = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    // A sandbox made with a proxy takes new rules in place; one made without
+    // cannot get a proxy at all, so only that one is made again.
+    let has_proxy = bx
+        .get_json(&name)?
+        .is_some_and(|record| record["spec"]["network"]["proxy"].is_object());
+    if has_proxy {
+        let rules = tod_sandbox::node::credential_rules(&creds, sandboxes.claude_token_via());
+        let fingerprint = tod_sandbox::node::rules_fingerprint(&rules);
+        progress(&format!("updating {name}'s proxy with the node's credentials…"));
+        bx.update_proxy(
+            &name,
+            &tod_sandbox::node::proxy_spec(&rules),
+            &[(tod_sandbox::node::CREDS_LABEL, fingerprint.as_str())],
+        )
+        .with_context(|| format!("update sandbox {name}'s proxy"))?;
+        return Ok(SandboxRefresh::Updated(name));
+    }
     if let Some(dir) = location.directory() {
         // Work the delete would lose: uncommitted files, or a branch that
         // will not push. The agent itself is running here, so a blocker

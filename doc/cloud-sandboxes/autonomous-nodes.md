@@ -491,8 +491,9 @@ Blaxel's options:
 - **Environment variables** (`envs` at creation, or updated on a running
   sandbox for new processes) are visible to anything in the sandbox,
   including the agent.
-- **Proxy routing with secrets injection** (public preview; set when the
-  sandbox is created, in `spec.network.proxy`, and cannot be added later):
+- **Proxy routing with secrets injection** (public preview; in `spec.network.proxy`.
+  A sandbox gets a proxy only when it is created, but its rules and secrets
+  can be replaced while it runs: see "Rotating a running sandbox's secrets"):
   all outbound traffic goes through Blaxel's proxy, which intercepts TLS and
   adds headers (or JSON body fields) per destination domain. Secrets are given
   with the rule and referenced as `{{SECRET:name}}`; the stored spec omits
@@ -616,9 +617,11 @@ The plan:
   "Run in the cloud" and the replacement of a lost sandbox fail before
   creating anything when no token is stored and the node would run Claude
   (anything but `TOD_CLOUD_AGENT=mock`), naming the Settings row.
-  **A token changed later** reaches a node when its sandbox is next created
-  (a replacement, or running it in the cloud again after deleting it): proxy
-  rules cannot be changed after creation. With `env`, it is passed at every
+  **A token changed later** reaches a Files sandbox in place
+  (`provision::refresh_sandbox_proxy`, `Blaxel::update_proxy`). It reaches an
+  autonomous node's sandbox only when that is next created (a replacement, or
+  running it in the cloud again after deleting it): tod does not yet update
+  those in place, though Blaxel allows it. With `env`, it is passed at every
   provisioning, so it also reaches the supervisor's next start after the
   node is run in the cloud again.
 
@@ -774,30 +777,41 @@ chosen per account in `sandboxes.toml`, so the same code runs everywhere:
    reaped, one per session); afterwards nothing but the sandbox API and the
    relay, no zombies. Existing sandboxes, created without the proxy, cannot
    get it (Blaxel: the proxy can be neither enabled nor fully disabled after
-   creation).
+   creation); its rules and secrets can be replaced.
 
-   **Rotating a running sandbox's secrets** (2026-09-28). Blaxel documents
-   it (SDK `updateNetwork`; REST `PUT /v0/sandboxes/<name>`): the update
-   **replaces the whole network configuration**, so every rule and every
-   secret must be sent again (secrets are write-only: `GET` returns the
-   header templates, never the values, and shows every env value as
-   `****`). Tried on a mock node's running sandbox, adding a dummy rule
-   (`httpbin.org`, `X-Tod-Probe: {{SECRET:probe}}`) with a body of only
-   `metadata.name` and `spec.network.proxy` (the node's own rules and
-   credentials unchanged): accepted in 0.2 s and stored, but it is a **full
-   spec replace and a redeploy**, not a hot update. The events show "Update
-   deployment", then "Deployment has failed" 7 s later: the partial spec
-   had cleared `runtime.image` (to `""`), reset `memory` to 1024, and
-   dropped the relay's port (the env names were kept). A request through
-   the proxy in the second before the redeploy did not yet carry the new
-   header. So rotating needs the complete create body (`node::create_body`,
-   with every credential) and redeploys the sandbox. Whether a full-body
-   update keeps the sandbox's disk and processes (the checkout, `/opt/tod`,
-   the supervisor's replica) is untested: it means sending the real
-   credentials again, which was not approved for this run. Until then tod
-   does not rotate: a token replaced in Settings reaches a node when its
-   sandbox is next created ("Stop running in the cloud", then "Run in the
-   cloud").
+   **Rotating a running sandbox's secrets** (2026-09-28, redone 2026-10-07).
+   Blaxel documents it (SDK `updateNetwork`; REST `PUT /v0/sandboxes/<name>`):
+   the update **replaces the whole network configuration**, so every rule and
+   every secret must be sent again (secrets are write-only: `GET` returns the
+   header templates, never the values, and shows every env value as `****`).
+   **The body must be the sandbox's whole spec, not only the network.** The
+   docs' curl example sends `metadata.name` and `spec.network` alone; on
+   2026-09-28 that was accepted in 0.2 s and the sandbox then went `FAILED`:
+   the partial spec had cleared `runtime.image` (to `""`), reset `memory` to
+   1024, and dropped the relay's port. The Blaxel SDK avoids this by fetching
+   the sandbox and merging; `Blaxel::update_proxy` does the same (`GET`, set
+   `spec.network.proxy` and the labels, `PUT` the lot back).
+
+   Measured on 2026-10-07 (`testspace-358401`, a `blaxel/base-image` sandbox
+   with a rule adding `X-Tod-Test: {{SECRET:k}}` for `httpbin.org`, probed
+   from inside every ~0.4 s through the proxy), with the full spec:
+
+   | Check | Result |
+   |---|---|
+   | `PUT` | 200 in 0.23 s |
+   | first request after it | already carried the **new** secret (the first probe, 0.6 s after the `PUT` was sent); the old value was never seen again |
+   | sandbox status | `DEPLOYED` in every poll for 9 s: no redeploy, no unavailable window |
+   | process started before the update | still running afterwards |
+   | files in `/root` and `/tmp` | still there (a second run) |
+   | an env var set at creation, `PUT` back as the masked `****` from `GET`, and with `envs` omitted | kept its real value either way |
+   | labels in the same `PUT` | applied |
+
+   So there is **no delay worth waiting for**: the update is a hot one, and a
+   request made after the `PUT` returns uses the new secret. (The earlier
+   note that it "is a redeploy" came from the failed partial body.) Not
+   measured: a sandbox with a proxy bypass list or other `network` keys
+   (`update_proxy` keeps them), and the supervisor's replica of an
+   autonomous node (tod updates only Files sandboxes this way so far).
 5. **The push service.** ntfy (`ntfy.sh`; see `orchestrator.md`, "Telling
    the app"). Measured 2026-09-28 from this machine (US West) against the
    development orchestrator (`us-was-1`), with a subscriber held the way

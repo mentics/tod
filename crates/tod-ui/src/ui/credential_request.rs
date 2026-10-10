@@ -399,15 +399,17 @@ impl CredentialDialog {
         .detach();
     }
 
-    /// A recreated sandbox took its agent processes with it: drop the live
-    /// sessions of the node's conversations (off the UI thread), so the answer
-    /// that follows starts the agent again and resumes, or rotates.
+    /// A recreated sandbox took its agent processes with it, and an updated
+    /// one's agents were launched with the environment of the old credentials:
+    /// drop the live sessions of the node's conversations (off the UI thread),
+    /// so the answer that follows starts the agent again and resumes, or
+    /// rotates.
     async fn settle(
         this: gpui::WeakEntity<Self>,
         outcome: anyhow::Result<Refresh>,
         cx: &mut gpui::AsyncWindowContext,
     ) {
-        if matches!(outcome, Ok(Refresh::Recreated(_))) {
+        if matches!(outcome, Ok(Refresh::Recreated(_) | Refresh::Updated(_))) {
             let closing = this
                 .update(cx, |this, cx| {
                     let node = this.decision.node_id;
