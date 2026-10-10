@@ -113,6 +113,7 @@ pub fn ensure(bx: &Blaxel, url: &str, payload: &Payload, progress: &mut dyn FnMu
     }
     let mut outcome = Outcome::RelayStarted;
     if current.output().trim() != manifest {
+        check_relay_arch(payload.relay)?;
         progress("installing tod's dependencies in the sandbox (first connect only)…");
         bx.upload(url, &format!("{TOD_DIR}/bootstrap.sh"), payload.bootstrap, "0755")?;
         bx.upload(url, &format!("{RELAY_PATH}.new"), payload.relay, "0755")?;
@@ -154,6 +155,24 @@ pub fn ensure(bx: &Blaxel, url: &str, payload: &Payload, progress: &mut dyn FnMu
             None => std::thread::sleep(Duration::from_millis(500)),
         }
     }
+}
+
+/// Sandboxes are x86-64 Linux. A relay built for anything else (an arm64
+/// Docker build on Apple Silicon, say) uploads fine but cannot run, and shows
+/// up only as the relay never answering.
+fn check_relay_arch(relay: &[u8]) -> Result<()> {
+    const EM_X86_64: u16 = 0x3e;
+    if relay.len() < 20 || &relay[..4] != b"\x7fELF" {
+        bail!("the relay binary is not a Linux (ELF) executable; rebuild it with scripts/build-sandbox-binaries.sh");
+    }
+    let machine = u16::from_le_bytes([relay[18], relay[19]]);
+    if machine != EM_X86_64 {
+        bail!(
+            "the relay binary is built for the wrong architecture (ELF machine {machine:#x}, sandboxes need x86-64); \
+            rebuild it with scripts/build-sandbox-binaries.sh"
+        );
+    }
+    Ok(())
 }
 
 /// The manifest as read through the relay, or `None` if the relay is not reachable.

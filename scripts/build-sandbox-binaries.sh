@@ -78,7 +78,9 @@ docker_run() {
     # .cargo/config.toml links the musl target with rust-lld (for cross
     # builds from other hosts); in the container musl is the host, so the
     # linker is its own C toolchain's (CARGO_TARGET_..._LINKER=cc).
-    MSYS_NO_PATHCONV=1 docker run --rm \
+    # Sandboxes are x86_64 Linux: without --platform, Docker on an arm64 host
+    # (Apple Silicon) runs an arm64 container and builds arm64 binaries.
+    MSYS_NO_PATHCONV=1 docker run --rm --platform linux/amd64 \
         -v "$(host_path "$REPO_ROOT"):/src:ro" \
         -v "$(host_path "$REPO_ROOT/target/sandbox"):/out" \
         -v "$TARGET_VOLUME:/target" \
@@ -132,9 +134,10 @@ if [[ ${#DOCKER_TEST[@]} -gt 0 ]]; then
     exit 0
 fi
 
-# With Docker (and no zigbuild), build every sandbox binary in one container
+# With Docker (preferred over zigbuild, which cannot link OpenSSL for the
+# crates that need it), build every sandbox binary in one container
 # run: one cargo invocation shares the dependency graph.
-if [[ $HAVE_DOCKER == 1 && ( $USE_DOCKER == yes || $HAVE_ZIGBUILD == 0 ) ]]; then
+if [[ $HAVE_DOCKER == 1 ]]; then
     PKGS=""
     BINS=""
     for entry in "${CANDIDATES[@]}"; do
