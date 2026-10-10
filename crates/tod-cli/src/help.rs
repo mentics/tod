@@ -59,7 +59,7 @@ mod tests {
 
     #[test]
     fn a_search_for_lifecycle_finds_how_to_enable_it() {
-        let found = run(&["lifecycle".into()], "");
+        let found = run(&["enable".into(), "lifecycle".into()], "");
         assert!(found.contains("tod-cli capabilities enable"), "{found}");
     }
 

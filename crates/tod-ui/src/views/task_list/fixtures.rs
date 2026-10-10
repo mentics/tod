@@ -11,7 +11,9 @@ pub fn load_tasks_from_store(store: &FleetStore, list_id: Option<Uuid>) -> Vec<T
     let Some(list_id) = list_id else {
         return Vec::new();
     };
-    let rows = store.flatten_outline(list_id).unwrap_or_default();
+    // Every node, so a search reaches those under collapsed parents; the
+    // filter hides them while there is no query.
+    let rows = store.flatten_outline_all(list_id).unwrap_or_default();
     // One list-scoped query per column instead of four per row: agent runtime
     // commits reload this list often, and each per-row call takes the
     // projection mutex.

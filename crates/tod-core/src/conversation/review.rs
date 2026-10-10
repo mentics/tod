@@ -131,6 +131,7 @@ impl Protocol for ReviewProtocol {
                 obligations,
                 ancestor_context,
                 verdicts: super::verify::current_verdicts(fleet, node_id),
+                skills: crate::skills_context::for_node(fleet, node_id, "review"),
             },
             &role_doc,
         )

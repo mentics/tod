@@ -80,6 +80,7 @@ fn main() -> Result<()> {
             plan_steps,
             obligations,
             ancestor_context,
+            skills: String::new(),
             verdicts: {
                 let mut verdicts: Vec<_> = tod_store::verification::VerdictRepo::new(&conn)
                     .latest_for_node(node_id)?

@@ -179,6 +179,7 @@ impl Protocol for ImplementationProtocol {
                 obligations,
                 ancestor_context,
                 verdicts: super::verify::current_verdicts(fleet, node_id),
+                skills: crate::skills_context::for_node(fleet, node_id, "implement"),
             },
         )
     }

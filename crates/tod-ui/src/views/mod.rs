@@ -4,6 +4,7 @@ pub mod cloud_node;
 pub mod command_history;
 pub mod database;
 pub mod environment_editor;
+pub mod lifecycle_config_editor;
 pub use tod_core::linear_import;
 pub mod incoming_check;
 pub mod lifecycle_control;

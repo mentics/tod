@@ -107,6 +107,7 @@ fn field_anchor_id(field: TaskEditField) -> &'static str {
         TaskEditField::Capability(Capability::Generator) => "task-edit-field-cap-generator",
         TaskEditField::Capability(Capability::Tags) => "task-edit-field-cap-tags",
         TaskEditField::Capability(Capability::Environment) => "task-edit-field-cap-environment",
+        TaskEditField::Capability(Capability::LifecycleConfig) => "task-edit-field-cap-lifecycle-config",
         TaskEditField::GeneratorSource => "task-edit-field-gen-source",
         TaskEditField::GeneratorField(_) => "task-edit-field-gen-field",
         TaskEditField::LinearQuery => "task-edit-field-linear-query",
@@ -359,6 +360,8 @@ pub struct TaskEditView {
     /// The store changed; reload what other writers (agents) may have touched.
     pending_live_refresh: bool,
     env_editor: Option<Entity<crate::views::environment_editor::EnvironmentEditor>>,
+    lifecycle_config_editor:
+        Option<Entity<crate::views::lifecycle_config_editor::LifecycleConfigEditor>>,
     /// Hosted in another view (the workbench's Settings column): Left and
     /// Ctrl+Left (`PaneFocusLeft`) go to the host instead of emitting
     /// `FocusTaskList`.
@@ -722,6 +725,7 @@ impl TaskEditView {
             loaded_summary: None,
             pending_live_refresh: false,
             env_editor: None,
+            lifecycle_config_editor: None,
             embedded: false,
             notes: Vec::new(),
             details_collapsed: false,
@@ -1334,6 +1338,9 @@ impl TaskEditView {
         };
         let _ = self.fleet.reload_if_stale();
         if let Some(editor) = &self.env_editor {
+            editor.update(cx, |e, cx| e.reload(cx));
+        }
+        if let Some(editor) = &self.lifecycle_config_editor {
             editor.update(cx, |e, cx| e.reload(cx));
         }
         self.load_summary();
@@ -4826,6 +4833,27 @@ impl TaskEditView {
         Self::render_legend_border_section(border, legend, body)
     }
 
+    fn render_lifecycle_config_section(
+        &self,
+        cap_index: usize,
+        background: gpui::Hsla,
+        border: gpui::Hsla,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let cap = Capability::LifecycleConfig;
+        let enabled = self.capability_enabled(cap);
+        let body = self.lifecycle_config_editor.as_ref().map(|editor| {
+            if let Some(node) = self.node_uuid() {
+                editor.update(cx, |e, cx| e.sync(node, enabled, cx));
+            }
+            editor.clone().into_any_element()
+        });
+        let legend = self
+            .render_section_legend(cap, cap_index, background, cx)
+            .into_any_element();
+        Self::render_legend_border_section(border, legend, body)
+    }
+
     fn render_tags_section(
         &self,
         cap_index: usize,
@@ -6244,6 +6272,9 @@ impl TaskEditView {
             Capability::Environment => self
                 .render_environment_section(cap_index, background, border, cx)
                 .into_any_element(),
+            Capability::LifecycleConfig => self
+                .render_lifecycle_config_section(cap_index, background, border, cx)
+                .into_any_element(),
         }
     }
 
@@ -6289,6 +6320,14 @@ impl Render for TaskEditView {
             let (fleet, root) = (self.fleet.clone(), self.paths.data_root().to_path_buf());
             self.env_editor = Some(cx.new(|cx| {
                 crate::views::environment_editor::EnvironmentEditor::new(fleet, root, node, cx)
+            }));
+        }
+        if self.lifecycle_config_editor.is_none()
+            && let Some(node) = self.node_uuid()
+        {
+            let fleet = self.fleet.clone();
+            self.lifecycle_config_editor = Some(cx.new(|cx| {
+                crate::views::lifecycle_config_editor::LifecycleConfigEditor::new(fleet, node, cx)
             }));
         }
         self.sync_input_tab_stops(cx);

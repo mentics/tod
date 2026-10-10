@@ -708,6 +708,14 @@ impl FleetStore {
             .map_err(Into::into)
     }
 
+    /// Like `flatten_outline`, but also the nodes under collapsed parents.
+    pub fn flatten_outline_all(&self, list_id: uuid::Uuid) -> Result<Vec<FlatNodeRow>> {
+        let guard = self.projection.lock().expect("fleet projection mutex");
+        TreeLoader::new(&guard.connection())
+            .flatten_all(list_id)
+            .map_err(Into::into)
+    }
+
     /// Generator configuration for a node, if it has one.
     pub fn get_generator_config(&self, node_id: uuid::Uuid) -> Result<Option<GeneratorConfig>> {
         let guard = self.projection.lock().expect("fleet projection mutex");

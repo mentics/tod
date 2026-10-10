@@ -157,6 +157,7 @@ pub const IMPLEMENT_SESSION: ContextRecipe = ContextRecipe {
         },
         DynamicBlock::AncestorContext,
         DynamicBlock::ObligationVerdicts,
+        DynamicBlock::ConfiguredSkills,
     ],
 };
 
@@ -218,6 +219,7 @@ pub const REVIEW_SESSION: ContextRecipe = ContextRecipe {
         },
         DynamicBlock::AncestorContext,
         DynamicBlock::ObligationVerdicts,
+        DynamicBlock::ConfiguredSkills,
     ],
 };
 
@@ -279,6 +281,7 @@ pub const FIX_SESSION: ContextRecipe = ContextRecipe {
             note: OWN_OBLIGATIONS_NOTE,
         },
         DynamicBlock::AncestorContext,
+        DynamicBlock::ConfiguredSkills,
     ],
 };
 
@@ -317,6 +320,7 @@ pub const PHASE: ContextRecipe = ContextRecipe {
         DynamicBlock::AncestorContext,
         DynamicBlock::Plan,
         DynamicBlock::WorkHistory,
+        DynamicBlock::ConfiguredSkills,
     ],
 };
 
