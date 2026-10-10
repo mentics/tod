@@ -60,11 +60,13 @@ pub fn launch_for(
     // A token of its own for this container, so `secrets run` starts its
     // command here and not on the host.
     let relay = cli_relay::endpoint_for_container(data_root, &container)?;
+    let mut env = relay.env();
+    env.extend(claude_token_env(data_root)?);
     Ok(Some(DevContainerLaunch {
         container,
         host_dir,
         directory,
-        env: relay.env(),
+        env,
         path_prepend: vec![cli_relay::SHIM_DIR.to_string()],
         files: vec![ContainerFile {
             path: shim_path(),
@@ -72,6 +74,22 @@ pub fn launch_for(
             executable: true,
         }],
     }))
+}
+
+/// The Claude token for an agent in a dev container, only when the user chose
+/// `claude_token_via = "env"` (Settings → Cloud sandboxes): otherwise the
+/// agent uses the Claude sign-in made inside the container. It reaches the
+/// agent process alone, by name (`docker exec -e KEY`), never on a command
+/// line. Reads the credential store: never on the UI thread.
+fn claude_token_env(data_root: &Path) -> Result<Vec<(String, String)>> {
+    let sandboxes = crate::fleet::sandbox::Sandboxes::load(data_root)?;
+    if sandboxes.claude_token_via() != tod_sandbox::config::ClaudeTokenVia::Env {
+        return Ok(Vec::new());
+    }
+    Ok(tod_sandbox::node::agent_env(&sandboxes.node_credentials(Vec::new()), tod_sandbox::config::ClaudeTokenVia::Env)
+        .into_iter()
+        .filter(|(key, _)| key == tod_sandbox::node::CLAUDE_TOKEN_ENV)
+        .collect())
 }
 
 /// The sandbox launch for a process that runs in `cwd`, when that is in a
@@ -179,6 +197,8 @@ mod tests {
             Some("/workspaces/app/.worktrees/x")
         );
         assert_eq!(launch.host_dir, data_root);
+        // Signed in inside the container unless the user chose the token itself.
+        assert!(!launch.env.iter().any(|(k, _)| k == tod_sandbox::node::CLAUDE_TOKEN_ENV));
     }
 
     #[test]

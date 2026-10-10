@@ -4,6 +4,24 @@
 //! is [`crate::ui::item_list`]. Only what a history entry *is* lives here: a
 //! time and what changed, and undoing through it.
 
+use crate::ui::off_thread::off_thread;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Set while an undo runs. The undo log's suppress flag is global, so only one
+/// undo (Ctrl+Z or the history window) may be in flight at a time.
+static UNDO_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+
+/// Claim the undo slot; false if an undo is already running.
+pub(crate) fn begin_undo() -> bool {
+    UNDO_IN_FLIGHT
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+}
+
+pub(crate) fn end_undo() {
+    UNDO_IN_FLIGHT.store(false, Ordering::Release);
+}
+
 use crate::app::HistoryWindowControl;
 use crate::ui::actionable::render_shortcut_pill;
 use crate::ui::item_list::keyboard::{
@@ -185,15 +203,31 @@ impl CommandHistoryView {
     }
 
     fn undo_through(&mut self, id: Uuid, cx: &mut Context<Self>) {
-        match self.fleet.undo_through(id) {
-            Ok(labels) if !labels.is_empty() => {
-                self.status_line = format!("Undid: {}", labels.join(", "));
-            }
-            Ok(_) => self.status_line = "Nothing to undo".into(),
-            Err(err) => self.status_line = format!("Undo failed: {err}"),
+        if !begin_undo() {
+            self.status_line = "An undo is already running".into();
+            cx.notify();
+            return;
         }
-        self.reload_entries();
-        cx.notify();
+        let fleet = self.fleet.clone();
+        off_thread(
+            cx,
+            move || {
+                let result = fleet.undo_through(id).map_err(|err| err.to_string());
+                end_undo();
+                result
+            },
+            |this, result, cx| {
+                match result {
+                    Ok(labels) if !labels.is_empty() => {
+                        this.status_line = format!("Undid: {}", labels.join(", "));
+                    }
+                    Ok(_) => this.status_line = "Nothing to undo".into(),
+                    Err(err) => this.status_line = format!("Undo failed: {err}"),
+                }
+                this.reload_entries();
+                cx.notify();
+            },
+        );
     }
 
     fn drain_row_actions(&mut self, cx: &mut Context<Self>) {

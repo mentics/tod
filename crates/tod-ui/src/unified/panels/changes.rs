@@ -26,7 +26,6 @@ use tod_store::fleet::FleetStore;
 use tod_store::fleet::changes::{BranchChanges, ChangesTrigger, changes_trigger, node_branch_changes};
 use uuid::Uuid;
 
-use super::node_title;
 use crate::ui::selectable_text::selectable_text;
 use crate::ui::style;
 use crate::unified::panel::{ColumnPanel, PanelOpenRequest};
@@ -166,7 +165,6 @@ impl ChangesWatch {
 
 pub struct ChangesPanel {
     fleet: Arc<FleetStore>,
-    title: String,
     watch: ChangesWatch,
     /// The last open-in-editor failure, shown under the list.
     open_error: Option<String>,
@@ -187,7 +185,6 @@ impl ChangesPanel {
     pub fn new(node_id: Uuid, fleet: Arc<FleetStore>, _window: &mut Window, cx: &mut Context<Self>) -> Self {
         let watch = ChangesWatch::new(node_id, fleet.clone(), cx);
         let mut this = Self {
-            title: node_title(&fleet, node_id),
             fleet,
             watch,
             open_error: None,
@@ -263,9 +260,6 @@ impl ColumnPanel for ChangesPanel {
         "Changes".into()
     }
 
-    fn target_label(&self, _cx: &App) -> SharedString {
-        self.title.clone().into()
-    }
 }
 
 impl EventEmitter<PanelOpenRequest> for ChangesPanel {}

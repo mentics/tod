@@ -137,6 +137,12 @@ contradiction of it. `surface/conversation.md` is the live example (surface 1's
 | `domain/capabilities.md` | Per-node optional behaviours, the `agent` capability | 4 (gate criteria reference them) |
 | `domain/plan.md` | Plan steps, dependencies, `--satisfies` links | 3, 4, 5, 7, 8, 11 |
 
+Separately from these fragments, the phase and protocol agents (phase, evaluate,
+implement, verify, review, fix, pr) carry a dynamic **Skills** block
+(`DynamicBlock::ConfiguredSkills`, `tod_core::skills_context`): the skills the
+user set for that phase through the Lifecycle config capability, resolved from
+the nearest node that lists the phase. It is empty, and omitted, when none are set.
+
 `app.md` is deleted; its content is redistributed here. No surface is told what
 tod stores in general — only about the concepts it will handle.
 

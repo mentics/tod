@@ -754,6 +754,8 @@ struct FlatIssue {
     description: Option<String>,
     priority: Option<i32>,
     state: Option<String>,
+    /// The workflow state's type (`completed`, `canceled`, ...).
+    state_type: Option<String>,
     assignee: Option<String>,
     labels: Vec<String>,
     parent_identifier: Option<String>,
@@ -778,7 +780,7 @@ fn fetch_all_issues(
                         title
                         description
                         priority
-                        state { name }
+                        state { name type }
                         assignee { name }
                         labels { nodes { name } }
                         parent { identifier }
@@ -864,7 +866,8 @@ fn fetch_all_issues(
                 title: node.title,
                 description: node.description.filter(|d| !d.trim().is_empty()),
                 priority: node.priority,
-                state: node.state.map(|s| s.name),
+                state: node.state.as_ref().map(|s| s.name.clone()),
+                state_type: node.state.and_then(|s| s.state_type),
                 assignee: node.assignee.map(|a| a.name),
                 labels: node.labels.nodes.into_iter().map(|l| l.name).collect(),
                 parent_identifier: node.parent.map(|p| p.identifier),
@@ -941,6 +944,15 @@ fn build_tree(flat: Vec<FlatIssue>, workspace_slug: &str) -> Vec<DataSourceItem>
             "state".into(),
             issue
                 .state
+                .as_ref()
+                .map(|s| serde_json::Value::String(s.clone()))
+                .unwrap_or(serde_json::Value::Null),
+        );
+
+        meta.insert(
+            "state_type".into(),
+            issue
+                .state_type
                 .as_ref()
                 .map(|s| serde_json::Value::String(s.clone()))
                 .unwrap_or(serde_json::Value::Null),
@@ -1134,6 +1146,8 @@ struct ParentRef {
 #[derive(Debug, Deserialize)]
 struct StateRef {
     name: String,
+    #[serde(rename = "type", default)]
+    state_type: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1371,6 +1385,7 @@ mod tests {
                 description: None,
                 priority: None,
                 state: None,
+                state_type: None,
                 assignee: None,
                 labels: vec![],
                 parent_identifier: None,
@@ -1381,6 +1396,7 @@ mod tests {
                 description: None,
                 priority: None,
                 state: None,
+                state_type: None,
                 assignee: None,
                 labels: vec![],
                 parent_identifier: Some("TOD-1".into()),
@@ -1401,6 +1417,7 @@ mod tests {
             description: None,
             priority: None,
             state: None,
+            state_type: None,
             assignee: None,
             labels: vec![],
             parent_identifier: Some("TOD-1".into()),
@@ -1418,6 +1435,7 @@ mod tests {
             description: None,
             priority: None,
             state: None,
+            state_type: None,
             assignee: None,
             labels: vec![],
             parent_identifier: None,
@@ -1458,6 +1476,7 @@ mod tests {
             description: None,
             priority: Some(2),
             state: Some("In Progress".into()),
+            state_type: None,
             assignee: Some("Alice".into()),
             labels: vec![],
             parent_identifier: None,

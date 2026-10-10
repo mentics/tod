@@ -1,0 +1,21 @@
+[package]
+name = "tod-agentd-client"
+version = "0.1.0"
+edition = "2024"
+publish = false
+build = "build.rs"
+
+# What `tod`, `tod-cli`, and `tod-core` link to find the resident daemon
+# (`doc/agentd.md`), start it when none runs, and talk to it: the wire
+# protocol, the client, and the writer that makes a `FleetStore` a client of
+# it. The daemon itself is `tod-agentd`, which depends on this and on
+# `tod-core`; this depends only on `tod-store`, so `tod-core` can use it.
+[dependencies]
+anyhow = "1.0"
+fs2 = "0.4"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+uuid = { version = "1.0", features = ["v4", "serde"] }
+tod-store = { path = "../tod-store" }
+tokio = { version = "1", features = ["sync"] }
+tracing = "0.1"

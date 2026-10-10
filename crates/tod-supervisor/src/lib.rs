@@ -332,7 +332,7 @@ pub fn wake(config: Config) -> Result<Woke> {
     let outcome = run?;
     pushed?;
     tracing::info!(?outcome, "autopilot stopped");
-    if matches!(outcome, Outcome::Stopped { .. }) {
+    if matches!(outcome, Outcome::Stopped { .. } | Outcome::Waiting { .. }) {
         schedule(&store, &config)?;
     }
     drop(agent);

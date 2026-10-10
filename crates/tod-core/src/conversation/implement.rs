@@ -13,6 +13,7 @@
 //! Spec: `doc/conversation/protocols.md` §4.
 
 use tod_store::fleet::Workdir;
+use super::problems::or_report;
 use super::protocol::{Next, Protocol, ProtocolEnv, RunNotice, Stop, TurnContext, cap_or_stall};
 use crate::agent_context::{ImplementRequest, NodeSelection, build_implement_message};
 use crate::gate::PlanStepWithLinks;
@@ -149,7 +150,7 @@ impl Protocol for ImplementationProtocol {
             .ok()
             .flatten();
         let plan_steps = open_plan_steps(implement_steps(fleet, node_id));
-        let obligations = fleet.list_obligations_for_node(node_id).unwrap_or_default();
+        let obligations = fleet.list_obligations_for_node(node_id).context("could not read the node's obligations")?;
         let ancestor_context = fleet
             .read(|conn| {
                 crate::node_context::render_inherited_context(
@@ -159,7 +160,7 @@ impl Protocol for ImplementationProtocol {
                     None,
                 )
             })
-            .unwrap_or_default();
+            .context("could not read the inherited context")?;
         let lifecycle = Some(node.lifecycle.clone());
         let working_dir = PathBuf::from(self.cwd(env)?.path_text());
         build_implement_message(
@@ -178,6 +179,7 @@ impl Protocol for ImplementationProtocol {
                 obligations,
                 ancestor_context,
                 verdicts: super::verify::current_verdicts(fleet, node_id),
+                skills: crate::skills_context::for_node(fleet, node_id, "implement"),
             },
         )
     }
@@ -447,9 +449,7 @@ pub enum PlanProgress {
 }
 
 pub fn plan_progress(fleet: &FleetStore, node_id: Uuid) -> PlanProgress {
-    let steps: Vec<_> = fleet
-        .list_plan_steps_for_node(node_id)
-        .unwrap_or_default()
+    let steps: Vec<_> = or_report(node_id, "the plan", fleet.list_plan_steps_for_node(node_id))
         .into_iter()
         .filter(|step| step.phase == PHASE_ACTIVE)
         .collect();
@@ -485,21 +485,17 @@ pub fn implement_steps(fleet: &FleetStore, node_id: Uuid) -> Vec<PlanStepWithLin
 /// the agent has moved it on from `failed` — a status change clears the
 /// step's own note, but the failure is what the step is being fixed for.
 pub fn plan_steps(fleet: &FleetStore, node_id: Uuid) -> Vec<PlanStepWithLinks> {
-    fleet
-        .list_plan_steps_for_node(node_id)
-        .unwrap_or_default()
+    or_report(node_id, "the plan", fleet.list_plan_steps_for_node(node_id))
         .into_iter()
         .map(|mut step| {
             if step.note.is_none() && step_is_open(&step.status) {
                 step.note =
                     latest_failure(fleet, step.id).map(|note| format!("{FAILURE_PREFIX}{note}"));
             }
-            let depends_on = fleet
-                .list_plan_step_dependencies(step.id)
-                .unwrap_or_default();
-            let satisfies = fleet
-                .list_plan_step_obligations(step.id)
-                .unwrap_or_default();
+            let depends_on =
+                or_report(node_id, "a plan step's dependencies", fleet.list_plan_step_dependencies(step.id));
+            let satisfies =
+                or_report(node_id, "a plan step's obligations", fleet.list_plan_step_obligations(step.id));
             PlanStepWithLinks {
                 step,
                 depends_on,

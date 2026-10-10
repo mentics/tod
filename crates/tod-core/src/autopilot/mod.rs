@@ -23,6 +23,7 @@
 //! file under the data root (`autopilot/<node>.json`). A restart reopens the
 //! conversation that was in progress instead of starting another.
 
+mod github_wait;
 pub mod local;
 mod state;
 
@@ -83,6 +84,11 @@ pub enum Outcome {
     /// supervisor was asked to stop). Whatever conversation was in progress
     /// stays current, so the next run reopens it.
     Stopped { reason: String },
+    /// Nothing to do until `due_at_ms` (or an event that wakes it sooner):
+    /// the run ends instead of sleeping, so whoever runs it (the app, a
+    /// cloud sandbox's scheduler) wakes it again then. The node's pending
+    /// `event` wait carries the same time.
+    Waiting { what: String, due_at_ms: i64 },
 }
 
 /// Where a run is when it calls its [`StepHook`].
@@ -371,6 +377,11 @@ impl Autopilot {
                 return self.finish(Outcome::NeedsHuman {
                     reason: NeedsHuman::Decision { pending },
                 });
+            }
+            // `approved` waits for the merge and `merged` for the release.
+            if let Some(outcome) = self.hold_for_github(fleet, &lifecycle)? {
+                hook.waiting(None);
+                return self.finish(outcome);
             }
             let standing = fleet.read(|conn| Standing::load(conn, self.node, &lifecycle))?;
             let Some(step) = next_step(&standing) else {
@@ -677,6 +688,12 @@ impl Autopilot {
                     if asked {
                         continue;
                     }
+                    if waits.iter().any(|w| matches!(w, Wait::HumanReview)) {
+                        // Hours or days: the run ends, and is woken at the
+                        // time recorded (or by the review's webhook).
+                        hook.waiting(None);
+                        return Ok(Some(self.wait_for_review(fleet, &live, &settings)?));
+                    }
                     let since = *waited_since.get_or_insert_with(std::time::Instant::now);
                     let what = wait_description(&waits);
                     hook.waiting(Some(&what));
@@ -692,6 +709,33 @@ impl Autopilot {
                 }
             }
         }
+    }
+
+    /// Records the wait for a person's review of the pull request: an
+    /// `event` wait on its reviews, whose deadline is the next scheduled
+    /// look (`crate::wait_cadence`). A webhook for a review satisfies it
+    /// sooner. Either way, waking re-reads the pull request.
+    fn wait_for_review(
+        &mut self,
+        fleet: &FleetStore,
+        live: &[crate::pr_readiness::LivePr],
+        settings: &tod_store::PrReadinessSettings,
+    ) -> Result<Outcome> {
+        use crate::pr_readiness::Wait;
+        let waiting_on = live
+            .iter()
+            .find(|p| p.assessment.waits().iter().any(|w| matches!(w, Wait::HumanReview)))
+            .map(|p| p.pr.clone());
+        let spec = waiting_on
+            .as_ref()
+            .map(|pr| format!("github:pr:{}:review", pr.pr_number))
+            .unwrap_or_else(|| "github:pr:review".to_string());
+        let due_at_ms = self.record_github_wait(fleet, spec, "github:pr:", settings)?;
+        let what = match &waiting_on {
+            Some(pr) => format!("a review of {}", pr.url),
+            None => "a review".to_string(),
+        };
+        Ok(Outcome::Waiting { what, due_at_ms })
     }
 
     /// The pull request conversation of this stay in `pr`, to send it the
@@ -816,7 +860,8 @@ impl Autopilot {
                         turn_ended = true;
                     }
                     ConversationEvent::Notice(notice) => {
-                        tracing::info!(node = %self.node, ?notice, "autopilot notice");
+                        // Errors are also in the conversation's transcript.
+                        tracing::warn!(node = %self.node, ?notice, "autopilot notice");
                     }
                     ConversationEvent::Continued => turn_ended = true,
                     ConversationEvent::Rotated => {}
@@ -977,6 +1022,7 @@ fn wait_description(waits: &[crate::pr_readiness::Wait]) -> String {
             Wait::BotReview { bot, .. } => format!("{bot} review"),
             Wait::ChecksRunning => "checks to finish".to_string(),
             Wait::GitHub => "GitHub".to_string(),
+            Wait::HumanReview => "a review".to_string(),
         })
         .collect();
     format!("waiting for {}", parts.join(", "))

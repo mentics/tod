@@ -19,7 +19,7 @@ use tod_sandbox::relay::{self, ExecRequest};
 use tod_sandbox::terminal::{self, TerminalOptions};
 use tod_store::credentials::CredentialKind;
 use tod_store::fleet::cli_relay;
-use tod_store::fleet::sandbox::{self as sandboxes, BOOTSTRAP, NewSandboxSource, Sandboxes};
+use tod_store::fleet::sandbox::{self as sandboxes, NewSandboxSource, Sandboxes};
 use tod_store::settings::SandboxIdleSettings;
 
 const USAGE: &str = "\
@@ -40,8 +40,10 @@ fork <source> <name> [--agents]
                          state (it may be in standby). Needs a Blaxel workspace
                          with forking.
 ensure <name>            Install or update tod's pieces in a sandbox (idempotent).
-bake <base-image> [--name IMAGE-NAME] [--agents]
-                         Build an image with everything preinstalled.
+bake <base-image> [--name IMAGE-NAME] [--agents] [--repo URL[=DIR]]...
+                         Build an image with everything preinstalled, and the
+                         repositories cloned into it (https, no credentials;
+                         DIR defaults to /root/<name>).
 list                     Sandboxes in the workspace.
 status <name>            Whether a sandbox is running or in standby, and its
                          deployment status (does not wake it).
@@ -364,18 +366,17 @@ fn bake(ctx: &mut Ctx, mut args: Args) -> Result<i32> {
     let name = args
         .opt("--name")
         .unwrap_or_else(|| format!("tod-baked-{}", sandboxes::label_value(sandboxes::short_image(&base))));
+    // `--repo URL` or `--repo URL=/dir`, as many as wanted.
+    let mut lines = String::new();
+    while let Some(repo) = args.opt("--repo") {
+        match repo.rsplit_once("=/") {
+            Some((url, dir)) => lines.push_str(&format!("{url} /{dir}\n")),
+            None => lines.push_str(&format!("{repo}\n")),
+        }
+    }
+    let repos = provision::parse_bake_repos(&lines)?;
     args.done()?;
-    let acct = ctx.account()?.clone();
-    let relay_bin = sandboxes::relay_binary()?;
-    let payload = sandboxes::payload(&relay_bin, agents);
-    let dir = sandboxes::build_dir(&name)?;
-    std::fs::write(dir.join("Dockerfile"), provision::bake_dockerfile(&base, &payload))?;
-    std::fs::write(dir.join("bootstrap.sh"), BOOTSTRAP)?;
-    std::fs::write(dir.join("tod-relay"), &relay_bin)?;
-    std::fs::write(dir.join("tod-cli"), payload.tod_cli)?;
-    std::fs::write(dir.join("blaxel.toml"), provision::blaxel_toml(&name, acct.memory_mb))?;
-    eprintln!("baking {base} with tod's dependencies into sandbox/{name}…");
-    ctx.bl_push(&dir, true, &mut |m| eprintln!("{m}"))?;
+    ctx.bake(&base, &name, agents, &repos, true, &mut |m| eprintln!("{m}"))?;
     let flag = if agents { " --agents" } else { "" };
     println!(
         "built sandbox/{name}:latest. Create sandboxes from it with\n  tod-sandbox create <name> --image sandbox/{name}:latest{flag}\n\

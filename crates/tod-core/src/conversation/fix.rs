@@ -20,6 +20,7 @@ use super::implement::{
     IMPLEMENT_CONVERSATION_ENV, IMPLEMENT_NODE_ENV, TestRun, commit_run, node_id, plan_steps,
     prepare_submodules, reopen_verification_after_change, worktree_fingerprint,
 };
+use super::problems::or_report;
 use super::protocol::{Next, Protocol, ProtocolEnv, RunNotice, Stop, TurnContext, cap_or_stall};
 use crate::agent_context::{ImplementRequest, NodeSelection, build_fix_message};
 use crate::dynamic::review_finding_lines;
@@ -37,9 +38,7 @@ use uuid::Uuid;
 /// The node's findings nobody has answered yet, in the order they were
 /// recorded.
 pub fn open_findings(fleet: &FleetStore, node_id: Uuid) -> Vec<ReviewFinding> {
-    fleet
-        .read(|conn| ReviewRepo::new(conn).list_for_node(node_id))
-        .unwrap_or_default()
+    or_report(node_id, "the review findings", fleet.read(|conn| ReviewRepo::new(conn).list_for_node(node_id)))
         .into_iter()
         .filter(ReviewFinding::is_open)
         .collect()
@@ -107,7 +106,7 @@ impl Protocol for FixProtocol {
             .get_extra_content(node_id, EXTRA_CONTENT_DETAILS)
             .ok()
             .flatten();
-        let obligations = fleet.list_obligations_for_node(node_id).unwrap_or_default();
+        let obligations = fleet.list_obligations_for_node(node_id).context("could not read the node's obligations")?;
         let ancestor_context = fleet
             .read(|conn| {
                 crate::node_context::render_inherited_context(
@@ -117,7 +116,7 @@ impl Protocol for FixProtocol {
                     None,
                 )
             })
-            .unwrap_or_default();
+            .context("could not read the inherited context")?;
         let working_dir = PathBuf::from(self.cwd(env)?.path_text());
         build_fix_message(
             env.media,
@@ -135,6 +134,7 @@ impl Protocol for FixProtocol {
                 obligations,
                 ancestor_context,
                 verdicts: super::verify::current_verdicts(fleet, node_id),
+                skills: crate::skills_context::for_node(fleet, node_id, "fix"),
             },
             &open_findings(fleet, node_id),
         )

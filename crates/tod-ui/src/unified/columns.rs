@@ -91,17 +91,9 @@ impl ColumnModel {
         self.columns.len()
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.columns.is_empty()
-    }
-
     /// The currently focused column's index (into `columns()`), if any.
     pub fn focused_index(&self) -> Option<usize> {
         self.focused
-    }
-
-    pub fn focused_panel(&self) -> Option<&PanelKind> {
-        self.focused.and_then(|ix| self.columns.get(ix)).map(|c| &c.panel)
     }
 
     pub fn is_pinned(&self, index: usize) -> bool {

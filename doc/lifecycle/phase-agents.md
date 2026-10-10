@@ -171,8 +171,8 @@ Waive for the certificate criterion. Force advance stays as it is.
 | verifying → review | `obligations-verified`, `plan-steps-verified` (derived) | — | Unchanged; verify is the phase agent. The 9 agent criteria are retired: what they asked is either already in the verify protocol's instructions or is now covered by the verdicts. |
 | review → pr | `review-done`, `findings-answered` (derived) | — | Unchanged. |
 | pr → approved | `mergeable` (derived, GitHub) | — | Unchanged; pr is the phase agent. |
-| approved → merged | `pr-merged` (derived, GitHub) | — | Unchanged. |
-| merged → released | **certified** | nothing (empty digest) | Release evidence recorded. The certificate note carries the evidence. |
+| approved → merged | `pr-merged` (derived, GitHub) | — | Unchanged. The run waits for the merge (see "Waiting on GitHub" below). |
+| merged → released | **certified** | nothing (empty digest) | Release evidence recorded. The certificate note carries the evidence. The run first waits for a release whose notes name the PR. |
 | released → learn | **certified** | nothing | Post-release smoke recorded with evidence. |
 | learn → done | `learn-recorded` (new derived: a `tod-cli learn` record exists for this stay) | — | The learn phase agent writes the retrospective; the record is the check mark, so no certificate is needed. |
 

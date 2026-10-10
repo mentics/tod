@@ -50,7 +50,7 @@ CREATE INDEX IF NOT EXISTS idx_journey_submissions_status ON journey_submissions
 ";
 
 /// One `journey_submissions` row.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SubmissionEntry {
     pub id: i64,
     pub bundle_id: Uuid,

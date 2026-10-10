@@ -32,7 +32,9 @@ cargo build --release -p tod --no-default-features
 tod --verify-process-bundle
 ```
 
-`cargo run -p tod` rebuilds only `tod`, never the `tod-cli` beside it. After
+`cargo build -p tod` builds `tod` and the resident `tod-agentd` beside it (the
+app starts it, owns nothing itself, and hosts no runs: see `doc/agentd.md`; a
+stale `tod-agentd` is refused with the command to rebuild it). `cargo run -p tod` rebuilds only `tod`, never the `tod-cli` beside it. After
 changing anything `tod-cli` is built from, run `cargo build -p tod-cli` too: a
 conversation refuses to send a turn when the two were built from different
 source (`tod_core::CLI_BUILD_STAMP`), rather than let the agent work from
@@ -70,7 +72,6 @@ reverse.**
 - `crates/tod-agent` — agent transport: the provider interface and its implementations across platforms (Cursor, Claude, mock) and environments. **A leaf crate with no `tod-*` dependencies by design** — it knows how to hold conversations and sessions, and nothing about paths, settings, process docs, or persistence. It is told what to say and reports back.
 - `crates/tod-store` — durable persistence. SQLite-backed (`rusqlite`) storage for **fleet** (agents/tasks/worktrees) and **outline** (task tree) data, plus credentials (OS keyring + `chacha20poly1305` encryption), settings, paths, and Linear API integration. Depends on `tod-agent` for the agent types it persists (`AgentPlatform`, `AgentLaunchOptions`).
 - Cloud sandboxes (Blaxel; [doc/cloud-sandboxes/setup.md](../doc/cloud-sandboxes/setup.md), design in `blaxel-remote.md`): `crates/tod-sandbox` (leaf lib: Blaxel API, relay client, provisioning, `sandboxes.toml`), `crates/tod-sandbox-cli` (the `tod-sandbox` binary), `crates/tod-zed-shim` (the `ssh`/`scp`/`sftp` Zed runs, routing `<name>.tod` hosts to sandboxes), `crates/tod-relay` (the Linux server inside each sandbox, cross-built for `x86_64-unknown-linux-musl`; protocol in `relay-protocol.md`), and `assets/sandbox/bootstrap.sh` (installs dependencies on any image).
-- `crates/nov-viz` — a separate visualization crate (layout/nav/keyboard model), not part of the main app binary path.
 - `assets/process/` — version-controlled source for agent behavior docs (SKILL files, agent definitions, manifest). Copied by `build.rs` to `target/{debug,release}/process/` so dev runs mirror an installed layout.
 - `crates/tod/media/context/` — version-controlled agent context documents (see **Agent chat context** below). Copied by `build.rs` to `target/{debug,release}/media/`.
 
@@ -540,6 +541,22 @@ Nothing starts or builds a container; tod only uses a running one.
 ### `tod-store::outline` — task tree
 
 A hierarchical task/outline model with its own DDL/migration path (`ddl.rs`, `migrate_interview.rs`), slug-based addressing (`slug.rs`), and import from the older interview-session format (`import.rs`).
+
+**Lifecycle config** (`Capability::LifecycleConfig`, `tod_store::lifecycle_config`,
+table `node_lifecycle_config`) holds, per phase, an ordered list of skill names
+the agent for that phase should use. It is a capability of its own, not part of
+Lifecycle, because it is meant for one or two high-level nodes and inherited by
+everything below: `lifecycle_config::resolve` takes the nearest node, from the
+node itself up, that lists the phase (so a lower node overrides per phase, and an
+explicit empty list turns a phase's skills off). The phase keys are the ten
+phase- and protocol-agent phases plus `fix` (`PHASES`). Names are free text and
+never validated (the skill may be set up later, and a container, sandbox or
+Cursor agent may have no Skill tool). `tod_core::skills_context::for_node` renders
+the "Skills" block (`DynamicBlock::ConfiguredSkills`) that each phase agent's
+opening carries, via a `skills` field on `ImplementRequest` and
+`GateCheckRequest`; the evaluator gets the skills of the state it judges. Edited in
+the task editor (`views::lifecycle_config_editor`) or with `tod-cli capabilities
+set <node> lifecycle-config`. Edits are not recorded in a conversation's change set.
 
 ### `crates/tod-core::interview` — conversational task creation
 

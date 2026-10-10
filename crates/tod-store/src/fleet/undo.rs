@@ -404,6 +404,7 @@ fn capture_outline_inverse(conn: &Connection, m: &OutlineMutation) -> Result<Opt
         | OutlineMutation::SetNodeTicket { .. }
         | OutlineMutation::SetNodeTags { .. }
         | OutlineMutation::SetNodeEnvironment { .. }
+        | OutlineMutation::SetNodeLifecycleConfig { .. }
         | OutlineMutation::EnableCapabilities { .. }
         | OutlineMutation::CreateObligation { .. }
         | OutlineMutation::RestoreObligation { .. }
@@ -439,6 +440,7 @@ fn capture_outline_inverse(conn: &Connection, m: &OutlineMutation) -> Result<Opt
         | OutlineMutation::DeleteManagedNode { .. }
         | OutlineMutation::RefreshLinkedCopy { .. }
         | OutlineMutation::PasteManagedNodeCopy { .. }
+        | OutlineMutation::CopyNodeSubtree { .. }
         | OutlineMutation::SetGeneratorAcceptConfig { .. }
         | OutlineMutation::AcceptGeneratedTicket { .. }
         | OutlineMutation::SetRefreshStatus { .. } => Ok(None),

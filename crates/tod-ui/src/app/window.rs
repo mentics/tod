@@ -115,8 +115,13 @@ pub struct Shell {
 }
 
 /// Human-readable summary of background work that would be lost if the
-/// window closed right now: agents mid-run.
-fn collect_running_work(fleet: &FleetStore) -> Vec<SharedString> {
+/// window closed right now: agents mid-run, split by whether closing the app
+/// cuts them off or the resident daemon keeps them running.
+fn collect_running_work(
+    fleet: &FleetStore,
+    agent_runs: &Entity<AgentRuns>,
+    cx: &App,
+) -> crate::ui::toast::CloseGuardWork {
     let mut items = Vec::new();
     if let Ok(runs) = fleet.list_unended_runs() {
         for run in runs {
@@ -140,7 +145,12 @@ fn collect_running_work(fleet: &FleetStore) -> Vec<SharedString> {
             }
         }
     }
-    items
+    let (affected, continuing) = agent_runs.read(cx).running_work_split();
+    items.extend(affected.into_iter().map(SharedString::from));
+    crate::ui::toast::CloseGuardWork {
+        affected: items,
+        continuing: continuing.into_iter().map(SharedString::from).collect(),
+    }
 }
 
 impl Shell {
@@ -527,11 +537,25 @@ impl Shell {
     }
 
     fn undo_last(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        match self.fleet.undo_last() {
-            Ok(Some(label)) => info_toast(window, cx, format!("Undid: {label}")),
-            Ok(None) => info_toast(window, cx, "Nothing to undo"),
-            Err(err) => error_toast(window, cx, format!("Undo failed: {err}")),
+        // The undo log's suppress flag is global, so a second undo while one
+        // is running is dropped rather than interleaved.
+        if !crate::views::command_history::begin_undo() {
+            return;
         }
+        let fleet = self.fleet.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { fleet.undo_last().map_err(|err| err.to_string()) })
+                .await;
+            crate::views::command_history::end_undo();
+            let _ = this.update_in(cx, |_, window, cx| match result {
+                Ok(Some(label)) => info_toast(window, cx, format!("Undid: {label}")),
+                Ok(None) => info_toast(window, cx, "Nothing to undo"),
+                Err(err) => error_toast(window, cx, format!("Undo failed: {err}")),
+            });
+        })
+        .detach();
     }
 
     /// The status bar's message: what the active view last posted to the
@@ -1026,7 +1050,13 @@ fn open_fleet_store(
     // identity and probes whether its process is still alive, which does not need to finish
     // before the window can be shown. `run_launch_hooks` runs afterward on a background
     // thread (see the `open()` caller below) so it can never delay first paint.
-    let mut store = FleetStore::open_without_reattach(&root).map_err(|err| (err, root.clone()))?;
+    // The daemon owns the store; this process reads it and asks the daemon to
+    // write (`doc/agentd.md`). It is started here when none runs, and an older
+    // one is replaced.
+    let executable = tod_agentd_client::client::locate_executable()
+        .map_err(|err| (FleetLaunchError::Other(err), root.clone()))?;
+    let mut store = tod_agentd_client::remote::open_store(&root, Some(&executable))
+        .map_err(|err| (FleetLaunchError::Other(err), root.clone()))?;
     store.set_traffic_log(traffic_log);
     Ok(Arc::new(store))
 }
@@ -1196,19 +1226,28 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                 let _ = format_tx.send_blocking(notice);
                             });
                         });
-                        tod_core::cloud_sync::sync_on_start(fleet.clone());
-                        tod_core::cloud_notify::start(fleet.clone());
+                        // Not when the daemon owns the store: it syncs.
+                        if !fleet.is_client() {
+                            tod_core::cloud_sync::sync_on_start(fleet.clone());
+                            tod_core::cloud_notify::start(fleet.clone());
+                        }
                         // Only the one long-lived GUI process should run this listener, so it
                         // starts here rather than inside `FleetStore::open` (which `tod-cli`
                         // also calls, as a one-shot process, when no GUI instance is running).
-                        let mutation_socket = tod_store::fleet::mutation_socket::start(
-                            fleet.clone(),
-                            fleet.paths().root(),
-                        )
-                        .inspect_err(|err| {
-                            tracing::error!("mutation socket failed to start: {err:#}");
-                        })
-                        .ok();
+                        // Not when the daemon owns the store: `tod-cli` reaches the
+                        // daemon itself.
+                        let mutation_socket = (!fleet.is_client())
+                            .then(|| {
+                                tod_store::fleet::mutation_socket::start(
+                                    fleet.clone(),
+                                    fleet.paths().root(),
+                                )
+                                .inspect_err(|err| {
+                                    tracing::error!("mutation socket failed to start: {err:#}");
+                                })
+                                .ok()
+                            })
+                            .flatten();
                         if agent_backend == AgentBackend::Mock {
                             // Mock interview agents write through the socket just started,
                             // the same path `tod-cli` gives real agents.
@@ -1358,8 +1397,9 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                             shell
                         });
                         let fleet_for_close = fleet.clone();
+                        let agent_runs_for_close = agent_runs.clone();
                         window.on_window_should_close(cx, move |window, cx| {
-                            let running = collect_running_work(&fleet_for_close);
+                            let running = collect_running_work(&fleet_for_close, &agent_runs_for_close, cx);
                             if running.is_empty() {
                                 persist_window_geometry(window, &paths_for_geometry);
                                 let _ = transcript_for_close.close(cx);

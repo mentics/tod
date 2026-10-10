@@ -380,7 +380,34 @@ impl Github {
         Ok(raw
             .into_iter()
             .filter_map(|r| {
-                Some(PrReview { author: r.user.map(|u| u.login), submitted_at: r.submitted_at? })
+                Some(PrReview { author: r.user.map(|u| u.login), submitted_at: r.submitted_at?, state: r.state })
+            })
+            .collect())
+    }
+
+    /// A pull request's title and whether, and when, it was merged.
+    pub fn get_pr_merge(&self, owner: &str, repo: &str, number: i64) -> Result<PrMerge, GithubError> {
+        let raw: PrMergeRaw = self.get_json(&format!("/repos/{owner}/{repo}/pulls/{number}"))?;
+        Ok(PrMerge {
+            title: raw.title,
+            merged: raw.merged.unwrap_or(false) || raw.merged_at.is_some(),
+            merged_at: raw.merged_at,
+        })
+    }
+
+    /// The repository's latest published releases (the first 30, newest
+    /// first). Drafts and pre-releases are left out: neither is released.
+    pub fn list_releases(&self, owner: &str, repo: &str) -> Result<Vec<Release>, GithubError> {
+        let raw: Vec<ReleaseRaw> = self.get_json(&format!("/repos/{owner}/{repo}/releases?per_page=30"))?;
+        Ok(raw
+            .into_iter()
+            .filter(|r| !r.draft && !r.prerelease)
+            .map(|r| Release {
+                tag: r.tag_name,
+                name: r.name.filter(|n| !n.trim().is_empty()),
+                body: r.body.unwrap_or_default(),
+                url: r.html_url,
+                published_at: r.published_at,
             })
             .collect())
     }
@@ -395,6 +422,48 @@ impl Github {
         let reviews = self.list_reviews(owner, repo, number)?;
         Ok(PrSnapshot { status, threads, comments, reviews })
     }
+}
+
+/// A pull request's title and merge, read to find the release that carries it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrMerge {
+    pub title: String,
+    pub merged: bool,
+    /// When it was merged (RFC 3339).
+    pub merged_at: Option<String>,
+}
+
+/// A published GitHub release.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Release {
+    pub tag: String,
+    pub name: Option<String>,
+    /// The release notes.
+    pub body: String,
+    pub url: String,
+    /// When it was published (RFC 3339).
+    pub published_at: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PrMergeRaw {
+    #[serde(default)]
+    title: String,
+    merged: Option<bool>,
+    merged_at: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReleaseRaw {
+    tag_name: String,
+    name: Option<String>,
+    body: Option<String>,
+    html_url: String,
+    published_at: Option<String>,
+    #[serde(default)]
+    draft: bool,
+    #[serde(default)]
+    prerelease: bool,
 }
 
 /// A review thread on a pull request.
@@ -445,6 +514,9 @@ pub struct PrReview {
     pub author: Option<String>,
     /// RFC 3339.
     pub submitted_at: String,
+    /// GitHub's state for the review: `APPROVED`, `CHANGES_REQUESTED`,
+    /// `COMMENTED`, `DISMISSED` or `PENDING`. Empty when not known.
+    pub state: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -508,6 +580,8 @@ struct ThreadCommentRaw {
 struct ReviewRaw {
     user: Option<UserRaw>,
     submitted_at: Option<String>,
+    #[serde(default)]
+    state: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -623,6 +697,12 @@ impl PullState {
             Self::Merged => "merged",
             Self::Closed => "closed",
         }
+    }
+
+    /// Merged or closed: the pull request is over, so it is shown struck
+    /// through wherever it is named.
+    pub const fn is_terminal(self) -> bool {
+        matches!(self, Self::Merged | Self::Closed)
     }
 }
 

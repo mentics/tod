@@ -11,7 +11,9 @@ pub fn load_tasks_from_store(store: &FleetStore, list_id: Option<Uuid>) -> Vec<T
     let Some(list_id) = list_id else {
         return Vec::new();
     };
-    let rows = store.flatten_outline(list_id).unwrap_or_default();
+    // Every node, so a search reaches those under collapsed parents; the
+    // filter hides them while there is no query.
+    let rows = store.flatten_outline_all(list_id).unwrap_or_default();
     // One list-scoped query per column instead of four per row: agent runtime
     // commits reload this list often, and each per-row call takes the
     // projection mutex.
@@ -88,11 +90,13 @@ pub fn load_tasks_from_store(store: &FleetStore, list_id: Option<Uuid>) -> Vec<T
                 accept_ready: row.accept_ready,
                 linked_copy: row.linked_copy,
                 has_copies: row.has_copies,
+                ticket_terminal: row.ticket_terminal,
                 // Filled in by `TaskListView::set_attention`, not the store load.
                 needs_you_count: 0,
                 waiting_since: None,
                 status_override: None,
             lifecycle_running: false,
+            awaiting: false,
             chat_running: false,
             finished_run: None,
             }
@@ -144,10 +148,12 @@ pub fn large_fixture_set(base_count: usize) -> Vec<TaskItem> {
             accept_ready: false,
             linked_copy: false,
             has_copies: false,
+            ticket_terminal: false,
             needs_you_count: 0,
             waiting_since: None,
             status_override: None,
             lifecycle_running: false,
+            awaiting: false,
             chat_running: false,
             finished_run: None,
         })

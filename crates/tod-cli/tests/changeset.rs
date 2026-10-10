@@ -69,7 +69,7 @@ fn with_repo<R>(root: &Path, f: impl FnOnce(ConversationRepo<'_>) -> R) -> R {
 /// Run `tod-cli` with `actor` as `TOD_INTERVIEW_ACTOR` (unset when `None`).
 fn cli(root: &Path, actor: Option<&str>, args: &[&str]) -> Result<String, String> {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_tod-cli"));
-    cmd.arg("--data-root").arg(root).args(args);
+    cmd.arg("--data-root").arg(root).args(args).env("TOD_NO_DAEMON", "1");
     match actor {
         Some(actor) => cmd.env(ACTOR_ENV, actor),
         None => cmd.env_remove(ACTOR_ENV),

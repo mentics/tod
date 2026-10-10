@@ -27,6 +27,10 @@ pub enum RunnerStatus {
     },
     /// Nothing can continue until the user answers something.
     Waiting { since: i64 },
+    /// The runner ended to wait for something outside (a person's review of
+    /// the pull request): `what`, and when it looks again. Nothing is asked
+    /// of the user; the run resumes by itself.
+    Awaiting { what: String, due_at_ms: i64 },
     /// The last agent turn failed, or the runner itself did.
     Failed { error: String },
     /// The user paused the runner.
@@ -131,6 +135,10 @@ impl RunnerStatus {
                 Outcome::Stopped { reason } => match reason.strip_prefix(FAILED_PREFIX) {
                     Some(error) => Self::Failed { error: error.to_string() },
                     None => Self::Stopped { reason: reason.clone() },
+                },
+                Outcome::Waiting { what, due_at_ms } => Self::Awaiting {
+                    what: what.clone(),
+                    due_at_ms: *due_at_ms,
                 },
                 Outcome::BudgetExhausted { limit } => Self::Stopped {
                     reason: match limit {

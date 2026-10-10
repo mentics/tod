@@ -96,6 +96,9 @@ pub mod color {
     pub fn node_needs_you_text() -> Hsla {
         hex(0xf0805aff)
     }
+    pub fn node_chat_text() -> Hsla {
+        hex(0x60a5faff)
+    }
     pub fn linked_source_text() -> Hsla {
         hex(0xa06707ff)
     }
@@ -420,12 +423,6 @@ pub fn callout_warning_title<E: Styled>(el: E) -> E {
     el.text_size(font::BODY)
         .font_weight(FontWeight::SEMIBOLD)
         .text_color(color::callout_warning_text())
-}
-
-/// `styles.node-title-pending-changes`: a tree row title whose node has
-/// incoming changes it has not been checked against.
-pub fn node_title_pending_changes<E: Styled>(el: E) -> E {
-    text_title(el).text_color(color::incoming_text())
 }
 
 /// `styles.scrim`.

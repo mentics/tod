@@ -1,0 +1,24 @@
+[package]
+name = "tod-agentd"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+# The resident daemon (`doc/agentd.md`). Its build stamp is computed by
+# `tod-agentd-client`'s build script, over this crate's source too.
+# The binary is `tod`'s `tod-agentd` target (`crates/tod/src/agentd.rs`).
+[dependencies]
+anyhow = "1.0"
+fs2 = "0.4"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+uuid = { version = "1.0", features = ["v4", "serde"] }
+tod-agentd-client = { path = "../tod-agentd-client" }
+tod-store = { path = "../tod-store" }
+tod-core = { path = "../tod-core" }
+tod-agent = { path = "../tod-agent" }
+tracing = "0.1"
+tokio = { version = "1", features = ["sync"] }

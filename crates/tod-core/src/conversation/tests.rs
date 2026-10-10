@@ -2,6 +2,7 @@ use super::context::{
     DELTA_HEADING, RESUME_HEADING, ReportedStale, delta, focus_selection, opening, situational_cli,
 };
 use super::driver::*;
+use super::protocol::RunNotice;
 use super::implement::{IMPLEMENT_CONVERSATION_ENV, IMPLEMENT_NODE_ENV, TestRun};
 use super::mock::{Direct, reply};
 use crate::interview::test_support::{Fixture, fixture};
@@ -656,6 +657,9 @@ fn a_session_that_cannot_be_resumed_rotates_and_resends() {
     agent.fail_resume = true;
     let mut driver = ConversationDriver::open(config(&fx, 100_000), &fx.fleet, id).unwrap();
     let events = say(&mut driver, &fx, &mut agent, "ask Are you back?");
+    // The session's log is nowhere (this one never existed): the user is told.
+    assert!(events.iter().any(|e| matches!(e, ConversationEvent::Notice(RunNotice::Error(_)))), "{events:?}");
+    let events: Vec<_> = events.into_iter().filter(|e| !matches!(e, ConversationEvent::Notice(_))).collect();
     assert_eq!(events, [ConversationEvent::Rotated, DONE]);
     assert_eq!(agent.turns.len(), 2);
     assert!(agent.turns[0].resume_session_id.is_some());
@@ -668,11 +672,12 @@ fn a_session_that_cannot_be_resumed_rotates_and_resends() {
             TurnRole::User,
             TurnRole::Agent,
             TurnRole::User,
+            TurnRole::Error,
             TurnRole::Rotation,
             TurnRole::Agent,
         ]
     );
-    assert_eq!(turns(&fx, id)[4].1, "Are you back?");
+    assert_eq!(turns(&fx, id)[5].1, "Are you back?");
     assert_eq!(driver.status().last_error, None);
 }
 
@@ -697,8 +702,13 @@ fn attached_images_are_kept_with_the_turn_and_sent_again_after_a_failed_resume()
         .send_with_images(&fx.fleet, &mut agent, "  ", vec![image.clone()])
         .unwrap();
     assert_eq!(agent.last().images, [image.clone()]);
+    let events: Vec<_> = driver
+        .tick(&fx.fleet, &mut agent)
+        .into_iter()
+        .filter(|e| !matches!(e, ConversationEvent::Notice(RunNotice::Error(_))))
+        .collect();
     assert_eq!(
-        driver.tick(&fx.fleet, &mut agent),
+        events,
         [ConversationEvent::Rotated]
     );
     // The fresh session is sent the image again.
@@ -1608,6 +1618,90 @@ mod pending_decision_hand_back {
             }
         }
     }
+}
+
+fn set_workspace(fx: &Fixture, dir: &std::path::Path, first: bool) {
+    if first {
+        fx.fleet
+            .enqueue_outline(OutlineMutation::EnableCapabilities {
+                node_id: fx.node,
+                capabilities: vec![tod_store::outline::Capability::Files],
+            })
+            .unwrap();
+        fx.fleet.writer().flush().unwrap();
+    }
+    fx.fleet
+        .enqueue_outline(OutlineMutation::SetNodeFiles {
+            node_id: fx.node,
+            repo: Some(dir.display().to_string()),
+            branch: None,
+            use_worktree: false,
+            dev_container: None,
+        })
+        .unwrap();
+    fx.fleet.writer().flush().unwrap();
+}
+
+/// A live agent session stays where it started, so when the node's files
+/// move the driver ends it and resumes the same session id in the new place,
+/// and tells the user (here no log exists to bring, which is told too).
+#[test]
+fn a_node_that_moves_resumes_its_session_in_the_new_place_and_says_so() {
+    let fx = fixture();
+    let (a, b) = (fx.root.join("place-a"), fx.root.join("place-b"));
+    std::fs::create_dir_all(&a).unwrap();
+    std::fs::create_dir_all(&b).unwrap();
+    set_workspace(&fx, &a, true);
+    let mut agent = FakeAgent::new(&fx.fleet);
+    let mut driver = ConversationDriver::new(config(&fx, 100_000), Focus::Node(fx.node), ProtocolKind::Outline);
+    say(&mut driver, &fx, &mut agent, "think hello");
+    let id = driver.conversation_id().unwrap();
+    let session = agent.session_id(&format!("conversation-{id}")).unwrap();
+    assert_eq!(agent.last().resume_session_id, None);
+
+    set_workspace(&fx, &b, false);
+    let events = say(&mut driver, &fx, &mut agent, "think again");
+    assert_eq!(agent.last().resume_session_id.as_deref(), Some(session.as_str()), "the same session, resumed");
+    assert!(agent.last().cwd.ends_with("place-b"), "{:?}", agent.last().cwd);
+    assert!(
+        events.iter().any(|e| matches!(e, ConversationEvent::Notice(RunNotice::Error(m)) if m.contains("no copy"))),
+        "the user is told the log could not be brought: {events:?}"
+    );
+}
+
+/// A node with files set up that cannot be reached is an error the user
+/// sees, never a quiet change of where the agent works.
+#[test]
+fn a_node_whose_files_are_missing_is_an_error_not_a_scratch_directory() {
+    let fx = fixture();
+    set_workspace(&fx, &fx.root.join("not-there"), true);
+    let mut agent = FakeAgent::new(&fx.fleet);
+    let mut driver = ConversationDriver::new(config(&fx, 100_000), Focus::Node(fx.node), ProtocolKind::Outline);
+    let err = driver.send(&fx.fleet, &mut agent, "think hello").unwrap_err();
+    assert!(format!("{err:#}").contains("not-there"), "{err:#}");
+    assert!(agent.turns.is_empty(), "nothing was sent");
+    let id = driver.conversation_id().unwrap();
+    assert!(turns(&fx, id).iter().any(|(role, body)| *role == TurnRole::Error && body.contains("not-there")));
+    assert!(driver.status().last_error.is_some());
+}
+
+/// A copy of the session's log that fails after its turn is written into the
+/// node's conversation (so an unattended run shows it), once.
+#[test]
+fn a_background_failure_is_recorded_in_the_nodes_conversation_once() {
+    let fx = fixture();
+    let mut agent = FakeAgent::new(&fx.fleet);
+    let mut driver = ConversationDriver::new(config(&fx, 100_000), Focus::Node(fx.node), ProtocolKind::Outline);
+    say(&mut driver, &fx, &mut agent, "think hello");
+    let id = driver.conversation_id().unwrap();
+    let message = format!("test problem {id}");
+    tod_store::fleet::session_log::report_problem(&fx.node.to_string(), message.clone());
+    // Whoever polls first takes it (a parallel test's driver may); it is
+    // recorded either way, and not again.
+    super::problems::record_pending(&fx.fleet);
+    super::problems::record_pending(&fx.fleet);
+    let errors = turns(&fx, id).into_iter().filter(|(role, body)| *role == TurnRole::Error && *body == message).count();
+    assert_eq!(errors, 1);
 }
 
 /// A visual-design opening on an obligation carries the inherited context

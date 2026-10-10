@@ -62,7 +62,8 @@ impl Request {
 const PARTS_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// What the run is doing right now.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct Live {
     /// The conversation's protocol; `None` between conversations.
     pub protocol: Option<ProtocolKind>,
@@ -70,6 +71,22 @@ pub struct Live {
     /// The turn in flight, with its streamed parts (sent at most every
     /// [`PARTS_INTERVAL`] while only they change).
     pub status: ConversationStatus,
+}
+
+/// One node's runner as the host of its runs reports it: what the app shows
+/// and what it is pushed when it changes.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RunnerState {
+    pub node: Uuid,
+    /// A run is in progress.
+    pub running: bool,
+    /// A pause or stop was asked for and the run has not ended yet.
+    pub pausing: bool,
+    /// When the run in progress started (ms since the epoch).
+    pub since: i64,
+    pub live: Live,
+    /// How the last run ended.
+    pub outcome: Option<Outcome>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -124,6 +141,7 @@ impl LocalRun {
             .name(format!("autopilot-{node}"))
             .spawn(move || {
                 let mut hook = Hook {
+                    node,
                     request: hook_request,
                     on_event: &mut on_event,
                     last: None,
@@ -138,7 +156,10 @@ impl LocalRun {
                     if renew_budget {
                         pilot.renew_budget()?;
                     }
-                    pilot.run_with(&fleet, &mut SharedAgentAccess(&agent), &mut hook)
+                    let outcome = pilot.run_with(&fleet, &mut SharedAgentAccess(&agent), &mut hook);
+                    // Before the run stops for a wait, a request, or the end.
+                    push_branch(&fleet, node);
+                    outcome
                 })();
                 let result = result.map_err(|err| {
                     let error = format!("{err:#}");
@@ -199,6 +220,7 @@ impl LocalRun {
 }
 
 struct Hook<'a, F: FnMut(LocalEvent)> {
+    node: Uuid,
     request: Arc<AtomicU8>,
     on_event: &'a mut F,
     /// The last [`Live`] reported, so an unchanged one is not sent again.
@@ -240,10 +262,23 @@ impl<F: FnMut(LocalEvent)> Hook<'_, F> {
     }
 }
 
+/// Push the node's own branch, so finished work is on the remote and the next
+/// machine has it. A failure is logged, not fatal.
+fn push_branch(fleet: &FleetStore, node: Uuid) {
+    match tod_store::fleet::provision::push_node_branch(fleet, &node.to_string()) {
+        Ok(Some(branch)) => tracing::debug!(%node, %branch, "pushed the branch"),
+        Ok(None) => {}
+        Err(err) => tracing::warn!(%node, "pushing the branch: {err:#}"),
+    }
+}
+
 impl<F: FnMut(LocalEvent)> StepHook for Hook<'_, F> {
-    fn at(&mut self, _: &FleetStore, boundary: Boundary) -> Result<Option<String>> {
-        if boundary == Boundary::Step && !self.waiting {
-            self.report(Live::default());
+    fn at(&mut self, fleet: &FleetStore, boundary: Boundary) -> Result<Option<String>> {
+        if boundary == Boundary::Step {
+            push_branch(fleet, self.node);
+            if !self.waiting {
+                self.report(Live::default());
+            }
         }
         Ok(match self.requested() {
             Request::Run => None,

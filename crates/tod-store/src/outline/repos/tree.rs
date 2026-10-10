@@ -17,6 +17,16 @@ impl<'a> TreeLoader<'a> {
     }
 
     pub fn flatten_visible(&self, list_id: Uuid) -> Result<Vec<FlatNodeRow>> {
+        self.flatten(list_id, false)
+    }
+
+    /// Every node in tree order, including those under collapsed parents.
+    /// Rows carry their `collapsed` flag so a caller can hide what they hold.
+    pub fn flatten_all(&self, list_id: Uuid) -> Result<Vec<FlatNodeRow>> {
+        self.flatten(list_id, true)
+    }
+
+    fn flatten(&self, list_id: Uuid, include_collapsed: bool) -> Result<Vec<FlatNodeRow>> {
         let entries = crate::outline::repos::OutlineRepo::new(self.conn).list_for_list(list_id)?;
         if entries.is_empty() {
             return Ok(Vec::new());
@@ -26,7 +36,7 @@ impl<'a> TreeLoader<'a> {
         let mut data = TreeData::load(self.conn, list_id)?;
         data.count_managed(&by_parent, None, None);
         let mut out = Vec::new();
-        walk(&by_parent, &data, None, None, 0, &mut out);
+        walk(&by_parent, &data, None, None, 0, include_collapsed, &mut out);
         Ok(out)
     }
 }
@@ -63,6 +73,8 @@ struct TreeData {
     /// Tickets some managed node is: a non-managed node with one of these is
     /// a linked copy, which refreshes update. Not scoped to the list either.
     generated: HashSet<String>,
+    /// Nodes whose ticket is in a terminal state, from their synced metadata.
+    ticket_terminal: HashSet<Uuid>,
 }
 
 impl TreeData {
@@ -201,6 +213,21 @@ impl TreeData {
         drop(rows);
         drop(stmt);
 
+        let ticket_terminal = string_map(
+            conn,
+            &list_blob,
+            "SELECT x.node_id, x.body
+             FROM node_extra_content x JOIN outline_entries e ON e.node_id = x.node_id
+             WHERE e.list_id = ?1 AND x.content_type = 'metadata'",
+        )?
+        .into_iter()
+        .filter(|(_, body)| {
+            serde_json::from_str::<serde_json::Value>(body)
+                .is_ok_and(|meta| crate::outline::types::ticket_is_terminal(&meta))
+        })
+        .map(|(id, _)| id)
+        .collect();
+
         Ok(Self {
             nodes,
             managed,
@@ -214,6 +241,7 @@ impl TreeData {
             accept_destinations,
             copied,
             generated,
+            ticket_terminal,
         })
     }
 
@@ -269,6 +297,7 @@ fn walk(
     parent_id: Option<Uuid>,
     generator: Option<Uuid>,
     depth: usize,
+    include_collapsed: bool,
     out: &mut Vec<FlatNodeRow>,
 ) {
     let Some(children) = by_parent.get(&parent_id) else {
@@ -352,14 +381,23 @@ fn walk(
             accept_ready,
             linked_copy,
             has_copies,
+            ticket_terminal: ticket.is_some() && data.ticket_terminal.contains(&entry.node_id),
         });
-        if !entry.collapsed {
+        if include_collapsed || !entry.collapsed {
             let generator = if data.is_generator(entry.node_id) {
                 Some(entry.node_id)
             } else {
                 generator
             };
-            walk(by_parent, data, Some(entry.node_id), generator, depth + 1, out);
+            walk(
+                by_parent,
+                data,
+                Some(entry.node_id),
+                generator,
+                depth + 1,
+                include_collapsed,
+                out,
+            );
         }
     }
 }

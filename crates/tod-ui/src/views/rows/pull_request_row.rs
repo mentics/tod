@@ -76,6 +76,8 @@ pub fn pull_request_row<A: From<ItemListEvent> + 'static>(
         .child(
             state
                 .column(COLUMN_NUMBER, style::text_dense_muted(div()))
+                // A merged or closed pull request is struck through.
+                .when(pull.state.is_terminal(), |el| el.line_through())
                 .child(format!("#{}", pull.number)),
         )
         .child(

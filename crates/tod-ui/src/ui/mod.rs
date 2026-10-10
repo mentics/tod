@@ -2,6 +2,7 @@ pub mod actionable;
 pub mod agent_chat;
 pub mod agent_runs;
 pub(crate) mod driver_slot;
+pub mod off_thread;
 pub mod claude_adapter;
 pub mod agent_conversation;
 pub mod agent_permission;
@@ -27,4 +28,7 @@ pub mod terminal_handoff;
 pub mod toast;
 pub mod session_info;
 pub mod token_usage;
+pub mod row_scrollbar;
+#[cfg(test)]
+mod scrollbar_harness;
 pub mod transcript_list;

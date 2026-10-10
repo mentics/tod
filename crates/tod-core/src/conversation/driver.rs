@@ -92,7 +92,8 @@ pub struct ConversationConfig {
 }
 
 /// What the view shows about the turn in flight.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct ConversationStatus {
     /// A turn is in flight.
     pub running: bool,
@@ -100,6 +101,8 @@ pub struct ConversationStatus {
     pub activity: Option<String>,
     /// The turn in flight so far, part by part (text, thoughts, tool calls),
     /// when the provider streams them. Empty when no turn is in flight.
+    /// Not sent to the app by the daemon: too chatty for a feed.
+    #[serde(skip)]
     pub parts: Vec<ReplyPart>,
     /// The agent is blocked on a permission decision; answer it through the
     /// provider (`respond_to_permission`) with this request's run.
@@ -112,6 +115,7 @@ pub struct ConversationStatus {
     pub live_usage: Option<TokenUsage>,
     /// What the latest turn this driver started launched with: the platform,
     /// model, and effort asked for. `None` until it starts one.
+    #[serde(skip)]
     pub launch: Option<AgentLaunchOptions>,
 }
 
@@ -148,6 +152,8 @@ struct Run {
     /// The cloud sandbox the agent runs in, whose session logs are kept
     /// outside it (`tod_store::fleet::session_log`).
     sandbox: Option<String>,
+    /// Where the agent runs, so its session log can be kept for a move.
+    workdir: Workdir,
 }
 
 pub struct ConversationDriver {
@@ -172,6 +178,12 @@ pub struct ConversationDriver {
     last_error: Option<String>,
     live_usage: Option<TokenUsage>,
     launched: Option<AgentLaunchOptions>,
+    /// Where this driver last started a turn (this machine, a dev container,
+    /// a sandbox). A live agent session stays where it started, so a turn
+    /// that now belongs elsewhere closes it and resumes it there.
+    session_place: Option<Workdir>,
+    /// Things the user must be told, delivered by the next [`Self::tick`].
+    notices: Vec<RunNotice>,
 }
 
 impl ConversationDriver {
@@ -194,6 +206,8 @@ impl ConversationDriver {
             last_error: None,
             live_usage: None,
             launched: None,
+            session_place: None,
+            notices: Vec::new(),
         }
     }
 
@@ -237,6 +251,65 @@ impl ConversationDriver {
         }
     }
 
+    /// A conversation resumes by its session id, which only works where the
+    /// session's log is: when the node has moved (this machine, a cloud
+    /// sandbox), copy it here from where it is, under this working
+    /// directory's project name (`doc/agentd.md`, "Moving a node"). A failure
+    /// is logged: the resume then fails and the driver's recovery runs.
+    fn bring_session(&mut self, fleet: &FleetStore, conversation: Uuid, cwd: &Workdir, session: &str, moved: bool) {
+        use tod_store::fleet::session_log::{self as log, ContainerRemote, HostRemote, MirrorRemote, SandboxRemote};
+        let result = (|| -> anyhow::Result<bool> {
+            let host = HostRemote::new()?;
+            let mirror = match self.focus {
+                Focus::Node(node) | Focus::Obligation { node, .. } | Focus::PlanStep { node, .. } => {
+                    Some(MirrorRemote::new(fleet.paths().root(), &node.to_string()))
+                }
+                Focus::Project => None,
+            };
+            match cwd {
+                Workdir::Host(path) => {
+                    let sources: Vec<&dyn log::Remote> = mirror.iter().map(|m| m as &dyn log::Remote).collect();
+                    log::ensure_session(&host, &sources, session, &log::project_dir_name(&path.to_string_lossy()))
+                }
+                Workdir::Sandbox { sandbox, path } => {
+                    let target = SandboxRemote::new(sandbox);
+                    let mut sources: Vec<&dyn log::Remote> = vec![&host];
+                    sources.extend(mirror.iter().map(|m| m as &dyn log::Remote));
+                    log::ensure_session(&target, &sources, session, &log::project_dir_name(path))
+                }
+                Workdir::Container { container, path } => {
+                    let target = ContainerRemote::new(container)?;
+                    let mut sources: Vec<&dyn log::Remote> = vec![&host];
+                    sources.extend(mirror.iter().map(|m| m as &dyn log::Remote));
+                    log::ensure_session(&target, &sources, session, &log::project_dir_name(path))
+                }
+            }
+        })();
+        // Shown to the user: a move that quietly lost the session would
+        // otherwise look like an agent that forgot.
+        match result {
+            Ok(true) if moved => self.notices.push(RunNotice::Warning(format!(
+                "This node moved: the agent's session continues in {cwd}."
+            ))),
+            Ok(true) => {}
+            Ok(false) => self.fail_visibly(fleet, conversation, format!(
+                "There is no copy of the agent's session log to bring to {cwd}, so it cannot continue there; a fresh session will be started."
+            )),
+            Err(err) => self.fail_visibly(fleet, conversation, format!(
+                "Could not bring the agent's session log to {cwd}, so a fresh session will be started: {err:#}"
+            )),
+        }
+    }
+
+    /// Tell the user: a notice, and an error turn in the transcript (which an
+    /// unattended run's transcript shows too).
+    fn fail_visibly(&mut self, fleet: &FleetStore, conversation: Uuid, message: String) {
+        if let Err(err) = self.append(fleet, conversation, TurnRole::Error, &message) {
+            tracing::warn!("could not record an error in the transcript: {err:#}");
+        }
+        self.notices.push(RunNotice::Error(message));
+    }
+
     /// The stored conversation, once the first send created it.
     pub fn conversation_id(&self) -> Option<Uuid> {
         self.conversation_id
@@ -255,6 +328,16 @@ impl ConversationDriver {
             last_error: self.last_error.clone(),
             live_usage: self.live_usage.clone(),
             launch: self.launched.clone(),
+        }
+    }
+
+    /// [`Self::launch_options`] for a launch: an unreadable setting is an
+    /// error, never a quiet change of what the agent runs with.
+    fn try_launch_options(&self, fleet: &FleetStore) -> Result<AgentLaunchOptions> {
+        let kind = self.protocol.kind();
+        match &self.config.settings_path {
+            Some(path) => crate::conversation::launch::try_resolve_from(fleet, path, self.focus, kind),
+            None => crate::conversation::launch::try_for_focus(fleet, self.focus, self.config.launch.clone()),
         }
     }
 
@@ -487,6 +570,14 @@ impl ConversationDriver {
         agent: &mut A,
     ) -> Vec<ConversationEvent> {
         let mut events = Vec::new();
+        // Background session-log copies that failed since the last tick: put
+        // in the transcript, so an unattended run shows them too.
+        for problem in crate::conversation::problems::record_pending(fleet) {
+            self.notices.push(RunNotice::Error(problem));
+        }
+        for notice in std::mem::take(&mut self.notices) {
+            events.push(ConversationEvent::Notice(notice));
+        }
         let key = self.run.as_ref().map(|run| run.key.clone());
         if let Err(err) = self.poll(fleet, agent, &mut events) {
             let error = format!("{err:#}");
@@ -576,6 +667,17 @@ impl ConversationDriver {
                         fleet.paths().root().to_path_buf(),
                         node.to_string(),
                         sandbox,
+                    );
+                } else if let (Some(node), Some(session)) =
+                    (self.focus.node_id(), agent.with(|a| a.session_id(&run.key)))
+                {
+                    // On this machine or in a dev container the log is kept
+                    // too, so a move to another environment has it to copy.
+                    tod_store::fleet::session_log::keep_session_in_background(
+                        fleet.paths().root().to_path_buf(),
+                        node.to_string(),
+                        session,
+                        run.workdir.clone(),
                     );
                 }
                 let body = if parts.is_empty() {
@@ -910,24 +1012,59 @@ impl ConversationDriver {
         check_tod_cli()?;
         let (cwd, turn_env, progress) = {
             let env = self.env(fleet, id);
+            let cwd = match self.protocol.cwd(&env) {
+                Ok(cwd) => cwd,
+                Err(err) => {
+                    // Shown in the transcript and the view: the turn is not sent.
+                    let message = format!("{err:#}");
+                    self.append(fleet, id, TurnRole::Error, &message)?;
+                    self.last_error = Some(message);
+                    return Err(err);
+                }
+            };
             if let Err(err) = self.protocol.prepare(&env) {
-                tracing::warn!("preparing the working directory: {err:#}");
+                let err = err.context("preparing the working directory");
+                let message = format!("{err:#}");
+                self.append(fleet, id, TurnRole::Error, &message)?;
+                self.last_error = Some(message);
+                return Err(err);
             }
             let mut turn_env = self.protocol.turn_env(&env);
             turn_env.extend(tod_cli_path_env());
             (
-                self.protocol.cwd(&env)?,
+                cwd,
                 turn_env,
                 self.protocol.progress(&env).ok().flatten(),
             )
         };
         let environment = launch_environment(fleet, self.focus, &cwd)?;
+        // The node moved while its session was live: the agent process is
+        // still where it began, so end it and resume the same session here
+        // (`doc/agentd.md`, "Moving a node").
+        let mut resume = resume;
+        let mut moved = false;
+        if resume.is_none()
+            && context.is_none()
+            && self.session_place.as_ref().is_some_and(|place| *place != cwd)
+        {
+            moved = true;
+            resume = agent.with(|a| {
+                let session = a.session_id(&key);
+                a.close_session(&key);
+                session
+            });
+        }
+        self.session_place = Some(cwd.clone());
+        if let Some(session) = &resume {
+            self.bring_session(fleet, id, &cwd, session, moved);
+        }
         self.progress_before = progress;
         // Whatever the protocol, an agent running in a codebase gets its rules.
         let context =
             context.map(|context| crate::codebase_rules::with_codebase_rules_in(context, &cwd));
         // An agent inside a dev container or sandbox is started from the
         // data root here.
+        let workdir = cwd.clone();
         let sandbox = match &cwd {
             Workdir::Sandbox { sandbox, .. } => Some(sandbox.clone()),
             _ => None,
@@ -946,7 +1083,15 @@ impl ConversationDriver {
             + images.len() as i64 * IMAGE_TOKENS;
         self.session_tokens = Some(self.session_tokens.unwrap_or(0) + sent);
         let cold_resume = resume.is_some();
-        let options = self.launch_options(fleet);
+        let options = match self.try_launch_options(fleet) {
+            Ok(options) => options,
+            Err(err) => {
+                let message = format!("{err:#}");
+                self.append(fleet, id, TurnRole::Error, &message)?;
+                self.last_error = Some(message);
+                return Err(err);
+            }
+        };
         self.launched = Some(options.clone());
         let turn_had_images = !images.is_empty();
         let turn = SessionTurn {
@@ -991,6 +1136,7 @@ impl ConversationDriver {
             title,
             session_saved: false,
             sandbox,
+            workdir,
         });
         crate::journey::record(
             self.journey_key(),

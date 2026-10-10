@@ -90,6 +90,7 @@ pub enum RowAction {
         position: gpui::Point<gpui::Pixels>,
     },
     /// The row's attention badge (needs-you count).
+    #[cfg(test)]
     OpenTaskPanel {
         task_id: String,
     },
@@ -577,6 +578,13 @@ impl ListDelegate for TaskListDelegate {
             .pl(depth_indent)
             .child(chevron_cell)
             .when_some(item.ticket_id.clone(), |row, ticket| {
+                // The generator link colors the ticket id, not the title.
+                let ticket_color = if item.linked_copy {
+                    // `styles.node-ticket-linked-copy`
+                    crate::ui::style::color::linked_copy_text()
+                } else {
+                    link_color
+                };
                 let sink = sink.clone();
                 let task_id_ticket = item.id.clone();
                 row.child(
@@ -584,8 +592,10 @@ impl ListDelegate for TaskListDelegate {
                         .id(SharedString::from(format!("row-ticket-{}", item.id)))
                         .text_xs()
                         .font_semibold()
-                        .text_color(link_color)
+                        .text_color(ticket_color)
                         .underline()
+                        // A done or canceled ticket is struck through.
+                        .when(item.ticket_terminal, |el| el.line_through())
                         .cursor_pointer()
                         .flex_shrink_0()
                         .child(format!("{ticket}: "))
@@ -603,11 +613,19 @@ impl ListDelegate for TaskListDelegate {
             })
             .when(item.ticket_id.is_none(), |row| {
                 row.when_some(item.external_id.clone(), |row, external_id| {
+                    // A managed row with a linked copy colors its ticket id.
+                    let external_color = if item.has_copies {
+                        // `styles.node-ticket-has-copies`
+                        crate::ui::style::color::linked_source_text()
+                    } else {
+                        muted_foreground
+                    };
                     row.child(
                         div()
                             .text_xs()
                             .font_semibold()
-                            .text_color(muted_foreground)
+                            .text_color(external_color)
+                            .when(item.ticket_terminal, |el| el.line_through())
                             .flex_shrink_0()
                             .child(format!("{external_id}: ")),
                     )
@@ -621,23 +639,11 @@ impl ListDelegate for TaskListDelegate {
         } else {
             let title_color = if item.title.is_empty() {
                 muted_foreground
-            } else if item.needs_you_count > 0 {
-                // `styles.node-title-needs-you`
-                crate::ui::style::color::node_needs_you_text()
-            } else if item.finished_run.is_some() {
-                // `styles.node-title-finished`
-                crate::ui::style::color::node_finished_text()
-            } else if item.lifecycle_running || item.chat_running {
-                // `styles.node-title-running`
-                crate::ui::style::color::node_running_text()
-            } else if item.has_copies {
-                // `styles.node-title-has-copies`
-                crate::ui::style::color::linked_source_text()
+            } else if item.awaiting {
+                // A wait nobody owes anything to: out of the way.
+                muted_foreground
             } else if managed {
                 muted_foreground
-            } else if item.linked_copy {
-                // `styles.node-title-linked-copy`
-                crate::ui::style::color::linked_copy_text()
             } else {
                 foreground
             };
@@ -649,11 +655,6 @@ impl ListDelegate for TaskListDelegate {
                     display_title.clone(),
                     selected,
                     managed,
-                    item.incoming_count > 0
-                        && item.needs_you_count == 0
-                        && !item.lifecycle_running
-                        && !item.chat_running
-                        && item.finished_run.is_none(),
                     item.id.clone(),
                     sink.clone(),
                 ),
@@ -767,6 +768,7 @@ impl ListDelegate for TaskListDelegate {
                 item.lifecycle_running,
                 item.chat_running,
                 item.finished_run,
+                item.incoming_count > 0,
             ))
             .child(title_line)
             .when_some(menu_at, |el, (at, menu)| el.child(popup_at(at, menu)));
@@ -797,18 +799,21 @@ impl ListDelegate for TaskListDelegate {
     }
 }
 
-/// The fixed-width cell at the left of a row: an alert icon when the node
-/// waits on the user; else, for something that stopped since the row was last
-/// selected, its icon in a circle; else a play icon while its lifecycle
-/// processor runs, or a square while only the chat panel does. The shape
-/// says which: play for the lifecycle processor, square for the chat panel.
-/// Static on purpose (a tree of animated rows would distract), and always
-/// reserved so rows do not shift when a run starts or stops.
+/// The fixed-width cell at the left of a row. Three live states nest in one
+/// 16px glyph so any combination shows at once without taking more room: a
+/// circle while the lifecycle processor runs, a triangle while the node waits
+/// on the user, a square while a chat session is active (the triangle's
+/// corners stay visible around the square). With none of those, an
+/// icon ringed in a circle for something that stopped since the row was last
+/// selected, else the incoming-changes dot. Static on purpose (a tree of
+/// animated rows would distract), and always reserved so rows do not shift
+/// when a run starts or stops.
 fn status_icon_cell(
     needs_you: bool,
     lifecycle_running: bool,
     chat_running: bool,
     finished: Option<RunSource>,
+    pending_changes: bool,
 ) -> gpui::Div {
     use gpui_kit_assets::IconName;
     let cell = div()
@@ -816,20 +821,16 @@ fn status_icon_cell(
         .flex_shrink_0()
         .flex()
         .items_center();
-    let source_icon = |source| match source {
-        RunSource::Lifecycle => IconName::Play,
-        RunSource::Chat => IconName::Square,
-    };
-    if needs_you {
-        return cell.child(
-            gpui_component::Icon::new(IconName::TriangleAlert)
-                .xsmall()
-                .text_color(crate::ui::style::color::node_needs_you_text()),
-        );
+    if needs_you || lifecycle_running || chat_running {
+        return cell.child(nested_status_glyph(needs_you, lifecycle_running, chat_running));
     }
     if let Some(source) = finished {
-        // `styles.node-title-finished`: the icon keeps its shape, ringed.
+        // `styles.node-status-finished`: the icon keeps its shape, ringed.
         let color = crate::ui::style::color::node_finished_text();
+        let icon = match source {
+            RunSource::Lifecycle => IconName::Play,
+            RunSource::Chat => IconName::Square,
+        };
         return cell.child(
             div()
                 .size(px(14.0))
@@ -839,21 +840,76 @@ fn status_icon_cell(
                 .rounded_full()
                 .border_1()
                 .border_color(color)
-                .child(gpui_component::Icon::new(source_icon(source)).size(px(8.0)).text_color(color)),
+                .child(gpui_component::Icon::new(icon).size(px(8.0)).text_color(color)),
         );
     }
-    let source = if lifecycle_running {
-        RunSource::Lifecycle
-    } else if chat_running {
-        RunSource::Chat
+    if pending_changes {
+        // `styles.node-status-pending-changes`: incoming changes not yet
+        // checked against; rare, so it stands out from the other rows.
+        return cell.child(
+            gpui_component::Icon::new(IconName::CircleDot)
+                .xsmall()
+                .text_color(crate::ui::style::color::incoming_text()),
+        );
+    }
+    cell
+}
+
+/// `styles.node-status-nested`: circle (lifecycle running) outside, filled
+/// triangle (needs the user) inside it, square (chat active) at the centre.
+/// Each layer is drawn only when its state holds, in the same place.
+fn nested_status_glyph(needs_you: bool, lifecycle_running: bool, chat_running: bool) -> gpui::Div {
+    use gpui::{canvas, point, PathBuilder};
+    let glyph = div().relative().size(px(16.0)).flex_shrink_0();
+    let glyph = if lifecycle_running {
+        glyph.child(
+            div()
+                .absolute()
+                .top(px(1.0))
+                .left(px(1.0))
+                .size(px(14.0))
+                .rounded_full()
+                .border(px(1.5))
+                .border_color(crate::ui::style::color::node_running_text()),
+        )
     } else {
-        return cell;
+        glyph
     };
-    cell.child(
-        gpui_component::Icon::new(source_icon(source))
-            .xsmall()
-            .text_color(crate::ui::style::color::node_running_text()),
-    )
+    let glyph = if needs_you {
+        glyph.child(
+            canvas(
+                |_, _, _| {},
+                |bounds, _, window, _| {
+                    let at = |x: f32, y: f32| point(bounds.origin.x + px(x), bounds.origin.y + px(y));
+                    let mut path = PathBuilder::fill();
+                    path.move_to(at(8.0, 2.6));
+                    path.line_to(at(13.6, 12.4));
+                    path.line_to(at(2.4, 12.4));
+                    path.close();
+                    if let Ok(path) = path.build() {
+                        window.paint_path(path, crate::ui::style::color::node_needs_you_text());
+                    }
+                },
+            )
+            .absolute()
+            .size_full(),
+        )
+    } else {
+        glyph
+    };
+    if chat_running {
+        glyph.child(
+            div()
+                .absolute()
+                .top(px(5.0))
+                .left(px(5.0))
+                .size(px(6.0))
+                .rounded(px(1.0))
+                .bg(crate::ui::style::color::node_chat_text()),
+        )
+    } else {
+        glyph
+    }
 }
 
 fn title_label(
@@ -863,7 +919,6 @@ fn title_label(
     title: String,
     selected: bool,
     managed: bool,
-    pending_changes: bool,
     task_id: String,
     sink: Rc<RefCell<Vec<RowAction>>>,
 ) -> impl gpui::IntoElement {
@@ -872,17 +927,15 @@ fn title_label(
         .flex_1()
         .min_w_0()
         .when(selected, |el| el.cursor_pointer())
-        .child(if pending_changes {
-            crate::ui::style::node_title_pending_changes(div()).child(title)
-        } else {
+        .child(
             div()
                 .text_sm()
                 .font_medium()
                 .text_color(foreground)
                 .overflow_hidden()
                 .text_ellipsis()
-                .child(title)
-        })
+                .child(title),
+        )
         .when(selected, |el| {
             el.on_mouse_down(MouseButton::Left, {
                 let task_id = task_id.clone();

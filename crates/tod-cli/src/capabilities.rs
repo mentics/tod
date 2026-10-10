@@ -16,7 +16,7 @@ pub(crate) const USAGE: &str = "\
 tod-cli capabilities — a node's capabilities and their settings
 
 Nodes may be addressed by slug or full UUID. <CAP> is one of spec, lifecycle,
-agent, generator, tags, files, ticket.
+agent, generator, tags, files, ticket, environment, lifecycle-config.
 
 COMMANDS:
     list    <NODE>
@@ -29,6 +29,7 @@ COMMANDS:
     set     <NODE> ticket [--ticket <ID>] [--pr <URL>]...
     set     <NODE> tags (--tags <A,B,..> | --add <TAG> | --remove <TAG>)
     set     <NODE> generator --source <TYPE> --config <JSON>
+    set     <NODE> lifecycle-config (--phase <PHASE> --skills <A,B,..> | --clear <PHASE>)
 
 `list` shows the enabled capabilities and each one's settings. `enable` adds
 capabilities with their defaults; generator and lifecycle cannot both be on.
@@ -40,6 +41,13 @@ empty value (`--model ''`) clears one. A node is at most one ticket:
 `--ticket` replaces it (`--ticket ''` clears it); note any related tickets
 on the node instead. `--pr` replaces the whole list when given. The capability must already be enabled. A node's lifecycle
 state cannot be set here.
+
+`lifecycle-config` sets the skills the agent for a phase uses, for this node
+and everything below it. <PHASE> is one of proposed, design, planning,
+implement, verify, review, fix, pr, merged, released, learn. `--skills` replaces
+that phase's list (`--skills ''` means no skills, even where an ancestor sets
+some); `--clear` removes the phase from this node so the nearest ancestor's
+applies again. Other phases are untouched.
 
 `--container` runs the node's agents, terminals, and git inside that running
 dev container (`--container ''` runs them on this machine again). The
@@ -82,7 +90,7 @@ pub fn run(inv: Invocation) -> anyhow::Result<String> {
 fn parse_cap(raw: &str) -> anyhow::Result<Capability> {
     Capability::parse(&raw.to_ascii_lowercase()).ok_or_else(|| {
         anyhow::anyhow!(
-            "unknown capability `{raw}` (expected: spec, lifecycle, agent, generator, tags, files, ticket)"
+            "unknown capability `{raw}` (expected: spec, lifecycle, agent, generator, tags, files, ticket, environment, lifecycle-config)"
         )
     })
 }
@@ -230,6 +238,26 @@ fn list(inv: &Invocation, node: Uuid) -> anyhow::Result<String> {
             Capability::Tags => format!("tags: {}", list(&s.tags)),
             Capability::Environment => {
                 "environment: see `tod-cli environment list`".to_string()
+            }
+            Capability::LifecycleConfig => {
+                let skills = inv
+                    .client()
+                    .read(|conn| tod_store::lifecycle_config::skills(conn, node))?;
+                if skills.is_empty() {
+                    "lifecycle-config: no phases set".to_string()
+                } else {
+                    let phases: Vec<String> = skills
+                        .iter()
+                        .map(|(phase, names)| {
+                            if names.is_empty() {
+                                format!("{phase}: none")
+                            } else {
+                                format!("{phase}: {}", names.join(", "))
+                            }
+                        })
+                        .collect();
+                    format!("lifecycle-config: {}", phases.join("; "))
+                }
             }
             Capability::Generator => match &s.generator {
                 Some((source, config)) => format!(
@@ -402,6 +430,41 @@ fn set(inv: &Invocation, node: Uuid, args: &Args) -> anyhow::Result<String> {
                 data_source_type: source,
                 config_json: parsed.to_string(),
             }
+        }
+        Capability::LifecycleConfig => {
+            let mut skills = inv
+                .client()
+                .read(|conn| tod_store::lifecycle_config::skills(conn, node))?;
+            let phase_ok = |phase: &str| -> anyhow::Result<()> {
+                if tod_store::lifecycle_config::is_phase(phase) {
+                    Ok(())
+                } else {
+                    anyhow::bail!(
+                        "unknown phase `{phase}` (expected: {})",
+                        tod_store::lifecycle_config::PHASES.join(", ")
+                    )
+                }
+            };
+            match (args.get("--phase"), args.get("--skills"), args.get("--clear")) {
+                (Some(phase), Some(names), None) => {
+                    phase_ok(phase)?;
+                    let list = names
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|n| !n.is_empty())
+                        .map(String::from)
+                        .collect();
+                    skills.insert(phase.to_string(), list);
+                }
+                (None, None, Some(phase)) => {
+                    phase_ok(phase)?;
+                    skills.remove(phase);
+                }
+                _ => anyhow::bail!(
+                    "give `--phase <PHASE> --skills <A,B,..>` or `--clear <PHASE>`"
+                ),
+            }
+            OutlineMutation::SetNodeLifecycleConfig { node_id: node, skills }
         }
         Capability::Environment => anyhow::bail!(
             "environment entries are managed with `tod-cli environment`, not `capabilities set`"

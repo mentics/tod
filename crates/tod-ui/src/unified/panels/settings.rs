@@ -15,11 +15,8 @@ use crate::interview::TodPaths;
 use crate::unified::panel::ColumnPanel;
 use crate::views::task_edit::TaskEditView;
 
-use super::node_title;
 
 pub struct SettingsPanel {
-    fleet: Arc<FleetStore>,
-    node_id: Uuid,
     inner: Entity<TaskEditView>,
 }
 
@@ -39,16 +36,9 @@ impl SettingsPanel {
             view
         });
         Self {
-            fleet,
-            node_id,
             inner,
         }
     }
-
-    pub fn node_id(&self) -> Uuid {
-        self.node_id
-    }
-
 }
 
 impl ColumnPanel for SettingsPanel {
@@ -56,9 +46,6 @@ impl ColumnPanel for SettingsPanel {
         "Settings".into()
     }
 
-    fn target_label(&self, _cx: &App) -> SharedString {
-        node_title(&self.fleet, self.node_id).into()
-    }
 }
 
 impl Focusable for SettingsPanel {
@@ -112,8 +99,6 @@ mod tests {
         let fixture = Fixture::new();
         let (view, cx) = open_view(&fixture, cx);
 
-        let node_id = view.read_with(cx, |view, _| view.node_id());
-        assert_eq!(node_id, fixture.node_id);
         let open_task_id = view.update(cx, |view, cx| {
             view.inner.update(cx, |inner, cx| inner.open_task_id(cx))
         });

@@ -1,9 +1,11 @@
 //! How a short-lived process reaches interview data: `tod-cli`, and the mock
 //! agent standing in for one.
 //!
-//! Writes go to a running `tod` over its mutation socket when one is live (it
-//! holds the exclusive store lock); otherwise the store is opened directly.
-//! Reads never need the lock and use a read-only connection.
+//! Writes go to the resident daemon, which owns the store (`doc/agentd.md`),
+//! starting it when none runs. A process that owns its own data root instead
+//! (the cloud supervisor, the orchestrator) is reached over its mutation
+//! socket; with neither, the store is opened directly. Reads never need the
+//! lock and use a read-only connection.
 
 use anyhow::{Context, Result, bail};
 use rusqlite::Connection;
@@ -12,6 +14,10 @@ use std::io::{BufRead, BufReader, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+use tod_agentd_client::Paths;
+use tod_agentd_client::client as daemon_client;
+use tod_agentd_client::remote::DaemonWriter;
+use tod_store::fleet::writer::{FleetMutation, RemoteWriter};
 use tod_store::fleet::{FleetPaths, FleetStore, schema};
 use tod_store::interview::{ACTOR_ENV, ACTOR_USER, InterviewCommand};
 use tod_store::outline::OutlineMutation;
@@ -19,6 +25,8 @@ use tod_store::outline::OutlineMutation;
 pub struct InterviewClient {
     data_root: PathBuf,
     actor: String,
+    /// Whether to start the daemon when none runs.
+    start_daemon: bool,
 }
 
 impl InterviewClient {
@@ -26,7 +34,14 @@ impl InterviewClient {
         Self {
             data_root: data_root.into(),
             actor: actor.into(),
+            start_daemon: true,
         }
+    }
+
+    /// Never start the daemon: write to one that runs, or the old way.
+    pub fn without_daemon(mut self) -> Self {
+        self.start_daemon = false;
+        self
     }
 
     /// Acting as the interview agent session named in the environment, or the user.
@@ -53,9 +68,15 @@ impl InterviewClient {
     }
 
     pub fn interview(&self, command: InterviewCommand) -> Result<Value> {
+        if let Some(daemon) = self.running_daemon() {
+            return daemon.interview(&self.actor, command);
+        }
         let request = json!({ "actor": self.actor, "interview": command });
         if let Some(reply) = self.forward(&request)? {
             return Ok(reply);
+        }
+        if let Some(daemon) = self.started_daemon() {
+            return daemon.interview(&self.actor, command);
         }
         self.open_store()?
             .interview(&self.actor, command)
@@ -63,9 +84,17 @@ impl InterviewClient {
     }
 
     pub fn outline(&self, mutation: OutlineMutation) -> Result<()> {
+        if let Some(daemon) = self.running_daemon() {
+            daemon.enqueue(&self.actor, FleetMutation::Outline(mutation))?;
+            return daemon.flush();
+        }
         let request = json!({ "actor": self.actor, "outline": mutation });
         if self.forward(&request)?.is_some() {
             return Ok(());
+        }
+        if let Some(daemon) = self.started_daemon() {
+            daemon.enqueue(&self.actor, FleetMutation::Outline(mutation))?;
+            return daemon.flush();
         }
         let store = self.open_store()?;
         store
@@ -88,6 +117,33 @@ impl InterviewClient {
             return f(&conn);
         }
         self.open_store()?.read(f)
+    }
+
+    /// The daemon for this data root, when one is running.
+    fn running_daemon(&self) -> Option<DaemonWriter> {
+        daemon_client::connect(&Paths::new(&self.data_root))
+            .map(|_| DaemonWriter::new(&self.data_root, None))
+    }
+
+    /// Start the daemon for this data root (no process answered for it), if
+    /// there is one beside this program and starting is allowed.
+    fn started_daemon(&self) -> Option<DaemonWriter> {
+        // `TOD_NO_DAEMON` is for tests that run `tod-cli` on a throwaway data
+        // root: a daemon started for it would outlive the test.
+        if !self.start_daemon || std::env::var_os("TOD_NO_DAEMON").is_some_and(|v| !v.is_empty()) {
+            return None;
+        }
+        // No daemon beside this program: write the old way.
+        let executable = daemon_client::locate_executable().ok()?;
+        match daemon_client::ensure_running(&self.data_root, &executable) {
+            Ok(_) => {}
+            Err(err) if err.downcast_ref::<daemon_client::DaemonNewer>().is_some() => {}
+            Err(err) => {
+                eprintln!("tod: could not start tod-agentd: {err:#}");
+                return None;
+            }
+        }
+        Some(DaemonWriter::new(&self.data_root, Some(executable)))
     }
 
     fn open_store(&self) -> Result<FleetStore> {
@@ -170,7 +226,7 @@ mod tests {
     #[test]
     fn writes_go_to_a_running_instance_attributed_to_the_actor() {
         let (root, server) = fake_instance(r#"ok {"id":"q-7"}"#);
-        let client = InterviewClient::new(&root, "session-123");
+        let client = InterviewClient::new(&root, "session-123").without_daemon();
         let session_id = Uuid::new_v4();
         let value = client
             .interview(InterviewCommand::SetExhausted {
@@ -191,6 +247,7 @@ mod tests {
         let (root, server) =
             fake_instance("err conflict: this changed after your context was built");
         let err = InterviewClient::new(&root, ACTOR_USER)
+            .without_daemon()
             .interview(InterviewCommand::SetExhausted {
                 session_id: Uuid::new_v4(),
                 reason: None,
@@ -216,7 +273,7 @@ mod tests {
             port.to_string(),
         )
         .unwrap();
-        let client = InterviewClient::new(&root, ACTOR_USER);
+        let client = InterviewClient::new(&root, ACTOR_USER).without_daemon();
         let err = client
             .interview(InterviewCommand::SetExhausted {
                 session_id: Uuid::new_v4(),

@@ -18,6 +18,15 @@ pub struct CommandEntry {
     pub action_id: Option<i64>,
 }
 
+/// What a client of the daemon shows of an entry: the daemon keeps the
+/// inverses, and undoes by id.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct EntrySummary {
+    pub id: Uuid,
+    pub label: String,
+    pub created_at: i64,
+}
+
 #[derive(Debug)]
 pub struct CommandLog {
     entries: Vec<CommandEntry>,
@@ -49,6 +58,35 @@ impl CommandLog {
 
     pub fn set_suppressed(&mut self, suppressed: bool) {
         self.recording_suppressed = suppressed;
+    }
+
+    /// The entries as summaries, oldest first.
+    pub fn summaries(&self) -> Vec<EntrySummary> {
+        self.entries
+            .iter()
+            .map(|e| EntrySummary { id: e.id, label: e.label.clone(), created_at: e.created_at })
+            .collect()
+    }
+
+    /// Replace the entries with the daemon's (a client mirrors, it does not
+    /// record), telling subscribers when they changed.
+    pub fn replace_with_summaries(&mut self, summaries: Vec<EntrySummary>) {
+        let same = summaries.len() == self.entries.len()
+            && summaries.iter().zip(&self.entries).all(|(s, e)| s.id == e.id);
+        if same {
+            return;
+        }
+        self.entries = summaries
+            .into_iter()
+            .map(|s| CommandEntry {
+                id: s.id,
+                label: s.label,
+                created_at: s.created_at,
+                inverses: Vec::new(),
+                action_id: None,
+            })
+            .collect();
+        let _ = self.tx.send(());
     }
 
     pub fn entries(&self) -> &[CommandEntry] {

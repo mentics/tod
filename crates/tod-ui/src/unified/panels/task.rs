@@ -70,6 +70,8 @@ pub(crate) struct TaskHeader {
     /// The Linear ticket's browser URL, when both the id and the workspace
     /// slug are known.
     pub ticket_url: Option<String>,
+    /// The ticket is done or canceled: its id is struck through.
+    pub ticket_terminal: bool,
     /// The pull requests linked to the node (its Ticket capability's links,
     /// where `tod-cli pr open` adds the one it opens).
     pub pull_requests: Vec<tod_store::github::NodePr>,
@@ -117,6 +119,9 @@ fn load(fleet: &FleetStore, node_id: Uuid) -> TaskHeader {
             .and_then(|json_str| serde_json::from_str::<serde_json::Value>(&json_str).ok());
         header.ticket_url =
             tod_integration::linear_issue_url(metadata.as_ref(), fleet.paths().root(), ticket);
+        header.ticket_terminal = metadata
+            .as_ref()
+            .is_some_and(tod_store::outline::types::ticket_is_terminal);
     }
     header.pull_requests = fleet
         .read(|conn| Ok(tod_store::github::NodePrRepo::new(conn).read(node_id)?))
@@ -332,6 +337,7 @@ impl TaskPanel {
             _runners_sub,
         };
         panel.track_run_since(cx);
+        panel.refresh_pr_states(cx);
         panel.refresh_runner(cx);
         ChangesWatch::recompute(&mut panel, node_id, cx);
         panel
@@ -358,7 +364,34 @@ impl TaskPanel {
 
     fn reload(&mut self, cx: &mut Context<Self>) {
         self.header = load(&self.fleet, self.node_id);
+        self.refresh_pr_states(cx);
         cx.notify();
+    }
+
+    /// Read the state of the linked pull requests from GitHub, off the UI
+    /// thread, and redraw when one changed (a merged one is struck through).
+    fn refresh_pr_states(&mut self, cx: &mut Context<Self>) {
+        let prs: Vec<_> = self
+            .header
+            .pull_requests
+            .iter()
+            .filter(|pr| tod_core::pull_requests::pull_state_stale(pr))
+            .cloned()
+            .collect();
+        if prs.is_empty() {
+            return;
+        }
+        let root = self.fleet.paths().root().to_path_buf();
+        cx.spawn(async move |this, cx| {
+            let changed = cx
+                .background_executor()
+                .spawn(async move { tod_core::pull_requests::refresh_pull_states(&root, &prs) })
+                .await;
+            if changed {
+                this.update(cx, |_, cx| cx.notify()).ok();
+            }
+        })
+        .detach();
     }
 
     fn open(&self, target: PanelKind, ctrl: bool, cx: &mut Context<Self>) {
@@ -388,13 +421,25 @@ impl TaskPanel {
                     .gap_2()
                     .when_some(self.header.ticket_id.clone(), |el, ticket| {
                         el.child(match self.header.ticket_url.clone() {
-                            Some(url) => self.external_link("unified-task-ticket", ticket, url, cx),
-                            None => style::text_muted(div()).child(ticket).into_any_element(),
+                            Some(url) => self.external_link(
+                                "unified-task-ticket",
+                                ticket,
+                                url,
+                                self.header.ticket_terminal,
+                                cx,
+                            ),
+                            None => style::text_muted(div())
+                                .when(self.header.ticket_terminal, |el| el.line_through())
+                                .child(ticket)
+                                .into_any_element(),
                         })
                     })
                     .children(self.header.pull_requests.iter().enumerate().map(|(ix, pr)| {
                         let label = format!("{}#{}", pr.repo, pr.pr_number);
-                        self.external_link(("unified-task-pr", ix), label, pr.url.clone(), cx)
+                        // A merged or closed pull request is struck through.
+                        let finished = tod_core::pull_requests::cached_pull_state(pr)
+                            .is_some_and(|state| state.is_terminal());
+                        self.external_link(("unified-task-pr", ix), label, pr.url.clone(), finished, cx)
                     })),
             )
             .into_any_element()
@@ -406,9 +451,11 @@ impl TaskPanel {
         id: impl Into<ElementId>,
         label: String,
         url: String,
+        struck: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         style::text_link_external(div().id(id))
+            .when(struck, |el| el.line_through())
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |_this, _event: &MouseDownEvent, _, cx| {
@@ -887,6 +934,19 @@ impl TaskPanel {
                             .child(format!("waiting {}", elapsed.unwrap_or_default())),
                     );
                 }
+                RunnerStatus::Awaiting { what, due_at_ms } => {
+                    let next = chrono::DateTime::from_timestamp_millis(*due_at_ms)
+                        .map(|t| t.with_timezone(&chrono::Local).format("%a %H:%M").to_string())
+                        .unwrap_or_default();
+                    line = line.child(sep()).child(style::text_muted(div().flex_1().min_w_0()).child(
+                        selectable_text(
+                            "unified-task-runner-awaiting",
+                            format!("waiting for {what}; next check {next}"),
+                            window,
+                            cx,
+                        ),
+                    ));
+                }
                 RunnerStatus::Failed { error } => {
                     line = line.child(sep()).child(style::text_error(div().flex_1().min_w_0()).child(
                         selectable_text("unified-task-runner-error", error.clone(), window, cx),
@@ -1009,9 +1069,6 @@ impl ColumnPanel for TaskPanel {
         "Task".into()
     }
 
-    fn target_label(&self, _cx: &App) -> SharedString {
-        self.header.title.clone().into()
-    }
 }
 
 impl EventEmitter<PanelOpenRequest> for TaskPanel {}
@@ -1027,6 +1084,7 @@ impl Render for TaskPanel {
         if self.pending_refresh {
             self.pending_refresh = false;
             self.header = load(&self.fleet, self.node_id);
+            self.refresh_pr_states(cx);
         }
         let identity = self.render_identity(window, cx);
         let artifacts = self.render_artifacts(cx);

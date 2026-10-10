@@ -16,6 +16,7 @@
 //! Observers are notified whenever anything shown changes, including the
 //! node's lifecycle, so they re-read it from the store.
 
+use crate::ui::off_thread::off_thread;
 use gpui::Context;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -123,8 +124,37 @@ impl LifecycleController {
     /// Move the node straight back to `target`, several states if need be,
     /// with no confirmation: the caller's button names the state, and it is
     /// only offered when the node's current state no longer holds
-    /// (`tod_core::lifecycle_validity`). `true` when the node moved.
-    pub fn revert_to(&mut self, task_id: &str, target: &str, cx: &mut Context<Self>) -> bool {
+    /// (`tod_core::lifecycle_validity`). The write is made off the UI thread.
+    pub fn revert_to(&mut self, task_id: &str, target: &'static str, cx: &mut Context<Self>) {
+        let Ok(node_id) = Uuid::parse_str(task_id) else {
+            return;
+        };
+        let state = self.gate_states.entry(task_id.to_string()).or_default();
+        state.revert_armed = false;
+        state.force_advance_armed = false;
+        let fleet = self.fleet.clone();
+        let task_id = task_id.to_string();
+        off_thread(
+            cx,
+            move || tod_core::lifecycle::set_lifecycle(&fleet, node_id, target).map_err(|e| format!("{e:#}")),
+            move |this, result, cx| {
+                let state = this.gate_states.entry(task_id).or_default();
+                match result {
+                    Ok(()) => {
+                        state.gate_error = None;
+                        state.gate_status = format!("Moved back to {target}.");
+                        state.criteria_detail.clear();
+                    }
+                    Err(err) => state.gate_error = Some(format!("Failed to move back: {err}")),
+                }
+                cx.notify();
+            },
+        );
+    }
+
+    /// [`Self::revert_to`], waiting for the store and saying whether the node
+    /// moved: for a caller that moves several nodes and counts them.
+    pub fn revert_to_blocking(&mut self, task_id: &str, target: &str, cx: &mut Context<Self>) -> bool {
         let Ok(node_id) = Uuid::parse_str(task_id) else {
             return false;
         };

@@ -126,6 +126,21 @@ pub struct OpenThread {
     pub reviewer: Option<String>,
 }
 
+/// Where the people's review of the pull request stands: the latest decisive
+/// review (approval, requested changes, or a dismissal) of each reviewer who
+/// is not a bot. Comments decide nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HumanReview {
+    /// No person has approved or asked for changes (or every such review
+    /// was dismissed).
+    Pending,
+    /// At least one person approved and none asks for changes.
+    Approved,
+    /// At least one person asks for changes. `unaddressed` is when the
+    /// request is newer than the head commit: nothing has been pushed since.
+    ChangesRequested { unaddressed: bool },
+}
+
 /// What a pull request stands at.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Assessment {
@@ -135,6 +150,7 @@ pub struct Assessment {
     pub checks: Option<String>,
     pub open_threads: Vec<OpenThread>,
     pub bots: Vec<BotReport>,
+    pub human_review: HumanReview,
 }
 
 /// Something the babysitter has to do.
@@ -150,6 +166,9 @@ pub enum Work {
     Conflict,
     /// A bot reviewed the current head and scored it under the threshold.
     LowScore { bot: String, score: u8, min: u8 },
+    /// A person asked for changes, nothing has been pushed since, and no
+    /// review thread carries the request (those are [`Work::Threads`]).
+    ChangesRequested,
 }
 
 /// Something the babysitter can only wait for.
@@ -161,6 +180,10 @@ pub enum Wait {
     ChecksRunning,
     /// GitHub has not computed mergeability yet.
     GitHub,
+    /// Everything the babysitter can do is done and GitHub still holds the
+    /// merge (`mergeable_state` `blocked`) with no approval from a person.
+    /// Hours or days; see `crate::wait_cadence`.
+    HumanReview,
 }
 
 /// What comes next for the pull request.
@@ -172,8 +195,8 @@ pub enum Next {
     Work(Vec<Work>),
     /// Nothing to do until the outside moves.
     Wait(Vec<Wait>),
-    /// Everything the babysitter can do is done. Anything still missing
-    /// (`mergeable_state` `blocked`: a human review) is for a person.
+    /// Everything the babysitter can do is done, and nothing is left to wait
+    /// for. Anything still missing is for a person.
     Clear,
 }
 
@@ -245,6 +268,7 @@ impl Assessment {
             checks: snapshot.status.checks.clone(),
             open_threads: snapshot.threads.iter().filter(|t| wants_answer(t)).map(open_thread).collect(),
             bots,
+            human_review: human_review(snapshot, head_at),
         }
     }
 
@@ -277,6 +301,9 @@ impl Assessment {
         }
         if self.checks.as_deref() == Some("failure") {
             work.push(Work::FailingChecks);
+        }
+        if self.human_review == (HumanReview::ChangesRequested { unaddressed: true }) && self.open_threads.is_empty() {
+            work.push(Work::ChangesRequested);
         }
         for report in &self.bots {
             if let BotStanding::Current { score } = report.standing
@@ -312,6 +339,14 @@ impl Assessment {
         if self.mergeable_state.is_none() {
             waits.push(Wait::GitHub);
         }
+        // Only when nothing quicker is outstanding: a running check or a
+        // bot's review is what the babysitter polls for first.
+        if waits.is_empty()
+            && self.mergeable_state.as_deref() == Some("blocked")
+            && self.human_review != HumanReview::Approved
+        {
+            waits.push(Wait::HumanReview);
+        }
         waits
     }
 
@@ -333,6 +368,43 @@ impl Assessment {
     /// A thread the user must take over: answered `rounds` times and still open.
     pub fn stuck_thread(&self, max_thread_rounds: u32) -> Option<&OpenThread> {
         self.open_threads.iter().find(|t| t.rounds >= max_thread_rounds)
+    }
+}
+
+/// Whether `login` is a person: not a GitHub app, and not a review bot we
+/// know.
+fn is_person(login: &str) -> bool {
+    !login.ends_with("[bot]") && !GREPTILE.is_author(login)
+}
+
+/// The people's review of the snapshot's pull request.
+fn human_review(snapshot: &PrSnapshot, head_at: Option<DateTime<Utc>>) -> HumanReview {
+    use std::collections::HashMap;
+    // Each reviewer's latest decisive review.
+    let mut latest: HashMap<&str, (DateTime<Utc>, &str)> = HashMap::new();
+    for review in &snapshot.reviews {
+        let Some(author) = review.author.as_deref().filter(|a| is_person(a)) else {
+            continue;
+        };
+        let state = review.state.as_str();
+        if !matches!(state, "APPROVED" | "CHANGES_REQUESTED" | "DISMISSED") {
+            continue;
+        }
+        let Some(at) = parse_time(&review.submitted_at) else {
+            continue;
+        };
+        if latest.get(author).is_none_or(|(prev, _)| at >= *prev) {
+            latest.insert(author, (at, state));
+        }
+    }
+    let requested = latest.values().filter(|(_, s)| *s == "CHANGES_REQUESTED").map(|(at, _)| *at).max();
+    if let Some(at) = requested {
+        return HumanReview::ChangesRequested { unaddressed: head_at.is_some_and(|h| at > h) };
+    }
+    if latest.values().any(|(_, s)| *s == "APPROVED") {
+        HumanReview::Approved
+    } else {
+        HumanReview::Pending
     }
 }
 
@@ -450,6 +522,7 @@ pub fn render_work(url: &str, assessment: &Assessment) -> String {
             Work::Behind => "- it is behind its base branch: merge the base in\n".to_string(),
             Work::Threads(n) => format!("- {n} review thread(s) are open: `tod-cli pr threads`\n"),
             Work::FailingChecks => "- a check is failing: `tod-cli pr status`\n".to_string(),
+            Work::ChangesRequested => "- a reviewer asked for changes in a review: read it with `tod-cli pr status`\n".to_string(),
             Work::LowScore { bot, score, min } => format!(
                 "- {bot} scored it {score}/5, under the {min}/5 needed: read its summary comment and fix what it found that this change introduced\n"
             ),
@@ -610,9 +683,10 @@ Not safe.
         let mut reviews = vec![tod_store::github::PrReview {
             author: Some("greptile-apps[bot]".into()),
             submitted_at: "2026-01-01T11:00:00Z".into(),
+            state: "COMMENTED".into(),
         }];
         if let Some(at) = rereview_at {
-            reviews.push(tod_store::github::PrReview { author: Some("greptile-apps[bot]".into()), submitted_at: at.into() });
+            reviews.push(tod_store::github::PrReview { author: Some("greptile-apps[bot]".into()), submitted_at: at.into(), state: "COMMENTED".into() });
         }
         snap.reviews = reviews;
         let mut t = thread("t", true, &["bot finding", "we declined, here is why"]);
@@ -826,10 +900,73 @@ Not safe.
     }
 
     #[test]
-    fn a_human_review_still_missing_is_clear_for_the_babysitter() {
+    fn a_human_review_still_missing_is_a_wait_for_the_babysitter() {
         let none = PrReadinessSettings::default();
         let a = Assessment::of(&snap(status("blocked", "success"), vec![], vec![]), &none, now());
-        assert_eq!(a.next(), Next::Clear);
+        assert_eq!(a.human_review, HumanReview::Pending);
+        assert_eq!(a.next(), Next::Wait(vec![Wait::HumanReview]));
+        let clean = Assessment::of(&snap(status("clean", "success"), vec![], vec![]), &none, now());
+        assert_eq!(clean.next(), Next::Clear);
+    }
+
+    fn review(author: &str, at: &str, state: &str) -> tod_store::github::PrReview {
+        tod_store::github::PrReview { author: Some(author.into()), submitted_at: at.into(), state: state.into() }
+    }
+
+    /// A blocked pull request whose head was committed at 10:00.
+    fn reviewed(head_at: &str, reviews: Vec<tod_store::github::PrReview>) -> Assessment {
+        let mut s = snap(status("blocked", "success"), vec![], vec![]);
+        s.status.head_committed_at = Some(head_at.into());
+        s.reviews = reviews;
+        Assessment::of(&s, &PrReadinessSettings::default(), now())
+    }
+
+    #[test]
+    fn an_approval_ends_the_wait_and_a_bot_or_comment_does_not_count() {
+        let approved = reviewed("2026-01-01T10:00:00Z", vec![review("alice", "2026-01-01T11:00:00Z", "APPROVED")]);
+        assert_eq!(approved.human_review, HumanReview::Approved);
+        assert_eq!(approved.next(), Next::Clear);
+        let not_a_person = reviewed(
+            "2026-01-01T10:00:00Z",
+            vec![
+                review("greptile-apps[bot]", "2026-01-01T11:00:00Z", "APPROVED"),
+                review("alice", "2026-01-01T11:30:00Z", "COMMENTED"),
+            ],
+        );
+        assert_eq!(not_a_person.human_review, HumanReview::Pending);
+        assert_eq!(not_a_person.next(), Next::Wait(vec![Wait::HumanReview]));
+    }
+
+    #[test]
+    fn requested_changes_are_work_until_something_is_pushed_then_a_wait() {
+        let asked = reviewed("2026-01-01T10:00:00Z", vec![review("alice", "2026-01-01T11:00:00Z", "CHANGES_REQUESTED")]);
+        assert_eq!(asked.human_review, HumanReview::ChangesRequested { unaddressed: true });
+        assert_eq!(asked.work(), vec![Work::ChangesRequested]);
+        let answered = reviewed("2026-01-01T11:30:00Z", vec![review("alice", "2026-01-01T11:00:00Z", "CHANGES_REQUESTED")]);
+        assert_eq!(answered.human_review, HumanReview::ChangesRequested { unaddressed: false });
+        assert_eq!(answered.next(), Next::Wait(vec![Wait::HumanReview]));
+    }
+
+    #[test]
+    fn a_later_review_replaces_an_earlier_one_by_the_same_person() {
+        let flipped = reviewed(
+            "2026-01-01T10:00:00Z",
+            vec![
+                review("alice", "2026-01-01T11:00:00Z", "CHANGES_REQUESTED"),
+                review("alice", "2026-01-01T11:30:00Z", "APPROVED"),
+            ],
+        );
+        assert_eq!(flipped.human_review, HumanReview::Approved);
+        let dismissed = reviewed("2026-01-01T10:00:00Z", vec![review("alice", "2026-01-01T11:00:00Z", "DISMISSED")]);
+        assert_eq!(dismissed.human_review, HumanReview::Pending);
+        let split = reviewed(
+            "2026-01-01T10:00:00Z",
+            vec![
+                review("alice", "2026-01-01T11:00:00Z", "APPROVED"),
+                review("bob", "2026-01-01T11:10:00Z", "CHANGES_REQUESTED"),
+            ],
+        );
+        assert!(matches!(split.human_review, HumanReview::ChangesRequested { .. }));
     }
 
     #[test]
@@ -857,12 +994,29 @@ pub trait PrFeed: Send + Sync {
     fn snapshot(&self, pr: &tod_store::github::NodePr) -> Result<PrSnapshot, String>;
     /// A top-level comment on the pull request.
     fn comment(&self, pr: &tod_store::github::NodePr, body: &str) -> Result<(), String>;
+    /// The pull request's title and merge: what `crate::release_watch` looks
+    /// for in a release's notes. Unsupported unless a feed says otherwise.
+    fn merge(&self, _pr: &tod_store::github::NodePr) -> Result<tod_store::github::PrMerge, String> {
+        Err("this feed does not read merges".to_string())
+    }
+    /// The published releases of the pull request's repository, newest first.
+    fn releases(&self, _pr: &tod_store::github::NodePr) -> Result<Vec<tod_store::github::Release>, String> {
+        Err("this feed does not read releases".to_string())
+    }
 }
 
 /// [`PrFeed`] over the GitHub API, with the credentials the app itself uses.
 pub struct GithubFeed(pub tod_store::github::Github);
 
 impl PrFeed for GithubFeed {
+    fn merge(&self, pr: &tod_store::github::NodePr) -> Result<tod_store::github::PrMerge, String> {
+        self.0.get_pr_merge(&pr.owner, &pr.repo, pr.pr_number).map_err(|err| err.to_string())
+    }
+
+    fn releases(&self, pr: &tod_store::github::NodePr) -> Result<Vec<tod_store::github::Release>, String> {
+        self.0.list_releases(&pr.owner, &pr.repo).map_err(|err| err.to_string())
+    }
+
     fn snapshot(&self, pr: &tod_store::github::NodePr) -> Result<PrSnapshot, String> {
         cached_snapshot(&self.0, pr).map_err(|err| err.to_string())
     }

@@ -384,14 +384,43 @@ styles:
     font: title
     text-case: sentence
     text-end: no-period
-  node-title-pending-changes:
-    # A tree row whose node has incoming changes it has not been checked
-    # against: rare, so it must stand out from every other row.
-    extends: text-title
+  # RULE: a row's title text color is the user's to set, for their own
+  # purposes (planned: a per-row color the user picks). The app must not use
+  # title color to signal anything else; state is shown with the status icon
+  # (node-status-*) and the ticket id (node-ticket-*).
+  node-status-nested:
+    # The status glyph of a tree row, one 16px slot for three live states
+    # that can hold at once, nested: a circle (node-running-text) while the
+    # lifecycle processor runs, a filled triangle (node-needs-you-text) while
+    # the node waits on the user, a square (node-chat-text) while a chat
+    # session is active. Each is drawn only when its state holds, in the same
+    # place, so every combination is one glyph and rows never shift. The
+    # square keeps its size with the triangle shown; the triangle's corners
+    # stay visible. Wins over finished and pending-changes.
+    color: node-running-text
+  node-status-pending-changes:
+    # The status icon (circle dot) of a tree row whose node has incoming
+    # changes it has not been checked against: rare, so it must stand out
+    # from every other row. Shown only when no other status icon is.
     color: incoming-text
-  node-title-linked-copy:
-    # A tree row copied out of a generator that still receives its source
-    # item's updates.
+  node-status-running:
+    # The status icon of a tree row whose node the lifecycle processor is
+    # running (play icon) or only the chat panel is (square icon; the
+    # processor wins when both). Both go when the run stops.
+    color: node-running-text
+  node-status-finished:
+    # The status icon of a tree row whose run stopped since the user last
+    # selected it: orange, the icon (play or square) ringed in a circle.
+    # Temporary: selecting the row, or Alt+Q landing on it, clears it. Wins
+    # over running.
+    color: node-finished-text
+  node-status-needs-you:
+    # The alert icon of a tree row waiting on the user (replaces the "Needs
+    # you" chip). Wins over running.
+    color: node-needs-you-text
+  node-ticket-linked-copy:
+    # The ticket id of a tree row copied out of a generator that still
+    # receives its source item's updates (the title keeps its own color).
     color: linked-copy-text
   node-title-running:
     # A tree row whose node the lifecycle processor is running (play icon) or
@@ -407,9 +436,9 @@ styles:
     # A tree row waiting on the user (replaces the "Needs you" chip). Also
     # carries an alert icon. Wins over running.
     color: node-needs-you-text
-  node-title-has-copies:
-    # A generator-managed row with a linked copy elsewhere: the copy's
-    # amber, faded as far as text-muted is from text.
+  node-ticket-has-copies:
+    # The ticket id of a generator-managed row with a linked copy elsewhere:
+    # the copy's amber, faded as far as text-muted is from text.
     color: linked-source-text
   scrim:
     background: scrim
@@ -522,6 +551,7 @@ tokens:
     # Amber's neighbors: a soft olive-green for a node the lifecycle
     # processor is running, a soft coral for one waiting on the user.
     node-running-text: "#a8c060"
+    node-chat-text: "#60a5fa"
     node-finished-text: "#fb923c"
     node-needs-you-text: "#f0805a"
     notice-fill: "#ffff00"

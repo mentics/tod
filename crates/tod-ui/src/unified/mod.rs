@@ -297,16 +297,12 @@ impl UnifiedView {
             });
         let _agent_runs_subscription = cx.observe(&agent_runs, |this, _, cx| {
             this.apply_status_overrides(cx);
-            // A turn answering a runner's request has finished.
-            let attention = std::mem::take(&mut this.attention);
-            this.runners.update(cx, |runners, cx| runners.on_attention(&attention, cx));
-            this.attention = attention;
         });
         let runners = {
             let (fleet, agent, agent_runs) = (fleet.clone(), agent.clone(), agent_runs.clone());
             cx.new(|cx| runners::NodeRunners::new(fleet, agent, agent_runs, cx))
         };
-        let _runners_subscription = cx.observe(&runners, |this, _, cx| this.apply_running_nodes(cx));
+        let _runners_subscription = cx.observe(&runners, |this, _, cx| this.apply_status_overrides(cx));
         let _attention_poll = Self::spawn_attention_poll(fleet.clone(), window, cx);
         let mut this = Self {
             fleet,
@@ -446,7 +442,6 @@ impl UnifiedView {
         cx: &mut Context<Self>,
     ) {
         let for_tree = attention_feed::to_task_list_map(&map);
-        self.runners.update(cx, |runners, cx| runners.on_attention(&map, cx));
         self.attention = map;
         self.task_list.update(cx, |task_list, cx| {
             task_list.set_attention(for_tree, cx);
@@ -527,8 +522,22 @@ impl UnifiedView {
                 .flatten()
                 .map(|task| task.lifecycle)
         });
-        let map: std::collections::HashMap<String, String> =
+        let awaiting = self.runners.read(cx).awaiting_nodes();
+        let ids: std::collections::HashSet<String> = awaiting.iter().map(|n| n.to_string()).collect();
+        self.task_list.update(cx, |task_list, cx| task_list.set_awaiting(ids, cx));
+        let mut map: std::collections::HashMap<String, String> =
             map.into_iter().map(|(id, label)| (id.to_string(), label)).collect();
+        // A node whose run ended to wait (for a review, say) is out of the
+        // way: nobody owes it anything, time has to pass.
+        for node in awaiting {
+            let id = node.to_string();
+            if map.contains_key(&id) {
+                continue;
+            }
+            if let Some(task) = self.fleet.get_node(&id).ok().flatten() {
+                map.insert(id, format!("{} · waiting", task.lifecycle));
+            }
+        }
         self.task_list.update(cx, |task_list, cx| {
             task_list.set_status_overrides(map, cx);
         });

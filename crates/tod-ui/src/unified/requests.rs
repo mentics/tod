@@ -30,6 +30,28 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+/// Unsent free-form answers, by decision, for the life of the app: the
+/// panel showing a node is rebuilt each time it is opened, so they live here.
+#[derive(Default)]
+struct FreeformDrafts(HashMap<Uuid, String>);
+
+impl gpui::Global for FreeformDrafts {}
+
+impl FreeformDrafts {
+    fn get(decision: Uuid, cx: &App) -> String {
+        cx.try_global::<Self>().and_then(|d| d.0.get(&decision).cloned()).unwrap_or_default()
+    }
+
+    fn set(decision: Uuid, text: String, cx: &mut App) {
+        let drafts = cx.default_global::<Self>();
+        if text.is_empty() {
+            drafts.0.remove(&decision);
+        } else {
+            drafts.0.insert(decision, text);
+        }
+    }
+}
+
 use gpui::{
     AnyElement, App, AppContext, Context, Entity, EventEmitter, FocusHandle, InteractiveElement,
     IntoElement, KeyBinding, MouseButton, MouseDownEvent, ParentElement, Render, SharedString,
@@ -56,6 +78,7 @@ use tod_store::request_feedback::{
 use tod_store::review::{FINDING_DECLINED, FINDING_FIXED, FINDING_OUT_OF_SCOPE, ReviewFinding, ReviewRepo};
 use uuid::Uuid;
 
+use crate::ui::off_thread::off_thread;
 use crate::ui::agent_runs::AgentRuns;
 use crate::ui::journey::{Source, record_action};
 use crate::ui::key_context;
@@ -347,6 +370,8 @@ pub struct Requests {
     /// newer one.
     generation: u64,
     freeform_editing: Option<Uuid>,
+    /// The decision whose unsent text `freeform_input` holds.
+    freeform_draft_for: Option<Uuid>,
     freeform_input: Entity<InputState>,
     /// A log entry's decision the user asked to change.
     pub(crate) changing: Option<Uuid>,
@@ -377,8 +402,15 @@ impl Requests {
         let freeform_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("Freeform answer… (Enter to submit)"));
         let freeform_sub = cx.subscribe(&freeform_input, |this, _, event, cx| {
-            if matches!(event, InputEvent::PressEnter { .. }) {
-                this.submit_freeform(cx);
+            match event {
+                InputEvent::PressEnter { .. } => this.submit_freeform(cx),
+                InputEvent::Change => {
+                    if let Some(owner) = this.freeform_draft_for {
+                        let text = this.freeform_input.read(cx).text().to_string();
+                        FreeformDrafts::set(owner, text, cx);
+                    }
+                }
+                _ => {}
             }
         });
         let feedback_note_input =
@@ -414,6 +446,7 @@ impl Requests {
             loaded: Loaded::default(),
             generation: 0,
             freeform_editing: None,
+            freeform_draft_for: None,
             freeform_input,
             changing: None,
             selected_link: 0,
@@ -541,11 +574,23 @@ impl Requests {
             Self::presented_for(&decision),
         );
         let decision_id = decision.id;
-        let result = self.agent_runs.update(cx, |runs, cx| runs.answer_decision(decision_id, option, text, cx));
-        self.set_error("record answer", result.map(|_| ()));
+        // The answer is recorded off the UI thread; what was being edited
+        // closes now, and the list reloads when it is in.
         self.freeform_editing = None;
+        FreeformDrafts::set(decision.id, String::new(), cx);
+        if self.freeform_draft_for == Some(decision.id) {
+            self.freeform_draft_for = None;
+        }
         self.changing = None;
-        self.reload(cx);
+        let this = cx.weak_entity();
+        self.agent_runs.update(cx, |runs, cx| {
+            runs.answer_decision_then(decision_id, option, text, cx, move |result, cx| {
+                let _ = this.update(cx, |this, cx| {
+                    this.set_error("record answer", result);
+                    this.reload(cx);
+                });
+            })
+        });
     }
 
     /// Answer the *top* request with option `n` (1-based), when it has
@@ -674,9 +719,15 @@ impl Requests {
             Self::presented_for_step(step),
         );
         let step_id = step.id;
-        let result = self.agent_runs.update(cx, |runs, cx| runs.answer_plan_step_handoff(step_id, answer, cx));
-        self.set_error("answer plan step", result.map(|_| ()));
-        self.reload(cx);
+        let this = cx.weak_entity();
+        self.agent_runs.update(cx, |runs, cx| {
+            runs.answer_plan_step_handoff_then(step_id, answer, cx, move |result, cx| {
+                let _ = this.update(cx, |this, cx| {
+                    this.set_error("answer plan step", result);
+                    this.reload(cx);
+                });
+            })
+        });
     }
 
     fn presented_for_finding(finding: &ReviewFinding) -> Presented {
@@ -707,9 +758,15 @@ impl Requests {
         );
         let finding_id = finding.id;
         let status = status.to_string();
-        let result = self.agent_runs.update(cx, |runs, _| runs.respond_review_finding(finding_id, &status));
-        self.set_error("answer finding", result.map(|_| ()));
-        self.reload(cx);
+        let fleet = self.fleet.clone();
+        off_thread(
+            cx,
+            move || AgentRuns::respond_finding_on(&fleet, finding_id, &status),
+            |this, result, cx| {
+                this.set_error("answer finding", result);
+                this.reload(cx);
+            },
+        );
     }
 
     /// The feedback given on request `id` in this session, if any.
@@ -921,7 +978,14 @@ impl Requests {
 
     fn begin_freeform_edit(&mut self, decision_id: Uuid, window: &mut Window, cx: &mut Context<Self>) {
         self.freeform_editing = Some(decision_id);
-        self.freeform_input.update(cx, |input, cx| input.set_value(String::new(), window, cx));
+        // The one input is shared by every decision, and the panel is rebuilt
+        // per node: its text is mirrored into `FreeformDrafts` as it changes,
+        // and the decision's own draft is loaded back here.
+        if self.freeform_draft_for != Some(decision_id) {
+            self.freeform_draft_for = Some(decision_id);
+            let text = FreeformDrafts::get(decision_id, cx);
+            self.freeform_input.update(cx, |input, cx| input.set_value(text, window, cx));
+        }
         cx.notify();
         let input = self.freeform_input.clone();
         cx.on_next_frame(window, move |_, window, cx| {
@@ -1201,17 +1265,20 @@ impl Requests {
             },
         );
         let id = item.id;
-        let result = match item.kind {
-            AttentionKind::Decision => {
-                self.agent_runs.update(cx, |runs, _| runs.resolve_decision_elsewhere(id))
-            }
-            AttentionKind::PlanStep => {
-                self.agent_runs.update(cx, |runs, _| runs.resolve_plan_step_elsewhere(id))
-            }
-            AttentionKind::Finding => Ok(()),
-        };
-        self.set_error("dismiss the request", result);
-        self.reload(cx);
+        let kind = item.kind;
+        let fleet = self.fleet.clone();
+        off_thread(
+            cx,
+            move || match kind {
+                AttentionKind::Decision => AgentRuns::resolve_decision_on(&fleet, id),
+                AttentionKind::PlanStep => AgentRuns::resolve_plan_step_on(&fleet, id),
+                AttentionKind::Finding => Ok(()),
+            },
+            |this, result, cx| {
+                this.set_error("dismiss the request", result);
+                this.reload(cx);
+            },
+        );
     }
 
     /// Open a terminal resuming `conversation`'s agent session
@@ -1274,11 +1341,15 @@ impl Requests {
             .child(if editing {
                 Input::new(&self.freeform_input).small().into_any_element()
             } else {
-                div()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(if only { "Enter to type your answer…" } else { "Enter to answer freely…" })
-                    .into_any_element()
+                let draft = Some(FreeformDrafts::get(decision_id, cx)).filter(|text| !text.trim().is_empty());
+                match draft {
+                    Some(draft) => div().text_xs().child(draft).into_any_element(),
+                    None => div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(if only { "Enter to type your answer…" } else { "Enter to answer freely…" })
+                        .into_any_element(),
+                }
             })
     }
 
@@ -1343,9 +1414,9 @@ impl Requests {
             .flatten()
             .collect::<Vec<_>>();
             if !why.is_empty() {
-                card = card.child(style::text_muted(div().text_sm()).child(selectable_text(
+                card = card.child(style::text_muted(div().text_sm()).child(selectable_markdown(
                     SharedString::from(format!("unified-decisions-plan-step-why-{}", item.id)),
-                    why.join("\n"),
+                    why.join("\n\n"),
                     window,
                     cx,
                 )));
@@ -1452,7 +1523,7 @@ impl Requests {
             .p_2()
             .border_b_1()
             .border_color(border)
-            .child(div().text_sm().child(selectable_text(
+            .child(div().text_sm().child(selectable_markdown(
                 ("unified-decisions-log-question", entry.answer.id as u64),
                 decision.question.clone(),
                 window,

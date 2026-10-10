@@ -150,6 +150,9 @@ pub enum DynamicBlock {
     /// The variables and credentials defined for the node the work is on
     /// (pre-rendered; see `crate::environment_context`). Omitted when none.
     Environment,
+    /// The skills the user chose for the phase the agent is working in
+    /// (pre-rendered; see `crate::skills_context`). Omitted when none.
+    ConfiguredSkills,
     /// The saved mockup's path, the working draft's path, and whether they
     /// differ. Omitted when the surface supplied no state.
     VisualDesign,
@@ -175,6 +178,7 @@ pub struct DynamicContext<'a> {
     pub focus: Option<&'a FocusSelection>,
     pub incoming: &'a [IncomingChangeItem],
     pub environment: &'a str,
+    pub skills: &'a str,
     pub visual_design: Option<&'a VisualDesignState>,
 }
 
@@ -485,6 +489,12 @@ fn render_block(block: DynamicBlock, ctx: &DynamicContext<'_>, out: &mut String)
         DynamicBlock::Environment => {
             if !ctx.environment.is_empty() {
                 out.push_str(ctx.environment);
+            }
+        }
+
+        DynamicBlock::ConfiguredSkills => {
+            if !ctx.skills.is_empty() {
+                out.push_str(ctx.skills);
             }
         }
 

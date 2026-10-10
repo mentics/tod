@@ -78,6 +78,9 @@ pub struct ImplementRequest<'a> {
     /// the node's own or inherited (`tod_store::verification`). A `failed`
     /// one's evidence is what implementation starts from.
     pub verdicts: Vec<ObligationVerdict>,
+    /// The skills block for the phase this session works in
+    /// (`crate::skills_context`); empty when none are configured.
+    pub skills: String,
 }
 
 /// Build the full implementation-session first message.
@@ -162,6 +165,7 @@ fn build_plan_session_message_with(
             ancestor_context: &request.ancestor_context,
             plan_steps: &request.plan_steps,
             verdicts: &request.verdicts,
+            skills: &request.skills,
             findings,
             ..Default::default()
         },
@@ -317,5 +321,18 @@ mod tests {
             },
         );
         assert!(text.contains(&format!("**Working directory:** `{}`", worktree.display())));
+    }
+
+    /// Every agent that works a phase is shown the skills chosen for it, and
+    /// a session with none configured is shown no Skills section.
+    #[test]
+    fn every_phase_recipe_renders_the_configured_skills() {
+        let skills = crate::skills_context::render_skills("review", &["security-review".into()]);
+        for recipe in [&IMPLEMENT_SESSION, &VERIFY_SESSION, &REVIEW_SESSION, &FIX_SESSION, &crate::context_recipes::PR_SESSION, &crate::context_recipes::PHASE, &crate::context_recipes::EVALUATE] {
+            let with = render(recipe.blocks, &DynamicContext { skills: &skills, ..Default::default() });
+            assert!(with.contains("`security-review`"), "{}", recipe.name);
+            let without = render(recipe.blocks, &DynamicContext::default());
+            assert!(!without.contains("## Skills"), "{}", recipe.name);
+        }
     }
 }

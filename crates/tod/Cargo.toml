@@ -9,12 +9,25 @@ build = "build.rs"
 name = "tod"
 path = "src/main.rs"
 
+# The resident daemon (`doc/agentd.md`), built here so that building `tod`
+# leaves it beside `tod` and `tod-cli`, where they look for it.
+[[bin]]
+name = "tod-agentd"
+path = "src/agentd.rs"
+
 [features]
 default = ["agent-socket"]
 agent-socket = ["tod-ui/agent-socket"]
 
 [dependencies]
 tod-ui = { path = "../tod-ui", default-features = false }
+tod-agentd = { path = "../tod-agentd" }
+tod-agentd-client = { path = "../tod-agentd-client" }
+
+[dev-dependencies]
+tod-store = { path = "../tod-store" }
+serde_json = "1.0"
+uuid = { version = "1.0", features = ["v4"] }
 
 [build-dependencies]
 embed-resource = "3"

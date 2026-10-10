@@ -71,6 +71,7 @@ impl ObligationsPanel {
         }
     }
 
+    #[cfg(test)]
     pub fn node_id(&self) -> Uuid {
         self.node_id
     }
@@ -140,9 +141,6 @@ impl ColumnPanel for ObligationsPanel {
         "Obligations".into()
     }
 
-    fn target_label(&self, _cx: &App) -> SharedString {
-        node_title(&self.fleet, self.node_id).into()
-    }
 }
 
 impl EventEmitter<PanelOpenRequest> for ObligationsPanel {}

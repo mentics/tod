@@ -308,8 +308,20 @@ pub enum AgentConversationEvent {
     Action(SharedString, crate::ui::journey::Source),
 }
 
+/// How much of the panel's entries the list has not seen yet.
+#[derive(Debug, Clone, Copy)]
+enum ListPush {
+    None,
+    /// Everything.
+    Full,
+    /// Only the entries from this index on.
+    Tail(usize),
+}
+
 pub struct AgentConversationPanel {
     entries: Vec<Entry>,
+    /// What of `entries` the list has yet to be given, at the next render.
+    push: ListPush,
     /// Chunks the user expanded or collapsed; the rest show their default.
     toggled: HashMap<ChunkId, bool>,
     highlight: PanelStop,
@@ -378,6 +390,7 @@ impl AgentConversationPanel {
         });
         Self {
             entries: Vec::new(),
+            push: ListPush::None,
             toggled: HashMap::new(),
             highlight: PanelStop::Input,
             active: false,
@@ -426,6 +439,7 @@ impl AgentConversationPanel {
     pub fn set_entries(&mut self, entries: Vec<Entry>, cx: &mut Context<Self>) {
         if entries != self.entries {
             self.entries = entries;
+            self.push = ListPush::Full;
             if !self.stops().contains(&self.highlight) {
                 self.highlight = PanelStop::Input;
             }
@@ -433,9 +447,36 @@ impl AgentConversationPanel {
         }
     }
 
+    /// Replace everything after the first `keep` entries with `tail` (at most
+    /// one entry, e.g. a live reply), taking the first `keep` as unchanged.
+    /// Only the tail is compared and handed to the list.
+    pub fn set_tail(&mut self, keep: usize, tail: Option<Entry>, cx: &mut Context<Self>) {
+        let keep = keep.min(self.entries.len());
+        let same = match (&tail, self.entries.get(keep)) {
+            (None, None) => true,
+            (Some(new), Some(old)) => new == old && self.entries.len() == keep + 1,
+            _ => false,
+        };
+        if same {
+            return;
+        }
+        self.entries.truncate(keep);
+        self.entries.extend(tail);
+        self.push = match self.push {
+            ListPush::Full => ListPush::Full,
+            ListPush::Tail(earlier) => ListPush::Tail(earlier.min(keep)),
+            ListPush::None => ListPush::Tail(keep),
+        };
+        if !self.stops().contains(&self.highlight) {
+            self.highlight = PanelStop::Input;
+        }
+        cx.notify();
+    }
+
     /// Forget what was expanded and where the highlight was: a different
     /// conversation is about to be shown.
     pub fn reset(&mut self, cx: &mut Context<Self>) {
+        self.push = ListPush::None;
         self.entries.clear();
         self.toggled.clear();
         self.highlight = PanelStop::Input;
@@ -946,7 +987,7 @@ impl Render for AgentConversationPanel {
 
         // Bring the transcript up to date. The panel owns what is expanded
         // and where the highlight is, so both are pushed down each render.
-        let entries = self.entries.clone();
+        let push = std::mem::replace(&mut self.push, ListPush::None);
         let toggled = self.toggled.clone();
         let chunk_highlight = match self.highlight {
             PanelStop::Chunk(id) => Some(id),
@@ -956,8 +997,15 @@ impl Render for AgentConversationPanel {
         let running = self.running;
         let activity = self.activity.clone().map(|a| a.to_string());
         let empty_message = self.empty_message.clone();
+        // Entries reach the list only when they changed, and a streamed
+        // reply sends only its tail: nothing here scales with the transcript.
+        let entries = &self.entries;
         self.list.update(cx, |list, cx| {
-            list.set_entries(entries, cx);
+            match push {
+                ListPush::Full => list.set_entries(entries.clone(), cx),
+                ListPush::Tail(keep) => list.set_tail(keep, entries.get(keep).cloned(), cx),
+                ListPush::None => {}
+            }
             list.set_toggled(toggled, cx);
             list.set_highlight(chunk_highlight, cx);
             list.set_active(active, cx);

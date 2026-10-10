@@ -57,6 +57,8 @@ struct Loaded {
     ticket_id: Option<String>,
     /// The ticket's browser URL, when it can be worked out.
     ticket_url: Option<String>,
+    /// The ticket is done or canceled: its id is struck through.
+    ticket_terminal: bool,
     lifecycle: String,
     details: String,
     obligation_count: usize,
@@ -73,6 +75,7 @@ impl Loaded {
             title: String::new(),
             ticket_id: None,
             ticket_url: None,
+            ticket_terminal: false,
             lifecycle: String::new(),
             details: String::new(),
             obligation_count: 0,
@@ -106,6 +109,9 @@ fn load(fleet: &FleetStore, node_id: Uuid) -> Loaded {
             .and_then(|json_str| serde_json::from_str::<serde_json::Value>(&json_str).ok());
         loaded.ticket_url =
             tod_integration::linear_issue_url(metadata.as_ref(), fleet.paths().root(), ticket);
+        loaded.ticket_terminal = metadata
+            .as_ref()
+            .is_some_and(tod_store::outline::types::ticket_is_terminal);
     }
     loaded.details = fleet
         .get_extra_content(node_id, EXTRA_CONTENT_DETAILS)
@@ -329,18 +335,34 @@ impl DetailsPanel {
             self.drafts.remove(&self.node_id);
             return;
         }
-        if self
-            .fleet
-            .enqueue_outline(OutlineMutation::SetExtraContent {
-                node_id: self.node_id,
-                content_type: EXTRA_CONTENT_DETAILS.to_string(),
-                body: value.clone(),
-            })
-            .is_ok()
-        {
-            self.loaded.details = value;
-            self.drafts.remove(&self.node_id);
-        }
+        let node_id = self.node_id;
+        let previous = std::mem::replace(&mut self.loaded.details, value.clone());
+        let draft = self.drafts.remove(&node_id);
+        let fleet = self.fleet.clone();
+        crate::ui::off_thread::off_thread(
+            cx,
+            move || {
+                fleet
+                    .enqueue_outline(OutlineMutation::SetExtraContent {
+                        node_id,
+                        content_type: EXTRA_CONTENT_DETAILS.to_string(),
+                        body: value,
+                    })
+                    .is_ok()
+            },
+            move |this, saved, cx| {
+                if !saved {
+                    // Not stored: show the stored text again, and keep the draft.
+                    if this.node_id == node_id {
+                        this.loaded.details = previous;
+                    }
+                    if let Some(draft) = draft {
+                        this.drafts.insert(node_id, draft);
+                    }
+                    cx.notify();
+                }
+            },
+        );
     }
 
     fn open(&self, target: PanelKind, cx: &mut Context<Self>) {
@@ -356,9 +378,6 @@ impl ColumnPanel for DetailsPanel {
         "Details".into()
     }
 
-    fn target_label(&self, _cx: &App) -> SharedString {
-        self.loaded.title.clone().into()
-    }
 }
 
 impl EventEmitter<PanelOpenRequest> for DetailsPanel {}
@@ -427,9 +446,13 @@ impl Render for DetailsPanel {
                                     gpui::MouseButton::Left,
                                     move |_, _, cx| cx.open_url(&url),
                                 )
+                                .when(self.loaded.ticket_terminal, |el| el.line_through())
                                 .child(ticket)
                                 .into_any_element(),
-                                None => style::text_muted(div()).child(ticket).into_any_element(),
+                                None => style::text_muted(div())
+                                    .when(self.loaded.ticket_terminal, |el| el.line_through())
+                                    .child(ticket)
+                                    .into_any_element(),
                             },
                         ))
                     }),
@@ -974,6 +997,8 @@ mod tests {
             assert_eq!(view.loaded.details, draft_text);
             assert!(!view.has_draft());
         });
+        // The write runs off the UI thread.
+        cx.run_until_parked();
         let stored = fixture
             .store
             .get_extra_content(fixture.node_id, EXTRA_CONTENT_DETAILS)

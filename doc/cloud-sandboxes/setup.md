@@ -142,6 +142,24 @@ tod-sandbox bake ubuntu:24.04 --agents          # builds sandbox/tod-baked-ubunt
 tod-sandbox create dev3 --image sandbox/tod-baked-ubuntu-24-04:latest --agents
 ```
 
+`bake` can clone repositories into the image too, one `--repo` per repository
+(`URL` or `URL=/dir`; the directory defaults to `/root/<name>`):
+
+```sh
+tod-sandbox bake ubuntu:24.04 --agents --name my-base \
+  --repo https://github.com/acme/app --repo https://github.com/acme/lib=/root/lib
+```
+
+Only `https://` URLs without credentials are accepted: the clone command stays
+in the image's layers, so a token in a URL would too. A private repository
+cannot be built in this way; it is fetched when a node's sandbox is made, like
+any other. One image can hold the repository a node works on and the source it
+depends on, and be shared by every node. In the app, the task editor's Files
+section does this under **Each node's sandbox starts from → An image → Image
+with repositories**: the base image, a name, and one repository per line
+(`<url> [<directory>]`); when the build finishes the new image is what each
+node's sandbox starts from.
+
 A baked image already has everything installed, so a sandbox created from it
 is ready in about 10 s. `tod-sandbox setup --image <image>` makes an image the
 default for `create`.

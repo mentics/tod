@@ -302,6 +302,55 @@ impl AgentRuns {
         })
     }
 
+    /// What a running slot is doing, in words the user can place: the kind of
+    /// conversation and the node (or project) it is about, never its id.
+    fn describe_slot(&self, slot: &DriverSlot) -> String {
+        let kind = kind_label(slot.protocol);
+        let node = match slot.focus {
+            Focus::Project => None,
+            Focus::Node(node) | Focus::Obligation { node, .. } | Focus::PlanStep { node, .. } => Some(node),
+        };
+        // `get_node`, not `get_task`: the latter only finds nodes with the
+        // Agent capability, so a plain node would read as deleted.
+        let found = node.map(|node| self.fleet.get_node(&node.to_string()).ok().flatten());
+        let title = found
+            .clone()
+            .flatten()
+            .map(|t| t.title)
+            .filter(|t| !t.trim().is_empty());
+        match (title, found) {
+            (Some(title), _) => format!("Agent running ({kind}): {title}"),
+            (None, Some(Some(_))) => format!("Agent running ({kind}): an untitled node"),
+            (None, Some(None)) => format!("Agent running ({kind}): a node that is no longer in the outline"),
+            (None, None) => format!("Agent running ({kind}): the whole project"),
+        }
+    }
+
+    /// Work in flight, for the close-window warning.
+    #[cfg(test)]
+    pub fn running_work(&self) -> Vec<String> {
+        let (mut affected, continuing) = self.running_work_split();
+        affected.extend(continuing);
+        affected
+    }
+
+    /// Work in flight, split for the close-window warning: what closing the
+    /// app would cut off, and what the resident daemon keeps running (a
+    /// conversation a node's runner drives there).
+    pub fn running_work_split(&self) -> (Vec<String>, Vec<String>) {
+        let daemon = self.fleet.is_client();
+        let (mut affected, mut continuing) = (Vec::new(), Vec::new());
+        for d in self.slots.iter().filter(|d| d.status.running) {
+            let what = self.describe_slot(d);
+            if daemon && d.is_hosted_elsewhere() {
+                continuing.push(what);
+            } else {
+                affected.push(what);
+            }
+        }
+        (affected, continuing)
+    }
+
     /// Every run on `node`: what the status label (`state` / `state →` /
     /// `→ state`, W11) reads. Reads each matching slot's conversation row for
     /// the transition a gate check or on-entry turn is about.
@@ -513,33 +562,22 @@ impl AgentRuns {
         }
     }
 
-    /// Records the user's answer to `decision_id` (append-only: a change of
-    /// mind is a new `decision_answers` row, never an update — see
-    /// `tod_store::decisions`), then delivers a turn to the asking
-    /// conversation with the question, the chosen option/text, and — if this
-    /// is a change of mind — the previous answer, so the agent knows to
-    /// review what it did based on it.
-    ///
-    /// Delivery resumes the conversation's slot when it is not hosted yet
-    /// (`Self::ensure_for_conversation`), so this always reaches the agent
-    /// once the decision has a conversation, regardless of what a view has
-    /// open. It never blocks the UI thread: recording the answer is a single
-    /// SQLite write (as every other conversation action is), and sending the
-    /// turn itself runs off it via `Self::send_to_conversation`.
-    pub fn answer_decision(
-        &mut self,
+    /// Records the user's answer to `decision_id` and says what to tell the
+    /// asking conversation: its id and the message, or `None` when nothing
+    /// is to be delivered (a permission, or a decision with no
+    /// conversation). Blocks on the store: run it off the UI thread.
+    pub fn record_decision_answer(
+        fleet: &FleetStore,
         decision_id: Uuid,
         option: Option<usize>,
         text: Option<String>,
-        cx: &mut Context<Self>,
-    ) -> anyhow::Result<()> {
-        let before = self
-            .fleet
+    ) -> anyhow::Result<Option<(Uuid, String)>> {
+        let before = fleet
             .read(|conn| DecisionRepo::new(conn).get_with_answers(decision_id))?
             .with_context(|| format!("decision {decision_id} not found"))?;
         let option_index = option.map(|o| o as i64);
 
-        self.fleet.interview(
+        fleet.interview(
             ACTOR_USER,
             InterviewCommand::AnswerDecision {
                 decision_id,
@@ -548,8 +586,7 @@ impl AgentRuns {
             },
         )?;
 
-        let after = self
-            .fleet
+        let after = fleet
             .read(|conn| DecisionRepo::new(conn).get_with_answers(decision_id))?
             .with_context(|| format!("decision {decision_id} vanished after answering"))?;
 
@@ -558,10 +595,10 @@ impl AgentRuns {
         // agent's next ask is answered from the saved answer
         // (`tod_core::permission`).
         if after.decision.protocol.as_deref() == Some(tod_core::permission::PROTOCOL) {
-            return Ok(());
+            return Ok(None);
         }
         let Some(conversation_id) = after.decision.conversation_id else {
-            return Ok(());
+            return Ok(None);
         };
 
         let chosen = Self::describe_answer(&after.decision, option_index, text.as_deref());
@@ -596,8 +633,69 @@ impl AgentRuns {
             },
         };
 
+        Ok(Some((conversation_id, message)))
+    }
+
+    /// Records the user's answer to `decision_id` (append-only: a change of
+    /// mind is a new `decision_answers` row, never an update — see
+    /// `tod_store::decisions`), then delivers a turn to the asking
+    /// conversation with the question, the chosen option/text, and — if this
+    /// is a change of mind — the previous answer, so the agent knows to
+    /// review what it did based on it.
+    ///
+    /// Delivery resumes the conversation's slot when it is not hosted yet
+    /// (`Self::ensure_for_conversation`), so this always reaches the agent
+    /// once the decision has a conversation, regardless of what a view has
+    /// open. It never blocks the UI thread: recording the answer is a single
+    /// SQLite write (as every other conversation action is), and sending the
+    /// turn itself runs off it via `Self::send_to_conversation`.
+    pub fn answer_decision(
+        &mut self,
+        decision_id: Uuid,
+        option: Option<usize>,
+        text: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> anyhow::Result<()> {
+        if let Some((conversation_id, message)) =
+            Self::record_decision_answer(&self.fleet, decision_id, option, text)?
+        {
+            self.deliver_answer(conversation_id, &message, cx)?;
+        }
+        Ok(())
+    }
+
+    /// [`Self::answer_decision`] without blocking the UI thread: the answer
+    /// is recorded on the background executor, the turn is delivered here,
+    /// and `done` gets the result.
+    pub fn answer_decision_then(
+        &mut self,
+        decision_id: Uuid,
+        option: Option<usize>,
+        text: Option<String>,
+        cx: &mut Context<Self>,
+        done: impl FnOnce(anyhow::Result<()>, &mut gpui::App) + 'static,
+    ) {
+        let fleet = self.fleet.clone();
+        cx.spawn(async move |this, cx| {
+            let recorded = cx
+                .background_executor()
+                .spawn(async move { Self::record_decision_answer(&fleet, decision_id, option, text) })
+                .await;
+            let result = match recorded {
+                Ok(Some((conversation_id, message))) => this
+                    .update(cx, |this, cx| this.deliver_answer(conversation_id, &message, cx))
+                    .unwrap_or(Ok(())),
+                Ok(None) => Ok(()),
+                Err(err) => Err(err),
+            };
+            cx.update(|cx| done(result, cx));
+        })
+        .detach();
+    }
+
+    fn deliver_answer(&mut self, conversation_id: Uuid, message: &str, cx: &mut Context<Self>) -> anyhow::Result<()> {
         self.ensure_for_conversation(conversation_id)?;
-        if !self.send_to_conversation(conversation_id, &message, cx) {
+        if !self.send_to_conversation(conversation_id, message, cx) {
             tracing::warn!(
                 "answer_decision: could not deliver the answer to conversation {conversation_id}"
             );
@@ -605,8 +703,8 @@ impl AgentRuns {
         Ok(())
     }
 
-    fn latest_handoff_conversation(&self, focus: Focus) -> anyhow::Result<Option<Uuid>> {
-        Ok(self.fleet.read(|conn| latest_handoff_conversation(conn, focus))?.map(|c| c.id))
+    fn latest_handoff_conversation_in(fleet: &FleetStore, focus: Focus) -> anyhow::Result<Option<Uuid>> {
+        Ok(fleet.read(|conn| latest_handoff_conversation(conn, focus))?.map(|c| c.id))
     }
 
     /// Whether `conversation_id`'s turn is in flight here, driven by the app
@@ -622,64 +720,84 @@ impl AgentRuns {
         self.driver_config()
     }
 
-    /// Answer a plan step the agent handed back to the user (`HandoffReason`),
-    /// from outside the conversation view — the unified task panel's
-    /// `PlanStep` items (`crate::unified::panels::decisions`). Sends the same
-    /// message `conversation::side_pane::answer_handoff` sends, to whichever
-    /// implementation/verification conversation on the step's node most
-    /// recently handed work back, then sets the step back to `in_progress`
-    /// as a `ConversationEdit` under that conversation — the same mutation
-    /// `ConversationView::choose_status` makes after a handoff answer, so it
-    /// is reversible and the agent hears of it.
-    pub fn answer_plan_step_handoff(
+    /// [`Self::answer_plan_step_handoff`] without blocking the UI thread:
+    /// reads and writes run on the background executor, the turn is
+    /// delivered here, and `done` gets the result.
+    pub fn answer_plan_step_handoff_then(
         &mut self,
         step_id: Uuid,
         answer: HandoffAnswer,
         cx: &mut Context<Self>,
-    ) -> anyhow::Result<()> {
-        let step = self
-            .fleet
-            .read(|conn| PlanStepRepo::new(conn).get(step_id))?
-            .with_context(|| format!("plan step {step_id} not found"))?;
-        let focus = Focus::Node(step.node_id);
-        let conversation_id = self
-            .latest_handoff_conversation(focus)?
-            .context(
-                "No implement or verify conversation has worked on this node, so there is no \
-                agent to send the answer to. Start one, or change the step yourself in the \
-                Plan panel.",
-            )?;
-
-        let message = handoff_answer_message(&step, &answer);
-        self.ensure_for_conversation(conversation_id)?;
-        // As in the conversation view, the step goes back to `in_progress`
-        // only once the answer has gone out: otherwise it would read as
-        // answered while the agent never heard it.
-        if !self.send_to_conversation(conversation_id, &message, cx) {
-            anyhow::bail!("the agent is busy; the answer was not sent");
-        }
-
-        self.fleet.interview(
-            ACTOR_USER,
-            InterviewCommand::ConversationEdit {
-                conversation_id,
-                mutation: OutlineMutation::UpdatePlanStepStatus {
-                    step_id,
-                    status: STATUS_IN_PROGRESS.to_string(),
-                    note: None,
-                    reason: None,
-                },
-            },
-        )?;
-        Ok(())
+        done: impl FnOnce(anyhow::Result<()>, &mut gpui::App) + 'static,
+    ) {
+        let fleet = self.fleet.clone();
+        cx.spawn(async move |this, cx| {
+            let prepare_fleet = fleet.clone();
+            let prepared = cx
+                .background_executor()
+                .spawn(async move {
+                    let step = prepare_fleet
+                        .read(|conn| PlanStepRepo::new(conn).get(step_id))?
+                        .with_context(|| format!("plan step {step_id} not found"))?;
+                    let conversation_id = Self::latest_handoff_conversation_in(&prepare_fleet, Focus::Node(step.node_id))?
+                        .context(
+                            "No implement or verify conversation has worked on this node, so there is no \
+                            agent to send the answer to. Start one, or change the step yourself in the \
+                            Plan panel.",
+                        )?;
+                    anyhow::Ok((conversation_id, handoff_answer_message(&step, &answer)))
+                })
+                .await;
+            let result = match prepared {
+                Err(err) => Err(err),
+                Ok((conversation_id, message)) => {
+                    // The step goes back to `in_progress` only once the answer
+                    // has gone out, as in the synchronous path.
+                    let sent = this
+                        .update(cx, |this, cx| {
+                            this.ensure_for_conversation(conversation_id)?;
+                            if this.send_to_conversation(conversation_id, &message, cx) {
+                                Ok(())
+                            } else {
+                                Err(anyhow::anyhow!("the agent is busy; the answer was not sent"))
+                            }
+                        })
+                        .unwrap_or(Ok(()));
+                    match sent {
+                        Err(err) => Err(err),
+                        Ok(()) => {
+                            cx.background_executor()
+                                .spawn(async move {
+                                    fleet.interview(
+                                        ACTOR_USER,
+                                        InterviewCommand::ConversationEdit {
+                                            conversation_id,
+                                            mutation: OutlineMutation::UpdatePlanStepStatus {
+                                                step_id,
+                                                status: STATUS_IN_PROGRESS.to_string(),
+                                                note: None,
+                                                reason: None,
+                                            },
+                                        },
+                                    )?;
+                                    anyhow::Ok(())
+                                })
+                                .await
+                        }
+                    }
+                }
+            };
+            cx.update(|cx| done(result, cx));
+        })
+        .detach();
     }
 
     /// Settle a pending decision the user answered outside the app, in the
     /// asking agent's own session: an answer saying so is logged, and no turn
     /// is sent, since that session already has the answer. The next turn
     /// resumes the same session.
-    pub fn resolve_decision_elsewhere(&mut self, decision_id: Uuid) -> anyhow::Result<()> {
-        self.fleet.interview(
+    pub fn resolve_decision_on(fleet: &FleetStore, decision_id: Uuid) -> anyhow::Result<()> {
+        fleet.interview(
             ACTOR_USER,
             InterviewCommand::AnswerDecision {
                 decision_id,
@@ -694,9 +812,8 @@ impl AgentRuns {
     /// sending an answer: the user settled it outside the app, in the agent's
     /// own session. Recorded under the conversation that handed it back,
     /// when there is one, as [`Self::answer_plan_step_handoff`] does.
-    pub fn resolve_plan_step_elsewhere(&mut self, step_id: Uuid) -> anyhow::Result<()> {
-        let step = self
-            .fleet
+    pub fn resolve_plan_step_on(fleet: &FleetStore, step_id: Uuid) -> anyhow::Result<()> {
+        let step = fleet
             .read(|conn| PlanStepRepo::new(conn).get(step_id))?
             .with_context(|| format!("plan step {step_id} not found"))?;
         let mutation = OutlineMutation::UpdatePlanStepStatus {
@@ -705,16 +822,16 @@ impl AgentRuns {
             note: None,
             reason: None,
         };
-        match self.latest_handoff_conversation(Focus::Node(step.node_id))? {
+        match Self::latest_handoff_conversation_in(fleet, Focus::Node(step.node_id))? {
             Some(conversation_id) => {
-                self.fleet.interview(
+                fleet.interview(
                     ACTOR_USER,
                     InterviewCommand::ConversationEdit { conversation_id, mutation },
                 )?;
             }
             None => {
-                self.fleet.enqueue_outline(mutation)?;
-                self.fleet.writer().flush()?;
+                fleet.enqueue_outline(mutation)?;
+                fleet.writer().flush()?;
             }
         }
         Ok(())
@@ -725,13 +842,12 @@ impl AgentRuns {
     /// `conversation::side_pane::respond_to_finding`: a pure status write,
     /// nothing to deliver to an agent (a fix conversation answers findings on
     /// its own initiative instead).
-    pub fn respond_review_finding(&mut self, finding_id: Uuid, status: &str) -> anyhow::Result<()> {
-        let current = self
-            .fleet
+    pub fn respond_finding_on(fleet: &FleetStore, finding_id: Uuid, status: &str) -> anyhow::Result<()> {
+        let current = fleet
             .read(|conn| ReviewRepo::new(conn).get(finding_id))?
             .with_context(|| format!("finding {finding_id} not found"))?;
         if current.status != status {
-            self.fleet.interview(
+            fleet.interview(
                 ACTOR_USER,
                 InterviewCommand::RespondReviewFinding {
                     finding_id,
@@ -742,6 +858,7 @@ impl AgentRuns {
         }
         Ok(())
     }
+
 }
 
 #[cfg(test)]
@@ -1147,5 +1264,24 @@ mod tests {
             "expected the decline message: {turns:?}"
         );
         assert!(!turns.iter().any(|t| t.body.contains("It is now set")), "{turns:?}");
+    }
+}
+
+/// The kind of conversation, in words the user can place.
+fn kind_label(kind: ProtocolKind) -> &'static str {
+    match kind {
+        ProtocolKind::Outline => "outline",
+        ProtocolKind::Implementation => "implementation",
+        ProtocolKind::Verification => "verification",
+        ProtocolKind::Review => "review",
+        ProtocolKind::Fix => "fix",
+        ProtocolKind::Pr => "pr",
+        ProtocolKind::Chat => "chat",
+        ProtocolKind::VisualDesign => "visual design",
+        ProtocolKind::Phase => "phase",
+        ProtocolKind::Evaluate => "evaluation",
+        ProtocolKind::GateCheck => "gate check",
+        ProtocolKind::OnEntry => "on entry",
+        ProtocolKind::Incoming => "incoming check",
     }
 }

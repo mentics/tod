@@ -13,6 +13,7 @@ pub enum Capability {
     Files,
     Ticket,
     Environment,
+    LifecycleConfig,
 }
 
 impl Capability {
@@ -26,6 +27,7 @@ impl Capability {
             Self::Files => "files",
             Self::Ticket => "ticket",
             Self::Environment => "environment",
+            Self::LifecycleConfig => "lifecycle_config",
         }
     }
 
@@ -39,17 +41,19 @@ impl Capability {
             "files" => Some(Self::Files),
             "ticket" => Some(Self::Ticket),
             "environment" => Some(Self::Environment),
+            "lifecycle_config" | "lifecycle-config" => Some(Self::LifecycleConfig),
             _ => None,
         }
     }
 
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::Spec,
         Self::Lifecycle,
         Self::Agent,
         Self::Files,
         Self::Ticket,
         Self::Environment,
+        Self::LifecycleConfig,
         Self::Generator,
         Self::Tags,
     ];
@@ -64,6 +68,7 @@ impl Capability {
             Self::Files => "Files",
             Self::Ticket => "Ticket",
             Self::Environment => "Environment",
+            Self::LifecycleConfig => "Lifecycle config",
         }
     }
 
@@ -79,6 +84,7 @@ impl Capability {
             }
             Self::Tags => "Freeform labels for organizing and filtering nodes",
             Self::Environment => "Variables and credentials the agents working below this node can use",
+            Self::LifecycleConfig => "Skills the agent for each lifecycle phase uses, for this node and everything below it",
         }
     }
 
@@ -103,6 +109,9 @@ impl Capability {
             Self::Tags => "Disabling Tags will remove this node's tags.",
             Self::Environment => {
                 "Disabling Environment will remove the variables and credentials defined on this node."
+            }
+            Self::LifecycleConfig => {
+                "Disabling Lifecycle config will remove the per-phase skills set on this node."
             }
         }
     }
@@ -197,4 +206,47 @@ pub struct FlatNodeRow {
     pub linked_copy: bool,
     /// True for a managed node that has at least one linked copy elsewhere.
     pub has_copies: bool,
+    /// True when the node's ticket is in a terminal state (done or canceled),
+    /// so its id is shown struck through.
+    pub ticket_terminal: bool,
+}
+
+/// Whether the ticket a node's metadata (`EXTRA_CONTENT_METADATA`) describes
+/// is in a terminal state: Linear's `completed` or `canceled` workflow-state
+/// type. Metadata synced before the type was stored has only the state's
+/// name, which is matched against the usual terminal names.
+pub fn ticket_is_terminal(metadata: &serde_json::Value) -> bool {
+    if let Some(kind) = metadata.get("state_type").and_then(|v| v.as_str()) {
+        return matches!(kind, "completed" | "canceled");
+    }
+    metadata
+        .get("state")
+        .and_then(|v| v.as_str())
+        .is_some_and(|name| {
+            matches!(
+                name.to_ascii_lowercase().as_str(),
+                "done" | "canceled" | "cancelled" | "duplicate" | "closed"
+            )
+        })
+}
+
+#[cfg(test)]
+mod ticket_terminal_tests {
+    use super::ticket_is_terminal;
+    use serde_json::json;
+
+    #[test]
+    fn completed_and_canceled_types_are_terminal() {
+        assert!(ticket_is_terminal(&json!({"state": "Shipped", "state_type": "completed"})));
+        assert!(ticket_is_terminal(&json!({"state": "Won't do", "state_type": "canceled"})));
+        assert!(!ticket_is_terminal(&json!({"state": "Done?", "state_type": "started"})));
+    }
+
+    #[test]
+    fn older_metadata_falls_back_to_the_state_name() {
+        assert!(ticket_is_terminal(&json!({"state": "Done"})));
+        assert!(ticket_is_terminal(&json!({"state": "Cancelled"})));
+        assert!(!ticket_is_terminal(&json!({"state": "In Progress"})));
+        assert!(!ticket_is_terminal(&json!({"state": null})));
+    }
 }

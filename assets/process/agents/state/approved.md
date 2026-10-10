@@ -4,7 +4,7 @@
 
 ## Agent
 
-No agent runs on entry — `approved` is a thin holding state, like `ready`/`done`. The `pr` state already drove the PR to mergeable; this state just waits for the user to click merge.
+No agent runs on entry — `approved` is a thin holding state, like `ready`/`done`. The `pr` state already drove the PR to mergeable; this state just waits for the user to click merge. The app does the waiting: the run ends with a timed wait that reads GitHub again at each scheduled look (a webhook for the merge wakes it sooner), and goes on through the gate once every linked PR is merged.
 
 ## Responsibilities
 

@@ -23,6 +23,7 @@
 //! are measured when first shown and remeasured only when their entry or its
 //! expansion changes.
 
+use crate::ui::row_scrollbar::RowScrollbar;
 use crate::ui::selectable_text::{selectable_markdown, selectable_text};
 use crate::ui::style;
 use gpui::prelude::FluentBuilder;
@@ -372,6 +373,8 @@ pub struct TranscriptList {
     activity: Option<SharedString>,
     empty_message: SharedString,
     list: ListState,
+    /// Kept across frames: it remembers a drag in progress.
+    scrollbar: RowScrollbar,
     /// Entries shown last render; more means scroll to the newest.
     rendered_entries: usize,
     /// Scroll the highlighted chunk into view on the next render.
@@ -393,6 +396,7 @@ impl TranscriptList {
 
     /// A list whose chunks start as `start` says.
     pub fn starting(start: StartState) -> Self {
+        let list = ListState::new(0, ListAlignment::Top, px(1000.));
         Self {
             entries: Vec::new(),
             toggled: HashMap::new(),
@@ -403,28 +407,68 @@ impl TranscriptList {
             running: false,
             activity: None,
             empty_message: SharedString::default(),
-            list: ListState::new(0, ListAlignment::Top, px(1000.)),
+            scrollbar: RowScrollbar::new(&list),
+            list,
             rendered_entries: 0,
             scroll_to_highlight: false,
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn list_state(&self) -> ListState {
+        self.list.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn scrollbar_handle(&self) -> RowScrollbar {
+        self.scrollbar.clone()
+    }
+
     pub fn set_entries(&mut self, entries: Vec<Entry>, cx: &mut Context<Self>) {
-        if entries != self.entries {
-            let changed: HashSet<usize> = (0..entries.len().max(self.entries.len()))
-                .filter(|ix| entries.get(*ix) != self.entries.get(*ix))
-                .collect();
-            // A live reply grows in place; keep its newest step in view
-            // unless the user has scrolled away from the end.
-            let follow = entries.last().is_some_and(|e| e.live)
-                && self.list.is_scrolled_to_end().unwrap_or(true);
-            self.entries = entries;
-            self.sync_rows(&changed);
-            if follow {
-                self.list.scroll_to_end();
-            }
-            cx.notify();
+        // One pass: the changed set is empty exactly when nothing differs.
+        let changed: HashSet<usize> = (0..entries.len().max(self.entries.len()))
+            .filter(|ix| entries.get(*ix) != self.entries.get(*ix))
+            .collect();
+        if !changed.is_empty() {
+            self.apply_entries(entries, changed, cx);
         }
+    }
+
+    /// Replace everything after the first `keep` entries with `tail`, which
+    /// is at most one entry (a live reply). The first `keep` entries are
+    /// taken as unchanged, so only the tail is compared: a streamed reply
+    /// costs what it holds, not what the whole transcript holds.
+    pub fn set_tail(&mut self, keep: usize, tail: Option<Entry>, cx: &mut Context<Self>) {
+        let keep = keep.min(self.entries.len());
+        let same = match (&tail, self.entries.get(keep)) {
+            (None, None) => true,
+            (Some(new), Some(old)) => new == old && self.entries.len() == keep + 1,
+            _ => false,
+        };
+        if same {
+            return;
+        }
+        let follow = tail.as_ref().is_some_and(|e| e.live) && self.list.is_scrolled_to_end().unwrap_or(true);
+        let changed: HashSet<usize> = (keep..self.entries.len().max(keep + tail.is_some() as usize)).collect();
+        self.entries.truncate(keep);
+        self.entries.extend(tail);
+        self.sync_rows(&changed);
+        if follow {
+            self.list.scroll_to_end();
+        }
+        cx.notify();
+    }
+
+    fn apply_entries(&mut self, entries: Vec<Entry>, changed: HashSet<usize>, cx: &mut Context<Self>) {
+        // A live reply grows in place; keep its newest step in view
+        // unless the user has scrolled away from the end.
+        let follow = entries.last().is_some_and(|e| e.live) && self.list.is_scrolled_to_end().unwrap_or(true);
+        self.entries = entries;
+        self.sync_rows(&changed);
+        if follow {
+            self.list.scroll_to_end();
+        }
+        cx.notify();
     }
 
     /// Mirror the host's expansion state.
@@ -936,7 +980,7 @@ impl Render for TranscriptList {
                     .right_0()
                     .bottom_0()
                     .w(px(16.))
-                    .child(Scrollbar::vertical(&self.list)),
+                    .child(Scrollbar::vertical(&self.scrollbar)),
             )
     }
 }
