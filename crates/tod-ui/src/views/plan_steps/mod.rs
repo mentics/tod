@@ -5,7 +5,6 @@
 
 mod rows;
 
-use crate::ui::agent_chat::{OpenAgentChat, OpenConversation};
 use crate::ui::report_problem::{OpenReportDialog, ReportProblem};
 use crate::ui::item_list::keyboard::{
     ItemListActivate, ItemListCommitEdit, ItemListCreateAbove, ItemListCreateBelow, ItemListDelete,
@@ -30,7 +29,7 @@ use rows::{ListAction, PlanRow, PlanStepItem};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
-use tod_store::conversation::{Focus, NetOp};
+use tod_store::conversation::NetOp;
 use tod_store::fleet::FleetStore;
 use tod_store::interview::{ACTOR_USER, InterviewCommand};
 use tod_store::outline::repos::plan_steps::needs_user;
@@ -207,21 +206,6 @@ impl PlanStepsView {
         cx.notify();
     }
 
-    /// What the host shows under each step's body. The standalone panel
-    /// leaves it unset; a conversation uses it for the blocks only a
-    /// conversation has — a step handed back to the user, and what
-    /// verification found.
-    pub fn set_row_detail(&mut self, detail: Option<RowDetail>) {
-        self.row_detail = detail;
-    }
-
-    /// How the host runs what the list changes. Set inside a conversation so
-    /// every edit, creation, reorder and deletion is recorded as the user's
-    /// own action there.
-    pub fn set_mutation_router(&mut self, router: Option<MutationRouter>) {
-        self.router = router;
-    }
-
     /// Run `mutation` the way the host asked for.
     fn apply(&self, mutation: OutlineMutation) -> Result<(), String> {
         match &self.router {
@@ -238,33 +222,12 @@ impl PlanStepsView {
         }
     }
 
-    /// The steps the list is showing, in order.
-    #[cfg(test)]
-    pub(crate) fn shown_steps(&self) -> Vec<Uuid> {
-        self.list.items().map(|item| item.step.id).collect()
-    }
-
     /// The step under the cursor.
     pub(crate) fn selected_id(&self) -> Option<Uuid> {
         self.selected_step().map(|step| step.id)
     }
 
-    /// The status dropdown, while open.
     #[cfg(test)]
-    pub(crate) fn open_menu(&self) -> Option<StatusMenu> {
-        self.status_menu
-    }
-
-    #[cfg(test)]
-    pub(crate) fn toggle_filter(
-        &mut self,
-        status: Option<&str>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.set_filter(status, window, cx);
-    }
-
     /// Scroll to plan step `id` and highlight it. Does nothing if the step is
     /// not on this node.
     pub fn highlight_item(&mut self, id: Uuid, window: &mut Window, cx: &mut Context<Self>) {
@@ -276,6 +239,7 @@ impl PlanStepsView {
         self.list.scroll_to_cursor();
     }
 
+    #[cfg(test)]
     /// Show a leading op icon on each plan step in `markers`.
     pub fn set_change_markers(&mut self, markers: HashMap<Uuid, NetOp>, cx: &mut Context<Self>) {
         self.change_markers = markers;
@@ -286,21 +250,6 @@ impl PlanStepsView {
     /// Whether `id` is shown as a removed (struck-through) row.
     pub(crate) fn is_struck(&self, id: Uuid) -> bool {
         self.struck.contains(&id)
-    }
-
-    /// Also show `steps`, which no longer exist, struck through at their old
-    /// place. Ones that exist again (a reversed deletion) show as normal.
-    pub fn set_removed_items(
-        &mut self,
-        steps: Vec<PlanStep>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if self.removed == steps {
-            return;
-        }
-        self.removed = steps;
-        self.reload(window, cx);
     }
 
     pub fn open(
@@ -315,32 +264,6 @@ impl PlanStepsView {
         self.clear_inline_edit_state(window, cx);
         self.reload(window, cx);
         self.focus_list(window, cx);
-        cx.notify();
-    }
-
-    /// `focus` controls whether keyboard focus moves into the panel — true
-    /// for an explicit "open plan steps" action, false when the panel is
-    /// merely following tree selection and focus should stay put.
-    pub fn retarget(
-        &mut self,
-        node_id: Uuid,
-        title: &str,
-        focus: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if self.node_id == Some(node_id) {
-            self.title = title.to_string();
-            self.reload(window, cx);
-            return;
-        }
-        self.node_id = Some(node_id);
-        self.title = title.to_string();
-        self.clear_inline_edit_state(window, cx);
-        self.reload(window, cx);
-        if focus {
-            self.focus_list(window, cx);
-        }
         cx.notify();
     }
 
@@ -458,22 +381,6 @@ impl PlanStepsView {
         cx.notify();
     }
 
-    /// Ctrl+J: the conversation about the selected step, or about the node
-    /// when none is selected. Embedded, the host decides.
-    fn on_open_agent_chat(
-        &mut self,
-        _: &OpenAgentChat,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(focus) = self.conversation_focus().filter(|_| !self.embedded) else {
-            cx.propagate();
-            return;
-        };
-        cx.stop_propagation();
-        window.dispatch_action(Box::new(OpenConversation::outline(focus)), cx);
-    }
-
     /// Ctrl+Shift+R: report a problem against the node behind the selected
     /// step, or the whole project when there is none. Embedded, the host
     /// decides.
@@ -492,16 +399,6 @@ impl PlanStepsView {
             .map_or(tod_journey::JourneyKey::Project, tod_journey::JourneyKey::Node);
         cx.stop_propagation();
         window.dispatch_action(Box::new(OpenReportDialog { key, conversation: None }), cx);
-    }
-
-    /// The conversation Ctrl+J opens here: the selected step, or the node
-    /// when none (or a removed one) is selected.
-    pub fn conversation_focus(&self) -> Option<Focus> {
-        let node = self.node_id?;
-        Some(match self.selected_live_step() {
-            Some(step) => Focus::PlanStep { node, id: step.id },
-            None => Focus::Node(node),
-        })
     }
 
     fn selected_step(&self) -> Option<PlanStep> {
@@ -1072,7 +969,6 @@ impl Render for PlanStepsView {
                 cx.emit(PlanStepsEvent::FocusTaskList);
                 cx.stop_propagation();
             }))
-            .on_action(cx.listener(Self::on_open_agent_chat))
             .on_action(cx.listener(Self::on_report_problem))
             .on_action(cx.listener(Self::on_close))
             .on_action(cx.listener(Self::on_enter))
@@ -1307,45 +1203,6 @@ mod tests {
             events.borrow().as_slice(),
             [PlanStepsEvent::FocusTaskList, PlanStepsEvent::Close]
         ));
-    }
-
-    #[gpui::test]
-    fn plan_steps_ctrl_j_opens_the_selected_step(cx: &mut TestAppContext) {
-        let fixture = Fixture::new();
-        let (_, _, cx) = open_view(&fixture, false, cx);
-        let opened = record_open_conversation(cx);
-        cx.dispatch_action(OpenAgentChat);
-        cx.run_until_parked();
-        assert_eq!(
-            opened.borrow().as_slice(),
-            [Focus::PlanStep {
-                node: fixture.node_id,
-                id: fixture.steps[0],
-            }]
-        );
-    }
-
-    #[gpui::test]
-    fn plan_steps_embedded_leaves_ctrl_j_to_the_host(cx: &mut TestAppContext) {
-        let fixture = Fixture::new();
-        let (_, _, cx) = open_view(&fixture, true, cx);
-        let opened = record_open_conversation(cx);
-        cx.dispatch_action(OpenAgentChat);
-        cx.run_until_parked();
-        assert!(opened.borrow().is_empty());
-    }
-
-    /// Every `OpenConversation` that reaches the top of the dispatch path, as
-    /// the shell would see it.
-    fn record_open_conversation(cx: &mut VisualTestContext) -> Rc<RefCell<Vec<Focus>>> {
-        let opened = Rc::new(RefCell::new(Vec::new()));
-        let sink = opened.clone();
-        cx.update(|_, cx| {
-            cx.on_action(move |action: &OpenConversation, _| {
-                sink.borrow_mut().push(action.focus);
-            });
-        });
-        opened
     }
 
     #[gpui::test]

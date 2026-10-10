@@ -72,16 +72,6 @@ impl PlanPanel {
         self.node_id
     }
 
-    /// Point this column at a different node, in place.
-    pub fn retarget(&mut self, node_id: Uuid, window: &mut Window, cx: &mut Context<Self>) {
-        self.node_id = node_id;
-        let title = node_title(&self.fleet, node_id);
-        self.inner.update(cx, |view, cx| {
-            view.retarget(node_id, &title, false, window, cx);
-        });
-        cx.notify();
-    }
-
     /// `E`: open the selected plan step's own transcript — the conversation
     /// that last changed it, while one did.
     fn on_open_transcript(

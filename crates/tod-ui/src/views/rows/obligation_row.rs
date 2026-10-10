@@ -8,10 +8,9 @@ use gpui::{
     AnyElement, App, Entity, InteractiveElement, IntoElement, MouseButton, ParentElement,
     SharedString, Styled, Window, div, prelude::FluentBuilder, px,
 };
-use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::input::{Textarea, TextareaState};
-use gpui_component::{ActiveTheme, Sizable as _, h_flex};
-use tod_store::interview::{PHASE_DESIGN, short_id};
+use gpui_component::{ActiveTheme, h_flex};
+use tod_store::interview::short_id;
 use tod_store::outline::NodeObligation;
 use uuid::Uuid;
 
@@ -23,8 +22,6 @@ pub enum ObligationRowEvent {
     Select { row_ix: usize },
     /// Double-clicked the highlighted row's text.
     StartEdit { obligation_id: Uuid },
-    /// Clicked a design-phase obligation's "Design" affordance.
-    OpenVisualDesign { obligation_id: Uuid },
 }
 
 pub const COLUMN_TEXT: &str = "obligation";
@@ -188,23 +185,6 @@ pub fn obligation_row<A: From<ObligationRowEvent> + 'static>(
                 })
                 .child(text.into_any_element()),
         );
-        if !compact && obligation.phase == PHASE_DESIGN {
-            let has_design = obligation.visual_design_path.is_some();
-            let design_host = host.clone();
-            row = row.child(
-                Button::new(("obligation-visual-design", row_ix))
-                    .label(if has_design { "Design" } else { "+ Design" })
-                    .ghost()
-                    .xsmall()
-                    .flex_shrink_0()
-                    .on_click(move |_, _, cx| {
-                        design_host.push(
-                            ObligationRowEvent::OpenVisualDesign { obligation_id: id }.into(),
-                            cx,
-                        );
-                    }),
-            );
-        }
     }
 
     if !compact && !columns.is_empty() {

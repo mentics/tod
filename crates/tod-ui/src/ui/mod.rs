@@ -1,6 +1,7 @@
 pub mod actionable;
 pub mod agent_chat;
 pub mod agent_runs;
+pub(crate) mod driver_slot;
 pub mod claude_adapter;
 pub mod agent_conversation;
 pub mod agent_permission;
@@ -14,7 +15,6 @@ pub mod key_context;
 pub mod list;
 pub mod nav_history;
 pub mod pane_nav;
-pub mod panel_split;
 pub mod pasted_image;
 pub mod report_problem;
 pub mod scroll_reveal;

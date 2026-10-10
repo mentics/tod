@@ -49,15 +49,6 @@ impl SettingsPanel {
         self.node_id
     }
 
-    /// Point this column at a different node, in place.
-    pub fn retarget(&mut self, node_id: Uuid, window: &mut Window, cx: &mut Context<Self>) {
-        self.node_id = node_id;
-        let id = node_id.to_string();
-        self.inner.update(cx, |view, cx| {
-            view.retarget(&id, window, cx);
-        });
-        cx.notify();
-    }
 }
 
 impl ColumnPanel for SettingsPanel {

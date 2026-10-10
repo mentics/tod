@@ -1,8 +1,7 @@
 //! The app-wide registry of agent runs.
 //!
 //! Every conversation driver (implement, verify, review, fix, gate check,
-//! on-entry, freeform) is hosted here instead of inside [`ConversationView`]
-//! (`crate::conversation::ConversationView`), so any view can ask which
+//! on-entry, freeform) is hosted here, so any view can ask which
 //! agents are running on a given node, under which protocol, and — for a
 //! lifecycle-flavored run — whether it is entering or leaving a state. One
 //! [`AgentRuns`] is created in `app::window::open` and shared as an
@@ -11,11 +10,11 @@
 //!
 //! Starting a turn and collecting a finished one run git, Docker, and
 //! `tod-cli`, which can take seconds — see
-//! `crate::conversation::driver_slot::DriverSlot`. Callers take a slot's
+//! `crate::ui::driver_slot::DriverSlot`. Callers take a slot's
 //! driver to the background executor and put it back; [`AgentRuns`] only
 //! ever holds the slots, never blocks the UI thread itself.
 
-use crate::conversation::driver_slot::DriverSlot;
+use crate::ui::driver_slot::DriverSlot;
 use crate::interview::agent::SharedAgent;
 use crate::interview::{TodPaths, TodSettings};
 use anyhow::Context as _;
@@ -162,21 +161,13 @@ impl AgentRuns {
         self.slots.get(ix).map(|s| s.status.clone())
     }
 
+    #[cfg(test)]
     /// Whether a conversation running `protocol` on `focus` is working now,
     /// whichever conversation a caller has open.
     pub fn protocol_running(&self, focus: Focus, protocol: ProtocolKind) -> bool {
         self.slots
             .iter()
             .any(|d| d.focus == focus && d.protocol == protocol && d.status.running)
-    }
-
-    /// The conversation id of the (first) slot running `protocol` on
-    /// `focus`, when one is working now; `Some(None)` for an unsaved one.
-    pub fn running_conversation(&self, focus: Focus, protocol: ProtocolKind) -> Option<Option<Uuid>> {
-        self.slots
-            .iter()
-            .find(|d| d.focus == focus && d.protocol == protocol && d.status.running)
-            .map(|d| d.conversation_id)
     }
 
     /// The slot for `focus`/`protocol`/`conversation_id`, starting a fresh
@@ -205,6 +196,7 @@ impl AgentRuns {
         Some((slot.id, driver))
     }
 
+    #[cfg(test)]
     /// Every slot with a turn in flight, taken to be ticked off the main
     /// thread; [`AgentRuns::put_back`] returns each one.
     pub fn take_running(&mut self) -> Vec<(u64, ConversationDriver)> {
@@ -221,6 +213,7 @@ impl AgentRuns {
         }
     }
 
+    #[cfg(test)]
     /// Take, and clear, the slot `id`'s cancel flag.
     pub fn take_cancel(&mut self, id: u64) -> bool {
         self.slots
@@ -309,27 +302,6 @@ impl AgentRuns {
         })
     }
 
-    /// Drop every slot `keep` says no to; used to drop idle slots for a
-    /// conversation nobody is showing.
-    pub fn retain(&mut self, keep: impl FnMut(&DriverSlot) -> bool) {
-        self.slots.retain(keep);
-    }
-
-    /// Work in flight, for the close-window warning.
-    pub fn running_work(&self) -> Vec<String> {
-        self.slots
-            .iter()
-            .filter(|d| d.status.running)
-            .map(|d| {
-                let id = d
-                    .conversation_id
-                    .map(tod_store::interview::short_id)
-                    .unwrap_or_default();
-                format!("Conversation agent running: {id}")
-            })
-            .collect()
-    }
-
     /// Every run on `node`: what the status label (`state` / `state →` /
     /// `→ state`, W11) reads. Reads each matching slot's conversation row for
     /// the transition a gate check or on-entry turn is about.
@@ -369,12 +341,6 @@ impl AgentRuns {
             .filter_map(|s| s.conversation_id)
             .map(ConversationDriver::session_key)
             .collect()
-    }
-
-    /// Every run currently in flight, across every focus (for a future
-    /// "agents running" indicator).
-    pub fn running(&self) -> impl Iterator<Item = &DriverSlot> {
-        self.slots.iter().filter(|s| s.status.running)
     }
 
     /// Nodes with a lifecycle-processor conversation (anything but a chat or

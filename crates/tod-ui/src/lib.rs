@@ -1,6 +1,5 @@
 mod app;
 mod cli;
-mod conversation;
 mod interview;
 mod ui;
 pub(crate) mod unified;

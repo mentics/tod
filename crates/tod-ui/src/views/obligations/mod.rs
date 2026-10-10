@@ -5,7 +5,6 @@ mod rows;
 pub use rows::DRAG_LIST;
 
 use crate::ui::actionable::{chrome_control_with_shortcut, render_shortcut_pill};
-use crate::ui::agent_chat::OpenAgentChat;
 use crate::ui::item_list::keyboard::{
     ItemListActivate, ItemListAddGroup, ItemListCollapse, ItemListCommitEdit, ItemListCreateAbove,
     ItemListCreateBelow, ItemListCreateChild, ItemListDelete, ItemListDown, ItemListEdit,
@@ -19,7 +18,6 @@ use crate::ui::item_list::{
 };
 use crate::ui::key_context;
 use crate::ui::pane_nav::{PaneFocusLeft, bind_modified_pane_nav};
-use crate::ui::report_problem::ReportProblem;
 use crate::ui::status_filter::{StatusFilter, render_status_filter, status_counts};
 use crate::views::rows::{RowAction, RowHost, obligation_columns};
 use gpui::prelude::FluentBuilder;
@@ -38,7 +36,7 @@ use rows::{
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use tod_store::conversation::{Focus, NetOp};
+use tod_store::conversation::NetOp;
 use tod_store::fleet::FleetStore;
 use tod_store::interview::{OBLIGATION_PHASES, PHASE_REQUIREMENTS, PHASE_UNKNOWN};
 use tod_store::outline::repos::PlanStepRepo;
@@ -120,24 +118,6 @@ pub enum ObligationsEvent {
     FocusTaskList,
     /// Delete key with no obligation item selected — delete the task in the tree.
     DeleteSelectedTask,
-    /// Ctrl+J — open the conversation about the selected obligation, or about
-    /// the node when no obligation is selected.
-    OpenAgentChat {
-        node_id: Uuid,
-        /// The specific obligation selected, when one is.
-        obligation_id: Option<Uuid>,
-    },
-    /// Ctrl+Shift+R — report a problem against the node behind the selected
-    /// obligation.
-    ReportProblem {
-        node_id: Uuid,
-    },
-    /// Clicked the "Design"/"+ Design" affordance on a design-phase
-    /// obligation row — create or open its associated visual-design mockup.
-    OpenVisualDesign {
-        node_id: Uuid,
-        obligation_id: Uuid,
-    },
 }
 
 /// What the cursor is on, cloned out of the list so the panel can act on it.
@@ -304,6 +284,7 @@ impl ObligationsView {
         cx.notify();
     }
 
+    #[cfg(test)]
     /// Scroll to obligation `id` and highlight it, expanding its phase, kind,
     /// and section, and clearing a search that hides it. Does nothing if the
     /// obligation is not on this node.
@@ -333,6 +314,7 @@ impl ObligationsView {
         self.list.scroll_to_cursor();
     }
 
+    #[cfg(test)]
     /// Show a leading op icon on each obligation in `markers`.
     pub fn set_change_markers(&mut self, markers: HashMap<Uuid, NetOp>, cx: &mut Context<Self>) {
         self.change_markers = markers;
@@ -355,36 +337,6 @@ impl ObligationsView {
         self.struck.contains(&id)
     }
 
-    /// Also show `items`, which no longer exist, struck through at their old
-    /// place. Ones that exist again (a reversed deletion) show as normal.
-    pub fn set_removed_items(
-        &mut self,
-        items: Vec<NodeObligation>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if self.removed == items {
-            return;
-        }
-        self.removed = items;
-        self.reload(window, cx);
-    }
-
-    /// The conversation Ctrl+J opens here: the selected obligation, or the
-    /// node when none (or a removed one) is selected.
-    pub fn conversation_focus(&self) -> Option<Focus> {
-        let node = self.node_id?;
-        Some(
-            match self
-                .selected_obligation_id()
-                .filter(|id| !self.is_struck(*id))
-            {
-                Some(id) => Focus::Obligation { node, id },
-                None => Focus::Node(node),
-            },
-        )
-    }
-
     pub fn open(
         &mut self,
         node_id: Uuid,
@@ -400,39 +352,6 @@ impl ObligationsView {
         self.clear_inline_edit_state(window, cx);
         self.reload(window, cx);
         self.focus_list(window, cx);
-        cx.notify();
-    }
-
-    /// `focus` controls whether keyboard focus moves into the panel — true
-    /// for an explicit "open obligations" action, false when the panel is
-    /// merely following tree selection and focus should stay put.
-    ///
-    /// `active_phase` is the interview's current phase, `None` outside an
-    /// interview — only every phase starting expanded on open is affected.
-    pub fn retarget(
-        &mut self,
-        node_id: Uuid,
-        title: &str,
-        active_phase: Option<&str>,
-        focus: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if self.node_id == Some(node_id) {
-            self.title = title.to_string();
-            self.active_phase = active_phase.map(str::to_string);
-            self.reload(window, cx);
-            return;
-        }
-        self.node_id = Some(node_id);
-        self.title = title.to_string();
-        self.active_phase = active_phase.map(str::to_string);
-        self.reset_phase_collapse();
-        self.clear_inline_edit_state(window, cx);
-        self.reload(window, cx);
-        if focus {
-            self.focus_list(window, cx);
-        }
         cx.notify();
     }
 
@@ -476,23 +395,6 @@ impl ObligationsView {
     /// a group or section header.
     pub(crate) fn selected_obligation_id(&self) -> Option<Uuid> {
         Some(self.list.cursor_item()?.obligation.id)
-    }
-
-    fn open_agent_chat(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
-        let Some(node_id) = self.node_id else {
-            return;
-        };
-        cx.emit(ObligationsEvent::OpenAgentChat {
-            node_id,
-            obligation_id: self.selected_obligation_id(),
-        });
-    }
-
-    fn report_problem(&mut self, cx: &mut Context<Self>) {
-        let Some(node_id) = self.node_id else {
-            return;
-        };
-        cx.emit(ObligationsEvent::ReportProblem { node_id });
     }
 
     pub fn reload(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1473,14 +1375,6 @@ impl ObligationsView {
                 ListAction::DeleteSelected => {
                     self.on_delete(&ItemListDelete, window, cx);
                 }
-                ListAction::OpenVisualDesign { obligation_id } => {
-                    if let Some(node_id) = self.node_id {
-                        cx.emit(ObligationsEvent::OpenVisualDesign {
-                            node_id,
-                            obligation_id,
-                        });
-                    }
-                }
             }
         }
     }
@@ -1760,23 +1654,6 @@ impl Render for ObligationsView {
                     return;
                 }
                 cx.emit(ObligationsEvent::FocusTaskList);
-                cx.stop_propagation();
-            }))
-            .on_action(cx.listener(|this, _: &OpenAgentChat, window, cx| {
-                // Embedded, the host owns the conversation it opens.
-                if this.embedded {
-                    cx.propagate();
-                    return;
-                }
-                this.open_agent_chat(window, cx);
-                cx.stop_propagation();
-            }))
-            .on_action(cx.listener(|this, _: &ReportProblem, _window, cx| {
-                if this.embedded {
-                    cx.propagate();
-                    return;
-                }
-                this.report_problem(cx);
                 cx.stop_propagation();
             }))
             .on_action(cx.listener(Self::on_search_space))
@@ -2264,34 +2141,6 @@ mod tests {
             events.borrow().as_slice(),
             [ObligationsEvent::FocusTaskList, ObligationsEvent::Close]
         ));
-    }
-
-    #[gpui::test]
-    fn obligations_ctrl_j_opens_the_selection_without_an_agent_capability(cx: &mut TestAppContext) {
-        // The fixture node has no Agent capability: Ctrl+J is not gated on it.
-        let fixture = Fixture::new();
-        let (view, events, cx) = open_view(&fixture, false, cx);
-        let target = fixture.offline_obligation;
-        view.update_in(cx, |view, window, cx| {
-            view.highlight_item(target, window, cx)
-        });
-        draw(cx);
-        let selected = selected_obligation(&view, cx);
-        assert_eq!(selected, Some(target));
-        cx.dispatch_action(OpenAgentChat);
-        assert!(matches!(
-            events.borrow().as_slice(),
-            [ObligationsEvent::OpenAgentChat { node_id, obligation_id }]
-                if *node_id == fixture.node_id && *obligation_id == selected
-        ));
-    }
-
-    #[gpui::test]
-    fn obligations_embedded_leaves_ctrl_j_to_the_host(cx: &mut TestAppContext) {
-        let fixture = Fixture::new();
-        let (_, events, cx) = open_view(&fixture, true, cx);
-        cx.dispatch_action(OpenAgentChat);
-        assert!(events.borrow().is_empty());
     }
 
     #[gpui::test]

@@ -46,7 +46,7 @@ use tod_store::conversation::{
 };
 use tod_store::fleet::FleetStore;
 
-use crate::conversation::format_time;
+use chrono::{Local, TimeZone};
 use crate::interview::agent::SharedAgent;
 use crate::interview::{TodPaths, TodSettings};
 use crate::ui::agent_conversation::{bind_panel_host_keys, forward_panel_keys, AgentConversationEvent, AgentConversationPanel, Entry, EntryKind};
@@ -800,7 +800,10 @@ impl ChatDrawer {
         }
         for summary in &self.sessions {
             let id = summary.conversation.id;
-            let visual_design = summary.conversation.protocol == ProtocolKind::VisualDesign;
+            // A visual-design conversation has no view here.
+            if summary.conversation.protocol == ProtocolKind::VisualDesign {
+                continue;
+            }
             let opening = if summary.opening.is_empty() {
                 "(no messages)".to_string()
             } else {
@@ -817,23 +820,9 @@ impl ChatDrawer {
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |this, _: &MouseDownEvent, window, cx| {
-                        if visual_design {
-                            window.dispatch_action(
-                                Box::new(crate::ui::agent_chat::OpenConversation {
-                                    focus: this.focus,
-                                    protocol: ProtocolKind::VisualDesign,
-                                    start: false,
-                                }),
-                                cx,
-                            );
-                        } else {
-                            this.open_session(id, window, cx)
-                        }
+                        this.open_session(id, window, cx)
                     }),
                 )
-                .children(visual_design.then(|| {
-                    style::badge(div()).flex_shrink_0().child("visual design")
-                }))
                 .child(
                     style::text_dense_muted(div())
                         .flex_shrink_0()
@@ -843,6 +832,18 @@ impl ChatDrawer {
             );
         }
         list
+    }
+}
+
+/// A timestamp as the session list shows it: the time today, else the date.
+fn format_time(ms: i64) -> String {
+    let Some(at) = Local.timestamp_millis_opt(ms).single() else {
+        return String::new();
+    };
+    if at.date_naive() == Local::now().date_naive() {
+        at.format("%H:%M").to_string()
+    } else {
+        at.format("%b %-d").to_string()
     }
 }
 

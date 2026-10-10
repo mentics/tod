@@ -18,32 +18,6 @@ pub enum CloudUpdate {
     Failed(String),
 }
 
-/// The line shown instead of a cloud node's lifecycle buttons: where it
-/// runs and what the supervisor last did, as far as the synced data says.
-pub fn status_line(cloud: &CloudNode, lifecycle: &str) -> String {
-    status_line_with(cloud, lifecycle, None)
-}
-
-/// [`status_line`], saying when the sandbox was found gone and what the
-/// app's lost-sandbox check (`cloud_sync::lost`) did about it (`note`).
-pub fn status_line_with(cloud: &CloudNode, lifecycle: &str, note: Option<&str>) -> String {
-    let mut line = format!(
-        "Runs in the cloud (sandbox {}, as {}); its supervisor moves it along. \
-         Last synced state: {}.",
-        cloud.sandbox,
-        cloud.user,
-        if lifecycle.is_empty() { "unknown" } else { lifecycle }
-    );
-    match note {
-        Some(note) => line = format!("{line} {note}"),
-        None if cloud.lost_at.is_some() => {
-            line.push_str(" Its sandbox is gone; the app replaces it on its next sync.")
-        }
-        None => {}
-    }
-    line
-}
-
 /// Take `node_id` out of the cloud off the UI thread (`cloud_sync::lost::stop_running_in_cloud`).
 pub fn stop_running<T: 'static>(
     fleet: Arc<FleetStore>,
@@ -111,20 +85,4 @@ fn spawn<T: 'static>(
         }
     })
     .detach();
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn status_line_names_the_sandbox_and_state() {
-        let mut cloud = CloudNode { sandbox: "node-x".into(), user: "joel".into(), accepted_at_ms: 0, lost_at: None };
-        let line = status_line(&cloud, "active");
-        assert!(line.contains("node-x") && line.contains("joel") && line.contains("active"), "{line}");
-        assert!(status_line(&cloud, "").contains("unknown"));
-        cloud.lost_at = Some(1);
-        assert!(status_line(&cloud, "active").contains("gone"));
-        assert!(status_line_with(&cloud, "active", Some("Replaced it.")).ends_with("Replaced it."));
-    }
 }

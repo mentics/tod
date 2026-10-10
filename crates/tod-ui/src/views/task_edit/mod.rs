@@ -744,6 +744,7 @@ impl TaskEditView {
         self.task_id.is_some()
     }
 
+    #[cfg(test)]
     pub fn open_task_id(&self, _cx: &Context<Self>) -> Option<String> {
         self.task_id.clone()
     }
@@ -770,34 +771,6 @@ impl TaskEditView {
             this.focus_handle.focus(window, cx);
             cx.notify();
         });
-    }
-
-    pub fn retarget(&mut self, task_id: &str, window: &mut Window, cx: &mut Context<Self>) {
-        if self.task_id.as_deref() == Some(task_id) {
-            return;
-        }
-        let previous = self.task_id.clone();
-        self.task_id = Some(task_id.to_string());
-        if !self.load_task(window, cx) {
-            // Never keep showing a node that is no longer selected.
-            self.task_id = previous;
-            self.close(cx);
-            return;
-        }
-        cx.notify();
-    }
-
-    /// Pick up a generator refresh that ran somewhere else (the tree's own
-    /// refresh action, or the credential prompt resuming one this panel
-    /// blocked on). Does nothing unless the panel is showing that generator.
-    pub fn reload_generator_for(&mut self, node_id: uuid::Uuid, cx: &mut Context<Self>) {
-        if self.node_uuid() != Some(node_id) {
-            return;
-        }
-        let _ = self.fleet.reload_if_stale();
-        self.generator_busy = None;
-        self.reload_generator_status();
-        cx.notify();
     }
 
     pub fn close(&mut self, cx: &mut Context<Self>) {

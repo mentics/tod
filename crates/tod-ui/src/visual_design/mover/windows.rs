@@ -18,7 +18,7 @@ struct Search {
     hidden: Option<WindowHandle>,
 }
 
-unsafe extern "system" fn visit(hwnd: HWND, lparam: LPARAM) -> BOOL {
+unsafe extern "system" fn visit(hwnd: HWND, lparam: LPARAM) -> BOOL { unsafe {
     let search = &mut *(lparam.0 as *mut Search);
     let n = GetWindowTextLengthW(hwnd);
     if n > 0 {
@@ -35,7 +35,7 @@ unsafe extern "system" fn visit(hwnd: HWND, lparam: LPARAM) -> BOOL {
         }
     }
     BOOL(1)
-}
+}}
 
 fn hwnd(w: &WindowHandle) -> HWND {
     HWND(w.id as usize as isize)

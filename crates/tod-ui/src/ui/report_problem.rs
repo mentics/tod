@@ -34,19 +34,7 @@ pub struct OpenReportDialog {
 }
 
 impl OpenReportDialog {
-    pub fn project() -> Self {
-        Self {
-            key: JourneyKey::Project,
-            conversation: None,
-        }
-    }
 
-    pub fn node(id: Uuid) -> Self {
-        Self {
-            key: JourneyKey::Node(id),
-            conversation: None,
-        }
-    }
 }
 
 /// Whether reports can be sent (`JourneySettings::can_submit`). While not,

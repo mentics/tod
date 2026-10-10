@@ -24,7 +24,6 @@ use chrono::{DateTime, Utc};
 use crate::interview::TodPaths;
 use crate::ui::journey::Source;
 use crate::ui::actionable::{chrome_control_with_shortcut, render_shortcut_pill};
-use crate::ui::agent_chat::{OpenAgentChat, OpenConversation};
 use crate::ui::report_problem::{OpenReportDialog, ReportProblem};
 use crate::ui::app_nav::{AppDestination, AppNavMenu, HasAppNav, on_app_nav_toggle};
 use crate::ui::key_context;
@@ -33,7 +32,6 @@ use crate::ui::list::{
     viewport_row_count,
 };
 use crate::ui::pane_nav::{PaneFocusRight, bind_modified_pane_nav};
-use crate::views::incoming_check::{IncomingCheck, outcome_line};
 use delegate::{RowAction, TaskListDelegate};
 use fixtures::load_tasks_from_store;
 use gpui::{
@@ -48,9 +46,8 @@ use gpui_component::menu::PopupMenu;
 use gpui_component::{ActiveTheme, Disableable, Sizable, StyledExt};
 use model::{ListWorkingSet as WorkingSet, filter_and_sort_tasks, nearest_visible_id};
 use row_menu::RowMenuKind;
-use tod_core::process::interview_phase_for_lifecycle;
 use tod_core::task::model::RunSource;
-use tod_store::fleet::{FleetStore, code_editors, validate_interview_workspace};
+use tod_store::fleet::{FleetStore, code_editors};
 use tod_store::outline::{CreatePosition, OutlineMutation, ReorderDirection};
 use working_set::{load_working_set, save_working_set};
 
@@ -104,7 +101,6 @@ actions!(
         TaskListCopy,
         TaskListPaste,
         TaskListToggleMark,
-        TaskListCheckIncoming,
     ]
 );
 
@@ -182,7 +178,6 @@ pub fn register_task_list_keyboard_bindings(cx: &mut App) {
         KeyBinding::new("backspace", TaskListDelete, context),
         KeyBinding::new("ctrl-c", TaskListCopy, context),
         KeyBinding::new("space", TaskListToggleMark, context),
-        KeyBinding::new("i", TaskListCheckIncoming, context),
         KeyBinding::new("ctrl-v", TaskListPaste, context),
         // Inline title edit: Escape cancels; arrows leave the field and move selection.
         KeyBinding::new(
@@ -369,12 +364,8 @@ pub struct TaskListView {
     _compose_subscription: Subscription,
     _credential_subscription: Subscription,
     _inline_edit_subscription: Subscription,
-    /// Rows marked for a multi-node action (Space / Ctrl+click): today,
-    /// "Check incoming changes". Session-only.
+    /// Rows marked with Space / Ctrl+click. Session-only.
     marked: std::collections::HashSet<String>,
-    /// The shared incoming-changes check (`bind_incoming_check`).
-    incoming_check: Option<Entity<IncomingCheck>>,
-    _incoming_check_subscription: Option<Subscription>,
     /// Fed by the host through `set_attention` — what each node is waiting
     /// on the user for, and since when. Not persisted; re-supplied on every
     /// host-side change.
@@ -544,8 +535,6 @@ impl TaskListView {
             _credential_subscription,
             _inline_edit_subscription,
             marked: std::collections::HashSet::new(),
-            incoming_check: None,
-            _incoming_check_subscription: None,
             attention: std::collections::HashMap::new(),
             pending_attention_apply: false,
             pending_status_override_apply: false,
@@ -1093,22 +1082,6 @@ impl TaskListView {
         self.live_refresh(window, cx);
     }
 
-    /// Open the Linear API key prompt on behalf of another view (the edit
-    /// panel, routed through the shell), resuming that generator's refresh
-    /// once the key is saved.
-    pub fn prompt_linear_credentials_for_generator(
-        &mut self,
-        node_id: uuid::Uuid,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.open_linear_credential_prompt(
-            PendingCredentialRequest::GeneratorRefresh { node_id },
-            window,
-            cx,
-        );
-    }
-
     fn set_collapsed(
         &mut self,
         task_id: &str,
@@ -1409,109 +1382,6 @@ impl TaskListView {
         self.set_status_line(format!("Lifecycle panel: {lifecycle}"), cx);
     }
 
-    /// Validate and open the implementation/design/requirements interview
-    /// for `task_id` on demand — used by the lifecycle panel's "Open
-    /// interview" affordance rather than being forced automatically.
-    pub fn open_interview_for_task(
-        &mut self,
-        task_id: &str,
-        lifecycle: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        // The shell opens `proposed` / `design` nodes in the conversation view
-        // before it gets here; this path is the interview's (`planning`).
-        let label = tod_core::process::spec_view_label(lifecycle).unwrap_or("Interview");
-        if interview_phase_for_lifecycle(lifecycle).is_none() {
-            self.show_error(
-                format!("{label} unavailable for this lifecycle state."),
-                window,
-                cx,
-            );
-            return;
-        }
-        let Some(task) = self.all_tasks.iter().find(|t| t.id == task_id).cloned() else {
-            return;
-        };
-        if !task.is_work_node {
-            self.show_error(
-                format!("{label} unavailable — task is not a work node."),
-                window,
-                cx,
-            );
-            return;
-        }
-        let Ok(node_id) = uuid::Uuid::parse_str(&task.id) else {
-            self.show_error(
-                format!("{label} unavailable — invalid task id."),
-                window,
-                cx,
-            );
-            return;
-        };
-        if let Ok(Some(task_row)) = self.fleet.get_task(task_id) {
-            if task_row.repo.as_ref().is_none_or(|r| r.trim().is_empty()) {
-                self.show_error(
-                    format!(
-                        "Set repository on task before opening {}.",
-                        label.to_lowercase()
-                    ),
-                    window,
-                    cx,
-                );
-                return;
-            }
-            let repo = task_row.repo.as_deref().unwrap_or("");
-            let branch = task_row.branch.as_deref().unwrap_or("");
-            // A repository inside a dev container or sandbox can't be checked
-            // from here.
-            let in_container = self
-                .fleet
-                .resolve_files_for_node(task_id)
-                .ok()
-                .flatten()
-                .is_some_and(|files| files.repo_is_remote());
-            if !in_container
-                && let Err(err) =
-                    validate_interview_workspace(PathBuf::from(repo).as_path(), branch)
-            {
-                self.show_error(format!("{label} workspace: {err:#}"), window, cx);
-                return;
-            }
-        }
-        cx.emit(TaskListEvent::OpenInterview {
-            task_id: task_id.to_string(),
-            node_id,
-            lifecycle: lifecycle.to_string(),
-            title: task.title.clone(),
-        });
-        self.set_status_line(
-            format!("Opening {} for {}", label.to_lowercase(), task.title),
-            cx,
-        );
-    }
-
-    /// Open the lifecycle transition panel for a task (bypasses interview
-    /// routing), selecting it in the tree so the drawer shows the selection.
-    pub fn open_lifecycle_panel(
-        &mut self,
-        task_id: &str,
-        lifecycle: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.select_task_by_id(task_id, window, cx);
-        cx.emit(TaskListEvent::OpenLifecycle {
-            task_id: task_id.to_string(),
-            lifecycle: lifecycle.to_string(),
-        });
-        self.set_status_line(format!("Lifecycle panel: {lifecycle}"), cx);
-    }
-
-    pub fn restore_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.focus_list(window, cx);
-    }
-
     pub(super) fn focus_list(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.list_state.update(cx, |state, cx| {
             state.focus(window, cx);
@@ -1622,19 +1492,6 @@ impl TaskListView {
         cx.notify();
     }
 
-    /// Kept in sync by the shell, so Escape in the tree knows to close the drawer.
-    pub fn set_drawer_open(&mut self, open: bool, cx: &mut Context<Self>) {
-        if self.drawer_open == open {
-            return;
-        }
-        self.drawer_open = open;
-        if !open {
-            self.set_status_line("", cx);
-        } else {
-            cx.notify();
-        }
-    }
-
     pub fn request_live_refresh(&mut self, cx: &mut Context<Self>) {
         self.pending_live_refresh = true;
         cx.notify();
@@ -1655,23 +1512,6 @@ impl TaskListView {
             return None;
         }
         uuid::Uuid::parse_str(id).ok()
-    }
-
-    /// Ctrl+J: the conversation about the selected node, or about the whole
-    /// project when nothing is selected.
-    fn on_open_agent_chat(
-        &mut self,
-        _: &OpenAgentChat,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let focus = self
-            .selected_node_id()
-            .map_or(tod_store::conversation::Focus::Project, |id| {
-                tod_store::conversation::Focus::Node(id)
-            });
-        cx.stop_propagation();
-        window.dispatch_action(Box::new(OpenConversation::outline(focus)), cx);
     }
 
     /// Ctrl+Shift+R: report a problem against the selected node, or the
@@ -1896,6 +1736,7 @@ impl TaskListView {
         self.rebuild_visible_list(window, cx);
     }
 
+    #[cfg(test)]
     pub fn refresh(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.live_refresh(window, cx);
     }
@@ -2801,14 +2642,6 @@ impl TaskListView {
         self.open_obligations_panel(&task_id, window, cx);
     }
 
-    /// Share the incoming-changes check with the lifecycle panel, so a
-    /// check started in either shows in both.
-    pub fn bind_incoming_check(&mut self, check: Entity<IncomingCheck>, cx: &mut Context<Self>) {
-        self._incoming_check_subscription = Some(cx.observe(&check, |_, _, cx| cx.notify()));
-        self.incoming_check = Some(check);
-        cx.notify();
-    }
-
     /// Host this view as a column; see `marks_focused_column`.
     pub fn set_marks_focused_column(&mut self, marks: bool) {
         self.marks_focused_column = marks;
@@ -3010,48 +2843,6 @@ impl TaskListView {
         tod_core::linear_sync::push(&self.fleet, new_node_id, tod_core::linear_sync::Milestone::Accepted);
         self.live_refresh(window, cx);
         self.select_created_task(&new_node_id.to_string(), window, cx);
-    }
-
-    /// The nodes "Check incoming changes" acts on: the marked rows, else
-    /// the selected one.
-    fn check_targets(&self, cx: &Context<Self>) -> Vec<uuid::Uuid> {
-        if self.marked.is_empty() {
-            return self
-                .working_set
-                .selected_id
-                .clone()
-                .or_else(|| self.selected_task(cx).map(|t| t.id))
-                .and_then(|id| uuid::Uuid::parse_str(&id).ok())
-                .into_iter()
-                .collect();
-        }
-        // In tree order, so the summary reads top to bottom.
-        self.all_tasks
-            .iter()
-            .filter(|t| self.marked.contains(&t.id))
-            .filter_map(|t| uuid::Uuid::parse_str(&t.id).ok())
-            .collect()
-    }
-
-    fn on_check_incoming(
-        &mut self,
-        _: &TaskListCheckIncoming,
-        _: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.check_incoming(cx);
-    }
-
-    fn check_incoming(&mut self, cx: &mut Context<Self>) {
-        let Some(check) = self.incoming_check.clone() else {
-            return;
-        };
-        let nodes = self.check_targets(cx);
-        if nodes.is_empty() || check.read(cx).is_running() {
-            return;
-        }
-        check.update(cx, |check, cx| check.start(nodes, cx));
-        self.clear_marks(cx);
     }
 
     fn on_open_plan(&mut self, _: &TaskListOpenPlan, window: &mut Window, cx: &mut Context<Self>) {
@@ -3294,7 +3085,7 @@ impl TaskListView {
     /// (and their ancestors). Shown while any node has one, or while on.
     fn render_quick_filters(
         &self,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<gpui::AnyElement> {
         use gpui::IntoElement as _;
@@ -3323,27 +3114,6 @@ impl TaskListView {
         {
             return None;
         }
-        let running = self
-            .incoming_check
-            .as_ref()
-            .is_some_and(|c| c.read(cx).is_running());
-        let check_label = if self.marked.is_empty() {
-            "Check incoming changes".to_string()
-        } else {
-            format!("Check incoming changes ({} marked)", self.marked.len())
-        };
-        let check_button = chrome_control_with_shortcut(
-            Button::new("check-incoming-changes")
-                .label(check_label)
-                .ghost()
-                .small()
-                .disabled(running || self.incoming_check.is_none())
-                .on_click(cx.listener(|this, _, _, cx| this.check_incoming(cx))),
-            window,
-            &TaskListCheckIncoming,
-            TASK_LIST_CONTEXT,
-            cx,
-        );
         let clear_marks = (!self.marked.is_empty()).then(|| {
             Button::new("clear-marks")
                 .label("Clear marks")
@@ -3402,150 +3172,9 @@ impl TaskListView {
                         })),
                     self.working_set.running_only,
                 ))
-                .child(check_button)
                 .children(clear_marks)
                 .into_any_element(),
         )
-    }
-
-    /// The shared incoming-changes check's progress while it runs, and its
-    /// summary afterwards: every node's outcome, and **Move back all** for
-    /// the ones whose verdict sends them back (one confirmation).
-    fn render_incoming_check(
-        &self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Option<gpui::AnyElement> {
-        use crate::ui::selectable_text::selectable_text;
-        use gpui::IntoElement as _;
-        use gpui_component::scroll::ScrollableElement as _;
-        use gpui_component::{h_flex, v_flex};
-        let check = self.incoming_check.clone()?;
-        let check = check.read(cx);
-        let muted = cx.theme().muted_foreground;
-        let danger = cx.theme().danger;
-        let card = v_flex()
-            .gap(crate::ui::style::space::HAIRLINE)
-            .mx(crate::ui::style::space::RELATED)
-            .my(crate::ui::style::space::HAIRLINE)
-            .p(crate::ui::style::space::RELATED)
-            .border_1()
-            .border_color(crate::ui::style::color::incoming_text())
-            .rounded_md();
-        if let Some((done, total)) = check.progress() {
-            return Some(
-                card.child(
-                    div()
-                        .text_xs()
-                        .font_semibold()
-                        .child(format!("Checking incoming changes: {done} of {total} done")),
-                )
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(muted)
-                        .child("One agent session per node. Keep working meanwhile."),
-                )
-                .into_any_element(),
-            );
-        }
-        if !check.has_summary() {
-            return None;
-        }
-        let affected = check.affected();
-        let heading = match (check.results().len(), affected.len()) {
-            (0, _) => "Incoming-changes check".to_string(),
-            (n, 0) => format!("Checked {n} node(s): none needs to move back"),
-            (n, k) => format!("Checked {n} node(s): {k} should move back"),
-        };
-        let error = check.error().map(str::to_string);
-        let lines: Vec<String> = check.results().iter().map(outcome_line).collect();
-        let moved = check.moved().map(str::to_string);
-        let armed = check.move_back_armed();
-        let mut card = card.child(div().text_xs().font_semibold().child(heading));
-        if let Some(error) = error {
-            card = card.child(div().text_xs().text_color(danger).child(selectable_text(
-                "incoming-check-error",
-                error,
-                window,
-                cx,
-            )));
-        }
-        // Tree order (`IncomingCheck`), capped so a large check scrolls
-        // instead of pushing the tree off screen.
-        let mut list = v_flex()
-            .id("incoming-check-results")
-            .gap(crate::ui::style::space::HAIRLINE)
-            .max_h(crate::ui::style::size::SUMMARY_LIST_MAX)
-            .overflow_y_scrollbar();
-        for (i, line) in lines.into_iter().enumerate() {
-            list = list.child(div().text_xs().child(selectable_text(
-                format!("incoming-check-result-{i}"),
-                format!("* {line}"),
-                window,
-                cx,
-            )));
-        }
-        card = card.child(list);
-        let offer_move = !affected.is_empty() && moved.is_none();
-        if let Some(moved) = moved {
-            card = card.child(div().text_xs().text_color(muted).child(selectable_text(
-                "incoming-check-moved",
-                moved,
-                window,
-                cx,
-            )));
-        }
-        let mut buttons = h_flex().gap_1();
-        if offer_move {
-            if armed {
-                buttons = buttons
-                    .child(
-                        Button::new("incoming-check-move-back-confirm")
-                            .label(format!("Confirm: move {} node(s) back", affected.len()))
-                            .primary()
-                            .small()
-                            .on_click(cx.listener(|this, _, _, cx| this.move_back_all(cx))),
-                    )
-                    .child(
-                        Button::new("incoming-check-move-back-cancel")
-                            .label("Cancel")
-                            .ghost()
-                            .small()
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                if let Some(check) = &this.incoming_check {
-                                    check.update(cx, |c, cx| c.cancel_move_back(cx));
-                                }
-                            })),
-                    );
-            } else {
-                buttons = buttons.child(
-                    Button::new("incoming-check-move-back-all")
-                        .label("Move back all")
-                        .primary()
-                        .small()
-                        .on_click(cx.listener(|this, _, _, cx| this.move_back_all(cx))),
-                );
-            }
-        }
-        buttons = buttons.child(
-            Button::new("incoming-check-dismiss")
-                .label("Dismiss")
-                .ghost()
-                .small()
-                .on_click(cx.listener(|this, _, _, cx| {
-                    if let Some(check) = &this.incoming_check {
-                        check.update(cx, |c, cx| c.dismiss(cx));
-                    }
-                })),
-        );
-        Some(card.child(buttons).into_any_element())
-    }
-
-    fn move_back_all(&mut self, cx: &mut Context<Self>) {
-        if let Some(check) = &self.incoming_check {
-            check.update(cx, |c, cx| c.move_back_all(cx));
-        }
     }
 
     fn render_sort_menu_overlay(&self, cx: &mut Context<Self>) -> Option<impl gpui::IntoElement> {
@@ -3632,12 +3261,7 @@ impl HasAppNav for TaskListView {
     }
 
     fn app_nav_current(&self) -> Option<AppDestination> {
-        // Hosted as a column only in the workbench.
-        if self.marks_focused_column {
-            Some(AppDestination::Workbench)
-        } else {
-            Some(AppDestination::Tasks)
-        }
+        Some(AppDestination::Workbench)
     }
 
     fn app_nav_fallback_focus(&self) -> FocusHandle {
@@ -3755,7 +3379,6 @@ impl Render for TaskListView {
             .size_full()
             .relative()
             .on_action(cx.listener(Self::on_focus_drawer))
-            .on_action(cx.listener(Self::on_open_agent_chat))
             .on_action(cx.listener(Self::on_report_problem))
             .on_action(cx.listener(Self::on_arrow_up))
             .on_action(cx.listener(Self::on_arrow_down))
@@ -3810,14 +3433,10 @@ impl Render for TaskListView {
             .on_action(cx.listener(Self::on_copy))
             .on_action(cx.listener(Self::on_paste))
             .on_action(cx.listener(Self::on_toggle_mark))
-            .on_action(cx.listener(Self::on_check_incoming))
             .on_action(cx.listener(on_app_nav_toggle::<Self>))
             .child(self.render_header(window, cx))
             .when_some(self.render_quick_filters(window, cx), |el, bar| {
                 el.child(bar)
-            })
-            .when_some(self.render_incoming_check(window, cx), |el, card| {
-                el.child(card)
             })
             .child(body)
             .when_some(self.render_sort_menu_overlay(cx), |el, menu| el.child(menu))

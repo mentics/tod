@@ -5,25 +5,20 @@ mod data_root_setup;
 mod fleet_blocked;
 mod history_window;
 pub(crate) mod no_focus;
-mod right_drawer;
 pub mod transcript_window;
 pub mod window;
 
 use crate::cli::LaunchOptions;
-use crate::conversation::register_conversation_keyboard_bindings;
-use crate::interview::views::{
-    register_sessions_keyboard_bindings, register_settings_keyboard_bindings,
-};
+use crate::interview::views::register_settings_keyboard_bindings;
 use crate::ui::agent_chat::register_agent_chat_keyboard_bindings;
+use crate::ui::agent_conversation::register_agent_conversation_bindings;
 use crate::ui::journey::register_app_journey_keystrokes;
 use crate::ui::report_problem::register_report_problem_keyboard_bindings;
 use crate::ui::list::register_list_keyboard_bindings;
-use crate::views::action_panel::register_action_panel_keyboard_bindings;
 use crate::views::pull_requests::register_pull_requests_keyboard_bindings;
 use crate::views::agent_transcripts::register_agent_transcripts_keyboard_bindings;
 use crate::views::command_history::register_command_history_keyboard_bindings;
 use crate::views::database::register_database_keyboard_bindings;
-use crate::views::lifecycle_panel::register_lifecycle_panel_keyboard_bindings;
 use crate::views::obligations::register_obligations_keyboard_bindings;
 use crate::views::plan_steps::register_plan_steps_keyboard_bindings;
 use crate::views::task_edit::register_task_edit_keyboard_bindings;
@@ -46,12 +41,9 @@ pub fn register_main_keyboard_bindings(cx: &mut gpui::App) {
     register_task_edit_keyboard_bindings(cx);
     register_obligations_keyboard_bindings(cx);
     register_plan_steps_keyboard_bindings(cx);
-    register_lifecycle_panel_keyboard_bindings(cx);
-    register_action_panel_keyboard_bindings(cx);
     register_pull_requests_keyboard_bindings(cx);
-    register_sessions_keyboard_bindings(cx);
-    register_conversation_keyboard_bindings(cx);
     register_settings_keyboard_bindings(cx);
+    register_agent_conversation_bindings(cx);
     register_database_keyboard_bindings(cx);
     register_agent_transcripts_keyboard_bindings(cx);
     register_unified_keyboard_bindings(cx);

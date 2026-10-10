@@ -224,15 +224,6 @@ impl PanelAction {
         }
     }
 
-    pub fn primary(mut self, primary: bool) -> Self {
-        self.primary = primary;
-        self
-    }
-
-    pub fn disabled(mut self, disabled: bool) -> Self {
-        self.disabled = disabled;
-        self
-    }
 }
 
 /// A host icon button in the input's row, left of Send.
@@ -291,10 +282,6 @@ impl PanelNotice {
         }
     }
 
-    pub fn with_action(mut self, action: PanelAction) -> Self {
-        self.action = Some(action);
-        self
-    }
 }
 
 /// A message the user sent: what they wrote and the images they attached.
@@ -468,15 +455,6 @@ impl AgentConversationPanel {
         }
     }
 
-    /// The host's buttons beside Send, left to right.
-    pub fn set_actions(&mut self, actions: Vec<PanelAction>, cx: &mut Context<Self>) {
-        if actions != self.actions {
-            self.actions = actions;
-            self.keep_highlight();
-            cx.notify();
-        }
-    }
-
     /// The host's icon buttons left of Send, left to right.
     pub fn set_tools(&mut self, tools: Vec<PanelTool>, cx: &mut Context<Self>) {
         if tools != self.tools {
@@ -504,23 +482,6 @@ impl AgentConversationPanel {
         }
     }
 
-    /// The host's buttons beside the title, left to right.
-    pub fn set_header_actions(&mut self, actions: Vec<PanelAction>, cx: &mut Context<Self>) {
-        if actions != self.header_actions {
-            self.header_actions = actions;
-            self.keep_highlight();
-            cx.notify();
-        }
-    }
-
-    /// The node's lifecycle state, named in the lifecycle footer's heading.
-    pub fn set_lifecycle_state(&mut self, state: Option<String>, cx: &mut Context<Self>) {
-        if state != self.lifecycle_state {
-            self.lifecycle_state = state;
-            cx.notify();
-        }
-    }
-
     /// The session line shown under the title (platform, model, effort,
     /// tokens; see `ui::session_info`): one line, and everything behind it
     /// shown on hover. `None` hides the line.
@@ -528,15 +489,6 @@ impl AgentConversationPanel {
         let usage = usage.map(|(line, details)| (line.into(), details.into()));
         if usage != self.usage {
             self.usage = usage;
-            cx.notify();
-        }
-    }
-
-    /// The host's status lines above the input, top to bottom.
-    pub fn set_notices(&mut self, notices: Vec<PanelNotice>, cx: &mut Context<Self>) {
-        if notices != self.notices {
-            self.notices = notices;
-            self.keep_highlight();
             cx.notify();
         }
     }
@@ -559,10 +511,6 @@ impl AgentConversationPanel {
     #[allow(dead_code)]
     pub fn is_editing(&self) -> bool {
         self.editing
-    }
-
-    pub fn highlight(&self) -> PanelStop {
-        self.highlight
     }
 
     #[allow(dead_code)]
@@ -588,14 +536,6 @@ impl AgentConversationPanel {
     #[allow(dead_code)]
     pub fn images(&self) -> Vec<PromptImage> {
         self.images.iter().map(|image| image.prompt.clone()).collect()
-    }
-
-    /// Attach `images` to the message being written, after any it has: the
-    /// host giving back a message that did not go out.
-    pub fn add_images(&mut self, images: Vec<PromptImage>, cx: &mut Context<Self>) {
-        self.images
-            .extend(images.into_iter().map(PendingImage::from_prompt));
-        cx.notify();
     }
 
     /// Attach the images a paste found, once each is prepared off the UI

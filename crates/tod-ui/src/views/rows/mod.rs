@@ -8,7 +8,6 @@
 //! an op icon, hover actions, strike-through, an unsure flag).
 
 pub mod finding_row;
-pub mod node_row;
 pub mod obligation_row;
 pub mod plan_step_row;
 pub mod pull_request_row;
@@ -29,9 +28,8 @@ use gpui_kit_assets::IconName;
 use tod_store::conversation::NetOp;
 
 pub use finding_row::{
-    FindingRowEvent, FindingRowProps, STATUS_COLUMN_WIDTH, finding_columns, finding_row,
+    FindingRowEvent, FindingRowProps, finding_columns, finding_row,
 };
-pub use node_row::{NodeRowEvent, NodeRowProps, node_row};
 pub use obligation_row::{
     ObligationRowEvent, ObligationRowProps, obligation_columns, obligation_row,
 };

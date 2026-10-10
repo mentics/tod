@@ -39,18 +39,6 @@ thread_local! {
     static OPEN: RefCell<HashSet<RunId>> = RefCell::new(HashSet::new());
 }
 
-/// Queue `request` to be opened as a modal dialog on the next frame. Safe to
-/// call every poll tick: a request already queued or open for the same run
-/// is not queued twice.
-pub fn queue_permission_request(agent: SharedAgent, request: PermissionRequest) {
-    let run = request.run;
-    let is_new = OPEN.with(|open| open.borrow_mut().insert(run));
-    if !is_new {
-        return;
-    }
-    QUEUE.with(|queue| queue.borrow_mut().push((agent, request)));
-}
-
 /// Open a dialog for every request queued since the last drain. Called once
 /// per frame by the app shell.
 pub fn drain_queued_requests(window: &mut Window, cx: &mut App) {

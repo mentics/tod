@@ -141,11 +141,6 @@ pub enum ListAction {
         phase: String,
         kind: &'static str,
     },
-    /// Clicked the design-phase obligation's "Design" affordance — create or
-    /// open its associated visual-design mockup.
-    OpenVisualDesign {
-        obligation_id: Uuid,
-    },
     /// Dragged an obligation to a new place in the list.
     Drop(ItemDropped),
     /// Add an obligation below the selected one (what `n` does).
@@ -159,9 +154,6 @@ impl From<ObligationRowEvent> for ListAction {
         match event {
             ObligationRowEvent::Select { row_ix } => Self::Select { row_ix },
             ObligationRowEvent::StartEdit { obligation_id } => Self::StartEdit { obligation_id },
-            ObligationRowEvent::OpenVisualDesign { obligation_id } => {
-                Self::OpenVisualDesign { obligation_id }
-            }
         }
     }
 }

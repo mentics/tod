@@ -15,7 +15,6 @@ use std::time::{Duration, SystemTime};
 use gpui::{App, AppContext as _, Entity, Global};
 use tod_journey::{Actor, Event, NavEvent, Presented, Record};
 use tod_store::conversation::Focus;
-use uuid::Uuid;
 
 /// Entries older than this are dropped on the next write.
 const WINDOW: Duration = Duration::from_secs(30 * 60);
@@ -190,11 +189,6 @@ pub fn record_keystroke(cx: &mut App, action: impl Into<String>, keystroke: impl
             keystroke: keystroke.into(),
         },
     );
-}
-
-/// Record a conversation opened for `conversation`.
-pub fn record_conversation_opened(cx: &mut App, conversation: Uuid) {
-    record_nav(cx, NavEvent::ConversationOpened { conversation });
 }
 
 /// Registered once at startup (alongside `register_main_keyboard_bindings`):

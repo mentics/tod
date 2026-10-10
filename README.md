@@ -136,34 +136,11 @@ Point the target at your **install** `process/` directory (or repo `assets/proce
 
 ## Navigation and shortcuts
 
-- **`** opens the app nav (Tasks, Conversation, Settings); **Ctrl+1** goes to
-  Tasks, **Ctrl+,** to Settings.
+- **`** opens the app nav (Settings, Database, Workbench, Pull requests);
+  **Ctrl+1** goes to the Workbench, **Ctrl+,** to Settings.
 - In multi-column views, **Left/Right** (or **Ctrl+Left/Right** where the panel
   uses plain arrows itself, like the task tree) move between panels.
-- **Ctrl+J**, from anywhere, opens the **conversation view** about the current
-  selection (a node, obligation, or plan step; with nothing selected, the whole
-  project). Nodes in the `proposed` or `design` lifecycle open it from the
-  lifecycle panel's "Open conversation".
-
-The conversation view has the transcript and direction box on the left and the
-change set (everything the conversation changed, net per item) on the right:
-
-| Key | Action |
-|-----|--------|
-| Enter / click (direction box) | Start writing; **Ctrl+Enter** sends, **Esc** stops writing |
-| Up / Down | Move the highlight in the change set |
-| Space | Select a change |
-| Enter | Expand a change (full text, per-field diff, flag reason) |
-| R / Shift+R | Reverse the selection (or highlighted change) / reverse all |
-| E | Edit the highlighted item inline |
-| F | Clear the unsure flag |
-| 1 / 2 / 3 | All / Unsure / Deleted tabs |
-| Ctrl+J | Talk about the highlighted item (refocus) |
-| Alt+Left | Back to the previous focus (or the view you came from) |
-| Ctrl+N | New conversation about the same focus (the picker lists the others) |
-| Ctrl+I | Toggle the context panel (the item in its obligations or plan list) |
-| G | With the context panel open: show that node in Tasks |
-| Right (on a change) | Move into the change's reference links; Enter opens one |
+- **Ctrl+J**, in the Workbench, toggles the chat drawer about the selected node.
 
 Reversal never uses Ctrl+Z; it applies inverses from the conversation's own log,
 and asks for confirmation when an item changed since or other changes depend on

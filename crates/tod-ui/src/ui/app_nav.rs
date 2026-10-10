@@ -14,8 +14,6 @@ actions!(
     app_nav,
     [
         AppNavToggle,
-        ShellGoTasks,
-        ShellGoConversation,
         ShellGoSettings,
         ShellGoDatabase,
         ShellGoWorkbench,
@@ -28,14 +26,7 @@ actions!(
 );
 
 const APP_NAV_POPUP_CONTEXT: &str = "AppNavPopup";
-const APP_NAV_ITEMS: [&str; 6] = [
-    "Tasks",
-    "Conversation",
-    "Settings",
-    "Database",
-    "Workbench",
-    "Pull requests",
-];
+const APP_NAV_ITEMS: [&str; 4] = ["Settings", "Database", "Workbench", "Pull requests"];
 
 /// Shared handler for `` ` `` / app-nav toggle — attach via [`HasAppNav::bind_app_nav_toggle`].
 pub fn on_app_nav_toggle<V: Render + HasAppNav + 'static>(
@@ -52,7 +43,7 @@ pub fn register_app_nav_keyboard_bindings(cx: &mut gpui::App) {
     let popup_context = Some(APP_NAV_POPUP_CONTEXT);
     cx.bind_keys([
         gpui::KeyBinding::new("`", AppNavToggle, context),
-        gpui::KeyBinding::new("ctrl-1", ShellGoTasks, context),
+        gpui::KeyBinding::new("ctrl-1", ShellGoWorkbench, context),
         gpui::KeyBinding::new("ctrl-comma", ShellGoSettings, context),
         gpui::KeyBinding::new("enter", AppNavConfirm, popup_context),
         gpui::KeyBinding::new("escape", AppNavCancel, popup_context),
@@ -63,8 +54,6 @@ pub fn register_app_nav_keyboard_bindings(cx: &mut gpui::App) {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AppDestination {
-    Tasks,
-    Conversation,
     Settings,
     Database,
     Workbench,
@@ -88,11 +77,9 @@ impl AppNavPopup {
 
     fn confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let action: Box<dyn gpui::Action> = match self.selected_index {
-            0 => Box::new(ShellGoTasks),
-            1 => Box::new(ShellGoConversation),
-            2 => Box::new(ShellGoSettings),
-            3 => Box::new(ShellGoDatabase),
-            4 => Box::new(ShellGoWorkbench),
+            0 => Box::new(ShellGoSettings),
+            1 => Box::new(ShellGoDatabase),
+            2 => Box::new(ShellGoWorkbench),
             _ => Box::new(ShellGoPullRequests),
         };
         self.action_context.focus(window, cx);
@@ -406,11 +393,9 @@ pub trait HasAppNav {
 
 fn nav_item_index(current: Option<AppDestination>) -> usize {
     match current {
-        Some(AppDestination::Conversation) => 1,
-        Some(AppDestination::Settings) => 2,
-        Some(AppDestination::Database) => 3,
-        Some(AppDestination::Workbench) => 4,
-        Some(AppDestination::PullRequests) => 5,
-        Some(AppDestination::Tasks) | None => 0,
+        Some(AppDestination::Settings) => 0,
+        Some(AppDestination::Database) => 1,
+        Some(AppDestination::Workbench) | None => 2,
+        Some(AppDestination::PullRequests) => 3,
     }
 }

@@ -804,12 +804,16 @@ impl UnifiedView {
         self.chat_drawer.update(cx, |drawer, cx| drawer.set_focus(focus, cx));
     }
 
-    /// Ctrl+J toggles the chat drawer here instead of opening the old
-    /// conversation view: captured before the tree's own `OpenAgentChat`
-    /// handler can consume it.
+    /// Ctrl+J toggles the chat drawer: captured before the tree's own
+    /// `OpenAgentChat` handler can consume it.
     fn on_open_agent_chat(&mut self, _: &OpenAgentChat, window: &mut Window, cx: &mut Context<Self>) {
-        self.chat_drawer.update(cx, |drawer, cx| drawer.toggle(window, cx));
+        self.toggle_chat(window, cx);
         cx.stop_propagation();
+    }
+
+    /// Show or hide the chat drawer.
+    pub fn toggle_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.chat_drawer.update(cx, |drawer, cx| drawer.toggle(window, cx));
     }
 
     /// Apply the column-placement rule and keep `hosted` in sync with the
