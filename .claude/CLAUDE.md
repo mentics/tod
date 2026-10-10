@@ -542,6 +542,22 @@ Nothing starts or builds a container; tod only uses a running one.
 
 A hierarchical task/outline model with its own DDL/migration path (`ddl.rs`, `migrate_interview.rs`), slug-based addressing (`slug.rs`), and import from the older interview-session format (`import.rs`).
 
+**Lifecycle config** (`Capability::LifecycleConfig`, `tod_store::lifecycle_config`,
+table `node_lifecycle_config`) holds, per phase, an ordered list of skill names
+the agent for that phase should use. It is a capability of its own, not part of
+Lifecycle, because it is meant for one or two high-level nodes and inherited by
+everything below: `lifecycle_config::resolve` takes the nearest node, from the
+node itself up, that lists the phase (so a lower node overrides per phase, and an
+explicit empty list turns a phase's skills off). The phase keys are the ten
+phase- and protocol-agent phases plus `fix` (`PHASES`). Names are free text and
+never validated (the skill may be set up later, and a container, sandbox or
+Cursor agent may have no Skill tool). `tod_core::skills_context::for_node` renders
+the "Skills" block (`DynamicBlock::ConfiguredSkills`) that each phase agent's
+opening carries, via a `skills` field on `ImplementRequest` and
+`GateCheckRequest`; the evaluator gets the skills of the state it judges. Edited in
+the task editor (`views::lifecycle_config_editor`) or with `tod-cli capabilities
+set <node> lifecycle-config`. Edits are not recorded in a conversation's change set.
+
 ### `crates/tod-core::interview` — conversational task creation
 
 The interview flow turns a conversation with two agents (question maker, answer processor) into obligations. All interview data — questions (queue and history), agent memory, a trigger-fed change log, and agent sessions — lives in the database (`tod_store::interview`, schema v15); every write is an `InterviewCommand` run on the fleet writer and attributed to an actor (the user, or an agent session via `TOD_INTERVIEW_ACTOR`). `driver.rs` decides when each agent takes a turn and which session it goes to (reuse, resume, or rotate to a fresh snapshot); `context.rs` builds the snapshot a session gets once and the per-turn delta of changes it did not make itself; `client.rs` is how `tod-cli` and the mock agents reach the data (mutation socket when the app is running, direct store otherwise); `mock.rs` plays both agents for `--agent mock`; `routing.rs` decides completion (`interview_work_remains` gates whether the task list can proceed). `db.rs` is the interview-session store. Spec: `doc/new-reqs/interview-protocol.md`.

@@ -119,6 +119,7 @@ impl Protocol for VerificationProtocol {
                 obligations,
                 ancestor_context,
                 verdicts: current_verdicts(fleet, node_id),
+                skills: crate::skills_context::for_node(fleet, node_id, "verify"),
             },
             &role_doc,
         )

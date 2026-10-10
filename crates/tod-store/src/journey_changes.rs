@@ -295,6 +295,11 @@ pub fn environment_triggers_sql() -> String {
     node_keyed_triggers("node_environment")
 }
 
+/// Triggers for `node_lifecycle_config` (one row per node).
+pub fn lifecycle_config_triggers_sql() -> String {
+    node_keyed_triggers("node_lifecycle_config")
+}
+
 /// Triggers for `node_files_locations` (one row per node).
 pub fn files_locations_triggers_sql() -> String {
     node_keyed_triggers("node_files_locations")

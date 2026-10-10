@@ -2503,3 +2503,303 @@ fn plan_step_phases_order_dependencies_and_readiness() {
         })
         .unwrap();
 }
+
+#[test]
+fn copy_node_subtree_copies_node_and_descendants() {
+    let (store, root, list_id) = setup_store_with_list();
+    let parent_id = Uuid::new_v4();
+    let child_id = Uuid::new_v4();
+    for (id, parent, title) in [(parent_id, None, "Parent"), (child_id, Some(parent_id), "Child")] {
+        store
+            .enqueue_outline(OutlineMutation::CreateNode {
+                node_id: Some(id),
+                list_id,
+                parent_id: parent,
+                anchor_id: None,
+                position: CreatePosition::Below,
+                title: title.into(),
+            })
+            .unwrap();
+    }
+    store.writer().flush().unwrap();
+
+    store
+        .enqueue_outline(OutlineMutation::CopyNodeSubtree {
+            source_node_id: parent_id,
+            list_id,
+            parent_id: None,
+            ordinal: 5,
+        })
+        .unwrap();
+    store.writer().flush().unwrap();
+
+    let titles: Vec<String> = store
+        .read(|conn| {
+            let mut stmt = conn.prepare("SELECT title FROM nodes WHERE title IN ('Parent','Child')")?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+        })
+        .unwrap();
+    assert_eq!(titles.iter().filter(|t| *t == "Parent").count(), 2);
+    assert_eq!(titles.iter().filter(|t| *t == "Child").count(), 2);
+
+    drop(store);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn copy_node_subtree_copies_generator_settings_but_not_managed_children() {
+    let (store, root, list_id) = setup_store_with_list();
+    let (generator_id, _managed_id, _managed_child_id) =
+        setup_generator_with_managed_tree(&store, list_id);
+    store
+        .enqueue_outline(OutlineMutation::SetGeneratorConfig {
+            node_id: generator_id,
+            data_source_type: "mock".into(),
+            config_json: "{\"q\":1}".into(),
+        })
+        .unwrap();
+    store.writer().flush().unwrap();
+
+    store
+        .enqueue_outline(OutlineMutation::CopyNodeSubtree {
+            source_node_id: generator_id,
+            list_id,
+            parent_id: None,
+            ordinal: 9,
+        })
+        .unwrap();
+    store.writer().flush().unwrap();
+
+    store
+        .read(|conn| {
+            let ids: Vec<Vec<u8>> = conn
+                .prepare("SELECT node_id FROM node_generator_config")?
+                .query_map([], |r| r.get(0))?
+                .collect::<std::result::Result<_, _>>()?;
+            assert_eq!(ids.len(), 2, "the copy has its own generator config");
+            let copies: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM nodes WHERE title = 'Fix the bug'",
+                [],
+                |r| r.get(0),
+            )?;
+            assert_eq!(copies, 1, "managed children are not copied");
+            Ok(())
+        })
+        .unwrap();
+
+    drop(store);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn copy_node_subtree_copies_capability_settings_and_obligations() {
+    let (store, root, list_id) = setup_store_with_list();
+    let src = create_node_in(&store, list_id, None, "Source");
+    store
+        .enqueue_outline(OutlineMutation::EnableCapabilities {
+            node_id: src,
+            capabilities: vec![
+                Capability::Spec,
+                Capability::Agent,
+                Capability::Files,
+                Capability::Ticket,
+                Capability::Environment,
+            ],
+        })
+        .unwrap();
+    store.writer().flush().unwrap();
+    for m in [
+        OutlineMutation::SetNodeAgent {
+            node_id: src,
+            platform: Some("claude".into()),
+            model: Some("m1".into()),
+            effort: None,
+        },
+        OutlineMutation::SetNodeFiles {
+            node_id: src,
+            repo: Some("C:/r".into()),
+            branch: Some("task/src".into()),
+            use_worktree: true,
+            dev_container: None,
+        },
+        OutlineMutation::SetNodeTicket {
+            node_id: src,
+            ticket: Some("ABC-1".into()),
+            linked_prs: vec![],
+        },
+        OutlineMutation::SetNodeEnvironment {
+            node_id: src,
+            entries: vec![crate::environment::Entry::variable("A", "1")],
+        },
+        OutlineMutation::CreateObligation {
+            obligation_id: None,
+            node_id: src,
+            kind: "requirement".into(),
+            after_id: None,
+            before: false,
+            section: None,
+            body: "Do the thing".into(),
+            phase: "requirements".into(),
+        },
+    ] {
+        store.enqueue_outline(m).unwrap();
+    }
+    store.writer().flush().unwrap();
+
+    store
+        .enqueue_outline(OutlineMutation::CopyNodeSubtree {
+            source_node_id: src,
+            list_id,
+            parent_id: None,
+            ordinal: 9,
+        })
+        .unwrap();
+    store.writer().flush().unwrap();
+
+    store
+        .read(|conn| {
+            let copy: Vec<u8> = conn.query_row(
+                "SELECT id FROM nodes WHERE title = 'Source' AND id != ?1",
+                [crate::outline::uuid_blob::uuid_to_blob(src)],
+                |r| r.get(0),
+            )?;
+            let copy = crate::outline::uuid_blob::blob_to_uuid_sql(&copy)?;
+            let nodes = crate::outline::repos::NodeRepo::new(conn);
+            assert_eq!(nodes.list_capabilities(copy)?.len(), 5);
+            let id = copy.to_string();
+            let agent = crate::fleet::repos::node_agent::NodeAgentRepo::new(conn)
+                .get(&id)?
+                .unwrap();
+            assert_eq!(agent.model.as_deref(), Some("m1"));
+            let task = crate::fleet::repos::task::TaskRepo::new(conn)
+                .get_node(&id)?
+                .unwrap();
+            assert_eq!(task.repo.as_deref(), Some("C:/r"));
+            assert_ne!(task.branch.as_deref(), Some("task/src"));
+            assert_eq!(task.ticket, None);
+            assert_eq!(crate::environment::entries(conn, copy)?.len(), 1);
+            let obs = crate::outline::repos::obligations::ObligationRepo::new(conn)
+                .list_for_node(copy)?;
+            assert_eq!(obs.len(), 1);
+            assert_eq!(obs[0].body, "Do the thing");
+            Ok(())
+        })
+        .unwrap();
+
+    drop(store);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn lifecycle_config_resolves_per_phase_from_the_nearest_node() {
+    use crate::lifecycle_config::{self, Skills};
+    let (store, root, list_id) = setup_store_with_list();
+    let top = create_node_in(&store, list_id, None, "Top");
+    let mid = create_node_in(&store, list_id, Some(top), "Mid");
+    let leaf = create_node_in(&store, list_id, Some(mid), "Leaf");
+    for node in [top, mid] {
+        store
+            .enqueue_outline(OutlineMutation::EnableCapabilities {
+                node_id: node,
+                capabilities: vec![Capability::LifecycleConfig],
+            })
+            .unwrap();
+    }
+    store.writer().flush().unwrap();
+    let skills = |pairs: &[(&str, &[&str])]| -> Skills {
+        pairs
+            .iter()
+            .map(|(p, s)| (p.to_string(), s.iter().map(|n| n.to_string()).collect()))
+            .collect()
+    };
+    for (node, config) in [
+        (top, skills(&[("review", &["a", " b ", "a", ""]), ("learn", &["l"])])),
+        (mid, skills(&[("review", &[])])),
+    ] {
+        store
+            .enqueue_outline(OutlineMutation::SetNodeLifecycleConfig { node_id: node, skills: config })
+            .unwrap();
+    }
+    // An unknown phase is refused.
+    store.writer().flush().unwrap();
+    assert!(
+        store
+            .enqueue_outline(OutlineMutation::SetNodeLifecycleConfig {
+                node_id: top,
+                skills: skills(&[("ready", &["x"])]),
+            })
+            .is_err()
+    );
+
+    store
+        .read(|conn| {
+            let top_skills = lifecycle_config::skills(conn, top)?;
+            assert_eq!(top_skills["review"], ["a", "b"], "trimmed and de-duplicated");
+            assert!(!top_skills.contains_key("ready"));
+            // An empty list overrides the ancestor's, only for its phase.
+            let review = lifecycle_config::resolve(conn, leaf, "review")?.unwrap();
+            assert!(review.skills.is_empty());
+            assert_eq!((review.source_node, review.inherited), (mid, true));
+            let learn = lifecycle_config::resolve(conn, leaf, "learn")?.unwrap();
+            assert_eq!(learn.skills, ["l"]);
+            assert_eq!(learn.source_node, top);
+            assert!(lifecycle_config::resolve(conn, leaf, "design")?.is_none());
+            Ok(())
+        })
+        .unwrap();
+
+    // Disabling removes the node's skills, so the ancestor's apply again.
+    store
+        .enqueue_outline(OutlineMutation::DisableCapability { node_id: mid, capability: Capability::LifecycleConfig })
+        .unwrap();
+    store.writer().flush().unwrap();
+    store
+        .read(|conn| {
+            let review = lifecycle_config::resolve(conn, leaf, "review")?.unwrap();
+            assert_eq!(review.skills, ["a", "b"]);
+            assert_eq!(review.source_node, top);
+            Ok(())
+        })
+        .unwrap();
+
+    drop(store);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn lifecycle_config_is_copied_with_a_subtree() {
+    let (store, root, list_id) = setup_store_with_list();
+    let src = create_node_in(&store, list_id, None, "Source");
+    store
+        .enqueue_outline(OutlineMutation::EnableCapabilities {
+            node_id: src,
+            capabilities: vec![Capability::LifecycleConfig],
+        })
+        .unwrap();
+    store.writer().flush().unwrap();
+    store
+        .enqueue_outline(OutlineMutation::SetNodeLifecycleConfig {
+            node_id: src,
+            skills: [("fix".to_string(), vec!["f".to_string()])].into(),
+        })
+        .unwrap();
+    store
+        .enqueue_outline(OutlineMutation::CopyNodeSubtree {
+            source_node_id: src,
+            list_id,
+            parent_id: None,
+            ordinal: 9,
+        })
+        .unwrap();
+    store.writer().flush().unwrap();
+    store
+        .read(|conn| {
+            let rows: i64 = conn.query_row("SELECT COUNT(*) FROM node_lifecycle_config WHERE skills LIKE '%\"f\"%'", [], |r| r.get(0))?;
+            assert_eq!(rows, 2);
+            Ok(())
+        })
+        .unwrap();
+    drop(store);
+    let _ = fs::remove_dir_all(root);
+}
