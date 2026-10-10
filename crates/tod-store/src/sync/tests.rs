@@ -41,7 +41,7 @@ fn temp_root(tag: &str) -> std::path::PathBuf {
 /// Two stores seeded from one snapshot.
 fn pair() -> (Side, Side) {
     let root_a = temp_root("a");
-    let fleet_a = FleetStore::open(&root_a).unwrap();
+    let fleet_a = FleetStore::open_without_reload(&root_a).unwrap();
     fleet_a
         .enqueue_outline(OutlineMutation::CreateList {
             slug: "t".into(),
@@ -55,11 +55,11 @@ fn pair() -> (Side, Side) {
     snapshot(fleet_a.paths().db(), &snap).unwrap();
     // Open once so the data root's layout exists, then replace its database.
     let db_b = {
-        let f = FleetStore::open(&root_b).unwrap();
+        let f = FleetStore::open_without_reload(&root_b).unwrap();
         f.paths().db().to_path_buf()
     };
     restore(&snap, &db_b).unwrap();
-    let fleet_b = FleetStore::open(&root_b).unwrap();
+    let fleet_b = FleetStore::open_without_reload(&root_b).unwrap();
 
     let a = Side {
         root: root_a,

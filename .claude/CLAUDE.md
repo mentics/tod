@@ -18,12 +18,14 @@ cargo run -p tod -- --data-root .local/agent/scratchpad/tod/root-<unique if need
 # Type-check across the workspace (matches CI)
 cargo check --workspace --all-targets
 
-# Run all tests
-cargo test --workspace
+# Run all tests (nextest: one process per test, all binaries at once; ~77s warm
+# for the workspace; `cargo test --workspace` ran serially, binary by binary, and
+# had not finished after 10 minutes)
+cargo nextest run --workspace --no-fail-fast
 
 # Run a single test
-cargo test -p tod-store fleet::tests::some_test_name
-cargo test -p tod-ui some_test_name
+cargo nextest run -p tod-store fleet::tests::some_test_name
+cargo nextest run -p tod-ui some_test_name
 
 # Release build — excludes the TCP agent-control socket entirely
 cargo build --release -p tod --no-default-features
@@ -44,8 +46,10 @@ CI runs `cargo check --workspace --all-targets` on Ubuntu, Windows, and macOS. C
 
 ### Running builds/tests without getting stuck
 
+- `tod-core`'s `build.rs` stamps the build with the git commit and a hash of the `tod-cli` sources. Anything it makes cargo treat as changed recompiles `tod-core` and every crate above it (~15s even when nothing changed). It must only `rerun-if-changed` paths that exist (use `git rev-parse --git-path`; in a worktree the branch ref is in the common dir) and, in dev builds, must not track git HEAD.
+
 - Always run `cargo check` / `cargo test` / `cargo build` with an explicit ~120s timeout, even when you expect them to be fast. Tests can hang intermittently (a spawned process, a port, a wait on stdin); a timeout is cheap insurance and should be the default, not a special case. If 120s proves too short for a particular command, raise it for that command rather than dropping the policy.
-- Scope test runs to what the change actually touches (`cargo test -p tod-store ...`) rather than defaulting to `cargo test --workspace`, which pulls in the full GPUI build. Use `--workspace` when the change is broad or you need the CI-equivalent check.
+- Scope test runs to what the change actually touches (`cargo nextest run -p tod-store ...`) rather than defaulting to the whole workspace, which pulls in the full GPUI build. Use `--workspace` when the change is broad or you need the CI-equivalent check.
 - Piping through `grep`/`head` to cut noise is fine and preferred — don't remove that just to see more output.
 - If you do intentionally background a long-running command (e.g. an ultra review, a release build), don't just sit idle waiting on it — either continue other work, or if there's nothing else to do, poll it periodically (sleep, then check) rather than blocking indefinitely on a single wait.
 

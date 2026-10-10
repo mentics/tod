@@ -263,7 +263,16 @@ fn spawn(paths: &Paths, executable: &Path, me: &Identity) -> Result<Info> {
     let copy = paths.executable(&me.stamp);
     if !copy.is_file() {
         let tmp = copy.with_extension("partial");
-        std::fs::copy(executable, &tmp).with_context(|| format!("copy {}", executable.display()))?;
+        let _ = std::fs::remove_file(&tmp);
+        // A hard link where the platform allows one: macOS checks the
+        // signature of every new executable on its first run (~0.7s, and
+        // serialized across processes), but not of a second name for one
+        // already checked. Builds and installs replace the file rather than
+        // write into it, so the link keeps the build it was made from.
+        let linked = cfg!(unix) && std::fs::hard_link(executable, &tmp).is_ok();
+        if !linked {
+            std::fs::copy(executable, &tmp).with_context(|| format!("copy {}", executable.display()))?;
+        }
         std::fs::rename(&tmp, &copy)?;
     }
     let data_root = paths.dir().parent().ok_or_else(|| anyhow!("no data root"))?;

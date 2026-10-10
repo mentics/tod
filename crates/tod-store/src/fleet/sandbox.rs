@@ -864,11 +864,11 @@ pub fn known(root: &Path) -> Vec<String> {
 /// own name characters are accepted.
 pub fn validate_name(name: &str) -> Result<()> {
     let ok = !name.is_empty()
-        && name.len() <= 48
+        && name.len() <= 128
         && name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
         && !name.starts_with('-');
     if !ok {
-        bail!("sandbox names are lowercase letters, digits, and dashes (at most 48): {name:?}");
+        bail!("sandbox names are lowercase letters, digits, and dashes (at most 128): {name:?}");
     }
     Ok(())
 }
@@ -999,6 +999,8 @@ mod tests {
     #[test]
     fn names_are_checked() {
         assert!(validate_name("tod-dev-1").is_ok());
+        assert!(validate_name(&"a".repeat(128)).is_ok());
+        assert!(validate_name(&"a".repeat(129)).is_err());
         for bad in ["", "-x", "Dev", "a b", "a;b", "a/b"] {
             assert!(validate_name(bad).is_err(), "{bad}");
         }
