@@ -256,12 +256,18 @@ impl Sandboxes {
                 // `wsx-golden-*` stands for the newest sandbox with that prefix
                 // (the names carry a timestamp, so they sort oldest first).
                 let golden = match golden.trim().strip_suffix('*') {
-                    Some(prefix) => bx
-                        .list()?
-                        .into_iter()
-                        .filter(|i| i.name.starts_with(prefix) && !matches!(i.status.as_str(), "TERMINATED" | "DELETING"))
-                        .map(|i| i.name)
-                        .max()
+                    Some(prefix) => ({
+                        let all: Vec<_> = bx
+                            .list()?
+                            .into_iter()
+                            .filter(|i| i.name.starts_with(prefix) && !matches!(i.status.as_str(), "TERMINATED" | "DELETING"))
+                            .collect();
+                        // A golden is marked `ready` once it passed its checks; a
+                        // half-made one (left in place after a failure) is skipped
+                        // unless nothing is marked.
+                        let ready = all.iter().filter(|i| i.label("ready") == Some("true")).count();
+                        all.into_iter().filter(|i| ready == 0 || i.label("ready") == Some("true")).map(|i| i.name).max()
+                    })
                         .ok_or_else(|| anyhow!("no sandbox named {prefix}* exists to be the golden"))?,
                     None => golden,
                 };
@@ -290,6 +296,18 @@ impl Sandboxes {
                     // rebuilt from (wrapping it needs a registry image): fork,
                     // then replace the fork's proxy rules.
                     fork_proxy_pending = true;
+                    // A proxy is fixed at creation: a source made without one
+                    // gives forks that cannot carry credentials.
+                    let routes = bx
+                        .get_json(base)?
+                        .and_then(|v| v["spec"]["network"]["proxy"]["routing"].as_array().map(|r| r.len()))
+                        .unwrap_or(0);
+                    if routes == 0 {
+                        progress(&format!(
+                            "warning: {base} was made without a proxy, so {name} cannot carry the node's credentials \
+                             (fetching from GitHub will fail). Rebuild it so it is made with one (`blaxel-sbx golden refresh`)."
+                        ));
+                    }
                     source
                 }
             }
