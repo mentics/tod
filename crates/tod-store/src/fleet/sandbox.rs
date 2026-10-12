@@ -533,6 +533,19 @@ pub fn list(root: &Path) -> Result<Vec<ListedSandbox>> {
         })
         .collect();
     all.sort_by(|a, b| a.name.cmp(&b.name));
+    // The fixed name a node can fork, ahead of the sandboxes it stands for.
+    if let Some(golden) = sandboxes.config.blaxel.as_ref().and_then(|a| a.golden.as_deref()).filter(|g| !g.trim().is_empty()) {
+        all.insert(
+            0,
+            ListedSandbox {
+                name: tod_sandbox::config::GOLDEN.to_string(),
+                status: "always the newest".to_string(),
+                image: golden.to_string(),
+                owner: None,
+                known: true,
+            },
+        );
+    }
     Ok(all)
 }
 
