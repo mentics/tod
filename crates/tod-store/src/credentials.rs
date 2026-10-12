@@ -224,6 +224,12 @@ impl CredentialStore {
     }
 
     fn keyring_entry(&self, account: &str) -> Result<keyring::Entry, CredentialError> {
+        // `TOD_CREDENTIALS_BACKEND=file` skips the OS keyring, for dev builds:
+        // an unsigned binary is a new app to macOS after every build, so the
+        // keychain asks again each time. Reads and writes use the file store.
+        if std::env::var("TOD_CREDENTIALS_BACKEND").is_ok_and(|v| v.eq_ignore_ascii_case("file")) {
+            return Err(CredentialError::Message("keyring disabled by TOD_CREDENTIALS_BACKEND=file".into()));
+        }
         keyring::Entry::new(&self.keyring_service, account)
             .map_err(|err| CredentialError::Message(err.to_string()))
     }
