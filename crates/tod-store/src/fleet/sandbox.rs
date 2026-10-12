@@ -253,6 +253,19 @@ impl Sandboxes {
                 let golden = acct.golden.clone().filter(|g| !g.trim().is_empty()).ok_or_else(|| {
                     anyhow!("no golden sandbox is set: run `tod-sandbox golden <sandbox>` (or set `golden` in sandboxes.toml)")
                 })?;
+                // `wsx-golden-*` stands for the newest sandbox with that prefix
+                // (the names carry a timestamp, so they sort oldest first).
+                let golden = match golden.trim().strip_suffix('*') {
+                    Some(prefix) => bx
+                        .list()?
+                        .into_iter()
+                        .filter(|i| i.name.starts_with(prefix) && !matches!(i.status.as_str(), "TERMINATED" | "DELETING"))
+                        .map(|i| i.name)
+                        .max()
+                        .ok_or_else(|| anyhow!("no sandbox named {prefix}* exists to be the golden"))?,
+                    None => golden,
+                };
+                progress(&format!("golden is {golden}"));
                 resolved = NewSandboxSource::Fork(golden);
                 &resolved
             }

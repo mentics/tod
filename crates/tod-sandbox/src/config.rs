@@ -69,7 +69,8 @@ pub struct Account {
     pub node_base: Option<String>,
     /// The sandbox the name [`GOLDEN`] stands for (`golden = "..."`), so a
     /// node can fork `golden` once and a new golden sandbox is only
-    /// pointed at here (`tod-sandbox golden <name>`).
+    /// pointed at here (`tod-sandbox golden <name>`). A name ending in `*`
+    /// is a prefix: the newest sandbox that starts with it (`wsx-golden-*`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub golden: Option<String>,
 }
