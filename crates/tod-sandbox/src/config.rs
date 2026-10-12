@@ -67,7 +67,15 @@ pub struct Account {
     /// refused, each is created from the image. See `tod_core::cloud_sync`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node_base: Option<String>,
+    /// The sandbox the name [`GOLDEN`] stands for (`golden = "..."`), so a
+    /// node can fork `golden` once and a new golden sandbox is only
+    /// pointed at here (`tod-sandbox golden <name>`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub golden: Option<String>,
 }
+
+/// The fixed name a node forks from; [`Account::golden`] says which sandbox it is.
+pub const GOLDEN: &str = "golden";
 
 fn default_orchestrator() -> String {
     crate::orchestrator::NAME.to_string()
@@ -115,6 +123,7 @@ impl Account {
             orchestrator: default_orchestrator(),
             orchestrator_volume: None,
             node_base: None,
+            golden: None,
         }
     }
 }

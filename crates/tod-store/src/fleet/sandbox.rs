@@ -247,6 +247,18 @@ impl Sandboxes {
         }
         let started = Instant::now();
         let from_image;
+        let resolved;
+        let source = match source {
+            NewSandboxSource::Fork(name) if name == tod_sandbox::config::GOLDEN => {
+                let golden = acct.golden.clone().filter(|g| !g.trim().is_empty()).ok_or_else(|| {
+                    anyhow!("no golden sandbox is set: run `tod-sandbox golden <sandbox>` (or set `golden` in sandboxes.toml)")
+                })?;
+                resolved = NewSandboxSource::Fork(golden);
+                &resolved
+            }
+            other => other,
+        };
+        let mut fork_proxy_pending = false;
         let source = match source {
             NewSandboxSource::Fork(base) if !rules.is_empty() => {
                 validate_name(base)?;
@@ -254,11 +266,19 @@ impl Sandboxes {
                     .get(base)?
                     .ok_or_else(|| anyhow!("no sandbox named {base} to fork"))?
                     .image;
-                progress(&format!(
-                    "{base}'s proxy cannot carry this node's credentials; making {name} from its image instead…"
-                ));
-                from_image = NewSandboxSource::Image(image);
-                &from_image
+                if runs_as_is(&image) {
+                    progress(&format!(
+                        "{base}'s proxy cannot carry this node's credentials; making {name} from its image instead…"
+                    ));
+                    from_image = NewSandboxSource::Image(image);
+                    &from_image
+                } else {
+                    // Its image was not built for Blaxel, so it cannot be
+                    // rebuilt from (wrapping it needs a registry image): fork,
+                    // then replace the fork's proxy rules.
+                    fork_proxy_pending = true;
+                    source
+                }
             }
             other => other,
         };
@@ -314,6 +334,21 @@ impl Sandboxes {
                     .image;
                 progress(&format!("forking {source} into {name}…"));
                 bx.fork(source, name)?;
+                if fork_proxy_pending {
+                    let proxy = tod_sandbox::node::proxy_spec(&rules);
+                    let fingerprint = tod_sandbox::node::rules_fingerprint(&rules);
+                    let mut labels = vec![(tod_sandbox::node::CREDS_LABEL, fingerprint.as_str())];
+                    let owner = acct.owner.as_deref().map(label_value).unwrap_or_default();
+                    if !owner.is_empty() {
+                        labels.push(("tod-owner", owner.as_str()));
+                    }
+                    bx.wait_deployed(name, Duration::from_secs(300))?;
+                    if let Err(err) = bx.update_proxy(name, &proxy, &labels) {
+                        progress(&format!(
+                            "warning: {name} keeps {source}'s proxy; the node's credentials were not applied: {err:#}"
+                        ));
+                    }
+                }
                 image
             }
         };

@@ -35,6 +35,8 @@ setup [--workspace W] [--auth bl|api-key] [--api-key-stdin] [--region R]
 create <name> [--image IMAGE] [--agents]
                          Create a sandbox and install what tod needs in it. Any
                          image works: one not built for Blaxel is wrapped first.
+golden [<sandbox>]    Show, or set, the sandbox the name `golden` stands for: a node
+                         forks `golden` once, and a new golden sandbox is set here.
 fork <source> <name> [--agents]
                          Create a sandbox as a copy of another one's current
                          state (it may be in standby). Needs a Blaxel workspace
@@ -189,6 +191,7 @@ fn run() -> Result<i32> {
         "setup" | "login" => setup(&mut ctx, args),
         "create" => create(&mut ctx, args),
         "fork" => fork(&mut ctx, args),
+        "golden" => golden(&mut ctx, args),
         "ensure" => {
             let name = args.positional("sandbox name")?;
             args.done()?;
@@ -346,6 +349,21 @@ fn create(ctx: &mut Ctx, mut args: Args) -> Result<i32> {
     args.done()?;
     ctx.create(&name, &NewSandboxSource::Image(image), agents, true, &mut |m| eprintln!("{m}"))?;
     println!("{name}: ready. Open it with `tod-sandbox zed {name}` or `tod-sandbox shell {name}`.");
+    Ok(0)
+}
+
+fn golden(ctx: &mut Ctx, mut args: Args) -> Result<i32> {
+    let name = args.positional("sandbox").ok();
+    args.done()?;
+    let acct = ctx.config.blaxel.as_mut().ok_or_else(|| anyhow!("run `tod-sandbox setup` first"))?;
+    match name {
+        Some(name) => {
+            acct.golden = Some(name.clone());
+            ctx.save()?;
+            println!("golden is now {name}");
+        }
+        None => println!("{}", acct.golden.as_deref().unwrap_or("(none set)")),
+    }
     Ok(0)
 }
 
