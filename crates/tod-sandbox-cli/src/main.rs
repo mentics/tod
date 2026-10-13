@@ -41,7 +41,10 @@ fork <source> <name> [--agents]
                          Create a sandbox as a copy of another one's current
                          state (it may be in standby). Needs a Blaxel workspace
                          with forking.
-ensure <name>            Install or update tod's pieces in a sandbox (idempotent).
+ensure <name> [--install]
+                         Make a sandbox ready for tod (idempotent). A copy of a prepared
+                         sandbox gets only tod's relay and tod-cli, and an error naming
+                         what it lacks; --install installs the missing packages too.
 bake <base-image> [--name IMAGE-NAME] [--agents] [--repo URL[=DIR]]...
                          Build an image with everything preinstalled, and the
                          repositories cloned into it (https, no credentials;
@@ -193,10 +196,15 @@ fn run() -> Result<i32> {
         "fork" => fork(&mut ctx, args),
         "golden" => golden(&mut ctx, args),
         "ensure" => {
+            let install = args.flag("--install");
             let name = args.positional("sandbox name")?;
             args.done()?;
             let bx = ctx.blaxel()?;
-            ensure(&mut ctx, &bx, &name)?;
+            if install {
+                ctx.ensure_as(&bx, &name, tod_sandbox::provision::Mode::ForceInstall, &mut |m| eprintln!("{m}"))?;
+            } else {
+                ensure(&mut ctx, &bx, &name)?;
+            }
             println!("{name}: ready");
             Ok(0)
         }

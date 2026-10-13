@@ -7,6 +7,8 @@ fn main() -> anyhow::Result<()> {
     let mut args = std::env::args().skip(1);
     let root = std::path::PathBuf::from(args.next().expect("data root"));
     let node = args.next().expect("node");
+    tod_store::fleet::sandbox::set_data_root(&root);
+    tod_store::paths::set_data_root(root.clone());
     // The resident daemon holds the fleet lock; stop it (as the docs say a test must).
     println!("daemon quit: {:?}", tod_agentd_client::client::quit(&root));
     let fleet = FleetStore::open(&root)?;

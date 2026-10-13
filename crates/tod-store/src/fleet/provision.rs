@@ -407,6 +407,34 @@ pub fn refresh_sandbox_proxy(
     Ok(SandboxRefresh::Recreated(made))
 }
 
+/// Puts a new sandbox's checkout on the node's branch: `origin` fetched, the
+/// branch checked out, and the submodules on it. Returns warnings for what was
+/// done only in part.
+fn prepare_sandbox_checkout(
+    dir: &Workdir,
+    name: &str,
+    repo: &str,
+    branch: &str,
+    progress: &mut dyn FnMut(&str),
+) -> Result<Vec<String>> {
+    dir.git(&["rev-parse", "--show-toplevel"]).with_context(|| {
+        format!(
+            "sandbox {name} has no git repository at {repo}: the image or the forked \
+             sandbox must hold it there"
+        )
+    })?;
+    progress(&format!("fetching origin in {name}…"));
+    worktree::fetch_origin(dir)?;
+    progress(&format!("checking out {branch} in {name}…"));
+    worktree::checkout_branch(dir, branch)?;
+    let mut warnings = Vec::new();
+    if let Err(err) = worktree::init_submodules(dir) {
+        warnings.push(format!("{err:#}"));
+    }
+    warnings.extend(worktree::branch_submodules(dir, branch)?);
+    Ok(warnings)
+}
+
 fn make_sandbox(
     fleet: &FleetStore,
     files: &ResolvedFiles,
@@ -451,21 +479,37 @@ fn make_sandbox(
     record(fleet, &location)?;
     let repo = files.repo().unwrap_or_default();
     let dir = Workdir::sandbox(&name, repo);
-    dir.git(&["rev-parse", "--show-toplevel"]).with_context(|| {
-        format!(
-            "sandbox {name} has no git repository at {repo}: the image or the forked \
-             sandbox must hold it there"
-        )
-    })?;
-    progress(&format!("fetching origin in {name}…"));
-    worktree::fetch_origin(&dir)?;
-    progress(&format!("checking out {branch} in {name}…"));
-    worktree::checkout_branch(&dir, branch)?;
-    let mut warnings = Vec::new();
-    if let Err(err) = worktree::init_submodules(&dir) {
-        warnings.push(format!("{err:#}"));
-    }
-    warnings.extend(worktree::branch_submodules(&dir, branch)?);
+    // From here a failure leaves a sandbox that is not on the node's branch.
+    // Its location is recorded, so the next launch would take it as ready and
+    // open a shell on `main`: nothing has been done in it yet, so it is
+    // deleted and the location forgotten, and the next launch makes it again.
+    let prepared = prepare_sandbox_checkout(&dir, &name, repo, branch, progress);
+    let mut warnings = match prepared {
+        Ok(warnings) => warnings,
+        // `TOD_KEEP_FAILED_SANDBOX=1` leaves it for inspection (and the
+        // location recorded, so the launch reuses it).
+        Err(err) if std::env::var_os("TOD_KEEP_FAILED_SANDBOX").is_some() => {
+            return Err(err.context(format!("{name} was kept (TOD_KEEP_FAILED_SANDBOX)")));
+        }
+        Err(err) => {
+            let cleaned = match sandboxes.delete(&sandboxes.blaxel()?, &name) {
+                Ok(()) => {
+                    let forgotten = fleet
+                        .enqueue(FleetMutation::DeleteFilesLocation { node_id: files.node_id.clone() })
+                        .and_then(|_| fleet.writer().flush());
+                    match forgotten {
+                        Ok(()) => format!("{name} was deleted so the next launch makes a fresh one"),
+                        Err(e) => format!("{name} was deleted but its location could not be forgotten ({e:#})"),
+                    }
+                }
+                Err(e) => format!(
+                    "{name} could not be deleted ({e:#}); remove it with `tod-sandbox delete {name}` and the \
+                     node's location in its Files settings"
+                ),
+            };
+            return Err(err.context(cleaned));
+        }
+    };
     // A sandbox replacing one (a changed credential, a lost sandbox) gets the
     // agent's session logs back where Claude resumes from, so the
     // conversation's recorded session id resumes the same session. Without
