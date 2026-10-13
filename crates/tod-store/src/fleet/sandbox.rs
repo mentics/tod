@@ -251,6 +251,8 @@ impl Sandboxes {
         progress: &mut dyn FnMut(&str),
     ) -> Result<String> {
         validate_name(name)?;
+        // Before anything is made: a sandbox cannot be used without it.
+        relay_path()?;
         let acct = self.account()?.clone();
         let rules = tod_sandbox::node::credential_rules(creds, acct.claude_token_via);
         let bx = self.blaxel()?;

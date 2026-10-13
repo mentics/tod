@@ -161,6 +161,7 @@ done
 {agent_checks}
 echo "missing:$missing"
 echo "optional:$optional"
+case "${{HTTPS_PROXY:-}}" in *"{{{{"*) echo "proxy:unrendered" ;; esac
 "#
     )
 }
@@ -170,6 +171,27 @@ echo "optional:$optional"
 pub struct Requirements {
     pub missing: Vec<String>,
     pub optional: Vec<String>,
+    /// The sandbox's `HTTPS_PROXY` is a `{{file(...)}}` template the platform
+    /// never filled in ([`LOCAL_PROXY_URL`] is what it should say).
+    pub proxy_unrendered: bool,
+}
+
+/// The proxy every sandbox made with a proxy runs on loopback, which adds the
+/// credentials its rules hold. A sandbox forked and then given new proxy
+/// rules gets the rules but can keep an `HTTPS_PROXY` that points at an
+/// unrendered template, which git and every other client then refuse
+/// (`Unsupported proxy syntax`).
+pub const LOCAL_PROXY_URL: &str = "http://localhost:49152";
+
+/// The environment that overrides an unrendered proxy, for the relay (and so
+/// everything it runs).
+pub fn local_proxy_env() -> Vec<(&'static str, &'static str)> {
+    vec![
+        ("HTTPS_PROXY", LOCAL_PROXY_URL),
+        ("HTTP_PROXY", LOCAL_PROXY_URL),
+        ("https_proxy", LOCAL_PROXY_URL),
+        ("http_proxy", LOCAL_PROXY_URL),
+    ]
 }
 
 fn parse_requirements(output: &str) -> Requirements {
@@ -180,7 +202,11 @@ fn parse_requirements(output: &str) -> Requirements {
             .map(|rest| rest.split_whitespace().map(str::to_string).collect())
             .unwrap_or_default()
     };
-    Requirements { missing: list("missing:"), optional: list("optional:") }
+    Requirements {
+        missing: list("missing:"),
+        optional: list("optional:"),
+        proxy_unrendered: output.lines().any(|l| l.trim() == "proxy:unrendered"),
+    }
 }
 
 /// Why a fork cannot be used, and what to do about it.
@@ -210,6 +236,16 @@ pub fn ensure(
         return Ok(Outcome::AlreadyReady);
     }
     if reported.as_deref() == Some(fork_manifest.as_str()) {
+        // The relay's own environment can still carry the unrendered proxy
+        // (a relay started before this was handled, or restarted by the
+        // platform): fix that, which costs one command when it is fine.
+        if relay_output(bx, url, "printf '%s' \"${HTTPS_PROXY:-}\"").is_some_and(|v| v.contains("{{")) {
+            progress(&format!("restarting the relay with {LOCAL_PROXY_URL} as its proxy (its HTTPS_PROXY was never rendered)…"));
+            bx.kill(url, RELAY_PROCESS)?;
+            bx.start_with_env(url, RELAY_PROCESS, &relay_command(), true, &local_proxy_env())?;
+            wait_for_relay(bx, url, &fork_manifest)?;
+            return Ok(Outcome::RelayStarted);
+        }
         return Ok(Outcome::AlreadyReady);
     }
 
@@ -312,7 +348,14 @@ fn adopt_fork(
         bail!("writing {MANIFEST_PATH} failed: {}", res.output());
     }
     progress(&format!("relay installed in {:.1}s; starting it…", started.elapsed().as_secs_f64()));
-    bx.start(url, RELAY_PROCESS, &relay_command(), true)?;
+    if found.proxy_unrendered {
+        progress(&format!(
+            "the platform left this sandbox's HTTPS_PROXY unrendered; the relay and what it runs use {LOCAL_PROXY_URL} instead"
+        ));
+        bx.start_with_env(url, RELAY_PROCESS, &relay_command(), true, &local_proxy_env())?;
+    } else {
+        bx.start(url, RELAY_PROCESS, &relay_command(), true)?;
+    }
     wait_for_relay(bx, url, fork_manifest)?;
     Ok(Outcome::Adopted)
 }
@@ -352,12 +395,18 @@ fn check_relay_arch(relay: &[u8]) -> Result<()> {
 
 /// The manifest as read through the relay, or `None` if the relay is not reachable.
 fn relay_manifest(bx: &Blaxel, url: &str) -> Option<String> {
+    relay_output(bx, url, &format!("cat {MANIFEST_PATH} 2>/dev/null"))
+}
+
+/// What `command` prints, run through the relay (so in its environment), or
+/// `None` if the relay is not reachable.
+fn relay_output(bx: &Blaxel, url: &str, command: &str) -> Option<String> {
     let ws = relay::ws_url(url, "/exec");
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().ok()?;
     let res = rt.block_on(async {
         tokio::time::timeout(
             Duration::from_secs(20),
-            relay::run_capture(&ws, bx.token(), &format!("cat {MANIFEST_PATH} 2>/dev/null")),
+            relay::run_capture(&ws, bx.token(), command),
         )
         .await
     });
@@ -502,6 +551,7 @@ mod tests {
         assert_eq!(found.missing, ["claude-agent-acp", "node>=20.10"]);
         assert_eq!(found.optional, ["claude"]);
         assert_eq!(parse_requirements("missing:\noptional:\n"), Requirements::default());
+        assert!(parse_requirements("missing:\noptional:\nproxy:unrendered\n").proxy_unrendered);
     }
 
     #[test]
