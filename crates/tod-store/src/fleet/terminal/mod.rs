@@ -9,7 +9,7 @@ use crate::agent_launch::AgentLaunchOptions;
 use crate::fleet::reconnect_identity::{self};
 use crate::fleet::repos::agent_run::{AgentRun, RUNTIME_STATUS_ACTIVE};
 use crate::fleet::repos::shell::ShellSession;
-use crate::fleet::{FleetMutation, FleetStore, Workdir, resolve_launch_cwd};
+use crate::fleet::{FleetMutation, FleetStore, Workdir, resolve_launch_cwd, resolve_launch_cwd_with};
 use crate::paths::TodPaths;
 use crate::settings::{TerminalSettings, TodSettings};
 use anyhow::{Context, Result, bail};
@@ -796,7 +796,22 @@ pub fn open_shell_for_node(
     node_id: &str,
     startup_command: Option<&str>,
 ) -> Result<(String, Workdir)> {
-    let cwd = resolve_launch_cwd(fleet, node_id)?;
+    open_shell_for_node_with_progress(fleet, paths, settings, node_id, startup_command, &mut |_| {})
+}
+
+/// [`open_shell_for_node`], reporting each step of making the node's Files
+/// location (worktree, container, sandbox) so the UI can say what it is doing.
+pub fn open_shell_for_node_with_progress(
+    fleet: &FleetStore,
+    paths: &TodPaths,
+    settings: &TodSettings,
+    node_id: &str,
+    startup_command: Option<&str>,
+    progress: &mut dyn FnMut(&str),
+) -> Result<(String, Workdir)> {
+    progress("Preparing the node's files…");
+    let (cwd, _) = resolve_launch_cwd_with(fleet, node_id, progress)?;
+    progress("Starting the shell…");
     open_shell_at(fleet, paths, settings, node_id, cwd, startup_command)
 }
 

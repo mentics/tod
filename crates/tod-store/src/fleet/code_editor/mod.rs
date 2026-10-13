@@ -10,7 +10,7 @@ pub mod zed;
 pub use location::{CodeLocation, find_code_refs};
 
 use crate::fleet::terminal::path_util::normalize_launch_path;
-use crate::fleet::{FleetStore, resolve_launch_cwd};
+use crate::fleet::{FleetStore, resolve_launch_cwd, resolve_launch_cwd_with};
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
@@ -48,7 +48,21 @@ pub fn open_code_editor_for_node(
     editor: &dyn CodeEditor,
     node_id: &str,
 ) -> Result<PathBuf> {
-    let cwd = match resolve_launch_cwd(fleet, node_id)? {
+    open_code_editor_for_node_with_progress(fleet, editor, node_id, &mut |_| {})
+}
+
+/// [`open_code_editor_for_node`], reporting each step (making the node's Files
+/// location, then starting the editor) so the UI can say what it is doing.
+pub fn open_code_editor_for_node_with_progress(
+    fleet: &FleetStore,
+    editor: &dyn CodeEditor,
+    node_id: &str,
+    progress: &mut dyn FnMut(&str),
+) -> Result<PathBuf> {
+    progress("Preparing the node's files…");
+    let (dir, _) = resolve_launch_cwd_with(fleet, node_id, progress)?;
+    progress(&format!("Opening in {}…", editor.label()));
+    let cwd = match dir {
         crate::fleet::Workdir::Host(cwd) => cwd,
         crate::fleet::Workdir::Container { container, path } => {
             // Mounted repositories resolve to `Host` above and open on this

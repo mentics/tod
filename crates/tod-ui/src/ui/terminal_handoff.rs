@@ -10,16 +10,19 @@
 use crate::interview::agent::SharedAgent;
 use crate::interview::{TodPaths, TodSettings};
 use crate::ui::agent_conversation::PanelTool;
-use crate::ui::toast::{error_toast, info_toast};
+use crate::ui::toast::{dismiss_progress_toast, error_toast, info_toast, progress_toast};
 use anyhow::Context as _;
 use gpui::{Context, Window};
+use std::collections::HashSet;
+use std::sync::Mutex;
 use gpui_component::IconName;
 use std::sync::Arc;
 use tod_core::conversation::handoff::{release_session, terminal_handoff};
 use tod_core::conversation::{ConversationConfig, SharedAgentAccess};
 use tod_store::conversation::{Focus, ProtocolKind};
 use tod_store::fleet::{
-    FleetStore, code_editor, open_code_editor_for_node, open_shell_for_node, open_terminal_command,
+    FleetStore, code_editor, open_code_editor_for_node_with_progress,
+    open_shell_for_node_with_progress, open_terminal_command,
 };
 use uuid::Uuid;
 
@@ -32,10 +35,69 @@ pub const OPEN_SHELL: &str = "open-shell";
 /// The open-in-Zed tool's id in [`crate::ui::agent_conversation::AgentConversationEvent::Action`].
 pub const OPEN_IN_ZED: &str = "open-in-zed";
 
+/// The actions under way, by tool id and node: opening one can take a while
+/// (a worktree, a container, or a sandbox may have to be made first), and a
+/// second click meanwhile must not start another.
+static IN_FLIGHT: Mutex<Option<HashSet<(&'static str, Option<Uuid>)>>> = Mutex::new(None);
+
+fn in_flight(id: &'static str, node: Option<Uuid>) -> bool {
+    let guard = IN_FLIGHT.lock().unwrap_or_else(|p| p.into_inner());
+    guard.as_ref().is_some_and(|set| set.contains(&(id, node)))
+}
+
+fn set_in_flight(id: &'static str, node: Option<Uuid>, on: bool) -> bool {
+    let mut guard = IN_FLIGHT.lock().unwrap_or_else(|p| p.into_inner());
+    let set = guard.get_or_insert_with(HashSet::new);
+    if on {
+        set.insert((id, node))
+    } else {
+        set.remove(&(id, node))
+    }
+}
+
+/// Run `work` off the UI thread with a spinner toast that follows the steps
+/// it reports (`label` until the first), disable the tool meanwhile, then hand
+/// the result to `done` with the toast gone. A repeat click while it runs is
+/// ignored.
+fn run_with_progress<T: 'static, R: Send + 'static>(
+    id: &'static str,
+    node: Option<Uuid>,
+    label: String,
+    work: impl FnOnce(&mut dyn FnMut(&str)) -> anyhow::Result<R> + Send + 'static,
+    done: impl FnOnce(&mut Window, &mut gpui::App, anyhow::Result<R>) + 'static,
+    window: &mut Window,
+    cx: &mut Context<T>,
+) {
+    if !set_in_flight(id, node, true) {
+        return;
+    }
+    progress_toast(window, cx, id, label);
+    cx.notify();
+    cx.spawn_in(window, async move |this, cx| {
+        let (tx, rx) = async_channel::unbounded::<String>();
+        let task = cx.background_executor().spawn(async move {
+            work(&mut |step| {
+                let _ = tx.try_send(step.to_string());
+            })
+        });
+        while let Ok(step) = rx.recv().await {
+            let _ = cx.update(|window, cx| progress_toast(window, cx, id, step));
+        }
+        let result = task.await;
+        set_in_flight(id, node, false);
+        let _ = cx.update(|window, cx| {
+            dismiss_progress_toast(window, cx, id);
+            done(window, cx, result);
+        });
+        let _ = this.update(cx, |_, cx| cx.notify());
+    })
+    .detach();
+}
+
 /// The icons left of Send, the shell first, then Zed: the ones for the
 /// conversation's node (`None` for the project, which has no Files directory).
 pub fn tools(node: Option<Uuid>, running: bool) -> Vec<PanelTool> {
-    vec![shell_tool(node), zed_tool(node), tool(running)]
+    vec![shell_tool(node), zed_tool(node), tool(running, node)]
 }
 
 /// The Zed icon, enabled when the conversation is about a node.
@@ -46,7 +108,7 @@ pub fn zed_tool(node: Option<Uuid>) -> PanelTool {
         "Open in Zed (on a node, not the project)"
     };
     PanelTool::new(OPEN_IN_ZED, gpui_kit_assets::IconName::FolderCode, tooltip)
-        .disabled(node.is_none())
+        .disabled(node.is_none() || in_flight(OPEN_IN_ZED, node))
 }
 
 /// Open the node's Files directory in Zed off the UI thread (a dev container
@@ -60,20 +122,21 @@ pub fn open_in_zed<T: 'static>(
     let Some(node) = node else {
         return;
     };
-    cx.spawn_in(window, async move |_, cx| {
-        let opened = cx
-            .background_executor()
-            .spawn(async move {
-                let editor = code_editor("zed").context("Zed is not supported here")?;
-                open_code_editor_for_node(&fleet, editor, &node.to_string())
-            })
-            .await;
-        let _ = cx.update(|window, cx| match opened {
+    run_with_progress(
+        OPEN_IN_ZED,
+        Some(node),
+        "Opening this node's files in Zed…".to_string(),
+        move |progress| {
+            let editor = code_editor("zed").context("Zed is not supported here")?;
+            open_code_editor_for_node_with_progress(&fleet, editor, &node.to_string(), progress)
+        },
+        |window, cx, opened| match opened {
             Ok(dir) => info_toast(window, cx, format!("Opened {} in Zed", dir.display())),
             Err(err) => error_toast(window, cx, format!("Could not open Zed: {err:#}")),
-        });
-    })
-    .detach();
+        },
+        window,
+        cx,
+    );
 }
 
 /// The shell icon, enabled when the conversation is about a node.
@@ -84,7 +147,7 @@ pub fn shell_tool(node: Option<Uuid>) -> PanelTool {
         "Open a shell (on a node, not the project)"
     };
     PanelTool::new(OPEN_SHELL, gpui_kit_assets::IconName::Terminal, tooltip)
-        .disabled(node.is_none())
+        .disabled(node.is_none() || in_flight(OPEN_SHELL, node))
 }
 
 /// Open a shell for `node` off the UI thread (it waits for the terminal's
@@ -99,35 +162,42 @@ pub fn open_shell<T: 'static>(
     let Some(node) = node else {
         return;
     };
-    cx.spawn_in(window, async move |_, cx| {
-        let opened = cx
-            .background_executor()
-            .spawn(async move {
-                let paths = TodPaths::discover()?;
-                let settings = TodSettings::load(&paths).unwrap_or_default();
-                let (_, cwd) =
-                    open_shell_for_node(&fleet, &paths, &settings, &node.to_string(), None)?;
-                anyhow::Ok(cwd)
-            })
-            .await;
-        let _ = cx.update(|window, cx| match opened {
+    run_with_progress(
+        OPEN_SHELL,
+        Some(node),
+        "Opening a shell in this node's files…".to_string(),
+        move |progress| {
+            let paths = TodPaths::discover()?;
+            let settings = TodSettings::load(&paths).unwrap_or_default();
+            let (_, cwd) = open_shell_for_node_with_progress(
+                &fleet,
+                &paths,
+                &settings,
+                &node.to_string(),
+                None,
+                progress,
+            )?;
+            anyhow::Ok(cwd)
+        },
+        |window, cx, opened| match opened {
             Ok(cwd) => info_toast(window, cx, format!("Opened a shell in {cwd}")),
             Err(err) => error_toast(window, cx, format!("Could not open a shell: {err:#}")),
-        });
-    })
-    .detach();
+        },
+        window,
+        cx,
+    );
 }
 
 /// The icon, enabled whenever no turn is using the agent. Before the first
 /// reply it opens the same agent fresh, in a terminal, without sending
 /// anything; once the conversation has a session it resumes it there.
-pub fn tool(running: bool) -> PanelTool {
+pub fn tool(running: bool, node: Option<Uuid>) -> PanelTool {
     let tooltip = if running {
         "Continue in a terminal (once the agent is done)"
     } else {
         "Continue this conversation in a terminal"
     };
-    PanelTool::new(CONTINUE_IN_TERMINAL, IconName::SquareTerminal, tooltip).disabled(running)
+    PanelTool::new(CONTINUE_IN_TERMINAL, IconName::SquareTerminal, tooltip).disabled(running || in_flight(CONTINUE_IN_TERMINAL, node))
 }
 
 /// Open the terminal off the UI thread, and say how it went in a toast. When
@@ -158,42 +228,44 @@ pub fn continue_in_terminal<T: 'static>(
             return;
         }
     };
-    cx.spawn_in(window, async move |_, cx| {
-        let opened = cx
-            .background_executor()
-            .spawn(async move {
-                let handoff = terminal_handoff(
-                    &fleet,
-                    &config.media,
-                    config.launch.platform,
-                    protocol,
-                    focus,
-                    conversation_id,
-                )?;
-                let paths = TodPaths::discover()?;
-                let settings = TodSettings::load(&paths).unwrap_or_default();
-                if let Some(id) = conversation_id {
-                    release_session(&mut SharedAgentAccess(&agent), id);
-                }
-                open_terminal_command(
-                    &fleet,
-                    &paths,
-                    &settings,
-                    &handoff.cwd,
-                    handoff.environment,
-                    &handoff.env,
-                    handoff.tod_cli_dir.as_deref(),
-                    &handoff.command,
-                )?;
-                anyhow::Ok(handoff.command)
-            })
-            .await;
-        let _ = cx.update(|window, cx| match opened {
-            Ok(command) => info_toast(window, cx, format!("Continued in a terminal: {command}")),
-            Err(err) => {
-                error_toast(window, cx, format!("Could not continue in a terminal: {err:#}"))
+    let node = focus.node_id();
+    run_with_progress(
+        CONTINUE_IN_TERMINAL,
+        node,
+        "Opening a terminal…".to_string(),
+        move |progress| {
+            progress("Preparing the agent's session…");
+            let handoff = terminal_handoff(
+                &fleet,
+                &config.media,
+                config.launch.platform,
+                protocol,
+                focus,
+                conversation_id,
+            )?;
+            let paths = TodPaths::discover()?;
+            let settings = TodSettings::load(&paths).unwrap_or_default();
+            if let Some(id) = conversation_id {
+                release_session(&mut SharedAgentAccess(&agent), id);
             }
-        });
-    })
-    .detach();
+            progress("Starting the terminal…");
+            open_terminal_command(
+                &fleet,
+                &paths,
+                &settings,
+                &handoff.cwd,
+                handoff.environment,
+                &handoff.env,
+                handoff.tod_cli_dir.as_deref(),
+                &handoff.command,
+            )?;
+            anyhow::Ok(handoff.command)
+        },
+        |window, cx, opened| match opened {
+            Ok(command) => info_toast(window, cx, format!("Continued in a terminal: {command}")),
+            Err(err) => error_toast(window, cx, format!("Could not continue in a terminal: {err:#}")),
+        },
+        window,
+        cx,
+    );
 }
