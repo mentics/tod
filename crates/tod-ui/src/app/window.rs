@@ -1274,7 +1274,11 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                             tracing::error!("clearing interrupted generator refreshes failed: {err}");
                         }
                         let lifecycle = cx.new(|_| LifecycleController::new(fleet.clone()));
-                        let agent_runs = cx.new(|_| AgentRuns::new(fleet.clone(), agent.clone()));
+                        let agent_runs = cx.new(|cx| {
+                            let mut runs = AgentRuns::new(fleet.clone(), agent.clone());
+                            runs.start_polling(cx);
+                            runs
+                        });
                         crate::ui::credential_request::start_watcher(
                             crate::ui::credential_request::Ctx {
                                 fleet: fleet.clone(),

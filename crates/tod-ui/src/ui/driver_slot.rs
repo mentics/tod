@@ -96,7 +96,6 @@ impl DriverSlot {
     }
 
     /// Take the driver to collect its turn, when one is in flight.
-    #[cfg(test)]
     pub fn take_to_tick(&mut self) -> Option<ConversationDriver> {
         if !self.status.running {
             return None;
