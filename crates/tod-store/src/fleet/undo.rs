@@ -4,7 +4,9 @@ use crate::fleet::command_log::CommandEntry;
 use crate::fleet::repos::task::TaskRepo;
 use crate::fleet::writer::FleetMutation;
 use crate::outline::archive::{self, NodeSubtreeArchive};
-use crate::outline::mutations::{OutlineMutation, ReorderDirection};
+use crate::outline::mutations::{
+    OutlineMutation, ReorderDirection, ReorderOutcome, collapsed_from, plan_reorder,
+};
 use crate::outline::repos::{NodeRepo, OutlineRepo};
 use crate::outline::uuid_blob::{blob_to_uuid_sql, uuid_to_blob};
 use anyhow::Result;
@@ -200,9 +202,47 @@ fn capture_outline_inverse(conn: &Connection, m: &OutlineMutation) -> Result<Opt
             }))
         }
         OutlineMutation::ReorderSibling { node_id, direction } => {
-            let inverse = match direction {
-                ReorderDirection::Up => ReorderDirection::Down,
-                ReorderDirection::Down => ReorderDirection::Up,
+            let inverses = match plan_reorder(conn, *node_id, *direction)? {
+                ReorderOutcome::Unchanged => return Ok(None),
+                ReorderOutcome::Swap => vec![OutlineMutation::ReorderSibling {
+                    node_id: *node_id,
+                    direction: match direction {
+                        ReorderDirection::Up => ReorderDirection::Down,
+                        ReorderDirection::Down => ReorderDirection::Up,
+                    },
+                }],
+                // Across parents the opposite reorder can land somewhere
+                // else, so put the node back exactly where it was, and close
+                // what the move opened to show it.
+                ReorderOutcome::Reparent { parent_id, .. } => {
+                    let outline = OutlineRepo::new(conn);
+                    let Some(entry) = outline.get_entry(*node_id)? else {
+                        return Ok(None);
+                    };
+                    let mut siblings: Vec<_> = outline
+                        .list_for_list(entry.list_id)?
+                        .into_iter()
+                        .filter(|e| e.parent_id == entry.parent_id)
+                        .collect();
+                    siblings.sort_by_key(|e| e.ordinal);
+                    let index = siblings
+                        .iter()
+                        .position(|e| e.node_id == *node_id)
+                        .unwrap_or(0) as i32;
+                    let place = OutlineMutation::PlaceNode {
+                        node_id: *node_id,
+                        parent_id: entry.parent_id,
+                        index,
+                    };
+                    std::iter::once(place)
+                        .chain(collapsed_from(conn, parent_id)?.into_iter().map(|id| {
+                            OutlineMutation::SetNodeCollapsed {
+                                node_id: id,
+                                collapsed: true,
+                            }
+                        }))
+                        .collect()
+                }
             };
             let title = node_title(conn, *node_id)?;
             Ok(Some(CommandEntry {
@@ -210,10 +250,7 @@ fn capture_outline_inverse(conn: &Connection, m: &OutlineMutation) -> Result<Opt
                 label: format!("Moved \"{title}\""),
                 created_at: crate::outline::uuid_blob::now_ms(),
                 action_id: None,
-                inverses: vec![FleetMutation::Outline(OutlineMutation::ReorderSibling {
-                    node_id: *node_id,
-                    direction: inverse,
-                })],
+                inverses: inverses.into_iter().map(FleetMutation::Outline).collect(),
             }))
         }
         OutlineMutation::ReparentNode {

@@ -2803,3 +2803,280 @@ fn lifecycle_config_is_copied_with_a_subtree() {
     drop(store);
     let _ = fs::remove_dir_all(root);
 }
+
+// ---- Ctrl/Cmd+Up/Down across ancestors (ReorderSibling at either end) ----
+
+fn reorder(store: &FleetStore, node_id: Uuid, direction: crate::outline::ReorderDirection) {
+    store
+        .enqueue_outline(OutlineMutation::ReorderSibling { node_id, direction })
+        .unwrap();
+    store.writer().flush().unwrap();
+    store.reload_if_stale().ok();
+}
+
+fn parent_of(store: &FleetStore, node_id: Uuid) -> Option<Uuid> {
+    let projection = store.projection();
+    let guard = projection.lock().unwrap();
+    let conn = guard.connection();
+    OutlineRepo::new(&conn)
+        .get_entry(node_id)
+        .unwrap()
+        .unwrap()
+        .parent_id
+}
+
+/// Titles of `parent`'s children, in order.
+fn child_titles(store: &FleetStore, list_id: Uuid, parent: Option<Uuid>) -> Vec<String> {
+    let projection = store.projection();
+    let guard = projection.lock().unwrap();
+    let conn = guard.connection();
+    let mut kids: Vec<_> = OutlineRepo::new(&conn)
+        .list_for_list(list_id)
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.parent_id == parent)
+        .collect();
+    kids.sort_by_key(|e| e.ordinal);
+    let nodes = NodeRepo::new(&conn);
+    kids.into_iter()
+        .map(|e| nodes.get(e.node_id).unwrap().unwrap().title)
+        .collect()
+}
+
+fn is_collapsed(store: &FleetStore, node_id: Uuid) -> bool {
+    let projection = store.projection();
+    let guard = projection.lock().unwrap();
+    let conn = guard.connection();
+    OutlineRepo::new(&conn)
+        .get_entry(node_id)
+        .unwrap()
+        .unwrap()
+        .collapsed
+}
+
+fn undo_entry_count(store: &FleetStore) -> usize {
+    store.command_log().lock().unwrap().entries().len()
+}
+
+/// ```text
+/// A
+///   A1
+///     A1a
+///       w
+///       x
+/// B
+///   B1          (too shallow: no node at depth 2)
+/// C (collapsed)
+///   C1
+///     C1a
+///       c
+/// ```
+struct DeepTree {
+    store: FleetStore,
+    root: PathBuf,
+    list_id: Uuid,
+    /// C, collapsed.
+    top_c: Uuid,
+    a1a: Uuid,
+    x: Uuid,
+    c1a: Uuid,
+    c: Uuid,
+}
+
+fn deep_tree() -> DeepTree {
+    let (store, root, list_id) = setup_store_with_list();
+    let a = create_node_in(&store, list_id, None, "A");
+    let a1 = create_node_in(&store, list_id, Some(a), "A1");
+    let a1a = create_node_in(&store, list_id, Some(a1), "A1a");
+    create_node_in(&store, list_id, Some(a1a), "w");
+    let x = create_node_in(&store, list_id, Some(a1a), "x");
+    let b = create_node_in(&store, list_id, None, "B");
+    create_node_in(&store, list_id, Some(b), "B1");
+    let cc = create_node_in(&store, list_id, None, "C");
+    let c1 = create_node_in(&store, list_id, Some(cc), "C1");
+    let c1a = create_node_in(&store, list_id, Some(c1), "C1a");
+    let c = create_node_in(&store, list_id, Some(c1a), "c");
+    store
+        .enqueue_outline(OutlineMutation::SetNodeCollapsed {
+            node_id: cc,
+            collapsed: true,
+        })
+        .unwrap();
+    store.writer().flush().unwrap();
+    store.reload_if_stale().ok();
+    DeepTree {
+        store,
+        root,
+        list_id,
+        top_c: cc,
+        a1a,
+        x,
+        c1a,
+        c,
+    }
+}
+
+#[test]
+fn reorder_down_crosses_three_ancestor_levels_into_collapsed_branch() {
+    use crate::outline::ReorderDirection;
+    let t = deep_tree();
+    reorder(&t.store, t.x, ReorderDirection::Down);
+    // Over B's shallow branch, into C1a under the collapsed C, as its first child.
+    assert_eq!(parent_of(&t.store, t.x), Some(t.c1a));
+    assert_eq!(child_titles(&t.store, t.list_id, Some(t.c1a)), vec!["x", "c"]);
+    assert_eq!(child_titles(&t.store, t.list_id, Some(t.a1a)), vec!["w"]);
+    assert!(!is_collapsed(&t.store, t.top_c), "the way to x is opened");
+    drop(t.store);
+    let _ = fs::remove_dir_all(t.root);
+}
+
+#[test]
+fn reorder_up_crosses_three_ancestor_levels_as_last_child() {
+    use crate::outline::ReorderDirection;
+    let t = deep_tree();
+    reorder(&t.store, t.c, ReorderDirection::Up);
+    assert_eq!(parent_of(&t.store, t.c), Some(t.a1a));
+    assert_eq!(
+        child_titles(&t.store, t.list_id, Some(t.a1a)),
+        vec!["w", "x", "c"]
+    );
+    assert!(child_titles(&t.store, t.list_id, Some(t.c1a)).is_empty());
+    drop(t.store);
+    let _ = fs::remove_dir_all(t.root);
+}
+
+#[test]
+fn reorder_down_crosses_two_ancestor_levels() {
+    use crate::outline::ReorderDirection;
+    let (store, root, list_id) = setup_store_with_list();
+    let a = create_node_in(&store, list_id, None, "A");
+    let a1 = create_node_in(&store, list_id, Some(a), "A1");
+    let a1a = create_node_in(&store, list_id, Some(a1), "A1a");
+    let x = create_node_in(&store, list_id, Some(a1a), "x");
+    let a2 = create_node_in(&store, list_id, Some(a), "A2");
+    let a2a = create_node_in(&store, list_id, Some(a2), "A2a");
+    create_node_in(&store, list_id, Some(a2a), "y");
+    store.reload_if_stale().ok();
+
+    reorder(&store, x, ReorderDirection::Down);
+    assert_eq!(parent_of(&store, x), Some(a2a));
+    assert_eq!(child_titles(&store, list_id, Some(a2a)), vec!["x", "y"]);
+
+    reorder(&store, x, ReorderDirection::Up);
+    assert_eq!(parent_of(&store, x), Some(a1a));
+    drop(store);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn reorder_skips_a_generator_subtree() {
+    use crate::outline::ReorderDirection;
+    let (store, root, list_id) = setup_store_with_list();
+    let p = create_node_in(&store, list_id, None, "P");
+    let x = create_node_in(&store, list_id, Some(p), "x");
+    let g = create_node_in(&store, list_id, None, "G");
+    store
+        .enqueue_outline(OutlineMutation::EnableCapabilities {
+            node_id: g,
+            capabilities: vec![Capability::Generator],
+        })
+        .unwrap();
+    store.writer().flush().unwrap();
+    let q = create_node_in(&store, list_id, None, "Q");
+    store.reload_if_stale().ok();
+
+    reorder(&store, x, ReorderDirection::Down);
+    assert_eq!(parent_of(&store, x), Some(q));
+    assert!(child_titles(&store, list_id, Some(g)).is_empty());
+    drop(store);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn reorder_with_nowhere_to_go_changes_nothing_and_logs_no_undo() {
+    use crate::outline::ReorderDirection;
+    let (store, root, list_id) = setup_store_with_list();
+    // y is x's only child, and no other node sits at x's depth.
+    let p = create_node_in(&store, list_id, None, "P");
+    let x = create_node_in(&store, list_id, Some(p), "x");
+    create_node_in(&store, list_id, None, "Leaf");
+    let y = create_node_in(&store, list_id, Some(x), "y");
+    store.reload_if_stale().ok();
+    let before_y = undo_entry_count(&store);
+    for direction in [ReorderDirection::Up, ReorderDirection::Down] {
+        reorder(&store, y, direction);
+        assert_eq!(parent_of(&store, y), Some(x));
+    }
+    assert_eq!(undo_entry_count(&store), before_y);
+    assert_eq!(child_titles(&store, list_id, None), vec!["P", "Leaf"]);
+    drop(store);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn reorder_root_node_at_end_changes_nothing() {
+    use crate::outline::ReorderDirection;
+    let (store, root, list_id) = setup_store_with_list();
+    let a = create_node_in(&store, list_id, None, "A");
+    let b = create_node_in(&store, list_id, None, "B");
+    store.reload_if_stale().ok();
+    let before = undo_entry_count(&store);
+    reorder(&store, a, ReorderDirection::Up);
+    reorder(&store, b, ReorderDirection::Down);
+    assert_eq!(child_titles(&store, list_id, None), vec!["A", "B"]);
+    assert_eq!(undo_entry_count(&store), before);
+    drop(store);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn reorder_middle_child_swaps_with_neighbour() {
+    use crate::outline::ReorderDirection;
+    let (store, root, list_id) = setup_store_with_list();
+    let p = create_node_in(&store, list_id, None, "P");
+    create_node_in(&store, list_id, Some(p), "w");
+    let x = create_node_in(&store, list_id, Some(p), "x");
+    create_node_in(&store, list_id, Some(p), "y");
+    store.reload_if_stale().ok();
+    reorder(&store, x, ReorderDirection::Up);
+    assert_eq!(child_titles(&store, list_id, Some(p)), vec!["x", "w", "y"]);
+    reorder(&store, x, ReorderDirection::Down);
+    reorder(&store, x, ReorderDirection::Down);
+    assert_eq!(child_titles(&store, list_id, Some(p)), vec!["w", "y", "x"]);
+    store.undo_last().unwrap().expect("undo entry");
+    store.reload_if_stale().ok();
+    assert_eq!(child_titles(&store, list_id, Some(p)), vec!["w", "x", "y"]);
+    drop(store);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn undo_multi_level_move_restores_original_parent_and_index() {
+    use crate::outline::ReorderDirection;
+    let t = deep_tree();
+    // Swap x up and back down (x last again), then move it across parents.
+    reorder(&t.store, t.x, ReorderDirection::Up);
+    assert_eq!(child_titles(&t.store, t.list_id, Some(t.a1a)), vec!["x", "w"]);
+    reorder(&t.store, t.x, ReorderDirection::Down);
+    reorder(&t.store, t.x, ReorderDirection::Down);
+    assert_eq!(parent_of(&t.store, t.x), Some(t.c1a));
+    assert!(!is_collapsed(&t.store, t.top_c));
+    // One undo takes the cross-parent move back: under A1a at index 1, with
+    // C closed again.
+    t.store.undo_last().unwrap().expect("undo entry");
+    t.store.reload_if_stale().ok();
+    assert_eq!(parent_of(&t.store, t.x), Some(t.a1a));
+    assert!(is_collapsed(&t.store, t.top_c));
+    assert_eq!(child_titles(&t.store, t.list_id, Some(t.a1a)), vec!["w", "x"]);
+    assert_eq!(child_titles(&t.store, t.list_id, Some(t.c1a)), vec!["c"]);
+
+    // Up across levels from first child, then undo: back to index 0 of C1a.
+    reorder(&t.store, t.c, ReorderDirection::Up);
+    assert_eq!(parent_of(&t.store, t.c), Some(t.a1a));
+    t.store.undo_last().unwrap().expect("undo entry");
+    t.store.reload_if_stale().ok();
+    assert_eq!(parent_of(&t.store, t.c), Some(t.c1a));
+    assert_eq!(child_titles(&t.store, t.list_id, Some(t.a1a)), vec!["w", "x"]);
+    drop(t.store);
+    let _ = fs::remove_dir_all(t.root);
+}

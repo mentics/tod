@@ -1363,44 +1363,169 @@ fn parse_extra_content_type(content_type: &str) -> Result<&'static str> {
         .ok_or_else(|| anyhow::anyhow!("invalid extra content type: {content_type}"))
 }
 
-enum ParentSiblingJump {
-    Next,
-    Prev,
+/// What an [`OutlineMutation::ReorderSibling`] of a node would do, decided
+/// before it runs (the undo log needs this to pick the inverse).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReorderOutcome {
+    /// Nothing moves: no sibling that way and no node at the parent's depth.
+    Unchanged,
+    /// The node swaps with its adjacent sibling.
+    Swap,
+    /// The node leaves its parent for `parent_id`, at the 0-based `index`
+    /// among that parent's children.
+    Reparent { parent_id: Uuid, index: i32 },
+}
+
+pub(crate) fn plan_reorder(
+    conn: &Connection,
+    node_id: Uuid,
+    direction: ReorderDirection,
+) -> Result<ReorderOutcome> {
+    let outline = OutlineRepo::new(conn);
+    let Some(entry) = outline.get_entry(node_id)? else {
+        return Ok(ReorderOutcome::Unchanged);
+    };
+    let entries = outline.list_for_list(entry.list_id)?;
+    let mut siblings: Vec<&OutlineEntry> = entries
+        .iter()
+        .filter(|e| e.parent_id == entry.parent_id)
+        .collect();
+    siblings.sort_by_key(|e| e.ordinal);
+    let Some(pos) = siblings.iter().position(|e| e.node_id == node_id) else {
+        return Ok(ReorderOutcome::Unchanged);
+    };
+    let at_end = match direction {
+        ReorderDirection::Up => pos == 0,
+        ReorderDirection::Down => pos + 1 == siblings.len(),
+    };
+    if !at_end {
+        return Ok(ReorderOutcome::Swap);
+    }
+    let Some(parent_id) = entry.parent_id else {
+        return Ok(ReorderOutcome::Unchanged);
+    };
+    let Some(target) = cross_parent_target(conn, &entries, parent_id, direction)? else {
+        return Ok(ReorderOutcome::Unchanged);
+    };
+    let index = match direction {
+        ReorderDirection::Down => 0,
+        ReorderDirection::Up => entries.iter().filter(|e| e.parent_id == Some(target)).count() as i32,
+    };
+    Ok(ReorderOutcome::Reparent {
+        parent_id: target,
+        index,
+    })
+}
+
+/// The node a last (first) child moves into on Down (Up): the nearest node
+/// at its parent's depth after the parent's subtree (before the parent), in
+/// the stored outline's preorder. Collapsed state and UI filters play no part;
+/// nodes at other depths and nodes inside a generator subtree are passed over.
+fn cross_parent_target(
+    conn: &Connection,
+    entries: &[OutlineEntry],
+    parent_id: Uuid,
+    direction: ReorderDirection,
+) -> Result<Option<Uuid>> {
+    let mut children: std::collections::HashMap<Option<Uuid>, Vec<&OutlineEntry>> =
+        std::collections::HashMap::new();
+    for e in entries {
+        children.entry(e.parent_id).or_default().push(e);
+    }
+    for list in children.values_mut() {
+        list.sort_by_key(|e| e.ordinal);
+    }
+    // Preorder of (node, depth), roots first.
+    let mut preorder: Vec<(Uuid, usize)> = Vec::with_capacity(entries.len());
+    let mut stack: Vec<(Uuid, usize)> = children
+        .get(&None)
+        .map(|roots| roots.iter().rev().map(|e| (e.node_id, 0)).collect())
+        .unwrap_or_default();
+    while let Some((id, depth)) = stack.pop() {
+        preorder.push((id, depth));
+        if let Some(kids) = children.get(&Some(id)) {
+            stack.extend(kids.iter().rev().map(|e| (e.node_id, depth + 1)));
+        }
+    }
+    let Some(parent_pos) = preorder.iter().position(|(id, _)| *id == parent_id) else {
+        return Ok(None);
+    };
+    let depth = preorder[parent_pos].1;
+    let candidates: Box<dyn Iterator<Item = &(Uuid, usize)>> = match direction {
+        ReorderDirection::Down => Box::new(preorder[parent_pos + 1..].iter()),
+        ReorderDirection::Up => Box::new(preorder[..parent_pos].iter().rev()),
+    };
+    let generators = GeneratorRepo::new(conn);
+    for (id, d) in candidates {
+        if *d == depth && !generators.is_in_generator_subtree(*id)? {
+            return Ok(Some(*id));
+        }
+    }
+    Ok(None)
+}
+
+/// `node_id` and its ancestors that are collapsed, nearest first.
+pub(crate) fn collapsed_from(conn: &Connection, node_id: Uuid) -> Result<Vec<Uuid>> {
+    let outline = OutlineRepo::new(conn);
+    let mut found = Vec::new();
+    let mut current = Some(node_id);
+    while let Some(id) = current {
+        let Some(entry) = outline.get_entry(id)? else {
+            break;
+        };
+        if entry.collapsed {
+            found.push(id);
+        }
+        current = entry.parent_id;
+    }
+    Ok(found)
 }
 
 fn reorder_sibling(conn: &Connection, node_id: Uuid, direction: ReorderDirection) -> Result<()> {
     let outline = OutlineRepo::new(conn);
-    let entry = outline
-        .get_entry(node_id)?
-        .context("node missing from outline")?;
-    let list_id = outline_list_for_node(conn, node_id)?;
-    let parent_id = entry.parent_id;
-    let mut siblings: Vec<OutlineEntry> = outline
-        .list_for_list(list_id)?
-        .into_iter()
-        .filter(|e| e.parent_id == parent_id)
-        .collect();
-    siblings.sort_by_key(|e| e.ordinal);
-    let Some(pos) = siblings.iter().position(|e| e.node_id == node_id) else {
-        return Ok(());
-    };
-    if let Some(new_pos) = match direction {
-        ReorderDirection::Up if pos > 0 => Some(pos - 1),
-        ReorderDirection::Down if pos + 1 < siblings.len() => Some(pos + 1),
-        _ => None,
-    } {
-        siblings.swap(pos, new_pos);
-        renumber_siblings(&outline, &siblings, parent_id)?;
-        return Ok(());
-    }
-    match direction {
-        ReorderDirection::Down if pos + 1 == siblings.len() => {
-            reparent_to_parent_sibling(conn, node_id, list_id, parent_id, ParentSiblingJump::Next)?;
+    match plan_reorder(conn, node_id, direction)? {
+        ReorderOutcome::Unchanged => {}
+        ReorderOutcome::Swap => {
+            let entry = outline
+                .get_entry(node_id)?
+                .context("node missing from outline")?;
+            let parent_id = entry.parent_id;
+            let mut siblings: Vec<OutlineEntry> = outline
+                .list_for_list(entry.list_id)?
+                .into_iter()
+                .filter(|e| e.parent_id == parent_id)
+                .collect();
+            siblings.sort_by_key(|e| e.ordinal);
+            let pos = siblings
+                .iter()
+                .position(|e| e.node_id == node_id)
+                .context("node missing from its siblings")?;
+            let new_pos = match direction {
+                ReorderDirection::Up => pos - 1,
+                ReorderDirection::Down => pos + 1,
+            };
+            siblings.swap(pos, new_pos);
+            renumber_siblings(&outline, &siblings, parent_id)?;
         }
-        ReorderDirection::Up if pos == 0 => {
-            reparent_to_parent_sibling(conn, node_id, list_id, parent_id, ParentSiblingJump::Prev)?;
+        ReorderOutcome::Reparent { parent_id, index } => {
+            let entry = outline
+                .get_entry(node_id)?
+                .context("node missing from outline")?;
+            let old_parent = entry.parent_id;
+            // Open the way to where it lands, so it is still in view (its
+            // undo entry closes them again).
+            for ancestor in collapsed_from(conn, parent_id)? {
+                outline.set_collapsed(ancestor, false)?;
+            }
+            place_node(conn, node_id, Some(parent_id), index)?;
+            let mut remaining: Vec<OutlineEntry> = outline
+                .list_for_list(entry.list_id)?
+                .into_iter()
+                .filter(|e| e.parent_id == old_parent)
+                .collect();
+            remaining.sort_by_key(|e| e.ordinal);
+            renumber_siblings(&outline, &remaining, old_parent)?;
         }
-        _ => {}
     }
     Ok(())
 }
@@ -1416,66 +1541,6 @@ fn renumber_siblings(
             outline.set_parent(sibling.node_id, parent_id, ord)?;
         }
     }
-    Ok(())
-}
-
-/// When a node is at the first/last position under its parent, move it to the
-/// previous/next parent's child list instead of doing nothing.
-fn reparent_to_parent_sibling(
-    conn: &Connection,
-    node_id: Uuid,
-    list_id: Uuid,
-    parent_id: Option<Uuid>,
-    jump: ParentSiblingJump,
-) -> Result<()> {
-    let Some(parent_id) = parent_id else {
-        return Ok(());
-    };
-    let outline = OutlineRepo::new(conn);
-    let parent_entry = outline
-        .get_entry(parent_id)?
-        .context("parent missing from outline")?;
-    let grandparent_id = parent_entry.parent_id;
-
-    let mut parent_siblings: Vec<OutlineEntry> = outline
-        .list_for_list(list_id)?
-        .into_iter()
-        .filter(|e| e.parent_id == grandparent_id)
-        .collect();
-    parent_siblings.sort_by_key(|e| e.ordinal);
-
-    let Some(parent_pos) = parent_siblings.iter().position(|e| e.node_id == parent_id) else {
-        return Ok(());
-    };
-
-    let target_parent_id = match jump {
-        ParentSiblingJump::Next if parent_pos + 1 < parent_siblings.len() => {
-            parent_siblings[parent_pos + 1].node_id
-        }
-        ParentSiblingJump::Prev if parent_pos > 0 => parent_siblings[parent_pos - 1].node_id,
-        _ => return Ok(()),
-    };
-
-    let mut remaining: Vec<OutlineEntry> = outline
-        .list_for_list(list_id)?
-        .into_iter()
-        .filter(|e| e.parent_id == Some(parent_id) && e.node_id != node_id)
-        .collect();
-    remaining.sort_by_key(|e| e.ordinal);
-    renumber_siblings(&outline, &remaining, Some(parent_id))?;
-
-    let (new_parent, ordinal) = match jump {
-        ParentSiblingJump::Next => {
-            bump_ordinals_after(conn, list_id, Some(target_parent_id), 0)?;
-            (Some(target_parent_id), 0)
-        }
-        ParentSiblingJump::Prev => {
-            let ord = outline.next_ordinal(list_id, Some(target_parent_id))?;
-            (Some(target_parent_id), ord)
-        }
-    };
-
-    outline.set_parent(node_id, new_parent, ordinal)?;
     Ok(())
 }
 

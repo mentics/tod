@@ -242,7 +242,7 @@ mod tests {
     #[test]
     fn escape_applescript_quotes() {
         use super::escape_applescript;
-        assert_eq!(escape_applescript("C:\\dev\"test"), "C:\\dev\\\"test");
+        assert_eq!(escape_applescript("C:\\dev\"test"), "C:\\\\dev\\\"test");
     }
 
     #[test]

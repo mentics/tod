@@ -557,7 +557,10 @@ Second."), "{listed}");
         );
 
         let shown = cli(&root, &["visual-design", "show", "--obligation", &short]).unwrap();
-        assert!(shown.contains("mockup.html") || saved_file.display().to_string() == shown, "{shown}");
+        // macOS temp paths reach the CLI through a symlink (`/var` → `/private/var`).
+        let same_file = std::fs::canonicalize(shown.trim()).ok()
+            == std::fs::canonicalize(&saved_file).ok();
+        assert!(shown.contains("mockup.html") || same_file, "{shown}");
 
         // Saving again overwrites rather than creating a second file.
         let saved2 = cli(

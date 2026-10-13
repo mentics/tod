@@ -207,8 +207,7 @@ mod tests {
         store.writer().flush().unwrap();
         let ready = read();
         assert_ne!(ready, enabled);
-        // Files gives each node a worktree by default: set up, not yet made.
-        assert!(matches!(ready.files, Some((_, FilesDirectory::NotMade))));
+        assert!(matches!(ready.files, Some((_, FilesDirectory::Ready(_)))), "{:?}", ready.files);
 
         drop(store);
         cleanup_fleet_root(&root);

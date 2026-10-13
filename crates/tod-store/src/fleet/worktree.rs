@@ -162,8 +162,11 @@ const REMOTE: &str = "origin";
 /// fetch fails is an error, rather than a branch made from stale work.
 /// Network: never on the UI thread.
 pub fn fetch_origin(repo: &Workdir) -> Result<()> {
-    let remotes = run_git(repo, &["remote"])?;
-    if !remotes.lines().any(|r| r.trim() == REMOTE) {
+    // `git remote` also lists a remote only configured (say a global
+    // `remote.origin.prune`), which has no URL to fetch from.
+    let has_url = run_git(repo, &["config", "--get", &format!("remote.{REMOTE}.url")])
+        .is_ok_and(|url| !url.trim().is_empty());
+    if !has_url {
         return Ok(());
     }
     // A partial clone's connectivity check can ask the remote for an object
