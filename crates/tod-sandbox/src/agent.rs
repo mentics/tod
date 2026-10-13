@@ -11,7 +11,7 @@
 //! machine (`tod-cli`, see [`crate::tunnel`]) and keep a file in place, which
 //! tod's Zed shim reads as "keep Zed attached to this sandbox".
 //!
-//! Stdin closing ends the agent. The bridge exits when the agent does, with
+//! Stdin closing, or SIGTERM or SIGHUP, ends the agent. The bridge exits when the agent does, with
 //! its exit code.
 
 use crate::relay::{self, Ws};
@@ -153,20 +153,14 @@ pub async fn run(sandbox_url: &str, token: &str, opts: BridgeOptions) -> Result<
     let mut last_activity = Instant::now();
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     let mut stdout = std::io::stdout();
+    let mut terminated = Terminated::new();
 
     loop {
         tokio::select! {
             line = in_rx.recv() => {
                 let Some(Some(line)) = line else {
                     // Stdin closed: end the agent.
-                    if attached.is_none() {
-                        attached = attach(reattach.clone()).await.ok();
-                    }
-                    if let Some(mut a) = attached.take() {
-                        let _ = a.ws.send(Message::text("bye")).await;
-                        let _ = a.ws.close(None).await;
-                        a.release(&opts.awake_file);
-                    }
+                    end_agent(attached.take(), &attach, &reattach, &opts.awake_file).await;
                     return Ok(0);
                 };
                 last_activity = Instant::now();
@@ -184,6 +178,12 @@ pub async fn run(sandbox_url: &str, token: &str, opts: BridgeOptions) -> Result<
                     a.ws.send(Message::text(line)).await.context("send to the agent")?;
                     attached = Some(a);
                 }
+            }
+            // Asked to stop (tod ends a session by terminating the bridge):
+            // end the agent too, or it would stay in the sandbox.
+            () = terminated.wait() => {
+                end_agent(attached.take(), &attach, &reattach, &opts.awake_file).await;
+                return Ok(0);
             }
             msg = async { attached.as_mut().expect("attached").ws.next().await }, if attached.is_some() => {
                 match msg {
@@ -257,6 +257,60 @@ pub async fn run(sandbox_url: &str, token: &str, opts: BridgeOptions) -> Result<
                 }
             }
         }
+    }
+}
+
+/// Ends the agent in the sandbox with `bye`, reattaching first if the bridge
+/// had detached. Best effort: the relay also ends an agent nobody has
+/// attached to for a long while.
+async fn end_agent<F, Fut>(
+    attached: Option<Attached>,
+    attach: &F,
+    reattach: &Value,
+    awake_file: &Option<PathBuf>,
+) where
+    F: Fn(Value) -> Fut,
+    Fut: std::future::Future<Output = Result<Attached>>,
+{
+    let attached = match attached {
+        Some(a) => Some(a),
+        None => attach(reattach.clone()).await.ok(),
+    };
+    if let Some(mut a) = attached {
+        let _ = a.ws.send(Message::text("bye")).await;
+        let _ = a.ws.close(None).await;
+        a.release(awake_file);
+    }
+}
+
+/// Resolves when this process is asked to stop (SIGTERM or SIGHUP). Built
+/// once, ahead of the loop, so a signal between two polls is not missed.
+struct Terminated {
+    #[cfg(unix)]
+    signals: Option<(tokio::signal::unix::Signal, tokio::signal::unix::Signal)>,
+}
+
+impl Terminated {
+    fn new() -> Self {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+            let signals = signal(SignalKind::terminate())
+                .and_then(|t| Ok((t, signal(SignalKind::hangup())?)))
+                .ok();
+            Self { signals }
+        }
+        #[cfg(not(unix))]
+        Self {}
+    }
+
+    async fn wait(&mut self) {
+        #[cfg(unix)]
+        if let Some((term, hup)) = &mut self.signals {
+            tokio::select! { _ = term.recv() => {}, _ = hup.recv() => {} }
+            return;
+        }
+        std::future::pending::<()>().await
     }
 }
 
