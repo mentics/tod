@@ -486,6 +486,11 @@ fn make_sandbox(
     let prepared = prepare_sandbox_checkout(&dir, &name, repo, branch, progress);
     let mut warnings = match prepared {
         Ok(warnings) => warnings,
+        // `TOD_KEEP_FAILED_SANDBOX=1` leaves it for inspection (and the
+        // location recorded, so the launch reuses it).
+        Err(err) if std::env::var_os("TOD_KEEP_FAILED_SANDBOX").is_some() => {
+            return Err(err.context(format!("{name} was kept (TOD_KEEP_FAILED_SANDBOX)")));
+        }
         Err(err) => {
             let cleaned = match sandboxes.delete(&sandboxes.blaxel()?, &name) {
                 Ok(()) => {

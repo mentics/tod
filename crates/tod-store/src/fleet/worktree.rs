@@ -166,9 +166,15 @@ pub fn fetch_origin(repo: &Workdir) -> Result<()> {
     if !remotes.lines().any(|r| r.trim() == REMOTE) {
         return Ok(());
     }
-    run_git(repo, &["fetch", "--quiet", "--prune", REMOTE]).with_context(|| {
-        format!("fetch {REMOTE} in {repo}, so the node's new branch starts from the latest")
-    })?;
+    // A partial clone's connectivity check can ask the remote for an object
+    // by id that a branch moved past meanwhile ("not our ref"); the objects
+    // the first try did get are kept, so a second try normally succeeds.
+    let fetch = || run_git(repo, &["fetch", "--quiet", "--prune", REMOTE]);
+    fetch()
+        .or_else(|first| fetch().map_err(|_| first))
+        .with_context(|| {
+            format!("fetch {REMOTE} in {repo}, so the node's new branch starts from the latest")
+        })?;
     Ok(())
 }
 
