@@ -19,7 +19,9 @@ use uuid::Uuid;
 
 use tod_agent::devcontainer::{NoSshd, install_sshd};
 
-use crate::ui::toast::{error_toast, error_toast_with_action, info_toast};
+use crate::ui::toast::{
+    dismiss_progress_toast, error_toast, error_toast_with_action, info_toast, progress_toast,
+};
 
 /// Open a code reference clicked in text. Dispatched by the link, handled by
 /// the view that knows the node; never bound to a key.
@@ -53,6 +55,8 @@ pub fn on_link_click(url: &SharedString, event: &ClickEvent, window: &mut Window
     }
 }
 
+const OPEN_CODE_PROGRESS: &str = "open-code-ref";
+
 /// Open `target` in the first available code editor, off the UI thread,
 /// resolving a relative path against `node`'s Files directory. Failures show
 /// as an error toast.
@@ -70,13 +74,17 @@ pub fn open_code_ref(
         error_toast(window, cx, "No code editor is supported on this machine");
         return;
     };
+    // Making the node's files (worktree, container, sandbox) can take a while.
+    progress_toast(window, cx, OPEN_CODE_PROGRESS, "Opening the code…");
     let task = cx.background_spawn(async move {
         let node = node.map(|node| node.to_string());
         open_code_location(&fleet, editor, node.as_deref(), &location)
     });
     window
         .spawn(cx, async move |cx| {
-            if let Err(err) = task.await {
+            let result = task.await;
+            let _ = cx.update(|window, cx| dismiss_progress_toast(window, cx, OPEN_CODE_PROGRESS));
+            if let Err(err) = result {
                 let _ = cx.update(|window, cx| {
                     let message = format!("Open code failed: {err:#}");
                     let Some(missing) = err.downcast_ref::<NoSshd>() else {

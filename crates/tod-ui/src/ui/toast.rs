@@ -4,6 +4,7 @@ use gpui::{
 };
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::notification::Notification;
+use gpui_component::spinner::Spinner;
 use gpui_component::{IconName, Root, Sizable, StyledExt, WindowExt, h_flex};
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -15,6 +16,7 @@ struct ErrorBannerNotification;
 struct WarningBannerNotification;
 struct CloseGuardToast;
 struct InfoBannerNotification;
+struct ProgressBannerNotification;
 
 /// Brief, low-emphasis confirmation banner (autohides), for background work
 /// that finished successfully with nothing the user must act on.
@@ -42,6 +44,47 @@ pub fn info_toast(window: &mut Window, cx: &mut App, message: impl Into<SharedSt
             }),
         cx,
     );
+}
+
+/// Spinner banner for background work the user is waiting on. It stays until
+/// [`dismiss_progress_toast`] with the same `key`; pushing it again with the
+/// same key replaces the message, so a step-by-step status can be shown.
+pub fn progress_toast(
+    window: &mut Window,
+    cx: &mut App,
+    key: &'static str,
+    message: impl Into<SharedString>,
+) {
+    let message = message.into();
+    window.push_notification(
+        Notification::new()
+            .id1::<ProgressBannerNotification>(key)
+            .autohide(false)
+            .content(move |_note, window, cx| {
+                h_flex()
+                    .id("progress-banner")
+                    .max_w(px(480.))
+                    .min_w(px(240.))
+                    .px_4()
+                    .py_2p5()
+                    .gap_2()
+                    .items_center()
+                    .child(Spinner::new().small())
+                    .child(
+                        div().flex_1().min_w_0().child(
+                            selectable_text("progress-banner-text", message.clone(), window, cx)
+                                .text_sm(),
+                        ),
+                    )
+                    .into_any_element()
+            }),
+        cx,
+    );
+}
+
+/// Remove the [`progress_toast`] shown under `key`.
+pub fn dismiss_progress_toast(window: &mut Window, cx: &mut App, key: &'static str) {
+    window.remove_notification1::<ProgressBannerNotification>(key, cx);
 }
 
 /// Overlay for queued notifications (error banners, confirm toasts).
