@@ -87,18 +87,129 @@ fn ready_as_is(reported: Option<&str>, expected: &str) -> bool {
     reported.is_some_and(|m| m == expected || is_node_manifest(m))
 }
 
+/// What a fork's [`MANIFEST_PATH`] says once [`ensure`] has adopted it
+/// ([`Mode::Fork`]): the relay and `tod-cli` put there. Unlike
+/// [`Payload::manifest`] it does not cover the bootstrap script: a fork's
+/// packages are whatever its source had, and are never installed here.
+pub fn fork_manifest(payload: &Payload) -> String {
+    format!("{FORK_MANIFEST_PREFIX}relay={} tod-cli={}", &hex(payload.relay)[..16], &hex(payload.tod_cli)[..16])
+}
+
+const FORK_MANIFEST_PREFIX: &str = "fork ";
+
+/// Whether `manifest` is a fork's ([`fork_manifest`]).
+pub fn is_fork_manifest(manifest: &str) -> bool {
+    manifest.trim().starts_with(FORK_MANIFEST_PREFIX)
+}
+
 /// What [`ensure`] had to do.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Outcome {
     AlreadyReady,
     RelayStarted,
     Provisioned,
+    /// A fork got the relay and `tod-cli` and nothing else.
+    Adopted,
+}
+
+/// How [`ensure`] treats a sandbox that is not ready.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    /// Install what is missing ([`Payload::bootstrap`]). For a sandbox from a
+    /// plain image, which has nothing of tod's.
+    Install,
+    /// [`Mode::Install`] even for a fork that [`ensure`] adopted: the
+    /// explicit repair when a fork lacks something (`tod-sandbox ensure --install`).
+    ForceInstall,
+    /// The sandbox is a copy of one that was prepared ahead (a golden). Never
+    /// install a package: put the relay and `tod-cli` in (a few megabytes, and
+    /// they have to match this app) and check the rest is there, naming what
+    /// is not and how to fix the source instead. Forking is for speed, and an
+    /// install here would cost every fork what the golden was built to save.
+    Fork,
+}
+
+/// What tod needs in a sandbox that [`Mode::Fork`] only checks for. The
+/// first line it prints is `missing:` and the commands it did not find.
+fn requirements_script(agents: bool) -> String {
+    let agent_checks = if agents {
+        r#"
+node_ok() {
+    command -v node >/dev/null 2>&1 && command -v npm >/dev/null 2>&1 || return 1
+    node -e 'const [a, b] = process.versions.node.split(".").map(Number);
+             process.exit(a > 20 || (a === 20 && b >= 10) ? 0 : 1)' 2>/dev/null
+}
+node_ok || missing="$missing node>=20.10"
+command -v claude-agent-acp >/dev/null 2>&1 || missing="$missing claude-agent-acp"
+command -v claude >/dev/null 2>&1 || optional="$optional claude"
+"#
+    } else {
+        ""
+    };
+    format!(
+        r#"mkdir -p {TOD_DIR}/bin {TOD_DIR}/logs
+missing=""
+optional=""
+for c in sh git curl tar gzip bash ps scp; do
+    command -v "$c" >/dev/null 2>&1 || missing="$missing $c"
+done
+found=""
+for p in /usr/lib/ssh/sftp-server /usr/lib/openssh/sftp-server /usr/libexec/openssh/sftp-server /usr/libexec/sftp-server; do
+    if [ -x "$p" ]; then ln -sf "$p" {TOD_DIR}/bin/sftp-server; found=1; break; fi
+done
+[ -n "$found" ] || missing="$missing sftp-server"
+{agent_checks}
+echo "missing:$missing"
+echo "optional:$optional"
+"#
+    )
+}
+
+/// What [`requirements_script`] found.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Requirements {
+    pub missing: Vec<String>,
+    pub optional: Vec<String>,
+}
+
+fn parse_requirements(output: &str) -> Requirements {
+    let list = |tag: &str| -> Vec<String> {
+        output
+            .lines()
+            .find_map(|l| l.trim().strip_prefix(tag))
+            .map(|rest| rest.split_whitespace().map(str::to_string).collect())
+            .unwrap_or_default()
+    };
+    Requirements { missing: list("missing:"), optional: list("optional:") }
+}
+
+/// Why a fork cannot be used, and what to do about it.
+pub fn missing_in_fork_message(missing: &[String]) -> String {
+    format!(
+        "this sandbox is a copy of one that lacks what tod needs: {}. tod does not install anything into a \
+         fork, so every fork stays fast. Fix the sandbox it was forked from: add these to the image the golden \
+         is built from and make the golden again (for the workspace, .devcontainer/blaxel/Dockerfile and \
+         `blaxel-sbx golden refresh`). To install them into just this sandbox instead, run \
+         `tod-sandbox ensure <name> --install`",
+        missing.join(", ")
+    )
 }
 
 /// Makes the sandbox at `url` ready. `progress` hears about each slow step.
-pub fn ensure(bx: &Blaxel, url: &str, payload: &Payload, progress: &mut dyn FnMut(&str)) -> Result<Outcome> {
+pub fn ensure(
+    bx: &Blaxel,
+    url: &str,
+    payload: &Payload,
+    mode: Mode,
+    progress: &mut dyn FnMut(&str),
+) -> Result<Outcome> {
     let manifest = payload.manifest();
-    if ready_as_is(relay_manifest(bx, url).as_deref(), &manifest) {
+    let fork_manifest = fork_manifest(payload);
+    let reported = relay_manifest(bx, url);
+    if ready_as_is(reported.as_deref(), &manifest) {
+        return Ok(Outcome::AlreadyReady);
+    }
+    if reported.as_deref() == Some(fork_manifest.as_str()) {
         return Ok(Outcome::AlreadyReady);
     }
 
@@ -111,7 +222,15 @@ pub fn ensure(bx: &Blaxel, url: &str, payload: &Payload, progress: &mut dyn FnMu
             reprovision it"
         );
     }
+    if mode == Mode::Fork && !is_node_manifest(current.output()) {
+        return adopt_fork(bx, url, payload, &fork_manifest, current.output().trim(), progress);
+    }
     let mut outcome = Outcome::RelayStarted;
+    if mode != Mode::ForceInstall && is_fork_manifest(current.output()) {
+        // Adopted before, by another build of tod: its relay and `tod-cli`
+        // are replaced, and nothing is installed.
+        return adopt_fork(bx, url, payload, &fork_manifest, current.output().trim(), progress);
+    }
     if current.output().trim() != manifest {
         check_relay_arch(payload.relay)?;
         progress("installing tod's dependencies in the sandbox (first connect only)…");
@@ -152,6 +271,62 @@ pub fn ensure(bx: &Blaxel, url: &str, payload: &Payload, progress: &mut dyn FnMu
             Some(m) if ready_as_is(Some(&m), &manifest) => return Ok(outcome),
             Some(m) => bail!("the sandbox reports manifest {m:?}, expected {manifest:?}"),
             None if Instant::now() > deadline => bail!("the relay did not come up within 20s"),
+            None => std::thread::sleep(Duration::from_millis(500)),
+        }
+    }
+}
+
+/// [`Mode::Fork`]: checks the sandbox has what tod needs, puts the relay and
+/// `tod-cli` in, and starts the relay. Installs no package.
+fn adopt_fork(
+    bx: &Blaxel,
+    url: &str,
+    payload: &Payload,
+    fork_manifest: &str,
+    current: &str,
+    progress: &mut dyn FnMut(&str),
+) -> Result<Outcome> {
+    check_relay_arch(payload.relay)?;
+    let found = parse_requirements(bx.run(url, &requirements_script(payload.agents), 60)?.output());
+    if !found.optional.is_empty() {
+        progress(&format!(
+            "warning: the sandbox has no {} (a terminal agent cannot start there; the ACP agent is unaffected)",
+            found.optional.join(", ")
+        ));
+    }
+    if !found.missing.is_empty() {
+        bail!("{}", missing_in_fork_message(&found.missing));
+    }
+    let started = Instant::now();
+    if current.is_empty() {
+        progress("putting tod's relay and tod-cli in the sandbox…");
+    } else {
+        progress("updating tod's relay and tod-cli in the sandbox…");
+    }
+    bx.upload_large(url, RELAY_PATH, payload.relay, "0755")?;
+    bx.upload(url, TOD_CLI_PATH, payload.tod_cli, "0755")?;
+    // A relay from an older install would keep running the old binary.
+    bx.kill(url, RELAY_PROCESS)?;
+    let res = bx.run(url, &format!("printf '%s\\n' {} > {MANIFEST_PATH}", relay::shell_quote(fork_manifest)), 30)?;
+    if res.exit_code != 0 {
+        bail!("writing {MANIFEST_PATH} failed: {}", res.output());
+    }
+    progress(&format!("relay installed in {:.1}s; starting it…", started.elapsed().as_secs_f64()));
+    bx.start(url, RELAY_PROCESS, &relay_command(), true)?;
+    wait_for_relay(bx, url, fork_manifest)?;
+    Ok(Outcome::Adopted)
+}
+
+fn wait_for_relay(bx: &Blaxel, url: &str, manifest: &str) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        match relay_manifest(bx, url) {
+            Some(m) if ready_as_is(Some(&m), manifest) || m == manifest => return Ok(()),
+            Some(m) => bail!("the sandbox reports manifest {m:?}, expected {manifest:?}"),
+            None if Instant::now() > deadline => bail!(
+                "the relay did not come up within 20s (see {TOD_DIR}/logs in the sandbox, \
+                 and `tod-sandbox exec <name> -- ps`)"
+            ),
             None => std::thread::sleep(Duration::from_millis(500)),
         }
     }
@@ -309,6 +484,38 @@ protocol = "HTTP"
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn fork_manifest_tracks_relay_and_cli_not_the_bootstrap() {
+        let a = Payload { bootstrap: b"a", relay: b"r", tod_cli: b"t", agents: true };
+        let b = Payload { bootstrap: b"changed", relay: b"r", tod_cli: b"t", agents: false };
+        let c = Payload { bootstrap: b"a", relay: b"new", tod_cli: b"t", agents: true };
+        assert_eq!(fork_manifest(&a), fork_manifest(&b));
+        assert_ne!(fork_manifest(&a), fork_manifest(&c));
+        assert!(is_fork_manifest(&fork_manifest(&a)));
+        assert!(!is_fork_manifest(&a.manifest()));
+        assert!(!ready_as_is(Some(&fork_manifest(&a)), &a.manifest()));
+    }
+
+    #[test]
+    fn requirements_output_is_parsed() {
+        let found = parse_requirements("missing: claude-agent-acp node>=20.10\noptional: claude\n");
+        assert_eq!(found.missing, ["claude-agent-acp", "node>=20.10"]);
+        assert_eq!(found.optional, ["claude"]);
+        assert_eq!(parse_requirements("missing:\noptional:\n"), Requirements::default());
+    }
+
+    #[test]
+    fn a_missing_requirement_says_how_to_fix_the_source() {
+        let msg = missing_in_fork_message(&["claude-agent-acp".to_string()]);
+        assert!(msg.contains("claude-agent-acp") && msg.contains("golden refresh") && msg.contains("--install"));
+    }
+
+    #[test]
+    fn the_requirements_script_checks_agents_only_when_asked() {
+        assert!(requirements_script(true).contains("claude-agent-acp"));
+        assert!(!requirements_script(false).contains("claude-agent-acp"));
+    }
+
     use super::*;
 
     #[test]

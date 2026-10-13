@@ -278,6 +278,7 @@ claude_token_via = \"env\"
             orchestrator: "orch-2".into(),
             orchestrator_volume: Some("orch-data".into()),
             node_base: Some("base".into()),
+            golden: None,
         });
         c.upsert(Sandbox { name: "a".into(), image: "i".into(), url: None, agents: true });
         c.upsert(Sandbox { name: "a".into(), image: "j".into(), url: Some("u".into()), agents: true });

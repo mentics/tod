@@ -136,6 +136,19 @@ impl Sandboxes {
     /// Make the sandbox ready for tod (idempotent; one round trip when it
     /// is) and return its URL. `progress` hears about each slow step.
     pub fn ensure(&mut self, bx: &Blaxel, name: &str, progress: &mut dyn FnMut(&str)) -> Result<String> {
+        self.ensure_as(bx, name, provision::Mode::Install, progress)
+    }
+
+    /// [`Self::ensure`], with `mode` saying whether a sandbox that lacks tod's
+    /// packages gets them installed (a plain image) or is only checked (a
+    /// fork of a prepared sandbox).
+    pub fn ensure_as(
+        &mut self,
+        bx: &Blaxel,
+        name: &str,
+        mode: provision::Mode,
+        progress: &mut dyn FnMut(&str),
+    ) -> Result<String> {
         let info = bx.get(name)?.ok_or_else(|| anyhow!("no sandbox named {name}"))?;
         let info = if info.status == "DEPLOYED" {
             info
@@ -147,7 +160,8 @@ impl Sandboxes {
         let relay_bin = relay_binary()?;
         let payload = payload(&relay_bin, agents);
         let started = Instant::now();
-        let outcome = provision::ensure(bx, &url, &payload, progress)?;
+        let outcome = provision::ensure(bx, &url, &payload, mode, progress)
+            .with_context(|| format!("make sandbox {name} ready for tod"))?;
         if outcome != provision::Outcome::AlreadyReady {
             progress(&format!("{name}: ready ({outcome:?}, {:.1}s)", started.elapsed().as_secs_f64()));
         }
@@ -388,7 +402,22 @@ impl Sandboxes {
         self.config.upsert(Sandbox { name: name.to_string(), image, url: info.url, agents });
         self.save()?;
         forget(name);
-        self.ensure(&bx, name, progress)
+        let mode = match source {
+            NewSandboxSource::Fork(_) => provision::Mode::Fork,
+            NewSandboxSource::Image(_) => provision::Mode::Install,
+        };
+        match self.ensure_as(&bx, name, mode, progress) {
+            Ok(url) => Ok(url),
+            Err(err) => {
+                // Nothing has used it yet: leaving it would leak a sandbox
+                // per attempt (each one costs money and clutters the list).
+                let removed = match self.delete(&bx, name) {
+                    Ok(()) => format!("{name} was deleted"),
+                    Err(del) => format!("{name} could not be deleted either ({del:#}); `tod-sandbox delete {name}` removes it"),
+                };
+                Err(err.context(removed))
+            }
+        }
     }
 
     /// Builds `base_image` with tod's dependencies installed and `repos`
