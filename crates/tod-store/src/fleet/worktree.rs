@@ -166,7 +166,11 @@ pub fn fetch_origin(repo: &Workdir) -> Result<()> {
     if !remotes.lines().any(|r| r.trim() == REMOTE) {
         return Ok(());
     }
-    run_git(repo, &["fetch", "--quiet", "--prune", REMOTE]).with_context(|| {
+    let fetch = || run_git(repo, &["fetch", "--quiet", "--prune", REMOTE]);
+    // The first fetch into a blobless, shallow seed (a cloud sandbox's) can
+    // end with "not our ref" for an object it lazily asked the server for,
+    // after the pack was stored; the second finds nothing left to do.
+    fetch().or_else(|_| fetch()).with_context(|| {
         format!("fetch {REMOTE} in {repo}, so the node's new branch starts from the latest")
     })?;
     Ok(())

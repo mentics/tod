@@ -364,7 +364,15 @@ impl Sandboxes {
                     .ok_or_else(|| anyhow!("no sandbox named {source} to fork"))?
                     .image;
                 progress(&format!("forking {source} into {name}…"));
-                bx.fork(source, name)?;
+                // A fork's proxy variables come back as an unresolved
+                // `{{file(..)}}` template that curl, git, and npm reject; the
+                // sandbox's local proxy (what a new sandbox gets) works.
+                let proxy_env = "http://localhost:49152".to_string();
+                bx.fork_with_envs(
+                    source,
+                    name,
+                    &[("HTTPS_PROXY", proxy_env.clone()), ("HTTP_PROXY", proxy_env)],
+                )?;
                 if fork_proxy_pending {
                     let proxy = tod_sandbox::node::proxy_spec(&rules);
                     let fingerprint = tod_sandbox::node::rules_fingerprint(&rules);
