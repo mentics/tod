@@ -92,6 +92,35 @@ pub struct PreparedContainer {
     pub env: Vec<(String, String)>,
 }
 
+/// Runs `"$@"` (the agent) in a session of its own, with this script's stdin
+/// passed through a fifo, and ends the agent's whole process group when that
+/// stdin closes. Killing the `docker exec` client (tod ending a session, or
+/// dying) does not signal the process in the container: it only closes its
+/// stdin, so without this the agent's subprocesses stay behind. Exits with the
+/// agent's status. POSIX `sh` (dash): `kill -TERM -PGID`, not `kill -- -PGID`,
+/// and stdin is saved on fd 3 because a background job's own is /dev/null.
+pub const AGENT_WRAPPER: &str = r#"d=$(mktemp -d) || exit 1
+mkfifo "$d/in" || exit 1
+exec 3<&0
+s=; command -v setsid >/dev/null 2>&1 && s=setsid
+$s "$@" < "$d/in" 3<&- &
+p=$!
+stop() {
+  kill -TERM "-$p" 2>/dev/null || kill -TERM "$p" 2>/dev/null
+  sleep 2
+  kill -KILL "-$p" 2>/dev/null || kill -KILL "$p" 2>/dev/null
+}
+( cat <&3 > "$d/in"; stop ) &
+c=$!
+exec 3<&-
+trap 'stop' TERM HUP INT
+wait "$p"
+code=$?
+kill "$c" 2>/dev/null
+rm -f "$d/in"; rmdir "$d" 2>/dev/null
+exit "$code"
+"#;
+
 impl PreparedContainer {
     /// `docker exec` arguments (after `exec`) that run `program args…` in
     /// the container. Environment values are passed by name only (`-e KEY`)

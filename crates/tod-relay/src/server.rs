@@ -30,6 +30,16 @@ pub type WsIn = SplitStream<WebSocketStream<TcpStream>>;
 /// client that missed output cannot recover the stream, so past this the
 /// process is ended and the client sees it exit.
 const MAX_HELD_BYTES: usize = 32 << 20;
+/// How long an agent may sit with no client attached, nothing in flight and no
+/// output before it is ended. A client that ends an agent says `bye`, but one
+/// that is killed or crashes cannot, and its agent (and the adapter's own
+/// children) would otherwise stay forever: the name is the client's, so no
+/// later client replaces it. A live client leaves an agent idle for far less
+/// (tod releases an idle session after 15 minutes) and resumes the session by
+/// id if it finds the process gone.
+const DETACHED_AGENT_TTL: Duration = Duration::from_secs(60 * 60);
+/// How often detached agents are checked against [`DETACHED_AGENT_TTL`].
+const DETACHED_AGENT_SWEEP: Duration = Duration::from_secs(60);
 const LOG_DIR: &str = "/opt/tod/logs";
 /// How long a poke's own bridging lease (`Hold::lease("poke", ..)`) holds the
 /// sandbox awake by itself, giving the supervisor time to take its own hold.
@@ -784,6 +794,20 @@ struct AgentState {
     client_pending: HashSet<String>,
     /// Requests the agent sent that the client has not answered yet.
     agent_pending: HashSet<String>,
+    /// Since when nothing has happened on an agent with no client attached;
+    /// `None` while a client is attached.
+    idle_since: Option<std::time::Instant>,
+}
+
+impl AgentState {
+    /// Whether the agent has been abandoned: no client, nothing in flight, and
+    /// nothing heard from it for `ttl`.
+    fn abandoned(&self, ttl: Duration) -> bool {
+        self.client.is_none()
+            && self.client_pending.is_empty()
+            && self.agent_pending.is_empty()
+            && self.idle_since.is_some_and(|since| since.elapsed() >= ttl)
+    }
 }
 
 /// Tracks JSON-RPC requests in flight: a message with a method and an id is a
@@ -811,6 +835,7 @@ impl Agent {
             }
         }
         if !sent {
+            st.idle_since = Some(std::time::Instant::now());
             st.held_bytes += line.len();
             st.held.push_back(line);
             if st.held_bytes > MAX_HELD_BYTES {
@@ -852,6 +877,7 @@ impl Agent {
             let _ = tx.send(Message::Text(line));
         }
         s.held_bytes = 0;
+        s.idle_since = None;
         s.client = Some((conn, tx));
     }
 
@@ -859,6 +885,7 @@ impl Agent {
         let mut s = self.state.lock().unwrap();
         if s.client.as_ref().is_some_and(|(c, _)| *c == conn) {
             s.client = None;
+            s.idle_since = Some(std::time::Instant::now());
         }
     }
 }
@@ -948,6 +975,22 @@ fn spawn_agent(relay: &Arc<Relay>, name: &str, req: &AgentReq) -> std::io::Resul
         state: Mutex::new(AgentState::default()),
     });
     relay.agents.lock().unwrap().insert(name.to_string(), agent.clone());
+    let (a, r, n) = (agent.clone(), relay.clone(), name.to_string());
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(DETACHED_AGENT_SWEEP).await;
+            let current = r.agents.lock().unwrap().get(&n).is_some_and(|cur| Arc::ptr_eq(cur, &a));
+            if !current {
+                break;
+            }
+            if a.state.lock().unwrap().abandoned(DETACHED_AGENT_TTL) {
+                eprintln!("agent {n}: abandoned for {DETACHED_AGENT_TTL:?}; ending it");
+                // Its exit task removes it and releases its hold.
+                kill_group(a.pid);
+                break;
+            }
+        }
+    });
     let mut stdin = child.stdin.take().expect("stdin");
     tokio::spawn(async move {
         while let Some(line) = irx.recv().await {
@@ -1008,5 +1051,25 @@ mod tests {
             supervisor_env_from(vars),
             [("CLAUDE_CODE_OAUTH_TOKEN".to_string(), "tok".to_string())]
         );
+    }
+}
+
+#[cfg(test)]
+mod abandoned_tests {
+    use super::*;
+
+    #[test]
+    fn an_agent_is_abandoned_only_when_idle_detached_and_owed_nothing() {
+        let mut st = AgentState::default();
+        // Never detached (a client is about to attach): not abandoned.
+        assert!(!st.abandoned(Duration::ZERO));
+        st.idle_since = Some(std::time::Instant::now());
+        assert!(st.abandoned(Duration::ZERO));
+        assert!(!st.abandoned(Duration::from_secs(3600)));
+        st.client_pending.insert("1".into());
+        assert!(!st.abandoned(Duration::ZERO));
+        st.client_pending.clear();
+        st.agent_pending.insert("2".into());
+        assert!(!st.abandoned(Duration::ZERO));
     }
 }

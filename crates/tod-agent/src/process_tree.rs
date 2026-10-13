@@ -33,13 +33,38 @@ pub struct AgentProcess {
     child: Child,
     tree: Option<imp::Tree>,
     killed: bool,
+    /// How long to let the process end by itself (after SIGTERM) before the
+    /// tree is killed. See [`AgentProcess::with_grace`].
+    grace: Option<std::time::Duration>,
 }
 
 impl AgentProcess {
+    /// Ask the process to stop with SIGTERM and give it `grace` to do so
+    /// before [`Self::kill_tree`] kills the tree. For a process that holds
+    /// something elsewhere and releases it when asked, such as the
+    /// `tod-sandbox agent` bridge, which ends its agent in the sandbox (a
+    /// kill would leave it running there). Unix only; elsewhere the tree is
+    /// killed at once.
+    pub fn with_grace(mut self, grace: std::time::Duration) -> Self {
+        self.grace = Some(grace);
+        self
+    }
+
     /// Kill the agent and everything it started, and reap it. Idempotent.
     pub fn kill_tree(&mut self) {
         if std::mem::replace(&mut self.killed, true) {
             return;
+        }
+        #[cfg(unix)]
+        if let Some(grace) = self.grace {
+            unsafe { libc::kill(self.child.id() as i32, libc::SIGTERM) };
+            let deadline = std::time::Instant::now() + grace;
+            while std::time::Instant::now() < deadline {
+                if matches!(self.child.try_wait(), Ok(Some(_))) {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
         }
         imp::kill(&mut self.child, self.tree.as_mut());
         let _ = self.child.wait();
@@ -83,6 +108,7 @@ pub fn spawn(command: &mut Command) -> io::Result<AgentProcess> {
         child,
         tree,
         killed: false,
+        grace: None,
     })
 }
 

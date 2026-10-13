@@ -325,7 +325,11 @@ pub fn spawn_acp_in_sandbox(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    crate::process_tree::spawn(&mut command).with_context(|| {
+    // The bridge ends the agent in the sandbox when asked to stop; a kill
+    // would leave it (and its children) running there.
+    crate::process_tree::spawn(&mut command)
+        .map(|p| p.with_grace(std::time::Duration::from_secs(5)))
+        .with_context(|| {
         format!(
             "failed to start {} ACP in sandbox `{}` ({})",
             host.label(),
@@ -357,7 +361,15 @@ pub fn spawn_acp_in_container(
         container.env.retain(|(existing, _)| existing != key);
         container.env.push((key.clone(), value.clone()));
     }
-    let mut command = container.command(agent_bin, &args)?;
+    // Through the wrapper, so the agent's tree ends with the exec's stdin.
+    let mut wrapped = vec![
+        "-c".to_string(),
+        crate::devcontainer::AGENT_WRAPPER.to_string(),
+        "sh".to_string(),
+        agent_bin.to_string(),
+    ];
+    wrapped.extend(args);
+    let mut command = container.command("sh", &wrapped)?;
     command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
