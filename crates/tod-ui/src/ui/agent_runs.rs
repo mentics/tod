@@ -96,7 +96,12 @@ pub struct AgentRuns {
     slots: Vec<DriverSlot>,
     /// The next [`DriverSlot::id`].
     next_slot: u64,
+    /// Collects finished turns; see [`AgentRuns::start_polling`].
+    _poll: Option<gpui::Task<()>>,
 }
+
+/// How often a turn in flight is looked at.
+const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// Drop the provider's live agent sessions `keys`. The conversations keep
 /// their recorded agent session ids: the next message starts the agent again
@@ -118,7 +123,70 @@ impl AgentRuns {
             agent,
             slots: Vec::new(),
             next_slot: 0,
+            _poll: None,
         }
+    }
+
+    /// Start collecting finished turns for every conversation hosted here.
+    /// Nothing else does: a reply is stored, and the next turn of a loop
+    /// sent, only when its driver is ticked. Collecting runs git, Docker and
+    /// `tod-cli`, so each tick is off the main thread.
+    pub fn start_polling(&mut self, cx: &mut Context<Self>) {
+        self._poll = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(POLL_INTERVAL).await;
+                let Ok((fleet, agent, away)) = this.update(cx, |this, cx| {
+                    let away = this.take_running();
+                    if !away.is_empty() {
+                        cx.notify();
+                    }
+                    (this.fleet.clone(), this.agent.clone(), away)
+                }) else {
+                    break;
+                };
+                if away.is_empty() {
+                    continue;
+                }
+                let ticked = cx
+                    .background_executor()
+                    .spawn(async move {
+                        away.into_iter()
+                            .map(|(id, mut driver)| {
+                                let events = driver.tick(&fleet, &mut SharedAgentAccess(&agent));
+                                (id, driver, events)
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .await;
+                let Ok(()) = this.update(cx, |this, cx| {
+                    for (id, mut driver, events) in ticked {
+                        // Every run collected here can block on a permission,
+                        // not only one a view shows.
+                        if let Some(request) = driver.status().permission {
+                            crate::ui::agent_permission::queue_permission_request(
+                                this.agent.clone(),
+                                request,
+                            );
+                        }
+                        for event in events {
+                            if let tod_core::conversation::ConversationEvent::Notice(notice) = event {
+                                tracing::warn!("conversation notice: {notice:?}");
+                            }
+                        }
+                        if this.take_cancel(id)
+                            && let Err(err) =
+                                driver.cancel(&this.fleet, &mut SharedAgentAccess(&this.agent))
+                        {
+                            tracing::warn!("stopping a conversation failed: {err:#}");
+                        }
+                        this.put_back(id, driver);
+                    }
+                    cx.notify();
+                }) else {
+                    break;
+                };
+            }
+        }));
     }
 
     pub fn fleet(&self) -> &Arc<FleetStore> {
@@ -196,7 +264,6 @@ impl AgentRuns {
         Some((slot.id, driver))
     }
 
-    #[cfg(test)]
     /// Every slot with a turn in flight, taken to be ticked off the main
     /// thread; [`AgentRuns::put_back`] returns each one.
     pub fn take_running(&mut self) -> Vec<(u64, ConversationDriver)> {
@@ -213,7 +280,6 @@ impl AgentRuns {
         }
     }
 
-    #[cfg(test)]
     /// Take, and clear, the slot `id`'s cancel flag.
     pub fn take_cancel(&mut self, id: u64) -> bool {
         self.slots
@@ -882,6 +948,53 @@ mod tests {
 
     fn mock_agent() -> SharedAgent {
         Arc::new(Mutex::new(Box::new(MockAgentProvider::new())))
+    }
+
+    /// A finished turn is collected by the registry's own poll loop: nothing
+    /// else ticks a driver, so without it a reply is never stored and the
+    /// conversation reads as working forever.
+    #[gpui::test]
+    fn the_poll_loop_collects_a_finished_turn(cx: &mut TestAppContext) {
+        let fixture = Fixture::new();
+        tod_store::paths::set_data_root(fixture.store.paths().root().to_path_buf());
+        let conversation_id = Uuid::new_v4();
+        fixture
+            .store
+            .interview(
+                tod_store::interview::ACTOR_USER,
+                tod_store::interview::InterviewCommand::CreateConversation {
+                    id: conversation_id,
+                    focus: Focus::Node(fixture.node_id),
+                    protocol: ProtocolKind::Outline,
+                    platform: None,
+                    model: None,
+                    effort: None,
+                },
+            )
+            .unwrap();
+        let registry = cx.new(|cx| {
+            let mut runs = AgentRuns::new(fixture.store.clone(), mock_agent());
+            runs.start_polling(cx);
+            runs
+        });
+        registry.update(cx, |registry, cx| {
+            registry.ensure_for_conversation(conversation_id).unwrap();
+            assert!(registry.send_to_conversation(conversation_id, "hello there", cx));
+        });
+        for _ in 0..40 {
+            cx.executor().advance_clock(POLL_INTERVAL * 2);
+            cx.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let turns = fixture
+            .store
+            .read(|conn| ConversationRepo::new(conn).turns(conversation_id))
+            .unwrap();
+        assert!(
+            turns.iter().any(|t| t.role != tod_store::conversation::TurnRole::User),
+            "the turn's outcome was never collected: {turns:?}"
+        );
+        assert!(!registry.read_with(cx, |r, _| r.status_at(0).unwrap().running));
     }
 
     /// A conversation a node's runner drives shows as running here, is never
