@@ -182,6 +182,7 @@ fn second_fleet_store_open_rejected_while_lock_held() {
         Ok(_) => panic!("expected second FleetStore::open to fail while lock held"),
     };
     match err {
+        FleetLaunchError::StorageInUse(path) => assert!(path.ends_with("tod.lock")),
         FleetLaunchError::Other(inner) => {
             assert!(
                 inner.downcast_ref::<FleetLockError>().is_some()

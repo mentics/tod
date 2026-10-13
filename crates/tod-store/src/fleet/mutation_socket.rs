@@ -23,13 +23,22 @@ use std::time::Duration;
 /// instance for longer than necessary. A file left behind by a hard crash is
 /// still possible and is handled by the client side (connect failure -> fall
 /// back to direct-open), not by anything here.
-/// Dropping it also stops the listener, which then releases its store.
-pub struct PortFileGuard(std::path::PathBuf, Arc<AtomicBool>);
+/// Dropping it also stops the listener and waits for it to release its
+/// store, so the store's lock is free once the guard is gone (a store
+/// reopened straight after would otherwise find it still held).
+pub struct PortFileGuard(
+    std::path::PathBuf,
+    Arc<AtomicBool>,
+    Option<std::thread::JoinHandle<()>>,
+);
 
 impl Drop for PortFileGuard {
     fn drop(&mut self) {
         self.1.store(true, Ordering::Relaxed);
         let _ = std::fs::remove_file(&self.0);
+        if let Some(listener) = self.2.take() {
+            let _ = listener.join();
+        }
     }
 }
 
@@ -47,13 +56,16 @@ pub fn start(store: Arc<FleetStore>, root: &std::path::Path) -> anyhow::Result<P
 
     let shutdown = Arc::new(AtomicBool::new(false));
     let accept_shutdown = shutdown.clone();
-    let guard = PortFileGuard(paths.mutation_port().to_path_buf(), shutdown.clone());
-    std::thread::Builder::new()
+    let listener = std::thread::Builder::new()
         .name("tod-mutation-socket".into())
         .spawn(move || listen_loop(listener, store, accept_shutdown))
         .map_err(|err| anyhow::anyhow!("spawn mutation socket thread: {err}"))?;
 
-    Ok(guard)
+    Ok(PortFileGuard(
+        paths.mutation_port().to_path_buf(),
+        shutdown,
+        Some(listener),
+    ))
 }
 
 fn listen_loop(listener: TcpListener, store: Arc<FleetStore>, shutdown: Arc<AtomicBool>) {
