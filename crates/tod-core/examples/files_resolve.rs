@@ -11,6 +11,7 @@ fn main() -> anyhow::Result<()> {
     tod_store::paths::set_data_root(root.clone());
     // The resident daemon holds the fleet lock; stop it (as the docs say a test must).
     println!("daemon quit: {:?}", tod_agentd_client::client::quit(&root));
+    tod_store::paths::set_data_root(root.clone());
     let fleet = FleetStore::open(&root)?;
     let id = node;
     let mut say = |m: &str| println!("  {m}");
