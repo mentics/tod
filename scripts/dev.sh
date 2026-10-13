@@ -7,6 +7,11 @@
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
+# Keep credentials in the encrypted file, not the OS keyring: an unsigned dev
+# binary is a new app to macOS after every build, so the keychain re-prompts.
+# Override with TOD_CREDENTIALS_BACKEND=keyring.
+export TOD_CREDENTIALS_BACKEND="${TOD_CREDENTIALS_BACKEND:-file}"
+
 cargo build --profile dev-fast -p tod -p tod-cli -p tod-sandbox-cli -p tod-zed-shim
 
 # The relay that runs inside each cloud sandbox: a static Linux binary,
