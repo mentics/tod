@@ -42,7 +42,10 @@ pub fn resolve_launch_cwd_with(
     node_id: &str,
     progress: &mut dyn FnMut(&str),
 ) -> Result<(Workdir, Vec<String>)> {
-    let files = resolve_files(fleet, node_id)?;
+    let mut files = resolve_files(fleet, node_id)?;
+    if forget_deleted_sandbox(fleet, &files, progress) {
+        files = resolve_files(fleet, node_id)?;
+    }
     match files.directory() {
         FilesDirectory::Ready(dir) => {
             // A submodule can lose the branch after the location was made (a
@@ -73,6 +76,34 @@ pub fn resolve_launch_cwd_with(
             make_location(fleet, &paths, &settings, node_id, progress)
         }
     }
+}
+
+/// A node's own sandbox can be deleted behind tod's back (by hand, or by
+/// Blaxel). When the control plane says it no longer exists, forget the
+/// location so the launch makes a fresh sandbox, which gets the agent's saved
+/// session logs back ([`make_sandbox`]). Any other answer (an error, no
+/// sign-in) leaves the location alone: only a definite "gone" recreates.
+/// Returns whether the location was forgotten.
+fn forget_deleted_sandbox(fleet: &FleetStore, files: &ResolvedFiles, progress: &mut dyn FnMut(&str)) -> bool {
+    let Some(location) = files.location.as_ref().filter(|_| files.per_node()) else {
+        return false;
+    };
+    let Some(name) = location.sandbox() else {
+        return false;
+    };
+    let gone = Sandboxes::load(fleet.paths().root())
+        .and_then(|sandboxes| sandboxes.blaxel())
+        .and_then(|bx| bx.get(name))
+        .is_ok_and(|info| info.is_none());
+    if !gone {
+        return false;
+    }
+    progress(&format!("sandbox {name} no longer exists; making a new one…"));
+    let forgotten = fleet
+        .enqueue(FleetMutation::DeleteFilesLocation { node_id: files.node_id.clone() })
+        .and_then(|_| fleet.writer().flush())
+        .is_ok();
+    forgotten && fleet.reload_if_stale().is_ok()
 }
 
 /// Where `node_id` launches, without making anything: `Ok(Some)` when ready,
