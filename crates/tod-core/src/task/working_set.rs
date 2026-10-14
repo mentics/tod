@@ -48,10 +48,19 @@ pub fn load_working_set(config_dir: &Path) -> ListWorkingSet {
             .map(|(id, gs)| {
                 (
                     id,
-                    GeneratorSubtreeSort {
-                        sort_key: parse_sort_key(&gs.sort_key),
-                        sort_direction: parse_sort_direction(&gs.sort_direction),
-                        filter_query: gs.filter_query,
+                    // A generator's row button only flips its configured sort
+                    // now; a key an older build cycled to would stick, so it
+                    // is dropped.
+                    match parse_sort_key(&gs.sort_key) {
+                        SortKey::TreeOrder => GeneratorSubtreeSort {
+                            sort_key: SortKey::TreeOrder,
+                            sort_direction: parse_sort_direction(&gs.sort_direction),
+                            filter_query: gs.filter_query,
+                        },
+                        _ => GeneratorSubtreeSort {
+                            filter_query: gs.filter_query,
+                            ..GeneratorSubtreeSort::default()
+                        },
                     },
                 )
             })
@@ -135,9 +144,17 @@ mod tests {
         ws.generator_sorts.insert(
             "gen-1".into(),
             GeneratorSubtreeSort {
-                sort_key: SortKey::Title,
+                sort_key: SortKey::TreeOrder,
                 sort_direction: SortDirection::Desc,
                 filter_query: "login".into(),
+            },
+        );
+        ws.generator_sorts.insert(
+            "gen-old".into(),
+            GeneratorSubtreeSort {
+                sort_key: SortKey::Title,
+                sort_direction: SortDirection::Desc,
+                filter_query: "keep".into(),
             },
         );
         save_working_set(&dir, &ws);
@@ -146,9 +163,15 @@ mod tests {
             .generator_sorts
             .get("gen-1")
             .expect("generator sort persisted");
-        assert_eq!(saved.sort_key, SortKey::Title);
+        assert_eq!(saved.sort_key, SortKey::TreeOrder);
         assert_eq!(saved.sort_direction, SortDirection::Desc);
         assert_eq!(saved.filter_query, "login");
+        // A key an older build cycled to would stick now the button only
+        // flips direction: it is dropped, the filter kept.
+        let old = &loaded.generator_sorts["gen-old"];
+        assert_eq!(old.sort_key, SortKey::TreeOrder);
+        assert_eq!(old.sort_direction, SortDirection::Asc);
+        assert_eq!(old.filter_query, "keep");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

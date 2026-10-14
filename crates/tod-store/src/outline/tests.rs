@@ -1876,6 +1876,44 @@ fn tree_row(store: &FleetStore, list_id: Uuid, node_id: Uuid) -> crate::outline:
 }
 
 #[test]
+fn tree_rows_carry_a_tickets_metadata_and_its_generators_sort() {
+    let (store, root, list_id) = setup_store_with_list();
+    let generator_id = create_node_in(&store, list_id, None, "Linear");
+    ensure_generator(&store, generator_id, "linear");
+    store
+        .enqueue_outline(OutlineMutation::SetGeneratorConfig {
+            node_id: generator_id,
+            data_source_type: "linear".into(),
+            config_json: r#"{"sort_query":"priority, updatedAt desc"}"#.into(),
+        })
+        .unwrap();
+    let managed_id = Uuid::new_v4();
+    store
+        .enqueue_outline(OutlineMutation::CreateManagedNode {
+            node_id: Some(managed_id),
+            list_id,
+            parent_id: generator_id,
+            title: "Fix it".into(),
+            external_id: "TOD-7".into(),
+            tags: vec![],
+            body: String::new(),
+            metadata: Some(serde_json::json!({"priority": "High", "updatedAt": "2026-01-02T03:04:05Z"})),
+        })
+        .unwrap();
+    store.writer().flush().unwrap();
+
+    let generator = tree_row(&store, list_id, generator_id);
+    assert_eq!(generator.generator_sort.as_deref(), Some("priority, updatedAt desc"));
+    assert!(generator.metadata.is_none());
+    let ticket = tree_row(&store, list_id, managed_id);
+    let metadata = ticket.metadata.expect("a ticket row carries its metadata");
+    assert_eq!(metadata["priority"], "High");
+    assert_eq!(metadata["updatedAt"], "2026-01-02T03:04:05Z");
+    assert!(ticket.generator_sort.is_none());
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn deleting_generator_keeps_copies_their_titles_and_tickets() {
     let (store, root, list_id) = setup_store_with_list();
     let (generator_id, managed_id, _child_id) = setup_generator_with_managed_tree(&store, list_id);

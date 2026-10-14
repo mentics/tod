@@ -5,6 +5,7 @@ use crate::outline::uuid_blob::{blob_to_uuid_sql, ms_to_datetime, uuid_to_blob};
 use anyhow::Result;
 use rusqlite::{Connection, params};
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use uuid::Uuid;
 
 pub struct TreeLoader<'a> {
@@ -75,6 +76,10 @@ struct TreeData {
     generated: HashSet<String>,
     /// Nodes whose ticket is in a terminal state, from their synced metadata.
     ticket_terminal: HashSet<Uuid>,
+    /// Each node's synced metadata, which a generator's sort reads.
+    metadata: HashMap<Uuid, Arc<serde_json::Value>>,
+    /// Generator node → the sort text of its config.
+    generator_sort: HashMap<Uuid, String>,
 }
 
 impl TreeData {
@@ -213,7 +218,7 @@ impl TreeData {
         drop(rows);
         drop(stmt);
 
-        let ticket_terminal = string_map(
+        let metadata: HashMap<Uuid, Arc<serde_json::Value>> = string_map(
             conn,
             &list_blob,
             "SELECT x.node_id, x.body
@@ -221,12 +226,34 @@ impl TreeData {
              WHERE e.list_id = ?1 AND x.content_type = 'metadata'",
         )?
         .into_iter()
-        .filter(|(_, body)| {
-            serde_json::from_str::<serde_json::Value>(body)
-                .is_ok_and(|meta| crate::outline::types::ticket_is_terminal(&meta))
-        })
-        .map(|(id, _)| id)
+        .filter_map(|(id, body)| Some((id, Arc::new(serde_json::from_str(&body).ok()?))))
         .collect();
+        let ticket_terminal = metadata
+            .iter()
+            .filter(|(_, meta)| crate::outline::types::ticket_is_terminal(meta))
+            .map(|(id, _)| *id)
+            .collect();
+
+        let mut generator_sort = HashMap::new();
+        let mut stmt = conn.prepare(
+            "SELECT g.node_id, g.config_json
+             FROM node_generator_config g JOIN outline_entries e ON e.node_id = g.node_id
+             WHERE e.list_id = ?1",
+        )?;
+        let mut rows = stmt.query(params![list_blob])?;
+        while let Some(row) = rows.next()? {
+            let id_blob: Vec<u8> = row.get(0)?;
+            let config: String = row.get(1)?;
+            let sort = serde_json::from_str::<serde_json::Value>(&config)
+                .ok()
+                .and_then(|c| c.get("sort_query").and_then(|v| v.as_str()).map(str::to_string))
+                .filter(|text| !text.trim().is_empty());
+            if let Some(sort) = sort {
+                generator_sort.insert(blob_to_uuid_sql(&id_blob)?, sort);
+            }
+        }
+        drop(rows);
+        drop(stmt);
 
         Ok(Self {
             nodes,
@@ -242,6 +269,8 @@ impl TreeData {
             copied,
             generated,
             ticket_terminal,
+            metadata,
+            generator_sort,
         })
     }
 
@@ -382,6 +411,13 @@ fn walk(
             linked_copy,
             has_copies,
             ticket_terminal: ticket.is_some() && data.ticket_terminal.contains(&entry.node_id),
+            // Only a ticket's own metadata: it is what a generator's sort reads.
+            metadata: if ticket.is_some() || link.is_some() {
+                data.metadata.get(&entry.node_id).cloned()
+            } else {
+                None
+            },
+            generator_sort: data.generator_sort.get(&entry.node_id).cloned(),
         });
         if include_collapsed || !entry.collapsed {
             let generator = if data.is_generator(entry.node_id) {
