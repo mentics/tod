@@ -155,6 +155,9 @@ fn now_ms() -> i64 {
 #[derive(Debug, Default, Clone)]
 struct RunnerLine {
     lifecycle: String,
+    /// The node's Files capability puts its work in a cloud sandbox, so
+    /// running it in the cloud is the default.
+    files_in_sandbox: bool,
     waiting_since: Option<i64>,
     /// `(slot id, ms)`: the running slot and when it was first seen running.
     run_since: Option<(u64, i64)>,
@@ -173,6 +176,9 @@ struct RunnerLine {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RunnerAction {
     Start,
+    /// Start the autopilot on this machine for a node whose files are in
+    /// the cloud: it stops when the app closes.
+    StartHere,
     Resume,
     ResumeFreshBudget,
     Pause,
@@ -188,6 +194,7 @@ impl RunnerAction {
     fn label(self) -> &'static str {
         match self {
             Self::Start => "Start",
+            Self::StartHere => "Run on this machine (stops when the app closes)",
             Self::Resume => "Resume",
             Self::ResumeFreshBudget => "Resume with a fresh budget",
             Self::Pause => "Pause",
@@ -210,7 +217,7 @@ struct RunnerActions {
 
 /// The node's lifecycle state, how long it has waited on the user, and
 /// whether it runs in the cloud.
-fn load_runner(fleet: &FleetStore, node_id: Uuid) -> (String, Option<i64>, Option<CloudNode>) {
+fn load_runner(fleet: &FleetStore, node_id: Uuid) -> (String, Option<i64>, Option<CloudNode>, bool) {
     let lifecycle = fleet
         .get_node(&node_id.to_string())
         .ok()
@@ -222,7 +229,12 @@ fn load_runner(fleet: &FleetStore, node_id: Uuid) -> (String, Option<i64>, Optio
         .ok()
         .and_then(|a| a.waiting_since);
     let cloud = tod_core::cloud_sync::cloud_node(fleet, &node_id.to_string());
-    (lifecycle, waiting_since, cloud)
+    let files_in_sandbox = fleet
+        .resolve_files_for_node(&node_id.to_string())
+        .ok()
+        .flatten()
+        .is_some_and(|files| files.runs_in_sandbox());
+    (lifecycle, waiting_since, cloud, files_in_sandbox)
 }
 
 pub struct TaskPanel {
@@ -526,7 +538,7 @@ impl TaskPanel {
         let fleet = self.fleet.clone();
         let node_id = self.node_id;
         cx.spawn(async move |this, cx| {
-            let (lifecycle, waiting_since, cloud) = cx
+            let (lifecycle, waiting_since, cloud, files_in_sandbox) = cx
                 .background_executor()
                 .spawn(async move { load_runner(&fleet, node_id) })
                 .await;
@@ -535,6 +547,7 @@ impl TaskPanel {
                     this.runner.lifecycle = lifecycle;
                     this.runner.waiting_since = waiting_since;
                     this.runner.cloud = cloud;
+                    this.runner.files_in_sandbox = files_in_sandbox;
                     cx.notify();
                 }
             });
@@ -675,6 +688,12 @@ impl TaskPanel {
                 primary: Some((A::Resume, A::Resume.label(), false)),
                 menu: vec![A::ResumeFreshBudget, A::RunInCloud],
             },
+            // Its files are in the cloud, so its work belongs there: a run on
+            // this machine would stop with the app.
+            _ if self.runner.files_in_sandbox => RunnerActions {
+                primary: Some((A::RunInCloud, A::RunInCloud.label(), false)),
+                menu: vec![A::StartHere],
+            },
             _ => RunnerActions {
                 primary: Some((A::Start, A::Start.label(), false)),
                 menu: vec![A::RunInCloud],
@@ -724,7 +743,7 @@ impl TaskPanel {
             presented,
         );
         match action {
-            A::Start | A::Resume => {
+            A::Start | A::StartHere | A::Resume => {
                 let _ = self.runners.update(cx, |r, cx| r.start(node, false, cx));
             }
             A::ResumeFreshBudget => {
@@ -907,6 +926,21 @@ impl TaskPanel {
             line = line.child(sep()).child(style::text_muted(div().flex_1().min_w_0()).child(
                 selectable_text("unified-task-runner-cloud", text, window, cx),
             ));
+            // What the supervisor has left in the synced data: a request
+            // waiting on the user, or the node finished. Nothing else of
+            // its progress is known here between syncs.
+            match &status {
+                RunnerStatus::Waiting { .. } => {
+                    line = line.child(sep()).child(
+                        style::text_muted(div().flex_none())
+                            .child(format!("waiting on you {}", elapsed.clone().unwrap_or_default())),
+                    );
+                }
+                RunnerStatus::Done => {
+                    line = line.child(sep()).child(style::text_muted(div().flex_none()).child("done"));
+                }
+                _ => {}
+            }
         } else {
             match &status {
                 RunnerStatus::Running { activity, tokens, .. } => {

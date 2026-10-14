@@ -282,6 +282,17 @@ without it, so leave it unset there, or the base sits unused. See
 
 ## Running a node in the cloud without the window
 
+The cloud checks the repository out from an HTTPS URL. The node's Files
+directory may be that URL, a checkout on this machine (its `origin`, made
+HTTPS), or a path inside the node's own sandbox or the sandbox it forks
+(`git remote get-url origin` run there; `cloud_sync::origin_url_of`). When none
+yields an HTTPS URL, "Run in the cloud" fails before any network call and says
+what was tried and what to set instead.
+
+The daemon (`tod-agentd`) logs through `tracing` to stderr, which is
+`<data root>/daemon/agentd.log` (`RUST_LOG` sets the level, default info): the
+startup sync and the live-notify subscription report there.
+
 `cargo run -p tod-core --example cloud_dev -- <data_root> run <node>` does
 what the app's "Run in the cloud" does (`cloud_sync::run_in_cloud`): seed the
 orchestrator, create the node's sandbox with its proxy rules, install the

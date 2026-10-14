@@ -207,3 +207,19 @@ fn the_app_and_the_orchestrator_converge() {
     }
 }
 
+#[test]
+fn the_origin_comes_from_the_checkout_or_the_error_says_what_was_tried() {
+    let root = temp_root("origin-url");
+    let fleet = FleetStore::open(&root).unwrap();
+    let repo = root.join("checkout");
+    std::fs::create_dir_all(&repo).unwrap();
+    let git = |args: &[&str]| {
+        assert!(std::process::Command::new("git").arg("-C").arg(&repo).args(args).status().unwrap().success());
+    };
+    git(&["init", "-q"]);
+    git(&["remote", "add", "origin", "git@github.com:owner/repo.git"]);
+    let url = origin_url_of(&fleet, "n", repo.to_str().unwrap()).unwrap();
+    assert_eq!(url, "https://github.com/owner/repo.git");
+    let err = origin_url_of(&fleet, "n", "/workspace/not-here").unwrap_err().to_string();
+    assert!(err.contains("not a checkout on this machine") && err.contains("https://github.com/owner/repo"), "{err}");
+}

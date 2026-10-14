@@ -56,6 +56,11 @@ enum UiRequest {
     /// Yield one frame so layout/paint after input is visible to `shot`.
     Sync,
     Quit,
+    /// What the window's close button does: the close guard runs.
+    Close,
+    /// A synthetic mouse click through GPUI (platforms without a native path).
+    #[cfg(not(windows))]
+    Click { x: f32, y: f32, right: bool },
     Transcripts(TranscriptsCommand),
     AgentPlatform(AgentPlatformSocketCommand),
 }
@@ -155,10 +160,14 @@ fn handle_client(
             }
             Ok(Command::Key { keystroke }) => dispatch_ui(&tx, UiRequest::Key(keystroke)),
             Ok(Command::Text { text }) => dispatch_ui(&tx, UiRequest::Text(text)),
+            #[cfg(windows)]
             Ok(Command::Click { x, y, right }) => {
                 capture::send_click(x, y, logical_width, logical_height, right)
                     .map(|()| "ok".to_string())
             }
+            #[cfg(not(windows))]
+            Ok(Command::Click { x, y, right }) => dispatch_ui(&tx, UiRequest::Click { x, y, right }),
+            Ok(Command::Close) => dispatch_ui(&tx, UiRequest::Close),
             Ok(Command::Drag { from, to }) => {
                 capture::send_drag(from, to, logical_width, logical_height)
                     .map(|()| "ok".to_string())
@@ -256,6 +265,33 @@ fn handle_ui_request(
                 }
                 "ok".to_string()
             })),
+        UiRequest::Close => window
+            .update(cx, |_root, window, cx| {
+                let allowed = crate::app::window::request_close(window, cx);
+                if allowed { window.remove_window(); "ok closed".to_string() } else { "ok blocked".to_string() }
+            })
+            .map_err(|e| format!("close failed: {e}")),
+        #[cfg(not(windows))]
+        UiRequest::Click { x, y, right } => window
+            .update(cx, |_root, window, cx| {
+                use gpui::{px, point, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PlatformInput};
+                let position = point(px(x), px(y));
+                let button = if right { MouseButton::Right } else { MouseButton::Left };
+                window.dispatch_event(
+                    PlatformInput::MouseMove(MouseMoveEvent { position, pressed_button: None, modifiers: Modifiers::default() }),
+                    cx,
+                );
+                window.dispatch_event(
+                    PlatformInput::MouseDown(MouseDownEvent { button, position, modifiers: Modifiers::default(), click_count: 1, first_mouse: false }),
+                    cx,
+                );
+                window.dispatch_event(
+                    PlatformInput::MouseUp(MouseUpEvent { button, position, modifiers: Modifiers::default(), click_count: 1 }),
+                    cx,
+                );
+                "ok".to_string()
+            })
+            .map_err(|e| format!("click failed: {e}")),
         UiRequest::Key(keystroke) => apply_key(cx, window, keystroke).map(|()| "ok".into()),
         UiRequest::Text(text) => apply_text(cx, window, text).map(|()| "ok".into()),
         UiRequest::Transcripts(action) => apply_transcripts(cx, transcript_window, action),

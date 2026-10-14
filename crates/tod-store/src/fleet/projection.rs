@@ -78,6 +78,19 @@ impl FleetProjection {
         Ok(true)
     }
 
+    /// Reload when another connection has committed since this projection
+    /// last read (`PRAGMA data_version` on the connection it already holds:
+    /// no file is opened, so this is cheap enough to run on a short tick).
+    /// Announces the change like any reload.
+    pub fn reload_on_external_commit(&mut self) -> Result<bool> {
+        let current = read_data_version(&self.conn.lock().expect("projection connection mutex"))?;
+        if current == self.data_version {
+            return Ok(false);
+        }
+        self.reload()?;
+        Ok(true)
+    }
+
     /// Force reload from disk (e.g. after writer commit notification).
     pub fn reload(&mut self) -> Result<()> {
         let conn = schema::open_read_connection(&self.db_path)?;
@@ -160,7 +173,17 @@ pub fn spawn_commit_reloader(
                             }
                         }
                     }
-                    _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => {}
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => {
+                        // A write that came from another connection with no
+                        // commit notice (a sync applying the orchestrator's
+                        // changes, a `tod-cli` run straight on the file)
+                        // still has to reach the views.
+                        if let Ok(mut guard) = projection.lock() {
+                            if let Err(err) = guard.reload_on_external_commit() {
+                                tracing::error!("fleet projection external-change check failed: {err:#}");
+                            }
+                        }
+                    }
                 }
             }
         });
@@ -186,6 +209,19 @@ mod tests {
         .unwrap();
         let projection = FleetProjection::open(&path).unwrap();
         (dir, writer, projection)
+    }
+
+    #[test]
+    fn an_external_commit_reloads_and_announces_once() {
+        let (dir, _writer, mut projection) = temp_projection();
+        let mut rx = projection.subscribe();
+        assert!(!projection.reload_on_external_commit().unwrap());
+        let other = rusqlite::Connection::open(dir.join("tod.db")).unwrap();
+        other.execute_batch("CREATE TABLE IF NOT EXISTS external_probe (x INTEGER)").unwrap();
+        assert!(projection.reload_on_external_commit().unwrap());
+        assert!(rx.try_recv().is_ok());
+        assert!(!projection.reload_on_external_commit().unwrap());
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]

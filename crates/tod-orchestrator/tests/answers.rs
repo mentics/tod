@@ -101,13 +101,14 @@ fn an_answered_stop_question_pokes_its_node() {
         assert_eq!(resp.status, 200, "{}", String::from_utf8_lossy(&resp.body));
     };
 
-    // An agent's question: not the orchestrator's business.
+    // An agent's question stopped its run (`needs_human`, no wake scheduled):
+    // the answer must poke the node too.
     answer_and_post(other);
-    assert!(poked.lock().unwrap().is_empty());
-
-    // The supervisor's: the node is poked to act on it.
-    answer_and_post(stop);
     assert_eq!(*poked.lock().unwrap(), ["node-a"]);
+
+    // The supervisor's own stop question likewise.
+    answer_and_post(stop);
+    assert_eq!(*poked.lock().unwrap(), ["node-a", "node-a"]);
 
     drop(fleet);
     let _ = std::fs::remove_dir_all(&base);

@@ -45,6 +45,9 @@ struct Shared {
 /// Run the daemon for `data_root` until told to quit. `Ok(false)` when
 /// another daemon already holds the data root (this one exits quietly).
 pub fn run(data_root: &Path) -> Result<bool> {
+    // This process has no log directory: its tracing goes to stderr, which
+    // the starter files in `agentd.log`.
+    tod_core::logging::init_stderr();
     let paths = Paths::new(data_root);
     std::fs::create_dir_all(paths.dir()).with_context(|| format!("create {}", paths.dir().display()))?;
     let lock = std::fs::OpenOptions::new()

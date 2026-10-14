@@ -115,7 +115,15 @@ run's conversation shows in `AgentRuns` as hosted elsewhere, so the tree's
 status labels and the close-window warning see it and nothing else sends to
 it.
 
-**Closing the app** stops a local run where it is. It is started again when
+**Where the work should run.** A node whose Files capability is a cloud
+sandbox gets **Run in the cloud** as its default action, with **Run on this
+machine** in the menu: a run here stops when the app closes, a run in the cloud
+does not. A node running in the cloud shows `in the cloud (sandbox …)` and, from
+what has synced, `waiting on you` or `done`.
+
+**Closing the app** stops a local run where it is, and the close warning is red
+for it. A node running in the cloud is listed in the warning as continuing, which
+is yellow; it does not stop. It is started again when
 the app next opens, and reopens the conversation it was in; a paused or
 stopped run is left as it was.
 

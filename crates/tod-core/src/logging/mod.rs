@@ -101,6 +101,18 @@ pub fn init(config: InitConfig) -> Result<()> {
     Ok(())
 }
 
+/// Tracing for a process with no log directory of its own: plain lines on
+/// stderr (`RUST_LOG`, default `info`). The resident `tod-agentd` uses it, so
+/// the warnings from the cloud sync, notices and runners it hosts reach its
+/// `daemon/agentd.log` instead of vanishing. A second install is a no-op.
+pub fn init_stderr() {
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let _ = tracing_subscriber::registry()
+        .with(filter)
+        .with(tracing_subscriber::fmt::layer().with_ansi(false).with_writer(std::io::stderr))
+        .try_init();
+}
+
 pub fn cli_level_locked() -> bool {
     CLI_LEVEL_LOCKED.load(Ordering::Relaxed)
 }

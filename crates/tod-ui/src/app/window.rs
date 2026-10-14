@@ -114,6 +114,23 @@ pub struct Shell {
     _unified_nav_subscription: Subscription,
 }
 
+/// What the window's close request runs (the close guard), kept so the
+/// dev agent socket's `close` can do exactly what the close button does.
+#[cfg(feature = "agent-socket")]
+struct CloseHook(std::rc::Rc<dyn Fn(&mut Window, &mut App) -> bool>);
+#[cfg(feature = "agent-socket")]
+impl gpui::Global for CloseHook {}
+
+/// Ask the window to close as its close button would; `true` when it may.
+#[cfg(feature = "agent-socket")]
+pub fn request_close(window: &mut Window, cx: &mut App) -> bool {
+    let hook = cx.try_global::<CloseHook>().map(|h| h.0.clone());
+    match hook {
+        Some(hook) => hook(window, cx),
+        None => true,
+    }
+}
+
 /// Human-readable summary of background work that would be lost if the
 /// window closed right now: agents mid-run, split by whether closing the app
 /// cuts them off or the resident daemon keeps them running.
@@ -145,8 +162,27 @@ fn collect_running_work(
             }
         }
     }
-    let (affected, continuing) = agent_runs.read(cx).running_work_split();
+    let (affected, mut continuing) = agent_runs.read(cx).running_work_split();
     items.extend(affected.into_iter().map(SharedString::from));
+    // A node handed to the cloud is run by its supervisor in its own
+    // sandbox, so closing the app does not touch it. One whose sandbox is
+    // gone is waiting for the app anyway.
+    if let Ok(rows) = fleet.read(tod_store::cloud_nodes::list) {
+        for row in rows.into_iter().filter(|row| row.lost_at.is_none()) {
+            let node_id = row.node_id.to_string();
+            let Ok(Some(node)) = fleet.get_node(&node_id) else { continue };
+            if node.lifecycle == "done" {
+                continue;
+            }
+            let title = fleet
+                .get_task(&node_id)
+                .ok()
+                .flatten()
+                .map(|t| t.title)
+                .unwrap_or(node_id);
+            continuing.push(format!("{title}: running in the cloud"));
+        }
+    }
     crate::ui::toast::CloseGuardWork {
         affected: items,
         continuing: continuing.into_iter().map(SharedString::from).collect(),
@@ -1402,7 +1438,7 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                         });
                         let fleet_for_close = fleet.clone();
                         let agent_runs_for_close = agent_runs.clone();
-                        window.on_window_should_close(cx, move |window, cx| {
+                        let should_close: std::rc::Rc<dyn Fn(&mut Window, &mut App) -> bool> = std::rc::Rc::new(move |window: &mut Window, cx: &mut App| {
                             let running = collect_running_work(&fleet_for_close, &agent_runs_for_close, cx);
                             if running.is_empty() {
                                 persist_window_geometry(window, &paths_for_geometry);
@@ -1427,6 +1463,9 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                 false
                             }
                         });
+                        #[cfg(feature = "agent-socket")]
+                        cx.set_global(CloseHook(should_close.clone()));
+                        window.on_window_should_close(cx, move |window, cx| should_close(window, cx));
                         // The app opens on the workbench with keys on the
                         // node tree, whatever took focus while the views
                         // were being built.

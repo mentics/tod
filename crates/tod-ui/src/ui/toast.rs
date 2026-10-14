@@ -262,7 +262,8 @@ pub fn confirm_toast(
 pub struct CloseGuardWork {
     /// Cancelled, blocked, or otherwise affected by closing the app.
     pub affected: Vec<SharedString>,
-    /// Hosted by the resident daemon, so it carries on with the app closed.
+    /// Hosted by the resident daemon or running in a cloud sandbox, so it
+    /// carries on with the app closed.
     pub continuing: Vec<SharedString>,
 }
 

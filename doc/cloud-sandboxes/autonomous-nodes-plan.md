@@ -46,6 +46,10 @@ The facts that shape the plan:
 - **Credentials** (`tod_store::CredentialStore`) already hold the user's
   GitHub token and Linear key.
 
+**Status (October 2026): every item below (W1–W16) is built and was verified on
+the development workspace; the design's "To verify" lists the measurements
+and what is still unmeasured.** The waves are kept as the build order.
+
 ## Milestones
 
 1. **One node, start to finish, app closed** (waves 1–3): accept a node, it
@@ -154,7 +158,7 @@ The facts that shape the plan:
 - Runs `Autopilot` (W3) for its node in the sandbox, with the agent started
   locally (Claude Code through `claude-code-acp`, the subscription token in
   its environment). Its `tod-cli` is the shim, so every write goes to the
-  orchestrator; it keeps no database of its own.
+  orchestrator; it keeps a copy of the user's database for its node (`/var/lib/tod-supervisor/<node>`), seeded from the orchestrator and pushed back after each step (see the design, `tod-cli` in an agent sandbox).
 - Holds the sandbox awake through the relay's lease while it works (W4);
   when the agent records a wait, schedules the wake (W7), releases the hold,
   and exits. `tod-supervisor wake` (from a schedule or a poke) asks what it

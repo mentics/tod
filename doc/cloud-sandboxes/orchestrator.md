@@ -44,13 +44,15 @@ from the app are applied without being logged again, so they are not echoed.
 
 After an apply, three handlers look at what arrived. `impact_handler.rs` marks
 the running cloud nodes whose context the changes affect and pokes them.
-`answers.rs` pokes a cloud node when the changes answer one of its **stop
-questions** (`tod_core::stop_questions`): the decisions the node's
+`answers.rs` pokes a cloud node when the changes answer **any** decision on it
+(`DecisionRepo::get` gives the decision's node): the agent's own question as
+well as the **stop questions** (`tod_core::stop_questions`) the node's
 supervisor asks after repeated agent failures (`supervisor:failures`) or a
 spent budget (`supervisor:budget`), and the watchdog's flag (`watchdog`),
-each marked by the decision's `protocol` column. Decisions are otherwise not
-context (`tod_core::impact::IGNORED_TABLES`), so an answer to any other
-decision pokes nothing. On waking, the supervisor reads the node's latest
+each marked by the decision's `protocol` column. An answer to the agent's
+question wakes the node so the agent sees it; the other decision tables are
+still not context (`tod_core::impact::IGNORED_TABLES`), so the poke comes
+from `answers.rs`, not the impact handler. On waking, the supervisor reads the node's latest
 stop question: "Keep going" / "Wake it again" carries on (after a spent
 budget, with another budget of the same size); "Leave it stopped" / "Leave
 it asleep" leaves it stopped, asking nothing and scheduling no wake, until

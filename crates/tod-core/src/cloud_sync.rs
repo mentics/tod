@@ -142,7 +142,7 @@ pub fn cloud_node(fleet: &FleetStore, node_id: &str) -> Option<CloudNode> {
 /// "Sync now" and [`run_in_cloud`] from overlapping one.
 static SYNC_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-fn sync_lock() -> std::sync::MutexGuard<'static, ()> {
+pub(crate) fn sync_lock() -> std::sync::MutexGuard<'static, ()> {
     SYNC_LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
@@ -527,6 +527,57 @@ pub(crate) fn environment_credentials(
     fleet.read(|conn| tod_store::environment::sandbox_credentials(conn, creds, node))
 }
 
+/// The HTTPS origin of a node whose Files directory is not a URL: a checkout
+/// on this machine says it itself; a path inside a cloud sandbox (Files →
+/// Runs in → Cloud sandbox) is asked in the node's own sandbox, else in the
+/// sandbox its files are forked from. The error says what to set instead.
+fn origin_url_of(fleet: &FleetStore, node_id: &str, repo: &str) -> Result<String> {
+    let mut tried: Vec<String> = Vec::new();
+    if std::path::Path::new(repo).is_dir() {
+        let out = std::process::Command::new("git")
+            .args(["-C", repo, "remote", "get-url", "origin"])
+            .output()
+            .context("run git")?;
+        let remote = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if let Some(url) = https_repo_url(&remote) {
+            return Ok(url);
+        }
+        tried.push(format!("the checkout at {repo} has origin {remote:?}"));
+    } else {
+        let mut sandboxes: Vec<String> = Vec::new();
+        if let Ok(Some(loc)) = fleet.read(|conn| tod_store::fleet::repos::files_location::FilesLocationRepo::new(conn).get(node_id)) {
+            sandboxes.extend(loc.sandbox().map(str::to_string));
+        }
+        if let Ok(Some(files)) = fleet.resolve_files_for_node(node_id)
+            && let Some(dev) = files.dev_container
+            && let tod_store::fleet::SandboxFrom::Fork(name) = dev.sandbox_from
+            && !name.trim().is_empty()
+        {
+            sandboxes.push(name.trim().to_string());
+        }
+        for name in sandboxes {
+            let found = tod_store::fleet::sandbox::SandboxExec::new(&name)
+                .output(repo, "git", &["remote", "get-url", "origin"])
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+            match found {
+                Some(remote) => match https_repo_url(&remote) {
+                    Some(url) => return Ok(url),
+                    None => tried.push(format!("sandbox {name} has origin {remote:?} at {repo}")),
+                },
+                None => tried.push(format!("sandbox {name} has no git origin at {repo}")),
+            }
+        }
+    }
+    let why = if tried.is_empty() { format!("{repo} is not a checkout on this machine") } else { tried.join("; ") };
+    bail!(
+        "no HTTPS repository URL for the cloud run ({why}); the cloud checks the repository out from its \
+         HTTPS URL, so set the Files directory to that URL (e.g. https://github.com/owner/repo) or to a \
+         checkout on this machine whose origin is on GitHub"
+    )
+}
+
 /// Where a node's code comes from: its repository as an HTTPS URL, and branch.
 fn node_source(fleet: &FleetStore, node_id: &str) -> Result<(tod_store::fleet::FleetTask, String, String)> {
     let task = fleet.get_node(node_id)?.ok_or_else(|| anyhow!("no node {node_id}"))?;
@@ -535,15 +586,7 @@ fn node_source(fleet: &FleetStore, node_id: &str) -> Result<(tod_store::fleet::F
     })?;
     let repo_url = match https_repo_url(&repo) {
         Some(url) => url,
-        None => {
-            let out = std::process::Command::new("git")
-                .args(["-C", &repo, "remote", "get-url", "origin"])
-                .output()
-                .context("run git")?;
-            let remote = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            https_repo_url(&remote)
-                .ok_or_else(|| anyhow!("{repo}: no HTTPS-reachable origin remote ({remote:?})"))?
-        }
+        None => origin_url_of(fleet, node_id, &repo)?,
     };
     let branch = task.branch.clone().filter(|b| !b.trim().is_empty()).unwrap_or_else(|| task.slug.clone());
     Ok((task, repo_url, branch))

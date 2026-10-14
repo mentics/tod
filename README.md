@@ -198,6 +198,7 @@ If the chosen port is already in use, startup fails immediately with a bind erro
 | `drag <x1> <y1> <x2> <y2>` | Press at the first coords, move to the second, release (drags a list row to a new place) |
 | `press` / `moveto` / `release` `<x> <y>` | The same gesture one step at a time, so a `shot` can catch what only exists mid-drag (a list's landing line) |
 | `sync` | Wait one UI frame |
+| `close` | Ask the window to close as the user would: the close guard runs (replies `ok blocked` while its toast is up). `click` also works on macOS. |
 | `quit` | Close every window, so the app quits as if the user closed it |
 | `shot <path>` | PNG screenshot of the window |
 

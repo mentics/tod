@@ -50,6 +50,8 @@ pub enum Command {
     Sync,
     /// Close every window, as the user would: the app then quits itself.
     Quit,
+    /// Ask the window to close, as its close button does (the close guard).
+    Close,
     Transcripts(TranscriptsCommand),
     AgentPlatform(AgentPlatformSocketCommand),
 }
@@ -155,6 +157,12 @@ pub fn parse_line(line: &str) -> Result<Command, String> {
             }
             Ok(Command::Quit)
         }
+        "close" => {
+            if parts.next().is_some() {
+                return Err("close takes no arguments".into());
+            }
+            Ok(Command::Close)
+        }
         "sync" => {
             if parts.next().is_some() {
                 return Err("sync takes no arguments".into());
@@ -221,6 +229,11 @@ fn parse_coord(raw: &str, name: &str) -> Result<f32, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_close() {
+        assert!(matches!(parse_line("close").unwrap(), Command::Close));
+    }
 
     #[test]
     fn parses_key_with_modifiers() {

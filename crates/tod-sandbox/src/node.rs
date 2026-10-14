@@ -559,6 +559,7 @@ pub fn install(bx: &Blaxel, url: &str, payload: &NodePayload, progress: &mut dyn
     if res.exit_code != 0 {
         bail!("installing tod-cli failed: {}", res.output());
     }
+    ensure_curl(bx, url, progress)?;
     ensure_claude_adapter(bx, url, progress)?;
     if !payload.bundles.is_empty() {
         progress(&format!("installing {} bundle files…", payload.bundles.len()));
@@ -697,6 +698,30 @@ fn claude_adapter_script() -> String {
 
 /// See [`claude_adapter_script`]. A sandbox that cannot have it still runs
 /// a node on the mock agent, so failing is only a warning.
+/// The poke that starts the supervisor, and every wake, runs `curl` in the
+/// sandbox, which Blaxel's own base image does not ship.
+fn ensure_curl(bx: &Blaxel, url: &str, progress: &mut dyn FnMut(&str)) -> Result<()> {
+    let check = bx.run(url, "command -v curl >/dev/null 2>&1", 30)?;
+    if check.exit_code == 0 {
+        return Ok(());
+    }
+    progress("installing curl (the image lacks it)…");
+    let res = bx.run(url, &format!("sh -c {} 2>&1", shell_quote(CURL_INSTALL_SCRIPT)), 300)?;
+    if res.exit_code != 0 {
+        bail!("installing curl failed (exit {}): {}", res.exit_code, res.output().trim());
+    }
+    Ok(())
+}
+
+/// Installs curl with whichever package manager the image has.
+const CURL_INSTALL_SCRIPT: &str = "set -e\n\
+    if command -v apk >/dev/null 2>&1; then apk add --no-cache curl ca-certificates\n\
+    elif command -v apt-get >/dev/null 2>&1; then apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq curl ca-certificates\n\
+    elif command -v dnf >/dev/null 2>&1; then dnf install -y curl\n\
+    elif command -v microdnf >/dev/null 2>&1; then microdnf install -y curl\n\
+    elif command -v yum >/dev/null 2>&1; then yum install -y curl\n\
+    else echo 'no package manager to install curl with'; exit 1; fi\n";
+
 fn ensure_claude_adapter(bx: &Blaxel, url: &str, progress: &mut dyn FnMut(&str)) -> Result<()> {
     let check = bx.run(url, "command -v claude-agent-acp >/dev/null 2>&1", 30)?;
     if check.exit_code == 0 {
@@ -741,6 +766,14 @@ pub fn poke_script() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn curl_install_script_covers_the_common_package_managers() {
+        for pm in ["apk add", "apt-get install", "dnf install", "microdnf install", "yum install"] {
+            assert!(CURL_INSTALL_SCRIPT.contains(pm), "{pm}");
+        }
+        assert!(CURL_INSTALL_SCRIPT.starts_with("set -e"));
+    }
 
     #[test]
     fn claude_adapter_script_names_the_adapter_package() {

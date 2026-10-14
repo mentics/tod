@@ -1,6 +1,6 @@
-//! What the orchestrator does when a client's changes answer one of the
-//! questions a node's supervisor or the watchdog asked
-//! (`tod_core::stop_questions`): poke the node's sandbox, so its supervisor
+//! What the orchestrator does when a client's changes answer a decision on a
+//! cloud node: one the supervisor or the watchdog asked
+//! (`tod_core::stop_questions`) or the node's own agent: poke the node's sandbox, so its supervisor
 //! wakes and acts on the answer (carries on, or stays stopped).
 //!
 //! Decisions are not context (`tod_core::impact::IGNORED_TABLES`), so this
@@ -25,14 +25,17 @@ pub fn record(conn: &Connection, changes: &[Change]) -> Result<Vec<CloudNodeRow>
         let Some(decision) = decode_hex(hex).and_then(|b| Uuid::from_slice(&b).ok()) else {
             continue;
         };
-        let Some(node) = tod_core::stop_questions::node_of(conn, decision)? else {
+        // Any decision on the node, not only the supervisor's own stop
+        // questions: an agent's question stops its run (`needs_human`), and
+        // nothing but this poke would carry the node on once it is answered.
+        let Some(node) = tod_store::decisions::DecisionRepo::new(conn).get(decision)?.map(|d| d.node_id) else {
             continue;
         };
         if out.iter().any(|r| r.node_id == node) {
             continue;
         }
         if let Some(row) = cloud_nodes::get(conn, node)? {
-            eprintln!("tod-orchestrator: stop question answered on node {node}");
+            eprintln!("tod-orchestrator: decision answered on node {node}");
             out.push(row);
         }
     }

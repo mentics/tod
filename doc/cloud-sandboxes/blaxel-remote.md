@@ -1,7 +1,7 @@
 # Blaxel sandboxes: reaching them from tod and Zed
 
-Status: design, backed by a working prototype (September 2026). Nothing here is
-in tod yet. The prototype lives in the git-ignored
+Status: built (September 2026): `tod-sandbox`, `tod-relay`, and `tod-zed-shim`
+implement it. The original prototype lives in the git-ignored
 `.local/agent/scratchpad/blaxel-spike/` of the `journeys-functionality-12b84f`
 worktree; see [Prototype](#prototype). Running a node's whole lifecycle in a
 sandbox with the app closed is designed in

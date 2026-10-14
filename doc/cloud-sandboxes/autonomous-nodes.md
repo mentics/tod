@@ -1,9 +1,34 @@
 # Autonomous nodes in cloud sandboxes
 
-Status: design (September 2026). Nothing here is built. It builds on the
-sandbox transport in [blaxel-remote.md](blaxel-remote.md) and the relay in
+Status: built and running on the development workspace (September–October
+2026): the supervisor (`tod-supervisor`), the orchestrator
+(`tod-orchestrator`), the watchdog, the app's sync and "Run in the cloud"
+(`tod_core::cloud_sync`), and node transcripts on Agent Drive. "To verify"
+records what was measured; the parts still unmeasured are named where they
+come up. It builds on the sandbox transport in
+[blaxel-remote.md](blaxel-remote.md) and the relay in
 [relay-protocol.md](relay-protocol.md). The work items are in
 [autonomous-nodes-plan.md](autonomous-nodes-plan.md).
+
+## Where a node runs, and closing the app
+
+Two different things share the word "cloud", and only one keeps working when
+the app closes:
+
+| The node's Files capability is… | The loop (the lifecycle autopilot) runs… | With the app closed |
+|---|---|---|
+| this machine, a worktree, a dev container | in the app | stops where it is; restarted at the next launch |
+| a cloud sandbox, and the node is **started** | in the app (only the agent's commands run in the sandbox) | stops, as above |
+| a cloud sandbox, and the node is **run in the cloud** | in the node's own sandbox, as the supervisor | **keeps going** until it is done or needs the user |
+
+Running in the cloud is a choice made on the node (the task panel's runner
+button: it is the default when the node's Files are a cloud sandbox, and "Run
+on this machine" is in its menu). Closing the app with such a node running
+shows the close warning in yellow ("running in the cloud"), never red, and
+closing goes ahead. On the next launch the app syncs (`sync_on_start`), so the
+node's lifecycle state, requests, and finished work are current when its panel
+is shown. The one thing that does need the app is replacing a sandbox that was
+lost while it was closed (see Where data lives).
 
 ## Goal
 
@@ -457,7 +482,9 @@ when a sandbox is lost is not mirrored. Moving these onto Agent Drive is not don
   Reaching it asks the user; it never just keeps going.
 - **The user's answer takes effect.** These questions, and the watchdog's
   flag, are decisions marked as stop questions (`tod_core::stop_questions`);
-  an answer syncs to the orchestrator, which pokes the node. "Keep going"
+  an answer syncs to the orchestrator, which pokes the node (so does the
+  answer to any decision the node's agent raised: its run stopped as
+  `needs_human` and schedules no wake of its own). "Keep going"
   resets the failure count or grants another budget of the same size;
   "Leave it stopped" / "Leave it asleep" keeps the node stopped with no
   wake scheduled until the user answers again. See `orchestrator.md`.
