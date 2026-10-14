@@ -209,6 +209,11 @@ pub struct FlatNodeRow {
     /// True when the node's ticket is in a terminal state (done or canceled),
     /// so its id is shown struck through.
     pub ticket_terminal: bool,
+    /// The synced metadata (`EXTRA_CONTENT_METADATA`) of a ticket node, which
+    /// a generator's sort reads (priority, state, dates, ...).
+    pub metadata: Option<std::sync::Arc<serde_json::Value>>,
+    /// The sort text (`sort_query`) of a generator node's config.
+    pub generator_sort: Option<String>,
 }
 
 /// Whether the ticket a node's metadata (`EXTRA_CONTENT_METADATA`) describes

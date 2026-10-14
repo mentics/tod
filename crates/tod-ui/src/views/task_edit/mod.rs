@@ -26,6 +26,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use tod_core::generator::ConfigFieldType;
 use tod_integration::linear_query::{self, Completion, SuggestionKind};
+use tod_integration::linear_sort;
 use tod_store::fleet::provision::locations_affected_by;
 use tod_store::fleet::repos::files_location::recipe_key;
 use tod_store::fleet::{
@@ -111,6 +112,7 @@ fn field_anchor_id(field: TaskEditField) -> &'static str {
         TaskEditField::GeneratorSource => "task-edit-field-gen-source",
         TaskEditField::GeneratorField(_) => "task-edit-field-gen-field",
         TaskEditField::LinearQuery => "task-edit-field-linear-query",
+        TaskEditField::LinearSort => "task-edit-field-linear-sort",
         TaskEditField::GeneratorRefresh => "task-edit-field-gen-refresh",
         TaskEditField::GeneratorAcceptDestination => "task-edit-field-gen-accept-dest",
         TaskEditField::GeneratorAcceptCapability(_) => "task-edit-field-gen-accept-cap",
@@ -193,6 +195,8 @@ enum TaskEditField {
     GeneratorField(usize),
     /// The Linear filter query editor.
     LinearQuery,
+    /// The Linear sort editor, under the filter query.
+    LinearSort,
     /// Generator "Refresh now" button.
     GeneratorRefresh,
     /// Quick-accept destination node slug.
@@ -274,6 +278,14 @@ impl GeneratorConfigField {
         )
     }
 
+    /// Whether this is the placeholder the Linear sort editor renders under.
+    fn is_linear_sort(&self) -> bool {
+        matches!(
+            &self.schema.field_type,
+            ConfigFieldType::Custom { type_hint, .. } if type_hint == LINEAR_SORT_FIELDS_HINT
+        )
+    }
+
     /// Trimmed contents of a `Text` / `TextArea` field; empty for the kinds
     /// that have no input.
     fn text_value(&self, cx: &App) -> String {
@@ -329,11 +341,120 @@ enum LinearPresetAction {
 
 /// Key context wrapping the query editor, so its dropdown keys win over
 /// the input's own while it has focus.
+/// Which text editor with a completion dropdown: the Linear filter query, or
+/// the sort beneath it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum QueryKind {
+    Filter,
+    Sort,
+}
+
+impl QueryKind {
+    fn field(self) -> TaskEditField {
+        match self {
+            Self::Filter => TaskEditField::LinearQuery,
+            Self::Sort => TaskEditField::LinearSort,
+        }
+    }
+
+    fn container_id(self) -> &'static str {
+        match self {
+            Self::Filter => "task-edit-linear-query",
+            Self::Sort => "task-edit-linear-sort",
+        }
+    }
+
+    fn dropdown_id(self) -> &'static str {
+        match self {
+            Self::Filter => "task-edit-linear-query-dropdown",
+            Self::Sort => "task-edit-linear-sort-dropdown",
+        }
+    }
+
+    fn suggestion_id(self) -> &'static str {
+        match self {
+            Self::Filter => "task-edit-linear-query-suggestion",
+            Self::Sort => "task-edit-linear-sort-suggestion",
+        }
+    }
+
+    fn status_id(self) -> &'static str {
+        match self {
+            Self::Filter => "task-edit-linear-query-status",
+            Self::Sort => "task-edit-linear-sort-status",
+        }
+    }
+}
+
+/// One text field that grows as it wraps, with the suggestions at its cursor.
+struct QueryEditor {
+    input: Entity<TextareaState>,
+    /// Text to put in `input` once a window is at hand.
+    pending: Option<String>,
+    /// The suggestions at the cursor, and the text and cursor they were
+    /// computed for.
+    completion: Completion,
+    completed_at: (String, usize),
+    /// The highlighted suggestion; `None` until the user moves to one, when
+    /// the completion does not preselect.
+    highlight: Option<usize>,
+    /// Escape hid the dropdown; editing the text, Down, or Ctrl+Space
+    /// brings it back.
+    dismissed: bool,
+    scroll: ScrollHandle,
+    _subscriptions: [Subscription; 2],
+}
+
+impl QueryEditor {
+    fn new(
+        kind: QueryKind,
+        placeholder: &'static str,
+        window: &mut Window,
+        cx: &mut Context<TaskEditView>,
+    ) -> Self {
+        let input = cx.new(|cx| {
+            TextareaState::new(window, cx)
+                .auto_grow(1, LINEAR_QUERY_MAX_ROWS)
+                .placeholder(placeholder)
+        });
+        let _subscriptions = [
+            cx.subscribe(&input, move |this, _, event, cx| {
+                if matches!(event, InputEvent::Change) {
+                    this.editor_mut(kind).dismissed = false;
+                }
+                this.refresh_query_completion(kind, cx);
+            }),
+            // Moving the cursor changes what may be typed there.
+            cx.observe(&input, move |this, _, cx| {
+                this.refresh_query_completion(kind, cx);
+            }),
+        ];
+        Self {
+            input,
+            pending: None,
+            completion: Completion::default(),
+            completed_at: (String::new(), usize::MAX),
+            highlight: None,
+            dismissed: false,
+            scroll: ScrollHandle::new(),
+            _subscriptions,
+        }
+    }
+
+    /// The text as typed (or as loaded, until render puts it in the input).
+    fn text(&self, cx: &App) -> String {
+        self.pending
+            .clone()
+            .unwrap_or_else(|| input_text(&self.input, cx))
+    }
+}
+
 const LINEAR_QUERY_CONTEXT: &str = "LinearQuery";
 /// The query field grows with its text up to this many rows, then scrolls.
 const LINEAR_QUERY_MAX_ROWS: usize = 6;
 
 const LINEAR_FILTER_FIELDS_HINT: &str = "linear_filter_fields";
+const LINEAR_SORT_FIELDS_HINT: &str = "linear_sort_fields";
 
 pub struct TaskEditView {
     fleet: Arc<FleetStore>,
@@ -458,21 +579,9 @@ pub struct TaskEditView {
     linear_preset_select_synced: std::cell::RefCell<(Vec<String>, Option<String>)>,
     _linear_preset_select_subscription: Subscription,
     /// The filter query editor: one field that grows as the query wraps.
-    linear_query_input: Entity<TextareaState>,
-    /// Query text to put in `linear_query_input` once a window is at hand.
-    linear_query_pending: Option<String>,
-    /// The suggestions at the cursor, and the text and cursor they were
-    /// computed for.
-    linear_query_completion: Completion,
-    linear_query_completed_at: (String, usize),
-    /// The highlighted suggestion; `None` until the user moves to one, when
-    /// the completion does not preselect.
-    linear_query_highlight: Option<usize>,
-    /// Escape hid the dropdown; editing the query, Down, or Ctrl+Space
-    /// brings it back.
-    linear_query_dismissed: bool,
-    linear_query_scroll: ScrollHandle,
-    _linear_query_subscriptions: [Subscription; 2],
+    filter_editor: QueryEditor,
+    /// The sort editor beneath it, which works the same way.
+    sort_editor: QueryEditor,
     /// Stored `IssueFilter` keys the query language cannot write. Saved back
     /// untouched, and-ed with the query.
     linear_filter_passthrough: serde_json::Map<String, serde_json::Value>,
@@ -553,23 +662,18 @@ impl TaskEditView {
                 }
             },
         );
-        let linear_query_input = cx.new(|cx| {
-            TextareaState::new(window, cx)
-                .auto_grow(1, LINEAR_QUERY_MAX_ROWS)
-                .placeholder("Enter to edit · e.g. team IS ANY OF (TOD) AND assignee IS EMPTY")
-        });
-        let _linear_query_subscriptions = [
-            cx.subscribe(&linear_query_input, |this, _, event, cx| {
-                if matches!(event, InputEvent::Change) {
-                    this.linear_query_dismissed = false;
-                }
-                this.refresh_linear_query_completion(cx);
-            }),
-            // Moving the cursor changes what may be typed there.
-            cx.observe(&linear_query_input, |this, _, cx| {
-                this.refresh_linear_query_completion(cx);
-            }),
-        ];
+        let filter_editor = QueryEditor::new(
+            QueryKind::Filter,
+            "Enter to edit · e.g. team IS ANY OF (TOD) AND assignee IS EMPTY",
+            window,
+            cx,
+        );
+        let sort_editor = QueryEditor::new(
+            QueryKind::Sort,
+            "Enter to edit · e.g. priority, updatedAt desc, ticket",
+            window,
+            cx,
+        );
         let body_scroll_handle = ScrollHandle::new();
 
         let poll_entity = cx.weak_entity();
@@ -696,14 +800,8 @@ impl TaskEditView {
             linear_preset_select,
             linear_preset_select_synced: Default::default(),
             _linear_preset_select_subscription,
-            linear_query_input,
-            linear_query_pending: None,
-            linear_query_completion: Completion::default(),
-            linear_query_completed_at: (String::new(), usize::MAX),
-            linear_query_highlight: None,
-            linear_query_dismissed: false,
-            linear_query_scroll: ScrollHandle::new(),
-            _linear_query_subscriptions,
+            filter_editor,
+            sort_editor,
             linear_filter_passthrough: serde_json::Map::new(),
             managed_link: None,
             managed_source_type: None,
@@ -897,6 +995,11 @@ impl TaskEditView {
             }
             if self.generator_source_key().is_some() {
                 for (index, field) in self.generator_fields.iter().enumerate() {
+                    // The sort has no stop of its own row: its editor is the stop.
+                    if field.is_linear_sort() {
+                        stops.push(TaskEditField::LinearSort);
+                        continue;
+                    }
                     stops.push(TaskEditField::GeneratorField(index));
                     if field.is_linear_filters() {
                         stops.push(TaskEditField::LinearQuery);
@@ -982,7 +1085,8 @@ impl TaskEditView {
                     .get(index)
                     .and_then(|field| field.input.clone());
             }
-            TaskEditField::LinearQuery => self.linear_query_input.clone().into(),
+            TaskEditField::LinearQuery => self.filter_editor.input.clone().into(),
+            TaskEditField::LinearSort => self.sort_editor.input.clone().into(),
             TaskEditField::Title => self.title_input.clone().into(),
             TaskEditField::LinearLink => self.linear_input.clone().into(),
             TaskEditField::GithubPr => self.github_pr_input.clone().into(),
@@ -1068,8 +1172,15 @@ impl TaskEditView {
         {
             inputs.push((
                 TaskEditField::LinearQuery,
-                self.linear_query_input.clone().into(),
+                self.filter_editor.input.clone().into(),
             ));
+        }
+        if self
+            .generator_fields
+            .iter()
+            .any(GeneratorConfigField::is_linear_sort)
+        {
+            inputs.push((TaskEditField::LinearSort, self.sort_editor.input.clone().into()));
         }
         inputs
     }
@@ -1934,6 +2045,20 @@ impl TaskEditView {
             self.clear_linear_state();
         }
 
+        // The sort editor owns the sort text.
+        if fields.iter().any(GeneratorConfigField::is_linear_sort) {
+            self.sort_editor.pending = Some(
+                stored
+                    .get(linear_sort::SORT_KEY)
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string(),
+            );
+        } else {
+            self.sort_editor.pending = Some(String::new());
+        }
+
         // Schema evolution: orphaned field values (fields in stored config but not
         // in current schema) are kept in generator_extra_config but only temporarily.
         // They're omitted from the form and removed on next save.
@@ -1984,6 +2109,17 @@ impl TaskEditView {
                     if field.is_linear_filters() {
                         map.extend(self.linear_filter_config(cx));
                     }
+                    if field.is_linear_sort() {
+                        let sort = self.sort_editor.text(cx).trim().to_string();
+                        if sort.is_empty() {
+                            map.remove(linear_sort::SORT_KEY);
+                        } else {
+                            map.insert(
+                                linear_sort::SORT_KEY.to_string(),
+                                serde_json::Value::String(sort),
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -2015,7 +2151,9 @@ impl TaskEditView {
         // (and parses); the other fields save as they are edited.
         if self.generator_busy.is_some()
             || self.field_editing(TaskEditField::LinearQuery)
+            || self.field_editing(TaskEditField::LinearSort)
             || self.linear_query_error(cx).is_some()
+            || self.sort_query_error(cx).is_some()
         {
             return;
         }
@@ -2146,7 +2284,8 @@ impl TaskEditView {
         self.linear_preset_action = None;
         self.linear_preset_baseline = None;
         self.linear_filter_passthrough.clear();
-        self.linear_query_pending = Some(String::new());
+        self.filter_editor.pending = Some(String::new());
+        self.sort_editor.pending = Some(String::new());
     }
 
     fn trigger_linear_introspection_fetch(&mut self, cx: &mut Context<Self>) {
@@ -2314,7 +2453,10 @@ impl TaskEditView {
     ) {
         tod_integration::migrate_legacy_filter_keys(&mut stored);
         stored.retain(|_, value| !value.is_null());
-        if self.editing == Some(TaskEditField::LinearQuery) {
+        if matches!(
+            self.editing,
+            Some(TaskEditField::LinearQuery | TaskEditField::LinearSort)
+        ) {
             self.editing = None;
         }
 
@@ -2346,15 +2488,27 @@ impl TaskEditView {
                 .collect();
             grouped.join(" AND ")
         };
-        self.linear_query_pending = Some(query);
+        self.filter_editor.pending = Some(query);
         self.linear_filter_passthrough = stored;
     }
 
-    /// The query as typed (or as loaded, until render puts it in the input).
+    fn editor(&self, kind: QueryKind) -> &QueryEditor {
+        match kind {
+            QueryKind::Filter => &self.filter_editor,
+            QueryKind::Sort => &self.sort_editor,
+        }
+    }
+
+    fn editor_mut(&mut self, kind: QueryKind) -> &mut QueryEditor {
+        match kind {
+            QueryKind::Filter => &mut self.filter_editor,
+            QueryKind::Sort => &mut self.sort_editor,
+        }
+    }
+
+    /// The filter query as typed (or as loaded, until render puts it in the input).
     fn linear_query_text(&self, cx: &App) -> String {
-        self.linear_query_pending
-            .clone()
-            .unwrap_or_else(|| input_text(&self.linear_query_input, cx))
+        self.filter_editor.text(cx)
     }
 
     /// Why the query does not parse, if it does not.
@@ -2370,78 +2524,102 @@ impl TaskEditView {
         linear_query::parse(&self.linear_query_text(cx), &fields).err()
     }
 
-    /// Recompute the dropdown when the query or the cursor moved.
-    fn refresh_linear_query_completion(&mut self, cx: &mut Context<Self>) {
-        let input = self.linear_query_input.read(cx);
+    /// Why the sort does not parse, if it does not.
+    fn sort_query_error(&self, cx: &App) -> Option<linear_sort::SortError> {
+        if !self
+            .generator_fields
+            .iter()
+            .any(GeneratorConfigField::is_linear_sort)
+        {
+            return None;
+        }
+        linear_sort::parse(&self.sort_editor.text(cx)).err()
+    }
+
+    /// Recompute the dropdown when the text or the cursor moved.
+    fn refresh_query_completion(&mut self, kind: QueryKind, cx: &mut Context<Self>) {
+        let input = self.editor(kind).input.read(cx);
         let at = (input.text().to_string(), input.cursor());
-        if at == self.linear_query_completed_at {
+        if at == self.editor(kind).completed_at {
             return;
         }
-        let cache = self.linear_introspection_cache.as_ref();
-        let fields = linear_query::fields(cache);
-        self.linear_query_completion = linear_query::complete(&at.0, at.1, &fields, cache);
-        self.linear_query_completed_at = at;
-        self.linear_query_highlight = None;
-        self.linear_query_scroll.scroll_to_item(0);
+        let completion = match kind {
+            QueryKind::Filter => {
+                let cache = self.linear_introspection_cache.as_ref();
+                let fields = linear_query::fields(cache);
+                linear_query::complete(&at.0, at.1, &fields, cache)
+            }
+            QueryKind::Sort => linear_sort::complete(&at.0, at.1),
+        };
+        let editor = self.editor_mut(kind);
+        editor.completion = completion;
+        editor.completed_at = at;
+        editor.highlight = None;
+        editor.scroll.scroll_to_item(0);
         cx.notify();
     }
 
-    fn linear_query_dropdown_open(&self) -> bool {
-        self.field_editing(TaskEditField::LinearQuery)
-            && !self.linear_query_dismissed
-            && !self.linear_query_completion.items.is_empty()
+    fn query_dropdown_open(&self, kind: QueryKind) -> bool {
+        let editor = self.editor(kind);
+        self.field_editing(kind.field())
+            && !editor.dismissed
+            && !editor.completion.items.is_empty()
     }
 
     /// The suggestion Enter takes: the highlighted one, else the first when
     /// the completion preselects.
-    fn linear_query_chosen(&self) -> Option<usize> {
-        self.linear_query_highlight
-            .or(self.linear_query_completion.preselect.then_some(0))
+    fn query_chosen(&self, kind: QueryKind) -> Option<usize> {
+        let editor = self.editor(kind);
+        editor
+            .highlight
+            .or(editor.completion.preselect.then_some(0))
     }
 
     /// Show the dropdown again after Escape hid it (Down, Ctrl+Space).
-    fn reopen_linear_query_dropdown(&mut self, cx: &mut Context<Self>) {
-        if self.linear_query_dismissed {
-            self.linear_query_dismissed = false;
+    fn reopen_query_dropdown(&mut self, kind: QueryKind, cx: &mut Context<Self>) {
+        if self.editor(kind).dismissed {
+            self.editor_mut(kind).dismissed = false;
             cx.notify();
         }
     }
 
-    fn move_linear_query_highlight(&mut self, delta: isize, cx: &mut Context<Self>) {
-        if !self.linear_query_dropdown_open() {
-            if delta > 0 && self.linear_query_dismissed {
-                self.reopen_linear_query_dropdown(cx);
+    fn move_query_highlight(&mut self, kind: QueryKind, delta: isize, cx: &mut Context<Self>) {
+        if !self.query_dropdown_open(kind) {
+            if delta > 0 && self.editor(kind).dismissed {
+                self.reopen_query_dropdown(kind, cx);
             } else {
                 // Nothing to move through: the arrow moves the cursor.
                 cx.propagate();
             }
             return;
         }
-        let len = self.linear_query_completion.items.len() as isize;
-        let next = match self.linear_query_chosen() {
+        let len = self.editor(kind).completion.items.len() as isize;
+        let next = match self.query_chosen(kind) {
             Some(current) => (current as isize + delta).rem_euclid(len),
             None if delta > 0 => 0,
             None => len - 1,
         } as usize;
-        self.linear_query_highlight = Some(next);
-        self.linear_query_scroll.scroll_to_item(next);
+        let editor = self.editor_mut(kind);
+        editor.highlight = Some(next);
+        editor.scroll.scroll_to_item(next);
         cx.notify();
     }
 
-    fn accept_linear_query_suggestion(
+    fn accept_query_suggestion(
         &mut self,
+        kind: QueryKind,
         index: usize,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let text = input_text(&self.linear_query_input, cx);
-        let Some((query, cursor)) = self.linear_query_completion.apply(&text, index) else {
+        let text = input_text(&self.editor(kind).input, cx);
+        let Some((query, cursor)) = self.editor(kind).completion.apply(&text, index) else {
             return;
         };
         let head = &query[..cursor];
         let row = head.matches('\n').count() as u32;
         let column = head.rsplit('\n').next().unwrap_or_default().chars().count() as u32;
-        self.linear_query_input.update(cx, |input, cx| {
+        self.editor(kind).input.update(cx, |input, cx| {
             input.replace_all(query, window, cx);
             input.set_cursor_position(
                 gpui_component::input::Position::new(row, column),
@@ -2449,30 +2627,30 @@ impl TaskEditView {
                 cx,
             );
         });
-        self.linear_query_dismissed = false;
-        self.refresh_linear_query_completion(cx);
+        self.editor_mut(kind).dismissed = false;
+        self.refresh_query_completion(kind, cx);
     }
 
-    fn linear_query_accept(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn query_accept(&mut self, kind: QueryKind, window: &mut Window, cx: &mut Context<Self>) {
         match self
-            .linear_query_chosen()
-            .filter(|_| self.linear_query_dropdown_open())
+            .query_chosen(kind)
+            .filter(|_| self.query_dropdown_open(kind))
         {
-            Some(index) => self.accept_linear_query_suggestion(index, window, cx),
+            Some(index) => self.accept_query_suggestion(kind, index, window, cx),
             None => self.exit_edit(window, cx),
         }
     }
 
-    fn linear_query_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.linear_query_dropdown_open() {
-            let index = self.linear_query_chosen().unwrap_or(0);
-            self.accept_linear_query_suggestion(index, window, cx);
+    fn query_tab(&mut self, kind: QueryKind, window: &mut Window, cx: &mut Context<Self>) {
+        if self.query_dropdown_open(kind) {
+            let index = self.query_chosen(kind).unwrap_or(0);
+            self.accept_query_suggestion(kind, index, window, cx);
         }
     }
 
-    fn linear_query_escape(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.linear_query_dropdown_open() {
-            self.linear_query_dismissed = true;
+    fn query_escape(&mut self, kind: QueryKind, window: &mut Window, cx: &mut Context<Self>) {
+        if self.query_dropdown_open(kind) {
+            self.editor_mut(kind).dismissed = true;
             cx.notify();
         } else {
             self.exit_edit(window, cx);
@@ -2704,6 +2882,11 @@ impl TaskEditView {
 
         if let Some(error) = self.linear_query_error(cx) {
             self.generator_config_error = Some(format!("Filter query: {error}"));
+            cx.notify();
+            return;
+        }
+        if let Some(error) = self.sort_query_error(cx) {
+            self.generator_config_error = Some(format!("Sort: {error}"));
             cx.notify();
             return;
         }
@@ -5226,6 +5409,8 @@ impl TaskEditView {
                 if type_hint == LINEAR_FILTER_FIELDS_HINT {
                     self.render_linear_filter_ui(muted, window, cx)
                         .into_any_element()
+                } else if type_hint == LINEAR_SORT_FIELDS_HINT {
+                    self.render_query_editor(QueryKind::Sort, muted, window, cx)
                 } else {
                     div()
                         .text_xs()
@@ -5288,7 +5473,7 @@ impl TaskEditView {
             .child(self.render_linear_credential_status(muted, cx))
             .child(self.render_linear_introspection_section(muted, cx))
             .child(self.render_linear_preset_section(muted, window, cx))
-            .child(self.render_linear_query_editor(muted, window, cx))
+            .child(self.render_query_editor(QueryKind::Filter, muted, window, cx))
     }
 
     fn render_linear_credential_status(
@@ -5495,17 +5680,30 @@ impl TaskEditView {
 
     /// The query editor: one long input, with a dropdown of what may come
     /// next at the cursor — a field, its operator, its values, `AND` / `OR`.
-    fn render_linear_query_editor(
+    fn render_query_editor(
         &self,
+        kind: QueryKind,
         muted: gpui::Hsla,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        let field = TaskEditField::LinearQuery;
+        let field = kind.field();
+        let editor = self.editor(kind);
         let editing = self.field_editing(field);
-        let text = self.linear_query_text(cx);
-        let fields = linear_query::fields(self.linear_introspection_cache.as_ref());
-        let error = linear_query::parse(&text, &fields).err();
+        let text = editor.text(cx);
+        // The error's short message (shown as a hint while typing) and its
+        // full text with the column.
+        let error: Option<(String, String)> = match kind {
+            QueryKind::Filter => {
+                let fields = linear_query::fields(self.linear_introspection_cache.as_ref());
+                linear_query::parse(&text, &fields)
+                    .err()
+                    .map(|e| (e.message.clone(), e.to_string()))
+            }
+            QueryKind::Sort => linear_sort::parse(&text)
+                .err()
+                .map(|e| (e.message.clone(), e.to_string())),
+        };
         let (danger, list_active, list_hover, popover, border) = {
             let theme = cx.theme();
             (
@@ -5517,15 +5715,15 @@ impl TaskEditView {
             )
         };
 
-        let dropdown = self.linear_query_dropdown_open().then(|| {
-            let chosen = self.linear_query_chosen();
-            let rows: Vec<gpui::AnyElement> = self
-                .linear_query_completion
+        let dropdown = self.query_dropdown_open(kind).then(|| {
+            let chosen = self.query_chosen(kind);
+            let rows: Vec<gpui::AnyElement> = editor
+                .completion
                 .items
                 .iter()
                 .enumerate()
                 .map(|(index, item)| {
-                    let kind = match item.kind {
+                    let item_kind = match item.kind {
                         SuggestionKind::Field => "field",
                         SuggestionKind::Operator => "operator",
                         SuggestionKind::Value => "value",
@@ -5533,12 +5731,12 @@ impl TaskEditView {
                         SuggestionKind::Punctuation => "",
                     };
                     let detail = if item.detail.is_empty() {
-                        kind.to_string()
+                        item_kind.to_string()
                     } else {
                         item.detail.clone()
                     };
                     h_flex()
-                        .id(("task-edit-linear-query-suggestion", index))
+                        .id((kind.suggestion_id(), index))
                         .px_2()
                         .py_0p5()
                         .gap_3()
@@ -5551,7 +5749,7 @@ impl TaskEditView {
                             MouseButton::Left,
                             cx.listener(move |this, _, window, cx| {
                                 cx.stop_propagation();
-                                this.accept_linear_query_suggestion(index, window, cx);
+                                this.accept_query_suggestion(kind, index, window, cx);
                             }),
                         )
                         .child(div().text_sm().child(item.label.clone()))
@@ -5566,7 +5764,7 @@ impl TaskEditView {
             const MAX_HEIGHT: f32 = 240.;
             const MIN_HEIGHT: f32 = 100.;
             let gap = px(4.);
-            let bounds = self.linear_query_input.read(cx).input_bounds();
+            let bounds = editor.input.read(cx).input_bounds();
             let wanted = px((28. * rows.len() as f32 + 12.).min(MAX_HEIGHT));
             let below = window.viewport_size().height - bounds.bottom() - gap;
             let above = bounds.top() - gap;
@@ -5586,12 +5784,12 @@ impl TaskEditView {
             deferred(
                 gpui::anchored().anchor(anchor).position(position).child(
                     div()
-                        .id("task-edit-linear-query-dropdown")
+                        .id(kind.dropdown_id())
                         .occlude()
                         .min_w(px(280.))
                         .max_h(wanted.min(room).max(px(60.)))
                         .overflow_y_scroll()
-                        .track_scroll(&self.linear_query_scroll)
+                        .track_scroll(&editor.scroll)
                         .p_1()
                         .bg(popover)
                         .border_1()
@@ -5607,52 +5805,51 @@ impl TaskEditView {
         // While editing, a query that does not parse yet is usually one
         // being typed, so its error reads as a hint rather than a failure.
         let status: Option<(String, gpui::Hsla)> = match &error {
-            _ if self.linear_query_dropdown_open() => None,
-            Some(error) if editing => Some((error.message.clone(), muted)),
-            Some(error) => Some((error.to_string(), danger)),
-            None if editing => self
-                .linear_query_completion
-                .hint
-                .clone()
-                .map(|hint| (hint, muted)),
+            _ if self.query_dropdown_open(kind) => None,
+            Some((message, _)) if editing => Some((message.clone(), muted)),
+            Some((_, full)) => Some((full.clone(), danger)),
+            None if editing => editor.completion.hint.clone().map(|hint| (hint, muted)),
             None => None,
         };
-        let mut carried: Vec<String> = self
-            .linear_filter_passthrough
-            .iter()
-            .map(|(key, value)| format!("{key}: {value}"))
-            .collect();
+        let mut carried: Vec<String> = if kind == QueryKind::Filter {
+            self.linear_filter_passthrough
+                .iter()
+                .map(|(key, value)| format!("{key}: {value}"))
+                .collect()
+        } else {
+            Vec::new()
+        };
         carried.sort();
 
         self.apply_focus_scroll_anchor(
             field,
             v_flex()
-                .id("task-edit-linear-query")
+                .id(kind.container_id())
                 .gap_1()
                 .child(
                     div()
                         .key_context(LINEAR_QUERY_CONTEXT)
-                        .on_action(cx.listener(|this, _: &LinearQueryNext, _, cx| {
-                            this.move_linear_query_highlight(1, cx)
+                        .on_action(cx.listener(move |this, _: &LinearQueryNext, _, cx| {
+                            this.move_query_highlight(kind, 1, cx)
                         }))
-                        .on_action(cx.listener(|this, _: &LinearQueryPrev, _, cx| {
-                            this.move_linear_query_highlight(-1, cx)
+                        .on_action(cx.listener(move |this, _: &LinearQueryPrev, _, cx| {
+                            this.move_query_highlight(kind, -1, cx)
                         }))
-                        .on_action(cx.listener(|this, _: &LinearQueryAccept, window, cx| {
-                            this.linear_query_accept(window, cx)
+                        .on_action(cx.listener(move |this, _: &LinearQueryAccept, window, cx| {
+                            this.query_accept(kind, window, cx)
                         }))
-                        .on_action(cx.listener(|this, _: &LinearQueryTab, window, cx| {
-                            this.linear_query_tab(window, cx)
+                        .on_action(cx.listener(move |this, _: &LinearQueryTab, window, cx| {
+                            this.query_tab(kind, window, cx)
                         }))
-                        .on_action(cx.listener(|this, _: &LinearQueryEscape, window, cx| {
-                            this.linear_query_escape(window, cx)
+                        .on_action(cx.listener(move |this, _: &LinearQueryEscape, window, cx| {
+                            this.query_escape(kind, window, cx)
                         }))
-                        .on_action(cx.listener(|this, _: &LinearQueryOpen, _, cx| {
-                            this.reopen_linear_query_dropdown(cx)
+                        .on_action(cx.listener(move |this, _: &LinearQueryOpen, _, cx| {
+                            this.reopen_query_dropdown(kind, cx)
                         }))
                         .child(self.render_nav_input(
                             field,
-                            self.linear_query_input.clone(),
+                            editor.input.clone(),
                             None,
                             window,
                             cx,
@@ -5661,7 +5858,7 @@ impl TaskEditView {
                 )
                 .when_some(status, |el, (message, color)| {
                     el.child(div().text_xs().text_color(color).child(selectable_text(
-                        "task-edit-linear-query-status",
+                        kind.status_id(),
                         message,
                         window,
                         cx,
@@ -6270,9 +6467,12 @@ impl Render for TaskEditView {
         self.schedule_generator_autosave(cx);
         self.schedule_generator_accept_autosave(cx);
 
-        if let Some(query) = self.linear_query_pending.take() {
-            self.linear_query_input
-                .update(cx, |input, cx| input.set_value(query, window, cx));
+        for kind in [QueryKind::Filter, QueryKind::Sort] {
+            if let Some(text) = self.editor_mut(kind).pending.take() {
+                self.editor(kind)
+                    .input
+                    .update(cx, |input, cx| input.set_value(text, window, cx));
+            }
         }
 
         if !self.is_open() {

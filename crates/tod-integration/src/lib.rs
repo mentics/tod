@@ -7,6 +7,7 @@
 mod data_source;
 pub mod linear;
 pub mod linear_query;
+pub mod linear_sort;
 pub mod mock;
 pub mod ntfy;
 pub mod preset;
