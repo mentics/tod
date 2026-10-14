@@ -4,6 +4,15 @@ One sandbox per workspace (`tod-orchestrator`) holds a copy of each user's
 tod database and runs every `tod-cli` command the agent sandboxes send. The
 design is in [autonomous-nodes.md](autonomous-nodes.md); this is how it runs.
 
+**Deploying it.** When the app starts and `sandboxes.toml` has a Blaxel account
+but no orchestrator sandbox exists, the app deploys one in the background
+(`tod_core::cloud_sync::deploy`), as `tod-sandbox orchestrator` does: it needs
+the Linux `tod-orchestrator`, `tod-cli`, and `tod-relay` in the installed
+`sandbox/` directory (`scripts/build-sandbox-binaries.sh`). It looks once per
+launch, never touches an orchestrator that exists (updating one, or giving it
+a volume, stays an explicit `tod-sandbox orchestrator`), does nothing when the
+orchestrator URL is set by hand, and only logs when it cannot (the daemon log).
+
 ## Server (`crates/tod-orchestrator`)
 
 `tod-orchestrator [--port 8090] [--bind 0.0.0.0] [--base /data] [--tod-cli PATH]`

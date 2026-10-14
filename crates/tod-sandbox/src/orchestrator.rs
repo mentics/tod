@@ -275,7 +275,7 @@ fn unpack_command() -> String {
     format!("tar xzf {archive} -C {DATA_DIR} && rm -f {archive}")
 }
 
-fn is_dead(status: &str) -> bool {
+pub fn is_dead(status: &str) -> bool {
     matches!(status.to_ascii_uppercase().as_str(), "FAILED" | "TERMINATED" | "DELETING" | "DELETED")
 }
 

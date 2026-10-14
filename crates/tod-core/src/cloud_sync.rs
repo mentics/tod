@@ -484,6 +484,9 @@ pub fn sync_now(fleet: &FleetStore, root: &Path) -> Result<SyncReport> {
 pub fn sync_on_start(fleet: std::sync::Arc<FleetStore>) {
     spawn_outbox_pusher(fleet.clone());
     let root = fleet.paths().root().to_path_buf();
+    // Whether or not anything is seeded: a workspace with no orchestrator
+    // gets one, in the background.
+    deploy::spawn_ensure(root.clone());
     if !CloudSyncState::load(&root).is_ok_and(|s| s.seeded) {
         return;
     }
@@ -651,7 +654,7 @@ pub fn ensure_node_sandbox(
     let bx = sandboxes.blaxel()?;
     let orchestrator_url = sandboxes
         .url(&bx, &account.orchestrator)
-        .context("find the orchestrator sandbox")?;
+        .context("find the orchestrator sandbox: the app deploys it at launch (see the daemon log), or run `tod-sandbox orchestrator`")?;
     let orchestrator_host = orchestrator_url
         .trim_start_matches("https://")
         .trim_start_matches("http://")
@@ -893,6 +896,7 @@ pub fn run_in_cloud(
 }
 
 pub mod lost;
+pub mod deploy;
 
 #[cfg(test)]
 mod tests;
