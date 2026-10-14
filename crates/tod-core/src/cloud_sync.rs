@@ -852,7 +852,7 @@ pub fn ensure_node_sandbox(
     match &source {
         NodeSandboxSource::Fork(_) => {
             node::install_into_fork(&bx, &url, &payload, progress)?;
-            node::start(&bx, &url, &payload, progress)?;
+            node::start(&bx, &url, &payload, false, progress)?;
         }
         NodeSandboxSource::Image(_) => {
             progress("installing the relay and supervisor…");

@@ -227,8 +227,8 @@ pub fn refresh_credentials(fleet: &FleetStore, node_id: &str, force: bool) -> Re
     }
     if !force && let Some(url) = info.url.as_deref() {
         let script = format!(
-            "cd {dir} || exit 3; if [ -n \"$(git status --porcelain)\" ]; then echo DIRTY; exit 4; fi;              git push origin HEAD 2>&1 || {{ echo PUSHFAIL; exit 5; }}",
-            dir = tod_sandbox::node::WORKSPACE_DIR
+            "cd \"{dir}\" || exit 3; if [ -n \"$(git status --porcelain)\" ]; then echo DIRTY; exit 4; fi;              git push origin HEAD 2>&1 || {{ echo PUSHFAIL; exit 5; }}",
+            dir = tod_sandbox::node::WORKSPACE_PROBE
         );
         let cmd = format!("sh -c {} 2>&1", tod_sandbox::relay::shell_quote(&script));
         match bx.run(url, &cmd, 120) {

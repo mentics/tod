@@ -55,7 +55,7 @@ struct Relay {
     home: String,
     /// The command a poke starts when no supervisor is running
     /// (`--supervisor-cmd`; by default the one `tod_sandbox::node` installs,
-    /// `/opt/tod/tod-supervisor wake --workspace /workspace/repo`). A shell
+    /// `/opt/tod/tod-supervisor wake --workspace <the checkout>`). A shell
     /// command line.
     supervisor_cmd: String,
     /// The pid of a supervisor this relay started, while it is still
@@ -100,7 +100,12 @@ pub fn main(args: &[String]) {
     let mut port = 2222u16;
     let mut max_hold = 4 * 3600u64;
     let mut tunnel_port = crate::tunnel::DEFAULT_PORT;
-    let mut supervisor_cmd = "/opt/tod/tod-supervisor wake --workspace /workspace/repo".to_string();
+    let mut supervisor_cmd = concat!(
+        "/opt/tod/tod-supervisor wake --workspace \"",
+        "$(if [ -d /workspace/repo/.git ]; then echo /workspace/repo; else echo /workspace; fi)",
+        "\""
+    )
+    .to_string();
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {

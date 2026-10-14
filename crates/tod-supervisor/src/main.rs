@@ -5,7 +5,7 @@
 //! base URL is that without `/cli`; `TOD_ORCHESTRATOR_URL` overrides it).
 
 use anyhow::{Context, Result, bail};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tod_core::autopilot::Budget;
@@ -56,7 +56,12 @@ fn run(args: &[String]) -> Result<()> {
         Some("wake") => {}
         _ => bail!("{USAGE}"),
     }
-    let mut workspace = PathBuf::from("/workspace/repo");
+    // The clone tod made, else the checkout a golden image already holds.
+    let mut workspace = PathBuf::from(if Path::new("/workspace/repo/.git").exists() {
+        "/workspace/repo"
+    } else {
+        "/workspace"
+    });
     // The sandbox's environment picks the agent (`tod_sandbox::node::node_env`),
     // since the relay starts `wake` with no options.
     let mut agent = match env("TOD_SUPERVISOR_AGENT") {

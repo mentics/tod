@@ -24,8 +24,16 @@ use std::path::Path;
 pub const SUPERVISOR_PATH: &str = "/opt/tod/tod-supervisor";
 /// The supervisor's name in the sandbox's process API.
 pub const SUPERVISOR_PROCESS: &str = "tod-supervisor";
-/// Where the node's repository is checked out.
+/// Where the node's repository is cloned when the sandbox has no checkout.
 pub const WORKSPACE_DIR: &str = "/workspace/repo";
+/// Where a sandbox forked from a golden already has the repository (and its
+/// submodules), so nothing is cloned.
+pub const FORKED_WORKSPACE_DIR: &str = "/workspace";
+/// A shell expression for the node's checkout in its sandbox: [`WORKSPACE_DIR`]
+/// when it is a checkout, else [`FORKED_WORKSPACE_DIR`]. The relay's and the
+/// supervisor's defaults (`tod-relay`, `tod-supervisor`) pick the same way.
+pub const WORKSPACE_PROBE: &str =
+    "$(if [ -d /workspace/repo/.git ]; then echo /workspace/repo; else echo /workspace; fi)";
 /// What `gh` sees as its token; the proxy replaces the header it sends.
 pub const GH_TOKEN_PLACEHOLDER: &str = "placeholder-injected-by-proxy";
 /// Set to [`GITHUB_AUTH_PROXY`] in a node's sandbox whose proxy injects the
@@ -501,20 +509,31 @@ impl GitIdentity {
     }
 }
 
-/// Sets git's CA to the proxy's system-wide, then clones the repository (or
-/// fetches), sets the checkout's author to `identity`, and checks out
+/// Sets git's CA to the proxy's system-wide, then fetches the repository
+/// where the sandbox already has it ([`WORKSPACE_DIR`], else the image's own
+/// checkout at [`FORKED_WORKSPACE_DIR`], which is never cloned over), sets the
+/// checkout's author to `identity`, and checks out
 /// `branch`: from `origin/<branch>` when it exists, else the local branch
 /// when there is one, else a new branch from the latest of origin's default
-/// branch (`origin/HEAD`).
-pub fn checkout_script(repo_url: &str, branch: &str, identity: &GitIdentity) -> String {
-    let (repo, br, dir) = (shell_quote(repo_url), shell_quote(branch), shell_quote(WORKSPACE_DIR));
+/// branch (`origin/HEAD`). With neither present it clones into
+/// [`WORKSPACE_DIR`] when `allow_clone`, else fails: a fork of a golden that
+/// lacks the repository is a broken golden, not something to patch up here.
+pub fn checkout_script(repo_url: &str, branch: &str, identity: &GitIdentity, allow_clone: bool) -> String {
+    let (repo, br) = (shell_quote(repo_url), shell_quote(branch));
+    let (clone_dir, forked_dir) = (shell_quote(WORKSPACE_DIR), shell_quote(FORKED_WORKSPACE_DIR));
     let (name, email) = (shell_quote(&identity.name), shell_quote(&identity.email));
+    let missing = if allow_clone {
+        format!("mkdir -p \"$(dirname {clone_dir})\" && git clone {repo} {clone_dir} && dir={clone_dir}")
+    } else {
+        format!("echo \"no git checkout at {WORKSPACE_DIR} or {FORKED_WORKSPACE_DIR}: the golden this sandbox was forked from has no repository\" >&2; exit 1")
+    };
     format!(
         "set -e\n\
          if [ -n \"$SSL_CERT_FILE\" ]; then git config --system http.sslCAInfo \"$SSL_CERT_FILE\"; fi\n\
-         if [ -d {dir}/.git ]; then git -C {dir} fetch origin; \
-         else mkdir -p \"$(dirname {dir})\" && git clone {repo} {dir}; fi\n\
-         cd {dir}\n\
+         if [ -d {clone_dir}/.git ]; then dir={clone_dir}; git -C \"$dir\" fetch origin; \
+         elif [ -d {forked_dir}/.git ]; then dir={forked_dir}; git -C \"$dir\" fetch origin; \
+         else {missing}; fi\n\
+         cd \"$dir\"\n\
          git config user.name {name}\n\
          git config user.email {email}\n\
          if git show-ref --verify --quiet refs/remotes/origin/{br}; then \
@@ -529,7 +548,7 @@ pub fn checkout_script(repo_url: &str, branch: &str, identity: &GitIdentity) -> 
 /// `progress` hears each slow step and any warning.
 pub fn provision(bx: &Blaxel, url: &str, payload: &NodePayload, progress: &mut dyn FnMut(&str)) -> Result<()> {
     install(bx, url, payload, progress)?;
-    start(bx, url, payload, progress)
+    start(bx, url, payload, true, progress)
 }
 
 /// The part of [`provision`] that is the same for every node: the relay,
@@ -596,9 +615,9 @@ pub fn install_into_fork(bx: &Blaxel, url: &str, payload: &NodePayload, progress
 /// The part of [`provision`] that is the node's own: checks out its branch,
 /// and starts the relay and the supervisor. All a node forked from a base
 /// needs.
-pub fn start(bx: &Blaxel, url: &str, payload: &NodePayload, progress: &mut dyn FnMut(&str)) -> Result<()> {
+pub fn start(bx: &Blaxel, url: &str, payload: &NodePayload, allow_clone: bool, progress: &mut dyn FnMut(&str)) -> Result<()> {
     progress(&format!("checking out {}…", payload.branch));
-    let res = bx.run(url, &format!("sh -c {} 2>&1", shell_quote(&checkout_script(payload.repo_url, payload.branch, payload.git_identity))), 600)?;
+    let res = bx.run(url, &format!("sh -c {} 2>&1", shell_quote(&checkout_script(payload.repo_url, payload.branch, payload.git_identity, allow_clone))), 600)?;
     if res.exit_code != 0 {
         bail!("checking out {} failed (exit {}): {}", payload.branch, res.exit_code, res.output());
     }
@@ -789,7 +808,7 @@ fn ensure_claude_adapter(bx: &Blaxel, url: &str, progress: &mut dyn FnMut(&str))
 /// The command the relay runs to start the supervisor (its default
 /// `--supervisor-cmd`).
 pub fn supervisor_command() -> String {
-    format!("{SUPERVISOR_PATH} wake --workspace {WORKSPACE_DIR}")
+    format!("{SUPERVISOR_PATH} wake --workspace \"{WORKSPACE_PROBE}\"")
 }
 
 /// What a wake's Blaxel schedule runs in the node's sandbox: a poke of the
@@ -1148,7 +1167,7 @@ mod tests {
     #[test]
     fn the_supervisor_command_is_the_relays_default() {
         // tod-relay's `--supervisor-cmd` default (crates/tod-relay/src/server.rs).
-        assert_eq!(supervisor_command(), "/opt/tod/tod-supervisor wake --workspace /workspace/repo");
+        assert_eq!(supervisor_command(), format!("/opt/tod/tod-supervisor wake --workspace \"{WORKSPACE_PROBE}\""));
         assert!(poke_script().contains("http://127.0.0.1:2222/poke"));
     }
 
@@ -1158,7 +1177,7 @@ mod tests {
             name: "Ada O'Neil".into(),
             email: "ada@example.com".into(),
         };
-        let s = checkout_script("https://github.com/o/r.git", "feat/x", &me);
+        let s = checkout_script("https://github.com/o/r.git", "feat/x", &me, true);
         assert!(s.contains(r"git config user.name 'Ada O'\''Neil'"), "{s}");
         assert!(s.contains("git config user.email ada@example.com"), "{s}");
         assert!(s.contains("git config --system http.sslCAInfo \"$SSL_CERT_FILE\""));
@@ -1169,6 +1188,24 @@ mod tests {
         assert!(s.contains("git checkout --no-track -b feat/x \"$(git symbolic-ref -q --short refs/remotes/origin/HEAD"));
         assert!(!s.contains("else git checkout -B feat/x;"));
         // A branch needing quotes stays one word after `origin/`.
-        assert!(checkout_script("u", "a b", &me).contains("origin/'a b'"));
+        assert!(checkout_script("u", "a b", &me, true).contains("origin/'a b'"));
+    }
+
+    #[test]
+    fn a_fork_uses_the_images_checkout_and_never_clones() {
+        let me = GitIdentity::fallback();
+        let s = checkout_script("https://github.com/o/r.git", "feat/x", &me, false);
+        assert!(!s.contains("git clone"), "{s}");
+        // The golden's own checkout is fetched and used where the clone would be.
+        assert!(s.contains("elif [ -d /workspace/.git ]; then dir=/workspace; git -C \"$dir\" fetch origin"), "{s}");
+        // With neither, it fails loudly instead.
+        assert!(s.contains("has no repository\" >&2; exit 1"), "{s}");
+        assert!(checkout_script("https://github.com/o/r.git", "feat/x", &me, true).contains("git clone"));
+    }
+
+    #[test]
+    fn the_supervisor_workspace_is_the_clone_else_the_images_checkout() {
+        assert!(supervisor_command().contains(WORKSPACE_PROBE));
+        assert!(WORKSPACE_PROBE.contains("/workspace/repo/.git") && WORKSPACE_PROBE.contains("echo /workspace;"));
     }
 }
