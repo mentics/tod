@@ -231,6 +231,39 @@ impl Sandboxes {
         self.create_with_proxy(name, source, agents, inherit_output, &Default::default(), progress)
     }
 
+    /// The sandbox the name `golden` stands for. `wsx-golden-*` stands for the
+    /// newest sandbox with that prefix (the names carry a timestamp, so they
+    /// sort oldest first).
+    pub fn resolve_golden(&self, bx: &Blaxel) -> Result<String> {
+        let golden = self
+            .account()?
+            .golden
+            .clone()
+            .filter(|g| !g.trim().is_empty())
+            .ok_or_else(|| {
+                anyhow!("no golden sandbox is set: run `tod-sandbox golden <sandbox>` (or set `golden` in sandboxes.toml)")
+            })?;
+        Ok(match golden.trim().strip_suffix('*') {
+            Some(prefix) => {
+                let all: Vec<_> = bx
+                    .list()?
+                    .into_iter()
+                    .filter(|i| i.name.starts_with(prefix) && !matches!(i.status.as_str(), "TERMINATED" | "DELETING"))
+                    .collect();
+                // A golden is marked `ready` once it passed its checks; a
+                // half-made one (left in place after a failure) is skipped
+                // unless nothing is marked.
+                let ready = all.iter().filter(|i| i.label("ready") == Some("true")).count();
+                all.into_iter()
+                    .filter(|i| ready == 0 || i.label("ready") == Some("true"))
+                    .map(|i| i.name)
+                    .max()
+                    .ok_or_else(|| anyhow!("no sandbox named {prefix}* exists to be the golden"))?
+            }
+            None => golden,
+        })
+    }
+
     /// [`Self::create`] with `creds` as proxy rules (see
     /// [`Self::node_credentials`]: the user's GitHub, Linear, and Claude
     /// tokens as autonomous nodes get them, and the node's Environment
@@ -266,27 +299,7 @@ impl Sandboxes {
         let resolved;
         let source = match source {
             NewSandboxSource::Fork(name) if name == tod_sandbox::config::GOLDEN => {
-                let golden = acct.golden.clone().filter(|g| !g.trim().is_empty()).ok_or_else(|| {
-                    anyhow!("no golden sandbox is set: run `tod-sandbox golden <sandbox>` (or set `golden` in sandboxes.toml)")
-                })?;
-                // `wsx-golden-*` stands for the newest sandbox with that prefix
-                // (the names carry a timestamp, so they sort oldest first).
-                let golden = match golden.trim().strip_suffix('*') {
-                    Some(prefix) => ({
-                        let all: Vec<_> = bx
-                            .list()?
-                            .into_iter()
-                            .filter(|i| i.name.starts_with(prefix) && !matches!(i.status.as_str(), "TERMINATED" | "DELETING"))
-                            .collect();
-                        // A golden is marked `ready` once it passed its checks; a
-                        // half-made one (left in place after a failure) is skipped
-                        // unless nothing is marked.
-                        let ready = all.iter().filter(|i| i.label("ready") == Some("true")).count();
-                        all.into_iter().filter(|i| ready == 0 || i.label("ready") == Some("true")).map(|i| i.name).max()
-                    })
-                        .ok_or_else(|| anyhow!("no sandbox named {prefix}* exists to be the golden"))?,
-                    None => golden,
-                };
+                let golden = self.resolve_golden(&bx)?;
                 progress(&format!("golden is {golden}"));
                 resolved = NewSandboxSource::Fork(golden);
                 &resolved

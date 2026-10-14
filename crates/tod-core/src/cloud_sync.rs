@@ -577,6 +577,18 @@ fn origin_url_of(fleet: &FleetStore, node_id: &str, repo: &str) -> Result<String
         {
             sandboxes.push(name.trim().to_string());
         }
+        // `golden` is an alias for the newest golden sandbox, not a sandbox name.
+        for name in &mut sandboxes {
+            if name == tod_sandbox::config::GOLDEN {
+                let root = fleet.paths().root();
+                match tod_store::fleet::sandbox::Sandboxes::load(root)
+                    .and_then(|s| s.blaxel().and_then(|bx| s.resolve_golden(&bx)))
+                {
+                    Ok(real) => *name = real,
+                    Err(err) => tried.push(format!("could not resolve the golden sandbox: {err:#}")),
+                }
+            }
+        }
         for name in sandboxes {
             let found = tod_store::fleet::sandbox::SandboxExec::new(&name)
                 .output(repo, "git", &["config", "--get-regexp", REMOTE_URLS])
