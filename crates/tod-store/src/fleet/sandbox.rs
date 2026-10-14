@@ -922,24 +922,32 @@ impl SandboxExec {
     /// Run `program args…` in `dir` and collect its output. A relay that
     /// cannot be reached is made ready again, once.
     pub fn output(&self, dir: &str, program: &str, args: &[&str]) -> Result<Output> {
+        self.output_within(Duration::from_secs(600), dir, program, args)
+    }
+
+    /// [`Self::output`], giving up after `limit` for a call that should be
+    /// quick, so a wedged relay or a command that never finishes is an error
+    /// the caller can show rather than a wait of minutes. A timeout is not
+    /// retried.
+    pub fn output_within(&self, limit: Duration, dir: &str, program: &str, args: &[&str]) -> Result<Output> {
         let mut cmd = format!("cd {} && exec {}", relay::shell_quote(dir), relay::shell_quote(program));
         for arg in args {
             cmd.push(' ');
             cmd.push_str(&relay::shell_quote(arg));
         }
+        let timed_out = || format!("timed out after {}s in sandbox {}: {program}", limit.as_secs(), self.name);
         let run = |conn: &Connection| {
             block_on(async {
-                tokio::time::timeout(
-                    Duration::from_secs(600),
-                    relay::run_capture(&relay::ws_url(&conn.url, "/exec"), &conn.token, &cmd),
-                )
-                .await
-                .map_err(|_| anyhow!("timed out in sandbox {}: {program}", self.name))?
+                tokio::time::timeout(limit, relay::run_capture(&relay::ws_url(&conn.url, "/exec"), &conn.token, &cmd))
+                    .await
+                    .map_err(|_| anyhow!(timed_out()))?
             })
         };
         let conn = connect(&self.name)?;
+        let started = Instant::now();
         let (code, stdout, stderr) = match run(&conn) {
             Ok(result) => result,
+            Err(err) if started.elapsed() >= limit => return Err(err),
             Err(_) => {
                 forget(&self.name);
                 run(&connect(&self.name)?)?

@@ -246,6 +246,27 @@ impl Workdir {
         }
     }
 
+    /// [`Self::git_output`], for a call that should be quick: in a sandbox it
+    /// is an error after `limit` rather than a wait of up to ten minutes.
+    pub fn git_output_within(&self, limit: std::time::Duration, args: &[&str]) -> Result<Output> {
+        match self {
+            Self::Sandbox { sandbox, path } => {
+                let args: Vec<&str> = CONTAINER_GIT_CONFIG.iter().chain(args).copied().collect();
+                SandboxExec::new(sandbox).output_within(limit, path, "git", &args)
+            }
+            _ => self.git_output(args),
+        }
+    }
+
+    /// [`Self::output`], for a call that should be quick (see
+    /// [`Self::git_output_within`]).
+    pub fn output_within(&self, limit: std::time::Duration, program: &str, args: &[&str]) -> Result<Output> {
+        match self {
+            Self::Sandbox { sandbox, path } => SandboxExec::new(sandbox).output_within(limit, path, program, args),
+            _ => self.output(program, args),
+        }
+    }
+
     /// `git args…` in this directory. In a container or sandbox, git's
     /// ownership check is off (see [`CONTAINER_GIT_CONFIG`]).
     pub fn git_output(&self, args: &[&str]) -> Result<Output> {

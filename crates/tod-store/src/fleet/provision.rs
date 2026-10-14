@@ -56,9 +56,12 @@ pub fn resolve_launch_cwd_with(
                     .filter(|b| !b.is_empty())
                     .or_else(|| worktree::current_branch(&dir));
                 match branch {
-                    Some(branch) => worktree::branch_submodules(&dir, &branch).unwrap_or_else(|err| {
-                        vec![format!("{err:#}")]
-                    }),
+                    Some(branch) => {
+                        progress("Checking the submodules…");
+                        worktree::branch_submodules(&dir, &branch).unwrap_or_else(|err| {
+                            vec![format!("{err:#}")]
+                        })
+                    }
                     None => Vec::new(),
                 }
             } else {
