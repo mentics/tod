@@ -286,33 +286,78 @@ pub fn submodule_dirs(repo: &Workdir) -> Result<Vec<Workdir>> {
 
 /// [`submodule_dirs`], as paths relative to `repo` (`lib/a`, `lib/a/b`).
 pub fn submodule_paths(repo: &Workdir) -> Result<Vec<String>> {
-    // `git submodule status --recursive` takes most of a second even with
-    // nothing to report, and every run start and commit asks.
-    if !has_gitmodules(repo) {
-        return Ok(Vec::new());
-    }
-    let output = run_git(repo, &["submodule", "status", "--recursive"])?;
-    Ok(output
-        .lines()
-        .filter_map(parse_submodule_status)
-        .map(str::to_string)
+    Ok(submodule_states(repo)?
+        .into_iter()
+        .filter(|(_, initialized)| *initialized)
+        .map(|(path, _)| path)
         .collect())
 }
 
-/// The path from one `git submodule status` line, or `None` for a submodule
-/// that is not initialized (`-`). A line is `<flag><sha> <path>[ (<describe>)]`.
-fn parse_submodule_status(line: &str) -> Option<&str> {
-    let mut chars = line.chars();
-    let flag = chars.next()?;
-    if flag == '-' {
-        return None;
+/// How long a sandbox may take to list the submodules: a few quick commands,
+/// so a longer wait means the relay is stuck, not that it is working.
+const SUBMODULE_LIST_LIMIT: Duration = Duration::from_secs(30);
+
+/// Every submodule `repo` declares, recursively into the initialized ones
+/// (parents before children), as its path relative to `repo` and whether it
+/// is initialized, i.e. has a checkout of its own.
+///
+/// Reads `.gitmodules` and looks for each checkout's `.git`, rather than
+/// asking `git submodule status --recursive`, which also describes and
+/// status-checks every submodule and took over a minute on a large
+/// repository in a cloud sandbox (the relay dropped the connection first).
+/// This is one `git config` and one directory check per level, and every run
+/// start and commit asks.
+fn submodule_states(repo: &Workdir) -> Result<Vec<(String, bool)>> {
+    let out = repo
+        .git_output_within(
+            SUBMODULE_LIST_LIMIT,
+            &["config", "-f", ".gitmodules", "--get-regexp", r"^submodule\..*\.path$"],
+        )
+        .map_err(|err| err.context(format!("spawn git in {repo}")))?;
+    // Exit 1 is no match, or no `.gitmodules`: not a failure.
+    if !out.status.success() && out.status.code() != Some(1) {
+        bail!(
+            "git -C {repo} config -f .gitmodules failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
     }
-    let (_sha, rest) = chars.as_str().split_once(' ')?;
-    let path = match rest.rsplit_once(" (") {
-        Some((path, describe)) if describe.ends_with(')') => path,
-        _ => rest,
-    };
-    Some(path).filter(|p| !p.is_empty())
+    let declared: Vec<String> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|line| line.split_once(' ').map(|(_, path)| path.trim().to_string()))
+        .filter(|path| !path.is_empty())
+        .collect();
+    if declared.is_empty() {
+        return Ok(Vec::new());
+    }
+    let present = checkouts_present(repo, &declared)?;
+    let mut states = Vec::new();
+    for (path, initialized) in declared.into_iter().zip(present) {
+        states.push((path.clone(), initialized));
+        if initialized {
+            let nested = submodule_states(&repo.join(&path))?;
+            states.extend(nested.into_iter().map(|(rel, init)| (format!("{path}/{rel}"), init)));
+        }
+    }
+    Ok(states)
+}
+
+/// For each of `paths` (relative to `repo`), whether it holds a checkout
+/// (has a `.git`). One call for a container or sandbox.
+fn checkouts_present(repo: &Workdir, paths: &[String]) -> Result<Vec<bool>> {
+    if let Workdir::Host(root) = repo {
+        return Ok(paths.iter().map(|p| root.join(p).join(".git").exists()).collect());
+    }
+    let mut args = vec!["-c", r#"for p in "$@"; do if [ -e "$p/.git" ]; then echo 1; else echo 0; fi; done"#, "sh"];
+    args.extend(paths.iter().map(String::as_str));
+    let out = repo.output_within(SUBMODULE_LIST_LIMIT, "sh", &args)?;
+    if !out.status.success() {
+        bail!("check the submodules in {repo}: {}", String::from_utf8_lossy(&out.stderr).trim());
+    }
+    let found: Vec<bool> = String::from_utf8_lossy(&out.stdout).lines().map(|l| l.trim() == "1").collect();
+    if found.len() != paths.len() {
+        bail!("check the submodules in {repo}: expected {} answers, got {}", paths.len(), found.len());
+    }
+    Ok(found)
 }
 
 /// The branch checked out in `repo`, or `None` on a detached HEAD.
@@ -351,13 +396,11 @@ pub fn init_submodules(worktree: &Workdir) -> Result<()> {
     }
     // Repeat per level: a submodule's own submodules only show once it is.
     for _ in 0..8 {
-        let status = run_git(worktree, &["submodule", "status", "--recursive"])?;
-        let initialized: Vec<&str> = status.lines().filter_map(parse_submodule_status).collect();
-        let missing: Vec<&str> = status
-            .lines()
-            .filter(|line| line.starts_with('-'))
-            .filter_map(|line| line[1..].split_once(' ').map(|(_, path)| path))
-            .collect();
+        let states = submodule_states(worktree)?;
+        let initialized: Vec<&str> =
+            states.iter().filter(|(_, init)| *init).map(|(path, _)| path.as_str()).collect();
+        let missing: Vec<&str> =
+            states.iter().filter(|(_, init)| !*init).map(|(path, _)| path.as_str()).collect();
         if missing.is_empty() {
             return Ok(());
         }
@@ -1037,16 +1080,30 @@ mod tests {
     }
 
     #[test]
-    fn parses_submodule_status_lines() {
+    fn lists_initialized_submodules_and_skips_those_without_a_checkout() {
+        let top = repo_with_submodules();
+        assert_eq!(submodule_paths(&top).unwrap(), vec!["a", "b"]);
+        let host = top.host_path().unwrap().to_path_buf();
+        let states = submodule_states(&top).unwrap();
+        assert_eq!(states, vec![("a".to_string(), true), ("b".to_string(), true)]);
+        // A submodule whose checkout is gone (a new worktree shares the
+        // config but not the checkout) is declared, not initialized.
+        git_in(&top, &["submodule", "deinit", "-q", "-f", "b"]);
+        std::fs::remove_dir_all(host.join("b")).unwrap();
+        std::fs::create_dir(host.join("b")).unwrap();
         assert_eq!(
-            parse_submodule_status(" abc123 lib/a (heads/main)"),
-            Some("lib/a")
+            submodule_states(&top).unwrap(),
+            vec![("a".to_string(), true), ("b".to_string(), false)]
         );
-        assert_eq!(
-            parse_submodule_status("+abc123 has space/x"),
-            Some("has space/x")
-        );
-        assert_eq!(parse_submodule_status("-abc123 uninit"), None);
+        assert_eq!(submodule_paths(&top).unwrap(), vec!["a"]);
+    }
+
+    #[test]
+    fn a_repository_without_submodules_lists_none() {
+        let top = repo_with_submodules();
+        let plain = top.host_path().unwrap().join("a");
+        // `a` has no `.gitmodules` of its own.
+        assert!(submodule_paths(&Workdir::Host(plain)).unwrap().is_empty());
     }
 
     #[test]
