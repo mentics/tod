@@ -1908,6 +1908,27 @@ fn copy_node_subtree(
         .get_extra_content(source_node_id, EXTRA_CONTENT_DETAILS)?
         .unwrap_or_default();
 
+    // Listed before the copy is inserted: pasting under the source would
+    // otherwise find the copy among the source's children and recurse forever.
+    let mut stmt = conn.prepare(
+        "SELECT e.node_id FROM outline_entries e JOIN nodes n ON n.id = e.node_id
+         WHERE e.parent_id = ?1 AND e.list_id = ?2 AND n.managed = 0
+         ORDER BY e.ordinal",
+    )?;
+    let child_ids: Vec<Uuid> = stmt
+        .query_map(
+            params![
+                crate::outline::uuid_blob::uuid_to_blob(source_node_id),
+                crate::outline::uuid_blob::uuid_to_blob(list_id)
+            ],
+            |row| row.get::<_, Vec<u8>>(0),
+        )?
+        .collect::<std::result::Result<Vec<_>, _>>()?
+        .into_iter()
+        .map(|b| crate::outline::uuid_blob::blob_to_uuid_sql(&b))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    drop(stmt);
+
     let new_id = Uuid::new_v4();
     let base = crate::outline::slug::derive_node_slug(&source.title, None);
     let slug = crate::outline::slug::allocate_unique_slug(conn, &base, Some(new_id))?;
@@ -1933,24 +1954,6 @@ fn copy_node_subtree(
     }
     copy_capabilities(conn, source_node_id, new_id)?;
 
-    let mut stmt = conn.prepare(
-        "SELECT e.node_id FROM outline_entries e JOIN nodes n ON n.id = e.node_id
-         WHERE e.parent_id = ?1 AND e.list_id = ?2 AND n.managed = 0
-         ORDER BY e.ordinal",
-    )?;
-    let child_ids: Vec<Uuid> = stmt
-        .query_map(
-            params![
-                crate::outline::uuid_blob::uuid_to_blob(source_node_id),
-                crate::outline::uuid_blob::uuid_to_blob(list_id)
-            ],
-            |row| row.get::<_, Vec<u8>>(0),
-        )?
-        .collect::<std::result::Result<Vec<_>, _>>()?
-        .into_iter()
-        .map(|b| crate::outline::uuid_blob::blob_to_uuid_sql(&b))
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    drop(stmt);
 
     for child_id in child_ids {
         copy_node_subtree(conn, child_id, list_id, Some(new_id), None)?;
@@ -1978,6 +1981,27 @@ fn copy_managed_node_recursive(
     let body = node_repo
         .get_extra_content(source_node_id, EXTRA_CONTENT_DETAILS)?
         .unwrap_or_default();
+
+    // Listed before the copy is inserted: pasting under the source would
+    // otherwise find the copy among the source's children and recurse forever.
+    let mut stmt = conn.prepare(
+        "SELECT e.node_id FROM outline_entries e
+         JOIN nodes n ON n.id = e.node_id
+         WHERE e.parent_id = ?1 AND n.managed = 1",
+    )?;
+    let child_ids: Vec<Uuid> = stmt
+        .query_map(
+            params![crate::outline::uuid_blob::uuid_to_blob(source_node_id)],
+            |row| {
+                let blob: Vec<u8> = row.get(0)?;
+                Ok(blob)
+            },
+        )?
+        .collect::<std::result::Result<Vec<_>, _>>()?
+        .into_iter()
+        .map(|b| crate::outline::uuid_blob::blob_to_uuid_sql(&b))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    drop(stmt);
 
     let title = link.copy_title(&source.title);
     let new_id = forced_id.unwrap_or_else(Uuid::new_v4);
@@ -2012,24 +2036,6 @@ fn copy_managed_node_recursive(
     crate::fleet::repos::task::TaskRepo::new(conn)
         .update_ticket(&new_node.id.to_string(), Some(&link.external_id))?;
 
-    let mut stmt = conn.prepare(
-        "SELECT e.node_id FROM outline_entries e
-         JOIN nodes n ON n.id = e.node_id
-         WHERE e.parent_id = ?1 AND n.managed = 1",
-    )?;
-    let child_ids: Vec<Uuid> = stmt
-        .query_map(
-            params![crate::outline::uuid_blob::uuid_to_blob(source_node_id)],
-            |row| {
-                let blob: Vec<u8> = row.get(0)?;
-                Ok(blob)
-            },
-        )?
-        .collect::<std::result::Result<Vec<_>, _>>()?
-        .into_iter()
-        .map(|b| crate::outline::uuid_blob::blob_to_uuid_sql(&b))
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    drop(stmt);
 
     for child_id in child_ids {
         let Some(child_link) = gen_repo.get_link(child_id)? else {

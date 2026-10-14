@@ -1413,6 +1413,29 @@ fn paste_copy_of(store: &FleetStore, list_id: Uuid, source: Uuid, parent: Uuid) 
 }
 
 #[test]
+fn copy_node_subtree_pasted_under_itself_terminates() {
+    let (store, _root, list_id) = setup_store_with_list();
+    let parent = create_node_in(&store, list_id, None, "Parent");
+    let child = create_node_in(&store, list_id, Some(parent), "Child");
+    store
+        .enqueue_outline(OutlineMutation::CopyNodeSubtree {
+            source_node_id: parent,
+            list_id,
+            parent_id: Some(parent),
+            ordinal: 0,
+        })
+        .unwrap();
+    store.writer().flush().unwrap();
+    let entries = store
+        .read(|conn| OutlineRepo::new(conn).list_for_list(list_id))
+        .unwrap();
+    // Original parent + child, plus a copy of the parent (with a copy of the
+    // child) under the parent.
+    assert_eq!(entries.len(), 4);
+    assert!(entries.iter().any(|e| e.node_id == child));
+}
+
+#[test]
 fn pasted_linear_copy_carries_its_id_as_a_ticket_not_in_its_title() {
     let (store, root, list_id) = setup_store_with_list();
     let generator_id = create_node_in(&store, list_id, None, "Generator");
