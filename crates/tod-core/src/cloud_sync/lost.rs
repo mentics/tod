@@ -320,6 +320,25 @@ pub fn stop_running_in_cloud(fleet: &FleetStore, node_id: &str, delete_sandbox: 
     Ok(message)
 }
 
+/// Deletes the node's cloud sandbox in Blaxel, leaving its `cloud_nodes` row
+/// so the next lost-sandbox check replaces it. A sandbox Blaxel does not have
+/// is not an error: the message says so. Blocks on the network.
+pub fn delete_node_sandbox(fleet: &FleetStore, node_id: &str) -> Result<String> {
+    let root = fleet.paths().root().to_path_buf();
+    let uuid = uuid::Uuid::parse_str(node_id).with_context(|| format!("node id {node_id}"))?;
+    let row = fleet
+        .read(|c| cloud_nodes::get(c, uuid))?
+        .context("this node does not run in the cloud")?;
+    let mut sandboxes = tod_store::fleet::sandbox::Sandboxes::load(&root)?;
+    let bx = sandboxes.blaxel()?;
+    if bx.get(&row.sandbox).with_context(|| format!("look up sandbox {}", row.sandbox))?.is_none() {
+        sandboxes.forget(&row.sandbox)?;
+        return Ok(format!("Sandbox {} not found; nothing to delete.", row.sandbox));
+    }
+    sandboxes.delete(&bx, &row.sandbox).with_context(|| format!("delete sandbox {}", row.sandbox))?;
+    Ok(format!("Deleted sandbox {}.", row.sandbox))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

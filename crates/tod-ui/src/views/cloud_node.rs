@@ -34,6 +34,22 @@ pub fn stop_running<T: 'static>(
     });
 }
 
+/// Delete `node_id`'s cloud sandbox in Blaxel off the UI thread; the node stays a cloud node.
+pub fn delete_sandbox<T: 'static>(
+    fleet: Arc<FleetStore>,
+    node_id: String,
+    cx: &mut Context<T>,
+    on_update: impl Fn(&mut T, CloudUpdate, &mut Context<T>) + 'static,
+) {
+    spawn(cx, on_update, move |tx| {
+        let _ = tx.send_blocking(CloudUpdate::Progress("Deleting the sandbox…".into()));
+        let _ = tx.send_blocking(match cloud_sync::lost::delete_node_sandbox(&fleet, &node_id) {
+            Ok(msg) => CloudUpdate::Synced(msg),
+            Err(err) => CloudUpdate::Failed(format!("Delete sandbox failed: {err:#}")),
+        });
+    });
+}
+
 /// Run `node_id` in the cloud off the UI thread; `on_update` hears each step
 /// and the result.
 pub fn run_in_cloud<T: 'static>(

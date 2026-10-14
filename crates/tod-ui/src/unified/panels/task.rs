@@ -188,6 +188,8 @@ enum RunnerAction {
     RunInCloud,
     SyncCloud,
     LeaveCloud,
+    /// Delete the node's sandbox in Blaxel (a missing one is fine).
+    DeleteSandbox,
 }
 
 impl RunnerAction {
@@ -203,6 +205,7 @@ impl RunnerAction {
             Self::RunInCloud => "Run in the cloud",
             Self::SyncCloud => "Sync now",
             Self::LeaveCloud => "Stop running in the cloud",
+            Self::DeleteSandbox => "Delete Sandbox",
         }
     }
 }
@@ -654,7 +657,7 @@ impl TaskPanel {
         if self.runner.cloud.is_some() {
             return RunnerActions {
                 primary: Some((A::SyncCloud, A::SyncCloud.label(), self.runner.cloud_busy)),
-                menu: if self.runner.cloud_busy { Vec::new() } else { vec![A::LeaveCloud] },
+                menu: if self.runner.cloud_busy { Vec::new() } else { vec![A::DeleteSandbox, A::LeaveCloud] },
             };
         }
         if self.runner.cloud_busy {
@@ -770,6 +773,15 @@ impl TaskPanel {
                 crate::views::cloud_node::sync_now(self.fleet.clone(), cx, move |this, update, cx| {
                     this.on_cloud_update(node, update, cx)
                 });
+            }
+            A::DeleteSandbox => {
+                self.cloud_started(cx);
+                crate::views::cloud_node::delete_sandbox(
+                    self.fleet.clone(),
+                    node.to_string(),
+                    cx,
+                    move |this, update, cx| this.on_cloud_update(node, update, cx),
+                );
             }
             A::LeaveCloud => {
                 self.cloud_started(cx);
