@@ -61,6 +61,10 @@ For any UI-facing change, prefer driving the real app over guessing: `--agent mo
 
 Requires the default `agent-socket` feature. Launch with `--agent-socket-port PORT` (give parallel instances distinct ports) and drive it with a line-oriented protocol (`key`, `text`, `click`, `sync`, `shot`) — see [README.md](README.md) for the full command table and the `.local/agent/ui-smoke/` scripts. Use a random/unused port per subagent run to avoid clashing with other instances.
 
+## Errors are never hidden
+
+Never swallow, downgrade, or silently work around a failure. If the configured action cannot be taken, return an error that names what failed and why; do not fall back to a different action (another image, another source, a default) or carry on with a `warning:`, `let _ =`, `.ok()`, or an empty default. A fallback is allowed only when the user configured it. In particular, a cloud run never substitutes the default image for the sandbox source its node (or ancestor) configures.
+
 ## Architecture
 
 ### Workspace layout

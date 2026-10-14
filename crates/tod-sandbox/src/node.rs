@@ -536,6 +536,13 @@ pub fn provision(bx: &Blaxel, url: &str, payload: &NodePayload, progress: &mut d
 /// the shim, the supervisor, the Linux `tod-cli`, and the bundles. A base
 /// gets only this.
 pub fn install(bx: &Blaxel, url: &str, payload: &NodePayload, progress: &mut dyn FnMut(&str)) -> Result<()> {
+    upload_tod_files(bx, url, payload, progress)?;
+    ensure_curl(bx, url, progress)?;
+    ensure_claude_adapter(bx, url, progress)?;
+    install_bundles(bx, url, payload, progress)
+}
+
+fn upload_tod_files(bx: &Blaxel, url: &str, payload: &NodePayload, progress: &mut dyn FnMut(&str)) -> Result<()> {
     bx.upload_large(url, RELAY_PATH, payload.relay, "0755")?;
     bx.upload(url, TOD_CLI_PATH, payload.shim, "0755")?;
     match payload.supervisor {
@@ -559,8 +566,10 @@ pub fn install(bx: &Blaxel, url: &str, payload: &NodePayload, progress: &mut dyn
     if res.exit_code != 0 {
         bail!("installing tod-cli failed: {}", res.output());
     }
-    ensure_curl(bx, url, progress)?;
-    ensure_claude_adapter(bx, url, progress)?;
+    Ok(())
+}
+
+fn install_bundles(bx: &Blaxel, url: &str, payload: &NodePayload, progress: &mut dyn FnMut(&str)) -> Result<()> {
     if !payload.bundles.is_empty() {
         progress(&format!("installing {} bundle files…", payload.bundles.len()));
         let res = bx.run(url, &format!("rm -rf {TOD_DIR}/process {TOD_DIR}/media"), 30)?;
@@ -572,6 +581,16 @@ pub fn install(bx: &Blaxel, url: &str, payload: &NodePayload, progress: &mut dyn
         }
     }
     Ok(())
+}
+
+/// [`install`] for a fork of a golden: tod's own files only (the relay,
+/// `tod-cli`, the supervisor, the bundles). Installs no package: what the
+/// golden lacks is an error naming it, not something to patch in here.
+pub fn install_into_fork(bx: &Blaxel, url: &str, payload: &NodePayload, progress: &mut dyn FnMut(&str)) -> Result<()> {
+    crate::provision::check_relay_arch(payload.relay)?;
+    crate::provision::require_fork_prerequisites(bx, url, true, progress)?;
+    upload_tod_files(bx, url, payload, progress)?;
+    install_bundles(bx, url, payload, progress)
 }
 
 /// The part of [`provision`] that is the node's own: checks out its branch,
@@ -672,6 +691,34 @@ pub fn ensure_base(
 /// [`start`] it.
 pub fn fork(bx: &Blaxel, base: &str, spec: &NodeSandboxSpec, creds: &NodeCredentials) -> Result<()> {
     bx.fork_with_envs(base, spec.name, &env_for(spec, creds))
+}
+
+/// Forks `spec`'s sandbox from the golden `source` and gives the fork the
+/// node's own proxy rules and labels: a fork carries its source's proxy, which
+/// does not hold this node's credentials (or, with a Blaxel one, any a
+/// supervised node needs). Fails, leaving the fork to the caller to remove,
+/// when the golden was made without a proxy: that one cannot take rules.
+/// Wait with [`Blaxel::wait_deployed`] before the caller goes on.
+pub fn fork_golden(bx: &Blaxel, source: &str, spec: &NodeSandboxSpec, creds: &NodeCredentials) -> Result<()> {
+    let current = bx.get_json(source)?.ok_or_else(|| anyhow::anyhow!("no sandbox named {source} to fork"))?;
+    let routes = current["spec"]["network"]["proxy"]["routing"].as_array().map_or(0, Vec::len);
+    if routes == 0 {
+        bail!(
+            "{source} was made without a proxy, so a fork of it cannot carry the node's credentials; \
+             rebuild it with one (`blaxel-sbx golden refresh`)"
+        );
+    }
+    // A fork's proxy variables come back as an unrendered template; the
+    // sandbox's local proxy is what works.
+    let mut envs = env_for(spec, creds);
+    envs.extend(crate::provision::local_proxy_env().into_iter().map(|(k, v)| (k, v.to_string())));
+    bx.fork_with_envs(source, spec.name, &envs)?;
+    bx.wait_deployed(spec.name, std::time::Duration::from_secs(300))?;
+    let proxy = proxy_spec(&proxy_rules(creds, spec.orchestrator_host, spec.claude_via));
+    let env_label = env_fingerprint(&creds.custom);
+    let labels = [("tod-kind", "node"), ("tod-user", spec.user), ("tod-node", spec.node), (ENV_LABEL, env_label.as_str())];
+    bx.update_proxy(spec.name, &proxy, &labels)
+        .map_err(|err| err.context(format!("give {} the node's credentials (its proxy is {source}'s)", spec.name)))
 }
 
 /// Names `localhost` in `/etc/hosts` when the image left it out (Blaxel's

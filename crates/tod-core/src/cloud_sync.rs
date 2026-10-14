@@ -745,11 +745,16 @@ pub fn ensure_node_sandbox(
         progress("warning: no GitHub token stored; the node cannot push or open a pull request");
     }
 
+    let source = node_sandbox_source(fleet, &sandboxes, &bx, node_id)?;
     let name = node_sandbox_name(&task.slug);
     let agent = cloud_agent();
     let spec = node::NodeSandboxSpec {
         name: &name,
-        image: &account.default_image,
+        image: match &source {
+            NodeSandboxSource::Image(image) => image,
+            // Not used: a fork is made from its source, not from an image.
+            NodeSandboxSource::Fork(golden) => golden,
+        },
         region: &account.region,
         memory_mb: account.memory_mb,
         user,
@@ -804,32 +809,23 @@ pub fn ensure_node_sandbox(
             std::thread::sleep(Duration::from_secs(2));
         }
     }
-    let mut forked = false;
     if existing.as_ref().is_none_or(sandbox_is_dead) {
-        // A fork has the base's proxy, which lacks the node's own
-        // credentials (Environment), so such a node is made from scratch.
-        if let Some(base) =
-            account.node_base.as_deref().filter(|b| !b.is_empty() && credentials.custom.is_empty())
-        {
-            match fork_from_base(&bx, root, base, &spec, &credentials, &payload, progress) {
-                Ok(()) => forked = true,
-                Err(err) => {
-                    progress(&format!("could not fork from {base} ({err:#}); creating {name} instead…"));
+        match &source {
+            NodeSandboxSource::Fork(golden) => {
+                progress(&format!("forking {name} from {golden}…"));
+                if let Err(err) = node::fork_golden(&bx, golden, &spec, &credentials) {
                     // A fork that got as far as making the sandbox is not
-                    // one to keep: it may be only partly there.
+                    // one to keep: it may have no credentials.
                     if bx.get(&name).ok().flatten().is_some() {
-                        bx.delete(&name)?;
-                        let deadline = std::time::Instant::now() + Duration::from_secs(120);
-                        while bx.get(&name)?.is_some() && std::time::Instant::now() < deadline {
-                            std::thread::sleep(Duration::from_secs(2));
-                        }
+                        let _ = bx.delete(&name);
                     }
+                    return Err(err.context(format!("fork {name} from {golden}")));
                 }
             }
-        }
-        if !forked {
-            progress(&format!("creating sandbox {name}…"));
-            node::create(&bx, &spec, &credentials)?;
+            NodeSandboxSource::Image(image) => {
+                progress(&format!("creating sandbox {name} from {image}…"));
+                node::create(&bx, &spec, &credentials)?;
+            }
         }
     }
     progress(&format!("waiting for {name}…"));
@@ -839,23 +835,36 @@ pub fn ensure_node_sandbox(
 
     // Before the supervisor starts, which mirrors into the mount when it is
     // there. A fork does not keep its source's mounts, so this is every time.
-    match tod_sandbox::drive::mount_for_node(&bx, &url, &account.region, user, node_id) {
+    let region = match &source {
+        NodeSandboxSource::Fork(golden) => bx
+            .get_json(golden)?
+            .and_then(|v| v["spec"]["region"].as_str().map(str::to_string))
+            .ok_or_else(|| anyhow!("{golden} has no region"))?,
+        NodeSandboxSource::Image(_) => account.region.clone(),
+    };
+    match tod_sandbox::drive::mount_for_node(&bx, &url, &region, user, node_id) {
         Ok(()) => progress("mounted Agent Drive for the node's transcripts"),
         Err(err) => progress(&format!(
             "warning: no Agent Drive ({err:#}); the node's transcripts go to the orchestrator instead"
         )),
     }
 
-    if forked {
-        // The base has everything but the node's own checkout and processes.
-        node::start(&bx, &url, &payload, progress)?;
-    } else {
-        progress("installing the relay and supervisor…");
-        node::provision(&bx, &url, &payload, progress)?;
+    match &source {
+        NodeSandboxSource::Fork(_) => {
+            node::install_into_fork(&bx, &url, &payload, progress)?;
+            node::start(&bx, &url, &payload, progress)?;
+        }
+        NodeSandboxSource::Image(_) => {
+            progress("installing the relay and supervisor…");
+            node::provision(&bx, &url, &payload, progress)?;
+        }
     }
     progress(&format!(
         "{name} {} and provisioned after {:.1}s",
-        if forked { "forked" } else { "created" },
+        match &source {
+            NodeSandboxSource::Fork(_) => "forked",
+            NodeSandboxSource::Image(_) => "created",
+        },
         started.elapsed().as_secs_f64()
     ));
 
@@ -875,34 +884,45 @@ pub fn ensure_node_sandbox(
     Ok(name)
 }
 
-/// Where the fingerprint of the base nodes are forked from is kept
-/// (`tod_sandbox::node::base_fingerprint`): it covers the credentials in the
-/// base's proxy, so it is kept here rather than on the base.
-fn base_fingerprint_path(root: &Path, base: &str) -> PathBuf {
-    root.join(format!("{base}.base-fingerprint"))
+/// Where a node's sandbox comes from: configured on the node or the nearest
+/// ancestor with a Files setting, never defaulted.
+enum NodeSandboxSource {
+    /// A sandbox to fork, its `golden` alias resolved.
+    Fork(String),
+    Image(String),
 }
 
-/// Forks `spec`'s sandbox from `base` (`sandboxes.toml`'s `node_base`),
-/// making or remaking the base first when it is missing or out of date.
-fn fork_from_base(
+fn node_sandbox_source(
+    fleet: &FleetStore,
+    sandboxes: &tod_store::fleet::sandbox::Sandboxes,
     bx: &tod_sandbox::blaxel::Blaxel,
-    root: &Path,
-    base: &str,
-    spec: &tod_sandbox::node::NodeSandboxSpec,
-    creds: &tod_sandbox::node::NodeCredentials,
-    payload: &tod_sandbox::node::NodePayload,
-    progress: &mut dyn FnMut(&str),
-) -> Result<()> {
-    use tod_sandbox::node;
-    let base_spec = node::NodeSandboxSpec { name: base, node: "", ..*spec };
-    let path = base_fingerprint_path(root, base);
-    let recorded = std::fs::read_to_string(&path).ok();
-    let fingerprint = node::ensure_base(bx, &base_spec, creds, payload, recorded.as_deref().map(str::trim), progress)?;
-    if recorded.as_deref().map(str::trim) != Some(fingerprint.as_str()) {
-        std::fs::write(&path, &fingerprint).with_context(|| format!("write {}", path.display()))?;
+    node_id: &str,
+) -> Result<NodeSandboxSource> {
+    use tod_store::fleet::SandboxFrom;
+    let files = fleet
+        .resolve_files_for_node(node_id)?
+        .ok_or_else(|| anyhow!("no Files setting applies to this node or its ancestors, so there is no sandbox to make it from"))?;
+    let origin = &files.source_title;
+    let dev = files
+        .dev_container
+        .filter(|d| d.sandbox)
+        .ok_or_else(|| anyhow!("the Files setting on \"{origin}\" does not run in a sandbox; choose the sandbox to fork or an image there"))?;
+    match dev.sandbox_from {
+        SandboxFrom::Fork(name) => match name.trim() {
+            "" => bail!("the Files setting on \"{origin}\" forks a sandbox but names none; choose the sandbox to fork"),
+            n if n == tod_sandbox::config::GOLDEN => Ok(NodeSandboxSource::Fork(
+                sandboxes.resolve_golden(bx).with_context(|| format!("resolve the golden sandbox that \"{origin}\" forks"))?,
+            )),
+            n => Ok(NodeSandboxSource::Fork(n.to_string())),
+        },
+        SandboxFrom::Image(image) => match image.trim() {
+            "" => bail!(
+                "the Files setting on \"{origin}\" uses the default image, which a cloud run never does; \
+                 choose the sandbox to fork or name an image"
+            ),
+            image => Ok(NodeSandboxSource::Image(image.to_string())),
+        },
     }
-    progress(&format!("forking {} from {base}…", spec.name));
-    node::fork(bx, base, spec, creds)
 }
 
 /// Records that `node_id` runs in `sandbox` (clearing any lost mark) in the
