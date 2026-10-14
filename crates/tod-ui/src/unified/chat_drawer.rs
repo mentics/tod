@@ -49,7 +49,7 @@ use tod_store::fleet::FleetStore;
 use chrono::{Local, TimeZone};
 use crate::interview::agent::SharedAgent;
 use crate::interview::{TodPaths, TodSettings};
-use crate::ui::agent_conversation::{bind_panel_host_keys, forward_panel_keys, AgentConversationEvent, AgentConversationPanel, Entry, EntryKind};
+use crate::ui::agent_conversation::{bind_panel_host_keys, forward_panel_keys, AgentConversationEvent, AgentConversationPanel, Entry, EntryKind, NoticeTone, PanelAction, PanelNotice};
 use crate::ui::agent_runs::AgentRuns;
 use crate::ui::key_context;
 use crate::ui::session_info::SessionInfo;
@@ -66,6 +66,9 @@ const EDGE_LINE: f32 = 3.;
 
 /// How wide the sessions list is, beside the transcript.
 const SESSIONS_WIDTH: f32 = 220.;
+
+/// The notice button that sends the last message again after it failed.
+const RETRY: &str = "retry";
 
 /// The one protocol the drawer holds.
 const FREEFORM: ProtocolKind = ProtocolKind::Outline;
@@ -387,8 +390,33 @@ impl ChatDrawer {
             AgentConversationEvent::Action(id, _) if id.as_ref() == OPEN_SHELL => {
                 terminal_handoff::open_shell(self.fleet.clone(), self.focus.node_id(), window, cx)
             }
+            AgentConversationEvent::Action(id, _) if id.as_ref() == RETRY => {
+                if let Some(text) = self.failed_message() {
+                    self.send(&text, Vec::new(), window, cx);
+                }
+            }
             AgentConversationEvent::Action(..) => {}
         }
+    }
+
+    /// The user's last message, when the agent's turn on it ended in an error
+    /// (other than the user stopping it): what Retry sends again.
+    fn failed_message(&self) -> Option<String> {
+        if self.status.running {
+            return None;
+        }
+        let id = self.conversation_id?;
+        let turns = self
+            .fleet
+            .read(|conn| ConversationRepo::new(conn).turns(id))
+            .ok()?;
+        let last = turns.last()?;
+        if last.role != TurnRole::Error || last.body == "Stopped" {
+            return None;
+        }
+        let user = turns.iter().rev().find(|t| t.role == TurnRole::User)?;
+        let text = user.body.trim();
+        (!text.is_empty()).then(|| text.to_string())
     }
 
     fn send(
@@ -595,6 +623,13 @@ impl ChatDrawer {
             entries.push(Entry::live_reply(self.status.parts.clone()));
         }
         let tools = terminal_handoff::tools(self.focus.node_id(), self.status.running);
+        let notices = if self.failed_message().is_some() {
+            let mut notice = PanelNotice::new(NoticeTone::Error, "The agent's turn failed.");
+            notice.action = Some(PanelAction::new(RETRY, "Retry"));
+            vec![notice]
+        } else {
+            Vec::new()
+        };
         let running = self.status.running;
         let activity = self.status.activity.clone();
         let about = self.about.clone();
@@ -605,6 +640,7 @@ impl ChatDrawer {
             panel.set_usage(usage, cx);
             panel.set_entries(entries, cx);
             panel.set_tools(tools, cx);
+            panel.set_notices(notices, cx);
             panel.set_status(running, activity, cx);
             panel.set_empty_message(empty, cx);
         });

@@ -505,6 +505,15 @@ impl AgentConversationPanel {
         }
     }
 
+    /// Replace the status lines above the input.
+    pub fn set_notices(&mut self, notices: Vec<PanelNotice>, cx: &mut Context<Self>) {
+        if notices != self.notices {
+            self.notices = notices;
+            self.keep_highlight();
+            cx.notify();
+        }
+    }
+
     /// Replace the panel's title.
     pub fn set_title(&mut self, title: impl Into<SharedString>, cx: &mut Context<Self>) {
         let title = title.into();
