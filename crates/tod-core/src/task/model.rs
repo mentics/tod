@@ -89,6 +89,12 @@ pub struct TaskItem {
     /// Something stopped on this node since the user last selected it; the
     /// row says which kind did (fed by `TaskListView::set_finished_nodes`).
     pub finished_run: Option<RunSource>,
+    /// A ticket's synced metadata (priority, state, dates, ...), which a
+    /// generator's sort reads.
+    pub metadata: Option<std::sync::Arc<serde_json::Value>>,
+    /// The sort text of a generator node's config (`sort_query`); empty or
+    /// absent means none.
+    pub generator_sort: Option<String>,
 }
 
 /// What was acting on a node: the lifecycle processor, or only the chat panel.
@@ -387,7 +393,7 @@ pub fn compare_tasks(a: &TaskItem, b: &TaskItem, key: SortKey, dir: SortDirectio
         SortKey::InteractionTimestamp => a.interaction_timestamp.cmp(&b.interaction_timestamp),
         SortKey::Title => a.title.to_lowercase().cmp(&b.title.to_lowercase()),
         SortKey::Lifecycle => lifecycle_rank(&a.lifecycle).cmp(&lifecycle_rank(&b.lifecycle)),
-        SortKey::TicketId => compare_ticket_id(a.ticket_id.as_deref(), b.ticket_id.as_deref()),
+        SortKey::TicketId => compare_ticket_id(ticket_of(a), ticket_of(b)),
         SortKey::WaitingLongest => {
             let a_waiting = a.needs_you_count > 0;
             let b_waiting = b.needs_you_count > 0;
@@ -404,9 +410,15 @@ pub fn compare_tasks(a: &TaskItem, b: &TaskItem, key: SortKey, dir: SortDirectio
     }
 }
 
+/// The ticket a row is: a managed node's external id, else the ticket a
+/// node was given.
+fn ticket_of(task: &TaskItem) -> Option<&str> {
+    task.external_id.as_deref().or(task.ticket_id.as_deref())
+}
+
 fn compare_ticket_id(a: Option<&str>, b: Option<&str>) -> Ordering {
     match (a, b) {
-        (Some(a), Some(b)) => a.cmp(b),
+        (Some(a), Some(b)) => tod_integration::linear_sort::compare_ticket_ids(a, b),
         (Some(_), None) => Ordering::Less,
         (None, Some(_)) => Ordering::Greater,
         (None, None) => Ordering::Equal,
@@ -515,17 +527,54 @@ fn task_matches_generator_filter(
             .any(|tag| fuzzy_matches(&sort.filter_query, tag))
 }
 
+/// Whether any generator in `tasks` has a sort of its own configured.
+fn any_generator_sort(tasks: &[TaskItem]) -> bool {
+    tasks
+        .iter()
+        .any(|t| t.generator_sort.as_deref().is_some_and(|s| !s.trim().is_empty()))
+}
+
+fn sort_row(task: &TaskItem) -> tod_integration::linear_sort::SortRow<'_> {
+    tod_integration::linear_sort::SortRow {
+        external_id: ticket_of(task),
+        title: &task.title,
+        tags: &task.tags,
+        metadata: task.metadata.as_deref(),
+    }
+}
+
 fn sort_sibling_groups(
     children: &mut HashMap<Option<String>, Vec<usize>>,
     tasks: &[TaskItem],
     by_id: &HashMap<&str, &TaskItem>,
     working_set: &ListWorkingSet,
 ) {
+    use tod_integration::linear_sort;
+    let mut configured: HashMap<String, Vec<linear_sort::SortTerm>> = HashMap::new();
     for (parent_key, indices) in children.iter_mut() {
-        let (key, dir) = parent_key
+        let generator_id = parent_key
             .as_deref()
-            .and_then(|pid| owning_generator_id(by_id, pid))
-            .and_then(|generator_id| working_set.generator_sorts.get(&generator_id))
+            .and_then(|pid| owning_generator_id(by_id, pid));
+        let own = generator_id
+            .as_deref()
+            .and_then(|id| working_set.generator_sorts.get(id));
+        // The sort the generator's config names, which the row's sort button
+        // only flips: Asc keeps it as written, Desc runs every term backwards.
+        let terms = generator_id.as_deref().and_then(|id| {
+            let text = by_id.get(id)?.generator_sort.as_deref()?;
+            let terms = configured
+                .entry(id.to_string())
+                .or_insert_with(|| linear_sort::parse(text).unwrap_or_default());
+            (!terms.is_empty()).then(|| terms.clone())
+        });
+        if let Some(terms) = terms {
+            let flipped = own.is_some_and(|o| o.sort_direction == SortDirection::Desc);
+            indices.sort_by(|&a, &b| {
+                linear_sort::compare(&terms, flipped, &sort_row(&tasks[a]), &sort_row(&tasks[b]))
+            });
+            continue;
+        }
+        let (key, dir) = own
             .map(|sort| (sort.sort_key, sort.sort_direction))
             .unwrap_or((working_set.sort_key, working_set.sort_direction));
         indices.sort_by(|&a, &b| compare_tasks(&tasks[a], &tasks[b], key, dir));
@@ -599,7 +648,10 @@ pub fn filter_and_sort_tasks(
         })
         .cloned()
         .collect();
-    if working_set.sort_key == SortKey::TreeOrder && working_set.generator_sorts.is_empty() {
+    if working_set.sort_key == SortKey::TreeOrder
+        && working_set.generator_sorts.is_empty()
+        && !any_generator_sort(&filtered)
+    {
         return filtered;
     }
     let visible_ids: HashSet<&str> = filtered.iter().map(|t| t.id.as_str()).collect();
@@ -715,6 +767,8 @@ mod tests {
             linked_copy: false,
             has_copies: false,
             ticket_terminal: false,
+            metadata: None,
+            generator_sort: None,
             needs_you_count: 0,
             waiting_since: None,
             status_override: None,
@@ -959,6 +1013,83 @@ mod tests {
         let mut t = sample(id, title, "", &[]);
         t.managed_count = Some(2);
         t
+    }
+
+    fn ticket(id: &str, ext: &str, meta: serde_json::Value, ordinal: usize) -> TaskItem {
+        let mut t = managed_sample(id, id, "gen", ordinal);
+        t.external_id = Some(ext.into());
+        t.metadata = Some(std::sync::Arc::new(meta));
+        t
+    }
+
+    fn sorted_ids(tasks: &[TaskItem], ws: &ListWorkingSet) -> Vec<String> {
+        filter_and_sort_tasks(tasks, "", ws).into_iter().map(|t| t.id).collect()
+    }
+
+    #[test]
+    fn a_generators_configured_sort_orders_its_tickets_and_the_button_flips_it() {
+        let mut generator = generator_sample("gen", "Generator");
+        generator.generator_sort = Some("priority, ticket desc".into());
+        let tasks = vec![
+            generator,
+            ticket("a", "TOD-9", serde_json::json!({"priority": "High"}), 1),
+            ticket("b", "TOD-10", serde_json::json!({"priority": "High"}), 2),
+            ticket("c", "TOD-2", serde_json::json!({"priority": "Urgent"}), 3),
+            ticket("d", "TOD-1", serde_json::json!({"priority": null}), 4),
+        ];
+        let mut ws = ListWorkingSet::default_sort();
+        assert_eq!(sorted_ids(&tasks, &ws), ["gen", "c", "b", "a", "d"]);
+        ws.generator_sorts.insert(
+            "gen".into(),
+            GeneratorSubtreeSort {
+                sort_direction: SortDirection::Desc,
+                ..GeneratorSubtreeSort::default()
+            },
+        );
+        // Every term runs backwards; the ticket with no priority stays last.
+        assert_eq!(sorted_ids(&tasks, &ws), ["gen", "a", "b", "c", "d"]);
+    }
+
+    #[test]
+    fn a_configured_sort_leaves_other_lists_and_sub_issues_alone() {
+        let mut generator = generator_sample("gen", "Generator");
+        generator.generator_sort = Some("ticket".into());
+        let mut child = ticket("child", "TOD-1", serde_json::json!({}), 3);
+        child.parent_id = Some("b".into());
+        child.depth = 2;
+        let mut other_child = ticket("child2", "TOD-0", serde_json::json!({}), 4);
+        other_child.parent_id = Some("b".into());
+        other_child.depth = 2;
+        let tasks = vec![
+            sample("z", "Zed", "ready", &[]),
+            sample("y", "Why", "ready", &[]),
+            generator,
+            ticket("b", "TOD-20", serde_json::json!({}), 1),
+            ticket("a", "TOD-3", serde_json::json!({}), 2),
+            child,
+            other_child,
+        ];
+        let ws = ListWorkingSet::default_sort();
+        // Outside the generator the tree order stands; below it, tickets
+        // sort at every level.
+        assert_eq!(
+            sorted_ids(&tasks, &ws),
+            ["z", "y", "gen", "a", "b", "child2", "child"]
+        );
+    }
+
+    #[test]
+    fn ticket_sort_reads_managed_nodes_and_orders_by_number() {
+        let mut a = managed_sample("a", "A", "gen", 1);
+        a.external_id = Some("TOD-10".into());
+        let mut b = managed_sample("b", "B", "gen", 2);
+        b.external_id = Some("TOD-9".into());
+        let ws = ListWorkingSet {
+            sort_key: SortKey::TicketId,
+            sort_direction: SortDirection::Asc,
+            ..ListWorkingSet::default_sort()
+        };
+        assert_eq!(sorted_ids(&[generator_sample("gen", "G"), a, b], &ws), ["gen", "b", "a"]);
     }
 
     #[test]

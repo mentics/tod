@@ -809,8 +809,8 @@ impl TaskListView {
             RowAction::OpenTicket { task_id } => {
                 self.open_ticket_for(&task_id, cx);
             }
-            RowAction::CycleGeneratorSort { task_id } => {
-                self.cycle_generator_sort(&task_id, window, cx);
+            RowAction::FlipGeneratorSort { task_id } => {
+                self.flip_generator_sort(&task_id, window, cx);
             }
             RowAction::ToggleGeneratorFilter { task_id } => {
                 self.toggle_generator_filter(&task_id, window, cx);
@@ -853,7 +853,9 @@ impl TaskListView {
         }
     }
 
-    fn cycle_generator_sort(&mut self, task_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+    /// The row's sort button: run the generator's sort the other way round.
+    /// It reorders the rows already loaded; Linear is not asked again.
+    fn flip_generator_sort(&mut self, task_id: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Some(generator_id) = self.generator_ancestor_id(task_id) else {
             return;
         };
@@ -862,14 +864,7 @@ impl TaskListView {
             .generator_sorts
             .entry(generator_id)
             .or_default();
-        if entry.sort_key == tod_core::task::model::SortKey::TicketId {
-            entry.sort_key = tod_core::task::model::SortKey::TreeOrder;
-            entry.sort_direction = WorkingSet::initial_direction_for_key(entry.sort_key);
-        } else {
-            let next = entry.sort_key.cycle();
-            entry.sort_key = next;
-            entry.sort_direction = WorkingSet::initial_direction_for_key(next);
-        }
+        entry.sort_direction = entry.sort_direction.toggle();
         self.persist_working_set();
         self.rebuild_visible_list(window, cx);
     }

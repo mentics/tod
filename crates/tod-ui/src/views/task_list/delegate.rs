@@ -72,7 +72,7 @@ pub enum RowAction {
     OpenTicket {
         task_id: String,
     },
-    CycleGeneratorSort {
+    FlipGeneratorSort {
         task_id: String,
     },
     ToggleGeneratorFilter {
@@ -409,7 +409,7 @@ impl ListDelegate for TaskListDelegate {
                 {
                     let sink = sink.clone();
                     move || {
-                        sink.borrow_mut().push(RowAction::CycleGeneratorSort {
+                        sink.borrow_mut().push(RowAction::FlipGeneratorSort {
                             task_id: task_id_sort.clone(),
                         });
                     }

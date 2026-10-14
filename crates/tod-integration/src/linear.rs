@@ -144,6 +144,16 @@ impl DataSource for LinearDataSource {
                     required: false,
                 },
                 ConfigField {
+                    name: "_linear_sort".into(),
+                    label: "Sort".into(),
+                    help: "How the tickets are ordered, e.g. priority, updatedAt desc, ticket. The row's sort button flips it without asking Linear again.".into(),
+                    field_type: ConfigFieldType::Custom {
+                        type_hint: "linear_sort_fields".into(),
+                        metadata: serde_json::json!({}),
+                    },
+                    required: false,
+                },
+                ConfigField {
                     name: "result_cap".into(),
                     label: "Result cap".into(),
                     help: format!(
@@ -158,6 +168,10 @@ impl DataSource for LinearDataSource {
     }
 
     fn validate_config(&self, config: &serde_json::Value) -> Result<(), DataSourceError> {
+        if let Some(text) = config.get(crate::linear_sort::SORT_KEY).and_then(|v| v.as_str()) {
+            crate::linear_sort::parse(text)
+                .map_err(|e| DataSourceError::InvalidConfig(format!("Sort: {e}")))?;
+        }
         result_cap_from_config(config).map(|_| ())
     }
 
@@ -180,7 +194,8 @@ impl DataSource for LinearDataSource {
         let workspace_slug = fetch_workspace_slug(api_key)?;
 
         // Fetch all issues with pagination
-        let flat = fetch_all_issues(api_key, &filter, result_cap)?;
+        let order_by = crate::linear_sort::order_by(&crate::linear_sort::terms_from_config(config));
+        let flat = fetch_all_issues(api_key, &filter, order_by, result_cap)?;
 
         // Build tree and add workspace_slug to metadata
         let items = build_tree(flat, &workspace_slug);
@@ -223,6 +238,7 @@ pub fn is_filter_key(key: &str) -> bool {
     key != "result_cap"
         && key != "workspace_slug"
         && key != crate::linear_query::QUERY_KEY
+        && key != crate::linear_sort::SORT_KEY
         && !key.starts_with('_')
 }
 
@@ -753,6 +769,10 @@ struct FlatIssue {
     title: String,
     description: Option<String>,
     priority: Option<i32>,
+    estimate: Option<f64>,
+    created_at: Option<String>,
+    updated_at: Option<String>,
+    due_date: Option<String>,
     state: Option<String>,
     /// The workflow state's type (`completed`, `canceled`, ...).
     state_type: Option<String>,
@@ -765,6 +785,7 @@ struct FlatIssue {
 fn fetch_all_issues(
     api_key: &str,
     filter: &serde_json::Value,
+    order_by: Option<&str>,
     result_cap: usize,
 ) -> Result<Vec<FlatIssue>, DataSourceError> {
     let client = build_client()?;
@@ -773,13 +794,17 @@ fn fetch_all_issues(
 
     loop {
         let query = r#"
-            query Issues($filter: IssueFilter, $after: String, $first: Int!) {
-                issues(first: $first, after: $after, filter: $filter) {
+            query Issues($filter: IssueFilter, $after: String, $first: Int!, $orderBy: PaginationOrderBy) {
+                issues(first: $first, after: $after, filter: $filter, orderBy: $orderBy) {
                     nodes {
                         identifier
                         title
                         description
                         priority
+                        estimate
+                        createdAt
+                        updatedAt
+                        dueDate
                         state { name type }
                         assignee { name }
                         labels { nodes { name } }
@@ -799,6 +824,7 @@ fn fetch_all_issues(
                 "filter": filter,
                 "after": after,
                 "first": PAGE_SIZE,
+                "orderBy": order_by,
             },
         });
 
@@ -866,6 +892,10 @@ fn fetch_all_issues(
                 title: node.title,
                 description: node.description.filter(|d| !d.trim().is_empty()),
                 priority: node.priority,
+                estimate: node.estimate,
+                created_at: node.created_at,
+                updated_at: node.updated_at,
+                due_date: node.due_date,
                 state: node.state.as_ref().map(|s| s.name.clone()),
                 state_type: node.state.and_then(|s| s.state_type),
                 assignee: node.assignee.map(|a| a.name),
@@ -897,6 +927,9 @@ fn build_tree(flat: Vec<FlatIssue>, workspace_slug: &str) -> Vec<DataSourceItem>
     let mut children_by_parent: HashMap<String, Vec<String>> = HashMap::new();
     let mut by_id: HashMap<String, FlatIssue> = HashMap::new();
 
+    // The order Linear returned them in, which roots follow below: a
+    // `HashMap`'s iteration order is arbitrary and would shuffle them.
+    let fetched_order: Vec<String> = flat.iter().map(|i| i.identifier.clone()).collect();
     for issue in flat {
         if let Some(parent) = &issue.parent_identifier {
             children_by_parent
@@ -967,6 +1000,26 @@ fn build_tree(flat: Vec<FlatIssue>, workspace_slug: &str) -> Vec<DataSourceItem>
                 .unwrap_or(serde_json::Value::Null),
         );
 
+        // What the generator's sort reads back from the row.
+        for (key, value) in [
+            ("createdAt", &issue.created_at),
+            ("updatedAt", &issue.updated_at),
+            ("dueDate", &issue.due_date),
+        ] {
+            meta.insert(
+                key.into(),
+                value.clone().map(serde_json::Value::String).unwrap_or(serde_json::Value::Null),
+            );
+        }
+        meta.insert(
+            "estimate".into(),
+            issue
+                .estimate
+                .and_then(serde_json::Number::from_f64)
+                .map(serde_json::Value::Number)
+                .unwrap_or(serde_json::Value::Null),
+        );
+
         meta.insert(
             "workspace_slug".into(),
             serde_json::Value::String(workspace_slug.into()),
@@ -985,15 +1038,14 @@ fn build_tree(flat: Vec<FlatIssue>, workspace_slug: &str) -> Vec<DataSourceItem>
         }
     }
 
-    let root_ids: Vec<String> = by_id
-        .values()
-        .filter(|issue| {
-            issue
+    let root_ids: Vec<String> = fetched_order
+        .into_iter()
+        .filter(|id| {
+            by_id[id]
                 .parent_identifier
                 .as_ref()
                 .is_none_or(|parent| !by_id.contains_key(parent))
         })
-        .map(|issue| issue.identifier.clone())
         .collect();
 
     root_ids
@@ -1122,6 +1174,13 @@ struct IssueNode {
     title: String,
     description: Option<String>,
     priority: Option<i32>,
+    estimate: Option<f64>,
+    #[serde(rename = "createdAt")]
+    created_at: Option<String>,
+    #[serde(rename = "updatedAt")]
+    updated_at: Option<String>,
+    #[serde(rename = "dueDate")]
+    due_date: Option<String>,
     state: Option<StateRef>,
     assignee: Option<AssigneeRef>,
     labels: LabelConnection,
@@ -1384,6 +1443,10 @@ mod tests {
                 title: "Parent".into(),
                 description: None,
                 priority: None,
+                estimate: None,
+                created_at: None,
+                updated_at: None,
+                due_date: None,
                 state: None,
                 state_type: None,
                 assignee: None,
@@ -1395,6 +1458,10 @@ mod tests {
                 title: "Child".into(),
                 description: None,
                 priority: None,
+                estimate: None,
+                created_at: None,
+                updated_at: None,
+                due_date: None,
                 state: None,
                 state_type: None,
                 assignee: None,
@@ -1416,6 +1483,10 @@ mod tests {
             title: "Child".into(),
             description: None,
             priority: None,
+            estimate: None,
+            created_at: None,
+            updated_at: None,
+            due_date: None,
             state: None,
             state_type: None,
             assignee: None,
@@ -1434,6 +1505,10 @@ mod tests {
             title: "Fix bug".into(),
             description: None,
             priority: None,
+            estimate: None,
+            created_at: None,
+            updated_at: None,
+            due_date: None,
             state: None,
             state_type: None,
             assignee: None,
@@ -1475,6 +1550,10 @@ mod tests {
             title: "Test".into(),
             description: None,
             priority: Some(2),
+            estimate: None,
+            created_at: None,
+            updated_at: None,
+            due_date: None,
             state: Some("In Progress".into()),
             state_type: None,
             assignee: Some("Alice".into()),
