@@ -312,6 +312,27 @@ pub fn ensure(
     }
 }
 
+/// Checks a fork has what tod needs, installing nothing: fails naming what
+/// is missing ([`missing_in_fork_message`]). Warns about what is only optional.
+pub fn require_fork_prerequisites(
+    bx: &Blaxel,
+    url: &str,
+    agents: bool,
+    progress: &mut dyn FnMut(&str),
+) -> Result<Requirements> {
+    let found = parse_requirements(bx.run(url, &requirements_script(agents), 60)?.output());
+    if !found.optional.is_empty() {
+        progress(&format!(
+            "warning: the sandbox has no {} (a terminal agent cannot start there; the ACP agent is unaffected)",
+            found.optional.join(", ")
+        ));
+    }
+    if !found.missing.is_empty() {
+        bail!("{}", missing_in_fork_message(&found.missing));
+    }
+    Ok(found)
+}
+
 /// [`Mode::Fork`]: checks the sandbox has what tod needs, puts the relay and
 /// `tod-cli` in, and starts the relay. Installs no package.
 fn adopt_fork(
@@ -323,16 +344,7 @@ fn adopt_fork(
     progress: &mut dyn FnMut(&str),
 ) -> Result<Outcome> {
     check_relay_arch(payload.relay)?;
-    let found = parse_requirements(bx.run(url, &requirements_script(payload.agents), 60)?.output());
-    if !found.optional.is_empty() {
-        progress(&format!(
-            "warning: the sandbox has no {} (a terminal agent cannot start there; the ACP agent is unaffected)",
-            found.optional.join(", ")
-        ));
-    }
-    if !found.missing.is_empty() {
-        bail!("{}", missing_in_fork_message(&found.missing));
-    }
+    let found = require_fork_prerequisites(bx, url, payload.agents, progress)?;
     let started = Instant::now();
     if current.is_empty() {
         progress("putting tod's relay and tod-cli in the sandbox…");
@@ -378,7 +390,7 @@ fn wait_for_relay(bx: &Blaxel, url: &str, manifest: &str) -> Result<()> {
 /// Sandboxes are x86-64 Linux. A relay built for anything else (an arm64
 /// Docker build on Apple Silicon, say) uploads fine but cannot run, and shows
 /// up only as the relay never answering.
-fn check_relay_arch(relay: &[u8]) -> Result<()> {
+pub fn check_relay_arch(relay: &[u8]) -> Result<()> {
     const EM_X86_64: u16 = 0x3e;
     if relay.len() < 20 || &relay[..4] != b"\x7fELF" {
         bail!("the relay binary is not a Linux (ELF) executable; rebuild it with scripts/build-sandbox-binaries.sh");
