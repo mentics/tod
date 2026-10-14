@@ -223,3 +223,12 @@ fn the_origin_comes_from_the_checkout_or_the_error_says_what_was_tried() {
     let err = origin_url_of(&fleet, "n", "/workspace/not-here").unwrap_err().to_string();
     assert!(err.contains("not a checkout on this machine") && err.contains("https://github.com/owner/repo"), "{err}");
 }
+
+#[test]
+fn github_remote_url_prefers_origin_then_any_remote() {
+    let both = "remote.fs.url git@github.com:o/a.git\nremote.origin.url https://github.com/o/b.git";
+    assert_eq!(github_remote_url(both).as_deref(), Some("https://github.com/o/b.git"));
+    let only_fs = "remote.fs.url git@github.com:Cofactr/flagship.git";
+    assert_eq!(github_remote_url(only_fs).as_deref(), Some("https://github.com/Cofactr/flagship.git"));
+    assert_eq!(github_remote_url(""), None);
+}

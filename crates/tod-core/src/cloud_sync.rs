@@ -530,6 +530,25 @@ pub(crate) fn environment_credentials(
     fleet.read(|conn| tod_store::environment::sandbox_credentials(conn, creds, node))
 }
 
+/// `git config` pattern listing every remote's URL (`remote.<name>.url <url>`).
+const REMOTE_URLS: &str = r"^remote\..*\.url$";
+
+/// The HTTPS URL of a repository's remote, from `git config --get-regexp
+/// REMOTE_URLS` output: `origin` when it has one, else the first remote
+/// (a checkout may name its remote `fs` or `upstream`).
+fn github_remote_url(config: &str) -> Option<String> {
+    let remotes: Vec<(&str, &str)> = config
+        .lines()
+        .filter_map(|line| {
+            let (key, url) = line.split_once(char::is_whitespace)?;
+            Some((key.strip_prefix("remote.")?.strip_suffix(".url")?, url.trim()))
+        })
+        .collect();
+    let origin = remotes.iter().filter(|(name, _)| *name == "origin");
+    let others = remotes.iter().filter(|(name, _)| *name != "origin");
+    origin.chain(others).find_map(|(_, url)| https_repo_url(url))
+}
+
 /// The HTTPS origin of a node whose Files directory is not a URL: a checkout
 /// on this machine says it itself; a path inside a cloud sandbox (Files →
 /// Runs in → Cloud sandbox) is asked in the node's own sandbox, else in the
@@ -538,14 +557,14 @@ fn origin_url_of(fleet: &FleetStore, node_id: &str, repo: &str) -> Result<String
     let mut tried: Vec<String> = Vec::new();
     if std::path::Path::new(repo).is_dir() {
         let out = std::process::Command::new("git")
-            .args(["-C", repo, "remote", "get-url", "origin"])
+            .args(["-C", repo, "config", "--get-regexp", REMOTE_URLS])
             .output()
             .context("run git")?;
-        let remote = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        if let Some(url) = https_repo_url(&remote) {
+        let remotes = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if let Some(url) = github_remote_url(&remotes) {
             return Ok(url);
         }
-        tried.push(format!("the checkout at {repo} has origin {remote:?}"));
+        tried.push(format!("the checkout at {repo} has remotes {remotes:?}"));
     } else {
         let mut sandboxes: Vec<String> = Vec::new();
         if let Ok(Some(loc)) = fleet.read(|conn| tod_store::fleet::repos::files_location::FilesLocationRepo::new(conn).get(node_id)) {
@@ -560,16 +579,16 @@ fn origin_url_of(fleet: &FleetStore, node_id: &str, repo: &str) -> Result<String
         }
         for name in sandboxes {
             let found = tod_store::fleet::sandbox::SandboxExec::new(&name)
-                .output(repo, "git", &["remote", "get-url", "origin"])
+                .output(repo, "git", &["config", "--get-regexp", REMOTE_URLS])
                 .ok()
                 .filter(|o| o.status.success())
                 .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
             match found {
-                Some(remote) => match https_repo_url(&remote) {
+                Some(remotes) => match github_remote_url(&remotes) {
                     Some(url) => return Ok(url),
-                    None => tried.push(format!("sandbox {name} has origin {remote:?} at {repo}")),
+                    None => tried.push(format!("sandbox {name} has remotes {remotes:?} at {repo}")),
                 },
-                None => tried.push(format!("sandbox {name} has no git origin at {repo}")),
+                None => tried.push(format!("sandbox {name} has no git remotes at {repo}")),
             }
         }
     }
@@ -584,18 +603,41 @@ fn origin_url_of(fleet: &FleetStore, node_id: &str, repo: &str) -> Result<String
 /// Where a node's code comes from: its repository as an HTTPS URL, and branch.
 fn node_source(fleet: &FleetStore, node_id: &str) -> Result<(tod_store::fleet::FleetTask, String, String)> {
     let task = fleet.get_node(node_id)?.ok_or_else(|| anyhow!("no node {node_id}"))?;
-    let repo = task
-        .repo
-        .clone()
-        .filter(|r| !r.trim().is_empty())
-        .or_else(|| fleet.resolve_files_for_node(node_id).ok().flatten().and_then(|files| files.repo))
-        .filter(|r| !r.trim().is_empty())
-        .ok_or_else(|| {
-            anyhow!("the node has no repository (set its workspace directory in the Files section)")
-        })?;
-    let repo_url = match https_repo_url(&repo) {
+    // The Files capability's repository (the node's own, or the nearest
+    // ancestor's) comes first: a node's own `repo` field may hold a stale path
+    // (e.g. one inside a sandbox) while the ancestor holds the real URL. Try
+    // each distinct candidate; the first error is the one reported.
+    let inherited = fleet.resolve_files_for_node(node_id).ok().flatten().and_then(|files| files.repo);
+    let mut candidates: Vec<String> = Vec::new();
+    for repo in [inherited, task.repo.clone()].into_iter().flatten() {
+        let repo = repo.trim().to_string();
+        if !repo.is_empty() && !candidates.contains(&repo) {
+            candidates.push(repo);
+        }
+    }
+    if candidates.is_empty() {
+        bail!("the node has no repository (set its workspace directory in the Files section)");
+    }
+    let mut first_err = None;
+    let mut found = None;
+    for repo in &candidates {
+        let resolved = match https_repo_url(repo) {
+            Some(url) => Ok(url),
+            None => origin_url_of(fleet, node_id, repo),
+        };
+        match resolved {
+            Ok(url) => {
+                found = Some(url);
+                break;
+            }
+            Err(err) => {
+                first_err.get_or_insert(err);
+            }
+        }
+    }
+    let repo_url = match found {
         Some(url) => url,
-        None => origin_url_of(fleet, node_id, &repo)?,
+        None => return Err(first_err.expect("a candidate failed")),
     };
     let branch = task.branch.clone().filter(|b| !b.trim().is_empty()).unwrap_or_else(|| task.slug.clone());
     Ok((task, repo_url, branch))
