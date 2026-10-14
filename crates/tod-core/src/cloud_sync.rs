@@ -584,9 +584,15 @@ fn origin_url_of(fleet: &FleetStore, node_id: &str, repo: &str) -> Result<String
 /// Where a node's code comes from: its repository as an HTTPS URL, and branch.
 fn node_source(fleet: &FleetStore, node_id: &str) -> Result<(tod_store::fleet::FleetTask, String, String)> {
     let task = fleet.get_node(node_id)?.ok_or_else(|| anyhow!("no node {node_id}"))?;
-    let repo = task.repo.clone().filter(|r| !r.trim().is_empty()).ok_or_else(|| {
-        anyhow!("the node has no repository (set its workspace directory in the Files section)")
-    })?;
+    let repo = task
+        .repo
+        .clone()
+        .filter(|r| !r.trim().is_empty())
+        .or_else(|| fleet.resolve_files_for_node(node_id).ok().flatten().and_then(|files| files.repo))
+        .filter(|r| !r.trim().is_empty())
+        .ok_or_else(|| {
+            anyhow!("the node has no repository (set its workspace directory in the Files section)")
+        })?;
     let repo_url = match https_repo_url(&repo) {
         Some(url) => url,
         None => origin_url_of(fleet, node_id, &repo)?,
