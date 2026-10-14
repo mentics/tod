@@ -59,6 +59,17 @@ pub fn open_code_editor_for_node_with_progress(
     node_id: &str,
     progress: &mut dyn FnMut(&str),
 ) -> Result<PathBuf> {
+    crate::fleet::provision::retry_if_sandbox_lost(fleet, node_id, || {
+        open_code_editor_once(fleet, editor, node_id, &mut *progress)
+    })
+}
+
+fn open_code_editor_once(
+    fleet: &FleetStore,
+    editor: &dyn CodeEditor,
+    node_id: &str,
+    progress: &mut dyn FnMut(&str),
+) -> Result<PathBuf> {
     progress("Preparing the node's files…");
     let (dir, _) = resolve_launch_cwd_with(fleet, node_id, progress)?;
     progress(&format!("Opening in {}…", editor.label()));
@@ -144,7 +155,12 @@ pub fn open_code_location(
     let root = match node_id {
         Some(node_id) => match resolve_launch_cwd(fleet, node_id) {
             Ok(crate::fleet::Workdir::Host(root)) => Some(normalize_launch_path(&root)),
-            Ok(remote) => return open_remote_location(fleet, editor, &remote, location),
+            Ok(remote) => {
+                return crate::fleet::provision::retry_if_sandbox_lost(fleet, node_id, || {
+                    let remote = resolve_launch_cwd(fleet, node_id).unwrap_or_else(|_| remote.clone());
+                    open_remote_location(fleet, editor, &remote, location)
+                });
+            }
             Err(err) => {
                 if Path::new(&location.path).is_absolute() {
                     None

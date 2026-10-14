@@ -809,10 +809,12 @@ pub fn open_shell_for_node_with_progress(
     startup_command: Option<&str>,
     progress: &mut dyn FnMut(&str),
 ) -> Result<(String, Workdir)> {
-    progress("Preparing the node's files…");
-    let (cwd, _) = resolve_launch_cwd_with(fleet, node_id, progress)?;
-    progress("Starting the shell…");
-    open_shell_at(fleet, paths, settings, node_id, cwd, startup_command)
+    crate::fleet::provision::retry_if_sandbox_lost(fleet, node_id, || {
+        progress("Preparing the node's files…");
+        let (cwd, _) = resolve_launch_cwd_with(fleet, node_id, progress)?;
+        progress("Starting the shell…");
+        open_shell_at(fleet, paths, settings, node_id, cwd, startup_command)
+    })
 }
 
 /// Open a shell in the worktree or sandbox made for the node, whether or not
@@ -1195,6 +1197,19 @@ fn msys_unix_path(path: &Path) -> String {
 ///
 /// Uses the agent run id as the terminal state-file key for PID focus/liveness.
 pub fn open_terminal_agent_for_node(
+    fleet: &FleetStore,
+    paths: &TodPaths,
+    settings: &TodSettings,
+    node_id: &str,
+    startup_command: &str,
+    launch: Option<AgentLaunchOptions>,
+) -> Result<(String, Workdir)> {
+    crate::fleet::provision::retry_if_sandbox_lost(fleet, node_id, || {
+        open_terminal_agent_once(fleet, paths, settings, node_id, startup_command, launch.clone())
+    })
+}
+
+fn open_terminal_agent_once(
     fleet: &FleetStore,
     paths: &TodPaths,
     settings: &TodSettings,

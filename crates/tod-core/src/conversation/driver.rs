@@ -695,6 +695,48 @@ impl ConversationDriver {
                     },
                 );
             }
+            // The node's sandbox was deleted outside the app: forget it and
+            // send the same message again, which makes it a new one.
+            Err(message)
+                if self.focus.node_id().zip(run.sandbox.as_deref()).is_some_and(|(node, sandbox)| {
+                    tod_store::fleet::provision::forget_lost_sandbox(fleet, &node.to_string(), sandbox, &message)
+                        .unwrap_or(false)
+                }) =>
+            {
+                let (conversation, text, attachments) = fleet.read(|conn| {
+                    let repo = ConversationRepo::new(conn);
+                    let conversation = repo.get(id)?.context("conversation vanished")?;
+                    let (text, attachments) = repo
+                        .turns(id)?
+                        .into_iter()
+                        .find(|t| t.seq == run.user_seq)
+                        .map(|t| (t.body, t.attachments))
+                        .unwrap_or_default();
+                    Ok((conversation, text, attachments))
+                })?;
+                let images = attachments
+                    .iter()
+                    .map(|attachment| {
+                        Ok(PromptImage {
+                            mime_type: attachment.mime_type.clone(),
+                            data: attachment.read(fleet.paths().root())?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                tracing::warn!(conversation = %id, "sandbox gone, making a new one: {message}");
+                self.rotate_and_start(
+                    fleet,
+                    agent,
+                    &conversation,
+                    run.user_seq,
+                    "",
+                    &text,
+                    images,
+                    "sandbox lost",
+                    true,
+                )?;
+                events.push(ConversationEvent::Rotated);
+            }
             Err(message) if run.cold_resume => {
                 // The recorded session could not be resumed: start fresh and
                 // send the same message again, with its images.

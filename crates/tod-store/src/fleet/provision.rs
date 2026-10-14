@@ -75,6 +75,56 @@ pub fn resolve_launch_cwd_with(
     }
 }
 
+/// Recovery for a launch that failed reaching `sandbox`: when `error` says
+/// Blaxel has no sandbox by that name and it is still `node_id`'s recorded
+/// one, forget the location so the next launch makes the node a new sandbox
+/// (its session logs are restored there). Returns whether it did. Costs
+/// nothing on the normal path: it runs only after a failure.
+pub fn forget_lost_sandbox(fleet: &FleetStore, node_id: &str, sandbox: &str, error: &str) -> Result<bool> {
+    if !error.contains(&format!("no sandbox named {sandbox}")) {
+        return Ok(false);
+    }
+    let lock = node_lock(node_id);
+    let _held = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let files = resolve_files(fleet, node_id)?;
+    if files.location.as_ref().and_then(|l| l.sandbox.as_deref()) != Some(sandbox) {
+        return Ok(false);
+    }
+    fleet.enqueue(FleetMutation::DeleteFilesLocation { node_id: node_id.to_string() })?;
+    fleet.writer().flush()?;
+    fleet.reload_if_stale()?;
+    // A sandbox that is gone cannot hold sessions the next one should resume.
+    sandbox::forget_cached(sandbox);
+    Ok(true)
+}
+
+/// Runs `op` (which resolves the node's launch directory and uses it); when
+/// it fails because the node's recorded sandbox no longer exists, forgets
+/// that sandbox and runs `op` once more, which makes a new one. The normal
+/// path costs nothing.
+pub fn retry_if_sandbox_lost<T>(
+    fleet: &FleetStore,
+    node_id: &str,
+    mut op: impl FnMut() -> Result<T>,
+) -> Result<T> {
+    match op() {
+        Ok(value) => Ok(value),
+        Err(err) => {
+            let sandbox = node_location(fleet, node_id).ok().flatten().and_then(|l| l.sandbox);
+            let lost = match sandbox {
+                Some(name) => forget_lost_sandbox(fleet, node_id, &name, &format!("{err:#}")).unwrap_or(false),
+                None => false,
+            };
+            if lost {
+                tracing::warn!("sandbox of node {node_id} is gone; making a new one");
+                op()
+            } else {
+                Err(err)
+            }
+        }
+    }
+}
+
 /// Where `node_id` launches, without making anything: `Ok(Some)` when ready,
 /// `Ok(None)` when its worktree or sandbox will be made on first launch,
 /// `Err` with the user-facing reason it can't launch. Cheap enough for the

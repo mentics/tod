@@ -885,6 +885,11 @@ pub fn connect(name: &str) -> Result<Connection> {
     Ok(conn)
 }
 
+/// Drops the cached readiness of `name` (it is gone).
+pub fn forget_cached(name: &str) {
+    forget(name)
+}
+
 fn forget(name: &str) {
     ready().lock().expect("sandbox cache").remove(name);
 }
