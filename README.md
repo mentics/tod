@@ -242,6 +242,24 @@ everything), or summarize a folder with `... stats <dir>`. Pass `--home DIR`
 (`-JourneysHome DIR` in PowerShell) to use a different home. Format and
 protocol: [doc/journeys/spec.md](doc/journeys/spec.md).
 
+## Cloud orchestrator
+
+The cloud orchestrator is a separate sandbox that runs its own copy of
+`tod-orchestrator`, `tod-cli`, and `tod-relay`. It does **not** update when
+tod does, so after changing any of those crates (or when tod shows "The cloud
+orchestrator is out of date", or the log says `orchestrator ...: 404 Not
+Found`) redeploy it:
+
+```bash
+scripts/redeploy-orchestrator.sh --data-root <root>   # <root> holds sandboxes.toml
+```
+
+This builds the Linux binaries (needs Docker running, or zig +
+cargo-zigbuild), uploads them, and restarts the server. Its data is kept.
+Extra arguments go to `tod-sandbox orchestrator` (e.g. `--move-data`). The
+app deploys an orchestrator on its own only when none exists. Details:
+[doc/cloud-sandboxes/orchestrator.md](doc/cloud-sandboxes/orchestrator.md).
+
 ## Project layout
 
 ```text

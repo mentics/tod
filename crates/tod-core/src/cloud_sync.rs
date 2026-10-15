@@ -428,13 +428,35 @@ pub fn sync(fleet: &FleetStore, root: &Path, orch: &dyn Orchestrator, user: &str
             state.problems_after = Some(cursor);
             state.save(root)?;
         }
-        Err(err) => tracing::warn!("cloud sync: reading the cloud's problem log: {err:#}"),
+        Err(err) => warn_problem_log_unreadable(&err),
     }
     drop(_guard);
     if let Err(err) = lost::retire_done(fleet) {
         tracing::warn!("cloud sync: retiring done nodes: {err:#}");
     }
     Ok(report)
+}
+
+/// An orchestrator deployed before `problems/pull` existed answers 404 on every
+/// sync, and nothing the user does changes that until it is redeployed. That
+/// case is reported once per process, as a toast saying what to do; any other failure is
+/// reported every time, since the retry may differ.
+fn warn_problem_log_unreadable(err: &anyhow::Error) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static WARNED_MISSING: AtomicBool = AtomicBool::new(false);
+    if format!("{err:#}").contains("orchestrator problems: 404") {
+        if !WARNED_MISSING.swap(true, Ordering::Relaxed) {
+            // An error-level entry is what raises a toast.
+            crate::logging::buffer::record(
+                crate::logging::buffer::Level3::Error,
+                crate::logging::buffer::LogSource::App,
+                "The cloud orchestrator is out of date: it cannot send its problem log (404 on problems/pull). \
+                 Redeploy it with scripts/redeploy-orchestrator.sh --data-root <your data root> to see the cloud's problems here. Syncing otherwise works; this is not repeated until tod restarts.",
+            );
+        }
+    } else {
+        tracing::warn!("cloud sync: reading the cloud's problem log: {err:#}");
+    }
 }
 
 /// How long the store must be quiet before the outbox goes out.
