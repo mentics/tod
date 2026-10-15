@@ -10,18 +10,19 @@ use image::RgbaImage;
 use std::fs::File;
 use std::io::BufWriter;
 use std::path::Path;
+#[cfg(windows)]
 use std::sync::Mutex;
 
 /// Capture the app's main window as RGBA pixels, at native (physical) size.
 ///
 /// Returns `None` when there is no window to capture, or on platforms this
-/// isn't implemented for yet (anything but Windows, currently).
+/// isn't implemented for yet (anything but Windows and macOS).
 pub fn capture_app_screenshot() -> Option<RgbaImage> {
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     {
         capture_client_rgba().ok()
     }
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         None
     }
@@ -239,4 +240,100 @@ pub(crate) fn find_main_hwnd() -> Option<windows::Win32::Foundation::HWND> {
         let _ = EnumWindows(Some(callback), LPARAM(&mut state as *mut State as isize));
     }
     state.best.map(|(h, _)| h)
+}
+
+/// The app's own main window, read back from the window server.
+///
+/// A process may capture its own windows without Screen Recording permission,
+/// and `kCGWindowListOptionIncludingWindow` composites just that window, so it
+/// works while the window is covered or unfocused (`--no-focus`). Apple
+/// obsoleted `CGWindowListCreateImage` in the macOS 15 SDK headers but not at
+/// runtime; ScreenCaptureKit would need the permission even for ourselves.
+#[cfg(target_os = "macos")]
+pub(crate) fn capture_client_rgba() -> Result<RgbaImage, String> {
+    use core_graphics::geometry::CGRect;
+    use core_graphics::window::{
+        create_image, kCGWindowImageBestResolution, kCGWindowImageBoundsIgnoreFraming,
+        kCGWindowListOptionIncludingWindow,
+    };
+
+    let window_id = main_window_id()?;
+    let image = create_image(
+        CGRect::new(
+            &core_graphics::geometry::CGPoint::new(f64::INFINITY, f64::INFINITY),
+            &core_graphics::geometry::CGSize::new(0.0, 0.0),
+        ),
+        kCGWindowListOptionIncludingWindow,
+        window_id,
+        kCGWindowImageBoundsIgnoreFraming | kCGWindowImageBestResolution,
+    )
+    .ok_or_else(|| format!("CGWindowListCreateImage returned no image for window {window_id}"))?;
+
+    let (w, h) = (image.width(), image.height());
+    if image.bits_per_pixel() != 32 {
+        return Err(format!(
+            "unexpected window image format: {} bits per pixel",
+            image.bits_per_pixel()
+        ));
+    }
+    let stride = image.bytes_per_row();
+    let data = image.data();
+    let bytes = data.bytes();
+    if bytes.len() < stride * h {
+        return Err("window image data is shorter than its dimensions".into());
+    }
+    // The window server hands back BGRA.
+    let mut out = Vec::with_capacity(w * h * 4);
+    for row in 0..h {
+        for px in bytes[row * stride..row * stride + w * 4].chunks_exact(4) {
+            out.extend_from_slice(&[px[2], px[1], px[0], px[3]]);
+        }
+    }
+    RgbaImage::from_raw(w as u32, h as u32, out).ok_or_else(|| "invalid window image buffer".into())
+}
+
+/// The largest normal-layer window this process owns.
+#[cfg(target_os = "macos")]
+fn main_window_id() -> Result<u32, String> {
+    use core_foundation::base::{CFType, TCFType};
+    use core_foundation::dictionary::CFDictionary;
+    use core_foundation::number::CFNumber;
+    use core_foundation::string::CFString;
+    use core_graphics::window::{copy_window_info, kCGWindowListOptionAll};
+
+    let list = copy_window_info(kCGWindowListOptionAll, 0)
+        .ok_or_else(|| "CGWindowListCopyWindowInfo returned nothing".to_string())?;
+    let pid = std::process::id() as i64;
+    let number = |d: &CFDictionary<CFString, CFType>, key: &str| -> Option<f64> {
+        d.find(CFString::new(key))
+            .and_then(|v| v.downcast::<CFNumber>())
+            .and_then(|n| n.to_f64())
+    };
+    let mut best: Option<(u32, f64)> = None;
+    for item in list.iter() {
+        let dict: CFDictionary<CFString, CFType> =
+            unsafe { CFDictionary::wrap_under_get_rule(*item as _) };
+        if number(&dict, "kCGWindowOwnerPID") != Some(pid as f64)
+            || number(&dict, "kCGWindowLayer") != Some(0.0)
+        {
+            continue;
+        }
+        let Some(id) = number(&dict, "kCGWindowNumber") else {
+            continue;
+        };
+        let area = dict
+            .find(CFString::new("kCGWindowBounds"))
+            .and_then(|v| v.downcast::<CFDictionary>())
+            .map(|b| {
+                let b: CFDictionary<CFString, CFType> =
+                    unsafe { CFDictionary::wrap_under_get_rule(b.as_concrete_TypeRef()) };
+                number(&b, "Width").unwrap_or(0.0) * number(&b, "Height").unwrap_or(0.0)
+            })
+            .unwrap_or(0.0);
+        if area > 0.0 && best.map_or(true, |(_, a)| area > a) {
+            best = Some((id as u32, area));
+        }
+    }
+    best.map(|(id, _)| id)
+        .ok_or_else(|| "tod window not found".to_string())
 }
