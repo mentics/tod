@@ -199,7 +199,7 @@ impl Github {
         Ok(raw.into_summary())
     }
 
-    /// Open a pull request `head` -> `base` in `owner/repo`. Callers should
+    /// Open a **draft** pull request `head` -> `base` in `owner/repo`. Callers should
     /// check [`Github::find_open_pr`] first — this always creates a new one.
     pub fn create_pr(
         &self,
@@ -210,7 +210,7 @@ impl Github {
         title: &str,
         body: &str,
     ) -> Result<PullRequest, GithubError> {
-        let payload = serde_json::json!({ "title": title, "head": head, "base": base, "body": body });
+        let payload = serde_json::json!({ "title": title, "head": head, "base": base, "body": body, "draft": true });
         let raw: PrRaw = self.post_json(&format!("/repos/{owner}/{repo}/pulls"), payload)?;
         Ok(PullRequest { number: raw.number, url: raw.html_url })
     }
