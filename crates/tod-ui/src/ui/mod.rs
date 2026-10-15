@@ -20,6 +20,7 @@ pub mod pasted_image;
 pub mod report_problem;
 pub mod scroll_reveal;
 pub mod screenshot;
+pub mod find;
 pub mod selectable_text;
 pub mod status;
 pub mod status_filter;

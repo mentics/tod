@@ -23,16 +23,18 @@
 //! are measured when first shown and remeasured only when their entry or its
 //! expansion changes.
 
+use crate::ui::find::{FIND_CONTEXT, FindClose, count_matches};
 use crate::ui::row_scrollbar::RowScrollbar;
 use crate::ui::selectable_text::{selectable_markdown, selectable_text};
 use crate::ui::style;
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    AnyElement, Context, ElementId, EventEmitter, InteractiveElement, IntoElement, ListAlignment,
-    ListState, ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, Window,
+    AnyElement, AppContext as _, Context, ElementId, Focusable as _, Entity, EventEmitter, FocusHandle, InteractiveElement,
+    IntoElement, ListAlignment, ListState, Subscription, ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, Window,
     ObjectFit, StyledImage, div, img, list, px,
 };
-use gpui_component::button::ButtonVariants;
+use gpui_component::button::{Button, ButtonVariants};
+use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::scroll::Scrollbar;
 use gpui_component::{Icon, Sizable, h_flex, v_flex};
 use gpui_kit_assets::IconName;
@@ -357,6 +359,67 @@ fn tool_line(title: &str, status: &str) -> String {
     }
 }
 
+/// What a find searches, chunk by chunk: the text a chunk shows, collapsed or
+/// not (a match inside a collapsed chunk is revealed when it is visited).
+fn chunk_texts(entries: &[Entry]) -> Vec<(ChunkId, String)> {
+    let mut out = Vec::new();
+    for (ix, entry) in entries.iter().enumerate() {
+        let whole = ChunkId { entry: ix, part: None };
+        match entry.kind {
+            EntryKind::Marker => {}
+            EntryKind::User | EntryKind::Error | EntryKind::Raw { .. } => {
+                let label = entry.label.as_deref().unwrap_or(match entry.kind {
+                    EntryKind::Error => "Error",
+                    _ => "You",
+                });
+                out.push((whole, format!("{label}\n{}", entry.body)));
+            }
+            EntryKind::Agent => {
+                let pieces = pieces(entry);
+                let label = entry.label.as_deref().unwrap_or("Agent");
+                if pieces.is_empty() {
+                    let summary = entry.summary.as_deref().unwrap_or_default();
+                    out.push((whole, format!("{label}\n{}\n{summary}", entry.body)));
+                    continue;
+                }
+                out.push((whole, label.to_string()));
+                for (part_ix, (_, part)) in pieces.iter().enumerate() {
+                    let text = match part {
+                        ReplyPart::Text { text } | ReplyPart::Thought { text } => text.clone(),
+                        ReplyPart::Tool { title, status, .. } => tool_line(title, status),
+                    };
+                    out.push((ChunkId { entry: ix, part: Some(part_ix) }, text));
+                }
+                if let Some(summary) = &entry.summary {
+                    out.push((whole, summary.clone()));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The chunk of each occurrence of `query` in `entries`, in display order.
+pub fn find_hits(entries: &[Entry], query: &str) -> Vec<ChunkId> {
+    let mut hits = Vec::new();
+    for (id, text) in chunk_texts(entries) {
+        hits.extend(std::iter::repeat_n(id, count_matches(&text, query)));
+    }
+    hits
+}
+
+/// The find bar's state: the field, what it found, and where it is.
+struct Find {
+    input: Entity<InputState>,
+    query: String,
+    hits: Vec<ChunkId>,
+    /// Index into `hits` of the occurrence the bar is on.
+    current: usize,
+    /// Where focus returns when the bar closes.
+    return_focus: Option<FocusHandle>,
+    _subscription: Subscription,
+}
+
 pub struct TranscriptList {
     entries: Vec<Entry>,
     /// Chunks the host's user expanded or collapsed; the rest show their
@@ -379,6 +442,13 @@ pub struct TranscriptList {
     rendered_entries: usize,
     /// Scroll the highlighted chunk into view on the next render.
     scroll_to_highlight: bool,
+    /// The find bar, while open.
+    find: Option<Find>,
+    /// Chunks held open so the occurrence find is on shows, on top of what
+    /// the host's user toggled.
+    find_open: HashSet<ChunkId>,
+    /// Scroll the current occurrence into view on the next render.
+    scroll_to_find: bool,
 }
 
 impl EventEmitter<TranscriptListEvent> for TranscriptList {}
@@ -411,6 +481,9 @@ impl TranscriptList {
             list,
             rendered_entries: 0,
             scroll_to_highlight: false,
+            find: None,
+            find_open: HashSet::new(),
+            scroll_to_find: false,
         }
     }
 
@@ -452,6 +525,7 @@ impl TranscriptList {
         let changed: HashSet<usize> = (keep..self.entries.len().max(keep + tail.is_some() as usize)).collect();
         self.entries.truncate(keep);
         self.entries.extend(tail);
+        self.refresh_find_hits();
         self.sync_rows(&changed);
         if follow {
             self.list.scroll_to_end();
@@ -464,6 +538,7 @@ impl TranscriptList {
         // unless the user has scrolled away from the end.
         let follow = entries.last().is_some_and(|e| e.live) && self.list.is_scrolled_to_end().unwrap_or(true);
         self.entries = entries;
+        self.refresh_find_hits();
         self.sync_rows(&changed);
         if follow {
             self.list.scroll_to_end();
@@ -564,9 +639,166 @@ impl TranscriptList {
         self.toggled.clear();
         self.highlight = None;
         self.rendered_entries = 0;
+        self.find_open.clear();
+        if let Some(find) = &mut self.find {
+            find.hits.clear();
+            find.current = 0;
+        }
         self.rows = self.all_rows();
         self.list.reset(self.rows.len());
         cx.notify();
+    }
+
+    /// The find bar's query, hit count, and current index; `None` when closed.
+    #[cfg(test)]
+    pub(crate) fn find_status(&self) -> Option<(String, usize, usize)> {
+        self.find.as_ref().map(|f| (f.query.clone(), f.hits.len(), f.current))
+    }
+
+    /// Open the find bar (or refocus it) and put the cursor in its field.
+    pub fn open_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.find.is_none() {
+            let input = cx.new(|cx| InputState::new(window, cx).placeholder("Find in transcript…"));
+            let subscription = cx.subscribe_in(&input, window, |this, input, event, window, cx| match event {
+                InputEvent::Change => {
+                    // Enter also reports a change with the text as it was:
+                    // only a different query starts the search over.
+                    let query = input.read(cx).value().to_string();
+                    if this.find.as_ref().is_some_and(|f| f.query != query) {
+                        this.set_find_query(query, cx);
+                    }
+                }
+                InputEvent::PressEnter { shift, .. } => this.find_step(!*shift, cx),
+                _ => {
+                    let _ = window;
+                }
+            });
+            self.find = Some(Find {
+                input,
+                query: String::new(),
+                hits: Vec::new(),
+                current: 0,
+                return_focus: window.focused(cx),
+                _subscription: subscription,
+            });
+        }
+        if let Some(find) = &self.find {
+            let handle = find.input.read(cx).focus_handle(cx);
+            window.focus(&handle, cx);
+        }
+        cx.notify();
+    }
+
+    /// Close the find bar and give focus back to where it was.
+    pub fn close_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(find) = self.find.take() else { return };
+        if let Some(handle) = find.return_focus {
+            window.focus(&handle, cx);
+        }
+        self.find_open.clear();
+        self.sync_rows_all();
+        cx.notify();
+    }
+
+    fn set_find_query(&mut self, query: String, cx: &mut Context<Self>) {
+        let hits = find_hits(&self.entries, &query);
+        if let Some(find) = &mut self.find {
+            find.query = query;
+            find.hits = hits;
+            find.current = 0;
+        }
+        self.reveal_current_hit(cx);
+    }
+
+    /// Move to the next (or previous) occurrence, wrapping.
+    fn find_step(&mut self, forward: bool, cx: &mut Context<Self>) {
+        let Some(find) = &mut self.find else { return };
+        if find.hits.is_empty() {
+            return;
+        }
+        let n = find.hits.len();
+        find.current = if forward { (find.current + 1) % n } else { (find.current + n - 1) % n };
+        self.reveal_current_hit(cx);
+    }
+
+    /// Hold open what shows the current occurrence and scroll to it.
+    fn reveal_current_hit(&mut self, cx: &mut Context<Self>) {
+        self.find_open.clear();
+        let hit = self.find.as_ref().and_then(|f| f.hits.get(f.current).copied());
+        if let Some(id) = hit {
+            self.find_open.insert(ChunkId { entry: id.entry, part: None });
+            self.find_open.insert(id);
+            self.scroll_to_find = true;
+        }
+        self.sync_rows_all();
+        cx.notify();
+    }
+
+    /// Recount the occurrences after the entries changed, keeping the bar
+    /// on the same index when it still exists.
+    fn refresh_find_hits(&mut self) {
+        let Some(find) = &mut self.find else { return };
+        find.hits = find_hits(&self.entries, &find.query);
+        find.current = find.current.min(find.hits.len().saturating_sub(1));
+    }
+
+    /// Rebuild the rows after the find's open set changed: any entry may
+    /// have changed, so every row is told.
+    fn sync_rows_all(&mut self) {
+        let changed: HashSet<usize> = (0..self.entries.len()).collect();
+        self.sync_rows(&changed);
+    }
+
+    fn render_find_bar(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let find = self.find.as_ref()?;
+        let count = if find.query.is_empty() {
+            SharedString::default()
+        } else if find.hits.is_empty() {
+            "No results".into()
+        } else {
+            format!("{} of {}", find.current + 1, find.hits.len()).into()
+        };
+        Some(
+            h_flex()
+                .key_context(FIND_CONTEXT)
+                .absolute()
+                .top(style::space::RELATED)
+                .right(px(24.))
+                .w(px(340.))
+                .items_center()
+                .gap(style::space::RELATED)
+                .p(style::space::RELATED)
+                .rounded(style::radius::CONTROL)
+                .bg(style::color::badge_fill())
+                .border_1()
+                .border_color(style::color::badge_edge())
+                .occlude()
+                .on_action(cx.listener(|this, _: &FindClose, window, cx| this.close_find(window, cx)))
+                .child(div().flex_1().min_w_0().child(Input::new(&find.input)))
+                .child(style::text_dense_muted(div()).flex_shrink_0().child(count))
+                .child(
+                    Button::new("transcript-find-prev")
+                        .ghost()
+                        .compact()
+                        .icon(IconName::ChevronUp)
+                        .on_click(cx.listener(|this, _, _, cx| this.find_step(false, cx))),
+                )
+                .child(
+                    Button::new("transcript-find-next")
+                        .ghost()
+                        .compact()
+                        .icon(IconName::ChevronDown)
+                        .on_click(cx.listener(|this, _, _, cx| this.find_step(true, cx))),
+                )
+                .child(
+                    Button::new("transcript-find-close")
+                        .ghost()
+                        .compact()
+                        .icon(IconName::Close)
+                        .on_click(cx.listener(|this, _, window, cx| this.close_find(window, cx))),
+                )
+                .into_any_element(),
+        )
     }
 
     #[allow(dead_code)]
@@ -575,12 +807,18 @@ impl TranscriptList {
     }
 
     fn is_expanded(&self, id: ChunkId) -> bool {
-        is_expanded(&self.entries, &self.toggled, id, self.start)
+        self.find_open.contains(&id) || is_expanded(&self.entries, &self.toggled, id, self.start)
     }
 
     /// Every row, the status rows included.
     fn all_rows(&self) -> Vec<Row> {
-        let mut rows = rows(&self.entries, &self.toggled, self.start);
+        let mut rows = if self.find_open.is_empty() {
+            rows(&self.entries, &self.toggled, self.start)
+        } else {
+            let mut toggled = self.toggled.clone();
+            toggled.extend(self.find_open.iter().map(|id| (*id, true)));
+            rows(&self.entries, &toggled, self.start)
+        };
         if self.running {
             rows.push(Row::Working);
         }
@@ -670,6 +908,25 @@ impl TranscriptList {
                         .child(summary),
                 )
             })
+    }
+
+    /// The background a row takes while a find is on: a faint one when the
+    /// chunk holds an occurrence, a stronger one for the current one.
+    fn find_tint(&self, row: Row) -> Option<gpui::Hsla> {
+        let find = self.find.as_ref().filter(|f| !f.hits.is_empty())?;
+        let id = match row {
+            Row::Piece { entry, part } => ChunkId { entry, part: Some(part) },
+            Row::Entry { entry, marker: false } => ChunkId { entry, part: None },
+            Row::AgentBody(entry) | Row::Summary(entry) => ChunkId { entry, part: None },
+            _ => return None,
+        };
+        if find.hits.get(find.current) == Some(&id) {
+            Some(style::color::highlight())
+        } else if find.hits.contains(&id) {
+            Some(style::color::highlight_faint())
+        } else {
+            None
+        }
     }
 
     fn render_row(&self, row: Row, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
@@ -944,6 +1201,15 @@ impl Render for TranscriptList {
             }
         }
 
+        if std::mem::take(&mut self.scroll_to_find) {
+            let hit = self.find.as_ref().and_then(|f| f.hits.get(f.current).copied());
+            if let Some(id) = hit {
+                if let Some(row) = self.rows.iter().position(|row| row.chunk() == Some(id)) {
+                    self.list.scroll_to_reveal_item(row);
+                }
+            }
+        }
+
         // Only the rows in view are built: `list` asks for them by index.
         let row_list = list(
             self.list.clone(),
@@ -961,6 +1227,7 @@ impl Render for TranscriptList {
                         style::space::INLINE
                     })
                     .when(ix + 1 == this.rows.len(), |el| el.pb(style::space::INSET))
+                    .when_some(this.find_tint(row), |el, tint| el.bg(tint))
                     .child(this.render_row(row, window, cx))
                     .into_any_element()
             }),
@@ -972,6 +1239,7 @@ impl Render for TranscriptList {
             .min_h_0()
             .relative()
             .child(row_list)
+            .children(self.render_find_bar(cx))
             .child(
                 div()
                     .occlude()
@@ -988,6 +1256,30 @@ impl Render for TranscriptList {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn find_hits_cover_collapsed_pieces_and_ignore_case() {
+        let user = Entry::raw(true, "Request", "Needle in a haystack");
+        let reply = agent(
+            vec![
+                ReplyPart::Thought { text: "no match here".into() },
+                ReplyPart::Tool { id: "1".into(), title: "grep needle".into(), status: String::new() },
+                ReplyPart::Text { text: "NEEDLE and needle".into() },
+            ],
+            "",
+        );
+        let hits = find_hits(&[user, reply], "needle");
+        assert_eq!(
+            hits,
+            vec![
+                ChunkId { entry: 0, part: None },
+                ChunkId { entry: 1, part: Some(1) },
+                ChunkId { entry: 1, part: Some(2) },
+                ChunkId { entry: 1, part: Some(2) },
+            ]
+        );
+        assert!(find_hits(&[], "x").is_empty());
+    }
 
     fn agent(parts: Vec<ReplyPart>, body: &str) -> Entry {
         Entry {

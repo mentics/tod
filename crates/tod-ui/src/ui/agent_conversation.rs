@@ -171,6 +171,12 @@ pub fn forward_panel_keys<E: InteractiveElement>(
                     cx.propagate();
                 }
             }
+        })
+        .on_action({
+            let panel = panel.clone();
+            move |_: &crate::ui::find::FindInTranscript, window, cx| {
+                panel.update(cx, |p, cx| p.open_find(window, cx));
+            }
         });
     el
 }
@@ -178,6 +184,7 @@ pub fn forward_panel_keys<E: InteractiveElement>(
 /// Register after the host's bindings, so these are tried first; each
 /// propagates when the panel is not being written in.
 pub fn register_agent_conversation_bindings(cx: &mut App) {
+    crate::ui::find::register_find_bindings(cx);
     let input = Some(key_context::including_input(AGENT_CONVERSATION_CONTEXT));
     cx.bind_keys([
         KeyBinding::new("ctrl-enter", AgentConversationSubmit, input),
@@ -415,6 +422,16 @@ impl AgentConversationPanel {
             list,
             _list_subscription: subscription,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn find_status(&self, cx: &App) -> Option<(String, usize, usize)> {
+        self.list.read(cx).find_status()
+    }
+
+    /// Open the find bar on the transcript (Ctrl/Cmd+F).
+    pub fn open_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.list.update(cx, |list, cx| list.open_find(window, cx));
     }
 
     pub fn set_extra_hint(&mut self, hint: impl Into<SharedString>) {

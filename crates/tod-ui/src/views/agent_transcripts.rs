@@ -184,6 +184,8 @@ pub fn register_agent_transcripts_keyboard_bindings(cx: &mut App) {
         KeyBinding::new("9", AgentTranscriptsPick9, context),
     ]);
     key_context::bind_panel_escape(cx, AgentTranscriptsClose, AGENT_TRANSCRIPTS_CONTEXT);
+    // Last, so the find field's Escape beats the window's own.
+    crate::ui::find::register_find_bindings(cx);
 }
 
 /// A navigation key while the keyboard is in the transcript.
@@ -1146,6 +1148,9 @@ impl Render for AgentTranscriptsView {
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(|this, _: &AgentTranscriptsClose, window, cx| {
                 this.close(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &crate::ui::find::FindInTranscript, window, cx| {
+                this.transcript.update(cx, |list, cx| list.open_find(window, cx));
             }))
             .on_action(cx.listener(|this, _: &AgentTranscriptsRefresh, _, cx| {
                 this.refresh(cx);
