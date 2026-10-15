@@ -49,6 +49,17 @@ impl RollingCondition for SizeCapCondition {
     }
 }
 
+/// The level filter, plus a cap on gpui's macOS font loader. It warns once per
+/// duplicate PostScript name in the system UI font family (`.SFNS-Bold` is
+/// listed twice by CoreText); the duplicate is skipped correctly and nothing
+/// we configure can avoid it, so only its errors are worth keeping.
+fn level_filter(level: LogLevel) -> EnvFilter {
+    EnvFilter::new(format!(
+        "{},gpui_macos::text_system=error",
+        level.as_filter_directive()
+    ))
+}
+
 /// Initialize the global tracing subscriber with an NDJSON file sink under `log_dir`.
 pub fn init(config: InitConfig) -> Result<()> {
     std::fs::create_dir_all(&config.log_dir).with_context(|| {
@@ -76,7 +87,7 @@ pub fn init(config: InitConfig) -> Result<()> {
     let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
     *WORKER_GUARD.lock().expect("worker guard lock") = Some(guard);
 
-    let filter = EnvFilter::new(config.level.as_filter_directive());
+    let filter = level_filter(config.level);
     let (filter_layer, reload_handle) = reload::Layer::new(filter);
     let _ = FILTER_RELOAD.set(reload_handle);
 
@@ -128,7 +139,7 @@ pub fn reload_level(level: LogLevel) -> Result<()> {
         .get()
         .context("logging filter reload handle not initialized")?;
     handle
-        .reload(EnvFilter::new(level.as_filter_directive()))
+        .reload(level_filter(level))
         .context("failed to reload log level filter")?;
     Ok(())
 }
