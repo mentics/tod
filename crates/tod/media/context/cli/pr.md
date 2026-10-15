@@ -16,7 +16,7 @@ tod-cli --data-root <DATA_ROOT> pr merged                            [--note <TE
 tod-cli --data-root <DATA_ROOT> pr blocked                           --why <TEXT>
 ```
 
-- `open` refuses when a PR is already linked in that repository; run `status` first.
+- `open` always opens a draft PR, and refuses when a PR is already linked in that repository; run `status` first.
 - `threads` lists open review threads, human and bot, with code, comments and
   roughly how many rounds each has had. `threads answer` posts `--reply` (what
   you did, or why not) and resolves the thread. `--fixed`: push first

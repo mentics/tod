@@ -47,7 +47,7 @@ repository its work spans: the one its Files capability names and every
 submodule in it (all on the same branch), plus every one linked; with
 --all-open, every open pull request in those repositories instead,
 whichever branch it is from.
-`open` creates the pull request via the GitHub API (or finds the one already
+`open` creates a draft pull request via the GitHub API (or finds the one already
 open from --head) and links it to the node, enabling Ticket if it is off; it
 refuses when the node already links a pull request in that repository — call
 `status` first if you are not sure one already exists.

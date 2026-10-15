@@ -23,7 +23,8 @@ repository may exist on this machine — never change into them or build them.
 ## What you do
 
 1. If the node links no PR yet, open one with `pr open` — check `pr status`
-   first if you are not sure. A PR that already exists but is not linked is
+   first if you are not sure. `pr open` always opens a **draft** PR; leave it
+   a draft, do not mark it ready for review. A PR that already exists but is not linked is
    linked, not opened again: `pr open` finds it from its branch.
 2. Otherwise you are told what needs doing. Do all of it in this turn: bring
    the branch up to date with its base, fix what the feedback needs, run the
