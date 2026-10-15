@@ -310,6 +310,17 @@ pub fn install_local(dir: &Path) -> Result<InstalledAdapter> {
     })
 }
 
+/// Update the user's global install, by running [`GLOBAL_INSTALL`]. Only for
+/// when the user asked for it: tod otherwise never changes a global install.
+/// Returns what [`find`] then finds.
+pub fn update_global() -> Result<Option<InstalledAdapter>> {
+    run(
+        npm(&["install", "-g", &format!("{PACKAGE}@latest")]),
+        "Updating the global Claude ACP adapter",
+    )?;
+    Ok(find())
+}
+
 /// Update tod's own install when there is one and the registry has a newer
 /// version; tod keeps it current without asking, since nothing else uses it.
 /// Returns the updated install, or `None` when there was nothing to do.

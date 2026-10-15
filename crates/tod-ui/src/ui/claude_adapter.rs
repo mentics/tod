@@ -69,6 +69,39 @@ pub fn check(cx: &mut App) -> Task<()> {
     })
 }
 
+/// Update the user's global install by running [`claude_adapter::GLOBAL_INSTALL`],
+/// then check again. Only called when the user pressed the button that says so.
+/// Gives the version now installed.
+pub fn update_global(cx: &mut App) -> Task<Result<String, String>> {
+    let entity = state(cx);
+    entity.update(cx, |adapter, cx| {
+        adapter.installing = true;
+        adapter.error = None;
+        cx.notify();
+    });
+    let work = cx.background_spawn(async move {
+        let updated = claude_adapter::update_global();
+        (updated, claude_adapter::status(true))
+    });
+    cx.spawn(async move |cx| {
+        let (updated, status) = work.await;
+        let result = match updated {
+            Ok(Some(installed)) => Ok(installed.version.unwrap_or_else(|| "?".into())),
+            Ok(None) => Err("npm finished, but the adapter is still not found.".to_string()),
+            Err(err) => Err(format!("{err:#}")),
+        };
+        let _ = entity.update(cx, |adapter, cx| {
+            adapter.installing = false;
+            if let Err(err) = &result {
+                adapter.error = Some(err.clone());
+            }
+            adapter.status = Some(status);
+            cx.notify();
+        });
+        result
+    })
+}
+
 /// Install the latest adapter for tod only, then check again.
 pub fn install_for_tod(cx: &mut App) {
     let entity = state(cx);
@@ -150,6 +183,17 @@ impl ClaudeAdapter {
         self.status.as_ref().map(summary)
     }
 
+    /// Whether the global install is the one in use and out of date, which
+    /// the user can have tod update ([`update_global`]).
+    pub fn global_update_offered(&self) -> bool {
+        self.status.as_ref().is_some_and(|s| {
+            s.out_of_date()
+                && s.installed
+                    .as_ref()
+                    .is_some_and(|i| i.source == AdapterSource::Global)
+        })
+    }
+
     /// What the app says unasked when it starts: only what needs the user.
     pub fn startup_message(&self) -> Option<(Severity, String)> {
         startup_message(self.status.as_ref()?)
@@ -181,7 +225,8 @@ fn startup_message(status: &AdapterStatus) -> Option<(Severity, String)> {
         AdapterSource::Global => Some((
             Severity::Warning,
             format!(
-                "Claude's ACP adapter is out of date ({versions}). Update it:\n{command}\n\
+                "Claude's ACP adapter is out of date ({versions}). Update it with the button \
+                 below, or run:\n{command}\n\
                  Or install it for tod only in Settings → Agents, which tod keeps up to date."
             ),
         )),

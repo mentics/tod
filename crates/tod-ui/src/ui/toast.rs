@@ -179,6 +179,17 @@ fn show_error_toast(
 
 /// Amber banner for something the user should know that is not a failure.
 pub fn warning_toast(window: &mut Window, cx: &mut App, message: impl Into<SharedString>) {
+    warning_toast_with_action(window, cx, message, None);
+}
+
+/// [`warning_toast`] with a button under the message that runs `action`
+/// (its label, and what it does) and dismisses the banner.
+pub fn warning_toast_with_action(
+    window: &mut Window,
+    cx: &mut App,
+    message: impl Into<SharedString>,
+    action: Option<(SharedString, Rc<dyn Fn(&mut Window, &mut App)>)>,
+) {
     let message = message.into();
     tod_core::logging::buffer::record_notified(
         tod_core::logging::buffer::Level3::Warn,
@@ -206,11 +217,25 @@ pub fn warning_toast(window: &mut Window, cx: &mut App, message: impl Into<Share
                     .shadow_lg()
                     .items_start()
                     .child(
-                        div().flex_1().min_w_0().pr_5().child(
-                            selectable_text("warning-banner-text", message.clone(), window, cx)
-                                .text_sm()
-                                .text_color(gpui::white()),
-                        ),
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .pr_5()
+                            .child(
+                                selectable_text("warning-banner-text", message.clone(), window, cx)
+                                    .text_sm()
+                                    .text_color(gpui::white()),
+                            )
+                            .children(action.clone().map(|(label, run)| {
+                                div().mt_2().child(
+                                    Button::new("warning-banner-action").label(label).on_click(
+                                        cx.listener(move |note, _, window, cx| {
+                                            note.dismiss(window, cx);
+                                            run(window, cx);
+                                        }),
+                                    ),
+                                )
+                            })),
                     )
                     .into_any_element()
             }),

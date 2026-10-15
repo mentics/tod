@@ -28,7 +28,9 @@ use crate::ui::code_links::{OpenCodeRef, open_code_ref};
 use crate::ui::key_context::NOT_INPUT;
 use crate::ui::selectable_text::selectable_text;
 use crate::ui::status::{self, StatusSource};
-use crate::ui::toast::{error_toast, info_toast, notification_overlay, warning_toast};
+use crate::ui::toast::{
+    error_toast, info_toast, notification_overlay, warning_toast, warning_toast_with_action,
+};
 use crate::views::database::DatabaseView;
 use crate::views::lifecycle_control::LifecycleController;
 use crate::views::pull_requests::PullRequestsView;
@@ -118,6 +120,9 @@ pub struct Shell {
     /// Errors already in the log whose toast is waiting to be shown.
     pending_logged_toast: Option<String>,
     pending_warning_toast: Option<String>,
+    /// Set with `pending_warning_toast` when the warning is that the global
+    /// Claude adapter is out of date: it then carries the update button.
+    pending_adapter_update: bool,
     always_on_top: bool,
     _settings_subscription: Subscription,
     _unified_nav_subscription: Subscription,
@@ -595,7 +600,16 @@ impl Shell {
 
     fn drain_pending_error_toast(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(message) = self.pending_warning_toast.take() {
-            warning_toast(window, cx, message);
+            if std::mem::take(&mut self.pending_adapter_update) {
+                warning_toast_with_action(
+                    window,
+                    cx,
+                    message,
+                    Some(("Update now".into(), std::rc::Rc::new(update_global_adapter))),
+                );
+            } else {
+                warning_toast(window, cx, message);
+            }
         }
         // One error toast at a time (they share a slot), so both kinds merge
         // when they land together; the merged text is then logged once more.
@@ -1155,6 +1169,31 @@ fn open_fleet_store(
 }
 
 /// The banner for a transcript format the reader does not know.
+/// The adapter warning's "Update now": run the global install and say how it
+/// went.
+fn update_global_adapter(window: &mut Window, cx: &mut App) {
+    info_toast(window, cx, "Updating Claude's ACP adapter…");
+    let update = crate::ui::claude_adapter::update_global(cx);
+    window
+        .spawn(cx, async move |cx| {
+            let result = update.await;
+            let _ = cx.update(|window, cx| match result {
+                Ok(version) => {
+                    info_toast(window, cx, format!("Claude's ACP adapter is now {version}."))
+                }
+                Err(err) => error_toast(
+                    window,
+                    cx,
+                    format!(
+                        "Updating Claude's ACP adapter failed: {err}\n\nRun it yourself:\n{}",
+                        tod_agent::claude_adapter::GLOBAL_INSTALL
+                    ),
+                ),
+            });
+        })
+        .detach();
+}
+
 fn transcript_format_message(notice: &run_transcript::FormatNotice) -> String {
     let problems = notice
         .problems
@@ -1446,6 +1485,7 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                 pending_error_toast: None,
                                 pending_logged_toast: None,
                                 pending_warning_toast: None,
+                                pending_adapter_update: false,
                                 always_on_top: restore_always_on_top,
                                 _settings_subscription,
                                 _unified_nav_subscription,
@@ -1491,6 +1531,8 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                 let _ = adapter_entity.update(cx, |shell, cx| {
                                     let adapter = crate::ui::claude_adapter::state(cx);
                                     let message = adapter.read(cx).startup_message();
+                                    shell.pending_adapter_update =
+                                        adapter.read(cx).global_update_offered();
                                     match message {
                                         Some((crate::ui::claude_adapter::Severity::Error, text)) => {
                                             shell.queue_error_toast(text, cx)
