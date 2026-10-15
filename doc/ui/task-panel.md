@@ -98,12 +98,18 @@ along, and its menu holds the rest.
 
 | Runner is | Default action | Menu |
 |---|---|---|
-| never started, or done and moved back | **Start** | Run in the cloud |
+| never started, or done and moved back | **Start** | Move to the cloud |
 | running | **Pause** (once the agent's turn ends) | Stop now (cancels the turn) |
-| paused, stopped, failed, or waiting | **Resume** | Resume with a fresh budget, Run in the cloud |
-| stopped because its budget ran out | **Resume with a fresh budget** | Run in the cloud |
+| paused, stopped, failed, or waiting | **Resume** | Resume with a fresh budget, Move to the cloud |
+| stopped because its budget ran out | **Resume with a fresh budget** | Move to the cloud |
+| its files are in a cloud sandbox, not running there | **Run in the cloud** | Run on this machine instead |
 | in the cloud | **Sync now** | Stop running in the cloud |
 | a conversation the user started by hand is running | **Stop** | |
+
+The default action always continues where the node already runs; the menu
+holds the alternatives. The line says where that is: `in the cloud (sandbox …)`,
+`this machine` (with `dev container …` when its work is in one), or `not running
+in the cloud yet` for a node whose files are in a sandbox.
 
 **Where it runs.** Start runs the node's autopilot
 (`tod_core::autopilot`) on this machine, on a thread of the app's
