@@ -388,6 +388,16 @@ mod tests {
             )
             .unwrap()
             .id;
+        // The one location the tests pick for Files.
+        tod_store::fleet::places::save(
+            &fleet,
+            &tod_store::fleet::FilesPlace {
+                name: "Main".into(),
+                repo: Some(root.join("repo").display().to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
         drop(fleet);
         (root, node, session)
     }
@@ -954,16 +964,16 @@ Second."), "{listed}");
         let node = node.to_string();
         cli(&root, &["capabilities", "enable", &node, "files", "tags", "ticket"]).unwrap();
         let dir = root.join("repo").display().to_string();
-        cli(&root, &["capabilities", "set", &node, "files", "--dir", &dir, "--branch", "feat"])
+        cli(&root, &["capabilities", "set", &node, "files", "--location", "Main", "--branch", "feat"])
             .unwrap();
         cli(&root, &["capabilities", "set", &node, "tags", "--add", "ui"]).unwrap();
         cli(&root, &["capabilities", "set", &node, "ticket", "--ticket", "ABC-1"]).unwrap();
-        // Changing only the worktree setting leaves the directory and branch alone.
-        cli(&root, &["capabilities", "set", &node, "files", "--worktree", "on"]).unwrap();
+        // Naming only the location leaves the branch alone.
+        cli(&root, &["capabilities", "set", &node, "files", "--location", "Main"]).unwrap();
 
         let listed = cli(&root, &["capabilities", "list", &node]).unwrap();
         assert!(
-            listed.contains(&format!("files: dir {dir}, branch feat, worktree on,")),
+            listed.contains("files: location Main (") && listed.contains(&format!("dir {dir}")) && listed.contains("branch feat"),
             "{listed}"
         );
         assert!(listed.contains("tags: ui"), "{listed}");

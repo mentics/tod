@@ -1,12 +1,12 @@
-//! Files capability repository: the settings on the node that has Files —
-//! the worktree flag and where launches run.
+//! Files capability repository: the location a node with Files picked.
 //!
-//! The workspace directory and branch live on `node_fields.repo` / `branch`.
-//! These settings are a recipe: the directory each node works in (its own
-//! worktree or sandbox) is made from them when the node first needs its
-//! files, and kept in [`crate::fleet::repos::files_location`]. The
-//! `worktree_*` columns here predate that and are no longer read (schema v75
-//! moved them there).
+//! What a location holds (workspace directory, worktrees, where launches
+//! run) is in [`crate::fleet::repos::files_place`]; the directory each node
+//! works in (its own worktree or sandbox) is made from it when the node
+//! first needs its files, and kept in [`crate::fleet::repos::files_location`].
+//! The branch lives on `node_fields.branch`. The other columns of
+//! `node_files` predate locations (schema v82 moved them to
+//! `files_places`) and are no longer read.
 
 use crate::fleet::repos::{node_id_blob, node_id_column};
 use crate::outline::uuid_blob::now_ms;
@@ -128,13 +128,13 @@ impl DevContainerSetting {
     }
 }
 
+/// A node's Files capability: the location it picked.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NodeFiles {
     pub node_id: String,
-    /// Each node works in a worktree of its own.
-    pub use_worktree: bool,
-    /// Set when the node's launches run in a dev container or sandboxes.
-    pub dev_container: Option<DevContainerSetting>,
+    /// The location (`files_places.id`) this node's Files uses, if one is
+    /// picked. The node's branch is its own, on `node_fields`.
+    pub place_id: Option<String>,
 }
 
 pub struct NodeFilesRepo<'a> {
@@ -150,144 +150,68 @@ impl<'a> NodeFilesRepo<'a> {
         let blob = node_id_blob(node_id)?;
         self.conn
             .query_row(
-                "SELECT node_id, use_worktree, dev_container, container, container_repo_on_host,
-                        container_kind, sandbox_source, sandbox_from
-                 FROM node_files WHERE node_id = ?1",
+                "SELECT node_id, place_id FROM node_files WHERE node_id = ?1",
                 params![blob],
-                row_to_files,
+                |row| Ok(NodeFiles { node_id: node_id_column(row, 0)?, place_id: row.get(1)? }),
             )
             .optional()
             .map_err(Into::into)
     }
 
-    pub fn set_use_worktree(&self, node_id: &str, use_worktree: bool) -> Result<()> {
+    /// Pick the location (`Some`) or none (`None`); the location must exist.
+    pub fn set_place(&self, node_id: &str, place_id: Option<&str>) -> Result<()> {
         let blob = node_id_blob(node_id)?;
+        if let Some(id) = place_id
+            && crate::fleet::repos::files_place::FilesPlaceRepo::new(self.conn).get(id)?.is_none()
+        {
+            anyhow::bail!("Location {id} no longer exists");
+        }
         self.conn.execute(
-            "INSERT INTO node_files (node_id, use_worktree, updated_at) VALUES (?1, ?2, ?3)
+            "INSERT INTO node_files (node_id, use_worktree, place_id, updated_at)
+             VALUES (?1, 0, ?2, ?3)
              ON CONFLICT(node_id) DO UPDATE SET
-               use_worktree = excluded.use_worktree, updated_at = excluded.updated_at",
-            params![blob, i32::from(use_worktree), now_ms()],
-        )?;
-        Ok(())
-    }
-
-    /// Run the node's launches in a dev container (`Some`), or on this machine.
-    pub fn set_dev_container(
-        &self,
-        node_id: &str,
-        dev_container: Option<&DevContainerSetting>,
-    ) -> Result<()> {
-        let blob = node_id_blob(node_id)?;
-        let default_from = SandboxFrom::default();
-        let (on, container, on_host, kind, from) = match dev_container {
-            Some(setting) => (
-                1,
-                setting.container().filter(|_| !setting.sandbox).map(str::to_string),
-                i32::from(setting.repo_on_host && !setting.sandbox),
-                setting.kind(),
-                &setting.sandbox_from,
-            ),
-            None => (0, None, 0, "docker", &default_from),
-        };
-        let (source, from) = from.columns();
-        self.conn.execute(
-            "INSERT INTO node_files
-               (node_id, use_worktree, dev_container, container, container_repo_on_host,
-                container_kind, sandbox_source, sandbox_from, updated_at)
-             VALUES (?1, 0, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-             ON CONFLICT(node_id) DO UPDATE SET
-               dev_container = excluded.dev_container,
-               container = excluded.container,
-               container_repo_on_host = excluded.container_repo_on_host,
-               container_kind = excluded.container_kind,
-               sandbox_source = excluded.sandbox_source,
-               sandbox_from = excluded.sandbox_from,
-               updated_at = excluded.updated_at",
-            params![blob, on, container, on_host, kind, source, from, now_ms()],
+               place_id = excluded.place_id, updated_at = excluded.updated_at",
+            params![blob, place_id, now_ms()],
         )?;
         Ok(())
     }
 }
 
-fn row_to_files(row: &rusqlite::Row<'_>) -> rusqlite::Result<NodeFiles> {
-    Ok(NodeFiles {
-        node_id: node_id_column(row, 0)?,
-        use_worktree: row.get::<_, i64>(1)? != 0,
-        dev_container: if row.get::<_, i64>(2)? != 0 {
-            Some(DevContainerSetting {
-                container: row.get(3)?,
-                repo_on_host: row.get::<_, i64>(4)? != 0,
-                sandbox: row.get::<_, String>(5)? == "sandbox",
-                sandbox_from: SandboxFrom::from_columns(&row.get::<_, String>(6)?, row.get(7)?),
-            })
-        } else {
-            None
-        },
-    })
-}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fleet::repos::files_place::{FilesPlace, FilesPlaceRepo};
     use crate::fleet::repos::{cleanup_test_dir, seed_node, test_writer_conn};
 
     #[test]
-    fn worktree_flag_round_trip() {
+    fn picking_a_location_round_trips() {
         let (dir, conn) = test_writer_conn();
         let a = seed_node(&conn);
         let repo = NodeFilesRepo::new(&conn);
         assert!(repo.get(&a).unwrap().is_none());
-        repo.set_use_worktree(&a, true).unwrap();
-        assert!(repo.get(&a).unwrap().unwrap().use_worktree);
-        cleanup_test_dir(&dir);
-    }
-
-    #[test]
-    fn dev_container_round_trip() {
-        let (dir, conn) = test_writer_conn();
-        let a = seed_node(&conn);
-        let repo = NodeFilesRepo::new(&conn);
-        repo.set_use_worktree(&a, true).unwrap();
-
-        let setting = DevContainerSetting {
-            container: Some(" my-dev ".into()),
-            repo_on_host: true,
-            ..Default::default()
-        };
-        repo.set_dev_container(&a, Some(&setting)).unwrap();
-        let files = repo.get(&a).unwrap().unwrap();
-        assert!(files.use_worktree, "the worktree flag is kept");
-        let dev = files.dev_container.expect("dev container");
-        assert_eq!(dev.container.as_deref(), Some("my-dev"));
-        assert!(dev.repo_on_host);
-        assert_eq!(dev.repo_container(), None);
-
-        // Chosen, but no container picked yet.
-        repo.set_dev_container(&a, Some(&DevContainerSetting::default()))
+        let place = FilesPlaceRepo::new(&conn)
+            .save(&FilesPlace { name: "App".into(), ..Default::default() })
             .unwrap();
-        let dev = repo.get(&a).unwrap().unwrap().dev_container.unwrap();
-        assert_eq!(dev.container(), None);
-        assert!(!dev.repo_on_host, "the repository lives in the container by default");
-
-        repo.set_dev_container(&a, None).unwrap();
-        assert_eq!(repo.get(&a).unwrap().unwrap().dev_container, None);
+        repo.set_place(&a, Some(&place.id)).unwrap();
+        assert_eq!(repo.get(&a).unwrap().unwrap().place_id.as_deref(), Some(place.id.as_str()));
+        assert!(repo.set_place(&a, Some("gone")).is_err(), "an unknown location is refused");
+        repo.set_place(&a, None).unwrap();
+        assert_eq!(repo.get(&a).unwrap().unwrap().place_id, None);
         cleanup_test_dir(&dir);
     }
 
     #[test]
-    fn sandbox_recipe_round_trip() {
+    fn deleting_a_location_unpicks_it() {
         let (dir, conn) = test_writer_conn();
         let a = seed_node(&conn);
-        let repo = NodeFilesRepo::new(&conn);
-        let setting = DevContainerSetting {
-            sandbox: true,
-            sandbox_from: SandboxFrom::Fork("template".into()),
-            ..Default::default()
-        };
-        repo.set_dev_container(&a, Some(&setting)).unwrap();
-        let dev = repo.get(&a).unwrap().unwrap().dev_container.unwrap();
-        assert_eq!(dev, setting);
-        assert!(dev.repo_is_remote());
+        let places = FilesPlaceRepo::new(&conn);
+        let place = places.save(&FilesPlace { name: "App".into(), ..Default::default() }).unwrap();
+        NodeFilesRepo::new(&conn).set_place(&a, Some(&place.id)).unwrap();
+        assert_eq!(places.nodes_using(&place.id).unwrap(), vec![a.clone()]);
+        places.delete(&place.id).unwrap();
+        assert!(places.get(&place.id).unwrap().is_none());
+        assert_eq!(NodeFilesRepo::new(&conn).get(&a).unwrap().unwrap().place_id, None);
         cleanup_test_dir(&dir);
     }
 }

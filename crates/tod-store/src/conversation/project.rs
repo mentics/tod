@@ -435,6 +435,8 @@ fn same_ignoring_position(a: &EntitySnapshot, b: &EntitySnapshot) -> bool {
             EntitySnapshot::Capabilities { settings, .. } => {
                 settings.obligations = 0;
                 settings.managed_nodes = 0;
+                // A location's name is for display; renaming one is no change here.
+                settings.files_place_name = None;
             }
         }
         s

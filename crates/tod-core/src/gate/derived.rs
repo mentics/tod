@@ -747,14 +747,12 @@ mod tests {
     }
 
     fn set_repo(store: &FleetStore, node: Uuid, repo: &str) {
-        store
-            .enqueue(FleetMutation::UpdateTaskRepo {
-                id: node.to_string(),
-                repo: Some(repo.into()),
-            })
-            .unwrap();
-        store.writer().flush().unwrap();
-        store.reload_if_stale().ok();
+        tod_store::fleet::places::pick_matching(
+            store,
+            &node.to_string(),
+            &tod_store::fleet::FilesPlace { repo: Some(repo.into()), ..Default::default() },
+        )
+        .unwrap();
     }
 
     fn criterion(slug: &str) -> GateCriterion {

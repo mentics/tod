@@ -220,16 +220,17 @@ fn bare() -> Fixture {
         })
         .unwrap();
     fx.fleet.writer().flush().unwrap();
-    fx.fleet
-        // The workspace itself: a worktree of its own would need a data root.
-        .enqueue_outline(OutlineMutation::SetNodeFiles {
-            node_id: fx.node,
+    // The workspace itself: a worktree of its own would need a data root.
+    tod_store::fleet::places::pick_matching(
+        &fx.fleet,
+        &fx.node.to_string(),
+        &tod_store::fleet::FilesPlace {
             repo: Some(workspace.display().to_string()),
-            branch: None,
             use_worktree: false,
-            dev_container: None,
-        })
-        .unwrap();
+            ..Default::default()
+        },
+    )
+    .unwrap();
     fx.fleet.writer().flush().unwrap();
     fx
 }

@@ -240,10 +240,8 @@ fn capabilities_inverse(action: &ActionRow) -> Result<Vec<OutlineMutation>> {
         }],
         M::SetNodeFiles { .. } => vec![M::SetNodeFiles {
             node_id,
-            repo: s.repo,
+            place_id: s.files_place,
             branch: s.branch,
-            use_worktree: s.use_worktree,
-            dev_container: s.dev_container,
         }],
         M::SetNodeTicket { .. } => vec![M::SetNodeTicket {
             node_id,

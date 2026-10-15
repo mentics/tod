@@ -119,6 +119,11 @@ pub struct ArchivedNodeFiles {
     pub sandbox_source: String,
     #[serde(default)]
     pub sandbox_from: String,
+    /// The location the capability used (`files_places.id`). Archives made
+    /// before locations held the recipe in the columns above instead, which
+    /// are not restored.
+    #[serde(default)]
+    pub place_id: Option<String>,
 }
 
 fn image_source() -> String {
@@ -352,7 +357,7 @@ fn snapshot_node_files(conn: &Connection, node_id: Uuid) -> Result<Option<Archiv
     conn.query_row(
         "SELECT use_worktree, worktree_path, worktree_lease_id, worktree_lease_holder, updated_at,
                 dev_container, container, container_repo_on_host, container_kind,
-                sandbox_source, sandbox_from
+                sandbox_source, sandbox_from, place_id
          FROM node_files WHERE node_id = ?1",
         params![uuid_to_blob(node_id)],
         |row| {
@@ -368,6 +373,7 @@ fn snapshot_node_files(conn: &Connection, node_id: Uuid) -> Result<Option<Archiv
                 container_kind: row.get(8)?,
                 sandbox_source: row.get(9)?,
                 sandbox_from: row.get(10)?,
+                place_id: row.get(11)?,
             })
         },
     )
@@ -804,8 +810,9 @@ fn restore_node(conn: &Connection, archived: &ArchivedNode) -> Result<()> {
             "INSERT OR IGNORE INTO node_files
                (node_id, use_worktree, worktree_path, worktree_lease_id, worktree_lease_holder, updated_at,
                 dev_container, container, container_repo_on_host, container_kind,
-                sandbox_source, sandbox_from)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                sandbox_source, sandbox_from, place_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                     (SELECT id FROM files_places WHERE id = ?13))",
             params![
                 blob,
                 i32::from(files.use_worktree),
@@ -819,6 +826,7 @@ fn restore_node(conn: &Connection, archived: &ArchivedNode) -> Result<()> {
                 files.container_kind,
                 files.sandbox_source,
                 files.sandbox_from,
+                files.place_id,
             ],
         )?;
     }
@@ -1018,8 +1026,16 @@ mod tests {
             .enable_capabilities(child_id, &[Capability::Agent, Capability::Files])
             .unwrap();
         let child = child_id.to_string();
+        let place = crate::fleet::repos::files_place::FilesPlaceRepo::new(&conn)
+            .save(&crate::fleet::repos::files_place::FilesPlace {
+                name: "Repo".into(),
+                repo: Some("/repo".into()),
+                use_worktree: true,
+                ..Default::default()
+            })
+            .unwrap();
         crate::fleet::repos::node_files::NodeFilesRepo::new(&conn)
-            .set_use_worktree(&child, true)
+            .set_place(&child, Some(&place.id))
             .unwrap();
         let locations = crate::fleet::repos::files_location::FilesLocationRepo::new(&conn);
         locations
@@ -1056,7 +1072,7 @@ mod tests {
             .get(&child)
             .unwrap()
             .expect("files restored");
-        assert!(files.use_worktree);
+        assert_eq!(files.place_id.as_deref(), Some(place.id.as_str()));
         let location = locations.get(&child).unwrap().expect("location restored");
         assert_eq!(location.worktree_path(), Some("/wt/child"));
         let agent = crate::fleet::repos::node_agent::NodeAgentRepo::new(&conn)

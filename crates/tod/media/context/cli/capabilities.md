@@ -8,7 +8,7 @@ tod-cli --data-root <DATA_ROOT> capabilities list    <NODE>
 tod-cli --data-root <DATA_ROOT> capabilities enable  <NODE> <CAP>...
 tod-cli --data-root <DATA_ROOT> capabilities disable <NODE> <CAP>
 tod-cli --data-root <DATA_ROOT> capabilities set     <NODE> agent [--platform claude|cursor] [--model <TEXT>] [--effort <TEXT>]
-tod-cli --data-root <DATA_ROOT> capabilities set     <NODE> files [--dir <PATH>] [--branch <TEXT>] [--worktree on|off] [--container <NAME|ID>] [--mounted on|off] [--sandbox image[:<IMAGE>]|fork:<NAME>]
+tod-cli --data-root <DATA_ROOT> capabilities set     <NODE> files [--location <NAME|ID>] [--branch <TEXT>]
 tod-cli --data-root <DATA_ROOT> capabilities set     <NODE> ticket [--ticket <ID>] [--pr <URL>]...
 tod-cli --data-root <DATA_ROOT> capabilities set     <NODE> tags (--tags <A,B,..> | --add <TAG> | --remove <TAG>)
 tod-cli --data-root <DATA_ROOT> capabilities set     <NODE> generator --source <TYPE> --config <JSON>
@@ -30,18 +30,15 @@ phase's list (`--skills ''` means none, even where an ancestor sets some);
 `--clear` removes the phase from this node so the nearest ancestor's applies
 again. Other phases are untouched.
 
-`files --container` runs the node's agents, terminals, and git in that
-running dev container (`--container ''` moves them back to this machine).
-The repository lives in the container, so `--dir` is its path there. With
-`--mounted on` the repository is on the host and mounted into the container
-instead: `--dir` is the host path, and the directory inside the container
-follows from its mounts. `files --sandbox` gives each node working from
-these settings a cloud sandbox of its own, made when it first needs one:
-`image` (the default image), `image:<IMAGE>`, or `fork:<NAME>` (a copy of
-that sandbox); `--sandbox ''` moves them back. The image or forked sandbox
-must hold the repository, and `--dir` is its path there. Changing where the
-files are is refused while nodes have worktrees or sandboxes made from the
-current settings; the user removes those in the app.
+`files --location` picks which of the user's Files locations the node, and
+every node below it that does not enable Files itself, works from
+(`--location ''` picks none). A location is a named setup the user keeps in
+the app: a workspace directory, and whether each node gets a worktree, runs in
+a dev container, or gets a cloud sandbox. You cannot create or edit them; an
+unknown name is refused with the names that exist. `--branch` is this node's
+own branch. Picking a different location is refused while nodes have
+worktrees or sandboxes made from the current one that the new one would not
+make; the user removes those in the app.
 
 `disable` removes the capability **and everything that belongs to it** — a
 Spec's obligations and details, a generator's generated nodes. It is archived

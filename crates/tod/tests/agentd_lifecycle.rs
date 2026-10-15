@@ -9,11 +9,21 @@ fn exe() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_tod-agentd"))
 }
 
-fn root(name: &str) -> PathBuf {
+/// Stops the daemon and removes its root when a test ends, even by panic: a
+/// daemon outlives its parent by design, so a failed assert would leak it.
+struct Cleanup(PathBuf);
+
+impl Drop for Cleanup {
+    fn drop(&mut self) {
+        stop(&self.0);
+    }
+}
+
+fn root(name: &str) -> (PathBuf, Cleanup) {
     let dir = std::env::temp_dir().join(format!("tod-agentd-test-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    dir
+    (dir.clone(), Cleanup(dir))
 }
 
 fn build(stamp: &str, built_at: u64) -> Identity {
@@ -27,7 +37,7 @@ fn stop(root: &Path) {
 
 #[test]
 fn starts_once_reuses_it_and_quits() {
-    let root = root("reuse");
+    let (root, _cleanup) = root("reuse");
     let me = build("aaaa", 100);
     let first = client::ensure_running_as(&root, &exe(), &me).unwrap();
     assert!(first.started && !first.restarted);
@@ -44,23 +54,21 @@ fn starts_once_reuses_it_and_quits() {
     assert!(client::quit(&root).unwrap());
     assert!(client::connect(&Paths::new(&root)).is_none());
     assert!(!client::quit(&root).unwrap(), "nothing left to stop");
-    stop(&root);
 }
 
 #[test]
 fn an_older_daemon_is_drained_and_replaced() {
-    let root = root("older");
+    let (root, _cleanup) = root("older");
     let old = client::ensure_running_as(&root, &exe(), &build("old1", 100)).unwrap();
     let new = client::ensure_running_as(&root, &exe(), &build("new1", 200)).unwrap();
     assert!(new.restarted);
     assert_ne!(old.info.pid, new.info.pid);
     assert_eq!(new.info.stamp, "new1");
-    stop(&root);
 }
 
 #[test]
 fn a_newer_daemon_is_left_alone() {
-    let root = root("newer");
+    let (root, _cleanup) = root("newer");
     let running = client::ensure_running_as(&root, &exe(), &build("new1", 200)).unwrap();
     let err = client::ensure_running_as(&root, &exe(), &build("old1", 100)).unwrap_err();
     let newer = err.downcast_ref::<DaemonNewer>().expect("DaemonNewer");
@@ -68,12 +76,11 @@ fn a_newer_daemon_is_left_alone() {
     // Still the same daemon, still answering.
     let mut connection = client::connect(&Paths::new(&root)).unwrap();
     connection.request(Command::Ping).unwrap();
-    stop(&root);
 }
 
 #[test]
 fn a_stale_info_file_is_not_a_daemon() {
-    let root = root("stale");
+    let (root, _cleanup) = root("stale");
     let paths = Paths::new(&root);
     std::fs::create_dir_all(paths.dir()).unwrap();
     let stale = tod_agentd_client::Info {
@@ -89,12 +96,11 @@ fn a_stale_info_file_is_not_a_daemon() {
     let started = client::ensure_running_as(&root, &exe(), &build("fresh", 300)).unwrap();
     assert!(started.started);
     assert_ne!(started.info.pid, 1);
-    stop(&root);
 }
 
 #[test]
 fn concurrent_launches_start_one_daemon() {
-    let root = root("race");
+    let (root, _cleanup) = root("race");
     let me = build("race1", 100);
     let handles: Vec<_> = (0..4)
         .map(|_| {
@@ -106,5 +112,4 @@ fn concurrent_launches_start_one_daemon() {
     let pids: std::collections::HashSet<_> = results.iter().map(|r| r.info.pid).collect();
     assert_eq!(pids.len(), 1, "{results:?}");
     assert_eq!(results.iter().filter(|r| r.started).count(), 1);
-    stop(&root);
 }

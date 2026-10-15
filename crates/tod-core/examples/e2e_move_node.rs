@@ -25,13 +25,16 @@ use tod_store::outline::{OutlineMutation, types::Capability};
 
 /// What changing the Files settings does (the capabilities editor's write).
 fn set_files(store: &FleetStore, node: uuid::Uuid, repo: &str, dev: Option<DevContainerSetting>) -> anyhow::Result<()> {
-    store.enqueue_outline(OutlineMutation::SetNodeFiles {
-        node_id: node,
-        repo: Some(repo.to_string()),
-        branch: None,
-        use_worktree: true,
-        dev_container: dev,
-    })?;
+    tod_store::fleet::places::pick_matching(
+        store,
+        &node.to_string(),
+        &tod_store::fleet::FilesPlace {
+            repo: Some(repo.to_string()),
+            use_worktree: true,
+            dev_container: dev,
+            ..Default::default()
+        },
+    )?;
     store.writer().flush()?;
     Ok(())
 }

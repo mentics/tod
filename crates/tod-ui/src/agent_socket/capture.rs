@@ -1,8 +1,10 @@
 use std::path::Path;
 
+#[cfg(any(windows, target_os = "macos"))]
+use crate::ui::screenshot::{capture_client_rgba, write_png_fast};
 #[cfg(windows)]
-use crate::ui::screenshot::{capture_client_rgba, main_hwnd, write_png_fast};
-#[cfg(windows)]
+use crate::ui::screenshot::main_hwnd;
+#[cfg(any(windows, target_os = "macos"))]
 use image::DynamicImage;
 
 /// Capture the app window, scale to logical `width`×`height`, optional crop, write PNG.
@@ -15,19 +17,19 @@ pub fn capture_window_png(
     logical_height: u32,
     crop: Option<(f32, f32, f32, f32)>,
 ) -> Result<(), String> {
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     {
-        capture_windows(path, logical_width, logical_height, crop)
+        capture_scaled(path, logical_width, logical_height, crop)
     }
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         let _ = (path, logical_width, logical_height, crop);
         Err("screenshot unsupported on this platform".into())
     }
 }
 
-#[cfg(windows)]
-fn capture_windows(
+#[cfg(any(windows, target_os = "macos"))]
+fn capture_scaled(
     path: &Path,
     logical_width: u32,
     logical_height: u32,
@@ -72,7 +74,7 @@ fn capture_windows(
     write_png_fast(path, &out)
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 fn clamp_crop(
     x0: f32,
     y0: f32,

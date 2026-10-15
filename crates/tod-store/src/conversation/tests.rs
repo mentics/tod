@@ -300,10 +300,8 @@ fn every_mutation() -> Vec<(M, Option<ActionKind>)> {
         (
             M::SetNodeFiles {
                 node_id: id(),
-                repo: None,
+                place_id: None,
                 branch: None,
-                use_worktree: false,
-                dev_container: None,
             },
             Some(Edit),
         ),

@@ -200,7 +200,7 @@ If the chosen port is already in use, startup fails immediately with a bind erro
 | `sync` | Wait one UI frame |
 | `close` | Ask the window to close as the user would: the close guard runs (replies `ok blocked` while its toast is up). `click` also works on macOS. |
 | `quit` | Close every window, so the app quits as if the user closed it |
-| `shot <path>` | PNG screenshot of the window |
+| `shot <path>` | PNG screenshot of the window (Windows and macOS; on macOS the app reads its own window back from the window server, so no Screen Recording permission, and it works while the window is covered or unfocused) |
 
 See `.local/agent/ui-smoke/BATCH.md` for the full smoke workflow.
 

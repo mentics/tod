@@ -209,7 +209,10 @@ fn create_pre_upgrade_backup(paths: &FleetPaths) -> Result<(), FleetLaunchError>
     if tmp.exists() {
         let _ = fs::remove_file(&tmp);
     }
-    schema::backup_database(paths.db(), &tmp).map_err(|err| FleetLaunchError::BackupFailed {
+    // Nothing else is running yet and the app waits on this, so copy in one
+    // step: the throttled `backup_database` takes ~200 KB/s, so a few hundred
+    // MB outlasted the app's 60s wait for the daemon.
+    schema::copy_database(paths.db(), &tmp).map_err(|err| FleetLaunchError::BackupFailed {
         backup: backup.display().to_string(),
         reason: err.to_string(),
     })?;

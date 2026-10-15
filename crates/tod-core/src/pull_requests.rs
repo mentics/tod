@@ -591,7 +591,7 @@ mod tests {
     /// node, with no checkout on this machine.
     #[test]
     fn a_cloud_nodes_repository_url_needs_no_checkout() {
-        use tod_store::fleet::{FleetMutation, FleetStore};
+        use tod_store::fleet::FleetStore;
         use tod_store::outline::{Capability, CreatePosition, OutlineMutation};
         let root = std::env::temp_dir().join(format!("tod-pulls-{}", Uuid::new_v4()));
         let fleet = FleetStore::open(&root).unwrap();
@@ -616,12 +616,15 @@ mod tests {
                 capabilities: vec![Capability::Files],
             })
             .unwrap();
-        fleet
-            .enqueue(FleetMutation::UpdateTaskRepo {
-                id: node.to_string(),
+        tod_store::fleet::places::pick_matching(
+            &fleet,
+            &node.to_string(),
+            &tod_store::fleet::FilesPlace {
                 repo: Some("https://github.com/mentics/test-repo".into()),
-            })
-            .unwrap();
+                ..Default::default()
+            },
+        )
+        .unwrap();
         fleet.writer().flush().unwrap();
 
         let target = fleet.read(|conn| read_target(conn, node)).unwrap();
