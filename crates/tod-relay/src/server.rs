@@ -357,13 +357,19 @@ fn poke(relay: &Arc<Relay>) {
                 let code = child.wait().await.map(exit_code).unwrap_or(255);
                 reaper::untrack(pid);
                 eprintln!("poke: supervisor pid {pid} exited {code}");
+                if code != 0 {
+                    crate::problem(tod_problems::Level::Warn, &format!("poke: supervisor pid {pid} exited {code}"));
+                }
                 let mut sup = relay.supervisor.lock().unwrap();
                 if *sup == Some(pid) {
                     *sup = None;
                 }
             });
         }
-        Err(e) => eprintln!("poke: could not start supervisor: {e}"),
+        Err(e) => {
+            eprintln!("poke: could not start supervisor: {e}");
+            crate::problem(tod_problems::Level::Error, &format!("poke: could not start supervisor: {e}"));
+        }
     }
 }
 

@@ -41,5 +41,8 @@ better rule would have avoided:
   or an outright conflict (a review finding or a blocker you are
   raising rather than deciding).
 - **capability** — about a capability's own configuration.
+- **broken** — something tod or the environment gives you is failing: a
+  command errors, a credential is rejected, a tool is missing. See "When
+  something is broken" in how you work here; never work around it.
 - **other** — none of the above; use sparingly, since it cannot be counted
   toward a specific fix.

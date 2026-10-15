@@ -232,3 +232,40 @@ fn github_remote_url_prefers_origin_then_any_remote() {
     assert_eq!(github_remote_url(only_fs).as_deref(), Some("https://github.com/Cofactr/flagship.git"));
     assert_eq!(github_remote_url(""), None);
 }
+
+#[test]
+fn a_nodes_problem_reaches_the_apps_log_on_a_sync_and_only_once() {
+    use crate::logging::buffer::{self, Level3, LogFilter, LogSource};
+    let base = temp_root("orch-problems");
+    let url = start_orchestrator(&base);
+    let orch = HttpOrchestrator::new(url.clone(), None).with_client("app-test");
+    let root = temp_root("app-problems");
+    let app = FleetStore::open(&root).unwrap();
+    add_list(&app, "first");
+    // The first sync seeds and reads from now: nothing old is replayed.
+    sync(&app, &root, &orch, "alice").unwrap();
+
+    // A supervisor forwards one with its next request.
+    let sent = ureq::post(format!("{url}/users/alice/nodes/n-problems/problems"))
+        .header(sync::CLIENT_HEADER, "supervisor-n-problems")
+        .send_json(serde_json::json!([
+            {"time": 1, "level": "error", "process": "tod-relay", "message": "relay-boom-marker"}
+        ]))
+        .unwrap();
+    assert_eq!(sent.status(), 200);
+
+    let marker = |entries: Vec<buffer::LogEntry>| {
+        entries.into_iter().filter(|e| e.message.contains("relay-boom-marker")).collect::<Vec<_>>()
+    };
+    sync(&app, &root, &orch, "alice").unwrap();
+    let got = marker(buffer::snapshot(LogFilter::All));
+    assert_eq!(got.len(), 1);
+    assert_eq!(got[0].level, Level3::Error);
+    assert_eq!(got[0].source, LogSource::Relay);
+    assert!(got[0].message.starts_with("[node n-problems]"), "{}", got[0].message);
+
+    // The cursor is saved: the next sync does not repeat it.
+    sync(&app, &root, &orch, "alice").unwrap();
+    assert_eq!(marker(buffer::snapshot(LogFilter::All)).len(), 1);
+    assert!(CloudSyncState::load(&root).unwrap().problems_after.is_some());
+}

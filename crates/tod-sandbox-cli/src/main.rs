@@ -95,6 +95,12 @@ fn main() {
         Ok(code) => std::process::exit(code),
         Err(err) => {
             eprintln!("tod-sandbox: {err:#}");
+            // The app's log panel and toast get it too, from the data root
+            // named by `--data-root`, else `TOD_DATA_ROOT` / install.toml.
+            let argv: Vec<String> = std::env::args().collect();
+            let flag = argv.iter().position(|a| a == "--data-root").and_then(|i| argv.get(i + 1));
+            let root = tod_store::paths::resolve_startup_data_root(flag.map(Path::new));
+            tod_problems::report_or_warn(root.as_deref(), "tod-sandbox", tod_problems::Level::Error, &format!("{err:#}"));
             std::process::exit(1);
         }
     }

@@ -1,0 +1,11 @@
+[package]
+name = "tod-problems"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "The channel every tod executable reports failures through, and the app's reader of it"
+
+# A leaf crate with one dependency, so `tod-cli` and the Zed shim (which
+# start often and must start fast) can report without pulling in the store.
+[dependencies]
+serde_json = "1.0"

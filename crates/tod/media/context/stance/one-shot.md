@@ -10,3 +10,11 @@ a conversation.
   defines for an undecided outcome, with your reasoning.
 - Do not make changes. Read what you need, decide, and report. The app applies
   whatever follows from your answer.
+
+## When something is broken
+
+If something you need fails in a way that is not your own work's fault (a
+command errors, a credential is rejected, a tool is missing), do not work
+around it. Say so inside the structured response, in the form that surface
+defines for an undecided outcome: the exact command, the exact error, and what
+it blocks.

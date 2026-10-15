@@ -141,6 +141,16 @@ impl Orchestrator {
         Ok(())
     }
 
+    /// Sends problems collected in this node's sandbox (`tod_problems`) to be
+    /// shown in the app's log panel. Callers send these only along with a
+    /// request they are making anyway: this must not be the reason the
+    /// orchestrator is contacted.
+    pub fn push_problems(&self, problems: &[tod_problems::Problem]) -> Result<()> {
+        let body = serde_json::to_vec(&problems.iter().map(tod_problems::to_json).collect::<Vec<_>>())?;
+        self.ok("POST", &format!("/nodes/{}/problems", self.node), Some(&body))?;
+        Ok(())
+    }
+
     fn transcripts_path(&self, name: Option<&str>) -> String {
         match name {
             Some(name) => format!("/nodes/{}/transcripts/{name}", self.node),

@@ -7623,6 +7623,7 @@ dependencies = [
  "serde_json",
  "tod-agentd",
  "tod-agentd-client",
+ "tod-problems",
  "tod-store",
  "tod-ui",
  "uuid",
@@ -7656,6 +7657,7 @@ dependencies = [
  "tod-agent",
  "tod-agentd-client",
  "tod-core",
+ "tod-problems",
  "tod-store",
  "tokio",
  "tracing",
@@ -7686,6 +7688,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "tod-core",
+ "tod-problems",
  "tod-store",
  "uuid",
 ]
@@ -7709,6 +7712,7 @@ dependencies = [
  "tod-integration",
  "tod-journey",
  "tod-orchestrator",
+ "tod-problems",
  "tod-sandbox",
  "tod-store",
  "tokio",
@@ -7776,10 +7780,18 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "tod-core",
+ "tod-problems",
  "tod-sandbox",
  "tod-store",
  "ureq",
  "uuid",
+]
+
+[[package]]
+name = "tod-problems"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
 ]
 
 [[package]]
@@ -7790,6 +7802,7 @@ dependencies = [
  "libc",
  "serde",
  "serde_json",
+ "tod-problems",
  "tokio",
  "tokio-tungstenite",
 ]
@@ -7822,6 +7835,7 @@ dependencies = [
  "anyhow",
  "rpassword",
  "serde_json",
+ "tod-problems",
  "tod-sandbox",
  "tod-store",
  "tokio",
@@ -7870,6 +7884,7 @@ dependencies = [
  "tod-agent",
  "tod-core",
  "tod-orchestrator",
+ "tod-problems",
  "tod-store",
  "tracing",
  "tracing-subscriber",
@@ -7929,6 +7944,7 @@ version = "0.1.0"
 dependencies = [
  "futures-util",
  "serde_json",
+ "tod-problems",
  "tod-sandbox",
  "tokio",
  "tokio-tungstenite",

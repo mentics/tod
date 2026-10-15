@@ -169,6 +169,17 @@ impl CredentialStore {
             .filter(|value| !value.is_empty())
     }
 
+    /// Why the OS keyring could not be read for `kind`, when it could not
+    /// (access denied, locked, no service): a credential stored there then
+    /// looks missing. `None` when it read fine, held nothing, or is not used
+    /// in this build.
+    pub fn keyring_problem(&self, kind: CredentialKind) -> Option<String> {
+        self.get_from_keyring(kind.keyring_account())
+            .err()
+            .map(|err| err.to_string())
+            .filter(|msg| !msg.starts_with("keyring not used in this build"))
+    }
+
     pub fn backend(&self, kind: CredentialKind) -> Option<CredentialBackend> {
         if self.get_from_keyring(kind.keyring_account()).ok().flatten().is_some() {
             return Some(CredentialBackend::Keyring);

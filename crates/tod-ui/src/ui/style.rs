@@ -102,6 +102,9 @@ pub mod color {
     pub fn linked_source_text() -> Hsla {
         hex(0xa06707ff)
     }
+    pub fn stale_text() -> Hsla {
+        hex(0xfdba74ff)
+    }
     pub fn callout_warning_fill() -> Hsla {
         hex(0x7f1d1d33)
     }
@@ -416,6 +419,17 @@ pub fn callout_warning<E: Styled>(el: E) -> E {
         .bg(color::callout_warning_fill())
         .text_size(font::DENSE)
         .text_color(color::callout_warning_text())
+}
+
+/// `styles.log-row-error`: a log row for an error, in the red callout tones.
+pub fn log_row_error<E: Styled>(el: E) -> E {
+    el.bg(color::callout_warning_fill())
+        .text_color(color::callout_warning_text())
+}
+
+/// `styles.log-row-warning`: a log row for a warning, in the orange text tone.
+pub fn log_row_warning<E: Styled>(el: E) -> E {
+    el.text_color(color::stale_text())
 }
 
 /// `styles.callout-warning-title`.

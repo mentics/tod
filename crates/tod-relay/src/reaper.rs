@@ -46,6 +46,7 @@ fn tracked() -> std::sync::MutexGuard<'static, Option<HashSet<u32>>> {
 pub fn start() {
     if let Err(err) = become_subreaper() {
         eprintln!("reaper: could not become a child subreaper: {err}");
+        crate::problem(tod_problems::Level::Error, &format!("reaper: could not become a child subreaper: {err}"));
         return;
     }
     let spawned = std::thread::Builder::new().name("reaper".into()).spawn(|| loop {
@@ -56,6 +57,7 @@ pub fn start() {
     });
     if let Err(err) = spawned {
         eprintln!("reaper: could not start: {err}");
+        crate::problem(tod_problems::Level::Error, &format!("reaper: could not start: {err}"));
     }
 }
 

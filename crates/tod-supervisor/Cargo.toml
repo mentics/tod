@@ -17,6 +17,7 @@ name = "tod-supervisor"
 path = "src/main.rs"
 
 [dependencies]
+tod-problems = { path = "../tod-problems" }
 anyhow = "1.0"
 chrono = "0.4"
 rusqlite = { version = "0.37", features = ["bundled", "backup"] }

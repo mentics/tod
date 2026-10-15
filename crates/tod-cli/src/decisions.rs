@@ -35,7 +35,7 @@ quote it), any --option (repeatable, in the order they should be offered;
 none asks for a free-text answer), any --evidence links the user should be able to open while
 answering, each `kind:id` with kind one of: obligation, plan_step, test_run,
 conversation, finding, node, and --reason, one of:
-intent, missing_rule, conflict, access, risk, capability, other (defaults to
+intent, missing_rule, conflict, access, risk, capability, broken, other (defaults to
 other when omitted).
 `list` shows a node's pending decisions, oldest first; --all includes
 answered and withdrawn ones too.
@@ -84,6 +84,37 @@ pub fn run(inv: Invocation) -> anyhow::Result<String> {
         "show" => show(&inv, &args),
         other => anyhow::bail!("unknown command `{other}`\n\n{}", USAGE.trim_end()),
     }
+}
+
+/// File a `broken` decision for the node this invocation runs for, so a
+/// fault the agent cannot fix reaches the user even if the agent does not
+/// report it. One question stays pending per distinct `what`: a retry loop
+/// does not pile up copies. Returns `false` when there is no node to file it
+/// under (run outside a conversation).
+pub(crate) fn report_broken(inv: &Invocation, what: &str) -> anyhow::Result<bool> {
+    let Some(node) = env_uuid(IMPLEMENT_NODE_ENV)? else {
+        return Ok(false);
+    };
+    let question = format!("Something is broken: {what}");
+    let pending = inv
+        .client()
+        .read(|conn| DecisionRepo::new(conn).list_pending_for_node(node))?;
+    if pending.iter().any(|d| d.question == question) {
+        return Ok(true);
+    }
+    let (conversation_id, protocol) = asking_conversation(inv)?;
+    inv.client().interview(InterviewCommand::AskDecision {
+        node_id: node,
+        conversation_id,
+        protocol,
+        decision: NewDecision {
+            question,
+            options: vec!["Fixed, try again".to_string(), "Carry on without it".to_string()],
+            evidence: Vec::new(),
+            reason: tod_store::decisions::REASON_BROKEN.to_string(),
+        },
+    })?;
+    Ok(true)
 }
 
 fn parse_evidence(raw: &str) -> anyhow::Result<EvidenceRef> {

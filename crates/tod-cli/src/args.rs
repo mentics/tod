@@ -32,10 +32,12 @@ impl Drop for Args {
         ignored.sort();
         ignored.dedup();
         if !ignored.is_empty() && !std::thread::panicking() {
-            eprintln!(
-                "tod-cli: warning: ignored unknown option(s) {}; see `tod-cli <NOUN> --help`",
+            let message = format!(
+                "ignored unknown option(s) {}; see `tod-cli <NOUN> --help`",
                 ignored.join(", ")
             );
+            eprintln!("tod-cli: warning: {message}");
+            crate::report_problem(tod_problems::Level::Warn, &message, None);
         }
     }
 }

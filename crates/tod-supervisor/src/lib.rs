@@ -34,6 +34,7 @@ pub mod git;
 pub mod guard;
 pub mod hold;
 pub mod orchestrator;
+pub mod problems;
 pub mod replica;
 pub mod signal;
 pub mod transcripts;

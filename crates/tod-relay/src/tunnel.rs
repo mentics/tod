@@ -40,6 +40,7 @@ impl Tunnel {
             Ok(l) => l,
             Err(e) => {
                 eprintln!("tunnel: cannot listen on 127.0.0.1:{port}: {e}");
+                crate::problem(tod_problems::Level::Error, &format!("tunnel: cannot listen on 127.0.0.1:{port}: {e}"));
                 return;
             }
         };

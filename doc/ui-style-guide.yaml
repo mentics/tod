@@ -379,6 +379,13 @@ styles:
     padding-x: inset
     padding-y: related
     gap: related
+  log-row-error:
+    # A row of the log panel for an error. Warnings use log-row-warning;
+    # everything else is the plain row.
+    color: callout-warning-text
+    background: callout-warning-fill
+  log-row-warning:
+    color: stale-text
   callout-warning-title:
     extends: callout-warning
     font: title

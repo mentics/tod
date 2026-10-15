@@ -3,7 +3,9 @@ pub(crate) mod app_icon;
 pub(crate) mod assets;
 mod data_root_setup;
 mod fleet_blocked;
+mod github_token;
 mod history_window;
+mod log_window;
 pub(crate) mod no_focus;
 pub mod transcript_window;
 pub mod window;
@@ -30,6 +32,7 @@ use crate::unified::register_unified_keyboard_bindings;
 use gpui::*;
 
 pub use history_window::HistoryWindowControl;
+pub use log_window::LogWindowControl;
 pub use window::{open, open_data_root_setup};
 
 pub fn register_main_keyboard_bindings(cx: &mut gpui::App) {
@@ -38,6 +41,7 @@ pub fn register_main_keyboard_bindings(cx: &mut gpui::App) {
     register_report_problem_keyboard_bindings(cx);
     register_task_list_keyboard_bindings(cx);
     register_command_history_keyboard_bindings(cx);
+    crate::views::log_panel::bind_keys(cx);
     register_task_edit_keyboard_bindings(cx);
     register_obligations_keyboard_bindings(cx);
     register_plan_steps_keyboard_bindings(cx);

@@ -26,7 +26,7 @@ in full or as the 8-character prefix listings show.
   answering, kind one of `obligation`, `plan_step`, `test_run`,
   `conversation`, `finding`, `node`.
 - `--reason`: one of `intent`, `missing_rule`, `conflict`, `access`, `risk`,
-  `capability`, `other` — defaults to `other` when omitted. See "Asking the
+  `capability`, `broken`, `other` — defaults to `other` when omitted. See "Asking the
   user" for what each means.
 
 `list` shows a node's pending decisions, oldest first; `--all` also lists

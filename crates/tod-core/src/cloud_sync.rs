@@ -74,6 +74,11 @@ pub struct CloudSyncState {
     /// Where the orchestrator announces changes ([`crate::cloud_notify`]).
     #[serde(default)]
     pub notify: Option<crate::cloud_notify::NotifyTopics>,
+    /// How far the orchestrator's problem log has been read
+    /// ([`record_remote_problems`]); `None` until the first sync, which
+    /// starts from now.
+    #[serde(default)]
+    pub problems_after: Option<tod_problems::Cursor>,
 }
 
 /// This data root's sync client id, made and saved on first use.
@@ -200,6 +205,14 @@ pub trait Orchestrator {
     fn send(&self, user: &str, changes: &[Change]) -> Result<ApplyReport>;
     /// `GET /users/<u>/changes?after=n`: `(last_seq, changes)`.
     fn pull(&self, user: &str, after: i64) -> Result<(i64, Vec<Change>)>;
+    /// `POST /users/<u>/problems/pull`: what the cloud's executables reported
+    /// after `cursor` (`None`: from now), and the new cursor. Only ever
+    /// called inside a sync, so it adds no contact with the cloud of its own.
+    fn pull_problems(
+        &self,
+        user: &str,
+        cursor: Option<&tod_problems::Cursor>,
+    ) -> Result<(tod_problems::Cursor, Vec<tod_problems::Problem>)>;
 }
 
 /// The orchestrator over HTTP(S).
@@ -296,6 +309,35 @@ impl Orchestrator for HttpOrchestrator {
         let changes = serde_json::from_value(v["changes"].take())?;
         Ok((last, changes))
     }
+
+    fn pull_problems(
+        &self,
+        user: &str,
+        cursor: Option<&tod_problems::Cursor>,
+    ) -> Result<(tod_problems::Cursor, Vec<tod_problems::Problem>)> {
+        let resp = self
+            .auth(self.agent.post(&self.url(user, "problems/pull")))
+            .send_json(serde_json::json!({ "cursor": cursor }))
+            .context("orchestrator problems")?;
+        let v = Self::finish(resp, "problems")?;
+        let cursor = serde_json::from_value(v["cursor"].clone()).context("orchestrator problems: cursor")?;
+        let problems = v["problems"].as_array().map(|a| a.iter().filter_map(tod_problems::from_json).collect()).unwrap_or_default();
+        Ok((cursor, problems))
+    }
+}
+
+/// Put what the cloud's executables reported into the log panel (and, for
+/// errors, the toast), labelled with the node or sandbox they concern.
+pub fn record_remote_problems(problems: &[tod_problems::Problem]) {
+    use crate::logging::buffer::{Level3, LogSource, record};
+    for p in problems {
+        let level = match p.level {
+            tod_problems::Level::Error => Level3::Error,
+            tod_problems::Level::Warn => Level3::Warn,
+        };
+        let label = p.label.as_deref().unwrap_or("cloud");
+        record(level, LogSource::for_process(&p.process), format!("[{label}] {}", p.message));
+    }
 }
 
 /// What one [`sync`] did.
@@ -376,6 +418,18 @@ pub fn sync(fleet: &FleetStore, root: &Path, orch: &dyn Orchestrator, user: &str
     }
     state.feed_after = last;
     state.save(root)?;
+
+    // Problems the cloud's executables pushed up, read on this same sync:
+    // no extra contact with the cloud, so no sandbox is woken for them. A
+    // failure is reported, not dropped, and the cursor stays for the retry.
+    match orch.pull_problems(user, state.problems_after.as_ref()) {
+        Ok((cursor, problems)) => {
+            record_remote_problems(&problems);
+            state.problems_after = Some(cursor);
+            state.save(root)?;
+        }
+        Err(err) => tracing::warn!("cloud sync: reading the cloud's problem log: {err:#}"),
+    }
     drop(_guard);
     if let Err(err) = lost::retire_done(fleet) {
         tracing::warn!("cloud sync: retiring done nodes: {err:#}");

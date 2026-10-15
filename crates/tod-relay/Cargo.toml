@@ -5,6 +5,7 @@ edition = "2024"
 description = "The one server tod runs inside a cloud sandbox: commands, terminals, and agents over WebSockets."
 
 [dependencies]
+tod-problems = { path = "../tod-problems" }
 tokio = { version = "1", features = ["rt", "net", "io-util", "process", "macros", "time", "sync"] }
 tokio-tungstenite = "0.24"
 futures-util = "0.3"

@@ -53,6 +53,10 @@ pub enum RequestReason {
     Risk,
     /// About a capability's own configuration.
     Capability,
+    /// Something tod or the environment provides is broken (a failing
+    /// command, a rejected credential, a missing tool); the agent stopped
+    /// rather than work around it.
+    Broken,
     /// Does not fit the other reasons.
     Other,
 }
@@ -68,6 +72,7 @@ impl RequestReason {
             Self::Access => "access",
             Self::Risk => "risk",
             Self::Capability => "capability",
+            Self::Broken => "broken",
             Self::Other => "other",
         }
     }
@@ -82,6 +87,7 @@ impl RequestReason {
             "access" => Self::Access,
             "risk" => Self::Risk,
             "capability" => Self::Capability,
+            "broken" => Self::Broken,
             _ => Self::Other,
         }
     }

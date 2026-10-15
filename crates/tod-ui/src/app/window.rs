@@ -7,6 +7,7 @@ use crate::agent_socket;
 #[cfg(feature = "agent-socket")]
 use crate::agent_socket::commands::AgentPlatformSocketCommand;
 use crate::app::history_window::HistoryWindowControl;
+use crate::app::log_window::LogWindowControl;
 use crate::app::transcript_window::TranscriptWindowControl;
 use crate::cli::LaunchOptions;
 use crate::interview::agent::{AgentBackend, AgentPlatform, SharedAgent};
@@ -104,10 +105,18 @@ pub struct Shell {
     transcript_window: TranscriptWindowControl,
     engagement: tod_agent::SharedEngagementRegistry,
     history_window: HistoryWindowControl,
+    log_window: LogWindowControl,
+    /// Warnings+errors and errors logged since the log panel was last open.
+    log_unread: (usize, usize),
+    /// Which logged errors have raised a toast, and which repeats fold into one.
+    toast_gate: tod_core::logging::buffer::ToastGate,
     agent_status_text: SharedString,
     paths: TodPaths,
     migration_notice_dismissed: bool,
+    github_token: Entity<super::github_token::GithubTokenMonitor>,
     pending_error_toast: Option<String>,
+    /// Errors already in the log whose toast is waiting to be shown.
+    pending_logged_toast: Option<String>,
     pending_warning_toast: Option<String>,
     always_on_top: bool,
     _settings_subscription: Subscription,
@@ -359,6 +368,24 @@ impl Shell {
     }
 
     fn refresh_agent_status(&mut self, cx: &mut Context<Self>) {
+        // Every error that entered the log (the app's tracing, the daemon's
+        // log, the executables' problem files) and was not itself a toast
+        // raises one, with its source named; repeats fold into one.
+        let fresh = tod_core::logging::buffer::unnotified_errors_since(self.toast_gate.cursor());
+        if !fresh.is_empty() {
+            for text in self.toast_gate.texts(&fresh, std::time::Instant::now()) {
+                self.pending_logged_toast = Some(match self.pending_logged_toast.take() {
+                    Some(earlier) => format!("{earlier}\n\n{text}"),
+                    None => text,
+                });
+            }
+            cx.notify();
+        }
+        let unread = crate::views::log_panel::unread();
+        if unread != self.log_unread {
+            self.log_unread = unread;
+            cx.notify();
+        }
         let text = format_status_bar(&self.compute_status_groups());
         if self.agent_status_text.as_ref() != text {
             self.agent_status_text = text.into();
@@ -410,6 +437,18 @@ impl Shell {
         if let Err(err) = self.transcript_window.open_or_focus(cx) {
             tracing::error!("failed to open agent transcript window: {err}");
         }
+    }
+
+    fn open_log_window(&mut self, cx: &mut Context<Self>) {
+        crate::ui::journey::record_nav(
+            cx,
+            tod_journey::NavEvent::DrawerOpened { drawer: "log panel".into() },
+        );
+        if let Err(err) = self.log_window.open_or_focus(cx) {
+            tracing::error!("failed to open log window: {err}");
+        }
+        self.log_unread = crate::views::log_panel::unread();
+        cx.notify();
     }
 
     fn open_history_window(&mut self, cx: &mut Context<Self>) {
@@ -567,8 +606,13 @@ impl Shell {
         if let Some(message) = self.pending_warning_toast.take() {
             warning_toast(window, cx, message);
         }
-        if let Some(message) = self.pending_error_toast.take() {
-            error_toast(window, cx, message);
+        // One error toast at a time (they share a slot), so both kinds merge
+        // when they land together; the merged text is then logged once more.
+        match (self.pending_error_toast.take(), self.pending_logged_toast.take()) {
+            (Some(message), Some(logged)) => error_toast(window, cx, format!("{message}\n\n{logged}")),
+            (Some(message), None) => error_toast(window, cx, message),
+            (None, Some(logged)) => crate::ui::toast::error_toast_already_logged(window, cx, logged),
+            (None, None) => {}
         }
     }
 
@@ -659,6 +703,23 @@ impl Shell {
                                 this.open_transcript_window(cx);
                             })),
                     )
+                    .child({
+                        let (attention, errors) = self.log_unread;
+                        let label = if attention == 0 {
+                            "Log".to_string()
+                        } else {
+                            format!("Log ({attention})")
+                        };
+                        Button::new("open-log-panel")
+                            .outline()
+                            .compact()
+                            .label(label)
+                            .when(errors > 0, |b| b.danger())
+                            .tooltip("Open the log: errors, warnings, and status messages from tod and its daemons")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.open_log_window(cx);
+                            }))
+                    })
                     .when_some(
                         render_shortcut_pill_in_context(
                             window,
@@ -831,6 +892,10 @@ impl Render for Shell {
             }))
             .child(self.render_title_bar(window, cx))
             .child(self.render_migration_notice(cx))
+            .when_some(
+                super::github_token::render_banner(&self.github_token, window, cx),
+                |el, banner| el.child(banner),
+            )
             .child(
                 div()
                     .flex_1()
@@ -1153,6 +1218,7 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
     let transcript_window = TranscriptWindowControl::new();
     let engagement = tod_agent::shared_engagement_registry();
     let history_window = HistoryWindowControl::new();
+    let log_window = LogWindowControl::new();
     #[cfg(feature = "agent-socket")]
     let transcript_for_socket = transcript_window.clone();
 
@@ -1190,18 +1256,21 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
             let paths = paths.clone();
             let transcript_window = transcript_window.clone();
             let history_window = history_window.clone();
+            let log_window = log_window.clone();
             #[cfg(feature = "agent-socket")]
             let shell_for_socket = shell_for_socket.clone();
             move |window, cx| {
                 let paths_for_geometry = paths.clone();
                 let transcript_for_close = transcript_window.clone();
                 let history_for_close = history_window.clone();
+                let log_for_close = log_window.clone();
                 match fleet_open {
                     Err((error, resolved_root)) => {
                         window.on_window_should_close(cx, move |window, cx| {
                             persist_window_geometry(window, &paths_for_geometry);
                             let _ = transcript_for_close.close(cx);
                             history_for_close.close(cx);
+                            log_for_close.close(cx);
                             true
                         });
                         let view =
@@ -1303,6 +1372,10 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                         report_problem::set_available_from(&app_settings.journeys, cx);
                         transcript_window.bind(fleet.clone(), traffic_log.clone());
                         history_window.bind(fleet.clone());
+                        tod_core::logging::buffer::start_problem_tail(fleet.paths().root().to_path_buf());
+                        tod_core::logging::buffer::start_agentd_tail(
+                            tod_agentd_client::Paths::new(fleet.paths().root()).log(),
+                        );
                         let _ = crate::interview::bootstrap(fleet.clone());
                         // Before the tree is built, so no row is ever drawn as
                         // "refreshing…" for a refresh the last run never finished.
@@ -1368,10 +1441,18 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                 transcript_window: transcript_window.clone(),
                                 engagement: engagement.clone(),
                                 history_window: history_window.clone(),
+                                log_window: log_window.clone(),
+                                log_unread: (0, 0),
+                                toast_gate: Default::default(),
                                 agent_status_text,
                                 paths: paths.clone(),
                                 migration_notice_dismissed: false,
+                                github_token: super::github_token::GithubTokenMonitor::start(
+                                    paths.data_root().to_path_buf(),
+                                    cx,
+                                ),
                                 pending_error_toast: None,
+                                pending_logged_toast: None,
                                 pending_warning_toast: None,
                                 always_on_top: restore_always_on_top,
                                 _settings_subscription,
@@ -1444,11 +1525,13 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                 persist_window_geometry(window, &paths_for_geometry);
                                 let _ = transcript_for_close.close(cx);
                                 history_for_close.close(cx);
+                                log_for_close.close(cx);
                                 true
                             } else {
                                 let paths_for_force = paths_for_geometry.clone();
                                 let transcript_for_force = transcript_for_close.clone();
                                 let history_for_force = history_for_close.clone();
+                                let log_for_force = log_for_close.clone();
                                 crate::ui::toast::close_guard_toast(
                                     window,
                                     cx,
@@ -1457,6 +1540,7 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                         persist_window_geometry(window, &paths_for_force);
                                         let _ = transcript_for_force.close(cx);
                                         history_for_force.close(cx);
+                                        log_for_force.close(cx);
                                         window.remove_window();
                                     },
                                 );

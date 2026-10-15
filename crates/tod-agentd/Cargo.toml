@@ -11,6 +11,7 @@ path = "src/lib.rs"
 # `tod-agentd-client`'s build script, over this crate's source too.
 # The binary is `tod`'s `tod-agentd` target (`crates/tod/src/agentd.rs`).
 [dependencies]
+tod-problems = { path = "../tod-problems" }
 anyhow = "1.0"
 fs2 = "0.4"
 serde = { version = "1.0", features = ["derive"] }

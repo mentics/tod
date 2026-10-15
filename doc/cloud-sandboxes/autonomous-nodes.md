@@ -250,6 +250,13 @@ self-hosted), or a managed service such as Ably or Pusher. The topic per
 user must not be guessable (or the service must authenticate subscribers),
 since it reveals when a user's data changes.
 
+## Problems
+
+Warnings and errors from the relay, supervisor and orchestrator reach the app's
+log panel and toasts without waking anything: the supervisor forwards them
+beside requests it already makes, and the app reads them inside its sync. See
+[../problems.md](../problems.md).
+
 ## Interactive sessions
 
 The user's interactive work in a node's sandbox (chat, the terminal

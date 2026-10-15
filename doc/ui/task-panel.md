@@ -160,7 +160,7 @@ Each request shows:
     request with none shows none.
   - its **reason**: why the agent or runner could not handle it itself.
     Reasons are a fixed set (missing rule, conflict, access, risk,
-    capability, other) so they can be counted.
+    capability, broken, other) so they can be counted.
   - a **terminal** icon, when the lifecycle conversation that asked (the
     decision's or finding's own, or the implement/verify conversation that
     handed the plan step back) has an agent session:

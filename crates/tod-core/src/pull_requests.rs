@@ -122,7 +122,7 @@ impl PullSource for GithubPulls {
 /// The user-facing reason a node has no pull requests to show at all.
 pub const NO_FILES: &str =
     "Enable Files on this node (or an ancestor) to see the pull requests of its repository";
-pub const NO_TOKEN: &str = "No GitHub token is configured — add one in Settings";
+pub const NO_TOKEN: &str = "No GitHub token is configured — use \"Add token\" in the red banner at the top of the window";
 
 /// Where to look for a node's pull requests, as the database has it: the
 /// Files capability it resolves to, and the pull requests linked to it.

@@ -112,8 +112,30 @@ fn main() -> ExitCode {
         }
         Err(err) => {
             eprintln!("tod-cli: {err:#}");
+            // Also to the app's problem log (log panel and toast), under the
+            // data root the invocation named, else the one the app passed.
+            report_problem(tod_problems::Level::Error, &format!("{err:#}"), data_root_flag(&args).as_deref());
             ExitCode::FAILURE
         }
+    }
+}
+
+/// Where this process reports problems: the data root `run` resolved.
+static REPORT_ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// The `--data-root` value among `args`, if any.
+fn data_root_flag(args: &[String]) -> Option<PathBuf> {
+    let i = args.iter().position(|a| a == "--data-root")?;
+    args.get(i + 1).map(PathBuf::from)
+}
+
+/// Tell the app about a failure or warning of this process, in addition to
+/// stderr. With no data root known there is nowhere to tell: that is said on
+/// stderr too, never dropped.
+pub(crate) fn report_problem(level: tod_problems::Level, message: &str, root: Option<&std::path::Path>) {
+    let root = root.or_else(|| REPORT_ROOT.get().map(PathBuf::as_path));
+    if let Err(err) = tod_problems::report_to(root, "tod-cli", level, None, message) {
+        eprintln!("tod-cli: could not record this in the problem log: {err}");
     }
 }
 
@@ -193,6 +215,7 @@ fn run(args: &[String]) -> anyhow::Result<String> {
         anyhow::bail!("data root {} does not exist", data_root.display());
     }
 
+    let _ = REPORT_ROOT.set(data_root.clone());
     let noun = rest.remove(0);
     let invocation = Invocation {
         data_root,

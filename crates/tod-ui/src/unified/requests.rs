@@ -169,6 +169,7 @@ pub fn reason_label(reason: RequestReason) -> &'static str {
         RequestReason::Access => "Needs access",
         RequestReason::Risk => "Needs your sign-off",
         RequestReason::Capability => "Capability setting",
+        RequestReason::Broken => "Something is broken",
         RequestReason::Other => "Other",
     }
 }
@@ -1638,6 +1639,7 @@ mod tests {
             RequestReason::Access,
             RequestReason::Risk,
             RequestReason::Capability,
+            RequestReason::Broken,
             RequestReason::Other,
         ] {
             assert!(!reason_label(reason).is_empty());

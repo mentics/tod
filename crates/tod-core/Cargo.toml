@@ -9,6 +9,7 @@ name = "tod_core"
 path = "src/lib.rs"
 
 [dependencies]
+tod-problems = { path = "../tod-problems" }
 anyhow = "1.0"
 chrono = { version = "0.4", features = ["serde"] }
 dirs = "6.0"

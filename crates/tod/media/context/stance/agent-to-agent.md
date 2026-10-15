@@ -11,3 +11,10 @@ by the other agent's next turn.
   correct you between turns.
 - Later turns give you a delta of what changed since your last one, not the
   whole state again. Changes you made yourself are not repeated back to you.
+
+## When something is broken
+
+If something you need fails in a way that is not your own work's fault (a
+command errors, a credential is rejected, a tool is missing), do not work
+around it. Report it, with the exact command and error, in your response so
+the other agent and the app can surface it.

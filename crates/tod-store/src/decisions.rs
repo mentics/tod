@@ -44,19 +44,24 @@ pub const REASON_CAPABILITY: &str = "capability";
 /// What the user wants is not stated anywhere: the node's purpose, scope,
 /// or a preference only they can give.
 pub const REASON_INTENT: &str = "intent";
+/// Something tod or the work's environment provides is broken (a command
+/// fails, a credential is rejected, a tool is missing): the agent will not
+/// work around it, and the user needs to fix it.
+pub const REASON_BROKEN: &str = "broken";
 /// Does not fit the other reasons.
 pub const REASON_OTHER: &str = "other";
 
 /// Every reason a decision can be asked with (`doc/ui/task-panel.md`
 /// "Requests"); mirrored by `tod_core::attention::RequestReason`, which this
 /// crate cannot depend on (policy depends on transport, never the reverse).
-pub const DECISION_REASONS: [&str; 7] = [
+pub const DECISION_REASONS: [&str; 8] = [
     REASON_INTENT,
     REASON_MISSING_RULE,
     REASON_CONFLICT,
     REASON_ACCESS,
     REASON_RISK,
     REASON_CAPABILITY,
+    REASON_BROKEN,
     REASON_OTHER,
 ];
 

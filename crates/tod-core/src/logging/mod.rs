@@ -1,5 +1,6 @@
 //! Diagnostic logging init and helpers (no call-site facade).
 
+pub mod buffer;
 mod prune;
 
 pub use prune::prune_log_dir;
@@ -89,6 +90,7 @@ pub fn init(config: InitConfig) -> Result<()> {
     tracing_subscriber::registry()
         .with(filter_layer)
         .with(fmt_layer)
+        .with(buffer::RingLayer)
         .try_init()
         .context("failed to install tracing subscriber")?;
 

@@ -126,6 +126,8 @@ pub fn alerts_topic(topic: &str) -> String {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Observed {
     pub last_seq: i64,
+    /// Bytes in the user's problem files: a failure was reported for the app.
+    pub problems: u64,
     /// Ids of pending decisions and blocked plan steps.
     pub attention: HashSet<Vec<u8>>,
 }
@@ -146,6 +148,7 @@ impl Probe for StoreProbe {
         let conn = rusqlite::Connection::open(data.store.paths().db())?;
         conn.busy_timeout(Duration::from_secs(30))?;
         let last_seq = tod_store::sync::last_seq(&conn)?;
+        let problems = crate::problems::size(&self.0.root_of(user)?);
         let mut attention = HashSet::new();
         for sql in [
             "SELECT id FROM decisions WHERE status = 'pending'",
@@ -158,7 +161,7 @@ impl Probe for StoreProbe {
                 attention.insert(id?);
             }
         }
-        Ok(Observed { last_seq, attention })
+        Ok(Observed { last_seq, problems, attention })
     }
 
     fn topic(&self, user: &str) -> Result<String> {
@@ -213,15 +216,17 @@ impl Coalescer {
 #[derive(Default)]
 struct Announced {
     last_seq: Option<i64>,
+    problems: Option<u64>,
     attention: Option<HashSet<Vec<u8>>>,
 }
 
 /// Decides what to publish for one observation; updates `seen`.
 fn decide(seen: &mut Announced, now: Observed) -> (bool, bool) {
-    let changed = seen.last_seq.is_none_or(|s| s != now.last_seq);
+    let changed = seen.last_seq.is_none_or(|s| s != now.last_seq) || seen.problems.is_none_or(|p| p != now.problems);
     // The first look at a user sets the baseline: nothing is "new" yet.
     let needs_you = seen.attention.as_ref().is_some_and(|before| now.attention.iter().any(|id| !before.contains(id)));
     seen.last_seq = Some(now.last_seq);
+    seen.problems = Some(now.problems);
     seen.attention = Some(now.attention);
     (changed, needs_you)
 }
@@ -369,7 +374,7 @@ mod tests {
     #[test]
     fn needs_you_only_for_new_attention_after_the_baseline() {
         let mut seen = Announced::default();
-        let obs = |seq, ids: &[u8]| Observed { last_seq: seq, attention: ids.iter().map(|i| vec![*i]).collect() };
+        let obs = |seq, ids: &[u8]| Observed { last_seq: seq, problems: 0, attention: ids.iter().map(|i| vec![*i]).collect() };
         assert_eq!(decide(&mut seen, obs(1, &[1])), (true, false));
         assert_eq!(decide(&mut seen, obs(1, &[1])), (false, false));
         assert_eq!(decide(&mut seen, obs(2, &[1, 2])), (true, true));

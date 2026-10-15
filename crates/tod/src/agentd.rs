@@ -26,6 +26,9 @@ fn main() {
         Ok(false) => eprintln!("tod-agentd: another daemon holds {}", root.display()),
         Err(err) => {
             eprintln!("tod-agentd: {err:#}");
+            // The daemon's tracing reaches the app by the tail of its log;
+            // this fatal exit is plain stderr, so it goes to the problem log.
+            tod_problems::report_or_warn(Some(&root), "tod-agentd", tod_problems::Level::Error, &format!("{err:#}"));
             std::process::exit(1);
         }
     }

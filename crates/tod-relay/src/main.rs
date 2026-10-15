@@ -38,6 +38,16 @@ mod tunnel;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// Record a failure where the node's supervisor will forward it to the app's
+/// log panel (it does so only when it is already talking to the orchestrator;
+/// this never contacts anything). The caller keeps its own stderr line.
+#[allow(dead_code)]
+pub(crate) fn problem(level: tod_problems::Level, message: &str) {
+    if let Err(err) = tod_problems::report_in(&tod_problems::node_dir(), "tod-relay", level, None, message) {
+        eprintln!("tod-relay: could not record this in the problem log: {err}");
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|a| a == "--version") {

@@ -20,6 +20,9 @@
 //!   transcripts; `GET`/`POST .../transcripts/<name>` reads or appends one
 //!   (see [`transcripts`]).
 //! - `POST /users/<u>/nodes/<n>/flags` — the watchdog flags a node (see [`flags`]).
+//! - `POST /users/<u>/nodes/<n>/problems`, `POST /users/<u>/problems/pull` —
+//!   failures of the cloud's executables on their way to the app's log panel
+//!   (see [`problems`]).
 //! - `POST /webhooks/github`, `POST /webhooks/linear` — no user: signed, and
 //!   routed to nodes by branch or open waits (see [`webhooks`]).
 
@@ -29,6 +32,7 @@ pub mod flags;
 pub mod http;
 pub mod impact_handler;
 pub mod notify;
+pub mod problems;
 pub mod sync_backend;
 pub mod transcripts;
 pub mod users;
@@ -135,6 +139,19 @@ impl Server {
     /// (the notifier skips it when nothing was committed).
     pub fn handle(&self, request: &Request) -> Response {
         let response = self.route(request);
+        // This server's own failure goes where the app will find it.
+        if response.status >= 500 {
+            let user = request.path.trim_matches('/').strip_prefix("users/").and_then(|r| r.split('/').next());
+            if let Some(root) = user.or_else(|| request.header(USER_HEADER)).and_then(|u| self.users.root_of(u).ok()) {
+                problems::report_own(
+                    &root,
+                    &format!("{} {} failed: {}", request.method, request.path, String::from_utf8_lossy(&response.body).trim()),
+                );
+                if let Some(u) = user.or_else(|| request.header(USER_HEADER)) {
+                    self.notifier.poke(u);
+                }
+            }
+        }
         if request.method == "POST" && response.status == 200 {
             let path_user = request.path.trim_matches('/').strip_prefix("users/").and_then(|r| r.split('/').next());
             if let Some(user) = path_user.or_else(|| request.header(USER_HEADER)) {
@@ -214,6 +231,17 @@ impl Server {
                             &request.body,
                         ),
                         Err(err) => Response::text(500, format!("{err:#}")),
+                    },
+                    ("POST", ["nodes", node, "problems"]) => match self.users.root_of(&user) {
+                        Ok(root) => match users::validate(node) {
+                            Ok(()) => problems::push(&root, node, &request.body),
+                            Err(err) => Response::text(400, format!("node: {err:#}")),
+                        },
+                        Err(err) => Response::text(400, format!("{err:#}")),
+                    },
+                    ("POST", ["problems", "pull"]) => match self.users.root_of(&user) {
+                        Ok(root) => problems::pull(&root, &request.body),
+                        Err(err) => Response::text(400, format!("{err:#}")),
                     },
                     (_, ["nodes", node, "transcripts", rest @ ..]) => match self.users.root_of(&user) {
                         Ok(root) => transcripts::handle(&root, node, method, rest, request),

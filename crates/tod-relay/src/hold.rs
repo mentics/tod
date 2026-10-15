@@ -241,7 +241,10 @@ fn reconcile(state: &Mutex<HoldState>, current: &mut Option<(String, Instant)>, 
             eprintln!("hold: awake ({name}, timeout {desired_secs}s)");
             *current = Some((name, now + Duration::from_secs(desired_secs)));
         }
-        Err(e) => eprintln!("hold: could not start: {e}"),
+        Err(e) => {
+            eprintln!("hold: could not start: {e}");
+            crate::problem(tod_problems::Level::Error, &format!("hold: could not start: {e}"));
+        }
     }
 }
 

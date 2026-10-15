@@ -12,6 +12,7 @@ name = "tod-sandbox"
 path = "src/main.rs"
 
 [dependencies]
+tod-problems = { path = "../tod-problems" }
 anyhow = "1.0"
 rpassword = "7"
 serde_json = "1.0"

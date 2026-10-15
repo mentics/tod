@@ -30,17 +30,25 @@ fn main() {
     // started when the next poke comes, which may be right away, and
     // SIGUSR1's default action ends the process.
     tod_supervisor::signal::install();
-    tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
-        )
-        .init();
+    {
+        use tracing_subscriber::prelude::*;
+        tracing_subscriber::registry()
+            .with(
+                tracing_subscriber::fmt::layer().with_writer(std::io::stderr).with_filter(
+                    tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+                ),
+            )
+            // WARN and ERROR also go to the node's problem log, which the
+            // supervisor forwards to the app along with its next request.
+            .with(tod_supervisor::problems::ProblemLayer)
+            .init();
+    }
     let args: Vec<String> = std::env::args().skip(1).collect();
     match run(&args) {
         Ok(()) => {}
         Err(err) => {
             eprintln!("tod-supervisor: {err:#}");
+            tod_supervisor::problems::report(tod_problems::Level::Error, &format!("{err:#}"));
             std::process::exit(1);
         }
     }

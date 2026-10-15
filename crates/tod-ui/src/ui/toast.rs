@@ -106,6 +106,27 @@ pub fn error_toast_with_action(
     action: Option<(SharedString, Rc<dyn Fn(&mut Window, &mut App)>)>,
 ) {
     let message = message.into();
+    // A toast disappears; the log panel keeps it.
+    tod_core::logging::buffer::record_notified(
+        tod_core::logging::buffer::Level3::Error,
+        tod_core::logging::buffer::LogSource::App,
+        message.to_string(),
+    );
+    show_error_toast(window, cx, message, action);
+}
+
+/// The toast for an error that is already in the log (it is what raised the
+/// toast): shown, not logged a second time.
+pub fn error_toast_already_logged(window: &mut Window, cx: &mut App, message: impl Into<SharedString>) {
+    show_error_toast(window, cx, message.into(), None);
+}
+
+fn show_error_toast(
+    window: &mut Window,
+    cx: &mut App,
+    message: SharedString,
+    action: Option<(SharedString, Rc<dyn Fn(&mut Window, &mut App)>)>,
+) {
     window.push_notification(
         Notification::new()
             .id::<ErrorBannerNotification>()
@@ -159,6 +180,11 @@ pub fn error_toast_with_action(
 /// Amber banner for something the user should know that is not a failure.
 pub fn warning_toast(window: &mut Window, cx: &mut App, message: impl Into<SharedString>) {
     let message = message.into();
+    tod_core::logging::buffer::record_notified(
+        tod_core::logging::buffer::Level3::Warn,
+        tod_core::logging::buffer::LogSource::App,
+        message.to_string(),
+    );
     window.push_notification(
         Notification::new()
             .id::<WarningBannerNotification>()

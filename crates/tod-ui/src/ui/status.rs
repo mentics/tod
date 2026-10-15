@@ -9,8 +9,8 @@
 //!
 //! A post is a **message**: last writer wins; empty text clears it.
 //!
-//! Every message also lands in a bounded history, which a log panel can read
-//! later.
+//! Every message also lands in a bounded history and in the log panel's ring
+//! (`tod_core::logging::buffer`, source `status`).
 
 use std::collections::{HashMap, VecDeque};
 use std::time::SystemTime;
@@ -26,7 +26,7 @@ pub enum StatusSource {
     Tasks,
 }
 
-/// One line of the history. Nothing reads it yet; the log panel will.
+/// One line of the history.
 #[derive(Clone, Debug)]
 #[allow(dead_code)]
 pub struct StatusEntry {
@@ -75,6 +75,11 @@ impl StatusHub {
     }
 
     fn log(&mut self, source: StatusSource, text: SharedString) {
+        tod_core::logging::buffer::record(
+            tod_core::logging::buffer::Level3::Info,
+            tod_core::logging::buffer::LogSource::Status,
+            text.to_string(),
+        );
         if self.history.len() == HISTORY_LIMIT {
             self.history.pop_front();
         }

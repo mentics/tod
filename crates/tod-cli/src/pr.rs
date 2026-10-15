@@ -17,8 +17,9 @@ use tod_core::pull_requests::{
     NodePulls, PullScope, RepoPulls, RepoSection, load_node_pulls, read_target,
 };
 use tod_store::conversation::ConversationRepo;
-use tod_store::credentials::{CredentialStore, resolve_github_auth};
-use tod_store::github::{Github, NodePrRepo, PrLinks, parse_pr_link};
+use tod_store::credentials::{CredentialBackend, CredentialKind, CredentialStore, resolve_github_auth};
+use tod_store::github_token::TokenStatus;
+use tod_store::github::{Github, GithubError, NodePrRepo, PrLinks, parse_pr_link};
 use tod_store::interview::{InterviewCommand, short_id};
 use uuid::Uuid;
 
@@ -128,9 +129,55 @@ fn env_uuid(name: &str) -> anyhow::Result<Option<Uuid>> {
 
 fn github(inv: &Invocation) -> anyhow::Result<Github> {
     let store = CredentialStore::from_data_root(&inv.data_root);
-    resolve_github_auth(&store)
-        .map(Github::new)
-        .ok_or_else(|| anyhow::anyhow!("no GitHub token configured — see `tod-cli secrets`"))
+    match resolve_github_auth(&store) {
+        Some(auth) => Ok(Github::new(auth)),
+        None => {
+            let status =
+                TokenStatus::Missing { keyring_problem: store.keyring_problem(CredentialKind::GithubToken) };
+            Err(broken(inv, "no GitHub token is available to `tod-cli pr`", &status.for_agent()))
+        }
+    }
+}
+
+/// A fault the agent cannot fix: file it for the user (so it is captured even
+/// if the agent never reports it) and word the error so the agent stops.
+fn broken(inv: &Invocation, what: &str, message: &str) -> anyhow::Error {
+    let filed = match crate::decisions::report_broken(inv, what) {
+        Ok(true) => " tod has filed this for the user already; do not file it again.".to_string(),
+        Ok(false) => " Report it to the user yourself.".to_string(),
+        Err(err) => format!(" Filing it for the user failed ({err:#}); report it to the user yourself."),
+    };
+    anyhow::anyhow!("{message}{filed}")
+}
+
+/// A GitHub failure as the agent sees it. A rejected token is the user's to
+/// fix, so the message says so and tells the agent to stop, not retry.
+fn gh_err(inv: &Invocation, context: &str, err: GithubError) -> anyhow::Error {
+    match err {
+        // In a cloud sandbox there is no token here: the proxy adds the one
+        // it was made with, which the user's later change to the token does
+        // not reach until the sandbox's proxy is refreshed. The app's banner
+        // checks the user's own token, so it may not be showing.
+        GithubError::Unauthorized if tod_store::github::proxy_authenticated() => broken(
+            inv,
+            "GitHub rejects the token this cloud sandbox's credentials proxy holds",
+            &format!(
+                "{context}: {err}. This sandbox's credentials proxy holds a GitHub token that GitHub \
+                 no longer accepts (expired, revoked, or replaced since the sandbox was made). The \
+                 user must replace the token in tod and refresh this node's sandbox. Stop the work \
+                 that needs GitHub; do not retry or look for other tokens."
+            ),
+        ),
+        GithubError::Unauthorized => {
+            let rejected = TokenStatus::Rejected { source: CredentialBackend::Keyring };
+            broken(
+                inv,
+                "GitHub rejects the token tod holds",
+                &format!("{context}: {err}. {}", rejected.for_agent()),
+            )
+        }
+        other => anyhow::anyhow!("{context}: {other}"),
+    }
 }
 
 fn list(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
@@ -283,11 +330,11 @@ fn open(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
     // write below failed (the PR now orphaned from tod's perspective) finds
     // the existing PR instead of opening a duplicate.
     let pr = match github.find_open_pr(&owner, &repo, &head)
-        .map_err(|err| anyhow::anyhow!("GitHub: {err}"))?
+        .map_err(|err| gh_err(inv, "GitHub", err))?
     {
         Some(pr) => pr,
         None => github.create_pr(&owner, &repo, &head, &base, &title, &body)
-            .map_err(|err| anyhow::anyhow!("GitHub: {err}"))?,
+            .map_err(|err| gh_err(inv, "GitHub", err))?,
     };
     inv.client()
         .interview(InterviewCommand::RecordNodePr {
@@ -317,7 +364,7 @@ fn status(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
     for pr in &links.prs {
         let status = github
             .get_pr_status(&pr.owner, &pr.repo, pr.pr_number)
-            .map_err(|err| anyhow::anyhow!("GitHub ({}): {err}", pr.url))?;
+            .map_err(|err| gh_err(inv, &format!("GitHub ({})", pr.url), err))?;
         lines.push(format!(
             "{} mergeable={:?} mergeable_state={:?} merged={} checks={:?}",
             pr.url, status.mergeable, status.mergeable_state, status.merged, status.checks
@@ -376,7 +423,7 @@ fn comment(inv: &Invocation, rest: &[String]) -> anyhow::Result<String> {
     };
     github(inv)?
         .reply_to_comment(&pr.owner, &pr.repo, pr.pr_number, comment_id, &text)
-        .map_err(|err| anyhow::anyhow!("GitHub: {err}"))?;
+        .map_err(|err| gh_err(inv, "GitHub", err))?;
     Ok("ok".to_string())
 }
 
@@ -410,7 +457,7 @@ fn threads(inv: &Invocation, rest: &[String]) -> anyhow::Result<String> {
     let all = args.has("--all");
     let found = github(inv)?
         .list_review_threads(&pr.owner, &pr.repo, pr.pr_number)
-        .map_err(|err| anyhow::anyhow!("GitHub: {err}"))?;
+        .map_err(|err| gh_err(inv, "GitHub", err))?;
     let shown: Vec<_> = found.iter().filter(|t| all || (!t.resolved && !t.outdated)).collect();
     if inv.json {
         let list: Vec<_> = shown
@@ -483,7 +530,7 @@ fn answer_thread(inv: &Invocation, rest: &[String]) -> anyhow::Result<String> {
     let github = github(inv)?;
     let found = github
         .list_review_threads(&pr.owner, &pr.repo, pr.pr_number)
-        .map_err(|err| anyhow::anyhow!("GitHub: {err}"))?;
+        .map_err(|err| gh_err(inv, "GitHub", err))?;
     let thread = found
         .iter()
         .find(|t| &t.id == thread_id)
@@ -493,10 +540,10 @@ fn answer_thread(inv: &Invocation, rest: &[String]) -> anyhow::Result<String> {
     }
     github
         .reply_to_thread(thread_id, &reply)
-        .map_err(|err| anyhow::anyhow!("GitHub (reply): {err}"))?;
+        .map_err(|err| gh_err(inv, "GitHub (reply)", err))?;
     github
         .resolve_thread(thread_id)
-        .map_err(|err| anyhow::anyhow!("replied, but could not resolve the thread: GitHub: {err}"))?;
+        .map_err(|err| gh_err(inv, "replied, but could not resolve the thread: GitHub", err))?;
     Ok(format!("ok {} ({})", thread_id, if fixed { "fixed" } else { "rejected" }))
 }
 

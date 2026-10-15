@@ -63,6 +63,9 @@ fn close_stdout() {}
 fn fail(msg: &str) -> ! {
     log(msg);
     eprintln!("tod ssh: {msg}");
+    // Zed starts the shim with the app's TOD_DATA_ROOT; the app shows this in
+    // its log panel and as a toast. Without it there is nowhere to report.
+    tod_problems::report_or_warn(None, "tod-zed-shim", tod_problems::Level::Error, msg);
     std::process::exit(255);
 }
 

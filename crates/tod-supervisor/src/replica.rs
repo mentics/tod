@@ -125,10 +125,47 @@ impl Replica {
         Ok(())
     }
 
+    /// Forwards what this sandbox's executables reported (the relay, this
+    /// supervisor) to the orchestrator, for the app's log panel. Called only
+    /// beside a request the supervisor is making to the orchestrator anyway
+    /// (a pull, or a push that has changes), so a problem is never the reason
+    /// to contact it, and so never to wake it. A failure leaves the problems
+    /// queued for the next time and is logged, never dropped.
+    fn forward_problems(&self) {
+        let mut outboxes = Vec::new();
+        for dir in [tod_problems::node_dir(), tod_problems::dir(&self.root)] {
+            match tod_problems::Outbox::open(&dir) {
+                Ok(o) => outboxes.push(o),
+                Err(err) => tracing::warn!(dir = %dir.display(), "cannot read the problem log to forward it: {err}"),
+            }
+        }
+        for outbox in &mut outboxes {
+            let pending = match outbox.pending() {
+                Ok(p) if p.is_empty() => continue,
+                Ok(p) => p,
+                Err(err) => {
+                    tracing::warn!("cannot read the problem log to forward it: {err}");
+                    continue;
+                }
+            };
+            // The orchestrator takes a few hundred at a time.
+            let sent = pending.chunks(400).try_for_each(|batch| self.orchestrator.push_problems(batch));
+            match sent {
+                Ok(()) => {
+                    if let Err(err) = outbox.sent() {
+                        tracing::warn!("cannot record that problems were forwarded: {err}");
+                    }
+                }
+                Err(err) => tracing::warn!("forwarding problems to the orchestrator failed: {err:#}"),
+            }
+        }
+    }
+
     /// Applies the orchestrator's changes since the last pull. The number
     /// applied.
     pub fn pull(&mut self) -> Result<usize> {
         let feed = self.orchestrator.changes_after(self.cursors.pull_after)?;
+        self.forward_problems();
         let n = feed.changes.len();
         if n > 0 {
             let _ = self.store.flush_on_quit();
@@ -163,6 +200,7 @@ impl Replica {
         let n = changes.len();
         if n > 0 {
             self.orchestrator.push_changes(&changes)?;
+            self.forward_problems();
         }
         self.cursors.push_after = last;
         self.save_cursors()?;

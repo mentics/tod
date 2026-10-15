@@ -20,6 +20,9 @@ pub enum GithubError {
     MissingToken,
     #[error("HTTP request failed: {0}")]
     Http(String),
+    /// HTTP 401: GitHub does not accept the credential at all.
+    #[error("GitHub rejected the token (HTTP 401): it is expired, revoked, or mistyped")]
+    Unauthorized,
     #[error("pull request not found")]
     NotFound,
     #[error("GitHub API error: {0}")]
@@ -735,8 +738,21 @@ fn query_encode(value: &str) -> String {
 }
 
 fn api_error(status: u16, response: &mut ureq::http::Response<ureq::Body>) -> GithubError {
-    if status == 401 || status == 403 {
-        return GithubError::Api("Invalid or unauthorized GitHub token".into());
+    if status == 401 {
+        return GithubError::Unauthorized;
+    }
+    if status == 403 {
+        let detail = response
+            .body_mut()
+            .read_json::<ErrorRaw>()
+            .ok()
+            .map(ErrorRaw::describe)
+            .unwrap_or_default();
+        return GithubError::Api(format!(
+            "GitHub refused the request (HTTP 403){}: the token lacks access to this \
+             repository or its scope (`repo`) is missing, or a rate limit was hit",
+            if detail.is_empty() { String::new() } else { format!(": {detail}") }
+        ));
     }
     if status == 404 {
         return GithubError::NotFound;
