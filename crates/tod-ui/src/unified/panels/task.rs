@@ -158,6 +158,9 @@ struct RunnerLine {
     /// The node's Files capability puts its work in a cloud sandbox, so
     /// running it in the cloud is the default.
     files_in_sandbox: bool,
+    /// Where the runner runs when it is not in the cloud, for the line:
+    /// "this machine", or this machine and the dev container its work is in.
+    place: String,
     waiting_since: Option<i64>,
     /// `(slot id, ms)`: the running slot and when it was first seen running.
     run_since: Option<(u64, i64)>,
@@ -186,6 +189,9 @@ enum RunnerAction {
     /// Stop a conversation the user started by hand.
     StopTurn,
     RunInCloud,
+    /// Hand a node that runs here to the cloud: an alternative to the
+    /// default action, which continues where it already is.
+    MoveToCloud,
     SyncCloud,
     LeaveCloud,
     /// Delete the node's sandbox in Blaxel (a missing one is fine).
@@ -196,13 +202,14 @@ impl RunnerAction {
     fn label(self) -> &'static str {
         match self {
             Self::Start => "Start",
-            Self::StartHere => "Run on this machine (stops when the app closes)",
+            Self::StartHere => "Run on this machine instead",
             Self::Resume => "Resume",
             Self::ResumeFreshBudget => "Resume with a fresh budget",
             Self::Pause => "Pause",
             Self::StopNow => "Stop now",
             Self::StopTurn => "Stop",
             Self::RunInCloud => "Run in the cloud",
+            Self::MoveToCloud => "Move to the cloud",
             Self::SyncCloud => "Sync now",
             Self::LeaveCloud => "Stop running in the cloud",
             Self::DeleteSandbox => "Delete Sandbox",
@@ -220,7 +227,7 @@ struct RunnerActions {
 
 /// The node's lifecycle state, how long it has waited on the user, and
 /// whether it runs in the cloud.
-fn load_runner(fleet: &FleetStore, node_id: Uuid) -> (String, Option<i64>, Option<CloudNode>, bool) {
+fn load_runner(fleet: &FleetStore, node_id: Uuid) -> (String, Option<i64>, Option<CloudNode>, bool, String) {
     let lifecycle = fleet
         .get_node(&node_id.to_string())
         .ok()
@@ -232,12 +239,17 @@ fn load_runner(fleet: &FleetStore, node_id: Uuid) -> (String, Option<i64>, Optio
         .ok()
         .and_then(|a| a.waiting_since);
     let cloud = tod_core::cloud_sync::cloud_node(fleet, &node_id.to_string());
-    let files_in_sandbox = fleet
-        .resolve_files_for_node(&node_id.to_string())
-        .ok()
-        .flatten()
-        .is_some_and(|files| files.runs_in_sandbox());
-    (lifecycle, waiting_since, cloud, files_in_sandbox)
+    let files = fleet.resolve_files_for_node(&node_id.to_string()).ok().flatten();
+    let files_in_sandbox = files.as_ref().is_some_and(|files| files.runs_in_sandbox());
+    let place = match files.as_ref().and_then(|files| files.dev_container.as_ref()) {
+        Some(dev) if dev.sandbox => "not running in the cloud yet".to_string(),
+        Some(dev) => match dev.container.as_deref().map(str::trim).filter(|c| !c.is_empty()) {
+            Some(container) => format!("this machine, dev container {container}"),
+            None => "this machine".to_string(),
+        },
+        None => "this machine".to_string(),
+    };
+    (lifecycle, waiting_since, cloud, files_in_sandbox, place)
 }
 
 pub struct TaskPanel {
@@ -541,7 +553,7 @@ impl TaskPanel {
         let fleet = self.fleet.clone();
         let node_id = self.node_id;
         cx.spawn(async move |this, cx| {
-            let (lifecycle, waiting_since, cloud, files_in_sandbox) = cx
+            let (lifecycle, waiting_since, cloud, files_in_sandbox, place) = cx
                 .background_executor()
                 .spawn(async move { load_runner(&fleet, node_id) })
                 .await;
@@ -551,6 +563,7 @@ impl TaskPanel {
                     this.runner.waiting_since = waiting_since;
                     this.runner.cloud = cloud;
                     this.runner.files_in_sandbox = files_in_sandbox;
+                    this.runner.place = place;
                     cx.notify();
                 }
             });
@@ -682,24 +695,27 @@ impl TaskPanel {
         if *status == RunnerStatus::Done {
             return RunnerActions::default();
         }
+        // The default action continues where the node already runs; the menu
+        // holds the alternatives. A node whose files are in a cloud sandbox
+        // runs there (a run here would stop with the app).
+        if self.runner.files_in_sandbox {
+            return RunnerActions {
+                primary: Some((A::RunInCloud, A::RunInCloud.label(), false)),
+                menu: vec![A::StartHere],
+            };
+        }
         match runners.outcome(node) {
             Some(Outcome::BudgetExhausted { .. }) => RunnerActions {
                 primary: Some((A::ResumeFreshBudget, A::ResumeFreshBudget.label(), false)),
-                menu: vec![A::RunInCloud],
+                menu: vec![A::MoveToCloud],
             },
             Some(outcome) if *outcome != Outcome::Done => RunnerActions {
                 primary: Some((A::Resume, A::Resume.label(), false)),
-                menu: vec![A::ResumeFreshBudget, A::RunInCloud],
-            },
-            // Its files are in the cloud, so its work belongs there: a run on
-            // this machine would stop with the app.
-            _ if self.runner.files_in_sandbox => RunnerActions {
-                primary: Some((A::RunInCloud, A::RunInCloud.label(), false)),
-                menu: vec![A::StartHere],
+                menu: vec![A::ResumeFreshBudget, A::MoveToCloud],
             },
             _ => RunnerActions {
                 primary: Some((A::Start, A::Start.label(), false)),
-                menu: vec![A::RunInCloud],
+                menu: vec![A::MoveToCloud],
             },
         }
     }
@@ -759,7 +775,7 @@ impl TaskPanel {
                     self.stop_runner(slot, cx);
                 }
             }
-            A::RunInCloud => {
+            A::RunInCloud | A::MoveToCloud => {
                 self.cloud_started(cx);
                 crate::views::cloud_node::run_in_cloud(
                     self.fleet.clone(),
@@ -954,6 +970,9 @@ impl TaskPanel {
                 _ => {}
             }
         } else {
+            if !self.runner.place.is_empty() {
+                line = line.child(sep()).child(style::text_muted(div().flex_none()).child(self.runner.place.clone()));
+            }
             match &status {
                 RunnerStatus::Running { activity, tokens, next_poll_ms, .. } => {
                     if let Some(activity) = activity {
@@ -1241,7 +1260,7 @@ mod tests {
             actions,
             RunnerActions {
                 primary: Some((RunnerAction::Start, "Start", false)),
-                menu: vec![RunnerAction::RunInCloud],
+                menu: vec![RunnerAction::MoveToCloud],
             }
         );
 

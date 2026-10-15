@@ -813,6 +813,21 @@ pub fn sandbox_is_dead(info: &tod_sandbox::blaxel::SandboxInfo) -> bool {
     matches!(info.status.to_ascii_uppercase().as_str(), "FAILED" | "TERMINATED" | "DELETING" | "DELETED")
 }
 
+/// The sandbox `node_id` already has, so a cloud run reuses it instead of
+/// making another beside it: the one its `cloud_nodes` row names (a re-run,
+/// or a replacement of a lost one), else the one its Files location made
+/// (`tod-<slug>`, from opening a shell or launching an agent).
+fn existing_sandbox_name(fleet: &FleetStore, node_id: &str) -> Option<String> {
+    if let Some(row) = cloud_node(fleet, node_id) {
+        return Some(row.sandbox);
+    }
+    fleet
+        .read(|conn| tod_store::fleet::repos::files_location::FilesLocationRepo::new(conn).get(node_id))
+        .ok()
+        .flatten()
+        .and_then(|location| location.sandbox)
+}
+
 /// Make sure `node_id` has a working sandbox: create it (with the user's
 /// credentials in its proxy) if Blaxel has none by its name, or replace one
 /// that can no longer run; wait for it, provision the relay and supervisor,
@@ -868,7 +883,7 @@ pub fn ensure_node_sandbox(
     }
 
     let source = node_sandbox_source(fleet, &sandboxes, &bx, node_id)?;
-    let name = node_sandbox_name(&task.slug);
+    let name = existing_sandbox_name(fleet, node_id).unwrap_or_else(|| node_sandbox_name(&task.slug));
     let agent = cloud_agent();
     let spec = node::NodeSandboxSpec {
         name: &name,

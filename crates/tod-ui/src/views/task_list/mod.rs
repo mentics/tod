@@ -117,7 +117,6 @@ pub fn register_task_list_keyboard_bindings(cx: &mut App) {
         KeyBinding::new("home", ListHome, context),
         KeyBinding::new("end", ListEnd, context),
         KeyBinding::new("enter", TaskListEnter, context),
-        KeyBinding::new("n", TaskListCreateBelow, context),
         KeyBinding::new("/", TaskListFocusSearch, context),
         KeyBinding::new("s", TaskListSortToggle, context),
         KeyBinding::new("secondary-shift-t", TaskListClearTagFilter, context),
