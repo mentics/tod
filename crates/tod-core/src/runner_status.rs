@@ -24,6 +24,9 @@ pub enum RunnerStatus {
         activity: Option<String>,
         since: Option<i64>,
         tokens: Option<u64>,
+        /// The run is polling GitHub for a change (a bot's review, CI) and
+        /// reads it next at this time.
+        next_poll_ms: Option<i64>,
     },
     /// Nothing can continue until the user answers something.
     Waiting { since: i64 },
@@ -75,6 +78,7 @@ impl RunnerStatus {
                     let t = &u.total;
                     t.input + t.output + t.cache_read + t.cache_write
                 }),
+                next_poll_ms: None,
             };
         }
         if let Some(since) = waiting_since {
@@ -116,6 +120,7 @@ impl RunnerStatus {
                         let t = &u.total;
                         t.input + t.output + t.cache_read + t.cache_write
                     }),
+                    next_poll_ms: live.next_poll_ms,
                 }
             }
             Some(Runner::Ended(outcome)) if !conversation.is_some_and(|c| c.running) => match outcome {
@@ -250,6 +255,7 @@ mod tests {
                 activity: Some("Reading src/lib.rs".into()),
                 since: Some(10),
                 tokens: Some(21_500),
+                next_poll_ms: None,
             }
         );
     }
@@ -298,6 +304,7 @@ mod tests {
                 activity: Some("deciding the next step".into()),
                 since: Some(3),
                 tokens: None,
+                next_poll_ms: None,
             }
         );
         let paused = Outcome::Stopped {

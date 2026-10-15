@@ -127,7 +127,8 @@ pub trait StepHook {
 
     /// The run is waiting on something outside (a bot's review, CI) and no
     /// agent is working: `Some(what)` while it waits, `None` when it stops.
-    fn waiting(&mut self, _on: Option<&str>) {}
+    /// `next_poll_ms` is when GitHub is read again (ms since the epoch).
+    fn waiting(&mut self, _on: Option<&str>, _next_poll_ms: Option<i64>) {}
 }
 
 /// No hook: never stops.
@@ -380,7 +381,7 @@ impl Autopilot {
             }
             // `approved` waits for the merge and `merged` for the release.
             if let Some(outcome) = self.hold_for_github(fleet, &lifecycle)? {
-                hook.waiting(None);
+                hook.waiting(None, None);
                 return self.finish(outcome);
             }
             let standing = fleet.read(|conn| Standing::load(conn, self.node, &lifecycle))?;
@@ -574,18 +575,18 @@ impl Autopilot {
         let mut unchanged = 0u32;
         loop {
             if let Some(reason) = hook.at(fleet, Boundary::Step)? {
-                hook.waiting(None);
+                hook.waiting(None, None);
                 return Ok(Some(Outcome::Stopped { reason }));
             }
             if let Some(limit) = self.over_budget() {
-                hook.waiting(None);
+                hook.waiting(None, None);
                 return Ok(Some(Outcome::BudgetExhausted { limit }));
             }
             let pending = fleet
                 .read(|conn| Ok(DecisionRepo::new(conn).list_pending_for_node(self.node)?))?
                 .len();
             if pending > 0 {
-                hook.waiting(None);
+                hook.waiting(None, None);
                 return Ok(Some(Outcome::NeedsHuman {
                     reason: NeedsHuman::Decision { pending },
                 }));
@@ -593,7 +594,7 @@ impl Autopilot {
             let links = fleet.read(|conn| tod_store::github::NodePrRepo::new(conn).read(self.node))?;
             if links.prs.is_empty() {
                 // The agent opens it.
-                hook.waiting(None);
+                hook.waiting(None, None);
                 if let Some(outcome) = self.converse(fleet, agent, hook, ProtocolKind::Pr, None)? {
                     return Ok(Some(outcome));
                 }
@@ -611,7 +612,7 @@ impl Autopilot {
                 continue;
             }
             let Some(feed) = pr_readiness::feed_for(&self.config.data_root) else {
-                hook.waiting(None);
+                hook.waiting(None, None);
                 return Ok(None);
             };
             let settings = pr_readiness::settings_at(&self.config.data_root);
@@ -619,18 +620,18 @@ impl Autopilot {
                 Ok(live) => live,
                 Err(err) => {
                     tracing::info!(node = %self.node, %err, "pull request not readable; leaving it to the gate");
-                    hook.waiting(None);
+                    hook.waiting(None, None);
                     return Ok(None);
                 }
             };
             match pr_readiness::overall(&live) {
                 PrNext::Merged | PrNext::Clear => {
-                    hook.waiting(None);
+                    hook.waiting(None, None);
                     return Ok(None);
                 }
                 PrNext::Work(_) => {
                     waited_since = None;
-                    hook.waiting(None);
+                    hook.waiting(None, None);
                     let turns = self.pr_agent_turns(fleet)?;
                     let base = *self.state.pr_turns_base.get_or_insert(turns);
                     // The first turn opens the pull request: it is not a round.
@@ -691,19 +692,20 @@ impl Autopilot {
                     if waits.iter().any(|w| matches!(w, Wait::HumanReview)) {
                         // Hours or days: the run ends, and is woken at the
                         // time recorded (or by the review's webhook).
-                        hook.waiting(None);
+                        hook.waiting(None, None);
                         return Ok(Some(self.wait_for_review(fleet, &live, &settings)?));
                     }
                     let since = *waited_since.get_or_insert_with(std::time::Instant::now);
                     let what = wait_description(&waits);
-                    hook.waiting(Some(&what));
                     let interval = if since.elapsed() >= PR_SLOW_AFTER {
                         self.pr_poll * PR_SLOW_FACTOR
                     } else {
                         self.pr_poll
                     };
+                    let next_poll_ms = chrono::Utc::now().timestamp_millis() + interval.as_millis() as i64;
+                    hook.waiting(Some(&what), Some(next_poll_ms));
                     if let Some(reason) = self.sleep_watching(fleet, hook, interval)? {
-                        hook.waiting(None);
+                        hook.waiting(None, None);
                         return Ok(Some(Outcome::Stopped { reason }));
                     }
                 }

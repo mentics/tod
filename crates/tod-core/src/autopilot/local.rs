@@ -71,6 +71,9 @@ pub struct Live {
     /// The turn in flight, with its streamed parts (sent at most every
     /// [`PARTS_INTERVAL`] while only they change).
     pub status: ConversationStatus,
+    /// While the run waits on GitHub and polls it: when it reads it next
+    /// (ms since the epoch).
+    pub next_poll_ms: Option<i64>,
 }
 
 /// One node's runner as the host of its runs reports it: what the app shows
@@ -287,7 +290,7 @@ impl<F: FnMut(LocalEvent)> StepHook for Hook<'_, F> {
         })
     }
 
-    fn waiting(&mut self, on: Option<&str>) {
+    fn waiting(&mut self, on: Option<&str>, next_poll_ms: Option<i64>) {
         self.waiting = on.is_some();
         if let Some(on) = on {
             self.report(Live {
@@ -298,6 +301,7 @@ impl<F: FnMut(LocalEvent)> StepHook for Hook<'_, F> {
                     activity: Some(on.to_string()),
                     ..Default::default()
                 },
+                next_poll_ms,
             });
         }
     }
@@ -311,6 +315,7 @@ impl<F: FnMut(LocalEvent)> StepHook for Hook<'_, F> {
             protocol: Some(turn.protocol),
             conversation_id: turn.conversation_id,
             status,
+            next_poll_ms: None,
         });
         None
     }

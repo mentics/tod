@@ -955,7 +955,7 @@ impl TaskPanel {
             }
         } else {
             match &status {
-                RunnerStatus::Running { activity, tokens, .. } => {
+                RunnerStatus::Running { activity, tokens, next_poll_ms, .. } => {
                     if let Some(activity) = activity {
                         // Shrinks, never grows: the elapsed time and tokens
                         // stay beside it.
@@ -972,6 +972,14 @@ impl TaskPanel {
                         line = line
                             .child(sep())
                             .child(style::text_muted(div().flex_none()).child(format_tokens(*tokens)));
+                    }
+                    if let Some(at) = next_poll_ms {
+                        let next = chrono::DateTime::from_timestamp_millis(*at)
+                            .map(|t| t.with_timezone(&chrono::Local).format("%H:%M:%S").to_string())
+                            .unwrap_or_default();
+                        line = line
+                            .child(sep())
+                            .child(style::text_muted(div().flex_none()).child(format!("polling; next poll {next}")));
                     }
                 }
                 RunnerStatus::Waiting { .. } => {
