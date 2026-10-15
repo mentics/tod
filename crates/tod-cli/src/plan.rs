@@ -98,6 +98,13 @@ fn normalize_status(raw: &str) -> anyhow::Result<&'static str> {
 fn resolve(inv: &Invocation, raw: &str) -> anyhow::Result<Uuid> {
     inv.client()
         .read(|conn| InterviewRepo::new(conn).resolve_plan_step_id(raw))
+        .map_err(|err| {
+            err.context(format!(
+                "plan step `{raw}` is not one this data root holds (it may have been deleted or its \
+                 change reversed, or the id belongs to something else): `tod-cli plan list --node <NODE>` \
+                 shows the steps that exist"
+            ))
+        })
 }
 
 fn resolve_obligation(inv: &Invocation, raw: &str) -> anyhow::Result<Uuid> {

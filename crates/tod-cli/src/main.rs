@@ -108,13 +108,27 @@ fn main() -> ExitCode {
             if !output.is_empty() {
                 println!("{output}");
             }
+            for message in args::take_ignored_options() {
+                eprintln!("tod-cli: warning: {message}");
+                report_problem(
+                    tod_problems::Level::Warn,
+                    &format!("{message}\n{}", failure_context(&args)),
+                    data_root_flag(&args).as_deref(),
+                );
+            }
             ExitCode::SUCCESS
         }
         Err(err) => {
             eprintln!("tod-cli: {err:#}");
             // Also to the app's problem log (log panel and toast), under the
             // data root the invocation named, else the one the app passed.
-            report_problem(tod_problems::Level::Error, &format!("{err:#}"), data_root_flag(&args).as_deref());
+            // Options left unread because the command failed first say nothing.
+            args::take_ignored_options();
+            report_problem(
+                tod_problems::Level::Error,
+                &format!("{err:#}\n{}", failure_context(&args)),
+                data_root_flag(&args).as_deref(),
+            );
             ExitCode::FAILURE
         }
     }
@@ -137,6 +151,68 @@ pub(crate) fn report_problem(level: tod_problems::Level, message: &str, root: Op
     if let Err(err) = tod_problems::report_to(root, "tod-cli", level, None, message) {
         eprintln!("tod-cli: could not record this in the problem log: {err}");
     }
+}
+
+/// What the invocation was doing and for whom, for the problem log: the
+/// command line (long values cut), then the node and conversation the app
+/// started this agent for, looked up by name. A lookup that fails is said, not
+/// skipped.
+fn failure_context(args: &[String]) -> String {
+    use tod_core::conversation::implement::{IMPLEMENT_CONVERSATION_ENV, IMPLEMENT_NODE_ENV};
+    let mut words: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--data-root" => i += 1,
+            "--json" => {}
+            word => {
+                let word = word.replace('\n', " ");
+                let cut: String = word.chars().take(80).collect();
+                words.push(if cut.len() < word.len() { format!("{cut}…") } else { cut });
+            }
+        }
+        i += 1;
+    }
+    let mut out = format!("while running: tod-cli {}", words.join(" "));
+    let env = |name: &str| std::env::var(name).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
+    let root = data_root_flag(args).or_else(|| REPORT_ROOT.get().cloned());
+    let actor = env(tod_store::interview::ACTOR_ENV);
+    if let Some(actor) = &actor {
+        out.push_str(&format!("\nacting as: {actor}"));
+    }
+    let node = env(IMPLEMENT_NODE_ENV).map(|raw| (raw.clone(), uuid::Uuid::parse_str(&raw)));
+    let conversation = env(IMPLEMENT_CONVERSATION_ENV).map(|raw| (raw.clone(), uuid::Uuid::parse_str(&raw)));
+    if node.is_none() && conversation.is_none() {
+        return out;
+    }
+    let Some(root) = root else {
+        out.push_str("\n(no data root, so the node and conversation could not be named)");
+        return out;
+    };
+    let client = tod_core::interview::client::InterviewClient::new(root, actor.unwrap_or_default());
+    if let Some((raw, id)) = node {
+        let line = match id {
+            Err(_) => format!("\nnode: {IMPLEMENT_NODE_ENV} is not a UUID (`{raw}`)"),
+            Ok(id) => match client.read(|conn| tod_store::outline::repos::NodeRepo::new(conn).get(id)) {
+                Ok(Some(node)) => format!("\nnode: \"{}\" ({}, {id})", node.title, node.slug),
+                Ok(None) => format!("\nnode: {id} (no longer exists)"),
+                Err(err) => format!("\nnode: {id} (could not look it up: {err:#})"),
+            },
+        };
+        out.push_str(&line);
+    }
+    if let Some((raw, id)) = conversation {
+        let line = match id {
+            Err(_) => format!("\nconversation: {IMPLEMENT_CONVERSATION_ENV} is not a UUID (`{raw}`)"),
+            Ok(id) => match client.read(|conn| tod_store::conversation::ConversationRepo::new(conn).get(id)) {
+                Ok(Some(c)) => format!("\nconversation: {id}, {} protocol", c.protocol.as_str()),
+                Ok(None) => format!("\nconversation: {id} (not found)"),
+                Err(err) => format!("\nconversation: {id} (could not look it up: {err:#})"),
+            },
+        };
+        out.push_str(&line);
+    }
+    out
 }
 
 /// Parsed global options plus the remaining noun/command arguments.
