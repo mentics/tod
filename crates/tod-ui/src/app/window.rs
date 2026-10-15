@@ -717,6 +717,7 @@ impl Shell {
                             .compact()
                             .label(label)
                             .when(errors > 0, |b| b.danger())
+                            .when(errors == 0 && attention > 0, |b| b.warning())
                             .tooltip("Open the log: errors, warnings, and status messages from tod and its daemons")
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.open_log_window(cx);
