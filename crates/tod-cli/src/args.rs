@@ -36,10 +36,21 @@ impl Drop for Args {
                 "ignored unknown option(s) {}; see `tod-cli <NOUN> --help`",
                 ignored.join(", ")
             );
-            eprintln!("tod-cli: warning: {message}");
-            crate::report_problem(tod_problems::Level::Warn, &message, None);
+            IGNORED_OPTIONS.with(|pending| pending.borrow_mut().push(message));
         }
     }
+}
+
+thread_local! {
+    /// Ignored-option warnings from `Args` dropped so far. A command that
+    /// failed before reading its flags drops them unread, so the warning is
+    /// only meaningful (and only shown) once the command has succeeded.
+    static IGNORED_OPTIONS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The ignored-option warnings collected so far, emptied.
+pub fn take_ignored_options() -> Vec<String> {
+    IGNORED_OPTIONS.with(|pending| std::mem::take(&mut *pending.borrow_mut()))
 }
 
 impl Args {
