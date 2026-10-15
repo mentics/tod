@@ -60,6 +60,7 @@ use gpui::{
 };
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::input::{Input, InputEvent, InputState};
+use gpui_component::scroll::ScrollableElement;
 use gpui_component::{ActiveTheme, Disableable, IconName, Sizable};
 use tod_core::attention::{AttentionItem, AttentionKind, RequestReason};
 use tod_core::conversation::implement::HandoffAnswer;
@@ -1372,11 +1373,15 @@ impl Requests {
         };
         let footer = self.render_footer(item, window, cx);
         self.card(format!("unified-decisions-pending-{}", decision.id), cx)
-            .child(selectable_markdown(
-                SharedString::from(format!("unified-decisions-question-{}", decision.id)),
-                decision.question.clone(),
-                window,
-                cx,
+            .child(capped_scroll(
+                format!("unified-decisions-question-scroll-{}", decision.id),
+                output_max_height(window),
+                selectable_markdown(
+                    SharedString::from(format!("unified-decisions-question-{}", decision.id)),
+                    decision.question.clone(),
+                    window,
+                    cx,
+                ),
             ))
             .when(tod_core::environment_request::is_request(&decision), |el| {
                 el.child(self.render_credential_buttons(&decision, cx))
@@ -1731,4 +1736,22 @@ mod tests {
             assert_eq!(r.loaded.pending.len(), 1);
         });
     }
+}
+
+/// Most rows of agent output a request shows before it scrolls.
+const OUTPUT_MAX_ROWS: f32 = 12.;
+
+fn output_max_height(window: &Window) -> gpui::Pixels {
+    (window.line_height() * OUTPUT_MAX_ROWS).min(window.viewport_size().height)
+}
+
+/// `content` in a box no taller than 12 text rows or the window, whichever is
+/// shorter, with a scrollbar that appears only when the content overflows.
+fn capped_scroll(id: String, max_h: gpui::Pixels, content: impl IntoElement) -> AnyElement {
+    div()
+        .id(SharedString::from(id))
+        .max_h(max_h)
+        .overflow_y_scrollbar()
+        .child(content)
+        .into_any_element()
 }
