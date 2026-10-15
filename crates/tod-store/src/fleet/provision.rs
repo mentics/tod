@@ -250,7 +250,10 @@ fn make_worktree(
         .repo_dir()
         .context("Set a workspace directory before a worktree can be made")?;
     let repo_path = validate_git_repo(&repo)?;
-    let lease_holder = format!("tod-{}", files.node_id);
+    let node = fleet
+        .get_node(&files.node_id)?
+        .ok_or_else(|| anyhow!("no node {}", files.node_id))?;
+    let lease_holder = format!("tod-{}", node.slug);
     let data_root = settings.resolve_fleet_storage_root(paths)?;
     progress(&format!("making a worktree of {repo_path} on {branch}…"));
     // No store lock is held while git, Docker, or Treehouse run: the UI reads
