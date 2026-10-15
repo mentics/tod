@@ -252,6 +252,9 @@ pub struct UnifiedView {
     /// lifecycle processor, and only the chat panel. A node leaving both
     /// has stopped, and lands in [`Self::finished`].
     last_lifecycle_running: std::collections::HashSet<Uuid>,
+    /// Nodes whose supervisor is working in the cloud now
+    /// (`tod_core::cloud_sync::working_in_cloud`), shown as running.
+    cloud_working: std::collections::HashSet<Uuid>,
     last_chat_running: std::collections::HashSet<Uuid>,
     /// Nodes whose run stopped since the user last selected them, oldest
     /// first, and which kind stopped. The tree marks them (orange, ringed
@@ -324,6 +327,7 @@ impl UnifiedView {
             last_default: Cell::new(None),
             restoring_selection: None,
             last_lifecycle_running: std::collections::HashSet::new(),
+            cloud_working: std::collections::HashSet::new(),
             last_chat_running: std::collections::HashSet::new(),
             finished: Vec::new(),
             _task_list_subscription,
@@ -361,7 +365,7 @@ impl UnifiedView {
                     break;
                 };
                 let fleet_for_read = fleet.clone();
-                let (computed, is_task) = cx
+                let (computed, cloud, is_task) = cx
                     .background_executor()
                     .spawn(async move {
                         let is_task = selected.map(|id| {
@@ -370,11 +374,13 @@ impl UnifiedView {
                                 .unwrap_or(false);
                             (id, is_task)
                         });
-                        (attention_feed::compute(&fleet_for_read), is_task)
+                        let cloud = tod_core::cloud_sync::working_in_cloud(&fleet_for_read);
+                        (attention_feed::compute(&fleet_for_read), cloud, is_task)
                     })
                     .await;
                 let Ok(()) = this.update_in(cx, |this, window, cx| {
                     this.apply_attention(computed, cx);
+                    this.apply_cloud_working(cloud, cx);
                     if let Some((node_id, is_task)) = is_task {
                         this.follow_default_panel(node_id, is_task, window, cx);
                     }
@@ -448,6 +454,27 @@ impl UnifiedView {
         });
     }
 
+    /// Nodes working in the cloud count as running in the tree. A read that
+    /// failed is logged and leaves the last answer standing.
+    fn apply_cloud_working(
+        &mut self,
+        work: anyhow::Result<Vec<tod_core::cloud_sync::CloudWork>>,
+        cx: &mut Context<Self>,
+    ) {
+        let work = match work {
+            Ok(work) => work,
+            Err(err) => {
+                tracing::error!("could not read which cloud nodes are working: {err:#}");
+                return;
+            }
+        };
+        let working: std::collections::HashSet<Uuid> = work.into_iter().map(|w| w.node_id).collect();
+        if working != self.cloud_working {
+            self.cloud_working = working;
+            self.apply_running_nodes(cx);
+        }
+    }
+
     /// Tells the tree which nodes the lifecycle processor is working on (a
     /// runner with a run in progress, or a lifecycle conversation mid-turn),
     /// which only a chat is, and which stopped since the user last selected
@@ -456,6 +483,7 @@ impl UnifiedView {
     fn apply_running_nodes(&mut self, cx: &mut Context<Self>) {
         let mut lifecycle = self.agent_runs.read(cx).running_lifecycle_nodes();
         lifecycle.extend(self.runners.read(cx).running_nodes());
+        lifecycle.extend(self.cloud_working.iter().copied());
         let chat = self.agent_runs.read(cx).running_chat_nodes();
         let selected = self.task_list.read(cx).selected_node_id();
         let was_active: Vec<Uuid> = self

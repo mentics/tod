@@ -173,26 +173,15 @@ fn collect_running_work(
     }
     let (affected, mut continuing) = agent_runs.read(cx).running_work_split();
     items.extend(affected.into_iter().map(SharedString::from));
-    // A node handed to the cloud is run by its supervisor in its own
-    // sandbox, so closing the app does not touch it. One whose sandbox is
-    // gone is waiting for the app anyway.
-    if let Ok(rows) = fleet.read(tod_store::cloud_nodes::list) {
-        for row in rows.into_iter().filter(|row| row.lost_at.is_none()) {
-            let node_id = row.node_id.to_string();
-            let Ok(Some(node)) = fleet.get_node(&node_id) else { continue };
-            if node.lifecycle == "done" {
-                continue;
-            }
-            let title = if node.title.trim().is_empty() {
-                node.slug.clone()
-            } else {
-                node.title.clone()
-            };
-            continuing.push(format!(
-                "{title} ({}): running in the cloud",
-                node.lifecycle
-            ));
-        }
+    // A node working in the cloud is run by its supervisor in its own
+    // sandbox, so closing the app does not touch it. A node only assigned
+    // to the cloud (waiting on a review or on the user) is not listed.
+    match tod_core::cloud_sync::working_in_cloud(fleet) {
+        Ok(work) => continuing.extend(
+            work.into_iter()
+                .map(|w| format!("{} ({}): running in the cloud", w.title, w.lifecycle)),
+        ),
+        Err(err) => continuing.push(format!("could not read the cloud nodes: {err:#}")),
     }
     crate::ui::toast::CloseGuardWork {
         affected: items,

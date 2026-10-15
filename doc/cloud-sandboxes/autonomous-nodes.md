@@ -27,7 +27,11 @@ on this machine" is in its menu). Closing the app with such a node running
 shows the close warning in yellow ("running in the cloud"), never red, and
 closing goes ahead. On the next launch the app syncs (`sync_on_start`), so the
 node's lifecycle state, requests, and finished work are current when its panel
-is shown. The one thing that does need the app is replacing a sandbox that was
+is shown. A node counts as running in the cloud (the tree's running glyph,
+the close warning) only while it waits on nothing: no pending wait and no
+request for the user (`tod_core::cloud_sync::working_in_cloud`). The
+supervisor reports no heartbeat, so a supervisor that died mid-turn still
+reads as running. The one thing that does need the app is replacing a sandbox that was
 lost while it was closed (see Where data lives).
 
 ## Goal

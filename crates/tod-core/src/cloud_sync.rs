@@ -141,6 +141,52 @@ pub fn cloud_node(fleet: &FleetStore, node_id: &str) -> Option<CloudNode> {
     fleet.read(|conn| tod_store::cloud_nodes::get(conn, node)).ok()?.map(CloudNode::from)
 }
 
+/// A node whose supervisor is working in the cloud now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CloudWork {
+    pub node_id: uuid::Uuid,
+    pub title: String,
+    pub lifecycle: String,
+}
+
+/// The cloud nodes that are working now, as far as the synced data says. The
+/// supervisor reports no heartbeat, so this is derived: a node assigned to the
+/// cloud (not lost, not `done`) is working unless it is waiting on something
+/// (a pending `waits` row: a review, CI, a time) or on the user (a pending
+/// request). Being assigned to the cloud alone is not work: such a node can
+/// sit idle for days. A supervisor that died mid-turn still reads as working.
+///
+/// Reads the store's own connection, so call it off the UI thread.
+pub fn working_in_cloud(fleet: &FleetStore) -> Result<Vec<CloudWork>> {
+    let candidates = fleet.read(|conn| {
+        let rows: Vec<_> = tod_store::cloud_nodes::list(conn)?
+            .into_iter()
+            .filter(|row| row.lost_at.is_none())
+            .collect();
+        let ids: Vec<uuid::Uuid> = rows.iter().map(|row| row.node_id).collect();
+        let attention = crate::attention::for_nodes(conn, &ids)?;
+        let waits = tod_store::waits::WaitRepo::new(conn);
+        let mut free = Vec::new();
+        for id in ids {
+            if attention.get(&id).is_some_and(|a| a.count > 0) || !waits.list_pending_for_node(id)?.is_empty() {
+                continue;
+            }
+            free.push(id);
+        }
+        Ok(free)
+    })?;
+    let mut working = Vec::new();
+    for node_id in candidates {
+        let Some(node) = fleet.get_node(&node_id.to_string())? else { continue };
+        if node.lifecycle == "done" {
+            continue;
+        }
+        let title = if node.title.trim().is_empty() { node.slug.clone() } else { node.title.clone() };
+        working.push(CloudWork { node_id, title, lifecycle: node.lifecycle });
+    }
+    Ok(working)
+}
+
 /// Held by every [`sync`] in this process. Background syncs (the outbox
 /// push, notices, the start) go through one coalescing runner
 /// ([`crate::cloud_notify::runner`]); this lock also keeps the user's own

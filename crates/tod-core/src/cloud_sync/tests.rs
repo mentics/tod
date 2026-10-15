@@ -269,3 +269,46 @@ fn a_nodes_problem_reaches_the_apps_log_on_a_sync_and_only_once() {
     assert_eq!(marker(buffer::snapshot(LogFilter::All)).len(), 1);
     assert!(CloudSyncState::load(&root).unwrap().problems_after.is_some());
 }
+
+#[test]
+fn a_cloud_node_is_working_only_when_it_waits_on_nothing() {
+    use tod_store::interview::InterviewCommand;
+    use tod_store::waits::NewWait;
+    let root = temp_root("cloud-working");
+    let fleet = FleetStore::open(&root).unwrap();
+    add_list(&fleet, "t");
+    let list_id = fleet.list_outline_lists().unwrap()[0].id;
+    for title in ["working", "awaiting"] {
+        fleet
+            .enqueue_outline(OutlineMutation::CreateNode {
+                node_id: None,
+                list_id,
+                parent_id: None,
+                anchor_id: None,
+                position: tod_store::outline::CreatePosition::Below,
+                title: title.into(),
+            })
+            .unwrap();
+    }
+    fleet.writer().flush().unwrap();
+    fleet.reload_if_stale().unwrap();
+    let nodes = fleet.flatten_outline(list_id).unwrap();
+    let ids: Vec<uuid::Uuid> = nodes.iter().map(|n| n.node.id).collect();
+    for id in &ids {
+        fleet
+            .enqueue(FleetMutation::CloudNodeUpsert { node: *id, sandbox: "s".into(), user: "u".into(), accepted_at: 1 })
+            .unwrap();
+    }
+    fleet.writer().flush().unwrap();
+    assert_eq!(working_in_cloud(&fleet).unwrap().len(), 2, "assigned and waiting on nothing");
+
+    fleet
+        .interview(
+            "test",
+            InterviewCommand::RecordWait { node_id: ids[1], wait: NewWait::event("github:pr 1 checks", i64::MAX / 2) },
+        )
+        .unwrap();
+    fleet.writer().flush().unwrap();
+    let working = working_in_cloud(&fleet).unwrap();
+    assert_eq!(working.iter().map(|w| w.node_id).collect::<Vec<_>>(), vec![ids[0]]);
+}
