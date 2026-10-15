@@ -416,6 +416,53 @@ mod tests {
         FilesPlace { name: name.into(), repo: Some(repo.into()), ..Default::default() }
     }
 
+    /// v82: each node's Files recipe becomes a location it picks; nodes with
+    /// the same recipe share one, nothing configured is skipped, and the old
+    /// columns and the node's repo are left as they were.
+    #[test]
+    fn migration_makes_one_location_per_recipe_and_keeps_old_data() {
+        use crate::fleet::repos::{node_id_blob, seed_node};
+        let (dir, conn) = test_writer_conn();
+        let (a, b, c, empty) = (seed_node(&conn), seed_node(&conn), seed_node(&conn), seed_node(&conn));
+        let blob = |id: &str| node_id_blob(id).unwrap();
+        for (node, worktree, repo) in [(&a, 1, "/src/app"), (&b, 1, "/src/app"), (&c, 0, "/src/other"), (&empty, 0, "")] {
+            conn.execute(
+                "INSERT INTO node_capabilities (node_id, capability, enabled_at) VALUES (?1, 'files', 0)",
+                params![blob(node)],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO node_files (node_id, use_worktree, updated_at) VALUES (?1, ?2, 0)",
+                params![blob(node), worktree],
+            )
+            .unwrap();
+            if !repo.is_empty() {
+                conn.execute("UPDATE node_fields SET repo = ?2 WHERE node_id = ?1", params![blob(node), repo])
+                    .unwrap();
+            }
+        }
+        migrate_from_node_files(&conn).unwrap();
+
+        let places = FilesPlaceRepo::new(&conn).list().unwrap();
+        assert_eq!(places.len(), 2, "{places:?}");
+        let pick = |node: &str| -> Option<String> {
+            conn.query_row("SELECT place_id FROM node_files WHERE node_id = ?1", params![blob(node)], |r| r.get(0))
+                .unwrap()
+        };
+        assert!(pick(&a).is_some());
+        assert_eq!(pick(&a), pick(&b));
+        assert_ne!(pick(&a), pick(&c));
+        assert_eq!(pick(&empty), None);
+        let shared = places.iter().find(|p| Some(&p.id) == pick(&a).as_ref()).unwrap();
+        assert_eq!(shared.repo(), Some("/src/app"));
+        assert!(shared.use_worktree);
+        let repo: Option<String> = conn
+            .query_row("SELECT repo FROM node_fields WHERE node_id = ?1", params![blob(&a)], |r| r.get(0))
+            .unwrap();
+        assert_eq!(repo.as_deref(), Some("/src/app"));
+        cleanup_test_dir(&dir);
+    }
+
     #[test]
     fn save_round_trips_and_normalizes() {
         let (dir, conn) = test_writer_conn();
