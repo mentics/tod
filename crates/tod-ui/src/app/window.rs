@@ -694,6 +694,21 @@ impl Shell {
                                 this.open_transcript_window(cx);
                             })),
                     )
+                    .child(
+                        Button::new("open-locations")
+                            .outline()
+                            .compact()
+                            .label("Locations")
+                            .tooltip("Manage where nodes' files are: directories, dev containers, cloud sandboxes")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                crate::views::locations::open_locations_dialog(
+                                    window,
+                                    cx,
+                                    this.fleet.clone(),
+                                    this.paths.clone(),
+                                );
+                            })),
+                    )
                     .child({
                         let (attention, errors) = self.log_unread;
                         let label = if attention == 0 {

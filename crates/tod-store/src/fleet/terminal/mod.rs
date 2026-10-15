@@ -1632,24 +1632,16 @@ mod tests {
                 capabilities: vec![Capability::Files],
             })
             .unwrap();
-        store
-            .enqueue(FleetMutation::UpdateTaskRepo {
-                id: task_id.clone(),
-                repo: Some(cwd.display().to_string()),
-            })
-            .unwrap();
-        store.writer().flush().unwrap();
         // These tests run in `cwd` itself, not a worktree of it.
-        store
-            .enqueue_outline(OutlineMutation::SetNodeFiles {
-                node_id: uuid::Uuid::parse_str(&task_id).unwrap(),
+        crate::fleet::places::pick_matching(
+            &store,
+            &task_id,
+            &crate::fleet::FilesPlace {
                 repo: Some(cwd.display().to_string()),
-                branch: None,
-                use_worktree: false,
-                dev_container: None,
-            })
-            .unwrap();
-        store.writer().flush().unwrap();
+                ..Default::default()
+            },
+        )
+        .unwrap();
         let _ = store.reload_if_stale();
         task_id
     }

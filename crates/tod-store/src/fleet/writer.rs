@@ -71,15 +71,20 @@ pub enum FleetMutation {
         id: String,
     },
     // --- Files capability (immediate) ---
-    /// Set the node's worktree flag (workspace dir / branch use `UpdateTaskRepo` / `UpdateTaskBranch`).
-    SetNodeUseWorktree {
+    /// The location the node's Files uses (`None` picks none). Branch uses
+    /// `UpdateTaskBranch`.
+    SetNodeFilesPlace {
         node_id: String,
-        use_worktree: bool,
+        place_id: Option<String>,
     },
-    /// Run the node's launches in a dev container (`Some`), or on this machine.
-    SetNodeDevContainer {
-        node_id: String,
-        dev_container: Option<crate::fleet::repos::node_files::DevContainerSetting>,
+    /// Store a location (a new one has an empty id): validated, so a bad one
+    /// fails the flush with the reason.
+    SaveFilesPlace {
+        place: crate::fleet::repos::files_place::FilesPlace,
+    },
+    /// Delete a location; every node that picked it has none afterwards.
+    DeleteFilesPlace {
+        id: String,
     },
     /// Record the worktree or sandbox made for a node.
     RecordFilesLocation {
@@ -217,8 +222,9 @@ impl FleetMutation {
         matches!(
             self,
             FleetMutation::DeleteTask { .. }
-                | FleetMutation::SetNodeUseWorktree { .. }
-                | FleetMutation::SetNodeDevContainer { .. }
+                | FleetMutation::SetNodeFilesPlace { .. }
+                | FleetMutation::SaveFilesPlace { .. }
+                | FleetMutation::DeleteFilesPlace { .. }
                 | FleetMutation::RecordFilesLocation { .. }
                 | FleetMutation::DeleteFilesLocation { .. }
                 | FleetMutation::UpsertNodeAgent { .. }
@@ -290,17 +296,14 @@ impl FleetMutation {
             FleetMutation::DeleteTask { id } => {
                 TaskRepo::new(conn).delete(id)?;
             }
-            FleetMutation::SetNodeUseWorktree {
-                node_id,
-                use_worktree,
-            } => {
-                NodeFilesRepo::new(conn).set_use_worktree(node_id, *use_worktree)?;
+            FleetMutation::SetNodeFilesPlace { node_id, place_id } => {
+                NodeFilesRepo::new(conn).set_place(node_id, place_id.as_deref())?;
             }
-            FleetMutation::SetNodeDevContainer {
-                node_id,
-                dev_container,
-            } => {
-                NodeFilesRepo::new(conn).set_dev_container(node_id, dev_container.as_ref())?;
+            FleetMutation::SaveFilesPlace { place } => {
+                crate::fleet::repos::files_place::FilesPlaceRepo::new(conn).save(place)?;
+            }
+            FleetMutation::DeleteFilesPlace { id } => {
+                crate::fleet::repos::files_place::FilesPlaceRepo::new(conn).delete(id)?;
             }
             FleetMutation::RecordFilesLocation { location } => {
                 crate::fleet::repos::files_location::FilesLocationRepo::new(conn).upsert(location)?;

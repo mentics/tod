@@ -2,6 +2,7 @@ pub mod agent_transcripts;
 pub mod cloud_node;
 pub mod command_history;
 pub mod database;
+pub mod locations;
 pub mod log_panel;
 pub mod environment_editor;
 pub mod lifecycle_config_editor;

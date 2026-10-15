@@ -988,15 +988,16 @@ mod tests {
             })
             .unwrap();
         let parent = parent.to_string();
-        store
-            .enqueue(FleetMutation::UpdateTaskRepo {
-                id: parent.clone(),
+        crate::fleet::places::pick_matching(
+            &store,
+            &parent,
+            &crate::fleet::FilesPlace {
                 repo: Some(repo.to_string_lossy().into_owned()),
-            })
-            .unwrap();
-        store
-            .enqueue(FleetMutation::SetNodeUseWorktree { node_id: parent.clone(), use_worktree: true })
-            .unwrap();
+                use_worktree: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         store.writer().flush().unwrap();
         store.reload_if_stale().unwrap();
         (parent, child.to_string())

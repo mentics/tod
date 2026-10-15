@@ -3,6 +3,7 @@
 pub mod agent_run;
 pub mod agent_session;
 pub mod files_location;
+pub mod files_place;
 pub mod interview_session;
 pub mod node_agent;
 pub mod node_files;

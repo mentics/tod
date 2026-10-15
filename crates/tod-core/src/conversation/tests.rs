@@ -1146,16 +1146,17 @@ fn an_implementation_loops_on_recorded_state_until_the_plan_is_done() {
         })
         .unwrap();
     fx.fleet.writer().flush().unwrap();
-    fx.fleet
-        // The workspace itself: a worktree of its own would need a data root.
-        .enqueue_outline(OutlineMutation::SetNodeFiles {
-            node_id: fx.node,
+    // The workspace itself: a worktree of its own would need a data root.
+    tod_store::fleet::places::pick_matching(
+        &fx.fleet,
+        &fx.node.to_string(),
+        &tod_store::fleet::FilesPlace {
             repo: Some(workspace.display().to_string()),
-            branch: None,
             use_worktree: false,
-            dev_container: None,
-        })
-        .unwrap();
+            ..Default::default()
+        },
+    )
+    .unwrap();
     for n in 0..2 {
         fx.fleet
             .enqueue_outline(OutlineMutation::CreatePlanStep {
@@ -1231,16 +1232,17 @@ fn a_verification_loops_until_every_step_has_a_verdict() {
         })
         .unwrap();
     fx.fleet.writer().flush().unwrap();
-    fx.fleet
-        // The workspace itself: a worktree of its own would need a data root.
-        .enqueue_outline(OutlineMutation::SetNodeFiles {
-            node_id: fx.node,
+    // The workspace itself: a worktree of its own would need a data root.
+    tod_store::fleet::places::pick_matching(
+        &fx.fleet,
+        &fx.node.to_string(),
+        &tod_store::fleet::FilesPlace {
             repo: Some(workspace.display().to_string()),
-            branch: None,
             use_worktree: false,
-            dev_container: None,
-        })
-        .unwrap();
+            ..Default::default()
+        },
+    )
+    .unwrap();
     for n in 0..2 {
         fx.fleet
             .enqueue_outline(OutlineMutation::CreatePlanStep {
@@ -1317,16 +1319,17 @@ fn a_review_loops_until_it_is_recorded_done() {
         })
         .unwrap();
     fx.fleet.writer().flush().unwrap();
-    fx.fleet
-        // The workspace itself: a worktree of its own would need a data root.
-        .enqueue_outline(OutlineMutation::SetNodeFiles {
-            node_id: fx.node,
+    // The workspace itself: a worktree of its own would need a data root.
+    tod_store::fleet::places::pick_matching(
+        &fx.fleet,
+        &fx.node.to_string(),
+        &tod_store::fleet::FilesPlace {
             repo: Some(workspace.display().to_string()),
-            branch: None,
             use_worktree: false,
-            dev_container: None,
-        })
-        .unwrap();
+            ..Default::default()
+        },
+    )
+    .unwrap();
     fx.fleet.writer().flush().unwrap();
 
     let mut agent = FakeAgent::new(&fx.fleet);
@@ -1377,16 +1380,17 @@ fn a_fix_loops_until_no_finding_is_open() {
         })
         .unwrap();
     fx.fleet.writer().flush().unwrap();
-    fx.fleet
-        // The workspace itself: a worktree of its own would need a data root.
-        .enqueue_outline(OutlineMutation::SetNodeFiles {
-            node_id: fx.node,
+    // The workspace itself: a worktree of its own would need a data root.
+    tod_store::fleet::places::pick_matching(
+        &fx.fleet,
+        &fx.node.to_string(),
+        &tod_store::fleet::FilesPlace {
             repo: Some(workspace.display().to_string()),
-            branch: None,
             use_worktree: false,
-            dev_container: None,
-        })
-        .unwrap();
+            ..Default::default()
+        },
+    )
+    .unwrap();
     fx.fleet.writer().flush().unwrap();
     let mut ids = Vec::new();
     for summary in ["Empty input panics", "Unused import", "Already declined"] {
@@ -1630,15 +1634,16 @@ fn set_workspace(fx: &Fixture, dir: &std::path::Path, first: bool) {
             .unwrap();
         fx.fleet.writer().flush().unwrap();
     }
-    fx.fleet
-        .enqueue_outline(OutlineMutation::SetNodeFiles {
-            node_id: fx.node,
+    tod_store::fleet::places::pick_matching(
+        &fx.fleet,
+        &fx.node.to_string(),
+        &tod_store::fleet::FilesPlace {
             repo: Some(dir.display().to_string()),
-            branch: None,
             use_worktree: false,
-            dev_container: None,
-        })
-        .unwrap();
+            ..Default::default()
+        },
+    )
+    .unwrap();
     fx.fleet.writer().flush().unwrap();
 }
 

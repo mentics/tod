@@ -397,11 +397,18 @@ checking a gate (`settle_gate`), which may call GitHub.
 
 Tracks agents running against git worktrees: provisioning (`provision.rs`), launching (`launch.rs`, `runtime.rs`), reattaching to running processes (`reattach.rs`), terminal sessions (`terminal/`), prompt queuing (`prompt_queue.rs`), and an undo log (`undo.rs`). `store.rs` / `writer.rs` / `schema.rs` / `migration.rs` are the SQLite persistence core; `projection.rs` derives read-side views for the UI.
 
-### Files: settings inherit, locations are per node
+### Files: locations are global, the choice inherits, worktrees are per node
 
-The Files capability is a recipe, not a place: it says how to get a node
-its files, and every node below it that does not enable Files itself
-inherits it. A node whose files come from a worktree or a sandbox gets
+**Locations** (`files_places`, `tod_store::fleet::FilesPlace`, schema v82,
+machine-local and not synced) are configured once for the app in the status
+bar's Locations dialog (`views::locations`): a recipe for how to get files
+(workspace directory, worktrees, this machine / dev container / cloud
+sandbox). The Files capability only picks one (`node_files.place_id`), and
+every node below it that does not enable Files itself inherits the pick; the
+branch stays the node's own. Editing or deleting a location nodes use shows
+its impact first (`fleet::places::impact`, then `ui::files_impact`), and
+agents may only pick one (`tod-cli capabilities set <node> files --location`).
+A node whose files come from a worktree or a sandbox gets
 **its own** (`node_files_locations`, schema v75, machine-local and not
 synced), made the first time something needs its files: a launch, a shell,
 an editor, a protocol's `cwd` (`provision::resolve_launch_cwd`, which only
@@ -427,11 +434,10 @@ a change instead (including `node delete`). Making a location fetches
 
 ### Dev containers
 
-The Files capability can run a node's work in a running dev container
-instead of on this machine (`node_files.dev_container` / `container` /
-`container_repo_on_host`, schema v57; `container_dir` is unused; the task editor's
-"Runs in" section, which lists `docker ps` in the background, or `tod-cli
-capabilities set <node> files --container <name|id> [--mounted on|off]`).
+A Files location can run a node's work in a running dev container
+instead of on this machine (`files_places.dev_container` / `container` /
+`container_repo_on_host`; `container_dir` is unused; the Locations dialog's
+"Runs in", which lists `docker ps` in the background).
 Nothing starts or builds a container; tod only uses a running one.
 
 - **Repository in the container** (the default): the workspace directory is a
@@ -522,13 +528,12 @@ Nothing starts or builds a container; tod only uses a running one.
   Treehouse one needs `TOD_TEST_DEV_CONTAINER_TREEHOUSE` (a container with
   `treehouse` on its `PATH`).
 - **Cloud sandboxes** are the third place ("Runs in → Cloud sandbox";
-  `node_files.container_kind = 'sandbox'`, with what each node's sandbox
+  `files_places.container_kind = 'sandbox'`, with what each node's sandbox
   starts from in `sandbox_source` / `sandbox_from` (`SandboxFrom`: an image,
-  or a fork of a workspace sandbox); `tod-cli capabilities set <node> files
-  --sandbox image[:<IMAGE>]|fork:<NAME>`). Every node gets a sandbox of its
+  or a fork of a workspace sandbox)). Every node gets a sandbox of its
   own (`provision::make_sandbox`, `Sandboxes::create`), whose name is on its
   location, not the settings. The repository always lives in the sandbox:
-  the image or forked sandbox must already hold it. The Files section lists
+  the image or forked sandbox must already hold it. The Locations dialog lists
   the workspace's sandboxes (`fleet::sandbox::list`) to pick one to fork;
   the workspace and default image are in Settings → Cloud sandboxes
   (`account_settings` / `set_account_settings`, kept in `sandboxes.toml`,

@@ -14,11 +14,12 @@
 //! Changes pulled are applied without being logged here, so they are never
 //! pushed back.
 //!
-//! The node's Files capability names where the repository is for the user
-//! (a directory on their machine, or this sandbox by name); here it is
-//! always the checkout the supervisor was started in. So after every pull
-//! the copy's Files row is rewritten to that directory, unlogged, and pushes
-//! leave it out.
+//! The node's Files capability picks one of the user's locations, which
+//! name where the repository is for them (a directory on their machine, or
+//! this sandbox by name) and are not synced; here it is always the checkout
+//! the supervisor was started in. So after every pull the copy's Files row
+//! is pointed at a location of its own for that directory, unlogged, and
+//! pushes leave it out.
 
 use crate::orchestrator::Orchestrator;
 use anyhow::{Context, Result};
@@ -33,6 +34,9 @@ use tod_store::sync::{self, Change};
 use uuid::Uuid;
 
 const CURSORS_FILE: &str = "supervisor-sync.json";
+
+/// The location the copy's Files row picks: the checkout the supervisor runs in.
+const LOCAL_PLACE_ID: &str = "supervisor-local-checkout";
 
 #[derive(Debug, Default, Clone, Copy, Serialize, Deserialize)]
 struct Cursors {
@@ -227,15 +231,14 @@ impl Replica {
         let tx = conn.transaction()?;
         tx.execute_batch("UPDATE sync_state SET suppress = 1 WHERE id = 1;")?;
         tx.execute(
-            "INSERT INTO node_fields (node_id, repo, updated_at) VALUES (?1, ?2, ?3)
-             ON CONFLICT(node_id) DO UPDATE SET repo = excluded.repo",
-            params![blob, self.workspace.to_string_lossy(), now],
+            "INSERT INTO files_places (id, name, repo, created_at, updated_at)
+             VALUES (?1, 'This checkout', ?2, ?3, ?3)
+             ON CONFLICT(id) DO UPDATE SET repo = excluded.repo, updated_at = excluded.updated_at",
+            params![LOCAL_PLACE_ID, self.workspace.to_string_lossy(), now],
         )?;
         tx.execute(
-            "UPDATE node_files SET use_worktree = 0, worktree_path = NULL, dev_container = 0,
-                 container = NULL, container_repo_on_host = 0, container_kind = 'docker'
-             WHERE node_id = ?1",
-            params![blob],
+            "UPDATE node_files SET place_id = ?2 WHERE node_id = ?1",
+            params![blob, LOCAL_PLACE_ID],
         )?;
         tx.execute_batch("UPDATE sync_state SET suppress = 0 WHERE id = 1;")?;
         tx.commit()?;

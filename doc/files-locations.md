@@ -1,4 +1,4 @@
-# Files: inherited settings, per-node locations
+# Files: global locations, inherited choice, per-node worktrees
 
 ## The problem
 
@@ -10,31 +10,34 @@ the capability shared a single machine, and a sandbox that was never created
 
 ## The model
 
-A capability that **inherits** holds *settings* on the node that enables it
-(the source), and every node below it that does not enable the capability
-itself uses them. When the settings describe something each node needs its
-own copy of, the copy is **derived per-node state**: stored on the node,
-marked with where it came from, and never mistaken for an override.
+**Locations** (`files_places`, `tod_store::fleet::FilesPlace`) are configured
+once for the whole app, from the **Locations** button on the status bar
+(`views::locations`): a name, the workspace directory, where it runs (this
+machine, a dev container, cloud sandboxes), whether each node gets a
+worktree, and for sandboxes what each starts from (an image, or a fork of a
+workspace sandbox). They are machine-local and never synced.
 
-For Files:
+A node's **Files capability** only *picks* one (`node_files.place_id`) and
+every node below it that does not enable Files itself inherits the choice.
+The node keeps its own **branch** (`node_fields.branch`), so an inheriting
+node still has one. Enabling Files on a descendant starts from the location
+it already worked from. A node whose location was deleted, or never chosen,
+says "Choose a location" and cannot launch.
 
-- **Settings** (`node_files` on the source node): the workspace directory,
-  where it runs (this machine, a dev container, cloud sandboxes), whether
-  each node gets a worktree, and for sandboxes what each starts from (an
-  image, or a fork of a workspace sandbox).
+The worktree or sandbox a node gets from its location is **derived
+per-node state**:
+
 - **Location** (`node_files_locations`, one row per node): the worktree or
-  sandbox made for that node, with `source_node_id` (whose settings made
-  it) and `recipe` (a fingerprint of those settings,
+  sandbox made for that node, with `source_node_id` (the node whose pick made
+  it) and `recipe` (a fingerprint of the location's settings,
   `files_location::recipe_key`). It is machine-local and never synced.
 - A node's location is **current** when its source and fingerprint match
-  the settings the node resolves to now, and **stale** otherwise. A stale
-  location is never used; a launch refuses it until it is removed.
-  Reverting the settings makes it current again.
-- A node's **branch** is its own (`node_fields.branch`), `task/<slug>` by
-  default, recorded when its location is made. Every node with a location is
-  on a unique branch.
-- A node with no worktree or sandbox shares the workspace directory, as
-  before.
+  what the node resolves to now, and **stale** otherwise. A stale location is
+  never used; a launch refuses it until it is removed. Reverting makes it
+  current again.
+- A node's **branch** is its own, `task/<slug>` by default, recorded when its
+  location is made. Every node with a location is on a unique branch.
+- A node with no worktree or sandbox shares the workspace directory.
 
 ## Made on first use
 
@@ -60,15 +63,20 @@ Docker, or the network, so it only happens off the UI thread; the UI asks
 
 ## Confirming a change with its impact
 
-Any significant change is confirmed first, with what it will do shown. For
-Files, a change that would leave locations stale lists them
+Any significant change is confirmed first, with what it will do shown. A
+change that would leave locations stale lists them
 (`provision::locations_affected_by`) in a dialog (`ui::files_impact`):
 
-- changing the source's workspace directory, where it runs, whether
-  repositories are mounted, worktrees on or off, or what sandboxes start
-  from: the locations made from its settings;
+- **editing a location** that nodes use: the nodes that picked it, and the
+  worktrees and sandboxes made from it whose fingerprint the edit changes
+  (`fleet::places::impact`). A rename, or any edit that leaves the settings a
+  worktree was made from alone, removes nothing;
+- **deleting a location**: the nodes that picked it (they have none
+  afterwards) and every worktree or sandbox made from it;
+- a node **picking another location**: its own locations made from the old
+  one;
 - enabling Files on a descendant: the locations at or below it made from an
-  ancestor's settings;
+  ancestor's pick;
 - disabling Files: every location made from it;
 - "Remove" on one node: its own location;
 - deleting a node: every location at or below it
@@ -90,12 +98,15 @@ A row with uncommitted work blocks Confirm and offers:
 
 A row whose node has a shell or agent running is busy until it stops.
 
-`tod-cli capabilities set … files` refuses a change that would leave
-locations stale, and `tod-cli node delete` refuses a node with locations at
+`tod-cli capabilities set … files --location` picks an existing location and
+refuses a pick that would leave locations stale; agents cannot create, edit
+or delete locations. `tod-cli node delete` refuses a node with locations at
 or below it: removing them needs the user.
 
 ## Known gaps
 
+- The Locations dialog does not build images with repositories baked in (the
+  old per-node "Image with repositories" form). `tod-sandbox bake` does it.
 - The removal check sees shells and agents recorded for the node, not a
   conversation turn or autopilot run that is starting.
 - "Run in the cloud" (a node's autonomous runner, `doc/cloud-sandboxes/

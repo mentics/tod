@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Current fleet schema epoch stored in `PRAGMA user_version`.
-pub const CURRENT_USER_VERSION: i32 = 81;
+pub const CURRENT_USER_VERSION: i32 = 82;
 
 const BUSY_TIMEOUT_MS: i64 = 5000;
 
@@ -519,6 +519,12 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
         migrate_v80_to_v81(conn)?;
         conn.pragma_update(None, "user_version", 81)?;
     }
+    if version < 82 {
+        // Files settings become locations configured once for the app
+        // (`crate::fleet::repos::files_place`); a node picks one.
+        migrate_v81_to_v82(conn)?;
+        conn.pragma_update(None, "user_version", 82)?;
+    }
     // Other branches (the task panel) numbered their own steps 66–67 at the
     // same time as 66–70 above, so a store may be past a version without
     // having these. Every one is idempotent: make sure of them all.
@@ -546,6 +552,22 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
     // first seeded it (`INSERT OR IGNORE` alone would never update labels
     // on an install that already ran that migration long ago).
     crate::outline::gate_criteria_seed::seed_gate_criteria(conn)?;
+    Ok(())
+}
+
+/// Files locations: the `files_places` table, the location a `node_files`
+/// row picks, and each existing Files capability's recipe made into one.
+fn migrate_v81_to_v82(conn: &Connection) -> Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch(crate::fleet::repos::files_place::CREATE_TABLE)?;
+    let present = tx
+        .prepare("SELECT 1 FROM pragma_table_info('node_files') WHERE name = 'place_id'")?
+        .exists([])?;
+    if !present {
+        tx.execute_batch("ALTER TABLE node_files ADD COLUMN place_id TEXT;")?;
+    }
+    crate::fleet::repos::files_place::migrate_from_node_files(&tx)?;
+    tx.commit()?;
     Ok(())
 }
 

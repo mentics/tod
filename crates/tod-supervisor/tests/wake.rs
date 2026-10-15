@@ -101,12 +101,15 @@ fn app_database(root: &Path) -> Uuid {
     fleet.writer().flush().unwrap();
     // Where the repository is on the user's machine; the supervisor points
     // its copy at its own checkout.
-    fleet
-        .enqueue(tod_store::fleet::FleetMutation::UpdateTaskRepo {
-            id: node.to_string(),
+    tod_store::fleet::places::pick_matching(
+        &fleet,
+        &node.to_string(),
+        &tod_store::fleet::FilesPlace {
             repo: Some("C:/Users/someone/src/repo".into()),
-        })
-        .unwrap();
+            ..Default::default()
+        },
+    )
+    .unwrap();
     for n in 0..2 {
         fleet
             .enqueue_outline(OutlineMutation::CreatePlanStep {

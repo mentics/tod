@@ -175,9 +175,10 @@ reinstalls what changed in place, so a rebake is optional.
 
 ## A node's work in a sandbox
 
-In the task editor, a node's **Files** section has **Runs in**, which cycles
-through *This machine*, *Dev container*, and *Cloud sandbox*. With *Cloud
-sandbox*, the node and every node under it that does not set Files itself
+Locations are kept in the **Locations** dialog (status bar). A location's
+**Runs in** is *This machine*, *Dev container*, or *Cloud sandbox*. A node's
+**Files** section picks a location. With a *Cloud sandbox* location, the node
+and every node under it that does not set Files itself
 each get **a sandbox of their own**, made the first time the node needs its
 files (a turn, a shell, an editor). There is nothing to create by hand.
 
@@ -189,12 +190,12 @@ as its path there (`/root/app`). A baked image takes seconds, any other image
 a minute or more. Each sandbox is named after its node and checks out the
 node's own branch (`task/<slug>` unless set). See
 [../files-locations.md](../files-locations.md) for how these are kept and
-removed. An agent can set the same thing:
+removed. An agent can pick an existing location (it cannot create or edit
+one):
 
 ```sh
-tod-cli capabilities set <node> files --sandbox image --dir /root/app
-tod-cli capabilities set <node> files --sandbox fork:<name> --dir /root/app
-tod-cli capabilities set <node> files --sandbox ''     # back to this machine
+tod-cli capabilities set <node> files --location "<name>"
+tod-cli capabilities set <node> files --location ''     # none
 ```
 
 **Claude must be signed in** in each sandbox before its first turn. tod

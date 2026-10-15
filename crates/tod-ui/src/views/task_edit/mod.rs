@@ -28,9 +28,8 @@ use tod_core::generator::ConfigFieldType;
 use tod_integration::linear_query::{self, Completion, SuggestionKind};
 use tod_integration::linear_sort;
 use tod_store::fleet::provision::locations_affected_by;
-use tod_store::fleet::repos::files_location::recipe_key;
 use tod_store::fleet::{
-    AffectedLocation, DevContainerSetting, FilesDirectory, FleetMutation, FleetStore, NodeAgent,
+    AffectedLocation, FilesDirectory, FilesPlace, FleetMutation, FleetStore, NodeAgent,
     NoteItem, ResolvedAgent, ResolvedFiles, rename_branch_for_node, terminal::open_shell_for_node,
     validate_interview_workspace,
 };
@@ -41,7 +40,6 @@ use tod_store::{
     parse_platform, platform_storage, resolve_linear_api_key,
 };
 
-mod dev_container;
 
 const TASK_EDIT_CONTEXT: &str = "TaskEdit";
 const TITLE_MAX_LEN: usize = 120;
@@ -77,29 +75,17 @@ fn field_anchor_id(field: TaskEditField) -> &'static str {
         TaskEditField::LinearLink => "task-edit-field-linear-link",
         TaskEditField::GithubPr => "task-edit-field-github-pr",
         TaskEditField::Tags => "task-edit-field-tags",
-        TaskEditField::Repo => "task-edit-field-repo",
         TaskEditField::Branch => "task-edit-field-branch",
         TaskEditField::Details => "task-edit-field-details",
         TaskEditField::Obligations => "task-edit-field-obligations",
         TaskEditField::AgentPlatform => "task-edit-field-agent-platform",
         TaskEditField::AgentModel => "task-edit-field-agent-model",
         TaskEditField::AgentEffort => "task-edit-field-agent-effort",
-        TaskEditField::UseWorktree => "task-edit-field-use-worktree",
         TaskEditField::WorktreeAction => "task-edit-field-worktree-action",
         TaskEditField::LaunchShell => "task-edit-field-launch-shell",
-        TaskEditField::RunsIn => "task-edit-field-runs-in",
-        TaskEditField::RepoLocation => "task-edit-field-repo-location",
-        TaskEditField::ContainerName => "task-edit-field-container",
-        TaskEditField::ContainerRefresh => "task-edit-field-container-refresh",
-        TaskEditField::ContainerChoice(_) => "task-edit-field-container-choice",
-        TaskEditField::NewSandboxSource => "task-edit-field-new-sandbox-source",
-        TaskEditField::NewSandboxImage => "task-edit-field-new-sandbox-image",
-        TaskEditField::NewSandboxForkSource => "task-edit-field-new-sandbox-fork",
-        TaskEditField::NewSandboxBuild => "task-edit-field-new-sandbox-build",
-        TaskEditField::BuildImageBase => "task-edit-field-build-image-base",
-        TaskEditField::BuildImageName => "task-edit-field-build-image-name",
-        TaskEditField::BuildImageRepos => "task-edit-field-build-image-repos",
-        TaskEditField::BuildImageRun => "task-edit-field-build-image-run",
+        TaskEditField::Location => "task-edit-field-location",
+        TaskEditField::LocationChoice(_) => "task-edit-field-location-choice",
+        TaskEditField::ManageLocations => "task-edit-field-manage-locations",
         TaskEditField::Capability(Capability::Agent) => "task-edit-field-cap-agent",
         TaskEditField::Capability(Capability::Files) => "task-edit-field-cap-files",
         TaskEditField::Capability(Capability::Ticket) => "task-edit-field-cap-ticket",
@@ -144,7 +130,6 @@ enum TaskEditField {
     LinearLink,
     GithubPr,
     Tags,
-    Repo,
     Branch,
     Details,
     Obligations,
@@ -152,41 +137,16 @@ enum TaskEditField {
     AgentPlatform,
     AgentModel,
     AgentEffort,
-    /// Files capability worktree flag.
-    UseWorktree,
     /// Files: "Remove" this node's worktree or sandbox (confirmed first).
     WorktreeAction,
     /// Files capability: open a shell/terminal at the resolved directory.
     LaunchShell,
-    /// Files capability: this machine or a dev container (Enter cycles).
-    RunsIn,
-    /// Dev container: the repository is inside it, or mounted from this
-    /// machine (Enter cycles).
-    RepoLocation,
-    /// Dev container name or id.
-    ContainerName,
-    /// For a mounted repository, the directory inside the dev container
-    /// when its mounts do not say.
-    /// Re-list the running containers.
-    ContainerRefresh,
-    /// One listed running container, by index; Enter chooses it.
-    ContainerChoice(usize),
-    /// Sandboxes: each node's starts from an image or a fork (Enter switches).
-    NewSandboxSource,
-    /// Sandboxes: the image; empty uses the default from Settings.
-    NewSandboxImage,
-    /// Sandboxes: the one to fork (Enter takes the next listed one).
-    NewSandboxForkSource,
-    /// Sandboxes: opens or closes the form that builds an image holding repositories.
-    NewSandboxBuild,
-    /// The image form: the image it is built on.
-    BuildImageBase,
-    /// The image form: the new image's name.
-    BuildImageName,
-    /// The image form: the repositories to clone into it, one per line.
-    BuildImageRepos,
-    /// The image form: Enter builds it.
-    BuildImageRun,
+    /// Files capability: the location this node uses (Enter opens the list).
+    Location,
+    /// One listed location, by index; Enter chooses it.
+    LocationChoice(usize),
+    /// Files capability: open the Locations dialog.
+    ManageLocations,
     /// Generator capability: pick the data source (only until one is saved).
     GeneratorSource,
     /// One field of the generator's configuration form, by index into
@@ -217,17 +177,11 @@ impl TaskEditField {
                 | Self::AgentPlatform
                 | Self::AgentModel
                 | Self::AgentEffort
-                | Self::UseWorktree
                 | Self::WorktreeAction
                 | Self::LaunchShell
-                | Self::RunsIn
-                | Self::RepoLocation
-                | Self::ContainerRefresh
-                | Self::ContainerChoice(_)
-                | Self::NewSandboxSource
-                | Self::NewSandboxForkSource
-                | Self::NewSandboxBuild
-                | Self::BuildImageRun
+                | Self::Location
+                | Self::LocationChoice(_)
+                | Self::ManageLocations
                 | Self::GeneratorSource
                 | Self::GeneratorRefresh
                 | Self::GeneratorAcceptCapability(_)
@@ -464,7 +418,6 @@ pub struct TaskEditView {
     title_input: Entity<InputState>,
     linear_input: Entity<InputState>,
     github_pr_input: Entity<InputState>,
-    repo_input: Entity<InputState>,
     branch_input: Entity<InputState>,
     details_input: Entity<TextareaState>,
     tag_draft_input: Entity<InputState>,
@@ -473,7 +426,6 @@ pub struct TaskEditView {
     capabilities: HashSet<Capability>,
     loaded_title: String,
     loaded_slug: String,
-    loaded_repo: String,
     loaded_branch: String,
     loaded_lifecycle: String,
     loaded_details: String,
@@ -499,7 +451,6 @@ pub struct TaskEditView {
     /// confirmed (opened from `drain_pending`, which has the window).
     pending_files_change: Option<PendingFilesChange>,
     pending_title_revert: bool,
-    pending_repo_revert: bool,
     pending_branch_revert: bool,
     pending_clear_tag_draft: bool,
     focus_index: usize,
@@ -596,12 +547,13 @@ pub struct TaskEditView {
     worktree_busy: bool,
     worktree_status: Option<String>,
     shell_busy: bool,
-    /// Files: where launches run (this machine or a dev container).
-    dev: dev_container::DevContainerPanel,
+    /// The app's Files locations, for the picker.
+    places: Vec<FilesPlace>,
+    /// The location picker is showing its list.
+    location_open: bool,
     _title_subscription: Subscription,
     _linear_subscription: Subscription,
     _github_subscription: Subscription,
-    _repo_subscription: Subscription,
     _branch_subscription: Subscription,
     _details_subscription: Subscription,
     _tag_draft_subscription: Subscription,
@@ -625,9 +577,6 @@ impl TaskEditView {
             cx.new(|cx| InputState::new(window, cx).placeholder("Enter to edit · TOD-142 or URL"));
         let github_pr_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("Enter to edit · PR URL or owner/repo#42"));
-        let repo_input = cx.new(|cx| {
-            InputState::new(window, cx).placeholder("Enter to edit · Workspace directory")
-        });
         let branch_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("Enter to edit · main"));
         let note_edit_input =
@@ -716,11 +665,6 @@ impl TaskEditView {
                 this.persist_github_pr(cx);
             }
         });
-        let _repo_subscription = cx.subscribe(&repo_input, |this, _, event, cx| {
-            if matches!(event, InputEvent::Blur | InputEvent::PressEnter { .. }) {
-                this.persist_repo(cx);
-            }
-        });
         let _branch_subscription = cx.subscribe(&branch_input, |this, _, event, cx| {
             if matches!(event, InputEvent::Blur | InputEvent::PressEnter { .. }) {
                 this.persist_branch(cx);
@@ -747,17 +691,16 @@ impl TaskEditView {
                 // Preset name input is handled by explicit actions, not on blur/enter
             },
         );
-        let dev = dev_container::DevContainerPanel::new(window, cx);
         Self {
             fleet,
             paths,
-            dev,
+            places: Vec::new(),
+            location_open: false,
             task_id: None,
             focus_handle: cx.focus_handle(),
             title_input,
             linear_input,
             github_pr_input,
-            repo_input,
             branch_input,
             details_input,
             tag_draft_input,
@@ -816,7 +759,6 @@ impl TaskEditView {
             capabilities: HashSet::new(),
             loaded_title: String::new(),
             loaded_slug: String::new(),
-            loaded_repo: String::new(),
             loaded_branch: String::new(),
             loaded_lifecycle: String::new(),
             loaded_details: String::new(),
@@ -835,7 +777,6 @@ impl TaskEditView {
             pending_toast: None,
             pending_files_change: None,
             pending_title_revert: false,
-            pending_repo_revert: false,
             pending_branch_revert: false,
             pending_clear_tag_draft: false,
             focus_index: 0,
@@ -850,7 +791,6 @@ impl TaskEditView {
             _title_subscription,
             _linear_subscription,
             _github_subscription,
-            _repo_subscription,
             _branch_subscription,
             _details_subscription,
             _tag_draft_subscription,
@@ -919,46 +859,14 @@ impl TaskEditView {
             ]);
         }
         if self.capability_enabled(Capability::Files) {
-            // Where it runs first: it decides what the workspace directory is.
             if self.own_files().is_some() {
-                stops.push(TaskEditField::RunsIn);
-            }
-            if let Some(dev) = self.own_dev_container() {
-                let listed = || (0..self.dev.container_count()).map(TaskEditField::ContainerChoice);
-                if dev.sandbox {
-                    stops.push(TaskEditField::NewSandboxSource);
-                    if self.sandbox_is_fork() {
-                        stops.extend([
-                            TaskEditField::NewSandboxForkSource,
-                            TaskEditField::ContainerRefresh,
-                        ]);
-                        stops.extend(listed());
-                    } else {
-                        stops.push(TaskEditField::NewSandboxImage);
-                        stops.push(TaskEditField::NewSandboxBuild);
-                        if self.dev.build_open() {
-                            stops.extend([
-                                TaskEditField::BuildImageBase,
-                                TaskEditField::BuildImageName,
-                                TaskEditField::BuildImageRepos,
-                                TaskEditField::BuildImageRun,
-                            ]);
-                        }
-                    }
-                } else {
-                    stops.extend([
-                        TaskEditField::RepoLocation,
-                        TaskEditField::ContainerName,
-                        TaskEditField::ContainerRefresh,
-                    ]);
-                    stops.extend(listed());
+                stops.push(TaskEditField::Location);
+                if self.location_open {
+                    stops.extend((0..self.places.len()).map(TaskEditField::LocationChoice));
+                    stops.push(TaskEditField::ManageLocations);
                 }
             }
-            stops.extend([
-                TaskEditField::Repo,
-                TaskEditField::Branch,
-                TaskEditField::UseWorktree,
-            ]);
+            stops.push(TaskEditField::Branch);
             if self.worktree_action().is_some() {
                 stops.push(TaskEditField::WorktreeAction);
             }
@@ -1091,30 +999,18 @@ impl TaskEditView {
             TaskEditField::LinearLink => self.linear_input.clone().into(),
             TaskEditField::GithubPr => self.github_pr_input.clone().into(),
             TaskEditField::Tags => self.tag_draft_input.clone().into(),
-            TaskEditField::Repo => self.repo_input.clone().into(),
             TaskEditField::Branch => self.branch_input.clone().into(),
             TaskEditField::Details => self.details_input.clone().into(),
-            TaskEditField::ContainerName => self.dev.container_input.clone().into(),
-            TaskEditField::NewSandboxImage => self.dev.new_image_input.clone().into(),
-            TaskEditField::BuildImageBase => self.dev.build_base_input.clone().into(),
-            TaskEditField::BuildImageName => self.dev.build_name_input.clone().into(),
-            TaskEditField::BuildImageRepos => self.dev.build_repos_input.clone().into(),
             TaskEditField::GeneratorAcceptDestination => {
                 self.generator_accept_destination_input.clone().into()
             }
             TaskEditField::Obligations
-            | TaskEditField::RunsIn
-            | TaskEditField::RepoLocation
-            | TaskEditField::ContainerRefresh
-            | TaskEditField::ContainerChoice(_)
-            | TaskEditField::NewSandboxSource
-            | TaskEditField::NewSandboxForkSource
-            | TaskEditField::NewSandboxBuild
-            | TaskEditField::BuildImageRun
+            | TaskEditField::Location
+            | TaskEditField::LocationChoice(_)
+            | TaskEditField::ManageLocations
             | TaskEditField::AgentPlatform
             | TaskEditField::AgentModel
             | TaskEditField::AgentEffort
-            | TaskEditField::UseWorktree
             | TaskEditField::WorktreeAction
             | TaskEditField::LaunchShell
             | TaskEditField::GeneratorSource
@@ -1132,29 +1028,8 @@ impl TaskEditView {
             (TaskEditField::LinearLink, self.linear_input.clone().into()),
             (TaskEditField::GithubPr, self.github_pr_input.clone().into()),
             (TaskEditField::Tags, self.tag_draft_input.clone().into()),
-            (TaskEditField::Repo, self.repo_input.clone().into()),
             (TaskEditField::Branch, self.branch_input.clone().into()),
             (TaskEditField::Details, self.details_input.clone().into()),
-            (
-                TaskEditField::ContainerName,
-                self.dev.container_input.clone().into(),
-            ),
-            (
-                TaskEditField::NewSandboxImage,
-                self.dev.new_image_input.clone().into(),
-            ),
-            (
-                TaskEditField::BuildImageBase,
-                self.dev.build_base_input.clone().into(),
-            ),
-            (
-                TaskEditField::BuildImageName,
-                self.dev.build_name_input.clone().into(),
-            ),
-            (
-                TaskEditField::BuildImageRepos,
-                self.dev.build_repos_input.clone().into(),
-            ),
             (
                 TaskEditField::GeneratorAcceptDestination,
                 self.generator_accept_destination_input.clone().into(),
@@ -1232,10 +1107,6 @@ impl TaskEditView {
                 self.cycle_agent_field(field, cx);
                 return;
             }
-            TaskEditField::UseWorktree => {
-                self.toggle_use_worktree(cx);
-                return;
-            }
             TaskEditField::WorktreeAction => {
                 self.remove_node_location(cx);
                 return;
@@ -1244,36 +1115,23 @@ impl TaskEditView {
                 self.launch_shell_for_task(cx);
                 return;
             }
-            TaskEditField::RunsIn => {
-                self.toggle_dev_container(cx);
+            TaskEditField::Location => {
+                self.location_open = !self.location_open;
+                self.clamp_focus_index();
+                cx.notify();
                 return;
             }
-            TaskEditField::RepoLocation => {
-                self.toggle_repo_location(cx);
+            TaskEditField::LocationChoice(index) => {
+                self.choose_location(index, cx);
                 return;
             }
-            TaskEditField::ContainerRefresh => {
-                self.refresh_containers(cx);
-                return;
-            }
-            TaskEditField::ContainerChoice(index) => {
-                self.choose_container(index, window, cx);
-                return;
-            }
-            TaskEditField::NewSandboxSource => {
-                self.toggle_new_sandbox_source(cx);
-                return;
-            }
-            TaskEditField::NewSandboxForkSource => {
-                self.cycle_fork_source(cx);
-                return;
-            }
-            TaskEditField::NewSandboxBuild => {
-                self.toggle_image_build(cx);
-                return;
-            }
-            TaskEditField::BuildImageRun => {
-                self.build_image(window, cx);
+            TaskEditField::ManageLocations => {
+                crate::views::locations::open_locations_dialog(
+                    window,
+                    cx,
+                    self.fleet.clone(),
+                    self.paths.clone(),
+                );
                 return;
             }
             _ => {
@@ -1389,13 +1247,6 @@ impl TaskEditView {
                 input.set_value(title, window, cx);
             });
         }
-        if self.pending_repo_revert {
-            self.pending_repo_revert = false;
-            let repo = self.loaded_repo.clone();
-            self.repo_input.update(cx, |input, cx| {
-                input.set_value(repo, window, cx);
-            });
-        }
         if self.pending_branch_revert {
             self.pending_branch_revert = false;
             let branch = self.loaded_branch.clone();
@@ -1470,7 +1321,6 @@ impl TaskEditView {
 
         self.loaded_title = task.title.clone();
         self.loaded_slug = task.slug.clone();
-        self.loaded_repo = task.repo.clone().unwrap_or_default();
         self.loaded_branch = task.branch.clone().unwrap_or_default();
         self.loaded_lifecycle = task.lifecycle.clone();
         self.tags = task.tags.clone();
@@ -1482,7 +1332,7 @@ impl TaskEditView {
             .unwrap_or_default()
             .launch_options_for(AgentRole::Default);
         self.load_action_capabilities();
-        self.load_dev_container(window, cx);
+        self.location_open = false;
         self.load_obligation_counts(&task_id);
         self.load_generator_config(window, cx);
         self.load_managed_link();
@@ -1491,7 +1341,6 @@ impl TaskEditView {
             && self.capability_enabled(Capability::Generator);
         let linear = task.ticket.clone().unwrap_or_default();
         let github_pr = task.linked_prs.first().cloned().unwrap_or_default();
-        let repo = self.loaded_repo.clone();
         let branch = self.loaded_branch.clone();
         self.notes = task.notes.clone();
         self.editing_note_id = None;
@@ -1515,9 +1364,6 @@ impl TaskEditView {
         });
         self.github_pr_input.update(cx, |input, cx| {
             input.set_value(github_pr, window, cx);
-        });
-        self.repo_input.update(cx, |input, cx| {
-            input.set_value(repo, window, cx);
         });
         self.branch_input.update(cx, |input, cx| {
             input.set_value(branch, window, cx);
@@ -1551,6 +1397,13 @@ impl TaskEditView {
         };
         self.resolved_agent = self.fleet.resolve_agent_for_node(&task_id).ok().flatten();
         self.resolved_files = self.fleet.resolve_files_for_node(&task_id).ok().flatten();
+        match tod_store::fleet::places::list(&self.fleet) {
+            Ok(places) => self.places = places,
+            Err(err) => {
+                self.places.clear();
+                self.pending_toast = Some(format!("Failed to list locations: {err:#}"));
+            }
+        }
         self.node_agent = self
             .resolved_agent
             .as_ref()
@@ -1608,18 +1461,22 @@ impl TaskEditView {
         cx.notify();
     }
 
-    /// The locations made from this node's own Files settings that new
-    /// settings (`repo`, `use_worktree`, `dev`) would no longer make.
-    fn locations_changed_by(
-        &self,
-        repo: Option<&str>,
-        use_worktree: bool,
-        dev: Option<&DevContainerSetting>,
-    ) -> Vec<AffectedLocation> {
+    /// The workspace directory on this machine that this node makes a
+    /// worktree in (its location's), when it does.
+    fn local_worktree_repo(&self) -> Option<String> {
+        let files = self.resolved_files.as_ref()?;
+        let remote = files.dev_container.as_ref().is_some_and(|dev| dev.repo_is_remote());
+        (files.use_worktree && !remote)
+            .then(|| files.repo().map(str::to_string))
+            .flatten()
+    }
+
+    /// The worktrees and sandboxes made from this node's own location choice
+    /// that picking `recipe` instead would leave behind.
+    fn locations_changed_by(&self, recipe: &str) -> Vec<AffectedLocation> {
         let Some(node) = self.task_id() else {
             return Vec::new();
         };
-        let recipe = recipe_key(repo, use_worktree, dev);
         locations_affected_by(&self.fleet, &node)
             .unwrap_or_default()
             .into_iter()
@@ -1627,16 +1484,70 @@ impl TaskEditView {
             .collect()
     }
 
-    /// This node's own Files settings, for [`Self::locations_changed_by`].
-    fn files_settings(&self) -> (Option<String>, bool, Option<DevContainerSetting>) {
-        match self.own_files() {
-            Some(files) => (
-                files.repo().map(str::to_string),
-                files.use_worktree,
-                files.dev_container.clone(),
-            ),
-            None => (None, false, None),
+    /// Use the listed location `index` for this node's files, after
+    /// confirming when worktrees or sandboxes made from the old one would
+    /// be left behind.
+    fn choose_location(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(place) = self.places.get(index).cloned() else {
+            return;
+        };
+        self.location_open = false;
+        self.clamp_focus_index();
+        if self.own_files().and_then(|files| files.place_id.as_deref()) == Some(place.id.as_str()) {
+            cx.notify();
+            return;
         }
+        let affected = self.locations_changed_by(&place.recipe_key());
+        if !affected.is_empty() {
+            let name = place.name.clone();
+            self.guard_files_change(
+                affected,
+                "Change this node's location?".into(),
+                format!(
+                    "{name} puts the files somewhere else. These were made from the old \
+                     location, and are removed first (each branch is pushed before it goes)."
+                ),
+                "Remove and change",
+                move |this, _, cx| this.write_location(place, cx),
+                cx,
+            );
+            return;
+        }
+        self.write_location(place, cx);
+    }
+
+    fn write_location(&mut self, place: FilesPlace, cx: &mut Context<Self>) {
+        let Some(node_id) = self.task_id() else {
+            return;
+        };
+        let fleet = self.fleet.clone();
+        crate::ui::off_thread::off_thread(
+            cx,
+            move || {
+                fleet
+                    .enqueue(FleetMutation::SetNodeFilesPlace {
+                        node_id,
+                        place_id: Some(place.id),
+                    })
+                    .map_err(|err| format!("Failed to save the location: {err}"))?;
+                fleet
+                    .writer()
+                    .flush()
+                    .map_err(|err| format!("Failed to save the location: {err}"))?;
+                let _ = fleet.reload_if_stale();
+                Ok::<(), String>(())
+            },
+            |this, result, cx| {
+                if let Err(message) = result {
+                    this.pending_toast = Some(message);
+                    cx.notify();
+                    return;
+                }
+                this.load_action_capabilities();
+                this.clamp_focus_index();
+                this.notify_changed(cx);
+            },
+        );
     }
 
     /// "Remove": this node's worktree or sandbox, after confirming (and
@@ -1728,71 +1639,6 @@ impl TaskEditView {
         );
     }
 
-    fn toggle_use_worktree(&mut self, cx: &mut Context<Self>) {
-        let Some(use_worktree) = self.own_files().map(|files| !files.use_worktree) else {
-            return;
-        };
-        let (repo, _, dev) = self.files_settings();
-        let affected = self.locations_changed_by(repo.as_deref(), use_worktree, dev.as_ref());
-        if !affected.is_empty() {
-            let intro = if use_worktree {
-                "Turning worktrees on gives each node a worktree of its own. These were made \
-                 without one, and are removed first (each branch is pushed before it goes)."
-            } else {
-                "Turning worktrees off runs every node in the workspace directory itself. \
-                 These worktrees are removed first (each branch is pushed before it goes)."
-            };
-            self.guard_files_change(
-                affected,
-                "Change worktrees?".into(),
-                intro.into(),
-                "Remove and change",
-                move |this, _, cx| this.write_use_worktree(use_worktree, cx),
-                cx,
-            );
-            return;
-        }
-        self.write_use_worktree(use_worktree, cx);
-    }
-
-    fn write_use_worktree(&mut self, use_worktree: bool, cx: &mut Context<Self>) {
-        let Some(node_id) = self.task_id() else {
-            return;
-        };
-        let fleet = self.fleet.clone();
-        crate::ui::off_thread::off_thread(
-            cx,
-            move || {
-                fleet
-                    .enqueue(FleetMutation::SetNodeUseWorktree {
-                        node_id,
-                        use_worktree,
-                    })
-                    .map_err(|err| format!("Failed to save worktree setting: {err}"))?;
-                fleet
-                    .writer()
-                    .flush()
-                    .map_err(|_| "Failed to save worktree setting".to_string())?;
-                let _ = fleet.reload_if_stale();
-                Ok::<(), String>(())
-            },
-            |this, result, cx| {
-                if let Err(message) = result {
-                    this.pending_toast = Some(message);
-                    cx.notify();
-                    return;
-                }
-                this.load_action_capabilities();
-                this.clamp_focus_index();
-                if this.repo_in_container() {
-                    // Whether the directory must be a git repository changed.
-                    this.check_dev_container(cx);
-                }
-                this.notify_changed(cx);
-            },
-        );
-    }
-
     /// Open a shell/terminal at the node's resolved directory, off the UI thread.
     ///
     /// A click here can arrive with the workspace directory or branch field
@@ -1805,16 +1651,14 @@ impl TaskEditView {
         let Some(task_id) = self.task_id() else {
             return;
         };
-        self.persist_repo(cx);
         self.persist_branch(cx);
-        if input_text(&self.repo_input, cx) != self.loaded_repo
-            || input_text(&self.branch_input, cx) != self.loaded_branch
+        if input_text(&self.branch_input, cx) != self.loaded_branch
         {
             // A guard dialog, validation revert, or background rename is
             // still pending: the new value isn't saved yet, so opening now
             // would still use the old one. Let that settle first.
             self.pending_toast = Some(
-                "Finish editing the workspace directory or branch before opening a shell".into(),
+                "Finish editing the branch before opening a shell".into(),
             );
             cx.notify();
             return;
@@ -3262,15 +3106,11 @@ impl TaskEditView {
             cx.notify();
             return;
         }
-        if cap == Capability::Files && self.loaded_repo.is_empty() {
-            if let Ok(cwd) = std::env::current_dir() {
-                let cwd = cwd.to_string_lossy().into_owned();
-                self.repo_input.update(cx, |input, cx| {
-                    input.set_value(cwd, window, cx);
-                });
-                self.persist_repo(cx);
-            }
-        }
+        // Files turned on here start from the location the node already
+        // works from (an ancestor's), so enabling it changes nothing.
+        let inherited_place = (cap == Capability::Files)
+            .then(|| self.resolved_files.as_ref().and_then(|files| files.place_id.clone()))
+            .flatten();
         let fleet = self.fleet.clone();
         cx.spawn_in(window, async move |this, cx| {
             let result = cx
@@ -3282,6 +3122,14 @@ impl TaskEditView {
                             capabilities: vec![cap],
                         })
                         .map_err(|err| format!("Failed to enable {}: {err}", cap.label()))?;
+                    if let Some(place_id) = inherited_place {
+                        fleet
+                            .enqueue(FleetMutation::SetNodeFilesPlace {
+                                node_id: node_id.to_string(),
+                                place_id: Some(place_id),
+                            })
+                            .map_err(|err| format!("Failed to pick the location: {err}"))?;
+                    }
                     fleet
                         .writer()
                         .flush()
@@ -3459,11 +3307,7 @@ impl TaskEditView {
             if let Ok(Some(task)) = self.fleet.get_node(&task_id) {
                 self.loaded_lifecycle = task.lifecycle.clone();
                 if cap == Capability::Files {
-                    self.loaded_repo.clear();
                     self.loaded_branch.clear();
-                    self.repo_input.update(cx, |input, cx| {
-                        input.set_value("", window, cx);
-                    });
                     self.branch_input.update(cx, |input, cx| {
                         input.set_value("", window, cx);
                     });
@@ -3703,105 +3547,6 @@ impl TaskEditView {
         });
     }
 
-    fn persist_repo(&mut self, cx: &mut Context<Self>) {
-        let Some(id) = self.task_id() else {
-            return;
-        };
-        let value = input_text(&self.repo_input, cx).trim().to_string();
-        if value == self.loaded_repo {
-            return;
-        }
-        if !value.is_empty() && self.repo_path_is_remote() {
-            if !value.starts_with('/') {
-                let example = if self.runs_in_sandbox() {
-                    "/root/app"
-                } else {
-                    "/workspaces/app"
-                };
-                self.pending_toast = Some(format!(
-                    "The repository is inside {}: give its path there, like {example}",
-                    self.remote_place()
-                ));
-                self.pending_repo_revert = true;
-                cx.notify();
-                return;
-            }
-        } else if !value.is_empty() {
-            // Any directory will do; a worktree needs a git repository.
-            let checked = if self.own_files().is_some_and(|files| files.use_worktree) {
-                validate_interview_workspace(std::path::Path::new(&value), &self.loaded_branch)
-            } else if std::path::Path::new(&value).is_dir() {
-                Ok(())
-            } else {
-                Err(anyhow::anyhow!("{value} is not a directory"))
-            };
-            if let Err(err) = checked {
-                self.pending_toast = Some(format!("Workspace directory: {err:#}"));
-                self.pending_repo_revert = true;
-                cx.notify();
-                return;
-            }
-        }
-        let (_, use_worktree, dev) = self.files_settings();
-        let affected = self.locations_changed_by(Some(&value), use_worktree, dev.as_ref());
-        if !affected.is_empty() {
-            // Shown as it was until the change is confirmed.
-            self.pending_repo_revert = true;
-            self.guard_files_change(
-                affected,
-                "Change the workspace directory?".into(),
-                "These were made from the old workspace directory, and are removed first \
-                 (each branch is pushed before it goes)."
-                    .into(),
-                "Remove and change",
-                move |this, window, cx| {
-                    this.repo_input
-                        .update(cx, |input, cx| input.set_value(value.clone(), window, cx));
-                    this.write_repo(id, value, cx);
-                },
-                cx,
-            );
-            return;
-        }
-        self.write_repo(id, value, cx);
-    }
-
-    fn write_repo(&mut self, id: String, value: String, cx: &mut Context<Self>) {
-        let repo = if value.is_empty() {
-            None
-        } else {
-            Some(value.clone())
-        };
-        let previous = std::mem::replace(&mut self.loaded_repo, value);
-        let fleet = self.fleet.clone();
-        crate::ui::off_thread::off_thread(
-            cx,
-            move || {
-                fleet
-                    .enqueue(FleetMutation::UpdateTaskRepo { id, repo })
-                    .map_err(|err| format!("Failed to save repository: {err}"))?;
-                let _ = fleet.writer().flush();
-                let _ = fleet.reload_if_stale();
-                Ok::<(), String>(())
-            },
-            move |this, result, cx| {
-                if let Err(message) = result {
-                    this.loaded_repo = previous;
-                    this.pending_toast = Some(message);
-                    this.pending_repo_revert = true;
-                    cx.notify();
-                    return;
-                }
-                this.load_action_capabilities();
-                this.clamp_focus_index();
-                if this.repo_in_container() {
-                    this.check_dev_container(cx);
-                }
-                cx.notify();
-            },
-        );
-    }
-
     fn persist_branch(&mut self, cx: &mut Context<Self>) {
         let Some(id) = self.task_id() else {
             return;
@@ -3814,18 +3559,13 @@ impl TaskEditView {
             self.rename_worktree_branch(id, value, cx);
             return;
         }
-        if !self.loaded_repo.is_empty()
-            && !self.repo_path_is_remote()
-            && self.own_files().is_some_and(|files| files.use_worktree)
+        if let Some(repo) = self.local_worktree_repo()
+            && let Err(err) = validate_interview_workspace(std::path::Path::new(&repo), &value)
         {
-            if let Err(err) =
-                validate_interview_workspace(std::path::Path::new(&self.loaded_repo), &value)
-            {
-                self.pending_toast = Some(format!("Branch: {err:#}"));
-                self.pending_branch_revert = true;
-                cx.notify();
-                return;
-            }
+            self.pending_toast = Some(format!("Branch: {err:#}"));
+            self.pending_branch_revert = true;
+            cx.notify();
+            return;
         }
         let branch = if value.is_empty() {
             None
@@ -4398,18 +4138,42 @@ impl TaskEditView {
         )
     }
 
+    /// "Open shell" in this node's files directory.
+    fn render_open_shell(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let active = cx.theme().list_active;
+        let active_border = cx.theme().list_active_border;
+        let shell_busy = self.shell_busy;
+        let shell_focused = self.field_nav_focused(TaskEditField::LaunchShell);
+        self.apply_focus_scroll_anchor(
+            TaskEditField::LaunchShell,
+            div()
+                .id(field_anchor_id(TaskEditField::LaunchShell))
+                .rounded_md()
+                .when(shell_focused, |el| el.bg(active).border_1().border_color(active_border))
+                .child(
+                    Button::new("task-edit-launch-shell")
+                        .label(if shell_busy { "Opening…" } else { "Open shell" })
+                        .outline()
+                        .compact()
+                        .disabled(shell_busy)
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.enter_field_edit(TaskEditField::LaunchShell, window, cx);
+                        })),
+                ),
+        )
+    }
+
     fn render_files_body(
         &self,
         muted: gpui::Hsla,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let use_worktree = self.own_files().is_some_and(|files| files.use_worktree);
         let directory = self.own_files().map(|files| files.directory());
         let active = cx.theme().list_active;
         let active_border = cx.theme().list_active_border;
         let foreground = cx.theme().foreground;
-        let toggle_focused = self.field_nav_focused(TaskEditField::UseWorktree);
+        let danger = cx.theme().danger;
 
         let directory_text = self.own_files().and_then(|files| files_summary(files, false));
         let mut directory_row = h_flex().gap_2().items_center().flex_wrap();
@@ -4425,124 +4189,134 @@ impl TaskEditView {
             directory,
             Some(FilesDirectory::Ready(_) | FilesDirectory::NotMade)
         ) {
-            let shell_busy = self.shell_busy;
-            let shell_focused = self.field_nav_focused(TaskEditField::LaunchShell);
-            directory_row = directory_row.child(
-                self.apply_focus_scroll_anchor(
-                    TaskEditField::LaunchShell,
-                    div()
-                        .id(field_anchor_id(TaskEditField::LaunchShell))
-                        .rounded_md()
-                        .when(shell_focused, |el| {
-                            el.bg(active).border_1().border_color(active_border)
-                        })
-                        .child(
-                            Button::new("task-edit-launch-shell")
-                                .label(if shell_busy { "Opening…" } else { "Open shell" })
-                                .outline()
-                                .compact()
-                                .disabled(shell_busy)
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.enter_field_edit(
-                                        TaskEditField::LaunchShell,
-                                        window,
-                                        cx,
-                                    );
-                                })),
-                        ),
-                ),
+            directory_row = directory_row.child(self.render_open_shell(cx));
+        }
+
+        let picked = self.own_files().and_then(|files| files.place_id.clone());
+        let picked_name = self.own_files().and_then(|files| files.place_name.clone());
+        let location_focused = self.field_nav_focused(TaskEditField::Location);
+        let location_row = self.apply_focus_scroll_anchor(
+            TaskEditField::Location,
+            h_flex()
+                .id(field_anchor_id(TaskEditField::Location))
+                .items_center()
+                .gap_2()
+                .px_1()
+                .rounded_md()
+                .cursor_pointer()
+                .when(location_focused, |el| {
+                    el.bg(active).border_1().border_color(active_border)
+                })
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.enter_field_edit(TaskEditField::Location, window, cx);
+                }))
+                .child(Self::render_field_label("Location", cx))
+                .child(match (&picked, picked_name) {
+                    (_, Some(name)) => div().text_sm().text_color(foreground).child(name),
+                    (Some(_), None) => div()
+                        .text_sm()
+                        .text_color(danger)
+                        .child("Not set up on this machine"),
+                    (None, None) => div().text_sm().text_color(danger).child("None chosen"),
+                })
+                .child(div().text_xs().text_color(muted).child(if self.location_open {
+                    "Enter or click to close"
+                } else {
+                    "Enter or click to choose"
+                })),
+        );
+
+        let mut list = v_flex().gap_0p5().pl_3();
+        for (index, place) in self.places.iter().enumerate() {
+            let field = TaskEditField::LocationChoice(index);
+            let focused = self.field_nav_focused(field);
+            let chosen = picked.as_deref() == Some(place.id.as_str());
+            let mut detail = place.describe();
+            if let Some(repo) = place.repo() {
+                detail = format!("{detail} · {repo}");
+            }
+            if let Some(reason) = place.incomplete() {
+                detail = format!("{detail} · not usable yet: {reason}");
+            }
+            list = list.child(self.apply_focus_scroll_anchor(
+                field,
+                h_flex()
+                    .id(gpui::ElementId::NamedInteger(
+                        "task-edit-location-choice".into(),
+                        index as u64,
+                    ))
+                    .gap_2()
+                    .px_1()
+                    .items_center()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .when(focused, |el| el.bg(active).border_1().border_color(active_border))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.enter_field_edit(field, window, cx);
+                    }))
+                    .child(div().text_sm().text_color(foreground).child(if chosen { "●" } else { "○" }))
+                    .child(div().text_sm().text_color(foreground).flex_shrink_0().child(place.name.clone()))
+                    .child(div().min_w_0().text_xs().text_color(muted).child(selectable_text(
+                        gpui::SharedString::from(format!("task-edit-location-detail-{index}")),
+                        detail,
+                        window,
+                        cx,
+                    ))),
+            ));
+        }
+        if self.places.is_empty() {
+            list = list.child(
+                div()
+                    .text_xs()
+                    .text_color(muted)
+                    .child("No locations yet. Create one with Manage locations."),
             );
         }
+        let manage_focused = self.field_nav_focused(TaskEditField::ManageLocations);
+        let list = list.child(self.apply_focus_scroll_anchor(
+            TaskEditField::ManageLocations,
+            div()
+                .id(field_anchor_id(TaskEditField::ManageLocations))
+                .rounded_md()
+                .w_40()
+                .when(manage_focused, |el| el.bg(active).border_1().border_color(active_border))
+                .child(
+                    Button::new("task-edit-manage-locations")
+                        .label("Manage locations…")
+                        .outline()
+                        .compact()
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.enter_field_edit(TaskEditField::ManageLocations, window, cx);
+                        })),
+                ),
+        ));
 
         v_flex()
             .gap_2()
             .px_3()
             .pb_3()
             .when(self.own_files().is_some(), |el| {
-                el.child(self.render_dev_container(muted, window, cx))
+                el.child(location_row)
+                    .when(self.location_open, |el| el.child(list))
             })
             .child(
-                h_flex()
-                    .gap_2()
-                    .items_end()
-                    .flex_wrap()
-                    .child(
-                        self.apply_focus_scroll_anchor(
-                            TaskEditField::Repo,
-                            v_flex()
-                                .id(field_anchor_id(TaskEditField::Repo))
-                                .gap_1()
-                                .w(px(280.))
-                                .flex_shrink_0()
-                                .child(Self::render_field_label(
-                                    if self.runs_in_sandbox() {
-                                        "Workspace directory (in the sandbox)"
-                                    } else if self.repo_path_is_remote() {
-                                        "Workspace directory (in the container)"
-                                    } else {
-                                        "Workspace directory"
-                                    },
-                                    cx,
-                                ))
-                                .child(self.render_nav_input(
-                                    TaskEditField::Repo,
-                                    self.repo_input.clone(),
-                                    None,
-                                    window,
-                                    cx,
-                                )),
-                        ),
-                    )
-                    .child(
-                        self.apply_focus_scroll_anchor(
-                            TaskEditField::Branch,
-                            v_flex()
-                                .id(field_anchor_id(TaskEditField::Branch))
-                                .gap_1()
-                                .w(px(110.))
-                                .flex_shrink_0()
-                                .child(Self::render_field_label("Branch", cx))
-                                .child(self.render_nav_input(
-                                    TaskEditField::Branch,
-                                    self.branch_input.clone(),
-                                    None,
-                                    window,
-                                    cx,
-                                )),
-                        ),
-                    ),
-            )
-            // A sandbox is each node's own already.
-            .when(!self.runs_in_sandbox(), |el| el.child(
                 self.apply_focus_scroll_anchor(
-                    TaskEditField::UseWorktree,
-                    h_flex()
-                        .id(field_anchor_id(TaskEditField::UseWorktree))
-                        .items_center()
+                    TaskEditField::Branch,
+                    v_flex()
+                        .id(field_anchor_id(TaskEditField::Branch))
                         .gap_1()
-                        .px_1()
-                        .rounded_md()
-                        .cursor_pointer()
-                        .when(toggle_focused, |el| {
-                            el.bg(active).border_1().border_color(active_border)
-                        })
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.enter_field_edit(TaskEditField::UseWorktree, window, cx);
-                        }))
-                        .child(
-                            div()
-                                .text_sm()
-                                .text_color(foreground)
-                                .child(if use_worktree { "☑" } else { "☐" }),
-                        )
-                        .child(
-                            div()
-                                .text_sm()
-                                .text_color(foreground)
-                                .child("A worktree for each node"),
-                        ),
+                        .w(px(180.))
+                        .flex_shrink_0()
+                        .child(Self::render_field_label("Branch", cx))
+                        .child(self.render_nav_input(
+                            TaskEditField::Branch,
+                            self.branch_input.clone(),
+                            None,
+                            window,
+                            cx,
+                        )),
                 ),
-            ))
+            )
             .child(
                 v_flex()
                     .gap_1()
@@ -4637,7 +4411,13 @@ impl TaskEditView {
                     .text_color(muted)
                     .child(selectable_text(
                         "task-edit-inherited-files",
-                        format!("Inherited from {}: {summary}", resolved.source_title),
+                        match resolved.place_name.as_deref() {
+                            Some(place) => format!(
+                                "Inherited from {} · location {place}: {summary}",
+                                resolved.source_title
+                            ),
+                            None => format!("Inherited from {}: {summary}", resolved.source_title),
+                        },
                         window,
                         cx,
                     ));
@@ -4662,9 +4442,23 @@ impl TaskEditView {
                     v_flex()
                         .child(hint)
                         .child(branch_row)
-                        .when(self.worktree_action().is_some(), |el| {
-                            el.child(h_flex().px_3().pb_2().child(self.render_remove_location(cx)))
-                        })
+                        .child(
+                            h_flex()
+                                .px_3()
+                                .pb_2()
+                                .gap_2()
+                                .items_center()
+                                .when(self.worktree_action().is_some(), |el| {
+                                    el.child(self.render_remove_location(cx))
+                                })
+                                .when(
+                                    matches!(
+                                        resolved.directory(),
+                                        FilesDirectory::Ready(_) | FilesDirectory::NotMade
+                                    ),
+                                    |el| el.child(self.render_open_shell(cx)),
+                                ),
+                        )
                         .into_any_element(),
                 );
             }

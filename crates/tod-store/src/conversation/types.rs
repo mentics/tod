@@ -244,14 +244,15 @@ pub struct CapabilitySettings {
     #[serde(default)]
     pub agent_effort: Option<String>,
     #[serde(default)]
-    pub repo: Option<String>,
-    #[serde(default)]
     pub branch: Option<String>,
+    /// The location the node's Files uses (`files_places.id`). A change set
+    /// recorded before locations held the directory and `runs in` instead,
+    /// which are ignored.
     #[serde(default)]
-    pub use_worktree: bool,
-    /// `Some` when the node's launches run in a dev container.
+    pub files_place: Option<String>,
+    /// That location's name, for the change set (not compared).
     #[serde(default)]
-    pub dev_container: Option<crate::fleet::repos::node_files::DevContainerSetting>,
+    pub files_place_name: Option<String>,
     /// Recorded before a node had one ticket as `linked_issues`, an array
     /// whose first id is the ticket.
     #[serde(default, alias = "linked_issues", deserialize_with = "ticket_or_first")]
@@ -281,23 +282,6 @@ fn ticket_or_first<'de, D: serde::Deserializer<'de>>(de: D) -> Result<Option<Str
         Shape::One(ticket) => ticket,
         Shape::Many(tickets) => tickets.into_iter().next(),
     })
-}
-
-/// Where a Files capability's launches run, for the change set.
-pub fn runs_in(dev: &Option<crate::fleet::repos::node_files::DevContainerSetting>) -> String {
-    match dev {
-        None => "this machine".into(),
-        Some(dev) => {
-            let container = dev.container().unwrap_or("(none chosen)");
-            if dev.sandbox {
-                format!("a cloud sandbox per node, from {}", dev.sandbox_from.describe())
-            } else if dev.repo_on_host {
-                format!("dev container {container}, mounted")
-            } else {
-                format!("dev container {container}")
-            }
-        }
-    }
 }
 
 /// What changed between two states of a node's capabilities, one phrase per
@@ -372,19 +356,14 @@ pub fn capabilities_changes(
         setting("effort", opt(&old.agent_effort), opt(&new.agent_effort));
     }
     if both(Capability::Files) {
+        let place = |s: &CapabilitySettings| match (&s.files_place_name, &s.files_place) {
+            (Some(name), _) => name.clone(),
+            (None, Some(id)) => format!("{id} (gone)"),
+            (None, None) => "none".into(),
+        };
         let none = |v: &Option<String>| v.clone().unwrap_or_else(|| "none".into());
-        setting("directory", none(&old.repo), none(&new.repo));
+        setting("location", place(&old), place(&new));
         setting("branch", none(&old.branch), none(&new.branch));
-        setting(
-            "worktree",
-            if old.use_worktree { "on" } else { "off" }.into(),
-            if new.use_worktree { "on" } else { "off" }.into(),
-        );
-        setting(
-            "runs in",
-            runs_in(&old.dev_container),
-            runs_in(&new.dev_container),
-        );
     }
     if both(Capability::Ticket) {
         let none = |v: &Option<String>| v.clone().unwrap_or_else(|| "none".into());

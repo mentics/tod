@@ -190,20 +190,13 @@ mod tests {
         assert!(matches!(enabled.files, Some((_, FilesDirectory::Missing(_)))));
 
         let repo = std::env::temp_dir();
-        store
-            .enqueue(FleetMutation::UpdateTaskRepo {
-                id: node.to_string(),
-                repo: Some(repo.display().to_string()),
-            })
-            .unwrap();
-        // A Files node gets its own worktree by default, which is not made
-        // here; this checks the workspace directory being ready.
-        store
-            .enqueue(FleetMutation::SetNodeUseWorktree {
-                node_id: node.to_string(),
-                use_worktree: false,
-            })
-            .unwrap();
+        // The workspace directory itself (no worktree), which this checks is ready.
+        crate::fleet::places::pick_matching(
+            &store,
+            &node.to_string(),
+            &crate::fleet::FilesPlace { repo: Some(repo.display().to_string()), ..Default::default() },
+        )
+        .unwrap();
         store.writer().flush().unwrap();
         let ready = read();
         assert_ne!(ready, enabled);

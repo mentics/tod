@@ -11,6 +11,7 @@
 
 use crate::agent_launch::AgentLaunchOptions;
 use crate::fleet::repos::files_location::{FilesLocation, FilesLocationRepo, recipe_key};
+use crate::fleet::repos::files_place::FilesPlaceRepo;
 use crate::fleet::repos::node_agent::{NodeAgent, NodeAgentRepo};
 use crate::fleet::repos::node_files::{DevContainerSetting, NodeFilesRepo};
 use crate::fleet::workdir::Workdir;
@@ -34,7 +35,12 @@ pub struct ResolvedFiles {
     pub source_node_id: String,
     pub source_title: String,
     pub inherited: bool,
-    /// Workspace directory (`node_fields.repo` of the source).
+    /// The location the source node picked (`files_places.id`), whether or
+    /// not it exists on this machine.
+    pub place_id: Option<String>,
+    /// That location's name; `None` when none is picked or it is gone.
+    pub place_name: Option<String>,
+    /// Workspace directory (the location's).
     pub repo: Option<String>,
     /// The branch this node's work is on: its own `node_fields.branch` when
     /// it gets a location of its own ([`Self::per_node`]), else the source's.
@@ -194,6 +200,15 @@ impl ResolvedFiles {
 
     /// Why no location can be made from these settings yet (user-facing).
     pub fn incomplete(&self) -> Option<String> {
+        match (&self.place_id, &self.place_name) {
+            (None, _) => return Some("Choose a location".into()),
+            (Some(_), None) => {
+                return Some(
+                    "The location this node uses is not set up on this machine: choose one".into(),
+                );
+            }
+            _ => {}
+        }
         if let Some(dev) = &self.dev_container {
             if dev.sandbox {
                 if let Some(reason) = dev.sandbox_from.incomplete() {
@@ -323,33 +338,41 @@ pub fn resolve_files_for_node(conn: &Connection, node_id: &str) -> Result<Option
         return Ok(None);
     };
     let source_node_id = source.to_string();
-    let fields = |id: Uuid| -> Result<(Option<String>, Option<String>)> {
+    let branch_of = |id: Uuid| -> Result<Option<String>> {
         Ok(conn
             .query_row(
-                "SELECT repo, branch FROM node_fields WHERE node_id = ?1",
+                "SELECT branch FROM node_fields WHERE node_id = ?1",
                 params![uuid_to_blob(id)],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| row.get(0),
             )
             .optional()?
-            .unwrap_or_default())
+            .flatten())
     };
-    let (repo, source_branch) = fields(source)?;
-    let files = NodeFilesRepo::new(conn).get(&source_node_id)?;
+    let source_branch = branch_of(source)?;
+    let place_id = NodeFilesRepo::new(conn)
+        .get(&source_node_id)?
+        .and_then(|f| f.place_id);
+    let place = match &place_id {
+        Some(id) => FilesPlaceRepo::new(conn).get(id)?,
+        None => None,
+    };
     let mut resolved = ResolvedFiles {
         node_id: node_id.to_string(),
         source_title,
         inherited,
-        repo,
+        place_id,
+        place_name: place.as_ref().map(|p| p.name.clone()),
+        repo: place.as_ref().and_then(|p| p.repo.clone()),
         branch: source_branch,
-        use_worktree: files.as_ref().is_some_and(|f| f.use_worktree),
-        dev_container: files.and_then(|f| f.dev_container),
+        use_worktree: place.as_ref().is_some_and(|p| p.use_worktree),
+        dev_container: place.and_then(|p| p.dev_container),
         location: None,
         stale_location: None,
         source_node_id,
     };
     if resolved.per_node() && inherited {
         resolved.branch = match Uuid::parse_str(node_id) {
-            Ok(id) => fields(id)?.1,
+            Ok(id) => branch_of(id)?,
             Err(_) => None,
         };
     }
@@ -533,13 +556,12 @@ mod tests {
     }
 
     fn set_repo(store: &FleetStore, node: Uuid, repo: &str) {
-        store
-            .enqueue(FleetMutation::UpdateTaskRepo {
-                id: node.to_string(),
-                repo: Some(repo.into()),
-            })
-            .unwrap();
-        store.writer().flush().unwrap();
+        crate::fleet::places::pick_matching(
+            store,
+            &node.to_string(),
+            &crate::fleet::FilesPlace { repo: Some(repo.into()), ..Default::default() },
+        )
+        .unwrap();
     }
 
     #[test]
@@ -747,6 +769,8 @@ mod tests {
             dev_container: dev,
             location: None,
             stale_location: None,
+            place_id: Some("p".into()),
+            place_name: Some("P".into()),
         }
     }
 
@@ -850,20 +874,21 @@ mod tests {
         let tree = setup_tree();
         enable(&tree.store, tree.grandparent, vec![Capability::Files]);
         let (gp, child) = (tree.grandparent.to_string(), tree.child.to_string());
-        tree.store
-            .enqueue(FleetMutation::UpdateTaskRepo { id: gp.clone(), repo: Some("/root/app".into()) })
-            .unwrap();
+        let place = crate::fleet::places::pick_matching(
+            &tree.store,
+            &gp,
+            &crate::fleet::FilesPlace {
+                repo: Some("/root/app".into()),
+                dev_container: Some(DevContainerSetting { sandbox: true, ..Default::default() }),
+                ..Default::default()
+            },
+        )
+        .unwrap();
         tree.store
             .enqueue(FleetMutation::UpdateTaskBranch { id: gp.clone(), branch: Some("main".into()) })
             .unwrap();
         tree.store
             .enqueue(FleetMutation::UpdateTaskBranch { id: child.clone(), branch: Some("task/child".into()) })
-            .unwrap();
-        tree.store
-            .enqueue(FleetMutation::SetNodeDevContainer {
-                node_id: gp.clone(),
-                dev_container: Some(DevContainerSetting { sandbox: true, ..Default::default() }),
-            })
             .unwrap();
         tree.store.writer().flush().unwrap();
         tree.store.reload_if_stale().unwrap();
@@ -885,16 +910,18 @@ mod tests {
         assert_eq!(parent.directory(), FilesDirectory::NotMade);
 
         // Changing what sandboxes are made from leaves the child's stale.
-        tree.store
-            .enqueue(FleetMutation::SetNodeDevContainer {
-                node_id: gp.clone(),
+        crate::fleet::places::save(
+            &tree.store,
+            &crate::fleet::FilesPlace {
                 dev_container: Some(DevContainerSetting {
                     sandbox: true,
                     sandbox_from: crate::fleet::repos::node_files::SandboxFrom::Image("other".into()),
                     ..Default::default()
                 }),
-            })
-            .unwrap();
+                ..place
+            },
+        )
+        .unwrap();
         tree.store.writer().flush().unwrap();
         tree.store.reload_if_stale().unwrap();
         let files = tree.store.resolve_files_for_node(&child).unwrap().unwrap();

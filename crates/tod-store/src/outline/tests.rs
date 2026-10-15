@@ -2670,6 +2670,16 @@ fn copy_node_subtree_copies_capability_settings_and_obligations() {
         })
         .unwrap();
     store.writer().flush().unwrap();
+    let place = crate::fleet::places::pick_matching(
+        &store,
+        &src.to_string(),
+        &crate::fleet::FilesPlace {
+            repo: Some("C:/r".into()),
+            use_worktree: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
     for m in [
         OutlineMutation::SetNodeAgent {
             node_id: src,
@@ -2679,10 +2689,8 @@ fn copy_node_subtree_copies_capability_settings_and_obligations() {
         },
         OutlineMutation::SetNodeFiles {
             node_id: src,
-            repo: Some("C:/r".into()),
+            place_id: Some(place.id.clone()),
             branch: Some("task/src".into()),
-            use_worktree: true,
-            dev_container: None,
         },
         OutlineMutation::SetNodeTicket {
             node_id: src,
@@ -2736,7 +2744,10 @@ fn copy_node_subtree_copies_capability_settings_and_obligations() {
             let task = crate::fleet::repos::task::TaskRepo::new(conn)
                 .get_node(&id)?
                 .unwrap();
-            assert_eq!(task.repo.as_deref(), Some("C:/r"));
+            let copied = crate::fleet::repos::node_files::NodeFilesRepo::new(conn)
+                .get(&id)?
+                .unwrap();
+            assert_eq!(copied.place_id.as_deref(), Some(place.id.as_str()));
             assert_ne!(task.branch.as_deref(), Some("task/src"));
             assert_eq!(task.ticket, None);
             assert_eq!(crate::environment::entries(conn, copy)?.len(), 1);

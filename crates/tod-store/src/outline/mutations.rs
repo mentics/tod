@@ -82,15 +82,13 @@ pub enum OutlineMutation {
         model: Option<String>,
         effort: Option<String>,
     },
-    /// The Files capability's settings.
+    /// The Files capability's settings: the location it uses (one of the
+    /// app's, `files_places.id`; `None` picks none) and the node's branch.
     SetNodeFiles {
         node_id: Uuid,
-        repo: Option<String>,
-        branch: Option<String>,
-        use_worktree: bool,
-        /// `Some` runs the node's launches in a dev container.
         #[serde(default)]
-        dev_container: Option<crate::fleet::repos::node_files::DevContainerSetting>,
+        place_id: Option<String>,
+        branch: Option<String>,
     },
     /// The Ticket capability's ticket (at most one; `None` clears it) and
     /// pull requests.
@@ -573,22 +571,14 @@ impl OutlineMutation {
             }
             OutlineMutation::SetNodeFiles {
                 node_id,
-                repo,
+                place_id,
                 branch,
-                use_worktree,
-                dev_container,
             } => {
                 require_capability(conn, *node_id, Capability::Files)?;
                 let id = node_id.to_string();
-                let tasks = crate::fleet::repos::task::TaskRepo::new(conn);
-                tasks.update_repo(&id, repo.as_deref())?;
-                tasks.update_branch(&id, branch.as_deref())?;
-                if let Some(container) = dev_container.as_ref().and_then(|dev| dev.container()) {
-                    tod_agent::devcontainer::validate_container_ref(container)?;
-                }
-                let files = crate::fleet::repos::node_files::NodeFilesRepo::new(conn);
-                files.set_use_worktree(&id, *use_worktree)?;
-                files.set_dev_container(&id, dev_container.as_ref())?;
+                crate::fleet::repos::task::TaskRepo::new(conn).update_branch(&id, branch.as_deref())?;
+                crate::fleet::repos::node_files::NodeFilesRepo::new(conn)
+                    .set_place(&id, place_id.as_deref())?;
             }
             OutlineMutation::SetNodeTicket {
                 node_id,
@@ -1849,14 +1839,9 @@ fn copy_capabilities(conn: &Connection, source_id: Uuid, new_id: Uuid) -> Result
             }
             Capability::Files => {
                 use crate::fleet::repos::node_files::NodeFilesRepo;
-                let tasks = crate::fleet::repos::task::TaskRepo::new(conn);
-                if let Some(t) = tasks.get_node(&src)? {
-                    tasks.update_repo(&dst, t.repo.as_deref())?;
-                }
                 let files = NodeFilesRepo::new(conn);
                 if let Some(f) = files.get(&src)? {
-                    files.set_use_worktree(&dst, f.use_worktree)?;
-                    files.set_dev_container(&dst, f.dev_container.as_ref())?;
+                    files.set_place(&dst, f.place_id.as_deref())?;
                 }
             }
             Capability::Environment => {

@@ -23,9 +23,7 @@ COMMANDS:
     enable  <NODE> <CAP>...
     disable <NODE> <CAP>
     set     <NODE> agent [--platform claude|cursor] [--model <TEXT>] [--effort <TEXT>]
-    set     <NODE> files [--dir <PATH>] [--branch <TEXT>] [--worktree on|off]
-                         [--container <NAME|ID>] [--mounted on|off]
-                         [--sandbox image[:<IMAGE>]|fork:<NAME>]
+    set     <NODE> files [--location <NAME|ID>] [--branch <TEXT>]
     set     <NODE> ticket [--ticket <ID>] [--pr <URL>]...
     set     <NODE> tags (--tags <A,B,..> | --add <TAG> | --remove <TAG>)
     set     <NODE> generator --source <TYPE> --config <JSON>
@@ -49,21 +47,17 @@ that phase's list (`--skills ''` means no skills, even where an ancestor sets
 some); `--clear` removes the phase from this node so the nearest ancestor's
 applies again. Other phases are untouched.
 
-`--container` runs the node's agents, terminals, and git inside that running
-dev container (`--container ''` runs them on this machine again). The
-repository lives in the container: `--dir` is its path there, and worktrees
-are made there. `--mounted on` is for a repository on this machine mounted
-into the container: `--dir` stays the host path, git runs here, and the
-directory inside the container follows from its mounts. `--sandbox` gives
-each node that works from these settings a cloud sandbox of its own, made
-the first time it needs one: `image` from the account's default image,
-`image:<IMAGE>` from that image, `fork:<NAME>` as a copy of that sandbox
-(`--sandbox ''` runs them on this machine again). The image or forked
-sandbox must already hold the repository; `--dir` is its path there.
+`--location` picks which of the user's Files locations the node (and every node
+below it that does not enable Files itself) works from; `--location ''` picks
+none. A location is a named setup the user keeps in the app (a workspace
+directory, and whether each node gets a worktree, runs in a dev container, or
+gets a cloud sandbox). They cannot be created or edited from here, and an
+unknown name is refused with the names that exist. `--branch` is this node's
+own branch.
 
-Changing where the files are, or turning worktrees on or off, is refused
-while any node has a worktree or sandbox made from the old settings: they
-are removed from the app, which pushes each one's branch first.
+Picking a different location is refused while any node has a worktree or
+sandbox made from this node's current one that the new one would not make:
+the user removes those in the app, which pushes each branch first.
 ";
 
 pub fn run(inv: Invocation) -> anyhow::Result<String> {
@@ -95,85 +89,55 @@ fn parse_cap(raw: &str) -> anyhow::Result<Capability> {
     })
 }
 
-/// `--container` / `--sandbox` / `--mounted` over the node's current dev
-/// container or sandbox.
-fn files_dev_container(
-    args: &Args,
-    current: Option<tod_store::fleet::DevContainerSetting>,
-) -> anyhow::Result<Option<tod_store::fleet::DevContainerSetting>> {
-    let container = args.get("--container").map(str::trim);
-    let sandbox = args.get("--sandbox").map(str::trim);
-    let mut dev = match (container, sandbox) {
-        (Some(_), Some(_)) => anyhow::bail!("pass --container or --sandbox, not both"),
-        (None, None) => current,
-        (Some(""), None) | (None, Some("")) => None,
-        (Some(container), None) => Some(tod_store::fleet::DevContainerSetting {
-            container: Some(container.to_string()),
-            sandbox: false,
-            ..current.unwrap_or_default()
-        }),
-        (None, Some(sandbox)) => {
-            let from = match sandbox.split_once(':') {
-                None if sandbox == "image" => tod_store::fleet::SandboxFrom::Image(String::new()),
-                Some(("image", image)) => tod_store::fleet::SandboxFrom::Image(image.trim().to_string()),
-                Some(("fork", name)) => {
-                    tod_store::fleet::sandbox::validate_name(name.trim())?;
-                    tod_store::fleet::SandboxFrom::Fork(name.trim().to_string())
-                }
-                _ => anyhow::bail!(
-                    "--sandbox must be image, image:<IMAGE>, or fork:<NAME>, not `{sandbox}`"
-                ),
-            };
-            Some(tod_store::fleet::DevContainerSetting {
-                container: None,
-                repo_on_host: false,
-                sandbox: true,
-                sandbox_from: from,
-            })
+/// The location `reference` names (its name or id), or why there is none.
+fn find_location(
+    inv: &Invocation,
+    reference: &str,
+) -> anyhow::Result<tod_store::fleet::FilesPlace> {
+    use tod_store::fleet::repos::files_place::FilesPlaceRepo;
+    let (found, all) = inv.client().read(|conn| {
+        let repo = FilesPlaceRepo::new(conn);
+        Ok((repo.find(reference)?, repo.list()?))
+    })?;
+    found.ok_or_else(|| {
+        let names: Vec<String> = all.iter().map(|p| p.name.clone()).collect();
+        if names.is_empty() {
+            anyhow::anyhow!(
+                "no Files location named `{reference}`, and none are set up: ask the user to \
+                 create one in the app (the status bar's Locations)"
+            )
+        } else {
+            anyhow::anyhow!(
+                "no Files location named `{reference}`; the user has: {}",
+                names.join(", ")
+            )
         }
-    };
-    if dev.as_ref().is_some_and(|dev| dev.sandbox) && args.get("--mounted").is_some() {
-        anyhow::bail!("--mounted is for a dev container; a sandbox always holds its repository");
-    }
-    let needs_container = |flag: &str| {
-        anyhow::anyhow!("{flag} needs a dev container: pass --container too")
-    };
-    if let Some(mounted) = args.get("--mounted") {
-        let dev = dev.as_mut().ok_or_else(|| needs_container("--mounted"))?;
-        dev.repo_on_host = match mounted.trim() {
-            "on" => true,
-            "off" => false,
-            other => anyhow::bail!("--mounted must be on or off, not `{other}`"),
-        };
-    }
-    Ok(dev)
+    })
 }
 
-/// Refuse new Files settings that would leave worktrees or sandboxes made
-/// from the old ones behind: removing those needs the user (uncommitted
-/// work, a push), so it happens in the app.
+/// Refuse picking `place` when worktrees or sandboxes made from this node's
+/// current location would be left behind: removing those needs the user
+/// (uncommitted work, a push), so it happens in the app.
 fn refuse_orphaning_locations(
     inv: &Invocation,
     node: Uuid,
-    repo: Option<&str>,
-    use_worktree: bool,
-    dev: Option<&tod_store::fleet::DevContainerSetting>,
+    place: Option<&tod_store::fleet::FilesPlace>,
 ) -> anyhow::Result<()> {
-    use tod_store::fleet::repos::files_location::{FilesLocationRepo, recipe_key};
-    let recipe = recipe_key(repo, use_worktree, dev);
+    use tod_store::fleet::repos::files_location::FilesLocationRepo;
+    let recipe = place.map(|p| p.clone().normalized().recipe_key());
     let source = node.to_string();
     let made = inv.client().read(|conn| {
         Ok(FilesLocationRepo::new(conn)
             .list_all()?
             .into_iter()
-            .filter(|l| l.source_node_id == source && l.recipe != recipe)
+            .filter(|l| l.source_node_id == source && Some(&l.recipe) != recipe.as_ref())
             .count())
     })?;
     if made > 0 {
         anyhow::bail!(
             "{made} node(s) have a worktree or sandbox made from this node's current Files \
-             settings. Changing where the files are would leave them behind; ask the user to \
-             change it in the app, which removes them (pushing each branch first)."
+             location. Picking another would leave them behind; ask the user to change it in \
+             the app, which removes them (pushing each branch first)."
         );
     }
     Ok(())
@@ -223,13 +187,30 @@ fn list(inv: &Invocation, node: Uuid) -> anyhow::Result<String> {
                 or_none(&s.agent_model),
                 or_none(&s.agent_effort)
             ),
-            Capability::Files => format!(
-                "files: dir {}, branch {}, worktree {}, runs in {}",
-                or_none(&s.repo),
-                or_none(&s.branch),
-                if s.use_worktree { "on" } else { "off" },
-                tod_store::conversation::runs_in(&s.dev_container),
-            ),
+            Capability::Files => {
+                let place = match (&s.files_place_name, &s.files_place) {
+                    (Some(name), _) => name.clone(),
+                    (None, Some(id)) => format!("{id} (no longer exists)"),
+                    (None, None) => "(none)".to_string(),
+                };
+                let detail = match &s.files_place {
+                    Some(id) => inv
+                        .client()
+                        .read(|conn| {
+                            tod_store::fleet::repos::files_place::FilesPlaceRepo::new(conn).get(id)
+                        })?
+                        .map(|p| {
+                            format!(
+                                " ({}, dir {})",
+                                p.describe(),
+                                p.repo().unwrap_or("not set")
+                            )
+                        })
+                        .unwrap_or_default(),
+                    None => String::new(),
+                };
+                format!("files: location {place}{detail}, branch {}", or_none(&s.branch))
+            }
             Capability::Ticket => format!(
                 "ticket: ticket {}; pull requests {}",
                 or_none(&s.ticket),
@@ -353,21 +334,31 @@ fn set(inv: &Invocation, node: Uuid, args: &Args) -> anyhow::Result<String> {
             }
         }
         Capability::Files => {
-            let repo = merged(args, "--dir", s.repo);
-            let use_worktree = match args.get("--worktree") {
-                None => s.use_worktree,
-                Some("on") => true,
-                Some("off") => false,
-                Some(other) => anyhow::bail!("--worktree must be on or off, not `{other}`"),
+            for gone in ["--dir", "--worktree", "--container", "--mounted", "--sandbox"] {
+                if args.get(gone).is_some() {
+                    anyhow::bail!(
+                        "{gone} is no longer set per node: the directory, worktrees and where \
+                         files run belong to the user's Files locations. Pick one with \
+                         `--location <NAME>`; the user edits locations in the app"
+                    );
+                }
+            }
+            let place_id = match args.get("--location").map(str::trim) {
+                None => s.files_place,
+                Some("") => {
+                    refuse_orphaning_locations(inv, node, None)?;
+                    None
+                }
+                Some(reference) => {
+                    let place = find_location(inv, reference)?;
+                    refuse_orphaning_locations(inv, node, Some(&place))?;
+                    Some(place.id)
+                }
             };
-            let dev_container = files_dev_container(args, s.dev_container)?;
-            refuse_orphaning_locations(inv, node, repo.as_deref(), use_worktree, dev_container.as_ref())?;
             OutlineMutation::SetNodeFiles {
                 node_id: node,
-                repo,
+                place_id,
                 branch: merged(args, "--branch", s.branch),
-                use_worktree,
-                dev_container,
             }
         }
         Capability::Ticket => {

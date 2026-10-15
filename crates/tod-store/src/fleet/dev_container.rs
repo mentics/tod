@@ -150,6 +150,8 @@ mod tests {
             location: None,
             stale_location: None,
             dev_container: dev,
+            place_id: Some("p".into()),
+            place_name: Some("P".into()),
         }
     }
 

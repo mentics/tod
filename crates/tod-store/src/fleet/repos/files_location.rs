@@ -417,14 +417,11 @@ mod tests {
         let sandbox = repo.get(&sb).unwrap().unwrap();
         assert_eq!(sandbox.sandbox(), Some("tod-test-1"));
         assert_eq!(sandbox.directory(), Some(Workdir::sandbox("tod-test-1", "/root/app")));
-        let dev = crate::fleet::repos::node_files::NodeFilesRepo::new(&conn)
-            .get(&sb)
-            .unwrap()
-            .unwrap()
-            .dev_container
-            .unwrap();
-        assert_eq!(dev.sandbox_from, SandboxFrom::Fork("tod-test-1".into()));
-        assert_eq!(dev.container, None);
+        let dev = crate::fleet::repos::node_files::DevContainerSetting {
+            sandbox: true,
+            sandbox_from: SandboxFrom::Fork("tod-test-1".into()),
+            ..Default::default()
+        };
         assert_eq!(sandbox.recipe, recipe_key(Some("/root/app"), false, Some(&dev)));
         cleanup_test_dir(&dir);
     }
