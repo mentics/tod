@@ -144,7 +144,7 @@ fn collect_running_work(
         for run in runs {
             if run.is_live() {
                 let title = fleet
-                    .get_task(&run.node_id)
+                    .get_node(&run.node_id)
                     .ok()
                     .flatten()
                     .map(|t| t.title)
@@ -174,13 +174,15 @@ fn collect_running_work(
             if node.lifecycle == "done" {
                 continue;
             }
-            let title = fleet
-                .get_task(&node_id)
-                .ok()
-                .flatten()
-                .map(|t| t.title)
-                .unwrap_or(node_id);
-            continuing.push(format!("{title}: running in the cloud"));
+            let title = if node.title.trim().is_empty() {
+                node.slug.clone()
+            } else {
+                node.title.clone()
+            };
+            continuing.push(format!(
+                "{title} ({}): running in the cloud",
+                node.lifecycle
+            ));
         }
     }
     crate::ui::toast::CloseGuardWork {
