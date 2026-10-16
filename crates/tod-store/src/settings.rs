@@ -58,13 +58,60 @@ pub struct LifecycleSettings {
     /// certifies its own phase.
     #[serde(default = "default_independent_evaluation")]
     pub independent_evaluation: bool,
+    /// How each repository ships (`doc/lifecycle/repo-profiles.md`). The
+    /// first entry that matches a pull request's repository applies; a
+    /// repository nothing matches uses [`RepoProfile::Release`].
+    #[serde(default)]
+    pub repo_profiles: Vec<RepoProfileSetting>,
 }
 
 impl Default for LifecycleSettings {
     fn default() -> Self {
         Self {
             independent_evaluation: default_independent_evaluation(),
+            repo_profiles: Vec::new(),
         }
+    }
+}
+
+impl LifecycleSettings {
+    /// The profile for a pull request in `owner/repo`.
+    pub fn profile_for(&self, owner: &str, repo: &str) -> RepoProfile {
+        self.repo_profiles
+            .iter()
+            .find(|entry| entry.matches(owner, repo))
+            .map(|entry| entry.profile)
+            .unwrap_or_default()
+    }
+}
+
+/// How a repository ships a merged change.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RepoProfile {
+    /// A published GitHub release whose notes name the pull request carries
+    /// the change out. The behavior of every repository not listed.
+    #[default]
+    Release,
+    /// Merging is shipping: the repository publishes no releases, so a
+    /// merged pull request waits for nothing.
+    Merge,
+}
+
+/// One `repo_profiles` entry: which repositories, and how they ship.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepoProfileSetting {
+    /// `owner/repo`, `owner/*` (every repository of an owner), or `*`.
+    /// Compared without regard to case.
+    pub repo: String,
+    pub profile: RepoProfile,
+}
+
+impl RepoProfileSetting {
+    fn matches(&self, owner: &str, repo: &str) -> bool {
+        let pattern = self.repo.trim().to_lowercase();
+        let full = format!("{owner}/{repo}").to_lowercase();
+        pattern == "*" || pattern == full || pattern.strip_suffix("/*").is_some_and(|o| o == owner.to_lowercase())
     }
 }
 
@@ -1014,6 +1061,7 @@ mod tests {
             journeys: JourneySettings::default(),
             lifecycle: LifecycleSettings {
                 independent_evaluation: false,
+                repo_profiles: vec![RepoProfileSetting { repo: "acme/infra".into(), profile: RepoProfile::Merge }],
             },
             visual_design: VisualDesignSettings {
                 browser: Some("C:/chrome/chrome.exe".into()),
@@ -1034,6 +1082,23 @@ mod tests {
         let loaded = TodSettings::load_from_path(&path).unwrap();
         assert_eq!(loaded, settings);
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_repository_uses_the_first_profile_that_matches_it() {
+        let setting = |repo: &str, profile| RepoProfileSetting { repo: repo.into(), profile };
+        let lifecycle = LifecycleSettings {
+            repo_profiles: vec![
+                setting("Acme/Infra", RepoProfile::Merge),
+                setting("acme/*", RepoProfile::Release),
+                setting("other/*", RepoProfile::Merge),
+            ],
+            ..LifecycleSettings::default()
+        };
+        assert_eq!(lifecycle.profile_for("acme", "infra"), RepoProfile::Merge);
+        assert_eq!(lifecycle.profile_for("acme", "app"), RepoProfile::Release);
+        assert_eq!(lifecycle.profile_for("other", "x"), RepoProfile::Merge);
+        assert_eq!(lifecycle.profile_for("nobody", "x"), RepoProfile::Release);
     }
 
     #[test]

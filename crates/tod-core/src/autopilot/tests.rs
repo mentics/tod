@@ -1023,3 +1023,37 @@ fn a_wait_on_several_pull_requests_says_where_each_stands() {
     assert!(what.contains("acme/app#42 released in v1.0.0"), "{what}");
     assert!(what.contains("acme/infra#7 merged, no release names it yet"), "{what}");
 }
+
+#[test]
+fn a_repository_that_does_not_release_is_not_waited_on_for_one() {
+    let fx = bare();
+    retire_outside_criteria(&fx);
+    let github = AfterReview::new();
+    github.merged.store(true, std::sync::atomic::Ordering::SeqCst);
+    crate::pr_readiness::set_feed_override(Some(github.clone()));
+    let mut settings = tod_store::TodSettings::default();
+    settings.lifecycle.repo_profiles = vec![tod_store::RepoProfileSetting {
+        repo: "acme/infra".into(),
+        profile: tod_store::RepoProfile::Merge,
+    }];
+    settings.save(&tod_store::TodPaths::at(&fx.root)).unwrap();
+    linked_to_prs(
+        &fx,
+        "merged",
+        &["https://github.com/acme/app/pull/42", "https://github.com/acme/infra/pull/7"],
+    );
+    let mut agent = FakeAgent::new(&fx.fleet);
+
+    // The release for acme/app is still out: that alone holds the node.
+    let outcome = autopilot(&fx, Budget::default()).run(&fx.fleet, &mut agent).unwrap();
+    let Outcome::Waiting { what, .. } = outcome else {
+        panic!("expected Waiting, got {outcome:?}");
+    };
+    assert!(what.contains("acme/app#42"), "{what}");
+    assert!(what.contains("acme/infra#7 merged (this repository does not release)"), "{what}");
+
+    // Once it is released, the infra PR does not hold the node.
+    *github.notes.lock().unwrap() = Some("* Add the widget by @ann in #42".into());
+    let outcome = autopilot(&fx, Budget::default()).run(&fx.fleet, &mut agent).unwrap();
+    assert_eq!(outcome, Outcome::Done, "{outcome:?}");
+}

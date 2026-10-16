@@ -54,6 +54,9 @@ impl Autopilot {
         // Where each pull request stands, named in the wait so the person
         // can see what holds the node up and what does not.
         let mut standing: Vec<String> = Vec::new();
+        let lifecycle_settings = tod_store::TodSettings::load(&tod_store::TodPaths::at(&self.config.data_root))
+            .map_err(|e| anyhow::anyhow!("settings not readable: {e}"))?
+            .lifecycle;
         for pr in &links.prs {
             let label = crate::pr_readiness::pr_label(pr);
             let merge = match feed.merge(pr) {
@@ -74,6 +77,11 @@ impl Autopilot {
             }
             if !releasing {
                 standing.push(format!("{label} merged"));
+                continue;
+            }
+            // A repository that publishes no releases ships when it merges.
+            if lifecycle_settings.profile_for(&pr.owner, &pr.repo) == tod_store::RepoProfile::Merge {
+                standing.push(format!("{label} merged (this repository does not release)"));
                 continue;
             }
             let releases = match feed.releases(pr) {

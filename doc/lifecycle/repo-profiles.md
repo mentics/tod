@@ -1,6 +1,9 @@
 # Repository lifecycle profiles
 
-Status: design, not built.
+Status: partly built. `lifecycle.repo_profiles` (`tod_store::settings`,
+`RepoProfile` = `release` | `merge`) is read by `autopilot::github_wait`, so a
+`merge` repository's pull request never waits for a release. Editing it in
+Settings, the profile trait, and `atlantis` are not built.
 
 The lifecycle assumes one way of shipping: PR, human review, merge, then a
 GitHub release that names the PR. Some repositories ship differently. The
@@ -17,7 +20,9 @@ Lifecycle. A repository not listed uses `default`.
 lifecycle:
   repo_profiles:
     - repo: acme/infra
-      profile: atlantis
+      profile: merge        # release (default) | merge | atlantis (design)
+    - repo: acme/*          # `owner/repo`, `owner/*` or `*`; first match wins
+      profile: release
 ```
 
 ## Which profile applies

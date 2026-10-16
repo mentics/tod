@@ -325,6 +325,13 @@ person's review:
   node with no linked pull request waits for nothing: its phase agent drives
   the release.
 
+When a node has several pull requests the wait lists where each stands
+(`acme/app#42 released in v1.4.2; acme/infra#7 merged, no release names it
+yet`; in `pr`, `approved` / `awaiting review` / `changes requested`), so the
+person can see what holds the node up. A repository whose profile is `merge`
+(`doc/lifecycle/repo-profiles.md`) publishes no releases and is never waited
+on for one.
+
 The deadline of each wait is the next scheduled look (`review_schedule`), at
 which the scheduler wakes the node; a GitHub webhook for the merge, or for a
 published release (subscribe the webhook to *Releases*), satisfies the wait
