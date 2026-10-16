@@ -1091,6 +1091,16 @@ fn record_cloud_node(fleet: &FleetStore, node_id: &str, sandbox: String, user: &
 
 /// Run `node_id` in the cloud: sync (seeding first), make its sandbox
 /// ([`ensure_node_sandbox`]), and record it. `progress` hears each step.
+/// Logs one progress line from a cloud job, at `warn` when it says "warning:"
+/// (these lines otherwise reach only the panel).
+pub fn log_progress(context: &str, msg: &str) {
+    if msg.starts_with("warning:") {
+        tracing::warn!("cloud: {context}: {msg}");
+    } else {
+        tracing::info!("cloud: {context}: {msg}");
+    }
+}
+
 pub fn run_in_cloud(
     fleet: &FleetStore,
     root: &Path,

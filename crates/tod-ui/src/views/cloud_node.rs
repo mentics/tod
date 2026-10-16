@@ -61,6 +61,7 @@ pub fn run_in_cloud<T: 'static>(
     spawn(cx, on_update, move |tx| {
         let root = fleet.paths().root().to_path_buf();
         let mut progress = |msg: &str| {
+            cloud_sync::log_progress(&format!("running {node_id}"), msg);
             let _ = tx.send_blocking(CloudUpdate::Progress(msg.to_string()));
         };
         let result = cloud_sync::run_in_cloud(&fleet, &root, &node_id, &mut progress);

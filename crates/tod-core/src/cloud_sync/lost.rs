@@ -142,7 +142,7 @@ pub fn check(fleet: &FleetStore, check: Check) -> Result<usize> {
         let id = row.node_id.to_string();
         tracing::info!("cloud: node {id}'s sandbox {} is gone; replacing it", row.sandbox);
         set_note(&id, Some(format!("Its sandbox {} was gone; replacing it…", row.sandbox)));
-        let mut progress = |msg: &str| tracing::info!("cloud: replacing {}: {msg}", row.sandbox);
+        let mut progress = |msg: &str| super::log_progress(&format!("replacing {}", row.sandbox), msg);
         let result = ensure_node_sandbox(fleet, &root, &id, &row.user, &mut progress)
             .and_then(|name| record_cloud_node(fleet, &id, name, &row.user));
         match result {
@@ -253,7 +253,7 @@ pub fn refresh_credentials(fleet: &FleetStore, node_id: &str, force: bool) -> Re
     while bx.get(&row.sandbox)?.is_some() && std::time::Instant::now() < deadline {
         std::thread::sleep(std::time::Duration::from_secs(2));
     }
-    let mut progress = |msg: &str| tracing::info!("cloud: recreating {}: {msg}", row.sandbox);
+    let mut progress = |msg: &str| super::log_progress(&format!("recreating {}", row.sandbox), msg);
     let result = ensure_node_sandbox(fleet, &root, node_id, &row.user, &mut progress)
         .and_then(|name| record_cloud_node(fleet, node_id, name, &row.user));
     match result {

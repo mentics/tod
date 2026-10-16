@@ -141,6 +141,8 @@ node_ok() {
 }
 node_ok || missing="$missing node>=20.10"
 command -v claude-agent-acp >/dev/null 2>&1 || missing="$missing claude-agent-acp"
+# A non-login shell may not have where `claude` was installed on its PATH.
+PATH="$PATH:/usr/local/bin:$HOME/.local/bin:/root/.local/bin:$HOME/.claude/local"
 command -v claude >/dev/null 2>&1 || optional="$optional claude"
 "#
     } else {
@@ -323,7 +325,7 @@ pub fn require_fork_prerequisites(
     let found = parse_requirements(bx.run(url, &requirements_script(agents), 60)?.output());
     if !found.optional.is_empty() {
         progress(&format!(
-            "warning: the sandbox has no {} (a terminal agent cannot start there; the ACP agent is unaffected)",
+            "warning: the sandbox has no {} on its PATH, nor in /usr/local/bin or ~/.local/bin (a terminal agent cannot start there; the ACP agent is unaffected). If it is installed elsewhere, put it on the PATH in the image the sandbox is made from",
             found.optional.join(", ")
         ));
     }
