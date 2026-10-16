@@ -137,7 +137,9 @@ fn parse_evidence(raw: &str) -> anyhow::Result<EvidenceRef> {
 
 fn ask(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
     let node = node(args)?;
-    let question = args.target("a question")?.to_string();
+    let question = args
+        .target("a question (the first positional argument, quoted; there is no --question flag)")?
+        .to_string();
     let options: Vec<String> = args.get_all("--option").iter().map(|s| s.to_string()).collect();
     let evidence = args
         .get_all("--evidence")

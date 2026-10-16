@@ -23,7 +23,12 @@ pub enum GithubError {
     /// HTTP 401: GitHub does not accept the credential at all.
     #[error("GitHub rejected the token (HTTP 401): it is expired, revoked, or mistyped")]
     Unauthorized,
-    #[error("pull request not found")]
+    /// GitHub answers 404 both for a missing pull request and for a
+    /// repository the token cannot see, so the message names both.
+    #[error(
+        "pull request not found (GitHub also answers 404 when tod's token cannot see the \
+         repository, even if `gh` can: check the token's access to it)"
+    )]
     NotFound,
     #[error("GitHub API error: {0}")]
     Api(String),
