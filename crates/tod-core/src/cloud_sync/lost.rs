@@ -331,12 +331,22 @@ pub fn delete_node_sandbox(fleet: &FleetStore, node_id: &str) -> Result<String> 
         .context("this node does not run in the cloud")?;
     let mut sandboxes = tod_store::fleet::sandbox::Sandboxes::load(&root)?;
     let bx = sandboxes.blaxel()?;
-    if bx.get(&row.sandbox).with_context(|| format!("look up sandbox {}", row.sandbox))?.is_none() {
+    let message = if bx.get(&row.sandbox).with_context(|| format!("look up sandbox {}", row.sandbox))?.is_none() {
         sandboxes.forget(&row.sandbox)?;
-        return Ok(format!("Sandbox {} not found; nothing to delete.", row.sandbox));
-    }
-    sandboxes.delete(&bx, &row.sandbox).with_context(|| format!("delete sandbox {}", row.sandbox))?;
-    Ok(format!("Deleted sandbox {}.", row.sandbox))
+        format!("Sandbox {} not found; nothing to delete.", row.sandbox)
+    } else {
+        sandboxes.delete(&bx, &row.sandbox).with_context(|| format!("delete sandbox {}", row.sandbox))?;
+        format!("Deleted sandbox {}.", row.sandbox)
+    };
+    // The sandbox is gone either way: record it so the panel offers to run the node again.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    fleet.enqueue(FleetMutation::CloudNodeMarkLost { node: uuid, at: now })?;
+    fleet.writer().flush()?;
+    let _ = fleet.reload_if_stale();
+    Ok(message)
 }
 
 #[cfg(test)]

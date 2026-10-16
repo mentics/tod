@@ -681,7 +681,15 @@ impl TaskPanel {
         use RunnerAction as A;
         let runners = self.runners.read(cx);
         let node = self.node_id;
-        if self.runner.cloud.is_some() {
+        if let Some(cloud) = &self.runner.cloud {
+            // Its sandbox is gone: there is nothing to sync or delete, only
+            // a new sandbox to make (or leaving the cloud).
+            if cloud.lost_at.is_some() {
+                return RunnerActions {
+                    primary: Some((A::RunInCloud, A::RunInCloud.label(), self.runner.cloud_busy)),
+                    menu: if self.runner.cloud_busy { Vec::new() } else { vec![A::LeaveCloud] },
+                };
+            }
             return RunnerActions {
                 primary: Some((A::SyncCloud, A::SyncCloud.label(), self.runner.cloud_busy)),
                 menu: if self.runner.cloud_busy { Vec::new() } else { vec![A::DeleteSandbox, A::LeaveCloud] },
@@ -983,7 +991,7 @@ impl TaskPanel {
         if let Some(cloud) = &self.runner.cloud {
             let mut text = format!("in the cloud (sandbox {})", cloud.sandbox);
             if cloud.lost_at.is_some() {
-                text.push_str(", its sandbox is gone; replaced on the next sync");
+                text.push_str(", its sandbox is gone");
             }
             line = line.child(sep()).child(style::text_muted(div().flex_auto().min_w(gpui::px(160.))).child(
                 selectable_text("unified-task-runner-cloud", text, window, cx),

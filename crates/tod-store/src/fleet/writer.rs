@@ -195,6 +195,11 @@ pub enum FleetMutation {
     CloudNodeRemove {
         node: uuid::Uuid,
     },
+    /// The node's sandbox is gone (deleted by the user, or found missing).
+    CloudNodeMarkLost {
+        node: uuid::Uuid,
+        at: i64,
+    },
     // --- Outline (tree / lists) ---
     Outline(OutlineMutation),
     // --- Interview sessions (immediate) ---
@@ -249,6 +254,7 @@ impl FleetMutation {
                 | FleetMutation::SetInterviewSessionStatus { .. }
                 | FleetMutation::CloudNodeUpsert { .. }
                 | FleetMutation::CloudNodeRemove { .. }
+                | FleetMutation::CloudNodeMarkLost { .. }
         )
     }
 
@@ -467,6 +473,9 @@ impl FleetMutation {
             }
             FleetMutation::CloudNodeRemove { node } => {
                 crate::cloud_nodes::remove(conn, *node)?;
+            }
+            FleetMutation::CloudNodeMarkLost { node, at } => {
+                crate::cloud_nodes::mark_lost(conn, *node, *at)?;
             }
             FleetMutation::Outline(_) => {}
         }
