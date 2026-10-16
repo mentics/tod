@@ -191,6 +191,9 @@ pub fn github_wait(waits: &[tod_store::waits::Wait]) -> Option<(String, i64)> {
         .iter()
         .filter(|w| w.match_spec.starts_with("github:"))
         .min_by_key(|w| w.due_at)?;
+    if let Some(detail) = wait.detail.as_deref().filter(|d| !d.trim().is_empty()) {
+        return Some((detail.to_string(), wait.due_at));
+    }
     let spec = wait.match_spec.as_str();
     let what = if spec == "github:release:published" || spec.starts_with("github:release:") {
         "a release that names the pull request".to_string()
@@ -425,6 +428,7 @@ mod tests {
             state: "pending".into(),
             created_at: 0,
             updated_at: 0,
+            detail: None,
         };
         let waits = [wait("github:pr:12:merged", 500), wait("notes", 1), wait("github:pr:13:review", 900)];
         let scheduled = github_wait(&waits);
