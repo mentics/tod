@@ -134,6 +134,7 @@ pub struct ObligationsView {
     items: Vec<NodeObligation>,
     search_query: String,
     search_input: Entity<InputState>,
+    search_field: crate::ui::text_field::TextField,
     /// The interview's current phase, when this panel is scoped to one — used
     /// only to seed which phase starts expanded and as the default phase for
     /// obligations created with no clearer phase context. `None` outside an
@@ -205,6 +206,7 @@ impl ObligationsView {
 
         let search_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("Search obligations…"));
+        let focus_handle = cx.focus_handle();
 
         let poll_entity = cx.weak_entity();
         let fleet_for_poll = fleet.clone();
@@ -236,9 +238,13 @@ impl ObligationsView {
             title: String::new(),
             items: Vec::new(),
             search_query: String::new(),
+            search_field: crate::ui::text_field::TextField::new(
+                search_input.clone(),
+                focus_handle.clone(),
+            ),
             search_input,
             active_phase: None,
-            focus_handle: cx.focus_handle(),
+            focus_handle,
             list: ItemList::new()
                 .with_columns(obligation_columns())
                 .with_group_editor(section_edit_input.clone(), SECTION_EDIT_TAG)
@@ -1413,6 +1419,9 @@ impl ObligationsView {
     }
 
     fn on_close(&mut self, _: &ObligationsClose, window: &mut Window, cx: &mut Context<Self>) {
+        if self.search_field.leave(window, cx) {
+            return;
+        }
         if self.is_editing() {
             self.abandon_inline_edit(window, cx, true);
             return;
@@ -1592,9 +1601,7 @@ impl ObligationsView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.search_input.update(cx, |input, cx| {
-            input.focus(window, cx);
-        });
+        self.search_field.enter(window, cx);
     }
 
     fn on_search_space(
@@ -2163,6 +2170,21 @@ mod tests {
         cx.dispatch_action(ObligationsClose);
         cx.dispatch_action(PaneFocusLeft);
         assert!(view.read_with(cx, |view, _| view.is_open()));
+        assert!(events.borrow().is_empty());
+    }
+
+    #[gpui::test]
+    fn escape_in_search_leaves_the_field_without_closing(cx: &mut TestAppContext) {
+        let fixture = Fixture::new();
+        let (view, events, cx) = open_view(&fixture, false, cx);
+        cx.update(|window, cx| {
+            view.update(cx, |v, cx| v.search_field.enter(window, cx));
+        });
+        cx.dispatch_action(ObligationsClose);
+        assert!(view.read_with(cx, |v, _| v.is_open()));
+        cx.update(|window, cx| {
+            view.read(cx).search_field.is_focused(window, cx).then(|| panic!("still focused"));
+        });
         assert!(events.borrow().is_empty());
     }
 

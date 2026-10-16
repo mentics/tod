@@ -301,6 +301,7 @@ pub struct TaskListView {
     list_state: Entity<ListState<TaskListDelegate>>,
     list_view: ListView<TaskListDelegate>,
     search_input: Entity<InputState>,
+    search_field: crate::ui::text_field::TextField,
     focus_handle: FocusHandle,
     /// Hosted as a column of a multi-column view (the workbench): the
     /// header takes the `column-focused` state while the tree has focus.
@@ -494,6 +495,10 @@ impl TaskListView {
             search_query: String::new(),
             list_state,
             list_view,
+            search_field: crate::ui::text_field::TextField::new(
+                search_input.clone(),
+                focus_handle.clone(),
+            ),
             search_input,
             focus_handle,
             marks_focused_column: false,
@@ -1967,6 +1972,9 @@ impl TaskListView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.search_field.leave(window, cx) {
+            return;
+        }
         if self.drawer_open {
             cx.emit(TaskListEvent::CloseDrawer);
         } else if self.is_editing() {
@@ -2268,9 +2276,7 @@ impl TaskListView {
         cx: &mut Context<Self>,
     ) {
         self.close_sort_menu(cx);
-        self.search_input.update(cx, |input, cx| {
-            input.focus(window, cx);
-        });
+        self.search_field.enter(window, cx);
     }
 
     fn on_sort_toggle(
