@@ -181,6 +181,12 @@ pub fn opening_with(
         .map(|node| crate::environment_context::render(conn, data_root, node))
         .transpose()?
         .unwrap_or_default();
+    let pull_requests = conversation
+        .focus
+        .node_id()
+        .map(|node| crate::pr_context::render(conn, node))
+        .transpose()?
+        .unwrap_or_default();
     let extra = if recipe.situational {
         situational_cli(conn, conversation.focus)?
     } else {
@@ -212,6 +218,7 @@ pub fn opening_with(
             data_root: Some(data_root),
             focus: Some(&focus),
             environment: &environment,
+            pull_requests: &pull_requests,
             ancestor_context: &ancestor_context,
             visual_design: visual_design.as_ref(),
             ..Default::default()

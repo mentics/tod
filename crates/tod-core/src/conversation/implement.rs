@@ -180,6 +180,7 @@ impl Protocol for ImplementationProtocol {
                 ancestor_context,
                 verdicts: super::verify::current_verdicts(fleet, node_id),
                 skills: crate::skills_context::for_node(fleet, node_id, "implement"),
+                pull_requests: crate::pr_context::for_node(fleet, node_id),
             },
         )
     }

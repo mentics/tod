@@ -150,6 +150,9 @@ pub enum DynamicBlock {
     /// The variables and credentials defined for the node the work is on
     /// (pre-rendered; see `crate::environment_context`). Omitted when none.
     Environment,
+    /// The pull requests linked to the node the work is on, as links
+    /// (pre-rendered; see `crate::pr_context`). Omitted when none.
+    PullRequests,
     /// The skills the user chose for the phase the agent is working in
     /// (pre-rendered; see `crate::skills_context`). Omitted when none.
     ConfiguredSkills,
@@ -179,6 +182,7 @@ pub struct DynamicContext<'a> {
     pub incoming: &'a [IncomingChangeItem],
     pub environment: &'a str,
     pub skills: &'a str,
+    pub pull_requests: &'a str,
     pub visual_design: Option<&'a VisualDesignState>,
 }
 
@@ -489,6 +493,12 @@ fn render_block(block: DynamicBlock, ctx: &DynamicContext<'_>, out: &mut String)
         DynamicBlock::Environment => {
             if !ctx.environment.is_empty() {
                 out.push_str(ctx.environment);
+            }
+        }
+
+        DynamicBlock::PullRequests => {
+            if !ctx.pull_requests.is_empty() {
+                out.push_str(ctx.pull_requests);
             }
         }
 

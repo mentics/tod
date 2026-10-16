@@ -114,6 +114,7 @@ pub const VISUAL_DESIGN: ContextRecipe = ContextRecipe {
     ],
     blocks: &[
         DynamicBlock::DataRoot,
+        DynamicBlock::PullRequests,
         DynamicBlock::Focus,
         DynamicBlock::AncestorContext,
         DynamicBlock::VisualDesign,
@@ -150,6 +151,7 @@ pub const IMPLEMENT_SESSION: ContextRecipe = ContextRecipe {
     blocks: &[
         DynamicBlock::WorkingDirectory,
         DynamicBlock::DataRoot,
+        DynamicBlock::PullRequests,
         DynamicBlock::Node,
         DynamicBlock::Plan,
         DynamicBlock::NodeObligations {
@@ -213,6 +215,7 @@ pub const REVIEW_SESSION: ContextRecipe = ContextRecipe {
     blocks: &[
         DynamicBlock::WorkingDirectory,
         DynamicBlock::DataRoot,
+        DynamicBlock::PullRequests,
         DynamicBlock::Node,
         DynamicBlock::NodeObligations {
             note: OWN_OBLIGATIONS_NOTE,
@@ -274,6 +277,7 @@ pub const FIX_SESSION: ContextRecipe = ContextRecipe {
     blocks: &[
         DynamicBlock::WorkingDirectory,
         DynamicBlock::DataRoot,
+        DynamicBlock::PullRequests,
         DynamicBlock::Node,
         DynamicBlock::ReviewFindings,
         DynamicBlock::Plan,
@@ -311,6 +315,7 @@ pub const PHASE: ContextRecipe = ContextRecipe {
     ],
     blocks: &[
         DynamicBlock::DataRoot,
+        DynamicBlock::PullRequests,
         DynamicBlock::Node,
         DynamicBlock::NodeProcessFields,
         DynamicBlock::NodeObligations {
@@ -368,6 +373,7 @@ pub const FLEET_AUTONOMOUS: ContextRecipe = ContextRecipe {
     ],
     blocks: &[
         DynamicBlock::DataRoot,
+        DynamicBlock::PullRequests,
         DynamicBlock::Node,
         DynamicBlock::Workspace,
     ],
@@ -420,6 +426,7 @@ pub const CONVERSATION: ContextRecipe = ContextRecipe {
     ],
     blocks: &[
         DynamicBlock::DataRoot,
+        DynamicBlock::PullRequests,
         DynamicBlock::Focus,
         DynamicBlock::Environment,
     ],
@@ -448,6 +455,7 @@ pub const CHAT: ContextRecipe = ContextRecipe {
     ],
     blocks: &[
         DynamicBlock::DataRoot,
+        DynamicBlock::PullRequests,
         DynamicBlock::Focus,
         DynamicBlock::Environment,
     ],
@@ -473,6 +481,7 @@ pub const INCOMING_CHANGES: ContextRecipe = ContextRecipe {
     ],
     blocks: &[
         DynamicBlock::DataRoot,
+        DynamicBlock::PullRequests,
         DynamicBlock::Node,
         DynamicBlock::IncomingChanges,
         DynamicBlock::NodeObligations {
@@ -738,6 +747,24 @@ mod tests {
             assert!(
                 recipe.blocks.contains(&DynamicBlock::DataRoot),
                 "{} documents tod-cli but never renders the data root",
+                recipe.name
+            );
+        }
+    }
+
+    /// A node sent back after its pull request was opened is still about it,
+    /// so every surface that works on a node or a focus is shown its links.
+    #[test]
+    fn every_node_surface_renders_the_linked_pull_requests() {
+        for recipe in ALL_RECIPES {
+            let on_a_node = recipe.blocks.contains(&DynamicBlock::Node)
+                || recipe.blocks.contains(&DynamicBlock::Focus);
+            if !on_a_node {
+                continue;
+            }
+            assert!(
+                recipe.blocks.contains(&DynamicBlock::PullRequests),
+                "{} works on a node but never renders its pull requests",
                 recipe.name
             );
         }

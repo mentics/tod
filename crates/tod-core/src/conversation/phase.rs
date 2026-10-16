@@ -108,6 +108,7 @@ fn build_request<'a>(
         plan_steps,
         work_history,
         skills: crate::skills_context::for_node(fleet, node, from),
+        pull_requests: crate::pr_context::for_node(fleet, node),
         from_state: from.to_string(),
         to_state: to.to_string(),
         criteria,

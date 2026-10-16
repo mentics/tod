@@ -193,9 +193,11 @@ pub fn opening_message(
         slug: Some(node.slug),
     };
     let plan_steps = crate::conversation::implement::plan_steps(fleet, node_id);
+    let pull_requests = crate::pr_context::for_node(fleet, node_id);
     let ctx = DynamicContext {
         data_root: Some(data_root),
         node: Some(&selection),
+        pull_requests: &pull_requests,
         obligations: &obligations,
         plan_steps: &plan_steps,
         incoming: &incoming,

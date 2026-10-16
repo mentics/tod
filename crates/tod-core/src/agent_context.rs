@@ -81,6 +81,8 @@ pub struct ImplementRequest<'a> {
     /// The skills block for the phase this session works in
     /// (`crate::skills_context`); empty when none are configured.
     pub skills: String,
+    /// The node's linked pull requests (`crate::pr_context`); empty when none.
+    pub pull_requests: String,
 }
 
 /// Build the full implementation-session first message.
@@ -166,6 +168,7 @@ fn build_plan_session_message_with(
             plan_steps: &request.plan_steps,
             verdicts: &request.verdicts,
             skills: &request.skills,
+            pull_requests: &request.pull_requests,
             findings,
             ..Default::default()
         },

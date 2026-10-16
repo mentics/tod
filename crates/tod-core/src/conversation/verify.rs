@@ -120,6 +120,7 @@ impl Protocol for VerificationProtocol {
                 ancestor_context,
                 verdicts: current_verdicts(fleet, node_id),
                 skills: crate::skills_context::for_node(fleet, node_id, "verify"),
+                pull_requests: crate::pr_context::for_node(fleet, node_id),
             },
             &role_doc,
         )

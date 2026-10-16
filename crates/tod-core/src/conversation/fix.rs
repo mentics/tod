@@ -135,6 +135,7 @@ impl Protocol for FixProtocol {
                 ancestor_context,
                 verdicts: super::verify::current_verdicts(fleet, node_id),
                 skills: crate::skills_context::for_node(fleet, node_id, "fix"),
+                pull_requests: crate::pr_context::for_node(fleet, node_id),
             },
             &open_findings(fleet, node_id),
         )

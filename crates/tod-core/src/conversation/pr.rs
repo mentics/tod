@@ -137,6 +137,7 @@ impl Protocol for PrProtocol {
                 ancestor_context,
                 verdicts: super::verify::current_verdicts(fleet, node_id),
                 skills: crate::skills_context::for_node(fleet, node_id, "pr"),
+                pull_requests: crate::pr_context::for_node(fleet, node_id),
             },
             &role_doc,
         )

@@ -114,6 +114,13 @@ pub fn build_fleet_agent_prompt(
         cwd: cwd.display().to_string(),
         notes: task.notes.iter().map(|n| n.text.clone()).collect(),
     };
+    let links: Vec<&str> = task
+        .linked_prs
+        .iter()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty())
+        .collect();
+    let pull_requests = crate::pr_context::render_links(&links);
     context_recipes::build_message(
         media,
         &FLEET_AUTONOMOUS,
@@ -122,6 +129,7 @@ pub fn build_fleet_agent_prompt(
             data_root: Some(data_root),
             node: Some(&node),
             workspace: Some(&workspace),
+            pull_requests: &pull_requests,
             ..Default::default()
         },
         "\n## Instruction\n\n\
