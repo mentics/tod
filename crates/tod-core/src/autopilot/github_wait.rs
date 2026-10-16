@@ -51,7 +51,11 @@ impl Autopilot {
         };
         // The first pull request not merged (or not released) yet.
         let mut pending: Option<(&NodePr, String)> = None;
+        // Where each pull request stands, named in the wait so the person
+        // can see what holds the node up and what does not.
+        let mut standing: Vec<String> = Vec::new();
         for pr in &links.prs {
+            let label = crate::pr_readiness::pr_label(pr);
             let merge = match feed.merge(pr) {
                 Ok(merge) => merge,
                 Err(err) => {
@@ -64,10 +68,12 @@ impl Autopilot {
                     // `approved` was left without the merge: the gate says so.
                     return Ok(None);
                 }
+                standing.push(format!("{label} not merged"));
                 pending.get_or_insert((pr, format!("{} to be merged", pr.url)));
                 continue;
             }
             if !releasing {
+                standing.push(format!("{label} merged"));
                 continue;
             }
             let releases = match feed.releases(pr) {
@@ -80,8 +86,10 @@ impl Autopilot {
             match release_carrying(pr, &merge, &releases) {
                 Some(release) => {
                     tracing::info!(node = %self.node, pr = %pr.url, tag = %release.tag, "release found");
+                    standing.push(format!("{label} released in {}", release.tag));
                 }
                 None => {
+                    standing.push(format!("{label} merged, no release names it yet"));
                     pending.get_or_insert((pr, format!("a release whose notes name {}", pr.url)));
                 }
             }
@@ -101,6 +109,7 @@ impl Autopilot {
         let spec = if releasing { RELEASE_WAIT_SPEC.to_string() } else { merge_wait_spec(pr.pr_number) };
         let replaces = if releasing { "github:release:" } else { "github:pr:" };
         let due_at_ms = self.record_github_wait(fleet, spec, replaces, &settings)?;
+        let what = if standing.len() > 1 { format!("{what} ({})", standing.join("; ")) } else { what };
         Ok(Some(Outcome::Waiting { what, due_at_ms }))
     }
 

@@ -1065,6 +1065,40 @@ pub struct LivePr {
     pub fingerprint: String,
 }
 
+/// `owner/repo#number`: how a pull request is named in a status line.
+pub fn pr_label(pr: &tod_store::github::NodePr) -> String {
+    format!("{}/{}#{}", pr.owner, pr.repo, pr.pr_number)
+}
+
+impl LivePr {
+    /// Where the pull request stands, in words: `merged`, `draft`, or the
+    /// people's review (`approved`, `awaiting review`, `changes requested`),
+    /// then anything else it is waiting for.
+    pub fn status(&self) -> String {
+        if self.assessment.merged {
+            return "merged".to_string();
+        }
+        let mut parts = vec![if self.draft {
+            "draft"
+        } else {
+            match self.assessment.human_review {
+                HumanReview::Approved => "approved",
+                HumanReview::Pending => "awaiting review",
+                HumanReview::ChangesRequested { .. } => "changes requested",
+            }
+        }
+        .to_string()];
+        for wait in self.assessment.waits() {
+            match wait {
+                Wait::BotReview { bot, .. } => parts.push(format!("waiting for {bot} review")),
+                Wait::ChecksRunning => parts.push("checks running".to_string()),
+                Wait::GitHub | Wait::HumanReview => {}
+            }
+        }
+        parts.join(", ")
+    }
+}
+
 /// Every linked pull request, read and assessed. `Err` says why one could
 /// not be read (no credentials, GitHub down): the caller leaves that to the
 /// gate, which reports it.
