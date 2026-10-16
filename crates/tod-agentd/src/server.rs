@@ -261,6 +261,10 @@ fn execute(shared: &Shared, command: Command) -> Response {
             shared.runners.pause(node);
             Response::ok()
         }
+        Command::RunnerPollNow { node } => {
+            shared.runners.poll_now(node);
+            Response::ok()
+        }
         Command::RunnerStop { node } => {
             shared.runners.stop_now(node);
             Response::ok()

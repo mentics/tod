@@ -128,6 +128,11 @@ impl DaemonWriter {
         Ok(())
     }
 
+    pub fn runner_poll_now(&self, node: Uuid) -> Result<()> {
+        self.call(Command::RunnerPollNow { node })?;
+        Ok(())
+    }
+
     pub fn runner_stop(&self, node: Uuid) -> Result<()> {
         self.call(Command::RunnerStop { node })?;
         Ok(())

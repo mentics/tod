@@ -188,6 +188,8 @@ enum RunnerAction {
     ResumeFreshBudget,
     Pause,
     StopNow,
+    /// Read GitHub now instead of at the scheduled time.
+    PollNow,
     /// Stop a conversation the user started by hand.
     StopTurn,
     RunInCloud,
@@ -209,6 +211,7 @@ impl RunnerAction {
             Self::ResumeFreshBudget => "Resume with a fresh budget",
             Self::Pause => "Pause",
             Self::StopNow => "Stop now",
+            Self::PollNow => "Poll now",
             Self::StopTurn => "Stop",
             Self::RunInCloud => "Run in the cloud",
             Self::MoveToCloud => "Move to the cloud",
@@ -694,7 +697,11 @@ impl TaskPanel {
             let pausing = runners.is_pausing(node);
             return RunnerActions {
                 primary: Some((A::Pause, if pausing { "Pausing…" } else { A::Pause.label() }, pausing)),
-                menu: vec![A::StopNow],
+                menu: if matches!(status, RunnerStatus::Running { next_poll_ms: Some(_), .. }) && !pausing {
+                    vec![A::PollNow, A::StopNow]
+                } else {
+                    vec![A::StopNow]
+                },
             };
         }
         if status.is_running() {
@@ -715,7 +722,7 @@ impl TaskPanel {
                 menu: vec![A::StartHere],
             };
         }
-        match runners.outcome(node) {
+        let mut actions = match runners.outcome(node) {
             Some(Outcome::BudgetExhausted { .. }) => RunnerActions {
                 primary: Some((A::ResumeFreshBudget, A::ResumeFreshBudget.label(), false)),
                 menu: vec![A::MoveToCloud],
@@ -728,7 +735,12 @@ impl TaskPanel {
                 primary: Some((A::Start, A::Start.label(), false)),
                 menu: vec![A::MoveToCloud],
             },
+        };
+        // Only with a scheduled GitHub look to bring forward.
+        if matches!(status, RunnerStatus::Awaiting { .. }) {
+            actions.menu.insert(0, A::PollNow);
         }
+        actions
     }
 
     /// The journey's snapshot of the split button and the line beside it.
@@ -781,6 +793,15 @@ impl TaskPanel {
             }
             A::Pause => self.runners.update(cx, |r, cx| r.pause(node, cx)),
             A::StopNow => self.runners.update(cx, |r, cx| r.stop_now(node, cx)),
+            // A run polling reads GitHub at once; one that ended to wait is
+            // started again, which reads it first thing.
+            A::PollNow => {
+                if self.runners.read(cx).is_running(node) {
+                    self.runners.update(cx, |r, cx| r.poll_now(node, cx));
+                } else {
+                    let _ = self.runners.update(cx, |r, cx| r.start(node, false, cx));
+                }
+            }
             A::StopTurn => {
                 if let Some(slot) = slot {
                     self.stop_runner(slot, cx);

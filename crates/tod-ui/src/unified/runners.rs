@@ -74,6 +74,15 @@ impl Host {
         }
     }
 
+    fn poll_now(&self, node: Uuid) {
+        match self {
+            Host::Daemon(daemon) => {
+                let _ = daemon.runner_poll_now(node);
+            }
+            Host::Local(runners) => runners.poll_now(node),
+        }
+    }
+
     fn stop_now(&self, node: Uuid) {
         match self {
             Host::Daemon(daemon) => {
@@ -233,6 +242,14 @@ impl NodeRunners {
             let host = self.host.clone();
             cx.background_executor().spawn(async move { host.pause(node) }).detach();
             cx.notify();
+        }
+    }
+
+    /// Read GitHub now for a run polling it.
+    pub fn poll_now(&mut self, node: Uuid, cx: &mut Context<Self>) {
+        if self.is_running(node) {
+            let host = self.host.clone();
+            cx.background_executor().spawn(async move { host.poll_now(node) }).detach();
         }
     }
 

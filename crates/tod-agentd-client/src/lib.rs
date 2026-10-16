@@ -137,6 +137,8 @@ pub enum Command {
     RunnerStart { node: Uuid, renew_budget: bool },
     /// Stop a node's run once the agent's turn ends.
     RunnerPause { node: Uuid },
+    /// Read GitHub now, for a run waiting on it.
+    RunnerPollNow { node: Uuid },
     /// Cancel the turn in flight and stop.
     RunnerStop { node: Uuid },
     /// Every node's runner state, as the `value` (a list of `RunnerState`).

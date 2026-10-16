@@ -220,6 +220,13 @@ impl Runners {
         self.inner.publish(node);
     }
 
+    /// Read GitHub now, for a run that is waiting on it.
+    pub fn poll_now(&self, node: Uuid) {
+        if let Some(run) = self.inner.slots.lock().expect("runner slots").get(&node).and_then(|s| s.run.as_ref()) {
+            run.poll_now();
+        }
+    }
+
     /// Cancel the turn in flight and stop.
     pub fn stop_now(&self, node: Uuid) {
         if let Some(run) = self.inner.slots.lock().expect("runner slots").get(&node).and_then(|s| s.run.as_ref()) {

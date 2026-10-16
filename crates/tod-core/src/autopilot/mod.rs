@@ -129,6 +129,12 @@ pub trait StepHook {
     /// agent is working: `Some(what)` while it waits, `None` when it stops.
     /// `next_poll_ms` is when GitHub is read again (ms since the epoch).
     fn waiting(&mut self, _on: Option<&str>, _next_poll_ms: Option<i64>) {}
+
+    /// The user asked to read GitHub now rather than at the scheduled time.
+    /// Returns true once per ask.
+    fn poll_requested(&mut self) -> bool {
+        false
+    }
 }
 
 /// No hook: never stops.
@@ -773,6 +779,9 @@ impl Autopilot {
         while start.elapsed() < interval {
             if let Some(reason) = hook.at(fleet, Boundary::Step)? {
                 stop = Some(reason);
+                break;
+            }
+            if hook.poll_requested() {
                 break;
             }
             std::thread::sleep(slice);

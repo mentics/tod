@@ -105,6 +105,8 @@ pub enum LocalEvent {
 pub struct LocalRun {
     node: Uuid,
     request: Arc<AtomicU8>,
+    /// Set by [`Self::poll_now`]; the run clears it when it reads GitHub.
+    poll: Arc<std::sync::atomic::AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -140,12 +142,15 @@ impl LocalRun {
         crate::linear_sync::push(&fleet, node, crate::linear_sync::Milestone::Started);
         let data_root = config.data_root.clone();
         let hook_request = request.clone();
+        let poll_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let hook_poll = poll_flag.clone();
         let thread = std::thread::Builder::new()
             .name(format!("autopilot-{node}"))
             .spawn(move || {
                 let mut hook = Hook {
                     node,
                     request: hook_request,
+                    poll: hook_poll,
                     on_event: &mut on_event,
                     last: None,
                     last_at: None,
@@ -182,6 +187,7 @@ impl LocalRun {
         Ok(Self {
             node,
             request,
+            poll: poll_flag,
             thread: Some(thread),
         })
     }
@@ -198,6 +204,12 @@ impl LocalRun {
             Ordering::SeqCst,
             Ordering::SeqCst,
         );
+    }
+
+    /// Read GitHub now instead of waiting for the next scheduled poll. Does
+    /// nothing unless the run is waiting on GitHub.
+    pub fn poll_now(&self) {
+        self.poll.store(true, Ordering::SeqCst);
     }
 
     /// Cancel the turn in flight and stop.
@@ -225,6 +237,7 @@ impl LocalRun {
 struct Hook<'a, F: FnMut(LocalEvent)> {
     node: Uuid,
     request: Arc<AtomicU8>,
+    poll: Arc<std::sync::atomic::AtomicBool>,
     on_event: &'a mut F,
     /// The last [`Live`] reported, so an unchanged one is not sent again.
     last: Option<Live>,
@@ -304,6 +317,10 @@ impl<F: FnMut(LocalEvent)> StepHook for Hook<'_, F> {
                 next_poll_ms,
             });
         }
+    }
+
+    fn poll_requested(&mut self) -> bool {
+        self.poll.swap(false, Ordering::SeqCst)
     }
 
     fn watch(&mut self, turn: Turn<'_>) -> Option<String> {
