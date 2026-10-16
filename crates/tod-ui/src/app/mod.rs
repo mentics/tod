@@ -5,6 +5,7 @@ mod data_root_setup;
 mod fleet_blocked;
 mod github_token;
 mod history_window;
+mod http;
 mod log_window;
 pub(crate) mod no_focus;
 pub mod transcript_window;
@@ -96,7 +97,10 @@ fn register_app_lifecycle(cx: &mut gpui::App) {
 
 impl App {
     pub fn run(opts: LaunchOptions, needs_data_root_setup: bool) {
-        let app = gpui_platform::application().with_assets(assets::AppAssets);
+        let app = gpui_platform::application().with_assets(assets::AppAssets)
+            .with_http_client(std::sync::Arc::new(
+                http::ReqwestHttpClient::new().expect("starting the HTTP client for remote images"),
+            ));
 
         app.run(move |cx| {
             gpui_component::init(cx);
