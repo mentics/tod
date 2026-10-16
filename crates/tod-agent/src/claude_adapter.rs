@@ -318,7 +318,29 @@ pub fn update_global() -> Result<Option<InstalledAdapter>> {
         npm(&["install", "-g", &format!("{PACKAGE}@latest")]),
         "Updating the global Claude ACP adapter",
     )?;
-    Ok(find())
+    let found = find();
+    // npm's global prefix can differ from where `claude-agent-acp` on PATH
+    // points (a version manager's shim into an older Node's directory), so
+    // the install succeeds yet the adapter tod runs does not change.
+    let root = run(npm(&["root", "-g"]), "Asking npm where global packages go")?;
+    let package_path: PathBuf = PACKAGE.split('/').collect();
+    let manifest = Path::new(root.lines().last().unwrap_or("").trim())
+        .join(&package_path)
+        .join("package.json");
+    if let (Some(installed), Some(InstalledAdapter { bin, version: Some(running), .. })) =
+        (package_version(&manifest), &found)
+    {
+        if version_less(running, &installed) {
+            bail!(
+                "npm installed {installed} in {}, but {} (the adapter tod runs) is still {running}. \
+                 It points into a different Node installation than npm now uses; relink it, or \
+                 install the adapter for tod only in Settings → Agents.",
+                manifest.parent().map(|p| p.display().to_string()).unwrap_or_default(),
+                bin.display(),
+            );
+        }
+    }
+    Ok(found)
 }
 
 /// Update tod's own install when there is one and the registry has a newer
