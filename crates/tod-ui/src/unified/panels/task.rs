@@ -23,7 +23,7 @@
 use std::sync::Arc;
 
 use gpui::{
-    AnyElement, App, Context, EventEmitter, FocusHandle, Focusable, InteractiveElement,
+    AnyElement, App, ScrollHandle, Context, EventEmitter, FocusHandle, Focusable, InteractiveElement,
     IntoElement, MouseButton, MouseDownEvent, ParentElement, Render, SharedString,
     StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder,
 };
@@ -39,6 +39,7 @@ use gpui::{ElementId, Entity, Subscription};
 use gpui_component::Sizable as _;
 use gpui_component::Disableable as _;
 use gpui_component::button::Button;
+use gpui_component::scroll::Scrollbar;
 use tod_core::conversation::{ConversationStatus, SharedAgentAccess};
 use tod_core::runner_status::{RunnerStatus, format_elapsed, format_tokens};
 use tod_core::autopilot::Outcome;
@@ -284,6 +285,12 @@ pub struct TaskPanel {
     _requests_subs: Vec<Subscription>,
     /// T5: whether the Answered drawer is open; kept for the session only.
     pub(crate) answered_open: bool,
+    /// Scroll state of the header (its runner line can carry a long error), of
+    /// the requests, and of the Answered list; each shows a scrollbar only
+    /// when its content overflows.
+    header_scroll: ScrollHandle,
+    requests_scroll: ScrollHandle,
+    answered_scroll: ScrollHandle,
 }
 
 impl HasChangesWatch for TaskPanel {
@@ -364,6 +371,9 @@ impl TaskPanel {
             requests,
             _requests_subs,
             answered_open: false,
+            header_scroll: ScrollHandle::new(),
+            requests_scroll: ScrollHandle::new(),
+            answered_scroll: ScrollHandle::new(),
             header,
             pending_refresh: false,
             changes,
@@ -1173,15 +1183,14 @@ impl TaskPanel {
                 )
                 .when_some(entries, |el, entries| {
                     el.child(
-                        div()
-                            .id("unified-task-answered-list")
-                            .max_h(gpui::px(320.))
-                            .overflow_y_scroll()
-                            .px_3()
-                            .child(entries)
-                            .when(count == 0, |el| {
+                        scroll_with_bar(
+                            "unified-task-answered-list",
+                            &self.answered_scroll,
+                            div().px_3().max_h(gpui::px(320.)),
+                            div().px_3().child(entries).when(count == 0, |el| {
                                 el.child(div().text_xs().text_color(muted).pb_2().child("No answers yet."))
                             }),
+                        )
                     )
                 })
                 .into_any_element(),
@@ -1210,6 +1219,39 @@ impl Focusable for TaskPanel {
     }
 }
 
+/// `content` in a vertical scroll area with a scrollbar that appears only when
+/// it overflows. `frame` carries the sizing (its max height or flex).
+fn scroll_with_bar(
+    id: &'static str,
+    handle: &ScrollHandle,
+    frame: gpui::Div,
+    content: impl IntoElement,
+) -> AnyElement {
+    frame
+        .id(id)
+        .relative()
+        .w_full()
+        .child(
+            div()
+                .id(SharedString::from(format!("{id}-scroll")))
+                .size_full()
+                .max_h_full()
+                .overflow_y_scroll()
+                .track_scroll(handle)
+                .child(content),
+        )
+        .child(
+            div()
+                .absolute()
+                .top_0()
+                .right_0()
+                .bottom_0()
+                .left_0()
+                .child(Scrollbar::vertical(handle)),
+        )
+        .into_any_element()
+}
+
 impl Render for TaskPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if self.pending_refresh {
@@ -1228,27 +1270,29 @@ impl Render for TaskPanel {
             .flex()
             .flex_col()
             .size_full()
-            // Fixed header: identity, artifacts, runner.
-            .child(
+            // Header: identity, artifacts, runner. It never takes more than
+            // half the panel (a failed run's error can be pages long) and
+            // scrolls past that.
+            .child(scroll_with_bar(
+                "unified-task-header",
+                &self.header_scroll,
+                div().flex_none().max_h_1_2(),
                 div()
                     .flex()
                     .flex_col()
                     .gap_2()
                     .p_3()
-                    .flex_none()
                     .child(identity)
                     .child(artifacts)
                     .children(runner),
-            )
+            ))
             // Requests scroll; the drawer stays at the bottom.
-            .child(
-                div()
-                    .id("unified-task-requests")
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .children(requests),
-            )
+            .child(scroll_with_bar(
+                "unified-task-requests",
+                &self.requests_scroll,
+                div().flex_1().min_h_0(),
+                div().children(requests),
+            ))
             .children(drawer)
     }
 }

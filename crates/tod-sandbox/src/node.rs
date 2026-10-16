@@ -530,8 +530,8 @@ pub fn checkout_script(repo_url: &str, branch: &str, identity: &GitIdentity, all
     format!(
         "set -e\n\
          if [ -n \"$SSL_CERT_FILE\" ]; then git config --system http.sslCAInfo \"$SSL_CERT_FILE\"; fi\n\
-         if [ -d {clone_dir}/.git ]; then dir={clone_dir}; git -C \"$dir\" fetch origin; \
-         elif [ -d {forked_dir}/.git ]; then dir={forked_dir}; git -C \"$dir\" fetch origin; \
+         if [ -d {clone_dir}/.git ]; then dir={clone_dir}; git -C \"$dir\" fetch --quiet origin; \
+         elif [ -d {forked_dir}/.git ]; then dir={forked_dir}; git -C \"$dir\" fetch --quiet origin; \
          else {missing}; fi\n\
          cd \"$dir\"\n\
          git config user.name {name}\n\
@@ -619,7 +619,12 @@ pub fn start(bx: &Blaxel, url: &str, payload: &NodePayload, allow_clone: bool, p
     progress(&format!("checking out {}…", payload.branch));
     let res = bx.run(url, &format!("sh -c {} 2>&1", shell_quote(&checkout_script(payload.repo_url, payload.branch, payload.git_identity, allow_clone))), 600)?;
     if res.exit_code != 0 {
-        bail!("checking out {} failed (exit {}): {}", payload.branch, res.exit_code, res.output());
+        // git's own message is the last lines; a long ref listing before it
+        // must not hide it.
+        let out = res.output();
+        let lines: Vec<&str> = out.lines().collect();
+        let tail = lines[lines.len().saturating_sub(30)..].join("\n");
+        bail!("checking out {} failed (exit {}): {}", payload.branch, res.exit_code, tail);
     }
 
     // Restarted, so it runs the binary just installed.
@@ -1197,7 +1202,7 @@ mod tests {
         let s = checkout_script("https://github.com/o/r.git", "feat/x", &me, false);
         assert!(!s.contains("git clone"), "{s}");
         // The golden's own checkout is fetched and used where the clone would be.
-        assert!(s.contains("elif [ -d /workspace/.git ]; then dir=/workspace; git -C \"$dir\" fetch origin"), "{s}");
+        assert!(s.contains("elif [ -d /workspace/.git ]; then dir=/workspace; git -C \"$dir\" fetch --quiet origin"), "{s}");
         // With neither, it fails loudly instead.
         assert!(s.contains("has no repository\" >&2; exit 1"), "{s}");
         assert!(checkout_script("https://github.com/o/r.git", "feat/x", &me, true).contains("git clone"));
