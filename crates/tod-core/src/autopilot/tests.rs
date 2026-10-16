@@ -1062,3 +1062,32 @@ fn a_repository_that_does_not_release_is_not_waited_on_for_one() {
     let outcome = autopilot(&fx, Budget::default()).run(&fx.fleet, &mut agent).unwrap();
     assert_eq!(outcome, Outcome::Done, "{outcome:?}");
 }
+
+#[test]
+fn check_now_records_where_each_pull_request_stands_with_no_run() {
+    let fx = bare();
+    retire_outside_criteria(&fx);
+    let github = AfterReview::new();
+    github.merged.store(true, std::sync::atomic::Ordering::SeqCst);
+    crate::pr_readiness::set_feed_override(Some(github.clone()));
+    linked_to_prs(
+        &fx,
+        "merged",
+        &["https://github.com/acme/app/pull/42", "https://github.com/acme/infra/pull/7"],
+    );
+
+    let found = super::check_now(&fx.fleet, fx.node, &fx.root).unwrap();
+    let super::GithubCheck::Waiting { what, .. } = found else {
+        panic!("expected Waiting, got {found:?}");
+    };
+    assert!(what.contains("acme/app#42 merged, no release names it yet"), "{what}");
+    assert_eq!(pending_specs(&fx), ["github:release:published"]);
+    let waits = fx.fleet.read(|conn| tod_store::waits::WaitRepo::new(conn).list_pending_for_node(fx.node)).unwrap();
+    assert_eq!(crate::runner_status::github_wait(&waits).unwrap().0, what);
+
+    // Both released: nothing left, and the wait is gone.
+    *github.notes.lock().unwrap() = Some("* Add the widget in #42\n* Apply the infra change in #7".into());
+    let found = super::check_now(&fx.fleet, fx.node, &fx.root).unwrap();
+    assert_eq!(found, super::GithubCheck::Clear);
+    assert!(pending_specs(&fx).is_empty());
+}

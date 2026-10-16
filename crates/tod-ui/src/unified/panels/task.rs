@@ -191,6 +191,9 @@ enum RunnerAction {
     StopNow,
     /// Read GitHub now instead of at the scheduled time.
     PollNow,
+    /// Read the node's pull requests now and record where each stands, with
+    /// no run: works wherever the node runs.
+    CheckNow,
     /// Stop a conversation the user started by hand.
     StopTurn,
     RunInCloud,
@@ -213,6 +216,7 @@ impl RunnerAction {
             Self::Pause => "Pause",
             Self::StopNow => "Stop now",
             Self::PollNow => "Poll now",
+            Self::CheckNow => "Check now",
             Self::StopTurn => "Stop",
             Self::RunInCloud => "Run in the cloud",
             Self::MoveToCloud => "Move to the cloud",
@@ -688,6 +692,16 @@ impl TaskPanel {
 
     /// What the split button offers for `status`.
     fn runner_actions(&self, status: &RunnerStatus, cx: &App) -> RunnerActions {
+        let mut actions = self.runner_actions_for_place(status, cx);
+        // A scheduled GitHub look can be brought forward wherever the node
+        // runs (here, in a dev container, in a cloud sandbox).
+        if matches!(status, RunnerStatus::Awaiting { .. }) && !actions.menu.contains(&RunnerAction::PollNow) {
+            actions.menu.insert(0, RunnerAction::CheckNow);
+        }
+        actions
+    }
+
+    fn runner_actions_for_place(&self, status: &RunnerStatus, cx: &App) -> RunnerActions {
         use RunnerAction as A;
         let runners = self.runners.read(cx);
         let node = self.node_id;
@@ -740,7 +754,7 @@ impl TaskPanel {
                 menu: vec![A::StartHere],
             };
         }
-        let mut actions = match runners.outcome(node) {
+        match runners.outcome(node) {
             Some(Outcome::BudgetExhausted { .. }) => RunnerActions {
                 primary: Some((A::ResumeFreshBudget, A::ResumeFreshBudget.label(), false)),
                 menu: vec![A::MoveToCloud],
@@ -753,12 +767,7 @@ impl TaskPanel {
                 primary: Some((A::Start, A::Start.label(), false)),
                 menu: vec![A::MoveToCloud],
             },
-        };
-        // Only with a scheduled GitHub look to bring forward.
-        if matches!(status, RunnerStatus::Awaiting { .. }) {
-            actions.menu.insert(0, A::PollNow);
         }
-        actions
     }
 
     /// The journey's snapshot of the split button and the line beside it.
@@ -820,6 +829,7 @@ impl TaskPanel {
                     let _ = self.runners.update(cx, |r, cx| r.start(node, false, cx));
                 }
             }
+            A::CheckNow => self.check_now(cx),
             A::StopTurn => {
                 if let Some(slot) = slot {
                     self.stop_runner(slot, cx);
@@ -861,6 +871,38 @@ impl TaskPanel {
             }
         }
         cx.notify();
+    }
+
+    /// "Check now": reads GitHub off the UI thread, records where each pull
+    /// request stands, and says what it found (or why it could not look).
+    fn check_now(&mut self, cx: &mut Context<Self>) {
+        let node = self.node_id;
+        let fleet = self.fleet.clone();
+        let root = fleet.paths().root().to_path_buf();
+        self.runner.cloud_note = Some("Checking GitHub…".to_string());
+        self.runner.cloud_failed = false;
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { tod_core::autopilot::check_now(&fleet, node, &root) })
+                .await;
+            let _ = this.update(cx, |this: &mut TaskPanel, cx| {
+                use tod_core::autopilot::GithubCheck;
+                let (note, failed) = match result {
+                    Ok(GithubCheck::Waiting { what, .. }) => (format!("Checked GitHub: waiting for {what}"), false),
+                    Ok(GithubCheck::Clear) => {
+                        ("Checked GitHub: nothing left to wait for. Start the runner to go on.".to_string(), false)
+                    }
+                    Ok(_) => ("Checked GitHub: this state waits for nothing there.".to_string(), false),
+                    Err(err) => (format!("Could not check GitHub: {err:#}"), true),
+                };
+                this.runner.cloud_note = Some(note);
+                this.runner.cloud_failed = failed;
+                this.refresh_runner(cx);
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// The phase chip: an exceptional, deliberate override, so the menu

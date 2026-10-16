@@ -199,7 +199,7 @@ in `tod_core`, so both sides agree and it can be tested without a clock.
   hour, hourly after, every few hours after a day) and follows a **schedule**:
   a time zone and working hours, with nights pushed to the next window and
   weekends checked rarely.
-- **Check now** (a button) and an incoming event override the schedule.
+- **Check now** (a button) and an incoming event override the schedule. The task panel's Check now is in the runner menu whenever a GitHub look is scheduled, wherever the node runs, and reads GitHub with no run (`autopilot::check_now`).
 - The schedule is in `pr_readiness` in `tod.yml` (per project), with a user
   override. The defaults are for review waits only.
 

@@ -33,97 +33,139 @@ pub fn merge_wait_spec(number: i64) -> String {
     format!("github:pr:{number}:merged")
 }
 
+/// What looking at a node's linked pull requests found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GithubCheck {
+    /// `lifecycle` waits on nothing from GitHub, or there is no pull
+    /// request to ask about.
+    NothingToWaitOn,
+    /// Every pull request is where the state needs it; any open wait is
+    /// cancelled, and the node can go on.
+    Clear,
+    /// Still waiting. `what` says where each pull request stands; the wait
+    /// is recorded, with `what`, due at `due_at_ms`.
+    Waiting { what: String, due_at_ms: i64 },
+    /// GitHub (or the settings) could not be read; nothing was recorded.
+    Unreadable(String),
+}
+
+/// Reads GitHub for the node's linked pull requests as `lifecycle`
+/// (`approved` or `merged`) needs them, and records the wait that results:
+/// what [`Autopilot`] does at the end of a run, and what the task panel's
+/// "Check now" does with no run at all.
+pub fn check_github(
+    fleet: &FleetStore,
+    node: uuid::Uuid,
+    data_root: &std::path::Path,
+    lifecycle: &str,
+) -> Result<GithubCheck> {
+    let releasing = match lifecycle {
+        "approved" => false,
+        "merged" => true,
+        _ => return Ok(GithubCheck::NothingToWaitOn),
+    };
+    let links = fleet.read(|conn| NodePrRepo::new(conn).read(node))?;
+    if links.prs.is_empty() || !links.unrecognized.is_empty() {
+        return Ok(GithubCheck::NothingToWaitOn);
+    }
+    let Some(feed) = crate::pr_readiness::feed_for(data_root) else {
+        return Ok(GithubCheck::Unreadable("GitHub credentials are not set up".to_string()));
+    };
+    // The first pull request not merged (or not released) yet.
+    let mut pending: Option<(&NodePr, String)> = None;
+    // Where each pull request stands, named in the wait so the person can
+    // see what holds the node up and what does not.
+    let mut standing: Vec<String> = Vec::new();
+    let lifecycle_settings = tod_store::TodSettings::load(&tod_store::TodPaths::at(data_root))
+        .map_err(|e| anyhow::anyhow!("settings not readable: {e}"))?
+        .lifecycle;
+    for pr in &links.prs {
+        let label = crate::pr_readiness::pr_label(pr);
+        let merge = match feed.merge(pr) {
+            Ok(merge) => merge,
+            Err(err) => return Ok(GithubCheck::Unreadable(format!("{label} not readable: {err}"))),
+        };
+        if !merge.merged {
+            if releasing {
+                // `approved` was left without the merge: the gate says so.
+                return Ok(GithubCheck::NothingToWaitOn);
+            }
+            standing.push(format!("{label} not merged"));
+            pending.get_or_insert((pr, format!("{} to be merged", pr.url)));
+            continue;
+        }
+        if !releasing {
+            standing.push(format!("{label} merged"));
+            continue;
+        }
+        // A repository that publishes no releases ships when it merges.
+        if lifecycle_settings.profile_for(&pr.owner, &pr.repo) == tod_store::RepoProfile::Merge {
+            standing.push(format!("{label} merged (this repository does not release)"));
+            continue;
+        }
+        let releases = match feed.releases(pr) {
+            Ok(releases) => releases,
+            Err(err) => return Ok(GithubCheck::Unreadable(format!("releases of {label} not readable: {err}"))),
+        };
+        match release_carrying(pr, &merge, &releases) {
+            Some(release) => {
+                tracing::info!(%node, pr = %pr.url, tag = %release.tag, "release found");
+                standing.push(format!("{label} released in {}", release.tag));
+            }
+            None => {
+                standing.push(format!("{label} merged, no release names it yet"));
+                pending.get_or_insert((pr, format!("a release whose notes name {}", pr.url)));
+            }
+        }
+    }
+    let Some((pr, what)) = pending else {
+        // Nothing left to wait for: a wait still open (the merge came
+        // before its deadline) would keep a supervisor asleep on it.
+        let specs: Vec<String> = if releasing {
+            vec![RELEASE_WAIT_SPEC.to_string()]
+        } else {
+            links.prs.iter().map(|pr| merge_wait_spec(pr.pr_number)).collect()
+        };
+        cancel_waits(fleet, node, |spec| specs.iter().any(|s| s == spec))?;
+        return Ok(GithubCheck::Clear);
+    };
+    let settings = crate::pr_readiness::settings_at(data_root);
+    let spec = if releasing { RELEASE_WAIT_SPEC.to_string() } else { merge_wait_spec(pr.pr_number) };
+    let replaces = if releasing { "github:release:" } else { "github:pr:" };
+    let what = if standing.len() > 1 { format!("{what} ({})", standing.join("; ")) } else { what };
+    let due_at_ms = record_github_wait(fleet, node, spec, replaces, &settings, &what)?;
+    Ok(GithubCheck::Waiting { what, due_at_ms })
+}
+
+/// "Check now": reads GitHub for the node in its current state and records
+/// what it found, with no run. Says what it found, or why it could not
+/// look. A node that is now clear is left for the runner to carry on.
+pub fn check_now(fleet: &FleetStore, node: uuid::Uuid, data_root: &std::path::Path) -> Result<GithubCheck> {
+    let lifecycle = fleet
+        .get_node(&node.to_string())?
+        .map(|n| n.lifecycle)
+        .ok_or_else(|| anyhow::anyhow!("node not found"))?;
+    match check_github(fleet, node, data_root, &lifecycle)? {
+        GithubCheck::Unreadable(why) => anyhow::bail!("{why}"),
+        found => Ok(found),
+    }
+}
+
 impl Autopilot {
     /// The wait that `lifecycle` (`approved` or `merged`) calls for, as the
     /// run's end, or `None` when there is nothing to wait for.
     pub(super) fn hold_for_github(&mut self, fleet: &FleetStore, lifecycle: &str) -> Result<Option<Outcome>> {
-        let releasing = match lifecycle {
-            "approved" => false,
-            "merged" => true,
-            _ => return Ok(None),
-        };
-        let links = fleet.read(|conn| NodePrRepo::new(conn).read(self.node))?;
-        if links.prs.is_empty() || !links.unrecognized.is_empty() {
-            return Ok(None);
-        }
-        let Some(feed) = crate::pr_readiness::feed_for(&self.config.data_root) else {
-            return Ok(None);
-        };
-        // The first pull request not merged (or not released) yet.
-        let mut pending: Option<(&NodePr, String)> = None;
-        // Where each pull request stands, named in the wait so the person
-        // can see what holds the node up and what does not.
-        let mut standing: Vec<String> = Vec::new();
-        let lifecycle_settings = tod_store::TodSettings::load(&tod_store::TodPaths::at(&self.config.data_root))
-            .map_err(|e| anyhow::anyhow!("settings not readable: {e}"))?
-            .lifecycle;
-        for pr in &links.prs {
-            let label = crate::pr_readiness::pr_label(pr);
-            let merge = match feed.merge(pr) {
-                Ok(merge) => merge,
-                Err(err) => {
-                    tracing::info!(node = %self.node, %err, "pull request not readable; leaving it to the gate");
-                    return Ok(None);
-                }
-            };
-            if !merge.merged {
-                if releasing {
-                    // `approved` was left without the merge: the gate says so.
-                    return Ok(None);
-                }
-                standing.push(format!("{label} not merged"));
-                pending.get_or_insert((pr, format!("{} to be merged", pr.url)));
-                continue;
+        Ok(match check_github(fleet, self.node, &self.config.data_root, lifecycle)? {
+            GithubCheck::Waiting { what, due_at_ms } => Some(Outcome::Waiting { what, due_at_ms }),
+            GithubCheck::Unreadable(why) => {
+                tracing::info!(node = %self.node, %why, "leaving it to the gate");
+                None
             }
-            if !releasing {
-                standing.push(format!("{label} merged"));
-                continue;
-            }
-            // A repository that publishes no releases ships when it merges.
-            if lifecycle_settings.profile_for(&pr.owner, &pr.repo) == tod_store::RepoProfile::Merge {
-                standing.push(format!("{label} merged (this repository does not release)"));
-                continue;
-            }
-            let releases = match feed.releases(pr) {
-                Ok(releases) => releases,
-                Err(err) => {
-                    tracing::info!(node = %self.node, %err, "releases not readable; leaving it to the gate");
-                    return Ok(None);
-                }
-            };
-            match release_carrying(pr, &merge, &releases) {
-                Some(release) => {
-                    tracing::info!(node = %self.node, pr = %pr.url, tag = %release.tag, "release found");
-                    standing.push(format!("{label} released in {}", release.tag));
-                }
-                None => {
-                    standing.push(format!("{label} merged, no release names it yet"));
-                    pending.get_or_insert((pr, format!("a release whose notes name {}", pr.url)));
-                }
-            }
-        }
-        let Some((pr, what)) = pending else {
-            // Nothing left to wait for: a wait still open (the merge came
-            // before its deadline) would keep a supervisor asleep on it.
-            let specs: Vec<String> = if releasing {
-                vec![RELEASE_WAIT_SPEC.to_string()]
-            } else {
-                links.prs.iter().map(|pr| merge_wait_spec(pr.pr_number)).collect()
-            };
-            self.cancel_waits(fleet, |spec| specs.iter().any(|s| s == spec))?;
-            return Ok(None);
-        };
-        let settings = crate::pr_readiness::settings_at(&self.config.data_root);
-        let spec = if releasing { RELEASE_WAIT_SPEC.to_string() } else { merge_wait_spec(pr.pr_number) };
-        let replaces = if releasing { "github:release:" } else { "github:pr:" };
-        let what = if standing.len() > 1 { format!("{what} ({})", standing.join("; ")) } else { what };
-        let due_at_ms = self.record_github_wait(fleet, spec, replaces, &settings, &what)?;
-        Ok(Some(Outcome::Waiting { what, due_at_ms }))
+            GithubCheck::NothingToWaitOn | GithubCheck::Clear => None,
+        })
     }
 
-    /// Records an `event` wait on `spec`, due at the next scheduled look, in
-    /// place of the node's pending waits whose spec starts with `replaces`
-    /// (the last look's). Returns the deadline, in milliseconds.
+    /// Records an `event` wait on `spec`; see [`record_github_wait`].
     pub(super) fn record_github_wait(
         &self,
         fleet: &FleetStore,
@@ -132,26 +174,40 @@ impl Autopilot {
         settings: &tod_store::PrReadinessSettings,
         detail: &str,
     ) -> Result<i64> {
-        let due_at_ms =
-            crate::wait_cadence::next_check(chrono::Utc::now(), &settings.review_schedule).timestamp_millis();
-        self.cancel_waits(fleet, |old| old.starts_with(replaces))?;
-        fleet
-            .interview(
-                ACTOR,
-                InterviewCommand::RecordWait { node_id: self.node, wait: NewWait::event(spec, due_at_ms).with_detail(detail) },
-            )
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        Ok(due_at_ms)
+        record_github_wait(fleet, self.node, spec, replaces, settings, detail)
     }
+}
 
-    /// Cancels the node's pending waits whose spec `matches`.
-    fn cancel_waits(&self, fleet: &FleetStore, matches: impl Fn(&str) -> bool) -> Result<()> {
-        let old = fleet.read(|conn| WaitRepo::new(conn).list_pending_for_node(self.node))?;
-        for wait in old.iter().filter(|w| matches(&w.match_spec)) {
-            fleet
-                .interview(ACTOR, InterviewCommand::SetWaitState { wait_id: wait.id, state: "cancelled".into() })
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
-        }
-        Ok(())
+/// Records an `event` wait on `spec`, due at the next scheduled look, in
+/// place of the node's pending waits whose spec starts with `replaces`
+/// (the last look's). Returns the deadline, in milliseconds.
+fn record_github_wait(
+    fleet: &FleetStore,
+    node: uuid::Uuid,
+    spec: String,
+    replaces: &str,
+    settings: &tod_store::PrReadinessSettings,
+    detail: &str,
+) -> Result<i64> {
+    let due_at_ms =
+        crate::wait_cadence::next_check(chrono::Utc::now(), &settings.review_schedule).timestamp_millis();
+    cancel_waits(fleet, node, |old| old.starts_with(replaces))?;
+    fleet
+        .interview(
+            ACTOR,
+            InterviewCommand::RecordWait { node_id: node, wait: NewWait::event(spec, due_at_ms).with_detail(detail) },
+        )
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok(due_at_ms)
+}
+
+/// Cancels the node's pending waits whose spec `matches`.
+fn cancel_waits(fleet: &FleetStore, node: uuid::Uuid, matches: impl Fn(&str) -> bool) -> Result<()> {
+    let old = fleet.read(|conn| WaitRepo::new(conn).list_pending_for_node(node))?;
+    for wait in old.iter().filter(|w| matches(&w.match_spec)) {
+        fleet
+            .interview(ACTOR, InterviewCommand::SetWaitState { wait_id: wait.id, state: "cancelled".into() })
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
     }
+    Ok(())
 }
