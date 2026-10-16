@@ -162,6 +162,8 @@ struct RunnerLine {
     /// "this machine", or this machine and the dev container its work is in.
     place: String,
     waiting_since: Option<i64>,
+    /// What the node's pending GitHub wait is for and when it looks next.
+    scheduled: Option<(String, i64)>,
     /// `(slot id, ms)`: the running slot and when it was first seen running.
     run_since: Option<(u64, i64)>,
     /// The status has an elapsed time, so the ticker re-renders each second.
@@ -227,7 +229,10 @@ struct RunnerActions {
 
 /// The node's lifecycle state, how long it has waited on the user, and
 /// whether it runs in the cloud.
-fn load_runner(fleet: &FleetStore, node_id: Uuid) -> (String, Option<i64>, Option<CloudNode>, bool, String) {
+fn load_runner(
+    fleet: &FleetStore,
+    node_id: Uuid,
+) -> (String, Option<i64>, Option<CloudNode>, bool, String, Option<(String, i64)>) {
     let lifecycle = fleet
         .get_node(&node_id.to_string())
         .ok()
@@ -238,6 +243,10 @@ fn load_runner(fleet: &FleetStore, node_id: Uuid) -> (String, Option<i64>, Optio
         .read(|conn| tod_core::attention::for_node(conn, node_id))
         .ok()
         .and_then(|a| a.waiting_since);
+    let scheduled = fleet
+        .read(|conn| tod_store::waits::WaitRepo::new(conn).list_pending_for_node(node_id))
+        .ok()
+        .and_then(|waits| tod_core::runner_status::github_wait(&waits));
     let cloud = tod_core::cloud_sync::cloud_node(fleet, &node_id.to_string());
     let files = fleet.resolve_files_for_node(&node_id.to_string()).ok().flatten();
     let files_in_sandbox = files.as_ref().is_some_and(|files| files.runs_in_sandbox());
@@ -249,7 +258,7 @@ fn load_runner(fleet: &FleetStore, node_id: Uuid) -> (String, Option<i64>, Optio
         },
         None => "this machine".to_string(),
     };
-    (lifecycle, waiting_since, cloud, files_in_sandbox, place)
+    (lifecycle, waiting_since, cloud, files_in_sandbox, place, scheduled)
 }
 
 pub struct TaskPanel {
@@ -553,7 +562,7 @@ impl TaskPanel {
         let fleet = self.fleet.clone();
         let node_id = self.node_id;
         cx.spawn(async move |this, cx| {
-            let (lifecycle, waiting_since, cloud, files_in_sandbox, place) = cx
+            let (lifecycle, waiting_since, cloud, files_in_sandbox, place, scheduled) = cx
                 .background_executor()
                 .spawn(async move { load_runner(&fleet, node_id) })
                 .await;
@@ -561,6 +570,7 @@ impl TaskPanel {
                 if this.node_id == node_id {
                     this.runner.lifecycle = lifecycle;
                     this.runner.waiting_since = waiting_since;
+                    this.runner.scheduled = scheduled;
                     this.runner.cloud = cloud;
                     this.runner.files_in_sandbox = files_in_sandbox;
                     this.runner.place = place;
@@ -639,7 +649,8 @@ impl TaskPanel {
             self.runner.waiting_since,
             slot.as_ref().map(|(_, s)| s),
             self.runner.run_since.map(|(_, at)| at),
-        );
+        )
+        .or_scheduled(self.runner.scheduled.clone());
         (slot.map(|(id, _)| id), status)
     }
 
