@@ -1022,6 +1022,11 @@ fn a_wait_on_several_pull_requests_says_where_each_stands() {
     };
     assert!(what.contains("acme/app#42 released in v1.0.0"), "{what}");
     assert!(what.contains("acme/infra#7 merged, no release names it yet"), "{what}");
+
+    // What the task panel reads back later, with no run in this app.
+    let waits = fx.fleet.read(|conn| tod_store::waits::WaitRepo::new(conn).list_pending_for_node(fx.node)).unwrap();
+    let (shown, _) = crate::runner_status::github_wait(&waits).expect("a scheduled look");
+    assert_eq!(shown, what);
 }
 
 #[test]

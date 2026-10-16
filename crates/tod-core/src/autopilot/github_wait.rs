@@ -116,8 +116,8 @@ impl Autopilot {
         let settings = crate::pr_readiness::settings_at(&self.config.data_root);
         let spec = if releasing { RELEASE_WAIT_SPEC.to_string() } else { merge_wait_spec(pr.pr_number) };
         let replaces = if releasing { "github:release:" } else { "github:pr:" };
-        let due_at_ms = self.record_github_wait(fleet, spec, replaces, &settings)?;
         let what = if standing.len() > 1 { format!("{what} ({})", standing.join("; ")) } else { what };
+        let due_at_ms = self.record_github_wait(fleet, spec, replaces, &settings, &what)?;
         Ok(Some(Outcome::Waiting { what, due_at_ms }))
     }
 
@@ -130,6 +130,7 @@ impl Autopilot {
         spec: String,
         replaces: &str,
         settings: &tod_store::PrReadinessSettings,
+        detail: &str,
     ) -> Result<i64> {
         let due_at_ms =
             crate::wait_cadence::next_check(chrono::Utc::now(), &settings.review_schedule).timestamp_millis();
@@ -137,7 +138,7 @@ impl Autopilot {
         fleet
             .interview(
                 ACTOR,
-                InterviewCommand::RecordWait { node_id: self.node, wait: NewWait::event(spec, due_at_ms) },
+                InterviewCommand::RecordWait { node_id: self.node, wait: NewWait::event(spec, due_at_ms).with_detail(detail) },
             )
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         Ok(due_at_ms)

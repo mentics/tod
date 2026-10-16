@@ -452,6 +452,7 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
         // When the orchestrator found a cloud node's sandbox gone
         // (`crate::cloud_nodes::mark_lost`); synced with the rest of the row.
         crate::cloud_nodes::add_lost_at(conn)?;
+    crate::waits::add_detail(conn)?;
         conn.pragma_update(None, "user_version", 70)?;
     }
     if version < 71 {

@@ -738,7 +738,6 @@ impl Autopilot {
             .as_ref()
             .map(|pr| format!("github:pr:{}:review", pr.pr_number))
             .unwrap_or_else(|| "github:pr:review".to_string());
-        let due_at_ms = self.record_github_wait(fleet, spec, "github:pr:", settings)?;
         let mut what = match &waiting_on {
             Some(pr) => format!("a review of {}", pr.url),
             None => "a review".to_string(),
@@ -750,6 +749,7 @@ impl Autopilot {
                 .collect();
             what = format!("{what} ({})", each.join("; "));
         }
+        let due_at_ms = self.record_github_wait(fleet, spec, "github:pr:", settings, &what)?;
         Ok(Outcome::Waiting { what, due_at_ms })
     }
 

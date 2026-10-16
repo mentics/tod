@@ -62,7 +62,8 @@ pub const CREATE_TABLE: &str = "
         state       TEXT NOT NULL DEFAULT 'pending'
                         CHECK (state IN ('pending','satisfied','cancelled','expired')),
         created_at  INTEGER NOT NULL,
-        updated_at  INTEGER NOT NULL
+        updated_at  INTEGER NOT NULL,
+        detail      TEXT
     );
     CREATE INDEX IF NOT EXISTS idx_waits_node ON waits(node_id, state, due_at);
     CREATE INDEX IF NOT EXISTS idx_waits_due ON waits(state, due_at);
@@ -80,6 +81,10 @@ pub struct Wait {
     pub state: String,
     pub created_at: i64,
     pub updated_at: i64,
+    /// What the wait is for, in words, as of the look that recorded it (for
+    /// a GitHub wait, where each linked pull request stands).
+    #[serde(default)]
+    pub detail: Option<String>,
 }
 
 /// What `tod-cli wait` submits.
@@ -91,14 +96,22 @@ pub struct NewWait {
     #[serde(default)]
     pub every_secs: Option<i64>,
     pub due_at: i64,
+    #[serde(default)]
+    pub detail: Option<String>,
 }
 
 impl NewWait {
+    /// This wait, with `detail` saying what it is for.
+    pub fn with_detail(mut self, detail: impl Into<String>) -> Self {
+        self.detail = Some(detail.into());
+        self
+    }
+
     pub fn until(at_ms: i64) -> Self {
-        Self { kind: KIND_UNTIL.into(), match_spec: String::new(), every_secs: None, due_at: at_ms }
+        Self { kind: KIND_UNTIL.into(), match_spec: String::new(), every_secs: None, due_at: at_ms, detail: None }
     }
     pub fn event(spec: impl Into<String>, deadline_ms: i64) -> Self {
-        Self { kind: KIND_EVENT.into(), match_spec: spec.into(), every_secs: None, due_at: deadline_ms }
+        Self { kind: KIND_EVENT.into(), match_spec: spec.into(), every_secs: None, due_at: deadline_ms, detail: None }
     }
     pub fn check(command: impl Into<String>, every_secs: i64, now_ms: i64) -> Self {
         Self {
@@ -106,12 +119,24 @@ impl NewWait {
             match_spec: command.into(),
             every_secs: Some(every_secs),
             due_at: now_ms + every_secs * 1000,
+            detail: None,
         }
     }
 }
 
 const COLUMNS: &str =
-    "id, node_id, kind, match_spec, every_secs, due_at, state, created_at, updated_at";
+    "id, node_id, kind, match_spec, every_secs, due_at, state, created_at, updated_at, detail";
+
+/// The `detail` column (idempotent).
+pub fn add_detail(conn: &Connection) -> Result<()> {
+    let has = conn
+        .prepare("SELECT 1 FROM pragma_table_info('waits') WHERE name = 'detail'")?
+        .exists([])?;
+    if !has {
+        conn.execute_batch("ALTER TABLE waits ADD COLUMN detail TEXT")?;
+    }
+    Ok(())
+}
 
 fn row_to_wait(row: &Row<'_>) -> rusqlite::Result<Wait> {
     Ok(Wait {
@@ -124,6 +149,7 @@ fn row_to_wait(row: &Row<'_>) -> rusqlite::Result<Wait> {
         state: row.get(6)?,
         created_at: row.get(7)?,
         updated_at: row.get(8)?,
+        detail: row.get(9)?,
     })
 }
 
@@ -155,8 +181,8 @@ impl<'a> WaitRepo<'a> {
         let id = Uuid::new_v4();
         let now = now_ms();
         self.conn.execute(
-            &format!("INSERT INTO waits ({COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7, ?7)"),
-            params![uuid_to_blob(id), uuid_to_blob(node_id), wait.kind, spec, wait.every_secs, wait.due_at, now],
+            &format!("INSERT INTO waits ({COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7, ?7, ?8)"),
+            params![uuid_to_blob(id), uuid_to_blob(node_id), wait.kind, spec, wait.every_secs, wait.due_at, now, wait.detail],
         )?;
         self.get(id)?.context("wait vanished after insert")
     }
