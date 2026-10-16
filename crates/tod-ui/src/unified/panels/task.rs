@@ -999,6 +999,15 @@ impl TaskPanel {
                 RunnerStatus::Done => {
                     line = line.child(sep()).child(style::text_muted(div().flex_none()).child("done"));
                 }
+                // The supervisor's own wake is scheduled from this wait.
+                RunnerStatus::Awaiting { what, due_at_ms } => {
+                    let next = chrono::DateTime::from_timestamp_millis(*due_at_ms)
+                        .map(|t| t.with_timezone(&chrono::Local).format("%a %H:%M").to_string())
+                        .unwrap_or_default();
+                    line = line.child(sep()).child(style::text_muted(div().flex_none()).child(format!(
+                        "waiting for {what}; next check {next}"
+                    )));
+                }
                 _ => {}
             }
         } else {
