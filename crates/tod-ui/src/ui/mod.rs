@@ -26,6 +26,7 @@ pub mod status;
 pub mod status_filter;
 pub mod style;
 pub mod terminal_handoff;
+pub mod text_field;
 pub mod toast;
 pub mod session_info;
 pub mod token_usage;
