@@ -974,7 +974,9 @@ impl TaskPanel {
         let elapsed = status.since().map(|since| format_elapsed(now_ms() - since));
         let sep = || style::text_muted(div().flex_none()).child("·");
 
-        let mut line = div().flex().items_center().gap_2().min_w_0();
+        // Status pieces wrap onto further lines when the panel is narrow;
+        // long text keeps a readable minimum width instead of collapsing.
+        let mut line = div().flex().flex_wrap().items_center().gap_x_2().gap_y_1().flex_auto().min_w(gpui::px(160.));
         if status != RunnerStatus::Done {
             line = line.child(self.render_phase_chip(cx));
         }
@@ -983,7 +985,7 @@ impl TaskPanel {
             if cloud.lost_at.is_some() {
                 text.push_str(", its sandbox is gone; replaced on the next sync");
             }
-            line = line.child(sep()).child(style::text_muted(div().flex_1().min_w_0()).child(
+            line = line.child(sep()).child(style::text_muted(div().flex_auto().min_w(gpui::px(160.))).child(
                 selectable_text("unified-task-runner-cloud", text, window, cx),
             ));
             // What the supervisor has left in the synced data: a request
@@ -1019,7 +1021,7 @@ impl TaskPanel {
                     if let Some(activity) = activity {
                         // Shrinks, never grows: the elapsed time and tokens
                         // stay beside it.
-                        line = line.child(sep()).child(style::text_muted(div().flex_shrink_1().min_w_0()).child(
+                        line = line.child(sep()).child(style::text_muted(div().flex_auto().min_w(gpui::px(160.))).child(
                             selectable_text("unified-task-runner-activity", activity.clone(), window, cx),
                         ));
                     } else {
@@ -1052,7 +1054,7 @@ impl TaskPanel {
                     let next = chrono::DateTime::from_timestamp_millis(*due_at_ms)
                         .map(|t| t.with_timezone(&chrono::Local).format("%a %H:%M").to_string())
                         .unwrap_or_default();
-                    line = line.child(sep()).child(style::text_muted(div().flex_1().min_w_0()).child(
+                    line = line.child(sep()).child(style::text_muted(div().flex_auto().min_w(gpui::px(160.))).child(
                         selectable_text(
                             "unified-task-runner-awaiting",
                             format!("waiting for {what}; next check {next}"),
@@ -1062,7 +1064,7 @@ impl TaskPanel {
                     ));
                 }
                 RunnerStatus::Failed { error } => {
-                    line = line.child(sep()).child(style::text_error(div().flex_1().min_w_0()).child(
+                    line = line.child(sep()).child(style::text_error(div().flex_auto().min_w(gpui::px(160.))).child(
                         selectable_text("unified-task-runner-error", error.clone(), window, cx),
                     ));
                 }
@@ -1070,7 +1072,7 @@ impl TaskPanel {
                     line = line.child(sep()).child(style::text_muted(div().flex_none()).child("paused"));
                 }
                 RunnerStatus::Stopped { reason } => {
-                    line = line.child(sep()).child(style::text_muted(div().flex_1().min_w_0()).child(
+                    line = line.child(sep()).child(style::text_muted(div().flex_auto().min_w(gpui::px(160.))).child(
                         selectable_text("unified-task-runner-stopped", format!("stopped: {reason}"), window, cx),
                     ));
                 }
@@ -1087,7 +1089,7 @@ impl TaskPanel {
             (None, None) => None,
         };
         if let Some((note, failed)) = note {
-            let el = div().flex_1().min_w_0();
+            let el = div().flex_auto().min_w(gpui::px(160.));
             let el = if failed { style::text_error(el) } else { style::text_muted(el) };
             line = line.child(sep()).child(el.child(selectable_text("unified-task-runner-note", note, window, cx)));
         }
@@ -1102,16 +1104,23 @@ impl TaskPanel {
                 }))
         });
         let button = self.render_runner_button(actions, cx);
-        if watch.is_some() || button.is_some() {
-            line = line.child(div().flex_1());
-        }
+        let mut buttons = div().flex().flex_none().items_center().gap_2().ml_auto();
         if let Some(watch) = watch {
-            line = line.child(watch);
+            buttons = buttons.child(watch);
         }
         if let Some(button) = button {
-            line = line.child(button);
+            buttons = buttons.child(button);
         }
-        Some(line.id("unified-task-runner-line").into_any_element())
+        let line = div()
+            .id("unified-task-runner-line")
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap_x_3()
+            .gap_y_2()
+            .child(line)
+            .child(buttons);
+        Some(line.into_any_element())
     }
 
     /// T4: the requests waiting on the user, oldest first — the only part
