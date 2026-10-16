@@ -159,6 +159,15 @@ impl RunnerStatus {
         }
     }
 
+    /// A status that says nothing is happening, replaced by the scheduled
+    /// GitHub look recorded for the node, when there is one.
+    pub fn or_scheduled(self, scheduled: Option<(String, i64)>) -> Self {
+        match (self, scheduled) {
+            (Self::Idle, Some((what, due_at_ms))) => Self::Awaiting { what, due_at_ms },
+            (status, _) => status,
+        }
+    }
+
     pub fn is_running(&self) -> bool {
         matches!(self, Self::Running { .. })
     }
@@ -171,6 +180,34 @@ impl RunnerStatus {
             _ => None,
         }
     }
+}
+
+/// What the node's pending GitHub waits say it is waiting for, and when it
+/// looks next (ms): the soonest `github:` wait. The run that recorded it may
+/// not be in this app (it ended, the app restarted, or it runs in the
+/// cloud), so the wait itself is the record of the schedule.
+pub fn github_wait(waits: &[tod_store::waits::Wait]) -> Option<(String, i64)> {
+    let wait = waits
+        .iter()
+        .filter(|w| w.match_spec.starts_with("github:"))
+        .min_by_key(|w| w.due_at)?;
+    let spec = wait.match_spec.as_str();
+    let what = if spec == "github:release:published" || spec.starts_with("github:release:") {
+        "a release that names the pull request".to_string()
+    } else {
+        let number = spec.strip_prefix("github:pr:").and_then(|r| r.split(':').next());
+        let event = spec.rsplit(':').next().unwrap_or_default();
+        let thing = match event {
+            "merged" => "the merge",
+            "review" => "a review",
+            _ => "GitHub",
+        };
+        match number.filter(|n| n.chars().all(|c| c.is_ascii_digit()) && !n.is_empty()) {
+            Some(n) => format!("{thing} of pull request #{n}"),
+            None => thing.to_string(),
+        }
+    };
+    Some((what, wait.due_at))
 }
 
 /// The node's local runner, as [`RunnerStatus::with_runner`] reads it.
@@ -374,5 +411,29 @@ mod tests {
         assert_eq!(format_tokens(850), "850 tok");
         assert_eq!(format_tokens(23_400), "23k tok");
         assert_eq!(format_tokens(1_200_000), "1.2M tok");
+    }
+
+    #[test]
+    fn an_idle_node_with_a_scheduled_github_look_shows_it() {
+        let wait = |spec: &str, due_at| tod_store::waits::Wait {
+            id: uuid::Uuid::nil(),
+            node_id: uuid::Uuid::nil(),
+            kind: "event".into(),
+            match_spec: spec.into(),
+            every_secs: None,
+            due_at,
+            state: "pending".into(),
+            created_at: 0,
+            updated_at: 0,
+        };
+        let waits = [wait("github:pr:12:merged", 500), wait("notes", 1), wait("github:pr:13:review", 900)];
+        let scheduled = github_wait(&waits);
+        assert_eq!(scheduled, Some(("the merge of pull request #12".to_string(), 500)));
+        assert_eq!(
+            RunnerStatus::Idle.or_scheduled(scheduled.clone()),
+            RunnerStatus::Awaiting { what: "the merge of pull request #12".into(), due_at_ms: 500 }
+        );
+        assert_eq!(RunnerStatus::Paused.or_scheduled(scheduled), RunnerStatus::Paused);
+        assert_eq!(github_wait(&[wait("notes", 1)]), None);
     }
 }
