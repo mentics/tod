@@ -739,10 +739,17 @@ impl Autopilot {
             .map(|pr| format!("github:pr:{}:review", pr.pr_number))
             .unwrap_or_else(|| "github:pr:review".to_string());
         let due_at_ms = self.record_github_wait(fleet, spec, "github:pr:", settings)?;
-        let what = match &waiting_on {
+        let mut what = match &waiting_on {
             Some(pr) => format!("a review of {}", pr.url),
             None => "a review".to_string(),
         };
+        if live.len() > 1 {
+            let each: Vec<String> = live
+                .iter()
+                .map(|p| format!("{} {}", crate::pr_readiness::pr_label(&p.pr), p.status()))
+                .collect();
+            what = format!("{what} ({})", each.join("; "));
+        }
         Ok(Outcome::Waiting { what, due_at_ms })
     }
 

@@ -882,10 +882,10 @@ impl crate::pr_readiness::PrFeed for AfterReview {
         Ok(())
     }
 
-    fn merge(&self, _: &tod_store::github::NodePr) -> Result<tod_store::github::PrMerge, String> {
+    fn merge(&self, pr: &tod_store::github::NodePr) -> Result<tod_store::github::PrMerge, String> {
         let merged = self.merged.load(std::sync::atomic::Ordering::SeqCst);
         Ok(tod_store::github::PrMerge {
-            title: "Add the widget".into(),
+            title: if pr.pr_number == 7 { "Apply the infra change" } else { "Add the widget" }.into(),
             merged,
             merged_at: merged.then(|| "2026-03-01T00:00:00Z".to_string()),
         })
@@ -910,6 +910,10 @@ impl crate::pr_readiness::PrFeed for AfterReview {
 
 /// A node with the pull request linked, at `lifecycle`.
 fn linked_to_pr(fx: &Fixture, lifecycle: &str) {
+    linked_to_prs(fx, lifecycle, &["https://github.com/acme/app/pull/42"]);
+}
+
+fn linked_to_prs(fx: &Fixture, lifecycle: &str, urls: &[&str]) {
     fx.fleet
         .enqueue_outline(OutlineMutation::EnableCapabilities {
             node_id: fx.node,
@@ -920,7 +924,7 @@ fn linked_to_pr(fx: &Fixture, lifecycle: &str) {
     fx.fleet
         .enqueue(tod_store::fleet::FleetMutation::UpdateTaskLinkedPrs {
             id: fx.node.to_string(),
-            linked_prs: vec!["https://github.com/acme/app/pull/42".into()],
+            linked_prs: urls.iter().map(|u| u.to_string()).collect(),
         })
         .unwrap();
     fx.fleet.writer().flush().unwrap();
@@ -995,4 +999,61 @@ fn an_unreadable_pull_request_is_left_to_the_gate() {
     let outcome = autopilot(&fx, Budget::default()).run(&fx.fleet, &mut agent).unwrap();
     assert!(!matches!(outcome, Outcome::Waiting { .. }), "{outcome:?}");
     assert!(pending_specs(&fx).is_empty());
+}
+
+#[test]
+fn a_wait_on_several_pull_requests_says_where_each_stands() {
+    let fx = bare();
+    retire_outside_criteria(&fx);
+    let github = AfterReview::new();
+    github.merged.store(true, std::sync::atomic::Ordering::SeqCst);
+    // Only acme/app#42 is named in a release; acme/infra#7 never is.
+    *github.notes.lock().unwrap() = Some("* Add the widget by @ann in #42".into());
+    crate::pr_readiness::set_feed_override(Some(github.clone()));
+    linked_to_prs(
+        &fx,
+        "merged",
+        &["https://github.com/acme/app/pull/42", "https://github.com/acme/infra/pull/7"],
+    );
+    let mut agent = FakeAgent::new(&fx.fleet);
+    let outcome = autopilot(&fx, Budget::default()).run(&fx.fleet, &mut agent).unwrap();
+    let Outcome::Waiting { what, .. } = outcome else {
+        panic!("expected Waiting, got {outcome:?}");
+    };
+    assert!(what.contains("acme/app#42 released in v1.0.0"), "{what}");
+    assert!(what.contains("acme/infra#7 merged, no release names it yet"), "{what}");
+}
+
+#[test]
+fn a_repository_that_does_not_release_is_not_waited_on_for_one() {
+    let fx = bare();
+    retire_outside_criteria(&fx);
+    let github = AfterReview::new();
+    github.merged.store(true, std::sync::atomic::Ordering::SeqCst);
+    crate::pr_readiness::set_feed_override(Some(github.clone()));
+    let mut settings = tod_store::TodSettings::default();
+    settings.lifecycle.repo_profiles = vec![tod_store::RepoProfileSetting {
+        repo: "acme/infra".into(),
+        profile: tod_store::RepoProfile::Merge,
+    }];
+    settings.save(&tod_store::TodPaths::at(&fx.root)).unwrap();
+    linked_to_prs(
+        &fx,
+        "merged",
+        &["https://github.com/acme/app/pull/42", "https://github.com/acme/infra/pull/7"],
+    );
+    let mut agent = FakeAgent::new(&fx.fleet);
+
+    // The release for acme/app is still out: that alone holds the node.
+    let outcome = autopilot(&fx, Budget::default()).run(&fx.fleet, &mut agent).unwrap();
+    let Outcome::Waiting { what, .. } = outcome else {
+        panic!("expected Waiting, got {outcome:?}");
+    };
+    assert!(what.contains("acme/app#42"), "{what}");
+    assert!(what.contains("acme/infra#7 merged (this repository does not release)"), "{what}");
+
+    // Once it is released, the infra PR does not hold the node.
+    *github.notes.lock().unwrap() = Some("* Add the widget by @ann in #42".into());
+    let outcome = autopilot(&fx, Budget::default()).run(&fx.fleet, &mut agent).unwrap();
+    assert_eq!(outcome, Outcome::Done, "{outcome:?}");
 }

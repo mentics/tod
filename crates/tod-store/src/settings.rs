@@ -58,13 +58,97 @@ pub struct LifecycleSettings {
     /// certifies its own phase.
     #[serde(default = "default_independent_evaluation")]
     pub independent_evaluation: bool,
+    /// How each repository ships (`doc/lifecycle/repo-profiles.md`). The
+    /// first entry that matches a pull request's repository applies; a
+    /// repository nothing matches uses [`RepoProfile::Release`].
+    #[serde(default)]
+    pub repo_profiles: Vec<RepoProfileSetting>,
 }
 
 impl Default for LifecycleSettings {
     fn default() -> Self {
         Self {
             independent_evaluation: default_independent_evaluation(),
+            repo_profiles: Vec::new(),
         }
+    }
+}
+
+impl LifecycleSettings {
+    /// The profile for a pull request in `owner/repo`.
+    pub fn profile_for(&self, owner: &str, repo: &str) -> RepoProfile {
+        self.repo_profiles
+            .iter()
+            .find(|entry| entry.matches(owner, repo))
+            .map(|entry| entry.profile)
+            .unwrap_or_default()
+    }
+}
+
+/// How a repository ships a merged change.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RepoProfile {
+    /// A published GitHub release whose notes name the pull request carries
+    /// the change out. The behavior of every repository not listed.
+    #[default]
+    Release,
+    /// Merging is shipping: the repository publishes no releases, so a
+    /// merged pull request waits for nothing.
+    Merge,
+}
+
+/// One `repo_profiles` entry: which repositories, and how they ship.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepoProfileSetting {
+    /// `owner/repo`, `owner/*` (every repository of an owner), or `*`.
+    /// Compared without regard to case.
+    pub repo: String,
+    pub profile: RepoProfile,
+}
+
+impl RepoProfileSetting {
+    /// Parses `owner/repo=profile, owner/*=release` (the Settings text field).
+    pub fn parse_list(text: &str) -> Result<Vec<Self>, String> {
+        let mut out = Vec::new();
+        for entry in text.split(',').map(str::trim).filter(|e| !e.is_empty()) {
+            let (repo, profile) = entry
+                .split_once('=')
+                .ok_or_else(|| format!("\"{entry}\": write it as owner/repo=release or owner/repo=merge"))?;
+            let repo = repo.trim();
+            let valid_repo = repo == "*"
+                || repo.split_once('/').is_some_and(|(o, r)| {
+                    !o.is_empty() && !r.is_empty() && !o.contains('*') && !r.contains('/') && (r == "*" || !r.contains('*'))
+                });
+            if !valid_repo {
+                return Err(format!("\"{repo}\" is not owner/repo, owner/* or *"));
+            }
+            let profile = match profile.trim().to_lowercase().as_str() {
+                "release" => RepoProfile::Release,
+                "merge" => RepoProfile::Merge,
+                other => return Err(format!("unknown profile \"{other}\" (release or merge)")),
+            };
+            out.push(Self { repo: repo.to_string(), profile });
+        }
+        Ok(out)
+    }
+
+    /// The text [`Self::parse_list`] reads back.
+    pub fn format_list(list: &[Self]) -> String {
+        let one = |e: &Self| {
+            let profile = match e.profile {
+                RepoProfile::Release => "release",
+                RepoProfile::Merge => "merge",
+            };
+            format!("{}={profile}", e.repo)
+        };
+        list.iter().map(one).collect::<Vec<_>>().join(", ")
+    }
+
+    fn matches(&self, owner: &str, repo: &str) -> bool {
+        let pattern = self.repo.trim().to_lowercase();
+        let full = format!("{owner}/{repo}").to_lowercase();
+        pattern == "*" || pattern == full || pattern.strip_suffix("/*").is_some_and(|o| o == owner.to_lowercase())
     }
 }
 
@@ -1014,6 +1098,7 @@ mod tests {
             journeys: JourneySettings::default(),
             lifecycle: LifecycleSettings {
                 independent_evaluation: false,
+                repo_profiles: vec![RepoProfileSetting { repo: "acme/infra".into(), profile: RepoProfile::Merge }],
             },
             visual_design: VisualDesignSettings {
                 browser: Some("C:/chrome/chrome.exe".into()),
@@ -1034,6 +1119,35 @@ mod tests {
         let loaded = TodSettings::load_from_path(&path).unwrap();
         assert_eq!(loaded, settings);
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_repository_uses_the_first_profile_that_matches_it() {
+        let setting = |repo: &str, profile| RepoProfileSetting { repo: repo.into(), profile };
+        let lifecycle = LifecycleSettings {
+            repo_profiles: vec![
+                setting("Acme/Infra", RepoProfile::Merge),
+                setting("acme/*", RepoProfile::Release),
+                setting("other/*", RepoProfile::Merge),
+            ],
+            ..LifecycleSettings::default()
+        };
+        assert_eq!(lifecycle.profile_for("acme", "infra"), RepoProfile::Merge);
+        assert_eq!(lifecycle.profile_for("acme", "app"), RepoProfile::Release);
+        assert_eq!(lifecycle.profile_for("other", "x"), RepoProfile::Merge);
+        assert_eq!(lifecycle.profile_for("nobody", "x"), RepoProfile::Release);
+    }
+
+    #[test]
+    fn repo_profiles_round_trip_through_the_settings_text() {
+        let list = RepoProfileSetting::parse_list("acme/infra = merge, acme/* = release, *=merge").unwrap();
+        assert_eq!(list.len(), 3);
+        assert_eq!(RepoProfileSetting::format_list(&list), "acme/infra=merge, acme/*=release, *=merge");
+        assert!(RepoProfileSetting::parse_list("").unwrap().is_empty());
+        assert!(RepoProfileSetting::parse_list("acme/infra").is_err());
+        assert!(RepoProfileSetting::parse_list("acme/infra=atlantis").is_err());
+        assert!(RepoProfileSetting::parse_list("infra=merge").is_err());
+        assert!(RepoProfileSetting::parse_list("*/app=merge").is_err());
     }
 
     #[test]
