@@ -3,7 +3,7 @@
 Status: partly built. `lifecycle.repo_profiles` (`tod_store::settings`,
 `RepoProfile` = `release` | `merge`) is read by `autopilot::github_wait`, so a
 `merge` repository's pull request never waits for a release. Editing it in
-Settings, the profile trait, and `atlantis` are not built.
+Settings → Lifecycle ("How repositories ship", a text field of `owner/repo=profile`) is built; the profile trait and `atlantis` are not.
 
 The lifecycle assumes one way of shipping: PR, human review, merge, then a
 GitHub release that names the PR. Some repositories ship differently. The

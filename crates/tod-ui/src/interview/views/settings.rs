@@ -24,7 +24,7 @@ use std::time::Duration;
 use tod_core::logging;
 use tod_journey::RelayCode;
 use tod_store::fleet::default_terminal_hint;
-use tod_store::settings::{DEFAULT_TREEHOUSE_EXECUTABLE, JourneySettings};
+use tod_store::settings::{DEFAULT_TREEHOUSE_EXECUTABLE, JourneySettings, RepoProfileSetting};
 use tod_store::{AgentRole, efforts_for, models_for, parse_platform};
 
 const SAVE_DEBOUNCE: Duration = Duration::from_secs(2);
@@ -164,7 +164,7 @@ impl SettingsSection {
                 ClaudeAdapter,
                 MaxParallelSessions,
             ],
-            Self::Lifecycle => &[LifecycleIndependentEvaluation],
+            Self::Lifecycle => &[LifecycleIndependentEvaluation, LifecycleRepoProfiles],
             Self::QuestionMaker => &[ReplenishThreshold],
             Self::AnswerProcessor => &[ContextBudget, PromptCacheIdle, AnsweredHistoryCap],
             Self::Workspaces => &[
@@ -242,6 +242,8 @@ enum SettingField {
     JourneysStorageCap,
     /// `lifecycle.independent_evaluation`.
     LifecycleIndependentEvaluation,
+    /// `lifecycle.repo_profiles`, as text.
+    LifecycleRepoProfiles,
     /// Seconds an idle sandbox terminal keeps its connection.
     SandboxTerminalPark,
     /// Seconds an idle Zed on a sandbox keeps its connection.
@@ -284,6 +286,7 @@ impl SettingField {
             Self::JourneysMilestoneStates => "journeys-milestone-states",
             Self::JourneysStorageCap => "journeys-storage-cap",
             Self::LifecycleIndependentEvaluation => "lifecycle-independent-evaluation",
+            Self::LifecycleRepoProfiles => "lifecycle-repo-profiles",
             Self::SandboxTerminalPark => "sandbox-terminal-park",
             Self::SandboxZedPark => "sandbox-zed-park",
             Self::SandboxAgentIdle => "sandbox-agent-idle",
@@ -391,6 +394,9 @@ pub struct SettingsView {
     treehouse_executable_input: Entity<InputState>,
     relay_code_input: Entity<InputState>,
     milestone_states_input: Entity<InputState>,
+    repo_profiles_input: Entity<InputState>,
+    /// Why the text in `repo_profiles_input` was not saved.
+    repo_profiles_error: Option<String>,
     /// Cloud sandboxes: kept in `sandboxes.toml` (shared with `tod-sandbox`),
     /// not in the settings file; saved when leaving the field with
     /// Enter or Escape.
@@ -425,6 +431,7 @@ pub struct SettingsView {
     treehouse_executable_editing: bool,
     relay_code_editing: bool,
     milestone_states_editing: bool,
+    repo_profiles_editing: bool,
     selected_agent_column: usize,
     pending_launch_select_sync: bool,
     save_generation: u64,
@@ -440,6 +447,7 @@ pub struct SettingsView {
     _treehouse_executable_subscription: Subscription,
     _relay_code_subscription: Subscription,
     _milestone_states_subscription: Subscription,
+    _repo_profiles_subscription: Subscription,
     _claude_adapter_subscription: Subscription,
 }
 
@@ -610,6 +618,17 @@ impl SettingsView {
                 .placeholder("Comma-separated lifecycle states")
                 .default_value(settings.journeys.milestone_states.join(", "))
         });
+        let repo_profiles_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("owner/repo=merge, owner/*=release")
+                .default_value(RepoProfileSetting::format_list(&settings.lifecycle.repo_profiles))
+        });
+        let _repo_profiles_subscription = cx.subscribe(&repo_profiles_input, |this, input, event, cx| {
+            if matches!(event, InputEvent::Blur | InputEvent::PressEnter { .. }) {
+                let text = input.read(cx).text().to_string();
+                this.apply_repo_profiles_input(text, cx);
+            }
+        });
         let claude_adapter = crate::ui::claude_adapter::state(cx);
         let _claude_adapter_subscription = cx.observe(&claude_adapter, |_, _, cx| cx.notify());
         let _milestone_states_subscription =
@@ -646,6 +665,8 @@ impl SettingsView {
             claude_status: None,
             relay_code_input,
             milestone_states_input,
+            repo_profiles_input,
+            repo_profiles_error: None,
             agent_selects,
             focus_handle: cx.focus_handle(),
             app_nav: AppNavMenu::default(),
@@ -662,6 +683,7 @@ impl SettingsView {
             treehouse_executable_editing: false,
             relay_code_editing: false,
             milestone_states_editing: false,
+            repo_profiles_editing: false,
             selected_agent_column: 0,
             pending_launch_select_sync: false,
             save_generation: 0,
@@ -674,6 +696,7 @@ impl SettingsView {
             _treehouse_executable_subscription,
             _relay_code_subscription,
             _milestone_states_subscription,
+            _repo_profiles_subscription,
             _claude_adapter_subscription,
         }
     }
@@ -697,6 +720,36 @@ impl SettingsView {
         self.settings.journeys.milestone_states = states;
         self.schedule_save("journeys.milestone_states", cx);
         cx.notify();
+    }
+
+    /// Saves the repo profiles text, or says why it was not saved.
+    fn apply_repo_profiles_input(&mut self, raw: String, cx: &mut Context<Self>) {
+        match RepoProfileSetting::parse_list(&raw) {
+            Ok(list) => {
+                self.repo_profiles_error = None;
+                if self.settings.lifecycle.repo_profiles != list {
+                    self.settings.lifecycle.repo_profiles = list;
+                    self.schedule_save("lifecycle.repo_profiles", cx);
+                }
+            }
+            Err(why) => self.repo_profiles_error = Some(why),
+        }
+        cx.notify();
+    }
+
+    fn enter_repo_profiles_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !matches!(self.selected_field(), SettingField::LifecycleRepoProfiles) {
+            return;
+        }
+        self.focus_region = SettingsFocus::Panel;
+        self.repo_profiles_editing = true;
+        cx.notify();
+        let input = self.repo_profiles_input.clone();
+        cx.on_next_frame(window, move |_, window, cx| {
+            input.update(cx, |input, cx| {
+                input.focus(window, cx);
+            });
+        });
     }
 
     fn milestone_states_valid(states: &[String]) -> bool {
@@ -745,6 +798,7 @@ impl SettingsView {
             || self.treehouse_executable_editing
             || self.relay_code_editing
             || self.milestone_states_editing
+            || self.repo_profiles_editing
     }
 
     fn exit_text_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -758,6 +812,7 @@ impl SettingsView {
         self.visual_design_browser_editing = false;
         self.relay_code_editing = false;
         self.milestone_states_editing = false;
+        self.repo_profiles_editing = false;
         if let Some(field) = self.sandbox_editing.take() {
             self.leave_sandbox_field(field, window, cx);
         }
@@ -1015,6 +1070,7 @@ impl SettingsView {
         self.visual_design_browser_editing = false;
         self.relay_code_editing = false;
         self.milestone_states_editing = false;
+        self.repo_profiles_editing = false;
         if let Some(field) = self.sandbox_editing.take() {
             self.leave_sandbox_field(field, window, cx);
         }
@@ -1080,6 +1136,7 @@ impl SettingsView {
         self.visual_design_browser_editing = false;
         self.relay_code_editing = false;
         self.milestone_states_editing = false;
+        self.repo_profiles_editing = false;
         self.active_section = SECTIONS[next];
         self.selected_field_index = 0;
         self.focus_region = SettingsFocus::Sidebar;
@@ -1196,6 +1253,7 @@ impl SettingsView {
             SettingField::JourneysRelayCode
             | SettingField::JourneysSendTest
             | SettingField::JourneysMilestoneStates
+            | SettingField::LifecycleRepoProfiles
             | SettingField::ClaudeAdapter => {}
             SettingField::SandboxTerminalPark => self.step_sandbox_idle(
                 |idle| &mut idle.terminal_park_secs,
@@ -1250,6 +1308,7 @@ impl SettingsView {
             SettingField::Agent(role) => self.focus_agent_select(role, window, cx),
             SettingField::JourneysRelayCode => self.enter_relay_code_edit(window, cx),
             SettingField::JourneysMilestoneStates => self.enter_milestone_states_edit(window, cx),
+            SettingField::LifecycleRepoProfiles => self.enter_repo_profiles_edit(window, cx),
             SettingField::JourneysSendTest => self.send_journeys_test(cx),
             SettingField::ClaudeAdapter => self.activate_claude_adapter(cx),
             SettingField::JourneysSend => self.toggle_journeys_send(cx),
@@ -1420,6 +1479,7 @@ impl SettingsView {
         }
         self.focus_region = SettingsFocus::Panel;
         self.milestone_states_editing = false;
+        self.repo_profiles_editing = false;
         self.relay_code_editing = true;
         cx.notify();
         let input = self.relay_code_input.clone();
@@ -2022,6 +2082,12 @@ impl Render for SettingsView {
                 self.enter_sandbox_edit(field, window, cx);
             }
         }
+        key_context::set_input_tab_stop(&self.repo_profiles_input, self.repo_profiles_editing, cx);
+        if !self.repo_profiles_editing
+            && self.repo_profiles_input.read(cx).focus_handle(cx).is_focused(window)
+        {
+            self.enter_repo_profiles_edit(window, cx);
+        }
         key_context::set_input_tab_stop(
             &self.milestone_states_input,
             self.milestone_states_editing,
@@ -2597,6 +2663,19 @@ impl SettingsView {
                     "A fresh agent session, separate from the one that did the phase's work, judges whether each phase is done. It cannot edit; it sends fixes back to the phase agent.",
                     theme,
                     |this, cx| this.toggle_lifecycle_independent_evaluation(cx),
+                ))
+                .child(text_input_row(
+                    cx,
+                    self,
+                    SettingField::LifecycleRepoProfiles,
+                    "How repositories ship",
+                    match &self.repo_profiles_error {
+                        Some(why) => format!("Not saved: {why}."),
+                        None => "Comma-separated owner/repo=profile (also owner/* or *); the first match wins. release (default): a merged pull request waits for a published release naming it. merge: the repository publishes no releases, so merging is shipping.".to_string(),
+                    },
+                    &self.repo_profiles_input,
+                    self.repo_profiles_editing,
+                    theme,
                 ))
                 .into_any_element(),
             SettingsSection::Journeys => {

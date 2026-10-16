@@ -108,6 +108,43 @@ pub struct RepoProfileSetting {
 }
 
 impl RepoProfileSetting {
+    /// Parses `owner/repo=profile, owner/*=release` (the Settings text field).
+    pub fn parse_list(text: &str) -> Result<Vec<Self>, String> {
+        let mut out = Vec::new();
+        for entry in text.split(',').map(str::trim).filter(|e| !e.is_empty()) {
+            let (repo, profile) = entry
+                .split_once('=')
+                .ok_or_else(|| format!("\"{entry}\": write it as owner/repo=release or owner/repo=merge"))?;
+            let repo = repo.trim();
+            let valid_repo = repo == "*"
+                || repo.split_once('/').is_some_and(|(o, r)| {
+                    !o.is_empty() && !r.is_empty() && !o.contains('*') && !r.contains('/') && (r == "*" || !r.contains('*'))
+                });
+            if !valid_repo {
+                return Err(format!("\"{repo}\" is not owner/repo, owner/* or *"));
+            }
+            let profile = match profile.trim().to_lowercase().as_str() {
+                "release" => RepoProfile::Release,
+                "merge" => RepoProfile::Merge,
+                other => return Err(format!("unknown profile \"{other}\" (release or merge)")),
+            };
+            out.push(Self { repo: repo.to_string(), profile });
+        }
+        Ok(out)
+    }
+
+    /// The text [`Self::parse_list`] reads back.
+    pub fn format_list(list: &[Self]) -> String {
+        let one = |e: &Self| {
+            let profile = match e.profile {
+                RepoProfile::Release => "release",
+                RepoProfile::Merge => "merge",
+            };
+            format!("{}={profile}", e.repo)
+        };
+        list.iter().map(one).collect::<Vec<_>>().join(", ")
+    }
+
     fn matches(&self, owner: &str, repo: &str) -> bool {
         let pattern = self.repo.trim().to_lowercase();
         let full = format!("{owner}/{repo}").to_lowercase();
@@ -1099,6 +1136,18 @@ mod tests {
         assert_eq!(lifecycle.profile_for("acme", "app"), RepoProfile::Release);
         assert_eq!(lifecycle.profile_for("other", "x"), RepoProfile::Merge);
         assert_eq!(lifecycle.profile_for("nobody", "x"), RepoProfile::Release);
+    }
+
+    #[test]
+    fn repo_profiles_round_trip_through_the_settings_text() {
+        let list = RepoProfileSetting::parse_list("acme/infra = merge, acme/* = release, *=merge").unwrap();
+        assert_eq!(list.len(), 3);
+        assert_eq!(RepoProfileSetting::format_list(&list), "acme/infra=merge, acme/*=release, *=merge");
+        assert!(RepoProfileSetting::parse_list("").unwrap().is_empty());
+        assert!(RepoProfileSetting::parse_list("acme/infra").is_err());
+        assert!(RepoProfileSetting::parse_list("acme/infra=atlantis").is_err());
+        assert!(RepoProfileSetting::parse_list("infra=merge").is_err());
+        assert!(RepoProfileSetting::parse_list("*/app=merge").is_err());
     }
 
     #[test]
