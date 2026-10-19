@@ -452,7 +452,7 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
         // When the orchestrator found a cloud node's sandbox gone
         // (`crate::cloud_nodes::mark_lost`); synced with the rest of the row.
         crate::cloud_nodes::add_lost_at(conn)?;
-    crate::waits::add_detail(conn)?;
+        crate::waits::add_detail(conn)?;
         conn.pragma_update(None, "user_version", 70)?;
     }
     if version < 71 {
@@ -547,6 +547,7 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
     conn.execute_batch(crate::node_events::CREATE_TABLE)?;
     conn.execute_batch(&crate::journey_changes::node_events_triggers_sql())?;
     crate::cloud_nodes::add_lost_at(conn)?;
+    crate::waits::add_detail(conn)?;
     // The task panel's own steps, first numbered 66–69 on its branch.
     ensure_decisions_reason(conn)?;
     conn.execute_batch(crate::request_feedback::CREATE_TABLE)?;
