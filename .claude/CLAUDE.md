@@ -576,7 +576,7 @@ has one setting, `by_lifecycle`. The node tree then shows the node's children
 under a header per lifecycle state, in lifecycle order, made only while a child
 is in that state (`tod_core::task::model::group_children_by_lifecycle`, applied
 by `filter_and_sort_tasks`; a header is a `TaskItem` with `group_header` set,
-never a node, never selectable, folded in `ListWorkingSet::collapsed_groups`).
+never a node, selectable only so Left/Right can fold it (nothing else treats it as selected), folded in `ListWorkingSet::collapsed_groups`).
 Children must have Lifecycle: `groups::place_valid` moves one that does not down
 to the first place that accepts it (the next sibling of the grouped node, and so
 on up), when the setting is turned on, a node is reparented under it, or a child

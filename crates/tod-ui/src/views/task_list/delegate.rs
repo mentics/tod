@@ -228,15 +228,10 @@ impl ListDelegate for TaskListDelegate {
             let id = item.id.clone();
             let collapsed = item.collapsed;
             let label = group_label(&state);
-            let row = h_flex()
-                .size_full()
-                .items_center()
-                .pl(px(item.depth as f32 * TREE_LEVEL_STEP))
-                .gap_1()
+            let chevron = div()
+                .w(px(TREE_CHEVRON_WIDTH))
+                .flex_shrink_0()
                 .cursor_pointer()
-                .text_xs()
-                .font_semibold()
-                .text_color(muted_foreground)
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |_, _, _, cx| {
@@ -246,11 +241,28 @@ impl ListDelegate for TaskListDelegate {
                         cx.notify();
                     }),
                 )
-                .child(div().w(px(TREE_CHEVRON_WIDTH)).child(if collapsed { "▸" } else { "▾" }))
-                .child(label);
+                .child(if collapsed { "▸" } else { "▾" });
+            // Laid out like a node row: the status cell's width, then the
+            // depth indent, so headers line up with the nodes at their depth.
+            let row = h_flex()
+                .size_full()
+                .items_center()
+                .child(div().w(px(16.0)).flex_shrink_0())
+                .child(
+                    h_flex()
+                        .items_center()
+                        .flex_1()
+                        .min_w_0()
+                        .pl(px(item.depth as f32 * TREE_LEVEL_STEP))
+                        .text_xs()
+                        .font_semibold()
+                        .text_color(muted_foreground)
+                        .child(chevron)
+                        .child(label),
+                );
             return Some(
                 ListItem::new(("task-row", ix.row))
-                    .disabled(true)
+                    .selected(selected)
                     .h(TREE_ROW_HEIGHT)
                     .child(row),
             );

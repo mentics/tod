@@ -471,11 +471,6 @@ impl TaskListView {
             }
             ListEvent::Confirm(ix) => {
                 this.close_sort_menu(cx);
-                if let Some(target) = this.past_group_header(*ix, cx) {
-                    this.pending_revert = Some(target);
-                    cx.notify();
-                    return;
-                }
                 // A click lands where it was aimed: only arrow keys wrap, so
                 // only `Select` is checked for a wrap (a click from the first
                 // row to the last used to be undone as one).
@@ -699,15 +694,6 @@ impl TaskListView {
         let Some(item) = self.list_state.read(cx).delegate().selected_item().cloned() else {
             return;
         };
-        if item.group_header.is_some() {
-            // Reached by a click, Home/End, or a rebuild: fold the group if
-            // clicked, and leave the header for the row after it.
-            if let Some(ix) = self.list_state.read(cx).selected_index() {
-                self.pending_revert = self.past_group_header(ix, cx);
-            }
-            cx.notify();
-            return;
-        }
         let new_id = item.id.clone();
         if self.edit_open_for.is_some() && previous.as_deref() != Some(new_id.as_str()) {
             self.pending_abandon_edit = true;
@@ -724,7 +710,14 @@ impl TaskListView {
     /// `render` does too, so a path that forgets still can't strand the drawer
     /// on a node that is no longer selected.
     fn publish_selection(&mut self, cx: &mut Context<Self>) {
-        if self.published_selection == self.working_set.selected_id {
+        // A group header is selectable (so Left/Right can fold it) but is no
+        // node: what follows the selection shows nothing, as with none.
+        let selected = self
+            .working_set
+            .selected_id
+            .clone()
+            .filter(|id| !id.starts_with("group:"));
+        if self.published_selection == selected {
             return;
         }
         // A draft row has no node yet; the drawer stays on the last real one.
@@ -733,7 +726,7 @@ impl TaskListView {
                 return;
             }
         }
-        self.published_selection = self.working_set.selected_id.clone();
+        self.published_selection = selected;
         cx.emit(TaskListEvent::SelectionChanged {
             task_id: self.published_selection.clone(),
         });
@@ -1583,6 +1576,18 @@ impl TaskListView {
                         .cloned()
                 })
             })
+            // A selected group header is no node: nothing acts on it.
+            .filter(|t| t.group_header.is_none())
+    }
+
+    /// The group header row that is selected, if one is.
+    fn selected_group_header(&self, cx: &Context<Self>) -> Option<TaskItem> {
+        self.list_state
+            .read(cx)
+            .delegate()
+            .selected_item()
+            .filter(|t| t.group_header.is_some())
+            .cloned()
     }
 
     /// Remove a node and its subtree from the outline tree.
@@ -1825,24 +1830,7 @@ impl TaskListView {
         self.rebuild_visible_list(window, cx);
     }
 
-    /// Where selection goes instead of the group header at `ix`: the next row
-    /// when moving down (a header always has a child after it), else the one
-    /// above (its parent node).
-    fn past_group_header(&self, ix: IndexPath, cx: &mut Context<Self>) -> Option<IndexPath> {
-        let state = self.list_state.read(cx);
-        let items = state.delegate().items();
-        items.get(ix.row)?.group_header.as_ref()?;
-        let moving_up = self.last_selected.is_some_and(|last| last.row > ix.row);
-        let row = if moving_up { ix.row.saturating_sub(1) } else { ix.row + 1 };
-        Some(IndexPath::new(row.min(items.len().saturating_sub(1))))
-    }
-
     fn clamp_selection(&mut self, ix: IndexPath, cx: &mut Context<Self>) {
-        if let Some(target) = self.past_group_header(ix, cx) {
-            self.pending_revert = Some(target);
-            cx.notify();
-            return;
-        }
         let count = self.list_state.read(cx).delegate().items_count();
 
         if let Some(last) = self.last_selected {
@@ -2404,6 +2392,17 @@ impl TaskListView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let Some(header) = self.selected_group_header(cx) {
+            if header.collapsed {
+                // Its parent node is the row that owns the header.
+                if let Some(parent) = header.parent_id {
+                    self.select_task_by_id(&parent, window, cx);
+                }
+            } else {
+                self.toggle_collapsed(&header.id, window, cx);
+            }
+            return;
+        }
         let Some(task_id) = self.working_set.selected_id.clone() else {
             return;
         };
@@ -2442,6 +2441,12 @@ impl TaskListView {
     }
 
     fn on_expand(&mut self, _: &TaskListExpand, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(header) = self.selected_group_header(cx) {
+            if header.collapsed {
+                self.toggle_collapsed(&header.id, window, cx);
+            }
+            return;
+        }
         let Some(task_id) = self.working_set.selected_id.clone() else {
             return;
         };
