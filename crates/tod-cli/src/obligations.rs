@@ -120,7 +120,7 @@ fn resolve(inv: &Invocation, raw: &str) -> anyhow::Result<Uuid> {
 type Row = (NodeObligation, Option<String>);
 
 fn list(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
-    let node = args.uuid("--node")?;
+    let node = crate::node::flag(inv, args, "--node")?;
     let kind = args.get("--kind").map(normalize_kind).transpose()?;
     let search = args.get("--search");
     if node.is_none() {
@@ -296,7 +296,7 @@ fn show(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
 }
 
 fn add(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
-    let node = args.node()?;
+    let node = crate::node::required(&inv, args)?;
     let kind = normalize_kind(args.require("--kind")?)?;
     let body = args.require("--body")?.to_string();
     let phase = args
@@ -395,7 +395,7 @@ fn update(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
 
 fn move_to(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
     let id = resolve(inv, args.target("an obligation id")?)?;
-    let node = args.node()?;
+    let node = crate::node::required(&inv, args)?;
     inv.client().interview(InterviewCommand::Outline {
         mutation: OutlineMutation::MoveObligation {
             obligation_id: id,
@@ -416,7 +416,7 @@ fn delete(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
 }
 
 fn deleted(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
-    let node = args.node()?;
+    let node = crate::node::required(&inv, args)?;
     let by = args.get("--by");
     let rows: Vec<ObligationSnapshot> = inv
         .client()
@@ -440,7 +440,7 @@ fn history(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
 fn restore(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
     let client = inv.client();
     let mut snapshots: Vec<ObligationSnapshot> = if args.positional.is_empty() {
-        let (Some(node), Some(by)) = (args.uuid("--node")?, args.get("--by")) else {
+        let (Some(node), Some(by)) = (crate::node::flag(inv, args, "--node")?, args.get("--by")) else {
             anyhow::bail!("give change ids (r-<n>), or --node <UUID> --by user|agent|<SESSION>");
         };
         client
@@ -597,7 +597,7 @@ fn render_snapshots(rows: &[ObligationSnapshot], json: bool) -> String {
 }
 
 fn check_refs(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
-    let scope = args.uuid("--node")?;
+    let scope = crate::node::flag(inv, args, "--node")?;
     let broken = inv
         .client()
         .read(|conn| tod_store::outline::broken_references(conn, scope))?;

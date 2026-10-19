@@ -64,6 +64,17 @@ pub fn run(inv: Invocation) -> anyhow::Result<String> {
     }
 }
 
+/// `--node` (or another node flag) given as a slug or UUID, if present.
+pub(crate) fn flag(inv: &Invocation, args: &Args, flag: &str) -> anyhow::Result<Option<Uuid>> {
+    args.get(flag).map(|raw| resolve(inv, raw)).transpose()
+}
+
+/// The required `--node <SLUG_OR_UUID>`.
+pub(crate) fn required(inv: &Invocation, args: &Args) -> anyhow::Result<Uuid> {
+    flag(inv, args, "--node")?
+        .ok_or_else(|| anyhow::anyhow!("--node <SLUG_OR_UUID> is required"))
+}
+
 /// Resolve a `<SLUG_OR_UUID>` argument to a node id.
 pub(crate) fn resolve(inv: &Invocation, raw: &str) -> anyhow::Result<Uuid> {
     if let Ok(id) = Uuid::parse_str(raw) {

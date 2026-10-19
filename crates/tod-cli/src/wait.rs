@@ -47,8 +47,8 @@ satisfied, cancelled, and expired ones. `satisfy` and `cancel` close a wait;
 `reschedule` moves a pending wait's next time.
 ";
 
-fn node(args: &Args) -> anyhow::Result<Uuid> {
-    if let Some(node) = args.uuid("--node")? {
+fn node(inv: &Invocation, args: &Args) -> anyhow::Result<Uuid> {
+    if let Some(node) = crate::node::flag(inv, args, "--node")? {
         return Ok(node);
     }
     match std::env::var(IMPLEMENT_NODE_ENV) {
@@ -77,7 +77,7 @@ pub fn run(inv: Invocation) -> anyhow::Result<String> {
 }
 
 fn add(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
-    let node = node(args)?;
+    let node = node(inv, args)?;
     let now = now_ms();
     let (until, event, check) = (args.get("--until"), args.get("--event"), args.get("--check"));
     let wait = match (until, event, check) {
@@ -140,7 +140,7 @@ fn wait_line(w: &Wait) -> String {
 }
 
 fn list(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
-    let node = node(args)?;
+    let node = node(inv, args)?;
     let all = args.has("--all");
     let waits = inv.client().read(|conn| {
         let repo = WaitRepo::new(conn);

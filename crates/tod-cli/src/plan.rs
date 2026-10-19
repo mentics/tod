@@ -171,7 +171,7 @@ fn step_line(row: &PlanStep, deps: &[Uuid], obligations: &[Uuid]) -> String {
 type StepRow = (PlanStep, Vec<Uuid>, Vec<Uuid>);
 
 fn list(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
-    let node = args.uuid("--node")?;
+    let node = crate::node::flag(inv, args, "--node")?;
     let search = args.get("--search");
     if node.is_none() && search.is_none() {
         anyhow::bail!("--node <UUID> or --search <TEXT> is required");
@@ -319,7 +319,7 @@ fn normalize_phase(raw: &str) -> anyhow::Result<&'static str> {
 }
 
 fn add(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
-    let node = args.node()?;
+    let node = crate::node::required(&inv, args)?;
     let body = args.require("--body")?.to_string();
     let phase = args.get("--phase").map(normalize_phase).transpose()?;
     let after = args.get("--after").map(|raw| resolve(inv, raw)).transpose()?;
@@ -652,7 +652,7 @@ fn unsatisfy(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
 }
 
 fn ready(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
-    let node = args.node()?;
+    let node = crate::node::required(&inv, args)?;
     let ids: Vec<Uuid> = inv
         .client()
         .read(|conn| {
