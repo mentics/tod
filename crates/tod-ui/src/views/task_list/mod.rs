@@ -471,6 +471,11 @@ impl TaskListView {
             }
             ListEvent::Confirm(ix) => {
                 this.close_sort_menu(cx);
+                if let Some(target) = this.past_group_header(*ix, cx) {
+                    this.pending_revert = Some(target);
+                    cx.notify();
+                    return;
+                }
                 // A click lands where it was aimed: only arrow keys wrap, so
                 // only `Select` is checked for a wrap (a click from the first
                 // row to the last used to be undone as one).
@@ -694,6 +699,15 @@ impl TaskListView {
         let Some(item) = self.list_state.read(cx).delegate().selected_item().cloned() else {
             return;
         };
+        if item.group_header.is_some() {
+            // Reached by a click, Home/End, or a rebuild: fold the group if
+            // clicked, and leave the header for the row after it.
+            if let Some(ix) = self.list_state.read(cx).selected_index() {
+                self.pending_revert = self.past_group_header(ix, cx);
+            }
+            cx.notify();
+            return;
+        }
         let new_id = item.id.clone();
         if self.edit_open_for.is_some() && previous.as_deref() != Some(new_id.as_str()) {
             self.pending_abandon_edit = true;
@@ -1120,6 +1134,14 @@ impl TaskListView {
     }
 
     fn toggle_collapsed(&mut self, task_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        // A group header is not a node: its fold is kept by the view alone.
+        if task_id.starts_with("group:") {
+            if !self.working_set.collapsed_groups.remove(task_id) {
+                self.working_set.collapsed_groups.insert(task_id.to_string());
+            }
+            self.rebuild_visible_list(window, cx);
+            return;
+        }
         let Some(task) = self.all_tasks.iter().find(|t| t.id == task_id) else {
             return;
         };
@@ -1803,7 +1825,24 @@ impl TaskListView {
         self.rebuild_visible_list(window, cx);
     }
 
+    /// Where selection goes instead of the group header at `ix`: the next row
+    /// when moving down (a header always has a child after it), else the one
+    /// above (its parent node).
+    fn past_group_header(&self, ix: IndexPath, cx: &mut Context<Self>) -> Option<IndexPath> {
+        let state = self.list_state.read(cx);
+        let items = state.delegate().items();
+        items.get(ix.row)?.group_header.as_ref()?;
+        let moving_up = self.last_selected.is_some_and(|last| last.row > ix.row);
+        let row = if moving_up { ix.row.saturating_sub(1) } else { ix.row + 1 };
+        Some(IndexPath::new(row.min(items.len().saturating_sub(1))))
+    }
+
     fn clamp_selection(&mut self, ix: IndexPath, cx: &mut Context<Self>) {
+        if let Some(target) = self.past_group_header(ix, cx) {
+            self.pending_revert = Some(target);
+            cx.notify();
+            return;
+        }
         let count = self.list_state.read(cx).delegate().items_count();
 
         if let Some(last) = self.last_selected {

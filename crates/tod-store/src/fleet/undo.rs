@@ -442,6 +442,7 @@ fn capture_outline_inverse(conn: &Connection, m: &OutlineMutation) -> Result<Opt
         | OutlineMutation::SetNodeTags { .. }
         | OutlineMutation::SetNodeEnvironment { .. }
         | OutlineMutation::SetNodeLifecycleConfig { .. }
+        | OutlineMutation::SetNodeGroups { .. }
         | OutlineMutation::EnableCapabilities { .. }
         | OutlineMutation::CreateObligation { .. }
         | OutlineMutation::RestoreObligation { .. }

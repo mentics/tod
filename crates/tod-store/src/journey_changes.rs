@@ -300,6 +300,11 @@ pub fn lifecycle_config_triggers_sql() -> String {
     node_keyed_triggers("node_lifecycle_config")
 }
 
+/// Triggers for `node_groups` (one row per node).
+pub fn groups_triggers_sql() -> String {
+    node_keyed_triggers("node_groups")
+}
+
 /// Triggers for `node_files_locations` (one row per node).
 pub fn files_locations_triggers_sql() -> String {
     node_keyed_triggers("node_files_locations")

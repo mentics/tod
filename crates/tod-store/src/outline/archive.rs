@@ -657,6 +657,9 @@ pub fn build_capability_archive(
         Capability::LifecycleConfig => {
             collect_cascade(conn, "node_lifecycle_config", "node_id", &node, &mut seen, &mut rows)?
         }
+        Capability::Groups => {
+            collect_cascade(conn, "node_groups", "node_id", &node, &mut seen, &mut rows)?
+        }
         Capability::Generator => {
             collect_cascade(conn, "node_generator_config", "node_id", &node, &mut seen, &mut rows)?;
             // Managed children, with everything hanging off them.

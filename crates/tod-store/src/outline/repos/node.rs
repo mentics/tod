@@ -192,6 +192,12 @@ impl<'a> NodeRepo<'a> {
                     params![&blob, now_ms()],
                 )?;
             }
+            Capability::Groups => {
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO node_groups (node_id, by_lifecycle, updated_at) VALUES (?1, 0, ?2)",
+                    params![&blob, now_ms()],
+                )?;
+            }
             Capability::Generator => {
                 // No additional initialization needed at enable time.
                 // Configuration is saved separately via SetGeneratorConfig mutation.
@@ -540,6 +546,10 @@ impl<'a> NodeRepo<'a> {
             Capability::LifecycleConfig => {
                 self.conn
                     .execute("DELETE FROM node_lifecycle_config WHERE node_id = ?1", params![blob])?;
+            }
+            Capability::Groups => {
+                self.conn
+                    .execute("DELETE FROM node_groups WHERE node_id = ?1", params![blob])?;
             }
             Capability::Generator => {
                 let gen_repo = crate::outline::repos::GeneratorRepo::new(self.conn);

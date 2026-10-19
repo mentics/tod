@@ -114,6 +114,11 @@ pub enum OutlineMutation {
         node_id: Uuid,
         skills: crate::lifecycle_config::Skills,
     },
+    /// The Groups capability's setting: group the children by lifecycle state.
+    SetNodeGroups {
+        node_id: Uuid,
+        by_lifecycle: bool,
+    },
     CreateObligation {
         obligation_id: Option<Uuid>,
         node_id: Uuid,
@@ -426,6 +431,7 @@ impl OutlineMutation {
                 | OutlineMutation::SetNodeTags { .. }
                 | OutlineMutation::SetNodeEnvironment { .. }
                 | OutlineMutation::SetNodeLifecycleConfig { .. }
+                | OutlineMutation::SetNodeGroups { .. }
                 | OutlineMutation::UpdateNodeTitle { .. }
                 | OutlineMutation::ReorderSibling { .. }
                 | OutlineMutation::ReparentNode { .. }
@@ -502,9 +508,17 @@ impl OutlineMutation {
                 title,
             } => {
                 guard_not_in_generator_subtree(conn, *parent_id)?;
-                create_text_node(
+                let created = create_text_node(
                     conn, *list_id, *parent_id, *anchor_id, *position, title, *node_id,
                 )?;
+                // Under a node that groups by lifecycle a node needs a
+                // lifecycle state to be there at all.
+                let parent = OutlineRepo::new(conn).get_entry(created)?.and_then(|e| e.parent_id);
+                if let Some(parent) = parent
+                    && crate::groups::by_lifecycle(conn, parent)?
+                {
+                    NodeRepo::new(conn).enable_capabilities(created, &[Capability::Lifecycle])?;
+                }
             }
             OutlineMutation::UpdateNodeTitle { node_id, title } => {
                 guard_not_managed(conn, *node_id)?;
@@ -524,6 +538,7 @@ impl OutlineMutation {
                 let list_id = outline_list_for_node(conn, *node_id)?;
                 bump_ordinals_after(conn, list_id, *parent_id, *ordinal)?;
                 OutlineRepo::new(conn).set_parent(*node_id, *parent_id, *ordinal)?;
+                crate::groups::place_valid(conn, *node_id)?;
             }
             OutlineMutation::ReorderSibling { node_id, direction } => {
                 reorder_sibling(conn, *node_id, *direction)?;
@@ -539,7 +554,12 @@ impl OutlineMutation {
                 node_id,
                 capability,
             } => {
-                return NodeRepo::new(conn).disable_capability_archive(*node_id, *capability);
+                let archive =
+                    NodeRepo::new(conn).disable_capability_archive(*node_id, *capability)?;
+                if *capability == Capability::Lifecycle {
+                    crate::groups::place_valid(conn, *node_id)?;
+                }
+                return Ok(archive);
             }
             OutlineMutation::RestoreCapability {
                 node_id,
@@ -605,6 +625,10 @@ impl OutlineMutation {
             OutlineMutation::SetNodeLifecycleConfig { node_id, skills } => {
                 require_capability(conn, *node_id, Capability::LifecycleConfig)?;
                 crate::lifecycle_config::set_skills(conn, *node_id, skills)?;
+            }
+            OutlineMutation::SetNodeGroups { node_id, by_lifecycle } => {
+                require_capability(conn, *node_id, Capability::Groups)?;
+                crate::groups::set_by_lifecycle(conn, *node_id, *by_lifecycle)?;
             }
             OutlineMutation::CreateObligation {
                 obligation_id,
@@ -1592,7 +1616,7 @@ fn create_text_node(
     Ok(node.id)
 }
 
-fn bump_ordinals_after(
+pub(crate) fn bump_ordinals_after(
     conn: &Connection,
     list_id: Uuid,
     parent_id: Option<Uuid>,
@@ -1854,6 +1878,14 @@ fn copy_capabilities(conn: &Connection, source_id: Uuid, new_id: Uuid) -> Result
                 let skills = crate::lifecycle_config::skills(conn, source_id)?;
                 if !skills.is_empty() {
                     crate::lifecycle_config::set_skills(conn, new_id, &skills)?;
+                }
+            }
+            Capability::Groups => {
+                if crate::groups::by_lifecycle(conn, source_id)? {
+                    conn.execute(
+                        "UPDATE node_groups SET by_lifecycle = 1 WHERE node_id = ?1",
+                        rusqlite::params![crate::outline::uuid_blob::uuid_to_blob(new_id)],
+                    )?;
                 }
             }
             Capability::Generator => {

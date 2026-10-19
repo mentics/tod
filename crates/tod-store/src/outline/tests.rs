@@ -3152,3 +3152,55 @@ fn undo_multi_level_move_restores_original_parent_and_index() {
     drop(t.store);
     let _ = fs::remove_dir_all(t.root);
 }
+
+#[test]
+fn groups_by_lifecycle_moves_nodes_without_lifecycle_down() {
+    let (store, root, list_id) = setup_store_with_list();
+    let outer = create_node_in(&store, list_id, None, "Outer");
+    let grouped = create_node_in(&store, list_id, Some(outer), "Grouped");
+    let with = create_node_in(&store, list_id, Some(grouped), "With");
+    let without = create_node_in(&store, list_id, Some(grouped), "Without");
+    let enable = |node, caps: Vec<Capability>| {
+        store
+            .enqueue_outline(OutlineMutation::EnableCapabilities { node_id: node, capabilities: caps })
+            .unwrap();
+    };
+    enable(grouped, vec![Capability::Groups]);
+    enable(with, vec![Capability::Lifecycle]);
+    store.writer().flush().unwrap();
+    // Off by default: nothing moves.
+    assert_eq!(parent_of(&store, without), Some(grouped));
+
+    store
+        .enqueue_outline(OutlineMutation::SetNodeGroups { node_id: grouped, by_lifecycle: true })
+        .unwrap();
+    store.writer().flush().unwrap();
+    assert_eq!(parent_of(&store, with), Some(grouped));
+    assert_eq!(parent_of(&store, without), Some(outer), "next sibling of the grouped node");
+
+    // A node made under it gets a lifecycle, and one that loses it moves out.
+    let made = create_node_in(&store, list_id, Some(grouped), "Made");
+    store.writer().flush().unwrap();
+    assert_eq!(parent_of(&store, made), Some(grouped));
+    store
+        .read(|conn| {
+            assert!(NodeRepo::new(conn).list_capabilities(made)?.contains(&Capability::Lifecycle));
+            Ok(())
+        })
+        .unwrap();
+    store
+        .enqueue_outline(OutlineMutation::DisableCapability { node_id: with, capability: Capability::Lifecycle })
+        .unwrap();
+    store.writer().flush().unwrap();
+    assert_eq!(parent_of(&store, with), Some(outer));
+
+    // Moving one in without a lifecycle sends it down again.
+    store
+        .enqueue_outline(OutlineMutation::ReparentNode { node_id: without, parent_id: Some(grouped), ordinal: 0 })
+        .unwrap();
+    store.writer().flush().unwrap();
+    assert_eq!(parent_of(&store, without), Some(outer));
+
+    drop(store);
+    let _ = fs::remove_dir_all(root);
+}

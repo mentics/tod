@@ -95,6 +95,12 @@ pub struct TaskItem {
     /// The sort text of a generator node's config (`sort_query`); empty or
     /// absent means none.
     pub generator_sort: Option<String>,
+    /// The node groups its children by lifecycle state: the tree shows a
+    /// header row per state, see [`group_children_by_lifecycle`].
+    pub groups_by_lifecycle: bool,
+    /// Set on a fake header row (not a node, never selectable): the
+    /// lifecycle state whose children follow it.
+    pub group_header: Option<String>,
 }
 
 /// What was acting on a node: the lifecycle processor, or only the chat panel.
@@ -222,6 +228,9 @@ pub struct ListWorkingSet {
     pub running_only: bool,
     /// Show only nodes whose run ended to wait (`awaiting`), plus their ancestors.
     pub awaiting_only: bool,
+    /// Group header rows (see [`group_children_by_lifecycle`]) the user has
+    /// collapsed, by header id. Not persisted.
+    pub collapsed_groups: HashSet<String>,
 }
 
 impl ListWorkingSet {
@@ -237,6 +246,7 @@ impl ListWorkingSet {
             needs_you_only: false,
             running_only: false,
             awaiting_only: false,
+            collapsed_groups: HashSet::new(),
         }
     }
 
@@ -605,6 +615,144 @@ pub fn filter_and_sort_tasks(
     search_query: &str,
     working_set: &ListWorkingSet,
 ) -> Vec<TaskItem> {
+    group_children_by_lifecycle(
+        filter_and_sort_flat(tasks, search_query, working_set),
+        &working_set.collapsed_groups,
+    )
+}
+
+/// The id of the header row for `state` under the node `parent_id`.
+pub fn group_header_id(parent_id: &str, state: &str) -> String {
+    format!("group:{parent_id}:{state}")
+}
+
+/// Present each node that groups its children by lifecycle state: its
+/// children are ordered by state (the order within a state is kept), each run
+/// under a header row for that state, indented one level. A header is a fake
+/// row (`group_header` set, not a node, never selectable) made only while a
+/// child is in that state, so no header is ever empty. `collapsed` holds
+/// the ids of headers whose children are hidden.
+pub fn group_children_by_lifecycle(
+    visible: Vec<TaskItem>,
+    collapsed: &HashSet<String>,
+) -> Vec<TaskItem> {
+    if !visible.iter().any(|t| t.groups_by_lifecycle) {
+        return visible;
+    }
+    let mut out = Vec::with_capacity(visible.len() + 8);
+    emit_grouped(&visible, 0, collapsed, &mut out);
+    out
+}
+
+/// `rows` are sibling subtrees in tree order; `bump` is how many levels the
+/// headers above them add to their depth.
+fn emit_grouped(rows: &[TaskItem], bump: usize, collapsed: &HashSet<String>, out: &mut Vec<TaskItem>) {
+    let mut idx = 0;
+    while idx < rows.len() {
+        let row = &rows[idx];
+        let mut end = idx + 1;
+        while end < rows.len() && rows[end].depth > row.depth {
+            end += 1;
+        }
+        let mut shown = row.clone();
+        shown.depth += bump;
+        out.push(shown);
+        let children = &rows[idx + 1..end];
+        if row.groups_by_lifecycle && !children.is_empty() {
+            let child_depth = children.iter().map(|c| c.depth).min().unwrap_or(row.depth + 1);
+            // One block per child: the child and everything below it.
+            let mut blocks: Vec<&[TaskItem]> = Vec::new();
+            let mut start = 0;
+            for at in 1..=children.len() {
+                if at == children.len() || children[at].depth == child_depth {
+                    blocks.push(&children[start..at]);
+                    start = at;
+                }
+            }
+            blocks.sort_by_key(|b| lifecycle_rank(&b[0].lifecycle));
+            let mut run = 0;
+            while run < blocks.len() {
+                let state = blocks[run][0].lifecycle.clone();
+                let mut run_end = run + 1;
+                while run_end < blocks.len() && blocks[run_end][0].lifecycle == state {
+                    run_end += 1;
+                }
+                if state.is_empty() {
+                    // Cannot be grouped (a move to a valid place is pending).
+                    for block in &blocks[run..run_end] {
+                        emit_grouped(block, bump, collapsed, out);
+                    }
+                } else {
+                    let mut header = group_header_row(row, &state, row.depth + bump + 1);
+                    header.collapsed = collapsed.contains(&header.id);
+                    let hide = header.collapsed;
+                    out.push(header);
+                    if !hide {
+                        for block in &blocks[run..run_end] {
+                            emit_grouped(block, bump + 1, collapsed, out);
+                        }
+                    }
+                }
+                run = run_end;
+            }
+        } else {
+            emit_grouped(children, bump, collapsed, out);
+        }
+        idx = end;
+    }
+}
+
+/// A header row under `parent`, made from it so every field has a value.
+fn group_header_row(parent: &TaskItem, state: &str, depth: usize) -> TaskItem {
+    let mut header = parent.clone();
+    header.id = group_header_id(&parent.id, state);
+    header.title = state.to_string();
+    header.group_header = Some(state.to_string());
+    header.groups_by_lifecycle = false;
+    header.ticket_id = None;
+    header.lifecycle = String::new();
+    header.tags = Vec::new();
+    header.parent_id = Some(parent.id.clone());
+    header.depth = depth;
+    header.collapsed = false;
+    header.has_children = true;
+    header.has_actions = false;
+    header.has_files = false;
+    header.has_spec = false;
+    header.has_agent = false;
+    header.is_work_node = false;
+    header.live_run_count = 0;
+    header.shells = Vec::new();
+    header.requirement_count = 0;
+    header.constraint_count = 0;
+    header.incoming_count = 0;
+    header.managed = false;
+    header.external_id = None;
+    header.source_type = None;
+    header.managed_count = None;
+    header.generator_status = None;
+    header.generator_error = None;
+    header.accept_ready = false;
+    header.linked_copy = false;
+    header.has_copies = false;
+    header.ticket_terminal = false;
+    header.needs_you_count = 0;
+    header.waiting_since = None;
+    header.status_override = None;
+    header.lifecycle_running = false;
+    header.awaiting = false;
+    header.chat_running = false;
+    header.finished_run = None;
+    header.metadata = None;
+    header.generator_sort = None;
+    header
+}
+
+fn filter_and_sort_flat(
+    tasks: &[TaskItem],
+    search_query: &str,
+    working_set: &ListWorkingSet,
+) -> Vec<TaskItem> {
     let by_id: HashMap<&str, &TaskItem> = tasks.iter().map(|t| (t.id.as_str(), t)).collect();
     // Searching looks at every node, whether or not a collapsed ancestor hides
     // it in the tree; without a query the collapsed subtrees stay hidden.
@@ -680,9 +828,14 @@ pub fn selection_after_delete(
     }
     if let Some(del_ix) = visible_before.iter().position(|t| t.id == deleted_id) {
         let ix = del_ix.min(visible_after.len().saturating_sub(1));
-        return Some(visible_after[ix].id.clone());
+        // A group header is not selectable: take the nearest node instead.
+        let node = visible_after[ix..]
+            .iter()
+            .chain(visible_after[..ix].iter().rev())
+            .find(|t| t.group_header.is_none());
+        return node.map(|t| t.id.clone());
     }
-    visible_after.first().map(|t| t.id.clone())
+    visible_after.iter().find(|t| t.group_header.is_none()).map(|t| t.id.clone())
 }
 
 pub fn nearest_visible_id(
@@ -712,14 +865,16 @@ pub fn nearest_visible_id(
             needs_you_only: working_set.needs_you_only,
             running_only: working_set.running_only,
             awaiting_only: working_set.awaiting_only,
+            collapsed_groups: working_set.collapsed_groups.clone(),
         },
     );
     let prev_ix = match all.iter().position(|t| t.id == previous_id) {
         Some(ix) => ix,
-        None => return visible.first().map(|t| t.id.clone()),
+        None => return visible.iter().find(|t| t.group_header.is_none()).map(|t| t.id.clone()),
     };
     visible
         .iter()
+        .filter(|t| t.group_header.is_none())
         .min_by_key(|t| {
             all.iter()
                 .position(|a| a.id == t.id)
@@ -776,6 +931,8 @@ mod tests {
             awaiting: false,
             chat_running: false,
             finished_run: None,
+            groups_by_lifecycle: false,
+            group_header: None,
         }
     }
 
@@ -1168,5 +1325,59 @@ mod tests {
             .map(|t| t.title.as_str())
             .collect();
         assert_eq!(b_children, vec!["One", "Two"]);
+    }
+
+    #[test]
+    fn lifecycle_groups_order_children_and_make_headers_only_for_present_states() {
+        let mut parent = sample("p", "Parent", "ready", &[]);
+        parent.groups_by_lifecycle = true;
+        parent.has_children = true;
+        let child = |id: &str, state: &str| {
+            let mut c = sample(id, id, state, &[]);
+            c.parent_id = Some("p".into());
+            c.depth = 1;
+            c
+        };
+        let mut grandchild = sample("g", "g", "active", &[]);
+        grandchild.parent_id = Some("c1".into());
+        grandchild.depth = 2;
+        let tasks = vec![
+            parent,
+            child("c1", "active"),
+            grandchild,
+            child("c2", "design"),
+            child("c3", "active"),
+        ];
+        let mut ws = ListWorkingSet::default_sort();
+        let rows = filter_and_sort_tasks(&tasks, "", &ws);
+        let shape: Vec<(String, usize)> = rows.iter().map(|t| (t.id.clone(), t.depth)).collect();
+        let expect: Vec<(String, usize)> = [
+            ("p", 0),
+            ("group:p:design", 1),
+            ("c2", 2),
+            ("group:p:active", 1),
+            ("c1", 2),
+            ("g", 3),
+            ("c3", 2),
+        ]
+        .iter()
+        .map(|(id, d)| (id.to_string(), *d))
+        .collect();
+        assert_eq!(shape, expect);
+        assert!(rows[1].group_header.as_deref() == Some("design") && rows[0].group_header.is_none());
+
+        // Collapsing a header hides its children only.
+        ws.collapsed_groups.insert("group:p:active".into());
+        let ids: Vec<String> =
+            filter_and_sort_tasks(&tasks, "", &ws).into_iter().map(|t| t.id).collect();
+        assert_eq!(ids, ["p", "group:p:design", "c2", "group:p:active"]);
+
+        // Deleting the only child in a state leaves no header for it.
+        let without: Vec<TaskItem> = tasks.iter().filter(|t| t.id != "c2").cloned().collect();
+        let ids: Vec<String> = filter_and_sort_tasks(&without, "", &ListWorkingSet::default_sort())
+            .into_iter()
+            .map(|t| t.id)
+            .collect();
+        assert_eq!(ids, ["p", "group:p:active", "c1", "g", "c3"]);
     }
 }

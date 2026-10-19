@@ -101,6 +101,8 @@ pub fn load_tasks_from_store(store: &FleetStore, list_id: Option<Uuid>) -> Vec<T
             awaiting: false,
             chat_running: false,
             finished_run: None,
+            groups_by_lifecycle: row.groups_by_lifecycle,
+            group_header: None,
             }
         })
         .collect()
@@ -160,6 +162,8 @@ pub fn large_fixture_set(base_count: usize) -> Vec<TaskItem> {
             awaiting: false,
             chat_running: false,
             finished_run: None,
+            groups_by_lifecycle: false,
+            group_header: None,
         })
         .collect()
 }

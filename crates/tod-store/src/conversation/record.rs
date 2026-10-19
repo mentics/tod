@@ -200,6 +200,7 @@ pub fn classify(mutation: &OutlineMutation) -> Option<(ActionKind, Entity, Uuid)
         | M::AcceptGeneratedTicket { .. }
         | M::SetNodeEnvironment { .. }
         | M::SetNodeLifecycleConfig { .. }
+        | M::SetNodeGroups { .. }
         | M::SetRefreshStatus { .. } => return None,
     })
 }

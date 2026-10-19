@@ -14,6 +14,7 @@ pub enum Capability {
     Ticket,
     Environment,
     LifecycleConfig,
+    Groups,
 }
 
 impl Capability {
@@ -28,6 +29,7 @@ impl Capability {
             Self::Ticket => "ticket",
             Self::Environment => "environment",
             Self::LifecycleConfig => "lifecycle_config",
+            Self::Groups => "groups",
         }
     }
 
@@ -42,11 +44,12 @@ impl Capability {
             "ticket" => Some(Self::Ticket),
             "environment" => Some(Self::Environment),
             "lifecycle_config" | "lifecycle-config" => Some(Self::LifecycleConfig),
+            "groups" => Some(Self::Groups),
             _ => None,
         }
     }
 
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::Spec,
         Self::Lifecycle,
         Self::Agent,
@@ -54,6 +57,7 @@ impl Capability {
         Self::Ticket,
         Self::Environment,
         Self::LifecycleConfig,
+        Self::Groups,
         Self::Generator,
         Self::Tags,
     ];
@@ -69,6 +73,7 @@ impl Capability {
             Self::Ticket => "Ticket",
             Self::Environment => "Environment",
             Self::LifecycleConfig => "Lifecycle config",
+            Self::Groups => "Groups",
         }
     }
 
@@ -85,6 +90,7 @@ impl Capability {
             Self::Tags => "Freeform labels for organizing and filtering nodes",
             Self::Environment => "Variables and credentials the agents working below this node can use",
             Self::LifecycleConfig => "Skills the agent for each lifecycle phase uses, for this node and everything below it",
+            Self::Groups => "Show the children grouped, for example by lifecycle state",
         }
     }
 
@@ -113,6 +119,7 @@ impl Capability {
             Self::LifecycleConfig => {
                 "Disabling Lifecycle config will remove the per-phase skills set on this node."
             }
+            Self::Groups => "Disabling Groups will show this node's children in a plain list again.",
         }
     }
 
@@ -214,6 +221,8 @@ pub struct FlatNodeRow {
     pub metadata: Option<std::sync::Arc<serde_json::Value>>,
     /// The sort text (`sort_query`) of a generator node's config.
     pub generator_sort: Option<String>,
+    /// True when the node groups its children by lifecycle state (Groups).
+    pub groups_by_lifecycle: bool,
 }
 
 /// Whether the ticket a node's metadata (`EXTRA_CONTENT_METADATA`) describes

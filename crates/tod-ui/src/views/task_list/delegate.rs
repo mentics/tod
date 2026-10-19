@@ -222,6 +222,40 @@ impl ListDelegate for TaskListDelegate {
         let muted_bg = cx.theme().muted;
         let danger = cx.theme().danger;
 
+        if let Some(state) = item.group_header.clone() {
+            // A lifecycle group header: a label for the rows under it, not a
+            // node. It is never selected; a click only folds the group.
+            let id = item.id.clone();
+            let collapsed = item.collapsed;
+            let label = group_label(&state);
+            let row = h_flex()
+                .size_full()
+                .items_center()
+                .pl(px(item.depth as f32 * TREE_LEVEL_STEP))
+                .gap_1()
+                .cursor_pointer()
+                .text_xs()
+                .font_semibold()
+                .text_color(muted_foreground)
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |_, _, _, cx| {
+                        cx.stop_propagation();
+                        sink.borrow_mut()
+                            .push(RowAction::ToggleCollapsed { task_id: id.clone() });
+                        cx.notify();
+                    }),
+                )
+                .child(div().w(px(TREE_CHEVRON_WIDTH)).child(if collapsed { "▸" } else { "▾" }))
+                .child(label);
+            return Some(
+                ListItem::new(("task-row", ix.row))
+                    .disabled(true)
+                    .h(TREE_ROW_HEIGHT)
+                    .child(row),
+            );
+        }
+
         let is_work = item.is_work_node;
         let display_title = if item.title.is_empty() {
             "(new item)".to_string()
@@ -796,6 +830,15 @@ impl ListDelegate for TaskListDelegate {
         _window: &mut Window,
         _cx: &mut Context<ListState<Self>>,
     ) {
+    }
+}
+
+/// The header text for a lifecycle state: its name, capitalized.
+fn group_label(state: &str) -> String {
+    let mut chars = state.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
     }
 }
 

@@ -80,6 +80,8 @@ struct TreeData {
     metadata: HashMap<Uuid, Arc<serde_json::Value>>,
     /// Generator node → the sort text of its config.
     generator_sort: HashMap<Uuid, String>,
+    /// Nodes that group their children by lifecycle state (Groups capability).
+    groups_by_lifecycle: HashSet<Uuid>,
 }
 
 impl TreeData {
@@ -255,6 +257,22 @@ impl TreeData {
         drop(rows);
         drop(stmt);
 
+        let mut groups_by_lifecycle = HashSet::new();
+        let mut stmt = conn.prepare(
+            "SELECT g.node_id
+             FROM node_groups g
+             JOIN outline_entries e ON e.node_id = g.node_id
+             JOIN node_capabilities c ON c.node_id = g.node_id AND c.capability = 'groups'
+             WHERE e.list_id = ?1 AND g.by_lifecycle = 1",
+        )?;
+        let mut rows = stmt.query(params![list_blob])?;
+        while let Some(row) = rows.next()? {
+            let id_blob: Vec<u8> = row.get(0)?;
+            groups_by_lifecycle.insert(blob_to_uuid_sql(&id_blob)?);
+        }
+        drop(rows);
+        drop(stmt);
+
         Ok(Self {
             nodes,
             managed,
@@ -271,6 +289,7 @@ impl TreeData {
             ticket_terminal,
             metadata,
             generator_sort,
+            groups_by_lifecycle,
         })
     }
 
@@ -418,6 +437,7 @@ fn walk(
                 None
             },
             generator_sort: data.generator_sort.get(&entry.node_id).cloned(),
+            groups_by_lifecycle: data.groups_by_lifecycle.contains(&entry.node_id),
         });
         if include_collapsed || !entry.collapsed {
             let generator = if data.is_generator(entry.node_id) {

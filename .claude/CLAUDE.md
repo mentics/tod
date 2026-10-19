@@ -571,6 +571,18 @@ opening carries, via a `skills` field on `ImplementRequest` and
 the task editor (`views::lifecycle_config_editor`) or with `tod-cli capabilities
 set <node> lifecycle-config`. Edits are not recorded in a conversation's change set.
 
+**Groups** (`Capability::Groups`, `tod_store::groups`, table `node_groups`)
+has one setting, `by_lifecycle`. The node tree then shows the node's children
+under a header per lifecycle state, in lifecycle order, made only while a child
+is in that state (`tod_core::task::model::group_children_by_lifecycle`, applied
+by `filter_and_sort_tasks`; a header is a `TaskItem` with `group_header` set,
+never a node, never selectable, folded in `ListWorkingSet::collapsed_groups`).
+Children must have Lifecycle: `groups::place_valid` moves one that does not down
+to the first place that accepts it (the next sibling of the grouped node, and so
+on up), when the setting is turned on, a node is reparented under it, or a child
+loses Lifecycle; a node created under it gets Lifecycle. These moves are silent
+and not recorded in a conversation's change set.
+
 ### `crates/tod-core::interview` — conversational task creation
 
 The interview flow turns a conversation with two agents (question maker, answer processor) into obligations. All interview data — questions (queue and history), agent memory, a trigger-fed change log, and agent sessions — lives in the database (`tod_store::interview`, schema v15); every write is an `InterviewCommand` run on the fleet writer and attributed to an actor (the user, or an agent session via `TOD_INTERVIEW_ACTOR`). `driver.rs` decides when each agent takes a turn and which session it goes to (reuse, resume, or rotate to a fresh snapshot); `context.rs` builds the snapshot a session gets once and the per-turn delta of changes it did not make itself; `client.rs` is how `tod-cli` and the mock agents reach the data (mutation socket when the app is running, direct store otherwise); `mock.rs` plays both agents for `--agent mock`; `routing.rs` decides completion (`interview_work_remains` gates whether the task list can proceed). `db.rs` is the interview-session store. Spec: `doc/new-reqs/interview-protocol.md`.
