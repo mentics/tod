@@ -63,8 +63,8 @@ pub fn run(inv: Invocation) -> anyhow::Result<String> {
 }
 
 /// `--node`, else the node a review conversation is running on.
-fn node(args: &Args) -> anyhow::Result<Uuid> {
-    if let Some(node) = args.uuid("--node")? {
+fn node(inv: &Invocation, args: &Args) -> anyhow::Result<Uuid> {
+    if let Some(node) = crate::node::flag(inv, args, "--node")? {
         return Ok(node);
     }
     env_uuid(IMPLEMENT_NODE_ENV)?
@@ -115,7 +115,7 @@ fn finding_line(f: &ReviewFinding) -> String {
 }
 
 fn list(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
-    let node = node(args)?;
+    let node = node(inv, args)?;
     let open_only = args.has("--open");
     let findings: Vec<ReviewFinding> = inv
         .client()
@@ -159,7 +159,7 @@ fn show(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
 }
 
 fn add(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
-    let node = node(args)?;
+    let node = node(inv, args)?;
     let line = args
         .get("--line")
         .map(|raw| {

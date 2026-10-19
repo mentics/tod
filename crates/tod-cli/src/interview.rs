@@ -77,7 +77,7 @@ pub fn content(inv: Invocation) -> anyhow::Result<String> {
     let Some((command, args)) = split(&inv, CONTENT_USAGE)? else {
         return Ok(CONTENT_USAGE.trim_end().to_string());
     };
-    let node = args.node()?;
+    let node = crate::node::required(&inv, &args)?;
     let ty = args.require("--type")?;
     if !["details", "design", "plan", "summary"].contains(&ty) {
         anyhow::bail!("--type must be details|design|plan|summary");
@@ -114,7 +114,7 @@ pub fn questions(inv: Invocation) -> anyhow::Result<String> {
     let Some((command, args)) = split(&inv, QUESTIONS_USAGE)? else {
         return Ok(QUESTIONS_USAGE.trim_end().to_string());
     };
-    let node = args.node()?;
+    let node = crate::node::required(&inv, &args)?;
     let client = inv.client();
     match command.as_str() {
         "list" => {
@@ -191,7 +191,7 @@ pub fn memory(inv: Invocation) -> anyhow::Result<String> {
     let Some((command, args)) = split(&inv, MEMORY_USAGE)? else {
         return Ok(MEMORY_USAGE.trim_end().to_string());
     };
-    let node = args.node()?;
+    let node = crate::node::required(&inv, &args)?;
     let client = inv.client();
     match command.as_str() {
         "list" => {

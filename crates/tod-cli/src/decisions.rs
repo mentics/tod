@@ -42,8 +42,8 @@ answered and withdrawn ones too.
 `show` prints one decision and its full answer log, oldest first.
 ";
 
-fn node(args: &Args) -> anyhow::Result<Uuid> {
-    if let Some(node) = args.uuid("--node")? {
+fn node(inv: &Invocation, args: &Args) -> anyhow::Result<Uuid> {
+    if let Some(node) = crate::node::flag(inv, args, "--node")? {
         return Ok(node);
     }
     env_uuid(IMPLEMENT_NODE_ENV)?
@@ -136,7 +136,7 @@ fn parse_evidence(raw: &str) -> anyhow::Result<EvidenceRef> {
 }
 
 fn ask(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
-    let node = node(args)?;
+    let node = node(inv, args)?;
     let question = args
         .target("a question (the first positional argument, quoted; there is no --question flag)")?
         .to_string();
@@ -222,7 +222,7 @@ fn decision_line(d: &Decision) -> String {
 }
 
 fn list(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
-    let node = node(args)?;
+    let node = node(inv, args)?;
     let all = args.has("--all");
     let decisions: Vec<Decision> = inv.client().read(|conn| {
         let repo = DecisionRepo::new(conn);
