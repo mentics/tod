@@ -695,7 +695,13 @@ impl TaskPanel {
         let mut actions = self.runner_actions_for_place(status, cx);
         // A scheduled GitHub look can be brought forward wherever the node
         // runs (here, in a dev container, in a cloud sandbox).
-        if matches!(status, RunnerStatus::Awaiting { .. }) && !actions.menu.contains(&RunnerAction::PollNow) {
+        // A cloud node's supervisor may have stopped without a wait reaching
+        // here (the stop is not synced), so there it is offered in
+        // `approved` and `merged` whatever the status says.
+        let waits_on_github = matches!(status, RunnerStatus::Awaiting { .. })
+            || (self.runner.cloud.as_ref().is_some_and(|cloud| cloud.lost_at.is_none())
+                && matches!(self.runner.lifecycle.as_str(), "approved" | "merged"));
+        if waits_on_github && !actions.menu.contains(&RunnerAction::PollNow) && !actions.menu.contains(&RunnerAction::CheckNow) {
             actions.menu.insert(0, RunnerAction::CheckNow);
         }
         actions
@@ -890,6 +896,10 @@ impl TaskPanel {
                 use tod_core::autopilot::GithubCheck;
                 let (note, failed) = match result {
                     Ok(GithubCheck::Waiting { what, .. }) => (format!("Checked GitHub: waiting for {what}"), false),
+                    Ok(GithubCheck::Clear) if this.runner.cloud.is_some() => (
+                        "Checked GitHub: nothing left to wait for. Sync now so its sandbox carries on.".to_string(),
+                        false,
+                    ),
                     Ok(GithubCheck::Clear) => {
                         ("Checked GitHub: nothing left to wait for. Start the runner to go on.".to_string(), false)
                     }
