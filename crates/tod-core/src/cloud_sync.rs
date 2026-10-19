@@ -341,7 +341,7 @@ impl Orchestrator for HttpOrchestrator {
             .auth(self.agent.post(&self.url(user, "changes")))
             .send_json(changes)
             .context("orchestrator changes")?;
-        let v = Self::finish(resp, "changes")?;
+        let v = Self::finish(resp, "changes").map_err(older_orchestrator_hint)?;
         Ok(serde_json::from_value(v)?)
     }
 
@@ -1123,6 +1123,20 @@ pub fn run_in_cloud(
     Ok(record)
 }
 
+/// An orchestrator that rejects rows this app wrote (a constraint or a
+/// column it does not have) is older than the app: says so, and how to bring
+/// it up to date. Any other error passes through unchanged.
+fn older_orchestrator_hint(err: anyhow::Error) -> anyhow::Error {
+    let text = format!("{err:#}");
+    if text.contains("CHECK constraint failed") || text.contains("no such column") || text.contains("no such table") {
+        return err.context(
+            "the orchestrator is older than this app and does not accept what it wrote; \
+             update it with `scripts/build-sandbox-binaries.sh` then `tod-sandbox orchestrator`",
+        );
+    }
+    err
+}
+
 /// The settings a node's supervisor reads in its sandbox, as `tod.yml`: only
 /// what it acts on there (`lifecycle`: which repositories release, and
 /// `pr_readiness`: the review schedule), so nothing else of this machine's
@@ -1183,3 +1197,22 @@ pub mod deploy;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod older_orchestrator_tests {
+    use super::older_orchestrator_hint;
+
+    #[test]
+    fn a_rejected_row_says_the_orchestrator_is_older() {
+        let err = anyhow::anyhow!("orchestrator changes: 500: CHECK constraint failed: capability IN ('spec')");
+        let text = format!("{:#}", older_orchestrator_hint(err));
+        assert!(text.contains("older than this app"), "{text}");
+        assert!(text.contains("CHECK constraint failed"), "{text}");
+    }
+
+    #[test]
+    fn other_errors_are_left_alone() {
+        let text = format!("{:#}", older_orchestrator_hint(anyhow::anyhow!("connection refused")));
+        assert_eq!(text, "connection refused");
+    }
+}
