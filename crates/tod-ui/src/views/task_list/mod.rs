@@ -710,7 +710,14 @@ impl TaskListView {
     /// `render` does too, so a path that forgets still can't strand the drawer
     /// on a node that is no longer selected.
     fn publish_selection(&mut self, cx: &mut Context<Self>) {
-        if self.published_selection == self.working_set.selected_id {
+        // A group header is selectable (so Left/Right can fold it) but is no
+        // node: what follows the selection shows nothing, as with none.
+        let selected = self
+            .working_set
+            .selected_id
+            .clone()
+            .filter(|id| !id.starts_with("group:"));
+        if self.published_selection == selected {
             return;
         }
         // A draft row has no node yet; the drawer stays on the last real one.
@@ -719,7 +726,7 @@ impl TaskListView {
                 return;
             }
         }
-        self.published_selection = self.working_set.selected_id.clone();
+        self.published_selection = selected;
         cx.emit(TaskListEvent::SelectionChanged {
             task_id: self.published_selection.clone(),
         });
@@ -1120,6 +1127,14 @@ impl TaskListView {
     }
 
     fn toggle_collapsed(&mut self, task_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        // A group header is not a node: its fold is kept by the view alone.
+        if task_id.starts_with("group:") {
+            if !self.working_set.collapsed_groups.remove(task_id) {
+                self.working_set.collapsed_groups.insert(task_id.to_string());
+            }
+            self.rebuild_visible_list(window, cx);
+            return;
+        }
         let Some(task) = self.all_tasks.iter().find(|t| t.id == task_id) else {
             return;
         };
@@ -1561,6 +1576,18 @@ impl TaskListView {
                         .cloned()
                 })
             })
+            // A selected group header is no node: nothing acts on it.
+            .filter(|t| t.group_header.is_none())
+    }
+
+    /// The group header row that is selected, if one is.
+    fn selected_group_header(&self, cx: &Context<Self>) -> Option<TaskItem> {
+        self.list_state
+            .read(cx)
+            .delegate()
+            .selected_item()
+            .filter(|t| t.group_header.is_some())
+            .cloned()
     }
 
     /// Remove a node and its subtree from the outline tree.
@@ -2365,6 +2392,17 @@ impl TaskListView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let Some(header) = self.selected_group_header(cx) {
+            if header.collapsed {
+                // Its parent node is the row that owns the header.
+                if let Some(parent) = header.parent_id {
+                    self.select_task_by_id(&parent, window, cx);
+                }
+            } else {
+                self.toggle_collapsed(&header.id, window, cx);
+            }
+            return;
+        }
         let Some(task_id) = self.working_set.selected_id.clone() else {
             return;
         };
@@ -2403,6 +2441,12 @@ impl TaskListView {
     }
 
     fn on_expand(&mut self, _: &TaskListExpand, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(header) = self.selected_group_header(cx) {
+            if header.collapsed {
+                self.toggle_collapsed(&header.id, window, cx);
+            }
+            return;
+        }
         let Some(task_id) = self.working_set.selected_id.clone() else {
             return;
         };

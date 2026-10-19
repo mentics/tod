@@ -341,7 +341,7 @@ impl Orchestrator for HttpOrchestrator {
             .auth(self.agent.post(&self.url(user, "changes")))
             .send_json(changes)
             .context("orchestrator changes")?;
-        let v = Self::finish(resp, "changes")?;
+        let v = Self::finish(resp, "changes").map_err(older_orchestrator_hint)?;
         Ok(serde_json::from_value(v)?)
     }
 
@@ -1005,6 +1005,7 @@ pub fn ensure_node_sandbox(
         started.elapsed().as_secs_f64()
     ));
 
+    push_supervisor_settings(&bx, &url, root, node_id)?;
     progress("waking the node…");
     let poke = format!("{}/port/{}/poke", url.trim_end_matches('/'), tod_sandbox::blaxel::RELAY_PORT);
     let resp = ureq::post(&poke)
@@ -1122,8 +1123,96 @@ pub fn run_in_cloud(
     Ok(record)
 }
 
+/// An orchestrator that rejects rows this app wrote (a constraint or a
+/// column it does not have) is older than the app: says so, and how to bring
+/// it up to date. Any other error passes through unchanged.
+fn older_orchestrator_hint(err: anyhow::Error) -> anyhow::Error {
+    let text = format!("{err:#}");
+    if text.contains("CHECK constraint failed") || text.contains("no such column") || text.contains("no such table") {
+        return err.context(
+            "the orchestrator is older than this app and does not accept what it wrote; \
+             update it with `scripts/build-sandbox-binaries.sh` then `tod-sandbox orchestrator`",
+        );
+    }
+    err
+}
+
+/// The settings a node's supervisor reads in its sandbox, as `tod.yml`: only
+/// what it acts on there (`lifecycle`: which repositories release, and
+/// `pr_readiness`: the review schedule), so nothing else of this machine's
+/// settings leaves it. Without them the supervisor judges a merged pull
+/// request by the defaults, and waits for a release a `merge` repository
+/// never makes.
+pub fn supervisor_settings(root: &Path) -> Result<String> {
+    let all = tod_store::TodSettings::load(&tod_store::TodPaths::at(root))?;
+    let mut shared = tod_store::TodSettings::default();
+    shared.lifecycle = all.lifecycle;
+    shared.pr_readiness = all.pr_readiness;
+    serde_yaml::to_string(&shared).context("serialize the supervisor's settings")
+}
+
+/// Writes [`supervisor_settings`] into the node's sandbox, where its
+/// supervisor loads them from its state directory.
+fn push_supervisor_settings(bx: &tod_sandbox::blaxel::Blaxel, url: &str, root: &Path, node_id: &str) -> Result<()> {
+    let path = format!(
+        "{}/{node_id}/{}",
+        tod_store::fleet::cli_relay::SUPERVISOR_STATE_ROOT,
+        tod_store::paths::SETTINGS_FILE
+    );
+    bx.upload(url, &path, supervisor_settings(root)?.as_bytes(), "0644")
+        .with_context(|| format!("send the settings to the supervisor ({path})"))
+}
+
+/// Wakes `node_id`'s supervisor now, instead of at its next scheduled check:
+/// sends what changed here (a cancelled wait) to the orchestrator, then
+/// pokes the node's sandbox, which pulls it and goes on. Returns what it
+/// did. Blocks on the network: never on the UI thread.
+pub fn wake_node(fleet: &FleetStore, root: &Path, node_id: &str) -> Result<String> {
+    let row = cloud_node(fleet, node_id).ok_or_else(|| anyhow!("this node does not run in the cloud"))?;
+    let (orch, user) = resolve(root)?;
+    sync(fleet, root, &orch, &user).context("send the change to the orchestrator")?;
+    let sandboxes = tod_store::fleet::sandbox::Sandboxes::load(root)?;
+    let bx = sandboxes.blaxel()?;
+    let info = bx
+        .get(&row.sandbox)?
+        .ok_or_else(|| anyhow!("sandbox {} no longer exists", row.sandbox))?;
+    let url = info.url.ok_or_else(|| anyhow!("sandbox {} has no URL", row.sandbox))?;
+    push_supervisor_settings(&bx, &url, root, node_id)?;
+    let poke = format!("{}/port/{}/poke", url.trim_end_matches('/'), tod_sandbox::blaxel::RELAY_PORT);
+    let resp = ureq::post(&poke)
+        .header("Authorization", &format!("Bearer {}", bx.token()))
+        .config()
+        .http_status_as_error(false)
+        .build()
+        .send_empty()
+        .context("poke the node")?;
+    if !resp.status().is_success() {
+        bail!("poking sandbox {} got {}", row.sandbox, resp.status());
+    }
+    Ok(format!("woke the supervisor in {}", row.sandbox))
+}
+
 pub mod lost;
 pub mod deploy;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod older_orchestrator_tests {
+    use super::older_orchestrator_hint;
+
+    #[test]
+    fn a_rejected_row_says_the_orchestrator_is_older() {
+        let err = anyhow::anyhow!("orchestrator changes: 500: CHECK constraint failed: capability IN ('spec')");
+        let text = format!("{:#}", older_orchestrator_hint(err));
+        assert!(text.contains("older than this app"), "{text}");
+        assert!(text.contains("CHECK constraint failed"), "{text}");
+    }
+
+    #[test]
+    fn other_errors_are_left_alone() {
+        let text = format!("{:#}", older_orchestrator_hint(anyhow::anyhow!("connection refused")));
+        assert_eq!(text, "connection refused");
+    }
+}

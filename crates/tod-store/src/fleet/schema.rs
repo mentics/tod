@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Current fleet schema epoch stored in `PRAGMA user_version`.
-pub const CURRENT_USER_VERSION: i32 = 82;
+pub const CURRENT_USER_VERSION: i32 = 83;
 
 const BUSY_TIMEOUT_MS: i64 = 5000;
 
@@ -452,7 +452,7 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
         // When the orchestrator found a cloud node's sandbox gone
         // (`crate::cloud_nodes::mark_lost`); synced with the rest of the row.
         crate::cloud_nodes::add_lost_at(conn)?;
-    crate::waits::add_detail(conn)?;
+        crate::waits::add_detail(conn)?;
         conn.pragma_update(None, "user_version", 70)?;
     }
     if version < 71 {
@@ -526,6 +526,11 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
         migrate_v81_to_v82(conn)?;
         conn.pragma_update(None, "user_version", 82)?;
     }
+    if version < 83 {
+        // The Groups capability's table, and the capability CHECKs widened.
+        migrate_v82_to_v83(conn)?;
+        conn.pragma_update(None, "user_version", 83)?;
+    }
     // Other branches (the task panel) numbered their own steps 66–67 at the
     // same time as 66–70 above, so a store may be past a version without
     // having these. Every one is idempotent: make sure of them all.
@@ -533,6 +538,8 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
     conn.execute_batch(&crate::journey_changes::environment_triggers_sql())?;
     conn.execute_batch(crate::lifecycle_config::CREATE_TABLE)?;
     conn.execute_batch(&crate::journey_changes::lifecycle_config_triggers_sql())?;
+    conn.execute_batch(crate::groups::CREATE_TABLE)?;
+    conn.execute_batch(&crate::journey_changes::groups_triggers_sql())?;
     conn.execute_batch(crate::waits::CREATE_TABLE)?;
     conn.execute_batch(&crate::journey_changes::waits_triggers_sql())?;
     conn.execute_batch(crate::cloud_nodes::CREATE_TABLE)?;
@@ -540,6 +547,7 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
     conn.execute_batch(crate::node_events::CREATE_TABLE)?;
     conn.execute_batch(&crate::journey_changes::node_events_triggers_sql())?;
     crate::cloud_nodes::add_lost_at(conn)?;
+    crate::waits::add_detail(conn)?;
     // The task panel's own steps, first numbered 66–69 on its branch.
     ensure_decisions_reason(conn)?;
     conn.execute_batch(crate::request_feedback::CREATE_TABLE)?;
@@ -659,6 +667,51 @@ fn migrate_v80_to_v81(conn: &Connection) -> Result<()> {
     conn.execute_batch(&crate::journey_changes::create_triggers_sql())?;
     conn.execute_batch(&crate::journey_changes::environment_triggers_sql())?;
     conn.execute_batch(&crate::journey_changes::lifecycle_config_triggers_sql())?;
+    Ok(())
+}
+
+/// The Groups capability: its table, and the capability CHECKs widened.
+fn migrate_v82_to_v83(conn: &Connection) -> Result<()> {
+    conn.execute_batch("PRAGMA foreign_keys=OFF;")?;
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch(
+        "
+        CREATE TABLE node_capabilities_v83 (
+            node_id     BLOB NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+            capability  TEXT NOT NULL CHECK (capability IN ('spec', 'lifecycle', 'agent', 'generator', 'tags', 'files', 'ticket', 'environment', 'lifecycle_config', 'groups')),
+            enabled_at  INTEGER NOT NULL,
+            PRIMARY KEY (node_id, capability)
+        );
+        INSERT INTO node_capabilities_v83 SELECT node_id, capability, enabled_at FROM node_capabilities;
+        DROP TABLE node_capabilities;
+        PRAGMA legacy_alter_table = ON;
+        ALTER TABLE node_capabilities_v83 RENAME TO node_capabilities;
+        PRAGMA legacy_alter_table = OFF;
+
+        CREATE TABLE capability_archives_v83 (
+            id              BLOB PRIMARY KEY NOT NULL,
+            node_id         BLOB NOT NULL,
+            capability      TEXT NOT NULL CHECK (capability IN ('spec', 'lifecycle', 'agent', 'generator', 'tags', 'files', 'ticket', 'environment', 'lifecycle_config', 'groups')),
+            archived_at     INTEGER NOT NULL,
+            payload         TEXT NOT NULL
+        );
+        INSERT INTO capability_archives_v83 SELECT id, node_id, capability, archived_at, payload FROM capability_archives;
+        DROP INDEX IF EXISTS idx_capability_archives_node;
+        DROP TABLE capability_archives;
+        PRAGMA legacy_alter_table = ON;
+        ALTER TABLE capability_archives_v83 RENAME TO capability_archives;
+        PRAGMA legacy_alter_table = OFF;
+        CREATE INDEX IF NOT EXISTS idx_capability_archives_node ON capability_archives(node_id, archived_at);
+        ",
+    )?;
+    tx.execute_batch(crate::groups::CREATE_TABLE)?;
+    tx.commit()?;
+    conn.execute_batch("PRAGMA foreign_keys=ON;")?;
+    // The rebuilt tables lost their journey triggers.
+    conn.execute_batch(&crate::journey_changes::create_triggers_sql())?;
+    conn.execute_batch(&crate::journey_changes::environment_triggers_sql())?;
+    conn.execute_batch(&crate::journey_changes::lifecycle_config_triggers_sql())?;
+    conn.execute_batch(&crate::journey_changes::groups_triggers_sql())?;
     Ok(())
 }
 

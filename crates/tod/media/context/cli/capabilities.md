@@ -13,6 +13,7 @@ tod-cli --data-root <DATA_ROOT> capabilities set     <NODE> ticket [--ticket <ID
 tod-cli --data-root <DATA_ROOT> capabilities set     <NODE> tags (--tags <A,B,..> | --add <TAG> | --remove <TAG>)
 tod-cli --data-root <DATA_ROOT> capabilities set     <NODE> generator --source <TYPE> --config <JSON>
 tod-cli --data-root <DATA_ROOT> capabilities set     <NODE> lifecycle-config (--phase <PHASE> --skills <A,B,..> | --clear <PHASE>)
+tod-cli --data-root <DATA_ROOT> capabilities set     <NODE> groups --lifecycle <true|false>
 ```
 
 `<NODE>` is a slug or full UUID. `enable` adds capabilities with their
@@ -29,6 +30,10 @@ verify, review, fix, pr, merged, released, learn. `--skills` replaces that
 phase's list (`--skills ''` means none, even where an ancestor sets some);
 `--clear` removes the phase from this node so the nearest ancestor's applies
 again. Other phases are untouched.
+
+`groups --lifecycle true` shows the node's children grouped by lifecycle state.
+Every child then needs the Lifecycle capability: those without it move down to
+the first place that accepts them (the next sibling of the node, and so on up).
 
 `files --location` picks which of the user's Files locations the node, and
 every node below it that does not enable Files itself, works from

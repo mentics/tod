@@ -16,7 +16,7 @@ pub(crate) const USAGE: &str = "\
 tod-cli capabilities — a node's capabilities and their settings
 
 Nodes may be addressed by slug or full UUID. <CAP> is one of spec, lifecycle,
-agent, generator, tags, files, ticket, environment, lifecycle-config.
+agent, generator, tags, files, ticket, environment, lifecycle-config, groups.
 
 COMMANDS:
     list    <NODE>
@@ -28,6 +28,7 @@ COMMANDS:
     set     <NODE> tags (--tags <A,B,..> | --add <TAG> | --remove <TAG>)
     set     <NODE> generator --source <TYPE> --config <JSON>
     set     <NODE> lifecycle-config (--phase <PHASE> --skills <A,B,..> | --clear <PHASE>)
+    set     <NODE> groups --lifecycle <true|false>
 
 `list` shows the enabled capabilities and each one's settings. `enable` adds
 capabilities with their defaults; generator and lifecycle cannot both be on.
@@ -46,6 +47,10 @@ implement, verify, review, fix, pr, merged, released, learn. `--skills` replaces
 that phase's list (`--skills ''` means no skills, even where an ancestor sets
 some); `--clear` removes the phase from this node so the nearest ancestor's
 applies again. Other phases are untouched.
+
+`groups --lifecycle true` shows the node's children grouped by lifecycle state.
+Every child then needs the Lifecycle capability: those without it move down to
+the first place that accepts them (the next sibling of the node, and so on up).
 
 `--location` picks which of the user's Files locations the node (and every node
 below it that does not enable Files itself) works from; `--location ''` picks
@@ -84,7 +89,7 @@ pub fn run(inv: Invocation) -> anyhow::Result<String> {
 fn parse_cap(raw: &str) -> anyhow::Result<Capability> {
     Capability::parse(&raw.to_ascii_lowercase()).ok_or_else(|| {
         anyhow::anyhow!(
-            "unknown capability `{raw}` (expected: spec, lifecycle, agent, generator, tags, files, ticket, environment, lifecycle-config)"
+            "unknown capability `{raw}` (expected: spec, lifecycle, agent, generator, tags, files, ticket, environment, lifecycle-config, groups)"
         )
     })
 }
@@ -239,6 +244,10 @@ fn list(inv: &Invocation, node: Uuid) -> anyhow::Result<String> {
                         .collect();
                     format!("lifecycle-config: {}", phases.join("; "))
                 }
+            }
+            Capability::Groups => {
+                let on = inv.client().read(|conn| tod_store::groups::by_lifecycle(conn, node))?;
+                format!("groups: by lifecycle {}", if on { "on" } else { "off" })
             }
             Capability::Generator => match &s.generator {
                 Some((source, config)) => format!(
@@ -456,6 +465,14 @@ fn set(inv: &Invocation, node: Uuid, args: &Args) -> anyhow::Result<String> {
                 ),
             }
             OutlineMutation::SetNodeLifecycleConfig { node_id: node, skills }
+        }
+        Capability::Groups => {
+            let on = match args.require("--lifecycle")?.trim() {
+                "true" => true,
+                "false" => false,
+                other => anyhow::bail!("--lifecycle takes true or false, not `{other}`"),
+            };
+            OutlineMutation::SetNodeGroups { node_id: node, by_lifecycle: on }
         }
         Capability::Environment => anyhow::bail!(
             "environment entries are managed with `tod-cli environment`, not `capabilities set`"

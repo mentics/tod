@@ -95,6 +95,7 @@ fn field_anchor_id(field: TaskEditField) -> &'static str {
         TaskEditField::Capability(Capability::Tags) => "task-edit-field-cap-tags",
         TaskEditField::Capability(Capability::Environment) => "task-edit-field-cap-environment",
         TaskEditField::Capability(Capability::LifecycleConfig) => "task-edit-field-cap-lifecycle-config",
+        TaskEditField::Capability(Capability::Groups) => "task-edit-field-cap-groups",
         TaskEditField::GeneratorSource => "task-edit-field-gen-source",
         TaskEditField::GeneratorField(_) => "task-edit-field-gen-field",
         TaskEditField::LinearQuery => "task-edit-field-linear-query",
@@ -511,6 +512,8 @@ pub struct TaskEditView {
     /// Capabilities as last persisted.
     generator_accept_capabilities_saved: Vec<Capability>,
     generator_accept_error: Option<String>,
+    /// Why the last change to the Groups setting failed.
+    groups_error: Option<String>,
     generator_accept_busy: bool,
     /// Linear-specific state for filter configuration UI
     linear_introspection_cache: Option<tod_integration::IntrospectionCache>,
@@ -729,6 +732,7 @@ impl TaskEditView {
             generator_accept_capabilities: Vec::new(),
             generator_accept_capabilities_saved: Vec::new(),
             generator_accept_error: None,
+            groups_error: None,
             generator_accept_busy: false,
             linear_introspection_cache: None,
             linear_introspection_age: None,
@@ -4783,6 +4787,82 @@ impl TaskEditView {
         Self::render_legend_border_section(border, legend, body)
     }
 
+    /// The Groups capability: one checkbox, grouping the children by
+    /// lifecycle state.
+    fn render_groups_section(
+        &self,
+        cap_index: usize,
+        background: gpui::Hsla,
+        border: gpui::Hsla,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let cap = Capability::Groups;
+        let body: Option<gpui::AnyElement> = if self.capability_enabled(cap)
+            && let Some(node) = self.node_uuid()
+        {
+            let on = self
+                .fleet
+                .read(|conn| tod_store::groups::by_lifecycle(conn, node))
+                .unwrap_or(false);
+            let muted = cx.theme().muted_foreground;
+            Some(
+                v_flex()
+                    .gap_1()
+                    .px_3()
+                    .pb_3()
+                    .child(
+                        h_flex()
+                            .id("task-edit-groups-lifecycle")
+                            .gap_1()
+                            .items_center()
+                            .cursor_pointer()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.set_groups_by_lifecycle(node, !on, cx);
+                            }))
+                            .child(if on { "☑" } else { "☐" })
+                            .child("Lifecycle"),
+                    )
+                    .child(div().text_xs().text_color(muted).child(
+                        "Group the children under a header per lifecycle state. Children \
+                         must have Lifecycle: those without it move down to the first \
+                         place that accepts them.",
+                    ))
+                    .when_some(self.groups_error.clone(), |col, err| {
+                        col.child(div().text_xs().text_color(cx.theme().danger).child(
+                            selectable_text("task-edit-groups-error", err, window, cx),
+                        ))
+                    })
+                    .into_any_element(),
+            )
+        } else {
+            None
+        };
+        let legend = self
+            .render_section_legend(cap, cap_index, background, cx)
+            .into_any_element();
+        Self::render_legend_border_section(border, legend, body)
+    }
+
+    fn set_groups_by_lifecycle(&mut self, node: uuid::Uuid, on: bool, cx: &mut Context<Self>) {
+        let fleet = self.fleet.clone();
+        crate::ui::off_thread::off_thread(
+            cx,
+            move || {
+                fleet
+                    .enqueue_outline(OutlineMutation::SetNodeGroups { node_id: node, by_lifecycle: on })
+                    .map_err(|err| err.to_string())?;
+                fleet.writer().flush().map_err(|err| err.to_string())?;
+                let _ = fleet.reload_if_stale();
+                Ok::<(), String>(())
+            },
+            |this: &mut Self, result, cx| {
+                this.groups_error = result.err();
+                cx.notify();
+            },
+        );
+    }
+
     fn render_lifecycle_config_section(
         &self,
         cap_index: usize,
@@ -6238,6 +6318,9 @@ impl TaskEditView {
                 .into_any_element(),
             Capability::LifecycleConfig => self
                 .render_lifecycle_config_section(cap_index, background, border, cx)
+                .into_any_element(),
+            Capability::Groups => self
+                .render_groups_section(cap_index, background, border, window, cx)
                 .into_any_element(),
         }
     }

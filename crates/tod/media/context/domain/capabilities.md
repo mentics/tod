@@ -14,7 +14,9 @@ off by default and turned on per node:
 (Others exist — `Lifecycle`, `Tags` — but these three are the ones that change
 what an agent can do. `Lifecycle config` lists the skills the user chose for each
 phase, inherited from the nearest node that sets them; when it applies to you,
-your message has a Skills section.)
+your message has a Skills section. `Groups` only changes how the tree shows a
+node's children — under a header per lifecycle state — and requires them to have
+Lifecycle.)
 
 Gate criteria frequently refer to capabilities: a node cannot reach `active`
 without Agent and Files, for instance. Treat an absent capability as a real

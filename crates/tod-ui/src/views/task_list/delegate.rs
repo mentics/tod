@@ -222,6 +222,52 @@ impl ListDelegate for TaskListDelegate {
         let muted_bg = cx.theme().muted;
         let danger = cx.theme().danger;
 
+        if let Some(state) = item.group_header.clone() {
+            // A lifecycle group header: a label for the rows under it, not a
+            // node. It is never selected; a click only folds the group.
+            let id = item.id.clone();
+            let collapsed = item.collapsed;
+            let label = group_label(&state);
+            let chevron = div()
+                .w(px(TREE_CHEVRON_WIDTH))
+                .flex_shrink_0()
+                .cursor_pointer()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |_, _, _, cx| {
+                        cx.stop_propagation();
+                        sink.borrow_mut()
+                            .push(RowAction::ToggleCollapsed { task_id: id.clone() });
+                        cx.notify();
+                    }),
+                )
+                .child(if collapsed { "▸" } else { "▾" });
+            // Laid out like a node row: the status cell's width, then the
+            // depth indent, so headers line up with the nodes at their depth.
+            let row = h_flex()
+                .size_full()
+                .items_center()
+                .child(div().w(px(16.0)).flex_shrink_0())
+                .child(
+                    h_flex()
+                        .items_center()
+                        .flex_1()
+                        .min_w_0()
+                        .pl(px(item.depth as f32 * TREE_LEVEL_STEP))
+                        .text_xs()
+                        .font_semibold()
+                        .text_color(muted_foreground)
+                        .child(chevron)
+                        .child(label),
+                );
+            return Some(
+                ListItem::new(("task-row", ix.row))
+                    .selected(selected)
+                    .h(TREE_ROW_HEIGHT)
+                    .child(row),
+            );
+        }
+
         let is_work = item.is_work_node;
         let display_title = if item.title.is_empty() {
             "(new item)".to_string()
@@ -796,6 +842,15 @@ impl ListDelegate for TaskListDelegate {
         _window: &mut Window,
         _cx: &mut Context<ListState<Self>>,
     ) {
+    }
+}
+
+/// The header text for a lifecycle state: its name, capitalized.
+fn group_label(state: &str) -> String {
+    let mut chars = state.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
     }
 }
 

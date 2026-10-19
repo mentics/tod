@@ -885,23 +885,41 @@ impl TaskPanel {
         let node = self.node_id;
         let fleet = self.fleet.clone();
         let root = fleet.paths().root().to_path_buf();
+        let in_cloud = self.runner.cloud.is_some();
         self.runner.cloud_note = Some("Checking GitHub…".to_string());
         self.runner.cloud_failed = false;
         cx.spawn(async move |this, cx| {
+            // A clear node goes on at once: a node in the cloud has its
+            // supervisor woken (the cancelled wait is sent first), one here
+            // is started, rather than left until the next scheduled look.
             let result = cx
                 .background_executor()
-                .spawn(async move { tod_core::autopilot::check_now(&fleet, node, &root) })
+                .spawn(async move {
+                    let found = tod_core::autopilot::check_now(&fleet, node, &root)?;
+                    let woke = match (&found, in_cloud) {
+                        (tod_core::autopilot::GithubCheck::Clear, true) => {
+                            Some(tod_core::cloud_sync::wake_node(&fleet, &root, &node.to_string()))
+                        }
+                        _ => None,
+                    };
+                    anyhow::Ok((found, woke))
+                })
                 .await;
             let _ = this.update(cx, |this: &mut TaskPanel, cx| {
                 use tod_core::autopilot::GithubCheck;
                 let (note, failed) = match result {
-                    Ok(GithubCheck::Waiting { what, .. }) => (format!("Checked GitHub: waiting for {what}"), false),
-                    Ok(GithubCheck::Clear) if this.runner.cloud.is_some() => (
-                        "Checked GitHub: nothing left to wait for. Sync now so its sandbox carries on.".to_string(),
-                        false,
-                    ),
-                    Ok(GithubCheck::Clear) => {
-                        ("Checked GitHub: nothing left to wait for. Start the runner to go on.".to_string(), false)
+                    Ok((GithubCheck::Waiting { what, .. }, _)) => (format!("Checked GitHub: waiting for {what}"), false),
+                    Ok((GithubCheck::Clear, Some(Ok(done)))) => {
+                        (format!("Checked GitHub: nothing left to wait for; {done}."), false)
+                    }
+                    Ok((GithubCheck::Clear, Some(Err(err)))) => {
+                        (format!("Checked GitHub: nothing left to wait for, but waking the cloud node failed: {err:#}"), true)
+                    }
+                    Ok((GithubCheck::Clear, None)) => {
+                        if !this.runners.read(cx).is_running(node) {
+                            let _ = this.runners.update(cx, |r, cx| r.start(node, false, cx));
+                        }
+                        ("Checked GitHub: nothing left to wait for; going on.".to_string(), false)
                     }
                     Ok(_) => ("Checked GitHub: this state waits for nothing there.".to_string(), false),
                     Err(err) => (format!("Could not check GitHub: {err:#}"), true),

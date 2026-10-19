@@ -21,6 +21,9 @@ use crate::usage::{
 /// Record types that carry no part of the conversation.
 const BOOKKEEPING: &[&str] = &[
     "agent-name",
+    "api-request",
+    "api-request-blob",
+    "api-request-shape",
     "ai-title",
     "atis-latch",
     "attachment",

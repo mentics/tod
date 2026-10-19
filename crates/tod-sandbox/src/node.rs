@@ -518,6 +518,10 @@ impl GitIdentity {
 /// branch (`origin/HEAD`). With neither present it clones into
 /// [`WORKSPACE_DIR`] when `allow_clone`, else fails: a fork of a golden that
 /// lacks the repository is a broken golden, not something to patch up here.
+///
+/// The fetch prunes: a branch deleted on the remote (its pull request merged)
+/// would otherwise leave a stale `origin/<branch>` here, and checking it out
+/// asks the remote for a commit it no longer offers ("not our ref").
 pub fn checkout_script(repo_url: &str, branch: &str, identity: &GitIdentity, allow_clone: bool) -> String {
     let (repo, br) = (shell_quote(repo_url), shell_quote(branch));
     let (clone_dir, forked_dir) = (shell_quote(WORKSPACE_DIR), shell_quote(FORKED_WORKSPACE_DIR));
@@ -530,8 +534,8 @@ pub fn checkout_script(repo_url: &str, branch: &str, identity: &GitIdentity, all
     format!(
         "set -e\n\
          if [ -n \"$SSL_CERT_FILE\" ]; then git config --system http.sslCAInfo \"$SSL_CERT_FILE\"; fi\n\
-         if [ -d {clone_dir}/.git ]; then dir={clone_dir}; git -C \"$dir\" fetch --quiet origin; \
-         elif [ -d {forked_dir}/.git ]; then dir={forked_dir}; git -C \"$dir\" fetch --quiet origin; \
+         if [ -d {clone_dir}/.git ]; then dir={clone_dir}; git -C \"$dir\" fetch --quiet --prune origin; \
+         elif [ -d {forked_dir}/.git ]; then dir={forked_dir}; git -C \"$dir\" fetch --quiet --prune origin; \
          else {missing}; fi\n\
          cd \"$dir\"\n\
          git config user.name {name}\n\
@@ -1197,12 +1201,20 @@ mod tests {
     }
 
     #[test]
+    fn the_fetch_prunes_so_a_deleted_branch_is_not_checked_out_stale() {
+        let me = GitIdentity::fallback();
+        let s = checkout_script("https://github.com/o/r.git", "feat/x", &me, true);
+        assert_eq!(s.matches("fetch --quiet --prune origin").count(), 2, "{s}");
+        assert!(!s.contains("fetch --quiet origin"), "{s}");
+    }
+
+    #[test]
     fn a_fork_uses_the_images_checkout_and_never_clones() {
         let me = GitIdentity::fallback();
         let s = checkout_script("https://github.com/o/r.git", "feat/x", &me, false);
         assert!(!s.contains("git clone"), "{s}");
         // The golden's own checkout is fetched and used where the clone would be.
-        assert!(s.contains("elif [ -d /workspace/.git ]; then dir=/workspace; git -C \"$dir\" fetch --quiet origin"), "{s}");
+        assert!(s.contains("elif [ -d /workspace/.git ]; then dir=/workspace; git -C \"$dir\" fetch --quiet --prune origin"), "{s}");
         // With neither, it fails loudly instead.
         assert!(s.contains("has no repository\" >&2; exit 1"), "{s}");
         assert!(checkout_script("https://github.com/o/r.git", "feat/x", &me, true).contains("git clone"));
