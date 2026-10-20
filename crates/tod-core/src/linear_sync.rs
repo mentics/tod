@@ -67,6 +67,22 @@ pub fn push(fleet: &FleetStore, node: Uuid, milestone: Milestone) {
 
 /// [`push`] for a ticket already known, e.g. the source of an accepted copy.
 pub fn push_ticket(fleet: &FleetStore, ticket: String, milestone: Milestone) {
+    spawn_sync(fleet, ticket, milestone, false);
+}
+
+/// The user accepted `node`'s ticket: [`push`] to [`Milestone::Accepted`], and
+/// assign the ticket to the API key's user if nobody has it yet.
+pub fn accept(fleet: &FleetStore, node: Uuid) {
+    let Ok(Some(task)) = fleet.get_node(&node.to_string()) else {
+        return;
+    };
+    let Some(ticket) = task.ticket.as_deref().and_then(parse_ticket_reference) else {
+        return;
+    };
+    spawn_sync(fleet, ticket, Milestone::Accepted, true);
+}
+
+fn spawn_sync(fleet: &FleetStore, ticket: String, milestone: Milestone, assign: bool) {
     let root = fleet.paths().root().to_path_buf();
     let spawned = std::thread::Builder::new().name("tod-linear-sync".into()).spawn(move || {
         let Some(key) = resolve_linear_api_key(&CredentialStore::from_data_root(&root)) else {
@@ -76,6 +92,13 @@ pub fn push_ticket(fleet: &FleetStore, ticket: String, milestone: Milestone) {
             Ok(Some(state)) => tracing::info!(%ticket, %state, "moved Linear ticket"),
             Ok(None) => {}
             Err(err) => tracing::warn!(%ticket, "Linear ticket not updated: {err}"),
+        }
+        if assign {
+            match tod_store::linear::assign_to_viewer_if_unassigned(&key, &ticket) {
+                Ok(true) => tracing::info!(%ticket, "assigned Linear ticket to the current user"),
+                Ok(false) => {}
+                Err(err) => tracing::warn!(%ticket, "Linear ticket not assigned: {err}"),
+            }
         }
     });
     if let Err(err) = spawned {

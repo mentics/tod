@@ -172,6 +172,34 @@ pub fn ensure_state_at_least(
     Ok(Some(target.name.clone()))
 }
 
+const ASSIGNEE_QUERY: &str =
+    "query Issue($id: String!) { viewer { id } issue(id: $id) { id assignee { id } } }";
+const SET_ASSIGNEE_MUTATION: &str = "mutation SetAssignee($id: String!, $assigneeId: String!) { issueUpdate(id: $id, input: { assigneeId: $assigneeId }) { success } }";
+
+/// Assigns the issue to the API key's user when nobody is assigned yet.
+/// `Ok(true)` is that it was assigned; an issue with an assignee is left alone.
+pub fn assign_to_viewer_if_unassigned(api_key: &str, identifier: &str) -> Result<bool, LinearError> {
+    let data = post_graphql(api_key, ASSIGNEE_QUERY, serde_json::json!({ "id": identifier }))?;
+    let issue = data
+        .get("issue")
+        .filter(|issue| !issue.is_null())
+        .ok_or_else(|| LinearError::NotFound(identifier.to_string()))?;
+    if issue.get("assignee").is_some_and(|a| !a.is_null()) {
+        return Ok(false);
+    }
+    let issue_id = issue.get("id").and_then(|v| v.as_str()).unwrap_or(identifier);
+    let viewer_id = data
+        .pointer("/viewer/id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| LinearError::Api("Linear returned no current user".into()))?;
+    post_graphql(
+        api_key,
+        SET_ASSIGNEE_MUTATION,
+        serde_json::json!({ "id": issue_id, "assigneeId": viewer_id }),
+    )?;
+    Ok(true)
+}
+
 /// One GraphQL round trip; the response's `data`.
 fn post_graphql(
     api_key: &str,

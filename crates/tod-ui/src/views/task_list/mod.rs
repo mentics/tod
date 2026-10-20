@@ -2927,8 +2927,8 @@ impl TaskListView {
                     this.show_error(format!("Accept failed: {err}"), window, cx);
                     return;
                 }
-                // The copy is the same ticket: make sure Linear has it at least up next.
-                tod_core::linear_sync::push(&this.fleet, new_node_id, tod_core::linear_sync::Milestone::Accepted);
+                // The copy is the same ticket: make sure Linear has it at least up next and assigned to the user.
+                tod_core::linear_sync::accept(&this.fleet, new_node_id);
                 this.live_refresh(window, cx);
                 this.select_created_task(&new_node_id.to_string(), window, cx);
             },
