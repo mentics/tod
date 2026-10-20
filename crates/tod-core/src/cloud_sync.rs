@@ -970,21 +970,19 @@ pub fn ensure_node_sandbox(
     let url = info.url.clone().ok_or_else(|| anyhow!("sandbox {name} has no URL"))?;
     progress(&format!("{name} is up after {:.1}s", started.elapsed().as_secs_f64()));
 
-    // Before the supervisor starts, which mirrors into the mount when it is
-    // there. A fork does not keep its source's mounts, so this is every time.
-    let region = match &source {
-        NodeSandboxSource::Fork(golden) => bx
-            .get_json(golden)?
-            .and_then(|v| v["spec"]["region"].as_str().map(str::to_string))
-            .ok_or_else(|| anyhow!("{golden} has no region"))?,
-        NodeSandboxSource::Image(_) => account.region.clone(),
-    };
-    match tod_sandbox::drive::mount_for_node(&bx, &url, &region, user, node_id) {
-        Ok(()) => progress("mounted Agent Drive for the node's transcripts"),
-        Err(err) => progress(&format!(
-            "warning: no Agent Drive ({err:#}); the node's transcripts go to the orchestrator instead"
-        )),
-    }
+    // Agent Drive is not enabled yet, so the node's transcripts go to the
+    // orchestrator and nothing is mounted. When it is, turn this back on:
+    // mount before the supervisor starts (it mirrors into the mount when it
+    // is there); a fork does not keep its source's mounts, so this is every
+    // time. `drive::mount_for_node` takes the sandbox's region: a fork's
+    // golden's (`bx.get_json(golden)`, `spec.region`), else the account's.
+    //
+    // match tod_sandbox::drive::mount_for_node(&bx, &url, &region, user, node_id) {
+    //     Ok(()) => progress("mounted Agent Drive for the node's transcripts"),
+    //     Err(err) => progress(&format!(
+    //         "warning: no Agent Drive ({err:#}); the node's transcripts go to the orchestrator instead"
+    //     )),
+    // }
 
     match &source {
         NodeSandboxSource::Fork(_) => {
