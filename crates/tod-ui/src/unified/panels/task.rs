@@ -259,7 +259,19 @@ fn load_runner(
     let files = fleet.resolve_files_for_node(&node_id.to_string()).ok().flatten();
     let files_in_sandbox = files.as_ref().is_some_and(|files| files.runs_in_sandbox());
     let place = match files.as_ref().and_then(|files| files.dev_container.as_ref()) {
-        Some(dev) if dev.sandbox => "not running in the cloud yet".to_string(),
+        Some(dev) if dev.sandbox => {
+            // The sandbox is made when something first needs the node's
+            // files, so it can exist (in Blaxel) before the runner is
+            // handed to the cloud.
+            let made = tod_store::fleet::provision::node_location(fleet, &node_id.to_string())
+                .ok()
+                .flatten()
+                .and_then(|location| location.sandbox().map(str::to_string));
+            match made {
+                Some(name) => format!("sandbox {name} exists; runner not in the cloud yet"),
+                None => "not running in the cloud yet".to_string(),
+            }
+        }
         Some(dev) => match dev.container.as_deref().map(str::trim).filter(|c| !c.is_empty()) {
             Some(container) => format!("this machine, dev container {container}"),
             None => "this machine".to_string(),
