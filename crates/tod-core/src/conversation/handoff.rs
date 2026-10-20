@@ -67,7 +67,10 @@ pub fn terminal_handoff(
         conversation_id: conversation_id.unwrap_or_else(Uuid::nil),
         focus,
     };
-    let cwd = protocol.cwd(&env)?;
+    let cwd = match cloud_node_workdir(fleet, focus)? {
+        Some(cwd) => cwd,
+        None => protocol.cwd(&env)?,
+    };
     // Without a conversation there is nothing to attribute the terminal's
     // own outline writes to.
     let turn_env = if conversation_id.is_some() { protocol.turn_env(&env) } else { Vec::new() };
@@ -80,6 +83,33 @@ pub fn terminal_handoff(
         tod_cli_dir: cli.parent().filter(|_| cli.is_file()).map(Path::to_path_buf),
         command: launch_command(platform, session.as_deref()),
     })
+}
+
+/// The checkout in the sandbox a node runs in in the cloud, when it has one
+/// and no Files location of its own on this machine. A cloud run's session
+/// lives in that sandbox (`cloud_nodes`), which the Files location never
+/// records, so resolving the location would make a second, empty sandbox
+/// that cannot find the session.
+fn cloud_node_workdir(fleet: &FleetStore, focus: Focus) -> Result<Option<Workdir>> {
+    let Some(node) = focus.node_id() else { return Ok(None) };
+    let node = node.to_string();
+    let Some(cloud) = crate::cloud_sync::cloud_node(fleet, &node) else { return Ok(None) };
+    if tod_store::fleet::provision::launch_cwd_if_made(fleet, &node)?.is_some() {
+        return Ok(None);
+    }
+    let probe = format!("echo {}", tod_sandbox::node::WORKSPACE_PROBE);
+    let out = tod_store::fleet::sandbox::SandboxExec::new(&cloud.sandbox)
+        .output_within(std::time::Duration::from_secs(60), "/", "sh", &["-c", &probe])
+        .with_context(|| format!("find the checkout in the node's cloud sandbox {}", cloud.sandbox))?;
+    let dir = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if !out.status.success() || dir.is_empty() {
+        anyhow::bail!(
+            "could not find the checkout in the node's cloud sandbox {}: {}",
+            cloud.sandbox,
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(Some(Workdir::sandbox(cloud.sandbox, dir)))
 }
 
 /// Let go of the conversation's agent session, so the terminal is the only
