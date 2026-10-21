@@ -31,7 +31,8 @@ CREATE TABLE IF NOT EXISTS node_files_locations (
     worktree_lease_holder TEXT,
     sandbox               TEXT,
     created_at            INTEGER NOT NULL,
-    updated_at            INTEGER NOT NULL
+    updated_at            INTEGER NOT NULL,
+    creds_synced_at       INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_node_files_locations_source
     ON node_files_locations(source_node_id);
@@ -198,6 +199,28 @@ impl<'a> FilesLocationRepo<'a> {
                 location.repo,
                 location.container,
             ],
+        )?;
+        Ok(())
+    }
+
+    /// When the sandbox's proxy was last given the user's credentials by an
+    /// update (0: only by being made, at `created_at`).
+    pub fn creds_synced_at(&self, node_id: &str) -> Result<i64> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT creds_synced_at FROM node_files_locations WHERE node_id = ?1",
+                params![node_id_blob(node_id)?],
+                |row| row.get(0),
+            )
+            .optional()?
+            .unwrap_or(0))
+    }
+
+    pub fn mark_creds_synced(&self, node_id: &str, at: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE node_files_locations SET creds_synced_at = ?2 WHERE node_id = ?1",
+            params![node_id_blob(node_id)?, at],
         )?;
         Ok(())
     }
