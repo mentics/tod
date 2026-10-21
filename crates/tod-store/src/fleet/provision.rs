@@ -58,9 +58,14 @@ pub fn resolve_launch_cwd_with(
                 match branch {
                     Some(branch) => {
                         progress("Checking the submodules…");
-                        worktree::branch_submodules(&dir, &branch).unwrap_or_else(|err| {
-                            vec![format!("{err:#}")]
-                        })
+                        match worktree::branch_submodules(&dir, &branch) {
+                            Ok(warnings) => warnings,
+                            // The sandbox expired: not a submodule problem. Failing here
+                            // lets `retry_if_sandbox_lost` recover, instead of a shell
+                            // opening on a sandbox that is not there.
+                            Err(err) if sandbox_is_gone(&err) => return Err(err),
+                            Err(err) => vec![format!("{err:#}")],
+                        }
                     }
                     None => Vec::new(),
                 }
@@ -76,6 +81,11 @@ pub fn resolve_launch_cwd_with(
             make_location(fleet, &paths, &settings, node_id, progress)
         }
     }
+}
+
+/// Whether `err` says Blaxel has no sandbox by the name asked for.
+fn sandbox_is_gone(err: &anyhow::Error) -> bool {
+    format!("{err:#}").contains("no sandbox named ")
 }
 
 /// Recovery for a launch that failed reaching `sandbox`: when `error` says
@@ -491,6 +501,39 @@ fn prepare_sandbox_checkout(
     Ok(warnings)
 }
 
+/// The sandbox `node_id` runs in in the cloud (its `cloud_nodes` row) and the
+/// checkout's directory in it, when Blaxel still has it and it can run.
+/// `None` when the node has none, or it is gone (the cloud check replaces it).
+fn live_cloud_sandbox(
+    fleet: &FleetStore,
+    sandboxes: &Sandboxes,
+    node_id: &str,
+    progress: &mut dyn FnMut(&str),
+) -> Result<Option<(String, String)>> {
+    let node: uuid::Uuid = node_id.parse().context("node id")?;
+    let Some(row) = fleet.read(|conn| crate::cloud_nodes::get(conn, node))? else { return Ok(None) };
+    let alive = sandboxes.blaxel()?.get(&row.sandbox)?.is_some_and(|info| {
+        !matches!(info.status.to_ascii_uppercase().as_str(), "FAILED" | "TERMINATED" | "DELETING" | "DELETED")
+    });
+    if !alive {
+        return Ok(None);
+    }
+    progress(&format!("using the node's cloud sandbox {}…", row.sandbox));
+    let probe = format!("echo {}", tod_sandbox::node::WORKSPACE_PROBE);
+    let out = sandbox::SandboxExec::new(&row.sandbox)
+        .output_within(std::time::Duration::from_secs(60), "/", "sh", &["-c", &probe])
+        .with_context(|| format!("find the checkout in the node's cloud sandbox {}", row.sandbox))?;
+    let dir = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if !out.status.success() || dir.is_empty() {
+        bail!(
+            "could not find the checkout in the node's cloud sandbox {}: {}",
+            row.sandbox,
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(Some((row.sandbox, dir)))
+}
+
 fn make_sandbox(
     fleet: &FleetStore,
     files: &ResolvedFiles,
@@ -504,6 +547,18 @@ fn make_sandbox(
         .get_node(&files.node_id)?
         .ok_or_else(|| anyhow!("no node {}", files.node_id))?;
     let mut sandboxes = Sandboxes::load(&root)?;
+    // One sandbox per node: a node already running in the cloud has one, and
+    // a second beside it would not hold its session or its work.
+    if let Some((name, repo)) = live_cloud_sandbox(fleet, &sandboxes, &files.node_id, progress)? {
+        let dir = Workdir::sandbox(&name, &repo);
+        // Not deleted on failure, unlike a sandbox made here: it is the cloud run's.
+        let warnings = prepare_sandbox_checkout(&dir, &name, &repo, branch, progress)
+            .with_context(|| format!("use the node's cloud sandbox {name}"))?;
+        location.sandbox = Some(name);
+        location.repo = Some(repo);
+        record(fleet, &location)?;
+        return Ok((location, warnings));
+    }
     let source = dev.sandbox_from.source();
     // The node's Environment: secrets with hosts go in the sandbox's proxy,
     // so the agent calls those hosts without holding the value.
@@ -929,6 +984,13 @@ pub fn stale_locations(fleet: &FleetStore) -> Result<Vec<AffectedLocation>> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_missing_sandbox_is_told_apart_from_other_failures() {
+        let gone = anyhow!("no sandbox named tod-x-2-3").context("list submodules");
+        assert!(super::sandbox_is_gone(&gone));
+        assert!(!super::sandbox_is_gone(&anyhow!("git: not a repository")));
+    }
+
     use super::*;
     use crate::fleet::test_util::{cleanup_fleet_root, temp_fleet_root};
     use crate::outline::types::Capability;

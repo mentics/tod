@@ -219,11 +219,31 @@ impl Config {
             None => self.sandboxes.push(sandbox),
         }
     }
+
+    /// Drops every entry whose name is not in `present` (the names Blaxel
+    /// lists) and returns the names dropped. Blaxel expires sandboxes on its
+    /// own (seven days on the current tier), so entries outlive them.
+    pub fn forget_missing(&mut self, present: &[&str]) -> Vec<String> {
+        let (keep, gone): (Vec<_>, Vec<_>) =
+            std::mem::take(&mut self.sandboxes).into_iter().partition(|s| present.contains(&s.name.as_str()));
+        self.sandboxes = keep;
+        gone.into_iter().map(|s| s.name).collect()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn forget_missing_keeps_only_listed_sandboxes() {
+        let entry = |name: &str| Sandbox { name: name.into(), image: String::new(), url: None, agents: true };
+        let mut config = Config::default();
+        config.upsert(entry("a"));
+        config.upsert(entry("b"));
+        assert_eq!(config.forget_missing(&["a", "other"]), vec!["b".to_string()]);
+        assert!(config.sandbox("a").is_some() && config.sandbox("b").is_none());
+    }
 
     #[test]
     fn recognizes_sandbox_hosts() {
