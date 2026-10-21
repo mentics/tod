@@ -51,6 +51,21 @@ pub fn lost_rows(rows: &[CloudNodeRow], listing: Option<&[SandboxInfo]>) -> Vec<
         .collect()
 }
 
+/// Drops the `sandboxes.toml` entry of every sandbox absent from Blaxel's
+/// `listing` (it expired or was deleted), saving only if one went. Returns
+/// the names forgotten.
+pub fn forget_gone_sandboxes(
+    sandboxes: &mut tod_store::fleet::sandbox::Sandboxes,
+    listing: &[SandboxInfo],
+) -> Result<Vec<String>> {
+    let present: Vec<&str> = listing.iter().map(|s| s.name.as_str()).collect();
+    let gone = sandboxes.config.forget_missing(&present);
+    if !gone.is_empty() {
+        sandboxes.save()?;
+    }
+    Ok(gone)
+}
+
 static NOTES: Mutex<Option<HashMap<String, String>>> = Mutex::new(None);
 
 /// What the last check did about `node_id`'s sandbox, for its status line.
@@ -131,8 +146,13 @@ pub fn check(fleet: &FleetStore, check: Check) -> Result<usize> {
     }
     let listing = match check {
         Check::Full => {
-            let sandboxes = tod_store::fleet::sandbox::Sandboxes::load(&root)?;
-            Some(sandboxes.blaxel()?.list().context("list the workspace's sandboxes")?)
+            let mut sandboxes = tod_store::fleet::sandbox::Sandboxes::load(&root)?;
+            let listing = sandboxes.blaxel()?.list().context("list the workspace's sandboxes")?;
+            let gone = forget_gone_sandboxes(&mut sandboxes, &listing).context("forget sandboxes Blaxel no longer has")?;
+            if !gone.is_empty() {
+                tracing::info!("cloud: forgot {} sandbox(es) no longer in Blaxel: {}", gone.len(), gone.join(", "));
+            }
+            Some(listing)
         }
         Check::Marked => None,
     };
@@ -363,6 +383,24 @@ mod tests {
             context_changed_at: None,
             lost_at,
         }
+    }
+
+    #[test]
+    fn forgets_entries_blaxel_no_longer_lists() {
+        use tod_sandbox::config::Sandbox;
+        let dir = std::env::temp_dir().join(format!("tod-forget-gone-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut sandboxes = tod_store::fleet::sandbox::Sandboxes::load(&dir).unwrap();
+        for name in ["live", "failed", "expired"] {
+            sandboxes.config.upsert(Sandbox { name: name.into(), image: String::new(), url: None, agents: true });
+        }
+        let listing = [sandbox("live", "DEPLOYED"), sandbox("failed", "FAILED")];
+        let gone = forget_gone_sandboxes(&mut sandboxes, &listing).unwrap();
+        assert_eq!(gone, vec!["expired".to_string()]);
+        let saved = tod_store::fleet::sandbox::Sandboxes::load(&dir).unwrap();
+        let names: Vec<_> = saved.config.sandboxes.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["live", "failed"]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn sandbox(name: &str, status: &str) -> SandboxInfo {

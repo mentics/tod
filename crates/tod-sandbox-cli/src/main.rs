@@ -86,6 +86,7 @@ orchestrator [--image IMAGE] [--bin PATH] [--tod-cli PATH] [--move-data]
                          scripts/build-sandbox-binaries.sh), and start it.
                          --move-data: the sandbox exists without the volume;
                          copy its /data onto the volume, recreating it.
+prune                    Forget sandboxes Blaxel no longer has (they expire).
 doctor                   Check the setup.
 connect-info <name>      (internal) The relay URL, token, and idle times, as JSON.
 ";
@@ -245,6 +246,7 @@ fn run() -> Result<i32> {
         }
         "orchestrator" => orchestrator(&ctx, args),
         "watchdog" => watchdog(&ctx, args),
+        "prune" => prune(&mut ctx, args),
         "doctor" => doctor(&mut ctx),
         "connect-info" => {
             let target = args.positional("sandbox name")?;
@@ -748,6 +750,23 @@ fn zed(ctx: &mut Ctx, mut args: Args) -> Result<i32> {
     Ok(0)
 }
 
+/// Removes `sandboxes.toml` entries for sandboxes Blaxel no longer lists:
+/// it expires them on its own, so the file otherwise only grows.
+fn prune(ctx: &mut Ctx, args: Args) -> Result<i32> {
+    args.done()?;
+    let all = ctx.blaxel()?.list()?;
+    let present: Vec<&str> = all.iter().map(|i| i.name.as_str()).collect();
+    let gone = ctx.config.forget_missing(&present);
+    if !gone.is_empty() {
+        ctx.save()?;
+    }
+    for name in &gone {
+        println!("{name}: forgotten (not in Blaxel)");
+    }
+    println!("{} forgotten, {} kept", gone.len(), ctx.config.sandboxes.len());
+    Ok(0)
+}
+
 fn doctor(ctx: &mut Ctx) -> Result<i32> {
     let mut problems = 0;
     let mut report = |ok: bool, what: &str, detail: String| {
@@ -778,9 +797,16 @@ fn doctor(ctx: &mut Ctx) -> Result<i32> {
     match ctx.blaxel().and_then(|bx| bx.list()) {
         Ok(all) => {
             report(true, "sign-in", format!("{} sandbox(es) in the workspace", all.len()));
+            let mut stale: Vec<&str> = Vec::new();
             for s in &ctx.config.sandboxes {
-                let status = all.iter().find(|i| i.name == s.name).map(|i| i.status.as_str()).unwrap_or("missing");
-                report(status != "missing", &format!("sandbox {}", s.name), status.to_string());
+                match all.iter().find(|i| i.name == s.name) {
+                    Some(i) => report(true, &format!("sandbox {}", s.name), i.status.clone()),
+                    None => stale.push(s.name.as_str()),
+                }
+            }
+            if !stale.is_empty() {
+                // Blaxel expires sandboxes by itself: not a fault, only stale entries.
+                println!("warn {} known sandbox(es) no longer exist in Blaxel (expired or deleted); `tod-sandbox prune` forgets them", stale.len());
             }
         }
         Err(e) => report(false, "sign-in", format!("{e:#}")),
