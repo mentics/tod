@@ -2,6 +2,7 @@
 //! sandbox, made when the node first needs its files, and removed (its
 //! branch pushed first) when the settings it was made from change.
 
+use crate::credentials::CredentialStore;
 use crate::fleet::FleetStore;
 use crate::fleet::node_actions::{FilesDirectory, ResolvedFiles};
 use crate::fleet::repos::files_location::{FilesLocation, FilesLocationRepo};
@@ -45,6 +46,36 @@ pub fn resolve_launch_cwd_with(
     let files = resolve_files(fleet, node_id)?;
     match files.directory() {
         FilesDirectory::Ready(dir) => {
+            // The agent is given a placeholder for each credential its
+            // sandbox's proxy holds, which Claude Code prefers to its own
+            // sign-in, so a credential stored after the proxy was set up must
+            // reach it. The store's change time against the location's
+            // (made, or last updated) says so with no call to the sandbox.
+            if files.per_node()
+                && dir.sandbox_name().is_some()
+                && let Some(location) = &files.location
+            {
+                let root = fleet.paths().root();
+                let changed = CredentialStore::from_data_root(root).changed_at()?;
+                let synced = fleet.read(|c| FilesLocationRepo::new(c).creds_synced_at(node_id))?;
+                if changed > location.created_at.max(synced) {
+                    match refresh_sandbox_proxy(fleet, node_id, false, progress)? {
+                        SandboxRefresh::NotNeeded | SandboxRefresh::Updated(_) => {
+                            fleet.enqueue(FleetMutation::MarkFilesCredsSynced {
+                                node_id: node_id.to_string(),
+                                at: changed,
+                            })?;
+                            fleet.writer().flush()?;
+                        }
+                        // Made again, its directory resolved on the way.
+                        SandboxRefresh::Recreated(_) => return resolve_launch_cwd_with(fleet, node_id, progress),
+                        SandboxRefresh::NeedsConfirmation(why) => bail!(
+                            "the sandbox's proxy lacks the node's credentials, and giving it them means making it \
+                             again: {why}. Use the credentials prompt on the node to confirm."
+                        ),
+                    }
+                }
+            }
             // A submodule can lose the branch after the location was made (a
             // base merge, `git submodule update`, a pull request's work that
             // started elsewhere), so every launch puts it back. This is what a

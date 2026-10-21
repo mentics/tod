@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Current fleet schema epoch stored in `PRAGMA user_version`.
-pub const CURRENT_USER_VERSION: i32 = 83;
+pub const CURRENT_USER_VERSION: i32 = 84;
 
 const BUSY_TIMEOUT_MS: i64 = 5000;
 
@@ -531,6 +531,11 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
         migrate_v82_to_v83(conn)?;
         conn.pragma_update(None, "user_version", 83)?;
     }
+    if version < 84 {
+        // When a location's sandbox proxy last took the user's credentials.
+        migrate_v83_to_v84(conn)?;
+        conn.pragma_update(None, "user_version", 84)?;
+    }
     // Other branches (the task panel) numbered their own steps 66–67 at the
     // same time as 66–70 above, so a store may be past a version without
     // having these. Every one is idempotent: make sure of them all.
@@ -667,6 +672,16 @@ fn migrate_v80_to_v81(conn: &Connection) -> Result<()> {
     conn.execute_batch(&crate::journey_changes::create_triggers_sql())?;
     conn.execute_batch(&crate::journey_changes::environment_triggers_sql())?;
     conn.execute_batch(&crate::journey_changes::lifecycle_config_triggers_sql())?;
+    Ok(())
+}
+
+fn migrate_v83_to_v84(conn: &Connection) -> Result<()> {
+    let has: bool = conn
+        .prepare("SELECT 1 FROM pragma_table_info('node_files_locations') WHERE name = 'creds_synced_at'")?
+        .exists([])?;
+    if !has {
+        conn.execute_batch("ALTER TABLE node_files_locations ADD COLUMN creds_synced_at INTEGER NOT NULL DEFAULT 0;")?;
+    }
     Ok(())
 }
 

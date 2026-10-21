@@ -12,6 +12,8 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 const KEYRING_SERVICE: &str = "tod";
+/// Beside the credentials: when one last changed ([`CredentialStore::changed_at`]).
+const CHANGED_FILE: &str = "changed_at";
 const FILE_MAGIC: &[u8; 7] = b"TODENC1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -200,8 +202,45 @@ impl CredentialStore {
         None
     }
 
+    /// When any credential was last stored or removed here (ms since the
+    /// epoch), from a marker beside the credentials. Without one (a store
+    /// from before it), now is recorded, so whatever was made earlier counts
+    /// as possibly out of date once. Sandboxes compare it with when their
+    /// proxy last took the user's credentials, without reading the keyring.
+    pub fn changed_at(&self) -> Result<i64, CredentialError> {
+        let path = self.file_path(CHANGED_FILE);
+        match fs::read_to_string(&path) {
+            Ok(text) => text.trim().parse().map_err(|_| {
+                CredentialError::Message(format!("{} is not a timestamp", path.display()))
+            }),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => self.touch_changed(),
+            Err(err) => Err(CredentialError::Message(format!("read {}: {err}", path.display()))),
+        }
+    }
+
+    fn touch_changed(&self) -> Result<i64, CredentialError> {
+        let now = crate::outline::uuid_blob::now_ms();
+        fs::create_dir_all(&self.credentials_dir).map_err(|err| {
+            CredentialError::Message(format!("create credentials dir {}: {err}", self.credentials_dir.display()))
+        })?;
+        let path = self.file_path(CHANGED_FILE);
+        fs::write(&path, now.to_string())
+            .map_err(|err| CredentialError::Message(format!("write {}: {err}", path.display())))?;
+        Ok(now)
+    }
+
     /// Persist a credential using the most secure available backend.
     pub fn set(
+        &self,
+        kind: CredentialKind,
+        secret: &str,
+    ) -> Result<CredentialBackend, CredentialError> {
+        let backend = self.store(kind, secret)?;
+        self.touch_changed()?;
+        Ok(backend)
+    }
+
+    fn store(
         &self,
         kind: CredentialKind,
         secret: &str,
@@ -231,6 +270,7 @@ impl CredentialStore {
     pub fn delete(&self, kind: CredentialKind) -> Result<(), CredentialError> {
         let _ = self.delete_from_keyring(kind.keyring_account());
         let _ = self.remove_file(kind.file_name());
+        self.touch_changed()?;
         Ok(())
     }
 
