@@ -360,6 +360,7 @@ pub fn refresh_pull_states(data_root: &Path, prs: &[NodePr]) -> bool {
         return false;
     }
     let Some(source) = GithubPulls::from_data_root(data_root) else {
+        tracing::warn!("pull request states not read: {NO_TOKEN}");
         return false;
     };
     let mut changed = false;
@@ -368,8 +369,12 @@ pub fn refresh_pull_states(data_root: &Path, prs: &[NodePr]) -> bool {
             owner: pr.owner.clone(),
             repo: pr.repo.clone(),
         };
-        let Ok(pull) = source.pull(&repo, pr.pr_number) else {
-            continue;
+        let pull = match source.pull(&repo, pr.pr_number) {
+            Ok(pull) => pull,
+            Err(err) => {
+                tracing::warn!("could not read {}/{}#{}: {err}", pr.owner, pr.repo, pr.pr_number);
+                continue;
+            }
         };
         let before = cached_pull_state(pr);
         remember_pull_states(&repo, std::slice::from_ref(&pull));
