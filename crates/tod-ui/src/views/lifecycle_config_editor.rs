@@ -58,6 +58,7 @@ fn phase_label(phase: &str) -> &'static str {
         "review" => "Review",
         "fix" => "Fix review findings",
         "pr" => "Pull request",
+        "pr_review" => "Pull request review",
         "merged" => "Merged",
         "released" => "Released",
         "learn" => "Learn",

@@ -241,7 +241,7 @@ fn retire_outside_criteria(fx: &Fixture) {
     let conn = rusqlite::Connection::open(fx.fleet.paths().db()).unwrap();
     conn.execute(
         "UPDATE gate_criteria SET active = 0
-         WHERE slug = ?1 OR from_state IN ('pr', 'approved')",
+         WHERE slug = ?1 OR from_state IN ('pr', 'pr_review', 'approved')",
         [tod_store::outline::repos::gate::READY_ACTIVE_ACTION_CONFIG_SLUG],
     )
     .unwrap();
@@ -699,6 +699,8 @@ impl crate::pr_readiness::PrFeed for Sim {
                 head_sha: Some(format!("{:07}", round.min(1) + 1)),
                 head_committed_at: Some("2020-01-01T00:00:00Z".into()),
                 draft: false,
+                open: true,
+                reviewers: Vec::new(),
                 base_ref: Some("main".into()),
                 body: None,
             },
@@ -767,6 +769,23 @@ fn babysits_a_pull_request_through_feedback_and_a_bots_review() {
 }
 
 #[test]
+fn pr_review_never_opens_a_pull_request() {
+    // Opening the draft is `pr`'s work: a node that reaches `pr_review` with
+    // none linked hands back rather than start a second state's job.
+    let fx = setup();
+    retire_outside_criteria(&fx);
+    lifecycle::set_lifecycle(&fx.fleet, fx.node, "pr_review").unwrap();
+    let mut agent = FakeAgent::new(&fx.fleet);
+    let outcome = autopilot(&fx, Budget::default()).run(&fx.fleet, &mut agent).unwrap();
+    assert!(
+        matches!(outcome, Outcome::NeedsHuman { reason: NeedsHuman::PrBlocked { .. } }),
+        "{outcome:?}"
+    );
+    assert_eq!(agent.turns, 0);
+    assert_eq!(lifecycle::current_state(&fx.fleet, fx.node).unwrap(), "pr_review");
+}
+
+#[test]
 fn a_pull_request_waiting_for_a_person_ends_the_run_with_a_timed_wait() {
     let fx = setup();
     retire_outside_criteria(&fx);
@@ -783,6 +802,8 @@ fn a_pull_request_waiting_for_a_person_ends_the_run_with_a_timed_wait() {
                     head_sha: Some("abcdef1".into()),
                     head_committed_at: Some("2020-01-01T00:00:00Z".into()),
                     draft: false,
+                    open: true,
+                    reviewers: Vec::new(),
                     base_ref: None,
                     body: None,
                 },
@@ -831,6 +852,8 @@ fn a_pull_request_that_never_changes_stops_for_a_person() {
                     head_sha: Some("abcdef1".into()),
                     head_committed_at: Some("2020-01-01T00:00:00Z".into()),
                     draft: false,
+                    open: true,
+                    reviewers: Vec::new(),
                     base_ref: None,
                     body: None,
                 },
@@ -1089,5 +1112,61 @@ fn check_now_records_where_each_pull_request_stands_with_no_run() {
     *github.notes.lock().unwrap() = Some("* Add the widget in #42\n* Apply the infra change in #7".into());
     let found = super::check_now(&fx.fleet, fx.node, &fx.root).unwrap();
     assert_eq!(found, super::GithubCheck::Clear);
+    assert!(pending_specs(&fx).is_empty());
+}
+
+#[test]
+fn check_now_in_pr_waits_for_the_draft_to_be_ready_and_reviewed() {
+    use tod_store::github::{PrReview, PrSnapshot, PrStatus};
+    struct Feed(std::sync::Mutex<PrSnapshot>);
+    impl crate::pr_readiness::PrFeed for Feed {
+        fn snapshot(&self, _: &tod_store::github::NodePr) -> Result<PrSnapshot, String> {
+            Ok(self.0.lock().unwrap().clone())
+        }
+        fn comment(&self, _: &tod_store::github::NodePr, _: &str) -> Result<(), String> {
+            Ok(())
+        }
+    }
+    let fx = bare();
+    retire_outside_criteria(&fx);
+    let status = PrStatus {
+        mergeable: Some(true),
+        mergeable_state: Some("blocked".into()),
+        merged: false,
+        checks: None,
+        head_sha: None,
+        head_committed_at: None,
+        draft: true,
+        open: true,
+        reviewers: Vec::new(),
+        base_ref: None,
+        body: None,
+    };
+    let feed = Arc::new(Feed(std::sync::Mutex::new(PrSnapshot {
+        status,
+        threads: vec![],
+        comments: vec![],
+        reviews: vec![],
+    })));
+    crate::pr_readiness::set_feed_override(Some(feed.clone()));
+    linked_to_prs(&fx, "pr", &["https://github.com/acme/app/pull/42"]);
+
+    let found = super::check_now(&fx.fleet, fx.node, &fx.root).unwrap();
+    let super::GithubCheck::Waiting { what, .. } = found else { panic!("expected Waiting, got {found:?}") };
+    assert!(what.contains("marked ready for review"), "{what}");
+    assert_eq!(pending_specs(&fx), ["github:pr:42:ready_for_review"]);
+
+    feed.0.lock().unwrap().status.draft = false;
+    let found = super::check_now(&fx.fleet, fx.node, &fx.root).unwrap();
+    let super::GithubCheck::Waiting { what, .. } = found else { panic!("expected Waiting, got {found:?}") };
+    assert!(what.contains("reviewer"), "{what}");
+    assert_eq!(pending_specs(&fx), ["github:pr:42:review_requested"]);
+
+    feed.0.lock().unwrap().reviews.push(PrReview {
+        author: Some("alice".into()),
+        submitted_at: "2026-01-01T10:00:00Z".into(),
+        state: "COMMENTED".into(),
+    });
+    assert_eq!(super::check_now(&fx.fleet, fx.node, &fx.root).unwrap(), super::GithubCheck::Clear);
     assert!(pending_specs(&fx).is_empty());
 }

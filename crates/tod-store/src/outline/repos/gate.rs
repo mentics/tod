@@ -55,18 +55,28 @@ pub const REVIEW_APPROVED_REVIEW_DONE_SLUG: &str = "review-approved.review-done"
 /// findings table (`tod_core::gate::derived`); it never goes to an agent.
 pub const REVIEW_APPROVED_FINDINGS_ANSWERED_SLUG: &str = "review-approved.findings-answered";
 
-/// `pr` → `approved`: the PR is mergeable (checks green, reviews satisfied).
+/// `pr` → `pr_review`: the PR is open and no longer a draft.
+pub const PR_PR_REVIEW_READY_SLUG: &str = "pr-pr_review.ready-for-review";
+/// `pr` → `pr_review`: a person is on the PR as a reviewer (requested, or
+/// already reviewed). Hardcoded for now: a project will want to say what
+/// "ready for human review" means for it, which wants scripting.
+pub const PR_PR_REVIEW_REVIEWER_SLUG: &str = "pr-pr_review.reviewer-assigned";
+
+// The five below gate `pr_review` → `approved`. They kept the slugs they had
+// when the state was `pr`, so existing waivers and journeys still name them.
+
+/// `pr_review` → `approved`: the PR is mergeable (checks green, reviews satisfied).
 pub const PR_APPROVED_MERGEABLE_SLUG: &str = "pr-approved.mergeable";
-/// `pr` → `approved`: the branch contains its base branch's tip, with no
+/// `pr_review` → `approved`: the branch contains its base branch's tip, with no
 /// conflict (`doc/lifecycle/pr-readiness.md`).
 pub const PR_APPROVED_UP_TO_DATE_SLUG: &str = "pr-approved.up-to-date";
-/// `pr` → `approved`: every review thread, human or bot, is resolved or
+/// `pr_review` → `approved`: every review thread, human or bot, is resolved or
 /// outdated.
 pub const PR_APPROVED_THREADS_RESOLVED_SLUG: &str = "pr-approved.threads-resolved";
-/// `pr` → `approved`: each configured review bot has reviewed the PR's
+/// `pr_review` → `approved`: each configured review bot has reviewed the PR's
 /// current head. Passes when none is configured.
 pub const PR_APPROVED_REVIEW_CURRENT_SLUG: &str = "pr-approved.review-current";
-/// `pr` → `approved`: each configured review bot's current review scores at
+/// `pr_review` → `approved`: each configured review bot's current review scores at
 /// least its threshold. Passes when none is configured.
 pub const PR_APPROVED_REVIEW_SCORE_SLUG: &str = "pr-approved.review-score";
 /// `approved` → `merged`: the PR has actually been merged.
@@ -118,6 +128,8 @@ pub const DERIVED_CRITERION_SLUGS: &[&str] = &[
     VERIFYING_REVIEW_PLAN_VERIFIED_SLUG,
     REVIEW_APPROVED_REVIEW_DONE_SLUG,
     REVIEW_APPROVED_FINDINGS_ANSWERED_SLUG,
+    PR_PR_REVIEW_READY_SLUG,
+    PR_PR_REVIEW_REVIEWER_SLUG,
     PR_APPROVED_MERGEABLE_SLUG,
     PR_APPROVED_UP_TO_DATE_SLUG,
     PR_APPROVED_THREADS_RESOLVED_SLUG,

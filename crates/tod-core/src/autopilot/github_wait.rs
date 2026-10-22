@@ -62,6 +62,7 @@ pub fn check_github(
     let releasing = match lifecycle {
         "approved" => false,
         "merged" => true,
+        "pr" => return check_ready_for_review(fleet, node, data_root),
         _ => return Ok(GithubCheck::NothingToWaitOn),
     };
     let links = fleet.read(|conn| NodePrRepo::new(conn).read(node))?;
@@ -137,6 +138,56 @@ pub fn check_github(
     Ok(GithubCheck::Waiting { what, due_at_ms })
 }
 
+/// The `pr` state's wait: the draft its agent opened is marked ready for
+/// review and has a person on it, which the `pr → pr_review` gate asks and
+/// only a person can do. Waits on the first linked pull request that is not
+/// there yet; a webhook for it (`github:pr:<n>:ready_for_review`, or
+/// `:review_requested` once it is out of draft) wakes the run sooner than
+/// the scheduled look.
+fn check_ready_for_review(fleet: &FleetStore, node: uuid::Uuid, data_root: &std::path::Path) -> Result<GithubCheck> {
+    let links = fleet.read(|conn| NodePrRepo::new(conn).read(node))?;
+    if links.prs.is_empty() || !links.unrecognized.is_empty() {
+        // The `pr` agent opens it.
+        return Ok(GithubCheck::NothingToWaitOn);
+    }
+    let Some(feed) = crate::pr_readiness::feed_for(data_root) else {
+        return Ok(GithubCheck::Unreadable("GitHub credentials are not set up".to_string()));
+    };
+    let mut pending: Option<(&NodePr, String, &str)> = None;
+    let mut standing: Vec<String> = Vec::new();
+    for pr in &links.prs {
+        let label = crate::pr_readiness::pr_label(pr);
+        let snapshot = match feed.snapshot(pr) {
+            Ok(snapshot) => snapshot,
+            Err(err) => return Ok(GithubCheck::Unreadable(format!("{label} not readable: {err}"))),
+        };
+        let status = &snapshot.status;
+        if crate::gate::derived::ready_for_review(&pr.url, status).is_err() {
+            standing.push(format!("{label} still a draft"));
+            pending.get_or_insert((pr, format!("{} to be marked ready for review", pr.url), "ready_for_review"));
+        } else if crate::gate::derived::has_reviewer(&pr.url, status, &snapshot.reviews).is_err() {
+            standing.push(format!("{label} has no reviewer"));
+            pending.get_or_insert((pr, format!("a reviewer to be put on {}", pr.url), "review_requested"));
+        } else {
+            standing.push(format!("{label} ready for review"));
+        }
+    }
+    let Some((pr, what, event)) = pending else {
+        let specs: Vec<String> = links
+            .prs
+            .iter()
+            .flat_map(|pr| ["ready_for_review", "review_requested"].map(|e| format!("github:pr:{}:{e}", pr.pr_number)))
+            .collect();
+        cancel_waits(fleet, node, |spec| specs.iter().any(|s| s == spec))?;
+        return Ok(GithubCheck::Clear);
+    };
+    let settings = crate::pr_readiness::settings_at(data_root);
+    let spec = format!("github:pr:{}:{event}", pr.pr_number);
+    let what = if standing.len() > 1 { format!("{what} ({})", standing.join("; ")) } else { what };
+    let due_at_ms = record_github_wait(fleet, node, spec, "github:pr:", &settings, &what)?;
+    Ok(GithubCheck::Waiting { what, due_at_ms })
+}
+
 /// "Check now": reads GitHub for the node in its current state and records
 /// what it found, with no run. Says what it found, or why it could not
 /// look. A node that is now clear is left for the runner to carry on.
@@ -152,7 +203,7 @@ pub fn check_now(fleet: &FleetStore, node: uuid::Uuid, data_root: &std::path::Pa
 }
 
 impl Autopilot {
-    /// The wait that `lifecycle` (`approved` or `merged`) calls for, as the
+    /// The wait that `lifecycle` (`pr`, `approved` or `merged`) calls for, as the
     /// run's end, or `None` when there is nothing to wait for.
     pub(super) fn hold_for_github(&mut self, fleet: &FleetStore, lifecycle: &str) -> Result<Option<Outcome>> {
         Ok(match check_github(fleet, self.node, &self.config.data_root, lifecycle)? {

@@ -603,6 +603,8 @@ mod tests {
             head_sha: Some("abcdef1234567".into()),
             head_committed_at: Some("2026-01-01T10:00:00Z".into()),
             draft: false,
+            open: true,
+            reviewers: Vec::new(),
             base_ref: Some("main".into()),
             body: None,
         }

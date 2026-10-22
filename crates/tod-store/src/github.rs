@@ -64,6 +64,12 @@ pub struct PrStatus {
     pub head_committed_at: Option<String>,
     /// The PR is a draft.
     pub draft: bool,
+    /// The PR is open (not closed, merged or not).
+    pub open: bool,
+    /// Who GitHub still has a review requested from: user logins, and team
+    /// slugs as `org/team`. A reviewer who has already reviewed is no longer
+    /// listed; see [`PrReview`].
+    pub reviewers: Vec<String>,
     /// The branch the PR merges into.
     pub base_ref: Option<String>,
     /// The description. A review bot may keep its summary here, edited in
@@ -252,6 +258,13 @@ impl Github {
             head_sha: raw.head.as_ref().map(|h| h.sha.clone()),
             head_committed_at: None,
             draft: raw.draft.unwrap_or(false),
+            open: raw.state.as_deref() == Some("open"),
+            reviewers: raw
+                .requested_reviewers
+                .into_iter()
+                .map(|u| u.login)
+                .chain(raw.requested_teams.into_iter().map(|t| t.slug))
+                .collect(),
             base_ref: raw.base.map(|b| b.name),
             body: raw.body,
         })
@@ -831,9 +844,24 @@ struct PrDetailRaw {
     mergeable_state: Option<String>,
     merged: Option<bool>,
     draft: Option<bool>,
+    state: Option<String>,
+    #[serde(default)]
+    requested_reviewers: Vec<RequestedUserRaw>,
+    #[serde(default)]
+    requested_teams: Vec<RequestedTeamRaw>,
     head: Option<HeadRaw>,
     base: Option<RefRaw>,
     body: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RequestedUserRaw {
+    login: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RequestedTeamRaw {
+    slug: String,
 }
 
 #[derive(Debug, Deserialize)]

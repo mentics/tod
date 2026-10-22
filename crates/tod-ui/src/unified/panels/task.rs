@@ -709,10 +709,10 @@ impl TaskPanel {
         // runs (here, in a dev container, in a cloud sandbox).
         // A cloud node's supervisor may have stopped without a wait reaching
         // here (the stop is not synced), so there it is offered in
-        // `approved` and `merged` whatever the status says.
+        // `pr`, `approved` and `merged` whatever the status says.
         let waits_on_github = matches!(status, RunnerStatus::Awaiting { .. })
             || (self.runner.cloud.as_ref().is_some_and(|cloud| cloud.lost_at.is_none())
-                && matches!(self.runner.lifecycle.as_str(), "approved" | "merged"));
+                && matches!(self.runner.lifecycle.as_str(), "pr" | "approved" | "merged"));
         if waits_on_github && !actions.menu.contains(&RunnerAction::PollNow) && !actions.menu.contains(&RunnerAction::CheckNow) {
             actions.menu.insert(0, RunnerAction::CheckNow);
         }

@@ -4,7 +4,7 @@ Each node sits in one **lifecycle state**, and moves forward through them in
 order:
 
 `proposed` → `design` → `planning` → `ready` → `active` → `verifying` →
-`review` → `pr` → `approved` → `merged` → `released` → `learn` → `done`
+`review` → `pr` → `pr_review` → `approved` → `merged` → `released` → `learn` → `done`
 
 Once its runner is started, a node moves through the whole lifecycle without
 the user. Each state has a **gate**: criteria the app checks itself, from the
@@ -20,7 +20,9 @@ separate, fresh session judges it: it certifies, or sends it back with fixes
 for the phase agent to make.
 
 The user is involved only for what only they can supply, and for a pull
-request that needs a human review before it is mergeable.
+request that needs a human review before it is mergeable. `pr` opens the pull
+request as a draft; once a person has marked it ready and put a reviewer on
+it, `pr_review` answers the review's feedback until it is mergeable.
 
 ## Asking the user
 
