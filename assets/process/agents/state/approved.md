@@ -4,7 +4,7 @@
 
 ## Agent
 
-No agent runs on entry — `approved` is a thin holding state, like `ready`/`done`. The `pr` state already drove the PR to mergeable; this state just waits for the user to click merge. The app does the waiting: the run ends with a timed wait that reads GitHub again at each scheduled look (a webhook for the merge wakes it sooner), and goes on through the gate once every linked PR is merged.
+No agent runs on entry — `approved` is a thin holding state, like `ready`/`done`. The `pr_review` state already drove the PR to mergeable; this state just waits for the user to click merge. The app does the waiting: the run ends with a timed wait that reads GitHub again at each scheduled look (a webhook for the merge wakes it sooner), and goes on through the gate once every linked PR is merged.
 
 ## Responsibilities
 
@@ -18,4 +18,4 @@ The app checks this gate itself from GitHub's live status; no agent evaluates it
 
 ## Blockers
 
-None — if the PR needs more work, the node moves back to `pr`, not forward from here.
+None — if the PR needs more work, the node moves back to `pr_review`, not forward from here.

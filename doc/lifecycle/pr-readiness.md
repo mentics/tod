@@ -3,6 +3,25 @@
 Status: implemented, with the differences listed under "As built". Extends
 the `pr` state in [phase-agents.md](phase-agents.md).
 
+**Split into two states.** Everything below used to happen in `pr`. It now
+happens in `pr_review`, and `pr` is only the draft:
+
+- `pr`: the agent opens the pull request as a **draft** (`tod-cli pr open`;
+  the project's own skill for it goes under the `pr` phase in Lifecycle
+  config). Its gate, `pr → pr_review`, is app-checked: the PR is open and out
+  of draft (`pr-pr_review.ready-for-review`) and a person is on it as
+  reviewer, requested or already reviewed (`pr-pr_review.reviewer-assigned`).
+  A person does both; the run waits at the gate until they have. These two
+  are hardcoded. What "ready for human review" means will want to be
+  scriptable per project; that is for later.
+- `pr_review`: the babysitter. Its skills go under the `pr_review` phase,
+  so responding to reviewers can use a skill of its own. Its gate,
+  `pr_review → approved`, is the one `pr` had (the criteria below, which keep
+  their `pr-approved.*` slugs so existing waivers still apply).
+- `approved` is unchanged: it waits for the merge.
+
+Below, "the `pr` state" means `pr_review` unless it is about opening the PR.
+
 ## Problem
 
 A node in `pr` has a linked pull request. Today its only gate check is
