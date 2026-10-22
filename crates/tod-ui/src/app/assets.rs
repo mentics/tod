@@ -22,7 +22,11 @@ gpui_kit_assets::icon_assets!(
         FolderCode,
         RotateCcwClock,
         SquarePen,
-        Square
+        Square,
+        GitPullRequest,
+        GitPullRequestDraft,
+        GitPullRequestClosed,
+        GitMerge
     ]
 );
 
@@ -70,6 +74,19 @@ mod tests {
     fn chat_drawer_session_icons_are_bundled() {
         assert!(serves(&gpui_kit_assets::IconName::RotateCcwClock.path()));
         assert!(serves(&gpui_kit_assets::IconName::SquarePen.path()));
+    }
+
+    #[test]
+    fn node_pr_icons_are_bundled() {
+        use gpui_kit_assets::IconName;
+        for icon in [
+            IconName::GitPullRequest,
+            IconName::GitPullRequestDraft,
+            IconName::GitPullRequestClosed,
+            IconName::GitMerge,
+        ] {
+            assert!(serves(&icon.path()));
+        }
     }
 
     #[test]
