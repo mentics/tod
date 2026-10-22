@@ -173,9 +173,11 @@ pub fn large_fixture_set(base_count: usize) -> Vec<TaskItem> {
         .collect()
 }
 
-/// Each node's open pull request, as the last state read says (the tree
+/// Each node's pull-request state, as the last state read says (the tree
 /// refreshes unknown ones off the UI thread, see [`unread_pull_requests`]).
-/// A node with several shows the first still open; merged and closed show none.
+/// A node with several shows the earliest state among them (draft, then open,
+/// merged, closed): the one that says whether a pull request still needs
+/// attention.
 fn pr_states_by_node(store: &FleetStore) -> HashMap<Uuid, PullState> {
     let links = store
         .read(|conn| Ok(NodePrRepo::new(conn).all()?))
@@ -183,16 +185,16 @@ fn pr_states_by_node(store: &FleetStore) -> HashMap<Uuid, PullState> {
     links
         .into_iter()
         .filter_map(|(node_id, prs)| {
-            let states: Vec<PullState> = prs
+            let state = prs
                 .iter()
                 .filter_map(tod_core::pull_requests::cached_pull_state)
-                .filter(|state| !state.is_terminal())
-                .collect();
-            let state = states
-                .iter()
-                .find(|s| **s == PullState::Open)
-                .or(states.first())?;
-            Some((node_id, *state))
+                .min_by_key(|state| match state {
+                    PullState::Draft => 0,
+                    PullState::Open => 1,
+                    PullState::Merged => 2,
+                    PullState::Closed => 3,
+                })?;
+            Some((node_id, state))
         })
         .collect()
 }

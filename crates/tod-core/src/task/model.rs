@@ -64,9 +64,9 @@ pub struct TaskItem {
     pub has_copies: bool,
     /// True when the node's ticket is done or canceled (shown struck through).
     pub ticket_terminal: bool,
-    /// The state of the node's open pull request, when one is linked and its
-    /// state is known: only `Open` and `Draft` (a merged or closed one shows
-    /// nothing). The row's own cell, apart from the status icon.
+    /// The earliest state among the node's linked pull requests (draft, open,
+    /// merged, closed), when one is linked and its state is known. The row's
+    /// own cell, apart from the status icon.
     pub pr_state: Option<tod_store::github::PullState>,
     /// Pending decisions waiting on the user for this node (fed by the
     /// host via `TaskListView::set_attention`; zero until it calls in).

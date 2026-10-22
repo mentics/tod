@@ -911,8 +911,8 @@ fn status_icon_cell(
     cell
 }
 
-/// `styles.node-pr`: the cell right of the status icon for the node's open
-/// pull request. Always reserved, so titles stay aligned whether or not a row
+/// `styles.node-pr`: the cell right of the status icon for the node's pull
+/// request (its earliest state). Always reserved, so titles stay aligned whether or not a row
 /// has one.
 fn pr_icon_cell(state: Option<tod_store::github::PullState>) -> gpui::Div {
     use gpui_kit_assets::IconName;
@@ -929,7 +929,17 @@ fn pr_icon_cell(state: Option<tod_store::github::PullState>) -> gpui::Div {
                 .xsmall()
                 .text_color(crate::ui::style::color::node_pr_open_text()),
         ),
-        _ => cell,
+        Some(PullState::Merged) => cell.child(
+            gpui_component::Icon::new(IconName::GitMerge)
+                .xsmall()
+                .text_color(crate::ui::style::color::node_pr_merged_text()),
+        ),
+        Some(PullState::Closed) => cell.child(
+            gpui_component::Icon::new(IconName::GitPullRequestClosed)
+                .xsmall()
+                .text_color(crate::ui::style::color::node_pr_closed_text()),
+        ),
+        None => cell,
     }
 }
 
