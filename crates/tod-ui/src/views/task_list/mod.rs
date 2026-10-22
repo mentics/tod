@@ -500,7 +500,7 @@ impl TaskListView {
             ListEvent::Cancel => {}
         });
 
-        let view = Self {
+        let mut view = Self {
             writes: writes::WriteQueue::new(),
             creating: Vec::new(),
             all_tasks,
@@ -569,6 +569,18 @@ impl TaskListView {
             pr_refresh: PrRefresh::Idle(None),
         };
 
+        view.refresh_pr_states(cx);
+        // A draft turns ready, or a read that failed is tried again, without
+        // any store change to prompt it; `refresh_pr_states` rate-limits.
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(PR_REFRESH_COOLDOWN / 3).await;
+                if this.update(cx, |this, cx| this.refresh_pr_states(cx)).is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
         cx.defer_in(window, move |this, window, cx| {
             this.list_state.update(cx, |state, cx| {
                 state.set_selected_index(this.last_selected, window, cx);

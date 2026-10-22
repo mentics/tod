@@ -129,7 +129,9 @@ impl Github {
                 .into(),
             GithubAuth::Proxy => crate::sandbox_http::sandbox_agent(TIMEOUT),
         };
-        Self::with_agent(auth, agent, GITHUB_API_URL)
+        // `TOD_GITHUB_API_URL` points a dev run at a stand-in server.
+        let api = std::env::var("TOD_GITHUB_API_URL").unwrap_or_else(|_| GITHUB_API_URL.to_string());
+        Self::with_agent(auth, agent, &api)
     }
 
     /// With the agent and API base URL given.
