@@ -7,6 +7,8 @@ A node's pull requests (links in its Ticket capability; `pr open` adds one).
 ```
 tod-cli --data-root <DATA_ROOT> pr list                              [--node <NODE_UUID>] [--all-open]
 tod-cli --data-root <DATA_ROOT> pr open                              [--node <NODE_UUID>] --owner <OWNER> --repo <REPO> --head <BRANCH> --base <BRANCH> --title <TEXT> [--body <TEXT>]
+tod-cli --data-root <DATA_ROOT> pr link <LINK>                       [--node <NODE_UUID>]
+tod-cli --data-root <DATA_ROOT> pr unlink <LINK>                     [--node <NODE_UUID>]
 tod-cli --data-root <DATA_ROOT> pr status                            [--node <NODE_UUID>]
 tod-cli --data-root <DATA_ROOT> pr comment reply <COMMENT_ID> <TEXT> [--node <NODE_UUID>] [--pr <LINK>]
 tod-cli --data-root <DATA_ROOT> pr threads                           [--node <NODE_UUID>] [--pr <LINK>] [--all]
@@ -17,6 +19,9 @@ tod-cli --data-root <DATA_ROOT> pr blocked                           --why <TEXT
 ```
 
 - `open` always opens a draft PR, and refuses when a PR is already linked in that repository; run `status` first.
+- `link` attaches an existing PR to the node (a URL or `<OWNER>/<REPO>#<NUMBER>`);
+  `unlink` removes one and keeps the others. To swap a PR, link the new one and
+  unlink the old.
 - `threads` lists open review threads, human and bot, with code, comments and
   roughly how many rounds each has had. `threads answer` posts `--reply` (what
   you did, or why not) and resolves the thread. `--fixed`: push first

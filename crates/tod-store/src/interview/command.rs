@@ -278,6 +278,14 @@ pub enum InterviewCommand {
         pr_number: i64,
         url: String,
     },
+    /// Unlink a pull request from a node (`crate::github::NodePrRepo::remove`);
+    /// `url` is the link as given, and the result says whether one was linked.
+    UnlinkNodePr {
+        node_id: Uuid,
+        owner: String,
+        repo: String,
+        pr_number: i64,
+    },
     /// Respond to a review finding: its status, and the fix or why not.
     RespondReviewFinding {
         finding_id: Uuid,
@@ -1055,6 +1063,16 @@ pub fn execute(
             }
             crate::github::NodePrRepo::new(conn).add(*node_id, &pr)?;
             Ok(json!({}))
+        }
+        InterviewCommand::UnlinkNodePr {
+            node_id,
+            owner,
+            repo,
+            pr_number,
+        } => {
+            let pr = crate::github::NodePr::new(owner, repo, *pr_number);
+            let removed = crate::github::NodePrRepo::new(conn).remove(*node_id, &pr)?;
+            Ok(json!({ "removed": removed }))
         }
         InterviewCommand::RespondReviewFinding {
             finding_id,

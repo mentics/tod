@@ -31,6 +31,8 @@ Inside a `pr` conversation --node defaults to the node under work.
 COMMANDS:
     list                              [--node <UUID>] [--all-open]
     open                              [--node <UUID>] --owner <OWNER> --repo <REPO> --head <BRANCH> --base <BRANCH> --title <TEXT> [--body <TEXT>]
+    link <LINK>                       [--node <UUID>]
+    unlink <LINK>                     [--node <UUID>]
     status                            [--node <UUID>]
     comment reply <COMMENT_ID> <TEXT> [--node <UUID>] [--pr <LINK>]
     threads                           [--node <UUID>] [--pr <LINK>] [--all]
@@ -51,6 +53,10 @@ whichever branch it is from.
 open from --head) and links it to the node, enabling Ticket if it is off; it
 refuses when the node already links a pull request in that repository — call
 `status` first if you are not sure one already exists.
+`link` attaches an existing pull request (a URL or <OWNER>/<REPO>#<NUMBER>) to the
+node, after any it already links, enabling Ticket if it is off; `unlink` removes
+one and leaves the others. Neither touches GitHub, and `link` does not check the
+one-per-repository rule `open` applies.
 `status` fetches each linked PR's live mergeable flag, combined check status,
 and merged flag.
 `comment reply` posts a reply to a review comment thread by its numeric id
@@ -88,6 +94,7 @@ pub fn run(inv: Invocation) -> anyhow::Result<String> {
             let args = Args::parse(&rest)?;
             open(&inv, &args)
         }
+        "link" | "unlink" => link(&inv, &command, &rest),
         "status" => {
             let args = Args::parse(&rest)?;
             status(&inv, &args)
@@ -353,6 +360,39 @@ fn open(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
             )
         })?;
     Ok(format!("ok {}", pr.url))
+}
+
+/// `link <LINK>` / `unlink <LINK>`: the node's own list of pull requests,
+/// edited one at a time.
+fn link(inv: &Invocation, command: &str, rest: &[String]) -> anyhow::Result<String> {
+    let [target, flags @ ..] = rest else {
+        anyhow::bail!("`pr {command}` needs a pull request: a URL or <OWNER>/<REPO>#<NUMBER>");
+    };
+    let args = Args::parse(flags)?;
+    let node = node(&args)?;
+    let pr = parse_pr_link(target).ok_or_else(|| {
+        anyhow::anyhow!("`{target}` is not a pull request URL or <OWNER>/<REPO>#<NUMBER>")
+    })?;
+    if command == "link" {
+        inv.client().interview(InterviewCommand::RecordNodePr {
+            node_id: node,
+            owner: pr.owner,
+            repo: pr.repo,
+            pr_number: pr.pr_number,
+            url: pr.url.clone(),
+        })?;
+        return Ok(format!("ok {}", pr.url));
+    }
+    let out = inv.client().interview(InterviewCommand::UnlinkNodePr {
+        node_id: node,
+        owner: pr.owner,
+        repo: pr.repo,
+        pr_number: pr.pr_number,
+    })?;
+    if out["removed"].as_bool() != Some(true) {
+        anyhow::bail!("node {node} does not link {}", pr.url);
+    }
+    Ok(format!("ok unlinked {}", pr.url))
 }
 
 fn status(inv: &Invocation, args: &Args) -> anyhow::Result<String> {

@@ -1135,6 +1135,23 @@ impl<'a> NodePrRepo<'a> {
             .update_linked_prs(&node_id.to_string(), &links)?;
         Ok(())
     }
+
+    /// Unlink `pr` (every link that names it), leaving the others, and say
+    /// whether one was there. Ticket stays as it is.
+    pub fn remove(&self, node_id: Uuid, pr: &NodePr) -> Result<bool> {
+        let links = self.links(node_id)?;
+        let kept: Vec<String> = links
+            .iter()
+            .filter(|link| !parse_pr_link(link).is_some_and(|linked| linked.same_as(pr)))
+            .cloned()
+            .collect();
+        if kept.len() == links.len() {
+            return Ok(false);
+        }
+        crate::fleet::repos::task::TaskRepo::new(self.conn)
+            .update_linked_prs(&node_id.to_string(), &kept)?;
+        Ok(true)
+    }
 }
 
 #[cfg(test)]
@@ -1336,6 +1353,10 @@ mod tests {
             .list_capabilities(node)
             .unwrap()
             .contains(&Capability::Ticket));
+        let other = NodePr::new("ACME", "lib", 2);
+        assert!(prs.remove(node, &other).unwrap());
+        assert!(!prs.remove(node, &other).unwrap());
+        assert_eq!(prs.read(node).unwrap().prs, vec![NodePr::new("acme", "app", 7)]);
         let _ = std::fs::remove_dir_all(root);
     }
 }
