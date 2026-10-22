@@ -64,6 +64,10 @@ pub struct TaskItem {
     pub has_copies: bool,
     /// True when the node's ticket is done or canceled (shown struck through).
     pub ticket_terminal: bool,
+    /// The state of the node's open pull request, when one is linked and its
+    /// state is known: only `Open` and `Draft` (a merged or closed one shows
+    /// nothing). The row's own cell, apart from the status icon.
+    pub pr_state: Option<tod_store::github::PullState>,
     /// Pending decisions waiting on the user for this node (fed by the
     /// host via `TaskListView::set_attention`; zero until it calls in).
     pub needs_you_count: usize,
@@ -736,6 +740,7 @@ fn group_header_row(parent: &TaskItem, state: &str, depth: usize) -> TaskItem {
     header.linked_copy = false;
     header.has_copies = false;
     header.ticket_terminal = false;
+    header.pr_state = None;
     header.needs_you_count = 0;
     header.waiting_since = None;
     header.status_override = None;
@@ -922,6 +927,7 @@ mod tests {
             linked_copy: false,
             has_copies: false,
             ticket_terminal: false,
+            pr_state: None,
             metadata: None,
             generator_sort: None,
             needs_you_count: 0,

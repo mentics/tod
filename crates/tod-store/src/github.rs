@@ -1051,6 +1051,33 @@ impl<'a> NodePrRepo<'a> {
         Ok(out)
     }
 
+    /// Every node's pull requests, one query for all of them.
+    pub fn all(&self) -> Result<std::collections::HashMap<Uuid, Vec<NodePr>>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT node_id, linked_prs FROM node_fields WHERE linked_prs IS NOT NULL",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut out = std::collections::HashMap::new();
+        for row in rows {
+            let (id, raw) = row?;
+            let Ok(links) = serde_json::from_str::<Vec<String>>(&raw) else {
+                continue;
+            };
+            let mut prs: Vec<NodePr> = Vec::new();
+            for pr in links.iter().filter_map(|l| parse_pr_link(l)) {
+                if !prs.iter().any(|p| p.same_as(&pr)) {
+                    prs.push(pr);
+                }
+            }
+            if !prs.is_empty() {
+                out.insert(crate::outline::uuid_blob::blob_to_uuid(&id)?, prs);
+            }
+        }
+        Ok(out)
+    }
+
     /// The first pull request linked.
     pub fn get(&self, node_id: Uuid) -> Result<Option<NodePr>> {
         Ok(self.read(node_id)?.prs.into_iter().next())

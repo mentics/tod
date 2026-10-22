@@ -816,6 +816,7 @@ impl ListDelegate for TaskListDelegate {
                 item.finished_run,
                 item.incoming_count > 0,
             ))
+            .child(pr_icon_cell(item.pr_state))
             .child(title_line)
             .when_some(menu_at, |el, (at, menu)| el.child(popup_at(at, menu)));
 
@@ -908,6 +909,28 @@ fn status_icon_cell(
         );
     }
     cell
+}
+
+/// `styles.node-pr`: the cell right of the status icon for the node's open
+/// pull request. Always reserved, so titles stay aligned whether or not a row
+/// has one.
+fn pr_icon_cell(state: Option<tod_store::github::PullState>) -> gpui::Div {
+    use gpui_kit_assets::IconName;
+    use tod_store::github::PullState;
+    let cell = div().w(px(16.0)).flex_shrink_0().flex().items_center();
+    match state {
+        Some(PullState::Draft) => cell.child(
+            gpui_component::Icon::new(IconName::GitPullRequestDraft)
+                .xsmall()
+                .text_color(crate::ui::style::color::node_pr_draft_text()),
+        ),
+        Some(PullState::Open) => cell.child(
+            gpui_component::Icon::new(IconName::GitPullRequest)
+                .xsmall()
+                .text_color(crate::ui::style::color::node_pr_open_text()),
+        ),
+        _ => cell,
+    }
 }
 
 /// `styles.node-status-nested`: circle (lifecycle running) outside, filled

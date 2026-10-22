@@ -91,6 +91,7 @@ pub(super) fn insert_draft_row(tasks: &mut Vec<TaskItem>, draft: &DraftRow) {
             linked_copy: false,
             has_copies: false,
             ticket_terminal: false,
+            pr_state: None,
             metadata: None,
             generator_sort: None,
             needs_you_count: 0,
