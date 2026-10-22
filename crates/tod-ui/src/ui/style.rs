@@ -104,6 +104,12 @@ pub mod color {
     pub fn node_pr_draft_text() -> Hsla {
         hex(0xa3a3a3ff)
     }
+    pub fn node_pr_merged_text() -> Hsla {
+        hex(0xa78bfaff)
+    }
+    pub fn node_pr_closed_text() -> Hsla {
+        hex(0xf87171ff)
+    }
     pub fn node_chat_text() -> Hsla {
         hex(0x60a5faff)
     }
