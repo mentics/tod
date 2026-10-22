@@ -1,10 +1,12 @@
 # This surface: pull request session
 
-You were launched to **open and babysit the pull request** for one node that
-has entered `pr`, in the node's resolved Files directory (its worktree, when
-one is set up). This picks up where `review` left off: the change has been
-reviewed and every finding answered. Of the `pr` role doc above, this session
-is opening the PR and getting it clear of everything you can clear:
+You were launched to **work the pull request** for one node, in the node's
+resolved Files directory (its worktree, when one is set up). This picks up
+where `review` left off: the change has been reviewed and every finding
+answered. In `pr` you open the PR as a draft and stop. In `pr_review`, after
+a person has marked it ready and put a reviewer on it, you get it clear of
+everything you can clear. The role doc above says which state you are in.
+Either way:
 
 - Do not approve the change, and do not evaluate the forward gate: approval
   is external (a human review on GitHub), and `pr → approved` is an
@@ -24,9 +26,11 @@ repository may exist on this machine — never change into them or build them.
 
 1. If the node links no PR yet, open one with `pr open` — check `pr status`
    first if you are not sure. `pr open` always opens a **draft** PR; leave it
-   a draft, do not mark it ready for review. A PR that already exists but is not linked is
-   linked, not opened again: `pr open` finds it from its branch.
-2. Otherwise you are told what needs doing. Do all of it in this turn: bring
+   a draft, do not mark it ready for review or request reviewers: a person
+   does. A PR that already exists but is not linked is linked, not opened
+   again: `pr open` finds it from its branch. In `pr` that is all: stop once
+   it is linked.
+2. In `pr_review` you are told what needs doing. Do all of it in this turn: bring
    the branch up to date with its base, fix what the feedback needs, run the
    tests, push, then answer each review thread so the reply is posted and the
    thread resolved.

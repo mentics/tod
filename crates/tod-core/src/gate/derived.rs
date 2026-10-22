@@ -24,7 +24,9 @@ use tod_store::outline::{
     VERIFYING_REVIEW_OBLIGATIONS_VERIFIED_SLUG, VERIFYING_REVIEW_PLAN_VERIFIED_SLUG,
 };
 
-pub use tod_store::outline::{APPROVED_MERGED_PR_MERGED_SLUG, PR_APPROVED_MERGEABLE_SLUG};
+pub use tod_store::outline::{
+    APPROVED_MERGED_PR_MERGED_SLUG, PR_APPROVED_MERGEABLE_SLUG, PR_PR_REVIEW_READY_SLUG, PR_PR_REVIEW_REVIEWER_SLUG,
+};
 use tod_store::outline::{
     PR_APPROVED_REVIEW_CURRENT_SLUG, PR_APPROVED_REVIEW_SCORE_SLUG, PR_APPROVED_THREADS_RESOLVED_SLUG,
     PR_APPROVED_UP_TO_DATE_SLUG,
@@ -84,6 +86,8 @@ pub fn evaluate_derived_criterion(
         REVIEW_APPROVED_FINDINGS_ANSWERED_SLUG => {
             findings_answered_outcome(conn, node_id).map(Some)
         }
+        PR_PR_REVIEW_READY_SLUG => pr_ready_for_review_outcome(conn, node_id).map(Some),
+        PR_PR_REVIEW_REVIEWER_SLUG => pr_reviewer_outcome(conn, node_id).map(Some),
         PR_APPROVED_MERGEABLE_SLUG => pr_mergeable_outcome(conn, node_id).map(Some),
         APPROVED_MERGED_PR_MERGED_SLUG => pr_merged_outcome(conn, node_id).map(Some),
         PR_APPROVED_UP_TO_DATE_SLUG => pr_readiness_outcome(conn, node_id, Readiness::UpToDate).map(Some),
@@ -545,6 +549,99 @@ fn linked_prs(
         )));
     };
     Ok(Ok((links.prs, github)))
+}
+
+/// Why `status` is not ready for a person to review, or what says it is.
+pub(crate) fn ready_for_review(url: &str, status: &tod_store::github::PrStatus) -> std::result::Result<String, String> {
+    if status.merged {
+        Ok(format!("{url} is already merged."))
+    } else if !status.open {
+        Err(format!("{url} is closed."))
+    } else if status.draft {
+        Err(format!("{url} is still a draft: mark it ready for review."))
+    } else {
+        Ok(format!("{url} is open for review."))
+    }
+}
+
+/// Whether a person is on the PR as reviewer: one GitHub still has a review
+/// requested from, or one who has already reviewed (GitHub stops listing a
+/// reviewer once they have). A bot's review does not count.
+pub(crate) fn has_reviewer(
+    url: &str,
+    status: &tod_store::github::PrStatus,
+    reviews: &[tod_store::github::PrReview],
+) -> std::result::Result<String, String> {
+    if status.merged {
+        return Ok(format!("{url} is already merged."));
+    }
+    if !status.reviewers.is_empty() {
+        return Ok(format!("{url}: review requested from {}.", status.reviewers.join(", ")));
+    }
+    match reviews
+        .iter()
+        .filter_map(|r| r.author.as_deref())
+        .find(|author| !author.ends_with("[bot]"))
+    {
+        Some(author) => Ok(format!("{url} has been reviewed by {author}.")),
+        None => Err(format!("{url} has no reviewer: request one.")),
+    }
+}
+
+/// Every linked PR is open and out of draft: the `pr` state opens it as a
+/// draft, and a person marks it ready for review.
+fn pr_ready_for_review_outcome(conn: &Connection, node_id: Uuid) -> Result<DerivedOutcome> {
+    let (prs, github) = match linked_prs(conn, node_id)? {
+        Ok(found) => found,
+        Err(outcome) => return Ok(outcome),
+    };
+    let mut passed = Vec::new();
+    for pr in &prs {
+        let status = match github.get_pr_status(&pr.owner, &pr.repo, pr.pr_number) {
+            Ok(status) => status,
+            Err(err) => return Ok(fail(format!("Could not read {}: {err}", pr.url))),
+        };
+        match ready_for_review(&pr.url, &status) {
+            Ok(line) => passed.push(line),
+            Err(why) => return Ok(fail(why)),
+        }
+    }
+    Ok(DerivedOutcome {
+        outcome: OUTCOME_PASS,
+        detail: passed.join(" "),
+    })
+}
+
+/// Every linked PR has a person on it as reviewer ([`has_reviewer`]).
+fn pr_reviewer_outcome(conn: &Connection, node_id: Uuid) -> Result<DerivedOutcome> {
+    let (prs, github) = match linked_prs(conn, node_id)? {
+        Ok(found) => found,
+        Err(outcome) => return Ok(outcome),
+    };
+    let mut passed = Vec::new();
+    for pr in &prs {
+        let status = match github.get_pr_status(&pr.owner, &pr.repo, pr.pr_number) {
+            Ok(status) => status,
+            Err(err) => return Ok(fail(format!("Could not read {}: {err}", pr.url))),
+        };
+        // Reviews are only read when the requested list is empty.
+        let reviews = if status.merged || !status.reviewers.is_empty() {
+            Vec::new()
+        } else {
+            match github.list_reviews(&pr.owner, &pr.repo, pr.pr_number) {
+                Ok(reviews) => reviews,
+                Err(err) => return Ok(fail(format!("Could not read the reviews of {}: {err}", pr.url))),
+            }
+        };
+        match has_reviewer(&pr.url, &status, &reviews) {
+            Ok(line) => passed.push(line),
+            Err(why) => return Ok(fail(why)),
+        }
+    }
+    Ok(DerivedOutcome {
+        outcome: OUTCOME_PASS,
+        detail: passed.join(" "),
+    })
 }
 
 /// Every linked PR is mergeable: GitHub's own `mergeable_state` is
@@ -1383,6 +1480,8 @@ mod readiness_tests {
                 head_sha: Some("abcdef1234".into()),
                 head_committed_at: Some("2026-01-01T10:00:00Z".into()),
                 draft: false,
+                open: true,
+                reviewers: Vec::new(),
                 base_ref: Some("main".into()),
                 body: None,
             },
@@ -1436,4 +1535,47 @@ mod readiness_tests {
         assert_eq!(readiness_outcome(Readiness::ReviewCurrent, &none).outcome, OUTCOME_FAIL);
         assert_eq!(readiness_outcome(Readiness::ReviewScore, &none).outcome, OUTCOME_FAIL);
     }
+
+    fn pr_status(draft: bool, open: bool, reviewers: &[&str]) -> tod_store::github::PrStatus {
+        tod_store::github::PrStatus {
+            mergeable: Some(true),
+            mergeable_state: Some("blocked".into()),
+            merged: false,
+            checks: None,
+            head_sha: None,
+            head_committed_at: None,
+            draft,
+            open,
+            reviewers: reviewers.iter().map(|r| r.to_string()).collect(),
+            base_ref: None,
+            body: None,
+        }
+    }
+
+    fn review(author: &str) -> tod_store::github::PrReview {
+        tod_store::github::PrReview {
+            author: Some(author.into()),
+            submitted_at: "2026-01-01T10:00:00Z".into(),
+            state: "COMMENTED".into(),
+        }
+    }
+
+    #[test]
+    fn a_draft_or_closed_pr_is_not_ready_for_review() {
+        assert!(ready_for_review("u", &pr_status(true, true, &[])).unwrap_err().contains("draft"));
+        assert!(ready_for_review("u", &pr_status(false, false, &[])).unwrap_err().contains("closed"));
+        assert!(ready_for_review("u", &pr_status(false, true, &[])).is_ok());
+        let merged = tod_store::github::PrStatus { merged: true, open: false, ..pr_status(false, false, &[]) };
+        assert!(ready_for_review("u", &merged).is_ok());
+    }
+
+    #[test]
+    fn a_reviewer_is_one_requested_or_one_who_reviewed_but_not_a_bot() {
+        let open = pr_status(false, true, &[]);
+        assert!(has_reviewer("u", &open, &[]).is_err());
+        assert!(has_reviewer("u", &open, &[review("greptile-apps[bot]")]).is_err());
+        assert!(has_reviewer("u", &open, &[review("greptile-apps[bot]"), review("alice")]).unwrap().contains("alice"));
+        assert!(has_reviewer("u", &pr_status(false, true, &["bob"]), &[]).unwrap().contains("bob"));
+    }
+
 }

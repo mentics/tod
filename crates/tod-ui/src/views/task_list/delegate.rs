@@ -4,7 +4,7 @@ use std::rc::Rc;
 use crate::ui::item_list::ItemDrag;
 use crate::views::obligations::DRAG_LIST as OBLIGATION_DRAG_LIST;
 use gpui::{
-    Context, Entity, InteractiveElement, IntoElement, MouseButton, ParentElement, Styled,
+    Context, Entity, InteractiveElement, IntoElement, StatefulInteractiveElement, MouseButton, ParentElement, Styled,
     SharedString, WeakEntity, Window, div, prelude::FluentBuilder, px,
 };
 use gpui_component::IndexPath;
@@ -810,13 +810,15 @@ impl ListDelegate for TaskListDelegate {
                 el.drag_over::<ItemDrag>(|style, _, _, _| style.cursor_not_allowed())
             })
             .child(status_icon_cell(
+                &item.id,
+                item.needs_you_count,
                 item.needs_you_count > 0,
                 item.lifecycle_running,
                 item.chat_running,
                 item.finished_run,
                 item.incoming_count > 0,
             ))
-            .child(pr_icon_cell(item.pr_state))
+            .child(pr_icon_cell(&item.id, &item))
             .child(title_line)
             .when_some(menu_at, |el, (at, menu)| el.child(popup_at(at, menu)));
 
@@ -865,18 +867,26 @@ fn group_label(state: &str) -> String {
 /// animated rows would distract), and always reserved so rows do not shift
 /// when a run starts or stops.
 fn status_icon_cell(
+    id: &str,
+    needs_you_count: usize,
     needs_you: bool,
     lifecycle_running: bool,
     chat_running: bool,
     finished: Option<RunSource>,
     pending_changes: bool,
-) -> gpui::Div {
+) -> gpui::Stateful<gpui::Div> {
     use gpui_kit_assets::IconName;
-    let cell = div()
-        .w(px(16.0))
-        .flex_shrink_0()
-        .flex()
-        .items_center();
+    let cell = hover_lines(
+        div().w(px(16.0)).flex_shrink_0().flex().items_center(),
+        format!("row-status-{id}"),
+        status_lines(
+            needs_you_count,
+            lifecycle_running,
+            chat_running,
+            finished,
+            pending_changes,
+        ),
+    );
     if needs_you || lifecycle_running || chat_running {
         return cell.child(nested_status_glyph(needs_you, lifecycle_running, chat_running));
     }
@@ -911,14 +921,82 @@ fn status_icon_cell(
     cell
 }
 
+/// What each state of a row's status icon means, one line per state that holds.
+fn status_lines(
+    needs_you_count: usize,
+    lifecycle_running: bool,
+    chat_running: bool,
+    finished: Option<RunSource>,
+    pending_changes: bool,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    if needs_you_count > 0 {
+        lines.push(match needs_you_count {
+            1 => "Waiting on you (1 request)".to_string(),
+            n => format!("Waiting on you ({n} requests)"),
+        });
+    }
+    if lifecycle_running {
+        lines.push("Lifecycle running".to_string());
+    }
+    if chat_running {
+        lines.push("Chat session active".to_string());
+    }
+    match finished {
+        Some(RunSource::Lifecycle) => {
+            lines.push("Lifecycle run stopped since you last selected this".to_string())
+        }
+        Some(RunSource::Chat) => {
+            lines.push("Chat session stopped since you last selected this".to_string())
+        }
+        None => {}
+    }
+    if pending_changes {
+        lines.push("Incoming changes not yet checked".to_string());
+    }
+    lines
+}
+
+/// One line per linked pull request: which one, and where it stands.
+fn pr_lines(prs: &[super::model::PrMark]) -> Vec<String> {
+    use tod_store::github::PullState;
+    prs.iter()
+        .map(|pr| {
+            let state = match pr.state {
+                PullState::Draft => "draft",
+                PullState::Open => "open, ready for review",
+                PullState::Merged => "merged",
+                PullState::Closed => "closed without merging",
+            };
+            format!("{}: {state}", pr.label)
+        })
+        .collect()
+}
+
+/// Hover text of one line per entry; no hover when there are none.
+fn hover_lines(cell: gpui::Div, id: String, lines: Vec<String>) -> gpui::Stateful<gpui::Div> {
+    let cell = cell.id(SharedString::from(id));
+    if lines.is_empty() {
+        return cell;
+    }
+    let text = SharedString::from(lines.join("\n"));
+    cell.tooltip(move |window, cx| {
+        gpui_component::tooltip::Tooltip::new(text.clone()).build(window, cx)
+    })
+}
+
 /// `styles.node-pr`: the cell right of the status icon for the node's pull
 /// request (its earliest state). Always reserved, so titles stay aligned whether or not a row
 /// has one.
-fn pr_icon_cell(state: Option<tod_store::github::PullState>) -> gpui::Div {
+fn pr_icon_cell(id: &str, item: &TaskItem) -> gpui::Stateful<gpui::Div> {
     use gpui_kit_assets::IconName;
     use tod_store::github::PullState;
-    let cell = div().w(px(16.0)).flex_shrink_0().flex().items_center();
-    match state {
+    let cell = hover_lines(
+        div().w(px(16.0)).flex_shrink_0().flex().items_center(),
+        format!("row-pr-{id}"),
+        pr_lines(&item.pull_requests),
+    );
+    match item.earliest_pr_state() {
         Some(PullState::Draft) => cell.child(
             gpui_component::Icon::new(IconName::GitPullRequestDraft)
                 .xsmall()
@@ -1176,4 +1254,45 @@ fn tag_chip(
                     Tag::secondary().small().outline().child(tag)
                 }),
         )
+}
+
+#[cfg(test)]
+mod hover_tests {
+    use super::*;
+    use crate::views::task_list::model::PrMark;
+    use tod_store::github::PullState;
+
+    #[test]
+    fn status_hover_lists_every_state_that_holds_one_per_line() {
+        let lines = status_lines(2, true, true, None, true);
+        assert_eq!(
+            lines,
+            [
+                "Waiting on you (2 requests)",
+                "Lifecycle running",
+                "Chat session active",
+                "Incoming changes not yet checked",
+            ]
+        );
+        assert!(status_lines(0, false, false, None, false).is_empty());
+        assert_eq!(
+            status_lines(1, false, false, Some(RunSource::Chat), false),
+            [
+                "Waiting on you (1 request)",
+                "Chat session stopped since you last selected this"
+            ]
+        );
+    }
+
+    #[test]
+    fn pr_hover_names_each_pull_request_and_its_state() {
+        let prs = [
+            PrMark { label: "acme/widgets#1".into(), state: PullState::Draft },
+            PrMark { label: "acme/widgets#3".into(), state: PullState::Merged },
+        ];
+        assert_eq!(
+            pr_lines(&prs),
+            ["acme/widgets#1: draft", "acme/widgets#3: merged"]
+        );
+    }
 }

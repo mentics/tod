@@ -3,10 +3,10 @@ use std::path::PathBuf;
 use uuid::Uuid;
 
 use tod_store::fleet::FleetStore;
-use tod_store::github::{NodePr, NodePrRepo, PullState};
+use tod_store::github::{NodePr, NodePrRepo};
 use tod_store::outline::types::Capability;
 
-use super::model::{ShellInfo, TaskItem};
+use super::model::{PrMark, ShellInfo, TaskItem};
 
 /// Load tree rows from the outline store for `list_id` (or empty when none).
 pub fn load_tasks_from_store(store: &FleetStore, list_id: Option<Uuid>) -> Vec<TaskItem> {
@@ -32,7 +32,7 @@ pub fn load_tasks_from_store(store: &FleetStore, list_id: Option<Uuid>) -> Vec<T
     // Every node's pending incoming-change count, in one query.
     let incoming = store.incoming_counts().unwrap_or_default();
     let mut shells_by_node = store.shells_for_list(list_id).unwrap_or_default();
-    let pr_states = pr_states_by_node(store);
+    let mut pull_requests = pull_requests_by_node(store);
     rows.into_iter()
         .map(|row| {
             let is_work = !row.capabilities.is_empty();
@@ -94,7 +94,7 @@ pub fn load_tasks_from_store(store: &FleetStore, list_id: Option<Uuid>) -> Vec<T
                 linked_copy: row.linked_copy,
                 has_copies: row.has_copies,
                 ticket_terminal: row.ticket_terminal,
-                pr_state: pr_states.get(&row.node.id).copied(),
+                pull_requests: pull_requests.remove(&row.node.id).unwrap_or_default(),
                 metadata: row.metadata,
                 generator_sort: row.generator_sort,
                 // Filled in by `TaskListView::set_attention`, not the store load.
@@ -157,7 +157,7 @@ pub fn large_fixture_set(base_count: usize) -> Vec<TaskItem> {
             linked_copy: false,
             has_copies: false,
             ticket_terminal: false,
-            pr_state: None,
+            pull_requests: Vec::new(),
             metadata: None,
             generator_sort: None,
             needs_you_count: 0,
@@ -173,28 +173,25 @@ pub fn large_fixture_set(base_count: usize) -> Vec<TaskItem> {
         .collect()
 }
 
-/// Each node's pull-request state, as the last state read says (the tree
+/// Each node's linked pull requests whose state has been read (the tree
 /// refreshes unknown ones off the UI thread, see [`unread_pull_requests`]).
-/// A node with several shows the earliest state among them (draft, then open,
-/// merged, closed): the one that says whether a pull request still needs
-/// attention.
-fn pr_states_by_node(store: &FleetStore) -> HashMap<Uuid, PullState> {
+fn pull_requests_by_node(store: &FleetStore) -> HashMap<Uuid, Vec<PrMark>> {
     let links = store
         .read(|conn| Ok(NodePrRepo::new(conn).all()?))
         .unwrap_or_default();
     links
         .into_iter()
         .filter_map(|(node_id, prs)| {
-            let state = prs
+            let marks: Vec<PrMark> = prs
                 .iter()
-                .filter_map(tod_core::pull_requests::cached_pull_state)
-                .min_by_key(|state| match state {
-                    PullState::Draft => 0,
-                    PullState::Open => 1,
-                    PullState::Merged => 2,
-                    PullState::Closed => 3,
-                })?;
-            Some((node_id, state))
+                .filter_map(|pr| {
+                    Some(PrMark {
+                        label: format!("{}/{}#{}", pr.owner, pr.repo, pr.pr_number),
+                        state: tod_core::pull_requests::cached_pull_state(pr)?,
+                    })
+                })
+                .collect();
+            (!marks.is_empty()).then_some((node_id, marks))
         })
         .collect()
 }
