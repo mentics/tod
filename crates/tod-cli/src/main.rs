@@ -1049,6 +1049,28 @@ Second."), "{listed}");
         let shown = cli(&root, &["decisions", "show", &short]).unwrap();
         assert!(shown.contains("(no answers yet)"), "{shown}");
 
+        // An obligation is named by the 8-character prefix listings show.
+        let added = cli(
+            &root,
+            &["obligations", "add", "--node", &node, "--kind", "req", "--body", "Keep it simple."],
+        )
+        .unwrap();
+        let ob = added.strip_prefix("ok ").expect("one-line ack").to_string();
+        cli(
+            &root,
+            &[
+                "decisions", "ask", "--node", &node, "Which obligation wins?",
+                "--option", "a", "--evidence", &format!("obligation:{ob}"),
+            ],
+        )
+        .unwrap();
+        let err = cli(
+            &root,
+            &["decisions", "ask", "--node", &node, "Unknown?", "--option", "a", "--evidence", "obligation:ffffffff"],
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("obligation"), "{err}");
+
         // Bad evidence kind is refused before anything is recorded.
         let err = cli(
             &root,

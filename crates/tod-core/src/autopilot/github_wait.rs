@@ -120,14 +120,10 @@ pub fn check_github(
         }
     }
     let Some((pr, what)) = pending else {
-        // Nothing left to wait for: a wait still open (the merge came
-        // before its deadline) would keep a supervisor asleep on it.
-        let specs: Vec<String> = if releasing {
-            vec![RELEASE_WAIT_SPEC.to_string()]
-        } else {
-            links.prs.iter().map(|pr| merge_wait_spec(pr.pr_number)).collect()
-        };
-        cancel_waits(fleet, node, |spec| specs.iter().any(|s| s == spec))?;
+        // Nothing left to wait for: any GitHub wait still open (the merge
+        // came before its deadline, or an earlier state left one) would keep
+        // a supervisor asleep on it.
+        cancel_github_waits(fleet, node)?;
         return Ok(GithubCheck::Clear);
     };
     let settings = crate::pr_readiness::settings_at(data_root);
@@ -173,12 +169,7 @@ fn check_ready_for_review(fleet: &FleetStore, node: uuid::Uuid, data_root: &std:
         }
     }
     let Some((pr, what, event)) = pending else {
-        let specs: Vec<String> = links
-            .prs
-            .iter()
-            .flat_map(|pr| ["ready_for_review", "review_requested"].map(|e| format!("github:pr:{}:{e}", pr.pr_number)))
-            .collect();
-        cancel_waits(fleet, node, |spec| specs.iter().any(|s| s == spec))?;
+        cancel_github_waits(fleet, node)?;
         return Ok(GithubCheck::Clear);
     };
     let settings = crate::pr_readiness::settings_at(data_root);
@@ -250,6 +241,12 @@ fn record_github_wait(
         )
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     Ok(due_at_ms)
+}
+
+/// Cancels every pending wait the node has on GitHub, whichever state
+/// recorded it: a supervisor woken with one still open goes back to sleep.
+fn cancel_github_waits(fleet: &FleetStore, node: uuid::Uuid) -> Result<()> {
+    cancel_waits(fleet, node, |spec| spec.starts_with("github:"))
 }
 
 /// Cancels the node's pending waits whose spec `matches`.

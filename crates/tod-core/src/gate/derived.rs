@@ -575,8 +575,14 @@ pub(crate) fn has_reviewer(
     if status.merged {
         return Ok(format!("{url} is already merged."));
     }
-    if !status.reviewers.is_empty() {
-        return Ok(format!("{url}: review requested from {}.", status.reviewers.join(", ")));
+    let requested: Vec<&str> = status
+        .reviewers
+        .iter()
+        .map(String::as_str)
+        .filter(|login| !login.ends_with("[bot]"))
+        .collect();
+    if !requested.is_empty() {
+        return Ok(format!("{url}: review requested from {}.", requested.join(", ")));
     }
     match reviews
         .iter()
@@ -1576,6 +1582,8 @@ mod readiness_tests {
         assert!(has_reviewer("u", &open, &[review("greptile-apps[bot]")]).is_err());
         assert!(has_reviewer("u", &open, &[review("greptile-apps[bot]"), review("alice")]).unwrap().contains("alice"));
         assert!(has_reviewer("u", &pr_status(false, true, &["bob"]), &[]).unwrap().contains("bob"));
+        assert!(has_reviewer("u", &pr_status(false, true, &["greptile-apps[bot]"]), &[]).is_err());
+        assert!(has_reviewer("u", &pr_status(false, true, &["greptile-apps[bot]", "bob"]), &[]).unwrap().contains("bob"));
     }
 
 }

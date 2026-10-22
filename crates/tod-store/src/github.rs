@@ -32,6 +32,14 @@ pub enum GithubError {
     NotFound,
     #[error("GitHub API error: {0}")]
     Api(String),
+    /// Proxy authentication was chosen ([`GITHUB_AUTH_ENV`]) but no proxy is
+    /// configured, so a request would go out with no credential at all.
+    #[error(
+        "GitHub is to be reached through the sandbox's proxy ({GITHUB_AUTH_ENV}={GITHUB_AUTH_PROXY}), \
+         but this process has no proxy configured (HTTPS_PROXY is unset): the request would go to \
+         GitHub with no credentials"
+    )]
+    ProxyMissing,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -123,6 +131,8 @@ pub struct Github {
     auth: GithubAuth,
     agent: ureq::Agent,
     api: String,
+    /// Proxy authentication with no proxy to carry it: every call is refused.
+    proxy_missing: bool,
 }
 
 impl Github {
@@ -137,12 +147,13 @@ impl Github {
         };
         // `TOD_GITHUB_API_URL` points a dev run at a stand-in server.
         let api = std::env::var("TOD_GITHUB_API_URL").unwrap_or_else(|_| GITHUB_API_URL.to_string());
-        Self::with_agent(auth, agent, &api)
+        let proxy_missing = auth == GithubAuth::Proxy && ureq::Proxy::try_from_env().is_none();
+        Self { proxy_missing, ..Self::with_agent(auth, agent, &api) }
     }
 
     /// With the agent and API base URL given.
     pub fn with_agent(auth: GithubAuth, agent: ureq::Agent, api: &str) -> Self {
-        Self { auth, agent, api: api.trim_end_matches('/').to_string() }
+        Self { auth, agent, api: api.trim_end_matches('/').to_string(), proxy_missing: false }
     }
 
     pub fn auth(&self) -> &GithubAuth {
@@ -159,12 +170,18 @@ impl Github {
 
     /// `GET <api><path>`, as JSON.
     fn get_json<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<T, GithubError> {
+        if self.proxy_missing {
+            return Err(GithubError::ProxyMissing);
+        }
         let response = self.authorize(self.agent.get(&format!("{}{path}", self.api))).call();
         read_json(response)
     }
 
     /// `POST <api><path>` with a JSON body, the reply as JSON.
     fn post_json<T: serde::de::DeserializeOwned>(&self, path: &str, body: serde_json::Value) -> Result<T, GithubError> {
+        if self.proxy_missing {
+            return Err(GithubError::ProxyMissing);
+        }
         let response = self.authorize(self.agent.post(&format!("{}{path}", self.api))).send_json(body);
         read_json(response)
     }
@@ -262,6 +279,7 @@ impl Github {
             reviewers: raw
                 .requested_reviewers
                 .into_iter()
+                .filter(|u| !u.is_bot())
                 .map(|u| u.login)
                 .chain(raw.requested_teams.into_iter().map(|t| t.slug))
                 .collect(),
@@ -857,6 +875,17 @@ struct PrDetailRaw {
 #[derive(Debug, Deserialize)]
 struct RequestedUserRaw {
     login: String,
+    /// GitHub's account type: `User`, `Bot`, `Organization`.
+    #[serde(rename = "type", default)]
+    kind: String,
+}
+
+impl RequestedUserRaw {
+    /// A bot: GitHub says so by `type` (a requested Copilot is `Bot` with the
+    /// login `Copilot`), and a login ending `[bot]` is one too.
+    fn is_bot(&self) -> bool {
+        self.kind == "Bot" || self.login.ends_with("[bot]")
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1271,6 +1300,13 @@ mod tests {
         assert_eq!(seen[0], "CONNECT api.github.test:80 HTTP/1.1", "{seen:?}");
         assert!(seen.iter().any(|l| l.starts_with("GET /user ")), "{seen:?}");
         assert!(!has_authorization(&seen), "{seen:?}");
+    }
+
+    #[test]
+    fn proxy_mode_without_a_proxy_refuses_rather_than_going_out_unauthenticated() {
+        let agent = ureq::Agent::config_builder().http_status_as_error(false).build().into();
+        let gh = Github { proxy_missing: true, ..Github::with_agent(GithubAuth::Proxy, agent, "http://api.github.test") };
+        assert!(matches!(gh.user_login(), Err(GithubError::ProxyMissing)));
     }
 
     #[test]

@@ -24,7 +24,8 @@ in full or as the 8-character prefix listings show.
   their own words instead. With none, the question asks for free text.
 - `--evidence`: repeatable `kind:id` links the user can open while
   answering, kind one of `obligation`, `plan_step`, `test_run`,
-  `conversation`, `finding`, `node`.
+  `conversation`, `finding`, `node`. An obligation or plan step may be given
+  as the 8-character prefix shown in listings; the rest take the full UUID.
 - `--reason`: one of `intent`, `missing_rule`, `conflict`, `access`, `risk`,
   `capability`, `broken`, `other` — defaults to `other` when omitted. See "Asking the
   user" for what each means.

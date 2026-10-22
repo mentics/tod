@@ -1170,3 +1170,55 @@ fn check_now_in_pr_waits_for_the_draft_to_be_ready_and_reviewed() {
     assert_eq!(super::check_now(&fx.fleet, fx.node, &fx.root).unwrap(), super::GithubCheck::Clear);
     assert!(pending_specs(&fx).is_empty());
 }
+
+#[test]
+fn check_now_in_pr_clears_a_leftover_review_wait_and_ignores_a_bot_reviewer() {
+    use tod_store::github::{PrSnapshot, PrStatus};
+    struct Feed(PrSnapshot);
+    impl crate::pr_readiness::PrFeed for Feed {
+        fn snapshot(&self, _: &tod_store::github::NodePr) -> Result<PrSnapshot, String> {
+            Ok(self.0.clone())
+        }
+        fn comment(&self, _: &tod_store::github::NodePr, _: &str) -> Result<(), String> {
+            Ok(())
+        }
+    }
+    let fx = bare();
+    retire_outside_criteria(&fx);
+    let status = |reviewers: &[&str]| PrStatus {
+        mergeable: Some(true),
+        mergeable_state: Some("blocked".into()),
+        merged: false,
+        checks: None,
+        head_sha: None,
+        head_committed_at: None,
+        draft: false,
+        open: true,
+        reviewers: reviewers.iter().map(|r| r.to_string()).collect(),
+        base_ref: None,
+        body: None,
+    };
+    let snapshot = |reviewers: &[&str]| {
+        Arc::new(Feed(PrSnapshot { status: status(reviewers), threads: vec![], comments: vec![], reviews: vec![] }))
+    };
+    linked_to_prs(&fx, "pr", &["https://github.com/acme/app/pull/42"]);
+
+    // Only a bot is asked: no reviewer yet.
+    crate::pr_readiness::set_feed_override(Some(snapshot(&["greptile-apps[bot]"])));
+    let found = super::check_now(&fx.fleet, fx.node, &fx.root).unwrap();
+    assert!(matches!(found, super::GithubCheck::Waiting { .. }), "{found:?}");
+
+    // A wait from the review babysitter is still open when a person is put on it.
+    fx.fleet
+        .interview(
+            "test",
+            InterviewCommand::RecordWait {
+                node_id: fx.node,
+                wait: tod_store::waits::NewWait::event("github:pr:42:review".to_string(), i64::MAX / 2),
+            },
+        )
+        .unwrap();
+    crate::pr_readiness::set_feed_override(Some(snapshot(&["alice"])));
+    assert_eq!(super::check_now(&fx.fleet, fx.node, &fx.root).unwrap(), super::GithubCheck::Clear);
+    assert!(pending_specs(&fx).is_empty(), "{:?}", pending_specs(&fx));
+}
