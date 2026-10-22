@@ -712,17 +712,20 @@ fn origin_url_of(fleet: &FleetStore, node_id: &str, repo: &str) -> Result<String
             }
         }
         for name in sandboxes {
-            let found = tod_store::fleet::sandbox::SandboxExec::new(&name)
-                .output(repo, "git", &["config", "--get-regexp", REMOTE_URLS])
-                .ok()
-                .filter(|o| o.status.success())
-                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
-            match found {
-                Some(remotes) => match github_remote_url(&remotes) {
-                    Some(url) => return Ok(url),
-                    None => tried.push(format!("sandbox {name} has remotes {remotes:?} at {repo}")),
-                },
-                None => tried.push(format!("sandbox {name} has no git remotes at {repo}")),
+            match tod_store::fleet::sandbox::SandboxExec::new(&name).output(repo, "git", &["config", "--get-regexp", REMOTE_URLS]) {
+                Err(err) => tried.push(format!("could not run git in sandbox {name} at {repo}: {err:#}")),
+                Ok(o) if o.status.success() => {
+                    let remotes = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                    match github_remote_url(&remotes) {
+                        Some(url) => return Ok(url),
+                        None => tried.push(format!("sandbox {name} has remotes {remotes:?} at {repo}")),
+                    }
+                }
+                Ok(o) => tried.push(format!(
+                    "sandbox {name} has no git remotes at {repo} (git exited {}: {})",
+                    o.status,
+                    String::from_utf8_lossy(&o.stderr).trim()
+                )),
             }
         }
     }
