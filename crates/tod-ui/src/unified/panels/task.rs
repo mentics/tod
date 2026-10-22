@@ -732,9 +732,19 @@ impl TaskPanel {
                     menu: if self.runner.cloud_busy { Vec::new() } else { vec![A::LeaveCloud] },
                 };
             }
+            // A run that failed (or a sandbox missing a file the node needs)
+            // is put right by running again in the same sandbox, which
+            // reinstalls tod's files and restarts the node; deleting the
+            // sandbox first is not needed.
+            if self.runner.cloud_failed {
+                return RunnerActions {
+                    primary: Some((A::RunInCloud, A::RunInCloud.label(), self.runner.cloud_busy)),
+                    menu: if self.runner.cloud_busy { Vec::new() } else { vec![A::SyncCloud, A::DeleteSandbox, A::LeaveCloud] },
+                };
+            }
             return RunnerActions {
                 primary: Some((A::SyncCloud, A::SyncCloud.label(), self.runner.cloud_busy)),
-                menu: if self.runner.cloud_busy { Vec::new() } else { vec![A::DeleteSandbox, A::LeaveCloud] },
+                menu: if self.runner.cloud_busy { Vec::new() } else { vec![A::RunInCloud, A::DeleteSandbox, A::LeaveCloud] },
             };
         }
         if self.runner.cloud_busy {
