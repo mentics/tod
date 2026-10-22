@@ -96,6 +96,14 @@ pub mod color {
     pub fn node_needs_you_text() -> Hsla {
         hex(0xf0805aff)
     }
+    /// An open (non-draft) pull request: the amber of `linked-copy-text`.
+    pub fn node_pr_open_text() -> Hsla {
+        hex(0xf59e0bff)
+    }
+    /// A draft pull request: as quiet as muted text.
+    pub fn node_pr_draft_text() -> Hsla {
+        hex(0xa3a3a3ff)
+    }
     pub fn node_chat_text() -> Hsla {
         hex(0x60a5faff)
     }
