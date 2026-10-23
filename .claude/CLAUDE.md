@@ -662,12 +662,26 @@ appended, and the same panel already shown is focused instead —
 pinned is never unpinned or replaced by it. A task node's default panel is
 the task panel (`doc/ui/task-panel.md`), where its requests are answered.
 **Alt+Q** / **Alt+Shift+Q** jump the tree selection to the next/previous
-node waiting on the user, longest-waiting first (wrapping), and show it in
-its task panel by that rule, with keyboard focus there so the number keys
-answer its top request (`UnifiedView::advance_waiting`). What each node is waiting on comes from
-`tod_core::attention` (`for_node` / `for_nodes`), recomputed off the UI
-thread on every store change by `unified/attention_feed.rs` and pushed into
-the tree with `TaskListView::set_attention`. The task panel's runner line
+node on the user's list (`NodeStanding::on_you()`: waiting on a request, failed,
+stopped, paused or not started, and not deferred), longest-waiting first
+(wrapping), and show it in its task panel by that rule, with keyboard focus
+there so the number keys answer its top request
+(`UnifiedView::advance_waiting`).
+
+**Who is next** is one derived answer per Lifecycle node
+(`tod_core::next_actor`, `doc/lifecycle/next-actor.md`): `Working` (proved by
+a fresh activity lease, `tod_store::activity`; never claimed), `You` (a
+request, a failure, a stop, a pause, not started; a deferral,
+`tod_core::defer`, only hides it for a while and any new item wakes it),
+`Others` (a review, checks, a merge, a release; with `who`, a retry count and
+an error while a look at GitHub is failing), or `Done`. Every view reads it
+from `next_actor::compute` (the app's `unified/attention_feed.rs` off the UI
+thread on every store change, the daemon's tick); none derives its own "who".
+Every failure of what a node waits on ends as `Others` with its error and
+retries or as `You` failed with the error: nothing is logged and dropped
+(`autopilot::github_look_failed`). The tree's status cell is one glyph per
+actor, the strip above it filters by actor, and `tod_core::attention` stays as
+the list of requests behind `You`. The task panel's runner line
 starts, pauses, and resumes the node's lifecycle autopilot on this machine
 (`unified/runners.rs`, `tod_core::autopilot::local`: one thread per run,
 its conversation shown in `AgentRuns` as hosted elsewhere, restarted on the

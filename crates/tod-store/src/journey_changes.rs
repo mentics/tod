@@ -59,6 +59,9 @@
 //!   edits are not surfaced as their own journey rows.
 //! - `node_references`, `node_references_dirty` — a derived cache rebuilt
 //!   from obligation text (`outline::references`), not itself authored data.
+//! - `node_activity` (`crate::activity`) — lease bookkeeping refreshed every
+//!   few seconds while a node is processed: high-frequency and about whether
+//!   something is alive, not a change to the node.
 //! - `gate_criteria` — a global catalog with no `node_id`.
 //! - `incoming_changes` — a queue over changes that are already journaled at
 //!   their source; recording it too would double-count the same edit.
@@ -288,6 +291,11 @@ pub fn node_events_triggers_sql() -> String {
 /// Triggers for `cloud_nodes` (one row per node, keyed by `node_id`).
 pub fn cloud_nodes_triggers_sql() -> String {
     node_keyed_triggers("cloud_nodes")
+}
+
+/// Triggers for `node_deferrals` (one row per node, keyed by `node_id`).
+pub fn deferrals_triggers_sql() -> String {
+    node_keyed_triggers("node_deferrals")
 }
 
 /// Triggers for `node_environment` (one row per node).

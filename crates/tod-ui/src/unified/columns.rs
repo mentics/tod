@@ -22,6 +22,9 @@ pub enum PanelKind {
     /// The live transcript of a node's lifecycle processor, following it
     /// from one agent session to the next; the id is the node's.
     Watch(uuid::Uuid),
+    /// Everything waiting on someone else, grouped by who: the list the
+    /// summary strip's "On others" button opens. About no one node.
+    OnOthers,
 }
 
 impl PanelKind {
@@ -39,7 +42,7 @@ impl PanelKind {
             | PanelKind::Changes(id)
             | PanelKind::Watch(id) => Some(*id),
             // A transcript's id is its conversation's, not a node's.
-            PanelKind::Transcript(_) => None,
+            PanelKind::Transcript(_) | PanelKind::OnOthers => None,
         }
     }
 }

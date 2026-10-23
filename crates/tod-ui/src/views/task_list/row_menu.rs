@@ -17,6 +17,8 @@ pub(super) enum RowMenuKind {
     /// The right-click menu (`context_menu.rs`), opened where the click
     /// landed (window coordinates); `None` hangs it from the row's chips.
     Context(Option<Point<Pixels>>),
+    /// The Defer choices (the Z key), hung from the row's chips.
+    Defer,
 }
 
 /// Anchor a popup under a row trigger: it hangs from the trigger's own corner,
@@ -145,20 +147,35 @@ impl TaskListView {
             .unwrap_or(0);
         let view = cx.weak_entity();
         let focus = self.focus_handle.clone();
-        let menu = PopupMenu::build(window, cx, move |menu, _window, _cx| {
+        let offer = super::actor::DeferOffer::for_standing(self.standing_of(&task_id));
+        let menu = PopupMenu::build(window, cx, move |menu, window, cx| {
             build_row_menu(
                 menu.action_context(focus)
                     .min_w(crate::ui::style::size::ROW_MENU_MIN),
                 kind,
                 task,
                 attention_count,
+                offer,
                 view,
+                window,
+                cx,
             )
         });
         self._row_menu_subscription = Some(cx.subscribe(&menu, |this, _, _: &DismissEvent, cx| {
             this.close_row_menu(cx);
         }));
         self.row_menu = Some(menu);
+    }
+
+    /// The Z key on a node that is on the user: its Defer choices, under the
+    /// row.
+    pub(super) fn open_defer_menu(
+        &mut self,
+        task_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_row_menu_for(RowMenuKind::Defer, task_id.to_string(), window, cx);
     }
 
     fn focus_row_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -175,10 +192,16 @@ fn build_row_menu(
     kind: RowMenuKind,
     task: TaskItem,
     attention_count: usize,
+    offer: super::actor::DeferOffer,
     view: gpui::WeakEntity<TaskListView>,
+    window: &mut Window,
+    cx: &mut Context<PopupMenu>,
 ) -> PopupMenu {
     match kind {
-        RowMenuKind::Context(_) => context_menu::build(menu, &task, attention_count, view),
+        RowMenuKind::Context(_) => {
+            context_menu::build(menu, &task, attention_count, offer, view, window, cx)
+        }
+        RowMenuKind::Defer => context_menu::defer_choices(menu, &task.id, &view),
         RowMenuKind::Shells => {
             for shell in &task.shells {
                 let view = view.clone();

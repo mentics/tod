@@ -187,23 +187,99 @@ fn setup() -> Fixture {
     fx
 }
 
-/// GitHub as a test has it: unreachable, so the pull request is left to the
-/// gate.
-struct NoGithub;
+/// What a pull request that is merged, and named in a release, reads as:
+/// GitHub as most tests need it, where the pull request is no obstacle.
+fn finished_merge() -> tod_store::github::PrMerge {
+    tod_store::github::PrMerge {
+        title: "Mock change".into(),
+        merged: true,
+        merged_at: Some("2026-03-01T00:00:00Z".into()),
+    }
+}
 
-impl crate::pr_readiness::PrFeed for NoGithub {
+fn finished_releases() -> Vec<tod_store::github::Release> {
+    vec![tod_store::github::Release {
+        tag: "v1.0.0".into(),
+        name: None,
+        body: "Mock change".into(),
+        url: "https://github.com/mock-owner/mock-repo/releases/tag/v1.0.0".into(),
+        published_at: Some("2026-03-02T00:00:00Z".into()),
+    }]
+}
+
+/// GitHub as a test has it: every pull request merged and released, so
+/// nothing about it holds the node up. (An unreadable GitHub is an error the
+/// run reports, never something left to the gate: see
+/// `an_unreadable_pull_request_fails_the_run_visibly`.)
+struct FinishedGithub;
+
+impl crate::pr_readiness::PrFeed for FinishedGithub {
     fn snapshot(&self, _: &tod_store::github::NodePr) -> Result<tod_store::github::PrSnapshot, String> {
-        Err("no GitHub in this test".to_string())
+        use tod_store::github::{PrSnapshot, PrStatus};
+        Ok(PrSnapshot {
+            status: PrStatus {
+                mergeable: Some(true),
+                mergeable_state: Some("clean".into()),
+                merged: true,
+                checks: Some("success".into()),
+                head_sha: Some("abcdef1".into()),
+                head_committed_at: Some("2020-01-01T00:00:00Z".into()),
+                draft: false,
+                base_ref: Some("main".into()),
+                body: None,
+                ..Default::default()
+            },
+            threads: vec![],
+            comments: vec![],
+            reviews: vec![],
+        })
     }
 
     fn comment(&self, _: &tod_store::github::NodePr, _: &str) -> Result<(), String> {
-        Err("no GitHub in this test".to_string())
+        Ok(())
+    }
+
+    fn merge(&self, _: &tod_store::github::NodePr) -> Result<tod_store::github::PrMerge, String> {
+        Ok(finished_merge())
+    }
+
+    fn releases(&self, _: &tod_store::github::NodePr) -> Result<Vec<tod_store::github::Release>, String> {
+        Ok(finished_releases())
+    }
+}
+
+/// GitHub that fails every look with `error`.
+struct FailingGithub {
+    error: std::sync::Mutex<String>,
+}
+
+impl FailingGithub {
+    fn new(error: &str) -> Arc<Self> {
+        Arc::new(Self { error: std::sync::Mutex::new(error.to_string()) })
+    }
+}
+
+impl crate::pr_readiness::PrFeed for FailingGithub {
+    fn snapshot(&self, _: &tod_store::github::NodePr) -> Result<tod_store::github::PrSnapshot, String> {
+        Err(self.error.lock().unwrap().clone())
+    }
+
+    fn comment(&self, _: &tod_store::github::NodePr, _: &str) -> Result<(), String> {
+        Err(self.error.lock().unwrap().clone())
+    }
+
+    fn merge(&self, _: &tod_store::github::NodePr) -> Result<tod_store::github::PrMerge, String> {
+        Err(self.error.lock().unwrap().clone())
+    }
+
+    fn releases(&self, _: &tod_store::github::NodePr) -> Result<Vec<tod_store::github::Release>, String> {
+        Err(self.error.lock().unwrap().clone())
     }
 }
 
 /// A node with a workspace and nothing else: no requirements, no plan.
 fn bare() -> Fixture {
-    crate::pr_readiness::set_feed_override(Some(Arc::new(NoGithub)));
+    crate::pr_readiness::set_feed_override(Some(Arc::new(FinishedGithub)));
     let fx = fixture();
     let workspace = fx.root.join("workspace");
     std::fs::create_dir_all(&workspace).unwrap();
@@ -530,6 +606,14 @@ fn a_local_run_takes_the_node_to_done_on_its_own_thread() {
         "{events:#?}"
     );
     assert_eq!(events.last(), Some(&LocalEvent::Finished(Ok(Outcome::Done))));
+    // The run held a lease while it worked and let it go when it ended: the
+    // node is not left claiming to be processed.
+    fx.fleet.writer().flush().unwrap();
+    let leases = fx
+        .fleet
+        .read(|conn| tod_store::activity::ActivityRepo::new(conn).list_for_nodes(&[fx.node]))
+        .unwrap();
+    assert!(leases.is_empty(), "{leases:?}");
 }
 
 #[test]
@@ -703,6 +787,7 @@ impl crate::pr_readiness::PrFeed for Sim {
                 reviewers: Vec::new(),
                 base_ref: Some("main".into()),
                 body: None,
+                ..Default::default()
             },
             threads: if round == 0 {
                 vec![ReviewThread {
@@ -733,6 +818,15 @@ impl crate::pr_readiness::PrFeed for Sim {
     fn comment(&self, _: &tod_store::github::NodePr, body: &str) -> Result<(), String> {
         self.posted.lock().unwrap().push(body.to_string());
         Ok(())
+    }
+
+    // Once the review is through, the pull request merges and ships.
+    fn merge(&self, _: &tod_store::github::NodePr) -> Result<tod_store::github::PrMerge, String> {
+        Ok(finished_merge())
+    }
+
+    fn releases(&self, _: &tod_store::github::NodePr) -> Result<Vec<tod_store::github::Release>, String> {
+        Ok(finished_releases())
     }
 }
 
@@ -806,6 +900,7 @@ fn a_pull_request_waiting_for_a_person_ends_the_run_with_a_timed_wait() {
                     reviewers: Vec::new(),
                     base_ref: None,
                     body: None,
+                    ..Default::default()
                 },
                 threads: vec![],
                 comments: vec![],
@@ -836,6 +931,48 @@ fn a_pull_request_waiting_for_a_person_ends_the_run_with_a_timed_wait() {
 }
 
 #[test]
+fn the_wait_for_a_person_records_who_was_asked_to_review() {
+    let fx = setup();
+    retire_outside_criteria(&fx);
+    struct Asked;
+    impl crate::pr_readiness::PrFeed for Asked {
+        fn snapshot(&self, _: &tod_store::github::NodePr) -> Result<tod_store::github::PrSnapshot, String> {
+            use tod_store::github::{PrSnapshot, PrStatus};
+            Ok(PrSnapshot {
+                status: PrStatus {
+                    mergeable: Some(true),
+                    mergeable_state: Some("blocked".into()),
+                    checks: Some("success".into()),
+                    head_sha: Some("abcdef1".into()),
+                    head_committed_at: Some("2020-01-01T00:00:00Z".into()),
+                    reviewers: vec!["maria".into(), "acme/core".into()],
+                    ..Default::default()
+                },
+                threads: vec![],
+                comments: vec![],
+                reviews: vec![],
+            })
+        }
+        fn comment(&self, _: &tod_store::github::NodePr, _: &str) -> Result<(), String> {
+            Ok(())
+        }
+    }
+    crate::pr_readiness::set_feed_override(Some(Arc::new(Asked)));
+    lifecycle::set_lifecycle(&fx.fleet, fx.node, "pr").unwrap();
+    let mut agent = FakeAgent::new(&fx.fleet);
+    let outcome = autopilot(&fx, Budget::default()).run(&fx.fleet, &mut agent).unwrap();
+    assert!(matches!(outcome, Outcome::Waiting { .. }), "{outcome:?}");
+    let waits = fx
+        .fleet
+        .read(|conn| tod_store::waits::WaitRepo::new(conn).list_pending_for_node(fx.node))
+        .unwrap();
+    assert_eq!(waits.len(), 1, "{waits:?}");
+    assert!(waits[0].match_spec.starts_with("github:pr:"), "{waits:?}");
+    assert!(waits[0].match_spec.ends_with(":review:maria,acme/core"), "{waits:?}");
+    assert_eq!(crate::next_actor::WaitKind::from_spec(&waits[0].match_spec), crate::next_actor::WaitKind::HumanReview);
+}
+
+#[test]
 fn a_pull_request_that_never_changes_stops_for_a_person() {
     let fx = setup();
     retire_outside_criteria(&fx);
@@ -856,6 +993,7 @@ fn a_pull_request_that_never_changes_stops_for_a_person() {
                     reviewers: Vec::new(),
                     base_ref: None,
                     body: None,
+                    ..Default::default()
                 },
                 threads: vec![ReviewThread {
                     id: "PRRT_1".into(),
@@ -1012,16 +1150,77 @@ fn an_approved_node_waits_for_the_merge_then_for_the_release() {
     assert!(pending_specs(&fx).is_empty(), "{:?}", pending_specs(&fx));
 }
 
+fn read_wait(fx: &Fixture) -> Option<tod_store::waits::Wait> {
+    fx.fleet
+        .read(|conn| tod_store::waits::WaitRepo::new(conn).list_pending_for_node(fx.node))
+        .unwrap()
+        .into_iter()
+        .find(|w| w.match_spec == "github:pr:read")
+}
+
 #[test]
-fn an_unreadable_pull_request_is_left_to_the_gate() {
+fn an_unreadable_pull_request_fails_the_run_visibly() {
     let fx = bare();
     retire_outside_criteria(&fx);
-    // `NoGithub` reads nothing: there is nothing to wait on.
+    // An error asking again cannot fix: the run ends failed, naming it, and
+    // the failure is on the node (not in a log), where it shows.
+    crate::pr_readiness::set_feed_override(Some(FailingGithub::new(
+        "GitHub rejected the token (HTTP 401): it is expired, revoked, or mistyped",
+    )));
     linked_to_pr(&fx, "approved");
     let mut agent = FakeAgent::new(&fx.fleet);
     let outcome = autopilot(&fx, Budget::default()).run(&fx.fleet, &mut agent).unwrap();
-    assert!(!matches!(outcome, Outcome::Waiting { .. }), "{outcome:?}");
-    assert!(pending_specs(&fx).is_empty());
+    let Outcome::Stopped { reason } = &outcome else { panic!("{outcome:?}") };
+    assert!(reason.starts_with(crate::autopilot::local::FAILED_PREFIX), "{reason}");
+    assert!(reason.contains("rejected the token"), "{reason}");
+
+    let wait = read_wait(&fx).expect("the failure is recorded on the node");
+    assert!(wait.exhausted(), "{wait:?}");
+    assert_eq!(wait.attempt, wait.max_attempts.unwrap());
+    assert!(wait.last_error.as_deref().unwrap().contains("rejected the token"));
+}
+
+#[test]
+fn a_pull_request_github_could_not_serve_is_retried_then_fails_visibly() {
+    let fx = bare();
+    retire_outside_criteria(&fx);
+    crate::pr_readiness::set_feed_override(Some(FailingGithub::new("GitHub is unavailable (HTTP 503)")));
+    linked_to_pr(&fx, "approved");
+    let mut agent = FakeAgent::new(&fx.fleet);
+
+    let max = tod_store::waits::DEFAULT_MAX_ATTEMPTS;
+    for attempt in 1..max {
+        let outcome = autopilot(&fx, Budget::default()).run(&fx.fleet, &mut agent).unwrap();
+        let Outcome::Waiting { what, due_at_ms } = &outcome else { panic!("attempt {attempt}: {outcome:?}") };
+        assert!(what.contains(&format!("{attempt} of {max}")), "{what}");
+        assert!(what.contains("503"), "{what}");
+        assert!(*due_at_ms > chrono::Utc::now().timestamp_millis());
+        let wait = read_wait(&fx).unwrap();
+        assert_eq!((wait.attempt, wait.exhausted()), (attempt, false));
+    }
+    // The last attempt: retries spent, the user is told.
+    let outcome = autopilot(&fx, Budget::default()).run(&fx.fleet, &mut agent).unwrap();
+    let Outcome::Stopped { reason } = &outcome else { panic!("{outcome:?}") };
+    assert!(reason.starts_with(crate::autopilot::local::FAILED_PREFIX) && reason.contains("503"), "{reason}");
+    assert!(read_wait(&fx).unwrap().exhausted());
+}
+
+#[test]
+fn a_look_that_reads_github_again_ends_the_recorded_failure() {
+    let fx = bare();
+    retire_outside_criteria(&fx);
+    let github = FailingGithub::new("GitHub is unavailable (HTTP 503)");
+    crate::pr_readiness::set_feed_override(Some(github.clone()));
+    linked_to_pr(&fx, "approved");
+    let mut agent = FakeAgent::new(&fx.fleet);
+    let outcome = autopilot(&fx, Budget::default()).run(&fx.fleet, &mut agent).unwrap();
+    assert!(matches!(outcome, Outcome::Waiting { .. }), "{outcome:?}");
+    assert!(read_wait(&fx).is_some());
+
+    crate::pr_readiness::set_feed_override(Some(Arc::new(FinishedGithub)));
+    let outcome = autopilot(&fx, Budget::default()).run(&fx.fleet, &mut agent).unwrap();
+    assert_eq!(outcome, Outcome::Done, "{outcome:?}");
+    assert!(read_wait(&fx).is_none(), "{:?}", pending_specs(&fx));
 }
 
 #[test]

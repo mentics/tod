@@ -4,6 +4,7 @@
 pub mod details;
 pub mod findings;
 pub mod obligations;
+pub mod on_others;
 pub mod plan;
 pub mod settings;
 pub mod task;

@@ -205,6 +205,41 @@ pub enum FleetMutation {
         node: uuid::Uuid,
         at: i64,
     },
+    // --- Activity leases (immediate; `crate::activity`) ---
+    /// Something started processing a node.
+    ActivityStart {
+        id: uuid::Uuid,
+        node: uuid::Uuid,
+        kind: String,
+        owner: String,
+        at: i64,
+    },
+    /// The processing is still alive.
+    ActivityBeat {
+        id: uuid::Uuid,
+        at: i64,
+    },
+    /// The processing ended.
+    ActivityEnd {
+        id: uuid::Uuid,
+    },
+    /// The user has seen that processing was lost and moved on.
+    ActivityClearLost {
+        node: uuid::Uuid,
+        at: i64,
+    },
+    // --- Deferrals (immediate; `crate::deferrals`) ---
+    /// The user took the node off their list, until `until` (ms) or until
+    /// they bring it back.
+    DeferNode {
+        node: uuid::Uuid,
+        until: Option<i64>,
+        at: i64,
+    },
+    /// The node is back on the user's list.
+    UndeferNode {
+        node: uuid::Uuid,
+    },
     // --- Outline (tree / lists) ---
     Outline(OutlineMutation),
     // --- Interview sessions (immediate) ---
@@ -261,6 +296,12 @@ impl FleetMutation {
                 | FleetMutation::CloudNodeUpsert { .. }
                 | FleetMutation::CloudNodeRemove { .. }
                 | FleetMutation::CloudNodeMarkLost { .. }
+                | FleetMutation::ActivityStart { .. }
+                | FleetMutation::ActivityBeat { .. }
+                | FleetMutation::ActivityEnd { .. }
+                | FleetMutation::ActivityClearLost { .. }
+                | FleetMutation::DeferNode { .. }
+                | FleetMutation::UndeferNode { .. }
         )
     }
 
@@ -485,6 +526,26 @@ impl FleetMutation {
             }
             FleetMutation::CloudNodeMarkLost { node, at } => {
                 crate::cloud_nodes::mark_lost(conn, *node, *at)?;
+            }
+            FleetMutation::ActivityStart { id, node, kind, owner, at } => {
+                crate::activity::ActivityRepo::new(conn).start(*id, *node, kind, owner, *at)?;
+            }
+            FleetMutation::ActivityBeat { id, at } => {
+                // A lease cleared under its owner is the owner's to notice
+                // (`ActivityGuard`), not an error of the writer.
+                crate::activity::ActivityRepo::new(conn).beat(*id, *at)?;
+            }
+            FleetMutation::ActivityEnd { id } => {
+                crate::activity::ActivityRepo::new(conn).end(*id)?;
+            }
+            FleetMutation::ActivityClearLost { node, at } => {
+                crate::activity::ActivityRepo::new(conn).clear_lost(*node, *at)?;
+            }
+            FleetMutation::DeferNode { node, until, at } => {
+                crate::deferrals::DeferralRepo::new(conn).set(*node, *until, *at)?;
+            }
+            FleetMutation::UndeferNode { node } => {
+                crate::deferrals::DeferralRepo::new(conn).clear(*node)?;
             }
             FleetMutation::Outline(_) => {}
         }

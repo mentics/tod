@@ -7657,6 +7657,7 @@ dependencies = [
  "tod-agent",
  "tod-agentd-client",
  "tod-core",
+ "tod-journey",
  "tod-problems",
  "tod-store",
  "tokio",

@@ -9,8 +9,17 @@
 //!
 //! One daemon runs at most one run per node, which is the lease: a second
 //! start for a node that is running is a no-op.
+//!
+//! **Reconciling.** Each tick also compares what the daemon was asked for
+//! (the node's [`Desired`] state) with the evidence in the store
+//! (`tod_core::next_actor`, the activity leases): a node that should be
+//! running but is not, with nothing else explaining it, is started; when it
+//! cannot be, the failure is recorded as the run's outcome so the node shows
+//! `You::Failed` with the reason. A lease on a node that should not be
+//! running is reported and the run asked to stop. See [`decide`].
 
-use anyhow::{Result, anyhow};
+use crate::actor_journey::{self, ActorTracker};
+use anyhow::{Context, Result, anyhow};
 use std::collections::HashMap;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -18,10 +27,13 @@ use std::time::Duration;
 use tod_agent::SharedAgent;
 use tod_agentd_client::Event;
 use tod_core::attention;
-use tod_core::autopilot::local::{LocalEvent, LocalRun, Live, Request, RunnerState};
+use tod_core::autopilot::local::{FAILED_PREFIX, Live, LocalEvent, LocalRun, Request, RunnerState};
 use tod_core::autopilot::{AutopilotState, Budget, Outcome};
 use tod_core::conversation::ConversationConfig;
-use tod_store::fleet::FleetStore;
+use tod_core::next_actor::{self, NextActor, NodeStanding, YouReason};
+use tod_store::activity::{ActivityRepo, Lease};
+use tod_store::deferrals::DeferralRepo;
+use tod_store::fleet::{FleetMutation, FleetStore};
 use uuid::Uuid;
 
 /// How often a run that ended to wait is checked for being due, and a run
@@ -33,8 +45,25 @@ const TICK: Duration = Duration::from_secs(5);
 const DRAIN_PATIENCE: Duration = Duration::from_secs(20);
 const DRAIN_CANCELLED: Duration = Duration::from_secs(8);
 
+/// What the daemon was last asked to make true of a node's run. In memory: a
+/// restarted daemon starts from the saved outcomes (`resume_saved`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum Desired {
+    /// Nobody has asked for anything yet (a node only read from its saved
+    /// state).
+    #[default]
+    Unset,
+    Run,
+    Pause,
+    Stop,
+}
+
 #[derive(Default)]
 struct Slot {
+    desired: Desired,
+    /// A start is in progress (it can take a while), so the reconciler must
+    /// not start the node a second time.
+    starting: bool,
     run: Option<LocalRun>,
     live: Live,
     /// When the run in progress started (ms since the epoch).
@@ -51,6 +80,8 @@ struct Inner {
     agent: SharedAgent,
     slots: Mutex<HashMap<Uuid, Slot>>,
     subscribers: Mutex<Vec<mpsc::Sender<Event>>>,
+    /// Each node's last actor, for the journey.
+    actors: Mutex<ActorTracker>,
 }
 
 #[derive(Clone)]
@@ -84,6 +115,74 @@ fn load_saved(data_root: &std::path::Path) -> Vec<(Uuid, AutopilotState)> {
         .collect()
 }
 
+/// What the reconciler knows of a node's slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SlotView {
+    desired: Desired,
+    starting: bool,
+    /// A run thread is alive.
+    active_run: bool,
+    /// The slot has no outcome: the run did not end in a way anyone knows.
+    outcome_none: bool,
+}
+
+/// What the reconciler does about a node.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Action {
+    /// Start the run. With `lost`, the node's lifecycle lease went stale
+    /// first (the text says which): clear it, and say it was restarted.
+    Start { lost: Option<String> },
+    /// This daemon's own run is still going though it should stop: ask again.
+    StopOwn,
+    /// Someone else's lease is live on a node that should not be running:
+    /// say so. Only its owner can stop it.
+    StopForeign { owner: String, kind: String },
+}
+
+/// The one rule: desired state against evidence.
+///
+/// - Desired `run`, no run alive, no outcome (the run did not end), and
+///   nothing else explaining it: the node's actor is `You::NotStarted` (no
+///   live lease, no open request, no pending wait, no saved outcome), or
+///   `You::Failed` for a lifecycle lease that stopped beating. Start it.
+///   Every other actor has a reason (processing, a request, a wait, an
+///   outcome) and is left to it.
+/// - Desired `pause` or `stop` and a live lifecycle lease: report it.
+fn decide(view: &SlotView, standing: Option<&NodeStanding>, leases: &[Lease], now: i64) -> Option<Action> {
+    match view.desired {
+        Desired::Unset => None,
+        Desired::Run => {
+            if view.starting || view.active_run || !view.outcome_none {
+                return None;
+            }
+            match &standing?.actor {
+                NextActor::You { why: YouReason::NotStarted, .. } => Some(Action::Start { lost: None }),
+                NextActor::You { why: YouReason::Failed { .. }, .. } => {
+                    let stale = leases.iter().find(|l| l.is_lifecycle() && !l.is_live(now))?;
+                    Some(Action::Start {
+                        lost: Some(format!(
+                            "{} held by {} stopped beating {}ms ago",
+                            stale.kind,
+                            stale.owner,
+                            now - stale.heartbeat_at
+                        )),
+                    })
+                }
+                _ => None,
+            }
+        }
+        Desired::Pause | Desired::Stop => {
+            if view.active_run {
+                return Some(Action::StopOwn);
+            }
+            leases
+                .iter()
+                .find(|l| l.is_lifecycle() && l.is_live(now))
+                .map(|l| Action::StopForeign { owner: l.owner.clone(), kind: l.kind.clone() })
+        }
+    }
+}
+
 impl Runners {
     pub fn new(store: Arc<FleetStore>, agent: SharedAgent) -> Self {
         Self {
@@ -92,6 +191,7 @@ impl Runners {
                 agent,
                 slots: Mutex::new(HashMap::new()),
                 subscribers: Mutex::new(Vec::new()),
+                actors: Mutex::new(ActorTracker::default()),
             }),
         }
     }
@@ -107,8 +207,9 @@ impl Runners {
             match state.outcome {
                 None => {
                     tracing::info!(%node, "resuming the run the daemon was stopped on");
+                    // A failure is recorded on the node by `start`.
                     if let Err(err) = self.start(node, false) {
-                        tracing::warn!(%node, "could not resume: {err:#}");
+                        tracing::error!(%node, "could not resume: {err:#}");
                     }
                 }
                 Some(outcome) => {
@@ -127,8 +228,16 @@ impl Runners {
     }
 
     /// Start a run that is due: one that ended to wait and whose time has
-    /// come, or one that stopped for a request that has been answered.
+    /// come, or one that stopped for a request that has been answered. Then
+    /// reconcile what is desired with what is happening.
     fn tick(&self) {
+        self.start_due();
+        if let Err(err) = self.reconcile() {
+            tracing::error!("reconciling the runs failed: {err:#}");
+        }
+    }
+
+    fn start_due(&self) {
         let (due, request_nodes) = {
             let slots = self.inner.slots.lock().expect("runner slots");
             let now = now_ms();
@@ -148,16 +257,21 @@ impl Runners {
         };
         for node in due {
             tracing::info!(%node, "the wait is due; checking again");
-            let _ = self.start(node, false);
+            // A failure is recorded on the node by `start`.
+            if let Err(err) = self.start(node, false) {
+                tracing::error!(%node, "could not check the wait again: {err:#}");
+            }
         }
         if request_nodes.is_empty() {
             return;
         }
-        let waiting = self
-            .inner
-            .store
-            .read(|conn| attention::for_nodes(conn, &request_nodes))
-            .unwrap_or_default();
+        let waiting = match self.inner.store.read(|conn| attention::for_nodes(conn, &request_nodes)) {
+            Ok(waiting) => waiting,
+            Err(err) => {
+                tracing::error!("could not read what the nodes wait on: {err:#}");
+                return;
+            }
+        };
         let mut resume = Vec::new();
         {
             let mut slots = self.inner.slots.lock().expect("runner slots");
@@ -173,23 +287,204 @@ impl Runners {
         }
         for node in resume {
             tracing::info!(%node, "the run's request was answered; continuing");
-            let _ = self.start(node, false);
+            if let Err(err) = self.start(node, false) {
+                tracing::error!(%node, "could not continue after the answer: {err:#}");
+            }
         }
     }
 
-    /// Start `node`'s run, or continue its last one. A node that is running
-    /// is left alone.
-    pub fn start(&self, node: Uuid, renew_budget: bool) -> Result<()> {
-        let root = self.inner.store.paths().root().to_path_buf();
-        {
-            let slots = self.inner.slots.lock().expect("runner slots");
-            if slots.get(&node).is_some_and(|s| s.run.is_some()) {
-                return Ok(());
+    /// The reconciler: clear spent deferrals, start what should be running
+    /// and is not, report what runs and should not, and record who is next
+    /// for the journey. Every failure is collected and returned together.
+    fn reconcile(&self) -> Result<()> {
+        let store = &self.inner.store;
+        let root = store.paths().root().to_path_buf();
+        let now = now_ms();
+        store.reload_if_stale().context("reload the store")?;
+        let standings = next_actor::compute(store, &root).context("work out who is next")?;
+        let mut errors: Vec<String> = Vec::new();
+
+        let rows = store.read(|conn| DeferralRepo::new(conn).list_all()).context("read the deferrals")?;
+        for node in next_actor::spent_deferrals(&rows, &standings, now) {
+            if let Err(err) = tod_core::defer::undefer(store, node) {
+                errors.push(format!("clear the spent deferral of {node}: {err:#}"));
             }
         }
+
+        let nodes: Vec<Uuid> = self.inner.slots.lock().expect("runner slots").keys().copied().collect();
+        let mut leases: HashMap<Uuid, Vec<Lease>> = HashMap::new();
+        for lease in store
+            .read(|conn| ActivityRepo::new(conn).list_for_nodes(&nodes))
+            .context("read the activity leases")?
+        {
+            leases.entry(lease.node_id).or_default().push(lease);
+        }
+        let plan: Vec<(Uuid, Action)> = {
+            let slots = self.inner.slots.lock().expect("runner slots");
+            slots
+                .iter()
+                .filter_map(|(node, slot)| {
+                    let view = Self::view(slot);
+                    let mine = leases.get(node).map(Vec::as_slice).unwrap_or(&[]);
+                    decide(&view, standings.get(node), mine, now).map(|a| (*node, a))
+                })
+                .collect()
+        };
+        for (node, action) in plan {
+            if let Err(err) = self.act(node, action) {
+                errors.push(format!("{node}: {err:#}"));
+            }
+        }
+
+        let changes = self.inner.actors.lock().expect("actor tracker").observe(&standings);
+        actor_journey::record(&changes);
+
+        if errors.is_empty() { Ok(()) } else { Err(anyhow!("{}", errors.join("; "))) }
+    }
+
+    fn view(slot: &Slot) -> SlotView {
+        SlotView {
+            desired: slot.desired,
+            starting: slot.starting,
+            active_run: slot.run.as_ref().is_some_and(|r| !r.is_finished()),
+            outcome_none: slot.outcome.is_none(),
+        }
+    }
+
+    fn act(&self, node: Uuid, action: Action) -> Result<()> {
+        match action {
+            Action::Start { lost } => {
+                if let Some(lost) = &lost {
+                    tracing::warn!(%node, "restarting a run whose processing was lost: {lost}");
+                    let cleared = self
+                        .inner
+                        .store
+                        .enqueue(FleetMutation::ActivityClearLost { node, at: now_ms() })
+                        .map_err(|e| anyhow!("{e}"));
+                    if let Err(err) = cleared {
+                        // The stale lease would keep the node failed: say so.
+                        let err = err.context("clear the lost lease");
+                        self.record_start_failure(node, &err);
+                        return Err(err);
+                    }
+                }
+                // A run whose thread died: take it out of the slot.
+                let dead = {
+                    let mut slots = self.inner.slots.lock().expect("runner slots");
+                    slots.get_mut(&node).and_then(|slot| slot.run.take_if(|r| r.is_finished()))
+                };
+                if let Some(dead) = dead {
+                    dead.join();
+                }
+                tracing::warn!(%node, "desired to run but nothing is running it; starting it");
+                let started = self.start(node, false);
+                // The restart is recorded where the journey records who is next.
+                actor_journey::record(&[actor_journey::Change {
+                    node,
+                    from: lost.as_ref().map_or("you:not_started", |_| "you:failed").to_string(),
+                    to: if started.is_ok() { "working:runner" } else { "you:failed" }.to_string(),
+                    detail: match (&lost, &started) {
+                        (_, Err(err)) => format!("the daemon could not restart it: {err:#}"),
+                        (Some(lost), Ok(())) => format!("restarted by the daemon after processing was lost: {lost}"),
+                        (None, Ok(())) => "started by the daemon: it was desired to run and nothing was".to_string(),
+                    },
+                }]);
+                started
+            }
+            Action::StopOwn => {
+                let slots = self.inner.slots.lock().expect("runner slots");
+                let Some(slot) = slots.get(&node) else { return Ok(()) };
+                tracing::warn!(
+                    %node,
+                    owner = %next_actor::this_process(),
+                    desired = ?slot.desired,
+                    "a run is still going on a node that should not run; asking it to stop"
+                );
+                if let Some(run) = &slot.run {
+                    match slot.desired {
+                        Desired::Stop => run.stop_now(),
+                        _ => run.pause(),
+                    }
+                }
+                Ok(())
+            }
+            Action::StopForeign { owner, kind } => {
+                tracing::warn!(
+                    %node, %owner, %kind,
+                    "a lease is live on a node that should not run, and it is not this daemon's run"
+                );
+                Ok(())
+            }
+        }
+    }
+
+    /// Record that `node`'s run could not be started, as its outcome: in the
+    /// slot, and in its saved state, so the node shows `You::Failed` with the
+    /// reason and a restarted daemon does not start it again at once. The
+    /// same way `LocalRun` saves a run that failed.
+    fn record_start_failure(&self, node: Uuid, error: &anyhow::Error) {
+        let reason = format!("{FAILED_PREFIX}{error:#}");
+        let outcome = Outcome::Stopped { reason: reason.clone() };
+        let root = self.inner.store.paths().root().to_path_buf();
+        let saved = AutopilotState::load(&root, node).and_then(|mut state| {
+            state.outcome = Some(outcome.clone());
+            state.save(&root, node)
+        });
+        if let Err(err) = saved {
+            // The slot still says it; only a restart would lose it.
+            tracing::error!(%node, "could not save the failure of the run's start ({reason}): {err:#}");
+        }
+        {
+            let mut slots = self.inner.slots.lock().expect("runner slots");
+            let slot = slots.entry(node).or_default();
+            slot.starting = false;
+            slot.run = None;
+            slot.live = Live::default();
+            slot.outcome = Some(outcome);
+        }
+        self.inner.publish(node);
+    }
+
+    /// Start `node`'s run, or continue its last one. A node that is running
+    /// is left alone. When it cannot be started the failure is recorded as
+    /// the run's outcome (the node shows it) and returned.
+    pub fn start(&self, node: Uuid, renew_budget: bool) -> Result<()> {
+        {
+            let mut slots = self.inner.slots.lock().expect("runner slots");
+            let slot = slots.entry(node).or_default();
+            slot.desired = Desired::Run;
+            if slot.run.is_some() || slot.starting {
+                return Ok(());
+            }
+            slot.starting = true;
+        }
+        match self.spawn(node, renew_budget) {
+            Ok(run) => {
+                {
+                    let mut slots = self.inner.slots.lock().expect("runner slots");
+                    let slot = slots.entry(node).or_default();
+                    slot.starting = false;
+                    slot.run = Some(run);
+                    slot.live = Live::default();
+                    slot.since = now_ms();
+                    slot.outcome = None;
+                    slot.seen_waiting = false;
+                }
+                self.inner.publish(node);
+                Ok(())
+            }
+            Err(err) => {
+                self.record_start_failure(node, &err);
+                Err(err)
+            }
+        }
+    }
+
+    fn spawn(&self, node: Uuid, renew_budget: bool) -> Result<LocalRun> {
+        let root = self.inner.store.paths().root().to_path_buf();
         let config = config(&root).map_err(|e| anyhow!("{e}"))?;
         let inner = self.inner.clone();
-        let run = LocalRun::start(
+        LocalRun::start(
             self.inner.store.clone(),
             self.inner.agent.clone(),
             config,
@@ -198,24 +493,18 @@ impl Runners {
             renew_budget,
             move |event| Inner::on_event(&inner, node, event),
         )
-        .map_err(|e| anyhow!("Starting the runner failed: {e:#}"))?;
-        {
-            let mut slots = self.inner.slots.lock().expect("runner slots");
-            let slot = slots.entry(node).or_default();
-            slot.run = Some(run);
-            slot.live = Live::default();
-            slot.since = now_ms();
-            slot.outcome = None;
-            slot.seen_waiting = false;
-        }
-        self.inner.publish(node);
-        Ok(())
+        .map_err(|e| anyhow!("Starting the runner failed: {e:#}"))
     }
 
     /// Stop once the agent's turn ends.
     pub fn pause(&self, node: Uuid) {
-        if let Some(run) = self.inner.slots.lock().expect("runner slots").get(&node).and_then(|s| s.run.as_ref()) {
-            run.pause();
+        {
+            let mut slots = self.inner.slots.lock().expect("runner slots");
+            let slot = slots.entry(node).or_default();
+            slot.desired = Desired::Pause;
+            if let Some(run) = &slot.run {
+                run.pause();
+            }
         }
         self.inner.publish(node);
     }
@@ -229,8 +518,13 @@ impl Runners {
 
     /// Cancel the turn in flight and stop.
     pub fn stop_now(&self, node: Uuid) {
-        if let Some(run) = self.inner.slots.lock().expect("runner slots").get(&node).and_then(|s| s.run.as_ref()) {
-            run.stop_now();
+        {
+            let mut slots = self.inner.slots.lock().expect("runner slots");
+            let slot = slots.entry(node).or_default();
+            slot.desired = Desired::Stop;
+            if let Some(run) = &slot.run {
+                run.stop_now();
+            }
         }
         self.inner.publish(node);
     }
@@ -358,4 +652,252 @@ fn config(data_root: &std::path::Path) -> Result<ConversationConfig, String> {
         settings_path: Some(paths.settings_path()),
         context: settings.interview_context.clone(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tod_core::next_actor::{ExternalWait, WaitKind};
+
+    const NOW: i64 = 1_000_000;
+
+    fn view(desired: Desired) -> SlotView {
+        SlotView { desired, starting: false, active_run: false, outcome_none: true }
+    }
+
+    fn standing(actor: NextActor) -> NodeStanding {
+        NodeStanding { node_id: Uuid::new_v4(), actor, deferred: None }
+    }
+
+    fn you(why: YouReason) -> NodeStanding {
+        standing(NextActor::You { why, since: 1 })
+    }
+
+    fn lease(owner: &str, heartbeat_at: i64) -> Lease {
+        Lease {
+            id: Uuid::new_v4(),
+            node_id: Uuid::new_v4(),
+            kind: tod_store::activity::KIND_RUN.to_string(),
+            owner: owner.to_string(),
+            started_at: 0,
+            heartbeat_at,
+        }
+    }
+
+    #[test]
+    fn a_desired_run_with_nothing_explaining_it_is_started() {
+        assert_eq!(
+            decide(&view(Desired::Run), Some(&you(YouReason::NotStarted)), &[], NOW),
+            Some(Action::Start { lost: None })
+        );
+    }
+
+    #[test]
+    fn a_desired_run_with_a_reason_is_left_alone() {
+        let v = view(Desired::Run);
+        let waiting = standing(NextActor::Others {
+            wait: ExternalWait {
+                kind: WaitKind::HumanReview,
+                who: None,
+                detail: None,
+                since: 1,
+                next_check_ms: None,
+                overdue: false,
+                retry: None,
+            },
+        });
+        assert_eq!(decide(&v, Some(&waiting), &[], NOW), None, "a pending wait");
+        assert_eq!(decide(&v, Some(&you(YouReason::Request { count: 1 })), &[], NOW), None, "an open request");
+        assert_eq!(
+            decide(&v, Some(&standing(NextActor::Working { what: next_actor::Work::Runner, since: 1 })), &[], NOW),
+            None,
+            "live processing"
+        );
+        assert_eq!(decide(&v, Some(&you(YouReason::Failed { error: "x".into() })), &[], NOW), None, "a recorded failure");
+        assert_eq!(decide(&v, None, &[], NOW), None, "no Lifecycle");
+        assert_eq!(decide(&SlotView { starting: true, ..v }, Some(&you(YouReason::NotStarted)), &[], NOW), None);
+        assert_eq!(decide(&SlotView { active_run: true, ..v }, Some(&you(YouReason::NotStarted)), &[], NOW), None);
+        assert_eq!(decide(&SlotView { outcome_none: false, ..v }, Some(&you(YouReason::NotStarted)), &[], NOW), None);
+        assert_eq!(decide(&view(Desired::Unset), Some(&you(YouReason::NotStarted)), &[], NOW), None);
+    }
+
+    #[test]
+    fn a_lost_lease_on_a_desired_run_restarts_it_and_says_why() {
+        let stale = lease("tod-agentd:7", NOW - tod_store::activity::STALE_AFTER_MS - 1);
+        let got = decide(
+            &view(Desired::Run),
+            Some(&you(YouReason::Failed { error: "processing was lost".into() })),
+            &[stale],
+            NOW,
+        );
+        let Some(Action::Start { lost: Some(lost) }) = got else { panic!("expected a restart, got {got:?}") };
+        assert!(lost.contains("tod-agentd:7") && lost.contains("run"), "{lost}");
+    }
+
+    #[test]
+    fn a_live_lease_on_a_node_that_should_stop_is_reported() {
+        let live = lease("tod:9", NOW - 1);
+        let standing = standing(NextActor::Working { what: next_actor::Work::Runner, since: 1 });
+        for desired in [Desired::Pause, Desired::Stop] {
+            assert_eq!(
+                decide(&view(desired), Some(&standing), std::slice::from_ref(&live), NOW),
+                Some(Action::StopForeign { owner: "tod:9".into(), kind: "run".into() })
+            );
+            // Our own run still going is asked again.
+            assert_eq!(
+                decide(&SlotView { active_run: true, ..view(desired) }, Some(&standing), std::slice::from_ref(&live), NOW),
+                Some(Action::StopOwn)
+            );
+            // A stale lease is not processing, and nothing is reported.
+            let stale = lease("tod:9", NOW - tod_store::activity::STALE_AFTER_MS - 1);
+            assert_eq!(decide(&view(desired), Some(&standing), &[stale], NOW), None);
+            assert_eq!(decide(&view(desired), Some(&standing), &[], NOW), None);
+        }
+    }
+
+    // ---- against a real store ----
+
+    use tod_agent::MockAgentProvider;
+    use tod_store::outline::OutlineMutation;
+
+    struct Fixture {
+        runners: Runners,
+        node: Uuid,
+        root: std::path::PathBuf,
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    /// A store with one node that has Lifecycle. The media bundle is made
+    /// unfindable, so starting a run fails.
+    fn fixture() -> Fixture {
+        // One process per test under nextest; the variable is this test's.
+        unsafe { std::env::set_var("TOD_MEDIA_ROOT", "/nonexistent/tod-media") };
+        let root = std::env::temp_dir().join(format!("tod-agentd-runners-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let fleet = Arc::new(FleetStore::open(&root).unwrap());
+        fleet.enqueue_outline(OutlineMutation::CreateList { slug: "t".into(), title: "T".into() }).unwrap();
+        fleet.writer().flush().unwrap();
+        let list_id = fleet.list_outline_lists().unwrap()[0].id;
+        fleet
+            .enqueue_outline(OutlineMutation::CreateNode {
+                node_id: None,
+                list_id,
+                parent_id: None,
+                anchor_id: None,
+                position: tod_store::outline::CreatePosition::Below,
+                title: "N".into(),
+            })
+            .unwrap();
+        fleet.writer().flush().unwrap();
+        fleet.reload_if_stale().unwrap();
+        let node = fleet.flatten_outline(list_id).unwrap()[0].node.id;
+        fleet
+            .enqueue_outline(OutlineMutation::EnableCapabilities {
+                node_id: node,
+                capabilities: vec![tod_store::outline::Capability::Lifecycle],
+            })
+            .unwrap();
+        fleet.writer().flush().unwrap();
+        let agent: SharedAgent = Arc::new(Mutex::new(Box::new(MockAgentProvider::new())));
+        Fixture { runners: Runners::new(fleet, agent), node, root }
+    }
+
+    fn standing_of(fx: &Fixture) -> NodeStanding {
+        fx.runners.inner.store.reload_if_stale().unwrap();
+        next_actor::compute(&fx.runners.inner.store, &fx.root).unwrap().remove(&fx.node).expect("Lifecycle")
+    }
+
+    #[test]
+    fn a_start_that_fails_shows_the_node_failed_with_the_reason_and_keeps_it_saved() {
+        let fx = fixture();
+        let err = fx.runners.start(fx.node, false).unwrap_err();
+        assert!(format!("{err:#}").contains("Media bundle"), "{err:#}");
+        let NextActor::You { why: YouReason::Failed { error }, .. } = standing_of(&fx).actor else {
+            panic!("the node should be failed");
+        };
+        assert!(error.contains("Media bundle"), "{error}");
+        // Saved: a new daemon reads it, and does not start the node again.
+        let saved = AutopilotState::load(&fx.root, fx.node).unwrap();
+        assert!(matches!(saved.outcome, Some(Outcome::Stopped { ref reason }) if reason.starts_with(FAILED_PREFIX)));
+        // The slot is not "running" and not "starting".
+        let state = fx.runners.snapshot().into_iter().find(|s| s.node == fx.node).unwrap();
+        assert!(!state.running);
+    }
+
+    #[test]
+    fn the_reconciler_starts_a_desired_run_and_a_failed_start_is_reported_by_it() {
+        let fx = fixture();
+        {
+            let mut slots = fx.runners.inner.slots.lock().unwrap();
+            slots.entry(fx.node).or_default().desired = Desired::Run;
+        }
+        assert!(matches!(standing_of(&fx).actor, NextActor::You { why: YouReason::NotStarted, .. }));
+        let err = fx.runners.reconcile().unwrap_err();
+        assert!(format!("{err:#}").contains("Media bundle"), "{err:#}");
+        assert!(matches!(standing_of(&fx).actor, NextActor::You { why: YouReason::Failed { .. }, .. }));
+        // Now it has an outcome: the next tick leaves it be.
+        fx.runners.reconcile().unwrap();
+    }
+
+    #[test]
+    fn a_lost_lease_is_cleared_when_the_run_is_restarted() {
+        let fx = fixture();
+        let store = &fx.runners.inner.store;
+        let stale_at = now_ms() - tod_store::activity::STALE_AFTER_MS - 10_000;
+        store
+            .enqueue(FleetMutation::ActivityStart {
+                id: Uuid::new_v4(),
+                node: fx.node,
+                kind: tod_store::activity::KIND_RUN.into(),
+                owner: "dead:1".into(),
+                at: stale_at,
+            })
+            .unwrap();
+        store.writer().flush().unwrap();
+        {
+            let mut slots = fx.runners.inner.slots.lock().unwrap();
+            slots.entry(fx.node).or_default().desired = Desired::Run;
+        }
+        assert!(
+            matches!(standing_of(&fx).actor, NextActor::You { why: YouReason::Failed { ref error }, .. } if error.contains("dead:1"))
+        );
+        // The restart fails here (no media), but the stale lease is cleared first.
+        let _ = fx.runners.reconcile();
+        store.writer().flush().unwrap();
+        store.reload_if_stale().unwrap();
+        let left = store.read(|c| ActivityRepo::new(c).list_for_nodes(&[fx.node])).unwrap();
+        assert!(left.is_empty(), "{left:?}");
+    }
+
+    #[test]
+    fn spent_deferrals_are_cleared_by_the_tick() {
+        let fx = fixture();
+        let store = &fx.runners.inner.store;
+        store
+            .enqueue(FleetMutation::DeferNode { node: fx.node, until: Some(now_ms() - 1), at: now_ms() - 10_000 })
+            .unwrap();
+        store.writer().flush().unwrap();
+        fx.runners.reconcile().unwrap();
+        store.writer().flush().unwrap();
+        store.reload_if_stale().unwrap();
+        let rows = store.read(|c| DeferralRepo::new(c).list_all()).unwrap();
+        assert!(rows.is_empty(), "{rows:?}");
+    }
+
+    #[test]
+    fn pause_and_stop_are_the_desired_state() {
+        let fx = fixture();
+        let desired = |fx: &Fixture| fx.runners.inner.slots.lock().unwrap().get(&fx.node).map(|s| s.desired);
+        fx.runners.pause(fx.node);
+        assert_eq!(desired(&fx), Some(Desired::Pause));
+        fx.runners.stop_now(fx.node);
+        assert_eq!(desired(&fx), Some(Desired::Stop));
+        let _ = fx.runners.start(fx.node, false);
+        assert_eq!(desired(&fx), Some(Desired::Run));
+    }
 }

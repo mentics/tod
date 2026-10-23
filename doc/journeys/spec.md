@@ -177,6 +177,7 @@ enum Event {
     SessionRotated { conversation, reason },
     DataChanged { rows: Vec<RowRef> },
     Milestone { state },
+    NextActorChanged { from, to, detail },        // who has to act for the node changed (`tod_core::next_actor`); recorded by the daemon's tick
     Report { note, app_journey: Vec<Record>, screenshot: Option<Blob> },
     Submission { bundle: Uuid, status },           // queued | sent | acknowledged | abandoned
     // app journey only

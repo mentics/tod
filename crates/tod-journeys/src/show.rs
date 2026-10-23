@@ -127,6 +127,14 @@ fn describe_event(event: &Event) -> String {
         Event::SessionRotated { reason, .. } => format!("session rotated: {reason}"),
         Event::DataChanged { rows } => format!("data changed ({} rows)", rows.len()),
         Event::Milestone { state } => format!("milestone: {state}"),
+        Event::NextActorChanged { from, to, detail } => {
+            let from = if from.is_empty() { "(new)" } else { from.as_str() };
+            if detail.is_empty() {
+                format!("next actor {from} -> {to}")
+            } else {
+                format!("next actor {from} -> {to}: {detail}")
+            }
+        }
         Event::Report { note, .. } => format!("report: {note}"),
         Event::Submission { bundle, status } => format!("submission {bundle}: {status}"),
         Event::Nav { what } => format!("nav: {what:?}"),

@@ -32,6 +32,10 @@ pub enum GithubError {
     NotFound,
     #[error("GitHub API error: {0}")]
     Api(String),
+    /// HTTP 429 or 5xx: GitHub is rate limiting or down. Asking again later is
+    /// expected to work.
+    #[error("GitHub is unavailable ({0})")]
+    Unavailable(String),
     /// Proxy authentication was chosen ([`GITHUB_AUTH_ENV`]) but no proxy is
     /// configured, so a request would go out with no credential at all.
     #[error(
@@ -42,13 +46,30 @@ pub enum GithubError {
     ProxyMissing,
 }
 
+impl GithubError {
+    /// Whether asking again shortly is expected to work: GitHub could not be
+    /// reached or said to come back later. Anything else (a rejected token,
+    /// a missing pull request, a refused request) will fail the same way
+    /// until the user fixes it.
+    pub fn is_transient(&self) -> bool {
+        matches!(self, Self::Http(_) | Self::Unavailable(_))
+    }
+}
+
+/// [`GithubError::is_transient`] for an error that has been turned into text
+/// (`tod_core::pr_readiness::PrFeed` reports `String`s), possibly with a
+/// prefix. Pinned to the variants' own messages by a test.
+pub fn is_transient_message(message: &str) -> bool {
+    message.contains("HTTP request failed:") || message.contains("GitHub is unavailable (")
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PullRequest {
     pub number: i64,
     pub url: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct PrStatus {
     /// Raw GitHub `mergeable` flag: `false` only ever means a merge
     /// conflict. It says nothing about required reviews or required checks
@@ -816,6 +837,9 @@ fn api_error(status: u16, response: &mut ureq::http::Response<ureq::Body>) -> Gi
     if status == 404 {
         return GithubError::NotFound;
     }
+    if status == 429 || status >= 500 {
+        return GithubError::Unavailable(format!("HTTP {status}"));
+    }
     let message = response
         .body_mut()
         .read_json::<ErrorRaw>()
@@ -1291,6 +1315,29 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn transient_errors_are_those_that_say_to_ask_again() {
+        let transient = [
+            GithubError::Http("connection refused".into()),
+            GithubError::Unavailable("HTTP 503".into()),
+        ];
+        let broken = [
+            GithubError::MissingToken,
+            GithubError::Unauthorized,
+            GithubError::NotFound,
+            GithubError::Api("Validation Failed".into()),
+        ];
+        for err in &transient {
+            assert!(err.is_transient(), "{err}");
+            assert!(is_transient_message(&err.to_string()), "{err}");
+            assert!(is_transient_message(&format!("o/r#1: {err}")), "{err} with a prefix");
+        }
+        for err in &broken {
+            assert!(!err.is_transient(), "{err}");
+            assert!(!is_transient_message(&err.to_string()), "{err}");
+        }
+    }
 
     fn repo(owner: &str, name: &str) -> Option<GithubRepo> {
         Some(GithubRepo {

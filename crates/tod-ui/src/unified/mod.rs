@@ -41,7 +41,6 @@ use gpui::{
 use gpui_component::button::Button;
 use gpui_component::{ActiveTheme, IconName, Selectable, Sizable};
 use tod_core::attention::NodeAttention;
-use tod_core::task::model::RunSource;
 use tod_core::workbench_layout::{self, WorkbenchLayout};
 use tod_store::conversation::Focus;
 use tod_store::fleet::FleetStore;
@@ -70,6 +69,7 @@ enum HostedPanel {
     Settings(Entity<panels::settings::SettingsPanel>),
     Transcript(Entity<panels::transcript::TranscriptPanel>),
     Changes(Entity<panels::changes::ChangesPanel>),
+    OnOthers(Entity<panels::on_others::OnOthersPanel>),
 }
 
 impl HostedPanel {
@@ -83,6 +83,7 @@ impl HostedPanel {
             Self::Settings(e) => e.read(cx).title(cx),
             Self::Transcript(e) => e.read(cx).title(cx),
             Self::Changes(e) => e.read(cx).title(cx),
+            Self::OnOthers(e) => e.read(cx).title(cx),
         }
     }
 
@@ -96,6 +97,7 @@ impl HostedPanel {
             Self::Settings(e) => e.read(cx).focus_handle(cx),
             Self::Transcript(e) => e.read(cx).focus_handle(cx),
             Self::Changes(e) => e.read(cx).focus_handle(cx),
+            Self::OnOthers(e) => e.read(cx).focus_handle(cx),
         }
     }
 
@@ -109,6 +111,7 @@ impl HostedPanel {
             Self::Settings(e) => e.entity_id(),
             Self::Transcript(e) => e.entity_id(),
             Self::Changes(e) => e.entity_id(),
+            Self::OnOthers(e) => e.entity_id(),
         }
     }
 
@@ -122,6 +125,7 @@ impl HostedPanel {
             Self::Settings(e) => e.clone().into_any_element(),
             Self::Transcript(e) => e.clone().into_any_element(),
             Self::Changes(e) => e.clone().into_any_element(),
+            Self::OnOthers(e) => e.clone().into_any_element(),
         }
     }
 }
@@ -239,6 +243,12 @@ pub struct UnifiedView {
     /// via `TaskListView::set_attention`; Alt+Q walks the same data
     /// (`doc/ui/unified-view-plan.md` W12).
     attention: HashMap<Uuid, NodeAttention>,
+    /// Who is next for each node with Lifecycle (`tod_core::next_actor`),
+    /// from the same pass; every view that says "who" reads this.
+    standings: HashMap<Uuid, tod_core::next_actor::NodeStanding>,
+    /// Nodes a chat turn holds a live `chat` activity lease on (the chat
+    /// decorator's spinner, wherever the turn runs).
+    chat_leases: std::collections::HashSet<Uuid>,
     /// The node [`Self::default_panel`] last judged, and whether it was a
     /// task node then. A store change that turns the selected node into a
     /// task node (or back) swaps its default panel in place
@@ -248,19 +258,19 @@ pub struct UnifiedView {
     /// `SelectionChanged`, delivered later, must not open the node's default
     /// panel over the columns that were restored with it.
     restoring_selection: Option<Uuid>,
-    /// Who was working on each node when the tree was last told: the
-    /// lifecycle processor, and only the chat panel. A node leaving both
-    /// has stopped, and lands in [`Self::finished`].
+    /// Who was working on each node when this was last worked out: the
+    /// lifecycle processor, and only the chat panel. A chat leaving both
+    /// has stopped, and lands in [`Self::finished`]. Only the chat half is
+    /// told to the tree; who is next for the node is `NodeStanding`.
     last_lifecycle_running: std::collections::HashSet<Uuid>,
     /// Nodes whose supervisor is working in the cloud now
     /// (`tod_core::cloud_sync::working_in_cloud`), shown as running.
     cloud_working: std::collections::HashSet<Uuid>,
     last_chat_running: std::collections::HashSet<Uuid>,
-    /// Nodes whose run stopped since the user last selected them, oldest
-    /// first, and which kind stopped. The tree marks them (orange, ringed
-    /// icon) and Alt+Q visits them after the nodes waiting on the user;
-    /// selecting one (by click or by Alt+Q) clears it.
-    finished: Vec<(Uuid, RunSource)>,
+    /// Nodes whose chat stopped since the user last selected them, oldest
+    /// first. The tree marks them with a dot; selecting one (by click or by
+    /// Alt+Q) clears it.
+    finished: Vec<Uuid>,
     _task_list_subscription: Subscription,
     _agent_runs_subscription: Subscription,
     _runners_subscription: Subscription,
@@ -306,7 +316,7 @@ impl UnifiedView {
             cx.new(|cx| runners::NodeRunners::new(fleet, agent, agent_runs, cx))
         };
         let _runners_subscription = cx.observe(&runners, |this, _, cx| this.apply_status_overrides(cx));
-        let _attention_poll = Self::spawn_attention_poll(fleet.clone(), window, cx);
+        let _attention_poll = Self::spawn_attention_poll(fleet.clone(), paths.data_root().to_path_buf(), window, cx);
         let mut this = Self {
             fleet,
             paths,
@@ -324,6 +334,8 @@ impl UnifiedView {
             last_chat_focus: Focus::Project,
             focus_handle: cx.focus_handle(),
             attention: HashMap::new(),
+            standings: HashMap::new(),
+            chat_leases: std::collections::HashSet::new(),
             last_default: Cell::new(None),
             restoring_selection: None,
             last_lifecycle_running: std::collections::HashSet::new(),
@@ -355,6 +367,7 @@ impl UnifiedView {
     /// its default panel follows a capability change.
     fn spawn_attention_poll(
         fleet: Arc<FleetStore>,
+        data_root: std::path::PathBuf,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::Task<()> {
@@ -365,6 +378,7 @@ impl UnifiedView {
                     break;
                 };
                 let fleet_for_read = fleet.clone();
+                let data_root = data_root.clone();
                 let (computed, cloud, is_task) = cx
                     .background_executor()
                     .spawn(async move {
@@ -375,11 +389,11 @@ impl UnifiedView {
                             (id, is_task)
                         });
                         let cloud = tod_core::cloud_sync::working_in_cloud(&fleet_for_read);
-                        (attention_feed::compute(&fleet_for_read), cloud, is_task)
+                        (attention_feed::compute(&fleet_for_read, &data_root), cloud, is_task)
                     })
                     .await;
                 let Ok(()) = this.update_in(cx, |this, window, cx| {
-                    this.apply_attention(computed, cx);
+                    this.apply_feed(computed, cx);
                     this.apply_cloud_working(cloud, cx);
                     if let Some((node_id, is_task)) = is_task {
                         this.follow_default_panel(node_id, is_task, window, cx);
@@ -440,18 +454,54 @@ impl UnifiedView {
         cx.notify();
     }
 
-    /// Store the freshly computed attention map and hand its
-    /// `TaskListView::set_attention` shape to the tree.
-    fn apply_attention(
-        &mut self,
-        map: HashMap<Uuid, NodeAttention>,
-        cx: &mut Context<Self>,
-    ) {
-        let for_tree = attention_feed::to_task_list_map(&map);
-        self.attention = map;
+    /// Store the freshly computed feed and hand the tree its pieces: who is
+    /// next (`set_standings`), what each node asks (`set_attention`), and
+    /// which nodes a chat turn is working on (the chat decorator).
+    fn apply_feed(&mut self, feed: attention_feed::Feed, cx: &mut Context<Self>) {
+        // A failed read is said, and the last good answer stays on screen.
+        if let Some(error) = feed.errors.first() {
+            tracing::error!("{}", feed.errors.join("; "));
+            self.task_list.update(cx, |task_list, cx| {
+                task_list.set_status_message(format!("Who is next may be out of date: {error}"), cx);
+            });
+            if feed.standings.is_empty() && feed.attention.is_empty() {
+                return;
+            }
+        }
+        let for_tree = attention_feed::to_task_list_map(&feed.attention);
+        let standings = attention_feed::to_standing_map(&feed.standings);
+        self.attention = feed.attention;
+        self.standings = feed.standings;
         self.task_list.update(cx, |task_list, cx| {
             task_list.set_attention(for_tree, cx);
+            task_list.set_standings(standings, cx);
         });
+        if feed.chat_working != self.chat_leases {
+            self.chat_leases = feed.chat_working;
+            self.apply_running_nodes(cx);
+        }
+        // The "· waiting" status labels follow who is next.
+        self.apply_status_overrides(cx);
+        self.push_standings_to_panels(cx);
+    }
+
+    /// Hand the panels that say who is next the standings: the task panel
+    /// its node's, the On others list all of them.
+    fn push_standings_to_panels(&mut self, cx: &mut Context<Self>) {
+        for hosted in &self.hosted {
+            match &hosted.panel {
+                HostedPanel::Task(panel) => {
+                    let node = panel.read(cx).node_id_now();
+                    let standing = self.standings.get(&node).cloned();
+                    panel.update(cx, |panel, cx| panel.set_standing(standing, cx));
+                }
+                HostedPanel::OnOthers(panel) => {
+                    let standings = self.standings.clone();
+                    panel.update(cx, |panel, cx| panel.set_standings(standings, cx));
+                }
+                _ => {}
+            }
+        }
     }
 
     /// Nodes working in the cloud count as running in the tree. A read that
@@ -484,7 +534,8 @@ impl UnifiedView {
         let mut lifecycle = self.agent_runs.read(cx).running_lifecycle_nodes();
         lifecycle.extend(self.runners.read(cx).running_nodes());
         lifecycle.extend(self.cloud_working.iter().copied());
-        let chat = self.agent_runs.read(cx).running_chat_nodes();
+        let mut chat = self.agent_runs.read(cx).running_chat_nodes();
+        chat.extend(self.chat_leases.iter().copied());
         let selected = self.task_list.read(cx).selected_node_id();
         let was_active: Vec<Uuid> = self
             .last_lifecycle_running
@@ -496,17 +547,17 @@ impl UnifiedView {
             if lifecycle.contains(&node) || chat.contains(&node) || selected == Some(node) {
                 continue;
             }
-            let source = if self.last_lifecycle_running.contains(&node) {
-                RunSource::Lifecycle
-            } else {
-                RunSource::Chat
-            };
-            self.finished.retain(|(id, _)| *id != node);
-            self.finished.push((node, source));
+            // Who is next now says what the lifecycle half used to ("finished
+            // since you last looked"); only a chat that stopped is marked.
+            if self.last_lifecycle_running.contains(&node) {
+                continue;
+            }
+            self.finished.retain(|id| *id != node);
+            self.finished.push(node);
         }
         // A node working again is no longer "finished".
         self.finished
-            .retain(|(id, _)| !lifecycle.contains(id) && !chat.contains(id));
+            .retain(|id| !lifecycle.contains(id) && !chat.contains(id));
         self.last_lifecycle_running = lifecycle;
         self.last_chat_running = chat;
         self.feed_running_nodes(cx);
@@ -516,21 +567,16 @@ impl UnifiedView {
         let ids = |set: &std::collections::HashSet<Uuid>| -> std::collections::HashSet<String> {
             set.iter().map(|n| n.to_string()).collect()
         };
-        let lifecycle = ids(&self.last_lifecycle_running);
         let chat = ids(&self.last_chat_running);
-        let finished = self
-            .finished
-            .iter()
-            .map(|(id, source)| (id.to_string(), *source))
-            .collect();
+        let finished = ids(&self.finished.iter().copied().collect());
         self.task_list
-            .update(cx, |task_list, cx| task_list.set_running_nodes(lifecycle, chat, finished, cx));
+            .update(cx, |task_list, cx| task_list.set_running_nodes(chat, finished, cx));
     }
 
     /// The user has seen `node`: drop its "finished" marker.
     fn clear_finished(&mut self, node: Uuid, cx: &mut Context<Self>) {
         let before = self.finished.len();
-        self.finished.retain(|(id, _)| *id != node);
+        self.finished.retain(|id| *id != node);
         if self.finished.len() != before {
             self.feed_running_nodes(cx);
         }
@@ -550,20 +596,25 @@ impl UnifiedView {
                 .flatten()
                 .map(|task| task.lifecycle)
         });
-        let awaiting = self.runners.read(cx).awaiting_nodes();
-        let ids: std::collections::HashSet<String> = awaiting.iter().map(|n| n.to_string()).collect();
-        self.task_list.update(cx, |task_list, cx| task_list.set_awaiting(ids, cx));
         let mut map: std::collections::HashMap<String, String> =
             map.into_iter().map(|(id, label)| (id.to_string(), label)).collect();
-        // A node whose run ended to wait (for a review, say) is out of the
-        // way: nobody owes it anything, time has to pass.
-        for node in awaiting {
-            let id = node.to_string();
+        // A node waiting on others (a review, say) is out of the way: nobody
+        // owes it anything, time has to pass. Who is next says so.
+        for standing in self.standings.values().filter(|s| {
+            matches!(s.actor, tod_core::next_actor::NextActor::Others { .. })
+        }) {
+            let id = standing.node_id.to_string();
             if map.contains_key(&id) {
                 continue;
             }
-            if let Some(task) = self.fleet.get_node(&id).ok().flatten() {
-                map.insert(id, format!("{} · waiting", task.lifecycle));
+            match self.fleet.get_node(&id) {
+                Ok(Some(task)) => {
+                    map.insert(id, format!("{} · waiting", task.lifecycle));
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    tracing::error!("could not read node {id} for its status label: {err:#}")
+                }
             }
         }
         self.task_list.update(cx, |task_list, cx| {
@@ -578,6 +629,9 @@ impl UnifiedView {
         cx: &mut Context<Self>,
     ) {
         match event {
+            TaskListEvent::OpenOnOthers => {
+                self.open_panel(PanelKind::OnOthers, 0, false, window, cx);
+            }
             TaskListEvent::SelectionChanged { task_id } => {
                 let node_id = task_id.as_deref().and_then(|id| Uuid::parse_str(id).ok());
                 let restored = self.restoring_selection.take();
@@ -685,6 +739,8 @@ impl UnifiedView {
             PanelKind::Task(node_id) => {
                 let panel =
                     cx.new(|cx| panels::task::TaskPanel::new(node_id, self.fleet.clone(), self.agent_runs.clone(), self.lifecycle.clone(), self.runners.clone(), window, cx));
+                let standing = self.standings.get(&node_id).cloned();
+                panel.update(cx, |panel, cx| panel.set_standing(standing, cx));
                 let panel_id = panel.entity_id();
                 let subscription =
                     cx.subscribe_in(&panel, window, move |this, _, event: &PanelOpenRequest, window, cx| {
@@ -760,6 +816,20 @@ impl UnifiedView {
                     });
                 HostedColumn {
                     panel: HostedPanel::Findings(panel),
+                    _subscriptions: vec![subscription],
+                }
+            }
+            PanelKind::OnOthers => {
+                let panel = cx.new(|cx| {
+                    panels::on_others::OnOthersPanel::new(self.fleet.clone(), self.standings.clone(), cx)
+                });
+                let panel_id = panel.entity_id();
+                let subscription =
+                    cx.subscribe_in(&panel, window, move |this, _, event: &PanelOpenRequest, window, cx| {
+                        this.route_open_request(panel_id, event, window, cx);
+                    });
+                HostedColumn {
+                    panel: HostedPanel::OnOthers(panel),
                     _subscriptions: vec![subscription],
                 }
             }
@@ -1016,12 +1086,12 @@ impl UnifiedView {
     fn next_waiting_node(&self, forward: bool, cx: &Context<Self>) -> Option<Uuid> {
         // Nodes waiting on the user come first; then those whose run stopped
         // unseen, oldest first.
-        let mut order = attention_feed::waiting_order(&self.attention);
+        let mut order = attention_feed::waiting_order(&self.standings, &self.attention);
         let unseen: Vec<Uuid> = self
             .finished
             .iter()
-            .map(|(id, _)| *id)
-            .filter(|id| !order.contains(id))
+            .copied()
+            .filter(|id| !order.contains(id) && !self.standings.contains_key(id))
             .collect();
         order.extend(unseen);
         if order.is_empty() {
@@ -1933,8 +2003,8 @@ mod tests {
     /// end to end by the mock smoke test.
     fn load_attention(view: &Entity<UnifiedView>, cx: &mut VisualTestContext) {
         view.update(cx, |view, cx| {
-            let map = attention_feed::compute(&view.fleet);
-            view.apply_attention(map, cx);
+            let feed = attention_feed::compute(&view.fleet, view.paths.data_root());
+            view.apply_feed(feed, cx);
         });
     }
 
@@ -1948,7 +2018,7 @@ mod tests {
         let second = add_waiting_node(&fixture, "On the second node?", first);
         let (view, cx) = open_view(&fixture, cx);
         load_attention(&view, cx);
-        let order = view.read_with(cx, |view, _| attention_feed::waiting_order(&view.attention));
+        let order = view.read_with(cx, |view, _| attention_feed::waiting_order(&view.standings, &view.attention));
         // `add_waiting_node` asked its decision after `first`'s, so `first`
         // waits longer and sorts first — same rule as `SortKey::WaitingLongest`.
         assert_eq!(order, vec![first, second]);

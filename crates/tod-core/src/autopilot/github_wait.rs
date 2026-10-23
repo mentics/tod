@@ -33,6 +33,17 @@ pub fn merge_wait_spec(number: i64) -> String {
     format!("github:pr:{number}:merged")
 }
 
+/// The wait that `bot` has reviewed pull request `number`
+/// (`tod_core::next_actor` reads the bot's name back from it).
+pub fn bot_review_spec(number: Option<i64>, bot: &str) -> String {
+    format!("github:pr:{}:bot-review:{bot}", number.unwrap_or(0))
+}
+
+/// The wait that pull request `number`'s checks have finished.
+pub fn checks_spec(number: Option<i64>) -> String {
+    format!("github:pr:{}:checks", number.unwrap_or(0))
+}
+
 /// What looking at a node's linked pull requests found.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GithubCheck {
@@ -54,6 +65,103 @@ pub enum GithubCheck {
 /// what [`Autopilot`] does at the end of a run, and what the task panel's
 /// "Check now" does with no run at all.
 pub fn check_github(
+    fleet: &FleetStore,
+    node: uuid::Uuid,
+    data_root: &std::path::Path,
+    lifecycle: &str,
+) -> Result<GithubCheck> {
+    let found = look_at_github(fleet, node, data_root, lifecycle)?;
+    // A look that read GitHub ends any failure recorded for an earlier one.
+    if !matches!(found, GithubCheck::Unreadable(_)) {
+        clear_read_failures(fleet, node)?;
+    }
+    Ok(found)
+}
+
+/// The wait that carries the failures of looking at GitHub, so they are
+/// recorded, counted, and shown (`tod_core::next_actor`) instead of logged:
+/// one per kind of look, replaced by the look that succeeds.
+pub fn read_wait_spec(releasing: bool) -> &'static str {
+    if releasing { "github:release:read" } else { "github:pr:read" }
+}
+
+/// How long to wait before looking again after the `attempt`th failure in a
+/// row: 30 s, doubling, up to 10 minutes.
+pub fn retry_delay_ms(attempt: u32) -> i64 {
+    (30_000i64 << attempt.min(6)).min(10 * 60 * 1000)
+}
+
+/// A look at GitHub failed with `error`. Records it on the node's
+/// `github:*:read` wait (made if there is none), so it counts and shows,
+/// and says how the run ends:
+/// - an error asking again may fix (GitHub down, a timeout) → the run ends
+///   waiting to look again, naming the error and the attempt;
+/// - anything else, or the last attempt → the run ends failed with the
+///   error, which puts the node on the user's list.
+///
+/// This is the one place a failed look is handled. A failed look is never
+/// dropped and never left to the gate.
+pub fn github_look_failed(
+    fleet: &FleetStore,
+    node: uuid::Uuid,
+    releasing: bool,
+    error: &str,
+) -> Result<Outcome> {
+    let spec = read_wait_spec(releasing);
+    let now = chrono::Utc::now().timestamp_millis();
+    let existing = fleet
+        .read(|conn| WaitRepo::new(conn).list_pending_for_node(node))?
+        .into_iter()
+        .find(|w| w.match_spec == spec);
+    let (wait_id, attempt) = match existing {
+        Some(wait) => (wait.id, wait.attempt),
+        None => {
+            let made = fleet
+                .interview(
+                    ACTOR,
+                    InterviewCommand::RecordWait {
+                        node_id: node,
+                        wait: NewWait::event(spec, now + retry_delay_ms(0)).with_detail("a look at GitHub"),
+                    },
+                )
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let id = made["id"]
+                .as_str()
+                .and_then(|id| uuid::Uuid::parse_str(id).ok())
+                .ok_or_else(|| anyhow::anyhow!("the wait just recorded has no id"))?;
+            (id, 0)
+        }
+    };
+    let transient = tod_store::github::is_transient_message(error);
+    let retry_due_at = transient.then(|| now + retry_delay_ms(attempt));
+    let result = fleet
+        .interview(
+            ACTOR,
+            InterviewCommand::WaitFailed { wait_id, error: error.to_string(), retry_due_at },
+        )
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let exhausted = result["exhausted"].as_bool().unwrap_or(true);
+    match (exhausted, retry_due_at) {
+        (false, Some(due_at_ms)) => {
+            let attempt = result["attempt"].as_u64().unwrap_or(1);
+            let max = result["max_attempts"].as_u64().unwrap_or(0);
+            Ok(Outcome::Waiting {
+                what: format!("GitHub could not be read ({attempt} of {max}): {error}"),
+                due_at_ms,
+            })
+        }
+        _ => Ok(Outcome::Stopped {
+            reason: format!("{}GitHub could not be read: {error}", crate::autopilot::local::FAILED_PREFIX),
+        }),
+    }
+}
+
+/// The node's `github:*:read` waits end: GitHub has been read since.
+pub(super) fn clear_read_failures(fleet: &FleetStore, node: uuid::Uuid) -> Result<()> {
+    cancel_waits(fleet, node, |spec| spec.ends_with(":read") && spec.starts_with("github:"))
+}
+
+fn look_at_github(
     fleet: &FleetStore,
     node: uuid::Uuid,
     data_root: &std::path::Path,
@@ -200,11 +308,67 @@ impl Autopilot {
         Ok(match check_github(fleet, self.node, &self.config.data_root, lifecycle)? {
             GithubCheck::Waiting { what, due_at_ms } => Some(Outcome::Waiting { what, due_at_ms }),
             GithubCheck::Unreadable(why) => {
-                tracing::info!(node = %self.node, %why, "leaving it to the gate");
-                None
+                Some(github_look_failed(fleet, self.node, lifecycle == "merged", &why)?)
             }
             GithubCheck::NothingToWaitOn | GithubCheck::Clear => None,
         })
+    }
+
+    /// While the run polls GitHub in place (a bot's review, checks), the node
+    /// still waits on something outside, and says so: records that wait, due
+    /// at the next poll, replacing the last poll's. Without it the node
+    /// would read as having nothing in progress.
+    pub(super) fn record_poll_wait(
+        &self,
+        fleet: &FleetStore,
+        live: &[crate::pr_readiness::LivePr],
+        waits: &[crate::pr_readiness::Wait],
+        detail: &str,
+        due_at_ms: i64,
+    ) -> Result<()> {
+        use crate::pr_readiness::Wait;
+        let number_waiting = |matches: &dyn Fn(&Wait) -> bool| {
+            live.iter()
+                .find(|p| p.assessment.waits().iter().any(matches))
+                .map(|p| p.pr.pr_number)
+        };
+        let Some(first) = waits.first() else {
+            return Ok(());
+        };
+        let spec = match first {
+            Wait::BotReview { bot, .. } => {
+                let n = number_waiting(&|w| matches!(w, Wait::BotReview { bot: b, .. } if b == bot));
+                bot_review_spec(n, bot)
+            }
+            Wait::ChecksRunning => checks_spec(number_waiting(&|w| matches!(w, Wait::ChecksRunning))),
+            Wait::GitHub => format!("github:pr:{}:github", number_waiting(&|w| matches!(w, Wait::GitHub)).unwrap_or(0)),
+            // A person's review is recorded by `wait_for_review`.
+            Wait::HumanReview => return Ok(()),
+        };
+        let pending = fleet.read(|conn| WaitRepo::new(conn).list_pending_for_node(self.node))?;
+        if let Some(same) = pending.iter().find(|w| w.match_spec == spec) {
+            fleet
+                .interview(ACTOR, InterviewCommand::RescheduleWait { wait_id: same.id, due_at: due_at_ms })
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            return Ok(());
+        }
+        cancel_waits(fleet, self.node, |old| old.starts_with("github:pr:"))?;
+        fleet
+            .interview(
+                ACTOR,
+                InterviewCommand::RecordWait {
+                    node_id: self.node,
+                    wait: NewWait::event(spec, due_at_ms).with_detail(detail),
+                },
+            )
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        Ok(())
+    }
+
+    /// The run has something to do (or nothing left to wait for): the polled
+    /// waits recorded by [`Self::record_poll_wait`] no longer hold.
+    pub(super) fn clear_poll_waits(&self, fleet: &FleetStore) -> Result<()> {
+        cancel_waits(fleet, self.node, |spec| spec.starts_with("github:pr:") && !spec.ends_with(":read"))
     }
 
     /// Records an `event` wait on `spec`; see [`record_github_wait`].

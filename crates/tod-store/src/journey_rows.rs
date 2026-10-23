@@ -57,6 +57,7 @@ pub const ROW_KEYS: &[(&str, &[(&str, KeyKind)])] = &[
     ("request_feedback", &[("id", Blob)]),
     ("waits", &[("id", Blob)]),
     ("cloud_nodes", &[("node_id", Blob)]),
+    ("node_deferrals", &[("node_id", Blob)]),
     ("node_events", &[("id", Blob)]),
     ("decision_answers", &[("id", Int)]),
     ("phase_events", &[("id", Blob)]),
