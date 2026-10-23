@@ -210,7 +210,8 @@ Read it from that file on the orchestrator sandbox, then:
 - GitHub (repository or organization → Settings → Webhooks): payload URL
   `<preview-url>/webhooks/github`, content type `application/json`, that
   secret; events: pull requests, pull request reviews and review comments,
-  issue comments, check suites, check runs, workflow runs, pushes.
+  issue comments, check suites, check runs, workflow runs, pushes, and
+  releases (a `merged` node waits on `github:release:published`).
 - Linear (Settings → API → Webhooks): URL `<preview-url>/webhooks/linear`;
   Linear makes the signing secret, so put it in `linear` in `webhooks.json`
   (or the env var) and restart.
@@ -228,6 +229,7 @@ constant time, is refused with 401 before its body is parsed.
 | `issue_comment` | `github:pr:<n>:comment` or `github:issue:<n>:comment` |
 | `check_suite`, `check_run`, `workflow_run` (only `completed`) | `github:pr:<n>:checks:<conclusion>` per PR, `github:branch:<b>:checks:<conclusion>` |
 | `push` | `github:branch:<b>:push` |
+| `release` (`published`, not a draft) | `github:release:published` (routed by wait, and by the release notes: see Routing) |
 | other GitHub events | `github:<event>:<action>` (routed by wait only) |
 | Linear | `linear:<type>:<identifier>:<action>` and `linear:<type>:<id>:<action>` (e.g. `linear:issue:ENG-12:update`) |
 
@@ -248,6 +250,15 @@ event wait that matches. For each node:
 3. Their orchestrator wakes (id = wait id, in `wakes.json`) are dropped.
 4. Its sandbox is poked (a failed poke is retried by the wake timer), and
    the user's change notice is sent.
+
+**By wait, a node with linked pull requests hears only its own.** A PR number
+or a release names no repository, so when the delivery names one
+(`repository.full_name`) and the node has linked pull requests
+(`node_fields.linked_prs`), a pull request event must be about one of them (same
+repository and number), and a release must name one of them in its notes,
+read as the node's own check reads them (`tod_core::release_watch`, with the
+title and time of the merge event the node was sent, else by number or link).
+A node with no linked pull requests takes any event whose key matches.
 
 A wait scheduled with Blaxel (`BlaxelScheduler`) keeps its schedule (its
 process is named `wait-<id>`) here: the orchestrator has no Blaxel

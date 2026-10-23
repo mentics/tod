@@ -141,3 +141,81 @@ fn deliveries_are_verified_then_routed_by_branch_and_by_wait() {
     drop(fleet);
     let _ = std::fs::remove_dir_all(&base);
 }
+
+#[test]
+fn a_node_with_linked_pull_requests_hears_only_its_own_repository_and_releases() {
+    let base: PathBuf = std::env::temp_dir().join(format!("tod-orch-webhooks-links-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&base).unwrap();
+    let app = base.join("app");
+    let fleet = FleetStore::open(&app).unwrap();
+    fleet.enqueue_outline(OutlineMutation::CreateList { slug: "t".into(), title: "T".into() }).unwrap();
+    fleet.writer().flush().unwrap();
+    let list_id = fleet.list_outline_lists().unwrap()[0].id;
+    let a = node(&fleet, list_id, "Merged in acme/app");
+    let b = node(&fleet, list_id, "Merged in acme/other");
+    let (wait_a, wait_b) = {
+        let conn = rusqlite::Connection::open(app.join("tod.db")).unwrap();
+        tod_store::cloud_nodes::upsert(&conn, a, "node-a", "alice", 1).unwrap();
+        tod_store::cloud_nodes::upsert(&conn, b, "node-b", "alice", 1).unwrap();
+        for (node, link) in [(a, "https://github.com/acme/app/pull/12"), (b, "https://github.com/acme/other/pull/12")] {
+            conn.execute(
+                "INSERT INTO node_fields (node_id, linked_prs, updated_at) VALUES (?1, ?2, 1)",
+                rusqlite::params![uuid_to_blob(node), format!("[\"{link}\"]")],
+            )
+            .unwrap();
+        }
+        let far = i64::MAX / 2;
+        let wa = WaitRepo::new(&conn).create(a, &NewWait::event("github:release:published", far)).unwrap().id;
+        let wb = WaitRepo::new(&conn).create(b, &NewWait::event("github:release:published", far)).unwrap().id;
+        (wa, wb)
+    };
+    let _ = fleet.reload_if_stale();
+
+    let poked = Arc::new(Mutex::new(Vec::new()));
+    let orch = base.join("orchestrator");
+    let server = Server::with_sink(
+        Config { base: orch.clone(), tod_cli: "unused".into(), tod_cli_prefix: Vec::new() },
+        Box::new(FakePoker(poked.clone())),
+        Box::new(NoSink),
+    )
+    .unwrap();
+    let snap = base.join("snap.db");
+    tod_store::sync::snapshot(&app.join("tod.db"), &snap).unwrap();
+    let seeded = server.handle(&Request {
+        method: "POST".into(),
+        path: "/users/alice/seed".into(),
+        query: String::new(),
+        headers: Vec::new(),
+        body: std::fs::read(&snap).unwrap(),
+    });
+    assert_eq!(seeded.status, 200, "{}", String::from_utf8_lossy(&seeded.body));
+    let remote = orch.join("users").join("alice").join("tod.db");
+    let secret = Secrets::load(&orch).unwrap().github;
+
+    let release = |repo: &str, notes: &str| {
+        serde_json::json!({"action":"published","repository":{"full_name":repo},
+            "release":{"tag_name":"v1","body":notes,"draft":false,"published_at":"2099-01-01T00:00:00Z"}})
+    };
+    // A release of acme/app whose notes do not name PR 12: nobody hears it.
+    let resp = server.handle(&delivery(Some(&secret), "release", &release("acme/app", "Other things (#99)")));
+    assert_eq!(resp.status, 200, "{}", String::from_utf8_lossy(&resp.body));
+    assert!(poked.lock().unwrap().is_empty());
+    assert_eq!(wait_state(&remote, wait_a), "pending");
+
+    // One that does name it: only the node whose PR 12 is in acme/app.
+    let resp = server.handle(&delivery(Some(&secret), "release", &release("acme/app", "Fix it (#12)")));
+    assert_eq!(resp.status, 200, "{}", String::from_utf8_lossy(&resp.body));
+    assert_eq!(*poked.lock().unwrap(), ["node-a"]);
+    assert_eq!(wait_state(&remote, wait_a), "satisfied");
+    assert_eq!(wait_state(&remote, wait_b), "pending");
+
+    // A review of PR 12 in a repository neither node has linked.
+    poked.lock().unwrap().clear();
+    let review = serde_json::json!({"action":"submitted","repository":{"full_name":"acme/elsewhere"},
+        "review":{"state":"approved"},"pull_request":{"number":12,"head":{"ref":"x"}}});
+    assert_eq!(server.handle(&delivery(Some(&secret), "pull_request_review", &review)).status, 200);
+    assert!(poked.lock().unwrap().is_empty());
+
+    drop(fleet);
+    let _ = std::fs::remove_dir_all(&base);
+}

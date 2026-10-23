@@ -36,6 +36,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::Sha256;
 use std::path::Path;
+use tod_core::release_watch::release_carrying;
+use tod_store::github::{NodePr, PrMerge, Release};
 use uuid::Uuid;
 
 pub const FILE_NAME: &str = "webhooks.json";
@@ -138,6 +140,22 @@ pub struct Event {
     /// Match keys (route by wait).
     pub keys: Vec<String>,
     pub summary: String,
+    /// `owner/repo` (lower case) the delivery is about, when it says.
+    pub repo: Option<String>,
+    /// The pull requests it is about (numbers in `repo`).
+    pub pr_numbers: Vec<i64>,
+    /// A published release, for [`release_watch`](tod_core::release_watch).
+    pub release: Option<ReleaseInfo>,
+}
+
+/// What a `release` delivery says about the release.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReleaseInfo {
+    pub tag: String,
+    pub name: Option<String>,
+    pub notes: String,
+    pub url: String,
+    pub published_at: Option<String>,
 }
 
 fn s<'a>(v: &'a Value, path: &[&str]) -> Option<&'a str> {
@@ -152,9 +170,11 @@ fn n(v: &Value, path: &[&str]) -> Option<i64> {
 pub fn github_event(kind: &str, payload: &Value) -> Option<Event> {
     let mut e = Event { source: "github".into(), kind: kind.into(), ..Default::default() };
     let action = s(payload, &["action"]).unwrap_or("");
+    e.repo = s(payload, &["repository", "full_name"]).map(str::to_ascii_lowercase);
     let pr_keys = |e: &mut Event, number: Option<i64>, branch: Option<&str>, what: &str| {
         if let Some(n) = number {
             e.keys.push(format!("github:pr:{n}:{what}"));
+            e.pr_numbers.push(n);
         }
         if let Some(b) = branch.filter(|b| !b.is_empty()) {
             e.keys.push(format!("github:branch:{b}:{what}"));
@@ -174,6 +194,7 @@ pub fn github_event(kind: &str, payload: &Value) -> Option<Event> {
             // `github:pr:<n>:<action>` (not `pr:pr`), `github:branch:<b>:pr:<action>`.
             if let Some(num) = num {
                 e.keys.push(format!("github:pr:{num}:{}", what.trim_start_matches("pr:")));
+                e.pr_numbers.push(num);
             }
             pr_keys(&mut e, None, s(payload, &["pull_request", "head", "ref"]), &what);
             e.summary = format!("PR #{} {}", num.unwrap_or(0), what.trim_start_matches("pr:"));
@@ -194,6 +215,9 @@ pub fn github_event(kind: &str, payload: &Value) -> Option<Event> {
             let on_pr = payload["issue"].get("pull_request").is_some();
             if let Some(num) = num {
                 e.keys.push(format!("github:{}:{num}:comment", if on_pr { "pr" } else { "issue" }));
+                if on_pr {
+                    e.pr_numbers.push(num);
+                }
             }
             e.summary = format!("comment on #{}", num.unwrap_or(0));
         }
@@ -222,6 +246,23 @@ pub fn github_event(kind: &str, payload: &Value) -> Option<Event> {
             e.summary = format!("push to {}", branch.unwrap_or("?"));
         }
         "ping" => return None,
+        "release" => {
+            // A release is out when it is published (a draft is not).
+            let release = &payload["release"];
+            if action != "published" || release["draft"].as_bool() == Some(true) {
+                return None;
+            }
+            let tag = s(release, &["tag_name"]).unwrap_or("").to_string();
+            e.keys.push("github:release:published".into());
+            e.summary = format!("release {tag} published");
+            e.release = Some(ReleaseInfo {
+                tag,
+                name: s(release, &["name"]).map(str::to_string),
+                notes: s(release, &["body"]).unwrap_or("").to_string(),
+                url: s(release, &["html_url"]).unwrap_or("").to_string(),
+                published_at: s(release, &["published_at"]).map(str::to_string),
+            });
+        }
         other => {
             e.keys.push(format!("github:{other}:{action}"));
             e.summary = format!("{other} {action}");
@@ -308,8 +349,11 @@ fn targets(conn: &Connection, event: &Event) -> Result<Vec<Target>> {
         }
     }
     if nodes.is_empty() {
+        // By wait alone a PR number or a release names no repository, so a
+        // node that has linked pull requests hears only what concerns them.
+        let links = tod_store::github::NodePrRepo::new(conn).all()?;
         for (_, node) in &waits {
-            if !nodes.contains(node) {
+            if !nodes.contains(node) && concerns(conn, *node, links.get(node), event) {
                 nodes.push(*node);
             }
         }
@@ -322,6 +366,56 @@ fn targets(conn: &Connection, event: &Event) -> Result<Vec<Target>> {
             waits: waits.iter().filter(|(_, n)| *n == node).map(|(w, _)| *w).collect(),
         })
         .collect())
+}
+
+/// Whether `event`, which matched one of `node`'s waits by its key alone,
+/// is about the node's own pull requests. A node with none linked, or an
+/// event that names no repository, takes it as the key matched. Otherwise a
+/// pull request's event must be about one of them (same repository, same
+/// number) and a release must name one of them in its notes
+/// (`tod_core::release_watch`, as the node's own check reads them).
+fn concerns(conn: &Connection, node: Uuid, links: Option<&Vec<NodePr>>, event: &Event) -> bool {
+    let (Some(links), Some(repo)) = (links, event.repo.as_deref()) else { return true };
+    let in_repo = |pr: &&NodePr| format!("{}/{}", pr.owner, pr.repo).eq_ignore_ascii_case(repo);
+    if let Some(release) = &event.release {
+        let release = Release {
+            tag: release.tag.clone(),
+            name: release.name.clone(),
+            body: release.notes.clone(),
+            url: release.url.clone(),
+            published_at: release.published_at.clone(),
+        };
+        return links.iter().filter(in_repo).any(|pr| {
+            let merge = merge_seen(conn, node, pr);
+            release_carrying(pr, &merge, std::slice::from_ref(&release)).is_some()
+        });
+    }
+    let mut in_repo_links = links.iter().filter(in_repo).peekable();
+    if event.pr_numbers.is_empty() {
+        return in_repo_links.peek().is_some();
+    }
+    in_repo_links.any(|pr| event.pr_numbers.contains(&pr.pr_number))
+}
+
+/// What the node was told when `pr` merged, if it was: the title and time
+/// its release's notes are read against. Without it the notes can still
+/// name the pull request by its number or link.
+fn merge_seen(conn: &Connection, node: Uuid, pr: &NodePr) -> PrMerge {
+    let key = format!("github:pr:{}:merged", pr.pr_number);
+    let seen = tod_store::node_events::list_for_node(conn, node).unwrap_or_default();
+    let found = seen.iter().rev().filter(|e| e.kind == "pull_request" && e.keys.split(' ').any(|k| k == key)).find_map(|e| {
+        let payload: Value = serde_json::from_str(&e.payload).ok()?;
+        let repo = s(&payload, &["repository", "full_name"])?;
+        if !repo.eq_ignore_ascii_case(&format!("{}/{}", pr.owner, pr.repo)) {
+            return None;
+        }
+        Some(PrMerge {
+            title: s(&payload, &["pull_request", "title"]).unwrap_or("").to_string(),
+            merged: true,
+            merged_at: s(&payload, &["pull_request", "merged_at"]).map(str::to_string),
+        })
+    });
+    found.unwrap_or(PrMerge { title: String::new(), merged: true, merged_at: None })
 }
 
 /// Routes `event` (raw `payload`) across every user; returns what it did.
@@ -461,5 +555,26 @@ mod tests {
         assert!(r.keys.contains(&"github:pr:3:review:approved".to_string()));
         let p = github_event("pull_request", &json!({"action":"closed","pull_request":{"number":4,"merged":true,"head":{"ref":"b"}}})).unwrap();
         assert!(p.keys.contains(&"github:pr:4:merged".to_string()), "{:?}", p.keys);
+    }
+
+    #[test]
+    fn releases_and_repositories_are_read() {
+        let r = github_event(
+            "release",
+            &json!({"action":"published","repository":{"full_name":"Acme/App"},
+                "release":{"tag_name":"v1.2","body":"Fix it (#12)","draft":false,"published_at":"2026-01-02T00:00:00Z"}}),
+        )
+        .unwrap();
+        assert_eq!(r.keys, ["github:release:published"]);
+        assert_eq!(r.repo.as_deref(), Some("acme/app"));
+        assert_eq!(r.release.unwrap().notes, "Fix it (#12)");
+        assert!(github_event("release", &json!({"action":"published","release":{"draft":true}})).is_none());
+        assert!(github_event("release", &json!({"action":"created","release":{}})).is_none());
+        let p = github_event(
+            "pull_request",
+            &json!({"action":"closed","repository":{"full_name":"a/b"},"pull_request":{"number":4,"merged":true,"head":{"ref":"x"}}}),
+        )
+        .unwrap();
+        assert_eq!((p.repo.as_deref(), p.pr_numbers.as_slice()), (Some("a/b"), &[4][..]));
     }
 }
