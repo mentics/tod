@@ -28,3 +28,7 @@ Desktop.ini
 # Windows binaries and Git Bash crash dumps
 *.exe
 *.stackdump
+
+# git related
+
+.claude/worktrees

@@ -94,6 +94,11 @@ pub enum FleetMutation {
     DeleteFilesLocation {
         node_id: String,
     },
+    /// A node's sandbox proxy holds the user's credentials as of `at` (ms).
+    MarkFilesCredsSynced {
+        node_id: String,
+        at: i64,
+    },
     // --- Agent capability (immediate) ---
     /// Platform / model / effort for a node; `None` follows settings.
     UpsertNodeAgent {
@@ -267,6 +272,7 @@ impl FleetMutation {
                 | FleetMutation::DeleteFilesPlace { .. }
                 | FleetMutation::RecordFilesLocation { .. }
                 | FleetMutation::DeleteFilesLocation { .. }
+                | FleetMutation::MarkFilesCredsSynced { .. }
                 | FleetMutation::UpsertNodeAgent { .. }
                 | FleetMutation::UpdateAgentRunReconnect { .. }
                 | FleetMutation::ClearAgentRunReconnect { .. }
@@ -357,6 +363,9 @@ impl FleetMutation {
             }
             FleetMutation::DeleteFilesLocation { node_id } => {
                 crate::fleet::repos::files_location::FilesLocationRepo::new(conn).delete(node_id)?;
+            }
+            FleetMutation::MarkFilesCredsSynced { node_id, at } => {
+                crate::fleet::repos::files_location::FilesLocationRepo::new(conn).mark_creds_synced(node_id, *at)?;
             }
             FleetMutation::UpsertNodeAgent {
                 node_id,

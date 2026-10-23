@@ -415,6 +415,15 @@ pub fn decode_reply(bytes: &[u8]) -> Result<RelayReply> {
     Ok(RelayReply { code, stdout: body[..out_len].to_vec(), stderr: body[out_len..].to_vec() })
 }
 
+/// Whether the relay hands `key`, from an agent's environment, to the real
+/// `tod-cli` it runs here. Not where a command runs (the relay's own), and
+/// not [`crate::github::GITHUB_AUTH_ENV`]: it says a sandbox's proxy adds the
+/// GitHub token, which is no proxy of this machine's, so `tod-cli` here would
+/// send GitHub no credentials at all instead of using the token tod holds.
+fn keep_for_host_cli(key: &str) -> bool {
+    !key.starts_with("TOD_SECRETS_EXEC_") && key != crate::github::GITHUB_AUTH_ENV
+}
+
 fn serve(stream: TcpStream, data_root: &Path, cli: &Path, token: &str) -> Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(30)))?;
     let mut reader = BufReader::new(stream.try_clone()?);
@@ -436,7 +445,7 @@ fn serve(stream: TcpStream, data_root: &Path, cli: &Path, token: &str) -> Result
     let lookup = |key: &str| env_for_cli.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone());
     let (shim_cwd, shim_path) = (lookup(SHIM_CWD_ENV), lookup(SHIM_PATH_ENV));
     // The agent never picks where a command runs: these come from the relay.
-    env_for_cli.retain(|(key, _)| !key.starts_with("TOD_SECRETS_EXEC_"));
+    env_for_cli.retain(|(key, _)| keep_for_host_cli(key));
     if is_secrets_run(&request.args) {
         match &target {
             Some(container) => {
@@ -998,5 +1007,12 @@ mod tests {
             with_data_root(args(&["secrets", "run", "--", "x", "--data-root", "y"]), root),
             args(&["--data-root", "/data/root", "secrets", "run", "--", "x", "--data-root", "y"])
         );
+    }
+
+    #[test]
+    fn a_sandboxs_github_proxy_flag_does_not_reach_the_host_cli() {
+        assert!(!keep_for_host_cli(crate::github::GITHUB_AUTH_ENV));
+        assert!(!keep_for_host_cli("TOD_SECRETS_EXEC_CONTAINER"));
+        assert!(keep_for_host_cli("TOD_NODE"));
     }
 }

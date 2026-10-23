@@ -25,7 +25,7 @@ CREATE TABLE IF NOT EXISTS node_lifecycle_config (
 /// The phases an agent works in, and so the keys a config may name: the
 /// lifecycle states that have a phase agent, and the protocols that run
 /// in the others (`implement`, `verify`, `review`, `fix`, `pr`).
-pub const PHASES: [&str; 11] = [
+pub const PHASES: [&str; 12] = [
     "proposed",
     "design",
     "planning",
@@ -34,6 +34,7 @@ pub const PHASES: [&str; 11] = [
     "review",
     "fix",
     "pr",
+    "pr_review",
     "merged",
     "released",
     "learn",

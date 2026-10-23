@@ -15,7 +15,7 @@ use tod_store::conversation::ConversationRepo;
 use tod_store::decisions::{
     DECISION_REASONS, Decision, DecisionRepo, EVIDENCE_KINDS, EvidenceRef, NewDecision,
 };
-use tod_store::interview::{InterviewCommand, short_id};
+use tod_store::interview::{InterviewCommand, InterviewRepo, short_id};
 use uuid::Uuid;
 
 pub(crate) const USAGE: &str = "\
@@ -33,7 +33,7 @@ COMMANDS:
 `ask` records a pending decision: the question (as one positional argument —
 quote it), any --option (repeatable, in the order they should be offered;
 none asks for a free-text answer), any --evidence links the user should be able to open while
-answering, each `kind:id` with kind one of: obligation, plan_step, test_run,
+answering, each `kind:id` (an obligation or plan step may be given as its 8-character prefix) with kind one of: obligation, plan_step, test_run,
 conversation, finding, node, and --reason, one of:
 intent, missing_rule, conflict, access, risk, capability, broken, other (defaults to
 other when omitted).
@@ -117,7 +117,7 @@ pub(crate) fn report_broken(inv: &Invocation, what: &str) -> anyhow::Result<bool
     Ok(true)
 }
 
-fn parse_evidence(raw: &str) -> anyhow::Result<EvidenceRef> {
+fn parse_evidence(inv: &Invocation, raw: &str) -> anyhow::Result<EvidenceRef> {
     let (kind, id) = raw
         .split_once(':')
         .ok_or_else(|| anyhow::anyhow!("--evidence must be `kind:id` (got `{raw}`)"))?;
@@ -127,8 +127,14 @@ fn parse_evidence(raw: &str) -> anyhow::Result<EvidenceRef> {
             EVIDENCE_KINDS.join("|")
         );
     }
-    let id = Uuid::parse_str(id.trim())
-        .map_err(|_| anyhow::anyhow!("--evidence `{raw}`: `{id}` is not a UUID"))?;
+    // Listings show an obligation or plan step as an 8-character prefix, so
+    // those are accepted as such; any other kind needs the full UUID.
+    let id = match kind {
+        "obligation" => inv.client().read(|conn| InterviewRepo::new(conn).resolve_obligation_id(id))?,
+        "plan_step" => inv.client().read(|conn| InterviewRepo::new(conn).resolve_plan_step_id(id))?,
+        _ => Uuid::parse_str(id.trim())
+            .map_err(|_| anyhow::anyhow!("--evidence `{raw}`: `{id}` is not a UUID"))?,
+    };
     Ok(EvidenceRef {
         kind: kind.to_string(),
         id,
@@ -144,7 +150,7 @@ fn ask(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
     let evidence = args
         .get_all("--evidence")
         .iter()
-        .map(|raw| parse_evidence(raw))
+        .map(|raw| parse_evidence(inv, raw))
         .collect::<anyhow::Result<Vec<_>>>()?;
     let reason = match args.get("--reason") {
         Some(raw) => {

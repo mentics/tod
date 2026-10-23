@@ -1,10 +1,12 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 use uuid::Uuid;
 
 use tod_store::fleet::FleetStore;
+use tod_store::github::{NodePr, NodePrRepo};
 use tod_store::outline::types::Capability;
 
-use super::model::{ShellInfo, TaskItem};
+use super::model::{PrMark, ShellInfo, TaskItem};
 
 /// Load tree rows from the outline store for `list_id` (or empty when none).
 pub fn load_tasks_from_store(store: &FleetStore, list_id: Option<Uuid>) -> Vec<TaskItem> {
@@ -30,6 +32,7 @@ pub fn load_tasks_from_store(store: &FleetStore, list_id: Option<Uuid>) -> Vec<T
     // Every node's pending incoming-change count, in one query.
     let incoming = store.incoming_counts().unwrap_or_default();
     let mut shells_by_node = store.shells_for_list(list_id).unwrap_or_default();
+    let mut pull_requests = pull_requests_by_node(store);
     rows.into_iter()
         .map(|row| {
             let is_work = !row.capabilities.is_empty();
@@ -91,6 +94,7 @@ pub fn load_tasks_from_store(store: &FleetStore, list_id: Option<Uuid>) -> Vec<T
                 linked_copy: row.linked_copy,
                 has_copies: row.has_copies,
                 ticket_terminal: row.ticket_terminal,
+                pull_requests: pull_requests.remove(&row.node.id).unwrap_or_default(),
                 metadata: row.metadata,
                 generator_sort: row.generator_sort,
                 // Filled in by `TaskListView::set_attention`, not the store load.
@@ -151,6 +155,7 @@ pub fn large_fixture_set(base_count: usize) -> Vec<TaskItem> {
             linked_copy: false,
             has_copies: false,
             ticket_terminal: false,
+            pull_requests: Vec::new(),
             metadata: None,
             generator_sort: None,
             needs_you_count: 0,
@@ -161,6 +166,41 @@ pub fn large_fixture_set(base_count: usize) -> Vec<TaskItem> {
             groups_by_lifecycle: false,
             group_header: None,
         })
+        .collect()
+}
+
+/// Each node's linked pull requests whose state has been read (the tree
+/// refreshes unknown ones off the UI thread, see [`unread_pull_requests`]).
+fn pull_requests_by_node(store: &FleetStore) -> HashMap<Uuid, Vec<PrMark>> {
+    let links = store
+        .read(|conn| Ok(NodePrRepo::new(conn).all()?))
+        .unwrap_or_default();
+    links
+        .into_iter()
+        .filter_map(|(node_id, prs)| {
+            let marks: Vec<PrMark> = prs
+                .iter()
+                .filter_map(|pr| {
+                    Some(PrMark {
+                        label: format!("{}/{}#{}", pr.owner, pr.repo, pr.pr_number),
+                        state: tod_core::pull_requests::cached_pull_state(pr)?,
+                    })
+                })
+                .collect();
+            (!marks.is_empty()).then_some((node_id, marks))
+        })
+        .collect()
+}
+
+/// Every linked pull request whose state is unknown or may have changed.
+pub fn unread_pull_requests(store: &FleetStore) -> Vec<NodePr> {
+    let links = store
+        .read(|conn| Ok(NodePrRepo::new(conn).all()?))
+        .unwrap_or_default();
+    links
+        .into_values()
+        .flatten()
+        .filter(tod_core::pull_requests::pull_state_stale)
         .collect()
 }
 

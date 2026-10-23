@@ -1,13 +1,14 @@
 //! The `pr` protocol: an agent opening a node's pull request (if none exists
-//! yet), then watching CI, reviews, and comments — pushing fixes and
-//! replying, until GitHub says the PR is mergeable.
+//! yet) as a draft in the `pr` state; then, in `pr_review`, watching CI,
+//! reviews, and comments — pushing fixes and replying, until GitHub says the
+//! PR is mergeable.
 //!
 //! Nothing in the reply is parsed: the app reads the pull requests linked to
 //! the node (its Ticket capability's links, where `tod-cli pr open` adds the
 //! one it opens; `tod_store::github::NodePrRepo`) and
 //! knows the protocol's job is done when the agent records `mergeable` (or
 //! `merged`, if it happened out of band) through `tod-cli pr`. The forward
-//! gates (`pr → approved`, `approved → merged`) are app-checked directly
+//! gates (`pr → pr_review`, `pr_review → approved`, `approved → merged`) are app-checked directly
 //! against GitHub (`tod_core::gate::derived`), not decided by this protocol
 //! or its agent.
 //!
@@ -32,11 +33,16 @@ use tod_store::outline::EXTRA_CONTENT_DETAILS;
 use tod_store::outline::repos::NodeRepo;
 use uuid::Uuid;
 
-/// The lifecycle state whose role doc says how the PR is driven.
-const PR: &str = "pr";
+/// The lifecycle state whose role doc says what to do with the PR: `pr`
+/// opens a draft, `pr_review` drives it through review. The protocol also
+/// runs on a node in any other state (the action panel's Chat), which gets
+/// the `pr` doc.
+fn state_for(lifecycle: &str) -> &'static str {
+    if lifecycle == "pr_review" { "pr_review" } else { "pr" }
+}
 
 /// The report `tod-cli pr mergeable` records: the agent's job is done, the
-/// `pr → approved` gate can now check GitHub itself.
+/// `pr_review → approved` gate can now check GitHub itself.
 pub fn mergeable_report(note: Option<String>) -> Value {
     json!({ "pr": "mergeable", "note": note })
 }
@@ -76,7 +82,7 @@ impl Protocol for PrProtocol {
     }
 
     fn starter(&self) -> Option<&'static str> {
-        Some("Open and drive the pull request.")
+        Some("Open the pull request, or drive it through review.")
     }
 
     fn turn_env(&self, env: &ProtocolEnv<'_>) -> Vec<(String, String)> {
@@ -118,7 +124,8 @@ impl Protocol for PrProtocol {
             })
             .context("could not read the inherited context")?;
         let manifest = ProcessManifest::load(&TodInstallPaths::discover()?)?;
-        let role_doc = state_role_doc(&manifest, PR)?;
+        let state = state_for(&node.lifecycle);
+        let role_doc = state_role_doc(&manifest, state)?;
         let working_dir = PathBuf::from(self.cwd(env)?.path_text());
         build_pr_message(
             env.media,
@@ -136,7 +143,7 @@ impl Protocol for PrProtocol {
                 obligations,
                 ancestor_context,
                 verdicts: super::verify::current_verdicts(fleet, node_id),
-                skills: crate::skills_context::for_node(fleet, node_id, "pr"),
+                skills: crate::skills_context::for_node(fleet, node_id, state),
                 pull_requests: crate::pr_context::for_node(fleet, node_id),
             },
             &role_doc,
@@ -200,6 +207,18 @@ impl Protocol for PrProtocol {
         }
         let node = node_id(turn.env)?;
         let prs = turn.env.fleet.read(|conn| NodePrRepo::new(conn).read(node))?.prs;
+        // In `pr` the job is the draft: once it is linked there is nothing
+        // more for the agent (feedback comes after a person is asked to
+        // review, in `pr_review`).
+        let lifecycle = turn
+            .env
+            .fleet
+            .get_node(&node.to_string())?
+            .map(|n| n.lifecycle)
+            .unwrap_or_default();
+        if lifecycle == "pr" && !prs.is_empty() {
+            return Ok(Next::Done(Stop::Complete));
+        }
         let Some(live) = live_prs(turn.env.data_root, &prs) else {
             return Ok(Next::Done(Stop::Complete));
         };
@@ -452,6 +471,8 @@ open pr: Cloud test"), Some("Cloud test"));
                     head_sha: Some("abcdef1".into()),
                     head_committed_at: None,
                     draft: false,
+                    open: true,
+                    reviewers: Vec::new(),
                     base_ref: None,
                     body: None,
                     ..Default::default()

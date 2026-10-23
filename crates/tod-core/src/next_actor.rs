@@ -167,7 +167,7 @@ pub enum WaitKind {
 
 /// The spec of the wait for a person's review of pull request `number`:
 /// `github:pr:<n>:review`, or `github:pr:<n>:review:<login,login>` when
-/// GitHub says whom it asked (teams as `team:<slug>`). Without a number (the
+/// GitHub says whom it asked (teams as `org/team`). Without a number (the
 /// pull request is not known) `github:pr:review`.
 pub fn review_spec(number: Option<i64>, reviewers: &[String]) -> String {
     let mut spec = match number {

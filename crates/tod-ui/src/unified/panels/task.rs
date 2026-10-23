@@ -200,6 +200,10 @@ enum RunnerAction {
     /// default action, which continues where it already is.
     MoveToCloud,
     SyncCloud,
+    /// Set the node up again in the sandbox it already has: reinstall tod's
+    /// files, check out its branch, restart the relay and supervisor. For a
+    /// setup that failed or a sandbox missing a file; nothing is deleted.
+    ReinstallCloud,
     LeaveCloud,
     /// Delete the node's sandbox in Blaxel (a missing one is fine).
     DeleteSandbox,
@@ -220,6 +224,7 @@ impl RunnerAction {
             Self::RunInCloud => "Run in the cloud",
             Self::MoveToCloud => "Move to the cloud",
             Self::SyncCloud => "Sync now",
+            Self::ReinstallCloud => "Reinstall and restart",
             Self::LeaveCloud => "Stop running in the cloud",
             Self::DeleteSandbox => "Delete Sandbox",
         }
@@ -721,10 +726,10 @@ impl TaskPanel {
         // runs (here, in a dev container, in a cloud sandbox).
         // A cloud node's supervisor may have stopped without a wait reaching
         // here (the stop is not synced), so there it is offered in
-        // `approved` and `merged` whatever the status says.
+        // `pr`, `approved` and `merged` whatever the status says.
         let waits_on_github = self.awaits_others()
             || (self.runner.cloud.as_ref().is_some_and(|cloud| cloud.lost_at.is_none())
-                && matches!(self.runner.lifecycle.as_str(), "approved" | "merged"));
+                && matches!(self.runner.lifecycle.as_str(), "pr" | "approved" | "merged"));
         if waits_on_github && !actions.menu.contains(&RunnerAction::PollNow) && !actions.menu.contains(&RunnerAction::CheckNow) {
             actions.menu.insert(0, RunnerAction::CheckNow);
         }
@@ -744,9 +749,17 @@ impl TaskPanel {
                     menu: if self.runner.cloud_busy { Vec::new() } else { vec![A::LeaveCloud] },
                 };
             }
+            // After a failure, syncing says nothing: the fix is setting the
+            // node up again in the sandbox it has, without deleting it.
+            if self.runner.cloud_failed {
+                return RunnerActions {
+                    primary: Some((A::ReinstallCloud, A::ReinstallCloud.label(), self.runner.cloud_busy)),
+                    menu: if self.runner.cloud_busy { Vec::new() } else { vec![A::SyncCloud, A::DeleteSandbox, A::LeaveCloud] },
+                };
+            }
             return RunnerActions {
                 primary: Some((A::SyncCloud, A::SyncCloud.label(), self.runner.cloud_busy)),
-                menu: if self.runner.cloud_busy { Vec::new() } else { vec![A::DeleteSandbox, A::LeaveCloud] },
+                menu: if self.runner.cloud_busy { Vec::new() } else { vec![A::ReinstallCloud, A::DeleteSandbox, A::LeaveCloud] },
             };
         }
         if self.runner.cloud_busy {
@@ -871,7 +884,7 @@ impl TaskPanel {
                     self.stop_runner(slot, cx);
                 }
             }
-            A::RunInCloud | A::MoveToCloud => {
+            A::RunInCloud | A::MoveToCloud | A::ReinstallCloud => {
                 self.cloud_started(cx);
                 crate::views::cloud_node::run_in_cloud(
                     self.fleet.clone(),

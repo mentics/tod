@@ -450,6 +450,12 @@ styles:
     # changes it has not been checked against: rare, so it must stand out
     # from every other row. Shown only when no other status icon is.
     color: incoming-text
+  node-pr:
+    # The pull-request icon of a tree row whose node has a pull request, in a
+    # cell of its own right of the status icon (which it never touches), for
+    # the earliest state among its pull requests (draft, open, merged,
+    # closed): muted gray draft, amber open, purple merge icon, red closed.
+    color: "node-pr-draft-text | node-pr-open-text | node-pr-merged-text | node-pr-closed-text"
   node-ticket-linked-copy:
     # The ticket id of a tree row copied out of a generator that still
     # receives its source item's updates (the title keeps its own color).
@@ -588,6 +594,10 @@ tokens:
     node-others-text: "#94a3b8"
     node-failed-text: "#f87171"
     node-retrying-text: "#fbbf24"
+    node-pr-open-text: "#f59e0b"
+    node-pr-draft-text: "#a3a3a3"
+    node-pr-merged-text: "#a78bfa"
+    node-pr-closed-text: "#f87171"
     node-finished-text: "#fb923c"
     node-needs-you-text: "#f0805a"
     notice-fill: "#ffff00"

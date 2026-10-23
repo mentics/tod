@@ -46,7 +46,7 @@ impl Milestone {
         match state {
             "design" | "planning" | "ready" => Some(Self::Accepted),
             "active" | "verifying" => Some(Self::Started),
-            "review" | "pr" | "approved" => Some(Self::InReview),
+            "review" | "pr" | "pr_review" | "approved" => Some(Self::InReview),
             "merged" | "released" | "learn" | "done" => Some(Self::Done),
             _ => None,
         }

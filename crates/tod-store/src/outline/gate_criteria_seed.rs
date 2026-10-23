@@ -385,11 +385,30 @@ pub const GATE_CRITERIA: &[GateCriterionSeed] = &[
         label: "Every review finding answered (fixed, out of scope, declined, or rejected)?",
         sort_order: 2,
     },
-    // pr → approved — app-checked: the PR is mergeable (checks green,
+    // pr → pr_review — app-checked: the draft the `pr` state opened has been
+    // marked ready and has a person to review it. Hardcoded: what "ready for
+    // human review" means will want to be scriptable per project.
+    GateCriterionSeed {
+        id_str: "a1000006-0006-4006-8006-00000000000a",
+        from_state: "pr",
+        to_state: "pr_review",
+        slug: crate::outline::repos::gate::PR_PR_REVIEW_READY_SLUG,
+        label: "PR open and out of draft?",
+        sort_order: 1,
+    },
+    GateCriterionSeed {
+        id_str: "a1000006-0006-4006-8006-00000000000b",
+        from_state: "pr",
+        to_state: "pr_review",
+        slug: crate::outline::repos::gate::PR_PR_REVIEW_REVIEWER_SLUG,
+        label: "A person assigned to review it?",
+        sort_order: 2,
+    },
+    // pr_review → approved — app-checked: the PR is mergeable (checks green,
     // required reviews satisfied). `tod_core::gate::pr_mergeable_outcome`.
     GateCriterionSeed {
         id_str: "a1000006-0006-4006-8006-000000000003",
-        from_state: "pr",
+        from_state: "pr_review",
         to_state: "approved",
         slug: crate::outline::repos::gate::PR_APPROVED_MERGEABLE_SLUG,
         label: "PR approved and checks green?",
@@ -397,7 +416,7 @@ pub const GATE_CRITERIA: &[GateCriterionSeed] = &[
     },
     GateCriterionSeed {
         id_str: "a1000006-0006-4006-8006-000000000005",
-        from_state: "pr",
+        from_state: "pr_review",
         to_state: "approved",
         slug: crate::outline::repos::gate::PR_APPROVED_UP_TO_DATE_SLUG,
         label: "Branch up to date with its base, no conflicts?",
@@ -405,7 +424,7 @@ pub const GATE_CRITERIA: &[GateCriterionSeed] = &[
     },
     GateCriterionSeed {
         id_str: "a1000006-0006-4006-8006-000000000006",
-        from_state: "pr",
+        from_state: "pr_review",
         to_state: "approved",
         slug: crate::outline::repos::gate::PR_APPROVED_THREADS_RESOLVED_SLUG,
         label: "Every review thread resolved?",
@@ -413,7 +432,7 @@ pub const GATE_CRITERIA: &[GateCriterionSeed] = &[
     },
     GateCriterionSeed {
         id_str: "a1000006-0006-4006-8006-000000000007",
-        from_state: "pr",
+        from_state: "pr_review",
         to_state: "approved",
         slug: crate::outline::repos::gate::PR_APPROVED_REVIEW_CURRENT_SLUG,
         label: "Review bots have reviewed the current head?",
@@ -421,7 +440,7 @@ pub const GATE_CRITERIA: &[GateCriterionSeed] = &[
     },
     GateCriterionSeed {
         id_str: "a1000006-0006-4006-8006-000000000008",
-        from_state: "pr",
+        from_state: "pr_review",
         to_state: "approved",
         slug: crate::outline::repos::gate::PR_APPROVED_REVIEW_SCORE_SLUG,
         label: "Review bot scores meet the threshold?",
@@ -552,6 +571,14 @@ pub fn seed_gate_criteria(conn: &Connection) -> Result<()> {
     conn.execute(
         "UPDATE gate_criteria SET to_state = 'pr', updated_at = ?1
          WHERE from_state = 'review' AND to_state = 'approved'",
+        params![now],
+    )?;
+    // The `pr_review` state took over what `pr` gated: the criteria that
+    // checked the PR's readiness now belong to `pr_review → approved`, and
+    // `pr → pr_review` is new. Same backfill reason as above.
+    conn.execute(
+        "UPDATE gate_criteria SET from_state = 'pr_review', updated_at = ?1
+         WHERE from_state = 'pr' AND to_state = 'approved'",
         params![now],
     )?;
     // A gate never runs an agent (`doc/lifecycle/phase-agents.md`): every

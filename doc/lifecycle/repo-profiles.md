@@ -41,10 +41,10 @@ PR has met its own profile's criteria for the transition.
 The 13 lifecycle states and `next_lifecycle` stay fixed (no schema change).
 A profile owns, per linked PR:
 
-1. the **babysit** step in `pr` once the PR is ready for review
+1. the **babysit** step in `pr_review` once the PR is ready for review
    (`autopilot::babysit`),
 2. the **waits** after approval (`autopilot::github_wait::hold_for_github`),
-3. the derived **criteria** for `pr → approved`, `approved → merged`, and
+3. the derived **criteria** for `pr_review → approved`, `approved → merged`, and
    `merged → released` (`gate::derived`),
 4. the **labels** the UI shows for those states.
 
@@ -57,7 +57,7 @@ State meanings (the states are reused, the labels differ):
 
 | State | Default | Atlantis |
 |---|---|---|
-| `pr` | PR open, babysat until ready | same, then post `atlantis plan` and wait for the plan result |
+| `pr_review` | PR open, babysat until ready | same, then post `atlantis plan` and wait for the plan result |
 | `approved` | human review done | human review done (plan succeeded) |
 | `merged` | PR merged | **applied**: plan + apply commands run, apply succeeded |
 | `released` | release names the PR | **PR merged** (apply came first) |

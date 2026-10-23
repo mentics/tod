@@ -396,7 +396,20 @@ pub struct TaskListView {
     /// Who is next for each node and which strip filter is on, as the host
     /// last said (`set_standings`); not persisted.
     actor_view: standing::ActorView,
+    /// When pull-request states were last read from GitHub (off the UI
+    /// thread); `None` while one read is in flight. Rate-limits the reads a
+    /// store change would otherwise start every time.
+    pr_refresh: PrRefresh,
 }
+
+#[derive(Clone, Copy)]
+enum PrRefresh {
+    Idle(Option<std::time::Instant>),
+    Reading,
+}
+
+/// How long to leave unread pull requests alone after a read attempt.
+const PR_REFRESH_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(60);
 
 impl TaskListView {
     pub fn new(window: &mut Window, cx: &mut Context<Self>, fleet: Arc<FleetStore>) -> Self {
@@ -497,7 +510,7 @@ impl TaskListView {
             ListEvent::Cancel => {}
         });
 
-        let view = Self {
+        let mut view = Self {
             writes: writes::WriteQueue::new(),
             creating: Vec::new(),
             all_tasks,
@@ -564,8 +577,21 @@ impl TaskListView {
             pending_status_override_apply: false,
             running_nodes: RunFeed::default(),
             actor_view: standing::ActorView::default(),
+            pr_refresh: PrRefresh::Idle(None),
         };
 
+        view.refresh_pr_states(cx);
+        // A draft turns ready, or a read that failed is tried again, without
+        // any store change to prompt it; `refresh_pr_states` rate-limits.
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(PR_REFRESH_COOLDOWN / 3).await;
+                if this.update(cx, |this, cx| this.refresh_pr_states(cx)).is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
         cx.defer_in(window, move |this, window, cx| {
             this.list_state.update(cx, |state, cx| {
                 state.set_selected_index(this.last_selected, window, cx);
@@ -1750,6 +1776,7 @@ impl TaskListView {
         snapshot: LiveSnapshot,
         cx: &mut Context<Self>,
     ) {
+        self.refresh_pr_states(cx);
         // A draft row lives only in memory, and the active list may have moved
         // on while the read was in flight; neither is this path's to reconcile.
         if self.draft.is_some()
@@ -1779,6 +1806,37 @@ impl TaskListView {
         cx.notify();
     }
 
+    /// Read the state of the linked pull requests that are unknown or stale
+    /// from GitHub, off the UI thread, and reload the rows when one changed
+    /// (so a draft shows gray and a ready one amber).
+    fn refresh_pr_states(&mut self, cx: &mut Context<Self>) {
+        match self.pr_refresh {
+            PrRefresh::Reading => return,
+            PrRefresh::Idle(Some(at)) if at.elapsed() < PR_REFRESH_COOLDOWN => return,
+            PrRefresh::Idle(_) => {}
+        }
+        let prs = fixtures::unread_pull_requests(&self.fleet);
+        if prs.is_empty() {
+            return;
+        }
+        self.pr_refresh = PrRefresh::Reading;
+        let root = self.fleet.paths().root().to_path_buf();
+        cx.spawn(async move |this, cx| {
+            let changed = cx
+                .background_executor()
+                .spawn(async move { tod_core::pull_requests::refresh_pull_states(&root, &prs) })
+                .await;
+            this.update(cx, |this, cx| {
+                this.pr_refresh = PrRefresh::Idle(Some(std::time::Instant::now()));
+                if changed {
+                    this.request_live_refresh(cx);
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     fn live_refresh(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let visible_before =
             Self::visible_tasks(&self.all_tasks, &self.search_query, &self.working_set, &self.actor_view);
@@ -1795,6 +1853,7 @@ impl TaskListView {
                 .or_else(|| self.outline_lists.first().map(|l| l.id));
         }
         self.reload_all_tasks();
+        self.refresh_pr_states(cx);
         if let Some(sel) = selected.clone() {
             if !self.all_tasks.iter().any(|t| t.id == sel) {
                 let visible_after =

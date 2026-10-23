@@ -36,6 +36,14 @@ pub enum GithubError {
     /// expected to work.
     #[error("GitHub is unavailable ({0})")]
     Unavailable(String),
+    /// Proxy authentication was chosen ([`GITHUB_AUTH_ENV`]) but no proxy is
+    /// configured, so a request would go out with no credential at all.
+    #[error(
+        "GitHub is to be reached through the sandbox's proxy ({GITHUB_AUTH_ENV}={GITHUB_AUTH_PROXY}), \
+         but this process has no proxy configured (HTTPS_PROXY is unset): the request would go to \
+         GitHub with no credentials"
+    )]
+    ProxyMissing,
 }
 
 impl GithubError {
@@ -85,15 +93,17 @@ pub struct PrStatus {
     pub head_committed_at: Option<String>,
     /// The PR is a draft.
     pub draft: bool,
+    /// The PR is open (not closed, merged or not).
+    pub open: bool,
+    /// Who GitHub still has a review requested from: user logins, and team
+    /// slugs as `org/team`. A reviewer who has already reviewed is no longer
+    /// listed; see [`PrReview`].
+    pub reviewers: Vec<String>,
     /// The branch the PR merges into.
     pub base_ref: Option<String>,
     /// The description. A review bot may keep its summary here, edited in
     /// place, rather than in a comment.
     pub body: Option<String>,
-    /// Who GitHub still waits on for a review: the users' logins, then each
-    /// team as `team:<slug>`. A reviewer drops off this list when they
-    /// review (and comes back when a review is requested again).
-    pub requested_reviewers: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -142,6 +152,8 @@ pub struct Github {
     auth: GithubAuth,
     agent: ureq::Agent,
     api: String,
+    /// Proxy authentication with no proxy to carry it: every call is refused.
+    proxy_missing: bool,
 }
 
 impl Github {
@@ -154,12 +166,15 @@ impl Github {
                 .into(),
             GithubAuth::Proxy => crate::sandbox_http::sandbox_agent(TIMEOUT),
         };
-        Self::with_agent(auth, agent, GITHUB_API_URL)
+        // `TOD_GITHUB_API_URL` points a dev run at a stand-in server.
+        let api = std::env::var("TOD_GITHUB_API_URL").unwrap_or_else(|_| GITHUB_API_URL.to_string());
+        let proxy_missing = auth == GithubAuth::Proxy && ureq::Proxy::try_from_env().is_none();
+        Self { proxy_missing, ..Self::with_agent(auth, agent, &api) }
     }
 
     /// With the agent and API base URL given.
     pub fn with_agent(auth: GithubAuth, agent: ureq::Agent, api: &str) -> Self {
-        Self { auth, agent, api: api.trim_end_matches('/').to_string() }
+        Self { auth, agent, api: api.trim_end_matches('/').to_string(), proxy_missing: false }
     }
 
     pub fn auth(&self) -> &GithubAuth {
@@ -176,12 +191,18 @@ impl Github {
 
     /// `GET <api><path>`, as JSON.
     fn get_json<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<T, GithubError> {
+        if self.proxy_missing {
+            return Err(GithubError::ProxyMissing);
+        }
         let response = self.authorize(self.agent.get(&format!("{}{path}", self.api))).call();
         read_json(response)
     }
 
     /// `POST <api><path>` with a JSON body, the reply as JSON.
     fn post_json<T: serde::de::DeserializeOwned>(&self, path: &str, body: serde_json::Value) -> Result<T, GithubError> {
+        if self.proxy_missing {
+            return Err(GithubError::ProxyMissing);
+        }
         let response = self.authorize(self.agent.post(&format!("{}{path}", self.api))).send_json(body);
         read_json(response)
     }
@@ -267,7 +288,6 @@ impl Github {
             }
             None => None,
         };
-        let requested_reviewers = raw.requested_reviewer_names();
         Ok(PrStatus {
             mergeable: raw.mergeable,
             mergeable_state: raw.mergeable_state,
@@ -276,8 +296,15 @@ impl Github {
             head_sha: raw.head.as_ref().map(|h| h.sha.clone()),
             head_committed_at: None,
             draft: raw.draft.unwrap_or(false),
+            open: raw.state.as_deref() == Some("open"),
+            reviewers: raw
+                .requested_reviewers
+                .into_iter()
+                .filter(|u| !u.is_bot())
+                .map(|u| u.login)
+                .chain(raw.requested_teams.into_iter().map(|t| t.slug))
+                .collect(),
             base_ref: raw.base.map(|b| b.name),
-            requested_reviewers,
             body: raw.body,
         })
     }
@@ -859,35 +886,35 @@ struct PrDetailRaw {
     mergeable_state: Option<String>,
     merged: Option<bool>,
     draft: Option<bool>,
-    head: Option<HeadRaw>,
-    base: Option<RefRaw>,
-    body: Option<String>,
+    state: Option<String>,
     #[serde(default)]
     requested_reviewers: Vec<RequestedUserRaw>,
     #[serde(default)]
     requested_teams: Vec<RequestedTeamRaw>,
+    head: Option<HeadRaw>,
+    base: Option<RefRaw>,
+    body: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct RequestedUserRaw {
     login: String,
+    /// GitHub's account type: `User`, `Bot`, `Organization`.
+    #[serde(rename = "type", default)]
+    kind: String,
+}
+
+impl RequestedUserRaw {
+    /// A bot: GitHub says so by `type` (a requested Copilot is `Bot` with the
+    /// login `Copilot`), and a login ending `[bot]` is one too.
+    fn is_bot(&self) -> bool {
+        self.kind == "Bot" || self.login.ends_with("[bot]")
+    }
 }
 
 #[derive(Debug, Deserialize)]
 struct RequestedTeamRaw {
     slug: String,
-}
-
-impl PrDetailRaw {
-    /// `requested_reviewers` (users) as logins, then `requested_teams` as
-    /// `team:<slug>`.
-    fn requested_reviewer_names(&self) -> Vec<String> {
-        self.requested_reviewers
-            .iter()
-            .map(|u| u.login.clone())
-            .chain(self.requested_teams.iter().map(|t| format!("team:{}", t.slug)))
-            .collect()
-    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1107,6 +1134,33 @@ impl<'a> NodePrRepo<'a> {
         Ok(out)
     }
 
+    /// Every node's pull requests, one query for all of them.
+    pub fn all(&self) -> Result<std::collections::HashMap<Uuid, Vec<NodePr>>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT node_id, linked_prs FROM node_fields WHERE linked_prs IS NOT NULL",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut out = std::collections::HashMap::new();
+        for row in rows {
+            let (id, raw) = row?;
+            let Ok(links) = serde_json::from_str::<Vec<String>>(&raw) else {
+                continue;
+            };
+            let mut prs: Vec<NodePr> = Vec::new();
+            for pr in links.iter().filter_map(|l| parse_pr_link(l)) {
+                if !prs.iter().any(|p| p.same_as(&pr)) {
+                    prs.push(pr);
+                }
+            }
+            if !prs.is_empty() {
+                out.insert(crate::outline::uuid_blob::blob_to_uuid(&id)?, prs);
+            }
+        }
+        Ok(out)
+    }
+
     /// The first pull request linked.
     pub fn get(&self, node_id: Uuid) -> Result<Option<NodePr>> {
         Ok(self.read(node_id)?.prs.into_iter().next())
@@ -1134,27 +1188,27 @@ impl<'a> NodePrRepo<'a> {
             .update_linked_prs(&node_id.to_string(), &links)?;
         Ok(())
     }
+
+    /// Unlink `pr` (every link that names it), leaving the others, and say
+    /// whether one was there. Ticket stays as it is.
+    pub fn remove(&self, node_id: Uuid, pr: &NodePr) -> Result<bool> {
+        let links = self.links(node_id)?;
+        let kept: Vec<String> = links
+            .iter()
+            .filter(|link| !parse_pr_link(link).is_some_and(|linked| linked.same_as(pr)))
+            .cloned()
+            .collect();
+        if kept.len() == links.len() {
+            return Ok(false);
+        }
+        crate::fleet::repos::task::TaskRepo::new(self.conn)
+            .update_linked_prs(&node_id.to_string(), &kept)?;
+        Ok(true)
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn requested_reviewers_are_users_then_teams() {
-        let raw: super::PrDetailRaw = serde_json::from_str(
-            r#"{"mergeable":true,"merged":false,
-                "requested_reviewers":[{"login":"maria","id":1},{"login":"li"}],
-                "requested_teams":[{"slug":"core","name":"Core"}]}"#,
-        )
-        .unwrap();
-        assert_eq!(raw.requested_reviewer_names(), vec!["maria", "li", "team:core"]);
-    }
-
-    #[test]
-    fn a_pull_request_without_requested_reviewers_has_none() {
-        let raw: super::PrDetailRaw = serde_json::from_str(r#"{"merged":false}"#).unwrap();
-        assert!(raw.requested_reviewer_names().is_empty());
-    }
-
     #[test]
     fn checks_combine_statuses_and_check_runs() {
         use super::{CheckRunsRaw, CombinedStatusRaw, combine_checks};
@@ -1296,6 +1350,13 @@ mod tests {
     }
 
     #[test]
+    fn proxy_mode_without_a_proxy_refuses_rather_than_going_out_unauthenticated() {
+        let agent = ureq::Agent::config_builder().http_status_as_error(false).build().into();
+        let gh = Github { proxy_missing: true, ..Github::with_agent(GithubAuth::Proxy, agent, "http://api.github.test") };
+        assert!(matches!(gh.user_login(), Err(GithubError::ProxyMissing)));
+    }
+
+    #[test]
     fn token_mode_sends_the_token() {
         let (_, seen) = through_fake_proxy(GithubAuth::Token("t0k".into()));
         assert!(seen.iter().any(|l| l.eq_ignore_ascii_case("authorization: Bearer t0k")), "{seen:?}");
@@ -1375,6 +1436,10 @@ mod tests {
             .list_capabilities(node)
             .unwrap()
             .contains(&Capability::Ticket));
+        let other = NodePr::new("ACME", "lib", 2);
+        assert!(prs.remove(node, &other).unwrap());
+        assert!(!prs.remove(node, &other).unwrap());
+        assert_eq!(prs.read(node).unwrap().prs, vec![NodePr::new("acme", "app", 7)]);
         let _ = std::fs::remove_dir_all(root);
     }
 }

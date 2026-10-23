@@ -166,7 +166,7 @@ the cloud. Changes:
 3. **Move the settle step into `tod-core`.** `tod-supervisor/waits.rs::check`
    settles each due wait (`until`, `event`, `check`). Both the supervisor and
    the daemon call one copy.
-4. **`babysit` stops instead of sleeping.** In `pr`, when what is left is only
+4. **`babysit` stops instead of sleeping.** In `pr_review`, when what is left is only
    waiting, it returns `Outcome::Waiting` after recording a wait, on every
    path. Cloud: the supervisor reconciles the wake and exits, so the VM
    sleeps. Local: the supervisor exits and `LocalScheduler` wakes it.
@@ -185,7 +185,7 @@ nothing watches it. It becomes a wait:
 - a webhook is a hint, not the answer: it fires on any approval by anyone, is
   not undone by a later changes-requested or dismissal, and can be lost. The
   settle step therefore reads the pull request from GitHub (see Findings).
-- when it settles: approved advances the node (the `pr → approved` gate);
+- when it settles: approved advances the node (the `pr_review → approved` gate);
   changes requested reopens the `Pr` protocol turn.
 
 ### Cadence
@@ -422,7 +422,7 @@ Researched against the code; file references are to this tree.
   `reviewDecision` is never read. `mergeable_state == blocked` is the only
   human-review signal. Telling them apart needs a `state` on `PrReview` or a
   `reviewDecision` read.
-- **The `pr → approved` gate** has no human-approval criterion; it enforces
+- **The `pr_review → approved` gate** has no human-approval criterion; it enforces
   review only indirectly through `pr-approved.mergeable` (`clean` or merged).
 - **When the review is missing, the run stops.** `babysit` returns `Clear`
   and the gate fails `pr-approved.mergeable`, so the run ends as

@@ -24,7 +24,9 @@
 //! conversation that was in progress instead of starting another.
 
 mod github_wait;
-pub use github_wait::{GithubCheck, check_now, github_look_failed, read_wait_spec, retry_delay_ms};
+pub use github_wait::{
+    GithubCheck, check_github, check_now, github_look_failed, read_wait_spec, retry_delay_ms,
+};
 pub mod local;
 mod state;
 
@@ -442,9 +444,16 @@ impl Autopilot {
         hook: &mut H,
         from: &str,
     ) -> Result<Option<Outcome>> {
-        // In `pr`, the babysitter comes first: it gets the pull request to
-        // where only the human review is missing, then the gate checks it.
+        // In `pr` the agent opens the draft pull request, then the gate asks
+        // that a person has been put on it. In `pr_review` the babysitter
+        // comes first: it gets the pull request to where only the human
+        // review is missing, then the gate checks it.
         if from == "pr"
+            && let Some(outcome) = self.open_draft_pr(fleet, agent, hook)?
+        {
+            return Ok(Some(outcome));
+        }
+        if from == "pr_review"
             && let Some(outcome) = self.babysit(fleet, agent, hook)?
         {
             return Ok(Some(outcome));
@@ -560,8 +569,45 @@ impl Autopilot {
         Ok(self.pr_report(fleet)?.as_ref().and_then(blocked_why))
     }
 
+    /// Have the pull request's agent open the node's draft pull request if it
+    /// has none: the `pr` state's work. `None` once one is linked (or already
+    /// was), so the gate checks it; the pull request is not driven from here,
+    /// that is `pr_review`'s ([`Self::babysit`]).
+    fn open_draft_pr<A: AgentAccess + ?Sized, H: StepHook + ?Sized>(
+        &mut self,
+        fleet: &FleetStore,
+        agent: &mut A,
+        hook: &mut H,
+    ) -> Result<Option<Outcome>> {
+        let node = self.node;
+        let linked = |fleet: &FleetStore| -> Result<bool> {
+            Ok(!fleet
+                .read(|conn| tod_store::github::NodePrRepo::new(conn).read(node))?
+                .prs
+                .is_empty())
+        };
+        if linked(fleet)? {
+            return Ok(None);
+        }
+        hook.waiting(None, None);
+        if let Some(outcome) = self.converse(fleet, agent, hook, ProtocolKind::Pr, None)? {
+            return Ok(Some(outcome));
+        }
+        if linked(fleet)? {
+            return Ok(None);
+        }
+        Ok(Some(match self.blocked_report(fleet)? {
+            Some(why) => Outcome::NeedsHuman { reason: NeedsHuman::PrBlocked { why } },
+            None => Outcome::NeedsHuman {
+                reason: NeedsHuman::NoProgress {
+                    step: protocol_name(ProtocolKind::Pr).to_string(),
+                },
+            },
+        }))
+    }
+
     /// Babysit the node's pull request until nothing is left that an agent
-    /// or the app can do: the `pr` state's work (`doc/lifecycle/pr-readiness.md`).
+    /// or the app can do: the `pr_review` state's work (`doc/lifecycle/pr-readiness.md`).
     ///
     /// Each round reads the pull request. Work (open review threads, a failing
     /// check, a branch behind its base, a bot's low score) goes to the pull
@@ -600,23 +646,14 @@ impl Autopilot {
             }
             let links = fleet.read(|conn| tod_store::github::NodePrRepo::new(conn).read(self.node))?;
             if links.prs.is_empty() {
-                // The agent opens it.
+                // The `pr` state opens it; a node can reach here without one
+                // (moved forward by hand, or its link removed).
                 hook.waiting(None, None);
-                if let Some(outcome) = self.converse(fleet, agent, hook, ProtocolKind::Pr, None)? {
-                    return Ok(Some(outcome));
-                }
-                let opened = fleet.read(|conn| tod_store::github::NodePrRepo::new(conn).read(self.node))?;
-                if opened.prs.is_empty() {
-                    return Ok(Some(match self.blocked_report(fleet)? {
-                        Some(why) => Outcome::NeedsHuman { reason: NeedsHuman::PrBlocked { why } },
-                        None => Outcome::NeedsHuman {
-                            reason: NeedsHuman::NoProgress {
-                                step: protocol_name(ProtocolKind::Pr).to_string(),
-                            },
-                        },
-                    }));
-                }
-                continue;
+                return Ok(Some(Outcome::NeedsHuman {
+                    reason: NeedsHuman::PrBlocked {
+                        why: "no pull request is linked to this node: open one (or move it back to `pr`)".to_string(),
+                    },
+                }));
             }
             let Some(feed) = pr_readiness::feed_for(&self.config.data_root) else {
                 hook.waiting(None, None);

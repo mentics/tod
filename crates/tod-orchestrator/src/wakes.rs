@@ -72,6 +72,23 @@ pub fn is_gone(err: &anyhow::Error) -> bool {
 /// Told about a wake whose sandbox is gone.
 pub type LostHandler = Box<dyn Fn(&Wake) + Send + Sync>;
 
+/// What a due wake does, as its gate sees it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Verdict {
+    /// Poke the sandbox: there is work for it, or the gate cannot tell.
+    Poke,
+    /// Nothing to do yet: look again at `at` (ms) instead, under wake id
+    /// `id` (the wait it replaced is gone), and leave the sandbox asleep.
+    Later { id: String, at: i64 },
+}
+
+/// Looks at a due wake before its sandbox is poked, so a wait the
+/// orchestrator can answer itself (a pull request still unmerged) wakes
+/// nothing. See [`crate::github_gate`].
+pub trait WakeGate: Send + Sync {
+    fn check(&self, wake: &Wake) -> Verdict;
+}
+
 /// Wakes a sandbox.
 pub trait Poker: Send + Sync {
     fn poke(&self, wake: &Wake) -> Result<()>;
@@ -102,6 +119,7 @@ pub struct Wakes {
     changed: Condvar,
     poker: Box<dyn Poker>,
     lost: std::sync::OnceLock<LostHandler>,
+    gate: std::sync::OnceLock<Box<dyn WakeGate>>,
 }
 
 impl Wakes {
@@ -113,12 +131,19 @@ impl Wakes {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
             Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
         };
-        Ok(Arc::new(Self { path, rows: Mutex::new(rows), changed: Condvar::new(), poker, lost: std::sync::OnceLock::new() }))
+        Ok(Arc::new(Self { path, rows: Mutex::new(rows), changed: Condvar::new(), poker, lost: std::sync::OnceLock::new(), gate: std::sync::OnceLock::new() }))
     }
 
     /// Who hears of a sandbox found gone (set once; later calls are ignored).
     pub fn set_lost_handler(&self, handler: LostHandler) {
         let _ = self.lost.set(handler);
+    }
+
+    /// The gate every due wake passes before its sandbox is poked (set once;
+    /// later calls are ignored). A wake poked by [`Self::poke_now`] (a
+    /// webhook, an answer) is not gated: something happened.
+    pub fn set_gate(&self, gate: Box<dyn WakeGate>) {
+        let _ = self.gate.set(gate);
     }
 
     fn report_lost(&self, wake: &Wake) {
@@ -167,6 +192,16 @@ impl Wakes {
         let due: Vec<Wake> = self.rows.lock().unwrap().iter().filter(|w| w.at <= now).cloned().collect();
         let mut fired = Vec::new();
         for wake in due {
+            if let Some(Verdict::Later { id, at }) = self.gate.get().map(|g| g.check(&wake)) {
+                let mut rows = self.rows.lock().unwrap();
+                // Only if it was not replaced or dropped meanwhile.
+                if rows.iter().any(|w| w == &wake) {
+                    rows.retain(|w| w != &wake && w.id != id);
+                    rows.push(Wake { id, at: at.max(now + 1000), ..wake });
+                    let _ = self.save(&rows).map_err(|e| eprintln!("tod-orchestrator: wakes: {e:#}"));
+                }
+                continue;
+            }
             match self.poker.poke(&wake) {
                 Ok(()) => {
                     let mut rows = self.rows.lock().unwrap();

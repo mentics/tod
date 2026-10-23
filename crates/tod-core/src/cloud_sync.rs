@@ -725,17 +725,20 @@ fn origin_url_of(fleet: &FleetStore, node_id: &str, repo: &str) -> Result<String
             }
         }
         for name in sandboxes {
-            let found = tod_store::fleet::sandbox::SandboxExec::new(&name)
-                .output(repo, "git", &["config", "--get-regexp", REMOTE_URLS])
-                .ok()
-                .filter(|o| o.status.success())
-                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
-            match found {
-                Some(remotes) => match github_remote_url(&remotes) {
-                    Some(url) => return Ok(url),
-                    None => tried.push(format!("sandbox {name} has remotes {remotes:?} at {repo}")),
-                },
-                None => tried.push(format!("sandbox {name} has no git remotes at {repo}")),
+            match tod_store::fleet::sandbox::SandboxExec::new(&name).output(repo, "git", &["config", "--get-regexp", REMOTE_URLS]) {
+                Err(err) => tried.push(format!("could not run git in sandbox {name} at {repo}: {err:#}")),
+                Ok(o) if o.status.success() => {
+                    let remotes = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                    match github_remote_url(&remotes) {
+                        Some(url) => return Ok(url),
+                        None => tried.push(format!("sandbox {name} has remotes {remotes:?} at {repo}")),
+                    }
+                }
+                Ok(o) => tried.push(format!(
+                    "sandbox {name} has no git remotes at {repo} (git exited {}: {})",
+                    o.status,
+                    String::from_utf8_lossy(&o.stderr).trim()
+                )),
             }
         }
     }
@@ -830,15 +833,20 @@ pub fn sandbox_is_dead(info: &tod_sandbox::blaxel::SandboxInfo) -> bool {
 /// making another beside it: the one its `cloud_nodes` row names (a re-run,
 /// or a replacement of a lost one), else the one its Files location made
 /// (`tod-<slug>`, from opening a shell or launching an agent).
-fn existing_sandbox_name(fleet: &FleetStore, node_id: &str) -> Option<String> {
-    if let Some(row) = cloud_node(fleet, node_id) {
-        return Some(row.sandbox);
-    }
-    fleet
-        .read(|conn| tod_store::fleet::repos::files_location::FilesLocationRepo::new(conn).get(node_id))
-        .ok()
-        .flatten()
-        .and_then(|location| location.sandbox)
+fn existing_sandbox_name(fleet: &FleetStore, bx: &tod_sandbox::blaxel::Blaxel, node_id: &str) -> Result<Option<String>> {
+    let cloud = cloud_node(fleet, node_id).map(|row| row.sandbox);
+    let files = fleet
+        .read(|conn| tod_store::fleet::repos::files_location::FilesLocationRepo::new(conn).get(node_id))?
+        .and_then(|location| location.sandbox);
+    // Both are normally the same sandbox (a Files launch adopts the cloud
+    // one). They differ only after one was lost and replaced: take the one
+    // that can still run, rather than make a second beside it.
+    let usable = |name: &str| -> Result<bool> { Ok(bx.get(name)?.is_some_and(|info| !sandbox_is_dead(&info))) };
+    Ok(match (cloud, files) {
+        (Some(cloud), Some(files)) if cloud != files && !usable(&cloud)? && usable(&files)? => Some(files),
+        (Some(cloud), _) => Some(cloud),
+        (None, files) => files,
+    })
 }
 
 /// Make sure `node_id` has a working sandbox: create it (with the user's
@@ -896,7 +904,7 @@ pub fn ensure_node_sandbox(
     }
 
     let source = node_sandbox_source(fleet, &sandboxes, &bx, node_id)?;
-    let name = existing_sandbox_name(fleet, node_id).unwrap_or_else(|| node_sandbox_name(&task.slug));
+    let name = existing_sandbox_name(fleet, &bx, node_id)?.unwrap_or_else(|| node_sandbox_name(&task.slug));
     let agent = cloud_agent();
     let spec = node::NodeSandboxSpec {
         name: &name,

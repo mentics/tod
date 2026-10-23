@@ -29,6 +29,7 @@
 pub mod answers;
 pub mod cli;
 pub mod flags;
+pub mod github_gate;
 pub mod http;
 pub mod impact_handler;
 pub mod notify;
@@ -94,6 +95,7 @@ impl Server {
         let users = Arc::new(Users::new(config.base.clone()));
         let wakes = wakes::Wakes::load(&config.base, poker)?;
         wakes.set_lost_handler(impact_handler::lost_handler(users.clone()));
+        wakes.set_gate(Box::new(github_gate::GithubGate::new(users.clone())));
         let notifier = notify::Notifier::start(Box::new(notify::StoreProbe(users.clone())), sink);
         let webhook_secrets = webhooks::Secrets::load(&config.base)?;
         Ok(Arc::new(Self { config, users, wakes, notifier, webhook_secrets }))

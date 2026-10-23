@@ -64,6 +64,10 @@ pub struct TaskItem {
     pub has_copies: bool,
     /// True when the node's ticket is done or canceled (shown struck through).
     pub ticket_terminal: bool,
+    /// The node's linked pull requests whose state is known. The row's own
+    /// cell, apart from the status icon, shows the earliest of them
+    /// ([`TaskItem::earliest_pr_state`]); its hover text lists each.
+    pub pull_requests: Vec<PrMark>,
     /// Pending decisions waiting on the user for this node (fed by the
     /// host via `TaskListView::set_attention`; zero until it calls in).
     pub needs_you_count: usize,
@@ -95,6 +99,28 @@ pub struct TaskItem {
     /// Set on a fake header row (not a node, never selectable): the
     /// lifecycle state whose children follow it.
     pub group_header: Option<String>,
+}
+
+/// One linked pull request and the state last read for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrMark {
+    /// `owner/repo#number`.
+    pub label: String,
+    pub state: tod_store::github::PullState,
+}
+
+impl TaskItem {
+    /// The earliest state among the node's pull requests (draft, then open,
+    /// merged, closed): the one that says whether any still needs attention.
+    pub fn earliest_pr_state(&self) -> Option<tod_store::github::PullState> {
+        use tod_store::github::PullState;
+        self.pull_requests.iter().map(|pr| pr.state).min_by_key(|state| match state {
+            PullState::Draft => 0,
+            PullState::Open => 1,
+            PullState::Merged => 2,
+            PullState::Closed => 3,
+        })
+    }
 }
 
 impl TaskItem {
@@ -279,17 +305,18 @@ pub fn lifecycle_rank(lifecycle: &str) -> usize {
         "verifying" => 5,
         "review" => 6,
         "pr" => 7,
-        "approved" => 8,
-        "merged" => 9,
-        "released" => 10,
-        "learn" => 11,
-        "done" => 12,
+        "pr_review" => 8,
+        "approved" => 9,
+        "merged" => 10,
+        "released" => 11,
+        "learn" => 12,
+        "done" => 13,
         _ => 99,
     }
 }
 
 /// Ordered lifecycle states, indexed by `lifecycle_rank`.
-pub const LIFECYCLE_STATES: [&str; 13] = [
+pub const LIFECYCLE_STATES: [&str; 14] = [
     "proposed",
     "design",
     "planning",
@@ -298,6 +325,7 @@ pub const LIFECYCLE_STATES: [&str; 13] = [
     "verifying",
     "review",
     "pr",
+    "pr_review",
     "approved",
     "merged",
     "released",
@@ -325,9 +353,9 @@ pub fn previous_lifecycle(lifecycle: &str) -> Option<&'static str> {
 /// Whether `lifecycle` has a state agent at all (see `assets/process/agents/state/base.md`:
 /// "States `ready` and `done` have no agent"). Gates whether an on-entry or
 /// gate-check turn should ever be fired for it. `approved` is also agent-less:
-/// it is a thin holding state between the PR becoming mergeable (the `pr`
-/// state's job) and the user clicking merge — both its gates are app-checked
-/// against GitHub, not agent-decided.
+/// it is a thin holding state between the PR becoming mergeable (the
+/// `pr_review` state's job) and the user clicking merge — both its gates are
+/// app-checked against GitHub, not agent-decided.
 pub fn state_has_agent(lifecycle: &str) -> bool {
     !matches!(lifecycle, "ready" | "done" | "approved")
 }
@@ -733,6 +761,7 @@ fn group_header_row(parent: &TaskItem, state: &str, depth: usize) -> TaskItem {
     header.linked_copy = false;
     header.has_copies = false;
     header.ticket_terminal = false;
+    header.pull_requests.clear();
     header.needs_you_count = 0;
     header.waiting_since = None;
     header.status_override = None;
@@ -897,6 +926,7 @@ mod tests {
             linked_copy: false,
             has_copies: false,
             ticket_terminal: false,
+            pull_requests: Vec::new(),
             metadata: None,
             generator_sort: None,
             needs_you_count: 0,

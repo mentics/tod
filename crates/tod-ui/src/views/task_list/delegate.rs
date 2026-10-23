@@ -847,6 +847,7 @@ impl ListDelegate for TaskListDelegate {
                 self.standings.get(&item.id),
                 item.incoming_count > 0,
             ))
+            .child(pr_icon_cell(&item.id, &item))
             .child(title_line)
             .when_some(menu_at, |el, (at, menu)| el.child(popup_at(at, menu)));
 
@@ -921,6 +922,70 @@ fn status_icon_cell(
         );
     }
     cell
+}
+
+/// One line per linked pull request: which one, and where it stands.
+fn pr_lines(prs: &[super::model::PrMark]) -> Vec<String> {
+    use tod_store::github::PullState;
+    prs.iter()
+        .map(|pr| {
+            let state = match pr.state {
+                PullState::Draft => "draft",
+                PullState::Open => "open, ready for review",
+                PullState::Merged => "merged",
+                PullState::Closed => "closed without merging",
+            };
+            format!("{}: {state}", pr.label)
+        })
+        .collect()
+}
+
+/// Hover text of one line per entry; no hover when there are none.
+fn hover_lines(cell: gpui::Div, id: String, lines: Vec<String>) -> gpui::Stateful<gpui::Div> {
+    let cell = cell.id(SharedString::from(id));
+    if lines.is_empty() {
+        return cell;
+    }
+    let text = SharedString::from(lines.join("\n"));
+    cell.tooltip(move |window, cx| {
+        gpui_component::tooltip::Tooltip::new(text.clone()).build(window, cx)
+    })
+}
+
+/// `styles.node-pr`: the cell right of the status icon for the node's pull
+/// request (its earliest state). Always reserved, so titles stay aligned whether or not a row
+/// has one.
+fn pr_icon_cell(id: &str, item: &TaskItem) -> gpui::Stateful<gpui::Div> {
+    use gpui_kit_assets::IconName;
+    use tod_store::github::PullState;
+    let cell = hover_lines(
+        div().w(px(16.0)).flex_shrink_0().flex().items_center(),
+        format!("row-pr-{id}"),
+        pr_lines(&item.pull_requests),
+    );
+    match item.earliest_pr_state() {
+        Some(PullState::Draft) => cell.child(
+            gpui_component::Icon::new(IconName::GitPullRequestDraft)
+                .xsmall()
+                .text_color(crate::ui::style::color::node_pr_draft_text()),
+        ),
+        Some(PullState::Open) => cell.child(
+            gpui_component::Icon::new(IconName::GitPullRequest)
+                .xsmall()
+                .text_color(crate::ui::style::color::node_pr_open_text()),
+        ),
+        Some(PullState::Merged) => cell.child(
+            gpui_component::Icon::new(IconName::GitMerge)
+                .xsmall()
+                .text_color(crate::ui::style::color::node_pr_merged_text()),
+        ),
+        Some(PullState::Closed) => cell.child(
+            gpui_component::Icon::new(IconName::GitPullRequestClosed)
+                .xsmall()
+                .text_color(crate::ui::style::color::node_pr_closed_text()),
+        ),
+        None => cell,
+    }
 }
 
 fn tone_color(tone: Tone) -> gpui::Hsla {
@@ -1254,4 +1319,25 @@ fn tag_chip(
                     Tag::secondary().small().outline().child(tag)
                 }),
         )
+}
+
+#[cfg(test)]
+mod hover_tests {
+    use super::*;
+    use crate::views::task_list::model::PrMark;
+    use tod_store::github::PullState;
+
+    // What the status glyph's hover says is `standing::tooltip_lines`'s,
+    // tested there.
+    #[test]
+    fn pr_hover_names_each_pull_request_and_its_state() {
+        let prs = [
+            PrMark { label: "acme/widgets#1".into(), state: PullState::Draft },
+            PrMark { label: "acme/widgets#3".into(), state: PullState::Merged },
+        ];
+        assert_eq!(
+            pr_lines(&prs),
+            ["acme/widgets#1: draft", "acme/widgets#3: merged"]
+        );
+    }
 }

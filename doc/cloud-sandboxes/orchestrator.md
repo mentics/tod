@@ -210,7 +210,8 @@ Read it from that file on the orchestrator sandbox, then:
 - GitHub (repository or organization → Settings → Webhooks): payload URL
   `<preview-url>/webhooks/github`, content type `application/json`, that
   secret; events: pull requests, pull request reviews and review comments,
-  issue comments, check suites, check runs, workflow runs, pushes.
+  issue comments, check suites, check runs, workflow runs, pushes, and
+  releases (a `merged` node waits on `github:release:published`).
 - Linear (Settings → API → Webhooks): URL `<preview-url>/webhooks/linear`;
   Linear makes the signing secret, so put it in `linear` in `webhooks.json`
   (or the env var) and restart.
@@ -228,6 +229,7 @@ constant time, is refused with 401 before its body is parsed.
 | `issue_comment` | `github:pr:<n>:comment` or `github:issue:<n>:comment` |
 | `check_suite`, `check_run`, `workflow_run` (only `completed`) | `github:pr:<n>:checks:<conclusion>` per PR, `github:branch:<b>:checks:<conclusion>` |
 | `push` | `github:branch:<b>:push` |
+| `release` (`published`, not a draft) | `github:release:published` (routed by wait, and by the release notes: see Routing) |
 | other GitHub events | `github:<event>:<action>` (routed by wait only) |
 | Linear | `linear:<type>:<identifier>:<action>` and `linear:<type>:<id>:<action>` (e.g. `linear:issue:ENG-12:update`) |
 
@@ -249,6 +251,15 @@ event wait that matches. For each node:
 4. Its sandbox is poked (a failed poke is retried by the wake timer), and
    the user's change notice is sent.
 
+**By wait, a node with linked pull requests hears only its own.** A PR number
+or a release names no repository, so when the delivery names one
+(`repository.full_name`) and the node has linked pull requests
+(`node_fields.linked_prs`), a pull request event must be about one of them (same
+repository and number), and a release must name one of them in its notes,
+read as the node's own check reads them (`tod_core::release_watch`, with the
+title and time of the merge event the node was sent, else by number or link).
+A node with no linked pull requests takes any event whose key matches.
+
 A wait scheduled with Blaxel (`BlaxelScheduler`) keeps its schedule (its
 process is named `wait-<id>`) here: the orchestrator has no Blaxel
 credentials for the user's sandboxes. The poke wakes the supervisor, which
@@ -263,6 +274,22 @@ review` wait satisfied (and synced to the app), the node's supervisor started
 within 1.5 s, found only its timed wait left, and slept again. The same body
 unsigned, with a wrong signature, or altered after signing got 401 and
 routed nothing.
+
+**Waiting on GitHub: the deadline (`github_gate.rs`).** A GitHub event wait's
+deadline is the next scheduled look, for a webhook that was lost. With
+`scheduler = "orchestrator"`, a due wake whose id is a pending `github:` event
+wait passes a gate before its sandbox is poked: the orchestrator runs the
+node's own check (`tod_core::autopilot::check_github`) against the user's
+copy of the database. Still waiting, it has recorded the next look and the wake
+moves to it (under the new wait's id), with the sandbox left asleep, or gone.
+Clear, it pokes and the node goes on. If GitHub cannot be read from here (no
+access configured, a failed read) it says why on stderr and pokes, so the
+sandbox's own check, with the user's token, decides. Wakes from webhooks,
+answers, and every other wait are not gated. The orchestrator reads GitHub
+with `TOD_GITHUB_AUTH=proxy` and a proxy rule for `api.github.com` on its own
+sandbox (a read-only fine-grained token: Pull requests: read, Contents: read),
+so the token is never on its disk. With `scheduler = "blaxel"` the node's own
+schedule fires on its sandbox and the gate is not in the path.
 
 Deliveries are not deduplicated (`X-GitHub-Delivery` is ignored); a repeat
 records the event again and pokes again, which is harmless. Webhooks can be
