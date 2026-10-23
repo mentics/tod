@@ -63,6 +63,10 @@ pub struct TranscriptPanel {
     /// whichever of the node's conversations is running, and shows the turn
     /// in flight as it streams.
     watching: Option<Watching>,
+    /// What the cloud says of the node being watched, when it runs there:
+    /// the transcript is only what its supervisor has synced so far, so the
+    /// panel says whether anything is running and when it was last heard.
+    cloud: Option<tod_core::cloud_sync::CloudStatus>,
     /// The stored turns, as entries. Shared so a load can compare against
     /// them off the UI thread.
     stored: Arc<Vec<Entry>>,
@@ -117,6 +121,7 @@ impl TranscriptPanel {
             _subscription,
             _follow: gpui::Task::ready(()),
             watching: None,
+            cloud: None,
             stored: Arc::new(Vec::new()),
             stored_dirty: false,
             loaded: false,
@@ -138,7 +143,16 @@ impl TranscriptPanel {
                 while fleet_rx.try_recv().is_ok() {
                     changed = true;
                 }
-                if changed && this.update(cx, |this, cx| this.reload(cx)).is_err() {
+                if changed
+                    && this
+                        .update(cx, |this, cx| {
+                            this.reload(cx);
+                            // A watched node's cloud supervisor starts new
+                            // conversations that arrive through the store.
+                            this.sync_watch(cx);
+                        })
+                        .is_err()
+                {
                     break;
                 }
             }
@@ -206,8 +220,12 @@ impl TranscriptPanel {
                 .await;
             this.update(cx, |this, cx| {
                 this.searching = false;
-                if this.conversation_id.is_nil()
-                    && let Some(id) = latest
+                // Watching a node with nothing running here (a cloud node's
+                // work arrives through the store): follow its newest
+                // conversation, not the first one found.
+                if let Some(id) = latest
+                    && id != this.conversation_id
+                    && (this.conversation_id.is_nil() || this.watching.is_some())
                 {
                     this.retarget(id, cx);
                 }
@@ -243,15 +261,15 @@ impl TranscriptPanel {
         };
         let (target, live) = match running {
             Some((conversation, parts)) => (Some(conversation), parts),
-            None if self.conversation_id.is_nil() => {
+            None => {
                 self.find_latest(node, cx);
                 (None, Vec::new())
             }
-            None => (None, Vec::new()),
         };
         if let Some(watching) = &mut self.watching {
             watching.live = live;
         }
+        self.cloud = tod_core::cloud_sync::cloud_status(&self.fleet, node, tod_store::outline::uuid_blob::now_ms());
         match target {
             Some(id) if id != self.conversation_id => self.retarget(id, cx),
             _ => self.show(cx),
@@ -375,6 +393,53 @@ impl Focusable for TranscriptPanel {
     }
 }
 
+impl TranscriptPanel {
+    /// One line above the turns for a node that runs in the cloud: whether
+    /// its supervisor is working, and when it was last heard, so a stale
+    /// transcript is not mistaken for a quiet node. Times are clock times,
+    /// not ages: the line only changes when the store does.
+    fn render_cloud_status(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        use tod_core::cloud_sync::CloudStatus;
+        let at = |ms: i64| {
+            chrono::DateTime::from_timestamp_millis(ms)
+                .map(|t| t.with_timezone(&chrono::Local).format("%H:%M:%S").to_string())
+                .unwrap_or_default()
+        };
+        let (text, error) = match self.cloud.as_ref()? {
+            CloudStatus::Working { heard_at, what } => (
+                format!(
+                    "Working in the cloud{} (supervisor last heard {}). This shows what it has synced so far; \
+                     the agent's output is not streamed live from the cloud.",
+                    if what.is_empty() { String::new() } else { format!(" while {what}") },
+                    at(*heard_at)
+                ),
+                false,
+            ),
+            CloudStatus::Silent { heard_at, .. } => (
+                format!(
+                    "The cloud supervisor has not reported since {}: it stopped, or its news has not reached \
+                     this app. Sync now looks again.",
+                    at(*heard_at)
+                ),
+                true,
+            ),
+            CloudStatus::Idle => (
+                "Nothing is running in the cloud for this node right now (it is waiting, finished, or not \
+                 started). This is what it last synced."
+                    .to_string(),
+                false,
+            ),
+            CloudStatus::Lost => ("Its cloud sandbox is gone; the app makes a new one at its next sync.".to_string(), true),
+        };
+        let el = div().flex_none().px_2().py_1();
+        let el = if error { crate::ui::style::text_error(el) } else { crate::ui::style::text_muted(el) };
+        Some(
+            el.child(crate::ui::selectable_text::selectable_text("transcript-cloud-status", text, window, cx))
+                .into_any_element(),
+        )
+    }
+}
+
 impl Render for TranscriptPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let focused = self.focus_handle.contains_focused(window, cx);
@@ -383,7 +448,10 @@ impl Render for TranscriptPanel {
             .size_full()
             .key_context(TRANSCRIPT_PANEL_CONTEXT)
             .track_focus(&self.focus_handle)
-            .child(self.panel.clone())
+            .flex()
+            .flex_col()
+            .children(self.render_cloud_status(window, cx))
+            .child(div().flex_auto().min_h_0().child(self.panel.clone()))
     }
 }
 
@@ -399,6 +467,10 @@ mod tests {
     use tod_store::interview::{ACTOR_USER, InterviewCommand};
 
     fn add_conversation(fixture: &Fixture) -> Uuid {
+        add_conversation_under(fixture, ProtocolKind::Outline)
+    }
+
+    fn add_conversation_under(fixture: &Fixture, protocol: ProtocolKind) -> Uuid {
         let id = Uuid::new_v4();
         fixture
             .store
@@ -406,7 +478,7 @@ mod tests {
                 ACTOR_USER,
                 InterviewCommand::CreateConversation {
                     id,
-                    protocol: ProtocolKind::Outline,
+                    protocol,
                     focus: Focus::Node(fixture.node_id),
                     platform: None,
                     model: None,
@@ -486,6 +558,45 @@ mod tests {
             assert_eq!(view.conversation_id(), conversation_id);
             assert_eq!(view.panel.read(cx).entries().len(), 2);
         });
+    }
+
+    /// A cloud node's conversations are made by its supervisor and arrive
+    /// through the store, with nothing running here: the watch must move to
+    /// each newer one, not stay on the first it found.
+    #[gpui::test]
+    fn watching_a_node_with_nothing_running_here_follows_its_newest_conversation(cx: &mut TestAppContext) {
+        use crate::interview::agent::SharedAgent;
+        use std::sync::{Arc, Mutex};
+
+        let fixture = Fixture::new();
+        let first = add_conversation_under(&fixture, ProtocolKind::Phase);
+        cx.update(gpui_component::init);
+        let agent: SharedAgent = Arc::new(Mutex::new(Box::new(
+            crate::interview::agent::MockAgentProvider::new(),
+        )));
+        let runs = cx.new(|_| AgentRuns::new(fixture.store.clone(), agent));
+        let (store, node, runs_in) = (fixture.store.clone(), fixture.node_id, runs.clone());
+        let slot = std::rc::Rc::new(RefCell::new(None));
+        let slot_in = slot.clone();
+        let (_, cx) = cx.add_window_view(move |window, cx| {
+            let view = cx.new(|cx| TranscriptPanel::watching(node, store, runs_in, window, cx));
+            *slot_in.borrow_mut() = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let view = slot.borrow_mut().take().unwrap();
+        settle(cx);
+        view.read_with(cx, |view, _| assert_eq!(view.conversation_id(), first));
+
+        // The supervisor's next conversation syncs in.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let second = add_conversation_under(&fixture, ProtocolKind::Implementation);
+        for _ in 0..6 {
+            // The store announces a commit from a thread of its own.
+            std::thread::sleep(std::time::Duration::from_millis(60));
+            cx.executor().advance_clock(std::time::Duration::from_millis(250));
+            cx.run_until_parked();
+        }
+        view.read_with(cx, |view, _| assert_eq!(view.conversation_id(), second));
     }
 
     #[gpui::test]

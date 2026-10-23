@@ -39,6 +39,9 @@ pub const KIND_CHAT: &str = "chat";
 /// The autopilot's own run: deciding the next step, checking a gate, and the
 /// agent turns it drives, from the first boundary until it ends or waits.
 pub const KIND_RUN: &str = "run";
+/// The app sending a node to the cloud on the user's behalf: from the click
+/// until its supervisor is heard from (`tod_core::cloud_sync`).
+pub const KIND_CLOUD_START: &str = "cloud_start";
 pub const KIND_GATE_CHECK: &str = "gate_check";
 pub const KIND_INCOMING_CHECK: &str = "incoming_check";
 /// A conversation turn under a protocol: `protocol:<ProtocolKind::as_str>`.

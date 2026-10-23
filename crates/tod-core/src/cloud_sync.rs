@@ -141,6 +141,69 @@ pub fn cloud_node(fleet: &FleetStore, node_id: &str) -> Option<CloudNode> {
     fleet.read(|conn| tod_store::cloud_nodes::get(conn, node)).ok()?.map(CloudNode::from)
 }
 
+/// What the app knows of a cloud node's supervisor, for the places that show
+/// a cloud node's transcript or status.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CloudStatus {
+    /// The supervisor said it was working at `heard_at` (ms), while `what`.
+    Working { heard_at: i64, what: String },
+    /// It said so once and has not since: its sandbox or process died
+    /// mid-run, or the news has not reached this app.
+    Silent { heard_at: i64, what: String },
+    /// Nothing is running in the cloud for it (no heartbeat): it finished,
+    /// is waiting, or has not started.
+    Idle,
+    /// Its sandbox is gone; the app replaces it at the next sync.
+    Lost,
+}
+
+impl CloudStatus {
+    /// One sentence for what a sync found out about the node, with clock
+    /// times (not ages) so it does not go stale on screen.
+    pub fn describe(&self) -> String {
+        let at = |ms: i64| {
+            chrono::DateTime::from_timestamp_millis(ms)
+                .map(|t| t.with_timezone(&chrono::Local).format("%H:%M:%S").to_string())
+                .unwrap_or_default()
+        };
+        let doing = |what: &str| if what.is_empty() { String::new() } else { format!(" while {what}") };
+        match self {
+            Self::Working { heard_at, what } => {
+                format!("Its supervisor is working{} (last heard {}).", doing(what), at(*heard_at))
+            }
+            Self::Silent { heard_at, what } => format!(
+                "Its supervisor has not been heard from since {}{}: it stopped, or its news has not arrived.",
+                at(*heard_at),
+                doing(what)
+            ),
+            Self::Idle => "Nothing is running in the cloud for it now.".to_string(),
+            Self::Lost => "Its sandbox is gone; a new one is made at the next sync.".to_string(),
+        }
+    }
+}
+
+/// A cloud node's [`CloudStatus`]; `None` for a node that does not run in
+/// the cloud. Reads the store's own connection: fine on the UI thread.
+pub fn cloud_status(fleet: &FleetStore, node_id: uuid::Uuid, now_ms: i64) -> Option<CloudStatus> {
+    let (row, beat) = fleet
+        .read(|conn| {
+            Ok((
+                tod_store::cloud_nodes::get(conn, node_id)?,
+                tod_store::cloud_activity::get(conn, node_id)?,
+            ))
+        })
+        .ok()?;
+    let row = row?;
+    if row.lost_at.is_some() {
+        return Some(CloudStatus::Lost);
+    }
+    Some(match beat {
+        Some(b) if b.is_live(now_ms) => CloudStatus::Working { heard_at: b.heartbeat_at, what: b.what },
+        Some(b) => CloudStatus::Silent { heard_at: b.heartbeat_at, what: b.what },
+        None => CloudStatus::Idle,
+    })
+}
+
 /// A node whose supervisor is working in the cloud now.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CloudWork {
@@ -206,8 +269,32 @@ fn blocks_cloud_work(actor: &crate::next_actor::NextActor) -> bool {
 /// "Sync now" and [`run_in_cloud`] from overlapping one.
 static SYNC_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-pub(crate) fn sync_lock() -> std::sync::MutexGuard<'static, ()> {
-    SYNC_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+/// The lock file beside [`STATE_FILE`] that keeps two *processes* from
+/// syncing at once: the app and `tod-agentd` both sync one data root (the
+/// daemon in the background, the app on the user's click and while it waits
+/// for a node's supervisor), and both read and write the cursors in
+/// [`STATE_FILE`].
+pub const LOCK_FILE: &str = "cloud-sync.lock";
+
+/// [`SYNC_LOCK`] and the lock on [`LOCK_FILE`], released together.
+pub(crate) struct SyncGuard {
+    _process: std::sync::MutexGuard<'static, ()>,
+    _file: std::fs::File,
+}
+
+/// Waits for any sync of `root`, in this process or another, to finish, and
+/// holds the right to sync.
+pub(crate) fn sync_lock(root: &Path) -> Result<SyncGuard> {
+    let process = SYNC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let path = root.join(LOCK_FILE);
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .with_context(|| format!("open {}", path.display()))?;
+    fs2::FileExt::lock_exclusive(&file).with_context(|| format!("lock {}", path.display()))?;
+    Ok(SyncGuard { _process: process, _file: file })
 }
 
 /// A user name the orchestrator accepts: letters, digits, `-`, `_`, `.`,
@@ -423,6 +510,10 @@ pub struct SyncReport {
     /// Rows both sides changed (the app's version won going up; the
     /// orchestrator's coming down).
     pub conflicts: usize,
+    /// The nodes the feed changed something of (other than the record of
+    /// where they run, which the orchestrator also marks): proof that a
+    /// node's supervisor, or the orchestrator for it, has been heard from.
+    pub heard_from: std::collections::BTreeSet<uuid::Uuid>,
 }
 
 impl SyncReport {
@@ -447,7 +538,7 @@ fn connect(db: &Path) -> Result<rusqlite::Connection> {
 /// Seed if not seeded, send the outbox, pull and apply the feed; saves the
 /// cursors after each step, so a failure part way loses nothing.
 pub fn sync(fleet: &FleetStore, root: &Path, orch: &dyn Orchestrator, user: &str) -> Result<SyncReport> {
-    let _guard = sync_lock();
+    let _guard = sync_lock(root)?;
     let mut state = CloudSyncState::load(root)?;
     let mut report = SyncReport::default();
     let _ = fleet.flush_on_quit();
@@ -487,6 +578,11 @@ pub fn sync(fleet: &FleetStore, root: &Path, orch: &dyn Orchestrator, user: &str
         let applied = sync::apply_changes(&mut conn, &feed)?;
         drop(conn);
         report.received = feed.len();
+        report.heard_from = feed
+            .iter()
+            .filter(|c| c.table != tod_store::cloud_nodes::TABLE)
+            .filter_map(|c| c.node_id)
+            .collect();
         report.conflicts += applied.conflicts.len();
         let _ = fleet.reload_if_stale();
     }
@@ -1146,6 +1242,17 @@ pub fn run_in_cloud(
     node_id: &str,
     progress: &mut dyn FnMut(&str),
 ) -> Result<CloudNode> {
+    run_in_cloud_reporting(fleet, root, node_id, progress).map(|(record, _)| record)
+}
+
+/// [`run_in_cloud`], and what the final sync heard of the node: its
+/// supervisor may already be at work by then.
+fn run_in_cloud_reporting(
+    fleet: &FleetStore,
+    root: &Path,
+    node_id: &str,
+    progress: &mut dyn FnMut(&str),
+) -> Result<(CloudNode, SyncReport)> {
     // Fails early, before any network call, on a node with no repository or
     // no Claude token to run it with.
     node_source(fleet, node_id)?;
@@ -1155,10 +1262,105 @@ pub fn run_in_cloud(
     sync(fleet, root, &orch, &user)?;
     let name = ensure_node_sandbox(fleet, root, node_id, &user, progress)?;
     let record = record_cloud_node(fleet, node_id, name, &user)?;
-    if let Err(err) = sync(fleet, root, &orch, &user) {
-        progress(&format!("warning: could not send the record to the orchestrator yet: {err:#}"));
+    let heard = match sync(fleet, root, &orch, &user) {
+        Ok(report) => report,
+        Err(err) => {
+            progress(&format!("warning: could not send the record to the orchestrator yet: {err:#}"));
+            SyncReport::default()
+        }
+    };
+    Ok((record, heard))
+}
+
+/// How long after sending a node to the cloud its supervisor has to report
+/// in (sandbox boot, seeding its copy, starting the autopilot) before the
+/// user is told it did not.
+pub const SUPERVISOR_REPORTS_WITHIN: Duration = Duration::from_secs(150);
+/// How often the orchestrator is pulled from while waiting for it.
+const REPORT_POLL: Duration = Duration::from_secs(4);
+
+/// What starting a node in the cloud came to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Started {
+    pub node: CloudNode,
+    /// Its supervisor was heard from (a heartbeat, or any change it made)
+    /// within [`SUPERVISOR_REPORTS_WITHIN`].
+    pub heard: bool,
+}
+
+/// Whether the cloud side has told this app anything about `node` since it
+/// was sent: a heartbeat is there now, or `report` carried a change to it.
+fn supervisor_heard(fleet: &FleetStore, node: uuid::Uuid, report: &SyncReport) -> Result<bool> {
+    if report.heard_from.contains(&node) {
+        return Ok(true);
     }
-    Ok(record)
+    fleet.read(|conn| Ok(tod_store::cloud_activity::get(conn, node)?.is_some()))
+}
+
+/// [`run_in_cloud`] as the user's click means it: from the first moment the
+/// node holds an activity lease (`KIND_CLOUD_START`), so it shows as being
+/// worked, not as waiting on the user, while their request is carried out;
+/// and the lease is held until its supervisor has been heard from, so the
+/// node never falls back to "not started" in the gap between the sandbox
+/// being ready and its first heartbeat arriving. Pulls every few seconds
+/// meanwhile. Not hearing from it by [`SUPERVISOR_REPORTS_WITHIN`] is
+/// reported (`heard: false`), never taken for success.
+pub fn start_in_cloud(
+    fleet: &FleetStore,
+    root: &Path,
+    node_id: &str,
+    progress: &mut dyn FnMut(&str),
+) -> Result<Started> {
+    let node: uuid::Uuid = node_id.parse().context("node id")?;
+    let owner = crate::next_actor::this_process();
+    tod_store::activity::with_lease(fleet, node, tod_store::activity::KIND_CLOUD_START, &owner, || {
+        let (record, report) = run_in_cloud_reporting(fleet, root, node_id, progress)?;
+        let heard = wait_for_supervisor(fleet, root, node, report, progress)?;
+        Ok(Started { node: record, heard })
+    })?
+}
+
+/// [`wake_node`] with the same promise as [`start_in_cloud`]: the node shows
+/// as being worked from the click until its supervisor is heard from. The
+/// text is what [`wake_node`] said; the flag is whether it was heard.
+pub fn wake_node_tracked(
+    fleet: &FleetStore,
+    root: &Path,
+    node_id: &str,
+    progress: &mut dyn FnMut(&str),
+) -> Result<(String, bool)> {
+    let node: uuid::Uuid = node_id.parse().context("node id")?;
+    let owner = crate::next_actor::this_process();
+    tod_store::activity::with_lease(fleet, node, tod_store::activity::KIND_CLOUD_START, &owner, || {
+        let said = wake_node(fleet, root, node_id)?;
+        let heard = wait_for_supervisor(fleet, root, node, SyncReport::default(), progress)?;
+        Ok((said, heard))
+    })?
+}
+
+/// Pulls from the orchestrator every [`REPORT_POLL`] until the node's
+/// supervisor is heard from ([`supervisor_heard`], starting with `report`) or
+/// [`SUPERVISOR_REPORTS_WITHIN`] passes.
+fn wait_for_supervisor(
+    fleet: &FleetStore,
+    root: &Path,
+    node: uuid::Uuid,
+    mut report: SyncReport,
+    progress: &mut dyn FnMut(&str),
+) -> Result<bool> {
+    let deadline = std::time::Instant::now() + SUPERVISOR_REPORTS_WITHIN;
+    progress("waiting to hear from the node's supervisor…");
+    loop {
+        if supervisor_heard(fleet, node, &report)? {
+            return Ok(true);
+        }
+        if std::time::Instant::now() >= deadline {
+            return Ok(false);
+        }
+        std::thread::sleep(REPORT_POLL);
+        report = sync_now(fleet, root)
+            .context("the node was sent to the cloud, but looking for its supervisor failed")?;
+    }
 }
 
 /// An orchestrator that rejects rows this app wrote (a constraint or a

@@ -29,6 +29,7 @@
 
 pub mod agent;
 pub mod answers;
+pub mod beat;
 pub mod context;
 pub mod git;
 pub mod guard;
@@ -249,6 +250,8 @@ pub fn wake(config: Config) -> Result<Woke> {
         settings_path: None,
         context: InterviewContextSettings::default(),
     };
+    // From here the autopilot runs: say so to the app, and keep saying it.
+    let beating = beat::Beating::start(replica.clone(), config.node, beat::BEAT_EVERY)?;
     let mut agent = Guarded::new(
         Syncing::new(config.agent.provider(&data_root), replica.clone()),
         config.guards.hang_after,
@@ -320,7 +323,9 @@ pub fn wake(config: Config) -> Result<Woke> {
             replica.lock().unwrap_or_else(|e| e.into_inner()).push()?;
         });
 
-    // Whatever happened, leave the orchestrator and the branch with it.
+    // Whatever happened, leave the orchestrator and the branch with it. The
+    // heartbeat ends first, so that the push below carries the run's end.
+    let ended = beating.finish();
     let pushed = replica.lock().unwrap_or_else(|e| e.into_inner()).push();
     if config.push_branch
         && let Err(err) = git::push_branch(&config.workspace)
@@ -332,6 +337,7 @@ pub fn wake(config: Config) -> Result<Woke> {
     }
     let outcome = run?;
     pushed?;
+    ended?;
     tracing::info!(?outcome, "autopilot stopped");
     if matches!(outcome, Outcome::Stopped { .. } | Outcome::Waiting { .. }) {
         schedule(&store, &config)?;

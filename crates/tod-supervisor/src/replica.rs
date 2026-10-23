@@ -211,6 +211,27 @@ impl Replica {
         Ok(n)
     }
 
+    /// Says the supervisor is working on `node` (`tod_store::cloud_activity`)
+    /// and sends it now, so the app hears without waiting for the next
+    /// boundary.
+    pub fn cloud_beat(&mut self, node: Uuid) -> Result<()> {
+        let what = self.store.get_node(&node.to_string())?.map(|n| n.lifecycle).unwrap_or_default();
+        let conn = connect(&self.db())?;
+        tod_store::cloud_activity::beat(&conn, node, &what, tod_store::outline::uuid_blob::now_ms())?;
+        drop(conn);
+        self.push()?;
+        Ok(())
+    }
+
+    /// The run is over: removes the row and sends that.
+    pub fn end_cloud_beat(&mut self, node: Uuid) -> Result<()> {
+        let conn = connect(&self.db())?;
+        tod_store::cloud_activity::end(&conn, node)?;
+        drop(conn);
+        self.push()?;
+        Ok(())
+    }
+
     /// The node that owns the Files capability this node resolves to.
     fn files_source(&self, conn: &Connection) -> Result<Option<Uuid>> {
         Ok(tod_store::fleet::node_actions::resolve_files_for_node(conn, &self.node.to_string())?

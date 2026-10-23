@@ -85,24 +85,49 @@ pub fn run_in_cloud<T: 'static>(
             cloud_sync::log_progress(&format!("running {node_id}"), msg);
             let _ = tx.send_blocking(CloudUpdate::Progress(msg.to_string()));
         };
-        let result = cloud_sync::run_in_cloud(&fleet, &root, &node_id, &mut progress);
+        let result = cloud_sync::start_in_cloud(&fleet, &root, &node_id, &mut progress);
         let _ = tx.send_blocking(match result {
-            Ok(node) => CloudUpdate::Accepted(node),
+            Ok(started) if started.heard => CloudUpdate::Accepted(started.node),
+            Ok(started) => {
+                // Accepted, but nothing has come back: said, not left to look
+                // like it is working.
+                let _ = tx.send_blocking(CloudUpdate::Accepted(started.node));
+                CloudUpdate::failed(format!(
+                    "The cloud accepted the node, but its supervisor has not reported in after {} seconds.\n\
+                     Sync now looks again. If it stays silent, check the log panel for the cloud's problems, \
+                     or use Reinstall and restart.",
+                    cloud_sync::SUPERVISOR_REPORTS_WITHIN.as_secs()
+                ))
+            }
             Err(err) => CloudUpdate::failed(describe("Run in the cloud failed", &err)),
         });
     });
 }
 
 /// Sync with the orchestrator off the UI thread.
+///
+/// With `node`, the result also says what the sync now shows of that node's
+/// supervisor, so the click answers "is it working?", not only "did it sync?".
 pub fn sync_now<T: 'static>(
     fleet: Arc<FleetStore>,
+    node: Option<uuid::Uuid>,
     cx: &mut Context<T>,
     on_update: impl Fn(&mut T, CloudUpdate, &mut Context<T>) + 'static,
 ) {
     spawn(cx, on_update, move |tx| {
         let root = fleet.paths().root().to_path_buf();
         let _ = tx.send_blocking(match cloud_sync::sync_now(&fleet, &root) {
-            Ok(report) => CloudUpdate::Synced(report.summary()),
+            Ok(report) => {
+                let mut msg = report.summary();
+                if let Some(node) = node
+                    && let Some(status) =
+                        cloud_sync::cloud_status(&fleet, node, tod_store::outline::uuid_blob::now_ms())
+                {
+                    msg.push_str(". ");
+                    msg.push_str(&status.describe());
+                }
+                CloudUpdate::Synced(msg)
+            }
             Err(err) => CloudUpdate::failed(describe("Sync failed", &err)),
         });
     });

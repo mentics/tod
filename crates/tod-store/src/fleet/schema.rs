@@ -559,6 +559,9 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
     crate::cloud_nodes::add_lost_at(conn)?;
     crate::waits::add_detail(conn)?;
     crate::waits::add_retry(conn)?;
+    // A cloud supervisor's heartbeat for a node (`crate::cloud_activity`):
+    // synced, and not journaled (high-frequency bookkeeping).
+    conn.execute_batch(crate::cloud_activity::CREATE_TABLE)?;
     // Machine-local lease bookkeeping: no sync, no journey trigger
     // (`crate::activity`).
     conn.execute_batch(crate::activity::CREATE_TABLE)?;

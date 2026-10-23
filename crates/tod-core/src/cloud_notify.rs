@@ -200,7 +200,7 @@ fn topics(root: &Path) -> Result<NotifyTopics> {
     let topics: NotifyTopics = serde_json::from_value(orch.get_json(&user, "notify")?)?;
     // A sync holds this lock from loading the state to saving it; without
     // it, one already running would save its older copy over `notify`.
-    let _guard = cloud_sync::sync_lock();
+    let _guard = cloud_sync::sync_lock(root)?;
     let mut state = CloudSyncState::load(root)?;
     state.notify = Some(topics.clone());
     state.save(root)?;

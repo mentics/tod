@@ -902,7 +902,7 @@ impl TaskPanel {
             }
             A::SyncCloud => {
                 self.cloud_started(cx);
-                crate::views::cloud_node::sync_now(self.fleet.clone(), cx, move |this, update, cx| {
+                crate::views::cloud_node::sync_now(self.fleet.clone(), Some(node), cx, move |this, update, cx| {
                     this.on_cloud_update(node, update, cx)
                 });
             }
@@ -949,9 +949,9 @@ impl TaskPanel {
                 .spawn(async move {
                     let found = tod_core::autopilot::check_now(&fleet, node, &root)?;
                     let woke = match (&found, in_cloud) {
-                        (tod_core::autopilot::GithubCheck::Clear, true) => {
-                            Some(tod_core::cloud_sync::wake_node(&fleet, &root, &node.to_string()))
-                        }
+                        (tod_core::autopilot::GithubCheck::Clear, true) => Some(
+                            tod_core::cloud_sync::wake_node_tracked(&fleet, &root, &node.to_string(), &mut |_| {}),
+                        ),
                         _ => None,
                     };
                     anyhow::Ok((found, woke))
@@ -961,9 +961,17 @@ impl TaskPanel {
                 use tod_core::autopilot::GithubCheck;
                 let (note, failed) = match result {
                     Ok((GithubCheck::Waiting { what, .. }, _)) => (format!("Checked GitHub: waiting for {what}"), false),
-                    Ok((GithubCheck::Clear, Some(Ok(done)))) => {
+                    Ok((GithubCheck::Clear, Some(Ok((done, true))))) => {
                         (format!("Checked GitHub: nothing left to wait for; {done}."), false)
                     }
+                    Ok((GithubCheck::Clear, Some(Ok((done, false))))) => (
+                        format!(
+                            "Checked GitHub: nothing left to wait for; {done}, but its supervisor has not reported \
+                             in after {} seconds. Sync now looks again.",
+                            tod_core::cloud_sync::SUPERVISOR_REPORTS_WITHIN.as_secs()
+                        ),
+                        true,
+                    ),
                     Ok((GithubCheck::Clear, Some(Err(err)))) => {
                         (format!("Checked GitHub: nothing left to wait for, but waking the cloud node failed: {err:#}"), true)
                     }

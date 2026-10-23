@@ -127,6 +127,7 @@ pub const SYNCED_TABLES: &[&str] = &[
     "conversation_reports",
     "waits",
     "cloud_nodes",
+    "cloud_activity",
     "node_events",
 ];
 

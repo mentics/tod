@@ -312,6 +312,8 @@ fn work_label(work: &Work) -> String {
         Work::GateCheck => "a gate check".to_string(),
         Work::IncomingCheck => "an incoming-changes check".to_string(),
         Work::Runner => "the autopilot run".to_string(),
+        Work::Cloud => "in the cloud".to_string(),
+        Work::CloudStart => "starting in the cloud".to_string(),
         Work::Other => "background processing".to_string(),
     }
 }

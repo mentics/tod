@@ -28,8 +28,9 @@ use anyhow::Result;
 use rusqlite::Connection;
 use std::collections::HashMap;
 use tod_store::activity::{
-    ActivityRepo, KIND_GATE_CHECK, KIND_INCOMING_CHECK, KIND_PROTOCOL_PREFIX, KIND_RUN, Lease,
+    ActivityRepo, KIND_CLOUD_START, KIND_GATE_CHECK, KIND_INCOMING_CHECK, KIND_PROTOCOL_PREFIX, KIND_RUN, Lease,
 };
+use tod_store::cloud_activity::CloudBeat;
 use tod_store::conversation::ProtocolKind;
 use tod_store::deferrals::DeferralRepo;
 use tod_store::outline::repos::NodeRepo;
@@ -67,6 +68,14 @@ pub enum Work {
     /// The node's autopilot run: deciding, checking gates, and the turns it
     /// drives.
     Runner,
+    /// The node's supervisor, in its cloud sandbox, is running the autopilot:
+    /// proved by its synced heartbeat (`tod_store::cloud_activity`).
+    Cloud,
+    /// The app is sending the node to the cloud (making or waking its
+    /// sandbox, syncing) for the user, and waiting to hear its supervisor
+    /// begin. Set the moment the user clicks, so the node never reads as
+    /// waiting on them while their own request is being carried out.
+    CloudStart,
     /// Processing whose lease kind this version does not know. Still work:
     /// the lease proves it, so it is shown rather than dropped.
     Other,
@@ -80,6 +89,7 @@ impl Work {
         }
         match kind {
             KIND_RUN => Self::Runner,
+            KIND_CLOUD_START => Self::CloudStart,
             KIND_GATE_CHECK => Self::GateCheck,
             KIND_INCOMING_CHECK => Self::IncomingCheck,
             _ => Self::Other,
@@ -282,6 +292,8 @@ pub struct Facts<'a> {
     /// The node's activity leases (`tod_store::activity`): the only proof
     /// that anything is processing it.
     pub leases: &'a [Lease],
+    /// The node's supervisor's heartbeat from the cloud, when it has one.
+    pub cloud: Option<&'a CloudBeat>,
     pub run: &'a RunFacts,
     pub deferral: Option<Deferral>,
     pub now_ms: i64,
@@ -307,6 +319,10 @@ pub fn for_nodes(
     for lease in ActivityRepo::new(conn).list_for_nodes(node_ids)? {
         leases.entry(lease.node_id).or_default().push(lease);
     }
+    let mut cloud: HashMap<Uuid, CloudBeat> = HashMap::new();
+    for beat in tod_store::cloud_activity::list_for_nodes(conn, node_ids)? {
+        cloud.insert(beat.node_id, beat);
+    }
     // The stored deferrals, over which the caller's own (tests, previews) win.
     let mut deferrals: HashMap<Uuid, Deferral> = HashMap::new();
     for row in DeferralRepo::new(conn).list_for_nodes(node_ids)? {
@@ -327,6 +343,7 @@ pub fn for_nodes(
             attention: attention.get(&node_id).unwrap_or(&no_attention),
             waits: waits.get(&node_id).map(Vec::as_slice).unwrap_or(&[]),
             leases: leases.get(&node_id).map(Vec::as_slice).unwrap_or(&[]),
+            cloud: cloud.get(&node_id),
             run: inputs.runs.get(&node_id).unwrap_or(&no_run),
             deferral: deferrals.get(&node_id).copied(),
             now_ms: inputs.now_ms,
@@ -455,6 +472,9 @@ fn actor_for(facts: &Facts<'_>) -> (NextActor, i64) {
             0,
         );
     }
+    if let Some(beat) = facts.cloud.filter(|b| b.is_live(facts.now_ms)) {
+        return (NextActor::Working { what: Work::Cloud, since: beat.started_at }, 0);
+    }
     let requests = facts.attention;
     if let Some(waiting_since) = requests.waiting_since {
         let newest = requests.items.iter().map(|i| i.since).max().unwrap_or(waiting_since);
@@ -500,6 +520,16 @@ fn actor_for(facts: &Facts<'_>) -> (NextActor, i64) {
             },
             lease.heartbeat_at,
         );
+    }
+    // The same for a supervisor in the cloud that stopped beating without
+    // ending its run: its sandbox or process died mid-run.
+    if let Some(beat) = facts.cloud.filter(|b| !b.is_live(facts.now_ms)) {
+        let error = format!(
+            "the cloud supervisor stopped responding {} ago (last heard while {})",
+            format_elapsed(facts.now_ms - beat.heartbeat_at),
+            if beat.what.is_empty() { "working" } else { &beat.what },
+        );
+        return (NextActor::You { why: YouReason::Failed { error }, since: beat.heartbeat_at }, beat.heartbeat_at);
     }
     // A look at the outside that failed as often as it may (or in a way
     // asking again cannot fix) is the user's, with the error.
@@ -684,6 +714,7 @@ mod tests {
         leases: Vec<Lease>,
         run: RunFacts,
         deferral: Option<Deferral>,
+        cloud: Option<CloudBeat>,
     }
 
     fn case(lifecycle: &'static str) -> Case {
@@ -692,6 +723,7 @@ mod tests {
             attention: NodeAttention::default(),
             waits: Vec::new(),
             leases: Vec::new(),
+            cloud: None,
             run: RunFacts::default(),
             deferral: None,
         }
@@ -705,6 +737,7 @@ mod tests {
             attention: &c.attention,
             waits: &c.waits,
             leases: &c.leases,
+            cloud: c.cloud.as_ref(),
             run: &c.run,
             deferral: c.deferral,
             now_ms: NOW,
@@ -740,6 +773,40 @@ mod tests {
             standing(&c).actor,
             NextActor::Working { what: Work::Conversation(ProtocolKind::Implementation), since: 30 }
         );
+    }
+
+    fn beat(started_at: i64, ago_ms: i64) -> CloudBeat {
+        CloudBeat { node_id: Uuid::nil(), started_at, heartbeat_at: NOW - ago_ms, what: "active".into() }
+    }
+
+    #[test]
+    fn a_supervisor_that_is_beating_in_the_cloud_is_working() {
+        let mut c = case("active");
+        c.cloud = Some(beat(100, 5_000));
+        assert_eq!(standing(&c).actor, NextActor::Working { what: Work::Cloud, since: 100 });
+        // Working wins over a stale outcome, as a local lease does.
+        c.attention = requests(Uuid::nil(), &[10]);
+        assert_eq!(standing(&c).actor, NextActor::Working { what: Work::Cloud, since: 100 });
+    }
+
+    #[test]
+    fn a_supervisor_that_stopped_beating_is_a_loss_the_user_is_told_of() {
+        let mut c = case("active");
+        c.cloud = Some(beat(100, tod_store::cloud_activity::STALE_AFTER_MS + 5_000));
+        match standing(&c).actor {
+            NextActor::You { why: YouReason::Failed { error }, .. } => {
+                assert!(error.contains("cloud supervisor stopped responding"), "{error}");
+            }
+            other => panic!("not a failure: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_app_sending_a_node_to_the_cloud_is_work_from_the_click() {
+        let mut c = case("active");
+        c.leases = vec![live_lease(KIND_CLOUD_START, 40)];
+        assert_eq!(standing(&c).actor, NextActor::Working { what: Work::CloudStart, since: 40 });
+        assert_eq!(Work::from_kind(KIND_CLOUD_START), Work::CloudStart);
     }
 
     #[test]

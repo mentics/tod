@@ -65,13 +65,17 @@ impl FleetProjection {
 
     /// Compare `PRAGMA data_version` and metadata; reload when the on-disk store changed.
     pub fn reload_if_stale(&mut self) -> Result<bool> {
+        // `data_version` is per connection: it moves only when another
+        // connection commits after this connection last asked. A connection
+        // opened just now has no history to compare with (it always reads
+        // the same value), so the one held since the last reload is asked.
+        let held = read_data_version(&self.conn.lock().expect("projection connection mutex"))?;
         let conn = schema::open_read_connection(&self.db_path)?;
-        let on_disk_version = read_data_version(&conn)?;
         let on_disk_meta = load_metadata(&conn)?;
-        if on_disk_version == self.data_version && on_disk_meta == self.metadata {
+        if held == self.data_version && on_disk_meta == self.metadata {
             return Ok(false);
         }
-        self.data_version = on_disk_version;
+        self.data_version = read_data_version(&conn)?;
         self.metadata = on_disk_meta;
         *self.conn.lock().expect("projection connection mutex") = conn;
         let _ = self.change_tx.send(());
@@ -221,6 +225,17 @@ mod tests {
         assert!(projection.reload_on_external_commit().unwrap());
         assert!(rx.try_recv().is_ok());
         assert!(!projection.reload_on_external_commit().unwrap());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn an_external_commit_to_an_uncounted_table_is_noticed_by_reload_if_stale() {
+        let (dir, _writer, mut projection) = temp_projection();
+        let mut rx = projection.subscribe();
+        let other = rusqlite::Connection::open(dir.join("tod.db")).unwrap();
+        other.execute_batch("CREATE TABLE IF NOT EXISTS external_probe (x INTEGER)").unwrap();
+        assert!(projection.reload_if_stale().unwrap(), "the external commit went unnoticed");
+        assert!(rx.try_recv().is_ok(), "nothing was announced");
         let _ = fs::remove_dir_all(dir);
     }
 

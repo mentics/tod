@@ -442,6 +442,38 @@ Tests: a node with a stale lease is never `Working`; killing the owner
 mid-step produces `You::Failed` within the deadline; a desired-`run` node with
 no lease is restarted or fails visibly.
 
+### A node in the cloud: the supervisor's heartbeat, and the click
+
+A node's leases are machine-local, so the app never sees the ones its
+supervisor holds in a sandbox. `Working` for a cloud node is proved the same
+way, by a synced counterpart: the `cloud_activity` row
+(`tod_store::cloud_activity`), one per node, written only by that node's
+supervisor. It is made when the autopilot starts, refreshed every 15 s, and
+deleted when the run stops, and each write is pushed at once
+(`tod_supervisor::beat`). The app derives:
+
+- a row beating within 60 s: `Working { what: Cloud }`;
+- a row that stopped beating and was never deleted: `You::Failed`, "the cloud
+  supervisor stopped responding" (the sandbox or process died mid-run), the
+  analogue of a lost lease;
+- no row: whatever the node's waits, requests and last outcome say, as before
+  (a node that finished or waits on GitHub is `Others`, not `Working`).
+
+The app also takes a lease of its own, `cloud_start`
+(`Work::CloudStart`, "starting in the cloud"), the moment the user clicks Run
+in the cloud, Move to the cloud, Reinstall and restart, or Check now on a
+cloud node, so the node never reads as waiting on the user while their request
+is carried out. It holds it until the supervisor is heard from (a heartbeat,
+or any change to the node coming down the feed), pulling every few seconds
+meanwhile. If nothing comes within 150 s the click ends in an error saying so;
+silence is never taken for success (`cloud_sync::start_in_cloud`).
+
+A supervisor older than this does not beat: its nodes read as before until
+"Reinstall and restart" gives them the new one. The orchestrator must be
+deployed first (`scripts/build.sh --deploy-orchestrator`): it refuses a push
+carrying a table it does not know, and an app older than the orchestrator
+refuses a feed carrying `cloud_activity`.
+
 ### Deferring a node
 
 There is no park/defer concept today. (There is a runner **pause**, which

@@ -184,6 +184,28 @@ fn a_wake_runs_the_node_and_its_work_reaches_the_orchestrator() {
         db: base.join("supervisor").join("tod.db"),
         seeded_at_hold: Mutex::new(Vec::new()),
     });
+    // Watch the orchestrator's copy while the node is worked: the app can
+    // only know the supervisor is working if a heartbeat row is there.
+    let remote_db = base.join("orchestrator").join("users").join("alice").join("tod.db");
+    let sampling = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let sampler = {
+        let (db, sampling) = (remote_db.clone(), sampling.clone());
+        std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            while sampling.load(std::sync::atomic::Ordering::Relaxed) {
+                if let Ok(conn) = rusqlite::Connection::open(&db) {
+                    let _ = conn.busy_timeout(Duration::from_millis(200));
+                    if let Ok(beat) = tod_store::cloud_activity::get(&conn, node)
+                        && let Some(beat) = beat
+                    {
+                        seen.push(beat);
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            seen
+        })
+    };
     let woke = wake(Config {
         orchestrator: orchestrator.clone(),
         node,
@@ -202,6 +224,14 @@ fn a_wake_runs_the_node_and_its_work_reaches_the_orchestrator() {
     })
     .unwrap();
     assert!(matches!(woke, Woke::Ran(_)), "{woke:?}");
+    sampling.store(false, std::sync::atomic::Ordering::Relaxed);
+    let beats = sampler.join().unwrap();
+    assert!(!beats.is_empty(), "the orchestrator never saw the supervisor say it was working");
+    assert!(beats.iter().all(|b| b.is_live(b.heartbeat_at) && b.what == "active"), "{beats:?}");
+    // And it ended: a finished run must not look like a live one.
+    let conn = rusqlite::Connection::open(&remote_db).unwrap();
+    assert_eq!(tod_store::cloud_activity::get(&conn, node).unwrap(), None, "the heartbeat outlived the run");
+    drop(conn);
 
     // The supervisor's own writes (the implementation conversation, its
     // turns) and the mock agent's (plan steps) are on the orchestrator, in
@@ -258,7 +288,6 @@ fn a_wake_runs_the_node_and_its_work_reaches_the_orchestrator() {
 
     // Waits recorded on the orchestrator (as `tod-cli wait` there would): a
     // timer a minute out, and a check that is due and fails.
-    let remote_db = base.join("orchestrator").join("users").join("alice").join("tod.db");
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64;
     let (timer, poll) = {
         let conn = rusqlite::Connection::open(&remote_db).unwrap();

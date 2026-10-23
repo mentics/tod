@@ -254,6 +254,14 @@ self-hosted), or a managed service such as Ably or Pusher. The topic per
 user must not be guessable (or the service must authenticate subscribers),
 since it reveals when a user's data changes.
 
+Pushing "changed" notices is an optimization, never the only path: ntfy may
+drop, delay or refuse one with nothing to show for it, so while any node runs
+in the cloud the app also pulls every 20 s (`cloud_notify::FALLBACK_POLL`).
+A supervisor's heartbeat (`cloud_activity`, `doc/lifecycle/next-actor.md`, "A
+node in the cloud") is what tells the app a node is being worked on; syncs
+and notices only deliver it. The app and `tod-agentd` both sync one data root,
+so a sync takes a lock on `cloud-sync.lock` as well as the process's own.
+
 ## Problems
 
 Warnings and errors from the relay, supervisor and orchestrator reach the app's

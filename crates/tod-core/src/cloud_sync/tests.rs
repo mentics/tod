@@ -121,9 +121,13 @@ fn a_supervisors_changes_reach_the_app_and_nothing_is_echoed() {
         .unwrap();
     assert_eq!(sent.status(), 200);
 
-    // The app gets it.
+    // The app gets it, and its views are told: a change that arrives from
+    // the cloud must reach the screen without the user doing anything.
+    let mut told = app.subscribe_changes();
+    while told.try_recv().is_ok() {}
     let report = sync(&app, &root, &orch, "alice").unwrap();
     assert!(report.received >= 1, "{report:?}");
+    assert!(told.try_recv().is_ok(), "a synced change was applied but the app was never told");
     assert!(lists(&app).contains(&"from-supervisor".to_string()));
 
     // The app's next change goes up, and is not echoed to the app...
@@ -149,6 +153,87 @@ fn a_supervisors_changes_reach_the_app_and_nothing_is_echoed() {
         .collect();
     assert!(slugs.contains(&"from-app-2".to_string()), "{slugs:?}");
     assert!(!slugs.contains(&"from-supervisor".to_string()), "{slugs:?}");
+
+    drop(app);
+    drop(copy);
+    for r in [root, base, replica] {
+        let _ = std::fs::remove_dir_all(r);
+    }
+}
+
+/// What the user sees of a node in the cloud: its supervisor's heartbeat
+/// reaches the app through the orchestrator on a sync, the app is told, and
+/// the node reads as working until the run ends.
+#[test]
+fn a_cloud_nodes_heartbeat_reaches_the_app_and_it_shows_as_working() {
+    use crate::next_actor::{self, NextActor, Work, YouReason};
+    let base = temp_root("orch-beat");
+    let url = start_orchestrator(&base);
+    let orch = HttpOrchestrator::new(url.clone(), None).with_client("app-test");
+    let root = temp_root("app-beat");
+    let app = FleetStore::open(&root).unwrap();
+    add_list(&app, "t");
+    let list_id = app.list_outline_lists().unwrap()[0].id;
+    let node = uuid::Uuid::new_v4();
+    app.enqueue_outline(OutlineMutation::CreateNode {
+        node_id: Some(node),
+        list_id,
+        parent_id: None,
+        anchor_id: None,
+        position: tod_store::outline::CreatePosition::Below,
+        title: "cloud node".into(),
+    })
+    .unwrap();
+    app.enqueue_outline(OutlineMutation::EnableCapabilities {
+        node_id: node,
+        capabilities: vec![tod_store::outline::Capability::Lifecycle],
+    })
+    .unwrap();
+    app.writer().flush().unwrap();
+    sync(&app, &root, &orch, "alice").unwrap();
+    let standing = |app: &FleetStore| {
+        app.reload_if_stale().unwrap();
+        next_actor::compute(app, &root).unwrap().remove(&node).expect("the node has Lifecycle").actor
+    };
+    assert!(matches!(standing(&app), NextActor::You { why: YouReason::NotStarted, .. }));
+
+    // The supervisor's copy, as in the test above, says it is working.
+    let replica = temp_root("replica-beat");
+    let snapshot =
+        ureq::get(format!("{url}/users/alice/snapshot")).call().unwrap().body_mut().read_to_vec().unwrap();
+    std::fs::write(replica.join("seed.db"), &snapshot).unwrap();
+    sync::restore(&replica.join("seed.db"), &replica.join("tod.db")).unwrap();
+    let copy = FleetStore::open(&replica).unwrap();
+    let push = |after: i64| {
+        let outbox = sync::export_changes(&connect(copy.paths().db()).unwrap(), after).unwrap();
+        let sent = ureq::post(format!("{url}/users/alice/changes"))
+            .header(sync::CLIENT_HEADER, "supervisor-n1")
+            .send_json(&outbox)
+            .unwrap();
+        assert_eq!(sent.status(), 200);
+        outbox.iter().map(|c| c.seq).max().unwrap_or(after)
+    };
+    let mut pushed = sync::last_seq(&connect(copy.paths().db()).unwrap()).unwrap();
+    let now = tod_store::outline::uuid_blob::now_ms();
+    tod_store::cloud_activity::beat(&connect(copy.paths().db()).unwrap(), node, "active", now).unwrap();
+    pushed = push(pushed);
+
+    let mut told = app.subscribe_changes();
+    while told.try_recv().is_ok() {}
+    sync(&app, &root, &orch, "alice").unwrap();
+    assert!(told.try_recv().is_ok(), "the heartbeat was applied but the app was never told");
+    match standing(&app) {
+        NextActor::Working { what: Work::Cloud, since } => assert_eq!(since, now),
+        other => panic!("a node its supervisor is working on reads as {other:?}"),
+    }
+
+    // The run ends; the app is told, and the node no longer claims to work.
+    tod_store::cloud_activity::end(&connect(copy.paths().db()).unwrap(), node).unwrap();
+    push(pushed);
+    while told.try_recv().is_ok() {}
+    sync(&app, &root, &orch, "alice").unwrap();
+    assert!(told.try_recv().is_ok(), "the run ended but the app was never told");
+    assert!(matches!(standing(&app), NextActor::You { why: YouReason::NotStarted, .. }), "{:?}", standing(&app));
 
     drop(app);
     drop(copy);
@@ -343,4 +428,52 @@ fn the_supervisor_gets_the_release_profiles_and_nothing_else() {
     assert_eq!(seen.pr_readiness.max_rounds, 7);
     assert_eq!(seen.log_max_size_kb, tod_store::TodSettings::default().log_max_size_kb);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_supervisor_is_heard_from_by_a_change_to_the_node_or_by_its_heartbeat() {
+    let root = temp_root("heard");
+    let fleet = FleetStore::open(&root).unwrap();
+    add_list(&fleet, "t");
+    let list_id = fleet.list_outline_lists().unwrap()[0].id;
+    let node = uuid::Uuid::new_v4();
+    fleet
+        .enqueue_outline(OutlineMutation::CreateNode {
+            node_id: Some(node),
+            list_id,
+            parent_id: None,
+            anchor_id: None,
+            position: tod_store::outline::CreatePosition::Below,
+            title: "n".into(),
+        })
+        .unwrap();
+    fleet.writer().flush().unwrap();
+    fleet.reload_if_stale().unwrap();
+
+    assert!(!supervisor_heard(&fleet, node, &SyncReport::default()).unwrap(), "silence is not a report");
+    let other = SyncReport { heard_from: [uuid::Uuid::new_v4()].into(), ..Default::default() };
+    assert!(!supervisor_heard(&fleet, node, &other).unwrap(), "another node's change is not this one's");
+    let this = SyncReport { heard_from: [node].into(), ..Default::default() };
+    assert!(supervisor_heard(&fleet, node, &this).unwrap());
+
+    tod_store::cloud_activity::beat(&connect(fleet.paths().db()).unwrap(), node, "active", 1).unwrap();
+    fleet.reload_if_stale().unwrap();
+    assert!(supervisor_heard(&fleet, node, &SyncReport::default()).unwrap(), "a heartbeat row is a report");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The app and the daemon sync one data root: a sync in one process must keep
+/// a sync in the other from starting (they share the cursors in the state
+/// file).
+#[test]
+fn a_sync_in_one_process_holds_off_a_sync_in_another() {
+    let root = temp_root("sync-lock");
+    let guard = sync_lock(&root).unwrap();
+    // What the other process would do: its own handle on the same file.
+    let other = std::fs::OpenOptions::new().write(true).open(root.join(LOCK_FILE)).unwrap();
+    let err = fs2::FileExt::try_lock_exclusive(&other).expect_err("the lock was not held");
+    assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
+    drop(guard);
+    fs2::FileExt::try_lock_exclusive(&other).expect("the lock was not released");
+    let _ = std::fs::remove_dir_all(&root);
 }
