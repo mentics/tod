@@ -231,6 +231,20 @@ impl<'a> WaitRepo<'a> {
         self.query("node_id = ?1 AND state = 'pending'", [uuid_to_blob(node_id)])
     }
 
+    /// The pending waits of every node in `node_ids`, soonest first, in one
+    /// query: for a list view over many nodes (`tod_core::next_actor`).
+    pub fn list_pending_for_nodes(&self, node_ids: &[Uuid]) -> Result<Vec<Wait>> {
+        if node_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = node_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let params: Vec<Vec<u8>> = node_ids.iter().copied().map(uuid_to_blob).collect();
+        self.query(
+            &format!("state = 'pending' AND node_id IN ({placeholders})"),
+            rusqlite::params_from_iter(params.iter()),
+        )
+    }
+
     /// When the node next needs waking: its soonest pending `due_at`.
     pub fn next_due(&self, node_id: Uuid) -> Result<Option<i64>> {
         Ok(self.conn.query_row(

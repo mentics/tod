@@ -42,6 +42,7 @@ pub mod journey;
 pub mod lifecycle;
 pub mod lifecycle_next;
 pub mod lifecycle_validity;
+pub mod next_actor;
 pub mod linear_import;
 pub mod linear_sync;
 pub mod logging;
