@@ -33,13 +33,14 @@ const SIDEBAR_MIN: f32 = 140.0;
 const PANEL_MIN: f32 = 320.0;
 const SETTINGS_CONTEXT: &str = "Settings";
 
-const SECTIONS: [SettingsSection; 10] = [
+const SECTIONS: [SettingsSection; 11] = [
     SettingsSection::Agents,
     SettingsSection::Lifecycle,
     SettingsSection::QuestionMaker,
     SettingsSection::AnswerProcessor,
     SettingsSection::Workspaces,
     SettingsSection::CloudSandboxes,
+    SettingsSection::OrchestratorGithub,
     SettingsSection::EnvironmentPresets,
     SettingsSection::Logging,
     SettingsSection::Journeys,
@@ -96,6 +97,7 @@ pub fn register_settings_keyboard_bindings(cx: &mut App) {
         KeyBinding::new("escape", SettingsEscape, context),
         KeyBinding::new("escape", SettingsEscape, input_context_outside_select),
     ]);
+    crate::views::orchestrator_github_editor::register_keyboard_bindings(cx);
 }
 
 #[derive(Debug, Clone)]
@@ -117,6 +119,7 @@ enum SettingsSection {
     AnswerProcessor,
     Workspaces,
     CloudSandboxes,
+    OrchestratorGithub,
     EnvironmentPresets,
     Logging,
     Journeys,
@@ -132,6 +135,7 @@ impl SettingsSection {
             Self::AnswerProcessor => "Agent context",
             Self::Workspaces => "Workspaces",
             Self::CloudSandboxes => "Cloud sandboxes",
+            Self::OrchestratorGithub => "Orchestrator GitHub",
             Self::EnvironmentPresets => "Environment presets",
             Self::Logging => "Logging",
             Self::Journeys => "Journeys",
@@ -147,6 +151,7 @@ impl SettingsSection {
             Self::AnswerProcessor => "answer-processor",
             Self::Workspaces => "workspaces",
             Self::CloudSandboxes => "cloud-sandboxes",
+            Self::OrchestratorGithub => "orchestrator-github",
             Self::EnvironmentPresets => "environment-presets",
             Self::Logging => "logging",
             Self::Journeys => "journeys",
@@ -183,6 +188,7 @@ impl SettingsSection {
                 SandboxClaudeGetToken,
                 SandboxClaudeClear,
             ],
+            Self::OrchestratorGithub => &[OrchestratorGithub],
             Self::EnvironmentPresets => &[EnvironmentPresetsFile],
             Self::Logging => &[LogLevel, LogMaxSize],
             Self::Journeys => &[
@@ -214,6 +220,8 @@ enum SettingField {
     TerminalProgram,
     /// `visual_design.browser`: the browser the design window opens in.
     VisualDesignBrowser,
+    /// The orchestrator's GitHub tokens (edited by `OrchestratorGithubEditor`).
+    OrchestratorGithub,
     /// The user's environment presets file (edited by `PresetsEditor`).
     EnvironmentPresetsFile,
     /// The Blaxel workspace cloud sandboxes live in (`sandboxes.toml`).
@@ -270,6 +278,7 @@ impl SettingField {
             Self::VisualDesignBrowser => "visual-design-browser",
             Self::SandboxWorkspace => "sandbox-workspace",
             Self::EnvironmentPresetsFile => "environment-presets-file",
+            Self::OrchestratorGithub => "orchestrator-github",
             Self::SandboxSignIn => "sandbox-sign-in",
             Self::SandboxApiKey => "sandbox-api-key",
             Self::SandboxDefaultImage => "sandbox-default-image",
@@ -424,6 +433,8 @@ pub struct SettingsView {
     focus_region: SettingsFocus,
     active_section: SettingsSection,
     presets_editor: Entity<crate::views::environment_editor::PresetsEditor>,
+    orchestrator_github_editor:
+        Entity<crate::views::orchestrator_github_editor::OrchestratorGithubEditor>,
     selected_field_index: usize,
     terminal_program_editing: bool,
     visual_design_browser_editing: bool,
@@ -448,6 +459,7 @@ pub struct SettingsView {
     _relay_code_subscription: Subscription,
     _milestone_states_subscription: Subscription,
     _repo_profiles_subscription: Subscription,
+    _orchestrator_github_subscription: Subscription,
     _claude_adapter_subscription: Subscription,
 }
 
@@ -639,6 +651,22 @@ impl SettingsView {
                 }
             });
 
+        let orchestrator_github_editor = {
+            let root = paths.data_root().to_path_buf();
+            cx.new(|cx| {
+                crate::views::orchestrator_github_editor::OrchestratorGithubEditor::new(root, cx)
+            })
+        };
+        let _orchestrator_github_subscription = cx.subscribe_in(
+            &orchestrator_github_editor,
+            window,
+            |this, _, _: &crate::views::orchestrator_github_editor::Leave, window, cx| {
+                this.focus_region = SettingsFocus::Panel;
+                this.focus_handle.focus(window, cx);
+                cx.notify();
+            },
+        );
+
         let agent_selects = AgentRole::ALL
             .into_iter()
             .map(|role| AgentRoleSelects::new(role, &settings, window, cx))
@@ -697,6 +725,8 @@ impl SettingsView {
             _relay_code_subscription,
             _milestone_states_subscription,
             _repo_profiles_subscription,
+            _orchestrator_github_subscription,
+            orchestrator_github_editor,
             _claude_adapter_subscription,
         }
     }
@@ -1215,7 +1245,7 @@ impl SettingsView {
             return;
         }
         match self.selected_field() {
-            SettingField::EnvironmentPresetsFile => {}
+            SettingField::EnvironmentPresetsFile | SettingField::OrchestratorGithub => {}
             SettingField::Agent(role) => self.cycle_platform_for(role, delta, cx),
             SettingField::ReplenishThreshold => self.step_replenish(delta, cx),
             SettingField::ContextBudget => self.step_context_budget(delta, cx),
@@ -1287,6 +1317,10 @@ impl SettingsView {
         match self.selected_field() {
             SettingField::EnvironmentPresetsFile => {
                 let editor = self.presets_editor.clone();
+                editor.update(cx, |e, cx| e.focus(window, cx));
+            }
+            SettingField::OrchestratorGithub => {
+                let editor = self.orchestrator_github_editor.clone();
                 editor.update(cx, |e, cx| e.focus(window, cx));
             }
             SettingField::TerminalProgram => self.enter_terminal_edit(window, cx),
@@ -2650,6 +2684,9 @@ impl SettingsView {
                     |this, _, cx| this.step_log_max_size(1024, cx),
                 ))
                 .into_any_element(),
+            SettingsSection::OrchestratorGithub => {
+                self.orchestrator_github_editor.clone().into_any_element()
+            }
             SettingsSection::EnvironmentPresets => self.presets_editor.clone().into_any_element(),
             SettingsSection::Lifecycle => v_flex()
                 .gap_1()

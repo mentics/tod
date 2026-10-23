@@ -5,6 +5,7 @@ pub mod database;
 pub mod locations;
 pub mod log_panel;
 pub mod environment_editor;
+pub mod orchestrator_github_editor;
 pub mod lifecycle_config_editor;
 pub use tod_core::linear_import;
 pub mod lifecycle_control;
