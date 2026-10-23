@@ -20,10 +20,10 @@ This builds the `tod` binary (`crates/tod`) with the **agent-socket** feature en
 
 ### Dev loop (`tod` + `tod-cli` together)
 
-Agents shell out to `tod-cli`, which `cargo run -p tod` alone does not build. Use `scripts/dev.sh` (or `scripts/dev.ps1` on Windows) instead, which rebuilds `tod-cli` before launching `tod` so agent chats always see a current CLI:
+Agents shell out to `tod-cli`, which `cargo run -p tod` alone does not build. Use `scripts/run.sh` (or `scripts/dev.ps1` on Windows) instead, which brings every binary up to date (`scripts/build.sh`) before launching `tod` so agent chats always see a current CLI:
 
 ```bash
-scripts/dev.sh --data-root .local/test/my-sandbox --agent mock --no-focus
+scripts/run.sh --data-root .local/test/my-sandbox --agent mock --no-focus
 ```
 
 Any arguments are passed straight through to `tod`. Both binaries land in the same `target/{debug,release}/` directory, so `tod-cli` is already a sibling of `tod` once built — no copy step is needed in dev.
@@ -251,7 +251,7 @@ orchestrator is out of date", or the log says `orchestrator ...: 404 Not
 Found`) redeploy it:
 
 ```bash
-scripts/redeploy-orchestrator.sh --data-root <root>   # <root> holds sandboxes.toml
+scripts/build.sh --data-root <root> --deploy-orchestrator   # <root> holds sandboxes.toml
 ```
 
 This builds the Linux binaries (needs Docker running, or zig +

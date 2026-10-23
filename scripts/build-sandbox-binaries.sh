@@ -27,7 +27,7 @@
 #       runs `cargo test <args>` for Linux in the same container (e.g.
 #       `--docker-test -p tod-relay`), for code only Linux compiles.
 #
-# Windows: run this under Git Bash (the same shell scripts/dev.sh and
+# Windows: run this under Git Bash (the same shell scripts/run.sh and
 # scripts/install.sh already assume), not PowerShell — there is no .ps1
 # twin. `sh scripts/build-sandbox-binaries.sh` from Git Bash, or
 # `bash scripts/build-sandbox-binaries.sh`, both work.
