@@ -165,6 +165,94 @@ impl<'a> ActivityRepo<'a> {
     }
 }
 
+/// A lease whose holder refreshes it from its own loop instead of a thread:
+/// for work that already polls (a conversation driver's `tick`) and holds
+/// only a `&FleetStore`. [`Self::beat`] refreshes it at most every
+/// [`HEARTBEAT_EVERY_MS`]; [`Self::end`] drops it. Not ending it leaves it to
+/// go stale, which shows as lost: so the work that polls must end it on
+/// every path out.
+#[derive(Debug)]
+pub struct ActivityLease {
+    id: Uuid,
+    last_beat: std::time::Instant,
+}
+
+impl ActivityLease {
+    pub fn start(fleet: &crate::fleet::FleetStore, node: Uuid, kind: &str, owner: &str) -> Result<Self> {
+        use crate::fleet::writer::FleetMutation;
+        let id = Uuid::new_v4();
+        fleet
+            .enqueue(FleetMutation::ActivityStart {
+                id,
+                node,
+                kind: kind.to_string(),
+                owner: owner.to_string(),
+                at: crate::outline::uuid_blob::now_ms(),
+            })
+            .map_err(|e| anyhow::anyhow!("could not record that {kind} is running on {node}: {e}"))?;
+        Ok(Self { id, last_beat: std::time::Instant::now() })
+    }
+
+    /// Refresh the lease if it is due.
+    pub fn beat(&mut self, fleet: &crate::fleet::FleetStore) -> Result<()> {
+        if self.last_beat.elapsed() < std::time::Duration::from_millis(HEARTBEAT_EVERY_MS as u64) {
+            return Ok(());
+        }
+        fleet
+            .enqueue(crate::fleet::writer::FleetMutation::ActivityBeat {
+                id: self.id,
+                at: crate::outline::uuid_blob::now_ms(),
+            })
+            .map_err(|e| anyhow::anyhow!("could not refresh an activity lease: {e}"))?;
+        self.last_beat = std::time::Instant::now();
+        Ok(())
+    }
+
+    /// The work ended.
+    pub fn end(self, fleet: &crate::fleet::FleetStore) -> Result<()> {
+        fleet
+            .enqueue(crate::fleet::writer::FleetMutation::ActivityEnd { id: self.id })
+            .map_err(|e| anyhow::anyhow!("could not end an activity lease: {e}"))
+    }
+}
+
+/// Run `work` on this thread while holding a lease on `node`, refreshed by a
+/// scoped thread, and end the lease when `work` returns: for blocking work
+/// that holds only a `&FleetStore` and does not poll (a gate check that
+/// calls GitHub). Fails, without running `work`, if the lease cannot be
+/// recorded: work that cannot prove it is running must not claim to be.
+pub fn with_lease<T>(
+    fleet: &crate::fleet::FleetStore,
+    node: Uuid,
+    kind: &str,
+    owner: &str,
+    work: impl FnOnce() -> T,
+) -> Result<T> {
+    use crate::fleet::writer::FleetMutation;
+    let lease = ActivityLease::start(fleet, node, kind, owner)?;
+    let id = lease.id;
+    let out = std::thread::scope(|scope| {
+        let (stop, stopped) = std::sync::mpsc::channel::<()>();
+        scope.spawn(move || {
+            while let Err(std::sync::mpsc::RecvTimeoutError::Timeout) =
+                stopped.recv_timeout(std::time::Duration::from_millis(HEARTBEAT_EVERY_MS as u64))
+            {
+                let at = crate::outline::uuid_blob::now_ms();
+                if let Err(err) = fleet.enqueue(FleetMutation::ActivityBeat { id, at }) {
+                    // The lease goes stale and the node says its processing
+                    // was lost: the failure is not lost.
+                    tracing::warn!(%id, %err, "could not refresh an activity lease");
+                }
+            }
+        });
+        let out = work();
+        drop(stop);
+        out
+    });
+    lease.end(fleet)?;
+    Ok(out)
+}
+
 /// A held lease. Starting one records it; a thread refreshes it every
 /// [`HEARTBEAT_EVERY_MS`] for as long as the guard lives; dropping it ends
 /// the lease. If the process dies, nothing ends it and the lease goes stale,

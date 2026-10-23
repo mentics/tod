@@ -87,8 +87,18 @@ impl Work {
     }
 
     /// The lease kind a conversation turn under `protocol` holds.
+    ///
+    /// The plain chats (the outline chat, the chat panel, visual design) are
+    /// the user's own conversations, not the node's lifecycle processing:
+    /// their lease is a `chat` one, which feeds the tree's chat decorator and
+    /// never the node's actor.
     pub fn conversation_kind(protocol: ProtocolKind) -> String {
-        format!("{KIND_PROTOCOL_PREFIX}{}", protocol.as_str())
+        match protocol {
+            ProtocolKind::Outline | ProtocolKind::Chat | ProtocolKind::VisualDesign => {
+                tod_store::activity::KIND_CHAT.to_string()
+            }
+            _ => format!("{KIND_PROTOCOL_PREFIX}{}", protocol.as_str()),
+        }
     }
 }
 
@@ -143,6 +153,10 @@ pub struct Retry {
 pub enum WaitKind {
     /// A person's review of the pull request.
     HumanReview,
+    /// A review bot's review of the current head; `who` is the bot.
+    BotReview,
+    /// The head's checks to finish.
+    Checks,
     /// The merge.
     Merge,
     /// A release that names the pull request.
@@ -157,6 +171,10 @@ impl WaitKind {
     pub fn from_spec(spec: &str) -> Self {
         if spec.starts_with("github:release:") {
             Self::Release
+        } else if spec.starts_with("github:pr:") && spec.contains(":bot-review:") {
+            Self::BotReview
+        } else if spec.starts_with("github:pr:") && spec.ends_with(":checks") {
+            Self::Checks
         } else if spec.starts_with("github:pr:") && spec.ends_with(":merged") {
             Self::Merge
         } else if spec.starts_with("github:pr:") && spec.ends_with("review") {
@@ -526,7 +544,11 @@ fn external_wait(wait: &Wait, now_ms: i64) -> ExternalWait {
     let grace = (2 * interval).max(OVERDUE_GRACE_MS);
     ExternalWait {
         kind: WaitKind::from_spec(&wait.match_spec),
-        who: None,
+        who: wait
+            .match_spec
+            .split_once(":bot-review:")
+            .map(|(_, bot)| bot.to_string())
+            .filter(|bot| !bot.is_empty()),
         detail: wait.detail.clone().filter(|d| !d.trim().is_empty()),
         since: wait.created_at,
         next_check_ms: Some(wait.due_at),
@@ -845,8 +867,18 @@ mod tests {
         assert_eq!(WaitKind::from_spec("github:pr:7:merged"), WaitKind::Merge);
         assert_eq!(WaitKind::from_spec("github:release:published"), WaitKind::Release);
         assert_eq!(WaitKind::from_spec("github:pr:review"), WaitKind::HumanReview);
+        assert_eq!(WaitKind::from_spec("github:pr:7:bot-review:greptile"), WaitKind::BotReview);
+        assert_eq!(WaitKind::from_spec("github:pr:7:checks"), WaitKind::Checks);
         assert_eq!(WaitKind::from_spec(""), WaitKind::Other);
         assert_eq!(WaitKind::from_spec("github:pr 12 checks"), WaitKind::Other);
+    }
+
+    #[test]
+    fn a_bot_review_wait_names_the_bot() {
+        let mut c = case("pr");
+        c.waits = vec![wait("github:pr:7:bot-review:greptile", NOW + 60_000, NOW)];
+        let NextActor::Others { wait } = standing(&c).actor else { panic!("not others") };
+        assert_eq!((wait.kind, wait.who.as_deref()), (WaitKind::BotReview, Some("greptile")));
     }
 
     #[test]
@@ -1103,6 +1135,44 @@ mod tests {
         let mut want = vec![woken, expired, gone];
         want.sort();
         assert_eq!(spent, want, "the held one stays");
+    }
+
+    #[test]
+    fn a_gate_check_holds_a_lease_while_it_runs_and_not_after() {
+        use tod_store::fleet::FleetStore;
+        let root = std::env::temp_dir().join(format!("tod-next-actor-lease-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let fleet = FleetStore::open(&root).unwrap();
+        // The lease needs a node row; the node need not have Lifecycle.
+        fleet
+            .enqueue_outline(tod_store::outline::OutlineMutation::CreateList { slug: "t".into(), title: "T".into() })
+            .unwrap();
+        fleet.writer().flush().unwrap();
+        let list_id = fleet.list_outline_lists().unwrap()[0].id;
+        fleet
+            .enqueue_outline(tod_store::outline::OutlineMutation::CreateNode {
+                node_id: None,
+                list_id,
+                parent_id: None,
+                anchor_id: None,
+                position: tod_store::outline::CreatePosition::Below,
+                title: "N".into(),
+            })
+            .unwrap();
+        fleet.writer().flush().unwrap();
+        fleet.reload_if_stale().unwrap();
+        let node = fleet.flatten_outline(list_id).unwrap()[0].node.id;
+
+        let seen = tod_store::activity::with_lease(&fleet, node, KIND_GATE_CHECK, "test:1", || {
+            fleet.writer().flush().unwrap();
+            fleet.read(|conn| ActivityRepo::new(conn).list_for_nodes(&[node])).unwrap()
+        })
+        .unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(Work::from_kind(&seen[0].kind), Work::GateCheck);
+        fleet.writer().flush().unwrap();
+        assert!(fleet.read(|conn| ActivityRepo::new(conn).list_for_nodes(&[node])).unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

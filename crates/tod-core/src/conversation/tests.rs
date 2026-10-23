@@ -231,6 +231,52 @@ fn say(
 
 const DONE: ConversationEvent = ConversationEvent::TurnFinished { error: None };
 
+fn leases(fx: &Fixture) -> Vec<tod_store::activity::Lease> {
+    fx.fleet.writer().flush().unwrap();
+    fx.fleet
+        .read(|conn| tod_store::activity::ActivityRepo::new(conn).list_for_nodes(&[fx.node]))
+        .unwrap()
+}
+
+#[test]
+fn a_turn_in_flight_holds_a_lease_of_its_protocol_and_the_end_of_the_turn_lets_it_go() {
+    let fx = fixture();
+    let mut agent = FakeAgent::new(&fx.fleet);
+    let mut driver = ConversationDriver::new(
+        config(&fx, 100_000),
+        Focus::Node(fx.node),
+        ProtocolKind::Phase,
+    );
+    driver.send(&fx.fleet, &mut agent, "go").unwrap();
+    let held = leases(&fx);
+    assert_eq!(held.len(), 1, "{held:?}");
+    assert_eq!(held[0].kind, "protocol:phase");
+    assert!(held[0].is_lifecycle());
+
+    driver.tick(&fx.fleet, &mut agent);
+    assert!(!driver.status().running);
+    assert!(leases(&fx).is_empty(), "{:?}", leases(&fx));
+}
+
+#[test]
+fn a_plain_chat_turn_holds_a_chat_lease_and_a_stopped_turn_lets_it_go() {
+    let fx = fixture();
+    let mut agent = FakeAgent::new(&fx.fleet);
+    let mut driver = ConversationDriver::new(
+        config(&fx, 100_000),
+        Focus::Node(fx.node),
+        ProtocolKind::Outline,
+    );
+    driver.send(&fx.fleet, &mut agent, "go").unwrap();
+    let held = leases(&fx);
+    assert_eq!(held.len(), 1);
+    assert_eq!(held[0].kind, tod_store::activity::KIND_CHAT);
+    assert!(!held[0].is_lifecycle());
+
+    driver.cancel(&fx.fleet, &mut agent).unwrap();
+    assert!(leases(&fx).is_empty());
+}
+
 #[test]
 fn a_first_send_opens_the_session_and_records_actions_with_an_empty_reply() {
     let fx = fixture();

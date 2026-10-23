@@ -33,6 +33,17 @@ pub fn merge_wait_spec(number: i64) -> String {
     format!("github:pr:{number}:merged")
 }
 
+/// The wait that `bot` has reviewed pull request `number`
+/// (`tod_core::next_actor` reads the bot's name back from it).
+pub fn bot_review_spec(number: Option<i64>, bot: &str) -> String {
+    format!("github:pr:{}:bot-review:{bot}", number.unwrap_or(0))
+}
+
+/// The wait that pull request `number`'s checks have finished.
+pub fn checks_spec(number: Option<i64>) -> String {
+    format!("github:pr:{}:checks", number.unwrap_or(0))
+}
+
 /// What looking at a node's linked pull requests found.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GithubCheck {
@@ -259,6 +270,63 @@ impl Autopilot {
             }
             GithubCheck::NothingToWaitOn | GithubCheck::Clear => None,
         })
+    }
+
+    /// While the run polls GitHub in place (a bot's review, checks), the node
+    /// still waits on something outside, and says so: records that wait, due
+    /// at the next poll, replacing the last poll's. Without it the node
+    /// would read as having nothing in progress.
+    pub(super) fn record_poll_wait(
+        &self,
+        fleet: &FleetStore,
+        live: &[crate::pr_readiness::LivePr],
+        waits: &[crate::pr_readiness::Wait],
+        detail: &str,
+        due_at_ms: i64,
+    ) -> Result<()> {
+        use crate::pr_readiness::Wait;
+        let number_waiting = |matches: &dyn Fn(&Wait) -> bool| {
+            live.iter()
+                .find(|p| p.assessment.waits().iter().any(matches))
+                .map(|p| p.pr.pr_number)
+        };
+        let Some(first) = waits.first() else {
+            return Ok(());
+        };
+        let spec = match first {
+            Wait::BotReview { bot, .. } => {
+                let n = number_waiting(&|w| matches!(w, Wait::BotReview { bot: b, .. } if b == bot));
+                bot_review_spec(n, bot)
+            }
+            Wait::ChecksRunning => checks_spec(number_waiting(&|w| matches!(w, Wait::ChecksRunning))),
+            Wait::GitHub => format!("github:pr:{}:github", number_waiting(&|w| matches!(w, Wait::GitHub)).unwrap_or(0)),
+            // A person's review is recorded by `wait_for_review`.
+            Wait::HumanReview => return Ok(()),
+        };
+        let pending = fleet.read(|conn| WaitRepo::new(conn).list_pending_for_node(self.node))?;
+        if let Some(same) = pending.iter().find(|w| w.match_spec == spec) {
+            fleet
+                .interview(ACTOR, InterviewCommand::RescheduleWait { wait_id: same.id, due_at: due_at_ms })
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            return Ok(());
+        }
+        cancel_waits(fleet, self.node, |old| old.starts_with("github:pr:"))?;
+        fleet
+            .interview(
+                ACTOR,
+                InterviewCommand::RecordWait {
+                    node_id: self.node,
+                    wait: NewWait::event(spec, due_at_ms).with_detail(detail),
+                },
+            )
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        Ok(())
+    }
+
+    /// The run has something to do (or nothing left to wait for): the polled
+    /// waits recorded by [`Self::record_poll_wait`] no longer hold.
+    pub(super) fn clear_poll_waits(&self, fleet: &FleetStore) -> Result<()> {
+        cancel_waits(fleet, self.node, |spec| spec.starts_with("github:pr:") && !spec.ends_with(":read"))
     }
 
     /// Records an `event` wait on `spec`; see [`record_github_wait`].

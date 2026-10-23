@@ -640,11 +640,13 @@ impl Autopilot {
             };
             match pr_readiness::overall(&live) {
                 PrNext::Merged | PrNext::Clear => {
+                    self.clear_poll_waits(fleet)?;
                     hook.waiting(None, None);
                     return Ok(None);
                 }
                 PrNext::Work(_) => {
                     waited_since = None;
+                    self.clear_poll_waits(fleet)?;
                     hook.waiting(None, None);
                     let turns = self.pr_agent_turns(fleet)?;
                     let base = *self.state.pr_turns_base.get_or_insert(turns);
@@ -717,6 +719,7 @@ impl Autopilot {
                         self.pr_poll
                     };
                     let next_poll_ms = chrono::Utc::now().timestamp_millis() + interval.as_millis() as i64;
+                    self.record_poll_wait(fleet, &live, &waits, &what, next_poll_ms)?;
                     hook.waiting(Some(&what), Some(next_poll_ms));
                     if let Some(reason) = self.sleep_watching(fleet, hook, interval)? {
                         hook.waiting(None, None);

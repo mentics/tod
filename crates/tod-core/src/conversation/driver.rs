@@ -184,6 +184,11 @@ pub struct ConversationDriver {
     session_place: Option<Workdir>,
     /// Things the user must be told, delivered by the next [`Self::tick`].
     notices: Vec<RunNotice>,
+    /// The proof the turn in flight is being processed
+    /// (`tod_store::activity`): held from the turn's start to its end,
+    /// refreshed by [`Self::tick`]. A lease on the focus's node, of the
+    /// protocol's kind (`next_actor::Work::conversation_kind`).
+    lease: Option<tod_store::activity::ActivityLease>,
 }
 
 impl ConversationDriver {
@@ -208,6 +213,29 @@ impl ConversationDriver {
             launched: None,
             session_place: None,
             notices: Vec::new(),
+            lease: None,
+        }
+    }
+
+    /// Take the lease for the turn that just started. A failure to record it
+    /// is told to the user (a notice), not dropped.
+    fn start_lease(&mut self, fleet: &FleetStore) {
+        let Some(node) = self.focus.node_id() else {
+            return;
+        };
+        let kind = crate::next_actor::Work::conversation_kind(self.protocol.kind());
+        match tod_store::activity::ActivityLease::start(fleet, node, &kind, &crate::next_actor::this_process()) {
+            Ok(lease) => self.lease = Some(lease),
+            Err(err) => self.notices.push(RunNotice::Error(format!("{err:#}"))),
+        }
+    }
+
+    /// The turn ended (finished, failed, stopped): let the lease go.
+    fn end_lease(&mut self, fleet: &FleetStore) {
+        if let Some(lease) = self.lease.take()
+            && let Err(err) = lease.end(fleet)
+        {
+            self.notices.push(RunNotice::Error(format!("{err:#}")));
         }
     }
 
@@ -380,6 +408,7 @@ impl ConversationDriver {
         let Some(run) = self.run.take() else {
             return Ok(());
         };
+        self.end_lease(fleet);
         let _ = agent.with(|a| a.cancel_run(run.id));
         self.activity = None;
         self.parts.clear();
@@ -578,6 +607,11 @@ impl ConversationDriver {
         for notice in std::mem::take(&mut self.notices) {
             events.push(ConversationEvent::Notice(notice));
         }
+        if let Some(lease) = self.lease.as_mut()
+            && let Err(err) = lease.beat(fleet)
+        {
+            events.push(ConversationEvent::Notice(RunNotice::Error(format!("{err:#}"))));
+        }
         let key = self.run.as_ref().map(|run| run.key.clone());
         if let Err(err) = self.poll(fleet, agent, &mut events) {
             let error = format!("{err:#}");
@@ -628,6 +662,7 @@ impl ConversationDriver {
             None => Err("agent run was lost".to_string()),
         };
         let run = self.run.take().expect("checked above");
+        self.end_lease(fleet);
         self.activity = None;
         self.parts.clear();
         self.permission = None;
@@ -1180,6 +1215,7 @@ impl ConversationDriver {
             sandbox,
             workdir,
         });
+        self.start_lease(fleet);
         crate::journey::record(
             self.journey_key(),
             Actor::Agent { conversation: id },

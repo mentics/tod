@@ -126,6 +126,18 @@ pub fn check_gate(conn: &Connection, node: Uuid, from: &str) -> Result<GateCheck
 /// `ready` → `active` gate it gives the node's Files a branch when it has
 /// none, which that gate requires.
 pub fn settle_gate(fleet: &FleetStore, node: Uuid) -> Result<GateCheck> {
+    // The check may call GitHub: while it runs the node is being worked on,
+    // and says so (`tod_core::next_actor`).
+    tod_store::activity::with_lease(
+        fleet,
+        node,
+        tod_store::activity::KIND_GATE_CHECK,
+        &crate::next_actor::this_process(),
+        || settle_gate_unleased(fleet, node),
+    )?
+}
+
+fn settle_gate_unleased(fleet: &FleetStore, node: Uuid) -> Result<GateCheck> {
     let from = crate::lifecycle::current_state(fleet, node)?;
     if from == "ready" {
         crate::gate::derived::generate_missing_branch(fleet, node)?;
