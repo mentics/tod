@@ -454,6 +454,7 @@ open pr: Cloud test"), Some("Cloud test"));
                     draft: false,
                     base_ref: None,
                     body: None,
+                    ..Default::default()
                 },
                 threads: self
                     .open_thread

@@ -151,6 +151,9 @@ pub struct Assessment {
     pub open_threads: Vec<OpenThread>,
     pub bots: Vec<BotReport>,
     pub human_review: HumanReview,
+    /// Who GitHub still waits on for a review (logins, teams as `team:<slug>`);
+    /// empty when nobody was asked.
+    pub requested_reviewers: Vec<String>,
 }
 
 /// Something the babysitter has to do.
@@ -269,6 +272,7 @@ impl Assessment {
             open_threads: snapshot.threads.iter().filter(|t| wants_answer(t)).map(open_thread).collect(),
             bots,
             human_review: human_review(snapshot, head_at),
+            requested_reviewers: snapshot.status.requested_reviewers.clone(),
         }
     }
 
@@ -605,6 +609,7 @@ mod tests {
             draft: false,
             base_ref: Some("main".into()),
             body: None,
+            ..Default::default()
         }
     }
 
@@ -919,6 +924,16 @@ Not safe.
         s.status.head_committed_at = Some(head_at.into());
         s.reviews = reviews;
         Assessment::of(&s, &PrReadinessSettings::default(), now())
+    }
+
+    #[test]
+    fn the_assessment_carries_the_requested_reviewers() {
+        let mut s = snap(status("blocked", "success"), vec![], vec![]);
+        s.status.requested_reviewers = vec!["maria".into(), "team:core".into()];
+        let a = Assessment::of(&s, &PrReadinessSettings::default(), now());
+        assert_eq!(a.requested_reviewers, vec!["maria", "team:core"]);
+        let none = Assessment::of(&snap(status("blocked", "success"), vec![], vec![]), &PrReadinessSettings::default(), now());
+        assert!(none.requested_reviewers.is_empty());
     }
 
     #[test]

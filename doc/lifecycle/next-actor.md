@@ -214,11 +214,13 @@ the tree, summary strip, filters, Alt+Q, defer menu, "On others" panel, chat
 decorator and the task panel's runner line read `NodeStanding`
 (`tod-ui`: `views/task_list/{actor,standing}.rs`, `unified/attention_feed.rs`,
 `unified/panels/on_others.rs`); `RunnerStatus` is gone: what is left of
-`runner_status.rs` is `LiveTurn`. Not built: a custom date for a deferral
-(there is no date input yet), persisting the strip's filter,
-`who` for a human review, retiring the tod-core working-set fields the old
-filters used (`needs_you_only`, `running_only`, `awaiting_only`), and a
-`Permission` reason of its own.
+`runner_status.rs` is `LiveTurn`. The strip's filter is persisted
+(`ListWorkingSet::actor_filter`) and the old who-model fields are gone. A human
+review's wait names who was asked (`github:pr:<n>:review:<login,team:slug>`,
+from the pull request's `requested_reviewers` / `requested_teams`, whose field
+names were not checked against a live call), and a pending permission is
+`YouReason::Permission`. Not built: a custom date for a deferral (there is no
+date input in the app yet).
 
 Step 1 is built: `crates/tod-core/src/next_actor.rs` (types, `derive`, batched
 `for_nodes`, tests), with `WaitRepo::list_pending_for_nodes` and

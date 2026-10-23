@@ -61,7 +61,7 @@ pub struct PullRequest {
     pub url: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct PrStatus {
     /// Raw GitHub `mergeable` flag: `false` only ever means a merge
     /// conflict. It says nothing about required reviews or required checks
@@ -90,6 +90,10 @@ pub struct PrStatus {
     /// The description. A review bot may keep its summary here, edited in
     /// place, rather than in a comment.
     pub body: Option<String>,
+    /// Who GitHub still waits on for a review: the users' logins, then each
+    /// team as `team:<slug>`. A reviewer drops off this list when they
+    /// review (and comes back when a review is requested again).
+    pub requested_reviewers: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -263,6 +267,7 @@ impl Github {
             }
             None => None,
         };
+        let requested_reviewers = raw.requested_reviewer_names();
         Ok(PrStatus {
             mergeable: raw.mergeable,
             mergeable_state: raw.mergeable_state,
@@ -272,6 +277,7 @@ impl Github {
             head_committed_at: None,
             draft: raw.draft.unwrap_or(false),
             base_ref: raw.base.map(|b| b.name),
+            requested_reviewers,
             body: raw.body,
         })
     }
@@ -856,6 +862,32 @@ struct PrDetailRaw {
     head: Option<HeadRaw>,
     base: Option<RefRaw>,
     body: Option<String>,
+    #[serde(default)]
+    requested_reviewers: Vec<RequestedUserRaw>,
+    #[serde(default)]
+    requested_teams: Vec<RequestedTeamRaw>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RequestedUserRaw {
+    login: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RequestedTeamRaw {
+    slug: String,
+}
+
+impl PrDetailRaw {
+    /// `requested_reviewers` (users) as logins, then `requested_teams` as
+    /// `team:<slug>`.
+    fn requested_reviewer_names(&self) -> Vec<String> {
+        self.requested_reviewers
+            .iter()
+            .map(|u| u.login.clone())
+            .chain(self.requested_teams.iter().map(|t| format!("team:{}", t.slug)))
+            .collect()
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1106,6 +1138,23 @@ impl<'a> NodePrRepo<'a> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn requested_reviewers_are_users_then_teams() {
+        let raw: super::PrDetailRaw = serde_json::from_str(
+            r#"{"mergeable":true,"merged":false,
+                "requested_reviewers":[{"login":"maria","id":1},{"login":"li"}],
+                "requested_teams":[{"slug":"core","name":"Core"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(raw.requested_reviewer_names(), vec!["maria", "li", "team:core"]);
+    }
+
+    #[test]
+    fn a_pull_request_without_requested_reviewers_has_none() {
+        let raw: super::PrDetailRaw = serde_json::from_str(r#"{"merged":false}"#).unwrap();
+        assert!(raw.requested_reviewer_names().is_empty());
+    }
+
     #[test]
     fn checks_combine_statuses_and_check_runs() {
         use super::{CheckRunsRaw, CombinedStatusRaw, combine_checks};

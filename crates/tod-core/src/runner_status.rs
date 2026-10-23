@@ -87,10 +87,13 @@ pub fn github_wait(waits: &[tod_store::waits::Wait]) -> Option<(String, i64)> {
     } else {
         let number = spec.strip_prefix("github:pr:").and_then(|r| r.split(':').next());
         let event = spec.rsplit(':').next().unwrap_or_default();
-        let thing = match event {
-            "merged" => "the merge",
-            "review" => "a review",
-            _ => "GitHub",
+        let thing = if crate::next_actor::is_review_spec(spec) {
+            "a review"
+        } else {
+            match event {
+                "merged" => "the merge",
+                _ => "GitHub",
+            }
         };
         match number.filter(|n| n.chars().all(|c| c.is_ascii_digit()) && !n.is_empty()) {
             Some(n) => format!("{thing} of pull request #{n}"),
@@ -252,5 +255,9 @@ mod tests {
         let waits = [wait("github:pr:12:merged", 500), wait("notes", 1), wait("github:pr:13:review", 900)];
         assert_eq!(github_wait(&waits), Some(("the merge of pull request #12".to_string(), 500)));
         assert_eq!(github_wait(&[wait("notes", 1)]), None);
+        // Both forms of a review's spec read as a review.
+        for spec in ["github:pr:13:review", "github:pr:13:review:maria,team:core"] {
+            assert_eq!(github_wait(&[wait(spec, 900)]), Some(("a review of pull request #13".to_string(), 900)));
+        }
     }
 }

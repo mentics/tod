@@ -227,6 +227,7 @@ impl crate::pr_readiness::PrFeed for FinishedGithub {
                 draft: false,
                 base_ref: Some("main".into()),
                 body: None,
+                ..Default::default()
             },
             threads: vec![],
             comments: vec![],
@@ -784,6 +785,7 @@ impl crate::pr_readiness::PrFeed for Sim {
                 draft: false,
                 base_ref: Some("main".into()),
                 body: None,
+                ..Default::default()
             },
             threads: if round == 0 {
                 vec![ReviewThread {
@@ -877,6 +879,7 @@ fn a_pull_request_waiting_for_a_person_ends_the_run_with_a_timed_wait() {
                     draft: false,
                     base_ref: None,
                     body: None,
+                    ..Default::default()
                 },
                 threads: vec![],
                 comments: vec![],
@@ -907,6 +910,48 @@ fn a_pull_request_waiting_for_a_person_ends_the_run_with_a_timed_wait() {
 }
 
 #[test]
+fn the_wait_for_a_person_records_who_was_asked_to_review() {
+    let fx = setup();
+    retire_outside_criteria(&fx);
+    struct Asked;
+    impl crate::pr_readiness::PrFeed for Asked {
+        fn snapshot(&self, _: &tod_store::github::NodePr) -> Result<tod_store::github::PrSnapshot, String> {
+            use tod_store::github::{PrSnapshot, PrStatus};
+            Ok(PrSnapshot {
+                status: PrStatus {
+                    mergeable: Some(true),
+                    mergeable_state: Some("blocked".into()),
+                    checks: Some("success".into()),
+                    head_sha: Some("abcdef1".into()),
+                    head_committed_at: Some("2020-01-01T00:00:00Z".into()),
+                    requested_reviewers: vec!["maria".into(), "team:core".into()],
+                    ..Default::default()
+                },
+                threads: vec![],
+                comments: vec![],
+                reviews: vec![],
+            })
+        }
+        fn comment(&self, _: &tod_store::github::NodePr, _: &str) -> Result<(), String> {
+            Ok(())
+        }
+    }
+    crate::pr_readiness::set_feed_override(Some(Arc::new(Asked)));
+    lifecycle::set_lifecycle(&fx.fleet, fx.node, "pr").unwrap();
+    let mut agent = FakeAgent::new(&fx.fleet);
+    let outcome = autopilot(&fx, Budget::default()).run(&fx.fleet, &mut agent).unwrap();
+    assert!(matches!(outcome, Outcome::Waiting { .. }), "{outcome:?}");
+    let waits = fx
+        .fleet
+        .read(|conn| tod_store::waits::WaitRepo::new(conn).list_pending_for_node(fx.node))
+        .unwrap();
+    assert_eq!(waits.len(), 1, "{waits:?}");
+    assert!(waits[0].match_spec.starts_with("github:pr:"), "{waits:?}");
+    assert!(waits[0].match_spec.ends_with(":review:maria,team:core"), "{waits:?}");
+    assert_eq!(crate::next_actor::WaitKind::from_spec(&waits[0].match_spec), crate::next_actor::WaitKind::HumanReview);
+}
+
+#[test]
 fn a_pull_request_that_never_changes_stops_for_a_person() {
     let fx = setup();
     retire_outside_criteria(&fx);
@@ -925,6 +970,7 @@ fn a_pull_request_that_never_changes_stops_for_a_person() {
                     draft: false,
                     base_ref: None,
                     body: None,
+                    ..Default::default()
                 },
                 threads: vec![ReviewThread {
                     id: "PRRT_1".into(),

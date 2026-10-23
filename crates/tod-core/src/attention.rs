@@ -110,6 +110,9 @@ pub struct AttentionItem {
     pub since: i64,
     /// Why the agent or runner could not handle this itself.
     pub reason: RequestReason,
+    /// A permission an agent asked for that nobody has granted
+    /// (`crate::permission`): a decision with protocol `permission`.
+    pub permission: bool,
 }
 
 /// What one node is waiting on, oldest item first.
@@ -202,6 +205,7 @@ pub fn for_nodes(conn: &Connection, node_ids: &[Uuid]) -> Result<HashMap<Uuid, N
                     // A review finding is a judgment call the reviewer flagged
                     // for the user, not a missing rule or a conflict.
                     reason: RequestReason::Risk,
+                    permission: false,
                 });
         }
     }
@@ -224,6 +228,7 @@ fn decision_item(decision: &Decision) -> AttentionItem {
         options: decision.options.clone(),
         since: decision.created_at,
         reason: RequestReason::parse(&decision.reason),
+        permission: decision.protocol.as_deref() == Some(crate::permission::PROTOCOL),
     }
 }
 
@@ -253,6 +258,7 @@ fn plan_step_item(step: &PlanStep, updated_at: i64) -> AttentionItem {
         options,
         since: updated_at,
         reason,
+        permission: false,
     }
 }
 
@@ -329,6 +335,31 @@ mod tests {
         repo.answer(decision.id, Some(1), None, "user").unwrap();
         let after = for_node(&fx.conn, node).unwrap();
         assert_eq!(after.count, 0);
+    }
+
+    #[test]
+    fn only_a_permission_decision_is_marked_as_one() {
+        let fx = fixture();
+        let node = make_node(&fx.conn, "perm");
+        let repo = DecisionRepo::new(&fx.conn);
+        repo.create(
+            node,
+            None,
+            Some(crate::permission::PROTOCOL),
+            &NewDecision { question: "Run `rm`".into(), reason: "access".into(), ..Default::default() },
+        )
+        .unwrap();
+        repo.create(
+            node,
+            None,
+            None,
+            &NewDecision { question: "Which token?".into(), reason: "access".into(), ..Default::default() },
+        )
+        .unwrap();
+        let items = for_node(&fx.conn, node).unwrap().items;
+        let flags: Vec<(&str, bool)> = items.iter().map(|i| (i.summary.as_str(), i.permission)).collect();
+        assert!(flags.contains(&("Run `rm`", true)) && flags.contains(&("Which token?", false)), "{flags:?}");
+        assert!(items.iter().all(|i| i.reason == RequestReason::Access));
     }
 
     #[test]

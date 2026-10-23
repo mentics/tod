@@ -165,6 +165,37 @@ pub enum WaitKind {
     Other,
 }
 
+/// The spec of the wait for a person's review of pull request `number`:
+/// `github:pr:<n>:review`, or `github:pr:<n>:review:<login,login>` when
+/// GitHub says whom it asked (teams as `team:<slug>`). Without a number (the
+/// pull request is not known) `github:pr:review`.
+pub fn review_spec(number: Option<i64>, reviewers: &[String]) -> String {
+    let mut spec = match number {
+        Some(n) => format!("github:pr:{n}:review"),
+        None => "github:pr:review".to_string(),
+    };
+    if !reviewers.is_empty() {
+        spec.push(':');
+        spec.push_str(&reviewers.join(","));
+    }
+    spec
+}
+
+/// Whether `spec` is a wait for a person's review, in either form of
+/// [`review_spec`].
+pub fn is_review_spec(spec: &str) -> bool {
+    spec.starts_with("github:pr:") && (spec.ends_with(":review") || spec.contains(":review:"))
+}
+
+/// The reviewers a [`review_spec`] names, comma separated; `None` for the
+/// form that names nobody (and for a spec that is not a review's).
+pub fn review_spec_reviewers(spec: &str) -> Option<&str> {
+    if !is_review_spec(spec) {
+        return None;
+    }
+    spec.split_once(":review:").map(|(_, who)| who).filter(|who| !who.is_empty())
+}
+
 impl WaitKind {
     /// The kind of an `event` wait from its `match_spec`
     /// (`autopilot::github_wait`, `autopilot::babysit`).
@@ -173,12 +204,13 @@ impl WaitKind {
             Self::Release
         } else if spec.starts_with("github:pr:") && spec.contains(":bot-review:") {
             Self::BotReview
+        } else if is_review_spec(spec) {
+            // Before checks and merge: a reviewer's name ends the spec.
+            Self::HumanReview
         } else if spec.starts_with("github:pr:") && spec.ends_with(":checks") {
             Self::Checks
         } else if spec.starts_with("github:pr:") && spec.ends_with(":merged") {
             Self::Merge
-        } else if spec.starts_with("github:pr:") && spec.ends_with("review") {
-            Self::HumanReview
         } else {
             Self::Other
         }
@@ -426,9 +458,22 @@ fn actor_for(facts: &Facts<'_>) -> (NextActor, i64) {
     let requests = facts.attention;
     if let Some(waiting_since) = requests.waiting_since {
         let newest = requests.items.iter().map(|i| i.since).max().unwrap_or(waiting_since);
+        // Only permissions the user has not granted: that is a different
+        // thing to do than answering a question, so it is its own reason.
+        // Mixed with anything else it is one more request.
+        let why = match requests.items.as_slice() {
+            [first, rest @ ..]
+                if first.permission
+                    && first.reason == crate::attention::RequestReason::Access
+                    && rest.iter().all(|i| i.permission && i.reason == crate::attention::RequestReason::Access) =>
+            {
+                YouReason::Permission { title: first.summary.clone() }
+            }
+            _ => YouReason::Request { count: requests.count },
+        };
         return (
             NextActor::You {
-                why: YouReason::Request { count: requests.count },
+                why,
                 since: waiting_since,
             },
             newest,
@@ -547,8 +592,10 @@ fn external_wait(wait: &Wait, now_ms: i64) -> ExternalWait {
         who: wait
             .match_spec
             .split_once(":bot-review:")
-            .map(|(_, bot)| bot.to_string())
-            .filter(|bot| !bot.is_empty()),
+            .map(|(_, bot)| bot)
+            .or_else(|| review_spec_reviewers(&wait.match_spec))
+            .filter(|who| !who.is_empty())
+            .map(str::to_string),
         detail: wait.detail.clone().filter(|d| !d.trim().is_empty()),
         since: wait.created_at,
         next_check_ms: Some(wait.due_at),
@@ -617,6 +664,7 @@ mod tests {
                 options: Vec::new(),
                 since,
                 reason: RequestReason::Intent,
+                permission: false,
             })
             .collect();
         let mut sorted = items;
@@ -789,6 +837,50 @@ mod tests {
         assert_eq!(standing(&c).actor, you(YouReason::Request { count: 2 }, 200));
     }
 
+    fn permission_request(node: Uuid, since: i64, summary: &str) -> AttentionItem {
+        AttentionItem {
+            kind: AttentionKind::Decision,
+            id: Uuid::new_v4(),
+            node_id: node,
+            summary: summary.into(),
+            options: Vec::new(),
+            since,
+            reason: RequestReason::Access,
+            permission: true,
+        }
+    }
+
+    fn attention_of(node: Uuid, mut items: Vec<AttentionItem>) -> NodeAttention {
+        items.sort_by_key(|i| i.since);
+        NodeAttention {
+            node_id: node,
+            waiting_since: items.first().map(|i| i.since),
+            count: items.len(),
+            items,
+        }
+    }
+
+    #[test]
+    fn a_pending_permission_is_its_own_reason() {
+        let mut c = case("active");
+        c.attention = attention_of(Uuid::nil(), vec![permission_request(Uuid::nil(), 40, "Run `rm`")]);
+        assert_eq!(standing(&c).actor, you(YouReason::Permission { title: "Run `rm`".into() }, 40));
+    }
+
+    #[test]
+    fn a_permission_mixed_with_another_request_stays_a_request() {
+        let mut c = case("active");
+        let mut items = vec![permission_request(Uuid::nil(), 40, "Run `rm`")];
+        items.extend(requests(Uuid::nil(), &[50]).items);
+        c.attention = attention_of(Uuid::nil(), items);
+        assert_eq!(standing(&c).actor, you(YouReason::Request { count: 2 }, 40));
+        // An access request that is not a permission is a request too.
+        let mut plain = permission_request(Uuid::nil(), 40, "needs a token");
+        plain.permission = false;
+        c.attention = attention_of(Uuid::nil(), vec![plain]);
+        assert_eq!(standing(&c).actor, you(YouReason::Request { count: 1 }, 40));
+    }
+
     #[test]
     fn requests_beat_a_pending_wait() {
         let mut c = case("pr");
@@ -871,6 +963,31 @@ mod tests {
         assert_eq!(WaitKind::from_spec("github:pr:7:checks"), WaitKind::Checks);
         assert_eq!(WaitKind::from_spec(""), WaitKind::Other);
         assert_eq!(WaitKind::from_spec("github:pr 12 checks"), WaitKind::Other);
+    }
+
+    #[test]
+    fn a_review_spec_round_trips_and_both_forms_are_a_human_review() {
+        let reviewers = vec!["maria".to_string(), "team:checks".to_string()];
+        let spec = review_spec(Some(7), &reviewers);
+        assert_eq!(spec, "github:pr:7:review:maria,team:checks");
+        assert_eq!(WaitKind::from_spec(&spec), WaitKind::HumanReview);
+        assert_eq!(review_spec_reviewers(&spec), Some("maria,team:checks"));
+        assert_eq!(review_spec(Some(7), &[]), "github:pr:7:review");
+        assert_eq!(review_spec(None, &[]), "github:pr:review");
+        assert_eq!(WaitKind::from_spec("github:pr:7:review"), WaitKind::HumanReview);
+        assert_eq!(review_spec_reviewers("github:pr:7:review"), None);
+        assert_eq!(review_spec_reviewers("github:pr:7:merged"), None);
+    }
+
+    #[test]
+    fn a_human_review_wait_names_the_requested_reviewers() {
+        let mut c = case("pr");
+        c.waits = vec![wait("github:pr:7:review:maria,li", NOW + 60_000, NOW)];
+        let NextActor::Others { wait } = standing(&c).actor else { panic!("not others") };
+        assert_eq!((wait.kind, wait.who.as_deref()), (WaitKind::HumanReview, Some("maria,li")));
+        c.waits = vec![wait_at(NOW + 60_000, NOW)];
+        let NextActor::Others { wait } = standing(&c).actor else { panic!("not others") };
+        assert_eq!((wait.kind, wait.who), (WaitKind::HumanReview, None));
     }
 
     #[test]

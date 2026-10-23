@@ -745,10 +745,12 @@ impl Autopilot {
             .iter()
             .find(|p| p.assessment.waits().iter().any(|w| matches!(w, Wait::HumanReview)))
             .map(|p| p.pr.clone());
-        let spec = waiting_on
-            .as_ref()
-            .map(|pr| format!("github:pr:{}:review", pr.pr_number))
-            .unwrap_or_else(|| "github:pr:review".to_string());
+        let requested = live
+            .iter()
+            .find(|p| p.assessment.waits().iter().any(|w| matches!(w, Wait::HumanReview)))
+            .map(|p| p.assessment.requested_reviewers.as_slice())
+            .unwrap_or_default();
+        let spec = crate::next_actor::review_spec(waiting_on.as_ref().map(|pr| pr.pr_number), requested);
         let mut what = match &waiting_on {
             Some(pr) => format!("a review of {}", pr.url),
             None => "a review".to_string(),

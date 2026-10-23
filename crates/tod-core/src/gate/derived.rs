@@ -1385,6 +1385,7 @@ mod readiness_tests {
                 draft: false,
                 base_ref: Some("main".into()),
                 body: None,
+                ..Default::default()
             },
             threads,
             comments: review
