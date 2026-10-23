@@ -145,6 +145,7 @@ mod tests {
                 options: Vec::new(),
                 since: waiting_since.unwrap_or(0) + ix as i64,
                 reason: RequestReason::Other,
+                permission: false,
             })
             .collect::<Vec<_>>();
         NodeAttention {

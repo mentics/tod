@@ -41,7 +41,6 @@ use gpui::{
 use gpui_component::button::Button;
 use gpui_component::{ActiveTheme, IconName, Selectable, Sizable};
 use tod_core::attention::NodeAttention;
-use tod_core::task::model::RunSource;
 use tod_core::workbench_layout::{self, WorkbenchLayout};
 use tod_store::conversation::Focus;
 use tod_store::fleet::FleetStore;
@@ -259,19 +258,19 @@ pub struct UnifiedView {
     /// `SelectionChanged`, delivered later, must not open the node's default
     /// panel over the columns that were restored with it.
     restoring_selection: Option<Uuid>,
-    /// Who was working on each node when the tree was last told: the
-    /// lifecycle processor, and only the chat panel. A node leaving both
-    /// has stopped, and lands in [`Self::finished`].
+    /// Who was working on each node when this was last worked out: the
+    /// lifecycle processor, and only the chat panel. A chat leaving both
+    /// has stopped, and lands in [`Self::finished`]. Only the chat half is
+    /// told to the tree; who is next for the node is `NodeStanding`.
     last_lifecycle_running: std::collections::HashSet<Uuid>,
     /// Nodes whose supervisor is working in the cloud now
     /// (`tod_core::cloud_sync::working_in_cloud`), shown as running.
     cloud_working: std::collections::HashSet<Uuid>,
     last_chat_running: std::collections::HashSet<Uuid>,
-    /// Nodes whose run stopped since the user last selected them, oldest
-    /// first, and which kind stopped. The tree marks them (orange, ringed
-    /// icon) and Alt+Q visits them after the nodes waiting on the user;
-    /// selecting one (by click or by Alt+Q) clears it.
-    finished: Vec<(Uuid, RunSource)>,
+    /// Nodes whose chat stopped since the user last selected them, oldest
+    /// first. The tree marks them with a dot; selecting one (by click or by
+    /// Alt+Q) clears it.
+    finished: Vec<Uuid>,
     _task_list_subscription: Subscription,
     _agent_runs_subscription: Subscription,
     _runners_subscription: Subscription,
@@ -481,6 +480,8 @@ impl UnifiedView {
             self.chat_leases = feed.chat_working;
             self.apply_running_nodes(cx);
         }
+        // The "· waiting" status labels follow who is next.
+        self.apply_status_overrides(cx);
         self.push_standings_to_panels(cx);
     }
 
@@ -551,12 +552,12 @@ impl UnifiedView {
             if self.last_lifecycle_running.contains(&node) {
                 continue;
             }
-            self.finished.retain(|(id, _)| *id != node);
-            self.finished.push((node, RunSource::Chat));
+            self.finished.retain(|id| *id != node);
+            self.finished.push(node);
         }
         // A node working again is no longer "finished".
         self.finished
-            .retain(|(id, _)| !lifecycle.contains(id) && !chat.contains(id));
+            .retain(|id| !lifecycle.contains(id) && !chat.contains(id));
         self.last_lifecycle_running = lifecycle;
         self.last_chat_running = chat;
         self.feed_running_nodes(cx);
@@ -566,21 +567,16 @@ impl UnifiedView {
         let ids = |set: &std::collections::HashSet<Uuid>| -> std::collections::HashSet<String> {
             set.iter().map(|n| n.to_string()).collect()
         };
-        let lifecycle = ids(&self.last_lifecycle_running);
         let chat = ids(&self.last_chat_running);
-        let finished = self
-            .finished
-            .iter()
-            .map(|(id, source)| (id.to_string(), *source))
-            .collect();
+        let finished = ids(&self.finished.iter().copied().collect());
         self.task_list
-            .update(cx, |task_list, cx| task_list.set_running_nodes(lifecycle, chat, finished, cx));
+            .update(cx, |task_list, cx| task_list.set_running_nodes(chat, finished, cx));
     }
 
     /// The user has seen `node`: drop its "finished" marker.
     fn clear_finished(&mut self, node: Uuid, cx: &mut Context<Self>) {
         let before = self.finished.len();
-        self.finished.retain(|(id, _)| *id != node);
+        self.finished.retain(|id| *id != node);
         if self.finished.len() != before {
             self.feed_running_nodes(cx);
         }
@@ -600,20 +596,25 @@ impl UnifiedView {
                 .flatten()
                 .map(|task| task.lifecycle)
         });
-        let awaiting = self.runners.read(cx).awaiting_nodes();
-        let ids: std::collections::HashSet<String> = awaiting.iter().map(|n| n.to_string()).collect();
-        self.task_list.update(cx, |task_list, cx| task_list.set_awaiting(ids, cx));
         let mut map: std::collections::HashMap<String, String> =
             map.into_iter().map(|(id, label)| (id.to_string(), label)).collect();
-        // A node whose run ended to wait (for a review, say) is out of the
-        // way: nobody owes it anything, time has to pass.
-        for node in awaiting {
-            let id = node.to_string();
+        // A node waiting on others (a review, say) is out of the way: nobody
+        // owes it anything, time has to pass. Who is next says so.
+        for standing in self.standings.values().filter(|s| {
+            matches!(s.actor, tod_core::next_actor::NextActor::Others { .. })
+        }) {
+            let id = standing.node_id.to_string();
             if map.contains_key(&id) {
                 continue;
             }
-            if let Some(task) = self.fleet.get_node(&id).ok().flatten() {
-                map.insert(id, format!("{} · waiting", task.lifecycle));
+            match self.fleet.get_node(&id) {
+                Ok(Some(task)) => {
+                    map.insert(id, format!("{} · waiting", task.lifecycle));
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    tracing::error!("could not read node {id} for its status label: {err:#}")
+                }
             }
         }
         self.task_list.update(cx, |task_list, cx| {
@@ -1089,7 +1090,7 @@ impl UnifiedView {
         let unseen: Vec<Uuid> = self
             .finished
             .iter()
-            .map(|(id, _)| *id)
+            .copied()
             .filter(|id| !order.contains(id) && !self.standings.contains_key(id))
             .collect();
         order.extend(unseen);

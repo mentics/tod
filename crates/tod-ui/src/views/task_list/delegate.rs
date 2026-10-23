@@ -18,7 +18,7 @@ use gpui_component::tooltip::Tooltip;
 use gpui_component::{ActiveTheme, Sizable, StyledExt, h_flex};
 
 use super::TaskListView;
-use super::model::{RunSource, TaskItem};
+use super::model::TaskItem;
 use super::standing::{self, Counts, Glyph, Mark, Shape, Tone};
 use tod_core::next_actor::NodeStanding;
 use super::row_menu::{RowMenuKind, popup_anchor, popup_at, row_menu_anchor};
@@ -704,7 +704,10 @@ impl ListDelegate for TaskListDelegate {
         } else {
             let title_color = if item.title.is_empty() {
                 muted_foreground
-            } else if item.awaiting {
+            } else if matches!(
+                self.standings.get(&item.id).map(|s| &s.actor),
+                Some(tod_core::next_actor::NextActor::Others { .. })
+            ) {
                 // A wait nobody owes anything to: out of the way.
                 muted_foreground
             } else if managed {
@@ -1036,7 +1039,7 @@ fn chat_decorator(item: &TaskItem) -> Option<gpui::AnyElement> {
                 .into_any_element(),
         );
     }
-    if item.finished_run == Some(RunSource::Chat) {
+    if item.chat_finished {
         return Some(
             div()
                 .flex_shrink_0()

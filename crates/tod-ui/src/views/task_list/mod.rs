@@ -49,7 +49,6 @@ use gpui_component::menu::PopupMenu;
 use gpui_component::{ActiveTheme, Disableable, Sizable, StyledExt};
 use model::{ListWorkingSet as WorkingSet, nearest_visible_id};
 use row_menu::RowMenuKind;
-use tod_core::task::model::RunSource;
 use tod_store::fleet::{FleetStore, code_editors};
 use tod_store::outline::{CreatePosition, OutlineMutation, ReorderDirection};
 use working_set::{load_working_set, save_working_set};
@@ -202,13 +201,13 @@ pub fn register_task_list_keyboard_bindings(cx: &mut App) {
     key_context::bind_panel_escape(cx, TaskListDismissOverlay, TASK_LIST_CONTEXT);
 }
 
-/// What `set_running_nodes` last reported: who is working on each node now,
-/// and which nodes stopped since the user last selected them.
+/// What `set_running_nodes` last reported: which chats are working on a
+/// node now, and which stopped since the user last selected the node.
+/// (Who is next for the node itself is `NodeStanding`.)
 #[derive(Default, PartialEq)]
 struct RunFeed {
-    lifecycle: std::collections::HashSet<String>,
     chat: std::collections::HashSet<String>,
-    finished: std::collections::HashMap<String, RunSource>,
+    chat_finished: std::collections::HashSet<String>,
 }
 
 /// What a node is waiting on the user for, as the host (W6's attention
@@ -662,7 +661,7 @@ impl TaskListView {
             .as_ref()
             .and_then(|id| {
                 nearest_visible_id(
-                    &standing::restrict(&self.all_tasks, &self.actor_view),
+                    &standing::restrict(&self.all_tasks, &self.actor_view.standings, self.working_set.actor_filter),
                     &self.search_query,
                     &self.working_set,
                     id,
@@ -1731,9 +1730,8 @@ impl TaskListView {
 
     fn apply_running(tasks: &mut [TaskItem], feed: &RunFeed) {
         for task in tasks.iter_mut() {
-            task.lifecycle_running = feed.lifecycle.contains(&task.id);
             task.chat_running = feed.chat.contains(&task.id);
-            task.finished_run = feed.finished.get(&task.id).copied();
+            task.chat_finished = feed.chat_finished.contains(&task.id);
         }
     }
 
@@ -2797,35 +2795,16 @@ impl TaskListView {
         cx.notify();
     }
 
-    /// The host reports which nodes' runs ended to wait for something outside;
-    /// their rows recede. A node leaving the set goes back to normal.
-    pub fn set_awaiting(&mut self, nodes: std::collections::HashSet<String>, cx: &mut Context<Self>) {
-        let mut changed = false;
-        for task in self.all_tasks.iter_mut() {
-            let next = nodes.contains(&task.id);
-            if task.awaiting != next {
-                task.awaiting = next;
-                changed = true;
-            }
-        }
-        if changed {
-            self.pending_status_override_apply = true;
-            cx.notify();
-        }
-    }
-
-    /// The host reports which nodes the lifecycle processor is working on,
-    /// which only the chat panel is, and which stopped since the user last
-    /// selected them. Their rows show the matching icon and title colour; a
-    /// node leaving a set goes back to normal.
+    /// The host reports which nodes a chat is working on, and which a chat
+    /// stopped on since the user last selected them. Their rows show the
+    /// chat spinner or dot; a node leaving a set goes back to normal.
     pub fn set_running_nodes(
         &mut self,
-        lifecycle: std::collections::HashSet<String>,
         chat: std::collections::HashSet<String>,
-        finished: std::collections::HashMap<String, RunSource>,
+        chat_finished: std::collections::HashSet<String>,
         cx: &mut Context<Self>,
     ) {
-        let feed = RunFeed { lifecycle, chat, finished };
+        let feed = RunFeed { chat, chat_finished };
         if feed == self.running_nodes {
             return;
         }
@@ -3629,7 +3608,7 @@ mod tests {
         });
         // The "Needs you" filter keeps the node visible (it matches).
         view.update_in(cx, |view, window, cx| {
-            view.working_set.needs_you_only = true;
+            view.working_set.actor_filter = Some(super::standing::Bucket::OnMe);
             view.rebuild_visible_list(window, cx);
         });
         draw(cx);
@@ -3673,7 +3652,7 @@ mod tests {
         });
         // On others hides it; on me keeps it.
         view.update_in(cx, |view, window, cx| {
-            view.actor_view.filter = Some(super::standing::Bucket::OnOthers);
+            view.working_set.actor_filter = Some(super::standing::Bucket::OnOthers);
             view.rebuild_visible_list(window, cx);
         });
         draw(cx);
@@ -3681,7 +3660,7 @@ mod tests {
             assert!(!view.list_state.read(cx).delegate().items().iter().any(|t| t.id == node_id));
         });
         view.update_in(cx, |view, window, cx| {
-            view.actor_view.filter = Some(super::standing::Bucket::OnMe);
+            view.working_set.actor_filter = Some(super::standing::Bucket::OnMe);
             view.rebuild_visible_list(window, cx);
         });
         draw(cx);

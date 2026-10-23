@@ -22,31 +22,19 @@ use tod_core::task::model::{
     ListWorkingSet, SortKey, TaskItem, filter_and_sort_tasks,
 };
 
-/// The four ways a node can be placed for the summary strip and its filters.
-/// A node that is `Done` (or has no standing) is in none.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Bucket {
-    /// `You`, not deferred.
-    OnMe,
-    /// `Others`.
-    OnOthers,
-    /// `Working`.
-    Running,
-    /// `You`, and the user deferred it.
-    Deferred,
-}
+/// The four ways a node can be placed for the summary strip and its filters
+/// (the persisted [`ActorBucket`]). A node that is `Done` (or has no
+/// standing) is in none.
+pub use tod_core::task::model::ActorBucket as Bucket;
 
-impl Bucket {
-    pub const ALL: [Bucket; 4] = [Bucket::OnMe, Bucket::OnOthers, Bucket::Running, Bucket::Deferred];
-
-    pub fn of(standing: &NodeStanding) -> Option<Bucket> {
-        match &standing.actor {
-            NextActor::Done => None,
-            NextActor::Working { .. } => Some(Bucket::Running),
-            NextActor::Others { .. } => Some(Bucket::OnOthers),
-            NextActor::You { .. } if standing.deferred.is_some() => Some(Bucket::Deferred),
-            NextActor::You { .. } => Some(Bucket::OnMe),
-        }
+/// Which bucket `standing` is in.
+pub fn bucket_of(standing: &NodeStanding) -> Option<Bucket> {
+    match &standing.actor {
+        NextActor::Done => None,
+        NextActor::Working { .. } => Some(Bucket::Running),
+        NextActor::Others { .. } => Some(Bucket::OnOthers),
+        NextActor::You { .. } if standing.deferred.is_some() => Some(Bucket::Deferred),
+        NextActor::You { .. } => Some(Bucket::OnMe),
     }
 }
 
@@ -99,7 +87,7 @@ impl Counts {
     }
 
     fn add(&mut self, standing: &NodeStanding) {
-        match Bucket::of(standing) {
+        match bucket_of(standing) {
             None => {}
             Some(Bucket::OnMe) if is_failure(standing) => self.failures += 1,
             Some(Bucket::OnMe) => self.requests += 1,
@@ -177,7 +165,7 @@ fn matching_with_ancestors(
     let by_id: HashMap<&str, &TaskItem> = tasks.iter().map(|t| (t.id.as_str(), t)).collect();
     let mut ids = HashSet::new();
     for task in tasks {
-        if standings.get(&task.id).and_then(Bucket::of) != Some(bucket) {
+        if standings.get(&task.id).and_then(bucket_of) != Some(bucket) {
             continue;
         }
         let mut cur = Some(task);
@@ -191,19 +179,26 @@ fn matching_with_ancestors(
     ids
 }
 
-/// What the tree knows about who is next, and which bucket it shows.
+/// What the tree knows about who is next. The bucket it shows is the working
+/// set's `actor_filter`, which is persisted.
 #[derive(Debug, Default, Clone)]
 pub struct ActorView {
     pub standings: HashMap<String, NodeStanding>,
-    pub filter: Option<Bucket>,
 }
 
 /// The rows the strip's filter leaves: the nodes in the chosen bucket and
 /// their ancestors, or all of them with no filter.
-pub fn restrict(tasks: &[TaskItem], view: &ActorView) -> Vec<TaskItem> {
-    match view.filter {
+pub fn restrict(
+    tasks: &[TaskItem],
+    standings: &HashMap<String, NodeStanding>,
+    filter: Option<Bucket>,
+) -> Vec<TaskItem> {
+    match filter {
+        // Nothing reported yet (the app is starting): a filter restored from
+        // the last run would hide every row until the first report.
+        Some(_) if standings.is_empty() => tasks.to_vec(),
         Some(bucket) => {
-            let keep = matching_with_ancestors(tasks, &view.standings, bucket);
+            let keep = matching_with_ancestors(tasks, standings, bucket);
             tasks.iter().filter(|t| keep.contains(&t.id)).cloned().collect()
         }
         None => tasks.to_vec(),
@@ -220,7 +215,7 @@ pub fn visible(
     ws: &ListWorkingSet,
     view: &ActorView,
 ) -> Vec<TaskItem> {
-    let mut base = restrict(tasks, view);
+    let mut base = restrict(tasks, &view.standings, ws.actor_filter);
     if ws.sort_key != SortKey::WaitingLongest {
         return filter_and_sort_tasks(&base, search, ws);
     }
@@ -228,8 +223,8 @@ pub fn visible(
     // requests only. Stamp the actor's own onto a copy for the sort.
     for task in &mut base {
         let standing = view.standings.get(&task.id);
-        let waits = standing.is_some_and(|s| match view.filter {
-            Some(bucket) => Bucket::of(s) == Some(bucket),
+        let waits = standing.is_some_and(|s| match ws.actor_filter {
+            Some(bucket) => bucket_of(s) == Some(bucket),
             None => s.on_you(),
         });
         match standing.and_then(|s| s.since()).filter(|_| waits) {
@@ -572,11 +567,11 @@ mod tests {
 
     #[test]
     fn buckets() {
-        assert_eq!(Bucket::of(&working(1)), Some(Bucket::Running));
-        assert_eq!(Bucket::of(&request(1)), Some(Bucket::OnMe));
-        assert_eq!(Bucket::of(&deferred(request(1))), Some(Bucket::Deferred));
-        assert_eq!(Bucket::of(&others(wait(1))), Some(Bucket::OnOthers));
-        assert_eq!(Bucket::of(&standing(NextActor::Done)), None);
+        assert_eq!(bucket_of(&working(1)), Some(Bucket::Running));
+        assert_eq!(bucket_of(&request(1)), Some(Bucket::OnMe));
+        assert_eq!(bucket_of(&deferred(request(1))), Some(Bucket::Deferred));
+        assert_eq!(bucket_of(&others(wait(1))), Some(Bucket::OnOthers));
+        assert_eq!(bucket_of(&standing(NextActor::Done)), None);
     }
 
     #[test]
@@ -663,8 +658,8 @@ mod tests {
             visible(
                 &t,
                 "",
-                &ListWorkingSet::default_sort(),
-                &ActorView { standings: s.clone(), filter },
+                &ListWorkingSet { actor_filter: filter, ..ListWorkingSet::default_sort() },
+                &ActorView { standings: s.clone() },
             )
             .into_iter()
             .map(|t| t.id)
@@ -689,14 +684,15 @@ mod tests {
             sort_key: SortKey::WaitingLongest,
             ..ListWorkingSet::default_sort()
         };
-        let out = visible(&t, "", &ws, &ActorView { standings: s.clone(), filter: None });
+        let out = visible(&t, "", &ws, &ActorView { standings: s.clone() });
         // On me, oldest first; the rest follow in tree order.
         assert_eq!(out.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(), ["b", "d", "a", "c"]);
         // The stamped sort values are not left on the rows.
         assert!(out.iter().all(|t| t.needs_you_count == 0 && t.waiting_since.is_none()));
         // Within a chosen bucket the same rule orders it.
         let s2 = map(vec![("a", others(wait(30))), ("b", others(wait(10))), ("c", others(wait(20)))]);
-        let out = visible(&t, "", &ws, &ActorView { standings: s2, filter: Some(Bucket::OnOthers) });
+        let ws = ListWorkingSet { actor_filter: Some(Bucket::OnOthers), ..ws };
+        let out = visible(&t, "", &ws, &ActorView { standings: s2 });
         assert_eq!(out.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(), ["b", "c", "a"]);
     }
 

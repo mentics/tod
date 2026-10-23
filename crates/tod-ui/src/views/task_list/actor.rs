@@ -124,7 +124,7 @@ impl TaskListView {
 
     /// The strip filter that is on.
     pub fn actor_filter(&self) -> Option<Bucket> {
-        self.actor_view.filter
+        self.working_set.actor_filter
     }
 
     /// Turn the strip's `bucket` filter on, or off when it already is.
@@ -136,8 +136,9 @@ impl TaskListView {
         cx: &mut Context<Self>,
     ) {
         let bucket = button.bucket();
-        let now_on = self.actor_view.filter != Some(bucket);
-        self.actor_view.filter = now_on.then_some(bucket);
+        let now_on = self.working_set.actor_filter != Some(bucket);
+        self.working_set.actor_filter = now_on.then_some(bucket);
+        self.persist_working_set();
         self.record_strip_toggle(button, now_on, shown, cx);
         self.rebuild_visible_list(window, cx);
         // "On others" is also the place to see what to chase.
@@ -182,7 +183,7 @@ impl TaskListView {
     pub(super) fn render_actor_strip(&self, cx: &mut Context<Self>) -> Vec<gpui::AnyElement> {
         use gpui::IntoElement as _;
         let counts = standing::totals(&self.all_tasks, &self.actor_view.standings);
-        let shown = strip_buttons(&counts, self.actor_view.filter);
+        let shown = strip_buttons(&counts, self.working_set.actor_filter);
         shown
             .iter()
             .map(|(button, label)| {
@@ -200,7 +201,7 @@ impl TaskListView {
                 }
                 crate::ui::style::button_toggle(
                     chip,
-                    self.actor_view.filter == Some(button.bucket())
+                    self.working_set.actor_filter == Some(button.bucket())
                         && (button != StripButton::Failed),
                 )
                 .into_any_element()
@@ -210,7 +211,7 @@ impl TaskListView {
 
     pub(super) fn strip_is_shown(&self) -> bool {
         let counts = standing::totals(&self.all_tasks, &self.actor_view.standings);
-        !strip_buttons(&counts, self.actor_view.filter).is_empty()
+        !strip_buttons(&counts, self.working_set.actor_filter).is_empty()
     }
 
     // ------------------------------------------------------------- defer
