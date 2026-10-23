@@ -231,6 +231,13 @@ impl RunnerAction {
     }
 }
 
+/// Whether "Check now" has something to read: the node is in a state that
+/// waits on its pull requests (`pr`, `approved`, `merged`; any other state
+/// "waits for nothing there"), it has pull requests linked, and it is not done.
+fn offers_check_now(lifecycle: &str, has_pull_requests: bool, done: bool) -> bool {
+    !done && has_pull_requests && matches!(lifecycle, "pr" | "approved" | "merged")
+}
+
 /// The split button: its default action (with its label and whether it is
 /// disabled) and the menu's.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -722,15 +729,15 @@ impl TaskPanel {
     /// What the split button offers for `status`.
     fn runner_actions(&self, live: Option<&LiveTurn>, cx: &App) -> RunnerActions {
         let mut actions = self.runner_actions_for_place(live, cx);
-        // A scheduled GitHub look can be brought forward wherever the node
-        // runs (here, in a dev container, in a cloud sandbox).
-        // A cloud node's supervisor may have stopped without a wait reaching
-        // here (the stop is not synced), so there it is offered in
-        // `pr`, `approved` and `merged` whatever the status says.
-        let waits_on_github = self.awaits_others()
-            || (self.runner.cloud.as_ref().is_some_and(|cloud| cloud.lost_at.is_none())
-                && matches!(self.runner.lifecycle.as_str(), "pr" | "approved" | "merged"));
-        if waits_on_github && !actions.menu.contains(&RunnerAction::PollNow) && !actions.menu.contains(&RunnerAction::CheckNow) {
+        // A look at GitHub is tod's own code and needs no run, sandbox or
+        // agent, so it is offered wherever the node runs and whoever is
+        // next: a failed look, a paused run and a lost sandbox are when it
+        // is wanted most. It depends on the state and the links, not on the
+        // standing, since only those decide whether there is anything to read.
+        if offers_check_now(&self.runner.lifecycle, !self.header.pull_requests.is_empty(), self.is_done())
+            && !actions.menu.contains(&RunnerAction::PollNow)
+            && !actions.menu.contains(&RunnerAction::CheckNow)
+        {
             actions.menu.insert(0, RunnerAction::CheckNow);
         }
         actions
@@ -1455,6 +1462,18 @@ fn test_runners(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn check_now_is_offered_for_a_state_that_waits_on_its_pull_requests() {
+        for state in ["pr", "approved", "merged"] {
+            assert!(offers_check_now(state, true, false), "{state}");
+            assert!(!offers_check_now(state, false, false), "{state} without a pull request");
+            assert!(!offers_check_now(state, true, true), "{state} when done");
+        }
+        for state in ["", "proposed", "design", "planning", "implementing", "verifying", "review", "released", "learn"] {
+            assert!(!offers_check_now(state, true, false), "{state:?} reads nothing on GitHub");
+        }
+    }
 
     #[test]
     fn labels_show_failed_only_when_any() {
