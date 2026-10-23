@@ -494,7 +494,7 @@ fn actor_for(facts: &Facts<'_>) -> (NextActor, i64) {
                     detail: Some(what.clone()),
                     since: *at,
                     next_check_ms: Some(*due_at_ms),
-                    overdue: *due_at_ms + OVERDUE_GRACE_MS < facts.now_ms,
+                    overdue: due_at_ms.saturating_add(OVERDUE_GRACE_MS) < facts.now_ms,
                     retry: None,
                 },
             },
@@ -552,7 +552,7 @@ fn external_wait(wait: &Wait, now_ms: i64) -> ExternalWait {
         detail: wait.detail.clone().filter(|d| !d.trim().is_empty()),
         since: wait.created_at,
         next_check_ms: Some(wait.due_at),
-        overdue: wait.due_at + grace < now_ms,
+        overdue: wait.due_at.saturating_add(grace) < now_ms,
         retry: wait.last_error.as_ref().map(|error| Retry {
             attempt: wait.attempt,
             max: wait.max_attempts.unwrap_or(tod_store::waits::DEFAULT_MAX_ATTEMPTS),

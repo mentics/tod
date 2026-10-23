@@ -2,5 +2,6 @@
 //! [`server::run`] is the `tod-agentd` binary; the protocol and the client are
 //! in `tod-agentd-client`.
 
+pub mod actor_journey;
 pub mod runners;
 pub mod server;

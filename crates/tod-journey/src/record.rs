@@ -106,6 +106,19 @@ pub enum Event {
         #[serde(default)]
         state: String,
     },
+    /// Who has to act for the node changed (`tod_core::next_actor`). `from`
+    /// and `to` are short descriptions such as `you:request`, `you:failed`,
+    /// `others:human_review`, `working:runner`; `from` is empty the first time
+    /// the node is seen. `detail` is the new reason in words (an error, a
+    /// reviewer), when there is one.
+    NextActorChanged {
+        #[serde(default)]
+        from: String,
+        #[serde(default)]
+        to: String,
+        #[serde(default)]
+        detail: String,
+    },
     Report {
         #[serde(default)]
         note: String,

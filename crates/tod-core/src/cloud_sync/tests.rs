@@ -294,6 +294,16 @@ fn a_cloud_node_is_working_only_when_it_waits_on_nothing() {
     fleet.reload_if_stale().unwrap();
     let nodes = fleet.flatten_outline(list_id).unwrap();
     let ids: Vec<uuid::Uuid> = nodes.iter().map(|n| n.node.id).collect();
+    // Who is next is only worked out for nodes with Lifecycle.
+    for id in &ids {
+        fleet
+            .enqueue_outline(OutlineMutation::EnableCapabilities {
+                node_id: *id,
+                capabilities: vec![tod_store::outline::Capability::Lifecycle],
+            })
+            .unwrap();
+    }
+    fleet.writer().flush().unwrap();
     for id in &ids {
         fleet
             .enqueue(FleetMutation::CloudNodeUpsert { node: *id, sandbox: "s".into(), user: "u".into(), accepted_at: 1 })
@@ -305,7 +315,7 @@ fn a_cloud_node_is_working_only_when_it_waits_on_nothing() {
     fleet
         .interview(
             "test",
-            InterviewCommand::RecordWait { node_id: ids[1], wait: NewWait::event("github:pr 1 checks", i64::MAX / 2) },
+            InterviewCommand::RecordWait { node_id: ids[1], wait: NewWait::event("github:pr 1 checks", tod_store::outline::uuid_blob::now_ms() + 86_400_000) },
         )
         .unwrap();
     fleet.writer().flush().unwrap();
