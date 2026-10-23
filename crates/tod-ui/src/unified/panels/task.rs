@@ -1096,7 +1096,10 @@ impl TaskPanel {
         if let Some(cloud) = &self.runner.cloud {
             let mut text = format!("in the cloud (sandbox {})", cloud.sandbox);
             if cloud.lost_at.is_some() {
-                text.push_str(", its sandbox is gone");
+                // What woke it (a release, a merge) found nothing there: the
+                // orchestrator marked it, and the app makes a new one at its
+                // next sync, so a closed app leaves the node waiting for it.
+                text.push_str(", its sandbox is gone: the app makes a new one when it next syncs");
             }
             line = line.child(sep()).child(style::text_muted(div().flex_auto().min_w(gpui::px(160.))).child(
                 selectable_text("unified-task-runner-cloud", text, window, cx),

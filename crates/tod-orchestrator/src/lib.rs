@@ -220,6 +220,7 @@ impl Server {
                         }
                     }
                     ("GET", ["notify"]) => self.notify_topics(&user),
+                    ("GET" | "PUT", ["github-routes"]) => self.github_routes(&user, request),
                     ("GET", ["snapshot"]) => match self.users.get(&user) {
                         Ok(data) => sync_backend::snapshot(&data),
                         Err(err) => Response::text(500, format!("{err:#}")),
@@ -270,6 +271,41 @@ impl Server {
         };
         users::validate(user).map_err(|e| Response::text(400, format!("{e:#}")))?;
         Ok(user.to_string())
+    }
+
+    /// `GET`/`PUT /users/<u>/github-routes`: which of the orchestrator's
+    /// GitHub tokens reads which repository (`tod_store::github_routes`).
+    /// It names proxy secrets and holds no token.
+    fn github_routes(&self, user: &str, request: &Request) -> Response {
+        use tod_store::github_routes::GithubRoutes;
+        let root = match self.users.root_of(user) {
+            Ok(r) => r,
+            Err(err) => return Response::text(400, format!("{err:#}")),
+        };
+        if request.method == "GET" {
+            return match GithubRoutes::load(&root) {
+                Ok(routes) => Response {
+                    status: 200,
+                    content_type: "application/json",
+                    body: serde_json::to_vec(&routes).unwrap_or_default(),
+                },
+                Err(err) => Response::text(500, format!("{err:#}")),
+            };
+        }
+        let routes: GithubRoutes = match serde_json::from_slice(&request.body) {
+            Ok(r) => r,
+            Err(err) => return Response::text(400, format!("bad routes: {err}")),
+        };
+        for route in &routes.routes {
+            let secret_ok = !route.secret.is_empty() && route.secret.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+            if route.pattern.trim().is_empty() || !secret_ok {
+                return Response::text(400, format!("bad route {:?}: a pattern, and a secret of letters, digits and _", route.pattern));
+            }
+        }
+        match routes.save(&root) {
+            Ok(()) => Response::text(200, "ok"),
+            Err(err) => Response::text(500, format!("{err:#}")),
+        }
     }
 
     /// `GET /users/<u>/notify`: the ntfy server and the user's topics.

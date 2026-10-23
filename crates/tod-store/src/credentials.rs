@@ -120,6 +120,9 @@ pub struct CredentialStore {
     /// GitHub is authenticated by the sandbox's proxy
     /// ([`crate::github::proxy_authenticated`], read when the store is made).
     github_via_proxy: bool,
+    /// Where each repository's token is chosen, in the orchestrator
+    /// ([`crate::github::routed_authenticated`]); read when the store is made.
+    github_routes: Option<crate::github_routes::GithubRoutes>,
 }
 
 impl CredentialStore {
@@ -128,6 +131,7 @@ impl CredentialStore {
             credentials_dir: paths.credentials_dir(),
             keyring_service: KEYRING_SERVICE.to_string(),
             github_via_proxy: crate::github::proxy_authenticated(),
+            github_routes: routes_in(paths.data_root()),
         }
     }
 
@@ -136,6 +140,7 @@ impl CredentialStore {
             credentials_dir: data_root.join("credentials"),
             keyring_service: KEYRING_SERVICE.to_string(),
             github_via_proxy: crate::github::proxy_authenticated(),
+            github_routes: routes_in(data_root),
         }
     }
 
@@ -620,10 +625,26 @@ pub fn resolve_linear_api_key(store: &CredentialStore) -> Option<String> {
     store.get(CredentialKind::LinearApiKey)
 }
 
+/// The orchestrator's repository-to-token routes in `data_root`, where this
+/// process reads GitHub with them ([`crate::github::routed_authenticated`]).
+/// A routes file that cannot be read is logged, and reads as no routes.
+fn routes_in(data_root: &Path) -> Option<crate::github_routes::GithubRoutes> {
+    if !crate::github::routed_authenticated() {
+        return None;
+    }
+    Some(crate::github_routes::GithubRoutes::load(data_root).unwrap_or_else(|err| {
+        tracing::error!("GitHub routes: {err:#}");
+        Default::default()
+    }))
+}
+
 /// How to authenticate to GitHub from here: through the sandbox's proxy
 /// when it injects the token (whatever is stored), else the stored token.
 /// `None` when neither.
 pub fn resolve_github_auth(store: &CredentialStore) -> Option<crate::github::GithubAuth> {
+    if let Some(routes) = &store.github_routes {
+        return Some(crate::github::GithubAuth::Routed(routes.clone()));
+    }
     if store.github_via_proxy {
         return Some(crate::github::GithubAuth::Proxy);
     }
@@ -651,6 +672,7 @@ mod tests {
                     credentials_dir: dir,
                     keyring_service: format!("tod-test-{id}"),
                     github_via_proxy: false,
+                    github_routes: None,
                 },
             }
         }

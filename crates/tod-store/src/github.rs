@@ -103,6 +103,12 @@ pub enum GithubAuth {
     /// never in the sandbox. Requests go through `HTTPS_PROXY`, trusting its
     /// CA (`crate::sandbox_http`). Chosen by [`GITHUB_AUTH_ENV`].
     Proxy,
+    /// The orchestrator's: its proxy holds several tokens by name, and each
+    /// request sends the placeholder of the one that reads its repository
+    /// ([`GithubRoutes`], `crate::github_routes`). Chosen by
+    /// [`GITHUB_AUTH_ENV`] being [`GITHUB_AUTH_ROUTED`]. A repository no
+    /// route names is read with no token at all.
+    Routed(GithubRoutes),
 }
 
 impl std::fmt::Debug for GithubAuth {
@@ -110,13 +116,21 @@ impl std::fmt::Debug for GithubAuth {
         match self {
             Self::Token(_) => f.write_str("Token(<set>)"),
             Self::Proxy => f.write_str("Proxy"),
+            Self::Routed(routes) => write!(f, "Routed({} routes)", routes.routes.len()),
         }
     }
 }
 
 /// Set to [`GITHUB_AUTH_PROXY`] in an autonomous node's sandbox, whose proxy
 /// injects the user's GitHub token (`tod_sandbox::node::node_env`).
-pub use tod_sandbox::node::{GITHUB_AUTH_ENV, GITHUB_AUTH_PROXY};
+pub use tod_sandbox::node::{GITHUB_AUTH_ENV, GITHUB_AUTH_PROXY, GITHUB_AUTH_ROUTED};
+use crate::github_routes::GithubRoutes;
+
+/// Whether this process reads GitHub with the token its proxy holds for each
+/// repository ([`GithubAuth::Routed`]).
+pub fn routed_authenticated() -> bool {
+    std::env::var(GITHUB_AUTH_ENV).is_ok_and(|v| v.trim().eq_ignore_ascii_case(GITHUB_AUTH_ROUTED))
+}
 
 /// Whether this process runs where the proxy authenticates GitHub
 /// ([`GITHUB_AUTH_ENV`]).
@@ -143,11 +157,11 @@ impl Github {
                 .timeout_global(Some(TIMEOUT))
                 .build()
                 .into(),
-            GithubAuth::Proxy => crate::sandbox_http::sandbox_agent(TIMEOUT),
+            GithubAuth::Proxy | GithubAuth::Routed(_) => crate::sandbox_http::sandbox_agent(TIMEOUT),
         };
         // `TOD_GITHUB_API_URL` points a dev run at a stand-in server.
         let api = std::env::var("TOD_GITHUB_API_URL").unwrap_or_else(|_| GITHUB_API_URL.to_string());
-        let proxy_missing = auth == GithubAuth::Proxy && ureq::Proxy::try_from_env().is_none();
+        let proxy_missing = matches!(auth, GithubAuth::Proxy | GithubAuth::Routed(_)) && ureq::Proxy::try_from_env().is_none();
         Self { proxy_missing, ..Self::with_agent(auth, agent, &api) }
     }
 
@@ -160,11 +174,18 @@ impl Github {
         &self.auth
     }
 
-    fn authorize<B>(&self, req: ureq::RequestBuilder<B>) -> ureq::RequestBuilder<B> {
+    fn authorize<B>(&self, req: ureq::RequestBuilder<B>, path: &str) -> ureq::RequestBuilder<B> {
         let req = req.header("Accept", "application/vnd.github+json").header("User-Agent", "tod");
         match &self.auth {
             GithubAuth::Token(token) => req.header("Authorization", &format!("Bearer {token}")),
             GithubAuth::Proxy => req,
+            GithubAuth::Routed(routes) => {
+                let secret = crate::github_routes::repo_of_path(path).and_then(|(owner, repo)| routes.secret_for(owner, repo));
+                match secret {
+                    Some(name) => req.header("Authorization", &format!("Bearer {}", tod_sandbox::node::secret_placeholder(name))),
+                    None => req,
+                }
+            }
         }
     }
 
@@ -173,7 +194,7 @@ impl Github {
         if self.proxy_missing {
             return Err(GithubError::ProxyMissing);
         }
-        let response = self.authorize(self.agent.get(&format!("{}{path}", self.api))).call();
+        let response = self.authorize(self.agent.get(&format!("{}{path}", self.api)), path).call();
         read_json(response)
     }
 
@@ -182,7 +203,7 @@ impl Github {
         if self.proxy_missing {
             return Err(GithubError::ProxyMissing);
         }
-        let response = self.authorize(self.agent.post(&format!("{}{path}", self.api))).send_json(body);
+        let response = self.authorize(self.agent.post(&format!("{}{path}", self.api)), path).send_json(body);
         read_json(response)
     }
 
@@ -1185,6 +1206,57 @@ impl<'a> NodePrRepo<'a> {
 
 #[cfg(test)]
 mod tests {
+
+    /// Serves `count` requests on loopback, returning each one's `Authorization` header.
+    fn serve(count: usize) -> (String, std::thread::JoinHandle<Vec<Option<String>>>) {
+        use std::io::{BufRead, BufReader, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let handle = std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            for _ in 0..count {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut auth = None;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line.trim().is_empty() {
+                        break;
+                    }
+                    if let Some(v) = line.to_ascii_lowercase().strip_prefix("authorization:") {
+                        auth = Some(v.trim().to_string());
+                    }
+                }
+                let body = r#"{"title":"t","merged":true,"merged_at":null}"#;
+                write!(stream, "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).unwrap();
+                seen.push(auth);
+            }
+            seen
+        });
+        (url, handle)
+    }
+
+    #[test]
+    fn a_routed_client_sends_the_placeholder_of_the_secret_that_reads_the_repository() {
+        use crate::github_routes::{GithubRoutes, Route};
+        let routes = GithubRoutes {
+            routes: vec![
+                Route { pattern: "acme/*".into(), secret: "gh_acme".into() },
+                Route { pattern: "joel-cofactr/product-ingest".into(), secret: "gh_joel".into() },
+            ],
+        };
+        let (url, handle) = serve(3);
+        let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).build().into();
+        let gh = Github::with_agent(GithubAuth::Routed(routes), agent, &url);
+        gh.get_pr_merge("acme", "app", 1).unwrap();
+        gh.get_pr_merge("joel-cofactr", "product-ingest", 1).unwrap();
+        gh.get_pr_merge("someone", "else", 1).unwrap();
+        let seen = handle.join().unwrap();
+        assert_eq!(seen[0].as_deref(), Some("bearer {{secret:gh_acme}}"));
+        assert_eq!(seen[1].as_deref(), Some("bearer {{secret:gh_joel}}"));
+        assert_eq!(seen[2], None, "a repository no route names is read with no token");
+    }
     #[test]
     fn checks_combine_statuses_and_check_runs() {
         use super::{CheckRunsRaw, CombinedStatusRaw, combine_checks};

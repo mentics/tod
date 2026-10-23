@@ -18,6 +18,8 @@ pub mod journey_submissions;
 pub mod learn;
 pub mod lifecycle_baseline;
 pub mod github;
+pub mod github_routes;
+pub mod orchestrator_github;
 pub mod github_token;
 pub mod linear;
 pub mod log_level;

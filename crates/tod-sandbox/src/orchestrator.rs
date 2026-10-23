@@ -55,12 +55,18 @@ pub struct Spec<'a> {
     pub blaxel_token: &'a str,
 }
 
-/// The orchestrator process's environment.
-fn process_env<'a>(spec: &Spec<'a>) -> [(&'static str, &'a str); 2] {
-    [
+/// The orchestrator process's environment: its Blaxel account, its GitHub
+/// reads through the proxy ([`crate::node::GITHUB_AUTH_ROUTED`]), and the
+/// proxy's address (the platform's own `HTTPS_PROXY` can be an unrendered
+/// template: [`crate::provision::local_proxy_env`]).
+fn process_env<'a>(spec: &Spec<'a>) -> Vec<(&'static str, &'a str)> {
+    let mut env = vec![
         ("TOD_ORCHESTRATOR_BLAXEL_WORKSPACE", spec.blaxel_workspace),
         ("TOD_ORCHESTRATOR_BLAXEL_TOKEN", spec.blaxel_token),
-    ]
+        (crate::node::GITHUB_AUTH_ENV, crate::node::GITHUB_AUTH_ROUTED),
+    ];
+    env.extend(crate::provision::local_proxy_env());
+    env
 }
 
 /// What to do with the sandbox that is there now.
@@ -76,8 +82,22 @@ pub enum Plan {
 
 /// Decides [`Plan`] for the existing sandbox (`None`: none, or a dead one
 /// just removed) and the wanted volume.
-pub fn plan(existing: Option<&SandboxInfo>, volume: Option<&str>, move_data: bool) -> Result<Plan> {
+pub fn plan(existing: Option<&SandboxInfo>, has_proxy: bool, volume: Option<&str>, move_data: bool) -> Result<Plan> {
     let Some(info) = existing else { return Ok(Plan::Create) };
+    if !has_proxy {
+        // The proxy that holds its GitHub tokens can only be there from the
+        // start.
+        return if move_data {
+            Ok(Plan::MoveData)
+        } else {
+            bail!(
+                "{} was made without a proxy, which a sandbox cannot be given once it exists, and the \
+                 orchestrator reads GitHub through one. Run again with --move-data to recreate it \
+                 with its /data kept (nodes reach it by name, so they are unaffected)",
+                info.name
+            )
+        };
+    }
     match volume {
         Some(vol) if !info.volumes.iter().any(|v| v == vol) => {
             if move_data {
@@ -110,8 +130,12 @@ pub fn provision(bx: &Blaxel, spec: &Spec, progress: &mut dyn FnMut(&str)) -> Re
         remove(bx, name)?;
         existing = None;
     }
+    let has_proxy = match &existing {
+        Some(_) => bx.get_json(name)?.is_some_and(|v| crate::node::has_proxy(&v)),
+        None => true,
+    };
     // Decided first, so a run that is refused leaves nothing behind.
-    let plan = plan(existing.as_ref(), spec.volume, spec.move_data)?;
+    let plan = plan(existing.as_ref(), has_proxy, spec.volume, spec.move_data)?;
     if let Some(vol) = spec.volume {
         ensure_volume(bx, vol, spec.region, progress)?;
     }
@@ -299,6 +323,9 @@ fn create_body(spec: &Spec) -> serde_json::Value {
             },
         },
     });
+    // Made with a proxy that holds nothing yet: the app gives it the user's
+    // GitHub tokens later (`Blaxel::update_proxy`).
+    body["spec"]["network"] = json!({ "proxy": crate::node::keyed_secrets_spec(crate::node::GITHUB_API_HOST, &[]) });
     if let Some(vol) = spec.volume {
         // The mount hides whatever the image had at /data.
         body["spec"]["volumes"] = json!([{ "name": vol, "mountPath": DATA_DIR, "readOnly": false }]);
@@ -375,15 +402,30 @@ mod tests {
 
     #[test]
     fn plans_what_to_do_with_the_sandbox_there() {
-        assert_eq!(plan(None, Some("v"), false).unwrap(), Plan::Create);
-        assert_eq!(plan(None, None, false).unwrap(), Plan::Create);
-        assert_eq!(plan(Some(&info(&[])), None, false).unwrap(), Plan::Keep);
-        assert_eq!(plan(Some(&info(&["v"])), Some("v"), false).unwrap(), Plan::Keep);
+        assert_eq!(plan(None, true, Some("v"), false).unwrap(), Plan::Create);
+        assert_eq!(plan(None, true, None, false).unwrap(), Plan::Create);
+        assert_eq!(plan(Some(&info(&[])), true, None, false).unwrap(), Plan::Keep);
+        assert_eq!(plan(Some(&info(&["v"])), true, Some("v"), false).unwrap(), Plan::Keep);
         // One on its own disk is never silently replaced.
-        let err = plan(Some(&info(&[])), Some("v"), false).unwrap_err().to_string();
+        let err = plan(Some(&info(&[])), true, Some("v"), false).unwrap_err().to_string();
         assert!(err.contains("--move-data"), "{err}");
-        assert_eq!(plan(Some(&info(&[])), Some("v"), true).unwrap(), Plan::MoveData);
-        assert_eq!(plan(Some(&info(&["other"])), Some("v"), true).unwrap(), Plan::MoveData);
+        assert_eq!(plan(Some(&info(&[])), true, Some("v"), true).unwrap(), Plan::MoveData);
+        assert_eq!(plan(Some(&info(&["other"])), true, Some("v"), true).unwrap(), Plan::MoveData);
+        // One made without a proxy is recreated, with its data, only when asked.
+        let err = plan(Some(&info(&["v"])), false, Some("v"), false).unwrap_err().to_string();
+        assert!(err.contains("without a proxy") && err.contains("--move-data"), "{err}");
+        assert_eq!(plan(Some(&info(&["v"])), false, Some("v"), true).unwrap(), Plan::MoveData);
+    }
+
+    #[test]
+    fn it_is_made_with_a_proxy_and_reads_github_through_it() {
+        let body = create_body(&spec(None));
+        assert_eq!(body["spec"]["network"]["proxy"]["enabled"], true);
+        // Blaxel keeps a proxy only if it has a rule.
+        assert!(crate::node::has_proxy(&body));
+        let env = process_env(&spec(None));
+        assert!(env.contains(&("TOD_GITHUB_AUTH", "routed")));
+        assert!(env.iter().any(|(k, _)| *k == "HTTPS_PROXY"));
     }
 
     #[test]

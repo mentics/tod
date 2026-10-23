@@ -286,12 +286,50 @@ Clear, it pokes and the node goes on. If GitHub cannot be read from here (no
 access configured, a failed read) it says why on stderr and pokes, so the
 sandbox's own check, with the user's token, decides. Wakes from webhooks,
 answers, and every other wait are not gated. The orchestrator reads GitHub
-with `TOD_GITHUB_AUTH=proxy` and a proxy rule for `api.github.com` on its own
-sandbox (a read-only fine-grained token: Pull requests: read, Contents: read),
-so the token is never on its disk. With `scheduler = "blaxel"` the node's own
+through its own sandbox's proxy, so no token is on its disk or in its
+environment (see GitHub access, below). With `scheduler = "blaxel"` the node's own
 schedule fires on its sandbox and the gate is not in the path.
 
 Deliveries are not deduplicated (`X-GitHub-Delivery` is ignored); a repeat
 records the event again and pokes again, which is harmless. Webhooks can be
 lost; every event wait also has its deadline, so a lost one only delays the
 node.
+
+## GitHub access (`orchestrator_github`)
+
+The orchestrator reads GitHub (merges, releases) for waiting nodes, with
+the user's tokens, which sit in its sandbox's proxy and nowhere else.
+
+- **The orchestrator's sandbox is made with a proxy** (empty at first:
+  a sandbox can only take rules if it had one when created). One made
+  before this needs `tod-sandbox orchestrator --move-data` once, which
+  recreates it with its `/data` kept; without that, the app's Apply
+  says so.
+- **Several tokens, chosen per repository.** Blaxel's proxy matches only
+  on the destination host (measured, 2026-10-23: userinfo in the URL is
+  ignored, case and a port are ignored, `host.` with a trailing dot is a
+  distinct destination, rules on one host merge their headers, and a later
+  rule overrides an earlier one's same header). It does substitute
+  `{{SECRET:name}}` in a header the *client* sends, for any secret of a rule
+  on that host, and leaves another host's secrets alone. So the proxy holds
+  one rule on `api.github.com` that adds no header and carries every token
+  as a named secret (`tod_sandbox::node::keyed_secrets_spec`), and the
+  orchestrator's GitHub client sends `Authorization: Bearer
+  {{SECRET:gh_<id>}}` for the token that reads the repository
+  (`GithubAuth::Routed`, `tod_store::github_routes`; the process has
+  `TOD_GITHUB_AUTH=routed` and the proxy's address). A repository no route
+  names is read with no token, so private ones fail with GitHub's own 404.
+  Verified live against a private repository: the good placeholder read it
+  (200), a bad token's gave 401, and none gave 404.
+- **Settings → Orchestrator GitHub access** holds the tokens (a label, the
+  repositories it reads as `owner/repo`, `owner/*` or `*`, the most specific
+  winning, and the token, kept in the credential store, never in the list's
+  file `orchestrator-github.json`). **Apply** (`tod_core::orchestrator_github::apply`)
+  replaces the proxy's secrets with the stored tokens and sends the
+  orchestrator its routes (`PUT /users/<user>/github-routes`: pattern and
+  secret name only, kept in the user's directory as `github-routes.json`).
+- **One user's tokens per orchestrator, for now.** The proxy's secrets are
+  replaced as a whole and a `GET` never returns their values, so the
+  orchestrator holds the tokens of whoever applied last. Several users
+  sharing one orchestrator would overwrite each other.
+

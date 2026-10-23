@@ -41,6 +41,10 @@ pub const GH_TOKEN_PLACEHOLDER: &str = "placeholder-injected-by-proxy";
 /// sends no token of its own, through the proxy, trusting its CA.
 pub const GITHUB_AUTH_ENV: &str = "TOD_GITHUB_AUTH";
 pub const GITHUB_AUTH_PROXY: &str = "proxy";
+/// Set to this in the orchestrator's process: its proxy holds one GitHub
+/// token per name ([`keyed_secrets_spec`]) and the client chooses one per
+/// repository by sending its placeholder ([`secret_placeholder`]).
+pub const GITHUB_AUTH_ROUTED: &str = "routed";
 /// Where the real `tod-cli` is installed in a node's sandbox, beside the
 /// HTTP shim at `TOD_CLI_PATH`: the shim runs the nouns that reach GitHub
 /// with it (`tod_store::fleet::cli_relay::HTTP_SHIM_SCRIPT`).
@@ -325,6 +329,64 @@ pub fn proxy_spec(rules: &[ProxyRule]) -> Value {
         })
         .collect();
     json!({ "enabled": true, "routing": routing })
+}
+
+/// The destination whose rule holds the orchestrator's GitHub tokens.
+pub const GITHUB_API_HOST: &str = "api.github.com";
+
+/// A secret the proxy holds under `name`, to be chosen by a client that
+/// sends [`secret_placeholder`].
+#[derive(Clone, PartialEq, Eq)]
+pub struct KeyedSecret {
+    pub name: String,
+    pub value: String,
+}
+
+impl std::fmt::Debug for KeyedSecret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KeyedSecret").field("name", &self.name).finish_non_exhaustive()
+    }
+}
+
+/// A secret name the proxy accepts: letters, digits and `_`.
+pub fn secret_name(raw: &str) -> String {
+    raw.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect()
+}
+
+/// What a client sends in a header for the proxy to replace with the secret
+/// `name` (measured, 2026-10-23: the proxy substitutes it in a request's own
+/// headers, for any secret of a rule on the request's host, and leaves the
+/// placeholder of another host's secret alone).
+pub fn secret_placeholder(name: &str) -> String {
+    format!("{{{{SECRET:{name}}}}}")
+}
+
+/// The secret a proxy with nothing else to hold carries. Blaxel drops a proxy
+/// with no rules (measured, 2026-10-23: the sandbox comes back with none, and
+/// can never take one), so there is always one rule.
+pub const UNUSED_SECRET: &str = "tod_unused";
+
+/// `spec.network.proxy` for a sandbox that adds nothing itself: a rule on
+/// `destination` that only holds `secrets`, for its clients to choose among
+/// by placeholder. With none, a rule holding [`UNUSED_SECRET`], so the proxy
+/// exists (every sandbox that may later be given secrets is made with one:
+/// only then can it take rules).
+pub fn keyed_secrets_spec(destination: &str, secrets: &[KeyedSecret]) -> Value {
+    let mut held: serde_json::Map<String, Value> =
+        secrets.iter().map(|s| (s.name.clone(), Value::String(s.value.clone()))).collect();
+    if held.is_empty() {
+        held.insert(UNUSED_SECRET.to_string(), Value::String("unused".to_string()));
+    }
+    json!({
+        "enabled": true,
+        "routing": [{ "destinations": [destination], "headers": {}, "secrets": held }],
+    })
+}
+
+/// Whether a sandbox (as `Blaxel::get_json` returns it) has a proxy with
+/// rules: the only kind that can be given others.
+pub fn has_proxy(sandbox: &Value) -> bool {
+    sandbox["spec"]["network"]["proxy"]["routing"].as_array().is_some_and(|rules| !rules.is_empty())
 }
 
 /// The environment of every process in a node's sandbox. No secrets.

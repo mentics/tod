@@ -239,3 +239,30 @@ fn a_changes_post_is_announced_on_the_users_topic() {
     std::thread::sleep(std::time::Duration::from_millis(1500));
     assert_eq!(sink.0.lock().unwrap().len(), 1);
 }
+#[test]
+fn github_routes_are_kept_per_user_and_checked() {
+    let base = std::env::temp_dir().join(format!("tod-orch-routes-{}", uuid::Uuid::new_v4()));
+    let server = tod_orchestrator::Server::with_sink(
+        tod_orchestrator::Config { base: base.clone(), tod_cli: "unused".into(), tod_cli_prefix: Vec::new() },
+        Box::new(tod_orchestrator::wakes::RelayPoker::from_env()),
+        Box::new(tod_orchestrator::notify::NoSink),
+    )
+    .unwrap();
+    let req = |method: &str, body: &str| tod_orchestrator::http::Request {
+        method: method.into(),
+        path: "/users/alice/github-routes".into(),
+        query: String::new(),
+        headers: Vec::new(),
+        body: body.as_bytes().to_vec(),
+    };
+    let empty = server.handle(&req("GET", ""));
+    assert_eq!(empty.status, 200);
+    assert_eq!(String::from_utf8_lossy(&empty.body), r#"{"routes":[]}"#);
+    let put = server.handle(&req("PUT", r#"{"routes":[{"pattern":"acme/*","secret":"gh_acme"}]}"#));
+    assert_eq!(put.status, 200, "{}", String::from_utf8_lossy(&put.body));
+    assert!(String::from_utf8_lossy(&server.handle(&req("GET", "")).body).contains("gh_acme"));
+    for bad in [r#"{"routes":[{"pattern":"","secret":"x"}]}"#, r#"{"routes":[{"pattern":"a/b","secret":"bad name"}]}"#, "nope"] {
+        assert_eq!(server.handle(&req("PUT", bad)).status, 400, "{bad}");
+    }
+    let _ = std::fs::remove_dir_all(&base);
+}

@@ -294,6 +294,21 @@ impl HttpOrchestrator {
         Self::finish(resp, rest)
     }
 
+    /// `PUT /users/<user>/github-routes`: which of the orchestrator's GitHub
+    /// tokens reads which repository.
+    pub fn put_github_routes(&self, user: &str, routes: &tod_store::github_routes::GithubRoutes) -> Result<()> {
+        let mut resp = self
+            .auth(self.agent.put(&self.url(user, "github-routes")))
+            .send_json(routes)
+            .context("orchestrator github-routes")?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body: String = resp.body_mut().read_to_string().unwrap_or_default().chars().take(400).collect();
+            bail!("orchestrator github-routes: {status}: {body}");
+        }
+        Ok(())
+    }
+
     fn url(&self, user: &str, rest: &str) -> String {
         format!("{}/users/{user}/{rest}", self.base)
     }
