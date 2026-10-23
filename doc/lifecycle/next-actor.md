@@ -240,18 +240,25 @@ Step 2 is built in part. Done:
   actor. The local run (`autopilot::local`'s hook) holds a `run` lease while it
   works and lets it go while it waits on GitHub or a person.
 
-Not done (step 2b, before the views can trust `Working`):
+Step 2b is built:
 
-- Leases for the other processors: conversation turns the app drives itself
-  (`ConversationDriver`, which holds only `&FleetStore`, so it needs a passive
-  lease beaten from `tick`), `settle_gate` checks, the incoming-changes check,
-  and chat turns (kind `chat`, for the decorator).
-- The run's saved outcome and a pending permission as inputs from the daemon
-  (`RunFacts` is still filled by the caller).
-- The daemon's reconciler (desired `run` with no lease and nothing else →
-  start it, or fail visibly).
-- `BotReview`/`Checks` wait kinds and `who` need the babysitter to record them.
-- `check_now` records no failure on the node (it reports to the user).
+- Leases for the other processors: every turn a `ConversationDriver` starts
+  holds a passive lease (`ActivityLease`, refreshed from `tick`, ended on every
+  path out) of its protocol's kind on the focus node, or a `chat` lease for the
+  plain chats (outline chat, chat panel, visual design); `settle_gate` runs
+  under `activity::with_lease`. The incoming-changes check is a driver turn, so
+  it is covered. If a lease cannot be recorded or ended, the user gets a
+  notice in the transcript.
+- A run polling GitHub in place (bot review, checks, mergeability) records the
+  wait it is polling (`github:pr:<n>:bot-review:<bot>`, `:checks`, `:github`),
+  rescheduled each poll and cancelled when the run has work or nothing left to
+  wait for. `WaitKind::BotReview` / `Checks`, and `who` = the bot's name.
+- Stored deferrals (`node_deferrals`, `tod_core::defer`), the `compute` entry
+  point both the app and the daemon read, and `spent_deferrals`.
+
+Not done: `who` for a human review (the requested reviewer's login is not read
+from GitHub yet); a pending permission as its own `YouReason::Permission` (it is
+a request with reason `access` today).
 
 1. `tod_core::next_actor`: the types and `for_nodes`, with tests per row of
    the precedence list and per `YouReason`/`WaitKind`. Nothing uses it yet.
