@@ -96,6 +96,25 @@ pub fn selectable_text(
     selectable_text_with_menu(id, text, true, window, cx)
 }
 
+/// Plain data text in `color`. A selectable text view draws in the theme's
+/// body color whatever its parent's text color is, so a tone (muted, error)
+/// has to be given to the view itself.
+pub fn selectable_text_colored(
+    id: impl Into<ElementId>,
+    text: impl Into<SharedString>,
+    color: gpui::Hsla,
+    _window: &mut Window,
+    _cx: &mut App,
+) -> SelectableText {
+    let id = id.into();
+    let view = TextView::html(id.clone(), plain_text_html(&text.into()))
+        .on_link_click(on_link_click)
+        .selectable(true)
+        .style(TextViewStyle::default().paragraph_gap(rems(0.)))
+        .text_color(color);
+    with_copy_menu(id, view, true)
+}
+
 /// The same, with its own Copy menu only when `own_menu`.
 ///
 /// A row whose host installs a right-click menu passes false

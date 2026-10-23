@@ -31,7 +31,7 @@ use tod_store::fleet::FleetStore;
 use tod_store::outline::repos::plan_steps::STATUS_VERIFIED;
 use uuid::Uuid;
 
-use crate::ui::selectable_text::selectable_text;
+use crate::ui::selectable_text::{selectable_text, selectable_text_colored};
 use crate::ui::style;
 
 // T2: the runner line.
@@ -1214,13 +1214,14 @@ impl TaskPanel {
         if let Some(standing) = &standing {
             for (ix, part) in standing::runner_parts(standing, now_ms()).into_iter().enumerate() {
                 let el = div().flex_auto().min_w(gpui::px(60.));
-                let el = match part.tone {
-                    PartTone::Muted => style::text_muted(el),
-                    PartTone::Error => style::text_error(el),
+                let (el, color) = match part.tone {
+                    PartTone::Muted => (style::text_muted(el), style::color::text_muted()),
+                    PartTone::Error => (style::text_error(el), style::color::danger()),
                 };
-                line = line.child(sep()).child(el.child(selectable_text(
+                line = line.child(sep()).child(el.child(selectable_text_colored(
                     SharedString::from(format!("unified-task-runner-part-{ix}")),
                     part.text,
+                    color,
                     window,
                     cx,
                 )));

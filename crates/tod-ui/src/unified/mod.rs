@@ -952,8 +952,14 @@ impl UnifiedView {
                 (&self.hosted[ix].panel, target)
             {
                 // A task column retargeted to another task keeps its entity.
+                // Its standing is the new node's, not the old one's: the
+                // feed only pushes on a store change.
                 let panel = panel.clone();
-                panel.update(cx, |panel, cx| panel.set_node(node_id, cx));
+                let standing = self.standings.get(&node_id).cloned();
+                panel.update(cx, |panel, cx| {
+                    panel.set_node(node_id, cx);
+                    panel.set_standing(standing, cx);
+                });
             } else {
                 self.hosted[ix] = self.construct_hosted(target, window, cx);
             }
