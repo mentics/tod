@@ -775,8 +775,16 @@ mod tests {
     /// A store with one node that has Lifecycle. The media bundle is made
     /// unfindable, so starting a run fails.
     fn fixture() -> Fixture {
-        // One process per test under nextest; the variable is this test's.
-        unsafe { std::env::set_var("TOD_MEDIA_ROOT", "/nonexistent/tod-media") };
+        fixture_with_media(false)
+    }
+
+    /// [`fixture`], with the real media bundle findable when `media`, so a
+    /// run can start and go as far as the mock agent takes it.
+    fn fixture_with_media(media: bool) -> Fixture {
+        if !media {
+            // One process per test under nextest; the variable is this test's.
+            unsafe { std::env::set_var("TOD_MEDIA_ROOT", "/nonexistent/tod-media") };
+        }
         let root = std::env::temp_dir().join(format!("tod-agentd-runners-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
         let fleet = Arc::new(FleetStore::open(&root).unwrap());
@@ -872,6 +880,107 @@ mod tests {
         store.reload_if_stale().unwrap();
         let left = store.read(|c| ActivityRepo::new(c).list_for_nodes(&[fx.node])).unwrap();
         assert!(left.is_empty(), "{left:?}");
+    }
+
+    /// Wait for `node`'s run thread to end (it is the mock agent's, so short).
+    fn wait_until_not_running(fx: &Fixture) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            let running = fx.runners.snapshot().into_iter().any(|s| s.node == fx.node && s.running);
+            if !running {
+                return;
+            }
+            assert!(std::time::Instant::now() < deadline, "the run did not end");
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+
+    #[test]
+    fn a_dead_run_is_restarted_by_the_reconciler_and_goes_as_far_as_the_agent_takes_it() {
+        let fx = fixture_with_media(true);
+        let store = &fx.runners.inner.store;
+        let stale_at = now_ms() - tod_store::activity::STALE_AFTER_MS - 10_000;
+        store
+            .enqueue(FleetMutation::ActivityStart {
+                id: Uuid::new_v4(),
+                node: fx.node,
+                kind: tod_store::activity::KIND_RUN.into(),
+                owner: "dead:1".into(),
+                at: stale_at,
+            })
+            .unwrap();
+        store.writer().flush().unwrap();
+        fx.runners.inner.slots.lock().unwrap().entry(fx.node).or_default().desired = Desired::Run;
+        assert!(
+            matches!(standing_of(&fx).actor, NextActor::You { why: YouReason::Failed { ref error }, .. } if error.contains("dead:1")),
+            "the loss is shown before the restart"
+        );
+
+        // The restart succeeds: nothing is reported as failed.
+        fx.runners.reconcile().unwrap();
+        wait_until_not_running(&fx);
+        store.writer().flush().unwrap();
+        store.reload_if_stale().unwrap();
+
+        let left = store.read(|c| ActivityRepo::new(c).list_for_nodes(&[fx.node])).unwrap();
+        assert!(left.is_empty(), "the stale lease is gone and the run's own lease ended: {left:?}");
+        let saved = AutopilotState::load(&fx.root, fx.node).unwrap();
+        assert!(
+            !matches!(saved.outcome, Some(Outcome::Stopped { ref reason }) if reason.starts_with(FAILED_PREFIX)),
+            "{:?}",
+            saved.outcome
+        );
+        assert!(saved.outcome.is_some(), "the run ended and said how");
+        assert!(
+            !matches!(standing_of(&fx).actor, NextActor::You { why: YouReason::Failed { ref error }, .. } if error.contains("lost")),
+            "no longer reported as lost"
+        );
+    }
+
+    /// With a journey recorder installed, a change of actor seen by the tick
+    /// is on the node's journey; the first sight only seeds.
+    #[test]
+    fn a_change_of_actor_is_recorded_to_the_node_journey_by_the_tick() {
+        let fx = fixture();
+        let journeys = fx.root.join("journeys");
+        tod_core::journey::recorder::install(tod_core::journey::recorder::spawn(journeys.clone(), 1024));
+
+        fx.runners.reconcile().unwrap(); // first sight: seeds, records nothing
+        AutopilotState {
+            outcome: Some(Outcome::Stopped { reason: format!("{FAILED_PREFIX}boom") }),
+            ..AutopilotState::fresh()
+        }
+        .save(&fx.root, fx.node)
+        .unwrap();
+        fx.runners.reconcile().unwrap();
+
+        // The recorder's writer thread appends asynchronously.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let changes = loop {
+            let changes: Vec<(String, String, String)> =
+                match tod_journey::JourneyReader::open(&journeys, tod_journey::JourneyKey::Node(fx.node)) {
+                    Ok(reader) => reader
+                        .all()
+                        .iter()
+                        .filter_map(|r| match &r.event {
+                            tod_journey::Event::NextActorChanged { from, to, detail } => {
+                                Some((from.clone(), to.clone(), detail.clone()))
+                            }
+                            _ => None,
+                        })
+                        .collect(),
+                    // Nothing written yet.
+                    Err(_) => Vec::new(),
+                };
+            if !changes.is_empty() || std::time::Instant::now() > deadline {
+                break changes;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        };
+        assert_eq!(changes.len(), 1, "{changes:?}");
+        assert_eq!(changes[0].0, "you:not_started");
+        assert_eq!(changes[0].1, "you:failed");
+        assert!(changes[0].2.contains("boom"), "{:?}", changes[0]);
     }
 
     #[test]
