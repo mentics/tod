@@ -31,6 +31,7 @@ use tod_store::activity::{
     ActivityRepo, KIND_GATE_CHECK, KIND_INCOMING_CHECK, KIND_PROTOCOL_PREFIX, KIND_RUN, Lease,
 };
 use tod_store::conversation::ProtocolKind;
+use tod_store::deferrals::DeferralRepo;
 use tod_store::outline::repos::NodeRepo;
 use tod_store::waits::{Wait, WaitRepo};
 use uuid::Uuid;
@@ -256,6 +257,12 @@ pub fn for_nodes(
     for lease in ActivityRepo::new(conn).list_for_nodes(node_ids)? {
         leases.entry(lease.node_id).or_default().push(lease);
     }
+    // The stored deferrals, over which the caller's own (tests, previews) win.
+    let mut deferrals: HashMap<Uuid, Deferral> = HashMap::new();
+    for row in DeferralRepo::new(conn).list_for_nodes(node_ids)? {
+        deferrals.insert(row.node_id, Deferral { until: row.until, deferred_at: row.deferred_at });
+    }
+    deferrals.extend(inputs.deferrals.iter().map(|(id, d)| (*id, *d)));
     let no_run = RunFacts::default();
     let no_attention = NodeAttention::default();
     let mut out = HashMap::new();
@@ -271,12 +278,72 @@ pub fn for_nodes(
             waits: waits.get(&node_id).map(Vec::as_slice).unwrap_or(&[]),
             leases: leases.get(&node_id).map(Vec::as_slice).unwrap_or(&[]),
             run: inputs.runs.get(&node_id).unwrap_or(&no_run),
-            deferral: inputs.deferrals.get(&node_id).copied(),
+            deferral: deferrals.get(&node_id).copied(),
             now_ms: inputs.now_ms,
         });
         out.insert(node_id, standing);
     }
     Ok(out)
+}
+
+/// Every node's standing, as the app and the daemon read it: the store's
+/// facts plus each node's saved run (`autopilot/<node>.json`). Blocking
+/// (store and file reads): never call it on the UI thread.
+///
+/// A saved run that cannot be read is not skipped: the node shows it as a
+/// failure, with the reason.
+pub fn compute(fleet: &tod_store::fleet::FleetStore, data_root: &std::path::Path) -> Result<HashMap<Uuid, NodeStanding>> {
+    use crate::autopilot::{AutopilotState, state_path};
+    let now_ms = tod_store::outline::uuid_blob::now_ms();
+    fleet.read(|conn| {
+        let ids: Vec<Uuid> = NodeRepo::new(conn).list_all()?.into_iter().map(|n| n.id).collect();
+        let with_lifecycle = NodeRepo::new(conn).get_lifecycle_for_nodes(&ids)?;
+        let mut inputs = Inputs { now_ms, ..Default::default() };
+        for node in with_lifecycle.keys() {
+            let path = state_path(data_root, *node);
+            if !path.exists() {
+                continue;
+            }
+            let at = std::fs::metadata(&path)
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(now_ms, |d| d.as_millis() as i64);
+            let outcome = match AutopilotState::load(data_root, *node) {
+                Ok(state) => state.outcome,
+                Err(err) => Some(Outcome::Stopped { reason: format!("{FAILED_PREFIX}{err:#}") }),
+            };
+            if let Some(outcome) = outcome {
+                inputs.runs.insert(*node, RunFacts { last_outcome: Some((outcome, at)), ..Default::default() });
+            }
+        }
+        for_nodes(conn, &ids, &inputs)
+    })
+}
+
+/// The nodes whose stored deferral is spent and should be cleared: it
+/// expired, or something new reached the user (the node is `You` and no
+/// longer deferred), or the node no longer has a standing. Without this a
+/// node that woke would fall back under its old deferral the next time it
+/// needs the user.
+pub fn spent_deferrals(
+    rows: &[tod_store::deferrals::DeferralRow],
+    standings: &HashMap<Uuid, NodeStanding>,
+    now_ms: i64,
+) -> Vec<Uuid> {
+    rows.iter()
+        .filter(|row| {
+            let expired = row.until.is_some_and(|until| until <= now_ms);
+            expired
+                || match standings.get(&row.node_id) {
+                    None => true,
+                    Some(standing) => {
+                        matches!(standing.actor, NextActor::You { .. }) && standing.deferred.is_none()
+                    }
+                }
+        })
+        .map(|row| row.node_id)
+        .collect()
 }
 
 /// A name for this process in a lease's `owner` (`tod`, `tod-agentd`, …), so
@@ -1009,6 +1076,33 @@ mod tests {
             NextActor::You { since, .. } => *since,
             other => panic!("expected You, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn for_nodes_reads_stored_deferrals_and_spent_ones_are_found() {
+        let fx = fixture();
+        let held = node(&fx.conn, "held", Some("proposed"));
+        let woken = node(&fx.conn, "woken", Some("proposed"));
+        let expired = node(&fx.conn, "expired", Some("proposed"));
+        let gone = node(&fx.conn, "gone", None);
+        let repo = DeferralRepo::new(&fx.conn);
+        repo.set(held, Some(NOW + 60_000), 10).unwrap(); // entered at 7: holds
+        repo.set(woken, None, 3).unwrap(); // entered at 7 > 3: woken
+        repo.set(expired, Some(NOW - 1), 10).unwrap();
+        repo.set(gone, None, 1).unwrap();
+
+        let ids = [held, woken, expired, gone];
+        let got = for_nodes(&fx.conn, &ids, &Inputs { now_ms: NOW, ..Default::default() }).unwrap();
+        assert!(got[&held].deferred.is_some());
+        assert!(got[&woken].deferred.is_none());
+        assert!(got[&expired].deferred.is_none());
+
+        let rows = repo.list_all().unwrap();
+        let mut spent = spent_deferrals(&rows, &got, NOW);
+        spent.sort();
+        let mut want = vec![woken, expired, gone];
+        want.sort();
+        assert_eq!(spent, want, "the held one stays");
     }
 
     #[test]

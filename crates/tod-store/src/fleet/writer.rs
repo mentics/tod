@@ -223,6 +223,18 @@ pub enum FleetMutation {
         node: uuid::Uuid,
         at: i64,
     },
+    // --- Deferrals (immediate; `crate::deferrals`) ---
+    /// The user took the node off their list, until `until` (ms) or until
+    /// they bring it back.
+    DeferNode {
+        node: uuid::Uuid,
+        until: Option<i64>,
+        at: i64,
+    },
+    /// The node is back on the user's list.
+    UndeferNode {
+        node: uuid::Uuid,
+    },
     // --- Outline (tree / lists) ---
     Outline(OutlineMutation),
     // --- Interview sessions (immediate) ---
@@ -282,6 +294,8 @@ impl FleetMutation {
                 | FleetMutation::ActivityBeat { .. }
                 | FleetMutation::ActivityEnd { .. }
                 | FleetMutation::ActivityClearLost { .. }
+                | FleetMutation::DeferNode { .. }
+                | FleetMutation::UndeferNode { .. }
         )
     }
 
@@ -517,6 +531,12 @@ impl FleetMutation {
             }
             FleetMutation::ActivityClearLost { node, at } => {
                 crate::activity::ActivityRepo::new(conn).clear_lost(*node, *at)?;
+            }
+            FleetMutation::DeferNode { node, until, at } => {
+                crate::deferrals::DeferralRepo::new(conn).set(*node, *until, *at)?;
+            }
+            FleetMutation::UndeferNode { node } => {
+                crate::deferrals::DeferralRepo::new(conn).clear(*node)?;
             }
             FleetMutation::Outline(_) => {}
         }

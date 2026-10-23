@@ -293,6 +293,11 @@ pub fn cloud_nodes_triggers_sql() -> String {
     node_keyed_triggers("cloud_nodes")
 }
 
+/// Triggers for `node_deferrals` (one row per node, keyed by `node_id`).
+pub fn deferrals_triggers_sql() -> String {
+    node_keyed_triggers("node_deferrals")
+}
+
 /// Triggers for `node_environment` (one row per node).
 pub fn environment_triggers_sql() -> String {
     node_keyed_triggers("node_environment")

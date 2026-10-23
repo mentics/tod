@@ -552,6 +552,9 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
     // Machine-local lease bookkeeping: no sync, no journey trigger
     // (`crate::activity`).
     conn.execute_batch(crate::activity::CREATE_TABLE)?;
+    // The user's deferrals of nodes: machine-local, not synced, journaled.
+    conn.execute_batch(crate::deferrals::CREATE_TABLE)?;
+    conn.execute_batch(&crate::journey_changes::deferrals_triggers_sql())?;
     // The task panel's own steps, first numbered 66–69 on its branch.
     ensure_decisions_reason(conn)?;
     conn.execute_batch(crate::request_feedback::CREATE_TABLE)?;
