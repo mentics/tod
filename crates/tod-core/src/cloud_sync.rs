@@ -1005,6 +1005,10 @@ pub fn ensure_node_sandbox(
     let info = bx.wait_deployed(&name, Duration::from_secs(300))?;
     let url = info.url.clone().ok_or_else(|| anyhow!("sandbox {name} has no URL"))?;
     progress(&format!("{name} is up after {:.1}s", started.elapsed().as_secs_f64()));
+    // A sandbox in standby is "up" to the control plane but its workload is
+    // not reachable until it has resumed; the first request would get a 502.
+    progress(&format!("waking {name}…"));
+    bx.wait_reachable(&url, Duration::from_secs(180)).with_context(|| format!("wake {name}"))?;
 
     // Agent Drive is not enabled yet, so the node's transcripts go to the
     // orchestrator and nothing is mounted. When it is, turn this back on:

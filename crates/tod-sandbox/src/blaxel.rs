@@ -151,17 +151,43 @@ fn update_proxy_body(current: &Value, proxy: &Value, labels: &[(&str, &str)]) ->
     json!({ "metadata": { "name": current["metadata"]["name"], "labels": merged }, "spec": spec })
 }
 
-fn check(resp:&mut ureq::http::Response<ureq::Body>, what: &str) -> Result<()> {
+fn check(resp: &mut ureq::http::Response<ureq::Body>, what: &str) -> Result<()> {
     let status = resp.status();
     if status.is_success() {
         return Ok(());
     }
     let body = resp.body_mut().read_to_string().unwrap_or_default();
-    let body: String = body.chars().take(400).collect();
     if status.as_u16() == 401 || status.as_u16() == 403 {
         bail!("{what}: not authorized ({status}); check the workspace and credentials (`tod-sandbox doctor`)");
     }
-    bail!("{what}: {status}: {body}")
+    // The raw reply goes to the error log; the error carries what it says.
+    tracing::warn!("{what}: {status}: {body}");
+    bail!("{what}: {}", describe_failure(status, &body))
+}
+
+/// What a failed Blaxel reply says, without its JSON: the `error.message`
+/// (or a top-level `message`/`error` string) with the status and the API's
+/// `code`, and "retryable" when it says so. A body that is not that shape
+/// is shown as it is, cut short.
+fn describe_failure(status: ureq::http::StatusCode, body: &str) -> String {
+    let parsed: Option<Value> = serde_json::from_str(body).ok();
+    let err = parsed.as_ref().map(|v| if v["error"].is_object() { &v["error"] } else { v });
+    let message = err
+        .and_then(|e| e["message"].as_str().or_else(|| e["error"].as_str()))
+        .filter(|m| !m.trim().is_empty());
+    let Some(message) = message else {
+        let body: String = body.trim().chars().take(400).collect();
+        return if body.is_empty() { status.to_string() } else { format!("{status}: {body}") };
+    };
+    let mut detail = Vec::new();
+    if let Some(code) = err.and_then(|e| e["code"].as_str()) {
+        detail.push(code.to_string());
+    }
+    if err.is_some_and(|e| e["retryable"].as_bool() == Some(true)) {
+        detail.push("retryable".to_string());
+    }
+    let detail = if detail.is_empty() { String::new() } else { format!(" ({})", detail.join(", ")) };
+    format!("{status}\n{}{detail}", message.trim().trim_end_matches('.'))
 }
 
 impl Blaxel {
@@ -490,6 +516,40 @@ impl Blaxel {
         }
     }
 
+    /// Wakes the sandbox at `url` and waits until its workload answers. A
+    /// sandbox in standby is `DEPLOYED` with a URL, but until it has resumed
+    /// the platform answers 502/503/504 ("could not proxy the request to the
+    /// workload"), and does so again for a moment even after a first request
+    /// got through. The probe is a `GET` (idempotent, so retrying it is
+    /// safe); any other answer, a 404 included, means the workload is there.
+    pub fn wait_reachable(&self, url: &str, timeout: Duration) -> Result<()> {
+        let probe = format!("{url}/process/tod-wake-probe");
+        let start = Instant::now();
+        let mut last;
+        loop {
+            let mut resp = self
+                .auth(self.agent.get(&probe))
+                .config()
+                .timeout_global(Some(Duration::from_secs(30)))
+                .build()
+                .call();
+            last = match &mut resp {
+                Ok(r) if !matches!(r.status().as_u16(), 502 | 503 | 504) => return Ok(()),
+                Ok(r) => {
+                    let status = r.status();
+                    let body = r.body_mut().read_to_string().unwrap_or_default();
+                    tracing::info!("waiting for the sandbox to wake: {status}: {body}");
+                    describe_failure(status, &body)
+                }
+                Err(err) => format!("{err}"),
+            };
+            if start.elapsed() > timeout {
+                bail!("the sandbox did not wake within {}s; last answer: {last}", timeout.as_secs());
+            }
+            std::thread::sleep(Duration::from_secs(3));
+        }
+    }
+
     /// Runs `command` in the sandbox to completion (this wakes it).
     pub fn run(&self, url: &str, command: &str, timeout_secs: u64) -> Result<ProcessResult> {
         let body = json!({ "command": command, "waitForCompletion": true, "timeout": timeout_secs });
@@ -629,15 +689,29 @@ impl Blaxel {
         body.extend_from_slice(bytes);
         body.extend_from_slice(format!("\r\n--{BOUNDARY}--\r\n").as_bytes());
         let target = format!("{url}/filesystem%2F{}", path.trim_start_matches('/'));
-        let mut resp = self
-            .auth(self.agent.put(&target))
-            .header("Content-Type", &format!("multipart/form-data; boundary={BOUNDARY}"))
-            .config()
-            .timeout_global(Some(Duration::from_secs(300)))
-            .build()
-            .send(&body[..])
-            .context("sandbox filesystem API")?;
-        check(&mut resp, &format!("upload {path}"))
+        // The same PUT to the same path is idempotent, and Blaxel's gateway
+        // answers a transient 502/503/504 ("retry idempotent requests with
+        // exponential backoff"), so those are retried, each one logged.
+        const ATTEMPTS: u32 = 4;
+        for attempt in 1.. {
+            let mut resp = self
+                .auth(self.agent.put(&target))
+                .header("Content-Type", &format!("multipart/form-data; boundary={BOUNDARY}"))
+                .config()
+                .timeout_global(Some(Duration::from_secs(300)))
+                .build()
+                .send(&body[..])
+                .context("sandbox filesystem API")?;
+            let status = resp.status().as_u16();
+            if matches!(status, 502 | 503 | 504) && attempt < ATTEMPTS {
+                let wait = Duration::from_secs(1 << attempt);
+                tracing::warn!("upload {path}: {status} from the sandbox gateway; retrying in {wait:?} (attempt {attempt} of {ATTEMPTS})");
+                std::thread::sleep(wait);
+                continue;
+            }
+            return check(&mut resp, &format!("upload {path}"));
+        }
+        unreachable!()
     }
 }
 
@@ -797,5 +871,26 @@ mod tests {
         let token = "e30.eyJleHAiOjE3OTAzNTE0MTN9.sig";
         assert_eq!(jwt_expiry(token), Some(1790351413));
         assert_eq!(jwt_expiry("not-a-jwt"), None);
+    }
+}
+
+#[cfg(test)]
+mod failure_tests {
+    use super::describe_failure;
+    use ureq::http::StatusCode;
+
+    #[test]
+    fn a_gateway_error_shows_its_message_not_its_json() {
+        let body = r#"{"error":{"action":"Retry idempotent requests","code":"UPSTREAM_ERROR","message":"The platform could not proxy the request to the workload.","origin":"platform","retryable":true}}"#;
+        assert_eq!(
+            describe_failure(StatusCode::BAD_GATEWAY, body),
+            "502 Bad Gateway\nThe platform could not proxy the request to the workload (UPSTREAM_ERROR, retryable)"
+        );
+    }
+
+    #[test]
+    fn a_body_that_is_not_json_is_shown_as_it_is() {
+        assert_eq!(describe_failure(StatusCode::BAD_GATEWAY, "upstream down\n"), "502 Bad Gateway: upstream down");
+        assert_eq!(describe_failure(StatusCode::BAD_GATEWAY, ""), "502 Bad Gateway");
     }
 }

@@ -1348,12 +1348,24 @@ fn check_tod_cli() -> Result<()> {
         anyhow::bail!(
             "{} was built from different source than this app, so the agent \
             would get commands that do not match its instructions. Rebuild it \
-            (`cargo build -p tod-cli`) and send again.",
-            cli.display()
+            (`{}`) and send again.",
+            cli.display(),
+            rebuild_command(&cli)
         );
     }
     let _ = MATCHED.set(());
     Ok(())
+}
+
+/// The command that rebuilds `tod-cli` in the profile it was built in: the
+/// directory under `target/` that holds it names the profile.
+fn rebuild_command(cli: &std::path::Path) -> String {
+    let profile = cli.parent().and_then(|d| d.file_name()).and_then(|n| n.to_str());
+    match profile {
+        Some("release") => "cargo build --release -p tod-cli".to_string(),
+        Some("debug") | None => "cargo build -p tod-cli".to_string(),
+        Some(other) => format!("cargo build --profile {other} -p tod-cli"),
+    }
 }
 
 /// `PATH` with the directory holding the installed `tod-cli` first, so the

@@ -1248,15 +1248,33 @@ impl TaskPanel {
             }
         }
         // Why the runner could not start, or the latest word from the cloud.
+        let mut extra_note: Option<AnyElement> = None;
         let note = match (&self.runner.cloud_note, self.runners.read(cx).error(self.node_id)) {
             (Some(note), _) => Some((note.clone(), self.runner.cloud_failed)),
             (None, Some(error)) => Some((error.to_string(), true)),
             (None, None) => None,
         };
         if let Some((note, failed)) = note {
-            let el = div().flex_auto().min_w(gpui::px(160.));
-            let el = if failed { style::text_error(el) } else { style::text_muted(el) };
-            line = line.child(sep()).child(el.child(selectable_text("unified-task-runner-note", note, window, cx)));
+            // A multi-line note (a failure: its title, then each cause) is a
+            // block of its own, a line per row, causes set back in muted
+            // text; a one-line note stays on the runner line.
+            if note.contains('\n') {
+                let mut block = div().w_full().flex().flex_col().gap_1();
+                for (i, text) in note.lines().filter(|l| !l.trim().is_empty()).enumerate() {
+                    let id = SharedString::from(format!("unified-task-runner-note-{i}"));
+                    let row = div().w_full().pl(gpui::px(if i == 0 { 0. } else { 12. }));
+                    let row = match (failed, i) {
+                        (true, 0) => style::text_error(row),
+                        _ => style::text_muted(row),
+                    };
+                    block = block.child(row.child(selectable_text(id, text.to_string(), window, cx)));
+                }
+                extra_note = Some(block.into_any_element());
+            } else {
+                let el = div().flex_auto().min_w(gpui::px(160.));
+                let el = if failed { style::text_error(el) } else { style::text_muted(el) };
+                line = line.child(sep()).child(el.child(selectable_text("unified-task-runner-note", note, window, cx)));
+            }
         }
         let actions = self.runner_actions(live.as_ref(), cx);
         let node = self.node_id;
@@ -1287,6 +1305,7 @@ impl TaskPanel {
             .gap_x_3()
             .gap_y_2()
             .child(line)
+            .children(extra_note)
             .child(buttons);
         Some(line.into_any_element())
     }

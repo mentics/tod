@@ -7825,6 +7825,7 @@ dependencies = [
  "tokio-rustls",
  "tokio-tungstenite",
  "toml 0.8.23",
+ "tracing",
  "ureq",
  "windows-sys 0.59.0",
 ]

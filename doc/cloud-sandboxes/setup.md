@@ -44,8 +44,7 @@ orchestrator, so rebuild after changing either. Provisioning looks there first
 `tod-sandbox orchestrator`).
 
 ```sh
-scripts/build-sandbox-binaries.sh              # release build (default)
-scripts/build-sandbox-binaries.sh --debug
+scripts/build-sandbox-binaries.sh              # always a stripped release build
 scripts/build-sandbox-binaries.sh --docker-test -p tod-relay   # Linux-only tests
 ```
 

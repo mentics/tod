@@ -8,6 +8,12 @@ resolver = "2"
 # - line-table debug info keeps binaries smaller and links faster
 # - dependencies carry no debug info, to keep target/ small (every worktree
 #   has its own)
+# Release binaries carry no debug info and no symbol table: the sandbox
+# binaries are uploaded to every cloud sandbox, and the app ships them.
+[profile.release]
+debug = false
+strip = "symbols"
+
 [profile.dev]
 debug = "line-tables-only"
 split-debuginfo = "unpacked"
@@ -31,6 +37,8 @@ opt-level = 3
 [profile.dev-fast]
 inherits = "release"
 incremental = true
+# Keep symbols here: this is the profile that gets debugged.
+strip = "none"
 
 [profile.dev-fast.package.tod]
 opt-level = 0

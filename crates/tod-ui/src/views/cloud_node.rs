@@ -18,6 +18,27 @@ pub enum CloudUpdate {
     Failed(String),
 }
 
+impl CloudUpdate {
+    /// A failed job: shown in the panel and also recorded in the error log
+    /// (the app's log panel reads ERROR from tracing), which the panel alone
+    /// would never reach.
+    pub fn failed(msg: String) -> Self {
+        tracing::error!("cloud: {msg}");
+        CloudUpdate::Failed(msg)
+    }
+}
+
+/// A failure as the panel shows it: the title on the first line, then each
+/// cause of the error on a line of its own.
+fn describe(title: &str, err: &anyhow::Error) -> String {
+    let mut out = title.to_string();
+    for cause in err.chain() {
+        out.push('\n');
+        out.push_str(&cause.to_string());
+    }
+    out
+}
+
 /// Take `node_id` out of the cloud off the UI thread (`cloud_sync::lost::stop_running_in_cloud`).
 pub fn stop_running<T: 'static>(
     fleet: Arc<FleetStore>,
@@ -29,7 +50,7 @@ pub fn stop_running<T: 'static>(
     spawn(cx, on_update, move |tx| {
         let _ = tx.send_blocking(match cloud_sync::lost::stop_running_in_cloud(&fleet, &node_id, delete_sandbox) {
             Ok(msg) => CloudUpdate::Left(msg),
-            Err(err) => CloudUpdate::Failed(format!("Stop running in the cloud failed: {err:#}")),
+            Err(err) => CloudUpdate::failed(describe("Stop running in the cloud failed", &err)),
         });
     });
 }
@@ -45,7 +66,7 @@ pub fn delete_sandbox<T: 'static>(
         let _ = tx.send_blocking(CloudUpdate::Progress("Deleting the sandbox…".into()));
         let _ = tx.send_blocking(match cloud_sync::lost::delete_node_sandbox(&fleet, &node_id) {
             Ok(msg) => CloudUpdate::Synced(msg),
-            Err(err) => CloudUpdate::Failed(format!("Delete sandbox failed: {err:#}")),
+            Err(err) => CloudUpdate::failed(describe("Delete sandbox failed", &err)),
         });
     });
 }
@@ -67,7 +88,7 @@ pub fn run_in_cloud<T: 'static>(
         let result = cloud_sync::run_in_cloud(&fleet, &root, &node_id, &mut progress);
         let _ = tx.send_blocking(match result {
             Ok(node) => CloudUpdate::Accepted(node),
-            Err(err) => CloudUpdate::Failed(format!("Run in the cloud failed: {err:#}")),
+            Err(err) => CloudUpdate::failed(describe("Run in the cloud failed", &err)),
         });
     });
 }
@@ -82,7 +103,7 @@ pub fn sync_now<T: 'static>(
         let root = fleet.paths().root().to_path_buf();
         let _ = tx.send_blocking(match cloud_sync::sync_now(&fleet, &root) {
             Ok(report) => CloudUpdate::Synced(report.summary()),
-            Err(err) => CloudUpdate::Failed(format!("Sync failed: {err:#}")),
+            Err(err) => CloudUpdate::failed(describe("Sync failed", &err)),
         });
     });
 }

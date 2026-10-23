@@ -22,7 +22,7 @@
 # built last whenever this one's files are older, and ships its code.
 #
 # Usage:
-#   scripts/build-sandbox-binaries.sh [--release|--debug] [--docker|--no-docker]
+#   scripts/build-sandbox-binaries.sh [--docker|--no-docker]
 #   scripts/build-sandbox-binaries.sh --docker-test <cargo test args...>
 #       runs `cargo test <args>` for Linux in the same container (e.g.
 #       `--docker-test -p tod-relay`), for code only Linux compiles.
@@ -42,8 +42,9 @@ USE_DOCKER=auto
 DOCKER_TEST=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --release) PROFILE=release; PROFILE_DIR=release ;;
-        --debug) PROFILE=dev; PROFILE_DIR=debug ;;
+        # Always a release build (stripped, see [profile.release]): these
+        # binaries are uploaded to every sandbox, so there is no debug option.
+        --release) ;;
         --docker) USE_DOCKER=yes ;;
         --no-docker) USE_DOCKER=no ;;
         --docker-test) shift; DOCKER_TEST=("$@"); USE_DOCKER=yes; break ;;
