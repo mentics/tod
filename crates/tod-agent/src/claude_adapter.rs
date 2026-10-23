@@ -318,11 +318,16 @@ pub fn update_global() -> Result<Option<InstalledAdapter>> {
         npm(&["install", "-g", &format!("{PACKAGE}@latest")]),
         "Updating the global Claude ACP adapter",
     )?;
-    let found = find();
+    let mut found = find();
     // npm's global prefix can differ from where `claude-agent-acp` on PATH
     // points (a version manager's shim into an older Node's directory), so
     // the install succeeds yet the adapter tod runs does not change.
     let root = run(npm(&["root", "-g"]), "Asking npm where global packages go")?;
+    if let Some(stale) = found.as_ref().filter(|a| a.source == AdapterSource::Global) {
+        if relink_stale(&stale.bin)? {
+            found = find();
+        }
+    }
     let package_path: PathBuf = PACKAGE.split('/').collect();
     let manifest = Path::new(root.lines().last().unwrap_or("").trim())
         .join(&package_path)
@@ -341,6 +346,37 @@ pub fn update_global() -> Result<Option<InstalledAdapter>> {
         }
     }
     Ok(found)
+}
+
+/// When `bin` is a symlink into an older Node installation than the one npm
+/// installs globally into now (a version manager bumped Node, leaving its
+/// shim behind), point it at the adapter npm just installed. Returns whether
+/// it was repointed; anything else about `bin` is left alone.
+#[cfg(unix)]
+fn relink_stale(bin: &Path) -> Result<bool> {
+    let Ok(target) = std::fs::read_link(bin) else {
+        return Ok(false);
+    };
+    let prefix = run(npm(&["prefix", "-g"]), "Asking npm for its global prefix")?;
+    let current = Path::new(prefix.lines().last().unwrap_or("").trim())
+        .join("bin")
+        .join(BIN);
+    if !current.is_file() || current == target {
+        return Ok(false);
+    }
+    let link = bin.with_extension("tod-relink");
+    let _ = std::fs::remove_file(&link);
+    std::os::unix::fs::symlink(&current, &link)
+        .and_then(|()| std::fs::rename(&link, bin))
+        .with_context(|| {
+            format!("relinking {} to {}", bin.display(), current.display())
+        })?;
+    Ok(true)
+}
+
+#[cfg(not(unix))]
+fn relink_stale(_bin: &Path) -> Result<bool> {
+    Ok(false)
 }
 
 /// Update tod's own install when there is one and the registry has a newer
