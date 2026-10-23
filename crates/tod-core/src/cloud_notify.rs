@@ -9,6 +9,11 @@
 //! arrives while a sync runs makes one more run after it. The sync reloads
 //! the store, whose change events update the views.
 //!
+//! A notice is only a hint, and ntfy may drop, delay, or refuse (a rate
+//! limit, a 502) with nothing on this side to show it, so while any node runs
+//! in the cloud [`start`] also pulls on a timer ([`FALLBACK_POLL`]). A sync
+//! reads the orchestrator only, so polling wakes no node's sandbox.
+//!
 //! The server and topic come from `GET /users/<u>/notify` on the
 //! orchestrator, kept in `cloud-sync.json` (`notify`).
 
@@ -38,6 +43,37 @@ const RENEW_AFTER: Duration = Duration::from_secs(10 * 60);
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
 /// How often a data root that is not seeded yet is looked at again.
 const SEEDED_CHECK: Duration = Duration::from_secs(30);
+/// How often the orchestrator is pulled from while a node runs in the
+/// cloud, whether or not a notice arrived.
+pub const FALLBACK_POLL: Duration = Duration::from_secs(20);
+
+/// Whether any node is assigned to the cloud and not lost: its supervisor may
+/// be changing it there, so the feed is worth pulling without a notice.
+fn any_running_in_cloud(fleet: &FleetStore) -> bool {
+    fleet
+        .read(|conn| Ok(tod_store::cloud_nodes::list(conn)?.iter().any(|row| row.lost_at.is_none())))
+        .unwrap_or_else(|err| {
+            tracing::warn!("cloud poll: reading the cloud nodes: {err:#}");
+            false
+        })
+}
+
+/// Pulls on a timer for as long as the app runs, while a node runs in the
+/// cloud ([`any_running_in_cloud`]), in case no notice comes.
+fn spawn_fallback_poll(fleet: Arc<FleetStore>) {
+    let root = fleet.paths().root().to_path_buf();
+    let spawned = std::thread::Builder::new().name("tod-cloud-poll".into()).spawn(move || {
+        loop {
+            std::thread::sleep(FALLBACK_POLL);
+            if CloudSyncState::load(&root).is_ok_and(|s| s.seeded) && any_running_in_cloud(&fleet) {
+                runner(&fleet).request();
+            }
+        }
+    });
+    if let Err(err) = spawned {
+        tracing::warn!("cloud poll: could not start: {err}");
+    }
+}
 
 /// One line of ntfy's JSON stream.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -174,6 +210,7 @@ fn topics(root: &Path) -> Result<NotifyTopics> {
 /// Subscribes for as long as the app runs, once this data root is seeded.
 /// Never blocks the caller; for the app's start.
 pub fn start(fleet: Arc<FleetStore>) {
+    spawn_fallback_poll(fleet.clone());
     let root = fleet.paths().root().to_path_buf();
     let spawned = std::thread::Builder::new().name("tod-cloud-notify".into()).spawn(move || {
         while !CloudSyncState::load(&root).is_ok_and(|s| s.seeded) {
