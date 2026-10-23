@@ -1,115 +1,187 @@
-//! Settings → "Orchestrator GitHub access": the GitHub tokens the cloud
-//! orchestrator reads with, one per organization, each for the repositories
-//! the user lists (`tod_store::orchestrator_github`).
+//! Settings → "Orchestrator GitHub": the GitHub tokens the cloud orchestrator
+//! reads with, as an inline list of rows, each ONE repository pattern
+//! (`owner/repo`, `owner/*` or `*`) and ONE token
+//! (`crate::ui::editable_secret_list`).
 //!
-//! Token values are write-only: typed into a masked input, stored in the
-//! credential store, never read back for display (leaving the input empty
-//! keeps the stored one). Saving writes the list and the token only; nothing
-//! reaches the orchestrator until Apply (`tod_core::orchestrator_github::apply`,
-//! which blocks on the network and so runs on the background executor).
-//! Everything that touches the credential store or the network runs off the
-//! UI thread.
+//! Each row is one `tod_store::orchestrator_github::Entry` with a single
+//! pattern, its label that pattern. An entry saved by an older version with
+//! several repositories shows one row per repository, and on Save its stored
+//! token follows each row to the row's new id.
 //!
-//! Focus: Enter on the section's stop in Settings focuses this editor, where
-//! Enter adds a token and the mouse reaches the rest. A token's form is the
-//! edit mode (its inputs exist only while it is open, and every one is
-//! single-line): Enter saves, Escape closes it. Escape with no form open
-//! hands focus back to Settings. The bindings sit one context deeper than
-//! Settings' own Enter/Escape ones and are registered after them, so they win
-//! (`register_keyboard_bindings`).
+//! Tokens are write-only: typed into a masked input, stored in the credential
+//! store, never read back for display and never in the JSON file, a label, a
+//! log line, an error or a journey record. Save writes the list and the
+//! tokens only; nothing reaches the orchestrator until Apply
+//! (`tod_core::orchestrator_github::apply`, which blocks on the network and so
+//! runs on the background executor). Everything that touches the credential
+//! store or the network runs off the UI thread.
 
+use crate::ui::editable_secret_list::{
+    EditableSecretList, Labels, ListEvent, RowData, RowValues,
+};
 use crate::ui::journey::{self, Source};
 use crate::ui::selectable_text::selectable_text;
+use crate::ui::style;
 use gpui::{
-    actions, App, AppContext, Context, KeyBinding, Entity, EventEmitter, FocusHandle, InteractiveElement, IntoElement,
-    ParentElement, Render, Styled, Window, div, px,
+    App, AppContext, Context, Entity, EventEmitter, IntoElement, ParentElement, Render, Styled,
+    Subscription, Window, div, px,
 };
 use gpui_component::button::{Button, ButtonVariants};
-use gpui_component::input::{Input, InputState};
-use gpui_component::{ActiveTheme, Disableable, StyledExt, h_flex, v_flex};
-use std::collections::HashMap;
-use std::path::PathBuf;
+use gpui_component::{Disableable, h_flex, v_flex};
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use tod_store::orchestrator_github::{self as store, Config, Entry};
 
-/// Asks Settings to take keyboard focus back (Escape with no form open).
+/// Asks Settings to take keyboard focus back (Escape in a row).
 pub struct Leave;
 
-const CONTEXT: &str = "OrchestratorGithub";
-
-actions!(orchestrator_github, [OrchGhAdd, OrchGhSave, OrchGhEscape]);
-
-/// Enter and Escape for this editor. Call after Settings' own bindings are
-/// registered: ties in context depth go to the later binding.
+/// Enter and Escape inside the rows' inputs.
 pub fn register_keyboard_bindings(cx: &mut App) {
-    let outside_input: &'static str = Box::leak(format!("{CONTEXT} && !Input").into_boxed_str());
-    let in_input: &'static str = Box::leak(format!("{CONTEXT} > Input").into_boxed_str());
-    cx.bind_keys([
-        KeyBinding::new("enter", OrchGhAdd, Some(outside_input)),
-        KeyBinding::new("escape", OrchGhEscape, Some(outside_input)),
-        KeyBinding::new("enter", OrchGhSave, Some(in_input)),
-        KeyBinding::new("escape", OrchGhEscape, Some(in_input)),
-    ]);
+    crate::ui::editable_secret_list::register_keyboard_bindings(cx);
 }
 
-/// The repositories text (one per line, or comma or space separated) as
-/// patterns: trimmed, empty pieces dropped, duplicates dropped, each checked.
-pub fn parse_repos(text: &str) -> Result<Vec<String>, String> {
-    let mut out: Vec<String> = Vec::new();
-    for piece in text.split(|c: char| c == ',' || c.is_whitespace()) {
-        let piece = piece.trim();
-        if piece.is_empty() {
+/// One row per repository of every entry. `stored` says which entry ids have
+/// a token stored; a row's tag is the id of the entry it came from.
+pub fn rows_from_config(config: &Config, stored: &HashMap<String, bool>) -> Vec<RowData> {
+    config
+        .tokens
+        .iter()
+        .flat_map(|entry| {
+            let has = stored.get(&entry.id).copied().unwrap_or(false);
+            entry.repos.iter().map(move |repo| RowData {
+                key: repo.clone(),
+                stored: has,
+                tag: entry.id.clone(),
+            })
+        })
+        .collect()
+}
+
+/// What to do with a token when saving.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TokenOp {
+    /// The token stored under `from` is also stored under `to`.
+    Copy { from: String, to: String },
+    /// The user typed this token for `id`.
+    Set { id: String, token: String },
+    /// `id` no longer exists: forget its token.
+    Delete { id: String },
+}
+
+/// A save: the config to write and the token operations, in the order to run
+/// them (copies read before anything is written; deletes last).
+#[derive(Debug, PartialEq, Eq)]
+pub struct Plan {
+    pub config: Config,
+    pub ops: Vec<TokenOp>,
+}
+
+/// The config and token operations for the rows as the user left them, or an
+/// error naming the row. A row with neither pattern nor token is ignored.
+pub fn plan_save(old: &Config, rows: &[RowValues]) -> Result<Plan, String> {
+    struct Kept<'a> {
+        n: usize,
+        pattern: String,
+        row: &'a RowValues,
+    }
+    let mut kept: Vec<Kept> = Vec::new();
+    for (i, row) in rows.iter().enumerate() {
+        let n = i + 1;
+        if row.key.is_empty() && row.secret.is_empty() && !row.stored {
             continue;
         }
-        store::check_pattern(piece)?;
-        if !out.iter().any(|p| p == piece) {
-            out.push(piece.to_string());
+        if row.key.is_empty() {
+            return Err(format!("Row {n}: enter a repository (owner/repo, owner/*, or *)."));
+        }
+        store::check_pattern(&row.key).map_err(|e| format!("Row {n}: {e}"))?;
+        if let Some(first) = kept.iter().find(|k| k.pattern.eq_ignore_ascii_case(&row.key)) {
+            return Err(format!("Row {n}: {} is already in row {}.", row.key, first.n));
+        }
+        if row.secret.is_empty() && !(row.stored && !row.tag.is_empty()) {
+            return Err(format!("Row {n}: paste a token for {}; none is stored.", row.key));
+        }
+        kept.push(Kept { n, pattern: row.key.clone(), row });
+    }
+
+    // Ids: a row that is exactly its old single-repository entry keeps the
+    // entry's id; every other row gets one made from its pattern.
+    let mut ids: Vec<Option<String>> = vec![None; kept.len()];
+    let mut taken: HashSet<String> = HashSet::new();
+    for (k, slot) in kept.iter().zip(ids.iter_mut()) {
+        let same = old.tokens.iter().find(|e| {
+            e.id == k.row.tag && e.repos.len() == 1 && e.repos[0].eq_ignore_ascii_case(&k.pattern)
+        });
+        if let Some(entry) = same
+            && taken.insert(entry.id.clone())
+        {
+            *slot = Some(entry.id.clone());
         }
     }
-    if out.is_empty() {
-        return Err("List at least one repository (owner/repo, owner/*, or *).".to_string());
+    let mut entries: Vec<Entry> = taken
+        .iter()
+        .map(|id| Entry { id: id.clone(), label: String::new(), repos: Vec::new() })
+        .collect();
+    for (k, slot) in kept.iter().zip(ids.iter_mut()) {
+        if slot.is_none() {
+            let id = store::new_id(&k.pattern, &entries);
+            entries.push(Entry { id: id.clone(), label: String::new(), repos: Vec::new() });
+            *slot = Some(id);
+        }
     }
-    Ok(out)
-}
 
-/// What a form describes, ready to save, or what is wrong with it.
-#[derive(Debug, PartialEq, Eq)]
-pub struct Checked {
-    pub config: Config,
-    /// The id of the entry the form saved.
-    pub id: String,
-}
-
-/// The config after the form's entry replaces `original` (or is added),
-/// checked as a whole. A new entry needs its token: without one it could
-/// never be applied.
-pub fn check_form(
-    current: &Config,
-    original: Option<&str>,
-    label: &str,
-    repos_text: &str,
-    typed_token: bool,
-    stored_token: bool,
-) -> Result<Checked, String> {
-    let label = label.trim();
-    if label.is_empty() {
-        return Err("Give the token a label, e.g. the organization it is for.".to_string());
-    }
-    let repos = parse_repos(repos_text)?;
-    if !typed_token && !(original.is_some() && stored_token) {
-        return Err("Paste the token: none is stored for this entry yet.".to_string());
-    }
-    let mut config = current.clone();
-    let id = match original {
-        Some(id) => id.to_string(),
-        None => store::new_id(label, &config.tokens),
-    };
-    let entry = Entry { id: id.clone(), label: label.to_string(), repos };
-    match config.tokens.iter_mut().find(|e| e.id == id) {
-        Some(slot) => *slot = entry,
-        None => config.tokens.push(entry),
+    let mut config = Config::default();
+    let mut copies = Vec::new();
+    let mut sets = Vec::new();
+    for (k, id) in kept.iter().zip(ids) {
+        let id = id.expect("every kept row has an id");
+        config.tokens.push(Entry { id: id.clone(), label: k.pattern.clone(), repos: vec![k.pattern.clone()] });
+        if !k.row.secret.is_empty() {
+            sets.push(TokenOp::Set { id, token: k.row.secret.clone() });
+        } else if k.row.tag != id {
+            copies.push(TokenOp::Copy { from: k.row.tag.clone(), to: id });
+        }
     }
     config.check().map_err(|e| format!("{e:#}"))?;
-    Ok(Checked { config, id })
+    let new_ids: HashSet<&str> = config.tokens.iter().map(|e| e.id.as_str()).collect();
+    let deletes: Vec<TokenOp> = old
+        .tokens
+        .iter()
+        .filter(|e| !new_ids.contains(e.id.as_str()))
+        .map(|e| TokenOp::Delete { id: e.id.clone() })
+        .collect();
+    let mut ops = copies;
+    ops.extend(sets);
+    ops.extend(deletes);
+    Ok(Plan { config, ops })
+}
+
+/// Runs a plan against the credential store and the data root, then returns
+/// which ids have a token. Off the UI thread.
+fn execute(root: &Path, plan: &Plan) -> Result<HashMap<String, bool>, String> {
+    // Read every token to copy before anything is overwritten or deleted.
+    let mut copies = Vec::new();
+    for op in &plan.ops {
+        if let TokenOp::Copy { from, to } = op {
+            let token = store::token(root, from)
+                .ok_or_else(|| format!("The token stored for {from:?} could not be read: paste it again."))?;
+            copies.push((to.clone(), token));
+        }
+    }
+    for (to, token) in copies {
+        store::set_token(root, &to, &token).map_err(|e| format!("Storing a token failed: {e}"))?;
+    }
+    for op in &plan.ops {
+        if let TokenOp::Set { id, token } = op {
+            store::set_token(root, id, token).map_err(|e| format!("Storing a token failed: {e}"))?;
+        }
+    }
+    plan.config.save(root).map_err(|e| format!("Saving the list failed: {e:#}"))?;
+    for op in &plan.ops {
+        if let TokenOp::Delete { id } = op {
+            store::delete_token(root, id);
+        }
+    }
+    Ok(plan.config.tokens.iter().map(|e| (e.id.clone(), store::has_token(root, &e.id))).collect())
 }
 
 /// "N tokens, M routes", with the right plurals.
@@ -118,70 +190,86 @@ pub fn applied_summary(tokens: usize, routes: usize) -> String {
     format!("{}, {}", plural(tokens, "token", "tokens"), plural(routes, "route", "routes"))
 }
 
-struct Form {
-    /// The id of the entry being edited; `None` for a new one.
-    original: Option<String>,
-    label: Entity<InputState>,
-    repos: Entity<InputState>,
-    token: Entity<InputState>,
-    saving: bool,
-}
-
 pub struct OrchestratorGithubEditor {
     data_root: PathBuf,
+    list: Entity<EditableSecretList>,
+    /// The saved config the rows were made from.
     config: Config,
-    /// Whether each entry's token is stored; filled off the UI thread (the
-    /// keyring can prompt). `None` until read.
-    has_token: Option<HashMap<String, bool>>,
     loaded: bool,
-    form: Option<Form>,
-    error: Option<String>,
+    saving: bool,
     applying: bool,
-    apply_status: Option<Result<String, String>>,
-    focus_handle: FocusHandle,
+    error: Option<String>,
+    status: Option<Result<String, String>>,
+    _subscription: Subscription,
 }
 
 impl EventEmitter<Leave> for OrchestratorGithubEditor {}
 
 impl OrchestratorGithubEditor {
-    pub fn new(data_root: PathBuf, cx: &mut Context<Self>) -> Self {
+    pub fn new(data_root: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let list = cx.new(|cx| {
+            EditableSecretList::new(
+                Labels {
+                    key_placeholder: "owner/repo, owner/*, or *".into(),
+                    secret_placeholder: "GitHub token (write-only)".into(),
+                    secret_stored_placeholder: "token stored: type to replace".into(),
+                    add: "Add".into(),
+                    remove_tooltip: "Remove this row. A stored token also needs Save, then Apply, to leave the orchestrator".into(),
+                    stored_note: "A token is stored for this row. Leave the field empty to keep it. Removing the row needs Save, then Apply, to take the token off the orchestrator.".into(),
+                },
+                cx,
+            )
+        });
+        let subscription = cx.subscribe(&list, |this, _, event: &ListEvent, cx| match event {
+            ListEvent::Added => this.record(cx, "orchestrator_github_add_row", Source::Click, Vec::new()),
+            ListEvent::Removed { stored } => {
+                let notices = if *stored {
+                    vec!["The row had a stored token: removing it needs Save, then Apply".to_string()]
+                } else {
+                    Vec::new()
+                };
+                this.record(cx, "orchestrator_github_remove_row", Source::Click, notices)
+            }
+            ListEvent::Leave => cx.emit(Leave),
+        });
         let mut this = Self {
             data_root,
+            list,
             config: Config::default(),
-            has_token: None,
             loaded: false,
-            form: None,
-            error: None,
+            saving: false,
             applying: false,
-            apply_status: None,
-            focus_handle: cx.focus_handle(),
+            error: None,
+            status: None,
+            _subscription: subscription,
         };
-        this.reload(cx);
+        this.reload(window, cx);
         this
     }
 
     /// Re-read the list and which tokens are stored, off the UI thread.
-    fn reload(&mut self, cx: &mut Context<Self>) {
+    fn reload(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let root = self.data_root.clone();
-        cx.spawn(async move |this, cx| {
+        cx.spawn_in(window, async move |this, cx| {
             let loaded = cx
                 .background_executor()
                 .spawn(async move {
                     let config = Config::load(&root).map_err(|e| format!("{e:#}"))?;
-                    let has = config
+                    let stored = config
                         .tokens
                         .iter()
                         .map(|e| (e.id.clone(), store::has_token(&root, &e.id)))
                         .collect::<HashMap<_, _>>();
-                    Ok::<_, String>((config, has))
+                    Ok::<_, String>((config, stored))
                 })
                 .await;
-            let _ = this.update(cx, |this, cx| {
+            let _ = this.update_in(cx, |this, window, cx| {
                 this.loaded = true;
                 match loaded {
-                    Ok((config, has)) => {
+                    Ok((config, stored)) => {
+                        let rows = rows_from_config(&config, &stored);
                         this.config = config;
-                        this.has_token = Some(has);
+                        this.list.update(cx, |list, cx| list.set_rows(rows, window, cx));
                     }
                     Err(e) => this.error = Some(e),
                 }
@@ -192,48 +280,26 @@ impl OrchestratorGithubEditor {
     }
 
     pub fn focus(&self, window: &mut Window, cx: &mut Context<Self>) {
-        match &self.form {
-            Some(form) => form.label.update(cx, |s, cx| s.focus(window, cx)),
-            None => self.focus_handle.focus(window, cx),
-        }
+        self.list.update(cx, |list, cx| list.focus(window, cx));
     }
 
-    fn stored(&self, id: &str) -> bool {
-        self.has_token.as_ref().and_then(|m| m.get(id).copied()).unwrap_or(false)
-    }
-
-    /// A `UserAction` with what was on screen: the buttons of the list or of
-    /// the open form, Apply primary while the list is shown.
-    fn record(&self, cx: &mut gpui::App, action: &str, source: Source) {
+    /// A `UserAction` with what was on screen: Add, Save and Apply (Save is
+    /// primary), never a token.
+    fn record(&self, cx: &mut App, action: &str, source: Source, notices: Vec<String>) {
         let button = |id: &str, label: &str, primary: bool, disabled: bool| tod_journey::PresentedAction {
             id: id.to_string(),
             label: label.to_string(),
             primary,
             disabled,
         };
-        let actions = if self.form.is_some() {
-            vec![
-                button("orchestrator_github_save", "Save", true, self.form.as_ref().is_some_and(|f| f.saving)),
-                button("orchestrator_github_cancel", "Cancel", false, false),
-            ]
-        } else {
-            let mut v = vec![button("orchestrator_github_add", "Add a token", self.config.tokens.is_empty(), false)];
-            for e in &self.config.tokens {
-                v.push(button(&format!("orchestrator_github_edit:{}", e.id), &format!("Edit {}", e.label), false, false));
-                v.push(button(&format!("orchestrator_github_remove:{}", e.id), &format!("Remove {}", e.label), false, false));
-            }
-            v.push(button(
-                "orchestrator_github_apply",
-                "Apply to the orchestrator",
-                !self.config.tokens.is_empty(),
-                self.applying || !self.loaded,
-            ));
-            v
-        };
         let presented = tod_journey::Presented {
-            actions,
+            actions: vec![
+                button("orchestrator_github_add_row", "Add", false, false),
+                button("orchestrator_github_save", "Save", true, self.saving || !self.loaded),
+                button("orchestrator_github_apply", "Apply to the orchestrator", false, self.applying || !self.loaded),
+            ],
             focused: Some(action.to_string()),
-            notices: Vec::new(),
+            notices,
         };
         journey::record_action(
             cx,
@@ -245,123 +311,37 @@ impl OrchestratorGithubEditor {
         );
     }
 
-    fn open_form(&mut self, original: Option<Entry>, source: Source, window: &mut Window, cx: &mut Context<Self>) {
-        let action = if original.is_some() { "orchestrator_github_edit" } else { "orchestrator_github_add" };
-        self.record(cx, action, source);
-        let label = cx.new(|cx| InputState::new(window, cx).placeholder("Label, e.g. the organization (Acme)"));
-        let repos = cx.new(|cx| InputState::new(window, cx).placeholder("acme/api, acme/*, or *"));
-        let stored = original.as_ref().is_some_and(|e| self.stored(&e.id));
-        let token = cx.new(|cx| {
-            InputState::new(window, cx).masked(true).placeholder(if stored {
-                "A token is stored. Leave empty to keep it, or paste a new one"
-            } else {
-                "Paste the GitHub token (write-only)"
-            })
-        });
-        if let Some(e) = &original {
-            label.update(cx, |s, cx| s.set_value(e.label.clone(), window, cx));
-            repos.update(cx, |s, cx| s.set_value(e.repos.join(", "), window, cx));
-        }
-        label.update(cx, |s, cx| s.focus(window, cx));
-        self.form = Some(Form { original: original.map(|e| e.id), label, repos, token, saving: false });
-        self.error = None;
-        cx.notify();
-    }
-
-    fn close_form(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.form = None;
-        self.error = None;
-        self.focus_handle.focus(window, cx);
-        cx.notify();
-    }
-
-    fn save(&mut self, source: Source, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(form) = self.form.as_ref() else { return };
-        if form.saving {
+    fn save(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.saving || !self.loaded {
             return;
         }
-        let label = form.label.read(cx).text().to_string();
-        let repos = form.repos.read(cx).text().to_string();
-        let typed: String = form.token.read(cx).text().to_string();
-        let typed: String = typed.trim().chars().filter(|c| !c.is_control()).collect();
-        let original = form.original.clone();
-        let stored = original.as_deref().is_some_and(|id| self.stored(id));
-        let checked = match check_form(&self.config, original.as_deref(), &label, &repos, !typed.is_empty(), stored) {
-            Ok(c) => c,
+        let rows = self.list.read(cx).values(cx);
+        let plan = match plan_save(&self.config, &rows) {
+            Ok(plan) => plan,
             Err(e) => {
                 self.error = Some(e);
                 cx.notify();
                 return;
             }
         };
-        self.record(cx, "orchestrator_github_save", source);
-        if let Some(form) = self.form.as_mut() {
-            form.saving = true;
-        }
+        self.record(cx, "orchestrator_github_save", Source::Click, Vec::new());
+        self.saving = true;
         self.error = None;
+        self.status = None;
+        cx.notify();
         let root = self.data_root.clone();
-        let Checked { config, id } = checked;
-        let saved_id = id.clone();
-        let saved_config = config.clone();
+        let config = plan.config.clone();
         cx.spawn_in(window, async move |this, cx| {
-            let result = cx
-                .background_executor()
-                .spawn(async move {
-                    if !typed.is_empty() {
-                        store::set_token(&root, &id, &typed).map_err(|e| format!("Storing the token failed: {e}"))?;
-                    }
-                    config.save(&root).map_err(|e| format!("Saving the list failed: {e:#}"))?;
-                    Ok::<_, String>(store::has_token(&root, &id))
-                })
-                .await;
-            let _ = this.update_in(cx, |this, window, cx| match result {
-                Ok(has) => {
-                    this.config = saved_config;
-                    this.has_token.get_or_insert_with(HashMap::new).insert(saved_id, has);
-                    this.apply_status = Some(Ok(
-                        "Saved. Nothing reaches the orchestrator until you press Apply.".to_string()
-                    ));
-                    this.close_form(window, cx);
-                }
-                Err(e) => {
-                    if let Some(form) = this.form.as_mut() {
-                        form.saving = false;
-                    }
-                    this.error = Some(e);
-                    cx.notify();
-                }
-            });
-        })
-        .detach();
-    }
-
-    fn remove(&mut self, id: String, cx: &mut Context<Self>) {
-        self.record(cx, "orchestrator_github_remove", Source::Click);
-        let mut config = self.config.clone();
-        config.tokens.retain(|e| e.id != id);
-        let root = self.data_root.clone();
-        cx.spawn(async move |this, cx| {
-            let result = cx
-                .background_executor()
-                .spawn({
-                    let (config, id, root) = (config.clone(), id.clone(), root);
-                    async move {
-                        config.save(&root).map_err(|e| format!("Saving the list failed: {e:#}"))?;
-                        store::delete_token(&root, &id);
-                        Ok::<_, String>(())
-                    }
-                })
-                .await;
-            let _ = this.update(cx, |this, cx| {
+            let result = cx.background_executor().spawn(async move { execute(&root, &plan) }).await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.saving = false;
                 match result {
-                    Ok(()) => {
+                    Ok(stored) => {
+                        let rows = rows_from_config(&config, &stored);
                         this.config = config;
-                        if let Some(m) = this.has_token.as_mut() {
-                            m.remove(&id);
-                        }
-                        this.error = None;
-                        this.apply_status = Some(Ok(
-                            "Removed. The orchestrator still holds it until you press Apply.".to_string()
+                        this.list.update(cx, |list, cx| list.set_rows(rows, window, cx));
+                        this.status = Some(Ok(
+                            "Saved. Nothing reaches the orchestrator until you press Apply.".to_string()
                         ));
                     }
                     Err(e) => this.error = Some(e),
@@ -372,27 +352,24 @@ impl OrchestratorGithubEditor {
         .detach();
     }
 
-    fn apply(&mut self, source: Source, cx: &mut Context<Self>) {
+    fn apply(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.applying || !self.loaded {
             return;
         }
-        self.record(cx, "orchestrator_github_apply", source);
+        self.record(cx, "orchestrator_github_apply", Source::Click, Vec::new());
         self.applying = true;
-        self.apply_status = None;
+        self.status = None;
         cx.notify();
         let root = self.data_root.clone();
-        cx.spawn(async move |this, cx| {
+        cx.spawn_in(window, async move |this, cx| {
             let result = cx
                 .background_executor()
                 .spawn(async move { tod_core::orchestrator_github::apply(&root) })
                 .await;
-            let _ = this.update(cx, |this, cx| {
+            let _ = this.update_in(cx, |this, _, cx| {
                 this.applying = false;
-                this.apply_status = Some(match result {
-                    Ok(applied) => Ok(format!(
-                        "Applied: {}.",
-                        applied_summary(applied.tokens, applied.routes)
-                    )),
+                this.status = Some(match result {
+                    Ok(applied) => Ok(format!("Applied: {}.", applied_summary(applied.tokens, applied.routes))),
                     Err(e) => Err(format!("{e:#}")),
                 });
                 cx.notify();
@@ -400,222 +377,51 @@ impl OrchestratorGithubEditor {
         })
         .detach();
     }
-
-    fn render_row(&self, entry: &Entry, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let muted = cx.theme().muted_foreground;
-        let stored = match &self.has_token {
-            None => "checking the token…",
-            Some(_) if self.stored(&entry.id) => "token stored",
-            Some(_) => "no token stored",
-        };
-        let id = entry.id.clone();
-        let edit_entry = entry.clone();
-        v_flex()
-            .gap_0p5()
-            .w_full()
-            .p_2()
-            .rounded_md()
-            .border_1()
-            .border_color(cx.theme().border)
-            .child(
-                h_flex()
-                    .gap_2()
-                    .items_center()
-                    .child(div().text_sm().font_semibold().child(selectable_text(
-                        format!("orch-gh-label-{}", entry.id),
-                        entry.label.clone(),
-                        window,
-                        cx,
-                    )))
-                    .child(div().text_xs().text_color(muted).child(stored))
-                    .child(div().flex_1())
-                    .child(
-                        Button::new(SharedStringId::edit(&entry.id))
-                            .label("Edit")
-                            .ghost()
-                            .compact()
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.open_form(Some(edit_entry.clone()), Source::Click, window, cx)
-                            })),
-                    )
-                    .child(
-                        Button::new(SharedStringId::remove(&entry.id))
-                            .label("Remove")
-                            .ghost()
-                            .compact()
-                            .on_click(cx.listener(move |this, _, _, cx| this.remove(id.clone(), cx))),
-                    ),
-            )
-            .child(div().text_xs().text_color(muted).child(selectable_text(
-                format!("orch-gh-repos-{}", entry.id),
-                entry.repos.join(", "),
-                window,
-                cx,
-            )))
-            .into_any_element()
-    }
-
-    fn render_form(&self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let Some(form) = &self.form else { return div().into_any_element() };
-        let field = |label: &'static str, child: gpui::AnyElement| {
-            v_flex().gap_1().w_full().child(div().text_xs().font_semibold().child(label)).child(child)
-        };
-        let mut col = v_flex()
-            .gap_2()
-            .w_full()
-            .p_2()
-            .rounded_md()
-            .border_1()
-            .border_color(cx.theme().list_active_border)
-            .child(field("Label", Input::new(&form.label).into_any_element()))
-            .child(field(
-                "Repositories this token is for (comma separated: owner/repo, owner/*, or *)",
-                Input::new(&form.repos).into_any_element(),
-            ))
-            .child(field(
-                if form.original.is_some() { "Token (leave empty to keep the stored one)" } else { "Token" },
-                Input::new(&form.token).into_any_element(),
-            ))
-            .child(
-                h_flex()
-                    .gap_2()
-                    .items_center()
-                    .child(
-                        Button::new("orch-gh-save")
-                            .label(if form.saving { "Saving…" } else { "Save" })
-                            .primary()
-                            .compact()
-                            .disabled(form.saving)
-                            .on_click(cx.listener(|this, _, window, cx| this.save(Source::Click, window, cx))),
-                    )
-                    .child(
-                        Button::new("orch-gh-cancel")
-                            .label("Cancel")
-                            .ghost()
-                            .compact()
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.record(cx, "orchestrator_github_cancel", Source::Click);
-                                this.close_form(window, cx)
-                            })),
-                    ),
-            );
-        if let Some(err) = &self.error {
-            col = col.child(div().text_xs().text_color(cx.theme().danger).child(selectable_text(
-                "orch-gh-form-error",
-                err.clone(),
-                window,
-                cx,
-            )));
-        }
-        col.into_any_element()
-    }
-}
-
-/// Button ids that stay distinct per entry.
-struct SharedStringId;
-impl SharedStringId {
-    fn edit(id: &str) -> gpui::SharedString {
-        format!("orch-gh-edit-{id}").into()
-    }
-    fn remove(id: &str) -> gpui::SharedString {
-        format!("orch-gh-remove-{id}").into()
-    }
 }
 
 impl Render for OrchestratorGithubEditor {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let muted = cx.theme().muted_foreground;
-        let tokens = self.config.tokens.clone();
         let mut col = v_flex()
-            .id("orchestrator-github-editor")
-            .track_focus(&self.focus_handle)
             .gap_2()
             .w_full()
             .max_w(px(720.))
-            .key_context(CONTEXT)
-            .on_action(cx.listener(|this, _: &OrchGhAdd, window, cx| {
-                if this.form.is_none() && this.loaded {
-                    this.open_form(None, Source::Keyboard, window, cx);
-                }
-            }))
-            .on_action(cx.listener(|this, _: &OrchGhSave, window, cx| {
-                this.save(Source::Keyboard, window, cx);
-            }))
-            .on_action(cx.listener(|this, _: &OrchGhEscape, window, cx| {
-                if this.form.is_some() {
-                    this.record(cx, "orchestrator_github_cancel", Source::Keyboard);
-                    this.close_form(window, cx);
-                } else {
-                    cx.emit(Leave);
-                }
-            }))
-            // Settings focuses itself on any click; the inputs here must keep theirs.
-            .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .child(div().text_sm().text_color(muted).child(
-                "While a node waits, the orchestrator reads GitHub for it (merges, releases) so its sandbox need not wake. \
-                 A GitHub token covers one organization, so add one token per organization and list the repositories each is for: \
-                 owner/repo, owner/*, or * (the most specific match wins). \
-                 Saving keeps the list and the tokens here; nothing reaches the orchestrator until you press Apply.",
+            .child(style::text_muted(div()).child(
+                "The orchestrator reads GitHub (merges, releases) for waiting nodes so their sandboxes need not wake. \
+                 A token covers one organization: list each repository with the token that reads it; \
+                 the most specific pattern wins. Save keeps the list here; nothing reaches the orchestrator until Apply.",
             ));
         if !self.loaded {
-            col = col.child(div().text_xs().text_color(muted).child("Loading…"));
-        } else if tokens.is_empty() && self.form.is_none() {
-            col = col.child(div().text_xs().text_color(muted).child("No tokens yet."));
+            col = col.child(style::text_dense_muted(div()).child("Loading…"));
         }
-        for entry in &tokens {
-            // The entry being edited is shown as its form instead.
-            if self.form.as_ref().and_then(|f| f.original.as_deref()) == Some(entry.id.as_str()) {
-                col = col.child(self.render_form(window, cx));
-            } else {
-                col = col.child(self.render_row(entry, window, cx));
-            }
+        col = col.child(self.list.clone());
+        col = col.child(
+            h_flex()
+                .gap_2()
+                .items_center()
+                .child(
+                    Button::new("orch-gh-save")
+                        .label(if self.saving { "Saving…" } else { "Save" })
+                        .primary()
+                        .compact()
+                        .disabled(self.saving || !self.loaded)
+                        .on_click(cx.listener(|this, _, window, cx| this.save(window, cx))),
+                )
+                .child(
+                    Button::new("orch-gh-apply")
+                        .label(if self.applying { "Applying…" } else { "Apply to the orchestrator" })
+                        .compact()
+                        .disabled(self.applying || !self.loaded)
+                        .on_click(cx.listener(|this, _, window, cx| this.apply(window, cx))),
+                ),
+        );
+        if let Some(err) = self.error.clone() {
+            col = col.child(style::text_error(div()).child(selectable_text("orch-gh-error", err, window, cx)));
         }
-        if self.form.as_ref().is_some_and(|f| f.original.is_none()) {
-            col = col.child(self.render_form(window, cx));
-        }
-        if self.form.is_none() {
-            col = col.child(
-                h_flex()
-                    .gap_2()
-                    .items_center()
-                    .child(
-                        Button::new("orch-gh-add")
-                            .label("Add a token")
-                            .compact()
-                            .disabled(!self.loaded)
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.open_form(None, Source::Click, window, cx)
-                            })),
-                    )
-                    .child(
-                        Button::new("orch-gh-apply")
-                            .label(if self.applying { "Applying…" } else { "Apply to the orchestrator" })
-                            .primary()
-                            .compact()
-                            .disabled(self.applying || !self.loaded)
-                            .on_click(cx.listener(|this, _, _, cx| this.apply(Source::Click, cx))),
-                    ),
-            );
-            if let Some(err) = &self.error {
-                col = col.child(div().text_xs().text_color(cx.theme().danger).child(selectable_text(
-                    "orch-gh-error",
-                    err.clone(),
-                    window,
-                    cx,
-                )));
-            }
-        }
-        if let Some(status) = self.apply_status.clone() {
-            let (color, text) = match status {
-                Ok(t) => (muted, t),
-                Err(t) => (cx.theme().danger, t),
-            };
-            col = col.child(div().text_xs().text_color(color).child(selectable_text(
-                "orch-gh-status",
-                text,
-                window,
-                cx,
-            )));
+        if let Some(status) = self.status.clone() {
+            col = col.child(match status {
+                Ok(t) => style::text_dense_muted(div()).child(selectable_text("orch-gh-status", t, window, cx)),
+                Err(t) => style::text_error(div()).child(selectable_text("orch-gh-status", t, window, cx)),
+            });
         }
         col
     }
@@ -625,52 +431,107 @@ impl Render for OrchestratorGithubEditor {
 mod tests {
     use super::*;
 
-    fn cfg() -> Config {
-        Config { tokens: vec![Entry { id: "acme".into(), label: "Acme".into(), repos: vec!["acme/*".into()] }] }
+    fn entry(id: &str, repos: &[&str]) -> Entry {
+        Entry { id: id.into(), label: id.into(), repos: repos.iter().map(|s| s.to_string()).collect() }
+    }
+    fn row(key: &str, secret: &str, stored: bool, tag: &str) -> RowValues {
+        RowValues { key: key.into(), secret: secret.into(), stored, tag: tag.into() }
     }
 
     #[test]
-    fn repos_split_on_lines_commas_and_spaces() {
+    fn a_multi_repo_entry_splits_into_one_row_per_repo() {
+        let config = Config { tokens: vec![entry("acme", &["acme/api", "acme/*"]), entry("x", &["x/y"])] };
+        let stored = HashMap::from([("acme".to_string(), true)]);
+        let rows = rows_from_config(&config, &stored);
         assert_eq!(
-            parse_repos("acme/api, acme/web\n\n  other/*  ,*, acme/api").unwrap(),
-            vec!["acme/api", "acme/web", "other/*", "*"]
+            rows,
+            vec![
+                RowData { key: "acme/api".into(), stored: true, tag: "acme".into() },
+                RowData { key: "acme/*".into(), stored: true, tag: "acme".into() },
+                RowData { key: "x/y".into(), stored: false, tag: "x".into() },
+            ]
         );
     }
 
     #[test]
-    fn repos_reject_a_bad_pattern_and_an_empty_list() {
-        assert!(parse_repos("acme").unwrap_err().contains("acme"));
-        assert!(parse_repos(" \n, ").is_err());
+    fn untouched_single_rows_keep_their_ids_and_tokens() {
+        let old = Config { tokens: vec![entry("acme-api", &["acme/api"])] };
+        let plan = plan_save(&old, &[row("acme/api", "", true, "acme-api")]).unwrap();
+        assert_eq!(
+            plan.config.tokens,
+            vec![Entry { id: "acme-api".into(), label: "acme/api".into(), repos: vec!["acme/api".into()] }]
+        );
+        assert!(plan.ops.is_empty());
     }
 
     #[test]
-    fn a_new_entry_needs_its_token() {
-        assert!(check_form(&Config::default(), None, "Acme", "acme/*", false, false).is_err());
-        let ok = check_form(&Config::default(), None, "Acme", "acme/*", true, false).unwrap();
-        assert_eq!(ok.id, "acme");
-        assert_eq!(ok.config.tokens.len(), 1);
+    fn a_legacy_entry_is_split_and_its_token_carried_over() {
+        let old = Config { tokens: vec![entry("acme", &["acme/api", "acme/*"])] };
+        let rows = [row("acme/api", "", true, "acme"), row("acme/*", "", true, "acme")];
+        let plan = plan_save(&old, &rows).unwrap();
+        let ids: Vec<&str> = plan.config.tokens.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids, vec!["acme-api", "acme"]);
+        assert!(plan.config.tokens.iter().all(|e| e.repos.len() == 1 && e.label == e.repos[0]));
+        // "acme/*" keeps the id "acme" (its token is already there); only "acme/api" copies.
+        assert_eq!(plan.ops, vec![TokenOp::Copy { from: "acme".into(), to: "acme-api".into() }]);
+        // The old id lives on as a new one, so it is not deleted.
+        assert!(!plan.ops.iter().any(|op| matches!(op, TokenOp::Delete { .. })));
     }
 
     #[test]
-    fn a_new_entry_gets_an_unused_id() {
-        let ok = check_form(&cfg(), None, "Acme", "x/*", true, false).unwrap();
-        assert_eq!(ok.id, "acme-2");
-        assert_eq!(ok.config.tokens.len(), 2);
+    fn an_old_id_no_row_uses_is_deleted() {
+        let old = Config { tokens: vec![entry("acme", &["acme/api", "other/x"])] };
+        let rows = [row("acme/api", "", true, "acme"), row("other/x", "", true, "acme")];
+        let plan = plan_save(&old, &rows).unwrap();
+        assert!(plan.ops.contains(&TokenOp::Delete { id: "acme".into() }));
+        assert!(plan.ops.contains(&TokenOp::Copy { from: "acme".into(), to: "acme-api".into() }));
+        assert!(plan.ops.contains(&TokenOp::Copy { from: "acme".into(), to: "other-x".into() }));
     }
 
     #[test]
-    fn editing_keeps_the_stored_token_and_replaces_in_place() {
-        let ok = check_form(&cfg(), Some("acme"), "Acme Inc", "acme/api\nacme/web", false, true).unwrap();
-        assert_eq!(ok.config.tokens.len(), 1);
-        assert_eq!(ok.config.tokens[0].label, "Acme Inc");
-        assert_eq!(ok.config.tokens[0].repos, vec!["acme/api", "acme/web"]);
-        // Editing an entry whose token is gone needs one pasted.
-        assert!(check_form(&cfg(), Some("acme"), "Acme", "acme/*", false, false).is_err());
+    fn removing_a_row_deletes_its_token() {
+        let old = Config { tokens: vec![entry("a", &["a/b"]), entry("c", &["c/d"])] };
+        let plan = plan_save(&old, &[row("c/d", "", true, "c")]).unwrap();
+        assert_eq!(plan.ops, vec![TokenOp::Delete { id: "a".into() }]);
+        assert_eq!(plan.config.tokens.len(), 1);
     }
 
     #[test]
-    fn a_blank_label_is_refused() {
-        assert!(check_form(&cfg(), None, "  ", "a/b", true, false).is_err());
+    fn a_typed_token_replaces_the_stored_one() {
+        let old = Config { tokens: vec![entry("a-b", &["a/b"])] };
+        let plan = plan_save(&old, &[row("a/b", "ghp_new", true, "a-b")]).unwrap();
+        assert_eq!(plan.ops, vec![TokenOp::Set { id: "a-b".into(), token: "ghp_new".into() }]);
+    }
+
+    #[test]
+    fn a_new_row_needs_a_token_and_a_valid_unique_pattern() {
+        let old = Config::default();
+        let err = plan_save(&old, &[row("a/b", "", false, "")]).unwrap_err();
+        assert!(err.starts_with("Row 1:"), "{err}");
+        let err = plan_save(&old, &[row("a/b", "t", false, ""), row("nonsense", "t", false, "")]).unwrap_err();
+        assert!(err.starts_with("Row 2:") && err.contains("nonsense"), "{err}");
+        let err = plan_save(&old, &[row("a/b", "t", false, ""), row("A/B", "t", false, "")]).unwrap_err();
+        assert_eq!(err, "Row 2: A/B is already in row 1.");
+        let err = plan_save(&old, &[row("", "t", false, "")]).unwrap_err();
+        assert!(err.starts_with("Row 1:"));
+        let ok = plan_save(&old, &[row("a/b", "t", false, "")]).unwrap();
+        assert_eq!(ok.config.tokens[0].id, "a-b");
+        assert_eq!(ok.ops, vec![TokenOp::Set { id: "a-b".into(), token: "t".into() }]);
+    }
+
+    #[test]
+    fn a_blank_row_is_ignored_and_ids_never_collide() {
+        let old = Config::default();
+        let plan = plan_save(&old, &[row("", "", false, ""), row("a/b", "t", false, ""), row("a-b/*", "t", false, "")])
+            .unwrap();
+        assert_eq!(plan.config.tokens.len(), 2);
+        assert_ne!(plan.config.tokens[0].id, plan.config.tokens[1].id);
+    }
+
+    #[test]
+    fn errors_never_carry_a_token() {
+        let err = plan_save(&Config::default(), &[row("bad", "ghp_SECRET", false, "")]).unwrap_err();
+        assert!(!err.contains("ghp_SECRET"));
     }
 
     #[test]

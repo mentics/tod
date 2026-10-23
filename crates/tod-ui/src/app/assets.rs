@@ -26,7 +26,8 @@ gpui_kit_assets::icon_assets!(
         GitPullRequest,
         GitPullRequestDraft,
         GitPullRequestClosed,
-        GitMerge
+        GitMerge,
+        Trash
     ]
 );
 
@@ -58,6 +59,11 @@ pub fn serves(path: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::serves;
+
+    #[test]
+    fn trash_icon_is_bundled() {
+        assert!(serves("icons/trash.svg"));
+    }
 
     #[test]
     fn title_bar_report_icon_is_bundled() {

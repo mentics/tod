@@ -654,7 +654,9 @@ impl SettingsView {
         let orchestrator_github_editor = {
             let root = paths.data_root().to_path_buf();
             cx.new(|cx| {
-                crate::views::orchestrator_github_editor::OrchestratorGithubEditor::new(root, cx)
+                crate::views::orchestrator_github_editor::OrchestratorGithubEditor::new(
+                    root, window, cx,
+                )
             })
         };
         let _orchestrator_github_subscription = cx.subscribe_in(
