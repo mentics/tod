@@ -620,6 +620,15 @@ fn cli_relay_env(env: &mut HashMap<String, String>, from: Option<&Path>) -> Resu
     Ok(port)
 }
 
+/// The account's port forwards, carried wherever the tunnel is
+/// (`forwards` in `sandboxes.toml`'s account; `doc/cloud-sandboxes/port-forwarding.md`).
+fn configured_forwards(ctx: &Ctx, carry: bool) -> Result<Vec<tod_sandbox::config::Forward>> {
+    if !carry {
+        return Ok(Vec::new());
+    }
+    config::Config::load(&ctx.root.join(config::FILE_NAME))?.forwards()
+}
+
 /// `cmd` with the sandbox's `tod-cli` first on its `PATH`.
 fn with_tod_cli(cmd: &str) -> String {
     let dir = sandboxes::TOD_CLI_PATH.rsplit_once('/').map(|(dir, _)| dir).unwrap_or("/");
@@ -642,6 +651,7 @@ fn shell(ctx: &mut Ctx, mut args: Args) -> Result<i32> {
     args.done()?;
     terminal::require_terminal()?;
     let tunnel_port = carry.then(|| cli_relay_env(&mut env, relay_file.as_deref())).transpose()?;
+    let forwards = configured_forwards(ctx, carry)?;
     // Not a login shell when carrying `tod-cli`: a login profile resets
     // `PATH`, and with it `tod-cli`. The shell stays after `--run` exits.
     // Use the sandbox user's own configured shell (`/etc/passwd`), falling
@@ -665,6 +675,7 @@ fn shell(ctx: &mut Ctx, mut args: Args) -> Result<i32> {
             sandbox_url: url.to_string(),
             env: env.clone(),
             tunnel_port,
+            forwards: forwards.clone(),
             park_after: (park > 0).then(|| Duration::from_secs(park)),
             log: |_| {},
         };
@@ -692,6 +703,7 @@ fn agent(ctx: &mut Ctx, mut args: Args, remote: Vec<String>) -> Result<i32> {
         bail!("nothing to run: tod-sandbox agent {name} --name AGENT -- <command...>");
     }
     let tunnel_port = carry.then(|| cli_relay_env(&mut env, None)).transpose()?;
+    let forwards = configured_forwards(ctx, carry)?;
     let program = remote.iter().map(|a| relay::shell_quote(a)).collect::<Vec<_>>().join(" ");
     let cmd = if carry { with_tod_cli(&format!("exec {program}")) } else { format!("exec {program}") };
     let awake_file = ctx
@@ -708,6 +720,7 @@ fn agent(ctx: &mut Ctx, mut args: Args, remote: Vec<String>) -> Result<i32> {
             cwd: cwd.clone(),
             idle: Duration::from_secs(idle),
             tunnel_port,
+            forwards: forwards.clone(),
             awake_file: Some(awake_file.clone()),
         };
         block_on(tod_sandbox::agent::run(url, token, opts))

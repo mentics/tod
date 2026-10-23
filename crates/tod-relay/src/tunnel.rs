@@ -7,9 +7,15 @@
 //! `<id: u32 BE><bytes>` carries data, text `c<id>` says the sender has
 //! nothing more to write on it. A connection that arrives while no client is
 //! attached is closed at once.
+//!
+//! **Forwards.** A client may also ask the relay to listen on further loopback
+//! ports (text `f<port>`; answered `l<port>`, or `e<port>:<reason>`). A
+//! connection to one opens its stream as `o<id>:<port>`, so the client knows
+//! which of its own targets to dial; the relay never names a target, only the
+//! sandbox-side port. The default port's streams stay plain `o<id>`.
 
 use futures_util::StreamExt;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -32,6 +38,8 @@ pub struct Tunnel {
     /// the client closes its side or detaches.
     streams: Mutex<HashMap<u32, (u64, StreamIn)>>,
     next: AtomicU32,
+    /// Ports a client asked this relay to forward; each keeps listening.
+    forwards: Mutex<HashSet<u16>>,
 }
 
 impl Tunnel {
@@ -44,6 +52,28 @@ impl Tunnel {
                 return;
             }
         };
+        self.accept_loop(listener, None).await
+    }
+
+    /// Starts listening on `port` for a client's forward (a no-op when it
+    /// already is). Ports below 1024 are refused: a sandbox's own services
+    /// (and the relay) live there.
+    async fn start_forward(self: &Arc<Self>, port: u16) -> Result<(), String> {
+        if port < 1024 {
+            return Err("ports below 1024 cannot be forwarded".into());
+        }
+        if self.forwards.lock().unwrap().contains(&port) {
+            return Ok(());
+        }
+        let listener = TcpListener::bind(("127.0.0.1", port))
+            .await
+            .map_err(|e| format!("cannot listen on 127.0.0.1:{port}: {e}"))?;
+        self.forwards.lock().unwrap().insert(port);
+        tokio::spawn(self.clone().accept_loop(listener, Some(port)));
+        Ok(())
+    }
+
+    async fn accept_loop(self: Arc<Self>, listener: TcpListener, forward: Option<u16>) {
         loop {
             let Ok((stream, _)) = listener.accept().await else { continue };
             let Some((conn, tx)) = self.clients.lock().unwrap().last().cloned() else {
@@ -52,7 +82,11 @@ impl Tunnel {
             let id = self.next.fetch_add(1, Ordering::SeqCst);
             let (itx, mut irx) = unbounded_channel::<Option<Vec<u8>>>();
             self.streams.lock().unwrap().insert(id, (conn, itx));
-            if tx.send(Message::Text(format!("o{id}"))).is_err() {
+            let open = match forward {
+                Some(port) => format!("o{id}:{port}"),
+                None => format!("o{id}"),
+            };
+            if tx.send(Message::Text(open)).is_err() {
                 self.streams.lock().unwrap().remove(&id);
                 continue;
             }
@@ -85,7 +119,7 @@ impl Tunnel {
     }
 
     pub async fn serve(self: Arc<Self>, conn: u64, tx: Out, mut incoming: WsIn) {
-        self.clients.lock().unwrap().push((conn, tx));
+        self.clients.lock().unwrap().push((conn, tx.clone()));
         while let Some(msg) = incoming.next().await {
             match msg {
                 Ok(Message::Binary(b)) if b.len() >= 4 => {
@@ -100,6 +134,13 @@ impl Tunnel {
                             let _ = s.send(None);
                         }
                     }
+                }
+                Ok(Message::Text(t)) if t.starts_with('f') => {
+                    let Ok(port) = t[1..].parse::<u16>() else { continue };
+                    let _ = tx.send(Message::Text(match self.start_forward(port).await {
+                        Ok(()) => format!("l{port}"),
+                        Err(e) => format!("e{port}:{e}"),
+                    }));
                 }
                 Ok(Message::Close(_)) | Err(_) => break,
                 _ => {}

@@ -26,6 +26,8 @@ pub struct TerminalOptions {
     /// Carry the relay's tunnel to this local port while attached, so
     /// `tod-cli` in the terminal reaches the app.
     pub tunnel_port: Option<u16>,
+    /// Ports to forward through the tunnel (only while it is carried).
+    pub forwards: Vec<crate::config::Forward>,
     /// Park an idle terminal after this long; `None` never parks.
     pub park_after: Option<Duration>,
     /// Called with a line about each attach and park, for a log.
@@ -55,9 +57,10 @@ pub async fn run(url: &str, token: &str, opts: TerminalOptions) -> Result<i32> {
         }
         if let (true, Some(port)) = (on, opts.tunnel_port) {
             let (url, token) = (opts.sandbox_url.clone(), token.to_string());
+            let forwards = opts.forwards.clone();
             *current = Some(tokio::spawn(async move {
                 loop {
-                    let _ = crate::tunnel::run(&url, &token, port, None).await;
+                    let _ = crate::tunnel::run(&url, &token, port, &forwards, None).await;
                     tokio::time::sleep(Duration::from_secs(1)).await;
                 }
             }));

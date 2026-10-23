@@ -463,6 +463,7 @@ async fn tty(t: Target, cmd: String) -> i32 {
         sandbox_url: String::new(),
         env: Default::default(),
         tunnel_port: None,
+        forwards: Vec::new(),
         park_after: (park > 0).then(|| Duration::from_secs(park)),
         log,
     };

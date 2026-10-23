@@ -73,6 +73,61 @@ pub struct Account {
     /// is a prefix: the newest sandbox that starts with it (`wsx-golden-*`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub golden: Option<String>,
+    /// Ports a node's sandbox forwards to hosts reachable from this machine
+    /// (`forwards = ["5432=db.internal:5432"]`); see [`Forward`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub forwards: Vec<String>,
+}
+
+/// A port in a sandbox that reaches `host:port` from this machine: a
+/// connection to `127.0.0.1:<port>` in the sandbox is carried through the
+/// relay's tunnel and opened from here, as if this machine had made it
+/// (`doc/cloud-sandboxes/port-forwarding.md`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Forward {
+    /// The loopback port in the sandbox.
+    pub port: u16,
+    /// What this machine connects to, `host:port`.
+    pub target: String,
+}
+
+impl Forward {
+    /// `PORT=HOST:PORT`, or `HOST:PORT` for the same port at both ends.
+    /// Ports below 1024 are refused: the relay refuses them too.
+    pub fn parse(spec: &str) -> Result<Self> {
+        let spec = spec.trim();
+        let (port, target) = match spec.split_once('=') {
+            Some((port, target)) => (Some(port.trim()), target.trim()),
+            None => (None, spec),
+        };
+        let (host, target_port) = target
+            .rsplit_once(':')
+            .filter(|(host, _)| !host.is_empty())
+            .with_context(|| format!("forward {spec:?}: expected [PORT=]HOST:PORT"))?;
+        let target_port: u16 = target_port
+            .parse()
+            .with_context(|| format!("forward {spec:?}: {target_port:?} is not a port"))?;
+        let port = match port {
+            Some(p) => p.parse().with_context(|| format!("forward {spec:?}: {p:?} is not a port"))?,
+            None => target_port,
+        };
+        anyhow::ensure!(port >= 1024, "forward {spec:?}: sandbox port {port} is below 1024");
+        Ok(Self { port, target: format!("{host}:{target_port}") })
+    }
+}
+
+impl Config {
+    /// The configured forwards. A malformed or repeated one is an error, not skipped.
+    pub fn forwards(&self) -> Result<Vec<Forward>> {
+        let Some(account) = &self.blaxel else { return Ok(Vec::new()) };
+        let mut out: Vec<Forward> = Vec::new();
+        for spec in &account.forwards {
+            let forward = Forward::parse(spec)?;
+            anyhow::ensure!(out.iter().all(|f| f.port != forward.port), "forwards: sandbox port {} is listed twice", forward.port);
+            out.push(forward);
+        }
+        Ok(out)
+    }
 }
 
 /// The fixed name a node forks from; [`Account::golden`] says which sandbox it is.
@@ -125,6 +180,7 @@ impl Account {
             orchestrator_volume: None,
             node_base: None,
             golden: None,
+            forwards: Vec::new(),
         }
     }
 }
@@ -299,6 +355,7 @@ claude_token_via = \"env\"
             orchestrator_volume: Some("orch-data".into()),
             node_base: Some("base".into()),
             golden: None,
+            forwards: vec![],
         });
         c.upsert(Sandbox { name: "a".into(), image: "i".into(), url: None, agents: true });
         c.upsert(Sandbox { name: "a".into(), image: "j".into(), url: Some("u".into()), agents: true });
@@ -313,5 +370,19 @@ claude_token_via = \"env\"
         assert_eq!(acct.orchestrator_volume.as_deref(), Some("orch-data"));
         assert_eq!(acct.node_base.as_deref(), Some("base"));
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn forwards_parse() {
+        assert_eq!(Forward::parse("5432=db.internal:5432").unwrap(), Forward { port: 5432, target: "db.internal:5432".into() });
+        assert_eq!(Forward::parse("15432 = db:5432").unwrap().port, 15432);
+        assert_eq!(Forward::parse("db.internal:5432").unwrap().port, 5432);
+        assert!(Forward::parse("db.internal").is_err());
+        assert!(Forward::parse("80=db:5432").is_err());
+        assert!(Forward::parse("x=db:5432").is_err());
+        assert!(Forward::parse("5432=:5432").is_err());
+        let mut c = Config::default();
+        c.blaxel = Some(Account { forwards: vec!["5432=a:1".into(), "5432=b:2".into()], ..Account::new("w") });
+        assert!(c.forwards().is_err());
     }
 }

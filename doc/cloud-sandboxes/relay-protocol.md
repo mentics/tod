@@ -210,3 +210,11 @@ tod-relay --version
 `tod-relay`, restarted on failure) and installs it at `/opt/tod/tod-relay`.
 `/opt/tod/manifest` records the relay and bootstrap-script hashes that the
 sandbox was provisioned with (see `tod_sandbox::provision`).
+
+### Forwards on `/tunnel`
+
+Besides the default port, a client may ask the relay to listen on more
+loopback ports: text `f<port>` (client → relay) is answered `l<port>` or
+`e<port>:<reason>`. A connection to such a port opens as text `o<id>:<port>`.
+The relay never carries a target; the client decides what a port reaches.
+See [port-forwarding.md](port-forwarding.md).

@@ -37,6 +37,8 @@ pub struct BridgeOptions {
     pub idle: Duration,
     /// Carry the relay's tunnel to this local port while attached.
     pub tunnel_port: Option<u16>,
+    /// Ports to forward through the tunnel (only while it is carried).
+    pub forwards: Vec<crate::config::Forward>,
     /// A file to keep in place (and fresh) while attached.
     pub awake_file: Option<PathBuf>,
 }
@@ -75,17 +77,19 @@ pub async fn run(sandbox_url: &str, token: &str, opts: BridgeOptions) -> Result<
     let attach = |first: Value| {
         let (url, sandbox_url, token) = (url.clone(), sandbox_url.to_string(), token.to_string());
         let (tunnel_port, awake_file) = (opts.tunnel_port, opts.awake_file.clone());
+        let forwards = opts.forwards.clone();
         async move {
             // The tunnel is ready before the first message, so the agent's
             // first `tod-cli` finds it.
             let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
             let tunnel = tunnel_port.map(|port| {
                 let (sandbox_url, token) = (sandbox_url.clone(), token.clone());
+                let forwards = forwards.clone();
                 tokio::spawn(async move {
                     let mut ready = Some(ready_tx);
                     // Reconnect while attached: the relay may restart under us.
                     loop {
-                        let _ = crate::tunnel::run(&sandbox_url, &token, port, ready.take()).await;
+                        let _ = crate::tunnel::run(&sandbox_url, &token, port, &forwards, ready.take()).await;
                         tokio::time::sleep(Duration::from_secs(1)).await;
                     }
                 })
