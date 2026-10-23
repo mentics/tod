@@ -24,7 +24,7 @@
 //! conversation that was in progress instead of starting another.
 
 mod github_wait;
-pub use github_wait::{GithubCheck, check_now};
+pub use github_wait::{GithubCheck, check_github, check_now};
 pub mod local;
 mod state;
 

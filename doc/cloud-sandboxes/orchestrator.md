@@ -275,6 +275,22 @@ within 1.5 s, found only its timed wait left, and slept again. The same body
 unsigned, with a wrong signature, or altered after signing got 401 and
 routed nothing.
 
+**Waiting on GitHub: the deadline (`github_gate.rs`).** A GitHub event wait's
+deadline is the next scheduled look, for a webhook that was lost. With
+`scheduler = "orchestrator"`, a due wake whose id is a pending `github:` event
+wait passes a gate before its sandbox is poked: the orchestrator runs the
+node's own check (`tod_core::autopilot::check_github`) against the user's
+copy of the database. Still waiting, it has recorded the next look and the wake
+moves to it (under the new wait's id), with the sandbox left asleep, or gone.
+Clear, it pokes and the node goes on. If GitHub cannot be read from here (no
+access configured, a failed read) it says why on stderr and pokes, so the
+sandbox's own check, with the user's token, decides. Wakes from webhooks,
+answers, and every other wait are not gated. The orchestrator reads GitHub
+with `TOD_GITHUB_AUTH=proxy` and a proxy rule for `api.github.com` on its own
+sandbox (a read-only fine-grained token: Pull requests: read, Contents: read),
+so the token is never on its disk. With `scheduler = "blaxel"` the node's own
+schedule fires on its sandbox and the gate is not in the path.
+
 Deliveries are not deduplicated (`X-GitHub-Delivery` is ignored); a repeat
 records the event again and pokes again, which is harmless. Webhooks can be
 lost; every event wait also has its deadline, so a lost one only delays the
