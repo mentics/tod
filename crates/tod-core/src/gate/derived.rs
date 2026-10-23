@@ -1490,6 +1490,7 @@ mod readiness_tests {
                 reviewers: Vec::new(),
                 base_ref: Some("main".into()),
                 body: None,
+                ..Default::default()
             },
             threads,
             comments: review

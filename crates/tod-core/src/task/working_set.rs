@@ -4,7 +4,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use super::model::{GeneratorSubtreeSort, ListWorkingSet, SortDirection, SortKey};
+use super::model::{ActorBucket, GeneratorSubtreeSort, ListWorkingSet, SortDirection, SortKey};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct PersistedGeneratorSort {
@@ -22,6 +22,9 @@ struct PersistedWorkingSet {
     active_list_id: Option<String>,
     #[serde(default)]
     generator_sorts: HashMap<String, PersistedGeneratorSort>,
+    /// The summary strip's filter. Absent in a file an older build wrote.
+    #[serde(default)]
+    actor_filter: Option<ActorBucket>,
 }
 
 pub fn load_working_set(config_dir: &Path) -> ListWorkingSet {
@@ -39,9 +42,7 @@ pub fn load_working_set(config_dir: &Path) -> ListWorkingSet {
         selected_id: persisted.selected_id,
         active_list_id: persisted.active_list_id,
         pending_changes_only: false,
-        needs_you_only: false,
-        running_only: false,
-        awaiting_only: false,
+        actor_filter: persisted.actor_filter,
         collapsed_groups: Default::default(),
         generator_sorts: persisted
             .generator_sorts
@@ -80,6 +81,7 @@ pub fn save_working_set(config_dir: &Path, ws: &ListWorkingSet) {
         tag_filter: ws.tag_filter.clone(),
         selected_id: ws.selected_id.clone(),
         active_list_id: ws.active_list_id.clone(),
+        actor_filter: ws.actor_filter,
         generator_sorts: ws
             .generator_sorts
             .iter()
@@ -173,6 +175,32 @@ mod tests {
         assert_eq!(old.sort_key, SortKey::TreeOrder);
         assert_eq!(old.sort_direction, SortDirection::Asc);
         assert_eq!(old.filter_query, "keep");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn actor_filter_round_trips_and_an_older_file_without_it_loads() {
+        let dir =
+            std::env::temp_dir().join(format!("tod-working-set-test-{}", uuid::Uuid::new_v4()));
+        let mut ws = ListWorkingSet::default_sort();
+        ws.actor_filter = Some(ActorBucket::OnOthers);
+        save_working_set(&dir, &ws);
+        assert_eq!(load_working_set(&dir).actor_filter, Some(ActorBucket::OnOthers));
+        ws.actor_filter = None;
+        save_working_set(&dir, &ws);
+        assert_eq!(load_working_set(&dir).actor_filter, None);
+
+        // A file written before the filter existed.
+        std::fs::write(
+            dir.join("task-list-working-set.json"),
+            r#"{"sort_key":"title","sort_direction":"asc","tag_filter":null,
+                "selected_id":"n1","active_list_id":null}"#,
+        )
+        .unwrap();
+        let old = load_working_set(&dir);
+        assert_eq!(old.actor_filter, None);
+        assert_eq!(old.sort_key, SortKey::Title);
+        assert_eq!(old.selected_id.as_deref(), Some("n1"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -81,18 +81,12 @@ pub struct TaskItem {
     /// per row) since building it touches `AgentRuns::runs_for_node`, a
     /// `fleet.read`.
     pub status_override: Option<String>,
-    /// The lifecycle processor is working on this node right now (fed by the
-    /// host via `TaskListView::set_running_nodes`).
-    pub lifecycle_running: bool,
-    /// The node's run ended to wait for something outside (a review): out of
-    /// the way until it settles (`doc/agentd.md`, "Waiting, visually").
-    pub awaiting: bool,
-    /// Only the chat panel (not the lifecycle processor) is working on this
-    /// node right now. Ignored while `lifecycle_running`, which wins.
+    /// The chat panel is working on this node right now (fed by the host via
+    /// `TaskListView::set_running_nodes`). Who is next for the node itself
+    /// is `NodeStanding`, not this.
     pub chat_running: bool,
-    /// Something stopped on this node since the user last selected it; the
-    /// row says which kind did (fed by `TaskListView::set_finished_nodes`).
-    pub finished_run: Option<RunSource>,
+    /// A chat stopped on this node since the user last selected it.
+    pub chat_finished: bool,
     /// A ticket's synced metadata (priority, state, dates, ...), which a
     /// generator's sort reads.
     pub metadata: Option<std::sync::Arc<serde_json::Value>>,
@@ -129,19 +123,27 @@ impl TaskItem {
     }
 }
 
-/// What was acting on a node: the lifecycle processor, or only the chat panel.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RunSource {
-    Lifecycle,
-    Chat,
-}
-
 impl TaskItem {
     pub fn sorted_tags(&self) -> Vec<String> {
         let mut tags = self.tags.clone();
         tags.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
         tags
     }
+}
+
+/// The summary strip's four buckets of "who is next" (see `next_actor`).
+/// A node that is done, or has no standing, is in none. Persisted by name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActorBucket {
+    /// `You`, not deferred.
+    OnMe,
+    /// `Others`.
+    OnOthers,
+    /// `Working`.
+    Running,
+    /// `You`, and the user deferred it.
+    Deferred,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -248,12 +250,9 @@ pub struct ListWorkingSet {
     pub generator_sorts: HashMap<String, GeneratorSubtreeSort>,
     /// Show only nodes with pending incoming changes, plus their ancestors.
     pub pending_changes_only: bool,
-    /// Show only nodes with `needs_you_count > 0`, plus their ancestors.
-    pub needs_you_only: bool,
-    /// Show only nodes with `live_run_count > 0`, plus their ancestors.
-    pub running_only: bool,
-    /// Show only nodes whose run ended to wait (`awaiting`), plus their ancestors.
-    pub awaiting_only: bool,
+    /// The summary strip's filter: only the nodes in this bucket (and their
+    /// ancestors). Persisted.
+    pub actor_filter: Option<ActorBucket>,
     /// Group header rows (see [`group_children_by_lifecycle`]) the user has
     /// collapsed, by header id. Not persisted.
     pub collapsed_groups: HashSet<String>,
@@ -269,9 +268,7 @@ impl ListWorkingSet {
             active_list_id: None,
             generator_sorts: HashMap::new(),
             pending_changes_only: false,
-            needs_you_only: false,
-            running_only: false,
-            awaiting_only: false,
+            actor_filter: None,
             collapsed_groups: HashSet::new(),
         }
     }
@@ -768,10 +765,8 @@ fn group_header_row(parent: &TaskItem, state: &str, depth: usize) -> TaskItem {
     header.needs_you_count = 0;
     header.waiting_since = None;
     header.status_override = None;
-    header.lifecycle_running = false;
-    header.awaiting = false;
     header.chat_running = false;
-    header.finished_run = None;
+    header.chat_finished = false;
     header.metadata = None;
     header.generator_sort = None;
     header
@@ -794,15 +789,6 @@ fn filter_and_sort_flat(
     let pending = working_set
         .pending_changes_only
         .then(|| matching_with_ancestors(tasks, &by_id, |t| t.incoming_count > 0));
-    let needs_you = working_set
-        .needs_you_only
-        .then(|| matching_with_ancestors(tasks, &by_id, |t| t.needs_you_count > 0));
-    let running = working_set
-        .running_only
-        .then(|| matching_with_ancestors(tasks, &by_id, |t| t.lifecycle_running));
-    let awaiting = working_set
-        .awaiting_only
-        .then(|| matching_with_ancestors(tasks, &by_id, |t| t.awaiting));
     let filtered: Vec<TaskItem> = tasks
         .iter()
         .filter(|t| {
@@ -810,15 +796,6 @@ fn filter_and_sort_flat(
                 && pending
                     .as_ref()
                 .is_none_or(|ids| ids.contains(t.id.as_str()))
-                && needs_you
-                    .as_ref()
-                    .is_none_or(|ids| ids.contains(t.id.as_str()))
-                && running
-                    .as_ref()
-                    .is_none_or(|ids| ids.contains(t.id.as_str()))
-                && awaiting
-                    .as_ref()
-                    .is_none_or(|ids| ids.contains(t.id.as_str()))
                 && task_matches_tag_filter(t, working_set.tag_filter.as_deref())
                 && task_matches_search(t, search_query)
                 && task_matches_generator_filter(t, &by_id, working_set)
@@ -891,9 +868,7 @@ pub fn nearest_visible_id(
             active_list_id: working_set.active_list_id.clone(),
             generator_sorts: working_set.generator_sorts.clone(),
             pending_changes_only: working_set.pending_changes_only,
-            needs_you_only: working_set.needs_you_only,
-            running_only: working_set.running_only,
-            awaiting_only: working_set.awaiting_only,
+            actor_filter: working_set.actor_filter,
             collapsed_groups: working_set.collapsed_groups.clone(),
         },
     );
@@ -957,10 +932,8 @@ mod tests {
             needs_you_count: 0,
             waiting_since: None,
             status_override: None,
-            lifecycle_running: false,
-            awaiting: false,
             chat_running: false,
-            finished_run: None,
+            chat_finished: false,
             groups_by_lifecycle: false,
             group_header: None,
         }
@@ -994,62 +967,6 @@ mod tests {
             .collect();
         assert_eq!(ids, vec!["root", "mid", "leaf"]);
         assert_eq!(filter_and_sort_tasks(&tasks, "", &ListWorkingSet::default()).len(), 5);
-    }
-
-    #[test]
-    fn needs_you_filter_keeps_matching_nodes_and_their_ancestors() {
-        let root = sample("root", "Root", "ready", &[]);
-        let mut mid = sample("mid", "Mid", "ready", &[]);
-        mid.parent_id = Some("root".into());
-        let mut leaf = sample("leaf", "Leaf", "ready", &[]);
-        leaf.parent_id = Some("mid".into());
-        leaf.needs_you_count = 1;
-        let mut sibling = sample("sib", "Sibling", "ready", &[]);
-        sibling.parent_id = Some("root".into());
-        let tasks = vec![root, mid, leaf, sibling];
-        let ws = ListWorkingSet {
-            needs_you_only: true,
-            ..Default::default()
-        };
-        let ids: Vec<String> = filter_and_sort_tasks(&tasks, "", &ws)
-            .into_iter()
-            .map(|t| t.id)
-            .collect();
-        assert_eq!(ids, vec!["root", "mid", "leaf"]);
-    }
-
-    #[test]
-    fn running_filter_keeps_matching_nodes_and_their_ancestors() {
-        let root = sample("root", "Root", "ready", &[]);
-        let mut leaf = sample("leaf", "Leaf", "ready", &[]);
-        leaf.parent_id = Some("root".into());
-        leaf.lifecycle_running = true;
-        let mut other = sample("other", "Other", "ready", &[]);
-        other.parent_id = Some("root".into());
-        let tasks = vec![root, leaf, other];
-        let ws = ListWorkingSet {
-            running_only: true,
-            ..Default::default()
-        };
-        let ids: Vec<String> = filter_and_sort_tasks(&tasks, "", &ws)
-            .into_iter()
-            .map(|t| t.id)
-            .collect();
-        assert_eq!(ids, vec!["root", "leaf"]);
-    }
-
-    #[test]
-    fn awaiting_filter_keeps_waiting_nodes_and_their_ancestors() {
-        let root = sample("root", "Root", "ready", &[]);
-        let mut leaf = sample("leaf", "Leaf", "ready", &[]);
-        leaf.parent_id = Some("root".into());
-        leaf.awaiting = true;
-        let mut other = sample("other", "Other", "ready", &[]);
-        other.parent_id = Some("root".into());
-        let tasks = vec![root, leaf, other];
-        let ws = ListWorkingSet { awaiting_only: true, ..Default::default() };
-        let ids: Vec<String> = filter_and_sort_tasks(&tasks, "", &ws).into_iter().map(|t| t.id).collect();
-        assert_eq!(ids, vec!["root", "leaf"]);
     }
 
     #[test]

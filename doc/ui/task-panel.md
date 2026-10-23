@@ -90,8 +90,14 @@ pause and resume at the end.
 | failed | state · the error · retry |
 | done | done |
 
-While it waits, the line says only that and for how long; the request below
-says why.
+Who the node is waiting on (the user, someone or something else, or nobody
+because it is being worked) is `tod_core::next_actor`'s answer, rendered by
+`views::task_list::standing::runner_parts`; the table above says what the
+line shows in each case, and the extra parts are the actor's reason, who or
+what is waited on, how long, when it is next checked, a retry count and the
+error. The runner (`tod_core::runner_status::LiveTurn`) supplies only what a
+live turn is doing and the split button's actions. While the node waits, the
+line says only that and for how long; the request below says why.
 
 The line ends with a split button: its default action moves the runner
 along, and its menu holds the rest.

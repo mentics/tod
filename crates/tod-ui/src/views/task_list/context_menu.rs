@@ -12,7 +12,10 @@ use tod_store::outline::CreatePosition;
 
 use super::TaskListEvent;
 use super::TaskListView;
+use super::actor::{self, BRING_BACK_LABEL, DEFER_LABEL, DeferOffer};
 use super::model::TaskItem;
+use crate::ui::journey::Source;
+use tod_core::defer::DeferFor;
 
 /// Build the right-click menu for `task`. `attention_count` is the node's
 /// pending-decision count as last reported by `TaskListView::set_attention`
@@ -21,7 +24,10 @@ pub(super) fn build(
     mut menu: PopupMenu,
     task: &TaskItem,
     attention_count: usize,
+    offer: DeferOffer,
     view: gpui::WeakEntity<TaskListView>,
+    window: &mut Window,
+    cx: &mut gpui::Context<PopupMenu>,
 ) -> PopupMenu {
     let task_id = task.id.clone();
 
@@ -41,6 +47,11 @@ pub(super) fn build(
     }
     if !task.managed {
         labels.push("Rename (F2)".to_string());
+    }
+    match offer {
+        DeferOffer::Defer => labels.push(DEFER_LABEL.to_string()),
+        DeferOffer::BringBack => labels.push(BRING_BACK_LABEL.to_string()),
+        DeferOffer::None => {}
     }
     labels.push("New sibling below".to_string());
     labels.push("New child".to_string());
@@ -113,6 +124,30 @@ pub(super) fn build(
         ));
     }
 
+    match offer {
+        DeferOffer::Defer => {
+            // The submenu's own journey snapshot is the choices it shows;
+            // none custom: the app has no date input to offer.
+            let (view, id) = (view.clone(), task_id.clone());
+            menu = menu.submenu(DEFER_LABEL, window, cx, move |sub, _window, _cx| {
+                defer_choices(sub, &id, &view)
+            });
+        }
+        DeferOffer::BringBack => {
+            menu = menu.item(entry(
+                BRING_BACK_LABEL,
+                view.clone(),
+                task_id.clone(),
+                presented.clone(),
+                |this, id, _window, cx| {
+                    let presented = vec![BRING_BACK_LABEL.to_string()];
+                    this.bring_back_node(&id, Source::Click, &presented, cx);
+                },
+            ));
+        }
+        DeferOffer::None => {}
+    }
+
     menu = menu.item(entry(
         "New sibling below",
         view.clone(),
@@ -144,6 +179,26 @@ pub(super) fn build(
         ));
     }
 
+    menu
+}
+
+/// The Defer choices (the presets; there is no date input in the app to
+/// offer a custom date with), each a journey `UserAction` that lists every
+/// choice shown.
+pub(super) fn defer_choices(
+    mut menu: PopupMenu,
+    task_id: &str,
+    view: &gpui::WeakEntity<TaskListView>,
+) -> PopupMenu {
+    let presented = Rc::new(actor::defer_labels());
+    for how in DeferFor::PRESETS {
+        let (view, task_id, presented) = (view.clone(), task_id.to_string(), presented.clone());
+        menu = menu.item(PopupMenuItem::new(how.label()).on_click(move |_, _window, cx| {
+            let _ = view.update(cx, |this, cx| {
+                this.defer_node(&task_id, how, Source::Click, &presented, cx);
+            });
+        }));
+    }
     menu
 }
 

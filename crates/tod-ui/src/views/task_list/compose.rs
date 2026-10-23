@@ -18,7 +18,7 @@ impl TaskListView {
         });
         if let Some(id) = self.selection_before_compose.take() {
             let visible =
-                Self::visible_tasks(&self.all_tasks, &self.search_query, &self.working_set);
+                Self::visible_tasks(&self.all_tasks, &self.search_query, &self.working_set, &self.actor_view);
             if visible.iter().any(|t| t.id == id) {
                 self.select_task_by_id(&id, window, cx);
             } else {

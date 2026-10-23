@@ -151,6 +151,9 @@ pub struct Assessment {
     pub open_threads: Vec<OpenThread>,
     pub bots: Vec<BotReport>,
     pub human_review: HumanReview,
+    /// Who GitHub still waits on for a review (logins, teams as `org/team`);
+    /// empty when nobody was asked.
+    pub requested_reviewers: Vec<String>,
 }
 
 /// Something the babysitter has to do.
@@ -269,6 +272,7 @@ impl Assessment {
             open_threads: snapshot.threads.iter().filter(|t| wants_answer(t)).map(open_thread).collect(),
             bots,
             human_review: human_review(snapshot, head_at),
+            requested_reviewers: snapshot.status.reviewers.clone(),
         }
     }
 
@@ -607,6 +611,7 @@ mod tests {
             reviewers: Vec::new(),
             base_ref: Some("main".into()),
             body: None,
+            ..Default::default()
         }
     }
 
@@ -924,6 +929,16 @@ Not safe.
     }
 
     #[test]
+    fn the_assessment_carries_the_requested_reviewers() {
+        let mut s = snap(status("blocked", "success"), vec![], vec![]);
+        s.status.reviewers = vec!["maria".into(), "acme/core".into()];
+        let a = Assessment::of(&s, &PrReadinessSettings::default(), now());
+        assert_eq!(a.requested_reviewers, vec!["maria", "acme/core"]);
+        let none = Assessment::of(&snap(status("blocked", "success"), vec![], vec![]), &PrReadinessSettings::default(), now());
+        assert!(none.requested_reviewers.is_empty());
+    }
+
+    #[test]
     fn an_approval_ends_the_wait_and_a_bot_or_comment_does_not_count() {
         let approved = reviewed("2026-01-01T10:00:00Z", vec![review("alice", "2026-01-01T11:00:00Z", "APPROVED")]);
         assert_eq!(approved.human_review, HumanReview::Approved);
@@ -1037,6 +1052,12 @@ thread_local! {
 /// the autopilot synchronously). `None` puts GitHub back.
 pub fn set_feed_override(feed: Option<std::sync::Arc<dyn PrFeed>>) {
     FEED_OVERRIDE.with(|cell| *cell.borrow_mut() = feed);
+}
+
+/// The override set on this thread, for a thread started from it (a local
+/// run) to carry on with.
+pub fn feed_override() -> Option<std::sync::Arc<dyn PrFeed>> {
+    FEED_OVERRIDE.with(|cell| cell.borrow().clone())
 }
 
 /// The feed for the app whose data lives at `data_root`: the override, else

@@ -24,7 +24,9 @@
 //! conversation that was in progress instead of starting another.
 
 mod github_wait;
-pub use github_wait::{GithubCheck, check_github, check_now};
+pub use github_wait::{
+    GithubCheck, check_github, check_now, github_look_failed, read_wait_spec, retry_delay_ms,
+};
 pub mod local;
 mod state;
 
@@ -655,24 +657,33 @@ impl Autopilot {
             }
             let Some(feed) = pr_readiness::feed_for(&self.config.data_root) else {
                 hook.waiting(None, None);
-                return Ok(None);
+                return Ok(Some(github_wait::github_look_failed(
+                    fleet,
+                    self.node,
+                    false,
+                    "GitHub credentials are not set up",
+                )?));
             };
             let settings = pr_readiness::settings_at(&self.config.data_root);
             let live = match pr_readiness::live(feed.as_ref(), &links.prs, &settings) {
-                Ok(live) => live,
+                Ok(live) => {
+                    github_wait::clear_read_failures(fleet, self.node)?;
+                    live
+                }
                 Err(err) => {
-                    tracing::info!(node = %self.node, %err, "pull request not readable; leaving it to the gate");
                     hook.waiting(None, None);
-                    return Ok(None);
+                    return Ok(Some(github_wait::github_look_failed(fleet, self.node, false, &err)?));
                 }
             };
             match pr_readiness::overall(&live) {
                 PrNext::Merged | PrNext::Clear => {
+                    self.clear_poll_waits(fleet)?;
                     hook.waiting(None, None);
                     return Ok(None);
                 }
                 PrNext::Work(_) => {
                     waited_since = None;
+                    self.clear_poll_waits(fleet)?;
                     hook.waiting(None, None);
                     let turns = self.pr_agent_turns(fleet)?;
                     let base = *self.state.pr_turns_base.get_or_insert(turns);
@@ -745,6 +756,7 @@ impl Autopilot {
                         self.pr_poll
                     };
                     let next_poll_ms = chrono::Utc::now().timestamp_millis() + interval.as_millis() as i64;
+                    self.record_poll_wait(fleet, &live, &waits, &what, next_poll_ms)?;
                     hook.waiting(Some(&what), Some(next_poll_ms));
                     if let Some(reason) = self.sleep_watching(fleet, hook, interval)? {
                         hook.waiting(None, None);
@@ -770,10 +782,12 @@ impl Autopilot {
             .iter()
             .find(|p| p.assessment.waits().iter().any(|w| matches!(w, Wait::HumanReview)))
             .map(|p| p.pr.clone());
-        let spec = waiting_on
-            .as_ref()
-            .map(|pr| format!("github:pr:{}:review", pr.pr_number))
-            .unwrap_or_else(|| "github:pr:review".to_string());
+        let requested = live
+            .iter()
+            .find(|p| p.assessment.waits().iter().any(|w| matches!(w, Wait::HumanReview)))
+            .map(|p| p.assessment.requested_reviewers.as_slice())
+            .unwrap_or_default();
+        let spec = crate::next_actor::review_spec(waiting_on.as_ref().map(|pr| pr.pr_number), requested);
         let mut what = match &waiting_on {
             Some(pr) => format!("a review of {}", pr.url),
             None => "a review".to_string(),

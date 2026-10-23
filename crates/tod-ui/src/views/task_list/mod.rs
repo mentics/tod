@@ -1,3 +1,4 @@
+pub(crate) mod actor;
 mod compose;
 mod context_menu;
 mod credential_prompt;
@@ -9,6 +10,7 @@ mod from_ticket;
 use from_ticket::PendingTicketImport;
 pub(crate) use tod_core::task::model;
 mod row_menu;
+pub(crate) mod standing;
 mod writes;
 pub(crate) use tod_core::task::working_set;
 
@@ -45,9 +47,8 @@ use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::list::{ListEvent, ListState};
 use gpui_component::menu::PopupMenu;
 use gpui_component::{ActiveTheme, Disableable, Sizable, StyledExt};
-use model::{ListWorkingSet as WorkingSet, filter_and_sort_tasks, nearest_visible_id};
+use model::{ListWorkingSet as WorkingSet, nearest_visible_id};
 use row_menu::RowMenuKind;
-use tod_core::task::model::RunSource;
 use tod_store::fleet::{FleetStore, code_editors};
 use tod_store::outline::{CreatePosition, OutlineMutation, ReorderDirection};
 use working_set::{load_working_set, save_working_set};
@@ -102,6 +103,7 @@ actions!(
         TaskListCopy,
         TaskListPaste,
         TaskListToggleMark,
+        TaskListDefer,
     ]
 );
 
@@ -178,6 +180,9 @@ pub fn register_task_list_keyboard_bindings(cx: &mut App) {
         KeyBinding::new("backspace", TaskListDelete, context),
         KeyBinding::new("secondary-c", TaskListCopy, context),
         KeyBinding::new("space", TaskListToggleMark, context),
+        // Z: take the selected node off the list for a while, or bring a
+        // deferred one back.
+        KeyBinding::new("z", TaskListDefer, context),
         KeyBinding::new("secondary-v", TaskListPaste, context),
         // Inline title edit: Escape cancels; arrows leave the field and move selection.
         KeyBinding::new(
@@ -196,13 +201,13 @@ pub fn register_task_list_keyboard_bindings(cx: &mut App) {
     key_context::bind_panel_escape(cx, TaskListDismissOverlay, TASK_LIST_CONTEXT);
 }
 
-/// What `set_running_nodes` last reported: who is working on each node now,
-/// and which nodes stopped since the user last selected them.
+/// What `set_running_nodes` last reported: which chats are working on a
+/// node now, and which stopped since the user last selected the node.
+/// (Who is next for the node itself is `NodeStanding`.)
 #[derive(Default, PartialEq)]
 struct RunFeed {
-    lifecycle: std::collections::HashSet<String>,
     chat: std::collections::HashSet<String>,
-    finished: std::collections::HashMap<String, RunSource>,
+    chat_finished: std::collections::HashSet<String>,
 }
 
 /// What a node is waiting on the user for, as the host (W6's attention
@@ -216,6 +221,8 @@ pub struct Attention {
 
 #[derive(Debug, Clone)]
 pub enum TaskListEvent {
+    /// The "On others" filter was turned on: show the list of what to chase.
+    OpenOnOthers,
     /// Ctrl+Right — move keyboard focus to the right drawer, if one is open.
     FocusDrawer,
     OpenInterview {
@@ -386,6 +393,9 @@ pub struct TaskListView {
     pending_status_override_apply: bool,
     /// What is acting on, or just stopped acting on, each node, as the host last said.
     running_nodes: RunFeed,
+    /// Who is next for each node and which strip filter is on, as the host
+    /// last said (`set_standings`); not persisted.
+    actor_view: standing::ActorView,
     /// When pull-request states were last read from GitHub (off the UI
     /// thread); `None` while one read is in flight. Rate-limits the reads a
     /// store change would otherwise start every time.
@@ -451,7 +461,7 @@ impl TaskListView {
             cx.new(|cx| InputState::new(window, cx).placeholder("Filter title or tags…"));
 
         let action_sink = Rc::new(RefCell::new(Vec::new()));
-        let visible = Self::visible_tasks(&all_tasks, "", &working_set);
+        let visible = Self::visible_tasks(&all_tasks, "", &working_set, &standing::ActorView::default());
         let initial_selection = Self::initial_selection(&visible, &working_set);
 
         if let Some(id) = &initial_selection.1 {
@@ -566,6 +576,7 @@ impl TaskListView {
             pending_attention_apply: false,
             pending_status_override_apply: false,
             running_nodes: RunFeed::default(),
+            actor_view: standing::ActorView::default(),
             pr_refresh: PrRefresh::Idle(None),
         };
 
@@ -637,8 +648,13 @@ impl TaskListView {
         view
     }
 
-    fn visible_tasks(tasks: &[TaskItem], search: &str, ws: &WorkingSet) -> Vec<TaskItem> {
-        filter_and_sort_tasks(tasks, search, ws)
+    fn visible_tasks(
+        tasks: &[TaskItem],
+        search: &str,
+        ws: &WorkingSet,
+        view: &standing::ActorView,
+    ) -> Vec<TaskItem> {
+        standing::visible(tasks, search, ws, view)
     }
 
     fn initial_selection(
@@ -665,12 +681,17 @@ impl TaskListView {
                 .map(|t| t.id.clone())
         });
 
-        let visible = Self::visible_tasks(&self.all_tasks, &self.search_query, &self.working_set);
+        let visible = Self::visible_tasks(&self.all_tasks, &self.search_query, &self.working_set, &self.actor_view);
 
         let next_id = previous_id
             .as_ref()
             .and_then(|id| {
-                nearest_visible_id(&self.all_tasks, &self.search_query, &self.working_set, id)
+                nearest_visible_id(
+                    &standing::restrict(&self.all_tasks, &self.actor_view.standings, self.working_set.actor_filter),
+                    &self.search_query,
+                    &self.working_set,
+                    id,
+                )
             })
             .or_else(|| visible.first().map(|t| t.id.clone()));
 
@@ -698,6 +719,10 @@ impl TaskListView {
                 .delegate_mut()
                 .set_recently_updated(self.recently_updated_copy_ids.clone());
             state.delegate_mut().set_marked(self.marked.clone());
+            state.delegate_mut().set_standings(
+                self.actor_view.standings.clone(),
+                standing::rollup(&self.all_tasks, &self.actor_view.standings),
+            );
             state.set_selected_index(selected_ix, window, cx);
             // Only chase the selection when it actually moved. A rebuild the
             // user did not ask for (a background change to the tree) must not
@@ -1453,7 +1478,7 @@ impl TaskListView {
     }
 
     fn select_task_by_id(&mut self, task_id: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let visible = Self::visible_tasks(&self.all_tasks, &self.search_query, &self.working_set);
+        let visible = Self::visible_tasks(&self.all_tasks, &self.search_query, &self.working_set, &self.actor_view);
         if let Some(row) = visible.iter().position(|t| t.id == task_id) {
             let ix = IndexPath::new(row);
             self.last_selected = Some(ix);
@@ -1663,14 +1688,14 @@ impl TaskListView {
         let _ = self.fleet.reload_if_stale();
 
         let visible_before =
-            Self::visible_tasks(&self.all_tasks, &self.search_query, &self.working_set);
+            Self::visible_tasks(&self.all_tasks, &self.search_query, &self.working_set, &self.actor_view);
         let selected = self.working_set.selected_id.clone();
         if self.edit_open_for.as_deref() == Some(task_id) {
             self.edit_open_for = None;
         }
         self.reload_all_tasks();
         let visible_after =
-            Self::visible_tasks(&self.all_tasks, &self.search_query, &self.working_set);
+            Self::visible_tasks(&self.all_tasks, &self.search_query, &self.working_set, &self.actor_view);
         self.working_set.selected_id = model::selection_after_delete(
             &visible_before,
             &visible_after,
@@ -1731,9 +1756,8 @@ impl TaskListView {
 
     fn apply_running(tasks: &mut [TaskItem], feed: &RunFeed) {
         for task in tasks.iter_mut() {
-            task.lifecycle_running = feed.lifecycle.contains(&task.id);
             task.chat_running = feed.chat.contains(&task.id);
-            task.finished_run = feed.finished.get(&task.id).copied();
+            task.chat_finished = feed.chat_finished.contains(&task.id);
         }
     }
 
@@ -1769,7 +1793,7 @@ impl TaskListView {
         if tasks == self.all_tasks {
             return;
         }
-        let visible = Self::visible_tasks(&tasks, &self.search_query, &self.working_set);
+        let visible = Self::visible_tasks(&tasks, &self.search_query, &self.working_set, &self.actor_view);
         if !same_visible_rows(self.list_state.read(cx).delegate().items(), &visible) {
             self.request_live_refresh(cx);
             return;
@@ -1815,7 +1839,7 @@ impl TaskListView {
 
     fn live_refresh(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let visible_before =
-            Self::visible_tasks(&self.all_tasks, &self.search_query, &self.working_set);
+            Self::visible_tasks(&self.all_tasks, &self.search_query, &self.working_set, &self.actor_view);
         let selected = self.working_set.selected_id.clone();
         let _ = self.fleet.reload_if_stale();
         self.reload_outline_lists();
@@ -1833,7 +1857,7 @@ impl TaskListView {
         if let Some(sel) = selected.clone() {
             if !self.all_tasks.iter().any(|t| t.id == sel) {
                 let visible_after =
-                    Self::visible_tasks(&self.all_tasks, &self.search_query, &self.working_set);
+                    Self::visible_tasks(&self.all_tasks, &self.search_query, &self.working_set, &self.actor_view);
                 self.working_set.selected_id = model::selection_after_delete(
                     &visible_before,
                     &visible_after,
@@ -2830,35 +2854,16 @@ impl TaskListView {
         cx.notify();
     }
 
-    /// The host reports which nodes' runs ended to wait for something outside;
-    /// their rows recede. A node leaving the set goes back to normal.
-    pub fn set_awaiting(&mut self, nodes: std::collections::HashSet<String>, cx: &mut Context<Self>) {
-        let mut changed = false;
-        for task in self.all_tasks.iter_mut() {
-            let next = nodes.contains(&task.id);
-            if task.awaiting != next {
-                task.awaiting = next;
-                changed = true;
-            }
-        }
-        if changed {
-            self.pending_status_override_apply = true;
-            cx.notify();
-        }
-    }
-
-    /// The host reports which nodes the lifecycle processor is working on,
-    /// which only the chat panel is, and which stopped since the user last
-    /// selected them. Their rows show the matching icon and title colour; a
-    /// node leaving a set goes back to normal.
+    /// The host reports which nodes a chat is working on, and which a chat
+    /// stopped on since the user last selected them. Their rows show the
+    /// chat spinner or dot; a node leaving a set goes back to normal.
     pub fn set_running_nodes(
         &mut self,
-        lifecycle: std::collections::HashSet<String>,
         chat: std::collections::HashSet<String>,
-        finished: std::collections::HashMap<String, RunSource>,
+        chat_finished: std::collections::HashSet<String>,
         cx: &mut Context<Self>,
     ) {
-        let feed = RunFeed { lifecycle, chat, finished };
+        let feed = RunFeed { chat, chat_finished };
         if feed == self.running_nodes {
             return;
         }
@@ -2866,33 +2871,6 @@ impl TaskListView {
         Self::apply_running(&mut self.all_tasks, &self.running_nodes);
         self.pending_status_override_apply = true;
         cx.notify();
-    }
-
-    /// Records toggling a "Needs you" / "Running" tree filter chip as a
-    /// journey `UserAction`, on the project (the toggle isn't about one node).
-    fn record_quick_filter_toggle(&self, chip: &str, on: bool, cx: &mut Context<Self>) {
-        let presented = tod_journey::Presented {
-            actions: vec![tod_journey::PresentedAction {
-                id: chip.to_string(),
-                label: chip.to_string(),
-                primary: false,
-                disabled: false,
-            }],
-            focused: Some(chip.to_string()),
-            notices: Vec::new(),
-        };
-        crate::ui::journey::record_action(
-            cx,
-            tod_store::conversation::Focus::Project,
-            if on {
-                format!("{chip}-on")
-            } else {
-                format!("{chip}-off")
-            },
-            Source::Click,
-            "task_list_quick_filters",
-            presented,
-        );
     }
 
     fn toggle_mark(&mut self, task_id: &str, cx: &mut Context<Self>) {
@@ -3243,25 +3221,9 @@ impl TaskListView {
             .iter()
             .filter(|t| t.incoming_count > 0)
             .count();
-        let needs_you_nodes = self
-            .all_tasks
-            .iter()
-            .filter(|t| t.needs_you_count > 0)
-            .count();
-        let running_nodes = self
-            .all_tasks
-            .iter()
-            .filter(|t| t.lifecycle_running)
-            .count();
-        let awaiting_nodes = self.all_tasks.iter().filter(|t| t.awaiting).count();
         if pending_nodes == 0
-            && needs_you_nodes == 0
-            && running_nodes == 0
-            && awaiting_nodes == 0
-            && !self.working_set.awaiting_only
+            && !self.strip_is_shown()
             && !self.working_set.pending_changes_only
-            && !self.working_set.needs_you_only
-            && !self.working_set.running_only
             && self.marked.is_empty()
         {
             return None;
@@ -3273,6 +3235,7 @@ impl TaskListView {
                 .small()
                 .on_click(cx.listener(|this, _, _, cx| this.clear_marks(cx)))
         });
+        let strip = self.render_actor_strip(cx);
         Some(
             gpui_component::h_flex()
                 .flex_wrap()
@@ -3280,66 +3243,21 @@ impl TaskListView {
                 .gap(crate::ui::style::space::HAIRLINE)
                 .px(crate::ui::style::space::RELATED)
                 .py(crate::ui::style::space::HAIRLINE)
-                .child(crate::ui::style::button_toggle(
-                    Button::new("pending-changes-filter")
-                        .label(format!("Pending changes {pending_nodes}"))
-                        .ghost()
-                        .small()
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.working_set.pending_changes_only =
-                                !this.working_set.pending_changes_only;
-                            this.rebuild_visible_list(window, cx);
-                        })),
-                    self.working_set.pending_changes_only,
-                ))
-                .child(crate::ui::style::button_toggle(
-                    Button::new("needs-you-filter")
-                        .label(format!("Needs you ({needs_you_nodes})"))
-                        .ghost()
-                        .small()
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.working_set.needs_you_only = !this.working_set.needs_you_only;
-                            this.record_quick_filter_toggle(
-                                "needs-you-filter",
-                                this.working_set.needs_you_only,
-                                cx,
-                            );
-                            this.rebuild_visible_list(window, cx);
-                        })),
-                    self.working_set.needs_you_only,
-                ))
-                .child(crate::ui::style::button_toggle(
-                    Button::new("running-filter")
-                        .label(format!("Running ({running_nodes})"))
-                        .ghost()
-                        .small()
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.working_set.running_only = !this.working_set.running_only;
-                            this.record_quick_filter_toggle(
-                                "running-filter",
-                                this.working_set.running_only,
-                                cx,
-                            );
-                            this.rebuild_visible_list(window, cx);
-                        })),
-                    self.working_set.running_only,
-                ))
-                .child(crate::ui::style::button_toggle(
-                    Button::new("awaiting-filter")
-                        .label(format!("Waiting ({awaiting_nodes})"))
-                        .ghost()
-                        .small()
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.working_set.awaiting_only = !this.working_set.awaiting_only;
-                            this.record_quick_filter_toggle(
-                                "awaiting-filter",
-                                this.working_set.awaiting_only,
-                                cx,
-                            );
-                            this.rebuild_visible_list(window, cx);
-                        })),
-                    self.working_set.awaiting_only,
-                ))
+                .children(strip)
+                .when(pending_nodes > 0 || self.working_set.pending_changes_only, |row| {
+                    row.child(crate::ui::style::button_toggle(
+                        Button::new("pending-changes-filter")
+                            .label(format!("Pending changes {pending_nodes}"))
+                            .ghost()
+                            .small()
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.working_set.pending_changes_only =
+                                    !this.working_set.pending_changes_only;
+                                this.rebuild_visible_list(window, cx);
+                            })),
+                        self.working_set.pending_changes_only,
+                    ))
+                })
                 .children(clear_marks)
                 .into_any_element(),
         )
@@ -3562,6 +3480,7 @@ impl Render for TaskListView {
             .on_action(cx.listener(Self::on_clear_tag_filter))
             .on_action(cx.listener(Self::on_row_agents))
             .on_action(cx.listener(Self::on_row_shells))
+            .on_action(cx.listener(Self::on_defer_key))
             .on_action(cx.listener(Self::on_open_code))
             .on_action(cx.listener(Self::on_open_action_panel))
             .on_action(cx.listener(Self::on_row_lifecycle))
@@ -3748,7 +3667,7 @@ mod tests {
         });
         // The "Needs you" filter keeps the node visible (it matches).
         view.update_in(cx, |view, window, cx| {
-            view.working_set.needs_you_only = true;
+            view.working_set.actor_filter = Some(super::standing::Bucket::OnMe);
             view.rebuild_visible_list(window, cx);
         });
         draw(cx);
@@ -3756,6 +3675,82 @@ mod tests {
             let visible = view.list_state.read(cx).delegate().items();
             assert!(visible.iter().any(|t| t.id == node_id));
         });
+    }
+
+    fn standing_of_kind(node: &str, actor: tod_core::next_actor::NextActor) -> tod_core::next_actor::NodeStanding {
+        tod_core::next_actor::NodeStanding {
+            node_id: uuid::Uuid::parse_str(node).unwrap(),
+            actor,
+            deferred: None,
+        }
+    }
+
+    #[gpui::test]
+    fn set_standings_drives_the_strip_filter_and_keeps_ancestors(cx: &mut TestAppContext) {
+        use tod_core::next_actor::{NextActor, YouReason};
+        let fixture = Fixture::new();
+        let node_id = fixture.node_id.to_string();
+        let (view, _events, cx) = open_view(&fixture, cx);
+        let mut standings = std::collections::HashMap::new();
+        standings.insert(
+            node_id.clone(),
+            standing_of_kind(
+                &node_id,
+                NextActor::You { why: YouReason::Failed { error: "boom".into() }, since: 1 },
+            ),
+        );
+        view.update(cx, |view, cx| view.set_standings(standings, cx));
+        draw(cx);
+        view.read_with(cx, |view, cx| {
+            assert!(view.strip_is_shown());
+            // Failures are counted apart from requests, and both are on me.
+            let counts = super::standing::totals(&view.all_tasks, &view.actor_view.standings);
+            assert_eq!((counts.failures, counts.requests, counts.on_me()), (1, 0, 1));
+            // The row's glyph comes from the delegate's copy of the standing.
+            assert!(view.list_state.read(cx).delegate().items().iter().any(|t| t.id == node_id));
+        });
+        // On others hides it; on me keeps it.
+        view.update_in(cx, |view, window, cx| {
+            view.working_set.actor_filter = Some(super::standing::Bucket::OnOthers);
+            view.rebuild_visible_list(window, cx);
+        });
+        draw(cx);
+        view.read_with(cx, |view, cx| {
+            assert!(!view.list_state.read(cx).delegate().items().iter().any(|t| t.id == node_id));
+        });
+        view.update_in(cx, |view, window, cx| {
+            view.working_set.actor_filter = Some(super::standing::Bucket::OnMe);
+            view.rebuild_visible_list(window, cx);
+        });
+        draw(cx);
+        view.read_with(cx, |view, cx| {
+            assert!(view.list_state.read(cx).delegate().items().iter().any(|t| t.id == node_id));
+        });
+    }
+
+    #[gpui::test]
+    fn defer_and_bring_back_write_the_deferral(cx: &mut TestAppContext) {
+        let fixture = Fixture::new();
+        let node_id = fixture.node_id.to_string();
+        let (view, _events, cx) = open_view(&fixture, cx);
+        let presented = vec!["Defer: 1 hour".to_string()];
+        view.update(cx, |view, cx| {
+            view.defer_node(&node_id, tod_core::defer::DeferFor::OneHour, crate::ui::journey::Source::Keyboard, &presented, cx);
+        });
+        fixture.store.writer().flush().unwrap();
+        let rows = fixture
+            .store
+            .read(|conn| Ok(tod_store::deferrals::DeferralRepo::new(conn).list_all()?))
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].until.is_some());
+        view.update(cx, |view, cx| view.bring_back_node(&node_id, crate::ui::journey::Source::Click, &presented, cx));
+        fixture.store.writer().flush().unwrap();
+        let rows = fixture
+            .store
+            .read(|conn| Ok(tod_store::deferrals::DeferralRepo::new(conn).list_all()?))
+            .unwrap();
+        assert!(rows.is_empty());
     }
 
     /// Only arrow keys wrap from the first row to the last; a click there

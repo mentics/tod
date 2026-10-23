@@ -41,7 +41,9 @@ use gpui_component::Disableable as _;
 use gpui_component::button::Button;
 use gpui_component::scroll::Scrollbar;
 use tod_core::conversation::{ConversationStatus, SharedAgentAccess};
-use tod_core::runner_status::{RunnerStatus, format_elapsed, format_tokens};
+use tod_core::runner_status::{LiveTurn, format_tokens};
+use tod_core::next_actor::{NextActor, NodeStanding};
+use crate::views::task_list::standing::{self, PartTone};
 use tod_core::autopilot::Outcome;
 use tod_core::cloud_sync::CloudNode;
 use gpui_component::button::DropdownButton;
@@ -162,9 +164,6 @@ struct RunnerLine {
     /// Where the runner runs when it is not in the cloud, for the line:
     /// "this machine", or this machine and the dev container its work is in.
     place: String,
-    waiting_since: Option<i64>,
-    /// What the node's pending GitHub wait is for and when it looks next.
-    scheduled: Option<(String, i64)>,
     /// `(slot id, ms)`: the running slot and when it was first seen running.
     run_since: Option<(u64, i64)>,
     /// The status has an elapsed time, so the ticker re-renders each second.
@@ -245,21 +244,13 @@ struct RunnerActions {
 fn load_runner(
     fleet: &FleetStore,
     node_id: Uuid,
-) -> (String, Option<i64>, Option<CloudNode>, bool, String, Option<(String, i64)>) {
+) -> (String, Option<CloudNode>, bool, String) {
     let lifecycle = fleet
         .get_node(&node_id.to_string())
         .ok()
         .flatten()
         .map(|n| n.lifecycle)
         .unwrap_or_default();
-    let waiting_since = fleet
-        .read(|conn| tod_core::attention::for_node(conn, node_id))
-        .ok()
-        .and_then(|a| a.waiting_since);
-    let scheduled = fleet
-        .read(|conn| tod_store::waits::WaitRepo::new(conn).list_pending_for_node(node_id))
-        .ok()
-        .and_then(|waits| tod_core::runner_status::github_wait(&waits));
     let cloud = tod_core::cloud_sync::cloud_node(fleet, &node_id.to_string());
     let files = fleet.resolve_files_for_node(&node_id.to_string()).ok().flatten();
     let files_in_sandbox = files.as_ref().is_some_and(|files| files.runs_in_sandbox());
@@ -283,7 +274,7 @@ fn load_runner(
         },
         None => "this machine".to_string(),
     };
-    (lifecycle, waiting_since, cloud, files_in_sandbox, place, scheduled)
+    (lifecycle, cloud, files_in_sandbox, place)
 }
 
 pub struct TaskPanel {
@@ -297,6 +288,9 @@ pub struct TaskPanel {
     _poll: gpui::Task<()>,
     agent_runs: Entity<AgentRuns>,
     runner: RunnerLine,
+    /// Who is next, pushed by the workbench from the one pass every view
+    /// reads (`tod_core::next_actor`).
+    standing: Option<NodeStanding>,
     runners: Entity<NodeRunners>,
     _runner_tick: gpui::Task<()>,
     _agent_runs_sub: Subscription,
@@ -401,6 +395,7 @@ impl TaskPanel {
             _poll,
             agent_runs,
             runner: RunnerLine::default(),
+            standing: None,
             runners,
             _runner_tick,
             _agent_runs_sub,
@@ -415,6 +410,11 @@ impl TaskPanel {
 
     #[cfg(test)]
     pub fn node_id(&self) -> Uuid {
+        self.node_id
+    }
+
+    /// The node this panel shows now (it can be retargeted in place).
+    pub fn node_id_now(&self) -> Uuid {
         self.node_id
     }
 
@@ -596,15 +596,13 @@ impl TaskPanel {
         let fleet = self.fleet.clone();
         let node_id = self.node_id;
         cx.spawn(async move |this, cx| {
-            let (lifecycle, waiting_since, cloud, files_in_sandbox, place, scheduled) = cx
+            let (lifecycle, cloud, files_in_sandbox, place) = cx
                 .background_executor()
                 .spawn(async move { load_runner(&fleet, node_id) })
                 .await;
             let _ = this.update(cx, |this: &mut TaskPanel, cx| {
                 if this.node_id == node_id {
                     this.runner.lifecycle = lifecycle;
-                    this.runner.waiting_since = waiting_since;
-                    this.runner.scheduled = scheduled;
                     this.runner.cloud = cloud;
                     this.runner.files_in_sandbox = files_in_sandbox;
                     this.runner.place = place;
@@ -675,17 +673,31 @@ impl TaskPanel {
         };
     }
 
-    fn runner_status(&self, cx: &App) -> (Option<u64>, RunnerStatus) {
+    /// The turn that is live on the node right now, if any: the runner's, or
+    /// a conversation run by hand. Who is next is the standing's, never this.
+    fn runner_status(&self, cx: &App) -> (Option<u64>, Option<LiveTurn>) {
         let slot = self.node_slot(cx);
-        let status = RunnerStatus::with_runner(
+        let live = LiveTurn::of(
             self.runners.read(cx).runner(self.node_id),
-            &self.runner.lifecycle,
-            self.runner.waiting_since,
             slot.as_ref().map(|(_, s)| s),
             self.runner.run_since.map(|(_, at)| at),
-        )
-        .or_scheduled(self.runner.scheduled.clone());
-        (slot.map(|(id, _)| id), status)
+        );
+        (slot.map(|(id, _)| id), live)
+    }
+
+    /// The node is done (or has been shown to be).
+    fn is_done(&self) -> bool {
+        match &self.standing {
+            Some(standing) => matches!(standing.actor, NextActor::Done),
+            None => self.runner.lifecycle == tod_core::runner_status::DONE_STATE,
+        }
+    }
+
+    /// The node waits on something outside (a review, checks, a release).
+    fn awaits_others(&self) -> bool {
+        self.standing
+            .as_ref()
+            .is_some_and(|s| matches!(s.actor, NextActor::Others { .. }))
     }
 
     /// Stop the node's running turn: the conversation view's own stop path.
@@ -708,14 +720,14 @@ impl TaskPanel {
     }
 
     /// What the split button offers for `status`.
-    fn runner_actions(&self, status: &RunnerStatus, cx: &App) -> RunnerActions {
-        let mut actions = self.runner_actions_for_place(status, cx);
+    fn runner_actions(&self, live: Option<&LiveTurn>, cx: &App) -> RunnerActions {
+        let mut actions = self.runner_actions_for_place(live, cx);
         // A scheduled GitHub look can be brought forward wherever the node
         // runs (here, in a dev container, in a cloud sandbox).
         // A cloud node's supervisor may have stopped without a wait reaching
         // here (the stop is not synced), so there it is offered in
         // `pr`, `approved` and `merged` whatever the status says.
-        let waits_on_github = matches!(status, RunnerStatus::Awaiting { .. })
+        let waits_on_github = self.awaits_others()
             || (self.runner.cloud.as_ref().is_some_and(|cloud| cloud.lost_at.is_none())
                 && matches!(self.runner.lifecycle.as_str(), "pr" | "approved" | "merged"));
         if waits_on_github && !actions.menu.contains(&RunnerAction::PollNow) && !actions.menu.contains(&RunnerAction::CheckNow) {
@@ -724,7 +736,7 @@ impl TaskPanel {
         actions
     }
 
-    fn runner_actions_for_place(&self, status: &RunnerStatus, cx: &App) -> RunnerActions {
+    fn runner_actions_for_place(&self, live: Option<&LiveTurn>, cx: &App) -> RunnerActions {
         use RunnerAction as A;
         let runners = self.runners.read(cx);
         let node = self.node_id;
@@ -760,20 +772,20 @@ impl TaskPanel {
             let pausing = runners.is_pausing(node);
             return RunnerActions {
                 primary: Some((A::Pause, if pausing { "Pausing…" } else { A::Pause.label() }, pausing)),
-                menu: if matches!(status, RunnerStatus::Running { next_poll_ms: Some(_), .. }) && !pausing {
+                menu: if live.is_some_and(|l| l.next_poll_ms.is_some()) && !pausing {
                     vec![A::PollNow, A::StopNow]
                 } else {
                     vec![A::StopNow]
                 },
             };
         }
-        if status.is_running() {
+        if live.is_some() {
             return RunnerActions {
                 primary: Some((A::StopTurn, A::StopTurn.label(), false)),
                 menu: Vec::new(),
             };
         }
-        if *status == RunnerStatus::Done {
+        if self.is_done() {
             return RunnerActions::default();
         }
         // The default action continues where the node already runs; the menu
@@ -802,7 +814,7 @@ impl TaskPanel {
     }
 
     /// The journey's snapshot of the split button and the line beside it.
-    fn presented(&self, actions: &RunnerActions, status: &RunnerStatus) -> Presented {
+    fn presented(&self, actions: &RunnerActions) -> Presented {
         let mut presented: Vec<PresentedAction> = actions
             .primary
             .iter()
@@ -822,7 +834,13 @@ impl TaskPanel {
         Presented {
             actions: presented,
             focused: None,
-            notices: vec![format!("{} · {status:?}", self.runner.lifecycle)],
+            notices: vec![format!(
+                "{} · {}",
+                self.runner.lifecycle,
+                self.standing
+                    .as_ref()
+                    .map_or("no standing".to_string(), |s| format!("{:?}", s.actor))
+            )],
         }
     }
 
@@ -830,9 +848,9 @@ impl TaskPanel {
     /// menu's: records the `UserAction`, then does it.
     fn perform(&mut self, action: RunnerAction, cx: &mut Context<Self>) {
         use RunnerAction as A;
-        let (slot, status) = self.runner_status(cx);
-        let actions = self.runner_actions(&status, cx);
-        let presented = self.presented(&actions, &status);
+        let (slot, live) = self.runner_status(cx);
+        let actions = self.runner_actions(live.as_ref(), cx);
+        let presented = self.presented(&actions);
         let node = self.node_id;
         crate::ui::journey::record_action(
             cx,
@@ -956,6 +974,88 @@ impl TaskPanel {
             });
         })
         .detach();
+    }
+
+    /// Defer (a menu of how long) for a node that is on the user, Bring back
+    /// for one deferred, nothing otherwise.
+    fn render_defer_control(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        use crate::views::task_list::actor::{self as defer_ui, DeferOffer};
+        match DeferOffer::for_standing(self.standing.as_ref()) {
+            DeferOffer::None => None,
+            DeferOffer::BringBack => Some(
+                Button::new("unified-task-bring-back")
+                    .label(defer_ui::BRING_BACK_LABEL)
+                    .small()
+                    .on_click(cx.listener(|this, _, _, cx| this.bring_back(cx)))
+                    .into_any_element(),
+            ),
+            DeferOffer::Defer => {
+                let weak = cx.weak_entity();
+                Some(
+                    Button::new("unified-task-defer")
+                        .label("Defer…")
+                        .small()
+                        .dropdown_caret(true)
+                        .dropdown_menu(move |mut popup, _, _| {
+                            for how in tod_core::defer::DeferFor::PRESETS {
+                                let weak = weak.clone();
+                                popup = popup.item(PopupMenuItem::new(how.label()).on_click(move |_, _, cx| {
+                                    let _ = weak.update(cx, |this: &mut TaskPanel, cx| this.defer(how, cx));
+                                }));
+                            }
+                            popup
+                        })
+                        .into_any_element(),
+                )
+            }
+        }
+    }
+
+    /// Take the node off the user's list for `how`, as a journey `UserAction`
+    /// listing every choice shown. A failure is said on the line.
+    fn defer(&mut self, how: tod_core::defer::DeferFor, cx: &mut Context<Self>) {
+        use crate::views::task_list::actor::{defer_labels, preset_label, presented_of};
+        let node = self.node_id;
+        crate::ui::journey::record_action(
+            cx,
+            Focus::Node(node),
+            preset_label(how),
+            crate::ui::journey::Source::Click,
+            "task_panel",
+            presented_of(&defer_labels(), &preset_label(how)),
+        );
+        if let Err(err) = tod_core::defer::defer(&self.fleet, node, how) {
+            self.runner.cloud_note = Some(format!("Could not defer: {err:#}"));
+            self.runner.cloud_failed = true;
+        }
+        cx.notify();
+    }
+
+    /// Put the node back on the user's list.
+    fn bring_back(&mut self, cx: &mut Context<Self>) {
+        use crate::views::task_list::actor::{BRING_BACK_LABEL, presented_of};
+        let node = self.node_id;
+        crate::ui::journey::record_action(
+            cx,
+            Focus::Node(node),
+            BRING_BACK_LABEL,
+            crate::ui::journey::Source::Click,
+            "task_panel",
+            presented_of(&[BRING_BACK_LABEL.to_string()], BRING_BACK_LABEL),
+        );
+        if let Err(err) = tod_core::defer::undefer(&self.fleet, node) {
+            self.runner.cloud_note = Some(format!("Could not bring it back: {err:#}"));
+            self.runner.cloud_failed = true;
+        }
+        cx.notify();
+    }
+
+    /// Who is next for this node, as the workbench last computed it.
+    pub fn set_standing(&mut self, standing: Option<NodeStanding>, cx: &mut Context<Self>) {
+        if standing != self.standing {
+            self.standing = standing;
+            cx.notify();
+        }
     }
 
     /// The phase chip: an exceptional, deliberate override, so the menu
@@ -1082,15 +1182,19 @@ impl TaskPanel {
     /// T2: the runner line — lifecycle state, then what the runner is doing
     /// (`doc/ui/task-panel.md`, "Runner"), then the split button.
     fn render_runner_line(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let (_, status) = self.runner_status(cx);
-        self.runner.ticking = status.since().is_some();
-        let elapsed = status.since().map(|since| format_elapsed(now_ms() - since));
+        let (_, live) = self.runner_status(cx);
+        // Who is next is the standing's (`tod_core::next_actor`), never
+        // derived here; the runner's own status below only supplies the
+        // controls and a live turn's activity.
+        let standing = self.standing.clone();
+        let done = standing.as_ref().is_some_and(|s| matches!(s.actor, NextActor::Done));
+        self.runner.ticking = standing.is_some() && !done;
         let sep = || style::text_muted(div().flex_none()).child("·");
 
         // Status pieces wrap onto further lines when the panel is narrow;
         // long text keeps a readable minimum width instead of collapsing.
         let mut line = div().flex().flex_wrap().items_center().gap_x_2().gap_y_1().flex_auto().min_w(gpui::px(160.));
-        if status != RunnerStatus::Done {
+        if !done {
             line = line.child(self.render_phase_chip(cx));
         }
         if let Some(cloud) = &self.runner.cloud {
@@ -1101,98 +1205,35 @@ impl TaskPanel {
             line = line.child(sep()).child(style::text_muted(div().flex_auto().min_w(gpui::px(160.))).child(
                 selectable_text("unified-task-runner-cloud", text, window, cx),
             ));
-            // What the supervisor has left in the synced data: a request
-            // waiting on the user, or the node finished. Nothing else of
-            // its progress is known here between syncs.
-            match &status {
-                RunnerStatus::Waiting { .. } => {
-                    line = line.child(sep()).child(
-                        style::text_muted(div().flex_none())
-                            .child(format!("waiting on you {}", elapsed.clone().unwrap_or_default())),
-                    );
-                }
-                RunnerStatus::Done => {
-                    line = line.child(sep()).child(style::text_muted(div().flex_none()).child("done"));
-                }
-                // The supervisor's own wake is scheduled from this wait.
-                RunnerStatus::Awaiting { what, due_at_ms } => {
-                    let next = chrono::DateTime::from_timestamp_millis(*due_at_ms)
-                        .map(|t| t.with_timezone(&chrono::Local).format("%a %H:%M").to_string())
-                        .unwrap_or_default();
-                    line = line.child(sep()).child(style::text_muted(div().flex_none()).child(format!(
-                        "waiting for {what}; next check {next}"
-                    )));
-                }
-                _ => {}
+        } else if !self.runner.place.is_empty() {
+            line = line.child(sep()).child(style::text_muted(div().flex_none()).child(self.runner.place.clone()));
+        }
+        if let Some(standing) = &standing {
+            for (ix, part) in standing::runner_parts(standing, now_ms()).into_iter().enumerate() {
+                let el = div().flex_auto().min_w(gpui::px(60.));
+                let el = match part.tone {
+                    PartTone::Muted => style::text_muted(el),
+                    PartTone::Error => style::text_error(el),
+                };
+                line = line.child(sep()).child(el.child(selectable_text(
+                    SharedString::from(format!("unified-task-runner-part-{ix}")),
+                    part.text,
+                    window,
+                    cx,
+                )));
             }
-        } else {
-            if !self.runner.place.is_empty() {
-                line = line.child(sep()).child(style::text_muted(div().flex_none()).child(self.runner.place.clone()));
+        }
+        // What a live turn is doing right now, beside "working".
+        if let Some(LiveTurn { activity, tokens, .. }) = &live {
+            if let Some(activity) = activity {
+                line = line.child(sep()).child(style::text_muted(div().flex_auto().min_w(gpui::px(160.))).child(
+                    selectable_text("unified-task-runner-activity", activity.clone(), window, cx),
+                ));
             }
-            match &status {
-                RunnerStatus::Running { activity, tokens, next_poll_ms, .. } => {
-                    if let Some(activity) = activity {
-                        // Shrinks, never grows: the elapsed time and tokens
-                        // stay beside it.
-                        line = line.child(sep()).child(style::text_muted(div().flex_auto().min_w(gpui::px(160.))).child(
-                            selectable_text("unified-task-runner-activity", activity.clone(), window, cx),
-                        ));
-                    } else {
-                        line = line.child(sep()).child(style::text_muted(div().flex_none()).child("running"));
-                    }
-                    if let Some(elapsed) = elapsed {
-                        line = line.child(sep()).child(style::text_muted(div().flex_none()).child(elapsed));
-                    }
-                    if let Some(tokens) = tokens {
-                        line = line
-                            .child(sep())
-                            .child(style::text_muted(div().flex_none()).child(format_tokens(*tokens)));
-                    }
-                    if let Some(at) = next_poll_ms {
-                        let next = chrono::DateTime::from_timestamp_millis(*at)
-                            .map(|t| t.with_timezone(&chrono::Local).format("%H:%M:%S").to_string())
-                            .unwrap_or_default();
-                        line = line
-                            .child(sep())
-                            .child(style::text_muted(div().flex_none()).child(format!("polling; next poll {next}")));
-                    }
-                }
-                RunnerStatus::Waiting { .. } => {
-                    line = line.child(sep()).child(
-                        style::text_muted(div().flex_none())
-                            .child(format!("waiting {}", elapsed.unwrap_or_default())),
-                    );
-                }
-                RunnerStatus::Awaiting { what, due_at_ms } => {
-                    let next = chrono::DateTime::from_timestamp_millis(*due_at_ms)
-                        .map(|t| t.with_timezone(&chrono::Local).format("%a %H:%M").to_string())
-                        .unwrap_or_default();
-                    line = line.child(sep()).child(style::text_muted(div().flex_auto().min_w(gpui::px(160.))).child(
-                        selectable_text(
-                            "unified-task-runner-awaiting",
-                            format!("waiting for {what}; next check {next}"),
-                            window,
-                            cx,
-                        ),
-                    ));
-                }
-                RunnerStatus::Failed { error } => {
-                    line = line.child(sep()).child(style::text_error(div().flex_auto().min_w(gpui::px(160.))).child(
-                        selectable_text("unified-task-runner-error", error.clone(), window, cx),
-                    ));
-                }
-                RunnerStatus::Paused => {
-                    line = line.child(sep()).child(style::text_muted(div().flex_none()).child("paused"));
-                }
-                RunnerStatus::Stopped { reason } => {
-                    line = line.child(sep()).child(style::text_muted(div().flex_auto().min_w(gpui::px(160.))).child(
-                        selectable_text("unified-task-runner-stopped", format!("stopped: {reason}"), window, cx),
-                    ));
-                }
-                RunnerStatus::Idle => {}
-                RunnerStatus::Done => {
-                    line = line.child(style::text_muted(div().flex_none()).child("done"));
-                }
+            if let Some(tokens) = tokens {
+                line = line
+                    .child(sep())
+                    .child(style::text_muted(div().flex_none()).child(format_tokens(*tokens)));
             }
         }
         // Why the runner could not start, or the latest word from the cloud.
@@ -1206,7 +1247,7 @@ impl TaskPanel {
             let el = if failed { style::text_error(el) } else { style::text_muted(el) };
             line = line.child(sep()).child(el.child(selectable_text("unified-task-runner-note", note, window, cx)));
         }
-        let actions = self.runner_actions(&status, cx);
+        let actions = self.runner_actions(live.as_ref(), cx);
         let node = self.node_id;
         let watch = self.watch_target(cx).map(|_| {
             Button::new("unified-task-runner-watch")
@@ -1218,6 +1259,9 @@ impl TaskPanel {
         });
         let button = self.render_runner_button(actions, cx);
         let mut buttons = div().flex().flex_none().items_center().gap_2().ml_auto();
+        if let Some(defer) = self.render_defer_control(cx) {
+            buttons = buttons.child(defer);
+        }
         if let Some(watch) = watch {
             buttons = buttons.child(watch);
         }
@@ -1450,9 +1494,9 @@ mod tests {
         let view = slot.borrow_mut().take().unwrap();
         cx.run_until_parked();
         let status = view.read_with(cx, |view, cx| view.runner_status(cx).1);
-        assert!(matches!(status, RunnerStatus::Idle | RunnerStatus::Waiting { .. }), "{status:?}");
+        assert_eq!(status, None);
         // No runner yet: Start, with the cloud in the menu.
-        let actions = view.read_with(cx, |view, cx| view.runner_actions(&status, cx));
+        let actions = view.read_with(cx, |view, cx| view.runner_actions(status.as_ref(), cx));
         assert_eq!(
             actions,
             RunnerActions {
@@ -1487,16 +1531,16 @@ mod tests {
         let (seen, status) = view.read_with(cx, |view, cx| view.runner_status(cx));
         assert_eq!(seen, Some(slot_id));
         match status {
-            RunnerStatus::Running { activity, since, .. } => {
+            Some(LiveTurn { activity, since, .. }) => {
                 assert!(activity.is_some());
                 assert!(since.is_some());
             }
-            other => panic!("expected running, got {other:?}"),
+            None => panic!("expected a live turn"),
         }
         // A conversation run by hand: the button stops it, no runner to start.
         let actions = view.read_with(cx, |view, cx| {
             let (_, status) = view.runner_status(cx);
-            view.runner_actions(&status, cx)
+            view.runner_actions(status.as_ref(), cx)
         });
         assert_eq!(actions.primary, Some((RunnerAction::StopTurn, "Stop", false)));
 
@@ -2065,6 +2109,9 @@ mod request_tests {
             })
             .unwrap();
         fixture.store.writer().flush().unwrap();
+        // Times are in milliseconds: without a gap the two can tie, and the
+        // order of a tie is not the one this test is about.
+        std::thread::sleep(std::time::Duration::from_millis(5));
 
         let _decision = ask(&fixture, "A or B?", &["A", "B"]);
 
