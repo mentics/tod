@@ -144,11 +144,17 @@ impl LocalRun {
         let hook_request = request.clone();
         let poll_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let hook_poll = poll_flag.clone();
+        let feed_override = crate::pr_readiness::feed_override();
         let thread = std::thread::Builder::new()
             .name(format!("autopilot-{node}"))
             .spawn(move || {
+                // The run reads GitHub as the thread that started it does.
+                crate::pr_readiness::set_feed_override(feed_override);
                 let mut hook = Hook {
                     node,
+                    fleet: fleet.clone(),
+                    lease: None,
+                    lease_error: None,
                     request: hook_request,
                     poll: hook_poll,
                     on_event: &mut on_event,
@@ -236,6 +242,14 @@ impl LocalRun {
 
 struct Hook<'a, F: FnMut(LocalEvent)> {
     node: Uuid,
+    fleet: Arc<FleetStore>,
+    /// The run's proof that it is working (`tod_store::activity`): held while
+    /// it works, let go while it waits on something outside. It is what
+    /// `tod_core::next_actor` calls `Working`, and all of it.
+    lease: Option<tod_store::activity::ActivityGuard>,
+    /// Why the lease could not be taken; the run stops with it at its next
+    /// boundary, since work that cannot prove it is running must not claim to.
+    lease_error: Option<String>,
     request: Arc<AtomicU8>,
     poll: Arc<std::sync::atomic::AtomicBool>,
     on_event: &'a mut F,
@@ -276,6 +290,23 @@ impl<F: FnMut(LocalEvent)> Hook<'_, F> {
     fn requested(&self) -> Request {
         Request::from_u8(self.request.load(Ordering::SeqCst))
     }
+
+    /// Hold the run's lease if it is not held.
+    fn hold(&mut self) {
+        if self.lease.is_some() {
+            return;
+        }
+        let owner = crate::next_actor::this_process();
+        match tod_store::activity::ActivityGuard::start(
+            &self.fleet,
+            self.node,
+            tod_store::activity::KIND_RUN,
+            &owner,
+        ) {
+            Ok(guard) => self.lease = Some(guard),
+            Err(err) => self.lease_error = Some(format!("{err:#}")),
+        }
+    }
 }
 
 /// Push the node's own branch, so finished work is on the remote and the next
@@ -294,7 +325,11 @@ impl<F: FnMut(LocalEvent)> StepHook for Hook<'_, F> {
             push_branch(fleet, self.node);
             if !self.waiting {
                 self.report(Live::default());
+                self.hold();
             }
+        }
+        if let Some(error) = self.lease_error.take() {
+            anyhow::bail!("{error}");
         }
         Ok(match self.requested() {
             Request::Run => None,
@@ -305,6 +340,13 @@ impl<F: FnMut(LocalEvent)> StepHook for Hook<'_, F> {
 
     fn waiting(&mut self, on: Option<&str>, next_poll_ms: Option<i64>) {
         self.waiting = on.is_some();
+        // Waiting on GitHub or a person is not working: the node says whose
+        // turn it is instead (`tod_core::next_actor`).
+        if on.is_some() {
+            self.lease = None;
+        } else {
+            self.hold();
+        }
         if let Some(on) = on {
             self.report(Live {
                 protocol: Some(ProtocolKind::Pr),

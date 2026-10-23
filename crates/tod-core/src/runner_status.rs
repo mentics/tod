@@ -429,6 +429,9 @@ mod tests {
             created_at: 0,
             updated_at: 0,
             detail: None,
+            attempt: 0,
+            max_attempts: None,
+            last_error: None,
         };
         let waits = [wait("github:pr:12:merged", 500), wait("notes", 1), wait("github:pr:13:review", 900)];
         let scheduled = github_wait(&waits);

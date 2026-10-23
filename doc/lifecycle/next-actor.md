@@ -208,10 +208,50 @@ Every phase can additionally be `Retrying` (any service call) and
 
 Step 1 is built: `crates/tod-core/src/next_actor.rs` (types, `derive`, batched
 `for_nodes`, tests), with `WaitRepo::list_pending_for_nodes` and
-`NodeRepo::get_lifecycle_entered_for_nodes`. Nothing reads it yet. It takes the
-run facts and deferrals as inputs, to be sourced by steps 2 and 4: activity
-leases, the saved outcome, and a `node_deferrals` table. Not yet in it:
-`Retrying`, `BotReview`/`Checks` kinds, and `who` (they need step 2's data).
+`NodeRepo::get_lifecycle_entered_for_nodes`. Nothing reads it yet.
+
+Step 2 is built in part. Done:
+
+- **Retry fields on waits** (`waits.attempt`, `.max_attempts`, `.last_error`,
+  `WaitRepo::record_failure`, `InterviewCommand::WaitFailed`). `Wait::exhausted()`
+  is "the user must act". `Retrying` is not a `WaitKind` but a `retry` field on
+  `ExternalWait` (the wait still has its kind); a wait whose retries are spent
+  or whose error cannot be retried is `You::Failed` with the error.
+- **Transient errors are classified** where GitHub errors are made
+  (`GithubError::Unavailable` for 429/5xx, `is_transient`, and
+  `is_transient_message` for the `String`s `PrFeed` returns, pinned to the
+  variants by a test).
+- **No swallowed GitHub reads.** The babysitter's two silent paths
+  ("pull request not readable; leaving it to the gate", missing credentials) and
+  `hold_for_github`'s `Unreadable` now go through
+  `autopilot::github_look_failed`, which records the failure on a
+  `github:pr:read` (or `github:release:read`) wait and ends the run waiting to
+  retry (30 s, doubling, to 10 min; five attempts) or failed with the error.
+  A look that reads GitHub again cancels it. `check_now` already reports its
+  error to the user at once and is unchanged. Tests that relied on the old
+  leniency now use a feed that reads a finished pull request
+  (`FinishedGithub`); a run's thread inherits the feed override of the thread
+  that started it.
+- **Activity leases** (`tod_store::activity`: `node_activity`, `ActivityRepo`,
+  `ActivityGuard` with a heartbeat thread, `FleetMutation::Activity*`).
+  `next_actor::for_nodes` reads them: a live lifecycle lease is `Working`; a
+  lifecycle lease that stopped beating is `You::Failed("processing was lost…")`
+  until new work on the node clears it. A chat lease never counts for the
+  actor. The local run (`autopilot::local`'s hook) holds a `run` lease while it
+  works and lets it go while it waits on GitHub or a person.
+
+Not done (step 2b, before the views can trust `Working`):
+
+- Leases for the other processors: conversation turns the app drives itself
+  (`ConversationDriver`, which holds only `&FleetStore`, so it needs a passive
+  lease beaten from `tick`), `settle_gate` checks, the incoming-changes check,
+  and chat turns (kind `chat`, for the decorator).
+- The run's saved outcome and a pending permission as inputs from the daemon
+  (`RunFacts` is still filled by the caller).
+- The daemon's reconciler (desired `run` with no lease and nothing else →
+  start it, or fail visibly).
+- `BotReview`/`Checks` wait kinds and `who` need the babysitter to record them.
+- `check_now` records no failure on the node (it reports to the user).
 
 1. `tod_core::next_actor`: the types and `for_nodes`, with tests per row of
    the precedence list and per `YouReason`/`WaitKind`. Nothing uses it yet.

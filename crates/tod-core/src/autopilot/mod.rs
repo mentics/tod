@@ -24,7 +24,7 @@
 //! conversation that was in progress instead of starting another.
 
 mod github_wait;
-pub use github_wait::{GithubCheck, check_now};
+pub use github_wait::{GithubCheck, check_now, github_look_failed, read_wait_spec, retry_delay_ms};
 pub mod local;
 mod state;
 
@@ -620,15 +620,22 @@ impl Autopilot {
             }
             let Some(feed) = pr_readiness::feed_for(&self.config.data_root) else {
                 hook.waiting(None, None);
-                return Ok(None);
+                return Ok(Some(github_wait::github_look_failed(
+                    fleet,
+                    self.node,
+                    false,
+                    "GitHub credentials are not set up",
+                )?));
             };
             let settings = pr_readiness::settings_at(&self.config.data_root);
             let live = match pr_readiness::live(feed.as_ref(), &links.prs, &settings) {
-                Ok(live) => live,
+                Ok(live) => {
+                    github_wait::clear_read_failures(fleet, self.node)?;
+                    live
+                }
                 Err(err) => {
-                    tracing::info!(node = %self.node, %err, "pull request not readable; leaving it to the gate");
                     hook.waiting(None, None);
-                    return Ok(None);
+                    return Ok(Some(github_wait::github_look_failed(fleet, self.node, false, &err)?));
                 }
             };
             match pr_readiness::overall(&live) {

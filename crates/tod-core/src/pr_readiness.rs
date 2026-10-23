@@ -1037,6 +1037,12 @@ pub fn set_feed_override(feed: Option<std::sync::Arc<dyn PrFeed>>) {
     FEED_OVERRIDE.with(|cell| *cell.borrow_mut() = feed);
 }
 
+/// The override set on this thread, for a thread started from it (a local
+/// run) to carry on with.
+pub fn feed_override() -> Option<std::sync::Arc<dyn PrFeed>> {
+    FEED_OVERRIDE.with(|cell| cell.borrow().clone())
+}
+
 /// The feed for the app whose data lives at `data_root`: the override, else
 /// GitHub with the stored credentials; `None` without any.
 pub fn feed_for(data_root: &std::path::Path) -> Option<std::sync::Arc<dyn PrFeed>> {

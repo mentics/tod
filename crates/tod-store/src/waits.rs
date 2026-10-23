@@ -63,7 +63,10 @@ pub const CREATE_TABLE: &str = "
                         CHECK (state IN ('pending','satisfied','cancelled','expired')),
         created_at  INTEGER NOT NULL,
         updated_at  INTEGER NOT NULL,
-        detail      TEXT
+        detail      TEXT,
+        attempt      INTEGER NOT NULL DEFAULT 0,
+        max_attempts INTEGER,
+        last_error   TEXT
     );
     CREATE INDEX IF NOT EXISTS idx_waits_node ON waits(node_id, state, due_at);
     CREATE INDEX IF NOT EXISTS idx_waits_due ON waits(state, due_at);
@@ -85,7 +88,28 @@ pub struct Wait {
     /// a GitHub wait, where each linked pull request stands).
     #[serde(default)]
     pub detail: Option<String>,
+    /// How many looks in a row have failed (0 once one succeeds: a new wait
+    /// replaces this one then).
+    #[serde(default)]
+    pub attempt: u32,
+    /// Failed looks allowed before the user is told; set by the first failure.
+    #[serde(default)]
+    pub max_attempts: Option<u32>,
+    /// Why the last look failed, until a look succeeds.
+    #[serde(default)]
+    pub last_error: Option<String>,
 }
+
+impl Wait {
+    /// The looks have failed as often as they may, or failed in a way asking
+    /// again cannot fix: the user has to act.
+    pub fn exhausted(&self) -> bool {
+        self.last_error.is_some() && self.max_attempts.is_some_and(|max| self.attempt >= max)
+    }
+}
+
+/// Failed looks in a row allowed before the user is told.
+pub const DEFAULT_MAX_ATTEMPTS: u32 = 5;
 
 /// What `tod-cli wait` submits.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -127,6 +151,28 @@ impl NewWait {
 const COLUMNS: &str =
     "id, node_id, kind, match_spec, every_secs, due_at, state, created_at, updated_at, detail";
 
+/// What is read back: [`COLUMNS`] and the retry columns.
+const SELECT_COLUMNS: &str =
+    "id, node_id, kind, match_spec, every_secs, due_at, state, created_at, updated_at, detail, \
+     attempt, max_attempts, last_error";
+
+/// The retry columns: `attempt`, `max_attempts`, `last_error` (idempotent).
+pub fn add_retry(conn: &Connection) -> Result<()> {
+    for (name, ddl) in [
+        ("attempt", "ALTER TABLE waits ADD COLUMN attempt INTEGER NOT NULL DEFAULT 0"),
+        ("max_attempts", "ALTER TABLE waits ADD COLUMN max_attempts INTEGER"),
+        ("last_error", "ALTER TABLE waits ADD COLUMN last_error TEXT"),
+    ] {
+        let has = conn
+            .prepare("SELECT 1 FROM pragma_table_info('waits') WHERE name = ?1")?
+            .exists([name])?;
+        if !has {
+            conn.execute_batch(ddl)?;
+        }
+    }
+    Ok(())
+}
+
 /// The `detail` column (idempotent).
 pub fn add_detail(conn: &Connection) -> Result<()> {
     let has = conn
@@ -150,6 +196,9 @@ fn row_to_wait(row: &Row<'_>) -> rusqlite::Result<Wait> {
         created_at: row.get(7)?,
         updated_at: row.get(8)?,
         detail: row.get(9)?,
+        attempt: row.get(10)?,
+        max_attempts: row.get(11)?,
+        last_error: row.get(12)?,
     })
 }
 
@@ -190,7 +239,7 @@ impl<'a> WaitRepo<'a> {
     pub fn get(&self, id: Uuid) -> Result<Option<Wait>> {
         Ok(self
             .conn
-            .query_row(&format!("SELECT {COLUMNS} FROM waits WHERE id = ?1"), [uuid_to_blob(id)], row_to_wait)
+            .query_row(&format!("SELECT {SELECT_COLUMNS} FROM waits WHERE id = ?1"), [uuid_to_blob(id)], row_to_wait)
             .optional()?)
     }
 
@@ -217,7 +266,7 @@ impl<'a> WaitRepo<'a> {
     fn query(&self, where_: &str, params: impl rusqlite::Params) -> Result<Vec<Wait>> {
         let mut stmt = self
             .conn
-            .prepare(&format!("SELECT {COLUMNS} FROM waits WHERE {where_} ORDER BY due_at, created_at"))?;
+            .prepare(&format!("SELECT {SELECT_COLUMNS} FROM waits WHERE {where_} ORDER BY due_at, created_at"))?;
         Ok(stmt.query_map(params, row_to_wait)?.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
@@ -272,6 +321,31 @@ impl<'a> WaitRepo<'a> {
             bail!("wait {id} not found");
         }
         Ok(())
+    }
+
+    /// Record that a look failed. With `retry_due_at` the failure is expected
+    /// to pass: the wait counts the attempt and is due again then, until it
+    /// has failed [`DEFAULT_MAX_ATTEMPTS`] times in a row. Without it, asking
+    /// again cannot help (a rejected token, a missing pull request): the wait
+    /// is exhausted at once. Either way the error stays on the wait until a
+    /// look succeeds, so it is always visible (`tod_core::next_actor`).
+    pub fn record_failure(&self, id: Uuid, error: &str, retry_due_at: Option<i64>) -> Result<Wait> {
+        let wait = self.get(id)?.ok_or_else(|| anyhow::anyhow!("wait {id} not found"))?;
+        if wait.state != WAIT_PENDING {
+            bail!("wait {id} is {}, not pending", wait.state);
+        }
+        let max = wait.max_attempts.unwrap_or(DEFAULT_MAX_ATTEMPTS);
+        let attempt = match retry_due_at {
+            Some(_) => (wait.attempt + 1).min(max),
+            None => max,
+        };
+        self.conn.execute(
+            "UPDATE waits SET attempt = ?2, max_attempts = ?3, last_error = ?4,
+                 due_at = COALESCE(?5, due_at), updated_at = ?6
+             WHERE id = ?1",
+            params![uuid_to_blob(id), attempt, max, error, retry_due_at, now_ms()],
+        )?;
+        Ok(self.get(id)?.expect("the wait was just updated"))
     }
 
     /// Set a pending wait's next time (a poll's next check, with backoff).
@@ -329,6 +403,60 @@ mod tests {
         let node = Uuid::new_v4();
         conn.execute("INSERT INTO nodes VALUES (?1)", [uuid_to_blob(node)]).unwrap();
         (conn, node)
+    }
+
+    #[test]
+    fn a_transient_failure_is_counted_and_retried_until_the_attempts_are_spent() {
+        let (conn, node) = conn();
+        let repo = WaitRepo::new(&conn);
+        let wait = repo.create(node, &NewWait::event("github:pr:read", 1_000)).unwrap();
+        assert_eq!((wait.attempt, wait.max_attempts, wait.last_error.clone()), (0, None, None));
+        assert!(!wait.exhausted());
+
+        for attempt in 1..DEFAULT_MAX_ATTEMPTS {
+            let w = repo.record_failure(wait.id, "GitHub is unavailable (HTTP 503)", Some(2_000 * attempt as i64)).unwrap();
+            assert_eq!(w.attempt, attempt);
+            assert_eq!(w.max_attempts, Some(DEFAULT_MAX_ATTEMPTS));
+            assert_eq!(w.due_at, 2_000 * attempt as i64);
+            assert!(!w.exhausted());
+            assert_eq!(w.last_error.as_deref(), Some("GitHub is unavailable (HTTP 503)"));
+        }
+        let last = repo.record_failure(wait.id, "GitHub is unavailable (HTTP 503)", Some(99_000)).unwrap();
+        assert!(last.exhausted());
+        assert_eq!(last.state, WAIT_PENDING, "it stays, with its error, until a look succeeds");
+    }
+
+    #[test]
+    fn a_failure_asking_again_cannot_fix_is_exhausted_at_once_and_keeps_its_time() {
+        let (conn, node) = conn();
+        let repo = WaitRepo::new(&conn);
+        let wait = repo.create(node, &NewWait::event("github:pr:read", 1_000)).unwrap();
+        let w = repo.record_failure(wait.id, "GitHub rejected the token (HTTP 401)", None).unwrap();
+        assert!(w.exhausted());
+        assert_eq!(w.attempt, DEFAULT_MAX_ATTEMPTS);
+        assert_eq!(w.due_at, 1_000);
+    }
+
+    #[test]
+    fn only_a_pending_wait_can_record_a_failure() {
+        let (conn, node) = conn();
+        let repo = WaitRepo::new(&conn);
+        let wait = repo.create(node, &NewWait::event("github:pr:read", 1_000)).unwrap();
+        repo.set_state(wait.id, WAIT_CANCELLED).unwrap();
+        assert!(repo.record_failure(wait.id, "x", None).is_err());
+        assert!(repo.record_failure(Uuid::new_v4(), "x", None).is_err());
+    }
+
+    #[test]
+    fn pending_waits_are_listed_for_many_nodes_in_one_query() {
+        let (conn, node) = conn();
+        let repo = WaitRepo::new(&conn);
+        let a = repo.create(node, &NewWait::until(5_000)).unwrap();
+        let done = repo.create(node, &NewWait::until(6_000)).unwrap();
+        repo.set_state(done.id, WAIT_SATISFIED).unwrap();
+        let listed = repo.list_pending_for_nodes(&[node, Uuid::new_v4()]).unwrap();
+        assert_eq!(listed.iter().map(|w| w.id).collect::<Vec<_>>(), [a.id]);
+        assert!(repo.list_pending_for_nodes(&[]).unwrap().is_empty());
     }
 
     #[test]

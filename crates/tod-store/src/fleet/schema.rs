@@ -548,6 +548,10 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
     conn.execute_batch(&crate::journey_changes::node_events_triggers_sql())?;
     crate::cloud_nodes::add_lost_at(conn)?;
     crate::waits::add_detail(conn)?;
+    crate::waits::add_retry(conn)?;
+    // Machine-local lease bookkeeping: no sync, no journey trigger
+    // (`crate::activity`).
+    conn.execute_batch(crate::activity::CREATE_TABLE)?;
     // The task panel's own steps, first numbered 66–69 on its branch.
     ensure_decisions_reason(conn)?;
     conn.execute_batch(crate::request_feedback::CREATE_TABLE)?;

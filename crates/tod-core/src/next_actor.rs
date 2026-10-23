@@ -27,6 +27,9 @@ use crate::runner_status::{DONE_STATE, format_elapsed};
 use anyhow::Result;
 use rusqlite::Connection;
 use std::collections::HashMap;
+use tod_store::activity::{
+    ActivityRepo, KIND_GATE_CHECK, KIND_INCOMING_CHECK, KIND_PROTOCOL_PREFIX, KIND_RUN, Lease,
+};
 use tod_store::conversation::ProtocolKind;
 use tod_store::outline::repos::NodeRepo;
 use tod_store::waits::{Wait, WaitRepo};
@@ -60,6 +63,32 @@ pub enum Work {
     GateCheck,
     /// The app checking incoming changes.
     IncomingCheck,
+    /// The node's autopilot run: deciding, checking gates, and the turns it
+    /// drives.
+    Runner,
+    /// Processing whose lease kind this version does not know. Still work:
+    /// the lease proves it, so it is shown rather than dropped.
+    Other,
+}
+
+impl Work {
+    /// What a lease `kind` (`tod_store::activity`) is.
+    pub fn from_kind(kind: &str) -> Self {
+        if let Some(protocol) = kind.strip_prefix(KIND_PROTOCOL_PREFIX) {
+            return ProtocolKind::parse(protocol).map(Self::Conversation).unwrap_or(Self::Other);
+        }
+        match kind {
+            KIND_RUN => Self::Runner,
+            KIND_GATE_CHECK => Self::GateCheck,
+            KIND_INCOMING_CHECK => Self::IncomingCheck,
+            _ => Self::Other,
+        }
+    }
+
+    /// The lease kind a conversation turn under `protocol` holds.
+    pub fn conversation_kind(protocol: ProtocolKind) -> String {
+        format!("{KIND_PROTOCOL_PREFIX}{}", protocol.as_str())
+    }
 }
 
 /// Why the user is the one who has to act.
@@ -96,6 +125,17 @@ pub struct ExternalWait {
     /// The next look is well past due and nothing has been observed since:
     /// the thing that should be looking is not. Derived, never stored.
     pub overdue: bool,
+    /// The last look failed and another is due: what failed, and how many
+    /// times. Only while retrying; once the retries are spent the node is
+    /// `You::Failed` with the error instead.
+    pub retry: Option<Retry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Retry {
+    pub attempt: u32,
+    pub max: u32,
+    pub error: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -166,9 +206,6 @@ impl NodeStanding {
 /// daemon's or the app's. Absent means nothing is known.
 #[derive(Debug, Clone, Default)]
 pub struct RunFacts {
-    /// Automated processing is live, proved by a fresh activity lease. The
-    /// caller must not set this from anything weaker.
-    pub working: Option<(Work, i64)>,
     /// A permission an agent asked for, and since when.
     pub permission: Option<(String, i64)>,
     /// How the last run ended, and when.
@@ -191,6 +228,9 @@ pub struct Facts<'a> {
     pub entered_at: i64,
     pub attention: &'a NodeAttention,
     pub waits: &'a [Wait],
+    /// The node's activity leases (`tod_store::activity`): the only proof
+    /// that anything is processing it.
+    pub leases: &'a [Lease],
     pub run: &'a RunFacts,
     pub deferral: Option<Deferral>,
     pub now_ms: i64,
@@ -212,6 +252,10 @@ pub fn for_nodes(
     for wait in WaitRepo::new(conn).list_pending_for_nodes(node_ids)? {
         waits.entry(wait.node_id).or_default().push(wait);
     }
+    let mut leases: HashMap<Uuid, Vec<Lease>> = HashMap::new();
+    for lease in ActivityRepo::new(conn).list_for_nodes(node_ids)? {
+        leases.entry(lease.node_id).or_default().push(lease);
+    }
     let no_run = RunFacts::default();
     let no_attention = NodeAttention::default();
     let mut out = HashMap::new();
@@ -225,6 +269,7 @@ pub fn for_nodes(
             entered_at: *entered_at,
             attention: attention.get(&node_id).unwrap_or(&no_attention),
             waits: waits.get(&node_id).map(Vec::as_slice).unwrap_or(&[]),
+            leases: leases.get(&node_id).map(Vec::as_slice).unwrap_or(&[]),
             run: inputs.runs.get(&node_id).unwrap_or(&no_run),
             deferral: inputs.deferrals.get(&node_id).copied(),
             now_ms: inputs.now_ms,
@@ -232,6 +277,16 @@ pub fn for_nodes(
         out.insert(node_id, standing);
     }
     Ok(out)
+}
+
+/// A name for this process in a lease's `owner` (`tod`, `tod-agentd`, …), so
+/// a lost lease says who held it.
+pub fn this_process() -> String {
+    let exe = std::env::current_exe()
+        .ok()
+        .and_then(|path| path.file_stem().map(|s| s.to_string_lossy().into_owned()))
+        .unwrap_or_else(|| "tod".to_string());
+    format!("{exe}:{}", std::process::id())
 }
 
 /// The rule: see the module comment for the order.
@@ -271,8 +326,17 @@ fn actor_for(facts: &Facts<'_>) -> (NextActor, i64) {
             *since,
         );
     }
-    if let Some((what, since)) = run.working {
-        return (NextActor::Working { what, since }, 0);
+    // Working is only ever what a live lease says. Lifecycle leases only: a
+    // chat turn is the chat decorator's.
+    let lifecycle_leases = || facts.leases.iter().filter(|l| l.is_lifecycle());
+    if let Some(lease) = lifecycle_leases().find(|l| l.is_live(facts.now_ms)) {
+        return (
+            NextActor::Working {
+                what: Work::from_kind(&lease.kind),
+                since: lease.started_at,
+            },
+            0,
+        );
     }
     let requests = facts.attention;
     if let Some(waiting_since) = requests.waiting_since {
@@ -290,7 +354,43 @@ fn actor_for(facts: &Facts<'_>) -> (NextActor, i64) {
     {
         return (NextActor::You { why, since: *at }, *at);
     }
-    if let Some(wait) = facts.waits.first() {
+    // Processing that stopped answering: its owner died or hung. Said, not
+    // left to look like nothing is happening.
+    if let Some(lease) = lifecycle_leases().find(|l| !l.is_live(facts.now_ms)) {
+        let error = format!(
+            "processing was lost: {} held by {} stopped responding {} ago",
+            lease.kind,
+            lease.owner,
+            format_elapsed(facts.now_ms - lease.heartbeat_at),
+        );
+        return (
+            NextActor::You {
+                why: YouReason::Failed { error },
+                since: lease.heartbeat_at,
+            },
+            lease.heartbeat_at,
+        );
+    }
+    // A look at the outside that failed as often as it may (or in a way
+    // asking again cannot fix) is the user's, with the error.
+    if let Some(wait) = facts.waits.iter().find(|w| w.exhausted()) {
+        return (
+            NextActor::You {
+                why: YouReason::Failed {
+                    error: wait.last_error.clone().unwrap_or_default(),
+                },
+                since: wait.updated_at,
+            },
+            wait.updated_at,
+        );
+    }
+    // A failing look shows before the waits that are fine: it is the news.
+    if let Some(wait) = facts
+        .waits
+        .iter()
+        .find(|w| w.last_error.is_some())
+        .or(facts.waits.first())
+    {
         return (
             NextActor::Others {
                 wait: external_wait(wait, facts.now_ms),
@@ -310,6 +410,7 @@ fn actor_for(facts: &Facts<'_>) -> (NextActor, i64) {
                     since: *at,
                     next_check_ms: Some(*due_at_ms),
                     overdue: *due_at_ms + OVERDUE_GRACE_MS < facts.now_ms,
+                    retry: None,
                 },
             },
             0,
@@ -363,6 +464,11 @@ fn external_wait(wait: &Wait, now_ms: i64) -> ExternalWait {
         since: wait.created_at,
         next_check_ms: Some(wait.due_at),
         overdue: wait.due_at + grace < now_ms,
+        retry: wait.last_error.as_ref().map(|error| Retry {
+            attempt: wait.attempt,
+            max: wait.max_attempts.unwrap_or(tod_store::waits::DEFAULT_MAX_ATTEMPTS),
+            error: error.clone(),
+        }),
     }
 }
 
@@ -372,6 +478,7 @@ mod tests {
     use crate::attention::{AttentionItem, AttentionKind, RequestReason};
     use tod_store::fleet::schema;
     use tod_store::outline::repos::NodeRepo;
+    use tod_store::activity::KIND_CHAT;
     use tod_store::waits::NewWait;
 
     const NOW: i64 = 1_000_000;
@@ -388,7 +495,26 @@ mod tests {
             created_at: 100,
             updated_at,
             detail: Some("a review of the pull request".into()),
+            attempt: 0,
+            max_attempts: None,
+            last_error: None,
         }
+    }
+
+    /// A lease whose last heartbeat was `ago_ms` before `NOW`.
+    fn lease(kind: &str, started_at: i64, ago_ms: i64) -> Lease {
+        Lease {
+            id: Uuid::new_v4(),
+            node_id: Uuid::nil(),
+            kind: kind.into(),
+            owner: "daemon-1".into(),
+            started_at,
+            heartbeat_at: NOW - ago_ms,
+        }
+    }
+
+    fn live_lease(kind: &str, started_at: i64) -> Lease {
+        lease(kind, started_at, 1_000)
     }
 
     fn requests(node: Uuid, sinces: &[i64]) -> NodeAttention {
@@ -418,6 +544,7 @@ mod tests {
         lifecycle: &'static str,
         attention: NodeAttention,
         waits: Vec<Wait>,
+        leases: Vec<Lease>,
         run: RunFacts,
         deferral: Option<Deferral>,
     }
@@ -427,6 +554,7 @@ mod tests {
             lifecycle,
             attention: NodeAttention::default(),
             waits: Vec::new(),
+            leases: Vec::new(),
             run: RunFacts::default(),
             deferral: None,
         }
@@ -439,6 +567,7 @@ mod tests {
             entered_at: 500,
             attention: &c.attention,
             waits: &c.waits,
+            leases: &c.leases,
             run: &c.run,
             deferral: c.deferral,
             now_ms: NOW,
@@ -453,7 +582,7 @@ mod tests {
     fn done_is_terminal_whatever_else_is_recorded() {
         let mut c = case("done");
         c.attention = requests(Uuid::nil(), &[10]);
-        c.run.working = Some((Work::GateCheck, 20));
+        c.leases = vec![live_lease(KIND_GATE_CHECK, 20)];
         assert_eq!(standing(&c).actor, NextActor::Done);
     }
 
@@ -468,7 +597,8 @@ mod tests {
     #[test]
     fn processing_with_a_lease_is_working() {
         let mut c = case("active");
-        c.run.working = Some((Work::Conversation(ProtocolKind::Implementation), 30));
+        let kind = Work::conversation_kind(ProtocolKind::Implementation);
+        c.leases = vec![live_lease(&kind, 30)];
         assert_eq!(
             standing(&c).actor,
             NextActor::Working { what: Work::Conversation(ProtocolKind::Implementation), since: 30 }
@@ -476,9 +606,80 @@ mod tests {
     }
 
     #[test]
+    fn lease_kinds_round_trip_and_an_unknown_one_is_still_work() {
+        for protocol in [ProtocolKind::Implementation, ProtocolKind::Review, ProtocolKind::Pr] {
+            assert_eq!(
+                Work::from_kind(&Work::conversation_kind(protocol)),
+                Work::Conversation(protocol)
+            );
+        }
+        assert_eq!(Work::from_kind(KIND_GATE_CHECK), Work::GateCheck);
+        assert_eq!(Work::from_kind(KIND_INCOMING_CHECK), Work::IncomingCheck);
+        assert_eq!(Work::from_kind("something-new"), Work::Other);
+        assert_eq!(Work::from_kind("protocol:nonsense"), Work::Other);
+    }
+
+    #[test]
+    fn a_lease_that_stopped_beating_is_a_loss_not_working_and_not_idle() {
+        let mut c = case("active");
+        c.leases = vec![lease("protocol:implementation", 30, 60_000)];
+        let s = standing(&c);
+        let NextActor::You { why: YouReason::Failed { error }, since } = s.actor else {
+            panic!("a lost lease must be the user's: {:?}", s.actor)
+        };
+        assert!(error.contains("processing was lost"), "{error}");
+        assert!(error.contains("protocol:implementation"), "{error}");
+        assert!(error.contains("daemon-1"), "{error}");
+        assert_eq!(since, NOW - 60_000);
+    }
+
+    #[test]
+    fn a_live_lease_wins_over_a_lost_one_on_the_same_node() {
+        let mut c = case("active");
+        c.leases = vec![lease(KIND_GATE_CHECK, 1, 60_000), live_lease(KIND_INCOMING_CHECK, 2)];
+        assert!(matches!(standing(&c).actor, NextActor::Working { what: Work::IncomingCheck, .. }));
+    }
+
+    #[test]
+    fn a_chat_lease_never_makes_the_node_work_or_lost() {
+        let mut c = case("active");
+        c.leases = vec![live_lease(KIND_CHAT, 5), lease(KIND_CHAT, 1, 60_000)];
+        assert_eq!(standing(&c).actor, you(YouReason::NotStarted, 500));
+    }
+
+    #[test]
+    fn a_wait_that_failed_and_will_retry_is_others_with_the_error() {
+        let mut c = case("pr");
+        let mut w = wait("github:pr:read", NOW + 30_000, NOW);
+        w.attempt = 2;
+        w.max_attempts = Some(5);
+        w.last_error = Some("GitHub is unavailable (HTTP 503)".into());
+        c.waits = vec![w];
+        let NextActor::Others { wait } = standing(&c).actor else { panic!("not others") };
+        assert_eq!(
+            wait.retry,
+            Some(Retry { attempt: 2, max: 5, error: "GitHub is unavailable (HTTP 503)".into() })
+        );
+    }
+
+    #[test]
+    fn a_wait_whose_retries_are_spent_is_the_users_with_the_error() {
+        let mut c = case("pr");
+        let mut w = wait("github:pr:read", NOW + 30_000, NOW - 5);
+        w.attempt = 5;
+        w.max_attempts = Some(5);
+        w.last_error = Some("GitHub rejected the token (HTTP 401)".into());
+        c.waits = vec![w];
+        assert_eq!(
+            standing(&c).actor,
+            you(YouReason::Failed { error: "GitHub rejected the token (HTTP 401)".into() }, NOW - 5)
+        );
+    }
+
+    #[test]
     fn a_pending_permission_beats_working() {
         let mut c = case("active");
-        c.run.working = Some((Work::Conversation(ProtocolKind::Implementation), 30));
+        c.leases = vec![live_lease(&Work::conversation_kind(ProtocolKind::Implementation), 30)];
         c.run.permission = Some(("Run `rm`".into(), 40));
         assert_eq!(standing(&c).actor, you(YouReason::Permission { title: "Run `rm`".into() }, 40));
     }
@@ -488,7 +689,7 @@ mod tests {
         let mut c = case("review");
         c.attention = requests(Uuid::nil(), &[10]);
         c.run.last_outcome = Some((Outcome::Stopped { reason: "budget".into() }, 5));
-        c.run.working = Some((Work::GateCheck, 60));
+        c.leases = vec![live_lease(KIND_GATE_CHECK, 60)];
         assert!(matches!(standing(&c).actor, NextActor::Working { .. }));
     }
 
@@ -731,21 +932,83 @@ mod tests {
     }
 
     #[test]
-    fn for_nodes_takes_run_facts_and_deferrals_per_node() {
+    fn for_nodes_reads_leases_and_takes_deferrals_per_node() {
         let fx = fixture();
         let running = node(&fx.conn, "running", Some("active"));
         let parked = node(&fx.conn, "parked", Some("proposed"));
         let mut inputs = Inputs { now_ms: NOW, ..Default::default() };
-        inputs.runs.insert(
-            running,
-            RunFacts { working: Some((Work::IncomingCheck, 11)), ..Default::default() },
-        );
+        ActivityRepo::new(&fx.conn)
+            .start(Uuid::new_v4(), running, KIND_INCOMING_CHECK, "app-1", NOW - 500)
+            .unwrap();
         inputs.deferrals.insert(parked, Deferral { until: None, deferred_at: 9 });
 
         let got = for_nodes(&fx.conn, &[running, parked], &inputs).unwrap();
-        assert_eq!(got[&running].actor, NextActor::Working { what: Work::IncomingCheck, since: 11 });
+        assert_eq!(got[&running].actor, NextActor::Working { what: Work::IncomingCheck, since: NOW - 500 });
         assert!(got[&parked].deferred.is_some());
         assert!(!got[&parked].on_you());
+    }
+
+    #[test]
+    fn a_held_guard_makes_the_node_working_and_dropping_it_ends_that() {
+        use tod_store::fleet::FleetStore;
+        use tod_store::outline::OutlineMutation;
+
+        let root = std::env::temp_dir().join(format!("tod-next-actor-guard-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let fleet = std::sync::Arc::new(FleetStore::open(&root).unwrap());
+        fleet
+            .enqueue_outline(OutlineMutation::CreateList { slug: "t".into(), title: "T".into() })
+            .unwrap();
+        fleet.writer().flush().unwrap();
+        let list_id = fleet.list_outline_lists().unwrap()[0].id;
+        fleet
+            .enqueue_outline(OutlineMutation::CreateNode {
+                node_id: None,
+                list_id,
+                parent_id: None,
+                anchor_id: None,
+                position: tod_store::outline::CreatePosition::Below,
+                title: "N".into(),
+            })
+            .unwrap();
+        fleet.writer().flush().unwrap();
+        fleet.reload_if_stale().unwrap();
+        let node_id = fleet.flatten_outline(list_id).unwrap()[0].node.id;
+        fleet
+            .enqueue_outline(OutlineMutation::EnableCapabilities {
+                node_id,
+                capabilities: vec![tod_store::outline::Capability::Lifecycle],
+            })
+            .unwrap();
+        fleet.writer().flush().unwrap();
+
+        let now = || tod_store::outline::uuid_blob::now_ms();
+        let actor = |fleet: &FleetStore| {
+            fleet.reload_if_stale().unwrap();
+            let inputs = Inputs { now_ms: now(), ..Default::default() };
+            fleet
+                .read(|conn| for_nodes(conn, &[node_id], &inputs))
+                .unwrap()
+                .remove(&node_id)
+                .expect("the node has Lifecycle")
+                .actor
+        };
+
+        assert_eq!(actor(&fleet), NextActor::You { why: YouReason::NotStarted, since: actor_since(&actor(&fleet)) });
+        let guard = tod_store::activity::ActivityGuard::start(&fleet, node_id, KIND_RUN, "test:1").unwrap();
+        fleet.writer().flush().unwrap();
+        assert!(matches!(actor(&fleet), NextActor::Working { what: Work::Runner, .. }));
+        drop(guard);
+        fleet.writer().flush().unwrap();
+        assert!(matches!(actor(&fleet), NextActor::You { why: YouReason::NotStarted, .. }));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn actor_since(actor: &NextActor) -> i64 {
+        match actor {
+            NextActor::You { since, .. } => *since,
+            other => panic!("expected You, got {other:?}"),
+        }
     }
 
     #[test]

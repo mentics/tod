@@ -343,6 +343,13 @@ pub enum InterviewCommand {
     SetWaitState { wait_id: Uuid, state: String },
     /// Set a pending wait's next time (a poll's next check).
     RescheduleWait { wait_id: Uuid, due_at: i64 },
+    /// A look at what a wait is for failed (`crate::waits::WaitRepo::record_failure`):
+    /// retry at `retry_due_at`, or `None` when asking again cannot help.
+    WaitFailed {
+        wait_id: Uuid,
+        error: String,
+        retry_due_at: Option<i64>,
+    },
 }
 
 /// Append a phase event, attributed to `actor` (`crate::phase::certifier_for_actor`).
@@ -1185,6 +1192,10 @@ pub fn execute(
         InterviewCommand::RescheduleWait { wait_id, due_at } => {
             crate::waits::WaitRepo::new(conn).reschedule(*wait_id, *due_at)?;
             Ok(json!({}))
+        }
+        InterviewCommand::WaitFailed { wait_id, error, retry_due_at } => {
+            let wait = crate::waits::WaitRepo::new(conn).record_failure(*wait_id, error, *retry_due_at)?;
+            Ok(json!({ "attempt": wait.attempt, "max_attempts": wait.max_attempts, "exhausted": wait.exhausted() }))
         }
     }
 }
