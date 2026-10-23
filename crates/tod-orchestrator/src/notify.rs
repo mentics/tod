@@ -136,6 +136,9 @@ pub struct Observed {
 pub trait Probe: Send + Sync {
     fn observe(&self, user: &str) -> Result<Observed>;
     fn topic(&self, user: &str) -> Result<String>;
+    /// Puts a failed announcement where the user's app will find it. The
+    /// default drops it (tests).
+    fn report_failure(&self, _user: &str, _message: &str) {}
 }
 
 /// The real probe: the user's database under `<base>/users/<u>/`.
@@ -166,6 +169,13 @@ impl Probe for StoreProbe {
 
     fn topic(&self, user: &str) -> Result<String> {
         topic(&self.0.root_of(user)?)
+    }
+
+    fn report_failure(&self, user: &str, message: &str) {
+        match self.0.root_of(user) {
+            Ok(root) => crate::problems::report_own(&root, message),
+            Err(err) => eprintln!("tod-orchestrator: notify {user}: could not record a problem for the app: {err:#}"),
+        }
     }
 }
 
@@ -218,6 +228,9 @@ struct Announced {
     last_seq: Option<i64>,
     problems: Option<u64>,
     attention: Option<HashSet<Vec<u8>>>,
+    /// The failure last reported to the app, so a service that keeps
+    /// refusing is said once, not once a change (reporting is itself a change).
+    failure: Option<String>,
 }
 
 /// Decides what to publish for one observation; updates `seen`.
@@ -229,6 +242,24 @@ fn decide(seen: &mut Announced, now: Observed) -> (bool, bool) {
     seen.problems = Some(now.problems);
     seen.attention = Some(now.attention);
     (changed, needs_you)
+}
+
+/// The message to tell the app about, if `result` is a failure not already
+/// reported; a success clears what was reported, so a later failure is new.
+fn failure_to_report(last: &mut Option<String>, result: Result<(), String>) -> Option<String> {
+    match result {
+        Ok(()) => {
+            *last = None;
+            None
+        }
+        Err(message) if last.as_deref() == Some(message.as_str()) => None,
+        Err(message) => {
+            *last = Some(message.clone());
+            Some(format!(
+                "could not announce changes to your app ({message}); it pulls on a timer until announcements work again"
+            ))
+        }
+    }
 }
 
 pub struct Notifier {
@@ -304,8 +335,16 @@ impl Notifier {
     }
 
     fn announce(&self, user: &str) {
-        if let Err(err) = self.try_announce(user) {
-            eprintln!("tod-orchestrator: notify {user}: {err:#}");
+        let result = self.try_announce(user).map_err(|err| format!("{err:#}"));
+        if let Err(message) = &result {
+            eprintln!("tod-orchestrator: notify {user}: {message}");
+        }
+        let report = {
+            let mut announced = self.announced.lock().unwrap_or_else(|e| e.into_inner());
+            failure_to_report(&mut announced.entry(user.to_string()).or_default().failure, result)
+        };
+        if let Some(message) = report {
+            self.probe.report_failure(user, &message);
         }
     }
 
@@ -379,6 +418,17 @@ mod tests {
         assert_eq!(decide(&mut seen, obs(1, &[1])), (false, false));
         assert_eq!(decide(&mut seen, obs(2, &[1, 2])), (true, true));
         assert_eq!(decide(&mut seen, obs(3, &[2])), (true, false));
+    }
+
+    #[test]
+    fn a_repeated_failure_is_reported_once_until_a_success() {
+        let mut last = None;
+        let fail = |m: &str| Err(m.to_string());
+        assert!(failure_to_report(&mut last, fail("publish to ntfy: 429")).is_some());
+        assert_eq!(failure_to_report(&mut last, fail("publish to ntfy: 429")), None);
+        assert!(failure_to_report(&mut last, fail("publish to ntfy: 502")).is_some());
+        assert_eq!(failure_to_report(&mut last, Ok(())), None);
+        assert!(failure_to_report(&mut last, fail("publish to ntfy: 502")).is_some());
     }
 
     #[test]
