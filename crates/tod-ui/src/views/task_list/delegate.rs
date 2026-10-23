@@ -4,7 +4,7 @@ use std::rc::Rc;
 use crate::ui::item_list::ItemDrag;
 use crate::views::obligations::DRAG_LIST as OBLIGATION_DRAG_LIST;
 use gpui::{
-    Context, Entity, InteractiveElement, IntoElement, MouseButton, ParentElement, Styled,
+    Context, Entity, InteractiveElement, IntoElement, MouseButton, ParentElement, StatefulInteractiveElement, Styled,
     SharedString, WeakEntity, Window, div, prelude::FluentBuilder, px,
 };
 use gpui_component::IndexPath;
@@ -14,10 +14,13 @@ use gpui_component::input::InputState;
 use gpui_component::list::{ListDelegate, ListItem, ListState};
 use gpui_component::menu::PopupMenu;
 use gpui_component::tag::Tag;
+use gpui_component::tooltip::Tooltip;
 use gpui_component::{ActiveTheme, Sizable, StyledExt, h_flex};
 
 use super::TaskListView;
 use super::model::{RunSource, TaskItem};
+use super::standing::{self, Counts, Glyph, Mark, Shape, Tone};
+use tod_core::next_actor::NodeStanding;
 use super::row_menu::{RowMenuKind, popup_anchor, popup_at, row_menu_anchor};
 
 /// Checkvist-style uniform tree row height.
@@ -115,6 +118,11 @@ pub struct TaskListDelegate {
     recently_updated: std::collections::HashSet<String>,
     /// Rows marked for a multi-node action (Space / Ctrl+click).
     marked: std::collections::HashSet<String>,
+    /// Who is next for each node (`tod_core::next_actor`), as the host last
+    /// said: what the status cell draws.
+    standings: std::collections::HashMap<String, NodeStanding>,
+    /// What is below each node, for a collapsed branch.
+    below: std::collections::HashMap<String, Counts>,
 }
 
 impl TaskListDelegate {
@@ -133,7 +141,18 @@ impl TaskListDelegate {
             view: None,
             recently_updated: std::collections::HashSet::new(),
             marked: std::collections::HashSet::new(),
+            standings: std::collections::HashMap::new(),
+            below: std::collections::HashMap::new(),
         }
+    }
+
+    pub fn set_standings(
+        &mut self,
+        standings: std::collections::HashMap<String, NodeStanding>,
+        below: std::collections::HashMap<String, Counts>,
+    ) {
+        self.standings = standings;
+        self.below = below;
     }
 
     pub fn set_marked(&mut self, marked: std::collections::HashSet<String>) {
@@ -706,8 +725,19 @@ impl ListDelegate for TaskListDelegate {
                 ),
             ));
         }
+        if let Some(chip) = self.standings.get(&item.id).and_then(deferral_chip) {
+            chips = chips.child(chip);
+        }
+        if item.collapsed && item.has_children {
+            if let Some(below) = self.below.get(&item.id) {
+                chips = chips.children(rollup_chip(below));
+            }
+        }
+        if let Some(decorator) = chat_decorator(&item) {
+            chips = chips.child(decorator);
+        }
         let chips_menu_open = self.open_row_menu.as_ref().is_some_and(|(kind, id)| {
-            (selected && matches!(kind, RowMenuKind::Shells)
+            (selected && matches!(kind, RowMenuKind::Shells | RowMenuKind::Defer)
                 || matches!(kind, RowMenuKind::Context(None)))
                 && id == &item.id
         });
@@ -810,10 +840,8 @@ impl ListDelegate for TaskListDelegate {
                 el.drag_over::<ItemDrag>(|style, _, _, _| style.cursor_not_allowed())
             })
             .child(status_icon_cell(
-                item.needs_you_count > 0,
-                item.lifecycle_running,
-                item.chat_running,
-                item.finished_run,
+                &item.id,
+                self.standings.get(&item.id),
                 item.incoming_count > 0,
             ))
             .child(title_line)
@@ -854,49 +882,31 @@ fn group_label(state: &str) -> String {
     }
 }
 
-/// The fixed-width cell at the left of a row. Three live states nest in one
-/// 16px glyph so any combination shows at once without taking more room: a
-/// circle while the lifecycle processor runs, a triangle while the node waits
-/// on the user, a square while a chat session is active (the triangle's
-/// corners stay visible around the square). With none of those, an
-/// icon ringed in a circle for something that stopped since the row was last
-/// selected, else the incoming-changes dot. Static on purpose (a tree of
-/// animated rows would distract), and always reserved so rows do not shift
-/// when a run starts or stops.
+/// The fixed-width cell at the left of a row: one glyph for who is next
+/// (`standing::glyph`), or the incoming-changes dot when there is none.
+/// Static on purpose (a tree of animated rows would distract), and always
+/// reserved so rows do not shift when the actor changes. The hover says the
+/// same in words (`standing::tooltip_lines`).
 fn status_icon_cell(
-    needs_you: bool,
-    lifecycle_running: bool,
-    chat_running: bool,
-    finished: Option<RunSource>,
+    task_id: &str,
+    standing: Option<&NodeStanding>,
     pending_changes: bool,
-) -> gpui::Div {
+) -> gpui::Stateful<gpui::Div> {
     use gpui_kit_assets::IconName;
     let cell = div()
+        .id(SharedString::from(format!("row-status-{task_id}")))
         .w(px(16.0))
         .flex_shrink_0()
         .flex()
         .items_center();
-    if needs_you || lifecycle_running || chat_running {
-        return cell.child(nested_status_glyph(needs_you, lifecycle_running, chat_running));
-    }
-    if let Some(source) = finished {
-        // `styles.node-status-finished`: the icon keeps its shape, ringed.
-        let color = crate::ui::style::color::node_finished_text();
-        let icon = match source {
-            RunSource::Lifecycle => IconName::Play,
-            RunSource::Chat => IconName::Square,
-        };
-        return cell.child(
-            div()
-                .size(px(14.0))
-                .flex()
-                .items_center()
-                .justify_center()
-                .rounded_full()
-                .border_1()
-                .border_color(color)
-                .child(gpui_component::Icon::new(icon).size(px(8.0)).text_color(color)),
-        );
+    if let Some(standing) = standing {
+        if let Some(glyph) = standing::glyph(standing) {
+            let now = chrono::Utc::now().timestamp_millis();
+            let text = standing::tooltip_lines(standing, now).join("\n");
+            return cell
+                .child(actor_glyph(glyph))
+                .tooltip(move |window, cx| Tooltip::new(text.clone()).build(window, cx));
+        }
     }
     if pending_changes {
         // `styles.node-status-pending-changes`: incoming changes not yet
@@ -910,14 +920,27 @@ fn status_icon_cell(
     cell
 }
 
-/// `styles.node-status-nested`: circle (lifecycle running) outside, filled
-/// triangle (needs the user) inside it, square (chat active) at the centre.
-/// Each layer is drawn only when its state holds, in the same place.
-fn nested_status_glyph(needs_you: bool, lifecycle_running: bool, chat_running: bool) -> gpui::Div {
-    use gpui::{canvas, point, PathBuilder};
-    let glyph = div().relative().size(px(16.0)).flex_shrink_0();
-    let glyph = if lifecycle_running {
-        glyph.child(
+fn tone_color(tone: Tone) -> gpui::Hsla {
+    use crate::ui::style::color;
+    match tone {
+        Tone::Running => color::node_running_text(),
+        Tone::NeedsYou => color::node_needs_you_text(),
+        Tone::Failure => color::node_failed_text(),
+        Tone::Warning => color::node_retrying_text(),
+        Tone::Muted => color::node_others_text(),
+    }
+}
+
+/// `styles.node-status-working` (ring), `node-status-you` (filled triangle;
+/// `-failed` with a cross, `-deferred` muted with a clock) and
+/// `node-status-others` (outlined diamond; `-retrying`, `-overdue`): one
+/// 16px glyph per actor.
+fn actor_glyph(glyph: Glyph) -> gpui::Div {
+    use gpui::{PathBuilder, canvas, point};
+    let color = tone_color(glyph.tone);
+    let base = div().relative().size(px(16.0)).flex_shrink_0();
+    let base = match glyph.shape {
+        Shape::Ring => base.child(
             div()
                 .absolute()
                 .top(px(1.0))
@@ -925,46 +948,131 @@ fn nested_status_glyph(needs_you: bool, lifecycle_running: bool, chat_running: b
                 .size(px(14.0))
                 .rounded_full()
                 .border(px(1.5))
-                .border_color(crate::ui::style::color::node_running_text()),
-        )
-    } else {
-        glyph
+                .border_color(color),
+        ),
+        Shape::Triangle | Shape::Diamond => base,
     };
-    let glyph = if needs_you {
-        glyph.child(
-            canvas(
-                |_, _, _| {},
-                |bounds, _, window, _| {
-                    let at = |x: f32, y: f32| point(bounds.origin.x + px(x), bounds.origin.y + px(y));
-                    let mut path = PathBuilder::fill();
-                    path.move_to(at(8.0, 2.6));
-                    path.line_to(at(13.6, 12.4));
-                    path.line_to(at(2.4, 12.4));
-                    path.close();
-                    if let Ok(path) = path.build() {
-                        window.paint_path(path, crate::ui::style::color::node_needs_you_text());
+    base.child(
+        canvas(
+            |_, _, _| {},
+            move |bounds, _, window, _| {
+                let at = |x: f32, y: f32| point(bounds.origin.x + px(x), bounds.origin.y + px(y));
+                match glyph.shape {
+                    Shape::Ring => {}
+                    Shape::Triangle => {
+                        let mut path = PathBuilder::fill();
+                        path.move_to(at(8.0, 2.6));
+                        path.line_to(at(13.6, 12.4));
+                        path.line_to(at(2.4, 12.4));
+                        path.close();
+                        if let Ok(path) = path.build() {
+                            window.paint_path(path, color);
+                        }
                     }
-                },
-            )
-            .absolute()
-            .size_full(),
+                    Shape::Diamond => {
+                        let mut path = PathBuilder::stroke(px(1.5));
+                        path.move_to(at(8.0, 2.5));
+                        path.line_to(at(13.0, 8.0));
+                        path.line_to(at(8.0, 13.5));
+                        path.line_to(at(3.0, 8.0));
+                        path.close();
+                        if let Ok(path) = path.build() {
+                            window.paint_path(path, color);
+                        }
+                    }
+                }
+                match glyph.mark {
+                    Mark::None => {}
+                    // A cross cut out of the triangle's body.
+                    Mark::Cross => {
+                        let mut path = PathBuilder::stroke(px(1.4));
+                        path.move_to(at(6.6, 7.2));
+                        path.line_to(at(9.4, 10.0));
+                        path.move_to(at(9.4, 7.2));
+                        path.line_to(at(6.6, 10.0));
+                        if let Ok(path) = path.build() {
+                            window.paint_path(path, crate::ui::style::color::surface());
+                        }
+                    }
+                    // A small clock at the lower right.
+                    Mark::Clock => {
+                        let mut path = PathBuilder::stroke(px(1.0));
+                        let (cx0, cy0, r) = (12.2_f32, 12.2_f32, 3.0_f32);
+                        let steps = 16;
+                        for i in 0..=steps {
+                            let a = i as f32 / steps as f32 * std::f32::consts::TAU;
+                            let p = at(cx0 + r * a.cos(), cy0 + r * a.sin());
+                            if i == 0 {
+                                path.move_to(p);
+                            } else {
+                                path.line_to(p);
+                            }
+                        }
+                        path.move_to(at(cx0, cy0 - 1.8));
+                        path.line_to(at(cx0, cy0));
+                        path.line_to(at(cx0 + 1.4, cy0));
+                        if let Ok(path) = path.build() {
+                            window.paint_path(path, crate::ui::style::color::text());
+                        }
+                    }
+                }
+            },
         )
-    } else {
-        glyph
-    };
-    if chat_running {
-        glyph.child(
+        .absolute()
+        .size_full(),
+    )
+}
+
+/// `styles.node-chat-working` (a spinner, the one animated element in the
+/// tree) while the chat agent works; `styles.node-chat-new` (a small dot)
+/// once it finished or is waiting on the user and the row has not been seen
+/// since. Nothing otherwise, and it takes no column of its own.
+fn chat_decorator(item: &TaskItem) -> Option<gpui::AnyElement> {
+    if item.chat_running {
+        return Some(
             div()
-                .absolute()
-                .top(px(5.0))
-                .left(px(5.0))
-                .size(px(6.0))
-                .rounded(px(1.0))
-                .bg(crate::ui::style::color::node_chat_text()),
-        )
-    } else {
-        glyph
+                .flex_shrink_0()
+                .child(gpui_component::spinner::Spinner::new().xsmall().color(crate::ui::style::color::node_chat_text()))
+                .into_any_element(),
+        );
     }
+    if item.finished_run == Some(RunSource::Chat) {
+        return Some(
+            div()
+                .flex_shrink_0()
+                .size(px(7.0))
+                .rounded_full()
+                .bg(crate::ui::style::color::node_chat_text())
+                .into_any_element(),
+        );
+    }
+    None
+}
+
+/// A deferred node's return time at its trailing edge, so the Deferred
+/// filter shows when each comes back.
+fn deferral_chip(standing: &NodeStanding) -> Option<gpui::Div> {
+    let deferral = standing.deferred.as_ref()?;
+    Some(
+        div()
+            .flex_shrink_0()
+            .text_xs()
+            .text_color(crate::ui::style::color::node_others_text())
+            .child(standing::deferral_chip_text(deferral.until)),
+    )
+}
+
+/// A collapsed branch's counts: whether anything below is on me.
+fn rollup_chip(below: &Counts) -> Option<gpui::Div> {
+    use crate::ui::style::color;
+    let (text, tone) = if below.failures > 0 {
+        (format!("{} failed", below.failures), color::node_failed_text())
+    } else if below.requests > 0 {
+        (format!("{} on you", below.requests), color::node_needs_you_text())
+    } else {
+        return None;
+    };
+    Some(div().flex_shrink_0().text_xs().text_color(tone).child(text))
 }
 
 fn title_label(

@@ -90,6 +90,7 @@ pub mod color {
     pub fn node_running_text() -> Hsla {
         hex(0xa8c060ff)
     }
+    #[allow(dead_code)]
     pub fn node_finished_text() -> Hsla {
         hex(0xfb923cff)
     }
@@ -98,6 +99,15 @@ pub mod color {
     }
     pub fn node_chat_text() -> Hsla {
         hex(0x60a5faff)
+    }
+    pub fn node_others_text() -> Hsla {
+        hex(0x94a3b8ff)
+    }
+    pub fn node_failed_text() -> Hsla {
+        hex(0xf87171ff)
+    }
+    pub fn node_retrying_text() -> Hsla {
+        hex(0xfbbf24ff)
     }
     pub fn linked_source_text() -> Hsla {
         hex(0xa06707ff)

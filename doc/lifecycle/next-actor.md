@@ -206,6 +206,20 @@ Every phase can additionally be `Retrying` (any service call) and
 
 ## Build order
 
+**Status: steps 1–6 are built** (step 1 and 2 below, then): the daemon tick
+reconciles desired state against leases and clears spent deferrals
+(`tod-agentd/src/runners.rs`); `cloud_sync` asks `next_actor`; `NextActorChanged`
+is a journey event (`tod-agentd/src/actor_journey.rs`, `doc/journeys/spec.md`);
+the tree, summary strip, filters, Alt+Q, defer menu, "On others" panel, chat
+decorator and the task panel's runner line read `NodeStanding`
+(`tod-ui`: `views/task_list/{actor,standing}.rs`, `unified/attention_feed.rs`,
+`unified/panels/on_others.rs`); `RunnerStatus` is gone: what is left of
+`runner_status.rs` is `LiveTurn`. Not built: a custom date for a deferral
+(there is no date input yet), persisting the strip's filter,
+`who` for a human review, retiring the tod-core working-set fields the old
+filters used (`needs_you_only`, `running_only`, `awaiting_only`), and a
+`Permission` reason of its own.
+
 Step 1 is built: `crates/tod-core/src/next_actor.rs` (types, `derive`, batched
 `for_nodes`, tests), with `WaitRepo::list_pending_for_nodes` and
 `NodeRepo::get_lifecycle_entered_for_nodes`. Nothing reads it yet.

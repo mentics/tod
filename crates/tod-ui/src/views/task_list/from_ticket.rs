@@ -248,7 +248,7 @@ impl TaskListView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let visible = Self::visible_tasks(&self.all_tasks, &self.search_query, &self.working_set);
+        let visible = Self::visible_tasks(&self.all_tasks, &self.search_query, &self.working_set, &self.actor_view);
         if visible.iter().any(|t| t.id == task_id) {
             self.select_task_by_id(task_id, window, cx);
         }

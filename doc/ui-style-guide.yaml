@@ -395,36 +395,61 @@ styles:
   # purposes (planned: a per-row color the user picks). The app must not use
   # title color to signal anything else; state is shown with the status icon
   # (node-status-*) and the ticket id (node-ticket-*).
-  node-status-nested:
-    # The status glyph of a tree row, one 16px slot for three live states
-    # that can hold at once, nested: a circle (node-running-text) while the
-    # lifecycle processor runs, a filled triangle (node-needs-you-text) while
-    # the node waits on the user, a square (node-chat-text) while a chat
-    # session is active. Each is drawn only when its state holds, in the same
-    # place, so every combination is one glyph and rows never shift. The
-    # square keeps its size with the triangle shown; the triangle's corners
-    # stay visible. Wins over finished and pending-changes.
+  # The status cell of a tree row: one 16px glyph for who is next
+  # (doc/lifecycle/next-actor.md). The actor is exclusive, so the glyphs do not
+  # nest. Static (a tree of animated rows would distract) and always
+  # reserved, so rows never shift when the actor changes. A done node shows
+  # nothing. The hover says the same in words: the actor, the reason, who or
+  # what, and the age.
+  node-status-working:
+    # The processor is working on the node: a ring. Nothing for the user to do.
     color: node-running-text
+  node-status-you:
+    # The node waits on the user: a filled triangle.
+    color: node-needs-you-text
+  node-status-you-failed:
+    # On the user because something failed or stopped: the triangle in the
+    # failure color with a cross cut out of it. Counted apart from requests.
+    color: node-failed-text
+  node-status-you-deferred:
+    # On the user, who took it off their list for a while: the triangle
+    # muted, with a small clock at its lower right.
+    color: node-others-text
+  node-status-others:
+    # Someone or something else has to act: an outlined diamond, muted.
+    color: node-others-text
+  node-status-others-retrying:
+    # Waiting on others, and the last look failed and will be retried: the
+    # diamond in the warning color.
+    color: node-retrying-text
+  node-status-others-overdue:
+    # Waiting on others, and the next look is well past due with nothing
+    # observed since (the thing that should be looking is not): the diamond
+    # in the failure color.
+    color: node-failed-text
+  # The chat decorator sits at the trailing edge of a row, and only when
+  # there is something to show; it takes no column.
+  node-chat-working:
+    # A spinner while the chat agent works: the one animated element.
+    color: node-chat-text
+  node-chat-new:
+    # A small dot once the chat finished or waits on the user and the row has
+    # not been seen since. Selecting the row clears it.
+    color: node-chat-text
+  node-rollup:
+    # What a collapsed branch holds, in words at the row's trailing edge:
+    # "2 on you" (node-needs-you-text) or "1 failed" (node-failed-text).
+    color: node-needs-you-text
+  node-summary-strip:
+    # The strip above the tree: "3 on you · 1 failed · 5 on others · 2
+    # running". Each count is a filter button (button-ghost, toggled); failures
+    # are drawn in node-failed-text apart from requests.
+    color: text-muted
   node-status-pending-changes:
     # The status icon (circle dot) of a tree row whose node has incoming
     # changes it has not been checked against: rare, so it must stand out
     # from every other row. Shown only when no other status icon is.
     color: incoming-text
-  node-status-running:
-    # The status icon of a tree row whose node the lifecycle processor is
-    # running (play icon) or only the chat panel is (square icon; the
-    # processor wins when both). Both go when the run stops.
-    color: node-running-text
-  node-status-finished:
-    # The status icon of a tree row whose run stopped since the user last
-    # selected it: orange, the icon (play or square) ringed in a circle.
-    # Temporary: selecting the row, or Alt+Q landing on it, clears it. Wins
-    # over running.
-    color: node-finished-text
-  node-status-needs-you:
-    # The alert icon of a tree row waiting on the user (replaces the "Needs
-    # you" chip). Wins over running.
-    color: node-needs-you-text
   node-ticket-linked-copy:
     # The ticket id of a tree row copied out of a generator that still
     # receives its source item's updates (the title keeps its own color).
@@ -559,6 +584,10 @@ tokens:
     # processor is running, a soft coral for one waiting on the user.
     node-running-text: "#a8c060"
     node-chat-text: "#60a5fa"
+    # Waiting on others (and a deferral): a cool gray.
+    node-others-text: "#94a3b8"
+    node-failed-text: "#f87171"
+    node-retrying-text: "#fbbf24"
     node-finished-text: "#fb923c"
     node-needs-you-text: "#f0805a"
     notice-fill: "#ffff00"
