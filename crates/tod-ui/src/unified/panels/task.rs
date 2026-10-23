@@ -935,7 +935,9 @@ impl TaskPanel {
         let node = self.node_id;
         let fleet = self.fleet.clone();
         let root = fleet.paths().root().to_path_buf();
-        let in_cloud = self.runner.cloud.is_some();
+        // A lost sandbox has no supervisor to wake.
+        let in_cloud = self.runner.cloud.as_ref().is_some_and(|cloud| cloud.lost_at.is_none());
+        let sandbox_lost = self.runner.cloud.as_ref().is_some_and(|cloud| cloud.lost_at.is_some());
         self.runner.cloud_note = Some("Checking GitHub…".to_string());
         self.runner.cloud_failed = false;
         cx.spawn(async move |this, cx| {
@@ -965,6 +967,10 @@ impl TaskPanel {
                     Ok((GithubCheck::Clear, Some(Err(err)))) => {
                         (format!("Checked GitHub: nothing left to wait for, but waking the cloud node failed: {err:#}"), true)
                     }
+                    Ok((GithubCheck::Clear, None)) if sandbox_lost => (
+                        "Checked GitHub: nothing left to wait for. Run in the cloud to go on.".to_string(),
+                        false,
+                    ),
                     Ok((GithubCheck::Clear, None)) => {
                         if !this.runners.read(cx).is_running(node) {
                             let _ = this.runners.update(cx, |r, cx| r.start(node, false, cx));
