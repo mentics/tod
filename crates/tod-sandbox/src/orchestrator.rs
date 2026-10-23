@@ -145,7 +145,6 @@ pub fn provision(bx: &Blaxel, spec: &Spec, progress: &mut dyn FnMut(&str)) -> Re
         Plan::Create => {
             // A move that stopped after the old sandbox was deleted.
             if spec.move_data
-                && spec.volume.is_some()
                 && let Some(path) = spec.backup.filter(|p| p.is_file())
             {
                 progress(&format!("restoring {DATA_DIR} from {}…", path.display()));
