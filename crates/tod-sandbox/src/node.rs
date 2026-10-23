@@ -584,6 +584,12 @@ impl GitIdentity {
 /// The fetch prunes: a branch deleted on the remote (its pull request merged)
 /// would otherwise leave a stale `origin/<branch>` here, and checking it out
 /// asks the remote for a commit it no longer offers ("not our ref").
+///
+/// It never recurses into submodules: the first fetch in a fork brings in
+/// every branch, and git would then fetch, in each (blobless) submodule, the
+/// commits those old branches point at, some of which the submodule's remote
+/// no longer has ("not our ref"). The checkout does not need them: the
+/// submodules are the image's, as they are.
 pub fn checkout_script(repo_url: &str, branch: &str, identity: &GitIdentity, allow_clone: bool) -> String {
     let (repo, br) = (shell_quote(repo_url), shell_quote(branch));
     let (clone_dir, forked_dir) = (shell_quote(WORKSPACE_DIR), shell_quote(FORKED_WORKSPACE_DIR));
@@ -596,8 +602,8 @@ pub fn checkout_script(repo_url: &str, branch: &str, identity: &GitIdentity, all
     format!(
         "set -e\n\
          if [ -n \"$SSL_CERT_FILE\" ]; then git config --system http.sslCAInfo \"$SSL_CERT_FILE\"; fi\n\
-         if [ -d {clone_dir}/.git ]; then dir={clone_dir}; git -C \"$dir\" fetch --quiet --prune origin; \
-         elif [ -d {forked_dir}/.git ]; then dir={forked_dir}; git -C \"$dir\" fetch --quiet --prune origin; \
+         if [ -d {clone_dir}/.git ]; then dir={clone_dir}; git -C \"$dir\" fetch --quiet --prune --no-recurse-submodules origin; \
+         elif [ -d {forked_dir}/.git ]; then dir={forked_dir}; git -C \"$dir\" fetch --quiet --prune --no-recurse-submodules origin; \
          else {missing}; fi\n\
          cd \"$dir\"\n\
          git config user.name {name}\n\
@@ -1266,8 +1272,19 @@ mod tests {
     fn the_fetch_prunes_so_a_deleted_branch_is_not_checked_out_stale() {
         let me = GitIdentity::fallback();
         let s = checkout_script("https://github.com/o/r.git", "feat/x", &me, true);
-        assert_eq!(s.matches("fetch --quiet --prune origin").count(), 2, "{s}");
+        assert_eq!(s.matches("fetch --quiet --prune --no-recurse-submodules origin").count(), 2, "{s}");
         assert!(!s.contains("fetch --quiet origin"), "{s}");
+    }
+
+    #[test]
+    fn the_fetch_never_recurses_into_submodules() {
+        // A golden's blobless submodules cannot supply the commits that old
+        // superproject branches point at; recursing failed every first checkout.
+        let me = GitIdentity::fallback();
+        for allow_clone in [true, false] {
+            let s = checkout_script("https://github.com/o/r.git", "feat/x", &me, allow_clone);
+            assert_eq!(s.matches("fetch ").count(), s.matches("--no-recurse-submodules").count(), "{s}");
+        }
     }
 
     #[test]
@@ -1276,7 +1293,7 @@ mod tests {
         let s = checkout_script("https://github.com/o/r.git", "feat/x", &me, false);
         assert!(!s.contains("git clone"), "{s}");
         // The golden's own checkout is fetched and used where the clone would be.
-        assert!(s.contains("elif [ -d /workspace/.git ]; then dir=/workspace; git -C \"$dir\" fetch --quiet --prune origin"), "{s}");
+        assert!(s.contains("elif [ -d /workspace/.git ]; then dir=/workspace; git -C \"$dir\" fetch --quiet --prune --no-recurse-submodules origin"), "{s}");
         // With neither, it fails loudly instead.
         assert!(s.contains("has no repository\" >&2; exit 1"), "{s}");
         assert!(checkout_script("https://github.com/o/r.git", "feat/x", &me, true).contains("git clone"));
