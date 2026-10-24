@@ -23,6 +23,7 @@ pub mod attention;
 pub mod autopilot;
 pub mod cloud_notify;
 pub mod cloud_sync;
+pub mod db_broker;
 pub mod defer;
 pub mod codebase_rules;
 pub mod context_recipes;

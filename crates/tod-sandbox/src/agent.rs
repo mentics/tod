@@ -89,7 +89,7 @@ pub async fn run(sandbox_url: &str, token: &str, opts: BridgeOptions) -> Result<
                     let mut ready = Some(ready_tx);
                     // Reconnect while attached: the relay may restart under us.
                     loop {
-                        let _ = crate::tunnel::run(&sandbox_url, &token, port, &forwards, ready.take()).await;
+                        let _ = crate::tunnel::run(&sandbox_url, &token, port, &forwards, ready.take(), None).await;
                         tokio::time::sleep(Duration::from_secs(1)).await;
                     }
                 })

@@ -10,5 +10,8 @@ async fn main() -> anyhow::Result<()> {
     let mut args = std::env::args().skip(1);
     let url = args.next().expect("relay base URL");
     let forwards = args.map(|a| Forward::parse(&a)).collect::<anyhow::Result<Vec<_>>>()?;
-    tod_sandbox::tunnel::run(&url, "unused", 1, &forwards, None).await
+    // The relay's token, for a real sandbox; a local relay ignores it.
+    let token = std::env::var("TOD_RELAY_TOKEN").unwrap_or_else(|_| "unused".into());
+    tod_sandbox::relay::init_tls();
+    tod_sandbox::tunnel::run(&url, &token, 1, &forwards, None, None).await
 }

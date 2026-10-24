@@ -116,6 +116,7 @@ pub fn run(data_root: &Path) -> Result<bool> {
     // notifications. One process holds them, whoever has the app open.
     tod_core::cloud_sync::sync_on_start(shared.store.clone());
     tod_core::cloud_notify::start(shared.store.clone());
+    tod_core::db_broker::start(shared.store.clone());
     for stream in listener.incoming() {
         if shared.quit.load(Ordering::SeqCst) {
             break;

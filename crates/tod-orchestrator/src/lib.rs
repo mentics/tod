@@ -23,10 +23,14 @@
 //! - `POST /users/<u>/nodes/<n>/problems`, `POST /users/<u>/problems/pull` —
 //!   failures of the cloud's executables on their way to the app's log panel
 //!   (see [`problems`]).
+//! - `POST /users/<u>/broker/request`, `GET .../broker/next`,
+//!   `POST .../broker/reply/<id>` — a sandbox asking the user's own machine
+//!   for something only it can do (see [`broker`]).
 //! - `POST /webhooks/github`, `POST /webhooks/linear` — no user: signed, and
 //!   routed to nodes by branch or open waits (see [`webhooks`]).
 
 pub mod answers;
+pub mod broker;
 pub mod cli;
 pub mod flags;
 pub mod github_gate;
@@ -77,6 +81,7 @@ pub struct Server {
     wakes: Arc<wakes::Wakes>,
     notifier: Arc<notify::Notifier>,
     webhook_secrets: webhooks::Secrets,
+    broker: broker::Broker,
 }
 
 impl Server {
@@ -98,7 +103,7 @@ impl Server {
         wakes.set_gate(Box::new(github_gate::GithubGate::new(users.clone())));
         let notifier = notify::Notifier::start(Box::new(notify::StoreProbe(users.clone())), sink);
         let webhook_secrets = webhooks::Secrets::load(&config.base)?;
-        Ok(Arc::new(Self { config, users, wakes, notifier, webhook_secrets }))
+        Ok(Arc::new(Self { config, users, wakes, notifier, webhook_secrets, broker: broker::Broker::default() }))
     }
 
     pub fn wakes(&self) -> &Arc<wakes::Wakes> {
@@ -219,6 +224,9 @@ impl Server {
                             Err(err) => Response::text(500, format!("{err:#}")),
                         }
                     }
+                    ("POST", ["broker", "request"]) => self.broker.request(&user, request),
+                    ("GET", ["broker", "next"]) => self.broker.next(&user, request),
+                    ("POST", ["broker", "reply", id]) => self.broker.reply(&user, id, &request.body),
                     ("GET", ["notify"]) => self.notify_topics(&user),
                     ("GET" | "PUT", ["github-routes"]) => self.github_routes(&user, request),
                     ("GET", ["snapshot"]) => match self.users.get(&user) {

@@ -55,9 +55,12 @@ status <name>            Whether a sandbox is running or in standby, and its
 exec <name> [--keep-awake] [--cwd DIR] -- <command...>
                          Run a command in the sandbox.
 shell <name> [--cwd DIR] [--park SECS] [--run CMD] [--cli-relay]
-      [--cli-relay-file FILE] [--env NAME]...
+      [--cli-relay-file FILE] [--forward [PORT=]HOST:PORT]... [--env NAME]...
                          Interactive shell; parks when idle so the sandbox sleeps.
                          --park defaults to Settings, Advanced (0 never parks).
+                         --forward: with --cli-relay, also forward PORT in the
+                         sandbox to HOST:PORT from here (`forwards` in
+                         sandboxes.toml are always carried).
                          --run runs CMD first; the shell stays after it.
 agent <name> --name AGENT [--cwd DIR] [--idle SECS] [--cli-relay] [--env NAME]...
       -- <command...>    A line-oriented (ACP) agent in the sandbox over this
@@ -622,11 +625,22 @@ fn cli_relay_env(env: &mut HashMap<String, String>, from: Option<&Path>) -> Resu
 
 /// The account's port forwards, carried wherever the tunnel is
 /// (`forwards` in `sandboxes.toml`'s account; `doc/cloud-sandboxes/port-forwarding.md`).
-fn configured_forwards(ctx: &Ctx, carry: bool) -> Result<Vec<tod_sandbox::config::Forward>> {
+/// `--forward [PORT=]HOST:PORT` (repeatable) adds to them for this run.
+fn configured_forwards(ctx: &Ctx, args: &mut Args, carry: bool) -> Result<Vec<tod_sandbox::config::Forward>> {
+    let mut extra = Vec::new();
+    while let Some(spec) = args.opt("--forward") {
+        extra.push(tod_sandbox::config::Forward::parse(&spec)?);
+    }
     if !carry {
+        anyhow::ensure!(extra.is_empty(), "--forward needs --cli-relay: forwards ride on its tunnel");
         return Ok(Vec::new());
     }
-    config::Config::load(&ctx.root.join(config::FILE_NAME))?.forwards()
+    let mut all = config::Config::load(&ctx.root.join(config::FILE_NAME))?.forwards()?;
+    for forward in extra {
+        all.retain(|f| f.port != forward.port);
+        all.push(forward);
+    }
+    Ok(all)
 }
 
 /// `cmd` with the sandbox's `tod-cli` first on its `PATH`.
@@ -648,10 +662,10 @@ fn shell(ctx: &mut Ctx, mut args: Args) -> Result<i32> {
     let carry = args.flag("--cli-relay") || relay_file.is_some();
     let run = args.opt("--run");
     let mut env = env_flags(&mut args)?;
+    let forwards = configured_forwards(ctx, &mut args, carry)?;
     args.done()?;
     terminal::require_terminal()?;
     let tunnel_port = carry.then(|| cli_relay_env(&mut env, relay_file.as_deref())).transpose()?;
-    let forwards = configured_forwards(ctx, carry)?;
     // Not a login shell when carrying `tod-cli`: a login profile resets
     // `PATH`, and with it `tod-cli`. The shell stays after `--run` exits.
     // Use the sandbox user's own configured shell (`/etc/passwd`), falling
@@ -698,12 +712,12 @@ fn agent(ctx: &mut Ctx, mut args: Args, remote: Vec<String>) -> Result<i32> {
         .unwrap_or_else(|| SandboxIdleSettings::load(&ctx.root).agent_idle_secs);
     let carry = args.flag("--cli-relay");
     let mut env = env_flags(&mut args)?;
+    let forwards = configured_forwards(ctx, &mut args, carry)?;
     args.done()?;
     if remote.is_empty() {
         bail!("nothing to run: tod-sandbox agent {name} --name AGENT -- <command...>");
     }
     let tunnel_port = carry.then(|| cli_relay_env(&mut env, None)).transpose()?;
-    let forwards = configured_forwards(ctx, carry)?;
     let program = remote.iter().map(|a| relay::shell_quote(a)).collect::<Vec<_>>().join(" ");
     let cmd = if carry { with_tod_cli(&format!("exec {program}")) } else { format!("exec {program}") };
     let awake_file = ctx

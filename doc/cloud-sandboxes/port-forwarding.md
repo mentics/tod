@@ -57,30 +57,31 @@ the app attaches to.
 
 ## When it works
 
-A forward is carried by the same tunnel as `tod-cli`: **only while the app
-has the sandbox attached** (an agent turn, an attached terminal). It does
-not work for autonomous nodes running with the app closed (the orchestrator
-design in `autonomous-nodes.md`), which have no path to this machine; a
-connection then fails with "connection refused" in the sandbox, as any
-closed port does. Listeners the relay opened stay open after the app
+The `forwards` of `sandboxes.toml` are carried by the same tunnel as
+`tod-cli`: **only while a local `tod-sandbox agent` or terminal has the
+sandbox attached**. A node running in the cloud has no such process; for it,
+the daemon opens a forward on demand, tied to a database login. See
+[database-access.md](database-access.md). A connection with no tunnel fails
+with "connection refused" in the sandbox, as any closed port does. Listeners the relay opened stay open after the app
 detaches; connections to them are closed immediately while no client is
 attached.
 
 ## Using it with IAM database authentication
 
-This is only a TCP pipe, so IAM auth works if the token is made correctly.
+This is only a TCP pipe, so IAM auth works if the token is made correctly,
+and [database-access.md](database-access.md) does that for a node: it signs
+the token on this machine and maps the database's name to loopback in the
+sandbox. Verified against RDS Postgres. What matters, if you do it by hand:
 
-- Token generation is local signing of the host and port plus the IAM
-  credentials; it does not contact the database. The sandbox's credentials
-  (reaching the cloud provider over the internet) can do it.
-- The token is for the **real** host and port. Give the client the real
-  host name for the token and for TLS verification, and the loopback
-  address only for the connection. With libpq:
-  `host=db.internal hostaddr=127.0.0.1 port=5432 sslmode=verify-full`.
-  Using the same port number in the sandbox as the database's keeps the token
-  valid for databases that sign the port.
-- Only that one connection crosses the VPN. Everything else (the token,
-  other cloud APIs) goes over the internet from the sandbox as before.
+- Token generation is local signing; it contacts nothing. Sign it for the
+  server's **own name** (for RDS, the instance endpoint): a token signed for a
+  CNAME alias is refused, and the TLS certificate is made for the endpoint
+  name too.
+- The client connects to that same name, which must resolve to `127.0.0.1`
+  in the sandbox (`/etc/hosts`), at the forwarded port. The port need not
+  match the database's: the token is signed for the real `host:port`, not
+  the client's.
+- Only that one connection crosses to the database from this machine.
 
 ## Out of scope
 

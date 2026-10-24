@@ -291,7 +291,7 @@ fn run_with_secrets(inv: &Invocation, store: &CredentialStore, args: &[String]) 
 /// Copy `from` to `to` a line at a time, masking every secret. Line by line so
 /// a secret is never split across two reads; output is flushed per line so
 /// progress still shows as it happens.
-fn copy_masked(from: impl Read, mut to: impl Write, secrets: &[Vec<u8>]) {
+pub(crate) fn copy_masked(from: impl Read, mut to: impl Write, secrets: &[Vec<u8>]) {
     let mut reader = BufReader::new(from);
     let mut line = Vec::new();
     loop {

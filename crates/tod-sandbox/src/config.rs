@@ -117,11 +117,21 @@ impl Forward {
 }
 
 impl Config {
-    /// The configured forwards. A malformed or repeated one is an error, not skipped.
+    /// The configured databases; an invalid or repeated one is an error.
+    pub fn databases(&self) -> Result<Vec<crate::database::Database>> {
+        let mut seen = std::collections::HashSet::new();
+        for db in &self.databases {
+            db.validate()?;
+            anyhow::ensure!(seen.insert(db.name.as_str()), "database {} is declared twice", db.name);
+        }
+        Ok(self.databases.clone())
+    }
+
+    /// The configured `forwards` (a database's own forward is opened by the
+    /// daemon when a node asks for it, not carried always). A malformed or repeated one is an error, not skipped.
     pub fn forwards(&self) -> Result<Vec<Forward>> {
-        let Some(account) = &self.blaxel else { return Ok(Vec::new()) };
         let mut out: Vec<Forward> = Vec::new();
-        for spec in &account.forwards {
+        for spec in self.blaxel.iter().flat_map(|a| a.forwards.iter()) {
             let forward = Forward::parse(spec)?;
             anyhow::ensure!(out.iter().all(|f| f.port != forward.port), "forwards: sandbox port {} is listed twice", forward.port);
             out.push(forward);
@@ -244,6 +254,9 @@ pub struct Config {
     pub scheduler: SchedulerKind,
     #[serde(default, rename = "sandbox")]
     pub sandboxes: Vec<Sandbox>,
+    /// Databases sandboxes log in to through this machine (`[[database]]`).
+    #[serde(default, rename = "database", skip_serializing_if = "Vec::is_empty")]
+    pub databases: Vec<crate::database::Database>,
 }
 
 impl Config {

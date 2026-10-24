@@ -409,6 +409,34 @@ impl HttpOrchestrator {
         Ok(())
     }
 
+    /// The next request a node's sandbox has asked this machine to answer
+    /// (`GET /users/<u>/broker/next`), waiting up to `wait_secs` for one:
+    /// `(id, node, request)`. Holding this open is also how the orchestrator
+    /// knows this machine is there to answer.
+    pub fn broker_next(&self, user: &str, wait_secs: u64) -> Result<Option<(u64, String, serde_json::Value)>> {
+        let rest = format!("broker/next?wait={wait_secs}");
+        let v = Self::finish(self.auth(self.agent.get(&self.url(user, &rest))).call().context("orchestrator broker")?, "broker")?;
+        let Some(id) = v["id"].as_u64() else { return Ok(None) };
+        let node = v["node"].as_str().context("orchestrator broker: no node")?.to_string();
+        Ok(Some((id, node, v["request"].clone())))
+    }
+
+    /// Answers broker request `id` (`POST /users/<u>/broker/reply/<id>`).
+    pub fn broker_reply(&self, user: &str, id: u64, reply: &serde_json::Value) -> Result<()> {
+        let rest = format!("broker/reply/{id}");
+        let resp = self.auth(self.agent.post(&self.url(user, &rest))).send_json(reply).context("orchestrator broker reply")?;
+        Self::finish_text(resp, "broker reply")
+    }
+
+    fn finish_text(mut resp: ureq::http::Response<ureq::Body>, what: &str) -> Result<()> {
+        let status = resp.status();
+        if !status.is_success() {
+            let body: String = resp.body_mut().read_to_string().unwrap_or_default().chars().take(400).collect();
+            bail!("orchestrator {what}: {status}: {body}");
+        }
+        Ok(())
+    }
+
     fn url(&self, user: &str, rest: &str) -> String {
         format!("{}/users/{user}/{rest}", self.base)
     }

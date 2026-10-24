@@ -24,12 +24,15 @@ use tokio_tungstenite::tungstenite::Message;
 /// `forwards` are also asked of the relay: each opens a port in the sandbox
 /// whose connections are dialled to the forward's target from here. Only a
 /// target listed here is ever dialled, whatever the relay sends.
+/// `forwards_ready` hears once the relay is listening on every one, or why
+/// one was refused.
 pub async fn run(
     sandbox_url: &str,
     token: &str,
     local_port: u16,
     forwards: &[Forward],
     ready: Option<tokio::sync::oneshot::Sender<()>>,
+    forwards_ready: Option<tokio::sync::oneshot::Sender<std::result::Result<(), String>>>,
 ) -> Result<()> {
     let ws = relay::connect(&relay::ws_url(sandbox_url, "/tunnel"), token).await?;
     let (mut sink, mut incoming) = ws.split();
@@ -42,6 +45,12 @@ pub async fn run(
     }
     let by_port: HashMap<u16, String> = forwards.iter().map(|f| (f.port, f.target.clone())).collect();
     // A relay that predates forwards ignores the request, silently.
+    let mut forwards_ready = forwards_ready;
+    if waiting.is_empty() {
+        if let Some(done) = forwards_ready.take() {
+            let _ = done.send(Ok(()));
+        }
+    }
     let mut answer_by = (!waiting.is_empty()).then(|| tokio::time::Instant::now() + std::time::Duration::from_secs(10));
     if let Some(ready) = ready {
         let _ = ready.send(());
@@ -62,9 +71,13 @@ pub async fn run(
                 Ok(msg) => msg,
                 Err(_) => {
                     answer_by = None;
-                    report(format!(
+                    let why = format!(
                         "port forwards {waiting:?} were not answered: the sandbox's relay is too old to forward ports (rebuild its image)"
-                    ));
+                    );
+                    if let Some(done) = forwards_ready.take() {
+                        let _ = done.send(Err(why.clone()));
+                    }
+                    report(why);
                     continue;
                 }
             },
@@ -96,10 +109,16 @@ pub async fn run(
                 waiting.retain(|p| Some(*p) != t[1..].parse().ok());
                 if waiting.is_empty() {
                     answer_by = None;
+                    if let Some(done) = forwards_ready.take() {
+                        let _ = done.send(Ok(()));
+                    }
                 }
             }
             Message::Text(t) if t.starts_with('e') => {
                 report(format!("port forward refused by the sandbox: {}", &t[1..]));
+                if let Some(done) = forwards_ready.take() {
+                    let _ = done.send(Err(format!("port forward refused by the sandbox: {}", &t[1..])));
+                }
                 waiting.retain(|p| Some(*p) != t[1..].split(':').next().and_then(|p| p.parse().ok()));
                 if waiting.is_empty() {
                     answer_by = None;

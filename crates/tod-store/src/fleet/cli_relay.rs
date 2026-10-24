@@ -120,7 +120,7 @@ pub const LOCAL_CLI_DEFAULT: &str = tod_sandbox::node::LOCAL_CLI_PATH;
 pub const SUPERVISOR_STATE_ROOT: &str = tod_sandbox::node::SUPERVISOR_STATE_ROOT;
 /// The nouns [`HTTP_SHIM_SCRIPT`] runs in the sandbox, not on the
 /// orchestrator.
-pub const LOCAL_NOUNS: &[&str] = &["pr", "secrets"];
+pub const LOCAL_NOUNS: &[&str] = &["pr", "secrets", "db"];
 
 /// The `tod-cli` an autonomous node's sandbox runs: [`SHIM_SCRIPT`]'s request
 /// body (with an empty token) sent with `curl` to the orchestrator, retried
@@ -161,7 +161,7 @@ for arg in "$@"; do
   esac
 done
 case "$noun" in
-  pr|secrets)
+  pr|secrets|db)
     if [ ! -x "$local_cli" ]; then
       echo "tod-cli: $noun runs in this sandbox, but $local_cli is not installed (run the node in the cloud again)" >&2
       exit 70

@@ -22,5 +22,7 @@ pub mod orchestrator;
 pub mod provision;
 pub mod relay;
 pub mod terminal;
+pub mod database;
+pub mod hold;
 pub mod tunnel;
 pub mod watchdog;

@@ -166,7 +166,7 @@ backoff; a command that cannot reach the orchestrator fails like any other.
 This replaces, in the cloud, the `cli_relay` route back to the app (a TCP
 listener reached through the relay's `/tunnel`). The app is not involved.
 
-**Except `pr` and `secrets`, which run in the sandbox.** GitHub is reached
+**Except `pr`, `secrets` and `db`, which run in the sandbox.** (`db` asks the user's own machine for a database login through the orchestrator's broker; see [database-access.md](database-access.md).) GitHub is reached
 through the sandbox's proxy, which adds the user's token (see Credentials);
 the orchestrator holds no GitHub token and could not. And `secrets run` must
 start its command where the agent is. So the shim
