@@ -47,7 +47,19 @@ allowlist and the VPN apply as they do for the user.
 
 ### Configuration, on the user's machine
 
-`[[database]]` in `sandboxes.toml`:
+**Settings → Databases** in the app (Add a database, Test, Save), or
+`tod-sandbox database add|list|remove|test` from a terminal, both writing
+`[[database]]` in `sandboxes.toml`; nobody has to edit the file. `Test` (and
+`add --check`) signs a login with the profile and connects to the host from
+this machine, and sends nothing to the database, so a signed-out AWS session,
+a missing VPN, or a wrong host shows before an agent hits it.
+
+```
+tod-sandbox database add prod --host <instance endpoint> --user joel@cofactr.com \
+    --dbname monolith --region us-gov-east-1 --profile cofactr-gov --check
+```
+
+The file's form:
 
 ```toml
 [[database]]
@@ -95,6 +107,16 @@ For each request it:
 `op: list` returns the declared names (never hosts or users' secrets).
 `op: touch` only keeps the forward open; `db run` sends one a minute while its
 command runs.
+
+### What the agent is told
+
+Only a node with a database set up hears of `tod-cli db`. Each time the app
+wakes a cloud node it writes the **names** (database name, user, and the name
+of the database; never a host) to `databases.json` in the node supervisor's
+state directory (`tod_core::databases_context`). Agent contexts built there
+list them in a `Databases` block and add the `cli/db` how-to only when the
+list is not empty. A node with none, and any run on this machine, is not told
+`db` exists.
 
 ### In the sandbox (`tod-cli db`)
 
@@ -157,6 +179,6 @@ user's own (allowlisted) address.
 
 Credentials for anything but RDS IAM login (another database, an AWS API); a
 per-node allowlist of which databases a node may use; approval prompts per
-login; a UI for `[[database]]`; databases for a node that runs on this
+login; databases for a node that runs on this
 machine with its files in a sandbox (use the database directly there); a
 Windows sandbox.

@@ -110,6 +110,28 @@ impl Database {
         Ok(token)
     }
 
+    /// Whether this declaration works from this machine: the AWS profile can
+    /// sign a login now, and the database accepts a TCP connection from here.
+    /// It logs in to nothing and sends no token. Says what it found.
+    pub fn check(&self) -> Result<String> {
+        use std::net::{TcpStream, ToSocketAddrs};
+        self.validate()?;
+        self.mint_token()?;
+        let target = format!("{}:{}", self.host, self.port);
+        let addr = target
+            .to_socket_addrs()
+            .with_context(|| format!("look up {target}"))?
+            .next()
+            .with_context(|| format!("{target} has no address"))?;
+        TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(8))
+            .with_context(|| format!("connect to {target} ({addr}) from this machine: is the VPN up, and is this machine allowlisted?"))?;
+        Ok(format!(
+            "ok: {} can sign a login as {}, and {target} accepts connections from this machine",
+            self.profile.as_deref().map_or("the default AWS profile".to_string(), |p| format!("profile {p}")),
+            self.user
+        ))
+    }
+
     /// The reply a sandbox gets to a login request.
     pub fn login(&self) -> Result<Login> {
         Ok(Login {

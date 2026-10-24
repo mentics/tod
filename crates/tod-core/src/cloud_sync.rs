@@ -1428,7 +1428,12 @@ fn push_supervisor_settings(bx: &tod_sandbox::blaxel::Blaxel, url: &str, root: &
         tod_store::paths::SETTINGS_FILE
     );
     bx.upload(url, &path, supervisor_settings(root)?.as_bytes(), "0644")
-        .with_context(|| format!("send the settings to the supervisor ({path})"))
+        .with_context(|| format!("send the settings to the supervisor ({path})"))?;
+    // Which databases the user set up for it (names only), so its agent is
+    // told about `tod-cli db` exactly when it has something to use.
+    let databases = format!("{}/{node_id}/{}", tod_store::fleet::cli_relay::SUPERVISOR_STATE_ROOT, crate::databases_context::FILE);
+    bx.upload(url, &databases, crate::databases_context::snapshot(root)?.as_bytes(), "0644")
+        .with_context(|| format!("send the declared databases to the supervisor ({databases})"))
 }
 
 /// Wakes `node_id`'s supervisor now, instead of at its next scheduled check:

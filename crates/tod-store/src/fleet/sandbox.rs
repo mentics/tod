@@ -52,6 +52,32 @@ impl Sandboxes {
         self.config.save(&self.config_path)
     }
 
+    /// The databases nodes may log in to through this machine, as declared.
+    pub fn databases(&self) -> Result<Vec<tod_sandbox::database::Database>> {
+        self.config.databases()
+    }
+
+    /// Declares `database` (replacing the one of its name) and saves.
+    pub fn set_database(&mut self, database: tod_sandbox::database::Database) -> Result<()> {
+        self.config.upsert_database(database)?;
+        self.save()
+    }
+
+    /// Replaces the declared databases and saves; nothing changes if one is invalid.
+    pub fn replace_databases(&mut self, databases: Vec<tod_sandbox::database::Database>) -> Result<()> {
+        self.config.set_databases(databases)?;
+        self.save()
+    }
+
+    /// Forgets the database of that name and saves; whether there was one.
+    pub fn remove_database(&mut self, name: &str) -> Result<bool> {
+        let removed = self.config.remove_database(name);
+        if removed {
+            self.save()?;
+        }
+        Ok(removed)
+    }
+
     /// Deletes the sandbox in Blaxel and forgets it here ([`Self::forget`]).
     pub fn delete(&mut self, bx: &Blaxel, name: &str) -> Result<()> {
         bx.delete(name)?;

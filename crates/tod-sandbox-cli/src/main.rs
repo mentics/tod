@@ -50,6 +50,15 @@ bake <base-image> [--name IMAGE-NAME] [--agents] [--repo URL[=DIR]]...
                          repositories cloned into it (https, no credentials;
                          DIR defaults to /root/<name>).
 list                     Sandboxes in the workspace.
+database add <name> --host H --user U --dbname D --region R [--profile P]
+      [--port 5432] [--sandbox-port 15432] [--check]
+database list | remove <name> | test <name>
+                         The databases a node running in the cloud may log in to
+                         through this machine with `tod-cli db`: the login is
+                         signed here with the AWS profile (RDS IAM). --host is the
+                         server's own name (for RDS, the instance endpoint). --check
+                         tests it first; `test` signs a login and connects to the
+                         host from here, and sends nothing to it.
 status <name>            Whether a sandbox is running or in standby, and its
                          deployment status (does not wake it).
 exec <name> [--keep-awake] [--cwd DIR] -- <command...>
@@ -205,6 +214,7 @@ fn run() -> Result<i32> {
         "create" => create(&mut ctx, args),
         "fork" => fork(&mut ctx, args),
         "golden" => golden(&mut ctx, args),
+        "database" => database(&mut ctx, args),
         "ensure" => {
             let install = args.flag("--install");
             let name = args.positional("sandbox name")?;
@@ -369,6 +379,79 @@ fn create(ctx: &mut Ctx, mut args: Args) -> Result<i32> {
     ctx.create(&name, &NewSandboxSource::Image(image), agents, true, &mut |m| eprintln!("{m}"))?;
     println!("{name}: ready. Open it with `tod-sandbox zed {name}` or `tod-sandbox shell {name}`.");
     Ok(0)
+}
+
+/// `database add|list|remove|test`: what a cloud node may log in to through
+/// this machine (`doc/cloud-sandboxes/database-access.md`).
+fn database(ctx: &mut Ctx, mut args: Args) -> Result<i32> {
+    use tod_sandbox::database::{DEFAULT_SANDBOX_PORT, Database};
+    if args.0.is_empty() {
+        bail!("usage: tod-sandbox database add|list|remove|test (see `tod-sandbox help`)");
+    }
+    let verb = args.0.remove(0);
+    match verb.as_str() {
+        "list" => {
+            args.done()?;
+            let dbs = ctx.databases()?;
+            if dbs.is_empty() {
+                println!("(none) add one with `tod-sandbox database add`");
+            }
+            for d in dbs {
+                let profile = d.profile.as_deref().map_or(String::new(), |p| format!(", profile {p}"));
+                println!(
+                    "{}: {}@{}:{}/{} ({}{profile}), sandbox port {}",
+                    d.name, d.user, d.host, d.port, d.dbname, d.region, d.sandbox_port
+                );
+            }
+            Ok(0)
+        }
+        "add" => {
+            let name = args.positional("database name")?;
+            let need = |args: &mut Args, flag: &str| args.opt(flag).ok_or_else(|| anyhow!("{flag} is required"));
+            let host = need(&mut args, "--host")?;
+            let user = need(&mut args, "--user")?;
+            let dbname = need(&mut args, "--dbname")?;
+            let region = need(&mut args, "--region")?;
+            let profile = args.opt("--profile");
+            let port = args.opt("--port").map(|p| p.parse()).transpose().context("--port is a number")?.unwrap_or(5432);
+            let sandbox_port = args
+                .opt("--sandbox-port")
+                .map(|p| p.parse())
+                .transpose()
+                .context("--sandbox-port is a number")?
+                .unwrap_or(DEFAULT_SANDBOX_PORT);
+            let check = args.flag("--check");
+            args.done()?;
+            let database = Database { name: name.clone(), host, port, user, dbname, region, profile, sandbox_port };
+            if check {
+                println!("{}", database.check()?);
+            }
+            ctx.set_database(database)?;
+            println!("{name}: saved. Nodes running in the cloud can now use it with `tod-cli db`.");
+            Ok(0)
+        }
+        "remove" => {
+            let name = args.positional("database name")?;
+            args.done()?;
+            if !ctx.remove_database(&name)? {
+                bail!("no database named {name}");
+            }
+            println!("{name}: removed");
+            Ok(0)
+        }
+        "test" => {
+            let name = args.positional("database name")?;
+            args.done()?;
+            let database = ctx
+                .databases()?
+                .into_iter()
+                .find(|d| d.name == name)
+                .ok_or_else(|| anyhow!("no database named {name}"))?;
+            println!("{}", database.check()?);
+            Ok(0)
+        }
+        other => bail!("unknown database command {other:?}: add, list, remove, or test"),
+    }
 }
 
 fn golden(ctx: &mut Ctx, mut args: Args) -> Result<i32> {

@@ -127,6 +127,49 @@ impl Config {
         Ok(self.databases.clone())
     }
 
+    /// Adds `database`, or replaces the one of its name. Refuses one that
+    /// could not work, or that takes another's sandbox port.
+    pub fn upsert_database(&mut self, database: crate::database::Database) -> Result<()> {
+        database.validate()?;
+        if let Some(other) = self.databases.iter().find(|d| d.name != database.name && d.sandbox_port == database.sandbox_port) {
+            anyhow::bail!(
+                "sandbox port {} is already used by database {}: give {} another (sandbox_port)",
+                database.sandbox_port,
+                other.name,
+                database.name
+            );
+        }
+        match self.databases.iter_mut().find(|d| d.name == database.name) {
+            Some(existing) => *existing = database,
+            None => self.databases.push(database),
+        }
+        Ok(())
+    }
+
+    /// Replaces every declared database at once (what an editor saves). The
+    /// same checks as [`Self::databases`]: valid, uniquely named, and no two on
+    /// one sandbox port. Nothing changes if one fails.
+    pub fn set_databases(&mut self, databases: Vec<crate::database::Database>) -> Result<()> {
+        let mut names = std::collections::HashSet::new();
+        let mut ports: std::collections::HashMap<u16, &str> = std::collections::HashMap::new();
+        for db in &databases {
+            db.validate()?;
+            anyhow::ensure!(names.insert(db.name.as_str()), "database {} is listed twice", db.name);
+            if let Some(other) = ports.insert(db.sandbox_port, &db.name) {
+                anyhow::bail!("databases {other} and {} both use sandbox port {}", db.name, db.sandbox_port);
+            }
+        }
+        self.databases = databases;
+        Ok(())
+    }
+
+    /// Removes the database of that name; whether there was one.
+    pub fn remove_database(&mut self, name: &str) -> bool {
+        let before = self.databases.len();
+        self.databases.retain(|d| d.name != name);
+        self.databases.len() != before
+    }
+
     /// The configured `forwards` (a database's own forward is opened by the
     /// daemon when a node asks for it, not carried always). A malformed or repeated one is an error, not skipped.
     pub fn forwards(&self) -> Result<Vec<Forward>> {
@@ -397,5 +440,34 @@ claude_token_via = \"env\"
         let mut c = Config::default();
         c.blaxel = Some(Account { forwards: vec!["5432=a:1".into(), "5432=b:2".into()], ..Account::new("w") });
         assert!(c.forwards().is_err());
+    }
+
+    #[test]
+    fn databases_are_added_replaced_and_removed() {
+        use crate::database::{DEFAULT_SANDBOX_PORT, Database};
+        let db = |name: &str, port: u16| Database {
+            name: name.into(),
+            host: "h.example".into(),
+            port: 5432,
+            user: "u".into(),
+            dbname: "d".into(),
+            region: "us-east-1".into(),
+            profile: None,
+            sandbox_port: port,
+        };
+        let mut c = Config::default();
+        c.upsert_database(db("a", DEFAULT_SANDBOX_PORT)).unwrap();
+        c.upsert_database(db("a", DEFAULT_SANDBOX_PORT)).unwrap(); // replaced
+        assert_eq!(c.databases.len(), 1);
+        assert!(c.upsert_database(db("b", DEFAULT_SANDBOX_PORT)).is_err(), "port taken by a");
+        c.upsert_database(db("b", DEFAULT_SANDBOX_PORT + 1)).unwrap();
+        assert!(c.remove_database("a") && !c.remove_database("a"));
+        assert_eq!(c.databases().unwrap().len(), 1);
+        // It survives the file.
+        let dir = std::env::temp_dir().join(format!("tod-sandbox-db-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(FILE_NAME);
+        c.save(&path).unwrap();
+        assert_eq!(Config::load(&path).unwrap().databases[0].name, "b");
     }
 }

@@ -65,6 +65,14 @@ pub fn build_message_with(
         .iter()
         .position(|l| l.starts_with("surface/"))
         .unwrap_or(layers.len());
+    // `tod-cli db` is only worth an agent's attention where the user has set
+    // up a database for it: the block says which, and this says how.
+    if recipe.blocks.contains(&DynamicBlock::Databases)
+        && !crate::databases_context::declared(ctx.data_root).is_empty()
+        && !layers.contains(&"cli/db")
+    {
+        layers.insert(at, "cli/db");
+    }
     let extra: Vec<&str> = extra_cli
         .iter()
         .copied()
@@ -143,13 +151,13 @@ pub const IMPLEMENT_SESSION: ContextRecipe = ContextRecipe {
         "cli/plan",
         "cli/tests",
         "cli/secrets",
-        "cli/db",
         "cli/environment",
         "cli/decisions",
         "cli/wait",
         "surface/implement",
     ],
     blocks: &[
+        DynamicBlock::Databases,
         DynamicBlock::WorkingDirectory,
         DynamicBlock::DataRoot,
         DynamicBlock::PullRequests,
@@ -184,7 +192,6 @@ pub const VERIFY_SESSION: ContextRecipe = ContextRecipe {
         "cli/verdicts",
         "cli/tests",
         "cli/secrets",
-        "cli/db",
         "cli/environment",
         "cli/decisions",
         "cli/wait",
@@ -215,6 +222,7 @@ pub const REVIEW_SESSION: ContextRecipe = ContextRecipe {
     // The implementation blocks without the plan: a reviewer judges the change
     // against the obligations, not against how it was broken into steps.
     blocks: &[
+        DynamicBlock::Databases,
         DynamicBlock::WorkingDirectory,
         DynamicBlock::DataRoot,
         DynamicBlock::PullRequests,
@@ -271,13 +279,13 @@ pub const FIX_SESSION: ContextRecipe = ContextRecipe {
         "cli/review",
         "cli/tests",
         "cli/secrets",
-        "cli/db",
         "cli/environment",
         "cli/decisions",
         "cli/wait",
         "surface/fix",
     ],
     blocks: &[
+        DynamicBlock::Databases,
         DynamicBlock::WorkingDirectory,
         DynamicBlock::DataRoot,
         DynamicBlock::PullRequests,
@@ -424,11 +432,11 @@ pub const CONVERSATION: ContextRecipe = ContextRecipe {
         "cli/node",
         "cli/changeset",
         "cli/secrets",
-        "cli/db",
         "cli/environment",
         "surface/conversation",
     ],
     blocks: &[
+        DynamicBlock::Databases,
         DynamicBlock::DataRoot,
         DynamicBlock::PullRequests,
         DynamicBlock::Focus,
@@ -454,11 +462,11 @@ pub const CHAT: ContextRecipe = ContextRecipe {
         "cli/node",
         "cli/changeset",
         "cli/secrets",
-        "cli/db",
         "cli/environment",
         "surface/chat",
     ],
     blocks: &[
+        DynamicBlock::Databases,
         DynamicBlock::DataRoot,
         DynamicBlock::PullRequests,
         DynamicBlock::Focus,
@@ -790,5 +798,29 @@ mod tests {
         }
         assert!(VISUAL_DESIGN.blocks.contains(&DynamicBlock::VisualDesign));
         assert!(ALL_RECIPES.iter().any(|r| r.name == VISUAL_DESIGN.name));
+    }
+
+    /// `tod-cli db` is described to an agent only where the user has set up a
+    /// database for it, and the block names which.
+    #[test]
+    fn db_is_mentioned_only_when_databases_are_declared() {
+        let media = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join("tod").join("media");
+        let paths = MediaPaths::from_media_root(media).unwrap();
+        let dir = std::env::temp_dir().join(format!("tod-recipe-db-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let build = |root: &std::path::Path| {
+            let ctx = DynamicContext { data_root: Some(root), ..Default::default() };
+            build_message(&paths, &IMPLEMENT_SESSION, None, &ctx, "").unwrap()
+        };
+        let without = build(&dir);
+        assert!(!without.contains("tod-cli db") && !without.contains("## Databases"), "no databases, no mention");
+        std::fs::write(
+            dir.join(crate::databases_context::FILE),
+            r#"[{"name":"prod","dbname":"monolith","user":"u@x"}]"#,
+        )
+        .unwrap();
+        let with = build(&dir);
+        assert!(with.contains("## Databases") && with.contains("`prod`: database `monolith`"));
+        assert!(with.contains("db psql <NAME>"), "the how-to comes with it");
     }
 }

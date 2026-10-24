@@ -156,6 +156,9 @@ pub enum DynamicBlock {
     /// The skills the user chose for the phase the agent is working in
     /// (pre-rendered; see `crate::skills_context`). Omitted when none.
     ConfiguredSkills,
+    /// The databases the user has set up for this cloud node, by name
+    /// (`crate::databases_context`). Omitted when none.
+    Databases,
     /// The saved mockup's path, the working draft's path, and whether they
     /// differ. Omitted when the surface supplied no state.
     VisualDesign,
@@ -506,6 +509,10 @@ fn render_block(block: DynamicBlock, ctx: &DynamicContext<'_>, out: &mut String)
             if !ctx.skills.is_empty() {
                 out.push_str(ctx.skills);
             }
+        }
+
+        DynamicBlock::Databases => {
+            out.push_str(&crate::databases_context::render(&crate::databases_context::declared(ctx.data_root)));
         }
 
         DynamicBlock::Workspace => {
