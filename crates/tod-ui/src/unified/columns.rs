@@ -25,6 +25,10 @@ pub enum PanelKind {
     /// Everything waiting on someone else, grouped by who: the list the
     /// summary strip's "On others" button opens. About no one node.
     OnOthers,
+    /// A node's recorded journey (`panels::journey`); the id is the node's.
+    Journey(uuid::Uuid),
+    /// The user's own recent activity: the project journey. About no one node.
+    ProjectJourney,
 }
 
 impl PanelKind {
@@ -40,9 +44,10 @@ impl PanelKind {
             | PanelKind::Findings(id)
             | PanelKind::Settings(id)
             | PanelKind::Changes(id)
+            | PanelKind::Journey(id)
             | PanelKind::Watch(id) => Some(*id),
             // A transcript's id is its conversation's, not a node's.
-            PanelKind::Transcript(_) | PanelKind::OnOthers => None,
+            PanelKind::Transcript(_) | PanelKind::OnOthers | PanelKind::ProjectJourney => None,
         }
     }
 }

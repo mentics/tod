@@ -24,6 +24,17 @@ fn main() {
         println!("cargo:warning=tod: failed to copy process bundle: {err}");
     }
 
+    // Skills for working with tod (`tod-cli skills`) ship as a `skills/` sibling.
+    let skills_src = manifest_dir.join("../../assets/skills");
+    if skills_src.join("README.md").is_file() {
+        println!("cargo:rerun-if-changed={}", skills_src.display());
+        if let Err(err) = copy_dir_all(&skills_src, &target_root.join(&profile).join("skills")) {
+            println!("cargo:warning=tod: failed to copy skills bundle: {err}");
+        }
+    } else {
+        println!("cargo:warning=tod: assets/skills/README.md not found; skipping skills bundle copy");
+    }
+
     // Agent context docs ship the same way, landing as a `media/` sibling of the
     // executable so an installed build resolves them without the source tree.
     let media_src = manifest_dir.join("media");

@@ -1,4 +1,4 @@
-# Builds tod in release mode and installs it (binaries + process/media bundles)
+# Builds tod in release mode and installs it (binaries + process/media/skills bundles)
 # into a target directory, with cloud-sandbox support (tod-sandbox, Zed's ssh
 # shim, and the Linux relay that runs in each sandbox).
 #
@@ -80,7 +80,7 @@ try {
         }
     }
 
-    foreach ($dir in @("process", "media")) {
+    foreach ($dir in @("process", "media", "skills")) {
         $src = Join-Path $releaseDir $dir
         if (Test-Path $src) {
             $dst = Join-Path $TargetDir $dir

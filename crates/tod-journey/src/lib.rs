@@ -10,6 +10,7 @@ pub mod record;
 pub mod relay_code;
 pub mod retention;
 pub mod seal;
+pub mod timeline;
 pub mod writer;
 
 pub use bundle::BundleWriter;

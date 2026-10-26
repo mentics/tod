@@ -32,6 +32,10 @@ fn default_journey_milestone_states() -> Vec<String> {
     ]
 }
 
+fn default_journey_record() -> bool {
+    true
+}
+
 fn default_journey_storage_cap_mb() -> u64 {
     DEFAULT_JOURNEY_STORAGE_CAP_MB
 }
@@ -272,8 +276,13 @@ impl Default for ReviewSchedule {
 /// for review (`doc/journeys/spec.md`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JourneySettings {
+    /// Whether journeys are tracked and stored on this computer. Independent
+    /// of `send`: with this on and `send` off, journeys are kept locally
+    /// (for local analysis) and nothing leaves the machine.
+    #[serde(default = "default_journey_record")]
+    pub record: bool,
     /// Whether recorded journeys may be sealed and sent to the configured
-    /// relay. Recording itself is unconditional; this gates submission.
+    /// relay. Requires `record`; this gates submission only.
     #[serde(default)]
     pub send: bool,
     /// Whether a submitted bundle includes agent transcripts.
@@ -295,6 +304,7 @@ pub struct JourneySettings {
 impl Default for JourneySettings {
     fn default() -> Self {
         Self {
+            record: default_journey_record(),
             send: false,
             include_transcripts: false,
             relay_code: None,
@@ -308,7 +318,8 @@ impl JourneySettings {
     /// Whether a report would actually be sent: sending is on and the relay
     /// code parses. Everything that offers "Report a problem" asks this.
     pub fn can_submit(&self) -> bool {
-        self.send
+        self.record
+            && self.send
             && self
                 .relay_code
                 .as_deref()
@@ -316,6 +327,9 @@ impl JourneySettings {
     }
 
     pub fn validate(&self) -> Result<()> {
+        if self.send && !self.record {
+            bail!("journeys.send is true but journeys.record is false: nothing is stored to send");
+        }
         if self.send {
             let code = self
                 .relay_code

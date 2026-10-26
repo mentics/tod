@@ -8,6 +8,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
@@ -39,6 +40,19 @@ pub struct Recorder {
 }
 
 static RECORDER: OnceLock<Recorder> = OnceLock::new();
+static RECORDING: AtomicBool = AtomicBool::new(true);
+
+/// Turns tracking on or off for the whole process, live: while off, nothing
+/// is appended (existing journeys stay on disk). Driven by
+/// `settings.journeys.record`.
+pub fn set_recording(on: bool) {
+    RECORDING.store(on, Ordering::Relaxed);
+}
+
+/// Whether events are being recorded right now.
+pub fn is_recording() -> bool {
+    RECORDING.load(Ordering::Relaxed)
+}
 
 /// Installs `recorder` as the process-wide handle used by [`record`]. Only
 /// the first call takes effect (matches `tod_core::logging`'s init-once
@@ -68,6 +82,9 @@ impl Recorder {
     /// Same as the free function [`record`], for callers that already hold
     /// a handle (e.g. the change-feed thread).
     pub fn record(&self, key: JourneyKey, actor: Actor, event: Event) {
+        if !is_recording() {
+            return;
+        }
         let _ = self.tx.send(Msg::Append {
             key,
             actor,
@@ -83,6 +100,9 @@ impl Recorder {
     /// submission for a just-recorded report). Returns `None` if the writer
     /// thread is gone or the record could not be opened.
     pub fn record_and_get_seq(&self, key: JourneyKey, actor: Actor, event: Event) -> Option<u64> {
+        if !is_recording() {
+            return None;
+        }
         let (reply_tx, reply_rx) = mpsc::channel();
         self.tx
             .send(Msg::Append {

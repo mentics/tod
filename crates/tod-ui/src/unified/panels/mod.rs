@@ -3,6 +3,7 @@
 
 pub mod details;
 pub mod findings;
+pub mod journey;
 pub mod obligations;
 pub mod on_others;
 pub mod plan;

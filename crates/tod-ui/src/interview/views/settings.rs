@@ -192,6 +192,7 @@ impl SettingsSection {
             Self::EnvironmentPresets => &[EnvironmentPresetsFile],
             Self::Logging => &[LogLevel, LogMaxSize],
             Self::Journeys => &[
+                JourneysRecord,
                 JourneysSend,
                 JourneysIncludeTranscripts,
                 JourneysRelayCode,
@@ -242,6 +243,7 @@ enum SettingField {
     LogLevel,
     LogMaxSize,
     MaxParallelSessions,
+    JourneysRecord,
     JourneysSend,
     JourneysIncludeTranscripts,
     JourneysRelayCode,
@@ -288,6 +290,7 @@ impl SettingField {
             Self::LogLevel => "log-level",
             Self::LogMaxSize => "log-max-size",
             Self::MaxParallelSessions => "max-parallel-sessions",
+            Self::JourneysRecord => "journeys-record",
             Self::JourneysSend => "journeys-send",
             Self::JourneysIncludeTranscripts => "journeys-include-transcripts",
             Self::JourneysRelayCode => "journeys-relay-code",
@@ -452,6 +455,8 @@ pub struct SettingsView {
     /// Result of the last "Send a test" click, if any (spec §9.1, §9.7).
     journeys_test_status: Option<Result<SharedString, SharedString>>,
     journeys_test_sending: bool,
+    /// Bytes journeys occupy on disk, or why it could not be measured.
+    journeys_storage_bytes: std::io::Result<u64>,
     _terminal_subscription: Subscription,
     _visual_design_browser_subscription: Subscription,
     _treehouse_worktrees_root_subscription: Subscription,
@@ -720,6 +725,7 @@ impl SettingsView {
             pending_changed_keys: Vec::new(),
             journeys_test_status: None,
             journeys_test_sending: false,
+            journeys_storage_bytes: Ok(0),
             _terminal_subscription,
             _visual_design_browser_subscription,
             _treehouse_worktrees_root_subscription,
@@ -1107,6 +1113,7 @@ impl SettingsView {
             self.leave_sandbox_field(field, window, cx);
         }
         self.active_section = section;
+        self.refresh_journeys_storage();
         self.selected_field_index = 0;
         self.selected_agent_column = 0;
         self.focus_region = SettingsFocus::Sidebar;
@@ -1170,6 +1177,7 @@ impl SettingsView {
         self.milestone_states_editing = false;
         self.repo_profiles_editing = false;
         self.active_section = SECTIONS[next];
+        self.refresh_journeys_storage();
         self.selected_field_index = 0;
         self.focus_region = SettingsFocus::Sidebar;
         self.focus_handle.focus(window, cx);
@@ -1271,6 +1279,7 @@ impl SettingsView {
                 let step = if delta >= 0 { 1024 } else { -1024 };
                 self.step_log_max_size(step, cx);
             }
+            SettingField::JourneysRecord => self.toggle_journeys_record(cx),
             SettingField::JourneysSend => self.toggle_journeys_send(cx),
             SettingField::JourneysIncludeTranscripts => {
                 self.toggle_journeys_include_transcripts(cx)
@@ -1347,6 +1356,7 @@ impl SettingsView {
             SettingField::LifecycleRepoProfiles => self.enter_repo_profiles_edit(window, cx),
             SettingField::JourneysSendTest => self.send_journeys_test(cx),
             SettingField::ClaudeAdapter => self.activate_claude_adapter(cx),
+            SettingField::JourneysRecord => self.toggle_journeys_record(cx),
             SettingField::JourneysSend => self.toggle_journeys_send(cx),
             SettingField::JourneysIncludeTranscripts => {
                 self.toggle_journeys_include_transcripts(cx)
@@ -1542,12 +1552,33 @@ impl SettingsView {
         });
     }
 
+    /// Toggles "Record journeys on this computer". Turning it off also turns
+    /// off sending, which has nothing stored to send.
+    fn toggle_journeys_record(&mut self, cx: &mut Context<Self>) {
+        self.settings.journeys.record = !self.settings.journeys.record;
+        if !self.settings.journeys.record {
+            self.settings.journeys.send = false;
+            self.settings.journeys.include_transcripts = false;
+        }
+        tod_core::journey::set_recording(self.settings.journeys.record);
+        self.schedule_save("journeys.record", cx);
+        cx.notify();
+    }
+
+    /// Re-measures what the journeys occupy on disk (shown beside the cap).
+    fn refresh_journeys_storage(&mut self) {
+        self.journeys_storage_bytes =
+            tod_journey::retention::total_size(&self.paths.journeys_dir());
+    }
+
     /// Toggles "Send journeys to development". Disabled (no-op) until the
     /// relay code parses (spec §9.1: "Sending cannot be turned on until a
     /// valid code is entered"). Turning it off also turns off "Include
     /// transcripts", which is only meaningful while sending is on.
     fn toggle_journeys_send(&mut self, cx: &mut Context<Self>) {
-        if !self.settings.journeys.send && !self.relay_code_valid() {
+        if !self.settings.journeys.send
+            && (!self.settings.journeys.record || !self.relay_code_valid())
+        {
             return;
         }
         self.settings.journeys.send = !self.settings.journeys.send;
@@ -1688,6 +1719,7 @@ impl SettingsView {
         }
         let _ = logging::reload_level(self.settings.log_level);
         let _ = logging::set_max_size_kb(self.settings.log_max_size_kb);
+        self.refresh_journeys_storage();
         crate::ui::report_problem::set_available_from(&self.settings.journeys, cx);
         for key in std::mem::take(&mut self.pending_changed_keys) {
             crate::ui::journey::record_settings_changed(cx, key, "");
@@ -2726,11 +2758,22 @@ impl SettingsView {
                     .child(toggle_row(
                         cx,
                         self,
+                        SettingField::JourneysRecord,
+                        journeys.record,
+                        false,
+                        "Record journeys on this computer",
+                        "Track what happens and keep it on this computer's disk, for local analysis. Nothing leaves this computer unless sending is also on. While off, nothing new is recorded (journeys already stored stay) and sending is unavailable.",
+                        theme,
+                        |this, cx| this.toggle_journeys_record(cx),
+                    ))
+                    .child(toggle_row(
+                        cx,
+                        self,
                         SettingField::JourneysSend,
                         journeys.send,
-                        !relay_valid,
+                        !relay_valid || !journeys.record,
                         "Send journeys to development",
-                        "While off, reports and milestones are still recorded locally but nothing leaves this computer. Requires a valid relay code below.",
+                        "While off, journeys are still recorded locally but nothing leaves this computer. Requires recording and a valid relay code below.",
                         theme,
                         |this, cx| this.toggle_journeys_send(cx),
                     ))
@@ -2758,7 +2801,14 @@ impl SettingsView {
                         cx,
                         self,
                         SettingField::JourneysStorageCap,
-                        format!("{} MB", journeys.storage_cap_mb),
+                        format!(
+                            "{} used / {} MB",
+                            match &self.journeys_storage_bytes {
+                                Ok(bytes) => format_storage(*bytes),
+                                Err(err) => format!("unknown ({err})"),
+                            },
+                            journeys.storage_cap_mb
+                        ),
                         "Journey storage cap",
                         "Total on-disk cap across every journey before the oldest are pruned. Default 1024 MB.",
                         theme,
@@ -2778,6 +2828,16 @@ impl SettingsView {
                 rows.into_any_element()
             }
         }
+    }
+}
+
+/// Bytes as MB (one decimal), or KB below a tenth of a MB.
+fn format_storage(bytes: u64) -> String {
+    const MB: f64 = 1024.0 * 1024.0;
+    if bytes < 100 * 1024 {
+        format!("{:.0} KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{:.1} MB", bytes as f64 / MB)
     }
 }
 

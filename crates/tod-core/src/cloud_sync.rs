@@ -1050,6 +1050,14 @@ pub fn ensure_node_sandbox(
         )
         .context("read the media bundle")?,
     );
+    // `tod-cli skills` in the sandbox reads these (`/opt/tod/skills`).
+    bundles.extend(
+        node::bundle_files(
+            crate::skills::SkillsPaths::discover().context("skills bundle")?.root(),
+            "skills",
+        )
+        .context("read the skills bundle")?,
+    );
     let identity = git_identity(task.repo.as_deref());
     let supervisor_env = node::supervisor_env(&credentials, account.claude_token_via);
     let payload = node::NodePayload {
