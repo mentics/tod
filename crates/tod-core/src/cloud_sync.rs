@@ -852,6 +852,7 @@ fn github_remote_url(config: &str) -> Option<String> {
 /// sandbox its files are forked from. The error says what to set instead.
 fn origin_url_of(fleet: &FleetStore, node_id: &str, repo: &str) -> Result<String> {
     let mut tried: Vec<String> = Vec::new();
+    let mut golden_missing = false;
     if std::path::Path::new(repo).is_dir() {
         let out = std::process::Command::new("git")
             .args(["-C", repo, "config", "--get-regexp", REMOTE_URLS])
@@ -874,18 +875,28 @@ fn origin_url_of(fleet: &FleetStore, node_id: &str, repo: &str) -> Result<String
         {
             sandboxes.push(name.trim().to_string());
         }
-        // `golden` is an alias for the newest golden sandbox, not a sandbox name.
-        for name in &mut sandboxes {
-            if name == tod_sandbox::config::GOLDEN {
-                let root = fleet.paths().root();
-                match tod_store::fleet::sandbox::Sandboxes::load(root)
-                    .and_then(|s| s.blaxel().and_then(|bx| s.resolve_golden(&bx)))
-                {
-                    Ok(real) => *name = real,
-                    Err(err) => tried.push(format!("could not resolve the golden sandbox: {err:#}")),
+        // `golden` is an alias for the newest golden sandbox, not a sandbox name:
+        // one that cannot be resolved is not asked (there is no sandbox called
+        // `golden`), and the error says why.
+        let mut resolved = Vec::new();
+        for name in sandboxes {
+            if name != tod_sandbox::config::GOLDEN {
+                resolved.push(name);
+                continue;
+            }
+            let root = fleet.paths().root();
+            match tod_store::fleet::sandbox::Sandboxes::load(root).and_then(|s| s.blaxel().and_then(|bx| s.resolve_golden(&bx))) {
+                Ok(real) => resolved.push(real),
+                Err(err) => {
+                    golden_missing = true;
+                    tried.push(format!(
+                        "this node's files are forked from the golden sandbox, which cannot be found: {err:#}. \
+                         Make a golden sandbox and point tod at it with `tod-sandbox golden <sandbox>` (or set `golden` in sandboxes.toml)"
+                    ));
                 }
             }
         }
+        let sandboxes = resolved;
         for name in sandboxes {
             match tod_store::fleet::sandbox::SandboxExec::new(&name).output(repo, "git", &["config", "--get-regexp", REMOTE_URLS]) {
                 Err(err) => tried.push(format!("could not run git in sandbox {name} at {repo}: {err:#}")),
@@ -905,6 +916,10 @@ fn origin_url_of(fleet: &FleetStore, node_id: &str, repo: &str) -> Result<String
         }
     }
     let why = if tried.is_empty() { format!("{repo} is not a checkout on this machine") } else { tried.join("; ") };
+    if golden_missing {
+        // The Files directory is not at fault; do not send the user to change it.
+        bail!("no HTTPS repository URL for the cloud run: {why}");
+    }
     bail!(
         "no HTTPS repository URL for the cloud run ({why}); the cloud checks the repository out from its \
          HTTPS URL, so set the Files directory to that URL (e.g. https://github.com/owner/repo) or to a \
