@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use std::io::BufRead;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tod_store::fleet::FleetStore;
 
 /// What the app subscribes to.
@@ -161,6 +161,51 @@ impl Coalesced {
     }
 }
 
+/// How often a sync that keeps failing the same way is logged again.
+const REPEAT_FAILURE_LOG: Duration = Duration::from_secs(5 * 60);
+
+/// Keeps a sync that fails every few seconds the same way from filling the
+/// log: the first failure and every different one is logged in full, an
+/// identical one again only each [`REPEAT_FAILURE_LOG`] (with how many there
+/// were), and the end of a run of failures is logged too.
+#[derive(Default)]
+struct FailureLog {
+    last: Option<String>,
+    since_logged: u32,
+    logged_at: Option<Instant>,
+    total: u32,
+}
+
+impl FailureLog {
+    /// The line to log for this failure, if it is not a repeat to hold back.
+    fn failed(&mut self, text: &str, now: Instant) -> Option<String> {
+        self.total += 1;
+        let repeat = self.last.as_deref() == Some(text);
+        let due = self.logged_at.is_none_or(|t| now.duration_since(t) >= REPEAT_FAILURE_LOG);
+        if repeat && !due {
+            self.since_logged += 1;
+            return None;
+        }
+        let held = std::mem::take(&mut self.since_logged);
+        self.last = Some(text.to_string());
+        self.logged_at = Some(now);
+        Some(if repeat {
+            format!("cloud sync still failing ({} failures in a row, {held} since the last report): {text}", self.total)
+        } else {
+            format!("cloud sync failed: {text}")
+        })
+    }
+
+    /// The line to log when a sync works again after failures.
+    fn recovered(&mut self) -> Option<String> {
+        let total = std::mem::take(&mut self.total);
+        self.last = None;
+        self.since_logged = 0;
+        self.logged_at = None;
+        (total > 0).then(|| format!("cloud sync works again after {total} failures"))
+    }
+}
+
 /// The one background sync runner for `fleet`'s data root, shared by
 /// notices ([`start`]), the app's start, and the outbox push
 /// (`cloud_sync::spawn_outbox_pusher`), so their syncs coalesce and never
@@ -176,15 +221,24 @@ pub fn runner(fleet: &Arc<FleetStore>) -> Arc<Coalesced> {
         .entry(root.clone())
         .or_insert_with(|| {
             let fleet = fleet.clone();
+            let failures = Mutex::new(FailureLog::default());
             Coalesced::new(move || match cloud_sync::sync_now(&fleet, &root) {
                 Ok(report) => {
+                    if let Some(note) = failures.lock().unwrap_or_else(|e| e.into_inner()).recovered() {
+                        tracing::info!("{note}");
+                    }
                     tracing::info!("cloud sync: {}", report.summary());
                     // The orchestrator found a node's sandbox gone: replace it.
                     if cloud_sync::lost::any_marked(&fleet) {
                         cloud_sync::lost::spawn_check(fleet.clone(), cloud_sync::lost::Check::Marked);
                     }
                 }
-                Err(err) => tracing::warn!("cloud sync failed: {err:#}"),
+                Err(err) => {
+                    let text = format!("{err:#}");
+                    if let Some(line) = failures.lock().unwrap_or_else(|e| e.into_inner()).failed(&text, Instant::now()) {
+                        tracing::warn!("{line}");
+                    }
+                }
             })
         })
         .clone()
@@ -319,5 +373,20 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert_eq!(runs.load(Ordering::SeqCst), 2);
+    }
+    #[test]
+    fn a_repeated_failure_is_logged_once_per_interval() {
+        let t0 = Instant::now();
+        let mut log = FailureLog::default();
+        assert!(log.failed("502", t0).unwrap().starts_with("cloud sync failed: 502"));
+        assert_eq!(log.failed("502", t0 + Duration::from_secs(30)), None);
+        assert_eq!(log.failed("502", t0 + Duration::from_secs(60)), None);
+        // A different failure is always reported.
+        assert!(log.failed("timeout", t0 + Duration::from_secs(90)).unwrap().starts_with("cloud sync failed: timeout"));
+        assert_eq!(log.failed("timeout", t0 + Duration::from_secs(120)), None);
+        let again = log.failed("timeout", t0 + Duration::from_secs(90) + REPEAT_FAILURE_LOG).unwrap();
+        assert!(again.contains("still failing") && again.contains("1 since the last report"), "{again}");
+        assert!(log.recovered().unwrap().contains("works again after 6 failures"));
+        assert_eq!(log.recovered(), None);
     }
 }
