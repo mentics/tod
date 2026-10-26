@@ -19,7 +19,8 @@ use gpui_component::input::{
     AnyInputState, Input, InputEvent, InputState, Textarea, TextareaState,
 };
 use gpui_component::scroll::Scrollbar;
-use gpui_component::select::{SearchableVec, Select, SelectEvent, SelectState};
+use gpui_component::combobox::{Combobox, ComboboxEvent, ComboboxState};
+use gpui_component::select::{SearchableVec, Select, SelectEvent, SelectItem, SelectState};
 use gpui_component::tag::Tag;
 use gpui_component::{ActiveTheme, Disableable, Selectable, Sizable, StyledExt, h_flex, v_flex};
 use std::collections::HashSet;
@@ -96,6 +97,8 @@ fn field_anchor_id(field: TaskEditField) -> &'static str {
         TaskEditField::Capability(Capability::Environment) => "task-edit-field-cap-environment",
         TaskEditField::Capability(Capability::LifecycleConfig) => "task-edit-field-cap-lifecycle-config",
         TaskEditField::Capability(Capability::Groups) => "task-edit-field-cap-groups",
+        TaskEditField::CapabilityPicker => "task-edit-field-cap-picker",
+        TaskEditField::CapabilityRemove(_) => "task-edit-field-cap-remove",
         TaskEditField::GeneratorSource => "task-edit-field-gen-source",
         TaskEditField::GeneratorField(_) => "task-edit-field-gen-field",
         TaskEditField::LinearQuery => "task-edit-field-linear-query",
@@ -124,6 +127,27 @@ actions!(
         LinearQueryOpen,
     ]
 );
+
+/// One capability in the "add a capability" picker. Matches fuzzily, so
+/// typing "lfc" finds "Lifecycle config".
+#[derive(Clone)]
+struct CapabilityChoice(Capability);
+
+impl SelectItem for CapabilityChoice {
+    type Value = Capability;
+
+    fn title(&self) -> gpui::SharedString {
+        self.0.label().into()
+    }
+
+    fn value(&self) -> &Self::Value {
+        &self.0
+    }
+
+    fn matches(&self, query: &str) -> bool {
+        tod_core::fuzzy::fuzzy_matches(query, self.0.label())
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TaskEditField {
@@ -164,7 +188,12 @@ enum TaskEditField {
     GeneratorAcceptDestination,
     /// One quick-accept capability chip; Enter / click toggles it.
     GeneratorAcceptCapability(Capability),
+    /// The picker that adds a capability; Enter / click focuses it.
+    CapabilityPicker,
+    /// An enabled capability's header; Enter / click expands or collapses it.
     Capability(Capability),
+    /// Removes an enabled capability.
+    CapabilityRemove(Capability),
 }
 
 impl TaskEditField {
@@ -186,7 +215,9 @@ impl TaskEditField {
                 | Self::GeneratorSource
                 | Self::GeneratorRefresh
                 | Self::GeneratorAcceptCapability(_)
+                | Self::CapabilityPicker
                 | Self::Capability(_)
+                | Self::CapabilityRemove(_)
         )
     }
 }
@@ -529,6 +560,17 @@ pub struct TaskEditView {
     /// compares like with like. Edits never write the preset; only Overwrite.
     linear_preset_baseline: Option<serde_json::Map<String, serde_json::Value>>,
     linear_preset_select: Entity<SelectState<SearchableVec<String>>>,
+    /// Lists every capability, checked for the ones this node has; toggling
+    /// a row enables or disables it.
+    cap_picker: Entity<ComboboxState<SearchableVec<CapabilityChoice>>>,
+    /// The checked set `cap_picker` was last given; `None` forces it to be
+    /// given again (a change that did not take effect, a menu closing).
+    cap_picker_synced: std::cell::RefCell<Option<Vec<Capability>>>,
+    /// The checked set after the user's latest toggle, to apply next frame.
+    pending_cap_pick: Option<Vec<Capability>>,
+    /// Capabilities whose settings are showing; all start collapsed.
+    expanded_caps: HashSet<Capability>,
+    _cap_picker_subscription: Subscription,
     /// What `linear_preset_select` was last given: its items and selection.
     linear_preset_select_synced: std::cell::RefCell<(Vec<String>, Option<String>)>,
     _linear_preset_select_subscription: Subscription,
@@ -600,6 +642,35 @@ impl TaskEditView {
                     this.refresh_accept_destination_hints(cx);
                 }
             });
+        let cap_picker = cx.new(|cx| {
+            ComboboxState::new(
+                SearchableVec::new(
+                    Capability::ALL
+                        .into_iter()
+                        .map(CapabilityChoice)
+                        .collect::<Vec<_>>(),
+                ),
+                vec![],
+                window,
+                cx,
+            )
+            .multiple(true)
+            .searchable(true)
+        });
+        let _cap_picker_subscription = cx.subscribe(
+            &cap_picker,
+            |this: &mut TaskEditView,
+             _,
+             event: &ComboboxEvent<SearchableVec<CapabilityChoice>>,
+             cx| {
+                match event {
+                    ComboboxEvent::Change(values) => this.pending_cap_pick = Some(values.clone()),
+                    // Whatever did not take effect is checked again on close.
+                    ComboboxEvent::Confirm(_) => *this.cap_picker_synced.borrow_mut() = None,
+                }
+                cx.notify();
+            },
+        );
         let linear_preset_name_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("Preset name…"));
         let linear_preset_select = cx.new(|cx| {
@@ -745,6 +816,11 @@ impl TaskEditView {
             linear_preset_action: None,
             linear_preset_baseline: None,
             linear_preset_select,
+            cap_picker,
+            cap_picker_synced: Default::default(),
+            pending_cap_pick: None,
+            expanded_caps: HashSet::new(),
+            _cap_picker_subscription,
             linear_preset_select_synced: Default::default(),
             _linear_preset_select_subscription,
             filter_editor,
@@ -818,6 +894,9 @@ impl TaskEditView {
     }
 
     pub fn open(&mut self, task_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if self.task_id.as_deref() != Some(task_id) {
+            self.expanded_caps.clear();
+        }
         self.task_id = Some(task_id.to_string());
         if !self.load_task(window, cx) {
             self.task_id = None;
@@ -843,6 +922,7 @@ impl TaskEditView {
         self.task_id = None;
         self.tags.clear();
         self.capabilities.clear();
+        self.expanded_caps.clear();
         self.obligation_requirements = 0;
         self.obligation_constraints = 0;
         self.focus_index = 0;
@@ -855,7 +935,7 @@ impl TaskEditView {
         let mut stops = Vec::new();
         stops.push(TaskEditField::Title);
         stops.push(TaskEditField::Details);
-        if self.capability_enabled(Capability::Agent) {
+        if self.cap_body_open(Capability::Agent) {
             stops.extend([
                 TaskEditField::AgentPlatform,
                 TaskEditField::AgentModel,
@@ -863,6 +943,9 @@ impl TaskEditView {
             ]);
         }
         if self.capability_enabled(Capability::Files) {
+            if !self.expanded_caps.contains(&Capability::Files) {
+                // Collapsed: no stops.
+            } else {
             if self.own_files().is_some() {
                 stops.push(TaskEditField::Location);
                 if self.location_open {
@@ -880,6 +963,7 @@ impl TaskEditView {
             ) {
                 stops.push(TaskEditField::LaunchShell);
             }
+            }
         } else if self.worktree_action().is_some() {
             // Inherited Files: this node's own worktree or sandbox can
             // still be removed.
@@ -892,16 +976,16 @@ impl TaskEditView {
             let at = stops.len() - usize::from(self.worktree_action().is_some());
             stops.insert(at, TaskEditField::Branch);
         }
-        if self.capability_enabled(Capability::Ticket) {
+        if self.cap_body_open(Capability::Ticket) {
             stops.extend([TaskEditField::LinearLink, TaskEditField::GithubPr]);
         }
-        if self.capability_enabled(Capability::Tags) {
+        if self.cap_body_open(Capability::Tags) {
             stops.push(TaskEditField::Tags);
         }
-        if self.capability_enabled(Capability::Spec) {
+        if self.cap_body_open(Capability::Spec) {
             stops.push(TaskEditField::Obligations);
         }
-        if self.capability_enabled(Capability::Generator) {
+        if self.cap_body_open(Capability::Generator) {
             if self.generator_data_source_type.is_none() {
                 stops.push(TaskEditField::GeneratorSource);
             }
@@ -928,8 +1012,12 @@ impl TaskEditView {
                 }
             }
         }
-        for cap in Capability::ALL {
+        stops.push(TaskEditField::CapabilityPicker);
+        for cap in self.shown_caps() {
             stops.push(TaskEditField::Capability(cap));
+            if self.capability_enabled(cap) {
+                stops.push(TaskEditField::CapabilityRemove(cap));
+            }
         }
         stops
     }
@@ -1020,7 +1108,9 @@ impl TaskEditView {
             | TaskEditField::GeneratorSource
             | TaskEditField::GeneratorRefresh
             | TaskEditField::GeneratorAcceptCapability(_)
-            | TaskEditField::Capability(_) => return None,
+            | TaskEditField::CapabilityPicker
+            | TaskEditField::Capability(_)
+            | TaskEditField::CapabilityRemove(_) => return None,
         })
     }
 
@@ -1099,8 +1189,23 @@ impl TaskEditView {
                 self.toggle_accept_capability(cap, cx);
                 return;
             }
+            TaskEditField::CapabilityPicker => {
+                self.cap_picker.update(cx, |select, cx| select.focus(window, cx));
+                cx.notify();
+                return;
+            }
             TaskEditField::Capability(cap) => {
-                self.toggle_capability(cap, window, cx);
+                if self.capability_enabled(cap) {
+                    self.toggle_cap_expanded(cap);
+                } else {
+                    self.toggle_capability(cap, window, cx);
+                }
+                self.clamp_focus_index();
+                cx.notify();
+                return;
+            }
+            TaskEditField::CapabilityRemove(cap) => {
+                self.request_disable_capability(cap, window, cx);
                 self.clamp_focus_index();
                 cx.notify();
                 return;
@@ -1183,6 +1288,16 @@ impl TaskEditView {
     }
 
     fn handle_escape(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Focus inside the picker (or its open menu) is not the editor's own:
+        // Escape first returns to the editor rather than closing it.
+        if self.editing.is_none()
+            && !self.focus_handle.is_focused(window)
+            && self.focus_handle.contains_focused(window, cx)
+        {
+            self.focus_handle.focus(window, cx);
+            cx.notify();
+            return;
+        }
         if self.editing.is_some() {
             self.exit_edit(window, cx);
             return;
@@ -1214,6 +1329,20 @@ impl TaskEditView {
     fn drain_pending(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(message) = self.pending_toast.take() {
             error_toast(window, cx, message);
+        }
+        if let Some(chosen) = self.pending_cap_pick.take() {
+            for cap in Capability::ALL {
+                let wanted = chosen.contains(&cap);
+                if wanted && !self.capability_enabled(cap) {
+                    self.enable_capability(cap, window, cx);
+                } else if !wanted && self.capability_enabled(cap) {
+                    self.request_disable_capability(cap, window, cx);
+                    // Removing may wait on a confirmation or be refused: show
+                    // the capability checked until it really goes.
+                    *self.cap_picker_synced.borrow_mut() = None;
+                }
+            }
+            self.clamp_focus_index();
         }
         if let Some(change) = self.pending_files_change.take() {
             let view = cx.entity().downgrade();
@@ -1392,6 +1521,39 @@ impl TaskEditView {
 
     fn capability_enabled(&self, cap: Capability) -> bool {
         self.capabilities.contains(&cap)
+    }
+
+    /// Whether a capability's settings are showing: it is enabled and the
+    /// user expanded it. Collapsed settings have no navigation stops.
+    fn cap_body_open(&self, cap: Capability) -> bool {
+        self.capability_enabled(cap) && self.expanded_caps.contains(&cap)
+    }
+
+    /// The capabilities this node lists: those it has, and the inherited
+    /// Agent and Files, whose resolved settings (and this node's own
+    /// worktree) would otherwise be out of reach.
+    fn shown_caps(&self) -> Vec<Capability> {
+        Capability::ALL
+            .into_iter()
+            .filter(|&cap| {
+                self.capability_enabled(cap)
+                    || match cap {
+                        Capability::Agent => {
+                            self.resolved_agent.as_ref().is_some_and(|r| r.inherited)
+                        }
+                        Capability::Files => {
+                            self.resolved_files.as_ref().is_some_and(|f| f.inherited)
+                        }
+                        _ => false,
+                    }
+            })
+            .collect()
+    }
+
+    fn toggle_cap_expanded(&mut self, cap: Capability) {
+        if !self.expanded_caps.remove(&cap) {
+            self.expanded_caps.insert(cap);
+        }
     }
 
     /// Resolve Agent / Files (own or inherited) for the open node.
@@ -3933,6 +4095,9 @@ impl TaskEditView {
         });
     }
 
+    /// The header of a capability section. An enabled one has a chevron that
+    /// expands its settings and an ✕ that removes it; an inherited one (shown
+    /// for its resolved settings) has a checkbox that enables it here.
     fn render_section_legend(
         &self,
         cap: Capability,
@@ -3942,11 +4107,20 @@ impl TaskEditView {
     ) -> impl IntoElement {
         let enabled = self.capability_enabled(cap);
         let foreground = cx.theme().foreground;
-        let mark = if enabled { "☑" } else { "☐" };
+        let muted = cx.theme().muted_foreground;
+        let mark = if !enabled {
+            "☐"
+        } else if self.expanded_caps.contains(&cap) {
+            "▾"
+        } else {
+            "▸"
+        };
         let field = TaskEditField::Capability(cap);
         let focused = self.field_nav_focused(field);
+        let remove_field = TaskEditField::CapabilityRemove(cap);
+        let remove_focused = self.field_nav_focused(remove_field);
 
-        self.apply_focus_scroll_anchor(
+        let toggle = self.apply_focus_scroll_anchor(
             field,
             h_flex()
                 .id(("task-edit-cap-toggle", cap_index))
@@ -3962,7 +4136,13 @@ impl TaskEditView {
                 .cursor_pointer()
                 .bg(background)
                 .on_click(cx.listener(move |this, _, window, cx| {
-                    this.toggle_capability(cap, window, cx);
+                    if this.capability_enabled(cap) {
+                        this.toggle_cap_expanded(cap);
+                    } else {
+                        this.toggle_capability(cap, window, cx);
+                    }
+                    this.clamp_focus_index();
+                    cx.notify();
                 }))
                 .child(
                     div()
@@ -3977,14 +4157,92 @@ impl TaskEditView {
                         .text_color(foreground)
                         .child(cap.label().to_string()),
                 ),
+        );
+        h_flex()
+            .items_center()
+            .gap_1()
+            .child(toggle)
+            .when(enabled, |row| {
+                row.child(self.apply_focus_scroll_anchor(
+                    remove_field,
+                    div()
+                        .id(("task-edit-cap-remove", cap_index))
+                        .px_1()
+                        .rounded_md()
+                        .text_sm()
+                        .text_color(muted)
+                        .bg(background)
+                        .when(remove_focused, |el| {
+                            el.bg(cx.theme().list_active)
+                                .border_1()
+                                .border_color(cx.theme().list_active_border)
+                        })
+                        .cursor_pointer()
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.request_disable_capability(cap, window, cx);
+                            this.clamp_focus_index();
+                            cx.notify();
+                        }))
+                        .child("✕"),
+                ))
+            })
+    }
+
+    /// The "add a capability" picker: type to fuzzy-search, or open the list
+    /// and pick with the arrows or the mouse.
+    fn render_capability_picker(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let enabled: Vec<Capability> = Capability::ALL
+            .into_iter()
+            .filter(|cap| self.capability_enabled(*cap))
+            .collect();
+        if self.cap_picker_synced.borrow().as_ref() != Some(&enabled) {
+            self.cap_picker.update(cx, |picker, cx| {
+                picker.set_selected_values(&enabled, window, cx)
+            });
+            *self.cap_picker_synced.borrow_mut() = Some(enabled);
+        }
+        let field = TaskEditField::CapabilityPicker;
+        let focused = self.field_nav_focused(field);
+        self.apply_focus_scroll_anchor(
+            field,
+            v_flex()
+                .id(field_anchor_id(field))
+                .gap_1()
+                .w_full()
+                .child(Self::render_field_label("Add capability", cx))
+                .child(
+                    div()
+                        .w_full()
+                        .rounded_md()
+                        .when(focused, |el| {
+                            el.bg(cx.theme().list_active)
+                                .border_1()
+                                .border_color(cx.theme().list_active_border)
+                        })
+                        .child(
+                            Combobox::new(&self.cap_picker)
+                                .placeholder("Add a capability…")
+                                .search_placeholder("Type to search")
+                                .w_full(),
+                        ),
+                ),
         )
     }
 
+    /// The bordered section around a capability's settings. An enabled
+    /// capability the user has not expanded shows its header alone.
     fn render_legend_border_section(
+        &self,
+        cap: Capability,
         border: gpui::Hsla,
         legend: gpui::AnyElement,
         body: Option<gpui::AnyElement>,
     ) -> impl IntoElement {
+        let body = body.filter(|_| !self.capability_enabled(cap) || self.expanded_caps.contains(&cap));
         let legend_slot = div().absolute().top(px(-9.)).left(px(10.)).child(legend);
 
         match body {
@@ -4684,7 +4942,7 @@ impl TaskEditView {
         let legend = self
             .render_section_legend(cap, cap_index, background, cx)
             .into_any_element();
-        Self::render_legend_border_section(border, legend, body)
+        self.render_legend_border_section(cap, border, legend, body)
     }
 
     fn render_lifecycle_section(
@@ -4718,7 +4976,7 @@ impl TaskEditView {
         let legend = self
             .render_section_legend(cap, cap_index, background, cx)
             .into_any_element();
-        Self::render_legend_border_section(border, legend, body)
+        self.render_legend_border_section(cap, border, legend, body)
     }
 
     fn render_action_capability_section(
@@ -4743,7 +5001,7 @@ impl TaskEditView {
         let legend = self
             .render_section_legend(cap, cap_index, background, cx)
             .into_any_element();
-        Self::render_legend_border_section(border, legend, body)
+        self.render_legend_border_section(cap, border, legend, body)
     }
 
     fn render_tags_body(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -4784,7 +5042,7 @@ impl TaskEditView {
         let legend = self
             .render_section_legend(cap, cap_index, background, cx)
             .into_any_element();
-        Self::render_legend_border_section(border, legend, body)
+        self.render_legend_border_section(cap, border, legend, body)
     }
 
     /// The Groups capability: one checkbox, grouping the children by
@@ -4841,7 +5099,7 @@ impl TaskEditView {
         let legend = self
             .render_section_legend(cap, cap_index, background, cx)
             .into_any_element();
-        Self::render_legend_border_section(border, legend, body)
+        self.render_legend_border_section(cap, border, legend, body)
     }
 
     fn set_groups_by_lifecycle(&mut self, node: uuid::Uuid, on: bool, cx: &mut Context<Self>) {
@@ -4881,7 +5139,7 @@ impl TaskEditView {
         let legend = self
             .render_section_legend(cap, cap_index, background, cx)
             .into_any_element();
-        Self::render_legend_border_section(border, legend, body)
+        self.render_legend_border_section(cap, border, legend, body)
     }
 
     fn render_tags_section(
@@ -4901,7 +5159,7 @@ impl TaskEditView {
         let legend = self
             .render_section_legend(cap, cap_index, background, cx)
             .into_any_element();
-        Self::render_legend_border_section(border, legend, body)
+        self.render_legend_border_section(cap, border, legend, body)
     }
 
     fn render_generator_section(
@@ -4925,7 +5183,7 @@ impl TaskEditView {
         let legend = self
             .render_section_legend(cap, cap_index, background, cx)
             .into_any_element();
-        Self::render_legend_border_section(border, legend, body)
+        self.render_legend_border_section(cap, border, legend, body)
     }
 
     fn render_generator_body(
@@ -6437,7 +6695,11 @@ impl Render for TaskEditView {
         );
         body = body.child(self.render_notes_section(window, cx));
 
+        body = body.child(self.render_capability_picker(window, cx));
         for (cap_index, cap) in Capability::ALL.into_iter().enumerate() {
+            if !self.shown_caps().contains(&cap) {
+                continue;
+            }
             body =
                 body.child(self.render_capability_section(
                     cap, cap_index, background, border, muted, window, cx,
