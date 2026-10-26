@@ -147,6 +147,14 @@ protocol kinds remain only so old conversations load, and run
 (`tod-cli decisions ask`, free text with no `--option`) only for what only
 the user can supply.
 
+**Usual actions** (`tod_core::usual_actions`, `media/context/cli/usual-actions.yml`).
+The phase agent's and the evaluator's opening ends with the `tod-cli` commands
+that role usually runs in that state (and, for the phase agent, with independent
+evaluation on or off), rendered from that table ahead of the phase status. It is
+guidance for efficiency, never enforced, and ships with the app (shaped to move
+to the data root someday, not editable now). Each `run` must name a real
+`<noun> <verb>` (`tod_cli::doc_sync` checks); syntax stays in `cli/<noun>.md`.
+
 **PR babysitter** (`doc/lifecycle/pr-readiness.md`). In `pr` the autopilot's
 `babysit` (`autopilot/mod.rs`) drives the pull request until only the human
 review is missing: `tod_core::pr_readiness` reads it from GitHub

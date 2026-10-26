@@ -126,6 +126,34 @@ mod tests {
         }
     }
 
+    /// The usual-actions table (`cli/usual-actions.yml`) may only name commands
+    /// the binary accepts, so a renamed or removed verb cannot leave agents
+    /// being pointed at it.
+    #[test]
+    fn usual_actions_name_real_commands() {
+        let text = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../tod/media/context")
+                .join(tod_core::usual_actions::FILE),
+        )
+        .unwrap();
+        let entries = tod_core::usual_actions::parse(&text).unwrap();
+        assert!(!entries.is_empty());
+        for action in entries.iter().flat_map(|e| &e.actions) {
+            let mut words = action.run.split_whitespace();
+            let (noun, verb) = (words.next().unwrap_or(""), words.next().unwrap_or(""));
+            let Some(&(_, usage)) = nouns().iter().find(|(n, _)| *n == noun) else {
+                panic!("usual-actions runs `{}`: `{noun}` is not a tod-cli noun", action.run);
+            };
+            assert!(
+                verbs(usage).contains(&verb),
+                "usual-actions runs `{}`: tod-cli's `{noun}` has no `{verb}` (has: {:?})",
+                action.run,
+                verbs(usage)
+            );
+        }
+    }
+
     /// Guards the extractor itself: a silently-empty verb list would make the
     /// two tests above pass for any fragment at all.
     #[test]
