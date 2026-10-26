@@ -50,6 +50,7 @@ pub mod linear_import;
 pub mod linear_sync;
 pub mod logging;
 pub mod media;
+pub mod skills;
 pub mod node_context;
 pub mod permission;
 pub mod phase;

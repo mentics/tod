@@ -266,7 +266,7 @@ app deploys an orchestrator on its own only when none exists. Details:
 Cargo.toml              # workspace root
 assets/process/         # bundled agent docs (source; copied to target/.../process at build)
 crates/tod/             # thin launcher binary
-  build.rs              # installs process/ and media/ next to the executable
+  build.rs              # installs process/, media/ and skills/ next to the executable
   media/context/        # agent context docs (copied to target/.../media at build)
 crates/tod-ui/          # all GPUI code
   src/cli.rs            # LaunchOptions / CLI parsing

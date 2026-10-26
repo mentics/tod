@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Builds tod in release mode and installs it (binaries + process/media bundles)
+# Builds tod in release mode and installs it (binaries + process/media/skills bundles)
 # into a target directory, with cloud-sandbox support (tod-sandbox, Zed's ssh
 # shim, and the Linux relay, supervisor (agent daemon), and orchestrator
 # binaries that run in sandboxes).
@@ -59,7 +59,7 @@ for bin in "${BINS[@]}"; do
     fi
 done
 
-for dir in process media; do
+for dir in process media skills; do
     src="$RELEASE_DIR/$dir"
     if [[ -d "$src" ]]; then
         rm -rf "${TARGET_DIR:?}/$dir"

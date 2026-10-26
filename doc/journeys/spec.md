@@ -363,7 +363,11 @@ journey what happened.
 
 A **Journeys** section in the settings view:
 
-- **Send journeys to development**: off by default. While it is off, reports
+- **Record journeys on this computer**: on by default. Tracks and stores
+  journeys locally, for local analysis; nothing leaves the machine on its own.
+  Takes effect at once. While off, nothing new is recorded (journeys already
+  stored stay) and sending is unavailable (turning it off turns sending off).
+- **Send journeys to development**: off by default, and requires recording. While it is off, reports
   and milestones are still recorded in the journey, but nothing is queued and
   nothing leaves the machine. Turning it on does not send anything recorded
   before. While it is on, each report and milestone is sent as soon as it is
@@ -385,7 +389,7 @@ A **Journeys** section in the settings view:
   Sending cannot be turned on until a valid code is entered.
 - **Send a test**: sends a tiny sealed test bundle and reports whether the
   relay accepted it (§9.7).
-- **Milestone states** and **Journey storage cap** (default 1 GB).
+- **Milestone states** and **Journey storage cap** (default 1 GB), which also shows how much the journeys currently occupy on disk.
 
 Next to **Send journeys to development**, a prominent warning (a warning
 callout, not a caption):
@@ -518,3 +522,20 @@ replaced by journey analysis done outside the app. That is out of scope here.
 - Screenshots on macOS and Linux.
 - Any relay other than ntfy and the folder sink.
 - Replaying a journey against the app.
+
+
+## Reading journeys locally
+
+Journeys recorded on this computer can be reviewed without sending anything.
+
+- **In the app**: the task panel's **Journey** link opens a node's journey;
+  **Alt+J** (or "Your recent activity" in that panel) opens the project
+  journey, the user's own recent activity. The panel offers *Copy reference*
+  (`journey:node/<slug>` or `journey:project`), *Copy for agent* (the
+  reference plus the command that reads it) and *Copy timeline*. The chat
+  drawer's clock icon adds the same agent text to the message being written.
+- **For an agent**: `tod-cli journey show <slug|project> [--since 2h]
+  [--last N] [--full]` prints the timeline (`tod_journey::timeline`, shared
+  with `tod-journeys show`). Journeys are in no agent's context: the pasted
+  text names the command, and `tod-cli skills show journeys`
+  (`assets/skills/journeys.md`) says what to look for.

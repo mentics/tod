@@ -513,7 +513,7 @@ pub struct NodePayload<'a> {
     /// run without one).
     pub git_identity: &'a GitIdentity,
     /// The supervisor's bundles, as `(path relative to /opt/tod, contents)`:
-    /// `process/...` and `media/...`, found beside its executable (it builds
+    /// `process/...`, `media/...` and `skills/...`, found beside its executable (it builds
     /// the agent's context from them). See [`bundle_files`].
     pub bundles: &'a [(String, Vec<u8>)],
     /// [`supervisor_env`]: handed to the relay at each start, which gives it
@@ -663,7 +663,7 @@ fn upload_tod_files(bx: &Blaxel, url: &str, payload: &NodePayload, progress: &mu
 fn install_bundles(bx: &Blaxel, url: &str, payload: &NodePayload, progress: &mut dyn FnMut(&str)) -> Result<()> {
     if !payload.bundles.is_empty() {
         progress(&format!("installing {} bundle files…", payload.bundles.len()));
-        let res = bx.run(url, &format!("rm -rf {TOD_DIR}/process {TOD_DIR}/media"), 30)?;
+        let res = bx.run(url, &format!("rm -rf {TOD_DIR}/process {TOD_DIR}/media {TOD_DIR}/skills"), 30)?;
         if res.exit_code != 0 {
             bail!("clearing the old bundles failed: {}", res.output());
         }

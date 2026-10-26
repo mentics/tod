@@ -40,6 +40,12 @@ pub fn enforce_cap(dir: &Path, cap_bytes: u64, keep: JourneyKey) -> io::Result<(
     Ok(())
 }
 
+/// Bytes every journey under `dir` occupies on disk: what `enforce_cap`
+/// compares with the cap. Zero when `dir` does not exist yet.
+pub fn total_size(dir: &Path) -> io::Result<u64> {
+    Ok(collect(dir)?.iter().map(|j| j.size).sum())
+}
+
 fn collect(dir: &Path) -> io::Result<Vec<Journey>> {
     use std::collections::HashMap;
 
@@ -98,4 +104,19 @@ fn delete_journey(dir: &Path, stem: &str) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod total_size_tests {
+    use super::*;
+
+    #[test]
+    fn total_size_sums_journey_files_and_is_zero_for_a_missing_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(total_size(&dir.path().join("none")).unwrap(), 0);
+        fs::write(dir.path().join("a.journey.tail"), [0u8; 10]).unwrap();
+        fs::write(dir.path().join("a.journey.zst"), [0u8; 5]).unwrap();
+        fs::write(dir.path().join("unrelated.txt"), [0u8; 99]).unwrap();
+        assert_eq!(total_size(dir.path()).unwrap(), 15);
+    }
 }

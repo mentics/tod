@@ -70,6 +70,7 @@ enum HostedPanel {
     Transcript(Entity<panels::transcript::TranscriptPanel>),
     Changes(Entity<panels::changes::ChangesPanel>),
     OnOthers(Entity<panels::on_others::OnOthersPanel>),
+    Journey(Entity<panels::journey::JourneyPanel>),
 }
 
 impl HostedPanel {
@@ -84,6 +85,7 @@ impl HostedPanel {
             Self::Transcript(e) => e.read(cx).title(cx),
             Self::Changes(e) => e.read(cx).title(cx),
             Self::OnOthers(e) => e.read(cx).title(cx),
+            Self::Journey(e) => e.read(cx).title(cx),
         }
     }
 
@@ -98,6 +100,7 @@ impl HostedPanel {
             Self::Transcript(e) => e.read(cx).focus_handle(cx),
             Self::Changes(e) => e.read(cx).focus_handle(cx),
             Self::OnOthers(e) => e.read(cx).focus_handle(cx),
+            Self::Journey(e) => e.read(cx).focus_handle(cx),
         }
     }
 
@@ -112,6 +115,7 @@ impl HostedPanel {
             Self::Transcript(e) => e.entity_id(),
             Self::Changes(e) => e.entity_id(),
             Self::OnOthers(e) => e.entity_id(),
+            Self::Journey(e) => e.entity_id(),
         }
     }
 
@@ -126,6 +130,7 @@ impl HostedPanel {
             Self::Transcript(e) => e.clone().into_any_element(),
             Self::Changes(e) => e.clone().into_any_element(),
             Self::OnOthers(e) => e.clone().into_any_element(),
+            Self::Journey(e) => e.clone().into_any_element(),
         }
     }
 }
@@ -137,7 +142,8 @@ actions!(
         UnifiedTogglePinFocused,
         UnifiedNextWaiting,
         UnifiedPrevWaiting,
-        UnifiedCloseFocusedColumn
+        UnifiedCloseFocusedColumn,
+        UnifiedOpenRecentActivity
     ]
 );
 
@@ -156,6 +162,7 @@ pub fn register_unified_keyboard_bindings(cx: &mut App) {
         KeyBinding::new("alt-q", UnifiedNextWaiting, context),
         KeyBinding::new("alt-shift-q", UnifiedPrevWaiting, context),
         KeyBinding::new("ctrl-w", UnifiedCloseFocusedColumn, context),
+        KeyBinding::new("alt-j", UnifiedOpenRecentActivity, context),
     ]);
     register_chat_drawer_keyboard_bindings(cx);
     panels::transcript::register_transcript_panel_bindings(cx);
@@ -833,6 +840,22 @@ impl UnifiedView {
                     _subscriptions: vec![subscription],
                 }
             }
+            PanelKind::Journey(_) | PanelKind::ProjectJourney => {
+                let node = match target {
+                    PanelKind::Journey(id) => Some(id),
+                    _ => None,
+                };
+                let panel = cx.new(|cx| panels::journey::JourneyPanel::new(node, self.fleet.clone(), cx));
+                let panel_id = panel.entity_id();
+                let subscription =
+                    cx.subscribe_in(&panel, window, move |this, _, event: &PanelOpenRequest, window, cx| {
+                        this.route_open_request(panel_id, event, window, cx);
+                    });
+                HostedColumn {
+                    panel: HostedPanel::Journey(panel),
+                    _subscriptions: vec![subscription],
+                }
+            }
             PanelKind::Changes(id) => {
                 let panel = cx
                     .new(|cx| panels::changes::ChangesPanel::new(id, self.fleet.clone(), window, cx));
@@ -1137,6 +1160,18 @@ impl UnifiedView {
         // `ColumnModel::open` points `focused_index` at the column; move
         // keyboard focus there as well, or the number keys do nothing until
         // the user clicks the panel.
+        self.sync_window_focus(window, cx);
+        cx.notify();
+    }
+
+    /// Alt+J: the user's own recent activity, as a panel (the project journey).
+    fn open_recent_activity(
+        &mut self,
+        _: &UnifiedOpenRecentActivity,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_panel(PanelKind::ProjectJourney, 0, false, window, cx);
         self.sync_window_focus(window, cx);
         cx.notify();
     }
@@ -1467,6 +1502,7 @@ impl Render for UnifiedView {
                 open_code_ref(this.fleet.clone(), node, &action.target, window, cx);
             }))
             .on_action(cx.listener(Self::toggle_pin_focused))
+            .on_action(cx.listener(Self::open_recent_activity))
             .on_action(cx.listener(Self::next_waiting))
             .on_action(cx.listener(Self::prev_waiting))
             .on_action(cx.listener(Self::focus_left))

@@ -18,6 +18,8 @@ fn verify_process_bundle() -> anyhow::Result<()> {
     let phases = manifest.phase_count();
     println!("ok process_root={}", root.display());
     println!("ok manifest_phases={phases}");
+    let skills = tod_core::skills::SkillsPaths::discover()?;
+    println!("ok skills_root={}", skills.root().display());
     Ok(())
 }
 

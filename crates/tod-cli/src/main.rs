@@ -14,6 +14,8 @@ mod capabilities;
 mod decisions;
 mod help;
 mod changeset;
+mod journey;
+mod skills;
 mod doc_sync;
 mod incoming;
 mod learn;
@@ -71,6 +73,8 @@ NOUNS:
     phase                  Whether a node's lifecycle phase is done: status, ready, certify, reject
     wait                   What a node waits on between sessions: a time, an event, a check
     batch                  Run many commands in one call; the reply lists only the failures
+    journey                Read a recorded journey: a node's, or the user's recent activity
+    skills                 Skills for working with tod itself, read only when needed
 
 Run `tod-cli <NOUN> --help` for that noun's commands, or
 `tod-cli help <WORDS>` to find the commands that mention them
@@ -102,6 +106,8 @@ const NOUNS: &[(&str, &str)] = &[
     ("phase", crate::phase::USAGE),
     ("wait", crate::wait::USAGE),
     ("batch", crate::batch::USAGE),
+    ("journey", crate::journey::USAGE),
+    ("skills", crate::skills::USAGE),
 ];
 
 fn main() -> ExitCode {
@@ -326,8 +332,10 @@ fn run(args: &[String]) -> anyhow::Result<String> {
         "phase" => phase::run(invocation),
         "wait" => wait::run(invocation),
         "batch" => batch::run(invocation),
+        "journey" => journey::run(invocation),
+        "skills" => skills::run(invocation),
         other => anyhow::bail!(
-            "unknown noun `{other}` (expected: node, obligations, content, plan, questions, memory, interview, visual-design, capabilities, changeset, tests, review, pr, verdicts, incoming, learn, secrets, db, environment, decisions, phase, wait, batch)"
+            "unknown noun `{other}` (expected: node, obligations, content, plan, questions, memory, interview, visual-design, capabilities, changeset, tests, review, pr, verdicts, incoming, learn, secrets, db, environment, decisions, phase, wait, batch, journey, skills)"
         ),
     }
 }

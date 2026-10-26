@@ -36,6 +36,6 @@ docker run --rm \
       libasound2-dev libvulkan-dev libx11-dev libgtk-3-dev libwebkit2gtk-4.1-dev libsoup-3.0-dev libxdo-dev >/dev/null
     cargo build '"$FLAG"' -p tod -p tod-cli
     for b in tod tod-agentd tod-cli; do cp /target/'"$PROFILE"'/$b /out/; done
-    cp -r /target/'"$PROFILE"'/process /target/'"$PROFILE"'/media /out/ 2>/dev/null || true
+    cp -r /target/'"$PROFILE"'/process /target/'"$PROFILE"'/media /target/'"$PROFILE"'/skills /out/ 2>/dev/null || true
   '
 ls -la target/linux

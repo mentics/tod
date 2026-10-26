@@ -73,7 +73,7 @@ Crates are layered so that each one below only depends on the ones after it.
 The dependency direction is deliberate: **policy depends on transport, never the
 reverse.**
 
-- `crates/tod` — thin launcher binary. Owns `build.rs` (which installs the `process/` and `media/` bundles next to the executable) and little else.
+- `crates/tod` — thin launcher binary. Owns `build.rs` (which installs the `process/`, `media/` and `skills/` bundles next to the executable) and little else.
 - `crates/tod-ui` — all GPUI code: views, app shell, input/focus primitives, the conversation view, interview views, and the dev-only agent control socket.
 - `crates/tod-cli` — the `tod-cli` binary that agents shell out to. Depends on `tod-core` + `tod-store` only (no GPUI, no agent transport) so it starts fast.
 - `crates/tod-core` — policy and orchestration shared by the UI and the CLI: conversation and interview flow, process/phase rules, bundled process- and media-doc resolution, path/settings resolution, the task model, and agent context assembly. Decides *when* and *what* to persist.
@@ -100,7 +100,7 @@ There is a strict precedence for where durable state lives, checked in this orde
 - Never launch `tod` without `--data-root` (or `TOD_DATA_ROOT`). Without one the first-run picker appears, and completing it — including via the agent socket — calls `save_data_root` and overwrites the file.
 - Code or tests that exercise `install.toml` must set `TOD_CONFIG_DIR` to a temp dir first. Don't rely on `XDG_CONFIG_HOME`: `dirs::config_dir()` ignores it on Windows and macOS.
 
-Bundled agent docs resolve separately via `TodInstallPaths` (`TOD_PROCESS_ROOT` env → `{executable_dir}/process/` → walk-up-from-cwd fallback to `assets/process/`) — this is distinct from the data root and holds no user data. Agent context docs resolve the same way via `MediaPaths` (`TOD_MEDIA_ROOT` env → `{executable_dir}/media/` → walk-up to `crates/tod/media/`).
+Bundled agent docs resolve separately via `TodInstallPaths` (`TOD_PROCESS_ROOT` env → `{executable_dir}/process/` → walk-up-from-cwd fallback to `assets/process/`) — this is distinct from the data root and holds no user data. Agent context docs resolve the same way via `MediaPaths` (`TOD_MEDIA_ROOT` env → `{executable_dir}/media/` → walk-up to `crates/tod/media/`). `assets/skills/` (README plus one `<name>.md` per skill; read with `tod-cli skills`, never in a context) ships as `skills/` the same way (`SkillsPaths`: `TOD_SKILLS_ROOT` → `{executable_dir}/skills/` → `{executable_dir}/../skills/` → walk-up to `assets/skills/`), is uploaded to `/opt/tod/skills` in cloud sandboxes (`cloud_sync`), and is installed by `scripts/install.{sh,ps1}`.
 
 ### Agent chat context
 

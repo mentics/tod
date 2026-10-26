@@ -31,10 +31,14 @@ Only some nouns are documented below. All of them:
 
 `node` `obligations` `plan` `content` `capabilities` `changeset` `tests`
 `review` `pr` `verdicts` `incoming` `learn` `secrets` `db` `environment` `decisions` `phase`
-`wait` `batch` `questions` `memory` `interview` `visual-design`
+`wait` `batch` `questions` `memory` `interview` `visual-design` `journey` `skills`
 
 For a noun's commands and rules run `tod-cli <noun> --help`; to find a command
 by topic run `tod-cli help <WORDS>` (e.g. `tod-cli help lifecycle`). Search
 before concluding something cannot be done, and before asking the user to do
 it in the app. An option a command does not know is ignored with a warning on
 stderr, not applied, so heed that warning.
+
+If you are asked to do something you do not know how to do, `tod-cli skills`
+lists skills for working with tod itself (for example, reviewing a journey)
+and `tod-cli skills show <name>` reads one.

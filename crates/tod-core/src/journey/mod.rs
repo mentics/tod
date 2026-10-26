@@ -8,12 +8,13 @@
 pub mod bundle;
 pub mod changes;
 pub mod recorder;
+pub mod reference;
 pub mod snapshot;
 pub mod submit;
 pub mod worker;
 
 pub use bundle::build_bundle;
-pub use recorder::{Recorder, install, record, record_and_get_seq};
+pub use recorder::{Recorder, install, is_recording, record, record_and_get_seq, set_recording};
 pub use snapshot::{ResolvedAgentSettings, SettingsSnapshot, settings_snapshot};
 pub use submit::{AckCursor, FolderRelay, NtfyRelay, Relay, ACK_CURSOR_START};
 pub use worker::WorkerStatus;
@@ -29,6 +30,7 @@ use tod_store::settings::JourneySettings;
 /// works after this returns). Call once, from wherever the app starts the
 /// store and mutation socket — never for a data root that failed to open.
 pub fn start(journeys_dir: PathBuf, store: Arc<FleetStore>, settings: JourneySettings) -> Recorder {
+    set_recording(settings.record);
     let recorder = recorder::spawn(journeys_dir.clone(), settings.storage_cap_mb);
     install(recorder.clone());
     changes::spawn(journeys_dir.clone(), store.clone(), recorder.clone(), settings);

@@ -49,12 +49,15 @@ use tod_store::fleet::FleetStore;
 use chrono::{Local, TimeZone};
 use crate::interview::agent::SharedAgent;
 use crate::interview::{TodPaths, TodSettings};
-use crate::ui::agent_conversation::{bind_panel_host_keys, forward_panel_keys, AgentConversationEvent, AgentConversationPanel, Entry, EntryKind, NoticeTone, PanelAction, PanelNotice};
+use crate::ui::agent_conversation::{bind_panel_host_keys, forward_panel_keys, AgentConversationEvent, AgentConversationPanel, Entry, EntryKind, NoticeTone, PanelAction, PanelNotice, PanelTool};
 use crate::ui::agent_runs::AgentRuns;
 use crate::ui::key_context;
 use crate::ui::session_info::SessionInfo;
 use crate::ui::style;
 use crate::ui::terminal_handoff::{self, CONTINUE_IN_TERMINAL, OPEN_IN_ZED, OPEN_SHELL};
+
+/// The journey tool's id in [`AgentConversationEvent::Action`].
+const INSERT_JOURNEY: &str = "insert-journey";
 use crate::unified::resize::{CHAT_START_HEIGHT, ChatDrawerEdge, DIVIDER_WIDTH, DividerDrag};
 use uuid::Uuid;
 
@@ -390,6 +393,9 @@ impl ChatDrawer {
             AgentConversationEvent::Action(id, _) if id.as_ref() == OPEN_SHELL => {
                 terminal_handoff::open_shell(self.fleet.clone(), self.focus.node_id(), window, cx)
             }
+            AgentConversationEvent::Action(id, _) if id.as_ref() == INSERT_JOURNEY => {
+                self.insert_journey(window, cx)
+            }
             AgentConversationEvent::Action(id, _) if id.as_ref() == RETRY => {
                 if let Some(text) = self.failed_message() {
                     self.send(&text, Vec::new(), window, cx);
@@ -598,6 +604,30 @@ impl ChatDrawer {
         .detach();
     }
 
+    /// Appends the reference to this focus's journey (a node's, else the
+    /// user's recent activity), and how an agent reads it, to the message
+    /// being written. Journeys are never in an agent's context, so the text
+    /// carries the command (`tod_core::journey::reference`).
+    fn insert_journey(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        use tod_core::journey::reference::{PROJECT_REFERENCE, agent_snippet, node_reference};
+        let reference = match self.focus.node_id() {
+            Some(id) => match self.fleet.get_node(&id.to_string()) {
+                Ok(Some(node)) => node_reference(&node.slug),
+                _ => node_reference(&id.to_string()),
+            },
+            None => PROJECT_REFERENCE.to_string(),
+        };
+        let snippet = agent_snippet(&reference);
+        let input = self.transcript.read(cx).input().clone();
+        let current = input.read(cx).value().to_string();
+        let text = if current.trim().is_empty() {
+            snippet
+        } else {
+            format!("{}\n\n{snippet}", current.trim_end())
+        };
+        self.transcript.update(cx, |panel, cx| panel.set_input(&text, window, cx));
+    }
+
     fn on_agent_runs_changed(&mut self, cx: &mut Context<Self>) {
         let was_running = self.status.running;
         self.refresh_status(cx);
@@ -622,7 +652,16 @@ impl ChatDrawer {
         if self.status.running && !self.status.parts.is_empty() {
             entries.push(Entry::live_reply(self.status.parts.clone()));
         }
-        let tools = terminal_handoff::tools(self.focus.node_id(), self.status.running);
+        let mut tools = terminal_handoff::tools(self.focus.node_id(), self.status.running);
+        tools.push(PanelTool::new(
+            INSERT_JOURNEY,
+            gpui_kit_assets::IconName::RotateCcwClock,
+            if self.focus.node_id().is_some() {
+                "Add this node's journey to your message"
+            } else {
+                "Add your recent activity to your message"
+            },
+        ));
         let notices = if self.failed_message().is_some() {
             let mut notice = PanelNotice::new(NoticeTone::Error, "The agent's turn failed.");
             notice.action = Some(PanelAction::new(RETRY, "Retry"));
@@ -1135,6 +1174,23 @@ mod tests {
                 .any(|e| e.kind == EntryKind::Agent)
         });
         assert!(has_reply, "the mock agent's reply should be in the transcript");
+    }
+
+    #[gpui::test]
+    fn the_journey_tool_adds_the_nodes_reference_to_the_message(cx: &mut TestAppContext) {
+        let fixture = Fixture::new();
+        let agent = mock_agent();
+        let (drawer, _runs, cx) = open_drawer(&fixture, agent, cx);
+        drawer.update(cx, |d, cx| d.set_focus(Focus::Node(fixture.node_id), cx));
+        let panel = drawer.read_with(cx, |d, _| d.transcript.clone());
+        cx.update_window(cx.window_handle(), |_, window, cx| {
+            panel.update(cx, |p, cx| p.set_input("How did it go?", window, cx));
+            drawer.update(cx, |d, cx| d.insert_journey(window, cx));
+        })
+        .unwrap();
+        let text = panel.read_with(cx, |p, cx| p.input().read(cx).value().to_string());
+        assert!(text.starts_with("How did it go?\n\nJourney (a node's): journey:node/"), "{text}");
+        assert!(text.contains("tod-cli journey show"), "{text}");
     }
 
     #[gpui::test]
