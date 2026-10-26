@@ -16,8 +16,9 @@ Inside a conversation `--node` defaults to the node it is about.
   the app's verdict right now, and the phase's certificate: none, current
   (who certified it, and their note), or stale, with what changed since it
   was certified.
-- `ready`: the phase's work is done; have it evaluated. A separate session
-  then judges it and certifies it or sends it back.
+- `ready`: the phase's work is done; have it evaluated. It takes no flags and
+  no note: the evaluator judges from the node's own data and your reply. A
+  separate session then judges it and certifies it or sends it back.
 - `certify --note`: the phase is done. The app records a digest of what you
   judged, and the gate passes only while it is unchanged: any later edit to
   what the phase covers makes the certificate stale, and the phase comes back

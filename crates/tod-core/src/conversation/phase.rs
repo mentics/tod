@@ -19,6 +19,7 @@ use super::protocol::{
 };
 use crate::context_recipes::{EVALUATE, PHASE};
 use crate::gate::context::build_phase_message;
+use crate::usual_actions::Role;
 use crate::phase::{PhaseStanding, PhaseStep, independent_evaluation, render_status};
 use anyhow::{Context, Result};
 use rusqlite::Connection;
@@ -159,11 +160,22 @@ fn opening_for(
     env: &ProtocolEnv<'_>,
     recipe: &crate::context_recipes::ContextRecipe,
     purpose: &str,
+    role: Role,
 ) -> Result<String> {
     let (state, to) = transition(env)?;
     let node = node_id(env)?;
     let request = build_request(env, node, &state, &to, Vec::new())?;
-    let tail = format!("\n{}", status(env, node, &state)?);
+    // The commands this role usually runs in this state, ahead of the status
+    // that says what the gate lacks (`cli/usual-actions.yml`).
+    let usual = crate::usual_actions::render(
+        env.media,
+        role,
+        &state,
+        independent_evaluation(env.data_root),
+    )?
+    .map(|section| format!("\n{section}"))
+    .unwrap_or_default();
+    let tail = format!("{usual}\n{}", status(env, node, &state)?);
     build_phase_message(env.media, recipe, &request, &role_doc(&state)?, purpose, &tail)
 }
 
@@ -239,7 +251,7 @@ impl Protocol for PhaseProtocol {
     }
 
     fn opening(&self, env: &ProtocolEnv<'_>) -> Result<String> {
-        opening_for(env, &PHASE, "phase")
+        opening_for(env, &PHASE, "phase", Role::Phase)
     }
 
     /// The user's own edits and reversals since the last turn, as the
@@ -349,7 +361,7 @@ impl Protocol for EvaluateProtocol {
     }
 
     fn opening(&self, env: &ProtocolEnv<'_>) -> Result<String> {
-        opening_for(env, &EVALUATE, "evaluate")
+        opening_for(env, &EVALUATE, "evaluate", Role::Evaluate)
     }
 
     fn resume_snapshot(

@@ -64,6 +64,7 @@ pub mod wait_cadence;
 pub mod session_name;
 pub mod stop_questions;
 pub mod task;
+pub mod usual_actions;
 pub mod visual_design;
 pub mod workbench_layout;
 

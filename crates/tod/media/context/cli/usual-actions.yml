@@ -1,0 +1,118 @@
+# What a lifecycle agent usually does with `tod-cli`, by role and state.
+#
+# This is a guide, not a limit: it exists so an agent starts from the commands
+# its situation most likely needs instead of working them out from every
+# noun's reference. Nothing enforces it, and an agent may step outside it when
+# the work calls for that. The commands' syntax is documented in the `cli/`
+# fragments; each `run` here names a real `<noun> <verb>` (a test in `tod-cli`
+# checks that), and `say` only adds what is particular to this situation.
+#
+# Today this ships with the app. It is shaped so it could move to the data
+# root and be edited there, but nothing reads it from there yet.
+#
+# An entry applies when its `role` is the agent's, its `states` include the
+# node's state (omitted: every state), and its `independent_evaluation`
+# matches the setting (omitted: either). Entries whose conditions hold are
+# shown together, in file order.
+#
+# roles:  phase     the state's phase agent
+#         evaluate  the independent evaluator of a phase
+
+# ── Phase agent: every state ────────────────────────────────────────────────
+- role: phase
+  title: Reading
+  actions:
+    - run: phase status
+      say: What the gate checks, the certificate, and what was sent back.
+    - run: decisions ask <QUESTION>
+      say: Only for what only the user can supply; with `--option` where the answers can be listed. End your turn after asking.
+
+- role: phase
+  independent_evaluation: true
+  title: Finishing
+  actions:
+    - run: phase ready
+      say: No flags, and no note; there is nowhere to attach one. Whatever the evaluator needs to judge goes in the node's own data (obligations, plan, content) or in your reply, which it reads.
+
+- role: phase
+  independent_evaluation: false
+  title: Finishing
+  actions:
+    - run: phase certify --note <TEXT>
+      say: One line on why the phase is done. The note is required.
+
+# ── Phase agent: by state ───────────────────────────────────────────────────
+- role: phase
+  states: [proposed]
+  title: Your work
+  actions:
+    - run: obligations add --node <UUID> --kind requirement --phase requirements --body <TEXT>
+      say: Each requirement concrete and checkable. Never restate an inherited one.
+    - run: content set --node <UUID> --type details --body <TEXT>
+      say: Fill in the node's details when it has none.
+
+- role: phase
+  states: [design]
+  title: Your work
+  actions:
+    - run: content set --node <UUID> --type summary --body <TEXT>
+      say: First, regenerate the summary from the details and the settled requirements.
+    - run: obligations add --node <UUID> --kind constraint --phase design --body <TEXT>
+      say: Set where each acts with `--acts-in`.
+    - run: content set --node <UUID> --type design --body <TEXT>
+    - run: obligations check-refs --node <UUID>
+      say: Prints nothing when every `[[slug]]` resolves.
+
+- role: phase
+  states: [planning]
+  title: Your work
+  actions:
+    - run: content set --node <UUID> --type summary --body <TEXT>
+      say: First, regenerate the summary from the settled design.
+    - run: plan add --node <UUID> --body <TEXT> --phase active
+      say: Each step an action, never a check; `--phase` is the phase that can take it.
+    - run: plan depend <STEP_ID> --on <STEP_ID>
+      say: Only where the order is real.
+    - run: plan satisfy <STEP_ID> --obligation <OBLIGATION_UUID>
+      say: Every requirement needs a step that satisfies it.
+
+- role: phase
+  states: [merged, released]
+  title: Your work
+  actions:
+    - run: plan list --node <UUID>
+      say: Take this phase's steps in dependency order.
+    - run: plan update <STEP_ID> --status verified
+      say: Each step is done and verified here, in this phase.
+    - run: verdicts record <OBLIGATION_ID> --status verified --evidence <TEXT>
+      say: For each obligation only this phase's steps deliver.
+    - run: environment list
+      say: What access you have to the released environment.
+
+- role: phase
+  states: [learn]
+  title: Your work
+  actions:
+    - run: learn list
+      say: Check first whether this pass's retrospective is already recorded.
+    - run: learn record --content <TEXT>
+      say: Recording it is what passes the gate; there is no `phase` step in this state.
+
+# ── Evaluator: every certifiable state ──────────────────────────────────────
+- role: evaluate
+  title: Reading
+  actions:
+    - run: phase status
+      say: The gate, the certificate, and what changed since it.
+    - run: obligations list --node <UUID>
+    - run: plan list --node <UUID>
+
+- role: evaluate
+  title: Your verdict
+  actions:
+    - run: phase certify --note <TEXT>
+      say: Every item on the checklist holds. One line on why.
+    - run: phase reject --fix <TEXT>
+      say: One `--fix` per problem, saying what is wrong and what would make it right.
+    - run: decisions ask <QUESTION>
+      say: Only for what no agent can settle. End your turn after asking.
