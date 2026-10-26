@@ -361,6 +361,10 @@ pub trait Orchestrator {
     ) -> Result<(tod_problems::Cursor, Vec<tod_problems::Problem>)>;
 }
 
+/// How many times a request that is safe to repeat is sent while the
+/// gateway answers 502/503/504 (pauses of 2 s, then 4 s between them).
+const GATEWAY_ATTEMPTS: u32 = 3;
+
 /// The orchestrator over HTTP(S).
 pub struct HttpOrchestrator {
     base: String,
@@ -449,12 +453,38 @@ impl HttpOrchestrator {
         }
     }
 
+    /// Sends the request `make` builds, again after a pause while the gateway
+    /// answers 502/503/504 ("could not proxy the request to the workload":
+    /// the orchestrator's sandbox is waking or restarting), up to
+    /// [`GATEWAY_ATTEMPTS`] times. Only for requests that are safe to repeat:
+    /// the feed and problem pulls read, and an outbox replays harmlessly (the
+    /// orchestrator skips a row that already holds the sender's `after`, and
+    /// the sent cursor moves only on success). The last reply is returned for
+    /// [`Self::finish`] to report.
+    fn with_gateway_retry(
+        what: &str,
+        make: impl Fn() -> Result<ureq::http::Response<ureq::Body>, ureq::Error>,
+    ) -> Result<ureq::http::Response<ureq::Body>> {
+        for attempt in 1.. {
+            let resp = make().with_context(|| format!("orchestrator {what}"))?;
+            if matches!(resp.status().as_u16(), 502 | 503 | 504) && attempt < GATEWAY_ATTEMPTS {
+                let wait = Duration::from_secs(1 << attempt);
+                tracing::info!("orchestrator {what}: {} from the gateway; retrying in {wait:?} (attempt {attempt} of {GATEWAY_ATTEMPTS})", resp.status());
+                std::thread::sleep(wait);
+                continue;
+            }
+            return Ok(resp);
+        }
+        unreachable!()
+    }
+
     fn finish(mut resp: ureq::http::Response<ureq::Body>, what: &str) -> Result<serde_json::Value> {
         let status = resp.status();
         let body = resp.body_mut().read_to_string().unwrap_or_default();
         if !status.is_success() {
-            let body: String = body.chars().take(400).collect();
-            bail!("orchestrator {what}: {status}: {body}");
+            // The raw reply goes to the error log; the error carries what it says.
+            tracing::debug!("orchestrator {what}: {status}: {body}");
+            bail!("orchestrator {what}: {}", tod_sandbox::blaxel::describe_failure(status, &body));
         }
         serde_json::from_str(&body).with_context(|| format!("orchestrator {what}: not JSON"))
     }
@@ -480,19 +510,14 @@ impl Orchestrator for HttpOrchestrator {
     }
 
     fn send(&self, user: &str, changes: &[Change]) -> Result<ApplyReport> {
-        let resp = self
-            .auth(self.agent.post(&self.url(user, "changes")))
-            .send_json(changes)
-            .context("orchestrator changes")?;
+        let resp = Self::with_gateway_retry("changes", || self.auth(self.agent.post(&self.url(user, "changes"))).send_json(changes))?;
         let v = Self::finish(resp, "changes").map_err(older_orchestrator_hint)?;
         Ok(serde_json::from_value(v)?)
     }
 
     fn pull(&self, user: &str, after: i64) -> Result<(i64, Vec<Change>)> {
-        let resp = self
-            .auth(self.agent.get(&self.url(user, &format!("changes?after={after}"))))
-            .call()
-            .context("orchestrator feed")?;
+        let url = self.url(user, &format!("changes?after={after}"));
+        let resp = Self::with_gateway_retry("feed", || self.auth(self.agent.get(&url)).call())?;
         let mut v = Self::finish(resp, "feed")?;
         let last = v["last_seq"].as_i64().ok_or_else(|| anyhow!("orchestrator feed: no last_seq"))?;
         let changes = serde_json::from_value(v["changes"].take())?;
@@ -504,10 +529,8 @@ impl Orchestrator for HttpOrchestrator {
         user: &str,
         cursor: Option<&tod_problems::Cursor>,
     ) -> Result<(tod_problems::Cursor, Vec<tod_problems::Problem>)> {
-        let resp = self
-            .auth(self.agent.post(&self.url(user, "problems/pull")))
-            .send_json(serde_json::json!({ "cursor": cursor }))
-            .context("orchestrator problems")?;
+        let body = serde_json::json!({ "cursor": cursor });
+        let resp = Self::with_gateway_retry("problems", || self.auth(self.agent.post(&self.url(user, "problems/pull"))).send_json(&body))?;
         let v = Self::finish(resp, "problems")?;
         let cursor = serde_json::from_value(v["cursor"].clone()).context("orchestrator problems: cursor")?;
         let problems = v["problems"].as_array().map(|a| a.iter().filter_map(tod_problems::from_json).collect()).unwrap_or_default();

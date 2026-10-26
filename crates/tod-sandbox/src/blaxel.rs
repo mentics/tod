@@ -169,7 +169,7 @@ fn check(resp: &mut ureq::http::Response<ureq::Body>, what: &str) -> Result<()> 
 /// (or a top-level `message`/`error` string) with the status and the API's
 /// `code`, and "retryable" when it says so. A body that is not that shape
 /// is shown as it is, cut short.
-fn describe_failure(status: ureq::http::StatusCode, body: &str) -> String {
+pub fn describe_failure(status: ureq::http::StatusCode, body: &str) -> String {
     let parsed: Option<Value> = serde_json::from_str(body).ok();
     let err = parsed.as_ref().map(|v| if v["error"].is_object() { &v["error"] } else { v });
     let message = err
