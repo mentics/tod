@@ -215,7 +215,16 @@ impl Replica {
     /// and sends it now, so the app hears without waiting for the next
     /// boundary.
     pub fn cloud_beat(&mut self, node: Uuid) -> Result<()> {
-        let what = self.store.get_node(&node.to_string())?.map(|n| n.lifecycle).unwrap_or_default();
+        let Some(found) = self.store.get_node(&node.to_string())? else {
+            anyhow::bail!(
+                "node {node} is not in the supervisor's copy of the orchestrator's database (seeded at change {}, pulled to {}): \
+                 the orchestrator does not have it, so the app has not sent it there yet (or the orchestrator's data was reset); \
+                 sync the app, then reinstall and restart",
+                self.cursors.push_after,
+                self.cursors.pull_after
+            );
+        };
+        let what = found.lifecycle;
         let conn = connect(&self.db())?;
         tod_store::cloud_activity::beat(&conn, node, &what, tod_store::outline::uuid_blob::now_ms())?;
         drop(conn);
