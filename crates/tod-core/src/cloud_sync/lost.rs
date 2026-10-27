@@ -156,7 +156,9 @@ pub fn check(fleet: &FleetStore, check: Check) -> Result<usize> {
         }
         Check::Marked => None,
     };
-    let lost = lost_rows(&rows, listing.as_deref());
+    let deleted = CloudSyncState::load(&root)?.deleted_by_user;
+    let mut lost = lost_rows(&rows, listing.as_deref());
+    lost.retain(|row| !deleted.contains(&row.node_id.to_string()));
     let mut replaced = 0;
     for row in &lost {
         let id = row.node_id.to_string();
@@ -312,7 +314,10 @@ pub fn spawn_check(fleet: Arc<FleetStore>, kind: Check) {
 
 /// Whether any cloud node carries the orchestrator's lost mark.
 pub fn any_marked(fleet: &FleetStore) -> bool {
-    fleet.read(cloud_nodes::list).is_ok_and(|rows| rows.iter().any(|r| r.lost_at.is_some()))
+    let root = fleet.paths().root();
+    fleet.read(cloud_nodes::list).is_ok_and(|rows| {
+        rows.iter().any(|r| r.lost_at.is_some() && !super::sandbox_deleted_by_user(root, &r.node_id.to_string()))
+    })
 }
 
 /// The user takes `node_id` out of the cloud: its row goes, then (when
@@ -326,12 +331,18 @@ pub fn stop_running_in_cloud(fleet: &FleetStore, node_id: &str, delete_sandbox: 
     fleet.writer().flush()?;
     let _ = fleet.reload_if_stale();
     set_note(node_id, None);
+    super::set_sandbox_deleted_by_user(&root, node_id, false)?;
     let mut message = "No longer runs in the cloud.".to_string();
     if delete_sandbox && let Some(row) = &row {
         let mut sandboxes = tod_store::fleet::sandbox::Sandboxes::load(&root)?;
         let bx = sandboxes.blaxel()?;
-        sandboxes.delete(&bx, &row.sandbox).with_context(|| format!("delete sandbox {}", row.sandbox))?;
-        message = format!("No longer runs in the cloud; sandbox {} deleted.", row.sandbox);
+        if bx.get(&row.sandbox).with_context(|| format!("look up sandbox {}", row.sandbox))?.is_none() {
+            sandboxes.forget(&row.sandbox)?;
+            message = format!("No longer runs in the cloud; sandbox {} was already gone.", row.sandbox);
+        } else {
+            sandboxes.delete(&bx, &row.sandbox).with_context(|| format!("delete sandbox {}", row.sandbox))?;
+            message = format!("No longer runs in the cloud; sandbox {} deleted.", row.sandbox);
+        }
     }
     if CloudSyncState::load(&root).is_ok_and(|s| s.seeded) {
         let (orch, user) = resolve(&root)?;
@@ -341,7 +352,8 @@ pub fn stop_running_in_cloud(fleet: &FleetStore, node_id: &str, delete_sandbox: 
 }
 
 /// Deletes the node's cloud sandbox in Blaxel, leaving its `cloud_nodes` row
-/// so the next lost-sandbox check replaces it. A sandbox Blaxel does not have
+/// marked lost and remembering the user did it, so no lost-sandbox check
+/// replaces it: only running the node in the cloud again does. A sandbox Blaxel does not have
 /// is not an error: the message says so. Blocks on the network.
 pub fn delete_node_sandbox(fleet: &FleetStore, node_id: &str) -> Result<String> {
     let root = fleet.paths().root().to_path_buf();
@@ -359,6 +371,7 @@ pub fn delete_node_sandbox(fleet: &FleetStore, node_id: &str) -> Result<String> 
         format!("Deleted sandbox {}.", row.sandbox)
     };
     // The sandbox is gone either way: record it so the panel offers to run the node again.
+    super::set_sandbox_deleted_by_user(&root, node_id, true)?;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
@@ -383,6 +396,18 @@ mod tests {
             context_changed_at: None,
             lost_at,
         }
+    }
+
+    #[test]
+    fn a_sandbox_the_user_deleted_is_remembered_until_the_node_runs_again() {
+        let dir = std::env::temp_dir().join(format!("tod-deleted-by-user-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(!crate::cloud_sync::sandbox_deleted_by_user(&dir, "n"));
+        crate::cloud_sync::set_sandbox_deleted_by_user(&dir, "n", true).unwrap();
+        assert!(crate::cloud_sync::sandbox_deleted_by_user(&dir, "n"));
+        crate::cloud_sync::set_sandbox_deleted_by_user(&dir, "n", false).unwrap();
+        assert!(!crate::cloud_sync::sandbox_deleted_by_user(&dir, "n"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

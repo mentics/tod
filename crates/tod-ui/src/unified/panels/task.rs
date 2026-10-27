@@ -914,7 +914,7 @@ impl TaskPanel {
                 crate::views::cloud_node::stop_running(
                     self.fleet.clone(),
                     node.to_string(),
-                    false,
+                    true,
                     cx,
                     move |this, update, cx| this.on_cloud_update(node, update, cx),
                 );
@@ -1218,7 +1218,11 @@ impl TaskPanel {
                 // What woke it (a release, a merge) found nothing there: the
                 // orchestrator marked it, and the app makes a new one at its
                 // next sync, so a closed app leaves the node waiting for it.
-                text.push_str(", its sandbox is gone: the app makes a new one when it next syncs");
+                if tod_core::cloud_sync::sandbox_deleted_by_user(self.fleet.paths().root(), &self.node_id.to_string()) {
+                    text.push_str(", its sandbox was deleted: run it in the cloud to make a new one");
+                } else {
+                    text.push_str(", its sandbox is gone: the app makes a new one when it next syncs");
+                }
             }
             line = line.child(sep()).child(style::text_muted(div().flex_auto().min_w(gpui::px(160.))).child(
                 selectable_text("unified-task-runner-cloud", text, window, cx),
