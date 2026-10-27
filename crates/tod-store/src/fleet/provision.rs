@@ -198,7 +198,7 @@ fn stale_message(files: &ResolvedFiles, stale: &FilesLocation) -> String {
 }
 
 /// One lock per node, so two launches at once don't both make its location.
-fn node_lock(node_id: &str) -> Arc<Mutex<()>> {
+pub(super) fn node_lock(node_id: &str) -> Arc<Mutex<()>> {
     static LOCKS: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
     LOCKS
         .get_or_init(Default::default)
@@ -268,6 +268,13 @@ pub fn make_location(
     let dir = location
         .directory()
         .ok_or_else(|| anyhow!("made {} but found no directory in it", location.describe()))?;
+    let mut warnings = warnings;
+    if location.sandbox().is_some() {
+        // A sandbox that expired took its uncommitted work with it; the
+        // last checkpoint is on the remote (`fleet::checkpoint`).
+        progress("Looking for saved work…");
+        warnings.extend(crate::fleet::node_checkpoint::restore_into(&dir, node_id));
+    }
     Ok((dir, warnings))
 }
 
@@ -740,7 +747,7 @@ pub fn node_location(fleet: &FleetStore, node_id: &str) -> Result<Option<FilesLo
     fleet.read(|conn| FilesLocationRepo::new(conn).get(node_id))
 }
 
-fn location_dir(location: &FilesLocation) -> Result<Workdir> {
+pub(super) fn location_dir(location: &FilesLocation) -> Result<Workdir> {
     location
         .directory()
         .ok_or_else(|| anyhow!("{} has no directory recorded", location.describe()))
@@ -779,7 +786,7 @@ fn submodule_dirty_lines(dir: &Workdir) -> Result<Vec<String>> {
 /// Every repository in `dir`'s checkout, submodules (recursively) first and
 /// `dir` itself last, so a change in a submodule is dealt with before the
 /// parent that records it.
-fn repos_deepest_first(dir: &Workdir) -> Result<Vec<Workdir>> {
+pub(super) fn repos_deepest_first(dir: &Workdir) -> Result<Vec<Workdir>> {
     let mut repos = worktree::submodule_dirs(dir)?;
     repos.reverse();
     repos.push(dir.clone());
@@ -821,6 +828,11 @@ pub fn discard_location_changes(fleet: &FleetStore, node_id: &str) -> Result<()>
         repo.git(&["reset", "--hard", "-q"])?;
         repo.git(&["clean", "-fdq"])?;
     }
+    if location.sandbox().is_some() {
+        // Discarded on purpose: a checkpoint must not bring it back.
+        crate::fleet::node_checkpoint::delete_in(&dir, node_id)
+            .context("the changes were discarded, but their checkpoint could not be deleted")?;
+    }
     Ok(())
 }
 
@@ -861,7 +873,18 @@ pub fn push_node_branch(fleet: &FleetStore, node_id: &str) -> Result<Option<Stri
         bail!("{branch} is a default branch; a node pushes only its own");
     }
     push_branches(&dir)?;
+    // Everything is committed and pushed: a checkpoint of work that has
+    // since been committed would only bring it back a second time.
+    if location.sandbox().is_some() && location_state_is_clean(&dir)? {
+        crate::fleet::node_checkpoint::delete_in(&dir, node_id)?;
+    }
     Ok(Some(branch))
+}
+
+fn location_state_is_clean(dir: &Workdir) -> Result<bool> {
+    let mut lines = dir.git(&["status", "--porcelain", "--ignore-submodules=all"])?.lines().count();
+    lines += submodule_dirty_lines(dir)?.len();
+    Ok(lines == 0)
 }
 
 /// Push the branch of `dir` and of each submodule that is on one (a
@@ -913,6 +936,11 @@ pub fn remove_location(
             let dir = location_dir(&location)?;
             progress(&format!("pushing the branch in {}…", location.describe()));
             push_branches(&dir).with_context(|| format!("{} was kept", location.describe()))?;
+            if location.sandbox().is_some() {
+                // Clean and pushed: nothing a checkpoint holds is wanted.
+                crate::fleet::node_checkpoint::delete_in(&dir, node_id)
+                    .with_context(|| format!("{} was kept", location.describe()))?;
+            }
             progress(&format!("removing {}…", location.describe()));
             if let Some(name) = location.sandbox() {
                 let mut sandboxes = Sandboxes::load(fleet.paths().root())?;

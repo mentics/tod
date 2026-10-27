@@ -380,6 +380,7 @@ impl UnifiedView {
     ) -> gpui::Task<()> {
         cx.spawn_in(window, async move |this, cx| {
             let mut rx = fleet.subscribe_changes();
+            let mut checkpoints = tod_core::checkpoint::Tracker::default();
             loop {
                 let Ok(selected) = this.update(cx, |this, cx| this.task_list.read(cx).selected_node_id()) else {
                     break;
@@ -399,6 +400,33 @@ impl UnifiedView {
                         (attention_feed::compute(&fleet_for_read, &data_root), cloud, is_task)
                     })
                     .await;
+                // A node that just turned to you (or has worked a while) has
+                // its uncommitted sandbox work checkpointed to the remote,
+                // off the UI thread; what fails is said, not dropped.
+                let due = checkpoints.due(&computed.standings, tod_store::outline::uuid_blob::now_ms());
+                if !due.nodes.is_empty() || due.sweep {
+                    let fleet_for_checkpoint = fleet.clone();
+                    let failures = cx
+                        .background_executor()
+                        .spawn(async move { tod_core::checkpoint::run(&fleet_for_checkpoint, &due) });
+                    this.update(cx, |_, cx| {
+                        cx.spawn(async move |this, cx| {
+                            let failures = failures.await;
+                            if failures.is_empty() {
+                                return;
+                            }
+                            tracing::error!("{}", failures.join("; "));
+                            this.update(cx, |this, cx| {
+                                this.task_list.update(cx, |task_list, cx| {
+                                    task_list.set_status_message(failures.join("; "), cx);
+                                });
+                            })
+                            .ok();
+                        })
+                        .detach();
+                    })
+                    .ok();
+                }
                 let Ok(()) = this.update_in(cx, |this, window, cx| {
                     this.apply_feed(computed, cx);
                     this.apply_cloud_working(cloud, cx);
