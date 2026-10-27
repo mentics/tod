@@ -168,11 +168,104 @@ fn finished(fleet: &FleetStore, node: &str) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fleet::provision::node_location;
 
     #[test]
     fn a_submodule_is_named_by_its_path_from_the_checkout() {
         let root = Workdir::sandbox("sb", "/workspace");
         assert_eq!(rel(&root, &root), "");
         assert_eq!(rel(&root, &root.join("lib/a")), "lib/a");
+    }
+
+    /// The whole path, on a real cloud sandbox and GitHub. Needs
+    /// `TOD_TEST_E2E_ROOT` (a scratch copy of a data root with sandboxes.toml,
+    /// credentials, and a node under a sandbox location) and
+    /// `TOD_TEST_E2E_NODE` (that node's slug), with `tod-sandbox` built.
+    /// Makes the node's sandbox, leaves uncommitted work in it, checkpoints,
+    /// deletes the sandbox (as an expiry would), makes it again, and expects
+    /// the work back. Deletes the sandbox and the checkpoint at the end.
+    #[test]
+    fn a_node_whose_sandbox_expired_gets_its_uncommitted_work_back() {
+        use crate::fleet::provision::{resolve_launch_cwd_with, retry_if_sandbox_lost};
+        use crate::fleet::sandbox::{self, Sandboxes};
+        let (Ok(root), Ok(slug)) = (std::env::var("TOD_TEST_E2E_ROOT"), std::env::var("TOD_TEST_E2E_NODE")) else {
+            eprintln!("skipped: set TOD_TEST_E2E_ROOT and TOD_TEST_E2E_NODE");
+            return;
+        };
+        let root = std::fs::canonicalize(root).unwrap();
+        sandbox::set_data_root(&root);
+        crate::paths::set_data_root(root.clone());
+        let fleet = FleetStore::open(&root).unwrap();
+        let node = fleet
+            .read(|conn| NodeRepo::new(conn).get_by_slug(&slug))
+            .unwrap()
+            .expect("node")
+            .id
+            .to_string();
+        let say = |what: &str| eprintln!("[e2e] {what}");
+        let sh = |dir: &Workdir, script: &str| {
+            let out = dir.output("sh", &["-c", script]).unwrap();
+            assert!(out.status.success(), "{script}: {}", String::from_utf8_lossy(&out.stderr));
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+
+        say("making the node's sandbox (a fork), then its checkout");
+        let (dir, warnings) = resolve_launch_cwd_with(&fleet, &node, &mut |step| say(step)).unwrap();
+        say(&format!("sandbox ready: {dir} (warnings: {warnings:?})"));
+        let first_sandbox = dir.sandbox_name().expect("a sandbox").to_string();
+
+        let result = (|| -> anyhow::Result<()> {
+            let baseline = dir.git(&["status", "--porcelain", "--ignore-submodules=all"])?;
+            sh(&dir, "echo 'work that only exists in this sandbox' > ckpt-e2e-new.txt");
+            say("checkpointing");
+            let saved = checkpoint_node(&fleet, &node)?.expect("a sandbox location");
+            say(&format!("saved: {saved:?}"));
+            let root_saved = saved.iter().find(|(rel, _)| rel.is_empty()).expect("the checkout itself");
+            anyhow::ensure!(matches!(root_saved.1, Saved::Pushed { .. }), "{saved:?}");
+            let reference = checkpoint::ref_name(&node, "");
+            anyhow::ensure!(checkpoint::remote_ref(&dir, &reference)?.is_some(), "not on origin");
+            anyhow::ensure!(checkpoint_node(&fleet, &node)?.unwrap().iter().find(|(r, _)| r.is_empty()).unwrap().1 == Saved::Unchanged, "a repeat checkpoint pushed again");
+
+            say("deleting the sandbox, as an expiry would");
+            let mut sandboxes = Sandboxes::load(&root)?;
+            let bx = sandboxes.blaxel()?;
+            sandboxes.delete(&bx, &first_sandbox)?;
+            // Blaxel keeps a deleted sandbox listed as TERMINATED for a while;
+            // what the app acts on is the launch finding "no sandbox named",
+            // so take that step (`retry_if_sandbox_lost` does) and move on.
+            anyhow::ensure!(
+                crate::fleet::provision::forget_lost_sandbox(
+                    &fleet,
+                    &node,
+                    &first_sandbox,
+                    &format!("no sandbox named {first_sandbox}")
+                )?,
+                "the location was not forgotten"
+            );
+            say("launching again: the sandbox is gone, so a new one is made and the work restored");
+            let (dir2, warnings2) = retry_if_sandbox_lost(&fleet, &node, || {
+                resolve_launch_cwd_with(&fleet, &node, &mut |step| say(step))
+            })?;
+            say(&format!("new sandbox: {dir2} (warnings: {warnings2:?})"));
+                        anyhow::ensure!(warnings2.iter().any(|w| w.contains("Restored")), "no restore reported: {warnings2:?}");
+            anyhow::ensure!(sh(&dir2, "cat ckpt-e2e-new.txt") == "work that only exists in this sandbox", "restored content differs");
+            let after = dir2.git(&["status", "--porcelain", "--ignore-submodules=all"])?;
+            anyhow::ensure!(after.lines().count() == baseline.lines().count() + 1, "status after restore: {after}");
+            Ok(())
+        })();
+
+        say("cleaning up");
+        let current = node_location(&fleet, &node).unwrap();
+        if let Some(location) = current {
+            let dir = location_dir(&location).unwrap();
+            let deleted = delete_in(&dir, &node);
+            say(&format!("checkpoints deleted: {deleted:?}"));
+            if let Some(name) = location.sandbox() {
+                let mut sandboxes = Sandboxes::load(&root).unwrap();
+                let bx = sandboxes.blaxel().unwrap();
+                let _ = sandboxes.delete(&bx, name);
+            }
+        }
+        result.unwrap();
     }
 }
