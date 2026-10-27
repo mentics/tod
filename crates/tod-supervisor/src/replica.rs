@@ -23,7 +23,7 @@
 
 use crate::orchestrator::Orchestrator;
 use anyhow::{Context, Result};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -215,7 +215,18 @@ impl Replica {
     /// and sends it now, so the app hears without waiting for the next
     /// boundary.
     pub fn cloud_beat(&mut self, node: Uuid) -> Result<()> {
-        let Some(found) = self.store.get_node(&node.to_string())? else {
+        let conn = connect(&self.db())?;
+        // Asked of the connection that writes the row, not the store's cached
+        // view: the row's foreign key is checked against this database.
+        let what: Option<String> = conn
+            .query_row(
+                "SELECT COALESCE((SELECT state FROM node_lifecycle WHERE node_id = n.id), 'proposed')
+                 FROM nodes n WHERE n.id = ?1",
+                params![node.as_bytes().to_vec()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(what) = what else {
             anyhow::bail!(
                 "node {node} is not in the supervisor's copy of the orchestrator's database (seeded at change {}, pulled to {}): \
                  the orchestrator does not have it, so the app has not sent it there yet (or the orchestrator's data was reset); \
@@ -224,11 +235,10 @@ impl Replica {
                 self.cursors.pull_after
             );
         };
-        let what = found.lifecycle;
-        let conn = connect(&self.db())?;
-        tod_store::cloud_activity::beat(&conn, node, &what, tod_store::outline::uuid_blob::now_ms())?;
+        tod_store::cloud_activity::beat(&conn, node, &what, tod_store::outline::uuid_blob::now_ms())
+            .context("recording the heartbeat in the supervisor's copy")?;
         drop(conn);
-        self.push()?;
+        self.push().context("sending the heartbeat (and the copy's other changes) to the orchestrator")?;
         Ok(())
     }
 
