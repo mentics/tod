@@ -161,15 +161,17 @@ fn file_sizes(repo: &Workdir, paths: &[String]) -> Result<Vec<(String, u64)>> {
     Ok(sizes)
 }
 
-/// Whether `path` holds text (`grep -I` treats a file with a NUL byte as
-/// binary and matches nothing in it).
+/// Whether `path` is binary: a NUL byte in its first 8000 bytes, which is
+/// git's own test. (`grep -I` is not used: busybox's, as on Alpine
+/// sandboxes, treats such a file as text.)
 fn is_binary(repo: &Workdir, path: &str) -> Result<bool> {
+    const SCRIPT: &str = r#"f="./$0"; a=$(head -c 8000 "$f" | wc -c); b=$(head -c 8000 "$f" | tr -d '\000' | wc -c); [ "$a" != "$b" ]"#;
     let out = repo
-        .output("sh", &["-c", r#"grep -Iq '^' -- "$0""#, path])
+        .output("sh", &["-c", SCRIPT, path])
         .with_context(|| format!("look at {path} in {repo}"))?;
     match out.status.code() {
-        Some(0) => Ok(false),
-        Some(1) => Ok(true),
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
         _ => bail!(
             "could not tell whether {path} is binary in {repo}: {}",
             String::from_utf8_lossy(&out.stderr).trim()
@@ -532,5 +534,62 @@ mod tests {
         std::fs::remove_file(dir.join("big.log")).unwrap();
         let err = save_repo(&work, REF, &tight).unwrap_err().to_string();
         assert!(err.contains("add up to"), "{err}");
+    }
+
+    /// Needs `TOD_TEST_SANDBOX` (a sandbox with git) and `TOD_TEST_SANDBOX_ROOT`
+    /// (a data root with `sandboxes.toml`), as `fleet::sandbox`'s smoke test does.
+    /// The remote is a bare repository inside the sandbox, so it checks the
+    /// scripts and git there (busybox tools included), not GitHub.
+    #[test]
+    fn a_checkpoint_round_trips_through_a_real_cloud_sandbox() {
+        let (Ok(name), Ok(root)) = (std::env::var("TOD_TEST_SANDBOX"), std::env::var("TOD_TEST_SANDBOX_ROOT")) else {
+            eprintln!("skipped: set TOD_TEST_SANDBOX and TOD_TEST_SANDBOX_ROOT");
+            return;
+        };
+        crate::fleet::sandbox::set_data_root(&std::fs::canonicalize(root).unwrap());
+        let base = format!("/root/ckpt-live-{}", uuid::Uuid::new_v4().simple());
+        let top = Workdir::sandbox(&name, "/root");
+        let sh = |script: &str| {
+            let out = top.output("sh", &["-c", script]).unwrap();
+            assert!(out.status.success(), "{script}: {}", String::from_utf8_lossy(&out.stderr));
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let id = "-c user.name=t -c user.email=t@t";
+        sh(&format!(
+            "set -e; mkdir -p {base}; git init -q --bare -b main {base}/remote.git; \
+             git clone -q {base}/remote.git {base}/seed; cd {base}/seed; \
+             echo one > a.txt; echo 'scratch/' > .gitignore; git add .; git {id} commit -qm init; \
+             git push -q origin HEAD:refs/heads/main; git clone -q {base}/remote.git {base}/w"
+        ));
+        let work = Workdir::sandbox(&name, format!("{base}/w"));
+        sh(&format!(
+            "cd {base}/w; echo two > a.txt; echo new > new.txt; mkdir scratch; echo temp > scratch/n.md; \
+             head -c 2000000 /dev/urandom > blob.bin"
+        ));
+        let before = work.git(&["status", "--porcelain"]).unwrap();
+
+        // A 2 MB binary is refused by name, and nothing is pushed.
+        let err = save_repo(&work, REF, &Limits::default()).unwrap_err().to_string();
+        assert!(err.contains("blob.bin") && err.contains("binary"), "{err}");
+        assert!(remote_ref(&work, REF).unwrap().is_none());
+
+        sh(&format!("rm {base}/w/blob.bin"));
+        let saved = save_repo(&work, REF, &Limits::default()).unwrap();
+        assert!(matches!(saved, Saved::Pushed { files: 2, .. }), "{saved:?}");
+        assert_eq!(work.git(&["status", "--porcelain"]).unwrap(), before.replace("?? blob.bin\n", "").replace("\n?? blob.bin", ""));
+        assert_eq!(save_repo(&work, REF, &Limits::default()).unwrap(), Saved::Unchanged);
+        let tree = sh(&format!("cd {base}/remote.git; git ls-tree -r --name-only {REF}"));
+        assert!(tree.contains("new.txt") && !tree.contains("scratch"), "{tree}");
+
+        // A fresh checkout (the sandbox made again) gets the work back, uncommitted.
+        sh(&format!("git clone -q {base}/remote.git {base}/fresh"));
+        let fresh = Workdir::sandbox(&name, format!("{base}/fresh"));
+        assert!(matches!(restore_repo(&fresh, REF).unwrap(), Restored::Applied { files: 2 }));
+        assert_eq!(sh(&format!("cat {base}/fresh/a.txt")), "two");
+        assert_eq!(sh(&format!("cat {base}/fresh/new.txt")), "new");
+
+        assert!(delete_ref(&fresh, REF).unwrap());
+        assert!(remote_ref(&fresh, REF).unwrap().is_none());
+        sh(&format!("rm -rf {base}"));
     }
 }
