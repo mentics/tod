@@ -54,7 +54,22 @@ pub struct Replica {
     node: Uuid,
     workspace: PathBuf,
     cursors: Cursors,
+    /// Where this node's row was seen in the copy (seeding, each pull), for
+    /// the error when it is not there.
+    trail: Vec<String>,
     _socket: PortFileGuard,
+}
+
+/// `(nodes in the copy, whether `node` is one)`.
+fn nodes_and_presence(db: &Path, node: Uuid) -> Result<(i64, bool)> {
+    let conn = connect(db)?;
+    let count: i64 = conn.query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get(0))?;
+    let present: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM nodes WHERE id = ?1)",
+        params![node.as_bytes().to_vec()],
+        |r| r.get(0),
+    )?;
+    Ok((count, present))
 }
 
 fn connect(db: &Path) -> Result<Connection> {
@@ -91,6 +106,7 @@ impl Replica {
             }
             saved => saved,
         };
+        let seeded_now = saved.is_none();
         let (store, cursors) = match saved {
             Some(cursors) => (FleetStore::open(root).map_err(|e| anyhow::anyhow!("open {}: {e}", root.display()))?, cursors),
             None => {
@@ -123,8 +139,16 @@ impl Replica {
             node,
             workspace: workspace.to_path_buf(),
             cursors,
+            trail: Vec::new(),
             _socket: socket,
         };
+        let (count, present) = nodes_and_presence(&replica.db(), node)?;
+        replica.trail.push(format!(
+            "the copy opened with {count} nodes ({}; {}), this node {}",
+            if seeded_now { "just seeded" } else { "reused" },
+            replica.cursors.seed_id.as_deref().unwrap_or("no seeding id"),
+            if present { "present" } else { "absent" }
+        ));
         replica.save_cursors()?;
         replica.localize_files()?;
         Ok(replica)
@@ -209,6 +233,12 @@ impl Replica {
             drop(conn);
             self.localize_files()?;
             let _ = self.store.reload_if_stale();
+            let (count, present) = nodes_and_presence(&self.db(), self.node)?;
+            self.trail.push(format!(
+                "after applying {n} pulled changes ({} conflicts) the copy has {count} nodes, this node {}",
+                report.conflicts.len(),
+                if present { "present" } else { "absent" }
+            ));
         }
         self.cursors.pull_after = feed.last_seq;
         self.save_cursors()?;
@@ -258,9 +288,10 @@ impl Replica {
             anyhow::bail!(
                 "node {node} is not in the supervisor's copy of the orchestrator's database (seeded at change {}, pulled to {}): \
                  the orchestrator does not have it, so the app has not sent it there yet (or the orchestrator's data was reset); \
-                 sync the app, then reinstall and restart",
+                 sync the app, then reinstall and restart. History of this copy: {}",
                 self.cursors.push_after,
-                self.cursors.pull_after
+                self.cursors.pull_after,
+                self.trail.join("; ")
             );
         };
         tod_store::cloud_activity::beat(&conn, node, &what, tod_store::outline::uuid_blob::now_ms())
