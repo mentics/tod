@@ -626,16 +626,23 @@ impl Blaxel {
     }
 
     /// Writes a file of any size: in parts of at most 4 MB (the filesystem
-    /// API takes at most 5 MB per call), joined into `<path>.new`, which is
+    /// API takes at most 5 MB per call), joined into a staging file, which is
     /// then renamed over `path`, so a binary that is running can be replaced.
+    /// The parts and the staging file carry a name of this call's own: two
+    /// installs of the same file at once (a second click, a replaced sandbox's
+    /// check) would otherwise delete each other's parts.
     pub fn upload_large(&self, url: &str, path: &str, bytes: &[u8], mode: &str) -> Result<()> {
         const PART: usize = 4 * 1024 * 1024;
         let q = crate::relay::shell_quote;
-        let staged = format!("{path}.new");
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.subsec_nanos() ^ (d.as_secs() as u32).rotate_left(16));
+        let stage = format!("{path}.{nonce:08x}{:04x}", std::process::id() as u16);
+        let staged = format!("{stage}.new");
         let mut parts = Vec::new();
         let chunks: Vec<&[u8]> = if bytes.is_empty() { vec![&[]] } else { bytes.chunks(PART).collect() };
         for (i, chunk) in chunks.into_iter().enumerate() {
-            let part = format!("{path}.part{i:04}");
+            let part = format!("{stage}.part{i:04}");
             self.upload(url, &part, chunk, "0644")?;
             parts.push(part);
         }
@@ -652,7 +659,14 @@ impl Blaxel {
             120,
         )?;
         if res.exit_code != 0 {
-            bail!("writing {path} failed: {}", res.output());
+            // What is there now says whether the parts never arrived, were
+            // removed, or the sandbox is not the one they were sent to.
+            let dir = path.rsplit_once('/').map_or("/", |(d, _)| if d.is_empty() { "/" } else { d });
+            let listing = self
+                .run(url, &format!("ls -la {} 2>&1; rm -f {joined} {}", q(dir), q(&staged)), 30)
+                .map(|r| r.output().to_string())
+                .unwrap_or_else(|err| format!("(could not list it: {err:#})"));
+            bail!("writing {path} failed: {}\n{dir} holds:\n{}", res.output(), listing.trim_end());
         }
         Ok(())
     }
