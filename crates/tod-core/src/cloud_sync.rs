@@ -67,6 +67,10 @@ pub struct CloudSyncState {
     /// Nodes running in the cloud, by node id.
     #[serde(default)]
     pub nodes: BTreeMap<String, CloudNode>,
+    /// Nodes whose sandbox the user deleted on purpose: the lost-sandbox
+    /// check leaves them alone until the user runs them in the cloud again.
+    #[serde(default)]
+    pub deleted_by_user: std::collections::BTreeSet<String>,
     /// This data root's sync client id on the orchestrator (`app-<id>`),
     /// made on first use by [`client_id`].
     #[serde(default)]
@@ -131,6 +135,66 @@ impl CloudSyncState {
     }
 }
 
+/// The node's checkout inside its cloud sandbox `name`, as a directory git
+/// can run in (the probe picks `/workspace/repo` or the forked `/workspace`).
+pub fn sandbox_checkout(bx: &tod_sandbox::blaxel::Blaxel, name: &str) -> Result<tod_store::fleet::Workdir> {
+    let info = bx.get(name)?.with_context(|| format!("sandbox {name} does not exist"))?;
+    let url = info.url.with_context(|| format!("sandbox {name} has no URL"))?;
+    let cmd = format!("sh -c {}", tod_sandbox::relay::shell_quote(&format!("echo {}", tod_sandbox::node::WORKSPACE_PROBE)));
+    let res = bx.run(&url, &cmd, 60).with_context(|| format!("find the checkout in {name}"))?;
+    if res.exit_code != 0 {
+        anyhow::bail!("could not find the checkout in {name}: exit {}", res.exit_code);
+    }
+    let path = res.output().trim().to_string();
+    if !path.starts_with('/') {
+        anyhow::bail!("could not find the checkout in {name}: got {path:?}");
+    }
+    Ok(tod_store::fleet::Workdir::sandbox(name, path))
+}
+
+/// Pushes `node_id`'s uncommitted work in its cloud sandbox `name` to the
+/// hidden checkpoint ref (`tod_store::fleet::checkpoint`), so deleting the
+/// sandbox loses nothing. A sandbox Blaxel does not have has nothing to keep.
+/// Fails, naming why, when the work cannot be kept: the caller must then not
+/// delete. Blocks on git and the network.
+pub fn checkpoint_before_delete(
+    bx: &tod_sandbox::blaxel::Blaxel,
+    node_id: &str,
+    name: &str,
+) -> Result<()> {
+    if bx.get(name)?.is_none() {
+        return Ok(());
+    }
+    let checkout = sandbox_checkout(bx, name)?;
+    tod_store::fleet::node_checkpoint::checkpoint_dir(&checkout, node_id, &tod_store::fleet::checkpoint::Limits::default())
+        .with_context(|| format!("could not keep {name}'s uncommitted work, so the sandbox was not deleted"))?;
+    Ok(())
+}
+
+/// Records (or, with `deleted` false, forgets) that the user deleted
+/// `node_id`'s sandbox on purpose.
+pub fn set_sandbox_deleted_by_user(root: &Path, node_id: &str, deleted: bool) -> Result<()> {
+    let mut state = CloudSyncState::load(root)?;
+    let changed = if deleted { state.deleted_by_user.insert(node_id.to_string()) } else { state.deleted_by_user.remove(node_id) };
+    if changed {
+        state.save(root)?;
+    }
+    Ok(())
+}
+
+/// Whether the user deleted `node_id`'s sandbox on purpose and has not run
+/// the node in the cloud since. Reads a small file: for display, a failed
+/// read is logged and counts as no.
+pub fn sandbox_deleted_by_user(root: &Path, node_id: &str) -> bool {
+    match CloudSyncState::load(root) {
+        Ok(state) => state.deleted_by_user.contains(node_id),
+        Err(err) => {
+            tracing::warn!("cloud: reading which sandboxes the user deleted: {err:#}");
+            false
+        }
+    }
+}
+
 /// Where the node runs in the cloud, if it does: its `cloud_nodes` row
 /// (synced, so every copy of the app sees it), read through the store's
 /// already-open read connection, so fine on the UI thread (no database is
@@ -155,6 +219,9 @@ pub enum CloudStatus {
     Idle,
     /// Its sandbox is gone; the app replaces it at the next sync.
     Lost,
+    /// The user deleted its sandbox; nothing replaces it until they run the
+    /// node in the cloud again.
+    Deleted,
 }
 
 impl CloudStatus {
@@ -178,6 +245,7 @@ impl CloudStatus {
             ),
             Self::Idle => "Nothing is running in the cloud for it now.".to_string(),
             Self::Lost => "Its sandbox is gone; a new one is made at the next sync.".to_string(),
+            Self::Deleted => "Its sandbox was deleted; run it in the cloud to make a new one.".to_string(),
         }
     }
 }
@@ -195,7 +263,8 @@ pub fn cloud_status(fleet: &FleetStore, node_id: uuid::Uuid, now_ms: i64) -> Opt
         .ok()?;
     let row = row?;
     if row.lost_at.is_some() {
-        return Some(CloudStatus::Lost);
+        let deleted = sandbox_deleted_by_user(fleet.paths().root(), &node_id.to_string());
+        return Some(if deleted { CloudStatus::Deleted } else { CloudStatus::Lost });
     }
     Some(match beat {
         Some(b) if b.is_live(now_ms) => CloudStatus::Working { heard_at: b.heartbeat_at, what: b.what },
@@ -1249,6 +1318,12 @@ pub fn ensure_node_sandbox(
         progress(&format!("warning: the poke got {}", resp.status()));
     }
     let _ = sandboxes.save();
+    // Work checkpointed before an earlier sandbox of this node went away
+    // comes back as uncommitted edits.
+    let checkout = sandbox_checkout(&bx, &name)?;
+    for note in tod_store::fleet::node_checkpoint::restore_into(&checkout, node_id) {
+        progress(&format!("warning: {note}"));
+    }
     Ok(name)
 }
 
@@ -1298,6 +1373,8 @@ fn node_sandbox_source(
 /// active (`tod_core::impact`), and its supervisor reads its context mark
 /// there.
 fn record_cloud_node(fleet: &FleetStore, node_id: &str, sandbox: String, user: &str) -> Result<CloudNode> {
+    let root = fleet.paths().root();
+    set_sandbox_deleted_by_user(root, node_id, false)?;
     let record = CloudNode {
         sandbox,
         user: user.to_string(),
