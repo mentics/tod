@@ -554,7 +554,11 @@ fn apply_changes_with(conn: &mut Connection, changes: &[Change], origin: Option<
                     .collect();
                 let mut values: Vec<Value> =
                     cols.iter().map(|(_, v)| to_sql(v)).collect::<Result<_>>()?;
-                if found.is_some() {
+                // A row that never updates (a trigger refuses it) is replaced.
+                if found.is_some() && change.table == "learn_outputs" {
+                    tx.execute(&format!("DELETE FROM {qt} WHERE {clause}"), params_from_iter(key_values.clone()))?;
+                }
+                if found.is_some() && change.table != "learn_outputs" {
                     let set = cols
                         .iter()
                         .map(|(c, _)| format!("{} = ?", quote(c)))

@@ -335,7 +335,7 @@ impl Poker for RelayPoker {
         let agent: ureq::Agent = ureq::Agent::config_builder()
             .http_status_as_error(false)
             .timeout_global(Some(Duration::from_secs(60)))
-            .tls_config(crate::notify::system_roots())
+            .tls_config(crate::notify::system_roots()?)
             .build()
             .into();
         let resp = agent

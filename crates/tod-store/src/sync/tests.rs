@@ -327,3 +327,38 @@ fn a_snapshot_and_its_restore_copy_megabytes_at_once() {
     assert_eq!(rows, 2000);
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// A pass's `learn_outputs` row never updates (a trigger refuses it), but the
+/// receiving side's own `learn_completes_pass` trigger makes that row when the
+/// feed moves the node to `done`, so the sender's row then arrives over one
+/// that differs in its timestamp or content: the sender's version replaces it
+/// instead of the whole sync failing.
+#[test]
+fn a_learn_output_the_receiver_made_itself_is_replaced_by_the_senders() {
+    let (mut a, mut b) = pair();
+    let list_id = a.fleet.list_outline_lists().unwrap()[0].id;
+    let node = Uuid::new_v4();
+    a.apply(OutlineMutation::CreateNode {
+        node_id: Some(node),
+        list_id,
+        parent_id: None,
+        anchor_id: None,
+        position: CreatePosition::Below,
+        title: "learned".into(),
+    });
+    assert!(sync(&mut a, &mut b).is_empty());
+    let blob = node.as_bytes().to_vec();
+    let insert = "INSERT INTO learn_outputs (node_id, pass, content, at) VALUES (?1, 1, ?2, ?3)";
+    a.conn().execute(insert, rusqlite::params![blob, "from the sender", 1000]).unwrap();
+    b.conn().execute(insert, rusqlite::params![blob, "made by the trigger", 2000]).unwrap();
+    let conflicts = sync(&mut a, &mut b);
+    assert!(conflicts.iter().any(|c| c.table == "learn_outputs"), "{conflicts:?}");
+    let content: String = b
+        .conn()
+        .query_row("SELECT content FROM learn_outputs WHERE node_id = ?1 AND pass = 1", [blob], |r| r.get(0))
+        .unwrap();
+    assert_eq!(content, "from the sender");
+    assert_eq!(dump(&a.conn()), dump(&b.conn()));
+    let _ = std::fs::remove_dir_all(&a.root);
+    let _ = std::fs::remove_dir_all(&b.root);
+}

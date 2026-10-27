@@ -27,6 +27,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tod-core = { path = "../tod-core" }
 tod-sandbox = { path = "../tod-sandbox" }
-ureq = { version = "3", features = ["platform-verifier"] }
+ureq = "3"
+rustls-native-certs = "0.8"
 tod-store = { path = "../tod-store" }
 uuid = { version = "1.0", features = ["v4"] }
