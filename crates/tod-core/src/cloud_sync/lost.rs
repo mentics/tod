@@ -373,7 +373,7 @@ pub fn delete_node_sandbox(fleet: &FleetStore, node_id: &str) -> Result<String> 
     } else {
         super::checkpoint_before_delete(&bx, node_id, &row.sandbox)?;
         sandboxes.delete(&bx, &row.sandbox).with_context(|| format!("delete sandbox {}", row.sandbox))?;
-        format!("Deleted sandbox {}; its uncommitted work is kept on the remote and comes back when the node runs in the cloud again.", row.sandbox)
+        format!("Deleted sandbox {}; any uncommitted work was kept on the remote and comes back when the node runs in the cloud again.", row.sandbox)
     };
     // The sandbox is gone either way: record it so the panel offers to run the node again.
     super::set_sandbox_deleted_by_user(&root, node_id, true)?;
