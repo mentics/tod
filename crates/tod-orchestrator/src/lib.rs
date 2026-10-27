@@ -206,6 +206,7 @@ impl Server {
                 match (method, rest) {
                     ("POST", ["seed"]) => sync_backend::seed(&self.users, &user, &request.body),
                     ("POST", ["changes"]) => match self.users.get(&user) {
+                        Ok(data) if !sync_backend::is_seeded(&data.root) => Response::text(409, sync_backend::NOT_SEEDED),
                         Ok(data) => sync_backend::apply_changes(
                             &data,
                             &request.body,
@@ -220,6 +221,7 @@ impl Server {
                             Err(_) => return Response::text(400, "after must be a number"),
                         };
                         match self.users.get(&user) {
+                            Ok(data) if !sync_backend::is_seeded(&data.root) => Response::text(409, sync_backend::NOT_SEEDED),
                             Ok(data) => sync_backend::export_changes(&data, after, client(request)),
                             Err(err) => Response::text(500, format!("{err:#}")),
                         }
