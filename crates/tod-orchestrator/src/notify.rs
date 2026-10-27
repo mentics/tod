@@ -5,8 +5,8 @@
 //! user has two unguessable topics derived from a random secret made once
 //! and kept in `<root>/notify.json`:
 //!
-//! - `<topic>`: "changed", at most one a second per user, trailing edge
-//!   included (the last change is always announced). The app subscribes
+//! - `<topic>`: "changed", at most one per [`MIN_INTERVAL`] per user, trailing
+//!   edge included (the last change is always announced). The app subscribes
 //!   while open and pulls the feed on each message.
 //! - `<topic>-alerts`: "a node needs you", when a new question (pending
 //!   decision) or a newly blocked plan step appears. For the phone.
@@ -28,8 +28,14 @@ use std::time::{Duration, Instant};
 pub const NTFY_URL_ENV: &str = "TOD_NTFY_URL";
 pub const DEFAULT_NTFY_URL: &str = "https://ntfy.sh";
 const TOPIC_FILE: &str = "notify.json";
-/// At most one "changed" per user per this.
-pub const MIN_INTERVAL: Duration = Duration::from_secs(1);
+/// At most one "changed" per user per this. ntfy.sh limits publishes per IP
+/// address (by default a burst of 60, refilled at one request per 5 seconds:
+/// 12 a minute sustained) and every user shares the orchestrator's address.
+/// A busy user at this interval sends 2 a minute, so six busy users stay
+/// within the sustained rate and the burst absorbs the rest. A change after a
+/// quiet spell is still announced at once; only a continuous stream is
+/// batched, and the app also pulls on a timer.
+pub const MIN_INTERVAL: Duration = Duration::from_secs(30);
 
 /// What a message says.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -403,21 +409,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn first_poke_runs_now_then_one_a_second_with_a_trailing_run() {
+    fn first_poke_runs_now_then_one_per_interval_with_a_trailing_run() {
         let t0 = Instant::now();
         let mut c = Coalescer::default();
         c.poke("a", t0);
         assert_eq!(c.take_due(t0), vec!["a"]);
-        // Three changes within the next second: one run, a second after the last.
+        // Three changes within the interval: one run, one interval after the first.
         for ms in [100, 300, 900] {
             c.poke("a", t0 + Duration::from_millis(ms));
         }
         assert_eq!(c.next_due(), Some(t0 + MIN_INTERVAL));
-        assert!(c.take_due(t0 + Duration::from_millis(950)).is_empty());
+        assert!(c.take_due(t0 + MIN_INTERVAL - Duration::from_millis(50)).is_empty());
         assert_eq!(c.take_due(t0 + MIN_INTERVAL), vec!["a"]);
         assert_eq!(c.next_due(), None);
         // Long after: immediate again.
-        let later = t0 + Duration::from_secs(10);
+        let later = t0 + MIN_INTERVAL * 2;
         c.poke("a", later);
         assert_eq!(c.next_due(), Some(later));
     }

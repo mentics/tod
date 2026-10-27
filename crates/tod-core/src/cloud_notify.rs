@@ -1,7 +1,7 @@
 //! Hearing from the orchestrator that something changed.
 //!
 //! The orchestrator publishes a data-free "changed" message to the user's
-//! ntfy topic whenever it commits a change for them (at most one a second;
+//! ntfy topic whenever it commits a change for them (at most one every 30 seconds per user;
 //! `tod-orchestrator`'s `notify` module). While the app is open and this data
 //! root is seeded, [`start`] holds a subscription to that topic
 //! (`GET <server>/<topic>/json`, one JSON object per line) on a thread of its
