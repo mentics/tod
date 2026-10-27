@@ -5,6 +5,7 @@ use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
 const POSIX_INIT_SCRIPT: &str = include_str!("scripts/tod-shell-init.sh");
+#[cfg(windows)]
 const WINDOWS_INIT_SCRIPT: &str = include_str!("scripts/tod-shell-init.ps1");
 
 pub struct ShellInitAssets {
@@ -57,6 +58,7 @@ pub fn sh_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
+#[cfg(windows)]
 pub fn write_session_init_script(
     init_script: &Path,
     state_dir: &Path,
@@ -89,6 +91,7 @@ pub fn write_session_init_script(
 }
 
 /// MSYS-friendly path (`C:/data/...`) for Git Bash / mintty arguments.
+#[cfg(windows)]
 pub fn msys_path(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
 }

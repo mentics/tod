@@ -701,13 +701,6 @@ impl TaskPanel {
         }
     }
 
-    /// The node waits on something outside (a review, checks, a release).
-    fn awaits_others(&self) -> bool {
-        self.standing
-            .as_ref()
-            .is_some_and(|s| matches!(s.actor, NextActor::Others { .. }))
-    }
-
     /// Stop the node's running turn: the conversation view's own stop path.
     fn stop_runner(&mut self, slot: u64, cx: &mut Context<Self>) {
         self.agent_runs.update(cx, |runs, cx| {

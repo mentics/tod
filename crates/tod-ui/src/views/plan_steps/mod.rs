@@ -206,21 +206,6 @@ impl PlanStepsView {
         cx.notify();
     }
 
-    /// What the host shows under each step's body. The standalone panel
-    /// leaves it unset; a conversation uses it for the blocks only a
-    /// conversation has — a step handed back to the user, and what
-    /// verification found.
-    pub fn set_row_detail(&mut self, detail: Option<RowDetail>) {
-        self.row_detail = detail;
-    }
-
-    /// How the host runs what the list changes. Set inside a conversation so
-    /// every edit, creation, reorder and deletion is recorded as the user's
-    /// own action there.
-    pub fn set_mutation_router(&mut self, router: Option<MutationRouter>) {
-        self.router = router;
-    }
-
     /// Run `mutation` the way the host asked for, in the background (never on
     /// the UI thread), then `done` with the outcome on the view.
     fn write_then(

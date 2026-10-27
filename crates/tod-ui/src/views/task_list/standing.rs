@@ -490,27 +490,6 @@ pub fn runner_parts(standing: &NodeStanding, now_ms: i64) -> Vec<RunnerPart> {
     }
 }
 
-// ------------------------------------------------------------ strip text
-
-/// The strip's words for the counts: "3 on you · 1 failed · 5 on others ·
-/// 2 running", leaving out what is zero.
-pub fn strip_text(counts: &Counts) -> String {
-    let mut parts = Vec::new();
-    if counts.requests > 0 {
-        parts.push(format!("{} on you", counts.requests));
-    }
-    if counts.failures > 0 {
-        parts.push(format!("{} failed", counts.failures));
-    }
-    if counts.on_others > 0 {
-        parts.push(format!("{} on others", counts.on_others));
-    }
-    if counts.running > 0 {
-        parts.push(format!("{} running", counts.running));
-    }
-    parts.join(" · ")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -627,13 +606,6 @@ mod tests {
             Counts { requests: 1, failures: 1, on_others: 1, others_trouble: 1, running: 1, deferred: 1 }
         );
         assert_eq!(counts.on_me(), 2);
-        assert_eq!(strip_text(&counts), "1 on you · 1 failed · 1 on others · 1 running");
-    }
-
-    #[test]
-    fn strip_text_omits_zeroes() {
-        assert_eq!(strip_text(&Counts::default()), "");
-        assert_eq!(strip_text(&Counts { running: 2, ..Default::default() }), "2 running");
     }
 
     #[test]

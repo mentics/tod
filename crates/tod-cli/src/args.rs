@@ -148,11 +148,6 @@ impl Args {
             .transpose()
     }
 
-    pub fn node(&self) -> anyhow::Result<Uuid> {
-        self.uuid("--node")?
-            .ok_or_else(|| anyhow::anyhow!("--node <UUID> is required"))
-    }
-
     pub fn target(&self, what: &str) -> anyhow::Result<&str> {
         self.positional
             .first()
@@ -232,7 +227,7 @@ mod tests {
     #[test]
     fn missing_values_and_bad_uuids_are_errors() {
         assert!(parse(&["--body"]).is_err());
-        assert!(parse(&["--node", "not-a-uuid"]).unwrap().node().is_err());
+        assert!(parse(&["--node", "not-a-uuid"]).unwrap().uuid("--node").is_err());
         assert!(parse(&[]).unwrap().require("--kind").is_err());
     }
 }

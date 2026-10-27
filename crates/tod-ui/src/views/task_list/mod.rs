@@ -225,27 +225,18 @@ pub enum TaskListEvent {
     OpenOnOthers,
     /// Ctrl+Right — move keyboard focus to the right drawer, if one is open.
     FocusDrawer,
-    OpenInterview {
-        task_id: String,
-        node_id: uuid::Uuid,
-        lifecycle: String,
-        title: String,
-    },
     OpenTaskEdit {
         task_id: String,
     },
     OpenObligations {
         task_id: String,
-        title: String,
     },
     OpenPlan {
         task_id: String,
-        title: String,
     },
     /// Escape from the tree — close the right drawer, whichever panel it shows.
     CloseDrawer,
     OpenLifecycle {
-        task_id: String,
         /// Current lifecycle at emit time; the panel re-loads the task's
         /// live lifecycle when it opens, so this is informational only.
         #[allow(dead_code)]
@@ -254,9 +245,7 @@ pub enum TaskListEvent {
     /// A generator refresh finished and rewrote its managed subtree. The
     /// edit panel reloads from it, so its refresh status and error do not go
     /// stale when the refresh was driven from anywhere but that panel.
-    GeneratorRefreshed {
-        node_id: uuid::Uuid,
-    },
+    GeneratorRefreshed,
     /// The tree selection changed (`None`: nothing selected). The right
     /// drawer follows it, whichever panel it is showing.
     SelectionChanged {
@@ -267,19 +256,11 @@ pub enum TaskListEvent {
         task_id: String,
     },
     /// A — open the node's most recent chat session, or start one.
-    LaunchOrFocusAgent {
-        task_id: String,
-    },
+    LaunchOrFocusAgent,
     /// T — focus a shell, or open a new one when `shell_id` is `None`.
-    OpenShell {
-        task_id: String,
-        shell_id: Option<String>,
-    },
+    OpenShell,
     /// C — open the node's resolved Files directory in a code editor.
-    OpenCodeEditor {
-        task_id: String,
-        editor_id: String,
-    },
+    OpenCodeEditor,
     /// Right-click menu's "Open requests (n)", or the attention badge on a
     /// row. The host decides what "open" means (the unified view's
     /// task panel); the existing Tasks view may ignore it.
@@ -1132,7 +1113,7 @@ impl TaskListView {
                     Ok(updated_ids) => {
                         this.recently_updated_copy_ids
                             .extend(updated_ids.into_iter().map(|id| id.to_string()));
-                        cx.emit(TaskListEvent::GeneratorRefreshed { node_id });
+                        cx.emit(TaskListEvent::GeneratorRefreshed);
                     }
                     // Nothing was fetched and there is a key to collect, so
                     // ask for it and pick the refresh back up, rather than
@@ -1323,9 +1304,7 @@ impl TaskListView {
             return;
         }
         self.close_chrome_overlays(cx);
-        cx.emit(TaskListEvent::LaunchOrFocusAgent {
-            task_id: task_id.to_string(),
-        });
+        cx.emit(TaskListEvent::LaunchOrFocusAgent);
         self.set_status_line("Opening agent chat…", cx);
     }
 
@@ -1349,26 +1328,16 @@ impl TaskListView {
         }
         match task.shells.len() {
             0 => {
-                cx.emit(TaskListEvent::OpenShell {
-                    task_id: task_id.to_string(),
-                    shell_id: None,
-                });
+                cx.emit(TaskListEvent::OpenShell);
             }
             1 => {
-                cx.emit(TaskListEvent::OpenShell {
-                    task_id: task_id.to_string(),
-                    shell_id: Some(task.shells[0].id.clone()),
-                });
+                cx.emit(TaskListEvent::OpenShell);
             }
             _ => {
                 if self.open_row_menu.as_ref() == Some(&(RowMenuKind::Shells, task_id.to_string()))
                 {
-                    let shell_id = task.shells[0].id.clone();
                     self.close_row_menu(cx);
-                    cx.emit(TaskListEvent::OpenShell {
-                        task_id: task_id.to_string(),
-                        shell_id: Some(shell_id),
-                    });
+                    cx.emit(TaskListEvent::OpenShell);
                 } else {
                     self.toggle_shells_menu(task_id, window, cx);
                     self.set_status_line("Pick a shell (T again selects first)", cx);
@@ -1394,10 +1363,7 @@ impl TaskListView {
             return;
         };
         self.close_chrome_overlays(cx);
-        cx.emit(TaskListEvent::OpenCodeEditor {
-            task_id: task_id.to_string(),
-            editor_id: editor.id().to_string(),
-        });
+        cx.emit(TaskListEvent::OpenCodeEditor);
         self.set_status_line(format!("Opening {}…", editor.label()), cx);
     }
 
@@ -1441,7 +1407,7 @@ impl TaskListView {
             return;
         };
         self.bump_interaction(task_id, window, cx);
-        self.handle_lifecycle_control(task_id, &lifecycle, window, cx);
+        self.handle_lifecycle_control(&lifecycle, window, cx);
     }
 
     /// Proceed always opens the lifecycle transition panel first, whatever
@@ -1452,13 +1418,11 @@ impl TaskListView {
     /// `open_interview_for_task` for the on-demand path the panel uses.
     fn handle_lifecycle_control(
         &mut self,
-        task_id: &str,
         lifecycle: &str,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         cx.emit(TaskListEvent::OpenLifecycle {
-            task_id: task_id.to_string(),
             lifecycle: lifecycle.to_string(),
         });
         self.set_status_line(format!("Lifecycle panel: {lifecycle}"), cx);
@@ -1534,7 +1498,6 @@ impl TaskListView {
         self.close_chrome_overlays(cx);
         cx.emit(TaskListEvent::OpenObligations {
             task_id: task_id.to_string(),
-            title: task.title.clone(),
         });
         self.set_status_line(format!("Obligations: {}", task.title), cx);
         self.bump_interaction(task_id, window, cx);
@@ -1567,7 +1530,6 @@ impl TaskListView {
         self.close_chrome_overlays(cx);
         cx.emit(TaskListEvent::OpenPlan {
             task_id: task_id.to_string(),
-            title: task.title.clone(),
         });
         self.set_status_line(format!("Plan steps: {}", task.title), cx);
         self.bump_interaction(task_id, window, cx);

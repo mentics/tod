@@ -228,17 +228,12 @@ pub enum TaskEditEvent {
     /// Left / Ctrl+Left — move keyboard focus back to the task tree, leaving the panel open.
     FocusTaskList,
     Changed,
-    OpenObligations {
-        task_id: String,
-        title: String,
-    },
+    OpenObligations,
     /// A generator refresh stopped before fetching anything because the
     /// Linear API key is not stored. The panel has no prompt of its own; the
     /// shell routes this to the task list, which collects the key and
     /// resumes the refresh.
-    LinearCredentialsRequired {
-        node_id: uuid::Uuid,
-    },
+    LinearCredentialsRequired,
 }
 
 /// One row of the generator configuration form, built from the selected data
@@ -2952,7 +2947,7 @@ impl TaskEditView {
                         this.clamp_focus_index();
                         this.notify_changed(cx);
                         if needs_credentials {
-                            cx.emit(TaskEditEvent::LinearCredentialsRequired { node_id });
+                            cx.emit(TaskEditEvent::LinearCredentialsRequired);
                         }
                     }
                     Err(err) => {
@@ -3189,7 +3184,7 @@ impl TaskEditView {
                     // ask for it rather than leaving the user with an error
                     // and nowhere to enter one.
                     Err(err) if err.needs_linear_api_key() => {
-                        cx.emit(TaskEditEvent::LinearCredentialsRequired { node_id });
+                        cx.emit(TaskEditEvent::LinearCredentialsRequired);
                     }
                     Err(err) => {
                         this.pending_toast = Some(format!("Refresh failed: {err}"));
@@ -4086,13 +4081,10 @@ impl TaskEditView {
     }
 
     fn open_obligations(&mut self, cx: &mut Context<Self>) {
-        let Some(task_id) = self.task_id() else {
+        if self.task_id().is_none() {
             return;
-        };
-        cx.emit(TaskEditEvent::OpenObligations {
-            task_id,
-            title: self.loaded_title.clone(),
-        });
+        }
+        cx.emit(TaskEditEvent::OpenObligations);
     }
 
     /// The header of a capability section. An enabled one has a chevron that

@@ -16,9 +16,7 @@
 //! Observers are notified whenever anything shown changes, including the
 //! node's lifecycle, so they re-read it from the store.
 
-use crate::ui::off_thread::off_thread;
-use gpui::Context;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tod_core::gate::GateAction;
 use tod_core::task::model::next_lifecycle;
@@ -51,18 +49,10 @@ impl CriterionOutcome {
 #[derive(Default)]
 pub struct GateCheckState {
     pub gate_status: String,
-    pub gate_error: Option<String>,
     pub criteria_detail: Vec<CriterionOutcome>,
     /// The criteria catalog for the node's forward transition, kept around
     /// so criteria_detail rows can show a real label.
     criteria_catalog: Vec<GateCriterion>,
-    /// Set after one click on **Revert** — a second click while armed
-    /// actually applies it.
-    pub revert_armed: bool,
-    /// Same two-click confirm as `revert_armed`, for **Force advance**.
-    pub force_advance_armed: bool,
-    /// The gate is being checked, on the background executor.
-    pub checking: bool,
 }
 
 impl GateCheckState {
@@ -75,7 +65,6 @@ impl GateCheckState {
 pub struct LifecycleController {
     fleet: Arc<FleetStore>,
     gate_states: HashMap<String, GateCheckState>,
-    checking: HashSet<String>,
 }
 
 impl LifecycleController {
@@ -83,27 +72,7 @@ impl LifecycleController {
         Self {
             fleet,
             gate_states: HashMap::new(),
-            checking: HashSet::new(),
         }
-    }
-
-    /// Show where a gate check waiting on the node's incoming changes stands
-    /// (`views::incoming_check`): `status` while it waits, `error` when it
-    /// will not run. Both empty clears the line, as the gate check starts.
-    pub fn report_before_gate(
-        &mut self,
-        task_id: &str,
-        status: Option<String>,
-        error: Option<String>,
-        cx: &mut Context<Self>,
-    ) {
-        let state = self.gate_states.entry(task_id.to_string()).or_default();
-        state.gate_status = status.unwrap_or_default();
-        if error.is_some() {
-            state.criteria_detail.clear();
-        }
-        state.gate_error = error;
-        cx.notify();
     }
 
     /// The node's lifecycle and title, as the store has them now.
@@ -113,66 +82,6 @@ impl LifecycleController {
             .ok()
             .flatten()
             .map(|node| (node.lifecycle, node.title))
-    }
-
-    /// Record `lifecycle` as the node's state. `Err` carries the message.
-    fn set_lifecycle(&self, node_id: Uuid, lifecycle: &str) -> Result<(), String> {
-        tod_core::lifecycle::set_lifecycle(&self.fleet, node_id, lifecycle)
-            .map_err(|err| format!("{err:#}"))
-    }
-
-    /// Move the node straight back to `target`, several states if need be,
-    /// with no confirmation: the caller's button names the state, and it is
-    /// only offered when the node's current state no longer holds
-    /// (`tod_core::lifecycle_validity`). The write is made off the UI thread.
-    pub fn revert_to(&mut self, task_id: &str, target: &'static str, cx: &mut Context<Self>) {
-        let Ok(node_id) = Uuid::parse_str(task_id) else {
-            return;
-        };
-        let state = self.gate_states.entry(task_id.to_string()).or_default();
-        state.revert_armed = false;
-        state.force_advance_armed = false;
-        let fleet = self.fleet.clone();
-        let task_id = task_id.to_string();
-        off_thread(
-            cx,
-            move || tod_core::lifecycle::set_lifecycle(&fleet, node_id, target).map_err(|e| format!("{e:#}")),
-            move |this, result, cx| {
-                let state = this.gate_states.entry(task_id).or_default();
-                match result {
-                    Ok(()) => {
-                        state.gate_error = None;
-                        state.gate_status = format!("Moved back to {target}.");
-                        state.criteria_detail.clear();
-                    }
-                    Err(err) => state.gate_error = Some(format!("Failed to move back: {err}")),
-                }
-                cx.notify();
-            },
-        );
-    }
-
-    /// [`Self::revert_to`], waiting for the store and saying whether the node
-    /// moved: for a caller that moves several nodes and counts them.
-    pub fn revert_to_blocking(&mut self, task_id: &str, target: &str, cx: &mut Context<Self>) -> bool {
-        let Ok(node_id) = Uuid::parse_str(task_id) else {
-            return false;
-        };
-        let result = self.set_lifecycle(node_id, target);
-        let state = self.gate_states.entry(task_id.to_string()).or_default();
-        state.revert_armed = false;
-        state.force_advance_armed = false;
-        let moved = result.is_ok();
-        match result {
-            Ok(()) => {
-                state.gate_error = None;
-                state.gate_status = format!("Moved back to {target}.");
-                state.criteria_detail.clear();
-            }
-            Err(err) => state.gate_error = Some(format!("Failed to move back: {err}")),
-        }
-        cx.notify();
-        moved
     }
 
     /// Repopulate `criteria_detail` for `task_id` from the most recently

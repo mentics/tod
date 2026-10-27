@@ -206,16 +206,14 @@ fn build_row_menu(
             for shell in &task.shells {
                 let view = view.clone();
                 let label = shell.label.clone();
-                let task_id = task.id.clone();
                 let shell_id = shell.id.clone();
                 menu = menu.item(PopupMenuItem::new(label).on_click(move |_, _, cx| {
-                    activate_shell(&view, &task_id, Some(shell_id.clone()), cx);
+                    activate_shell(&view, Some(shell_id.clone()), cx);
                 }));
             }
             let view = view.clone();
-            let task_id = task.id.clone();
             menu.item(PopupMenuItem::new("New shell…").on_click(move |_, _, cx| {
-                activate_shell(&view, &task_id, None, cx);
+                activate_shell(&view, None, cx);
             }))
         }
     }
@@ -223,7 +221,6 @@ fn build_row_menu(
 
 fn activate_shell(
     view: &gpui::WeakEntity<TaskListView>,
-    task_id: &str,
     shell_id: Option<String>,
     cx: &mut App,
 ) {
@@ -232,10 +229,7 @@ fn activate_shell(
     };
     entity.update(cx, |this, cx| {
         this.close_row_menu(cx);
-        cx.emit(TaskListEvent::OpenShell {
-            task_id: task_id.to_string(),
-            shell_id: shell_id.clone(),
-        });
+        cx.emit(TaskListEvent::OpenShell);
         this.set_status_message(
             if shell_id.is_some() {
                 "Focusing shell…".to_string()

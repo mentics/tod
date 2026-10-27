@@ -100,26 +100,8 @@ fn clamp_crop(
 }
 
 /// Left-button click at logical client coords via `SendMessage` (no OS focus, waits for handling).
-pub fn send_click(
-    logical_x: f32,
-    logical_y: f32,
-    logical_width: u32,
-    logical_height: u32,
-    right: bool,
-) -> Result<(), String> {
-    #[cfg(windows)]
-    {
-        send_click_windows(logical_x, logical_y, logical_width, logical_height, right)
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = (logical_x, logical_y, logical_width, logical_height, right);
-        Err("click unsupported on this platform".into())
-    }
-}
-
 #[cfg(windows)]
-fn send_click_windows(
+pub fn send_click(
     logical_x: f32,
     logical_y: f32,
     logical_width: u32,

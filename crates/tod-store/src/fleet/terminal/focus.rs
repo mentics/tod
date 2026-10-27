@@ -2,7 +2,9 @@
 
 use super::state::ShellState;
 use anyhow::{Context, Result, bail};
-use std::process::{Command, Stdio};
+use std::process::Command;
+#[cfg(windows)]
+use std::process::Stdio;
 
 pub fn focus_shell_terminal(state: &ShellState) -> Result<()> {
     match state.backend.as_str() {

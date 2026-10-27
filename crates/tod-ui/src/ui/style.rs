@@ -78,9 +78,6 @@ pub mod color {
     pub fn surface() -> Hsla {
         hex(0x0a0a0aff)
     }
-    pub fn scrim() -> Hsla {
-        hex(0x00000073)
-    }
     pub fn incoming_text() -> Hsla {
         hex(0xfacc15ff)
     }
@@ -234,7 +231,6 @@ pub mod size {
     pub const DROP_STRIP: Pixels = px(28.);
     pub const TIMESTAMP_COLUMN: Pixels = px(72.);
     pub const TABLE_CELL: Pixels = px(160.);
-    pub const SUMMARY_LIST_MAX: Pixels = px(240.);
     pub const ROW_MENU_MIN: Pixels = px(160.);
     pub const THUMBNAIL: Pixels = px(64.);
 }
@@ -461,11 +457,6 @@ pub fn callout_warning_title<E: Styled>(el: E) -> E {
     el.text_size(font::BODY)
         .font_weight(FontWeight::SEMIBOLD)
         .text_color(color::callout_warning_text())
-}
-
-/// `styles.scrim`.
-pub fn scrim<E: Styled>(el: E) -> E {
-    el.bg(color::scrim())
 }
 
 /// A floating panel: `panel` with the `toast` frame (divider border,

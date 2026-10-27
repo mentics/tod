@@ -122,11 +122,6 @@ impl TaskListView {
         self.actor_view.standings.get(node_id)
     }
 
-    /// The strip filter that is on.
-    pub fn actor_filter(&self) -> Option<Bucket> {
-        self.working_set.actor_filter
-    }
-
     /// Turn the strip's `bucket` filter on, or off when it already is.
     pub(super) fn toggle_actor_filter(
         &mut self,

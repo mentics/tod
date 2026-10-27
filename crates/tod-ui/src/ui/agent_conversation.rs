@@ -266,7 +266,6 @@ impl PanelTool {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NoticeTone {
-    Muted,
     /// Work is under way: shown with a spinner.
     Busy,
     Error,
@@ -1082,7 +1081,7 @@ impl Render for AgentConversationPanel {
             );
             let text = match notice.tone {
                 NoticeTone::Error => style::text_error(div()),
-                NoticeTone::Muted | NoticeTone::Busy => style::text_dense_muted(div()),
+                NoticeTone::Busy => style::text_dense_muted(div()),
             }
             .flex_1()
             .min_w_0()
