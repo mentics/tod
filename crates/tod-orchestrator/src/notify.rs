@@ -48,22 +48,35 @@ pub trait Sink: Send + Sync {
 /// The ntfy HTTP publish API.
 pub struct NtfySink {
     server: String,
-    agent: ureq::Agent,
+    agent: Result<ureq::Agent>,
 }
 
-/// TLS that trusts the host's certificate store, so a root the image has
-/// (or a new CA chain a server moves to) works without a tod release.
-pub(crate) fn system_roots() -> ureq::tls::TlsConfig {
-    ureq::tls::TlsConfig::builder().root_certs(ureq::tls::RootCerts::PlatformVerifier).build()
+/// TLS that trusts the host's certificate store (the image's
+/// `ca-certificates`), so a CA chain a server moves to works without a tod
+/// release. Loaded with `rustls-native-certs` and handed to `ureq` as its
+/// roots: not through `ureq`'s `platform-verifier`, which the one cargo
+/// invocation that builds every sandbox binary would turn on for the
+/// supervisor and relay too.
+pub(crate) fn system_roots() -> Result<ureq::tls::TlsConfig> {
+    let loaded = rustls_native_certs::load_native_certs();
+    for err in &loaded.errors {
+        eprintln!("tod-orchestrator: a system certificate could not be read: {err}");
+    }
+    if loaded.certs.is_empty() {
+        let why = loaded.errors.iter().map(|e| e.to_string()).collect::<Vec<_>>().join("; ");
+        anyhow::bail!("this host has no system CA certificates to check HTTPS servers against ({why}); install ca-certificates");
+    }
+    let roots: Vec<ureq::tls::Certificate<'static>> =
+        loaded.certs.iter().map(|der| ureq::tls::Certificate::from_der(der.as_ref()).to_owned()).collect();
+    Ok(ureq::tls::TlsConfig::builder().root_certs(ureq::tls::RootCerts::from(roots)).build())
 }
 
 impl NtfySink {
     pub fn new(server: impl Into<String>) -> Self {
-        let agent = ureq::Agent::config_builder()
-            .timeout_global(Some(Duration::from_secs(15)))
-            .tls_config(system_roots())
-            .build()
-            .into();
+        // A host with no CA store is reported by every publish, not by a panic here.
+        let agent = system_roots().map(|tls| {
+            ureq::Agent::config_builder().timeout_global(Some(Duration::from_secs(15))).tls_config(tls).build().into()
+        });
         Self { server: server.into().trim_end_matches('/').to_string(), agent }
     }
 }
@@ -71,7 +84,8 @@ impl NtfySink {
 impl Sink for NtfySink {
     fn publish(&self, topic: &str, kind: Kind) -> Result<()> {
         let url = format!("{}/{topic}", self.server);
-        let req = self.agent.post(&url);
+        let agent = self.agent.as_ref().map_err(|e| anyhow::anyhow!("{e:#}"))?;
+        let req = agent.post(&url);
         let req = match kind {
             Kind::Changed => req.header("Priority", "min"),
             Kind::NeedsYou => req.header("Title", "tod").header("Priority", "high").header("Tags", "bell"),
