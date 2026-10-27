@@ -51,9 +51,19 @@ pub struct NtfySink {
     agent: ureq::Agent,
 }
 
+/// TLS that trusts the host's certificate store, so a root the image has
+/// (or a new CA chain a server moves to) works without a tod release.
+pub(crate) fn system_roots() -> ureq::tls::TlsConfig {
+    ureq::tls::TlsConfig::builder().root_certs(ureq::tls::RootCerts::PlatformVerifier).build()
+}
+
 impl NtfySink {
     pub fn new(server: impl Into<String>) -> Self {
-        let agent = ureq::Agent::config_builder().timeout_global(Some(Duration::from_secs(15))).build().into();
+        let agent = ureq::Agent::config_builder()
+            .timeout_global(Some(Duration::from_secs(15)))
+            .tls_config(system_roots())
+            .build()
+            .into();
         Self { server: server.into().trim_end_matches('/').to_string(), agent }
     }
 }
