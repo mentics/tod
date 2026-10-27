@@ -52,7 +52,7 @@ On Windows, run it under Git Bash (`bash scripts/build-sandbox-binaries.sh`);
 there is no PowerShell twin.
 
 Everything but the relay links C: bundled SQLite (through `tod-store`),
-OpenSSL (reqwest's native-tls, through `tod-integration`), zstd, and ring.
+zstd, and ring (rustls, through reqwest in `tod-integration`; no OpenSSL).
 So the script picks, in order:
 
 - **Docker** (used whenever `docker` answers, unless `--no-docker`; Docker

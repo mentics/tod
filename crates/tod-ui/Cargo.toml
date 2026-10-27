@@ -24,7 +24,7 @@ tokio-tungstenite = "0.24"
 futures-util = "0.3"
 ureq = { version = "3", features = ["json"] }
 # Async client behind `app::http` (gpui's remote image loading).
-reqwest = "0.12"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots"] }
 base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 gpui = { version = "0.3.1", package = "gpui-pre" }

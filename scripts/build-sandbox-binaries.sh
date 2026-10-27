@@ -6,9 +6,10 @@
 # (see .cargo/config.toml) with no extra tooling. Any crate that depends on
 # tod-store (tod-supervisor, tod-orchestrator, once those crates exist) pulls
 # in bundled SQLite, which is C, so cross-compiling it needs a Linux C
-# toolchain for x86_64-unknown-linux-musl (and OpenSSL, through reqwest's
-# native-tls). This script builds those in a Linux container when Docker is
-# available (rust:1-alpine: a native musl toolchain, static OpenSSL), else
+# toolchain for x86_64-unknown-linux-musl (as does ring, through rustls;
+# reqwest uses rustls, so there is no OpenSSL). This script builds those in a
+# Linux container when Docker is available (rust:1-alpine: a native musl
+# toolchain), else
 # tries `cargo zigbuild`; crates that need it are skipped, with instructions,
 # if neither is available.
 #
