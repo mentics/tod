@@ -25,6 +25,9 @@ pub struct Orchestrator {
 pub struct Feed {
     pub last_seq: i64,
     pub changes: Vec<Change>,
+    /// Which seeding of the orchestrator's database the feed follows.
+    #[serde(default)]
+    pub seed_id: Option<String>,
 }
 
 /// The orchestrator's base URL from its `/cli` URL (`TOD_ORCHESTRATOR_CLI_URL`).

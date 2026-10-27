@@ -12,7 +12,9 @@
 //!   and `last_seq`.
 //! - `GET /users/<u>/changes?after=<n>`: the changes after `n` (never from
 //!   before the seed), without the requesting client's own. Reply:
-//!   `{"last_seq": n, "changes": [...]}`; the client pulls again with
+//!   `{"last_seq": n, "changes": [...], "seed_id": id}` (`seed_id` names
+//!   the seeding the feed follows; a client whose copy came from another one
+//!   starts over); the client pulls again with
 //!   `after` = `last_seq`.
 //! - `GET /users/<u>/snapshot`: the whole database, for a node supervisor's
 //!   local copy (its `last_seq` is where that copy pulls from).
@@ -31,6 +33,13 @@ use tod_store::sync::{self, Change};
 
 /// Where the seed's cursor is kept, in the user's data root.
 const SEED_SEQ_FILE: &str = "orchestrator-seed-seq";
+/// Names one seeding, new each time: what a client holding a copy compares to
+/// know the database it copied from has been replaced.
+const SEED_ID_FILE: &str = "orchestrator-seed-id";
+
+fn seed_id(root: &Path) -> Option<String> {
+    std::fs::read_to_string(root.join(SEED_ID_FILE)).ok().map(|s| s.trim().to_string())
+}
 
 /// The words of the 409 an unseeded user's sync requests get; the app looks
 /// for them (`tod_core::cloud_sync::NOT_SEEDED`) and seeds again.
@@ -64,6 +73,7 @@ fn seed_inner(users: &Users, user: &str, snapshot: &[u8]) -> Result<Response> {
     let data = users.get(user)?;
     let last = sync::last_seq(&connect(&data)?)?;
     std::fs::write(root.join(SEED_SEQ_FILE), last.to_string())?;
+    std::fs::write(root.join(SEED_ID_FILE), uuid::Uuid::new_v4().to_string())?;
     Ok(json(&serde_json::json!({ "last_seq": last })))
 }
 
@@ -128,7 +138,7 @@ pub fn export_changes(user: &UserData, after: i64, client: Option<&str>) -> Resp
         let conn = connect(user)?;
         let last = sync::last_seq(&conn)?;
         let changes = sync::export_changes_for(&conn, after, client)?;
-        Ok(json(&serde_json::json!({ "last_seq": last, "changes": changes })))
+        Ok(json(&serde_json::json!({ "last_seq": last, "changes": changes, "seed_id": seed_id(&user.root) })))
     })())
 }
 
