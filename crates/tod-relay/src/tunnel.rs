@@ -40,6 +40,11 @@ pub struct Tunnel {
     next: AtomicU32,
     /// Ports a client asked this relay to forward; each keeps listening.
     forwards: Mutex<HashSet<u16>>,
+    /// The client that most recently asked for each forwarded port. A
+    /// connection to the port goes to it, not to the newest client: a
+    /// terminal or agent session that attaches later carries no such forward
+    /// and would close the connection.
+    owners: Mutex<HashMap<u16, u64>>,
 }
 
 impl Tunnel {
@@ -73,10 +78,22 @@ impl Tunnel {
         Ok(())
     }
 
+    /// The client to carry a connection: for a forwarded port, the one that
+    /// asked for it (if still attached); otherwise the newest.
+    fn client_for(&self, forward: Option<u16>) -> Option<(u64, Out)> {
+        let clients = self.clients.lock().unwrap();
+        if let Some(owner) = forward.and_then(|p| self.owners.lock().unwrap().get(&p).copied()) {
+            if let Some(found) = clients.iter().find(|(c, _)| *c == owner) {
+                return Some(found.clone());
+            }
+        }
+        clients.last().cloned()
+    }
+
     async fn accept_loop(self: Arc<Self>, listener: TcpListener, forward: Option<u16>) {
         loop {
             let Ok((stream, _)) = listener.accept().await else { continue };
-            let Some((conn, tx)) = self.clients.lock().unwrap().last().cloned() else {
+            let Some((conn, tx)) = self.client_for(forward) else {
                 continue; // dropped: nobody to carry it to
             };
             let id = self.next.fetch_add(1, Ordering::SeqCst);
@@ -137,7 +154,11 @@ impl Tunnel {
                 }
                 Ok(Message::Text(t)) if t.starts_with('f') => {
                     let Ok(port) = t[1..].parse::<u16>() else { continue };
-                    let _ = tx.send(Message::Text(match self.start_forward(port).await {
+                    let result = self.start_forward(port).await;
+                    if result.is_ok() {
+                        self.owners.lock().unwrap().insert(port, conn);
+                    }
+                    let _ = tx.send(Message::Text(match result {
                         Ok(()) => format!("l{port}"),
                         Err(e) => format!("e{port}:{e}"),
                     }));
@@ -147,6 +168,7 @@ impl Tunnel {
             }
         }
         self.clients.lock().unwrap().retain(|(c, _)| *c != conn);
+        self.owners.lock().unwrap().retain(|_, c| *c != conn);
         // Streams this client carried end with it.
         self.streams.lock().unwrap().retain(|_, (c, s)| {
             if *c == conn {
@@ -156,5 +178,28 @@ impl Tunnel {
                 true
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_forwarded_port_goes_to_the_client_that_asked_for_it() {
+        let t = Tunnel::default();
+        let (a, _ra) = unbounded_channel();
+        let (b, _rb) = unbounded_channel();
+        // Client 1 holds the forward; client 2 (a terminal) attaches later.
+        t.clients.lock().unwrap().push((1, a));
+        t.owners.lock().unwrap().insert(15433, 1);
+        t.clients.lock().unwrap().push((2, b));
+        assert_eq!(t.client_for(Some(15433)).unwrap().0, 1);
+        // Plain connections still go to the newest client.
+        assert_eq!(t.client_for(None).unwrap().0, 2);
+        assert_eq!(t.client_for(Some(15999)).unwrap().0, 2);
+        // The owner gone: the newest carries it, as before.
+        t.clients.lock().unwrap().retain(|(c, _)| *c != 1);
+        assert_eq!(t.client_for(Some(15433)).unwrap().0, 2);
     }
 }
