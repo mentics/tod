@@ -589,6 +589,28 @@ fn connect(db: &Path) -> Result<rusqlite::Connection> {
 /// Seed if not seeded, send the outbox, pull and apply the feed; saves the
 /// cursors after each step, so a failure part way loses nothing.
 pub fn sync(fleet: &FleetStore, root: &Path, orch: &dyn Orchestrator, user: &str) -> Result<SyncReport> {
+    match sync_once(fleet, root, orch, user) {
+        Err(err) if format!("{err:#}").contains(NOT_SEEDED) => {
+            // The orchestrator's data is gone (a redeploy without its volume):
+            // what the app remembers sending is not there. Seed it again.
+            tracing::warn!("cloud sync: {err:#}; seeding it again");
+            {
+                let _guard = sync_lock(root)?;
+                let mut state = CloudSyncState::load(root)?;
+                state.seeded = false;
+                state.save(root)?;
+            }
+            sync_once(fleet, root, orch, user)
+        }
+        other => other,
+    }
+}
+
+/// What the orchestrator says (409) to sync traffic for a user it holds no
+/// seeded database for (`tod_orchestrator::sync_backend::NOT_SEEDED`).
+pub const NOT_SEEDED: &str = "the orchestrator has not been seeded with this user's database";
+
+fn sync_once(fleet: &FleetStore, root: &Path, orch: &dyn Orchestrator, user: &str) -> Result<SyncReport> {
     let _guard = sync_lock(root)?;
     let mut state = CloudSyncState::load(root)?;
     let mut report = SyncReport::default();

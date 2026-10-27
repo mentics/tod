@@ -32,6 +32,17 @@ use tod_store::sync::{self, Change};
 /// Where the seed's cursor is kept, in the user's data root.
 const SEED_SEQ_FILE: &str = "orchestrator-seed-seq";
 
+/// The words of the 409 an unseeded user's sync requests get; the app looks
+/// for them (`tod_core::cloud_sync::NOT_SEEDED`) and seeds again.
+pub const NOT_SEEDED: &str = "the orchestrator has not been seeded with this user's database";
+
+/// Whether `root` holds a seeded database. A redeployed orchestrator without
+/// its data volume has none, whatever the app remembers having sent: rows
+/// sent to it would be dropped as orphans of nodes it never received.
+pub fn is_seeded(root: &Path) -> bool {
+    root.join(SEED_SEQ_FILE).is_file()
+}
+
 pub fn seed(users: &Users, user: &str, snapshot: &[u8]) -> Response {
     reply(seed_inner(users, user, snapshot))
 }

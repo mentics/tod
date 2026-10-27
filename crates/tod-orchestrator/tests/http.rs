@@ -113,6 +113,16 @@ fn json(body: &[u8]) -> serde_json::Value {
     serde_json::from_slice(body).unwrap_or_else(|e| panic!("{e}: {}", String::from_utf8_lossy(body)))
 }
 
+/// Seeds `user` with a fresh, empty database.
+fn seed_empty(h: &Harness, user: &str) {
+    let app = h.base.join(format!("app-{user}"));
+    drop(tod_store::fleet::FleetStore::open(&app).unwrap());
+    let snap = h.base.join(format!("snap-{user}.db"));
+    tod_store::sync::snapshot(&app.join("tod.db"), &snap).unwrap();
+    let (status, body) = send(h.port, "POST", &format!("/users/{user}/seed"), &[], &std::fs::read(&snap).unwrap());
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+}
+
 #[test]
 fn seed_then_sync_changes_both_ways() {
     let h = start("sync");
@@ -127,8 +137,11 @@ fn seed_then_sync_changes_both_ways() {
     };
 
     // Open the user's store first, so the seed must close it.
+    // Not seeded yet, so the feed and the outbox are refused, and say why.
     let (status, body) = send(h.port, "GET", "/users/carol/changes", &[], b"");
-    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(status, 409, "{}", String::from_utf8_lossy(&body));
+    assert!(String::from_utf8_lossy(&body).contains(tod_core::cloud_sync::NOT_SEEDED));
+    assert_eq!(send(h.port, "POST", "/users/carol/changes", &[], b"[]").0, 409);
     let (status, body) = send(h.port, "POST", "/users/carol/seed", &[], &std::fs::read(&snap).unwrap());
     assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
     let seeded = json(&body)["last_seq"].as_i64().unwrap();
@@ -220,6 +233,7 @@ fn a_changes_post_is_announced_on_the_users_topic() {
     use tod_orchestrator::notify::Kind;
     let sink = FakeSink::default();
     let h = start_with_sink("notify", Box::new(sink.clone()));
+    seed_empty(&h, "dave");
     let (status, body) = send(h.port, "POST", "/users/dave/changes", &[], b"[]");
     assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);

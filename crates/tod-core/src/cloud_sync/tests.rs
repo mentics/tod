@@ -477,3 +477,28 @@ fn a_sync_in_one_process_holds_off_a_sync_in_another() {
     fs2::FileExt::try_lock_exclusive(&other).expect("the lock was not released");
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// A redeployed orchestrator without its data volume holds nothing, whatever
+/// the app remembers sending: it says so, and the next sync seeds it again
+/// instead of sending changes that would be dropped as orphans.
+#[test]
+fn an_orchestrator_that_lost_its_data_is_seeded_again() {
+    let base = temp_root("orch-reset");
+    let url = start_orchestrator(&base);
+    let orch = HttpOrchestrator::new(url, None).with_client("app-test");
+    let root = temp_root("app-reset");
+    let app = FleetStore::open(&root).unwrap();
+    add_list(&app, "first");
+    assert!(sync(&app, &root, &orch, "alice").unwrap().seeded);
+
+    // The orchestrator's volume is gone; its server (and open store) is not.
+    let user_root = base.join("users").join("alice");
+    std::fs::remove_file(user_root.join("orchestrator-seed-seq")).unwrap();
+
+    add_list(&app, "second");
+    let report = sync(&app, &root, &orch, "alice").unwrap();
+    assert!(report.seeded, "the app seeds again");
+    assert_eq!(lists_in(&user_root.join("tod.db")), vec!["first".to_string(), "second".to_string()]);
+    let _ = std::fs::remove_dir_all(&base);
+    let _ = std::fs::remove_dir_all(&root);
+}
