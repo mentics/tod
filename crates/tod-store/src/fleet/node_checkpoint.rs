@@ -43,10 +43,18 @@ pub fn checkpoint_node_with(
     let lock = node_lock(node_id);
     let _held = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let dir = location_dir(&location)?;
+    checkpoint_dir(&dir, node_id, limits).map(Some)
+}
+
+/// Checkpoint `node_id`'s uncommitted work in `dir` (a checkout, e.g. a cloud
+/// node's sandbox) and each submodule, like [`checkpoint_node_with`] but for
+/// a directory the caller found. Every repository is tried; the first
+/// failures are returned after the rest.
+pub fn checkpoint_dir(dir: &Workdir, node_id: &str, limits: &Limits) -> Result<Vec<(String, Saved)>> {
     let mut saved = Vec::new();
     let mut failures = Vec::new();
-    for repo in repos_deepest_first(&dir)? {
-        let rel = rel(&dir, &repo);
+    for repo in repos_deepest_first(dir)? {
+        let rel = rel(dir, &repo);
         let reference = checkpoint::ref_name(node_id, &rel);
         match checkpoint::save_repo(&repo, &reference, limits) {
             Ok(done) => saved.push((rel, done)),
@@ -56,7 +64,7 @@ pub fn checkpoint_node_with(
     if !failures.is_empty() {
         bail!("{}", failures.join("; "));
     }
-    Ok(Some(saved))
+    Ok(saved)
 }
 
 /// Put `node_id`'s checkpoints into `dir`, a checkout made just now.

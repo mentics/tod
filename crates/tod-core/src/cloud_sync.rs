@@ -135,6 +135,42 @@ impl CloudSyncState {
     }
 }
 
+/// The node's checkout inside its cloud sandbox `name`, as a directory git
+/// can run in (the probe picks `/workspace/repo` or the forked `/workspace`).
+pub fn sandbox_checkout(bx: &tod_sandbox::blaxel::Blaxel, name: &str) -> Result<tod_store::fleet::Workdir> {
+    let info = bx.get(name)?.with_context(|| format!("sandbox {name} does not exist"))?;
+    let url = info.url.with_context(|| format!("sandbox {name} has no URL"))?;
+    let cmd = format!("sh -c {}", tod_sandbox::relay::shell_quote(&format!("echo {}", tod_sandbox::node::WORKSPACE_PROBE)));
+    let res = bx.run(&url, &cmd, 60).with_context(|| format!("find the checkout in {name}"))?;
+    if res.exit_code != 0 {
+        anyhow::bail!("could not find the checkout in {name}: exit {}", res.exit_code);
+    }
+    let path = res.output().trim().to_string();
+    if !path.starts_with('/') {
+        anyhow::bail!("could not find the checkout in {name}: got {path:?}");
+    }
+    Ok(tod_store::fleet::Workdir::sandbox(name, path))
+}
+
+/// Pushes `node_id`'s uncommitted work in its cloud sandbox `name` to the
+/// hidden checkpoint ref (`tod_store::fleet::checkpoint`), so deleting the
+/// sandbox loses nothing. A sandbox Blaxel does not have has nothing to keep.
+/// Fails, naming why, when the work cannot be kept: the caller must then not
+/// delete. Blocks on git and the network.
+pub fn checkpoint_before_delete(
+    bx: &tod_sandbox::blaxel::Blaxel,
+    node_id: &str,
+    name: &str,
+) -> Result<()> {
+    if bx.get(name)?.is_none() {
+        return Ok(());
+    }
+    let checkout = sandbox_checkout(bx, name)?;
+    tod_store::fleet::node_checkpoint::checkpoint_dir(&checkout, node_id, &tod_store::fleet::checkpoint::Limits::default())
+        .with_context(|| format!("could not keep {name}'s uncommitted work, so the sandbox was not deleted"))?;
+    Ok(())
+}
+
 /// Records (or, with `deleted` false, forgets) that the user deleted
 /// `node_id`'s sandbox on purpose.
 pub fn set_sandbox_deleted_by_user(root: &Path, node_id: &str, deleted: bool) -> Result<()> {
@@ -1282,6 +1318,12 @@ pub fn ensure_node_sandbox(
         progress(&format!("warning: the poke got {}", resp.status()));
     }
     let _ = sandboxes.save();
+    // Work checkpointed before an earlier sandbox of this node went away
+    // comes back as uncommitted edits.
+    let checkout = sandbox_checkout(&bx, &name)?;
+    for note in tod_store::fleet::node_checkpoint::restore_into(&checkout, node_id) {
+        progress(&format!("warning: {note}"));
+    }
     Ok(name)
 }
 

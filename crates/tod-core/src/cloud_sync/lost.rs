@@ -327,6 +327,10 @@ pub fn stop_running_in_cloud(fleet: &FleetStore, node_id: &str, delete_sandbox: 
     let root = fleet.paths().root().to_path_buf();
     let uuid = uuid::Uuid::parse_str(node_id).with_context(|| format!("node id {node_id}"))?;
     let row = fleet.read(|c| cloud_nodes::get(c, uuid))?;
+    if delete_sandbox && let Some(row) = &row {
+        let sandboxes = tod_store::fleet::sandbox::Sandboxes::load(&root)?;
+        super::checkpoint_before_delete(&sandboxes.blaxel()?, node_id, &row.sandbox)?;
+    }
     fleet.enqueue(FleetMutation::CloudNodeRemove { node: uuid })?;
     fleet.writer().flush()?;
     let _ = fleet.reload_if_stale();
@@ -367,8 +371,9 @@ pub fn delete_node_sandbox(fleet: &FleetStore, node_id: &str) -> Result<String> 
         sandboxes.forget(&row.sandbox)?;
         format!("Sandbox {} not found; nothing to delete.", row.sandbox)
     } else {
+        super::checkpoint_before_delete(&bx, node_id, &row.sandbox)?;
         sandboxes.delete(&bx, &row.sandbox).with_context(|| format!("delete sandbox {}", row.sandbox))?;
-        format!("Deleted sandbox {}.", row.sandbox)
+        format!("Deleted sandbox {}; its uncommitted work is kept on the remote and comes back when the node runs in the cloud again.", row.sandbox)
     };
     // The sandbox is gone either way: record it so the panel offers to run the node again.
     super::set_sandbox_deleted_by_user(&root, node_id, true)?;
