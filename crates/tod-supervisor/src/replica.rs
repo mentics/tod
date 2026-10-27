@@ -38,10 +38,13 @@ const CURSORS_FILE: &str = "supervisor-sync.json";
 /// The location the copy's Files row picks: the checkout the supervisor runs in.
 const LOCAL_PLACE_ID: &str = "supervisor-local-checkout";
 
-#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 struct Cursors {
     pull_after: i64,
     push_after: i64,
+    /// The orchestrator's seeding this copy came from (`Feed::seed_id`).
+    #[serde(default)]
+    seed_id: Option<String>,
 }
 
 pub struct Replica {
@@ -71,6 +74,23 @@ impl Replica {
             .ok()
             .and_then(|bytes| serde_json::from_slice(&bytes).ok())
             .filter(|_| db.is_file());
+        // A copy outlives the orchestrator's database when that is replaced (a
+        // redeploy without its volume, then the app seeding it again): its
+        // change numbers and rows belong to another history. Ask which
+        // seeding the orchestrator is on (a request past its last change
+        // returns no changes, only the id).
+        let current_seed = orchestrator.changes_after(i64::MAX)?.seed_id;
+        let saved = match saved {
+            Some(c) if c.seed_id != current_seed => {
+                tracing::warn!(
+                    copied_from = ?c.seed_id,
+                    now = ?current_seed,
+                    "the orchestrator's database was seeded again since this copy was made; seeding a new copy"
+                );
+                None
+            }
+            saved => saved,
+        };
         let (store, cursors) = match saved {
             Some(cursors) => (FleetStore::open(root).map_err(|e| anyhow::anyhow!("open {}: {e}", root.display()))?, cursors),
             None => {
@@ -89,7 +109,7 @@ impl Replica {
                 let _ = store.flush_on_quit();
                 // Whatever opening logged (a migration) is not ours to send.
                 let push_after = sync::last_seq(&connect(&db)?)?;
-                (store, Cursors { pull_after, push_after })
+                (store, Cursors { pull_after, push_after, seed_id: current_seed })
             }
         };
         let store = Arc::new(store);
@@ -169,6 +189,14 @@ impl Replica {
     /// applied.
     pub fn pull(&mut self) -> Result<usize> {
         let feed = self.orchestrator.changes_after(self.cursors.pull_after)?;
+        if feed.seed_id != self.cursors.seed_id {
+            anyhow::bail!(
+                "the orchestrator's database was seeded again while this copy was in use (copied from {:?}, now {:?}); \
+                 the next start takes a new copy",
+                self.cursors.seed_id,
+                feed.seed_id
+            );
+        }
         self.forward_problems();
         let n = feed.changes.len();
         if n > 0 {
