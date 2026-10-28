@@ -522,10 +522,11 @@ reply reached the app's store while its turn ran and was gone after it.
   "Leave it stopped" / "Leave it asleep" keeps the node stopped with no
   wake scheduled until the user answers again. See `orchestrator.md`.
 - **The watchdog.** Hourly, it lists the workspace's node sandboxes through
-  the control plane and asks each one's relay what holds it. It cannot
-  skip the ones in standby: the control plane reports a sandbox held awake
-  by a `keepAlive` process as `STANDBY` (its state follows proxied traffic,
-  not the VM), so asking wakes a sleeping one for that one request. A
+  the control plane and asks each one's relay what holds it. It skips the
+  ones whose listed `state` is `STANDBY`: they are asleep, held by nothing,
+  and asking would wake them. A sandbox held awake by a `keepAlive` process
+  is `RUNNING` (checked 2026-10-28; an earlier measurement, 2026-09-28,
+  saw `STANDBY` for one and no longer holds). A
   sandbox that has been awake longer than its lease allows gets its holds
   cleared (the relay's `release-all`, which kills its `keepAlive`
   process), and the node is flagged through the orchestrator. The watchdog
@@ -890,7 +891,7 @@ chosen per account in `sandboxes.toml`, so the same code runs everywhere:
    (cron `0 * * * *`, UTC; the token a `secret: true` env). A test sandbox
    labelled as a node of a scratch orchestrator user (`watchdog-test`, one
    node) held itself with `hold?reason=wdtest&secs=7200`. The first job
-   skipped it (the control plane said `STANDBY`; see Crash guards). A tick
+   skipped it (the control plane said `STANDBY`, as it did then; the watchdog now skips only `STANDBY`, which a held sandbox no longer reports). A tick
    written every 5 s inside it had no gap for as long as it was held (13
    minutes in all), and one 12 s gap, just after the watchdog released
    it: held, the VM runs whatever `state` says. Fixed,
