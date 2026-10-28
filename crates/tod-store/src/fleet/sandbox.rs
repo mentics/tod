@@ -659,6 +659,26 @@ pub fn list_vms(root: &Path) -> Result<Vec<tod_sandbox::vms::Vm>> {
     tod_sandbox::vms::list_managed(&bx, golden.as_deref())
 }
 
+/// The real sandbox a fork source names: `golden` is an alias for the newest
+/// golden sandbox ([`Sandboxes::resolve_golden`]), any other name is itself.
+/// A golden that cannot be resolved is an error saying why, never the literal
+/// name `golden` (no sandbox is called that). Asks Blaxel: never on the UI
+/// thread.
+pub fn resolve_fork_source(root: &Path, name: &str) -> Result<String> {
+    fork_source_with(name, || {
+        let sandboxes = Sandboxes::load(root)?;
+        let bx = sandboxes.blaxel()?;
+        sandboxes.resolve_golden(&bx)
+    })
+}
+
+fn fork_source_with(name: &str, resolve_golden: impl FnOnce() -> Result<String>) -> Result<String> {
+    if name != tod_sandbox::config::GOLDEN {
+        return Ok(name.to_string());
+    }
+    resolve_golden().with_context(|| "resolve the golden sandbox that \"golden\" stands for".to_string())
+}
+
 /// The Blaxel workspace and the image new sandboxes start from, as set up
 /// in this data root. Reads the file only.
 pub fn account_settings(root: &Path) -> (String, String) {
@@ -1059,6 +1079,18 @@ pub fn validate_name(name: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_golden_alias_is_resolved_not_looked_up_as_a_sandbox_name() {
+        use super::fork_source_with;
+        assert_eq!(
+            fork_source_with("golden", || Ok("wsx-golden-2026".into())).unwrap(),
+            "wsx-golden-2026"
+        );
+        assert_eq!(fork_source_with("other", || panic!("not an alias")).unwrap(), "other");
+        let err = fork_source_with("golden", || Err(anyhow!("no golden sandbox is set"))).unwrap_err();
+        assert!(format!("{err:#}").contains("no golden sandbox is set"), "{err:#}");
+    }
+
     #[test]
     fn an_interactive_proxy_is_current_only_with_all_its_credentials() {
         use tod_sandbox::config::ClaudeTokenVia::Proxy;

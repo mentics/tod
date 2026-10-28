@@ -359,6 +359,7 @@ impl LocationsDialog {
     /// Docker or wakes a sandbox).
     fn run_check(&mut self, cx: &mut Context<Self>) {
         let draft = self.draft(cx);
+        let root = self.fleet.paths().root().to_path_buf();
         self.generation += 1;
         let generation = self.generation;
         self.checking = true;
@@ -366,7 +367,7 @@ impl LocationsDialog {
         cx.notify();
         off_thread(
             cx,
-            move || check_place(&draft),
+            move || check_place(&draft, &root),
             move |this, result, cx| {
                 if this.generation != generation {
                     return;
@@ -1152,7 +1153,7 @@ fn sandbox_choice(listed: &ListedSandbox) -> ContainerSummary {
 
 /// Whether launches from `place` would work: what is missing, or where they
 /// would run. Talks to Docker or Blaxel.
-fn check_place(place: &FilesPlace) -> Result<String, String> {
+fn check_place(place: &FilesPlace, root: &std::path::Path) -> Result<String, String> {
     if let Some(reason) = place.incomplete() {
         return Err(reason);
     }
@@ -1183,8 +1184,11 @@ fn check_place(place: &FilesPlace) -> Result<String, String> {
                     ));
                 }
             };
-            check_repo_in_sandbox(&target, repo.as_deref())
-                .map(|found| format!("The sandbox each node forks: {found}"))
+            // `golden` is an alias: check the sandbox it stands for.
+            let real = sandboxes::resolve_fork_source(root, &target).map_err(|err| format!("{err:#}"))?;
+            let alias = if real != target { format!("{target} -> {real}: ") } else { String::new() };
+            check_repo_in_sandbox(&real, repo.as_deref())
+                .map(|found| format!("The sandbox each node forks ({alias}{found})"))
         }
         Some(dev) => {
             let container = dev.container().ok_or("Choose a dev container")?.to_string();
