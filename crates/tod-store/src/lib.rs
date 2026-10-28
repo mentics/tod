@@ -4,6 +4,7 @@ pub mod activity;
 pub mod cloud_activity;
 pub mod cloud_nodes;
 pub mod conversation;
+pub mod conversation_live;
 pub mod credentials;
 pub mod deferrals;
 pub mod decisions;

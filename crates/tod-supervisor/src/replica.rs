@@ -301,10 +301,31 @@ impl Replica {
         Ok(())
     }
 
+    /// The reply streaming in `conversation` so far, recorded for the app
+    /// (`tod_store::conversation_live`) and sent now: the finished turn
+    /// reaches the app only when it ends.
+    pub fn set_live_turn(&mut self, node: Uuid, conversation: Uuid, parts: &[tod_agent::ReplyPart]) -> Result<()> {
+        let conn = connect(&self.db())?;
+        tod_store::conversation_live::set(&conn, node, conversation, parts, tod_store::outline::uuid_blob::now_ms())
+            .context("recording the reply in flight in the supervisor's copy")?;
+        drop(conn);
+        self.push().context("sending the reply in flight to the orchestrator")?;
+        Ok(())
+    }
+
+    /// The turn ended: drops the in-flight row. Not sent here; the push that
+    /// follows each boundary carries it, together with the finished turn.
+    pub fn clear_live_turn(&mut self, node: Uuid) -> Result<()> {
+        let conn = connect(&self.db())?;
+        tod_store::conversation_live::clear(&conn, node)?;
+        Ok(())
+    }
+
     /// The run is over: removes the row and sends that.
     pub fn end_cloud_beat(&mut self, node: Uuid) -> Result<()> {
         let conn = connect(&self.db())?;
         tod_store::cloud_activity::end(&conn, node)?;
+        tod_store::conversation_live::clear(&conn, node)?;
         drop(conn);
         self.push()?;
         Ok(())

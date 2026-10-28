@@ -259,20 +259,41 @@ impl TranscriptPanel {
             }
             found
         };
+        self.cloud = tod_core::cloud_sync::cloud_status(&self.fleet, node, tod_store::outline::uuid_blob::now_ms());
         let (target, live) = match running {
             Some((conversation, parts)) => (Some(conversation), parts),
-            None => {
-                self.find_latest(node, cx);
-                (None, Vec::new())
-            }
+            None => match self.cloud_live_turn(node) {
+                // Nothing runs here, but the node's cloud supervisor is
+                // mid-turn: show the reply it has streamed so far.
+                Some((conversation, parts)) => (Some(conversation), parts),
+                None => {
+                    self.find_latest(node, cx);
+                    (None, Vec::new())
+                }
+            },
         };
         if let Some(watching) = &mut self.watching {
             watching.live = live;
         }
-        self.cloud = tod_core::cloud_sync::cloud_status(&self.fleet, node, tod_store::outline::uuid_blob::now_ms());
         match target {
             Some(id) if id != self.conversation_id => self.retarget(id, cx),
             _ => self.show(cx),
+        }
+    }
+
+    /// The turn `node`'s cloud supervisor has in flight, as it last sent it
+    /// (`tod_store::conversation_live`). Only while the supervisor is heard
+    /// from: a row left by one that died is not a turn in progress.
+    fn cloud_live_turn(&self, node: Uuid) -> Option<(Uuid, Vec<tod_agent::ReplyPart>)> {
+        if !matches!(self.cloud, Some(tod_core::cloud_sync::CloudStatus::Working { .. })) {
+            return None;
+        }
+        match self.fleet.read(|conn| tod_store::conversation_live::get(conn, node)) {
+            Ok(live) => live.map(|live| (live.conversation_id, live.parts)),
+            Err(err) => {
+                tracing::warn!("reading the cloud node's reply in flight: {err:#}");
+                None
+            }
         }
     }
 
@@ -409,7 +430,7 @@ impl TranscriptPanel {
             CloudStatus::Working { heard_at, what } => (
                 format!(
                     "Working in the cloud{} (supervisor last heard {}). This shows what it has synced so far; \
-                     the agent's output is not streamed live from the cloud.",
+                     the reply in flight is sent every few seconds.",
                     if what.is_empty() { String::new() } else { format!(" while {what}") },
                     at(*heard_at)
                 ),
@@ -598,6 +619,65 @@ mod tests {
             cx.run_until_parked();
         }
         view.read_with(cx, |view, _| assert_eq!(view.conversation_id(), second));
+    }
+
+    /// A node working in the cloud streams its reply into the synced
+    /// `conversation_live` row: the panel shows it after the stored turns,
+    /// and drops it once the supervisor says the turn is over.
+    #[gpui::test]
+    fn watching_a_cloud_node_shows_the_reply_its_supervisor_has_in_flight(cx: &mut TestAppContext) {
+        use crate::interview::agent::SharedAgent;
+        use std::sync::{Arc, Mutex};
+
+        let fixture = Fixture::new();
+        let conversation = add_conversation_under(&fixture, ProtocolKind::Implementation);
+        let now = tod_store::outline::uuid_blob::now_ms();
+        let db = fixture.store.paths().db().to_path_buf();
+        let write = |f: &dyn Fn(&rusqlite::Connection)| {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            f(&conn);
+            fixture.store.reload_if_stale().unwrap();
+        };
+        write(&|conn| {
+            tod_store::cloud_nodes::upsert(conn, fixture.node_id, "sandbox", "alice", now).unwrap();
+            tod_store::cloud_activity::beat(conn, fixture.node_id, "implementing", now).unwrap();
+            tod_store::conversation_live::set(
+                conn,
+                fixture.node_id,
+                conversation,
+                &[tod_agent::ReplyPart::Text { text: "reading the plan".into() }],
+                now,
+            )
+            .unwrap();
+        });
+        cx.update(gpui_component::init);
+        let agent: SharedAgent = Arc::new(Mutex::new(Box::new(
+            crate::interview::agent::MockAgentProvider::new(),
+        )));
+        let runs = cx.new(|_| AgentRuns::new(fixture.store.clone(), agent));
+        let (store, node, runs_in) = (fixture.store.clone(), fixture.node_id, runs.clone());
+        let slot = std::rc::Rc::new(RefCell::new(None));
+        let slot_in = slot.clone();
+        let (_, cx) = cx.add_window_view(move |window, cx| {
+            let view = cx.new(|cx| TranscriptPanel::watching(node, store, runs_in, window, cx));
+            *slot_in.borrow_mut() = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let view = slot.borrow_mut().take().unwrap();
+        settle(cx);
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.conversation_id(), conversation);
+            // Two stored turns and the reply in flight.
+            assert_eq!(view.panel.read(cx).entries().len(), 3);
+        });
+
+        write(&|conn| tod_store::conversation_live::clear(conn, fixture.node_id).unwrap());
+        for _ in 0..6 {
+            std::thread::sleep(std::time::Duration::from_millis(60));
+            cx.executor().advance_clock(std::time::Duration::from_millis(250));
+            cx.run_until_parked();
+        }
+        view.read_with(cx, |view, cx| assert_eq!(view.panel.read(cx).entries().len(), 2));
     }
 
     #[gpui::test]

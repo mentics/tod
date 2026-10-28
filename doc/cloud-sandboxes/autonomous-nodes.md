@@ -491,6 +491,20 @@ back at the same `projects/<project>/` path, so the conversation's recorded
 conversation falls back to a fresh session (rotation). A turn still running
 when a sandbox is lost is not mirrored. Moving these onto Agent Drive is not done yet.
 
+### The reply in flight
+
+A conversation's agent turn is stored when it ends, so the app would show a
+cloud node's user message and nothing else for the whole turn. While a turn
+runs, the supervisor's step hook (`watch`, every poll) writes the reply
+streamed so far, as `ReplyPart` JSON, into the synced `conversation_live` row
+(`tod_store::conversation_live`, one per node) at most every 3 seconds and
+only when it changed, and pushes it. It is deleted at the next turn or step
+boundary and when the run ends, by which time the finished turn is in
+`conversation_turns`. The transcript panel, watching a node whose heartbeat is
+fresh, shows the row after the stored turns; a row left by a supervisor that
+died is not shown. Verified live (2026-10-28): a real Claude node's streamed
+reply reached the app's store while its turn ran and was gone after it.
+
 ## Crash guards
 
 - **The hold expires.** See above; the supervisor's hold is a lease it must

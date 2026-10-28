@@ -242,6 +242,68 @@ fn a_cloud_nodes_heartbeat_reaches_the_app_and_it_shows_as_working() {
     }
 }
 
+/// A reply a supervisor is streaming reaches the app through the orchestrator
+/// while the turn runs, and is gone from the app once the turn has ended.
+#[test]
+fn a_cloud_nodes_reply_in_flight_reaches_the_app_and_goes_when_the_turn_ends() {
+    let base = temp_root("orch-live");
+    let url = start_orchestrator(&base);
+    let orch = HttpOrchestrator::new(url.clone(), None).with_client("app-test");
+    let root = temp_root("app-live");
+    let app = FleetStore::open(&root).unwrap();
+    add_list(&app, "t");
+    let list_id = app.list_outline_lists().unwrap()[0].id;
+    let node = uuid::Uuid::new_v4();
+    app.enqueue_outline(OutlineMutation::CreateNode {
+        node_id: Some(node),
+        list_id,
+        parent_id: None,
+        anchor_id: None,
+        position: tod_store::outline::CreatePosition::Below,
+        title: "cloud node".into(),
+    })
+    .unwrap();
+    app.writer().flush().unwrap();
+    sync(&app, &root, &orch, "alice").unwrap();
+
+    let replica = temp_root("replica-live");
+    let snapshot =
+        ureq::get(format!("{url}/users/alice/snapshot")).call().unwrap().body_mut().read_to_vec().unwrap();
+    std::fs::write(replica.join("seed.db"), &snapshot).unwrap();
+    sync::restore(&replica.join("seed.db"), &replica.join("tod.db")).unwrap();
+    let copy = FleetStore::open(&replica).unwrap();
+    let push = |after: i64| {
+        let outbox = sync::export_changes(&connect(copy.paths().db()).unwrap(), after).unwrap();
+        ureq::post(format!("{url}/users/alice/changes"))
+            .header(sync::CLIENT_HEADER, "supervisor-n1")
+            .send_json(&outbox)
+            .unwrap();
+        outbox.iter().map(|c| c.seq).max().unwrap_or(after)
+    };
+    let mut pushed = sync::last_seq(&connect(copy.paths().db()).unwrap()).unwrap();
+    let conversation = uuid::Uuid::new_v4();
+    let parts = vec![
+        tod_agent::ReplyPart::Text { text: "reading the plan".into() },
+        tod_agent::ReplyPart::Tool { id: "t1".into(), title: "Read plan.md".into(), status: "completed".into() },
+    ];
+    tod_store::conversation_live::set(&connect(copy.paths().db()).unwrap(), node, conversation, &parts, 5).unwrap();
+    pushed = push(pushed);
+    sync(&app, &root, &orch, "alice").unwrap();
+    let live = app.read(|conn| tod_store::conversation_live::get(conn, node)).unwrap().expect("the app has the reply in flight");
+    assert_eq!((live.conversation_id, live.parts), (conversation, parts));
+
+    tod_store::conversation_live::clear(&connect(copy.paths().db()).unwrap(), node).unwrap();
+    push(pushed);
+    sync(&app, &root, &orch, "alice").unwrap();
+    assert_eq!(app.read(|conn| tod_store::conversation_live::get(conn, node)).unwrap(), None);
+
+    drop(app);
+    drop(copy);
+    for r in [root, base, replica] {
+        let _ = std::fs::remove_dir_all(r);
+    }
+}
+
 /// The app's store and the orchestrator's copy converge: the seed, the
 /// app's outbox going up, a change made on the orchestrator coming down,
 /// and nothing echoed either way.

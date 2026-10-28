@@ -75,6 +75,25 @@ fn create_node(fleet: &FleetStore, title: &str, repo: &str, branch: &str, steps:
     fleet
         .enqueue(FleetMutation::UpdateTaskBranch { id: node.to_string(), branch: Some(branch.into()) })
         .map_err(e)?;
+    // Files locations (schema v82): the node runs in a sandbox of its own,
+    // made from the account's default image, with `repo` checked out there.
+    let place = tod_store::fleet::repos::files_place::FilesPlace {
+        id: uuid::Uuid::new_v4().to_string(),
+        name: format!("cloud-dev-{}", &uuid::Uuid::new_v4().simple().to_string()[..6]),
+        repo: Some(repo.into()),
+        dev_container: Some(tod_store::fleet::repos::node_files::DevContainerSetting {
+            sandbox: true,
+            sandbox_from: tod_store::fleet::repos::node_files::SandboxFrom::Image("blaxel/base-image:latest".into()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let place_id = place.id.clone();
+    fleet.enqueue(FleetMutation::SaveFilesPlace { place }).map_err(e)?;
+    fleet
+        .enqueue(FleetMutation::SetNodeFilesPlace { node_id: node.to_string(), place_id: Some(place_id) })
+        .map_err(e)?;
+    fleet.writer().flush().map_err(e)?;
     let mut after = None;
     for body in steps {
         let step = uuid::Uuid::new_v4();
