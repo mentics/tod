@@ -43,7 +43,16 @@ pub fn checkpoint_node_with(
     let lock = node_lock(node_id);
     let _held = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let dir = location_dir(&location)?;
-    checkpoint_dir(&dir, node_id, limits).map(Some)
+    match checkpoint_dir(&dir, node_id, limits) {
+        Ok(saved) => Ok(Some(saved)),
+        // An idle sandbox is reclaimed after a while: that is normal, and
+        // there is nothing in it to save. The next launch makes a new one.
+        Err(err) if format!("{err:#}").contains("no sandbox named ") => {
+            tracing::debug!(node_id, "not checkpointing: the node's sandbox is gone ({err:#})");
+            Ok(None)
+        }
+        Err(err) => Err(err),
+    }
 }
 
 /// Checkpoint `node_id`'s uncommitted work in `dir` (a checkout, e.g. a cloud

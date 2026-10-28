@@ -1089,7 +1089,16 @@ impl ConversationDriver {
         check_tod_cli()?;
         let (cwd, turn_env, progress) = {
             let env = self.env(fleet, id);
-            let cwd = match self.protocol.cwd(&env) {
+            // A node whose sandbox expired while it sat idle gets a new one
+            // here (forked from its source, session logs restored) and the
+            // turn goes on, instead of failing for the user to sort out.
+            let resolved = match self.focus.node_id() {
+                Some(node) => tod_store::fleet::provision::retry_if_sandbox_lost(fleet, &node.to_string(), || {
+                    self.protocol.cwd(&env)
+                }),
+                None => self.protocol.cwd(&env),
+            };
+            let cwd = match resolved {
                 Ok(cwd) => cwd,
                 Err(err) => {
                     // Shown in the transcript and the view: the turn is not sent.
