@@ -3,8 +3,10 @@
 //!
 //! A sandbox's deployment status is `DEPLOYED` whether it is running or in
 //! standby, so the billing API says which: a sandbox in standby is not billed
-//! for compute. Billing is hourly and lags a few minutes, so "active" means
-//! compute was billed in the current hour (or Blaxel reports it `RUNNING`).
+//! for compute. Blaxel's live `state` (`RUNNING` / `STANDBY`) decides; the
+//! billing API is hourly and lags a few minutes, so it only says when the
+//! state is missing, and otherwise whether the sandbox was billed earlier
+//! this hour.
 
 use crate::blaxel::{Blaxel, rfc3339_utc};
 use anyhow::{Result, anyhow, bail};
@@ -16,10 +18,12 @@ const COMPUTE: &str = "sandbox_compute_runtime_gbs";
 /// Whether compute is billed for a sandbox right now.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Billing {
-    /// Compute billed this hour, or Blaxel says it is running.
+    /// Running now (or, with no state from Blaxel, compute billed this hour).
     Active,
-    /// No compute billed this hour: asleep, costing storage only.
+    /// In standby, and not billed for compute this hour either.
     Standby,
+    /// In standby now, but compute was billed earlier this hour.
+    StandbyBilledThisHour,
     /// Not deployed (`FAILED`, `DEPLOYING`, ...): its status instead.
     Other(String),
 }
@@ -29,6 +33,7 @@ impl Billing {
         match self {
             Billing::Active => "Active (billed)".to_string(),
             Billing::Standby => "Standby".to_string(),
+            Billing::StandbyBilledThisHour => "Standby (billed earlier this hour)".to_string(),
             Billing::Other(s) => s.clone(),
         }
     }
@@ -57,8 +62,11 @@ pub fn billing_of(status: &str, state: Option<&str>, billed_this_hour: bool) -> 
     }
     match state {
         Some("RUNNING") => Billing::Active,
-        _ if billed_this_hour => Billing::Active,
-        _ => Billing::Standby,
+        Some("STANDBY") if billed_this_hour => Billing::StandbyBilledThisHour,
+        Some("STANDBY") => Billing::Standby,
+        Some(other) => Billing::Other(other.to_string()),
+        None if billed_this_hour => Billing::Active,
+        None => Billing::Standby,
     }
 }
 
@@ -174,10 +182,12 @@ mod tests {
     }
 
     #[test]
-    fn billing_prefers_failure_then_running_then_usage() {
+    fn billing_trusts_the_live_state_over_hourly_usage() {
         assert_eq!(billing_of("FAILED", Some("RUNNING"), true), Billing::Other("FAILED".into()));
         assert_eq!(billing_of("DEPLOYED", Some("RUNNING"), false), Billing::Active);
-        assert_eq!(billing_of("DEPLOYED", None, true), Billing::Active);
+        assert_eq!(billing_of("DEPLOYED", Some("STANDBY"), true), Billing::StandbyBilledThisHour);
         assert_eq!(billing_of("DEPLOYED", Some("STANDBY"), false), Billing::Standby);
+        assert_eq!(billing_of("DEPLOYED", None, true), Billing::Active);
+        assert_eq!(billing_of("DEPLOYED", None, false), Billing::Standby);
     }
 }

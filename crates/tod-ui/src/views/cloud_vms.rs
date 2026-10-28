@@ -105,10 +105,10 @@ impl CloudVmsView {
         let cell = |id: &str, text: String, window: &mut Window, cx: &mut Context<Self>| {
             selectable_text(SharedString::from(format!("{id}-{index}")), text, window, cx)
         };
-        let billing_cell = style::text_dense(div()).w(px(130.)).flex_shrink_0().child(cell("vm-billing", billing, window, cx));
+        let billing_cell = style::text_dense(div()).w(px(230.)).flex_shrink_0().child(cell("vm-billing", billing, window, cx));
         let billing_cell = match vm.billing {
             Billing::Active => billing_cell.text_color(style::color::text_muted()),
-            Billing::Standby => billing_cell,
+            Billing::Standby | Billing::StandbyBilledThisHour => billing_cell,
             Billing::Other(_) => billing_cell.text_color(gpui::red()),
         };
         style::row_wrapped(h_flex().id(("vm-row", index)))
@@ -218,7 +218,7 @@ impl Render for CloudVmsView {
                     .py(style::space::RELATED)
                     .child(div().w(px(260.)).flex_shrink_0().child("Name"))
                     .child(div().w(px(150.)).flex_shrink_0().child("Created"))
-                    .child(div().w(px(130.)).flex_shrink_0().child("Billing"))
+                    .child(div().w(px(230.)).flex_shrink_0().child("Billing"))
                     .child(div().flex_1().child("Labels")),
             )
             .child(
