@@ -23,6 +23,12 @@ for f in tod.yml linear_filter_presets.json linear_introspection_cache.json orch
 done
 [ -d "$REAL/credentials" ] && { mkdir -p "$TEST/credentials"; cp -Rp "$REAL/credentials/." "$TEST/credentials/"; chmod 700 "$TEST/credentials"; }
 
+# tod.yml may point at the real root's storage (fleet_storage_root), which would
+# make the test app open the real database and daemon: never carry it over.
+sed -i.bak '/^fleet_storage_root:/d' "$TEST/tod.yml" && rm -f "$TEST/tod.yml.bak"
+sed -i.bak "s#^treehouse_worktrees_root:.*#treehouse_worktrees_root: $TEST/worktrees#" "$TEST/tod.yml" && rm -f "$TEST/tod.yml.bak"
+if grep -qE '^fleet_storage_root:' "$TEST/tod.yml"; then echo "tod.yml still names a storage root" >&2; exit 1; fi
+
 # sandboxes.toml: keep the account ([blaxel], golden) and [[database]] entries,
 # drop the per-node [[sandbox]] entries, which belong to the real root's nodes.
 python3 - "$REAL/sandboxes.toml" "$TEST/sandboxes.toml" <<'PY'
