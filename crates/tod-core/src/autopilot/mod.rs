@@ -254,6 +254,10 @@ pub struct Autopilot {
     /// How often a pull request is read again while the run waits on it.
     pr_poll: Duration,
     state: AutopilotState,
+    /// Set by the user's request for a new session ([`AutopilotState::fresh_session`]):
+    /// the next conversation is a new one, never a reopened one. Taken by
+    /// [`Self::converse`].
+    fresh_session: bool,
 }
 
 /// How often a waiting pull request is read again, at first.
@@ -267,15 +271,22 @@ impl Autopilot {
     /// The autopilot for `node`, continuing whatever run its saved state
     /// holds (a fresh one when there is none).
     pub fn new(config: ConversationConfig, node: Uuid, budget: Budget) -> Result<Self> {
-        let state = AutopilotState::load(&config.data_root, node)?;
-        Ok(Self {
+        let mut state = AutopilotState::load(&config.data_root, node)?;
+        let fresh_session = std::mem::take(&mut state.fresh_session);
+        let mut pilot = Self {
             config,
             node,
             budget,
             poll: Duration::from_millis(500),
             pr_poll: PR_POLL,
             state,
-        })
+            fresh_session,
+        };
+        if fresh_session {
+            pilot.state.current = None;
+            pilot.save()?;
+        }
+        Ok(pilot)
     }
 
     /// How often a pull request being waited on is read again.
@@ -494,6 +505,9 @@ impl Autopilot {
     ) -> Result<Option<Outcome>> {
         let node = self.node;
         let earlier = fleet.read(|conn| {
+            if self.fresh_session {
+                return Ok(None);
+            }
             let since = PhaseRepo::new(conn).stay_started_at(node)?;
             let conversation = ConversationRepo::new(conn)
                 .latest_for_focus_with_protocol(Focus::Node(node), ProtocolKind::Phase)?;
@@ -864,6 +878,7 @@ impl Autopilot {
             return Ok(Some(Outcome::BudgetExhausted { limit }));
         }
         let lifecycle = lifecycle::current_state(fleet, self.node)?;
+        self.fresh_session = false;
         let resumable = self
             .state
             .current
