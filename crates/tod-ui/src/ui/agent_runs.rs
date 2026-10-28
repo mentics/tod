@@ -103,6 +103,9 @@ pub struct AgentRuns {
 /// How often a turn in flight is looked at.
 const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 
+/// What a slot shows while its turn is being stopped off the main thread.
+const STOPPING: &str = "Stopping…";
+
 /// Drop the provider's live agent sessions `keys`. The conversations keep
 /// their recorded agent session ids: the next message starts the agent again
 /// and resumes by id, and when the agent cannot (a recreated sandbox has no
@@ -173,13 +176,11 @@ impl AgentRuns {
                                 tracing::warn!("conversation notice: {notice:?}");
                             }
                         }
-                        if this.take_cancel(id)
-                            && let Err(err) =
-                                driver.cancel(&this.fleet, &mut SharedAgentAccess(&this.agent))
-                        {
-                            tracing::warn!("stopping a conversation failed: {err:#}");
+                        if this.take_cancel(id) {
+                            this.cancel_in_background(id, driver, cx);
+                        } else {
+                            this.put_back(id, driver);
                         }
-                        this.put_back(id, driver);
                     }
                     cx.notify();
                 }) else {
@@ -271,6 +272,48 @@ impl AgentRuns {
             .iter_mut()
             .filter_map(|slot| slot.take_to_tick().map(|driver| (slot.id, driver)))
             .collect()
+    }
+
+    /// Stop the turn of slot `id` without blocking the caller: stopping takes
+    /// the agent lock, ends the activity lease and writes the transcript, all
+    /// of which can wait on the agent's worker or the database. A driver that
+    /// is away on the background executor is marked to stop when it is back.
+    pub fn stop(&mut self, id: u64, cx: &mut Context<Self>) {
+        let driver = self
+            .slots
+            .iter_mut()
+            .find(|s| s.id == id)
+            .and_then(|s| s.take_to_cancel(STOPPING));
+        match driver {
+            Some(driver) => self.cancel_in_background(id, driver, cx),
+            None => self.set_cancel(id),
+        }
+        cx.notify();
+    }
+
+    /// Cancel `driver`'s turn on the background executor, then put it back.
+    fn cancel_in_background(&mut self, id: u64, mut driver: ConversationDriver, cx: &mut Context<Self>) {
+        if let Some(slot) = self.slots.iter_mut().find(|s| s.id == id) {
+            slot.status.activity = Some(STOPPING.to_string());
+        }
+        let fleet = self.fleet.clone();
+        let agent = self.agent.clone();
+        cx.spawn(async move |this, cx| {
+            let driver = cx
+                .background_executor()
+                .spawn(async move {
+                    if let Err(err) = driver.cancel(&fleet, &mut SharedAgentAccess(&agent)) {
+                        tracing::warn!("stopping a conversation failed: {err:#}");
+                    }
+                    driver
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.put_back(id, driver);
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// Mark the slot `id` to stop as soon as its driver is back.

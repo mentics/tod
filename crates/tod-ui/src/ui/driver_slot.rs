@@ -103,6 +103,14 @@ impl DriverSlot {
         self.driver.take()
     }
 
+    /// Take the driver to stop its turn off the main thread, showing
+    /// `activity` until it is back. `None` when it is away already.
+    pub fn take_to_cancel(&mut self, activity: &str) -> Option<ConversationDriver> {
+        let driver = self.driver.take()?;
+        self.status.activity = Some(activity.to_string());
+        Some(driver)
+    }
+
     /// The driver is back: read what it knows now.
     pub fn put_back(&mut self, driver: ConversationDriver) {
         self.conversation_id = driver.conversation_id();
