@@ -25,6 +25,9 @@ struct PersistedWorkingSet {
     /// The summary strip's filter. Absent in a file an older build wrote.
     #[serde(default)]
     actor_filter: Option<ActorBucket>,
+    /// Collapsed group header ids. Absent in a file an older build wrote.
+    #[serde(default)]
+    collapsed_groups: Vec<String>,
 }
 
 pub fn load_working_set(config_dir: &Path) -> ListWorkingSet {
@@ -43,7 +46,7 @@ pub fn load_working_set(config_dir: &Path) -> ListWorkingSet {
         active_list_id: persisted.active_list_id,
         pending_changes_only: false,
         actor_filter: persisted.actor_filter,
-        collapsed_groups: Default::default(),
+        collapsed_groups: persisted.collapsed_groups.into_iter().collect(),
         generator_sorts: persisted
             .generator_sorts
             .into_iter()
@@ -82,6 +85,11 @@ pub fn save_working_set(config_dir: &Path, ws: &ListWorkingSet) {
         selected_id: ws.selected_id.clone(),
         active_list_id: ws.active_list_id.clone(),
         actor_filter: ws.actor_filter,
+        collapsed_groups: {
+            let mut ids: Vec<String> = ws.collapsed_groups.iter().cloned().collect();
+            ids.sort();
+            ids
+        },
         generator_sorts: ws
             .generator_sorts
             .iter()
@@ -175,6 +183,20 @@ mod tests {
         assert_eq!(old.sort_key, SortKey::TreeOrder);
         assert_eq!(old.sort_direction, SortDirection::Asc);
         assert_eq!(old.filter_query, "keep");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn collapsed_groups_round_trip_across_save_and_load() {
+        let dir =
+            std::env::temp_dir().join(format!("tod-working-set-test-{}", uuid::Uuid::new_v4()));
+        let mut ws = ListWorkingSet::default_sort();
+        ws.collapsed_groups.insert("group:p:active".into());
+        save_working_set(&dir, &ws);
+        assert_eq!(
+            load_working_set(&dir).collapsed_groups,
+            ws.collapsed_groups
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

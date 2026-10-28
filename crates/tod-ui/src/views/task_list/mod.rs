@@ -1159,11 +1159,12 @@ impl TaskListView {
     }
 
     fn toggle_collapsed(&mut self, task_id: &str, window: &mut Window, cx: &mut Context<Self>) {
-        // A group header is not a node: its fold is kept by the view alone.
+        // A group header is not a node: its fold is kept in the working set.
         if task_id.starts_with("group:") {
             if !self.working_set.collapsed_groups.remove(task_id) {
                 self.working_set.collapsed_groups.insert(task_id.to_string());
             }
+            self.persist_working_set();
             self.rebuild_visible_list(window, cx);
             return;
         }

@@ -254,7 +254,7 @@ pub struct ListWorkingSet {
     /// ancestors). Persisted.
     pub actor_filter: Option<ActorBucket>,
     /// Group header rows (see [`group_children_by_lifecycle`]) the user has
-    /// collapsed, by header id. Not persisted.
+    /// collapsed, by header id. Persisted.
     pub collapsed_groups: HashSet<String>,
 }
 
