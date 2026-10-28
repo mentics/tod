@@ -339,6 +339,17 @@ impl Replica {
             "UPDATE node_files SET place_id = ?2 WHERE node_id = ?1",
             params![blob, LOCAL_PLACE_ID],
         )?;
+        // The checkout is on this node's own branch (what the app sent it
+        // here to work on), but a node inheriting Files resolves the branch
+        // of the node that owns it, since this location is not per-node. Say
+        // the node's own is the Files branch here, or the run warns that the
+        // worktree is on a branch other than the Files branch.
+        tx.execute(
+            "UPDATE node_fields SET branch = (SELECT branch FROM node_fields WHERE node_id = ?2)
+             WHERE node_id = ?1 AND ?1 != ?2
+               AND COALESCE((SELECT branch FROM node_fields WHERE node_id = ?2), '') != ''",
+            params![blob, self.node.as_bytes().to_vec()],
+        )?;
         tx.execute_batch("UPDATE sync_state SET suppress = 0 WHERE id = 1;")?;
         tx.commit()?;
         drop(conn);
