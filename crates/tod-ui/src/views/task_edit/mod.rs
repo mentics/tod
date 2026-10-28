@@ -632,11 +632,25 @@ impl TaskEditView {
             InputState::new(window, cx).placeholder("Enter to edit · Destination node slug")
         });
         let _generator_accept_destination_subscription =
-            cx.subscribe(&generator_accept_destination_input, |this, _, event, cx| {
-                if matches!(event, InputEvent::Change) {
-                    this.refresh_accept_destination_hints(cx);
-                }
-            });
+            cx.subscribe_in(
+                &generator_accept_destination_input,
+                window,
+                |this, _, event, window, cx| match event {
+                    InputEvent::Change => this.refresh_accept_destination_hints(cx),
+                    // Leaving the field finishes it: the destination is only
+                    // saved once the user is done with it (see
+                    // `schedule_generator_accept_autosave`), so without this
+                    // the field stayed "being edited" and nothing was saved.
+                    InputEvent::PressEnter { .. } => this.exit_edit(window, cx),
+                    InputEvent::Blur => {
+                        if this.editing == Some(TaskEditField::GeneratorAcceptDestination) {
+                            this.editing = None;
+                            cx.notify();
+                        }
+                    }
+                    _ => {}
+                },
+            );
         let cap_picker = cx.new(|cx| {
             ComboboxState::new(
                 SearchableVec::new(
@@ -6928,3 +6942,6 @@ fn capitalize(text: &str) -> String {
         None => String::new(),
     }
 }
+
+#[cfg(test)]
+mod accept_config_tests;
