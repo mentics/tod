@@ -120,6 +120,9 @@ pub struct CredentialStore {
     /// GitHub is authenticated by the sandbox's proxy
     /// ([`crate::github::proxy_authenticated`], read when the store is made).
     github_via_proxy: bool,
+    /// `credentials_file_only` in the data root's settings: the keyring is
+    /// never used.
+    file_only_setting: bool,
     /// Where each repository's token is chosen, in the orchestrator
     /// ([`crate::github::routed_authenticated`]); read when the store is made.
     github_routes: Option<crate::github_routes::GithubRoutes>,
@@ -130,6 +133,7 @@ impl CredentialStore {
         Self {
             credentials_dir: paths.credentials_dir(),
             keyring_service: KEYRING_SERVICE.to_string(),
+            file_only_setting: file_only_in(paths.data_root()),
             github_via_proxy: crate::github::proxy_authenticated(),
             github_routes: routes_in(paths.data_root()),
         }
@@ -139,6 +143,7 @@ impl CredentialStore {
         Self {
             credentials_dir: data_root.join("credentials"),
             keyring_service: KEYRING_SERVICE.to_string(),
+            file_only_setting: file_only_in(data_root),
             github_via_proxy: crate::github::proxy_authenticated(),
             github_routes: routes_in(data_root),
         }
@@ -184,7 +189,7 @@ impl CredentialStore {
         self.get_from_keyring(kind.keyring_account())
             .err()
             .map(|err| err.to_string())
-            .filter(|msg| !msg.starts_with("keyring not used in this build"))
+            .filter(|msg| !msg.starts_with("keyring not used"))
     }
 
     pub fn backend(&self, kind: CredentialKind) -> Option<CredentialBackend> {
@@ -288,10 +293,10 @@ impl CredentialStore {
         let file_only = match backend.to_ascii_lowercase().as_str() {
             "file" => true,
             "keyring" => false,
-            _ => cfg!(debug_assertions) && self.keyring_service == KEYRING_SERVICE,
+            _ => self.file_only_setting || (cfg!(debug_assertions) && self.keyring_service == KEYRING_SERVICE),
         };
         if file_only {
-            return Err(CredentialError::Message("keyring not used in this build (TOD_CREDENTIALS_BACKEND=keyring uses it)".into()));
+            return Err(CredentialError::Message("keyring not used (credentials_file_only in tod.yml, or a dev build; TOD_CREDENTIALS_BACKEND=keyring uses it)".into()));
         }
         keyring::Entry::new(&self.keyring_service, account)
             .map_err(|err| CredentialError::Message(err.to_string()))
@@ -628,6 +633,19 @@ pub fn resolve_linear_api_key(store: &CredentialStore) -> Option<String> {
 /// The orchestrator's repository-to-token routes in `data_root`, where this
 /// process reads GitHub with them ([`crate::github::routed_authenticated`]).
 /// A routes file that cannot be read is logged, and reads as no routes.
+/// Whether the data root's settings turn the keyring off. A settings file
+/// that cannot be read is reported, and the keyring is then not used either:
+/// a credential is never moved somewhere the user chose against.
+fn file_only_in(data_root: &Path) -> bool {
+    match crate::settings::TodSettings::load_from_path(&data_root.join(crate::paths::SETTINGS_FILE)) {
+        Ok(settings) => settings.credentials_file_only,
+        Err(err) => {
+            tracing::error!("credentials: settings unreadable, using the credential files only: {err:#}");
+            true
+        }
+    }
+}
+
 fn routes_in(data_root: &Path) -> Option<crate::github_routes::GithubRoutes> {
     if !crate::github::routed_authenticated() {
         return None;
@@ -671,6 +689,7 @@ mod tests {
                 store: CredentialStore {
                     credentials_dir: dir,
                     keyring_service: format!("tod-test-{id}"),
+                    file_only_setting: false,
                     github_via_proxy: false,
                     github_routes: None,
                 },

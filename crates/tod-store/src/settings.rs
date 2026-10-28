@@ -724,6 +724,11 @@ pub struct TodSettings {
     /// How long idle connections to cloud sandboxes stay open.
     #[serde(default)]
     pub sandbox_idle: SandboxIdleSettings,
+    /// Never use the OS keyring: every credential is read from and written to
+    /// the encrypted files under `credentials/`. `TOD_CREDENTIALS_BACKEND`
+    /// still overrides it.
+    #[serde(default)]
+    pub credentials_file_only: bool,
 }
 
 /// The Treehouse executable when none is configured: found on PATH.
@@ -755,6 +760,7 @@ impl Default for TodSettings {
             visual_design: VisualDesignSettings::default(),
             pr_readiness: PrReadinessSettings::default(),
             sandbox_idle: SandboxIdleSettings::default(),
+            credentials_file_only: false,
         }
     }
 }
@@ -1128,6 +1134,7 @@ mod tests {
                 review_schedule: ReviewSchedule { start_hour: 9, ..ReviewSchedule::default() },
             },
             sandbox_idle: SandboxIdleSettings::default(),
+            credentials_file_only: true,
         };
         settings.save_to_path(&path).unwrap();
         let loaded = TodSettings::load_from_path(&path).unwrap();
