@@ -21,6 +21,7 @@ pub mod journey_rows;
 pub mod journey_submissions;
 pub mod learn;
 pub mod lifecycle_baseline;
+pub mod lifecycle_reset;
 pub mod github;
 pub mod github_routes;
 pub mod orchestrator_github;

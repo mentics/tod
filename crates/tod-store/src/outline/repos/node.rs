@@ -232,6 +232,7 @@ impl<'a> NodeRepo<'a> {
 
     pub fn set_lifecycle(&self, node_id: Uuid, state: &str) -> Result<()> {
         let now = now_ms();
+        let previous = self.get_lifecycle(node_id)?;
         self.conn.execute(
             "INSERT INTO node_lifecycle (node_id, state, updated_at) VALUES (?1, ?2, ?3)
              ON CONFLICT(node_id) DO UPDATE SET state = excluded.state,
@@ -241,6 +242,11 @@ impl<'a> NodeRepo<'a> {
                                  THEN node_lifecycle.updated_at ELSE excluded.updated_at END",
             params![uuid_to_blob(node_id), state, now],
         )?;
+        // Moving back restarts from there: what certified the states being
+        // redone no longer counts (`crate::lifecycle_reset`).
+        if let Some(previous) = previous {
+            crate::lifecycle_reset::clear_certifications(self.conn, node_id, &previous, state)?;
+        }
         // What `ready` onwards is built on; see `crate::lifecycle_baseline`.
         let baselines = crate::lifecycle_baseline::BaselineRepo::new(self.conn);
         match state {

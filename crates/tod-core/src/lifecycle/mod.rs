@@ -217,4 +217,61 @@ mod tests {
         assert_eq!(revert(&fx.fleet, fx.node).unwrap(), None);
         assert_eq!(force_advance(&fx.fleet, fx.node).unwrap(), Some("design"));
     }
+    /// Sending a node back restarts from there: the reports certifying the
+    /// states redone stop counting, and those of earlier states stay.
+    #[test]
+    fn moving_back_drops_the_reports_certifying_the_states_redone() {
+        use tod_store::conversation::{ConversationRepo, Focus, ProtocolKind};
+        use tod_store::interview::{ACTOR_USER, InterviewCommand};
+        let fx = crate::interview::test_support::fixture();
+        let node = fx.node;
+        let make = |protocol| {
+            let id = Uuid::new_v4();
+            fx.fleet
+                .interview(
+                    ACTOR_USER,
+                    InterviewCommand::CreateConversation {
+                        id,
+                        protocol,
+                        focus: Focus::Node(node),
+                        platform: None,
+                        model: None,
+                        effort: None,
+                    },
+                )
+                .unwrap();
+            fx.fleet
+                .interview(
+                    ACTOR_USER,
+                    InterviewCommand::RecordConversationReport {
+                        conversation_id: id,
+                        body: serde_json::json!({"review": "done"}),
+                    },
+                )
+                .unwrap();
+            id
+        };
+        let review = make(ProtocolKind::Review);
+        let implement = make(ProtocolKind::Implementation);
+        let has_report = |id| {
+            fx.fleet
+                .read(|conn| Ok(ConversationRepo::new(conn).latest_report(id)?.is_some()))
+                .unwrap()
+        };
+
+        set_lifecycle(&fx.fleet, node, "pr").unwrap();
+        // Moving forward, or staying put, drops nothing.
+        set_lifecycle(&fx.fleet, node, "approved").unwrap();
+        set_lifecycle(&fx.fleet, node, "approved").unwrap();
+        assert!(has_report(review) && has_report(implement));
+
+        // Back to `review`: the review is redone, the implementation stands.
+        revert_to(&fx.fleet, node, "review").unwrap();
+        assert!(!has_report(review));
+        assert!(has_report(implement));
+
+        // Further back to `active`: the implementation is redone too.
+        revert_to(&fx.fleet, node, "active").unwrap();
+        assert!(!has_report(implement));
+    }
 }
