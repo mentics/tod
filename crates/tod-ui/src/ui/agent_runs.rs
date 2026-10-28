@@ -802,7 +802,26 @@ impl AgentRuns {
         .detach();
     }
 
+    /// Whether the conversation's node runs in the cloud: its supervisor
+    /// there owns the agent, and continues by itself once it sees the
+    /// request answered (the answer is in the synced store). Sending the turn
+    /// from this machine would start a second agent on the same session,
+    /// with this machine's sign-in.
+    fn conversation_runs_in_cloud(fleet: &FleetStore, conversation_id: Uuid) -> anyhow::Result<bool> {
+        let Some(conversation) = fleet.read(|conn| ConversationRepo::new(conn).get(conversation_id))? else {
+            return Ok(false);
+        };
+        Ok(conversation
+            .focus
+            .node_id()
+            .and_then(|node| tod_core::cloud_sync::cloud_node(fleet, &node.to_string()))
+            .is_some_and(|cloud| cloud.lost_at.is_none()))
+    }
+
     fn deliver_answer(&mut self, conversation_id: Uuid, message: &str, cx: &mut Context<Self>) -> anyhow::Result<()> {
+        if Self::conversation_runs_in_cloud(&self.fleet, conversation_id)? {
+            return Ok(());
+        }
         self.ensure_for_conversation(conversation_id)?;
         if !self.send_to_conversation(conversation_id, message, cx) {
             tracing::warn!(
@@ -864,6 +883,9 @@ impl AgentRuns {
                     // has gone out, as in the synchronous path.
                     let sent = this
                         .update(cx, |this, cx| {
+                            if Self::conversation_runs_in_cloud(&this.fleet, conversation_id)? {
+                                return Ok(());
+                            }
                             this.ensure_for_conversation(conversation_id)?;
                             if this.send_to_conversation(conversation_id, &message, cx) {
                                 Ok(())
@@ -1349,6 +1371,74 @@ mod tests {
         let body = &change_turn.unwrap().body;
         assert!(body.contains("per line"), "{body}");
         assert!(body.contains("per invoice"), "{body}");
+    }
+
+    /// A node in the cloud is continued by its supervisor: answering its
+    /// request records the answer and sends nothing from this machine.
+    #[gpui::test]
+    fn an_answer_for_a_node_in_the_cloud_is_recorded_and_not_sent_from_here(cx: &mut TestAppContext) {
+        let fixture = Fixture::new();
+        tod_store::paths::set_data_root(fixture.store.paths().root().to_path_buf());
+        let node = fixture.node_id;
+        let agent: SharedAgent = Arc::new(Mutex::new(Box::new(RecordingAgent::new())));
+        let registry = cx.new(|_| AgentRuns::new(fixture.store.clone(), agent));
+        let conversation_id = Uuid::new_v4();
+        fixture
+            .store
+            .interview(
+                tod_store::interview::ACTOR_USER,
+                tod_store::interview::InterviewCommand::CreateConversation {
+                    id: conversation_id,
+                    focus: Focus::Node(node),
+                    protocol: ProtocolKind::Outline,
+                    platform: None,
+                    model: None,
+                    effort: None,
+                },
+            )
+            .unwrap();
+        let decision_id = fixture
+            .store
+            .interview(
+                tod_store::interview::ACTOR_USER,
+                tod_store::interview::InterviewCommand::AskDecision {
+                    node_id: node,
+                    conversation_id: Some(conversation_id),
+                    protocol: Some("outline".to_string()),
+                    decision: tod_store::decisions::NewDecision {
+                        question: "Round per line or per invoice?".to_string(),
+                        options: vec!["per line".to_string(), "per invoice".to_string()],
+                        evidence: Vec::new(),
+                        ..Default::default()
+                    },
+                },
+            )
+            .unwrap()
+            .get("id")
+            .and_then(|v| v.as_str())
+            .and_then(|raw| Uuid::parse_str(raw).ok())
+            .unwrap();
+        let conn = rusqlite::Connection::open(fixture.store.paths().db()).unwrap();
+        tod_store::cloud_nodes::upsert(&conn, node, "node-sandbox", "alice", 1).unwrap();
+        fixture.store.reload_if_stale().unwrap();
+
+        registry
+            .update(cx, |registry, cx| registry.answer_decision(decision_id, Some(1), None, cx))
+            .unwrap();
+        cx.run_until_parked();
+
+        let with_answers = fixture
+            .store
+            .read(|conn| tod_store::decisions::DecisionRepo::new(conn).get_with_answers(decision_id))
+            .unwrap()
+            .unwrap();
+        assert_eq!(with_answers.answers.len(), 1, "the answer is recorded");
+        let turns = fixture.store.read(|conn| ConversationRepo::new(conn).turns(conversation_id)).unwrap();
+        assert!(turns.is_empty(), "nothing is sent from this machine: {turns:?}");
+        assert!(
+            registry.read_with(cx, |r, _| r.slot_by_index(0).is_none()),
+            "no local agent slot was made for it"
+        );
     }
 
     /// Declining a credential request tells the asking conversation it was
