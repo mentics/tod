@@ -132,7 +132,7 @@ pub fn main(args: &[String]) {
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
     rt.block_on(async move {
         let listener = TcpListener::bind(("0.0.0.0", port)).await.expect("bind relay port");
-        eprintln!("tod-relay {} listening on {port}, home {}", crate::VERSION, relay.home);
+        log!("tod-relay {} listening on {port}, home {}", crate::VERSION, relay.home);
         tokio::spawn(relay.tunnel.clone().listen(tunnel_port));
         loop {
             let Ok((stream, _)) = listener.accept().await else { continue };
@@ -283,7 +283,7 @@ async fn handle_http(relay: &Arc<Relay>, mut stream: TcpStream, action: HttpActi
             json_reply.as_bytes()
         }
         HttpAction::ReleaseAll => {
-            eprintln!("relay: release-all");
+            log!("relay: release-all");
             relay.hold.release_all();
             b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
         }
@@ -300,7 +300,7 @@ async fn handle_http(relay: &Arc<Relay>, mut stream: TcpStream, action: HttpActi
             b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
         }
         HttpAction::Bad(why) => {
-            eprintln!("relay: bad request: {why}");
+            log!("relay: bad request: {why}");
             b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
         }
     };
@@ -334,7 +334,7 @@ fn poke(relay: &Arc<Relay>) {
             if alive(pid) {
                 // SAFETY: signalling a process we started ourselves.
                 unsafe { libc::kill(pid as i32, libc::SIGUSR1) };
-                eprintln!("poke: signalled supervisor pid {pid}");
+                log!("poke: signalled supervisor pid {pid}");
                 return;
             }
             *sup = None;
@@ -351,12 +351,12 @@ fn poke(relay: &Arc<Relay>) {
         Ok(mut child) => {
             let pid = child.id().unwrap_or(0);
             *relay.supervisor.lock().unwrap() = Some(pid);
-            eprintln!("poke: started supervisor pid {pid}: {}", relay.supervisor_cmd);
+            log!("poke: started supervisor pid {pid}: {}", relay.supervisor_cmd);
             let relay = relay.clone();
             tokio::spawn(async move {
                 let code = child.wait().await.map(exit_code).unwrap_or(255);
                 reaper::untrack(pid);
-                eprintln!("poke: supervisor pid {pid} exited {code}");
+                log!("poke: supervisor pid {pid} exited {code}");
                 if code != 0 {
                     crate::problem(tod_problems::Level::Warn, &format!("poke: supervisor pid {pid} exited {code}"));
                 }
@@ -367,7 +367,7 @@ fn poke(relay: &Arc<Relay>) {
             });
         }
         Err(e) => {
-            eprintln!("poke: could not start supervisor: {e}");
+            log!("poke: could not start supervisor: {e}");
             crate::problem(tod_problems::Level::Error, &format!("poke: could not start supervisor: {e}"));
         }
     }
@@ -476,7 +476,7 @@ impl Session {
         s.held_bytes += msg_len(&m);
         s.held.push_back(m);
         if s.held_bytes > MAX_HELD_BYTES {
-            eprintln!("session {}: over {MAX_HELD_BYTES} bytes held while detached; ending it", self.key);
+            log!("session {}: over {MAX_HELD_BYTES} bytes held while detached; ending it", self.key);
             s.overflow = true;
             s.held.clear();
             s.held_bytes = 0;
@@ -646,7 +646,7 @@ fn spawn_session(relay: &Arc<Relay>, req: &ExecReq, conn: u64) -> std::io::Resul
     });
     let mut cmd = command(relay, req);
     let label = req.cmd.clone().unwrap_or_else(|| "(shell)".into());
-    eprintln!("exec {key}: {}", label.chars().take(120).collect::<String>());
+    log!("exec {key}: {}", label.chars().take(120).collect::<String>());
 
     if let Some((cols, rows)) = req.pty {
         let pty = reaper::spawn_tracked(|| pty::spawn(cmd, cols, rows), |p| Some(p.child.id()))?;
@@ -850,7 +850,7 @@ impl Agent {
             st.held_bytes += line.len();
             st.held.push_back(line);
             if st.held_bytes > MAX_HELD_BYTES {
-                eprintln!("agent {}: over {MAX_HELD_BYTES} bytes held while detached; ending it", self.name);
+                log!("agent {}: over {MAX_HELD_BYTES} bytes held while detached; ending it", self.name);
                 st.held.clear();
                 st.held_bytes = 0;
                 kill_group(self.pid);
@@ -913,7 +913,7 @@ async fn agent_conn(relay: Arc<Relay>, name: String, first: &str, tx: Out, mut i
     let mut existing = relay.agents.lock().unwrap().get(&name).cloned();
     if req.replace {
         if let Some(old) = existing.take() {
-            eprintln!("agent {name}: replaced");
+            log!("agent {name}: replaced");
             relay.agents.lock().unwrap().remove(&name);
             if let Some((_, old_tx)) = old.state.lock().unwrap().client.take() {
                 let _ = old_tx.send(close(4001, "replaced"));
@@ -977,7 +977,7 @@ fn spawn_agent(relay: &Arc<Relay>, name: &str, req: &AgentReq) -> std::io::Resul
         .stderr(std::process::Stdio::from(log));
     let mut child = reaper::spawn_tracked(|| cmd.spawn(), |c| c.id())?;
     let pid = child.id().unwrap_or(0);
-    eprintln!("agent {name}: started pid {pid}: {}", req.cmd);
+    log!("agent {name}: started pid {pid}: {}", req.cmd);
     let (itx, mut irx) = unbounded_channel::<String>();
     let agent = Arc::new(Agent {
         name: name.to_string(),
@@ -995,7 +995,7 @@ fn spawn_agent(relay: &Arc<Relay>, name: &str, req: &AgentReq) -> std::io::Resul
                 break;
             }
             if a.state.lock().unwrap().abandoned(DETACHED_AGENT_TTL) {
-                eprintln!("agent {n}: abandoned for {DETACHED_AGENT_TTL:?}; ending it");
+                log!("agent {n}: abandoned for {DETACHED_AGENT_TTL:?}; ending it");
                 // Its exit task removes it and releases its hold.
                 kill_group(a.pid);
                 break;
@@ -1024,7 +1024,7 @@ fn spawn_agent(relay: &Arc<Relay>, name: &str, req: &AgentReq) -> std::io::Resul
         let code = child.wait().await.map(exit_code).unwrap_or(255);
         reaper::untrack(pid);
         let _ = out_task.await;
-        eprintln!("agent {name}: exited {code}");
+        log!("agent {name}: exited {code}");
         // A replaced agent's name already belongs to its successor.
         let current = {
             let mut agents = r.agents.lock().unwrap();
