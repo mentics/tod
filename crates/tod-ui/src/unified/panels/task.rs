@@ -187,7 +187,8 @@ enum RunnerAction {
     Resume,
     ResumeFreshBudget,
     /// Run the current step's agent in a new session: nothing is reopened or
-    /// resumed. Lighter than reinstalling a cloud sandbox.
+    /// resumed. Here, or (for a node in the cloud) by its supervisor, with
+    /// nothing reinstalled.
     RunFresh,
     Pause,
     StopNow,
@@ -745,12 +746,12 @@ impl TaskPanel {
             if self.runner.cloud_failed {
                 return RunnerActions {
                     primary: Some((A::ReinstallCloud, A::ReinstallCloud.label(), self.runner.cloud_busy)),
-                    menu: if self.runner.cloud_busy { Vec::new() } else { vec![A::SyncCloud, A::DeleteSandbox, A::LeaveCloud] },
+                    menu: if self.runner.cloud_busy { Vec::new() } else { vec![A::RunFresh, A::SyncCloud, A::DeleteSandbox, A::LeaveCloud] },
                 };
             }
             return RunnerActions {
                 primary: Some((A::SyncCloud, A::SyncCloud.label(), self.runner.cloud_busy)),
-                menu: if self.runner.cloud_busy { Vec::new() } else { vec![A::ReinstallCloud, A::DeleteSandbox, A::LeaveCloud] },
+                menu: if self.runner.cloud_busy { Vec::new() } else { vec![A::RunFresh, A::ReinstallCloud, A::DeleteSandbox, A::LeaveCloud] },
             };
         }
         if self.runner.cloud_busy {
@@ -854,6 +855,18 @@ impl TaskPanel {
         match action {
             A::Start | A::StartHere | A::Resume => {
                 let _ = self.runners.update(cx, |r, cx| r.start(node, false, cx));
+            }
+            // A node in the cloud: its supervisor starts the step in a new
+            // session. (A lost sandbox is not offered this: it needs a new
+            // sandbox, which starts a new session anyway.)
+            A::RunFresh if self.runner.cloud.is_some() => {
+                self.cloud_started(cx);
+                crate::views::cloud_node::fresh_session(
+                    self.fleet.clone(),
+                    node.to_string(),
+                    cx,
+                    move |this, update, cx| this.on_cloud_update(node, update, cx),
+                );
             }
             A::RunFresh => {
                 let root = self.fleet.paths().root().to_path_buf();

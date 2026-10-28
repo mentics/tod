@@ -52,7 +52,7 @@ use std::time::Duration;
 use tod_agent::{AgentLaunchOptions, AgentPlatform};
 use guard::{Guarded, Guards, OnFailure};
 use tod_core::autopilot::{Autopilot, Boundary, Budget, BudgetLimit, NeedsHuman, Outcome, StepHook};
-use tod_core::conversation::driver::ConversationConfig;
+use tod_core::conversation::driver::{AgentAccess, ConversationConfig, ConversationDriver};
 use tod_core::media::MediaPaths;
 use tod_store::fleet::FleetStore;
 use tod_store::settings::InterviewContextSettings;
@@ -102,6 +102,11 @@ struct Hook<'a> {
     node: Uuid,
     workspace: &'a std::path::Path,
     push_branch: bool,
+    /// The supervisor's state directory, where the app leaves a request for
+    /// a new session ([`fresh_requested`]).
+    state_dir: &'a std::path::Path,
+    /// A request for a new session found, to take.
+    fresh_pending: bool,
     /// The last context mark taken.
     context_seen: i64,
     /// A newer mark found at the last boundary, to take.
@@ -114,8 +119,29 @@ struct Hook<'a> {
 /// whole reply, and the app only looks every few seconds.
 const LIVE_EVERY: Duration = Duration::from_secs(3);
 
+/// The reason the autopilot is stopped with to take a request for a new session.
+pub const FRESH_SESSION_REQUESTED: &str = "new session requested";
+
+/// Whether the app asked for a new session (it leaves a file in `state_dir`).
+fn fresh_requested(state_dir: &std::path::Path) -> bool {
+    state_dir.join(tod_core::autopilot::FRESH_SESSION_REQUEST_FILE).exists()
+}
+
+/// Takes the request ([`fresh_requested`]): deletes the file. An error is
+/// returned, never left to be taken again as a new request.
+fn take_fresh_request(state_dir: &std::path::Path) -> Result<()> {
+    let path = state_dir.join(tod_core::autopilot::FRESH_SESSION_REQUEST_FILE);
+    std::fs::remove_file(&path).map_err(|e| anyhow::anyhow!("remove {}: {e}", path.display()))
+}
+
 impl StepHook for Hook<'_> {
     fn watch(&mut self, turn: tod_core::autopilot::Turn<'_>) -> Option<String> {
+        // The user wants this turn replaced: cancel it (the run keeps it as
+        // current, and taking the request drops it).
+        if fresh_requested(self.state_dir) {
+            self.fresh_pending = true;
+            return Some(FRESH_SESSION_REQUESTED.to_string());
+        }
         let (Some(conversation), parts) = (turn.conversation_id, &turn.status.parts) else {
             return None;
         };
@@ -161,6 +187,10 @@ impl StepHook for Hook<'_> {
             if let Err(err) = git::push_branch(self.workspace) {
                 tracing::warn!("pushing the branch: {err:#}");
             }
+        }
+        if fresh_requested(self.state_dir) {
+            self.fresh_pending = true;
+            return Ok(Some(FRESH_SESSION_REQUESTED.to_string()));
         }
         if let Some(at) = context::changed_since(fleet, self.node, self.context_seen)? {
             self.context_pending = Some(at);
@@ -329,14 +359,36 @@ pub fn wake(config: Config) -> Result<Woke> {
         node: config.node,
         workspace: &config.workspace,
         push_branch: config.push_branch,
+        state_dir: &config.state_dir,
+        fresh_pending: false,
         context_seen: context::load_seen(&config.state_dir),
         context_pending: None,
         live_sent: None,
     };
+    // Asked for while the supervisor slept: this run starts in a new session.
+    // The request is saved in the autopilot's state (and survives a failure
+    // here), so deleting the file is what takes it.
+    if fresh_requested(&config.state_dir) {
+        tod_core::autopilot::AutopilotState::request_fresh_session(&data_root, config.node)?;
+        take_fresh_request(&config.state_dir)?;
+        tracing::info!("a new session was requested: the run starts in one");
+    }
     let run = Autopilot::new(conversation, config.node, budget)
         .map(|pilot| pilot.with_poll_interval(config.poll))
         .and_then(|mut pilot| loop {
             let outcome = pilot.run_with(&store, &mut agent, &mut hook)?;
+            if std::mem::take(&mut hook.fresh_pending) {
+                // Stopped for a request made while it ran: end the turn's
+                // agent session and go on in a new one.
+                let current = pilot.state().current.as_ref().map(|c| c.conversation_id);
+                if let Some(id) = current {
+                    agent.with(|a| a.close_session(&ConversationDriver::session_key(id)));
+                }
+                take_fresh_request(&config.state_dir)?;
+                pilot.start_fresh_session()?;
+                tracing::info!("took a request for a new session");
+                continue;
+            }
             let Some(at) = hook.context_pending.take() else {
                 let current = pilot.state().current.as_ref().map(|c| c.conversation_id);
                 match &outcome {

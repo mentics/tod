@@ -1503,10 +1503,22 @@ pub fn wake_node_tracked(
     node_id: &str,
     progress: &mut dyn FnMut(&str),
 ) -> Result<(String, bool)> {
+    wake_node_tracked_with(fleet, root, node_id, false, progress)
+}
+
+/// [`wake_node_tracked`] that also asks the supervisor to run the node's
+/// current step in a new session (`fresh_session`; see [`wake_node_with`]).
+pub fn wake_node_tracked_with(
+    fleet: &FleetStore,
+    root: &Path,
+    node_id: &str,
+    fresh_session: bool,
+    progress: &mut dyn FnMut(&str),
+) -> Result<(String, bool)> {
     let node: uuid::Uuid = node_id.parse().context("node id")?;
     let owner = crate::next_actor::this_process();
     tod_store::activity::with_lease(fleet, node, tod_store::activity::KIND_CLOUD_START, &owner, || {
-        let said = wake_node(fleet, root, node_id)?;
+        let said = wake_node_with(fleet, root, node_id, fresh_session)?;
         let heard = wait_for_supervisor(fleet, root, node, SyncReport::default(), progress)?;
         Ok((said, heard))
     })?
@@ -1587,6 +1599,15 @@ fn push_supervisor_settings(bx: &tod_sandbox::blaxel::Blaxel, url: &str, root: &
 /// pokes the node's sandbox, which pulls it and goes on. Returns what it
 /// did. Blocks on the network: never on the UI thread.
 pub fn wake_node(fleet: &FleetStore, root: &Path, node_id: &str) -> Result<String> {
+    wake_node_with(fleet, root, node_id, false)
+}
+
+/// [`wake_node`]; with `fresh_session` the sandbox first gets the request
+/// file ([`crate::autopilot::FRESH_SESSION_REQUEST_FILE`]) that makes the
+/// supervisor run the node's current step in a new session, never one it
+/// would reopen or resume. A running supervisor takes it at its next poll
+/// (cancelling the turn in flight); a sleeping one when this poke wakes it.
+pub fn wake_node_with(fleet: &FleetStore, root: &Path, node_id: &str, fresh_session: bool) -> Result<String> {
     let row = cloud_node(fleet, node_id).ok_or_else(|| anyhow!("this node does not run in the cloud"))?;
     let (orch, user) = resolve(root)?;
     sync(fleet, root, &orch, &user).context("send the change to the orchestrator")?;
@@ -1610,6 +1631,15 @@ pub fn wake_node(fleet: &FleetStore, root: &Path, node_id: &str) -> Result<Strin
     };
     let url = info.url.ok_or_else(|| anyhow!("sandbox {} has no URL", row.sandbox))?;
     push_supervisor_settings(&bx, &url, root, node_id)?;
+    if fresh_session {
+        let request = format!(
+            "{}/{node_id}/{}",
+            tod_store::fleet::cli_relay::SUPERVISOR_STATE_ROOT,
+            crate::autopilot::FRESH_SESSION_REQUEST_FILE
+        );
+        bx.upload(&url, &request, b"", "0644")
+            .with_context(|| format!("ask the supervisor for a new session ({request})"))?;
+    }
     let poke = format!("{}/port/{}/poke", url.trim_end_matches('/'), tod_sandbox::blaxel::RELAY_PORT);
     let resp = ureq::post(&poke)
         .header("Authorization", &format!("Bearer {}", bx.token()))

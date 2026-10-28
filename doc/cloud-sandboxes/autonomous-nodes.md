@@ -320,6 +320,15 @@ then:
    the timer instead; see Development account.)
 2. Releases its hold. The sandbox is in standby about 15 s later.
 
+**A new session on request.** The task panel's "Run with a new session" uploads
+an empty `fresh-session` file into the node's supervisor state directory
+(`tod_core::autopilot::FRESH_SESSION_REQUEST_FILE`) and pokes it
+(`cloud_sync::wake_node_with`); nothing is reinstalled. A sleeping supervisor
+takes the file as it wakes, a running one at its next poll (cancelling the
+turn in flight). Either way the autopilot drops its current conversation and
+the step runs in a new one (`Autopilot::start_fresh_session`). A node still
+waiting or holding a pending decision stays so: the request waits with it.
+
 **A wake is a poke, never an instruction.** Whether it comes from a schedule,
 a webhook, a user's answer, or a change to its context, the supervisor asks
 the orchestrator what it is waiting on and whether that is satisfied. Then it

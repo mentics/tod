@@ -524,6 +524,39 @@ fn a_restart_reopens_the_conversation_in_progress() {
     );
 }
 
+#[test]
+fn a_requested_fresh_session_starts_a_new_conversation_instead_of_reopening() {
+    let fx = setup();
+    lifecycle::set_lifecycle(&fx.fleet, fx.node, "active").unwrap();
+    let mut agent = FakeAgent::new(&fx.fleet);
+    let mut driver = ConversationDriver::new(
+        config(&fx),
+        Focus::Node(fx.node),
+        ProtocolKind::Implementation,
+    );
+    driver.send(&fx.fleet, &mut agent, "Implement the plan.").unwrap();
+    let id = driver.conversation_id().unwrap();
+    let mut state = AutopilotState::fresh();
+    state.current = Some(CurrentStep {
+        protocol: "implementation".into(),
+        lifecycle: "active".into(),
+        conversation_id: id,
+    });
+    state.save(&fx.root, fx.node).unwrap();
+    AutopilotState::request_fresh_session(&fx.root, fx.node).unwrap();
+
+    let mut pilot = autopilot(&fx, Budget::default());
+    // The request was taken as the run was set up, so a later run does not
+    // start a new session again.
+    assert!(!AutopilotState::load(&fx.root, fx.node).unwrap().fresh_session);
+    pilot.run(&fx.fleet, &mut agent).unwrap();
+    let first = pilot.state().steps.first().unwrap();
+    assert_eq!(first.step, "implementation");
+    assert_ne!(first.conversation_id, Some(id), "the earlier conversation was not reopened");
+    let turns = fx.fleet.read(|conn| ConversationRepo::new(conn).turns(id)).unwrap();
+    assert!(!turns.iter().any(|t| t.body == RESUME_MESSAGE));
+}
+
 /// Stops the run from `watch`, the first time a turn is in flight.
 struct StopMidTurn(bool);
 

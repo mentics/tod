@@ -104,6 +104,36 @@ pub fn run_in_cloud<T: 'static>(
     });
 }
 
+/// Have `node_id`'s supervisor run its current step in a new session, off
+/// the UI thread (`cloud_sync::wake_node_tracked_with`): the sandbox is not
+/// touched beyond a request file and a poke, so nothing is reinstalled.
+pub fn fresh_session<T: 'static>(
+    fleet: Arc<FleetStore>,
+    node_id: String,
+    cx: &mut Context<T>,
+    on_update: impl Fn(&mut T, CloudUpdate, &mut Context<T>) + 'static,
+) {
+    spawn(cx, on_update, move |tx| {
+        let root = fleet.paths().root().to_path_buf();
+        let mut progress = |msg: &str| {
+            cloud_sync::log_progress(&format!("new session for {node_id}"), msg);
+            let _ = tx.send_blocking(CloudUpdate::Progress(msg.to_string()));
+        };
+        let _ = tx.send_blocking(CloudUpdate::Progress("Asking the supervisor for a new session…".into()));
+        let result = cloud_sync::wake_node_tracked_with(&fleet, &root, &node_id, true, &mut progress);
+        let _ = tx.send_blocking(match result {
+            Ok((said, true)) => CloudUpdate::Synced(format!("Asked for a new session: {said}.")),
+            Ok((said, false)) => CloudUpdate::failed(format!(
+                "Asked for a new session ({said}), but its supervisor has not reported in after {} seconds.\n\
+                 Sync now looks again. If it stays silent, check the log panel for the cloud's problems, \
+                 or use Reinstall and restart.",
+                cloud_sync::SUPERVISOR_REPORTS_WITHIN.as_secs()
+            )),
+            Err(err) => CloudUpdate::failed(describe("Run with a new session failed", &err)),
+        });
+    });
+}
+
 /// Sync with the orchestrator off the UI thread.
 ///
 /// With `node`, the result also says what the sync now shows of that node's

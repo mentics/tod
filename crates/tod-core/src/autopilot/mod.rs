@@ -33,7 +33,7 @@ mod state;
 #[cfg(test)]
 mod tests;
 
-pub use state::{AutopilotState, CurrentStep, StepRecord, state_path};
+pub use state::{AutopilotState, CurrentStep, FRESH_SESSION_REQUEST_FILE, StepRecord, state_path};
 
 use crate::conversation::driver::{
     AgentAccess, ConversationConfig, ConversationDriver, ConversationEvent, ConversationStatus,
@@ -283,8 +283,7 @@ impl Autopilot {
             fresh_session,
         };
         if fresh_session {
-            pilot.state.current = None;
-            pilot.save()?;
+            pilot.start_fresh_session()?;
         }
         Ok(pilot)
     }
@@ -312,6 +311,15 @@ impl Autopilot {
     /// Forget the saved run: the next [`Self::run`] starts a fresh budget.
     pub fn reset(&mut self) -> Result<()> {
         self.state = AutopilotState::fresh();
+        self.save()
+    }
+
+    /// The next conversation is a new one: the one in progress is dropped
+    /// (the caller closes its agent session) and the phase conversation of
+    /// this stay is not reopened.
+    pub fn start_fresh_session(&mut self) -> Result<()> {
+        self.fresh_session = true;
+        self.state.current = None;
         self.save()
     }
 

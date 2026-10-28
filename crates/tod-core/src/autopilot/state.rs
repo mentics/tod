@@ -9,6 +9,11 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use uuid::Uuid;
 
+/// The file the app puts in a cloud node's supervisor state directory to ask
+/// for a new session; the supervisor takes it (and deletes it) at its next
+/// stopping point, or when it wakes.
+pub const FRESH_SESSION_REQUEST_FILE: &str = "fresh-session";
+
 pub(crate) fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
