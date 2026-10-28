@@ -25,4 +25,5 @@ pub mod terminal;
 pub mod database;
 pub mod hold;
 pub mod tunnel;
+pub mod vms;
 pub mod watchdog;

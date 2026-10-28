@@ -447,6 +447,13 @@ impl Shell {
         cx.notify();
     }
 
+    fn open_cloud_vms_window(&mut self, cx: &mut Context<Self>) {
+        let root = self.fleet.paths().root().to_path_buf();
+        if let Err(err) = crate::app::CloudVmsWindowControl::global().open_or_focus(cx, root) {
+            tracing::error!("failed to open cloud VMs window: {err}");
+        }
+    }
+
     fn open_history_window(&mut self, cx: &mut Context<Self>) {
         if let Err(err) = self.history_window.open_or_focus(cx) {
             tracing::error!("failed to open history window: {err}");
@@ -721,6 +728,16 @@ impl Shell {
                                     this.fleet.clone(),
                                     this.paths.clone(),
                                 );
+                            })),
+                    )
+                    .child(
+                        Button::new("open-cloud-vms")
+                            .outline()
+                            .compact()
+                            .label("Cloud VMs")
+                            .tooltip("Show the cloud sandboxes tod manages and whether each is active or in standby")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.open_cloud_vms_window(cx);
                             })),
                     )
                     .child({
@@ -1317,6 +1334,7 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                             let _ = transcript_for_close.close(cx);
                             history_for_close.close(cx);
                             log_for_close.close(cx);
+                            crate::app::CloudVmsWindowControl::global().close(cx);
                             true
                         });
                         let view =
@@ -1575,6 +1593,7 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                 let _ = transcript_for_close.close(cx);
                                 history_for_close.close(cx);
                                 log_for_close.close(cx);
+                            crate::app::CloudVmsWindowControl::global().close(cx);
                                 true
                             } else {
                                 let paths_for_force = paths_for_geometry.clone();
@@ -1590,6 +1609,7 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                         let _ = transcript_for_force.close(cx);
                                         history_for_force.close(cx);
                                         log_for_force.close(cx);
+                                        crate::app::CloudVmsWindowControl::global().close(cx);
                                         window.remove_window();
                                     },
                                 );
