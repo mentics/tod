@@ -181,6 +181,12 @@ impl<'a> ConversationRepo<'a> {
         self.summaries(self.for_focus(focus, None, None)?)
     }
 
+    /// The focus's conversations without their change counts or openings
+    /// (which read each one's action log), most recently updated first.
+    pub fn conversations_for_focus(&self, focus: Focus) -> Result<Vec<Conversation>> {
+        self.for_focus(focus, None, None)
+    }
+
     /// The focus's conversations running `protocol`, most recently updated
     /// first — the chat drawer's session list, which holds only freeform
     /// ones, never the lifecycle's.

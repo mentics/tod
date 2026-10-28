@@ -254,6 +254,14 @@ impl Blaxel {
         Ok(v.as_array().map(|a| a.iter().map(parse_info).collect()).unwrap_or_default())
     }
 
+    /// The listing as Blaxel returns it, for what [`SandboxInfo`] does not keep.
+    pub fn list_json(&self) -> Result<Vec<Value>> {
+        let mut resp = self.auth(self.agent.get(&format!("{API}/sandboxes"))).call().context("Blaxel API")?;
+        check(&mut resp, "list sandboxes")?;
+        let v: Value = resp.body_mut().read_json()?;
+        Ok(v.as_array().cloned().unwrap_or_default())
+    }
+
     /// Creates a sandbox that exposes the relay port. Returns once the control
     /// plane accepted it; see [`Blaxel::wait_deployed`].
     pub fn create(&self, spec: &NewSandbox) -> Result<()> {

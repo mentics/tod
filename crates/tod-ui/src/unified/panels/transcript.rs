@@ -6,9 +6,11 @@ use std::sync::Arc;
 
 use gpui::{
     App, AppContext, Context, Entity, FocusHandle, Focusable, InteractiveElement, IntoElement,
-    ParentElement, Render, SharedString, Styled, Subscription, Window, div,
+    MouseButton, MouseDownEvent, ParentElement, Render, SharedString, StatefulInteractiveElement, Styled,
+    Subscription, Window, div, px,
 };
-use tod_store::conversation::{ConversationRepo, Focus, ProtocolKind, Turn, TurnRole};
+use gpui_component::ActiveTheme;
+use tod_store::conversation::{Conversation, ConversationRepo, Focus, ProtocolKind, Turn, TurnRole};
 use tod_store::fleet::FleetStore;
 use uuid::Uuid;
 
@@ -17,6 +19,7 @@ use crate::ui::agent_conversation::{
     forward_panel_keys,
 };
 use crate::ui::agent_runs::AgentRuns;
+use crate::ui::style;
 use crate::unified::panel::ColumnPanel;
 
 pub const TRANSCRIPT_PANEL_CONTEXT: &str = "TranscriptPanel";
@@ -79,10 +82,13 @@ pub struct TranscriptPanel {
     reload_again: bool,
     /// Looking for the node's latest conversation.
     searching: bool,
+    /// The list of the node's conversations is being read.
+    items_loading: bool,
     /// A `sync_watch` is waiting out its throttle.
     sync_scheduled: bool,
     _load: gpui::Task<()>,
     _search: gpui::Task<()>,
+    _items: gpui::Task<()>,
     _sync: gpui::Task<()>,
 }
 
@@ -90,8 +96,67 @@ pub struct TranscriptPanel {
 /// shown as one.
 const WATCH_THROTTLE: std::time::Duration = std::time::Duration::from_millis(60);
 
+/// How wide the list of the node's conversations is, beside the transcript.
+const RUNS_WIDTH: f32 = 210.0;
+
+/// One of the watched node's conversations, as the list beside the
+/// transcript shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RunItem {
+    id: Uuid,
+    label: String,
+    updated_at: i64,
+}
+
+/// What a lifecycle conversation is called in the list: the work it does
+/// (and for a phase or evaluation, the state), not its protocol's name.
+fn run_label(c: &Conversation) -> String {
+    if let Some(label) = c.transition_label() {
+        return match c.protocol {
+            ProtocolKind::Phase | ProtocolKind::Evaluate => {
+                let mut chars = label.chars();
+                chars.next().map(|f| f.to_uppercase().collect::<String>() + chars.as_str()).unwrap_or(label)
+            }
+            _ => label,
+        };
+    }
+    match c.protocol {
+        ProtocolKind::Implementation => "Implement",
+        ProtocolKind::Verification => "Verify",
+        ProtocolKind::Review => "Review",
+        ProtocolKind::Fix => "Fix review findings",
+        ProtocolKind::Pr => "Pull request",
+        ProtocolKind::Incoming => "Incoming changes",
+        ProtocolKind::VisualDesign => "Visual design",
+        ProtocolKind::Chat => "Chat",
+        ProtocolKind::Outline => "Outline",
+        ProtocolKind::GateCheck | ProtocolKind::OnEntry | ProtocolKind::Phase | ProtocolKind::Evaluate => "Lifecycle",
+    }
+    .to_string()
+}
+
+/// A timestamp as the list shows it: the time today, else the date and time.
+fn format_time(ms: i64) -> String {
+    use chrono::{Local, TimeZone};
+    let Some(at) = Local.timestamp_millis_opt(ms).single() else {
+        return String::new();
+    };
+    if at.date_naive() == Local::now().date_naive() {
+        at.format("%H:%M").to_string()
+    } else {
+        at.format("%b %-d %H:%M").to_string()
+    }
+}
+
 struct Watching {
     node: Uuid,
+    /// The user chose a conversation from the list: stay on it instead of
+    /// following the node's running (or latest) one.
+    pinned: bool,
+    /// The node's conversations, oldest first, as last read.
+    items: Vec<RunItem>,
+    /// The conversation the node is running now (here or in the cloud).
+    live_id: Option<Uuid>,
     runs: Entity<AgentRuns>,
     /// The streamed reply of the turn in flight.
     live: Vec<tod_agent::ReplyPart>,
@@ -128,9 +193,11 @@ impl TranscriptPanel {
             loading: false,
             reload_again: false,
             searching: false,
+            items_loading: false,
             sync_scheduled: false,
             _load: gpui::Task::ready(()),
             _search: gpui::Task::ready(()),
+            _items: gpui::Task::ready(()),
             _sync: gpui::Task::ready(()),
         };
         let mut fleet_rx = this.fleet.subscribe_changes();
@@ -147,6 +214,7 @@ impl TranscriptPanel {
                     && this
                         .update(cx, |this, cx| {
                             this.reload(cx);
+                            this.load_items(cx);
                             // A watched node's cloud supervisor starts new
                             // conversations that arrive through the store.
                             this.sync_watch(cx);
@@ -172,7 +240,16 @@ impl TranscriptPanel {
     ) -> Self {
         let mut this = Self::new(Uuid::nil(), fleet, window, cx);
         let _sub = cx.observe(&runs, |this, _, cx| this.schedule_sync(cx));
-        this.watching = Some(Watching { node, runs, live: Vec::new(), _sub });
+        this.watching = Some(Watching {
+            node,
+            pinned: false,
+            items: Vec::new(),
+            live_id: None,
+            runs,
+            live: Vec::new(),
+            _sub,
+        });
+        this.load_items(cx);
         this.sync_watch(cx);
         this
     }
@@ -225,7 +302,8 @@ impl TranscriptPanel {
                 // conversation, not the first one found.
                 if let Some(id) = latest
                     && id != this.conversation_id
-                    && (this.conversation_id.is_nil() || this.watching.is_some())
+                    && (this.conversation_id.is_nil()
+                        || this.watching.as_ref().is_some_and(|w| !w.pinned))
                 {
                     this.retarget(id, cx);
                 }
@@ -259,8 +337,20 @@ impl TranscriptPanel {
             }
             found
         };
+        self.cloud = tod_core::cloud_sync::cloud_status(&self.fleet, node, tod_store::outline::uuid_blob::now_ms());
+        let pinned = self.watching.as_ref().is_some_and(|w| w.pinned);
+        let running = running.or_else(|| self.cloud_live_turn(node));
+        let live_id = running.as_ref().map(|(conversation, _)| *conversation);
         let (target, live) = match running {
+            // The one the user chose stays; its reply streams in only while
+            // it is the one running.
+            Some((conversation, parts)) if pinned => {
+                (Some(self.conversation_id), if conversation == self.conversation_id { parts } else { Vec::new() })
+            }
+            // Mid-turn, here or in the node's cloud sandbox (whose reply
+            // in flight arrives through the store): show it as it streams.
             Some((conversation, parts)) => (Some(conversation), parts),
+            None if pinned => (Some(self.conversation_id), Vec::new()),
             None => {
                 self.find_latest(node, cx);
                 (None, Vec::new())
@@ -268,11 +358,135 @@ impl TranscriptPanel {
         };
         if let Some(watching) = &mut self.watching {
             watching.live = live;
+            watching.live_id = live_id;
         }
-        self.cloud = tod_core::cloud_sync::cloud_status(&self.fleet, node, tod_store::outline::uuid_blob::now_ms());
         match target {
             Some(id) if id != self.conversation_id => self.retarget(id, cx),
             _ => self.show(cx),
+        }
+    }
+
+    /// Read the watched node's conversations off the UI thread, for the list.
+    fn load_items(&mut self, cx: &mut Context<Self>) {
+        let Some(node) = self.watching.as_ref().map(|w| w.node) else {
+            return;
+        };
+        if self.items_loading {
+            return;
+        }
+        self.items_loading = true;
+        let fleet = self.fleet.clone();
+        self._items = cx.spawn(async move |this, cx| {
+            let found = cx
+                .background_executor()
+                .spawn(async move {
+                    fleet.read(|conn| ConversationRepo::new(conn).conversations_for_focus(Focus::Node(node)))
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                this.items_loading = false;
+                match found {
+                    Ok(mut conversations) => {
+                        conversations.retain(|c| !matches!(c.protocol, ProtocolKind::Outline | ProtocolKind::Chat));
+                        conversations.sort_by_key(|c| (c.created_at, c.updated_at));
+                        let items: Vec<RunItem> = conversations
+                            .iter()
+                            .map(|c| RunItem { id: c.id, label: run_label(c), updated_at: c.updated_at })
+                            .collect();
+                        if let Some(watching) = &mut this.watching
+                            && watching.items != items
+                        {
+                            watching.items = items;
+                            cx.notify();
+                        }
+                    }
+                    Err(err) => tracing::warn!("reading the node's conversations: {err:#}"),
+                }
+            })
+            .ok();
+        });
+    }
+
+    /// Show `conversation` and stay on it; `None` goes back to following
+    /// the node's running (else latest) conversation.
+    fn choose(&mut self, conversation: Option<Uuid>, cx: &mut Context<Self>) {
+        let Some(watching) = &mut self.watching else {
+            return;
+        };
+        watching.pinned = conversation.is_some();
+        if let Some(id) = conversation
+            && id != self.conversation_id
+        {
+            self.retarget(id, cx);
+        }
+        // Takes the streamed reply only if this is the running one.
+        self.sync_watch(cx);
+        cx.notify();
+    }
+
+    /// The list of the node's conversations, oldest first, with "Follow
+    /// latest" above it.
+    fn render_runs(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let watching = self.watching.as_ref()?;
+        let mut list = div()
+            .id("transcript-runs")
+            .flex_none()
+            .w(px(RUNS_WIDTH))
+            .h_full()
+            .flex()
+            .flex_col()
+            .border_r_1()
+            .border_color(cx.theme().border)
+            .p_1()
+            .overflow_y_scroll()
+            .child(
+                style::menu_item(div().id("transcript-run-follow"), !watching.pinned)
+                    .cursor_pointer()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _: &MouseDownEvent, _, cx| this.choose(None, cx)),
+                    )
+                    .child("Follow latest"),
+            );
+        for item in &watching.items {
+            let id = item.id;
+            let current = watching.pinned && self.conversation_id == id;
+            let live = watching.live_id == Some(id);
+            list = list.child(
+                style::menu_item(div().id(SharedString::from(format!("transcript-run-{id}"))), current)
+                    .flex()
+                    .items_center()
+                    .cursor_pointer()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _: &MouseDownEvent, _, cx| this.choose(Some(id), cx)),
+                    )
+                    .child(
+                        div().flex_1().min_w_0().overflow_hidden().text_ellipsis().child(format!(
+                            "{}{}",
+                            if live { "\u{25cf} " } else { "" },
+                            item.label
+                        )),
+                    )
+                    .child(style::text_dense_muted(div()).flex_shrink_0().child(format_time(item.updated_at))),
+            );
+        }
+        Some(list.into_any_element())
+    }
+
+    /// The turn `node`'s cloud supervisor has in flight, as it last sent it
+    /// (`tod_store::conversation_live`). Only while the supervisor is heard
+    /// from: a row left by one that died is not a turn in progress.
+    fn cloud_live_turn(&self, node: Uuid) -> Option<(Uuid, Vec<tod_agent::ReplyPart>)> {
+        if !matches!(self.cloud, Some(tod_core::cloud_sync::CloudStatus::Working { .. })) {
+            return None;
+        }
+        match self.fleet.read(|conn| tod_store::conversation_live::get(conn, node)) {
+            Ok(live) => live.map(|live| (live.conversation_id, live.parts)),
+            Err(err) => {
+                tracing::warn!("reading the cloud node's reply in flight: {err:#}");
+                None
+            }
         }
     }
 
@@ -409,7 +623,7 @@ impl TranscriptPanel {
             CloudStatus::Working { heard_at, what } => (
                 format!(
                     "Working in the cloud{} (supervisor last heard {}). This shows what it has synced so far; \
-                     the agent's output is not streamed live from the cloud.",
+                     the reply in flight is sent every few seconds.",
                     if what.is_empty() { String::new() } else { format!(" while {what}") },
                     at(*heard_at)
                 ),
@@ -445,14 +659,22 @@ impl Render for TranscriptPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let focused = self.focus_handle.contains_focused(window, cx);
         self.panel.update(cx, |panel, cx| panel.set_active(focused, cx));
+        let runs = self.render_runs(cx);
+        let transcript = div()
+            .flex_auto()
+            .min_w_0()
+            .h_full()
+            .flex()
+            .flex_col()
+            .children(self.render_cloud_status(window, cx))
+            .child(div().flex_auto().min_h_0().child(self.panel.clone()));
         forward_panel_keys(div(), &self.panel, true)
             .size_full()
             .key_context(TRANSCRIPT_PANEL_CONTEXT)
             .track_focus(&self.focus_handle)
             .flex()
-            .flex_col()
-            .children(self.render_cloud_status(window, cx))
-            .child(div().flex_auto().min_h_0().child(self.panel.clone()))
+            .children(runs)
+            .child(transcript)
     }
 }
 
@@ -598,6 +820,126 @@ mod tests {
             cx.run_until_parked();
         }
         view.read_with(cx, |view, _| assert_eq!(view.conversation_id(), second));
+    }
+
+    /// A node working in the cloud streams its reply into the synced
+    /// `conversation_live` row: the panel shows it after the stored turns,
+    /// and drops it once the supervisor says the turn is over.
+    #[gpui::test]
+    fn watching_a_cloud_node_shows_the_reply_its_supervisor_has_in_flight(cx: &mut TestAppContext) {
+        use crate::interview::agent::SharedAgent;
+        use std::sync::{Arc, Mutex};
+
+        let fixture = Fixture::new();
+        let conversation = add_conversation_under(&fixture, ProtocolKind::Implementation);
+        let now = tod_store::outline::uuid_blob::now_ms();
+        let db = fixture.store.paths().db().to_path_buf();
+        let write = |f: &dyn Fn(&rusqlite::Connection)| {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            f(&conn);
+            fixture.store.reload_if_stale().unwrap();
+        };
+        write(&|conn| {
+            tod_store::cloud_nodes::upsert(conn, fixture.node_id, "sandbox", "alice", now).unwrap();
+            tod_store::cloud_activity::beat(conn, fixture.node_id, "implementing", now).unwrap();
+            tod_store::conversation_live::set(
+                conn,
+                fixture.node_id,
+                conversation,
+                &[tod_agent::ReplyPart::Text { text: "reading the plan".into() }],
+                now,
+            )
+            .unwrap();
+        });
+        cx.update(gpui_component::init);
+        let agent: SharedAgent = Arc::new(Mutex::new(Box::new(
+            crate::interview::agent::MockAgentProvider::new(),
+        )));
+        let runs = cx.new(|_| AgentRuns::new(fixture.store.clone(), agent));
+        let (store, node, runs_in) = (fixture.store.clone(), fixture.node_id, runs.clone());
+        let slot = std::rc::Rc::new(RefCell::new(None));
+        let slot_in = slot.clone();
+        let (_, cx) = cx.add_window_view(move |window, cx| {
+            let view = cx.new(|cx| TranscriptPanel::watching(node, store, runs_in, window, cx));
+            *slot_in.borrow_mut() = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let view = slot.borrow_mut().take().unwrap();
+        settle(cx);
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.conversation_id(), conversation);
+            // Two stored turns and the reply in flight.
+            assert_eq!(view.panel.read(cx).entries().len(), 3);
+        });
+
+        write(&|conn| tod_store::conversation_live::clear(conn, fixture.node_id).unwrap());
+        for _ in 0..6 {
+            std::thread::sleep(std::time::Duration::from_millis(60));
+            cx.executor().advance_clock(std::time::Duration::from_millis(250));
+            cx.run_until_parked();
+        }
+        view.read_with(cx, |view, cx| assert_eq!(view.panel.read(cx).entries().len(), 2));
+    }
+
+    /// Every conversation of the node is listed oldest first, one can be
+    /// chosen and then stays while another runs, and "Follow latest" returns
+    /// to the running one.
+    #[gpui::test]
+    fn a_chosen_conversation_stays_while_another_runs(cx: &mut TestAppContext) {
+        use crate::interview::agent::SharedAgent;
+        use std::sync::{Arc, Mutex};
+        use tod_core::conversation::ConversationStatus;
+
+        let fixture = Fixture::new();
+        let first = add_conversation_under(&fixture, ProtocolKind::Implementation);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let second = add_conversation_under(&fixture, ProtocolKind::Verification);
+        cx.update(gpui_component::init);
+        let agent: SharedAgent = Arc::new(Mutex::new(Box::new(
+            crate::interview::agent::MockAgentProvider::new(),
+        )));
+        let runs = cx.new(|_| AgentRuns::new(fixture.store.clone(), agent));
+        let (store, node, runs_in) = (fixture.store.clone(), fixture.node_id, runs.clone());
+        let slot = std::rc::Rc::new(RefCell::new(None));
+        let slot_in = slot.clone();
+        let (_, cx) = cx.add_window_view(move |window, cx| {
+            let view = cx.new(|cx| TranscriptPanel::watching(node, store, runs_in, window, cx));
+            *slot_in.borrow_mut() = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let view = slot.borrow_mut().take().unwrap();
+        settle(cx);
+        view.read_with(cx, |view, _| {
+            let items = &view.watching.as_ref().unwrap().items;
+            assert_eq!(items.iter().map(|i| (i.id, i.label.as_str())).collect::<Vec<_>>(), vec![(first, "Implement"), (second, "Verify")]);
+        });
+
+        let live = ConversationStatus {
+            running: true,
+            parts: vec![tod_agent::ReplyPart::Text { text: "working".into() }],
+            ..Default::default()
+        };
+        runs.update(cx, |runs, cx| {
+            cx.notify();
+            runs.host_elsewhere(Focus::Node(node), ProtocolKind::Verification, second, live).unwrap();
+        });
+        settle(cx);
+        view.read_with(cx, |view, _| assert_eq!(view.conversation_id(), second));
+
+        // Choosing the first stays on it, without the second's reply.
+        view.update(cx, |view, cx| view.choose(Some(first), cx));
+        settle(cx);
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.conversation_id(), first);
+            assert_eq!(view.panel.read(cx).entries().len(), 2);
+        });
+
+        view.update(cx, |view, cx| view.choose(None, cx));
+        settle(cx);
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.conversation_id(), second);
+            assert_eq!(view.panel.read(cx).entries().len(), 3);
+        });
     }
 
     #[gpui::test]

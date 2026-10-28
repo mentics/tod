@@ -562,6 +562,9 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
     // A cloud supervisor's heartbeat for a node (`crate::cloud_activity`):
     // synced, and not journaled (high-frequency bookkeeping).
     conn.execute_batch(crate::cloud_activity::CREATE_TABLE)?;
+    // The reply a cloud supervisor has in flight (`crate::conversation_live`):
+    // synced, and not journaled, for the same reason.
+    conn.execute_batch(crate::conversation_live::CREATE_TABLE)?;
     // Machine-local lease bookkeeping: no sync, no journey trigger
     // (`crate::activity`).
     conn.execute_batch(crate::activity::CREATE_TABLE)?;

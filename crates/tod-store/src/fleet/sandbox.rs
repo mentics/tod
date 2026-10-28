@@ -645,6 +645,20 @@ pub fn list(root: &Path) -> Result<Vec<ListedSandbox>> {
     Ok(all)
 }
 
+/// The tod-managed sandboxes with their billing state (see
+/// [`tod_sandbox::vms`]), the golden one marked. Asks Blaxel: never on the UI
+/// thread.
+pub fn list_vms(root: &Path) -> Result<Vec<tod_sandbox::vms::Vm>> {
+    let sandboxes = Sandboxes::load(root)?;
+    let bx = sandboxes.blaxel()?;
+    // No golden set is fine; one set that cannot be resolved is an error.
+    let golden = match sandboxes.config.blaxel.as_ref().and_then(|a| a.golden.as_deref()).filter(|g| !g.trim().is_empty()) {
+        Some(_) => Some(sandboxes.resolve_golden(&bx)?),
+        None => None,
+    };
+    tod_sandbox::vms::list_managed(&bx, golden.as_deref())
+}
+
 /// The Blaxel workspace and the image new sandboxes start from, as set up
 /// in this data root. Reads the file only.
 pub fn account_settings(root: &Path) -> (String, String) {

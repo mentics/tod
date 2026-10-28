@@ -1430,6 +1430,7 @@ fn run_in_cloud_reporting(
     // no Claude token to run it with.
     node_source(fleet, node_id)?;
     claude_token_for_node(root)?;
+    lost::forget_failure(node_id);
     progress("syncing with the orchestrator…");
     let (orch, user) = resolve(root)?;
     sync(fleet, root, &orch, &user)?;
