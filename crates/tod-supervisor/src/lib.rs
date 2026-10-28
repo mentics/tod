@@ -106,10 +106,49 @@ struct Hook<'a> {
     context_seen: i64,
     /// A newer mark found at the last boundary, to take.
     context_pending: Option<i64>,
+    /// The reply in flight last sent to the app, and when.
+    live_sent: Option<(std::time::Instant, Vec<tod_agent::ReplyPart>)>,
 }
 
+/// The least time between two sends of the reply in flight: each carries the
+/// whole reply, and the app only looks every few seconds.
+const LIVE_EVERY: Duration = Duration::from_secs(3);
+
 impl StepHook for Hook<'_> {
+    fn watch(&mut self, turn: tod_core::autopilot::Turn<'_>) -> Option<String> {
+        let (Some(conversation), parts) = (turn.conversation_id, &turn.status.parts) else {
+            return None;
+        };
+        if parts.is_empty() {
+            return None;
+        }
+        if let Some((at, sent)) = &self.live_sent
+            && (at.elapsed() < LIVE_EVERY || sent == parts)
+        {
+            return None;
+        }
+        let sent = self
+            .replica
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .set_live_turn(self.node, conversation, parts);
+        match sent {
+            // Kept even when it failed, so a broken send is retried every
+            // `LIVE_EVERY`, not on every poll.
+            Ok(()) => self.live_sent = Some((std::time::Instant::now(), parts.clone())),
+            Err(err) => {
+                tracing::warn!("sending the reply in flight: {err:#}");
+                self.live_sent = Some((std::time::Instant::now(), Vec::new()));
+            }
+        }
+        None
+    }
+
     fn at(&mut self, fleet: &FleetStore, boundary: Boundary) -> Result<Option<String>> {
+        // A turn ended or a step did: what was in flight is stored now, or
+        // gone. The push below carries the deletion.
+        self.live_sent = None;
+        self.replica.lock().unwrap_or_else(|e| e.into_inner()).clear_live_turn(self.node)?;
         if signal::take_poke() {
             tracing::info!("poked: looking again");
         }
@@ -292,6 +331,7 @@ pub fn wake(config: Config) -> Result<Woke> {
         push_branch: config.push_branch,
         context_seen: context::load_seen(&config.state_dir),
         context_pending: None,
+        live_sent: None,
     };
     let run = Autopilot::new(conversation, config.node, budget)
         .map(|pilot| pilot.with_poll_interval(config.poll))
