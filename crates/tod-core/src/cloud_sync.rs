@@ -1591,9 +1591,22 @@ pub fn wake_node(fleet: &FleetStore, root: &Path, node_id: &str) -> Result<Strin
     sync(fleet, root, &orch, &user).context("send the change to the orchestrator")?;
     let sandboxes = tod_store::fleet::sandbox::Sandboxes::load(root)?;
     let bx = sandboxes.blaxel()?;
-    let info = bx
-        .get(&row.sandbox)?
-        .ok_or_else(|| anyhow!("sandbox {} no longer exists", row.sandbox))?;
+    // A sandbox that is gone (deleted or reclaimed since the last look) is
+    // replaced the way the lost-sandbox check does, then woken.
+    let (row, info, replaced) = match bx.get(&row.sandbox)? {
+        Some(info) if !sandbox_is_dead(&info) => (row, info, None),
+        _ => {
+            let gone = row.sandbox.clone();
+            let mut progress = |msg: &str| log_progress(&format!("replacing {gone}"), msg);
+            let node = ensure_node_sandbox(fleet, root, node_id, &row.user, &mut progress)
+                .and_then(|name| record_cloud_node(fleet, node_id, name, &row.user))
+                .with_context(|| format!("sandbox {gone} is gone, and replacing it failed"))?;
+            let info = bx
+                .get(&node.sandbox)?
+                .ok_or_else(|| anyhow!("sandbox {} no longer exists", node.sandbox))?;
+            (node, info, Some(gone))
+        }
+    };
     let url = info.url.ok_or_else(|| anyhow!("sandbox {} has no URL", row.sandbox))?;
     push_supervisor_settings(&bx, &url, root, node_id)?;
     let poke = format!("{}/port/{}/poke", url.trim_end_matches('/'), tod_sandbox::blaxel::RELAY_PORT);
@@ -1607,7 +1620,10 @@ pub fn wake_node(fleet: &FleetStore, root: &Path, node_id: &str) -> Result<Strin
     if !resp.status().is_success() {
         bail!("poking sandbox {} got {}", row.sandbox, resp.status());
     }
-    Ok(format!("woke the supervisor in {}", row.sandbox))
+    Ok(match replaced {
+        Some(gone) => format!("replaced the missing sandbox {gone} with {} and woke its supervisor", row.sandbox),
+        None => format!("woke the supervisor in {}", row.sandbox),
+    })
 }
 
 pub mod lost;
