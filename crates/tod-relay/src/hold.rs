@@ -216,7 +216,7 @@ fn reconcile(state: &Mutex<HoldState>, current: &mut Option<(String, Instant)>, 
     if empty {
         if let Some((name, _)) = current.take() {
             let _ = api("DELETE", &format!("/process/{name}/kill"), None);
-            eprintln!("hold: released ({name})");
+            log!("hold: released ({name})");
         }
         return;
     }
@@ -238,11 +238,11 @@ fn reconcile(state: &Mutex<HoldState>, current: &mut Option<(String, Instant)>, 
     let body = hold_process_body(&name, desired_secs);
     match api("POST", "/process", Some(&body)) {
         Ok(_) => {
-            eprintln!("hold: awake ({name}, timeout {desired_secs}s)");
+            log!("hold: awake ({name}, timeout {desired_secs}s)");
             *current = Some((name, now + Duration::from_secs(desired_secs)));
         }
         Err(e) => {
-            eprintln!("hold: could not start: {e}");
+            log!("hold: could not start: {e}");
             crate::problem(tod_problems::Level::Error, &format!("hold: could not start: {e}"));
         }
     }

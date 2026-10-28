@@ -52,7 +52,7 @@ impl Tunnel {
         let listener = match TcpListener::bind(("127.0.0.1", port)).await {
             Ok(l) => l,
             Err(e) => {
-                eprintln!("tunnel: cannot listen on 127.0.0.1:{port}: {e}");
+                log!("tunnel: cannot listen on 127.0.0.1:{port}: {e}");
                 crate::problem(tod_problems::Level::Error, &format!("tunnel: cannot listen on 127.0.0.1:{port}: {e}"));
                 return;
             }

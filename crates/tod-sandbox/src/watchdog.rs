@@ -5,11 +5,10 @@
 //! each one's relay what holds it (`GET /holds`), and for any held past the
 //! policy's limits it ends every hold (`POST /release-all`) and flags the
 //! node through the orchestrator (`POST /users/<u>/nodes/<n>/flags`), so the
-//! user sees it in the decisions panel. It asks every deployed node sandbox,
-//! whatever state Blaxel reports: the control plane says `STANDBY` for a
-//! sandbox a `keepAlive` process holds awake (see [`node_sandboxes`]), which
-//! is exactly the one the watchdog is for. Asking one that is really asleep
-//! wakes it for that one request.
+//! user sees it in the decisions panel. It skips a sandbox whose listed
+//! `state` is `STANDBY`: that one is asleep, so nothing holds it, and asking
+//! its relay would wake it (see [`node_sandboxes`]). A sandbox held awake by
+//! a `keepAlive` process is `RUNNING`, so it is asked.
 //!
 //! The decision ([`judge`]) is pure; the calls go through [`WatchdogEnv`], so
 //! both are tested with fakes. [`BlaxelEnv`] is the real one. Deploying the
@@ -147,16 +146,17 @@ pub struct NodeSandbox {
 /// (`tod-kind=node-base`, the base's labels) is known by its `TOD_USER` and
 /// `TOD_NODE` instead; the base itself has no node, and is skipped.
 ///
-/// Blaxel's `state` is not consulted. Measured on a live workspace
-/// (2026-09-28): a sandbox held awake by the relay's `keepAlive` process,
-/// its VM running without a pause (a tick every 5 s, no gaps, uptime equal
-/// to its age), was reported `STANDBY` for its whole life, since the state
-/// follows proxied traffic, not the VM. Skipping `STANDBY` skipped exactly
-/// the sandboxes the watchdog is for.
+/// A sandbox whose `state` is `STANDBY` is skipped: it is asleep and held by
+/// nothing, and contacting its relay would wake it, which costs what the
+/// watchdog exists to save. One held awake by `keepAlive` is `RUNNING`
+/// (confirmed in the Cloud VMs window's test, 2026-10-28; the 2026-09-28
+/// measurement that said otherwise no longer holds). A sandbox with no
+/// `state` in the listing is asked, since nothing says it is asleep.
 pub fn node_sandboxes(list: &[SandboxInfo]) -> Vec<NodeSandbox> {
     list.iter()
         .filter(|s| matches!(s.label("tod-kind"), Some("node" | "node-base")))
         .filter(|s| s.status.eq_ignore_ascii_case("deployed"))
+        .filter(|s| !s.state.as_deref().is_some_and(|st| st.eq_ignore_ascii_case("standby")))
         .filter_map(|s| {
             let label = |key: &str| s.label(key).filter(|v| !v.is_empty());
             Some(NodeSandbox {
@@ -471,18 +471,17 @@ mod tests {
     }
 
     #[test]
-    fn every_deployed_node_sandbox_is_contacted_whatever_its_state() {
+    fn a_sandbox_in_standby_is_not_contacted() {
         let deleting = SandboxInfo { status: "DELETING".into(), ..info("e", Some("RUNNING"), "node") };
         let list = vec![
             info("a", Some("RUNNING"), "node"),
-            // Blaxel reports a sandbox held awake by keepAlive as STANDBY.
             info("b", Some("STANDBY"), "node"),
             info("c", None, "node"),
             info("d", Some("RUNNING"), "orchestrator"),
             deleting,
         ];
         let names: Vec<_> = node_sandboxes(&list).into_iter().map(|n| n.name).collect();
-        assert_eq!(names, vec!["a", "b", "c"]);
+        assert_eq!(names, vec!["a", "c"]);
     }
 
     #[test]
@@ -542,7 +541,8 @@ mod tests {
             list: vec![
                 info("over", Some("RUNNING"), "node"),
                 info("fine", Some("RUNNING"), "node"),
-                info("held", Some("STANDBY"), "node"),
+                info("held", Some("RUNNING"), "node"),
+                info("asleep", Some("STANDBY"), "node"),
                 info("gone", Some("RUNNING"), "node"),
                 info("stuck", Some("RUNNING"), "node"),
             ],
@@ -553,7 +553,7 @@ mod tests {
             HoldsReport { held_for_secs: Some(7200), reasons: vec![reason("ext:supervisor", Some(100))] },
         );
         fake.holds.insert("fine".into(), HoldsReport { held_for_secs: Some(10), reasons: vec![reason("poke", Some(50))] });
-        // Reported STANDBY while a lease far out keeps it awake.
+        // Held awake by a lease far out, so RUNNING.
         fake.holds.insert("held".into(), HoldsReport { held_for_secs: Some(60), reasons: vec![reason("ext:x", Some(7000))] });
         fake.holds.insert("stuck".into(), HoldsReport { held_for_secs: Some(99_999), reasons: vec![reason("x", None)] });
         fake.fail_release.push("stuck".into());

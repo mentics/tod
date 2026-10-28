@@ -55,6 +55,11 @@ enum UiRequest {
     Text(String),
     /// Yield one frame so layout/paint after input is visible to `shot`.
     Sync,
+    /// Force a draw, render the scene offscreen, write a PNG (see `shot2`).
+    Shot2 {
+        path: std::path::PathBuf,
+        crop: Option<(f32, f32, f32, f32)>,
+    },
     Quit,
     /// What the window's close button does: the close guard runs.
     Close,
@@ -158,6 +163,9 @@ fn handle_client(
                 capture::capture_window_png(&path, logical_width, logical_height, crop)
                     .map(|()| "ok".to_string())
             }
+            Ok(Command::Shot2 { path, crop }) => {
+                dispatch_ui(&tx, UiRequest::Shot2 { path, crop })
+            }
             Ok(Command::Key { keystroke }) => dispatch_ui(&tx, UiRequest::Key(keystroke)),
             Ok(Command::Text { text }) => dispatch_ui(&tx, UiRequest::Text(text)),
             #[cfg(windows)]
@@ -256,6 +264,19 @@ fn handle_ui_request(
 ) -> Result<String, String> {
     match request {
         UiRequest::Sync => Ok("ok".into()),
+        UiRequest::Shot2 { path, crop } => window
+            .update(cx, |_root, window, cx| {
+                // Force a fresh layout+paint of the current state: an occluded
+                // window gets no display-link frames, so its last scene is stale.
+                window.refresh();
+                let _ = window.draw(cx);
+                let rgba = window.render_to_image().map_err(|e| format!("render_to_image: {e}"))?;
+                let size = window.viewport_size();
+                let (lw, lh) = (f32::from(size.width).round() as u32, f32::from(size.height).round() as u32);
+                capture::write_scaled(&path, rgba, lw, lh, crop)?;
+                Ok("ok".to_string())
+            })
+            .map_err(|e| format!("window update failed: {e}"))?,
         UiRequest::Quit => Ok(cx
             .update(|app| {
                 // Closing the last window quits the app (`app::mod`), the

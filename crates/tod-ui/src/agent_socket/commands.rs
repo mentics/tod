@@ -46,6 +46,12 @@ pub enum Command {
         path: PathBuf,
         crop: Option<(f32, f32, f32, f32)>,
     },
+    /// Like `Shot`, but forces a fresh draw and renders offscreen through gpui,
+    /// so it is current even while the window is covered or minimized.
+    Shot2 {
+        path: PathBuf,
+        crop: Option<(f32, f32, f32, f32)>,
+    },
     /// Wait one UI frame (layout/paint) before the next observation.
     Sync,
     /// Close every window, as the user would: the app then quits itself.
@@ -127,7 +133,7 @@ pub fn parse_line(line: &str) -> Result<Command, String> {
                 y: parse_coord(y, "y")?,
             })
         }
-        "shot" => {
+        "shot" | "shot2" => {
             let path = parts
                 .next()
                 .ok_or_else(|| "shot requires a path".to_string())?;
@@ -146,9 +152,11 @@ pub fn parse_line(line: &str) -> Result<Command, String> {
                 }
                 _ => return Err("shot crop is path [x0 y0 x1 y1]".into()),
             };
-            Ok(Command::Shot {
-                path: PathBuf::from(path),
-                crop,
+            let path = PathBuf::from(path);
+            Ok(if verb == "shot2" {
+                Command::Shot2 { path, crop }
+            } else {
+                Command::Shot { path, crop }
             })
         }
         "quit" => {

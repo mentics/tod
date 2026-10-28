@@ -25,6 +25,8 @@
 //!
 //! The wire protocol is in `doc/cloud-sandboxes/relay-protocol.md`.
 
+#[macro_use]
+mod log;
 #[cfg(target_os = "linux")]
 mod hold;
 #[cfg(target_os = "linux")]
@@ -44,7 +46,7 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 #[allow(dead_code)]
 pub(crate) fn problem(level: tod_problems::Level, message: &str) {
     if let Err(err) = tod_problems::report_in(&tod_problems::node_dir(), "tod-relay", level, None, message) {
-        eprintln!("tod-relay: could not record this in the problem log: {err}");
+        log!("tod-relay: could not record this in the problem log: {err}");
     }
 }
 
