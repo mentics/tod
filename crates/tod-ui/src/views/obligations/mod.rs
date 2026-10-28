@@ -94,6 +94,53 @@ fn landing_index(
         .map_or(order.len(), |at| at + 1)
 }
 
+/// Where one step up or down lands `moved`, in the order the rows show: the
+/// section it ends in and the obligation it goes ahead of (`None` = the end of
+/// that section). `None` when it is already at the very top or bottom of its
+/// phase and kind.
+fn move_target(
+    items: &[NodeObligation],
+    moved: &NodeObligation,
+    up: bool,
+) -> Option<(String, Option<Uuid>)> {
+    let mut scope: Vec<&NodeObligation> = items
+        .iter()
+        .filter(|o| o.phase == moved.phase && o.kind == moved.kind)
+        .collect();
+    scope.sort_by_key(|o| o.ordinal);
+    // Sections in the order the rows show them: by first appearance.
+    let mut sections: Vec<&str> = Vec::new();
+    for o in &scope {
+        let s = obligation_section(o);
+        if !sections.contains(&s) {
+            sections.push(s);
+        }
+    }
+    let own = obligation_section(moved);
+    let in_section: Vec<&NodeObligation> = scope
+        .iter()
+        .copied()
+        .filter(|o| obligation_section(o) == own)
+        .collect();
+    let pos = in_section.iter().position(|o| o.id == moved.id)?;
+    let section_pos = sections.iter().position(|s| *s == own)?;
+    if up {
+        if pos > 0 {
+            return Some((own.to_string(), Some(in_section[pos - 1].id)));
+        }
+        let prev = sections.get(section_pos.checked_sub(1)?)?;
+        Some((prev.to_string(), None))
+    } else {
+        if in_section.get(pos + 1).is_some() {
+            let before = in_section.get(pos + 2).map(|o| o.id);
+            return Some((own.to_string(), before));
+        }
+        let next = sections.get(section_pos + 1)?;
+        let first = scope.iter().find(|o| obligation_section(o) == *next)?;
+        Some((next.to_string(), Some(first.id)))
+    }
+}
+
 const OBLIGATIONS_CONTEXT: &str = "Obligations";
 const INLINE_EDIT_ROWS: usize = 2;
 
@@ -1088,6 +1135,7 @@ impl ObligationsView {
         kind: &str,
         after_id: Option<Uuid>,
         before: bool,
+        section: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1105,7 +1153,7 @@ impl ObligationsView {
                 kind: kind.to_string(),
                 after_id,
                 before,
-                section: None,
+                section,
                 body: String::new(),
                 phase: phase.to_string(),
             }],
@@ -1127,11 +1175,13 @@ impl ObligationsView {
         match self.cursor_row() {
             Some(CursorRow::Group(ObGroup::Kind { phase, kind })) => {
                 if before {
-                    self.create_in_kind(&phase, kind, None, true, window, cx);
+                    self.create_in_kind(&phase, kind, None, true, None, window, cx);
                 } else {
                     match self.first_item_in_scope(&phase, kind, None) {
-                        Some(id) => self.create_in_kind(&phase, kind, Some(id), true, window, cx),
-                        None => self.create_in_kind(&phase, kind, None, false, window, cx),
+                        Some(id) => {
+                            self.create_in_kind(&phase, kind, Some(id), true, None, window, cx)
+                        }
+                        None => self.create_in_kind(&phase, kind, None, false, None, window, cx),
                     }
                 }
             }
@@ -1142,15 +1192,24 @@ impl ObligationsView {
                 ..
             })) => {
                 self.ensure_section_expanded(&phase, kind, &section, window, cx);
+                let target = (section != NO_SECTION).then(|| section.clone());
                 if before {
                     match self.first_item_in_scope(&phase, kind, Some(&section)) {
-                        Some(id) => self.create_in_kind(&phase, kind, Some(id), true, window, cx),
-                        None => self.create_in_kind(&phase, kind, None, false, window, cx),
+                        Some(id) => self.create_in_kind(
+                            &phase, kind, Some(id), true, target, window, cx,
+                        ),
+                        None => {
+                            self.create_in_kind(&phase, kind, None, false, target, window, cx)
+                        }
                     }
                 } else {
                     match self.last_item_in_scope(&phase, kind, Some(&section)) {
-                        Some(id) => self.create_in_kind(&phase, kind, Some(id), false, window, cx),
-                        None => self.create_in_kind(&phase, kind, None, false, window, cx),
+                        Some(id) => self.create_in_kind(
+                            &phase, kind, Some(id), false, target, window, cx,
+                        ),
+                        None => {
+                            self.create_in_kind(&phase, kind, None, false, target, window, cx)
+                        }
                     }
                 }
             }
@@ -1158,14 +1217,24 @@ impl ObligationsView {
                 let phase = item.obligation.phase.clone();
                 // A removed item is no anchor: add at the end of its kind.
                 let anchor = Some(item.obligation.id).filter(|_| !item.struck);
-                self.create_in_kind(&phase, &item.obligation.kind, anchor, before, window, cx);
+                let section = (obligation_section(&item.obligation) != NO_SECTION)
+                    .then(|| obligation_section(&item.obligation).to_string());
+                self.create_in_kind(
+                    &phase,
+                    &item.obligation.kind,
+                    anchor,
+                    before,
+                    section,
+                    window,
+                    cx,
+                );
             }
             Some(CursorRow::Group(ObGroup::Phase { phase })) => {
-                self.create_in_kind(&phase, KIND_REQUIREMENT, None, false, window, cx);
+                self.create_in_kind(&phase, KIND_REQUIREMENT, None, false, None, window, cx);
             }
             None => {
                 let phase = self.default_creation_phase();
-                self.create_in_kind(&phase, KIND_REQUIREMENT, None, false, window, cx);
+                self.create_in_kind(&phase, KIND_REQUIREMENT, None, false, None, window, cx);
             }
         }
     }
@@ -1333,6 +1402,12 @@ impl ObligationsView {
         });
     }
 
+    /// Move the obligation under the cursor one place in the order the rows
+    /// show: past its neighbour in the section, or — from the edge of its
+    /// section — into the next or previous section, as a node does between
+    /// parents. The stored order runs across the whole kind, so stepping it
+    /// directly would swap with an obligation of another section and move
+    /// nothing the user can see.
     fn move_selected(
         &mut self,
         direction: ReorderDirection,
@@ -1345,23 +1420,38 @@ impl ObligationsView {
         if item.struck {
             return;
         }
-        let id = item.obligation.id;
-        self.list.set_cursor_key(Some(id.to_string()));
-        self.write_then(
-            vec![OutlineMutation::ReorderObligation {
-                obligation_id: id,
-                direction,
-            }],
-            window,
-            cx,
-            |this, result, window, cx| {
-                if let Err(err) = result {
-                    crate::ui::toast::error_toast(window, cx, format!("Move failed: {err}"));
-                }
-                this.reload(window, cx);
-                this.focus_list(window, cx);
-            },
+        let moved = item.obligation.clone();
+        let up = matches!(direction, ReorderDirection::Up);
+        let Some((section, before)) = move_target(&self.items, &moved, up) else {
+            return;
+        };
+        let index = landing_index(
+            &self.items,
+            &moved,
+            &moved.kind,
+            &section,
+            before.map(|id| id.to_string()).as_deref(),
         );
+        let mut mutations = Vec::new();
+        if obligation_section(&moved) != section {
+            mutations.push(OutlineMutation::UpdateObligationSection {
+                obligation_id: moved.id,
+                section: (section != NO_SECTION).then(|| section.clone()),
+            });
+        }
+        mutations.push(OutlineMutation::PlaceObligation {
+            id: moved.id,
+            node_id: moved.node_id,
+            ordinal: index as i32 + 1,
+        });
+        self.list.set_cursor_key(Some(moved.id.to_string()));
+        self.write_then(mutations, window, cx, |this, result, window, cx| {
+            if let Err(err) = result {
+                crate::ui::toast::error_toast(window, cx, format!("Move failed: {err}"));
+            }
+            this.reload(window, cx);
+            this.focus_list(window, cx);
+        });
     }
 
     fn move_selection(&mut self, delta: i32, _window: &mut Window, cx: &mut Context<Self>) {
@@ -1477,7 +1567,7 @@ impl ObligationsView {
         match self.cursor_row() {
             Some(CursorRow::Group(ObGroup::Kind { phase, kind })) => {
                 self.set_group_collapsed(group_row_key(&phase, kind), false, window, cx);
-                self.create_in_kind(&phase, kind, None, false, window, cx);
+                self.create_in_kind(&phase, kind, None, false, None, window, cx);
             }
             Some(CursorRow::Group(ObGroup::Section {
                 phase,
@@ -1486,9 +1576,12 @@ impl ObligationsView {
                 ..
             })) => {
                 self.ensure_section_expanded(&phase, kind, &section, window, cx);
+                let target = (section != NO_SECTION).then(|| section.clone());
                 match self.last_item_in_scope(&phase, kind, Some(&section)) {
-                    Some(id) => self.create_in_kind(&phase, kind, Some(id), false, window, cx),
-                    None => self.create_in_kind(&phase, kind, None, false, window, cx),
+                    Some(id) => {
+                        self.create_in_kind(&phase, kind, Some(id), false, target, window, cx)
+                    }
+                    None => self.create_in_kind(&phase, kind, None, false, target, window, cx),
                 }
             }
             _ => self.create_relative(false, window, cx),
@@ -1859,6 +1952,21 @@ mod tests {
     use std::rc::Rc;
 
     type Events = Rc<RefCell<Vec<ObligationsEvent>>>;
+
+    #[test]
+    fn move_steps_through_the_rows_and_crosses_sections_at_the_edges() {
+        let items = kind_items(); // Offline: a, b; Sync: c
+        let (a, b, c) = (&items[0], &items[1], &items[2]);
+        // Within a section it passes its neighbour.
+        assert_eq!(move_target(&items, a, false), Some(("Offline".into(), None)));
+        assert_eq!(move_target(&items, b, true), Some(("Offline".into(), Some(a.id))));
+        // From the edge it enters the next or previous section.
+        assert_eq!(move_target(&items, b, false), Some(("Sync".into(), Some(c.id))));
+        assert_eq!(move_target(&items, c, true), Some(("Offline".into(), None)));
+        // The very top and bottom stay put.
+        assert_eq!(move_target(&items, a, true), None);
+        assert_eq!(move_target(&items, c, false), None);
+    }
 
     /// Two sections of one kind, in the order their ordinals put them.
     fn kind_items() -> Vec<NodeObligation> {
