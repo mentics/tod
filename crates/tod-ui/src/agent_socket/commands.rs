@@ -31,6 +31,15 @@ pub enum Command {
         /// The right button, for a row's context menu (`rclick`).
         right: bool,
     },
+    /// A mouse wheel / trackpad scroll at a point. Deltas are pixels in the
+    /// user's sense: positive `dy` scrolls down (content moves up), positive
+    /// `dx` scrolls right (content moves left).
+    Scroll {
+        x: f32,
+        y: f32,
+        dx: f32,
+        dy: f32,
+    },
     /// Press on one point, move to another, release: what reorders a list row.
     Drag {
         from: (f32, f32),
@@ -95,6 +104,25 @@ pub fn parse_line(line: &str) -> Result<Command, String> {
                 y: parse_coord(y, "y")?,
                 right: verb == "rclick",
             })
+        }
+        "scroll" => {
+            let mut num = |name: &str| {
+                parts
+                    .next()
+                    .ok_or_else(|| "scroll requires x y dx dy".to_string())
+                    .and_then(|value| {
+                        value
+                            .parse::<f32>()
+                            .ok()
+                            .filter(|v| v.is_finite())
+                            .ok_or_else(|| format!("invalid {name}: {value}"))
+                    })
+            };
+            let (x, y, dx, dy) = (num("x")?, num("y")?, num("dx")?, num("dy")?);
+            if parts.next().is_some() {
+                return Err("scroll takes exactly four numbers".into());
+            }
+            Ok(Command::Scroll { x, y, dx, dy })
         }
         "drag" => {
             let mut coord = |name: &str| {
@@ -265,6 +293,14 @@ mod tests {
             _ => panic!(),
         }
         assert!(parse_line("rclick 10").is_err());
+        let c = parse_line("scroll 10 20 0 -120.5").unwrap();
+        match c {
+            Command::Scroll { x, y, dx, dy } => assert_eq!((x, y, dx, dy), (10.0, 20.0, 0.0, -120.5)),
+            _ => panic!(),
+        }
+        assert!(parse_line("scroll 10 20 5").is_err());
+        assert!(parse_line("scroll 1 2 3 4 5").is_err());
+        assert!(parse_line("scroll a 2 3 4").is_err());
         let c = parse_line("drag 10 20 30 44").unwrap();
         match c {
             Command::Drag { from, to } => {

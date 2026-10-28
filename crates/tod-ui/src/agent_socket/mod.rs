@@ -5,6 +5,7 @@
 //! - `text <string>` — insert into focused input (after focus click + sync)
 //! - `click <x> <y>`
 //! - `rclick <x> <y>` — right-click, e.g. to open a list row's context menu
+//! - `scroll <x> <y> <dx> <dy>` — wheel scroll at a point; +dy scrolls down
 //! - `shot <path> [x0 y0 x1 y1]`
 //! - `sync` — wait one UI frame (use before a shot after clicks if paint must settle)
 //! - `transcripts open` — open or focus the agent transcript window (single instance)
@@ -61,6 +62,8 @@ enum UiRequest {
     /// A synthetic mouse click through GPUI (platforms without a native path).
     #[cfg(not(windows))]
     Click { x: f32, y: f32, right: bool },
+    /// A synthetic wheel event at a point (user sense: +dy = scroll down).
+    Scroll { x: f32, y: f32, dx: f32, dy: f32 },
     Transcripts(TranscriptsCommand),
     AgentPlatform(AgentPlatformSocketCommand),
 }
@@ -167,6 +170,7 @@ fn handle_client(
             }
             #[cfg(not(windows))]
             Ok(Command::Click { x, y, right }) => dispatch_ui(&tx, UiRequest::Click { x, y, right }),
+            Ok(Command::Scroll { x, y, dx, dy }) => dispatch_ui(&tx, UiRequest::Scroll { x, y, dx, dy }),
             Ok(Command::Close) => dispatch_ui(&tx, UiRequest::Close),
             Ok(Command::Drag { from, to }) => {
                 capture::send_drag(from, to, logical_width, logical_height)
@@ -292,6 +296,28 @@ fn handle_ui_request(
                 "ok".to_string()
             })
             .map_err(|e| format!("click failed: {e}")),
+        UiRequest::Scroll { x, y, dx, dy } => window
+            .update(cx, |_root, window, cx| {
+                use gpui::{point, px, Modifiers, MouseMoveEvent, PlatformInput, ScrollDelta, ScrollWheelEvent, TouchPhase};
+                let position = point(px(x), px(y));
+                window.dispatch_event(
+                    PlatformInput::MouseMove(MouseMoveEvent { position, pressed_button: None, modifiers: Modifiers::default() }),
+                    cx,
+                );
+                // GPUI deltas follow the scroll offset (negative = content moves
+                // up), so the user-facing "+dy = down" is negated here.
+                window.dispatch_event(
+                    PlatformInput::ScrollWheel(ScrollWheelEvent {
+                        position,
+                        delta: ScrollDelta::Pixels(point(px(-dx), px(-dy))),
+                        modifiers: Modifiers::default(),
+                        touch_phase: TouchPhase::Moved,
+                    }),
+                    cx,
+                );
+                "ok".to_string()
+            })
+            .map_err(|e| format!("scroll failed: {e}")),
         UiRequest::Key(keystroke) => apply_key(cx, window, keystroke).map(|()| "ok".into()),
         UiRequest::Text(text) => apply_text(cx, window, text).map(|()| "ok".into()),
         UiRequest::Transcripts(action) => apply_transcripts(cx, transcript_window, action),
