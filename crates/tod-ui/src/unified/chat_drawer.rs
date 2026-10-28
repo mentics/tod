@@ -508,15 +508,7 @@ impl ChatDrawer {
             let Some(slot) = runs.slot_by_index(ix).map(|s| s.id) else {
                 return;
             };
-            match runs.driver_mut(slot) {
-                Some(driver) => {
-                    let _ = driver.cancel(&self.fleet, &mut SharedAgentAccess(&self.agent));
-                    let status = driver.status();
-                    runs.set_status(slot, status);
-                }
-                None => runs.set_cancel(slot),
-            }
-            cx.notify();
+            runs.stop(slot, cx);
         });
         self.refresh_status(cx);
         cx.notify();

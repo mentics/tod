@@ -703,21 +703,7 @@ impl TaskPanel {
 
     /// Stop the node's running turn: the conversation view's own stop path.
     fn stop_runner(&mut self, slot: u64, cx: &mut Context<Self>) {
-        self.agent_runs.update(cx, |runs, cx| {
-            let fleet = runs.fleet().clone();
-            let agent = runs.agent().clone();
-            match runs.driver_mut(slot) {
-                Some(driver) => {
-                    if let Err(err) = driver.cancel(&fleet, &mut SharedAgentAccess(&agent)) {
-                        tracing::warn!("task panel: stopping the turn failed: {err:#}");
-                    }
-                    let status = driver.status();
-                    runs.set_status(slot, status);
-                }
-                None => runs.set_cancel(slot),
-            }
-            cx.notify();
-        });
+        self.agent_runs.update(cx, |runs, cx| runs.stop(slot, cx));
     }
 
     /// What the split button offers for `status`.
