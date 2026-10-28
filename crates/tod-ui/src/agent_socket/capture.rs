@@ -36,6 +36,18 @@ fn capture_scaled(
     crop: Option<(f32, f32, f32, f32)>,
 ) -> Result<(), String> {
     let rgba = capture_client_rgba()?;
+    write_scaled(path, rgba, logical_width, logical_height, crop)
+}
+
+/// Scale a physical-pixel capture to logical size, optionally crop, write PNG.
+#[cfg(any(windows, target_os = "macos"))]
+pub(super) fn write_scaled(
+    path: &Path,
+    rgba: image::RgbaImage,
+    logical_width: u32,
+    logical_height: u32,
+    crop: Option<(f32, f32, f32, f32)>,
+) -> Result<(), String> {
     let (pw, ph) = (rgba.width(), rgba.height());
     let lw = logical_width.max(1);
     let lh = logical_height.max(1);

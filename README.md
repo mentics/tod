@@ -201,6 +201,7 @@ If the chosen port is already in use, startup fails immediately with a bind erro
 | `close` | Ask the window to close as the user would: the close guard runs (replies `ok blocked` while its toast is up). `click` also works on macOS. |
 | `quit` | Close every window, so the app quits as if the user closed it |
 | `shot <path>` | PNG screenshot of the window (Windows and macOS; on macOS the app reads its own window back from the window server, so no Screen Recording permission, and it works while the window is covered or unfocused) |
+| `shot2 <path> [x0 y0 x1 y1]` | Like `shot`, but forces a fresh draw and renders the scene offscreen through gpui (`Window::render_to_image`, so it needs no window-server readback and is current while the window is covered or minimized). macOS-tested; dev builds only, since it turns on gpui's `test-support` |
 
 See `.local/agent/ui-smoke/BATCH.md` for the full smoke workflow.
 
