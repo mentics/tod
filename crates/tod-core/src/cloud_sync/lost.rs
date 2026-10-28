@@ -66,6 +66,35 @@ pub fn forget_gone_sandboxes(
     Ok(gone)
 }
 
+/// How long a node whose replacement failed is left alone by [`Check::Marked`].
+/// Its mark stays set, so without this every sync would fork a sandbox again,
+/// fail the same way, and delete it. A new "Run in the cloud" for the node
+/// ([`forget_failure`]) or the next start ([`Check::Full`]) tries sooner.
+const RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+static FAILED: Mutex<Option<HashMap<String, std::time::Instant>>> = Mutex::new(None);
+
+fn backed_off(node_id: &str) -> bool {
+    let failed = FAILED.lock().unwrap_or_else(|e| e.into_inner());
+    failed.as_ref().and_then(|m| m.get(node_id)).is_some_and(|at| at.elapsed() < RETRY_AFTER)
+}
+
+fn set_failed(node_id: &str, failed: bool) {
+    let mut map = FAILED.lock().unwrap_or_else(|e| e.into_inner());
+    let map = map.get_or_insert_with(HashMap::new);
+    if failed {
+        map.insert(node_id.to_string(), std::time::Instant::now());
+    } else {
+        map.remove(node_id);
+    }
+}
+
+/// The user is running `node_id` in the cloud again: its replacement may be
+/// retried by the next check.
+pub fn forget_failure(node_id: &str) {
+    set_failed(node_id, false);
+}
+
 static NOTES: Mutex<Option<HashMap<String, String>>> = Mutex::new(None);
 
 /// What the last check did about `node_id`'s sandbox, for its status line.
@@ -159,6 +188,9 @@ pub fn check(fleet: &FleetStore, check: Check) -> Result<usize> {
     let deleted = CloudSyncState::load(&root)?.deleted_by_user;
     let mut lost = lost_rows(&rows, listing.as_deref());
     lost.retain(|row| !deleted.contains(&row.node_id.to_string()));
+    if check == Check::Marked {
+        lost.retain(|row| !backed_off(&row.node_id.to_string()));
+    }
     let mut replaced = 0;
     for row in &lost {
         let id = row.node_id.to_string();
@@ -169,12 +201,17 @@ pub fn check(fleet: &FleetStore, check: Check) -> Result<usize> {
             .and_then(|name| record_cloud_node(fleet, &id, name, &row.user));
         match result {
             Ok(node) => {
+                set_failed(&id, false);
                 replaced += 1;
                 let when = chrono::Local::now().format("%Y-%m-%d %H:%M");
                 set_note(&id, Some(format!("Its sandbox was gone; the app replaced it with {} at {when}.", node.sandbox)));
             }
             Err(err) => {
-                tracing::warn!("cloud: replacing node {id}'s sandbox: {err:#}");
+                set_failed(&id, true);
+                tracing::warn!(
+                    "cloud: replacing node {id}'s sandbox: {err:#} (not retried for {} minutes unless it is run in the cloud again)",
+                    RETRY_AFTER.as_secs() / 60
+                );
                 set_note(&id, Some(format!("Its sandbox is gone and could not be replaced: {err:#}")));
             }
         }
@@ -316,7 +353,10 @@ pub fn spawn_check(fleet: Arc<FleetStore>, kind: Check) {
 pub fn any_marked(fleet: &FleetStore) -> bool {
     let root = fleet.paths().root();
     fleet.read(cloud_nodes::list).is_ok_and(|rows| {
-        rows.iter().any(|r| r.lost_at.is_some() && !super::sandbox_deleted_by_user(root, &r.node_id.to_string()))
+        rows.iter().any(|r| {
+            let id = r.node_id.to_string();
+            r.lost_at.is_some() && !super::sandbox_deleted_by_user(root, &id) && !backed_off(&id)
+        })
     })
 }
 
