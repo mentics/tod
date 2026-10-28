@@ -366,7 +366,16 @@ pub fn compute(fleet: &tod_store::fleet::FleetStore, data_root: &std::path::Path
         let ids: Vec<Uuid> = NodeRepo::new(conn).list_all()?.into_iter().map(|n| n.id).collect();
         let with_lifecycle = NodeRepo::new(conn).get_lifecycle_for_nodes(&ids)?;
         let mut inputs = Inputs { now_ms, ..Default::default() };
-        for node in with_lifecycle.keys() {
+        // A node whose supervisor runs in the cloud has no run of this
+        // machine's to speak of: the file here is the last local run's, from
+        // before the node moved (a failed start, say), and would read as the
+        // node's failure for as long as it stays.
+        let in_cloud: std::collections::HashSet<Uuid> = tod_store::cloud_nodes::list(conn)?
+            .into_iter()
+            .filter(|row| row.lost_at.is_none())
+            .map(|row| row.node_id)
+            .collect();
+        for node in with_lifecycle.keys().filter(|n| !in_cloud.contains(n)) {
             let path = state_path(data_root, *node);
             if !path.exists() {
                 continue;
@@ -1357,6 +1366,33 @@ mod tests {
         fleet.writer().flush().unwrap();
         assert!(fleet.read(|conn| ActivityRepo::new(conn).list_for_nodes(&[node])).unwrap().is_empty());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_local_failed_run_does_not_speak_for_a_node_that_runs_in_the_cloud() {
+        let fx = fixture();
+        let local = node(&fx.conn, "local", Some("active"));
+        let cloud = node(&fx.conn, "cloud", Some("active"));
+        tod_store::cloud_nodes::upsert(&fx.conn, cloud, "node-cloud", "alice", 1).unwrap();
+        for id in [local, cloud] {
+            let mut state = crate::autopilot::AutopilotState::fresh();
+            state.outcome = Some(Outcome::NeedsHuman {
+                reason: NeedsHuman::AgentFailed { error: "not signed in".into() },
+            });
+            state.save(&fx.dir, id).unwrap();
+        }
+        let fleet = tod_store::fleet::FleetStore::open(&fx.dir).unwrap();
+        let standings = compute(&fleet, &fx.dir).unwrap();
+        assert!(
+            matches!(standings[&local].actor, NextActor::You { why: YouReason::Failed { .. }, .. }),
+            "a node run here keeps its failure: {:?}",
+            standings[&local].actor
+        );
+        assert!(
+            !matches!(standings[&cloud].actor, NextActor::You { why: YouReason::Failed { .. }, .. }),
+            "the cloud node is not failed by a stale local run: {:?}",
+            standings[&cloud].actor
+        );
     }
 
     #[test]
