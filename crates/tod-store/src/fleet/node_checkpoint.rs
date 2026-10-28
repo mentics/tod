@@ -47,7 +47,7 @@ pub fn checkpoint_node_with(
         Ok(saved) => Ok(Some(saved)),
         // An idle sandbox is reclaimed after a while: that is normal, and
         // there is nothing in it to save. The next launch makes a new one.
-        Err(err) if format!("{err:#}").contains("no sandbox named ") => {
+        Err(err) if crate::fleet::provision::sandbox_is_gone(&err) => {
             tracing::debug!(node_id, "not checkpointing: the node's sandbox is gone ({err:#})");
             Ok(None)
         }

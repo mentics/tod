@@ -114,9 +114,18 @@ pub fn resolve_launch_cwd_with(
     }
 }
 
-/// Whether `err` says Blaxel has no sandbox by the name asked for.
-fn sandbox_is_gone(err: &anyhow::Error) -> bool {
-    format!("{err:#}").contains("no sandbox named ")
+/// Whether `err` says Blaxel has no sandbox by the name asked for, or lists
+/// it as terminated or being deleted (a deleted sandbox lingers that way).
+pub fn sandbox_is_gone(err: &anyhow::Error) -> bool {
+    let text = format!("{err:#}");
+    text.contains("no sandbox named ") || text.contains(" is TERMINATED") || text.contains(" is DELETING")
+}
+
+/// Whether `error` says the sandbox called `sandbox` is gone.
+fn says_sandbox_gone(error: &str, sandbox: &str) -> bool {
+    error.contains(&format!("no sandbox named {sandbox}"))
+        || error.contains(&format!("sandbox {sandbox} is TERMINATED"))
+        || error.contains(&format!("sandbox {sandbox} is DELETING"))
 }
 
 /// Recovery for a launch that failed reaching `sandbox`: when `error` says
@@ -125,7 +134,7 @@ fn sandbox_is_gone(err: &anyhow::Error) -> bool {
 /// (its session logs are restored there). Returns whether it did. Costs
 /// nothing on the normal path: it runs only after a failure.
 pub fn forget_lost_sandbox(fleet: &FleetStore, node_id: &str, sandbox: &str, error: &str) -> Result<bool> {
-    if !error.contains(&format!("no sandbox named {sandbox}")) {
+    if !says_sandbox_gone(error, sandbox) {
         return Ok(false);
     }
     let lock = node_lock(node_id);
@@ -1051,6 +1060,15 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn a_terminated_sandbox_counts_as_gone() {
+        let err = anyhow::anyhow!("spawn git in /workspace (in sandbox n-1): sandbox n-1 is TERMINATED");
+        assert!(sandbox_is_gone(&err));
+        assert!(says_sandbox_gone(&format!("{err:#}"), "n-1"));
+        assert!(!says_sandbox_gone(&format!("{err:#}"), "n-2"));
+        assert!(!sandbox_is_gone(&anyhow::anyhow!("sandbox n-1 is FAILED")));
+    }
     use crate::fleet::test_util::{cleanup_fleet_root, temp_fleet_root};
     use crate::outline::types::Capability;
     use crate::outline::{CreatePosition, OutlineMutation};
