@@ -400,10 +400,15 @@ impl TaskListView {
             self.show_error("Create a list first (Enter or Ctrl+Shift+L)", window, cx);
             return None;
         };
+        // Only a node that exists can anchor the new one: the selection may
+        // name a draft never created or a node gone since (an empty list keeps
+        // whatever the working set saved), and `CreateNode` refuses a missing
+        // anchor.
         let anchor_id = self
             .working_set
             .selected_id
             .as_deref()
+            .filter(|id| !self.is_draft_id(id) && self.all_tasks.iter().any(|t| t.id == *id))
             .and_then(|id| Uuid::parse_str(id).ok());
         let parent_id = if position == CreatePosition::Child {
             anchor_id

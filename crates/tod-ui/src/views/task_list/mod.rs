@@ -464,9 +464,9 @@ impl TaskListView {
         let visible = Self::visible_tasks(&all_tasks, "", &working_set, &standing::ActorView::default());
         let initial_selection = Self::initial_selection(&visible, &working_set);
 
-        if let Some(id) = &initial_selection.1 {
-            working_set.selected_id = Some(id.clone());
-        }
+        // A saved selection that is not a visible row (a draft left open when
+        // the app closed, or an empty list) is dropped, not kept as a ghost.
+        working_set.selected_id = initial_selection.1.clone();
 
         let delegate = TaskListDelegate::new(visible.clone(), action_sink.clone());
         let list_state = cx.new(|cx| ListState::new(delegate, window, cx).searchable(false));
@@ -3957,5 +3957,21 @@ mod tests {
         assert_eq!(visible[2].title, "Beta child");
         assert_eq!(visible[3].title, "Zeta root");
         assert_eq!(visible[1].depth, 1);
+    }
+    /// A selection that names no node (a draft that was never created, saved by
+    /// the working set) must not become the anchor of the next new item:
+    /// `CreateNode` would fail with "anchor node missing from outline".
+    #[gpui::test]
+    fn new_item_ignores_a_stale_selection(cx: &mut TestAppContext) {
+        let fixture = Fixture::new();
+        let (view, _events, cx) = open_view(&fixture, cx);
+        let stale = uuid::Uuid::new_v4();
+        view.update_in(cx, |view, window, cx| {
+            view.working_set.selected_id = Some(stale.to_string());
+            let draft = view
+                .draft_placement(tod_store::outline::CreatePosition::Below, window, cx)
+                .expect("a list is active");
+            assert_eq!(draft.anchor_id, None);
+        });
     }
 }
