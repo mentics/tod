@@ -45,18 +45,18 @@ fn tracked() -> std::sync::MutexGuard<'static, Option<HashSet<u32>>> {
 /// relay works without it, only zombies pile up.
 pub fn start() {
     if let Err(err) = become_subreaper() {
-        eprintln!("reaper: could not become a child subreaper: {err}");
+        log!("reaper: could not become a child subreaper: {err}");
         crate::problem(tod_problems::Level::Error, &format!("reaper: could not become a child subreaper: {err}"));
         return;
     }
     let spawned = std::thread::Builder::new().name("reaper".into()).spawn(|| loop {
         std::thread::sleep(EVERY);
         for pid in reap_orphans() {
-            eprintln!("reaper: reaped orphan pid {pid}");
+            log!("reaper: reaped orphan pid {pid}");
         }
     });
     if let Err(err) = spawned {
-        eprintln!("reaper: could not start: {err}");
+        log!("reaper: could not start: {err}");
         crate::problem(tod_problems::Level::Error, &format!("reaper: could not start: {err}"));
     }
 }
