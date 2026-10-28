@@ -301,29 +301,45 @@ impl Wakes {
 
 /// Pokes a sandbox's relay through Blaxel's port proxy.
 pub struct RelayPoker {
-    blaxel: Option<tod_sandbox::blaxel::Blaxel>,
+    creds: Option<(String, String)>,
 }
 
 impl RelayPoker {
     pub fn from_env() -> Self {
-        let blaxel = match (
+        let creds = match (
             std::env::var("TOD_ORCHESTRATOR_BLAXEL_WORKSPACE"),
             std::env::var("TOD_ORCHESTRATOR_BLAXEL_TOKEN"),
         ) {
-            (Ok(ws), Ok(token)) if !ws.is_empty() && !token.is_empty() => {
-                Some(tod_sandbox::blaxel::Blaxel::new(ws, token))
-            }
+            (Ok(ws), Ok(token)) if !ws.is_empty() && !token.is_empty() => Some((ws, token)),
             _ => None,
         };
-        Self { blaxel }
+        Self { creds }
+    }
+
+    /// The one HTTP client for a poke: both the Blaxel control-plane lookup
+    /// and the relay request. It checks servers against the host's CA store
+    /// ([`crate::notify::system_roots`]), never `ureq`'s bundled roots: those
+    /// rejected the control plane's chain from the deployed orchestrator
+    /// (`UnknownIssuer`), so every poke failed and no answer or wake ever
+    /// reached a node.
+    fn agent() -> Result<ureq::Agent> {
+        Ok(ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .timeout_connect(Some(Duration::from_secs(15)))
+            .timeout_global(Some(Duration::from_secs(60)))
+            .tls_config(crate::notify::system_roots()?)
+            .build()
+            .into())
     }
 }
 
 impl Poker for RelayPoker {
     fn poke(&self, wake: &Wake) -> Result<()> {
-        let Some(bx) = &self.blaxel else {
+        let Some((workspace, token)) = &self.creds else {
             bail!("TOD_ORCHESTRATOR_BLAXEL_WORKSPACE and TOD_ORCHESTRATOR_BLAXEL_TOKEN are not set");
         };
+        let agent = Self::agent()?;
+        let bx = tod_sandbox::blaxel::Blaxel::with_agent(workspace.clone(), token.clone(), agent.clone());
         let Some(info) = bx.get(&wake.sandbox)? else {
             return Err(SandboxGone(wake.sandbox.clone()).into());
         };
@@ -332,12 +348,6 @@ impl Poker for RelayPoker {
         }
         let url = info.url.with_context(|| format!("{} has no URL", wake.sandbox))?;
         let url = format!("{}/port/{}/poke", url.trim_end_matches('/'), tod_sandbox::blaxel::RELAY_PORT);
-        let agent: ureq::Agent = ureq::Agent::config_builder()
-            .http_status_as_error(false)
-            .timeout_global(Some(Duration::from_secs(60)))
-            .tls_config(crate::notify::system_roots()?)
-            .build()
-            .into();
         let resp = agent
             .post(&url)
             .header("Authorization", &format!("Bearer {}", bx.token()))
@@ -488,5 +498,24 @@ mod tests {
         let ticks = awake.0.lock().unwrap().clone();
         assert_eq!(ticks.first(), Some(&true), "held while the wake was pending");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn relay_poker_without_credentials_says_so() {
+        let poker = RelayPoker { creds: None };
+        let err = poker.poke(&wake("a", 0)).unwrap_err();
+        assert!(format!("{err:#}").contains("TOD_ORCHESTRATOR_BLAXEL_TOKEN"), "{err:#}");
+    }
+
+    /// The poke's one client (the Blaxel lookup and the relay request both
+    /// use it) is built on the host's CA store, never the bundled roots that
+    /// rejected the control plane (`UnknownIssuer`) and left every answered
+    /// decision unpoked. On a host with no CA store it fails by saying so.
+    #[test]
+    fn relay_poker_client_uses_the_host_ca_store() {
+        match RelayPoker::agent() {
+            Ok(_) => assert!(crate::notify::system_roots().is_ok()),
+            Err(err) => assert!(format!("{err:#}").contains("system CA certificates"), "{err:#}"),
+        }
     }
 }
