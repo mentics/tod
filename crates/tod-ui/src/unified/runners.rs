@@ -226,6 +226,12 @@ impl NodeRunners {
         Ok(())
     }
 
+    /// Show `error` on the node's runner line.
+    pub fn fail(&mut self, node: Uuid, error: String, cx: &mut Context<Self>) {
+        self.errors.insert(node, error);
+        cx.notify();
+    }
+
     /// Stop once the agent's turn ends.
     pub fn pause(&mut self, node: Uuid, cx: &mut Context<Self>) {
         if let Some(runner) = self.runners.get_mut(&node).filter(|r| r.running) {

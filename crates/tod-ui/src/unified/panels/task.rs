@@ -186,6 +186,9 @@ enum RunnerAction {
     StartHere,
     Resume,
     ResumeFreshBudget,
+    /// Run the current step's agent in a new session: nothing is reopened or
+    /// resumed. Lighter than reinstalling a cloud sandbox.
+    RunFresh,
     Pause,
     StopNow,
     /// Read GitHub now instead of at the scheduled time.
@@ -216,6 +219,7 @@ impl RunnerAction {
             Self::StartHere => "Run on this machine instead",
             Self::Resume => "Resume",
             Self::ResumeFreshBudget => "Resume with a fresh budget",
+            Self::RunFresh => "Run with a new session",
             Self::Pause => "Pause",
             Self::StopNow => "Stop now",
             Self::PollNow => "Poll now",
@@ -787,15 +791,15 @@ impl TaskPanel {
         match runners.outcome(node) {
             Some(Outcome::BudgetExhausted { .. }) => RunnerActions {
                 primary: Some((A::ResumeFreshBudget, A::ResumeFreshBudget.label(), false)),
-                menu: vec![A::MoveToCloud],
+                menu: vec![A::RunFresh, A::MoveToCloud],
             },
             Some(outcome) if *outcome != Outcome::Done => RunnerActions {
                 primary: Some((A::Resume, A::Resume.label(), false)),
-                menu: vec![A::ResumeFreshBudget, A::MoveToCloud],
+                menu: vec![A::ResumeFreshBudget, A::RunFresh, A::MoveToCloud],
             },
             _ => RunnerActions {
                 primary: Some((A::Start, A::Start.label(), false)),
-                menu: vec![A::MoveToCloud],
+                menu: vec![A::RunFresh, A::MoveToCloud],
             },
         }
     }
@@ -850,6 +854,15 @@ impl TaskPanel {
         match action {
             A::Start | A::StartHere | A::Resume => {
                 let _ = self.runners.update(cx, |r, cx| r.start(node, false, cx));
+            }
+            A::RunFresh => {
+                let root = self.fleet.paths().root().to_path_buf();
+                match tod_core::autopilot::AutopilotState::request_fresh_session(&root, node) {
+                    Ok(()) => {
+                        let _ = self.runners.update(cx, |r, cx| r.start(node, false, cx));
+                    }
+                    Err(err) => self.runners.update(cx, |r, cx| r.fail(node, format!("{err:#}"), cx)),
+                }
             }
             A::ResumeFreshBudget => {
                 let _ = self.runners.update(cx, |r, cx| r.start(node, true, cx));
@@ -1541,7 +1554,7 @@ mod tests {
             actions,
             RunnerActions {
                 primary: Some((RunnerAction::Start, "Start", false)),
-                menu: vec![RunnerAction::MoveToCloud],
+                menu: vec![RunnerAction::RunFresh, RunnerAction::MoveToCloud],
             }
         );
 

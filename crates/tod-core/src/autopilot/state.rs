@@ -45,6 +45,11 @@ pub struct AutopilotState {
     /// to count (`doc/lifecycle/pr-readiness.md`); `None` until the first.
     #[serde(default)]
     pub pr_turns_base: Option<u32>,
+    /// The user asked for the next run's agent to start a new session
+    /// instead of continuing or reopening one; the run clears it as it
+    /// starts ([`super::Autopilot::new`]).
+    #[serde(default)]
+    pub fresh_session: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -79,6 +84,7 @@ impl AutopilotState {
             steps: Vec::new(),
             outcome: None,
             pr_turns_base: None,
+            fresh_session: false,
         }
     }
 
@@ -91,6 +97,13 @@ impl AutopilotState {
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Self::fresh()),
             Err(err) => Err(err).with_context(|| format!("read {}", path.display())),
         }
+    }
+
+    /// Ask that the next run of `node` start its agent in a new session.
+    pub fn request_fresh_session(data_root: &Path, node: Uuid) -> Result<()> {
+        let mut state = Self::load(data_root, node)?;
+        state.fresh_session = true;
+        state.save(data_root, node)
     }
 
     pub fn save(&self, data_root: &Path, node: Uuid) -> Result<()> {
@@ -135,6 +148,16 @@ impl AutopilotState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fresh_session_request_is_saved_and_old_files_load() {
+        let dir = std::env::temp_dir().join(format!("tod-fresh-{}", Uuid::new_v4()));
+        let node = Uuid::new_v4();
+        assert!(!AutopilotState::load(&dir, node).unwrap().fresh_session);
+        AutopilotState::request_fresh_session(&dir, node).unwrap();
+        assert!(AutopilotState::load(&dir, node).unwrap().fresh_session);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn time_asleep_does_not_count() {
