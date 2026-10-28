@@ -523,7 +523,7 @@ fn actor_for(facts: &Facts<'_>) -> (NextActor, i64) {
     }
     // The same for a supervisor in the cloud that stopped beating without
     // ending its run: its sandbox or process died mid-run.
-    if let Some(beat) = facts.cloud.filter(|b| !b.is_live(facts.now_ms)) {
+    if let Some(beat) = facts.cloud.filter(|b| !b.is_idle() && !b.is_live(facts.now_ms)) {
         let error = format!(
             "the cloud supervisor stopped responding {} ago (last heard while {})",
             format_elapsed(facts.now_ms - beat.heartbeat_at),

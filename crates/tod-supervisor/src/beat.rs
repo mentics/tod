@@ -5,7 +5,8 @@
 //!
 //! [`Beating::start`] records the run and pushes it at once, then a thread
 //! refreshes and pushes it every [`BEAT_EVERY`]. [`Beating::finish`] (or
-//! dropping it) deletes the row and pushes that: the app sees the run end.
+//! dropping it) marks the row idle and pushes that: the app sees the run end,
+//! even one that began and ended between two of its syncs.
 //! A supervisor that dies leaves the row to go stale, which the app shows
 //! as the loss it is.
 
@@ -53,7 +54,7 @@ impl Beating {
         Ok(Self { replica, node, stop: Some(stop), thread: Some(thread) })
     }
 
-    /// The run is over: stops the beat, deletes the row, and sends that.
+    /// The run is over: stops the beat, marks the row idle, and sends that.
     pub fn finish(mut self) -> Result<()> {
         self.end()
     }
