@@ -194,18 +194,42 @@ fn ask(store: &FleetStore, node: Uuid, conversation: Option<Uuid>, kind: &str, q
     Ok(())
 }
 
+/// A phase of starting up that takes longer than this is a warning, so it
+/// reaches the app's log panel (only warnings and errors are forwarded):
+/// the app waits `SUPERVISOR_REPORTS_WITHIN` for the first heartbeat, and
+/// what the supervisor spent that on should be visible when it is missed.
+const SLOW_PHASE: Duration = Duration::from_secs(15);
+
+/// Runs `f`, logging how long the startup phase `name` took (and warning when
+/// it was slow, see [`SLOW_PHASE`]).
+fn phase<T>(name: &str, since_wake: std::time::Instant, f: impl FnOnce() -> T) -> T {
+    let started = std::time::Instant::now();
+    let out = f();
+    let took = started.elapsed();
+    let at = since_wake.elapsed().as_secs();
+    if took >= SLOW_PHASE {
+        tracing::warn!(phase = name, took_secs = took.as_secs(), seconds_since_wake_began = at, "a slow start: this phase delayed the first heartbeat");
+    } else {
+        tracing::info!(phase = name, took_ms = took.as_millis() as u64, seconds_since_wake_began = at, "startup phase done");
+    }
+    out
+}
+
 /// One wake. See the module docs.
 pub fn wake(config: Config) -> Result<Woke> {
+    let began = std::time::Instant::now();
     signal::install();
     // Hold the sandbox awake from the start: seeding a new replica from the
     // orchestrator can outlast the relay's poke hold, and the sandbox must
     // not go to standby mid-seed. Released when the wake returns, including
     // when it finds nothing to do.
     let hold = HoldGuard::take(config.holder.clone());
-    let replica = Replica::open(&config.state_dir, config.orchestrator.clone(), config.node, &config.workspace)?;
+    let replica = phase("open the local copy (seeding it from the orchestrator when new)", began, || {
+        Replica::open(&config.state_dir, config.orchestrator.clone(), config.node, &config.workspace)
+    })?;
     let replica = Arc::new(Mutex::new(replica));
     let store = replica.lock().unwrap_or_else(|e| e.into_inner()).store().clone();
-    replica.lock().unwrap_or_else(|e| e.into_inner()).pull()?;
+    phase("pull the orchestrator's changes", began, || replica.lock().unwrap_or_else(|e| e.into_inner()).pull())?;
 
     let budget = match answers::before_wake(&store, config.node, &config.state_dir, config.budget)? {
         answers::Before::LeaveStopped(reason) => {
@@ -232,7 +256,7 @@ pub fn wake(config: Config) -> Result<Woke> {
     let follow = match &config.transcripts {
         Some((projects, sink)) => {
             let mirror = Arc::new(Mirror::new(projects.clone(), sink.clone()));
-            match mirror.restore() {
+            match phase("restore agent transcripts", began, || mirror.restore()) {
                 Ok(0) => {}
                 Ok(n) => tracing::info!(n, "restored agent transcripts"),
                 Err(err) => tracing::warn!("restoring transcripts: {err:#}"),
@@ -251,7 +275,7 @@ pub fn wake(config: Config) -> Result<Woke> {
         context: InterviewContextSettings::default(),
     };
     // From here the autopilot runs: say so to the app, and keep saying it.
-    let beating = beat::Beating::start(replica.clone(), config.node, beat::BEAT_EVERY)?;
+    let beating = phase("first heartbeat", began, || beat::Beating::start(replica.clone(), config.node, beat::BEAT_EVERY))?;
     let mut agent = Guarded::new(
         Syncing::new(config.agent.provider(&data_root), replica.clone()),
         config.guards.hang_after,
