@@ -1610,7 +1610,20 @@ impl ObligationsView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.search_input.update(cx, |input, cx| {
+        // The binding covers every input on this surface, so type the space
+        // into whichever one has focus, not always the search field.
+        if self.inline_edit_input.read(cx).focus_handle(cx).is_focused(window) {
+            self.inline_edit_input.update(cx, |input, cx| {
+                input.insert(" ", window, cx);
+            });
+            return;
+        }
+        let target = if self.section_edit_input.read(cx).focus_handle(cx).is_focused(window) {
+            &self.section_edit_input
+        } else {
+            &self.search_input
+        };
+        target.update(cx, |input, cx| {
             input.insert(" ", window, cx);
         });
     }
