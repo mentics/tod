@@ -168,6 +168,17 @@ impl DataSource for LinearDataSource {
     }
 
     fn validate_config(&self, config: &serde_json::Value) -> Result<(), DataSourceError> {
+        // `_`-prefixed names are the form's schema placeholders, never stored.
+        if let Some(bad) = config
+            .as_object()
+            .and_then(|obj| obj.keys().find(|key| key.starts_with('_')))
+        {
+            return Err(DataSourceError::InvalidConfig(format!(
+                "Unknown config key \"{bad}\". Valid keys: {}, {}, result_cap, workspace_slug, or an IssueFilter field (team, state, assignee, labels, ...)",
+                crate::linear_query::QUERY_KEY,
+                crate::linear_sort::SORT_KEY,
+            )));
+        }
         if let Some(text) = config.get(crate::linear_sort::SORT_KEY).and_then(|v| v.as_str()) {
             crate::linear_sort::parse(text)
                 .map_err(|e| DataSourceError::InvalidConfig(format!("Sort: {e}")))?;
@@ -1291,6 +1302,19 @@ mod tests {
     fn display_name_is_linear_tickets() {
         let ds = LinearDataSource::new();
         assert_eq!(ds.display_name(), "Linear Tickets");
+    }
+
+    #[test]
+    fn validate_config_refuses_unknown_placeholder_keys() {
+        let ds = LinearDataSource::new();
+        let err = ds
+            .validate_config(&serde_json::json!({"_linear_filters": "x"}))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("_linear_filters") && err.contains("filter_query") && err.contains("result_cap"));
+        assert!(ds
+            .validate_config(&serde_json::json!({"filter_query": "team:TOD", "result_cap": 5}))
+            .is_ok());
     }
 
     #[test]

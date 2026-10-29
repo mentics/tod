@@ -127,10 +127,14 @@ fn show_error_toast(
     message: SharedString,
     action: Option<(SharedString, Rc<dyn Fn(&mut Window, &mut App)>)>,
 ) {
+    // The log panel keeps the message, so a banner with nothing to click goes
+    // away on its own instead of sitting over the panel's buttons; one with an
+    // action stays until it is used or closed.
+    let autohide = action.is_none();
     window.push_notification(
         Notification::new()
             .id::<ErrorBannerNotification>()
-            .autohide(false)
+            .autohide(autohide)
             .bg(gpui::hsla(0., 0., 0., 0.))
             .border_0()
             .shadow_none()

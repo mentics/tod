@@ -538,6 +538,10 @@ pub struct TaskEditView {
     /// Capabilities as last persisted.
     generator_accept_capabilities_saved: Vec<Capability>,
     generator_accept_error: Option<String>,
+    /// Title of the node the destination's Files would come from, when the
+    /// destination (or an ancestor) already has Files: accepted copies then
+    /// inherit it and the Files chip does nothing.
+    generator_accept_files_inherited_from: Option<String>,
     /// Why the last change to the Groups setting failed.
     groups_error: Option<String>,
     generator_accept_busy: bool,
@@ -809,6 +813,7 @@ impl TaskEditView {
             _generator_accept_destination_subscription,
             generator_accept_autosave_pending: None,
             _generator_accept_autosave_task: None,
+            generator_accept_files_inherited_from: None,
             generator_accept_capabilities: Vec::new(),
             generator_accept_capabilities_saved: Vec::new(),
             generator_accept_error: None,
@@ -3020,6 +3025,22 @@ impl TaskEditView {
             .to_string();
         self.generator_accept_destination_title = None;
         self.generator_accept_destination_suggestions.clear();
+        self.generator_accept_files_inherited_from = self
+            .resolve_accept_destination(cx)
+            .ok()
+            .flatten()
+            .and_then(|id| {
+                self.fleet
+                    .read(|conn| {
+                        tod_store::outline::mutations::inherited_capability_source(
+                            conn,
+                            id,
+                            Capability::Files,
+                        )
+                    })
+                    .ok()
+                    .flatten()
+            });
         if text.is_empty() {
             cx.notify();
             return;
@@ -5378,6 +5399,7 @@ impl TaskEditView {
         );
 
         let mut chips = h_flex().gap_1().flex_wrap();
+        let inherited_files = self.generator_accept_files_inherited_from.clone();
         for cap in Capability::ALL {
             let checked = self.generator_accept_capabilities.contains(&cap);
             let focused = self.field_nav_focused(TaskEditField::GeneratorAcceptCapability(cap));
@@ -5397,7 +5419,12 @@ impl TaskEditView {
                     })
                     .when(checked, |el| el.bg(cx.theme().list_active))
                     .text_color(if checked { cx.theme().foreground } else { muted })
-                    .child(cap.label())
+                    .child(match (&inherited_files, cap) {
+                        (Some(from), Capability::Files) => {
+                            format!("{} (inherited from {from})", cap.label())
+                        }
+                        _ => cap.label().to_string(),
+                    })
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, _, _, cx| {

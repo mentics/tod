@@ -2306,6 +2306,54 @@ fn accept_generated_ticket_copies_to_destination_and_enables_capabilities() {
     let _ = fs::remove_dir_all(root);
 }
 
+/// Ticking Files in the quick-accept chips must not give the copy an empty
+/// Files of its own when the destination already provides one: that would
+/// override the inherited location. Without a provider it enables as before.
+#[test]
+fn accept_generated_ticket_keeps_inheriting_files_from_the_destination() {
+    for destination_has_files in [true, false] {
+        let (store, root, list_id) = setup_store_with_list();
+        let (generator_id, managed_id, _child) = setup_generator_with_managed_tree(&store, list_id);
+        let destination = create_node_in(&store, list_id, None, "Accepted work");
+        if destination_has_files {
+            store
+                .enqueue_outline(OutlineMutation::EnableCapabilities {
+                    node_id: destination,
+                    capabilities: vec![Capability::Files],
+                })
+                .unwrap();
+            store.writer().flush().unwrap();
+        }
+        store
+            .enqueue_outline(OutlineMutation::SetGeneratorAcceptConfig {
+                node_id: generator_id,
+                destination_node_id: Some(destination),
+                capabilities: vec![Capability::Files, Capability::Spec],
+            })
+            .unwrap();
+        let new_node_id = Uuid::new_v4();
+        store
+            .enqueue_outline(OutlineMutation::AcceptGeneratedTicket {
+                source_node_id: managed_id,
+                new_node_id,
+            })
+            .unwrap();
+        store.writer().flush().unwrap();
+        store
+            .read(|conn| {
+                let caps = crate::outline::repos::NodeRepo::new(conn)
+                    .list_capabilities(new_node_id)
+                    .unwrap();
+                assert_eq!(caps.contains(&Capability::Files), !destination_has_files);
+                assert!(caps.contains(&Capability::Spec));
+                Ok(())
+            })
+            .unwrap();
+        drop(store);
+        let _ = fs::remove_dir_all(root);
+    }
+}
+
 #[test]
 fn paste_managed_node_copy_blocked_inside_generator_subtree() {
     let (store, root, list_id) = setup_store_with_list();

@@ -21,6 +21,9 @@ defaults; generator and lifecycle cannot both be on. `set` changes only the
 settings you pass (an empty value clears one; `--pr` replaces the whole
 list) and needs the capability enabled first. A node is at most one ticket:
 `--ticket` replaces it, and related tickets go in the node's notes.
+A Linear generator's `--config` reads `filter_query` (the filter text),
+`sort_query`, and `result_cap`; a key starting with `_` is refused with the
+valid keys named.
 Refreshing a generator updates every node that is one of its tickets,
 wherever that node came from.
 

@@ -1817,11 +1817,37 @@ fn accept_generated_ticket(
         Some(new_node_id),
     )?;
 
-    if !config.accept_capabilities.is_empty() {
-        NodeRepo::new(conn).enable_capabilities(new_id, &config.accept_capabilities)?;
+    // A copy that enables Files itself would override the location the
+    // destination (or an ancestor) already gives it with an empty one; it
+    // keeps inheriting instead (doc/files-locations.md).
+    let provider = inherited_capability_source(conn, destination, Capability::Files)?;
+    let caps: Vec<Capability> = config
+        .accept_capabilities
+        .iter()
+        .copied()
+        .filter(|cap| !(*cap == Capability::Files && provider.is_some()))
+        .collect();
+    if !caps.is_empty() {
+        NodeRepo::new(conn).enable_capabilities(new_id, &caps)?;
     }
 
     Ok(Some(new_id))
+}
+
+/// Title of the nearest node, from `parent` up, that has `cap` enabled: what
+/// a child of `parent` would inherit it from.
+pub fn inherited_capability_source(
+    conn: &Connection,
+    parent: Uuid,
+    cap: Capability,
+) -> Result<Option<String>> {
+    let repo = NodeRepo::new(conn);
+    for id in super::ancestor_chain(conn, parent)?.into_iter().rev() {
+        if repo.list_capabilities(id)?.contains(&cap) {
+            return Ok(Some(repo.get(id)?.map(|n| n.title).unwrap_or_default()));
+        }
+    }
+    Ok(None)
 }
 
 /// Give `new_id` the capabilities of `source_id` and their settings. What a
