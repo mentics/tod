@@ -131,10 +131,7 @@ fn run(service: Arc<Service>) {
             Ok(Some((id, node, request))) => {
                 let (service, tunnels, orch, user) = (service.clone(), tunnels.clone(), orch.clone(), user.clone());
                 let spawned = std::thread::Builder::new().name("db-broker-request".into()).spawn(move || {
-                    let reply = match answer(&service, &tunnels, &node, &request) {
-                        Ok(v) => v,
-                        Err(err) => json!({"ok": false, "error": format!("{err:#}")}),
-                    };
+                    let reply = reply_for(answer(&service, &tunnels, &node, &request));
                     if let Err(err) = orch.broker_reply(&user, id, &reply) {
                         tracing::warn!("database broker: could not send the reply for request {id}: {err:#}");
                     }
@@ -153,6 +150,30 @@ fn run(service: Arc<Service>) {
     }
 }
 
+/// The node is not one this machine runs. Not a failure: the user may have
+/// other tod apps (other data roots) on other machines or this one, and the
+/// orchestrator offers the request to each of them, so this is answered as
+/// `not_mine` and the orchestrator reports an error only if none claims it.
+#[derive(Debug)]
+struct NotMine;
+
+impl std::fmt::Display for NotMine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "not a cloud node this machine knows")
+    }
+}
+
+impl std::error::Error for NotMine {}
+
+/// The reply to send for `answer`'s outcome.
+fn reply_for(outcome: Result<Value>) -> Value {
+    match outcome {
+        Ok(v) => v,
+        Err(err) if err.downcast_ref::<NotMine>().is_some() => json!({"ok": false, "not_mine": true}),
+        Err(err) => json!({"ok": false, "error": format!("{err:#}")}),
+    }
+}
+
 /// One request's reply. The request is `{"op": "list" | "token" | "touch", "name": …}`.
 fn answer(service: &Service, tunnels: &Tunnels, node: &str, request: &Value) -> Result<Value> {
     let dbs = (service.databases)()?;
@@ -167,7 +188,7 @@ fn answer(service: &Service, tunnels: &Tunnels, node: &str, request: &Value) -> 
         anyhow!("no database named {name:?} is set up on the user's machine (it has: {})", known.join(", "))
     })?;
     // Only a node this machine knows to run in a sandbox of its own.
-    let sandbox = (service.sandbox_of)(node).ok_or_else(|| anyhow!("node {node} is not a cloud node this machine knows"))?;
+    let sandbox = (service.sandbox_of)(node).ok_or(NotMine)?;
     tunnels.ensure(&service.root, &sandbox, db.forward())?;
     match op {
         "touch" => Ok(json!({"ok": true})),
@@ -268,6 +289,9 @@ mod tests {
         assert!(format!("{unknown_db:#}").contains("no database named"), "{unknown_db:#}");
         let unknown_node = answer(&svc, &tunnels, "stranger", &json!({"op": "token", "name": "prod"})).unwrap_err();
         assert!(format!("{unknown_node:#}").contains("not a cloud node"), "{unknown_node:#}");
+        // Declined, not failed: another of the user's apps may run it.
+        assert_eq!(reply_for(Err(unknown_node)), json!({"ok": false, "not_mine": true}));
+        assert_eq!(reply_for(Err(anyhow!("boom")))["error"], "boom");
         let no_name = answer(&svc, &tunnels, "known", &json!({"op": "token"})).unwrap_err();
         assert!(format!("{no_name:#}").contains("names no database"));
     }

@@ -91,13 +91,20 @@ machine is off, or tod is not running). The orchestrator sees the reply, which
 carries the token. It is already the system of record for the user's
 database and is reached only through the sandboxes' proxy.
 
+A user may run several tod apps (each data root is a machine, named by its
+`X-Tod-Client`). The broker offers every request to every connected machine; one
+that does not know the node replies `not_mine`, which only declines. The first
+real reply wins, and only when every connected machine has declined does the
+caller get an error, naming how many machines were asked.
+
 ### The daemon (`tod_core::db_broker`, run by `tod-agentd`)
 
 Holds a 25 s long poll on the broker while any `[[database]]` is declared.
 For each request it:
 
 1. answers only a **declared database** and only for a **node it knows runs in
-   its own cloud sandbox** (`cloud_nodes`); anything else is an error reply,
+   its own cloud sandbox** (`cloud_nodes`); an unknown node is answered
+   `not_mine` (not an error), anything else is an error reply,
 2. opens the forward on that node's sandbox (`tod_sandbox::hold`), waiting
    until the relay is listening: the tunnel is held while the node keeps
    asking and closed 10 minutes after the last request, so an idle sandbox

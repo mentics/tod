@@ -228,7 +228,7 @@ impl Server {
                     }
                     ("POST", ["broker", "request"]) => self.broker.request(&user, request),
                     ("GET", ["broker", "next"]) => self.broker.next(&user, request),
-                    ("POST", ["broker", "reply", id]) => self.broker.reply(&user, id, &request.body),
+                    ("POST", ["broker", "reply", id]) => self.broker.reply(&user, id, request),
                     ("GET", ["notify"]) => self.notify_topics(&user),
                     ("GET" | "PUT", ["github-routes"]) => self.github_routes(&user, request),
                     ("GET", ["snapshot"]) => match self.users.get(&user) {
