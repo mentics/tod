@@ -913,6 +913,57 @@ fn pr_review_never_opens_a_pull_request() {
 }
 
 #[test]
+fn pr_runs_its_agent_on_every_stay_even_with_a_pull_request_and_no_work() {
+    // `pr` gets the draft ready for review: a linked pull request that shows
+    // no work still gets the agent's turn (the phase's skills apply), once per
+    // stay, and the run then moves on to the gate.
+    let fx = setup();
+    retire_outside_criteria(&fx);
+    struct Clean;
+    impl crate::pr_readiness::PrFeed for Clean {
+        fn snapshot(&self, _: &tod_store::github::NodePr) -> Result<tod_store::github::PrSnapshot, String> {
+            use tod_store::github::{PrSnapshot, PrStatus};
+            Ok(PrSnapshot {
+                status: PrStatus {
+                    mergeable: Some(true),
+                    mergeable_state: Some("blocked".into()),
+                    checks: Some("success".into()),
+                    head_sha: Some("abcdef1".into()),
+                    head_committed_at: Some("2020-01-01T00:00:00Z".into()),
+                    draft: true,
+                    open: true,
+                    ..Default::default()
+                },
+                threads: vec![],
+                comments: vec![],
+                reviews: vec![],
+            })
+        }
+        fn comment(&self, _: &tod_store::github::NodePr, _: &str) -> Result<(), String> {
+            Ok(())
+        }
+    }
+    crate::pr_readiness::set_feed_override(Some(Arc::new(Clean)));
+    linked_to_prs(&fx, "pr", &["https://github.com/acme/app/pull/42"]);
+    let mut agent = FakeAgent::new(&fx.fleet);
+    let mut pilot = autopilot(&fx, Budget::default()).with_pr_poll_interval(Duration::ZERO);
+    let outcome = pilot.run(&fx.fleet, &mut agent).unwrap();
+    assert_eq!(agent.turns, 1, "{outcome:?}");
+    assert!(!matches!(outcome, Outcome::NeedsHuman { reason: NeedsHuman::PrBlocked { .. } }), "{outcome:?}");
+
+    // Run again in the same stay: the agent is not sent again.
+    let mut again = autopilot(&fx, Budget::default()).with_pr_poll_interval(Duration::ZERO);
+    again.run(&fx.fleet, &mut agent).unwrap();
+    assert_eq!(agent.turns, 1);
+
+    // A new session was asked for: it goes out again.
+    super::AutopilotState::request_fresh_session(&fx.root, fx.node).unwrap();
+    let mut fresh = autopilot(&fx, Budget::default()).with_pr_poll_interval(Duration::ZERO);
+    fresh.run(&fx.fleet, &mut agent).unwrap();
+    assert_eq!(agent.turns, 2);
+}
+
+#[test]
 fn a_pull_request_waiting_for_a_person_ends_the_run_with_a_timed_wait() {
     let fx = setup();
     retire_outside_criteria(&fx);
@@ -979,6 +1030,7 @@ fn the_wait_for_a_person_records_who_was_asked_to_review() {
                     head_sha: Some("abcdef1".into()),
                     head_committed_at: Some("2020-01-01T00:00:00Z".into()),
                     reviewers: vec!["maria".into(), "acme/core".into()],
+                    open: true,
                     ..Default::default()
                 },
                 threads: vec![],

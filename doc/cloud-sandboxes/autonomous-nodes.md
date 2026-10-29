@@ -327,7 +327,11 @@ an empty `fresh-session` file into the node's supervisor state directory
 takes the file as it wakes, a running one at its next poll (cancelling the
 turn in flight). Either way the autopilot drops its current conversation and
 the step runs in a new one (`Autopilot::start_fresh_session`). A node still
-waiting or holding a pending decision stays so: the request waits with it.
+holding a pending decision stays so. A node that is waiting (on GitHub, say)
+runs anyway: the request skips the supervisor's "still waiting" return, and the
+run looks again and records whatever it still waits on. In `pr` that means its
+agent takes a turn before the wait for a person to review is recorded
+(`doc/lifecycle/pr-readiness.md`).
 
 **A wake is a poke, never an instruction.** Whether it comes from a schedule,
 a webhook, a user's answer, or a change to its context, the supervisor asks

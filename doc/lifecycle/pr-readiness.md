@@ -3,8 +3,18 @@
 Status: implemented, with the differences listed under "As built". Extends
 the `pr` state in [phase-agents.md](phase-agents.md).
 
-**Split into two states.** Everything below used to happen in `pr`. It now
-happens in `pr_review`, and `pr` is only the draft:
+**Two states.** The babysitter runs in both:
+
+- In `pr` it gets the draft ready *before* a person looks: the PR agent takes
+  at least one turn in every stay in `pr` (so its configured skills apply,
+  even when the PR already exists and GitHub shows no work), then the same
+  loop as `pr_review` clears checks, branch drift, threads, and bot scores. A
+  wait for the human review ends the run's work there (it is the goal), and
+  the gate asks that a person has been put on it. "Run with a new session"
+  forces a fresh turn.
+- In `pr_review` it answers the human reviewer's feedback.
+
+The two states, as they were split:
 
 - `pr`: the agent opens the pull request as a **draft** (`tod-cli pr open`;
   the project's own skill for it goes under the `pr` phase in Lifecycle
