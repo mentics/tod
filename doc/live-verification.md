@@ -50,3 +50,18 @@ click before the next one (dialogs animate).
 Walk the accepted node one lifecycle step at a time. On any failure: write a
 short repro, hand it to a sub-agent in its own worktree to fix with a
 regression test, merge, rebuild, relaunch, and rerun from the failing step.
+
+## Gotchas found on the first run
+
+- **Stale daemons answer for you.** `tod-agentd` hosts the database broker and
+  outlives its app. Every data root whose `sandboxes.toml` declares a
+  `[[database]]` runs one, and the orchestrator offers a request to each. A
+  daemon from an older build (your real root's, another worktree's) answers a
+  node it does not own with a final error. Before testing `tod-cli db`, list
+  them (`ps aux | grep tod-agentd`) and stop the old ones.
+- **Sandbox binaries.** `tod-sandbox orchestrator` takes the newest
+  `sandbox/<name>` above the executable; never leave a copy in
+  `target/debug/sandbox`. Pass `--bin target/sandbox/tod-orchestrator` to be sure.
+- **Testing `tod-cli db` by hand.** A plain shell lacks `TOD_ORCHESTRATOR_CLI_URL`
+  (`<orchestrator>/port/8090/cli`), `TOD_USER` and `TOD_NODE`; set all three.
+- The node's `Needs access` plan step needs **Retry** once access works.
