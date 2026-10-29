@@ -311,7 +311,11 @@ pub fn wake(config: Config) -> Result<Woke> {
     let status = waits::check(&store, config.node, &config.workspace)?;
     // What `check` settled or moved goes up before anything else.
     replica.lock().unwrap_or_else(|e| e.into_inner()).push()?;
-    if let waits::WaitStatus::Waiting { reason } = status {
+    // A request for a new session is a request to run now: what the node
+    // waits on is looked at again by the run, which records it afresh.
+    if let waits::WaitStatus::Waiting { reason } = status
+        && !fresh_requested(&config.state_dir)
+    {
         schedule(&store, &config)?;
         tracing::info!(%reason, "still waiting; going back to sleep");
         return Ok(Woke::StillWaiting(reason));

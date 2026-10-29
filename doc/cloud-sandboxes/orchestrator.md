@@ -134,12 +134,11 @@ Each pass:
 
 1. Lists the workspace's sandboxes and keeps the deployed node ones
    (`tod-kind=node`, or a fork of a base known by its `TOD_USER` and
-   `TOD_NODE`), whatever state Blaxel reports. The control plane's `state`
-   cannot be used to skip sleeping ones: a sandbox held awake by the relay's
-   `keepAlive` process read `STANDBY` in all 30 samples over 10 minutes
-   while its VM ran without a pause (2026-09-28), and the first deployed
-   job skipped it for that. Asking one that is really asleep wakes it for
-   that one request.
+   `TOD_NODE`), except those whose listed `state` is `STANDBY`: asleep and
+   held by nothing, so asking would wake them. A sandbox held awake by the
+   relay's `keepAlive` process is `RUNNING` (checked 2026-10-28; the
+   2026-09-28 reading of `STANDBY` for one no longer holds). A sandbox with
+   no `state` is asked.
 2. Asks each one's relay what holds it (`GET /holds`, see
    `relay-protocol.md`).
 3. Judges it over its lease when it has been held continuously for more

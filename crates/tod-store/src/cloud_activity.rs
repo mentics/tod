@@ -10,8 +10,11 @@
 //!
 //! - a row whose `heartbeat_at` is fresh ([`CloudBeat::is_live`]) means the
 //!   supervisor is at work on the node, as far as the app can tell;
-//! - a row that has stopped beating and was never deleted means the
-//!   supervisor (or its sandbox) died mid-run.
+//! - a row that has stopped beating and was not marked [`idle`] means the
+//!   supervisor (or its sandbox) died mid-run;
+//! - an [`idle`] row means the supervisor woke and went back to sleep (its
+//!   `heartbeat_at` says when), which is how the app hears of a wake that
+//!   found only a wait.
 //!
 //! The app compares `heartbeat_at` with its own clock, so the window is wide
 //! ([`STALE_AFTER_MS`]) to absorb clock skew and the lag of a sync.
@@ -57,10 +60,21 @@ pub struct CloudBeat {
     pub what: String,
 }
 
+/// What a run that ended leaves in `what`: the supervisor woke, did what
+/// there was to do (often nothing: the node waits on something outside), and
+/// went back to sleep. The row is kept rather than deleted, so a wake that
+/// came and went between two syncs is still heard by the app.
+pub const IDLE_WHAT: &str = "idle";
+
 impl CloudBeat {
     /// The supervisor said it was working recently enough to still be.
     pub fn is_live(&self, now_ms: i64) -> bool {
-        now_ms - self.heartbeat_at <= STALE_AFTER_MS
+        !self.is_idle() && now_ms - self.heartbeat_at <= STALE_AFTER_MS
+    }
+
+    /// The last run ended ([`idle`]); the supervisor is asleep, not lost.
+    pub fn is_idle(&self) -> bool {
+        self.what == IDLE_WHAT
     }
 }
 
@@ -81,7 +95,13 @@ pub fn beat(conn: &Connection, node: Uuid, what: &str, now_ms: i64) -> Result<()
     Ok(())
 }
 
-/// The run stopped: drops the row.
+/// The run ended and the supervisor is going back to sleep: keeps the row,
+/// stamped now, as [`IDLE_WHAT`]. Not a heartbeat of work, and never stale.
+pub fn idle(conn: &Connection, node: Uuid, now_ms: i64) -> Result<()> {
+    beat(conn, node, IDLE_WHAT, now_ms)
+}
+
+/// The node left the cloud: drops the row.
 pub fn end(conn: &Connection, node: Uuid) -> Result<()> {
     conn.execute("DELETE FROM cloud_activity WHERE node_id = ?1", params![uuid_to_blob(node)])?;
     Ok(())

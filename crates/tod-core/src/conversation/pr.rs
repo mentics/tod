@@ -207,18 +207,6 @@ impl Protocol for PrProtocol {
         }
         let node = node_id(turn.env)?;
         let prs = turn.env.fleet.read(|conn| NodePrRepo::new(conn).read(node))?.prs;
-        // In `pr` the job is the draft: once it is linked there is nothing
-        // more for the agent (feedback comes after a person is asked to
-        // review, in `pr_review`).
-        let lifecycle = turn
-            .env
-            .fleet
-            .get_node(&node.to_string())?
-            .map(|n| n.lifecycle)
-            .unwrap_or_default();
-        if lifecycle == "pr" && !prs.is_empty() {
-            return Ok(Next::Done(Stop::Complete));
-        }
         let Some(live) = live_prs(turn.env.data_root, &prs) else {
             return Ok(Next::Done(Stop::Complete));
         };

@@ -267,6 +267,7 @@ pub fn cloud_status(fleet: &FleetStore, node_id: uuid::Uuid, now_ms: i64) -> Opt
         return Some(if deleted { CloudStatus::Deleted } else { CloudStatus::Lost });
     }
     Some(match beat {
+        Some(b) if b.is_idle() => CloudStatus::Idle,
         Some(b) if b.is_live(now_ms) => CloudStatus::Working { heard_at: b.heartbeat_at, what: b.what },
         Some(b) => CloudStatus::Silent { heard_at: b.heartbeat_at, what: b.what },
         None => CloudStatus::Idle,
@@ -1464,12 +1465,22 @@ pub struct Started {
 
 /// Whether the cloud side has told this app anything about `node` since it
 /// was sent: a heartbeat is there now, or `report` carried a change to it.
-fn supervisor_heard(fleet: &FleetStore, node: uuid::Uuid, report: &SyncReport) -> Result<bool> {
+///
+/// A row left by an earlier run does not count: it must be stamped at or
+/// after `since_ms` (less [`CLOCK_SKEW_MS`]). A run that only found the node
+/// waiting leaves an idle row (`cloud_activity::idle`), which is a report.
+fn supervisor_heard(fleet: &FleetStore, node: uuid::Uuid, report: &SyncReport, since_ms: i64) -> Result<bool> {
     if report.heard_from.contains(&node) {
         return Ok(true);
     }
-    fleet.read(|conn| Ok(tod_store::cloud_activity::get(conn, node)?.is_some()))
+    fleet.read(|conn| {
+        Ok(tod_store::cloud_activity::get(conn, node)?.is_some_and(|b| b.heartbeat_at >= since_ms - CLOCK_SKEW_MS))
+    })
 }
+
+/// How far the sandbox's clock may be behind this machine's when comparing
+/// a heartbeat's stamp with when the node was sent.
+const CLOCK_SKEW_MS: i64 = 30_000;
 
 /// [`run_in_cloud`] as the user's click means it: from the first moment the
 /// node holds an activity lease (`KIND_CLOUD_START`), so it shows as being
@@ -1488,8 +1499,9 @@ pub fn start_in_cloud(
     let node: uuid::Uuid = node_id.parse().context("node id")?;
     let owner = crate::next_actor::this_process();
     tod_store::activity::with_lease(fleet, node, tod_store::activity::KIND_CLOUD_START, &owner, || {
+        let since = tod_store::outline::uuid_blob::now_ms();
         let (record, report) = run_in_cloud_reporting(fleet, root, node_id, progress)?;
-        let heard = wait_for_supervisor(fleet, root, node, report, progress)?;
+        let heard = wait_for_supervisor(fleet, root, node, report, since, progress)?;
         Ok(Started { node: record, heard })
     })?
 }
@@ -1518,8 +1530,9 @@ pub fn wake_node_tracked_with(
     let node: uuid::Uuid = node_id.parse().context("node id")?;
     let owner = crate::next_actor::this_process();
     tod_store::activity::with_lease(fleet, node, tod_store::activity::KIND_CLOUD_START, &owner, || {
+        let since = tod_store::outline::uuid_blob::now_ms();
         let said = wake_node_with(fleet, root, node_id, fresh_session)?;
-        let heard = wait_for_supervisor(fleet, root, node, SyncReport::default(), progress)?;
+        let heard = wait_for_supervisor(fleet, root, node, SyncReport::default(), since, progress)?;
         Ok((said, heard))
     })?
 }
@@ -1532,12 +1545,13 @@ fn wait_for_supervisor(
     root: &Path,
     node: uuid::Uuid,
     mut report: SyncReport,
+    since_ms: i64,
     progress: &mut dyn FnMut(&str),
 ) -> Result<bool> {
     let deadline = std::time::Instant::now() + SUPERVISOR_REPORTS_WITHIN;
     progress("waiting to hear from the node's supervisor…");
     loop {
-        if supervisor_heard(fleet, node, &report)? {
+        if supervisor_heard(fleet, node, &report, since_ms)? {
             return Ok(true);
         }
         if std::time::Instant::now() >= deadline {

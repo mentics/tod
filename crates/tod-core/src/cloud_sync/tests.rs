@@ -228,7 +228,7 @@ fn a_cloud_nodes_heartbeat_reaches_the_app_and_it_shows_as_working() {
     }
 
     // The run ends; the app is told, and the node no longer claims to work.
-    tod_store::cloud_activity::end(&connect(copy.paths().db()).unwrap(), node).unwrap();
+    tod_store::cloud_activity::idle(&connect(copy.paths().db()).unwrap(), node, now + 1).unwrap();
     push(pushed);
     while told.try_recv().is_ok() {}
     sync(&app, &root, &orch, "alice").unwrap();
@@ -512,15 +512,27 @@ fn a_supervisor_is_heard_from_by_a_change_to_the_node_or_by_its_heartbeat() {
     fleet.writer().flush().unwrap();
     fleet.reload_if_stale().unwrap();
 
-    assert!(!supervisor_heard(&fleet, node, &SyncReport::default()).unwrap(), "silence is not a report");
+    let sent = 1_000_000;
+    assert!(!supervisor_heard(&fleet, node, &SyncReport::default(), sent).unwrap(), "silence is not a report");
     let other = SyncReport { heard_from: [uuid::Uuid::new_v4()].into(), ..Default::default() };
-    assert!(!supervisor_heard(&fleet, node, &other).unwrap(), "another node's change is not this one's");
+    assert!(!supervisor_heard(&fleet, node, &other, sent).unwrap(), "another node's change is not this one's");
     let this = SyncReport { heard_from: [node].into(), ..Default::default() };
-    assert!(supervisor_heard(&fleet, node, &this).unwrap());
+    assert!(supervisor_heard(&fleet, node, &this, sent).unwrap());
 
-    tod_store::cloud_activity::beat(&connect(fleet.paths().db()).unwrap(), node, "active", 1).unwrap();
+    let db = connect(fleet.paths().db()).unwrap();
+    tod_store::cloud_activity::beat(&db, node, "active", sent - 10 * CLOCK_SKEW_MS).unwrap();
     fleet.reload_if_stale().unwrap();
-    assert!(supervisor_heard(&fleet, node, &SyncReport::default()).unwrap(), "a heartbeat row is a report");
+    assert!(
+        !supervisor_heard(&fleet, node, &SyncReport::default(), sent).unwrap(),
+        "a heartbeat from an earlier run is not a report of this one"
+    );
+    tod_store::cloud_activity::beat(&db, node, "active", sent).unwrap();
+    fleet.reload_if_stale().unwrap();
+    assert!(supervisor_heard(&fleet, node, &SyncReport::default(), sent).unwrap(), "a heartbeat row is a report");
+    // A wake that only found a wait ended before the app looked: still heard.
+    tod_store::cloud_activity::idle(&db, node, sent + 5).unwrap();
+    fleet.reload_if_stale().unwrap();
+    assert!(supervisor_heard(&fleet, node, &SyncReport::default(), sent).unwrap(), "an idle row is a report");
     let _ = std::fs::remove_dir_all(&root);
 }
 

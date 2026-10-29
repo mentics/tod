@@ -408,7 +408,11 @@ impl Autopilot {
                 });
             }
             // `approved` waits for the merge and `merged` for the release.
-            if let Some(outcome) = self.hold_for_github(fleet, &lifecycle)? {
+            // `pr` waits for a person to take the draft too, but only after
+            // its agent has got it ready ([`Self::gate`]).
+            if lifecycle != "pr"
+                && let Some(outcome) = self.hold_for_github(fleet, &lifecycle)?
+            {
                 hook.waiting(None, None);
                 return self.finish(outcome);
             }
@@ -472,9 +476,19 @@ impl Autopilot {
         {
             return Ok(Some(outcome));
         }
-        if from == "pr_review"
-            && let Some(outcome) = self.babysit(fleet, agent, hook)?
+        // Both states get the pull request in order; `pr` stops short of
+        // waiting on a human (it is what gets it ready for one).
+        if (from == "pr" || from == "pr_review")
+            && let Some(outcome) = self.babysit(fleet, agent, hook, from == "pr")?
         {
+            return Ok(Some(outcome));
+        }
+        // The pull request is as ready as the agent can make it: now wait for
+        // a person to mark it ready and review it.
+        if from == "pr"
+            && let Some(outcome) = self.hold_for_github(fleet, from)?
+        {
+            hook.waiting(None, None);
             return Ok(Some(outcome));
         }
         let gate = settle_gate(fleet, self.node)?;
@@ -592,9 +606,9 @@ impl Autopilot {
     }
 
     /// Have the pull request's agent open the node's draft pull request if it
-    /// has none: the `pr` state's work. `None` once one is linked (or already
-    /// was), so the gate checks it; the pull request is not driven from here,
-    /// that is `pr_review`'s ([`Self::babysit`]).
+    /// has none: the first of the `pr` state's work. `None` once one is linked
+    /// (or already was); the pull request is then got ready by
+    /// [`Self::babysit`].
     fn open_draft_pr<A: AgentAccess + ?Sized, H: StepHook + ?Sized>(
         &mut self,
         fleet: &FleetStore,
@@ -639,15 +653,28 @@ impl Autopilot {
     /// `None` when the pull request is clear (or cannot be read: the gate
     /// says why), so the gate checks it. What is left after that, a human
     /// review, stops the run at the gate as a request.
+    ///
+    /// `before_review` is the `pr` state, whose job is getting the pull
+    /// request ready for a person to review: the agent takes at least one turn
+    /// in each stay (or when a new session was asked for), since its skills
+    /// and the project's own checks apply even when GitHub shows no work, and
+    /// a wait for the human review is the goal, not something to wait out.
     fn babysit<A: AgentAccess + ?Sized, H: StepHook + ?Sized>(
         &mut self,
         fleet: &FleetStore,
         agent: &mut A,
         hook: &mut H,
+        before_review: bool,
     ) -> Result<Option<Outcome>> {
         use crate::pr_readiness::{self, Next as PrNext, Wait};
         let mut waited_since: Option<std::time::Instant> = None;
         let mut unchanged = 0u32;
+        if before_review && (self.fresh_session || !self.pr_conversation_this_stay(fleet)?) {
+            hook.waiting(None, None);
+            if let Some(outcome) = self.converse(fleet, agent, hook, ProtocolKind::Pr, None)? {
+                return Ok(Some(outcome));
+            }
+        }
         loop {
             if let Some(reason) = hook.at(fleet, Boundary::Step)? {
                 hook.waiting(None, None);
@@ -764,6 +791,11 @@ impl Autopilot {
                     if asked {
                         continue;
                     }
+                    if before_review && waits.iter().all(|w| matches!(w, Wait::HumanReview)) {
+                        // Ready for a person: the gate asks that one is on it.
+                        hook.waiting(None, None);
+                        return Ok(None);
+                    }
                     if waits.iter().any(|w| matches!(w, Wait::HumanReview)) {
                         // Hours or days: the run ends, and is woken at the
                         // time recorded (or by the review's webhook).
@@ -823,6 +855,18 @@ impl Autopilot {
         }
         let due_at_ms = self.record_github_wait(fleet, spec, "github:pr:", settings, &what)?;
         Ok(Outcome::Waiting { what, due_at_ms })
+    }
+
+    /// Whether a pull request conversation has been started in this stay in the
+    /// state.
+    fn pr_conversation_this_stay(&self, fleet: &FleetStore) -> Result<bool> {
+        let node = self.node;
+        fleet.read(|conn| {
+            let since = PhaseRepo::new(conn).stay_started_at(node)?;
+            let conversation = ConversationRepo::new(conn)
+                .latest_for_focus_with_protocol(Focus::Node(node), ProtocolKind::Pr)?;
+            Ok(conversation.is_some_and(|c| since.is_none_or(|since| c.created_at >= since)))
+        })
     }
 
     /// The pull request conversation of this stay in `pr`, to send it the
