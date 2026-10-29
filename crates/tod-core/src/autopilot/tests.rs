@@ -1456,6 +1456,51 @@ fn check_now_in_pr_waits_for_the_draft_to_be_ready_and_reviewed() {
 }
 
 #[test]
+fn check_now_in_pr_sends_new_changes_requested_to_the_agent_even_on_a_draft() {
+    use tod_store::github::{PrReview, PrSnapshot, PrStatus};
+    struct Feed(PrSnapshot);
+    impl crate::pr_readiness::PrFeed for Feed {
+        fn snapshot(&self, _: &tod_store::github::NodePr) -> Result<PrSnapshot, String> {
+            Ok(self.0.clone())
+        }
+        fn comment(&self, _: &tod_store::github::NodePr, _: &str) -> Result<(), String> {
+            Ok(())
+        }
+    }
+    let fx = bare();
+    retire_outside_criteria(&fx);
+    let status = PrStatus {
+        mergeable: Some(true),
+        mergeable_state: Some("blocked".into()),
+        merged: false,
+        checks: None,
+        head_sha: None,
+        head_committed_at: Some("2026-01-01T09:00:00Z".into()),
+        draft: true,
+        open: true,
+        reviewers: Vec::new(),
+        base_ref: None,
+        body: None,
+    };
+    crate::pr_readiness::set_feed_override(Some(Arc::new(Feed(PrSnapshot {
+        status,
+        threads: vec![],
+        comments: vec![],
+        reviews: vec![PrReview {
+            author: Some("alice".into()),
+            submitted_at: "2026-01-01T10:00:00Z".into(),
+            state: "CHANGES_REQUESTED".into(),
+        }],
+    }))));
+    linked_to_prs(&fx, "pr", &["https://github.com/acme/app/pull/42"]);
+
+    let found = super::check_now(&fx.fleet, fx.node, &fx.root).unwrap();
+    let super::GithubCheck::Feedback { what } = found else { panic!("expected Feedback, got {found:?}") };
+    assert!(what.contains("changes requested"), "{what}");
+    assert!(pending_specs(&fx).is_empty(), "the agent goes on, so nothing is waited for");
+}
+
+#[test]
 fn check_now_in_pr_clears_a_leftover_review_wait_and_ignores_a_bot_reviewer() {
     use tod_store::github::{PrSnapshot, PrStatus};
     struct Feed(PrSnapshot);

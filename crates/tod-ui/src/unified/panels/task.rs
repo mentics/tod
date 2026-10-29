@@ -955,7 +955,7 @@ impl TaskPanel {
                 .spawn(async move {
                     let found = tod_core::autopilot::check_now(&fleet, node, &root)?;
                     let woke = match (&found, in_cloud) {
-                        (tod_core::autopilot::GithubCheck::Clear, true) => Some(
+                        (tod_core::autopilot::GithubCheck::Clear | tod_core::autopilot::GithubCheck::Feedback { .. }, true) => Some(
                             tod_core::cloud_sync::wake_node_tracked(&fleet, &root, &node.to_string(), &mut |_| {}),
                         ),
                         _ => None,
@@ -967,6 +967,16 @@ impl TaskPanel {
                 use tod_core::autopilot::GithubCheck;
                 let (note, failed) = match result {
                     Ok((GithubCheck::Waiting { what, .. }, _)) => (format!("Checked GitHub: waiting for {what}"), false),
+                    Ok((GithubCheck::Feedback { what }, woke)) => match woke {
+                        Some(Err(err)) => (format!("Checked GitHub: {what}, but waking the cloud node failed: {err:#}"), true),
+                        Some(Ok(_)) => (format!("Checked GitHub: {what}; its agent is on it."), false),
+                        None => {
+                            if !this.runners.read(cx).is_running(node) {
+                                let _ = this.runners.update(cx, |r, cx| r.start(node, false, cx));
+                            }
+                            (format!("Checked GitHub: {what}; its agent is on it."), false)
+                        }
+                    },
                     Ok((GithubCheck::Clear, Some(Ok((done, true))))) => {
                         (format!("Checked GitHub: nothing left to wait for; {done}."), false)
                     }

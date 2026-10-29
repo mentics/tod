@@ -65,6 +65,11 @@ impl GithubGate {
                 Ok(Verdict::Later { id: next.id.to_string(), at: due_at_ms })
             }
             GithubCheck::Clear | GithubCheck::NothingToWaitOn => Ok(Verdict::Poke),
+            // Feedback on the pull request is the node's agent's work: wake it.
+            GithubCheck::Feedback { what } => {
+                eprintln!("tod-orchestrator: {}'s node {node} has feedback to address ({what}); waking its sandbox", wake.user);
+                Ok(Verdict::Poke)
+            }
             GithubCheck::Unreadable(why) => {
                 eprintln!("tod-orchestrator: cannot look at GitHub for {}'s node {node}: {why}; waking its sandbox", wake.user);
                 Ok(Verdict::Poke)

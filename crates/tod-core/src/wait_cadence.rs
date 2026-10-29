@@ -64,10 +64,23 @@ pub fn next_check(now: DateTime<Utc>, schedule: &ReviewSchedule) -> DateTime<Utc
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn by_default_it_looks_every_five_minutes_day_and_night() {
+        let s = ReviewSchedule { utc_offset_minutes: Some(0), ..ReviewSchedule::default() };
+        let at = |s: &str| DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc);
+        assert_eq!(next_check(at("2026-01-01T10:00:00Z"), &s), at("2026-01-01T10:05:00Z"));
+        assert_eq!(next_check(at("2026-01-03T23:00:00Z"), &s), at("2026-01-03T23:05:00Z"));
+    }
+
     use super::*;
 
     fn schedule() -> ReviewSchedule {
-        ReviewSchedule { utc_offset_minutes: Some(0), ..ReviewSchedule::default() }
+        ReviewSchedule {
+            utc_offset_minutes: Some(0),
+            interval_minutes: 90,
+            off_hours_interval_minutes: 720,
+            ..ReviewSchedule::default()
+        }
     }
 
     fn at(s: &str) -> DateTime<Utc> {

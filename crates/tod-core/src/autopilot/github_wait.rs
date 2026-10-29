@@ -56,6 +56,11 @@ pub enum GithubCheck {
     /// Still waiting. `what` says where each pull request stands; the wait
     /// is recorded, with `what`, due at `due_at_ms`.
     Waiting { what: String, due_at_ms: i64 },
+    /// Something on a pull request is for the `pr` agent to answer (a
+    /// person asked for changes, review threads are open, a check failed):
+    /// any open wait is cancelled, and the node goes on to its agent rather
+    /// than waiting out the next look.
+    Feedback { what: String },
     /// GitHub (or the settings) could not be read; nothing was recorded.
     Unreadable(String),
 }
@@ -257,8 +262,10 @@ fn check_ready_for_review(fleet: &FleetStore, node: uuid::Uuid, data_root: &std:
     let Some(feed) = crate::pr_readiness::feed_for(data_root) else {
         return Ok(GithubCheck::Unreadable("GitHub credentials are not set up".to_string()));
     };
+    let settings = crate::pr_readiness::settings_at(data_root);
     let mut pending: Option<(&NodePr, String, &str)> = None;
     let mut standing: Vec<String> = Vec::new();
+    let mut feedback: Vec<String> = Vec::new();
     for pr in &links.prs {
         let label = crate::pr_readiness::pr_label(pr);
         let snapshot = match feed.snapshot(pr) {
@@ -266,6 +273,13 @@ fn check_ready_for_review(fleet: &FleetStore, node: uuid::Uuid, data_root: &std:
             Err(err) => return Ok(GithubCheck::Unreadable(format!("{label} not readable: {err}"))),
         };
         let status = &snapshot.status;
+        // Feedback on the pull request, a draft included, is the agent's
+        // work whether or not a person has taken it yet. Comments that
+        // report no problem (a bot's score above its threshold) are not.
+        let work = crate::pr_readiness::Assessment::of(&snapshot, &settings, chrono::Utc::now()).work();
+        if !work.is_empty() {
+            feedback.push(format!("{label}: {}", work_description(&work)));
+        }
         if crate::gate::derived::ready_for_review(&pr.url, status).is_err() {
             standing.push(format!("{label} still a draft"));
             pending.get_or_insert((pr, format!("{} to be marked ready for review", pr.url), "ready_for_review"));
@@ -276,15 +290,34 @@ fn check_ready_for_review(fleet: &FleetStore, node: uuid::Uuid, data_root: &std:
             standing.push(format!("{label} ready for review"));
         }
     }
+    if !feedback.is_empty() {
+        cancel_github_waits(fleet, node)?;
+        return Ok(GithubCheck::Feedback { what: feedback.join("; ") });
+    }
     let Some((pr, what, event)) = pending else {
         cancel_github_waits(fleet, node)?;
         return Ok(GithubCheck::Clear);
     };
-    let settings = crate::pr_readiness::settings_at(data_root);
     let spec = format!("github:pr:{}:{event}", pr.pr_number);
     let what = if standing.len() > 1 { format!("{what} ({})", standing.join("; ")) } else { what };
     let due_at_ms = record_github_wait(fleet, node, spec, "github:pr:", &settings, &what)?;
     Ok(GithubCheck::Waiting { what, due_at_ms })
+}
+
+/// What `work` asks of the agent, in words.
+fn work_description(work: &[crate::pr_readiness::Work]) -> String {
+    use crate::pr_readiness::Work;
+    work.iter()
+        .map(|w| match w {
+            Work::Threads(n) => format!("{n} open review thread{}", if *n == 1 { "" } else { "s" }),
+            Work::FailingChecks => "failing checks".to_string(),
+            Work::Behind => "behind its base".to_string(),
+            Work::Conflict => "conflicts with its base".to_string(),
+            Work::LowScore { bot, score, min } => format!("{bot} scored it {score} (needs {min})"),
+            Work::ChangesRequested => "changes requested".to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// "Check now": reads GitHub for the node in its current state and records
@@ -310,7 +343,7 @@ impl Autopilot {
             GithubCheck::Unreadable(why) => {
                 Some(github_look_failed(fleet, self.node, lifecycle == "merged", &why)?)
             }
-            GithubCheck::NothingToWaitOn | GithubCheck::Clear => None,
+            GithubCheck::NothingToWaitOn | GithubCheck::Clear | GithubCheck::Feedback { .. } => None,
         })
     }
 
