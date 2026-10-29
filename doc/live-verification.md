@@ -1,5 +1,13 @@
 # Live lifecycle verification
 
+The procedure an agent follows is the `live-verify` skill (text in
+`doc/live-verify-skill.md`, to be installed as
+`.claude/skills/live-verify/SKILL.md`); this page is the setup and the facts.
+Since the first run: the app reinstalls idle node sandboxes whose install
+differs from the build at launch (`cloud_sync::refresh`), and the
+orchestrator's gate checks a waiting pull request every 5 minutes and wakes
+the node on feedback.
+
 A persistent data root, `~/.local/share/tod-live-verify`, for walking a real
 Linear ticket through the whole lifecycle in a Golden Sandbox fork, the way an
 engineer on the team would, and fixing what breaks.
