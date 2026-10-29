@@ -331,6 +331,10 @@ fn a_wake_runs_the_node_and_its_work_reaches_the_orchestrator() {
     assert_eq!(moved.state, "pending");
     assert!(moved.due_at >= now + 3_600_000, "{moved:?}");
     assert!(scheduler.cancels.lock().unwrap().is_empty());
+    // The wake that found nothing due says so, so an app waiting to hear
+    // from the supervisor it started is answered rather than left to time out.
+    let beat = tod_store::cloud_activity::get(&conn, node).unwrap().expect("an idle beat reached the orchestrator");
+    assert!(beat.is_idle(), "{beat:?}");
     drop(conn);
 
     // The timer is satisfied some other way (as a webhook would), so the

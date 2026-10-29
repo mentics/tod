@@ -341,6 +341,15 @@ pub fn spawn_check(fleet: Arc<FleetStore>, kind: Check) {
             Ok(_) => {}
             Err(err) => tracing::warn!("cloud: checking for lost sandboxes: {err:#}"),
         }
+        // At the app's start, after lost sandboxes are replaced: node
+        // sandboxes left on an older build of the app catch up.
+        if kind == Check::Full {
+            match super::refresh::refresh_stale(&fleet) {
+                Ok(n) if n > 0 => tracing::info!("cloud: reinstalled {n} node sandbox(es) on this build"),
+                Ok(_) => {}
+                Err(err) => tracing::warn!("cloud: checking node installs: {err:#}"),
+            }
+        }
         CHECKING.store(false, Ordering::SeqCst);
     });
     if let Err(err) = spawned {

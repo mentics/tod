@@ -317,6 +317,10 @@ pub fn wake(config: Config) -> Result<Woke> {
         && !fresh_requested(&config.state_dir)
     {
         schedule(&store, &config)?;
+        // Say so: the app waits to hear from a supervisor it started (a
+        // reinstall, "Check now"), and a wake that finds nothing due is an
+        // answer, not silence.
+        replica.lock().unwrap_or_else(|e| e.into_inner()).end_cloud_beat(config.node)?;
         tracing::info!(%reason, "still waiting; going back to sleep");
         return Ok(Woke::StillWaiting(reason));
     }

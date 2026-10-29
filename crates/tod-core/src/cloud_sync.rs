@@ -1319,6 +1319,9 @@ pub fn ensure_node_sandbox(
         progress(&format!("warning: the poke got {}", resp.status()));
     }
     let _ = sandboxes.save();
+    // What this sandbox now runs, so a later build of the app can tell it
+    // is out of date ([`refresh`]).
+    refresh::record(root, node_id, &refresh::install_stamp()?)?;
     // Work checkpointed before an earlier sandbox of this node went away
     // comes back as uncommitted edits.
     let checkout = sandbox_checkout(&bx, &name)?;
@@ -1672,6 +1675,7 @@ pub fn wake_node_with(fleet: &FleetStore, root: &Path, node_id: &str, fresh_sess
 }
 
 pub mod lost;
+pub mod refresh;
 pub mod deploy;
 
 #[cfg(test)]
