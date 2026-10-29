@@ -368,3 +368,24 @@ sooner. Waking runs the autopilot again, which reads GitHub afresh, so a late
 or duplicate wake is harmless. A pull request that cannot be read (no
 credentials, GitHub down) is not waited on: the run goes to the gate, which
 says why it fails.
+
+## Looking again while waiting on a person
+
+A pull request waiting for a person (a draft to be marked ready, a reviewer)
+is read again every `pr_readiness.review_schedule.interval_minutes`
+(default 5, in or out of the working day; `off_hours_interval_minutes`
+caps the gap at night). Each look, in the app's `Check now` and in the
+orchestrator's gate, has three outcomes:
+
+1. Nothing changed: the next look is recorded and the sandbox stays asleep.
+2. Ready for review and reviewed: the wait ends and the gate can pass.
+3. Feedback: a person asked for changes, review threads are open, a check
+   failed, the branch is behind, a bot scored under its threshold, or a person
+   left a review with text and no verdict (`Work::ReviewComments`) since the
+   head commit and since the pull request agent's last turn. The wait is
+   cancelled, the node's supervisor is woken, and the `pr` agent runs with
+   the feedback text. A bot's report above its threshold, and reviews that
+   say nothing, are not feedback.
+
+The agent's own turn answers the reviews before it, so one review is acted on
+once; a new push or a newer review reopens it.
