@@ -609,14 +609,34 @@ fn watchdog(ctx: &Ctx, mut args: Args) -> Result<i32> {
 /// `target/sandbox/<name>` (or `sandbox/<name>` beside an install), found
 /// from this executable's directory up.
 fn sandbox_binary(name: &str) -> Result<PathBuf> {
-    let exe = std::env::current_exe()?;
+    let found = sandbox_binary_from(&std::env::current_exe()?, name)?;
+    eprintln!("using {}", found.display());
+    Ok(found)
+}
+
+/// Every `sandbox/<name>` in a directory above `exe`; the newest by
+/// modification time wins (the nearest on a tie). The nearest alone is not
+/// right: a stale copy in `target/debug/sandbox/` sits closer to
+/// `target/debug/tod-sandbox` than the fresh build in `target/sandbox/`, and
+/// shipped a pre-fix `tod-orchestrator` to the deployed orchestrator.
+fn sandbox_binary_from(exe: &std::path::Path, name: &str) -> Result<PathBuf> {
+    let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
     for dir in exe.ancestors().skip(1) {
         let p = dir.join("sandbox").join(name);
-        if p.is_file() {
-            return Ok(p);
+        if !p.is_file() {
+            continue;
+        }
+        let modified = std::fs::metadata(&p)
+            .and_then(|m| m.modified())
+            .with_context(|| format!("stat {}", p.display()))?;
+        if best.as_ref().is_none_or(|(t, _)| modified > *t) {
+            best = Some((modified, p));
         }
     }
-    bail!("{name} (Linux) not found under sandbox/; build it with scripts/build-sandbox-binaries.sh or pass its path")
+    match best {
+        Some((_, p)) => Ok(p),
+        None => bail!("{name} (Linux) not found under sandbox/; build it with scripts/build-sandbox-binaries.sh or pass its path"),
+    }
 }
 
 fn list(ctx: &Ctx) -> Result<i32> {
@@ -922,4 +942,43 @@ fn doctor(ctx: &mut Ctx) -> Result<i32> {
         Err(e) => report(false, "sign-in", format!("{e:#}")),
     }
     Ok(if problems == 0 { 0 } else { 1 })
+}
+
+#[cfg(test)]
+mod sandbox_binary_tests {
+    use super::sandbox_binary_from;
+    use std::time::{Duration, SystemTime};
+
+    fn put(path: &std::path::Path, age_secs: u64) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let f = std::fs::File::create(path).unwrap();
+        f.set_modified(SystemTime::now() - Duration::from_secs(age_secs)).unwrap();
+    }
+
+    /// A stale `target/debug/sandbox/<bin>` beside the executable must not
+    /// shadow the fresh `target/sandbox/<bin>` a build just wrote.
+    #[test]
+    fn a_fresher_build_further_up_wins_over_a_stale_nearer_copy() {
+        let dir = std::env::temp_dir().join(format!("tod-sbx-bin-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        put(&dir.join("target/debug/sandbox/tod-orchestrator"), 3600);
+        put(&dir.join("target/sandbox/tod-orchestrator"), 10);
+        let exe = dir.join("target/debug/tod-sandbox");
+        assert_eq!(sandbox_binary_from(&exe, "tod-orchestrator").unwrap(), dir.join("target/sandbox/tod-orchestrator"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_missing_binary_is_an_error_and_a_tie_goes_to_the_nearest() {
+        let dir = std::env::temp_dir().join(format!("tod-sbx-bin2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let exe = dir.join("target/debug/tod-sandbox");
+        assert!(sandbox_binary_from(&exe, "tod-relay").is_err());
+        let near = dir.join("target/debug/sandbox/tod-relay");
+        put(&near, 100);
+        std::fs::File::options().write(true).open(&near).unwrap().set_modified(SystemTime::now() - Duration::from_secs(50)).unwrap();
+        put(&dir.join("target/sandbox/tod-relay"), 50);
+        assert!(sandbox_binary_from(&exe, "tod-relay").is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
