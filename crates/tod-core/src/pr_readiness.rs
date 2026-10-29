@@ -128,7 +128,7 @@ pub struct OpenThread {
 
 /// Where the people's review of the pull request stands: the latest decisive
 /// review (approval, requested changes, or a dismissal) of each reviewer who
-/// is not a bot. Comments decide nothing.
+/// is not a bot. Comments decide nothing here: a review with text and no verdict is [`ReviewComment`] feedback.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HumanReview {
     /// No person has approved or asked for changes (or every such review
@@ -139,6 +139,16 @@ pub enum HumanReview {
     /// At least one person asks for changes. `unaddressed` is when the
     /// request is newer than the head commit: nothing has been pushed since.
     ChangesRequested { unaddressed: bool },
+}
+
+/// A review a person left with text and no verdict (GitHub's `COMMENTED`)
+/// since the head commit: feedback that wants an answer even though it
+/// neither approves nor blocks. A bot's review (a score) is not one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewComment {
+    pub author: String,
+    pub at: DateTime<Utc>,
+    pub body: String,
 }
 
 /// What a pull request stands at.
@@ -154,6 +164,12 @@ pub struct Assessment {
     /// Who GitHub still waits on for a review (logins, teams as `org/team`);
     /// empty when nobody was asked.
     pub requested_reviewers: Vec<String>,
+    /// People's reviews with text and no verdict, newer than the head commit.
+    pub review_comments: Vec<ReviewComment>,
+    /// When the pull request's agent last took a turn: reviews before it
+    /// have been seen and answered. `None` until set
+    /// ([`Self::answered_through`]).
+    pub answered_at: Option<DateTime<Utc>>,
 }
 
 /// Something the babysitter has to do.
@@ -172,6 +188,9 @@ pub enum Work {
     /// A person asked for changes, nothing has been pushed since, and no
     /// review thread carries the request (those are [`Work::Threads`]).
     ChangesRequested,
+    /// People left reviews with text but no verdict since the last push and
+    /// the agent has not yet had a turn on them.
+    ReviewComments(usize),
 }
 
 /// Something the babysitter can only wait for.
@@ -273,7 +292,21 @@ impl Assessment {
             bots,
             human_review: human_review(snapshot, head_at),
             requested_reviewers: snapshot.status.reviewers.clone(),
+            review_comments: review_comments(snapshot, head_at),
+            answered_at: None,
         }
+    }
+
+    /// Reviews up to `at` (the pull request's agent last took a turn then)
+    /// have been answered.
+    pub fn answered_through(mut self, at: Option<DateTime<Utc>>) -> Self {
+        self.answered_at = at;
+        self
+    }
+
+    /// Reviews with text the agent has not yet had a turn on.
+    pub fn unanswered_review_comments(&self) -> Vec<&ReviewComment> {
+        self.review_comments.iter().filter(|r| self.answered_at.is_none_or(|a| r.at > a)).collect()
     }
 
     /// The branch is behind its base.
@@ -308,6 +341,10 @@ impl Assessment {
         }
         if self.human_review == (HumanReview::ChangesRequested { unaddressed: true }) && self.open_threads.is_empty() {
             work.push(Work::ChangesRequested);
+        }
+        let unanswered = self.unanswered_review_comments().len();
+        if unanswered > 0 {
+            work.push(Work::ReviewComments(unanswered));
         }
         for report in &self.bots {
             if let BotStanding::Current { score } = report.standing
@@ -410,6 +447,28 @@ fn human_review(snapshot: &PrSnapshot, head_at: Option<DateTime<Utc>>) -> HumanR
     } else {
         HumanReview::Pending
     }
+}
+
+/// The reviews people left with text and no verdict since the head commit.
+/// A bot's report (a score, a summary) is read through its own standing, and
+/// a review that approves or asks for changes through [`human_review`].
+fn review_comments(snapshot: &PrSnapshot, head_at: Option<DateTime<Utc>>) -> Vec<ReviewComment> {
+    let mut found: Vec<ReviewComment> = snapshot
+        .reviews
+        .iter()
+        .filter(|r| r.state == "COMMENTED" && !r.body.trim().is_empty())
+        .filter_map(|r| {
+            let author = r.author.as_deref().filter(|a| is_person(a))?;
+            let at = parse_time(&r.submitted_at)?;
+            head_at.is_none_or(|h| at > h).then(|| ReviewComment {
+                author: author.to_string(),
+                at,
+                body: r.body.trim().to_string(),
+            })
+        })
+        .collect();
+    found.sort_by_key(|r| r.at);
+    found
 }
 
 /// An unresolved thread whose code has not since changed.
@@ -527,6 +586,17 @@ pub fn render_work(url: &str, assessment: &Assessment) -> String {
             Work::Threads(n) => format!("- {n} review thread(s) are open: `tod-cli pr threads`\n"),
             Work::FailingChecks => "- a check is failing: `tod-cli pr status`\n".to_string(),
             Work::ChangesRequested => "- a reviewer asked for changes in a review: read it with `tod-cli pr status`\n".to_string(),
+            Work::ReviewComments(_) => {
+                let mut text = String::new();
+                for review in assessment.unanswered_review_comments() {
+                    let body: String = review.body.chars().take(6000).collect();
+                    text.push_str(&format!(
+                        "- {} left a review (no verdict) asking for this; treat what it asks as feedback: fix what this change introduced and push, and say why on the pull request for anything you reject:\n\n{}\n\n",
+                        review.author, body
+                    ));
+                }
+                text
+            }
             Work::LowScore { bot, score, min } => format!(
                 "- {bot} scored it {score}/5, under the {min}/5 needed: read its summary comment and fix what it found that this change introduced\n"
             ),
@@ -691,9 +761,10 @@ Not safe.
             author: Some("greptile-apps[bot]".into()),
             submitted_at: "2026-01-01T11:00:00Z".into(),
             state: "COMMENTED".into(),
+            body: String::new(),
         }];
         if let Some(at) = rereview_at {
-            reviews.push(tod_store::github::PrReview { author: Some("greptile-apps[bot]".into()), submitted_at: at.into(), state: "COMMENTED".into() });
+            reviews.push(tod_store::github::PrReview { author: Some("greptile-apps[bot]".into()), submitted_at: at.into(), state: "COMMENTED".into(), body: String::new() });
         }
         snap.reviews = reviews;
         let mut t = thread("t", true, &["bot finding", "we declined, here is why"]);
@@ -784,6 +855,25 @@ Not safe.
         ] {
             assert_eq!(GREPTILE.parse_score(body), want, "{body}");
         }
+    }
+
+    #[test]
+    fn a_persons_review_with_text_and_no_verdict_is_feedback_until_the_agent_has_had_a_turn() {
+        let mut st = status("blocked", "success");
+        st.head_committed_at = Some("2026-01-01T09:00:00Z".into());
+        let mut person = review("alice", "2026-01-01T10:00:00Z", "COMMENTED");
+        person.body = "two bugs to fix".into();
+        let mut bot = review("greptile-apps[bot]", "2026-01-01T10:00:00Z", "COMMENTED");
+        bot.body = "Confidence 4/5".into();
+        let empty = review("bob", "2026-01-01T10:00:00Z", "COMMENTED");
+        let mut snapshot = snap(st, vec![], vec![]);
+        snapshot.reviews = vec![person, bot, empty];
+        let a = Assessment::of(&snapshot, &PrReadinessSettings::default(), now());
+        assert_eq!(a.work(), vec![Work::ReviewComments(1)]);
+        let render = render_work("https://github.com/o/r/pull/1", &a);
+        assert!(render.contains("two bugs to fix"), "{render}");
+        let answered = a.answered_through(Some(DateTime::parse_from_rfc3339("2026-01-01T11:00:00Z").unwrap().with_timezone(&Utc)));
+        assert!(answered.work().is_empty());
     }
 
     #[test]
@@ -917,7 +1007,7 @@ Not safe.
     }
 
     fn review(author: &str, at: &str, state: &str) -> tod_store::github::PrReview {
-        tod_store::github::PrReview { author: Some(author.into()), submitted_at: at.into(), state: state.into() }
+        tod_store::github::PrReview { author: Some(author.into()), submitted_at: at.into(), state: state.into(), body: String::new() }
     }
 
     /// A blocked pull request whose head was committed at 10:00.
@@ -1078,6 +1168,28 @@ pub fn settings_at(data_root: &std::path::Path) -> PrReadinessSettings {
         .unwrap_or_default()
 }
 
+/// When the node's pull request agent last took a turn, if it has.
+pub fn agent_answered_at(
+    fleet: &tod_store::fleet::FleetStore,
+    node: uuid::Uuid,
+) -> anyhow::Result<Option<DateTime<Utc>>> {
+    use tod_store::conversation::{ConversationRepo, Focus, ProtocolKind, TurnRole};
+    fleet.read(|conn| {
+        let repo = ConversationRepo::new(conn);
+        let Some(conversation) = repo.latest_for_focus_with_protocol(Focus::Node(node), ProtocolKind::Pr)? else {
+            return Ok(None);
+        };
+        Ok(repo
+            .turns(conversation.id)?
+            .iter()
+            .filter(|t| t.role == TurnRole::Agent)
+            .map(|t| t.created_at)
+            .max()
+            .and_then(DateTime::from_timestamp_millis))
+    })
+    .map_err(Into::into)
+}
+
 /// One linked pull request as it stands now.
 #[derive(Debug, Clone)]
 pub struct LivePr {
@@ -1118,6 +1230,9 @@ impl LivePr {
                 Wait::GitHub | Wait::HumanReview => {}
             }
         }
+        if !self.assessment.unanswered_review_comments().is_empty() {
+            parts.push("review comments to answer".to_string());
+        }
         parts.join(", ")
     }
 }
@@ -1130,11 +1245,22 @@ pub fn live(
     prs: &[tod_store::github::NodePr],
     settings: &PrReadinessSettings,
 ) -> Result<Vec<LivePr>, String> {
+    live_answered(feed, prs, settings, None)
+}
+
+/// [`live`], with reviews up to `answered_at` counted as answered (see
+/// [`agent_answered_at`]).
+pub fn live_answered(
+    feed: &dyn PrFeed,
+    prs: &[tod_store::github::NodePr],
+    settings: &PrReadinessSettings,
+    answered_at: Option<DateTime<Utc>>,
+) -> Result<Vec<LivePr>, String> {
     let now = Utc::now();
     prs.iter()
         .map(|pr| {
             let snapshot = feed.snapshot(pr).map_err(|err| format!("{}: {err}", pr.url))?;
-            let assessment = Assessment::of(&snapshot, settings, now);
+            let assessment = Assessment::of(&snapshot, settings, now).answered_through(answered_at);
             let mut open: Vec<&str> = assessment.open_threads.iter().map(|t| t.id.as_str()).collect();
             open.sort_unstable();
             let fingerprint = format!(

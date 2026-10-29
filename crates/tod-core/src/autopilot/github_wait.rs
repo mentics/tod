@@ -263,6 +263,7 @@ fn check_ready_for_review(fleet: &FleetStore, node: uuid::Uuid, data_root: &std:
         return Ok(GithubCheck::Unreadable("GitHub credentials are not set up".to_string()));
     };
     let settings = crate::pr_readiness::settings_at(data_root);
+    let answered_at = crate::pr_readiness::agent_answered_at(fleet, node)?;
     let mut pending: Option<(&NodePr, String, &str)> = None;
     let mut standing: Vec<String> = Vec::new();
     let mut feedback: Vec<String> = Vec::new();
@@ -276,7 +277,9 @@ fn check_ready_for_review(fleet: &FleetStore, node: uuid::Uuid, data_root: &std:
         // Feedback on the pull request, a draft included, is the agent's
         // work whether or not a person has taken it yet. Comments that
         // report no problem (a bot's score above its threshold) are not.
-        let work = crate::pr_readiness::Assessment::of(&snapshot, &settings, chrono::Utc::now()).work();
+        let work = crate::pr_readiness::Assessment::of(&snapshot, &settings, chrono::Utc::now())
+            .answered_through(answered_at)
+            .work();
         if !work.is_empty() {
             feedback.push(format!("{label}: {}", work_description(&work)));
         }
@@ -315,6 +318,7 @@ fn work_description(work: &[crate::pr_readiness::Work]) -> String {
             Work::Conflict => "conflicts with its base".to_string(),
             Work::LowScore { bot, score, min } => format!("{bot} scored it {score} (needs {min})"),
             Work::ChangesRequested => "changes requested".to_string(),
+            Work::ReviewComments(n) => format!("{n} review{} with comments to answer", if *n == 1 { "" } else { "s" }),
         })
         .collect::<Vec<_>>()
         .join(", ")

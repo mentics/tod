@@ -714,7 +714,8 @@ impl Autopilot {
                 )?));
             };
             let settings = pr_readiness::settings_at(&self.config.data_root);
-            let live = match pr_readiness::live(feed.as_ref(), &links.prs, &settings) {
+            let answered_at = pr_readiness::agent_answered_at(fleet, self.node)?;
+            let live = match pr_readiness::live_answered(feed.as_ref(), &links.prs, &settings, answered_at) {
                 Ok(live) => {
                     github_wait::clear_read_failures(fleet, self.node)?;
                     live
@@ -755,7 +756,8 @@ impl Autopilot {
                     }
                     // A turn that left the pull request exactly as it was,
                     // twice: another would do the same.
-                    let now = pr_readiness::live(feed.as_ref(), &links.prs, &settings).ok();
+                    let answered_at = pr_readiness::agent_answered_at(fleet, self.node)?;
+                    let now = pr_readiness::live_answered(feed.as_ref(), &links.prs, &settings, answered_at).ok();
                     let same = now.as_ref().is_some_and(|n| {
                         n.iter().map(|p| p.fingerprint.clone()).collect::<Vec<_>>() == fingerprint
                     });

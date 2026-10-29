@@ -240,7 +240,8 @@ fn live_prs(
     prs: &[tod_store::github::NodePr],
 ) -> Option<Vec<crate::pr_readiness::LivePr>> {
     let feed = crate::pr_readiness::feed_for(data_root)?;
-    crate::pr_readiness::live(feed.as_ref(), prs, &pr_settings_at(data_root)).ok()
+    // Called after an agent turn: whatever it was asked has had its answer.
+    crate::pr_readiness::live_answered(feed.as_ref(), prs, &pr_settings_at(data_root), Some(chrono::Utc::now())).ok()
 }
 
 /// How to go about the work, after what it is.

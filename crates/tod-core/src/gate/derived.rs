@@ -1564,6 +1564,7 @@ mod readiness_tests {
             author: Some(author.into()),
             submitted_at: "2026-01-01T10:00:00Z".into(),
             state: "COMMENTED".into(),
+            body: String::new(),
         }
     }
 

@@ -841,6 +841,7 @@ impl crate::pr_readiness::PrFeed for Sim {
                     author: Some("alice".into()),
                     submitted_at: "2021-06-01T00:00:00Z".into(),
                     state: "APPROVED".into(),
+            body: String::new(),
                 }]
             } else {
                 vec![]
@@ -1450,6 +1451,7 @@ fn check_now_in_pr_waits_for_the_draft_to_be_ready_and_reviewed() {
         author: Some("alice".into()),
         submitted_at: "2026-01-01T10:00:00Z".into(),
         state: "COMMENTED".into(),
+            body: String::new(),
     });
     assert_eq!(super::check_now(&fx.fleet, fx.node, &fx.root).unwrap(), super::GithubCheck::Clear);
     assert!(pending_specs(&fx).is_empty());
@@ -1490,6 +1492,7 @@ fn check_now_in_pr_sends_new_changes_requested_to_the_agent_even_on_a_draft() {
             author: Some("alice".into()),
             submitted_at: "2026-01-01T10:00:00Z".into(),
             state: "CHANGES_REQUESTED".into(),
+            body: String::new(),
         }],
     }))));
     linked_to_prs(&fx, "pr", &["https://github.com/acme/app/pull/42"]);

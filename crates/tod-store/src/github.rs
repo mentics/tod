@@ -463,7 +463,12 @@ impl Github {
         Ok(raw
             .into_iter()
             .filter_map(|r| {
-                Some(PrReview { author: r.user.map(|u| u.login), submitted_at: r.submitted_at?, state: r.state })
+                Some(PrReview {
+                    author: r.user.map(|u| u.login),
+                    submitted_at: r.submitted_at?,
+                    state: r.state,
+                    body: r.body.unwrap_or_default(),
+                })
             })
             .collect())
     }
@@ -600,6 +605,8 @@ pub struct PrReview {
     /// GitHub's state for the review: `APPROVED`, `CHANGES_REQUESTED`,
     /// `COMMENTED`, `DISMISSED` or `PENDING`. Empty when not known.
     pub state: String,
+    /// The text the reviewer wrote with it; empty when there is none.
+    pub body: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -665,6 +672,7 @@ struct ReviewRaw {
     submitted_at: Option<String>,
     #[serde(default)]
     state: String,
+    body: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
