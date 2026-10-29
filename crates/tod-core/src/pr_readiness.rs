@@ -146,6 +146,8 @@ pub enum HumanReview {
 /// neither approves nor blocks. A bot's review (a score) is not one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReviewComment {
+    /// `review` or `comment` (a top-level comment on the pull request).
+    pub kind: &'static str,
     pub author: String,
     pub at: DateTime<Utc>,
     pub body: String,
@@ -461,12 +463,30 @@ fn review_comments(snapshot: &PrSnapshot, head_at: Option<DateTime<Utc>>) -> Vec
             let author = r.author.as_deref().filter(|a| is_person(a))?;
             let at = parse_time(&r.submitted_at)?;
             head_at.is_none_or(|h| at > h).then(|| ReviewComment {
+                kind: "review",
                 author: author.to_string(),
                 at,
                 body: r.body.trim().to_string(),
             })
         })
         .collect();
+    // Top-level comments from people: the same feedback, said outside a
+    // review. The app's own asks of a review bot are not feedback; nor is a
+    // bot's comment. The pull request's agent posts as the user too, so its
+    // comments are told apart by time, not author: they come before the end
+    // of its turn, which answers them ([`Assessment::answered_through`]).
+    for c in &snapshot.comments {
+        let body = c.body.trim();
+        let asks_a_bot = [&GREPTILE]
+            .iter()
+            .any(|b| body.eq_ignore_ascii_case(b.rereview) || body.eq_ignore_ascii_case(b.rereview_draft));
+        let Some(author) = c.author.as_deref().filter(|a| is_person(a)) else { continue };
+        let Some(at) = parse_time(&c.created_at) else { continue };
+        if body.is_empty() || asks_a_bot || !head_at.is_none_or(|h| at > h) {
+            continue;
+        }
+        found.push(ReviewComment { kind: "comment", author: author.to_string(), at, body: body.to_string() });
+    }
     found.sort_by_key(|r| r.at);
     found
 }
@@ -591,8 +611,8 @@ pub fn render_work(url: &str, assessment: &Assessment) -> String {
                 for review in assessment.unanswered_review_comments() {
                     let body: String = review.body.chars().take(6000).collect();
                     text.push_str(&format!(
-                        "- {} left a review (no verdict) asking for this; treat what it asks as feedback: fix what this change introduced and push, and say why on the pull request for anything you reject:\n\n{}\n\n",
-                        review.author, body
+                        "- {} left a {} on the pull request ({}); treat what it asks as feedback: fix what this change introduced and push, and say why on the pull request for anything you reject. Earlier reviews and comments were already handled in earlier turns; only this one is new:\n\n{}\n\n",
+                        review.author, review.kind, review.at.format("%Y-%m-%d %H:%M UTC"), body
                     ));
                 }
                 text
@@ -874,6 +894,24 @@ Not safe.
         assert!(render.contains("two bugs to fix"), "{render}");
         let answered = a.answered_through(Some(DateTime::parse_from_rfc3339("2026-01-01T11:00:00Z").unwrap().with_timezone(&Utc)));
         assert!(answered.work().is_empty());
+    }
+
+    #[test]
+    fn a_persons_top_level_comment_after_the_agents_turn_is_feedback() {
+        let mut st = status("blocked", "success");
+        st.head_committed_at = Some("2026-01-01T09:00:00Z".into());
+        let cs = vec![
+            comment("alice", "earlier ask", "2026-01-01T10:00:00Z"),
+            comment("alice", "@greptileai review this", "2026-01-01T10:30:00Z"),
+            comment("github-actions[bot]", "tests passed", "2026-01-01T12:30:00Z"),
+            comment("alice", "also fix the hard-coded lists", "2026-01-01T13:00:00Z"),
+        ];
+        let a = Assessment::of(&snap(st, vec![], cs), &PrReadinessSettings::default(), now());
+        assert_eq!(a.work(), vec![Work::ReviewComments(2)]);
+        let at = DateTime::parse_from_rfc3339("2026-01-01T11:00:00Z").unwrap().with_timezone(&Utc);
+        let after = a.answered_through(Some(at));
+        assert_eq!(after.work(), vec![Work::ReviewComments(1)]);
+        assert!(render_work("u", &after).contains("hard-coded"));
     }
 
     #[test]
