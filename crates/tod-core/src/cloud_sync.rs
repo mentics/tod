@@ -58,6 +58,11 @@ pub struct CloudSyncState {
     /// The orchestrator holds a copy of this database.
     #[serde(default)]
     pub seeded: bool,
+    /// The orchestrator's seeding ([`Seeding::seed_id`]) this copy was sent
+    /// to. When the orchestrator names another, its database was replaced
+    /// and the next sync seeds it again ([`sync_once`]).
+    #[serde(default)]
+    pub seed_id: Option<String>,
     /// The last local `sync_changes.seq` the orchestrator accepted.
     #[serde(default)]
     pub sent_after: i64,
@@ -413,14 +418,31 @@ pub fn https_repo_url(remote: &str) -> Option<String> {
     None
 }
 
+/// What the orchestrator answers to a seed.
+pub struct Seeding {
+    /// The feed's start: the snapshot's own change number.
+    pub last_seq: i64,
+    /// Names this seeding ([`CloudSyncState::seed_id`]); `None` from an
+    /// orchestrator too old to say.
+    pub seed_id: Option<String>,
+}
+
+/// What the orchestrator answers to a feed request.
+pub struct Feed {
+    pub last_seq: i64,
+    pub changes: Vec<Change>,
+    /// The seeding the feed follows; see [`Seeding::seed_id`].
+    pub seed_id: Option<String>,
+}
+
 /// How the app reaches the orchestrator.
 pub trait Orchestrator {
-    /// `POST /users/<u>/seed`: the new feed cursor.
-    fn seed(&self, user: &str, snapshot: &[u8]) -> Result<i64>;
+    /// `POST /users/<u>/seed`: replaces the orchestrator's copy.
+    fn seed(&self, user: &str, snapshot: &[u8]) -> Result<Seeding>;
     /// `POST /users/<u>/changes`.
     fn send(&self, user: &str, changes: &[Change]) -> Result<ApplyReport>;
-    /// `GET /users/<u>/changes?after=n`: `(last_seq, changes)`.
-    fn pull(&self, user: &str, after: i64) -> Result<(i64, Vec<Change>)>;
+    /// `GET /users/<u>/changes?after=n`.
+    fn pull(&self, user: &str, after: i64) -> Result<Feed>;
     /// `POST /users/<u>/problems/pull`: what the cloud's executables reported
     /// after `cursor` (`None`: from now), and the new cursor. Only ever
     /// called inside a sync, so it adds no contact with the cloud of its own.
@@ -561,7 +583,7 @@ impl HttpOrchestrator {
 }
 
 impl Orchestrator for HttpOrchestrator {
-    fn seed(&self, user: &str, snapshot: &[u8]) -> Result<i64> {
+    fn seed(&self, user: &str, snapshot: &[u8]) -> Result<Seeding> {
         // The orchestrator answers 409 while the user's store is in use.
         for attempt in 0..5 {
             let resp = self
@@ -574,7 +596,8 @@ impl Orchestrator for HttpOrchestrator {
                 continue;
             }
             let v = Self::finish(resp, "seed")?;
-            return v["last_seq"].as_i64().ok_or_else(|| anyhow!("orchestrator seed: no last_seq"));
+            let last_seq = v["last_seq"].as_i64().ok_or_else(|| anyhow!("orchestrator seed: no last_seq"))?;
+            return Ok(Seeding { last_seq, seed_id: v["seed_id"].as_str().map(str::to_string) });
         }
         unreachable!()
     }
@@ -585,13 +608,13 @@ impl Orchestrator for HttpOrchestrator {
         Ok(serde_json::from_value(v)?)
     }
 
-    fn pull(&self, user: &str, after: i64) -> Result<(i64, Vec<Change>)> {
+    fn pull(&self, user: &str, after: i64) -> Result<Feed> {
         let url = self.url(user, &format!("changes?after={after}"));
         let resp = Self::with_gateway_retry("feed", || self.auth(self.agent.get(&url)).call())?;
         let mut v = Self::finish(resp, "feed")?;
-        let last = v["last_seq"].as_i64().ok_or_else(|| anyhow!("orchestrator feed: no last_seq"))?;
+        let last_seq = v["last_seq"].as_i64().ok_or_else(|| anyhow!("orchestrator feed: no last_seq"))?;
         let changes = serde_json::from_value(v["changes"].take())?;
-        Ok((last, changes))
+        Ok(Feed { last_seq, changes, seed_id: v["seed_id"].as_str().map(str::to_string) })
     }
 
     fn pull_problems(
@@ -687,6 +710,37 @@ fn sync_once(fleet: &FleetStore, root: &Path, orch: &dyn Orchestrator, user: &st
     let _ = fleet.flush_on_quit();
     let db = fleet.paths().db().to_path_buf();
 
+    // Which seeding the orchestrator is on, from its feed (no changes are
+    // asked for). A seeding this copy was not sent to replaced the database
+    // the cursors follow: take what it holds, then seed it with this one.
+    if state.seeded {
+        let now = orch.pull(user, i64::MAX)?.seed_id;
+        match (state.seed_id.clone(), now) {
+            (Some(known), Some(now)) if known != now => {
+                tracing::warn!(
+                    known,
+                    now,
+                    "the orchestrator's database was seeded again; taking what it holds, then seeding it with this database"
+                );
+                let taken = orch.pull(user, 0)?;
+                let mut conn = connect(&db)?;
+                let applied = sync::apply_changes(&mut conn, &taken.changes)?;
+                drop(conn);
+                report.received += taken.changes.len();
+                report.conflicts += applied.conflicts.len();
+                state.seeded = false;
+                state.seed_id = None;
+                state.save(root)?;
+            }
+            (None, now @ Some(_)) => {
+                // Copied before the seeding was recorded: from now on it is.
+                state.seed_id = now;
+                state.save(root)?;
+            }
+            _ => {}
+        }
+    }
+
     if !state.seeded {
         let tmp = root.join("cloud-seed-snapshot.db");
         let _ = std::fs::remove_file(&tmp);
@@ -698,10 +752,11 @@ fn sync_once(fleet: &FleetStore, root: &Path, orch: &dyn Orchestrator, user: &st
             Ok::<_, anyhow::Error>((snap_seq, feed))
         })();
         let _ = std::fs::remove_file(&tmp);
-        let (snap_seq, feed) = result?;
+        let (snap_seq, seeding) = result?;
         state.seeded = true;
+        state.seed_id = seeding.seed_id;
         state.sent_after = snap_seq;
-        state.feed_after = feed;
+        state.feed_after = seeding.last_seq;
         state.save(root)?;
         report.seeded = true;
     }
@@ -711,11 +766,22 @@ fn sync_once(fleet: &FleetStore, root: &Path, orch: &dyn Orchestrator, user: &st
         let applied = orch.send(user, &outbox)?;
         report.sent = outbox.len();
         report.conflicts += applied.conflicts.len();
+        record_conflicts(&applied.conflicts);
         state.sent_after = outbox.iter().map(|c| c.seq).max().unwrap_or(state.sent_after);
         state.save(root)?;
     }
 
-    let (last, feed) = orch.pull(user, state.feed_after)?;
+    let pulled = orch.pull(user, state.feed_after)?;
+    if let (Some(known), Some(now)) = (&state.seed_id, &pulled.seed_id)
+        && known != now
+    {
+        // Seeded again since the check above: nothing from it is applied, and
+        // the next sync takes it (what was sent just now is in the copy it
+        // makes then).
+        anyhow::bail!("the orchestrator's database was seeded again during this sync; the next sync takes it");
+    }
+    let last = pulled.last_seq;
+    let feed = pulled.changes;
     if !feed.is_empty() {
         let mut conn = connect(&db)?;
         let applied = sync::apply_changes(&mut conn, &feed)?;
@@ -748,6 +814,27 @@ fn sync_once(fleet: &FleetStore, root: &Path, orch: &dyn Orchestrator, user: &st
         tracing::warn!("cloud sync: retiring done nodes: {err:#}");
     }
     Ok(report)
+}
+
+/// Logs the changes the orchestrator reported as conflicting with its copy.
+/// Each was applied over the orchestrator's row, or dropped when its parent
+/// is not there, so the user has to be able to see it, not only the count.
+fn record_conflicts(conflicts: &[sync::Conflict]) {
+    if conflicts.is_empty() {
+        return;
+    }
+    let mut tables: Vec<&str> = conflicts.iter().map(|c| c.table.as_str()).collect();
+    tables.sort_unstable();
+    tables.dedup();
+    crate::logging::buffer::record(
+        crate::logging::buffer::Level3::Warn,
+        crate::logging::buffer::LogSource::App,
+        format!(
+            "The orchestrator reported {} of this copy's changes as conflicting ({}): each was applied over its row, or dropped when its parent is missing there.",
+            conflicts.len(),
+            tables.join(", ")
+        ),
+    );
 }
 
 /// An orchestrator deployed before `problems/pull` existed answers 404 on every

@@ -576,3 +576,42 @@ fn an_orchestrator_that_lost_its_data_is_seeded_again() {
     let _ = std::fs::remove_dir_all(&base);
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// Another copy of the app seeds the orchestrator, replacing its database.
+/// The next sync sees a seeding this copy was not sent to, and seeds the
+/// orchestrator with this database again, so its rows are back there.
+#[test]
+fn an_orchestrator_seeded_by_another_copy_is_seeded_with_this_one_again() {
+    let base = temp_root("orch-other");
+    let url = start_orchestrator(&base);
+    let orch = HttpOrchestrator::new(url, None).with_client("app-test");
+    let root = temp_root("app-other");
+    let app = FleetStore::open(&root).unwrap();
+    add_list(&app, "first");
+    let first = sync(&app, &root, &orch, "alice").unwrap();
+    assert!(first.seeded);
+    let seed_id = CloudSyncState::load(&root).unwrap().seed_id;
+    assert!(seed_id.is_some(), "the seeding is recorded");
+
+    // The other copy's database, which does not have "first".
+    let other_root = temp_root("other-app");
+    let other = FleetStore::open(&other_root).unwrap();
+    add_list(&other, "elsewhere");
+    let snap = other_root.join("snap.db");
+    sync::snapshot(other.paths().db(), &snap).unwrap();
+    orch.seed("alice", &std::fs::read(&snap).unwrap()).unwrap();
+    let user_root = base.join("users").join("alice");
+    assert_eq!(lists_in(&user_root.join("tod.db")), vec!["elsewhere".to_string()]);
+
+    // Nothing changed here, but the orchestrator is on another seeding:
+    // the app seeds it again, with its own database.
+    add_list(&app, "second");
+    let report = sync(&app, &root, &orch, "alice").unwrap();
+    assert!(report.seeded, "{report:?}");
+    assert_eq!(lists_in(&user_root.join("tod.db")), lists(&app));
+    assert_ne!(CloudSyncState::load(&root).unwrap().seed_id, seed_id, "the new seeding is recorded");
+
+    let _ = std::fs::remove_dir_all(&base);
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&other_root);
+}

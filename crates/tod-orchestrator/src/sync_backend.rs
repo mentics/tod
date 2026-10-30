@@ -4,7 +4,7 @@
 //!   (`tod_store::sync::snapshot`). It replaces the user's database; the
 //!   snapshot's `last_seq` is recorded as the feed's start, since the
 //!   snapshot carries the app's own log, which the app must not get back.
-//!   Reply: `{"last_seq": n}`.
+//!   Reply: `{"last_seq": n, "seed_id": id}`.
 //! - `POST /users/<u>/changes`: the body is a client's changes (the app's,
 //!   or a node supervisor's), a JSON array of `tod_store::sync::Change`.
 //!   Logged, tagged with the client (`X-Tod-Client`, else `?client=`, else
@@ -73,8 +73,9 @@ fn seed_inner(users: &Users, user: &str, snapshot: &[u8]) -> Result<Response> {
     let data = users.get(user)?;
     let last = sync::last_seq(&connect(&data)?)?;
     std::fs::write(root.join(SEED_SEQ_FILE), last.to_string())?;
-    std::fs::write(root.join(SEED_ID_FILE), uuid::Uuid::new_v4().to_string())?;
-    Ok(json(&serde_json::json!({ "last_seq": last })))
+    let id = uuid::Uuid::new_v4().to_string();
+    std::fs::write(root.join(SEED_ID_FILE), &id)?;
+    Ok(json(&serde_json::json!({ "last_seq": last, "seed_id": id })))
 }
 
 /// Logged, tagged with the sending `client`, so every other client gets
