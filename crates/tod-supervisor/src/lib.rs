@@ -308,14 +308,16 @@ pub fn wake(config: Config) -> Result<Woke> {
         answers::Before::Go(budget) => budget,
     };
 
+    // A request for a new session is a request to run now: what the node
+    // waits on is looked at again by the run, which records it afresh. Left
+    // pending, a wait would stop the run at its first step, before any agent.
+    if fresh_requested(&config.state_dir) {
+        waits::cancel_pending(&store, config.node)?;
+    }
     let status = waits::check(&store, config.node, &config.workspace)?;
     // What `check` settled or moved goes up before anything else.
     replica.lock().unwrap_or_else(|e| e.into_inner()).push()?;
-    // A request for a new session is a request to run now: what the node
-    // waits on is looked at again by the run, which records it afresh.
-    if let waits::WaitStatus::Waiting { reason } = status
-        && !fresh_requested(&config.state_dir)
-    {
+    if let waits::WaitStatus::Waiting { reason } = status {
         schedule(&store, &config)?;
         // Say so: the app waits to hear from a supervisor it started (a
         // reinstall, "Check now"), and a wake that finds nothing due is an
@@ -392,6 +394,7 @@ pub fn wake(config: Config) -> Result<Woke> {
                 if let Some(id) = current {
                     agent.with(|a| a.close_session(&ConversationDriver::session_key(id)));
                 }
+                waits::cancel_pending(&store, config.node)?;
                 take_fresh_request(&config.state_dir)?;
                 pilot.start_fresh_session()?;
                 tracing::info!("took a request for a new session");

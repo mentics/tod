@@ -157,3 +157,74 @@ fn a_requested_new_session_is_taken_when_the_supervisor_wakes() {
     assert!(matches!(woke, Woke::Ran(_)), "{woke:?}");
     assert!(!request.exists());
 }
+
+/// A wait the last run recorded (a pull request to be marked ready, say) does
+/// not stop a run the user asked for: the request cancels it, and the run
+/// works instead of stopping at its first step.
+#[test]
+fn a_requested_new_session_runs_despite_a_pending_wait() {
+    let tmp = Temp(std::env::temp_dir().join(format!("tod-supervisor-fresh-wait-{}", Uuid::new_v4())));
+    let base = tmp.0.clone();
+    std::fs::create_dir_all(&base).unwrap();
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let orch_url = format!("http://{}", listener.local_addr().unwrap());
+    let server = tod_orchestrator::Server::new(tod_orchestrator::Config {
+        base: base.join("orchestrator"),
+        tod_cli: "tod-cli-not-used".into(),
+        tod_cli_prefix: Vec::new(),
+    })
+    .unwrap();
+    std::thread::spawn(move || server.serve(listener));
+    let app = base.join("app");
+    let node = app_database(&app);
+    let snap = base.join("snap.db");
+    tod_store::sync::snapshot(&app.join("tod.db"), &snap).unwrap();
+    let seeded = ureq::post(format!("{orch_url}/users/alice/seed")).send(std::fs::read(&snap).unwrap()).unwrap();
+    assert_eq!(seeded.status(), 200);
+    let orchestrator = Orchestrator::new(orch_url.clone(), "alice", node.to_string());
+
+    let workspace = base.join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    git(&workspace, &["init", "--quiet"]);
+    let state_dir = base.join("supervisor");
+
+    let woke = wake(config(&orchestrator, node, &base)).unwrap();
+    assert!(matches!(woke, Woke::Ran(_)), "{woke:?}");
+
+    // The run left a wait an hour out, as `pr_draft` does for the review.
+    let wait = {
+        let local = FleetStore::open(&state_dir).unwrap();
+        local
+            .interview(
+                "test",
+                tod_store::interview::InterviewCommand::RecordWait {
+                    node_id: node,
+                    wait: tod_store::waits::NewWait::event("github:pr:1:ready_for_review", now_ms() + 3_600_000),
+                },
+            )
+            .unwrap();
+        local.read(|conn| tod_store::waits::WaitRepo::new(conn).list_pending_for_node(node)).unwrap()[0].id
+    };
+
+    std::fs::write(state_dir.join(tod_core::autopilot::FRESH_SESSION_REQUEST_FILE), b"").unwrap();
+    let mut second = config(&orchestrator, node, &base);
+    second.budget = Budget { max_sessions: 10, max_duration: Duration::from_secs(600) };
+    let woke = wake(second).unwrap();
+    match &woke {
+        Woke::Ran(tod_core::autopilot::Outcome::Stopped { reason }) => {
+            assert!(!reason.starts_with("waiting:"), "stopped on the old wait: {reason}")
+        }
+        Woke::Ran(_) => {}
+        other => panic!("{other:?}"),
+    }
+    let local = FleetStore::open(&state_dir).unwrap();
+    let state = local
+        .read(|conn| Ok(tod_store::waits::WaitRepo::new(conn).get(wait)?.unwrap().state))
+        .unwrap();
+    assert_eq!(state, tod_store::waits::WAIT_CANCELLED);
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64
+}

@@ -118,6 +118,15 @@ pub fn check(fleet: &FleetStore, node: Uuid, workspace: &Path) -> Result<WaitSta
     Ok(if open.is_empty() { WaitStatus::Clear } else { WaitStatus::Waiting { reason: open.join(", ") } })
 }
 
+/// Cancels every wait still pending on `node`: the user asked it to run now
+/// (a new session), and the run records afresh whatever it still waits on.
+pub fn cancel_pending(fleet: &FleetStore, node: Uuid) -> Result<()> {
+    for wait in pending(fleet, node)? {
+        set_state(fleet, &wait, tod_store::waits::WAIT_CANCELLED)?;
+    }
+    Ok(())
+}
+
 /// Asks `scheduler` to wake `sandbox` at `node`'s soonest pending wait, if any.
 /// The schedule's id is that wait's, so rescheduling replaces it.
 pub fn schedule_wake(fleet: &FleetStore, node: Uuid, scheduler: &dyn Scheduler, sandbox: &str) -> Result<Option<i64>> {
