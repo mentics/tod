@@ -1,9 +1,20 @@
 # Fixing a pull request's checks and review feedback
 
-How to clear what a node's pull request needs from you: failing checks, and
-review comments from bots and people. Your phase's role doc says which of
-these this state covers (in `pr_draft`, checks and bots; in `pr_review`, everyone),
-and how to decide scope; this skill is how to do the work.
+How to clear what a node's pull requests need from you: failing checks, and
+review comments from bots and people. It is meant for both `pr_draft` (before
+a person reviews: checks and automated reviewers) and `pr_review` (after: the
+human review too, and whatever the bots say about the changes it brings).
+Your phase's role doc says which feedback the state covers and how to decide
+scope; this skill is how to do the work.
+
+This skill is the procedure for one turn. A project skill configured after it
+for the same phase is its reference: which checks are required, how to run
+and fix the project's own checks, and its own review bots. Where it says
+something more specific, follow it.
+
+The loop is the app's, not yours: it watches the pull requests, asks review
+bots to look again, waits for CI, and wakes you with what changed. Each turn
+you clear what is there and stop.
 
 ## You never wait
 
@@ -47,15 +58,8 @@ comments on the linked PR, which the app watches), record it with
 ## Which checks matter
 
 Every red check is yours to fix if the change caused it; a required one also
-blocks the merge. In the Cofactr workspace:
-
-| Repo     | Required                                                                      | Advisory                              |
-| -------- | ----------------------------------------------------------------------------- | ------------------------------------- |
-| flagship | `test`, `Migrations / migration conflicts`, `Migrations / missing migrations` | `Lint / ruff`, `Type check / pyright` |
-| ui       | `check`                                                                       | --                                    |
-| kb       | none                                                                          | all of them                           |
-
-The table drifts; the branch protection is the truth:
+blocks the merge. The project skill lists them per repository; the branch
+protection is the truth:
 
 ```
 gh api repos/:owner/:repo/branches/main --jq '.protection.required_status_checks.contexts'
@@ -65,61 +69,14 @@ Run `gh` from inside the repository the PR belongs to (the submodule, in a
 workspace of submodules). From the wrong one it says "Could not resolve to a
 PullRequest", which reads like a broken PR.
 
-## Flagship checks
+## Fixing a check
 
-`flagship-lint --diff` runs the lint and type checks exactly as CI does. Run
-it before each push.
-
-### `Lint / ruff`
-
-- **`ruff check` and `ruff format --check`**: mechanical, always fix.
-  `--format --fix` is safe. A bare `--fix` rewrites the whole file, including
-  code the PR never touched, so read `git diff` after.
-- **Quality ratchet** (`flagship-lint --ratchet`): fails when a function's
-  complexity or statement count, or a file's length, grows past
-  `.quality/baseline.json`. Simplify the code. Record growth you mean with
-  `uv run python scripts/check_quality_ratchet.py --update --accept-regressions`,
-  and say why in the PR.
-
-### `Type check / pyright`
-
-basedpyright over the whole tree against `.basedpyright/baseline.json`. Any
-error the baseline does not record fails, including in files the PR never
-touched (a changed signature breaking a caller). Fix them. Do not disable the
-job, scatter `# pyright: ignore`, or fold unrelated type debt into the PR.
-
-### Baselines
-
-`.basedpyright/baseline.json` and `.quality/baseline.json` record existing
-debt and should only shrink.
-
-- **Stale** (the PR fixed something baselined: "Baseline is up to date"
-  fails, or `stale:` lines): run `flagship-lint --pyright --diff --fix` and
-  `flagship-lint --ratchet --fix`, and commit the result. Both only lower
-  values.
-- **Moved or renamed code**: both files are keyed by path, so moved code's
-  existing debt reads as new. Confirm it is the same code (a rename that
-  changed a type is a real finding), fix what the PR caused, re-record the
-  rest (`uv run basedpyright --writebaseline`, and the ratchet `--update`
-  above), and say in the PR what moved and how many entries.
-- **Merge conflict in a baseline**: do not hand-merge the hunks. Take the
-  base's version, then re-apply this PR's side with the two `--fix` commands,
-  and record again any growth the PR deliberately recorded.
-
-### `Migrations / migration conflicts` and `missing migrations`
-
-- `migration conflicts` fails when merging would leave an app with two leaf
-  migrations. It scans the live tip of `main`, so it can turn red with no
-  push of yours; when you are woken for it, that is why.
-- Fix: merge `origin/main` into the branch, then generate the merge migration
-  with `python manage.py makemigrations <app> --merge`. Never hand-write it,
-  and never renumber a migration already on `main`. If the PR's own migration
-  has not merged anywhere, regenerating it onto the new leaf is an
-  alternative (regenerate, do not edit `dependencies`).
-- Check locally: `python3 scripts/check_migration_conflicts.py .` from
-  `flagship/`.
-- `missing migrations`: a model changed without its migration. Run
-  `makemigrations` and commit the result.
+Read the failure before changing anything, and reproduce it locally with the
+command the check runs (the project skill names the local equivalents). Fix
+the cause, not the check: do not disable a job, skip a test, or add
+suppressions to make it pass. A check can turn red with no push of yours
+(it compares against the base branch's moving tip); when you are woken for
+one, that is a likely reason, and merging the base in is the usual start.
 
 ## Review comments
 
@@ -143,22 +100,13 @@ still wants each nit addressed or acknowledged.
 
 ### The bots
 
-| Bot                      | Author (`user.login`) | Severity                          |
-| ------------------------ | --------------------- | --------------------------------- |
-| Greptile                 | `greptile-apps[bot]`  | `P1` (worst) / `P2` / `P3` / nit  |
-| Macroscope               | `macroscopeapp[bot]`  | `🔴 High` / `🟡 Medium` / `🟢 Low` |
-| Agent Code Review (ours) | `github-actions[bot]` | `Important` / `Nit` / `Pre-existing` |
+Common third-party bots (the project skill adds its own):
 
-- **Agent Code Review** is the Cofactr workspace's own CI (`pr-automation`,
-  `.github/workflows/pr-automation-reusable.yml`), judging by
-  `.claude/skills/code-review/REVIEW.md`. Its comments carry
-  `<!-- pr-automation:code-review -->` (summary) or
-  `<!-- pr-automation:inline-code-review:<fingerprint> -->` (inline). It runs
-  once per `code-review` label, which only a person applies. **Never add the
-  label.** If a finding is wrong in a way that will recur, say in the reply
-  that `REVIEW.md` is where it should change.
-- `🚫 **[pyright]**` comments from `github-actions[bot]` on older flagship PRs
-  are output from a retired job, not findings. Skip them.
+| Bot        | Author (`user.login`) | Severity                          |
+| ---------- | --------------------- | --------------------------------- |
+| Greptile   | `greptile-apps[bot]`  | `P1` (worst) / `P2` / `P3` / nit  |
+| Macroscope | `macroscopeapp[bot]`  | `🔴 High` / `🟡 Medium` / `🟢 Low` |
+
 - **Greptile's "Comments Outside Diff."** Findings Greptile cannot anchor to a
   changed line go into one general PR comment marked
   `<!-- greptile_failed_comments -->` (a collapsed "Comments Outside Diff
@@ -178,12 +126,13 @@ still wants each nit addressed or acknowledged.
 
 Read the code the comment is about before changing anything.
 
-- Weigh by severity: look hard at `P1`/`P2`, `High`/`Medium`, `Important`.
+- Weigh by severity: look hard at `P1`/`P2`, `High`/`Medium`, and the
+  highest levels of any other bot.
   A nit that does not fit the codebase's conventions may be declined.
 - Bots misread context, flag intended design, and flag what was already
   there. Do not apply a `suggestion` block without checking it; when it is
-  right, apply it and run the checks. What a bot itself labels
-  `Pre-existing` is usually out of scope.
+  right, apply it and run the checks. What a bot itself says was already
+  there is usually out of scope.
 - Scope is the role doc's rule: what this change introduced is fixed; what
   predates it and would grow the PR is declined, with the reason.
 

@@ -5,7 +5,11 @@
 //! the config, and the agent's environment (Cursor, a container, a sandbox) may
 //! not have a Skill tool at all. So the block is advice the agent follows where
 //! it can. A name that is one of tod's own skills (`crate::skills`, shipped to
-//! every sandbox) is pointed at `tod-cli skills show` instead of the Skill tool.
+//! every sandbox) is pointed at `tod-cli skills show`. Any other is read from
+//! its `SKILL.md` under the checkout's `.claude/skills/` first, since a
+//! project may keep phase skills in a grouping folder and mark them
+//! `disable-model-invocation` (for the user's `/name` only), and Claude
+//! Code's Skill tool then refuses them; the Skill tool is the fallback.
 
 use anyhow::Result;
 use rusqlite::Connection;
@@ -55,8 +59,11 @@ pub fn render_skills(phase: &str, skills: &[String], tod_skills: &[String]) -> S
     }
     if !other.is_empty() {
         how.push_str(&format!(
-            "Use {} through your Skill tool; if you have no Skill tool, or a skill is not \
-             available to you, carry on following what it is meant to do as best you can. ",
+            "For {}, read the skill's `SKILL.md` and follow it: look under `.claude/skills/` \
+             in your working directory and its parents, in a folder named for the skill, \
+             which may sit inside a grouping folder (`.claude/skills/<group>/<name>/SKILL.md`). \
+             Only when there is no such file, use your Skill tool; if that has none either, \
+             carry on following what the skill is meant to do as best you can. ",
             quoted(&other)
         ));
     }
@@ -83,6 +90,7 @@ mod tests {
         let text = render_skills("review", &["security-review".into(), "simplify".into()], &[]);
         assert!(text.contains("review phase"), "{text}");
         assert!(text.find("`security-review`").unwrap() < text.find("`simplify`").unwrap());
+        assert!(text.contains("`.claude/skills/<group>/<name>/SKILL.md`"), "{text}");
         assert!(text.contains("Skill tool"));
         assert!(!text.contains("tod-cli skills show"), "{text}");
     }
@@ -91,9 +99,9 @@ mod tests {
     fn tods_own_skills_are_read_with_tod_cli() {
         let text = render_skills("pr", &["tod-open-pr".into(), "simplify".into()], &["tod-open-pr".into()]);
         assert!(text.contains("`tod-open-pr` is tod's own: read it with `tod-cli skills show"), "{text}");
-        assert!(text.contains("Use `simplify` through your Skill tool"), "{text}");
+        assert!(text.contains("For `simplify`, read the skill's `SKILL.md`"), "{text}");
         let only_own = render_skills("pr", &["tod-open-pr".into()], &["tod-open-pr".into()]);
-        assert!(!only_own.contains("Skill tool;"), "{only_own}");
+        assert!(!only_own.contains("SKILL.md"), "{only_own}");
     }
 
     /// The skills this repository ships for lifecycle phases are in the bundle
