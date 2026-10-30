@@ -17,9 +17,9 @@ const DEFAULT_JOURNEY_STORAGE_CAP_MB: u64 = 1024;
 /// constraint on `node_lifecycle.state` (`outline/ddl.rs`). Kept here rather
 /// than importing `tod-core`'s `LIFECYCLE_STATES`: `tod-store` is the lower
 /// layer and never depends on `tod-core`. `tod-core` tests that the two agree.
-pub const VALID_LIFECYCLE_STATES: [&str; 14] = [
+pub const VALID_LIFECYCLE_STATES: [&str; 15] = [
     "proposed", "design", "planning", "ready", "active", "verifying", "review", "pr",
-    "pr_review", "approved", "merged", "released", "learn", "done",
+    "pr_draft", "pr_review", "approved", "merged", "released", "learn", "done",
 ];
 
 fn default_journey_milestone_states() -> Vec<String> {

@@ -3,12 +3,19 @@
 Status: implemented, with the differences listed under "As built". Extends
 the `pr` state in [phase-agents.md](phase-agents.md).
 
-**Two states.** The babysitter runs in both:
+**Three states.** `pr` opens the draft; the babysitter runs in the other two:
 
-- In `pr` it gets the draft ready *before* a person looks: the PR agent takes
-  at least one turn in every stay in `pr` (so its configured skills apply,
-  even when the PR already exists and GitHub shows no work), then the same
-  loop as `pr_review` clears checks, branch drift, threads, and bot scores. A
+- In `pr` the PR agent opens the draft pull request (or, when the node was
+  moved back and one exists, reviews it and brings its description up to
+  date) and certifies the `pr` phase (`tod-cli phase certify`). The gate,
+  `pr → pr_draft`, asks that a PR is linked and open
+  (`pr-pr_draft.pr-open`) and that the phase is certified in this stay
+  (`pr-pr_draft.phase-certified`). A certificate counts only for the stay it
+  was given in, so a move back always sends the agent round again.
+- In `pr_draft` it gets the draft ready *before* a person looks: the PR
+  agent takes at least one turn in every stay in `pr_draft` (so the skills
+  configured for `pr_draft` apply, even when GitHub shows no work), then the
+  same loop as `pr_review` clears checks, branch drift, threads, and bot scores. A
   wait for the human review ends the run's work there (it is the goal), and
   the gate asks that a person has been put on it. "Run with a new session"
   forces a fresh turn.
@@ -18,7 +25,10 @@ The two states, as they were split:
 
 - `pr`: the agent opens the pull request as a **draft** (`tod-cli pr open`;
   the project's own skill for it goes under the `pr` phase in Lifecycle
-  config). Its gate, `pr → pr_review`, is app-checked: the PR is open and out
+  config) and certifies it.
+- `pr_draft`: the draft is worked on its automated feedback (the skill for
+  that goes under the `pr_draft` phase). Its gate, `pr_draft → pr_review`
+  (the one `pr` had before `pr_draft`), is app-checked: the PR is open and out
   of draft (`pr-pr_review.ready-for-review`) and a person is on it as
   reviewer, requested or already reviewed (`pr-pr_review.reviewer-assigned`).
   A person does both; the run waits at the gate until they have. These two

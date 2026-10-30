@@ -1,14 +1,17 @@
-//! The `pr` protocol: an agent opening a node's pull request (if none exists
-//! yet) as a draft in the `pr` state; then, in `pr_review`, watching CI,
-//! reviews, and comments — pushing fixes and replying, until GitHub says the
-//! PR is mergeable.
+//! The `pr` protocol: an agent opening a node's pull request as a draft in the
+//! `pr` state (or reviewing the one an earlier stay left) and certifying it
+//! ready; then, in `pr_draft` and `pr_review`, watching CI, reviews, and
+//! comments — pushing fixes and replying, until only a person is missing
+//! (`pr_draft`) or GitHub says the PR is mergeable (`pr_review`).
 //!
 //! Nothing in the reply is parsed: the app reads the pull requests linked to
 //! the node (its Ticket capability's links, where `tod-cli pr open` adds the
 //! one it opens; `tod_store::github::NodePrRepo`) and
 //! knows the protocol's job is done when the agent records `mergeable` (or
-//! `merged`, if it happened out of band) through `tod-cli pr`. The forward
-//! gates (`pr → pr_review`, `pr_review → approved`, `approved → merged`) are app-checked directly
+//! `merged`, if it happened out of band) through `tod-cli pr`, or, in `pr`,
+//! certifies the phase (`tod-cli phase certify`). The forward gates
+//! (`pr → pr_draft`, `pr_draft → pr_review`, `pr_review → approved`,
+//! `approved → merged`) are app-checked directly
 //! against GitHub (`tod_core::gate::derived`), not decided by this protocol
 //! or its agent.
 //!
@@ -34,12 +37,32 @@ use tod_store::outline::repos::NodeRepo;
 use uuid::Uuid;
 
 /// The lifecycle state whose role doc says what to do with the PR: `pr`
-/// opens a draft, `pr_review` drives it through review. The protocol also
-/// runs on a node in any other state (the action panel's Chat), which gets
-/// the `pr` doc.
+/// opens a draft and certifies it, `pr_draft` gets the draft ready for a
+/// person, `pr_review` drives it through review. The protocol also runs on a
+/// node in any other state (the action panel's Chat), which gets the `pr`
+/// doc.
 fn state_for(lifecycle: &str) -> &'static str {
-    if lifecycle == "pr_review" { "pr_review" } else { "pr" }
+    match lifecycle {
+        "pr_draft" => "pr_draft",
+        "pr_review" => "pr_review",
+        _ => "pr",
+    }
 }
+
+/// Whether the `pr` phase is certified in the node's current stay.
+fn pr_certified(fleet: &tod_store::fleet::FleetStore, node: Uuid) -> Result<bool> {
+    fleet.read(|conn| {
+        Ok(matches!(
+            tod_store::phase::PhaseRepo::new(conn).certificate_status(node, "pr")?,
+            tod_store::phase::CertificateStatus::Current(_)
+        ))
+    })
+}
+
+/// What the `pr` state's agent is sent while its draft is not certified.
+const CERTIFY_MESSAGE: &str = "The `pr` phase is not certified yet. Make sure the draft pull request is open and linked (`tod-cli pr status`), its branch pushed, and its title and description describe what was built; apply this phase's skills. Then certify the phase with `tod-cli phase certify --note <why>`. If you cannot, record why with `tod-cli pr blocked`.
+
+Your reply, when you stop, is at most a sentence or two, or nothing.";
 
 /// The report `tod-cli pr mergeable` records: the agent's job is done, the
 /// `pr_review → approved` gate can now check GitHub itself.
@@ -206,6 +229,21 @@ impl Protocol for PrProtocol {
             return Ok(Next::Done(Stop::Complete));
         }
         let node = node_id(turn.env)?;
+        let lifecycle = turn.env.fleet.read(|conn| NodeRepo::new(conn).get_lifecycle(node))?;
+        if lifecycle.as_deref() == Some("pr") {
+            // `pr` is done when its agent has certified the draft, whatever
+            // GitHub shows: the feedback on it is `pr_draft`'s work.
+            if pr_certified(turn.env.fleet, node)? {
+                return Ok(Next::Done(Stop::Complete));
+            }
+            if let Some(done) = cap_or_stall(turn) {
+                return Ok(done);
+            }
+            return Ok(Next::Continue {
+                message: CERTIFY_MESSAGE.to_string(),
+                reason: "the draft pull request is not certified yet".to_string(),
+            });
+        }
         let prs = turn.env.fleet.read(|conn| NodePrRepo::new(conn).read(node))?.prs;
         let Some(live) = live_prs(turn.env.data_root, &prs) else {
             return Ok(Next::Done(Stop::Complete));
@@ -287,8 +325,9 @@ fn pr_settings_at(data_root: &std::path::Path) -> tod_store::PrReadinessSettings
     crate::pr_readiness::settings_at(data_root)
 }
 
-/// Plays the pr agent for `--agent mock`: the first turn opens the PR and
-/// stops without finishing; the next records mergeable.
+/// Plays the pr agent for `--agent mock`. In `pr` it opens the PR if there
+/// is none and certifies the phase. Elsewhere the first turn opens the PR
+/// and stops without finishing; the next records mergeable.
 ///
 /// Without a directive the PR is a fake reference, with no GitHub call. A
 /// line `open pr: <title>` in one of the node's plan steps makes it open a
@@ -302,7 +341,13 @@ pub fn mock_turn(
     conversation_id: Uuid,
     place: super::mock::Place<'_>,
 ) -> Result<String> {
-    let has_pr = access.read(|conn| Ok(NodePrRepo::new(conn).get(node_id)?.is_some()))?;
+    let (has_pr, lifecycle) = access.read(|conn| {
+        Ok((
+            NodePrRepo::new(conn).get(node_id)?.is_some(),
+            NodeRepo::new(conn).get_lifecycle(node_id)?,
+        ))
+    })?;
+    let in_pr = lifecycle.as_deref() == Some("pr");
     if !has_pr {
         let steps = mock_step_bodies(access, node_id)?;
         match steps.iter().find_map(|body| mock_pr_title(body)) {
@@ -317,6 +362,16 @@ pub fn mock_turn(
                 })?;
             }
         }
+        if !in_pr {
+            return Ok(String::new());
+        }
+    }
+    if in_pr {
+        access.interview(tod_store::interview::InterviewCommand::PhaseCertify {
+            node_id,
+            state: "pr".to_string(),
+            note: "Mock: the draft pull request is open and ready.".to_string(),
+        })?;
         return Ok(String::new());
     }
     access.interview(

@@ -408,9 +408,9 @@ impl Autopilot {
                 });
             }
             // `approved` waits for the merge and `merged` for the release.
-            // `pr` waits for a person to take the draft too, but only after
-            // its agent has got it ready ([`Self::gate`]).
-            if lifecycle != "pr"
+            // `pr_draft` waits for a person to take the draft too, but only
+            // after its agent has got it ready ([`Self::gate`]).
+            if lifecycle != "pr_draft"
                 && let Some(outcome) = self.hold_for_github(fleet, &lifecycle)?
             {
                 hook.waiting(None, None);
@@ -467,25 +467,26 @@ impl Autopilot {
         hook: &mut H,
         from: &str,
     ) -> Result<Option<Outcome>> {
-        // In `pr` the agent opens the draft pull request, then the gate asks
-        // that a person has been put on it. In `pr_review` the babysitter
-        // comes first: it gets the pull request to where only the human
-        // review is missing, then the gate checks it.
+        // In `pr` the agent opens the draft pull request (or reviews the one
+        // an earlier stay left) and certifies it, which the gate checks. In
+        // `pr_draft` and `pr_review` the babysitter comes first: it gets the
+        // pull request to where only a person is missing, then the gate
+        // checks it.
         if from == "pr"
-            && let Some(outcome) = self.open_draft_pr(fleet, agent, hook)?
+            && let Some(outcome) = self.certify_draft_pr(fleet, agent, hook)?
         {
             return Ok(Some(outcome));
         }
-        // Both states get the pull request in order; `pr` stops short of
-        // waiting on a human (it is what gets it ready for one).
-        if (from == "pr" || from == "pr_review")
-            && let Some(outcome) = self.babysit(fleet, agent, hook, from == "pr")?
+        // `pr_draft` stops short of waiting on a human reviewer (it is what
+        // gets the draft ready for one).
+        if (from == "pr_draft" || from == "pr_review")
+            && let Some(outcome) = self.babysit(fleet, agent, hook, from == "pr_draft")?
         {
             return Ok(Some(outcome));
         }
-        // The pull request is as ready as the agent can make it: now wait for
-        // a person to mark it ready and review it.
-        if from == "pr"
+        // The draft is as ready as the agent can make it: now wait for a
+        // person to mark it ready and review it.
+        if from == "pr_draft"
             && let Some(outcome) = self.hold_for_github(fleet, from)?
         {
             hook.waiting(None, None);
@@ -605,31 +606,35 @@ impl Autopilot {
         Ok(self.pr_report(fleet)?.as_ref().and_then(blocked_why))
     }
 
-    /// Have the pull request's agent open the node's draft pull request if it
-    /// has none: the first of the `pr` state's work. `None` once one is linked
-    /// (or already was); the pull request is then got ready by
-    /// [`Self::babysit`].
-    fn open_draft_pr<A: AgentAccess + ?Sized, H: StepHook + ?Sized>(
+    /// Have the pull request's agent open the node's draft pull request, or
+    /// review the one an earlier stay left, and certify it ready: the `pr`
+    /// state's work. The agent runs in every stay, since a node moved back
+    /// may still link the pull request it had; only its certificate, which a
+    /// new stay does not carry over, lets the gate pass. `None` once the
+    /// phase is certified in this stay (and no new session was asked for).
+    fn certify_draft_pr<A: AgentAccess + ?Sized, H: StepHook + ?Sized>(
         &mut self,
         fleet: &FleetStore,
         agent: &mut A,
         hook: &mut H,
     ) -> Result<Option<Outcome>> {
         let node = self.node;
-        let linked = |fleet: &FleetStore| -> Result<bool> {
-            Ok(!fleet
-                .read(|conn| tod_store::github::NodePrRepo::new(conn).read(node))?
-                .prs
-                .is_empty())
+        let certified = |fleet: &FleetStore| -> Result<bool> {
+            fleet.read(|conn| {
+                Ok(matches!(
+                    PhaseRepo::new(conn).certificate_status(node, "pr")?,
+                    tod_store::phase::CertificateStatus::Current(_)
+                ))
+            })
         };
-        if linked(fleet)? {
+        if !self.fresh_session && certified(fleet)? {
             return Ok(None);
         }
         hook.waiting(None, None);
         if let Some(outcome) = self.converse(fleet, agent, hook, ProtocolKind::Pr, None)? {
             return Ok(Some(outcome));
         }
-        if linked(fleet)? {
+        if certified(fleet)? {
             return Ok(None);
         }
         Ok(Some(match self.blocked_report(fleet)? {
@@ -654,9 +659,9 @@ impl Autopilot {
     /// says why), so the gate checks it. What is left after that, a human
     /// review, stops the run at the gate as a request.
     ///
-    /// `before_review` is the `pr` state, whose job is getting the pull
-    /// request ready for a person to review: the agent takes at least one turn
-    /// in each stay (or when a new session was asked for), since its skills
+    /// `before_review` is the `pr_draft` state, whose job is getting the
+    /// draft pull request ready for a person to review: the agent takes at
+    /// least one turn in each stay (or when a new session was asked for), since its skills
     /// and the project's own checks apply even when GitHub shows no work, and
     /// a wait for the human review is the goal, not something to wait out.
     fn babysit<A: AgentAccess + ?Sized, H: StepHook + ?Sized>(
@@ -871,8 +876,8 @@ impl Autopilot {
         })
     }
 
-    /// The pull request conversation of this stay in `pr`, to send it the
-    /// work in; `None` starts a new one.
+    /// The pull request conversation of this stay in `pr_draft` or
+    /// `pr_review`, to send it the work in; `None` starts a new one.
     fn pr_reopen(
         &self,
         fleet: &FleetStore,

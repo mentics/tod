@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Current fleet schema epoch stored in `PRAGMA user_version`.
-pub const CURRENT_USER_VERSION: i32 = 85;
+pub const CURRENT_USER_VERSION: i32 = 86;
 
 const BUSY_TIMEOUT_MS: i64 = 5000;
 
@@ -540,6 +540,11 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
         // The `pr_review` lifecycle state.
         migrate_v84_to_v85(conn)?;
         conn.pragma_update(None, "user_version", 85)?;
+    }
+    if version < 86 {
+        // The `pr_draft` lifecycle state.
+        migrate_v85_to_v86(conn)?;
+        conn.pragma_update(None, "user_version", 86)?;
     }
     // Other branches (the task panel) numbered their own steps 66–67 at the
     // same time as 66–70 above, so a store may be past a version without
@@ -1322,6 +1327,33 @@ fn migrate_v84_to_v85(conn: &Connection) -> Result<()> {
                              'proposed', 'design', 'planning', 'ready', 'active',
                              'verifying', 'review', 'pr', 'pr_review', 'approved', 'merged',
                              'released', 'learn', 'done'
+                         )),
+             updated_at  INTEGER NOT NULL
+         );
+         INSERT INTO node_lifecycle SELECT node_id, state, updated_at FROM node_lifecycle_old;
+         DROP TABLE node_lifecycle_old;",
+    )?;
+    tx.execute_batch(crate::learn::CREATE_LEARN_TABLES)?;
+    tx.execute_batch(&crate::journey_changes::create_triggers_sql())?;
+    tx.commit()?;
+    conn.execute_batch("PRAGMA foreign_keys=ON;")?;
+    Ok(())
+}
+
+/// `node_lifecycle.state`'s CHECK constraint predates the `pr_draft` state
+/// (the draft pull request being worked before a person reviews it, after
+/// `pr` opened it); rebuilt as in [`migrate_v62_to_v63`].
+fn migrate_v85_to_v86(conn: &Connection) -> Result<()> {
+    conn.execute_batch("PRAGMA foreign_keys=OFF;")?;
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch(
+        "ALTER TABLE node_lifecycle RENAME TO node_lifecycle_old;
+         CREATE TABLE node_lifecycle (
+             node_id     BLOB PRIMARY KEY NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+             state       TEXT NOT NULL CHECK (state IN (
+                             'proposed', 'design', 'planning', 'ready', 'active',
+                             'verifying', 'review', 'pr', 'pr_draft', 'pr_review', 'approved',
+                             'merged', 'released', 'learn', 'done'
                          )),
              updated_at  INTEGER NOT NULL
          );

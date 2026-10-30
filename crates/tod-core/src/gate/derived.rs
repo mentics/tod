@@ -25,7 +25,8 @@ use tod_store::outline::{
 };
 
 pub use tod_store::outline::{
-    APPROVED_MERGED_PR_MERGED_SLUG, PR_APPROVED_MERGEABLE_SLUG, PR_PR_REVIEW_READY_SLUG, PR_PR_REVIEW_REVIEWER_SLUG,
+    APPROVED_MERGED_PR_MERGED_SLUG, PR_APPROVED_MERGEABLE_SLUG, PR_PR_DRAFT_PHASE_CERTIFIED_SLUG,
+    PR_PR_DRAFT_PR_OPEN_SLUG, PR_PR_REVIEW_READY_SLUG, PR_PR_REVIEW_REVIEWER_SLUG,
 };
 use tod_store::outline::{
     PR_APPROVED_REVIEW_CURRENT_SLUG, PR_APPROVED_REVIEW_SCORE_SLUG, PR_APPROVED_THREADS_RESOLVED_SLUG,
@@ -86,6 +87,8 @@ pub fn evaluate_derived_criterion(
         REVIEW_APPROVED_FINDINGS_ANSWERED_SLUG => {
             findings_answered_outcome(conn, node_id).map(Some)
         }
+        PR_PR_DRAFT_PR_OPEN_SLUG => pr_open_outcome(conn, node_id).map(Some),
+        PR_PR_DRAFT_PHASE_CERTIFIED_SLUG => phase_certified_outcome(conn, node_id, "pr").map(Some),
         PR_PR_REVIEW_READY_SLUG => pr_ready_for_review_outcome(conn, node_id).map(Some),
         PR_PR_REVIEW_REVIEWER_SLUG => pr_reviewer_outcome(conn, node_id).map(Some),
         PR_APPROVED_MERGEABLE_SLUG => pr_mergeable_outcome(conn, node_id).map(Some),
@@ -549,6 +552,43 @@ fn linked_prs(
         )));
     };
     Ok(Ok((links.prs, github)))
+}
+
+/// Every linked PR is open (a draft is what `pr` opens) or already merged:
+/// the `pr → pr_draft` check that the agent's pull request exists.
+fn pr_open_outcome(conn: &Connection, node_id: Uuid) -> Result<DerivedOutcome> {
+    let (prs, github) = match linked_prs(conn, node_id)? {
+        Ok(found) => found,
+        Err(outcome) => return Ok(outcome),
+    };
+    let mut passed = Vec::new();
+    for pr in &prs {
+        let status = match github.get_pr_status(&pr.owner, &pr.repo, pr.pr_number) {
+            Ok(status) => status,
+            Err(err) => return Ok(fail(format!("Could not read {}: {err}", pr.url))),
+        };
+        match pr_open(&pr.url, &status) {
+            Ok(line) => passed.push(line),
+            Err(why) => return Ok(fail(why)),
+        }
+    }
+    Ok(DerivedOutcome {
+        outcome: OUTCOME_PASS,
+        detail: passed.join(" "),
+    })
+}
+
+/// Why `status` is not an open (or merged) pull request, or what it is.
+pub(crate) fn pr_open(url: &str, status: &tod_store::github::PrStatus) -> std::result::Result<String, String> {
+    if status.merged {
+        Ok(format!("{url} is already merged."))
+    } else if !status.open {
+        Err(format!("{url} is closed: reopen it, or open another with `tod-cli pr open`."))
+    } else if status.draft {
+        Ok(format!("{url} is open as a draft."))
+    } else {
+        Ok(format!("{url} is open."))
+    }
 }
 
 /// Why `status` is not ready for a person to review, or what says it is.
@@ -1575,6 +1615,15 @@ mod readiness_tests {
         assert!(ready_for_review("u", &pr_status(false, true, &[])).is_ok());
         let merged = tod_store::github::PrStatus { merged: true, open: false, ..pr_status(false, false, &[]) };
         assert!(ready_for_review("u", &merged).is_ok());
+    }
+
+    #[test]
+    fn a_draft_counts_as_open_but_a_closed_pr_does_not() {
+        assert!(pr_open("u", &pr_status(true, true, &[])).unwrap().contains("draft"));
+        assert!(pr_open("u", &pr_status(false, true, &[])).is_ok());
+        assert!(pr_open("u", &pr_status(false, false, &[])).unwrap_err().contains("closed"));
+        let merged = tod_store::github::PrStatus { merged: true, open: false, ..pr_status(false, false, &[]) };
+        assert!(pr_open("u", &merged).is_ok());
     }
 
     #[test]

@@ -514,7 +514,7 @@ the same `git::push_branch`, moved to `tod-core`. Triggers:
 - before the run **stops** for a wait, needs-human, or done;
 - before a node **moves** between locations (uncommitted work does not
   travel, so commit then push);
-- after a **fix round in `pr`**, so the pull request shows it. This is
+- after a **fix round in `pr_draft` or `pr_review`**, so the pull request shows it. This is
   already a step boundary.
 
 Not on a timer: a clock does not know whether the work is in a state worth

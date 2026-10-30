@@ -237,10 +237,10 @@ impl RunnerAction {
 }
 
 /// Whether "Check now" has something to read: the node is in a state that
-/// waits on its pull requests (`pr`, `approved`, `merged`; any other state
+/// waits on its pull requests (`pr_draft`, `approved`, `merged`; any other state
 /// "waits for nothing there"), it has pull requests linked, and it is not done.
 fn offers_check_now(lifecycle: &str, has_pull_requests: bool, done: bool) -> bool {
-    !done && has_pull_requests && matches!(lifecycle, "pr" | "approved" | "merged")
+    !done && has_pull_requests && matches!(lifecycle, "pr_draft" | "approved" | "merged")
 }
 
 /// The split button: its default action (with its label and whether it is
@@ -1518,12 +1518,12 @@ mod tests {
 
     #[test]
     fn check_now_is_offered_for_a_state_that_waits_on_its_pull_requests() {
-        for state in ["pr", "approved", "merged"] {
+        for state in ["pr_draft", "approved", "merged"] {
             assert!(offers_check_now(state, true, false), "{state}");
             assert!(!offers_check_now(state, false, false), "{state} without a pull request");
             assert!(!offers_check_now(state, true, true), "{state} when done");
         }
-        for state in ["", "proposed", "design", "planning", "implementing", "verifying", "review", "released", "learn"] {
+        for state in ["", "proposed", "design", "planning", "implementing", "verifying", "review", "pr", "released", "learn"] {
             assert!(!offers_check_now(state, true, false), "{state:?} reads nothing on GitHub");
         }
     }

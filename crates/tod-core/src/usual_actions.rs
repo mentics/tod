@@ -163,7 +163,8 @@ mod tests {
     #[test]
     fn the_evaluator_is_shown_its_verdict_commands_in_every_certifiable_state() {
         let entries = shipped();
-        for state in CERTIFIABLE_STATES {
+        // A certifiable state no phase agent works (`pr`) has no evaluator.
+        for state in CERTIFIABLE_STATES.into_iter().filter(|s| PHASE_AGENT_STATES.contains(s)) {
             let text = render_entries(&entries, Role::Evaluate, state, true)
                 .unwrap_or_else(|| panic!("nothing for the evaluator in `{state}`"));
             assert!(text.contains("phase certify") && text.contains("phase reject"));

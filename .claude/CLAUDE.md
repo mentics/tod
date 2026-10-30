@@ -155,7 +155,10 @@ guidance for efficiency, never enforced, and ships with the app (shaped to move
 to the data root someday, not editable now). Each `run` must name a real
 `<noun> <verb>` (`tod_cli::doc_sync` checks); syntax stays in `cli/<noun>.md`.
 
-**PR babysitter** (`doc/lifecycle/pr-readiness.md`). In `pr` the autopilot's
+**PR babysitter** (`doc/lifecycle/pr-readiness.md`). In `pr` the PR agent
+opens the draft (or reviews the one a move back left) and certifies the `pr`
+phase itself, which `pr → pr_draft` checks; the certificate counts only for
+that stay. In `pr_draft` and `pr_review` the autopilot's
 `babysit` (`autopilot/mod.rs`) drives the pull request until only the human
 review is missing: `tod_core::pr_readiness` reads it from GitHub
 (`Assessment`: open review threads, the branch behind its base, failing

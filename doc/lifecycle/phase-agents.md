@@ -16,7 +16,7 @@ digest and passes only while nothing it covers has changed since.
 through the whole lifecycle with no user intervention whenever it can. It stops
 only for something that only the user can supply, such as a missing intent, a
 decision that belongs to them, or an access grant. Required human PR review is
-the one exception: it naturally holds `pr → pr_review` until the PR has a reviewer, and `pr_review → approved` until the PR is
+the one exception: it naturally holds `pr_draft → pr_review` until the PR has a reviewer, and `pr_review → approved` until the PR is
 mergeable. Anything an agent can fix confidently, an agent fixes. A stop that
 makes the user ask "why did you stop to ask me that?" is a bug.
 
@@ -34,7 +34,7 @@ This design does two things:
 
 | Term | Meaning |
 |---|---|
-| **Phase agent** | The agent for one lifecycle state. It runs while the node is in that state and the gate does not pass. It replaces both the on-entry turn and the gate-check agent. Implement, verify, review, fix and pr are the phase agents of `active`, `verifying`, `review`, `pr` and `pr_review`, and keep their current protocols. |
+| **Phase agent** | The agent for one lifecycle state. It runs while the node is in that state and the gate does not pass. It replaces both the on-entry turn and the gate-check agent. Implement, verify, review, fix and pr are the phase agents of `active`, `verifying`, `review`, `pr`, `pr_draft` and `pr_review`, and keep their current protocols. |
 | **Certificate** | A row saying "phase *S* of node *N* was judged complete, over inputs with digest *D*, by session *X*". Only the app computes *D*; the agent just asks for the certificate. |
 | **Evaluator** | A fresh agent session, separate from the phase agent, that judges the phase and certifies it or sends it back. Used when the setting below is on. |
 | **Gate** | The app's deterministic check for leaving a state. It combines the derived criteria we already have with, for some states, "a current certificate exists". |
@@ -170,7 +170,8 @@ Waive for the certificate criterion. Force advance stays as it is.
 | active → verifying | `plan-steps-implemented` (derived) | — | Unchanged; implement is the phase agent. |
 | verifying → review | `obligations-verified`, `plan-steps-verified` (derived) | — | Unchanged; verify is the phase agent. The 9 agent criteria are retired: what they asked is either already in the verify protocol's instructions or is now covered by the verdicts. |
 | review → pr | `review-done`, `findings-answered` (derived) | — | Unchanged. |
-| pr → pr_review | `ready-for-review`, `reviewer-assigned` (derived, GitHub) | — | The `pr` agent only opens the draft PR; a person marks it ready and requests a reviewer. Hardcoded; to be made scriptable per project. |
+| pr → pr_draft | `pr-open` (derived, GitHub); **certified** | nothing (empty digest) | The `pr` agent opens the draft PR, or reviews the one an earlier stay left, and certifies it itself (no evaluator, whatever `independent_evaluation` says). The certificate is for this stay only, so a node moved back gets the agent again rather than passing on a PR that already exists. |
+| pr_draft → pr_review | `ready-for-review`, `reviewer-assigned` (derived, GitHub) | — | The gate `pr` used to have, moved. The `pr_draft` agent clears checks and bot feedback on the draft (its own Lifecycle config skills); a person marks it ready and requests a reviewer. Hardcoded; to be made scriptable per project. |
 | pr_review → approved | `mergeable`, `up-to-date`, `threads-resolved`, `review-current`, `review-score` (derived, GitHub) | — | The gate `pr` used to have, moved. `pr_review` is the phase agent (the babysitter, `doc/lifecycle/pr-readiness.md`). |
 | approved → merged | `pr-merged` (derived, GitHub) | — | Unchanged. The run waits for the merge (see "Waiting on GitHub" below). |
 | merged → released | **certified** | nothing (empty digest) | Release evidence recorded. The certificate note carries the evidence. The run first waits for a release whose notes name the PR. |
