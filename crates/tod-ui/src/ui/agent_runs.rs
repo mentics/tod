@@ -1282,7 +1282,7 @@ mod tests {
         fn complete_running(registry: &gpui::Entity<AgentRuns>, cx: &mut TestAppContext) {
             registry.update(cx, |registry, cx| {
                 let agent = registry.agent().clone();
-                let fleet = registry.fleet().clone();
+                let fleet = registry.fleet.clone();
                 for (id, mut driver) in registry.take_running() {
                     driver.tick(&fleet, &mut SharedAgentAccess(&agent));
                     registry.put_back(id, driver);
@@ -1477,7 +1477,7 @@ mod tests {
         cx.run_until_parked();
         registry.update(cx, |registry, cx| {
             let agent = registry.agent().clone();
-            let fleet = registry.fleet().clone();
+            let fleet = registry.fleet.clone();
             for (id, mut driver) in registry.take_running() {
                 driver.tick(&fleet, &mut SharedAgentAccess(&agent));
                 registry.put_back(id, driver);
