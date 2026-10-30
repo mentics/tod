@@ -162,7 +162,9 @@ impl Protocol for ImplementationProtocol {
             })
             .context("could not read the inherited context")?;
         let lifecycle = Some(node.lifecycle.clone());
-        let working_dir = PathBuf::from(self.cwd(env)?.path_text());
+        let cwd = self.cwd(env)?;
+        let working_dir = PathBuf::from(cwd.path_text());
+        let skills = crate::skills_context::for_node(fleet, node_id, "implement", &cwd)?;
         build_implement_message(
             env.media,
             &ImplementRequest {
@@ -179,7 +181,7 @@ impl Protocol for ImplementationProtocol {
                 obligations,
                 ancestor_context,
                 verdicts: super::verify::current_verdicts(fleet, node_id),
-                skills: crate::skills_context::for_node(fleet, node_id, "implement"),
+                skills,
                 pull_requests: crate::pr_context::for_node(fleet, node_id),
             },
         )

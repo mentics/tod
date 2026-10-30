@@ -61,6 +61,7 @@ fn build_request<'a>(
     from: &str,
     to: &str,
     criteria: Vec<(tod_store::outline::GateCriterion, Option<tod_store::outline::NodeGateEvaluation>)>,
+    cwd: &Workdir,
 ) -> Result<crate::gate::GateCheckRequest<'a>> {
     let fleet = env.fleet;
     let node_row = fleet
@@ -108,7 +109,7 @@ fn build_request<'a>(
         ancestor_context,
         plan_steps,
         work_history,
-        skills: crate::skills_context::for_node(fleet, node, from),
+        skills: crate::skills_context::for_node(fleet, node, from, cwd)?,
         pull_requests: crate::pr_context::for_node(fleet, node),
         from_state: from.to_string(),
         to_state: to.to_string(),
@@ -164,7 +165,8 @@ fn opening_for(
 ) -> Result<String> {
     let (state, to) = transition(env)?;
     let node = node_id(env)?;
-    let request = build_request(env, node, &state, &to, Vec::new())?;
+    let cwd = focus_cwd_or_scratch(env, purpose)?;
+    let request = build_request(env, node, &state, &to, Vec::new(), &cwd)?;
     // The commands this role usually runs in this state, ahead of the status
     // that says what the gate lacks (`cli/usual-actions.yml`).
     let usual = crate::usual_actions::render(
