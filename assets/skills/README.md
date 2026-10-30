@@ -7,10 +7,14 @@ do not know how.
 | Skill | Use it when |
 |---|---|
 | `journeys` | You are asked to look at a journey (a node's, or the user's recent activity): how work on a node went, or what the user did. |
-| `tod-open-pr` | You open a node's pull request, or bring its title and description up to date. |
-| `tod-fix-ci` | A node's pull request has failing checks or review comments to answer. |
+| `tod-open-pr` | You make sure a node has one up-to-date draft pull request per changed repository, and certify the `pr` phase. |
+| `tod-fix-ci` | A node's pull request has failing checks or review comments to answer (`pr_draft`, `pr_review`). |
 
 A skill may also be chosen for a lifecycle phase (the Lifecycle config
 capability, by name); the phase's context then tells its agent to read it.
+`tod-open-pr` is meant for the `pr` phase and `tod-fix-ci` for `pr_draft` and
+`pr_review`. Both are generic: a project's own details (its repositories,
+required checks, review bots, title format) go in a skill of the project's
+own, listed after tod's for the same phase.
 
 To add a skill, write `assets/skills/<name>.md` and list it above.
