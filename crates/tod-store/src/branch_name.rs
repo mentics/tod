@@ -7,6 +7,13 @@
 //! `ready` → `active` gate). A branch a node already has is never renamed, so
 //! changing the template only affects nodes that have none yet.
 //!
+//! `[...]` marks an optional section: its text is kept only when every
+//! variable inside it has a value (today only `{ticket}` and `{ticket_lower}`
+//! can lack one), and dropped whole otherwise, so `task/[{ticket_lower}-]{title}`
+//! is `task/tod-142-fix-login` for a node with a ticket and `task/fix-login`
+//! for one without. Sections do not nest. A variable outside any section that
+//! has no value is an error.
+//!
 //! A variable's value is cleaned to characters git accepts in a branch name,
 //! so only the template's own text can make an invalid name. A template that
 //! names an unknown variable, or a variable the node has no value for (no
@@ -26,11 +33,11 @@ pub const BRANCH_VARIABLES: &[(&str, &str)] = &[
     ),
     (
         "ticket",
-        "the ticket on the node's Ticket capability, as written in Linear (e.g. TOD-142); an error for a node with no ticket",
+        "the ticket on the node's Ticket capability, as written in Linear (e.g. TOD-142); a node with no ticket has none (see [ ])",
     ),
     (
         "ticket_lower",
-        "the same ticket in lowercase (e.g. tod-142), as Linear names its own branches; an error for a node with no ticket",
+        "the same ticket in lowercase (e.g. tod-142), as Linear names its own branches; a node with no ticket has none (see [ ])",
     ),
     ("title", "the node's title as lowercase words, without the ticket (e.g. fix-login)"),
     ("id", "the first 8 characters of the node's id; unique per node"),
@@ -45,29 +52,75 @@ pub struct BranchVars<'a> {
     pub ticket: Option<&'a str>,
 }
 
+/// The node has no ticket: an error outside an optional section, and what
+/// drops the section inside one.
+#[derive(Debug)]
+struct NoTicket(String);
+
+impl std::fmt::Display for NoTicket {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "branch_template uses {{{}}}, but this node has no ticket (its Ticket capability links none); \
+             put the part that needs it in [ ] to leave it out for such nodes",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for NoTicket {}
+
 /// The branch name for `vars` from `template`.
 pub fn render(template: &str, vars: &BranchVars<'_>) -> Result<String> {
     let mut out = String::new();
     let mut rest = template;
+    while let Some(at) = rest.find(['[', ']']) {
+        out.push_str(&expand(&rest[..at], vars)?);
+        if rest[at..].starts_with(']') {
+            bail!("branch_template has a `]` with no `[` before it: {template:?}");
+        }
+        let after = &rest[at + 1..];
+        let Some(close) = after.find([']', '[']) else {
+            bail!("branch_template has a `[` that is never closed: {template:?}");
+        };
+        if after[close..].starts_with('[') {
+            bail!("branch_template has a `[ ]` section inside another; sections do not nest: {template:?}");
+        }
+        match expand(&after[..close], vars) {
+            Ok(text) => out.push_str(&text),
+            Err(err) if err.is::<NoTicket>() => {}
+            Err(err) => return Err(err),
+        }
+        rest = &after[close + 1..];
+    }
+    out.push_str(&expand(rest, vars)?);
+    check_ref(&out, template)?;
+    Ok(out)
+}
+
+/// `text` with its `{variables}` filled in.
+fn expand(text: &str, vars: &BranchVars<'_>) -> Result<String> {
+    let mut out = String::new();
+    let mut rest = text;
     while let Some(open) = rest.find(['{', '}']) {
         out.push_str(&rest[..open]);
         if rest[open..].starts_with('}') {
-            bail!("branch_template has a `}}` with no `{{` before it: {template:?}");
+            bail!("branch_template has a `}}` with no `{{` before it: {text:?}");
         }
         let Some(len) = rest[open..].find('}') else {
-            bail!("branch_template has a `{{` that is never closed: {template:?}");
+            bail!("branch_template has a `{{` that is never closed: {text:?}");
         };
         let name = &rest[open + 1..open + len];
         out.push_str(&value(name, vars)?);
         rest = &rest[open + len + 1..];
     }
     out.push_str(rest);
-    check_ref(&out, template)?;
     Ok(out)
 }
 
-/// Whether `template` is usable: every variable is known and a node that has
-/// every value gets a valid branch name from it.
+/// Whether `template` is usable: every variable is known and it makes a valid
+/// branch name both for a node with every value and for one with no ticket
+/// (where an error is only the ticket missing from outside a `[ ]` section).
 pub fn validate_template(template: &str) -> Result<()> {
     let sample = BranchVars {
         id: "0a1b2c3d",
@@ -75,19 +128,18 @@ pub fn validate_template(template: &str) -> Result<()> {
         title: "fix-login",
         ticket: Some("TOD-142"),
     };
-    render(template, &sample).map(|_| ())
+    render(template, &sample)?;
+    match render(template, &BranchVars { ticket: None, ..sample }) {
+        Err(err) if !err.is::<NoTicket>() => Err(err),
+        _ => Ok(()),
+    }
 }
 
 fn value(name: &str, vars: &BranchVars<'_>) -> Result<String> {
     let ticket = || {
         vars.ticket
             .filter(|t| !t.trim().is_empty())
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "branch_template uses {{{name}}}, but this node has no ticket \
-                     (its Ticket capability links none)"
-                )
-            })
+            .ok_or_else(|| anyhow::Error::new(NoTicket(name.to_string())))
     };
     let raw = match name {
         "slug" => vars.slug.to_string(),
@@ -186,7 +238,44 @@ mod tests {
     #[test]
     fn a_missing_ticket_is_an_error_not_a_blank() {
         let err = render("{ticket}-{slug}", &vars(None)).unwrap_err().to_string();
-        assert!(err.contains("no ticket"), "{err}");
+        assert!(err.contains("no ticket") && err.contains("[ ]"), "{err}");
+    }
+
+    #[test]
+    fn an_optional_section_is_kept_with_a_ticket_and_dropped_without() {
+        let t = "task/[{ticket_lower}-]{title}";
+        assert_eq!(render(t, &vars(Some("TOD-142"))).unwrap(), "task/tod-142-Fix-the-login");
+        assert_eq!(render(t, &vars(None)).unwrap(), "task/Fix-the-login");
+        // Text with no variable is always kept; a section holds several variables.
+        assert_eq!(render("a[/x]/{id}", &vars(None)).unwrap(), "a/x/0a1b2c3d");
+        assert_eq!(render("[{ticket}/{id}-]{slug}", &vars(None)).unwrap(), "tod-142-fix-login");
+    }
+
+    #[test]
+    fn a_variable_outside_a_section_still_needs_its_value() {
+        assert!(render("[{ticket}-]{ticket}", &vars(None)).is_err());
+    }
+
+    #[test]
+    fn a_typo_inside_a_section_is_not_hidden() {
+        let err = render("x/[{tickt}-]{slug}", &vars(None)).unwrap_err().to_string();
+        assert!(err.contains("{tickt}"), "{err}");
+    }
+
+    #[test]
+    fn sections_must_pair_and_not_nest() {
+        for t in ["x[{slug}", "x]{slug}", "[a[b]]{slug}", "[a]]{slug}"] {
+            assert!(render(t, &vars(Some("T-1"))).is_err(), "{t:?}");
+        }
+    }
+
+    #[test]
+    fn validation_checks_the_no_ticket_name_too() {
+        assert!(validate_template("task/[{ticket_lower}-]{title}").is_ok());
+        // Valid with a ticket, but `task//…` without one.
+        assert!(validate_template("task/[{ticket_lower}]/{title}").is_err());
+        // Needs a ticket outright: allowed, errors per node at launch.
+        assert!(validate_template("{ticket}-{title}").is_ok());
     }
 
     #[test]

@@ -3412,7 +3412,10 @@ fn branch_template_help() -> String {
         .map(|(name, what)| format!("{{{name}}} is {what}"))
         .collect();
     format!(
-        "The name of the git branch a node works on, made when the node first needs one; a node that already has a branch keeps it. Empty uses {DEFAULT_BRANCH_TEMPLATE}. Variables: {}.",
+        "The name of the git branch a node works on, made when the node first needs one; a node that already has a branch keeps it. Empty uses {DEFAULT_BRANCH_TEMPLATE}. \
+         Text in [ ] is optional: it is kept only if every variable inside it has a value, and left out otherwise. \
+         For example task/[{{ticket_lower}}-]{{title}} is task/tod-142-fix-login for a node with a ticket and task/fix-login for one without. \
+         A variable outside [ ] that a node has no value for is an error when its branch is made. Variables: {}.",
         variables.join("; ")
     )
 }

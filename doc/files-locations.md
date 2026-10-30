@@ -40,8 +40,10 @@ per-node state**:
   an agent: the `branch_template` setting (Settings → Workspaces, default
   `task/{slug}`) with `{slug}`, `{ticket}`, `{ticket_lower}`, `{title}` and
   `{id}` filled in from the node (`tod_store::branch_name`; the ticket is the
-  node's Ticket capability link, e.g. a Linear id). A template that needs a
-  ticket is an error for a node without one. A branch a node already has is
+  node's Ticket capability link, e.g. a Linear id). Text in `[ ]` is optional,
+  kept only when every variable in it has a value
+  (`task/[{ticket_lower}-]{title}`); a ticket variable outside `[ ]` is an
+  error for a node without a ticket. A branch a node already has is
   never renamed. Every node with a location is on a unique branch.
 - A node with no worktree or sandbox shares the workspace directory.
 
