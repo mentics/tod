@@ -162,7 +162,7 @@ impl AgentRuns {
                     })
                     .await;
                 let Ok(()) = this.update(cx, |this, cx| {
-                    for (id, mut driver, events) in ticked {
+                    for (id, driver, events) in ticked {
                         // Every run collected here can block on a permission,
                         // not only one a view shows.
                         if let Some(request) = driver.status().permission {
@@ -188,10 +188,6 @@ impl AgentRuns {
                 };
             }
         }));
-    }
-
-    pub fn fleet(&self) -> &Arc<FleetStore> {
-        &self.fleet
     }
 
     pub fn agent(&self) -> &SharedAgent {
@@ -335,18 +331,6 @@ impl AgentRuns {
     pub fn put_back(&mut self, id: u64, driver: ConversationDriver) {
         if let Some(slot) = self.slots.iter_mut().find(|s| s.id == id) {
             slot.put_back(driver);
-        }
-    }
-
-    /// The slot `id`'s driver, when it is here (not away on the background
-    /// executor).
-    pub fn driver_mut(&mut self, id: u64) -> Option<&mut ConversationDriver> {
-        self.slots.iter_mut().find(|s| s.id == id).and_then(|s| s.driver_mut())
-    }
-
-    pub fn set_status(&mut self, id: u64, status: ConversationStatus) {
-        if let Some(slot) = self.slots.iter_mut().find(|s| s.id == id) {
-            slot.status = status;
         }
     }
 

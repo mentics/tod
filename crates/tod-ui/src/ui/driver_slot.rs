@@ -75,11 +75,6 @@ impl DriverSlot {
         self.elsewhere
     }
 
-    /// The driver, when it is here.
-    pub fn driver_mut(&mut self) -> Option<&mut ConversationDriver> {
-        self.driver.as_mut()
-    }
-
     /// Take the driver to send a message: `None` when it is working already
     /// (or away). Until it comes back the slot reads as starting a turn.
     pub fn take_to_send(&mut self) -> Option<ConversationDriver> {

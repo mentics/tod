@@ -7,8 +7,11 @@
 //! back through a channel/task.
 
 use image::RgbaImage;
+#[cfg(all(feature = "agent-socket", any(windows, target_os = "macos")))]
 use std::fs::File;
+#[cfg(all(feature = "agent-socket", any(windows, target_os = "macos")))]
 use std::io::BufWriter;
+#[cfg(all(feature = "agent-socket", any(windows, target_os = "macos")))]
 use std::path::Path;
 #[cfg(windows)]
 use std::sync::Mutex;
@@ -31,6 +34,7 @@ pub fn capture_app_screenshot() -> Option<RgbaImage> {
 /// Encode an RGBA image as a PNG to `path`, creating parent directories as
 /// needed. Used both by the agent socket's `shot` command and by
 /// `report_problem`'s bundle attachment.
+#[cfg(all(feature = "agent-socket", any(windows, target_os = "macos")))]
 pub fn write_png_fast(path: &Path, img: &RgbaImage) -> Result<(), String> {
     use image::codecs::png::{CompressionType, FilterType, PngEncoder};
     use image::{ExtendedColorType, ImageEncoder};

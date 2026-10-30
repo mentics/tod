@@ -40,7 +40,7 @@ use gpui_component::Sizable as _;
 use gpui_component::Disableable as _;
 use gpui_component::button::Button;
 use gpui_component::scroll::Scrollbar;
-use tod_core::conversation::{ConversationStatus, SharedAgentAccess};
+use tod_core::conversation::ConversationStatus;
 use tod_core::runner_status::{LiveTurn, format_tokens};
 use tod_core::next_actor::{NextActor, NodeStanding};
 use crate::views::task_list::standing::{self, PartTone};
