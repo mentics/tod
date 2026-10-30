@@ -28,7 +28,7 @@ use anyhow::Result;
 use rusqlite::Connection;
 use std::collections::HashMap;
 use tod_store::activity::{
-    ActivityRepo, KIND_CLOUD_START, KIND_GATE_CHECK, KIND_INCOMING_CHECK, KIND_PROTOCOL_PREFIX, KIND_RUN, Lease,
+    ActivityRepo, KIND_CLOUD_REPAIR, KIND_CLOUD_START, KIND_GATE_CHECK, KIND_INCOMING_CHECK, KIND_PROTOCOL_PREFIX, KIND_RUN, Lease,
 };
 use tod_store::cloud_activity::CloudBeat;
 use tod_store::conversation::ProtocolKind;
@@ -76,6 +76,9 @@ pub enum Work {
     /// begin. Set the moment the user clicks, so the node never reads as
     /// waiting on them while their own request is being carried out.
     CloudStart,
+    /// The app is replacing the node's lost cloud sandbox, or reinstalling
+    /// one left on an older build, so its supervisor can run again.
+    CloudRepair,
     /// Processing whose lease kind this version does not know. Still work:
     /// the lease proves it, so it is shown rather than dropped.
     Other,
@@ -90,6 +93,7 @@ impl Work {
         match kind {
             KIND_RUN => Self::Runner,
             KIND_CLOUD_START => Self::CloudStart,
+            KIND_CLOUD_REPAIR => Self::CloudRepair,
             KIND_GATE_CHECK => Self::GateCheck,
             KIND_INCOMING_CHECK => Self::IncomingCheck,
             _ => Self::Other,
@@ -816,6 +820,14 @@ mod tests {
         c.leases = vec![live_lease(KIND_CLOUD_START, 40)];
         assert_eq!(standing(&c).actor, NextActor::Working { what: Work::CloudStart, since: 40 });
         assert_eq!(Work::from_kind(KIND_CLOUD_START), Work::CloudStart);
+    }
+
+    #[test]
+    fn the_app_repairing_a_nodes_sandbox_is_work() {
+        let mut c = case("pr_draft");
+        c.leases = vec![live_lease(KIND_CLOUD_REPAIR, 40)];
+        assert_eq!(standing(&c).actor, NextActor::Working { what: Work::CloudRepair, since: 40 });
+        assert_eq!(Work::from_kind(KIND_CLOUD_REPAIR), Work::CloudRepair);
     }
 
     #[test]

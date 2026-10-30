@@ -314,6 +314,7 @@ fn work_label(work: &Work) -> String {
         Work::Runner => "the autopilot run".to_string(),
         Work::Cloud => "in the cloud".to_string(),
         Work::CloudStart => "starting in the cloud".to_string(),
+        Work::CloudRepair => "repairing its cloud sandbox".to_string(),
         Work::Other => "background processing".to_string(),
     }
 }

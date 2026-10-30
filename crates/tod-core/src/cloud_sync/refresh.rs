@@ -17,7 +17,7 @@ use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::path::Path;
-use tod_store::cloud_nodes::{self, CloudNodeRow};
+use tod_store::cloud_nodes::CloudNodeRow;
 use tod_store::fleet::FleetStore;
 
 /// Where each node's last install is recorded, under the data root.
@@ -62,8 +62,13 @@ fn load(root: &Path) -> BTreeMap<String, String> {
         .unwrap_or_default()
 }
 
+/// Held across [`record`]'s read-modify-write: nodes are repaired at once,
+/// each recording its own install when it is done.
+static RECORDING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Records that `node_id`'s sandbox now has the install `stamp` stands for.
 pub fn record(root: &Path, node_id: &str, stamp: &str) -> Result<()> {
+    let _held = RECORDING.lock().unwrap_or_else(|e| e.into_inner());
     let mut all = load(root);
     all.insert(node_id.to_string(), stamp.to_string());
     std::fs::write(root.join(STAMPS_FILE), serde_json::to_string_pretty(&all)?)
@@ -86,40 +91,36 @@ pub fn stale_rows(
         .collect()
 }
 
-/// Reinstalls every cloud node whose sandbox is out of date and idle.
-/// Returns how many it did. Blocks on the network: never on the UI thread.
-pub fn refresh_stale(fleet: &FleetStore) -> Result<usize> {
+/// The cloud nodes among `rows` whose sandbox is out of date and idle, and
+/// not one the user deleted, with the install they should have. A failure to
+/// read a node's heartbeat is an error, not taken for idle.
+pub fn stale(fleet: &FleetStore, rows: &[CloudNodeRow]) -> Result<(Vec<CloudNodeRow>, String)> {
     let root = fleet.paths().root().to_path_buf();
-    let rows = fleet.read(cloud_nodes::list)?;
-    if rows.is_empty() {
-        return Ok(0);
-    }
     let current = install_stamp()?;
     let now = tod_store::outline::uuid_blob::now_ms();
-    let stale = stale_rows(&rows, &load(&root), &current, |row| {
-        fleet
+    let mut busy = std::collections::HashSet::new();
+    for row in rows {
+        if fleet
             .read(|conn| tod_store::cloud_activity::get(conn, row.node_id))
-            .ok()
-            .flatten()
+            .with_context(|| format!("read node {}'s cloud heartbeat", row.node_id))?
             .is_some_and(|beat| beat.is_live(now))
-    });
-    let mut done = 0;
-    for row in stale {
-        let id = row.node_id.to_string();
-        if super::sandbox_deleted_by_user(&root, &id) {
-            continue;
-        }
-        tracing::info!("cloud: {id}: its sandbox has an older install; reinstalling");
-        match ensure_node_sandbox(fleet, &root, &id, &row.user, &mut |m| super::log_progress(&format!("refresh {id}"), m)) {
-            Ok(_) => {
-                record(&root, &id, &current)?;
-                done += 1;
-            }
-            // Said, and tried again at the next launch: never dropped.
-            Err(err) => tracing::warn!("cloud: {id}: reinstalling its sandbox failed: {err:#}"),
+        {
+            busy.insert(row.node_id);
         }
     }
-    Ok(done)
+    let mut stale = stale_rows(rows, &load(&root), &current, |row| busy.contains(&row.node_id));
+    stale.retain(|row| !super::sandbox_deleted_by_user(&root, &row.node_id.to_string()));
+    Ok((stale, current))
+}
+
+/// Reinstalls `row`'s sandbox on this build ([`ensure_node_sandbox`]) and
+/// records it. Blocks on the network: never on the UI thread.
+pub fn reinstall(fleet: &FleetStore, row: &CloudNodeRow, current: &str) -> Result<()> {
+    let root = fleet.paths().root().to_path_buf();
+    let id = row.node_id.to_string();
+    tracing::info!("cloud: {id}: its sandbox has an older install; reinstalling");
+    ensure_node_sandbox(fleet, &root, &id, &row.user, &mut |m| super::log_progress(&format!("refresh {id}"), m))?;
+    record(&root, &id, current)
 }
 
 #[cfg(test)]

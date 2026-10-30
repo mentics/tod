@@ -161,8 +161,21 @@ pub fn retire_done(fleet: &FleetStore) -> Result<usize> {
     Ok(done.len())
 }
 
-/// Replaces each lost sandbox `check` finds. Syncs first and after.
-pub fn check(fleet: &FleetStore, check: Check) -> Result<usize> {
+/// What a [`check`] repaired.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Repaired {
+    /// Lost sandboxes replaced.
+    pub replaced: usize,
+    /// Sandboxes left on an older build reinstalled.
+    pub reinstalled: usize,
+}
+
+/// Replaces each lost sandbox `check` finds and, on a [`Check::Full`] (the
+/// app's start), reinstalls every idle node sandbox left on an older build
+/// ([`super::refresh`]). Every node is repaired at once, on a thread of its
+/// own holding a `cloud_repair` activity lease, so the node shows as being
+/// worked meanwhile and none waits behind another. Syncs first and after.
+pub fn check(fleet: &FleetStore, check: Check) -> Result<Repaired> {
     let root = fleet.paths().root().to_path_buf();
     if let Err(err) = adopt_legacy_records(fleet) {
         tracing::warn!("cloud: moving old node records into the database: {err:#}");
@@ -171,7 +184,7 @@ pub fn check(fleet: &FleetStore, check: Check) -> Result<usize> {
     sync(fleet, &root, &orch, &user)?;
     let rows = fleet.read(cloud_nodes::list)?;
     if rows.is_empty() {
-        return Ok(0);
+        return Ok(Repaired::default());
     }
     let listing = match check {
         Check::Full => {
@@ -191,35 +204,109 @@ pub fn check(fleet: &FleetStore, check: Check) -> Result<usize> {
     if check == Check::Marked {
         lost.retain(|row| !backed_off(&row.node_id.to_string()));
     }
-    let mut replaced = 0;
-    for row in &lost {
-        let id = row.node_id.to_string();
-        tracing::info!("cloud: node {id}'s sandbox {} is gone; replacing it", row.sandbox);
-        set_note(&id, Some(format!("Its sandbox {} was gone; replacing it…", row.sandbox)));
-        let mut progress = |msg: &str| super::log_progress(&format!("replacing {}", row.sandbox), msg);
-        let result = ensure_node_sandbox(fleet, &root, &id, &row.user, &mut progress)
-            .and_then(|name| record_cloud_node(fleet, &id, name, &row.user));
-        match result {
-            Ok(node) => {
-                set_failed(&id, false);
-                replaced += 1;
-                let when = chrono::Local::now().format("%Y-%m-%d %H:%M");
-                set_note(&id, Some(format!("Its sandbox was gone; the app replaced it with {} at {when}.", node.sandbox)));
-            }
-            Err(err) => {
-                set_failed(&id, true);
-                tracing::warn!(
-                    "cloud: replacing node {id}'s sandbox: {err:#} (not retried for {} minutes unless it is run in the cloud again)",
-                    RETRY_AFTER.as_secs() / 60
-                );
-                set_note(&id, Some(format!("Its sandbox is gone and could not be replaced: {err:#}")));
-            }
+    // A node being replaced gets this build anyway: not reinstalled too.
+    let (stale, current) = match check {
+        Check::Full => {
+            let fine: Vec<CloudNodeRow> = rows
+                .iter()
+                .filter(|row| !lost.iter().any(|l| l.node_id == row.node_id))
+                .cloned()
+                .collect();
+            super::refresh::stale(fleet, &fine)?
         }
-    }
-    if replaced > 0 {
+        Check::Marked => (Vec::new(), String::new()),
+    };
+    let owner = crate::next_actor::this_process();
+    let repaired = std::thread::scope(|scope| {
+        let replacing: Vec<_> = lost
+            .iter()
+            .map(|row| {
+                let (root, owner) = (&root, &owner);
+                scope.spawn(move || replace(fleet, root, row, owner))
+            })
+            .collect();
+        let reinstalling: Vec<_> = stale
+            .iter()
+            .map(|row| {
+                let (current, owner) = (&current, &owner);
+                scope.spawn(move || reinstall(fleet, row, current, owner))
+            })
+            .collect();
+        Repaired {
+            replaced: replacing.into_iter().map(|h| joined(h.join())).filter(|done| *done).count(),
+            reinstalled: reinstalling.into_iter().map(|h| joined(h.join())).filter(|done| *done).count(),
+        }
+    });
+    if repaired.replaced > 0 {
         sync(fleet, &root, &orch, &user)?;
     }
-    Ok(replaced)
+    Ok(repaired)
+}
+
+/// Whether a repair thread finished its node; one that panicked is said.
+fn joined(result: std::thread::Result<bool>) -> bool {
+    result.unwrap_or_else(|panic| {
+        let what = panic
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| panic.downcast_ref::<String>().cloned())
+            .unwrap_or_default();
+        tracing::error!("cloud: repairing a node's sandbox panicked: {what}");
+        false
+    })
+}
+
+/// Replaces `row`'s lost sandbox under a `cloud_repair` lease. Whether it did;
+/// a failure is logged, noted for the node's status line, and backed off.
+fn replace(fleet: &FleetStore, root: &std::path::Path, row: &CloudNodeRow, owner: &str) -> bool {
+    let id = row.node_id.to_string();
+    tracing::info!("cloud: node {id}'s sandbox {} is gone; replacing it", row.sandbox);
+    set_note(&id, Some(format!("Its sandbox {} was gone; replacing it…", row.sandbox)));
+    let mut progress = |msg: &str| super::log_progress(&format!("replacing {}", row.sandbox), msg);
+    let result = tod_store::activity::with_lease(fleet, row.node_id, tod_store::activity::KIND_CLOUD_REPAIR, owner, || {
+        ensure_node_sandbox(fleet, root, &id, &row.user, &mut progress)
+            .and_then(|name| record_cloud_node(fleet, &id, name, &row.user))
+    })
+    .and_then(|r| r);
+    match result {
+        Ok(node) => {
+            set_failed(&id, false);
+            let when = chrono::Local::now().format("%Y-%m-%d %H:%M");
+            set_note(&id, Some(format!("Its sandbox was gone; the app replaced it with {} at {when}.", node.sandbox)));
+            true
+        }
+        Err(err) => {
+            set_failed(&id, true);
+            tracing::warn!(
+                "cloud: replacing node {id}'s sandbox: {err:#} (not retried for {} minutes unless it is run in the cloud again)",
+                RETRY_AFTER.as_secs() / 60
+            );
+            set_note(&id, Some(format!("Its sandbox is gone and could not be replaced: {err:#}")));
+            false
+        }
+    }
+}
+
+/// Reinstalls `row`'s sandbox on this build under a `cloud_repair` lease.
+/// Whether it did; a failure is logged and tried again at the next launch.
+fn reinstall(fleet: &FleetStore, row: &CloudNodeRow, current: &str, owner: &str) -> bool {
+    let id = row.node_id.to_string();
+    set_note(&id, Some("Its sandbox has an older install; reinstalling it…".into()));
+    let result = tod_store::activity::with_lease(fleet, row.node_id, tod_store::activity::KIND_CLOUD_REPAIR, owner, || {
+        super::refresh::reinstall(fleet, row, current)
+    })
+    .and_then(|r| r);
+    match result {
+        Ok(()) => {
+            set_note(&id, None);
+            true
+        }
+        Err(err) => {
+            tracing::warn!("cloud: {id}: reinstalling its sandbox failed: {err:#}");
+            set_note(&id, Some(format!("Reinstalling its sandbox on this build failed: {err:#}")));
+            false
+        }
+    }
 }
 
 /// What [`refresh_credentials`] did.
@@ -337,18 +424,15 @@ pub fn spawn_check(fleet: Arc<FleetStore>, kind: Check) {
     }
     let spawned = std::thread::Builder::new().name("tod-cloud-lost".into()).spawn(move || {
         match check(&fleet, kind) {
-            Ok(n) if n > 0 => tracing::info!("cloud: replaced {n} lost sandbox(es)"),
-            Ok(_) => {}
-            Err(err) => tracing::warn!("cloud: checking for lost sandboxes: {err:#}"),
-        }
-        // At the app's start, after lost sandboxes are replaced: node
-        // sandboxes left on an older build of the app catch up.
-        if kind == Check::Full {
-            match super::refresh::refresh_stale(&fleet) {
-                Ok(n) if n > 0 => tracing::info!("cloud: reinstalled {n} node sandbox(es) on this build"),
-                Ok(_) => {}
-                Err(err) => tracing::warn!("cloud: checking node installs: {err:#}"),
+            Ok(Repaired { replaced, reinstalled }) => {
+                if replaced > 0 {
+                    tracing::info!("cloud: replaced {replaced} lost sandbox(es)");
+                }
+                if reinstalled > 0 {
+                    tracing::info!("cloud: reinstalled {reinstalled} node sandbox(es) on this build");
+                }
             }
+            Err(err) => tracing::warn!("cloud: checking node sandboxes: {err:#}"),
         }
         CHECKING.store(false, Ordering::SeqCst);
     });

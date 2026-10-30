@@ -468,6 +468,13 @@ or any change to the node coming down the feed), pulling every few seconds
 meanwhile. If nothing comes within 150 s the click ends in an error saying so;
 silence is never taken for success (`cloud_sync::start_in_cloud`).
 
+When the app itself replaces a node's lost sandbox or reinstalls one left on
+an older build (at launch, or after a sync brings a lost mark;
+`cloud_sync::lost`), it holds a `cloud_repair` lease on that node
+(`Work::CloudRepair`, "repairing its cloud sandbox") for as long as the work
+takes. Every node's repair runs at once, each on its own thread, so none
+waits behind another's.
+
 A supervisor older than this does not beat: its nodes read as before until
 "Reinstall and restart" gives them the new one. The orchestrator must be
 deployed first (`scripts/deploy.sh`): it refuses a push

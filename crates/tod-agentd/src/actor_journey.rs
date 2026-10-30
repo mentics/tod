@@ -66,6 +66,7 @@ fn work_key(work: Work) -> String {
         Work::Runner => "runner".into(),
         Work::Cloud => "cloud".into(),
         Work::CloudStart => "cloud_start".into(),
+        Work::CloudRepair => "cloud_repair".into(),
         Work::Other => "other".into(),
     }
 }

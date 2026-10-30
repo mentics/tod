@@ -42,6 +42,10 @@ pub const KIND_RUN: &str = "run";
 /// The app sending a node to the cloud on the user's behalf: from the click
 /// until its supervisor is heard from (`tod_core::cloud_sync`).
 pub const KIND_CLOUD_START: &str = "cloud_start";
+/// The app replacing a node's cloud sandbox that went missing, or
+/// reinstalling one left on an older build (`tod_core::cloud_sync::lost`):
+/// from the start of that work until the sandbox is provisioned and poked.
+pub const KIND_CLOUD_REPAIR: &str = "cloud_repair";
 pub const KIND_GATE_CHECK: &str = "gate_check";
 pub const KIND_INCOMING_CHECK: &str = "incoming_check";
 /// A conversation turn under a protocol: `protocol:<ProtocolKind::as_str>`.
