@@ -57,6 +57,22 @@ pub fn including_input(surface: &str) -> &'static str {
     Box::leak(format!("{surface} > {INPUT}").into_boxed_str())
 }
 
+/// Whether keyboard focus is inside a dropdown's menu (a `Select`, or the
+/// `List` a combobox opens) below `surface`. Escape and Enter there belong to
+/// the menu: a surface handling them instead (an Escape bound with
+/// [`including_input`] matches the menu's search box) leaves the menu open
+/// but hidden, and its click-outside handler then swallows the next click.
+/// A surface's handler should `cx.propagate()` when this is true, so the
+/// menu's own binding runs.
+pub fn focus_in_menu(window: &gpui::Window, surface: &str) -> bool {
+    window
+        .context_stack()
+        .iter()
+        .skip_while(|context| !context.contains(surface))
+        .skip(1)
+        .any(|context| context.contains("List") || context.contains("Select"))
+}
+
 /// Build a surface context predicate for when a text field tagged `tag` (via
 /// `.key_context(tag)` on a wrapping element) inside that surface is focused.
 /// Use this to scope a key binding (e.g. plain Enter to commit) to one

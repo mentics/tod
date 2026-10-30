@@ -482,6 +482,10 @@ pub struct TaskEditView {
     pending_clear_tag_draft: bool,
     focus_index: usize,
     editing: Option<TaskEditField>,
+    /// Edit mode was entered and its input is focused on the next frame.
+    edit_focus_pending: bool,
+    /// The branch name a worktree rename in flight is renaming to.
+    branch_renaming_to: Option<String>,
     body_scroll_handle: ScrollHandle,
     scroll_anchor: ScrollReveal,
     linear_fetch_generation: u64,
@@ -737,36 +741,43 @@ impl TaskEditView {
         .detach();
         let scroll_anchor = ScrollReveal::for_handle(body_scroll_handle.clone());
 
-        let _title_subscription = cx.subscribe(&title_input, |this, _, event, cx| {
-            if matches!(event, InputEvent::Blur | InputEvent::PressEnter { .. }) {
-                this.persist_title(cx);
-            }
-        });
-        let _linear_subscription = cx.subscribe(&linear_input, |this, _, event, cx| {
-            if matches!(event, InputEvent::Blur | InputEvent::PressEnter { .. }) {
-                this.queue_linear_import(cx);
-            }
-        });
-        let _github_subscription = cx.subscribe(&github_pr_input, |this, _, event, cx| {
-            if matches!(event, InputEvent::Blur | InputEvent::PressEnter { .. }) {
-                this.persist_github_pr(cx);
-            }
-        });
-        let _branch_subscription = cx.subscribe(&branch_input, |this, _, event, cx| {
-            if matches!(event, InputEvent::Blur | InputEvent::PressEnter { .. }) {
-                this.persist_branch(cx);
-            }
-        });
+        // Single-line fields save on blur, and Enter finishes them (which
+        // blurs them) as it does every single-line field in the app.
+        let _title_subscription =
+            cx.subscribe_in(&title_input, window, |this, _, event, window, cx| match event {
+                InputEvent::Blur => this.persist_title(cx),
+                InputEvent::PressEnter { .. } => this.exit_edit(window, cx),
+                _ => {}
+            });
+        let _linear_subscription =
+            cx.subscribe_in(&linear_input, window, |this, _, event, window, cx| match event {
+                InputEvent::Blur => this.queue_linear_import(cx),
+                InputEvent::PressEnter { .. } => this.exit_edit(window, cx),
+                _ => {}
+            });
+        let _github_subscription =
+            cx.subscribe_in(&github_pr_input, window, |this, _, event, window, cx| match event {
+                InputEvent::Blur => this.persist_github_pr(cx),
+                InputEvent::PressEnter { .. } => this.exit_edit(window, cx),
+                _ => {}
+            });
+        let _branch_subscription =
+            cx.subscribe_in(&branch_input, window, |this, _, event, window, cx| match event {
+                InputEvent::Blur => this.persist_branch(cx),
+                InputEvent::PressEnter { .. } => this.exit_edit(window, cx),
+                _ => {}
+            });
         let _note_edit_subscription = cx.subscribe(&note_edit_input, |this, _, event, cx| {
             if matches!(event, InputEvent::Blur) {
                 this.commit_note_edit(cx);
             }
         });
-        let _details_subscription = cx.subscribe(&details_input, |this, _, event, cx| {
-            if matches!(event, InputEvent::Blur) {
-                this.persist_details(cx);
-            }
-        });
+        let _details_subscription =
+            cx.subscribe_in(&details_input, window, |this, _, event, window, cx| match event {
+                InputEvent::Blur => this.persist_details(cx),
+                InputEvent::PressEnter { secondary: true, .. } => this.exit_edit(window, cx),
+                _ => {}
+            });
         let _tag_draft_subscription = cx.subscribe(&tag_draft_input, |this, _, event, cx| {
             if matches!(event, InputEvent::PressEnter { .. }) {
                 this.commit_tag_draft(cx);
@@ -875,6 +886,8 @@ impl TaskEditView {
             pending_clear_tag_draft: false,
             focus_index: 0,
             editing: None,
+            edit_focus_pending: false,
+            branch_renaming_to: None,
             body_scroll_handle,
             scroll_anchor,
             linear_fetch_generation: 0,
@@ -945,95 +958,102 @@ impl TaskEditView {
         cx.notify();
     }
 
+    /// The navigation stops, in the order they are on screen: Up/Down and
+    /// Tab move through them as the eye reads the panel.
     fn field_stops(&self) -> Vec<TaskEditField> {
-        let mut stops = Vec::new();
-        stops.push(TaskEditField::Title);
-        stops.push(TaskEditField::Details);
-        if self.cap_body_open(Capability::Agent) {
-            stops.extend([
-                TaskEditField::AgentPlatform,
-                TaskEditField::AgentModel,
-                TaskEditField::AgentEffort,
-            ]);
-        }
-        if self.capability_enabled(Capability::Files) {
-            if !self.expanded_caps.contains(&Capability::Files) {
-                // Collapsed: no stops.
-            } else {
-            if self.own_files().is_some() {
-                stops.push(TaskEditField::Location);
-                if self.location_open {
-                    stops.extend((0..self.places.len()).map(TaskEditField::LocationChoice));
-                    stops.push(TaskEditField::ManageLocations);
-                }
-            }
-            stops.push(TaskEditField::Branch);
-            if self.worktree_action().is_some() {
-                stops.push(TaskEditField::WorktreeAction);
-            }
-            if matches!(
-                self.own_files().map(|files| files.directory()),
-                Some(FilesDirectory::Ready(_) | FilesDirectory::NotMade)
-            ) {
-                stops.push(TaskEditField::LaunchShell);
-            }
-            }
-        } else if self.worktree_action().is_some() {
-            // Inherited Files: this node's own worktree or sandbox can
-            // still be removed.
-            stops.push(TaskEditField::WorktreeAction);
-        }
-        if !self.capability_enabled(Capability::Files)
-            && self.resolved_files.as_ref().is_some_and(|f| f.inherited)
-        {
-            // The branch is the node's own even when the recipe is inherited.
-            let at = stops.len() - usize::from(self.worktree_action().is_some());
-            stops.insert(at, TaskEditField::Branch);
-        }
-        if self.cap_body_open(Capability::Ticket) {
-            stops.extend([TaskEditField::LinearLink, TaskEditField::GithubPr]);
-        }
-        if self.cap_body_open(Capability::Tags) {
-            stops.push(TaskEditField::Tags);
-        }
-        if self.cap_body_open(Capability::Spec) {
-            stops.push(TaskEditField::Obligations);
-        }
-        if self.cap_body_open(Capability::Generator) {
-            if self.generator_data_source_type.is_none() {
-                stops.push(TaskEditField::GeneratorSource);
-            }
-            if self.generator_source_key().is_some() {
-                for (index, field) in self.generator_fields.iter().enumerate() {
-                    // The sort has no stop of its own row: its editor is the stop.
-                    if field.is_linear_sort() {
-                        stops.push(TaskEditField::LinearSort);
-                        continue;
-                    }
-                    stops.push(TaskEditField::GeneratorField(index));
-                    if field.is_linear_filters() {
-                        stops.push(TaskEditField::LinearQuery);
-                    }
-                }
-            }
-            if self.generator_data_source_type.is_some() {
-                stops.push(TaskEditField::GeneratorRefresh);
-                // Quick-accept config lives on the same row as the data-source
-                // config, so it only exists once that has been saved once.
-                stops.push(TaskEditField::GeneratorAcceptDestination);
-                for cap in Capability::ALL {
-                    stops.push(TaskEditField::GeneratorAcceptCapability(cap));
-                }
-            }
-        }
-        stops.push(TaskEditField::CapabilityPicker);
+        let mut stops = vec![
+            TaskEditField::Title,
+            TaskEditField::Details,
+            TaskEditField::CapabilityPicker,
+        ];
         for cap in self.shown_caps() {
             stops.push(TaskEditField::Capability(cap));
             if self.capability_enabled(cap) {
                 stops.push(TaskEditField::CapabilityRemove(cap));
             }
+            self.push_body_stops(cap, &mut stops);
         }
         stops
+    }
+
+    /// The stops inside `cap`'s section, when its body is showing.
+    fn push_body_stops(&self, cap: Capability, stops: &mut Vec<TaskEditField>) {
+        match cap {
+            Capability::Agent if self.cap_body_open(cap) => stops.extend([
+                TaskEditField::AgentPlatform,
+                TaskEditField::AgentModel,
+                TaskEditField::AgentEffort,
+            ]),
+            Capability::Files if self.cap_body_open(cap) => {
+                if self.own_files().is_some() {
+                    stops.push(TaskEditField::Location);
+                    if self.location_open {
+                        stops.extend((0..self.places.len()).map(TaskEditField::LocationChoice));
+                        stops.push(TaskEditField::ManageLocations);
+                    }
+                }
+                stops.push(TaskEditField::Branch);
+                if self.worktree_action().is_some() {
+                    stops.push(TaskEditField::WorktreeAction);
+                }
+                if matches!(
+                    self.own_files().map(|files| files.directory()),
+                    Some(FilesDirectory::Ready(_) | FilesDirectory::NotMade)
+                ) {
+                    stops.push(TaskEditField::LaunchShell);
+                }
+            }
+            // Inherited Files: the branch is still the node's own, and so is
+            // its worktree or sandbox.
+            Capability::Files if !self.capability_enabled(cap) => {
+                let Some(files) = self.resolved_files.as_ref().filter(|f| f.inherited) else {
+                    return;
+                };
+                stops.push(TaskEditField::Branch);
+                if self.worktree_action().is_some() {
+                    stops.push(TaskEditField::WorktreeAction);
+                }
+                if matches!(
+                    files.directory(),
+                    FilesDirectory::Ready(_) | FilesDirectory::NotMade
+                ) {
+                    stops.push(TaskEditField::LaunchShell);
+                }
+            }
+            Capability::Ticket if self.cap_body_open(cap) => {
+                stops.extend([TaskEditField::LinearLink, TaskEditField::GithubPr]);
+            }
+            Capability::Tags if self.cap_body_open(cap) => stops.push(TaskEditField::Tags),
+            Capability::Spec if self.cap_body_open(cap) => stops.push(TaskEditField::Obligations),
+            Capability::Generator if self.cap_body_open(cap) => {
+                if self.generator_data_source_type.is_none() {
+                    stops.push(TaskEditField::GeneratorSource);
+                }
+                if self.generator_source_key().is_some() {
+                    for (index, field) in self.generator_fields.iter().enumerate() {
+                        // The sort has no stop of its own row: its editor is the stop.
+                        if field.is_linear_sort() {
+                            stops.push(TaskEditField::LinearSort);
+                            continue;
+                        }
+                        stops.push(TaskEditField::GeneratorField(index));
+                        if field.is_linear_filters() {
+                            stops.push(TaskEditField::LinearQuery);
+                        }
+                    }
+                }
+                if self.generator_data_source_type.is_some() {
+                    stops.push(TaskEditField::GeneratorRefresh);
+                    // Quick-accept config lives on the same row as the data-source
+                    // config, so it only exists once that has been saved once.
+                    stops.push(TaskEditField::GeneratorAcceptDestination);
+                    for cap in Capability::ALL {
+                        stops.push(TaskEditField::GeneratorAcceptCapability(cap));
+                    }
+                }
+            }
+            _ => {}
+        }
     }
 
     fn clamp_focus_index(&mut self) {
@@ -1175,6 +1195,12 @@ impl TaskEditView {
         cx: &mut Context<Self>,
     ) {
         let previous_index = self.focus_index;
+        // Whatever is activated, the field being edited is finished first
+        // (its input blurs and saves), so edit mode is never left behind on
+        // a field the user has moved away from.
+        if self.editing.is_some_and(|editing| editing != field) {
+            self.exit_edit(window, cx);
+        }
         if let Some(index) = self.field_stops().iter().position(|stop| *stop == field) {
             self.focus_index = index;
         }
@@ -1258,36 +1284,67 @@ impl TaskEditView {
                 return;
             }
             _ => {
+                if field == TaskEditField::Details {
+                    self.details_collapsed = false;
+                }
                 self.editing = Some(field);
                 cx.notify();
                 if self.focus_index != previous_index {
                     self.ensure_focused_visible(window, cx);
                 }
                 if let Some(input) = self.input_for_field(field) {
-                    cx.on_next_frame(window, move |_, window, cx| match &input {
-                        AnyInputState::Input(input) => {
-                            input.update(cx, |input, cx| input.focus(window, cx))
+                    if input.focus_handle(cx).is_focused(window) {
+                        return;
+                    }
+                    // Enabled by the next render; focus it then. Until it is
+                    // focused, `reconcile_input_focus` must not read the
+                    // unfocused input as the user having left it.
+                    self.edit_focus_pending = true;
+                    cx.on_next_frame(window, move |this, window, cx| {
+                        this.edit_focus_pending = false;
+                        if this.editing != Some(field) {
+                            return;
                         }
-                        AnyInputState::Textarea(input) => {
-                            input.update(cx, |input, cx| input.focus(window, cx))
+                        match &input {
+                            AnyInputState::Input(input) => {
+                                input.update(cx, |input, cx| input.focus(window, cx))
+                            }
+                            AnyInputState::Textarea(input) => {
+                                input.update(cx, |input, cx| input.focus(window, cx))
+                            }
+                            _ => {}
                         }
-                        _ => {}
                     });
                 }
             }
         }
     }
 
+    /// Enter (single-line), Ctrl+Enter (multi-line), or Escape: end edit
+    /// mode and give the keyboard back to navigation, on the same stop.
     fn exit_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let leaving = self.editing;
-        if leaving.is_none() {
+        if self.editing.is_none() {
             return;
         }
-        self.editing = None;
-        if leaving == Some(TaskEditField::LinearLink) {
-            self.queue_linear_import(cx);
-        }
+        self.leave_edit(cx);
         self.focus_handle.focus(window, cx);
+        cx.notify();
+    }
+
+    /// End edit mode without moving focus, saving the field. Inputs also
+    /// save on blur, but gpui reports blur only while the window is active,
+    /// so leaving a field never depends on it.
+    fn leave_edit(&mut self, cx: &mut Context<Self>) {
+        let leaving = self.editing.take();
+        self.edit_focus_pending = false;
+        match leaving {
+            Some(TaskEditField::Title) => self.persist_title(cx),
+            Some(TaskEditField::LinearLink) => self.queue_linear_import(cx),
+            Some(TaskEditField::GithubPr) => self.persist_github_pr(cx),
+            Some(TaskEditField::Branch) => self.persist_branch(cx),
+            Some(TaskEditField::Details) => self.persist_details(cx),
+            _ => {}
+        }
         cx.notify();
     }
 
@@ -1325,7 +1382,18 @@ impl TaskEditView {
         }
     }
 
+    /// Keep edit mode in step with where focus really is: an input that
+    /// got focus some other way (Tab, a click straight on it) is being
+    /// edited, and a text field whose input lost focus (a click elsewhere,
+    /// another panel) is not, so the arrows and Enter keep working.
     fn reconcile_input_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(field) = self.editing.filter(|field| field.is_text())
+            && !self.edit_focus_pending
+            && let Some(input) = self.input_for_field(field)
+            && !input.focus_handle(cx).contains_focused(window, cx)
+        {
+            self.leave_edit(cx);
+        }
         if self.text_editing() {
             return;
         }
@@ -3748,7 +3816,7 @@ impl TaskEditView {
             return;
         };
         let value = input_text(&self.branch_input, cx).trim().to_string();
-        if value == self.loaded_branch {
+        if value == self.loaded_branch || self.branch_renaming_to.as_deref() == Some(&value) {
             return;
         }
         if self.has_own_worktree() {
@@ -3803,6 +3871,7 @@ impl TaskEditView {
             return;
         }
         self.worktree_busy = true;
+        self.branch_renaming_to = Some(value.clone());
         self.worktree_status = Some("Renaming branch…".into());
         cx.notify();
         let fleet = self.fleet.clone();
@@ -3813,6 +3882,7 @@ impl TaskEditView {
                 .await;
             let _ = this.update(cx, |this, cx| {
                 this.worktree_busy = false;
+                this.branch_renaming_to = None;
                 match result {
                     Ok(warnings) => {
                         this.worktree_status = Some(format!("Branch renamed to {value}"));
@@ -4047,9 +4117,10 @@ impl TaskEditView {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, _, window, cx| {
-                    if !this.field_editing(field) {
-                        this.enter_field_edit(field, window, cx);
-                    }
+                    this.enter_field_edit(field, window, cx);
+                    // The field's input is focused (now, or next frame): the
+                    // panel's own click-to-focus must not take it back.
+                    window.prevent_default();
                 }),
             )
             .child(input_el)
@@ -4163,13 +4234,7 @@ impl TaskEditView {
                 .cursor_pointer()
                 .bg(background)
                 .on_click(cx.listener(move |this, _, window, cx| {
-                    if this.capability_enabled(cap) {
-                        this.toggle_cap_expanded(cap);
-                    } else {
-                        this.toggle_capability(cap, window, cx);
-                    }
-                    this.clamp_focus_index();
-                    cx.notify();
+                    this.enter_field_edit(field, window, cx);
                 }))
                 .child(
                     div()
@@ -4206,9 +4271,7 @@ impl TaskEditView {
                         })
                         .cursor_pointer()
                         .on_click(cx.listener(move |this, _, window, cx| {
-                            this.request_disable_capability(cap, window, cx);
-                            this.clamp_focus_index();
-                            cx.notify();
+                            this.enter_field_edit(remove_field, window, cx);
                         }))
                         .child("✕"),
                 ))
@@ -6778,6 +6841,10 @@ impl Render for TaskEditView {
                 cx.stop_propagation();
             }))
             .on_action(cx.listener(|this, _: &TaskEditEscape, window, cx| {
+                if key_context::focus_in_menu(window, TASK_EDIT_CONTEXT) {
+                    cx.propagate();
+                    return;
+                }
                 this.handle_escape(window, cx);
                 cx.stop_propagation();
             }))
@@ -6876,7 +6943,7 @@ impl Render for TaskEditView {
                         div()
                             .text_xs()
                             .text_color(muted)
-                            .child("↑↓ or Tab field · Enter activate · Esc exit edit/close"),
+                            .child("↑↓ or Tab field · Enter activate or finish · Ctrl+Enter finish details · Esc exit edit/close"),
                     ),
             )
             .into_any_element()
@@ -6972,3 +7039,6 @@ fn capitalize(text: &str) -> String {
 
 #[cfg(test)]
 mod accept_config_tests;
+
+#[cfg(test)]
+mod navigation_tests;

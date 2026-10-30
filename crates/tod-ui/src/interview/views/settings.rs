@@ -323,6 +323,21 @@ impl SettingField {
 const PLATFORM_ORDER: [AgentPlatform; 2] = [AgentPlatform::Claude, AgentPlatform::Cursor];
 /// Platform, model, effort — the dropdowns in one agent role row.
 const AGENT_ROW_COLUMNS: usize = 3;
+/// The fields edited as text, each in its own input (`SettingsView::text_input`).
+const TEXT_FIELDS: [SettingField; 12] = [
+    SettingField::TreehouseExecutable,
+    SettingField::TreehouseWorktreesRoot,
+    SettingField::BranchTemplate,
+    SettingField::TerminalProgram,
+    SettingField::VisualDesignBrowser,
+    SettingField::SandboxWorkspace,
+    SettingField::SandboxApiKey,
+    SettingField::SandboxDefaultImage,
+    SettingField::SandboxClaudeToken,
+    SettingField::JourneysRelayCode,
+    SettingField::JourneysMilestoneStates,
+    SettingField::LifecycleRepoProfiles,
+];
 
 /// Platform / model / effort dropdowns for one agent role's settings line.
 struct AgentRoleSelects {
@@ -427,8 +442,7 @@ pub struct SettingsView {
     /// Why the text in `branch_template_input` was not saved.
     branch_template_error: Option<String>,
     /// Cloud sandboxes: kept in `sandboxes.toml` (shared with `tod-sandbox`),
-    /// not in the settings file; saved when leaving the field with
-    /// Enter or Escape.
+    /// not in the settings file; saved when leaving the field.
     sandbox_workspace_input: Entity<InputState>,
     sandbox_image_input: Entity<InputState>,
     sandbox_key_input: Entity<InputState>,
@@ -438,7 +452,6 @@ pub struct SettingsView {
     sandbox_has_key: Option<bool>,
     /// Drops a sign-in check superseded by a later change.
     sandbox_check_generation: u64,
-    sandbox_editing: Option<SettingField>,
     sandbox_status: Option<Result<SharedString, SharedString>>,
     /// The Claude subscription token for autonomous nodes' sandboxes: pasted
     /// here, stored in the credential store, never shown.
@@ -457,14 +470,10 @@ pub struct SettingsView {
         Entity<crate::views::orchestrator_github_editor::OrchestratorGithubEditor>,
     databases_editor: Entity<crate::views::databases_editor::DatabasesEditor>,
     selected_field_index: usize,
-    terminal_program_editing: bool,
-    visual_design_browser_editing: bool,
-    treehouse_worktrees_root_editing: bool,
-    treehouse_executable_editing: bool,
-    relay_code_editing: bool,
-    milestone_states_editing: bool,
-    repo_profiles_editing: bool,
-    branch_template_editing: bool,
+    /// The text field being edited, if any (edit mode); see [`TEXT_FIELDS`].
+    editing: Option<SettingField>,
+    /// Edit mode was entered and its input is focused on the next frame.
+    edit_focus_pending: bool,
     selected_agent_column: usize,
     pending_launch_select_sync: bool,
     save_generation: u64,
@@ -567,16 +576,9 @@ impl SettingsView {
                 )
         });
         let _treehouse_executable_subscription =
-            cx.subscribe(&treehouse_executable_input, |this, input, event, cx| {
+            cx.subscribe(&treehouse_executable_input, |this, _, event, cx| {
                 if matches!(event, InputEvent::Blur | InputEvent::PressEnter { .. }) {
-                    let text = input.read(cx).text().to_string();
-                    let trimmed = text.trim();
-                    // A bare name is looked up on PATH, so it is kept as typed.
-                    let next = (!trimmed.is_empty()).then(|| PathBuf::from(trimmed));
-                    if this.settings.treehouse_executable != next {
-                        this.settings.treehouse_executable = next;
-                        this.schedule_save("treehouse_executable", cx);
-                    }
+                    this.apply_text_field(SettingField::TreehouseExecutable, cx);
                 }
             });
         let terminal_program_input = cx.new(|cx| {
@@ -590,40 +592,21 @@ impl SettingsView {
                 .default_value(settings.visual_design.browser.clone().unwrap_or_default())
         });
         let _visual_design_browser_subscription =
-            cx.subscribe(&visual_design_browser_input, |this, input, event, cx| {
+            cx.subscribe(&visual_design_browser_input, |this, _, event, cx| {
                 if matches!(event, InputEvent::Blur | InputEvent::PressEnter { .. }) {
-                    let text = input.read(cx).text().to_string();
-                    let trimmed = text.trim();
-                    let next = (!trimmed.is_empty()).then(|| trimmed.to_string());
-                    if this.settings.visual_design.browser != next {
-                        this.settings.visual_design.browser = next;
-                        this.schedule_save("visual_design.browser", cx);
-                    }
+                    this.apply_text_field(SettingField::VisualDesignBrowser, cx);
                 }
             });
         let _terminal_subscription =
-            cx.subscribe(&terminal_program_input, |this, input, event, cx| {
+            cx.subscribe(&terminal_program_input, |this, _, event, cx| {
                 if matches!(event, InputEvent::Blur | InputEvent::PressEnter { .. }) {
-                    let text = input.read(cx).text().to_string();
-                    let trimmed = text.trim();
-                    let next = if trimmed.is_empty() {
-                        None
-                    } else {
-                        Some(trimmed.to_string())
-                    };
-                    if this.settings.terminal.program != next {
-                        this.settings.terminal.program = next;
-                        this.schedule_save("terminal.program", cx);
-                    }
+                    this.apply_text_field(SettingField::TerminalProgram, cx);
                 }
             });
         let _treehouse_worktrees_root_subscription =
-            cx.subscribe(&treehouse_worktrees_root_input, |this, input, event, cx| {
+            cx.subscribe(&treehouse_worktrees_root_input, |this, _, event, cx| {
                 if matches!(event, InputEvent::Blur | InputEvent::PressEnter { .. }) {
-                    this.apply_treehouse_worktrees_root_input(
-                        input.read(cx).text().to_string(),
-                        cx,
-                    );
+                    this.apply_text_field(SettingField::TreehouseWorktreesRoot, cx);
                 }
             });
 
@@ -633,7 +616,7 @@ impl SettingsView {
                 .default_value(settings.journeys.relay_code.clone().unwrap_or_default())
         });
         let _relay_code_subscription =
-            cx.subscribe(&relay_code_input, |this, input, event, cx| {
+            cx.subscribe(&relay_code_input, |this, _, event, cx| {
                 // Applied on every change as well as on blur/Enter: the code is
                 // pasted whole, and the toggles below depend on whether it parses,
                 // so they must not wait for a blur that may never come.
@@ -641,14 +624,7 @@ impl SettingsView {
                     event,
                     InputEvent::Change | InputEvent::Blur | InputEvent::PressEnter { .. }
                 ) {
-                    let text = input.read(cx).text().to_string();
-                    let trimmed = text.trim();
-                    let next = (!trimmed.is_empty()).then(|| trimmed.to_string());
-                    if this.settings.journeys.relay_code != next {
-                        this.settings.journeys.relay_code = next;
-                        this.schedule_save("journeys.relay_code", cx);
-                    }
-                    cx.notify();
+                    this.apply_text_field(SettingField::JourneysRelayCode, cx);
                 }
             });
         let milestone_states_input = cx.new(|cx| {
@@ -661,10 +637,9 @@ impl SettingsView {
                 .placeholder("owner/repo=merge, owner/*=release")
                 .default_value(RepoProfileSetting::format_list(&settings.lifecycle.repo_profiles))
         });
-        let _repo_profiles_subscription = cx.subscribe(&repo_profiles_input, |this, input, event, cx| {
+        let _repo_profiles_subscription = cx.subscribe(&repo_profiles_input, |this, _, event, cx| {
             if matches!(event, InputEvent::Blur | InputEvent::PressEnter { .. }) {
-                let text = input.read(cx).text().to_string();
-                this.apply_repo_profiles_input(text, cx);
+                this.apply_text_field(SettingField::LifecycleRepoProfiles, cx);
             }
         });
         let branch_template_input = cx.new(|cx| {
@@ -672,19 +647,17 @@ impl SettingsView {
                 .placeholder(format!("Enter to edit · Default: {DEFAULT_BRANCH_TEMPLATE}"))
                 .default_value(settings.branch_template.clone())
         });
-        let _branch_template_subscription = cx.subscribe(&branch_template_input, |this, input, event, cx| {
+        let _branch_template_subscription = cx.subscribe(&branch_template_input, |this, _, event, cx| {
             if matches!(event, InputEvent::Blur | InputEvent::PressEnter { .. }) {
-                let text = input.read(cx).text().to_string();
-                this.apply_branch_template_input(text, cx);
+                this.apply_text_field(SettingField::BranchTemplate, cx);
             }
         });
         let claude_adapter = crate::ui::claude_adapter::state(cx);
         let _claude_adapter_subscription = cx.observe(&claude_adapter, |_, _, cx| cx.notify());
         let _milestone_states_subscription =
-            cx.subscribe(&milestone_states_input, |this, input, event, cx| {
+            cx.subscribe(&milestone_states_input, |this, _, event, cx| {
                 if matches!(event, InputEvent::Blur | InputEvent::PressEnter { .. }) {
-                    let text = input.read(cx).text().to_string();
-                    this.apply_milestone_states_input(text, cx);
+                    this.apply_text_field(SettingField::JourneysMilestoneStates, cx);
                 }
             });
 
@@ -739,7 +712,6 @@ impl SettingsView {
             sandbox_auth,
             sandbox_has_key: None,
             sandbox_check_generation: 0,
-            sandbox_editing: None,
             sandbox_status: None,
             claude_token_input,
             claude_token_backend: None,
@@ -760,14 +732,8 @@ impl SettingsView {
                 cx.new(|cx| crate::views::environment_editor::PresetsEditor::new(root, window, cx))
             },
             selected_field_index: 0,
-            terminal_program_editing: false,
-            visual_design_browser_editing: false,
-            treehouse_worktrees_root_editing: false,
-            treehouse_executable_editing: false,
-            relay_code_editing: false,
-            milestone_states_editing: false,
-            repo_profiles_editing: false,
-            branch_template_editing: false,
+            editing: None,
+            edit_focus_pending: false,
             selected_agent_column: 0,
             pending_launch_select_sync: false,
             save_generation: 0,
@@ -827,6 +793,7 @@ impl SettingsView {
         cx.notify();
     }
 
+
     /// Saves the branch template, or says why it was not saved. Empty means
     /// the default. Only nodes with no branch yet are affected.
     fn apply_branch_template_input(&mut self, raw: String, cx: &mut Context<Self>) {
@@ -843,36 +810,6 @@ impl SettingsView {
             Err(why) => self.branch_template_error = Some(format!("{why:#}")),
         }
         cx.notify();
-    }
-
-    fn enter_branch_template_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !matches!(self.selected_field(), SettingField::BranchTemplate) {
-            return;
-        }
-        self.focus_region = SettingsFocus::Panel;
-        self.branch_template_editing = true;
-        cx.notify();
-        let input = self.branch_template_input.clone();
-        cx.on_next_frame(window, move |_, window, cx| {
-            input.update(cx, |input, cx| {
-                input.focus(window, cx);
-            });
-        });
-    }
-
-    fn enter_repo_profiles_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !matches!(self.selected_field(), SettingField::LifecycleRepoProfiles) {
-            return;
-        }
-        self.focus_region = SettingsFocus::Panel;
-        self.repo_profiles_editing = true;
-        cx.notify();
-        let input = self.repo_profiles_input.clone();
-        cx.on_next_frame(window, move |_, window, cx| {
-            input.update(cx, |input, cx| {
-                input.focus(window, cx);
-            });
-        });
     }
 
     fn milestone_states_valid(states: &[String]) -> bool {
@@ -913,76 +850,178 @@ impl SettingsView {
         cx.notify();
     }
 
-    fn text_editing(&self) -> bool {
-        self.sandbox_editing.is_some()
-            || self.terminal_program_editing
-            || self.visual_design_browser_editing
-            || self.treehouse_worktrees_root_editing
-            || self.treehouse_executable_editing
-            || self.relay_code_editing
-            || self.milestone_states_editing
-            || self.repo_profiles_editing
-            || self.branch_template_editing
+
+
+
+
+    fn text_input(&self, field: SettingField) -> Option<Entity<InputState>> {
+        Some(
+            match field {
+                SettingField::TreehouseExecutable => &self.treehouse_executable_input,
+                SettingField::TreehouseWorktreesRoot => &self.treehouse_worktrees_root_input,
+                SettingField::BranchTemplate => &self.branch_template_input,
+                SettingField::TerminalProgram => &self.terminal_program_input,
+                SettingField::VisualDesignBrowser => &self.visual_design_browser_input,
+                SettingField::SandboxWorkspace => &self.sandbox_workspace_input,
+                SettingField::SandboxApiKey => &self.sandbox_key_input,
+                SettingField::SandboxDefaultImage => &self.sandbox_image_input,
+                SettingField::SandboxClaudeToken => &self.claude_token_input,
+                SettingField::JourneysRelayCode => &self.relay_code_input,
+                SettingField::JourneysMilestoneStates => &self.milestone_states_input,
+                SettingField::LifecycleRepoProfiles => &self.repo_profiles_input,
+                _ => return None,
+            }
+            .clone(),
+        )
     }
 
+    fn text_editing(&self) -> bool {
+        self.editing.is_some()
+    }
+
+    fn field_editing(&self, field: SettingField) -> bool {
+        self.editing == Some(field)
+    }
+
+    /// Select `field` in the panel, as a click or the arrows would.
+    fn select_field(&mut self, field: SettingField) {
+        if let Some(index) = self
+            .active_section
+            .fields()
+            .iter()
+            .position(|candidate| *candidate == field)
+        {
+            self.selected_field_index = index;
+        }
+        self.focus_region = SettingsFocus::Panel;
+    }
+
+    /// Select a text field and put it in edit mode: the one way into a
+    /// field, from Enter, a click on its row, or focus reaching its input.
+    /// Leaves any other field first, so its value is kept.
+    fn enter_text_edit(&mut self, field: SettingField, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(input) = self.text_input(field) else {
+            return;
+        };
+        self.select_field(field);
+        if self.editing != Some(field) {
+            self.leave_text_edit(window, cx);
+            self.editing = Some(field);
+        }
+        cx.notify();
+        if input.read(cx).focus_handle(cx).is_focused(window) {
+            return;
+        }
+        // Enabled by the next render; focus it then. Until it is focused,
+        // `reconcile_text_focus` must not read the unfocused input as the
+        // user having left it.
+        self.edit_focus_pending = true;
+        cx.on_next_frame(window, move |this, window, cx| {
+            this.edit_focus_pending = false;
+            if this.editing == Some(field) {
+                input.update(cx, |input, cx| input.focus(window, cx));
+            }
+        });
+    }
+
+    /// End edit mode without moving focus, saving the field. Inputs also
+    /// save on Enter and blur, but gpui reports blur only while the window
+    /// is active, so leaving a field never depends on it.
+    fn leave_text_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(field) = self.editing.take() else {
+            return;
+        };
+        self.edit_focus_pending = false;
+        match field {
+            SettingField::SandboxApiKey => self.save_sandbox_key(window, cx),
+            SettingField::SandboxClaudeToken => self.save_claude_token(window, cx),
+            SettingField::SandboxWorkspace | SettingField::SandboxDefaultImage => {
+                self.save_sandbox_account(cx)
+            }
+            field => self.apply_text_field(field, cx),
+        }
+        cx.notify();
+    }
+
+    /// Take a settings-file text field's value from its input, saving it if
+    /// it changed. Cloud sandbox fields are kept elsewhere (see
+    /// `leave_text_edit`).
+    fn apply_text_field(&mut self, field: SettingField, cx: &mut Context<Self>) {
+        let Some(input) = self.text_input(field) else {
+            return;
+        };
+        let text = input.read(cx).text().to_string();
+        let trimmed = text.trim();
+        let next = (!trimmed.is_empty()).then(|| trimmed.to_string());
+        match field {
+            SettingField::TerminalProgram => {
+                if self.settings.terminal.program != next {
+                    self.settings.terminal.program = next;
+                    self.schedule_save("terminal.program", cx);
+                }
+            }
+            SettingField::VisualDesignBrowser => {
+                if self.settings.visual_design.browser != next {
+                    self.settings.visual_design.browser = next;
+                    self.schedule_save("visual_design.browser", cx);
+                }
+            }
+            SettingField::TreehouseExecutable => {
+                // A bare name is looked up on PATH, so it is kept as typed.
+                let next = next.map(PathBuf::from);
+                if self.settings.treehouse_executable != next {
+                    self.settings.treehouse_executable = next;
+                    self.schedule_save("treehouse_executable", cx);
+                }
+            }
+            SettingField::TreehouseWorktreesRoot => {
+                self.apply_treehouse_worktrees_root_input(text, cx)
+            }
+            SettingField::JourneysRelayCode => {
+                if self.settings.journeys.relay_code != next {
+                    self.settings.journeys.relay_code = next;
+                    self.schedule_save("journeys.relay_code", cx);
+                }
+                cx.notify();
+            }
+            SettingField::JourneysMilestoneStates => self.apply_milestone_states_input(text, cx),
+            SettingField::LifecycleRepoProfiles => self.apply_repo_profiles_input(text, cx),
+            SettingField::BranchTemplate => self.apply_branch_template_input(text, cx),
+            _ => {}
+        }
+    }
+
+    /// Enter or Escape in a field: end edit mode and give the keyboard back
+    /// to navigation, on the same row.
     fn exit_text_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.terminal_program_editing {
-            self.terminal_program_editing = false;
-        }
-        if self.treehouse_worktrees_root_editing {
-            self.treehouse_worktrees_root_editing = false;
-        }
-        self.treehouse_executable_editing = false;
-        self.visual_design_browser_editing = false;
-        self.relay_code_editing = false;
-        self.milestone_states_editing = false;
-        self.repo_profiles_editing = false;
-        self.branch_template_editing = false;
-        if let Some(field) = self.sandbox_editing.take() {
-            self.leave_sandbox_field(field, window, cx);
-        }
+        self.leave_text_edit(window, cx);
         self.focus_handle.focus(window, cx);
         cx.notify();
     }
 
-    fn enter_sandbox_edit(
-        &mut self,
-        field: SettingField,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let input = match field {
-            SettingField::SandboxWorkspace => self.sandbox_workspace_input.clone(),
-            SettingField::SandboxApiKey => self.sandbox_key_input.clone(),
-            SettingField::SandboxDefaultImage => self.sandbox_image_input.clone(),
-            SettingField::SandboxClaudeToken => self.claude_token_input.clone(),
-            _ => return,
-        };
-        if self.selected_field() != field {
-            return;
+    /// Keep edit mode in step with where focus really is. Focus that reached
+    /// an input some other way (Tab, a click straight on it) puts its field
+    /// in edit mode, so what the user sees focused is always the field
+    /// being edited.
+    fn reconcile_text_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // And focus that left the field being edited (a click elsewhere)
+        // ends its edit, so the arrows and Enter keep working.
+        if let Some(field) = self.editing
+            && !self.edit_focus_pending
+            && let Some(input) = self.text_input(field)
+            && !input.read(cx).focus_handle(cx).contains_focused(window, cx)
+        {
+            self.leave_text_edit(window, cx);
         }
-        // Moving from one to another keeps what was typed in the first.
-        if let Some(editing) = self.sandbox_editing.filter(|editing| *editing != field) {
-            self.leave_sandbox_field(editing, window, cx);
-        }
-        self.focus_region = SettingsFocus::Panel;
-        self.sandbox_editing = Some(field);
-        cx.notify();
-        cx.on_next_frame(window, move |_, window, cx| {
-            input.update(cx, |input, cx| input.focus(window, cx));
-        });
-    }
-
-    fn leave_sandbox_field(
-        &mut self,
-        field: SettingField,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        match field {
-            SettingField::SandboxApiKey => self.save_sandbox_key(window, cx),
-            SettingField::SandboxClaudeToken => self.save_claude_token(window, cx),
-            _ => self.save_sandbox_account(cx),
+        for field in TEXT_FIELDS {
+            let Some(input) = self.text_input(field) else {
+                continue;
+            };
+            let focus = input.read(cx).focus_handle(cx);
+            key_context::set_input_tab_stop(&input, self.field_editing(field), cx);
+            if !self.field_editing(field) && focus.is_focused(window) {
+                self.enter_text_edit(field, window, cx);
+            }
         }
     }
 
@@ -1189,17 +1228,7 @@ impl SettingsView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.terminal_program_editing = false;
-        self.treehouse_worktrees_root_editing = false;
-        self.treehouse_executable_editing = false;
-        self.visual_design_browser_editing = false;
-        self.relay_code_editing = false;
-        self.milestone_states_editing = false;
-        self.repo_profiles_editing = false;
-        self.branch_template_editing = false;
-        if let Some(field) = self.sandbox_editing.take() {
-            self.leave_sandbox_field(field, window, cx);
-        }
+        self.leave_text_edit(window, cx);
         self.active_section = section;
         self.refresh_journeys_storage();
         self.selected_field_index = 0;
@@ -1257,14 +1286,7 @@ impl SettingsView {
             .unwrap_or(0);
         let len = SECTIONS.len() as i32;
         let next = ((idx as i32 + delta).rem_euclid(len)) as usize;
-        self.terminal_program_editing = false;
-        self.treehouse_worktrees_root_editing = false;
-        self.treehouse_executable_editing = false;
-        self.visual_design_browser_editing = false;
-        self.relay_code_editing = false;
-        self.milestone_states_editing = false;
-        self.repo_profiles_editing = false;
-        self.branch_template_editing = false;
+        self.leave_text_edit(window, cx);
         self.active_section = SECTIONS[next];
         self.refresh_journeys_storage();
         self.selected_field_index = 0;
@@ -1428,16 +1450,7 @@ impl SettingsView {
                 let editor = self.databases_editor.clone();
                 editor.update(cx, |e, cx| e.focus(window, cx));
             }
-            SettingField::TerminalProgram => self.enter_terminal_edit(window, cx),
-            SettingField::VisualDesignBrowser => self.enter_visual_design_browser_edit(window, cx),
-            SettingField::TreehouseWorktreesRoot => {
-                self.enter_treehouse_worktrees_root_edit(window, cx)
-            }
-            SettingField::TreehouseExecutable => self.enter_treehouse_executable_edit(window, cx),
-            field @ (SettingField::SandboxWorkspace
-            | SettingField::SandboxApiKey
-            | SettingField::SandboxDefaultImage
-            | SettingField::SandboxClaudeToken) => self.enter_sandbox_edit(field, window, cx),
+            field if self.text_input(field).is_some() => self.enter_text_edit(field, window, cx),
             SettingField::SandboxClaudeGetToken => {
                 self.get_claude_token(crate::ui::journey::Source::Keyboard, cx)
             }
@@ -1445,10 +1458,6 @@ impl SettingsView {
                 self.clear_claude_token(crate::ui::journey::Source::Keyboard, cx)
             }
             SettingField::Agent(role) => self.focus_agent_select(role, window, cx),
-            SettingField::JourneysRelayCode => self.enter_relay_code_edit(window, cx),
-            SettingField::JourneysMilestoneStates => self.enter_milestone_states_edit(window, cx),
-            SettingField::LifecycleRepoProfiles => self.enter_repo_profiles_edit(window, cx),
-            SettingField::BranchTemplate => self.enter_branch_template_edit(window, cx),
             SettingField::JourneysSendTest => self.send_journeys_test(cx),
             SettingField::ClaudeAdapter => self.activate_claude_adapter(cx),
             SettingField::JourneysRecord => self.toggle_journeys_record(cx),
@@ -1543,110 +1552,11 @@ impl SettingsView {
         true
     }
 
-    fn enter_treehouse_worktrees_root_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !matches!(self.selected_field(), SettingField::TreehouseWorktreesRoot) {
-            return;
-        }
-        self.focus_region = SettingsFocus::Panel;
-        self.terminal_program_editing = false;
-        self.treehouse_executable_editing = false;
-        self.visual_design_browser_editing = false;
-        self.treehouse_worktrees_root_editing = true;
-        cx.notify();
-        let input = self.treehouse_worktrees_root_input.clone();
-        cx.on_next_frame(window, move |_, window, cx| {
-            input.update(cx, |input, cx| {
-                input.focus(window, cx);
-            });
-        });
-    }
 
-    fn enter_treehouse_executable_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !matches!(self.selected_field(), SettingField::TreehouseExecutable) {
-            return;
-        }
-        self.focus_region = SettingsFocus::Panel;
-        self.terminal_program_editing = false;
-        self.treehouse_worktrees_root_editing = false;
-        self.treehouse_executable_editing = true;
-        cx.notify();
-        let input = self.treehouse_executable_input.clone();
-        cx.on_next_frame(window, move |_, window, cx| {
-            input.update(cx, |input, cx| {
-                input.focus(window, cx);
-            });
-        });
-    }
 
-    fn enter_visual_design_browser_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !matches!(self.selected_field(), SettingField::VisualDesignBrowser) {
-            return;
-        }
-        self.focus_region = SettingsFocus::Panel;
-        self.terminal_program_editing = false;
-        self.treehouse_worktrees_root_editing = false;
-        self.treehouse_executable_editing = false;
-        self.visual_design_browser_editing = true;
-        cx.notify();
-        let input = self.visual_design_browser_input.clone();
-        cx.on_next_frame(window, move |_, window, cx| {
-            input.update(cx, |input, cx| {
-                input.focus(window, cx);
-            });
-        });
-    }
 
-    fn enter_terminal_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !matches!(self.selected_field(), SettingField::TerminalProgram) {
-            return;
-        }
-        self.focus_region = SettingsFocus::Panel;
-        self.treehouse_worktrees_root_editing = false;
-        self.treehouse_executable_editing = false;
-        self.visual_design_browser_editing = false;
-        self.terminal_program_editing = true;
-        cx.notify();
-        let input = self.terminal_program_input.clone();
-        cx.on_next_frame(window, move |_, window, cx| {
-            input.update(cx, |input, cx| {
-                input.focus(window, cx);
-            });
-        });
-    }
 
-    fn enter_relay_code_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !matches!(self.selected_field(), SettingField::JourneysRelayCode) {
-            return;
-        }
-        self.focus_region = SettingsFocus::Panel;
-        self.milestone_states_editing = false;
-        self.repo_profiles_editing = false;
-        self.branch_template_editing = false;
-        self.relay_code_editing = true;
-        cx.notify();
-        let input = self.relay_code_input.clone();
-        cx.on_next_frame(window, move |_, window, cx| {
-            input.update(cx, |input, cx| {
-                input.focus(window, cx);
-            });
-        });
-    }
 
-    fn enter_milestone_states_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !matches!(self.selected_field(), SettingField::JourneysMilestoneStates) {
-            return;
-        }
-        self.focus_region = SettingsFocus::Panel;
-        self.relay_code_editing = false;
-        self.milestone_states_editing = true;
-        cx.notify();
-        let input = self.milestone_states_input.clone();
-        cx.on_next_frame(window, move |_, window, cx| {
-            input.update(cx, |input, cx| {
-                input.focus(window, cx);
-            });
-        });
-    }
 
     /// Toggles "Record journeys on this computer". Turning it off also turns
     /// off sending, which has nothing stored to send.
@@ -2204,110 +2114,7 @@ impl Render for SettingsView {
             self.sync_agent_selects(window, cx);
             self.pending_launch_select_sync = false;
         }
-        key_context::set_input_tab_stop(
-            &self.terminal_program_input,
-            self.terminal_program_editing,
-            cx,
-        );
-        key_context::set_input_tab_stop(
-            &self.visual_design_browser_input,
-            self.visual_design_browser_editing,
-            cx,
-        );
-        if !self.visual_design_browser_editing
-            && self
-                .visual_design_browser_input
-                .read(cx)
-                .focus_handle(cx)
-                .is_focused(window)
-        {
-            self.enter_visual_design_browser_edit(window, cx);
-        }
-        key_context::set_input_tab_stop(
-            &self.treehouse_worktrees_root_input,
-            self.treehouse_worktrees_root_editing,
-            cx,
-        );
-        key_context::set_input_tab_stop(
-            &self.treehouse_executable_input,
-            self.treehouse_executable_editing,
-            cx,
-        );
-        key_context::set_input_tab_stop(&self.relay_code_input, self.relay_code_editing, cx);
-        for (field, input) in [
-            (SettingField::SandboxWorkspace, self.sandbox_workspace_input.clone()),
-            (SettingField::SandboxApiKey, self.sandbox_key_input.clone()),
-            (SettingField::SandboxDefaultImage, self.sandbox_image_input.clone()),
-            (SettingField::SandboxClaudeToken, self.claude_token_input.clone()),
-        ] {
-            let editing = self.sandbox_editing == Some(field);
-            key_context::set_input_tab_stop(&input, editing, cx);
-            if !editing && input.read(cx).focus_handle(cx).is_focused(window) {
-                self.enter_sandbox_edit(field, window, cx);
-            }
-        }
-        key_context::set_input_tab_stop(&self.branch_template_input, self.branch_template_editing, cx);
-        if !self.branch_template_editing
-            && self.branch_template_input.read(cx).focus_handle(cx).is_focused(window)
-        {
-            self.enter_branch_template_edit(window, cx);
-        }
-        key_context::set_input_tab_stop(&self.repo_profiles_input, self.repo_profiles_editing, cx);
-        if !self.repo_profiles_editing
-            && self.repo_profiles_input.read(cx).focus_handle(cx).is_focused(window)
-        {
-            self.enter_repo_profiles_edit(window, cx);
-        }
-        key_context::set_input_tab_stop(
-            &self.milestone_states_input,
-            self.milestone_states_editing,
-            cx,
-        );
-        if !self.relay_code_editing
-            && self
-                .relay_code_input
-                .read(cx)
-                .focus_handle(cx)
-                .is_focused(window)
-        {
-            self.enter_relay_code_edit(window, cx);
-        }
-        if !self.milestone_states_editing
-            && self
-                .milestone_states_input
-                .read(cx)
-                .focus_handle(cx)
-                .is_focused(window)
-        {
-            self.enter_milestone_states_edit(window, cx);
-        }
-        if !self.treehouse_executable_editing
-            && self
-                .treehouse_executable_input
-                .read(cx)
-                .focus_handle(cx)
-                .is_focused(window)
-        {
-            self.enter_treehouse_executable_edit(window, cx);
-        }
-        if !self.terminal_program_editing
-            && self
-                .terminal_program_input
-                .read(cx)
-                .focus_handle(cx)
-                .is_focused(window)
-        {
-            self.enter_terminal_edit(window, cx);
-        }
-        if !self.treehouse_worktrees_root_editing
-            && self
-                .treehouse_worktrees_root_input
-                .read(cx)
-                .focus_handle(cx)
-                .is_focused(window)
-        {
-            self.enter_treehouse_worktrees_root_edit(window, cx);
-        }
+        self.reconcile_text_focus(window, cx);
 
         let theme = cx.theme().clone();
         let focus = self.focus_handle.clone();
@@ -2356,6 +2163,10 @@ impl Render for SettingsView {
                 cx.stop_propagation();
             }))
             .on_action(cx.listener(|this, _: &SettingsEscape, window, cx| {
+                if key_context::focus_in_menu(window, SETTINGS_CONTEXT) {
+                    cx.propagate();
+                    return;
+                }
                 this.handle_escape(window, cx);
                 cx.stop_propagation();
             }))
@@ -2405,12 +2216,6 @@ impl Render for SettingsView {
                     .child(div().text_xs().text_color(muted).child(
                         "←→ sidebar/fields · ↑↓ move · −/= adjust · Enter/Space activate · Enter/Esc exit edit",
                     )),
-            )
-            .on_mouse_down(
-                gpui::MouseButton::Left,
-                cx.listener(|this, _, window, cx| {
-                    this.focus_handle.focus(window, cx);
-                }),
             );
 
         self.bind_app_nav_toggle(root, cx)
@@ -2578,7 +2383,6 @@ impl SettingsView {
                     "Treehouse executable",
                     "The Treehouse program tod runs for worktree pools. A bare name is looked up on PATH; empty uses \"treehouse\".",
                     &self.treehouse_executable_input,
-                    self.treehouse_executable_editing,
                     theme,
                 ))
                 .child(text_input_row(
@@ -2588,7 +2392,6 @@ impl SettingsView {
                     "Treehouse worktrees root",
                     "Parent directory for Treehouse worktree pools (TREEHOUSE_WORKTREES). Empty uses TREEHOUSE_HOME ({data_root}/treehouse).",
                     &self.treehouse_worktrees_root_input,
-                    self.treehouse_worktrees_root_editing,
                     theme,
                 ))
                 .child(text_input_row(
@@ -2601,7 +2404,6 @@ impl SettingsView {
                         None => branch_template_help(),
                     },
                     &self.branch_template_input,
-                    self.branch_template_editing,
                     theme,
                 ))
                 .child(text_input_row(
@@ -2611,7 +2413,6 @@ impl SettingsView {
                     "Terminal program",
                     default_terminal_hint(),
                     &self.terminal_program_input,
-                    self.terminal_program_editing,
                     theme,
                 ))
                 .child(text_input_row(
@@ -2621,7 +2422,6 @@ impl SettingsView {
                     "Design browser",
                     "Path of the browser the visual-design window opens in (Chrome). Empty finds Chrome automatically.",
                     &self.visual_design_browser_input,
-                    self.visual_design_browser_editing,
                     theme,
                 ))
                 .into_any_element(),
@@ -2634,7 +2434,6 @@ impl SettingsView {
                     "Blaxel workspace",
                     "The Blaxel workspace nodes' cloud sandboxes live in. A team shares one workspace, and each person signs in as themselves. Empty turns cloud sandboxes off.",
                     &self.sandbox_workspace_input,
-                    self.sandbox_editing == Some(SettingField::SandboxWorkspace),
                     theme,
                 ))
                 .child(cycle_row(
@@ -2662,7 +2461,6 @@ impl SettingsView {
                         None => "Kept in the OS keyring (else an encrypted file), where agents cannot read it.",
                     },
                     &self.sandbox_key_input,
-                    self.sandbox_editing == Some(SettingField::SandboxApiKey),
                     theme,
                 ))
                 .child(text_input_row(
@@ -2672,7 +2470,6 @@ impl SettingsView {
                     "Default image",
                     "What a new sandbox starts from unless the Files capability names another image. A baked image (`tod-sandbox bake`) is ready in seconds. Any other image is set up the first time, which takes a minute or more.",
                     &self.sandbox_image_input,
-                    self.sandbox_editing == Some(SettingField::SandboxDefaultImage),
                     theme,
                 ))
                 .when_some(self.sandbox_status.clone(), |el, status| {
@@ -2700,7 +2497,6 @@ impl SettingsView {
                     "Claude subscription",
                     claude_token_help(self.claude_token_backend),
                     &self.claude_token_input,
-                    self.sandbox_editing == Some(SettingField::SandboxClaudeToken),
                     theme,
                 ))
                 .child(claude_button_row(
@@ -2861,7 +2657,6 @@ impl SettingsView {
                         None => "Comma-separated owner/repo=profile (also owner/* or *); the first match wins. release (default): a merged pull request waits for a published release naming it. merge: the repository publishes no releases, so merging is shipping.".to_string(),
                     },
                     &self.repo_profiles_input,
-                    self.repo_profiles_editing,
                     theme,
                 ))
                 .into_any_element(),
@@ -2899,7 +2694,6 @@ impl SettingsView {
                         cx,
                         self,
                         &self.relay_code_input,
-                        self.relay_code_editing,
                         theme,
                     ))
                     .child(journeys_send_test_row(cx, self, theme))
@@ -2910,7 +2704,6 @@ impl SettingsView {
                         "Milestone states",
                         "Comma-separated lifecycle states that trigger a milestone bundle. Default: active, verifying, review, approved, done.",
                         &self.milestone_states_input,
-                        self.milestone_states_editing,
                         theme,
                     ))
                     .child(stepper_row(
@@ -3163,19 +2956,6 @@ fn select_control(
         )
 }
 
-/// The branch template's explanation: what it is for and each variable with
-/// where its value comes from.
-fn branch_template_help() -> String {
-    let variables: Vec<String> = tod_store::branch_name::BRANCH_VARIABLES
-        .iter()
-        .map(|(name, what)| format!("{{{name}}} is {what}"))
-        .collect();
-    format!(
-        "The name of the git branch a node works on, made when the node first needs one; a node that already has a branch keeps it. Empty uses {DEFAULT_BRANCH_TEMPLATE}. Variables: {}.",
-        variables.join("; ")
-    )
-}
-
 fn text_input_row(
     cx: &mut Context<SettingsView>,
     view: &SettingsView,
@@ -3183,10 +2963,10 @@ fn text_input_row(
     label: impl Into<SharedString>,
     help: impl Into<SharedString>,
     input: &Entity<InputState>,
-    editing: bool,
     theme: &gpui_component::Theme,
 ) -> impl IntoElement {
     let selected = view.field_selected(field);
+    let editing = view.field_editing(field);
     let label = label.into();
     let help = help.into();
 
@@ -3205,47 +2985,10 @@ fn text_input_row(
         .on_mouse_down(
             gpui::MouseButton::Left,
             cx.listener(move |this, _, window, cx| {
-                if let Some(index) = this
-                    .active_section
-                    .fields()
-                    .iter()
-                    .position(|candidate| *candidate == field)
-                {
-                    this.selected_field_index = index;
-                }
-                this.focus_region = SettingsFocus::Panel;
-                match field {
-                    SettingField::TerminalProgram => {
-                        if !this.terminal_program_editing {
-                            this.enter_terminal_edit(window, cx);
-                        }
-                    }
-                    SettingField::TreehouseWorktreesRoot => {
-                        if !this.treehouse_worktrees_root_editing {
-                            this.enter_treehouse_worktrees_root_edit(window, cx);
-                        }
-                    }
-                    SettingField::VisualDesignBrowser => {
-                        if !this.visual_design_browser_editing {
-                            this.enter_visual_design_browser_edit(window, cx);
-                        }
-                    }
-                    SettingField::TreehouseExecutable => {
-                        if !this.treehouse_executable_editing {
-                            this.enter_treehouse_executable_edit(window, cx);
-                        }
-                    }
-                    SettingField::SandboxWorkspace
-                    | SettingField::SandboxApiKey
-                    | SettingField::SandboxDefaultImage
-                    | SettingField::SandboxClaudeToken => {
-                        if this.sandbox_editing != Some(field) {
-                            this.enter_sandbox_edit(field, window, cx);
-                        }
-                    }
-                    _ => {}
-                }
-                cx.notify();
+                this.enter_text_edit(field, window, cx);
+                // The row's input is focused (now, or next frame): the
+                // view's own click-to-focus must not take it back.
+                window.prevent_default();
             }),
         )
         .child(
@@ -3394,7 +3137,6 @@ fn relay_code_row(
     cx: &mut Context<SettingsView>,
     view: &SettingsView,
     input: &Entity<InputState>,
-    editing: bool,
     theme: &gpui_component::Theme,
 ) -> impl IntoElement {
     let code = view.settings.journeys.relay_code.clone();
@@ -3415,7 +3157,6 @@ fn relay_code_row(
             "Relay code",
             "One pasted string holding the recipient's public key, the relay server, and the two topics. Sending cannot be turned on until this parses.",
             input,
-            editing,
             theme,
         ))
         .when_some(error, |el, err| {
@@ -3661,4 +3402,17 @@ fn read_only_row(
                 .text_color(theme.muted_foreground),
             ),
         )
+}
+
+/// The branch template's explanation: what it is for and each variable with
+/// where its value comes from.
+fn branch_template_help() -> String {
+    let variables: Vec<String> = tod_store::branch_name::BRANCH_VARIABLES
+        .iter()
+        .map(|(name, what)| format!("{{{name}}} is {what}"))
+        .collect();
+    format!(
+        "The name of the git branch a node works on, made when the node first needs one; a node that already has a branch keeps it. Empty uses {DEFAULT_BRANCH_TEMPLATE}. Variables: {}.",
+        variables.join("; ")
+    )
 }
