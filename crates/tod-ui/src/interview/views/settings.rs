@@ -24,6 +24,7 @@ use std::time::Duration;
 use tod_core::logging;
 use tod_journey::RelayCode;
 use tod_store::fleet::default_terminal_hint;
+use tod_store::branch_name::DEFAULT_BRANCH_TEMPLATE;
 use tod_store::settings::{DEFAULT_TREEHOUSE_EXECUTABLE, JourneySettings, RepoProfileSetting};
 use tod_store::{AgentRole, efforts_for, models_for, parse_platform};
 
@@ -181,6 +182,7 @@ impl SettingsSection {
                 WorktreeBackend,
                 TreehouseExecutable,
                 TreehouseWorktreesRoot,
+                BranchTemplate,
                 TerminalProgram,
                 VisualDesignBrowser,
             ],
@@ -224,6 +226,8 @@ enum SettingField {
     WorktreeBackend,
     TreehouseExecutable,
     TreehouseWorktreesRoot,
+    /// `branch_template`: the name a node's branch gets.
+    BranchTemplate,
     TerminalProgram,
     /// `visual_design.browser`: the browser the design window opens in.
     VisualDesignBrowser,
@@ -284,6 +288,7 @@ impl SettingField {
             Self::WorktreeBackend => "worktree-backend",
             Self::TreehouseExecutable => "treehouse-executable",
             Self::TreehouseWorktreesRoot => "treehouse-worktrees-root",
+            Self::BranchTemplate => "branch-template",
             Self::TerminalProgram => "terminal-program",
             Self::VisualDesignBrowser => "visual-design-browser",
             Self::SandboxWorkspace => "sandbox-workspace",
@@ -418,6 +423,9 @@ pub struct SettingsView {
     repo_profiles_input: Entity<InputState>,
     /// Why the text in `repo_profiles_input` was not saved.
     repo_profiles_error: Option<String>,
+    branch_template_input: Entity<InputState>,
+    /// Why the text in `branch_template_input` was not saved.
+    branch_template_error: Option<String>,
     /// Cloud sandboxes: kept in `sandboxes.toml` (shared with `tod-sandbox`),
     /// not in the settings file; saved when leaving the field with
     /// Enter or Escape.
@@ -456,6 +464,7 @@ pub struct SettingsView {
     relay_code_editing: bool,
     milestone_states_editing: bool,
     repo_profiles_editing: bool,
+    branch_template_editing: bool,
     selected_agent_column: usize,
     pending_launch_select_sync: bool,
     save_generation: u64,
@@ -474,6 +483,7 @@ pub struct SettingsView {
     _relay_code_subscription: Subscription,
     _milestone_states_subscription: Subscription,
     _repo_profiles_subscription: Subscription,
+    _branch_template_subscription: Subscription,
     _orchestrator_github_subscription: Subscription,
     _databases_subscription: Subscription,
     _claude_adapter_subscription: Subscription,
@@ -657,6 +667,17 @@ impl SettingsView {
                 this.apply_repo_profiles_input(text, cx);
             }
         });
+        let branch_template_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(format!("Enter to edit · Default: {DEFAULT_BRANCH_TEMPLATE}"))
+                .default_value(settings.branch_template.clone())
+        });
+        let _branch_template_subscription = cx.subscribe(&branch_template_input, |this, input, event, cx| {
+            if matches!(event, InputEvent::Blur | InputEvent::PressEnter { .. }) {
+                let text = input.read(cx).text().to_string();
+                this.apply_branch_template_input(text, cx);
+            }
+        });
         let claude_adapter = crate::ui::claude_adapter::state(cx);
         let _claude_adapter_subscription = cx.observe(&claude_adapter, |_, _, cx| cx.notify());
         let _milestone_states_subscription =
@@ -727,6 +748,8 @@ impl SettingsView {
             milestone_states_input,
             repo_profiles_input,
             repo_profiles_error: None,
+            branch_template_input,
+            branch_template_error: None,
             agent_selects,
             focus_handle: cx.focus_handle(),
             app_nav: AppNavMenu::default(),
@@ -744,6 +767,7 @@ impl SettingsView {
             relay_code_editing: false,
             milestone_states_editing: false,
             repo_profiles_editing: false,
+            branch_template_editing: false,
             selected_agent_column: 0,
             pending_launch_select_sync: false,
             save_generation: 0,
@@ -758,6 +782,7 @@ impl SettingsView {
             _relay_code_subscription,
             _milestone_states_subscription,
             _repo_profiles_subscription,
+            _branch_template_subscription,
             _orchestrator_github_subscription,
             orchestrator_github_editor,
             _databases_subscription,
@@ -800,6 +825,39 @@ impl SettingsView {
             Err(why) => self.repo_profiles_error = Some(why),
         }
         cx.notify();
+    }
+
+    /// Saves the branch template, or says why it was not saved. Empty means
+    /// the default. Only nodes with no branch yet are affected.
+    fn apply_branch_template_input(&mut self, raw: String, cx: &mut Context<Self>) {
+        let trimmed = raw.trim();
+        let next = if trimmed.is_empty() { DEFAULT_BRANCH_TEMPLATE } else { trimmed };
+        match tod_store::branch_name::validate_template(next) {
+            Ok(()) => {
+                self.branch_template_error = None;
+                if self.settings.branch_template != next {
+                    self.settings.branch_template = next.to_string();
+                    self.schedule_save("branch_template", cx);
+                }
+            }
+            Err(why) => self.branch_template_error = Some(format!("{why:#}")),
+        }
+        cx.notify();
+    }
+
+    fn enter_branch_template_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !matches!(self.selected_field(), SettingField::BranchTemplate) {
+            return;
+        }
+        self.focus_region = SettingsFocus::Panel;
+        self.branch_template_editing = true;
+        cx.notify();
+        let input = self.branch_template_input.clone();
+        cx.on_next_frame(window, move |_, window, cx| {
+            input.update(cx, |input, cx| {
+                input.focus(window, cx);
+            });
+        });
     }
 
     fn enter_repo_profiles_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -864,6 +922,7 @@ impl SettingsView {
             || self.relay_code_editing
             || self.milestone_states_editing
             || self.repo_profiles_editing
+            || self.branch_template_editing
     }
 
     fn exit_text_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -878,6 +937,7 @@ impl SettingsView {
         self.relay_code_editing = false;
         self.milestone_states_editing = false;
         self.repo_profiles_editing = false;
+        self.branch_template_editing = false;
         if let Some(field) = self.sandbox_editing.take() {
             self.leave_sandbox_field(field, window, cx);
         }
@@ -1136,6 +1196,7 @@ impl SettingsView {
         self.relay_code_editing = false;
         self.milestone_states_editing = false;
         self.repo_profiles_editing = false;
+        self.branch_template_editing = false;
         if let Some(field) = self.sandbox_editing.take() {
             self.leave_sandbox_field(field, window, cx);
         }
@@ -1203,6 +1264,7 @@ impl SettingsView {
         self.relay_code_editing = false;
         self.milestone_states_editing = false;
         self.repo_profiles_editing = false;
+        self.branch_template_editing = false;
         self.active_section = SECTIONS[next];
         self.refresh_journeys_storage();
         self.selected_field_index = 0;
@@ -1322,6 +1384,7 @@ impl SettingsView {
             | SettingField::JourneysSendTest
             | SettingField::JourneysMilestoneStates
             | SettingField::LifecycleRepoProfiles
+            | SettingField::BranchTemplate
             | SettingField::ClaudeAdapter => {}
             SettingField::SandboxTerminalPark => self.step_sandbox_idle(
                 |idle| &mut idle.terminal_park_secs,
@@ -1385,6 +1448,7 @@ impl SettingsView {
             SettingField::JourneysRelayCode => self.enter_relay_code_edit(window, cx),
             SettingField::JourneysMilestoneStates => self.enter_milestone_states_edit(window, cx),
             SettingField::LifecycleRepoProfiles => self.enter_repo_profiles_edit(window, cx),
+            SettingField::BranchTemplate => self.enter_branch_template_edit(window, cx),
             SettingField::JourneysSendTest => self.send_journeys_test(cx),
             SettingField::ClaudeAdapter => self.activate_claude_adapter(cx),
             SettingField::JourneysRecord => self.toggle_journeys_record(cx),
@@ -1557,6 +1621,7 @@ impl SettingsView {
         self.focus_region = SettingsFocus::Panel;
         self.milestone_states_editing = false;
         self.repo_profiles_editing = false;
+        self.branch_template_editing = false;
         self.relay_code_editing = true;
         cx.notify();
         let input = self.relay_code_input.clone();
@@ -2181,6 +2246,12 @@ impl Render for SettingsView {
                 self.enter_sandbox_edit(field, window, cx);
             }
         }
+        key_context::set_input_tab_stop(&self.branch_template_input, self.branch_template_editing, cx);
+        if !self.branch_template_editing
+            && self.branch_template_input.read(cx).focus_handle(cx).is_focused(window)
+        {
+            self.enter_branch_template_edit(window, cx);
+        }
         key_context::set_input_tab_stop(&self.repo_profiles_input, self.repo_profiles_editing, cx);
         if !self.repo_profiles_editing
             && self.repo_profiles_input.read(cx).focus_handle(cx).is_focused(window)
@@ -2518,6 +2589,19 @@ impl SettingsView {
                     "Parent directory for Treehouse worktree pools (TREEHOUSE_WORKTREES). Empty uses TREEHOUSE_HOME ({data_root}/treehouse).",
                     &self.treehouse_worktrees_root_input,
                     self.treehouse_worktrees_root_editing,
+                    theme,
+                ))
+                .child(text_input_row(
+                    cx,
+                    self,
+                    SettingField::BranchTemplate,
+                    "Branch name",
+                    match &self.branch_template_error {
+                        Some(why) => format!("Not saved: {why}."),
+                        None => branch_template_help(),
+                    },
+                    &self.branch_template_input,
+                    self.branch_template_editing,
                     theme,
                 ))
                 .child(text_input_row(
@@ -3077,6 +3161,19 @@ fn select_control(
                 .search_placeholder("Filter…")
                 .menu_width(px(width)),
         )
+}
+
+/// The branch template's explanation: what it is for and each variable with
+/// where its value comes from.
+fn branch_template_help() -> String {
+    let variables: Vec<String> = tod_store::branch_name::BRANCH_VARIABLES
+        .iter()
+        .map(|(name, what)| format!("{{{name}}} is {what}"))
+        .collect();
+    format!(
+        "The name of the git branch a node works on, made when the node first needs one; a node that already has a branch keeps it. Empty uses {DEFAULT_BRANCH_TEMPLATE}. Variables: {}.",
+        variables.join("; ")
+    )
 }
 
 fn text_input_row(

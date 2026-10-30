@@ -423,7 +423,7 @@ synced), made the first time something needs its files: a launch, a shell,
 an editor, a protocol's `cwd` (`provision::resolve_launch_cwd`, which only
 runs off the UI thread; the UI thread asks `launch_cwd_if_made`). There is
 no "set up" button. Each is on its own branch (the node's own
-`node_fields.branch`, `task/<slug>` by default). Without a worktree or
+`node_fields.branch`, named by the `branch_template` setting, `task/{slug}` by default). Without a worktree or
 sandbox, nodes share the workspace directory as before.
 
 A location records the node it was made from (`source_node_id`) and a

@@ -476,6 +476,10 @@ fn default_agent_idle_secs() -> u64 {
     DEFAULT_AGENT_IDLE_SECS
 }
 
+fn default_branch_template() -> String {
+    crate::branch_name::DEFAULT_BRANCH_TEMPLATE.to_string()
+}
+
 fn default_log_level() -> LogLevel {
     LogLevel::Info
 }
@@ -724,6 +728,11 @@ pub struct TodSettings {
     /// How long idle connections to cloud sandboxes stay open.
     #[serde(default)]
     pub sandbox_idle: SandboxIdleSettings,
+    /// The name of the branch a node works on, with `{variables}` filled in
+    /// from the node (`crate::branch_name::BRANCH_VARIABLES`). Used for a node
+    /// that has no branch of its own yet.
+    #[serde(default = "default_branch_template")]
+    pub branch_template: String,
 }
 
 /// The Treehouse executable when none is configured: found on PATH.
@@ -755,6 +764,7 @@ impl Default for TodSettings {
             visual_design: VisualDesignSettings::default(),
             pr_readiness: PrReadinessSettings::default(),
             sandbox_idle: SandboxIdleSettings::default(),
+            branch_template: default_branch_template(),
         }
     }
 }
@@ -923,6 +933,7 @@ impl TodSettings {
             geometry.validate()?;
         }
         self.journeys.validate()?;
+        crate::branch_name::validate_template(&self.branch_template)?;
         Ok(())
     }
 
@@ -1128,6 +1139,7 @@ mod tests {
                 review_schedule: ReviewSchedule { start_hour: 9, ..ReviewSchedule::default() },
             },
             sandbox_idle: SandboxIdleSettings::default(),
+            branch_template: "feat/{ticket_lower}-{title}".into(),
         };
         settings.save_to_path(&path).unwrap();
         let loaded = TodSettings::load_from_path(&path).unwrap();
