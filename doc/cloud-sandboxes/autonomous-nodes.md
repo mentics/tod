@@ -656,8 +656,10 @@ The plan:
   token changed later reaches only sandboxes created after (Blaxel can
   replace a running sandbox's rules, but only by redeploying it; see To
   verify 4). **User tokens never leave the user's
-  machine except into a sandbox's proxy rules:** the orchestrator does not
-  keep them. So a sandbox that expires while the app is closed is replaced
+  machine except into a proxy's rules:** a node's sandbox's, and the
+  orchestrator sandbox's for the tokens the user applies in Settings →
+  Orchestrator GitHub access (`orchestrator.md`, "GitHub access"); the
+  orchestrator process never sees a value. So a sandbox that expires while the app is closed is replaced
   only when the user's app next runs; until then its node waits (the
   orchestrator marks it, and the app replaces it on start). A team bot identity (a GitHub App, a Linear service
   account) would be a later change to where the secrets come from, nothing
