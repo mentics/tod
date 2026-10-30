@@ -512,7 +512,9 @@ impl Sandboxes {
         let acct = self.account()?;
         let mut cmd = Command::new("bl");
         // `bl` does not find blaxel.toml through `-d` with a Windows path; run it there.
-        cmd.args(["-w", &acct.workspace, "push", "--skip-version-warning"]).current_dir(dir);
+        // `--yes` keeps `bl` from its interactive "Deploy this image" picker, which
+        // would otherwise take over the terminal after the push has succeeded.
+        cmd.args(["-w", &acct.workspace, "push", "--skip-version-warning", "--yes"]).current_dir(dir);
         if acct.auth == AuthMode::ApiKey {
             cmd.env("BL_API_KEY", self.token()?).env("BL_WORKSPACE", &acct.workspace);
         }
