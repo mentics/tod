@@ -7,5 +7,10 @@ do not know how.
 | Skill | Use it when |
 |---|---|
 | `journeys` | You are asked to look at a journey (a node's, or the user's recent activity): how work on a node went, or what the user did. |
+| `tod-open-pr` | You open a node's pull request, or bring its title and description up to date. |
+| `tod-fix-ci` | A node's pull request has failing checks or review comments to answer. |
+
+A skill may also be chosen for a lifecycle phase (the Lifecycle config
+capability, by name); the phase's context then tells its agent to read it.
 
 To add a skill, write `assets/skills/<name>.md` and list it above.
