@@ -575,11 +575,19 @@ everything below: `lifecycle_config::resolve` takes the nearest node, from the
 node itself up, that lists the phase (so a lower node overrides per phase, and an
 explicit empty list turns a phase's skills off). The phase keys are the ten
 phase- and protocol-agent phases plus `fix` (`PHASES`). Names are free text and
-never validated (the skill may be set up later, and a container, sandbox or
-Cursor agent may have no Skill tool). `tod_core::skills_context::for_node` renders
-the "Skills" block (`DynamicBlock::ConfiguredSkills`) that each phase agent's
-opening carries, via a `skills` field on `ImplementRequest` and
-`GateCheckRequest`; the evaluator gets the skills of the state it judges. Edited in
+not validated when saved (the skill may be set up later).
+`tod_core::skills_context::for_node` renders the "Skills" block
+(`DynamicBlock::ConfiguredSkills`) that each phase agent's opening carries, via
+a `skills` field on `ImplementRequest` and `GateCheckRequest`; the evaluator
+gets the skills of the state it judges. The block holds each skill's **text**,
+not only its name, so no agent spends turns finding it and a skill marked
+`disable-model-invocation` (kept out of every session's context, refused by
+Claude Code's Skill tool) still works: a name is looked up among tod's own
+skills, then as `.claude/skills/[<group>/]<name>/SKILL.md` in the agent's
+working directory, then in `~/.claude/skills/` where the agent runs (host,
+container, or sandbox, off the UI thread). A name with no file (a built-in
+such as `simplify`) is passed on for the agent's Skill tool, and the block
+says so. Edited in
 the task editor (`views::lifecycle_config_editor`) or with `tod-cli capabilities
 set <node> lifecycle-config`. Edits are not recorded in a conversation's change set.
 

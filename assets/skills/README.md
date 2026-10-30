@@ -11,7 +11,7 @@ do not know how.
 | `tod-fix-ci` | A node's pull request has failing checks or review comments to answer (`pr_draft`, `pr_review`). |
 
 A skill may also be chosen for a lifecycle phase (the Lifecycle config
-capability, by name); the phase's context then tells its agent to read it.
+capability, by name); its text is then put in that phase agent's context.
 `tod-open-pr` is meant for the `pr` phase and `tod-fix-ci` for `pr_draft` and
 `pr_review`. Both are generic: a project's own details (its repositories,
 required checks, review bots, title format) go in a skill of the project's

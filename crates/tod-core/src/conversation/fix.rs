@@ -117,7 +117,9 @@ impl Protocol for FixProtocol {
                 )
             })
             .context("could not read the inherited context")?;
-        let working_dir = PathBuf::from(self.cwd(env)?.path_text());
+        let cwd = self.cwd(env)?;
+        let working_dir = PathBuf::from(cwd.path_text());
+        let skills = crate::skills_context::for_node(fleet, node_id, "fix", &cwd)?;
         build_fix_message(
             env.media,
             &ImplementRequest {
@@ -134,7 +136,7 @@ impl Protocol for FixProtocol {
                 obligations,
                 ancestor_context,
                 verdicts: super::verify::current_verdicts(fleet, node_id),
-                skills: crate::skills_context::for_node(fleet, node_id, "fix"),
+                skills,
                 pull_requests: crate::pr_context::for_node(fleet, node_id),
             },
             &open_findings(fleet, node_id),

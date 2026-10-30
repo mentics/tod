@@ -1,8 +1,9 @@
 //! Skills for working with tod itself, shipped alongside the executable.
 //!
-//! Unlike the agent context fragments (`crate::media`), nothing here is put in
-//! an agent's context: a skill is read only when an agent runs into something
-//! it does not know how to do (`tod-cli skills`). They are versioned with the
+//! Unlike the agent context fragments (`crate::media`), a skill is not put in
+//! an agent's context by default: it is read when an agent runs into something
+//! it does not know how to do (`tod-cli skills`), or put in a phase agent's
+//! opening when the Lifecycle config chooses it (`crate::skills_context`). They are versioned with the
 //! source under `assets/skills/` and installed as a `skills/` sibling of the
 //! executable. `README.md` lists each skill and when to use it; every other
 //! `<name>.md` is one skill.

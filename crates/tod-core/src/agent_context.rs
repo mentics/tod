@@ -330,7 +330,7 @@ mod tests {
     /// a session with none configured is shown no Skills section.
     #[test]
     fn every_phase_recipe_renders_the_configured_skills() {
-        let skills = crate::skills_context::render_skills("review", &["security-review".into()], &[]);
+        let skills = crate::skills_context::render_skills("review", &[crate::skills_context::Skill::ByName("security-review".into())]);
         for recipe in [&IMPLEMENT_SESSION, &VERIFY_SESSION, &REVIEW_SESSION, &FIX_SESSION, &crate::context_recipes::PR_SESSION, &crate::context_recipes::PHASE, &crate::context_recipes::EVALUATE] {
             let with = render(recipe.blocks, &DynamicContext { skills: &skills, ..Default::default() });
             assert!(with.contains("`security-review`"), "{}", recipe.name);
