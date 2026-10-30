@@ -4,11 +4,6 @@ description: Walk a real Linear ticket through the whole lifecycle in a cloud sa
 user_invocable: true
 ---
 
-<!-- The text of the `live-verify` skill. It belongs at
-     .claude/skills/live-verify/SKILL.md, but writes there were denied in the
-     session that made it. Install it with:
-       mkdir -p .claude/skills/live-verify && cp doc/live-verify-skill.md .claude/skills/live-verify/SKILL.md -->
-
 Run tod the way an engineer on the team does, against real services, find what
 breaks, and fix it. The argument (if any) is a bug the user saw or a part of
 the process to exercise; reproduce that first, then keep walking and fix
