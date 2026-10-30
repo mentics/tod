@@ -17,8 +17,10 @@
 //!   of it ending at a `:` ([`spec_matches`]): `github:pr 12 checks` matches
 //!   `github:pr:12:checks:success`.
 //! - **Routing.** First by branch: the cloud nodes (`cloud_nodes`) whose Files
-//!   branch (`node_fields.branch`) is the event's. Otherwise, every node with
-//!   an open event wait the event matches. Across all users.
+//!   branch (`node_fields.branch`) is the event's, in the event's repository
+//!   when the node has linked pull requests ([`in_repository`]). Otherwise,
+//!   every node with an open event wait the event matches ([`concerns`]).
+//!   Across all users.
 //! - **Effect**, per node: the event recorded (`tod_store::node_events`), its
 //!   matching waits set `satisfied` (`InterviewCommand::SetWaitState`, as the
 //!   supervisor does), their orchestrator wakes dropped, and its sandbox
@@ -335,8 +337,12 @@ fn targets(conn: &Connection, event: &Event) -> Result<Vec<Target>> {
         }
     }
     let sandbox_of = |node: Uuid| cloud.iter().find(|c| c.node_id == node).map(|c| c.sandbox.clone());
+    let links = tod_store::github::NodePrRepo::new(conn).all()?;
     let mut nodes: Vec<Uuid> = Vec::new();
     for row in &cloud {
+        if !in_repository(links.get(&row.node_id), event) {
+            continue;
+        }
         let branch: Option<String> = conn
             .query_row(
                 "SELECT branch FROM node_fields WHERE node_id = ?1",
@@ -351,7 +357,6 @@ fn targets(conn: &Connection, event: &Event) -> Result<Vec<Target>> {
     if nodes.is_empty() {
         // By wait alone a PR number or a release names no repository, so a
         // node that has linked pull requests hears only what concerns them.
-        let links = tod_store::github::NodePrRepo::new(conn).all()?;
         for (_, node) in &waits {
             if !nodes.contains(node) && concerns(conn, *node, links.get(node), event) {
                 nodes.push(*node);
@@ -366,6 +371,16 @@ fn targets(conn: &Connection, event: &Event) -> Result<Vec<Target>> {
             waits: waits.iter().filter(|(_, n)| *n == node).map(|(w, _)| *w).collect(),
         })
         .collect())
+}
+
+/// Whether a node whose branch is `event`'s is in the repository the event
+/// is about. A branch name is only unique within a repository, so a node
+/// with linked pull requests hears only its repositories' branches. A node
+/// with none linked, or an event that names no repository, takes it: its
+/// linked pull requests are the only GitHub repository a node records.
+fn in_repository(links: Option<&Vec<NodePr>>, event: &Event) -> bool {
+    let (Some(links), Some(repo)) = (links, event.repo.as_deref()) else { return true };
+    links.is_empty() || links.iter().any(|pr| format!("{}/{}", pr.owner, pr.repo).eq_ignore_ascii_case(repo))
 }
 
 /// Whether `event`, which matched one of `node`'s waits by its key alone,

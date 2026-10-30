@@ -240,7 +240,11 @@ version is in `media/context/cli/wait.md`.
 **Routing**, across every user under `<base>/users/`: first the cloud nodes
 (`cloud_nodes`) whose Files branch (`node_fields.branch`) is the event's
 branch (a Linear issue's `branchName`); if none, every node with a pending
-event wait that matches. For each node:
+event wait that matches. A branch name is unique only within a repository,
+so when the delivery names one (`repository.full_name`) a node with linked
+pull requests is routed by branch only if one of them is in that
+repository. A node with none linked records no repository and takes any
+branch match. For each node:
 
 1. The event is recorded in `node_events` (schema v69, synced: keys, a
    summary, the raw payload), under the user's sync lock.

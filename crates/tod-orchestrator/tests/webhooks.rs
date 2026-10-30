@@ -157,9 +157,10 @@ fn a_node_with_linked_pull_requests_hears_only_its_own_repository_and_releases()
         let conn = rusqlite::Connection::open(app.join("tod.db")).unwrap();
         tod_store::cloud_nodes::upsert(&conn, a, "node-a", "alice", 1).unwrap();
         tod_store::cloud_nodes::upsert(&conn, b, "node-b", "alice", 1).unwrap();
+        // The same branch name in both repositories.
         for (node, link) in [(a, "https://github.com/acme/app/pull/12"), (b, "https://github.com/acme/other/pull/12")] {
             conn.execute(
-                "INSERT INTO node_fields (node_id, linked_prs, updated_at) VALUES (?1, ?2, 1)",
+                "INSERT INTO node_fields (node_id, branch, linked_prs, updated_at) VALUES (?1, 'task/same', ?2, 1)",
                 rusqlite::params![uuid_to_blob(node), format!("[\"{link}\"]")],
             )
             .unwrap();
@@ -214,6 +215,18 @@ fn a_node_with_linked_pull_requests_hears_only_its_own_repository_and_releases()
     let review = serde_json::json!({"action":"submitted","repository":{"full_name":"acme/elsewhere"},
         "review":{"state":"approved"},"pull_request":{"number":12,"head":{"ref":"x"}}});
     assert_eq!(server.handle(&delivery(Some(&secret), "pull_request_review", &review)).status, 200);
+    assert!(poked.lock().unwrap().is_empty());
+
+    // By branch: a push to `task/same` in acme/other reaches only B.
+    let push = |repo: &str| {
+        serde_json::json!({"ref":"refs/heads/task/same","repository":{"full_name":repo}})
+    };
+    assert_eq!(server.handle(&delivery(Some(&secret), "push", &push("Acme/Other"))).status, 200);
+    assert_eq!(*poked.lock().unwrap(), ["node-b"]);
+    assert!(events(&remote, a).iter().all(|k| !k.contains("push")));
+    // And one in a repository neither node has linked reaches nobody.
+    poked.lock().unwrap().clear();
+    assert_eq!(server.handle(&delivery(Some(&secret), "push", &push("acme/elsewhere"))).status, 200);
     assert!(poked.lock().unwrap().is_empty());
 
     drop(fleet);
