@@ -125,7 +125,7 @@ pub fn check_gate(conn: &Connection, node: Uuid, from: &str) -> Result<GateCheck
 /// the gate last found (waivers are left as they are). Before the
 /// `ready` → `active` gate it gives the node's Files a branch when it has
 /// none, which that gate requires.
-pub fn settle_gate(fleet: &FleetStore, node: Uuid) -> Result<GateCheck> {
+pub fn settle_gate(fleet: &FleetStore, node: Uuid, branch_template: &str) -> Result<GateCheck> {
     // The check may call GitHub: while it runs the node is being worked on,
     // and says so (`tod_core::next_actor`).
     tod_store::activity::with_lease(
@@ -133,14 +133,14 @@ pub fn settle_gate(fleet: &FleetStore, node: Uuid) -> Result<GateCheck> {
         node,
         tod_store::activity::KIND_GATE_CHECK,
         &crate::next_actor::this_process(),
-        || settle_gate_unleased(fleet, node),
+        || settle_gate_unleased(fleet, node, branch_template),
     )?
 }
 
-fn settle_gate_unleased(fleet: &FleetStore, node: Uuid) -> Result<GateCheck> {
+fn settle_gate_unleased(fleet: &FleetStore, node: Uuid, branch_template: &str) -> Result<GateCheck> {
     let from = crate::lifecycle::current_state(fleet, node)?;
     if from == "ready" {
-        crate::gate::derived::generate_missing_branch(fleet, node)?;
+        crate::gate::derived::generate_missing_branch(fleet, node, branch_template)?;
     }
     let gate = fleet.read(|conn| check_gate(conn, node, &from))?;
     let rows: Vec<(Uuid, String, Option<String>, String)> = gate

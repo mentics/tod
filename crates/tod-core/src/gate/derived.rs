@@ -12,7 +12,9 @@ use tod_store::fleet::node_actions::{
 };
 use tod_store::fleet::{FleetMutation, FleetStore};
 use tod_store::interview::short_id;
-use tod_store::outline::repos::{NodeRepo, PlanStepRepo};
+use tod_store::outline::repos::PlanStepRepo;
+#[cfg(test)]
+use tod_store::outline::repos::NodeRepo;
 use tod_store::outline::repos::plan_steps::{STATUS_FAILED, STATUS_IMPLEMENTED, STATUS_VERIFIED};
 use tod_store::outline::repos::obligations::KIND_REQUIREMENT;
 use tod_store::outline::repos::ObligationRepo;
@@ -122,12 +124,12 @@ pub fn evaluate_derived_criterion(
     }
 }
 
-/// Give the node's Files capability the branch `task/<slug>` when it has
-/// none, so the `ready` → `active` check that requires one always finds it.
+/// Give the node's Files capability the branch `branch_template` makes when
+/// it has none, so the `ready` → `active` check that requires one always finds it.
 /// The slug is the node's own, even when Files is inherited from an ancestor.
 /// When each node gets its own worktree or sandbox, the branch is the node's
 /// own too; otherwise it goes on the Files it shares.
-pub fn generate_missing_branch(fleet: &FleetStore, node_id: Uuid) -> Result<()> {
+pub fn generate_missing_branch(fleet: &FleetStore, node_id: Uuid, branch_template: &str) -> Result<()> {
     fleet.reload_if_stale().ok();
     let Some(files) = fleet.resolve_files_for_node(&node_id.to_string())? else {
         return Ok(());
@@ -135,9 +137,7 @@ pub fn generate_missing_branch(fleet: &FleetStore, node_id: Uuid) -> Result<()> 
     if files.branch().is_some() {
         return Ok(());
     }
-    let Some(node) = fleet.read(|conn| Ok(NodeRepo::new(conn).get(node_id)?))? else {
-        return Ok(());
-    };
+    let branch = tod_store::fleet::provision::branch_from_template(fleet, &node_id.to_string(), branch_template)?;
     let id = if files.per_node() {
         files.node_id
     } else {
@@ -145,7 +145,7 @@ pub fn generate_missing_branch(fleet: &FleetStore, node_id: Uuid) -> Result<()> 
     };
     fleet.enqueue(FleetMutation::UpdateTaskBranch {
         id,
-        branch: Some(format!("task/{}", node.slug)),
+        branch: Some(branch),
     })?;
     fleet.writer().flush()?;
     fleet.reload_if_stale().ok();
@@ -982,7 +982,7 @@ mod tests {
         let outcome = evaluate(&store, node, READY_ACTIVE_ACTION_CONFIG_SLUG).unwrap();
         assert_eq!(outcome.outcome, OUTCOME_FAIL, "no branch");
         assert!(outcome.detail.contains("branch"), "{}", outcome.detail);
-        generate_missing_branch(&store, node).unwrap();
+        generate_missing_branch(&store, node, tod_store::branch_name::DEFAULT_BRANCH_TEMPLATE).unwrap();
         let slug = store
             .read(|conn| Ok(NodeRepo::new(conn).get(node)?))
             .unwrap()

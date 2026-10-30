@@ -492,7 +492,8 @@ impl Autopilot {
             hook.waiting(None, None);
             return Ok(Some(outcome));
         }
-        let gate = settle_gate(fleet, self.node)?;
+        let branch_template = tod_store::TodSettings::load(&tod_store::TodPaths::at(&self.config.data_root))?.branch_template;
+        let gate = settle_gate(fleet, self.node, &branch_template)?;
         if !gate.clear() {
             let failing: Vec<String> = gate
                 .failing()

@@ -35,8 +35,14 @@ per-node state**:
   what the node resolves to now, and **stale** otherwise. A stale location is
   never used; a launch refuses it until it is removed. Reverting makes it
   current again.
-- A node's **branch** is its own, `task/<slug>` by default, recorded when its
-  location is made. Every node with a location is on a unique branch.
+- A node's **branch** is its own, recorded when its location is made (or
+  before the `ready` → `active` gate, if that comes first). Code names it, never
+  an agent: the `branch_template` setting (Settings → Workspaces, default
+  `task/{slug}`) with `{slug}`, `{ticket}`, `{ticket_lower}`, `{title}` and
+  `{id}` filled in from the node (`tod_store::branch_name`; the ticket is the
+  node's Ticket capability link, e.g. a Linear id). A template that needs a
+  ticket is an error for a node without one. A branch a node already has is
+  never renamed. Every node with a location is on a unique branch.
 - A node with no worktree or sandbox shares the workspace directory.
 
 ## Made on first use

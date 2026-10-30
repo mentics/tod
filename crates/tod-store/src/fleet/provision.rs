@@ -218,21 +218,34 @@ pub(super) fn node_lock(node_id: &str) -> Arc<Mutex<()>> {
         .clone()
 }
 
-/// The branch `node_id` works on: its own, else `task/<slug>`, recorded.
-fn node_branch(fleet: &FleetStore, files: &ResolvedFiles) -> Result<String> {
+/// The branch `node_id` works on: its own, else the one `template` (the
+/// `branch_template` setting) makes from the node, recorded.
+fn node_branch(fleet: &FleetStore, files: &ResolvedFiles, template: &str) -> Result<String> {
     if let Some(branch) = files.branch() {
         return Ok(branch.to_string());
     }
-    let node = fleet
-        .get_node(&files.node_id)?
-        .ok_or_else(|| anyhow!("no node {}", files.node_id))?;
-    let branch = format!("task/{}", node.slug);
+    let branch = branch_from_template(fleet, &files.node_id, template)?;
     fleet.enqueue(FleetMutation::UpdateTaskBranch {
         id: files.node_id.clone(),
         branch: Some(branch.clone()),
     })?;
     fleet.writer().flush()?;
     Ok(branch)
+}
+
+/// The branch name `template` makes for `node_id`, from its slug, title and
+/// ticket.
+pub fn branch_from_template(fleet: &FleetStore, node_id: &str, template: &str) -> Result<String> {
+    let node = fleet.get_node(node_id)?.ok_or_else(|| anyhow!("no node {node_id}"))?;
+    crate::branch_name::render(
+        template,
+        &crate::branch_name::BranchVars {
+            id: &node.id,
+            slug: &node.slug,
+            title: &crate::outline::slug::slugify(&node.title),
+            ticket: node.ticket.as_deref(),
+        },
+    )
 }
 
 /// Make `node_id`'s worktree or sandbox from the Files settings it resolves
@@ -256,7 +269,7 @@ pub fn make_location(
     if let Some(stale) = &files.stale_location {
         bail!("{}", stale_message(&files, stale));
     }
-    let branch = node_branch(fleet, &files)?;
+    let branch = node_branch(fleet, &files, &settings.branch_template)?;
     let location = FilesLocation {
         node_id: node_id.to_string(),
         source_node_id: files.source_node_id.clone(),
@@ -1144,6 +1157,29 @@ mod tests {
         store.writer().flush().unwrap();
         store.reload_if_stale().unwrap();
         (parent, child.to_string())
+    }
+
+    /// The template reads the node's own title and Linear ticket from the
+    /// store; a node with no ticket is refused when the template needs one.
+    #[test]
+    fn the_branch_template_takes_the_nodes_ticket_and_title() {
+        let root = temp_fleet_root();
+        let (repo, _origin) = repo_with_origin(&root);
+        let store = FleetStore::open(root.join("fleet")).unwrap();
+        let (_parent, child) = tree(&store, &repo);
+        let template = "feat/{ticket_lower}-{title}";
+        let err = branch_from_template(&store, &child, template).unwrap_err().to_string();
+        assert!(err.contains("no ticket"), "{err}");
+        store
+            .enqueue(FleetMutation::UpdateTaskTicket { id: child.clone(), ticket: Some("TOD-142".into()) })
+            .unwrap();
+        store.writer().flush().unwrap();
+        store.reload_if_stale().unwrap();
+        assert_eq!(branch_from_template(&store, &child, template).unwrap(), "feat/tod-142-fix-login");
+        assert_eq!(
+            branch_from_template(&store, &child, crate::branch_name::DEFAULT_BRANCH_TEMPLATE).unwrap(),
+            format!("task/{}", store.get_node(&child).unwrap().unwrap().slug)
+        );
     }
 
     /// An inheriting node gets a worktree of its own on its own branch the
