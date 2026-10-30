@@ -851,7 +851,7 @@ fn warn_problem_log_unreadable(err: &anyhow::Error) {
                 crate::logging::buffer::Level3::Error,
                 crate::logging::buffer::LogSource::App,
                 "The cloud orchestrator is out of date: it cannot send its problem log (404 on problems/pull). \
-                 Redeploy it with scripts/build.sh --data-root <your data root> --deploy-orchestrator to see the cloud's problems here. Syncing otherwise works; this is not repeated until tod restarts.",
+                 Redeploy it with scripts/deploy.sh to see the cloud's problems here. Syncing otherwise works; this is not repeated until tod restarts.",
             );
         }
     } else {

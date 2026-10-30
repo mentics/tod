@@ -253,7 +253,7 @@ orchestrator is out of date", or the log says `orchestrator ...: 404 Not
 Found`) redeploy it:
 
 ```bash
-scripts/build.sh --data-root <root> --deploy-orchestrator   # <root> holds sandboxes.toml
+scripts/deploy.sh   # deploys the orchestrator and the watchdog when they are out of date
 ```
 
 This builds the Linux binaries (needs Docker running, or zig +

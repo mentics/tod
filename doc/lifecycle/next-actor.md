@@ -470,7 +470,7 @@ silence is never taken for success (`cloud_sync::start_in_cloud`).
 
 A supervisor older than this does not beat: its nodes read as before until
 "Reinstall and restart" gives them the new one. The orchestrator must be
-deployed first (`scripts/build.sh --deploy-orchestrator`): it refuses a push
+deployed first (`scripts/deploy.sh`): it refuses a push
 carrying a table it does not know, and an app older than the orchestrator
 refuses a feed carrying `cloud_activity`.
 
