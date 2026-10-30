@@ -18,7 +18,8 @@ Inside a conversation `--node` defaults to the node it is about.
   was certified.
 - `ready`: the phase's work is done; have it evaluated. It takes no flags and
   no note: the evaluator judges from the node's own data and your reply. A
-  separate session then judges it and certifies it or sends it back.
+  separate session then judges it and certifies it or sends it back. Not in
+  `pr`, which no separate session evaluates: there, `certify` it yourself.
 - `certify --note`: the phase is done. The app records a digest of what you
   judged, and the gate passes only while it is unchanged: any later edit to
   what the phase covers makes the certificate stale, and the phase comes back

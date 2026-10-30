@@ -1,26 +1,27 @@
 # State: `pr`
 
-**Gate:** `pr` → `pr_review`. The app checks it against GitHub; no agent evaluates it: the pull request is open and no longer a draft, and a person is on it as reviewer. The gate is hardcoded for now (what "ready for human review" means will want to be scriptable per project).
+**Gate:** `pr` → `pr_draft`. The app checks it; no agent evaluates it: a pull request is linked to the node and open (as a draft), and you have certified the draft ready in this stay. The certificate does not carry over: when the node is moved back and comes to `pr` again, the gate fails until you have reviewed the pull request again and certified it.
 
 ## First
 
-The PR is worked as the node's `pr` conversation. Read lifecycle state, obligations, plan, and the review's findings and their answers. Check the pull request's status first (`tod-cli pr status`): an earlier session, or an earlier stay in this state, may already have opened it. You run on every stay in `pr`, whether or not the PR exists and whether or not GitHub shows work, so that the skills configured for this phase are applied each time.
+The PR is worked as the node's `pr` conversation. Read lifecycle state, obligations, plan, and the review's findings and their answers. Check the pull request's status first (`tod-cli pr status`): an earlier session, or an earlier stay in this state, may already have opened it. You run on every stay in `pr`, whether or not the PR exists, so that a PR left from before a move back is looked at again rather than passed through.
 
 ## Responsibilities
 
-Get the pull request **ready for a person to review**, as a draft:
+Get the **draft** pull request in place and describing the change as it is now:
 
-- If none exists yet, open it and link it to the node (`tod-cli pr open` does both). Push the branch first. Write the title and description from the node's obligations and what was built, so a reviewer who has not followed the work can follow the change; when the PR exists, bring them up to date with what is built now.
+- If none exists yet, open it and link it to the node (`tod-cli pr open` does both; it always opens a draft). Push the branch first. Write the title and description from the node's obligations and what was built, so a reviewer who has not followed the work can follow the change.
+- If one exists, push what is not pushed yet, and bring its title and description up to date with what is built now.
 - Apply this phase's configured skills to the PR, as its context lists them.
-- Clear everything you can: bring the branch up to date with its base, fix failing checks, answer review threads from automated reviewers and bots, and meet any bot's required score. The app asks a bot to review again and waits for it and for CI; you are sent back when there is more to do.
-- Keep it a draft. A person marks it ready for review and puts a reviewer on it; that is what the gate waits for. Do not mark it ready, and do not request reviewers yourself.
+- Keep it a draft. Do not mark it ready for review, and do not request reviewers.
+- Certify the phase (`tod-cli phase certify --note <why>`) once the draft is open, pushed, and describes the change. In this state no separate session evaluates it: you certify it yourself, whether or not independent evaluation is on.
 
-A human reviewer's feedback comes after that, in `pr_review`.
+Checks, bot reviews, and branch drift are not this state's work: `pr_draft`, next, clears them before a person looks.
 
 ## Done when
 
-The pull request is open and linked, and nothing is left that you can clear: the branch is current, checks pass, bot feedback is answered and any bot's score is met. The gate then checks from GitHub that it is open for review and has a reviewer; until a person does that, the run waits at the gate with those criteria failing.
+The pull request is open as a draft, linked, its branch pushed, and its title and description match what was built; and you have certified the phase in this stay.
 
 ## Blockers
 
-A branch you cannot push, or nothing to open a pull request from → ask the user, or record blocked with why, and stop.
+A branch you cannot push, or nothing to open a pull request from → ask the user, or record blocked with why (`tod-cli pr blocked`), and stop.

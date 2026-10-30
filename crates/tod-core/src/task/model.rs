@@ -305,18 +305,19 @@ pub fn lifecycle_rank(lifecycle: &str) -> usize {
         "verifying" => 5,
         "review" => 6,
         "pr" => 7,
-        "pr_review" => 8,
-        "approved" => 9,
-        "merged" => 10,
-        "released" => 11,
-        "learn" => 12,
-        "done" => 13,
+        "pr_draft" => 8,
+        "pr_review" => 9,
+        "approved" => 10,
+        "merged" => 11,
+        "released" => 12,
+        "learn" => 13,
+        "done" => 14,
         _ => 99,
     }
 }
 
 /// Ordered lifecycle states, indexed by `lifecycle_rank`.
-pub const LIFECYCLE_STATES: [&str; 14] = [
+pub const LIFECYCLE_STATES: [&str; 15] = [
     "proposed",
     "design",
     "planning",
@@ -325,6 +326,7 @@ pub const LIFECYCLE_STATES: [&str; 14] = [
     "verifying",
     "review",
     "pr",
+    "pr_draft",
     "pr_review",
     "approved",
     "merged",

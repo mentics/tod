@@ -13,7 +13,7 @@ it, and an existing PR for the branch is linked, not opened again.
 
 - **Always a draft.** `pr open` opens one. Do not mark it ready for review and
   do not request reviewers: a person does both, and that is what the gate
-  out of `pr` waits for.
+  out of `pr_draft` waits for.
 - **Base** is the repository's default branch (`main`) unless the node says
   otherwise. **Head** is the branch you pushed.
 - **One PR per repository that changed.** In a workspace of submodules

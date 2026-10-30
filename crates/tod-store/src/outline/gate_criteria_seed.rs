@@ -385,12 +385,31 @@ pub const GATE_CRITERIA: &[GateCriterionSeed] = &[
         label: "Every review finding answered (fixed, out of scope, declined, or rejected)?",
         sort_order: 2,
     },
-    // pr → pr_review — app-checked: the draft the `pr` state opened has been
-    // marked ready and has a person to review it. Hardcoded: what "ready for
-    // human review" means will want to be scriptable per project.
+    // pr → pr_draft — app-checked: the `pr` state's agent opened the draft
+    // pull request (or reviewed the one an earlier stay left) and certified
+    // it ready in this stay.
+    GateCriterionSeed {
+        id_str: "a1000006-0006-4006-8006-00000000000c",
+        from_state: "pr",
+        to_state: "pr_draft",
+        slug: crate::outline::repos::gate::PR_PR_DRAFT_PR_OPEN_SLUG,
+        label: "Pull request opened and linked?",
+        sort_order: 1,
+    },
+    GateCriterionSeed {
+        id_str: "a1000006-0006-4006-8006-00000000000d",
+        from_state: "pr",
+        to_state: "pr_draft",
+        slug: crate::outline::repos::gate::PR_PR_DRAFT_PHASE_CERTIFIED_SLUG,
+        label: "Draft pull request certified ready in this stay?",
+        sort_order: 2,
+    },
+    // pr_draft → pr_review — app-checked: the draft has been marked ready and
+    // has a person to review it. Hardcoded: what "ready for human review"
+    // means will want to be scriptable per project.
     GateCriterionSeed {
         id_str: "a1000006-0006-4006-8006-00000000000a",
-        from_state: "pr",
+        from_state: "pr_draft",
         to_state: "pr_review",
         slug: crate::outline::repos::gate::PR_PR_REVIEW_READY_SLUG,
         label: "PR open and out of draft?",
@@ -398,7 +417,7 @@ pub const GATE_CRITERIA: &[GateCriterionSeed] = &[
     },
     GateCriterionSeed {
         id_str: "a1000006-0006-4006-8006-00000000000b",
-        from_state: "pr",
+        from_state: "pr_draft",
         to_state: "pr_review",
         slug: crate::outline::repos::gate::PR_PR_REVIEW_REVIEWER_SLUG,
         label: "A person assigned to review it?",
@@ -579,6 +598,15 @@ pub fn seed_gate_criteria(conn: &Connection) -> Result<()> {
     conn.execute(
         "UPDATE gate_criteria SET from_state = 'pr_review', updated_at = ?1
          WHERE from_state = 'pr' AND to_state = 'approved'",
+        params![now],
+    )?;
+    // The `pr_draft` state took over what `pr` gated: the criteria that check
+    // the PR is out of draft with a reviewer now belong to
+    // `pr_draft → pr_review`, and `pr → pr_draft` is new. Same backfill
+    // reason as above.
+    conn.execute(
+        "UPDATE gate_criteria SET from_state = 'pr_draft', updated_at = ?1
+         WHERE from_state = 'pr' AND to_state = 'pr_review'",
         params![now],
     )?;
     // A gate never runs an agent (`doc/lifecycle/phase-agents.md`): every

@@ -39,7 +39,7 @@ pub const CERTIFIER_INDEPENDENT: &str = "independent";
 pub const CERTIFIER_USER: &str = "user";
 
 /// The states whose leaving needs a certificate.
-pub const CERTIFIABLE_STATES: [&str; 5] = ["proposed", "design", "planning", "merged", "released"];
+pub const CERTIFIABLE_STATES: [&str; 6] = ["proposed", "design", "planning", "pr", "merged", "released"];
 
 /// Whether `state` is one a certificate can be recorded for.
 pub fn is_certifiable(state: &str) -> bool {
@@ -251,7 +251,9 @@ struct Inputs {
 ///   send the phase back.
 /// - `planning`: own obligations, plan steps (id, body, phase), and which step
 ///   satisfies which obligation.
-/// - `merged`, `released`: `{}` — the certificate is a check mark for the stay.
+/// - `pr`, `merged`, `released`: `{}` — the certificate is a check mark for
+///   the stay. In `pr` it is the pull request's agent saying the draft is
+///   ready; a move back starts a new stay, so it must say so again.
 pub fn phase_inputs(conn: &Connection, node_id: Uuid, state: &str) -> Result<Option<Value>> {
     let inputs = match state {
         "proposed" => Inputs {
@@ -271,7 +273,7 @@ pub fn phase_inputs(conn: &Connection, node_id: Uuid, state: &str) -> Result<Opt
             step_obligations: Some(step_links(conn, node_id)?),
             ..Default::default()
         },
-        "merged" | "released" => Inputs::default(),
+        "pr" | "merged" | "released" => Inputs::default(),
         _ => return Ok(None),
     };
     Ok(Some(serde_json::to_value(inputs)?))
@@ -826,7 +828,7 @@ mod tests {
             assert!(is_certifiable(state));
             assert!(phase_inputs(&fx.conn, fx.node, state).unwrap().is_some());
         }
-        for state in ["ready", "active", "verifying", "review", "pr", "approved", "learn", "done"] {
+        for state in ["ready", "active", "verifying", "review", "pr_draft", "pr_review", "approved", "learn", "done"] {
             assert!(!is_certifiable(state));
             assert!(phase_inputs(&fx.conn, fx.node, state).unwrap().is_none());
         }

@@ -19,12 +19,13 @@ use uuid::Uuid;
 
 /// Lifecycle states at or after `ready`: a node in one of these has built
 /// (or committed to building) on what it inherits.
-pub const COMMITTED_STATES: [&str; 11] = [
+pub const COMMITTED_STATES: [&str; 12] = [
     "ready",
     "active",
     "verifying",
     "review",
     "pr",
+    "pr_draft",
     "pr_review",
     "approved",
     "merged",

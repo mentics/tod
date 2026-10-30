@@ -317,7 +317,7 @@ fn retire_outside_criteria(fx: &Fixture) {
     let conn = rusqlite::Connection::open(fx.fleet.paths().db()).unwrap();
     conn.execute(
         "UPDATE gate_criteria SET active = 0
-         WHERE slug = ?1 OR from_state IN ('pr', 'pr_review', 'approved')",
+         WHERE slug = ?1 OR from_state IN ('pr', 'pr_draft', 'pr_review', 'approved')",
         [tod_store::outline::repos::gate::READY_ACTIVE_ACTION_CONFIG_SLUG],
     )
     .unwrap();
@@ -914,10 +914,78 @@ fn pr_review_never_opens_a_pull_request() {
 }
 
 #[test]
-fn pr_runs_its_agent_on_every_stay_even_with_a_pull_request_and_no_work() {
-    // `pr` gets the draft ready for review: a linked pull request that shows
-    // no work still gets the agent's turn (the phase's skills apply), once per
-    // stay, and the run then moves on to the gate.
+fn pr_certifies_the_draft_in_every_stay_even_when_the_pull_request_exists() {
+    // A node moved back to `pr` may still link the pull request it had: its
+    // agent runs again anyway, and only a certificate from this stay lets the
+    // gate pass.
+    let fx = setup();
+    retire_outside_criteria(&fx);
+    // Back on: the certificate is what this test is about. Whether the PR is
+    // open needs GitHub, which a test has not got.
+    let conn = rusqlite::Connection::open(fx.fleet.paths().db()).unwrap();
+    conn.execute(
+        "UPDATE gate_criteria SET active = 1 WHERE slug = ?1",
+        [tod_store::outline::repos::gate::PR_PR_DRAFT_PHASE_CERTIFIED_SLUG],
+    )
+    .unwrap();
+    drop(conn);
+    fx.fleet.reload_if_stale().ok();
+    struct Clean;
+    impl crate::pr_readiness::PrFeed for Clean {
+        fn snapshot(&self, _: &tod_store::github::NodePr) -> Result<tod_store::github::PrSnapshot, String> {
+            use tod_store::github::{PrSnapshot, PrStatus};
+            Ok(PrSnapshot {
+                status: PrStatus {
+                    mergeable: Some(true),
+                    mergeable_state: Some("blocked".into()),
+                    checks: Some("success".into()),
+                    head_sha: Some("abcdef1".into()),
+                    head_committed_at: Some("2020-01-01T00:00:00Z".into()),
+                    draft: true,
+                    open: true,
+                    ..Default::default()
+                },
+                threads: vec![],
+                comments: vec![],
+                reviews: vec![],
+            })
+        }
+        fn comment(&self, _: &tod_store::github::NodePr, _: &str) -> Result<(), String> {
+            Ok(())
+        }
+    }
+    crate::pr_readiness::set_feed_override(Some(Arc::new(Clean)));
+    linked_to_prs(&fx, "pr", &["https://github.com/acme/app/pull/42"]);
+    let certificate = || {
+        fx.fleet
+            .read(|conn| Ok(PhaseRepo::new(conn).certificate_status(fx.node, "pr")?))
+            .unwrap()
+    };
+    let mut agent = FakeAgent::new(&fx.fleet);
+
+    let mut pilot = autopilot(&fx, Budget::default()).with_pr_poll_interval(Duration::ZERO);
+    let outcome = pilot.run(&fx.fleet, &mut agent).unwrap();
+    let steps: Vec<_> = pilot.state().steps.iter().map(|s| format!("{} {}->{}", s.step, s.from, s.to)).collect();
+    assert!(steps.iter().any(|s| s == "advance pr->pr_draft"), "{outcome:?} {steps:#?}");
+    let turns_in_pr = steps.iter().filter(|s| s.ends_with("pr->pr")).count();
+    assert_eq!(turns_in_pr, 1, "{steps:#?}");
+
+    // Moved back: the certificate from the earlier stay no longer counts, so
+    // the agent goes round again although the pull request is still linked.
+    lifecycle::set_lifecycle(&fx.fleet, fx.node, "pr").unwrap();
+    assert_eq!(certificate(), tod_store::phase::CertificateStatus::None);
+    let mut again = autopilot(&fx, Budget::default()).with_pr_poll_interval(Duration::ZERO);
+    let outcome = again.run(&fx.fleet, &mut agent).unwrap();
+    let steps: Vec<_> = again.state().steps.iter().map(|s| format!("{} {}->{}", s.step, s.from, s.to)).collect();
+    assert!(steps.iter().any(|s| s == "pr pr->pr"), "{outcome:?} {steps:#?}");
+    assert!(steps.iter().any(|s| s == "advance pr->pr_draft"), "{outcome:?} {steps:#?}");
+}
+
+#[test]
+fn pr_draft_runs_its_agent_on_every_stay_even_with_a_pull_request_and_no_work() {
+    // `pr_draft` gets the draft ready for review: a linked pull request that
+    // shows no work still gets the agent's turn (the phase's skills apply),
+    // once per stay, and the run then moves on to the gate.
     let fx = setup();
     retire_outside_criteria(&fx);
     struct Clean;
@@ -945,7 +1013,7 @@ fn pr_runs_its_agent_on_every_stay_even_with_a_pull_request_and_no_work() {
         }
     }
     crate::pr_readiness::set_feed_override(Some(Arc::new(Clean)));
-    linked_to_prs(&fx, "pr", &["https://github.com/acme/app/pull/42"]);
+    linked_to_prs(&fx, "pr_draft", &["https://github.com/acme/app/pull/42"]);
     let mut agent = FakeAgent::new(&fx.fleet);
     let mut pilot = autopilot(&fx, Budget::default()).with_pr_poll_interval(Duration::ZERO);
     let outcome = pilot.run(&fx.fleet, &mut agent).unwrap();
@@ -1401,7 +1469,7 @@ fn check_now_records_where_each_pull_request_stands_with_no_run() {
 }
 
 #[test]
-fn check_now_in_pr_waits_for_the_draft_to_be_ready_and_reviewed() {
+fn check_now_in_pr_draft_waits_for_the_draft_to_be_ready_and_reviewed() {
     use tod_store::github::{PrReview, PrSnapshot, PrStatus};
     struct Feed(std::sync::Mutex<PrSnapshot>);
     impl crate::pr_readiness::PrFeed for Feed {
@@ -1434,7 +1502,7 @@ fn check_now_in_pr_waits_for_the_draft_to_be_ready_and_reviewed() {
         reviews: vec![],
     })));
     crate::pr_readiness::set_feed_override(Some(feed.clone()));
-    linked_to_prs(&fx, "pr", &["https://github.com/acme/app/pull/42"]);
+    linked_to_prs(&fx, "pr_draft", &["https://github.com/acme/app/pull/42"]);
 
     let found = super::check_now(&fx.fleet, fx.node, &fx.root).unwrap();
     let super::GithubCheck::Waiting { what, .. } = found else { panic!("expected Waiting, got {found:?}") };
@@ -1458,7 +1526,7 @@ fn check_now_in_pr_waits_for_the_draft_to_be_ready_and_reviewed() {
 }
 
 #[test]
-fn check_now_in_pr_sends_new_changes_requested_to_the_agent_even_on_a_draft() {
+fn check_now_in_pr_draft_sends_new_changes_requested_to_the_agent_even_on_a_draft() {
     use tod_store::github::{PrReview, PrSnapshot, PrStatus};
     struct Feed(PrSnapshot);
     impl crate::pr_readiness::PrFeed for Feed {
@@ -1495,7 +1563,7 @@ fn check_now_in_pr_sends_new_changes_requested_to_the_agent_even_on_a_draft() {
             body: String::new(),
         }],
     }))));
-    linked_to_prs(&fx, "pr", &["https://github.com/acme/app/pull/42"]);
+    linked_to_prs(&fx, "pr_draft", &["https://github.com/acme/app/pull/42"]);
 
     let found = super::check_now(&fx.fleet, fx.node, &fx.root).unwrap();
     let super::GithubCheck::Feedback { what } = found else { panic!("expected Feedback, got {found:?}") };
@@ -1504,7 +1572,7 @@ fn check_now_in_pr_sends_new_changes_requested_to_the_agent_even_on_a_draft() {
 }
 
 #[test]
-fn check_now_in_pr_clears_a_leftover_review_wait_and_ignores_a_bot_reviewer() {
+fn check_now_in_pr_draft_clears_a_leftover_review_wait_and_ignores_a_bot_reviewer() {
     use tod_store::github::{PrSnapshot, PrStatus};
     struct Feed(PrSnapshot);
     impl crate::pr_readiness::PrFeed for Feed {
@@ -1533,7 +1601,7 @@ fn check_now_in_pr_clears_a_leftover_review_wait_and_ignores_a_bot_reviewer() {
     let snapshot = |reviewers: &[&str]| {
         Arc::new(Feed(PrSnapshot { status: status(reviewers), threads: vec![], comments: vec![], reviews: vec![] }))
     };
-    linked_to_prs(&fx, "pr", &["https://github.com/acme/app/pull/42"]);
+    linked_to_prs(&fx, "pr_draft", &["https://github.com/acme/app/pull/42"]);
 
     // Only a bot is asked: no reviewer yet.
     crate::pr_readiness::set_feed_override(Some(snapshot(&["greptile-apps[bot]"])));

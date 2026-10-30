@@ -342,7 +342,7 @@ mod tests {
         for state in ["proposed", "design", "planning", "merged", "released", "learn"] {
             assert!(has_phase_agent(state), "{state}");
         }
-        for state in ["ready", "active", "verifying", "review", "pr", "approved", "done"] {
+        for state in ["ready", "active", "verifying", "review", "pr", "pr_draft", "pr_review", "approved", "done"] {
             assert!(!has_phase_agent(state), "{state}");
         }
     }

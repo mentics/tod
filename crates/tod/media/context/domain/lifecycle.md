@@ -4,7 +4,7 @@ Each node sits in one **lifecycle state**, and moves forward through them in
 order:
 
 `proposed` → `design` → `planning` → `ready` → `active` → `verifying` →
-`review` → `pr` → `pr_review` → `approved` → `merged` → `released` → `learn` → `done`
+`review` → `pr` → `pr_draft` → `pr_review` → `approved` → `merged` → `released` → `learn` → `done`
 
 Once its runner is started, a node moves through the whole lifecycle without
 the user. Each state has a **gate**: criteria the app checks itself, from the
@@ -14,15 +14,20 @@ agent does the state's work and records it in a form the gate can check.
 Where the work is a judgment (`proposed`, `design`, `planning`, `merged`,
 `released`), the agent **certifies** the phase is done. A certificate records
 a digest of what it covers (the node's obligations, its plan, its content), so
-any later change to those makes it stale and the phase runs again. When
+any later change to those makes it stale and the phase runs again. The `pr`
+state's agent certifies its draft pull request too. A certificate counts only
+for the stay in the state it was given in: a node moved back must have each
+phase certified again. When
 independent evaluation is on, the phase agent marks the work ready and a
 separate, fresh session judges it: it certifies, or sends it back with fixes
 for the phase agent to make.
 
 The user is involved only for what only they can supply, and for a pull
 request that needs a human review before it is mergeable. `pr` opens the pull
-request as a draft; once a person has marked it ready and put a reviewer on
-it, `pr_review` answers the review's feedback until it is mergeable.
+request as a draft and certifies it; `pr_draft` clears the checks and the
+review bots' feedback on the draft; once a person has marked it ready and put
+a reviewer on it, `pr_review` answers the review's feedback until it is
+mergeable.
 
 ## Asking the user
 

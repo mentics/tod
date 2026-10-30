@@ -329,7 +329,7 @@ turn in flight). Either way the autopilot drops its current conversation and
 the step runs in a new one (`Autopilot::start_fresh_session`). A node still
 holding a pending decision stays so. A node that is waiting (on GitHub, say)
 runs anyway: the request skips the supervisor's "still waiting" return, and the
-run looks again and records whatever it still waits on. In `pr` that means its
+run looks again and records whatever it still waits on. In `pr_draft` that means its
 agent takes a turn before the wait for a person to review is recorded
 (`doc/lifecycle/pr-readiness.md`).
 

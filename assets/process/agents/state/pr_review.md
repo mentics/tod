@@ -7,11 +7,11 @@
 The PR is driven as the node's `pr` conversation (the protocol is named for the pull request; this state is its review). The lifecycle runner sends you into it when there is something to do, and tells you what: the open threads, the failing check, the branch behind its base.
 
 1. Read lifecycle state, obligations, plan, and the review's findings and their answers.
-2. Check the pull request's status before doing anything else (`tod-cli pr status`): the `pr` state opened it as a draft, and a person has since marked it ready and asked for a review.
+2. Check the pull request's status before doing anything else (`tod-cli pr status`): the `pr` state opened it as a draft, `pr_draft` cleared the automated feedback on it, and a person has since marked it ready and asked for a review.
 
 ## Responsibilities
 
-The pull request already exists: the `pr` state opened it, and the gate out of it held until it was open for review with a reviewer on it. Do not open another. **Babysit** it: get it to a state that is 100% mergeable except for the human review, which you cannot do and do not wait on.
+The pull request already exists: the `pr` state opened it, and the gate out of `pr_draft` held until it was open for review with a reviewer on it. Do not open another. **Babysit** it: get it to a state that is 100% mergeable except for the human review, which you cannot do and do not wait on.
 
 - **Keep the branch current.** When the base branch has moved on, merge it into the branch (a merge, never a rebase or a force-push, so review history stays intact), resolve conflicts, and run the tests.
 - **Answer every review thread**, human or bot, with the same care. Read the thread with its code. Then either fix it, or decline with a reason, and answer the thread so the reply is posted and the thread resolved. Push before you answer, so the reply can name the commit.

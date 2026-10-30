@@ -175,7 +175,7 @@ fn look_at_github(
     let releasing = match lifecycle {
         "approved" => false,
         "merged" => true,
-        "pr" => return check_ready_for_review(fleet, node, data_root),
+        "pr_draft" => return check_ready_for_review(fleet, node, data_root),
         _ => return Ok(GithubCheck::NothingToWaitOn),
     };
     let links = fleet.read(|conn| NodePrRepo::new(conn).read(node))?;
@@ -247,8 +247,8 @@ fn look_at_github(
     Ok(GithubCheck::Waiting { what, due_at_ms })
 }
 
-/// The `pr` state's wait: the draft its agent opened is marked ready for
-/// review and has a person on it, which the `pr → pr_review` gate asks and
+/// The `pr_draft` state's wait: the draft the `pr` state opened is marked
+/// ready for review and has a person on it, which the `pr_draft → pr_review` gate asks and
 /// only a person can do. Waits on the first linked pull request that is not
 /// there yet; a webhook for it (`github:pr:<n>:ready_for_review`, or
 /// `:review_requested` once it is out of draft) wakes the run sooner than

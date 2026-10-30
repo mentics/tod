@@ -879,7 +879,8 @@ fn gate_criteria_seed_on_migration() {
         slugs("review", "pr"),
         [REVIEW_APPROVED_REVIEW_DONE_SLUG, REVIEW_APPROVED_FINDINGS_ANSWERED_SLUG]
     );
-    assert_eq!(slugs("pr", "pr_review"), [PR_PR_REVIEW_READY_SLUG, PR_PR_REVIEW_REVIEWER_SLUG]);
+    assert_eq!(slugs("pr", "pr_draft"), [PR_PR_DRAFT_PR_OPEN_SLUG, PR_PR_DRAFT_PHASE_CERTIFIED_SLUG]);
+    assert_eq!(slugs("pr_draft", "pr_review"), [PR_PR_REVIEW_READY_SLUG, PR_PR_REVIEW_REVIEWER_SLUG]);
     assert_eq!(
         slugs("pr_review", "approved"),
         [

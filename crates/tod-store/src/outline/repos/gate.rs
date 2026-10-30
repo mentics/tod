@@ -55,9 +55,21 @@ pub const REVIEW_APPROVED_REVIEW_DONE_SLUG: &str = "review-approved.review-done"
 /// findings table (`tod_core::gate::derived`); it never goes to an agent.
 pub const REVIEW_APPROVED_FINDINGS_ANSWERED_SLUG: &str = "review-approved.findings-answered";
 
-/// `pr` → `pr_review`: the PR is open and no longer a draft.
+/// `pr` → `pr_draft`: the node links a pull request, and each is open (still a
+/// draft is expected) or merged.
+pub const PR_PR_DRAFT_PR_OPEN_SLUG: &str = "pr-pr_draft.pr-open";
+/// `pr` → `pr_draft`: the `pr` phase's agent certified the draft pull request
+/// ready in this stay (`crate::phase`). A move back starts a new stay, so the
+/// agent runs again and reviews the PR it finds rather than the gate passing
+/// on a PR an earlier stay left behind.
+pub const PR_PR_DRAFT_PHASE_CERTIFIED_SLUG: &str = "pr-pr_draft.phase-certified";
+
+// The two below gate `pr_draft` → `pr_review`. They kept the slugs they had
+// when `pr` led straight to `pr_review`.
+
+/// `pr_draft` → `pr_review`: the PR is open and no longer a draft.
 pub const PR_PR_REVIEW_READY_SLUG: &str = "pr-pr_review.ready-for-review";
-/// `pr` → `pr_review`: a person is on the PR as a reviewer (requested, or
+/// `pr_draft` → `pr_review`: a person is on the PR as a reviewer (requested, or
 /// already reviewed). Hardcoded for now: a project will want to say what
 /// "ready for human review" means for it, which wants scripting.
 pub const PR_PR_REVIEW_REVIEWER_SLUG: &str = "pr-pr_review.reviewer-assigned";
@@ -107,6 +119,7 @@ pub fn phase_certified_slug(from_state: &str) -> Option<&'static str> {
         "proposed" => Some(PROPOSED_DESIGN_PHASE_CERTIFIED_SLUG),
         "design" => Some(DESIGN_PLANNING_PHASE_CERTIFIED_SLUG),
         "planning" => Some(PLANNING_READY_PHASE_CERTIFIED_SLUG),
+        "pr" => Some(PR_PR_DRAFT_PHASE_CERTIFIED_SLUG),
         "merged" => Some(MERGED_RELEASED_PHASE_CERTIFIED_SLUG),
         "released" => Some(RELEASED_LEARN_PHASE_CERTIFIED_SLUG),
         _ => None,
@@ -128,6 +141,8 @@ pub const DERIVED_CRITERION_SLUGS: &[&str] = &[
     VERIFYING_REVIEW_PLAN_VERIFIED_SLUG,
     REVIEW_APPROVED_REVIEW_DONE_SLUG,
     REVIEW_APPROVED_FINDINGS_ANSWERED_SLUG,
+    PR_PR_DRAFT_PR_OPEN_SLUG,
+    PR_PR_DRAFT_PHASE_CERTIFIED_SLUG,
     PR_PR_REVIEW_READY_SLUG,
     PR_PR_REVIEW_REVIEWER_SLUG,
     PR_APPROVED_MERGEABLE_SLUG,

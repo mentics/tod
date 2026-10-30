@@ -2,7 +2,7 @@
 
 How to clear what a node's pull request needs from you: failing checks, and
 review comments from bots and people. Your phase's role doc says which of
-these this state covers (in `pr`, checks and bots; in `pr_review`, everyone),
+these this state covers (in `pr_draft`, checks and bots; in `pr_review`, everyone),
 and how to decide scope; this skill is how to do the work.
 
 ## You never wait

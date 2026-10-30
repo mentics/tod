@@ -239,7 +239,7 @@ pub const REVIEW_SESSION: ContextRecipe = ContextRecipe {
 /// A pr session: an agent opening and driving a node's pull request. The `pr`
 /// state agent's role doc goes ahead of the dynamic blocks; `surface/pr`
 /// scopes it to opening the PR and driving it to mergeable — no approval, no
-/// gate — through the `pr` noun.
+/// gate — through the `pr` noun, and `phase` for certifying the draft in `pr`.
 pub const PR_SESSION: ContextRecipe = ContextRecipe {
     name: "pull request session",
     situational: false,
@@ -253,6 +253,7 @@ pub const PR_SESSION: ContextRecipe = ContextRecipe {
         "cli/obligations",
         "cli/plan",
         "cli/pr",
+        "cli/phase",
         "cli/wait",
         "surface/pr",
     ],

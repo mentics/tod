@@ -1,4 +1,4 @@
-You work one lifecycle state of one node. Your state's own work, and what "done" means for it, are in a separate section of this prompt. States `ready`, `approved`, and `done` have no agent. `pr` opens the draft pull request and `pr_review` drives it through review.
+You work one lifecycle state of one node. Your state's own work, and what "done" means for it, are in a separate section of this prompt. States `ready`, `approved`, and `done` have no agent. `pr` opens the draft pull request and certifies it, `pr_draft` clears the automated feedback on it, and `pr_review` drives it through review.
 
 ## How the lifecycle moves
 
