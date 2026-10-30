@@ -282,7 +282,11 @@ pub fn make_location(
         // A sandbox that expired took its uncommitted work with it; the
         // last checkpoint is on the remote (`fleet::checkpoint`).
         progress("Looking for saved work…");
-        warnings.extend(crate::fleet::node_checkpoint::restore_into(&dir, node_id));
+        let notes = crate::fleet::node_checkpoint::restore_into(&dir, node_id);
+        for restored in &notes.restored {
+            progress(restored.as_str());
+        }
+        warnings.extend(notes.failures);
     }
     Ok((dir, warnings))
 }

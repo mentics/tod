@@ -1325,8 +1325,12 @@ pub fn ensure_node_sandbox(
     // Work checkpointed before an earlier sandbox of this node went away
     // comes back as uncommitted edits.
     let checkout = sandbox_checkout(&bx, &name)?;
-    for note in tod_store::fleet::node_checkpoint::restore_into(&checkout, node_id) {
-        progress(&format!("warning: {note}"));
+    let notes = tod_store::fleet::node_checkpoint::restore_into(&checkout, node_id);
+    for restored in &notes.restored {
+        progress(restored.as_str());
+    }
+    for failure in &notes.failures {
+        progress(&format!("warning: {failure}"));
     }
     Ok(name)
 }

@@ -76,25 +76,37 @@ pub fn checkpoint_dir(dir: &Workdir, node_id: &str, limits: &Limits) -> Result<V
     Ok(saved)
 }
 
+/// What [`restore_into`] did, in two lists: what was put back (a success,
+/// reported as progress) and what was not (a checkpoint that does not apply,
+/// or could not be read, which stays on the remote and is shown as a warning).
+#[derive(Debug, Default, PartialEq)]
+pub struct RestoreNotes {
+    pub restored: Vec<String>,
+    pub failures: Vec<String>,
+}
+
 /// Put `node_id`'s checkpoints into `dir`, a checkout made just now.
-/// Returns what to tell the user: a checkpoint that does not apply, or could
-/// not be read, is left on the remote and said, never dropped.
-pub fn restore_into(dir: &Workdir, node_id: &str) -> Vec<String> {
+/// A checkpoint that does not apply, or could not be read, is left on the
+/// remote and reported in `failures`, never dropped.
+pub fn restore_into(dir: &Workdir, node_id: &str) -> RestoreNotes {
+    let mut notes = RestoreNotes::default();
     let repos = match repos_deepest_first(dir) {
         Ok(repos) => repos,
-        Err(err) => return vec![format!("could not look for saved work: {err:#}")],
+        Err(err) => {
+            notes.failures.push(format!("could not look for saved work: {err:#}"));
+            return notes;
+        }
     };
-    let mut notes = Vec::new();
     for repo in repos {
         let rel = rel(dir, &repo);
         let reference = checkpoint::ref_name(node_id, &rel);
         match checkpoint::restore_repo(&repo, &reference) {
             Ok(Restored::Nothing) => {}
-            Ok(Restored::Applied { files }) => notes.push(format!(
+            Ok(Restored::Applied { files }) => notes.restored.push(format!(
                 "Restored {files} uncommitted file(s) from the last checkpoint of {}",
                 if rel.is_empty() { "this node".to_string() } else { rel }
             )),
-            Err(err) => notes.push(format!("{err:#}")),
+            Err(err) => notes.failures.push(format!("{err:#}")),
         }
     }
     notes
@@ -138,6 +150,13 @@ pub fn sweep(fleet: &FleetStore) -> Result<Vec<String>> {
     for repo in checkouts.values() {
         let refs = match checkpoint::remote_refs(repo, &format!("{}/*", checkpoint::REF_ROOT)) {
             Ok(refs) => refs,
+            // An idle sandbox is reclaimed after a while, and then there is
+            // nothing in it to sweep. Its checkpoints stay on the remote until
+            // a sweep from a checkout that still exists lists them.
+            Err(err) if crate::fleet::provision::sandbox_is_gone(&err) => {
+                tracing::debug!(sandbox = ?repo.sandbox_name(), "not sweeping checkpoints: the sandbox is gone ({err:#})");
+                continue;
+            }
             Err(err) => {
                 failures.push(format!("{err:#}"));
                 continue;
