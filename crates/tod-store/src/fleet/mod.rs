@@ -20,6 +20,7 @@ pub mod places;
 pub mod projection;
 pub mod provision;
 pub mod reattach;
+pub mod workspace_update;
 pub mod reconnect_identity;
 pub mod repositories;
 pub mod repos;

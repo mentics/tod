@@ -204,6 +204,11 @@ enum RunnerAction {
     /// default action, which continues where it already is.
     MoveToCloud,
     SyncCloud,
+    /// Fast-forward the node's workspace checkout to the latest `main` (for
+    /// development, when the workspace's skills or docs changed after the
+    /// checkout was made). Refuses a checkout with uncommitted changes or
+    /// commits of its own.
+    UpdateWorkspace,
     /// Set the node up again in the sandbox it already has: reinstall tod's
     /// files, check out its branch, restart the relay and supervisor. For a
     /// setup that failed or a sandbox missing a file; nothing is deleted.
@@ -229,6 +234,7 @@ impl RunnerAction {
             Self::RunInCloud => "Run in the cloud",
             Self::MoveToCloud => "Move to the cloud",
             Self::SyncCloud => "Sync now",
+            Self::UpdateWorkspace => "Update workspace to latest main",
             Self::ReinstallCloud => "Reinstall and restart",
             Self::LeaveCloud => "Stop running in the cloud",
             Self::DeleteSandbox => "Delete Sandbox",
@@ -746,12 +752,12 @@ impl TaskPanel {
             if self.runner.cloud_failed {
                 return RunnerActions {
                     primary: Some((A::ReinstallCloud, A::ReinstallCloud.label(), self.runner.cloud_busy)),
-                    menu: if self.runner.cloud_busy { Vec::new() } else { vec![A::RunFresh, A::SyncCloud, A::DeleteSandbox, A::LeaveCloud] },
+                    menu: if self.runner.cloud_busy { Vec::new() } else { vec![A::RunFresh, A::SyncCloud, A::UpdateWorkspace, A::DeleteSandbox, A::LeaveCloud] },
                 };
             }
             return RunnerActions {
                 primary: Some((A::SyncCloud, A::SyncCloud.label(), self.runner.cloud_busy)),
-                menu: if self.runner.cloud_busy { Vec::new() } else { vec![A::RunFresh, A::ReinstallCloud, A::DeleteSandbox, A::LeaveCloud] },
+                menu: if self.runner.cloud_busy { Vec::new() } else { vec![A::RunFresh, A::ReinstallCloud, A::UpdateWorkspace, A::DeleteSandbox, A::LeaveCloud] },
             };
         }
         if self.runner.cloud_busy {
@@ -912,6 +918,7 @@ impl TaskPanel {
                     this.on_cloud_update(node, update, cx)
                 });
             }
+            A::UpdateWorkspace => self.update_workspace(cx),
             A::DeleteSandbox => {
                 self.cloud_started(cx);
                 crate::views::cloud_node::delete_sandbox(
@@ -933,6 +940,33 @@ impl TaskPanel {
             }
         }
         cx.notify();
+    }
+
+    /// "Update workspace to latest main": git runs in the node's workspace
+    /// (maybe in its sandbox), off the UI thread, and the line says what it did
+    /// or why it left the checkout alone.
+    fn update_workspace(&mut self, cx: &mut Context<Self>) {
+        let node = self.node_id.to_string();
+        let fleet = self.fleet.clone();
+        self.runner.cloud_note = Some("Updating the workspace to the latest main…".to_string());
+        self.runner.cloud_failed = false;
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { tod_store::fleet::workspace_update::update_workspace_to_main(&fleet, &node) })
+                .await;
+            let _ = this.update(cx, |this: &mut TaskPanel, cx| {
+                let (note, failed) = match result {
+                    Ok(said) => (said, false),
+                    Err(err) => (format!("Could not update the workspace: {err:#}"), true),
+                };
+                this.runner.cloud_note = Some(note);
+                this.runner.cloud_failed = failed;
+                this.refresh_runner(cx);
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// "Check now": reads GitHub off the UI thread, records where each pull
