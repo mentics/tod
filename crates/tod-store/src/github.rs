@@ -81,6 +81,11 @@ pub struct PrStatus {
     /// `"blocked"`/`"unstable"`/`"dirty"`/`"behind"` mean something is
     /// still outstanding. `None` while GitHub is still computing it.
     pub mergeable_state: Option<String>,
+    /// How many commits of the base branch the head does not have, from
+    /// GitHub's compare. `mergeable_state` cannot say: `blocked` (a review
+    /// still required) hides `behind`. `None` when merged, or the head or
+    /// base is unknown.
+    pub behind_by: Option<u32>,
     pub merged: bool,
     /// The head commit's checks, commit statuses and check runs together:
     /// `failure` if any failed, else `pending` if any is still running, else
@@ -309,9 +314,20 @@ impl Github {
             }
             None => None,
         };
+        let behind_by = match (&raw.head, &raw.base, raw.merged.unwrap_or(false)) {
+            (Some(head), Some(base), false) => {
+                let compare: CompareRaw = self.get_json(&format!(
+                    "/repos/{owner}/{repo}/compare/{}...{}?per_page=1",
+                    base.name, head.sha
+                ))?;
+                Some(compare.behind_by)
+            }
+            _ => None,
+        };
         Ok(PrStatus {
             mergeable: raw.mergeable,
             mergeable_state: raw.mergeable_state,
+            behind_by,
             merged: raw.merged.unwrap_or(false),
             checks,
             head_sha: raw.head.as_ref().map(|h| h.sha.clone()),
@@ -907,6 +923,11 @@ impl PullListRaw {
             updated_at: self.updated_at,
         }
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct CompareRaw {
+    behind_by: u32,
 }
 
 #[derive(Debug, Deserialize)]

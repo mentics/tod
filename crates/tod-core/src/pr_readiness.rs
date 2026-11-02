@@ -149,6 +149,8 @@ pub struct Assessment {
     pub merged: bool,
     pub draft: bool,
     pub mergeable_state: Option<String>,
+    /// Commits of its base the branch lacks (`PrStatus::behind_by`).
+    pub behind_by: Option<u32>,
     pub checks: Option<String>,
     pub open_threads: Vec<OpenThread>,
     pub bots: Vec<BotReport>,
@@ -183,7 +185,9 @@ pub enum Work {
     /// A bot has not reviewed the current head in `minutes`
     /// (`rerun_after_minutes`), nor has the agent had a turn in that time:
     /// it may need asking, which the project's own skill says how to do.
-    BotReviewMissing { bot: String, minutes: u64 },
+    /// `low_last_score` is its latest score and the threshold, when that
+    /// score (for an earlier commit) is under it.
+    BotReviewMissing { bot: String, minutes: u64, low_last_score: Option<(u8, u8)> },
     /// A person asked for changes, nothing has been pushed since, and no
     /// review thread carries the request (those are [`Work::Threads`]).
     ChangesRequested,
@@ -258,6 +262,7 @@ impl Assessment {
             merged: snapshot.status.merged,
             draft: snapshot.status.draft,
             mergeable_state: snapshot.status.mergeable_state.clone(),
+            behind_by: snapshot.status.behind_by,
             checks: snapshot.status.checks.clone(),
             open_threads: snapshot.threads.iter().filter(|t| wants_answer(t)).map(open_thread).collect(),
             bots,
@@ -283,7 +288,7 @@ impl Assessment {
 
     /// The branch is behind its base.
     pub fn behind(&self) -> bool {
-        self.mergeable_state.as_deref() == Some("behind")
+        self.behind_by.is_some_and(|n| n > 0)
     }
 
     /// The branch conflicts with its base.
@@ -339,7 +344,17 @@ impl Assessment {
                     let minutes = report.settings.rerun_after_minutes;
                     let quiet = chrono::Duration::minutes(minutes as i64);
                     if report.overdue && self.answered_at.is_none_or(|a| self.read_at - a >= quiet) {
-                        work.push(Work::BotReviewMissing { bot: report.settings.name.clone(), minutes });
+                        let low_last_score = match report.standing {
+                            BotStanding::Stale { last_score: Some(score) } if score < report.settings.min_score => {
+                                Some((score, report.settings.min_score))
+                            }
+                            _ => None,
+                        };
+                        work.push(Work::BotReviewMissing {
+                            bot: report.settings.name.clone(),
+                            minutes,
+                            low_last_score,
+                        });
                     }
                 }
             }
@@ -598,9 +613,14 @@ pub fn render_work(url: &str, assessment: &Assessment) -> String {
             Work::LowScore { bot, score, min } => format!(
                 "- {bot} scored it {score}/5, under the {min}/5 needed: read its summary comment and fix what it found that this change introduced\n"
             ),
-            Work::BotReviewMissing { bot, minutes } => format!(
-                "- {bot} has not reviewed the current head in {minutes} minutes: if it has to be asked for a review, ask it\n"
-            ),
+            Work::BotReviewMissing { bot, minutes, low_last_score } => match low_last_score {
+                Some((score, min)) => format!(
+                    "- {bot} has not reviewed the current head in {minutes} minutes, and its last score, {score}/5 on an earlier commit, is under the {min}/5 needed: fix what it found that this change introduced if you have not, and if it has to be asked for a new review, ask it\n"
+                ),
+                None => format!(
+                    "- {bot} has not reviewed the current head in {minutes} minutes: if it has to be asked for a review, ask it\n"
+                ),
+            },
         });
     }
     out
@@ -673,6 +693,7 @@ mod tests {
         PrStatus {
             mergeable: Some(true),
             mergeable_state: Some(state.into()),
+            behind_by: Some(if state == "behind" { 3 } else { 0 }),
             merged: false,
             checks: Some(checks.into()),
             head_sha: Some("abcdef1234567".into()),
@@ -877,6 +898,15 @@ Not safe.
     }
 
     #[test]
+    fn behind_is_read_from_the_commit_count_not_the_merge_state() {
+        // GitHub says `blocked` while a review is required, hiding `behind`.
+        let mut st = status("blocked", "success");
+        st.behind_by = Some(31);
+        let a = Assessment::of(&snap(st, vec![], vec![]), &PrReadinessSettings::default(), now());
+        assert_eq!(a.work(), vec![Work::Behind]);
+    }
+
+    #[test]
     fn outdated_threads_do_not_count() {
         let mut t = thread("t", false, &["x"]);
         t.outdated = true;
@@ -899,7 +929,7 @@ Not safe.
         assert_eq!(a.bots[0].standing, BotStanding::Stale { last_score: Some(2) });
         // Stale: no work from its old score. The head is two hours old (ten
         // minutes is the limit), so the agent is told, which may ask it.
-        assert_eq!(a.work(), vec![Work::BotReviewMissing { bot: "greptile".into(), minutes: 10 }]);
+        assert_eq!(a.work(), vec![Work::BotReviewMissing { bot: "greptile".into(), minutes: 10, low_last_score: Some((2, 4)) }]);
         // After a turn in the last ten minutes, it is only waited for.
         let answered = a.clone().answered_through(Some(at("2026-01-01T11:55:00Z")));
         assert_eq!(answered.next(), Next::Wait(vec![Wait::BotReview { bot: "greptile".into() }]));

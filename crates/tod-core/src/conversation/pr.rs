@@ -478,6 +478,7 @@ open pr: Cloud test"), Some("Cloud test"));
                 status: PrStatus {
                     mergeable: Some(true),
                     mergeable_state: Some("blocked".into()),
+                    behind_by: Some(0),
                     checks: Some("success".into()),
                     head_sha: Some("abcdef1".into()),
                     open: true,

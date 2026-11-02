@@ -1521,6 +1521,7 @@ mod readiness_tests {
             status: PrStatus {
                 mergeable: Some(true),
                 mergeable_state: Some(state.into()),
+                behind_by: Some(if state == "behind" { 3 } else { 0 }),
                 merged: false,
                 checks: Some("success".into()),
                 head_sha: Some("abcdef1234".into()),
@@ -1587,6 +1588,7 @@ mod readiness_tests {
         tod_store::github::PrStatus {
             mergeable: Some(true),
             mergeable_state: Some("blocked".into()),
+            behind_by: Some(0),
             merged: false,
             checks: None,
             head_sha: None,

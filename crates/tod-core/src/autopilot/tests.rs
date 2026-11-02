@@ -220,6 +220,7 @@ impl crate::pr_readiness::PrFeed for FinishedGithub {
             status: PrStatus {
                 mergeable: Some(true),
                 mergeable_state: Some("clean".into()),
+                behind_by: Some(0),
                 merged: true,
                 checks: Some("success".into()),
                 head_sha: Some("abcdef1".into()),
@@ -795,6 +796,7 @@ impl crate::pr_readiness::PrFeed for Sim {
             status: PrStatus {
                 mergeable: Some(true),
                 mergeable_state: Some("blocked".into()),
+                behind_by: Some(0),
                 merged: false,
                 checks: Some("success".into()),
                 head_sha: Some(format!("{:07}", round.min(1) + 1)),
@@ -917,6 +919,7 @@ fn pr_certifies_the_draft_in_every_stay_even_when_the_pull_request_exists() {
                 status: PrStatus {
                     mergeable: Some(true),
                     mergeable_state: Some("blocked".into()),
+                    behind_by: Some(0),
                     checks: Some("success".into()),
                     head_sha: Some("abcdef1".into()),
                     head_committed_at: Some("2020-01-01T00:00:00Z".into()),
@@ -972,6 +975,7 @@ fn pr_draft_runs_its_agent_on_every_stay_even_with_a_pull_request_and_no_work() 
                 status: PrStatus {
                     mergeable: Some(true),
                     mergeable_state: Some("blocked".into()),
+                    behind_by: Some(0),
                     checks: Some("success".into()),
                     head_sha: Some("abcdef1".into()),
                     head_committed_at: Some("2020-01-01T00:00:00Z".into()),
@@ -1017,6 +1021,7 @@ fn a_pull_request_waiting_for_a_person_ends_the_run_with_a_timed_wait() {
                 status: PrStatus {
                     mergeable: Some(true),
                     mergeable_state: Some("blocked".into()),
+                    behind_by: Some(0),
                     merged: false,
                     checks: Some("success".into()),
                     head_sha: Some("abcdef1".into()),
@@ -1065,6 +1070,7 @@ fn the_wait_for_a_person_records_who_was_asked_to_review() {
                 status: PrStatus {
                     mergeable: Some(true),
                     mergeable_state: Some("blocked".into()),
+                    behind_by: Some(0),
                     checks: Some("success".into()),
                     head_sha: Some("abcdef1".into()),
                     head_committed_at: Some("2020-01-01T00:00:00Z".into()),
@@ -1105,6 +1111,7 @@ fn a_pull_request_that_never_changes_stops_for_a_person() {
                 status: PrStatus {
                     mergeable: Some(true),
                     mergeable_state: Some("blocked".into()),
+                    behind_by: Some(0),
                     merged: false,
                     checks: Some("success".into()),
                     head_sha: Some("abcdef1".into()),
@@ -1443,6 +1450,7 @@ fn check_now_in_pr_draft_waits_for_the_draft_to_be_ready_and_reviewed() {
     let status = PrStatus {
         mergeable: Some(true),
         mergeable_state: Some("blocked".into()),
+        behind_by: Some(0),
         merged: false,
         checks: None,
         head_sha: None,
@@ -1497,6 +1505,7 @@ fn check_now_in_pr_draft_sends_new_changes_requested_to_the_agent_even_on_a_draf
     let status = PrStatus {
         mergeable: Some(true),
         mergeable_state: Some("blocked".into()),
+        behind_by: Some(0),
         merged: false,
         checks: None,
         head_sha: None,
@@ -1540,6 +1549,7 @@ fn check_now_in_pr_draft_clears_a_leftover_review_wait_and_ignores_a_bot_reviewe
     let status = |reviewers: &[&str]| PrStatus {
         mergeable: Some(true),
         mergeable_state: Some("blocked".into()),
+        behind_by: Some(0),
         merged: false,
         checks: None,
         head_sha: None,

@@ -35,6 +35,17 @@ Always give the reason in the reply, so the reviewer can disagree. If you cannot
 
 A thread you have answered three times that is still open, or four rounds of fixing and reviewing on the PR as a whole, mean something unusual is going on. Stop and hand back with what keeps coming back; the app stops the run on the same limits.
 
+### Before you say nothing is left
+
+Do not rely on what the runner sent you or on GitHub's merge state alone: the merge state reads `blocked` while a review is missing, and that hides a branch that is behind its base. Check each of these yourself, and fix what fails:
+
+- **The branch is current.** Compare it with its base (`git fetch`, then see whether the base has commits the branch lacks); if it does, merge the base in.
+- **Every review bot the project names** (there may be several, or none) **has reviewed the current head, and its latest score for the head meets its threshold.** A score, or a review, left on an earlier commit does not count: if a bot has not reviewed the current head, ask it to, as the project's own skill says how, and fix what it finds that this change introduced.
+- **Every open review thread, from a person or a bot, is answered.**
+- **This phase's configured skills have been applied**, as the context lists them.
+
+Only when all of these hold, say nothing is left.
+
 ## Done when
 
 The app checks the gate itself from GitHub; you are done when nothing on the PR needs you:
