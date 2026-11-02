@@ -31,19 +31,19 @@ fi
 scripts/build.sh --data-root "$root"
 want="$(sandbox_source_hash)"
 
-if [[ "$(cat "$root/orchestrator-deployed.hash" 2>/dev/null)" == "$want" ]]; then
+if [[ "$(recorded_hash "$root/orchestrator-deployed.hash")" == "$want" ]]; then
     echo "==> orchestrator up to date ($root)"
 else
     echo "==> deploying the orchestrator"
     cargo run --release -q -p tod-sandbox-cli -- --data-root "$root" orchestrator
-    printf '%s\n' "$want" > "$root/orchestrator-deployed.hash"
+    record_deploy "$root/orchestrator-deployed.hash" "$want"
 fi
 
 # The watchdog job's image is built from target/sandbox/tod-watchdog.
-if [[ "$(cat "$root/watchdog-deployed.hash" 2>/dev/null)" == "$want" ]]; then
+if [[ "$(recorded_hash "$root/watchdog-deployed.hash")" == "$want" ]]; then
     echo "==> watchdog up to date ($root)"
 else
     echo "==> deploying the watchdog"
     cargo run --release -q -p tod-sandbox-cli -- --data-root "$root" watchdog deploy
-    printf '%s\n' "$want" > "$root/watchdog-deployed.hash"
+    record_deploy "$root/watchdog-deployed.hash" "$want"
 fi

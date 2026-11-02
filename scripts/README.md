@@ -38,14 +38,14 @@ through; run `tod-sandbox orchestrator <options>` directly when you need one.
    content hash of `crates/`, `Cargo.lock`, `.cargo/`, `assets/sandbox/` and the
    build script (~0.1s) is compared with `target/sandbox/.source-hash`.
    Different, or a binary missing: `build-sandbox-binaries.sh` rebuilds (Docker
-   or zigbuild; it fails loudly with neither). Any change under `crates/`
-   counts, including UI-only ones, which cost a Docker rebuild.
+   or zigbuild; it fails loudly with neither). A UI-only change does not count.
 3. **Cloud orchestrator**: the same hash is compared with
    `<data root>/orchestrator-deployed.hash`. A stale one is **reported only**,
    pointing to `deploy.sh`. The orchestrator is shared by the whole workspace.
    The data root is `--data-root`, else `TOD_DATA_ROOT`, else `data_root` from
    `install.toml` (read only; what `tod` itself uses), so normally you pass
    nothing. With none of them it is not checked and says so.
+   The record also names the commit and branch it was deployed from.
    It cannot see a deploy made from another machine.
 4. **Watchdog job**: the same hash is compared with
    `<data root>/watchdog-deployed.hash`, reported the same way.

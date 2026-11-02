@@ -6,7 +6,8 @@
 #      tod-cli, ...) in target/sandbox/: rebuilt when a hash of their sources
 #      differs from target/sandbox/.source-hash, or a binary is missing;
 #   3. the cloud orchestrator: reported when its recorded hash,
-#      <data root>/orchestrator-deployed.hash, differs from the sources;
+#      <data root>/orchestrator-deployed.hash, differs from the sources (the crates the sandbox binaries
+#      are built from, not the whole workspace);
 #   4. the hourly watchdog job: reported when its recorded hash,
 #      <data root>/watchdog-deployed.hash, differs the same way.
 #
@@ -59,16 +60,18 @@ if [[ -z $root ]]; then
     exit 0
 fi
 
-if [[ "$(cat "$root/orchestrator-deployed.hash" 2>/dev/null)" == "$want" ]]; then
+if [[ "$(recorded_hash "$root/orchestrator-deployed.hash")" == "$want" ]]; then
     echo "==> orchestrator up to date ($root)"
 else
     echo "==> orchestrator is out of date (or never deployed from here). It is shared, so it was left alone." >&2
+    from="$(recorded_from "$root/orchestrator-deployed.hash")"; [[ -z $from ]] || echo "    Last deployed from: $from" >&2
     echo "    Deploy it with: scripts/deploy.sh" >&2
 fi
 
-if [[ "$(cat "$root/watchdog-deployed.hash" 2>/dev/null)" == "$want" ]]; then
+if [[ "$(recorded_hash "$root/watchdog-deployed.hash")" == "$want" ]]; then
     echo "==> watchdog up to date ($root)"
 else
     echo "==> watchdog is out of date (or never deployed from here). It is shared, so it was left alone." >&2
+    from="$(recorded_from "$root/watchdog-deployed.hash")"; [[ -z $from ]] || echo "    Last deployed from: $from" >&2
     echo "    Deploy it with: scripts/deploy.sh" >&2
 fi
