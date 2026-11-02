@@ -362,6 +362,9 @@ pub struct AgentConversationPanel {
     /// Why the last pasted image could not be attached.
     image_error: Option<SharedString>,
     editing: bool,
+    /// No input, Send, Stop or tools: the host only shows a transcript it
+    /// cannot send to.
+    read_only: bool,
     return_focus: Option<FocusHandle>,
     /// The transcript above the input.
     list: Entity<TranscriptList>,
@@ -417,6 +420,7 @@ impl AgentConversationPanel {
             preparing: 0,
             image_error: None,
             editing: false,
+            read_only: false,
             return_focus: None,
             list,
             _list_subscription: subscription,
@@ -566,6 +570,19 @@ impl AgentConversationPanel {
         }
     }
 
+    /// Drop the input and everything beside it, for a host that shows a
+    /// conversation it never sends to.
+    pub fn set_read_only(&mut self, read_only: bool, cx: &mut Context<Self>) {
+        if read_only != self.read_only {
+            self.read_only = read_only;
+            if read_only {
+                self.editing = false;
+            }
+            self.keep_highlight();
+            cx.notify();
+        }
+    }
+
     pub fn set_active(&mut self, active: bool, cx: &mut Context<Self>) {
         if active != self.active {
             self.active = active;
@@ -687,15 +704,17 @@ impl AgentConversationPanel {
                 .filter(|(_, n)| n.action.as_ref().is_some_and(|a| !a.disabled))
                 .map(|(ix, _)| PanelStop::NoticeAction(ix)),
         );
-        stops.extend((0..self.images.len()).map(PanelStop::Image));
-        stops.push(PanelStop::Input);
-        stops.extend(
-            self.tools
-                .iter()
-                .enumerate()
-                .filter(|(_, t)| !t.disabled)
-                .map(|(ix, _)| PanelStop::Tool(ix)),
-        );
+        if !self.read_only {
+            stops.extend((0..self.images.len()).map(PanelStop::Image));
+            stops.push(PanelStop::Input);
+            stops.extend(
+                self.tools
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, t)| !t.disabled)
+                    .map(|(ix, _)| PanelStop::Tool(ix)),
+            );
+        }
         stops.extend(
             self.actions
                 .iter()
@@ -703,7 +722,7 @@ impl AgentConversationPanel {
                 .filter(|(_, a)| !a.disabled)
                 .map(|(ix, _)| PanelStop::Action(ix)),
         );
-        if self.running {
+        if self.running && !self.read_only {
             stops.push(PanelStop::Stop);
         }
         stops
@@ -713,11 +732,13 @@ impl AgentConversationPanel {
     /// when that would leave the panel.
     pub fn move_highlight(&mut self, delta: isize, cx: &mut Context<Self>) -> bool {
         let stops = self.stops();
-        let ix = stops
-            .iter()
-            .position(|s| *s == self.highlight)
-            .unwrap_or(stops.len() - 1) as isize;
-        let next = ix + delta;
+        // Read-only, the highlight can rest on the input it does not show:
+        // moving from there starts at the bottom.
+        let next = match stops.iter().position(|s| *s == self.highlight) {
+            Some(ix) => ix as isize + delta,
+            None if delta < 0 => stops.len() as isize - 1,
+            None => return false,
+        };
         if next < 0 || next >= stops.len() as isize {
             return false;
         }
@@ -833,6 +854,7 @@ impl AgentConversationPanel {
     pub fn activate(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         match self.highlight {
             PanelStop::Chunk(id) => self.toggle(id, cx),
+            PanelStop::Input if self.read_only => {}
             PanelStop::Input => self.start_editing(window, cx),
             PanelStop::Image(ix) => self.remove_image(ix, cx),
             PanelStop::Action(ix) => {
@@ -902,6 +924,9 @@ impl AgentConversationPanel {
     // ----- the input -----------------------------------------------------------
 
     pub fn start_editing(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.read_only {
+            return;
+        }
         self.highlight = PanelStop::Input;
         if !self.editing {
             self.editing = true;
@@ -928,7 +953,7 @@ impl AgentConversationPanel {
     /// Ask the host to send what is written, with the images attached to
     /// it. Waits for a pasted image still being prepared.
     pub fn submit(&mut self, cx: &mut Context<Self>) {
-        if self.preparing > 0 {
+        if self.read_only || self.preparing > 0 {
             return;
         }
         let text = self.input.read(cx).value().trim().to_string();
@@ -1229,42 +1254,44 @@ impl Render for AgentConversationPanel {
                     )))
             }))
             .child(div().flex_1().min_h_0().child(self.list.clone()))
-            .child(
-                style::panel_footer(v_flex())
-                    .children(self.render_images(cx))
-                    .child(field)
-                    .child(
-                    h_flex()
-                        .items_center()
-                        .gap(style::space::RELATED)
+            .when(!self.read_only, |el| {
+                el.child(
+                    style::panel_footer(v_flex())
+                        .children(self.render_images(cx))
+                        .child(field)
                         .child(
-                            style::text_dense_muted(div())
-                                .flex_1()
-                                .min_w_0()
-                                .child(hint),
-                        )
-                        .when(self.running, |el| {
-                            el.child(
-                                Button::new("agent-conversation-stop")
-                                    .label("Stop")
-                                    .ghost()
-                                    .small()
-                                    .selected(stop_highlighted)
-                                    .on_click(cx.listener(|_, _, _, cx| {
-                                        cx.emit(AgentConversationEvent::Stop)
-                                    })),
-                            )
-                        })
-                        .children(tools)
-                        .child(
-                            Button::new("agent-conversation-send")
-                                .label("Send")
-                                .primary()
-                                .small()
-                                .on_click(cx.listener(|this, _, _, cx| this.submit(cx))),
+                            h_flex()
+                                .items_center()
+                                .gap(style::space::RELATED)
+                                .child(
+                                    style::text_dense_muted(div())
+                                        .flex_1()
+                                        .min_w_0()
+                                        .child(hint),
+                                )
+                                .when(self.running, |el| {
+                                    el.child(
+                                        Button::new("agent-conversation-stop")
+                                            .label("Stop")
+                                            .ghost()
+                                            .small()
+                                            .selected(stop_highlighted)
+                                            .on_click(cx.listener(|_, _, _, cx| {
+                                                cx.emit(AgentConversationEvent::Stop)
+                                            })),
+                                    )
+                                })
+                                .children(tools)
+                                .child(
+                                    Button::new("agent-conversation-send")
+                                        .label("Send")
+                                        .primary()
+                                        .small()
+                                        .on_click(cx.listener(|this, _, _, cx| this.submit(cx))),
+                                ),
                         ),
-                ),
-            )
+                )
+            })
             .when(has_lifecycle, |el| {
                 el.child(
                     style::panel_footer(v_flex())

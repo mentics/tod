@@ -173,9 +173,11 @@ impl TranscriptPanel {
         let panel = cx.new(|cx| {
             let mut panel = AgentConversationPanel::new("Transcript", "", window, cx);
             panel.set_active(false, cx);
+            // A run's conversation is driven by its runner (here or in the
+            // cloud), never sent to from here.
+            panel.set_read_only(true, cx);
             panel
         });
-        // Read-only: a Send or Stop here has nothing to act on.
         let _subscription = cx.subscribe(&panel, |_, _, _: &AgentConversationEvent, _| {});
         let mut this = Self {
             fleet,
@@ -780,6 +782,27 @@ mod tests {
         view.read_with(cx, |view, cx| {
             assert_eq!(view.conversation_id(), conversation_id);
             assert_eq!(view.panel.read(cx).entries().len(), 2);
+        });
+    }
+
+    /// Nothing here sends to a run's conversation, so the panel offers no
+    /// input or Send that would do nothing.
+    #[gpui::test]
+    fn the_transcript_offers_nothing_to_send(cx: &mut TestAppContext) {
+        use crate::ui::agent_conversation::PanelStop;
+
+        let fixture = Fixture::new();
+        let conversation_id = add_conversation(&fixture);
+        let (view, cx) = open_view(&fixture, conversation_id, cx);
+
+        cx.update(|window, cx| {
+            let panel = view.read(cx).panel.clone();
+            panel.update(cx, |panel, cx| {
+                let stops = panel.stops();
+                assert!(!stops.contains(&PanelStop::Input), "{stops:?}");
+                panel.start_editing(window, cx);
+                assert!(!panel.is_editing());
+            });
         });
     }
 
