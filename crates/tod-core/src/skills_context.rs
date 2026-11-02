@@ -9,7 +9,9 @@
 //! Claude Code's Skill tool then refuses them), and Cursor has no Skill tool.
 //!
 //! A name is looked up, in order, among tod's own skills (`crate::skills`),
-//! then under `.claude/skills/` in the agent's working directory, then under
+//! then under `.claude/skills/` in the agent's working directory and in each
+//! directory above it, nearest first (a project's repository often sits under a
+//! workspace that holds the skills for all of them), then under
 //! the user's `~/.claude/skills/` where the agent runs (this machine, its dev
 //! container, or its sandbox): `<name>/SKILL.md`, or `<group>/<name>/SKILL.md`
 //! one grouping folder down. A name with no file anywhere (a skill built into
@@ -109,10 +111,10 @@ fn candidates_in(skills: &Path, name: &str) -> Vec<PathBuf> {
     out
 }
 
-/// [`resolve`]'s lookup on this machine: the working directory's
-/// `.claude/skills`, then `home`'s.
+/// [`resolve`]'s lookup on this machine: the `.claude/skills` of the working
+/// directory and of each directory above it, nearest first, then `home`'s.
 fn find_on_host(cwd: &Path, home: Option<&Path>, name: &str) -> Result<Option<(String, String)>> {
-    let mut roots = vec![cwd.join(".claude").join("skills")];
+    let mut roots: Vec<PathBuf> = cwd.ancestors().map(|d| d.join(".claude").join("skills")).collect();
     roots.extend(home.map(|h| h.join(".claude").join("skills")));
     for root in roots {
         for path in candidates_in(&root, name) {
@@ -134,7 +136,19 @@ fn home_dir() -> Option<PathBuf> {
 
 /// The same lookup inside a container or sandbox, in one command: it prints
 /// the path found, then the file; exit 3 when there is none.
-const FIND_REMOTE: &str = r#"for root in "$PWD/.claude/skills" "$HOME/.claude/skills"; do
+const FIND_REMOTE: &str = r#"d="$PWD"
+roots=""
+while :; do
+  roots="$roots
+$d/.claude/skills"
+  [ "$d" = / ] && break
+  d=$(dirname "$d")
+done
+roots="$roots
+$HOME/.claude/skills"
+IFS='
+'
+for root in $roots; do
   for f in "$root/$1/SKILL.md" "$root"/*/"$1"/SKILL.md; do
     if [ -f "$f" ]; then printf '%s\n' "$f"; cat "$f"; exit 0; fi
   done
@@ -272,6 +286,7 @@ mod tests {
             std::fs::write(path, body).unwrap();
         };
         write(project.path(), "tod/ci-fix-step/SKILL.md", "grouped");
+        write(project.path(), "steps/up-the-tree/SKILL.md", "workspace root");
         write(project.path(), "direct/SKILL.md", "direct");
         write(home.path(), "direct/SKILL.md", "home direct");
         write(home.path(), "mine/SKILL.md", "home only");
@@ -282,6 +297,12 @@ mod tests {
         assert_eq!(find("direct").as_deref(), Some("direct"));
         assert_eq!(find("mine").as_deref(), Some("home only"));
         assert_eq!(find("simplify"), None);
+        // The agent runs in a repository under the workspace that holds the skill.
+        let inner = project.path().join("kb");
+        std::fs::create_dir_all(&inner).unwrap();
+        let from_inner = |name: &str| find_on_host(&inner, None, name).unwrap().map(|(_, t)| t);
+        assert_eq!(from_inner("up-the-tree").as_deref(), Some("workspace root"));
+        assert_eq!(from_inner("mine"), None);
     }
 
     #[test]
