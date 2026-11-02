@@ -14,9 +14,10 @@
 //! workspace that holds the skills for all of them), then under
 //! the user's `~/.claude/skills/` where the agent runs (this machine, its dev
 //! container, or its sandbox): `<name>/SKILL.md`, or `<group>/<name>/SKILL.md`
-//! one grouping folder down. A name with no file anywhere (a skill built into
-//! the agent, such as `simplify`, or one from a plugin) is passed on by name
-//! for the agent's Skill tool, and the block says so.
+//! one grouping folder down. A name with no file anywhere is an error naming
+//! the skill and where it was looked for, unless it is one the agent has built
+//! in (such as `simplify`), which is passed on by name for the agent's Skill
+//! tool, and the block says so.
 
 use anyhow::{Context, Result};
 use rusqlite::Connection;
@@ -54,13 +55,30 @@ pub fn for_node(fleet: &FleetStore, node: Uuid, phase: &str, cwd: &Workdir) -> R
     let own = crate::skills::SkillsPaths::discover()?;
     let skills = names
         .iter()
-        .map(|name| resolve(&own, cwd, name))
+        .map(|name| resolve(&own, cwd, name).with_context(|| format!("the {phase} phase's skills")))
         .collect::<Result<Vec<_>>>()?;
     Ok(render_skills(phase, &skills))
 }
 
+/// Skills the agent has built in, which have no file to find: passed on by name
+/// ([`Skill::ByName`]). Any other name with no file is an error, so a skill the
+/// user chose never silently goes missing from the agent's instructions.
+const BUILT_IN: &[&str] = &[
+    "simplify",
+    "code-review",
+    "security-review",
+    "init",
+    "loop",
+    "schedule",
+    "run",
+    "update-config",
+    "fewer-permission-prompts",
+    "keybindings-help",
+    "claude-api",
+];
+
 /// Find `name`'s text: tod's own skill, else a `SKILL.md` where the agent
-/// runs, else [`Skill::ByName`].
+/// runs, else [`Skill::ByName`] for a built-in; any other name is an error.
 pub fn resolve(own: &crate::skills::SkillsPaths, cwd: &Workdir, name: &str) -> Result<Skill> {
     if !is_plain_name(name) {
         anyhow::bail!("`{name}` (configured for a lifecycle phase) is not a skill name");
@@ -82,7 +100,13 @@ pub fn resolve(own: &crate::skills::SkillsPaths, cwd: &Workdir, name: &str) -> R
             path: Some(path),
             body: strip_frontmatter(&text).trim().to_string(),
         },
-        None => Skill::ByName(name.to_string()),
+        None if BUILT_IN.contains(&name) => Skill::ByName(name.to_string()),
+        None => anyhow::bail!(
+            "the skill `{name}` is configured but cannot be found: not among tod's own skills, not \
+             under `.claude/skills` in {} or any directory above it, and not in the home directory's \
+             `.claude/skills`. Add it there, fix its name in the lifecycle config, or remove it",
+            cwd.storage()
+        ),
     })
 }
 
@@ -315,10 +339,9 @@ mod tests {
             panic!("tod-open-pr is tod's own");
         };
         assert!(body.contains("tod-cli phase certify"), "{body}");
-        assert!(matches!(
-            resolve(&own, &cwd, "not-a-skill-anywhere-xyz").unwrap(),
-            Skill::ByName(_)
-        ));
+        assert!(matches!(resolve(&own, &cwd, "simplify").unwrap(), Skill::ByName(_)));
+        let err = format!("{:#}", resolve(&own, &cwd, "not-a-skill-anywhere-xyz").unwrap_err());
+        assert!(err.contains("not-a-skill-anywhere-xyz") && err.contains("cannot be found"), "{err}");
         assert!(resolve(&own, &cwd, "../etc").is_err());
     }
 
