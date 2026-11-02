@@ -255,7 +255,7 @@ fn live_prs(
 
 /// How to go about the work, after what it is.
 const WORK_GUIDANCE: &str = "
-Do it now, in order: bring the branch up to date, fix what the feedback needs, run the tests, push, and only then answer each thread with `tod-cli pr threads answer` (which posts your reply and resolves it).
+Do it now, in order: bring the branch up to date, fix what the feedback needs, run the tests, push, and only then answer each thread with `tod-cli pr threads answer` (which posts your reply and resolves it). Apply this phase's skills, given at the start of this session, throughout.
 
 Stay within what this node set out to do. Fix a problem this change introduces. Reject, giving the reason, one that was already there or would enlarge the scope. A thread you cannot decide goes to the user with `tod-cli decisions ask`.
 
