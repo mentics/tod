@@ -22,18 +22,12 @@ pub struct ReviewBot {
     pub author: &'static str,
     /// What the summary comment's score line starts with; `<n>/5` follows.
     score_label: &'static str,
-    /// The comment that asks it to review.
-    rereview: &'static str,
-    /// The same, for a draft pull request.
-    rereview_draft: &'static str,
 }
 
 pub const GREPTILE: ReviewBot = ReviewBot {
     name: "greptile",
     author: "greptile-apps",
     score_label: "Confidence Score:",
-    rereview: "@greptileai review this",
-    rereview_draft: "@greptileai review this draft",
 };
 
 /// The built-in bot `name` selects.
@@ -67,11 +61,6 @@ impl ReviewBot {
             return digits.parse::<u8>().ok().filter(|n| (1..=5).contains(n));
         }
         None
-    }
-
-    /// The comment that asks the bot to review.
-    pub fn rereview_comment(&self, draft: bool) -> &'static str {
-        if draft { self.rereview_draft } else { self.rereview }
     }
 }
 
@@ -109,8 +98,9 @@ pub struct BotReport {
     pub settings: PrReviewBotSettings,
     pub bot: &'static ReviewBot,
     pub standing: BotStanding,
-    /// A comment asking it to review the current head is already there.
-    pub asked: bool,
+    /// When it last reviewed or scored the pull request: its latest review,
+    /// or the latest edit of a comment of its that says a score.
+    pub reviewed_at: Option<DateTime<Utc>>,
     /// The head has waited `rerun_after_minutes` for its review.
     pub overdue: bool,
 }
@@ -168,6 +158,8 @@ pub struct Assessment {
     pub requested_reviewers: Vec<String>,
     /// People's reviews with text and no verdict, newer than the head commit.
     pub review_comments: Vec<ReviewComment>,
+    /// When the pull request was read.
+    pub read_at: DateTime<Utc>,
     /// When the pull request's agent last took a turn: reviews before it
     /// have been seen and answered. `None` until set
     /// ([`Self::answered_through`]).
@@ -185,8 +177,13 @@ pub enum Work {
     Behind,
     /// The branch conflicts with its base.
     Conflict,
-    /// A bot reviewed the current head and scored it under the threshold.
+    /// A bot reviewed the current head and scored it under the threshold,
+    /// and the agent has not had a turn since.
     LowScore { bot: String, score: u8, min: u8 },
+    /// A bot has not reviewed the current head in `minutes`
+    /// (`rerun_after_minutes`), nor has the agent had a turn in that time:
+    /// it may need asking, which the project's own skill says how to do.
+    BotReviewMissing { bot: String, minutes: u64 },
     /// A person asked for changes, nothing has been pushed since, and no
     /// review thread carries the request (those are [`Work::Threads`]).
     ChangesRequested,
@@ -198,9 +195,8 @@ pub enum Work {
 /// Something the babysitter can only wait for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Wait {
-    /// A bot has not reviewed the current head; `ask` when it should be
-    /// asked to (it is overdue and has not been asked).
-    BotReview { bot: String, ask: bool },
+    /// A bot has not reviewed the current head.
+    BotReview { bot: String },
     ChecksRunning,
     /// GitHub has not computed mergeability yet.
     GitHub,
@@ -235,54 +231,27 @@ impl Assessment {
             .iter()
             .filter_map(|configured| {
                 let bot = builtin_bot(&configured.name)?;
-                let mut standing = bot_standing(bot, snapshot, sha, head_at);
-                let ask_times: Vec<DateTime<Utc>> = snapshot
-                    .comments
-                    .iter()
-                    .filter(|c| {
-                        let body = c.body.trim();
-                        body.eq_ignore_ascii_case(bot.rereview) || body.eq_ignore_ascii_case(bot.rereview_draft)
-                    })
-                    .filter_map(|c| parse_time(&c.created_at))
-                    .collect();
-                let mut asked = ask_times.iter().any(|a| head_at.is_some_and(|h| *a >= h));
-                let mut overdue = head_at.is_none_or(|h| {
+                let standing = bot_standing(bot, snapshot, sha, head_at);
+                let overdue = head_at.is_none_or(|h| {
                     now.signed_duration_since(h)
                         >= chrono::Duration::minutes(configured.rerun_after_minutes as i64)
                 });
-                // A bot reviews on a push, not on a reply. When it reviewed
-                // the current head (a review of the head that raised threads)
-                // and replies have been posted since, a round that changed
-                // nothing, its review is out of date, and the app asks for
-                // another at once rather than after a push's delay. A review
-                // that raised nothing leaves no review behind, so an ask
-                // counts as answered once the usual wait has passed.
-                let last_review = snapshot
+                let reviewed_at = snapshot
                     .reviews
                     .iter()
                     .filter(|r| r.author.as_deref().is_some_and(|a| bot.is_author(a)))
-                    .filter_map(|r| parse_time(&r.submitted_at))
+                    .map(|r| r.submitted_at.as_str())
+                    .chain(
+                        snapshot
+                            .comments
+                            .iter()
+                            .filter(|c| c.author.as_deref().is_some_and(|a| bot.is_author(a)))
+                            .filter(|c| bot.parse_score(&c.body).is_some())
+                            .map(|c| c.updated_at.as_str()),
+                    )
+                    .filter_map(parse_time)
                     .max();
-                let last_reply = snapshot
-                    .threads
-                    .iter()
-                    .flat_map(|t| &t.comments)
-                    .filter(|c| !c.author.as_deref().is_some_and(|a| bot.is_author(a)))
-                    .filter_map(|c| parse_time(&c.created_at))
-                    .max();
-                if let (BotStanding::Current { score }, Some(reply), Some(review)) = (&standing, last_reply, last_review)
-                    && reply > review
-                    && head_at.is_some_and(|h| review > h)
-                {
-                    let ask = ask_times.iter().filter(|a| **a > reply).max();
-                    let wait = chrono::Duration::minutes(configured.rerun_after_minutes as i64);
-                    if ask.is_none_or(|a| now.signed_duration_since(*a) < wait) {
-                        standing = BotStanding::Stale { last_score: Some(*score) };
-                        asked = ask.is_some();
-                        overdue = true;
-                    }
-                }
-                Some(BotReport { settings: configured.clone(), bot, standing, asked, overdue })
+                Some(BotReport { settings: configured.clone(), bot, standing, reviewed_at, overdue })
             })
             .collect();
         Self {
@@ -295,6 +264,7 @@ impl Assessment {
             human_review: human_review(snapshot, head_at),
             requested_reviewers: snapshot.status.reviewers.clone(),
             review_comments: review_comments(snapshot, head_at),
+            read_at: now,
             answered_at: None,
         }
     }
@@ -348,15 +318,30 @@ impl Assessment {
         if unanswered > 0 {
             work.push(Work::ReviewComments(unanswered));
         }
+        // A bot's review is work once: a turn that answered it without a
+        // push leaves its score where it was, and the gate says so.
         for report in &self.bots {
-            if let BotStanding::Current { score } = report.standing
-                && score < report.settings.min_score
-            {
-                work.push(Work::LowScore {
-                    bot: report.settings.name.clone(),
-                    score,
-                    min: report.settings.min_score,
-                });
+            match report.standing {
+                BotStanding::Current { score } if score < report.settings.min_score => {
+                    if self.answered_at.is_none_or(|a| report.reviewed_at.is_none_or(|r| r > a)) {
+                        work.push(Work::LowScore {
+                            bot: report.settings.name.clone(),
+                            score,
+                            min: report.settings.min_score,
+                        });
+                    }
+                }
+                BotStanding::Current { .. } => {}
+                BotStanding::Stale { .. } | BotStanding::Missing => {
+                    // Told at most once per `minutes`: a bot asked and slow
+                    // is not asked again at once, and one that never comes
+                    // ends in the round limit.
+                    let minutes = report.settings.rerun_after_minutes;
+                    let quiet = chrono::Duration::minutes(minutes as i64);
+                    if report.overdue && self.answered_at.is_none_or(|a| self.read_at - a >= quiet) {
+                        work.push(Work::BotReviewMissing { bot: report.settings.name.clone(), minutes });
+                    }
+                }
             }
         }
         work
@@ -370,10 +355,7 @@ impl Assessment {
         let mut waits = Vec::new();
         for report in &self.bots {
             if !matches!(report.standing, BotStanding::Current { .. }) {
-                waits.push(Wait::BotReview {
-                    bot: report.settings.name.clone(),
-                    ask: report.overdue && !report.asked,
-                });
+                waits.push(Wait::BotReview { bot: report.settings.name.clone() });
             }
         }
         if self.checks.as_deref() == Some("pending") {
@@ -471,18 +453,14 @@ fn review_comments(snapshot: &PrSnapshot, head_at: Option<DateTime<Utc>>) -> Vec
         })
         .collect();
     // Top-level comments from people: the same feedback, said outside a
-    // review. The app's own asks of a review bot are not feedback; nor is a
-    // bot's comment. The pull request's agent posts as the user too, so its
+    // review. A bot's comment is not. The pull request's agent posts as the user too, so its
     // comments are told apart by time, not author: they come before the end
     // of its turn, which answers them ([`Assessment::answered_through`]).
     for c in &snapshot.comments {
         let body = c.body.trim();
-        let asks_a_bot = [&GREPTILE]
-            .iter()
-            .any(|b| body.eq_ignore_ascii_case(b.rereview) || body.eq_ignore_ascii_case(b.rereview_draft));
         let Some(author) = c.author.as_deref().filter(|a| is_person(a)) else { continue };
         let Some(at) = parse_time(&c.created_at) else { continue };
-        if body.is_empty() || asks_a_bot || !head_at.is_none_or(|h| at > h) {
+        if body.is_empty() || !head_at.is_none_or(|h| at > h) {
             continue;
         }
         found.push(ReviewComment { kind: "comment", author: author.to_string(), at, body: body.to_string() });
@@ -619,6 +597,9 @@ pub fn render_work(url: &str, assessment: &Assessment) -> String {
             }
             Work::LowScore { bot, score, min } => format!(
                 "- {bot} scored it {score}/5, under the {min}/5 needed: read its summary comment and fix what it found that this change introduced\n"
+            ),
+            Work::BotReviewMissing { bot, minutes } => format!(
+                "- {bot} has not reviewed the current head in {minutes} minutes: if it has to be asked for a review, ask it\n"
             ),
         });
     }
@@ -773,75 +754,36 @@ Not safe.
         }
     }
 
-    /// A pull request whose head the bot reviewed at 11:00, with a thread
-    /// answered (a person's or our reply) at `reply_at`.
-    fn reviewed_then_replied(reply_at: &str, ask_at: Option<&str>, rereview_at: Option<&str>) -> PrSnapshot {
+    fn at(text: &str) -> DateTime<Utc> {
+        parse_time(text).unwrap()
+    }
+
+    /// A pull request whose head (10:00) the bot reviewed at 11:00 with a
+    /// low score.
+    fn reviewed_low() -> PrSnapshot {
         let mut snap = snapshot_with_description(DESCRIPTION);
-        let mut reviews = vec![tod_store::github::PrReview {
+        snap.reviews = vec![tod_store::github::PrReview {
             author: Some("greptile-apps[bot]".into()),
             submitted_at: "2026-01-01T11:00:00Z".into(),
             state: "COMMENTED".into(),
             body: String::new(),
         }];
-        if let Some(at) = rereview_at {
-            reviews.push(tod_store::github::PrReview { author: Some("greptile-apps[bot]".into()), submitted_at: at.into(), state: "COMMENTED".into(), body: String::new() });
-        }
-        snap.reviews = reviews;
-        let mut t = thread("t", true, &["bot finding", "we declined, here is why"]);
-        t.comments[0].author = Some("greptile-apps[bot]".into());
-        t.comments[0].created_at = "2026-01-01T11:00:00Z".into();
-        t.comments[1].created_at = reply_at.into();
-        snap.threads = vec![t];
-        if let Some(at) = ask_at {
-            snap.comments = vec![comment("someone", "@greptileai review this", at)];
-        }
         snap
     }
 
     #[test]
-    fn a_reply_after_the_bots_review_asks_it_to_review_again_at_once() {
-        let snap = reviewed_then_replied("2026-01-01T11:30:00Z", None, None);
-        let a = Assessment::of(&snap, &greptile_settings(), now());
-        assert_eq!(a.bots[0].standing, BotStanding::Stale { last_score: Some(2) });
-        assert_eq!(a.next(), Next::Wait(vec![Wait::BotReview { bot: "greptile".into(), ask: true }]));
-    }
-
-    #[test]
-    fn once_asked_it_only_waits() {
-        let snap = reviewed_then_replied("2026-01-01T11:30:00Z", Some("2026-01-01T11:55:00Z"), None);
-        let a = Assessment::of(&snap, &greptile_settings(), now());
-        assert_eq!(a.next(), Next::Wait(vec![Wait::BotReview { bot: "greptile".into(), ask: false }]));
-    }
-
-    #[test]
-    fn a_later_reply_is_asked_about_again() {
-        let snap = reviewed_then_replied("2026-01-01T11:50:00Z", Some("2026-01-01T11:40:00Z"), None);
-        let a = Assessment::of(&snap, &greptile_settings(), now());
-        assert_eq!(a.next(), Next::Wait(vec![Wait::BotReview { bot: "greptile".into(), ask: true }]));
-    }
-
-    #[test]
-    fn an_ask_a_review_never_answered_is_let_go() {
-        let snap = reviewed_then_replied("2026-01-01T10:10:00Z", Some("2026-01-01T10:20:00Z"), None);
-        let a = Assessment::of(&snap, &greptile_settings(), now());
+    fn a_low_score_is_work_until_the_agent_has_had_a_turn_on_it() {
+        let a = Assessment::of(&reviewed_low(), &greptile_settings(), now());
         assert_eq!(a.bots[0].standing, BotStanding::Current { score: 2 });
-    }
-
-    #[test]
-    fn replies_after_a_push_are_not_a_round_without_a_change() {
-        // The bot's only review predates the head commit (10:00): the head
-        // has not been reviewed with threads, so the reply proves nothing.
-        let mut snap = reviewed_then_replied("2026-01-01T11:30:00Z", None, None);
-        snap.reviews[0].submitted_at = "2026-01-01T09:00:00Z".into();
-        let a = Assessment::of(&snap, &greptile_settings(), now());
-        assert_eq!(a.bots[0].standing, BotStanding::Current { score: 2 });
-    }
-
-    #[test]
-    fn a_review_after_the_reply_settles_it() {
-        let snap = reviewed_then_replied("2026-01-01T11:30:00Z", Some("2026-01-01T11:40:00Z"), Some("2026-01-01T11:50:00Z"));
-        let a = Assessment::of(&snap, &greptile_settings(), now());
-        assert_eq!(a.bots[0].standing, BotStanding::Current { score: 2 });
+        assert_eq!(a.work(), vec![Work::LowScore { bot: "greptile".into(), score: 2, min: 4 }]);
+        // A turn after the review that pushed nothing leaves the score to the
+        // gate: the bot is not asked again, and no turn is spent on it.
+        let answered = a.answered_through(Some(at("2026-01-01T11:30:00Z")));
+        assert!(answered.work().is_empty());
+        // A turn before the review did not see it.
+        let a = Assessment::of(&reviewed_low(), &greptile_settings(), now());
+        let earlier = a.answered_through(Some(at("2026-01-01T10:30:00Z")));
+        assert_eq!(earlier.work().len(), 1);
     }
 
     fn settings() -> PrReadinessSettings {
@@ -902,7 +844,6 @@ Not safe.
         st.head_committed_at = Some("2026-01-01T09:00:00Z".into());
         let cs = vec![
             comment("alice", "earlier ask", "2026-01-01T10:00:00Z"),
-            comment("alice", "@greptileai review this", "2026-01-01T10:30:00Z"),
             comment("github-actions[bot]", "tests passed", "2026-01-01T12:30:00Z"),
             comment("alice", "also fix the hard-coded lists", "2026-01-01T13:00:00Z"),
         ];
@@ -912,12 +853,6 @@ Not safe.
         let after = a.answered_through(Some(at));
         assert_eq!(after.work(), vec![Work::ReviewComments(1)]);
         assert!(render_work("u", &after).contains("hard-coded"));
-    }
-
-    #[test]
-    fn rereview_comment_depends_on_draft() {
-        assert_eq!(GREPTILE.rereview_comment(false), "@greptileai review this");
-        assert_eq!(GREPTILE.rereview_comment(true), "@greptileai review this draft");
     }
 
     #[test]
@@ -954,7 +889,7 @@ Not safe.
     }
 
     #[test]
-    fn a_review_older_than_the_head_is_stale_and_waited_for() {
+    fn a_review_older_than_the_head_is_stale_and_the_agent_told_once() {
         let s = snap(
             status("blocked", "success"),
             vec![],
@@ -962,28 +897,23 @@ Not safe.
         );
         let a = Assessment::of(&s, &settings(), now());
         assert_eq!(a.bots[0].standing, BotStanding::Stale { last_score: Some(2) });
-        // Stale: no work from its old score, and a wait, with a request due
-        // (the head is two hours old; ten minutes is the limit).
-        assert_eq!(a.next(), Next::Wait(vec![Wait::BotReview { bot: "greptile".into(), ask: true }]));
+        // Stale: no work from its old score. The head is two hours old (ten
+        // minutes is the limit), so the agent is told, which may ask it.
+        assert_eq!(a.work(), vec![Work::BotReviewMissing { bot: "greptile".into(), minutes: 10 }]);
+        // After a turn in the last ten minutes, it is only waited for.
+        let answered = a.clone().answered_through(Some(at("2026-01-01T11:55:00Z")));
+        assert_eq!(answered.next(), Next::Wait(vec![Wait::BotReview { bot: "greptile".into() }]));
+        // Still missing ten minutes after that turn: told again.
+        let later = a.answered_through(Some(at("2026-01-01T11:50:00Z")));
+        assert_eq!(later.work().len(), 1);
     }
 
     #[test]
-    fn a_request_already_made_for_this_head_is_not_repeated() {
-        let s = snap(
-            status("blocked", "success"),
-            vec![],
-            vec![comment("someone", "@greptileai review this", "2026-01-01T10:30:00Z")],
-        );
-        let a = Assessment::of(&s, &settings(), now());
-        assert_eq!(a.next(), Next::Wait(vec![Wait::BotReview { bot: "greptile".into(), ask: false }]));
-    }
-
-    #[test]
-    fn a_fresh_head_is_given_time_before_asking() {
+    fn a_fresh_head_is_given_time_before_the_agent_is_told() {
         let mut st = status("blocked", "success");
         st.head_committed_at = Some("2026-01-01T11:55:00Z".into());
         let a = Assessment::of(&snap(st, vec![], vec![]), &settings(), now());
-        assert_eq!(a.next(), Next::Wait(vec![Wait::BotReview { bot: "greptile".into(), ask: false }]));
+        assert_eq!(a.next(), Next::Wait(vec![Wait::BotReview { bot: "greptile".into() }]));
     }
 
     #[test]
@@ -1137,8 +1067,6 @@ Not safe.
 /// fake in tests ([`set_feed_override`]).
 pub trait PrFeed: Send + Sync {
     fn snapshot(&self, pr: &tod_store::github::NodePr) -> Result<PrSnapshot, String>;
-    /// A top-level comment on the pull request.
-    fn comment(&self, pr: &tod_store::github::NodePr, body: &str) -> Result<(), String>;
     /// The pull request's title and merge: what `crate::release_watch` looks
     /// for in a release's notes. Unsupported unless a feed says otherwise.
     fn merge(&self, _pr: &tod_store::github::NodePr) -> Result<tod_store::github::PrMerge, String> {
@@ -1164,10 +1092,6 @@ impl PrFeed for GithubFeed {
 
     fn snapshot(&self, pr: &tod_store::github::NodePr) -> Result<PrSnapshot, String> {
         cached_snapshot(&self.0, pr).map_err(|err| err.to_string())
-    }
-
-    fn comment(&self, pr: &tod_store::github::NodePr, body: &str) -> Result<(), String> {
-        self.0.post_issue_comment(&pr.owner, &pr.repo, pr.pr_number, body).map_err(|err| err.to_string())
     }
 }
 

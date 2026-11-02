@@ -33,9 +33,6 @@ impl PrFeed for Github {
     fn snapshot(&self, _: &NodePr) -> Result<PrSnapshot, String> {
         Err("not read here".into())
     }
-    fn comment(&self, _: &NodePr, _: &str) -> Result<(), String> {
-        Ok(())
-    }
     fn merge(&self, _: &NodePr) -> Result<PrMerge, String> {
         Ok(PrMerge { title: "Add ingest".into(), merged: true, merged_at: Some("2026-03-01T00:00:00Z".into()) })
     }

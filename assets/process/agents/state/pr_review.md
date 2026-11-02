@@ -18,7 +18,7 @@ The pull request already exists: the `pr` state opened it, and the gate out of `
 - **Fix failing checks** the change caused.
 - **Fix what a review bot found**, whatever its score: a score at or above the threshold does not make a real problem acceptable. Its threads and its summary say what; apply the scope rule below to each.
 
-You never ask a bot to review and you never wait for one: the app does both, and calls you back when there is something new.
+You never wait for a review or for CI: the app does, and calls you back when there is something new.
 
 ### Scope
 

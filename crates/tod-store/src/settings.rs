@@ -181,8 +181,8 @@ pub struct PrReviewBotSettings {
     /// The lowest score that passes.
     #[serde(default = "default_min_score")]
     pub min_score: u8,
-    /// How long after a push the bot may take to review on its own before
-    /// the app asks it to.
+    /// How long after the head commit the bot may take to review it before
+    /// the pull request's agent is told it has not (it may need asking).
     #[serde(default = "default_rerun_after_minutes")]
     pub rerun_after_minutes: u64,
 }

@@ -53,7 +53,7 @@ because reviewers and bots answer late.
 
 The goal: once a PR is open, tod babysits it without the user. It reads
 feedback, fixes what needs fixing, replies, resolves threads, keeps the branch
-current with its base, and gets bot reviews rerun, until the PR is **fully
+current with its base, and waits for bot reviews and CI, until the PR is **fully
 mergeable except for the human review**. That review is the one thing it
 cannot do; it waits for it (see the loop). It stops for the user only at a
 blocker it cannot solve.
@@ -64,9 +64,10 @@ Gates are app checks; no agent evaluates one (see phase-agents.md). So:
 
 - **Readiness is a list of criteria the app derives** from GitHub, each
   waivable like any gate criterion.
-- **The babysitter is the `pr` phase agent.** It changes the world (code,
-  replies, thread resolution, re-review requests) so the criteria become
-  true. It never decides readiness.
+- **The babysitter runs the PR agent.** The agent changes the world (code,
+  replies, thread resolution, and review requests where the project's own
+  skill says to make them) so the criteria become true. Neither decides
+  readiness.
 
 ## Criteria
 
@@ -100,17 +101,18 @@ score. First supported: Greptile.
   matching it. If GitHub does not let us tie it to the head, treat as not
   current.
 - Threshold: `min_score = 4` for this project (4 or 5 passes).
-- Re-review: a bot may need to be asked. Greptile is asked by commenting
-  `@greptileai review this` on the PR, or `@greptileai review this draft`
-  when the PR is a draft. The app does this after pushing, when
-  `pr-review-current` fails because the bot has not reviewed the new head
-  and has had `rerun_after` to do it on its own (default 10 minutes).
-  Requests are not repeated for the same head more than once per
-  `rerun_after`.
+- Asking for a review: the app never asks a bot. How and when to ask (on a
+  draft, after a round of fixes) is project-specific, so it is in the
+  project's own skill for `pr_draft` and `pr_review`, and the agent does it.
+  When the bot has not reviewed the current head `rerun_after_minutes`
+  (default 10) after the head commit, and the agent has had no turn in that
+  time, the app sends the agent `Work::BotReviewMissing`; it may need
+  asking. That repeats at most once per `rerun_after_minutes`, and a bot
+  that never comes ends in the round limit.
 
-The bot's specifics (author, score pattern, re-review comment, thresholds)
-are data on a `ReviewBot` definition in code (Greptile is the only built-in);
-the project config below only selects and tunes bots.
+The bot's specifics (author, score pattern) are data on a `ReviewBot`
+definition in code (Greptile is the only built-in); the project config below
+only selects and tunes bots.
 
 ## Project configuration
 
@@ -133,29 +135,36 @@ most of them through `mergeable_state`, so they are not needed to ship this.
 
 ## The babysitter
 
-The `pr` phase agent (`ProtocolKind::Phase`, state `pr`). Its role doc's
-**Done when**: every review thread is answered and resolved, every bot review
-is current and at or above its threshold, and the PR is mergeable. It
-certifies nothing: the gate derives all of this.
+The autopilot's loop for `pr_draft` and `pr_review` (`autopilot::babysit`,
+run from the gate step of those states, which have no phase agent). It is
+the only loop there: the PR agent (`ProtocolKind::Pr`) takes one turn each
+time it is sent, and hands back. The role docs' **Done when**: every review
+thread is answered and resolved, every bot review is current and at or above
+its threshold, and the PR is mergeable. Nothing is certified: the gate
+derives all of this.
 
 ### Loop
 
-The autopilot's `next_step` for a node in `pr` (after the PR exists):
+Each round reads every linked PR (`pr_readiness::Assessment`):
 
-1. Gate passes → advance to `approved`.
-2. Unanswered decision → stop for the user.
-3. **Actionable feedback exists** (open threads, a failed check, a bot score
-   under threshold, the branch behind its base, or a conflict) → run a
-   babysitter turn.
-4. **Nothing actionable, but the gate waits on something outside** (a bot
-   has not reviewed the current head, a required human review, checks still
-   running) → **wait**. No agent turn is used while waiting.
+1. Unanswered decision → stop for the user.
+2. **Work** (open threads, a failed check, a bot score under threshold not
+   yet seen by the agent, a bot review overdue, the branch behind its base,
+   a conflict, a person's review or comment since the agent's last turn) →
+   one agent turn with the work, then read again.
+3. **Waiting** (a bot has not reviewed the current head, checks still
+   running, GitHub has not computed mergeability) → poll. No agent turn is
+   used while waiting.
+4. **Waiting on a person** → in `pr_draft`, go to the gate (a person on
+   the draft is what it asks); in `pr_review`, end the run with a wait the
+   review's webhook or the next scheduled look wakes.
+5. **Clear** → the gate.
 
-After a push the sequence is: the turn's fixes are pushed and its replies
-posted **at once** (nothing is held back for the re-review), the bot is asked
-to review if it does not do so itself, and the node waits on `bot review`.
-When the review lands, the loop starts again from step 1. That may repeat
-several times; the limits are under "Guards against loops".
+After a push the sequence is: the agent's fixes are pushed and its replies
+posted **at once** in its turn (and, where the project's skill says so, it
+asks the bot to review), and the node waits on `bot review`. When the review
+lands, the loop starts again. That may repeat several times; the limits are
+under "Guards against loops".
 
 Waiting is the point of the design. It is not an agent sitting in a turn:
 
@@ -174,8 +183,8 @@ Waiting is the point of the design. It is not an agent sitting in a turn:
 
 ### A turn
 
-The agent is given, by the app (a `Phase`-protocol dynamic block, never
-fetched by the agent itself), the PR's:
+The agent is given, by the app (`conversation::pr::work_message`; it
+fetches the details with `tod-cli pr`), what needs doing on the PR:
 
 - unresolved threads: id, file and line, every comment, diff hunk;
 - top-level PR comments and reviews since its last turn, bot summaries
@@ -186,7 +195,7 @@ fetched by the agent itself), the PR's:
 **Keeping current with the base.** When the branch is behind, the agent merges
 the base branch into it (a merge, never a rebase or force-push, so review
 history stays intact), resolves conflicts, and leaves the recorded test run
-green before the app pushes. This is ordinary babysitter work, not a stop.
+green before it pushes. This is ordinary babysitter work, not a stop.
 Conflicts it cannot resolve confidently are `needs-user`.
 
 **Scope.** Feedback is judged against the node's intended scope (its
@@ -222,11 +231,10 @@ user may set):
   (`tod-cli decisions ask`) and stops the runner. This is the only outcome
   that stops for the user.
 
-The app then acts, not the agent: it commits and pushes the agent's changes
-(the same path Implement uses), posts each reply, resolves the threads it
-answered, and requests bot re-reviews (the Greptile comment above). The
-agent may fix and answer many threads in one turn; the app posts them
-together after the push so replies can cite the pushed commit.
+The agent commits and pushes, then answers each thread with `tod-cli pr
+threads answer`, which posts the reply and resolves the thread, so replies
+can cite the pushed commit. Asking a bot for a review, where it is needed, is
+the agent's too, as the project's skill says.
 
 **Replies and resolving are autonomous.** This is what the user asked for and
 it is outward-facing, so it is bounded:
@@ -240,9 +248,9 @@ it is outward-facing, so it is bounded:
 - Code changes go through the node's ordinary review-state tests: a turn that
   changes code must leave the recorded test run green, as Fix does, or the
   fix is not pushed and the turn is reopened.
-- Every posted reply, push, resolve, and re-review request is recorded as a
-  `UserAction`-style journey event with what it did, so a wrong autonomous
-  action is traceable.
+- Every posted reply, push, and resolve is recorded as a `UserAction`-style
+  journey event with what it did, so a wrong autonomous action is
+  traceable.
 
 ### Guards against loops
 
@@ -255,9 +263,10 @@ it is outward-facing, so it is bounded:
   coming back), since something unusual is going on. Both limits are
   settings (`pr_readiness.max_thread_rounds`, `max_rounds`); merging the base
   branch and fixing a failed check do not count as rounds.
-- A bot score under threshold after a pass with no code change possible (the
-  agent judges the remaining findings wrong) is `needs-user`, not a
-  rerun: the user decides whether to waive `pr-review-score`.
+- A bot score under threshold is work once: the agent's next turn sees it.
+  If that turn pushes nothing (the agent judges the remaining findings
+  wrong), the score is left to the gate, which stops for the user, who
+  decides whether to waive `pr-review-score`.
 - A turn that changes nothing, replies to nothing, and leaves the gate
   unchanged twice in a row stops the run (`NeedsHuman::PrStuck`), like
   `EvaluationStuck`.
@@ -293,11 +302,15 @@ it is outward-facing, so it is bounded:
 
 ## Decided
 
-- Posting, resolving and requesting re-reviews use the same GitHub
-  credentials the app uses to read the PR (the engineer's own).
+- Posting and resolving use the same GitHub credentials the app uses to
+  read the PR (the engineer's own).
 - Human and bot threads are treated alike; the agent replies and resolves.
-- Fixes are pushed and replies posted immediately; only the bot re-review is
+- Fixes are pushed and replies posted immediately; only the bot review is
   waited on, by polling.
+- The app never asks a bot for a review: that is project-specific, and in
+  the project's skill. A tod skill (`tod-fix-ci`) names no bot, and says
+  nothing about asking one, so it cannot contradict the project's skill run
+  beside it.
 
 ## Open questions
 
@@ -320,20 +333,15 @@ Where the code differs from the design above:
   the PR are the agent turns of its conversation since the run began counting
   (`AutopilotState::pr_turns_base`, reset by renewing the budget). Both limits
   are `pr_readiness.max_thread_rounds` / `max_rounds`.
-- **A round that changes no code still gets a fresh review.** A bot reviews
-  on a push, not on a reply, so when replies (declining a finding, say) have been
-  posted since the bot's latest review of the current head, its review counts as
-  out of date and the app asks for another at once (`Assessment::of`, from the
-  PR's reviews and its thread comments), asking again for each later reply.
-- **The pull request protocol keeps looping while there is work**
-  (`conversation::pr`): after each turn it reads the PR and continues with
-  the work, so the conversation view's Pr step also babysits. The autopilot's
-  `babysit` (`autopilot/mod.rs`) wraps it: it opens the PR, reads it, runs
-  the agent while there is work, asks an overdue bot to review, and polls
-  GitHub while it waits. The poller is that loop; it runs on the run's own
-  thread and sleeps in half-second slices so Pause is heard, and time asleep
-  is not time worked. It does not push a store event; the task panel's runner
-  line shows "waiting for greptile review" through `StepHook::waiting`.
+- **One loop.** The pull request protocol (`conversation::pr`) loops only
+  in `pr`, until the draft is certified; in `pr_draft` and `pr_review` it
+  hands back after every turn. The autopilot's `babysit`
+  (`autopilot/mod.rs`) is the loop there: it reads the PR, runs the agent
+  while there is work, and polls GitHub while it waits. It runs on the run's
+  own thread and sleeps in half-second slices so Pause is heard, and time
+  asleep is not time worked. It does not push a store event; the task
+  panel's runner line shows "waiting for greptile review" through
+  `StepHook::waiting`.
 - **The poll is fixed at 60 s, then 5 min after an hour**, not configurable.
 - **Not built:** the Settings UI for bots (edit `pr_readiness` in `tod.yml`);
   `WaitingOn` in the task panel beyond the runner line; the `--agent mock`
@@ -390,7 +398,8 @@ orchestrator's gate, has three outcomes:
 1. Nothing changed: the next look is recorded and the sandbox stays asleep.
 2. Ready for review and reviewed: the wait ends and the gate can pass.
 3. Feedback: a person asked for changes, review threads are open, a check
-   failed, the branch is behind, a bot scored under its threshold, or a person
+   failed, the branch is behind, a bot scored under its threshold, a bot's
+   review of the head is overdue, or a person
    left a review with text and no verdict (`Work::ReviewComments`) since the
    head commit and since the pull request agent's last turn. The wait is
    cancelled, the node's supervisor is woken, and the `pr` agent runs with

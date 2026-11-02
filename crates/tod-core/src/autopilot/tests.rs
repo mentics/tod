@@ -235,9 +235,6 @@ impl crate::pr_readiness::PrFeed for FinishedGithub {
         })
     }
 
-    fn comment(&self, _: &tod_store::github::NodePr, _: &str) -> Result<(), String> {
-        Ok(())
-    }
 
     fn merge(&self, _: &tod_store::github::NodePr) -> Result<tod_store::github::PrMerge, String> {
         Ok(finished_merge())
@@ -261,10 +258,6 @@ impl FailingGithub {
 
 impl crate::pr_readiness::PrFeed for FailingGithub {
     fn snapshot(&self, _: &tod_store::github::NodePr) -> Result<tod_store::github::PrSnapshot, String> {
-        Err(self.error.lock().unwrap().clone())
-    }
-
-    fn comment(&self, _: &tod_store::github::NodePr, _: &str) -> Result<(), String> {
         Err(self.error.lock().unwrap().clone())
     }
 
@@ -769,12 +762,12 @@ fn an_evaluator_that_keeps_rejecting_the_same_work_stops_the_run() {
 /// A pull request that changes as the agent takes turns: it opens with an
 /// unanswered review thread; once the agent has taken a turn the thread is
 /// answered and the head is new, and the review bot has not looked at it
-/// until it is asked and has been polled a couple of times.
+/// until the agent has had a turn on that and it has been polled a couple of
+/// times.
 struct Sim {
     turns: Arc<std::sync::atomic::AtomicUsize>,
     base: std::sync::Mutex<Option<usize>>,
-    posted: std::sync::Mutex<Vec<String>>,
-    polls_after_ask: std::sync::atomic::AtomicUsize,
+    polls_after_nudge: std::sync::atomic::AtomicUsize,
 }
 
 impl crate::pr_readiness::PrFeed for Sim {
@@ -784,21 +777,12 @@ impl crate::pr_readiness::PrFeed for Sim {
         let turns = self.turns.load(SeqCst);
         let base = *self.base.lock().unwrap().get_or_insert(turns);
         let round = turns - base;
-        let asked = !self.posted.lock().unwrap().is_empty();
-        if asked {
-            self.polls_after_ask.fetch_add(1, SeqCst);
+        // The turn after the fix is the one told the bot has not reviewed.
+        if round >= 2 {
+            self.polls_after_nudge.fetch_add(1, SeqCst);
         }
         let mut comments = Vec::new();
-        if asked {
-            comments.push(IssueComment {
-                id: 1,
-                author: Some("someone".into()),
-                body: self.posted.lock().unwrap()[0].clone(),
-                created_at: "2020-01-02T00:00:00Z".into(),
-                updated_at: "2020-01-02T00:00:00Z".into(),
-            });
-        }
-        if self.polls_after_ask.load(SeqCst) >= 3 {
+        if self.polls_after_nudge.load(SeqCst) >= 3 {
             comments.push(IssueComment {
                 id: 2,
                 author: Some("greptile-apps".into()),
@@ -836,7 +820,7 @@ impl crate::pr_readiness::PrFeed for Sim {
             },
             comments,
             // A person approves once the bot has been through.
-            reviews: if self.polls_after_ask.load(SeqCst) >= 3 {
+            reviews: if self.polls_after_nudge.load(SeqCst) >= 3 {
                 vec![tod_store::github::PrReview {
                     author: Some("alice".into()),
                     submitted_at: "2021-06-01T00:00:00Z".into(),
@@ -847,11 +831,6 @@ impl crate::pr_readiness::PrFeed for Sim {
                 vec![]
             },
         })
-    }
-
-    fn comment(&self, _: &tod_store::github::NodePr, body: &str) -> Result<(), String> {
-        self.posted.lock().unwrap().push(body.to_string());
-        Ok(())
     }
 
     // Once the review is through, the pull request merges and ships.
@@ -870,15 +849,15 @@ fn babysits_a_pull_request_through_feedback_and_a_bots_review() {
     retire_outside_criteria(&fx);
     std::fs::write(
         fx.root.join("tod.yml"),
-        "pr_readiness:\n  bots:\n    - name: greptile\n",
+        // No wait before the agent is told the bot has not reviewed.
+        "pr_readiness:\n  bots:\n    - name: greptile\n      rerun_after_minutes: 0\n",
     )
     .unwrap();
     let turns = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let sim = Arc::new(Sim {
         turns: turns.clone(),
         base: std::sync::Mutex::new(None),
-        posted: std::sync::Mutex::new(Vec::new()),
-        polls_after_ask: std::sync::atomic::AtomicUsize::new(0),
+        polls_after_nudge: std::sync::atomic::AtomicUsize::new(0),
     });
     crate::pr_readiness::set_feed_override(Some(sim.clone()));
     lifecycle::set_lifecycle(&fx.fleet, fx.node, "pr").unwrap();
@@ -888,12 +867,12 @@ fn babysits_a_pull_request_through_feedback_and_a_bots_review() {
     let outcome = pilot.run(&fx.fleet, &mut agent).unwrap();
     let steps: Vec<_> = pilot.state().steps.iter().map(|s| format!("{} {}->{}", s.step, s.from, s.to)).collect();
     assert_eq!(outcome, Outcome::Done, "{steps:#?}");
-    // The agent opened the PR, then took another turn for the open thread.
+    // The agent opened the PR, took a turn for the open thread, then one
+    // for the bot's missing review (asking it is the agent's), and the app
+    // waited for the review without posting anything itself.
     assert!(steps.iter().any(|s| s.starts_with("pr ")), "{steps:#?}");
-    assert!(agent.turns >= 2 + 1, "turns: {}", agent.turns);
-    // The bot had not reviewed the new head: it was asked, once, and waited for.
-    assert_eq!(*sim.posted.lock().unwrap(), vec!["@greptileai review this".to_string()]);
-    assert!(sim.polls_after_ask.load(std::sync::atomic::Ordering::SeqCst) >= 3);
+    assert!(agent.turns >= 2 + 2, "turns: {}", agent.turns);
+    assert!(sim.polls_after_nudge.load(std::sync::atomic::Ordering::SeqCst) >= 3);
 }
 
 #[test]
@@ -950,9 +929,6 @@ fn pr_certifies_the_draft_in_every_stay_even_when_the_pull_request_exists() {
                 reviews: vec![],
             })
         }
-        fn comment(&self, _: &tod_store::github::NodePr, _: &str) -> Result<(), String> {
-            Ok(())
-        }
     }
     crate::pr_readiness::set_feed_override(Some(Arc::new(Clean)));
     linked_to_prs(&fx, "pr", &["https://github.com/acme/app/pull/42"]);
@@ -1008,9 +984,6 @@ fn pr_draft_runs_its_agent_on_every_stay_even_with_a_pull_request_and_no_work() 
                 reviews: vec![],
             })
         }
-        fn comment(&self, _: &tod_store::github::NodePr, _: &str) -> Result<(), String> {
-            Ok(())
-        }
     }
     crate::pr_readiness::set_feed_override(Some(Arc::new(Clean)));
     linked_to_prs(&fx, "pr_draft", &["https://github.com/acme/app/pull/42"]);
@@ -1060,9 +1033,6 @@ fn a_pull_request_waiting_for_a_person_ends_the_run_with_a_timed_wait() {
                 reviews: vec![],
             })
         }
-        fn comment(&self, _: &tod_store::github::NodePr, _: &str) -> Result<(), String> {
-            Ok(())
-        }
     }
     crate::pr_readiness::set_feed_override(Some(Arc::new(Pending)));
     lifecycle::set_lifecycle(&fx.fleet, fx.node, "pr").unwrap();
@@ -1106,9 +1076,6 @@ fn the_wait_for_a_person_records_who_was_asked_to_review() {
                 comments: vec![],
                 reviews: vec![],
             })
-        }
-        fn comment(&self, _: &tod_store::github::NodePr, _: &str) -> Result<(), String> {
-            Ok(())
         }
     }
     crate::pr_readiness::set_feed_override(Some(Arc::new(Asked)));
@@ -1161,9 +1128,6 @@ fn a_pull_request_that_never_changes_stops_for_a_person() {
                 reviews: vec![],
             })
         }
-        fn comment(&self, _: &tod_store::github::NodePr, _: &str) -> Result<(), String> {
-            Ok(())
-        }
     }
     crate::pr_readiness::set_feed_override(Some(Arc::new(Stuck)));
     lifecycle::set_lifecycle(&fx.fleet, fx.node, "pr").unwrap();
@@ -1193,9 +1157,6 @@ impl crate::pr_readiness::PrFeed for AfterReview {
         Err("not read after the review".to_string())
     }
 
-    fn comment(&self, _: &tod_store::github::NodePr, _: &str) -> Result<(), String> {
-        Ok(())
-    }
 
     fn merge(&self, pr: &tod_store::github::NodePr) -> Result<tod_store::github::PrMerge, String> {
         let merged = self.merged.load(std::sync::atomic::Ordering::SeqCst);
@@ -1476,9 +1437,6 @@ fn check_now_in_pr_draft_waits_for_the_draft_to_be_ready_and_reviewed() {
         fn snapshot(&self, _: &tod_store::github::NodePr) -> Result<PrSnapshot, String> {
             Ok(self.0.lock().unwrap().clone())
         }
-        fn comment(&self, _: &tod_store::github::NodePr, _: &str) -> Result<(), String> {
-            Ok(())
-        }
     }
     let fx = bare();
     retire_outside_criteria(&fx);
@@ -1533,9 +1491,6 @@ fn check_now_in_pr_draft_sends_new_changes_requested_to_the_agent_even_on_a_draf
         fn snapshot(&self, _: &tod_store::github::NodePr) -> Result<PrSnapshot, String> {
             Ok(self.0.clone())
         }
-        fn comment(&self, _: &tod_store::github::NodePr, _: &str) -> Result<(), String> {
-            Ok(())
-        }
     }
     let fx = bare();
     retire_outside_criteria(&fx);
@@ -1578,9 +1533,6 @@ fn check_now_in_pr_draft_clears_a_leftover_review_wait_and_ignores_a_bot_reviewe
     impl crate::pr_readiness::PrFeed for Feed {
         fn snapshot(&self, _: &tod_store::github::NodePr) -> Result<PrSnapshot, String> {
             Ok(self.0.clone())
-        }
-        fn comment(&self, _: &tod_store::github::NodePr, _: &str) -> Result<(), String> {
-            Ok(())
         }
     }
     let fx = bare();

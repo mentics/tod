@@ -22,8 +22,6 @@ use super::implement::{IMPLEMENT_CONVERSATION_ENV, IMPLEMENT_NODE_ENV, node_id, 
 use super::protocol::{
     Next, Protocol, ProtocolEnv, Stop, TurnContext, cap_or_stall, hand_back_for_pending_decision,
 };
-use crate::pr_readiness::{Next as PrNext, overall as pr_overall};
-use tod_store::conversation::{ConversationRepo, TurnRole};
 use crate::agent_context::{ImplementRequest, NodeSelection, build_pr_message};
 use crate::process_bundle::{ProcessManifest, TodInstallPaths, state_role_doc};
 use anyhow::{Context, Result};
@@ -217,12 +215,12 @@ impl Protocol for PrProtocol {
         ))
     }
 
-    /// Done when the pull request needs nothing more from the agent: every
-    /// review thread answered, the branch current, checks passing, any bot's
-    /// score met. What is left is waiting (a bot's review, CI, a human
-    /// reviewer), which the app does itself — polling GitHub, not an agent
-    /// turn — and the gate then checks. While there is work, another turn
-    /// goes out, until the cap or a turn that changed nothing.
+    /// In `pr`, done when the agent has certified the draft; until then
+    /// another turn goes out, up to the cap or a turn that changed nothing.
+    /// In `pr_draft` and `pr_review`, done after every turn: the autopilot's
+    /// babysitter (`crate::autopilot`) is the loop there. It reads the pull
+    /// request, sends the agent what is left, waits for CI and reviews
+    /// without an agent, and holds the round limits.
     fn next(&self, turn: &TurnContext<'_>) -> Result<Next> {
         if let Some(next) = hand_back_for_pending_decision(turn)? {
             return Ok(next);
@@ -232,44 +230,15 @@ impl Protocol for PrProtocol {
         }
         let node = node_id(turn.env)?;
         let lifecycle = turn.env.fleet.read(|conn| NodeRepo::new(conn).get_lifecycle(node))?;
-        if lifecycle.as_deref() == Some("pr") {
-            // `pr` is done when its agent has certified the draft, whatever
-            // GitHub shows: the feedback on it is `pr_draft`'s work.
-            if pr_certified(turn.env.fleet, node)? {
-                return Ok(Next::Done(Stop::Complete));
-            }
-            if let Some(done) = cap_or_stall(turn) {
-                return Ok(done);
-            }
-            return Ok(Next::Continue {
-                message: CERTIFY_MESSAGE.to_string(),
-                reason: "the draft pull request is not certified yet".to_string(),
-            });
-        }
-        let prs = turn.env.fleet.read(|conn| NodePrRepo::new(conn).read(node))?.prs;
-        let Some(live) = live_prs(turn.env.data_root, &prs) else {
+        if lifecycle.as_deref() != Some("pr") || pr_certified(turn.env.fleet, node)? {
             return Ok(Next::Done(Stop::Complete));
-        };
-        let PrNext::Work(work) = pr_overall(&live) else {
-            return Ok(Next::Done(Stop::Complete));
-        };
-        let settings = pr_settings_at(turn.env.data_root);
-        let turns = turn
-            .env
-            .fleet
-            .read(|conn| ConversationRepo::new(conn).turns(turn.env.conversation_id))?
-            .iter()
-            .filter(|t| t.role == TurnRole::Agent)
-            .count() as u32;
-        if let Some(why) = pr_stuck(&live, &settings, turns.saturating_sub(1)) {
-            return Ok(Next::Done(Stop::HandBack(why)));
         }
         if let Some(done) = cap_or_stall(turn) {
             return Ok(done);
         }
         Ok(Next::Continue {
-            message: work_message(&live),
-            reason: format!("{} thing(s) still to do on the pull request", work.len()),
+            message: CERTIFY_MESSAGE.to_string(),
+            reason: "the draft pull request is not certified yet".to_string(),
         })
     }
 }
@@ -458,7 +427,6 @@ fn open_real_pr(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::conversation::protocol::CONTINUATION_CAP;
     use crate::interview::test_support::fixture;
     use crate::media::MediaPaths;
     use tod_store::conversation::Focus;
@@ -501,9 +469,7 @@ open pr: Cloud test"), Some("Cloud test"));
         assert!(matches!(decide(Some(merged_report(None)), 0, true), Next::Done(Stop::Complete)));
     }
 
-    struct Fake {
-        open_thread: bool,
-    }
+    struct Fake;
 
     impl crate::pr_readiness::PrFeed for Fake {
         fn snapshot(&self, _: &tod_store::github::NodePr) -> Result<tod_store::github::PrSnapshot, String> {
@@ -512,42 +478,29 @@ open pr: Cloud test"), Some("Cloud test"));
                 status: PrStatus {
                     mergeable: Some(true),
                     mergeable_state: Some("blocked".into()),
-                    merged: false,
                     checks: Some("success".into()),
                     head_sha: Some("abcdef1".into()),
-                    head_committed_at: None,
-                    draft: false,
                     open: true,
-                    reviewers: Vec::new(),
-                    base_ref: None,
-                    body: None,
                     ..Default::default()
                 },
-                threads: self
-                    .open_thread
-                    .then(|| ReviewThread {
-                        id: "PRRT_1".into(),
-                        resolved: false,
-                        outdated: false,
-                        path: Some("src/a.rs".into()),
-                        line: Some(4),
-                        comments: vec![],
-                    })
-                    .into_iter()
-                    .collect(),
+                threads: vec![ReviewThread {
+                    id: "PRRT_1".into(),
+                    resolved: false,
+                    outdated: false,
+                    path: Some("src/a.rs".into()),
+                    line: Some(4),
+                    comments: vec![],
+                }],
                 comments: vec![],
                 reviews: vec![],
             })
         }
-
-        fn comment(&self, _: &tod_store::github::NodePr, _: &str) -> Result<(), String> {
-            Ok(())
-        }
     }
 
-    /// [`decide`] on a node that links a pull request `open_thread` says is
-    /// waiting on an answer.
-    fn decide_live(open_thread: bool, continuations: u32, progressed: bool) -> Next {
+    #[test]
+    fn after_the_pr_state_each_turn_hands_back_to_the_babysitter() {
+        // An open review thread is still work, but the babysitter sends it:
+        // the protocol does not loop on it.
         let fx = fixture();
         fx.fleet
             .interview(
@@ -561,7 +514,8 @@ open pr: Cloud test"), Some("Cloud test"));
                 },
             )
             .unwrap();
-        crate::pr_readiness::set_feed_override(Some(std::sync::Arc::new(Fake { open_thread })));
+        crate::lifecycle::set_lifecycle(&fx.fleet, fx.node, "pr_review").unwrap();
+        crate::pr_readiness::set_feed_override(Some(std::sync::Arc::new(Fake)));
         let media = MediaPaths::discover().expect("media paths");
         let env = ProtocolEnv {
             fleet: &fx.fleet,
@@ -570,35 +524,13 @@ open pr: Cloud test"), Some("Cloud test"));
             conversation_id: Uuid::new_v4(),
             focus: Focus::Node(fx.node),
         };
-        let next = PrProtocol
-            .next(&TurnContext { env: &env, report: None, continuations, progressed })
-            .expect("a decision");
+        let next = PrProtocol.next(&TurnContext { env: &env, report: None, continuations: 0, progressed: true });
         crate::pr_readiness::set_feed_override(None);
-        next
-    }
-
-    #[test]
-    fn feedback_still_open_keeps_the_loop_going() {
-        let Next::Continue { message, .. } = decide_live(true, 0, true) else {
-            panic!("an open review thread should continue");
-        };
-        assert!(message.contains("1 review thread(s) are open"), "{message}");
-        assert!(message.contains("tod-cli pr threads answer"), "{message}");
-    }
-
-    #[test]
-    fn nothing_left_for_the_agent_hands_back() {
-        assert!(matches!(decide_live(false, 0, true), Next::Done(Stop::Complete)));
+        assert!(matches!(next.expect("a decision"), Next::Done(Stop::Complete)));
     }
 
     #[test]
     fn a_pr_that_cannot_be_read_is_left_to_the_gate() {
         assert!(matches!(decide(None, 0, true), Next::Done(Stop::Complete)));
-    }
-
-    #[test]
-    fn the_cap_or_a_turn_that_changed_nothing_stops_the_loop() {
-        assert!(matches!(decide_live(true, CONTINUATION_CAP, true), Next::Done(Stop::ContinuationCap)));
-        assert!(matches!(decide_live(true, 1, false), Next::Done(Stop::NoProgress)));
     }
 }

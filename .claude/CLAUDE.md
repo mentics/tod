@@ -159,15 +159,19 @@ to the data root someday, not editable now). Each `run` must name a real
 opens the draft (or reviews the one a move back left) and certifies the `pr`
 phase itself, which `pr → pr_draft` checks; the certificate counts only for
 that stay. In `pr_draft` and `pr_review` the autopilot's
-`babysit` (`autopilot/mod.rs`) drives the pull request until only the human
-review is missing: `tod_core::pr_readiness` reads it from GitHub
-(`Assessment`: open review threads, the branch behind its base, failing
-checks, a review bot's score for the current head) and says what is *work*
-(the `Pr` protocol's agent fixes, merges the base in, and answers threads
-with `tod-cli pr threads answer`, which posts the reply and resolves the
-thread) and what is only *waiting* (a bot's review, CI), which the run does
-itself by polling, asking an overdue bot to review (`@greptileai review
-this`, or `... this draft`). The project's bots and round limits are
+`babysit` (`autopilot/mod.rs`) is the only loop: it drives the pull request
+until only the human review is missing, sending the `Pr` protocol's agent
+one turn at a time (the protocol loops only in `pr`). `tod_core::pr_readiness`
+reads the PR from GitHub (`Assessment`: open review threads, the branch
+behind its base, failing checks, a review bot's score for the current head)
+and says what is *work* (the agent fixes, merges the base in, and answers
+threads with `tod-cli pr threads answer`, which posts the reply and resolves
+the thread) and what is only *waiting* (a bot's review, CI), which the run
+does itself by polling. The app never asks a bot to review: that is
+project-specific, in the project's own skill; a review overdue is work that
+tells the agent (`Work::BotReviewMissing`). For the same reason no tod skill
+or role doc names a bot or says whether to ask one, so it cannot contradict
+the project's skill in the same prompt. The project's bots and round limits are
 `pr_readiness` in `tod.yml`. The same assessment answers the `pr →
 approved` criteria (`pr-approved.up-to-date`, `.threads-resolved`,
 `.review-current`, `.review-score`). Tests replace GitHub with

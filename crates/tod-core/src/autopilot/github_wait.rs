@@ -317,6 +317,7 @@ fn work_description(work: &[crate::pr_readiness::Work]) -> String {
             Work::Behind => "behind its base".to_string(),
             Work::Conflict => "conflicts with its base".to_string(),
             Work::LowScore { bot, score, min } => format!("{bot} scored it {score} (needs {min})"),
+            Work::BotReviewMissing { bot, .. } => format!("no {bot} review of the current head"),
             Work::ChangesRequested => "changes requested".to_string(),
             Work::ReviewComments(n) => format!("{n} review{} with comments to answer", if *n == 1 { "" } else { "s" }),
         })

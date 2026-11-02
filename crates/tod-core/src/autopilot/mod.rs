@@ -653,9 +653,12 @@ impl Autopilot {
     ///
     /// Each round reads the pull request. Work (open review threads, a failing
     /// check, a branch behind its base, a bot's low score) goes to the pull
-    /// request's agent. Waiting (a bot has not reviewed the new head, checks
-    /// are running) is done here, without an agent: a bot overdue is asked to
-    /// review, then GitHub is read again every [`PR_POLL`] until it moves.
+    /// request's agent, one turn at a time: the `Pr` protocol hands back after
+    /// each, and this loop is the only one, with the only round limits.
+    /// Waiting (a bot has not reviewed the new head, checks are running) is
+    /// done here, without an agent: GitHub is read again every [`PR_POLL`]
+    /// until it moves. Asking a review bot for a review is the agent's, as
+    /// the project's own skill says; a bot overdue is work for it.
     /// `None` when the pull request is clear (or cannot be read: the gate
     /// says why), so the gate checks it. What is left after that, a human
     /// review, stops the run at the gate as a request.
@@ -777,28 +780,6 @@ impl Autopilot {
                     }
                 }
                 PrNext::Wait(waits) => {
-                    // A bot that has had its time and not been asked is asked.
-                    let mut asked = false;
-                    for p in &live {
-                        let due = p.assessment.waits();
-                        for report in &p.assessment.bots {
-                            let ask = due.iter().any(|w| {
-                                matches!(w, Wait::BotReview { bot, ask: true } if *bot == report.settings.name)
-                            });
-                            if ask {
-                                match feed.comment(&p.pr, report.bot.rereview_comment(p.draft)) {
-                                    Ok(()) => asked = true,
-                                    Err(err) => tracing::warn!(
-                                        node = %self.node, %err,
-                                        "could not ask {} to review", report.settings.name
-                                    ),
-                                }
-                            }
-                        }
-                    }
-                    if asked {
-                        continue;
-                    }
                     if before_review && waits.iter().all(|w| matches!(w, Wait::HumanReview)) {
                         // Ready for a person: the gate asks that one is on it.
                         hook.waiting(None, None);

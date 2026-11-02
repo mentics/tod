@@ -11,7 +11,7 @@ The PR is worked as the node's `pr` conversation (the protocol is named for the 
 The pull request already exists: do not open another. Get the draft **ready for a person to review**, by clearing the automated feedback on it first:
 
 - Apply this phase's configured skills to the PR, as its context lists them.
-- Clear everything you can: bring the branch up to date with its base, fix failing checks, answer review threads from automated reviewers and bots, and meet any bot's required score. The app asks a bot to review again and waits for it and for CI; you are sent back when there is more to do.
+- Clear everything you can: bring the branch up to date with its base, fix failing checks, answer review threads from automated reviewers and bots, and meet any bot's required score. The app waits for reviews and for CI; you are sent back when there is more to do.
 - Keep it a draft. A person marks it ready for review and puts a reviewer on it; that is what the gate waits for. Do not mark it ready, and do not request reviewers yourself.
 
 Decide the scope of each piece of feedback as `pr_review` does: fix what this change introduced, and decline with a reason what was already there or would enlarge the change.
