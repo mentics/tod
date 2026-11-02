@@ -12,9 +12,9 @@ for the same phase is its reference: which checks are required, how to run
 and fix the project's own checks, and its own review bots. Where it says
 something more specific, follow it.
 
-The loop is the app's, not yours: it watches the pull requests, asks review
-bots to look again, waits for CI, and wakes you with what changed. Each turn
-you clear what is there and stop.
+The loop is the app's, not yours: it watches the pull requests, waits for CI
+and reviews, and wakes you with what changed. Each turn you clear what is
+there and stop.
 
 ## You never wait
 
@@ -24,9 +24,6 @@ A session does work and ends. It does not wait for anything outside it:
   `sleep`, not a polling loop, not a background watcher you plan to come back
   to. When a check is still running, or a review has not landed, and there is
   nothing else to fix, end your turn.
-- **No asking a bot to review.** Do not `@greptileai`, do not comment to
-  trigger Macroscope, do not add a label. The app asks for reviews when they
-  are due, waits for them and for CI, and sends you back with what landed.
 - The node's sandbox sleeps while it waits, and you are woken with what
   changed. Assume nothing from your last session is still running.
 
@@ -98,36 +95,14 @@ People come first: their comments are the ones that most need an answer, and
 when a person and a bot disagree, the person wins. An approval with nits
 still wants each nit addressed or acknowledged.
 
-### The bots
-
-Common third-party bots (the project skill adds its own):
-
-| Bot        | Author (`user.login`) | Severity                          |
-| ---------- | --------------------- | --------------------------------- |
-| Greptile   | `greptile-apps[bot]`  | `P1` (worst) / `P2` / `P3` / nit  |
-| Macroscope | `macroscopeapp[bot]`  | `🔴 High` / `🟡 Medium` / `🟢 Low` |
-
-- **Greptile's "Comments Outside Diff."** Findings Greptile cannot anchor to a
-  changed line go into one general PR comment marked
-  `<!-- greptile_failed_comments -->` (a collapsed "Comments Outside Diff
-  (N)"), not into threads, so `pr threads` does not show them:
-
-  ```
-  gh api repos/:owner/:repo/issues/$PR/comments --paginate \
-    --jq '.[] | select(.user.login=="greptile-apps[bot]") | select(.body | test("greptile_failed_comments")) | .body'
-  ```
-
-  Each item names a path, a line range and a severity; triage them like any
-  finding. They have no thread to answer, so answer them all in one top-level
-  `gh pr comment`, item by item: what you fixed, or why not. Do not mention
-  `@greptileai` in it; that asks for a review, which is the app's to do.
+Which review bots the project uses, how each marks severity, and where each
+posts findings that are not in a thread are in the project skill.
 
 ### Deciding each one
 
 Read the code the comment is about before changing anything.
 
-- Weigh by severity: look hard at `P1`/`P2`, `High`/`Medium`, and the
-  highest levels of any other bot.
+- Weigh by severity: look hard at each bot's highest levels.
   A nit that does not fit the codebase's conventions may be declined.
 - Bots misread context, flag intended design, and flag what was already
   there. Do not apply a `suggestion` block without checking it; when it is
@@ -148,6 +123,3 @@ comment) gets a reply with `gh pr comment`.
 - **Not a problem**: why the code is right as it is.
 
 Keep replies short and factual. Do not mention AI, Claude, or an assistant.
-
-A reply does not make a bot re-score. That is fine: the app decides when a
-bot should look again, and asks it.
