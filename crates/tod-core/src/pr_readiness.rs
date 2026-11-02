@@ -615,10 +615,10 @@ pub fn render_work(url: &str, assessment: &Assessment) -> String {
             ),
             Work::BotReviewMissing { bot, minutes, low_last_score } => match low_last_score {
                 Some((score, min)) => format!(
-                    "- {bot} has not reviewed the current head in {minutes} minutes, and its last score, {score}/5 on an earlier commit, is under the {min}/5 needed. Commits were pushed after that review, so it stands on code that has since changed: fix what it found that this change introduced if you have not, then ask {bot} for a new review of the current head the way the project's skill says to, and do not end the turn saying nothing is left until you have asked or can say why the project's skill rules a new review out\n"
+                    "- {bot} has not reviewed the current head in {minutes} minutes, and its last score, {score}/5 on an earlier commit, is under the {min}/5 needed: fix what it found that this change introduced if you have not, and if it has to be asked for a new review, ask it\n"
                 ),
                 None => format!(
-                    "- {bot} has not reviewed the current head in {minutes} minutes: ask {bot} for a review the way the project's skill says to (a draft is often not reviewed until it is asked), and do not end the turn saying nothing is left until you have asked or can say why the project's skill rules it out\n"
+                    "- {bot} has not reviewed the current head in {minutes} minutes: if it has to be asked for a review, ask it\n"
                 ),
             },
         });
