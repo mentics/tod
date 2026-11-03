@@ -246,6 +246,13 @@ impl<'a> NodeRepo<'a> {
         // redone no longer counts (`crate::lifecycle_reset`).
         if let Some(previous) = previous {
             crate::lifecycle_reset::clear_certifications(self.conn, node_id, &previous, state)?;
+            // What the node waited on in the stay it just left (a check, a
+            // review, a deadline) is moot, whichever way it left (gate,
+            // force-advance, move-back): a stale wait would block the next
+            // stay's runs and show the node as waiting on others forever.
+            if previous != state {
+                crate::waits::cancel_for_node(self.conn, node_id, &format!("the node left {previous}"))?;
+            }
         }
         // What `ready` onwards is built on; see `crate::lifecycle_baseline`.
         let baselines = crate::lifecycle_baseline::BaselineRepo::new(self.conn);

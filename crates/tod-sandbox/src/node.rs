@@ -649,7 +649,7 @@ fn upload_tod_files(bx: &Blaxel, url: &str, payload: &NodePayload, progress: &mu
     let res = bx.run(
         url,
         &format!(
-            "mkdir -p {TOD_DIR}/bin && ln -sf {TOD_CLI_PATH} /usr/local/bin/tod-cli && {LOOPBACK_HOSTS} && printf '%s\\n' {} > {MANIFEST_PATH}",
+            "mkdir -p {TOD_DIR}/bin && ln -sf {TOD_CLI_PATH} /usr/local/bin/tod-cli && {LOOPBACK_HOSTS} && printf '%s\\n' {} > {MANIFEST_PATH}.tmp && mv -f {MANIFEST_PATH}.tmp {MANIFEST_PATH}",
             shell_quote(&node_manifest(payload.relay))
         ),
         30,
@@ -689,15 +689,8 @@ pub fn install_into_fork(bx: &Blaxel, url: &str, payload: &NodePayload, progress
 /// needs.
 pub fn start(bx: &Blaxel, url: &str, payload: &NodePayload, allow_clone: bool, progress: &mut dyn FnMut(&str)) -> Result<()> {
     progress(&format!("checking out {}…", payload.branch));
-    let res = bx.run(url, &format!("sh -c {} 2>&1", shell_quote(&checkout_script(payload.repo_url, payload.branch, payload.git_identity, allow_clone))), 600)?;
-    if res.exit_code != 0 {
-        // git's own message is the last lines; a long ref listing before it
-        // must not hide it.
-        let out = res.output();
-        let lines: Vec<&str> = out.lines().collect();
-        let tail = lines[lines.len().saturating_sub(30)..].join("\n");
-        bail!("checking out {} failed (exit {}): {}", payload.branch, res.exit_code, tail);
-    }
+    let script = format!("sh -c {} 2>&1", shell_quote(&checkout_script(payload.repo_url, payload.branch, payload.git_identity, allow_clone)));
+    checkout_with_auth_retry(&mut || bx.run(url, &script, 600), &mut |d| std::thread::sleep(d), payload.branch, progress)?;
 
     // Restarted, so it runs the binary just installed.
     bx.kill(url, RELAY_PROCESS)?;
@@ -715,6 +708,119 @@ pub fn start(bx: &Blaxel, url: &str, payload: &NodePayload, allow_clone: bool, p
         }
     }
     Ok(())
+}
+
+/// How long the checkout waits before its one retry of an authentication
+/// failure.
+const CHECKOUT_AUTH_RETRY_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Whether git's output says the proxy did not (yet) supply the credentials:
+/// the request went out unauthenticated and git had nobody to ask.
+fn is_auth_failure(output: &str) -> bool {
+    output.contains("could not read Username") || output.contains("Authentication failed")
+}
+
+/// Runs the checkout, and once more after a short wait when it failed for
+/// want of GitHub credentials: the proxy rule that adds them can still be
+/// taking effect after [`wait_proxy_ready`] passed. Any other failure, and a
+/// second authentication failure, is the error.
+fn checkout_with_auth_retry(
+    run: &mut dyn FnMut() -> Result<crate::blaxel::ProcessResult>,
+    sleep: &mut dyn FnMut(std::time::Duration),
+    branch: &str,
+    progress: &mut dyn FnMut(&str),
+) -> Result<()> {
+    let mut attempt = 0;
+    loop {
+        let res = run()?;
+        if res.exit_code == 0 {
+            return Ok(());
+        }
+        // git's own message is the last lines; a long ref listing before it
+        // must not hide it.
+        let out = res.output();
+        let lines: Vec<&str> = out.lines().collect();
+        let tail = lines[lines.len().saturating_sub(30)..].join("\n");
+        if attempt == 0 && is_auth_failure(&tail) {
+            attempt += 1;
+            progress(&format!(
+                "checking out {branch} got an authentication failure; retrying in {}s…",
+                CHECKOUT_AUTH_RETRY_WAIT.as_secs()
+            ));
+            sleep(CHECKOUT_AUTH_RETRY_WAIT);
+            continue;
+        }
+        bail!("checking out {branch} failed (exit {}): {}", res.exit_code, tail);
+    }
+}
+
+/// Waits between probes of [`wait_proxy_ready`] for a sandbox forked from a
+/// golden (about 90 s in all): its proxy rules are replaced after the fork.
+pub const FORK_PROBE_DELAYS: &[u64] = &[1, 2, 4, 8, 15, 15, 15, 15, 15];
+/// The same for a sandbox made from an image, whose rules went in with its
+/// creation: a short check that they work.
+pub const IMAGE_PROBE_DELAYS: &[u64] = &[1, 2, 4, 8];
+
+/// Exit code of [`probe_script`] when the node's environment is not there.
+const PROBE_NO_NODE_ENV: i32 = 41;
+
+/// What the checkout needs, tried once: the node's environment (so a fork's
+/// environment update has landed) and an authenticated read of the repository
+/// through the sandbox's proxy, at the URL the checkout uses.
+pub fn probe_script(repo_url: &str, node: &str) -> String {
+    format!(
+        "if [ \"$TOD_NODE\" != {} ]; then echo \"TOD_NODE is '$TOD_NODE' in the sandbox environment\"; exit {PROBE_NO_NODE_ENV}; fi\n\
+         if [ -n \"$SSL_CERT_FILE\" ]; then git config --system http.sslCAInfo \"$SSL_CERT_FILE\"; fi\n\
+         GIT_TERMINAL_PROMPT=0 git ls-remote --exit-code {} HEAD 2>&1\n",
+        shell_quote(node),
+        shell_quote(repo_url)
+    )
+}
+
+/// Waits until the sandbox at `url` can do what the checkout will: it has
+/// `node`'s environment and reads `repo_url` through its proxy with the
+/// node's GitHub credentials. A fork's proxy rules and environment are
+/// replaced after the fork call returns, and the checkout has failed
+/// ("could not read Username") when it ran first. Probes after each of
+/// `delays` (seconds); the error names what was still missing.
+pub fn wait_proxy_ready(
+    bx: &Blaxel,
+    url: &str,
+    node: &str,
+    repo_url: &str,
+    delays: &[u64],
+    progress: &mut dyn FnMut(&str),
+) -> Result<()> {
+    let script = format!("sh -c {}", shell_quote(&probe_script(repo_url, node)));
+    wait_proxy_ready_with(&mut || bx.run(url, &script, 60), &mut |d| std::thread::sleep(d), delays, progress)
+}
+
+fn wait_proxy_ready_with(
+    run: &mut dyn FnMut() -> Result<crate::blaxel::ProcessResult>,
+    sleep: &mut dyn FnMut(std::time::Duration),
+    delays: &[u64],
+    progress: &mut dyn FnMut(&str),
+) -> Result<()> {
+    let mut waited = 0;
+    let mut last;
+    let mut attempt = 0;
+    loop {
+        match run() {
+            Ok(res) if res.exit_code == 0 => return Ok(()),
+            Ok(res) => {
+                let what = if res.exit_code == PROBE_NO_NODE_ENV { "the node's environment" } else { "GitHub access through the proxy" };
+                last = format!("{what} (exit {}): {}", res.exit_code, res.output().trim());
+            }
+            // A sandbox still coming up fails the call itself.
+            Err(err) => last = format!("the sandbox's process API: {err:#}"),
+        }
+        let Some(delay) = delays.get(attempt) else { break };
+        progress(&format!("the sandbox is not ready yet ({}); trying again in {delay}s…", last.lines().next().unwrap_or("")));
+        sleep(std::time::Duration::from_secs(*delay));
+        waited += delay;
+        attempt += 1;
+    }
+    bail!("the sandbox was still not ready after {waited}s: {last}")
 }
 
 /// What a base made from `base_body` (its [`create_body`]) with `payload`
@@ -909,6 +1015,92 @@ pub fn poke_script() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn result(exit_code: i32, logs: &str) -> crate::blaxel::ProcessResult {
+        crate::blaxel::ProcessResult { exit_code, logs: Some(logs.to_string()), status: None }
+    }
+
+    #[test]
+    fn probe_retries_until_the_proxy_works() {
+        let mut replies = vec![
+            result(128, "fatal: could not read Username for 'https://github.com'"),
+            result(PROBE_NO_NODE_ENV, "TOD_NODE is ''"),
+            result(0, "abc\tHEAD"),
+        ]
+        .into_iter();
+        let mut slept = Vec::new();
+        let mut said = Vec::new();
+        wait_proxy_ready_with(
+            &mut || Ok(replies.next().unwrap()),
+            &mut |d| slept.push(d.as_secs()),
+            &[1, 2, 4],
+            &mut |m| said.push(m.to_string()),
+        )
+        .unwrap();
+        assert_eq!(slept, [1, 2]);
+        assert_eq!(said.len(), 2);
+    }
+
+    #[test]
+    fn probe_failure_after_the_budget_names_what_was_missing() {
+        let mut slept = 0;
+        let err = wait_proxy_ready_with(
+            &mut || Ok(result(128, "fatal: could not read Username")),
+            &mut |d| slept += d.as_secs(),
+            &[1, 2],
+            &mut |_| {},
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("after 3s") && msg.contains("GitHub access through the proxy") && msg.contains("could not read Username"), "{msg}");
+        assert_eq!(slept, 3);
+        let err = wait_proxy_ready_with(&mut || Ok(result(PROBE_NO_NODE_ENV, "x")), &mut |_| {}, &[], &mut |_| {}).unwrap_err();
+        assert!(format!("{err:#}").contains("the node's environment"));
+    }
+
+    #[test]
+    fn probe_script_checks_env_and_reads_the_repo_without_prompting() {
+        let s = probe_script("https://github.com/o/r.git", "n-1");
+        assert!(s.contains("TOD_NODE") && s.contains("n-1"), "{s}");
+        assert!(s.contains("GIT_TERMINAL_PROMPT=0 git ls-remote --exit-code"), "{s}");
+        assert!(s.contains("https://github.com/o/r.git"), "{s}");
+    }
+
+    #[test]
+    fn checkout_retries_one_authentication_failure_then_fails() {
+        let auth = "fatal: could not read Username for 'https://github.com'";
+        let mut replies = vec![result(128, auth), result(0, "")].into_iter();
+        let mut slept = 0;
+        checkout_with_auth_retry(&mut || Ok(replies.next().unwrap()), &mut |_| slept += 1, "b", &mut |_| {}).unwrap();
+        assert_eq!(slept, 1);
+
+        let mut calls = 0;
+        let err = checkout_with_auth_retry(
+            &mut || {
+                calls += 1;
+                Ok(result(128, auth))
+            },
+            &mut |_| {},
+            "b",
+            &mut |_| {},
+        )
+        .unwrap_err();
+        assert_eq!(calls, 2);
+        assert!(format!("{err:#}").contains("checking out b failed (exit 128)"));
+
+        let mut calls = 0;
+        checkout_with_auth_retry(
+            &mut || {
+                calls += 1;
+                Ok(result(1, "fatal: not our ref"))
+            },
+            &mut |_| {},
+            "b",
+            &mut |_| {},
+        )
+        .unwrap_err();
+        assert_eq!(calls, 1);
+    }
 
     #[test]
     fn curl_install_script_covers_the_common_package_managers() {

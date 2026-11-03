@@ -384,7 +384,7 @@ impl Autopilot {
             Wait::HumanReview => return Ok(()),
         };
         let pending = fleet.read(|conn| WaitRepo::new(conn).list_pending_for_node(self.node))?;
-        if let Some(same) = pending.iter().find(|w| w.match_spec == spec) {
+        if let Some(same) = pending.iter().find(|w| tod_store::waits::normalize_spec(&w.match_spec) == spec) {
             fleet
                 .interview(ACTOR, InterviewCommand::RescheduleWait { wait_id: same.id, due_at: due_at_ms })
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -454,7 +454,8 @@ fn cancel_github_waits(fleet: &FleetStore, node: uuid::Uuid) -> Result<()> {
 /// Cancels the node's pending waits whose spec `matches`.
 fn cancel_waits(fleet: &FleetStore, node: uuid::Uuid, matches: impl Fn(&str) -> bool) -> Result<()> {
     let old = fleet.read(|conn| WaitRepo::new(conn).list_pending_for_node(node))?;
-    for wait in old.iter().filter(|w| matches(&w.match_spec)) {
+    // Agents write `github:pr 2810 checks`: match every spelling alike.
+    for wait in old.iter().filter(|w| matches(&tod_store::waits::normalize_spec(&w.match_spec))) {
         fleet
             .interview(ACTOR, InterviewCommand::SetWaitState { wait_id: wait.id, state: "cancelled".into() })
             .map_err(|e| anyhow::anyhow!("{e}"))?;

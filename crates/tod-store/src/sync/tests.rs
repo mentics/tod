@@ -678,3 +678,96 @@ fn the_resolvers_answer_the_same_on_a_slice() {
     let _ = std::fs::remove_dir_all(&a.root);
     let _ = std::fs::remove_dir_all(&b.root);
 }
+
+fn log_count(conn: &Connection) -> i64 {
+    conn.query_row("SELECT COUNT(*) FROM sync_changes", [], |r| r.get(0)).unwrap()
+}
+
+#[test]
+fn a_snapshot_leaves_the_change_log_out_but_keeps_its_numbering() {
+    let (a, b) = pair();
+    random_edit(&a, &mut Lcg(3), 0);
+    let _ = a.fleet.writer().flush();
+    assert!(log_count(&a.conn()) > 0);
+    let snap = b.root.join("again.db");
+    snapshot(a.fleet.paths().db(), &snap).unwrap();
+    let copy = Connection::open(&snap).unwrap();
+    assert_eq!(log_count(&copy), 0);
+    assert_eq!(last_seq(&copy).unwrap(), last_seq(&a.conn()).unwrap());
+    let _ = std::fs::remove_dir_all(&a.root);
+    let _ = std::fs::remove_dir_all(&b.root);
+}
+
+#[test]
+fn pruning_sent_entries_keeps_later_ones_and_the_numbering() {
+    let (a, b) = pair();
+    random_edit(&a, &mut Lcg(5), 0);
+    let _ = a.fleet.writer().flush();
+    let conn = a.conn();
+    let last = last_seq(&conn).unwrap();
+    assert!(log_count(&conn) > 0);
+    let deleted = prune_sent(&conn, last).unwrap();
+    assert!(deleted > 0);
+    assert_eq!(log_count(&conn), 0);
+    assert_eq!(last_seq(&conn).unwrap(), last, "numbering must not start over");
+    assert!(export_changes(&conn, 0).unwrap().is_empty());
+    drop(conn);
+    // A later change is numbered after it and is the only one left to send.
+    let list_id = a.fleet.list_outline_lists().unwrap()[0].id;
+    a.apply(OutlineMutation::CreateNode {
+        node_id: None,
+        list_id,
+        parent_id: None,
+        anchor_id: None,
+        position: CreatePosition::Below,
+        title: "later".into(),
+    });
+    let conn = a.conn();
+    assert!(last_seq(&conn).unwrap() > last);
+    assert!(!export_changes(&conn, last).unwrap().is_empty());
+    let _ = std::fs::remove_dir_all(&a.root);
+    let _ = std::fs::remove_dir_all(&b.root);
+}
+
+#[test]
+fn a_change_the_receiver_refuses_is_recorded_and_the_rest_apply() {
+    let (a, b) = pair();
+    let list_id = a.fleet.list_outline_lists().unwrap()[0].id;
+    for title in ["good one", "good two"] {
+        a.apply(OutlineMutation::CreateNode {
+            node_id: None,
+            list_id,
+            parent_id: None,
+            anchor_id: None,
+            position: CreatePosition::Below,
+            title: title.into(),
+        });
+    }
+    let mut changes = export_changes(&a.conn(), a.cursor).unwrap();
+    let good = changes.len();
+    assert!(good >= 2);
+    // A node row with none of the required columns: the insert is refused.
+    let mut key = Row::new();
+    key.insert("id".into(), SqlValue::Blob("00112233445566778899aabbccddeeff".into()));
+    changes.insert(
+        1,
+        Change { seq: 999, node_id: None, table: "nodes".into(), key: key.clone(), before: None, after: Some(key) },
+    );
+    let report = apply_changes_from(&mut b.conn(), &changes, "one").unwrap();
+    assert_eq!(report.rejected, 1);
+    assert_eq!(report.applied, good);
+    assert_eq!(report.reject_errors.len(), 1);
+    assert!(report.reject_errors[0].starts_with("nodes:"), "{:?}", report.reject_errors);
+    let (seq, tbl, op): (i64, String, String) = b
+        .conn()
+        .query_row("SELECT seq, tbl, op FROM sync_rejects", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .unwrap();
+    assert_eq!((seq, tbl.as_str(), op.as_str()), (999, "nodes", "insert"));
+    let titles: i64 = b
+        .conn()
+        .query_row("SELECT COUNT(*) FROM nodes WHERE title IN ('good one', 'good two')", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(titles, 2, "the rows around the bad one applied");
+    let _ = std::fs::remove_dir_all(&a.root);
+    let _ = std::fs::remove_dir_all(&b.root);
+}

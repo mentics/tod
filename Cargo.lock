@@ -7554,6 +7554,7 @@ dependencies = [
  "fs2",
  "serde",
  "serde_json",
+ "tempfile",
  "tod-agent",
  "tod-agentd-client",
  "tod-core",

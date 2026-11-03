@@ -1,6 +1,6 @@
 # Who is next: the one answer to "what is this node waiting on?"
 
-Status: design, not built.
+Status: built, apart from the parts listed under "Build order".
 
 Every node that is not `done` is in the same position: **something has to
 happen before it moves, and some actor has to make it happen.** The app must
@@ -456,8 +456,33 @@ deleted when the run stops, and each write is pushed at once
 - a row that stopped beating and was never deleted: `You::Failed`, "the cloud
   supervisor stopped responding" (the sandbox or process died mid-run), the
   analogue of a lost lease;
-- no row: whatever the node's waits, requests and last outcome say, as before
-  (a node that finished or waits on GitHub is `Others`, not `Working`).
+- an idle row (the wake ended; the row is kept, not deleted) with a `stopped`
+  reason: `You::Stopped { reason }`. The supervisor writes the reason in the
+  idle beat at the end of every wake (`tod_supervisor::stop_reason`: a stuck
+  pull request, a spent budget, an evaluator that was stuck, a permission, a
+  stop question answered "Leave it stopped" (`left stopped: ...`), a failed
+  supervisor), in plain words with what the user can do. It is cleared by the
+  next beat. A wake that finished, only waited, or stopped for a request
+  leaves none (the wait row, or the request, says it);
+- the node's latest stop question (`tod_core::stop_questions`) answered
+  "leave it": `You::Stopped`, naming the question and the answer that resumes
+  it (the task panel offers **Keep going**, which answers it to continue and
+  wakes the supervisor);
+- the node's sandbox gone (`cloud_nodes.lost_at`): `You::Stopped`, "its sandbox
+  was deleted; Run in the cloud makes a new one" (or "is gone; a new one is
+  made at the next sync");
+- an idle row with none of these, or no row: whatever the node's waits,
+  requests and last outcome say, as before (a node that finished or waits on
+  GitHub is `Others`, not `Working`).
+
+The first word of a wake is a row with `what = "starting"`, sent straight to
+the orchestrator before the supervisor seeds its local copy
+(`Orchestrator::push_starting_beat`), so the app hears from it within seconds
+instead of after a slow seed. The heartbeat thread records each beat on a
+connection of its own and pushes only when no sync holds the replica; the
+sync's own push carries a skipped beat. "Running in the cloud" in the tree and
+the quit dialog (`cloud_sync::working_in_cloud`) is `Working` and nothing else:
+being assigned to the cloud, or having no wait or request, proves nothing.
 
 The app also takes a lease of its own, `cloud_start`
 (`Work::CloudStart`, "starting in the cloud"), the moment the user clicks Run

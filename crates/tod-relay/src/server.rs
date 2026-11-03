@@ -44,6 +44,10 @@ const LOG_DIR: &str = "/opt/tod/logs";
 /// How long a poke's own bridging lease (`Hold::lease("poke", ..)`) holds the
 /// sandbox awake by itself, giving the supervisor time to take its own hold.
 const POKE_BRIDGE_SECS: u64 = 60;
+/// The hold a poke takes (not namespaced: only the relay takes it).
+const POKE_REASON: &str = "poke";
+/// What the supervisor calls its own hold (`POST /hold?reason=supervisor`).
+const SUPERVISOR_REASON: &str = "supervisor";
 
 static NEXT_CONN: AtomicU64 = AtomicU64::new(1);
 
@@ -58,9 +62,13 @@ struct Relay {
     /// `/opt/tod/tod-supervisor wake --workspace <the checkout>`). A shell
     /// command line.
     supervisor_cmd: String,
-    /// The pid of a supervisor this relay started, while it is still
-    /// running. `None` both before one has been started and once it exits.
-    supervisor: Mutex<Option<u32>>,
+    /// The pid of a supervisor this relay started, with the `poke_gen` it has
+    /// seen, while it is still running. `None` both before one has been started and once it exits.
+    supervisor: Mutex<Option<(u32, u64)>>,
+    /// Counts pokes. A supervisor records the count when it is started or
+    /// last signalled; one that exits with the count ahead of that missed a
+    /// poke (it arrived in its exit tail), and a new one is started.
+    poke_gen: AtomicU64,
     /// What only the supervisor is given: [`take_supervisor_env`].
     supervisor_env: Vec<(String, String)>,
 }
@@ -127,6 +135,7 @@ pub fn main(args: &[String]) {
         home: home_dir(),
         supervisor_cmd,
         supervisor: Mutex::new(None),
+        poke_gen: AtomicU64::new(0),
         supervisor_env,
     });
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
@@ -293,6 +302,11 @@ async fn handle_http(relay: &Arc<Relay>, mut stream: TcpStream, action: HttpActi
         }
         HttpAction::Hold(reason, secs) => {
             relay.hold.lease(&external_reason(&reason), secs);
+            if reason == SUPERVISOR_REASON {
+                // The supervisor holds for itself now: the poke's bridge has
+                // done its job.
+                relay.hold.release(POKE_REASON);
+            }
             b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
         }
         HttpAction::Release(reason) => {
@@ -312,7 +326,18 @@ async fn handle_http(relay: &Arc<Relay>, mut stream: TcpStream, action: HttpActi
 /// fresh one because it is gone.
 fn alive(pid: u32) -> bool {
     // SAFETY: signal 0 only checks for existence/permission, sends nothing.
-    unsafe { libc::kill(pid as i32, 0) == 0 }
+    if unsafe { libc::kill(pid as i32, 0) } != 0 {
+        return false;
+    }
+    // A process that exited but is not yet reaped still takes a signal.
+    !std::fs::read_to_string(format!("/proc/{pid}/stat")).map(|s| is_zombie_stat(&s)).unwrap_or(false)
+}
+
+/// Whether a `/proc/<pid>/stat` line says the process is a zombie. The
+/// command name is in parentheses and may hold anything, so the state is the
+/// first field after the last `)`.
+fn is_zombie_stat(stat: &str) -> bool {
+    stat.rsplit_once(')').and_then(|(_, rest)| rest.trim_start().chars().next()) == Some('Z')
 }
 
 /// Wakes the node's supervisor: if one we started is still running, signal it
@@ -327,19 +352,34 @@ fn alive(pid: u32) -> bool {
 /// one — it lapses on its own (`POKE_BRIDGE_SECS`) unless another poke
 /// arrives to renew it.
 fn poke(relay: &Arc<Relay>) {
-    relay.hold.lease("poke", POKE_BRIDGE_SECS);
-    {
-        let mut sup = relay.supervisor.lock().unwrap();
-        if let Some(pid) = *sup {
-            if alive(pid) {
-                // SAFETY: signalling a process we started ourselves.
-                unsafe { libc::kill(pid as i32, libc::SIGUSR1) };
-                log!("poke: signalled supervisor pid {pid}");
-                return;
-            }
-            *sup = None;
+    relay.hold.lease(POKE_REASON, POKE_BRIDGE_SECS);
+    let gen_now = relay.poke_gen.fetch_add(1, Ordering::SeqCst) + 1;
+    let mut sup = relay.supervisor.lock().unwrap();
+    if let Some((pid, seen)) = sup.as_mut() {
+        if alive(*pid) {
+            // SAFETY: signalling a process we started ourselves.
+            unsafe { libc::kill(*pid as i32, libc::SIGUSR1) };
+            *seen = gen_now;
+            log!("poke: signalled supervisor pid {pid}");
+            return;
         }
+        *sup = None;
     }
+    start_supervisor(relay, &mut sup);
+}
+
+/// Whether a supervisor that has seen `seen` pokes missed one by exiting.
+fn missed_poke(poke_gen: u64, seen: u64) -> bool {
+    poke_gen > seen
+}
+
+/// Starts the supervisor (`supervisor_cmd`) and records it in `sup`, which
+/// the caller holds locked so no second one starts meanwhile. Its exit
+/// releases the holds it and its poke took (a crashed supervisor leaves its
+/// lease behind otherwise), and starts another at once if a poke arrived that
+/// it never saw.
+fn start_supervisor(relay: &Arc<Relay>, sup: &mut Option<(u32, u64)>) {
+    let started_gen = relay.poke_gen.load(Ordering::SeqCst);
     let mut cmd = tokio::process::Command::new("/bin/sh");
     // `exec`, so the pid is the supervisor's own and the next poke's
     // SIGUSR1 reaches it: a shell in between would die of the signal and
@@ -347,10 +387,21 @@ fn poke(relay: &Arc<Relay>) {
     cmd.arg("-c").arg(format!("exec {}", relay.supervisor_cmd));
     cmd.env("HOME", &relay.home);
     cmd.envs(relay.supervisor_env.iter().map(|(k, v)| (k, v)));
+    // An ignored signal stays ignored across `exec`, so a poke that lands
+    // before the supervisor installed its handler is dropped, not fatal
+    // (the default action for SIGUSR1 is to terminate). Its handler replaces
+    // this once installed.
+    // SAFETY: only async-signal-safe `signal` between fork and exec.
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::signal(libc::SIGUSR1, libc::SIG_IGN);
+            Ok(())
+        });
+    }
     match reaper::spawn_tracked(|| cmd.spawn(), |c| c.id()) {
         Ok(mut child) => {
             let pid = child.id().unwrap_or(0);
-            *relay.supervisor.lock().unwrap() = Some(pid);
+            *sup = Some((pid, started_gen));
             log!("poke: started supervisor pid {pid}: {}", relay.supervisor_cmd);
             let relay = relay.clone();
             tokio::spawn(async move {
@@ -360,15 +411,25 @@ fn poke(relay: &Arc<Relay>) {
                 if code != 0 {
                     crate::problem(tod_problems::Level::Warn, &format!("poke: supervisor pid {pid} exited {code}"));
                 }
+                relay.hold.release(POKE_REASON);
+                relay.hold.release(&external_reason(SUPERVISOR_REASON));
                 let mut sup = relay.supervisor.lock().unwrap();
-                if *sup == Some(pid) {
-                    *sup = None;
+                let Some((cur, seen)) = *sup else { return };
+                if cur != pid {
+                    return;
+                }
+                *sup = None;
+                let gen_now = relay.poke_gen.load(Ordering::SeqCst);
+                if missed_poke(gen_now, seen) {
+                    log!("poke: supervisor pid {pid} exited with a poke unanswered; starting another");
+                    relay.hold.lease(POKE_REASON, POKE_BRIDGE_SECS);
+                    start_supervisor(&relay, &mut sup);
                 }
             });
         }
         Err(e) => {
             log!("poke: could not start supervisor: {e}");
-            crate::problem(tod_problems::Level::Error, &format!("poke: could not start supervisor: {e}"));
+            crate::problem_limited(tod_problems::Level::Error, &format!("poke: could not start supervisor: {e}"));
         }
     }
 }
@@ -1082,5 +1143,73 @@ mod abandoned_tests {
         st.client_pending.clear();
         st.agent_pending.insert("2".into());
         assert!(!st.abandoned(Duration::ZERO));
+    }
+
+    #[test]
+    fn zombie_state_is_read_after_the_last_paren() {
+        assert!(is_zombie_stat("123 (sleep) Z 1 123 123 0 -1"));
+        assert!(!is_zombie_stat("123 (sleep) S 1 123 123 0 -1"));
+        assert!(is_zombie_stat("123 (a) Z b) Z 1"));
+        assert!(!is_zombie_stat("123 (a) Z b) S 1"));
+        assert!(!is_zombie_stat(""));
+    }
+
+    #[test]
+    fn a_poke_after_the_supervisor_last_saw_the_count_is_missed() {
+        assert!(!missed_poke(3, 3));
+        assert!(missed_poke(4, 3));
+    }
+
+    fn test_relay(cmd: &str) -> Arc<Relay> {
+        unsafe { std::env::set_var("TOD_PROBLEMS_DIR", std::env::temp_dir().join("tod-relay-test-problems")) };
+        Arc::new(Relay {
+            sessions: Mutex::new(HashMap::new()),
+            agents: Mutex::new(HashMap::new()),
+            tunnel: Arc::new(Tunnel::default()),
+            hold: Hold::new(3600),
+            home: "/tmp".into(),
+            supervisor_cmd: cmd.into(),
+            supervisor: Mutex::new(None),
+            poke_gen: AtomicU64::new(0),
+            supervisor_env: vec![],
+        })
+    }
+
+    fn current_pid(relay: &Relay) -> Option<u32> {
+        relay.supervisor.lock().unwrap().map(|(p, _)| p)
+    }
+
+    /// A signal to a supervisor that has not installed its handler is
+    /// ignored, and a poke the supervisor never saw, arriving as it exits,
+    /// starts the next one.
+    #[test]
+    fn a_poke_in_the_exit_tail_starts_another_supervisor() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let relay = test_relay("sleep 0.6");
+            poke(&relay);
+            let first = current_pid(&relay).expect("started");
+            // Another poke signals the live child (SIG_IGN: it survives).
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            poke(&relay);
+            assert_eq!(current_pid(&relay), Some(first));
+            assert!(alive(first), "SIGUSR1 must not kill a supervisor before its handler is installed");
+            // A poke the child never saw (as in its exit tail): count ahead.
+            relay.poke_gen.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(750)).await;
+            let second = current_pid(&relay).expect("a new supervisor was started");
+            assert_ne!(second, first);
+        });
+    }
+
+    #[test]
+    fn an_exit_with_every_poke_seen_starts_nothing() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let relay = test_relay("sleep 0.3");
+            poke(&relay);
+            tokio::time::sleep(Duration::from_millis(800)).await;
+            assert_eq!(current_pid(&relay), None);
+        });
     }
 }

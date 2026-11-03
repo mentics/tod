@@ -1584,3 +1584,24 @@ fn check_now_in_pr_draft_clears_a_leftover_review_wait_and_ignores_a_bot_reviewe
     assert_eq!(super::check_now(&fx.fleet, fx.node, &fx.root).unwrap(), super::GithubCheck::Clear);
     assert!(pending_specs(&fx).is_empty(), "{:?}", pending_specs(&fx));
 }
+
+#[test]
+fn a_wait_an_agent_wrote_with_spaces_is_cleared_like_the_colon_form() {
+    let fx = bare();
+    for spec in ["github:pr 2810 checks", "github:pr:2811:review", "slack:thread 1"] {
+        fx.fleet
+            .interview(
+                "agent",
+                tod_store::interview::InterviewCommand::RecordWait {
+                    node_id: fx.node,
+                    wait: tod_store::waits::NewWait::event(spec, 1_000),
+                },
+            )
+            .unwrap();
+    }
+    // Written in one spelling, whichever the agent used.
+    assert_eq!(pending_specs(&fx), ["github:pr:2810:checks", "github:pr:2811:review", "slack:thread:1"]);
+
+    autopilot(&fx, Budget::default()).clear_poll_waits(&fx.fleet).unwrap();
+    assert_eq!(pending_specs(&fx), ["slack:thread:1"]);
+}

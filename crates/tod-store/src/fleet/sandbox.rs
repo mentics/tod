@@ -1082,6 +1082,33 @@ pub fn validate_name(name: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn saves_at_once_each_write_a_whole_file_and_leave_no_temp_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(tod_sandbox::config::FILE_NAME);
+        std::thread::scope(|s| {
+            for i in 0..8 {
+                let path = path.clone();
+                s.spawn(move || {
+                    let mut config = tod_sandbox::config::Config::default();
+                    config.upsert(tod_sandbox::config::Sandbox {
+                        name: format!("sb-{i}"),
+                        image: "img".into(),
+                        url: None,
+                        agents: false,
+                    });
+                    for _ in 0..20 {
+                        config.save(&path).unwrap();
+                    }
+                });
+            }
+        });
+        let loaded = tod_sandbox::config::Config::load(&path).unwrap();
+        assert_eq!(loaded.sandboxes.len(), 1);
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(leftovers.len(), 1, "{leftovers:?}");
+    }
+
+    #[test]
     fn the_golden_alias_is_resolved_not_looked_up_as_a_sandbox_name() {
         use super::fork_source_with;
         assert_eq!(

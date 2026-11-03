@@ -1,7 +1,8 @@
 # `tod-agentd`: the resident daemon
 
-Status: **design, not implemented.** Nothing here is built; "Open questions"
-lists what has not been checked against the code.
+Status: built (`crates/tod-agentd`, `crates/tod-agentd-client`). The app starts
+the daemon, and the app and `tod-cli` write through it; "Status and
+deviations" under "Order" says what differs from the design and what is left.
 
 ## The problem
 
@@ -117,6 +118,24 @@ starts `tod`; waits that came due meanwhile fire then.
 
 **`quit`** is a protocol command, as with the agent control socket: drain
 (below), then exit. Anything launched for a test must be stopped this way.
+
+### Lifetime
+
+The daemon also ends itself (`tod_agentd::lifetime`, checked every minute,
+the reason logged at info):
+
+- when its data root directory no longer exists; or
+- when no client (app or `tod-cli`) has been connected for the idle period
+  (6 hours; `TOD_AGENTD_IDLE_SECS` overrides it) **and** no run is in
+  progress **and** it is not serving the database broker. A root whose
+  `sandboxes.toml` declares a `[[database]]` keeps its daemon up while the app
+  is closed: answering a cloud node's `tod-cli db` is that feature
+  (`doc/cloud-sandboxes/database-access.md`). An unreadable `sandboxes.toml`
+  counts as declaring one.
+
+On start the daemon removes the build copies in `<root>/daemon/` other than the
+one it runs from and the 3 newest, and logs each. `agentd.lock` and
+`start.lock` are untouched.
 
 ## Version check
 

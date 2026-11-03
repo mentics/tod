@@ -138,6 +138,20 @@ pub const SYNCED_TABLES: &[&str] = &[
 /// and whose changes its pulls leave out.
 pub const CLIENT_HEADER: &str = "X-Tod-Client";
 
+/// The database broker's polling timings, named once for both ends
+/// (`doc/cloud-sandboxes/database-access.md`). A machine long-polls the
+/// orchestrator for `BROKER_POLL_SECS`, re-issuing at once; a poll's HTTP
+/// timeout is a little above that; a failing poll is retried
+/// `BROKER_POLL_ATTEMPTS` times with pauses of 2 s, 4 s, ... so the orchestrator
+/// counts a machine connected for a poll, the retry pauses, and some slack.
+pub const BROKER_POLL_SECS: u64 = 25;
+pub const BROKER_POLL_TIMEOUT_SECS: u64 = 40;
+pub const BROKER_POLL_ATTEMPTS: u32 = 3;
+/// The longest total pause between the attempts of one poll.
+pub const BROKER_RETRY_PAUSE_SECS: u64 = (1 << 1) + (1 << 2);
+/// How long the orchestrator counts a machine connected after its last contact.
+pub const BROKER_CONNECTED_SECS: u64 = BROKER_POLL_SECS + BROKER_RETRY_PAUSE_SECS + 15;
+
 pub const CREATE_SYNC_TABLES: &str = "
 CREATE TABLE IF NOT EXISTS sync_changes (
     seq      INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -153,6 +167,19 @@ CREATE TABLE IF NOT EXISTS sync_state (
     suppress INTEGER NOT NULL DEFAULT 0
 );
 INSERT OR IGNORE INTO sync_state (id, suppress) VALUES (1, 0);
+-- Changes this side refused to apply (a CHECK or foreign key from a newer
+-- schema, an unknown table), kept so one bad row does not wedge the batch.
+-- Machine-local and not synced; no journey_changes trigger: it is a log about
+-- the sync itself, like sync_changes, not data the user changed.
+CREATE TABLE IF NOT EXISTS sync_rejects (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    seq         INTEGER NOT NULL,
+    tbl         TEXT NOT NULL,
+    row_key     TEXT NOT NULL,
+    op          TEXT NOT NULL,
+    error       TEXT NOT NULL,
+    received_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
 ";
 
 /// One column value, typed as SQLite stores it.
@@ -202,7 +229,16 @@ pub struct Conflict {
 pub struct ApplyReport {
     pub applied: usize,
     pub conflicts: Vec<Conflict>,
+    /// Changes this side refused and skipped (recorded in `sync_rejects`).
+    #[serde(default)]
+    pub rejected: usize,
+    /// The first few reasons, each naming the table and the error.
+    #[serde(default)]
+    pub reject_errors: Vec<String>,
 }
+
+/// How many reject reasons an [`ApplyReport`] carries.
+pub const MAX_REPORTED_REJECTS: usize = 5;
 
 struct TableInfo {
     columns: Vec<String>,
@@ -496,8 +532,28 @@ fn key_clause(key: &Row) -> Result<(String, Vec<Value>)> {
 
 /// The largest `sync_changes.seq` so far (0 when empty): the cursor a copy
 /// seeded from this database starts at.
+///
+/// Read from `sqlite_sequence` as well as the rows: the log is pruned
+/// ([`prune_sent`]) and left out of a snapshot, and its numbering must not
+/// start over (every cursor compares against it).
 pub fn last_seq(conn: &Connection) -> Result<i64> {
-    Ok(conn.query_row("SELECT COALESCE(MAX(seq), 0) FROM sync_changes", [], |r| r.get(0))?)
+    let rows: i64 = conn.query_row("SELECT COALESCE(MAX(seq), 0) FROM sync_changes", [], |r| r.get(0))?;
+    let used: i64 = conn.query_row(
+        "SELECT COALESCE((SELECT seq FROM sqlite_sequence WHERE name = 'sync_changes'), 0)",
+        [],
+        |r| r.get(0),
+    )?;
+    Ok(rows.max(used))
+}
+
+/// Deletes the log entries up to and including `upto`: what a copy has sent
+/// to the other side and had accepted. Nothing reads a sent entry again (a
+/// conflict is judged on the receiving side from the entry it was sent, and a
+/// snapshot leaves the log out), and each carries the whole old row, so kept
+/// they are most of the database. Numbering continues ([`last_seq`]).
+/// Returns how many were deleted.
+pub fn prune_sent(conn: &Connection, upto: i64) -> Result<usize> {
+    Ok(conn.execute("DELETE FROM sync_changes WHERE seq <= ?1", [upto])?)
 }
 
 /// Every row changed after `after`, one [`Change`] per row with its current
@@ -611,6 +667,76 @@ pub fn apply_changes_confined(
     apply_changes_with(conn, changes, Some(origin), Some(node))
 }
 
+/// One change, applied inside its own savepoint by [`apply_changes_with`].
+fn apply_one(
+    tx: &Connection,
+    change: &Change,
+    rest: &[Change],
+    infos: &mut HashMap<String, TableInfo>,
+    parked: &mut Vec<(String, Row)>,
+    report: &mut ApplyReport,
+) -> Result<()> {
+    if !SYNCED_TABLES.contains(&change.table.as_str()) {
+        bail!("refusing to apply a change to unsynced table {}", change.table);
+    }
+    if !infos.contains_key(&change.table) {
+        let Some(info) = table_info(&tx, &change.table)? else {
+            return Ok(()); // a table this side does not have yet
+        };
+        infos.insert(change.table.clone(), info);
+    }
+    let info = &infos[&change.table];
+    let found = current_row(&tx, &change.table, info, &change.key)?;
+    let was_parked = parked.iter().any(|(t, k)| *t == change.table && *k == change.key);
+    if !was_parked && !same_content(&found, &change.before) && !same_content(&found, &change.after) {
+        report.conflicts.push(Conflict {
+            node_id: change.node_id,
+            table: change.table.clone(),
+            key: change.key.clone(),
+            expected: change.before.clone(),
+            found: found.clone(),
+        });
+    }
+    if found == change.after {
+        return Ok(());
+    }
+    let (clause, key_values) = key_clause(&change.key)?;
+    let qt = quote(&change.table);
+    match &change.after {
+        None => {
+            tx.execute(&format!("DELETE FROM {qt} WHERE {clause}"), params_from_iter(key_values))?;
+        }
+        Some(row) => {
+            evict_unique_holders(tx, change, rest, info, row, parked, report)?;
+            let cols: Vec<(&String, &SqlValue)> = row
+                .iter()
+                .filter(|(c, _)| info.columns.contains(c))
+                .collect();
+            let mut values: Vec<Value> =
+                cols.iter().map(|(_, v)| to_sql(v)).collect::<Result<_>>()?;
+            // A row that never updates (a trigger refuses it) is replaced.
+            if found.is_some() && change.table == "learn_outputs" {
+                tx.execute(&format!("DELETE FROM {qt} WHERE {clause}"), params_from_iter(key_values.clone()))?;
+            }
+            if found.is_some() && change.table != "learn_outputs" {
+                let set = cols
+                    .iter()
+                    .map(|(c, _)| format!("{} = ?", quote(c)))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                values.extend(key_values);
+                tx.execute(&format!("UPDATE {qt} SET {set} WHERE {clause}"), params_from_iter(values))?;
+            } else {
+                let names = cols.iter().map(|(c, _)| quote(c)).collect::<Vec<_>>().join(", ");
+                let marks = vec!["?"; cols.len()].join(", ");
+                tx.execute(&format!("INSERT INTO {qt} ({names}) VALUES ({marks})"), params_from_iter(values))?;
+            }
+        }
+    }
+    report.applied += 1;
+    Ok(())
+}
+
 fn apply_changes_with(
     conn: &mut Connection,
     changes: &[Change],
@@ -634,64 +760,33 @@ fn apply_changes_with(
     // this batch sets for good ([`evict_unique_holders`]).
     let mut parked: Vec<(String, Row)> = Vec::new();
     for (at, change) in changes.iter().enumerate() {
-        if !SYNCED_TABLES.contains(&change.table.as_str()) {
-            bail!("refusing to apply a change to unsynced table {}", change.table);
-        }
-        if !infos.contains_key(&change.table) {
-            let Some(info) = table_info(&tx, &change.table)? else {
-                continue; // a table this side does not have yet
-            };
-            infos.insert(change.table.clone(), info);
-        }
-        let info = &infos[&change.table];
-        let found = current_row(&tx, &change.table, info, &change.key)?;
-        let was_parked = parked.iter().any(|(t, k)| *t == change.table && *k == change.key);
-        if !was_parked && !same_content(&found, &change.before) && !same_content(&found, &change.after) {
-            report.conflicts.push(Conflict {
-                node_id: change.node_id,
-                table: change.table.clone(),
-                key: change.key.clone(),
-                expected: change.before.clone(),
-                found: found.clone(),
-            });
-        }
-        if found == change.after {
-            continue;
-        }
-        let (clause, key_values) = key_clause(&change.key)?;
-        let qt = quote(&change.table);
-        match &change.after {
-            None => {
-                tx.execute(&format!("DELETE FROM {qt} WHERE {clause}"), params_from_iter(key_values))?;
-            }
-            Some(row) => {
-                evict_unique_holders(&tx, change, &changes[at + 1..], info, row, &mut parked, &mut report)?;
-                let cols: Vec<(&String, &SqlValue)> = row
-                    .iter()
-                    .filter(|(c, _)| info.columns.contains(c))
-                    .collect();
-                let mut values: Vec<Value> =
-                    cols.iter().map(|(_, v)| to_sql(v)).collect::<Result<_>>()?;
-                // A row that never updates (a trigger refuses it) is replaced.
-                if found.is_some() && change.table == "learn_outputs" {
-                    tx.execute(&format!("DELETE FROM {qt} WHERE {clause}"), params_from_iter(key_values.clone()))?;
-                }
-                if found.is_some() && change.table != "learn_outputs" {
-                    let set = cols
-                        .iter()
-                        .map(|(c, _)| format!("{} = ?", quote(c)))
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    values.extend(key_values);
-                    tx.execute(&format!("UPDATE {qt} SET {set} WHERE {clause}"), params_from_iter(values))?;
-                } else {
-                    let names = cols.iter().map(|(c, _)| quote(c)).collect::<Vec<_>>().join(", ");
-                    let marks = vec!["?"; cols.len()].join(", ");
-                    tx.execute(&format!("INSERT INTO {qt} ({names}) VALUES ({marks})"), params_from_iter(values))?;
+        tx.execute_batch("SAVEPOINT sync_change")?;
+        let conflicts_before = report.conflicts.len();
+        let applied_before = report.applied;
+        let result = apply_one(&tx, change, &changes[at + 1..], &mut infos, &mut parked, &mut report);
+        match result {
+            Ok(()) => tx.execute_batch("RELEASE sync_change")?,
+            Err(err) => {
+                tx.execute_batch("ROLLBACK TO sync_change; RELEASE sync_change")?;
+                report.conflicts.truncate(conflicts_before);
+                report.applied = applied_before;
+                let error = format!("{err:#}");
+                let op = match (&change.before, &change.after) {
+                    (_, None) => "delete",
+                    (None, _) => "insert",
+                    _ => "update",
+                };
+                let key = serde_json::to_string(&change.key).unwrap_or_default();
+                tx.execute(
+                    "INSERT INTO sync_rejects (seq, tbl, row_key, op, error) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    rusqlite::params![change.seq, change.table, key, op, error],
+                )?;
+                report.rejected += 1;
+                if report.reject_errors.len() < MAX_REPORTED_REJECTS {
+                    report.reject_errors.push(format!("{}: {error}", change.table));
                 }
             }
         }
-        report.applied += 1;
     }
     drop_orphans(&tx, &mut report)?;
     if let Some((node, mut allowed, deletes)) = confinement {
@@ -877,12 +972,28 @@ fn drop_orphans(tx: &Connection, report: &mut ApplyReport) -> Result<()> {
     bail!("could not resolve foreign key violations while applying sync changes")
 }
 
-/// Copies the whole database at `db` to `to` (SQLite online backup), for
-/// seeding another copy. The copy's [`last_seq`] is the cursor to export from.
+/// Copies the database at `db` to `to` (SQLite online backup), for seeding
+/// another copy, without its change log (`sync_changes`: a copy starts with
+/// nothing to send, and the entries are the old rows of every change made).
+/// The copy's [`last_seq`] is the cursor to export from.
 /// One step, not the paced backup: the orchestrator takes it under the
 /// user's sync lock while a node's supervisor waits to start.
 pub fn snapshot(db: &Path, to: &Path) -> Result<()> {
-    crate::fleet::schema::copy_database(db, to)
+    crate::fleet::schema::copy_database(db, to)?;
+    let conn = Connection::open(to).with_context(|| format!("open the snapshot {}", to.display()))?;
+    // A database that never had sync installed has no log to leave out. The
+    // numbering stays in `sqlite_sequence`, so `last_seq` is unchanged.
+    let has_log: bool = conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sync_changes')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !has_log {
+        return Ok(());
+    }
+    conn.execute_batch("DELETE FROM sync_changes; DROP TABLE IF EXISTS sync_rejects; VACUUM;")
+        .context("leave the change log out of the snapshot")?;
+    Ok(())
 }
 
 /// Replaces the database at `db` with the snapshot at `from` (in one step,

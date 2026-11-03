@@ -227,18 +227,96 @@ fn waits_now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-fn budget_question(limit: &BudgetLimit) -> String {
-    let spent = match limit {
-        BudgetLimit::Sessions { used } => format!("{used} agent sessions"),
-        BudgetLimit::Time { elapsed_secs } => format!("{:.1} hours of work", *elapsed_secs as f64 / 3600.0),
-    };
-    format!("This node has spent its budget ({spent}) without finishing. Keep going?")
+/// Hours for a sentence: "16", "1.5".
+fn fmt_hours(h: f64) -> String {
+    if (h - h.round()).abs() < 0.05 { format!("{}", h.round() as u64) } else { format!("{h:.1}") }
+}
+
+fn hours(d: Duration) -> String {
+    fmt_hours(d.as_secs_f64() / 3600.0)
+}
+
+/// What the node spent of `budget` when `limit` stopped it.
+fn budget_spent(limit: &BudgetLimit, budget: &Budget) -> (u32, f64) {
+    match limit {
+        BudgetLimit::Sessions { used } => (*used, budget.max_duration.as_secs_f64() / 3600.0),
+        BudgetLimit::Time { elapsed_secs } => (budget.max_sessions, *elapsed_secs as f64 / 3600.0),
+    }
+}
+
+fn budget_question(limit: &BudgetLimit, budget: &Budget) -> String {
+    let (sessions, spent_hours) = budget_spent(limit, budget);
+    let spent_hours = fmt_hours(spent_hours);
+    format!(
+        "Used {sessions} of {} sessions ({spent_hours} of {} hours). Keep going gives it {} more sessions \
+         and {} more hours. Leave it stopped keeps it stopped until you change this answer.",
+        budget.max_sessions,
+        hours(budget.max_duration),
+        budget.max_sessions,
+        hours(budget.max_duration),
+    )
+}
+
+/// Why a wake that ended with `outcome` leaves the node needing someone, in
+/// plain words, for the app to show (`cloud_activity.stopped`); `None` when
+/// it does not: the node is done, waits on something outside (its wait row
+/// says what), or stopped for a request the user answers where requests are
+/// answered (which the app reads from the request itself, and which would be
+/// stale once answered). Every variant is named, so a new one is a compile
+/// error here, not a node that reads as "not started".
+pub fn stop_reason(outcome: &Outcome, budget: &Budget) -> Option<String> {
+    match outcome {
+        Outcome::Done | Outcome::Waiting { .. } => None,
+        // The hook stops for a wait as "waiting: ..."; a usage limit is a
+        // wait the supervisor recorded and scheduled.
+        Outcome::Stopped { reason } if reason.starts_with("waiting") || reason.starts_with("usage limit: waiting") => None,
+        Outcome::Stopped { reason } => Some(format!("the supervisor stopped: {reason}")),
+        Outcome::BudgetExhausted { limit } => {
+            let (sessions, spent_hours) = budget_spent(limit, budget);
+            Some(format!(
+                "its budget is spent ({sessions} of {} sessions, {} of {} hours). \
+                 Answer the budget question \"{}\" to give it more.",
+                budget.max_sessions,
+                fmt_hours(spent_hours),
+                hours(budget.max_duration),
+                tod_core::stop_questions::KEEP_GOING,
+            ))
+        }
+        Outcome::NeedsHuman { reason } => match reason {
+            // Requests: shown from the request itself.
+            NeedsHuman::Decision { .. }
+            | NeedsHuman::BlockedSteps { .. }
+            | NeedsHuman::FailingCriteria { .. }
+            | NeedsHuman::GateNotPassed { .. } => None,
+            NeedsHuman::NoPlan
+            | NeedsHuman::EvaluationStuck { .. }
+            | NeedsHuman::PrBlocked { .. }
+            | NeedsHuman::PrStuck { .. }
+            | NeedsHuman::Permission { .. }
+            | NeedsHuman::AgentFailed { .. }
+            | NeedsHuman::NoProgress { .. } => Some(reason.describe()),
+        },
+    }
+}
+
+/// The reason a wake that ended with `woke` leaves in the beat.
+fn woke_reason(woke: &Woke, budget: &Budget) -> Option<String> {
+    match woke {
+        Woke::StillWaiting(_) => None,
+        Woke::LeftStopped(reason) => Some(reason.clone()),
+        Woke::Ran(outcome) => stop_reason(outcome, budget),
+    }
 }
 
 /// Asks the user through a pending decision on the node, as an agent's
 /// `ask` would; the next wake stops on it until it is answered. Not again
 /// while an earlier one is unanswered.
 fn ask(store: &FleetStore, node: Uuid, conversation: Option<Uuid>, kind: &str, question: String) -> Result<()> {
+    let options = if kind == tod_core::stop_questions::CONFIG {
+        tod_core::stop_questions::CONFIG_OPTIONS
+    } else {
+        tod_core::stop_questions::SUPERVISOR_OPTIONS
+    };
     if answers::still_asking(store, node)? {
         tracing::info!(%question, "already asked; still waiting on the answer");
         return Ok(());
@@ -253,7 +331,7 @@ fn ask(store: &FleetStore, node: Uuid, conversation: Option<Uuid>, kind: &str, q
                 protocol: Some(kind.to_string()),
                 decision: tod_store::decisions::NewDecision {
                     question,
-                    options: tod_core::stop_questions::SUPERVISOR_OPTIONS.iter().map(|o| o.to_string()).collect(),
+                    options: options.iter().map(|o| o.to_string()).collect(),
                     evidence: Vec::new(),
                     ..Default::default()
                 },
@@ -293,6 +371,17 @@ pub fn wake(config: Config) -> Result<Woke> {
     // not go to standby mid-seed. Released when the wake returns, including
     // when it finds nothing to do.
     let hold = HoldGuard::take(config.holder.clone());
+    // Say so before anything slow: seeding a new copy and restoring
+    // transcripts can take minutes, and the app waits `SUPERVISOR_REPORTS_WITHIN`
+    // for a first word. The local copy does not exist yet to record it in, so
+    // this goes straight to the orchestrator as the node's `cloud_activity`
+    // row (`Orchestrator::push_starting_beat`); the copy is seeded with it.
+    // A failure is a warning, not a stop: the first beat recorded in the copy
+    // repeats the request and fails the wake with the real reason if the
+    // orchestrator cannot be reached.
+    if let Err(err) = config.orchestrator.push_starting_beat(config.node, waits_now_ms()) {
+        tracing::warn!("the starting heartbeat could not be sent: {err:#}");
+    }
     let replica = phase("open the local copy (seeding it from the orchestrator when new)", began, || {
         Replica::open(&config.state_dir, config.orchestrator.clone(), config.node, &config.workspace)
     })?;
@@ -300,8 +389,18 @@ pub fn wake(config: Config) -> Result<Woke> {
     let store = replica.lock().unwrap_or_else(|e| e.into_inner()).store().clone();
     phase("pull the orchestrator's changes", began, || replica.lock().unwrap_or_else(|e| e.into_inner()).pull())?;
 
-    let budget = match answers::before_wake(&store, config.node, &config.state_dir, config.budget)? {
+    let budget = match answers::before_wake_with(
+        &store,
+        config.node,
+        &config.state_dir,
+        config.budget,
+        fresh_requested(&config.state_dir),
+    )? {
         answers::Before::LeaveStopped(reason) => {
+            // Say so, as a wait does below: the app waits to hear from a
+            // supervisor it woke, and a wake that leaves the node stopped is
+            // an answer, not silence.
+            replica.lock().unwrap_or_else(|e| e.into_inner()).end_cloud_beat(config.node, Some(&reason))?;
             tracing::info!(%reason, "left stopped; going back to sleep");
             return Ok(Woke::LeftStopped(reason));
         }
@@ -322,7 +421,7 @@ pub fn wake(config: Config) -> Result<Woke> {
         // Say so: the app waits to hear from a supervisor it started (a
         // reinstall, "Check now"), and a wake that finds nothing due is an
         // answer, not silence.
-        replica.lock().unwrap_or_else(|e| e.into_inner()).end_cloud_beat(config.node)?;
+        replica.lock().unwrap_or_else(|e| e.into_inner()).end_cloud_beat(config.node, None)?;
         tracing::info!(%reason, "still waiting; going back to sleep");
         return Ok(Woke::StillWaiting(reason));
     }
@@ -405,6 +504,23 @@ pub fn wake(config: Config) -> Result<Woke> {
                 match &outcome {
                     Outcome::NeedsHuman { reason: NeedsHuman::AgentFailed { error } } => {
                         let done = pilot.state().steps.len();
+                        if tod_core::skills_context::is_missing_skill(error) {
+                            // Configuration, not a flaky agent: not counted,
+                            // not retried.
+                            tracing::warn!(%error, "a configured skill is missing; stopping");
+                            ask(
+                                &store,
+                                config.node,
+                                current,
+                                tod_core::stop_questions::CONFIG,
+                                format!(
+                                    "The lifecycle configuration cannot be used: {error}. Fix it (add the skill \
+                                     to the repository or the home directory, or correct the lifecycle config), \
+                                     then try again."
+                                ),
+                            )?;
+                            break Ok(outcome);
+                        }
                         if done > steps_at_failure {
                             failures = 0;
                         }
@@ -420,6 +536,7 @@ pub fn wake(config: Config) -> Result<Woke> {
                                 tracing::warn!(failures, %error, "the agent failed; running the step again");
                                 continue;
                             }
+                            OnFailure::Config => unreachable!("a missing skill is handled before counting"),
                             OnFailure::Ask => {
                                 ask(
                                     &store,
@@ -435,7 +552,7 @@ pub fn wake(config: Config) -> Result<Woke> {
                         }
                     }
                     Outcome::BudgetExhausted { limit } => {
-                        ask(&store, config.node, current, tod_core::stop_questions::BUDGET, budget_question(limit))?;
+                        ask(&store, config.node, current, tod_core::stop_questions::BUDGET, budget_question(limit, &budget))?;
                         break Ok(outcome);
                     }
                     _ => break Ok(outcome),
@@ -452,7 +569,11 @@ pub fn wake(config: Config) -> Result<Woke> {
 
     // Whatever happened, leave the orchestrator and the branch with it. The
     // heartbeat ends first, so that the push below carries the run's end.
-    let ended = beating.finish();
+    let stopped = match &run {
+        Ok(outcome) => woke_reason(&Woke::Ran(outcome.clone()), &budget),
+        Err(err) => Some(format!("the supervisor failed: {err:#}")),
+    };
+    let ended = beating.finish(stopped);
     let pushed = replica.lock().unwrap_or_else(|e| e.into_inner()).push();
     if config.push_branch
         && let Err(err) = git::push_branch(&config.workspace)
@@ -472,4 +593,79 @@ pub fn wake(config: Config) -> Result<Woke> {
     drop(agent);
     drop(hold);
     Ok(Woke::Ran(outcome))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn budget() -> Budget {
+        Budget { max_sessions: 60, max_duration: Duration::from_secs(16 * 3600) }
+    }
+
+    #[test]
+    fn every_outcome_that_leaves_the_node_needing_someone_leaves_its_reason() {
+        let reason = |o: Outcome| stop_reason(&o, &budget());
+        assert_eq!(reason(Outcome::Done), None);
+        assert_eq!(reason(Outcome::Waiting { what: "checks".into(), due_at_ms: 1 }), None);
+        // A wait the hook stopped for, and a usage limit (a wait of its own).
+        assert_eq!(reason(Outcome::Stopped { reason: "waiting: a review".into() }), None);
+        assert_eq!(reason(Outcome::Stopped { reason: usage_limit_reason(&usage_limit::UsageLimit { reset_at_ms: 5, parsed: true }) }), None);
+        assert_eq!(
+            reason(Outcome::Stopped { reason: "the user paused it".into() }).as_deref(),
+            Some("the supervisor stopped: the user paused it")
+        );
+        let spent = reason(Outcome::BudgetExhausted { limit: BudgetLimit::Sessions { used: 60 } }).unwrap();
+        assert!(spent.contains("60 of 60 sessions") && spent.contains("16 hours") && spent.contains("Keep going"), "{spent}");
+        let timed = reason(Outcome::BudgetExhausted { limit: BudgetLimit::Time { elapsed_secs: 16 * 3600 } }).unwrap();
+        assert!(timed.contains("60 of 60 sessions") && timed.contains("16 of 16 hours"), "{timed}");
+        // Requests are shown from the request itself, and stale once answered.
+        for needs in [
+            NeedsHuman::Decision { pending: 1 },
+            NeedsHuman::BlockedSteps { count: 1 },
+            NeedsHuman::FailingCriteria { criteria: vec!["tests".into()] },
+            NeedsHuman::GateNotPassed { result: "fail".into(), summary: "s".into() },
+        ] {
+            assert_eq!(reason(Outcome::NeedsHuman { reason: needs.clone() }), None, "{needs:?}");
+        }
+        for needs in [
+            NeedsHuman::NoPlan,
+            NeedsHuman::EvaluationStuck { fixes: vec!["f".into()] },
+            NeedsHuman::PrBlocked { why: "conflict".into() },
+            NeedsHuman::PrStuck { why: "threads".into() },
+            NeedsHuman::Permission { title: "Write x".into() },
+            NeedsHuman::AgentFailed { error: "boom".into() },
+            NeedsHuman::NoProgress { step: "fix_failed".into() },
+        ] {
+            let text = reason(Outcome::NeedsHuman { reason: needs.clone() }).expect("a reason");
+            assert_eq!(text, needs.describe());
+            assert!(!text.contains("fix_failed") && !text.contains("_"), "internal names leak: {text}");
+        }
+    }
+
+    #[test]
+    fn a_wake_that_only_waited_leaves_no_reason_and_one_that_left_it_stopped_does() {
+        assert_eq!(woke_reason(&Woke::StillWaiting("a review".into()), &budget()), None);
+        assert_eq!(
+            woke_reason(&Woke::LeftStopped("left stopped: you answered".into()), &budget()).as_deref(),
+            Some("left stopped: you answered")
+        );
+    }
+
+    #[test]
+    fn the_budget_question_says_what_was_used_and_what_each_answer_does() {
+        let q = budget_question(&BudgetLimit::Sessions { used: 60 }, &budget());
+        assert_eq!(
+            q,
+            "Used 60 of 60 sessions (16 of 16 hours). Keep going gives it 60 more sessions and 16 more hours. \
+             Leave it stopped keeps it stopped until you change this answer."
+        );
+        let q = budget_question(&BudgetLimit::Time { elapsed_secs: 16 * 3600 + 600 }, &budget());
+        assert!(q.starts_with("Used 60 of 60 sessions (16.2 of 16 hours)."), "{q}");
+    }
+
+    #[test]
+    fn the_default_budget_is_sixty_sessions_and_sixteen_hours() {
+        assert_eq!(Budget::default(), budget());
+    }
 }

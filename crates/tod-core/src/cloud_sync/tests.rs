@@ -3,6 +3,25 @@ use std::net::TcpListener;
 use tod_store::outline::OutlineMutation;
 
 #[test]
+fn a_failed_provisioning_deletes_the_sandbox_it_made_and_says_so() {
+    let mut deleted = 0;
+    let err = discard_failed_sandbox(anyhow!("checking out b failed"), "node-x", &mut || {
+        deleted += 1;
+        Ok(())
+    });
+    assert_eq!(deleted, 1);
+    let msg = format!("{err:#}");
+    assert!(msg.contains("node-x was deleted") && msg.contains("checking out b failed"), "{msg}");
+}
+
+#[test]
+fn a_failed_delete_of_a_failed_sandbox_is_part_of_the_error() {
+    let err = discard_failed_sandbox(anyhow!("probe failed"), "node-x", &mut || Err(anyhow!("503 from Blaxel")));
+    let msg = format!("{err:#}");
+    assert!(msg.contains("could not be deleted") && msg.contains("503 from Blaxel") && msg.contains("probe failed"), "{msg}");
+}
+
+#[test]
 fn user_names_are_what_the_orchestrator_accepts() {
     assert_eq!(user_name("Joel Shellman").as_deref(), Some("joel-shellman"));
     assert_eq!(user_name("..-alice").as_deref(), Some("alice"));
@@ -418,7 +437,7 @@ fn a_nodes_problem_reaches_the_apps_log_on_a_sync_and_only_once() {
 }
 
 #[test]
-fn a_cloud_node_is_working_only_when_it_waits_on_nothing() {
+fn a_cloud_node_is_working_only_while_its_supervisor_is_beating() {
     use tod_store::interview::InterviewCommand;
     use tod_store::waits::NewWait;
     let root = temp_root("cloud-working");
@@ -457,17 +476,40 @@ fn a_cloud_node_is_working_only_when_it_waits_on_nothing() {
             .unwrap();
     }
     fleet.writer().flush().unwrap();
-    assert_eq!(working_in_cloud(&fleet).unwrap().len(), 2, "assigned and waiting on nothing");
+    assert!(
+        working_in_cloud(&fleet).unwrap().is_empty(),
+        "assigned to the cloud and waiting on nothing is not working: nothing proves a supervisor is at it"
+    );
 
+    // A live heartbeat is what makes a node working.
+    let db = connect(fleet.paths().db()).unwrap();
+    let now = tod_store::outline::uuid_blob::now_ms();
+    tod_store::cloud_activity::beat(&db, ids[0], "active", now).unwrap();
+    fleet.reload_if_stale().unwrap();
+    let working = working_in_cloud(&fleet).unwrap();
+    assert_eq!(working.iter().map(|w| w.node_id).collect::<Vec<_>>(), vec![ids[0]]);
+
+    // A wake that ended stopped, a heartbeat that went stale, and a node that
+    // only waits are none of them working.
+    tod_store::cloud_activity::idle_stopped(&db, ids[0], Some("budget spent"), now).unwrap();
+    tod_store::cloud_activity::beat(&db, ids[1], "active", now - 10 * tod_store::cloud_activity::STALE_AFTER_MS).unwrap();
+    fleet.reload_if_stale().unwrap();
+    assert!(working_in_cloud(&fleet).unwrap().is_empty());
+    tod_store::cloud_activity::beat(&db, ids[1], "active", now).unwrap();
     fleet
         .interview(
             "test",
-            InterviewCommand::RecordWait { node_id: ids[1], wait: NewWait::event("github:pr 1 checks", tod_store::outline::uuid_blob::now_ms() + 86_400_000) },
+            InterviewCommand::RecordWait { node_id: ids[1], wait: NewWait::event("github:pr 1 checks", now + 86_400_000) },
         )
         .unwrap();
     fleet.writer().flush().unwrap();
-    let working = working_in_cloud(&fleet).unwrap();
-    assert_eq!(working.iter().map(|w| w.node_id).collect::<Vec<_>>(), vec![ids[0]]);
+    fleet.reload_if_stale().unwrap();
+    assert_eq!(
+        working_in_cloud(&fleet).unwrap().iter().map(|w| w.node_id).collect::<Vec<_>>(),
+        vec![ids[1]],
+        "a live heartbeat beats a pending wait, as it does for the tree's status"
+    );
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -577,14 +619,15 @@ fn an_orchestrator_that_lost_its_data_is_seeded_again() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// Another copy of the app seeds the orchestrator, replacing its database.
-/// The next sync sees a seeding this copy was not sent to, and seeds the
-/// orchestrator with this database again, so its rows are back there.
+/// Another copy of the app seeds the orchestrator, replacing its database
+/// (only by taking it over: without that, the orchestrator refuses). The next
+/// sync sees a seeding this copy was not sent to, and seeds the orchestrator
+/// with this database again (this copy's take-over), so its rows are back there.
 #[test]
 fn an_orchestrator_seeded_by_another_copy_is_seeded_with_this_one_again() {
     let base = temp_root("orch-other");
     let url = start_orchestrator(&base);
-    let orch = HttpOrchestrator::new(url, None).with_client("app-test");
+    let orch = HttpOrchestrator::new(url.clone(), None).with_client("app-test");
     let root = temp_root("app-other");
     let app = FleetStore::open(&root).unwrap();
     add_list(&app, "first");
@@ -599,13 +642,22 @@ fn an_orchestrator_seeded_by_another_copy_is_seeded_with_this_one_again() {
     add_list(&other, "elsewhere");
     let snap = other_root.join("snap.db");
     sync::snapshot(other.paths().db(), &snap).unwrap();
-    orch.seed("alice", &std::fs::read(&snap).unwrap()).unwrap();
+    // Another client is refused unless the user chose to take over.
+    let other_orch = HttpOrchestrator::new(url.clone(), None).with_client("app-other");
+    let err = other_orch.seed("alice", &std::fs::read(&snap).unwrap()).err().expect("refused");
+    assert!(format!("{err:#}").contains("app-test"), "{err:#}");
+    other_orch.with_take_over(true).seed("alice", &std::fs::read(&snap).unwrap()).unwrap();
     let user_root = base.join("users").join("alice");
     assert_eq!(lists_in(&user_root.join("tod.db")), vec!["elsewhere".to_string()]);
 
     // Nothing changed here, but the orchestrator is on another seeding:
     // the app seeds it again, with its own database.
     add_list(&app, "second");
+    // Refused while this copy has not taken over, with the error naming who seeded.
+    let err = sync(&app, &root, &orch, "alice").unwrap_err();
+    assert!(format!("{err:#}").contains("app-other"), "{err:#}");
+    assert_eq!(lists_in(&user_root.join("tod.db")), vec!["elsewhere".to_string()]);
+    let orch = HttpOrchestrator::new(url.clone(), None).with_client("app-test").with_take_over(true);
     let report = sync(&app, &root, &orch, "alice").unwrap();
     assert!(report.seeded, "{report:?}");
     assert_eq!(lists_in(&user_root.join("tod.db")), lists(&app));
@@ -614,4 +666,146 @@ fn an_orchestrator_seeded_by_another_copy_is_seeded_with_this_one_again() {
     let _ = std::fs::remove_dir_all(&base);
     let _ = std::fs::remove_dir_all(&root);
     let _ = std::fs::remove_dir_all(&other_root);
+}
+
+#[test]
+fn running_a_node_answers_a_stop_answer_to_continue() {
+    use crate::stop_questions::{self, Answer};
+    use tod_store::decisions::NewDecision;
+    let root = temp_root("run-over-stop");
+    let app = FleetStore::open(&root).unwrap();
+    add_list(&app, "t");
+    let list_id = app.list_outline_lists().unwrap()[0].id;
+    let node = uuid::Uuid::new_v4();
+    app.enqueue_outline(OutlineMutation::CreateNode {
+        node_id: Some(node),
+        list_id,
+        parent_id: None,
+        anchor_id: None,
+        position: tod_store::outline::CreatePosition::Below,
+        title: "n".into(),
+    })
+    .unwrap();
+    app.writer().flush().unwrap();
+    let latest = |app: &FleetStore| app.read(|c| stop_questions::latest(c, node)).unwrap().unwrap();
+    // No question: nothing to answer.
+    assert_eq!(continue_over_stop_answer(&app, &node.to_string()).unwrap(), None);
+    app.interview(
+        tod_store::interview::ACTOR_AGENT,
+        tod_store::interview::InterviewCommand::AskDecision {
+            node_id: node,
+            conversation_id: None,
+            protocol: Some(stop_questions::BUDGET.into()),
+            decision: NewDecision {
+                question: "Keep going?".into(),
+                options: stop_questions::SUPERVISOR_OPTIONS.iter().map(|o| o.to_string()).collect(),
+                evidence: Vec::new(),
+                ..Default::default()
+            },
+        },
+    )
+    .unwrap();
+    let id = latest(&app).decision;
+    // Pending is left alone.
+    assert_eq!(continue_over_stop_answer(&app, &node.to_string()).unwrap(), None);
+    app.interview(
+        tod_store::interview::ACTOR_USER,
+        tod_store::interview::InterviewCommand::AnswerDecision { decision_id: id, option: Some(2), text: None },
+    )
+    .unwrap();
+    assert_eq!(latest(&app).answer, Answer::Stop);
+    assert_eq!(continue_over_stop_answer(&app, &node.to_string()).unwrap(), Some(id));
+    assert_eq!(latest(&app).answer, Answer::Continue);
+    // Answered to continue already: nothing more.
+    assert_eq!(continue_over_stop_answer(&app, &node.to_string()).unwrap(), None);
+}
+
+/// What the orchestrator accepted is dropped from the app's outbox (each
+/// entry holds a whole old row), and the numbering goes on: the next change
+/// is still sent, and nothing already sent is sent again.
+#[test]
+fn what_was_sent_is_pruned_from_the_outbox_and_later_changes_still_go() {
+    let base = temp_root("orch-prune");
+    let orch = HttpOrchestrator::new(start_orchestrator(&base), None);
+    let remote_db = base.join("users").join("alice").join("tod.db");
+    let root = temp_root("app-prune");
+    let app = FleetStore::open(&root).unwrap();
+    let log = |app: &FleetStore| -> i64 {
+        connect(app.paths().db())
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM sync_changes", [], |r| r.get(0))
+            .unwrap()
+    };
+    add_list(&app, "first");
+    sync(&app, &root, &orch, "alice").unwrap();
+    assert_eq!(log(&app), 0, "the seeding covered everything");
+
+    add_list(&app, "second");
+    assert!(log(&app) > 0);
+    let before = sync::last_seq(&connect(app.paths().db()).unwrap()).unwrap();
+    let report = sync(&app, &root, &orch, "alice").unwrap();
+    assert!(report.sent >= 1, "{report:?}");
+    assert_eq!(log(&app), 0, "what was sent is pruned");
+    assert_eq!(CloudSyncState::load(&root).unwrap().sent_after, before);
+    assert_eq!(sync::last_seq(&connect(app.paths().db()).unwrap()).unwrap(), before);
+
+    add_list(&app, "third");
+    let report = sync(&app, &root, &orch, "alice").unwrap();
+    assert!(report.sent >= 1, "{report:?}");
+    assert!(lists_in(&remote_db).contains(&"third".to_string()));
+    let quiet = sync(&app, &root, &orch, "alice").unwrap();
+    assert_eq!((quiet.sent, quiet.received), (0, 0), "{quiet:?}");
+
+    drop(app);
+    for r in [root, base] {
+        let _ = std::fs::remove_dir_all(r);
+    }
+}
+
+fn info_with(status: &str, state: Option<&str>) -> tod_sandbox::blaxel::SandboxInfo {
+    tod_sandbox::blaxel::SandboxInfo {
+        name: "tod-x".into(),
+        status: status.into(),
+        state: state.map(str::to_string),
+        url: None,
+        image: String::new(),
+        labels: Vec::new(),
+        volumes: Vec::new(),
+        node_env: Vec::new(),
+    }
+}
+
+#[test]
+fn a_sandbox_is_dead_by_its_state_as_well_as_its_status() {
+    assert!(!sandbox_is_dead(&info_with("DEPLOYED", None)));
+    assert!(!sandbox_is_dead(&info_with("DEPLOYED", Some("STANDBY"))));
+    assert!(!sandbox_is_dead(&info_with("DEPLOYED", Some("RUNNING"))));
+    for status in ["FAILED", "terminated", "DELETING", "DELETED"] {
+        assert!(sandbox_is_dead(&info_with(status, None)), "{status}");
+    }
+    for state in ["TERMINATED", "DELETING", "FAILED", "expired"] {
+        let info = info_with("DEPLOYED", Some(state));
+        assert!(sandbox_is_dead(&info), "{state}");
+        assert!(sandbox_dead_reason(&info).unwrap().contains(state));
+    }
+}
+
+/// A change the orchestrator refused is raised once per distinct error, as an
+/// error the user sees, with the orchestrator-is-older hint.
+#[test]
+fn rejected_changes_are_raised_once_per_distinct_error() {
+    use crate::logging::buffer::{self, Level3, LogFilter};
+    let error = "nodes: CHECK constraint failed: state IN (rejects-test-1)";
+    let report = sync::ApplyReport { rejected: 2, reject_errors: vec![error.into()], ..Default::default() };
+    record_rejects(&report);
+    record_rejects(&report);
+    let hits: Vec<_> = buffer::snapshot(LogFilter::All)
+        .into_iter()
+        .filter(|e| e.message.contains("rejects-test-1"))
+        .collect();
+    assert_eq!(hits.len(), 1, "{hits:?}");
+    assert_eq!(hits[0].level, Level3::Error);
+    assert!(hits[0].message.contains("older than this app"), "{}", hits[0].message);
+    // No rejects, nothing raised.
+    record_rejects(&sync::ApplyReport::default());
 }

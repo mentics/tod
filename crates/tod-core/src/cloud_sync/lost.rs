@@ -457,12 +457,24 @@ pub fn any_marked(fleet: &FleetStore) -> bool {
 /// `delete_sandbox`) its sandbox, and the change is synced so the
 /// orchestrator and the node's supervisor stop treating it as running.
 pub fn stop_running_in_cloud(fleet: &FleetStore, node_id: &str, delete_sandbox: bool) -> Result<String> {
+    stop_running_in_cloud_with(fleet, node_id, delete_sandbox, false)
+}
+
+/// [`stop_running_in_cloud`] for a sandbox whose checkpoint failed: deletes
+/// it without keeping its uncommitted work ("Delete anyway").
+pub fn stop_running_in_cloud_anyway(fleet: &FleetStore, node_id: &str, delete_sandbox: bool) -> Result<String> {
+    stop_running_in_cloud_with(fleet, node_id, delete_sandbox, true)
+}
+
+fn stop_running_in_cloud_with(fleet: &FleetStore, node_id: &str, delete_sandbox: bool, force: bool) -> Result<String> {
     let root = fleet.paths().root().to_path_buf();
     let uuid = uuid::Uuid::parse_str(node_id).with_context(|| format!("node id {node_id}"))?;
     let row = fleet.read(|c| cloud_nodes::get(c, uuid))?;
     if delete_sandbox && let Some(row) = &row {
         let sandboxes = tod_store::fleet::sandbox::Sandboxes::load(&root)?;
-        super::checkpoint_before_delete(&sandboxes.blaxel()?, node_id, &row.sandbox)?;
+        if !force {
+            checkpoint_for_delete(&sandboxes.blaxel()?, node_id, &row.sandbox)?;
+        }
     }
     fleet.enqueue(FleetMutation::CloudNodeRemove { node: uuid })?;
     fleet.writer().flush()?;
@@ -493,6 +505,34 @@ pub fn stop_running_in_cloud(fleet: &FleetStore, node_id: &str, delete_sandbox: 
 /// replaces it: only running the node in the cloud again does. A sandbox Blaxel does not have
 /// is not an error: the message says so. Blocks on the network.
 pub fn delete_node_sandbox(fleet: &FleetStore, node_id: &str) -> Result<String> {
+    delete_node_sandbox_with(fleet, node_id, false)
+}
+
+/// [`delete_node_sandbox`] without the checkpoint, for when it failed (a full
+/// disk, broken git) and the user chooses to lose the sandbox's uncommitted
+/// work rather than keep a sandbox they cannot use ("Delete anyway").
+pub fn delete_node_sandbox_anyway(fleet: &FleetStore, node_id: &str) -> Result<String> {
+    delete_node_sandbox_with(fleet, node_id, true)
+}
+
+/// Free space a checkpoint needs on the sandbox's root filesystem.
+const CHECKPOINT_MIN_FREE: u64 = 32 * 1024 * 1024;
+
+/// Keeps the sandbox's uncommitted work before it is deleted. A failure says
+/// so and why, and that nothing was deleted; it is never swallowed.
+fn checkpoint_for_delete(bx: &tod_sandbox::blaxel::Blaxel, node_id: &str, name: &str) -> Result<()> {
+    let explain = |err: anyhow::Error| {
+        err.context(format!(
+            "the checkpoint of sandbox {name} failed, so nothing was deleted; delete it anyway to discard its uncommitted work"
+        ))
+    };
+    if let Some(url) = bx.get(name)?.and_then(|info| info.url) {
+        bx.require_free_space(&url, "/", CHECKPOINT_MIN_FREE, name).map_err(explain)?;
+    }
+    super::checkpoint_before_delete(bx, node_id, name).map_err(explain)
+}
+
+fn delete_node_sandbox_with(fleet: &FleetStore, node_id: &str, force: bool) -> Result<String> {
     let root = fleet.paths().root().to_path_buf();
     let uuid = uuid::Uuid::parse_str(node_id).with_context(|| format!("node id {node_id}"))?;
     let row = fleet
@@ -503,8 +543,11 @@ pub fn delete_node_sandbox(fleet: &FleetStore, node_id: &str) -> Result<String> 
     let message = if bx.get(&row.sandbox).with_context(|| format!("look up sandbox {}", row.sandbox))?.is_none() {
         sandboxes.forget(&row.sandbox)?;
         format!("Sandbox {} not found; nothing to delete.", row.sandbox)
+    } else if force {
+        sandboxes.delete(&bx, &row.sandbox).with_context(|| format!("delete sandbox {}", row.sandbox))?;
+        format!("Deleted sandbox {} without keeping its uncommitted work.", row.sandbox)
     } else {
-        super::checkpoint_before_delete(&bx, node_id, &row.sandbox)?;
+        checkpoint_for_delete(&bx, node_id, &row.sandbox)?;
         sandboxes.delete(&bx, &row.sandbox).with_context(|| format!("delete sandbox {}", row.sandbox))?;
         format!("Deleted sandbox {}; any uncommitted work was kept on the remote and comes back when the node runs in the cloud again.", row.sandbox)
     };

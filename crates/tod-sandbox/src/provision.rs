@@ -288,7 +288,7 @@ pub fn ensure(
         let res = bx.run(
             url,
             &format!(
-                "mv {RELAY_PATH}.new {RELAY_PATH} && printf '%s\\n' {} > {MANIFEST_PATH}",
+                "mv {RELAY_PATH}.new {RELAY_PATH} && printf '%s\\n' {} > {MANIFEST_PATH}.tmp && mv -f {MANIFEST_PATH}.tmp {MANIFEST_PATH}",
                 relay::shell_quote(&manifest)
             ),
             30,
@@ -357,7 +357,7 @@ fn adopt_fork(
     bx.upload(url, TOD_CLI_PATH, payload.tod_cli, "0755")?;
     // A relay from an older install would keep running the old binary.
     bx.kill(url, RELAY_PROCESS)?;
-    let res = bx.run(url, &format!("printf '%s\\n' {} > {MANIFEST_PATH}", relay::shell_quote(fork_manifest)), 30)?;
+    let res = bx.run(url, &format!("printf '%s\\n' {} > {MANIFEST_PATH}.tmp && mv -f {MANIFEST_PATH}.tmp {MANIFEST_PATH}", relay::shell_quote(fork_manifest)), 30)?;
     if res.exit_code != 0 {
         bail!("writing {MANIFEST_PATH} failed: {}", res.output());
     }
@@ -508,7 +508,7 @@ COPY bootstrap.sh {TOD_DIR}/bootstrap.sh
 COPY tod-relay {RELAY_PATH}
 COPY tod-cli {TOD_CLI_PATH}
 RUN chmod 0755 {TOD_DIR}/bootstrap.sh {RELAY_PATH} {TOD_CLI_PATH} && sh {TOD_DIR}/bootstrap.sh {args} \
- && printf '%s\n' '{manifest}' > {MANIFEST_PATH}
+ && printf '%s\n' '{manifest}' > {MANIFEST_PATH}.tmp && mv -f {MANIFEST_PATH}.tmp {MANIFEST_PATH}
 {clones}ENTRYPOINT ["/usr/local/bin/sandbox-api"]
 "#,
         args = payload.bootstrap_args(),

@@ -230,7 +230,13 @@ impl Server {
                     Err(r) => return r,
                 };
                 match (method, rest) {
-                    ("POST", ["seed"]) => sync_backend::seed(&self.users, &user, &request.body),
+                    ("POST", ["seed"]) => sync_backend::seed(
+                        &self.users,
+                        &user,
+                        &request.body,
+                        client(request).unwrap_or("unknown"),
+                        request.header(sync_backend::TAKE_OVER_HEADER) == Some("yes"),
+                    ),
                     ("POST", ["changes"]) => match self.users.get(&user) {
                         Ok(data) if !sync_backend::is_seeded(&data.root) => Response::text(409, sync_backend::NOT_SEEDED),
                         Ok(data) => match supervisor_node(request) {
@@ -253,7 +259,13 @@ impl Server {
                         match self.users.get(&user) {
                             Ok(data) if !sync_backend::is_seeded(&data.root) => Response::text(409, sync_backend::NOT_SEEDED),
                             Ok(data) => match slice_node(request) {
-                                Ok(slice) => sync_backend::export_changes(&data, after, client(request), slice),
+                                Ok(slice) => sync_backend::export_changes(
+                                    &data,
+                                    after,
+                                    client(request),
+                                    slice,
+                                    self.notifier.degraded_for().map(|d| d.as_secs().max(1)),
+                                ),
                                 Err(r) => r,
                             },
                             Err(err) => Response::text(500, format!("{err:#}")),

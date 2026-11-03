@@ -289,8 +289,10 @@ crates/tod-store/       # persistence (SQLite, credentials, settings, paths)
 ```
 
 Crates are layered so each depends only on the ones below it: `tod` → `tod-ui`
-→ `tod-core` → `tod-agent`, with `tod-store` alongside. See CLAUDE.md for the
-rationale.
+→ `tod-core` → `tod-agent`, with `tod-store` alongside. The full picture, with
+every executable and the rules that hold across them, is
+[doc/architecture.md](doc/architecture.md); `.claude/CLAUDE.md` has the
+crate-by-crate detail.
 
 ## Stack
 

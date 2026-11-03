@@ -113,12 +113,29 @@ pub fn stale(fleet: &FleetStore, rows: &[CloudNodeRow]) -> Result<(Vec<CloudNode
     Ok((stale, current))
 }
 
+/// Free space a reinstall needs under `/opt/tod` (the binaries and bundles,
+/// each written beside its old copy).
+const REINSTALL_MIN_FREE: u64 = 128 * 1024 * 1024;
+
+/// Refuses to reinstall into a sandbox that is out of disk: a write that runs
+/// out of space leaves a truncated manifest, which reads as "not installed".
+fn check_disk(root: &Path, row: &CloudNodeRow) -> Result<()> {
+    let mut sandboxes = tod_store::fleet::sandbox::Sandboxes::load(root)?;
+    let bx = sandboxes.blaxel()?;
+    let Some(url) = bx.get(&row.sandbox)?.and_then(|info| info.url) else {
+        return Ok(());
+    };
+    bx.require_free_space(&url, "/", REINSTALL_MIN_FREE, &row.sandbox)
+        .context("not reinstalling: the sandbox is out of disk space")
+}
+
 /// Reinstalls `row`'s sandbox on this build ([`ensure_node_sandbox`]) and
 /// records it. Blocks on the network: never on the UI thread.
 pub fn reinstall(fleet: &FleetStore, row: &CloudNodeRow, current: &str) -> Result<()> {
     let root = fleet.paths().root().to_path_buf();
     let id = row.node_id.to_string();
     tracing::info!("cloud: {id}: its sandbox has an older install; reinstalling");
+    check_disk(&root, row)?;
     ensure_node_sandbox(fleet, &root, &id, &row.user, &mut |m| super::log_progress(&format!("refresh {id}"), m))?;
     record(&root, &id, current)
 }

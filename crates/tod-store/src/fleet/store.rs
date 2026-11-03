@@ -113,6 +113,10 @@ impl FleetStore {
         let lock = FleetLock::try_acquire(paths.root()).map_err(map_lock_error)?;
         recover_incomplete_storage_migration(&paths).map_err(FleetLaunchError::Other)?;
         FleetLaunch::prepare(&paths)?;
+        // Rows deleted earlier (a pruned sync outbox) left the file large;
+        // this owner has the database to itself until the writer opens it.
+        crate::fleet::schema::reclaim_free_space(paths.db(), crate::fleet::schema::RECLAIM_THRESHOLD_BYTES)
+            .map_err(FleetLaunchError::Other)?;
         // One app per data root: its cloud sandboxes are this root's.
         crate::fleet::sandbox::set_data_root(paths.root());
         let command_log = CommandLog::shared();

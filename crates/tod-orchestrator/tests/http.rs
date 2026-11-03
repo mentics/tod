@@ -157,7 +157,7 @@ fn seed_then_sync_changes_both_ways() {
     let (status, body) = send(h.port, "POST", "/users/carol/changes", &[], b"[]");
     assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
     assert_eq!(json(&body)["applied"], 0);
-    assert_eq!(send(h.port, "POST", "/users/carol/changes", &[], b"not json").0, 500);
+    assert_eq!(send(h.port, "POST", "/users/carol/changes", &[], b"not json").0, 400);
 }
 
 #[test]
@@ -279,4 +279,67 @@ fn github_routes_are_kept_per_user_and_checked() {
         assert_eq!(server.handle(&req("PUT", bad)).status, 400, "{bad}");
     }
     let _ = std::fs::remove_dir_all(&base);
+}
+
+/// The app retries a seed while the store is briefly held (the notifier probe).
+fn seed_retrying(h: &Harness, user: &str, client: &str, snap: &[u8]) -> (u16, Vec<u8>) {
+    for _ in 0..20 {
+        let (status, body) = send(h.port, "POST", &format!("/users/{user}/seed"), &[("X-Tod-Client", client)], snap);
+        if status != 409 || !String::from_utf8_lossy(&body).contains("in use") {
+            return (status, body);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    panic!("the store stayed in use");
+}
+
+fn snapshot_bytes(h: &Harness, name: &str) -> Vec<u8> {
+    let app = h.base.join(format!("app-{name}"));
+    drop(tod_store::fleet::FleetStore::open(&app).unwrap());
+    let snap = h.base.join(format!("snap-{name}.db"));
+    tod_store::sync::snapshot(&app.join("tod.db"), &snap).unwrap();
+    std::fs::read(&snap).unwrap()
+}
+
+#[test]
+fn a_seed_from_a_newer_schema_is_refused_and_the_database_kept() {
+    let h = start("seed-newer");
+    let good = snapshot_bytes(&h, "good");
+    assert_eq!(send(h.port, "POST", "/users/erin/seed", &[("X-Tod-Client", "app-1")], &good).0, 200);
+    let newer = h.base.join("newer.db");
+    std::fs::write(&newer, &good).unwrap();
+    let conn = rusqlite::Connection::open(&newer).unwrap();
+    conn.pragma_update(None, "user_version", 9999).unwrap();
+    drop(conn);
+    let (status, body) =
+        send(h.port, "POST", "/users/erin/seed", &[("X-Tod-Client", "app-1")], &std::fs::read(&newer).unwrap());
+    let text = String::from_utf8_lossy(&body);
+    assert_eq!(status, 422, "{text}");
+    assert!(text.contains("9999") && text.contains("scripts/deploy.sh"), "{text}");
+    // Still seeded and serving.
+    assert_eq!(send(h.port, "GET", "/users/erin/changes?after=0", &[], b"").0, 200);
+}
+
+#[test]
+fn another_client_may_seed_only_by_taking_over() {
+    let h = start("seed-client");
+    let snap = snapshot_bytes(&h, "c");
+    assert_eq!(send(h.port, "POST", "/users/fay/seed", &[("X-Tod-Client", "app-1")], &snap).0, 200);
+    // The same client reseeds freely.
+    let (status, body) = seed_retrying(&h, "fay", "app-1", &snap);
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    let (status, body) = send(h.port, "POST", "/users/fay/seed", &[("X-Tod-Client", "app-2")], &snap);
+    assert_eq!(status, 409, "{}", String::from_utf8_lossy(&body));
+    assert!(String::from_utf8_lossy(&body).contains("app-1"));
+    let (status, body) = send(
+        h.port,
+        "POST",
+        "/users/fay/seed",
+        &[("X-Tod-Client", "app-2"), ("X-Tod-Take-Over", "yes")],
+        &snap,
+    );
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    // Now app-1 is the other client.
+    assert_eq!(send(h.port, "POST", "/users/fay/seed", &[("X-Tod-Client", "app-1")], &snap).0, 409);
+    assert!(h.base.join("users/fay/orchestrator-seed-client").is_file());
 }

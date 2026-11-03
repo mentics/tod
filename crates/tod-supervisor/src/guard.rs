@@ -239,10 +239,16 @@ pub enum OnFailure {
     Retry,
     /// Too many in a row: ask the user.
     Ask,
+    /// Not the agent's failure: the configuration names something that does
+    /// not exist (a skill). Retrying cannot help; stop and tell the user.
+    Config,
 }
 
 /// Decides [`OnFailure`] for the `failures`-th consecutive failure.
 pub fn on_failure(error: &str, failures: u32, guards: &Guards, now_ms: i64) -> OnFailure {
+    if tod_core::skills_context::is_missing_skill(error) {
+        return OnFailure::Config;
+    }
     if let Some(limit) = crate::usage_limit::detect(error, now_ms) {
         return OnFailure::UsageLimit(limit);
     }
@@ -403,5 +409,21 @@ mod tests {
             on_failure("Claude usage limit reached|1800000000", 3, &guards, 0),
             OnFailure::UsageLimit(_)
         ));
+    }
+
+    #[test]
+    fn a_missing_skill_is_a_configuration_problem_not_a_failure_to_retry() {
+        let guards = Guards::default();
+        let error = format!(
+            "the pr_draft phase's skills: {}",
+            tod_core::skills_context::SkillsError::Missing {
+                name: "ci-fix-step".into(),
+                cwd: "/w".into(),
+                default_branch: "it could not be read".into(),
+            }
+        );
+        assert_eq!(on_failure(&error, 1, &guards, 0), OnFailure::Config);
+        assert_eq!(on_failure(&error, 3, &guards, 0), OnFailure::Config);
+        assert_eq!(on_failure("boom", 1, &guards, 0), OnFailure::Retry);
     }
 }
