@@ -192,9 +192,20 @@ fn phase_certified_outcome(conn: &Connection, node_id: Uuid, state: &str) -> Res
         )),
         CertificateStatus::None => fail("not certified"),
         CertificateStatus::Stale { changed, .. } => {
-            fail(format!("certificate is stale: {}", changed.join("; ")))
+            fail(stale_certificate_detail(&changed))
         }
     })
+}
+
+/// Why a certificate no longer counts. `changed` can be empty when the inputs
+/// differ in a way the certificate's snapshot cannot describe; the line must
+/// still say something, not end in "stale: ".
+fn stale_certificate_detail(changed: &[String]) -> String {
+    if changed.is_empty() {
+        "certificate is stale: what it covers changed since it was recorded".to_string()
+    } else {
+        format!("certificate is stale: {}", changed.join("; "))
+    }
 }
 
 /// The learn phase recorded its retrospective (`tod-cli learn record`) in
@@ -848,6 +859,19 @@ fn pr_merged_outcome(conn: &Connection, node_id: Uuid) -> Result<DerivedOutcome>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_stale_certificate_with_nothing_describable_still_says_why() {
+        assert_eq!(
+            stale_certificate_detail(&[]),
+            "certificate is stale: what it covers changed since it was recorded"
+        );
+        assert_eq!(
+            stale_certificate_detail(&["a".into(), "b".into()]),
+            "certificate is stale: a; b"
+        );
+    }
+
     use tod_store::fleet::{FleetMutation, FleetStore};
     use tod_store::outline::{Capability, CreatePosition, OutlineMutation};
 
