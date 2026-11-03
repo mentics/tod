@@ -639,4 +639,58 @@ mod tests {
         // Again: nothing to do.
         PhaseProtocol.prepare(&env).unwrap();
     }
+
+    /// Recording the phase `ready` again over the same work is not progress:
+    /// the loop would otherwise resend "not finished" until its cap.
+    #[test]
+    fn recording_ready_again_is_not_progress() {
+        let fx = fixture();
+        let list_id = fx.fleet.list_outline_lists().unwrap()[0].id;
+        let node = Uuid::new_v4();
+        fx.fleet
+            .enqueue_outline(OutlineMutation::CreateNode {
+                node_id: Some(node),
+                list_id,
+                parent_id: None,
+                anchor_id: None,
+                position: CreatePosition::Below,
+                title: "New task".into(),
+            })
+            .unwrap();
+        fx.fleet
+            .interview(
+                ACTOR_USER,
+                InterviewCommand::Outline {
+                    mutation: OutlineMutation::EnableCapabilities {
+                        node_id: node,
+                        capabilities: vec![Capability::Lifecycle, Capability::Spec],
+                    },
+                    target: None,
+                },
+            )
+            .unwrap();
+        let marker = || {
+            fx.fleet
+                .read(|conn| PhaseStanding::load(conn, node, "proposed"))
+                .unwrap()
+                .marker
+        };
+        let ready = || {
+            fx.fleet
+                .interview(
+                    ACTOR_USER,
+                    InterviewCommand::PhaseReady {
+                        node_id: node,
+                        state: "proposed".into(),
+                    },
+                )
+                .unwrap();
+        };
+        let before = marker();
+        ready();
+        let first = marker();
+        ready();
+        assert_eq!(before, first);
+        assert_eq!(first, marker());
+    }
 }

@@ -217,8 +217,8 @@ pub struct PhaseStanding {
     /// An evaluator rejected the same content twice: the phase agent changed
     /// nothing in between.
     pub stuck: bool,
-    /// Changes whenever the phase's inputs or events do: the current digest
-    /// and the latest event. Lets the runner tell a step that did something
+    /// Changes whenever the phase's inputs or a verdict do: the current digest
+    /// and the latest certify or reject. Lets the runner tell a step that did something
     /// from one that did nothing.
     pub marker: String,
 }
@@ -237,10 +237,13 @@ impl PhaseStanding {
             Some(e) if e.kind == PHASE_REJECT => e.fixes(),
             _ => Vec::new(),
         };
+        // Recording `ready` again over the same work is not progress: only a
+        // change to the inputs or a verdict moves the marker.
+        let verdict = events.iter().rev().find(|e| e.kind != PHASE_READY);
         let marker = format!(
             "{}:{}",
             digest.unwrap_or_default(),
-            last.map(|e| e.id.to_string()).unwrap_or_default()
+            verdict.map(|e| e.id.to_string()).unwrap_or_default()
         );
         Ok(Self {
             certificate: repo.certificate_status(node, state)?,
