@@ -469,6 +469,10 @@ pub struct HttpOrchestrator {
     /// This app as a sync client (`X-Tod-Client`): what it sends reaches the
     /// node supervisors and never comes back to it.
     client: String,
+    /// Sends `X-Tod-Take-Over: yes` with a seed, which the orchestrator
+    /// otherwise refuses when another client made the current seeding. Set
+    /// only when the user chose to take it over.
+    take_over: bool,
     agent: ureq::Agent,
 }
 
@@ -480,12 +484,20 @@ impl HttpOrchestrator {
             .timeout_global(Some(Duration::from_secs(300)))
             .build()
             .into();
-        Self { base: base.into().trim_end_matches('/').to_string(), token, client: "app".into(), agent }
+        Self { base: base.into().trim_end_matches('/').to_string(), token, client: "app".into(), take_over: false, agent }
     }
 
     /// Names this app as the sync client `client` ([`client_id`]).
     pub fn with_client(mut self, client: impl Into<String>) -> Self {
         self.client = client.into();
+        self
+    }
+
+    /// Whether seeds carry `X-Tod-Take-Over: yes`: the user's explicit choice
+    /// to replace a database another client seeded (the UI sets this only
+    /// from that choice; see `tod_orchestrator::sync_backend::seed`).
+    pub fn with_take_over(mut self, take_over: bool) -> Self {
+        self.take_over = take_over;
         self
     }
 
@@ -589,18 +601,28 @@ impl HttpOrchestrator {
 
 impl Orchestrator for HttpOrchestrator {
     fn seed(&self, user: &str, snapshot: &[u8]) -> Result<Seeding> {
-        // The orchestrator answers 409 while the user's store is in use.
+        // The orchestrator answers 409 while the user's store is in use; a
+        // 409 for another client's seeding is not retried.
         for attempt in 0..5 {
-            let resp = self
+            let mut req = self
                 .auth(self.agent.post(&self.url(user, "seed")))
-                .header("Content-Type", "application/octet-stream")
-                .send(snapshot)
-                .context("orchestrator seed")?;
-            if resp.status().as_u16() == 409 && attempt < 4 {
-                std::thread::sleep(Duration::from_millis(500 * (attempt + 1)));
-                continue;
+                .header("Content-Type", "application/octet-stream");
+            if self.take_over {
+                req = req.header("X-Tod-Take-Over", "yes");
             }
-            let v = Self::finish(resp, "seed")?;
+            let mut resp = req.send(snapshot).context("orchestrator seed")?;
+            if resp.status().as_u16() == 409 {
+                let body = resp.body_mut().read_to_string().unwrap_or_default();
+                if body.contains("store is in use") && attempt < 4 {
+                    std::thread::sleep(Duration::from_millis(500 * (attempt + 1)));
+                    continue;
+                }
+                bail!(
+                    "orchestrator seed: {}",
+                    tod_sandbox::blaxel::describe_failure(resp.status(), &body)
+                );
+            }
+            let v = Self::finish(resp, "seed").map_err(older_orchestrator_hint)?;
             let last_seq = v["last_seq"].as_i64().ok_or_else(|| anyhow!("orchestrator seed: no last_seq"))?;
             return Ok(Seeding { last_seq, seed_id: v["seed_id"].as_str().map(str::to_string) });
         }
@@ -779,6 +801,7 @@ fn sync_once(fleet: &FleetStore, root: &Path, orch: &dyn Orchestrator, user: &st
         report.sent = outbox.len();
         report.conflicts += applied.conflicts.len();
         record_conflicts(&applied.conflicts);
+        record_rejects(&applied);
         state.sent_after = outbox.iter().map(|c| c.seq).max().unwrap_or(state.sent_after);
         state.save(root)?;
     }
@@ -834,6 +857,35 @@ fn sync_once(fleet: &FleetStore, root: &Path, orch: &dyn Orchestrator, user: &st
         tracing::warn!("cloud sync: retiring done nodes: {err:#}");
     }
     Ok(report)
+}
+
+/// A change the orchestrator refused is skipped there (so the batch and the
+/// cursor still advance), and so the user has to be told: it is a sign the
+/// orchestrator is older than this app. Each distinct error is raised once per
+/// process, as an error (a toast) with the hint, and logged at warn level.
+fn record_rejects(applied: &sync::ApplyReport) {
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+    static SEEN: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+    if applied.rejected == 0 {
+        return;
+    }
+    for error in &applied.reject_errors {
+        let fresh = SEEN.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashSet::new).insert(error.clone());
+        if !fresh {
+            continue;
+        }
+        let hinted = format!("{:#}", older_orchestrator_hint(anyhow!("{error}")));
+        tracing::warn!(rejected = applied.rejected, "cloud sync: the orchestrator refused changes: {hinted}");
+        crate::logging::buffer::record(
+            crate::logging::buffer::Level3::Error,
+            crate::logging::buffer::LogSource::App,
+            format!(
+                "The orchestrator refused {} of this copy's changes and skipped them (they are not synced): {hinted}",
+                applied.rejected
+            ),
+        );
+    }
 }
 
 /// Logs the changes the orchestrator reported as conflicting with its copy.
@@ -1688,7 +1740,11 @@ fn wait_for_supervisor(
 /// it up to date. Any other error passes through unchanged.
 fn older_orchestrator_hint(err: anyhow::Error) -> anyhow::Error {
     let text = format!("{err:#}");
-    if text.contains("CHECK constraint failed") || text.contains("no such column") || text.contains("no such table") {
+    if text.contains("CHECK constraint failed")
+        || text.contains("no such column")
+        || text.contains("no such table")
+        || text.contains("newer than this orchestrator supports")
+    {
         return err.context(
             "the orchestrator is older than this app and does not accept what it wrote; \
              update it with `scripts/build-sandbox-binaries.sh` then `tod-sandbox orchestrator`",
