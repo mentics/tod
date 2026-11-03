@@ -29,7 +29,16 @@ struct FakeAgent {
     turns: usize,
     /// Every turn played, counted where a fake pull request can see it.
     shared_turns: Option<Arc<std::sync::atomic::AtomicUsize>>,
+    /// Replaces the verification agent: given which verify turn this is
+    /// (from 1) and the obligations verification covers, the ones it fails.
+    verify_script: Option<VerifyScript>,
+    verify_rounds: std::sync::atomic::AtomicUsize,
+    /// Every phase-agent turn first adds an obligation, so the work the
+    /// evaluator judges is new each time.
+    phase_churn: bool,
 }
+
+type VerifyScript = Arc<dyn Fn(usize, &[Uuid]) -> Vec<Uuid> + Send + Sync>;
 
 impl FakeAgent {
     fn new(fleet: &Arc<FleetStore>) -> Self {
@@ -39,7 +48,62 @@ impl FakeAgent {
             sessions: HashMap::new(),
             turns: 0,
             shared_turns: None,
+            verify_script: None,
+            verify_rounds: std::sync::atomic::AtomicUsize::new(0),
+            phase_churn: false,
         }
+    }
+
+    /// One scripted verification turn: a verdict on every obligation due
+    /// (failed for the ones `script` names), the plan step failed when any
+    /// obligation is, and a green test run.
+    fn scripted_verify(&self, script: &VerifyScript, node: Uuid, conversation: Uuid) -> anyhow::Result<()> {
+        use tod_store::interview::InterviewCommand as Cmd;
+        let round = self.verify_rounds.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        let user = Direct { fleet: &self.fleet, actor: format!("conversation:{conversation}") };
+        let due: Vec<Uuid> = self.fleet.read(|conn| {
+            Ok(tod_store::verification::VerdictRepo::new(conn)
+                .standings(node)?
+                .iter()
+                .filter(|s| s.due_by("verifying"))
+                .map(|s| s.obligation.id)
+                .collect())
+        })?;
+        let failing = script(round, &due);
+        for id in &due {
+            let failed = failing.contains(id);
+            crate::conversation::mock::Access::interview(&user, Cmd::RecordObligationVerdict {
+                node_id: node,
+                obligation_id: *id,
+                conversation_id: Some(conversation),
+                status: if failed { "failed" } else { "verified" }.to_string(),
+                evidence: format!("scripted round {round}"),
+            })?;
+        }
+        let steps = self.fleet.read(|conn| Ok(PlanStepRepo::new(conn).list_for_node(node)?))?;
+        for (n, step) in steps.iter().filter(|s| s.due_by("verifying")).enumerate() {
+            let failed = !failing.is_empty() && n == 0;
+            crate::conversation::mock::Access::interview(&user, Cmd::Outline {
+                mutation: OutlineMutation::UpdatePlanStepStatus {
+                    step_id: step.id,
+                    status: if failed { "failed" } else { "verified" }.to_string(),
+                    note: failed.then(|| "scripted failure".to_string()),
+                    reason: None,
+                },
+                target: None,
+            })?;
+        }
+        let run = crate::conversation::implement::TestRun {
+            command: "scripted".to_string(),
+            passed: 1,
+            failed: 0,
+            errors: 0,
+        };
+        crate::conversation::mock::Access::interview(&user, Cmd::RecordConversationReport {
+            conversation_id: conversation,
+            body: serde_json::to_value(&run)?,
+        })?;
+        Ok(())
     }
 
     fn play(&self, turn: &SessionTurn) -> anyhow::Result<String> {
@@ -56,6 +120,42 @@ impl FakeAgent {
                 fleet: &self.fleet,
                 actor: env(ACTOR_ENV).unwrap_or_else(|| ACTOR_USER.to_string()),
             };
+            if let Some(script) = &self.verify_script {
+                let protocol = self.fleet.read(|conn| {
+                    Ok(tod_store::conversation::ConversationRepo::new(conn)
+                        .get(conversation.parse()?)?
+                        .map(|c| c.protocol))
+                })?;
+                if protocol == Some(tod_store::conversation::ProtocolKind::Verification) {
+                    self.scripted_verify(script, node.parse()?, conversation.parse()?)?;
+                    return Ok(String::new());
+                }
+            }
+            if self.phase_churn {
+                let protocol = self.fleet.read(|conn| {
+                    Ok(tod_store::conversation::ConversationRepo::new(conn)
+                        .get(conversation.parse()?)?
+                        .map(|c| c.protocol))
+                })?;
+                if protocol == Some(tod_store::conversation::ProtocolKind::Phase) {
+                    self.fleet.interview(
+                        &format!("conversation:{conversation}"),
+                        InterviewCommand::Outline {
+                            mutation: OutlineMutation::CreateObligation {
+                                obligation_id: None,
+                                node_id: node.parse()?,
+                                kind: tod_store::outline::KIND_REQUIREMENT.into(),
+                                after_id: None,
+                                before: false,
+                                section: None,
+                                body: format!("Churn {}", Uuid::new_v4()),
+                                phase: tod_store::interview::PHASE_REQUIREMENTS.into(),
+                            },
+                            target: None,
+                        },
+                    )?;
+                }
+            }
             let place = crate::conversation::mock::Place {
                 cwd: Some(&turn.cwd),
                 env: &turn.env,
@@ -1681,4 +1781,135 @@ fn looping_is_stated_in_plain_words_and_is_on_you_as_stopped() {
         crate::next_actor::outcome_reason(&outcome),
         Some(crate::next_actor::YouReason::Stopped { reason: reason.describe() })
     );
+}
+
+/// A node whose verification runs per `script`, in a store with `extra`
+/// more obligations besides the one `setup` makes.
+fn verify_run(extra: usize, script: VerifyScript, budget: Budget) -> (Fixture, FakeAgent, Autopilot, Outcome) {
+    let fx = setup();
+    retire_outside_criteria(&fx);
+    for n in 0..extra {
+        fx.fleet
+            .enqueue_outline(OutlineMutation::CreateObligation {
+                obligation_id: None,
+                node_id: fx.node,
+                kind: tod_store::outline::KIND_REQUIREMENT.into(),
+                after_id: None,
+                before: false,
+                section: None,
+                body: format!("Extra {n}."),
+                phase: tod_store::interview::PHASE_REQUIREMENTS.into(),
+            })
+            .unwrap();
+    }
+    fx.fleet.writer().flush().unwrap();
+    let mut agent = FakeAgent::new(&fx.fleet);
+    agent.verify_script = Some(script);
+    let mut pilot = autopilot(&fx, budget);
+    let outcome = pilot.run(&fx.fleet, &mut agent).unwrap();
+    (fx, agent, pilot, outcome)
+}
+
+#[test]
+fn the_real_loop_stops_a_verify_fix_ping_pong_on_the_same_obligation() {
+    let budget = Budget::default();
+    let (_fx, agent, pilot, outcome) = verify_run(0, Arc::new(|_, due| due.to_vec()), budget);
+    let steps: Vec<_> = pilot.state().steps.iter().map(|s| s.step.clone()).collect();
+    match &outcome {
+        Outcome::NeedsHuman { reason: NeedsHuman::Looping { what, times } } => {
+            assert_eq!(*times, CYCLE_LIMIT, "{steps:?}");
+            assert!(what.contains("It works."), "{what}");
+        }
+        other => panic!("{other:?} {steps:?}"),
+    }
+    // Exactly the limit: not before, and not after spending the budget.
+    assert_eq!(agent.verify_rounds.load(std::sync::atomic::Ordering::SeqCst), CYCLE_LIMIT as usize, "{steps:?}");
+    assert!(pilot.state().sessions < budget.max_sessions, "{}", pilot.state().sessions);
+    assert_eq!(pilot.state().loops.fix_cycles, CYCLE_LIMIT - 1);
+}
+
+#[test]
+fn the_real_loop_never_stops_a_run_whose_failures_keep_changing() {
+    // A, then B, then A again (it was fixed in between), then B, then green.
+    let (fx, agent, pilot, outcome) = verify_run(
+        1,
+        Arc::new(|round, due| match round {
+            1 | 3 => vec![due[0]],
+            2 | 4 => vec![due[1]],
+            _ => vec![],
+        }),
+        Budget::default(),
+    );
+    let steps: Vec<_> = pilot.state().steps.iter().map(|s| s.step.clone()).collect();
+    assert_eq!(outcome, Outcome::Done, "{steps:?}");
+    assert_eq!(agent.verify_rounds.load(std::sync::atomic::Ordering::SeqCst), 5);
+    assert_eq!(pilot.state().loops.fix_cycles, 4);
+    assert_eq!(lifecycle::current_state(&fx.fleet, fx.node).unwrap(), "done");
+}
+
+#[test]
+fn the_real_loop_does_not_stop_an_obligation_that_went_green_between_returns() {
+    // Fails twice (below the limit), is fixed, and passes.
+    let (_fx, _agent, pilot, outcome) = verify_run(
+        0,
+        Arc::new(|round, due| if round <= CYCLE_LIMIT as usize - 1 { due.to_vec() } else { vec![] }),
+        Budget::default(),
+    );
+    assert_eq!(outcome, Outcome::Done, "{:?}", pilot.state().steps);
+    assert_eq!(pilot.state().loops.fix_cycles, CYCLE_LIMIT - 1);
+}
+
+#[test]
+fn the_loop_counters_survive_a_restart_mid_loop() {
+    // Enough sessions for the first verify -> fix round trip, not the limit.
+    let (fx, _agent, pilot, outcome) = verify_run(
+        0,
+        Arc::new(|_, due| due.to_vec()),
+        Budget { max_sessions: 9, ..Budget::default() },
+    );
+    assert!(matches!(outcome, Outcome::BudgetExhausted { .. }), "{outcome:?} {:?}", pilot.state().steps);
+    let saved = AutopilotState::load(&fx.root, fx.node).unwrap();
+    assert!(saved.loops.fix_cycles >= 1, "{:?}", saved.loops);
+    assert_eq!(saved.loops, pilot.state().loops);
+    let count = saved.loops.cycles.values().copied().next().expect("a counted problem");
+    assert!(count >= 1 && count < CYCLE_LIMIT, "{count}");
+    // A renewed run keeps the counts and finishes the count to the limit.
+    let mut agent = FakeAgent::new(&fx.fleet);
+    agent.verify_script = Some(Arc::new(|_, due| due.to_vec()));
+    let mut again = autopilot(&fx, Budget::default());
+    assert_eq!(again.state().loops, saved.loops);
+    let outcome = again.run(&fx.fleet, &mut agent).unwrap();
+    assert!(
+        matches!(&outcome, Outcome::NeedsHuman { reason: NeedsHuman::Looping { times, .. } } if *times == CYCLE_LIMIT),
+        "{outcome:?}"
+    );
+}
+
+#[test]
+fn the_real_loop_stops_an_evaluator_that_rejects_changed_work_with_the_same_asks() {
+    let fx = setup();
+    retire_outside_criteria(&fx);
+    fx.fleet
+        .enqueue_outline(OutlineMutation::UpdateNodeTitle {
+            node_id: fx.node,
+            title: "Interview node [reject]".into(),
+        })
+        .unwrap();
+    fx.fleet.writer().flush().unwrap();
+    let mut agent = FakeAgent::new(&fx.fleet);
+    agent.phase_churn = true;
+    let budget = Budget::default();
+    let mut pilot = autopilot(&fx, budget);
+    let outcome = pilot.run(&fx.fleet, &mut agent).unwrap();
+    let steps: Vec<_> = pilot.state().steps.iter().map(|s| s.step.clone()).collect();
+    match &outcome {
+        Outcome::NeedsHuman { reason: NeedsHuman::Looping { what, times } } => {
+            assert_eq!(*times, CYCLE_LIMIT, "{steps:?}");
+            assert!(what.contains("Mock fix"), "{what}");
+        }
+        other => panic!("{other:?} {steps:?}"),
+    }
+    let evaluations = steps.iter().filter(|s| *s == "evaluate").count();
+    assert_eq!(evaluations, CYCLE_LIMIT as usize, "{steps:?}");
+    assert!(pilot.state().sessions < budget.max_sessions);
 }
