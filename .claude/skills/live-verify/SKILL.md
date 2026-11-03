@@ -127,3 +127,11 @@ Run tests with explicit timeouts and scoped (`cargo nextest run -p <crate> ...`)
 When you finish, report: what you ran, each bug found (fixed, or why not), what
 you merged and deployed (including the orchestrator), and what is left. Add any
 new gotcha to this file and `doc/live-verification.md` and merge them.
+- The orchestrator is behind Blaxel's edge: every request needs the Blaxel
+  bearer token (a bare `curl` to its URL, `/health` too, answers 401). Its log
+  is in its sandbox under `/var/log/sandbox-api/` (see doc/live-verification.md).
+- Blaxel masks env values (`TOD_USER` reads `****`): treat as unknown.
+- A node with a live heartbeat is skipped by the launch reinstall: use
+  "Reinstall and restart" after a deploy, and check `user_version` of the
+  supervisor's `tod.db` in the sandbox to be sure it is the new build.
+- No `timeout` on macOS; do not wrap cargo in it, and `sed -i ''`.

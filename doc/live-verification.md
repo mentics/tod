@@ -88,3 +88,27 @@ regression test, merge, rebuild, relaunch, and rerun from the failing step.
   and exits 1, and the app waits 150 s. The app now refuses it, naming Delete
   Sandbox. A shared orchestrator can also answer a poke with Blaxel 502s for
   many minutes (egress proxy); redeploying the orchestrator cleared it.
+- **The orchestrator sits behind Blaxel's edge.** Every request to its URL
+  needs `Authorization: Bearer <Blaxel key>`, `/health` included (a bare
+  `curl` gets 401). The app's version-contract probe forgot it once and every
+  sync failed with "orchestrator health: 401"; `tod-sandbox exec
+  tod-orchestrator` is the way to look inside.
+- **Blaxel masks env values** in its listing (`TOD_USER` reads `****`). That
+  is not a user: `SandboxInfo::env` treats it as absent.
+- **The orchestrator's log** is in the sandbox, `/var/log/sandbox-api/tod-orchestrator-<id>.stderr.log`
+  (newest by `ls -t`, or `grep -l trusting`). It says how many CA certificates
+  it trusts at its first HTTPS call. `UnknownIssuer` on every poke was seen
+  once on a fresh deploy and not again after a second one; the cause is not
+  known (Python in the sandbox verified the proxy chain with the same bundle).
+- **A node with a live heartbeat is not reinstalled at app launch.** After a
+  deploy use the task panel's "Sync now" dropdown, "Reinstall and restart", to
+  put the new supervisor on it; check with `tod-sandbox exec <sandbox> --
+  python3 -c ...` on `/var/lib/tod-supervisor/<node>/tod.db` (`user_version`).
+- **The live-verify root's `orchestrator-github.json`** lists the GitHub tokens
+  the orchestrator may use for the root's user and which repositories each
+  reads. If none covers the node's repository the gate logs "pull request not
+  found (GitHub also answers 404 when tod's token cannot see the repository)"
+  and wakes the sandbox instead; the supervisor then looks itself.
+- **No `timeout` command on macOS**: `timeout 120 cargo ...` fails with
+  "command not found", and a pipeline that greps its output hides that. Run
+  cargo plainly, or check the exit code. macOS `sed -i` needs `-i ''`.
