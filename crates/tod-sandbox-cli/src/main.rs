@@ -101,6 +101,13 @@ orchestrator [--image IMAGE] [--bin PATH] [--tod-cli PATH] [--move-data]
                          --move-data: the sandbox exists without the volume;
                          copy its /data onto the volume, recreating it.
 prune                    Forget sandboxes Blaxel no longer has (they expire).
+sweep [--min-age-hours N] [--delete NAME...]
+                         List orphan sandboxes: node-* sandboxes at Blaxel that no
+                         node or Files location of this data root names, older than
+                         N hours (default 6). Deletes nothing unless --delete names
+                         them; each is re-checked first and refused if it is no
+                         longer an orphan. Another machine's nodes live in its own
+                         database, so check the list before deleting.
 doctor                   Check the setup.
 connect-info <name>      (internal) The relay URL, token, and idle times, as JSON.
 ";
@@ -263,6 +270,7 @@ fn run() -> Result<i32> {
         "webhooks" => webhooks(&ctx, args),
         "watchdog" => watchdog(&ctx, args),
         "prune" => prune(&mut ctx, args),
+        "sweep" => sweep(&ctx, args),
         "doctor" => doctor(&mut ctx),
         "connect-info" => {
             let target = args.positional("sandbox name")?;
@@ -928,6 +936,67 @@ fn prune(ctx: &mut Ctx, args: Args) -> Result<i32> {
     Ok(0)
 }
 
+/// What `sweep` was asked: the minimum age and the names to delete.
+#[derive(Debug, PartialEq)]
+struct SweepArgs {
+    min_age: Duration,
+    delete: Vec<String>,
+}
+
+/// `[--min-age-hours N] [--delete NAME...]`: `--delete` takes every name up to
+/// the next `--` option, so a sandbox is never deleted by being listed.
+fn parse_sweep(raw: Vec<String>) -> Result<SweepArgs> {
+    let mut min_age = tod_core::cloud_sync::provisioning::ORPHAN_MIN_AGE;
+    let mut delete = Vec::new();
+    let mut it = raw.into_iter().peekable();
+    while let Some(a) = it.next() {
+        if a == "--min-age-hours" || a.starts_with("--min-age-hours=") {
+            let v = match a.strip_prefix("--min-age-hours=") {
+                Some(v) => v.to_string(),
+                None => it.next().ok_or_else(|| anyhow!("--min-age-hours needs a number\n\n{USAGE}"))?,
+            };
+            let hours: f64 = v.parse().map_err(|_| anyhow!("--min-age-hours {v:?} is not a number"))?;
+            if !hours.is_finite() || hours < 0.0 {
+                bail!("--min-age-hours {v:?} must be zero or more");
+            }
+            min_age = Duration::from_secs_f64(hours * 3600.0);
+        } else if a == "--delete" {
+            while let Some(name) = it.next_if(|n| !n.starts_with("--")) {
+                delete.push(name);
+            }
+            if delete.is_empty() {
+                bail!("--delete needs at least one sandbox name\n\n{USAGE}");
+            }
+        } else {
+            bail!("unexpected argument {a:?}\n\n{USAGE}");
+        }
+    }
+    Ok(SweepArgs { min_age, delete })
+}
+
+fn sweep(ctx: &Ctx, args: Args) -> Result<i32> {
+    use tod_core::cloud_sync::provisioning as prov;
+    let SweepArgs { min_age, delete } = parse_sweep(args.0)?;
+    if delete.is_empty() {
+        let orphans = prov::list_orphan_sandboxes_at(&ctx.root, min_age)?;
+        if orphans.is_empty() {
+            println!("no orphan sandboxes");
+            return Ok(0);
+        }
+        println!("{:<40} {:>8}  STATE", "NAME", "AGE");
+        for o in &orphans {
+            println!("{:<40} {:>8}  {}", o.name, prov::age_text(o.age), o.status);
+        }
+        println!("\n{} orphan(s). Nothing deleted; delete with: tod-sandbox sweep --delete NAME...", orphans.len());
+        return Ok(0);
+    }
+    let deleted = prov::delete_orphan_sandboxes_at(&ctx.root, &delete, min_age)?;
+    for name in &deleted {
+        println!("{name}: deleted");
+    }
+    Ok(0)
+}
+
 fn doctor(ctx: &mut Ctx) -> Result<i32> {
     let mut problems = 0;
     let mut report = |ok: bool, what: &str, detail: String| {
@@ -1011,5 +1080,38 @@ mod sandbox_binary_tests {
         put(&dir.join("target/sandbox/tod-relay"), 50);
         assert!(sandbox_binary_from(&exe, "tod-relay").is_ok());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod sweep_tests {
+    use super::*;
+
+    fn v(a: &[&str]) -> Vec<String> {
+        a.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn no_arguments_lists_with_the_default_age() {
+        let a = parse_sweep(v(&[])).unwrap();
+        assert!(a.delete.is_empty());
+        assert_eq!(a.min_age, tod_core::cloud_sync::provisioning::ORPHAN_MIN_AGE);
+    }
+
+    #[test]
+    fn delete_takes_names_up_to_the_next_option() {
+        let a = parse_sweep(v(&["--delete", "node-a", "node-b", "--min-age-hours", "2"])).unwrap();
+        assert_eq!(a.delete, v(&["node-a", "node-b"]));
+        assert_eq!(a.min_age, Duration::from_secs(7200));
+        assert_eq!(parse_sweep(v(&["--min-age-hours=0.5"])).unwrap().min_age, Duration::from_secs(1800));
+    }
+
+    #[test]
+    fn bad_input_is_an_error() {
+        assert!(parse_sweep(v(&["--delete"])).is_err());
+        assert!(parse_sweep(v(&["--delete", "--min-age-hours", "1"])).is_err());
+        assert!(parse_sweep(v(&["--min-age-hours", "soon"])).is_err());
+        assert!(parse_sweep(v(&["--min-age-hours", "-1"])).is_err());
+        assert!(parse_sweep(v(&["node-a"])).is_err());
     }
 }
