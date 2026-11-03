@@ -63,6 +63,7 @@ pub mod release_watch;
 pub mod pull_requests;
 pub mod run_transcript;
 pub mod run_state;
+pub mod runner_place;
 pub mod runner_status;
 pub mod scheduler;
 pub mod wait_cadence;
