@@ -89,6 +89,8 @@ watchdog deploy [--image IMAGE] [--orchestrator-url URL] [--max-awake-secs N] [-
                          tod-watchdog. Without --image, builds job/tod-watchdog
                          from target/sandbox/tod-watchdog with `bl push`.
                          Needs an API-key sign-in.
+webhooks             Print the URLs to give GitHub and Linear for webhooks (the orchestrator's
+                         public preview) and where the secrets are.
 orchestrator [--image IMAGE] [--bin PATH] [--tod-cli PATH] [--move-data]
                          Create (if needed) the team's orchestrator sandbox
                          (sandboxes.toml's `orchestrator`, with its data on the
@@ -258,6 +260,7 @@ fn run() -> Result<i32> {
             Ok(0)
         }
         "orchestrator" => orchestrator(&ctx, args),
+        "webhooks" => webhooks(&ctx, args),
         "watchdog" => watchdog(&ctx, args),
         "prune" => prune(&mut ctx, args),
         "doctor" => doctor(&mut ctx),
@@ -502,6 +505,34 @@ fn bake(ctx: &mut Ctx, mut args: Args) -> Result<i32> {
         "built sandbox/{name}:latest. Create sandboxes from it with\n  tod-sandbox create <name> --image sandbox/{name}:latest{flag}\n\
          or make it the default with `tod-sandbox setup --image sandbox/{name}:latest`. \
          Rebake after updating tod, or the first connect updates it in place."
+    );
+    Ok(0)
+}
+
+/// Where GitHub and Linear send webhooks: the orchestrator's public preview.
+/// The secrets are in `/data/webhooks.json` on the orchestrator and are not
+/// printed here.
+fn webhooks(ctx: &Ctx, args: Args) -> Result<i32> {
+    args.done()?;
+    let acct = ctx.account()?.clone();
+    let bx = ctx.blaxel()?;
+    let path = format!("/sandboxes/{}/previews", acct.orchestrator);
+    let previews = bx
+        .get_path(&path, "list the orchestrator's previews")?
+        .ok_or_else(|| anyhow!("no orchestrator sandbox {}: run `tod-sandbox orchestrator`", acct.orchestrator))?;
+    let list = previews.as_array().cloned().unwrap_or_default();
+    let url_of = |p: &serde_json::Value| {
+        ["/status/url", "/spec/url", "/metadata/url", "/url"].iter().find_map(|k| p.pointer(k)?.as_str().map(str::to_string))
+    };
+    let Some(url) = list.iter().find_map(url_of) else {
+        bail!("the orchestrator has no public preview ({} listed): run `tod-sandbox orchestrator` to create it", list.len());
+    };
+    let url = url.trim_end_matches('/');
+    println!("GitHub payload URL:  {url}/webhooks/github   (content type application/json)");
+    println!("Linear URL:          {url}/webhooks/linear");
+    println!(
+        "Secrets: `tod-sandbox exec {} -- cat /data/webhooks.json` (GitHub's is the `github` value; Linear makes its own, set it as `linear` there and restart)",
+        acct.orchestrator
     );
     Ok(0)
 }

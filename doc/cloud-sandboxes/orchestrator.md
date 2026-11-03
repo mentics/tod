@@ -357,17 +357,16 @@ the user's tokens, which sit in its sandbox's proxy and nowhere else.
   sharing one orchestrator would overwrite each other.
 
 
-## Saving GitHub tokens probably restarts the orchestrator's container
+## The orchestrator's container can reset and lose `/data`
 
 Observed 2026-11-03: the orchestrator sandbox's container came back at 10:43
-UTC from its base image (no `/data`, no `/opt/tod-orchestrator`), the same
-minute `orchestrator-github.json` was saved in Settings. Saving calls
-`tod_core::orchestrator_github::apply`, which replaces the sandbox's proxy
-secrets (`update_proxy`), and a changed Blaxel sandbox spec can be applied by
-replacing the container. Without `orchestrator_volume` its `/data` goes with
-it: the wakes, the webhook secrets (so the URLs configured in GitHub and
-Linear stop matching), each user's database and GitHub routes. Recovery today:
-`tod-sandbox orchestrator` (starts it again), then each app reseeds on its next
-sync, which also re-sends its GitHub routes, and the orchestrator rebuilds its
-wakes from the pending waits it was reseeded with (`wake_rebuild`). Set
-`orchestrator_volume` to avoid the loss.
+UTC from its base image (no `/data`, no `/opt/tod-orchestrator`). The cause
+is not known. It coincided with saving `orchestrator-github.json` in Settings,
+but a later save (about 14:35) did not reset it, so saving tokens is not the
+cause. Without `orchestrator_volume` the loss is total: the wakes, the webhook
+secrets (so the URLs configured in GitHub and Linear stop matching), each
+user's database and GitHub routes. Recovery without a volume: `tod-sandbox
+orchestrator` (starts it again), then each app reseeds on its next sync, which
+also re-sends its GitHub routes, and the orchestrator rebuilds its wakes from
+the pending waits it was reseeded with (`wake_rebuild`). Use
+`orchestrator_volume` so none of that is needed.
