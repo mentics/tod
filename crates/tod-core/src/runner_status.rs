@@ -251,6 +251,7 @@ mod tests {
             attempt: 0,
             max_attempts: None,
             last_error: None,
+            stay: None,
         };
         let waits = [wait("github:pr:12:merged", 500), wait("notes", 1), wait("github:pr:13:review", 900)];
         assert_eq!(github_wait(&waits), Some(("the merge of pull request #12".to_string(), 500)));

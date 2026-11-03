@@ -219,8 +219,8 @@ impl Default for PrReadinessSettings {
 }
 
 /// How often a pull request waiting for a person is read again: every five
-/// minutes by default, in or out of the working day
-/// (`tod_core::wait_cadence`).
+/// minutes in the working day by default, and every four hours outside it
+/// (`tod_core::wait_cadence`), when nobody is going to review it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReviewSchedule {
     /// The reviewers' offset from UTC in minutes; this machine's when unset.
@@ -256,7 +256,7 @@ fn default_review_interval_minutes() -> u32 {
     5
 }
 fn default_review_off_hours_minutes() -> u32 {
-    5
+    240
 }
 
 impl Default for ReviewSchedule {

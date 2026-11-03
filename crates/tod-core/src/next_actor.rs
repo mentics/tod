@@ -37,12 +37,8 @@ use tod_store::cloud_activity::CloudBeat;
 use tod_store::conversation::ProtocolKind;
 use tod_store::deferrals::DeferralRepo;
 use tod_store::outline::repos::NodeRepo;
-use tod_store::waits::{Wait, WaitRepo};
+use tod_store::waits::{GiveUp, Wait, WaitRepo};
 use uuid::Uuid;
-
-/// Longest an `Others` wait may go unobserved past its next check, at least,
-/// before it is shown as overdue (see [`ExternalWait::overdue`]).
-pub const OVERDUE_GRACE_MS: i64 = 2 * 60 * 1000;
 
 /// Who has to act for the node to move.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -150,8 +146,9 @@ pub struct ExternalWait {
     pub since: i64,
     /// When GitHub (or whatever it is) is looked at next (ms).
     pub next_check_ms: Option<i64>,
-    /// The next look is well past due and nothing has been observed since:
-    /// the thing that should be looking is not. Derived, never stored.
+    /// Always false now: a wait well past due is the user's
+    /// (`NextActor::You`, by the one `Wait::expired_by` check), never
+    /// `Others`. Kept for the views that read it.
     pub overdue: bool,
     /// The last look failed and another is due: what failed, and how many
     /// times. Only while retrying; once the retries are spent the node is
@@ -622,9 +619,20 @@ fn actor_for(facts: &Facts<'_>) -> (NextActor, i64) {
         );
         return (NextActor::You { why: YouReason::Failed { error }, since: beat.heartbeat_at }, beat.heartbeat_at);
     }
+    // A wait recorded in a stay the node has left no longer holds anything
+    // (the move that ended it may not have reached this copy of the
+    // database): it is ignored here and ended by the sweep.
+    let waits: Vec<&Wait> = facts
+        .waits
+        .iter()
+        .filter(|w| {
+            let ends = GiveUp::for_kind(&w.kind).is_some_and(GiveUp::ends_with_stay);
+            !(ends && w.stay.is_some_and(|stay| stay != facts.entered_at))
+        })
+        .collect();
     // A look at the outside that failed as often as it may (or in a way
     // asking again cannot fix) is the user's, with the error.
-    if let Some(wait) = facts.waits.iter().find(|w| w.exhausted()) {
+    if let Some(wait) = waits.iter().copied().find(|w| w.exhausted()) {
         return (
             NextActor::You {
                 why: YouReason::Failed {
@@ -637,10 +645,10 @@ fn actor_for(facts: &Facts<'_>) -> (NextActor, i64) {
     }
     // A wait long past its time that nothing is looking at is the user's:
     // the wake that should have served it is not coming.
-    if let Some((wait, overdue_ms)) = facts
-        .waits
+    if let Some((wait, overdue_ms)) = waits
         .iter()
-        .filter_map(|w| unserved_overdue(w, facts).map(|late| (w, late)))
+        .copied()
+        .filter_map(|w| w.expired_by(facts.now_ms, facts.cloud.is_some()).map(|late| (w, late)))
         .max_by_key(|(_, late)| *late)
     {
         let on = wait.detail.clone().filter(|d| !d.trim().is_empty()).unwrap_or_else(|| wait.match_spec.clone());
@@ -658,22 +666,44 @@ fn actor_for(facts: &Facts<'_>) -> (NextActor, i64) {
         );
     }
     // A failing look shows before the waits that are fine: it is the news.
-    if let Some(wait) = facts
-        .waits
-        .iter()
-        .find(|w| w.last_error.is_some())
-        .or(facts.waits.first())
-    {
-        return (
-            NextActor::Others {
-                wait: external_wait(wait, facts.now_ms),
-            },
-            0,
-        );
+    if let Some(wait) = waits.iter().copied().find(|w| w.last_error.is_some()).or(waits.first().copied()) {
+        return (NextActor::Others { wait: external_wait(wait) }, 0);
     }
     // A run that ended to wait, with no wait row left to say so, is still a
     // wait on something outside, and says so.
     if let Some((Outcome::Waiting { what, due_at_ms }, at)) = &run.last_outcome {
+        // The time it was to be looked at again has long passed: the same
+        // fault as a wait row past due, by the same check.
+        let as_wait = Wait {
+            id: Uuid::nil(),
+            node_id: facts.node_id,
+            kind: tod_store::waits::KIND_EVENT.into(),
+            match_spec: String::new(),
+            every_secs: None,
+            due_at: *due_at_ms,
+            state: tod_store::waits::WAIT_PENDING.into(),
+            created_at: *at,
+            updated_at: *at,
+            detail: None,
+            attempt: 0,
+            max_attempts: None,
+            last_error: None,
+            stay: None,
+        };
+        if let Some(late) = as_wait.expired_by(facts.now_ms, facts.cloud.is_some()) {
+            return (
+                NextActor::You {
+                    why: YouReason::Stopped {
+                        reason: format!(
+                            "its wait on {what} was due {} ago and nothing is looking at it",
+                            format_elapsed(late)
+                        ),
+                    },
+                    since: *due_at_ms,
+                },
+                *due_at_ms,
+            );
+        }
         return (
             NextActor::Others {
                 wait: ExternalWait {
@@ -682,7 +712,7 @@ fn actor_for(facts: &Facts<'_>) -> (NextActor, i64) {
                     detail: Some(what.clone()),
                     since: *at,
                     next_check_ms: Some(*due_at_ms),
-                    overdue: due_at_ms.saturating_add(OVERDUE_GRACE_MS) < facts.now_ms,
+                    overdue: false,
                     retry: None,
                 },
             },
@@ -725,28 +755,9 @@ fn outcome_reason(outcome: &Outcome) -> Option<YouReason> {
     }
 }
 
-/// How long past its time a pending wait nothing serves is, in ms: past
-/// `due_at` by more than two of its own intervals (the gap between the last
-/// look and the next, which a poller keeps), or, on a node with no cloud
-/// supervisor to wake it, by more than [`UNSERVED_GRACE_MS`]. `None` while
-/// it is still within that. A cloud node's wake comes from the
-/// orchestrator, so the longer, interval-based bound applies there.
-fn unserved_overdue(wait: &Wait, facts: &Facts<'_>) -> Option<i64> {
-    let late = facts.now_ms - wait.due_at;
-    let interval = (wait.due_at - wait.updated_at).max(0);
-    let grace = if facts.cloud.is_some() { (2 * interval).max(OVERDUE_GRACE_MS) } else { UNSERVED_GRACE_MS };
-    (late > grace).then_some(late)
-}
-
-/// Past its time by this much, a wait on a node no cloud supervisor serves
-/// has no scheduler left to look at it.
-pub const UNSERVED_GRACE_MS: i64 = 10 * 60 * 1000;
-
-fn external_wait(wait: &Wait, now_ms: i64) -> ExternalWait {
-    // The poller reschedules a wait it has just looked at, so the gap between
-    // the last update and the next check is the interval it keeps.
-    let interval = (wait.due_at - wait.updated_at).max(0);
-    let grace = (2 * interval).max(OVERDUE_GRACE_MS);
+/// An `Others` wait. A wait past due is never shown this way: that is the
+/// user's (`Wait::expired_by`), so `overdue` is only ever false here.
+fn external_wait(wait: &Wait) -> ExternalWait {
     ExternalWait {
         kind: WaitKind::from_spec(&wait.match_spec),
         who: wait
@@ -759,7 +770,7 @@ fn external_wait(wait: &Wait, now_ms: i64) -> ExternalWait {
         detail: wait.detail.clone().filter(|d| !d.trim().is_empty()),
         since: wait.created_at,
         next_check_ms: Some(wait.due_at),
-        overdue: wait.due_at.saturating_add(grace) < now_ms,
+        overdue: false,
         retry: wait.last_error.as_ref().map(|error| Retry {
             attempt: wait.attempt,
             max: wait.max_attempts.unwrap_or(tod_store::waits::DEFAULT_MAX_ATTEMPTS),
@@ -794,6 +805,7 @@ mod tests {
             attempt: 0,
             max_attempts: None,
             last_error: None,
+            stay: None,
         }
     }
 
@@ -1210,18 +1222,53 @@ mod tests {
     }
 
     #[test]
-    fn a_wait_whose_next_check_is_long_past_is_overdue() {
+    fn a_wait_past_due_is_a_fault_never_others_and_not_yet_due_is_others() {
         let interval = 60_000;
         let mut c = case("pr");
+        c.cloud = Some(beat(100, tod_store::cloud_activity::STALE_AFTER_MS + 5_000));
+        c.cloud.as_mut().unwrap().what = tod_store::cloud_activity::IDLE_WHAT.into();
         // Looked at 10 minutes ago, due again 9 minutes ago, 1 minute interval.
         c.waits = vec![wait("github:pr:7:review", NOW - 9 * 60_000, NOW - 9 * 60_000 - interval)];
+        assert!(
+            matches!(standing(&c).actor, NextActor::You { why: YouReason::Stopped { .. }, .. }),
+            "past due beyond its grace is the user's"
+        );
+        // The same wait on a node nothing schedules: 9 minutes is still within the grace.
+        c.cloud = None;
         let NextActor::Others { wait } = standing(&c).actor else { panic!("not others") };
-        assert!(wait.overdue);
-
+        assert!(!wait.overdue, "an Others wait is never overdue");
         // Due a moment ago is just the poller about to run.
         c.waits = vec![wait_at(NOW - 5_000, NOW - 65_000)];
-        let NextActor::Others { wait } = standing(&c).actor else { panic!("not others") };
-        assert!(!wait.overdue);
+        assert!(matches!(standing(&c).actor, NextActor::Others { .. }));
+    }
+
+    #[test]
+    fn a_run_that_ended_waiting_long_past_its_time_with_no_row_is_the_users() {
+        let mut c = case("pr");
+        c.run.last_outcome = Some((Outcome::Waiting { what: "a review".into(), due_at_ms: NOW - 30 * 60_000 }, 50));
+        let NextActor::You { why: YouReason::Stopped { reason }, .. } = standing(&c).actor else {
+            panic!("not the user's")
+        };
+        assert!(reason.contains("a review") && reason.contains("nothing is looking"), "{reason}");
+    }
+
+    #[test]
+    fn a_wait_of_a_stay_the_node_left_is_ignored() {
+        let mut c = case("pr");
+        let mut stale = wait("github:pr:7:review", NOW + 60_000, NOW);
+        stale.stay = Some(500 - 1);
+        c.waits = vec![stale.clone()];
+        let NextActor::You { why: YouReason::NotStarted, .. } = standing(&c).actor else {
+            panic!("a wait of an ended stay held the node")
+        };
+        stale.stay = Some(500);
+        c.waits = vec![stale.clone()];
+        assert!(matches!(standing(&c).actor, NextActor::Others { .. }));
+        // An `until` wait (a usage limit) outlives the stay.
+        stale.stay = Some(500 - 1);
+        stale.kind = "until".into();
+        c.waits = vec![stale];
+        assert!(matches!(standing(&c).actor, NextActor::Others { .. }));
     }
 
     #[test]

@@ -1,7 +1,7 @@
 //! The orchestrator answers a GitHub wait's deadline itself
 //! (`doc/cloud-sandboxes/orchestrator.md`, "Waiting on GitHub").
 //!
-//! A node in `approved` or `merged` waits for a pull request to be merged or
+//! A node in `pr_draft`, `pr_review`, `approved` or `merged` waits for a pull request to be merged or
 //! released, which a webhook usually announces (`crate::webhooks`). The wait
 //! also has a deadline, the next scheduled look, in case a webhook was lost.
 //! Poking the node's sandbox for that look would wake it only to find
@@ -11,7 +11,11 @@
 //! database, with the orchestrator's GitHub access (a proxy rule, `TOD_GITHUB_AUTH=proxy`).
 //!
 //! - Still waiting: the check has recorded the next look; the wake moves to
-//!   it and the sandbox stays asleep, or does not exist.
+//!   it and the sandbox stays asleep, or does not exist. This includes a
+//!   `pr_review` node whose pull request waits only for a person's review:
+//!   the look is at the review cadence (`tod_core::wait_cadence`: minutes in
+//!   the working day, hours outside it), never a sandbox wake. A bot's
+//!   review, running checks, and work for the agent still poke.
 //! - Clear, or nothing to wait on: poke, the node goes on.
 //! - Not readable (no GitHub access here, a failed read): poke, as before,
 //!   and say why on stderr; the sandbox's own check then reads GitHub with
@@ -55,8 +59,14 @@ impl GithubGate {
             .context("the node is not in the user's database")?;
         // A wait of a family the node's state has no use for (it left the
         // state that recorded it) is ended here, not poked a sandbox for.
-        if let Some(allowed) = tod_store::waits::spec_states(&wait.match_spec)
-            && !allowed.contains(&lifecycle.as_str())
+        // The same for a wait recorded in a stay the node has left, even in
+        // a state that takes its spec family (the node went back and forward).
+        let stay_ended = match (wait.stay, data.store.read(|conn| tod_store::waits::current_stay(conn, node))?) {
+            (Some(recorded), Some(current)) => recorded != current,
+            _ => false,
+        };
+        if stay_ended
+            || tod_store::waits::spec_states(&wait.match_spec).is_some_and(|allowed| !allowed.contains(&lifecycle.as_str()))
         {
             data.store
                 .interview(
@@ -65,7 +75,7 @@ impl GithubGate {
                 )
                 .map_err(|e| anyhow::anyhow!("end the wait that no longer belongs to {lifecycle}: {e}"))?;
             eprintln!(
-                "tod-orchestrator: {}'s node {node}: ended wait `{}` that does not belong to {lifecycle}",
+                "tod-orchestrator: {}'s node {node}: ended wait `{}` that does not belong to {lifecycle} or its stay",
                 wake.user, wait.match_spec
             );
             return Ok(Verdict::Drop);

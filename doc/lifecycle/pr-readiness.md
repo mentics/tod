@@ -391,9 +391,11 @@ says why it fails.
 
 A pull request waiting for a person (a draft to be marked ready, a reviewer)
 is read again every `pr_readiness.review_schedule.interval_minutes`
-(default 5, in or out of the working day; `off_hours_interval_minutes`
-caps the gap at night). Each look, in the app's `Check now` and in the
-orchestrator's gate, has three outcomes:
+(default 5 in the working day; `off_hours_interval_minutes`, default 240,
+caps the gap at night and at weekends). Each look, in the app's `Check now`
+and in the orchestrator's gate (which absorbs the `pr_review` wait too, so a
+pull request waiting for a person does not wake the sandbox), has three
+outcomes:
 
 1. Nothing changed: the next look is recorded and the sandbox stays asleep.
 2. Ready for review and reviewed: the wait ends and the gate can pass.

@@ -103,7 +103,14 @@ worktree `tod-cli-vm-connection-ee97d5` against current `main`, deploy the
 orchestrator first. Also move `conversations.opening_context` into a
 write-once table so an update does not copy 50 KB into the log.
 
-### 3.3 Waits owned by lifecycle stays (autopilot D2)
+### 3.3 Waits owned by lifecycle stays (autopilot D2) — landed
+
+Done: `waits.stay` (schema v88, the node's `node_lifecycle.updated_at` when the
+wait was recorded); `sweep` and the orchestrator gate end a wait whose stay
+has ended (an `until` wait outlives it); `Wait::expired_by` is the one
+past-due check (past due is `You`, never `Others`); `GiveUp` names each kind's
+give-up behaviour; the gate absorbs `pr_review` waits for a person's review;
+off-hours cadence default is 240 minutes.
 
 2.5 cancels and expires. The full rule: record the stay id on every wait;
 ending the stay ends its waits; `next_actor` has one authoritative
