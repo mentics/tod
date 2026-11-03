@@ -137,7 +137,7 @@ fn request_words(kind: &str) -> (&'static str, &'static str) {
     match kind {
         cloud_sync::REQUEST_FRESH_SESSION => ("a new session", "Run with a new session"),
         cloud_sync::REQUEST_FRESH_BUDGET => ("a fresh budget", "Resume with a fresh budget"),
-        cloud_sync::REQUEST_KEEP_GOING => ("to go on", "Resume"),
+        cloud_sync::REQUEST_KEEP_GOING => ("it to go on", "Resume"),
         _ => ("this", "The request"),
     }
 }
@@ -282,4 +282,19 @@ fn spawn<T: 'static>(
         }
     })
     .detach();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// "Asked for {what}" and "Asking the supervisor for {what}" must read as
+    /// sentences for every request.
+    #[test]
+    fn request_words_read_in_the_asked_for_sentence() {
+        for kind in [cloud_sync::REQUEST_FRESH_SESSION, cloud_sync::REQUEST_FRESH_BUDGET, cloud_sync::REQUEST_KEEP_GOING] {
+            let (what, _) = request_words(kind);
+            assert!(!what.starts_with("to "), "{kind}: Asked for {what}");
+        }
+    }
 }
