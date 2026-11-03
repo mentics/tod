@@ -919,28 +919,7 @@ impl Autopilot {
         live: &[crate::pr_readiness::LivePr],
         settings: &tod_store::PrReadinessSettings,
     ) -> Result<Outcome> {
-        use crate::pr_readiness::Wait;
-        let waiting_on = live
-            .iter()
-            .find(|p| p.assessment.waits().iter().any(|w| matches!(w, Wait::HumanReview)))
-            .map(|p| p.pr.clone());
-        let requested = live
-            .iter()
-            .find(|p| p.assessment.waits().iter().any(|w| matches!(w, Wait::HumanReview)))
-            .map(|p| p.assessment.requested_reviewers.as_slice())
-            .unwrap_or_default();
-        let spec = crate::next_actor::review_spec(waiting_on.as_ref().map(|pr| pr.pr_number), requested);
-        let mut what = match &waiting_on {
-            Some(pr) => format!("a review of {}", pr.url),
-            None => "a review".to_string(),
-        };
-        if live.len() > 1 {
-            let each: Vec<String> = live
-                .iter()
-                .map(|p| format!("{} {}", crate::pr_readiness::pr_label(&p.pr), p.status()))
-                .collect();
-            what = format!("{what} ({})", each.join("; "));
-        }
+        let (spec, what) = github_wait::review_wait_of(live);
         let due_at_ms = self.record_github_wait(fleet, spec, "github:pr:", settings, &what)?;
         Ok(Outcome::Waiting { what, due_at_ms })
     }

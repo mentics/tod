@@ -53,8 +53,17 @@ impl PrFeed for Github {
     }
 }
 
-#[test]
-fn the_orchestrator_looks_at_github_for_a_due_wait_and_wakes_the_sandbox_only_for_work() {
+struct Rig {
+    base: PathBuf,
+    fleet: FleetStore,
+    node: Uuid,
+    wait: Uuid,
+    poked: Arc<Mutex<Vec<String>>>,
+    server: Arc<Server>,
+    remote: PathBuf,
+}
+
+fn rig(lifecycle: &str, spec: &str) -> Rig {
     let base: PathBuf = std::env::temp_dir().join(format!("tod-orch-gate-{}", Uuid::new_v4()));
     std::fs::create_dir_all(&base).unwrap();
     let app = base.join("app");
@@ -83,11 +92,11 @@ fn the_orchestrator_looks_at_github_for_a_due_wait_and_wakes_the_sandbox_only_fo
         .unwrap();
     fleet.writer().flush().unwrap();
     let _ = fleet.reload_if_stale();
-    tod_core::lifecycle::set_lifecycle(&fleet, node, "merged").unwrap();
+    tod_core::lifecycle::set_lifecycle(&fleet, node, lifecycle).unwrap();
     let wait = {
         let conn = rusqlite::Connection::open(app.join("tod.db")).unwrap();
         tod_store::cloud_nodes::upsert(&conn, node, "node-x", "alice", 1).unwrap();
-        WaitRepo::new(&conn).create(node, &NewWait::event("github:release:published", 0)).unwrap().id
+        WaitRepo::new(&conn).create(node, &NewWait::event(spec, 0)).unwrap().id
     };
     let _ = fleet.reload_if_stale();
 
@@ -111,6 +120,12 @@ fn the_orchestrator_looks_at_github_for_a_due_wait_and_wakes_the_sandbox_only_fo
     assert_eq!(seeded.status, 200, "{}", String::from_utf8_lossy(&seeded.body));
     let remote = orch.join("users").join("alice").join("tod.db");
 
+    Rig { base, fleet, node, wait, poked, server, remote }
+}
+
+#[test]
+fn the_orchestrator_looks_at_github_for_a_due_wait_and_wakes_the_sandbox_only_for_work() {
+    let Rig { base, fleet, node, wait, poked, server, remote } = rig("merged", "github:release:published");
     let github = Arc::new(Github(Mutex::new(None)));
     set_feed_override(Some(github.clone()));
     server
@@ -140,6 +155,93 @@ fn the_orchestrator_looks_at_github_for_a_due_wait_and_wakes_the_sandbox_only_fo
     let conn = rusqlite::Connection::open(&remote).unwrap();
     assert!(WaitRepo::new(&conn).list_pending_for_node(node).unwrap().is_empty(), "the wait is cleared");
 
+    set_feed_override(None);
+    drop(fleet);
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// A pull request that waits only for a person's review: the gate absorbs the
+/// `pr_review` wait, moving the wake to the next look at the review cadence
+/// and leaving the sandbox asleep. Work for the agent still pokes it.
+struct Review(Mutex<&'static str>);
+
+impl PrFeed for Review {
+    fn snapshot(&self, _: &NodePr) -> Result<PrSnapshot, String> {
+        let checks = *self.0.lock().unwrap();
+        Ok(PrSnapshot {
+            status: tod_store::github::PrStatus {
+                mergeable: Some(true),
+                mergeable_state: Some("blocked".into()),
+                behind_by: Some(0),
+                checks: Some(checks.into()),
+                head_sha: Some("abc".into()),
+                open: true,
+                ..Default::default()
+            },
+            threads: Vec::new(),
+            comments: Vec::new(),
+            reviews: Vec::new(),
+        })
+    }
+    fn merge(&self, _: &NodePr) -> Result<PrMerge, String> {
+        Err("not read here".into())
+    }
+    fn releases(&self, _: &NodePr) -> Result<Vec<Release>, String> {
+        Ok(Vec::new())
+    }
+}
+
+#[test]
+fn a_pr_review_wait_for_a_person_does_not_wake_the_sandbox() {
+    let Rig { base, fleet, node, wait, poked, server, remote } = rig("pr_review", "github:pr:1:review");
+    let feed = Arc::new(Review(Mutex::new("success")));
+    set_feed_override(Some(feed.clone()));
+    server
+        .wakes()
+        .put(Wake { id: wait.to_string(), user: "alice".into(), node: node.to_string(), sandbox: "node-x".into(), at: 0 })
+        .unwrap();
+
+    server.wakes().fire_due(now_ms());
+    assert!(poked.lock().unwrap().is_empty(), "a review nobody has done yet is not a reason to wake the sandbox");
+    let rows = server.wakes().list();
+    assert_eq!(rows.len(), 1);
+    assert!(rows[0].at > now_ms(), "the wake moved to the next look");
+    let conn = rusqlite::Connection::open(&remote).unwrap();
+    let pending = WaitRepo::new(&conn).list_pending_for_node(node).unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].match_spec, "github:pr:1:review");
+    assert_eq!(pending[0].id.to_string(), rows[0].id);
+    drop(conn);
+
+    // Now a check fails: that is the agent's work, so the sandbox is woken.
+    *feed.0.lock().unwrap() = "failure";
+    server.wakes().fire_due(i64::MAX / 2);
+    assert_eq!(*poked.lock().unwrap(), ["node-x"]);
+
+    set_feed_override(None);
+    drop(fleet);
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn a_wait_from_a_stay_the_node_has_left_is_ended_not_poked() {
+    let Rig { base, fleet, node, wait, poked, server, remote } = rig("pr_review", "github:pr:1:review");
+    // The wait claims a stay that is not the node's current one (the node
+    // went back and forward again, and this copy never saw it end).
+    {
+        let conn = rusqlite::Connection::open(&remote).unwrap();
+        conn.execute("UPDATE waits SET stay = stay - 1000", []).unwrap();
+    }
+    set_feed_override(Some(Arc::new(Review(Mutex::new("success")))));
+    server
+        .wakes()
+        .put(Wake { id: wait.to_string(), user: "alice".into(), node: node.to_string(), sandbox: "node-x".into(), at: 0 })
+        .unwrap();
+    server.wakes().fire_due(now_ms());
+    assert!(poked.lock().unwrap().is_empty());
+    assert!(server.wakes().list().is_empty(), "the wake is dropped");
+    let conn = rusqlite::Connection::open(&remote).unwrap();
+    assert!(WaitRepo::new(&conn).list_pending_for_node(node).unwrap().is_empty());
     set_feed_override(None);
     drop(fleet);
     let _ = std::fs::remove_dir_all(&base);

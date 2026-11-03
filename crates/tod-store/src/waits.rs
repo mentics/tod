@@ -66,7 +66,8 @@ pub const CREATE_TABLE: &str = "
         detail      TEXT,
         attempt      INTEGER NOT NULL DEFAULT 0,
         max_attempts INTEGER,
-        last_error   TEXT
+        last_error   TEXT,
+        stay         INTEGER
     );
     CREATE INDEX IF NOT EXISTS idx_waits_node ON waits(node_id, state, due_at);
     CREATE INDEX IF NOT EXISTS idx_waits_due ON waits(state, due_at);
@@ -98,13 +99,90 @@ pub struct Wait {
     /// Why the last look failed, until a look succeeds.
     #[serde(default)]
     pub last_error: Option<String>,
+    /// The lifecycle stay the wait was recorded in: when the node entered
+    /// its state (`node_lifecycle.updated_at`, which a move to another state
+    /// changes and a repeat of the same state does not), schema v88. The wait
+    /// belongs to that stay and ends with it ([`sweep`]). `None` for a wait
+    /// recorded before v88, or on a node with no lifecycle.
+    #[serde(default)]
+    pub stay: Option<i64>,
 }
+
+/// What a wait does when its time comes and nobody has served it: the
+/// give-up behaviour every wait kind names ([`GiveUp::for_kind`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GiveUp {
+    /// `until`: the time is the whole wait. At it the node is woken and the
+    /// wait is satisfied; one that is not served is a fault shown to the
+    /// user (`tod_core::next_actor`), but is never expired on its own (the
+    /// usage-limit wait outlives any state).
+    WakeAtTime,
+    /// `event`: the deadline is the next look. The scheduler wakes the node
+    /// (or the orchestrator's gate looks) and reads the source directly. A
+    /// look nobody serves is a fault shown to the user, and the wait expires
+    /// ([`expire_overdue`]).
+    LookAtDeadline,
+    /// `check`: its command runs again every `every_secs`. A check nobody
+    /// runs is a fault shown to the user, and the wait expires.
+    RunAtInterval,
+}
+
+impl GiveUp {
+    /// The give-up behaviour of a wait of `kind`; `None` for a kind that
+    /// names none, which [`WaitRepo::create`] refuses.
+    pub fn for_kind(kind: &str) -> Option<GiveUp> {
+        match kind {
+            KIND_UNTIL => Some(GiveUp::WakeAtTime),
+            KIND_EVENT => Some(GiveUp::LookAtDeadline),
+            KIND_CHECK => Some(GiveUp::RunAtInterval),
+            _ => None,
+        }
+    }
+
+    /// Whether a wait nobody serves is expired by [`expire_overdue`].
+    pub fn expires_when_unserved(self) -> bool {
+        !matches!(self, GiveUp::WakeAtTime)
+    }
+
+    /// Whether the wait ends with the lifecycle stay that recorded it.
+    pub fn ends_with_stay(self) -> bool {
+        !matches!(self, GiveUp::WakeAtTime)
+    }
+}
+
+/// The shortest a wait may be past due before it is a fault.
+pub const OVERDUE_MIN_GRACE_MS: i64 = 2 * 60 * 1000;
+/// The longest a wait that a scheduler serves may be past due before it is a
+/// fault, whatever its interval (an orchestrator restart, a slow wake).
+pub const OVERDUE_MAX_GRACE_MS: i64 = 60 * 60 * 1000;
+/// A wait on a node nothing schedules has no one to wake it: past due by this
+/// much it is a fault.
+pub const UNSERVED_GRACE_MS: i64 = 10 * 60 * 1000;
 
 impl Wait {
     /// The looks have failed as often as they may, or failed in a way asking
     /// again cannot fix: the user has to act.
     pub fn exhausted(&self) -> bool {
         self.last_error.is_some() && self.max_attempts.is_some_and(|max| self.attempt >= max)
+    }
+
+    /// The one answer to "is this wait past due, and nobody came": how many
+    /// ms past its time it is once past the grace, else `None`. A past-due
+    /// wait is a fault (the user's), never something others will resolve.
+    /// `scheduled` is whether a scheduler serves the node (a cloud node's
+    /// wake comes from the orchestrator): its grace is two of the wait's own
+    /// intervals (the gap between the last look and the next, which a poller
+    /// keeps), within [`OVERDUE_MIN_GRACE_MS`]..[`OVERDUE_MAX_GRACE_MS`];
+    /// otherwise it is [`UNSERVED_GRACE_MS`].
+    pub fn expired_by(&self, now_ms: i64, scheduled: bool) -> Option<i64> {
+        let late = now_ms - self.due_at;
+        let grace = if scheduled {
+            let interval = (self.due_at - self.updated_at).max(0);
+            (2 * interval).clamp(OVERDUE_MIN_GRACE_MS, OVERDUE_MAX_GRACE_MS)
+        } else {
+            UNSERVED_GRACE_MS
+        };
+        (late > grace).then_some(late)
     }
 }
 
@@ -149,12 +227,12 @@ impl NewWait {
 }
 
 const COLUMNS: &str =
-    "id, node_id, kind, match_spec, every_secs, due_at, state, created_at, updated_at, detail";
+    "id, node_id, kind, match_spec, every_secs, due_at, state, created_at, updated_at, detail, stay";
 
 /// What is read back: [`COLUMNS`] and the retry columns.
 const SELECT_COLUMNS: &str =
     "id, node_id, kind, match_spec, every_secs, due_at, state, created_at, updated_at, detail, \
-     attempt, max_attempts, last_error";
+     stay, attempt, max_attempts, last_error";
 
 /// The retry columns: `attempt`, `max_attempts`, `last_error` (idempotent).
 pub fn add_retry(conn: &Connection) -> Result<()> {
@@ -171,6 +249,31 @@ pub fn add_retry(conn: &Connection) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// The `stay` column (schema v88, idempotent): the lifecycle stay a wait was
+/// recorded in. Waits already pending when it is added have none, and are
+/// ended by their spec's family instead ([`spec_states`]).
+pub fn add_stay(conn: &Connection) -> Result<()> {
+    let has = conn.prepare("SELECT 1 FROM pragma_table_info('waits') WHERE name = 'stay'")?.exists([])?;
+    if !has {
+        conn.execute_batch("ALTER TABLE waits ADD COLUMN stay INTEGER")?;
+    }
+    Ok(())
+}
+
+/// The node's current lifecycle stay (when it entered its state), if it has
+/// a lifecycle.
+pub fn current_stay(conn: &Connection, node: Uuid) -> Result<Option<i64>> {
+    let has = conn
+        .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'node_lifecycle'")?
+        .exists([])?;
+    if !has {
+        return Ok(None);
+    }
+    Ok(conn
+        .query_row("SELECT updated_at FROM node_lifecycle WHERE node_id = ?1", [uuid_to_blob(node)], |r| r.get(0))
+        .optional()?)
 }
 
 /// The `detail` column (idempotent).
@@ -196,9 +299,10 @@ fn row_to_wait(row: &Row<'_>) -> rusqlite::Result<Wait> {
         created_at: row.get(7)?,
         updated_at: row.get(8)?,
         detail: row.get(9)?,
-        attempt: row.get(10)?,
-        max_attempts: row.get(11)?,
-        last_error: row.get(12)?,
+        stay: row.get(10)?,
+        attempt: row.get(11)?,
+        max_attempts: row.get(12)?,
+        last_error: row.get(13)?,
     })
 }
 
@@ -230,9 +334,10 @@ impl<'a> WaitRepo<'a> {
         }
         let id = Uuid::new_v4();
         let now = now_ms();
+        let stay = current_stay(self.conn, node_id)?;
         self.conn.execute(
-            &format!("INSERT INTO waits ({COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7, ?7, ?8)"),
-            params![uuid_to_blob(id), uuid_to_blob(node_id), wait.kind, spec, wait.every_secs, wait.due_at, now, wait.detail],
+            &format!("INSERT INTO waits ({COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7, ?7, ?8, ?9)"),
+            params![uuid_to_blob(id), uuid_to_blob(node_id), wait.kind, spec, wait.every_secs, wait.due_at, now, wait.detail, stay],
         )?;
         self.get(id)?.context("wait vanished after insert")
     }
@@ -439,7 +544,8 @@ pub fn spec_states(spec: &str) -> Option<&'static [&'static str]> {
 
 /// The startup sweep: cancels pending waits that cannot be waited on any
 /// more, each with a detail naming the rule: the node is `done`; the node is
-/// a cloud node whose sandbox is lost (`lost_at` set); or an event wait's
+/// a cloud node whose sandbox is lost (`lost_at` set); the lifecycle stay
+/// that recorded the wait ([`Wait::stay`]) has ended; or an event wait's
 /// spec family does not belong to the node's lifecycle state
 /// ([`spec_states`]).
 pub fn sweep(conn: &Connection, now: i64) -> Result<Vec<Swept>> {
@@ -453,10 +559,19 @@ pub fn sweep(conn: &Connection, now: i64) -> Result<Vec<Swept>> {
             .query_row("SELECT state FROM node_lifecycle WHERE node_id = ?1", [uuid_to_blob(wait.node_id)], |r| r.get(0))
             .optional()?;
         let lost = crate::cloud_nodes::get(conn, wait.node_id)?.is_some_and(|c| c.lost_at.is_some());
+        let current_stay = current_stay(conn, wait.node_id)?;
         let reason = if state.as_deref() == Some("done") {
             Some("the node is done".to_string())
         } else if lost {
             Some("the node's sandbox is lost".to_string())
+        } else if let (Some(recorded), Some(current)) = (wait.stay, current_stay)
+            && recorded != current
+            && GiveUp::for_kind(&wait.kind).is_some_and(GiveUp::ends_with_stay)
+        {
+            // The wait was recorded in a stay that has ended: the node moved
+            // on (or back) since, and the move that ended it did not reach
+            // this copy of the database (a replica that synced late).
+            Some(format!("the stay in {} that recorded it has ended", state.as_deref().unwrap_or("its state")))
         } else if let (Some(state), Some(allowed)) = (state.as_deref(), spec_states(&wait.match_spec)) {
             (wait.kind == KIND_EVENT && !allowed.contains(&state))
                 .then(|| format!("a wait of {} does not belong to {state}", allowed.join("/")))
@@ -470,8 +585,9 @@ pub fn sweep(conn: &Connection, now: i64) -> Result<Vec<Swept>> {
     Ok(ended)
 }
 
-/// Marks `expired` every pending `event` wait more than `grace` past its
-/// deadline on a node nothing serves: no live cloud supervisor
+/// Marks `expired` every pending wait whose give-up behaviour expires it
+/// ([`GiveUp::expires_when_unserved`]: `event` and `check`) more than `grace`
+/// past its time on a node nothing serves: no live cloud supervisor
 /// (`cloud_activity`) and no live lifecycle lease (`activity`) on it. A wake
 /// that should have fired has not, so the wait would only block the node.
 pub fn expire_overdue(conn: &Connection, now: i64, grace: i64) -> Result<Vec<Swept>> {
@@ -479,7 +595,7 @@ pub fn expire_overdue(conn: &Connection, now: i64, grace: i64) -> Result<Vec<Swe
         return Ok(Vec::new());
     }
     let candidates = WaitRepo::new(conn)
-        .query("state = 'pending' AND kind = 'event' AND due_at + ?1 < ?2", params![grace, now])?;
+        .query("state = 'pending' AND kind IN ('event','check') AND due_at + ?1 < ?2", params![grace, now])?;
     let mut ended = Vec::new();
     for wait in &candidates {
         let cloud_live = crate::cloud_activity::get(conn, wait.node_id)?.is_some_and(|b| b.is_live(now));
@@ -759,6 +875,100 @@ mod tests {
         assert_eq!(pending(&r, local).len(), 1);
         assert_eq!(pending(&r, fresh).len(), 1);
         assert!(expire_overdue(&r.conn, 100_000, 200_000).unwrap().is_empty(), "within the grace");
+    }
+
+    #[test]
+    fn a_wait_records_the_stay_it_was_made_in_and_a_new_stay_ends_it() {
+        let r = real();
+        let node = node_in(&r, "pr_review");
+        let repo = WaitRepo::new(&r.conn);
+        let stay = current_stay(&r.conn, node).unwrap().unwrap();
+        let wait = repo.create(node, &NewWait::event("github:pr:1:review", 5)).unwrap();
+        assert_eq!(wait.stay, Some(stay), "the wait carries the node's stay");
+        assert_eq!(repo.create(node, &NewWait::until(9)).unwrap().stay, Some(stay));
+        // Setting the state it is already in is not a new stay.
+        NodeRepo::new(&r.conn).set_lifecycle(node, "pr_review").unwrap();
+        assert_eq!(current_stay(&r.conn, node).unwrap(), Some(stay));
+
+        // A copy of the database that never saw the stay end (a replica):
+        // the sweep ends the wait by its stay, though its spec family still fits.
+        r.conn.execute("UPDATE node_lifecycle SET updated_at = updated_at + 5", []).unwrap();
+        let swept = sweep(&r.conn, 100).unwrap();
+        assert_eq!(swept.len(), 1, "only the event wait: an `until` outlives the stay");
+        assert!(swept[0].reason.contains("stay"), "{}", swept[0].reason);
+        assert_eq!(repo.get(wait.id).unwrap().unwrap().state, WAIT_CANCELLED);
+        assert_eq!(repo.list_pending_for_node(node).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn leaving_a_state_for_a_new_stay_of_the_same_state_ends_its_waits() {
+        let r = real();
+        let node = node_in(&r, "pr_review");
+        let repo = WaitRepo::new(&r.conn);
+        repo.create(node, &NewWait::event("github:pr:1:review", 5)).unwrap();
+        NodeRepo::new(&r.conn).set_lifecycle(node, "pr_draft").unwrap();
+        assert!(pending(&r, node).is_empty());
+        // Back again later: the wait made then is of the new stay.
+        r.conn.execute("UPDATE node_lifecycle SET updated_at = updated_at + 1", []).unwrap();
+        NodeRepo::new(&r.conn).set_lifecycle(node, "pr_review").unwrap();
+        let again = repo.create(node, &NewWait::event("github:pr:1:review", 5)).unwrap();
+        assert!(sweep(&r.conn, 100).unwrap().is_empty());
+        assert_eq!(again.stay, current_stay(&r.conn, node).unwrap());
+    }
+
+    #[test]
+    fn every_wait_kind_names_its_give_up_behaviour() {
+        for kind in KINDS {
+            assert!(GiveUp::for_kind(kind).is_some(), "{kind} names no give-up behaviour");
+        }
+        assert_eq!(GiveUp::for_kind(KIND_UNTIL), Some(GiveUp::WakeAtTime));
+        assert!(GiveUp::for_kind("nonsense").is_none());
+        assert!(!GiveUp::WakeAtTime.expires_when_unserved());
+        assert!(GiveUp::LookAtDeadline.expires_when_unserved() && GiveUp::RunAtInterval.expires_when_unserved());
+    }
+
+    #[test]
+    fn an_overdue_check_wait_expires_but_an_overdue_until_does_not() {
+        let r = real();
+        let node = node_in(&r, "active");
+        let repo = WaitRepo::new(&r.conn);
+        let check = repo.create(node, &NewWait::check("true", 60, 0)).unwrap();
+        let until = repo.create(node, &NewWait::until(1_000)).unwrap();
+        let ended = expire_overdue(&r.conn, 10_000_000, 10_000).unwrap();
+        assert_eq!(ended.iter().map(|s| s.wait_id).collect::<Vec<_>>(), [check.id]);
+        assert_eq!(repo.get(until.id).unwrap().unwrap().state, WAIT_PENDING);
+    }
+
+    #[test]
+    fn expired_by_is_the_one_past_due_check() {
+        let mut w = Wait {
+            id: Uuid::nil(),
+            node_id: Uuid::nil(),
+            kind: KIND_EVENT.into(),
+            match_spec: "github:pr:1:review".into(),
+            every_secs: None,
+            due_at: 1_000_000,
+            state: WAIT_PENDING.into(),
+            created_at: 0,
+            updated_at: 1_000_000 - 60_000,
+            detail: None,
+            attempt: 0,
+            max_attempts: None,
+            last_error: None,
+            stay: None,
+        };
+        // Not served by a scheduler: ten minutes of grace.
+        assert_eq!(w.expired_by(1_000_000 + UNSERVED_GRACE_MS, false), None);
+        assert_eq!(w.expired_by(1_000_000 + UNSERVED_GRACE_MS + 1, false), Some(UNSERVED_GRACE_MS + 1));
+        // Served: two of its own intervals, at least two minutes.
+        assert_eq!(w.expired_by(1_000_000 + OVERDUE_MIN_GRACE_MS, true), None);
+        assert!(w.expired_by(1_000_000 + OVERDUE_MIN_GRACE_MS + 1, true).is_some());
+        // A long interval is capped, so a four-hour cadence is not eight hours of silence.
+        w.updated_at = w.due_at - 4 * 60 * 60 * 1000;
+        assert!(w.expired_by(1_000_000 + OVERDUE_MAX_GRACE_MS + 1, true).is_some());
+        assert_eq!(w.expired_by(1_000_000 + OVERDUE_MAX_GRACE_MS, true), None);
+        // Not yet due is never expired.
+        assert_eq!(w.expired_by(999_999, true), None);
     }
 
     #[test]

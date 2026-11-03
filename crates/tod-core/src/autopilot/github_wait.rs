@@ -176,6 +176,7 @@ fn look_at_github(
         "approved" => false,
         "merged" => true,
         "pr_draft" => return check_ready_for_review(fleet, node, data_root),
+        "pr_review" => return check_in_review(fleet, node, data_root),
         _ => return Ok(GithubCheck::NothingToWaitOn),
     };
     let links = fleet.read(|conn| NodePrRepo::new(conn).read(node))?;
@@ -305,6 +306,70 @@ fn check_ready_for_review(fleet: &FleetStore, node: uuid::Uuid, data_root: &std:
     let what = if standing.len() > 1 { format!("{what} ({})", standing.join("; ")) } else { what };
     let due_at_ms = record_github_wait(fleet, node, spec, "github:pr:", &settings, &what)?;
     Ok(GithubCheck::Waiting { what, due_at_ms })
+}
+
+/// The spec and the words of the wait for a person's review of `live`'s pull
+/// requests (what the babysitter records when only the review is missing).
+pub(super) fn review_wait_of(live: &[crate::pr_readiness::LivePr]) -> (String, String) {
+    use crate::pr_readiness::Wait;
+    let waiting = live.iter().find(|p| p.assessment.waits().iter().any(|w| matches!(w, Wait::HumanReview)));
+    let requested = waiting.map(|p| p.assessment.requested_reviewers.as_slice()).unwrap_or_default();
+    let spec = crate::next_actor::review_spec(waiting.map(|p| p.pr.pr_number), requested);
+    let mut what = match waiting {
+        Some(p) => format!("a review of {}", p.pr.url),
+        None => "a review".to_string(),
+    };
+    if live.len() > 1 {
+        let each: Vec<String> =
+            live.iter().map(|p| format!("{} {}", crate::pr_readiness::pr_label(&p.pr), p.status())).collect();
+        what = format!("{what} ({})", each.join("; "));
+    }
+    (spec, what)
+}
+
+/// `pr_review`: reads the pull requests as the babysitter does. When the
+/// only thing missing is a person's review, that is the wait ([`Waiting`],
+/// recorded at the review cadence): the orchestrator's gate absorbs it, so a
+/// pull request awaiting a person does not wake the sandbox. Work for the
+/// agent is [`Feedback`]. A bot's review or running checks are the
+/// babysitter's own short poll: left to it ([`NothingToWaitOn`]), as is a
+/// pull request that is clear or merged ([`Clear`]).
+///
+/// [`Waiting`]: GithubCheck::Waiting
+/// [`Feedback`]: GithubCheck::Feedback
+/// [`NothingToWaitOn`]: GithubCheck::NothingToWaitOn
+/// [`Clear`]: GithubCheck::Clear
+fn check_in_review(fleet: &FleetStore, node: uuid::Uuid, data_root: &std::path::Path) -> Result<GithubCheck> {
+    use crate::pr_readiness::{Next, Wait};
+    let links = fleet.read(|conn| NodePrRepo::new(conn).read(node))?;
+    if links.prs.is_empty() || !links.unrecognized.is_empty() {
+        return Ok(GithubCheck::NothingToWaitOn);
+    }
+    let Some(feed) = crate::pr_readiness::feed_for(data_root) else {
+        return Ok(GithubCheck::Unreadable("GitHub credentials are not set up".to_string()));
+    };
+    let settings = crate::pr_readiness::settings_at(data_root);
+    let answered_at = crate::pr_readiness::agent_answered_at(fleet, node)?;
+    let live = match crate::pr_readiness::live_answered(feed.as_ref(), &links.prs, &settings, answered_at) {
+        Ok(live) => live,
+        Err(err) => return Ok(GithubCheck::Unreadable(err)),
+    };
+    match crate::pr_readiness::overall(&live) {
+        Next::Merged | Next::Clear => {
+            cancel_github_waits(fleet, node)?;
+            Ok(GithubCheck::Clear)
+        }
+        Next::Work(work) => {
+            cancel_github_waits(fleet, node)?;
+            Ok(GithubCheck::Feedback { what: work_description(&work) })
+        }
+        Next::Wait(waits) if waits.iter().all(|w| matches!(w, Wait::HumanReview)) => {
+            let (spec, what) = review_wait_of(&live);
+            let due_at_ms = record_github_wait(fleet, node, spec, "github:pr:", &settings, &what)?;
+            Ok(GithubCheck::Waiting { what, due_at_ms })
+        }
+        Next::Wait(_) => Ok(GithubCheck::NothingToWaitOn),
+    }
 }
 
 /// What `work` asks of the agent, in words.

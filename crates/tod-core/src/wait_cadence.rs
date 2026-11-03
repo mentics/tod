@@ -3,7 +3,8 @@
 //! A review takes hours to days, so the check is seldom and follows the
 //! reviewers' day: every [`ReviewSchedule::interval_minutes`] inside the
 //! working day, and outside it (nights, weekends) one check shortly before
-//! the day begins, never more than `off_hours_interval_minutes` apart.
+//! the day begins, never more than `off_hours_interval_minutes` apart (hours:
+//! four by default).
 //! Pure: the caller passes the time and the UTC offset.
 
 use chrono::{DateTime, Datelike, Duration, FixedOffset, Timelike, Utc, Weekday};
@@ -65,11 +66,14 @@ pub fn next_check(now: DateTime<Utc>, schedule: &ReviewSchedule) -> DateTime<Utc
 #[cfg(test)]
 mod tests {
     #[test]
-    fn by_default_it_looks_every_five_minutes_day_and_night() {
+    fn by_default_it_looks_every_five_minutes_in_the_day_and_every_four_hours_out_of_it() {
         let s = ReviewSchedule { utc_offset_minutes: Some(0), ..ReviewSchedule::default() };
         let at = |s: &str| DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc);
         assert_eq!(next_check(at("2026-01-01T10:00:00Z"), &s), at("2026-01-01T10:05:00Z"));
-        assert_eq!(next_check(at("2026-01-03T23:00:00Z"), &s), at("2026-01-03T23:05:00Z"));
+        // A Saturday night: hours, not minutes (a sandbox is not woken every
+        // five minutes for a review nobody will do before Monday).
+        assert_eq!(next_check(at("2026-01-03T23:00:00Z"), &s), at("2026-01-04T03:00:00Z"));
+        assert_eq!(next_check(at("2026-01-06T20:00:00Z"), &s), at("2026-01-07T00:00:00Z"));
     }
 
     use super::*;
