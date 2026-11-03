@@ -115,14 +115,15 @@ fn a_long_poll_returns_empty_at_its_timeout_and_ignores_the_clients_own_changes(
     let after = s.seeded;
     let started = Instant::now();
     let poll = std::thread::spawn(move || {
-        let r = server.handle(&request("GET", "/users/alice/changes", &format!("after={after}&wait=2"), "app-2", Vec::new()));
+        let r = server.handle(&request("GET", "/users/alice/changes", &format!("after={after}&wait=5"), "app-2", Vec::new()));
         json(&r)
     });
     // Its own change wakes the poll but is not news to it: it keeps waiting.
+    // The poll is long enough that a slow machine posts it before it ends.
     std::thread::sleep(Duration::from_millis(300));
     post_a_change(&s, "app-2", s.seeded);
     let feed = poll.join().unwrap();
-    assert!(started.elapsed() >= Duration::from_secs(2), "answered after {:?}", started.elapsed());
+    assert!(started.elapsed() >= Duration::from_secs(5), "answered after {:?}", started.elapsed());
     assert!(feed["changes"].as_array().unwrap().is_empty(), "{feed}");
     assert_eq!(feed["waited"], true);
     assert!(feed["last_seq"].as_i64().unwrap() > s.seeded);
