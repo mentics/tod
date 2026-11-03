@@ -74,6 +74,9 @@ impl Host {
         }
     }
 
+    // The daemon command stays (a running run polls on its own); the task
+    // panel no longer has a Poll now entry.
+    #[allow(dead_code)]
     fn poll_now(&self, node: Uuid) {
         match self {
             Host::Daemon(daemon) => {
@@ -242,7 +245,8 @@ impl NodeRunners {
         }
     }
 
-    /// Read GitHub now for a run polling it.
+    /// Read GitHub now for a run polling it. No panel offers it any more.
+    #[allow(dead_code)]
     pub fn poll_now(&mut self, node: Uuid, cx: &mut Context<Self>) {
         if self.is_running(node) {
             let host = self.host.clone();

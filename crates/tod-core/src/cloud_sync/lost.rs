@@ -595,10 +595,148 @@ pub fn delete_node_sandbox_anyway(fleet: &FleetStore, node_id: &str) -> Result<S
     delete_node_sandbox_with(fleet, node_id, true)
 }
 
-// A8: "Stop and delete" (`stop_and_delete_node_sandbox`) goes here: stop the
-// runner (local: the daemon's `RunnerStop`; supervised: A4's `stop_now`
-// request), wait for it to end, then call the delete above. Until then the
-// delete refuses an active runner and the caller must stop it first.
+/// How long [`stop_and_delete_node_sandbox`] waits, and how often it looks.
+#[derive(Debug, Clone, Copy)]
+struct StopBounds {
+    /// Between two looks at whether the runner has ended.
+    poll: std::time::Duration,
+    /// A local run: how long the daemon has to end it before the delete is refused.
+    local_within: std::time::Duration,
+    /// A supervised run: how long the supervisor has to stop (its heartbeat
+    /// goes stale after `STALE_AFTER_MS` anyway), after which the sandbox is
+    /// deleted regardless.
+    supervised_within: std::time::Duration,
+}
+
+const STOP_BOUNDS: StopBounds = StopBounds {
+    poll: std::time::Duration::from_secs(4),
+    local_within: std::time::Duration::from_secs(30),
+    supervised_within: std::time::Duration::from_millis(tod_store::cloud_activity::STALE_AFTER_MS as u64 + 5_000),
+};
+
+/// Stops a node's runner and looks at how it is going, so stop-then-delete
+/// can be tested without a daemon or a supervisor.
+trait RunnerStopper {
+    fn stop(&mut self, fleet: &FleetStore, node_id: &str, place: crate::runner_place::RunnerPlace) -> Result<()>;
+    /// One pause between looks; a supervised run also syncs, so the
+    /// supervisor's report reaches this machine.
+    fn wait_step(
+        &mut self,
+        fleet: &FleetStore,
+        place: crate::runner_place::RunnerPlace,
+        poll: std::time::Duration,
+    ) -> Result<()>;
+}
+
+struct RealStopper;
+
+impl RunnerStopper for RealStopper {
+    fn stop(&mut self, fleet: &FleetStore, node_id: &str, place: crate::runner_place::RunnerPlace) -> Result<()> {
+        let root = fleet.paths().root().to_path_buf();
+        match place {
+            crate::runner_place::RunnerPlace::Supervisor => {
+                super::wake_node_requesting(fleet, &root, node_id, super::REQUEST_STOP_NOW)
+                    .context("ask the supervisor to stop now")?;
+            }
+            crate::runner_place::RunnerPlace::Local => {
+                // A run hosted in this process (no daemon) is stopped by the
+                // caller, which holds it (`NodeRunners::stop_now`); the
+                // daemon's runs are stopped here.
+                if fleet.is_client() {
+                    let uuid = uuid::Uuid::parse_str(node_id).with_context(|| format!("node id {node_id}"))?;
+                    tod_agentd_client::remote::DaemonWriter::new(&root, None)
+                        .runner_stop(uuid)
+                        .context("ask the daemon to stop the node's runner")?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn wait_step(
+        &mut self,
+        fleet: &FleetStore,
+        place: crate::runner_place::RunnerPlace,
+        poll: std::time::Duration,
+    ) -> Result<()> {
+        std::thread::sleep(poll);
+        if place == crate::runner_place::RunnerPlace::Supervisor {
+            let root = fleet.paths().root().to_path_buf();
+            let (orch, user) = resolve(&root)?;
+            sync(fleet, &root, &orch, &user).context("sync to see whether the supervisor has stopped")?;
+        }
+        Ok(())
+    }
+}
+
+/// [`delete_node_sandbox`] (or [`delete_node_sandbox_anyway`] when
+/// `checkpoint` is false) for a node whose runner may be active: the runner
+/// is stopped first and the delete waits for it to end.
+///
+/// - **Local:** the daemon's runner stop (a run hosted in this process is
+///   stopped by the caller), then until the run's activity lease ends; if it
+///   does not end in 30 seconds the delete is refused with that error.
+/// - **Supervised:** the `stop_now` request (row, marker, poke), then syncs
+///   until the supervisor's heartbeat ends, bounded by the stale-heartbeat
+///   window; if it does not stop in time the progress line says so and the
+///   sandbox, and the supervisor in it, is deleted anyway (the checkpoint
+///   still runs first when `checkpoint`).
+///
+/// A node whose runner is not active is simply deleted. Blocks.
+pub fn stop_and_delete_node_sandbox(
+    fleet: &FleetStore,
+    node_id: &str,
+    checkpoint: bool,
+    progress: &mut dyn FnMut(&str),
+) -> Result<String> {
+    let mut backend = BlaxelBackend::load(fleet.paths().root())?;
+    stop_and_delete_with(fleet, node_id, !checkpoint, progress, &mut RealStopper, STOP_BOUNDS, &mut backend)
+}
+
+fn stop_and_delete_with(
+    fleet: &FleetStore,
+    node_id: &str,
+    force: bool,
+    progress: &mut dyn FnMut(&str),
+    stopper: &mut dyn RunnerStopper,
+    bounds: StopBounds,
+    backend: &mut dyn SandboxBackend,
+) -> Result<String> {
+    use crate::runner_place::RunnerPlace;
+    let uuid = uuid::Uuid::parse_str(node_id).with_context(|| format!("node id {node_id}"))?;
+    let mut runner_ignored = false;
+    if runner_blocker(fleet, node_id)?.is_some() {
+        progress("Stopping, then deleting the sandbox\u{2026}");
+        let place = RunnerPlace::of(fleet, uuid)?;
+        stopper.stop(fleet, node_id, place)?;
+        let within = match place {
+            RunnerPlace::Local => bounds.local_within,
+            RunnerPlace::Supervisor => bounds.supervised_within,
+        };
+        let deadline = std::time::Instant::now() + within;
+        while let Some(why) = runner_blocker(fleet, node_id)? {
+            if std::time::Instant::now() >= deadline {
+                match place {
+                    RunnerPlace::Local => anyhow::bail!(
+                        "the sandbox was not deleted: {why} still, {} seconds after it was told to stop",
+                        within.as_secs()
+                    ),
+                    RunnerPlace::Supervisor => {
+                        progress(&format!(
+                            "The supervisor did not report stopping within {} seconds ({why}); deleting the sandbox anyway.",
+                            within.as_secs()
+                        ));
+                        runner_ignored = true;
+                        break;
+                    }
+                }
+            }
+            stopper.wait_step(fleet, place, bounds.poll)?;
+        }
+    }
+    let plan = delete_plan_with(fleet, node_id, !runner_ignored)?;
+    delete_with(fleet, node_id, &plan, force, backend)
+}
 
 /// Keeps the sandbox's uncommitted work before it is deleted. A failure says
 /// so and why, and that nothing was deleted; it is never swallowed.
@@ -642,6 +780,12 @@ struct DeletePlan {
 }
 
 fn delete_plan(fleet: &FleetStore, node_id: &str) -> Result<DeletePlan> {
+    delete_plan_with(fleet, node_id, true)
+}
+
+/// `check_runner` false: the caller stopped the runner, waited, and chose to
+/// delete although the supervisor did not report stopping.
+fn delete_plan_with(fleet: &FleetStore, node_id: &str, check_runner: bool) -> Result<DeletePlan> {
     let uuid = uuid::Uuid::parse_str(node_id).with_context(|| format!("node id {node_id}"))?;
     let location = tod_store::fleet::provision::node_location(fleet, node_id)?.filter(|l| l.sandbox().is_some());
     let row = fleet.read(|c| cloud_nodes::get(c, uuid))?;
@@ -654,7 +798,7 @@ fn delete_plan(fleet: &FleetStore, node_id: &str) -> Result<DeletePlan> {
     if names.is_empty() {
         anyhow::bail!("this node has no sandbox: neither its Files location nor a cloud run records one");
     }
-    if let Some(why) = runner_blocker(fleet, node_id)? {
+    if check_runner && let Some(why) = runner_blocker(fleet, node_id)? {
         anyhow::bail!("the sandbox was not deleted: {why}; stop it first");
     }
     Ok(DeletePlan { location, row, names })
@@ -1125,5 +1269,128 @@ mod tests {
         drop(conn);
         let err = delete_plan(&fx.fleet, &fx.id()).err().expect("refused").to_string();
         assert!(err.contains("supervisor"), "{err}");
+    }
+
+    /// A stopper whose stop ends the run (a lease or heartbeat removed) or
+    /// does not, and that counts its looks.
+    struct FakeStopper {
+        db: std::path::PathBuf,
+        ends_the_run: bool,
+        stops: Vec<crate::runner_place::RunnerPlace>,
+        looks: usize,
+    }
+
+    impl RunnerStopper for FakeStopper {
+        fn stop(&mut self, _: &FleetStore, _: &str, place: crate::runner_place::RunnerPlace) -> Result<()> {
+            self.stops.push(place);
+            if self.ends_the_run {
+                let conn = rusqlite::Connection::open(&self.db).unwrap();
+                conn.execute("DELETE FROM node_activity", []).unwrap();
+                conn.execute("DELETE FROM cloud_activity", []).unwrap();
+            }
+            Ok(())
+        }
+        fn wait_step(&mut self, _: &FleetStore, _: crate::runner_place::RunnerPlace, poll: std::time::Duration) -> Result<()> {
+            self.looks += 1;
+            std::thread::sleep(poll);
+            Ok(())
+        }
+    }
+
+    const QUICK: StopBounds = StopBounds {
+        poll: std::time::Duration::from_millis(5),
+        local_within: std::time::Duration::from_millis(40),
+        supervised_within: std::time::Duration::from_millis(40),
+    };
+
+    fn live_run(fx: &Fx) {
+        let now = tod_store::outline::uuid_blob::now_ms();
+        fx.fleet
+            .enqueue(FleetMutation::ActivityStart {
+                id: Uuid::new_v4(),
+                node: fx.node,
+                kind: tod_store::activity::KIND_RUN.into(),
+                owner: "daemon".into(),
+                at: now,
+            })
+            .unwrap();
+        fx.fleet.writer().flush().unwrap();
+    }
+
+    fn stopper(fx: &Fx, ends_the_run: bool) -> FakeStopper {
+        FakeStopper { db: fx.fleet.paths().db().to_path_buf(), ends_the_run, stops: Vec::new(), looks: 0 }
+    }
+
+    #[test]
+    fn stop_and_delete_stops_a_local_run_then_deletes() {
+        let fx = fx();
+        fx.locate("node-s1");
+        live_run(&fx);
+        let mut fake = has(&["node-s1"]);
+        let mut stop = stopper(&fx, true);
+        let mut said = Vec::new();
+        fx.stop_and_delete(false, &mut said, &mut stop, &mut fake).unwrap();
+        assert_eq!(stop.stops, [crate::runner_place::RunnerPlace::Local]);
+        assert_eq!(fake.deleted, ["node-s1"]);
+        assert_eq!(said, ["Stopping, then deleting the sandbox\u{2026}"]);
+    }
+
+    #[test]
+    fn stop_and_delete_deletes_nothing_when_a_local_run_does_not_end() {
+        let fx = fx();
+        fx.locate("node-s2");
+        live_run(&fx);
+        let mut fake = has(&["node-s2"]);
+        let mut stop = stopper(&fx, false);
+        let err = format!("{:#}", fx.stop_and_delete(false, &mut Vec::new(), &mut stop, &mut fake).unwrap_err());
+        assert!(err.contains("not deleted") && err.contains("runner is active"), "{err}");
+        assert!(fake.deleted.is_empty() && fake.checkpointed.is_empty());
+        assert!(stop.looks > 0, "it waited");
+    }
+
+    #[test]
+    fn stop_and_delete_deletes_anyway_when_the_supervisor_does_not_stop_and_says_so() {
+        use crate::runner_place::test_support::{sandbox, set_files};
+        let fx = fx();
+        set_files(&fx.fleet, fx.node, sandbox(), false);
+        fx.locate("node-s3");
+        fx.cloud_row("node-s3");
+        let conn = rusqlite::Connection::open(fx.fleet.paths().db()).unwrap();
+        tod_store::cloud_activity::beat(&conn, fx.node, "active", tod_store::outline::uuid_blob::now_ms()).unwrap();
+        drop(conn);
+        let mut fake = has(&["node-s3"]);
+        let mut stop = stopper(&fx, false);
+        let mut said = Vec::new();
+        fx.stop_and_delete(false, &mut said, &mut stop, &mut fake).unwrap();
+        assert_eq!(stop.stops, [crate::runner_place::RunnerPlace::Supervisor]);
+        assert!(said.iter().any(|s| s.contains("did not report stopping") && s.contains("deleting the sandbox anyway")), "{said:?}");
+        // The checkpoint still ran first.
+        assert_eq!(fake.checkpointed.len(), 1);
+        assert_eq!(fake.deleted, ["node-s3"]);
+    }
+
+    #[test]
+    fn stop_and_delete_of_an_idle_node_just_deletes() {
+        let fx = fx();
+        fx.locate("node-s4");
+        let mut fake = has(&["node-s4"]);
+        let mut stop = stopper(&fx, true);
+        let mut said = Vec::new();
+        fx.stop_and_delete(true, &mut said, &mut stop, &mut fake).unwrap();
+        assert!(stop.stops.is_empty() && said.is_empty());
+        assert_eq!(fake.deleted, ["node-s4"]);
+        assert!(fake.checkpointed.is_empty(), "without a checkpoint");
+    }
+
+    impl Fx {
+        fn stop_and_delete(
+            &self,
+            force: bool,
+            said: &mut Vec<String>,
+            stopper: &mut FakeStopper,
+            backend: &mut Fake,
+        ) -> Result<String> {
+            stop_and_delete_with(&self.fleet, &self.id(), force, &mut |m| said.push(m.to_string()), stopper, QUICK, backend)
+        }
     }
 }
