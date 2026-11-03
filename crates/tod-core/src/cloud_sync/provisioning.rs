@@ -146,6 +146,8 @@ pub fn intents(root: &Path) -> Result<Vec<Intent>> {
 pub struct OrphanSandbox {
     pub name: String,
     pub age: Duration,
+    /// Blaxel's status for it (`DEPLOYED`, `FAILED`, ...); `unknown` if not given.
+    pub status: String,
 }
 
 /// The orphans among `listing` (Blaxel's sandbox list): named `node-*`,
@@ -193,7 +195,8 @@ pub fn find_orphans(
         if intents.iter().any(|i| i.sandbox == name && now_ms - i.started_at_ms < min_ms) {
             continue;
         }
-        out.push(OrphanSandbox { name: name.to_string(), age: Duration::from_millis(age_ms as u64) });
+        let status = if status.is_empty() { "unknown".to_string() } else { status };
+        out.push(OrphanSandbox { name: name.to_string(), age: Duration::from_millis(age_ms as u64), status });
     }
     out.sort_by(|a, b| a.name.cmp(&b.name));
     out
@@ -201,15 +204,18 @@ pub fn find_orphans(
 
 /// The sandbox names the app's own records refer to: every `cloud_nodes`
 /// row and every Files location.
-fn known_sandboxes(fleet: &FleetStore) -> Result<HashSet<String>> {
-    let mut known: HashSet<String> = fleet
-        .read(|conn| tod_store::cloud_nodes::list(conn))?
-        .into_iter()
-        .map(|row| row.sandbox)
-        .collect();
-    let locations = fleet.read(|conn| tod_store::fleet::repos::files_location::FilesLocationRepo::new(conn).list_all())?;
+fn known_sandboxes(conn: &rusqlite::Connection) -> Result<HashSet<String>> {
+    let mut known: HashSet<String> =
+        tod_store::cloud_nodes::list(conn)?.into_iter().map(|row| row.sandbox).collect();
+    let locations = tod_store::fleet::repos::files_location::FilesLocationRepo::new(conn).list_all()?;
     known.extend(locations.iter().filter_map(|l| l.sandbox().map(str::to_string)));
     Ok(known)
+}
+
+fn list_orphans_with(root: &Path, min_age: Duration, known: HashSet<String>) -> Result<Vec<OrphanSandbox>> {
+    let bx = tod_store::fleet::sandbox::Sandboxes::load(root)?.blaxel()?;
+    let listing = bx.list_json().context("list sandboxes")?;
+    Ok(find_orphans(&listing, &known, &intents(root)?, now_ms(), min_age))
 }
 
 /// Lists the sandboxes named `node-*` that no `cloud_nodes` row or Files
@@ -218,22 +224,30 @@ fn known_sandboxes(fleet: &FleetStore) -> Result<HashSet<String>> {
 /// database that has not synced here) can make a live sandbox look like an
 /// orphan, which is why deleting is a separate, explicit call.
 pub fn list_orphan_sandboxes(fleet: &FleetStore, min_age: Duration) -> Result<Vec<OrphanSandbox>> {
-    let root = fleet.paths().root();
-    let bx = tod_store::fleet::sandbox::Sandboxes::load(root)?.blaxel()?;
-    let listing = bx.list_json().context("list sandboxes")?;
-    Ok(find_orphans(&listing, &known_sandboxes(fleet)?, &intents(root)?, now_ms(), min_age))
+    let known = fleet.read(|c| known_sandboxes(c))?;
+    list_orphans_with(fleet.paths().root(), min_age, known)
 }
 
-/// Deletes the sandboxes in `names` that are still orphans now (re-listed,
-/// so a node that has since recorded one keeps it), and returns the names
-/// deleted. A failed delete is an error naming it, after the rest were tried.
-pub fn delete_orphan_sandboxes(fleet: &FleetStore, names: &[String], min_age: Duration) -> Result<Vec<String>> {
-    let root = fleet.paths().root();
+/// [`list_orphan_sandboxes`] for a data root, reading the database through a
+/// read-only connection of its own (no lock, so it works beside the running
+/// app). For `tod-sandbox sweep` and the Cloud VMs window. Asks Blaxel: never
+/// on the UI thread.
+pub fn list_orphan_sandboxes_at(root: &Path, min_age: Duration) -> Result<Vec<OrphanSandbox>> {
+    let paths = tod_store::fleet::FleetPaths::new(root).map_err(|e| anyhow!("open {}: {e}", root.display()))?;
+    let conn = tod_store::fleet::schema::open_read_connection(paths.db())?;
+    let known = known_sandboxes(&conn)?;
+    list_orphans_with(root, min_age, known)
+}
+
+fn delete_orphans_with(root: &Path, names: &[String], still: HashSet<String>) -> Result<Vec<String>> {
     let bx = tod_store::fleet::sandbox::Sandboxes::load(root)?.blaxel()?;
-    let still: HashSet<String> = list_orphan_sandboxes(fleet, min_age)?.into_iter().map(|o| o.name).collect();
     let mut deleted = Vec::new();
     let mut failed = Vec::new();
-    for name in names.iter().filter(|n| still.contains(*n)) {
+    for name in names {
+        if !still.contains(name) {
+            failed.push(format!("{name}: not an orphan now (recorded by a node, too young, or gone)"));
+            continue;
+        }
         match bx.delete(name) {
             Ok(()) => {
                 tracing::info!("cloud: deleted orphan sandbox {name}");
@@ -246,6 +260,32 @@ pub fn delete_orphan_sandboxes(fleet: &FleetStore, names: &[String], min_age: Du
         return Err(anyhow!("could not delete orphan sandboxes: {}", failed.join("; ")));
     }
     Ok(deleted)
+}
+
+/// Deletes the sandboxes in `names` that are still orphans now (re-listed,
+/// so a node that has since recorded one keeps it), and returns the names
+/// deleted. A name that is no longer an orphan, or a failed delete, is an
+/// error naming it, after the rest were tried.
+pub fn delete_orphan_sandboxes(fleet: &FleetStore, names: &[String], min_age: Duration) -> Result<Vec<String>> {
+    let still = list_orphan_sandboxes(fleet, min_age)?.into_iter().map(|o| o.name).collect();
+    delete_orphans_with(fleet.paths().root(), names, still)
+}
+
+/// [`delete_orphan_sandboxes`] for a data root (see
+/// [`list_orphan_sandboxes_at`]).
+pub fn delete_orphan_sandboxes_at(root: &Path, names: &[String], min_age: Duration) -> Result<Vec<String>> {
+    let still = list_orphan_sandboxes_at(root, min_age)?.into_iter().map(|o| o.name).collect();
+    delete_orphans_with(root, names, still)
+}
+
+/// `1d 3h`, `5h 20m`, `12m`: an age for people.
+pub fn age_text(age: Duration) -> String {
+    let mins = age.as_secs() / 60;
+    match (mins / 1440, mins / 60 % 24, mins % 60) {
+        (0, 0, m) => format!("{m}m"),
+        (0, h, m) => format!("{h}h {m}m"),
+        (d, h, _) => format!("{d}d {h}h"),
+    }
 }
 
 #[cfg(test)]
@@ -270,6 +310,13 @@ mod tests {
 
     fn day() -> Duration {
         Duration::from_secs(24 * 3600)
+    }
+
+    #[test]
+    fn ages_read_for_people() {
+        assert_eq!(age_text(Duration::from_secs(12 * 60)), "12m");
+        assert_eq!(age_text(Duration::from_secs(5 * 3600 + 20 * 60)), "5h 20m");
+        assert_eq!(age_text(Duration::from_secs(27 * 3600)), "1d 3h");
     }
 
     #[test]

@@ -557,6 +557,37 @@ impl HttpOrchestrator {
         Ok(())
     }
 
+    /// `GET /github-secrets`: the names of the secrets the last apply put in
+    /// the orchestrator's proxy; `None` when none is recorded (an orchestrator
+    /// older than this endpoint, or a fresh disk).
+    pub fn github_secrets(&self) -> Result<Option<Vec<String>>> {
+        let resp = self
+            .auth(self.agent.get(&format!("{}/github-secrets", self.base)))
+            .call()
+            .context("orchestrator github-secrets")?;
+        if resp.status().as_u16() == 404 {
+            return Ok(None);
+        }
+        let v = Self::finish(resp, "github-secrets")?;
+        let names = v["names"]
+            .as_array()
+            .ok_or_else(|| anyhow!("orchestrator github-secrets: no names"))?
+            .iter()
+            .filter_map(|n| n.as_str().map(str::to_string))
+            .collect();
+        Ok(Some(names))
+    }
+
+    /// `PUT /github-secrets`: records the names (never values) now in the
+    /// orchestrator's proxy.
+    pub fn put_github_secrets(&self, names: &[String]) -> Result<()> {
+        let resp = self
+            .auth(self.agent.put(&format!("{}/github-secrets", self.base)))
+            .send_json(serde_json::json!({ "names": names }))
+            .context("orchestrator github-secrets")?;
+        Self::finish_text(resp, "github-secrets")
+    }
+
     /// The next request a node's sandbox has asked this machine to answer
     /// (`GET /users/<u>/broker/next`), waiting up to `wait_secs` for one:
     /// `(id, node, request)`. Holding this open is also how the orchestrator

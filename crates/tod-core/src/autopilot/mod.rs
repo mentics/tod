@@ -155,8 +155,11 @@ impl StepHook for () {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum BudgetLimit {
-    Sessions { used: u32 },
-    Time { elapsed_secs: u64 },
+    /// Both counts are kept: the one that was not the limit is shown too, as
+    /// what was used, not as its maximum (`elapsed_secs` / `used` of an older
+    /// saved state read as 0).
+    Sessions { used: u32, #[serde(default)] elapsed_secs: u64 },
+    Time { elapsed_secs: u64, #[serde(default)] used: u32 },
 }
 
 /// What the user is needed for.
@@ -449,11 +452,13 @@ impl Autopilot {
         if self.state.sessions >= self.budget.max_sessions {
             return Some(BudgetLimit::Sessions {
                 used: self.state.sessions,
+                elapsed_secs: self.state.elapsed().as_secs(),
             });
         }
         let elapsed = self.state.elapsed();
         (elapsed >= self.budget.max_duration).then_some(BudgetLimit::Time {
             elapsed_secs: elapsed.as_secs(),
+            used: self.state.sessions,
         })
     }
 

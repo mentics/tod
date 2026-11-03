@@ -69,7 +69,7 @@ fn main() -> anyhow::Result<()> {
         let id = "e2e-probe";
         Config { tokens: vec![Entry { id: id.into(), label: "e2e probe".into(), repos: vec![format!("{owner}/*")] }] }.save(&scratch)?;
         tod_store::orchestrator_github::set_token(&scratch, id, &github_token)?;
-        let applied = tod_core::orchestrator_github::apply(&scratch);
+        let applied = tod_core::orchestrator_github::apply(&scratch, true);
         tod_store::orchestrator_github::delete_token(&scratch, id);
         println!("apply: {:?}", applied?);
 

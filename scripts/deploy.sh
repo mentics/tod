@@ -2,7 +2,8 @@
 # Deploys whatever shared cloud piece is out of date, and nothing that is not:
 #   - the cloud orchestrator, recorded in <data root>/orchestrator-deployed.hash,
 #   - the hourly watchdog job, recorded in <data root>/watchdog-deployed.hash.
-# Each record is compared with the hash of the sandbox sources. A deploy
+# Each record is compared with the hash of the orchestrator artifact's sources
+# (not the supervisor, relay or tod-cli, which node sandboxes run). A deploy
 # records the hash it deployed, so the next run finds it up to date.
 #
 # Usage: scripts/deploy.sh
@@ -29,7 +30,9 @@ if [[ -z $root ]]; then
 fi
 
 scripts/build.sh --data-root "$root"
-want="$(sandbox_source_hash)"
+# The orchestrator and the watchdog are judged by the orchestrator artifact
+# alone: a supervisor-only change does not make them stale.
+want="$(sandbox_source_hash orchestrator)"
 
 if [[ "$(recorded_hash "$root/orchestrator-deployed.hash")" == "$want" ]]; then
     echo "==> orchestrator up to date ($root)"

@@ -198,6 +198,9 @@ pub struct OrchestratorGithubEditor {
     loaded: bool,
     saving: bool,
     applying: bool,
+    /// Why the last Apply did nothing, when it declined to drop tokens this
+    /// root does not hold: offers "Apply and remove …".
+    refused: Option<tod_core::orchestrator_github::Refused>,
     error: Option<String>,
     status: Option<Result<String, String>>,
     _subscription: Subscription,
@@ -239,6 +242,7 @@ impl OrchestratorGithubEditor {
             loaded: false,
             saving: false,
             applying: false,
+            refused: None,
             error: None,
             status: None,
             _subscription: subscription,
@@ -352,25 +356,30 @@ impl OrchestratorGithubEditor {
         .detach();
     }
 
-    fn apply(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn apply(&mut self, remove_others: bool, window: &mut Window, cx: &mut Context<Self>) {
         if self.applying || !self.loaded {
             return;
         }
-        self.record(cx, "orchestrator_github_apply", Source::Click, Vec::new());
+        let action = if remove_others { "orchestrator_github_apply_remove_others" } else { "orchestrator_github_apply" };
+        self.record(cx, action, Source::Click, Vec::new());
         self.applying = true;
         self.status = None;
+        self.refused = None;
         cx.notify();
         let root = self.data_root.clone();
         cx.spawn_in(window, async move |this, cx| {
             let result = cx
                 .background_executor()
-                .spawn(async move { tod_core::orchestrator_github::apply(&root) })
+                .spawn(async move { tod_core::orchestrator_github::apply(&root, remove_others) })
                 .await;
             let _ = this.update_in(cx, |this, _, cx| {
                 this.applying = false;
                 this.status = Some(match result {
                     Ok(applied) => Ok(format!("Applied: {}.", applied_summary(applied.tokens, applied.routes))),
-                    Err(e) => Err(format!("{e:#}")),
+                    Err(e) => {
+                        this.refused = e.downcast_ref::<tod_core::orchestrator_github::Refused>().cloned();
+                        Err(format!("{e:#}"))
+                    }
                 });
                 cx.notify();
             });
@@ -411,9 +420,26 @@ impl Render for OrchestratorGithubEditor {
                         .label(if self.applying { "Applying…" } else { "Apply to the orchestrator" })
                         .compact()
                         .disabled(self.applying || !self.loaded)
-                        .on_click(cx.listener(|this, _, window, cx| this.apply(window, cx))),
+                        .on_click(cx.listener(|this, _, window, cx| this.apply(false, window, cx))),
                 ),
         );
+        if let Some(refused) = self.refused.clone() {
+            let label = match refused {
+                tod_core::orchestrator_github::Refused::WouldRemove(names) => {
+                    format!("Apply and remove {}", names.join(", "))
+                }
+                tod_core::orchestrator_github::Refused::HoldingsUnknown => {
+                    "Apply and replace whatever the orchestrator holds".to_string()
+                }
+            };
+            col = col.child(
+                Button::new("orch-gh-apply-remove")
+                    .label(label)
+                    .compact()
+                    .disabled(self.applying || !self.loaded)
+                    .on_click(cx.listener(|this, _, window, cx| this.apply(true, window, cx))),
+            );
+        }
         if let Some(err) = self.error.clone() {
             col = col.child(style::text_error(div()).child(selectable_text("orch-gh-error", err, window, cx)));
         }

@@ -20,6 +20,59 @@ This page is the summary and the plan: what the live system showed, the
 bugs fixed in this pass, the design changes that remove whole classes of
 failure (ranked), the process changes, and how to verify.
 
+## Status, end of 2026-11-03
+
+All of section 3 (3.1 to 3.12) is on `main` and was exercised on the
+live-verify root; the orchestrator is on a volume (`orchestrator_volume`) with
+its databases on local disk (SQLite WAL fails on the volume), and the app
+starts it again when its sandbox is up and its process is gone.
+
+Verified live (real sandboxes, real binaries): the sliced replica (7 MB); the
+health probe on fork; run state and its plain-words stops; request rows consumed
+by the supervisor; the long-poll feed; the notice topic re-fetch; the version
+contract (a newer client gets 426, one with no headers is accepted); wake
+rebuild; the gate reading a PR with a routed token; a webhook merge waking a
+node 2 s after the event; the orchestrator self-heal drill; replacing three
+expired real sandboxes at once; `tod-cli db` routing (sandbox -> orchestrator
+broker -> the root's daemon, signed login returned, no query run); the disk
+cleanup script; the budget stop with Keep going (its hours text was wrong and is
+fixed); the missing-skill stop and "Fixed, try again"; the quit dialog's rule
+(against the real database: listed only with a fresh working heartbeat); a
+second supervisor meeting the lock (exits 0, pokes the holder, touches nothing);
+the relay adopting a supervisor it did not start; the dead-man retry wake after a
+real wake error (scheduled at the orchestrator under the node id, counter 1); the
+wake command's detached fallback (returns in 14 ms, own session).
+
+Verified by tests on real processes but not live: the relay killing a stalled
+relay-started supervisor (Linux process tests in Docker); the loop-detection stop
+(end-to-end through `Autopilot::run_with`); the quit dialog's rendering (the
+control socket's `quit` bypasses it).
+
+Not verified live: the Settings token-apply guard (it changes the shared
+orchestrator's secrets: unit-tested, the endpoint answers 404 until an apply
+records names).
+
+How it works (not gaps):
+
+- **Sandboxes are deleted when idle, on purpose.** A GitHub workflow deletes node
+  sandboxes that have sat idle for an hour, so nothing sits around building
+  while nobody is using it; a node's sandbox is meant to be forked from the
+  golden and running in a second or two. A node waiting on a review therefore
+  usually has no sandbox, and an event for it (a webhook, a due wake) makes the
+  orchestrator mark it lost; the app's daemon then makes a new one. That needs the
+  user's machine (the user's tokens are only there), which is the design.
+  "Its sandbox is gone; the app replaces it" is the normal path, and the
+  replacement restores uncommitted work from the checkpoint. Sandboxes should
+  only disappear when idle; one that vanishes while working is a bug.
+- The supervisor the wake command's fallback detaches runs without the relay's
+  secrets until the relay adopts it; wake schedules made before the new command
+  keep the old fallback until they are recreated.
+- Saving GitHub tokens in two roots that share an orchestrator asks before it
+  drops names this root has no token for; a reset orchestrator disk loses the
+  recorded names, so the next apply asks once.
+- The cause of the orchestrator container reset at 10:43 UTC on 2026-11-03 is not
+  known and is not being pursued: the volume and the app's restart cover it.
+
 ## 1. What the live system showed
 
 Measured 2026-11-03 (UTC), live root `~/.config/tod`, six cloud nodes.
@@ -158,7 +211,7 @@ sends `X-Tod-Wire`/`X-Tod-Schema`; the orchestrator answers 426 to a client
 newer than itself; `sync` refuses a newer orchestrator naming both versions;
 `deploy::ensure_orchestrator` updates an older one in place; the build hash
 covers only `src/`, manifests and build scripts. Not done: skipping the
-update while a node is mid-seed; the supervisor does not send the headers yet.
+update while a node is mid-seed; (done: supervisors and tod-cli send them).
 
 "Out of date" is a source hash over 12 crates, per machine. Replace it
 with `/health` returning `{wire, schema, build}` and request headers

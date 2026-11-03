@@ -27,10 +27,26 @@ pub const LOCK_FILE: &str = "supervisor.lock";
 /// The progress marker's name (`tod_supervisor::progress::PROGRESS_FILE`).
 pub const PROGRESS_FILE: &str = "progress";
 
-/// How long a supervisor may go without marking progress before the relay
-/// kills it. The supervisor stops claiming to work (no hold renewal, no
-/// heartbeat) at its agent's hang limit plus ten minutes, 25 minutes by
-/// default, so this is later: the supervisor's own gate acts first.
+/// The file the supervisor writes beside its progress marker: its agent
+/// hang limit in minutes (`tod_supervisor::progress::HANG_LIMIT_FILE`).
+pub const HANG_LIMIT_FILE: &str = "hang-limit-minutes";
+/// The agent hang limit the supervisor uses unless `TOD_HANG_MINUTES` says
+/// otherwise; assumed when the file is absent (an older supervisor).
+pub const DEFAULT_HANG_LIMIT: Duration = Duration::from_secs(15 * 60);
+/// The supervisor stops claiming to work (no hold renewal, no heartbeat) at
+/// its hang limit plus this (`tod_supervisor`'s `STALL_MARGIN`).
+const SUPERVISOR_MARGIN: Duration = Duration::from_secs(10 * 60);
+/// What the relay waits beyond that, so the supervisor's own gate acts first.
+const RELAY_SLACK: Duration = Duration::from_secs(15 * 60);
+
+/// How long a supervisor with this agent hang limit may go without marking
+/// progress before the relay kills it: the limit plus the supervisor's own
+/// margin plus the relay's slack (40 minutes at the default 15).
+pub fn stall_limit(hang_limit: Duration) -> Duration {
+    hang_limit + SUPERVISOR_MARGIN + RELAY_SLACK
+}
+
+/// The stall limit when the supervisor recorded no hang limit.
 pub const STALL_LIMIT: Duration = Duration::from_secs(40 * 60);
 
 /// A supervisor named by a state directory's lock file.
@@ -40,6 +56,8 @@ pub struct Found {
     /// Time since the progress marker was last touched; `None` when there
     /// is no marker.
     pub progress_age: Option<Duration>,
+    /// The agent hang limit the supervisor recorded; `None` when it has not.
+    pub hang_limit: Option<Duration>,
 }
 
 /// Looks through `root`'s subdirectories (one per node; a sandbox has one)
@@ -66,7 +84,16 @@ pub fn find(root: &Path, now: SystemTime, is_supervisor: &dyn Fn(u32) -> bool) -
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(e) => return Err(e),
         };
-        return Ok(Some(Found { pid, progress_age }));
+        let hang_limit = match std::fs::read_to_string(dir.join(HANG_LIMIT_FILE)) {
+            Ok(text) => Some(Duration::from_secs(
+                text.trim().parse::<u64>().map_err(|e| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{HANG_LIMIT_FILE} in {}: {e}", dir.display()))
+                })? * 60,
+            )),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e),
+        };
+        return Ok(Some(Found { pid, progress_age, hang_limit }));
     }
     Ok(None)
 }
@@ -83,6 +110,7 @@ pub enum Action {
 
 /// `tracked` is the supervisor the relay started and is still alive, with
 /// how long ago it started; `found` is what the state directory names.
+/// `limit` is the stall limit used when `found` records no hang limit.
 pub fn decide(tracked: Option<(u32, Duration)>, found: Option<&Found>, limit: Duration) -> Action {
     match (tracked, found) {
         (Some((pid, since_start)), found) => {
@@ -92,6 +120,7 @@ pub fn decide(tracked: Option<(u32, Duration)>, found: Option<&Found>, limit: Du
                 Some(age) => age.min(since_start),
                 None => since_start,
             };
+            let limit = found.filter(|f| f.pid == pid).and_then(|f| f.hang_limit).map_or(limit, stall_limit);
             if age > limit { Action::KillStalled { pid, age } } else { Action::Nothing }
         }
         (None, Some(found)) => Action::Adopt { pid: found.pid },
@@ -106,7 +135,7 @@ mod tests {
     const LIMIT: Duration = Duration::from_secs(600);
 
     fn found(pid: u32, age: Option<u64>) -> Found {
-        Found { pid, progress_age: age.map(Duration::from_secs) }
+        Found { pid, progress_age: age.map(Duration::from_secs), hang_limit: None }
     }
 
     #[test]
@@ -145,6 +174,33 @@ mod tests {
         assert_eq!(decide(None, None, LIMIT), Action::Nothing);
     }
 
+    #[test]
+    fn the_stall_limit_follows_the_recorded_hang_limit() {
+        assert_eq!(stall_limit(DEFAULT_HANG_LIMIT), STALL_LIMIT);
+        assert_eq!(stall_limit(Duration::from_secs(60 * 60)), Duration::from_secs(85 * 60));
+        let started = Duration::from_secs(100_000);
+        let mut f = found(7, Some(50 * 60));
+        assert!(matches!(decide(Some((7, started)), Some(&f), STALL_LIMIT), Action::KillStalled { .. }));
+        f.hang_limit = Some(Duration::from_secs(60 * 60));
+        assert_eq!(decide(Some((7, started)), Some(&f), STALL_LIMIT), Action::Nothing);
+        f.progress_age = Some(Duration::from_secs(86 * 60));
+        assert!(matches!(decide(Some((7, started)), Some(&f), STALL_LIMIT), Action::KillStalled { .. }));
+    }
+
+    #[test]
+    fn find_reads_the_recorded_hang_limit() {
+        let root = state_root("hang");
+        let node = root.join("n");
+        std::fs::create_dir_all(&node).unwrap();
+        std::fs::write(node.join(LOCK_FILE), "5").unwrap();
+        std::fs::write(node.join(HANG_LIMIT_FILE), "30").unwrap();
+        let f = find(&root, SystemTime::now(), &|_| true).unwrap().unwrap();
+        assert_eq!(f.hang_limit, Some(Duration::from_secs(30 * 60)));
+        std::fs::write(node.join(HANG_LIMIT_FILE), "soon").unwrap();
+        assert!(find(&root, SystemTime::now(), &|_| true).is_err(), "a garbled file is an error, not the default");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     fn state_root(name: &str) -> std::path::PathBuf {
         let nanos = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_nanos();
         let root = std::env::temp_dir().join(format!("tod-relay-{name}-{}-{nanos}", std::process::id()));
@@ -164,7 +220,7 @@ mod tests {
         std::fs::write(node.join(LOCK_FILE), "1234").unwrap();
         assert_eq!(find(&root, SystemTime::now(), &|_| false).unwrap(), None, "no such supervisor alive");
         let f = find(&root, SystemTime::now(), &|p| p == 1234).unwrap().unwrap();
-        assert_eq!(f, Found { pid: 1234, progress_age: None });
+        assert_eq!(f, Found { pid: 1234, progress_age: None, hang_limit: None });
         std::fs::write(node.join(PROGRESS_FILE), "1").unwrap();
         let later = SystemTime::now() + Duration::from_secs(120);
         let f = find(&root, later, &|p| p == 1234).unwrap().unwrap();
