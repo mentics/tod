@@ -114,6 +114,7 @@ pub fn write_response(mut stream: &TcpStream, response: &Response) -> Result<()>
         404 => "Not Found",
         405 => "Method Not Allowed",
         409 => "Conflict",
+        426 => "Upgrade Required",
         503 => "Service Unavailable",
         504 => "Gateway Timeout",
         500 => "Internal Server Error",

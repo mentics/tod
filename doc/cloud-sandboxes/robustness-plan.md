@@ -138,6 +138,14 @@ call; delete on failure; an orphan sweeper.
 
 ### 3.6 A version contract instead of source hashes (orchestrator D1, 19)
 
+**Done:** `tod_store::sync::contract` (`WIRE`, `Contract`, `judge`); `/health`
+returns `{wire, schema, build}` (an old one's `ok` reads as wire 0); the app
+sends `X-Tod-Wire`/`X-Tod-Schema`; the orchestrator answers 426 to a client
+newer than itself; `sync` refuses a newer orchestrator naming both versions;
+`deploy::ensure_orchestrator` updates an older one in place; the build hash
+covers only `src/`, manifests and build scripts. Not done: skipping the
+update while a node is mid-seed; the supervisor does not send the headers yet.
+
 "Out of date" is a source hash over 12 crates, per machine. Replace it
 with `/health` returning `{wire, schema, build}` and request headers
 carrying the client's; the app judges compatibility from that, deploys

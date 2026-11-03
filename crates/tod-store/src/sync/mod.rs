@@ -74,6 +74,7 @@ use rusqlite::{Connection, params_from_iter};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+pub mod contract;
 pub mod slice;
 #[cfg(test)]
 mod tests;

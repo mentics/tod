@@ -197,11 +197,29 @@ impl Server {
         response
     }
 
+    /// This orchestrator's version contract (`GET /health`).
+    pub fn contract(&self) -> tod_store::sync::contract::Contract {
+        tod_store::sync::contract::Contract::current(tod_core::CLI_BUILD_STAMP)
+    }
+
     fn route(&self, request: &Request) -> Response {
+        if request.path.trim_matches('/') != "health"
+            && let Err(why) = tod_store::sync::contract::check_client(
+                &self.contract(),
+                request.header(tod_store::sync::contract::WIRE_HEADER),
+                request.header(tod_store::sync::contract::SCHEMA_HEADER),
+            )
+        {
+            return Response::text(426, why);
+        }
         let segments: Vec<&str> = request.path.trim_matches('/').split('/').collect();
         let method = request.method.as_str();
         match segments.as_slice() {
-            ["health"] => Response::text(200, "ok"),
+            ["health"] => {
+                let mut response = Response::text(200, serde_json::to_string(&self.contract()).unwrap_or_default());
+                response.content_type = "application/json";
+                response
+            }
             ["webhooks", source] => {
                 let (response, touched) =
                     webhooks::handle(&self.users, &self.wakes, &self.webhook_secrets, source, request);
