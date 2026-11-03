@@ -1490,7 +1490,7 @@ fn existing_sandbox_name(fleet: &FleetStore, bx: &tod_sandbox::blaxel::Blaxel, n
 /// Make sure `node_id` has a working sandbox: create it (with the user's
 /// credentials in its proxy) if Blaxel has none by its name, or replace one
 /// that can no longer run; wait for it, provision the relay and supervisor,
-/// and poke it. Returns the sandbox's name. The one path both
+/// and, when `wake`, poke it. Returns the sandbox's name. The one path both
 /// [`run_in_cloud`] and replacing a lost sandbox ([`lost`]) take. Blocks on
 /// the network.
 pub fn ensure_node_sandbox(
@@ -1498,6 +1498,7 @@ pub fn ensure_node_sandbox(
     root: &Path,
     node_id: &str,
     user: &str,
+    wake: bool,
     progress: &mut dyn FnMut(&str),
 ) -> Result<String> {
     use tod_sandbox::node;
@@ -1730,17 +1731,19 @@ pub fn ensure_node_sandbox(
     ));
 
     push_supervisor_settings(&bx, &url, root, node_id)?;
-    progress("waking the node…");
-    let poke = format!("{}/port/{}/poke", url.trim_end_matches('/'), tod_sandbox::blaxel::RELAY_PORT);
-    let resp = ureq::post(&poke)
-        .header("Authorization", &format!("Bearer {}", bx.token()))
-        .config()
-        .http_status_as_error(false)
-        .build()
-        .send_empty()
-        .context("poke the node")?;
-    if !resp.status().is_success() {
-        progress(&format!("warning: the poke got {}", resp.status()));
+    if wake {
+        progress("waking the node…");
+        let poke = format!("{}/port/{}/poke", url.trim_end_matches('/'), tod_sandbox::blaxel::RELAY_PORT);
+        let resp = ureq::post(&poke)
+            .header("Authorization", &format!("Bearer {}", bx.token()))
+            .config()
+            .http_status_as_error(false)
+            .build()
+            .send_empty()
+            .context("poke the node")?;
+        if !resp.status().is_success() {
+            progress(&format!("warning: the poke got {}", resp.status()));
+        }
     }
     // Adopted as good only now: the relay answers with the manifest just
     // installed, and the checkout's own prerequisites still hold.
@@ -1970,7 +1973,7 @@ fn run_in_cloud_reporting(
     progress("syncing with the orchestrator…");
     let (orch, user) = resolve(root)?;
     sync(fleet, root, &orch, &user)?;
-    let name = ensure_node_sandbox(fleet, root, node_id, &user, progress)?;
+    let name = ensure_node_sandbox(fleet, root, node_id, &user, true, progress)?;
     let record = record_cloud_node(fleet, node_id, name, &user)?;
     let heard = match sync(fleet, root, &orch, &user) {
         Ok(report) => report,
@@ -2266,7 +2269,7 @@ pub fn wake_node_requesting(fleet: &FleetStore, root: &Path, node_id: &str, kind
         _ => {
             let gone = row.sandbox.clone();
             let mut progress = |msg: &str| log_progress(&format!("replacing {gone}"), msg);
-            let node = ensure_node_sandbox(fleet, root, node_id, &user, &mut progress)
+            let node = ensure_node_sandbox(fleet, root, node_id, &user, true, &mut progress)
                 .and_then(|name| record_cloud_node(fleet, node_id, name, &user))
                 .with_context(|| format!("sandbox {gone} is gone, and replacing it failed"))?;
             let info = bx

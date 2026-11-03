@@ -34,6 +34,7 @@ pub mod environment_context;
 pub mod pr_context;
 pub mod skills_context;
 pub mod environment_request;
+pub mod environment_reset;
 pub mod fuzzy;
 pub mod gate;
 pub mod impact;

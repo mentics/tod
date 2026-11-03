@@ -35,13 +35,13 @@ impl RunnerPlace {
 }
 
 #[cfg(test)]
-mod test_support {
+pub(crate) mod test_support {
     use tod_store::fleet::{DevContainerSetting, FilesPlace, FleetMutation, FleetStore};
     use tod_store::outline::{Capability, OutlineMutation};
     use uuid::Uuid;
 
     /// Enable Files on `node` and pick a new location with `dev_container`.
-    pub(super) fn set_files(fleet: &FleetStore, node: Uuid, dev_container: Option<DevContainerSetting>, worktree: bool) {
+    pub(crate) fn set_files(fleet: &FleetStore, node: Uuid, dev_container: Option<DevContainerSetting>, worktree: bool) {
         fleet
             .enqueue_outline(OutlineMutation::EnableCapabilities {
                 node_id: node,
@@ -65,7 +65,7 @@ mod test_support {
         fleet.reload_if_stale().unwrap();
     }
 
-    pub(super) fn sandbox() -> Option<DevContainerSetting> {
+    pub(crate) fn sandbox() -> Option<DevContainerSetting> {
         Some(DevContainerSetting { sandbox: true, ..Default::default() })
     }
 }

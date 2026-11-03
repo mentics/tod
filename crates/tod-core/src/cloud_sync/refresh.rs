@@ -264,7 +264,7 @@ pub fn reinstall(fleet: &FleetStore, row: &CloudNodeRow, current: &str) -> Resul
     let reason = reinstall_reason(load(&root)?.get(&id).map(Recorded::install).as_ref(), &now);
     tracing::info!("cloud: {id}: reinstalling its sandbox: {reason}");
     check_disk(&root, row)?;
-    ensure_node_sandbox(fleet, &root, &id, &row.user, &mut |m| super::log_progress(&format!("refresh {id}"), m))?;
+    ensure_node_sandbox(fleet, &root, &id, &row.user, true, &mut |m| super::log_progress(&format!("refresh {id}"), m))?;
     record(&root, &id, &now, Some(&reason))
 }
 

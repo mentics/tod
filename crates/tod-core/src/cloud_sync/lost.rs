@@ -331,7 +331,7 @@ fn replace(fleet: &FleetStore, root: &std::path::Path, row: &CloudNodeRow, owner
     set_note(&id, Some(format!("Its sandbox {} was gone; replacing it…", row.sandbox)));
     let mut progress = |msg: &str| super::log_progress(&format!("replacing {}", row.sandbox), msg);
     let result = tod_store::activity::with_lease(fleet, row.node_id, tod_store::activity::KIND_CLOUD_REPAIR, owner, || {
-        ensure_node_sandbox(fleet, root, &id, &row.user, &mut progress)
+        ensure_node_sandbox(fleet, root, &id, &row.user, true, &mut progress)
             .and_then(|name| record_cloud_node(fleet, &id, name, &row.user))
     })
     .and_then(|r| r);
@@ -467,7 +467,7 @@ pub fn refresh_credentials(fleet: &FleetStore, node_id: &str, force: bool) -> Re
         std::thread::sleep(std::time::Duration::from_secs(2));
     }
     let mut progress = |msg: &str| super::log_progress(&format!("recreating {}", row.sandbox), msg);
-    let result = ensure_node_sandbox(fleet, &root, node_id, &row.user, &mut progress)
+    let result = ensure_node_sandbox(fleet, &root, node_id, &row.user, true, &mut progress)
         .and_then(|name| record_cloud_node(fleet, node_id, name, &row.user));
     match result {
         Ok(node) => {
