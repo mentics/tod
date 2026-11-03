@@ -1354,25 +1354,34 @@ pub fn ensure_node_sandbox(
     // Only a sandbox made now is an empty checkout. One that was already up
     // holds the node's own work, which a checkpoint must not be applied over.
     let made_now = existing.as_ref().is_none_or(sandbox_is_dead);
+    // Deletes the sandbox if there is one (a failed call may or may not have
+    // made it).
+    let mut remove = || -> Result<()> {
+        if bx.get(&name)?.is_some() {
+            bx.delete(&name)?;
+        }
+        Ok(())
+    };
     if made_now {
         match &source {
             NodeSandboxSource::Fork(golden) => {
                 progress(&format!("forking {name} from {golden}…"));
                 if let Err(err) = node::fork_golden(&bx, golden, &spec, &credentials) {
-                    // A fork that got as far as making the sandbox is not
-                    // one to keep: it may have no credentials.
-                    if bx.get(&name).ok().flatten().is_some() {
-                        let _ = bx.delete(&name);
-                    }
-                    return Err(err.context(format!("fork {name} from {golden}")));
+                    return Err(discard_failed_sandbox(err.context(format!("fork {name} from {golden}")), &name, &mut remove));
                 }
             }
             NodeSandboxSource::Image(image) => {
                 progress(&format!("creating sandbox {name} from {image}…"));
-                node::create(&bx, &spec, &credentials)?;
+                if let Err(err) = node::create(&bx, &spec, &credentials) {
+                    return Err(discard_failed_sandbox(err.context(format!("create {name} from {image}")), &name, &mut remove));
+                }
             }
         }
     }
+    // From here a sandbox made now that fails is deleted, so the next attempt
+    // makes another instead of adopting one whose proxy or checkout is bad. A
+    // sandbox is adopted as good only once the probe has passed.
+    let mut setup = || -> Result<String> {
     progress(&format!("waiting for {name}…"));
     let info = bx.wait_deployed(&name, Duration::from_secs(300))?;
     let url = info.url.clone().ok_or_else(|| anyhow!("sandbox {name} has no URL"))?;
@@ -1381,6 +1390,14 @@ pub fn ensure_node_sandbox(
     // not reachable until it has resumed; the first request would get a 502.
     progress(&format!("waking {name}…"));
     bx.wait_reachable(&url, Duration::from_secs(180)).with_context(|| format!("wake {name}"))?;
+    // A fork is "deployed" before its proxy rules and environment (replaced
+    // by a second call) are in effect; the checkout needs both.
+    progress(&format!("checking {name} can reach {repo_url}…"));
+    let delays = match (&source, made_now) {
+        (NodeSandboxSource::Fork(_), true) => node::FORK_PROBE_DELAYS,
+        _ => node::IMAGE_PROBE_DELAYS,
+    };
+    node::wait_proxy_ready(&bx, &url, node_id, &repo_url, delays, progress).with_context(|| format!("{name}"))?;
 
     // Agent Drive is not enabled yet, so the node's transcripts go to the
     // orchestrator and nothing is mounted. When it is, turn this back on:
@@ -1428,7 +1445,19 @@ pub fn ensure_node_sandbox(
     if !resp.status().is_success() {
         progress(&format!("warning: the poke got {}", resp.status()));
     }
-    let _ = sandboxes.save();
+    Ok(url)
+    };
+    if let Err(err) = setup() {
+        // A sandbox that was already up holds the node's own work: kept.
+        if !made_now {
+            return Err(err);
+        }
+        return Err(discard_failed_sandbox(err, &name, &mut remove));
+    }
+    // `sandboxes` is not saved here: nothing above changes the config except
+    // `Sandboxes::url`, which saves its own change, and writing this copy back
+    // after a 20-45 s provisioning would overwrite what other threads saved
+    // meanwhile.
     // What this sandbox now runs, so a later build of the app can tell it
     // is out of date ([`refresh`]).
     refresh::record(root, node_id, &refresh::install_stamp()?)?;
@@ -1446,6 +1475,20 @@ pub fn ensure_node_sandbox(
         }
     }
     Ok(name)
+}
+
+/// What a provisioning that failed after it made `name` returns: `err`, once
+/// the sandbox is deleted (it may lack credentials or a checkout, and the next
+/// attempt would otherwise adopt it as it is). A failed delete is part of the
+/// error, never dropped. `TOD_KEEP_FAILED_SANDBOX` keeps it for inspection.
+fn discard_failed_sandbox(err: anyhow::Error, name: &str, delete: &mut dyn FnMut() -> Result<()>) -> anyhow::Error {
+    if std::env::var_os("TOD_KEEP_FAILED_SANDBOX").is_some() {
+        return err.context(format!("{name} was kept (TOD_KEEP_FAILED_SANDBOX)"));
+    }
+    match delete() {
+        Ok(()) => err.context(format!("{name} was deleted so the next attempt makes a new one")),
+        Err(del) => err.context(format!("{name} could not be deleted either ({del:#}); delete it before trying again")),
+    }
 }
 
 /// Where a node's sandbox comes from: configured on the node or the nearest

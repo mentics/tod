@@ -3,6 +3,25 @@ use std::net::TcpListener;
 use tod_store::outline::OutlineMutation;
 
 #[test]
+fn a_failed_provisioning_deletes_the_sandbox_it_made_and_says_so() {
+    let mut deleted = 0;
+    let err = discard_failed_sandbox(anyhow!("checking out b failed"), "node-x", &mut || {
+        deleted += 1;
+        Ok(())
+    });
+    assert_eq!(deleted, 1);
+    let msg = format!("{err:#}");
+    assert!(msg.contains("node-x was deleted") && msg.contains("checking out b failed"), "{msg}");
+}
+
+#[test]
+fn a_failed_delete_of_a_failed_sandbox_is_part_of_the_error() {
+    let err = discard_failed_sandbox(anyhow!("probe failed"), "node-x", &mut || Err(anyhow!("503 from Blaxel")));
+    let msg = format!("{err:#}");
+    assert!(msg.contains("could not be deleted") && msg.contains("503 from Blaxel") && msg.contains("probe failed"), "{msg}");
+}
+
+#[test]
 fn user_names_are_what_the_orchestrator_accepts() {
     assert_eq!(user_name("Joel Shellman").as_deref(), Some("joel-shellman"));
     assert_eq!(user_name("..-alice").as_deref(), Some("alice"));
