@@ -905,10 +905,10 @@ impl TaskPanel {
             // A node in the cloud: its supervisor starts the step in a new
             // session. (A lost sandbox is not offered this: it needs a new
             // sandbox, which starts a new session anyway.)
-            A::RunFresh if self.runner.cloud.is_some() => self.cloud_fresh_session(cx),
+            A::RunFresh if self.runner.cloud.is_some() => self.cloud_request(tod_core::cloud_sync::REQUEST_FRESH_SESSION, cx),
             // Only offered to a node in the cloud; the wake records the
             // answer to continue first (`continue_over_stop_answer`).
-            A::KeepGoing if self.runner.cloud.is_some() => self.cloud_fresh_session(cx),
+            A::KeepGoing if self.runner.cloud.is_some() => self.cloud_request(tod_core::cloud_sync::REQUEST_KEEP_GOING, cx),
             A::KeepGoing => self.runners.update(cx, |r, cx| {
                 r.fail(node, "Keep going answers a cloud node's stop question; this node does not run in the cloud".into(), cx)
             }),
@@ -1257,12 +1257,13 @@ impl TaskPanel {
             .into_any_element()
     }
 
-    /// Has the node's supervisor run its step in a new session (answering a
-    /// "leave it stopped" stop question to continue first), off the UI thread.
-    fn cloud_fresh_session(&mut self, cx: &mut Context<Self>) {
+    /// Records the user's request of `kind` (a new session, or going on) for
+    /// the node's supervisor, answering a "leave it stopped" stop question to
+    /// continue first, and wakes it, off the UI thread.
+    fn cloud_request(&mut self, kind: &'static str, cx: &mut Context<Self>) {
         let node = self.node_id;
         self.cloud_started(cx);
-        crate::views::cloud_node::fresh_session(self.fleet.clone(), node.to_string(), cx, move |this, update, cx| {
+        crate::views::cloud_node::request(self.fleet.clone(), node.to_string(), kind, cx, move |this, update, cx| {
             this.on_cloud_update(node, update, cx)
         });
     }

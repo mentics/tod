@@ -1883,6 +1883,9 @@ fn run_in_cloud_reporting(
     node_source(fleet, node_id)?;
     claude_token_for_node(root)?;
     lost::forget_failure(node_id);
+    // "Run": a row the supervisor consumes when it starts, which also
+    // supersedes an older answer to leave the node stopped.
+    record_node_request(fleet, node_id, REQUEST_RUN)?;
     progress("syncing with the orchestrator…");
     let (orch, user) = resolve(root)?;
     sync(fleet, root, &orch, &user)?;
@@ -1978,11 +1981,24 @@ pub fn wake_node_tracked_with(
     fresh_session: bool,
     progress: &mut dyn FnMut(&str),
 ) -> Result<(String, bool)> {
+    let kind = if fresh_session { REQUEST_FRESH_SESSION } else { REQUEST_CHECK_NOW };
+    wake_node_tracked_requesting(fleet, root, node_id, kind, progress)
+}
+
+/// [`wake_node_tracked`] that records the user's request of `kind`
+/// (`tod_store::node_requests::KINDS`) for the supervisor to consume.
+pub fn wake_node_tracked_requesting(
+    fleet: &FleetStore,
+    root: &Path,
+    node_id: &str,
+    kind: &str,
+    progress: &mut dyn FnMut(&str),
+) -> Result<(String, bool)> {
     let node: uuid::Uuid = node_id.parse().context("node id")?;
     let owner = crate::next_actor::this_process();
     tod_store::activity::with_lease(fleet, node, tod_store::activity::KIND_CLOUD_START, &owner, || {
         let since = tod_store::outline::uuid_blob::now_ms();
-        let said = wake_node_with(fleet, root, node_id, fresh_session)?;
+        let said = wake_node_requesting(fleet, root, node_id, kind)?;
         let heard = wait_for_supervisor(fleet, root, node, SyncReport::default(), since, progress)?;
         Ok((said, heard))
     })?
@@ -2077,13 +2093,53 @@ pub fn wake_node(fleet: &FleetStore, root: &Path, node_id: &str) -> Result<Strin
 /// would reopen or resume. A running supervisor takes it at its next poll
 /// (cancelling the turn in flight); a sleeping one when this poke wakes it.
 pub fn wake_node_with(fleet: &FleetStore, root: &Path, node_id: &str, fresh_session: bool) -> Result<String> {
+    let kind = if fresh_session { REQUEST_FRESH_SESSION } else { REQUEST_CHECK_NOW };
+    wake_node_requesting(fleet, root, node_id, kind)
+}
+
+pub use tod_store::node_requests::{
+    KIND_CHECK_NOW as REQUEST_CHECK_NOW, KIND_FRESH_SESSION as REQUEST_FRESH_SESSION, KIND_KEEP_GOING as REQUEST_KEEP_GOING,
+    KIND_RUN as REQUEST_RUN,
+};
+
+/// The actor that records a request row.
+pub const REQUEST_ACTOR: &str = "app:request";
+
+/// Records the user's request of `kind` on the node as a row that travels
+/// with the next sync and is consumed by the supervisor
+/// (`tod_store::node_requests`).
+pub fn record_node_request(fleet: &FleetStore, node_id: &str, kind: &str) -> Result<uuid::Uuid> {
+    let node = uuid::Uuid::parse_str(node_id).with_context(|| format!("node id {node_id}"))?;
+    let result = fleet
+        .interview(
+            REQUEST_ACTOR,
+            tod_store::interview::InterviewCommand::RecordNodeRequest {
+                node_id: node,
+                kind: kind.to_string(),
+                by: "app".to_string(),
+                at: tod_store::outline::uuid_blob::now_ms(),
+            },
+        )
+        .map_err(|e| anyhow!("record the {kind} request: {e}"))?;
+    let id = result["id"].as_str().ok_or_else(|| anyhow!("the {kind} request was recorded without an id"))?;
+    uuid::Uuid::parse_str(id).context("request id")
+}
+
+/// [`wake_node_with`] for a request of `kind`: the row is recorded first, so
+/// it travels with the sync (and stays pending until the supervisor consumes
+/// it, whenever it next wakes). A request to run or to go on also answers the
+/// node's stop question to continue (2.1), for a supervisor that reads only
+/// that; a new session also leaves the marker file an older supervisor reads.
+pub fn wake_node_requesting(fleet: &FleetStore, root: &Path, node_id: &str, kind: &str) -> Result<String> {
+    let fresh_session = kind == REQUEST_FRESH_SESSION;
     let row = cloud_node(fleet, node_id).ok_or_else(|| anyhow!("this node does not run in the cloud"))?;
     let (orch, user) = resolve(root)?;
-    // Before the sync, so the answer travels with it: a supervisor that
-    // reads "left stopped" would ignore the request.
-    if fresh_session {
+    // Before the sync, so the answer and the row travel with it: a supervisor
+    // that reads "left stopped" would ignore the request.
+    if kind != REQUEST_CHECK_NOW {
         continue_over_stop_answer(fleet, node_id)?;
     }
+    record_node_request(fleet, node_id, kind)?;
     sync(fleet, root, &orch, &user).context("send the change to the orchestrator")?;
     let sandboxes = tod_store::fleet::sandbox::Sandboxes::load(root)?;
     let bx = sandboxes.blaxel()?;

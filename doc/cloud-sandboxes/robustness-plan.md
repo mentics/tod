@@ -127,6 +127,18 @@ Make each a consumable row on the node (synced, with who/when), consumed by
 the supervisor at the first boundary, superseding any older stop answer.
 2.1 is the first step (the app answers the stop question).
 
+Done: `node_requests` (schema v90, `tod_store::node_requests`; kinds `run`,
+`fresh_session`, `check_now`, `keep_going`; `requested_by/at`, `consumed_by/at`),
+synced and journaled. The app records the row (`cloud_sync::record_node_request`)
+beside the 2.1 answer and the legacy marker file (kept for a supervisor built
+before v90). The supervisor reads pending rows at wake: any but `check_now`
+supersedes a stop answer and cancels pending waits; nothing is consumed until
+the run starts (or, for `check_now`, the look is made), so an early-exit wake
+leaves them. Mid-run they are consumed at the first boundary after a pull; a
+local runner consumes them as `run_with` starts. Gap: a row reaches a running
+supervisor only at its next pull, so a mid-turn "new session" still relies on
+the marker file to cancel the turn at once.
+
 ### 3.5 One Blaxel client with classification and a health probe (provisioning D1, D2)
 
 2.7 adds the classification and retry; the rest: a `SandboxHealth` probe
