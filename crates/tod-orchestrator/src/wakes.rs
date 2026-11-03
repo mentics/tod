@@ -19,7 +19,7 @@
 //!   on every tick, and `/release?reason=wakes` once nothing is pending.
 //!
 //! A poke that finds the sandbox gone ([`SandboxGone`]: Blaxel has no such
-//! sandbox, or its relay answers 404) is not retried: the wake is dropped and
+//! sandbox, or terminated) is not retried; a 404 from a sandbox Blaxel still has is retried: the wake is dropped and
 //! the lost handler ([`Wakes::set_lost_handler`]; the server marks the node's
 //! `cloud_nodes.lost_at`) is told, so the app replaces the sandbox on its
 //! next sync. Only the app can: the user's tokens are only on their machine.
@@ -363,6 +363,16 @@ impl RelayPoker {
     }
 }
 
+/// What a poke's 404 means once Blaxel has been asked whether the sandbox
+/// exists: gone if not, else an ordinary failure the wake is retried after.
+pub(crate) fn after_poke_404(sandbox_exists: bool, sandbox: &str, url: &str) -> anyhow::Error {
+    if sandbox_exists {
+        anyhow::anyhow!("poke {url}: 404, but {sandbox} exists (its workload is waking, or its relay lacks /poke); retrying")
+    } else {
+        anyhow::Error::new(SandboxGone(sandbox.to_string())).context(format!("poke {url}: 404"))
+    }
+}
+
 impl Poker for RelayPoker {
     fn poke(&self, wake: &Wake) -> Result<()> {
         let Some((workspace, token)) = &self.creds else {
@@ -385,7 +395,12 @@ impl Poker for RelayPoker {
             .context("poke")?;
         let status = resp.status().as_u16();
         if status == 404 {
-            return Err(anyhow::Error::new(SandboxGone(wake.sandbox.clone())).context(format!("poke {url}: 404")));
+            // Blaxel answers 404 while a standby sandbox's workload is still
+            // waking, and an older relay answers it for a route it lacks:
+            // neither is a sandbox that is gone. Only Blaxel having no such
+            // sandbox is.
+            let exists = bx.get(&wake.sandbox)?.is_some();
+            return Err(after_poke_404(exists, &wake.sandbox, &url));
         }
         if !(200..300).contains(&status) {
             bail!("poke {url}: {status}");
@@ -456,6 +471,14 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("tod-orch-wakes-{}-{}-{n}", std::process::id(), now_ms()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn a_poke_404_from_a_sandbox_that_exists_is_not_gone() {
+        let live = after_poke_404(true, "node-a", "https://x/poke");
+        assert!(!is_gone(&live), "{live:#}");
+        let gone = after_poke_404(false, "node-a", "https://x/poke");
+        assert!(is_gone(&gone), "{gone:#}");
     }
 
     #[test]
