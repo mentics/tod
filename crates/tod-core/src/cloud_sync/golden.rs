@@ -114,6 +114,16 @@ fn refresh_with(
         };
         progress("installing tod's files…");
         tod_sandbox::node::install(bx, &url, &payload, progress)?;
+        // A fork does not keep its source's proxy routing (checked live: the
+        // fork's `network` comes back empty), and `fork_golden` refuses a
+        // golden with none, since a fork of it cannot take the node's rules.
+        // Give it a placeholder rule, as a hand-made golden has.
+        bx.update_proxy(&name, &placeholder_proxy(), &[])
+            .with_context(|| format!("give {name} a proxy, so nodes can be forked from it"))?;
+        let routed = bx.get_json(&name)?.is_some_and(|j| has_proxy_routes(&j));
+        if !routed {
+            bail!("{name} did not keep the proxy it was given, so nodes cannot be forked from it");
+        }
         // Stamp first and `ready` last: a half-made golden is never ready.
         let stamp_labels = mine.labels();
         let mut labels: Vec<(&str, &str)> = stamp_labels.iter().map(|(k, v)| (*k, v.as_str())).collect();
@@ -151,9 +161,36 @@ fn refresh_with(
     Ok(name)
 }
 
+/// The proxy a golden carries so nodes can be forked from it: one rule that
+/// matches nothing real. A fork replaces it with the node's own rules.
+fn placeholder_proxy() -> serde_json::Value {
+    tod_sandbox::node::proxy_spec(&[tod_sandbox::node::ProxyRule {
+        destination: "tod-proxy-placeholder.invalid".into(),
+        header: "X-Tod-Placeholder".into(),
+        value: "{{SECRET:placeholder}}".into(),
+        secret_name: "placeholder".into(),
+        secret_value: "unused".into(),
+    }])
+}
+
+/// Whether a sandbox's record has proxy routing, which `fork_golden` needs.
+fn has_proxy_routes(record: &serde_json::Value) -> bool {
+    record["spec"]["network"]["proxy"]["routing"].as_array().is_some_and(|r| !r.is_empty())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Live: a golden made by `golden refresh` (a fork) came out with no proxy
+    /// routing, and every node fork from it was refused. What it is given
+    /// must count as routing to `fork_golden`'s own check.
+    #[test]
+    fn the_placeholder_proxy_is_what_fork_golden_accepts() {
+        let record = serde_json::json!({ "spec": { "network": { "proxy": placeholder_proxy() } } });
+        assert!(has_proxy_routes(&record));
+        assert!(!has_proxy_routes(&serde_json::json!({ "spec": { "network": {} } })));
+    }
 
     #[test]
     fn a_repository_is_normalized_from_a_slug_or_a_url() {
