@@ -1418,12 +1418,7 @@ impl TaskPanel {
     /// disabled, with an empty menu; after Pause (or Stop now) it says
     /// "Pausing…" until the runner has ended.
     fn render_runner_button(&self, actions: RunnerActions, pausing: bool, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let (primary, label, disabled) = match (actions.busy, actions.default) {
-            (Some(what), _) => (None, what, true),
-            (None, Some(action)) if action == RunnerAction::Pause && pausing => (Some(action), "Pausing…", true),
-            (None, Some(action)) => (Some(action), action.label(), false),
-            (None, None) => return None,
-        };
+        let (primary, label, disabled) = runner_button_face(&actions, pausing)?;
         let button = Button::new("unified-task-runner-action")
             .label(label)
             .disabled(disabled)
@@ -1808,6 +1803,40 @@ fn test_runners(
         Arc::new(std::sync::Mutex::new(Box::new(tod_agent::MockAgentProvider::new())));
     let (fleet, agent_runs) = (fleet.clone(), agent_runs.clone());
     cx.new(|cx| NodeRunners::new(fleet, agent, agent_runs, cx))
+}
+
+/// The split button's own face: the action it performs (none for a label
+/// only), its words, and whether it is disabled. `None` when there is
+/// nothing to show. A node with no default action (waiting on something
+/// outside) still has a menu (Check now, Migrate, Reset environment), so its
+/// button reads "Actions", disabled, and the caret opens the menu.
+fn runner_button_face(actions: &RunnerActions, pausing: bool) -> Option<(Option<RunnerAction>, &'static str, bool)> {
+    match (actions.busy, actions.default) {
+        (Some(what), _) => Some((None, what, true)),
+        (None, Some(action)) if action == RunnerAction::Pause && pausing => Some((Some(action), "Pausing…", true)),
+        (None, Some(action)) => Some((Some(action), action.label(), false)),
+        (None, None) if actions.menu.is_empty() => None,
+        (None, None) => Some((None, "Actions", true)),
+    }
+}
+
+#[cfg(test)]
+mod face_tests {
+    use super::*;
+
+    #[test]
+    fn a_node_with_a_menu_but_no_default_still_gets_a_button() {
+        let waiting = RunnerActions {
+            default: None,
+            menu: vec![RunnerAction::CheckNow, RunnerAction::MigrateTo],
+            busy: None,
+        };
+        assert_eq!(runner_button_face(&waiting, false), Some((None, "Actions", true)));
+        let nothing = RunnerActions { default: None, menu: Vec::new(), busy: None };
+        assert_eq!(runner_button_face(&nothing, false), None);
+        let running = RunnerActions { default: Some(RunnerAction::Pause), menu: Vec::new(), busy: None };
+        assert_eq!(runner_button_face(&running, true), Some((Some(RunnerAction::Pause), "Pausing…", true)));
+    }
 }
 
 #[cfg(test)]
