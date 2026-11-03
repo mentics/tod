@@ -1048,14 +1048,31 @@ impl TaskPanel {
                 use tod_core::autopilot::GithubCheck;
                 let (note, failed) = match result {
                     Ok((GithubCheck::Waiting { what, .. }, _)) => (format!("Checked GitHub: waiting for {what}"), false),
+                    // The work is the agent's, so the note says what putting
+                    // it on that work did, never that it is on it already.
                     Ok((GithubCheck::Feedback { what }, woke)) => match woke {
                         Some(Err(err)) => (format!("Checked GitHub: {what}, but waking the cloud node failed: {err:#}"), true),
-                        Some(Ok(_)) => (format!("Checked GitHub: {what}; its agent is on it."), false),
+                        Some(Ok((done, true))) => (format!("Checked GitHub: {what}; {done}."), false),
+                        Some(Ok((done, false))) => (
+                            format!(
+                                "Checked GitHub: {what}; {done}, but its supervisor has not reported in after {} \
+                                 seconds. Sync now looks again.",
+                                tod_core::cloud_sync::SUPERVISOR_REPORTS_WITHIN.as_secs()
+                            ),
+                            true,
+                        ),
+                        None if sandbox_lost => {
+                            (format!("Checked GitHub: {what}. Run in the cloud to put its agent on it."), false)
+                        }
                         None => {
-                            if !this.runners.read(cx).is_running(node) {
-                                let _ = this.runners.update(cx, |r, cx| r.start(node, false, cx));
+                            if this.runners.read(cx).is_running(node) {
+                                (format!("Checked GitHub: {what}; its runner is already going."), false)
+                            } else {
+                                match this.runners.update(cx, |r, cx| r.start(node, false, cx)) {
+                                    Ok(()) => (format!("Checked GitHub: {what}; starting its runner."), false),
+                                    Err(err) => (format!("Checked GitHub: {what}, but its runner could not start: {err}"), true),
+                                }
                             }
-                            (format!("Checked GitHub: {what}; its agent is on it."), false)
                         }
                     },
                     Ok((GithubCheck::Clear, Some(Ok((done, true))))) => {
@@ -1377,8 +1394,12 @@ impl TaskPanel {
         }
         // Why the runner could not start, or the latest word from the cloud.
         let mut extra_note: Option<AnyElement> = None;
+        // A start that failed off the UI thread outranks the note that said
+        // it was starting; a failed note keeps its own error.
         let note = match (&self.runner.cloud_note, self.runners.read(cx).error(self.node_id)) {
-            (Some(note), _) => Some((note.clone(), self.runner.cloud_failed)),
+            (Some(note), None) => Some((note.clone(), self.runner.cloud_failed)),
+            (Some(note), Some(_)) if self.runner.cloud_failed => Some((note.clone(), true)),
+            (Some(_), Some(error)) => Some((error.to_string(), true)),
             (None, Some(error)) => Some((error.to_string(), true)),
             (None, None) => None,
         };
