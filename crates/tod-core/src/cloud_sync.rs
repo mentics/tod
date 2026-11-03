@@ -418,6 +418,9 @@ pub struct Feed {
     /// on a short timer ([`crate::cloud_notify::DEGRADED_POLL`]). `None` from
     /// an orchestrator that is publishing, or too old to say.
     pub notices_degraded_secs: Option<u64>,
+    /// The orchestrator honoured `?wait=` (a long-poll); `false` from an
+    /// orchestrator too old to know it, which answers at once.
+    pub waited: bool,
 }
 
 /// How the app reaches the orchestrator.
@@ -543,6 +546,42 @@ impl HttpOrchestrator {
         Ok(Some((id, node, v["request"].clone())))
     }
 
+    /// `GET /users/<u>/changes?after=n&wait=<secs>`: the feed as a long-poll.
+    /// The orchestrator answers when another client's change is there, or
+    /// after `wait_secs` with no changes; one request is in flight, and the
+    /// orchestrator is awake only while it is. [`Feed::waited`] is `false`
+    /// when the orchestrator is too old to know `wait` (it answered at once).
+    pub fn pull_waiting(&self, user: &str, after: i64, wait_secs: u64) -> Result<Feed> {
+        self.pull_feed(user, after, Some(wait_secs))
+    }
+
+    /// The feed, with the gateway retry (502/503/504) either way.
+    fn pull_feed(&self, user: &str, after: i64, wait_secs: Option<u64>) -> Result<Feed> {
+        let rest = match wait_secs {
+            Some(w) => format!("changes?after={after}&wait={w}"),
+            None => format!("changes?after={after}"),
+        };
+        let url = self.url(user, &rest);
+        let timeout = wait_secs.map(|w| Duration::from_secs(w + 15));
+        let resp = Self::with_gateway_retry("feed", || {
+            let req = self.auth(self.agent.get(&url));
+            match timeout {
+                Some(t) => req.config().timeout_global(Some(t)).build().call(),
+                None => req.call(),
+            }
+        })?;
+        let mut v = Self::finish(resp, "feed")?;
+        let last_seq = v["last_seq"].as_i64().ok_or_else(|| anyhow!("orchestrator feed: no last_seq"))?;
+        let changes = serde_json::from_value(v["changes"].take())?;
+        Ok(Feed {
+            last_seq,
+            changes,
+            seed_id: v["seed_id"].as_str().map(str::to_string),
+            notices_degraded_secs: v["notices_degraded_secs"].as_u64(),
+            waited: v["waited"].as_bool() == Some(true),
+        })
+    }
+
     /// Answers broker request `id` (`POST /users/<u>/broker/reply/<id>`).
     pub fn broker_reply(&self, user: &str, id: u64, reply: &serde_json::Value) -> Result<()> {
         let rest = format!("broker/reply/{id}");
@@ -645,17 +684,7 @@ impl Orchestrator for HttpOrchestrator {
     }
 
     fn pull(&self, user: &str, after: i64) -> Result<Feed> {
-        let url = self.url(user, &format!("changes?after={after}"));
-        let resp = Self::with_gateway_retry("feed", || self.auth(self.agent.get(&url)).call())?;
-        let mut v = Self::finish(resp, "feed")?;
-        let last_seq = v["last_seq"].as_i64().ok_or_else(|| anyhow!("orchestrator feed: no last_seq"))?;
-        let changes = serde_json::from_value(v["changes"].take())?;
-        Ok(Feed {
-            last_seq,
-            changes,
-            seed_id: v["seed_id"].as_str().map(str::to_string),
-            notices_degraded_secs: v["notices_degraded_secs"].as_u64(),
-        })
+        self.pull_feed(user, after, None)
     }
 
     fn pull_problems(

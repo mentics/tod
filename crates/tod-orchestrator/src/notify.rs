@@ -36,15 +36,12 @@ const TOPIC_FILE: &str = "notify.json";
 /// quiet spell is still announced at once; only a continuous stream is
 /// batched, and the app also pulls on a timer.
 pub const MIN_INTERVAL: Duration = Duration::from_secs(30);
-/// How long publishing stops after the service answers 429. The limit is per
-/// IP address, so it stops for every user; the app is told (the feed's
-/// `notices_degraded_secs`) and pulls on a short timer meanwhile.
+/// How long publishing stops after the service refuses (429, but also a 5xx,
+/// a timeout or a DNS failure: any failed publish). A rate limit is per IP
+/// address, so it stops for every user; the change is not marked announced
+/// and is announced again when the pause is over. The app is told (the
+/// feed's `notices_degraded_secs`) and pulls on a short timer meanwhile.
 pub const RATE_LIMIT_BACKOFF: Duration = Duration::from_secs(60);
-
-/// Whether `err` is the notice service refusing for rate (HTTP 429).
-fn is_rate_limited(err: &anyhow::Error) -> bool {
-    matches!(err.downcast_ref::<ureq::Error>(), Some(ureq::Error::StatusCode(429)))
-}
 
 /// What a message says.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -302,7 +299,7 @@ fn failure_to_report(last: &mut Option<String>, result: Result<(), String>) -> O
         Err(message) => {
             *last = Some(message.clone());
             Some(format!(
-                "could not announce changes to your app ({message}); it pulls on a timer until announcements work again"
+                "could not announce changes to your app ({message}); the announcement is retried, and the app's feed long-poll does not need it"
             ))
         }
     }
@@ -432,11 +429,10 @@ impl Notifier {
             }
             Ok(())
         })();
-        if let Err(err) = &published
-            && is_rate_limited(err)
-        {
-            // Stop for everyone, and announce again when it is over: what was
-            // not announced is not marked as announced.
+        if published.is_err() {
+            // Any failed publish (not only a 429): stop publishing for a
+            // while, tell the app through the feed, and announce again when
+            // it is over: what was not announced is not marked as announced.
             let until = Instant::now() + RATE_LIMIT_BACKOFF;
             *self.degraded_until.lock().unwrap_or_else(|e| e.into_inner()) = Some(until);
             let mut announced = self.announced.lock().unwrap_or_else(|e| e.into_inner());
@@ -525,15 +521,16 @@ mod tests {
         }
     }
 
-    /// Refuses with a 429 while `refuse` is set; counts what it takes.
+    /// Refuses while `refuse` is set (with `status`); counts what it takes.
     struct Flaky {
+        status: u16,
         refuse: Arc<Mutex<bool>>,
         taken: Arc<Mutex<u32>>,
     }
     impl Sink for Flaky {
         fn publish(&self, _: &str, _: Kind) -> Result<()> {
             if *self.refuse.lock().unwrap() {
-                return Err(anyhow::Error::new(ureq::Error::StatusCode(429)).context("publish to ntfy"));
+                return Err(anyhow::Error::new(ureq::Error::StatusCode(self.status)).context("publish to ntfy"));
             }
             *self.taken.lock().unwrap() += 1;
             Ok(())
@@ -546,7 +543,7 @@ mod tests {
         let taken = Arc::new(Mutex::new(0));
         let n = Notifier::start(
             Box::new(SeqProbe(Mutex::new(1))),
-            Box::new(Flaky { refuse: refuse.clone(), taken: taken.clone() }),
+            Box::new(Flaky { status: 429, refuse: refuse.clone(), taken: taken.clone() }),
         );
         assert!(n.degraded_for().is_none());
         assert!(n.try_announce("u").is_err());
@@ -558,6 +555,28 @@ mod tests {
         assert_eq!(*taken.lock().unwrap(), 0);
         // Over: the same change, not yet announced, goes out.
         *n.degraded_until.lock().unwrap() = None;
+        assert!(n.try_announce("u").is_ok());
+        assert_eq!(*taken.lock().unwrap(), 1);
+    }
+
+    #[test]
+    fn a_failed_publish_that_is_not_a_429_is_not_marked_announced_and_is_retried() {
+        let refuse = Arc::new(Mutex::new(true));
+        let taken = Arc::new(Mutex::new(0));
+        let n = Notifier::start(
+            Box::new(SeqProbe(Mutex::new(1))),
+            Box::new(Flaky { status: 502, refuse: refuse.clone(), taken: taken.clone() }),
+        );
+        assert!(n.try_announce("u").is_err());
+        // The feed tells the app to pull, and a retry is held for later.
+        assert!(n.degraded_for().is_some());
+        assert!(n.state.lock().unwrap().next_due().is_some());
+        // Service back, pause over: the same change goes out, not lost.
+        *refuse.lock().unwrap() = false;
+        *n.degraded_until.lock().unwrap() = None;
+        assert!(n.try_announce("u").is_ok());
+        assert_eq!(*taken.lock().unwrap(), 1);
+        // And it is announced once.
         assert!(n.try_announce("u").is_ok());
         assert_eq!(*taken.lock().unwrap(), 1);
     }
