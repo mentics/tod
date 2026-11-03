@@ -6,6 +6,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 `tod` is a desktop task/agent management application built with **GPUI** (GPU-accelerated UI, Rust) and **gpui-component**. It manages "obligations", a conversation view where the user directs an agent that edits the outline (with every change reversible), an interview-style workflow for turning conversation into tasks, and a "fleet" of coding agents (Claude, Cursor) working in worktrees.
 
+**Start with [doc/architecture.md](../doc/architecture.md)**: the one-page overview of the processes (app, daemon, `tod-cli`, supervisor, orchestrator, relay), the crate layering, the data root, how agents are driven, where work runs, and the rules that hold everywhere. The sections below are the crate-by-crate detail behind it.
+
 ## Commands
 
 ```bash
@@ -66,6 +68,8 @@ Requires the default `agent-socket` feature. Launch with `--agent-socket-port PO
 Never swallow, downgrade, or silently work around a failure. If the configured action cannot be taken, return an error that names what failed and why; do not fall back to a different action (another image, another source, a default) or carry on with a `warning:`, `let _ =`, `.ok()`, or an empty default. A fallback is allowed only when the user configured it. In particular, a cloud run never substitutes the default image for the sandbox source its node (or ancestor) configures.
 
 ## Architecture
+
+The big picture is [doc/architecture.md](../doc/architecture.md); this section is the detail. Keep the two in step: a new crate, executable, or rule that holds everywhere belongs in the overview too.
 
 ### Workspace layout
 
