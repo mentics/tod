@@ -26,9 +26,9 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-/// A machine counts as connected for this long after its last poll began or
-/// ended. Its polls are `MAX_WAIT` long and re-issued at once.
-const CONNECTED_FOR: Duration = Duration::from_secs(MAX_WAIT_SECS + 15);
+/// A machine counts as connected for this long after its last contact. The
+/// client's poll length and retries are named with it in `tod_store::sync`.
+const CONNECTED_FOR: Duration = Duration::from_secs(tod_store::sync::BROKER_CONNECTED_SECS);
 const MAX_WAIT_SECS: u64 = 30;
 /// How long a sandbox's request waits for its answer. A login can need a
 /// tunnel to be opened first.
@@ -55,6 +55,9 @@ struct State {
     answers: HashMap<u64, Vec<u8>>,
     /// When each of a user's machines (by `X-Tod-Client`) last polled.
     seen: HashMap<String, HashMap<String, Instant>>,
+    /// The machine that last answered for a node (user, node): later requests
+    /// for it go to that machine first.
+    owners: HashMap<(String, String), String>,
 }
 
 impl State {
@@ -63,6 +66,14 @@ impl State {
             .get(user)
             .map(|m| m.iter().filter(|(_, at)| at.elapsed() < CONNECTED_FOR).map(|(k, _)| k).collect())
             .unwrap_or_default()
+    }
+
+    /// The machine to offer `q` to alone: the node's known owner, while it is
+    /// connected and has not declined this request. `None` means broadcast.
+    fn owner_of(&self, user: &str, q: &Queued) -> Option<String> {
+        let owner = self.owners.get(&(user.to_string(), q.node.clone()))?;
+        let live = self.seen.get(user).and_then(|m| m.get(owner)).is_some_and(|at| at.elapsed() < CONNECTED_FOR);
+        (live && !q.declined.contains(owner)).then(|| owner.clone())
     }
 
     /// The error for request `id` when every connected machine has said the
@@ -75,7 +86,7 @@ impl State {
         }
         let n = connected.len();
         Some(format!(
-            "node {} is not a cloud node that any of the user's connected machines knows: asked {n} machine{} \
+            "no machine owns node {}: not a cloud node that any of the user's connected machines knows: asked {n} machine{} \
              and none claimed it (each machine is a tod app with its own data root; the node belongs to a data root that is not running, or is not running its daemon)",
             q.node,
             if n == 1 { "" } else { "s" }
@@ -108,7 +119,7 @@ impl Broker {
             Ok(v) => v,
             Err(err) => return Response::text(400, format!("the request is not JSON: {err}")),
         };
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.connected(user).is_empty() {
             return json(
                 503,
@@ -142,7 +153,7 @@ impl Broker {
                 break json(504, serde_json::json!({"ok": false, "error": "the user's machine did not answer in time"}));
             }
             // Wake now and then: a machine that went away no longer counts.
-            state = self.changed.wait_timeout(state, left.min(Duration::from_secs(5))).unwrap().0;
+            state = self.changed.wait_timeout(state, left.min(Duration::from_secs(5))).unwrap_or_else(|e| e.into_inner()).0;
         };
         // Nobody should answer it later.
         if let Some(queue) = state.queued.get_mut(user) {
@@ -162,13 +173,23 @@ impl Broker {
             .min(MAX_WAIT_SECS);
         let machine = machine(request);
         let deadline = Instant::now() + Duration::from_secs(wait);
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         loop {
             state.seen.entry(user.to_string()).or_default().insert(machine.clone(), Instant::now());
+            let routed: Vec<Option<String>> = state
+                .queued
+                .get(user)
+                .map(|qs| qs.iter().map(|q| state.owner_of(user, q)).collect())
+                .unwrap_or_default();
             let offer = state
                 .queued
                 .get_mut(user)
-                .and_then(|q| q.iter_mut().find(|q| !q.offered.contains(&machine)))
+                .and_then(|qs| {
+                    qs.iter_mut()
+                        .zip(routed)
+                        .find(|(q, owner)| !q.offered.contains(&machine) && owner.as_ref().is_none_or(|o| *o == machine))
+                        .map(|(q, _)| q)
+                })
                 .map(|q| {
                     q.offered.insert(machine.clone());
                     (q.id, q.node.clone(), q.request.clone())
@@ -178,9 +199,10 @@ impl Broker {
             }
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
+                state.seen.entry(user.to_string()).or_default().insert(machine.clone(), Instant::now());
                 return json(200, serde_json::json!({}));
             }
-            state = self.changed.wait_timeout(state, left).unwrap().0;
+            state = self.changed.wait_timeout(state, left).unwrap_or_else(|e| e.into_inner()).0;
         }
     }
 
@@ -193,16 +215,33 @@ impl Broker {
             return Response::text(400, "the reply is not JSON");
         };
         let machine = machine(request);
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         state.seen.entry(user.to_string()).or_default().insert(machine.clone(), Instant::now());
         let waiting = state.queued.get(user).is_some_and(|q| q.iter().any(|q| q.id == id));
         if waiting {
             if parsed["not_mine"].as_bool() == Some(true) {
+                let mut node = None;
                 if let Some(q) = state.queued.get_mut(user).and_then(|q| q.iter_mut().find(|q| q.id == id)) {
-                    q.declined.insert(machine);
+                    q.declined.insert(machine.clone());
+                    node = Some(q.node.clone());
+                }
+                // A machine that said it is not the owner no longer is.
+                if let Some(node) = node {
+                    let key = (user.to_string(), node);
+                    if state.owners.get(&key) == Some(&machine) {
+                        state.owners.remove(&key);
+                    }
                 }
             } else {
-                // The first answer wins.
+                // The first answer wins, and its machine owns the node. A
+                // machine that fails for a node it owns (an error reply)
+                // is still its owner: only `not_mine` says otherwise.
+                if !state.answers.contains_key(&id) {
+                    let node = state.queued.get(user).and_then(|q| q.iter().find(|q| q.id == id)).map(|q| q.node.clone());
+                    if let Some(node) = node {
+                        state.owners.insert((user.to_string(), node), machine);
+                    }
+                }
                 state.answers.entry(id).or_insert_with(|| body.to_vec());
             }
         }
@@ -265,7 +304,7 @@ mod tests {
     fn another_user_never_sees_the_request() {
         let broker = Broker::default();
         broker.next("u", &req(None, "", "wait=0"));
-        broker.state.lock().unwrap().queued.entry("u".into()).or_default().push(Queued {
+        broker.state.lock().unwrap_or_else(|e| e.into_inner()).queued.entry("u".into()).or_default().push(Queued {
             id: 9,
             node: "n".into(),
             request: serde_json::json!({}),
@@ -319,6 +358,58 @@ mod tests {
         assert_eq!(v["ok"], false);
         let error = v["error"].as_str().unwrap();
         assert!(error.contains("asked 2 machines") && error.contains("n1"), "{error}");
+    }
+
+    #[test]
+    fn a_node_goes_to_the_machine_that_answered_for_it_before() {
+        let broker = Arc::new(Broker::default());
+        for m in ["a", "b"] {
+            broker.next("u", &req_from(m, None, "", "wait=0"));
+        }
+        // "b" answers first and so owns n1.
+        let b = machine_replying(&broker, "b", r#"{"ok":true}"#);
+        assert_eq!(broker.request("u", &req(Some("n1"), "{}", "")).status, 200);
+        b.join().unwrap();
+        assert_eq!(broker.state.lock().unwrap().owners.get(&("u".into(), "n1".into())).map(String::as_str), Some("b"));
+        // The next request is not offered to "a" while "b" is connected.
+        broker.next("u", &req_from("a", None, "", "wait=0"));
+        broker.next("u", &req_from("b", None, "", "wait=0"));
+        let b = machine_replying(&broker, "b", r#"{"ok":true,"again":true}"#);
+        let a_poll = {
+            let broker = broker.clone();
+            std::thread::spawn(move || broker.next("u", &req_from("a", None, "", "wait=1")).body)
+        };
+        let r = broker.request("u", &req(Some("n1"), "{}", ""));
+        b.join().unwrap();
+        assert_eq!(r.status, 200);
+        assert_eq!(a_poll.join().unwrap(), b"{}", "the non-owner was offered the request");
+    }
+
+    #[test]
+    fn an_owner_that_declines_loses_the_node_and_the_request_is_broadcast() {
+        let broker = Arc::new(Broker::default());
+        for m in ["a", "b"] {
+            broker.next("u", &req_from(m, None, "", "wait=0"));
+        }
+        broker.state.lock().unwrap().owners.insert(("u".into(), "n1".into()), "a".into());
+        let a = machine_replying(&broker, "a", NOT_MINE);
+        let b = machine_replying(&broker, "b", r#"{"ok":true}"#);
+        let r = broker.request("u", &req(Some("n1"), "{}", ""));
+        a.join().unwrap();
+        b.join().unwrap();
+        assert_eq!(r.status, 200);
+        assert_eq!(broker.state.lock().unwrap().owners.get(&("u".into(), "n1".into())).map(String::as_str), Some("b"));
+    }
+
+    #[test]
+    fn nobody_owning_the_node_is_the_final_error() {
+        let broker = Arc::new(Broker::default());
+        broker.next("u", &req_from("a", None, "", "wait=0"));
+        let a = machine_replying(&broker, "a", NOT_MINE);
+        let r = broker.request("u", &req(Some("n9"), "{}", ""));
+        a.join().unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
+        assert!(v["error"].as_str().unwrap().contains("no machine owns node n9"), "{v}");
     }
 
     #[test]

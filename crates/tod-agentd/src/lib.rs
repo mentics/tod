@@ -3,5 +3,6 @@
 //! in `tod-agentd-client`.
 
 pub mod actor_journey;
+pub mod lifetime;
 pub mod runners;
 pub mod server;

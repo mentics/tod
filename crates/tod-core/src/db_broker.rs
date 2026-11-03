@@ -31,7 +31,7 @@ use tod_store::fleet::FleetStore;
 
 /// How long a sandbox's forwards stay open after the node last asked.
 pub const IDLE: Duration = Duration::from_secs(10 * 60);
-const POLL_SECS: u64 = 25;
+const POLL_SECS: u64 = tod_store::sync::BROKER_POLL_SECS;
 
 /// What the broker needs from its surroundings; tests and the live check
 /// replace the parts that would otherwise need a running app.
@@ -91,6 +91,13 @@ impl Quiet {
 
 fn databases(root: &Path) -> Result<Vec<Database>> {
     Config::load(&root.join(config::FILE_NAME))?.databases()
+}
+
+/// Whether this data root declares any `[[database]]`, so that its daemon
+/// must keep polling the broker while the app is closed. A `sandboxes.toml`
+/// that cannot be read counts as declaring them: the poll retries it.
+pub fn declares_databases(root: &Path) -> bool {
+    databases(root).map(|d| !d.is_empty()).unwrap_or(true)
 }
 
 fn run(service: Arc<Service>) {
@@ -176,6 +183,10 @@ fn reply_for(outcome: Result<Value>) -> Value {
 
 /// One request's reply. The request is `{"op": "list" | "token" | "touch", "name": …}`.
 fn answer(service: &Service, tunnels: &Tunnels, node: &str, request: &Value) -> Result<Value> {
+    // Ownership first: a data root that does not run this node declines, whatever
+    // its own database list holds or fails to load. Once it is the node's root,
+    // every error below is final.
+    let sandbox = (service.sandbox_of)(node).ok_or(NotMine)?;
     let dbs = (service.databases)()?;
     let op = request["op"].as_str().unwrap_or_default();
     if op == "list" {
@@ -187,8 +198,6 @@ fn answer(service: &Service, tunnels: &Tunnels, node: &str, request: &Value) -> 
         let known: Vec<&str> = dbs.iter().map(|d| d.name.as_str()).collect();
         anyhow!("no database named {name:?} is set up on the user's machine (it has: {})", known.join(", "))
     })?;
-    // Only a node this machine knows to run in a sandbox of its own.
-    let sandbox = (service.sandbox_of)(node).ok_or(NotMine)?;
     tunnels.ensure(&service.root, &sandbox, db.forward())?;
     match op {
         "touch" => Ok(json!({"ok": true})),
@@ -215,7 +224,7 @@ impl Tunnels {
     /// `forward` is open on `sandbox` when this returns. Opening one may
     /// wake the sandbox, so it can take a few seconds.
     fn ensure(&self, root: &Path, sandbox: &str, forward: Forward) -> Result<()> {
-        let mut map = self.map.lock().unwrap();
+        let mut map = self.map.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(entry) = map.get_mut(sandbox) {
             if entry.held.forwards.contains(&forward) {
                 entry.last_used = Instant::now();
@@ -235,7 +244,7 @@ impl Tunnels {
     fn spawn_reaper(self: Arc<Self>) {
         let spawned = std::thread::Builder::new().name("db-broker-reaper".into()).spawn(move || loop {
             std::thread::sleep(Duration::from_secs(30));
-            self.map.lock().unwrap().retain(|_, e| e.last_used.elapsed() < IDLE);
+            self.map.lock().unwrap_or_else(|e| e.into_inner()).retain(|_, e| e.last_used.elapsed() < IDLE);
         });
         if let Err(err) = spawned {
             tracing::warn!("database broker: the idle check did not start: {err}");
@@ -275,8 +284,31 @@ mod tests {
     }
 
     #[test]
+    fn a_root_without_the_node_declines_before_looking_anything_up() {
+        let mut svc = service(&[]);
+        svc.databases = Box::new(|| Err(anyhow!("sandboxes.toml is unreadable")));
+        for request in [json!({"op": "list"}), json!({"op": "token", "name": "missing"}), json!({"op": "touch"})] {
+            let outcome = answer(&svc, &Tunnels::default(), "stranger", &request);
+            assert_eq!(reply_for(outcome), json!({"ok": false, "not_mine": true}), "{request}");
+        }
+        let mut empty = service(&[]);
+        empty.databases = Box::new(|| Ok(vec![]));
+        let outcome = answer(&empty, &Tunnels::default(), "stranger", &json!({"op": "token", "name": "prod"}));
+        assert_eq!(reply_for(outcome), json!({"ok": false, "not_mine": true}));
+    }
+
+    #[test]
+    fn an_error_on_an_owned_node_is_final() {
+        let mut svc = service(&[("mine", "sbx")]);
+        svc.databases = Box::new(|| Err(anyhow!("sandboxes.toml is unreadable")));
+        let reply = reply_for(answer(&svc, &Tunnels::default(), "mine", &json!({"op": "list"})));
+        assert!(reply["error"].as_str().unwrap().contains("unreadable"), "{reply}");
+        assert!(reply.get("not_mine").is_none());
+    }
+
+    #[test]
     fn list_names_the_databases_and_nothing_secret() {
-        let reply = answer(&service(&[]), &Tunnels::default(), "n", &json!({"op": "list"})).unwrap();
+        let reply = answer(&service(&[("n", "sbx")]), &Tunnels::default(), "n", &json!({"op": "list"})).unwrap();
         assert_eq!(reply["databases"][0]["name"], "prod");
         assert!(!reply.to_string().contains("h.example"), "{reply}");
     }

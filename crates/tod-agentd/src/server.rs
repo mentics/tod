@@ -8,8 +8,10 @@ use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
+use crate::lifetime;
 use crate::runners::Runners;
 use tod_agent::AgentBackend;
 use tod_core::autopilot::local::RunnerState;
@@ -40,6 +42,10 @@ struct Shared {
     /// Bumped on every change the store announces.
     seq: AtomicU64,
     answered: Mutex<VecDeque<(Uuid, Response)>>,
+    /// Connections open now, and when one last was (the idle exit,
+    /// `lifetime::should_exit`).
+    clients: AtomicUsize,
+    last_client: Mutex<Instant>,
 }
 
 /// Run the daemon for `data_root` until told to quit. `Ok(false)` when
@@ -106,6 +112,8 @@ pub fn run(data_root: &Path) -> Result<bool> {
         quit: AtomicBool::new(false),
         seq: AtomicU64::new(0),
         answered: Mutex::new(VecDeque::new()),
+        clients: AtomicUsize::new(0),
+        last_client: Mutex::new(Instant::now()),
     });
     // Clients can write now, which a mock agent's own writes need.
     if mock {
@@ -117,16 +125,23 @@ pub fn run(data_root: &Path) -> Result<bool> {
     tod_core::cloud_sync::sync_on_start(shared.store.clone());
     tod_core::cloud_notify::start(shared.store.clone());
     tod_core::db_broker::start(shared.store.clone());
+    // Old build copies go (this one is running from `daemon/`, not removed).
+    let running = std::env::current_exe().ok();
+    lifetime::prune_builds(paths.dir(), running.as_deref(), lifetime::KEEP_BUILDS);
+    watch_lifetime(shared.clone(), data_root.to_path_buf(), port);
     for stream in listener.incoming() {
         if shared.quit.load(Ordering::SeqCst) {
             break;
         }
         let Ok(stream) = stream else { continue };
         let shared = shared.clone();
+        shared.clients.fetch_add(1, Ordering::SeqCst);
         std::thread::Builder::new()
             .name("tod-agentd-client".into())
             .spawn(move || {
                 serve(stream, &shared);
+                *shared.last_client.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
+                shared.clients.fetch_sub(1, Ordering::SeqCst);
                 if shared.quit.load(Ordering::SeqCst) {
                     // Wake the accept loop so it sees the flag.
                     let _ = TcpStream::connect(("127.0.0.1", port));
@@ -147,6 +162,38 @@ pub fn run(data_root: &Path) -> Result<bool> {
     drop(lock);
     eprintln!("tod-agentd {stamp} stopped");
     Ok(true)
+}
+
+/// Ends the daemon when [`lifetime::should_exit`] says to, checked every
+/// minute. The reason is logged at info.
+fn watch_lifetime(shared: Arc<Shared>, root: std::path::PathBuf, port: u16) {
+    let idle = lifetime::idle_limit();
+    let polls_broker = tod_core::db_broker::declares_databases(&root);
+    let spawned = std::thread::Builder::new().name("tod-agentd-lifetime".into()).spawn(move || loop {
+        std::thread::sleep(lifetime::CHECK_EVERY);
+        if shared.quit.load(Ordering::SeqCst) {
+            return;
+        }
+        let runs = shared.runners.snapshot().iter().filter(|r| r.running || r.pausing).count();
+        // A connection that is open now is a client now.
+        let last = if shared.clients.load(Ordering::SeqCst) > 0 {
+            Instant::now()
+        } else {
+            *shared.last_client.lock().unwrap_or_else(|e| e.into_inner())
+        };
+        // Re-read: a database may have been declared since the daemon started.
+        let polls = polls_broker || tod_core::db_broker::declares_databases(&root);
+        if let Some(reason) = lifetime::should_exit(Instant::now(), last, runs, polls, root.exists(), idle) {
+            tracing::info!("tod-agentd: exiting: {reason}");
+            shared.quit.store(true, Ordering::SeqCst);
+            // Wake the accept loop so it sees the flag.
+            let _ = TcpStream::connect(("127.0.0.1", port));
+            return;
+        }
+    });
+    if let Err(err) = spawned {
+        tracing::warn!("tod-agentd: the lifetime check did not start: {err}");
+    }
 }
 
 fn serve(stream: TcpStream, shared: &Shared) {
