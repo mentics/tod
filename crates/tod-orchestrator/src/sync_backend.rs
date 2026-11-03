@@ -12,7 +12,8 @@
 //!   and `last_seq`.
 //! - `GET /users/<u>/changes?after=<n>`: the changes after `n` (never from
 //!   before the seed), without the requesting client's own. Reply:
-//!   `{"last_seq": n, "changes": [...], "seed_id": id}` (`seed_id` names
+//!   `{"last_seq": n, "changes": [...], "seed_id": id}` (plus
+//!   `notices_degraded_secs` while the notice service refuses publishes; `seed_id` names
 //!   the seeding the feed follows; a client whose copy came from another one
 //!   starts over); the client pulls again with
 //!   `after` = `last_seq`.
@@ -130,8 +131,10 @@ pub fn apply_changes(
     response
 }
 
-/// `client`'s own changes are left out.
-pub fn export_changes(user: &UserData, after: i64, client: Option<&str>) -> Response {
+/// `client`'s own changes are left out. `notices_degraded_secs` is how long
+/// the notice service has been refusing for (see `notify::Notifier::degraded_for`):
+/// the app pulls on a short timer until then, as no notice will say a change came.
+pub fn export_changes(user: &UserData, after: i64, client: Option<&str>, notices_degraded_secs: Option<u64>) -> Response {
     reply((|| {
         let _guard = user.sync_lock.lock().unwrap_or_else(|e| e.into_inner());
         let _ = user.store.flush_on_quit();
@@ -139,7 +142,11 @@ pub fn export_changes(user: &UserData, after: i64, client: Option<&str>) -> Resp
         let conn = connect(user)?;
         let last = sync::last_seq(&conn)?;
         let changes = sync::export_changes_for(&conn, after, client)?;
-        Ok(json(&serde_json::json!({ "last_seq": last, "changes": changes, "seed_id": seed_id(&user.root) })))
+        let mut v = serde_json::json!({ "last_seq": last, "changes": changes, "seed_id": seed_id(&user.root) });
+        if let Some(secs) = notices_degraded_secs {
+            v["notices_degraded_secs"] = secs.into();
+        }
+        Ok(json(&v))
     })())
 }
 

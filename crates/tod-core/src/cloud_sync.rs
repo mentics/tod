@@ -433,6 +433,11 @@ pub struct Feed {
     pub changes: Vec<Change>,
     /// The seeding the feed follows; see [`Seeding::seed_id`].
     pub seed_id: Option<String>,
+    /// How many seconds the orchestrator's notice service has left in a
+    /// refusal (HTTP 429): no notice will arrive until then, so the app pulls
+    /// on a short timer ([`crate::cloud_notify::DEGRADED_POLL`]). `None` from
+    /// an orchestrator that is publishing, or too old to say.
+    pub notices_degraded_secs: Option<u64>,
 }
 
 /// How the app reaches the orchestrator.
@@ -614,7 +619,12 @@ impl Orchestrator for HttpOrchestrator {
         let mut v = Self::finish(resp, "feed")?;
         let last_seq = v["last_seq"].as_i64().ok_or_else(|| anyhow!("orchestrator feed: no last_seq"))?;
         let changes = serde_json::from_value(v["changes"].take())?;
-        Ok(Feed { last_seq, changes, seed_id: v["seed_id"].as_str().map(str::to_string) })
+        Ok(Feed {
+            last_seq,
+            changes,
+            seed_id: v["seed_id"].as_str().map(str::to_string),
+            notices_degraded_secs: v["notices_degraded_secs"].as_u64(),
+        })
     }
 
     fn pull_problems(
@@ -658,6 +668,8 @@ pub struct SyncReport {
     /// where they run, which the orchestrator also marks): proof that a
     /// node's supervisor, or the orchestrator for it, has been heard from.
     pub heard_from: std::collections::BTreeSet<uuid::Uuid>,
+    /// The feed's `notices_degraded_secs`; see [`Feed`].
+    pub notices_degraded_secs: Option<u64>,
 }
 
 impl SyncReport {
@@ -781,6 +793,7 @@ fn sync_once(fleet: &FleetStore, root: &Path, orch: &dyn Orchestrator, user: &st
         anyhow::bail!("the orchestrator's database was seeded again during this sync; the next sync takes it");
     }
     let last = pulled.last_seq;
+    report.notices_degraded_secs = pulled.notices_degraded_secs;
     let feed = pulled.changes;
     if !feed.is_empty() {
         let mut conn = connect(&db)?;
