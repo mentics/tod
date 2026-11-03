@@ -149,21 +149,69 @@ fn stop_marker(state_dir: &std::path::Path) -> bool {
     state_dir.join(tod_core::autopilot::STOP_NOW_REQUEST_FILE).exists()
 }
 
+/// How many `stop_now` rows are still owed to a stop the marker file already
+/// took (a number, in the state directory). The app writes the marker
+/// beside the row, and the marker reaches a turn in flight at once while the
+/// row arrives only with the next pull: a supervisor that stopped on the
+/// marker finds no row to consume. Left alone, the row would arrive later and
+/// stop the next run the moment it started.
+const STOP_ROWS_OWED_FILE: &str = "stop-rows-owed";
+
+fn stop_rows_owed(state_dir: &std::path::Path) -> usize {
+    std::fs::read_to_string(state_dir.join(STOP_ROWS_OWED_FILE)).ok().and_then(|s| s.trim().parse().ok()).unwrap_or(0)
+}
+
+fn set_stop_rows_owed(state_dir: &std::path::Path, owed: usize) -> Result<()> {
+    let path = state_dir.join(STOP_ROWS_OWED_FILE);
+    if owed == 0 {
+        match std::fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(anyhow::anyhow!("remove {}: {e}", path.display())),
+        }
+    } else {
+        std::fs::write(&path, owed.to_string()).map_err(|e| anyhow::anyhow!("write {}: {e}", path.display()))
+    }
+}
+
+/// Consumes the oldest pending `stop_now` rows a marker-file stop was owed
+/// (see [`STOP_ROWS_OWED_FILE`]): they are the request already taken, not a
+/// new one for the run now starting.
+fn settle_owed_stop_rows(state_dir: &std::path::Path, fleet: &FleetStore, node: Uuid, by: &str) -> Result<()> {
+    let owed = stop_rows_owed(state_dir);
+    if owed == 0 {
+        return Ok(());
+    }
+    let stale: Vec<_> = pending_requests(fleet, node)?
+        .into_iter()
+        .filter(|r| r.kind == tod_store::node_requests::KIND_STOP_NOW)
+        .take(owed)
+        .collect();
+    consume_requests(fleet, &stale, by)?;
+    set_stop_rows_owed(state_dir, owed - stale.len())
+}
+
 /// Takes the requests to pause or stop: deletes the stop marker (an error
 /// removing one that is there is returned, never left to stop the next run)
-/// and consumes the pending `pause` and `stop_now` rows.
+/// and consumes the pending `pause` and `stop_now` rows. A marker taken with
+/// no `stop_now` row yet pulled leaves that row owed ([`STOP_ROWS_OWED_FILE`]).
 fn take_stop_requests(state_dir: &std::path::Path, fleet: &FleetStore, node: Uuid, by: &str) -> Result<()> {
     let path = state_dir.join(tod_core::autopilot::STOP_NOW_REQUEST_FILE);
-    match std::fs::remove_file(&path) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+    let had_marker = match std::fs::remove_file(&path) {
+        Ok(()) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
         Err(e) => return Err(anyhow::anyhow!("remove {}: {e}", path.display())),
-    }
+    };
     let stops: Vec<_> = pending_requests(fleet, node)?
         .into_iter()
         .filter(|r| matches!(r.kind.as_str(), tod_store::node_requests::KIND_PAUSE | tod_store::node_requests::KIND_STOP_NOW))
         .collect();
-    consume_requests(fleet, &stops, by)
+    consume_requests(fleet, &stops, by)?;
+    let rows = stops.iter().filter(|r| r.kind == tod_store::node_requests::KIND_STOP_NOW).count();
+    // Rows consumed here pay what was owed; a marker with no row to go with
+    // it owes one.
+    let owed = stop_rows_owed(state_dir).saturating_sub(rows) + usize::from(had_marker && rows == 0);
+    set_stop_rows_owed(state_dir, owed)
 }
 
 /// The node's requests not yet consumed (`tod_store::node_requests`).
@@ -277,6 +325,7 @@ impl StepHook for Hook<'_> {
                 tracing::warn!("pushing the branch: {err:#}");
             }
         }
+        settle_owed_stop_rows(self.state_dir, fleet, self.node, &self.consumer)?;
         let pending = pending_requests(fleet, self.node)?;
         // The user's Stop now and Pause end the run here, at the boundary:
         // taken (and the marker deleted) now, so the next wake does not stop
@@ -672,6 +721,7 @@ pub fn wake(config: Config) -> Result<Woke> {
     // Asked for while the supervisor slept: this run starts in a new session.
     // The request is saved in the autopilot's state (and survives a failure
     // here), so deleting the file is what takes it.
+    settle_owed_stop_rows(&config.state_dir, &store, config.node, &consumer)?;
     if fresh_requested(&config.state_dir, &store, config.node)? {
         tod_core::autopilot::AutopilotState::request_fresh_session(&data_root, config.node)?;
         take_fresh_request(&config.state_dir, &store, config.node, &consumer)?;
@@ -832,6 +882,79 @@ pub fn wake(config: Config) -> Result<Woke> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("tod-supervisor-{tag}-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn store_with_node(root: &std::path::Path) -> (FleetStore, Uuid) {
+        use tod_store::outline::{CreatePosition, OutlineMutation};
+        let fleet = FleetStore::open(root).unwrap();
+        fleet.enqueue_outline(OutlineMutation::CreateList { slug: "t".into(), title: "T".into() }).unwrap();
+        let list_id = fleet.list_outline_lists().unwrap()[0].id;
+        let node = Uuid::new_v4();
+        fleet
+            .enqueue_outline(OutlineMutation::CreateNode {
+                node_id: Some(node),
+                list_id,
+                parent_id: None,
+                anchor_id: None,
+                position: CreatePosition::Below,
+                title: "N".into(),
+            })
+            .unwrap();
+        fleet.writer().flush().unwrap();
+        (fleet, node)
+    }
+
+    fn record(fleet: &FleetStore, node: Uuid, kind: &str, at: i64) {
+        fleet
+            .interview(
+                "app",
+                tod_store::interview::InterviewCommand::RecordNodeRequest {
+                    node_id: node,
+                    kind: kind.to_string(),
+                    by: "app".into(),
+                    at,
+                },
+            )
+            .unwrap();
+    }
+
+    /// Stop now reaches a turn in flight as the marker file; its row arrives
+    /// with a later pull. The stop that took the marker must still take the
+    /// row when it arrives, or the next run is stopped by it at once.
+    #[test]
+    fn a_stop_taken_from_its_marker_takes_its_row_when_it_arrives() {
+        let state = temp_dir("state");
+        let root = temp_dir("root");
+        let (fleet, node) = store_with_node(&root);
+        std::fs::write(state.join(tod_core::autopilot::STOP_NOW_REQUEST_FILE), "").unwrap();
+
+        // The stop is taken on the marker: no row has arrived.
+        take_stop_requests(&state, &fleet, node, "sup").unwrap();
+        assert!(!stop_marker(&state));
+        assert_eq!(stop_rows_owed(&state), 1);
+
+        // The row arrives later, with a request for a new session.
+        record(&fleet, node, tod_store::node_requests::KIND_STOP_NOW, 10);
+        record(&fleet, node, tod_store::node_requests::KIND_FRESH_SESSION, 20);
+        settle_owed_stop_rows(&state, &fleet, node, "sup").unwrap();
+
+        let pending = pending_requests(&fleet, node).unwrap();
+        assert_eq!(pending.len(), 1, "{pending:?}");
+        assert_eq!(pending[0].kind, tod_store::node_requests::KIND_FRESH_SESSION);
+        assert_eq!(stop_rows_owed(&state), 0);
+
+        // A later, genuine Stop now is left for the run to take.
+        record(&fleet, node, tod_store::node_requests::KIND_STOP_NOW, 30);
+        settle_owed_stop_rows(&state, &fleet, node, "sup").unwrap();
+        assert!(tod_store::node_requests::any_of(&pending_requests(&fleet, node).unwrap(), tod_store::node_requests::KIND_STOP_NOW));
+        std::fs::remove_dir_all(state).ok();
+        std::fs::remove_dir_all(root).ok();
+    }
 
     fn budget() -> Budget {
         Budget { max_sessions: 60, max_duration: Duration::from_secs(16 * 3600) }
