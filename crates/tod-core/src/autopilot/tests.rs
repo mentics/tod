@@ -36,6 +36,9 @@ struct FakeAgent {
     /// Every phase-agent turn first adds an obligation, so the work the
     /// evaluator judges is new each time.
     phase_churn: bool,
+    /// Every review turn records a new finding and finishes: a reviewer that
+    /// never comes back clean.
+    review_never_clean: bool,
 }
 
 type VerifyScript = Arc<dyn Fn(usize, &[Uuid]) -> Vec<Uuid> + Send + Sync>;
@@ -51,6 +54,7 @@ impl FakeAgent {
             verify_script: None,
             verify_rounds: std::sync::atomic::AtomicUsize::new(0),
             phase_churn: false,
+            review_never_clean: false,
         }
     }
 
@@ -128,6 +132,32 @@ impl FakeAgent {
                 })?;
                 if protocol == Some(tod_store::conversation::ProtocolKind::Verification) {
                     self.scripted_verify(script, node.parse()?, conversation.parse()?)?;
+                    return Ok(String::new());
+                }
+            }
+            if self.review_never_clean {
+                let protocol = self.fleet.read(|conn| {
+                    Ok(tod_store::conversation::ConversationRepo::new(conn)
+                        .get(conversation.parse()?)?
+                        .map(|c| c.protocol))
+                })?;
+                if protocol == Some(tod_store::conversation::ProtocolKind::Review) {
+                    use crate::conversation::mock::Access;
+                    user.interview(InterviewCommand::AddReviewFinding {
+                        node_id: node.parse()?,
+                        conversation_id: Some(conversation.parse()?),
+                        finding: tod_store::review::NewFinding {
+                            severity: "medium".into(),
+                            file: Some("src/lib.rs".into()),
+                            line: Some(1),
+                            summary: "Another defect.".into(),
+                            detail: None,
+                        },
+                    })?;
+                    user.interview(InterviewCommand::RecordConversationReport {
+                        conversation_id: conversation.parse()?,
+                        body: crate::conversation::review::done_report(),
+                    })?;
                     return Ok(String::new());
                 }
             }
@@ -458,6 +488,66 @@ fn takes_a_node_from_proposed_to_done() {
     assert_eq!(saved.current, None);
     // Every finished step's session was ended, not left holding an agent.
     assert!(agent.sessions.is_empty(), "{:?}", agent.sessions.keys().collect::<Vec<_>>());
+}
+
+#[test]
+fn a_review_that_never_comes_back_clean_stops_for_the_user_after_the_round_limit() {
+    let fx = setup();
+    retire_outside_criteria(&fx);
+    let mut agent = FakeAgent::new(&fx.fleet);
+    agent.review_never_clean = true;
+    let mut pilot = autopilot(&fx, Budget::default());
+    let outcome = pilot.run(&fx.fleet, &mut agent).unwrap();
+    let steps = &pilot.state().steps;
+    match &outcome {
+        Outcome::NeedsHuman { reason: NeedsHuman::ReviewNotConverging { rounds, standing } } => {
+            assert_eq!(*rounds, REVIEW_ROUND_LIMIT);
+            // What the last review recorded, and the fixer's claim on it.
+            assert_eq!(standing.len(), 1, "{standing:?}");
+            assert!(standing[0].contains("Another defect.") && standing[0].contains("fixed"), "{standing:?}");
+        }
+        other => panic!("{other:?} {steps:#?}"),
+    }
+    // Review then fix, the limit's times, and no fix after the last one went
+    // unreviewed past the limit: each a conversation (so a session) of its own.
+    let of = |name: &str| steps.iter().filter(|s| s.step == name).collect::<Vec<_>>();
+    assert_eq!(of("review").len(), REVIEW_ROUND_LIMIT as usize, "{steps:#?}");
+    assert_eq!(of("fix").len(), REVIEW_ROUND_LIMIT as usize, "{steps:#?}");
+    let mut conversations: Vec<_> = of("review").iter().chain(of("fix").iter()).map(|s| s.conversation_id).collect();
+    conversations.sort();
+    conversations.dedup();
+    assert_eq!(conversations.len(), 2 * REVIEW_ROUND_LIMIT as usize, "{steps:#?}");
+    // The node stayed in `review`: nothing the fixer claimed moved it on.
+    assert_eq!(lifecycle::current_state(&fx.fleet, fx.node).unwrap(), "review");
+    // And the user is told why, in words that say what to do.
+    let words = outcome_words(&outcome);
+    assert!(words.contains("rounds of review and fix"), "{words}");
+}
+
+fn outcome_words(outcome: &Outcome) -> String {
+    match outcome {
+        Outcome::NeedsHuman { reason } => reason.describe(),
+        other => format!("{other:?}"),
+    }
+}
+
+#[test]
+fn a_review_that_finds_something_is_followed_by_a_fix_and_then_another_review() {
+    let fx = setup();
+    retire_outside_criteria(&fx);
+    let mut agent = FakeAgent::new(&fx.fleet);
+    let mut pilot = autopilot(&fx, Budget::default());
+    let outcome = pilot.run(&fx.fleet, &mut agent).unwrap();
+    assert_eq!(outcome, Outcome::Done);
+    let order: Vec<_> = pilot
+        .state()
+        .steps
+        .iter()
+        .map(|s| s.step.as_str())
+        .filter(|s| matches!(*s, "review" | "fix"))
+        .collect();
+    // The mock reviewer finds one thing the first time, then nothing.
+    assert_eq!(order, ["review", "fix", "review"], "{order:?}");
 }
 
 #[test]

@@ -55,8 +55,8 @@ fn phase_label(phase: &str) -> &'static str {
         "planning" => "Planning",
         "implement" => "Implement",
         "verify" => "Verify",
-        "review" => "Review",
-        "fix" => "Fix review findings",
+        "review" => "Review (finds problems)",
+        "fix" => "Fix (resolves the review's findings)",
         "pr" => "Pull request",
         "pr_draft" => "Pull request draft",
         "pr_review" => "Pull request review",
@@ -64,6 +64,22 @@ fn phase_label(phase: &str) -> &'static str {
         "released" => "Released",
         "learn" => "Learn",
         _ => "Phase",
+    }
+}
+
+/// What a phase's skills are for, where the phase name alone does not say.
+/// Review and Fix are two agents in two sessions, each with its own list.
+fn phase_blurb(phase: &str) -> Option<&'static str> {
+    match phase {
+        "review" => Some(
+            "For the agent that reviews the change and records findings. Optional: leave it empty \
+             and the review still runs; add project-specific things to look for.",
+        ),
+        "fix" => Some(
+            "For the separate agent that fixes what the review found, then is reviewed again. \
+             Optional: leave it empty and the fix still runs; add project-specific ways to fix.",
+        ),
+        _ => None,
     }
 }
 
@@ -260,6 +276,9 @@ impl LifecycleConfigEditor {
                         })
                     }),
             )
+            .when_some(phase_blurb(phase), |el, blurb| {
+                el.child(div().text_xs().text_color(muted).child(blurb))
+            })
             .child(div().text_xs().text_color(muted).child(selectable_text(
                 format!("lc-summary-{index}"),
                 match &source {
@@ -295,6 +314,9 @@ impl LifecycleConfigEditor {
                     .child(format!("Skills for {}", phase_label(form.phase))),
             )
             .child(Input::new(&form.skills))
+            .when_some(phase_blurb(form.phase), |el, blurb| {
+                el.child(div().text_xs().text_color(cx.theme().muted_foreground).child(blurb))
+            })
             .child(
                 div()
                     .text_xs()

@@ -471,13 +471,21 @@ fn obligations_verified_outcome(conn: &Connection, node_id: Uuid) -> Result<Deri
     Ok(fail(parts.join(" ")))
 }
 
-/// The node's review conversation recorded the review finished.
+/// The node's latest review recorded itself finished and came back clean.
+/// Fixing what an earlier review found does not satisfy this: only a review
+/// of the fixed change can.
 fn review_done_outcome(conn: &Connection, node_id: Uuid) -> Result<DerivedOutcome> {
-    if crate::conversation::review::review_recorded_done(conn, node_id)? {
+    if crate::conversation::review::review_passed(conn, node_id)? {
         return Ok(DerivedOutcome {
             outcome: OUTCOME_PASS,
-            detail: "The review conversation recorded the review finished.".into(),
+            detail: "The latest review recorded itself finished and found nothing standing.".into(),
         });
+    }
+    if crate::conversation::review::review_recorded_done(conn, node_id)? {
+        return Ok(fail(
+            "The latest review recorded findings, so it has not cleared the change: run Review \
+             again. The node moves on only when a review of the current change finds nothing.",
+        ));
     }
     Ok(fail(
         "No finished code review — run Review from this panel and let it record the \
@@ -1266,6 +1274,45 @@ mod tests {
         assert_eq!(evaluate(&store, node, done).unwrap().outcome, OUTCOME_PASS);
         let outcome = evaluate(&store, node, answered).unwrap();
         assert_eq!(outcome.outcome, OUTCOME_PASS, "{}", outcome.detail);
+    }
+
+    /// The fix agent's `fixed` is a claim: only a later review that finds
+    /// nothing clears the node.
+    #[test]
+    fn a_fixed_finding_needs_another_review_to_clear_the_node() {
+        use tod_store::conversation::{ConversationRepo, Focus, ProtocolKind, TurnRole};
+        use tod_store::review::{FINDING_FIXED, NewFinding};
+
+        let done = REVIEW_APPROVED_REVIEW_DONE_SLUG;
+        let (store, node) = store_with_node();
+        let conn = writer_conn(&store);
+        let conversations = ConversationRepo::new(&conn);
+        let finish = |id: Uuid| {
+            conversations.append_turn(id, TurnRole::User, "Review").unwrap();
+            conversations.record_report(id, &crate::conversation::review::done_report()).unwrap();
+        };
+        let first = conversations.create(Focus::Node(node), ProtocolKind::Review, None, None, None).unwrap();
+        let finding = ReviewRepo::new(&conn)
+            .add(
+                node,
+                Some(first.id),
+                &NewFinding { severity: "high".into(), summary: "Panics on empty input".into(), ..Default::default() },
+            )
+            .unwrap();
+        finish(first.id);
+        // Done, but with a finding open.
+        assert_eq!(evaluate(&store, node, done).unwrap().outcome, OUTCOME_FAIL);
+        // The fixer answers it `fixed`: still not clear.
+        ReviewRepo::new(&conn).respond(finding.id, FINDING_FIXED, Some("guarded in lib.rs")).unwrap();
+        let outcome = evaluate(&store, node, done).unwrap();
+        assert_eq!(outcome.outcome, OUTCOME_FAIL);
+        assert!(outcome.detail.contains("run Review again"), "{}", outcome.detail);
+        // A new review of the fixed change records nothing: now it is clear.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let second = conversations.create(Focus::Node(node), ProtocolKind::Review, None, None, None).unwrap();
+        assert_eq!(evaluate(&store, node, done).unwrap().outcome, OUTCOME_FAIL, "not finished yet");
+        finish(second.id);
+        assert_eq!(evaluate(&store, node, done).unwrap().outcome, OUTCOME_PASS);
     }
 
     #[test]

@@ -65,6 +65,11 @@ pub struct AutopilotState {
 /// the run stops and asks the user ([`LoopCounters::note`]).
 pub const CYCLE_LIMIT: u32 = 3;
 
+/// How many reviews a node may have in one stay in `review` before the run
+/// stops and asks the user: review, fix, review again, and so on, until a
+/// review finds nothing. Reaching it means the two are not converging.
+pub const REVIEW_ROUND_LIMIT: u32 = 3;
+
 /// Everything that counts a loop the run is in. Sessions
 /// ([`AutopilotState::sessions`]) and the pull request's start
 /// ([`AutopilotState::pr_turns_base`]) stay beside it; this holds the rest,
@@ -77,6 +82,10 @@ pub struct LoopCounters {
     /// Evaluator rejections in the current stay in the state being judged.
     #[serde(default)]
     pub evaluator_rejections: u32,
+    /// Reviews started in the current stay in `review`. Each is a round of
+    /// review, then fix; the run stops for the user at [`REVIEW_ROUND_LIMIT`].
+    #[serde(default)]
+    pub review_rounds: u32,
     /// Times a failed verification sent the node back to be fixed.
     #[serde(default)]
     pub fix_cycles: u32,

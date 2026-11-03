@@ -24,7 +24,7 @@ use tod_store::conversation::{ConversationRepo, Focus, ProtocolKind};
 use tod_store::fleet::provision::resolve_launch_cwd;
 use tod_store::outline::EXTRA_CONTENT_DETAILS;
 use tod_store::outline::repos::NodeRepo;
-use tod_store::review::{NewFinding, ReviewRepo};
+use tod_store::review::{FINDING_DECLINED, FINDING_OUT_OF_SCOPE, NewFinding, ReviewRepo};
 use uuid::Uuid;
 
 /// The lifecycle state whose role doc says how review is done.
@@ -53,6 +53,32 @@ pub fn review_recorded_done(conn: &Connection, node_id: Uuid) -> Result<bool> {
     Ok(repo
         .latest_report(conversation.id)?
         .is_some_and(|report| is_done_report(&report)))
+}
+
+/// Whether the node's latest review came back clean: it recorded itself
+/// finished, and none of the findings it recorded still stands. A finding the
+/// user answered `out_of_scope` or `declined` is theirs to dismiss and does
+/// not count against it; one answered `fixed` or `rejected` (by the fix agent,
+/// or open) does, because only another review can say the change is right now.
+/// This is the review's own verdict, never the fix agent's claim.
+pub fn review_passed(conn: &Connection, node_id: Uuid) -> Result<bool> {
+    let repo = ConversationRepo::new(conn);
+    let Some(conversation) =
+        repo.latest_for_focus_with_protocol(Focus::Node(node_id), ProtocolKind::Review)?
+    else {
+        return Ok(false);
+    };
+    if !repo
+        .latest_report(conversation.id)?
+        .is_some_and(|report| is_done_report(&report))
+    {
+        return Ok(false);
+    }
+    Ok(ReviewRepo::new(conn)
+        .list_for_node(node_id)?
+        .iter()
+        .filter(|f| f.conversation_id == Some(conversation.id))
+        .all(|f| matches!(f.status.as_str(), FINDING_OUT_OF_SCOPE | FINDING_DECLINED)))
 }
 
 pub struct ReviewProtocol;
@@ -219,13 +245,17 @@ pub fn mock_turn(
     node_id: Uuid,
     conversation_id: Uuid,
 ) -> Result<String> {
-    let recorded = access.read(|conn| {
-        Ok(ReviewRepo::new(conn)
-            .list_for_node(node_id)?
-            .iter()
-            .any(|f| f.conversation_id == Some(conversation_id)))
+    // The first review records one finding. A review after a fix (the node
+    // already has findings from an earlier session) finds nothing: it is
+    // clean, so the mock loop ends in a round or two instead of going round.
+    let (mine, any) = access.read(|conn| {
+        let findings = ReviewRepo::new(conn).list_for_node(node_id)?;
+        Ok((
+            findings.iter().any(|f| f.conversation_id == Some(conversation_id)),
+            !findings.is_empty(),
+        ))
     })?;
-    if !recorded {
+    if !mine && !any {
         access.interview(tod_store::interview::InterviewCommand::AddReviewFinding {
             node_id,
             conversation_id: Some(conversation_id),

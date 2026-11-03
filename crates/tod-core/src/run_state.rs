@@ -59,6 +59,8 @@ pub mod kind {
     pub const NO_PROGRESS: &str = "no_progress";
     /// The same problem came back too often.
     pub const LOOPING: &str = "looping";
+    /// Review and fix ran out of rounds without a review coming back clean.
+    pub const REVIEW_NOT_CONVERGING: &str = "review_not_converging";
 }
 
 /// How a run's words differ by who ran it.
@@ -177,6 +179,9 @@ pub fn for_outcome(outcome: &Outcome, words: Words<'_>) -> Draft {
                 NeedsHuman::AgentFailed { error } => draft(Phase::Stopped, kind::FAILED, error.clone(), RESUMABLE_BY_YOU),
                 NeedsHuman::NoProgress { .. } => draft(Phase::Stopped, kind::NO_PROGRESS, text, RESUMABLE_BY_YOU),
                 NeedsHuman::Looping { .. } => draft(Phase::Stopped, kind::LOOPING, text, RESUMABLE_BY_YOU),
+                NeedsHuman::ReviewNotConverging { .. } => {
+                    draft(Phase::Stopped, kind::REVIEW_NOT_CONVERGING, text, RESUMABLE_BY_YOU)
+                }
             }
         }
     }
@@ -325,6 +330,10 @@ mod tests {
             (NeedsHuman::Permission { title: "edit a.rs".into() }, kind::PERMISSION),
             (NeedsHuman::NoProgress { step: "verify".into() }, kind::NO_PROGRESS),
             (NeedsHuman::Looping { what: "a test".into(), times: 3 }, kind::LOOPING),
+            (
+                NeedsHuman::ReviewNotConverging { rounds: 3, standing: vec!["[ab12] a bug (fixed)".into()] },
+                kind::REVIEW_NOT_CONVERGING,
+            ),
         ];
         for (reason, expected) in stops {
             let got = needs(reason.clone());

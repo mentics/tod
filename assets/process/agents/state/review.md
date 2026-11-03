@@ -1,6 +1,6 @@
 # State: `review`
 
-**Gate:** `review` → `pr`. The app checks it: the review is recorded done, and no finding is still open.
+**Gate:** `review` → `pr`. The app checks it: the latest review is recorded done and found nothing standing, and no finding is still open. Fixing findings is never enough: a fresh review of the fixed change has to come back clean. The runner loops review → fix → review, up to a few rounds, and then stops and asks the user.
 
 ## First
 
@@ -26,7 +26,7 @@ Track all findings until each has an explicit response:
 
 Fixing is a separate fix conversation (the runner starts it, or the conversation view's **Fix**): its agent answers each open finding `fixed` or `rejected`. The other answers are the user's.
 
-No outstanding unaddressed findings.
+No outstanding unaddressed findings. A review that records findings is followed by a fix, and the fix by another review in a new session; the reviewer, not the fixer, decides the change is right.
 
 ### External approval
 
@@ -38,7 +38,7 @@ Implement fixes or document responses. Re-verify when fixes touch behavior cover
 
 ## Done when
 
-- The review conversation recorded the review finished.
+- The latest review conversation recorded the review finished, and recorded no finding that still stands (a finding the user marked out of scope or declined does not count).
 - No finding is still open: each has an explicit response (fixed, with a pointer to the change or commit; out of scope; declined as not critical, beyond requirements, or not worth the cost; or rejected as not a problem, with a note saying why).
 
 ## Blockers

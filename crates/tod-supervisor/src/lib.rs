@@ -363,7 +363,8 @@ pub fn stop_reason(outcome: &Outcome, budget: &Budget) -> Option<String> {
             | NeedsHuman::Permission { .. }
             | NeedsHuman::AgentFailed { .. }
             | NeedsHuman::NoProgress { .. }
-            | NeedsHuman::Looping { .. } => Some(reason.describe()),
+            | NeedsHuman::Looping { .. }
+            | NeedsHuman::ReviewNotConverging { .. } => Some(reason.describe()),
         },
     }
 }
