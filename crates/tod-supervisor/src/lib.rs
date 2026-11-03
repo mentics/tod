@@ -300,7 +300,13 @@ pub fn wake(config: Config) -> Result<Woke> {
     let store = replica.lock().unwrap_or_else(|e| e.into_inner()).store().clone();
     phase("pull the orchestrator's changes", began, || replica.lock().unwrap_or_else(|e| e.into_inner()).pull())?;
 
-    let budget = match answers::before_wake(&store, config.node, &config.state_dir, config.budget)? {
+    let budget = match answers::before_wake_with(
+        &store,
+        config.node,
+        &config.state_dir,
+        config.budget,
+        fresh_requested(&config.state_dir),
+    )? {
         answers::Before::LeaveStopped(reason) => {
             tracing::info!(%reason, "left stopped; going back to sleep");
             return Ok(Woke::LeftStopped(reason));

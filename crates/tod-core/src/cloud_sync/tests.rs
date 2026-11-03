@@ -615,3 +615,55 @@ fn an_orchestrator_seeded_by_another_copy_is_seeded_with_this_one_again() {
     let _ = std::fs::remove_dir_all(&root);
     let _ = std::fs::remove_dir_all(&other_root);
 }
+
+#[test]
+fn running_a_node_answers_a_stop_answer_to_continue() {
+    use crate::stop_questions::{self, Answer};
+    use tod_store::decisions::NewDecision;
+    let root = temp_root("run-over-stop");
+    let app = FleetStore::open(&root).unwrap();
+    add_list(&app, "t");
+    let list_id = app.list_outline_lists().unwrap()[0].id;
+    let node = uuid::Uuid::new_v4();
+    app.enqueue_outline(OutlineMutation::CreateNode {
+        node_id: Some(node),
+        list_id,
+        parent_id: None,
+        anchor_id: None,
+        position: tod_store::outline::CreatePosition::Below,
+        title: "n".into(),
+    })
+    .unwrap();
+    app.writer().flush().unwrap();
+    let latest = |app: &FleetStore| app.read(|c| stop_questions::latest(c, node)).unwrap().unwrap();
+    // No question: nothing to answer.
+    assert_eq!(continue_over_stop_answer(&app, &node.to_string()).unwrap(), None);
+    app.interview(
+        tod_store::interview::ACTOR_AGENT,
+        tod_store::interview::InterviewCommand::AskDecision {
+            node_id: node,
+            conversation_id: None,
+            protocol: Some(stop_questions::BUDGET.into()),
+            decision: NewDecision {
+                question: "Keep going?".into(),
+                options: stop_questions::SUPERVISOR_OPTIONS.iter().map(|o| o.to_string()).collect(),
+                evidence: Vec::new(),
+                ..Default::default()
+            },
+        },
+    )
+    .unwrap();
+    let id = latest(&app).decision;
+    // Pending is left alone.
+    assert_eq!(continue_over_stop_answer(&app, &node.to_string()).unwrap(), None);
+    app.interview(
+        tod_store::interview::ACTOR_USER,
+        tod_store::interview::InterviewCommand::AnswerDecision { decision_id: id, option: Some(2), text: None },
+    )
+    .unwrap();
+    assert_eq!(latest(&app).answer, Answer::Stop);
+    assert_eq!(continue_over_stop_answer(&app, &node.to_string()).unwrap(), Some(id));
+    assert_eq!(latest(&app).answer, Answer::Continue);
+    // Answered to continue already: nothing more.
+    assert_eq!(continue_over_stop_answer(&app, &node.to_string()).unwrap(), None);
+}

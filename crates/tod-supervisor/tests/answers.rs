@@ -245,3 +245,27 @@ fn leave_it_stopped_after_failures_keeps_the_node_stopped() {
     // And it asked nothing more.
     assert_eq!(count(&s.remote_db, "SELECT COUNT(*) FROM decisions"), 1);
 }
+
+#[test]
+fn a_request_to_run_overrides_leave_it_stopped_and_is_taken() {
+    let s = setup("override");
+    let woke = wake_once(&s, fake_relay().0, 1);
+    assert!(matches!(woke, Woke::Ran(Outcome::BudgetExhausted { .. })), "{woke:?}");
+    answer(&s, 2); // Leave it stopped
+    let woke = wake_once(&s, fake_relay().0, 1);
+    assert!(matches!(woke, Woke::LeftStopped(_)), "{woke:?}");
+
+    // "Run with a new session": the request file.
+    let state = s.base.join("supervisor");
+    let request = state.join(tod_core::autopilot::FRESH_SESSION_REQUEST_FILE);
+    std::fs::write(&request, b"").unwrap();
+    let turns = count(&s.remote_db, "SELECT COUNT(*) FROM conversation_turns");
+    let woke = wake_once(&s, fake_relay().0, 1);
+    assert!(matches!(woke, Woke::Ran(_)), "{woke:?}");
+    assert!(!request.exists(), "the request was taken");
+    assert!(count(&s.remote_db, "SELECT COUNT(*) FROM conversation_turns") > turns, "the node ran");
+
+    // The next scheduled wake, with no request, does not revert to stopped.
+    let woke = wake_once(&s, fake_relay().0, 1);
+    assert!(!matches!(woke, Woke::LeftStopped(_)), "{woke:?}");
+}
