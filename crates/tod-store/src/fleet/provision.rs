@@ -696,6 +696,13 @@ fn make_sandbox(
             "the agent's session logs could not be restored ({err:#}); its conversations start a new session"
         )),
     }
+    // A node migrated here keeps its runner state too (the autopilot's
+    // position and the supervisor's grants), before its first wake.
+    match super::session_log::place_node_state(fleet, &files.node_id, &name) {
+        Ok(0) => {}
+        Ok(n) => progress(&format!("sent {n} runner state file(s) to {name}")),
+        Err(err) => warnings.push(format!("the runner state could not be sent ({err:#}); the runner starts over")),
+    }
     Ok((location, warnings))
 }
 

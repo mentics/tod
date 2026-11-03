@@ -477,6 +477,9 @@ pub struct TaskEditView {
     /// A change that would remove worktrees or sandboxes, waiting to be
     /// confirmed (opened from `drain_pending`, which has the window).
     pending_files_change: Option<PendingFilesChange>,
+    /// A location picked for a node that has files made: Migrate, confirmed
+    /// in `drain_pending` (it needs the window).
+    pending_migrate: Option<FilesPlace>,
     pending_title_revert: bool,
     pending_branch_revert: bool,
     pending_clear_tag_draft: bool,
@@ -881,6 +884,7 @@ impl TaskEditView {
             obligation_constraints: 0,
             pending_toast: None,
             pending_files_change: None,
+            pending_migrate: None,
             pending_title_revert: false,
             pending_branch_revert: false,
             pending_clear_tag_draft: false,
@@ -1426,6 +1430,33 @@ impl TaskEditView {
             }
             self.clamp_focus_index();
         }
+        if let Some(place) = self.pending_migrate.take()
+            && let Some(node) = self.task_id()
+        {
+            let view = cx.entity().downgrade();
+            crate::ui::files_impact::confirm_migrate(
+                window,
+                cx,
+                self.fleet.clone(),
+                self.paths.clone(),
+                node,
+                place,
+                Box::new(move |result, _window, cx| {
+                    let _ = view.update(cx, |this, cx| {
+                        if let Err(message) = result {
+                            // The children refusal shows here too.
+                            this.pending_toast = Some(message);
+                            cx.notify();
+                            return;
+                        }
+                        let _ = this.fleet.reload_if_stale();
+                        this.load_action_capabilities();
+                        this.clamp_focus_index();
+                        this.notify_changed(cx);
+                    });
+                }),
+            );
+        }
         if let Some(change) = self.pending_files_change.take() {
             let view = cx.entity().downgrade();
             let apply = change.apply;
@@ -1742,6 +1773,15 @@ impl TaskEditView {
         self.location_open = false;
         self.clamp_focus_index();
         if self.own_files().and_then(|files| files.place_id.as_deref()) == Some(place.id.as_str()) {
+            cx.notify();
+            return;
+        }
+        // A node whose files are made moves them: Migrate keeps its sessions,
+        // shows what it leaves, and refuses a node with children. Picking
+        // for a node with nothing made yet (what its children inherit) is
+        // the plain flow below.
+        if self.node_location().is_some() {
+            self.pending_migrate = Some(place);
             cx.notify();
             return;
         }
