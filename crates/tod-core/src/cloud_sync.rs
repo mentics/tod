@@ -1278,6 +1278,16 @@ pub fn sandbox_is_dead(info: &tod_sandbox::blaxel::SandboxInfo) -> bool {
     sandbox_dead_reason(info).is_some()
 }
 
+/// Why a node's recorded sandbox cannot serve this app, when it was made for
+/// another orchestrator user than the one this app syncs as (the root's owner
+/// changed since): its supervisor would read that other user's database, never
+/// find the node, and exit.
+pub fn sandbox_user_reason(sandbox: &str, recorded_user: &str, user: &str) -> Option<String> {
+    (recorded_user != user).then(|| {
+        format!("sandbox {sandbox} was made for orchestrator user {recorded_user}, but this app syncs as {user}")
+    })
+}
+
 /// Why `info`'s sandbox cannot be reused, if it cannot: [`sandbox_dead_reason`],
 /// else its workload not answering after the reachability wait (Blaxel's
 /// record can say `DEPLOYED` for a sandbox that is gone).
@@ -1436,6 +1446,15 @@ pub fn ensure_node_sandbox(
         while bx.get(&name)?.is_some() && std::time::Instant::now() < deadline {
             std::thread::sleep(Duration::from_secs(2));
         }
+    }
+    // A sandbox made for another orchestrator user would read that user's
+    // database and never find the node. It may hold the node's work, so it is
+    // not deleted here: say so, and let the user's Delete Sandbox checkpoint it.
+    if let Some(info) = &existing
+        && !sandbox_is_dead(info)
+        && let Some(why) = sandbox_user_reason(&name, info.env("TOD_USER").unwrap_or(user), user)
+    {
+        bail!("{why}; use Delete Sandbox in the task panel (it saves the work first), then run the node again");
     }
     // Only a sandbox made now is an empty checkout. One that was already up
     // holds the node's own work, which a checkpoint must not be applied over.
@@ -1891,7 +1910,9 @@ pub fn wake_node_with(fleet: &FleetStore, root: &Path, node_id: &str, fresh_sess
     // A sandbox in standby answers 502/503/504 and Blaxel's own 404 "workload
     // is not ready" for up to ~30s after waking: every upload below waits it
     // out, and one that never answers is replaced rather than reused.
-    let unusable = found.as_ref().and_then(|info| sandbox_unusable_reason(&bx, info));
+    let made_for = found.as_ref().and_then(|info| info.env("TOD_USER")).unwrap_or(&row.user);
+    let unusable = sandbox_user_reason(&row.sandbox, made_for, &user)
+        .or_else(|| found.as_ref().and_then(|info| sandbox_unusable_reason(&bx, info)));
     if let Some(reason) = &unusable {
         tracing::warn!("cloud: {reason}; replacing it");
     }
@@ -1900,8 +1921,8 @@ pub fn wake_node_with(fleet: &FleetStore, root: &Path, node_id: &str, fresh_sess
         _ => {
             let gone = row.sandbox.clone();
             let mut progress = |msg: &str| log_progress(&format!("replacing {gone}"), msg);
-            let node = ensure_node_sandbox(fleet, root, node_id, &row.user, &mut progress)
-                .and_then(|name| record_cloud_node(fleet, node_id, name, &row.user))
+            let node = ensure_node_sandbox(fleet, root, node_id, &user, &mut progress)
+                .and_then(|name| record_cloud_node(fleet, node_id, name, &user))
                 .with_context(|| format!("sandbox {gone} is gone, and replacing it failed"))?;
             let info = bx
                 .get(&node.sandbox)?

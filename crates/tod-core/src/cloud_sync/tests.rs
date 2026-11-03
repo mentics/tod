@@ -30,6 +30,13 @@ fn user_names_are_what_the_orchestrator_accepts() {
 }
 
 #[test]
+fn a_sandbox_made_for_another_orchestrator_user_is_not_reused() {
+    assert_eq!(sandbox_user_reason("node-a", "me", "me"), None);
+    let why = sandbox_user_reason("node-a", "jshellman", "jshellman-live-verify").unwrap();
+    assert!(why.contains("node-a") && why.contains("jshellman,") && why.contains("jshellman-live-verify"), "{why}");
+}
+
+#[test]
 fn a_claude_node_without_a_token_fails_before_anything_is_created() {
     let err = require_claude_token(None, None).unwrap_err().to_string();
     assert!(err.contains("Settings → Cloud sandboxes → Claude subscription"), "{err}");
