@@ -408,7 +408,7 @@ pub fn check_relay_arch(relay: &[u8]) -> Result<()> {
 }
 
 /// The manifest as read through the relay, or `None` if the relay is not reachable.
-fn relay_manifest(bx: &Blaxel, url: &str) -> Option<String> {
+pub(crate) fn relay_manifest(bx: &Blaxel, url: &str) -> Option<String> {
     relay_output(bx, url, &format!("cat {MANIFEST_PATH} 2>/dev/null"))
 }
 

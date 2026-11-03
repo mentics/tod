@@ -1422,6 +1422,9 @@ pub fn ensure_node_sandbox(
 ) -> Result<String> {
     use tod_sandbox::node;
 
+    // One provisioning of a node at a time, across the app and the daemon:
+    // two would fork the same name or start two relays.
+    let _provisioning = provisioning::lock_node_provisioning(root, node_id, progress)?;
     let (task, repo_url, branch) = node_source(fleet, node_id)?;
     // Before any network call: without it the sandbox could not run Claude.
     let claude_oauth_token = claude_token_for_node(root)?;
@@ -1463,6 +1466,9 @@ pub fn ensure_node_sandbox(
 
     let source = node_sandbox_source(fleet, &sandboxes, &bx, node_id)?;
     let name = existing_sandbox_name(fleet, &bx, node_id)?.unwrap_or_else(|| node_sandbox_name(&task.slug));
+    // Before the first call that changes anything at Blaxel: a crash from
+    // here on leaves a record of the sandbox that may exist.
+    provisioning::record_intent(root, node_id, &name)?;
     let agent = cloud_agent();
     let spec = node::NodeSandboxSpec {
         name: &name,
@@ -1551,7 +1557,8 @@ pub fn ensure_node_sandbox(
         if bx.get(&name)?.is_some() {
             bx.delete(&name)?;
         }
-        Ok(())
+        // Gone (or never made): nothing is left for the sweeper to find.
+        provisioning::clear_intent(root, node_id)
     };
     if made_now {
         match &source {
@@ -1568,6 +1575,24 @@ pub fn ensure_node_sandbox(
                 }
             }
         }
+    }
+    let expected_manifest = tod_sandbox::provision::node_manifest(&relay);
+    // A sandbox that was already up is reused on its health, never on its
+    // `DEPLOYED` status: say what is wrong with it before provisioning repairs
+    // it (a repair that does not fix it fails the probe below, naming the check).
+    if !made_now
+        && let Some(url) = existing.as_ref().and_then(|info| info.url.as_deref())
+        && let Err(failure) = probe_health(
+            &bx,
+            &HealthTarget { label: &name, node: node_id, repo_url: &repo_url, url },
+            tod_sandbox::health::Stage::Ready,
+            INSTALL_MIN_FREE,
+            None,
+            &[],
+            progress,
+        )
+    {
+        progress(&format!("{name} is not healthy ({failure}); repairing it…"));
     }
     // From here a sandbox made now that fails is deleted, so the next attempt
     // makes another instead of adopting one whose proxy or checkout is bad. A
@@ -1588,7 +1613,8 @@ pub fn ensure_node_sandbox(
         (NodeSandboxSource::Fork(_), true) => node::FORK_PROBE_DELAYS,
         _ => node::IMAGE_PROBE_DELAYS,
     };
-    node::wait_proxy_ready(&bx, &url, node_id, &repo_url, delays, progress).with_context(|| format!("{name}"))?;
+    let target = HealthTarget { label: &name, node: node_id, repo_url: &repo_url, url: &url };
+    probe_health(&bx, &target, tod_sandbox::health::Stage::Base, INSTALL_MIN_FREE, None, delays, progress)?;
 
     // Agent Drive is not enabled yet, so the node's transcripts go to the
     // orchestrator and nothing is mounted. When it is, turn this back on:
@@ -1636,6 +1662,18 @@ pub fn ensure_node_sandbox(
     if !resp.status().is_success() {
         progress(&format!("warning: the poke got {}", resp.status()));
     }
+    // Adopted as good only now: the relay answers with the manifest just
+    // installed, and the checkout's own prerequisites still hold.
+    progress(&format!("checking {name} is healthy…"));
+    probe_health(
+        &bx,
+        &target,
+        tod_sandbox::health::Stage::Ready,
+        INSTALL_MIN_FREE,
+        Some(&expected_manifest),
+        node::IMAGE_PROBE_DELAYS,
+        progress,
+    )?;
     Ok(url)
     };
     if let Err(err) = setup() {
@@ -1666,6 +1704,43 @@ pub fn ensure_node_sandbox(
         }
     }
     Ok(name)
+}
+
+/// Free space a provisioning needs on a node sandbox's root filesystem.
+const INSTALL_MIN_FREE: u64 = 128 * 1024 * 1024;
+
+/// The sandbox a health probe looks at.
+pub struct HealthTarget<'a> {
+    pub label: &'a str,
+    pub node: &'a str,
+    pub repo_url: &'a str,
+    pub url: &'a str,
+}
+
+/// Probes a node's sandbox ([`tod_sandbox::health`]): reachable, disk free,
+/// relay up, manifest sane (equal to `expected_manifest` when given), the
+/// node's environment, and `git ls-remote` through the proxy. The failure
+/// names the check that failed. `delays` are the seconds to wait between
+/// tries of the checks a fresh fork or a restarted relay passes late.
+pub fn probe_health(
+    bx: &tod_sandbox::blaxel::Blaxel,
+    target: &HealthTarget,
+    stage: tod_sandbox::health::Stage,
+    min_free: u64,
+    expected_manifest: Option<&str>,
+    delays: &[u64],
+    progress: &mut dyn FnMut(&str),
+) -> Result<(), tod_sandbox::health::HealthFailure> {
+    let spec = tod_sandbox::health::HealthSpec {
+        label: target.label,
+        node: target.node,
+        repo_url: target.repo_url,
+        min_free,
+        reachable_wait: Duration::from_secs(180),
+        expected_manifest,
+        probe_delays: delays,
+    };
+    tod_sandbox::health::probe(bx, target.url, stage, &spec, progress)
 }
 
 /// What a provisioning that failed after it made `name` returns: `err`, once
@@ -1730,6 +1805,8 @@ fn node_sandbox_source(
 fn record_cloud_node(fleet: &FleetStore, node_id: &str, sandbox: String, user: &str) -> Result<CloudNode> {
     let root = fleet.paths().root();
     set_sandbox_deleted_by_user(root, node_id, false)?;
+    // Recorded now, so the sweeper no longer needs the intent to know the
+    // sandbox is the node's.
     let record = CloudNode {
         sandbox,
         user: user.to_string(),
@@ -1749,6 +1826,7 @@ fn record_cloud_node(fleet: &FleetStore, node_id: &str, sandbox: String, user: &
     })?;
     fleet.writer().flush()?;
     let _ = fleet.reload_if_stale();
+    provisioning::clear_intent(root, node_id)?;
     Ok(record)
 }
 
@@ -2017,8 +2095,21 @@ pub fn wake_node_with(fleet: &FleetStore, root: &Path, node_id: &str, fresh_sess
         }
     };
     let url = info.url.ok_or_else(|| anyhow!("sandbox {} has no URL", row.sandbox))?;
-    bx.ensure_free_space(&url, "/", WAKE_MIN_FREE, &row.sandbox)
-        .with_context(|| format!("not waking {node_id}'s supervisor"))?;
+    // The disk check, and the rest of the health probe: a sandbox that is
+    // `DEPLOYED` but cannot reach GitHub, lost its environment or has no relay
+    // is named here, not discovered by a turn that fails later.
+    let (_, repo_url, _) = node_source(fleet, node_id)?;
+    let mut wake_progress = |msg: &str| log_progress(&format!("wake {node_id}"), msg);
+    probe_health(
+        &bx,
+        &HealthTarget { label: &row.sandbox, node: node_id, repo_url: &repo_url, url: &url },
+        tod_sandbox::health::Stage::Ready,
+        WAKE_MIN_FREE,
+        None,
+        &[],
+        &mut wake_progress,
+    )
+    .with_context(|| format!("not waking {node_id}'s supervisor"))?;
     push_supervisor_settings(&bx, &url, root, node_id)?;
     if fresh_session {
         let request = format!(
@@ -2087,6 +2178,7 @@ pub fn continue_over_stop_answer(fleet: &FleetStore, node_id: &str) -> Result<Op
 }
 
 pub mod lost;
+pub mod provisioning;
 pub mod refresh;
 pub mod deploy;
 
