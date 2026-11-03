@@ -179,8 +179,9 @@ fn collect_running_work(
     let (affected, mut continuing) = agent_runs.read(cx).running_work_split();
     items.extend(affected.into_iter().map(SharedString::from));
     // A node working in the cloud is run by its supervisor in its own
-    // sandbox, so closing the app does not touch it. A node only assigned
-    // to the cloud (waiting on a review or on the user) is not listed.
+    // sandbox, so closing the app does not touch it. Only a node whose
+    // supervisor's heartbeat is live is listed (`next_actor`'s `Working`): one
+    // assigned to the cloud that is waiting, stopped, or silent is not.
     match tod_core::cloud_sync::working_in_cloud(fleet) {
         Ok(work) => continuing.extend(
             work.into_iter()

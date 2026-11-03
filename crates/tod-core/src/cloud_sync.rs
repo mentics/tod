@@ -287,55 +287,35 @@ pub struct CloudWork {
     pub lifecycle: String,
 }
 
-/// The cloud nodes that are working now, as far as the synced data says. The
-/// supervisor reports no heartbeat, so this is derived: a node assigned to the
-/// cloud (not lost, not `done`) is working unless it is waiting on something
-/// (`next_actor`: `Others`) or on the user (`You`, other than not started). Being assigned to the cloud alone is not work: such a node can
-/// sit idle for days. A supervisor that died mid-turn still reads as working.
+/// The cloud nodes whose supervisor is working now: those `next_actor` says
+/// are `Working`, which for a cloud node is proved only by a live heartbeat
+/// (`tod_store::cloud_activity`) the supervisor writes while its autopilot
+/// runs. A node that is assigned to the cloud but idle, stopped, waiting, or
+/// whose supervisor stopped beating is not working, whatever else is or is
+/// not recorded for it (an absent wait or request proves nothing).
 ///
 /// Reads the store's own connection, so call it off the UI thread.
 pub fn working_in_cloud(fleet: &FleetStore) -> Result<Vec<CloudWork>> {
-    let candidates = fleet.read(|conn| {
-        let rows: Vec<_> = tod_store::cloud_nodes::list(conn)?
+    let working = fleet.read(|conn| {
+        let ids: Vec<uuid::Uuid> = tod_store::cloud_nodes::list(conn)?
             .into_iter()
             .filter(|row| row.lost_at.is_none())
+            .map(|row| row.node_id)
             .collect();
-        let ids: Vec<uuid::Uuid> = rows.iter().map(|row| row.node_id).collect();
         let inputs = crate::next_actor::Inputs { now_ms: tod_store::outline::uuid_blob::now_ms(), ..Default::default() };
         let standings = crate::next_actor::for_nodes(conn, &ids, &inputs)?;
-        let mut free = Vec::new();
-        for id in ids {
-            if standings.get(&id).is_some_and(|s| blocks_cloud_work(&s.actor)) {
-                continue;
-            }
-            free.push(id);
-        }
-        Ok(free)
+        Ok(ids
+            .into_iter()
+            .filter(|id| standings.get(id).is_some_and(|s| matches!(s.actor, crate::next_actor::NextActor::Working { .. })))
+            .collect::<Vec<_>>())
     })?;
-    let mut working = Vec::new();
-    for node_id in candidates {
+    let mut out = Vec::new();
+    for node_id in working {
         let Some(node) = fleet.get_node(&node_id.to_string())? else { continue };
-        if node.lifecycle == "done" {
-            continue;
-        }
         let title = if node.title.trim().is_empty() { node.slug.clone() } else { node.title.clone() };
-        working.push(CloudWork { node_id, title, lifecycle: node.lifecycle });
+        out.push(CloudWork { node_id, title, lifecycle: node.lifecycle });
     }
-    Ok(working)
-}
-
-/// Whether a node's actor means the cloud is not the one at work: the user
-/// or someone else has to act. `NotStarted` does not: a cloud node's
-/// supervisor runs elsewhere and holds no lease here, so "nothing running"
-/// is what every cloud node looks like locally. A node with no standing (no
-/// Lifecycle) is not blocked either, as before.
-fn blocks_cloud_work(actor: &crate::next_actor::NextActor) -> bool {
-    use crate::next_actor::{NextActor, YouReason};
-    match actor {
-        NextActor::You { why: YouReason::NotStarted, .. } => false,
-        NextActor::You { .. } | NextActor::Others { .. } => true,
-        NextActor::Working { .. } | NextActor::Done => false,
-    }
+    Ok(out)
 }
 
 /// Held by every [`sync`] in this process. Background syncs (the outbox

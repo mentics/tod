@@ -418,7 +418,7 @@ fn a_nodes_problem_reaches_the_apps_log_on_a_sync_and_only_once() {
 }
 
 #[test]
-fn a_cloud_node_is_working_only_when_it_waits_on_nothing() {
+fn a_cloud_node_is_working_only_while_its_supervisor_is_beating() {
     use tod_store::interview::InterviewCommand;
     use tod_store::waits::NewWait;
     let root = temp_root("cloud-working");
@@ -457,17 +457,40 @@ fn a_cloud_node_is_working_only_when_it_waits_on_nothing() {
             .unwrap();
     }
     fleet.writer().flush().unwrap();
-    assert_eq!(working_in_cloud(&fleet).unwrap().len(), 2, "assigned and waiting on nothing");
+    assert!(
+        working_in_cloud(&fleet).unwrap().is_empty(),
+        "assigned to the cloud and waiting on nothing is not working: nothing proves a supervisor is at it"
+    );
 
+    // A live heartbeat is what makes a node working.
+    let db = connect(fleet.paths().db()).unwrap();
+    let now = tod_store::outline::uuid_blob::now_ms();
+    tod_store::cloud_activity::beat(&db, ids[0], "active", now).unwrap();
+    fleet.reload_if_stale().unwrap();
+    let working = working_in_cloud(&fleet).unwrap();
+    assert_eq!(working.iter().map(|w| w.node_id).collect::<Vec<_>>(), vec![ids[0]]);
+
+    // A wake that ended stopped, a heartbeat that went stale, and a node that
+    // only waits are none of them working.
+    tod_store::cloud_activity::idle_stopped(&db, ids[0], Some("budget spent"), now).unwrap();
+    tod_store::cloud_activity::beat(&db, ids[1], "active", now - 10 * tod_store::cloud_activity::STALE_AFTER_MS).unwrap();
+    fleet.reload_if_stale().unwrap();
+    assert!(working_in_cloud(&fleet).unwrap().is_empty());
+    tod_store::cloud_activity::beat(&db, ids[1], "active", now).unwrap();
     fleet
         .interview(
             "test",
-            InterviewCommand::RecordWait { node_id: ids[1], wait: NewWait::event("github:pr 1 checks", tod_store::outline::uuid_blob::now_ms() + 86_400_000) },
+            InterviewCommand::RecordWait { node_id: ids[1], wait: NewWait::event("github:pr 1 checks", now + 86_400_000) },
         )
         .unwrap();
     fleet.writer().flush().unwrap();
-    let working = working_in_cloud(&fleet).unwrap();
-    assert_eq!(working.iter().map(|w| w.node_id).collect::<Vec<_>>(), vec![ids[0]]);
+    fleet.reload_if_stale().unwrap();
+    assert_eq!(
+        working_in_cloud(&fleet).unwrap().iter().map(|w| w.node_id).collect::<Vec<_>>(),
+        vec![ids[1]],
+        "a live heartbeat beats a pending wait, as it does for the tree's status"
+    );
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]

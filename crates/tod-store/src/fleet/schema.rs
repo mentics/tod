@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Current fleet schema epoch stored in `PRAGMA user_version`.
-pub const CURRENT_USER_VERSION: i32 = 86;
+pub const CURRENT_USER_VERSION: i32 = 87;
 
 const BUSY_TIMEOUT_MS: i64 = 5000;
 
@@ -583,6 +583,12 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
         migrate_v85_to_v86(conn)?;
         conn.pragma_update(None, "user_version", 86)?;
     }
+    if version < 87 {
+        // Why a cloud supervisor's last wake stopped (`crate::cloud_activity`,
+        // the `stopped` column); the sync triggers are remade below.
+        crate::cloud_activity::add_stopped(conn)?;
+        conn.pragma_update(None, "user_version", 87)?;
+    }
     // Other branches (the task panel) numbered their own steps 66–67 at the
     // same time as 66–70 above, so a store may be past a version without
     // having these. Every one is idempotent: make sure of them all.
@@ -604,6 +610,7 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
     // A cloud supervisor's heartbeat for a node (`crate::cloud_activity`):
     // synced, and not journaled (high-frequency bookkeeping).
     conn.execute_batch(crate::cloud_activity::CREATE_TABLE)?;
+    crate::cloud_activity::add_stopped(conn)?;
     // The reply a cloud supervisor has in flight (`crate::conversation_live`):
     // synced, and not journaled, for the same reason.
     conn.execute_batch(crate::conversation_live::CREATE_TABLE)?;

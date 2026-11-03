@@ -539,7 +539,9 @@ impl UnifiedView {
         }
     }
 
-    /// Nodes working in the cloud count as running in the tree. A read that
+    /// Nodes working in the cloud count as running in the tree: only those
+    /// whose supervisor's heartbeat is live (`NextActor::Working`), never
+    /// ones merely assigned to the cloud, waiting, or stopped. A read that
     /// failed is logged and leaves the last answer standing.
     fn apply_cloud_working(
         &mut self,

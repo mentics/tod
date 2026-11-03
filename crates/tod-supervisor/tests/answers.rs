@@ -196,6 +196,20 @@ fn keep_going_after_the_budget_grants_another() {
     };
     assert_eq!(latest.kind, stop_questions::BUDGET);
     assert_eq!(latest.answer, stop_questions::Answer::Pending);
+    // The question says what was spent and what each answer does, and the
+    // beat the wake left says why it stopped.
+    let (question, beat) = {
+        let conn = rusqlite::Connection::open(&s.remote_db).unwrap();
+        let question: String = conn.query_row("SELECT question FROM decisions", [], |r| r.get(0)).unwrap();
+        (question, tod_store::cloud_activity::get(&conn, s.node).unwrap().unwrap())
+    };
+    assert!(
+        question.starts_with("Used 1 of 1 sessions (")
+            && question.contains("Keep going gives it 1 more sessions and ")
+            && question.contains("Leave it stopped keeps it stopped until you change this answer."),
+        "{question}"
+    );
+    assert!(beat.is_idle() && beat.stopped.as_deref().is_some_and(|r| r.contains("budget is spent")), "{beat:?}");
 
     // Unanswered, it stays stopped on the question, and does not ask again.
     let woke = wake_once(&s, fake_relay().0, 1);
@@ -238,6 +252,16 @@ fn leave_it_stopped_after_failures_keeps_the_node_stopped() {
     let (relay, seen) = fake_relay();
     let woke = wake_once(&s, relay, 30);
     assert!(matches!(woke, Woke::LeftStopped(_)), "{woke:?}");
+    // The beat it left says so, naming the question and what resumes it.
+    {
+        let conn = rusqlite::Connection::open(&s.remote_db).unwrap();
+        let beat = tod_store::cloud_activity::get(&conn, s.node).unwrap().unwrap();
+        let reason = beat.stopped.expect("a wake that left the node stopped left no reason");
+        assert!(
+            reason.starts_with("left stopped: ") && reason.contains("failing several times") && reason.contains("Leave it stopped"),
+            "{reason}"
+        );
+    }
     // Held only while it looked: released before going back to sleep.
     let seen = seen.lock().unwrap().clone();
     assert!(seen.last().is_some_and(|l| l.starts_with("POST /release?reason=supervisor ")), "{seen:?}");

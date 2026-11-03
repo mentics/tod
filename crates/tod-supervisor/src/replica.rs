@@ -271,22 +271,18 @@ impl Replica {
         Ok(n)
     }
 
+    /// A handle that records beats in this copy without the [`Replica`], so
+    /// the heartbeat thread never waits behind a sync that holds it.
+    pub fn beat_writer(&self, node: Uuid) -> BeatWriter {
+        BeatWriter { db: self.db(), node }
+    }
+
     /// Says the supervisor is working on `node` (`tod_store::cloud_activity`)
     /// and sends it now, so the app hears without waiting for the next
     /// boundary.
     pub fn cloud_beat(&mut self, node: Uuid) -> Result<()> {
-        let conn = connect(&self.db())?;
-        // Asked of the connection that writes the row, not the store's cached
-        // view: the row's foreign key is checked against this database.
-        let what: Option<String> = conn
-            .query_row(
-                "SELECT COALESCE((SELECT state FROM node_lifecycle WHERE node_id = n.id), 'proposed')
-                 FROM nodes n WHERE n.id = ?1",
-                params![node.as_bytes().to_vec()],
-                |r| r.get(0),
-            )
-            .optional()?;
-        let Some(what) = what else {
+        let recorded = self.beat_writer(node).record()?;
+        if !recorded {
             anyhow::bail!(
                 "node {node} is not in the supervisor's copy of the orchestrator's database (seeded at change {}, pulled to {}): \
                  the orchestrator does not have it, so the app has not sent it there yet (or the orchestrator's data was reset); \
@@ -295,10 +291,7 @@ impl Replica {
                 self.cursors.pull_after,
                 self.trail.join("; ")
             );
-        };
-        tod_store::cloud_activity::beat(&conn, node, &what, tod_store::outline::uuid_blob::now_ms())
-            .context("recording the heartbeat in the supervisor's copy")?;
-        drop(conn);
+        }
         self.push().context("sending the heartbeat (and the copy's other changes) to the orchestrator")?;
         Ok(())
     }
@@ -325,9 +318,11 @@ impl Replica {
 
     /// The run is over: marks the row idle (not deleted: a run that ended
     /// between two of the app's syncs must still be heard) and sends that.
-    pub fn end_cloud_beat(&mut self, node: Uuid) -> Result<()> {
+    /// `stopped` is why the wake ended with the node still needing someone,
+    /// when it did (`tod_store::cloud_activity::idle_stopped`).
+    pub fn end_cloud_beat(&mut self, node: Uuid, stopped: Option<&str>) -> Result<()> {
         let conn = connect(&self.db())?;
-        tod_store::cloud_activity::idle(&conn, node, tod_store::outline::uuid_blob::now_ms())?;
+        tod_store::cloud_activity::idle_stopped(&conn, node, stopped, tod_store::outline::uuid_blob::now_ms())?;
         tod_store::conversation_live::clear(&conn, node)?;
         drop(conn);
         self.push()?;
@@ -379,6 +374,38 @@ impl Replica {
         drop(conn);
         let _ = self.store.reload_if_stale();
         Ok(())
+    }
+}
+
+/// Records the heartbeat row in the copy, on a connection of its own, so it
+/// needs neither the [`Replica`] nor its lock. The next push, by whoever
+/// makes it, carries the row to the orchestrator.
+#[derive(Debug, Clone)]
+pub struct BeatWriter {
+    db: PathBuf,
+    node: Uuid,
+}
+
+impl BeatWriter {
+    /// Records the beat; `false` if the node is not in the copy at all.
+    pub fn record(&self) -> Result<bool> {
+        let conn = connect(&self.db)?;
+        // Asked of the connection that writes the row, not the store's cached
+        // view: the row's foreign key is checked against this database.
+        let what: Option<String> = conn
+            .query_row(
+                "SELECT COALESCE((SELECT state FROM node_lifecycle WHERE node_id = n.id), 'proposed')
+                 FROM nodes n WHERE n.id = ?1",
+                params![self.node.as_bytes().to_vec()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(what) = what else {
+            return Ok(false);
+        };
+        tod_store::cloud_activity::beat(&conn, self.node, &what, tod_store::outline::uuid_blob::now_ms())
+            .context("recording the heartbeat in the supervisor's copy")?;
+        Ok(true)
     }
 }
 
