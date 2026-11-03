@@ -318,3 +318,59 @@ fn a_branch_name_in_another_repository_is_ignored() {
     drop(fleet);
     let _ = std::fs::remove_dir_all(&base);
 }
+
+/// A node's checkout is not necessarily the repository its pull request is
+/// in: a `flagship` node's pull request is in `kb`. The webhook for the pull
+/// request's repository must reach it, and one for any other repository not.
+#[test]
+fn a_node_hears_the_repository_of_its_pull_request_not_only_its_checkouts() {
+    let base: PathBuf = std::env::temp_dir().join(format!("tod-orch-webhooks-sub-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&base).unwrap();
+    let app = base.join("app");
+    let fleet = FleetStore::open(&app).unwrap();
+    fleet.enqueue_outline(OutlineMutation::CreateList { slug: "t".into(), title: "T".into() }).unwrap();
+    fleet.writer().flush().unwrap();
+    let list_id = fleet.list_outline_lists().unwrap()[0].id;
+    let sub = node(&fleet, list_id, "Checkout acme/flagship, PR in acme/kb");
+    {
+        let conn = rusqlite::Connection::open(app.join("tod.db")).unwrap();
+        tod_store::cloud_nodes::upsert(&conn, sub, "node-sub", "alice", 1).unwrap();
+        conn.execute(
+            "INSERT INTO node_fields (node_id, branch, linked_prs, updated_at) VALUES (?1, 'task/fix', ?2, 1)",
+            rusqlite::params![uuid_to_blob(sub), "[\"https://github.com/acme/kb/pull/7\"]"],
+        )
+        .unwrap();
+        record_repo(&conn, sub, "acme/flagship");
+    }
+    let _ = fleet.reload_if_stale();
+    let poked = Arc::new(Mutex::new(Vec::new()));
+    let orch = base.join("orchestrator");
+    let server = Server::with_sink(
+        Config { base: orch.clone(), tod_cli: "unused".into(), tod_cli_prefix: Vec::new() },
+        Box::new(FakePoker(poked.clone())),
+        Box::new(NoSink),
+    )
+    .unwrap();
+    let snap = base.join("snap.db");
+    tod_store::sync::snapshot(&app.join("tod.db"), &snap).unwrap();
+    let seeded = server.handle(&Request {
+        method: "POST".into(),
+        path: "/users/alice/seed".into(),
+        query: String::new(),
+        headers: Vec::new(),
+        body: std::fs::read(&snap).unwrap(),
+    });
+    assert_eq!(seeded.status, 200, "{}", String::from_utf8_lossy(&seeded.body));
+    let secret = Secrets::load(&orch).unwrap().github;
+    let checks = |repo: &str| {
+        serde_json::json!({"action":"completed","repository":{"full_name":repo},
+            "check_suite":{"head_branch":"task/fix","conclusion":"success","pull_requests":[]}})
+    };
+    server.handle(&delivery(Some(&secret), "check_suite", &checks("acme/kb")));
+    assert_eq!(*poked.lock().unwrap(), ["node-sub"], "the pull request's repository reaches the node");
+    poked.lock().unwrap().clear();
+    server.handle(&delivery(Some(&secret), "check_suite", &checks("acme/flagship")));
+    assert!(poked.lock().unwrap().is_empty(), "its checkout's repository is not one it has a pull request in");
+    drop(fleet);
+    let _ = std::fs::remove_dir_all(&base);
+}

@@ -344,7 +344,7 @@ fn targets(conn: &Connection, event: &Event) -> Result<Vec<Target>> {
     let links = tod_store::github::NodePrRepo::new(conn).all()?;
     let mut nodes: Vec<Uuid> = Vec::new();
     for row in &cloud {
-        if !recorded_repo_matches(row.ownership.repo.as_deref(), event) || !in_repository(links.get(&row.node_id), event) {
+        if !node_repo_matches(row.ownership.repo.as_deref(), links.get(&row.node_id), event) {
             continue;
         }
         let branch: Option<String> = conn
@@ -363,7 +363,7 @@ fn targets(conn: &Connection, event: &Event) -> Result<Vec<Target>> {
         // node that has linked pull requests hears only what concerns them.
         for (_, node) in &waits {
             let recorded = cloud.iter().find(|c| c.node_id == *node).and_then(|c| c.ownership.repo.as_deref());
-            if !recorded_repo_matches(recorded, event) {
+            if !node_repo_matches(recorded, links.get(node), event) {
                 continue;
             }
             if !nodes.contains(node) && concerns(conn, *node, links.get(node), event) {
@@ -379,6 +379,18 @@ fn targets(conn: &Connection, event: &Event) -> Result<Vec<Target>> {
             waits: waits.iter().filter(|(_, n)| *n == node).map(|(w, _)| *w).collect(),
         })
         .collect())
+}
+
+/// Whether an event about a repository concerns a node. A node with linked
+/// pull requests hears the repositories they are in, whatever its checkout is
+/// (a `flagship` node's pull request is in a submodule's repository, `kb`);
+/// only a node with none falls back to the repository recorded for its
+/// checkout ([`recorded_repo_matches`]).
+fn node_repo_matches(recorded: Option<&str>, links: Option<&Vec<NodePr>>, event: &Event) -> bool {
+    match (links, event.repo.as_deref()) {
+        (Some(links), Some(_)) if !links.is_empty() => in_repository(Some(links), event),
+        _ => recorded_repo_matches(recorded, event),
+    }
 }
 
 /// Whether the repository recorded on a node's `cloud_nodes` row
