@@ -615,3 +615,45 @@ fn an_orchestrator_seeded_by_another_copy_is_seeded_with_this_one_again() {
     let _ = std::fs::remove_dir_all(&root);
     let _ = std::fs::remove_dir_all(&other_root);
 }
+
+/// What the orchestrator accepted is dropped from the app's outbox (each
+/// entry holds a whole old row), and the numbering goes on: the next change
+/// is still sent, and nothing already sent is sent again.
+#[test]
+fn what_was_sent_is_pruned_from_the_outbox_and_later_changes_still_go() {
+    let base = temp_root("orch-prune");
+    let orch = HttpOrchestrator::new(start_orchestrator(&base), None);
+    let remote_db = base.join("users").join("alice").join("tod.db");
+    let root = temp_root("app-prune");
+    let app = FleetStore::open(&root).unwrap();
+    let log = |app: &FleetStore| -> i64 {
+        connect(app.paths().db())
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM sync_changes", [], |r| r.get(0))
+            .unwrap()
+    };
+    add_list(&app, "first");
+    sync(&app, &root, &orch, "alice").unwrap();
+    assert_eq!(log(&app), 0, "the seeding covered everything");
+
+    add_list(&app, "second");
+    assert!(log(&app) > 0);
+    let before = sync::last_seq(&connect(app.paths().db()).unwrap()).unwrap();
+    let report = sync(&app, &root, &orch, "alice").unwrap();
+    assert!(report.sent >= 1, "{report:?}");
+    assert_eq!(log(&app), 0, "what was sent is pruned");
+    assert_eq!(CloudSyncState::load(&root).unwrap().sent_after, before);
+    assert_eq!(sync::last_seq(&connect(app.paths().db()).unwrap()).unwrap(), before);
+
+    add_list(&app, "third");
+    let report = sync(&app, &root, &orch, "alice").unwrap();
+    assert!(report.sent >= 1, "{report:?}");
+    assert!(lists_in(&remote_db).contains(&"third".to_string()));
+    let quiet = sync(&app, &root, &orch, "alice").unwrap();
+    assert_eq!((quiet.sent, quiet.received), (0, 0), "{quiet:?}");
+
+    drop(app);
+    for r in [root, base] {
+        let _ = std::fs::remove_dir_all(r);
+    }
+}

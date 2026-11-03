@@ -258,7 +258,6 @@ impl Replica {
             .into_iter()
             .filter(|c| !is_local_files_row(c, files_source))
             .collect();
-        drop(conn);
         let n = changes.len();
         if n > 0 {
             self.orchestrator.push_changes(&changes)?;
@@ -266,6 +265,9 @@ impl Replica {
         }
         self.cursors.push_after = last;
         self.save_cursors()?;
+        // Sent and accepted: never read again, and each entry holds a whole old row.
+        sync::prune_sent(&conn, last).context("prune the sent change log")?;
+        drop(conn);
         Ok(n)
     }
 

@@ -52,6 +52,43 @@ fn apply_connection_pragmas(conn: &Connection, read_only: bool) -> Result<()> {
     Ok(())
 }
 
+/// Free space in the database file (pages on the freelist) that is worth
+/// giving back: deleting rows never shrinks a SQLite file.
+pub const RECLAIM_THRESHOLD_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Runs `VACUUM` on the database at `db` when its freelist holds at least
+/// `min_free_bytes`, and returns how many bytes the file shrank by (`None`
+/// when there was too little to bother). It rewrites the whole file, so it
+/// is only for an owner that has the database to itself (the store's open,
+/// under its lock, before any other connection exists) and only when the
+/// threshold is met, never on every start. A failure is an error.
+pub fn reclaim_free_space(db: &Path, min_free_bytes: u64) -> Result<Option<u64>> {
+    let conn = Connection::open(db).with_context(|| format!("failed to open {}", db.display()))?;
+    conn.busy_timeout(std::time::Duration::from_millis(BUSY_TIMEOUT_MS as u64))?;
+    let page_size: u64 = conn.pragma_query_value(None, "page_size", |r| r.get(0))?;
+    let free: u64 = conn.pragma_query_value(None, "freelist_count", |r| r.get(0))?;
+    if free * page_size < min_free_bytes {
+        return Ok(None);
+    }
+    let size = |conn: &Connection| -> Result<u64> {
+        let pages: u64 = conn.pragma_query_value(None, "page_count", |r| r.get(0))?;
+        Ok(pages * page_size)
+    };
+    let before = size(&conn)?;
+    let started = std::time::Instant::now();
+    conn.execute_batch("VACUUM;").with_context(|| format!("failed to vacuum {}", db.display()))?;
+    let after = size(&conn)?;
+    let reclaimed = before.saturating_sub(after);
+    tracing::info!(
+        reclaimed_mb = reclaimed / (1024 * 1024),
+        before_mb = before / (1024 * 1024),
+        after_mb = after / (1024 * 1024),
+        took_ms = started.elapsed().as_millis() as u64,
+        "reclaimed free space in the database"
+    );
+    Ok(Some(reclaimed))
+}
+
 /// Read `user_version` without applying migrations.
 pub fn peek_user_version(path: &Path) -> Result<i32> {
     let conn = Connection::open(path)
@@ -5698,5 +5735,36 @@ mod plan_step_migration_tests {
             .unwrap();
         assert_eq!(outcome, "pending");
         let _ = fs::remove_dir_all(dir);
+    }
+}
+
+#[cfg(test)]
+mod reclaim_tests {
+    use super::*;
+
+    #[test]
+    fn free_space_is_vacuumed_only_past_the_threshold() {
+        let dir = std::env::temp_dir().join(format!("tod-reclaim-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("t.db");
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v BLOB);").unwrap();
+        for _ in 0..40 {
+            conn.execute("INSERT INTO t (v) VALUES (zeroblob(100000))", []).unwrap();
+        }
+        conn.execute("DELETE FROM t", []).unwrap();
+        drop(conn);
+        let size = |p: &Path| std::fs::metadata(p).unwrap().len();
+        let before = size(&db);
+        assert!(before > 3_000_000);
+        // Below the threshold: left alone.
+        assert_eq!(reclaim_free_space(&db, 100_000_000).unwrap(), None);
+        assert_eq!(size(&db), before);
+        let reclaimed = reclaim_free_space(&db, 1_000_000).unwrap().expect("vacuumed");
+        assert!(reclaimed > 3_000_000, "{reclaimed}");
+        assert!(size(&db) < before / 2);
+        // Nothing left to give back.
+        assert_eq!(reclaim_free_space(&db, 1_000_000).unwrap(), None);
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

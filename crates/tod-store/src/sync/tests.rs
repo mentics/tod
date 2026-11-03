@@ -432,3 +432,53 @@ fn swapping_obligation_ordinals_keeps_plan_step_links() {
     assert_eq!(links(&a).len(), 2, "the sender kept its links");
     assert_eq!(links(&b).len(), 2, "the receiver lost links to evicted obligations");
 }
+
+fn log_count(conn: &Connection) -> i64 {
+    conn.query_row("SELECT COUNT(*) FROM sync_changes", [], |r| r.get(0)).unwrap()
+}
+
+#[test]
+fn a_snapshot_leaves_the_change_log_out_but_keeps_its_numbering() {
+    let (a, b) = pair();
+    random_edit(&a, &mut Lcg(3), 0);
+    let _ = a.fleet.writer().flush();
+    assert!(log_count(&a.conn()) > 0);
+    let snap = b.root.join("again.db");
+    snapshot(a.fleet.paths().db(), &snap).unwrap();
+    let copy = Connection::open(&snap).unwrap();
+    assert_eq!(log_count(&copy), 0);
+    assert_eq!(last_seq(&copy).unwrap(), last_seq(&a.conn()).unwrap());
+    let _ = std::fs::remove_dir_all(&a.root);
+    let _ = std::fs::remove_dir_all(&b.root);
+}
+
+#[test]
+fn pruning_sent_entries_keeps_later_ones_and_the_numbering() {
+    let (a, b) = pair();
+    random_edit(&a, &mut Lcg(5), 0);
+    let _ = a.fleet.writer().flush();
+    let conn = a.conn();
+    let last = last_seq(&conn).unwrap();
+    assert!(log_count(&conn) > 0);
+    let deleted = prune_sent(&conn, last).unwrap();
+    assert!(deleted > 0);
+    assert_eq!(log_count(&conn), 0);
+    assert_eq!(last_seq(&conn).unwrap(), last, "numbering must not start over");
+    assert!(export_changes(&conn, 0).unwrap().is_empty());
+    drop(conn);
+    // A later change is numbered after it and is the only one left to send.
+    let list_id = a.fleet.list_outline_lists().unwrap()[0].id;
+    a.apply(OutlineMutation::CreateNode {
+        node_id: None,
+        list_id,
+        parent_id: None,
+        anchor_id: None,
+        position: CreatePosition::Below,
+        title: "later".into(),
+    });
+    let conn = a.conn();
+    assert!(last_seq(&conn).unwrap() > last);
+    assert!(!export_changes(&conn, last).unwrap().is_empty());
+    let _ = std::fs::remove_dir_all(&a.root);
+    let _ = std::fs::remove_dir_all(&b.root);
+}
