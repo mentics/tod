@@ -22,6 +22,11 @@ engineer on the team would, and fixing what breaks.
    test app open the real database and daemon.
 2. `credentials_file_only: true` in `tod.yml` (both roots): never use the OS
    keyring.
+   The script also gives the root its own orchestrator user
+   (`owner = "<you>-live-verify"` in its `sandboxes.toml`): the orchestrator
+   keeps one database per user, and two roots with the same user seed over
+   each other. An existing root with the real root's owner must be changed
+   by hand the same way (then it seeds a fresh copy on the next launch).
 3. Copy `target/sandbox/*` (relay, orchestrator, Linux `tod-cli`, ...) from a
    checkout that has built them; `tod-sandbox --data-root <root> doctor` must
    be clean.
