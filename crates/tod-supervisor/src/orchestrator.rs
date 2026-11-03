@@ -1,5 +1,6 @@
 //! The orchestrator's routes the supervisor uses (see `tod_orchestrator`):
-//! the snapshot and the change feed for its copy of the user's database, and
+//! the snapshot and the change feed for its node's slice of the user's
+//! database, and
 //! the node's transcripts. Requests go through the sandbox's proxy (from
 //! `HTTPS_PROXY`), which adds the credentials; failures are retried with
 //! backoff, as the `tod-cli` shim does.
@@ -28,6 +29,10 @@ pub struct Feed {
     /// Which seeding of the orchestrator's database the feed follows.
     #[serde(default)]
     pub seed_id: Option<String>,
+    /// Which slice the feed is confined to (the node's ancestor chain); an
+    /// orchestrator that does not cut slices sends none.
+    #[serde(default)]
+    pub slice_id: Option<String>,
 }
 
 /// The orchestrator's base URL from its `/cli` URL (`TOD_ORCHESTRATOR_CLI_URL`).
@@ -127,13 +132,15 @@ impl Orchestrator {
         Ok(bytes)
     }
 
-    /// The user's whole database.
+    /// This node's slice of the user's database (`tod_store::sync::slice`),
+    /// which records its own cursor and slice id.
     pub fn snapshot(&self) -> Result<Vec<u8>> {
-        self.ok("GET", "/snapshot", None)
+        self.ok("GET", "/snapshot?slice=1", None)
     }
 
+    /// The changes in this node's slice after `after`.
     pub fn changes_after(&self, after: i64) -> Result<Feed> {
-        let bytes = self.ok("GET", &format!("/changes?after={after}"), None)?;
+        let bytes = self.ok("GET", &format!("/changes?after={after}&slice=1"), None)?;
         serde_json::from_slice(&bytes).context("the orchestrator's change feed")
     }
 

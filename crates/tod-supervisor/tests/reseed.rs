@@ -6,7 +6,7 @@
 use std::net::TcpListener;
 use std::path::PathBuf;
 use tod_store::fleet::FleetStore;
-use tod_store::outline::OutlineMutation;
+use tod_store::outline::{CreatePosition, OutlineMutation};
 use tod_supervisor::orchestrator::Orchestrator;
 use tod_supervisor::replica::Replica;
 use uuid::Uuid;
@@ -19,10 +19,9 @@ impl Drop for Temp {
     }
 }
 
-fn lists(db: &std::path::Path) -> Vec<String> {
+fn title(db: &std::path::Path, node: Uuid) -> String {
     let conn = rusqlite::Connection::open(db).unwrap();
-    let mut stmt = conn.prepare("SELECT slug FROM lists ORDER BY slug").unwrap();
-    stmt.query_map([], |r| r.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap()
+    conn.query_row("SELECT title FROM nodes WHERE id = ?1", [node.as_bytes().to_vec()], |r| r.get(0)).unwrap()
 }
 
 #[test]
@@ -50,9 +49,22 @@ fn a_copy_from_an_earlier_seeding_is_replaced_by_a_new_one() {
         let r = ureq::post(format!("{url}/users/alice/seed")).send(std::fs::read(&snap).unwrap()).unwrap();
         assert_eq!(r.status(), 200);
     };
+    store.enqueue_outline(OutlineMutation::CreateList { slug: "t".into(), title: "T".into() }).unwrap();
+    store.writer().flush().unwrap();
+    let node = Uuid::new_v4();
+    store
+        .enqueue_outline(OutlineMutation::CreateNode {
+            node_id: Some(node),
+            list_id: store.list_outline_lists().unwrap()[0].id,
+            parent_id: None,
+            anchor_id: None,
+            position: CreatePosition::Below,
+            title: "first".into(),
+        })
+        .unwrap();
+    store.writer().flush().unwrap();
     seed("first");
 
-    let node = Uuid::new_v4();
     let workspace = base.join("workspace");
     std::fs::create_dir_all(&workspace).unwrap();
     let open = || {
@@ -60,13 +72,13 @@ fn a_copy_from_an_earlier_seeding_is_replaced_by_a_new_one() {
             .unwrap()
     };
     drop(open());
-    assert!(lists(&base.join("replica").join("tod.db")).is_empty());
+    assert_eq!(title(&base.join("replica").join("tod.db"), node), "first");
 
-    // The app now holds a list the first seeding did not, and seeds again.
-    store.enqueue_outline(OutlineMutation::CreateList { slug: "later".into(), title: "LATER".into() }).unwrap();
+    // The app's node changed after the first seeding, and it seeds again.
+    store.enqueue_outline(OutlineMutation::UpdateNodeTitle { node_id: node, title: "second".into() }).unwrap();
     store.writer().flush().unwrap();
     seed("second");
 
     drop(open());
-    assert_eq!(lists(&base.join("replica").join("tod.db")), vec!["later".to_string()]);
+    assert_eq!(title(&base.join("replica").join("tod.db"), node), "second");
 }

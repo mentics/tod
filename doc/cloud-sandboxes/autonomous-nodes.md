@@ -172,8 +172,11 @@ the orchestrator holds no GitHub token and could not. And `secrets run` must
 start its command where the agent is. So the shim
 (`cli_relay::HTTP_SHIM_SCRIPT`, `LOCAL_NOUNS`) runs those two nouns with the
 real Linux `tod-cli`, installed beside it at `/opt/tod/tod-cli-local`
-(`tod_sandbox::node::LOCAL_CLI_PATH`), against the supervisor's copy of the
-database (`/var/lib/tod-supervisor/<node>`), whatever `--data-root` says.
+(`tod_sandbox::node::LOCAL_CLI_PATH`), against the supervisor's copy
+(`/var/lib/tod-supervisor/<node>`), whatever `--data-root` says. That copy
+holds only the node's slice of the user's database (the node, what it
+inherits from its ancestors, and the rows those reference;
+[node-scoped-copy.md](node-scoped-copy.md)), never the whole of it.
 What they write (`pr open`'s record, `mergeable`, `blocked`) goes into the
 copy, through its mutation socket while the supervisor runs, and the
 supervisor pushes it to the orchestrator after the step, as it does its own

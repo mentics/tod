@@ -1,16 +1,21 @@
-//! The supervisor's local copy of the user's database.
+//! The supervisor's local copy of its node's slice of the user's database.
 //!
 //! The autopilot decides from a `FleetStore`, but the user's database lives
 //! on the orchestrator. So the supervisor keeps a copy in the sandbox, as a
-//! cache: seeded from the orchestrator's snapshot, brought up to date from
-//! its change feed before every decision, and sending back what the
+//! cache, of only what the node needs: the node, what it inherits from its
+//! ancestors, and the rows those reference (`tod_store::sync::slice`;
+//! `doc/cloud-sandboxes/node-scoped-copy.md`). It is seeded from the
+//! orchestrator's slice snapshot, brought up to date from the slice's change
+//! feed before every decision, and sending back what the
 //! supervisor itself wrote (conversations, lifecycle moves) after each one.
 //! The agent's own `tod-cli` writes go to the orchestrator directly and come
 //! back through the feed. Losing the copy loses nothing: the next start
 //! seeds a new one.
 //!
 //! Two cursors, in `supervisor-sync.json` beside the database: `pull_after`
-//! (the orchestrator's change numbers) and `push_after` (this copy's own).
+//! (the orchestrator's change numbers) and `push_after` (this copy's own),
+//! with the slice they follow (`slice_id`, the node's ancestor chain): when
+//! the node or an ancestor moves, the slice is cut again rather than patched.
 //! Changes pulled are applied without being logged here, so they are never
 //! pushed back.
 //!
@@ -45,6 +50,10 @@ struct Cursors {
     /// The orchestrator's seeding this copy came from (`Feed::seed_id`).
     #[serde(default)]
     seed_id: Option<String>,
+    /// The slice this copy is (`Feed::slice_id`). A copy without one was a
+    /// whole database, and is seeded again as a slice.
+    #[serde(default)]
+    slice_id: Option<String>,
 }
 
 pub struct Replica {
@@ -94,13 +103,25 @@ impl Replica {
         // change numbers and rows belong to another history. Ask which
         // seeding the orchestrator is on (a request past its last change
         // returns no changes, only the id).
-        let current_seed = orchestrator.changes_after(i64::MAX)?.seed_id;
+        let current = orchestrator.changes_after(i64::MAX)?;
+        let current_seed = current.seed_id;
+        let current_slice = current
+            .slice_id
+            .context("the orchestrator does not cut a node's slice; it is older than this supervisor")?;
         let saved = match saved {
             Some(c) if c.seed_id != current_seed => {
                 tracing::warn!(
                     copied_from = ?c.seed_id,
                     now = ?current_seed,
                     "the orchestrator's database was seeded again since this copy was made; seeding a new copy"
+                );
+                None
+            }
+            Some(c) if c.slice_id.as_deref() != Some(current_slice.as_str()) => {
+                tracing::info!(
+                    copied = ?c.slice_id,
+                    now = %current_slice,
+                    "this copy is not the node's current slice (a whole database, or the node moved); seeding a new copy"
                 );
                 None
             }
@@ -114,7 +135,12 @@ impl Replica {
                 let snapshot = orchestrator.snapshot()?;
                 let incoming = root.join("seed-incoming.db");
                 std::fs::write(&incoming, &snapshot)?;
-                let pull_after = sync::last_seq(&connect(&incoming)?)?;
+                let slice = sync::slice::slice_info(&connect(&incoming)?)?
+                    .context("the orchestrator sent a whole database, not this node's slice")?;
+                if slice.node != node {
+                    anyhow::bail!("the orchestrator sent node {}'s slice, not {node}'s", slice.node);
+                }
+                let pull_after = slice.last_seq;
                 for suffix in ["", "-wal", "-shm"] {
                     let _ = std::fs::remove_file(root.join(format!("tod.db{suffix}")));
                 }
@@ -125,7 +151,7 @@ impl Replica {
                 let _ = store.flush_on_quit();
                 // Whatever opening logged (a migration) is not ours to send.
                 let push_after = sync::last_seq(&connect(&db)?)?;
-                (store, Cursors { pull_after, push_after, seed_id: current_seed })
+                (store, Cursors { pull_after, push_after, seed_id: current_seed, slice_id: Some(slice.slice_id) })
             }
         };
         let store = Arc::new(store);
@@ -219,6 +245,14 @@ impl Replica {
                  the next start takes a new copy",
                 self.cursors.seed_id,
                 feed.seed_id
+            );
+        }
+        if feed.slice_id != self.cursors.slice_id {
+            anyhow::bail!(
+                "this node's slice changed while its copy was in use (the node or an ancestor moved: was {:?}, now {:?}); \
+                 the next start takes a new copy",
+                self.cursors.slice_id,
+                feed.slice_id
             );
         }
         self.forward_problems();

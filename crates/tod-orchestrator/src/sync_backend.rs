@@ -19,6 +19,14 @@
 //! - `GET /users/<u>/snapshot`: the whole database, for a node supervisor's
 //!   local copy (its `last_seq` is where that copy pulls from).
 //!
+//! A node's supervisor asks for its node's slice instead (`?slice=1`, the
+//! node named by `X-Tod-Node`; `tod_store::sync::slice`): the snapshot is cut
+//! to the slice, which records its cursor and slice id itself, and the feed
+//! is confined to it and carries `"slice_id"`, so a copy whose node moved is
+//! cut again. A supervisor's own changes (a `supervisor-` client naming its
+//! node with `X-Tod-Node`) are refused when they reach outside its node and
+//! the nodes under it.
+//!
 //! Each runs on its own SQLite connection, under the user's sync lock, after
 //! flushing the store's pending writes; the store reloads its read view
 //! after an apply so `tod-cli` and later reads see the result.
@@ -29,7 +37,9 @@ use anyhow::{Context, Result};
 use rusqlite::Connection;
 use std::path::Path;
 use std::time::Duration;
+use tod_store::sync::slice::Scope;
 use tod_store::sync::{self, Change};
+use uuid::Uuid;
 
 /// Where the seed's cursor is kept, in the user's data root.
 const SEED_SEQ_FILE: &str = "orchestrator-seed-seq";
@@ -81,6 +91,9 @@ fn seed_inner(users: &Users, user: &str, snapshot: &[u8]) -> Result<Response> {
 /// Logged, tagged with the sending `client`, so every other client gets
 /// them through the feed and `client` does not get them back.
 ///
+/// With `confined_to` (a node's supervisor), the whole batch is refused
+/// (400) when it reaches outside that node and the nodes under it.
+///
 /// With `impact` (the user's name and the wakes), the running cloud nodes
 /// the changes affect are marked and poked ([`crate::impact_handler`]), and
 /// so are those whose stop questions they answer ([`crate::answers`]) and
@@ -90,6 +103,7 @@ pub fn apply_changes(
     body: &[u8],
     client: &str,
     impact: Option<(&str, &crate::wakes::Wakes)>,
+    confined_to: Option<Uuid>,
 ) -> Response {
     let mut affected = Vec::new();
     let mut answered = Vec::new();
@@ -99,7 +113,13 @@ pub fn apply_changes(
         let _guard = user.sync_lock.lock().unwrap_or_else(|e| e.into_inner());
         let _ = user.store.flush_on_quit();
         let mut conn = connect(user)?;
-        let report = sync::apply_changes_from(&mut conn, &changes, client)?;
+        let report = match confined_to {
+            Some(node) => match sync::apply_changes_confined(&mut conn, &changes, client, node) {
+                Ok(report) => report,
+                Err(err) => return Ok(Response::text(400, format!("{err:#}"))),
+            },
+            None => sync::apply_changes_from(&mut conn, &changes, client)?,
+        };
         if impact.is_some() {
             affected = crate::impact_handler::record(&conn, &changes, client, crate::wakes::now_ms())
                 .unwrap_or_else(|err| {
@@ -131,29 +151,44 @@ pub fn apply_changes(
 }
 
 /// `client`'s own changes are left out.
-pub fn export_changes(user: &UserData, after: i64, client: Option<&str>) -> Response {
+///
+/// With `slice` (a node), only the changes in that node's slice, and its
+/// `slice_id`.
+pub fn export_changes(user: &UserData, after: i64, client: Option<&str>, slice: Option<Uuid>) -> Response {
     reply((|| {
         let _guard = user.sync_lock.lock().unwrap_or_else(|e| e.into_inner());
         let _ = user.store.flush_on_quit();
         let after = after.max(seed_seq(&user.root));
         let conn = connect(user)?;
         let last = sync::last_seq(&conn)?;
-        let changes = sync::export_changes_for(&conn, after, client)?;
-        Ok(json(&serde_json::json!({ "last_seq": last, "changes": changes, "seed_id": seed_id(&user.root) })))
+        let scope = slice.map(|node| Scope::for_node(&conn, "", node)).transpose()?;
+        let changes = sync::export_changes_in(&conn, after, client, scope.as_ref())?;
+        let mut v = serde_json::json!({ "last_seq": last, "changes": changes, "seed_id": seed_id(&user.root) });
+        if let Some(scope) = &scope {
+            v["slice_id"] = scope.id().into();
+        }
+        Ok(json(&v))
     })())
 }
+
 
 /// `GET /users/<u>/snapshot`: the user's whole database (the body), for a
 /// node's supervisor to seed its local copy from. Taken under the sync lock,
 /// so the snapshot's own `last_seq` is the feed cursor to pull after.
-pub fn snapshot(user: &UserData) -> Response {
+///
+/// With `slice` (a node), that node's slice instead (`sync::slice`), which
+/// records its own cursor.
+pub fn snapshot(user: &UserData, slice: Option<Uuid>) -> Response {
     use std::sync::atomic::{AtomicU64, Ordering};
     static N: AtomicU64 = AtomicU64::new(0);
     reply((|| {
         let _guard = user.sync_lock.lock().unwrap_or_else(|e| e.into_inner());
         let _ = user.store.flush_on_quit();
         let out = user.root.join(format!("snapshot-{}.db", N.fetch_add(1, Ordering::Relaxed)));
-        let taken = sync::snapshot(user.store.paths().db(), &out);
+        let taken = match slice {
+            Some(node) => sync::slice::snapshot_slice(user.store.paths().db(), node, &out).map(|_| ()),
+            None => sync::snapshot(user.store.paths().db(), &out),
+        };
         let bytes = taken.and_then(|()| std::fs::read(&out).context("read the snapshot"));
         let _ = std::fs::remove_file(&out);
         Ok(Response::bytes(bytes?))
