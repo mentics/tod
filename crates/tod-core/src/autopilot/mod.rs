@@ -336,6 +336,9 @@ pub const PR_POLL: Duration = Duration::from_secs(60);
 const PR_SLOW_AFTER: Duration = Duration::from_secs(60 * 60);
 const PR_SLOW_FACTOR: u32 = 5;
 
+/// Who a request is consumed by when a runner on this machine takes it.
+pub const LOCAL_CONSUMER: &str = "autopilot:local";
+
 impl Autopilot {
     /// The autopilot for `node`, continuing whatever run its saved state
     /// holds (a fresh one when there is none).
@@ -455,6 +458,28 @@ impl Autopilot {
         // Called again after it stopped: the user has presumably dealt with
         // what it stopped for.
         self.state.outcome = None;
+        // The user's explicit requests on the node (`tod_store::node_requests`)
+        // are consumed as the run starts: the first boundary of a local runner.
+        // One for a new session starts in one, as the saved flag does.
+        let requests = fleet.read(|conn| tod_store::node_requests::pending_for_node(conn, self.node))?;
+        if !requests.is_empty() {
+            if tod_store::node_requests::any_of(&requests, tod_store::node_requests::KIND_FRESH_SESSION) && !self.fresh_session {
+                self.start_fresh_session()?;
+            }
+            let at = state::now_ms();
+            for request in &requests {
+                fleet
+                    .interview(
+                        LOCAL_CONSUMER,
+                        tod_store::interview::InterviewCommand::ConsumeNodeRequest {
+                            request_id: request.id,
+                            by: LOCAL_CONSUMER.to_string(),
+                            at,
+                        },
+                    )
+                    .map_err(|e| anyhow::anyhow!("consume the {} request {}: {e}", request.kind, request.id))?;
+            }
+        }
         self.state.begin_active();
         self.save()?;
         let mut last: Option<(Standing, NextStep)> = None;

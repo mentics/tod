@@ -36,6 +36,8 @@
 //!   `create_triggers_sql` above is seeded at, so their triggers are created
 //!   by [`decisions_triggers_sql`] instead, run by the same migration step
 //!   that creates the tables.
+//! - `node_requests` (`tod_store::node_requests`), created by
+//!   [`node_requests_triggers_sql`] (same shape as `waits`).
 //! - `waits` (`tod_store::waits`), created by [`waits_triggers_sql`] in the
 //!   v67 migration for the same reason.
 //! - `cloud_nodes` (`tod_store::cloud_nodes`), created by
@@ -281,6 +283,12 @@ pub fn decisions_triggers_sql() -> String {
 /// are updated).
 pub fn waits_triggers_sql() -> String {
     simple_id_triggers("waits")
+}
+
+/// Triggers for `node_requests` (explicit user requests to a node; consuming
+/// one is an update).
+pub fn node_requests_triggers_sql() -> String {
+    simple_id_triggers("node_requests")
 }
 
 /// Triggers for `node_events` (webhook events routed to a node).

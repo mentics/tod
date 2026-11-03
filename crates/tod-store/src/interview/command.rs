@@ -347,6 +347,10 @@ pub enum InterviewCommand {
         node_id: Uuid,
         wait: crate::waits::NewWait,
     },
+    /// Record an explicit user request to a node (`crate::node_requests`).
+    RecordNodeRequest { node_id: Uuid, kind: String, by: String, at: i64 },
+    /// Consume a request: when and by whom (`crate::node_requests::consume`).
+    ConsumeNodeRequest { request_id: Uuid, by: String, at: i64 },
     /// Move a wait to another state (`satisfied`, `cancelled`, `expired`).
     SetWaitState { wait_id: Uuid, state: String },
     /// Set a pending wait's next time (a poll's next check).
@@ -1209,6 +1213,14 @@ pub fn execute(
         InterviewCommand::RecordWait { node_id, wait } => {
             let wait = crate::waits::WaitRepo::new(conn).create(*node_id, wait)?;
             Ok(json!({ "id": wait.id.to_string(), "due_at": wait.due_at }))
+        }
+        InterviewCommand::RecordNodeRequest { node_id, kind, by, at } => {
+            let id = crate::node_requests::record(conn, *node_id, kind, by, *at)?;
+            Ok(json!({ "id": id.to_string() }))
+        }
+        InterviewCommand::ConsumeNodeRequest { request_id, by, at } => {
+            let consumed = crate::node_requests::consume(conn, *request_id, by, *at)?;
+            Ok(json!({ "consumed": consumed }))
         }
         InterviewCommand::SetWaitState { wait_id, state } => {
             crate::waits::WaitRepo::new(conn).set_state(*wait_id, state)?;

@@ -28,6 +28,7 @@ pub const IGNORED_TABLES: &[&str] = &[
     "cloud_nodes",
     "waits",
     "node_events",
+    "node_requests",
     "decisions",
     "decision_answers",
     "conversations",

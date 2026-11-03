@@ -551,6 +551,37 @@ fn a_requested_fresh_session_starts_a_new_conversation_instead_of_reopening() {
     assert!(!turns.iter().any(|t| t.body == RESUME_MESSAGE));
 }
 
+/// A local runner takes a request row as the supervisor does: a request for a
+/// new session starts one, and every request is consumed (by whom, and when).
+#[test]
+fn a_local_runner_consumes_request_rows_and_starts_a_new_session_for_one() {
+    let fx = setup();
+    lifecycle::set_lifecycle(&fx.fleet, fx.node, "active").unwrap();
+    let mut agent = FakeAgent::new(&fx.fleet);
+    let mut driver = ConversationDriver::new(config(&fx), Focus::Node(fx.node), ProtocolKind::Implementation);
+    driver.send(&fx.fleet, &mut agent, "Implement the plan.").unwrap();
+    let id = driver.conversation_id().unwrap();
+    let mut state = AutopilotState::fresh();
+    state.current = Some(CurrentStep { protocol: "implementation".into(), lifecycle: "active".into(), conversation_id: id });
+    state.save(&fx.root, fx.node).unwrap();
+    for kind in [tod_store::node_requests::KIND_FRESH_SESSION, tod_store::node_requests::KIND_CHECK_NOW] {
+        fx.fleet
+            .interview(
+                "test",
+                InterviewCommand::RecordNodeRequest { node_id: fx.node, kind: kind.into(), by: "app".into(), at: 5 },
+            )
+            .unwrap();
+    }
+
+    let mut pilot = autopilot(&fx, Budget::default());
+    pilot.run(&fx.fleet, &mut agent).unwrap();
+    let first = pilot.state().steps.first().unwrap();
+    assert_ne!(first.conversation_id, Some(id), "the earlier conversation was not reopened");
+    let all = fx.fleet.read(|conn| tod_store::node_requests::list_for_node(conn, fx.node)).unwrap();
+    assert_eq!(all.len(), 2);
+    assert!(all.iter().all(|r| r.consumed_at.is_some() && r.consumed_by.as_deref() == Some(LOCAL_CONSUMER)), "{all:?}");
+}
+
 /// Stops the run from `watch`, the first time a turn is in flight.
 struct StopMidTurn(bool);
 

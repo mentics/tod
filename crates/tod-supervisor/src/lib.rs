@@ -112,6 +112,8 @@ struct Hook<'a> {
     state_dir: &'a std::path::Path,
     /// A request for a new session found, to take.
     fresh_pending: bool,
+    /// Who consumes requests (`consumed_by`).
+    consumer: String,
     /// The last context mark taken.
     context_seen: i64,
     /// A newer mark found at the last boundary, to take.
@@ -131,23 +133,65 @@ const LIVE_EVERY: Duration = Duration::from_secs(3);
 /// The reason the autopilot is stopped with to take a request for a new session.
 pub const FRESH_SESSION_REQUESTED: &str = "new session requested";
 
-/// Whether the app asked for a new session (it leaves a file in `state_dir`).
-fn fresh_requested(state_dir: &std::path::Path) -> bool {
+/// Whether the legacy marker file asking for a new session is there (a
+/// supervisor before schema v89 read only this; the app still writes it
+/// beside the request row, `tod_store::node_requests`).
+fn fresh_marker(state_dir: &std::path::Path) -> bool {
     state_dir.join(tod_core::autopilot::FRESH_SESSION_REQUEST_FILE).exists()
 }
 
-/// Takes the request ([`fresh_requested`]): deletes the file. An error is
-/// returned, never left to be taken again as a new request.
-fn take_fresh_request(state_dir: &std::path::Path) -> Result<()> {
+/// The node's requests not yet consumed (`tod_store::node_requests`).
+fn pending_requests(fleet: &FleetStore, node: Uuid) -> Result<Vec<tod_store::node_requests::NodeRequest>> {
+    fleet.read(|conn| tod_store::node_requests::pending_for_node(conn, node))
+}
+
+/// Whether a new session was asked for: the marker file or a pending
+/// `fresh_session` row.
+fn fresh_requested(state_dir: &std::path::Path, fleet: &FleetStore, node: Uuid) -> Result<bool> {
+    Ok(fresh_marker(state_dir)
+        || tod_store::node_requests::any_of(&pending_requests(fleet, node)?, tod_store::node_requests::KIND_FRESH_SESSION))
+}
+
+/// Consumes `requests` (`by`, now): the record that the supervisor took them.
+fn consume_requests(fleet: &FleetStore, requests: &[tod_store::node_requests::NodeRequest], by: &str) -> Result<()> {
+    let at = waits_now_ms();
+    for request in requests {
+        fleet
+            .interview(by, tod_store::interview::InterviewCommand::ConsumeNodeRequest {
+                request_id: request.id,
+                by: by.to_string(),
+                at,
+            })
+            .map_err(|e| anyhow::anyhow!("consume the {} request {}: {e}", request.kind, request.id))?;
+        tracing::info!(kind = %request.kind, id = %request.id, "consumed a request");
+    }
+    Ok(())
+}
+
+/// Takes the request for a new session: deletes the marker file (if any; an
+/// error removing one that is there is returned, never left to be taken again
+/// as a new request) and consumes the pending `fresh_session` rows.
+fn take_fresh_request(state_dir: &std::path::Path, fleet: &FleetStore, node: Uuid, by: &str) -> Result<()> {
     let path = state_dir.join(tod_core::autopilot::FRESH_SESSION_REQUEST_FILE);
-    std::fs::remove_file(&path).map_err(|e| anyhow::anyhow!("remove {}: {e}", path.display()))
+    match std::fs::remove_file(&path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(anyhow::anyhow!("remove {}: {e}", path.display())),
+    }
+    let fresh: Vec<_> = pending_requests(fleet, node)?
+        .into_iter()
+        .filter(|r| r.kind == tod_store::node_requests::KIND_FRESH_SESSION)
+        .collect();
+    consume_requests(fleet, &fresh, by)
 }
 
 impl StepHook for Hook<'_> {
     fn watch(&mut self, turn: tod_core::autopilot::Turn<'_>) -> Option<String> {
         // The user wants this turn replaced: cancel it (the run keeps it as
         // current, and taking the request drops it).
-        if fresh_requested(self.state_dir) {
+        // Only the marker file is seen mid-turn: a request row arrives with
+        // the next pull, at a boundary ([`StepHook::at`]).
+        if fresh_marker(self.state_dir) {
             self.fresh_pending = true;
             return Some(FRESH_SESSION_REQUESTED.to_string());
         }
@@ -203,10 +247,16 @@ impl StepHook for Hook<'_> {
                 tracing::warn!("pushing the branch: {err:#}");
             }
         }
-        if fresh_requested(self.state_dir) {
+        let pending = pending_requests(fleet, self.node)?;
+        if fresh_marker(self.state_dir)
+            || tod_store::node_requests::any_of(&pending, tod_store::node_requests::KIND_FRESH_SESSION)
+        {
             self.fresh_pending = true;
             return Ok(Some(FRESH_SESSION_REQUESTED.to_string()));
         }
+        // Any other request is taken here, at the first boundary after it
+        // arrived: the run is going, which is all it asked for.
+        consume_requests(fleet, &pending, &self.consumer)?;
         if let Some(at) = context::changed_since(fleet, self.node, self.context_seen)? {
             self.context_pending = Some(at);
             return Ok(Some(context::CONTEXT_CHANGED.to_string()));
@@ -433,13 +483,13 @@ pub fn wake(config: Config) -> Result<Woke> {
     let store = replica.lock().unwrap_or_else(|e| e.into_inner()).store().clone();
     phase("pull the orchestrator's changes", began, &progress, || replica.lock().unwrap_or_else(|e| e.into_inner()).pull())?;
 
-    let budget = match answers::before_wake_with(
-        &store,
-        config.node,
-        &config.state_dir,
-        config.budget,
-        fresh_requested(&config.state_dir),
-    )? {
+    // The user's explicit requests (rows, and the marker an older app left):
+    // any that asks to run supersedes an older stop answer. Nothing is consumed
+    // until the run starts, so a wake that leaves early leaves them for the next.
+    let consumer = format!("supervisor:{}:pid{}", config.sandbox, std::process::id());
+    let requested = pending_requests(&store, config.node)?;
+    let run_requested = fresh_marker(&config.state_dir) || tod_store::node_requests::asks_to_run(&requested);
+    let budget = match answers::before_wake_with(&store, config.node, &config.state_dir, config.budget, run_requested)? {
         answers::Before::LeaveStopped(reason) => {
             // Say so, as a wait does below: the app waits to hear from a
             // supervisor it woke, and a wake that leaves the node stopped is
@@ -454,13 +504,18 @@ pub fn wake(config: Config) -> Result<Woke> {
     // A request for a new session is a request to run now: what the node
     // waits on is looked at again by the run, which records it afresh. Left
     // pending, a wait would stop the run at its first step, before any agent.
-    if fresh_requested(&config.state_dir) {
+    if run_requested {
         waits::cancel_pending(&store, config.node)?;
     }
     let status = waits::check(&store, config.node, &config.workspace)?;
     // What `check` settled or moved goes up before anything else.
     replica.lock().unwrap_or_else(|e| e.into_inner()).push()?;
     if let waits::WaitStatus::Waiting { reason } = status {
+        // A "Check now" asked for this look and it was made; a request to run
+        // is left for the wake that does.
+        let looked: Vec<_> =
+            requested.iter().filter(|r| r.kind == tod_store::node_requests::KIND_CHECK_NOW).cloned().collect();
+        consume_requests(&store, &looked, &consumer)?;
         schedule(&store, &config)?;
         // Say so: the app waits to hear from a supervisor it started (a
         // reinstall, "Check now"), and a wake that finds nothing due is an
@@ -528,6 +583,7 @@ pub fn wake(config: Config) -> Result<Woke> {
         push_branch: config.push_branch,
         state_dir: &config.state_dir,
         fresh_pending: false,
+        consumer: consumer.clone(),
         context_seen: context::load_seen(&config.state_dir),
         context_pending: None,
         progress: &progress,
@@ -537,11 +593,13 @@ pub fn wake(config: Config) -> Result<Woke> {
     // Asked for while the supervisor slept: this run starts in a new session.
     // The request is saved in the autopilot's state (and survives a failure
     // here), so deleting the file is what takes it.
-    if fresh_requested(&config.state_dir) {
+    if fresh_requested(&config.state_dir, &store, config.node)? {
         tod_core::autopilot::AutopilotState::request_fresh_session(&data_root, config.node)?;
-        take_fresh_request(&config.state_dir)?;
+        take_fresh_request(&config.state_dir, &store, config.node, &consumer)?;
         tracing::info!("a new session was requested: the run starts in one");
     }
+    // The run starts: the rest of what was asked is taken with it.
+    consume_requests(&store, &pending_requests(&store, config.node)?, &consumer)?;
     let run = Autopilot::new(conversation, config.node, budget)
         .map(|pilot| pilot.with_poll_interval(config.poll))
         .and_then(|mut pilot| loop {
@@ -554,7 +612,7 @@ pub fn wake(config: Config) -> Result<Woke> {
                     agent.with(|a| a.close_session(&ConversationDriver::session_key(id)));
                 }
                 waits::cancel_pending(&store, config.node)?;
-                take_fresh_request(&config.state_dir)?;
+                take_fresh_request(&config.state_dir, &store, config.node, &consumer)?;
                 pilot.start_fresh_session()?;
                 tracing::info!("took a request for a new session");
                 continue;

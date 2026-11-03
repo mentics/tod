@@ -293,3 +293,84 @@ fn a_request_to_run_overrides_leave_it_stopped_and_is_taken() {
     let woke = wake_once(&s, fake_relay().0, 1);
     assert!(!matches!(woke, Woke::LeftStopped(_)), "{woke:?}");
 }
+
+/// A request row the app wrote (as sync delivers it to the orchestrator).
+fn request(s: &Setup, kind: &str) -> Uuid {
+    let conn = rusqlite::Connection::open(&s.remote_db).unwrap();
+    conn.busy_timeout(Duration::from_secs(10)).unwrap();
+    tod_store::node_requests::record(&conn, s.node, kind, "app", 1).unwrap()
+}
+
+/// `(consumed_at set, consumed_by)` of a request, read from the orchestrator.
+fn consumption(s: &Setup, id: Uuid) -> (bool, Option<String>) {
+    let conn = rusqlite::Connection::open(&s.remote_db).unwrap();
+    conn.busy_timeout(Duration::from_secs(10)).unwrap();
+    let row = tod_store::node_requests::list_for_node(&conn, s.node)
+        .unwrap()
+        .into_iter()
+        .find(|r| r.id == id)
+        .unwrap();
+    (row.consumed_at.is_some(), row.consumed_by)
+}
+
+/// A request written while the supervisor was not running is consumed at its
+/// next wake, supersedes the older answer to leave the node stopped, and
+/// records who took it and when; the next wake has nothing to take.
+#[test]
+fn a_request_row_written_while_asleep_supersedes_a_stop_answer_and_is_consumed() {
+    let s = setup("row-override");
+    let woke = wake_once(&s, fake_relay().0, 1);
+    assert!(matches!(woke, Woke::Ran(Outcome::BudgetExhausted { .. })), "{woke:?}");
+    answer(&s, 2); // Leave it stopped
+    let woke = wake_once(&s, fake_relay().0, 1);
+    assert!(matches!(woke, Woke::LeftStopped(_)), "{woke:?}");
+
+    let id = request(&s, tod_store::node_requests::KIND_KEEP_GOING);
+    assert_eq!(consumption(&s, id), (false, None));
+    let turns = count(&s.remote_db, "SELECT COUNT(*) FROM conversation_turns");
+    let woke = wake_once(&s, fake_relay().0, 1);
+    assert!(matches!(woke, Woke::Ran(_)), "{woke:?}");
+    assert!(count(&s.remote_db, "SELECT COUNT(*) FROM conversation_turns") > turns, "the node ran");
+    let (consumed, by) = consumption(&s, id);
+    assert!(consumed, "consumed at the wake");
+    assert!(by.unwrap().starts_with("supervisor:"));
+    let woke = wake_once(&s, fake_relay().0, 1);
+    assert!(!matches!(woke, Woke::LeftStopped(_)), "{woke:?}");
+}
+
+/// A wake that exits early (another supervisor holds the node) takes nothing:
+/// the request is still there for the next wake.
+#[test]
+fn an_early_exit_leaves_a_request_unconsumed() {
+    let s = setup("row-early");
+    let woke = wake_once(&s, fake_relay().0, 1);
+    assert!(matches!(woke, Woke::Ran(_)), "{woke:?}");
+    let id = request(&s, tod_store::node_requests::KIND_RUN);
+
+    let state = s.base.join("supervisor");
+    let held = match tod_supervisor::lock::acquire(&state).unwrap() {
+        tod_supervisor::lock::Taken::Held(l) => l,
+        tod_supervisor::lock::Taken::Busy { .. } => panic!("nobody holds it yet"),
+    };
+    let woke = wake_once(&s, fake_relay().0, 1);
+    assert!(matches!(woke, Woke::AlreadyRunning { .. }), "{woke:?}");
+    assert_eq!(consumption(&s, id), (false, None), "an early exit consumes nothing");
+    drop(held);
+
+    let woke = wake_once(&s, fake_relay().0, 1);
+    assert!(matches!(woke, Woke::Ran(_)), "{woke:?}");
+    assert!(consumption(&s, id).0, "the next wake took it");
+}
+
+/// "Check now" does not countermand a stop answer the way a request to run does.
+#[test]
+fn a_check_now_request_does_not_supersede_leave_it_stopped() {
+    let s = setup("row-check");
+    let woke = wake_once(&s, fake_relay().0, 1);
+    assert!(matches!(woke, Woke::Ran(Outcome::BudgetExhausted { .. })), "{woke:?}");
+    answer(&s, 2);
+    let id = request(&s, tod_store::node_requests::KIND_CHECK_NOW);
+    let woke = wake_once(&s, fake_relay().0, 1);
+    assert!(matches!(woke, Woke::LeftStopped(_)), "{woke:?}");
+    assert_eq!(consumption(&s, id), (false, None));
+}

@@ -771,3 +771,34 @@ fn a_change_the_receiver_refuses_is_recorded_and_the_rest_apply() {
     let _ = std::fs::remove_dir_all(&a.root);
     let _ = std::fs::remove_dir_all(&b.root);
 }
+
+/// A request the app writes reaches the other side (it is a synced table), is
+/// in the node's slice and not its sibling's, and its consumption travels back.
+#[test]
+fn a_node_request_syncs_slices_and_its_consumption_comes_back() {
+    let (mut a, mut b) = pair();
+    let t = tree(&a);
+    let at = 1_000;
+    let mine = crate::node_requests::record(&a.conn(), t.node, crate::node_requests::KIND_FRESH_SESSION, "app", at).unwrap();
+    crate::node_requests::record(&a.conn(), t.sibling, crate::node_requests::KIND_RUN, "app", at).unwrap();
+    assert!(sync(&mut a, &mut b).is_empty());
+    assert_eq!(crate::node_requests::pending_for_node(&b.conn(), t.node).unwrap().len(), 1);
+
+    let out = a.root.join("slice.db");
+    slice::snapshot_slice(a.fleet.paths().db(), t.node, &out).unwrap();
+    let conn = Connection::open(&out).unwrap();
+    assert_eq!(texts(&conn, "SELECT kind FROM node_requests"), ["fresh_session"], "only the node's own request");
+
+    assert!(crate::node_requests::consume(&b.conn(), mine, "supervisor", 2_000).unwrap());
+    assert!(sync(&mut b, &mut a).is_empty());
+    let seen = crate::node_requests::list_for_node(&a.conn(), t.node).unwrap();
+    assert_eq!(seen[0].consumed_at, Some(2_000));
+    assert_eq!(seen[0].consumed_by.as_deref(), Some("supervisor"));
+    let journaled: i64 = a
+        .conn()
+        .query_row("SELECT COUNT(*) FROM journey_changes WHERE tbl = 'node_requests'", [], |r| r.get(0))
+        .unwrap();
+    assert!(journaled >= 2, "a node-scoped trigger journals the writes: {journaled}");
+    let _ = std::fs::remove_dir_all(&a.root);
+    let _ = std::fs::remove_dir_all(&b.root);
+}

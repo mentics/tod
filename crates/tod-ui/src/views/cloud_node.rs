@@ -122,12 +122,14 @@ pub fn run_in_cloud<T: 'static>(
     });
 }
 
-/// Have `node_id`'s supervisor run its current step in a new session, off
-/// the UI thread (`cloud_sync::wake_node_tracked_with`): the sandbox is not
+/// Record the user's request of `kind` for `node_id`'s supervisor (a new
+/// session, or going on) and wake it, off the UI thread
+/// (`cloud_sync::wake_node_tracked_requesting`): the sandbox is not
 /// touched beyond a request file and a poke, so nothing is reinstalled.
-pub fn fresh_session<T: 'static>(
+pub fn request<T: 'static>(
     fleet: Arc<FleetStore>,
     node_id: String,
+    kind: &'static str,
     cx: &mut Context<T>,
     on_update: impl Fn(&mut T, CloudUpdate, &mut Context<T>) + 'static,
 ) {
@@ -138,7 +140,7 @@ pub fn fresh_session<T: 'static>(
             let _ = tx.send_blocking(CloudUpdate::Progress(msg.to_string()));
         };
         let _ = tx.send_blocking(CloudUpdate::Progress("Asking the supervisor for a new session…".into()));
-        let result = cloud_sync::wake_node_tracked_with(&fleet, &root, &node_id, true, &mut progress);
+        let result = cloud_sync::wake_node_tracked_requesting(&fleet, &root, &node_id, kind, &mut progress);
         let _ = tx.send_blocking(match result {
             Ok((said, true)) => CloudUpdate::Synced(format!("Asked for a new session: {said}.")),
             Ok((said, false)) => CloudUpdate::failed(format!(

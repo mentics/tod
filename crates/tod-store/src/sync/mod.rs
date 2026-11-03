@@ -132,6 +132,7 @@ pub const SYNCED_TABLES: &[&str] = &[
     "cloud_activity",
     "conversation_live",
     "node_events",
+    "node_requests",
 ];
 
 /// The HTTP header a client names itself by to the orchestrator
