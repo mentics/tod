@@ -1399,6 +1399,18 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                         if !fleet.is_client() {
                             tod_core::cloud_sync::sync_on_start(fleet.clone());
                             tod_core::cloud_notify::start(fleet.clone());
+                            // Waits left behind by states the node has left.
+                            let sweep_fleet = fleet.clone();
+                            std::thread::spawn(move || {
+                                if let Err(err) = sweep_fleet.interview(
+                                    tod_store::waits::LIFECYCLE_ACTOR,
+                                    tod_store::interview::InterviewCommand::SweepWaits {
+                                        expire_grace_ms: Some(tod_store::waits::EXPIRE_GRACE_MS),
+                                    },
+                                ) {
+                                    tracing::error!("sweeping the stale waits failed: {err}");
+                                }
+                            });
                         }
                         // Only the one long-lived GUI process should run this listener, so it
                         // starts here rather than inside `FleetStore::open` (which `tod-cli`

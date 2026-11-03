@@ -358,6 +358,13 @@ pub enum InterviewCommand {
         error: String,
         retry_due_at: Option<i64>,
     },
+    /// End the waits nothing can serve any more (`crate::waits::sweep`), and,
+    /// with `expire_grace_ms`, those long past due that nothing is looking
+    /// at (`crate::waits::expire_overdue`).
+    SweepWaits {
+        #[serde(default)]
+        expire_grace_ms: Option<i64>,
+    },
 }
 
 /// Append a phase event, attributed to `actor` (`crate::phase::certifier_for_actor`).
@@ -1210,6 +1217,18 @@ pub fn execute(
         InterviewCommand::RescheduleWait { wait_id, due_at } => {
             crate::waits::WaitRepo::new(conn).reschedule(*wait_id, *due_at)?;
             Ok(json!({}))
+        }
+        InterviewCommand::SweepWaits { expire_grace_ms } => {
+            let now = crate::outline::uuid_blob::now_ms();
+            let swept = crate::waits::sweep(conn, now)?;
+            let expired = match expire_grace_ms {
+                Some(grace) => crate::waits::expire_overdue(conn, now, *grace)?,
+                None => Vec::new(),
+            };
+            Ok(json!({
+                "cancelled": swept.iter().map(|s| format!("{} ({})", s.spec, s.reason)).collect::<Vec<_>>(),
+                "expired": expired.iter().map(|s| format!("{} ({})", s.spec, s.reason)).collect::<Vec<_>>(),
+            }))
         }
         InterviewCommand::WaitFailed { wait_id, error, retry_due_at } => {
             let wait = crate::waits::WaitRepo::new(conn).record_failure(*wait_id, error, *retry_due_at)?;

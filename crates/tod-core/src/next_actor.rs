@@ -214,6 +214,8 @@ impl WaitKind {
     /// The kind of an `event` wait from its `match_spec`
     /// (`autopilot::github_wait`, `autopilot::babysit`).
     pub fn from_spec(spec: &str) -> Self {
+        // Agents write `github:pr 2810 checks`; the supervisor writes colons.
+        let spec = &tod_store::waits::normalize_spec(spec);
         if spec.starts_with("github:release:") {
             Self::Release
         } else if spec.starts_with("github:pr:") && spec.contains(":bot-review:") {
@@ -557,6 +559,28 @@ fn actor_for(facts: &Facts<'_>) -> (NextActor, i64) {
             wait.updated_at,
         );
     }
+    // A wait long past its time that nothing is looking at is the user's:
+    // the wake that should have served it is not coming.
+    if let Some((wait, overdue_ms)) = facts
+        .waits
+        .iter()
+        .filter_map(|w| unserved_overdue(w, facts).map(|late| (w, late)))
+        .max_by_key(|(_, late)| *late)
+    {
+        let on = wait.detail.clone().filter(|d| !d.trim().is_empty()).unwrap_or_else(|| wait.match_spec.clone());
+        return (
+            NextActor::You {
+                why: YouReason::Stopped {
+                    reason: format!(
+                        "its wait on {on} was due {} ago and nothing is looking at it",
+                        format_elapsed(overdue_ms)
+                    ),
+                },
+                since: wait.due_at,
+            },
+            wait.due_at,
+        );
+    }
     // A failing look shows before the waits that are fine: it is the news.
     if let Some(wait) = facts
         .waits
@@ -624,6 +648,23 @@ fn outcome_reason(outcome: &Outcome) -> Option<YouReason> {
         }),
     }
 }
+
+/// How long past its time a pending wait nothing serves is, in ms: past
+/// `due_at` by more than two of its own intervals (the gap between the last
+/// look and the next, which a poller keeps), or, on a node with no cloud
+/// supervisor to wake it, by more than [`UNSERVED_GRACE_MS`]. `None` while
+/// it is still within that. A cloud node's wake comes from the
+/// orchestrator, so the longer, interval-based bound applies there.
+fn unserved_overdue(wait: &Wait, facts: &Facts<'_>) -> Option<i64> {
+    let late = facts.now_ms - wait.due_at;
+    let interval = (wait.due_at - wait.updated_at).max(0);
+    let grace = if facts.cloud.is_some() { (2 * interval).max(OVERDUE_GRACE_MS) } else { UNSERVED_GRACE_MS };
+    (late > grace).then_some(late)
+}
+
+/// Past its time by this much, a wait on a node no cloud supervisor serves
+/// has no scheduler left to look at it.
+pub const UNSERVED_GRACE_MS: i64 = 10 * 60 * 1000;
 
 fn external_wait(wait: &Wait, now_ms: i64) -> ExternalWait {
     // The poller reschedules a wait it has just looked at, so the gap between
@@ -1050,7 +1091,7 @@ mod tests {
         assert_eq!(WaitKind::from_spec("github:pr:7:bot-review:greptile"), WaitKind::BotReview);
         assert_eq!(WaitKind::from_spec("github:pr:7:checks"), WaitKind::Checks);
         assert_eq!(WaitKind::from_spec(""), WaitKind::Other);
-        assert_eq!(WaitKind::from_spec("github:pr 12 checks"), WaitKind::Other);
+        assert_eq!(WaitKind::from_spec("github:pr 12 checks"), WaitKind::Checks, "the space form agents write");
     }
 
     #[test]
@@ -1099,6 +1140,39 @@ mod tests {
         c.waits = vec![wait_at(NOW - 5_000, NOW - 65_000)];
         let NextActor::Others { wait } = standing(&c).actor else { panic!("not others") };
         assert!(!wait.overdue);
+    }
+
+    #[test]
+    fn a_wait_long_past_with_nothing_looking_at_it_is_the_users_not_others() {
+        let h = 3_600_000;
+        // An agent's 24h deadline, long gone, on a node with no supervisor.
+        let mut c = case("planning");
+        c.waits = vec![wait("github:pr 2810 checks", NOW - 11 * 60_000, NOW - 25 * h)];
+        let NextActor::You { why: YouReason::Stopped { reason }, since } = standing(&c).actor else {
+            panic!("a stale wait is the user's, not others'")
+        };
+        assert!(reason.contains("was due 11m ago and nothing is looking at it"), "{reason}");
+        assert_eq!(since, NOW - 11 * 60_000);
+
+        // The poller about to run (a few minutes late) is still others'.
+        c.waits = vec![wait("github:pr:7:review", NOW - 5 * 60_000, NOW - 65 * 60_000)];
+        assert!(matches!(standing(&c).actor, NextActor::Others { .. }));
+
+        // A cloud node's wake comes from the orchestrator: two intervals of grace.
+        let mut cloud = case("pr_draft");
+        cloud.cloud = Some(beat(100, tod_store::cloud_activity::STALE_AFTER_MS + 5_000));
+        cloud.cloud.as_mut().unwrap().what = tod_store::cloud_activity::IDLE_WHAT.into();
+        cloud.waits = vec![wait("github:pr:7:review", NOW - 59 * 60_000, NOW - 2 * h)];
+        assert!(matches!(standing(&cloud).actor, NextActor::Others { .. }), "within 2 intervals");
+        cloud.waits = vec![wait("github:pr:7:review", NOW - 3 * h, NOW - 4 * h)];
+        assert!(matches!(standing(&cloud).actor, NextActor::You { why: YouReason::Stopped { .. }, .. }));
+    }
+
+    #[test]
+    fn the_space_form_of_a_spec_is_classified_like_the_colon_form() {
+        assert_eq!(WaitKind::from_spec("github:pr 2810 checks"), WaitKind::Checks);
+        assert_eq!(WaitKind::from_spec("github:pr 5 merged"), WaitKind::Merge);
+        assert_eq!(WaitKind::from_spec("github:pr 5 bot-review greptile"), WaitKind::BotReview);
     }
 
     fn wait_at(due_at: i64, updated_at: i64) -> Wait {
