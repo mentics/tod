@@ -728,3 +728,31 @@ fn what_was_sent_is_pruned_from_the_outbox_and_later_changes_still_go() {
         let _ = std::fs::remove_dir_all(r);
     }
 }
+
+fn info_with(status: &str, state: Option<&str>) -> tod_sandbox::blaxel::SandboxInfo {
+    tod_sandbox::blaxel::SandboxInfo {
+        name: "tod-x".into(),
+        status: status.into(),
+        state: state.map(str::to_string),
+        url: None,
+        image: String::new(),
+        labels: Vec::new(),
+        volumes: Vec::new(),
+        node_env: Vec::new(),
+    }
+}
+
+#[test]
+fn a_sandbox_is_dead_by_its_state_as_well_as_its_status() {
+    assert!(!sandbox_is_dead(&info_with("DEPLOYED", None)));
+    assert!(!sandbox_is_dead(&info_with("DEPLOYED", Some("STANDBY"))));
+    assert!(!sandbox_is_dead(&info_with("DEPLOYED", Some("RUNNING"))));
+    for status in ["FAILED", "terminated", "DELETING", "DELETED"] {
+        assert!(sandbox_is_dead(&info_with(status, None)), "{status}");
+    }
+    for state in ["TERMINATED", "DELETING", "FAILED", "expired"] {
+        let info = info_with("DEPLOYED", Some(state));
+        assert!(sandbox_is_dead(&info), "{state}");
+        assert!(sandbox_dead_reason(&info).unwrap().contains(state));
+    }
+}
