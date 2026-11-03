@@ -179,8 +179,9 @@ fn collect_running_work(
     let (affected, mut continuing) = agent_runs.read(cx).running_work_split();
     items.extend(affected.into_iter().map(SharedString::from));
     // A node working in the cloud is run by its supervisor in its own
-    // sandbox, so closing the app does not touch it. A node only assigned
-    // to the cloud (waiting on a review or on the user) is not listed.
+    // sandbox, so closing the app does not touch it. Only a node whose
+    // supervisor's heartbeat is live is listed (`next_actor`'s `Working`): one
+    // assigned to the cloud that is waiting, stopped, or silent is not.
     match tod_core::cloud_sync::working_in_cloud(fleet) {
         Ok(work) => continuing.extend(
             work.into_iter()
@@ -1399,6 +1400,18 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                         if !fleet.is_client() {
                             tod_core::cloud_sync::sync_on_start(fleet.clone());
                             tod_core::cloud_notify::start(fleet.clone());
+                            // Waits left behind by states the node has left.
+                            let sweep_fleet = fleet.clone();
+                            std::thread::spawn(move || {
+                                if let Err(err) = sweep_fleet.interview(
+                                    tod_store::waits::LIFECYCLE_ACTOR,
+                                    tod_store::interview::InterviewCommand::SweepWaits {
+                                        expire_grace_ms: Some(tod_store::waits::EXPIRE_GRACE_MS),
+                                    },
+                                ) {
+                                    tracing::error!("sweeping the stale waits failed: {err}");
+                                }
+                            });
                         }
                         // Only the one long-lived GUI process should run this listener, so it
                         // starts here rather than inside `FleetStore::open` (which `tod-cli`

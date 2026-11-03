@@ -228,12 +228,24 @@ fn a_wake_runs_the_node_and_its_work_reaches_the_orchestrator() {
     let beats = sampler.join().unwrap();
     let working: Vec<_> = beats.iter().filter(|b| !b.is_idle()).collect();
     assert!(!working.is_empty(), "the orchestrator never saw the supervisor say it was working: {beats:?}");
-    assert!(working.iter().all(|b| b.is_live(b.heartbeat_at) && b.what == "active"), "{beats:?}");
+    // The first word is the starting beat, sent before the copy is seeded
+    // (the seed hold is taken first; seeding follows); every later one is the
+    // node's state.
+    assert_eq!(working[0].what, tod_store::cloud_activity::STARTING_WHAT, "{beats:?}");
+    assert!(
+        working.iter().all(|b| b.is_live(b.heartbeat_at) && (b.what == "active" || b.what == "starting")),
+        "{beats:?}"
+    );
+    assert!(working.iter().any(|b| b.what == "active"), "no beat from the copy itself: {beats:?}");
     // And it ended: a finished run must not look like a live one. The row is
     // kept, as idle, so a wake between two syncs is still heard.
     let conn = rusqlite::Connection::open(&remote_db).unwrap();
     let last = tod_store::cloud_activity::get(&conn, node).unwrap().expect("the run left no activity row");
     assert!(last.is_idle() && !last.is_live(last.heartbeat_at), "the heartbeat outlived the run: {last:?}");
+    // The wake ended on its budget (one session): the reason is left in the
+    // row for the app, and says what the user can do about it.
+    let reason = last.stopped.as_deref().expect("a wake that ended on its budget left no reason");
+    assert!(reason.contains("budget is spent") && reason.contains("Keep going"), "{reason}");
     drop(conn);
 
     // The supervisor's own writes (the implementation conversation, its

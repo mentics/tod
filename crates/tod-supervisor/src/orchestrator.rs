@@ -1,5 +1,6 @@
 //! The orchestrator's routes the supervisor uses (see `tod_orchestrator`):
-//! the snapshot and the change feed for its copy of the user's database, and
+//! the snapshot and the change feed for its node's slice of the user's
+//! database, and
 //! the node's transcripts. Requests go through the sandbox's proxy (from
 //! `HTTPS_PROXY`), which adds the credentials; failures are retried with
 //! backoff, as the `tod-cli` shim does.
@@ -28,6 +29,10 @@ pub struct Feed {
     /// Which seeding of the orchestrator's database the feed follows.
     #[serde(default)]
     pub seed_id: Option<String>,
+    /// Which slice the feed is confined to (the node's ancestor chain); an
+    /// orchestrator that does not cut slices sends none.
+    #[serde(default)]
+    pub slice_id: Option<String>,
 }
 
 /// The orchestrator's base URL from its `/cli` URL (`TOD_ORCHESTRATOR_CLI_URL`).
@@ -127,13 +132,15 @@ impl Orchestrator {
         Ok(bytes)
     }
 
-    /// The user's whole database.
+    /// This node's slice of the user's database (`tod_store::sync::slice`),
+    /// which records its own cursor and slice id.
     pub fn snapshot(&self) -> Result<Vec<u8>> {
-        self.ok("GET", "/snapshot", None)
+        self.ok("GET", "/snapshot?slice=1", None)
     }
 
+    /// The changes in this node's slice after `after`.
     pub fn changes_after(&self, after: i64) -> Result<Feed> {
-        let bytes = self.ok("GET", &format!("/changes?after={after}"), None)?;
+        let bytes = self.ok("GET", &format!("/changes?after={after}&slice=1"), None)?;
         serde_json::from_slice(&bytes).context("the orchestrator's change feed")
     }
 
@@ -142,6 +149,34 @@ impl Orchestrator {
         let body = serde_json::to_vec(changes)?;
         self.ok("POST", "/changes", Some(&body))?;
         Ok(())
+    }
+
+    /// Tells the app this supervisor has begun a wake, before it has a local
+    /// copy of the database to record that in: sends the node's
+    /// `cloud_activity` row (`what = "starting"`) as one change, directly. The
+    /// seed that follows carries the row into the copy, so the first beat
+    /// recorded there updates it. The row's foreign key is checked by the
+    /// orchestrator, which holds the node because the app sent it.
+    pub fn push_starting_beat(&self, node: uuid::Uuid, now_ms: i64) -> Result<()> {
+        use tod_store::sync::{Row, SqlValue};
+        let hex: String = tod_store::outline::uuid_blob::uuid_to_blob(node).iter().map(|b| format!("{b:02x}")).collect();
+        let key: Row = [("node_id".to_string(), SqlValue::Blob(hex.clone()))].into();
+        let mut after = key.clone();
+        after.insert("started_at".into(), SqlValue::Integer(now_ms));
+        after.insert("heartbeat_at".into(), SqlValue::Integer(now_ms));
+        after.insert("what".into(), SqlValue::Text(tod_store::cloud_activity::STARTING_WHAT.into()));
+        after.insert("stopped".into(), SqlValue::Null);
+        // `before` is unknown (a row from the last wake may be there): the
+        // orchestrator notes the difference and applies this row.
+        self.push_changes(&[Change {
+            seq: 0,
+            node_id: Some(node),
+            table: tod_store::cloud_activity::TABLE.to_string(),
+            key,
+            before: None,
+            after: Some(after),
+        }])
+        .context("telling the app this supervisor has started")
     }
 
     /// Sends problems collected in this node's sandbox (`tod_problems`) to be

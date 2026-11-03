@@ -62,6 +62,32 @@ fn client(request: &Request) -> Option<&str> {
         .or_else(|| request.query_param("client"))
         .filter(|c| !c.is_empty())
 }
+/// The node whose slice a `snapshot` or `changes` request asks for
+/// (`?slice=1` with `X-Tod-Node`), or `None` for the whole database.
+fn slice_node(request: &Request) -> Result<Option<uuid::Uuid>, Response> {
+    if request.query_param("slice") != Some("1") {
+        return Ok(None);
+    }
+    let node = request
+        .header(tod_store::fleet::cli_relay::NODE_HEADER)
+        .ok_or_else(|| Response::text(400, "?slice=1 needs the node (X-Tod-Node)"))?;
+    uuid::Uuid::parse_str(node)
+        .map(Some)
+        .map_err(|_| Response::text(400, format!("X-Tod-Node: not a node id: {node}")))
+}
+
+/// The node a supervisor's changes are confined to: a `supervisor-` client
+/// that names its node (`X-Tod-Node`, as every supervisor does).
+fn supervisor_node(request: &Request) -> Result<Option<uuid::Uuid>, Response> {
+    let is_supervisor = client(request).is_some_and(|c| c.starts_with("supervisor-"));
+    match request.header(tod_store::fleet::cli_relay::NODE_HEADER) {
+        Some(node) if is_supervisor => uuid::Uuid::parse_str(node)
+            .map(Some)
+            .map_err(|_| Response::text(400, format!("X-Tod-Node: not a node id: {node}"))),
+        _ => Ok(None),
+    }
+}
+
 /// Not 8080: every Blaxel sandbox's own API listens there.
 pub const DEFAULT_PORT: u16 = 8090;
 pub const DEFAULT_BASE: &str = "/data";
@@ -204,15 +230,25 @@ impl Server {
                     Err(r) => return r,
                 };
                 match (method, rest) {
-                    ("POST", ["seed"]) => sync_backend::seed(&self.users, &user, &request.body),
+                    ("POST", ["seed"]) => sync_backend::seed(
+                        &self.users,
+                        &user,
+                        &request.body,
+                        client(request).unwrap_or("unknown"),
+                        request.header(sync_backend::TAKE_OVER_HEADER) == Some("yes"),
+                    ),
                     ("POST", ["changes"]) => match self.users.get(&user) {
                         Ok(data) if !sync_backend::is_seeded(&data.root) => Response::text(409, sync_backend::NOT_SEEDED),
-                        Ok(data) => sync_backend::apply_changes(
-                            &data,
-                            &request.body,
-                            client(request).unwrap_or("unknown"),
-                            Some((&user, &self.wakes)),
-                        ),
+                        Ok(data) => match supervisor_node(request) {
+                            Ok(confined_to) => sync_backend::apply_changes(
+                                &data,
+                                &request.body,
+                                client(request).unwrap_or("unknown"),
+                                Some((&user, &self.wakes)),
+                                confined_to,
+                            ),
+                            Err(r) => r,
+                        },
                         Err(err) => Response::text(500, format!("{err:#}")),
                     },
                     ("GET", ["changes"]) => {
@@ -222,7 +258,16 @@ impl Server {
                         };
                         match self.users.get(&user) {
                             Ok(data) if !sync_backend::is_seeded(&data.root) => Response::text(409, sync_backend::NOT_SEEDED),
-                            Ok(data) => sync_backend::export_changes(&data, after, client(request)),
+                            Ok(data) => match slice_node(request) {
+                                Ok(slice) => sync_backend::export_changes(
+                                    &data,
+                                    after,
+                                    client(request),
+                                    slice,
+                                    self.notifier.degraded_for().map(|d| d.as_secs().max(1)),
+                                ),
+                                Err(r) => r,
+                            },
                             Err(err) => Response::text(500, format!("{err:#}")),
                         }
                     }
@@ -232,7 +277,10 @@ impl Server {
                     ("GET", ["notify"]) => self.notify_topics(&user),
                     ("GET" | "PUT", ["github-routes"]) => self.github_routes(&user, request),
                     ("GET", ["snapshot"]) => match self.users.get(&user) {
-                        Ok(data) => sync_backend::snapshot(&data),
+                        Ok(data) => match slice_node(request) {
+                            Ok(slice) => sync_backend::snapshot(&data, slice),
+                            Err(r) => r,
+                        },
                         Err(err) => Response::text(500, format!("{err:#}")),
                     },
                     ("POST", ["nodes", node, "flags"]) => match self.users.get(&user) {

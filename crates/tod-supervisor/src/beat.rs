@@ -5,15 +5,24 @@
 //!
 //! [`Beating::start`] records the run and pushes it at once, then a thread
 //! refreshes and pushes it every [`BEAT_EVERY`]. [`Beating::finish`] (or
-//! dropping it) marks the row idle and pushes that: the app sees the run end,
+//! dropping it) marks the row idle, with why the wake stopped when it did
+//! (`cloud_activity.stopped`), and pushes that: the app sees the run end,
 //! even one that began and ended between two of its syncs.
+//!
+//! The thread records each beat in the local copy on a connection of its own
+//! ([`crate::replica::BeatWriter`]) and pushes only if it can take the
+//! replica without waiting: a sync (push and pull, with long HTTP timeouts)
+//! holds that lock, and a beat that waited behind it would let the row go
+//! stale ([`tod_store::cloud_activity::STALE_AFTER_MS`]) while the supervisor
+//! is fine. A skipped push is not lost: the sync that held the lock pushes
+//! the copy's changes, the beat among them, and the next beat tries again.
 //! A supervisor that dies leaves the row to go stale, which the app shows
 //! as the loss it is.
 
-use crate::replica::Replica;
+use crate::replica::{BeatWriter, Replica};
 use anyhow::{Context, Result};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, TryLockError};
 use std::thread::JoinHandle;
 use std::time::Duration;
 use uuid::Uuid;
@@ -38,15 +47,31 @@ impl Beating {
         beat_once(&replica, node).context("telling the app this node is being worked on")?;
         let (stop, stopped) = mpsc::channel::<()>();
         let beating = replica.clone();
+        let writer = replica.lock().unwrap_or_else(|e| e.into_inner()).beat_writer(node);
         let thread = std::thread::Builder::new()
             .name("cloud-heartbeat".into())
             .spawn(move || {
                 // `recv_timeout` is the sleep: dropping the sender wakes it.
+                let mut skipped = 0u32;
                 while let Err(RecvTimeoutError::Timeout) = stopped.recv_timeout(every) {
-                    if let Err(err) = beat_once(&beating, node) {
-                        // The row goes stale and the app says the supervisor
-                        // stopped responding: the failure is not lost.
-                        tracing::warn!("cloud heartbeat: {err:#}");
+                    match beat_without_waiting(&beating, &writer) {
+                        Ok(true) => skipped = 0,
+                        Ok(false) => {
+                            skipped += 1;
+                            // One skip is normal (a sync is under way); several
+                            // mean the sync is slow, and the app will see the
+                            // row stale until it ends.
+                            if skipped >= 3 {
+                                tracing::warn!(skipped, "cloud heartbeat: a sync has held the local copy for {skipped} beats; the row is recorded but not sent until it ends");
+                            } else {
+                                tracing::info!("cloud heartbeat: a sync holds the local copy; this beat is recorded and goes with its push");
+                            }
+                        }
+                        Err(err) => {
+                            // The row goes stale and the app says the supervisor
+                            // stopped responding: the failure is not lost.
+                            tracing::warn!("cloud heartbeat: {err:#}");
+                        }
                     }
                 }
             })
@@ -54,12 +79,13 @@ impl Beating {
         Ok(Self { replica, node, stop: Some(stop), thread: Some(thread) })
     }
 
-    /// The run is over: stops the beat, marks the row idle, and sends that.
-    pub fn finish(mut self) -> Result<()> {
-        self.end()
+    /// The run is over: stops the beat, marks the row idle (with `stopped`,
+    /// why the wake ended needing someone, when it did), and sends that.
+    pub fn finish(mut self, stopped: Option<String>) -> Result<()> {
+        self.end(stopped.as_deref())
     }
 
-    fn end(&mut self) -> Result<()> {
+    fn end(&mut self, stopped: Option<&str>) -> Result<()> {
         drop(self.stop.take());
         if let Some(thread) = self.thread.take()
             && thread.join().is_err()
@@ -67,19 +93,38 @@ impl Beating {
             tracing::warn!("the cloud heartbeat thread panicked");
         }
         let mut replica = self.replica.lock().unwrap_or_else(|e| e.into_inner());
-        replica.end_cloud_beat(self.node).context("telling the app this node is no longer being worked on")
+        replica.end_cloud_beat(self.node, stopped).context("telling the app this node is no longer being worked on")
     }
 }
 
 impl Drop for Beating {
     fn drop(&mut self) {
         if self.stop.is_some()
-            && let Err(err) = self.end()
+            && let Err(err) = self.end(Some(UNEXPECTED_END))
         {
             // The row stays and goes stale: shown as lost, not hidden.
             tracing::warn!("cloud heartbeat: {err:#}");
         }
     }
+}
+
+/// The reason left when the run ends by being dropped, not finished: the
+/// supervisor returned early with an error (its log has it).
+const UNEXPECTED_END: &str = "the supervisor ended its run without finishing it; see the supervisor's log in the log panel, then run it again";
+
+/// Records a beat and sends it unless a sync holds the replica. Whether it
+/// was sent.
+fn beat_without_waiting(replica: &Arc<Mutex<Replica>>, writer: &BeatWriter) -> Result<bool> {
+    if !writer.record()? {
+        anyhow::bail!("the node is not in the supervisor's copy of the database; the heartbeat cannot be recorded");
+    }
+    let mut replica = match replica.try_lock() {
+        Ok(replica) => replica,
+        Err(TryLockError::WouldBlock) => return Ok(false),
+        Err(TryLockError::Poisoned(e)) => e.into_inner(),
+    };
+    replica.push().context("sending the heartbeat (and the copy's other changes) to the orchestrator")?;
+    Ok(true)
 }
 
 fn beat_once(replica: &Arc<Mutex<Replica>>, node: Uuid) -> Result<()> {

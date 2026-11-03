@@ -216,9 +216,10 @@ impl<'a> WaitRepo<'a> {
         if !KINDS.contains(&wait.kind.as_str()) {
             bail!("unknown wait kind `{}` (expected {})", wait.kind, KINDS.join("|"));
         }
-        let spec = wait.match_spec.trim();
+        let normalised = if wait.kind == KIND_EVENT { normalize_spec(&wait.match_spec) } else { wait.match_spec.trim().to_string() };
+        let spec = normalised.as_str();
         match wait.kind.as_str() {
-            KIND_EVENT if !spec.contains(':') => {
+            KIND_EVENT if !wait.match_spec.contains(':') => {
                 bail!("an event wait needs `<source>:<match>` (got `{spec}`)")
             }
             KIND_CHECK if spec.is_empty() => bail!("a check wait needs a command"),
@@ -361,6 +362,140 @@ impl<'a> WaitRepo<'a> {
     }
 }
 
+/// The one spelling of an event wait's spec: words separated by `:` or
+/// whitespace, joined by `:`, so `github:pr 2810 checks` (as agents write
+/// it) is `github:pr:2810:checks` (as the supervisor writes it). Applied
+/// where specs are written ([`WaitRepo::create`]) and wherever one is
+/// matched, since rows written before it keep the space form.
+pub fn normalize_spec(spec: &str) -> String {
+    spec.split(|c: char| c == ':' || c.is_whitespace()).filter(|w| !w.is_empty()).collect::<Vec<_>>().join(":")
+}
+
+/// Who ends waits the lifecycle itself made moot (the start of their `detail`).
+pub const LIFECYCLE_ACTOR: &str = "lifecycle";
+/// How long past its deadline an event wait nobody serves waits before
+/// [`expire_overdue`] ends it.
+pub const EXPIRE_GRACE_MS: i64 = 6 * 60 * 60 * 1000;
+
+fn has_waits_table(conn: &Connection) -> Result<bool> {
+    Ok(conn.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'waits'")?.exists([])?)
+}
+
+/// Ends the node's pending `event` and `check` waits (GitHub's among them)
+/// with `detail`: the state that recorded them is over. `until` waits stay:
+/// the usage-limit path records one that outlives any state
+/// (`tod_supervisor::usage_limit::record`; an `until` wait with no spec).
+/// Returns how many it ended.
+pub fn cancel_for_node(conn: &Connection, node: Uuid, detail: &str) -> Result<usize> {
+    if !has_waits_table(conn)? {
+        return Ok(0);
+    }
+    Ok(conn.execute(
+        "UPDATE waits SET state = 'cancelled', detail = ?2, updated_at = ?3
+         WHERE node_id = ?1 AND state = 'pending' AND kind IN ('event','check')",
+        params![uuid_to_blob(node), format!("{LIFECYCLE_ACTOR}: {detail}"), now_ms()],
+    )?)
+}
+
+/// A wait [`sweep`] or [`expire_overdue`] ended, and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Swept {
+    pub wait_id: Uuid,
+    pub node_id: Uuid,
+    pub spec: String,
+    pub reason: String,
+}
+
+fn end_wait(conn: &Connection, wait: &Wait, state: &str, reason: &str, now: i64) -> Result<Swept> {
+    conn.execute(
+        "UPDATE waits SET state = ?2, detail = ?3, updated_at = ?4 WHERE id = ?1 AND state = 'pending'",
+        params![uuid_to_blob(wait.id), state, format!("{LIFECYCLE_ACTOR}: {reason}"), now],
+    )?;
+    Ok(Swept { wait_id: wait.id, node_id: wait.node_id, spec: wait.match_spec.clone(), reason: reason.to_string() })
+}
+
+/// The lifecycle states a GitHub wait `spec` can belong to, or `None` for a
+/// spec of no family we know (left alone).
+pub fn spec_states(spec: &str) -> Option<&'static [&'static str]> {
+    let spec = normalize_spec(spec);
+    if spec.starts_with("github:release:") {
+        Some(&["merged"])
+    } else if !spec.starts_with("github:pr:") {
+        None
+    } else if spec.ends_with(":ready_for_review") || spec.ends_with(":review_requested") {
+        Some(&["pr_draft"])
+    } else if spec.ends_with(":merged") {
+        Some(&["approved"])
+    } else if spec.contains(":bot-review:")
+        || spec.ends_with(":review")
+        || spec.contains(":review:")
+        || spec.ends_with(":checks")
+    {
+        Some(&["pr_draft", "pr_review"])
+    } else {
+        None
+    }
+}
+
+/// The startup sweep: cancels pending waits that cannot be waited on any
+/// more, each with a detail naming the rule: the node is `done`; the node is
+/// a cloud node whose sandbox is lost (`lost_at` set); or an event wait's
+/// spec family does not belong to the node's lifecycle state
+/// ([`spec_states`]).
+pub fn sweep(conn: &Connection, now: i64) -> Result<Vec<Swept>> {
+    if !has_waits_table(conn)? {
+        return Ok(Vec::new());
+    }
+    let pending = WaitRepo::new(conn).query("state = 'pending' AND kind IN ('event','check')", [])?;
+    let mut ended = Vec::new();
+    for wait in &pending {
+        let state: Option<String> = conn
+            .query_row("SELECT state FROM node_lifecycle WHERE node_id = ?1", [uuid_to_blob(wait.node_id)], |r| r.get(0))
+            .optional()?;
+        let lost = crate::cloud_nodes::get(conn, wait.node_id)?.is_some_and(|c| c.lost_at.is_some());
+        let reason = if state.as_deref() == Some("done") {
+            Some("the node is done".to_string())
+        } else if lost {
+            Some("the node's sandbox is lost".to_string())
+        } else if let (Some(state), Some(allowed)) = (state.as_deref(), spec_states(&wait.match_spec)) {
+            (wait.kind == KIND_EVENT && !allowed.contains(&state))
+                .then(|| format!("a wait of {} does not belong to {state}", allowed.join("/")))
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            ended.push(end_wait(conn, wait, WAIT_CANCELLED, &reason, now)?);
+        }
+    }
+    Ok(ended)
+}
+
+/// Marks `expired` every pending `event` wait more than `grace` past its
+/// deadline on a node nothing serves: no live cloud supervisor
+/// (`cloud_activity`) and no live lifecycle lease (`activity`) on it. A wake
+/// that should have fired has not, so the wait would only block the node.
+pub fn expire_overdue(conn: &Connection, now: i64, grace: i64) -> Result<Vec<Swept>> {
+    if !has_waits_table(conn)? {
+        return Ok(Vec::new());
+    }
+    let candidates = WaitRepo::new(conn)
+        .query("state = 'pending' AND kind = 'event' AND due_at + ?1 < ?2", params![grace, now])?;
+    let mut ended = Vec::new();
+    for wait in &candidates {
+        let cloud_live = crate::cloud_activity::get(conn, wait.node_id)?.is_some_and(|b| b.is_live(now));
+        let local_live = crate::activity::ActivityRepo::new(conn)
+            .list_for_nodes(&[wait.node_id])?
+            .iter()
+            .any(|l| l.is_lifecycle() && l.is_live(now));
+        if cloud_live || local_live {
+            continue;
+        }
+        let reason = format!("due {}m ago and nothing was looking at it", (now - wait.due_at) / 60_000);
+        ended.push(end_wait(conn, wait, WAIT_EXPIRED, &reason, now)?);
+    }
+    Ok(ended)
+}
+
 /// `30s`, `5m`, `2h`, `1d`, or a bare number of seconds.
 pub fn parse_duration(raw: &str) -> Result<i64> {
     let raw = raw.trim();
@@ -486,6 +621,144 @@ mod tests {
         assert!(repo.create(node, &NewWait::event("no source", 1)).is_err());
         assert!(repo.create(node, &NewWait::check("", 60, 0)).is_err());
         assert!(repo.set_state(Uuid::new_v4(), WAIT_CANCELLED).is_err());
+    }
+
+    use crate::fleet::schema;
+    use crate::outline::repos::NodeRepo;
+
+    struct Real {
+        dir: std::path::PathBuf,
+        conn: Connection,
+    }
+    impl Drop for Real {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+    fn real() -> Real {
+        let dir = std::env::temp_dir().join(format!("tod-waits-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let conn = schema::open_writer_connection(&dir.join("tod.db")).unwrap();
+        Real { dir, conn }
+    }
+    fn node_in(r: &Real, state: &str) -> Uuid {
+        let node = Uuid::new_v4();
+        NodeRepo::new(&r.conn).create_with_id(node, &node.simple().to_string(), "N").unwrap();
+        NodeRepo::new(&r.conn).set_lifecycle(node, state).unwrap();
+        node
+    }
+    fn pending(r: &Real, node: Uuid) -> Vec<String> {
+        WaitRepo::new(&r.conn).list_pending_for_node(node).unwrap().into_iter().map(|w| w.match_spec).collect()
+    }
+
+    #[test]
+    fn the_space_spelling_is_one_spelling() {
+        assert_eq!(normalize_spec("github:pr 2810 checks"), "github:pr:2810:checks");
+        assert_eq!(normalize_spec("  github:pr:7:review:a,b "), "github:pr:7:review:a,b");
+        let (conn, node) = conn();
+        let w = WaitRepo::new(&conn).create(node, &NewWait { match_spec: "github:pr 5 checks".into(), ..NewWait::event("x:y", 1) }).unwrap();
+        assert_eq!(w.match_spec, "github:pr:5:checks");
+    }
+
+    #[test]
+    fn leaving_a_state_cancels_its_event_and_check_waits_but_not_an_until() {
+        let r = real();
+        let node = node_in(&r, "pr_draft");
+        let repo = WaitRepo::new(&r.conn);
+        repo.create(node, &NewWait::event("github:pr:1:ready_for_review", 5)).unwrap();
+        repo.create(node, &NewWait::check("true", 60, 0)).unwrap();
+        let limit = repo.create(node, &NewWait::until(9_999_999_999_999)).unwrap();
+        NodeRepo::new(&r.conn).set_lifecycle(node, "pr_draft").unwrap();
+        assert_eq!(pending(&r, node).len(), 3, "staying put ends nothing");
+        NodeRepo::new(&r.conn).set_lifecycle(node, "pr_review").unwrap();
+        let left: Vec<_> = repo.list_for_node(node).unwrap();
+        assert_eq!(repo.list_pending_for_node(node).unwrap().iter().map(|w| w.id).collect::<Vec<_>>(), [limit.id]);
+        let cancelled = left.iter().find(|w| w.kind == KIND_EVENT).unwrap();
+        assert_eq!(cancelled.state, WAIT_CANCELLED);
+        assert_eq!(cancelled.detail.as_deref(), Some("lifecycle: the node left pr_draft"));
+    }
+
+    #[test]
+    fn moving_back_cancels_too() {
+        let r = real();
+        let node = node_in(&r, "pr_review");
+        WaitRepo::new(&r.conn).create(node, &NewWait::event("github:pr:1:review", 5)).unwrap();
+        NodeRepo::new(&r.conn).set_lifecycle(node, "active").unwrap();
+        assert!(pending(&r, node).is_empty());
+    }
+
+    #[test]
+    fn the_sweep_ends_waits_by_the_rule_that_applies() {
+        let r = real();
+        let done = node_in(&r, "done");
+        let planning = node_in(&r, "planning");
+        let draft = node_in(&r, "pr_draft");
+        let review = node_in(&r, "pr_review");
+        let approved = node_in(&r, "approved");
+        let merged = node_in(&r, "merged");
+        let lost = node_in(&r, "pr_review");
+        let repo = WaitRepo::new(&r.conn);
+        let ev = |n, spec: &str| repo.create(n, &NewWait::event(spec, 1)).unwrap();
+        ev(done, "github:pr:1:review");
+        ev(planning, "github:pr 2 checks");
+        ev(draft, "github:pr:3:ready_for_review");
+        ev(review, "github:pr:4:ready_for_review");
+        ev(review, "github:pr:4:review:alice");
+        ev(review, "github:pr:4:bot-review:greptile");
+        ev(approved, "github:pr:5:merged");
+        ev(approved, "github:pr:5:review");
+        ev(merged, "github:release:published");
+        ev(merged, "github:pr:6:merged");
+        ev(lost, "github:pr:7:review");
+        ev(lost, "custom:thing");
+        ev(planning, "slack:message");
+        r.conn.execute("INSERT INTO cloud_nodes (node_id, sandbox, user_name, accepted_at, lost_at) VALUES (?1, 's', 'u', 0, 5)", [uuid_to_blob(lost)]).unwrap();
+
+        let swept = sweep(&r.conn, 100).unwrap();
+        let mut ended: Vec<_> = swept.iter().map(|s| s.spec.as_str()).collect();
+        ended.sort();
+        assert_eq!(
+            ended,
+            [
+                "custom:thing",
+                "github:pr:1:review",
+                "github:pr:2:checks",
+                "github:pr:4:ready_for_review",
+                "github:pr:5:review",
+                "github:pr:6:merged",
+                "github:pr:7:review",
+            ]
+        );
+        assert!(swept.iter().find(|s| s.node_id == done).unwrap().reason.contains("done"));
+        assert!(swept.iter().find(|s| s.node_id == lost).unwrap().reason.contains("lost"));
+        assert!(swept.iter().find(|s| s.spec.ends_with("5:review")).unwrap().reason.contains("approved"));
+        assert_eq!(pending(&r, draft), ["github:pr:3:ready_for_review"]);
+        assert_eq!(pending(&r, review).len(), 2);
+        assert_eq!(pending(&r, merged), ["github:release:published"]);
+        assert_eq!(pending(&r, planning), ["slack:message"], "an unknown family is left alone");
+    }
+
+    #[test]
+    fn an_overdue_event_wait_nobody_serves_expires_but_a_served_one_stays() {
+        let r = real();
+        let (idle, cloud, local, fresh) = (node_in(&r, "pr_draft"), node_in(&r, "pr_draft"), node_in(&r, "pr_draft"), node_in(&r, "pr_draft"));
+        let repo = WaitRepo::new(&r.conn);
+        for n in [idle, cloud, local] {
+            repo.create(n, &NewWait::event("github:pr:1:ready_for_review", 1_000)).unwrap();
+        }
+        repo.create(fresh, &NewWait::event("github:pr:1:ready_for_review", 99_000)).unwrap();
+        let until = repo.create(idle, &NewWait::until(1_000)).unwrap();
+        r.conn.execute("INSERT INTO cloud_activity (node_id, started_at, heartbeat_at, what) VALUES (?1, 0, 95000, 'pr_draft')", [uuid_to_blob(cloud)]).unwrap();
+        crate::activity::ActivityRepo::new(&r.conn).start(Uuid::new_v4(), local, crate::activity::KIND_RUN, "daemon", 95_000).unwrap();
+
+        let ended = expire_overdue(&r.conn, 100_000, 10_000).unwrap();
+        assert_eq!(ended.iter().map(|s| s.node_id).collect::<Vec<_>>(), [idle]);
+        assert_eq!(repo.get(ended[0].wait_id).unwrap().unwrap().state, WAIT_EXPIRED);
+        assert_eq!(repo.get(until.id).unwrap().unwrap().state, WAIT_PENDING, "only event waits expire");
+        assert_eq!(pending(&r, cloud).len(), 1);
+        assert_eq!(pending(&r, local).len(), 1);
+        assert_eq!(pending(&r, fresh).len(), 1);
+        assert!(expire_overdue(&r.conn, 100_000, 200_000).unwrap().is_empty(), "within the grace");
     }
 
     #[test]

@@ -4,7 +4,7 @@ The panel shown by default when a **task node** is selected (see
 `doc/glossary.md`: lifecycle on itself, agent on itself or inherited). Other
 node types have their own default panel (generator nodes and managed nodes
 already do); every node with none of its own gets the details panel. Status:
-design. Nothing here is implemented yet.
+built (`crates/tod-ui/src/unified/panels/task.rs`).
 
 The task panel replaces the decisions panel. **Alt+Q** / **Alt+Shift+Q** jump
 the tree selection to the next / previous task with a request, longest

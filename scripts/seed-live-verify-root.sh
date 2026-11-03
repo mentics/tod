@@ -45,5 +45,20 @@ for b in blocks[1:]:
 open(sys.argv[2], 'w').write(''.join(keep))
 PY
 
+# The orchestrator keeps one database per user name, and the user name comes
+# from `owner`: with the real root's owner this root would seed over, and be
+# seeded over by, the real root's copy (the two take turns wiping each other).
+# Give this root its own user on the shared orchestrator.
+python3 - "$TEST/sandboxes.toml" <<'PY'
+import re, sys
+path = sys.argv[1]
+src = open(path).read()
+new, n = re.subn(r'(?m)^(owner\s*=\s*")([^"]*)(")', lambda m: m.group(1) + (m.group(2) if m.group(2).endswith('-live-verify') else m.group(2) + '-live-verify') + m.group(3), src)
+if n == 0:
+    sys.exit("sandboxes.toml has no `owner`: set one under [blaxel] so this root gets its own orchestrator user")
+open(path, 'w').write(new)
+PY
+echo "Orchestrator user: $(grep -E '^owner' "$TEST/sandboxes.toml")"
+
 echo "Seeded $TEST"
 echo "Golden sandbox: $(grep -E '^golden' "$TEST/sandboxes.toml" || echo '(none)')"

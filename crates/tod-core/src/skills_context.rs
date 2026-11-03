@@ -31,8 +31,36 @@ use uuid::Uuid;
 pub enum Skill {
     /// Its text was found: tod's own (`path` is `None`), or a `SKILL.md`.
     Text { name: String, path: Option<String>, body: String },
+    /// The checkout lacks it but the repository's default branch has it,
+    /// read through git: `git_ref` is e.g. `origin/main`, `path` the file in
+    /// that branch.
+    FromBranch { name: String, git_ref: String, path: String, body: String },
     /// No file has it; the agent loads it by name.
     ByName(String),
+}
+
+/// What a missing skill's message says it is, so a caller that only has the
+/// error's text (the supervisor, reading a failed turn) can tell a
+/// configuration problem from the agent failing.
+pub const MISSING_MARKER: &str = "is configured but cannot be found";
+
+/// Whether `error` (any text containing a [`SkillsError::Missing`] message,
+/// however it was wrapped) is a missing skill.
+pub fn is_missing_skill(error: &str) -> bool {
+    error.contains(MISSING_MARKER)
+}
+
+/// A skill the lifecycle config names that no place has: a configuration
+/// problem for the user, never the agent's failure.
+#[derive(Debug, thiserror::Error)]
+pub enum SkillsError {
+    #[error(
+        "the skill `{name}` is configured but cannot be found: not among tod's own skills, not under \
+         `.claude/skills` in {cwd} or any directory above it, not in the home directory's \
+         `.claude/skills`, and not on the repository's default branch ({default_branch}). Add it \
+         there, fix its name in the lifecycle config, or remove it"
+    )]
+    Missing { name: String, cwd: String, default_branch: String },
 }
 
 /// The configured skill names for `phase` on `node`, nearest config first
@@ -94,20 +122,84 @@ pub fn resolve(own: &crate::skills::SkillsPaths, cwd: &Workdir, name: &str) -> R
         Workdir::Host(dir) => find_on_host(dir, home_dir().as_deref(), name)?,
         _ => find_remote(cwd, name)?,
     };
-    Ok(match found {
-        Some((path, text)) => Skill::Text {
+    if let Some((path, text)) = found {
+        return Ok(Skill::Text {
             name: name.to_string(),
             path: Some(path),
             body: strip_frontmatter(&text).trim().to_string(),
-        },
-        None if BUILT_IN.contains(&name) => Skill::ByName(name.to_string()),
-        None => anyhow::bail!(
-            "the skill `{name}` is configured but cannot be found: not among tod's own skills, not \
-             under `.claude/skills` in {} or any directory above it, and not in the home directory's \
-             `.claude/skills`. Add it there, fix its name in the lifecycle config, or remove it",
-            cwd.storage()
-        ),
-    })
+        });
+    }
+    if BUILT_IN.contains(&name) {
+        return Ok(Skill::ByName(name.to_string()));
+    }
+    // The checkout may simply be behind the branch the skill was added to.
+    let default_branch = match find_on_default_branch(cwd, name) {
+        Ok(Ok(found)) => {
+            return Ok(Skill::FromBranch {
+                name: name.to_string(),
+                git_ref: found.git_ref,
+                path: found.path,
+                body: strip_frontmatter(&found.text).trim().to_string(),
+            });
+        }
+        Ok(Err(searched)) => format!("looked in `{searched}`, which has none"),
+        Err(err) => format!("it could not be read: {err:#}"),
+    };
+    Err(SkillsError::Missing { name: name.to_string(), cwd: cwd.storage(), default_branch }.into())
+}
+
+struct OnBranch {
+    git_ref: String,
+    path: String,
+    text: String,
+}
+
+/// The skill in the repository's default branch, read through git without
+/// checking it out: `Ok(Ok(..))` when found, `Ok(Err(ref))` when the branch
+/// was read and has no such skill, `Err` when git or the branch cannot be
+/// read.
+fn find_on_default_branch(cwd: &Workdir, name: &str) -> Result<std::result::Result<OnBranch, String>> {
+    cwd.git(&["rev-parse", "--show-toplevel"])
+        .with_context(|| format!("{} is not inside a git repository whose root can be read", cwd.storage()))?;
+    let git_ref = default_branch_ref(cwd)?;
+    let listing = cwd
+        .git(&["ls-tree", "-r", "--name-only", "--full-name", &git_ref, "--", ":/.claude/skills"])
+        .with_context(|| format!("could not list `.claude/skills` on {git_ref}"))?;
+    let direct = format!(".claude/skills/{name}/SKILL.md");
+    let suffix = format!("/{name}/SKILL.md");
+    let mut files: Vec<&str> = listing.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    files.sort();
+    // Directly under `skills`, else inside a grouping folder (as on disk).
+    let path = files
+        .iter()
+        .find(|f| **f == direct)
+        .or_else(|| {
+            files.iter().find(|f| {
+                f.strip_prefix(".claude/skills/")
+                    .and_then(|rest| rest.strip_suffix(&suffix))
+                    .is_some_and(|group| !group.is_empty() && !group.contains('/'))
+            })
+        })
+        .map(|f| f.to_string());
+    let Some(path) = path else {
+        return Ok(Err(git_ref));
+    };
+    let text = cwd
+        .git(&["show", &format!("{git_ref}:{path}")])
+        .with_context(|| format!("could not read {path} from {git_ref}"))?;
+    Ok(Ok(OnBranch { git_ref, path, text }))
+}
+
+/// `origin`'s default branch (`origin/HEAD`), else `origin/main`.
+fn default_branch_ref(cwd: &Workdir) -> Result<String> {
+    if let Ok(head) = cwd.git(&["symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"])
+        && !head.is_empty()
+    {
+        return Ok(head);
+    }
+    cwd.git(&["rev-parse", "--verify", "--quiet", "origin/main^{commit}"])
+        .context("neither `origin/HEAD` nor `origin/main` exists")?;
+    Ok("origin/main".to_string())
 }
 
 /// A skill name names one folder: nothing that could leave the skills
@@ -221,7 +313,7 @@ pub fn render_skills(phase: &str, skills: &[Skill]) -> String {
     let names = skills
         .iter()
         .map(|s| match s {
-            Skill::Text { name, .. } | Skill::ByName(name) => format!("`{name}`"),
+            Skill::Text { name, .. } | Skill::FromBranch { name, .. } | Skill::ByName(name) => format!("`{name}`"),
         })
         .collect::<Vec<_>>()
         .join(", ");
@@ -244,6 +336,17 @@ pub fn render_skills(phase: &str, skills: &[Skill]) -> String {
                         "From `{path}`. Files it refers to by relative path are in `{dir}`.\n\n"
                     ));
                 }
+                out.push_str(body.trim());
+                out.push('\n');
+            }
+            Skill::FromBranch { name, git_ref, path, body } => {
+                out.push_str(&format!("\n### Skill `{name}`\n\n"));
+                out.push_str(&format!(
+                    "This checkout does not have this skill, so it is read from `{git_ref}` (`{path}`), \
+                     where the repository has it. Files it refers to by relative path are not \
+                     available from there: they are not in this checkout, so read them with \
+                     `git show {git_ref}:<path>`, or update the branch from `{git_ref}` to have them.\n\n"
+                ));
                 out.push_str(body.trim());
                 out.push('\n');
             }
@@ -342,6 +445,7 @@ mod tests {
         assert!(matches!(resolve(&own, &cwd, "simplify").unwrap(), Skill::ByName(_)));
         let err = format!("{:#}", resolve(&own, &cwd, "not-a-skill-anywhere-xyz").unwrap_err());
         assert!(err.contains("not-a-skill-anywhere-xyz") && err.contains("cannot be found"), "{err}");
+        assert!(is_missing_skill(&err), "{err}");
         assert!(resolve(&own, &cwd, "../etc").is_err());
     }
 
@@ -354,5 +458,68 @@ mod tests {
         for name in ["tod-open-pr", "tod-fix-ci"] {
             assert!(names.iter().any(|n| n == name), "{name} missing from {names:?}");
         }
+    }
+
+    fn git(dir: &Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    }
+
+    /// A branch created before the commit that added a skill still gets it:
+    /// from the default branch, named as such.
+    #[test]
+    fn a_skill_the_checkout_lacks_is_read_from_the_default_branch() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        let clone = root.path().join("clone");
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-q", "-b", "main"]);
+        std::fs::write(repo.join("a.txt"), "a").unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-qm", "first"]);
+        git(root.path(), &["clone", "-q", repo.to_str().unwrap(), clone.to_str().unwrap()]);
+        // The skill lands on main after the clone's branch was made.
+        git(&clone, &["checkout", "-q", "-b", "task/old"]);
+        let skill = repo.join(".claude/skills/steps/x");
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(skill.join("SKILL.md"), "---\nname: x\n---\n# X from main\n").unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-qm", "add skill"]);
+        git(&clone, &["fetch", "-q", "origin"]);
+        assert!(!clone.join(".claude").exists());
+
+        let own = crate::skills::SkillsPaths::from_root(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/skills"),
+        )
+        .unwrap();
+        let cwd = Workdir::host(&clone);
+        let skill = resolve(&own, &cwd, "x").unwrap();
+        let Skill::FromBranch { git_ref, path, body, .. } = &skill else {
+            panic!("expected the default branch's copy: {skill:?}");
+        };
+        assert_eq!(git_ref, "origin/main");
+        assert_eq!(path, ".claude/skills/steps/x/SKILL.md");
+        assert_eq!(body.trim(), "# X from main");
+        let block = render_skills("pr_draft", &[skill]);
+        assert!(block.contains("origin/main") && block.contains(".claude/skills/steps/x/SKILL.md"), "{block}");
+        assert!(block.contains("relative path"), "{block}");
+        assert!(!clone.join(".claude").exists(), "nothing was checked out");
+
+        // A name no branch has is the typed missing error, naming the places.
+        let err = resolve(&own, &cwd, "nope-xyz").unwrap_err();
+        assert!(matches!(err.downcast_ref::<SkillsError>(), Some(SkillsError::Missing { .. })), "{err:#}");
+        let text = format!("{err:#}");
+        assert!(text.contains("home directory") && text.contains("origin/main"), "{text}");
+
+        // Outside a repository, the error says the git root could not be read.
+        let plain = tempfile::tempdir().unwrap();
+        let err = format!("{:#}", resolve(&own, &Workdir::host(plain.path()), "nope-xyz").unwrap_err());
+        assert!(err.contains("not inside a git repository") && err.contains("home directory"), "{err}");
     }
 }

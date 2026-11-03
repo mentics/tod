@@ -50,6 +50,37 @@ pub(crate) fn problem(level: tod_problems::Level, message: &str) {
     }
 }
 
+/// How long a problem report with the same message is held back after one
+/// went out: a failure that repeats every second (the process API down) is
+/// one line a minute in the log panel, not sixty.
+const PROBLEM_REPEAT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Whether the report of `key` is due at `now`, noting it when it is.
+fn report_due(
+    seen: &mut std::collections::HashMap<String, std::time::Instant>,
+    key: &str,
+    now: std::time::Instant,
+) -> bool {
+    match seen.get(key) {
+        Some(at) if now.saturating_duration_since(*at) < PROBLEM_REPEAT => false,
+        _ => {
+            seen.insert(key.to_string(), now);
+            true
+        }
+    }
+}
+
+/// [`problem`], at most once a minute per distinct message.
+#[allow(dead_code)]
+pub(crate) fn problem_limited(level: tod_problems::Level, message: &str) {
+    static SEEN: std::sync::Mutex<Option<std::collections::HashMap<String, std::time::Instant>>> =
+        std::sync::Mutex::new(None);
+    let due = report_due(SEEN.lock().unwrap().get_or_insert_with(Default::default), message, std::time::Instant::now());
+    if due {
+        problem(level, message);
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|a| a == "--version") {
@@ -63,5 +94,23 @@ fn main() {
         let _ = args;
         eprintln!("tod-relay only runs inside a Linux sandbox");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn a_repeated_problem_is_reported_once_a_minute_per_message() {
+        let t0 = Instant::now();
+        let mut seen = Default::default();
+        assert!(report_due(&mut seen, "a", t0));
+        assert!(!report_due(&mut seen, "a", t0 + Duration::from_secs(1)));
+        assert!(!report_due(&mut seen, "a", t0 + Duration::from_secs(59)));
+        assert!(report_due(&mut seen, "b", t0 + Duration::from_secs(1)));
+        assert!(report_due(&mut seen, "a", t0 + Duration::from_secs(60)));
+        assert!(!report_due(&mut seen, "a", t0 + Duration::from_secs(61)));
     }
 }

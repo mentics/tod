@@ -175,6 +175,10 @@ struct RunnerLine {
     /// The latest word from a cloud job; an error when `cloud_failed`.
     cloud_note: Option<String>,
     cloud_failed: bool,
+    /// The node's latest supervisor stop question is answered "leave it
+    /// stopped" (`tod_core::stop_questions`): the stop the standing shows is
+    /// the user's own answer, and answering it to continue resumes the node.
+    cloud_stop_answered: bool,
 }
 
 /// What the runner line's split button offers.
@@ -190,6 +194,11 @@ enum RunnerAction {
     /// resumed. Here, or (for a node in the cloud) by its supervisor, with
     /// nothing reinstalled.
     RunFresh,
+    /// A node in the cloud stopped by the user's own "leave it stopped"
+    /// answer: answers that question to continue, and wakes its supervisor
+    /// (what Run with a new session does, offered first and named for what
+    /// the user is doing).
+    KeepGoing,
     Pause,
     StopNow,
     /// Read GitHub now instead of at the scheduled time.
@@ -216,6 +225,10 @@ enum RunnerAction {
     LeaveCloud,
     /// Delete the node's sandbox in Blaxel (a missing one is fine).
     DeleteSandbox,
+    /// [`Self::DeleteSandbox`] without the checkpoint of uncommitted work
+    /// first: for a sandbox whose checkpoint cannot run (out of disk, a
+    /// broken checkout), which would otherwise refuse to be deleted.
+    DeleteSandboxAnyway,
 }
 
 impl RunnerAction {
@@ -226,6 +239,7 @@ impl RunnerAction {
             Self::Resume => "Resume",
             Self::ResumeFreshBudget => "Resume with a fresh budget",
             Self::RunFresh => "Run with a new session",
+            Self::KeepGoing => "Keep going",
             Self::Pause => "Pause",
             Self::StopNow => "Stop now",
             Self::PollNow => "Poll now",
@@ -238,6 +252,7 @@ impl RunnerAction {
             Self::ReinstallCloud => "Reinstall and restart",
             Self::LeaveCloud => "Stop running in the cloud",
             Self::DeleteSandbox => "Delete Sandbox",
+            Self::DeleteSandboxAnyway => "Delete Sandbox without a checkpoint",
         }
     }
 }
@@ -262,7 +277,7 @@ struct RunnerActions {
 fn load_runner(
     fleet: &FleetStore,
     node_id: Uuid,
-) -> (String, Option<CloudNode>, bool, String) {
+) -> (String, Option<CloudNode>, bool, String, bool) {
     let lifecycle = fleet
         .get_node(&node_id.to_string())
         .ok()
@@ -292,7 +307,16 @@ fn load_runner(
         },
         None => "this machine".to_string(),
     };
-    (lifecycle, cloud, files_in_sandbox, place)
+    // A read that fails is not "no": the line then offers no Keep going, and
+    // the error is logged for the log panel.
+    let stop_answered = match fleet.read(|conn| tod_core::stop_questions::latest(conn, node_id)) {
+        Ok(latest) => latest.is_some_and(|l| l.answer == tod_core::stop_questions::Answer::Stop),
+        Err(err) => {
+            tracing::error!("could not read the stop question of node {node_id}: {err:#}");
+            false
+        }
+    };
+    (lifecycle, cloud, files_in_sandbox, place, stop_answered)
 }
 
 pub struct TaskPanel {
@@ -615,7 +639,7 @@ impl TaskPanel {
         let fleet = self.fleet.clone();
         let node_id = self.node_id;
         cx.spawn(async move |this, cx| {
-            let (lifecycle, cloud, files_in_sandbox, place) = cx
+            let (lifecycle, cloud, files_in_sandbox, place, stop_answered) = cx
                 .background_executor()
                 .spawn(async move { load_runner(&fleet, node_id) })
                 .await;
@@ -625,6 +649,7 @@ impl TaskPanel {
                     this.runner.cloud = cloud;
                     this.runner.files_in_sandbox = files_in_sandbox;
                     this.runner.place = place;
+                    this.runner.cloud_stop_answered = stop_answered;
                     cx.notify();
                 }
             });
@@ -752,12 +777,27 @@ impl TaskPanel {
             if self.runner.cloud_failed {
                 return RunnerActions {
                     primary: Some((A::ReinstallCloud, A::ReinstallCloud.label(), self.runner.cloud_busy)),
-                    menu: if self.runner.cloud_busy { Vec::new() } else { vec![A::RunFresh, A::SyncCloud, A::UpdateWorkspace, A::DeleteSandbox, A::LeaveCloud] },
+                    menu: if self.runner.cloud_busy { Vec::new() } else { vec![A::RunFresh, A::SyncCloud, A::UpdateWorkspace, A::DeleteSandbox, A::DeleteSandboxAnyway, A::LeaveCloud] },
+                };
+            }
+            // Stopped by its own "leave it stopped" answer: syncing re-wakes a
+            // supervisor that reads the same answer and stops again. The way
+            // on is to answer it to continue.
+            if self.runner.cloud_stop_answered
+                && matches!(&self.standing, Some(s) if matches!(s.actor, NextActor::You { why: tod_core::next_actor::YouReason::Stopped { .. }, .. }))
+            {
+                return RunnerActions {
+                    primary: Some((A::KeepGoing, A::KeepGoing.label(), self.runner.cloud_busy)),
+                    menu: if self.runner.cloud_busy {
+                        Vec::new()
+                    } else {
+                        vec![A::RunFresh, A::SyncCloud, A::ReinstallCloud, A::UpdateWorkspace, A::DeleteSandbox, A::DeleteSandboxAnyway, A::LeaveCloud]
+                    },
                 };
             }
             return RunnerActions {
                 primary: Some((A::SyncCloud, A::SyncCloud.label(), self.runner.cloud_busy)),
-                menu: if self.runner.cloud_busy { Vec::new() } else { vec![A::RunFresh, A::ReinstallCloud, A::UpdateWorkspace, A::DeleteSandbox, A::LeaveCloud] },
+                menu: if self.runner.cloud_busy { Vec::new() } else { vec![A::RunFresh, A::ReinstallCloud, A::UpdateWorkspace, A::DeleteSandbox, A::DeleteSandboxAnyway, A::LeaveCloud] },
             };
         }
         if self.runner.cloud_busy {
@@ -865,15 +905,13 @@ impl TaskPanel {
             // A node in the cloud: its supervisor starts the step in a new
             // session. (A lost sandbox is not offered this: it needs a new
             // sandbox, which starts a new session anyway.)
-            A::RunFresh if self.runner.cloud.is_some() => {
-                self.cloud_started(cx);
-                crate::views::cloud_node::fresh_session(
-                    self.fleet.clone(),
-                    node.to_string(),
-                    cx,
-                    move |this, update, cx| this.on_cloud_update(node, update, cx),
-                );
-            }
+            A::RunFresh if self.runner.cloud.is_some() => self.cloud_fresh_session(cx),
+            // Only offered to a node in the cloud; the wake records the
+            // answer to continue first (`continue_over_stop_answer`).
+            A::KeepGoing if self.runner.cloud.is_some() => self.cloud_fresh_session(cx),
+            A::KeepGoing => self.runners.update(cx, |r, cx| {
+                r.fail(node, "Keep going answers a cloud node's stop question; this node does not run in the cloud".into(), cx)
+            }),
             A::RunFresh => {
                 let root = self.fleet.paths().root().to_path_buf();
                 match tod_core::autopilot::AutopilotState::request_fresh_session(&root, node) {
@@ -922,6 +960,15 @@ impl TaskPanel {
             A::DeleteSandbox => {
                 self.cloud_started(cx);
                 crate::views::cloud_node::delete_sandbox(
+                    self.fleet.clone(),
+                    node.to_string(),
+                    cx,
+                    move |this, update, cx| this.on_cloud_update(node, update, cx),
+                );
+            }
+            A::DeleteSandboxAnyway => {
+                self.cloud_started(cx);
+                crate::views::cloud_node::delete_sandbox_anyway(
                     self.fleet.clone(),
                     node.to_string(),
                     cx,
@@ -1210,6 +1257,16 @@ impl TaskPanel {
             .into_any_element()
     }
 
+    /// Has the node's supervisor run its step in a new session (answering a
+    /// "leave it stopped" stop question to continue first), off the UI thread.
+    fn cloud_fresh_session(&mut self, cx: &mut Context<Self>) {
+        let node = self.node_id;
+        self.cloud_started(cx);
+        crate::views::cloud_node::fresh_session(self.fleet.clone(), node.to_string(), cx, move |this, update, cx| {
+            this.on_cloud_update(node, update, cx)
+        });
+    }
+
     fn cloud_started(&mut self, cx: &mut Context<Self>) {
         self.runner.cloud_busy = true;
         self.runner.cloud_note = None;
@@ -1287,7 +1344,10 @@ impl TaskPanel {
         }
         if let Some(cloud) = &self.runner.cloud {
             let mut text = format!("in the cloud (sandbox {})", cloud.sandbox);
-            if cloud.lost_at.is_some() {
+            // While the app is making the replacement the standing says
+            // working; the stale "deleted, run it" note would contradict it.
+            let replacing = standing.as_ref().is_some_and(|s| matches!(s.actor, NextActor::Working { .. }));
+            if cloud.lost_at.is_some() && !replacing {
                 // What woke it (a release, a merge) found nothing there: the
                 // orchestrator marked it, and the app makes a new one at its
                 // next sync, so a closed app leaves the node waiting for it.
@@ -1595,6 +1655,62 @@ mod tests {
         assert_eq!(header.plan_label(), "Plan 5/6");
         header.obligations_failed = 1;
         assert_eq!(header.obligations_label(), "Obligations 7 · 1 failed");
+    }
+
+    /// A cloud node the user left stopped offers Keep going first (syncing
+    /// would only wake a supervisor that stops at the same answer); one
+    /// stopped for any other reason keeps Sync now.
+    #[gpui::test]
+    fn a_cloud_node_stopped_by_the_users_answer_offers_keep_going(cx: &mut gpui::TestAppContext) {
+        use crate::views::rows::fixture::Fixture;
+        use gpui::AppContext as _;
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        use tod_core::next_actor::{NextActor, NodeStanding, YouReason};
+
+        let fixture = Fixture::new();
+        cx.update(gpui_component::init);
+        let agent: crate::interview::agent::SharedAgent =
+            Arc::new(std::sync::Mutex::new(Box::new(tod_agent::MockAgentProvider::new())));
+        let agent_runs = cx.new(|_| AgentRuns::new(fixture.store.clone(), agent));
+        let (node, fleet, runs_in) = (fixture.node_id, fixture.store.clone(), agent_runs.clone());
+        let lifecycle = cx.new(|_| LifecycleController::new(fixture.store.clone()));
+        let runners = test_runners(&fleet, &agent_runs, cx);
+        let slot = Rc::new(RefCell::new(None));
+        let slot_in = slot.clone();
+        let (_, cx) = cx.add_window_view(move |window, cx| {
+            let view = cx.new(|cx| TaskPanel::new(node, fleet, runs_in, lifecycle, runners, window, cx));
+            *slot_in.borrow_mut() = Some(view.clone());
+            gpui_component::Root::new(view, window, cx)
+        });
+        let view = slot.borrow_mut().take().unwrap();
+        cx.run_until_parked();
+        let stopped = |reason: &str| NodeStanding {
+            node_id: node,
+            actor: NextActor::You { why: YouReason::Stopped { reason: reason.into() }, since: 1 },
+            deferred: None,
+        };
+        let primary = |cx: &mut gpui::VisualTestContext, answered: bool, standing: NodeStanding| {
+            view.update(cx, |view, _| {
+                view.runner.cloud = Some(CloudNode {
+                    sandbox: "sb".into(),
+                    user: "alice".into(),
+                    accepted_at_ms: 1,
+                    lost_at: None,
+                });
+                view.runner.cloud_stop_answered = answered;
+                view.standing = Some(standing);
+            });
+            let actions = view.read_with(cx, |view, cx| view.runner_actions(None, cx));
+            (actions.primary.map(|p| p.0), actions.menu)
+        };
+        let (action, menu) = primary(cx, true, stopped("you answered the question about its budget"));
+        assert_eq!(action, Some(RunnerAction::KeepGoing));
+        assert!(menu.contains(&RunnerAction::RunFresh) && menu.contains(&RunnerAction::SyncCloud), "{menu:?}");
+        let (action, _) = primary(cx, false, stopped("the pull request needs a person"));
+        assert_eq!(action, Some(RunnerAction::SyncCloud));
+        let (action, _) = primary(cx, true, NodeStanding { actor: NextActor::Done, ..stopped("x") });
+        assert_eq!(action, Some(RunnerAction::SyncCloud));
     }
 
     /// T2: a run starting in `AgentRuns` shows on the runner line as

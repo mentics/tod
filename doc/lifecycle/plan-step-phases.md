@@ -1,6 +1,10 @@
 # Plan steps by phase, follow-up nodes, and ticket links
 
-Status: proposed.
+Status: partly built. Plan-step phases (section 1: `node_plan_steps.phase`,
+`tod-cli plan --phase`, the gates, loops, and validity rules) are built, and
+the process docs carry the follow-up rules (section 3). Ticket links by id
+(section 4) are not: `managed_node_links` and `node_fields.linked_issues` are
+still in use.
 
 ## Problem
 

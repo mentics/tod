@@ -10,6 +10,9 @@
 //!   ([`KEEP_GOING`] / [`LEAVE_STOPPED`]);
 //! - [`BUDGET`]: the autopilot spent its budget (same options; keep going
 //!   grants another budget of the same size);
+//! - [`CONFIG`]: the node's configuration cannot be used (a skill the
+//!   lifecycle config names is missing), which retrying cannot fix
+//!   ([`FIXED_TRY_AGAIN`] / [`LEAVE_STOPPED`]);
 //! - [`WATCHDOG`]: the watchdog let the node's sandbox sleep
 //!   ([`WAKE_AGAIN`] / [`LEAVE_ASLEEP`]).
 //!
@@ -30,15 +33,19 @@ use uuid::Uuid;
 pub const FAILURES: &str = "supervisor:failures";
 pub const BUDGET: &str = "supervisor:budget";
 pub const WATCHDOG: &str = "watchdog";
-pub const KINDS: [&str; 3] = [FAILURES, BUDGET, WATCHDOG];
+pub const CONFIG: &str = "supervisor:config";
+pub const KINDS: [&str; 4] = [FAILURES, BUDGET, WATCHDOG, CONFIG];
 
 pub const KEEP_GOING: &str = "Keep going";
 pub const LEAVE_STOPPED: &str = "Leave it stopped";
+pub const FIXED_TRY_AGAIN: &str = "Fixed, try again";
 pub const WAKE_AGAIN: &str = "Wake it again";
 pub const LEAVE_ASLEEP: &str = "Leave it asleep";
 
 /// The supervisor's options, in order.
 pub const SUPERVISOR_OPTIONS: [&str; 2] = [KEEP_GOING, LEAVE_STOPPED];
+/// The configuration question's options, in order.
+pub const CONFIG_OPTIONS: [&str; 2] = [FIXED_TRY_AGAIN, LEAVE_STOPPED];
 /// The watchdog's options, in order.
 pub const WATCHDOG_OPTIONS: [&str; 2] = [WAKE_AGAIN, LEAVE_ASLEEP];
 
@@ -67,6 +74,8 @@ pub struct Latest {
     /// Identifies the answer (`<decision>:<answered_at>`), so it is acted on
     /// once; `None` while pending.
     pub answer_key: Option<String>,
+    /// When it was answered (ms); `None` while pending.
+    pub answered_at: Option<i64>,
 }
 
 /// See the module docs. Withdrawn questions are skipped.
@@ -74,9 +83,9 @@ pub fn latest(conn: &Connection, node: Uuid) -> Result<Option<Latest>> {
     let id: Option<Vec<u8>> = conn
         .query_row(
             "SELECT id FROM decisions
-             WHERE node_id = ?1 AND protocol IN (?2, ?3, ?4) AND status != 'withdrawn'
+             WHERE node_id = ?1 AND protocol IN (?2, ?3, ?4, ?5) AND status != 'withdrawn'
              ORDER BY created_at DESC, rowid DESC LIMIT 1",
-            params![uuid_to_blob(node), KINDS[0], KINDS[1], KINDS[2]],
+            params![uuid_to_blob(node), KINDS[0], KINDS[1], KINDS[2], KINDS[3]],
             |r| r.get(0),
         )
         .optional()?;
@@ -88,7 +97,7 @@ pub fn latest(conn: &Connection, node: Uuid) -> Result<Option<Latest>> {
     };
     let kind = found.decision.protocol.clone().unwrap_or_default();
     let Some(last) = found.answers.iter().max_by_key(|a| (a.answered_at, a.id)) else {
-        return Ok(Some(Latest { decision: id, kind, answer: Answer::Pending, answer_key: None }));
+        return Ok(Some(Latest { decision: id, kind, answer: Answer::Pending, answer_key: None, answered_at: None }));
     };
     let chosen = last
         .option
@@ -104,7 +113,37 @@ pub fn latest(conn: &Connection, node: Uuid) -> Result<Option<Latest>> {
         kind,
         answer,
         answer_key: Some(format!("{id}:{}", last.answered_at)),
+        answered_at: Some(last.answered_at),
     }))
+}
+
+/// What a question of `kind` was about, for a sentence ("the question about
+/// its budget").
+pub fn subject(kind: &str) -> &'static str {
+    match kind {
+        FAILURES => "the agent failing several times in a row",
+        BUDGET => "its budget",
+        CONFIG => "its configuration",
+        WATCHDOG => "its sandbox being left asleep",
+        _ => "why it stopped",
+    }
+}
+
+/// Why a node whose latest question of `kind` is answered with a "leave it"
+/// option is stopped, and what continues it (the user's words for the
+/// option that does).
+pub fn left_stopped_reason(kind: &str) -> String {
+    let go = match kind {
+        CONFIG => FIXED_TRY_AGAIN,
+        WATCHDOG => WAKE_AGAIN,
+        _ => KEEP_GOING,
+    };
+    format!(
+        "you answered the question about {} with \"{}\", so it stays stopped. Answering it \"{go}\" \
+         (or Run with a new session) resumes it",
+        subject(kind),
+        if kind == WATCHDOG { LEAVE_ASLEEP } else { LEAVE_STOPPED },
+    )
 }
 
 /// The node `decision` is on, when it is

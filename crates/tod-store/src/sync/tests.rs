@@ -431,4 +431,343 @@ fn swapping_obligation_ordinals_keeps_plan_step_links() {
 
     assert_eq!(links(&a).len(), 2, "the sender kept its links");
     assert_eq!(links(&b).len(), 2, "the receiver lost links to evicted obligations");
+    let _ = std::fs::remove_dir_all(&a.root);
+    let _ = std::fs::remove_dir_all(&b.root);
+}
+
+#[test]
+fn every_synced_table_has_an_owner_rule() {
+    let (a, b) = pair();
+    let conn = a.conn();
+    for table in SYNCED_TABLES {
+        let Some(info) = table_info(&conn, table).unwrap() else {
+            continue;
+        };
+        let owner = owner_expr(table, &info.columns, "NEW", "");
+        assert_eq!(
+            owner == "NULL",
+            UNOWNED_TABLES.contains(table),
+            "{table}: give it an owner in `owner_expr`, or list it in UNOWNED_TABLES with a rule in `slice::Scope`"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&a.root);
+    let _ = std::fs::remove_dir_all(&b.root);
+}
+
+/// `root` ⟶ (`node` ⟶ `child`, `sibling`), with an obligation on each of the
+/// first three, a plan step on `node` and `sibling`, and a conversation with
+/// a turn on `node`, on `sibling`, and on the project.
+struct Tree {
+    root: Uuid,
+    node: Uuid,
+    sibling: Uuid,
+    child: Uuid,
+    node_conversation: Uuid,
+    sibling_conversation: Uuid,
+}
+
+fn create_node(side: &Side, parent: Option<Uuid>, title: &str) -> Uuid {
+    let list_id = side.fleet.list_outline_lists().unwrap()[0].id;
+    let node = Uuid::new_v4();
+    side.apply(OutlineMutation::CreateNode {
+        node_id: Some(node),
+        list_id,
+        parent_id: parent,
+        anchor_id: None,
+        position: CreatePosition::Below,
+        title: title.into(),
+    });
+    side.apply(OutlineMutation::EnableCapabilities {
+        node_id: node,
+        capabilities: vec![Capability::Spec, Capability::Lifecycle],
+    });
+    node
+}
+
+fn obligation(side: &Side, node: Uuid, body: &str) {
+    side.apply(OutlineMutation::CreateObligation {
+        obligation_id: None,
+        node_id: node,
+        kind: KIND_REQUIREMENT.into(),
+        after_id: None,
+        before: false,
+        section: None,
+        body: body.into(),
+        phase: "requirements".into(),
+    });
+}
+
+fn conversation(side: &Side, focus: crate::conversation::Focus, says: &str) -> Uuid {
+    use crate::conversation::{ConversationRepo, ProtocolKind, TurnRole};
+    let conn = side.conn();
+    let repo = ConversationRepo::new(&conn);
+    let c = repo.create(focus, ProtocolKind::Outline, None, None, None).unwrap();
+    repo.append_turn(c.id, TurnRole::User, says).unwrap();
+    c.id
+}
+
+fn tree(side: &Side) -> Tree {
+    use crate::conversation::Focus;
+    let root = create_node(side, None, "root");
+    let node = create_node(side, Some(root), "node");
+    let sibling = create_node(side, Some(root), "sibling");
+    let child = create_node(side, Some(node), "child");
+    obligation(side, root, "root constraint");
+    obligation(side, node, "node requirement");
+    obligation(side, sibling, "sibling requirement");
+    for (n, body) in [(node, "node step"), (sibling, "sibling step")] {
+        side.apply(OutlineMutation::CreatePlanStep { step_id: None, node_id: n, after_id: None, before: false, body: body.into() });
+    }
+    let node_conversation = conversation(side, Focus::Node(node), "node turn");
+    let sibling_conversation = conversation(side, Focus::Node(sibling), "sibling turn");
+    conversation(side, Focus::Project, "project turn");
+    Tree { root, node, sibling, child, node_conversation, sibling_conversation }
+}
+
+fn texts(conn: &Connection, sql: &str) -> Vec<String> {
+    let mut stmt = conn.prepare(sql).unwrap();
+    let mut out: Vec<String> = stmt.query_map([], |r| r.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap();
+    out.sort();
+    out
+}
+
+#[test]
+fn a_slice_holds_the_node_and_what_it_inherits_and_nothing_else() {
+    let (a, b) = pair();
+    let t = tree(&a);
+    let out = a.root.join("slice.db");
+    let info = slice::snapshot_slice(a.fleet.paths().db(), t.node, &out).unwrap();
+    assert_eq!(info.slice_id, format!("{}/{}", t.root, t.node));
+    assert_eq!(info.last_seq, last_seq(&a.conn()).unwrap());
+
+    let conn = Connection::open(&out).unwrap();
+    assert_eq!(texts(&conn, "SELECT title FROM nodes"), ["node", "root"]);
+    assert_eq!(texts(&conn, "SELECT body FROM node_obligations"), ["node requirement", "root constraint"]);
+    assert_eq!(texts(&conn, "SELECT body FROM node_plan_steps"), ["node step"]);
+    assert_eq!(texts(&conn, "SELECT body FROM conversation_turns"), ["node turn"]);
+    assert_eq!(texts(&conn, "SELECT slug FROM lists").len(), 1);
+    let logged: i64 = conn.query_row("SELECT COUNT(*) FROM sync_changes", [], |r| r.get(0)).unwrap();
+    assert_eq!(logged, 0, "a slice starts with an empty change log");
+    assert_eq!(slice::slice_info(&conn).unwrap(), Some(info));
+    // Its triggers are back: a write is logged.
+    conn.execute("UPDATE nodes SET title = 'renamed' WHERE id = ?1", [t.node.as_bytes().to_vec()]).unwrap();
+    assert_eq!(last_seq(&conn).unwrap(), 1);
+    let _ = (t.sibling, t.child, t.node_conversation, t.sibling_conversation);
+    let _ = std::fs::remove_dir_all(&a.root);
+    let _ = std::fs::remove_dir_all(&b.root);
+}
+
+#[test]
+fn a_slice_copies_a_row_outside_it_that_a_row_in_it_references() {
+    let (a, b) = pair();
+    let t = tree(&a);
+    // A verdict on the node's obligation, recorded in the sibling's conversation.
+    let conn = a.conn();
+    let obligation: Vec<u8> = conn
+        .query_row("SELECT id FROM node_obligations WHERE node_id = ?1", [t.node.as_bytes().to_vec()], |r| r.get(0))
+        .unwrap();
+    conn.execute(
+        "INSERT INTO obligation_verdicts (node_id, obligation_id, conversation_id, status, evidence, created_at)
+         VALUES (?1, ?2, ?3, 'verified', 'seen', 0)",
+        rusqlite::params![t.node.as_bytes().to_vec(), obligation, t.sibling_conversation.as_bytes().to_vec()],
+    )
+    .unwrap();
+    let out = a.root.join("slice.db");
+    slice::snapshot_slice(a.fleet.paths().db(), t.node, &out).unwrap();
+    let slice = Connection::open(&out).unwrap();
+    assert_eq!(texts(&slice, "SELECT evidence FROM obligation_verdicts"), ["seen"]);
+    let conversations: i64 = slice.query_row("SELECT COUNT(*) FROM conversations", [], |r| r.get(0)).unwrap();
+    assert_eq!(conversations, 2, "the node's own and the one its verdict names");
+    assert_eq!(texts(&slice, "SELECT body FROM conversation_turns"), ["node turn"], "not that one's turns");
+    let _ = std::fs::remove_dir_all(&a.root);
+    let _ = std::fs::remove_dir_all(&b.root);
+}
+
+#[test]
+fn a_scoped_feed_has_the_nodes_changes_and_its_ancestors_inherited_ones() {
+    let (a, b) = pair();
+    let t = tree(&a);
+    let after = last_seq(&a.conn()).unwrap();
+    obligation(&a, t.root, "new root constraint");
+    obligation(&a, t.node, "new node requirement");
+    obligation(&a, t.sibling, "new sibling requirement");
+    obligation(&a, t.child, "new child requirement");
+    {
+        use crate::conversation::{ConversationRepo, TurnRole};
+        let conn = a.conn();
+        let repo = ConversationRepo::new(&conn);
+        repo.append_turn(t.node_conversation, TurnRole::Agent, "node reply").unwrap();
+        repo.append_turn(t.sibling_conversation, TurnRole::Agent, "sibling reply").unwrap();
+    }
+    a.apply(OutlineMutation::CreatePlanStep { step_id: None, node_id: t.root, after_id: None, before: false, body: "root step".into() });
+
+    let conn = a.conn();
+    let scope = slice::Scope::for_node(&conn, "", t.node).unwrap();
+    let changes = export_changes_in(&conn, after, None, Some(&scope)).unwrap();
+    let bodies: Vec<String> = changes
+        .iter()
+        .filter_map(|c| match c.after.as_ref()?.get("body")? {
+            SqlValue::Text(s) => Some(s.clone()),
+            _ => None,
+        })
+        .collect();
+    for expected in ["new node requirement", "new root constraint", "node reply"] {
+        assert!(bodies.iter().any(|b| b == expected), "{expected} missing from {bodies:?}");
+    }
+    for left_out in ["new sibling requirement", "new child requirement", "sibling reply", "root step"] {
+        assert!(!bodies.iter().any(|b| b == left_out), "{left_out} in {bodies:?}");
+    }
+    let everything = export_changes(&conn, after).unwrap();
+    assert!(everything.len() > changes.len());
+    let _ = std::fs::remove_dir_all(&a.root);
+    let _ = std::fs::remove_dir_all(&b.root);
+}
+
+#[test]
+fn a_supervisors_changes_outside_its_node_are_refused() {
+    let (a, b) = pair();
+    let t = tree(&a);
+    // `b` is the orchestrator, with the same tree.
+    let changes = export_changes(&a.conn(), 0).unwrap();
+    apply_changes(&mut b.conn(), &changes).unwrap();
+
+    let after = last_seq(&a.conn()).unwrap();
+    obligation(&a, t.sibling, "written by the node's supervisor");
+    let outside = export_changes(&a.conn(), after).unwrap();
+    let err = apply_changes_confined(&mut b.conn(), &outside, "supervisor-x", t.node).unwrap_err();
+    assert!(format!("{err:#}").contains("node_obligations"), "{err:#}");
+    assert!(texts(&b.conn(), "SELECT body FROM node_obligations").iter().all(|s| s != "written by the node's supervisor"));
+
+    let after = last_seq(&a.conn()).unwrap();
+    obligation(&a, t.node, "its own");
+    obligation(&a, t.child, "under it");
+    let inside = export_changes(&a.conn(), after).unwrap();
+    apply_changes_confined(&mut b.conn(), &inside, "supervisor-x", t.node).unwrap();
+    let _ = std::fs::remove_dir_all(&a.root);
+    let _ = std::fs::remove_dir_all(&b.root);
+}
+
+/// What a node inherits reads the same from its slice as from the whole
+/// database: every resolver the supervisor (and the `pr`, `secrets` and
+/// `db` nouns) reads up the ancestor chain.
+#[test]
+fn the_resolvers_answer_the_same_on_a_slice() {
+    let (a, b) = pair();
+    let t = tree(&a);
+    a.apply(OutlineMutation::EnableCapabilities {
+        node_id: t.root,
+        capabilities: vec![Capability::Files, Capability::Agent, Capability::Environment, Capability::LifecycleConfig],
+    });
+    let out = a.root.join("slice.db");
+    slice::snapshot_slice(a.fleet.paths().db(), t.node, &out).unwrap();
+    let resolve = |conn: &Connection| -> Vec<String> {
+        let id = t.node.to_string();
+        vec![
+            format!("{:?}", crate::outline::resolve_obligations(conn, t.node, None).unwrap()),
+            format!("{:?}", crate::fleet::node_actions::resolve_files_for_node(conn, &id).unwrap()),
+            format!("{:?}", crate::fleet::node_actions::resolve_agent_for_node(conn, &id).unwrap()),
+            format!("{:?}", crate::environment::resolve(conn, t.node).unwrap()),
+            format!("{:?}", crate::lifecycle_config::resolve(conn, t.node, "implement").unwrap()),
+            format!("{:?}", crate::outline::ancestor_chain(conn, t.node).unwrap()),
+        ]
+    };
+    let whole = resolve(&a.conn());
+    assert!(whole[0].contains("root constraint"), "the fixture inherits an obligation: {}", whole[0]);
+    assert!(whole[1].starts_with("Some"), "the fixture inherits Files: {}", whole[1]);
+    assert_eq!(resolve(&Connection::open(&out).unwrap()), whole);
+    let _ = std::fs::remove_dir_all(&a.root);
+    let _ = std::fs::remove_dir_all(&b.root);
+}
+
+fn log_count(conn: &Connection) -> i64 {
+    conn.query_row("SELECT COUNT(*) FROM sync_changes", [], |r| r.get(0)).unwrap()
+}
+
+#[test]
+fn a_snapshot_leaves_the_change_log_out_but_keeps_its_numbering() {
+    let (a, b) = pair();
+    random_edit(&a, &mut Lcg(3), 0);
+    let _ = a.fleet.writer().flush();
+    assert!(log_count(&a.conn()) > 0);
+    let snap = b.root.join("again.db");
+    snapshot(a.fleet.paths().db(), &snap).unwrap();
+    let copy = Connection::open(&snap).unwrap();
+    assert_eq!(log_count(&copy), 0);
+    assert_eq!(last_seq(&copy).unwrap(), last_seq(&a.conn()).unwrap());
+    let _ = std::fs::remove_dir_all(&a.root);
+    let _ = std::fs::remove_dir_all(&b.root);
+}
+
+#[test]
+fn pruning_sent_entries_keeps_later_ones_and_the_numbering() {
+    let (a, b) = pair();
+    random_edit(&a, &mut Lcg(5), 0);
+    let _ = a.fleet.writer().flush();
+    let conn = a.conn();
+    let last = last_seq(&conn).unwrap();
+    assert!(log_count(&conn) > 0);
+    let deleted = prune_sent(&conn, last).unwrap();
+    assert!(deleted > 0);
+    assert_eq!(log_count(&conn), 0);
+    assert_eq!(last_seq(&conn).unwrap(), last, "numbering must not start over");
+    assert!(export_changes(&conn, 0).unwrap().is_empty());
+    drop(conn);
+    // A later change is numbered after it and is the only one left to send.
+    let list_id = a.fleet.list_outline_lists().unwrap()[0].id;
+    a.apply(OutlineMutation::CreateNode {
+        node_id: None,
+        list_id,
+        parent_id: None,
+        anchor_id: None,
+        position: CreatePosition::Below,
+        title: "later".into(),
+    });
+    let conn = a.conn();
+    assert!(last_seq(&conn).unwrap() > last);
+    assert!(!export_changes(&conn, last).unwrap().is_empty());
+    let _ = std::fs::remove_dir_all(&a.root);
+    let _ = std::fs::remove_dir_all(&b.root);
+}
+
+#[test]
+fn a_change_the_receiver_refuses_is_recorded_and_the_rest_apply() {
+    let (a, b) = pair();
+    let list_id = a.fleet.list_outline_lists().unwrap()[0].id;
+    for title in ["good one", "good two"] {
+        a.apply(OutlineMutation::CreateNode {
+            node_id: None,
+            list_id,
+            parent_id: None,
+            anchor_id: None,
+            position: CreatePosition::Below,
+            title: title.into(),
+        });
+    }
+    let mut changes = export_changes(&a.conn(), a.cursor).unwrap();
+    let good = changes.len();
+    assert!(good >= 2);
+    // A node row with none of the required columns: the insert is refused.
+    let mut key = Row::new();
+    key.insert("id".into(), SqlValue::Blob("00112233445566778899aabbccddeeff".into()));
+    changes.insert(
+        1,
+        Change { seq: 999, node_id: None, table: "nodes".into(), key: key.clone(), before: None, after: Some(key) },
+    );
+    let report = apply_changes_from(&mut b.conn(), &changes, "one").unwrap();
+    assert_eq!(report.rejected, 1);
+    assert_eq!(report.applied, good);
+    assert_eq!(report.reject_errors.len(), 1);
+    assert!(report.reject_errors[0].starts_with("nodes:"), "{:?}", report.reject_errors);
+    let (seq, tbl, op): (i64, String, String) = b
+        .conn()
+        .query_row("SELECT seq, tbl, op FROM sync_rejects", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .unwrap();
+    assert_eq!((seq, tbl.as_str(), op.as_str()), (999, "nodes", "insert"));
+    let titles: i64 = b
+        .conn()
+        .query_row("SELECT COUNT(*) FROM nodes WHERE title IN ('good one', 'good two')", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(titles, 2, "the rows around the bad one applied");
+    let _ = std::fs::remove_dir_all(&a.root);
+    let _ = std::fs::remove_dir_all(&b.root);
 }

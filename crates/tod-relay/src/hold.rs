@@ -16,8 +16,9 @@
 //! until a deadline, and ends there unless renewed with a later one before
 //! then — a caller that dies or hangs stops renewing, and the hold ends
 //! within its lease, never longer. The `keepAlive` process's `timeout` is set
-//! to the shortest lease still open (or `max_secs` when only lease-less
-//! reasons are open), replacing the old fixed 4-hour cap.
+//! to the longest lease still open (or `max_secs` when a lease-less reason is
+//! open), replacing the old fixed 4-hour cap. A lease that ends sooner drops
+//! out of the reasons itself, and the process is killed once none is left.
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -30,6 +31,10 @@ use std::time::{Duration, Instant};
 /// small enough that a lease reliably ends close to its deadline, large
 /// enough that the process is not restarted every tick.
 const RENEW_MARGIN: Duration = Duration::from_secs(20);
+
+/// How much later than the running process's end the wanted end must be
+/// before it is replaced.
+const RESTART_HYSTERESIS: Duration = Duration::from_secs(5);
 
 /// Pure lease/hold bookkeeping: which reasons are open and when each ends.
 /// No thread, clock, or process behind it, so it is covered directly by
@@ -117,13 +122,42 @@ impl HoldState {
     }
 
     /// The `keepAlive` process's `timeout`, in seconds, for the reasons open
-    /// right now: the shortest lease left, or `max_secs` when no lease is
-    /// open (only lease-less reasons, or none open at all). A lease longer
-    /// than `max_secs` is still capped by it.
+    /// right now: `max_secs` when a lease-less reason is open or none is,
+    /// else the *longest* lease left (capped by `max_secs`). The shortest
+    /// would make the process end, and be restarted every tick, as the
+    /// nearest lease ran out while another still needs the sandbox.
     fn timeout_secs(&self, now: Instant, max_secs: u64) -> u64 {
-        let shortest_lease =
-            self.reasons.values().filter_map(|d| *d).map(|d| d.saturating_duration_since(now).as_secs()).min();
-        shortest_lease.map(|s| s.min(max_secs)).unwrap_or(max_secs)
+        if self.reasons.values().any(|d| d.is_none()) {
+            return max_secs;
+        }
+        let longest_lease =
+            self.reasons.values().filter_map(|d| *d).map(|d| d.saturating_duration_since(now).as_secs()).max();
+        longest_lease.map(|s| s.min(max_secs)).unwrap_or(max_secs)
+    }
+}
+
+impl HoldState {
+    /// [`HoldState::timeout_secs`] in milliseconds (the restart decision
+    /// must not be rounded to a second).
+    fn timeout_ms(&self, now: Instant, max_secs: u64) -> u64 {
+        if self.reasons.values().any(|d| d.is_none()) {
+            return max_secs * 1000;
+        }
+        let longest = self.reasons.values().filter_map(|d| *d).map(|d| d.saturating_duration_since(now).as_millis() as u64).max();
+        longest.map(|m| m.min(max_secs * 1000)).unwrap_or(max_secs * 1000)
+    }
+}
+
+/// A running `keepAlive` process is replaced only when it is within
+/// `RENEW_MARGIN` of ending *and* the end now wanted is more than
+/// `RESTART_HYSTERESIS` later than its own: a clock-second of jitter in a
+/// lease's remaining time must not restart it.
+fn needs_restart(now: Instant, current_end: Option<Instant>, desired_end: Instant) -> bool {
+    match current_end {
+        None => true,
+        Some(end) => {
+            end.saturating_duration_since(now) <= RENEW_MARGIN && desired_end > end + RESTART_HYSTERESIS
+        }
     }
 }
 
@@ -207,11 +241,11 @@ impl Hold {
 /// (within `RENEW_MARGIN`) but a reason still needs more time than that.
 fn reconcile(state: &Mutex<HoldState>, current: &mut Option<(String, Instant)>, next_id: &mut u64, max_secs: u64) {
     let now = Instant::now();
-    let (empty, desired_secs) = {
+    let (empty, desired_secs, desired_ms) = {
         let mut s = state.lock().unwrap();
         s.expire(now);
         s.touch(now);
-        (s.is_empty(), s.timeout_secs(now, max_secs))
+        (s.is_empty(), s.timeout_secs(now, max_secs), s.timeout_ms(now, max_secs))
     };
     if empty {
         if let Some((name, _)) = current.take() {
@@ -220,30 +254,25 @@ fn reconcile(state: &Mutex<HoldState>, current: &mut Option<(String, Instant)>, 
         }
         return;
     }
-    let needs_restart = match current {
-        None => true,
-        Some((_, expiry)) => {
-            let remaining = expiry.saturating_duration_since(now);
-            remaining <= RENEW_MARGIN && Duration::from_secs(desired_secs) > remaining
-        }
-    };
-    if !needs_restart {
+    let desired_end = now + Duration::from_millis(desired_ms);
+    if !needs_restart(now, current.as_ref().map(|(_, e)| *e), desired_end) {
         return;
     }
-    if let Some((name, _)) = current.take() {
-        let _ = api("DELETE", &format!("/process/{name}/kill"), None);
-    }
+    // Start the replacement before killing the old process: no gap in which
+    // nothing holds the sandbox.
     *next_id += 1;
     let name = format!("tod-relay-hold-{}-{next_id}", std::process::id());
-    let body = hold_process_body(&name, desired_secs);
+    let body = hold_process_body(&name, desired_secs.max(1));
     match api("POST", "/process", Some(&body)) {
         Ok(_) => {
             log!("hold: awake ({name}, timeout {desired_secs}s)");
-            *current = Some((name, now + Duration::from_secs(desired_secs)));
+            if let Some((old, _)) = current.replace((name, desired_end)) {
+                let _ = api("DELETE", &format!("/process/{old}/kill"), None);
+            }
         }
         Err(e) => {
             log!("hold: could not start: {e}");
-            crate::problem(tod_problems::Level::Error, &format!("hold: could not start: {e}"));
+            crate::problem_limited(tod_problems::Level::Error, &format!("hold: could not start: {e}"));
         }
     }
 }
@@ -331,12 +360,12 @@ mod tests {
     }
 
     #[test]
-    fn timeout_is_the_shortest_open_lease() {
+    fn timeout_is_the_longest_open_lease() {
         let now = Instant::now();
         let mut s = HoldState::default();
         s.lease("a", now + secs(600));
         s.lease("b", now + secs(120));
-        assert_eq!(s.timeout_secs(now, 3600), 120);
+        assert_eq!(s.timeout_secs(now, 3600), 600);
     }
 
     #[test]
@@ -348,15 +377,63 @@ mod tests {
     }
 
     #[test]
-    fn mixing_lease_and_lease_less_takes_the_shorter() {
+    fn mixing_lease_and_lease_less_takes_max_secs() {
         let now = Instant::now();
         let mut s = HoldState::default();
         s.set("busy:1", true);
         s.lease("supervisor", now + secs(30));
-        assert_eq!(s.timeout_secs(now, 3600), 30);
+        assert_eq!(s.timeout_secs(now, 3600), 3600);
         s.set("busy:1", false);
-        s.set("busy:1", true);
         assert_eq!(s.timeout_secs(now, 3600), 30);
+    }
+
+    /// Two leases, the nearer one running out: the process is neither
+    /// clipped to it nor restarted as it approaches.
+    #[test]
+    fn no_restart_churn_as_the_nearest_lease_runs_out() {
+        let t0 = Instant::now();
+        let mut s = HoldState::default();
+        s.lease("a", t0 + secs(18));
+        s.lease("b", t0 + secs(100));
+        let mut end = Some(t0 + Duration::from_millis(s.timeout_ms(t0, 3600)));
+        let mut restarts = 0;
+        for tick in 1..=15u64 {
+            let now = t0 + secs(tick);
+            s.expire(now);
+            let desired_end = now + Duration::from_millis(s.timeout_ms(now, 3600));
+            if needs_restart(now, end, desired_end) {
+                restarts += 1;
+                end = Some(desired_end);
+            }
+        }
+        assert_eq!(restarts, 0);
+        assert_eq!(end, Some(t0 + secs(100)));
+    }
+
+    /// A single lease ending at its own deadline is not chased by restarts
+    /// with a one-second-smaller timeout each tick.
+    #[test]
+    fn single_lease_near_its_end_does_not_restart() {
+        let t0 = Instant::now();
+        let deadline = t0 + secs(20);
+        let end = Some(deadline);
+        for tick in 0..15u64 {
+            let now = t0 + secs(tick);
+            assert!(!needs_restart(now, end, deadline), "tick {tick}");
+        }
+    }
+
+    #[test]
+    fn a_renewal_restarts_only_near_the_end_and_past_the_hysteresis() {
+        let t0 = Instant::now();
+        let end = Some(t0 + secs(100));
+        // Far from the end: no restart even though a longer end is wanted.
+        assert!(!needs_restart(t0, end, t0 + secs(220)));
+        // Near the end, wanted end barely later: no.
+        assert!(!needs_restart(t0 + secs(85), end, t0 + secs(103)));
+        // Near the end, wanted end clearly later: yes.
+        assert!(needs_restart(t0 + secs(85), end, t0 + secs(205)));
+        assert!(needs_restart(t0, None, t0 + secs(5)));
     }
 
     #[test]

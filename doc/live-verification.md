@@ -22,6 +22,11 @@ engineer on the team would, and fixing what breaks.
    test app open the real database and daemon.
 2. `credentials_file_only: true` in `tod.yml` (both roots): never use the OS
    keyring.
+   The script also gives the root its own orchestrator user
+   (`owner = "<you>-live-verify"` in its `sandboxes.toml`): the orchestrator
+   keeps one database per user, and two roots with the same user seed over
+   each other. An existing root with the real root's owner must be changed
+   by hand the same way (then it seeds a fresh copy on the next launch).
 3. Copy `target/sandbox/*` (relay, orchestrator, Linux `tod-cli`, ...) from a
    checkout that has built them; `tod-sandbox --data-root <root> doctor` must
    be clean.
@@ -73,3 +78,13 @@ regression test, merge, rebuild, relaunch, and rerun from the failing step.
 - **Testing `tod-cli db` by hand.** A plain shell lacks `TOD_ORCHESTRATOR_CLI_URL`
   (`<orchestrator>/port/8090/cli`), `TOD_USER` and `TOD_NODE`; set all three.
 - The node's `Needs access` plan step needs **Retry** once access works.
+- **A fresh worktree has no `target/sandbox`.** The first "Run with a new session"
+  then fails naming `target/debug/sandbox/tod-relay`; build the binaries
+  (`scripts/build-sandbox-binaries.sh`) or copy `target/sandbox/*` from a checkout
+  built from the same commit (never into `target/debug/sandbox`).
+- **A node sandbox made for another orchestrator user** (the root's `owner`
+  changed after its `cloud_nodes` row was written) gets `TOD_USER` of the old
+  user: its supervisor seeds from that user's database, does not find the node
+  and exits 1, and the app waits 150 s. The app now refuses it, naming Delete
+  Sandbox. A shared orchestrator can also answer a poke with Blaxel 502s for
+  many minutes (egress proxy); redeploying the orchestrator cleared it.

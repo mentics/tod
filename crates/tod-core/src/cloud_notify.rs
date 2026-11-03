@@ -14,6 +14,12 @@
 //! in the cloud [`start`] also pulls on a timer ([`FALLBACK_POLL`]). A sync
 //! reads the orchestrator only, so polling wakes no node's sandbox.
 //!
+//! When the orchestrator's publishes are refused (ntfy answers 429) it stops
+//! publishing for a minute and says so in the feed
+//! (`notices_degraded_secs`); until then the app pulls every
+//! [`DEGRADED_POLL`], node in the cloud or not, and goes back to the
+//! subscription alone after.
+//!
 //! The server and topic come from `GET /users/<u>/notify` on the
 //! orchestrator, kept in `cloud-sync.json` (`notify`).
 
@@ -46,6 +52,45 @@ const SEEDED_CHECK: Duration = Duration::from_secs(30);
 /// How often the orchestrator is pulled from while a node runs in the
 /// cloud, whether or not a notice arrived.
 pub const FALLBACK_POLL: Duration = Duration::from_secs(20);
+/// How often it is pulled from while the orchestrator says its notices are
+/// refused ([`note_degraded`]).
+pub const DEGRADED_POLL: Duration = Duration::from_secs(5);
+
+/// Per data root, until when the orchestrator said its notices are refused.
+static DEGRADED_UNTIL: Mutex<Option<std::collections::HashMap<std::path::PathBuf, Instant>>> = Mutex::new(None);
+
+/// Records what a feed said of the notice service: `secs` left in a refusal,
+/// or `None` for publishing.
+fn note_degraded(root: &Path, secs: Option<u64>) {
+    let mut map = DEGRADED_UNTIL.lock().unwrap_or_else(|e| e.into_inner());
+    let map = map.get_or_insert_with(Default::default);
+    match secs {
+        Some(secs) => {
+            if !map.contains_key(root) {
+                tracing::warn!("cloud notices: the orchestrator's notices are refused; pulling every {}s for {secs}s", DEGRADED_POLL.as_secs());
+            }
+            map.insert(root.to_path_buf(), Instant::now() + Duration::from_secs(secs));
+        }
+        None => {
+            map.remove(root);
+        }
+    }
+}
+
+fn degraded(root: &Path) -> bool {
+    let map = DEGRADED_UNTIL.lock().unwrap_or_else(|e| e.into_inner());
+    map.as_ref().and_then(|m| m.get(root)).is_some_and(|until| *until > Instant::now())
+}
+
+/// Whether the timer pulls now: every [`DEGRADED_POLL`] while notices are
+/// refused, else every [`FALLBACK_POLL`] while a node runs in the cloud.
+fn poll_due(since_last: Duration, degraded: bool, in_cloud: impl FnOnce() -> bool) -> bool {
+    if degraded {
+        since_last >= DEGRADED_POLL
+    } else {
+        since_last >= FALLBACK_POLL && in_cloud()
+    }
+}
 
 /// Whether any node is assigned to the cloud and not lost: its supervisor may
 /// be changing it there, so the feed is worth pulling without a notice.
@@ -58,14 +103,18 @@ fn any_running_in_cloud(fleet: &FleetStore) -> bool {
         })
 }
 
-/// Pulls on a timer for as long as the app runs, while a node runs in the
-/// cloud ([`any_running_in_cloud`]), in case no notice comes.
+/// Pulls on a timer for as long as the app runs: while a node runs in the
+/// cloud ([`any_running_in_cloud`]), in case no notice comes, and faster
+/// while the orchestrator says its notices are refused.
 fn spawn_fallback_poll(fleet: Arc<FleetStore>) {
     let root = fleet.paths().root().to_path_buf();
     let spawned = std::thread::Builder::new().name("tod-cloud-poll".into()).spawn(move || {
+        let mut last = Instant::now();
         loop {
-            std::thread::sleep(FALLBACK_POLL);
-            if CloudSyncState::load(&root).is_ok_and(|s| s.seeded) && any_running_in_cloud(&fleet) {
+            std::thread::sleep(DEGRADED_POLL);
+            let due = poll_due(last.elapsed(), degraded(&root), || any_running_in_cloud(&fleet));
+            if due && CloudSyncState::load(&root).is_ok_and(|s| s.seeded) {
+                last = Instant::now();
                 runner(&fleet).request();
             }
         }
@@ -174,7 +223,13 @@ struct FailureLog {
     since_logged: u32,
     logged_at: Option<Instant>,
     total: u32,
+    escalated_at: Option<Instant>,
 }
+
+/// A run of this many failures in a row is raised to an error the user sees
+/// (and again at most each [`ESCALATION_REPEAT`]), instead of only counting.
+const ESCALATE_AFTER: u32 = 20;
+const ESCALATION_REPEAT: Duration = Duration::from_secs(60 * 60);
 
 impl FailureLog {
     /// The line to log for this failure, if it is not a repeat to hold back.
@@ -196,12 +251,29 @@ impl FailureLog {
         })
     }
 
+    /// The error to raise (toast and log) once a run of failures passes
+    /// [`ESCALATE_AFTER`], then at most hourly; call after [`Self::failed`].
+    fn escalate(&mut self, text: &str, now: Instant) -> Option<String> {
+        if self.total < ESCALATE_AFTER {
+            return None;
+        }
+        if self.escalated_at.is_some_and(|t| now.duration_since(t) < ESCALATION_REPEAT) {
+            return None;
+        }
+        self.escalated_at = Some(now);
+        Some(format!(
+            "Cloud sync has failed {} times in a row and is not syncing; last error: {text}",
+            self.total
+        ))
+    }
+
     /// The line to log when a sync works again after failures.
     fn recovered(&mut self) -> Option<String> {
         let total = std::mem::take(&mut self.total);
         self.last = None;
         self.since_logged = 0;
         self.logged_at = None;
+        self.escalated_at = None;
         (total > 0).then(|| format!("cloud sync works again after {total} failures"))
     }
 }
@@ -228,6 +300,7 @@ pub fn runner(fleet: &Arc<FleetStore>) -> Arc<Coalesced> {
                         tracing::info!("{note}");
                     }
                     tracing::info!("cloud sync: {}", report.summary());
+                    note_degraded(&root, report.notices_degraded_secs);
                     // The orchestrator found a node's sandbox gone: replace it.
                     if cloud_sync::lost::any_marked(&fleet) {
                         cloud_sync::lost::spawn_check(fleet.clone(), cloud_sync::lost::Check::Marked);
@@ -235,8 +308,18 @@ pub fn runner(fleet: &Arc<FleetStore>) -> Arc<Coalesced> {
                 }
                 Err(err) => {
                     let text = format!("{err:#}");
-                    if let Some(line) = failures.lock().unwrap_or_else(|e| e.into_inner()).failed(&text, Instant::now()) {
+                    let mut failures = failures.lock().unwrap_or_else(|e| e.into_inner());
+                    let now = Instant::now();
+                    if let Some(line) = failures.failed(&text, now) {
                         tracing::warn!("{line}");
+                    }
+                    if let Some(line) = failures.escalate(&text, now) {
+                        // An error-level entry is what raises a toast.
+                        crate::logging::buffer::record(
+                            crate::logging::buffer::Level3::Error,
+                            crate::logging::buffer::LogSource::App,
+                            line,
+                        );
                     }
                 }
             })
@@ -302,6 +385,26 @@ pub fn start(fleet: Arc<FleetStore>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_timer_is_fast_only_while_notices_are_refused() {
+        let s = Duration::from_secs;
+        assert!(!poll_due(s(5), false, || true));
+        assert!(poll_due(s(20), false, || true));
+        assert!(!poll_due(s(20), false, || false), "no node in the cloud, notices working: no timer");
+        assert!(poll_due(s(5), true, || false), "refused: pull even with no node in the cloud");
+        assert!(!poll_due(s(4), true, || true));
+    }
+
+    #[test]
+    fn a_refusal_is_remembered_until_a_feed_says_it_is_over() {
+        let root = std::path::PathBuf::from("/nowhere/degraded-test");
+        assert!(!degraded(&root));
+        note_degraded(&root, Some(60));
+        assert!(degraded(&root));
+        note_degraded(&root, None);
+        assert!(!degraded(&root));
+    }
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -388,5 +491,25 @@ mod tests {
         assert!(again.contains("still failing") && again.contains("1 since the last report"), "{again}");
         assert!(log.recovered().unwrap().contains("works again after 6 failures"));
         assert_eq!(log.recovered(), None);
+    }
+
+    #[test]
+    fn a_long_run_of_failures_escalates_once_then_hourly() {
+        let t0 = Instant::now();
+        let mut log = FailureLog::default();
+        let mut raised = Vec::new();
+        for i in 0..ESCALATE_AFTER + 30 {
+            let now = t0 + Duration::from_secs(i as u64);
+            log.failed("500", now);
+            raised.extend(log.escalate("500", now));
+        }
+        assert_eq!(raised.len(), 1, "{raised:?}");
+        assert!(raised[0].contains("20 times in a row") && raised[0].contains("500"), "{raised:?}");
+        // An hour later it is raised again, with the new count.
+        let later = t0 + Duration::from_secs(3600 + 100);
+        log.failed("500", later);
+        assert!(log.escalate("500", later).unwrap().contains("51 times"));
+        log.recovered();
+        assert_eq!(log.escalate("500", later), None);
     }
 }

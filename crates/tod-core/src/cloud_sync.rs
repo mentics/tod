@@ -287,55 +287,35 @@ pub struct CloudWork {
     pub lifecycle: String,
 }
 
-/// The cloud nodes that are working now, as far as the synced data says. The
-/// supervisor reports no heartbeat, so this is derived: a node assigned to the
-/// cloud (not lost, not `done`) is working unless it is waiting on something
-/// (`next_actor`: `Others`) or on the user (`You`, other than not started). Being assigned to the cloud alone is not work: such a node can
-/// sit idle for days. A supervisor that died mid-turn still reads as working.
+/// The cloud nodes whose supervisor is working now: those `next_actor` says
+/// are `Working`, which for a cloud node is proved only by a live heartbeat
+/// (`tod_store::cloud_activity`) the supervisor writes while its autopilot
+/// runs. A node that is assigned to the cloud but idle, stopped, waiting, or
+/// whose supervisor stopped beating is not working, whatever else is or is
+/// not recorded for it (an absent wait or request proves nothing).
 ///
 /// Reads the store's own connection, so call it off the UI thread.
 pub fn working_in_cloud(fleet: &FleetStore) -> Result<Vec<CloudWork>> {
-    let candidates = fleet.read(|conn| {
-        let rows: Vec<_> = tod_store::cloud_nodes::list(conn)?
+    let working = fleet.read(|conn| {
+        let ids: Vec<uuid::Uuid> = tod_store::cloud_nodes::list(conn)?
             .into_iter()
             .filter(|row| row.lost_at.is_none())
+            .map(|row| row.node_id)
             .collect();
-        let ids: Vec<uuid::Uuid> = rows.iter().map(|row| row.node_id).collect();
         let inputs = crate::next_actor::Inputs { now_ms: tod_store::outline::uuid_blob::now_ms(), ..Default::default() };
         let standings = crate::next_actor::for_nodes(conn, &ids, &inputs)?;
-        let mut free = Vec::new();
-        for id in ids {
-            if standings.get(&id).is_some_and(|s| blocks_cloud_work(&s.actor)) {
-                continue;
-            }
-            free.push(id);
-        }
-        Ok(free)
+        Ok(ids
+            .into_iter()
+            .filter(|id| standings.get(id).is_some_and(|s| matches!(s.actor, crate::next_actor::NextActor::Working { .. })))
+            .collect::<Vec<_>>())
     })?;
-    let mut working = Vec::new();
-    for node_id in candidates {
+    let mut out = Vec::new();
+    for node_id in working {
         let Some(node) = fleet.get_node(&node_id.to_string())? else { continue };
-        if node.lifecycle == "done" {
-            continue;
-        }
         let title = if node.title.trim().is_empty() { node.slug.clone() } else { node.title.clone() };
-        working.push(CloudWork { node_id, title, lifecycle: node.lifecycle });
+        out.push(CloudWork { node_id, title, lifecycle: node.lifecycle });
     }
-    Ok(working)
-}
-
-/// Whether a node's actor means the cloud is not the one at work: the user
-/// or someone else has to act. `NotStarted` does not: a cloud node's
-/// supervisor runs elsewhere and holds no lease here, so "nothing running"
-/// is what every cloud node looks like locally. A node with no standing (no
-/// Lifecycle) is not blocked either, as before.
-fn blocks_cloud_work(actor: &crate::next_actor::NextActor) -> bool {
-    use crate::next_actor::{NextActor, YouReason};
-    match actor {
-        NextActor::You { why: YouReason::NotStarted, .. } => false,
-        NextActor::You { .. } | NextActor::Others { .. } => true,
-        NextActor::Working { .. } | NextActor::Done => false,
-    }
+    Ok(out)
 }
 
 /// Held by every [`sync`] in this process. Background syncs (the outbox
@@ -433,6 +413,11 @@ pub struct Feed {
     pub changes: Vec<Change>,
     /// The seeding the feed follows; see [`Seeding::seed_id`].
     pub seed_id: Option<String>,
+    /// How many seconds the orchestrator's notice service has left in a
+    /// refusal (HTTP 429): no notice will arrive until then, so the app pulls
+    /// on a short timer ([`crate::cloud_notify::DEGRADED_POLL`]). `None` from
+    /// an orchestrator that is publishing, or too old to say.
+    pub notices_degraded_secs: Option<u64>,
 }
 
 /// How the app reaches the orchestrator.
@@ -457,6 +442,17 @@ pub trait Orchestrator {
 /// gateway answers 502/503/504 (pauses of 2 s, then 4 s between them).
 const GATEWAY_ATTEMPTS: u32 = 3;
 
+/// A transport error worth sending the request again for: the connection
+/// could not be made, timed out, or was reset.
+fn transient(err: &ureq::Error) -> bool {
+    use std::io::ErrorKind::*;
+    match err {
+        ureq::Error::Timeout(_) | ureq::Error::ConnectionFailed => true,
+        ureq::Error::Io(e) => matches!(e.kind(), ConnectionReset | ConnectionAborted | BrokenPipe | TimedOut | UnexpectedEof | ConnectionRefused),
+        _ => false,
+    }
+}
+
 /// The orchestrator over HTTP(S).
 pub struct HttpOrchestrator {
     base: String,
@@ -464,6 +460,10 @@ pub struct HttpOrchestrator {
     /// This app as a sync client (`X-Tod-Client`): what it sends reaches the
     /// node supervisors and never comes back to it.
     client: String,
+    /// Sends `X-Tod-Take-Over: yes` with a seed, which the orchestrator
+    /// otherwise refuses when another client made the current seeding. Set
+    /// only when the user chose to take it over.
+    take_over: bool,
     agent: ureq::Agent,
 }
 
@@ -475,12 +475,20 @@ impl HttpOrchestrator {
             .timeout_global(Some(Duration::from_secs(300)))
             .build()
             .into();
-        Self { base: base.into().trim_end_matches('/').to_string(), token, client: "app".into(), agent }
+        Self { base: base.into().trim_end_matches('/').to_string(), token, client: "app".into(), take_over: false, agent }
     }
 
     /// Names this app as the sync client `client` ([`client_id`]).
     pub fn with_client(mut self, client: impl Into<String>) -> Self {
         self.client = client.into();
+        self
+    }
+
+    /// Whether seeds carry `X-Tod-Take-Over: yes`: the user's explicit choice
+    /// to replace a database another client seeded (the UI sets this only
+    /// from that choice; see `tod_orchestrator::sync_backend::seed`).
+    pub fn with_take_over(mut self, take_over: bool) -> Self {
+        self.take_over = take_over;
         self
     }
 
@@ -511,7 +519,25 @@ impl HttpOrchestrator {
     /// knows this machine is there to answer.
     pub fn broker_next(&self, user: &str, wait_secs: u64) -> Result<Option<(u64, String, serde_json::Value)>> {
         let rest = format!("broker/next?wait={wait_secs}");
-        let v = Self::finish(self.auth(self.agent.get(&self.url(user, &rest))).call().context("orchestrator broker")?, "broker")?;
+        let timeout = Duration::from_secs(sync::BROKER_POLL_TIMEOUT_SECS.max(wait_secs + 15));
+        let url = self.url(user, &rest);
+        let mut attempt = 1;
+        let resp = loop {
+            let sent = self.auth(self.agent.get(&url)).config().timeout_global(Some(timeout)).build().call();
+            let why = match &sent {
+                Ok(resp) if matches!(resp.status().as_u16(), 502 | 503 | 504) => format!("{} from the gateway", resp.status()),
+                Err(err) if transient(err) => err.to_string(),
+                _ => break sent.context("orchestrator broker")?,
+            };
+            if attempt >= sync::BROKER_POLL_ATTEMPTS {
+                break sent.context("orchestrator broker")?;
+            }
+            let wait = Duration::from_secs(1 << attempt);
+            tracing::info!("orchestrator broker: {why}; retrying in {wait:?} (attempt {attempt} of {})", sync::BROKER_POLL_ATTEMPTS);
+            std::thread::sleep(wait);
+            attempt += 1;
+        };
+        let v = Self::finish(resp, "broker")?;
         let Some(id) = v["id"].as_u64() else { return Ok(None) };
         let node = v["node"].as_str().context("orchestrator broker: no node")?.to_string();
         Ok(Some((id, node, v["request"].clone())))
@@ -584,18 +610,28 @@ impl HttpOrchestrator {
 
 impl Orchestrator for HttpOrchestrator {
     fn seed(&self, user: &str, snapshot: &[u8]) -> Result<Seeding> {
-        // The orchestrator answers 409 while the user's store is in use.
+        // The orchestrator answers 409 while the user's store is in use; a
+        // 409 for another client's seeding is not retried.
         for attempt in 0..5 {
-            let resp = self
+            let mut req = self
                 .auth(self.agent.post(&self.url(user, "seed")))
-                .header("Content-Type", "application/octet-stream")
-                .send(snapshot)
-                .context("orchestrator seed")?;
-            if resp.status().as_u16() == 409 && attempt < 4 {
-                std::thread::sleep(Duration::from_millis(500 * (attempt + 1)));
-                continue;
+                .header("Content-Type", "application/octet-stream");
+            if self.take_over {
+                req = req.header("X-Tod-Take-Over", "yes");
             }
-            let v = Self::finish(resp, "seed")?;
+            let mut resp = req.send(snapshot).context("orchestrator seed")?;
+            if resp.status().as_u16() == 409 {
+                let body = resp.body_mut().read_to_string().unwrap_or_default();
+                if body.contains("store is in use") && attempt < 4 {
+                    std::thread::sleep(Duration::from_millis(500 * (attempt + 1)));
+                    continue;
+                }
+                bail!(
+                    "orchestrator seed: {}",
+                    tod_sandbox::blaxel::describe_failure(resp.status(), &body)
+                );
+            }
+            let v = Self::finish(resp, "seed").map_err(older_orchestrator_hint)?;
             let last_seq = v["last_seq"].as_i64().ok_or_else(|| anyhow!("orchestrator seed: no last_seq"))?;
             return Ok(Seeding { last_seq, seed_id: v["seed_id"].as_str().map(str::to_string) });
         }
@@ -614,7 +650,12 @@ impl Orchestrator for HttpOrchestrator {
         let mut v = Self::finish(resp, "feed")?;
         let last_seq = v["last_seq"].as_i64().ok_or_else(|| anyhow!("orchestrator feed: no last_seq"))?;
         let changes = serde_json::from_value(v["changes"].take())?;
-        Ok(Feed { last_seq, changes, seed_id: v["seed_id"].as_str().map(str::to_string) })
+        Ok(Feed {
+            last_seq,
+            changes,
+            seed_id: v["seed_id"].as_str().map(str::to_string),
+            notices_degraded_secs: v["notices_degraded_secs"].as_u64(),
+        })
     }
 
     fn pull_problems(
@@ -658,6 +699,8 @@ pub struct SyncReport {
     /// where they run, which the orchestrator also marks): proof that a
     /// node's supervisor, or the orchestrator for it, has been heard from.
     pub heard_from: std::collections::BTreeSet<uuid::Uuid>,
+    /// The feed's `notices_degraded_secs`; see [`Feed`].
+    pub notices_degraded_secs: Option<u64>,
 }
 
 impl SyncReport {
@@ -767,8 +810,16 @@ fn sync_once(fleet: &FleetStore, root: &Path, orch: &dyn Orchestrator, user: &st
         report.sent = outbox.len();
         report.conflicts += applied.conflicts.len();
         record_conflicts(&applied.conflicts);
+        record_rejects(&applied);
         state.sent_after = outbox.iter().map(|c| c.seq).max().unwrap_or(state.sent_after);
         state.save(root)?;
+    }
+
+    // What the orchestrator has accepted is not read again, and each entry
+    // holds a whole old row: drop them (also the ones a seeding covered).
+    let pruned = sync::prune_sent(&connect(&db)?, state.sent_after).context("prune the sent change log")?;
+    if pruned > 0 {
+        tracing::debug!(pruned, upto = state.sent_after, "cloud sync: pruned sent changes from the outbox");
     }
 
     let pulled = orch.pull(user, state.feed_after)?;
@@ -781,6 +832,7 @@ fn sync_once(fleet: &FleetStore, root: &Path, orch: &dyn Orchestrator, user: &st
         anyhow::bail!("the orchestrator's database was seeded again during this sync; the next sync takes it");
     }
     let last = pulled.last_seq;
+    report.notices_degraded_secs = pulled.notices_degraded_secs;
     let feed = pulled.changes;
     if !feed.is_empty() {
         let mut conn = connect(&db)?;
@@ -814,6 +866,35 @@ fn sync_once(fleet: &FleetStore, root: &Path, orch: &dyn Orchestrator, user: &st
         tracing::warn!("cloud sync: retiring done nodes: {err:#}");
     }
     Ok(report)
+}
+
+/// A change the orchestrator refused is skipped there (so the batch and the
+/// cursor still advance), and so the user has to be told: it is a sign the
+/// orchestrator is older than this app. Each distinct error is raised once per
+/// process, as an error (a toast) with the hint, and logged at warn level.
+fn record_rejects(applied: &sync::ApplyReport) {
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+    static SEEN: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+    if applied.rejected == 0 {
+        return;
+    }
+    for error in &applied.reject_errors {
+        let fresh = SEEN.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashSet::new).insert(error.clone());
+        if !fresh {
+            continue;
+        }
+        let hinted = format!("{:#}", older_orchestrator_hint(anyhow!("{error}")));
+        tracing::warn!(rejected = applied.rejected, "cloud sync: the orchestrator refused changes: {hinted}");
+        crate::logging::buffer::record(
+            crate::logging::buffer::Level3::Error,
+            crate::logging::buffer::LogSource::App,
+            format!(
+                "The orchestrator refused {} of this copy's changes and skipped them (they are not synced): {hinted}",
+                applied.rejected
+            ),
+        );
+    }
 }
 
 /// Logs the changes the orchestrator reported as conflicting with its copy.
@@ -1180,9 +1261,44 @@ fn claude_token_for_node(root: &Path) -> Result<Option<String>> {
     )
 }
 
+/// Why Blaxel's record of a sandbox says it can no longer run, if it does:
+/// its deployment `status` or its running `state` is a terminal one. A
+/// sandbox that expired can stay `DEPLOYED` for an hour while its `state`
+/// already says so.
+pub fn sandbox_dead_reason(info: &tod_sandbox::blaxel::SandboxInfo) -> Option<String> {
+    const DEAD: [&str; 6] = ["FAILED", "TERMINATED", "DELETING", "DELETED", "EXPIRED", "EXPIRING"];
+    let field = |what: &str, value: &str| {
+        DEAD.contains(&value.to_ascii_uppercase().as_str()).then(|| format!("sandbox {} has {what} {value}", info.name))
+    };
+    field("status", &info.status).or_else(|| info.state.as_deref().and_then(|state| field("state", state)))
+}
+
 /// Whether Blaxel's record of a sandbox says it can no longer run.
 pub fn sandbox_is_dead(info: &tod_sandbox::blaxel::SandboxInfo) -> bool {
-    matches!(info.status.to_ascii_uppercase().as_str(), "FAILED" | "TERMINATED" | "DELETING" | "DELETED")
+    sandbox_dead_reason(info).is_some()
+}
+
+/// Why a node's recorded sandbox cannot serve this app, when it was made for
+/// another orchestrator user than the one this app syncs as (the root's owner
+/// changed since): its supervisor would read that other user's database, never
+/// find the node, and exit.
+pub fn sandbox_user_reason(sandbox: &str, recorded_user: &str, user: &str) -> Option<String> {
+    (recorded_user != user).then(|| {
+        format!("sandbox {sandbox} was made for orchestrator user {recorded_user}, but this app syncs as {user}")
+    })
+}
+
+/// Why `info`'s sandbox cannot be reused, if it cannot: [`sandbox_dead_reason`],
+/// else its workload not answering after the reachability wait (Blaxel's
+/// record can say `DEPLOYED` for a sandbox that is gone).
+pub fn sandbox_unusable_reason(bx: &tod_sandbox::blaxel::Blaxel, info: &tod_sandbox::blaxel::SandboxInfo) -> Option<String> {
+    if let Some(reason) = sandbox_dead_reason(info) {
+        return Some(reason);
+    }
+    let url = info.url.as_deref()?;
+    bx.wait_reachable(url, std::time::Duration::from_secs(90))
+        .err()
+        .map(|err| format!("sandbox {} does not answer: {err:#}", info.name))
 }
 
 /// The sandbox `node_id` already has, so a cloud run reuses it instead of
@@ -1331,25 +1447,46 @@ pub fn ensure_node_sandbox(
             std::thread::sleep(Duration::from_secs(2));
         }
     }
-    if existing.as_ref().is_none_or(sandbox_is_dead) {
+    // A sandbox made for another orchestrator user would read that user's
+    // database and never find the node. It may hold the node's work, so it is
+    // not deleted here: say so, and let the user's Delete Sandbox checkpoint it.
+    if let Some(info) = &existing
+        && !sandbox_is_dead(info)
+        && let Some(why) = sandbox_user_reason(&name, info.env("TOD_USER").unwrap_or(user), user)
+    {
+        bail!("{why}; use Delete Sandbox in the task panel (it saves the work first), then run the node again");
+    }
+    // Only a sandbox made now is an empty checkout. One that was already up
+    // holds the node's own work, which a checkpoint must not be applied over.
+    let made_now = existing.as_ref().is_none_or(sandbox_is_dead);
+    // Deletes the sandbox if there is one (a failed call may or may not have
+    // made it).
+    let mut remove = || -> Result<()> {
+        if bx.get(&name)?.is_some() {
+            bx.delete(&name)?;
+        }
+        Ok(())
+    };
+    if made_now {
         match &source {
             NodeSandboxSource::Fork(golden) => {
                 progress(&format!("forking {name} from {golden}…"));
                 if let Err(err) = node::fork_golden(&bx, golden, &spec, &credentials) {
-                    // A fork that got as far as making the sandbox is not
-                    // one to keep: it may have no credentials.
-                    if bx.get(&name).ok().flatten().is_some() {
-                        let _ = bx.delete(&name);
-                    }
-                    return Err(err.context(format!("fork {name} from {golden}")));
+                    return Err(discard_failed_sandbox(err.context(format!("fork {name} from {golden}")), &name, &mut remove));
                 }
             }
             NodeSandboxSource::Image(image) => {
                 progress(&format!("creating sandbox {name} from {image}…"));
-                node::create(&bx, &spec, &credentials)?;
+                if let Err(err) = node::create(&bx, &spec, &credentials) {
+                    return Err(discard_failed_sandbox(err.context(format!("create {name} from {image}")), &name, &mut remove));
+                }
             }
         }
     }
+    // From here a sandbox made now that fails is deleted, so the next attempt
+    // makes another instead of adopting one whose proxy or checkout is bad. A
+    // sandbox is adopted as good only once the probe has passed.
+    let mut setup = || -> Result<String> {
     progress(&format!("waiting for {name}…"));
     let info = bx.wait_deployed(&name, Duration::from_secs(300))?;
     let url = info.url.clone().ok_or_else(|| anyhow!("sandbox {name} has no URL"))?;
@@ -1358,6 +1495,14 @@ pub fn ensure_node_sandbox(
     // not reachable until it has resumed; the first request would get a 502.
     progress(&format!("waking {name}…"));
     bx.wait_reachable(&url, Duration::from_secs(180)).with_context(|| format!("wake {name}"))?;
+    // A fork is "deployed" before its proxy rules and environment (replaced
+    // by a second call) are in effect; the checkout needs both.
+    progress(&format!("checking {name} can reach {repo_url}…"));
+    let delays = match (&source, made_now) {
+        (NodeSandboxSource::Fork(_), true) => node::FORK_PROBE_DELAYS,
+        _ => node::IMAGE_PROBE_DELAYS,
+    };
+    node::wait_proxy_ready(&bx, &url, node_id, &repo_url, delays, progress).with_context(|| format!("{name}"))?;
 
     // Agent Drive is not enabled yet, so the node's transcripts go to the
     // orchestrator and nothing is mounted. When it is, turn this back on:
@@ -1405,21 +1550,50 @@ pub fn ensure_node_sandbox(
     if !resp.status().is_success() {
         progress(&format!("warning: the poke got {}", resp.status()));
     }
-    let _ = sandboxes.save();
+    Ok(url)
+    };
+    if let Err(err) = setup() {
+        // A sandbox that was already up holds the node's own work: kept.
+        if !made_now {
+            return Err(err);
+        }
+        return Err(discard_failed_sandbox(err, &name, &mut remove));
+    }
+    // `sandboxes` is not saved here: nothing above changes the config except
+    // `Sandboxes::url`, which saves its own change, and writing this copy back
+    // after a 20-45 s provisioning would overwrite what other threads saved
+    // meanwhile.
     // What this sandbox now runs, so a later build of the app can tell it
     // is out of date ([`refresh`]).
     refresh::record(root, node_id, &refresh::install_stamp()?)?;
     // Work checkpointed before an earlier sandbox of this node went away
-    // comes back as uncommitted edits.
-    let checkout = sandbox_checkout(&bx, &name)?;
-    let notes = tod_store::fleet::node_checkpoint::restore_into(&checkout, node_id);
-    for restored in &notes.restored {
-        progress(restored.as_str());
-    }
-    for failure in &notes.failures {
-        progress(&format!("warning: {failure}"));
+    // comes back as uncommitted edits. A sandbox that was already up (a
+    // refresh, a node that is running) has that work in it already.
+    if made_now {
+        let checkout = sandbox_checkout(&bx, &name)?;
+        let notes = tod_store::fleet::node_checkpoint::restore_into(&checkout, node_id);
+        for restored in &notes.restored {
+            progress(restored.as_str());
+        }
+        for failure in &notes.failures {
+            progress(&format!("warning: {failure}"));
+        }
     }
     Ok(name)
+}
+
+/// What a provisioning that failed after it made `name` returns: `err`, once
+/// the sandbox is deleted (it may lack credentials or a checkout, and the next
+/// attempt would otherwise adopt it as it is). A failed delete is part of the
+/// error, never dropped. `TOD_KEEP_FAILED_SANDBOX` keeps it for inspection.
+fn discard_failed_sandbox(err: anyhow::Error, name: &str, delete: &mut dyn FnMut() -> Result<()>) -> anyhow::Error {
+    if std::env::var_os("TOD_KEEP_FAILED_SANDBOX").is_some() {
+        return err.context(format!("{name} was kept (TOD_KEEP_FAILED_SANDBOX)"));
+    }
+    match delete() {
+        Ok(()) => err.context(format!("{name} was deleted so the next attempt makes a new one")),
+        Err(del) => err.context(format!("{name} could not be deleted either ({del:#}); delete it before trying again")),
+    }
 }
 
 /// Where a node's sandbox comes from: configured on the node or the nearest
@@ -1662,7 +1836,11 @@ fn wait_for_supervisor(
 /// it up to date. Any other error passes through unchanged.
 fn older_orchestrator_hint(err: anyhow::Error) -> anyhow::Error {
     let text = format!("{err:#}");
-    if text.contains("CHECK constraint failed") || text.contains("no such column") || text.contains("no such table") {
+    if text.contains("CHECK constraint failed")
+        || text.contains("no such column")
+        || text.contains("no such table")
+        || text.contains("newer than this orchestrator supports")
+    {
         return err.context(
             "the orchestrator is older than this app and does not accept what it wrote; \
              update it with `scripts/build-sandbox-binaries.sh` then `tod-sandbox orchestrator`",
@@ -1718,18 +1896,33 @@ pub fn wake_node(fleet: &FleetStore, root: &Path, node_id: &str) -> Result<Strin
 pub fn wake_node_with(fleet: &FleetStore, root: &Path, node_id: &str, fresh_session: bool) -> Result<String> {
     let row = cloud_node(fleet, node_id).ok_or_else(|| anyhow!("this node does not run in the cloud"))?;
     let (orch, user) = resolve(root)?;
+    // Before the sync, so the answer travels with it: a supervisor that
+    // reads "left stopped" would ignore the request.
+    if fresh_session {
+        continue_over_stop_answer(fleet, node_id)?;
+    }
     sync(fleet, root, &orch, &user).context("send the change to the orchestrator")?;
     let sandboxes = tod_store::fleet::sandbox::Sandboxes::load(root)?;
     let bx = sandboxes.blaxel()?;
     // A sandbox that is gone (deleted or reclaimed since the last look) is
     // replaced the way the lost-sandbox check does, then woken.
-    let (row, info, replaced) = match bx.get(&row.sandbox)? {
-        Some(info) if !sandbox_is_dead(&info) => (row, info, None),
+    let found = bx.get(&row.sandbox)?;
+    // A sandbox in standby answers 502/503/504 and Blaxel's own 404 "workload
+    // is not ready" for up to ~30s after waking: every upload below waits it
+    // out, and one that never answers is replaced rather than reused.
+    let made_for = found.as_ref().and_then(|info| info.env("TOD_USER")).unwrap_or(&row.user);
+    let unusable = sandbox_user_reason(&row.sandbox, made_for, &user)
+        .or_else(|| found.as_ref().and_then(|info| sandbox_unusable_reason(&bx, info)));
+    if let Some(reason) = &unusable {
+        tracing::warn!("cloud: {reason}; replacing it");
+    }
+    let (row, info, replaced) = match found {
+        Some(info) if unusable.is_none() => (row, info, None),
         _ => {
             let gone = row.sandbox.clone();
             let mut progress = |msg: &str| log_progress(&format!("replacing {gone}"), msg);
-            let node = ensure_node_sandbox(fleet, root, node_id, &row.user, &mut progress)
-                .and_then(|name| record_cloud_node(fleet, node_id, name, &row.user))
+            let node = ensure_node_sandbox(fleet, root, node_id, &user, &mut progress)
+                .and_then(|name| record_cloud_node(fleet, node_id, name, &user))
                 .with_context(|| format!("sandbox {gone} is gone, and replacing it failed"))?;
             let info = bx
                 .get(&node.sandbox)?
@@ -1763,6 +1956,46 @@ pub fn wake_node_with(fleet: &FleetStore, root: &Path, node_id: &str, fresh_sess
         Some(gone) => format!("replaced the missing sandbox {gone} with {} and woke its supervisor", row.sandbox),
         None => format!("woke the supervisor in {}", row.sandbox),
     })
+}
+
+/// The actor of the answer [`continue_over_stop_answer`] records.
+pub const RUN_REQUEST_ACTOR: &str = "app:run-with-a-new-session";
+
+/// The user asked to run the node ("Run with a new session"): if its latest
+/// stop question (`crate::stop_questions`) is answered to leave it stopped,
+/// that is answered again to continue, so the supervisor does not read the
+/// old answer and go back to sleep. Answers are append-only, so the earlier
+/// one stays in the log. Returns the decision answered, if any.
+pub fn continue_over_stop_answer(fleet: &FleetStore, node_id: &str) -> Result<Option<uuid::Uuid>> {
+    use crate::stop_questions::{self, Answer};
+    let node = uuid::Uuid::parse_str(node_id).with_context(|| format!("node id {node_id}"))?;
+    let Some(latest) = fleet.read(|conn| stop_questions::latest(conn, node))? else {
+        return Ok(None);
+    };
+    if latest.answer != Answer::Stop {
+        return Ok(None);
+    }
+    let decision = fleet
+        .read(|conn| tod_store::decisions::DecisionRepo::new(conn).get(latest.decision))?
+        .ok_or_else(|| anyhow!("stop question {} not found", latest.decision))?;
+    let option = decision
+        .options
+        .iter()
+        .position(|o| {
+            o == stop_questions::KEEP_GOING || o == stop_questions::WAKE_AGAIN || o == stop_questions::FIXED_TRY_AGAIN
+        })
+        .ok_or_else(|| anyhow!("stop question {} has no option to continue", latest.decision))?;
+    fleet
+        .interview(
+            RUN_REQUEST_ACTOR,
+            tod_store::interview::InterviewCommand::AnswerDecision {
+                decision_id: latest.decision,
+                option: Some(option as i64 + 1),
+                text: None,
+            },
+        )
+        .map_err(|e| anyhow!("answer the stop question {} to continue: {e}", latest.decision))?;
+    Ok(Some(latest.decision))
 }
 
 pub mod lost;
