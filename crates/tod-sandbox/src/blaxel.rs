@@ -95,6 +95,16 @@ fn failure_error(what: &str, status: ureq::http::StatusCode, body: &str) -> anyh
     anyhow::anyhow!("{what}: {}", describe_failure(status, body))
 }
 
+/// Removes what tod leaves behind and package caches, from known paths only:
+/// half-uploaded parts and staging files, an interrupted seed, and caches. A
+/// tool that is not installed is not an error.
+pub const DISK_CLEANUP_SCRIPT: &str = "rm -f /opt/tod/*.part* /opt/tod/*.new /opt/tod/bin/*.part* /opt/tod/bin/*.new /var/lib/tod-supervisor/*/seed-incoming.db; \
+rm -rf /root/.cache/pip /var/cache/apt/archives/*.deb /root/.npm/_cacache; \
+if command -v npm >/dev/null 2>&1; then npm cache clean --force >/dev/null 2>&1; fi; \
+if command -v pnpm >/dev/null 2>&1; then pnpm store prune >/dev/null 2>&1; fi; \
+if command -v journalctl >/dev/null 2>&1; then journalctl --vacuum-size=50M >/dev/null 2>&1; fi; \
+true";
+
 /// The free space in KB `df -Pk` reports on its last line.
 pub fn parse_df_available_kb(output: &str) -> Option<u64> {
     output.lines().rev().find(|l| !l.trim().is_empty())?.split_whitespace().nth(3)?.parse().ok()
@@ -801,6 +811,41 @@ impl Blaxel {
         Ok(())
     }
 
+    /// [`Self::require_free_space`] that first cleans what tod itself leaves
+    /// behind ([`DISK_CLEANUP_SCRIPT`]) when the disk is short, and fails, with
+    /// what is using the disk, only if it is still short. Run before every
+    /// install, wake and checkpoint: a full disk must be a named error here,
+    /// never a truncated manifest or an install loop later.
+    pub fn ensure_free_space(&self, url: &str, path: &str, needed: u64, label: &str) -> Result<()> {
+        let free = self.free_space(url, path)?;
+        if free >= needed {
+            return Ok(());
+        }
+        tracing::warn!(
+            "sandbox {label}: {} MB free on {path}, {} MB needed; cleaning its caches and leftovers",
+            free / (1024 * 1024),
+            needed.div_ceil(1024 * 1024)
+        );
+        let cleaned = self.run(url, DISK_CLEANUP_SCRIPT, 120)?;
+        if cleaned.exit_code != 0 {
+            bail!("cleaning sandbox {label}'s disk failed: {}", cleaned.output().trim());
+        }
+        let after = self.free_space(url, path)?;
+        if after >= needed {
+            tracing::info!("sandbox {label}: cleaning freed {} MB on {path}", after.saturating_sub(free) / (1024 * 1024));
+            return Ok(());
+        }
+        let largest = match self.run(url, "du -xk -d1 / 2>/dev/null | sort -rn | head -6; true", 60) {
+            Ok(res) => res.output().trim().replace('\n', "; "),
+            Err(err) => format!("(could not list it: {err:#})"),
+        };
+        bail!(
+            "sandbox disk full: {label} has {} MB free on {path} after cleaning, {} MB needed; largest (KB): {largest}",
+            after / (1024 * 1024),
+            needed.div_ceil(1024 * 1024)
+        )
+    }
+
     /// Writes a file of any size: in parts of at most 4 MB (the filesystem
     /// API takes at most 5 MB per call), joined into a staging file, which is
     /// then renamed over `path`, so a binary that is running can be replaced.
@@ -1305,5 +1350,48 @@ mod http_tests {
         assert!(format!("{err:#}").contains("no space left"), "{err:#}");
         let rm = removed.lock().unwrap().clone();
         assert!(rm.contains(".part0000") && rm.contains(".part0001"), "{rm}");
+    }
+
+    const LOW_DF: &str = "Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/x 100000 99000 1000 99% /\n";
+    const ROOMY_DF: &str = "Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/x 900000 1000 899000 1% /\n";
+
+    #[test]
+    fn a_short_disk_is_cleaned_and_then_passes_when_that_frees_enough() {
+        let cleaned = Arc::new(Mutex::new(false));
+        let c = cleaned.clone();
+        let (url, _) = stub(move |_, _, body| {
+            if body.contains("df -Pk") {
+                (200, process_reply(0, if *c.lock().unwrap() { ROOMY_DF } else { LOW_DF }))
+            } else {
+                if body.contains("seed-incoming.db") {
+                    *c.lock().unwrap() = true;
+                }
+                (200, process_reply(0, ""))
+            }
+        });
+        client().ensure_free_space(&url, "/", 100 * 1024 * 1024, "s").unwrap();
+        assert!(*cleaned.lock().unwrap());
+    }
+
+    #[test]
+    fn a_disk_still_short_after_cleaning_is_a_named_error_with_what_uses_it() {
+        let (url, _) = stub(|_, _, body| {
+            if body.contains("df -Pk") {
+                (200, process_reply(0, LOW_DF))
+            } else if body.contains("du -xk") {
+                (200, process_reply(0, "99000\t/\n80000\t/workspace\n"))
+            } else {
+                (200, process_reply(0, ""))
+            }
+        });
+        let err = format!("{:#}", client().ensure_free_space(&url, "/", 100 * 1024 * 1024, "s").unwrap_err());
+        assert!(err.contains("sandbox disk full") && err.contains("/workspace"), "{err}");
+    }
+
+    #[test]
+    fn a_disk_with_room_is_not_cleaned() {
+        let (url, log) = stub(|_, _, _| (200, process_reply(0, ROOMY_DF)));
+        client().ensure_free_space(&url, "/", 1024, "s").unwrap();
+        assert_eq!(log.lock().unwrap().len(), 1);
     }
 }
