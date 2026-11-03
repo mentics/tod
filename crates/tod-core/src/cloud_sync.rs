@@ -1737,6 +1737,11 @@ pub fn wake_node(fleet: &FleetStore, root: &Path, node_id: &str) -> Result<Strin
 pub fn wake_node_with(fleet: &FleetStore, root: &Path, node_id: &str, fresh_session: bool) -> Result<String> {
     let row = cloud_node(fleet, node_id).ok_or_else(|| anyhow!("this node does not run in the cloud"))?;
     let (orch, user) = resolve(root)?;
+    // Before the sync, so the answer travels with it: a supervisor that
+    // reads "left stopped" would ignore the request.
+    if fresh_session {
+        continue_over_stop_answer(fleet, node_id)?;
+    }
     sync(fleet, root, &orch, &user).context("send the change to the orchestrator")?;
     let sandboxes = tod_store::fleet::sandbox::Sandboxes::load(root)?;
     let bx = sandboxes.blaxel()?;
@@ -1782,6 +1787,44 @@ pub fn wake_node_with(fleet: &FleetStore, root: &Path, node_id: &str, fresh_sess
         Some(gone) => format!("replaced the missing sandbox {gone} with {} and woke its supervisor", row.sandbox),
         None => format!("woke the supervisor in {}", row.sandbox),
     })
+}
+
+/// The actor of the answer [`continue_over_stop_answer`] records.
+pub const RUN_REQUEST_ACTOR: &str = "app:run-with-a-new-session";
+
+/// The user asked to run the node ("Run with a new session"): if its latest
+/// stop question (`crate::stop_questions`) is answered to leave it stopped,
+/// that is answered again to continue, so the supervisor does not read the
+/// old answer and go back to sleep. Answers are append-only, so the earlier
+/// one stays in the log. Returns the decision answered, if any.
+pub fn continue_over_stop_answer(fleet: &FleetStore, node_id: &str) -> Result<Option<uuid::Uuid>> {
+    use crate::stop_questions::{self, Answer};
+    let node = uuid::Uuid::parse_str(node_id).with_context(|| format!("node id {node_id}"))?;
+    let Some(latest) = fleet.read(|conn| stop_questions::latest(conn, node))? else {
+        return Ok(None);
+    };
+    if latest.answer != Answer::Stop {
+        return Ok(None);
+    }
+    let decision = fleet
+        .read(|conn| tod_store::decisions::DecisionRepo::new(conn).get(latest.decision))?
+        .ok_or_else(|| anyhow!("stop question {} not found", latest.decision))?;
+    let option = decision
+        .options
+        .iter()
+        .position(|o| o == stop_questions::KEEP_GOING || o == stop_questions::WAKE_AGAIN)
+        .ok_or_else(|| anyhow!("stop question {} has no option to continue", latest.decision))?;
+    fleet
+        .interview(
+            RUN_REQUEST_ACTOR,
+            tod_store::interview::InterviewCommand::AnswerDecision {
+                decision_id: latest.decision,
+                option: Some(option as i64 + 1),
+                text: None,
+            },
+        )
+        .map_err(|e| anyhow!("answer the stop question {} to continue: {e}", latest.decision))?;
+    Ok(Some(latest.decision))
 }
 
 pub mod lost;

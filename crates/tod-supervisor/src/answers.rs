@@ -37,8 +37,14 @@ fn path(state_dir: &Path) -> PathBuf {
     state_dir.join(FILE)
 }
 
-fn load(state_dir: &Path) -> Acted {
-    std::fs::read(path(state_dir)).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
+fn load(state_dir: &Path) -> Result<Acted> {
+    let file = path(state_dir);
+    match std::fs::read(&file) {
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .map_err(|e| anyhow::anyhow!("{} is not readable ({e}); fix or remove it", file.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Acted::default()),
+        Err(e) => Err(anyhow::anyhow!("read {}: {e}", file.display())),
+    }
 }
 
 fn save(state_dir: &Path, acted: &Acted) -> Result<()> {
@@ -67,10 +73,31 @@ fn granted(budget: Budget, grants: u32) -> Budget {
 
 /// See the module docs.
 pub fn before_wake(fleet: &FleetStore, node: Uuid, state_dir: &Path, budget: Budget) -> Result<Before> {
+    before_wake_with(fleet, node, state_dir, budget, false)
+}
+
+/// [`before_wake`]; with `run_requested` (the user asked to run the node, a
+/// request for a new session) an answer to leave it stopped is read as an
+/// answer to continue, once: it is recorded as handled (granting another
+/// budget after the budget ran out, as a continue answer does), so the next
+/// wake does not go back to leaving it stopped. The caller finds the request;
+/// this module reads no file but its own.
+pub fn before_wake_with(
+    fleet: &FleetStore,
+    node: Uuid,
+    state_dir: &Path,
+    budget: Budget,
+    run_requested: bool,
+) -> Result<Before> {
     let latest = fleet.read(|conn| stop_questions::latest(conn, node))?;
-    let mut acted = load(state_dir);
+    let mut acted = load(state_dir)?;
     if let Some(latest) = latest {
-        match latest.answer {
+        let mut answer = latest.answer;
+        if answer == Answer::Stop && run_requested {
+            tracing::info!(kind = %latest.kind, "a request to run overrode the answer to leave it stopped");
+            answer = Answer::Continue;
+        }
+        match answer {
             Answer::Stop => {
                 return Ok(Before::LeaveStopped(format!("the user left it stopped ({})", latest.kind)));
             }
