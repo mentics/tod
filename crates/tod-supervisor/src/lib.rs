@@ -302,6 +302,10 @@ pub fn wake(config: Config) -> Result<Woke> {
 
     let budget = match answers::before_wake(&store, config.node, &config.state_dir, config.budget)? {
         answers::Before::LeaveStopped(reason) => {
+            // Say so, as a wait does below: the app waits to hear from a
+            // supervisor it woke, and a wake that leaves the node stopped is
+            // an answer, not silence.
+            replica.lock().unwrap_or_else(|e| e.into_inner()).end_cloud_beat(config.node)?;
             tracing::info!(%reason, "left stopped; going back to sleep");
             return Ok(Woke::LeftStopped(reason));
         }
