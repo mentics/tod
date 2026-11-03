@@ -426,10 +426,19 @@ pub fn wake(config: Config) -> Result<Woke> {
         return Ok(Woke::StillWaiting(reason));
     }
 
-    // A wake still scheduled (its wait was satisfied some other way, e.g.
-    // by a webhook) would only poke later; drop it now.
+    // Never a window with no wake: replace the wait's schedule (satisfied
+    // some other way, e.g. by a webhook, it would only poke later) with a
+    // retry wake before any work. An orderly end replaces it with the wake
+    // the node's waits need or drops it; an error out of here leaves it (and
+    // `main` replaces it with a backoff retry), so the node is never stranded.
     if let Some(scheduler) = &config.scheduler {
-        waits::cancel_scheduled(scheduler.as_ref(), &config.state_dir)?;
+        waits::arm_retry(
+            scheduler.as_ref(),
+            config.node,
+            &config.sandbox,
+            &config.state_dir,
+            waits_now_ms() + waits::DEAD_MAN_MS,
+        )?;
     }
     let follow = match &config.transcripts {
         Some((projects, sink)) => {
@@ -461,8 +470,11 @@ pub fn wake(config: Config) -> Result<Woke> {
     );
     // Consecutive failed runs, and the steps finished at the last one: a
     // step finished since then means the failures were not in a row.
-    let mut failures = 0u32;
+    // Persisted: the backoff is a wait the node sleeps through, so the next
+    // wake carries on counting.
+    let mut failures = waits::load_count(&config.state_dir, waits::AGENT_FAILURES_FILE);
     let mut steps_at_failure = 0usize;
+    let mut backing_off = false;
     let mut hook = Hook {
         replica: &replica,
         node: config.node,
@@ -526,15 +538,24 @@ pub fn wake(config: Config) -> Result<Woke> {
                         }
                         failures += 1;
                         steps_at_failure = done;
+                        waits::save_count(&config.state_dir, waits::AGENT_FAILURES_FILE, failures)?;
                         match guard::on_failure(error, failures, &config.guards, waits_now_ms()) {
                             OnFailure::UsageLimit(limit) => {
                                 usage_limit::record(&store, config.node, &limit)?;
                                 tracing::info!(reset_at = limit.reset_at_ms, parsed = limit.parsed, "usage limit reached");
                                 break Ok(Outcome::Stopped { reason: usage_limit_reason(&limit) });
                             }
-                            OnFailure::Retry => {
-                                tracing::warn!(failures, %error, "the agent failed; running the step again");
-                                continue;
+                            OnFailure::Backoff { until_ms } => {
+                                // An `until` wait, as for a usage limit: the node
+                                // sleeps and the wake it schedules runs the step again.
+                                waits::record_until(&store, config.node, until_ms)?;
+                                backing_off = true;
+                                tracing::warn!(failures, %error, until_ms, "the agent failed; running the step again later");
+                                break Ok(Outcome::Stopped {
+                                    reason: format!(
+                                        "waiting: the agent failed ({failures} in a row), trying again at {until_ms}: {error}"
+                                    ),
+                                });
                             }
                             OnFailure::Config => unreachable!("a missing skill is handled before counting"),
                             OnFailure::Ask => {
@@ -587,8 +608,14 @@ pub fn wake(config: Config) -> Result<Woke> {
     pushed?;
     ended?;
     tracing::info!(?outcome, "autopilot stopped");
+    if !backing_off {
+        waits::save_count(&config.state_dir, waits::AGENT_FAILURES_FILE, 0)?;
+    }
     if matches!(outcome, Outcome::Stopped { .. } | Outcome::Waiting { .. }) {
         schedule(&store, &config)?;
+    } else if let Some(scheduler) = &config.scheduler {
+        // An orderly end that needs no wake: clear the retry.
+        waits::cancel_scheduled(scheduler.as_ref(), &config.state_dir)?;
     }
     drop(agent);
     drop(hold);

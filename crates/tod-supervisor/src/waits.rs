@@ -192,6 +192,84 @@ pub fn reconcile_wake(
     Ok(next)
 }
 
+/// How long after a wake began its dead-man retry fires if nothing replaced
+/// it: the run is still going then (a poke of a running supervisor is
+/// harmless) or it died, and this wake is what finds out.
+pub const DEAD_MAN_MS: i64 = 10 * 60 * 1000;
+
+/// The first failure's backoff, and the longest.
+const BACKOFF_FIRST_MS: i64 = 60_000;
+const BACKOFF_MAX_MS: i64 = 30 * 60_000;
+
+/// How long to wait after the `failures`-th consecutive failure (1 for the
+/// first): a minute, doubling, at most half an hour.
+pub fn backoff_ms(failures: u32) -> i64 {
+    let doublings = failures.saturating_sub(1).min(16);
+    (BACKOFF_FIRST_MS << doublings).min(BACKOFF_MAX_MS)
+}
+
+/// Replaces whatever wake is scheduled with a retry wake at `at_ms`, under
+/// the node's own id (a wait's id names a wait's wake). Run before work, so
+/// that no window exists in which nothing would wake the node; an orderly
+/// end replaces it with the real one (`reconcile_wake`) or drops it
+/// (`cancel_scheduled`). A failure to schedule is returned.
+pub fn arm_retry(scheduler: &dyn Scheduler, node: Uuid, sandbox: &str, state_dir: &Path, at_ms: i64) -> Result<()> {
+    scheduler.schedule(node, sandbox, at_ms).context("scheduling the retry wake")?;
+    if let Some(old) = load_scheduled(state_dir).filter(|old| *old != node) {
+        match scheduler.cancel(old) {
+            Ok(()) => tracing::info!(wait = %old, "replaced wake cancelled"),
+            Err(err) => tracing::warn!(wait = %old, "cancelling a replaced wake: {err:#}"),
+        }
+    }
+    save_scheduled(state_dir, Some(node))?;
+    tracing::info!(at = at_ms, "retry wake scheduled");
+    Ok(())
+}
+
+/// File counting consecutive wakes that ended in an error.
+pub const WAKE_ERRORS_FILE: &str = "wake-errors";
+/// File counting consecutive failed agent runs, across wakes.
+pub const AGENT_FAILURES_FILE: &str = "agent-failures";
+
+pub fn load_count(state_dir: &Path, file: &str) -> u32 {
+    std::fs::read_to_string(state_dir.join(file)).ok().and_then(|s| s.trim().parse().ok()).unwrap_or(0)
+}
+
+pub fn save_count(state_dir: &Path, file: &str, n: u32) -> Result<()> {
+    let path = state_dir.join(file);
+    if n == 0 {
+        return match std::fs::remove_file(&path) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                Err(e).with_context(|| format!("remove {}", path.display()))
+            }
+            _ => Ok(()),
+        };
+    }
+    std::fs::create_dir_all(state_dir).with_context(|| format!("create {}", state_dir.display()))?;
+    std::fs::write(&path, n.to_string()).with_context(|| format!("write {}", path.display()))
+}
+
+/// A wake ended in an error: schedules its retry with backoff (growing
+/// with consecutive errors) through `scheduler`. Returns the time.
+pub fn retry_after_error(
+    scheduler: &dyn Scheduler,
+    node: Uuid,
+    sandbox: &str,
+    state_dir: &Path,
+    now_ms: i64,
+) -> Result<i64> {
+    let errors = load_count(state_dir, WAKE_ERRORS_FILE) + 1;
+    let at = now_ms + backoff_ms(errors);
+    arm_retry(scheduler, node, sandbox, state_dir, at)?;
+    save_count(state_dir, WAKE_ERRORS_FILE, errors)?;
+    Ok(at)
+}
+
+/// Records an `until` wait on `node`: the node sleeps until then.
+pub fn record_until(fleet: &FleetStore, node: Uuid, at_ms: i64) -> Result<()> {
+    run(fleet, InterviewCommand::RecordWait { node_id: node, wait: tod_store::waits::NewWait::until(at_ms) })
+}
+
 /// Cancels the wake scheduled for this node, if any: it has work now, and
 /// will schedule what it needs when it stops.
 pub fn cancel_scheduled(scheduler: &dyn Scheduler, state_dir: &Path) -> Result<()> {
@@ -203,4 +281,77 @@ pub fn cancel_scheduled(scheduler: &dyn Scheduler, state_dir: &Path) -> Result<(
         save_scheduled(state_dir, None)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    struct TmpDir(std::path::PathBuf);
+    impl TmpDir {
+        fn new() -> Self {
+            let p = std::env::temp_dir().join(format!("tod-waits-test-{}", Uuid::new_v4()));
+            std::fs::create_dir_all(&p).unwrap();
+            Self(p)
+        }
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+    impl Drop for TmpDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[derive(Default)]
+    struct Fake {
+        calls: Mutex<Vec<(Uuid, i64)>>,
+        cancels: Mutex<Vec<Uuid>>,
+    }
+    impl Scheduler for Fake {
+        fn schedule(&self, id: Uuid, _: &str, at: i64) -> Result<()> {
+            self.calls.lock().unwrap().push((id, at));
+            Ok(())
+        }
+        fn cancel(&self, id: Uuid) -> Result<()> {
+            self.cancels.lock().unwrap().push(id);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn backoff_grows_and_is_capped() {
+        assert_eq!(backoff_ms(1), 60_000);
+        assert_eq!(backoff_ms(2), 120_000);
+        assert_eq!(backoff_ms(3), 240_000);
+        assert_eq!(backoff_ms(40), 30 * 60_000);
+    }
+
+    #[test]
+    fn an_error_leaves_a_retry_schedule_that_backs_off_further_each_time() {
+        let dir = TmpDir::new();
+        let node = Uuid::new_v4();
+        let old = Uuid::new_v4();
+        save_scheduled(dir.path(), Some(old)).unwrap();
+        let fake = Fake::default();
+        assert_eq!(retry_after_error(&fake, node, "sb", dir.path(), 1_000).unwrap(), 61_000);
+        assert_eq!(retry_after_error(&fake, node, "sb", dir.path(), 1_000).unwrap(), 121_000);
+        assert_eq!(*fake.calls.lock().unwrap(), vec![(node, 61_000), (node, 121_000)]);
+        // The wait's wake it replaced is cancelled, once; the retry is on record.
+        assert_eq!(*fake.cancels.lock().unwrap(), vec![old]);
+        assert_eq!(load_scheduled(dir.path()), Some(node));
+    }
+
+    #[test]
+    fn an_orderly_end_clears_the_retry() {
+        let dir = TmpDir::new();
+        let node = Uuid::new_v4();
+        let fake = Fake::default();
+        arm_retry(&fake, node, "sb", dir.path(), 5).unwrap();
+        cancel_scheduled(&fake, dir.path()).unwrap();
+        assert_eq!(*fake.cancels.lock().unwrap(), vec![node]);
+        assert_eq!(load_scheduled(dir.path()), None);
+    }
 }

@@ -235,8 +235,9 @@ impl<P: AgentProvider> AgentProvider for Guarded<P> {
 pub enum OnFailure {
     /// A usage limit: wait for its reset.
     UsageLimit(crate::usage_limit::UsageLimit),
-    /// Run the step again.
-    Retry,
+    /// Run the step again at `until_ms`: recorded as an `until` wait (like a
+    /// usage limit) so the node sleeps cheaply instead of retrying at once.
+    Backoff { until_ms: i64 },
     /// Too many in a row: ask the user.
     Ask,
     /// Not the agent's failure: the configuration names something that does
@@ -252,7 +253,11 @@ pub fn on_failure(error: &str, failures: u32, guards: &Guards, now_ms: i64) -> O
     if let Some(limit) = crate::usage_limit::detect(error, now_ms) {
         return OnFailure::UsageLimit(limit);
     }
-    if failures >= guards.max_failures { OnFailure::Ask } else { OnFailure::Retry }
+    if failures >= guards.max_failures {
+        OnFailure::Ask
+    } else {
+        OnFailure::Backoff { until_ms: now_ms + crate::waits::backoff_ms(failures) }
+    }
 }
 
 #[cfg(test)]
@@ -402,8 +407,8 @@ mod tests {
     #[test]
     fn failures_retry_until_the_limit_then_ask() {
         let guards = Guards::default();
-        assert_eq!(on_failure("agent hung: x", 1, &guards, 0), OnFailure::Retry);
-        assert_eq!(on_failure("boom", 2, &guards, 0), OnFailure::Retry);
+        assert_eq!(on_failure("agent hung: x", 1, &guards, 0), OnFailure::Backoff { until_ms: 60_000 });
+        assert_eq!(on_failure("boom", 2, &guards, 0), OnFailure::Backoff { until_ms: 120_000 });
         assert_eq!(on_failure("boom", 3, &guards, 0), OnFailure::Ask);
         assert!(matches!(
             on_failure("Claude usage limit reached|1800000000", 3, &guards, 0),
@@ -424,6 +429,6 @@ mod tests {
         );
         assert_eq!(on_failure(&error, 1, &guards, 0), OnFailure::Config);
         assert_eq!(on_failure(&error, 3, &guards, 0), OnFailure::Config);
-        assert_eq!(on_failure("boom", 1, &guards, 0), OnFailure::Retry);
+        assert_eq!(on_failure("boom", 1, &guards, 0), OnFailure::Backoff { until_ms: 60_000 });
     }
 }

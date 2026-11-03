@@ -406,7 +406,10 @@ fn a_wake_runs_the_node_and_its_work_reaches_the_orchestrator() {
     })
     .unwrap();
     assert!(matches!(woke, Woke::Ran(_)), "{woke:?}");
-    assert_eq!(*scheduler.cancels.lock().unwrap(), vec![timer.id, poll.id]);
+    // The check's wake was replaced by a retry wake (under the node's id) before
+    // the work began, and the orderly end cleared that: no wake is left.
+    assert_eq!(scheduler.calls.lock().unwrap().last().map(|c| c.0), Some(node));
+    assert_eq!(*scheduler.cancels.lock().unwrap(), vec![timer.id, poll.id, node]);
 }
 
 #[derive(Default)]

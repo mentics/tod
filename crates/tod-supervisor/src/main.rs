@@ -25,6 +25,34 @@ fn env(name: &str) -> Result<String> {
     std::env::var(name).ok().filter(|v| !v.is_empty()).with_context(|| format!("{name} is not set"))
 }
 
+/// What the error arm needs to schedule a retry once `wake` has taken the config.
+struct Retry {
+    scheduler: Option<Arc<dyn tod_core::scheduler::Scheduler>>,
+    node: uuid::Uuid,
+    sandbox: String,
+    state_dir: PathBuf,
+}
+
+impl Retry {
+    /// Any `Err` out of `wake` would strand the node (its wake was replaced
+    /// by a dead-man retry at best): schedule a backoff retry through the
+    /// scheduler (the local Blaxel API). A failure to schedule is part of the
+    /// error returned, never dropped.
+    fn after_error(&self, err: anyhow::Error) -> anyhow::Error {
+        let Some(scheduler) = &self.scheduler else {
+            return err.context("no scheduler: nothing will retry this wake but a poke");
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        match tod_supervisor::waits::retry_after_error(scheduler.as_ref(), self.node, &self.sandbox, &self.state_dir, now) {
+            Ok(at) => err.context(format!("the wake failed; retrying at {at}")),
+            Err(sched) => err.context(format!("the wake failed and its retry could not be scheduled: {sched:#}")),
+        }
+    }
+}
+
 fn main() {
     // First, before anything slow: the relay signals a supervisor it has
     // started when the next poke comes, which may be right away, and
@@ -151,7 +179,20 @@ fn run(args: &[String]) -> Result<()> {
         },
         sandbox: env("TOD_SANDBOX").unwrap_or_else(|_| format!("node-{node}")),
     };
-    match wake(config)? {
+    // Kept for the error arm: `wake` takes the config.
+    let retry = Retry {
+        scheduler: config.scheduler.clone(),
+        node,
+        sandbox: config.sandbox.clone(),
+        state_dir: config.state_dir.clone(),
+    };
+    let woke = match wake(config) {
+        Ok(woke) => woke,
+        Err(err) => return Err(retry.after_error(err)),
+    };
+    // An orderly end: the next failure backs off from the start again.
+    tod_supervisor::waits::save_count(&retry.state_dir, tod_supervisor::waits::WAKE_ERRORS_FILE, 0)?;
+    match woke {
         Woke::StillWaiting(reason) => eprintln!("tod-supervisor: still waiting ({reason})"),
         Woke::LeftStopped(reason) => eprintln!("tod-supervisor: left stopped ({reason})"),
         Woke::Ran(outcome) => eprintln!("tod-supervisor: stopped: {}", serde_json::to_string(&outcome)?),
