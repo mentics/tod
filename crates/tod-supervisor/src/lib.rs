@@ -214,6 +214,49 @@ fn take_stop_requests(state_dir: &std::path::Path, fleet: &FleetStore, node: Uui
     set_stop_rows_owed(state_dir, owed)
 }
 
+/// The state file left when a run ended because the user paused or stopped
+/// it (its content is the stop reason shown to the user). While it is there, a
+/// wake nobody asked to run (a poke for a change to the node's context, a
+/// retry timer) leaves the node as the user left it, so a Pause survives
+/// every other change to the node; a request to run (Resume, a new session,
+/// a fresh budget) takes it away.
+const USER_STOPPED_FILE: &str = "user-stopped";
+
+/// Records how a run ended: stopped by the user, or not.
+fn record_user_stop(state_dir: &std::path::Path, outcome: &Outcome) -> Result<()> {
+    let path = state_dir.join(USER_STOPPED_FILE);
+    match outcome {
+        Outcome::Stopped { reason }
+            if reason == tod_core::autopilot::local::PAUSED || reason == tod_core::autopilot::local::STOPPED =>
+        {
+            std::fs::write(&path, reason).map_err(|e| anyhow::anyhow!("write {}: {e}", path.display()))
+        }
+        _ => match std::fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(anyhow::anyhow!("remove {}: {e}", path.display())),
+        },
+    }
+}
+
+/// Why this wake leaves the node alone: the user paused or stopped it and
+/// nothing asked it to run since ([`USER_STOPPED_FILE`]). A pending
+/// "Check now" is left to the wake's own look.
+fn left_by_the_user(
+    state_dir: &std::path::Path,
+    run_requested: bool,
+    requested: &[tod_store::node_requests::NodeRequest],
+) -> Option<String> {
+    if run_requested || tod_store::node_requests::any_of(requested, tod_store::node_requests::KIND_CHECK_NOW) {
+        return None;
+    }
+    let reason = std::fs::read_to_string(state_dir.join(USER_STOPPED_FILE)).ok()?;
+    stop_reason(
+        &Outcome::Stopped { reason: reason.trim().to_string() },
+        &Budget { max_sessions: 1, max_duration: Duration::from_secs(1) },
+    )
+}
+
 /// The node's requests not yet consumed (`tod_store::node_requests`).
 fn pending_requests(fleet: &FleetStore, node: Uuid) -> Result<Vec<tod_store::node_requests::NodeRequest>> {
     fleet.read(|conn| tod_store::node_requests::pending_for_node(conn, node))
@@ -598,6 +641,15 @@ pub fn wake(config: Config) -> Result<Woke> {
         .filter(|r| r.kind == tod_store::node_requests::KIND_FRESH_BUDGET)
         .map(|r| r.id)
         .collect();
+    if let Some(reason) = left_by_the_user(&config.state_dir, run_requested, &requested) {
+        replica.lock().unwrap_or_else(|e| e.into_inner()).end_cloud_beat(
+            config.node,
+            Some(&reason),
+            &tod_core::run_state::left_stopped(&reason),
+        )?;
+        tracing::info!(%reason, "left as the user left it; going back to sleep");
+        return Ok(Woke::LeftStopped(reason));
+    }
     let budget = match answers::before_wake_requested(
         &store,
         config.node,
@@ -865,6 +917,7 @@ pub fn wake(config: Config) -> Result<Woke> {
     pushed?;
     ended?;
     tracing::info!(?outcome, "autopilot stopped");
+    record_user_stop(&config.state_dir, &outcome)?;
     if !backing_off {
         waits::save_count(&config.state_dir, waits::AGENT_FAILURES_FILE, 0)?;
     }
@@ -921,6 +974,27 @@ mod tests {
                 },
             )
             .unwrap();
+    }
+
+    /// A node the user paused stays paused through a wake nobody asked to
+    /// run (the orchestrator pokes a node whose context changed, for instance
+    /// the app's own Check now moving it on), and a request to run takes the
+    /// pause away.
+    #[test]
+    fn a_paused_node_stays_paused_until_asked_to_run() {
+        let state = temp_dir("paused");
+        let paused = Outcome::Stopped { reason: tod_core::autopilot::local::PAUSED.into() };
+        record_user_stop(&state, &paused).unwrap();
+        assert_eq!(left_by_the_user(&state, false, &[]).as_deref(), Some("you paused it; resume it to carry on"));
+        // A request to run overrides it.
+        assert_eq!(left_by_the_user(&state, true, &[]), None);
+        // A run that ended another way clears it.
+        record_user_stop(&state, &Outcome::Done).unwrap();
+        assert_eq!(left_by_the_user(&state, false, &[]), None);
+        // Stop now reads the same way, in its own words.
+        record_user_stop(&state, &Outcome::Stopped { reason: tod_core::autopilot::local::STOPPED.into() }).unwrap();
+        assert_eq!(left_by_the_user(&state, false, &[]).as_deref(), Some("you stopped it; run it again to carry on"));
+        std::fs::remove_dir_all(state).ok();
     }
 
     /// Stop now reaches a turn in flight as the marker file; its row arrives
