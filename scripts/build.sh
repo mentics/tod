@@ -6,8 +6,8 @@
 #      tod-cli, ...) in target/sandbox/: rebuilt when a hash of their sources
 #      differs from target/sandbox/.source-hash, or a binary is missing;
 #   3. the cloud orchestrator: reported when its recorded hash,
-#      <data root>/orchestrator-deployed.hash, differs from the sources (the crates the sandbox binaries
-#      are built from, not the whole workspace);
+#      <data root>/orchestrator-deployed.hash, differs from the orchestrator's sources (its
+#      own crates and what they depend on; a supervisor-only change does not stale it);
 #   4. the hourly watchdog job: reported when its recorded hash,
 #      <data root>/watchdog-deployed.hash, differs the same way.
 #
@@ -42,14 +42,24 @@ cargo build --profile dev-fast -p tod -p tod-cli -p tod-sandbox-cli -p tod-zed-s
 [[ $sandbox == 1 ]] || { echo "==> sandbox binaries and cloud checks skipped (--no-sandbox)"; exit 0; }
 
 want="$(sandbox_source_hash)"
+# Per artifact: the orchestrator (+ watchdog) and what a node sandbox runs
+# (supervisor, relay, tod-cli). A change to one does not stale the other.
+want_orch="$(sandbox_source_hash orchestrator)"
+want_node="$(sandbox_source_hash node)"
 bins=(tod-relay tod-supervisor tod-orchestrator tod-cli tod-watchdog)
 stale=""
-[[ "$(cat target/sandbox/.source-hash 2>/dev/null)" == "$want" ]] || stale="sources changed"
+if [[ "$(cat target/sandbox/.source-hash 2>/dev/null)" != "$want" ]]; then
+    stale="sources changed:"
+    [[ "$(cat target/sandbox/.source-hash-orchestrator 2>/dev/null)" == "$want_orch" ]] || stale="$stale orchestrator"
+    [[ "$(cat target/sandbox/.source-hash-node 2>/dev/null)" == "$want_node" ]] || stale="$stale node-sandbox (supervisor, relay, tod-cli)"
+fi
 for b in "${bins[@]}"; do [[ -f target/sandbox/$b ]] || stale="$b is missing"; done
 if [[ -n $stale ]]; then
     echo "==> sandbox binaries ($stale)"
     scripts/build-sandbox-binaries.sh --release
     printf '%s\n' "$want" > target/sandbox/.source-hash
+    printf '%s\n' "$want_orch" > target/sandbox/.source-hash-orchestrator
+    printf '%s\n' "$want_node" > target/sandbox/.source-hash-node
 else
     echo "==> sandbox binaries up to date"
 fi
@@ -60,15 +70,15 @@ if [[ -z $root ]]; then
     exit 0
 fi
 
-if [[ "$(recorded_hash "$root/orchestrator-deployed.hash")" == "$want" ]]; then
+if [[ "$(recorded_hash "$root/orchestrator-deployed.hash")" == "$want_orch" ]]; then
     echo "==> orchestrator up to date ($root)"
 else
-    echo "==> orchestrator is out of date (or never deployed from here). It is shared, so it was left alone." >&2
+    echo "==> orchestrator is out of date (its own sources changed, or it was never deployed from here). It is shared, so it was left alone." >&2
     from="$(recorded_from "$root/orchestrator-deployed.hash")"; [[ -z $from ]] || echo "    Last deployed from: $from" >&2
     echo "    Deploy it with: scripts/deploy.sh" >&2
 fi
 
-if [[ "$(recorded_hash "$root/watchdog-deployed.hash")" == "$want" ]]; then
+if [[ "$(recorded_hash "$root/watchdog-deployed.hash")" == "$want_orch" ]]; then
     echo "==> watchdog up to date ($root)"
 else
     echo "==> watchdog is out of date (or never deployed from here). It is shared, so it was left alone." >&2
