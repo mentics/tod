@@ -1,6 +1,9 @@
 # Moving a conversation's agent session to another machine
 
-Status: design, not implemented.
+Status: partly built. Bringing a session log to where the conversation now
+runs is built (`ConversationDriver::bring_session`,
+`tod_store::fleet::session_log`); the rest of the sequenced procedure below
+is the design.
 
 A conversation's agent session can run in one of three places: on this
 machine, in the node's dev container, or in its cloud sandbox (the Files

@@ -1,8 +1,8 @@
 # The unified view
 
 A new view, separate from the existing ones, built for one person keeping many
-agents busy at once. Status: design in progress. Nothing here is implemented
-yet.
+agents busy at once. Status: built (`crates/tod-ui/src/unified/`); the design
+below is the reference for it.
 
 ## The goal
 

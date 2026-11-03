@@ -1,6 +1,6 @@
 # Phase agents and deterministic gates
 
-Status: proposed design. Replaces the gate-check agent and the on-entry turn.
+Status: implemented (all work items below are done). Replaces the gate-check agent and the on-entry turn.
 
 ## The rule
 
