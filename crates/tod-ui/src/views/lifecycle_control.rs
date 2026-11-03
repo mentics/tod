@@ -5,7 +5,7 @@
 //! The agent runs are not here: a state's work, its evaluation, Implement,
 //! Verify, and Review are conversations the conversation view runs. What is
 //! here is what the lifecycle does without an agent: checking the gate
-//! ([`LifecycleController::check_gate`], an app check through
+//! (`tod_core::lifecycle::check_now`: an app check through
 //! `tod_core::phase::settle_gate`, which advances the node when it is clear),
 //! waiving a criterion, advancing once every recorded criterion reads
 //! pass/waived ([`LifecycleController::advance_after_criteria`]), forcing or

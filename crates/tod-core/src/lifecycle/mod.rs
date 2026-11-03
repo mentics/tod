@@ -11,6 +11,9 @@
 //! Which step comes next is [`crate::lifecycle_next`]; whether the current
 //! state still holds is [`crate::lifecycle_validity`].
 
+mod check_now;
+pub use check_now::{CheckNow, check_now};
+
 use crate::task::model::{next_lifecycle, previous_lifecycle};
 use anyhow::{Context, Result};
 use tod_store::fleet::FleetStore;
