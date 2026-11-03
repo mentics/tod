@@ -75,7 +75,14 @@ fn a_second_supervisor_exits_at_once_and_leaves_everything_alone() {
     assert!(calls.0.lock().unwrap().is_empty(), "a second supervisor touched the hold or the schedule: {:?}", calls.0.lock().unwrap());
     assert!(!dir.join("tod.db").exists(), "it opened the replica");
     // It poked the holder to look again.
-    assert!(tod_supervisor::signal::take_poke());
+    // A signal is delivered asynchronously, to any thread: wait for the handler.
+    let poked = (0..100).any(|_| {
+        tod_supervisor::signal::take_poke() || {
+            std::thread::sleep(Duration::from_millis(20));
+            false
+        }
+    });
+    assert!(poked, "the holder was not poked");
     drop(held);
     let _ = std::fs::remove_dir_all(&dir);
 }
