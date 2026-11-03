@@ -168,6 +168,44 @@ another one's current state, files and installed tools included, even while
 the source is in standby. Not every Blaxel workspace has forking; one without
 it refuses with "fork feature is not enabled for this workspace".
 
+**The golden sandbox, one per repository.** A node's sandbox is a fork of
+its project's golden, which holds the repository, the dependencies, and tod's
+own files (relay, shim, Linux `tod-cli`, supervisor, bundles, Claude adapter),
+so a fork installs nothing of tod's. `tod-sandbox golden` lists the goldens;
+`golden <owner/name>` shows one; `golden <owner/name> <sandbox>` points a
+repository at a sandbox (a name ending in `*` is the newest sandbox with that
+prefix). A `golden = "..."` from before there was one per repository is read
+as the golden of every repository that has none of its own, and stays when
+one is set (the log says so); `[blaxel.goldens]` holds the per-repository ones.
+
+`tod-sandbox golden refresh [<owner/name>]` makes the golden again on this
+build: it forks the current golden, checks what a fork needs, installs tod's
+files, labels it `tod-install` (the install stamp), `tod-schema`, `tod-wire`,
+and `tod-built` (the commit time of the build) plus `tod-kind=golden`, marks
+it `ready`, points the repository at it, and deletes the old golden when tod
+made it (`tod-kind=golden`) and no other setting points at it. The library
+entry `tod_core::cloud_sync::golden::ensure_golden_current` does the same
+only when needed: the same stamp is used; an older golden (by schema, wire,
+then commit time) or one of the same order but another stamp (a build with
+local changes) is refreshed forward; a **newer** golden is refused, naming the
+repository and both stamps, since a fork would run a newer supervisor against
+this older tod's schema. Nothing in the app calls it yet.
+
+*Live check* (not run in tests: there is no fake Blaxel; use a throwaway
+workspace or data root, never the live one). With a golden set for a test
+repository, run `tod-sandbox golden refresh <owner/name>` and expect, in
+order: `forking ...`, the prerequisites check, `installing tod's files…`,
+`<new> is now the golden of <repo>`, and either `deleting the old golden` or
+`left ... in place` with the reason. Then `tod-sandbox status <new> --json`
+shows labels `tod-install`, `tod-schema`, `tod-wire`, `tod-built`,
+`tod-kind=golden`, `ready=true`; `tod-sandbox exec <new> -- ls /opt/tod`
+shows `tod-relay`, `tod-cli`, `tod-supervisor`, `process`, `media`, `skills`;
+and `tod-sandbox golden <owner/name>` names it. Run the refresh a second time
+from the same build: it forks again (refresh always remakes), and a
+`tod_core` caller of `ensure_golden_current` should instead use the golden
+as it is. To see the refusal, relabel the golden with a higher `tod-schema`
+and call `ensure_golden_current`.
+
 **Updates.** Whenever `tod-sandbox` connects, it checks the sandbox's manifest
 of what was installed (one round trip, 0.3 s). After a tod update it
 reinstalls what changed in place, so a rebake is optional.

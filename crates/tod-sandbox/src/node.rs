@@ -427,8 +427,7 @@ fn github_token(creds: &NodeCredentials) -> Option<&str> {
     creds.github_token.as_deref().filter(|t| !t.is_empty())
 }
 
-/// What a node's sandbox is created as. With an empty `node`, a base
-/// that nodes are forked from ([`ensure_base`]).
+/// What a node's sandbox is created as.
 #[derive(Clone, Copy)]
 pub struct NodeSandboxSpec<'a> {
     pub name: &'a str,
@@ -829,78 +828,6 @@ fn wait_proxy_ready_with(
     bail!("the sandbox was still not ready after {waited}s: {last}")
 }
 
-/// What a base made from `base_body` (its [`create_body`]) with `payload`
-/// installed is: a base whose fingerprint differs (new binaries, bundles,
-/// credentials, image, orchestrator) is made again. Hex SHA-256; it
-/// covers the proxy's secrets, so it is kept only on this machine.
-pub fn base_fingerprint(base_body: &Value, payload: &NodePayload) -> String {
-    use sha2::{Digest, Sha256};
-    let mut h = Sha256::new();
-    let mut part = |bytes: &[u8]| {
-        h.update((bytes.len() as u64).to_le_bytes());
-        h.update(bytes);
-    };
-    part(base_body.to_string().as_bytes());
-    part(payload.relay);
-    part(payload.shim);
-    part(payload.local_cli.unwrap_or_default());
-    part(payload.supervisor.unwrap_or_default());
-    for (rel, bytes) in payload.bundles {
-        part(rel.as_bytes());
-        part(bytes);
-    }
-    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
-}
-
-/// Makes sure the base `base` (a [`NodeSandboxSpec`] with no node) is there,
-/// deployed, and has `payload` installed ([`install`]), making it again when
-/// it is missing, can no longer run, or its fingerprint ([`base_fingerprint`])
-/// is not `recorded`. Returns the fingerprint to record once it is ready.
-pub fn ensure_base(
-    bx: &Blaxel,
-    base: &NodeSandboxSpec,
-    creds: &NodeCredentials,
-    payload: &NodePayload,
-    recorded: Option<&str>,
-    progress: &mut dyn FnMut(&str),
-) -> Result<String> {
-    let body = create_body(base, creds);
-    let fingerprint = base_fingerprint(&body, payload);
-    let existing = bx.get(base.name)?;
-    let dead = |status: &str| matches!(status.to_ascii_uppercase().as_str(), "FAILED" | "TERMINATED" | "DELETING" | "DELETED");
-    if let Some(info) = &existing
-        && !dead(&info.status)
-        && recorded == Some(fingerprint.as_str())
-    {
-        return Ok(fingerprint);
-    }
-    if existing.is_some() {
-        progress(&format!("replacing the base {}…", base.name));
-        bx.delete(base.name)?;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
-        while bx.get(base.name)?.is_some() {
-            if std::time::Instant::now() >= deadline {
-                bail!("the old base {} is still there", base.name);
-            }
-            std::thread::sleep(std::time::Duration::from_secs(2));
-        }
-    }
-    progress(&format!("creating the base {}…", base.name));
-    bx.create_from_body(&body)?;
-    let info = bx.wait_deployed(base.name, std::time::Duration::from_secs(300))?;
-    let url = info.url.ok_or_else(|| anyhow::anyhow!("sandbox {} has no URL", base.name))?;
-    install(bx, &url, payload, progress)?;
-    Ok(fingerprint)
-}
-
-/// Forks `spec`'s sandbox from the base `base`, with `spec`'s environment
-/// ([`env_for`]) over the base's. Its proxy rules and labels are the base's
-/// (the same user's credentials); wait with [`Blaxel::wait_deployed`], then
-/// [`start`] it.
-pub fn fork(bx: &Blaxel, base: &str, spec: &NodeSandboxSpec, creds: &NodeCredentials) -> Result<()> {
-    bx.fork_with_envs(base, spec.name, &env_for(spec, creds))
-}
-
 /// Forks `spec`'s sandbox from the golden `source` and gives the fork the
 /// node's own proxy rules and labels: a fork carries its source's proxy, which
 /// does not hold this node's credentials (or, with a Blaxel one, any a
@@ -1218,38 +1145,6 @@ mod tests {
         assert_eq!(create_body(&node, &creds())["metadata"]["labels"]["tod-kind"], "node");
         let base = NodeSandboxSpec { name: "tod-node-base", node: "", ..node };
         assert_eq!(create_body(&base, &creds())["metadata"]["labels"]["tod-kind"], "node-base");
-    }
-
-    #[test]
-    fn a_base_fingerprint_changes_with_what_it_is_made_from() {
-        fn payload<'a>(relay: &'a [u8], bundles: &'a [(String, Vec<u8>)], identity: &'a GitIdentity) -> NodePayload<'a> {
-            NodePayload {
-                relay,
-                shim: b"shim",
-                local_cli: None,
-                supervisor: Some(b"sup"),
-                repo_url: "https://example/r.git",
-                branch: "b",
-                git_identity: identity,
-                bundles,
-                supervisor_env: &[],
-            }
-        }
-        let identity = GitIdentity::fallback();
-        let bundles = vec![("process/a.md".to_string(), b"one".to_vec())];
-        let bundles = bundles.as_slice();
-        let body = create_body(&NodeSandboxSpec { node: "", ..spec(ClaudeTokenVia::Proxy) }, &creds());
-        let a = base_fingerprint(&body, &payload(b"relay-1", bundles, &identity));
-        assert_eq!(a, base_fingerprint(&body, &payload(b"relay-1", bundles, &identity)));
-        assert_ne!(a, base_fingerprint(&body, &payload(b"relay-2", bundles, &identity)));
-        assert_ne!(a, base_fingerprint(&body, &payload(b"relay-1", &[], &identity)));
-        let mut other = body.clone();
-        other["spec"]["runtime"]["image"] = json!("other:latest");
-        assert_ne!(a, base_fingerprint(&other, &payload(b"relay-1", bundles, &identity)));
-        // The branch and repository are the node's, not the base's.
-        let mut p = payload(b"relay-1", bundles, &identity);
-        p.branch = "other";
-        assert_eq!(a, base_fingerprint(&body, &p));
     }
 
     #[test]

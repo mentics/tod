@@ -45,7 +45,7 @@ pub struct Vm {
     pub created_at: Option<String>,
     pub labels: Vec<(String, String)>,
     pub billing: Billing,
-    /// The newest golden: shown apart from the rest.
+    /// A golden (one per repository): shown apart from the rest.
     pub golden: bool,
 }
 
@@ -129,7 +129,7 @@ fn billed_this_hour(bx: &Blaxel, now_secs: i64) -> Result<HashMap<String, bool>>
 /// deleted), the golden first, then by name. Asks Blaxel (which wakes
 /// nothing): never on the UI thread. A failure of the billing API is an
 /// error, not a guess.
-pub fn list_managed(bx: &Blaxel, golden_name: Option<&str>) -> Result<Vec<Vm>> {
+pub fn list_managed(bx: &Blaxel, golden_names: &[String]) -> Result<Vec<Vm>> {
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
     let records = bx.list_json()?;
     let billed = billed_this_hour(bx, now)?;
@@ -147,15 +147,15 @@ pub fn list_managed(bx: &Blaxel, golden_name: Option<&str>) -> Result<Vec<Vm>> {
                 .map(|m| m.iter().map(|(k, v)| (k.clone(), v.as_str().unwrap_or_default().to_string())).collect())
                 .unwrap_or_default();
             labels.sort();
-            // The golden is ours by being the one nodes fork, label or not.
-            if golden_name != Some(name.as_str()) && !is_managed(&labels) {
+            // A golden is ours by being what nodes fork, label or not.
+            if !golden_names.contains(&name) && !is_managed(&labels) {
                 return None;
             }
             let state = v["state"].as_str().filter(|s| !s.is_empty());
             Some(Vm {
                 billing: billing_of(status, state, billed.contains_key(&name)),
                 created_at: meta["createdAt"].as_str().map(str::to_string),
-                golden: golden_name == Some(name.as_str()),
+                golden: golden_names.contains(&name),
                 name,
                 labels,
             })

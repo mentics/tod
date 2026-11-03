@@ -247,6 +247,17 @@ fn update_proxy_body(current: &Value, proxy: &Value, labels: &[(&str, &str)]) ->
     json!({ "metadata": { "name": current["metadata"]["name"], "labels": merged }, "spec": spec })
 }
 
+/// The body of a `PUT /sandboxes/<name>` that sets `labels` on `current`
+/// (its `GET` record) and nothing else; see [`update_proxy_body`] for why the
+/// whole spec goes back.
+fn update_labels_body(current: &Value, labels: &[(&str, &str)]) -> Value {
+    let mut merged = current["metadata"]["labels"].as_object().cloned().unwrap_or_default();
+    for (k, v) in labels {
+        merged.insert(k.to_string(), json!(v));
+    }
+    json!({ "metadata": { "name": current["metadata"]["name"], "labels": merged }, "spec": current["spec"] })
+}
+
 fn check(resp: &mut ureq::http::Response<ureq::Body>, what: &str) -> Result<()> {
     let status = resp.status();
     if status.is_success() {
@@ -461,6 +472,14 @@ impl Blaxel {
         let current = self.get_json(name)?.ok_or_else(|| anyhow::anyhow!("no sandbox named {name}"))?;
         let body = update_proxy_body(&current, proxy, labels);
         self.put_json(&format!("/sandboxes/{name}"), &body, "update the sandbox's proxy")
+    }
+
+    /// Sets `labels` on a sandbox (the others stay) and changes nothing else
+    /// about it: its proxy, environment, and disk are as they were.
+    pub fn set_labels(&self, name: &str, labels: &[(&str, &str)]) -> Result<()> {
+        let current = self.get_json(name)?.ok_or_else(|| anyhow::anyhow!("no sandbox named {name}"))?;
+        let body = update_labels_body(&current, labels);
+        self.put_json(&format!("/sandboxes/{name}"), &body, "set the sandbox's labels")
     }
 
     /// `PUT {API}{path}` with a JSON body, for calls this type has no method for.
@@ -1084,6 +1103,17 @@ mod tests {
         assert_eq!(body["spec"]["network"]["proxy"], proxy);
         assert_eq!(body["metadata"]["labels"], json!({ "tod": "1", "tod-creds": "new" }));
         assert_eq!(body["metadata"]["name"], "s");
+    }
+
+    #[test]
+    fn a_label_update_changes_only_the_labels() {
+        let current = json!({
+            "metadata": { "name": "s", "labels": { "tod": "1", "ready": "false" } },
+            "spec": { "runtime": { "image": "img" }, "network": { "proxy": { "routing": [] } } },
+        });
+        let body = update_labels_body(&current, &[("ready", "true"), ("tod-install", "abc")]);
+        assert_eq!(body["spec"], current["spec"]);
+        assert_eq!(body["metadata"]["labels"], json!({ "tod": "1", "ready": "true", "tod-install": "abc" }));
     }
 
     #[test]

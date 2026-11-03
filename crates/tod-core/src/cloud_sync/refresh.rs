@@ -84,6 +84,27 @@ pub fn install_of(relay: &[u8], supervisor: Option<&[u8]>, tod_cli: Option<&[u8]
 
 /// The [`Install`] this machine would give a node's sandbox now.
 pub fn install() -> Result<Install> {
+    Ok(install_files()?.install())
+}
+
+/// The files this machine gives a sandbox, read from disk: the stamp
+/// ([`InstallFiles::install`]) and what is uploaded are of the same bytes.
+pub struct InstallFiles {
+    pub relay: Vec<u8>,
+    pub supervisor: Option<Vec<u8>>,
+    pub local_cli: Option<Vec<u8>>,
+    /// `process/...`, `media/...`, `skills/...`.
+    pub bundles: Vec<(String, Vec<u8>)>,
+}
+
+impl InstallFiles {
+    pub fn install(&self) -> Install {
+        install_of(&self.relay, self.supervisor.as_deref(), self.local_cli.as_deref(), &self.bundles)
+    }
+}
+
+/// Reads [`InstallFiles`] from where this build keeps them.
+pub fn install_files() -> Result<InstallFiles> {
     let relay_path = tod_store::fleet::sandbox::relay_path()?;
     let dir = relay_path.parent().context("the sandbox binaries' directory")?;
     let relay = std::fs::read(&relay_path).with_context(|| format!("read {}", relay_path.display()))?;
@@ -93,12 +114,12 @@ pub fn install() -> Result<Install> {
         "media",
     )?);
     bundles.extend(tod_sandbox::node::bundle_files(crate::skills::SkillsPaths::discover()?.root(), "skills")?);
-    Ok(install_of(
-        &relay,
-        tod_sandbox::node::supervisor_from(dir).as_deref(),
-        tod_sandbox::node::local_cli_from(dir).as_deref(),
-        &bundles,
-    ))
+    Ok(InstallFiles {
+        relay,
+        supervisor: tod_sandbox::node::supervisor_from(dir),
+        local_cli: tod_sandbox::node::local_cli_from(dir),
+        bundles,
+    })
 }
 
 /// What is recorded for one node: the install, and why it was last made.
