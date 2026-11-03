@@ -534,10 +534,7 @@ fn place_state_via(run: Run, data_root: &Path, node_id: &str) -> Result<usize> {
 /// conversation driver keeps the mirror after every turn. A failure is
 /// returned, naming what, and the caller removes nothing.
 pub fn keep_node_state(fleet: &super::FleetStore, node_id: &str) -> Result<()> {
-    let Some(location) = super::provision::node_location(fleet, node_id)? else {
-        return Ok(());
-    };
-    let Some(sandbox) = location.sandbox().map(str::to_string) else {
+    let Some(sandbox) = node_sandbox(fleet, node_id)? else {
         return Ok(());
     };
     let root = fleet.paths().root();
@@ -547,6 +544,20 @@ pub fn keep_node_state(fleet: &super::FleetStore, node_id: &str) -> Result<()> {
     keep_state_via(&|script, args| remote.sh(script, args), root, node_id)
         .with_context(|| format!("Could not keep the runner state from sandbox {sandbox}"))?;
     Ok(())
+}
+
+/// The sandbox `node_id` works in now: the one its Files location records,
+/// else the one its `cloud_nodes` row names (a sandbox the cloud start made
+/// leaves no location row) unless that one is marked lost.
+pub fn node_sandbox(fleet: &super::FleetStore, node_id: &str) -> Result<Option<String>> {
+    if let Some(location) = super::provision::node_location(fleet, node_id)?
+        && let Some(sandbox) = location.sandbox()
+    {
+        return Ok(Some(sandbox.to_string()));
+    }
+    let uuid = uuid::Uuid::parse_str(node_id).with_context(|| format!("node id {node_id}"))?;
+    let row = fleet.read(|conn| crate::cloud_nodes::get(conn, uuid))?;
+    Ok(row.filter(|r| r.lost_at.is_none()).map(|r| r.sandbox))
 }
 
 /// For a node entering sandbox `sandbox`: sends the runner state
@@ -647,6 +658,47 @@ pub fn keep_session_in_background(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Live: a sandbox the cloud start made has a `cloud_nodes` row and no
+    /// Files location row, so Migrate saw nothing to keep or remove. The
+    /// node's sandbox is the row's, unless it is marked lost.
+    #[test]
+    fn a_sandbox_only_the_cloud_row_names_is_the_nodes_sandbox() {
+        use crate::fleet::test_util::{cleanup_fleet_root, temp_fleet_root};
+        let root = temp_fleet_root();
+        let fleet = crate::fleet::FleetStore::open(&root).unwrap();
+        use crate::outline::{CreatePosition, OutlineMutation};
+        fleet.enqueue_outline(OutlineMutation::CreateList { slug: "t".into(), title: "T".into() }).unwrap();
+        let list_id = fleet.list_outline_lists().unwrap()[0].id;
+        let node = uuid::Uuid::new_v4();
+        fleet
+            .enqueue_outline(OutlineMutation::CreateNode {
+                node_id: Some(node),
+                list_id,
+                parent_id: None,
+                anchor_id: None,
+                position: CreatePosition::Below,
+                title: "N".into(),
+            })
+            .unwrap();
+        fleet.writer().flush().unwrap();
+        let id = node.to_string();
+        assert_eq!(node_sandbox(&fleet, &id).unwrap(), None);
+
+        let conn = rusqlite::Connection::open(root.join("tod.db")).unwrap();
+        crate::cloud_nodes::upsert(&conn, node, "node-x", "alice", 1).unwrap();
+        drop(conn);
+        fleet.reload_if_stale().ok();
+        assert_eq!(node_sandbox(&fleet, &id).unwrap().as_deref(), Some("node-x"));
+
+        let conn = rusqlite::Connection::open(root.join("tod.db")).unwrap();
+        crate::cloud_nodes::mark_lost(&conn, node, 2).unwrap();
+        drop(conn);
+        fleet.reload_if_stale().ok();
+        assert_eq!(node_sandbox(&fleet, &id).unwrap(), None, "a lost sandbox is not kept or removed");
+        drop(fleet);
+        cleanup_fleet_root(&root);
+    }
 
     /// A sandbox's projects directory, on disk.
     struct Fs(PathBuf);

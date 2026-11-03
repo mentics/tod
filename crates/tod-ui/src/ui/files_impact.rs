@@ -117,14 +117,19 @@ pub fn confirm_migrate(
                 .spawn(async move {
                     let affected = tod_store::fleet::places::migrate_impact(&fleet, &node, &place_id)?;
                     tod_store::fleet::session_log::keep_node_state(&fleet, &node)?;
-                    anyhow::Ok(affected)
+                    // A sandbox the cloud start made is recorded only by the
+                    // node's cloud row: no location names it, so the impact
+                    // above cannot.
+                    let cloud_only = !affected.iter().any(|a| a.location.sandbox().is_some())
+                        && tod_store::fleet::session_log::node_sandbox(&fleet, &node)?.is_some();
+                    anyhow::Ok((affected, cloud_only))
                 })
                 .await
         };
         let _ = cx.update(|window, cx| match prepared {
             Err(err) => on_done(Err(migrate_error(err)), window, cx),
-            Ok(affected) => {
-                let left_sandbox = affected.iter().any(|a| a.location.sandbox().is_some());
+            Ok((affected, cloud_only)) => {
+                let left_sandbox = cloud_only || affected.iter().any(|a| a.location.sandbox().is_some());
                 let intro = format!(
                     "{} puts this node's files somewhere else. Its current files are removed \
                      first (each branch is pushed before it goes); its agent sessions are kept \
@@ -148,10 +153,13 @@ pub fn confirm_migrate(
                                 .spawn(async move {
                                     tod_store::fleet::places::migrate(&fleet_for_run, &node_for_run, &place_id)?;
                                     if left_sandbox {
+                                        // The impact dialog removed a location's
+                                        // sandbox; one only the cloud row names is
+                                        // checkpointed and deleted here.
                                         tod_core::cloud_sync::lost::stop_running_in_cloud(
                                             &fleet_for_run,
                                             &node_for_run,
-                                            false,
+                                            cloud_only,
                                         )?;
                                     }
                                     anyhow::Ok(())
