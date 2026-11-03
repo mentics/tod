@@ -1217,6 +1217,15 @@ fn github_remote_url(config: &str) -> Option<String> {
     origin.chain(others).find_map(|(_, url)| https_repo_url(url))
 }
 
+/// The HTTPS URL of the repository recorded on the node's cloud row
+/// (`owner/name`, `tod_store::cloud_nodes::Ownership::repo`), if there is one.
+fn recorded_repo_url(fleet: &FleetStore, node_id: &str) -> Option<String> {
+    let node: uuid::Uuid = node_id.parse().ok()?;
+    let row = fleet.read(|conn| tod_store::cloud_nodes::get(conn, node)).ok().flatten()?;
+    let repo = row.ownership.repo.as_deref()?.trim();
+    (repo.split('/').count() == 2 && !repo.starts_with('/') && !repo.ends_with('/')).then(|| format!("https://github.com/{repo}.git"))
+}
+
 /// The HTTPS origin of a node whose Files directory is not a URL: a checkout
 /// on this machine says it itself; a path inside a cloud sandbox (Files →
 /// Runs in → Cloud sandbox) is asked in the node's own sandbox, else in the
@@ -1235,6 +1244,11 @@ fn origin_url_of(fleet: &FleetStore, node_id: &str, repo: &str) -> Result<String
         }
         tried.push(format!("the checkout at {repo} has remotes {remotes:?}"));
     } else {
+        // The repository the node's cloud row records (from an earlier run) says
+        // it without asking a sandbox, which may be gone: the case this is for.
+        if let Some(url) = recorded_repo_url(fleet, node_id) {
+            return Ok(url);
+        }
         let mut sandboxes: Vec<String> = Vec::new();
         if let Ok(Some(loc)) = fleet.read(|conn| tod_store::fleet::repos::files_location::FilesLocationRepo::new(conn).get(node_id)) {
             sandboxes.extend(loc.sandbox().map(str::to_string));

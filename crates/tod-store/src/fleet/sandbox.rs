@@ -937,6 +937,19 @@ fn ready() -> &'static Mutex<Ready> {
     READY.get_or_init(Default::default)
 }
 
+/// The lock that serializes making sandbox `name` ready: the same one for the
+/// same name, another for another.
+fn ready_gate(name: &str) -> std::sync::Arc<Mutex<()>> {
+    static GATES: OnceLock<Mutex<std::collections::HashMap<String, std::sync::Arc<Mutex<()>>>>> = OnceLock::new();
+    GATES
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .entry(name.to_string())
+        .or_default()
+        .clone()
+}
+
 /// How long a check that a sandbox is ready stands (its relay could restart
 /// after that, and a token expires).
 const READY_TTL: Duration = Duration::from_secs(600);
@@ -944,10 +957,20 @@ const READY_TTL: Duration = Duration::from_secs(600);
 /// The sandbox `name`, made ready for tod. Cached for a while, so a burst of
 /// git commands costs one check. Talks to Blaxel: never on the UI thread.
 pub fn connect(name: &str) -> Result<Connection> {
-    if let Some((conn, at)) = ready().lock().expect("sandbox cache").get(name) {
-        if at.elapsed() < READY_TTL {
-            return Ok(conn.clone());
-        }
+    let cached = |name: &str| {
+        ready().lock().expect("sandbox cache").get(name).filter(|(_, at)| at.elapsed() < READY_TTL).map(|(conn, _)| conn.clone())
+    };
+    if let Some(conn) = cached(name) {
+        return Ok(conn);
+    }
+    // One caller at a time makes a sandbox ready: they all upload the relay to
+    // the same `/opt/tod/tod-relay.new` and move it into place, so three at
+    // once (three nodes' sandboxes replaced together, each asking the same
+    // golden for its git remote) leave the others without a file to move.
+    let gate = ready_gate(name);
+    let _one_at_a_time = gate.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(conn) = cached(name) {
+        return Ok(conn);
     }
     let mut sandboxes = Sandboxes::load(&data_root()?)?;
     let bx = sandboxes.blaxel()?;
@@ -1327,5 +1350,28 @@ mod tests {
         let p = payload(b"relay", true);
         assert!(std::str::from_utf8(p.tod_cli).unwrap().contains("tod-cli-relay 1"));
         assert_ne!(p.manifest(), payload(b"relay", false).manifest());
+    }
+}
+
+
+#[cfg(test)]
+mod ready_gate_tests {
+    use super::ready_gate;
+    use std::sync::Arc;
+
+    #[test]
+    fn one_gate_per_sandbox_name() {
+        assert!(Arc::ptr_eq(&ready_gate("a"), &ready_gate("a")), "callers for one sandbox share a gate");
+        assert!(!Arc::ptr_eq(&ready_gate("a"), &ready_gate("b")), "another sandbox has its own");
+    }
+
+    #[test]
+    fn a_second_caller_waits_for_the_first() {
+        let first = ready_gate("c");
+        let held = first.lock().unwrap();
+        let second = ready_gate("c");
+        assert!(second.try_lock().is_err(), "the gate is taken while a caller makes the sandbox ready");
+        drop(held);
+        assert!(second.try_lock().is_ok());
     }
 }

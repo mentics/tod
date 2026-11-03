@@ -853,3 +853,42 @@ fn rejected_changes_are_raised_once_per_distinct_error() {
     // No rejects, nothing raised.
     record_rejects(&sync::ApplyReport::default());
 }
+
+
+/// A node whose sandbox is gone still knows its repository from the cloud row
+/// recorded when it ran; replacing it must not need the dead sandbox to say.
+#[test]
+fn a_gone_sandbox_does_not_stop_its_node_from_naming_its_repository() {
+    use tod_store::outline::{CreatePosition, OutlineMutation};
+    let root = temp_root("recorded-repo");
+    let fleet = FleetStore::open(&root).unwrap();
+    add_list(&fleet, "t");
+    let list_id = fleet.list_outline_lists().unwrap()[0].id;
+    let node = uuid::Uuid::new_v4();
+    fleet
+        .enqueue_outline(OutlineMutation::CreateNode {
+            node_id: Some(node),
+            list_id,
+            parent_id: None,
+            anchor_id: None,
+            position: CreatePosition::Below,
+            title: "n".into(),
+        })
+        .unwrap();
+    fleet.writer().flush().unwrap();
+    {
+        let conn = rusqlite::Connection::open(root.join("tod.db")).unwrap();
+        tod_store::cloud_nodes::upsert(&conn, node, "node-gone", "alice", 1).unwrap();
+        tod_store::cloud_nodes::set_ownership(
+            &conn,
+            node,
+            &tod_store::cloud_nodes::Ownership { workspace: None, owner_client: None, repo: Some("acme/app".into()) },
+        )
+        .unwrap();
+    }
+    let _ = fleet.reload_if_stale();
+    // `/workspace/app` is not a checkout on this machine and the sandbox is gone.
+    let url = origin_url_of(&fleet, &node.to_string(), "/workspace/app").unwrap();
+    assert_eq!(url, "https://github.com/acme/app.git");
+    let _ = std::fs::remove_dir_all(&root);
+}
