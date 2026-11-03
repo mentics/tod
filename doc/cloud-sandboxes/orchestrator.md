@@ -100,8 +100,15 @@ Its data is under `/data`. By default that is the sandbox's own disk, and
 goes with the sandbox. With `orchestrator_volume = "<volume>"` under
 `[blaxel]`, the volume (4 GB, in the account's region, labelled
 `tod-role=orchestrator-data`) is created if missing and mounted at `/data`,
-so the data outlives the sandbox: delete it, run `tod-sandbox orchestrator`
-again, and the new one has everything. A volume can only be given to a
+so what must outlive the sandbox does: delete it, run `tod-sandbox orchestrator`
+again, and the new one has the webhook secrets and the wakes. **The users'
+databases are not on the volume**: SQLite's WAL fails there (`disk I/O error`
+creating the `-shm`; measured 2026-11-03), so `/data/users` is a symlink to
+`/var/lib/tod-orchestrator/users` on the sandbox's own disk, made by
+`tod-sandbox orchestrator` (`local_databases_command`; a `/data/users` that was
+a real directory is moved there, not copied). Those are replicas: after a
+container reset each app seeds its database again on its next sync, re-sends its
+GitHub routes, and the orchestrator rebuilds its wakes from the pending waits. A volume can only be given to a
 sandbox when it is created, so for an orchestrator that already exists
 without it the command stops and asks for `--move-data`, which stops the
 server, packs `/data`, keeps a copy in the data root

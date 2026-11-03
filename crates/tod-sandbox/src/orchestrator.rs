@@ -17,6 +17,12 @@ pub const NAME: &str = "tod-orchestrator";
 /// Not 8080: every Blaxel sandbox's own API (the process API) listens there.
 pub const PORT: u16 = 8090;
 pub const DATA_DIR: &str = "/data";
+/// Where the users' databases live when `/data` is a volume: SQLite's WAL
+/// cannot run on Blaxel's volume filesystem (`disk I/O error` on creating the
+/// `-shm`), and the databases are replicas the apps seed again, so they stay on
+/// the sandbox's own disk, behind a symlink at `/data/users`. What must
+/// outlive the container (the webhook secrets, the wakes) is on the volume.
+pub const LOCAL_DB_DIR: &str = "/var/lib/tod-orchestrator";
 /// The size a new data volume is created with, in MB (it can grow later).
 pub const VOLUME_MB: u32 = 4096;
 const DIR: &str = "/opt/tod-orchestrator";
@@ -207,6 +213,13 @@ pub fn provision(bx: &Blaxel, spec: &Spec, progress: &mut dyn FnMut(&str)) -> Re
     bx.run(&url, "mkdir -p /opt/tod", 30)?;
     bx.upload(&url, RELAY_PATH, spec.relay, "0755")?;
     bx.start(&url, RELAY_PROCESS, &crate::provision::relay_command(), true)?;
+    if spec.volume.is_some() {
+        progress("keeping the users' databases on the local disk (the volume cannot run SQLite's WAL)…");
+        let res = bx.run(&url, &local_databases_command(), 600)?;
+        if res.exit_code != 0 {
+            bail!("moving the databases off the volume failed: {}", res.output());
+        }
+    }
     progress("starting tod-orchestrator…");
     bx.start_with_env(&url, PROCESS, &start_command(), true, &process_env(spec))?;
     // A preview that already exists is fine; any other failure only costs
@@ -304,6 +317,21 @@ pub fn is_dead(status: &str) -> bool {
     matches!(status.to_ascii_uppercase().as_str(), "FAILED" | "TERMINATED" | "DELETING" | "DELETED")
 }
 
+/// With a volume at `/data`: the users' databases go to the local disk and
+/// `/data/users` points there. A `/data/users` that is a real directory (a
+/// volume that held them before, or a restored archive) is moved, not copied
+/// or deleted, so a database that was on it is carried across intact.
+pub fn local_databases_command() -> String {
+    format!(
+        "mkdir -p {LOCAL_DB_DIR} && \\
+         if [ -d {DATA_DIR}/users ] && [ ! -L {DATA_DIR}/users ]; then \\
+           if [ -e {LOCAL_DB_DIR}/users ]; then echo 'both {DATA_DIR}/users and {LOCAL_DB_DIR}/users exist' >&2; exit 1; fi; \\
+           mv {DATA_DIR}/users {LOCAL_DB_DIR}/users; \\
+         fi && \\
+         mkdir -p {LOCAL_DB_DIR}/users && ln -sfn {LOCAL_DB_DIR}/users {DATA_DIR}/users"
+    )
+}
+
 pub fn start_command() -> String {
     format!("{DIR}/tod-orchestrator --port {PORT} --base {DATA_DIR} --tod-cli {DIR}/tod-cli")
 }
@@ -373,6 +401,14 @@ mod tests {
             volumes: volumes.iter().map(|v| v.to_string()).collect(),
             node_env: Vec::new(),
         }
+    }
+
+    #[test]
+    fn databases_stay_on_local_disk_behind_a_symlink_when_data_is_a_volume() {
+        let c = local_databases_command();
+        assert!(c.contains("mv /data/users /var/lib/tod-orchestrator/users"), "{c}");
+        assert!(c.contains("ln -sfn /var/lib/tod-orchestrator/users /data/users"), "{c}");
+        assert!(c.contains("[ ! -L /data/users ]"), "a link already there is left alone: {c}");
     }
 
     #[test]
