@@ -768,7 +768,7 @@ pub const FORK_PROBE_DELAYS: &[u64] = &[1, 2, 4, 8, 15, 15, 15, 15, 15];
 pub const IMAGE_PROBE_DELAYS: &[u64] = &[1, 2, 4, 8];
 
 /// Exit code of [`probe_script`] when the node's environment is not there.
-const PROBE_NO_NODE_ENV: i32 = 41;
+pub(crate) const PROBE_NO_NODE_ENV: i32 = 41;
 
 /// What the checkout needs, tried once: the node's environment (so a fork's
 /// environment update has landed) and an authenticated read of the repository

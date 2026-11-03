@@ -23,6 +23,7 @@ pub mod provision;
 pub mod relay;
 pub mod terminal;
 pub mod database;
+pub mod health;
 pub mod hold;
 pub mod tunnel;
 pub mod vms;
