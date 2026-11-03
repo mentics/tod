@@ -37,13 +37,29 @@ fn problems_are_forwarded_with_a_pull_once_each_and_labelled_with_the_node() {
 
     let app = base.join("app");
     let store = FleetStore::open(&app).unwrap();
+    // The node the supervisor copies its slice of.
+    let node = Uuid::new_v4();
+    store
+        .enqueue_outline(tod_store::outline::OutlineMutation::CreateList { slug: "t".into(), title: "T".into() })
+        .unwrap();
+    store.writer().flush().unwrap();
+    store
+        .enqueue_outline(tod_store::outline::OutlineMutation::CreateNode {
+            node_id: Some(node),
+            list_id: store.list_outline_lists().unwrap()[0].id,
+            parent_id: None,
+            anchor_id: None,
+            position: tod_store::outline::CreatePosition::Below,
+            title: "node".into(),
+        })
+        .unwrap();
+    store.writer().flush().unwrap();
     let _ = store.flush_on_quit();
     let snap = base.join("snap.db");
     tod_store::sync::snapshot(&app.join("tod.db"), &snap).unwrap();
     let seeded = ureq::post(format!("{url}/users/alice/seed")).send(std::fs::read(&snap).unwrap()).unwrap();
     assert_eq!(seeded.status(), 200);
 
-    let node = Uuid::new_v4();
     let workspace = base.join("workspace");
     std::fs::create_dir_all(&workspace).unwrap();
     let mut replica =

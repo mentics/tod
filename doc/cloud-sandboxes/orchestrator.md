@@ -38,6 +38,13 @@ both, they must agree). A user name is one path segment: letters, digits,
 | `POST /users/<u>/seed` | a database snapshot (`tod_store::sync::snapshot`) | `{"last_seq": n}` |
 | `POST /users/<u>/changes` | JSON `[Change]`, the app's outbox | the `ApplyReport` plus `last_seq` |
 | `GET /users/<u>/changes?after=<n>` | | `{"last_seq": n, "changes": [...]}` |
+| `GET /users/<u>/snapshot?slice=1` | | the slice of the node named by `X-Tod-Node` (`tod_store::sync::slice`), a database that records its own cursor |
+| `GET /users/<u>/changes?after=<n>&slice=1` | | the changes in that slice, plus `"slice_id"` |
+
+A node's supervisor asks only for its node's slice
+([node-scoped-copy.md](node-scoped-copy.md)). Its pushes (a `supervisor-`
+client with `X-Tod-Node`) are refused with a 400 naming each row when they
+reach outside that node and the nodes under it.
 
 `/cli` runs the real `tod-cli` with `--data-root` and `TOD_DATA_ROOT` set to
 the user's root, replacing any the sandbox sent; only `TOD_*` variables are
