@@ -1006,8 +1006,21 @@ pub fn supervisor_command() -> String {
 /// Should the relay not be running (the sandbox was restarted, not just
 /// woken), the supervisor is started directly. The process API runs it
 /// with a shell.
+///
+/// Why the fallback does not start the relay: the relay's environment (the
+/// supervisor's secrets, `relay_env`) is handed to it by the process API when
+/// `start` starts it and is deliberately written to no file, so nothing in
+/// the sandbox can reconstruct it. Instead the fallback runs the supervisor
+/// detached (`setsid`, its own session and process group, output discarded)
+/// and returns at once: the process API's 120 s timeout (`schedule_body`)
+/// kills only the shell, not the supervisor. It still runs untracked, and
+/// the relay adopts it when it is back (`tod-relay`'s `liveness`).
 pub fn wake_command() -> String {
-    format!("curl -fsS -m 20 -X POST http://127.0.0.1:{RELAY_PORT}/poke || exec {}", supervisor_command())
+    format!(
+        "curl -fsS -m 20 -X POST http://127.0.0.1:{RELAY_PORT}/poke || \
+         {{ nohup setsid {} </dev/null >/dev/null 2>&1 & }}",
+        supervisor_command()
+    )
 }
 
 /// Pokes the relay on loopback, retrying while it starts listening.
@@ -1240,10 +1253,11 @@ mod tests {
     }
 
     #[test]
-    fn a_wake_pokes_the_relay_and_falls_back_to_the_supervisor() {
+    fn a_wake_pokes_the_relay_and_falls_back_to_a_detached_supervisor() {
         let cmd = wake_command();
-        assert!(cmd.starts_with("curl -fsS -m 20 -X POST http://127.0.0.1:2222/poke || exec "), "{cmd}");
-        assert!(cmd.ends_with(&supervisor_command()), "{cmd}");
+        assert!(cmd.starts_with("curl -fsS -m 20 -X POST http://127.0.0.1:2222/poke || "), "{cmd}");
+        assert!(!cmd.contains("exec "), "the fallback must not run the supervisor in the timed shell: {cmd}");
+        assert!(cmd.contains(&format!("nohup setsid {} </dev/null >/dev/null 2>&1 &", supervisor_command())), "{cmd}");
     }
 
     #[test]
