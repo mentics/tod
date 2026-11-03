@@ -358,10 +358,15 @@ the user's tokens, which sit in its sandbox's proxy and nowhere else.
   replaces the proxy's secrets with the stored tokens and sends the
   orchestrator its routes (`PUT /users/<user>/github-routes`: pattern and
   secret name only, kept in the user's directory as `github-routes.json`).
-- **One user's tokens per orchestrator, for now.** The proxy's secrets are
-  replaced as a whole and a `GET` never returns their values, so the
-  orchestrator holds the tokens of whoever applied last. Several users
-  sharing one orchestrator would overwrite each other.
+- **Roots sharing one orchestrator.** The proxy's secrets are replaced as a
+  whole and a `GET` never returns their values, so an apply cannot merge. It
+  reads which secret *names* the orchestrator holds (the keys of the proxy's
+  rules if Blaxel shows them, plus `GET /github-secrets`, the names the last
+  apply recorded with `PUT /github-secrets`; names only) and refuses
+  (`orchestrator_github::Refused`) when it would remove one this root has no
+  token for, or when nothing says what is held. Settings shows the error and
+  an "Apply and remove X, Y" button (`remove_others`). A reset orchestrator
+  disk forgets the recorded names; the next apply then reads as unknown.
 
 
 ## The orchestrator's container can reset and lose `/data`

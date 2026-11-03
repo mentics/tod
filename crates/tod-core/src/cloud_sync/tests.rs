@@ -892,3 +892,19 @@ fn a_gone_sandbox_does_not_stop_its_node_from_naming_its_repository() {
     assert_eq!(url, "https://github.com/acme/app.git");
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// The orchestrator records which secret names its proxy holds (never values),
+/// so a root's apply can tell what it would drop; none recorded reads as `None`.
+#[test]
+fn the_orchestrator_records_the_names_of_the_secrets_its_proxy_holds() {
+    let base = temp_root("orch-secrets");
+    let url = start_orchestrator(&base);
+    let orch = HttpOrchestrator::new(url.clone(), None).with_client("app-test");
+    assert_eq!(orch.github_secrets().unwrap(), None);
+    orch.put_github_secrets(&["gh_a".to_string(), "gh_b".to_string()]).unwrap();
+    assert_eq!(orch.github_secrets().unwrap(), Some(vec!["gh_a".to_string(), "gh_b".to_string()]));
+    orch.put_github_secrets(&["gh_a".to_string()]).unwrap();
+    assert_eq!(orch.github_secrets().unwrap(), Some(vec!["gh_a".to_string()]));
+    assert!(orch.put_github_secrets(&["bad name".to_string()]).is_err());
+    let _ = std::fs::remove_dir_all(&base);
+}
