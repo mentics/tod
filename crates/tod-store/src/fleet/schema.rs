@@ -506,7 +506,6 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
     if version < 73 {
         // Images the user attached to a message.
         ensure_turn_attachments(conn)?;
-    ensure_skill_group(conn)?;
         conn.pragma_update(None, "user_version", 73)?;
     }
     if version < 74 {
@@ -673,6 +672,9 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
     crate::phase::ensure_table(conn)?;
     conn.execute_batch(&crate::journey_changes::phase_events_triggers_sql())?;
     ensure_turn_attachments(conn)?;
+    // Added to the v73 step after stores had passed it, so it is made sure of
+    // here, like the rest (`conversations.skill_group`).
+    ensure_skill_group(conn)?;
     crate::sync::install(conn)?;
     // Idempotent and cheap — keeps the gate criteria catalog's wording in
     // sync with the source on every startup, not just the migration that
@@ -4199,6 +4201,37 @@ mod tests {
         let path = dir.join("tod.db");
         let conn = open_writer_connection(&path).unwrap();
         (dir, conn)
+    }
+
+    /// `conversations.skill_group` was added inside the v73 step, after
+    /// stores had passed it: a store at the current version without the
+    /// column must get it, or every conversation query and every sync slice
+    /// of the table fails ("no such column: skill_group").
+    #[test]
+    fn a_store_past_v73_without_skill_group_gets_the_column() {
+        let (dir, conn) = temp_db();
+        // The sync triggers name the column; a store without it has none of them.
+        let triggers: Vec<String> = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 'conversations'")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        for name in triggers {
+            conn.execute_batch(&format!("DROP TRIGGER \"{name}\";")).unwrap();
+        }
+        conn.execute_batch("ALTER TABLE conversations DROP COLUMN skill_group;").unwrap();
+        drop(conn);
+
+        let conn = open_writer_connection(&dir.join("tod.db")).unwrap();
+        let present = conn
+            .prepare("SELECT 1 FROM pragma_table_info('conversations') WHERE name = 'skill_group'")
+            .unwrap()
+            .exists([])
+            .unwrap();
+        assert!(present);
+        fs::remove_dir_all(dir).ok();
     }
 
     /// Put `nodes` (and `list_health_issues`) back in their pre-v26 shape,
