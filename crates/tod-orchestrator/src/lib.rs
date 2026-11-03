@@ -108,6 +108,7 @@ pub struct Server {
     notifier: Arc<notify::Notifier>,
     webhook_secrets: webhooks::Secrets,
     broker: broker::Broker,
+    feed_signal: sync_backend::FeedSignal,
 }
 
 impl Server {
@@ -129,7 +130,7 @@ impl Server {
         wakes.set_gate(Box::new(github_gate::GithubGate::new(users.clone())));
         let notifier = notify::Notifier::start(Box::new(notify::StoreProbe(users.clone())), sink);
         let webhook_secrets = webhooks::Secrets::load(&config.base)?;
-        Ok(Arc::new(Self { config, users, wakes, notifier, webhook_secrets, broker: broker::Broker::default() }))
+        Ok(Arc::new(Self { config, users, wakes, notifier, webhook_secrets, broker: broker::Broker::default(), feed_signal: Default::default() }))
     }
 
     pub fn wakes(&self) -> &Arc<wakes::Wakes> {
@@ -186,6 +187,8 @@ impl Server {
             }
         }
         if request.method == "POST" && response.status == 200 {
+            // Wakes the feed long-polls (`GET changes?wait=`).
+            self.feed_signal.bump();
             let path_user = request.path.trim_matches('/').strip_prefix("users/").and_then(|r| r.split('/').next());
             if let Some(user) = path_user.or_else(|| request.header(USER_HEADER)) {
                 self.notifier.poke(user);
@@ -259,13 +262,22 @@ impl Server {
                         match self.users.get(&user) {
                             Ok(data) if !sync_backend::is_seeded(&data.root) => Response::text(409, sync_backend::NOT_SEEDED),
                             Ok(data) => match slice_node(request) {
-                                Ok(slice) => sync_backend::export_changes(
-                                    &data,
-                                    after,
-                                    client(request),
-                                    slice,
-                                    self.notifier.degraded_for().map(|d| d.as_secs().max(1)),
-                                ),
+                                Ok(slice) => {
+                                    let degraded = || self.notifier.degraded_for().map(|d| d.as_secs().max(1));
+                                    match request.query_param("wait").map(str::parse::<u64>) {
+                                        None => sync_backend::export_changes(&data, after, client(request), slice, degraded()),
+                                        Some(Ok(secs)) => sync_backend::export_changes_waiting(
+                                            &data,
+                                            &self.feed_signal,
+                                            Duration::from_secs(secs),
+                                            after,
+                                            client(request),
+                                            slice,
+                                            degraded,
+                                        ),
+                                        Some(Err(_)) => Response::text(400, "wait must be a number of seconds"),
+                                    }
+                                }
                                 Err(r) => r,
                             },
                             Err(err) => Response::text(500, format!("{err:#}")),

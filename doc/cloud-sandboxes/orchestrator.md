@@ -131,7 +131,20 @@ the server in `TOD_NTFY_URL`; `off` turns it off). Messages carry no data.
   the topics into `cloud-sync.json` (`notify`), holds `GET <server>/<topic>/json`
   on a background thread (renewed every 10 minutes, resuming with `since=`;
   reconnects with backoff), and runs one cloud sync per message, never two
-  at once.
+  at once. It fetches the topics again on every subscription and after every
+  sync, so a topic the orchestrator changed is not subscribed to stale.
+- A publish that fails for any reason (not only a 429) is not marked
+  announced: publishing pauses 60 s (the feed's `notices_degraded_secs`) and
+  the change is announced again after.
+- **Feed long-poll.** `GET /users/<u>/changes?after=n&wait=<secs>` (at most
+  55) is held until another client's change is committed or the time is over
+  (then empty); the answer carries `"waited": true`. An orchestrator that
+  predates it ignores `wait` and answers at once without `waited`; an old
+  client sends no `wait` and is unchanged. The app holds one such request
+  (25 s) while a node runs in the cloud, so the orchestrator is awake only
+  while a request is in flight, and once an orchestrator has answered one the
+  app stops subscribing to ntfy and stops its timers (ntfy stays for the
+  phone's alerts). Deploy the orchestrator before the app.
 
 ## The watchdog (`tod_sandbox::watchdog`, `tod-watchdog`)
 

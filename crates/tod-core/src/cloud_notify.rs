@@ -20,8 +20,24 @@
 //! [`DEGRADED_POLL`], node in the cloud or not, and goes back to the
 //! subscription alone after.
 //!
+//! **Long-poll** ([`spawn_longpoll`]). An orchestrator that knows it
+//! (`?wait=`; see `tod_orchestrator::sync_backend::export_changes_waiting`)
+//! is pulled from with one request in flight, held until another client's
+//! change is committed: no third party in the path, and the orchestrator is
+//! awake only while the request is. It is held only while a node runs in the
+//! cloud ([`any_running_in_cloud`]); with none there is nothing to wait for,
+//! and the app's own syncs (start, each local change) still pull. Once an
+//! orchestrator has answered one ([`longpoll_supported`]) the ntfy
+//! subscription and the timers stand down: ntfy remains for the phone's
+//! alerts, which the orchestrator publishes whatever the app does. An older
+//! orchestrator answers a `wait` at once without saying it waited, and the
+//! subscription and timers above apply as before.
+//!
 //! The server and topic come from `GET /users/<u>/notify` on the
-//! orchestrator, kept in `cloud-sync.json` (`notify`).
+//! orchestrator, kept in `cloud-sync.json` (`notify`) and fetched again on
+//! every subscription and after every sync ([`refresh_topics`]), so a topic
+//! the orchestrator has changed (its data was recreated) is not subscribed to
+//! stale.
 
 use crate::cloud_sync::{self, CloudSyncState};
 use anyhow::{Context, Result};
@@ -77,6 +93,139 @@ fn note_degraded(root: &Path, secs: Option<u64>) {
     }
 }
 
+/// How long one feed long-poll is asked to be held. Under the orchestrator's
+/// own cap and any gateway's idle limit.
+pub const LONGPOLL_WAIT_SECS: u64 = 25;
+/// How often an orchestrator that did not know `wait` is asked again (it may
+/// have been updated since).
+const LONGPOLL_REPROBE: Duration = Duration::from_secs(10 * 60);
+/// How often the long-poll thread looks for a node running in the cloud.
+const LONGPOLL_IDLE_CHECK: Duration = Duration::from_secs(10);
+
+/// What this data root last learned of its orchestrator's long-poll.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum LongPoll {
+    Supported,
+    /// Answered a `wait` at once, at this time.
+    Unsupported(Instant),
+}
+
+static LONGPOLL: Mutex<Option<std::collections::HashMap<std::path::PathBuf, LongPoll>>> = Mutex::new(None);
+
+fn note_longpoll(root: &Path, state: LongPoll) {
+    let mut map = LONGPOLL.lock().unwrap_or_else(|e| e.into_inner());
+    map.get_or_insert_with(Default::default).insert(root.to_path_buf(), state);
+}
+
+fn longpoll_state(root: &Path) -> Option<LongPoll> {
+    LONGPOLL.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|m| m.get(root)).copied()
+}
+
+/// Whether the orchestrator has answered a feed long-poll for this data root,
+/// so the ntfy subscription and the timers are not needed for the app.
+pub fn longpoll_supported(root: &Path) -> bool {
+    longpoll_state(root) == Some(LongPoll::Supported)
+}
+
+/// Whether the long-poll thread should ask now: not while an orchestrator
+/// that did not know `wait` was asked less than [`LONGPOLL_REPROBE`] ago.
+fn longpoll_due(state: Option<LongPoll>, now: Instant) -> bool {
+    match state {
+        Some(LongPoll::Unsupported(at)) => now.duration_since(at) >= LONGPOLL_REPROBE,
+        _ => true,
+    }
+}
+
+/// What a long-poll answer means for the loop.
+#[derive(Debug, PartialEq, Eq)]
+enum Heard {
+    /// The orchestrator is too old to wait.
+    Unsupported,
+    /// Waited and nothing is new.
+    Nothing,
+    /// Another client's changes are there to sync.
+    Changes,
+}
+
+fn heard(feed: &cloud_sync::Feed) -> Heard {
+    if !feed.waited {
+        Heard::Unsupported
+    } else if feed.changes.is_empty() {
+        Heard::Nothing
+    } else {
+        Heard::Changes
+    }
+}
+
+/// Holds the feed long-poll while a node runs in the cloud (see the module
+/// docs). A change heard runs a sync through the shared runner and waits for
+/// the feed cursor to pass it before asking again, so the same changes are
+/// not answered twice.
+fn spawn_longpoll(fleet: Arc<FleetStore>) {
+    let root = fleet.paths().root().to_path_buf();
+    let spawned = std::thread::Builder::new().name("tod-cloud-longpoll".into()).spawn(move || {
+        let mut orch: Option<(cloud_sync::HttpOrchestrator, String)> = None;
+        let mut backoff = Duration::from_secs(1);
+        loop {
+            let state = CloudSyncState::load(&root);
+            let seeded = state.as_ref().is_ok_and(|s| s.seeded);
+            if !seeded || !longpoll_due(longpoll_state(&root), Instant::now()) || !any_running_in_cloud(&fleet) {
+                std::thread::sleep(if seeded { LONGPOLL_IDLE_CHECK } else { SEEDED_CHECK });
+                continue;
+            }
+            let after = state.map(|s| s.feed_after).unwrap_or(0);
+            let result = (|| {
+                if orch.is_none() {
+                    orch = Some(cloud_sync::resolve(&root)?);
+                }
+                let (o, user) = orch.as_ref().expect("resolved above");
+                o.pull_waiting(user, after, LONGPOLL_WAIT_SECS)
+            })();
+            match result {
+                Ok(feed) => {
+                    backoff = Duration::from_secs(1);
+                    note_degraded(&root, feed.notices_degraded_secs);
+                    match heard(&feed) {
+                        Heard::Unsupported => {
+                            tracing::info!("cloud notices: the orchestrator does not hold feed long-polls (it is older than this app); using notices and a timer");
+                            note_longpoll(&root, LongPoll::Unsupported(Instant::now()));
+                        }
+                        Heard::Nothing => note_longpoll(&root, LongPoll::Supported),
+                        Heard::Changes => {
+                            note_longpoll(&root, LongPoll::Supported);
+                            runner(&fleet).request();
+                            wait_for_cursor(&root, feed.last_seq);
+                        }
+                    }
+                }
+                Err(err) => {
+                    // The next try resolves the orchestrator again (its URL may have moved).
+                    orch = None;
+                    tracing::warn!("cloud notices: feed long-poll: {err:#}; retrying in {}s", backoff.as_secs());
+                    std::thread::sleep(backoff);
+                    backoff = (backoff * 2).min(MAX_BACKOFF);
+                }
+            }
+        }
+    });
+    if let Err(err) = spawned {
+        tracing::warn!("cloud notices: could not start the feed long-poll: {err}");
+    }
+}
+
+/// Waits (at most 30 s) until a sync has moved the feed cursor to `last_seq`.
+/// A sync that keeps failing ends the wait, so the long-poll asks again at
+/// that pace rather than in a spin.
+fn wait_for_cursor(root: &Path, last_seq: i64) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(250));
+        if CloudSyncState::load(root).is_ok_and(|s| s.feed_after >= last_seq) {
+            return;
+        }
+    }
+}
+
 fn degraded(root: &Path) -> bool {
     let map = DEGRADED_UNTIL.lock().unwrap_or_else(|e| e.into_inner());
     map.as_ref().and_then(|m| m.get(root)).is_some_and(|until| *until > Instant::now())
@@ -112,6 +261,11 @@ fn spawn_fallback_poll(fleet: Arc<FleetStore>) {
         let mut last = Instant::now();
         loop {
             std::thread::sleep(DEGRADED_POLL);
+            // The feed long-poll replaces the timers once the orchestrator holds one.
+            if longpoll_supported(&root) {
+                last = Instant::now();
+                continue;
+            }
             let due = poll_due(last.elapsed(), degraded(&root), || any_running_in_cloud(&fleet));
             if due && CloudSyncState::load(&root).is_ok_and(|s| s.seeded) {
                 last = Instant::now();
@@ -301,6 +455,7 @@ pub fn runner(fleet: &Arc<FleetStore>) -> Arc<Coalesced> {
                     }
                     tracing::info!("cloud sync: {}", report.summary());
                     note_degraded(&root, report.notices_degraded_secs);
+                    refresh_topics(&root);
                     // The orchestrator found a node's sandbox gone: replace it.
                     if cloud_sync::lost::any_marked(&fleet) {
                         cloud_sync::lost::spawn_check(fleet.clone(), cloud_sync::lost::Check::Marked);
@@ -327,27 +482,54 @@ pub fn runner(fleet: &Arc<FleetStore>) -> Arc<Coalesced> {
         .clone()
 }
 
-/// The topics for `root`, from `cloud-sync.json` or else the orchestrator
-/// (then saved).
+/// Whether the orchestrator's topics differ from the ones saved: its data was
+/// recreated (a new secret), and what is saved is a dead topic.
+fn topics_changed(saved: Option<&NotifyTopics>, fresh: &NotifyTopics) -> bool {
+    saved != Some(fresh)
+}
+
+/// The topics for `root` as the orchestrator says now (`GET /notify`), saved
+/// in `cloud-sync.json` when they differ from what is there. Never the saved
+/// copy alone: a stale one subscribes to a topic nothing is published to.
 fn topics(root: &Path) -> Result<NotifyTopics> {
-    if let Some(t) = CloudSyncState::load(root)?.notify {
-        return Ok(t);
-    }
     let (orch, user) = cloud_sync::resolve(root)?;
-    let topics: NotifyTopics = serde_json::from_value(orch.get_json(&user, "notify")?)?;
+    let fresh: NotifyTopics = serde_json::from_value(orch.get_json(&user, "notify")?)?;
+    save_topics(root, &fresh)?;
+    Ok(fresh)
+}
+
+fn save_topics(root: &Path, fresh: &NotifyTopics) -> Result<()> {
     // A sync holds this lock from loading the state to saving it; without
     // it, one already running would save its older copy over `notify`.
     let _guard = cloud_sync::sync_lock(root)?;
     let mut state = CloudSyncState::load(root)?;
-    state.notify = Some(topics.clone());
-    state.save(root)?;
-    Ok(topics)
+    if topics_changed(state.notify.as_ref(), fresh) {
+        if let Some(old) = &state.notify {
+            tracing::warn!("cloud notices: the orchestrator's topic changed ({} -> {}); using the new one", old.topic, fresh.topic);
+        }
+        state.notify = Some(fresh.clone());
+        state.save(root)?;
+    }
+    Ok(())
+}
+
+/// After a sync: fetches the topics again when this data root has any saved
+/// (so one that subscribes, or did, notices a changed topic at its next
+/// renewal). A failure is logged, not dropped.
+fn refresh_topics(root: &Path) {
+    if longpoll_supported(root) || !CloudSyncState::load(root).is_ok_and(|s| s.notify.is_some()) {
+        return;
+    }
+    if let Err(err) = topics(root) {
+        tracing::warn!("cloud notices: could not re-read the topic: {err:#}");
+    }
 }
 
 /// Subscribes for as long as the app runs, once this data root is seeded.
 /// Never blocks the caller; for the app's start.
 pub fn start(fleet: Arc<FleetStore>) {
     spawn_fallback_poll(fleet.clone());
+    spawn_longpoll(fleet.clone());
     let root = fleet.paths().root().to_path_buf();
     let spawned = std::thread::Builder::new().name("tod-cloud-notify".into()).spawn(move || {
         while !CloudSyncState::load(&root).is_ok_and(|s| s.seeded) {
@@ -357,6 +539,12 @@ pub fn start(fleet: Arc<FleetStore>) {
         let mut backoff = Duration::from_secs(1);
         let mut since: Option<String> = None;
         loop {
+            // The orchestrator holds a feed long-poll: the app needs no
+            // subscription (ntfy is for the phone's alerts).
+            if longpoll_supported(&root) {
+                std::thread::sleep(LONGPOLL_IDLE_CHECK);
+                continue;
+            }
             let result = topics(&root).and_then(|t| {
                 // A (re)connect may have missed messages; pull once to be sure.
                 sync.request();
@@ -394,6 +582,97 @@ mod tests {
         assert!(!poll_due(s(20), false, || false), "no node in the cloud, notices working: no timer");
         assert!(poll_due(s(5), true, || false), "refused: pull even with no node in the cloud");
         assert!(!poll_due(s(4), true, || true));
+    }
+
+    fn feed(waited: bool, changes: usize) -> cloud_sync::Feed {
+        let change = || tod_store::sync::Change {
+            seq: 1,
+            node_id: None,
+            table: "t".into(),
+            key: Default::default(),
+            before: None,
+            after: None,
+        };
+        cloud_sync::Feed {
+            last_seq: 5,
+            changes: (0..changes).map(|_| change()).collect(),
+            seed_id: None,
+            notices_degraded_secs: None,
+            waited,
+        }
+    }
+
+    #[test]
+    fn a_long_poll_answer_is_told_from_an_old_orchestrators_by_waited() {
+        assert_eq!(heard(&feed(false, 0)), Heard::Unsupported);
+        assert_eq!(heard(&feed(false, 2)), Heard::Unsupported);
+        assert_eq!(heard(&feed(true, 0)), Heard::Nothing);
+        assert_eq!(heard(&feed(true, 1)), Heard::Changes);
+    }
+
+    #[test]
+    fn an_orchestrator_without_long_polls_is_asked_again_only_after_a_while() {
+        let now = Instant::now();
+        assert!(longpoll_due(None, now));
+        assert!(longpoll_due(Some(LongPoll::Supported), now));
+        assert!(!longpoll_due(Some(LongPoll::Unsupported(now)), now + Duration::from_secs(60)));
+        assert!(longpoll_due(Some(LongPoll::Unsupported(now)), now + LONGPOLL_REPROBE));
+    }
+
+    #[test]
+    fn a_changed_topic_is_noticed() {
+        let t = |topic: &str| NotifyTopics { server: "s".into(), topic: topic.into(), alerts_topic: None };
+        assert!(topics_changed(None, &t("a")));
+        assert!(!topics_changed(Some(&t("a")), &t("a")));
+        assert!(topics_changed(Some(&t("a")), &t("b")));
+    }
+
+    /// Serves `replies` (status, body), one per connection; returns the port
+    /// and the request lines it saw.
+    fn stub(replies: Vec<(u16, String)>) -> (u16, std::thread::JoinHandle<Vec<String>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            for (status, body) in replies {
+                let (mut s, _) = listener.accept().unwrap();
+                let mut buf = [0u8; 4096];
+                let n = s.read(&mut buf).unwrap();
+                seen.push(String::from_utf8_lossy(&buf[..n]).lines().next().unwrap_or("").to_string());
+                write!(
+                    s,
+                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+            }
+            seen
+        });
+        (port, handle)
+    }
+
+    #[test]
+    fn pull_waiting_asks_for_a_wait_and_reports_whether_it_was_held() {
+        let waited = r#"{"last_seq":7,"changes":[],"seed_id":"s","waited":true}"#.to_string();
+        let old = r#"{"last_seq":7,"changes":[],"seed_id":"s"}"#.to_string();
+        let (port, server) = stub(vec![(200, waited), (200, old)]);
+        let orch = cloud_sync::HttpOrchestrator::new(format!("http://127.0.0.1:{port}"), None);
+        let new = orch.pull_waiting("u", 3, 25).unwrap();
+        assert!(new.waited && new.changes.is_empty() && new.last_seq == 7);
+        let old = orch.pull_waiting("u", 3, 25).unwrap();
+        assert!(!old.waited);
+        let seen = server.join().unwrap();
+        assert!(seen[0].starts_with("GET /users/u/changes?after=3&wait=25 "), "{seen:?}");
+    }
+
+    #[test]
+    fn pull_waiting_keeps_the_gateway_retry() {
+        let ok = r#"{"last_seq":1,"changes":[],"waited":true}"#.to_string();
+        let (port, server) = stub(vec![(502, "bad gateway".into()), (503, "waking".into()), (200, ok)]);
+        let orch = cloud_sync::HttpOrchestrator::new(format!("http://127.0.0.1:{port}"), None);
+        let feed = orch.pull_waiting("u", 0, 1).unwrap();
+        assert!(feed.waited);
+        assert_eq!(server.join().unwrap().len(), 3);
     }
 
     #[test]

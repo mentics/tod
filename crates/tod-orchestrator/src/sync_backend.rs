@@ -228,6 +228,36 @@ pub fn apply_changes(
     response
 }
 
+/// Wakes a long-poll of the feed ([`export_changes_waiting`]) when something
+/// was committed: a counter and a condvar, bumped after every successful POST.
+#[derive(Default)]
+pub struct FeedSignal {
+    generation: std::sync::Mutex<u64>,
+    changed: std::sync::Condvar,
+}
+
+impl FeedSignal {
+    /// A change may have been committed.
+    pub fn bump(&self) {
+        *self.generation.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+        self.changed.notify_all();
+    }
+
+    fn generation(&self) -> u64 {
+        *self.generation.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Blocks until the counter passes `seen` or `timeout` is over.
+    fn wait_past(&self, seen: u64, timeout: Duration) {
+        let guard = self.generation.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = self.changed.wait_timeout_while(guard, timeout, |g| *g == seen).unwrap_or_else(|e| e.into_inner());
+    }
+}
+
+/// The longest a long-poll of the feed is held (`?wait=` is cut to this): under
+/// the gateway's own idle limit.
+pub const MAX_FEED_WAIT: Duration = Duration::from_secs(55);
+
 /// `client`'s own changes are left out. `notices_degraded_secs` is how long
 /// the notice service has been refusing for (see `notify::Notifier::degraded_for`):
 /// the app pulls on a short timer until then, as no notice will say a change came.
@@ -241,25 +271,63 @@ pub fn export_changes(
     slice: Option<Uuid>,
     notices_degraded_secs: Option<u64>,
 ) -> Response {
-    reply((|| {
-        let _guard = user.sync_lock.lock().unwrap_or_else(|e| e.into_inner());
-        let _ = user.store.flush_on_quit();
-        let after = after.max(seed_seq(&user.root));
-        let conn = connect(user)?;
-        let last = sync::last_seq(&conn)?;
-        let scope = slice.map(|node| Scope::for_node(&conn, "", node)).transpose()?;
-        let changes = sync::export_changes_in(&conn, after, client, scope.as_ref())?;
-        let mut v = serde_json::json!({ "last_seq": last, "changes": changes, "seed_id": seed_id(&user.root) });
-        if let Some(scope) = &scope {
-            v["slice_id"] = scope.id().into();
+    reply(feed(user, after, client, slice, notices_degraded_secs).map(|(v, _)| json(&v)))
+}
+
+/// [`export_changes`] as a long-poll (`?wait=<secs>`): answers at once when
+/// there are changes for `client` after `after`, else holds the request until
+/// one is committed ([`FeedSignal::bump`]) or `wait` is over (an empty feed).
+/// No lock is held while waiting. The answer says `"waited": true`: an
+/// orchestrator that does not know `wait` answers at once without it, which
+/// is how a client tells the two apart.
+pub fn export_changes_waiting(
+    user: &UserData,
+    signal: &FeedSignal,
+    wait: Duration,
+    after: i64,
+    client: Option<&str>,
+    slice: Option<Uuid>,
+    notices_degraded_secs: impl Fn() -> Option<u64>,
+) -> Response {
+    let deadline = std::time::Instant::now() + wait.min(MAX_FEED_WAIT);
+    reply((|| loop {
+        // Read the counter first: a commit between the look and the wait is
+        // seen as a counter that moved, not missed.
+        let seen = signal.generation();
+        let (mut v, n) = feed(user, after, client, slice, notices_degraded_secs())?;
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if n > 0 || left.is_zero() {
+            v["waited"] = true.into();
+            return Ok(json(&v));
         }
-        if let Some(secs) = notices_degraded_secs {
-            v["notices_degraded_secs"] = secs.into();
-        }
-        Ok(json(&v))
+        signal.wait_past(seen, left);
     })())
 }
 
+fn feed(
+    user: &UserData,
+    after: i64,
+    client: Option<&str>,
+    slice: Option<Uuid>,
+    notices_degraded_secs: Option<u64>,
+) -> Result<(serde_json::Value, usize)> {
+    let _guard = user.sync_lock.lock().unwrap_or_else(|e| e.into_inner());
+    let _ = user.store.flush_on_quit();
+    let after = after.max(seed_seq(&user.root));
+    let conn = connect(user)?;
+    let last = sync::last_seq(&conn)?;
+    let scope = slice.map(|node| Scope::for_node(&conn, "", node)).transpose()?;
+    let changes = sync::export_changes_in(&conn, after, client, scope.as_ref())?;
+    let n = changes.len();
+    let mut v = serde_json::json!({ "last_seq": last, "changes": changes, "seed_id": seed_id(&user.root) });
+    if let Some(scope) = &scope {
+        v["slice_id"] = scope.id().into();
+    }
+    if let Some(secs) = notices_degraded_secs {
+        v["notices_degraded_secs"] = secs.into();
+    }
+    Ok((v, n))
+}
 
 /// `GET /users/<u>/snapshot`: the user's whole database (the body), for a
 /// node's supervisor to seed its local copy from. Taken under the sync lock,
