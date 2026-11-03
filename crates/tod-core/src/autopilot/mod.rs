@@ -67,8 +67,8 @@ pub struct Budget {
 impl Default for Budget {
     fn default() -> Self {
         Self {
-            max_sessions: 30,
-            max_duration: Duration::from_secs(8 * 60 * 60),
+            max_sessions: 60,
+            max_duration: Duration::from_secs(16 * 60 * 60),
         }
     }
 }
@@ -202,29 +202,73 @@ impl NeedsHuman {
         )
     }
 
-    /// One line for the user.
+    /// What happened and what the user can do about it, in plain words (no
+    /// internal step or protocol names). It is shown as the reason a node is
+    /// on the user, and stored by a cloud supervisor in its idle beat
+    /// (`tod_store::cloud_activity`).
     pub fn describe(&self) -> String {
         match self {
-            Self::Decision { pending } => format!("{pending} decision(s) waiting on you"),
-            Self::BlockedSteps { count } => format!("{count} plan step(s) handed back to you"),
-            Self::NoPlan => "no plan steps to implement".into(),
-            Self::FailingCriteria { criteria } => {
-                format!("gate criteria failing: {}", criteria.join("; "))
+            Self::Decision { pending } => {
+                format!("the agent asked you {pending} question(s) and is waiting for your answer")
             }
-            Self::GateNotPassed { result, summary } => {
-                format!("the gate check did not pass ({result}): {summary}")
-            }
+            Self::BlockedSteps { count } => format!(
+                "the agent handed back {count} plan step(s) it could not finish; open the plan to see why, \
+                 then answer or change them"
+            ),
+            Self::NoPlan => "the node is ready to be built but has no plan steps; ask the agent to make a plan \
+                 or add the steps yourself"
+                .into(),
+            Self::FailingCriteria { criteria } => format!(
+                "it cannot move on yet because these checks fail: {}. Fix them, or waive one you accept",
+                criteria.join("; ")
+            ),
+            Self::GateNotPassed { result, summary } => format!(
+                "the check for moving on did not pass ({result}): {summary}. Look at what it says, \
+                 then fix it or waive it"
+            ),
             Self::EvaluationStuck { fixes } => format!(
-                "the evaluator sent the phase back twice for the same work: {}",
+                "the reviewer sent the same work back twice and the agent changed nothing in between. \
+                 Still asked for: {}. Tell the agent what to do differently, or do it yourself",
                 fixes.join("; ")
             ),
-            Self::PrBlocked { why } => format!("the pull request is blocked: {why}"),
-            Self::PrStuck { why } => format!("the pull request needs a person: {why}"),
-            Self::Permission { title } => format!("the agent asked for permission: {title}"),
-            Self::AgentFailed { error } => format!("the agent's turn failed: {error}"),
-            Self::NoProgress { step } => format!("{step} changed nothing"),
+            Self::PrBlocked { why } => {
+                format!("the agent handed the pull request back to you: {why}. Resolve that, then run it again")
+            }
+            Self::PrStuck { why } => format!(
+                "the pull request keeps needing work and the agent is not getting it through: {why}. \
+                 Look at the pull request yourself, then run it again"
+            ),
+            Self::Permission { title } => format!(
+                "the agent is asking for permission ({title}) and nobody has granted it; \
+                 allow or deny it and the agent carries on"
+            ),
+            Self::AgentFailed { error } => {
+                format!("the agent's turn failed: {error}. Run it again to retry")
+            }
+            Self::NoProgress { step } => format!(
+                "the {} ran and left everything as it was, so running it again would not help. \
+                 Look at what the agent did, change the plan or the instructions, then run it again",
+                step_in_words(step)
+            ),
         }
     }
+}
+
+/// A step's recorded name ([`step_name`], or a protocol's) in words for the user.
+fn step_in_words(step: &str) -> String {
+    match step {
+        "implement" => "implementation",
+        "verify" => "verification",
+        "fix_failed" => "fix for the failed checks",
+        "review" => "code review",
+        "fix" => "fixing of the review findings",
+        "gate_check" => "check for moving on",
+        "phase" => "work for this stage",
+        "evaluate" => "evaluation",
+        "pr" => "work on the pull request",
+        other => return other.replace('_', " "),
+    }
+    .to_string()
 }
 
 /// A step the autopilot takes, as recorded in its state.

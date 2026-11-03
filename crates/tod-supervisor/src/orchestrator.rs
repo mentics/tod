@@ -144,6 +144,34 @@ impl Orchestrator {
         Ok(())
     }
 
+    /// Tells the app this supervisor has begun a wake, before it has a local
+    /// copy of the database to record that in: sends the node's
+    /// `cloud_activity` row (`what = "starting"`) as one change, directly. The
+    /// seed that follows carries the row into the copy, so the first beat
+    /// recorded there updates it. The row's foreign key is checked by the
+    /// orchestrator, which holds the node because the app sent it.
+    pub fn push_starting_beat(&self, node: uuid::Uuid, now_ms: i64) -> Result<()> {
+        use tod_store::sync::{Row, SqlValue};
+        let hex: String = tod_store::outline::uuid_blob::uuid_to_blob(node).iter().map(|b| format!("{b:02x}")).collect();
+        let key: Row = [("node_id".to_string(), SqlValue::Blob(hex.clone()))].into();
+        let mut after = key.clone();
+        after.insert("started_at".into(), SqlValue::Integer(now_ms));
+        after.insert("heartbeat_at".into(), SqlValue::Integer(now_ms));
+        after.insert("what".into(), SqlValue::Text(tod_store::cloud_activity::STARTING_WHAT.into()));
+        after.insert("stopped".into(), SqlValue::Null);
+        // `before` is unknown (a row from the last wake may be there): the
+        // orchestrator notes the difference and applies this row.
+        self.push_changes(&[Change {
+            seq: 0,
+            node_id: Some(node),
+            table: tod_store::cloud_activity::TABLE.to_string(),
+            key,
+            before: None,
+            after: Some(after),
+        }])
+        .context("telling the app this supervisor has started")
+    }
+
     /// Sends problems collected in this node's sandbox (`tod_problems`) to be
     /// shown in the app's log panel. Callers send these only along with a
     /// request they are making anyway: this must not be the reason the

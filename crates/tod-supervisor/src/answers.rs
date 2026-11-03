@@ -99,7 +99,10 @@ pub fn before_wake_with(
         }
         match answer {
             Answer::Stop => {
-                return Ok(Before::LeaveStopped(format!("the user left it stopped ({})", latest.kind)));
+                return Ok(Before::LeaveStopped(format!(
+                    "left stopped: {}",
+                    stop_questions::left_stopped_reason(&latest.kind)
+                )));
             }
             Answer::Continue => {
                 let key = latest.answer_key.unwrap_or_default();

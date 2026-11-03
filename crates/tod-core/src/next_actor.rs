@@ -11,7 +11,10 @@
 //! 2. A pending permission → `You`.
 //! 3. Automated processing live → `Working`.
 //! 4. Open requests → `You`.
-//! 5. The last run failed, stopped, or was paused → `You`.
+//! 5. The last run failed, stopped, or was paused → `You`. For a node in the
+//!    cloud the last run is what its supervisor left in its idle heartbeat
+//!    (`cloud_activity.stopped`), the answer "leave it stopped" to its latest
+//!    stop question, or a sandbox that is gone.
 //! 6. A pending wait on something outside → `Others`.
 //! 7. Otherwise → `You` (`NotStarted`): nothing is ever idle.
 //!
@@ -279,9 +282,31 @@ pub struct RunFacts {
     pub last_outcome: Option<(Outcome, i64)>,
 }
 
+/// A cloud node whose sandbox is gone (`cloud_nodes.lost_at`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CloudLost {
+    /// When the orchestrator found it gone (ms).
+    pub since: i64,
+    /// The user deleted it (this machine's `deleted_by_user`).
+    pub deleted_by_user: bool,
+}
+
+/// The user's answer to a cloud node's latest stop question, when it is a
+/// "leave it" one (`crate::stop_questions`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StopAnswer {
+    /// The question's kind (`stop_questions::KINDS`).
+    pub kind: String,
+    /// When it was answered (ms).
+    pub at: i64,
+}
+
 /// What [`for_nodes`] needs besides the store.
 #[derive(Debug, Clone, Default)]
 pub struct Inputs {
+    /// Cloud nodes whose sandbox the user deleted: that is a file on this
+    /// machine (`cloud_sync::sandbox_deleted_by_user`), not the store.
+    pub deleted_sandboxes: std::collections::HashSet<Uuid>,
     pub runs: HashMap<Uuid, RunFacts>,
     pub deferrals: HashMap<Uuid, Deferral>,
     pub now_ms: i64,
@@ -300,6 +325,10 @@ pub struct Facts<'a> {
     pub leases: &'a [Lease],
     /// The node's supervisor's heartbeat from the cloud, when it has one.
     pub cloud: Option<&'a CloudBeat>,
+    /// The node's cloud sandbox is gone.
+    pub cloud_lost: Option<CloudLost>,
+    /// The node's latest stop question was answered "leave it".
+    pub stop_answer: Option<&'a StopAnswer>,
     pub run: &'a RunFacts,
     pub deferral: Option<Deferral>,
     pub now_ms: i64,
@@ -329,6 +358,22 @@ pub fn for_nodes(
     for beat in tod_store::cloud_activity::list_for_nodes(conn, node_ids)? {
         cloud.insert(beat.node_id, beat);
     }
+    // Cloud nodes: a sandbox that is gone, and the answer to the latest stop
+    // question (only for a node whose sandbox is there to be stopped).
+    let mut lost: HashMap<Uuid, CloudLost> = HashMap::new();
+    let mut stop_answers: HashMap<Uuid, StopAnswer> = HashMap::new();
+    for row in tod_store::cloud_nodes::list(conn)?.into_iter().filter(|r| node_ids.contains(&r.node_id)) {
+        if let Some(since) = row.lost_at {
+            lost.insert(row.node_id, CloudLost { since, deleted_by_user: inputs.deleted_sandboxes.contains(&row.node_id) });
+        } else if let Some(latest) = crate::stop_questions::latest(conn, row.node_id)?
+            && latest.answer == crate::stop_questions::Answer::Stop
+        {
+            stop_answers.insert(
+                row.node_id,
+                StopAnswer { kind: latest.kind, at: latest.answered_at.unwrap_or(row.accepted_at) },
+            );
+        }
+    }
     // The stored deferrals, over which the caller's own (tests, previews) win.
     let mut deferrals: HashMap<Uuid, Deferral> = HashMap::new();
     for row in DeferralRepo::new(conn).list_for_nodes(node_ids)? {
@@ -350,6 +395,8 @@ pub fn for_nodes(
             waits: waits.get(&node_id).map(Vec::as_slice).unwrap_or(&[]),
             leases: leases.get(&node_id).map(Vec::as_slice).unwrap_or(&[]),
             cloud: cloud.get(&node_id),
+            cloud_lost: lost.get(&node_id).copied(),
+            stop_answer: stop_answers.get(&node_id),
             run: inputs.runs.get(&node_id).unwrap_or(&no_run),
             deferral: deferrals.get(&node_id).copied(),
             now_ms: inputs.now_ms,
@@ -372,6 +419,11 @@ pub fn compute(fleet: &tod_store::fleet::FleetStore, data_root: &std::path::Path
         let ids: Vec<Uuid> = NodeRepo::new(conn).list_all()?.into_iter().map(|n| n.id).collect();
         let with_lifecycle = NodeRepo::new(conn).get_lifecycle_for_nodes(&ids)?;
         let mut inputs = Inputs { now_ms, ..Default::default() };
+        inputs.deleted_sandboxes = crate::cloud_sync::CloudSyncState::load(data_root)?
+            .deleted_by_user
+            .iter()
+            .filter_map(|id| Uuid::parse_str(id).ok())
+            .collect();
         // A node whose supervisor runs in the cloud has no run of this
         // machine's to speak of: the file here is the last local run's, from
         // before the node moved (a failed start, say), and would read as the
@@ -512,6 +564,30 @@ fn actor_for(facts: &Facts<'_>) -> (NextActor, i64) {
                 since: waiting_since,
             },
             newest,
+        );
+    }
+    // A node in the cloud: its sandbox gone, a stop question the user
+    // answered "leave it", or a wake that ended needing someone (what the
+    // supervisor left in its idle heartbeat). Each says why and what to do;
+    // none is "not started".
+    if let Some(lost) = facts.cloud_lost {
+        let reason = if lost.deleted_by_user {
+            "its sandbox was deleted; Run in the cloud makes a new one".to_string()
+        } else {
+            "its sandbox is gone; a new one is made at the next sync, or Run in the cloud makes one now".to_string()
+        };
+        return (NextActor::You { why: YouReason::Stopped { reason }, since: lost.since }, lost.since);
+    }
+    if let Some(answer) = facts.stop_answer {
+        let reason = format!("stopped: {}", crate::stop_questions::left_stopped_reason(&answer.kind));
+        return (NextActor::You { why: YouReason::Stopped { reason }, since: answer.at }, answer.at);
+    }
+    if let Some(beat) = facts.cloud.filter(|b| b.is_idle())
+        && let Some(reason) = &beat.stopped
+    {
+        return (
+            NextActor::You { why: YouReason::Stopped { reason: reason.clone() }, since: beat.heartbeat_at },
+            beat.heartbeat_at,
         );
     }
     if let Some((outcome, at)) = &run.last_outcome
@@ -769,6 +845,8 @@ mod tests {
         run: RunFacts,
         deferral: Option<Deferral>,
         cloud: Option<CloudBeat>,
+        cloud_lost: Option<CloudLost>,
+        stop_answer: Option<StopAnswer>,
     }
 
     fn case(lifecycle: &'static str) -> Case {
@@ -778,6 +856,8 @@ mod tests {
             waits: Vec::new(),
             leases: Vec::new(),
             cloud: None,
+            cloud_lost: None,
+            stop_answer: None,
             run: RunFacts::default(),
             deferral: None,
         }
@@ -792,6 +872,8 @@ mod tests {
             waits: &c.waits,
             leases: &c.leases,
             cloud: c.cloud.as_ref(),
+            cloud_lost: c.cloud_lost,
+            stop_answer: c.stop_answer.as_ref(),
             run: &c.run,
             deferral: c.deferral,
             now_ms: NOW,
@@ -830,7 +912,7 @@ mod tests {
     }
 
     fn beat(started_at: i64, ago_ms: i64) -> CloudBeat {
-        CloudBeat { node_id: Uuid::nil(), started_at, heartbeat_at: NOW - ago_ms, what: "active".into() }
+        CloudBeat { node_id: Uuid::nil(), started_at, heartbeat_at: NOW - ago_ms, what: "active".into(), stopped: None }
     }
 
     #[test]
@@ -1479,6 +1561,128 @@ mod tests {
             "the cloud node is not failed by a stale local run: {:?}",
             standings[&cloud].actor
         );
+    }
+
+    fn idle_beat(stopped: Option<&str>) -> CloudBeat {
+        CloudBeat {
+            node_id: Uuid::nil(),
+            started_at: 100,
+            heartbeat_at: NOW - 3 * 86_400_000,
+            what: tod_store::cloud_activity::IDLE_WHAT.into(),
+            stopped: stopped.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn a_cloud_wake_that_stopped_leaves_its_reason_not_not_started() {
+        let mut c = case("planning");
+        c.cloud = Some(idle_beat(None));
+        assert_eq!(standing(&c).actor, you(YouReason::NotStarted, 500), "an idle beat without a reason is as before");
+        c.cloud = Some(idle_beat(Some("the pull request needs a person: threads")));
+        let heard = NOW - 3 * 86_400_000;
+        assert_eq!(
+            standing(&c).actor,
+            you(YouReason::Stopped { reason: "the pull request needs a person: threads".into() }, heard)
+        );
+        assert!(standing(&c).on_you());
+        // A request still comes first, and a live beat is working.
+        c.attention = requests(Uuid::nil(), &[10]);
+        assert!(matches!(standing(&c).actor, NextActor::You { why: YouReason::Request { .. }, .. }));
+        c.attention = NodeAttention::default();
+        c.cloud = Some(beat(100, 5_000));
+        assert!(matches!(standing(&c).actor, NextActor::Working { what: Work::Cloud, .. }));
+    }
+
+    #[test]
+    fn a_stop_question_answered_leave_it_stopped_names_the_question_and_what_resumes_it() {
+        let mut c = case("planning");
+        c.stop_answer = Some(StopAnswer { kind: crate::stop_questions::BUDGET.into(), at: 700 });
+        let NextActor::You { why: YouReason::Stopped { reason }, since } = standing(&c).actor else {
+            panic!("{:?}", standing(&c).actor)
+        };
+        assert_eq!(since, 700);
+        assert!(reason.contains("its budget") && reason.contains("Leave it stopped") && reason.contains("Keep going"), "{reason}");
+        // It outranks an older reason left in the beat and a wait.
+        c.cloud = Some(idle_beat(Some("budget spent")));
+        c.waits = vec![wait("github:pr:1:review", 5, 4)];
+        assert!(matches!(standing(&c).actor, NextActor::You { since: 700, .. }));
+    }
+
+    #[test]
+    fn a_cloud_node_whose_sandbox_is_gone_says_so() {
+        let mut c = case("planning");
+        c.cloud_lost = Some(CloudLost { since: 900, deleted_by_user: true });
+        c.cloud = Some(beat(100, tod_store::cloud_activity::STALE_AFTER_MS + 5_000));
+        assert_eq!(
+            standing(&c).actor,
+            you(YouReason::Stopped { reason: "its sandbox was deleted; Run in the cloud makes a new one".into() }, 900)
+        );
+        c.cloud_lost = Some(CloudLost { since: 900, deleted_by_user: false });
+        let NextActor::You { why: YouReason::Stopped { reason }, .. } = standing(&c).actor else { panic!() };
+        assert!(reason.contains("sandbox is gone"), "{reason}");
+    }
+
+    #[test]
+    fn compute_reads_the_stop_answer_and_the_lost_row_from_the_store() {
+        use crate::stop_questions as sq;
+        let fx = fixture();
+        let stopped = node(&fx.conn, "stopped", Some("planning"));
+        let lost = node(&fx.conn, "lost", Some("planning"));
+        let deleted = node(&fx.conn, "deleted", Some("planning"));
+        let left = node(&fx.conn, "left", Some("planning"));
+        for id in [stopped, lost, deleted, left] {
+            tod_store::cloud_nodes::upsert(&fx.conn, id, "sb", "alice", 1).unwrap();
+        }
+        tod_store::cloud_nodes::mark_lost(&fx.conn, lost, 50).unwrap();
+        tod_store::cloud_nodes::mark_lost(&fx.conn, deleted, 60).unwrap();
+        // `left` had a wake that ended needing someone.
+        tod_store::cloud_activity::beat(&fx.conn, left, "planning", 10).unwrap();
+        tod_store::cloud_activity::idle_stopped(&fx.conn, left, Some("no progress"), 20).unwrap();
+        crate::cloud_sync::set_sandbox_deleted_by_user(&fx.dir, &deleted.to_string(), true).unwrap();
+        let fleet = tod_store::fleet::FleetStore::open(&fx.dir).unwrap();
+        fleet
+            .interview(
+                tod_store::interview::ACTOR_AGENT,
+                tod_store::interview::InterviewCommand::AskDecision {
+                    node_id: stopped,
+                    conversation_id: None,
+                    protocol: Some(sq::BUDGET.into()),
+                    decision: tod_store::decisions::NewDecision {
+                        question: "Keep going?".into(),
+                        options: sq::SUPERVISOR_OPTIONS.iter().map(|o| o.to_string()).collect(),
+                        evidence: Vec::new(),
+                        ..Default::default()
+                    },
+                },
+            )
+            .unwrap();
+        let id = fleet.read(|c| sq::latest(c, stopped)).unwrap().unwrap().decision;
+        let reason_of = |standings: &HashMap<Uuid, NodeStanding>, n: Uuid| match &standings[&n].actor {
+            NextActor::You { why: YouReason::Stopped { reason }, .. } => Some(reason.clone()),
+            _ => None,
+        };
+        let standings = compute(&fleet, &fx.dir).unwrap();
+        assert!(matches!(standings[&stopped].actor, NextActor::You { why: YouReason::Request { .. }, .. }), "pending is a request");
+        fleet
+            .interview(
+                tod_store::interview::ACTOR_USER,
+                tod_store::interview::InterviewCommand::AnswerDecision { decision_id: id, option: Some(2), text: None },
+            )
+            .unwrap();
+        let standings = compute(&fleet, &fx.dir).unwrap();
+        assert!(reason_of(&standings, stopped).unwrap().contains("its budget"));
+        assert!(reason_of(&standings, lost).unwrap().contains("sandbox is gone"));
+        assert!(reason_of(&standings, deleted).unwrap().contains("was deleted"));
+        assert_eq!(reason_of(&standings, left).as_deref(), Some("no progress"));
+        // Answered to continue: nothing stops it any more.
+        fleet
+            .interview(
+                tod_store::interview::ACTOR_USER,
+                tod_store::interview::InterviewCommand::AnswerDecision { decision_id: id, option: Some(1), text: None },
+            )
+            .unwrap();
+        let standings = compute(&fleet, &fx.dir).unwrap();
+        assert_eq!(reason_of(&standings, stopped), None);
     }
 
     #[test]

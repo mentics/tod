@@ -12,6 +12,10 @@
 //!   supervisor is at work on the node, as far as the app can tell;
 //! - a row that has stopped beating and was not marked [`idle`] means the
 //!   supervisor (or its sandbox) died mid-run;
+//! - an [`idle`] row with a `stopped` reason ([`idle_stopped`]) means the
+//!   wake ended with the node needing someone (a stuck pull request, a spent
+//!   budget, a stop question answered "leave it stopped"): the app shows the
+//!   reason instead of "not started";
 //! - an [`idle`] row means the supervisor woke and went back to sleep (its
 //!   `heartbeat_at` says when), which is how the app hears of a wake that
 //!   found only a wait.
@@ -49,6 +53,21 @@ pub const CREATE_TABLE: &str = "
     );
 ";
 
+/// The v87 migration: the `stopped` column (idempotent). Added to an
+/// existing table, so it is not in [`CREATE_TABLE`] (which an older store
+/// runs first, and which must stay valid for it).
+pub fn add_stopped(conn: &Connection) -> Result<()> {
+    // A store older than the table has not made it yet when this runs.
+    conn.execute_batch(CREATE_TABLE)?;
+    let has = conn
+        .prepare("SELECT 1 FROM pragma_table_info('cloud_activity') WHERE name = 'stopped'")?
+        .exists([])?;
+    if !has {
+        conn.execute_batch("ALTER TABLE cloud_activity ADD COLUMN stopped TEXT")?;
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CloudBeat {
     pub node_id: Uuid,
@@ -58,6 +77,11 @@ pub struct CloudBeat {
     pub heartbeat_at: i64,
     /// What it is doing, in a few words (the node's lifecycle state).
     pub what: String,
+    /// Why the last wake ended without the node finishing or waiting on
+    /// something outside, in plain words, when it did (schema v87). Set by
+    /// [`idle_stopped`], cleared by the next [`beat`]. `None` for a wake that
+    /// finished, or only found a wait (the wait row says so).
+    pub stopped: Option<String>,
 }
 
 /// What a run that ended leaves in `what`: the supervisor woke, did what
@@ -65,6 +89,10 @@ pub struct CloudBeat {
 /// went back to sleep. The row is kept rather than deleted, so a wake that
 /// came and went between two syncs is still heard by the app.
 pub const IDLE_WHAT: &str = "idle";
+
+/// What the supervisor's first word of a wake says it is doing: it has begun
+/// and is seeding its copy of the database, before the first real beat.
+pub const STARTING_WHAT: &str = "starting";
 
 impl CloudBeat {
     /// The supervisor said it was working recently enough to still be.
@@ -88,8 +116,8 @@ fn has_table(conn: &Connection) -> Result<bool> {
 /// of a run already recorded) and refreshes it.
 pub fn beat(conn: &Connection, node: Uuid, what: &str, now_ms: i64) -> Result<()> {
     conn.execute(
-        "INSERT INTO cloud_activity (node_id, started_at, heartbeat_at, what) VALUES (?1, ?2, ?2, ?3)
-         ON CONFLICT(node_id) DO UPDATE SET heartbeat_at = excluded.heartbeat_at, what = excluded.what",
+        "INSERT INTO cloud_activity (node_id, started_at, heartbeat_at, what, stopped) VALUES (?1, ?2, ?2, ?3, NULL)
+         ON CONFLICT(node_id) DO UPDATE SET heartbeat_at = excluded.heartbeat_at, what = excluded.what, stopped = NULL",
         params![uuid_to_blob(node), now_ms, what],
     )?;
     Ok(())
@@ -98,7 +126,19 @@ pub fn beat(conn: &Connection, node: Uuid, what: &str, now_ms: i64) -> Result<()
 /// The run ended and the supervisor is going back to sleep: keeps the row,
 /// stamped now, as [`IDLE_WHAT`]. Not a heartbeat of work, and never stale.
 pub fn idle(conn: &Connection, node: Uuid, now_ms: i64) -> Result<()> {
-    beat(conn, node, IDLE_WHAT, now_ms)
+    idle_stopped(conn, node, None, now_ms)
+}
+
+/// [`idle`], leaving `stopped` (why the wake ended with the node still
+/// needing someone) for the app to show. `None` or a blank reason is no stop.
+pub fn idle_stopped(conn: &Connection, node: Uuid, stopped: Option<&str>, now_ms: i64) -> Result<()> {
+    let stopped = stopped.map(str::trim).filter(|s| !s.is_empty());
+    beat(conn, node, IDLE_WHAT, now_ms)?;
+    conn.execute(
+        "UPDATE cloud_activity SET stopped = ?2 WHERE node_id = ?1",
+        params![uuid_to_blob(node), stopped],
+    )?;
+    Ok(())
 }
 
 /// The node left the cloud: drops the row.
@@ -114,6 +154,7 @@ fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CloudBeat> {
         started_at: row.get(1)?,
         heartbeat_at: row.get(2)?,
         what: row.get(3)?,
+        stopped: row.get(4)?,
     })
 }
 
@@ -123,7 +164,7 @@ pub fn get(conn: &Connection, node: Uuid) -> Result<Option<CloudBeat>> {
     }
     Ok(conn
         .query_row(
-            "SELECT node_id, started_at, heartbeat_at, what FROM cloud_activity WHERE node_id = ?1",
+            "SELECT node_id, started_at, heartbeat_at, what, stopped FROM cloud_activity WHERE node_id = ?1",
             params![uuid_to_blob(node)],
             from_row,
         )
@@ -138,9 +179,68 @@ pub fn list_for_nodes(conn: &Connection, node_ids: &[Uuid]) -> Result<Vec<CloudB
     let placeholders = node_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
     let params: Vec<Vec<u8>> = node_ids.iter().copied().map(uuid_to_blob).collect();
     let mut stmt = conn.prepare(&format!(
-        "SELECT node_id, started_at, heartbeat_at, what FROM cloud_activity WHERE node_id IN ({placeholders})"
+        "SELECT node_id, started_at, heartbeat_at, what, stopped FROM cloud_activity WHERE node_id IN ({placeholders})"
     ))?;
     Ok(stmt
         .query_map(rusqlite::params_from_iter(params.iter()), from_row)?
         .collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fleet::schema;
+    use crate::outline::repos::NodeRepo;
+
+    #[test]
+    fn a_stop_reason_round_trips_and_the_next_beat_clears_it() {
+        let dir = std::env::temp_dir().join(format!("tod-cloud-activity-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let conn = schema::open_writer_connection(&dir.join("tod.db")).unwrap();
+        let node = Uuid::new_v4();
+        NodeRepo::new(&conn).create_with_id(node, "n", "N").unwrap();
+        beat(&conn, node, "planning", 10).unwrap();
+        assert_eq!(get(&conn, node).unwrap().unwrap().stopped, None);
+        idle_stopped(&conn, node, Some("  the pull request needs a person  "), 20).unwrap();
+        let row = get(&conn, node).unwrap().unwrap();
+        assert!(row.is_idle());
+        assert_eq!(row.stopped.as_deref(), Some("the pull request needs a person"));
+        assert_eq!(list_for_nodes(&conn, &[node]).unwrap()[0].stopped, row.stopped);
+        // A blank reason is no stop; idle() is a wake that stopped for nothing.
+        idle_stopped(&conn, node, Some("  "), 25).unwrap();
+        assert_eq!(get(&conn, node).unwrap().unwrap().stopped, None);
+        idle_stopped(&conn, node, Some("budget"), 30).unwrap();
+        beat(&conn, node, "planning", 40).unwrap();
+        assert_eq!(get(&conn, node).unwrap().unwrap().stopped, None, "working again clears the reason");
+        idle_stopped(&conn, node, Some("budget"), 50).unwrap();
+        idle(&conn, node, 60).unwrap();
+        assert_eq!(get(&conn, node).unwrap().unwrap().stopped, None);
+        // It travels in the synced change log with the rest of the row.
+        let changes = crate::sync::export_changes(&conn, 0).unwrap();
+        assert!(changes.iter().any(|c| c.table == TABLE));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn migration_from_v86_adds_the_stopped_column_and_keeps_its_rows() {
+        let dir = std::env::temp_dir().join(format!("tod-cloud-activity-migrate-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("tod.db");
+        let node = Uuid::new_v4();
+        {
+            let conn = schema::open_writer_connection(&db).unwrap();
+            NodeRepo::new(&conn).create_with_id(node, "n", "N").unwrap();
+            beat(&conn, node, "review", 5).unwrap();
+            conn.execute_batch("DROP TRIGGER IF EXISTS trg_sync_cloud_activity_insert; DROP TRIGGER IF EXISTS trg_sync_cloud_activity_update; DROP TRIGGER IF EXISTS trg_sync_cloud_activity_delete; ALTER TABLE cloud_activity DROP COLUMN stopped;").unwrap();
+            conn.pragma_update(None, "user_version", 86).unwrap();
+        }
+        let conn = schema::open_writer_connection(&db).unwrap();
+        let version: i32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(version, schema::CURRENT_USER_VERSION);
+        let row = get(&conn, node).unwrap().unwrap();
+        assert_eq!((row.what.as_str(), row.stopped), ("review", None));
+        idle_stopped(&conn, node, Some("why"), 9).unwrap();
+        assert_eq!(get(&conn, node).unwrap().unwrap().stopped.as_deref(), Some("why"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
