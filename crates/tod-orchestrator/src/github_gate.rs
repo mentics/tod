@@ -53,6 +53,23 @@ impl GithubGate {
             .get_node(&node.to_string())?
             .map(|n| n.lifecycle)
             .context("the node is not in the user's database")?;
+        // A wait of a family the node's state has no use for (it left the
+        // state that recorded it) is ended here, not poked a sandbox for.
+        if let Some(allowed) = tod_store::waits::spec_states(&wait.match_spec)
+            && !allowed.contains(&lifecycle.as_str())
+        {
+            data.store
+                .interview(
+                    tod_store::waits::LIFECYCLE_ACTOR,
+                    tod_store::interview::InterviewCommand::SweepWaits { expire_grace_ms: None },
+                )
+                .map_err(|e| anyhow::anyhow!("end the wait that no longer belongs to {lifecycle}: {e}"))?;
+            eprintln!(
+                "tod-orchestrator: {}'s node {node}: ended wait `{}` that does not belong to {lifecycle}",
+                wake.user, wait.match_spec
+            );
+            return Ok(Verdict::Drop);
+        }
         match check_github(&data.store, node, &data.root, &lifecycle)? {
             GithubCheck::Waiting { due_at_ms, what } => {
                 let next = data

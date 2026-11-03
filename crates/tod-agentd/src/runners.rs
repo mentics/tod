@@ -82,7 +82,13 @@ struct Inner {
     subscribers: Mutex<Vec<mpsc::Sender<Event>>>,
     /// Each node's last actor, for the journey.
     actors: Mutex<ActorTracker>,
+    /// When the stale waits were last swept (ms; 0 = never), so the
+    /// reconciler writes at most once per [`WAIT_SWEEP_EVERY_MS`].
+    last_wait_sweep: std::sync::atomic::AtomicI64,
 }
+
+/// How often the reconciler sweeps waits nothing serves.
+const WAIT_SWEEP_EVERY_MS: i64 = 5 * 60 * 1000;
 
 #[derive(Clone)]
 pub struct Runners {
@@ -192,6 +198,7 @@ impl Runners {
                 slots: Mutex::new(HashMap::new()),
                 subscribers: Mutex::new(Vec::new()),
                 actors: Mutex::new(ActorTracker::default()),
+                last_wait_sweep: std::sync::atomic::AtomicI64::new(0),
             }),
         }
     }
@@ -301,6 +308,20 @@ impl Runners {
         let root = store.paths().root().to_path_buf();
         let now = now_ms();
         store.reload_if_stale().context("reload the store")?;
+        // Waits nothing serves any more would read as "waiting on others"
+        // forever and stop every run at its next boundary.
+        let last = self.inner.last_wait_sweep.load(std::sync::atomic::Ordering::Relaxed);
+        if now - last >= WAIT_SWEEP_EVERY_MS {
+            store
+                .interview(
+                    tod_store::waits::LIFECYCLE_ACTOR,
+                    tod_store::interview::InterviewCommand::SweepWaits {
+                        expire_grace_ms: Some(tod_store::waits::EXPIRE_GRACE_MS),
+                    },
+                )
+                .map_err(|e| anyhow::anyhow!("sweep the stale waits: {e}"))?;
+            self.inner.last_wait_sweep.store(now, std::sync::atomic::Ordering::Relaxed);
+        }
         let standings = next_actor::compute(store, &root).context("work out who is next")?;
         let mut errors: Vec<String> = Vec::new();
 

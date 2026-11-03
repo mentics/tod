@@ -80,6 +80,9 @@ pub enum Verdict {
     /// Nothing to do yet: look again at `at` (ms) instead, under wake id
     /// `id` (the wait it replaced is gone), and leave the sandbox asleep.
     Later { id: String, at: i64 },
+    /// The wait this wake was for no longer belongs to its node's state
+    /// (and has been ended): drop the wake and poke nothing.
+    Drop,
 }
 
 /// Looks at a due wake before its sandbox is poked, so a wait the
@@ -192,7 +195,14 @@ impl Wakes {
         let due: Vec<Wake> = self.rows.lock().unwrap().iter().filter(|w| w.at <= now).cloned().collect();
         let mut fired = Vec::new();
         for wake in due {
-            if let Some(Verdict::Later { id, at }) = self.gate.get().map(|g| g.check(&wake)) {
+            let verdict = self.gate.get().map(|g| g.check(&wake));
+            if verdict == Some(Verdict::Drop) {
+                let mut rows = self.rows.lock().unwrap();
+                rows.retain(|w| w != &wake);
+                let _ = self.save(&rows).map_err(|e| eprintln!("tod-orchestrator: wakes: {e:#}"));
+                continue;
+            }
+            if let Some(Verdict::Later { id, at }) = verdict {
                 let mut rows = self.rows.lock().unwrap();
                 // Only if it was not replaced or dropped meanwhile.
                 if rows.iter().any(|w| w == &wake) {
