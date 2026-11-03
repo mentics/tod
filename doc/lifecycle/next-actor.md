@@ -1,6 +1,6 @@
 # Who is next: the one answer to "what is this node waiting on?"
 
-Status: design, not built.
+Status: built, apart from the parts listed under "Build order".
 
 Every node that is not `done` is in the same position: **something has to
 happen before it moves, and some actor has to make it happen.** The app must

@@ -1,7 +1,8 @@
 # `tod-agentd`: the resident daemon
 
-Status: **design, not implemented.** Nothing here is built; "Open questions"
-lists what has not been checked against the code.
+Status: built (`crates/tod-agentd`, `crates/tod-agentd-client`). The app starts
+the daemon, and the app and `tod-cli` write through it; "Status and
+deviations" under "Order" says what differs from the design and what is left.
 
 ## The problem
 

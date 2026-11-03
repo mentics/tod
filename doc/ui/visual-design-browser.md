@@ -1,11 +1,11 @@
 # Visual design in an external browser
 
-Status: proposal, with the browser mechanics verified by a spike on Windows
-(section 12). Replaces the embedded `gpui_wry::WebView` in
-`crates/tod-ui/src/views/visual_design_panel.rs`, which is a dead end: it is
-slated for deletion and is not extended. This is built for the
-`VisualDesign` conversation protocol (section 8) and the old panel is deleted
-when that replaces it. Nothing here is written twice.
+Status: built (`crates/tod-ui/src/visual_design/`: the design server, the
+browser launcher and window movers for Windows, macOS and Linux, and page
+feedback), with the browser mechanics first verified by a spike on Windows
+(section 12). It replaced the embedded `gpui_wry::WebView` panel, which is
+deleted. This is built for the `VisualDesign` conversation protocol
+(section 8). Nothing here is written twice.
 
 ## 1. Why change
 
