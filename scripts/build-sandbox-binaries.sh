@@ -22,6 +22,14 @@
 # source mtimes, so a target shared between worktrees reuses whichever one
 # built last whenever this one's files are older, and ships its code.
 #
+# The host (non-Docker) cross builds use one cargo target directory shared by
+# every checkout (TOD_SANDBOX_TARGET_DIR, default ~/.cache/tod/sandbox-target),
+# not each worktree's own target/: the registry crates (typenum, libc, ...) are
+# the same in every worktree, so they compile once instead of once per
+# worktree. Unlike the Docker volume above, this is safe: on the host each
+# checkout has its own path, and a path crate's cargo fingerprint includes it,
+# so worktrees never reuse each other's workspace crates.
+#
 # Usage:
 #   scripts/build-sandbox-binaries.sh [--docker|--no-docker]
 #   scripts/build-sandbox-binaries.sh --docker-test <cargo test args...>
@@ -100,6 +108,12 @@ docker_run() {
 }
 
 TARGET=x86_64-unknown-linux-musl
+# One target dir per toolchain: rust-lld and zigbuild compile with different
+# settings, so sharing one makes each invalidate the other's dependencies and
+# every run recompiles them all.
+HOST_TARGET_DIR="${TOD_SANDBOX_TARGET_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/tod/sandbox-target}"
+LLD_TARGET_DIR="$HOST_TARGET_DIR/lld"
+ZIG_TARGET_DIR="$HOST_TARGET_DIR/zig"
 OUT_DIR="$REPO_ROOT/target/sandbox"
 mkdir -p "$OUT_DIR"
 
@@ -170,6 +184,8 @@ install_bin() {
     return 1
 }
 
+ZIG_PKGS=""
+ZIG_BINS=""
 for entry in "${CANDIDATES[@]}"; do
     IFS=':' read -r bin_name crate_name needs_c <<<"$entry"
     if ! cargo metadata --no-deps --format-version 1 2>/dev/null | grep -q "\"name\":\"$crate_name\""; then
@@ -180,21 +196,18 @@ for entry in "${CANDIDATES[@]}"; do
     if [[ "$needs_c" == "false" ]]; then
         # No C dependencies: plain cross-compile with rust-lld.
         echo "Building $crate_name for $TARGET (no C dependencies, rust-lld)"
-        cargo build --profile "$PROFILE" -p "$crate_name" --target "$TARGET"
-        install_bin "$bin_name" "$REPO_ROOT/target/$TARGET/$PROFILE_DIR" \
+        CARGO_TARGET_DIR="$LLD_TARGET_DIR" cargo build --profile "$PROFILE" -p "$crate_name" --target "$TARGET"
+        install_bin "$bin_name" "$LLD_TARGET_DIR/$TARGET/$PROFILE_DIR" \
             || echo "warning: $bin_name not found after building $crate_name" >&2
         continue
     fi
 
     # Depends on tod-store (bundled SQLite, C): needs a cross C toolchain.
     if [[ $HAVE_ZIGBUILD == 1 ]]; then
-        echo "Building $crate_name for $TARGET with cargo zigbuild"
-        if cargo zigbuild --profile "$PROFILE" -p "$crate_name" --target "$TARGET"; then
-            install_bin "$bin_name" "$REPO_ROOT/target/$TARGET/$PROFILE_DIR" \
-                || echo "warning: $bin_name not found after zigbuild" >&2
-        else
-            echo "warning: cargo zigbuild failed for $crate_name; see the fallback below" >&2
-        fi
+        # Built together below, in one cargo invocation: separate -p sets
+        # unify features differently and would recompile shared dependencies.
+        case " $ZIG_PKGS " in *" -p $crate_name "*) ;; *) ZIG_PKGS="$ZIG_PKGS -p $crate_name" ;; esac
+        ZIG_BINS="$ZIG_BINS $bin_name"
     else
         cat >&2 <<EOF
 warning: $crate_name depends on tod-store (bundled SQLite, C) and cargo-zigbuild
@@ -211,6 +224,18 @@ warning: $crate_name depends on tod-store (bundled SQLite, C) and cargo-zigbuild
 EOF
     fi
 done
+
+if [[ -n $ZIG_PKGS ]]; then
+    echo "Building$ZIG_BINS for $TARGET with cargo zigbuild"
+    if CARGO_TARGET_DIR="$ZIG_TARGET_DIR" cargo zigbuild --profile "$PROFILE" $ZIG_PKGS --target "$TARGET"; then
+        for b in $ZIG_BINS; do
+            install_bin "$b" "$ZIG_TARGET_DIR/$TARGET/$PROFILE_DIR" \
+                || echo "warning: $b not found after zigbuild" >&2
+        done
+    else
+        echo "warning: cargo zigbuild failed for$ZIG_PKGS; see the fallback in this script's header" >&2
+    fi
+fi
 
 echo
 echo "Done. Sandbox binaries are in $OUT_DIR"
