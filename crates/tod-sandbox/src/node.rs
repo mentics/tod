@@ -649,7 +649,7 @@ fn upload_tod_files(bx: &Blaxel, url: &str, payload: &NodePayload, progress: &mu
     let res = bx.run(
         url,
         &format!(
-            "mkdir -p {TOD_DIR}/bin && ln -sf {TOD_CLI_PATH} /usr/local/bin/tod-cli && {LOOPBACK_HOSTS} && printf '%s\\n' {} > {MANIFEST_PATH}",
+            "mkdir -p {TOD_DIR}/bin && ln -sf {TOD_CLI_PATH} /usr/local/bin/tod-cli && {LOOPBACK_HOSTS} && printf '%s\\n' {} > {MANIFEST_PATH}.tmp && mv -f {MANIFEST_PATH}.tmp {MANIFEST_PATH}",
             shell_quote(&node_manifest(payload.relay))
         ),
         30,
