@@ -633,7 +633,13 @@ pub fn install(bx: &Blaxel, url: &str, payload: &NodePayload, progress: &mut dyn
     install_bundles(bx, url, payload, progress)
 }
 
+/// Free space an install needs on the sandbox's root filesystem, at least.
+const INSTALL_MIN_FREE: u64 = 128 * 1024 * 1024;
+
 fn upload_tod_files(bx: &Blaxel, url: &str, payload: &NodePayload, progress: &mut dyn FnMut(&str)) -> Result<()> {
+    // Each binary is written beside its old copy, then renamed over it.
+    let bytes = (payload.relay.len() + payload.supervisor.map_or(0, <[u8]>::len) + payload.local_cli.map_or(0, <[u8]>::len)) as u64;
+    bx.ensure_free_space(url, "/", INSTALL_MIN_FREE.max(bytes * 3), url)?;
     bx.upload_large(url, RELAY_PATH, payload.relay, "0755")?;
     bx.upload(url, TOD_CLI_PATH, payload.shim, "0755")?;
     match payload.supervisor {

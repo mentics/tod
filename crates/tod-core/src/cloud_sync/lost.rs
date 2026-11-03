@@ -515,9 +515,6 @@ pub fn delete_node_sandbox_anyway(fleet: &FleetStore, node_id: &str) -> Result<S
     delete_node_sandbox_with(fleet, node_id, true)
 }
 
-/// Free space a checkpoint needs on the sandbox's root filesystem.
-const CHECKPOINT_MIN_FREE: u64 = 32 * 1024 * 1024;
-
 /// Keeps the sandbox's uncommitted work before it is deleted. A failure says
 /// so and why, and that nothing was deleted; it is never swallowed.
 fn checkpoint_for_delete(bx: &tod_sandbox::blaxel::Blaxel, node_id: &str, name: &str) -> Result<()> {
@@ -526,9 +523,6 @@ fn checkpoint_for_delete(bx: &tod_sandbox::blaxel::Blaxel, node_id: &str, name: 
             "the checkpoint of sandbox {name} failed, so nothing was deleted; delete it anyway to discard its uncommitted work"
         ))
     };
-    if let Some(url) = bx.get(name)?.and_then(|info| info.url) {
-        bx.require_free_space(&url, "/", CHECKPOINT_MIN_FREE, name).map_err(explain)?;
-    }
     super::checkpoint_before_delete(bx, node_id, name).map_err(explain)
 }
 

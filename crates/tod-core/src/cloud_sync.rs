@@ -157,6 +157,12 @@ pub fn sandbox_checkout(bx: &tod_sandbox::blaxel::Blaxel, name: &str) -> Result<
     Ok(tod_store::fleet::Workdir::sandbox(name, path))
 }
 
+/// Free space a checkpoint needs on the sandbox's root filesystem.
+const CHECKPOINT_MIN_FREE: u64 = 32 * 1024 * 1024;
+
+/// Free space a wake needs (the supervisor's settings, its state, its logs).
+const WAKE_MIN_FREE: u64 = 64 * 1024 * 1024;
+
 /// Pushes `node_id`'s uncommitted work in its cloud sandbox `name` to the
 /// hidden checkpoint ref (`tod_store::fleet::checkpoint`), so deleting the
 /// sandbox loses nothing. A sandbox Blaxel does not have has nothing to keep.
@@ -167,8 +173,11 @@ pub fn checkpoint_before_delete(
     node_id: &str,
     name: &str,
 ) -> Result<()> {
-    if bx.get(name)?.is_none() {
+    let Some(info) = bx.get(name)? else {
         return Ok(());
+    };
+    if let Some(url) = info.url {
+        bx.ensure_free_space(&url, "/", CHECKPOINT_MIN_FREE, name)?;
     }
     let checkout = sandbox_checkout(bx, name)?;
     tod_store::fleet::node_checkpoint::checkpoint_dir(&checkout, node_id, &tod_store::fleet::checkpoint::Limits::default())
@@ -1565,7 +1574,7 @@ pub fn ensure_node_sandbox(
     // meanwhile.
     // What this sandbox now runs, so a later build of the app can tell it
     // is out of date ([`refresh`]).
-    refresh::record(root, node_id, &refresh::install_stamp()?)?;
+    refresh::record(root, node_id, &refresh::install()?, None)?;
     // Work checkpointed before an earlier sandbox of this node went away
     // comes back as uncommitted edits. A sandbox that was already up (a
     // refresh, a node that is running) has that work in it already.
@@ -1931,6 +1940,8 @@ pub fn wake_node_with(fleet: &FleetStore, root: &Path, node_id: &str, fresh_sess
         }
     };
     let url = info.url.ok_or_else(|| anyhow!("sandbox {} has no URL", row.sandbox))?;
+    bx.ensure_free_space(&url, "/", WAKE_MIN_FREE, &row.sandbox)
+        .with_context(|| format!("not waking {node_id}'s supervisor"))?;
     push_supervisor_settings(&bx, &url, root, node_id)?;
     if fresh_session {
         let request = format!(
