@@ -260,6 +260,7 @@ impl Server {
                 };
                 self.cli(&user, &request.body)
             }
+            ["github-secrets"] if method == "GET" || method == "PUT" => self.github_secrets(request),
             ["wakes", rest @ ..] if rest.len() <= 1 => {
                 let user = match self.user(request, None) {
                     Ok(u) => u,
@@ -390,6 +391,41 @@ impl Server {
         };
         users::validate(user).map_err(|e| Response::text(400, format!("{e:#}")))?;
         Ok(user.to_string())
+    }
+
+    /// `GET`/`PUT /github-secrets`: the names (never values) of the GitHub
+    /// secrets the orchestrator's proxy holds, as the last apply recorded them
+    /// (`<base>/github-secrets.json`, `{"names": [...]}`). The proxy's secrets
+    /// are replaced as a whole and shared by every user, so an app asks which
+    /// names are held before it replaces them.
+    fn github_secrets(&self, request: &Request) -> Response {
+        let path = self.config.base.join("github-secrets.json");
+        if request.method == "GET" {
+            return match std::fs::read(&path) {
+                Ok(bytes) => Response { status: 200, content_type: "application/json", body: bytes },
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    Response::text(404, "no apply has recorded the proxy's secrets")
+                }
+                Err(err) => Response::text(500, format!("read {}: {err}", path.display())),
+            };
+        }
+        #[derive(serde::Deserialize)]
+        struct Names {
+            names: Vec<String>,
+        }
+        let names: Names = match serde_json::from_slice(&request.body) {
+            Ok(n) => n,
+            Err(err) => return Response::text(400, format!("bad secret names: {err}")),
+        };
+        if let Some(bad) = names.names.iter().find(|n| n.is_empty() || !n.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')) {
+            return Response::text(400, format!("bad secret name {bad:?}: letters, digits and _"));
+        }
+        let tmp = path.with_extension("json.tmp");
+        let body = serde_json::json!({ "names": names.names });
+        match std::fs::write(&tmp, body.to_string()).and_then(|()| std::fs::rename(&tmp, &path)) {
+            Ok(()) => Response::text(200, "ok"),
+            Err(err) => Response::text(500, format!("write {}: {err}", path.display())),
+        }
     }
 
     /// `GET`/`PUT /users/<u>/github-routes`: which of the orchestrator's
