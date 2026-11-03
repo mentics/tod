@@ -176,11 +176,29 @@ pub fn ensure_running(data_root: &Path, executable: &Path) -> Result<Ensured> {
     // A `tod-agentd` left over from an older build would start, be found
     // older, and be replaced by the next caller's, over and over.
     if !matches!(Info::read(&Paths::new(data_root)), Some(i) if i.stamp == me.stamp) {
-        let built = std::process::Command::new(executable)
-            .arg("--build-stamp")
-            .output()
-            .with_context(|| format!("run {}", executable.display()))?;
-        let built = String::from_utf8_lossy(&built.stdout).trim().to_string();
+        // The system may kill a program at its first run (see
+        // [`killed_at_start`]): ask again, and say so if it keeps doing it,
+        // rather than call the empty answer "a different build".
+        let mut attempt = 1;
+        let built = loop {
+            let out = std::process::Command::new(executable)
+                .arg("--build-stamp")
+                .output()
+                .with_context(|| format!("run {}", executable.display()))?;
+            if killed_at_start(&out.status) {
+                if attempt < START_ATTEMPTS {
+                    attempt += 1;
+                    std::thread::sleep(Duration::from_millis(200));
+                    continue;
+                }
+                bail!(
+                    "{} was killed by the system ({}) every one of {START_ATTEMPTS} times it was run to read its build",
+                    executable.display(),
+                    out.status
+                );
+            }
+            break String::from_utf8_lossy(&out.stdout).trim().to_string();
+        };
         if built != me.stamp {
             bail!(
                 "{} is from a different build than this program ({built}, not {});                  build tod-agentd too (cargo build -p tod-agentd)",
@@ -294,15 +312,19 @@ fn spawn(paths: &Paths, executable: &Path, me: &Identity) -> Result<Info> {
     };
     // A launcher inside a job object that kills its children on exit needs
     // breakaway; if that is refused, start without it and say so.
-    let mut child = match launch(Detach::Breakaway) {
-        Ok(child) => child,
-        Err(err) => {
-            eprintln!("tod-agentd: starting with breakaway failed ({err}); starting without");
-            launch(Detach::Plain).context("start tod-agentd")?
+    let start = || -> Result<std::process::Child> {
+        match launch(Detach::Breakaway) {
+            Ok(child) => Ok(child),
+            Err(err) => {
+                eprintln!("tod-agentd: starting with breakaway failed ({err}); starting without");
+                launch(Detach::Plain).context("start tod-agentd")
+            }
         }
     };
 
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut attempt = 1;
+    let mut child = start()?;
+    let mut deadline = Instant::now() + Duration::from_secs(60);
     while Instant::now() < deadline {
         if let Some(connection) = connect(paths) {
             return Ok(connection.info);
@@ -312,11 +334,51 @@ fn spawn(paths: &Paths, executable: &Path, me: &Identity) -> Result<Info> {
             if let Some(connection) = connect(paths) {
                 return Ok(connection.info);
             }
+            // macOS sometimes kills a program at its first run, while it
+            // checks the signature of what it was given (seen about one start
+            // in five under load, with the hard link): start it again, from a
+            // real copy this time.
+            if killed_at_start(&status) && attempt < START_ATTEMPTS {
+                attempt += 1;
+                eprintln!("tod-agentd: killed at start ({status}); starting it again (attempt {attempt})");
+                replace_with_copy(&copy, executable)?;
+                child = start()?;
+                deadline = Instant::now() + Duration::from_secs(60);
+                continue;
+            }
             bail!("tod-agentd exited at start ({status}); see {}", paths.log().display());
         }
         std::thread::sleep(Duration::from_millis(50));
     }
     bail!("tod-agentd did not answer within 60s; see {}", paths.log().display())
+}
+
+/// How many times a daemon killed at start is started again.
+const START_ATTEMPTS: u32 = 3;
+
+/// Whether the daemon was killed by SIGKILL, which is not something it does
+/// itself: the system refused to run it.
+fn killed_at_start(status: &std::process::ExitStatus) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        status.signal() == Some(9)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = status;
+        false
+    }
+}
+
+/// Puts a real copy of `executable` (a new file, not another name for the same
+/// one) where `copy` is.
+fn replace_with_copy(copy: &Path, executable: &Path) -> Result<()> {
+    let tmp = copy.with_extension("partial");
+    let _ = std::fs::remove_file(&tmp);
+    std::fs::copy(executable, &tmp).with_context(|| format!("copy {}", executable.display()))?;
+    std::fs::rename(&tmp, copy).with_context(|| format!("replace {}", copy.display()))?;
+    Ok(())
 }
 
 #[derive(Clone, Copy)]
@@ -346,5 +408,18 @@ impl Detach {
         // launcher does not signal it.
         command.process_group(0);
         let _ = self;
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::ExitStatus;
+
+    #[test]
+    fn only_sigkill_counts_as_killed_at_start() {
+        assert!(super::killed_at_start(&ExitStatus::from_raw(9)));
+        assert!(!super::killed_at_start(&ExitStatus::from_raw(15)));
+        assert!(!super::killed_at_start(&ExitStatus::from_raw(1 << 8)), "a plain exit 1");
     }
 }
