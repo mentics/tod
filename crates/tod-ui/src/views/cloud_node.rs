@@ -71,6 +71,24 @@ pub fn delete_sandbox<T: 'static>(
     });
 }
 
+/// [`delete_sandbox`] without the checkpoint first
+/// (`cloud_sync::lost::delete_node_sandbox_anyway`): uncommitted work in the
+/// sandbox is lost, so the caller offers it only beside the ordinary delete.
+pub fn delete_sandbox_anyway<T: 'static>(
+    fleet: Arc<FleetStore>,
+    node_id: String,
+    cx: &mut Context<T>,
+    on_update: impl Fn(&mut T, CloudUpdate, &mut Context<T>) + 'static,
+) {
+    spawn(cx, on_update, move |tx| {
+        let _ = tx.send_blocking(CloudUpdate::Progress("Deleting the sandbox without a checkpoint…".into()));
+        let _ = tx.send_blocking(match cloud_sync::lost::delete_node_sandbox_anyway(&fleet, &node_id) {
+            Ok(msg) => CloudUpdate::Synced(msg),
+            Err(err) => CloudUpdate::failed(describe("Delete sandbox failed", &err)),
+        });
+    });
+}
+
 /// Run `node_id` in the cloud off the UI thread; `on_update` hears each step
 /// and the result.
 pub fn run_in_cloud<T: 'static>(

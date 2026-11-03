@@ -225,6 +225,10 @@ enum RunnerAction {
     LeaveCloud,
     /// Delete the node's sandbox in Blaxel (a missing one is fine).
     DeleteSandbox,
+    /// [`Self::DeleteSandbox`] without the checkpoint of uncommitted work
+    /// first: for a sandbox whose checkpoint cannot run (out of disk, a
+    /// broken checkout), which would otherwise refuse to be deleted.
+    DeleteSandboxAnyway,
 }
 
 impl RunnerAction {
@@ -248,6 +252,7 @@ impl RunnerAction {
             Self::ReinstallCloud => "Reinstall and restart",
             Self::LeaveCloud => "Stop running in the cloud",
             Self::DeleteSandbox => "Delete Sandbox",
+            Self::DeleteSandboxAnyway => "Delete Sandbox without a checkpoint",
         }
     }
 }
@@ -772,7 +777,7 @@ impl TaskPanel {
             if self.runner.cloud_failed {
                 return RunnerActions {
                     primary: Some((A::ReinstallCloud, A::ReinstallCloud.label(), self.runner.cloud_busy)),
-                    menu: if self.runner.cloud_busy { Vec::new() } else { vec![A::RunFresh, A::SyncCloud, A::UpdateWorkspace, A::DeleteSandbox, A::LeaveCloud] },
+                    menu: if self.runner.cloud_busy { Vec::new() } else { vec![A::RunFresh, A::SyncCloud, A::UpdateWorkspace, A::DeleteSandbox, A::DeleteSandboxAnyway, A::LeaveCloud] },
                 };
             }
             // Stopped by its own "leave it stopped" answer: syncing re-wakes a
@@ -786,13 +791,13 @@ impl TaskPanel {
                     menu: if self.runner.cloud_busy {
                         Vec::new()
                     } else {
-                        vec![A::RunFresh, A::SyncCloud, A::ReinstallCloud, A::UpdateWorkspace, A::DeleteSandbox, A::LeaveCloud]
+                        vec![A::RunFresh, A::SyncCloud, A::ReinstallCloud, A::UpdateWorkspace, A::DeleteSandbox, A::DeleteSandboxAnyway, A::LeaveCloud]
                     },
                 };
             }
             return RunnerActions {
                 primary: Some((A::SyncCloud, A::SyncCloud.label(), self.runner.cloud_busy)),
-                menu: if self.runner.cloud_busy { Vec::new() } else { vec![A::RunFresh, A::ReinstallCloud, A::UpdateWorkspace, A::DeleteSandbox, A::LeaveCloud] },
+                menu: if self.runner.cloud_busy { Vec::new() } else { vec![A::RunFresh, A::ReinstallCloud, A::UpdateWorkspace, A::DeleteSandbox, A::DeleteSandboxAnyway, A::LeaveCloud] },
             };
         }
         if self.runner.cloud_busy {
@@ -955,6 +960,15 @@ impl TaskPanel {
             A::DeleteSandbox => {
                 self.cloud_started(cx);
                 crate::views::cloud_node::delete_sandbox(
+                    self.fleet.clone(),
+                    node.to_string(),
+                    cx,
+                    move |this, update, cx| this.on_cloud_update(node, update, cx),
+                );
+            }
+            A::DeleteSandboxAnyway => {
+                self.cloud_started(cx);
+                crate::views::cloud_node::delete_sandbox_anyway(
                     self.fleet.clone(),
                     node.to_string(),
                     cx,
