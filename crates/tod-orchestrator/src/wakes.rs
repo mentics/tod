@@ -162,7 +162,12 @@ impl Wakes {
 
     fn save(&self, rows: &[Wake]) -> Result<()> {
         let tmp = self.path.with_extension("json.tmp");
-        std::fs::write(&tmp, serde_json::to_vec_pretty(rows)?).with_context(|| format!("write {}", tmp.display()))?;
+        // Written and synced before the rename, so a crash leaves the old
+        // file or the new one, never half of either.
+        let mut file = std::fs::File::create(&tmp).with_context(|| format!("write {}", tmp.display()))?;
+        file.write_all(&serde_json::to_vec_pretty(rows)?).with_context(|| format!("write {}", tmp.display()))?;
+        file.sync_all().with_context(|| format!("sync {}", tmp.display()))?;
+        drop(file);
         std::fs::rename(&tmp, &self.path).with_context(|| format!("write {}", self.path.display()))
     }
 
@@ -174,6 +179,21 @@ impl Wakes {
         self.save(&rows)?;
         self.changed.notify_all();
         Ok(())
+    }
+
+    /// Records `new` (all of one node) only when `user` has no wake at all
+    /// for `node`, under one lock and one save, so a rebuild never adds a
+    /// second wake beside one that exists. Returns how many were added.
+    pub fn put_if_node_has_none(&self, user: &str, node: &str, new: Vec<Wake>) -> Result<usize> {
+        let mut rows = self.rows.lock().unwrap();
+        if new.is_empty() || rows.iter().any(|w| w.user == user && w.node == node) {
+            return Ok(0);
+        }
+        let added = new.len();
+        rows.extend(new);
+        self.save(&rows)?;
+        self.changed.notify_all();
+        Ok(added)
     }
 
     /// Drops `id` if `user` owns it. Returns whether one was dropped.

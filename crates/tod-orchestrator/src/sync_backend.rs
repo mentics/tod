@@ -282,6 +282,11 @@ pub fn apply_changes(
         crate::impact_handler::poke(wakes, name, &affected);
         crate::answers::poke(wakes, name, &answered);
         crate::wait_changes::poke(wakes, name, &waits_changed);
+        // A wait changed for a node that has no wake: it would sleep past it.
+        let nodes: Vec<Uuid> = waits_changed.iter().map(|r| r.node_id).collect();
+        if !nodes.is_empty() {
+            crate::wake_rebuild::log_rebuild(user, name, wakes, Some(&nodes), "after applied changes");
+        }
     }
     response
 }

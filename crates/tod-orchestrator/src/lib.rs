@@ -42,6 +42,7 @@ pub mod sync_backend;
 pub mod transcripts;
 pub mod users;
 pub mod wait_changes;
+pub mod wake_rebuild;
 pub mod wakes;
 pub mod webhooks;
 
@@ -130,11 +131,16 @@ impl Server {
         wakes.set_gate(Box::new(github_gate::GithubGate::new(users.clone())));
         let notifier = notify::Notifier::start(Box::new(notify::StoreProbe(users.clone())), sink);
         let webhook_secrets = webhooks::Secrets::load(&config.base)?;
+        wake_rebuild::rebuild_all(&users, &wakes);
         Ok(Arc::new(Self { config, users, wakes, notifier, webhook_secrets, broker: broker::Broker::default(), feed_signal: Default::default() }))
     }
 
     pub fn wakes(&self) -> &Arc<wakes::Wakes> {
         &self.wakes
+    }
+
+    pub fn users(&self) -> &Arc<users::Users> {
+        &self.users
     }
 
     /// Starts the wake timer, then accepts connections until the listener
@@ -267,13 +273,19 @@ impl Server {
                     Err(r) => return r,
                 };
                 match (method, rest) {
-                    ("POST", ["seed"]) => sync_backend::seed(
-                        &self.users,
-                        &user,
-                        &request.body,
-                        client(request).unwrap_or("unknown"),
-                        request.header(sync_backend::TAKE_OVER_HEADER) == Some("yes"),
-                    ),
+                    ("POST", ["seed"]) => {
+                        let response = sync_backend::seed(
+                            &self.users,
+                            &user,
+                            &request.body,
+                            client(request).unwrap_or("unknown"),
+                            request.header(sync_backend::TAKE_OVER_HEADER) == Some("yes"),
+                        );
+                        if response.status == 200 {
+                            wake_rebuild::rebuild_user(&self.users, &user, &self.wakes, "after a seed");
+                        }
+                        response
+                    }
                     ("POST", ["changes"]) => match self.users.get(&user) {
                         Ok(data) if !sync_backend::is_seeded(&data.root) => Response::text(409, sync_backend::NOT_SEEDED),
                         Ok(data) => match supervisor_node(request) {
