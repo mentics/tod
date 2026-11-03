@@ -351,6 +351,8 @@ pub enum InterviewCommand {
     RecordNodeRequest { node_id: Uuid, kind: String, by: String, at: i64 },
     /// Consume a request: when and by whom (`crate::node_requests::consume`).
     ConsumeNodeRequest { request_id: Uuid, by: String, at: i64 },
+    /// Record what a node's runner is doing (`crate::run_state`).
+    SetRunState { node_id: Uuid, draft: crate::run_state::Draft, writer: String, at: i64 },
     /// Move a wait to another state (`satisfied`, `cancelled`, `expired`).
     SetWaitState { wait_id: Uuid, state: String },
     /// Set a pending wait's next time (a poll's next check).
@@ -1217,6 +1219,10 @@ pub fn execute(
         InterviewCommand::RecordNodeRequest { node_id, kind, by, at } => {
             let id = crate::node_requests::record(conn, *node_id, kind, by, *at)?;
             Ok(json!({ "id": id.to_string() }))
+        }
+        InterviewCommand::SetRunState { node_id, draft, writer, at } => {
+            let changed = crate::run_state::set(conn, *node_id, draft, writer, *at)?;
+            Ok(json!({ "changed": changed }))
         }
         InterviewCommand::ConsumeNodeRequest { request_id, by, at } => {
             let consumed = crate::node_requests::consume(conn, *request_id, by, *at)?;

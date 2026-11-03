@@ -25,6 +25,9 @@ use tod_store::conversation::ProtocolKind;
 use tod_store::fleet::FleetStore;
 use uuid::Uuid;
 
+/// Who a local run names as the writer of its run state.
+const WRITER: &str = "local";
+
 /// The reason a run the user paused stopped with.
 pub const PAUSED: &str = "paused";
 /// The reason a run the user stopped mid-turn stopped with.
@@ -155,6 +158,7 @@ impl LocalRun {
                     fleet: fleet.clone(),
                     lease: None,
                     lease_error: None,
+                    state_error: None,
                     request: hook_request,
                     poll: hook_poll,
                     on_event: &mut on_event,
@@ -162,7 +166,8 @@ impl LocalRun {
                     last_at: None,
                     waiting: false,
                 };
-                let result = (|| {
+                let result = (|| -> Result<Outcome> {
+                    crate::run_state::record(&fleet, node, crate::run_state::working("running on this machine"), WRITER)?;
                     let mut pilot = Autopilot::new(config, node, budget)?;
                     if let Some(poll) = poll {
                         pilot = pilot.with_poll_interval(poll);
@@ -173,7 +178,16 @@ impl LocalRun {
                     let outcome = pilot.run_with(&fleet, &mut SharedAgentAccess(&agent), &mut hook);
                     // Before the run stops for a wait, a request, or the end.
                     push_branch(&fleet, node);
-                    outcome
+                    // How it ended, as the node's run state: the one place
+                    // `next_actor` reads why a run stopped.
+                    let outcome = outcome?;
+                    crate::run_state::record(
+                        &fleet,
+                        node,
+                        crate::run_state::for_outcome(&outcome, crate::run_state::Words::local()),
+                        WRITER,
+                    )?;
+                    Ok(outcome)
                 })();
                 let result = result.map_err(|err| {
                     let error = format!("{err:#}");
@@ -185,7 +199,12 @@ impl LocalRun {
                         });
                         let _ = state.save(&data_root, node);
                     }
-                    error
+                    // A run that failed leaves that as its state too. If even
+                    // that cannot be recorded the error says so beside the failure.
+                    match crate::run_state::record(&fleet, node, crate::run_state::runner_failed(&error), WRITER) {
+                        Ok(_) => error,
+                        Err(record) => format!("{error} (and the run state could not be recorded: {record:#})"),
+                    }
                 });
                 drop(hook);
                 on_event(LocalEvent::Finished(result));
@@ -250,6 +269,10 @@ struct Hook<'a, F: FnMut(LocalEvent)> {
     /// Why the lease could not be taken; the run stops with it at its next
     /// boundary, since work that cannot prove it is running must not claim to.
     lease_error: Option<String>,
+    /// Why the run state could not be recorded (`tod_store::run_state`); the
+    /// run stops with it at its next boundary rather than leave the node
+    /// saying something else.
+    state_error: Option<String>,
     request: Arc<AtomicU8>,
     poll: Arc<std::sync::atomic::AtomicBool>,
     on_event: &'a mut F,
@@ -331,6 +354,9 @@ impl<F: FnMut(LocalEvent)> StepHook for Hook<'_, F> {
         if let Some(error) = self.lease_error.take() {
             anyhow::bail!("{error}");
         }
+        if let Some(error) = self.state_error.take() {
+            anyhow::bail!("{error}");
+        }
         Ok(match self.requested() {
             Request::Run => None,
             Request::Pause => Some(PAUSED.to_string()),
@@ -340,6 +366,13 @@ impl<F: FnMut(LocalEvent)> StepHook for Hook<'_, F> {
 
     fn waiting(&mut self, on: Option<&str>, next_poll_ms: Option<i64>) {
         self.waiting = on.is_some();
+        let draft = match on {
+            Some(what) => crate::run_state::waiting_outside(what),
+            None => crate::run_state::working("running on this machine"),
+        };
+        if let Err(err) = crate::run_state::record(&self.fleet, self.node, draft, WRITER) {
+            self.state_error = Some(format!("{err:#}"));
+        }
         // Waiting on GitHub or a person is not working: the node says whose
         // turn it is instead (`tod_core::next_actor`).
         if on.is_some() {

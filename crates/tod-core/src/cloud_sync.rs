@@ -1886,6 +1886,7 @@ fn run_in_cloud_reporting(
     // "Run": a row the supervisor consumes when it starts, which also
     // supersedes an older answer to leave the node stopped.
     record_node_request(fleet, node_id, REQUEST_RUN)?;
+    record_starting(fleet, node_id)?;
     progress("syncing with the orchestrator…");
     let (orch, user) = resolve(root)?;
     sync(fleet, root, &orch, &user)?;
@@ -2102,6 +2103,17 @@ pub use tod_store::node_requests::{
     KIND_RUN as REQUEST_RUN,
 };
 
+/// Writes the node's `starting` run state (`tod_store::run_state`) before
+/// anything is sent or seeded, so it reads as being started from the first
+/// sync on, not as "not started" until its supervisor first reports in. The
+/// supervisor overwrites it with its own words as soon as it has them; one
+/// built before the table ignores it and its heartbeat speaks instead.
+pub fn record_starting(fleet: &FleetStore, node_id: &str) -> Result<()> {
+    let node = uuid::Uuid::parse_str(node_id).with_context(|| format!("node id {node_id}"))?;
+    crate::run_state::record(fleet, node, crate::run_state::sending(), "app")?;
+    Ok(())
+}
+
 /// The actor that records a request row.
 pub const REQUEST_ACTOR: &str = "app:request";
 
@@ -2140,6 +2152,7 @@ pub fn wake_node_requesting(fleet: &FleetStore, root: &Path, node_id: &str, kind
         continue_over_stop_answer(fleet, node_id)?;
     }
     record_node_request(fleet, node_id, kind)?;
+    record_starting(fleet, node_id)?;
     sync(fleet, root, &orch, &user).context("send the change to the orchestrator")?;
     let sandboxes = tod_store::fleet::sandbox::Sandboxes::load(root)?;
     let bx = sandboxes.blaxel()?;

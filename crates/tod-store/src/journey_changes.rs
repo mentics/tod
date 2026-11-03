@@ -38,6 +38,8 @@
 //!   that creates the tables.
 //! - `node_requests` (`tod_store::node_requests`), created by
 //!   [`node_requests_triggers_sql`] (same shape as `waits`).
+//! - `run_state` (`tod_store::run_state`), created by
+//!   [`run_state_triggers_sql`] (same shape as `cloud_nodes`).
 //! - `waits` (`tod_store::waits`), created by [`waits_triggers_sql`] in the
 //!   v67 migration for the same reason.
 //! - `cloud_nodes` (`tod_store::cloud_nodes`), created by
@@ -289,6 +291,11 @@ pub fn waits_triggers_sql() -> String {
 /// one is an update).
 pub fn node_requests_triggers_sql() -> String {
     simple_id_triggers("node_requests")
+}
+
+/// Triggers for `run_state` (one row per node, keyed by `node_id`).
+pub fn run_state_triggers_sql() -> String {
+    node_keyed_triggers("run_state")
 }
 
 /// Triggers for `node_events` (webhook events routed to a node).

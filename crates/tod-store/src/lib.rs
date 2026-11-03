@@ -41,6 +41,7 @@ pub mod sync;
 pub mod verification;
 pub mod node_events;
 pub mod node_requests;
+pub mod run_state;
 pub mod waits;
 
 /// Agent launch options and live traffic counters live in `tod-agent` (they

@@ -261,6 +261,10 @@ fn leave_it_stopped_after_failures_keeps_the_node_stopped() {
             reason.starts_with("left stopped: ") && reason.contains("failing several times") && reason.contains("Leave it stopped"),
             "{reason}"
         );
+        let state = tod_store::run_state::get(&conn, s.node).unwrap().expect("no run state left");
+        assert_eq!(state.phase, tod_store::run_state::Phase::Stopped);
+        assert_eq!(state.reason_kind, tod_core::run_state::kind::LEFT_STOPPED);
+        assert_eq!(state.reason_text, reason);
     }
     // Held only while it looked: released before going back to sleep.
     let seen = seen.lock().unwrap().clone();

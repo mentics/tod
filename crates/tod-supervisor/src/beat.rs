@@ -99,11 +99,12 @@ impl Beating {
 
     /// The run is over: stops the beat, marks the row idle (with `stopped`,
     /// why the wake ended needing someone, when it did), and sends that.
-    pub fn finish(mut self, stopped: Option<String>) -> Result<()> {
-        self.end(stopped.as_deref())
+    /// `state` is how the run ended as the node's run state.
+    pub fn finish(mut self, stopped: Option<String>, state: &tod_store::run_state::Draft) -> Result<()> {
+        self.end(stopped.as_deref(), state)
     }
 
-    fn end(&mut self, stopped: Option<&str>) -> Result<()> {
+    fn end(&mut self, stopped: Option<&str>, state: &tod_store::run_state::Draft) -> Result<()> {
         drop(self.stop.take());
         if let Some(thread) = self.thread.take()
             && thread.join().is_err()
@@ -111,14 +112,14 @@ impl Beating {
             tracing::warn!("the cloud heartbeat thread panicked");
         }
         let mut replica = self.replica.lock().unwrap_or_else(|e| e.into_inner());
-        replica.end_cloud_beat(self.node, stopped).context("telling the app this node is no longer being worked on")
+        replica.end_cloud_beat(self.node, stopped, state).context("telling the app this node is no longer being worked on")
     }
 }
 
 impl Drop for Beating {
     fn drop(&mut self) {
         if self.stop.is_some()
-            && let Err(err) = self.end(Some(UNEXPECTED_END))
+            && let Err(err) = self.end(Some(UNEXPECTED_END), &tod_core::run_state::runner_failed(UNEXPECTED_END))
         {
             // The row stays and goes stale: shown as lost, not hidden.
             tracing::warn!("cloud heartbeat: {err:#}");

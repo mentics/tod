@@ -322,6 +322,19 @@ fn budget_question(limit: &BudgetLimit, budget: &Budget) -> String {
     )
 }
 
+/// A spent budget in plain words, with what was used and what answers it.
+fn budget_reason(limit: &BudgetLimit, budget: &Budget) -> String {
+    let (sessions, spent_hours) = budget_spent(limit, budget);
+    format!(
+        "its budget is spent ({sessions} of {} sessions, {} of {} hours). \
+         Answer the budget question \"{}\" to give it more.",
+        budget.max_sessions,
+        fmt_hours(spent_hours),
+        hours(budget.max_duration),
+        tod_core::stop_questions::KEEP_GOING,
+    )
+}
+
 /// Why a wake that ended with `outcome` leaves the node needing someone, in
 /// plain words, for the app to show (`cloud_activity.stopped`); `None` when
 /// it does not: the node is done, waits on something outside (its wait row
@@ -336,17 +349,7 @@ pub fn stop_reason(outcome: &Outcome, budget: &Budget) -> Option<String> {
         // wait the supervisor recorded and scheduled.
         Outcome::Stopped { reason } if reason.starts_with("waiting") || reason.starts_with("usage limit: waiting") => None,
         Outcome::Stopped { reason } => Some(format!("the supervisor stopped: {reason}")),
-        Outcome::BudgetExhausted { limit } => {
-            let (sessions, spent_hours) = budget_spent(limit, budget);
-            Some(format!(
-                "its budget is spent ({sessions} of {} sessions, {} of {} hours). \
-                 Answer the budget question \"{}\" to give it more.",
-                budget.max_sessions,
-                fmt_hours(spent_hours),
-                hours(budget.max_duration),
-                tod_core::stop_questions::KEEP_GOING,
-            ))
-        }
+        Outcome::BudgetExhausted { limit } => Some(budget_reason(limit, budget)),
         Outcome::NeedsHuman { reason } => match reason {
             // Requests: shown from the request itself.
             NeedsHuman::Decision { .. }
@@ -494,7 +497,11 @@ pub fn wake(config: Config) -> Result<Woke> {
             // Say so, as a wait does below: the app waits to hear from a
             // supervisor it woke, and a wake that leaves the node stopped is
             // an answer, not silence.
-            replica.lock().unwrap_or_else(|e| e.into_inner()).end_cloud_beat(config.node, Some(&reason))?;
+            replica.lock().unwrap_or_else(|e| e.into_inner()).end_cloud_beat(
+                config.node,
+                Some(&reason),
+                &tod_core::run_state::left_stopped(&reason),
+            )?;
             tracing::info!(%reason, "left stopped; going back to sleep");
             return Ok(Woke::LeftStopped(reason));
         }
@@ -520,7 +527,11 @@ pub fn wake(config: Config) -> Result<Woke> {
         // Say so: the app waits to hear from a supervisor it started (a
         // reinstall, "Check now"), and a wake that finds nothing due is an
         // answer, not silence.
-        replica.lock().unwrap_or_else(|e| e.into_inner()).end_cloud_beat(config.node, None)?;
+        replica.lock().unwrap_or_else(|e| e.into_inner()).end_cloud_beat(
+            config.node,
+            None,
+            &tod_core::run_state::waiting_outside(&reason),
+        )?;
         tracing::info!(%reason, "still waiting; going back to sleep");
         return Ok(Woke::StillWaiting(reason));
     }
@@ -700,7 +711,17 @@ pub fn wake(config: Config) -> Result<Woke> {
         Ok(outcome) => woke_reason(&Woke::Ran(outcome.clone()), &budget),
         Err(err) => Some(format!("the supervisor failed: {err:#}")),
     };
-    let ended = beating.finish(stopped);
+    let state = match &run {
+        Ok(outcome) => tod_core::run_state::for_outcome(
+            outcome,
+            tod_core::run_state::Words {
+                budget: &|limit| budget_reason(limit, &budget),
+                stopped_by: Some("the supervisor"),
+            },
+        ),
+        Err(err) => tod_core::run_state::runner_failed(&format!("the supervisor failed: {err:#}")),
+    };
+    let ended = beating.finish(stopped, &state);
     let pushed = replica.lock().unwrap_or_else(|e| e.into_inner()).push();
     if config.push_branch
         && let Err(err) = git::push_branch(&config.workspace)
@@ -774,6 +795,58 @@ mod tests {
             assert_eq!(text, needs.describe());
             assert!(!text.contains("fix_failed") && !text.contains("_"), "internal names leak: {text}");
         }
+    }
+
+    /// The beat's stop reason (kept for a supervisor's old readers) and the
+    /// run state agree on every outcome: one says "needs someone" exactly
+    /// when the other is `stopped`, with the same words where both have them.
+    #[test]
+    fn the_run_state_and_the_idle_beat_agree_on_every_outcome() {
+        use tod_store::run_state::Phase;
+        let budget = budget();
+        let words = tod_core::run_state::Words {
+            budget: &|limit| budget_reason(limit, &budget),
+            stopped_by: Some("the supervisor"),
+        };
+        let mut outcomes = vec![
+            Outcome::Done,
+            Outcome::Waiting { what: "checks".into(), due_at_ms: 1 },
+            Outcome::Stopped { reason: "waiting: a review".into() },
+            Outcome::Stopped { reason: usage_limit_reason(&usage_limit::UsageLimit { reset_at_ms: 5, parsed: true }) },
+            Outcome::Stopped { reason: "a new session was requested".into() },
+            Outcome::BudgetExhausted { limit: BudgetLimit::Sessions { used: 60 } },
+            Outcome::BudgetExhausted { limit: BudgetLimit::Time { elapsed_secs: 16 * 3600 } },
+        ];
+        for needs in [
+            NeedsHuman::Decision { pending: 1 },
+            NeedsHuman::BlockedSteps { count: 1 },
+            NeedsHuman::FailingCriteria { criteria: vec!["tests".into()] },
+            NeedsHuman::GateNotPassed { result: "fail".into(), summary: "s".into() },
+            NeedsHuman::NoPlan,
+            NeedsHuman::EvaluationStuck { fixes: vec!["f".into()] },
+            NeedsHuman::PrBlocked { why: "conflict".into() },
+            NeedsHuman::PrStuck { why: "threads".into() },
+            NeedsHuman::Permission { title: "Write x".into() },
+            NeedsHuman::AgentFailed { error: "boom".into() },
+            NeedsHuman::NoProgress { step: "fix_failed".into() },
+            NeedsHuman::Looping { what: "a test".into(), times: 3 },
+        ] {
+            outcomes.push(Outcome::NeedsHuman { reason: needs });
+        }
+        for outcome in outcomes {
+            let beat = stop_reason(&outcome, &budget);
+            let state = tod_core::run_state::for_outcome(&outcome, words);
+            assert_eq!(beat.is_some(), state.phase == Phase::Stopped, "{outcome:?}: {beat:?} vs {state:?}");
+            if let (Some(beat), Outcome::BudgetExhausted { .. } | Outcome::Stopped { .. }) = (&beat, &outcome) {
+                assert_eq!(&state.reason_text, beat, "{outcome:?}");
+            }
+        }
+        // The supervisor's budget words, on the row.
+        let spent = tod_core::run_state::for_outcome(
+            &Outcome::BudgetExhausted { limit: BudgetLimit::Sessions { used: 60 } },
+            words,
+        );
+        assert!(spent.reason_text.contains("60 of 60 sessions") && spent.reason_text.contains("Keep going"));
     }
 
     #[test]

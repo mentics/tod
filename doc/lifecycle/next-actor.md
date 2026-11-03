@@ -113,8 +113,10 @@ When more than one holds, the first of these wins (as built in
    Processing wins over open requests and a stale outcome, as `RunnerStatus`
    already did: the node is moving, and the run's own result replaces them.
 4. A request is open → `You`.
-5. The last run failed, stopped, or was paused → `You`. This beats a pending
-   wait, so a failure is never hidden behind one.
+5. The last run failed, stopped, or was paused → `You`: the run state's
+   `stopped` row, else the heartbeat's reason or the saved run. This beats a
+   pending wait, so a failure is never hidden behind one. (A `starting` row
+   sits here too: `Working` for 150 s, then a failure.)
 6. A pending external wait → `Others`.
 7. Otherwise → `You::NotStarted`. Nothing is ever "idle": a node with no
    actor is a node nobody has been told to move.
@@ -505,6 +507,48 @@ A supervisor older than this does not beat: its nodes read as before until
 deployed first (`scripts/deploy.sh`): it refuses a push
 carrying a table it does not know, and an app older than the orchestrator
 refuses a feed carrying `cloud_activity`.
+
+### The run state: one synced row per node
+
+Beside the heartbeat, whoever runs a node says what it is doing and why in one
+synced row, `run_state` (`tod_store::run_state`, schema v91, robustness plan
+3.1): `{phase: starting|working|waiting|stopped|done, reason_kind,
+reason_text, since, resumable_by, updated_at, writer}`. It is written at every
+transition by the cloud supervisor (`tod_supervisor`: `working` with each
+beat, then the run's end in the same write as its idle beat), the local
+autopilot runner (`autopilot::local`: `working`, `waiting` while it polls
+something outside, the run's end), and the app (`starting`, written by
+`cloud_sync::record_starting` before anything is sent or seeded, so the node
+reads as being started from the click and the 150 s silence is gone). A write
+that repeats the same state leaves the row alone, so `since` is when the state
+began.
+
+`tod_core::run_state::for_outcome` is the one map from how a run ended to the
+row, exhaustive over `Outcome` and every `NeedsHuman` (no wildcard arm: a new
+one does not compile until it has a kind, a phase and words). `stopped` rows
+carry `resumable_by = you`; `waiting` rows are a request (`attention` shows
+it), something outside (the wait row shows it) or a retry time, and `done` is
+the lifecycle's. `next_actor` reads the row for cloud and local alike:
+
+- `starting`: `Working { CloudStart }` for 150 s from the write, then
+  `You::Failed` ("the cloud supervisor has not reported in ... Run in the cloud
+  sends it again"). Ignored once a heartbeat newer than the row exists.
+- `stopped`: `You::Stopped { reason_text }`, `You::Failed { error }`
+  (`failed`) or `You::Paused` (`paused`, `stopped_now`), since `since`.
+  Ignored when a later word exists: a heartbeat or a saved local run dated
+  more than 5 s after the row.
+- `working`, `waiting`, `done`: nothing of their own. `Working` is still only
+  proved by a live lease or heartbeat, a wait is the wait row's, `done` the
+  lifecycle's.
+
+The row is the preferred word and the older evidence stays as the fallback:
+a supervisor built before the table writes no row, so its `cloud_activity`
+beat (live, stale, idle with a `stopped` reason) and the app's saved local run
+speak exactly as above. Both directions are compatible: a new supervisor still
+writes the heartbeat and `stopped` reason an old app reads, and an old app
+ignores the row. Not done yet: the orchestrator does not stamp the row (the
+writer's clock is used), and a runner that dies without a final write leaves
+its last row until the heartbeat goes stale.
 
 ### Deferring a node
 

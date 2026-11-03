@@ -246,6 +246,14 @@ fn a_wake_runs_the_node_and_its_work_reaches_the_orchestrator() {
     // row for the app, and says what the user can do about it.
     let reason = last.stopped.as_deref().expect("a wake that ended on its budget left no reason");
     assert!(reason.contains("budget is spent") && reason.contains("Keep going"), "{reason}");
+    // The same end as the node's run state, which reaches the orchestrator
+    // with it: stopped on the budget, resumable by the user.
+    let state = tod_store::run_state::get(&conn, node).unwrap().expect("the run left no run state");
+    assert_eq!(state.phase, tod_store::run_state::Phase::Stopped, "{state:?}");
+    assert_eq!(state.reason_kind, tod_core::run_state::kind::BUDGET, "{state:?}");
+    assert_eq!(state.resumable_by, tod_store::run_state::RESUMABLE_BY_YOU);
+    assert!(state.reason_text.contains("budget is spent") && state.reason_text.contains("Keep going"), "{state:?}");
+    assert!(state.writer.starts_with("supervisor"), "{state:?}");
     drop(conn);
 
     // The supervisor's own writes (the implementation conversation, its

@@ -354,8 +354,14 @@ impl Replica {
     /// between two of the app's syncs must still be heard) and sends that.
     /// `stopped` is why the wake ended with the node still needing someone,
     /// when it did (`tod_store::cloud_activity::idle_stopped`).
-    pub fn end_cloud_beat(&mut self, node: Uuid, stopped: Option<&str>) -> Result<()> {
+    ///
+    /// `state` is the same end as the node's run state
+    /// (`tod_store::run_state`), written first so the idle beat that follows
+    /// is never older than it.
+    pub fn end_cloud_beat(&mut self, node: Uuid, stopped: Option<&str>, state: &tod_store::run_state::Draft) -> Result<()> {
         let conn = connect(&self.db())?;
+        tod_store::run_state::set(&conn, node, state, RUN_STATE_WRITER, tod_store::outline::uuid_blob::now_ms())
+            .context("recording the run state in the supervisor's copy")?;
         tod_store::cloud_activity::idle_stopped(&conn, node, stopped, tod_store::outline::uuid_blob::now_ms())?;
         tod_store::conversation_live::clear(&conn, node)?;
         drop(conn);
@@ -411,6 +417,9 @@ impl Replica {
     }
 }
 
+/// Who the supervisor names as the writer of the run state.
+const RUN_STATE_WRITER: &str = "supervisor";
+
 /// Records the heartbeat row in the copy, on a connection of its own, so it
 /// needs neither the [`Replica`] nor its lock. The next push, by whoever
 /// makes it, carries the row to the orchestrator.
@@ -437,8 +446,13 @@ impl BeatWriter {
         let Some(what) = what else {
             return Ok(false);
         };
-        tod_store::cloud_activity::beat(&conn, self.node, &what, tod_store::outline::uuid_blob::now_ms())
+        let now = tod_store::outline::uuid_blob::now_ms();
+        tod_store::cloud_activity::beat(&conn, self.node, &what, now)
             .context("recording the heartbeat in the supervisor's copy")?;
+        // Working again: the run state says so, naming the lifecycle state
+        // (a repeat of the same one leaves the row alone).
+        tod_store::run_state::set(&conn, self.node, &tod_core::run_state::working(&what), RUN_STATE_WRITER, now)
+            .context("recording the run state in the supervisor's copy")?;
         Ok(true)
     }
 }

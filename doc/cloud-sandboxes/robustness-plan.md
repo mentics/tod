@@ -79,7 +79,9 @@ repository's shallow submodule clone (`--shallow-since`, in the golden).
 Ranked by how many of the observed failures each removes. Each names the
 audit finding it comes from.
 
-### 3.1 One synced `run_state` per node (autopilot D1, supervisor D3)
+### 3.1 One synced `run_state` per node (autopilot D1, supervisor D3) — landed (schema v91)
+
+Landed: `tod_store::run_state`, written by the supervisor, the local runner and the app (`starting` before seeding); read by `next_actor` with the heartbeat as fallback. See `doc/lifecycle/next-actor.md`, "The run state". Not yet: orchestrator stamping.
 
 Today the app infers a cloud node's state from a heartbeat, waits,
 decisions and plan steps, and the supervisor's own conclusion is printed to

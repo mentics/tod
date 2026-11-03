@@ -60,6 +60,7 @@ pub const ROW_KEYS: &[(&str, &[(&str, KeyKind)])] = &[
     ("node_deferrals", &[("node_id", Blob)]),
     ("node_events", &[("id", Blob)]),
     ("node_requests", &[("id", Blob)]),
+    ("run_state", &[("node_id", Blob)]),
     ("decision_answers", &[("id", Int)]),
     ("phase_events", &[("id", Blob)]),
     ("node_subtree_archives", &[("id", Blob)]),

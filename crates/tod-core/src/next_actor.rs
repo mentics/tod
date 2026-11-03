@@ -34,6 +34,7 @@ use tod_store::activity::{
     ActivityRepo, KIND_CLOUD_REPAIR, KIND_CLOUD_START, KIND_GATE_CHECK, KIND_INCOMING_CHECK, KIND_PROTOCOL_PREFIX, KIND_RUN, Lease,
 };
 use tod_store::cloud_activity::CloudBeat;
+use tod_store::run_state::{Phase, RunState};
 use tod_store::conversation::ProtocolKind;
 use tod_store::deferrals::DeferralRepo;
 use tod_store::outline::repos::NodeRepo;
@@ -324,6 +325,10 @@ pub struct Facts<'a> {
     pub cloud: Option<&'a CloudBeat>,
     /// The node's cloud sandbox is gone.
     pub cloud_lost: Option<CloudLost>,
+    /// What the node's runner last said it was doing (`tod_store::run_state`),
+    /// when it said anything: a supervisor or app built before the table
+    /// writes none, and the heartbeat and saved run speak instead.
+    pub run_state: Option<&'a RunState>,
     /// The node's latest stop question was answered "leave it".
     pub stop_answer: Option<&'a StopAnswer>,
     pub run: &'a RunFacts,
@@ -351,6 +356,8 @@ pub fn for_nodes(
     for lease in ActivityRepo::new(conn).list_for_nodes(node_ids)? {
         leases.entry(lease.node_id).or_default().push(lease);
     }
+    let run_states: HashMap<Uuid, RunState> =
+        tod_store::run_state::list_for_nodes(conn, node_ids)?.into_iter().map(|r| (r.node_id, r)).collect();
     let mut cloud: HashMap<Uuid, CloudBeat> = HashMap::new();
     for beat in tod_store::cloud_activity::list_for_nodes(conn, node_ids)? {
         cloud.insert(beat.node_id, beat);
@@ -393,6 +400,7 @@ pub fn for_nodes(
             leases: leases.get(&node_id).map(Vec::as_slice).unwrap_or(&[]),
             cloud: cloud.get(&node_id),
             cloud_lost: lost.get(&node_id).copied(),
+            run_state: run_states.get(&node_id),
             stop_answer: stop_answers.get(&node_id),
             run: inputs.runs.get(&node_id).unwrap_or(&no_run),
             deferral: deferrals.get(&node_id).copied(),
@@ -508,6 +516,14 @@ fn deferral_holds(deferral: &Deferral, newest: i64, now_ms: i64) -> bool {
     !expired && newest <= deferral.deferred_at
 }
 
+/// How long a `starting` row holds the node as working before it is a failure:
+/// a sandbox to boot, a copy to seed, an autopilot to start
+/// (`cloud_sync::SUPERVISOR_REPORTS_WITHIN`).
+const START_REPORTS_WITHIN_MS: i64 = 150_000;
+/// How much later than a row another word may be dated and still be the same
+/// run's end (the supervisor writes the row, then its idle heartbeat).
+const RUN_STATE_SKEW_MS: i64 = 5_000;
+
 /// The actor, and when the newest thing reaching the user arrived (for the
 /// deferral's wake rule).
 fn actor_for(facts: &Facts<'_>) -> (NextActor, i64) {
@@ -563,6 +579,28 @@ fn actor_for(facts: &Facts<'_>) -> (NextActor, i64) {
             newest,
         );
     }
+    // The runner's own word (`tod_store::run_state`). Only a heartbeat or a
+    // saved run newer than the row can supersede it: a supervisor built
+    // before the table writes no row, and its beat is then the later word.
+    let run_state = facts.run_state;
+    // The app sent the node to the cloud and nothing has reported in yet:
+    // starting, for as long as a supervisor may take to boot and seed, then
+    // a failure that says so (never the silence of "not started").
+    if let Some(row) = run_state.filter(|r| r.phase == Phase::Starting)
+        && facts.cloud.is_none_or(|b| b.heartbeat_at <= row.updated_at)
+    {
+        let waited = facts.now_ms - row.updated_at;
+        if waited <= START_REPORTS_WITHIN_MS {
+            return (NextActor::Working { what: Work::CloudStart, since: row.since }, 0);
+        }
+        let error = format!(
+            "the cloud supervisor has not reported in {} after the node was sent ({}); \
+             Run in the cloud sends it again",
+            format_elapsed(waited),
+            row.reason_text,
+        );
+        return (NextActor::You { why: YouReason::Failed { error }, since: row.since }, row.since);
+    }
     // A node in the cloud: its sandbox gone, a stop question the user
     // answered "leave it", or a wake that ended needing someone (what the
     // supervisor left in its idle heartbeat). Each says why and what to do;
@@ -579,6 +617,15 @@ fn actor_for(facts: &Facts<'_>) -> (NextActor, i64) {
         let reason = format!("stopped: {}", crate::stop_questions::left_stopped_reason(&answer.kind));
         return (NextActor::You { why: YouReason::Stopped { reason }, since: answer.at }, answer.at);
     }
+    // The run stopped and said why, as a row. Skipped when a later wake (an
+    // old supervisor's beat) or a later saved run speaks after it.
+    if let Some(row) = run_state
+        && let Some(why) = crate::run_state::you_reason(row)
+        && facts.cloud.is_none_or(|b| b.heartbeat_at <= row.updated_at + RUN_STATE_SKEW_MS)
+        && run.last_outcome.as_ref().is_none_or(|(_, at)| *at <= row.updated_at + RUN_STATE_SKEW_MS)
+    {
+        return (NextActor::You { why, since: row.since }, row.since);
+    }
     if let Some(beat) = facts.cloud.filter(|b| b.is_idle())
         && let Some(reason) = &beat.stopped
     {
@@ -587,7 +634,10 @@ fn actor_for(facts: &Facts<'_>) -> (NextActor, i64) {
             beat.heartbeat_at,
         );
     }
+    // A row written at or after the saved run is the later word: when it did
+    // not stop the node (above), the saved run's old stop no longer holds.
     if let Some((outcome, at)) = &run.last_outcome
+        && !run_state.is_some_and(|row| row.updated_at + RUN_STATE_SKEW_MS >= *at)
         && let Some(why) = outcome_reason(outcome)
     {
         return (NextActor::You { why, since: *at }, *at);
@@ -859,6 +909,7 @@ mod tests {
         cloud: Option<CloudBeat>,
         cloud_lost: Option<CloudLost>,
         stop_answer: Option<StopAnswer>,
+        run_state: Option<RunState>,
     }
 
     fn case(lifecycle: &'static str) -> Case {
@@ -870,6 +921,7 @@ mod tests {
             cloud: None,
             cloud_lost: None,
             stop_answer: None,
+            run_state: None,
             run: RunFacts::default(),
             deferral: None,
         }
@@ -885,6 +937,7 @@ mod tests {
             leases: &c.leases,
             cloud: c.cloud.as_ref(),
             cloud_lost: c.cloud_lost,
+            run_state: c.run_state.as_ref(),
             stop_answer: c.stop_answer.as_ref(),
             run: &c.run,
             deferral: c.deferral,
@@ -1655,6 +1708,76 @@ mod tests {
         assert!(matches!(standing(&c).actor, NextActor::You { since: 700, .. }));
     }
 
+    fn row(phase: Phase, kind: &str, text: &str, since: i64, updated_at: i64) -> RunState {
+        RunState {
+            node_id: Uuid::nil(),
+            phase,
+            reason_kind: kind.into(),
+            reason_text: text.into(),
+            since,
+            resumable_by: tod_store::run_state::RESUMABLE_BY_YOU.into(),
+            updated_at,
+            writer: "t".into(),
+        }
+    }
+
+    #[test]
+    fn a_starting_row_is_working_from_the_click_then_a_failure_that_says_so() {
+        let mut c = case("planning");
+        c.run_state = Some(row(Phase::Starting, crate::run_state::kind::SENDING, "sending the node", NOW - 10_000, NOW - 10_000));
+        assert_eq!(standing(&c).actor, NextActor::Working { what: Work::CloudStart, since: NOW - 10_000 });
+        // Past what a boot and a seed may take, with nothing heard.
+        c.run_state = Some(row(Phase::Starting, crate::run_state::kind::SENDING, "sending the node", 100, 100));
+        let NextActor::You { why: YouReason::Failed { error }, since } = standing(&c).actor else {
+            panic!("{:?}", standing(&c).actor)
+        };
+        assert_eq!(since, 100);
+        assert!(error.contains("has not reported in") && error.contains("Run in the cloud sends it again"), "{error}");
+        // An older supervisor's later beat is the later word: the row is ignored.
+        c.cloud = Some(idle_beat(None));
+        c.run_state = Some(row(Phase::Starting, crate::run_state::kind::SENDING, "x", NOW - 4 * 86_400_000, NOW - 4 * 86_400_000));
+        assert_eq!(standing(&c).actor, you(YouReason::NotStarted, 500));
+    }
+
+    #[test]
+    fn a_stopped_row_says_why_for_cloud_and_local_and_an_older_one_gives_way() {
+        use crate::run_state::kind;
+        let mut c = case("planning");
+        c.run_state = Some(row(Phase::Stopped, kind::PR_STUCK, "the pull request keeps needing work", 800, 800));
+        assert_eq!(
+            standing(&c).actor,
+            you(YouReason::Stopped { reason: "the pull request keeps needing work".into() }, 800)
+        );
+        assert!(standing(&c).on_you());
+        c.run_state = Some(row(Phase::Stopped, kind::FAILED, "boom", 800, 800));
+        assert_eq!(standing(&c).actor, you(YouReason::Failed { error: "boom".into() }, 800));
+        c.run_state = Some(row(Phase::Stopped, kind::PAUSED, "you paused it", 800, 800));
+        assert_eq!(standing(&c).actor, you(YouReason::Paused, 800));
+        // The same row beats an idle beat's older reason.
+        c.run_state = Some(row(Phase::Stopped, kind::STOPPED, "from the row", 800, 800));
+        c.cloud = Some(CloudBeat { heartbeat_at: 801, ..idle_beat(Some("from the beat")) });
+        assert_eq!(standing(&c).actor, you(YouReason::Stopped { reason: "from the row".into() }, 800));
+        // An old supervisor woke after the row and ended without a reason: the row is stale.
+        c.cloud = Some(CloudBeat { heartbeat_at: 800 + 60_000, ..idle_beat(None) });
+        assert_eq!(standing(&c).actor, you(YouReason::NotStarted, 500));
+        // Local: a saved run newer than the row wins; a row newer than the saved run hides it.
+        c.cloud = None;
+        c.run.last_outcome = Some((Outcome::Stopped { reason: "old".into() }, 900_000));
+        assert_eq!(standing(&c).actor, you(YouReason::Stopped { reason: "old".into() }, 900_000));
+        c.run_state = Some(row(Phase::Waiting, kind::WAITING_OUTSIDE, "a review", 950_000, 950_000));
+        assert_eq!(standing(&c).actor, you(YouReason::NotStarted, 500), "the row is newer and says it only waits");
+    }
+
+    #[test]
+    fn a_working_waiting_or_done_row_asks_nothing_of_the_user_itself() {
+        use crate::run_state::kind;
+        let mut c = case("planning");
+        for phase in [Phase::Working, Phase::Waiting, Phase::Done] {
+            c.run_state = Some(row(phase, kind::WORKING, "x", 800, 800));
+            assert_eq!(standing(&c).actor, you(YouReason::NotStarted, 500), "{phase:?}");
+        }
+    }
+
     #[test]
     fn a_cloud_node_whose_sandbox_is_gone_says_so() {
         let mut c = case("planning");
@@ -1667,6 +1790,35 @@ mod tests {
         c.cloud_lost = Some(CloudLost { since: 900, deleted_by_user: false });
         let NextActor::You { why: YouReason::Stopped { reason }, .. } = standing(&c).actor else { panic!() };
         assert!(reason.contains("sandbox is gone"), "{reason}");
+    }
+
+    /// The app's `starting` row, then a runner's stop, each written the way
+    /// the app and the runners write them and read back through `compute`.
+    #[test]
+    fn compute_reads_the_run_state_the_app_and_runners_wrote() {
+        let fx = fixture();
+        let sent = node(&fx.conn, "sent", Some("planning"));
+        let stopped = node(&fx.conn, "stopped", Some("planning"));
+        let local = node(&fx.conn, "local", Some("planning"));
+        let fleet = tod_store::fleet::FleetStore::open(&fx.dir).unwrap();
+        crate::cloud_sync::record_starting(&fleet, &sent.to_string()).unwrap();
+        let stop = crate::run_state::for_outcome(
+            &Outcome::NeedsHuman { reason: NeedsHuman::NoProgress { step: "verify".into() } },
+            crate::run_state::Words::local(),
+        );
+        crate::run_state::record(&fleet, stopped, stop.clone(), "supervisor").unwrap();
+        let paused = crate::run_state::for_outcome(&Outcome::Stopped { reason: crate::autopilot::local::PAUSED.into() }, crate::run_state::Words::local());
+        crate::run_state::record(&fleet, local, paused, "local").unwrap();
+        let standings = compute(&fleet, &fx.dir).unwrap();
+        assert!(matches!(standings[&sent].actor, NextActor::Working { what: Work::CloudStart, .. }), "{:?}", standings[&sent].actor);
+        assert_eq!(
+            standings[&stopped].actor.clone(),
+            NextActor::You { why: YouReason::Stopped { reason: stop.reason_text }, since: match &standings[&stopped].actor {
+                NextActor::You { since, .. } => *since,
+                other => panic!("{other:?}"),
+            } }
+        );
+        assert!(matches!(standings[&local].actor, NextActor::You { why: YouReason::Paused, .. }), "{:?}", standings[&local].actor);
     }
 
     #[test]
