@@ -378,3 +378,89 @@ fn a_check_now_request_does_not_supersede_leave_it_stopped() {
     assert!(matches!(woke, Woke::LeftStopped(_)), "{woke:?}");
     assert_eq!(consumption(&s, id), (false, None));
 }
+
+/// A pause asked for while the node ran stops it at the next boundary, as the
+/// user's own stop, and is consumed: the wake after it does not pause again.
+#[test]
+fn a_pause_request_stops_the_run_at_a_boundary_and_is_consumed() {
+    let s = setup("row-pause");
+    let id = request(&s, tod_store::node_requests::KIND_PAUSE);
+    let woke = wake_once(&s, fake_relay().0, 5);
+    let Woke::Ran(Outcome::Stopped { reason }) = &woke else { panic!("{woke:?}") };
+    assert_eq!(reason, tod_core::autopilot::local::PAUSED);
+    let (consumed, by) = consumption(&s, id);
+    assert!(consumed && by.unwrap().starts_with("supervisor:"));
+    let woke = wake_once(&s, fake_relay().0, 5);
+    assert!(!matches!(&woke, Woke::Ran(Outcome::Stopped { reason }) if reason == tod_core::autopilot::local::PAUSED), "{woke:?}");
+}
+
+/// Neither pause nor stop-now countermands a stop answer.
+#[test]
+fn pause_and_stop_now_do_not_supersede_leave_it_stopped() {
+    let s = setup("row-pause-stopped");
+    let woke = wake_once(&s, fake_relay().0, 1);
+    assert!(matches!(woke, Woke::Ran(Outcome::BudgetExhausted { .. })), "{woke:?}");
+    answer(&s, 2);
+    let pause = request(&s, tod_store::node_requests::KIND_PAUSE);
+    let stop = request(&s, tod_store::node_requests::KIND_STOP_NOW);
+    let woke = wake_once(&s, fake_relay().0, 1);
+    assert!(matches!(woke, Woke::LeftStopped(_)), "{woke:?}");
+    assert_eq!((consumption(&s, pause).0, consumption(&s, stop).0), (false, false));
+}
+
+/// The stop-now marker (the app's file, seen mid-turn) and its row stop the
+/// run as the user's stop; both are taken.
+#[test]
+fn a_stop_now_marker_and_row_stop_the_run_and_are_taken() {
+    let s = setup("row-stop");
+    let id = request(&s, tod_store::node_requests::KIND_STOP_NOW);
+    let state = s.base.join("supervisor");
+    std::fs::create_dir_all(&state).unwrap();
+    let marker = state.join(tod_core::autopilot::STOP_NOW_REQUEST_FILE);
+    std::fs::write(&marker, b"").unwrap();
+    let woke = wake_once(&s, fake_relay().0, 5);
+    let Woke::Ran(Outcome::Stopped { reason }) = &woke else { panic!("{woke:?}") };
+    assert_eq!(reason, tod_core::autopilot::local::STOPPED);
+    assert!(!marker.exists(), "the marker is taken");
+    assert!(consumption(&s, id).0);
+}
+
+/// A fresh budget goes on past a spent one, like a "Keep going" answer.
+#[test]
+fn a_fresh_budget_request_grants_another_budget_once() {
+    let s = setup("row-fresh-budget");
+    let woke = wake_once(&s, fake_relay().0, 1);
+    assert!(matches!(woke, Woke::Ran(Outcome::BudgetExhausted { .. })), "{woke:?}");
+    answer(&s, 2); // Leave it stopped: the fresh budget overrides it
+    let id = request(&s, tod_store::node_requests::KIND_FRESH_BUDGET);
+    let turns = count(&s.remote_db, "SELECT COUNT(*) FROM conversation_turns");
+    let woke = wake_once(&s, fake_relay().0, 1);
+    assert!(matches!(woke, Woke::Ran(_)), "{woke:?}");
+    assert!(count(&s.remote_db, "SELECT COUNT(*) FROM conversation_turns") > turns, "the node ran past the first budget");
+    assert!(consumption(&s, id).0);
+    // One grant: the overridden budget answer and the request are one budget.
+    let acted = std::fs::read_to_string(s.base.join("supervisor").join("stop-answers.json")).unwrap();
+    let acted: serde_json::Value = serde_json::from_str(&acted).unwrap();
+    assert_eq!(acted["budget_grants"], 1, "{acted}");
+}
+
+/// `before_wake_requested` grants a request's budget once, however many wakes
+/// see the request before it is consumed.
+#[test]
+fn before_wake_requested_grants_a_fresh_budget_request_once() {
+    let tmp = Temp(std::env::temp_dir().join(format!("tod-supervisor-grant-{}", Uuid::new_v4())));
+    std::fs::create_dir_all(&tmp.0).unwrap();
+    let fleet = FleetStore::open(&tmp.0).unwrap();
+    let state = tmp.0.join("state");
+    let budget = Budget { max_sessions: 10, max_duration: Duration::from_secs(100) };
+    let node = Uuid::new_v4();
+    let request = Uuid::new_v4();
+    let go = |ids: &[Uuid]| match tod_supervisor::answers::before_wake_requested(&fleet, node, &state, budget, false, ids).unwrap() {
+        tod_supervisor::answers::Before::Go(b) => b,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(go(&[]).max_sessions, 10);
+    assert_eq!(go(&[request]).max_sessions, 20);
+    assert_eq!(go(&[request]).max_sessions, 20, "the same request grants nothing more");
+    assert_eq!(go(&[Uuid::new_v4()]).max_sessions, 30, "another request grants another");
+}

@@ -1708,6 +1708,27 @@ mod tests {
         assert!(matches!(standing(&c).actor, NextActor::You { since: 700, .. }));
     }
 
+    #[test]
+    fn a_supervised_node_the_user_paused_or_stopped_is_paused_and_a_spent_budget_says_so() {
+        let supervisor = |outcome: &Outcome| {
+            let words = crate::run_state::Words { budget: &crate::run_state::budget_text, stopped_by: Some("the supervisor") };
+            let draft = crate::run_state::for_outcome(outcome, words);
+            row(draft.phase, &draft.reason_kind, &draft.reason_text, 800, 800)
+        };
+        let mut c = case("planning");
+        for reason in [crate::autopilot::local::PAUSED, crate::autopilot::local::STOPPED] {
+            c.run_state = Some(supervisor(&Outcome::Stopped { reason: reason.into() }));
+            assert_eq!(standing(&c).actor, you(YouReason::Paused, 800), "{reason}");
+        }
+        c.run_state = Some(supervisor(&Outcome::BudgetExhausted {
+            limit: BudgetLimit::Sessions { used: 6, elapsed_secs: 60 },
+        }));
+        assert_eq!(
+            standing(&c).actor,
+            you(YouReason::Stopped { reason: "budget spent: 6 sessions".into() }, 800)
+        );
+    }
+
     fn row(phase: Phase, kind: &str, text: &str, since: i64, updated_at: i64) -> RunState {
         RunState {
             node_id: Uuid::nil(),
