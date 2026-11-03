@@ -626,6 +626,43 @@ fn an_orchestrator_that_lost_its_data_is_seeded_again() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// A seeded orchestrator may have lost its disk, and with it the routes that
+/// say which repositories each of its GitHub tokens reads: every seeding is
+/// followed by the app's routes, or the gate reads pull requests with no token.
+#[test]
+fn a_seeding_gives_the_orchestrator_the_github_routes_again() {
+    let base = temp_root("orch-routes");
+    let url = start_orchestrator(&base);
+    let orch = HttpOrchestrator::new(url, None).with_client("app-test");
+    let root = temp_root("app-routes");
+    tod_store::orchestrator_github::Config {
+        tokens: vec![tod_store::orchestrator_github::Entry {
+            id: "acme".into(),
+            label: "acme/*".into(),
+            repos: vec!["acme/*".into()],
+        }],
+    }
+    .save(&root)
+    .unwrap();
+    let app = FleetStore::open(&root).unwrap();
+    add_list(&app, "first");
+    assert!(sync(&app, &root, &orch, "alice").unwrap().seeded);
+    let routes: tod_store::github_routes::GithubRoutes =
+        serde_json::from_value(orch.get_json("alice", "github-routes").unwrap()).unwrap();
+    assert_eq!(routes.secret_for("acme", "repo"), Some("gh_acme"));
+
+    // The disk is reset: the routes go with it, and the next seeding restores them.
+    std::fs::remove_file(base.join("users").join("alice").join("orchestrator-seed-seq")).unwrap();
+    let _ = std::fs::remove_file(base.join("users").join("alice").join("github-routes.json"));
+    add_list(&app, "second");
+    assert!(sync(&app, &root, &orch, "alice").unwrap().seeded);
+    let routes: tod_store::github_routes::GithubRoutes =
+        serde_json::from_value(orch.get_json("alice", "github-routes").unwrap()).unwrap();
+    assert_eq!(routes.secret_for("acme", "repo"), Some("gh_acme"));
+    let _ = std::fs::remove_dir_all(&base);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// Another copy of the app seeds the orchestrator, replacing its database
 /// (only by taking it over: without that, the orchestrator refuses). The next
 /// sync sees a seeding this copy was not sent to, and seeds the orchestrator

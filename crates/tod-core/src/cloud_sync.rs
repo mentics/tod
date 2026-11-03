@@ -454,6 +454,13 @@ pub trait Orchestrator {
     fn check_contract(&self) -> Result<()> {
         Ok(())
     }
+    /// `PUT /users/<u>/github-routes`: which repositories each of the
+    /// orchestrator's GitHub tokens reads. A seeding gives the orchestrator a
+    /// fresh disk's worth of state, which holds no routes, so each seeding is
+    /// followed by this.
+    fn put_github_routes(&self, _user: &str, _routes: &tod_store::github_routes::GithubRoutes) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// This build's version contract with the orchestrator.
@@ -685,6 +692,10 @@ impl HttpOrchestrator {
 }
 
 impl Orchestrator for HttpOrchestrator {
+    fn put_github_routes(&self, user: &str, routes: &tod_store::github_routes::GithubRoutes) -> Result<()> {
+        HttpOrchestrator::put_github_routes(self, user, routes)
+    }
+
     fn check_contract(&self) -> Result<()> {
         use tod_store::sync::contract::{Verdict, judge, newer_message};
         if self.contract_ok.load(std::sync::atomic::Ordering::Relaxed) {
@@ -878,6 +889,14 @@ fn sync_once(fleet: &FleetStore, root: &Path, orch: &dyn Orchestrator, user: &st
             let snap_seq = sync::last_seq(&connect(&tmp)?)?;
             let bytes = std::fs::read(&tmp)?;
             let feed = orch.seed(user, &bytes)?;
+            // A seeded orchestrator may be a fresh one (its disk was reset):
+            // it knows no GitHub routes until told, and its gate would read
+            // every pull request without the token that can see it.
+            let github = tod_store::orchestrator_github::Config::load(root)?;
+            if !github.tokens.is_empty() {
+                orch.put_github_routes(user, &github.routes())
+                    .context("seeded the orchestrator, but could not give it the GitHub routes")?;
+            }
             Ok::<_, anyhow::Error>((snap_seq, feed))
         })();
         let _ = std::fs::remove_file(&tmp);
