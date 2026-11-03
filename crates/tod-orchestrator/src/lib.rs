@@ -204,7 +204,13 @@ impl Server {
                     Err(r) => return r,
                 };
                 match (method, rest) {
-                    ("POST", ["seed"]) => sync_backend::seed(&self.users, &user, &request.body),
+                    ("POST", ["seed"]) => sync_backend::seed(
+                        &self.users,
+                        &user,
+                        &request.body,
+                        client(request).unwrap_or("unknown"),
+                        request.header(sync_backend::TAKE_OVER_HEADER) == Some("yes"),
+                    ),
                     ("POST", ["changes"]) => match self.users.get(&user) {
                         Ok(data) if !sync_backend::is_seeded(&data.root) => Response::text(409, sync_backend::NOT_SEEDED),
                         Ok(data) => sync_backend::apply_changes(

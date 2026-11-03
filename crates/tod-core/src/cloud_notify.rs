@@ -223,7 +223,13 @@ struct FailureLog {
     since_logged: u32,
     logged_at: Option<Instant>,
     total: u32,
+    escalated_at: Option<Instant>,
 }
+
+/// A run of this many failures in a row is raised to an error the user sees
+/// (and again at most each [`ESCALATION_REPEAT`]), instead of only counting.
+const ESCALATE_AFTER: u32 = 20;
+const ESCALATION_REPEAT: Duration = Duration::from_secs(60 * 60);
 
 impl FailureLog {
     /// The line to log for this failure, if it is not a repeat to hold back.
@@ -245,12 +251,29 @@ impl FailureLog {
         })
     }
 
+    /// The error to raise (toast and log) once a run of failures passes
+    /// [`ESCALATE_AFTER`], then at most hourly; call after [`Self::failed`].
+    fn escalate(&mut self, text: &str, now: Instant) -> Option<String> {
+        if self.total < ESCALATE_AFTER {
+            return None;
+        }
+        if self.escalated_at.is_some_and(|t| now.duration_since(t) < ESCALATION_REPEAT) {
+            return None;
+        }
+        self.escalated_at = Some(now);
+        Some(format!(
+            "Cloud sync has failed {} times in a row and is not syncing; last error: {text}",
+            self.total
+        ))
+    }
+
     /// The line to log when a sync works again after failures.
     fn recovered(&mut self) -> Option<String> {
         let total = std::mem::take(&mut self.total);
         self.last = None;
         self.since_logged = 0;
         self.logged_at = None;
+        self.escalated_at = None;
         (total > 0).then(|| format!("cloud sync works again after {total} failures"))
     }
 }
@@ -285,8 +308,18 @@ pub fn runner(fleet: &Arc<FleetStore>) -> Arc<Coalesced> {
                 }
                 Err(err) => {
                     let text = format!("{err:#}");
-                    if let Some(line) = failures.lock().unwrap_or_else(|e| e.into_inner()).failed(&text, Instant::now()) {
+                    let mut failures = failures.lock().unwrap_or_else(|e| e.into_inner());
+                    let now = Instant::now();
+                    if let Some(line) = failures.failed(&text, now) {
                         tracing::warn!("{line}");
+                    }
+                    if let Some(line) = failures.escalate(&text, now) {
+                        // An error-level entry is what raises a toast.
+                        crate::logging::buffer::record(
+                            crate::logging::buffer::Level3::Error,
+                            crate::logging::buffer::LogSource::App,
+                            line,
+                        );
                     }
                 }
             })
@@ -458,5 +491,25 @@ mod tests {
         assert!(again.contains("still failing") && again.contains("1 since the last report"), "{again}");
         assert!(log.recovered().unwrap().contains("works again after 6 failures"));
         assert_eq!(log.recovered(), None);
+    }
+
+    #[test]
+    fn a_long_run_of_failures_escalates_once_then_hourly() {
+        let t0 = Instant::now();
+        let mut log = FailureLog::default();
+        let mut raised = Vec::new();
+        for i in 0..ESCALATE_AFTER + 30 {
+            let now = t0 + Duration::from_secs(i as u64);
+            log.failed("500", now);
+            raised.extend(log.escalate("500", now));
+        }
+        assert_eq!(raised.len(), 1, "{raised:?}");
+        assert!(raised[0].contains("20 times in a row") && raised[0].contains("500"), "{raised:?}");
+        // An hour later it is raised again, with the new count.
+        let later = t0 + Duration::from_secs(3600 + 100);
+        log.failed("500", later);
+        assert!(log.escalate("500", later).unwrap().contains("51 times"));
+        log.recovered();
+        assert_eq!(log.escalate("500", later), None);
     }
 }

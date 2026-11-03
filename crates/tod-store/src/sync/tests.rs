@@ -482,3 +482,46 @@ fn pruning_sent_entries_keeps_later_ones_and_the_numbering() {
     let _ = std::fs::remove_dir_all(&a.root);
     let _ = std::fs::remove_dir_all(&b.root);
 }
+
+#[test]
+fn a_change_the_receiver_refuses_is_recorded_and_the_rest_apply() {
+    let (a, b) = pair();
+    let list_id = a.fleet.list_outline_lists().unwrap()[0].id;
+    for title in ["good one", "good two"] {
+        a.apply(OutlineMutation::CreateNode {
+            node_id: None,
+            list_id,
+            parent_id: None,
+            anchor_id: None,
+            position: CreatePosition::Below,
+            title: title.into(),
+        });
+    }
+    let mut changes = export_changes(&a.conn(), a.cursor).unwrap();
+    let good = changes.len();
+    assert!(good >= 2);
+    // A node row with none of the required columns: the insert is refused.
+    let mut key = Row::new();
+    key.insert("id".into(), SqlValue::Blob("00112233445566778899aabbccddeeff".into()));
+    changes.insert(
+        1,
+        Change { seq: 999, node_id: None, table: "nodes".into(), key: key.clone(), before: None, after: Some(key) },
+    );
+    let report = apply_changes_from(&mut b.conn(), &changes, "one").unwrap();
+    assert_eq!(report.rejected, 1);
+    assert_eq!(report.applied, good);
+    assert_eq!(report.reject_errors.len(), 1);
+    assert!(report.reject_errors[0].starts_with("nodes:"), "{:?}", report.reject_errors);
+    let (seq, tbl, op): (i64, String, String) = b
+        .conn()
+        .query_row("SELECT seq, tbl, op FROM sync_rejects", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .unwrap();
+    assert_eq!((seq, tbl.as_str(), op.as_str()), (999, "nodes", "insert"));
+    let titles: i64 = b
+        .conn()
+        .query_row("SELECT COUNT(*) FROM nodes WHERE title IN ('good one', 'good two')", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(titles, 2, "the rows around the bad one applied");
+    let _ = std::fs::remove_dir_all(&a.root);
+    let _ = std::fs::remove_dir_all(&b.root);
+}

@@ -596,14 +596,15 @@ fn an_orchestrator_that_lost_its_data_is_seeded_again() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// Another copy of the app seeds the orchestrator, replacing its database.
-/// The next sync sees a seeding this copy was not sent to, and seeds the
-/// orchestrator with this database again, so its rows are back there.
+/// Another copy of the app seeds the orchestrator, replacing its database
+/// (only by taking it over: without that, the orchestrator refuses). The next
+/// sync sees a seeding this copy was not sent to, and seeds the orchestrator
+/// with this database again (this copy's take-over), so its rows are back there.
 #[test]
 fn an_orchestrator_seeded_by_another_copy_is_seeded_with_this_one_again() {
     let base = temp_root("orch-other");
     let url = start_orchestrator(&base);
-    let orch = HttpOrchestrator::new(url, None).with_client("app-test");
+    let orch = HttpOrchestrator::new(url.clone(), None).with_client("app-test");
     let root = temp_root("app-other");
     let app = FleetStore::open(&root).unwrap();
     add_list(&app, "first");
@@ -618,13 +619,22 @@ fn an_orchestrator_seeded_by_another_copy_is_seeded_with_this_one_again() {
     add_list(&other, "elsewhere");
     let snap = other_root.join("snap.db");
     sync::snapshot(other.paths().db(), &snap).unwrap();
-    orch.seed("alice", &std::fs::read(&snap).unwrap()).unwrap();
+    // Another client is refused unless the user chose to take over.
+    let other_orch = HttpOrchestrator::new(url.clone(), None).with_client("app-other");
+    let err = other_orch.seed("alice", &std::fs::read(&snap).unwrap()).err().expect("refused");
+    assert!(format!("{err:#}").contains("app-test"), "{err:#}");
+    other_orch.with_take_over(true).seed("alice", &std::fs::read(&snap).unwrap()).unwrap();
     let user_root = base.join("users").join("alice");
     assert_eq!(lists_in(&user_root.join("tod.db")), vec!["elsewhere".to_string()]);
 
     // Nothing changed here, but the orchestrator is on another seeding:
     // the app seeds it again, with its own database.
     add_list(&app, "second");
+    // Refused while this copy has not taken over, with the error naming who seeded.
+    let err = sync(&app, &root, &orch, "alice").unwrap_err();
+    assert!(format!("{err:#}").contains("app-other"), "{err:#}");
+    assert_eq!(lists_in(&user_root.join("tod.db")), vec!["elsewhere".to_string()]);
+    let orch = HttpOrchestrator::new(url.clone(), None).with_client("app-test").with_take_over(true);
     let report = sync(&app, &root, &orch, "alice").unwrap();
     assert!(report.seeded, "{report:?}");
     assert_eq!(lists_in(&user_root.join("tod.db")), lists(&app));
@@ -755,4 +765,24 @@ fn a_sandbox_is_dead_by_its_state_as_well_as_its_status() {
         assert!(sandbox_is_dead(&info), "{state}");
         assert!(sandbox_dead_reason(&info).unwrap().contains(state));
     }
+}
+
+/// A change the orchestrator refused is raised once per distinct error, as an
+/// error the user sees, with the orchestrator-is-older hint.
+#[test]
+fn rejected_changes_are_raised_once_per_distinct_error() {
+    use crate::logging::buffer::{self, Level3, LogFilter};
+    let error = "nodes: CHECK constraint failed: state IN (rejects-test-1)";
+    let report = sync::ApplyReport { rejected: 2, reject_errors: vec![error.into()], ..Default::default() };
+    record_rejects(&report);
+    record_rejects(&report);
+    let hits: Vec<_> = buffer::snapshot(LogFilter::All)
+        .into_iter()
+        .filter(|e| e.message.contains("rejects-test-1"))
+        .collect();
+    assert_eq!(hits.len(), 1, "{hits:?}");
+    assert_eq!(hits[0].level, Level3::Error);
+    assert!(hits[0].message.contains("older than this app"), "{}", hits[0].message);
+    // No rejects, nothing raised.
+    record_rejects(&sync::ApplyReport::default());
 }
