@@ -383,7 +383,14 @@ from its status badge. `fix.rs` resolves them (the conversation view's Fix,
 beside Review): given the open findings, the agent answers each `fixed` or
 `rejected` with a note — `tod-cli` refuses it the user's answers — and loops
 until none is open and a test run is green. The `review` → `pr` gate is app-checked
-(`tod_core::gate::derived`): review recorded done, no finding still open. `tod_ui::conversation::side_pane` picks the pane, and the picker offers a
+(`tod_core::gate::derived`): the latest review recorded done **and recorded
+nothing that still stands** (`review::review_passed`; a finding the user marked
+out of scope or declined does not count), and no finding is open. The fixer's
+`fixed` is a claim, never the verdict: `lifecycle_next` sends a fixed-up node to
+Review again, each Review and Fix a conversation (session) of its own, until a
+review comes back clean. The autopilot stops for the user at
+`REVIEW_ROUND_LIMIT` reviews in one stay (`NeedsHuman::ReviewNotConverging`,
+shown as the node's stopped reason). `tod_ui::conversation::side_pane` picks the pane, and the picker offers a
 "New …" entry per kind the focus can start. Adding a kind means a
 `ProtocolKind` variant, an impl, a registry arm, and a side pane. The spec,
 `doc/conversation/protocols.md`, was deleted in commit `1e13f79` ("cleanup doc

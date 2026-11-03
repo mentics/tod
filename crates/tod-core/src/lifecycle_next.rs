@@ -45,6 +45,8 @@ pub struct Standing {
     pub obligations_failed: usize,
     /// In `review`: the review recorded itself done.
     pub review_done: bool,
+    /// In `review`: the latest review came back clean (`review_passed`).
+    pub review_clean: bool,
     /// Review findings nobody has answered.
     pub open_findings: usize,
     /// In a state the generic phase agent works: what it does next.
@@ -65,7 +67,8 @@ pub enum NextStep {
     Verify,
     /// Verification is complete and failed: back to `active` to fix it.
     FixFailed,
-    /// The code review has not finished.
+    /// The code review has not finished, or findings were fixed since the
+    /// last one and it has to look again.
     Review,
     /// The review's findings need answers.
     Fix,
@@ -130,6 +133,7 @@ impl Standing {
             obligations_unchecked: standings.iter().filter(|s| s.is_unchecked()).count(),
             obligations_failed: standings.iter().filter(|s| s.is_failed()).count(),
             review_done: reviewing && review_recorded_done(conn, node_id)?,
+            review_clean: reviewing && crate::conversation::review::review_passed(conn, node_id)?,
             open_findings,
         })
     }
@@ -164,6 +168,9 @@ pub fn next_step(standing: &Standing) -> Option<NextStep> {
         "verifying" if standing.steps_failed > 0 => Some(NextStep::FixFailed),
         "review" if !standing.review_done => Some(NextStep::Review),
         "review" if standing.open_findings > 0 => Some(NextStep::Fix),
+        // Findings answered, but by the fixer: another review of the fixed
+        // change decides, never the fixer's own claim.
+        "review" if !standing.review_clean => Some(NextStep::Review),
         _ => match standing.phase {
             Some(PhaseStep::Work) => Some(NextStep::Phase),
             Some(PhaseStep::Evaluate) => Some(NextStep::Evaluate),
@@ -267,7 +274,12 @@ mod tests {
         s.review_done = true;
         s.open_findings = 1;
         assert_eq!(next_step(&s), Some(NextStep::Fix));
+        // The fixer answered them all: the review looks again, it does not
+        // take the fixer's word.
         s.open_findings = 0;
+        assert_eq!(next_step(&s), Some(NextStep::Review));
+        // Only a review that found nothing standing moves the node on.
+        s.review_clean = true;
         assert_eq!(next_step(&s), Some(NextStep::GateCheck));
     }
 

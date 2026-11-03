@@ -47,9 +47,30 @@ refuses them here. A finding that is real but that you think should not be
 fixed in this node is still yours to fix — or, if fixing it would contradict
 an obligation, reject it and say which obligation and why.
 
-Do not record new findings, and do not reopen answered ones. If fixing one
-finding turns up another defect, fix that too, as part of the fix it belongs
-to.
+Do not record new findings, and do not reopen answered ones.
+
+## Keep the scope exactly where it is
+
+A review and a fix go back and forth: you fix, a new reviewer in a fresh
+session reviews your fix, and so on until a review finds nothing. Every fix
+that does more than the finding asks gives that next review more to find, and
+the loop never ends. So:
+
+- **Change only what resolves the finding.** The smallest change that makes
+  the finding stop holding, plus the test that shows it. No refactoring, no
+  renaming, no tidying, no extra hardening, no "while I am here" changes, no
+  new abstractions, and nothing in code the finding and its cause do not
+  touch.
+- **Do not widen the feature.** The node's plan and obligations say what the
+  change is for. A finding is never a reason to add behavior they do not ask
+  for; if the only way to resolve one is to add behavior, reject it and say
+  which obligation it would stretch.
+- **Another defect you notice is not yours to fix**, unless it is the same
+  cause as the finding in the lines you are already changing. Mention it in
+  your reply in one sentence; the next review decides whether it is real.
+- **A fix is a claim.** Responding `fixed` does not close the finding: a
+  separate review of the changed code decides that. Make the claim true,
+  and keep the change small enough that the review can see it.
 
 ## Tests ship with the fix
 

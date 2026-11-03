@@ -33,7 +33,7 @@ mod state;
 #[cfg(test)]
 mod tests;
 
-pub use state::{AutopilotState, CYCLE_LIMIT, CurrentStep, FRESH_SESSION_REQUEST_FILE, LoopCounters, StepRecord, state_path};
+pub use state::{AutopilotState, CYCLE_LIMIT, REVIEW_ROUND_LIMIT, CurrentStep, FRESH_SESSION_REQUEST_FILE, LoopCounters, StepRecord, state_path};
 
 use crate::conversation::driver::{
     AgentAccess, ConversationConfig, ConversationDriver, ConversationEvent, ConversationStatus,
@@ -193,6 +193,10 @@ pub enum NeedsHuman {
     /// the work went around in a circle (verification fails it, a fix
     /// follows, verification fails it again) without getting anywhere.
     Looping { what: String, times: u32 },
+    /// Review and fix went [`REVIEW_ROUND_LIMIT`] rounds and the latest
+    /// review still did not come back clean. `standing` is what it left:
+    /// the findings it recorded, with their status.
+    ReviewNotConverging { rounds: u32, standing: Vec<String> },
 }
 
 impl NeedsHuman {
@@ -256,6 +260,18 @@ impl NeedsHuman {
                 "the {} ran and left everything as it was, so running it again would not help. \
                  Look at what the agent did, change the plan or the instructions, then run it again",
                 step_in_words(step)
+            ),
+            Self::ReviewNotConverging { rounds, standing } => format!(
+                "the code review ran {rounds} rounds of review and fix and the last review still found problems, \
+                 so the node has not moved on. This may be a bug (the fixer undoing or missing the same thing), \
+                 a reviewer holding to something it should drop, or a real problem only you can settle. \
+                 Open the review findings and the review and fix transcripts{}. Answer or change what is wrong, \
+                 then run it again for a fresh set of rounds",
+                if standing.is_empty() {
+                    String::new()
+                } else {
+                    format!(" (last review: {})", standing.join("; "))
+                }
             ),
             Self::Looping { what, times } => format!(
                 "the same problem has come back {times} times and the agent is going in circles: {what}. \
@@ -538,6 +554,35 @@ impl Autopilot {
             }
             last = Some((standing, step));
 
+            if lifecycle != "review" {
+                self.state.loops.review_rounds = 0;
+            }
+            if step == NextStep::Review {
+                if self.state.loops.review_rounds >= REVIEW_ROUND_LIMIT {
+                    let node = self.node;
+                    let standing = fleet.read(|conn| {
+                        // What the latest review recorded and the fixer claims to have fixed.
+                        let latest = tod_store::conversation::ConversationRepo::new(conn)
+                            .latest_for_focus_with_protocol(Focus::Node(node), ProtocolKind::Review)?
+                            .map(|c| c.id);
+                        Ok(tod_store::review::ReviewRepo::new(conn)
+                            .list_for_node(node)?
+                            .iter()
+                            .filter(|f| f.conversation_id == latest)
+                            .filter(|f| !matches!(f.status.as_str(), "out_of_scope" | "declined"))
+                            .map(|f| format!("[{}] {} ({})", tod_store::interview::short_id(f.id), f.summary, f.status))
+                            .collect::<Vec<_>>())
+                    })?;
+                    return self.finish(Outcome::NeedsHuman {
+                        reason: NeedsHuman::ReviewNotConverging {
+                            rounds: self.state.loops.review_rounds,
+                            standing,
+                        },
+                    });
+                }
+                self.state.loops.review_rounds += 1;
+                self.save()?;
+            }
             let stopped = match step {
                 NextStep::Implement => self.converse(fleet, agent, hook, ProtocolKind::Implementation, None)?,
                 NextStep::Verify => self.converse(fleet, agent, hook, ProtocolKind::Verification, None)?,
