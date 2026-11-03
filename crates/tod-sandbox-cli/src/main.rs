@@ -35,8 +35,18 @@ setup [--workspace W] [--auth bl|api-key] [--api-key-stdin] [--region R]
 create <name> [--image IMAGE] [--agents]
                          Create a sandbox and install what tod needs in it. Any
                          image works: one not built for Blaxel is wrapped first.
-golden [<sandbox>]    Show, or set, the sandbox the name `golden` stands for: a node
-                         forks `golden` once, and a new golden sandbox is set here.
+golden [<repo>] [<sandbox>]
+                         Show, or set, the sandbox the name `golden` stands for, per
+                         repository (owner/name): a node forks `golden` once, and
+                         a new golden sandbox is set here. A `golden` of an older
+                         sandboxes.toml is every repository's until it has its own.
+golden refresh [<repo>]  Make the repository's golden again on this build: fork the
+                         current one, check what a fork needs, install tod's files
+                         (relay, shim, Linux tod-cli, supervisor, bundles, Claude
+                         adapter), label it with this build's stamp, mark it ready,
+                         point the repository at it, and delete the old one when tod
+                         made it and no other repository uses it. Refuses a golden a
+                         newer tod made.
 fork <source> <name> [--agents]
                          Create a sandbox as a copy of another one's current
                          state (it may be in standby). Needs a Blaxel workspace
@@ -476,17 +486,71 @@ fn database(ctx: &mut Ctx, mut args: Args) -> Result<i32> {
 }
 
 fn golden(ctx: &mut Ctx, mut args: Args) -> Result<i32> {
-    let name = args.positional("sandbox").ok();
+    let first = args.positional("repository").ok();
+    if first.as_deref() == Some("refresh") {
+        let repo = args.positional("repository").ok();
+        args.done()?;
+        return golden_refresh(ctx, repo);
+    }
+    let sandbox = args.positional("sandbox").ok();
     args.done()?;
     let acct = ctx.config.blaxel.as_mut().ok_or_else(|| anyhow!("run `tod-sandbox setup` first"))?;
-    match name {
-        Some(name) => {
-            acct.golden = Some(name.clone());
-            ctx.save()?;
-            println!("golden is now {name}");
+    let normalize = |repo: &str| {
+        tod_store::cloud_nodes::normalize_repo(repo)
+            .ok_or_else(|| anyhow!("{repo:?} is not a repository: say it as owner/name, as in `golden <owner/name> <sandbox>`"))
+    };
+    match (first, sandbox) {
+        (None, _) => {
+            let all = acct.golden_settings();
+            if all.is_empty() {
+                println!("(none set)");
+            }
+            for (repo, golden) in all {
+                println!("{repo}: {golden}{}", if repo == "*" { " (every repository without its own)" } else { "" });
+            }
         }
-        None => println!("{}", acct.golden.as_deref().unwrap_or("(none set)")),
+        (Some(repo), None) => {
+            let repo = normalize(&repo)?;
+            match acct.golden_for(&repo) {
+                Some(setting) => println!("{}", setting.name()),
+                None => println!("(none set for {repo})"),
+            }
+        }
+        (Some(repo), Some(sandbox)) => {
+            let repo = normalize(&repo)?;
+            acct.set_golden(&repo, &sandbox);
+            ctx.save()?;
+            println!("the golden of {repo} is now {sandbox}");
+        }
     }
+    Ok(0)
+}
+
+/// `golden refresh [<repo>]`: makes the project's golden again on this build
+/// (`tod_core::cloud_sync::golden::refresh_golden`). With no repository, the
+/// only one that has a golden of its own.
+fn golden_refresh(ctx: &mut Ctx, repo: Option<String>) -> Result<i32> {
+    let repo = match repo {
+        Some(repo) => repo,
+        None => {
+            let acct = ctx.account()?;
+            let repos: Vec<&String> = acct.goldens.keys().collect();
+            match repos.as_slice() {
+                [only] => (*only).clone(),
+                [] => bail!(
+                    "no repository has a golden of its own yet: say which to refresh, `golden refresh <owner/name>` \
+                     (the sandbox it starts from is the account's `golden`, or one set with `golden <owner/name> <sandbox>`)"
+                ),
+                many => bail!(
+                    "more than one repository has a golden ({}): say which to refresh, `golden refresh <owner/name>`",
+                    many.iter().map(|r| r.as_str()).collect::<Vec<_>>().join(", ")
+                ),
+            }
+        }
+    };
+    let bx = ctx.blaxel()?;
+    let name = tod_core::cloud_sync::golden::refresh_golden(ctx, &bx, &repo, &mut |m| eprintln!("{m}"))?;
+    println!("{name}");
     Ok(0)
 }
 

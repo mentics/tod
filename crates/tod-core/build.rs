@@ -52,7 +52,17 @@ fn emit_git_identity(manifest_dir: &Path) {
         None => "unknown".to_string(),
     };
 
+    // The commit's own time (unix seconds): it orders builds, which the install
+    // stamp (a hash) cannot (`tod_sandbox::golden`). Like the commit it is as of
+    // the last time this script ran, which a dev build does not re-run on a
+    // commit; a script that did not get a time says "unknown", never a zero.
+    let commit_time = run_git(manifest_dir, &["log", "-1", "--format=%ct", "HEAD"])
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+        .unwrap_or_else(|| "unknown".to_string());
+
     println!("cargo:rustc-env=TOD_GIT_COMMIT={commit}");
+    println!("cargo:rustc-env=TOD_GIT_COMMIT_TIME={commit_time}");
     println!("cargo:rustc-env=TOD_GIT_DIRTY={dirty}");
 
     // A release build records the commit it was made from, so rerun when HEAD

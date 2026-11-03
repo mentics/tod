@@ -17,6 +17,7 @@ pub mod blaxel;
 pub mod config;
 pub mod drive;
 pub mod edge;
+pub mod golden;
 pub mod node;
 pub mod orchestrator;
 pub mod provision;

@@ -1311,13 +1311,13 @@ fn origin_url_of(fleet: &FleetStore, node_id: &str, repo: &str) -> Result<String
                 continue;
             }
             let root = fleet.paths().root();
-            match tod_store::fleet::sandbox::Sandboxes::load(root).and_then(|s| s.blaxel().and_then(|bx| s.resolve_golden(&bx))) {
+            match tod_store::fleet::sandbox::Sandboxes::load(root).and_then(|s| s.blaxel().and_then(|bx| s.resolve_sole_golden(&bx))) {
                 Ok(real) => resolved.push(real),
                 Err(err) => {
                     golden_missing = true;
                     tried.push(format!(
                         "this node's files are forked from the golden sandbox, which cannot be found: {err:#}. \
-                         Make a golden sandbox and point tod at it with `tod-sandbox golden <sandbox>` (or set `golden` in sandboxes.toml)"
+                         Make one with `tod-sandbox golden refresh <repo>`, or point tod at one with `tod-sandbox golden <repo> <sandbox>`"
                     ));
                 }
             }
@@ -1545,7 +1545,7 @@ pub fn ensure_node_sandbox(
         progress("warning: no GitHub token stored; the node cannot push or open a pull request");
     }
 
-    let source = node_sandbox_source(fleet, &sandboxes, &bx, node_id)?;
+    let source = node_sandbox_source(fleet, &sandboxes, &bx, node_id, &repo_url)?;
     let name = existing_sandbox_name(fleet, &bx, node_id)?.unwrap_or_else(|| node_sandbox_name(&task.slug));
     // Before the first call that changes anything at Blaxel: a crash from
     // here on leaves a record of the sandbox that may exist.
@@ -1853,6 +1853,7 @@ fn node_sandbox_source(
     sandboxes: &tod_store::fleet::sandbox::Sandboxes,
     bx: &tod_sandbox::blaxel::Blaxel,
     node_id: &str,
+    repo_url: &str,
 ) -> Result<NodeSandboxSource> {
     use tod_store::fleet::SandboxFrom;
     let files = fleet
@@ -1866,9 +1867,15 @@ fn node_sandbox_source(
     match dev.sandbox_from {
         SandboxFrom::Fork(name) => match name.trim() {
             "" => bail!("the Files setting on \"{origin}\" forks a sandbox but names none; choose the sandbox to fork"),
-            n if n == tod_sandbox::config::GOLDEN => Ok(NodeSandboxSource::Fork(
-                sandboxes.resolve_golden(bx).with_context(|| format!("resolve the golden sandbox that \"{origin}\" forks"))?,
-            )),
+            n if n == tod_sandbox::config::GOLDEN => {
+                let repo = tod_store::cloud_nodes::normalize_repo(repo_url)
+                    .ok_or_else(|| anyhow!("cannot read an owner and repository name from {repo_url}"))?;
+                Ok(NodeSandboxSource::Fork(
+                    sandboxes
+                        .resolve_golden(bx, &repo)
+                        .with_context(|| format!("resolve the golden sandbox that \"{origin}\" forks"))?,
+                ))
+            }
             n => Ok(NodeSandboxSource::Fork(n.to_string())),
         },
         SandboxFrom::Image(image) => match image.trim() {
@@ -2391,6 +2398,7 @@ fn answer_latest_to_continue(
     Ok(Some(latest.decision))
 }
 
+pub mod golden;
 pub mod lost;
 pub mod provisioning;
 pub mod refresh;

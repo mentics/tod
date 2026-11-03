@@ -257,18 +257,31 @@ impl Sandboxes {
         self.create_with_proxy(name, source, agents, inherit_output, &Default::default(), progress)
     }
 
-    /// The sandbox the name `golden` stands for. `wsx-golden-*` stands for the
-    /// newest sandbox with that prefix (the names carry a timestamp, so they
-    /// sort oldest first).
-    pub fn resolve_golden(&self, bx: &Blaxel) -> Result<String> {
-        let golden = self
-            .account()?
-            .golden
-            .clone()
-            .filter(|g| !g.trim().is_empty())
-            .ok_or_else(|| {
-                anyhow!("no golden sandbox is set: run `tod-sandbox golden <sandbox>` (or set `golden` in sandboxes.toml)")
-            })?;
+    /// The sandbox the name `golden` stands for for `repo` (normalized as
+    /// `cloud_nodes::normalize_repo` does): its own entry, else the old
+    /// account-wide one. `wsx-golden-*` stands for the newest sandbox with
+    /// that prefix (the names carry a timestamp, so they sort oldest first).
+    pub fn resolve_golden(&self, bx: &Blaxel, repo: &str) -> Result<String> {
+        let setting = self.account()?.golden_for(repo).ok_or_else(|| {
+            anyhow!(
+                "no golden sandbox is set for {repo}: run `tod-sandbox golden refresh {repo}` to make one, or \
+                 `tod-sandbox golden {repo} <sandbox>` to point at one"
+            )
+        })?;
+        if let tod_sandbox::config::GoldenSetting::Legacy(name) = &setting {
+            tracing::info!("{repo} has no golden of its own; using the account-wide `golden = {name:?}` of sandboxes.toml");
+        }
+        self.resolve_golden_setting(bx, setting.name())
+    }
+
+    /// [`Self::resolve_golden`] for a caller that has no repository: the only
+    /// golden there is, else an error asking for a repository.
+    pub fn resolve_sole_golden(&self, bx: &Blaxel) -> Result<String> {
+        let setting = self.account()?.sole_golden()?;
+        self.resolve_golden_setting(bx, &setting)
+    }
+
+    fn resolve_golden_setting(&self, bx: &Blaxel, golden: &str) -> Result<String> {
         Ok(match golden.trim().strip_suffix('*') {
             Some(prefix) => {
                 let all: Vec<_> = bx
@@ -286,7 +299,7 @@ impl Sandboxes {
                     .max()
                     .ok_or_else(|| anyhow!("no sandbox named {prefix}* exists to be the golden"))?
             }
-            None => golden,
+            None => golden.trim().to_string(),
         })
     }
 
@@ -325,7 +338,7 @@ impl Sandboxes {
         let resolved;
         let source = match source {
             NewSandboxSource::Fork(name) if name == tod_sandbox::config::GOLDEN => {
-                let golden = self.resolve_golden(&bx)?;
+                let golden = self.resolve_sole_golden(&bx)?;
                 progress(&format!("golden is {golden}"));
                 resolved = NewSandboxSource::Fork(golden);
                 &resolved
@@ -631,14 +644,16 @@ pub fn list(root: &Path) -> Result<Vec<ListedSandbox>> {
         })
         .collect();
     all.sort_by(|a, b| a.name.cmp(&b.name));
-    // The fixed name a node can fork, ahead of the sandboxes it stands for.
-    if let Some(golden) = sandboxes.config.blaxel.as_ref().and_then(|a| a.golden.as_deref()).filter(|g| !g.trim().is_empty()) {
+    // The fixed name a node can fork, ahead of the sandboxes it stands for:
+    // one per repository, and the old account-wide one.
+    let settings = sandboxes.config.blaxel.as_ref().map(|a| a.golden_settings()).unwrap_or_default();
+    for (repo, golden) in settings.into_iter().rev() {
         all.insert(
             0,
             ListedSandbox {
                 name: tod_sandbox::config::GOLDEN.to_string(),
-                status: "always the newest".to_string(),
-                image: golden.to_string(),
+                status: if repo == "*" { "every repository without its own".to_string() } else { format!("for {repo}") },
+                image: golden,
                 owner: None,
                 known: true,
             },
@@ -654,11 +669,11 @@ pub fn list_vms(root: &Path) -> Result<Vec<tod_sandbox::vms::Vm>> {
     let sandboxes = Sandboxes::load(root)?;
     let bx = sandboxes.blaxel()?;
     // No golden set is fine; one set that cannot be resolved is an error.
-    let golden = match sandboxes.config.blaxel.as_ref().and_then(|a| a.golden.as_deref()).filter(|g| !g.trim().is_empty()) {
-        Some(_) => Some(sandboxes.resolve_golden(&bx)?),
-        None => None,
-    };
-    tod_sandbox::vms::list_managed(&bx, golden.as_deref())
+    let mut goldens = Vec::new();
+    for (_, setting) in sandboxes.config.blaxel.as_ref().map(|a| a.golden_settings()).unwrap_or_default() {
+        goldens.push(sandboxes.resolve_golden_setting(&bx, &setting)?);
+    }
+    tod_sandbox::vms::list_managed(&bx, &goldens)
 }
 
 /// The real sandbox a fork source names: `golden` is an alias for the newest
@@ -670,7 +685,7 @@ pub fn resolve_fork_source(root: &Path, name: &str) -> Result<String> {
     fork_source_with(name, || {
         let sandboxes = Sandboxes::load(root)?;
         let bx = sandboxes.blaxel()?;
-        sandboxes.resolve_golden(&bx)
+        sandboxes.resolve_sole_golden(&bx)
     })
 }
 

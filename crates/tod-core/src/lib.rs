@@ -13,6 +13,11 @@ pub const CLI_BUILD_STAMP: &str = env!("TOD_CLI_BUILD_STAMP");
 /// build from a tarball with no `.git`). See `build.rs`.
 pub const GIT_COMMIT: &str = env!("TOD_GIT_COMMIT");
 
+/// The commit's time, unix seconds (`git log -1 --format=%ct`), or `"unknown"`
+/// as for [`GIT_COMMIT`]. It orders builds where a hash cannot
+/// (`tod_sandbox::golden`). See `build.rs`.
+pub const GIT_COMMIT_TIME: &str = env!("TOD_GIT_COMMIT_TIME");
+
 /// Whether the working tree had uncommitted changes at build time
 /// (`git status --porcelain`), as `"true"` / `"false"`, or `"unknown"` when
 /// git or the repository is missing. See `build.rs`.
