@@ -304,8 +304,8 @@ fn hours(d: Duration) -> String {
 /// What the node spent of `budget` when `limit` stopped it.
 fn budget_spent(limit: &BudgetLimit, budget: &Budget) -> (u32, f64) {
     match limit {
-        BudgetLimit::Sessions { used } => (*used, budget.max_duration.as_secs_f64() / 3600.0),
-        BudgetLimit::Time { elapsed_secs } => (budget.max_sessions, *elapsed_secs as f64 / 3600.0),
+        BudgetLimit::Sessions { used, elapsed_secs } => (*used, *elapsed_secs as f64 / 3600.0),
+        BudgetLimit::Time { elapsed_secs, used } => (*used, *elapsed_secs as f64 / 3600.0),
     }
 }
 
@@ -769,10 +769,10 @@ mod tests {
             reason(Outcome::Stopped { reason: "the user paused it".into() }).as_deref(),
             Some("the supervisor stopped: the user paused it")
         );
-        let spent = reason(Outcome::BudgetExhausted { limit: BudgetLimit::Sessions { used: 60 } }).unwrap();
-        assert!(spent.contains("60 of 60 sessions") && spent.contains("16 hours") && spent.contains("Keep going"), "{spent}");
-        let timed = reason(Outcome::BudgetExhausted { limit: BudgetLimit::Time { elapsed_secs: 16 * 3600 } }).unwrap();
-        assert!(timed.contains("60 of 60 sessions") && timed.contains("16 of 16 hours"), "{timed}");
+        let spent = reason(Outcome::BudgetExhausted { limit: BudgetLimit::Sessions { used: 60, elapsed_secs: 5 * 60 } }).unwrap();
+        assert!(spent.contains("60 of 60 sessions") && spent.contains("0.1 of 16 hours") && spent.contains("Keep going"), "{spent}");
+        let timed = reason(Outcome::BudgetExhausted { limit: BudgetLimit::Time { elapsed_secs: 16 * 3600, used: 7 } }).unwrap();
+        assert!(timed.contains("7 of 60 sessions") && timed.contains("16 of 16 hours"), "{timed}");
         // Requests are shown from the request itself, and stale once answered.
         for needs in [
             NeedsHuman::Decision { pending: 1 },
@@ -814,8 +814,8 @@ mod tests {
             Outcome::Stopped { reason: "waiting: a review".into() },
             Outcome::Stopped { reason: usage_limit_reason(&usage_limit::UsageLimit { reset_at_ms: 5, parsed: true }) },
             Outcome::Stopped { reason: "a new session was requested".into() },
-            Outcome::BudgetExhausted { limit: BudgetLimit::Sessions { used: 60 } },
-            Outcome::BudgetExhausted { limit: BudgetLimit::Time { elapsed_secs: 16 * 3600 } },
+            Outcome::BudgetExhausted { limit: BudgetLimit::Sessions { used: 60, elapsed_secs: 5 * 60 } },
+            Outcome::BudgetExhausted { limit: BudgetLimit::Time { elapsed_secs: 16 * 3600, used: 7 } },
         ];
         for needs in [
             NeedsHuman::Decision { pending: 1 },
@@ -843,7 +843,7 @@ mod tests {
         }
         // The supervisor's budget words, on the row.
         let spent = tod_core::run_state::for_outcome(
-            &Outcome::BudgetExhausted { limit: BudgetLimit::Sessions { used: 60 } },
+            &Outcome::BudgetExhausted { limit: BudgetLimit::Sessions { used: 60, elapsed_secs: 5 * 60 } },
             words,
         );
         assert!(spent.reason_text.contains("60 of 60 sessions") && spent.reason_text.contains("Keep going"));
@@ -860,14 +860,14 @@ mod tests {
 
     #[test]
     fn the_budget_question_says_what_was_used_and_what_each_answer_does() {
-        let q = budget_question(&BudgetLimit::Sessions { used: 60 }, &budget());
+        let q = budget_question(&BudgetLimit::Sessions { used: 60, elapsed_secs: 5 * 60 }, &budget());
         assert_eq!(
             q,
-            "Used 60 of 60 sessions (16 of 16 hours). Keep going gives it 60 more sessions and 16 more hours. \
+            "Used 60 of 60 sessions (0.1 of 16 hours). Keep going gives it 60 more sessions and 16 more hours. \
              Leave it stopped keeps it stopped until you change this answer."
         );
-        let q = budget_question(&BudgetLimit::Time { elapsed_secs: 16 * 3600 + 600 }, &budget());
-        assert!(q.starts_with("Used 60 of 60 sessions (16.2 of 16 hours)."), "{q}");
+        let q = budget_question(&BudgetLimit::Time { elapsed_secs: 16 * 3600 + 600, used: 7 }, &budget());
+        assert!(q.starts_with("Used 7 of 60 sessions (16.2 of 16 hours)."), "{q}");
     }
 
     #[test]

@@ -82,8 +82,8 @@ impl Words<'static> {
 /// A spent budget, in short.
 pub fn budget_text(limit: &BudgetLimit) -> String {
     match limit {
-        BudgetLimit::Sessions { used } => format!("budget spent: {used} sessions"),
-        BudgetLimit::Time { elapsed_secs } => {
+        BudgetLimit::Sessions { used, .. } => format!("budget spent: {used} sessions"),
+        BudgetLimit::Time { elapsed_secs, .. } => {
             format!("budget spent: {} of work", crate::runner_status::format_elapsed(*elapsed_secs as i64 * 1000))
         }
     }
@@ -254,7 +254,7 @@ mod tests {
                 None,
             ),
             (
-                Outcome::BudgetExhausted { limit: BudgetLimit::Sessions { used: 60 } },
+                Outcome::BudgetExhausted { limit: BudgetLimit::Sessions { used: 60, elapsed_secs: 0 } },
                 Phase::Stopped,
                 kind::BUDGET,
                 "budget spent: 60 sessions",

@@ -796,8 +796,8 @@ pub(crate) fn outcome_reason(outcome: &Outcome) -> Option<YouReason> {
         }),
         Outcome::BudgetExhausted { limit } => Some(YouReason::Stopped {
             reason: match limit {
-                BudgetLimit::Sessions { used } => format!("budget spent: {used} sessions"),
-                BudgetLimit::Time { elapsed_secs } => {
+                BudgetLimit::Sessions { used, .. } => format!("budget spent: {used} sessions"),
+                BudgetLimit::Time { elapsed_secs, .. } => {
                     format!("budget spent: {} of work", format_elapsed(*elapsed_secs as i64 * 1000))
                 }
             },
@@ -1197,7 +1197,7 @@ mod tests {
         assert!(matches!(standing(&c).actor, NextActor::You { why: YouReason::Stopped { .. }, since: 2 }));
 
         c.run.last_outcome = Some((
-            Outcome::BudgetExhausted { limit: BudgetLimit::Sessions { used: 6 } },
+            Outcome::BudgetExhausted { limit: BudgetLimit::Sessions { used: 6, elapsed_secs: 0 } },
             3,
         ));
         assert_eq!(

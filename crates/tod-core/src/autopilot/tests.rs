@@ -457,7 +457,7 @@ fn stops_when_the_session_budget_runs_out_and_a_restart_keeps_count() {
     assert_eq!(
         outcome,
         Outcome::BudgetExhausted {
-            limit: BudgetLimit::Sessions { used: 2 }
+            limit: BudgetLimit::Sessions { used: 2, elapsed_secs: 0 }
         }
     );
 

@@ -59,7 +59,7 @@ database list | remove <name> | test <name>
                          server's own name (for RDS, the instance endpoint). --check
                          tests it first; `test` signs a login and connects to the
                          host from here, and sends nothing to it.
-status <name>            Whether a sandbox is running or in standby, and its
+status <name> [--json]   Whether a sandbox is running or in standby, and its
                          deployment status (does not wake it).
 exec <name> [--keep-awake] [--cwd DIR] -- <command...>
                          Run a command in the sandbox.
@@ -234,7 +234,17 @@ fn run() -> Result<i32> {
         "list" => list(&ctx),
         "status" => {
             let name = args.positional("sandbox name")?;
+            let json = args.flag("--json");
             args.done()?;
+            if json {
+                // The raw record, for what `status` does not show (its lifetime
+                // fields, its network and volumes): values of environment
+                // variables and proxy secrets are never printed.
+                let mut raw = ctx.blaxel()?.get_json(&name)?.ok_or_else(|| anyhow!("{name}: does not exist"))?;
+                redact_sandbox_json(&mut raw);
+                println!("{}", serde_json::to_string_pretty(&raw)?);
+                return Ok(0);
+            }
             match ctx.blaxel()?.get(&name)? {
                 Some(info) => println!(
                     "{name}: {} ({}, {})",
@@ -535,6 +545,25 @@ fn webhooks(ctx: &Ctx, args: Args) -> Result<i32> {
         acct.orchestrator
     );
     Ok(0)
+}
+
+/// Removes what a sandbox record holds that must not be shown: the values of
+/// its environment variables and of its proxy's secrets and injected headers.
+fn redact_sandbox_json(v: &mut serde_json::Value) {
+    match v {
+        serde_json::Value::Object(map) => {
+            for (key, value) in map.iter_mut() {
+                let lower = key.to_ascii_lowercase();
+                if (lower == "secrets" || lower == "headers" || lower == "envs" || lower == "env") && !value.is_null() {
+                    *value = serde_json::Value::String("<hidden>".into());
+                } else {
+                    redact_sandbox_json(value);
+                }
+            }
+        }
+        serde_json::Value::Array(items) => items.iter_mut().for_each(redact_sandbox_json),
+        _ => {}
+    }
 }
 
 fn orchestrator(ctx: &Ctx, mut args: Args) -> Result<i32> {
