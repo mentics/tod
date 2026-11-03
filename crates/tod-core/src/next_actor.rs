@@ -701,7 +701,7 @@ fn actor_for(facts: &Facts<'_>) -> (NextActor, i64) {
 /// What a run's last outcome asks of the user, when it asks anything.
 /// Requests are `attention`'s: an outcome that stopped for one is stale once
 /// none is left (the run continues by itself), so it asks nothing here.
-fn outcome_reason(outcome: &Outcome) -> Option<YouReason> {
+pub(crate) fn outcome_reason(outcome: &Outcome) -> Option<YouReason> {
     match outcome {
         Outcome::Done | Outcome::Waiting { .. } => None,
         outcome if stopped_by_user(outcome) => Some(YouReason::Paused),

@@ -294,7 +294,8 @@ pub fn stop_reason(outcome: &Outcome, budget: &Budget) -> Option<String> {
             | NeedsHuman::PrStuck { .. }
             | NeedsHuman::Permission { .. }
             | NeedsHuman::AgentFailed { .. }
-            | NeedsHuman::NoProgress { .. } => Some(reason.describe()),
+            | NeedsHuman::NoProgress { .. }
+            | NeedsHuman::Looping { .. } => Some(reason.describe()),
         },
     }
 }
