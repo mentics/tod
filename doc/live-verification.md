@@ -112,3 +112,38 @@ regression test, merge, rebuild, relaunch, and rerun from the failing step.
 - **No `timeout` command on macOS**: `timeout 120 cargo ...` fails with
   "command not found", and a pipeline that greps its output hides that. Run
   cargo plainly, or check the exit code. macOS `sed -i` needs `-i ''`.
+
+## Testing the webhook wake (`joel-cofactr/build-test`)
+
+A throwaway private repo for GitHub tests; a webhook for the live-verify
+orchestrator is registered on it (`gh api repos/joel-cofactr/build-test/hooks`,
+events: pull requests, reviews, comments, checks, pushes, releases) and stays.
+Its payload URL and where the secret is: `tod-sandbox --data-root <root>
+webhooks`. A delivery's result (200, the keys it made, which nodes it routed to)
+is in `gh api repos/joel-cofactr/build-test/hooks/<id>/deliveries[/<delivery>]`
+(`.response.payload`); a redelivery is `POST .../deliveries/<id>/attempts`.
+
+Recipe, as run 2026-11-03 (a wake 2 s after the merge, the wait's own timer
+due 3 minutes later):
+
+1. A branch named like the node's (`task/<slug>`) with one commit, and a PR.
+2. `tod-cli node create --parent eng-work`, `capabilities enable <n> spec
+   lifecycle agent files ticket`, `pr link joel-cofactr/build-test#<N> --node
+   <uuid>` (needs the UUID), and set `node_lifecycle.state = 'pr_review'` in the
+   root's `tod.db` (no CLI sets it). The Files location can stay
+   `Golden flagship`: only the PR link matters for the wait.
+3. Run it in the cloud (task panel). With the PR having failing or stuck checks
+   the node ends `pr_stuck`; `gh workflow disable` the repo's two workflows and
+   push a commit so the PR has none, then "Run with a new session": the node
+   goes to `approved` and waits on `github:pr:<N>:merged`.
+4. `gh pr merge <N> --squash`. The orchestrator logs `webhook PR #N merged for
+   <user>'s node ...`, the wait becomes `satisfied` and the supervisor starts
+   at once. Re-enable the workflows and delete the branch afterwards.
+
+Gotchas from it: a node's recorded repository is its checkout's, not its PR's,
+so routing keys on its linked PRs (a flagship node's PR is in kb); the gate
+replaces every `github:pr:` wait of a node in review, so add test waits only in
+states it does not own; `tod-sandbox fork` makes a sandbox with no proxy rules,
+which `fork_golden` refuses, so a repo-specific base must come from a sandbox
+the app made; macOS `tar` adds `._` files that break a git checkout (use
+`COPYFILE_DISABLE=1`).
