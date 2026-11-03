@@ -41,7 +41,12 @@ sandbox_source_hash() {
     local dirs
     dirs="$(sandbox_crate_dirs)" || return 1
     [[ -n $dirs ]] || { echo "sandbox_source_hash: no crates found" >&2; return 1; }
-    while IFS= read -r d; do paths+=("$d"); done <<< "$dirs"
+    # Only what is compiled: a crate's src/, manifest and build script. Its
+    # tests/, benches and docs cannot change a binary. (Whether a running
+    # orchestrator is compatible is not decided here but by the version
+    # contract, `GET /health`; this hash only says whether the Linux binaries
+    # need a rebuild.)
+    while IFS= read -r d; do paths+=("$d/src" "$d/Cargo.toml" "$d/build.rs"); done <<< "$dirs"
     local sha=(shasum -a 256)
     command -v shasum >/dev/null 2>&1 || sha=(sha256sum)
     comm -23 \

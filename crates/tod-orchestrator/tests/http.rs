@@ -161,6 +161,27 @@ fn seed_then_sync_changes_both_ways() {
 }
 
 #[test]
+fn health_reports_the_version_contract_and_a_newer_client_is_refused() {
+    let h = start("contract");
+    let (status, body) = send(h.port, "GET", "/health", &[], b"");
+    assert_eq!(status, 200);
+    let ours = tod_store::sync::contract::Contract::parse_health(&String::from_utf8(body).unwrap());
+    assert_eq!(ours.wire, tod_store::sync::contract::WIRE);
+    assert!(ours.schema > 0, "{ours:?}");
+    // /health is answered whatever the client sends.
+    assert_eq!(send(h.port, "GET", "/health", &[("X-Tod-Wire", "99")], b"").0, 200);
+    // The same client or an older one is served; a newer one is told to update.
+    let (wire, schema) = (ours.wire.to_string(), ours.schema.to_string());
+    let same = [("X-Tod-User", "a"), ("X-Tod-Wire", wire.as_str()), ("X-Tod-Schema", schema.as_str())];
+    assert_eq!(send(h.port, "GET", "/cli", &same, b"").0, 405);
+    let newer_schema = (ours.schema + 1).to_string();
+    let newer = [("X-Tod-User", "a"), ("X-Tod-Schema", newer_schema.as_str())];
+    let (status, body) = send(h.port, "GET", "/cli", &newer, b"");
+    assert_eq!(status, 426);
+    assert!(String::from_utf8_lossy(&body).contains("redeploy"));
+}
+
+#[test]
 fn routing() {
     let h = start("routes");
     assert_eq!(send(h.port, "GET", "/health", &[], b"").0, 200);

@@ -448,6 +448,17 @@ pub trait Orchestrator {
         user: &str,
         cursor: Option<&tod_problems::Cursor>,
     ) -> Result<(tod_problems::Cursor, Vec<tod_problems::Problem>)>;
+    /// Refuses (with both versions named) an orchestrator whose wire or
+    /// schema is newer than this app reads (`tod_store::sync::contract`);
+    /// an older one is the app's to redeploy (`deploy`), not a refusal.
+    fn check_contract(&self) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// This build's version contract with the orchestrator.
+pub fn my_contract() -> tod_store::sync::contract::Contract {
+    tod_store::sync::contract::Contract::current(crate::CLI_BUILD_STAMP)
 }
 
 /// How many times a request that is safe to repeat is sent while the
@@ -477,6 +488,8 @@ pub struct HttpOrchestrator {
     /// only when the user chose to take it over.
     take_over: bool,
     agent: ureq::Agent,
+    /// Set once the orchestrator's contract was judged readable.
+    contract_ok: std::sync::atomic::AtomicBool,
 }
 
 impl HttpOrchestrator {
@@ -487,7 +500,7 @@ impl HttpOrchestrator {
             .timeout_global(Some(Duration::from_secs(300)))
             .build()
             .into();
-        Self { base: base.into().trim_end_matches('/').to_string(), token, client: "app".into(), take_over: false, agent }
+        Self { base: base.into().trim_end_matches('/').to_string(), token, client: "app".into(), take_over: false, agent, contract_ok: false.into() }
     }
 
     /// Names this app as the sync client `client` ([`client_id`]).
@@ -502,6 +515,18 @@ impl HttpOrchestrator {
     pub fn with_take_over(mut self, take_over: bool) -> Self {
         self.take_over = take_over;
         self
+    }
+
+    /// `GET /health`: the orchestrator's `{wire, schema, build}`; an
+    /// orchestrator from before the contract reads as wire 0.
+    pub fn health(&self) -> Result<tod_store::sync::contract::Contract> {
+        let mut resp = Self::with_gateway_retry("health", || self.agent.get(&format!("{}/health", self.base)).call())?;
+        let status = resp.status();
+        let body = resp.body_mut().read_to_string().unwrap_or_default();
+        if !status.is_success() {
+            bail!("orchestrator health: {}", tod_sandbox::blaxel::describe_failure(status, &body));
+        }
+        Ok(tod_store::sync::contract::Contract::parse_health(&body))
     }
 
     /// `GET /users/<user>/<rest>` as JSON.
@@ -612,7 +637,10 @@ impl HttpOrchestrator {
     }
 
     fn auth<B>(&self, req: ureq::RequestBuilder<B>) -> ureq::RequestBuilder<B> {
-        let req = req.header(sync::CLIENT_HEADER, &self.client);
+        let mut req = req.header(sync::CLIENT_HEADER, &self.client);
+        for (name, value) in my_contract().headers() {
+            req = req.header(name, &value);
+        }
         match &self.token {
             Some(t) => req.header("Authorization", &format!("Bearer {t}")),
             None => req,
@@ -657,6 +685,25 @@ impl HttpOrchestrator {
 }
 
 impl Orchestrator for HttpOrchestrator {
+    fn check_contract(&self) -> Result<()> {
+        use tod_store::sync::contract::{Verdict, judge, newer_message};
+        if self.contract_ok.load(std::sync::atomic::Ordering::Relaxed) {
+            return Ok(());
+        }
+        let (mine, theirs) = (my_contract(), self.health()?);
+        match judge(&mine, &theirs) {
+            Verdict::Newer => bail!("{}", newer_message(&mine, &theirs)),
+            Verdict::Older => tracing::info!(
+                "the orchestrator is older than this app ({}; this app is {}); the app redeploys it at launch",
+                theirs.describe(),
+                mine.describe()
+            ),
+            Verdict::Compatible => {}
+        }
+        self.contract_ok.store(true, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
     fn seed(&self, user: &str, snapshot: &[u8]) -> Result<Seeding> {
         // The orchestrator answers 409 while the user's store is in use; a
         // 409 for another client's seeding is not retried.
@@ -763,6 +810,7 @@ fn connect(db: &Path) -> Result<rusqlite::Connection> {
 /// Seed if not seeded, send the outbox, pull and apply the feed; saves the
 /// cursors after each step, so a failure part way loses nothing.
 pub fn sync(fleet: &FleetStore, root: &Path, orch: &dyn Orchestrator, user: &str) -> Result<SyncReport> {
+    orch.check_contract()?;
     match sync_once(fleet, root, orch, user) {
         Err(err) if format!("{err:#}").contains(NOT_SEEDED) => {
             // The orchestrator's data is gone (a redeploy without its volume):

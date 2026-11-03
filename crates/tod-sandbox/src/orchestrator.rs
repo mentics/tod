@@ -222,7 +222,9 @@ pub fn provision(bx: &Blaxel, spec: &Spec, progress: &mut dyn FnMut(&str)) -> Re
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let (status, body) = bx.get_url(&health)?;
-        if status == 200 && body.trim() == "ok" {
+        // `{wire, schema, build}` (`tod_store::sync::contract`); an older
+        // orchestrator answered `ok`.
+        if status == 200 && (body.trim() == "ok" || body.trim_start().starts_with('{')) {
             return Ok(url);
         }
         if Instant::now() > deadline {
