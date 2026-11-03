@@ -40,6 +40,7 @@ use crate::conversation::driver::{
 };
 use crate::conversation::protocol::protocol_for;
 use crate::lifecycle;
+use state::PendingGroups;
 use crate::lifecycle_next::{NextStep, Standing, next_step};
 use crate::phase::{PhaseStanding, settle_gate};
 use tod_store::phase::PhaseRepo;
@@ -127,6 +128,10 @@ pub trait StepHook {
     fn watch(&mut self, _turn: Turn<'_>) -> Option<String> {
         None
     }
+
+    /// The run is working on `what` that is not one agent turn it already
+    /// shows (the next group of the phase's skills): for showing where it is.
+    fn working_on(&mut self, _what: &str) {}
 
     /// The run is waiting on something outside (a bot's review, CI) and no
     /// agent is working: `Some(what)` while it waits, `None` when it stops.
@@ -313,6 +318,21 @@ fn step_name(step: NextStep) -> &'static str {
 fn protocol_name(kind: ProtocolKind) -> &'static str {
     kind.as_str()
 }
+
+/// A step's name in the run's record: the protocol, and for a later group of
+/// the phase's skills which one.
+fn step_label(kind: ProtocolKind, group: usize) -> String {
+    if group == 0 {
+        protocol_name(kind).to_string()
+    } else {
+        format!("{} (skills group {})", protocol_name(kind), group + 1)
+    }
+}
+
+/// What a session for a later group of the phase's skills is first told: its
+/// context is the phase's own, with only that group's skills in the Skills block.
+const SKILL_GROUP_STARTER: &str = "Run the skills in the Skills section of your context on this node's current work, \
+as they direct. Other sessions carry out the rest of this phase; do what these skills ask and nothing else.";
 
 /// Drives one node. See the module docs.
 pub struct Autopilot {
@@ -511,6 +531,17 @@ impl Autopilot {
                 hook.waiting(None, None);
                 return self.finish(outcome);
             }
+            // The later groups of the step that finished come before anything
+            // after it, whatever stopped the run before they were done.
+            let owed = self.state.pending_groups.is_some();
+            if let Some(outcome) = self.run_pending_groups(fleet, agent, hook, &lifecycle)? {
+                return self.finish(outcome);
+            }
+            if owed {
+                // Their sessions are work done: the standing may read the same
+                // after them, and the same step again is not "no progress".
+                last = None;
+            }
             let standing = fleet.read(|conn| Standing::load(conn, self.node, &lifecycle))?;
             let Some(step) = next_step(&standing) else {
                 let reason = if standing.steps_need_user > 0 {
@@ -560,6 +591,19 @@ impl Autopilot {
                 }
                 NextStep::GateCheck => self.gate(fleet, agent, hook, &lifecycle)?,
             };
+            if stopped.is_none() {
+                let owed = match step {
+                    NextStep::Implement => Some((ProtocolKind::Implementation, "implement")),
+                    NextStep::Verify => Some((ProtocolKind::Verification, "verify")),
+                    NextStep::Review => Some((ProtocolKind::Review, "review")),
+                    NextStep::Fix => Some((ProtocolKind::Fix, "fix")),
+                    NextStep::Phase => Some((ProtocolKind::Phase, lifecycle.as_str())),
+                    _ => None,
+                };
+                if let Some((kind, phase_key)) = owed {
+                    self.owe_groups(fleet, kind, phase_key, &lifecycle)?;
+                }
+            }
             if let Some(outcome) = stopped {
                 return self.finish(outcome);
             }
@@ -583,6 +627,11 @@ impl Autopilot {
             && let Some(outcome) = self.certify_draft_pr(fleet, agent, hook)?
         {
             return Ok(Some(outcome));
+        }
+        // The draft's later groups of skills run before the node moves on: the
+        // run's next round does them, and comes back to the gate.
+        if from == "pr" && self.state.pending_groups.is_some() {
+            return Ok(None);
         }
         // `pr_draft` stops short of waiting on a human reviewer (it is what
         // gets the draft ready for one).
@@ -759,6 +808,8 @@ impl Autopilot {
             return Ok(Some(outcome));
         }
         if certified(fleet)? {
+            // The later groups are owed before the gate is looked at again.
+            self.owe_groups(fleet, ProtocolKind::Pr, "pr", "pr")?;
             return Ok(None);
         }
         Ok(Some(match self.blocked_report(fleet)? {
@@ -801,6 +852,11 @@ impl Autopilot {
         use crate::pr_readiness::{self, Next as PrNext, Wait};
         let mut waited_since: Option<std::time::Instant> = None;
         let mut unchanged = 0u32;
+        // The later groups of the phase's skills (a code review) run once each
+        // time the pull request reads clean; what they post is work for the
+        // first group, which sets this again.
+        let phase_key = if before_review { "pr_draft" } else { "pr_review" };
+        let mut side_done = false;
         if before_review && (self.fresh_session || !self.pr_conversation_this_stay(fleet)?) {
             hook.waiting(None, None);
             if let Some(outcome) = self.converse(fleet, agent, hook, ProtocolKind::Pr, None)? {
@@ -857,7 +913,24 @@ impl Autopilot {
                     return Ok(Some(github_wait::github_look_failed(fleet, self.node, false, &err)?));
                 }
             };
-            match pr_readiness::overall(&live) {
+            let overall = pr_readiness::overall(&live);
+            let ready = matches!(overall, PrNext::Clear)
+                || (before_review
+                    && matches!(&overall, PrNext::Wait(waits) if waits.iter().all(|w| matches!(w, Wait::HumanReview))));
+            if ready && !side_done {
+                side_done = true;
+                let node = self.node;
+                if fleet.read(|conn| crate::skills_context::extra_groups(conn, node, phase_key))? > 0 {
+                    self.clear_poll_waits(fleet)?;
+                    hook.waiting(None, None);
+                    if let Some(outcome) = self.side_groups(fleet, agent, hook, ProtocolKind::Pr, phase_key)? {
+                        return Ok(Some(outcome));
+                    }
+                    // Read the pull request again: they may have posted work.
+                    continue;
+                }
+            }
+            match overall {
                 PrNext::Merged | PrNext::Clear => {
                     self.clear_poll_waits(fleet)?;
                     hook.waiting(None, None);
@@ -878,6 +951,7 @@ impl Autopilot {
                     let before = self.pr_report(fleet)?;
                     let fingerprint: Vec<String> = live.iter().map(|p| p.fingerprint.clone()).collect();
                     let reopen = self.pr_reopen(fleet, &live)?;
+                    side_done = false;
                     if let Some(outcome) = self.converse(fleet, agent, hook, ProtocolKind::Pr, reopen)? {
                         return Ok(Some(outcome));
                     }
@@ -1018,6 +1092,93 @@ impl Autopilot {
         kind: ProtocolKind,
         reopen: Option<(Uuid, String)>,
     ) -> Result<Option<Outcome>> {
+        self.converse_group(fleet, agent, hook, kind, reopen, 0)
+    }
+
+    /// Run the later groups of the phase's skills (`phase_key`'s
+    /// `lifecycle_config`), in order, each in a fresh session of `kind` that
+    /// is given only its own group's skills: the independent runs (a code
+    /// review) beside the phase agent's own. `Some` when the run has to stop.
+    fn side_groups<A: AgentAccess + ?Sized, H: StepHook + ?Sized>(
+        &mut self,
+        fleet: &FleetStore,
+        agent: &mut A,
+        hook: &mut H,
+        kind: ProtocolKind,
+        phase_key: &str,
+    ) -> Result<Option<Outcome>> {
+        let node = self.node;
+        let extra = fleet.read(|conn| crate::skills_context::extra_groups(conn, node, phase_key))?;
+        for group in 1..=extra {
+            if let Some(outcome) = self.converse_group(fleet, agent, hook, kind, None, group)? {
+                return Ok(Some(outcome));
+            }
+        }
+        Ok(None)
+    }
+
+    /// A step of `kind` finished: the later groups of `phase_key`'s skills are
+    /// now owed, and recorded so (saved) before any of them runs.
+    fn owe_groups(&mut self, fleet: &FleetStore, kind: ProtocolKind, phase_key: &str, lifecycle: &str) -> Result<()> {
+        let node = self.node;
+        let extra = fleet.read(|conn| crate::skills_context::extra_groups(conn, node, phase_key))?;
+        self.state.pending_groups = (extra > 0).then(|| PendingGroups {
+            protocol: protocol_name(kind).to_string(),
+            phase_key: phase_key.to_string(),
+            lifecycle: lifecycle.to_string(),
+            next: 1,
+        });
+        self.save()
+    }
+
+    /// Run the groups [`Self::owe_groups`] recorded, one at a time, saving
+    /// after each so a stop resumes at the one it was in. Dropped, not run, if
+    /// the node left the state they were owed in or the config no longer has
+    /// them. `Some` when the run has to stop (the group stays owed).
+    fn run_pending_groups<A: AgentAccess + ?Sized, H: StepHook + ?Sized>(
+        &mut self,
+        fleet: &FleetStore,
+        agent: &mut A,
+        hook: &mut H,
+        lifecycle: &str,
+    ) -> Result<Option<Outcome>> {
+        while let Some(pending) = self.state.pending_groups.clone() {
+            let node = self.node;
+            let total = fleet.read(|conn| crate::skills_context::extra_groups(conn, node, &pending.phase_key))? + 1;
+            if pending.lifecycle != lifecycle || pending.next >= total {
+                self.state.pending_groups = None;
+                self.save()?;
+                break;
+            }
+            let kind = ProtocolKind::parse(&pending.protocol)?;
+            hook.working_on(&format!(
+                "skills group {} of {} for the {} phase",
+                pending.next + 1,
+                total,
+                pending.phase_key
+            ));
+            if let Some(outcome) = self.converse_group(fleet, agent, hook, kind, None, pending.next)? {
+                return Ok(Some(outcome));
+            }
+            if let Some(now) = self.state.pending_groups.as_mut() {
+                now.next += 1;
+            }
+            self.save()?;
+        }
+        Ok(None)
+    }
+
+    /// [`Self::converse`] for skill group `group` of the phase: 0 is the phase
+    /// agent's own session, any other a session of its own for that group.
+    fn converse_group<A: AgentAccess + ?Sized, H: StepHook + ?Sized>(
+        &mut self,
+        fleet: &FleetStore,
+        agent: &mut A,
+        hook: &mut H,
+        kind: ProtocolKind,
+        reopen: Option<(Uuid, String)>,
+        group: usize,
+    ) -> Result<Option<Outcome>> {
         if let Some(limit) = self.over_budget() {
             return Ok(Some(Outcome::BudgetExhausted { limit }));
         }
@@ -1028,16 +1189,16 @@ impl Autopilot {
             .current
             .as_ref()
             .and_then(|current| {
-                (current.protocol == protocol_name(kind) && current.lifecycle == lifecycle)
+                (current.protocol == protocol_name(kind) && current.lifecycle == lifecycle && current.skill_group == group)
                     .then(|| (current.conversation_id, RESUME_MESSAGE.to_string()))
             })
             .or(reopen);
         let (mut driver, message) = match resumable {
             Some((id, message)) => match ConversationDriver::open(self.config.clone(), fleet, id) {
                 Ok(driver) => (driver, message),
-                Err(_) => self.new_driver(kind),
+                Err(_) => self.new_driver(kind, group),
             },
-            None => self.new_driver(kind),
+            None => self.new_driver(kind, group),
         };
         self.state.sessions += 1;
         if let Err(err) = driver.send(fleet, agent, &message) {
@@ -1054,6 +1215,7 @@ impl Autopilot {
             protocol: protocol_name(kind).to_string(),
             lifecycle: lifecycle.clone(),
             conversation_id,
+            skill_group: group,
         });
         self.save()?;
 
@@ -1101,7 +1263,7 @@ impl Autopilot {
                     driver.cancel(fleet, agent)?;
                 } else {
                     self.state.current = None;
-                    self.record(fleet, protocol_name(kind), &lifecycle, conversation_id)?;
+                    self.record(fleet, &step_label(kind, group), &lifecycle, conversation_id)?;
                     close_session(agent, conversation_id);
                 }
                 return Ok(Some(Outcome::Stopped { reason }));
@@ -1128,7 +1290,7 @@ impl Autopilot {
             std::thread::sleep(self.poll);
         }
         self.state.current = None;
-        self.record(fleet, protocol_name(kind), &lifecycle, conversation_id)?;
+        self.record(fleet, &step_label(kind, group), &lifecycle, conversation_id)?;
         close_session(agent, conversation_id);
         Ok(None)
     }
@@ -1194,10 +1356,14 @@ impl Autopilot {
         Ok(Some(Outcome::NeedsHuman { reason }))
     }
 
-    fn new_driver(&self, kind: ProtocolKind) -> (ConversationDriver, String) {
-        let message = protocol_for(kind).starter().unwrap_or("Continue.").to_string();
+    fn new_driver(&self, kind: ProtocolKind, group: usize) -> (ConversationDriver, String) {
+        let message = if group == 0 {
+            protocol_for(kind).starter().unwrap_or("Continue.").to_string()
+        } else {
+            SKILL_GROUP_STARTER.to_string()
+        };
         (
-            ConversationDriver::new(self.config.clone(), Focus::Node(self.node), kind),
+            ConversationDriver::new(self.config.clone(), Focus::Node(self.node), kind).with_skill_group(group),
             message,
         )
     }

@@ -111,6 +111,10 @@ struct RunItem {
 /// What a lifecycle conversation is called in the list: the work it does
 /// (and for a phase or evaluation, the state), not its protocol's name.
 fn run_label(c: &Conversation) -> String {
+    format!("{}{}", run_label_base(c), c.group_suffix())
+}
+
+fn run_label_base(c: &Conversation) -> String {
     if let Some(label) = c.transition_label() {
         return match c.protocol {
             ProtocolKind::Phase | ProtocolKind::Evaluate => {

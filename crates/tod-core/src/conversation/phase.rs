@@ -20,7 +20,7 @@ use super::protocol::{
 use crate::context_recipes::{EVALUATE, PHASE};
 use crate::gate::context::build_phase_message;
 use crate::usual_actions::Role;
-use crate::phase::{PhaseStanding, PhaseStep, independent_evaluation, render_status};
+use crate::phase::{PhaseStanding, PhaseStep, evaluation_is_independent, render_status};
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 use tod_store::conversation::{Focus, ProtocolKind, actor_for};
@@ -109,7 +109,7 @@ fn build_request<'a>(
         ancestor_context,
         plan_steps,
         work_history,
-        skills: crate::skills_context::for_node(fleet, node, from, cwd)?,
+        skills: crate::skills_context::for_group(fleet, node, from, cwd, env.skill_group())?,
         pull_requests: crate::pr_context::for_node(fleet, node),
         from_state: from.to_string(),
         to_state: to.to_string(),
@@ -127,8 +127,13 @@ fn role_doc(state: &str) -> Result<String> {
 
 /// The node's phase status, as the phase agent and the evaluator are told it.
 fn status(env: &ProtocolEnv<'_>, node: Uuid, state: &str) -> Result<String> {
-    let standing = env.fleet.read(|conn| PhaseStanding::load(conn, node, state))?;
-    Ok(render_status(&standing, independent_evaluation(env.data_root)))
+    let (standing, independent) = env.fleet.read(|conn| {
+        Ok((
+            PhaseStanding::load(conn, node, state)?,
+            evaluation_is_independent(conn, env.data_root, node, state)?,
+        ))
+    })?;
+    Ok(render_status(&standing, independent))
 }
 
 /// Both protocols' variables: the conversation actor, so the phase agent's
@@ -169,12 +174,10 @@ fn opening_for(
     let request = build_request(env, node, &state, &to, Vec::new(), &cwd)?;
     // The commands this role usually runs in this state, ahead of the status
     // that says what the gate lacks (`cli/usual-actions.yml`).
-    let usual = crate::usual_actions::render(
-        env.media,
-        role,
-        &state,
-        independent_evaluation(env.data_root),
-    )?
+    let independent = env
+        .fleet
+        .read(|conn| evaluation_is_independent(conn, env.data_root, node, &state))?;
+    let usual = crate::usual_actions::render(env.media, role, &state, independent)?
     .map(|section| format!("\n{section}"))
     .unwrap_or_default();
     let tail = format!("{usual}\n{}", status(env, node, &state)?);
@@ -186,10 +189,15 @@ fn opening_for(
 /// what the gate still lacks and what was sent back.
 pub fn work_message(fleet: &FleetStore, data_root: &std::path::Path, node: Uuid) -> Result<String> {
     let state = crate::lifecycle::current_state(fleet, node)?;
-    let standing = fleet.read(|conn| PhaseStanding::load(conn, node, &state))?;
+    let (standing, independent) = fleet.read(|conn| {
+        Ok((
+            PhaseStanding::load(conn, node, &state)?,
+            evaluation_is_independent(conn, data_root, node, &state)?,
+        ))
+    })?;
     Ok(format!(
         "Carry this phase on until it is done.\n\n{}",
-        render_status(&standing, independent_evaluation(data_root))
+        render_status(&standing, independent)
     ))
 }
 
@@ -301,7 +309,12 @@ impl Protocol for PhaseProtocol {
         if crate::lifecycle::current_state(env.fleet, node)? != state {
             return Ok(Next::Done(Stop::Complete));
         }
-        let standing = env.fleet.read(|conn| PhaseStanding::load(conn, node, &state))?;
+        let (standing, independent) = env.fleet.read(|conn| {
+            Ok((
+                PhaseStanding::load(conn, node, &state)?,
+                evaluation_is_independent(conn, env.data_root, node, &state)?,
+            ))
+        })?;
         if standing.step() != PhaseStep::Work {
             return Ok(Next::Done(Stop::Complete));
         }
@@ -314,7 +327,7 @@ impl Protocol for PhaseProtocol {
                  is left, then finish it as the status below says. If only the \
                  user can supply what is missing, ask them through the \
                  `decisions` noun and end your turn.\n\n{}",
-                render_status(&standing, independent_evaluation(env.data_root))
+                render_status(&standing, independent)
             ),
             reason: "phase not finished".to_string(),
         })
@@ -537,7 +550,8 @@ pub fn mock_turn(
     if !is_certifiable(&state) {
         return Ok(String::new());
     }
-    let command = if independent_evaluation(&access.data_root()) {
+    let data_root = access.data_root();
+    let command = if access.read(|conn| evaluation_is_independent(conn, &data_root, node, &state))? {
         InterviewCommand::PhaseReady {
             node_id: node,
             state: state.clone(),

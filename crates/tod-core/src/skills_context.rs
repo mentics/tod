@@ -63,20 +63,40 @@ pub enum SkillsError {
     Missing { name: String, cwd: String, default_branch: String },
 }
 
-/// The configured skill names for `phase` on `node`, nearest config first
+/// The configured skill groups for `phase` on `node`, nearest config first
 /// (`lifecycle_config::resolve`). Empty when none are configured, including
-/// when an explicit empty list turns them off.
-pub fn configured(conn: &Connection, node: Uuid, phase: &str) -> Result<Vec<String>> {
-    Ok(lifecycle_config::resolve(conn, node, phase)?.map(|r| r.skills).unwrap_or_default())
+/// when an explicit empty list turns them off. Group 0 is the phase agent's
+/// own session's; each later one gets a session of its own
+/// (`lifecycle_config::groups`).
+pub fn configured(conn: &Connection, node: Uuid, phase: &str) -> Result<Vec<Vec<String>>> {
+    Ok(lifecycle_config::resolve(conn, node, phase)?
+        .map(|r| lifecycle_config::groups(&r.skills))
+        .unwrap_or_default())
 }
 
-/// The block for `phase` on `node`, for an agent working in `cwd`; empty when
-/// no skills are configured. Looking a skill up may run a command in the
-/// agent's container or sandbox, so this is never called on the UI thread.
+/// How many sessions the phase's skills run in beyond the phase agent's own:
+/// the later groups that name a skill.
+pub fn extra_groups(conn: &Connection, node: Uuid, phase: &str) -> Result<usize> {
+    Ok(configured(conn, node, phase)?.len().saturating_sub(1))
+}
+
+/// The block for the phase agent's own session (group 0) for `phase` on
+/// `node`, for an agent working in `cwd`; empty when it has no skills.
 pub fn for_node(fleet: &FleetStore, node: Uuid, phase: &str, cwd: &Workdir) -> Result<String> {
+    for_group(fleet, node, phase, cwd, 0)
+}
+
+/// The block for skill group `group` of `phase` on `node`: only that group's
+/// skills, so a session never sees another group's. Empty when the group has
+/// none. Looking a skill up may run a command in the agent's container or
+/// sandbox, so this is never called on the UI thread.
+pub fn for_group(fleet: &FleetStore, node: Uuid, phase: &str, cwd: &Workdir, group: usize) -> Result<String> {
     let names = fleet
         .read(|conn| configured(conn, node, phase))
-        .with_context(|| format!("could not read the skills configured for the {phase} phase"))?;
+        .with_context(|| format!("could not read the skills configured for the {phase} phase"))?
+        .into_iter()
+        .nth(group)
+        .unwrap_or_default();
     if names.is_empty() {
         return Ok(String::new());
     }

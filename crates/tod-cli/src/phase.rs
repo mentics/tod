@@ -176,7 +176,7 @@ fn certify(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
         anyhow::bail!("--note must say why the phase is done");
     }
     let state = state(inv, node_id)?;
-    refuse_self_certification(inv, &state)?;
+    refuse_self_certification(inv, node_id, &state)?;
     let result = inv.client().interview(InterviewCommand::PhaseCertify {
         node_id,
         state,
@@ -189,10 +189,13 @@ fn certify(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
 /// that did the phase's work records it `ready` instead. A state no phase
 /// agent works (`pr`, whose pull request agent certifies its draft) has no
 /// evaluator, so its agent certifies it itself.
-fn refuse_self_certification(inv: &Invocation, state: &str) -> anyhow::Result<()> {
-    if !tod_core::phase::independent_evaluation(&inv.data_root)
-        || !tod_core::phase::has_phase_agent(state)
-    {
+fn refuse_self_certification(inv: &Invocation, node: Uuid, state: &str) -> anyhow::Result<()> {
+    // Also on when the state has later groups of skills, which run after the
+    // agent and so before the evaluator that certifies.
+    let independent = inv.client().read(|conn| {
+        tod_core::phase::evaluation_is_independent(conn, &inv.data_root, node, state)
+    })?;
+    if !independent || !tod_core::phase::has_phase_agent(state) {
         return Ok(());
     }
     let actor = std::env::var(ACTOR_ENV).unwrap_or_else(|_| ACTOR_AGENT.to_string());

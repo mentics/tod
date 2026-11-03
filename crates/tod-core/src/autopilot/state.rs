@@ -59,6 +59,25 @@ pub struct AutopilotState {
     /// The run's loop counters, where the app reads them to show them.
     #[serde(default)]
     pub loops: LoopCounters,
+    /// Later groups of the phase's skills still owed after the step that
+    /// just finished; run before anything else, so an interruption resumes
+    /// at the group it stopped in instead of moving on without it.
+    #[serde(default)]
+    pub pending_groups: Option<PendingGroups>,
+}
+
+/// The later skill groups (`lifecycle_config::groups`, 1 and up) a finished
+/// step still owes, and where it is among them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingGroups {
+    /// `ProtocolKind::as_str` of the conversations they run as.
+    pub protocol: String,
+    /// The lifecycle config's phase key.
+    pub phase_key: String,
+    /// The node's state when they became owed: they are dropped if it moved.
+    pub lifecycle: String,
+    /// The next group to run (1-based among the later ones: group index).
+    pub next: usize,
 }
 
 /// How many times the same problem may come back in the same state before
@@ -118,6 +137,10 @@ pub struct CurrentStep {
     /// the same state.
     pub lifecycle: String,
     pub conversation_id: Uuid,
+    /// The group of the phase's skills the conversation works with (0: the
+    /// phase agent's own), so a restart reopens the right session.
+    #[serde(default)]
+    pub skill_group: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -144,6 +167,7 @@ impl AutopilotState {
             pr_turns_base: None,
             fresh_session: false,
             loops: LoopCounters::default(),
+            pending_groups: None,
         }
     }
 

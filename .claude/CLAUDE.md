@@ -584,6 +584,24 @@ node itself up, that lists the phase (so a lower node overrides per phase, and a
 explicit empty list turns a phase's skills off). The phase keys are the ten
 phase- and protocol-agent phases plus `fix` (`PHASES`). Names are free text and
 not validated when saved (the skill may be set up later).
+A phase's list is flat and ordered, with `;` (`lifecycle_config::GROUP_BREAK`) between
+groups: `a, b; c` is two. The first group is worked in the phase agent's own
+session; each later one runs in a fresh session of the same protocol
+(`Autopilot::side_groups`, `conversations.skill_group`, recorded by
+`ConversationDriver::with_skill_group`) whose Skills block holds only its own
+group (`skills_context::for_group`), after the phase agent's work, every time the
+phase loops. In `pr_draft`/`pr_review` they run when the pull request reads
+clean, so what they post becomes work for the first group. A leading `;` leaves
+the phase agent's session with no skills; an empty group elsewhere is refused
+(`lifecycle_config::parse_list`). The groups a finished step owes are recorded in the
+run state (`AutopilotState::pending_groups`, saved) and run before anything else,
+so an interrupted run resumes at the group it stopped in, never past it. A phase
+with later groups is always evaluated independently
+(`phase::evaluation_is_independent`): its agent only records `ready`, and the
+evaluator, after the last group, certifies. The local runner says which group
+is running in the node's run state (`StepHook::working_on`).
+`latest_for_focus_with_protocol` never returns a
+later group's session; `list_for_focus` shows all of them.
 `tod_core::skills_context::for_node` renders the "Skills" block
 (`DynamicBlock::ConfiguredSkills`) that each phase agent's opening carries, via
 a `skills` field on `ImplementRequest` and `GateCheckRequest`; the evaluator

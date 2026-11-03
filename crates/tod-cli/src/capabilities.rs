@@ -48,6 +48,12 @@ that phase's list (`--skills ''` means no skills, even where an ancestor sets
 some); `--clear` removes the phase from this node so the nearest ancestor's
 applies again. Other phases are untouched.
 
+`--skills` takes names separated by commas. A semicolon starts a new group:
+the first group is worked in the phase agent's own session and every later one
+in a session of its own, run in order each time the phase runs (`a, b; c` is two
+groups). A leading semicolon (`; c`) leaves the phase agent's own session with no
+skills. An empty group (a trailing `;`, or two in a row) is refused.
+
 `groups --lifecycle true` shows the node's children grouped by lifecycle state.
 Every child then needs the Lifecycle capability: those without it move down to
 the first place that accepts them (the next sibling of the node, and so on up).
@@ -238,7 +244,7 @@ fn list(inv: &Invocation, node: Uuid) -> anyhow::Result<String> {
                             if names.is_empty() {
                                 format!("{phase}: none")
                             } else {
-                                format!("{phase}: {}", names.join(", "))
+                                format!("{phase}: {}", tod_store::lifecycle_config::format_list(names))
                             }
                         })
                         .collect();
@@ -448,13 +454,7 @@ fn set(inv: &Invocation, node: Uuid, args: &Args) -> anyhow::Result<String> {
             match (args.get("--phase"), args.get("--skills"), args.get("--clear")) {
                 (Some(phase), Some(names), None) => {
                     phase_ok(phase)?;
-                    let list = names
-                        .split(',')
-                        .map(str::trim)
-                        .filter(|n| !n.is_empty())
-                        .map(String::from)
-                        .collect();
-                    skills.insert(phase.to_string(), list);
+                    skills.insert(phase.to_string(), tod_store::lifecycle_config::parse_list(names)?);
                 }
                 (None, None, Some(phase)) => {
                     phase_ok(phase)?;

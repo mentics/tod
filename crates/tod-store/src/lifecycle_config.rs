@@ -42,7 +42,70 @@ pub const PHASES: [&str; 13] = [
 ];
 
 /// Skills by phase key, as stored on one node.
+///
+/// A phase's list is ordered and flat, with [`GROUP_BREAK`] elements between
+/// groups: the first group is worked in the phase agent's own session, and each
+/// later one in a session of its own (`a, b; c` is two groups, `; a` is an empty
+/// first group and then `a`). A list with no break is one group, as before.
 pub type Skills = BTreeMap<String, Vec<String>>;
+
+/// The element of a stored list that separates two groups of skills. It is
+/// never a skill name (names are plain file names), so no name can collide.
+pub const GROUP_BREAK: &str = ";";
+
+/// Parse the text a user enters for one phase: names separated by commas,
+/// groups by semicolons. A leading semicolon is an empty first group (so the
+/// phase agent's own session runs no skills); a trailing semicolon or two in a
+/// row would be an empty group that means nothing, and is an error.
+pub fn parse_list(text: &str) -> Result<Vec<String>> {
+    let mut list = Vec::new();
+    for (index, group) in text.split(';').enumerate() {
+        if index > 0 {
+            list.push(GROUP_BREAK.to_string());
+        }
+        let names: Vec<&str> = group.split(',').map(str::trim).filter(|n| !n.is_empty()).collect();
+        if names.is_empty() && index > 0 {
+            bail!(
+                "an empty skill group after a `;` means nothing: remove the extra or trailing `;` \
+                 (only a leading `;` is meaningful, and keeps the first skills out of the phase agent's session)"
+            );
+        }
+        list.extend(names.into_iter().map(String::from));
+    }
+    // Text with no names at all (`''`) stays the explicit empty list.
+    Ok(list)
+}
+
+/// The text form of a stored list, as [`parse_list`] reads it.
+pub fn format_list(list: &[String]) -> String {
+    let mut out = String::new();
+    let mut first_in_group = true;
+    for name in list {
+        if name == GROUP_BREAK {
+            out.push(';');
+            first_in_group = true;
+            continue;
+        }
+        if !first_in_group {
+            out.push(',');
+        }
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(name);
+        first_in_group = false;
+    }
+    out
+}
+
+/// A stored list as its groups, in order. An empty list has none; otherwise
+/// the first is the phase agent's (possibly empty).
+pub fn groups(list: &[String]) -> Vec<Vec<String>> {
+    if list.is_empty() {
+        return Vec::new();
+    }
+    list.split(|n| n == GROUP_BREAK).map(<[String]>::to_vec).collect()
+}
 
 /// The skills for one phase after inheritance, and the node they came from.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -78,10 +141,22 @@ pub fn set_skills(conn: &Connection, node_id: Uuid, config: &Skills) -> Result<(
             bail!("{phase} is not a lifecycle phase ({})", PHASES.join(", "));
         }
         let mut list: Vec<String> = Vec::new();
+        // Blanks and repeats within one group are dropped; a break must follow
+        // a name or open the list, never repeat or end it.
+        let mut group_start = 0;
         for name in names.iter().map(|n| n.trim()).filter(|n| !n.is_empty()) {
-            if !list.iter().any(|have| have == name) {
+            if name == GROUP_BREAK {
+                if list.last().is_some_and(|n| n == GROUP_BREAK) {
+                    bail!("{phase}: an empty skill group means nothing (two `;` in a row)");
+                }
+                list.push(name.to_string());
+                group_start = list.len();
+            } else if !list[group_start..].iter().any(|have| have == name) {
                 list.push(name.to_string());
             }
+        }
+        if list.last().is_some_and(|n| n == GROUP_BREAK) {
+            bail!("{phase}: a trailing `;` leaves an empty skill group, which means nothing");
         }
         clean.insert(phase.clone(), list);
     }
@@ -103,4 +178,55 @@ pub fn resolve(conn: &Connection, node_id: Uuid, phase: &str) -> Result<Option<R
         }
     }
     Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn v(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn a_list_without_a_semicolon_is_one_group() {
+        assert_eq!(parse_list("a, b").unwrap(), v(&["a", "b"]));
+        assert_eq!(groups(&v(&["a", "b"])), vec![v(&["a", "b"])]);
+        assert!(parse_list("").unwrap().is_empty());
+        assert!(groups(&[]).is_empty());
+    }
+
+    #[test]
+    fn semicolons_separate_groups() {
+        let list = parse_list("a, b; c; d, e").unwrap();
+        assert_eq!(list, v(&["a", "b", ";", "c", ";", "d", "e"]));
+        assert_eq!(groups(&list), vec![v(&["a", "b"]), v(&["c"]), v(&["d", "e"])]);
+        assert_eq!(format_list(&list), "a, b; c; d, e");
+    }
+
+    #[test]
+    fn a_leading_semicolon_leaves_the_first_group_empty() {
+        let list = parse_list("; a, b").unwrap();
+        assert_eq!(groups(&list), vec![vec![], v(&["a", "b"])]);
+        assert_eq!(format_list(&list), "; a, b");
+        assert_eq!(parse_list(&format_list(&list)).unwrap(), list);
+    }
+
+    #[test]
+    fn an_empty_group_after_the_first_is_refused() {
+        for text in ["a;", "a;;b", ";", "; ;a", "a; ,"] {
+            assert!(parse_list(text).is_err(), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn set_skills_refuses_empty_groups_and_keeps_breaks() {
+        let conn = Connection::open_in_memory().unwrap();
+        let mut bad = Skills::new();
+        bad.insert("pr_draft".into(), v(&["a", ";", ";", "b"]));
+        // No table needed: validation runs before the write.
+        assert!(set_skills(&conn, Uuid::new_v4(), &bad).is_err());
+        bad.insert("pr_draft".into(), v(&["a", ";"]));
+        assert!(set_skills(&conn, Uuid::new_v4(), &bad).is_err());
+    }
 }

@@ -154,6 +154,12 @@ pub enum InterviewCommand {
         from_state: String,
         to_state: String,
     },
+    /// Record which group of the phase's skills a conversation works with
+    /// (`lifecycle_config::groups`); a later group runs in a session of its own.
+    SetConversationSkillGroup {
+        conversation_id: Uuid,
+        group: usize,
+    },
     /// Append a transcript entry; returns its `seq`.
     AppendConversationTurn {
         conversation_id: Uuid,
@@ -940,6 +946,10 @@ pub fn execute(
                 from_state,
                 to_state,
             )?;
+            Ok(json!({}))
+        }
+        InterviewCommand::SetConversationSkillGroup { conversation_id, group } => {
+            crate::conversation::ConversationRepo::new(conn).set_skill_group(*conversation_id, *group)?;
             Ok(json!({}))
         }
         InterviewCommand::AppendConversationTurn {

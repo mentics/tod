@@ -506,6 +506,7 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
     if version < 73 {
         // Images the user attached to a message.
         ensure_turn_attachments(conn)?;
+    ensure_skill_group(conn)?;
         conn.pragma_update(None, "user_version", 73)?;
     }
     if version < 74 {
@@ -1484,6 +1485,19 @@ fn ensure_turn_attachments(conn: &Connection) -> Result<()> {
         .exists([])?;
     if !present {
         conn.execute_batch("ALTER TABLE conversation_turns ADD COLUMN attachments TEXT;")?;
+    }
+    Ok(())
+}
+
+/// `conversations.skill_group`: which group of the phase's skills
+/// (`lifecycle_config::groups`) the conversation works with; 0 is the phase
+/// agent's own. A no-op when the column is already there.
+fn ensure_skill_group(conn: &Connection) -> Result<()> {
+    let present = conn
+        .prepare("SELECT 1 FROM pragma_table_info('conversations') WHERE name = 'skill_group'")?
+        .exists([])?;
+    if !present {
+        conn.execute_batch("ALTER TABLE conversations ADD COLUMN skill_group INTEGER NOT NULL DEFAULT 0;")?;
     }
     Ok(())
 }

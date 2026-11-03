@@ -11,7 +11,7 @@ use uuid::Uuid;
 const OPENING_WORDS: usize = 8;
 
 const CONVERSATION_COLUMNS: &str = "id, focus_kind, focus_id, focus_node_id, agent_session_id, \
-     session_name, platform, model, effort, created_at, updated_at, protocol, agent_run_id, from_state, to_state";
+     session_name, platform, model, effort, created_at, updated_at, protocol, agent_run_id, from_state, to_state, skill_group";
 
 const ACTION_COLUMNS: &str = "id, conversation_id, source, turn_seq, actor, kind, entity, entity_id, \
      node_id, mutation, before, after, archive_id, reverses, reversed_by, at";
@@ -78,7 +78,8 @@ impl<'a> ConversationRepo<'a> {
 
     /// The focus's most recently updated conversation running `protocol` —
     /// how a protocol with one conversation per focus (implementation) finds
-    /// the one to reopen.
+    /// the one to reopen. Never one for a later group of the phase's skills,
+    /// which is a session of its own (`set_skill_group`).
     pub fn latest_for_focus_with_protocol(
         &self,
         focus: Focus,
@@ -88,7 +89,7 @@ impl<'a> ConversationRepo<'a> {
             .query_row(
                 &format!(
                     "SELECT {CONVERSATION_COLUMNS} FROM conversations
-                     WHERE focus_kind = ?1 AND focus_id IS ?2 AND protocol = ?3
+                     WHERE focus_kind = ?1 AND focus_id IS ?2 AND protocol = ?3 AND skill_group = 0
                      ORDER BY updated_at DESC, created_at DESC
                      LIMIT 1"
                 ),
@@ -416,6 +417,31 @@ impl<'a> ConversationRepo<'a> {
         Ok(())
     }
 
+    /// Record which group of the phase's skills the conversation works with.
+    pub fn set_skill_group(&self, conversation_id: Uuid, group: usize) -> Result<()> {
+        let n = self.conn.execute(
+            "UPDATE conversations SET skill_group = ?1 WHERE id = ?2",
+            params![group as i64, uuid_to_blob(conversation_id)],
+        )?;
+        anyhow::ensure!(n == 1, "conversation {conversation_id} not found");
+        Ok(())
+    }
+
+    /// The group of the phase's skills the conversation works with: 0, the
+    /// phase agent's own, unless it was started for a later group.
+    pub fn skill_group(&self, conversation_id: Uuid) -> Result<usize> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT skill_group FROM conversations WHERE id = ?1",
+                params![uuid_to_blob(conversation_id)],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .unwrap_or(0)
+            .max(0) as usize)
+    }
+
     /// Record the context the conversation's first turn sent.
     pub fn set_opening_context(&self, conversation_id: Uuid, context: &str) -> Result<()> {
         let n = self.conn.execute(
@@ -603,6 +629,7 @@ fn map_conversation(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<Conversa
     let agent_run_id = row.get(12)?;
     let from_state = row.get(13)?;
     let to_state = row.get(14)?;
+    let skill_group: i64 = row.get(15)?;
     Ok(Focus::from_columns(&kind, focus_id, focus_node).and_then(|focus| {
         Ok(Conversation {
             id,
@@ -616,6 +643,7 @@ fn map_conversation(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<Conversa
             effort,
             from_state,
             to_state,
+            skill_group: skill_group.max(0) as usize,
             created_at,
             updated_at,
         })

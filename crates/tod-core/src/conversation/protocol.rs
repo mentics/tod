@@ -36,6 +36,16 @@ pub struct ProtocolEnv<'a> {
     pub focus: Focus,
 }
 
+impl ProtocolEnv<'_> {
+    /// The group of the phase's skills this conversation works with: 0, the
+    /// phase agent's own, unless it was started for a later group.
+    pub fn skill_group(&self) -> usize {
+        self.fleet
+            .read(|conn| tod_store::conversation::ConversationRepo::new(conn).skill_group(self.conversation_id))
+            .unwrap_or(0)
+    }
+}
+
 /// What the driver does once a reply has landed.
 pub enum Next {
     /// Hand back to the user, for the given reason.
