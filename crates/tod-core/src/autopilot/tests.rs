@@ -1252,6 +1252,70 @@ fn pr_draft_runs_the_review_group_when_the_pull_request_reads_clean() {
     assert_eq!(sessions.iter().map(|(g, _)| *g).collect::<Vec<_>>(), [0, 1], "{sessions:#?}");
     assert!(sessions[0].1.contains("simplify") && !sessions[0].1.contains("code-review"));
     assert!(sessions[1].1.contains("code-review") && !sessions[1].1.contains("simplify"));
+
+    // A restart in the same stay is not a new phase: nothing runs again.
+    let mut again = autopilot(&fx, Budget::default()).with_pr_poll_interval(Duration::ZERO);
+    again.run(&fx.fleet, &mut agent).unwrap();
+    assert_eq!(agent.turns, 2);
+}
+
+/// A pull request that is open, ready, and waits on a person's review.
+struct AwaitingReview;
+
+impl crate::pr_readiness::PrFeed for AwaitingReview {
+    fn snapshot(&self, _: &tod_store::github::NodePr) -> Result<tod_store::github::PrSnapshot, String> {
+        use tod_store::github::{PrSnapshot, PrStatus};
+        Ok(PrSnapshot {
+            status: PrStatus {
+                mergeable: Some(true),
+                mergeable_state: Some("blocked".into()),
+                behind_by: Some(0),
+                checks: Some("success".into()),
+                head_sha: Some("abcdef1".into()),
+                head_committed_at: Some("2020-01-01T00:00:00Z".into()),
+                draft: false,
+                open: true,
+                ..Default::default()
+            },
+            threads: vec![],
+            comments: vec![],
+            reviews: vec![],
+        })
+    }
+}
+
+#[test]
+fn pr_review_with_skills_runs_every_group_on_entry_then_waits_for_the_person() {
+    // Entering `pr_review` runs the agent's session and each later group of the
+    // phase's skills, in order, once; then the run waits for the human review
+    // (and is woken by it). A restart in the same stay runs nothing again.
+    let fx = setup();
+    retire_outside_criteria(&fx);
+    crate::pr_readiness::set_feed_override(Some(Arc::new(AwaitingReview)));
+    set_phase_skills(&fx, "pr_review", "simplify; code-review");
+    linked_to_prs(&fx, "pr_review", &["https://github.com/acme/app/pull/42"]);
+    let mut agent = FakeAgent::new(&fx.fleet);
+    let outcome = autopilot(&fx, Budget::default()).with_pr_poll_interval(Duration::ZERO).run(&fx.fleet, &mut agent).unwrap();
+    assert!(matches!(outcome, Outcome::Waiting { .. }), "{outcome:?}");
+    assert_eq!(agent.turns, 2);
+    let sessions = openings(&fx, ProtocolKind::Pr);
+    assert_eq!(sessions.iter().map(|(g, _)| *g).collect::<Vec<_>>(), [0, 1], "{sessions:#?}");
+
+    let again = autopilot(&fx, Budget::default()).with_pr_poll_interval(Duration::ZERO).run(&fx.fleet, &mut agent).unwrap();
+    assert!(matches!(again, Outcome::Waiting { .. }), "{again:?}");
+    assert_eq!(agent.turns, 2, "a restart is not a new phase");
+}
+
+#[test]
+fn pr_review_without_skills_takes_no_entry_turn() {
+    let fx = setup();
+    retire_outside_criteria(&fx);
+    crate::pr_readiness::set_feed_override(Some(Arc::new(AwaitingReview)));
+    linked_to_prs(&fx, "pr_review", &["https://github.com/acme/app/pull/42"]);
+    let mut agent = FakeAgent::new(&fx.fleet);
+    let outcome = autopilot(&fx, Budget::default()).with_pr_poll_interval(Duration::ZERO).run(&fx.fleet, &mut agent).unwrap();
+    assert!(matches!(outcome, Outcome::Waiting { .. }), "{outcome:?}");
+    assert_eq!(agent.turns, 0);
 }
 
 #[test]

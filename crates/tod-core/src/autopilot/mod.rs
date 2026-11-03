@@ -527,15 +527,6 @@ impl Autopilot {
                     reason: NeedsHuman::Decision { pending },
                 });
             }
-            // `approved` waits for the merge and `merged` for the release.
-            // `pr_draft` waits for a person to take the draft too, but only
-            // after its agent has got it ready ([`Self::gate`]).
-            if lifecycle != "pr_draft"
-                && let Some(outcome) = self.hold_for_github(fleet, &lifecycle)?
-            {
-                hook.waiting(None, None);
-                return self.finish(outcome);
-            }
             // The later groups of the step that finished come before anything
             // after it, whatever stopped the run before they were done.
             let owed = self.state.pending_groups.is_some();
@@ -546,6 +537,17 @@ impl Autopilot {
                 // Their sessions are work done: the standing may read the same
                 // after them, and the same step again is not "no progress".
                 last = None;
+            }
+            // `approved` waits for the merge and `merged` for the release.
+            // `pr_draft` waits for a person to take the draft too, but only
+            // after its agent has got it ready ([`Self::gate`]); so does
+            // `pr_review` when it has skills to run on entry, which come first.
+            if lifecycle != "pr_draft"
+                && !self.pr_review_entry_owed(fleet, &lifecycle)?
+                && let Some(outcome) = self.hold_for_github(fleet, &lifecycle)?
+            {
+                hook.waiting(None, None);
+                return self.finish(outcome);
             }
             let standing = fleet.read(|conn| Standing::load(conn, self.node, &lifecycle))?;
             let Some(step) = next_step(&standing) else {
@@ -857,14 +859,18 @@ impl Autopilot {
         use crate::pr_readiness::{self, Next as PrNext, Wait};
         let mut waited_since: Option<std::time::Instant> = None;
         let mut unchanged = 0u32;
-        // The later groups of the phase's skills (a code review) run once each
-        // time the pull request reads clean; what they post is work for the
-        // first group, which sets this again.
+        // Like every phase: coming in, the agent's session and then each later
+        // group of the phase's skills run in order, once per stay; the pull
+        // request is looked at after. What a later group posts (a code review)
+        // is work the next round gives the agent and then every group again.
+        // `pr_draft` always takes its entry turn; `pr_review` only when it has
+        // skills, since an agent session with nothing to do on every stay is waste.
         let phase_key = if before_review { "pr_draft" } else { "pr_review" };
-        let mut side_done = false;
-        if before_review && (self.fresh_session || !self.pr_conversation_this_stay(fleet)?) {
+        let node = self.node;
+        let entry = before_review || fleet.read(|conn| crate::skills_context::has_skills(conn, node, phase_key))?;
+        if entry && (self.fresh_session || !self.pr_conversation_this_stay(fleet)?) {
             hook.waiting(None, None);
-            if let Some(outcome) = self.converse(fleet, agent, hook, ProtocolKind::Pr, None)? {
+            if let Some(outcome) = self.pr_turn(fleet, agent, hook, None, phase_key)? {
                 return Ok(Some(outcome));
             }
         }
@@ -919,22 +925,6 @@ impl Autopilot {
                 }
             };
             let overall = pr_readiness::overall(&live);
-            let ready = matches!(overall, PrNext::Clear)
-                || (before_review
-                    && matches!(&overall, PrNext::Wait(waits) if waits.iter().all(|w| matches!(w, Wait::HumanReview))));
-            if ready && !side_done {
-                side_done = true;
-                let node = self.node;
-                if fleet.read(|conn| crate::skills_context::extra_groups(conn, node, phase_key))? > 0 {
-                    self.clear_poll_waits(fleet)?;
-                    hook.waiting(None, None);
-                    if let Some(outcome) = self.side_groups(fleet, agent, hook, ProtocolKind::Pr, phase_key)? {
-                        return Ok(Some(outcome));
-                    }
-                    // Read the pull request again: they may have posted work.
-                    continue;
-                }
-            }
             match overall {
                 PrNext::Merged | PrNext::Clear => {
                     self.clear_poll_waits(fleet)?;
@@ -956,8 +946,7 @@ impl Autopilot {
                     let before = self.pr_report(fleet)?;
                     let fingerprint: Vec<String> = live.iter().map(|p| p.fingerprint.clone()).collect();
                     let reopen = self.pr_reopen(fleet, &live)?;
-                    side_done = false;
-                    if let Some(outcome) = self.converse(fleet, agent, hook, ProtocolKind::Pr, reopen)? {
+                    if let Some(outcome) = self.pr_turn(fleet, agent, hook, reopen, phase_key)? {
                         return Ok(Some(outcome));
                     }
                     let after = self.pr_report(fleet)?;
@@ -1100,26 +1089,36 @@ impl Autopilot {
         self.converse_group(fleet, agent, hook, kind, reopen, 0)
     }
 
-    /// Run the later groups of the phase's skills (`phase_key`'s
-    /// `lifecycle_config`), in order, each in a fresh session of `kind` that
-    /// is given only its own group's skills: the independent runs (a code
-    /// review) beside the phase agent's own. `Some` when the run has to stop.
-    fn side_groups<A: AgentAccess + ?Sized, H: StepHook + ?Sized>(
+    /// Whether `pr_review`, just entered, still owes its entry: the agent's
+    /// session and each later group of its skills, which run before the run
+    /// waits on the person's review. Only a phase with skills has one.
+    fn pr_review_entry_owed(&self, fleet: &FleetStore, lifecycle: &str) -> Result<bool> {
+        if lifecycle != "pr_review" {
+            return Ok(false);
+        }
+        let node = self.node;
+        if !fleet.read(|conn| crate::skills_context::has_skills(conn, node, "pr_review"))? {
+            return Ok(false);
+        }
+        Ok(self.fresh_session || !self.pr_conversation_this_stay(fleet)?)
+    }
+
+    /// One round of work on the pull request: the agent's turn, then the
+    /// later groups of the phase's skills it owes (run now, and resumed first
+    /// if the run stops in one). `Some` when the run has to stop.
+    fn pr_turn<A: AgentAccess + ?Sized, H: StepHook + ?Sized>(
         &mut self,
         fleet: &FleetStore,
         agent: &mut A,
         hook: &mut H,
-        kind: ProtocolKind,
+        reopen: Option<(Uuid, String)>,
         phase_key: &str,
     ) -> Result<Option<Outcome>> {
-        let node = self.node;
-        let extra = fleet.read(|conn| crate::skills_context::extra_groups(conn, node, phase_key))?;
-        for group in 1..=extra {
-            if let Some(outcome) = self.converse_group(fleet, agent, hook, kind, None, group)? {
-                return Ok(Some(outcome));
-            }
+        if let Some(outcome) = self.converse(fleet, agent, hook, ProtocolKind::Pr, reopen)? {
+            return Ok(Some(outcome));
         }
-        Ok(None)
+        self.owe_groups(fleet, ProtocolKind::Pr, phase_key, phase_key)?;
+        self.run_pending_groups(fleet, agent, hook, phase_key)
     }
 
     /// A step of `kind` finished: the later groups of `phase_key`'s skills are

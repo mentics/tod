@@ -74,6 +74,11 @@ pub fn configured(conn: &Connection, node: Uuid, phase: &str) -> Result<Vec<Vec<
         .unwrap_or_default())
 }
 
+/// Whether any skill is configured for `phase` on `node`, in any group.
+pub fn has_skills(conn: &Connection, node: Uuid, phase: &str) -> Result<bool> {
+    Ok(configured(conn, node, phase)?.iter().any(|group| !group.is_empty()))
+}
+
 /// How many sessions the phase's skills run in beyond the phase agent's own:
 /// the later groups that name a skill.
 pub fn extra_groups(conn: &Connection, node: Uuid, phase: &str) -> Result<usize> {

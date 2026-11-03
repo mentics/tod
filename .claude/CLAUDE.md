@@ -590,8 +590,14 @@ session; each later one runs in a fresh session of the same protocol
 (`Autopilot::side_groups`, `conversations.skill_group`, recorded by
 `ConversationDriver::with_skill_group`) whose Skills block holds only its own
 group (`skills_context::for_group`), after the phase agent's work, every time the
-phase loops. In `pr_draft`/`pr_review` they run when the pull request reads
-clean, so what they post becomes work for the first group. A leading `;` leaves
+phase loops. Every phase is the same: coming in, the agent's session and then
+each group run in order, then the gate. A gate that fails with work to do (in
+`pr_draft`/`pr_review`, GitHub showing feedback; woken by a webhook, with polling
+as the fallback) starts again from the agent's session and every group, so what
+a later group posts (a code review) becomes work for the first; a gate with
+nothing to do just waits. `pr_draft` always takes its entry turn, `pr_review`
+only when it has skills (`pr_review_entry_owed`), and neither reruns on a
+restart in the same stay. A leading `;` leaves
 the phase agent's session with no skills; an empty group elsewhere is refused
 (`lifecycle_config::parse_list`). The groups a finished step owes are recorded in the
 run state (`AutopilotState::pending_groups`, saved) and run before anything else,
