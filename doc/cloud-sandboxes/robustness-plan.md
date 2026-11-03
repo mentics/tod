@@ -52,14 +52,26 @@ Not verified live: the Settings token-apply guard (it changes the shared
 orchestrator's secrets: unit-tested, the endpoint answers 404 until an apply
 records names).
 
-Known gaps: the supervisor detached by the wake fallback runs without the relay's
-secrets until the relay adopts it; wake schedules created before the new command
-keep the old fallback until recreated; sandboxes vanish from Blaxel without tod
-deleting them (seen: an hour-old fork, earlier forks over days; the replacement
-path recovers them); the cause of the orchestrator container reset at 10:43 UTC on
-2026-11-03 is unknown; saving GitHub tokens in two roots that share an
-orchestrator now asks before dropping names this root has no token for, but a
-reset orchestrator disk loses the recorded names so the next apply asks once.
+How it works (not gaps):
+
+- **Sandboxes are deleted when idle, on purpose.** A GitHub workflow deletes node
+  sandboxes that have sat idle for an hour, so nothing sits around building
+  while nobody is using it; a node's sandbox is meant to be forked from the
+  golden and running in a second or two. A node waiting on a review therefore
+  usually has no sandbox, and an event for it (a webhook, a due wake) makes the
+  orchestrator mark it lost; the app's daemon then makes a new one. That needs the
+  user's machine (the user's tokens are only there), which is the design.
+  "Its sandbox is gone; the app replaces it" is the normal path, and the
+  replacement restores uncommitted work from the checkpoint. Sandboxes should
+  only disappear when idle; one that vanishes while working is a bug.
+- The supervisor the wake command's fallback detaches runs without the relay's
+  secrets until the relay adopts it; wake schedules made before the new command
+  keep the old fallback until they are recreated.
+- Saving GitHub tokens in two roots that share an orchestrator asks before it
+  drops names this root has no token for; a reset orchestrator disk loses the
+  recorded names, so the next apply asks once.
+- The cause of the orchestrator container reset at 10:43 UTC on 2026-11-03 is not
+  known and is not being pursued: the volume and the app's restart cover it.
 
 ## 1. What the live system showed
 
