@@ -200,13 +200,22 @@ impl Github {
         &self.auth
     }
 
-    fn authorize<B>(&self, req: ureq::RequestBuilder<B>, path: &str) -> ureq::RequestBuilder<B> {
+    /// `repo` names the repository a call is about when its path does not
+    /// (GraphQL's is `/graphql`): the routed client needs it to pick a token.
+    fn authorize<B>(
+        &self,
+        req: ureq::RequestBuilder<B>,
+        path: &str,
+        repo: Option<(&str, &str)>,
+    ) -> ureq::RequestBuilder<B> {
         let req = req.header("Accept", "application/vnd.github+json").header("User-Agent", "tod");
         match &self.auth {
             GithubAuth::Token(token) => req.header("Authorization", &format!("Bearer {token}")),
             GithubAuth::Proxy => req,
             GithubAuth::Routed(routes) => {
-                let secret = crate::github_routes::repo_of_path(path).and_then(|(owner, repo)| routes.secret_for(owner, repo));
+                let secret = crate::github_routes::repo_of_path(path)
+                    .or(repo)
+                    .and_then(|(owner, repo)| routes.secret_for(owner, repo));
                 match secret {
                     Some(name) => req.header("Authorization", &format!("Bearer {}", tod_sandbox::node::secret_placeholder(name))),
                     None => req,
@@ -220,16 +229,26 @@ impl Github {
         if self.proxy_missing {
             return Err(GithubError::ProxyMissing);
         }
-        let response = self.authorize(self.agent.get(&format!("{}{path}", self.api)), path).call();
+        let response = self.authorize(self.agent.get(&format!("{}{path}", self.api)), path, None).call();
         read_json(response)
     }
 
     /// `POST <api><path>` with a JSON body, the reply as JSON.
     fn post_json<T: serde::de::DeserializeOwned>(&self, path: &str, body: serde_json::Value) -> Result<T, GithubError> {
+        self.post_json_for(path, body, None)
+    }
+
+    /// [`Self::post_json`] about `repo`, for a path that does not name it.
+    fn post_json_for<T: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+        body: serde_json::Value,
+        repo: Option<(&str, &str)>,
+    ) -> Result<T, GithubError> {
         if self.proxy_missing {
             return Err(GithubError::ProxyMissing);
         }
-        let response = self.authorize(self.agent.post(&format!("{}{path}", self.api)), path).send_json(body);
+        let response = self.authorize(self.agent.post(&format!("{}{path}", self.api)), path, repo).send_json(body);
         read_json(response)
     }
 
@@ -386,9 +405,10 @@ impl Github {
         &self,
         query: &str,
         variables: serde_json::Value,
+        repo: Option<(&str, &str)>,
     ) -> Result<T, GithubError> {
         let reply: GraphqlReply<T> =
-            self.post_json("/graphql", serde_json::json!({ "query": query, "variables": variables }))?;
+            self.post_json_for("/graphql", serde_json::json!({ "query": query, "variables": variables }), repo)?;
         if let Some(errors) = reply.errors.filter(|e| !e.is_empty()) {
             let message = errors.into_iter().map(|e| e.message).collect::<Vec<_>>().join("; ");
             return Err(GithubError::Api(message));
@@ -402,7 +422,7 @@ impl Github {
     pub fn list_review_threads(&self, owner: &str, repo: &str, number: i64) -> Result<Vec<ReviewThread>, GithubError> {
         const QUERY: &str = "query($owner: String!, $repo: String!, $number: Int!) { repository(owner: $owner, name: $repo) { pullRequest(number: $number) { reviewThreads(first: 100) { nodes { id isResolved isOutdated path line comments(first: 50) { nodes { databaseId body createdAt author { login } diffHunk } } } } } } }";
         let data: ThreadsData =
-            self.graphql(QUERY, serde_json::json!({ "owner": owner, "repo": repo, "number": number }))?;
+            self.graphql(QUERY, serde_json::json!({ "owner": owner, "repo": repo, "number": number }), Some((owner, repo)))?;
         let pull = data.repository.and_then(|r| r.pull_request).ok_or(GithubError::NotFound)?;
         Ok(pull
             .review_threads
@@ -433,14 +453,14 @@ impl Github {
     /// Reply in a review thread (by the thread's GraphQL id).
     pub fn reply_to_thread(&self, thread_id: &str, body: &str) -> Result<(), GithubError> {
         const MUTATION: &str = "mutation($thread: ID!, $body: String!) { addPullRequestReviewThreadReply(input: {pullRequestReviewThreadId: $thread, body: $body}) { comment { id } } }";
-        self.graphql::<serde_json::Value>(MUTATION, serde_json::json!({ "thread": thread_id, "body": body }))?;
+        self.graphql::<serde_json::Value>(MUTATION, serde_json::json!({ "thread": thread_id, "body": body }), None)?;
         Ok(())
     }
 
     /// Mark a review thread resolved.
     pub fn resolve_thread(&self, thread_id: &str) -> Result<(), GithubError> {
         const MUTATION: &str = "mutation($thread: ID!) { resolveReviewThread(input: {threadId: $thread}) { thread { id } } }";
-        self.graphql::<serde_json::Value>(MUTATION, serde_json::json!({ "thread": thread_id }))?;
+        self.graphql::<serde_json::Value>(MUTATION, serde_json::json!({ "thread": thread_id }), None)?;
         Ok(())
     }
 
@@ -1310,6 +1330,19 @@ mod tests {
         assert_eq!(seen[1].as_deref(), Some("bearer {{secret:gh_joel}}"));
         assert_eq!(seen[2], None, "a repository no route names is read with no token");
     }
+    #[test]
+    fn a_routed_graphql_call_sends_the_token_of_the_repository_it_is_about() {
+        use crate::github_routes::{GithubRoutes, Route};
+        let routes = GithubRoutes { routes: vec![Route { pattern: "acme/*".into(), secret: "gh_acme".into() }] };
+        let (url, handle) = serve(1);
+        let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).build().into();
+        let gh = Github::with_agent(GithubAuth::Routed(routes), agent, &url);
+        // The stand-in's reply is not GraphQL: only the request's header matters.
+        let _ = gh.list_review_threads("acme", "app", 1);
+        let seen = handle.join().unwrap();
+        assert_eq!(seen[0].as_deref(), Some("bearer {{secret:gh_acme}}"), "GraphQL went out with no token");
+    }
+
     #[test]
     fn checks_combine_statuses_and_check_runs() {
         use super::{CheckRunsRaw, CombinedStatusRaw, combine_checks};
