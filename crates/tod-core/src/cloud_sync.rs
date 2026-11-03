@@ -1200,9 +1200,34 @@ fn claude_token_for_node(root: &Path) -> Result<Option<String>> {
     )
 }
 
+/// Why Blaxel's record of a sandbox says it can no longer run, if it does:
+/// its deployment `status` or its running `state` is a terminal one. A
+/// sandbox that expired can stay `DEPLOYED` for an hour while its `state`
+/// already says so.
+pub fn sandbox_dead_reason(info: &tod_sandbox::blaxel::SandboxInfo) -> Option<String> {
+    const DEAD: [&str; 6] = ["FAILED", "TERMINATED", "DELETING", "DELETED", "EXPIRED", "EXPIRING"];
+    let field = |what: &str, value: &str| {
+        DEAD.contains(&value.to_ascii_uppercase().as_str()).then(|| format!("sandbox {} has {what} {value}", info.name))
+    };
+    field("status", &info.status).or_else(|| info.state.as_deref().and_then(|state| field("state", state)))
+}
+
 /// Whether Blaxel's record of a sandbox says it can no longer run.
 pub fn sandbox_is_dead(info: &tod_sandbox::blaxel::SandboxInfo) -> bool {
-    matches!(info.status.to_ascii_uppercase().as_str(), "FAILED" | "TERMINATED" | "DELETING" | "DELETED")
+    sandbox_dead_reason(info).is_some()
+}
+
+/// Why `info`'s sandbox cannot be reused, if it cannot: [`sandbox_dead_reason`],
+/// else its workload not answering after the reachability wait (Blaxel's
+/// record can say `DEPLOYED` for a sandbox that is gone).
+pub fn sandbox_unusable_reason(bx: &tod_sandbox::blaxel::Blaxel, info: &tod_sandbox::blaxel::SandboxInfo) -> Option<String> {
+    if let Some(reason) = sandbox_dead_reason(info) {
+        return Some(reason);
+    }
+    let url = info.url.as_deref()?;
+    bx.wait_reachable(url, std::time::Duration::from_secs(90))
+        .err()
+        .map(|err| format!("sandbox {} does not answer: {err:#}", info.name))
 }
 
 /// The sandbox `node_id` already has, so a cloud run reuses it instead of
@@ -1754,8 +1779,16 @@ pub fn wake_node_with(fleet: &FleetStore, root: &Path, node_id: &str, fresh_sess
     let bx = sandboxes.blaxel()?;
     // A sandbox that is gone (deleted or reclaimed since the last look) is
     // replaced the way the lost-sandbox check does, then woken.
-    let (row, info, replaced) = match bx.get(&row.sandbox)? {
-        Some(info) if !sandbox_is_dead(&info) => (row, info, None),
+    let found = bx.get(&row.sandbox)?;
+    // A sandbox in standby answers 502/503/504 and Blaxel's own 404 "workload
+    // is not ready" for up to ~30s after waking: every upload below waits it
+    // out, and one that never answers is replaced rather than reused.
+    let unusable = found.as_ref().and_then(|info| sandbox_unusable_reason(&bx, info));
+    if let Some(reason) = &unusable {
+        tracing::warn!("cloud: {reason}; replacing it");
+    }
+    let (row, info, replaced) = match found {
+        Some(info) if unusable.is_none() => (row, info, None),
         _ => {
             let gone = row.sandbox.clone();
             let mut progress = |msg: &str| log_progress(&format!("replacing {gone}"), msg);
