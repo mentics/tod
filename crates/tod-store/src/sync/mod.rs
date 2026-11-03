@@ -137,6 +137,20 @@ pub const SYNCED_TABLES: &[&str] = &[
 /// and whose changes its pulls leave out.
 pub const CLIENT_HEADER: &str = "X-Tod-Client";
 
+/// The database broker's polling timings, named once for both ends
+/// (`doc/cloud-sandboxes/database-access.md`). A machine long-polls the
+/// orchestrator for `BROKER_POLL_SECS`, re-issuing at once; a poll's HTTP
+/// timeout is a little above that; a failing poll is retried
+/// `BROKER_POLL_ATTEMPTS` times with pauses of 2 s, 4 s, ... so the orchestrator
+/// counts a machine connected for a poll, the retry pauses, and some slack.
+pub const BROKER_POLL_SECS: u64 = 25;
+pub const BROKER_POLL_TIMEOUT_SECS: u64 = 40;
+pub const BROKER_POLL_ATTEMPTS: u32 = 3;
+/// The longest total pause between the attempts of one poll.
+pub const BROKER_RETRY_PAUSE_SECS: u64 = (1 << 1) + (1 << 2);
+/// How long the orchestrator counts a machine connected after its last contact.
+pub const BROKER_CONNECTED_SECS: u64 = BROKER_POLL_SECS + BROKER_RETRY_PAUSE_SECS + 15;
+
 pub const CREATE_SYNC_TABLES: &str = "
 CREATE TABLE IF NOT EXISTS sync_changes (
     seq      INTEGER PRIMARY KEY AUTOINCREMENT,

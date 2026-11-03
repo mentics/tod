@@ -462,6 +462,17 @@ pub trait Orchestrator {
 /// gateway answers 502/503/504 (pauses of 2 s, then 4 s between them).
 const GATEWAY_ATTEMPTS: u32 = 3;
 
+/// A transport error worth sending the request again for: the connection
+/// could not be made, timed out, or was reset.
+fn transient(err: &ureq::Error) -> bool {
+    use std::io::ErrorKind::*;
+    match err {
+        ureq::Error::Timeout(_) | ureq::Error::ConnectionFailed => true,
+        ureq::Error::Io(e) => matches!(e.kind(), ConnectionReset | ConnectionAborted | BrokenPipe | TimedOut | UnexpectedEof | ConnectionRefused),
+        _ => false,
+    }
+}
+
 /// The orchestrator over HTTP(S).
 pub struct HttpOrchestrator {
     base: String,
@@ -516,7 +527,25 @@ impl HttpOrchestrator {
     /// knows this machine is there to answer.
     pub fn broker_next(&self, user: &str, wait_secs: u64) -> Result<Option<(u64, String, serde_json::Value)>> {
         let rest = format!("broker/next?wait={wait_secs}");
-        let v = Self::finish(self.auth(self.agent.get(&self.url(user, &rest))).call().context("orchestrator broker")?, "broker")?;
+        let timeout = Duration::from_secs(sync::BROKER_POLL_TIMEOUT_SECS.max(wait_secs + 15));
+        let url = self.url(user, &rest);
+        let mut attempt = 1;
+        let resp = loop {
+            let sent = self.auth(self.agent.get(&url)).config().timeout_global(Some(timeout)).build().call();
+            let why = match &sent {
+                Ok(resp) if matches!(resp.status().as_u16(), 502 | 503 | 504) => format!("{} from the gateway", resp.status()),
+                Err(err) if transient(err) => err.to_string(),
+                _ => break sent.context("orchestrator broker")?,
+            };
+            if attempt >= sync::BROKER_POLL_ATTEMPTS {
+                break sent.context("orchestrator broker")?;
+            }
+            let wait = Duration::from_secs(1 << attempt);
+            tracing::info!("orchestrator broker: {why}; retrying in {wait:?} (attempt {attempt} of {})", sync::BROKER_POLL_ATTEMPTS);
+            std::thread::sleep(wait);
+            attempt += 1;
+        };
+        let v = Self::finish(resp, "broker")?;
         let Some(id) = v["id"].as_u64() else { return Ok(None) };
         let node = v["node"].as_str().context("orchestrator broker: no node")?.to_string();
         Ok(Some((id, node, v["request"].clone())))
