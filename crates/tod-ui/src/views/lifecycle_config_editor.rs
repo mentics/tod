@@ -19,12 +19,13 @@ use gpui::{
     Render, Styled, Window, div,
 };
 use gpui_component::button::{Button, ButtonVariants};
+use gpui_component::checkbox::Checkbox;
 use gpui_component::input::{Input, InputState};
 use gpui_component::{ActiveTheme, Disableable, StyledExt, h_flex, v_flex};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tod_store::fleet::FleetStore;
-use tod_store::lifecycle_config::{self, PHASES, Resolved, Skills};
+use tod_store::lifecycle_config::{self, DeleteSandbox, PHASES, Resolved, Skills};
 use tod_store::outline::OutlineMutation;
 use uuid::Uuid;
 
@@ -37,6 +38,10 @@ pub struct LifecycleConfigEditor {
     /// What applies to this node for each phase, after inheritance.
     effective: Vec<(&'static str, Option<Resolved>)>,
     titles: HashMap<Uuid, String>,
+    /// Whether the sandbox is deleted at `done`, after inheritance, and
+    /// whether this node itself says.
+    delete_sandbox: DeleteSandbox,
+    own_delete_sandbox: Option<bool>,
     form: Option<Form>,
     error: Option<String>,
 }
@@ -76,6 +81,8 @@ impl LifecycleConfigEditor {
             own: Skills::new(),
             effective: Vec::new(),
             titles: HashMap::new(),
+            delete_sandbox: DeleteSandbox { enabled: true, source_node: None },
+            own_delete_sandbox: None,
             form: None,
             error: None,
         };
@@ -128,11 +135,28 @@ impl LifecycleConfigEditor {
                         }
                         effective.push((phase, resolved));
                     }
-                    (own, effective, titles)
+                    let delete = fleet
+                        .read(|conn| lifecycle_config::resolve_delete_sandbox(conn, node))
+                        .unwrap_or(DeleteSandbox { enabled: true, source_node: None });
+                    let own_delete = fleet
+                        .read(|conn| lifecycle_config::own_delete_sandbox(conn, node))
+                        .unwrap_or(None);
+                    if let Some(source) = delete.source_node.filter(|s| *s != node)
+                        && !titles.contains_key(&source)
+                    {
+                        let title = fleet
+                            .read(|conn| {
+                                Ok(tod_store::outline::repos::NodeRepo::new(conn).get(source)?.map(|n| n.title))
+                            })
+                            .ok()
+                            .flatten();
+                        titles.insert(source, title.unwrap_or_else(|| "an ancestor".into()));
+                    }
+                    (own, effective, titles, delete, own_delete)
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
-                (this.own, this.effective, this.titles) = loaded;
+                (this.own, this.effective, this.titles, this.delete_sandbox, this.own_delete_sandbox) = loaded;
                 cx.notify();
             });
         })
@@ -181,6 +205,31 @@ impl LifecycleConfigEditor {
                         }
                     }
                 }
+                this.reload(cx);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Set what this node says about deleting its sandbox at `done`
+    /// (`None`: leave it to an ancestor again).
+    fn write_delete_sandbox(&mut self, value: Option<bool>, cx: &mut Context<Self>) {
+        let (fleet, node) = (self.fleet.clone(), self.node);
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    fleet
+                        .enqueue_outline(OutlineMutation::SetNodeLifecycleDeleteSandbox {
+                            node_id: node,
+                            delete_sandbox: value,
+                        })
+                        .map_err(|e| e.to_string())
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.error = result.err();
                 this.reload(cx);
                 cx.notify();
             });
@@ -272,6 +321,42 @@ impl LifecycleConfigEditor {
             .into_any_element()
     }
 
+    /// The "Delete sandbox" choice for the final state (`done`), which has no
+    /// agent and so no row of its own above.
+    fn render_delete_sandbox(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let muted = cx.theme().muted_foreground;
+        let from = self.delete_sandbox.source_node.filter(|source| *source != self.node).map(|source| {
+            format!("from {}", self.titles.get(&source).map_or("an ancestor", String::as_str))
+        });
+        h_flex()
+            .gap_2()
+            .items_center()
+            .child(
+                Checkbox::new("lc-delete-sandbox")
+                    .label("Delete sandbox")
+                    .checked(self.delete_sandbox.enabled)
+                    .disabled(!self.enabled)
+                    .on_click(cx.listener(|this, checked: &bool, _, cx| this.write_delete_sandbox(Some(*checked), cx))),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(muted)
+                    .child("when a node reaches done, its cloud sandbox is deleted (uncommitted work is kept)"),
+            )
+            .when_some(from, |el, from| el.child(div().text_xs().text_color(muted).child(from)))
+            .when(self.enabled && self.own_delete_sandbox.is_some(), |el| {
+                el.child(
+                    Button::new("lc-delete-sandbox-inherit")
+                        .label("Use inherited")
+                        .ghost()
+                        .compact()
+                        .on_click(cx.listener(|this, _, _, cx| this.write_delete_sandbox(None, cx))),
+                )
+            })
+            .into_any_element()
+    }
+
     fn render_form(&self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
         let Some(form) = &self.form else { return div().into_any_element() };
         v_flex()
@@ -349,6 +434,17 @@ impl Render for LifecycleConfigEditor {
         for (i, (phase, resolved)) in rows.iter().enumerate() {
             col = col.child(self.render_row(i, phase, resolved, window, cx));
         }
+        col = col.child(
+            v_flex()
+                .gap_0p5()
+                .w_full()
+                .p_2()
+                .rounded_md()
+                .border_1()
+                .border_color(cx.theme().border)
+                .child(div().text_sm().font_semibold().child("Done"))
+                .child(self.render_delete_sandbox(cx)),
+        );
         if self.form.is_some() {
             col = col.child(self.render_form(window, cx));
         } else if let Some(err) = &self.error {

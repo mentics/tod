@@ -19,8 +19,21 @@ pub const CREATE_TABLE: &str = "
 CREATE TABLE IF NOT EXISTS node_lifecycle_config (
     node_id     BLOB PRIMARY KEY NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
     skills      TEXT NOT NULL DEFAULT '{}',
-    updated_at  INTEGER NOT NULL
+    updated_at  INTEGER NOT NULL,
+    delete_sandbox INTEGER
 );";
+
+/// The `delete_sandbox` column (schema v92, idempotent): NULL means this node
+/// says nothing and the nearest ancestor that does decides.
+pub fn add_delete_sandbox(conn: &Connection) -> Result<()> {
+    let has = conn
+        .prepare("SELECT 1 FROM pragma_table_info('node_lifecycle_config') WHERE name = 'delete_sandbox'")?
+        .exists([])?;
+    if !has {
+        conn.execute_batch("ALTER TABLE node_lifecycle_config ADD COLUMN delete_sandbox INTEGER")?;
+    }
+    Ok(())
+}
 
 /// The phases an agent works in, and so the keys a config may name: the
 /// lifecycle states that have a phase agent, and the protocols that run
@@ -40,6 +53,11 @@ pub const PHASES: [&str; 13] = [
     "released",
     "learn",
 ];
+
+/// The last lifecycle state (`done`, which has no agent and so no entry in
+/// [`PHASES`]): a node entering it has its sandbox deleted unless
+/// [`resolve_delete_sandbox`] says otherwise.
+pub const FINAL_PHASE: &str = crate::settings::VALID_LIFECYCLE_STATES[crate::settings::VALID_LIFECYCLE_STATES.len() - 1];
 
 /// Skills by phase key, as stored on one node.
 pub type Skills = BTreeMap<String, Vec<String>>;
@@ -103,4 +121,52 @@ pub fn resolve(conn: &Connection, node_id: Uuid, phase: &str) -> Result<Option<R
         }
     }
     Ok(None)
+}
+
+/// Whether the node's sandbox is deleted when it enters [`FINAL_PHASE`], and
+/// the node the answer came from: the nearest node, from itself up, that
+/// states it; on by default when none does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeleteSandbox {
+    pub enabled: bool,
+    pub source_node: Option<Uuid>,
+}
+
+/// What `node_id` itself says about deleting its sandbox, if anything.
+pub fn own_delete_sandbox(conn: &Connection, node_id: Uuid) -> Result<Option<bool>> {
+    let has = conn
+        .prepare("SELECT 1 FROM pragma_table_info('node_lifecycle_config') WHERE name = 'delete_sandbox'")?
+        .exists([])?;
+    if !has {
+        return Ok(None);
+    }
+    let value: Option<Option<i64>> = conn
+        .query_row(
+            "SELECT delete_sandbox FROM node_lifecycle_config WHERE node_id = ?1",
+            params![uuid_to_blob(node_id)],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(value.flatten().map(|v| v != 0))
+}
+
+/// [`DeleteSandbox`] for `node_id`.
+pub fn resolve_delete_sandbox(conn: &Connection, node_id: Uuid) -> Result<DeleteSandbox> {
+    for id in crate::outline::ancestor_chain(conn, node_id)?.into_iter().rev() {
+        if let Some(enabled) = own_delete_sandbox(conn, id)? {
+            return Ok(DeleteSandbox { enabled, source_node: Some(id) });
+        }
+    }
+    Ok(DeleteSandbox { enabled: true, source_node: None })
+}
+
+/// Set (`Some`) or clear (`None`, so an ancestor's choice applies again) what
+/// `node_id` says about deleting its sandbox.
+pub fn set_delete_sandbox(conn: &Connection, node_id: Uuid, value: Option<bool>) -> Result<()> {
+    conn.execute(
+        "INSERT INTO node_lifecycle_config (node_id, skills, updated_at, delete_sandbox) VALUES (?1, '{}', ?2, ?3)
+         ON CONFLICT(node_id) DO UPDATE SET delete_sandbox = excluded.delete_sandbox, updated_at = excluded.updated_at",
+        params![uuid_to_blob(node_id), now_ms(), value.map(i64::from)],
+    )?;
+    Ok(())
 }

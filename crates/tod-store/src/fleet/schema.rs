@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Current fleet schema epoch stored in `PRAGMA user_version`.
-pub const CURRENT_USER_VERSION: i32 = 91;
+pub const CURRENT_USER_VERSION: i32 = 92;
 
 const BUSY_TIMEOUT_MS: i64 = 5000;
 
@@ -614,6 +614,12 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
         conn.execute_batch(&crate::journey_changes::run_state_triggers_sql())?;
         conn.pragma_update(None, "user_version", 91)?;
     }
+    if version < 92 {
+        // Whether a node's sandbox is deleted on the final phase
+        // (`crate::lifecycle_config::add_delete_sandbox`); the sync triggers are remade below.
+        crate::lifecycle_config::add_delete_sandbox(conn)?;
+        conn.pragma_update(None, "user_version", 92)?;
+    }
     // Other branches (the task panel) numbered their own steps 66–67 at the
     // same time as 66–70 above, so a store may be past a version without
     // having these. Every one is idempotent: make sure of them all.
@@ -638,6 +644,7 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
     crate::waits::add_detail(conn)?;
     crate::waits::add_retry(conn)?;
     crate::waits::add_stay(conn)?;
+    crate::lifecycle_config::add_delete_sandbox(conn)?;
     // A cloud supervisor's heartbeat for a node (`crate::cloud_activity`):
     // synced, and not journaled (high-frequency bookkeeping).
     conn.execute_batch(crate::cloud_activity::CREATE_TABLE)?;

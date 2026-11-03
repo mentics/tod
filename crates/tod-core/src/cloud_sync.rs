@@ -998,6 +998,16 @@ fn sync_once(fleet: &FleetStore, root: &Path, orch: &dyn Orchestrator, user: &st
         Err(err) => warn_problem_log_unreadable(&err),
     }
     drop(_guard);
+    // Before `retire_done`, which forgets a done node's row: a node that went
+    // straight through the final phase still gets its sandbox deleted.
+    if let Err(err) = lost::delete_sandboxes_at_final_phase(fleet) {
+        tracing::warn!("cloud sync: {err:#}");
+        crate::logging::buffer::record(
+            crate::logging::buffer::Level3::Error,
+            crate::logging::buffer::LogSource::App,
+            format!("{err:#}"),
+        );
+    }
     if let Err(err) = lost::retire_done(fleet) {
         tracing::warn!("cloud sync: retiring done nodes: {err:#}");
     }

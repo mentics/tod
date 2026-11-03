@@ -26,6 +26,7 @@ use tod_sandbox::blaxel::SandboxInfo;
 use tod_store::cloud_nodes::{self, CloudNodeRow};
 use tod_store::fleet::{FleetMutation, FleetStore};
 use tod_store::fleet::provision::SandboxRefresh;
+use tod_store::lifecycle_config::{self, FINAL_PHASE};
 
 /// Which cloud nodes a check looks at.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -139,6 +140,44 @@ pub fn adopt_legacy_records(fleet: &FleetStore) -> Result<usize> {
     state.save(root)?;
     let _ = fleet.reload_if_stale();
     Ok(adopted)
+}
+
+/// Deletes the sandbox of every node of this client's that has entered the
+/// final lifecycle state ([`FINAL_PHASE`], `done`) while its Lifecycle config
+/// says to ("Delete sandbox", on unless a node turned it off). A node whose
+/// sandbox is already gone or was deleted on purpose is left alone, and so is
+/// one another client owns (only its owner holds the tokens). Every node is
+/// tried; the failures come back together as one error naming each. Blocks on
+/// the network: never on the UI thread.
+pub fn delete_sandboxes_at_final_phase(fleet: &FleetStore) -> Result<Vec<String>> {
+    let root = fleet.paths().root().to_path_buf();
+    let final_rank = crate::task::model::lifecycle_rank(FINAL_PHASE);
+    let mut deleted = Vec::new();
+    let mut failures = Vec::new();
+    for row in fleet.read(cloud_nodes::list)? {
+        let node = row.node_id.to_string();
+        let Some(task) = fleet.get_node(&node)? else { continue };
+        if crate::task::model::lifecycle_rank(&task.lifecycle) < final_rank
+            || row.lost_at.is_some()
+            || super::sandbox_deleted_by_user(&root, &node)
+        {
+            continue;
+        }
+        if row.ownership.owner_client.as_deref().is_some_and(|owner| super::client_id(&root).is_ok_and(|me| me != owner)) {
+            continue;
+        }
+        if !fleet.read(|c| lifecycle_config::resolve_delete_sandbox(c, row.node_id))?.enabled {
+            continue;
+        }
+        match delete_node_sandbox(fleet, &node) {
+            Ok(message) => deleted.push(message),
+            Err(err) => failures.push(format!("{} ({}): {err:#}", task.title, row.sandbox)),
+        }
+    }
+    if !failures.is_empty() {
+        anyhow::bail!("deleting the sandbox of a node that reached {FINAL_PHASE} failed for {}", failures.join("; "));
+    }
+    Ok(deleted)
 }
 
 /// Drops the `cloud_nodes` row of every node that reached `done`.

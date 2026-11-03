@@ -114,6 +114,12 @@ pub enum OutlineMutation {
         node_id: Uuid,
         skills: crate::lifecycle_config::Skills,
     },
+    /// The Lifecycle config capability's "delete the sandbox on the final
+    /// phase" choice; `None` leaves it to an ancestor.
+    SetNodeLifecycleDeleteSandbox {
+        node_id: Uuid,
+        delete_sandbox: Option<bool>,
+    },
     /// The Groups capability's setting: group the children by lifecycle state.
     SetNodeGroups {
         node_id: Uuid,
@@ -431,6 +437,7 @@ impl OutlineMutation {
                 | OutlineMutation::SetNodeTags { .. }
                 | OutlineMutation::SetNodeEnvironment { .. }
                 | OutlineMutation::SetNodeLifecycleConfig { .. }
+                | OutlineMutation::SetNodeLifecycleDeleteSandbox { .. }
                 | OutlineMutation::SetNodeGroups { .. }
                 | OutlineMutation::UpdateNodeTitle { .. }
                 | OutlineMutation::ReorderSibling { .. }
@@ -625,6 +632,10 @@ impl OutlineMutation {
             OutlineMutation::SetNodeLifecycleConfig { node_id, skills } => {
                 require_capability(conn, *node_id, Capability::LifecycleConfig)?;
                 crate::lifecycle_config::set_skills(conn, *node_id, skills)?;
+            }
+            OutlineMutation::SetNodeLifecycleDeleteSandbox { node_id, delete_sandbox } => {
+                require_capability(conn, *node_id, Capability::LifecycleConfig)?;
+                crate::lifecycle_config::set_delete_sandbox(conn, *node_id, *delete_sandbox)?;
             }
             OutlineMutation::SetNodeGroups { node_id, by_lifecycle } => {
                 require_capability(conn, *node_id, Capability::Groups)?;
