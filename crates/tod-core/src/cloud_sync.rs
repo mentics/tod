@@ -1812,7 +1812,9 @@ pub fn continue_over_stop_answer(fleet: &FleetStore, node_id: &str) -> Result<Op
     let option = decision
         .options
         .iter()
-        .position(|o| o == stop_questions::KEEP_GOING || o == stop_questions::WAKE_AGAIN)
+        .position(|o| {
+            o == stop_questions::KEEP_GOING || o == stop_questions::WAKE_AGAIN || o == stop_questions::FIXED_TRY_AGAIN
+        })
         .ok_or_else(|| anyhow!("stop question {} has no option to continue", latest.decision))?;
     fleet
         .interview(
