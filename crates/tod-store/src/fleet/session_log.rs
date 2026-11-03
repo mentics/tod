@@ -461,6 +461,103 @@ pub fn restore_node(data_root: &Path, node_id: &str, sandbox: &str) -> Result<us
     restore(&SandboxRemote::new(sandbox), &local)
 }
 
+/// The runner state that travels with a node between places: the
+/// autopilot's own (`autopilot/<node>.json`: current step, budget used, loop
+/// counters) and the supervisor's grants (`stop-answers.json`). Each is a
+/// local path under the data root and the path the supervisor keeps it at.
+/// The supervisor's replica root is its state directory
+/// (`<SUPERVISOR_STATE_ROOT>/<node>`, `tod-supervisor`'s `Replica`), and the
+/// autopilot keeps its file under the data root it runs with, so inside a
+/// sandbox it is `<state dir>/autopilot/<node>.json`.
+fn state_files(data_root: &Path, node_id: &str) -> [(PathBuf, String); 2] {
+    let state_dir = format!("{}/{node_id}", super::cli_relay::SUPERVISOR_STATE_ROOT);
+    let autopilot = data_root.join("autopilot");
+    [
+        (autopilot.join(format!("{node_id}.json")), format!("{state_dir}/autopilot/{node_id}.json")),
+        (autopilot.join(format!("{node_id}.stop-answers.json")), format!("{state_dir}/stop-answers.json")),
+    ]
+}
+
+/// Copies the runner state a sandbox holds for `node_id` into the data root.
+/// A file the sandbox does not have is not an error (the node never ran
+/// supervised); one it has but cannot be read or kept is. The files copied.
+fn keep_state_via(run: Run, data_root: &Path, node_id: &str) -> Result<usize> {
+    let mut kept = 0;
+    for (local, remote) in state_files(data_root, node_id) {
+        let bytes = run(r#"[ -f "$1" ] && cat "$1"; exit 0"#, &[&remote])
+            .with_context(|| format!("read the runner state {remote}"))?;
+        if bytes.is_empty() {
+            continue;
+        }
+        let dir = local.parent().context("runner state path has no directory")?;
+        std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+        let tmp = local.with_extension("json.keeping");
+        std::fs::write(&tmp, &bytes).with_context(|| format!("write {}", tmp.display()))?;
+        std::fs::rename(&tmp, &local).with_context(|| format!("keep {}", local.display()))?;
+        kept += 1;
+    }
+    Ok(kept)
+}
+
+/// Copies the runner state kept in the data root for `node_id` into a
+/// sandbox, for a supervisor's first wake. Nothing kept is nothing to do.
+fn place_state_via(run: Run, data_root: &Path, node_id: &str) -> Result<usize> {
+    let mut placed = 0;
+    for (local, remote) in state_files(data_root, node_id) {
+        let bytes = match std::fs::read(&local) {
+            Ok(bytes) if !bytes.is_empty() => bytes,
+            Ok(_) => continue,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => return Err(err).with_context(|| format!("read {}", local.display())),
+        };
+        let dir = remote.rsplit_once('/').map_or("/", |(dir, _)| dir);
+        run(r#"mkdir -p "$1""#, &[dir]).with_context(|| format!("create {dir}"))?;
+        let tmp = format!("{remote}.placing");
+        for (n, chunk) in bytes.chunks(CHUNK).enumerate() {
+            let encoded = base64::engine::general_purpose::STANDARD.encode(chunk);
+            let redirect = if n == 0 { ">" } else { ">>" };
+            let script = format!(r#"printf %s "$2" | base64 -d {redirect} "$1""#);
+            run(&script, &[&tmp, &encoded]).with_context(|| format!("send the runner state {remote}"))?;
+        }
+        run(r#"mv "$1" "$2""#, &[&tmp, &remote]).with_context(|| format!("place the runner state {remote}"))?;
+        placed += 1;
+    }
+    Ok(placed)
+}
+
+/// Before `node_id`'s files are removed from where they are: copies what
+/// only that place holds into the data root, so the node resumes in its next
+/// place. A sandbox's agent session logs go into the mirror
+/// ([`pull_node`]) and the supervisor's runner state beside the app's
+/// (`autopilot/`); a supervisor's turns run inside the sandbox and never
+/// fill either. A host or dev-container place has nothing to copy: the
+/// conversation driver keeps the mirror after every turn. A failure is
+/// returned, naming what, and the caller removes nothing.
+pub fn keep_node_state(fleet: &super::FleetStore, node_id: &str) -> Result<()> {
+    let Some(location) = super::provision::node_location(fleet, node_id)? else {
+        return Ok(());
+    };
+    let Some(sandbox) = location.sandbox().map(str::to_string) else {
+        return Ok(());
+    };
+    let root = fleet.paths().root();
+    pull_node(root, node_id, &sandbox)
+        .with_context(|| format!("Could not keep the agent session logs from sandbox {sandbox}"))?;
+    let remote = SandboxRemote::new(&sandbox);
+    keep_state_via(&|script, args| remote.sh(script, args), root, node_id)
+        .with_context(|| format!("Could not keep the runner state from sandbox {sandbox}"))?;
+    Ok(())
+}
+
+/// For a node entering sandbox `sandbox`: sends the runner state
+/// [`keep_node_state`] kept, before its supervisor's first wake (the session
+/// logs go in through [`restore_node`]). The number of files sent.
+pub fn place_node_state(fleet: &super::FleetStore, node_id: &str, sandbox: &str) -> Result<usize> {
+    let remote = SandboxRemote::new(sandbox);
+    place_state_via(&|script, args| remote.sh(script, args), fleet.paths().root(), node_id)
+        .with_context(|| format!("Could not send the runner state to sandbox {sandbox}"))
+}
+
 static PROBLEMS: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
 
 /// A background copy failed: logged, and held for the app to show the user
@@ -791,6 +888,50 @@ mod transfer_tests {
         let logs = sh_list(&run).unwrap();
         assert_eq!(logs, vec![RemoteLog { project: "-proj".into(), session: id.into(), size: body.len() as u64 }]);
         assert_eq!(sh_read_from(&run, "-proj", id, 8).unwrap(), body[8..].to_vec());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn runner_state_is_kept_from_a_sandbox_and_placed_into_one() {
+        let Ok(probe) = std::process::Command::new("sh").arg("-c").arg("command -v base64").output() else { return };
+        if !probe.status.success() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("tod-runner-state-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (app, sandbox) = (dir.join("app"), dir.join("sandbox"));
+        std::fs::create_dir_all(&app).unwrap();
+        // A fake sandbox: every absolute path the runner state uses is moved under `sandbox`.
+        let prefix = sandbox.to_string_lossy().replace(std::path::MAIN_SEPARATOR, "/");
+        let run = |script: &str, args: &[&str]| -> Result<Vec<u8>> {
+            let rooted: Vec<String> = args
+                .iter()
+                .map(|a| if a.starts_with('/') { format!("{prefix}{a}") } else { a.to_string() })
+                .collect();
+            let mut all = vec!["-c", script, "sh"];
+            all.extend(rooted.iter().map(String::as_str));
+            let out = std::process::Command::new("sh").args(all).output()?;
+            anyhow::ensure!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+            Ok(out.stdout)
+        };
+        let node = "11111111-2222-3333-4444-555555555555";
+        // Nothing there: nothing kept, and not an error.
+        assert_eq!(keep_state_via(&run, &app, node).unwrap(), 0);
+        let files = state_files(&app, node);
+        std::fs::create_dir_all(files[0].0.parent().unwrap()).unwrap();
+        std::fs::write(&files[0].0, b"{\"step\":3}").unwrap();
+        std::fs::write(&files[1].0, b"{\"answers\":[]}").unwrap();
+        // Into the sandbox (the second arg of the write is base64, never a path), then out into a data root of its own.
+        assert_eq!(place_state_via(&run, &app, node).unwrap(), 2);
+        let other = dir.join("other");
+        assert_eq!(keep_state_via(&run, &other, node).unwrap(), 2);
+        let back = state_files(&other, node);
+        assert_eq!(std::fs::read(&back[0].0).unwrap(), b"{\"step\":3}");
+        assert_eq!(std::fs::read(&back[1].0).unwrap(), b"{\"answers\":[]}");
+        // A failing sandbox is an error naming what, never a silent skip.
+        let failing = |_: &str, _: &[&str]| -> Result<Vec<u8>> { bail!("relay down") };
+        let err = keep_state_via(&failing, &other, node).unwrap_err();
+        assert!(format!("{err:#}").contains("relay down"), "{err:#}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

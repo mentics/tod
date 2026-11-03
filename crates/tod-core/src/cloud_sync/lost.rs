@@ -537,6 +537,12 @@ fn stop_running_in_cloud_with(fleet: &FleetStore, node_id: &str, delete_sandbox:
     let root = fleet.paths().root().to_path_buf();
     let uuid = uuid::Uuid::parse_str(node_id).with_context(|| format!("node id {node_id}"))?;
     let row = fleet.read(|c| cloud_nodes::get(c, uuid))?;
+    // Migrating a node out of a sandbox ends here: its row goes and the
+    // change is synced. A node with no row never ran in the cloud, so there
+    // is nothing to drop and nothing to sync.
+    if row.is_none() && !delete_sandbox {
+        return Ok("The node was not running in the cloud.".to_string());
+    }
     if delete_sandbox && let Some(row) = &row {
         let sandboxes = tod_store::fleet::sandbox::Sandboxes::load(&root)?;
         if !force {
