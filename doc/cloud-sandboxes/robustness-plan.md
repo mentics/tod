@@ -20,6 +20,34 @@ This page is the summary and the plan: what the live system showed, the
 bugs fixed in this pass, the design changes that remove whole classes of
 failure (ranked), the process changes, and how to verify.
 
+## Status, end of 2026-11-03
+
+All of section 3 (3.1 to 3.12) is on `main` and was exercised on the
+live-verify root; the orchestrator is on a volume (`orchestrator_volume`) with
+its databases on local disk (SQLite WAL fails on the volume), and the app
+starts it again when its sandbox is up and its process is gone. Verified live:
+the sliced replica (7 MB), the health probe on fork, run state and its plain-words
+stops, request rows consumed by the supervisor, the lock and progress files, the
+long-poll feed, the notice topic re-fetch, the version contract, wake rebuild,
+the gate reading a PR with a routed token, a webhook merge waking a node 2 s
+after the event, the orchestrator self-heal drill, and replacing three expired
+real sandboxes at once.
+
+Not yet exercised live: the budget and missing-skill stops with Keep going; the
+quit dialog listing only live nodes; `tod-cli db` routing; the cycle-detection
+stop (unit-tested only); the disk-cleanup script; the relay killing a wedged
+supervisor; a second supervisor meeting the flock for real; the dead-man retry
+after a real wake error.
+
+Known gaps: nothing calls the orphan sandbox sweeper (`list_orphan_sandboxes`);
+the supervisor and `tod-cli` in sandboxes send no contract headers; the wake
+command's fallback still runs the supervisor untracked when the relay is down;
+the relay's 40-minute kill limit is fixed (assumes the default hang limit);
+`scripts/build.sh` / `deploy.sh` still compare a source hash; the cause of the
+orchestrator container reset at 10:43 UTC on 2026-11-03 is unknown; saving
+GitHub tokens in two roots that share an orchestrator replaces its proxy secrets
+as a whole (the last save wins).
+
 ## 1. What the live system showed
 
 Measured 2026-11-03 (UTC), live root `~/.config/tod`, six cloud nodes.
