@@ -605,7 +605,8 @@ later group's session; `list_for_focus` shows all of them.
 `tod_core::skills_context::for_node` renders the "Skills" block
 (`DynamicBlock::ConfiguredSkills`) that each phase agent's opening carries, via
 a `skills` field on `ImplementRequest` and `GateCheckRequest`; the evaluator
-gets the skills of the state it judges. The block holds each skill's **text**,
+gets none (it judges the result against the gate and the role doc's checklist,
+not how the work was done). The block holds each skill's **text**,
 not only its name, so no agent spends turns finding it and a skill marked
 `disable-model-invocation` (kept out of every session's context, refused by
 Claude Code's Skill tool) still works: a name is looked up among tod's own

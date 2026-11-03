@@ -6,10 +6,11 @@ use std::sync::Arc;
 
 use gpui::{
     App, AppContext, Context, Entity, FocusHandle, Focusable, InteractiveElement, IntoElement,
-    MouseButton, MouseDownEvent, ParentElement, Render, SharedString, StatefulInteractiveElement, Styled,
-    Subscription, Window, div, px,
+    MouseButton, MouseDownEvent, ParentElement, Render, ScrollHandle, SharedString, StatefulInteractiveElement,
+    Styled, Subscription, Window, div, px,
 };
 use gpui_component::ActiveTheme;
+use gpui_component::scroll::Scrollbar;
 use tod_store::conversation::{Conversation, ConversationRepo, Focus, ProtocolKind, Turn, TurnRole};
 use tod_store::fleet::FleetStore;
 use uuid::Uuid;
@@ -89,6 +90,8 @@ pub struct TranscriptPanel {
     _load: gpui::Task<()>,
     _search: gpui::Task<()>,
     _items: gpui::Task<()>,
+    /// Scroll position of the list of the watched node's conversations.
+    runs_scroll: ScrollHandle,
     _sync: gpui::Task<()>,
 }
 
@@ -204,6 +207,7 @@ impl TranscriptPanel {
             _load: gpui::Task::ready(()),
             _search: gpui::Task::ready(()),
             _items: gpui::Task::ready(()),
+            runs_scroll: ScrollHandle::new(),
             _sync: gpui::Task::ready(()),
         };
         let mut fleet_rx = this.fleet.subscribe_changes();
@@ -434,19 +438,20 @@ impl TranscriptPanel {
     /// latest" above it.
     fn render_runs(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
         let watching = self.watching.as_ref()?;
-        let mut list = div()
-            .id("transcript-runs")
-            .flex_none()
-            .w(px(RUNS_WIDTH))
-            .h_full()
+        // Rows keep their own height (`flex_none`): a flex column shrinks its
+        // children to fit, which squashed them all into the list's height
+        // instead of scrolling. The scrollbar shows only when they overflow.
+        let mut rows = div()
+            .id("transcript-runs-scroll")
+            .size_full()
             .flex()
             .flex_col()
-            .border_r_1()
-            .border_color(cx.theme().border)
             .p_1()
             .overflow_y_scroll()
+            .track_scroll(&self.runs_scroll)
             .child(
                 style::menu_item(div().id("transcript-run-follow"), !watching.pinned)
+                    .flex_none()
                     .cursor_pointer()
                     .on_mouse_down(
                         MouseButton::Left,
@@ -458,8 +463,9 @@ impl TranscriptPanel {
             let id = item.id;
             let current = watching.pinned && self.conversation_id == id;
             let live = watching.live_id == Some(id);
-            list = list.child(
+            rows = rows.child(
                 style::menu_item(div().id(SharedString::from(format!("transcript-run-{id}"))), current)
+                    .flex_none()
                     .flex()
                     .items_center()
                     .cursor_pointer()
@@ -477,7 +483,27 @@ impl TranscriptPanel {
                     .child(style::text_dense_muted(div()).flex_shrink_0().child(format_time(item.updated_at))),
             );
         }
-        Some(list.into_any_element())
+        Some(
+            div()
+                .id("transcript-runs")
+                .relative()
+                .flex_none()
+                .w(px(RUNS_WIDTH))
+                .h_full()
+                .border_r_1()
+                .border_color(cx.theme().border)
+                .child(rows)
+                .child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .right_0()
+                        .bottom_0()
+                        .left_0()
+                        .child(Scrollbar::vertical(&self.runs_scroll)),
+                )
+                .into_any_element(),
+        )
     }
 
     /// The turn `node`'s cloud supervisor has in flight, as it last sent it

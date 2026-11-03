@@ -1191,6 +1191,10 @@ fn a_phase_with_later_groups_is_evaluated_even_with_independent_evaluation_off()
     let at = |name: &str| steps.iter().position(|s| s == name).unwrap_or_else(|| panic!("{name}: {steps:?}"));
     // Group 0 only recorded the phase `ready`: the evaluator, last, certified it.
     assert!(at("phase") < at("phase (skills group 2)") && at("phase (skills group 2)") < at("evaluate"), "{steps:?}");
+    // The evaluator judges the result, not how the work was done: no skills.
+    let evaluations = openings(&fx, ProtocolKind::Evaluate);
+    assert!(!evaluations.is_empty());
+    assert!(evaluations.iter().all(|(_, o)| !o.contains("simplify") && !o.contains("code-review")), "{evaluations:#?}");
 }
 
 #[test]
