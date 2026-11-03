@@ -222,7 +222,12 @@ impl Server {
                         };
                         match self.users.get(&user) {
                             Ok(data) if !sync_backend::is_seeded(&data.root) => Response::text(409, sync_backend::NOT_SEEDED),
-                            Ok(data) => sync_backend::export_changes(&data, after, client(request)),
+                            Ok(data) => sync_backend::export_changes(
+                                &data,
+                                after,
+                                client(request),
+                                self.notifier.degraded_for().map(|d| d.as_secs().max(1)),
+                            ),
                             Err(err) => Response::text(500, format!("{err:#}")),
                         }
                     }

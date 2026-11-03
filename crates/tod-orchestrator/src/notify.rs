@@ -36,6 +36,15 @@ const TOPIC_FILE: &str = "notify.json";
 /// quiet spell is still announced at once; only a continuous stream is
 /// batched, and the app also pulls on a timer.
 pub const MIN_INTERVAL: Duration = Duration::from_secs(30);
+/// How long publishing stops after the service answers 429. The limit is per
+/// IP address, so it stops for every user; the app is told (the feed's
+/// `notices_degraded_secs`) and pulls on a short timer meanwhile.
+pub const RATE_LIMIT_BACKOFF: Duration = Duration::from_secs(60);
+
+/// Whether `err` is the notice service refusing for rate (HTTP 429).
+fn is_rate_limited(err: &anyhow::Error) -> bool {
+    matches!(err.downcast_ref::<ureq::Error>(), Some(ureq::Error::StatusCode(429)))
+}
 
 /// What a message says.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -232,6 +241,13 @@ impl Coalescer {
         }
     }
 
+    /// Holds `user`'s run until `until` at the earliest: it is already
+    /// scheduled or is now, and publishing is stopped before then.
+    pub fn defer(&mut self, user: &str, until: Instant) {
+        let slot = self.users.entry(user.to_string()).or_default();
+        slot.due = Some(slot.due.map_or(until, |d| d.max(until)));
+    }
+
     /// The earliest scheduled run.
     pub fn next_due(&self) -> Option<Instant> {
         self.users.values().filter_map(|s| s.due).min()
@@ -253,7 +269,7 @@ impl Coalescer {
 }
 
 /// What was last announced for a user.
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct Announced {
     last_seq: Option<i64>,
     problems: Option<u64>,
@@ -298,6 +314,8 @@ pub struct Notifier {
     probe: Box<dyn Probe>,
     sink: Box<dyn Sink>,
     announced: Mutex<HashMap<String, Announced>>,
+    /// Publishing is stopped until then, after a 429.
+    degraded_until: Mutex<Option<Instant>>,
 }
 
 impl Notifier {
@@ -309,6 +327,7 @@ impl Notifier {
             probe,
             sink,
             announced: Mutex::new(HashMap::new()),
+            degraded_until: Mutex::new(None),
         });
         let worker = n.clone();
         std::thread::Builder::new()
@@ -336,6 +355,13 @@ impl Notifier {
             Some(server) => Box::new(NtfySink::new(server)),
             None => Box::new(NoSink),
         }
+    }
+
+    /// How much longer publishing is stopped for, after a 429; `None` when it is not.
+    pub fn degraded_for(&self) -> Option<Duration> {
+        let until = (*self.degraded_until.lock().unwrap_or_else(|e| e.into_inner()))?;
+        let left = until.saturating_duration_since(Instant::now());
+        (!left.is_zero()).then_some(left)
     }
 
     /// A change may have been committed for `user`. Never blocks on I/O.
@@ -379,22 +405,50 @@ impl Notifier {
     }
 
     fn try_announce(&self, user: &str) -> Result<()> {
+        // Stopped after a 429: nothing is looked at or consumed, and the run
+        // comes again when publishing resumes, so the change is still announced.
+        if let Some(left) = self.degraded_for() {
+            self.state.lock().unwrap_or_else(|e| e.into_inner()).defer(user, Instant::now() + left);
+            return Ok(());
+        }
         let observed = self.probe.observe(user)?;
-        let (changed, needs_you) = {
+        let (before, changed, needs_you) = {
             let mut announced = self.announced.lock().unwrap_or_else(|e| e.into_inner());
-            decide(announced.entry(user.to_string()).or_default(), observed)
+            let seen = announced.entry(user.to_string()).or_default();
+            let before = seen.clone();
+            let (changed, needs_you) = decide(seen, observed);
+            (before, changed, needs_you)
         };
         if !changed && !needs_you {
             return Ok(());
         }
-        let topic = self.probe.topic(user)?;
-        if changed {
-            self.sink.publish(&topic, Kind::Changed)?;
+        let published = (|| {
+            let topic = self.probe.topic(user)?;
+            if changed {
+                self.sink.publish(&topic, Kind::Changed)?;
+            }
+            if needs_you {
+                self.sink.publish(&alerts_topic(&topic), Kind::NeedsYou)?;
+            }
+            Ok(())
+        })();
+        if let Err(err) = &published
+            && is_rate_limited(err)
+        {
+            // Stop for everyone, and announce again when it is over: what was
+            // not announced is not marked as announced.
+            let until = Instant::now() + RATE_LIMIT_BACKOFF;
+            *self.degraded_until.lock().unwrap_or_else(|e| e.into_inner()) = Some(until);
+            let mut announced = self.announced.lock().unwrap_or_else(|e| e.into_inner());
+            let seen = announced.entry(user.to_string()).or_default();
+            seen.last_seq = None;
+            seen.attention = before.attention;
+            seen.problems = None;
+            drop(announced);
+            self.state.lock().unwrap_or_else(|e| e.into_inner()).defer(user, until);
+            self.wake.notify_one();
         }
-        if needs_you {
-            self.sink.publish(&alerts_topic(&topic), Kind::NeedsYou)?;
-        }
-        Ok(())
+        published
     }
 }
 
@@ -459,6 +513,64 @@ mod tests {
         assert!(failure_to_report(&mut last, fail("publish to ntfy: 502")).is_some());
         assert_eq!(failure_to_report(&mut last, Ok(())), None);
         assert!(failure_to_report(&mut last, fail("publish to ntfy: 502")).is_some());
+    }
+
+    struct SeqProbe(Mutex<i64>);
+    impl Probe for SeqProbe {
+        fn observe(&self, _: &str) -> Result<Observed> {
+            Ok(Observed { last_seq: *self.0.lock().unwrap(), ..Observed::default() })
+        }
+        fn topic(&self, _: &str) -> Result<String> {
+            Ok("t".into())
+        }
+    }
+
+    /// Refuses with a 429 while `refuse` is set; counts what it takes.
+    struct Flaky {
+        refuse: Arc<Mutex<bool>>,
+        taken: Arc<Mutex<u32>>,
+    }
+    impl Sink for Flaky {
+        fn publish(&self, _: &str, _: Kind) -> Result<()> {
+            if *self.refuse.lock().unwrap() {
+                return Err(anyhow::Error::new(ureq::Error::StatusCode(429)).context("publish to ntfy"));
+            }
+            *self.taken.lock().unwrap() += 1;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_429_stops_publishing_and_the_change_is_announced_when_it_is_over() {
+        let refuse = Arc::new(Mutex::new(true));
+        let taken = Arc::new(Mutex::new(0));
+        let n = Notifier::start(
+            Box::new(SeqProbe(Mutex::new(1))),
+            Box::new(Flaky { refuse: refuse.clone(), taken: taken.clone() }),
+        );
+        assert!(n.degraded_for().is_none());
+        assert!(n.try_announce("u").is_err());
+        assert!(n.degraded_for().is_some_and(|d| d <= RATE_LIMIT_BACKOFF));
+        assert!(n.state.lock().unwrap().next_due().is_some(), "a run is held for when it is over");
+        // Meanwhile nothing is sent, even once the service would take it.
+        *refuse.lock().unwrap() = false;
+        assert!(n.try_announce("u").is_ok());
+        assert_eq!(*taken.lock().unwrap(), 0);
+        // Over: the same change, not yet announced, goes out.
+        *n.degraded_until.lock().unwrap() = None;
+        assert!(n.try_announce("u").is_ok());
+        assert_eq!(*taken.lock().unwrap(), 1);
+    }
+
+    #[test]
+    fn a_deferred_run_waits_for_its_time() {
+        let t0 = Instant::now();
+        let mut c = Coalescer::default();
+        c.poke("a", t0);
+        c.take_due(t0);
+        c.defer("a", t0 + Duration::from_secs(60));
+        assert!(c.take_due(t0 + Duration::from_secs(59)).is_empty());
+        assert_eq!(c.take_due(t0 + Duration::from_secs(60)), vec!["a"]);
     }
 
     #[test]

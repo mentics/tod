@@ -14,6 +14,12 @@
 //! in the cloud [`start`] also pulls on a timer ([`FALLBACK_POLL`]). A sync
 //! reads the orchestrator only, so polling wakes no node's sandbox.
 //!
+//! When the orchestrator's publishes are refused (ntfy answers 429) it stops
+//! publishing for a minute and says so in the feed
+//! (`notices_degraded_secs`); until then the app pulls every
+//! [`DEGRADED_POLL`], node in the cloud or not, and goes back to the
+//! subscription alone after.
+//!
 //! The server and topic come from `GET /users/<u>/notify` on the
 //! orchestrator, kept in `cloud-sync.json` (`notify`).
 
@@ -46,6 +52,45 @@ const SEEDED_CHECK: Duration = Duration::from_secs(30);
 /// How often the orchestrator is pulled from while a node runs in the
 /// cloud, whether or not a notice arrived.
 pub const FALLBACK_POLL: Duration = Duration::from_secs(20);
+/// How often it is pulled from while the orchestrator says its notices are
+/// refused ([`note_degraded`]).
+pub const DEGRADED_POLL: Duration = Duration::from_secs(5);
+
+/// Per data root, until when the orchestrator said its notices are refused.
+static DEGRADED_UNTIL: Mutex<Option<std::collections::HashMap<std::path::PathBuf, Instant>>> = Mutex::new(None);
+
+/// Records what a feed said of the notice service: `secs` left in a refusal,
+/// or `None` for publishing.
+fn note_degraded(root: &Path, secs: Option<u64>) {
+    let mut map = DEGRADED_UNTIL.lock().unwrap_or_else(|e| e.into_inner());
+    let map = map.get_or_insert_with(Default::default);
+    match secs {
+        Some(secs) => {
+            if !map.contains_key(root) {
+                tracing::warn!("cloud notices: the orchestrator's notices are refused; pulling every {}s for {secs}s", DEGRADED_POLL.as_secs());
+            }
+            map.insert(root.to_path_buf(), Instant::now() + Duration::from_secs(secs));
+        }
+        None => {
+            map.remove(root);
+        }
+    }
+}
+
+fn degraded(root: &Path) -> bool {
+    let map = DEGRADED_UNTIL.lock().unwrap_or_else(|e| e.into_inner());
+    map.as_ref().and_then(|m| m.get(root)).is_some_and(|until| *until > Instant::now())
+}
+
+/// Whether the timer pulls now: every [`DEGRADED_POLL`] while notices are
+/// refused, else every [`FALLBACK_POLL`] while a node runs in the cloud.
+fn poll_due(since_last: Duration, degraded: bool, in_cloud: impl FnOnce() -> bool) -> bool {
+    if degraded {
+        since_last >= DEGRADED_POLL
+    } else {
+        since_last >= FALLBACK_POLL && in_cloud()
+    }
+}
 
 /// Whether any node is assigned to the cloud and not lost: its supervisor may
 /// be changing it there, so the feed is worth pulling without a notice.
@@ -58,14 +103,18 @@ fn any_running_in_cloud(fleet: &FleetStore) -> bool {
         })
 }
 
-/// Pulls on a timer for as long as the app runs, while a node runs in the
-/// cloud ([`any_running_in_cloud`]), in case no notice comes.
+/// Pulls on a timer for as long as the app runs: while a node runs in the
+/// cloud ([`any_running_in_cloud`]), in case no notice comes, and faster
+/// while the orchestrator says its notices are refused.
 fn spawn_fallback_poll(fleet: Arc<FleetStore>) {
     let root = fleet.paths().root().to_path_buf();
     let spawned = std::thread::Builder::new().name("tod-cloud-poll".into()).spawn(move || {
+        let mut last = Instant::now();
         loop {
-            std::thread::sleep(FALLBACK_POLL);
-            if CloudSyncState::load(&root).is_ok_and(|s| s.seeded) && any_running_in_cloud(&fleet) {
+            std::thread::sleep(DEGRADED_POLL);
+            let due = poll_due(last.elapsed(), degraded(&root), || any_running_in_cloud(&fleet));
+            if due && CloudSyncState::load(&root).is_ok_and(|s| s.seeded) {
+                last = Instant::now();
                 runner(&fleet).request();
             }
         }
@@ -228,6 +277,7 @@ pub fn runner(fleet: &Arc<FleetStore>) -> Arc<Coalesced> {
                         tracing::info!("{note}");
                     }
                     tracing::info!("cloud sync: {}", report.summary());
+                    note_degraded(&root, report.notices_degraded_secs);
                     // The orchestrator found a node's sandbox gone: replace it.
                     if cloud_sync::lost::any_marked(&fleet) {
                         cloud_sync::lost::spawn_check(fleet.clone(), cloud_sync::lost::Check::Marked);
@@ -302,6 +352,26 @@ pub fn start(fleet: Arc<FleetStore>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_timer_is_fast_only_while_notices_are_refused() {
+        let s = Duration::from_secs;
+        assert!(!poll_due(s(5), false, || true));
+        assert!(poll_due(s(20), false, || true));
+        assert!(!poll_due(s(20), false, || false), "no node in the cloud, notices working: no timer");
+        assert!(poll_due(s(5), true, || false), "refused: pull even with no node in the cloud");
+        assert!(!poll_due(s(4), true, || true));
+    }
+
+    #[test]
+    fn a_refusal_is_remembered_until_a_feed_says_it_is_over() {
+        let root = std::path::PathBuf::from("/nowhere/degraded-test");
+        assert!(!degraded(&root));
+        note_degraded(&root, Some(60));
+        assert!(degraded(&root));
+        note_degraded(&root, None);
+        assert!(!degraded(&root));
+    }
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::sync::atomic::{AtomicUsize, Ordering};
