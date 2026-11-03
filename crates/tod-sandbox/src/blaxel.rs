@@ -140,8 +140,13 @@ impl SandboxInfo {
     }
 
     /// Its `TOD_USER` or `TOD_NODE` (see [`Self::node_env`]), when not empty.
+    /// A value Blaxel masks in its listing (all asterisks) is not a value:
+    /// it reads as absent, never as a user or node named `****`.
     pub fn env(&self, name: &str) -> Option<&str> {
-        self.node_env.iter().find(|(k, v)| k == name && !v.is_empty()).map(|(_, v)| v.as_str())
+        self.node_env
+            .iter()
+            .find(|(k, v)| k == name && !v.is_empty() && !v.chars().all(|c| c == '*'))
+            .map(|(_, v)| v.as_str())
     }
 }
 
@@ -1396,5 +1401,27 @@ mod http_tests {
         let (url, log) = stub(|_, _, _| (200, process_reply(0, ROOMY_DF)));
         client().ensure_free_space(&url, "/", 1024, "s").unwrap();
         assert_eq!(log.lock().unwrap().len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod env_tests {
+    use super::*;
+
+    fn info(envs: serde_json::Value) -> SandboxInfo {
+        parse_info(&serde_json::json!({"metadata": {"name": "n"}, "spec": {"runtime": {"envs": envs}}}))
+    }
+
+    #[test]
+    fn a_node_env_blaxel_shows_is_a_value() {
+        let i = info(serde_json::json!([{"name": "TOD_USER", "value": "me"}, {"name": "TOD_NODE", "value": "abc"}]));
+        assert_eq!(i.env("TOD_USER"), Some("me"));
+        assert_eq!(i.env("TOD_NODE"), Some("abc"));
+    }
+
+    #[test]
+    fn a_node_env_blaxel_masks_is_absent_not_a_user_named_stars() {
+        let i = info(serde_json::json!([{"name": "TOD_USER", "value": "****"}]));
+        assert_eq!(i.env("TOD_USER"), None);
     }
 }
