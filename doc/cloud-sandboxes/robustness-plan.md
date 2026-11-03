@@ -47,7 +47,12 @@ Measured 2026-11-03 (UTC), live root `~/.config/tod`, six cloud nodes.
 
 ## 2. Bugs fixed in this pass
 
-Each landed on `main` with a regression test; see the commit for details.
+Each landed on `main` on 2026-11-03 with regression tests (the merge of
+`js/cloud-vm-robustness-audit-4a4b9e`). They need a rebuild of the sandbox
+binaries, an orchestrator redeploy (`scripts/deploy.sh`), and an app relaunch
+(which reinstalls idle node sandboxes); the `cloud_activity.stopped` column
+(schema v87) means an old app and a new orchestrator must not be mixed for
+long: relaunch the app after the deploy.
 
 | # | Symptom | Cause | Fix |
 |---|---|---|---|
@@ -61,6 +66,9 @@ Each landed on `main` with a regression test; see the commit for details.
 | 2.8 | relay hold churn; pokes lost | timeout clipped to the shortest lease; `alive()` true on zombies; SIGUSR1 before the handler; poke in the exit tail | clip to the longest lease with hysteresis; release the poke lease when the supervisor holds or exits; `SIG_IGN` across exec; a poke generation counter re-runs the supervisor |
 | 2.9 | one rejected row wedges sync forever; a second root reseeds over the first | batch apply in one transaction; no seed ownership | per-row apply with a `sync_rejects` quarantine and a visible escalation; a seed from a newer schema or another client is refused unless taken over; atomic seed markers |
 | 2.10 | the wrong daemon answers the database broker; daemons never exit | ownership checked after the lookups; no lifetime | ownership first, owner routing on the orchestrator, bounded broker poll timeouts; a daemon exits when its root is gone or idle 6 h with nothing to keep it; old build copies pruned |
+
+| 2.11 | the live-verify root reseeds over the real root's orchestrator copy | both use `owner = "jshellman"` | the seed script gives that root `owner = "<you>-live-verify"`; the live root was changed by hand the same way |
+| 2.12 | a truncated manifest after a full disk made the installer take the image path | `printf > manifest` cut short | the manifest is written to a temp file and moved into place; "Delete Sandbox without a checkpoint" in the runner menu |
 
 Still open from the catalogue, by design decision rather than bug:
 Node 20 missing from a golden fork (fix it in the image); the workspace
