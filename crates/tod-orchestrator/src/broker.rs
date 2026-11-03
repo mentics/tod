@@ -334,11 +334,16 @@ mod tests {
         for m in ["a", "b"] {
             broker.next("u", &req_from(m, None, "", "wait=0"));
         }
-        let a = machine_replying(&broker, "a", NOT_MINE);
-        let b = machine_replying(&broker, "b", r#"{"ok":true,"login":"l"}"#);
-        let r = broker.request("u", &req(Some("n1"), r#"{"op":"token"}"#, ""));
-        a.join().unwrap();
-        b.join().unwrap();
+        // "a" must decline before "b" polls: if "b" answered first, the
+        // request would be gone before a slow "a" was offered it (a flake
+        // under load), and the decline path would go untested.
+        let caller = {
+            let broker = broker.clone();
+            std::thread::spawn(move || broker.request("u", &req(Some("n1"), r#"{"op":"token"}"#, "")))
+        };
+        machine_replying(&broker, "a", NOT_MINE).join().unwrap();
+        machine_replying(&broker, "b", r#"{"ok":true,"login":"l"}"#).join().unwrap();
+        let r = caller.join().unwrap();
         assert_eq!(r.status, 200);
         assert_eq!(r.body, br#"{"ok":true,"login":"l"}"#);
     }
