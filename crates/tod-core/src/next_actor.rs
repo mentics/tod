@@ -595,7 +595,7 @@ fn actor_for(facts: &Facts<'_>) -> (NextActor, i64) {
         }
         let error = format!(
             "the cloud supervisor has not reported in {} after the node was sent ({}); \
-             Run in the cloud sends it again",
+             Start sends it again",
             format_elapsed(waited),
             row.reason_text,
         );
@@ -607,9 +607,9 @@ fn actor_for(facts: &Facts<'_>) -> (NextActor, i64) {
     // none is "not started".
     if let Some(lost) = facts.cloud_lost {
         let reason = if lost.deleted_by_user {
-            "its sandbox was deleted; Run in the cloud makes a new one".to_string()
+            "its sandbox was deleted; Start makes a new one".to_string()
         } else {
-            "its sandbox is gone; a new one is made at the next sync, or Run in the cloud makes one now".to_string()
+            "its sandbox is gone; a new one is made at the next sync, or Start makes one now".to_string()
         };
         return (NextActor::You { why: YouReason::Stopped { reason }, since: lost.since }, lost.since);
     }
@@ -1753,7 +1753,7 @@ mod tests {
             panic!("{:?}", standing(&c).actor)
         };
         assert_eq!(since, 100);
-        assert!(error.contains("has not reported in") && error.contains("Run in the cloud sends it again"), "{error}");
+        assert!(error.contains("has not reported in") && error.contains("Start sends it again"), "{error}");
         // An older supervisor's later beat is the later word: the row is ignored.
         c.cloud = Some(idle_beat(None));
         c.run_state = Some(row(Phase::Starting, crate::run_state::kind::SENDING, "x", NOW - 4 * 86_400_000, NOW - 4 * 86_400_000));
@@ -1806,7 +1806,7 @@ mod tests {
         c.cloud = Some(beat(100, tod_store::cloud_activity::STALE_AFTER_MS + 5_000));
         assert_eq!(
             standing(&c).actor,
-            you(YouReason::Stopped { reason: "its sandbox was deleted; Run in the cloud makes a new one".into() }, 900)
+            you(YouReason::Stopped { reason: "its sandbox was deleted; Start makes a new one".into() }, 900)
         );
         c.cloud_lost = Some(CloudLost { since: 900, deleted_by_user: false });
         let NextActor::You { why: YouReason::Stopped { reason }, .. } = standing(&c).actor else { panic!() };

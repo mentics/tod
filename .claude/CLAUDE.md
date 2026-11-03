@@ -126,11 +126,13 @@ agent evaluates one** (`tod_core::phase::settle_gate`, over the derived
 criteria in `tod_core::gate::derived`). Advance checks the gate and moves the
 node on when it is clear; the failing criteria, each with a Waive, sit in the
 side pane beneath the list the node's state is about (obligations, plan, or
-findings), never above the input. Gate checks, waiving, and advancing run in
-`views::lifecycle_control::LifecycleController`, one entity the shell shares
-between the conversation view and the lifecycle panel, so a check started in
-either shows in both. The manual escape hatches (force advance, revert, open
-interview) stay in the panel.
+findings), never above the input. Gates are checked in two places: the
+autopilot's `gate` step, and the task panel's runner menu **Check now**
+(`tod_core::lifecycle::check_now`: `phase::settle_gate`, then the advance when
+the gate is clear, with no agent). Waiving a criterion and the manual escape
+hatches (force advance, revert, open interview) run in
+`views::lifecycle_control::LifecycleController`, which only keeps what the
+lifecycle panel shows.
 
 **Phase agents** (`doc/lifecycle/phase-agents.md`). In `proposed`, `design`,
 `planning`, `merged`, `released`, and `learn` a phase agent
@@ -736,9 +738,10 @@ retries or as `You` failed with the error: nothing is logged and dropped
 actor, the strip above it filters by actor, and `tod_core::attention` stays as
 the list of requests behind `You`. The task panel's runner line
 starts, pauses, and resumes the node's lifecycle autopilot on this machine
-(`unified/runners.rs`, `tod_core::autopilot::local`: one thread per run,
-its conversation shown in `AgentRuns` as hosted elsewhere, restarted on the
-next launch if the app closed mid-run) or hands it to the cloud
-(`doc/ui/task-panel.md`, "Runner"). See `doc/ui/unified-view.md` for
+(`unified/runners.rs`: the runs are `tod-agentd`'s and go on with the app
+closed; `tod_core::autopilot::local`, its conversation shown in `AgentRuns`
+as hosted elsewhere) or, for a node whose Files are a cloud
+sandbox, hands it to a supervisor in that sandbox (`tod_core::runner_place`;
+`doc/ui/task-panel.md`, "Runner"; `doc/runner-menu/design.md`). See `doc/ui/unified-view.md` for
 the full design (layout, pinning, panels, keys) and
 `doc/ui/unified-view-plan.md` for the work-item breakdown.

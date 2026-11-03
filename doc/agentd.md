@@ -257,7 +257,8 @@ wait settles the store change clears it.
 ## Moving a node
 
 A node moves between this machine, a dev container, and a cloud sandbox by
-changing:
+the user choosing **Migrate to…** in the task panel's runner menu (the one
+way to move a node; a node with children cannot be migrated), which changes:
 - its **wake target** (`Local` or `Sandbox`),
 - its **backend** (direct on the data root, or a replica synced with the
   orchestrator),

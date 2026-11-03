@@ -117,8 +117,9 @@ or below it: removing them needs the user.
   old per-node "Image with repositories" form). `tod-sandbox bake` does it.
 - The removal check sees shells and agents recorded for the node, not a
   conversation turn or autopilot run that is starting.
-- "Run in the cloud" (a node's autonomous runner, `doc/cloud-sandboxes/
-  autonomous-nodes.md`) makes its sandbox on its own path
+- Start on a node whose Files are a cloud sandbox (its autonomous runner,
+  `doc/cloud-sandboxes/autonomous-nodes.md`; being merged with the path above,
+  see `doc/runner-menu`) makes its sandbox on its own path
   (`cloud_sync::ensure_node_sandbox`): it clones the repository by URL and
   starts the node's branch from `origin/HEAD` there, but it is not recorded
   as the node's location and none of the above applies to it.

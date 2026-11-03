@@ -6,7 +6,7 @@
 //!   `cloud_nodes.lost_at`; the app checks every cloud node against Blaxel on
 //!   start ([`Check::Full`]) and, after any sync that brings a lost mark,
 //!   those ([`Check::Marked`]). Either way it replaces the sandbox through
-//!   [`super::ensure_node_sandbox`], the path "Run in the cloud" takes: only
+//!   [`super::ensure_node_sandbox`], the path Start takes: only
 //!   the app holds the user's tokens. How that went is kept per node for the
 //!   status line ([`note`]).
 //! - [`stop_running_in_cloud`] is the user leaving the cloud: the row goes
@@ -69,7 +69,7 @@ pub fn forget_gone_sandboxes(
 
 /// How long a node whose replacement failed is left alone by [`Check::Marked`].
 /// Its mark stays set, so without this every sync would fork a sandbox again,
-/// fail the same way, and delete it. A new "Run in the cloud" for the node
+/// fail the same way, and delete it. A new Start for the node
 /// ([`forget_failure`]) or the next start ([`Check::Full`]) tries sooner.
 const RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 

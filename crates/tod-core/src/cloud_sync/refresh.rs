@@ -4,7 +4,7 @@
 //! process, media and skills bundles when it is provisioned, and keeps them:
 //! a node that waits for days on a pull request runs whatever supervisor it
 //! was given, however much the app has changed since. So at launch (and on
-//! the "Reinstall and restart" the user always could ask for) the app
+//! the Reinstall and restart (removed) the user always could ask for) the app
 //! compares what each cloud node's sandbox was last given with what it would
 //! give now ([`install_stamp`]) and reinstalls the ones that differ
 //! ([`super::ensure_node_sandbox`], the same path), leaving alone a node

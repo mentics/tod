@@ -69,7 +69,7 @@ each marked by the decision's `protocol` column. An answer to the agent's
 question wakes the node so the agent sees it; the other decision tables are
 still not context (`tod_core::impact::IGNORED_TABLES`), so the poke comes
 from `answers.rs`, not the impact handler. On waking, the supervisor reads the node's latest
-stop question: "Keep going" / "Wake it again" carries on (after a spent
+stop question: "Keep going" / "Wake it again" carries on (the task panel's Resume answers it) (after a spent
 budget, with another budget of the same size); "Leave it stopped" / "Leave
 it asleep" leaves it stopped, asking nothing and scheduling no wake, until
 the user answers again (the last answer counts). While one is unanswered the

@@ -100,44 +100,64 @@ live turn is doing and the split button's actions. While the node waits, the
 line says only that and for how long; the request below says why.
 
 The line ends with a split button: its default action moves the runner
-along, and its menu holds the rest.
+along, and its menu holds the rest. The entries are a pure function of one
+value (`unified::panels::runner_menu::menu`, tested without a window); design
+and reasons are in `doc/runner-menu/design.md`.
 
 | Runner is | Default action | Menu |
 |---|---|---|
-| never started, or done and moved back | **Start** | Move to the cloud |
+| never started, or done and moved back | **Start** | Check now, Run with a new session (when there is one), Migrate to…, Reset environment, Update workspace to latest main, Delete sandbox |
 | running | **Pause** (once the agent's turn ends) | Stop now (cancels the turn) |
-| paused, stopped, failed, or waiting | **Resume** | Resume with a fresh budget, Move to the cloud |
-| stopped because its budget ran out | **Resume with a fresh budget** | Move to the cloud |
-| its files are in a cloud sandbox, not running there | **Run in the cloud** | Run on this machine instead |
-| in the cloud | **Sync now** | Stop running in the cloud |
-| a conversation the user started by hand is running | **Stop** | |
+| paused, stopped, failed, or waiting on a request | **Resume** | Resume with a fresh budget, Run with a new session, Check now, and the rest as above |
+| stopped because its budget ran out | **Resume with a fresh budget** | Run with a new session, Check now, and the rest as above |
+| a conversation the user started by hand is running | **Stop now** | |
+| done | | Delete sandbox, Update workspace to latest main, Sync now (where they apply) |
 
-The default action always continues where the node already runs; the menu
-holds the alternatives. The line says where that is: `in the cloud (sandbox …)`,
-`this machine` (with `dev container …` when its work is in one), or `not running
-in the cloud yet` for a node whose files are in a sandbox.
+Further entries show when they apply: **Migrate to…** (a node with no
+children), **Reset environment** (a dev container or cloud sandbox; sets the
+environment up again, deleting nothing), **Delete sandbox** and **Delete
+sandbox without a checkpoint** (a node with a cloud sandbox, even while it
+runs, in which case it asks first), and **Sync now** (a node whose runner is a
+supervisor in a sandbox). While a job of the panel's own is running the
+default shows what it is doing, disabled, and the menu is empty. The removed
+entries are Run in the cloud, Run on this machine instead, Move to the cloud,
+Stop running in the cloud, Keep going (now Resume), Poll now (now Check now)
+and Stop (now Stop now).
 
-**Where it runs.** Start runs the node's autopilot
-(`tod_core::autopilot`) on this machine, on a thread of the app's
-(`tod_ui::unified::runners::NodeRunners`); its agent runs wherever the node's
-Files capability says (this machine, a dev container, a sandbox), as any
-conversation's does. Run in the cloud hands the node to a supervisor in its
-own sandbox instead (`doc/cloud-sandboxes/autonomous-nodes.md`). A local
-run's conversation shows in `AgentRuns` as hosted elsewhere, so the tree's
-status labels and the close-window warning see it and nothing else sends to
-it.
+**Check now** runs the current state's gate check at once with no agent
+(`tod_core::lifecycle::check_now`): the same `phase::settle_gate` the
+autopilot's gate step makes, then, when the gate is clear, the advance; in
+`pr_draft`, `approved` and `merged` it also looks at GitHub. It never starts
+or wakes the runner and is offered only while the runner is idle.
 
-**Where the work should run.** A node whose Files capability is a cloud
-sandbox gets **Run in the cloud** as its default action, with **Run on this
-machine** in the menu: a run here stops when the app closes, a run in the cloud
-does not. A node running in the cloud shows `in the cloud (sandbox …)` and, from
-what has synced, `waiting on you` or `done`.
+The line says where the node runs: `in the cloud (sandbox …)`, `this machine`
+(with `dev container …` when its work is in one), or `not running in the
+cloud yet` for a node whose files are in a sandbox.
 
-**Closing the app** stops a local run where it is, and the close warning is red
-for it. A node running in the cloud is listed in the warning as continuing, which
-is yellow; it does not stop. It is started again when
-the app next opens, and reopens the conversation it was in; a paused or
+**Where it runs.** Start looks at where the node's Files capability puts its
+work (`tod_core::runner_place`). Files on this machine or in a dev container:
+the autopilot runs under `tod-agentd`, the resident daemon, and the app
+(`tod_ui::unified::runners::NodeRunners`) only sends it commands and shows the
+state it pushes. Files in a cloud sandbox: a supervisor in the node's own
+sandbox runs it (`doc/cloud-sandboxes/autonomous-nodes.md`), and the daemon
+refuses to run that node itself. A node's conversation shows in `AgentRuns` as
+hosted elsewhere, so the tree's status labels and the close-window warning see
+it and nothing else sends to it. **Migrate to…** is the way to move a node:
+pick one of the app's locations, and its sessions go with it
+(`doc/agentd.md`, "Moving a node").
+
+**Closing the app** does not stop a run: local runs are hosted by
+`tod-agentd`, which keeps them going (and starts a run it was stopped on
+again after a restart), and a node in a sandbox continues under its
+supervisor. The close warning lists both as continuing, in yellow; a paused or
 stopped run is left as it was.
+
+**Delete sandbox when done.** The lifecycle config editor's Done block has a
+**Delete sandbox** checkbox, on by default, inherited from the nearest node
+that sets it like the skills are: when the node reaches `done` its sandbox is
+deleted. The automatic trigger is being reworked (stage B4 of
+`doc/runner-menu/implementation.md`); the menu's Delete sandbox is the manual
+way meanwhile.
 
 **Requests.** A run that stopped for a request (a decision, a plan step
 handed back, a gate criterion no agent can fix) continues by itself once the user has

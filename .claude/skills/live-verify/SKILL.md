@@ -69,9 +69,9 @@ yourself (the Read tool): text dumps are not enough. Wait ~1.5 s between clicks
 (dialogs animate). Positions move; take a screenshot before clicking.
 
 Useful in the task panel (Task pane, right side): the status line and "waiting
-on / working", the runner buttons ("Run in the cloud", "Sync now" dropdown:
-Check now, Run with a new session, Reinstall and restart, Delete Sandbox, Stop
-running in the cloud), Watch, and the Log button (bottom right) for errors.
+on / working", the runner split button (Start / Resume / Pause as the default; its menu: Resume
+with a fresh budget, Run with a new session, Stop now, Check now, Migrate to…,
+Reset environment, Update workspace to latest main, Delete sandbox, Sync now), Watch, and the Log button (bottom right) for errors.
 `tod-cli --data-root <root> ...` reads and edits the root's data (a node id is a
 UUID: `node show <slug>`). Look in the sandbox with `tod-sandbox --data-root
 <root> exec <sandbox> -- sh -c '...'` (processes, files, logs).
@@ -132,6 +132,6 @@ new gotcha to this file and `doc/live-verification.md` and merge them.
   is in its sandbox under `/var/log/sandbox-api/` (see doc/live-verification.md).
 - Blaxel masks env values (`TOD_USER` reads `****`): treat as unknown.
 - A node with a live heartbeat is skipped by the launch reinstall: use
-  "Reinstall and restart" after a deploy, and check `user_version` of the
+  Reset environment (runner menu) after a deploy, and check `user_version` of the
   supervisor's `tod.db` in the sandbox to be sure it is the new build.
 - No `timeout` on macOS; do not wrap cargo in it, and `sed -i ''`.

@@ -101,7 +101,7 @@ regression test, merge, rebuild, relaunch, and rerun from the failing step.
   once on a fresh deploy and not again after a second one; the cause is not
   known (Python in the sandbox verified the proxy chain with the same bundle).
 - **A node with a live heartbeat is not reinstalled at app launch.** After a
-  deploy use the task panel's "Sync now" dropdown, "Reinstall and restart", to
+  deploy use the task panel's runner menu, Reset environment, to
   put the new supervisor on it; check with `tod-sandbox exec <sandbox> --
   python3 -c ...` on `/var/lib/tod-supervisor/<node>/tod.db` (`user_version`).
 - **The live-verify root's `orchestrator-github.json`** lists the GitHub tokens

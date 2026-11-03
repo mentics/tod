@@ -24,9 +24,11 @@ the conversation's own change set.
 
 The work a node needs (a shell, an editor, an agent, git) can run on this
 machine, in a git worktree, in a running dev container, or in a cloud
-sandbox. A node whose files are in a cloud sandbox can be **run in the
-cloud**, where a supervisor process takes it through the lifecycle with the
-app closed.
+sandbox. A node whose files are in a cloud sandbox is started on a supervisor
+process in that sandbox, which takes it through the lifecycle with the app
+closed; any other node runs under `tod-agentd`, which also survives the app.
+The task panel's runner menu starts, pauses and resumes either, and
+**Migrate to…** moves a node between places.
 
 ## The concepts
 
@@ -241,7 +243,7 @@ launch takes, so the rest of the code does not branch on where it runs.
 | This machine, a worktree | here | here | loopback TCP |
 | Dev container, repository inside | `docker exec` | `docker exec` | a bash shim relaying over TCP to the app's listener |
 | Dev container, repository mounted | here | `docker exec` | the same relay |
-| Cloud sandbox | `tod-sandbox exec` through the relay | `tod-sandbox agent` bridged to the relay | the relay's tunnel back to this machine, or the orchestrator when run in the cloud |
+| Cloud sandbox | `tod-sandbox exec` through the relay | `tod-sandbox agent` bridged to the relay | the relay's tunnel back to this machine, or the orchestrator when it runs under a supervisor |
 
 Nothing starts or builds a container; tod only uses a running one. A
 sandbox is awake only while it has work, and every hold on it expires or is
