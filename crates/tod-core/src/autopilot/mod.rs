@@ -33,7 +33,7 @@ mod state;
 #[cfg(test)]
 mod tests;
 
-pub use state::{AutopilotState, CurrentStep, FRESH_SESSION_REQUEST_FILE, StepRecord, state_path};
+pub use state::{AutopilotState, CYCLE_LIMIT, CurrentStep, FRESH_SESSION_REQUEST_FILE, LoopCounters, StepRecord, state_path};
 
 use crate::conversation::driver::{
     AgentAccess, ConversationConfig, ConversationDriver, ConversationEvent, ConversationStatus,
@@ -186,6 +186,10 @@ pub enum NeedsHuman {
     AgentFailed { error: String },
     /// A step ran and changed nothing its successor decides from.
     NoProgress { step: String },
+    /// The same problem came back [`CYCLE_LIMIT`] times in the same state:
+    /// the work went around in a circle (verification fails it, a fix
+    /// follows, verification fails it again) without getting anywhere.
+    Looping { what: String, times: u32 },
 }
 
 impl NeedsHuman {
@@ -250,8 +254,29 @@ impl NeedsHuman {
                  Look at what the agent did, change the plan or the instructions, then run it again",
                 step_in_words(step)
             ),
+            Self::Looping { what, times } => format!(
+                "the same problem has come back {times} times and the agent is going in circles: {what}. \
+                 Look at it yourself, or change the plan or the instructions, then run it again"
+            ),
         }
     }
+}
+
+/// Counts each of `failing` (its id and the words that name it) as having
+/// come back in `state`, and stops once one has [`CYCLE_LIMIT`] times. What
+/// is no longer failing is forgotten, so a different problem each time is
+/// progress and never stops the run.
+fn cycle_stop(loops: &mut LoopCounters, state: &str, failing: &[(String, String)]) -> Option<NeedsHuman> {
+    let ids: Vec<String> = failing.iter().map(|(id, _)| id.clone()).collect();
+    loops.keep_only(state, &ids);
+    let mut worst: Option<(&str, u32)> = None;
+    for (id, what) in failing {
+        let times = loops.note(state, id);
+        if times >= CYCLE_LIMIT && worst.is_none_or(|(_, t)| times > t) {
+            worst = Some((what.as_str(), times));
+        }
+    }
+    worst.map(|(what, times)| NeedsHuman::Looping { what: what.trim().to_string(), times })
 }
 
 /// A step's recorded name ([`step_name`], or a protocol's) in words for the user.
@@ -379,6 +404,7 @@ impl Autopilot {
         // Rounds on the pull request count from here: the user has seen why
         // it stopped and wants it to go on.
         self.state.pr_turns_base = None;
+        self.state.loops.clear();
         self.save()
     }
 
@@ -490,6 +516,18 @@ impl Autopilot {
                 NextStep::Phase => self.phase(fleet, agent, hook, &lifecycle)?,
                 NextStep::Evaluate => self.evaluate(fleet, agent, hook, &lifecycle)?,
                 NextStep::FixFailed => {
+                    let failing = fleet.read(|conn| {
+                        Ok(tod_store::verification::VerdictRepo::new(conn)
+                            .standings(self.node)?
+                            .into_iter()
+                            .filter(|s| s.is_failed() && (s.phase == tod_store::outline::repos::plan_steps::PHASE_ACTIVE || s.due_by(&lifecycle)))
+                            .map(|s| (s.obligation.id.to_string(), s.obligation.body))
+                            .collect::<Vec<_>>())
+                    })?;
+                    if let Some(reason) = cycle_stop(&mut self.state.loops, &lifecycle, &failing) {
+                        return self.finish(Outcome::NeedsHuman { reason });
+                    }
+                    self.state.loops.fix_cycles += 1;
                     // Back to `active`; the next round implements the fix.
                     lifecycle::revert(fleet, self.node)?;
                     self.record(fleet, step_name(step), &lifecycle, None)?;
@@ -608,7 +646,23 @@ impl Autopilot {
             return Ok(Some(outcome));
         }
         let node = self.node;
-        let standing = fleet.read(|conn| PhaseStanding::load(conn, node, state))?;
+        let (standing, rejections) = fleet.read(|conn| {
+            Ok((
+                PhaseStanding::load(conn, node, state)?,
+                PhaseRepo::new(conn).rejections_in_stay(node, state)?.len() as u32,
+            ))
+        })?;
+        self.state.loops.evaluator_rejections = rejections;
+        if !standing.stuck && !standing.fixes.is_empty() {
+            // Rejected again with the same asks, though the work changed in
+            // between (the same-digest guard below does not see that).
+            let what = standing.fixes.join("; ");
+            if let Some(reason) =
+                cycle_stop(&mut self.state.loops, state, &[(what.clone(), what)])
+            {
+                return Ok(Some(Outcome::NeedsHuman { reason }));
+            }
+        }
         if standing.stuck {
             return Ok(Some(Outcome::NeedsHuman {
                 reason: NeedsHuman::EvaluationStuck {
@@ -792,6 +846,7 @@ impl Autopilot {
                     let base = *self.state.pr_turns_base.get_or_insert(turns);
                     // The first turn opens the pull request: it is not a round.
                     let rounds = turns.saturating_sub(base);
+                    self.state.loops.pr_rounds = rounds;
                     if let Some(why) = crate::conversation::pr::pr_stuck(&live, &settings, rounds) {
                         return Ok(Some(Outcome::NeedsHuman { reason: NeedsHuman::PrStuck { why } }));
                     }

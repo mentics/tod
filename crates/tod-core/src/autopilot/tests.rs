@@ -1605,3 +1605,49 @@ fn a_wait_an_agent_wrote_with_spaces_is_cleared_like_the_colon_form() {
     autopilot(&fx, Budget::default()).clear_poll_waits(&fx.fleet).unwrap();
     assert_eq!(pending_specs(&fx), ["slack:thread:1"]);
 }
+
+fn failing(ids: &[&str]) -> Vec<(String, String)> {
+    ids.iter().map(|id| (id.to_string(), format!("obligation {id}"))).collect()
+}
+
+#[test]
+fn a_verify_fix_verify_ping_pong_stops_at_the_limit() {
+    let mut loops = LoopCounters::default();
+    for _ in 1..CYCLE_LIMIT {
+        assert_eq!(cycle_stop(&mut loops, "verifying", &failing(&["a"])), None);
+    }
+    assert_eq!(
+        cycle_stop(&mut loops, "verifying", &failing(&["a"])),
+        Some(NeedsHuman::Looping { what: "obligation a".into(), times: CYCLE_LIMIT })
+    );
+}
+
+#[test]
+fn a_run_that_makes_progress_never_hits_the_cycle_limit() {
+    let mut loops = LoopCounters::default();
+    // A different obligation fails each time, and a fixed one stays fixed.
+    for ids in [&["a"][..], &["a", "b"], &["b"], &["c"], &["c", "d"], &["d"]] {
+        assert_eq!(cycle_stop(&mut loops, "verifying", &failing(ids)), None, "{ids:?}");
+    }
+    // Another state's count does not mix in.
+    let mut loops = LoopCounters::default();
+    for state in ["verifying", "review", "verifying", "review"] {
+        assert_eq!(cycle_stop(&mut loops, state, &failing(&["a"])), None);
+    }
+}
+
+#[test]
+fn looping_is_stated_in_plain_words_and_is_on_you_as_stopped() {
+    let reason = NeedsHuman::Looping { what: "it must keep the cache warm".into(), times: 3 };
+    assert_eq!(
+        reason.describe(),
+        "the same problem has come back 3 times and the agent is going in circles: it must keep the cache warm. \
+         Look at it yourself, or change the plan or the instructions, then run it again"
+    );
+    assert!(!reason.is_request());
+    let outcome = Outcome::NeedsHuman { reason: reason.clone() };
+    assert_eq!(
+        crate::next_actor::outcome_reason(&outcome),
+        Some(crate::next_actor::YouReason::Stopped { reason: reason.describe() })
+    );
+}

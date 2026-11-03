@@ -5,6 +5,7 @@
 use super::Outcome;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use uuid::Uuid;
@@ -55,6 +56,58 @@ pub struct AutopilotState {
     /// starts ([`super::Autopilot::new`]).
     #[serde(default)]
     pub fresh_session: bool,
+    /// The run's loop counters, where the app reads them to show them.
+    #[serde(default)]
+    pub loops: LoopCounters,
+}
+
+/// How many times the same problem may come back in the same state before
+/// the run stops and asks the user ([`LoopCounters::note`]).
+pub const CYCLE_LIMIT: u32 = 3;
+
+/// Everything that counts a loop the run is in. Sessions
+/// ([`AutopilotState::sessions`]) and the pull request's start
+/// ([`AutopilotState::pr_turns_base`]) stay beside it; this holds the rest,
+/// so one place says how far each loop has gone.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoopCounters {
+    /// Rounds of work on the pull request since they began to count.
+    #[serde(default)]
+    pub pr_rounds: u32,
+    /// Evaluator rejections in the current stay in the state being judged.
+    #[serde(default)]
+    pub evaluator_rejections: u32,
+    /// Times a failed verification sent the node back to be fixed.
+    #[serde(default)]
+    pub fix_cycles: u32,
+    /// How often each problem has come back, keyed `<state>|<what>`
+    /// (a failing obligation, or what an evaluator asked for).
+    #[serde(default)]
+    pub cycles: BTreeMap<String, u32>,
+}
+
+impl LoopCounters {
+    /// `what` failed again in `state`: its count so far, this time included.
+    pub fn note(&mut self, state: &str, what: &str) -> u32 {
+        let count = self.cycles.entry(format!("{state}|{what}")).or_insert(0);
+        *count += 1;
+        *count
+    }
+
+    /// Forgets what `state` had counted that is not in `still`: those
+    /// problems are gone, so a different one failing next is progress.
+    pub fn keep_only(&mut self, state: &str, still: &[String]) {
+        let prefix = format!("{state}|");
+        self.cycles.retain(|key, _| {
+            key.strip_prefix(&prefix)
+                .is_none_or(|what| still.iter().any(|s| s == what))
+        });
+    }
+
+    /// Starts counting again: the user has seen why the run stopped.
+    pub fn clear(&mut self) {
+        *self = Self::default();
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -90,6 +143,7 @@ impl AutopilotState {
             outcome: None,
             pr_turns_base: None,
             fresh_session: false,
+            loops: LoopCounters::default(),
         }
     }
 
@@ -162,6 +216,27 @@ mod tests {
         AutopilotState::request_fresh_session(&dir, node).unwrap();
         assert!(AutopilotState::load(&dir, node).unwrap().fresh_session);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_problem_that_comes_back_counts_and_a_fixed_one_is_forgotten() {
+        let mut loops = LoopCounters::default();
+        assert_eq!(loops.note("verifying", "a"), 1);
+        assert_eq!(loops.note("verifying", "a"), 2);
+        assert_eq!(loops.note("verifying", "b"), 1);
+        loops.keep_only("verifying", &["b".to_string()]);
+        assert_eq!(loops.note("verifying", "a"), 1);
+        assert_eq!(loops.note("verifying", "b"), 2);
+        // Other states' counts are left alone.
+        loops.note("review", "x");
+        loops.keep_only("verifying", &[]);
+        assert_eq!(loops.cycles.len(), 1);
+        // Saved states from before the counters load.
+        let old: AutopilotState = serde_json::from_str(
+            r#"{"started_at_ms":1,"sessions":2,"current":null,"steps":[],"outcome":null}"#,
+        )
+        .unwrap();
+        assert_eq!(old.loops, LoopCounters::default());
     }
 
     #[test]
