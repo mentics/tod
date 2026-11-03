@@ -38,6 +38,14 @@ The two states, as they were split:
   so responding to reviewers can use a skill of its own. Its gate,
   `pr_review → approved`, is the one `pr` had (the criteria below, which keep
   their `pr-approved.*` slugs so existing waivers still apply).
+- Skill groups (`;` in a phase's skills, see `.claude/CLAUDE.md`, "Lifecycle
+  config") work as in every phase: on entry the PR agent's session and then each
+  later group run in order, once per stay, and the run then looks at the pull
+  request. `pr_draft` always takes its entry turn; `pr_review` only when it has
+  skills. Work on the pull request (a code review's threads, CI) sends the
+  run round again from the agent's session and through every group; with no
+  work the run waits for the person (woken by the webhook, else by polling) and
+  nothing runs again on a restart in the same stay.
 - `approved` is unchanged: it waits for the merge.
 
 Below, "the `pr` state" means `pr_review` unless it is about opening the PR.

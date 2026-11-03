@@ -599,6 +599,7 @@ fn a_restart_reopens_the_conversation_in_progress() {
         protocol: "implementation".into(),
         lifecycle: "active".into(),
         conversation_id: id,
+        skill_group: 0,
     });
     state.save(&fx.root, fx.node).unwrap();
 
@@ -635,6 +636,7 @@ fn a_requested_fresh_session_starts_a_new_conversation_instead_of_reopening() {
         protocol: "implementation".into(),
         lifecycle: "active".into(),
         conversation_id: id,
+        skill_group: 0,
     });
     state.save(&fx.root, fx.node).unwrap();
     AutopilotState::request_fresh_session(&fx.root, fx.node).unwrap();
@@ -662,7 +664,7 @@ fn a_local_runner_consumes_request_rows_and_starts_a_new_session_for_one() {
     driver.send(&fx.fleet, &mut agent, "Implement the plan.").unwrap();
     let id = driver.conversation_id().unwrap();
     let mut state = AutopilotState::fresh();
-    state.current = Some(CurrentStep { protocol: "implementation".into(), lifecycle: "active".into(), conversation_id: id });
+    state.current = Some(CurrentStep { protocol: "implementation".into(), lifecycle: "active".into(), conversation_id: id, skill_group: 0 });
     state.save(&fx.root, fx.node).unwrap();
     for kind in [tod_store::node_requests::KIND_FRESH_SESSION, tod_store::node_requests::KIND_CHECK_NOW] {
         fx.fleet
@@ -1089,6 +1091,231 @@ fn pr_certifies_the_draft_in_every_stay_even_when_the_pull_request_exists() {
     let steps: Vec<_> = again.state().steps.iter().map(|s| format!("{} {}->{}", s.step, s.from, s.to)).collect();
     assert!(steps.iter().any(|s| s == "pr pr->pr"), "{outcome:?} {steps:#?}");
     assert!(steps.iter().any(|s| s == "advance pr->pr_draft"), "{outcome:?} {steps:#?}");
+}
+
+/// Configure `phase`'s skills on the fixture's node from the text a user enters.
+fn set_phase_skills(fx: &Fixture, phase: &str, text: &str) {
+    let list = tod_store::lifecycle_config::parse_list(text).unwrap();
+    fx.fleet
+        .enqueue_outline(OutlineMutation::EnableCapabilities {
+            node_id: fx.node,
+            capabilities: vec![Capability::LifecycleConfig],
+        })
+        .unwrap();
+    fx.fleet.writer().flush().unwrap();
+    fx.fleet
+        .enqueue_outline(OutlineMutation::SetNodeLifecycleConfig {
+            node_id: fx.node,
+            skills: [(phase.to_string(), list)].into(),
+        })
+        .unwrap();
+    fx.fleet.writer().flush().unwrap();
+}
+
+/// What the conversations of `kind` on the fixture's node were given, by skill
+/// group: the group and the opening context its first turn sent.
+fn openings(fx: &Fixture, kind: ProtocolKind) -> Vec<(usize, String)> {
+    fx.fleet
+        .read(|conn| {
+            let repo = ConversationRepo::new(conn);
+            let mut found = Vec::new();
+            for summary in repo.list_for_focus(Focus::Node(fx.node))? {
+                let conversation = summary.conversation;
+                if conversation.protocol == kind {
+                    found.push((
+                        repo.skill_group(conversation.id)?,
+                        repo.opening_context(conversation.id)?.unwrap_or_default(),
+                    ));
+                }
+            }
+            found.sort_by_key(|(group, _)| *group);
+            Ok(found)
+        })
+        .unwrap()
+}
+
+#[test]
+fn a_later_group_of_skills_runs_in_a_session_of_its_own_with_only_its_skills() {
+    let fx = setup();
+    retire_outside_criteria(&fx);
+    // `simplify` for the implementing agent's own session, `code-review` apart.
+    set_phase_skills(&fx, "implement", "simplify; code-review");
+    let mut agent = FakeAgent::new(&fx.fleet);
+    let mut pilot = autopilot(&fx, Budget::default());
+    let outcome = pilot.run(&fx.fleet, &mut agent).unwrap();
+    assert_eq!(outcome, Outcome::Done);
+    let steps: Vec<_> = pilot.state().steps.iter().map(|s| s.step.clone()).collect();
+    assert!(steps.iter().any(|s| s == "implementation (skills group 2)"), "{steps:?}");
+
+    let sessions = openings(&fx, ProtocolKind::Implementation);
+    assert_eq!(sessions.iter().map(|(g, _)| *g).collect::<Vec<_>>(), [0, 1], "{sessions:#?}");
+    assert!(sessions[0].1.contains("simplify") && !sessions[0].1.contains("code-review"));
+    assert!(sessions[1].1.contains("code-review") && !sessions[1].1.contains("simplify"));
+}
+
+#[test]
+fn a_group_the_run_stopped_before_is_run_before_the_evaluator_not_skipped() {
+    // The phase agent records `ready` and the run stops (here: its session
+    // budget) before the later group has run. Coming back, the next thing is
+    // that group, not the evaluation the standing would otherwise ask for.
+    let fx = setup();
+    retire_outside_criteria(&fx);
+    set_phase_skills(&fx, "proposed", "simplify; code-review");
+    let mut agent = FakeAgent::new(&fx.fleet);
+    let mut pilot = autopilot(&fx, Budget { max_sessions: 1, ..Budget::default() });
+    assert!(matches!(pilot.run(&fx.fleet, &mut agent).unwrap(), Outcome::BudgetExhausted { .. }));
+    let owed = pilot.state().pending_groups.clone().expect("the later group is still owed");
+    assert_eq!((owed.phase_key.as_str(), owed.next), ("proposed", 1));
+    let steps = |pilot: &Autopilot| pilot.state().steps.iter().map(|s| s.step.clone()).collect::<Vec<_>>();
+    assert_eq!(steps(&pilot), ["phase"]);
+
+    // A new run (reading the saved state) does the group, then the evaluator.
+    let mut again = autopilot(&fx, Budget::default());
+    assert_eq!(again.run(&fx.fleet, &mut agent).unwrap(), Outcome::Done);
+    let steps = steps(&again);
+    let at = |name: &str| steps.iter().position(|s| s == name).unwrap_or_else(|| panic!("{name}: {steps:?}"));
+    assert!(at("phase (skills group 2)") < at("evaluate"), "{steps:?}");
+    assert!(again.state().pending_groups.is_none());
+}
+
+#[test]
+fn a_phase_with_later_groups_is_evaluated_even_with_independent_evaluation_off() {
+    let fx = setup();
+    retire_outside_criteria(&fx);
+    std::fs::write(fx.root.join("tod.yml"), "lifecycle:\n  independent_evaluation: false\n").unwrap();
+    set_phase_skills(&fx, "proposed", "simplify; code-review");
+    let mut agent = FakeAgent::new(&fx.fleet);
+    let mut pilot = autopilot(&fx, Budget::default());
+    assert_eq!(pilot.run(&fx.fleet, &mut agent).unwrap(), Outcome::Done);
+    let steps: Vec<String> = pilot.state().steps.iter().map(|s| s.step.clone()).collect();
+    let at = |name: &str| steps.iter().position(|s| s == name).unwrap_or_else(|| panic!("{name}: {steps:?}"));
+    // Group 0 only recorded the phase `ready`: the evaluator, last, certified it.
+    assert!(at("phase") < at("phase (skills group 2)") && at("phase (skills group 2)") < at("evaluate"), "{steps:?}");
+    // The evaluator judges the result, not how the work was done: no skills.
+    let evaluations = openings(&fx, ProtocolKind::Evaluate);
+    assert!(!evaluations.is_empty());
+    assert!(evaluations.iter().all(|(_, o)| !o.contains("simplify") && !o.contains("code-review")), "{evaluations:#?}");
+}
+
+#[test]
+fn a_leading_semicolon_keeps_every_skill_out_of_the_phase_agents_session() {
+    let fx = setup();
+    retire_outside_criteria(&fx);
+    set_phase_skills(&fx, "implement", "; code-review");
+    let mut agent = FakeAgent::new(&fx.fleet);
+    let mut pilot = autopilot(&fx, Budget::default());
+    assert_eq!(pilot.run(&fx.fleet, &mut agent).unwrap(), Outcome::Done);
+    let sessions = openings(&fx, ProtocolKind::Implementation);
+    assert_eq!(sessions.iter().map(|(g, _)| *g).collect::<Vec<_>>(), [0, 1], "{sessions:#?}");
+    assert!(!sessions[0].1.contains("code-review"));
+    assert!(sessions[1].1.contains("code-review"));
+}
+
+#[test]
+fn pr_draft_runs_the_review_group_when_the_pull_request_reads_clean() {
+    // `fix CI, feedback; code review`: the first group's session works the
+    // pull request, and once it is clean the second group reviews it in a
+    // session of its own. What the review posts is work the next round gives
+    // the first group again; this feed never has any, so the run ends there.
+    let fx = setup();
+    retire_outside_criteria(&fx);
+    struct Clean;
+    impl crate::pr_readiness::PrFeed for Clean {
+        fn snapshot(&self, _: &tod_store::github::NodePr) -> Result<tod_store::github::PrSnapshot, String> {
+            use tod_store::github::{PrSnapshot, PrStatus};
+            Ok(PrSnapshot {
+                status: PrStatus {
+                    mergeable: Some(true),
+                    mergeable_state: Some("blocked".into()),
+                    behind_by: Some(0),
+                    checks: Some("success".into()),
+                    head_sha: Some("abcdef1".into()),
+                    head_committed_at: Some("2020-01-01T00:00:00Z".into()),
+                    draft: true,
+                    open: true,
+                    ..Default::default()
+                },
+                threads: vec![],
+                comments: vec![],
+                reviews: vec![],
+            })
+        }
+    }
+    crate::pr_readiness::set_feed_override(Some(Arc::new(Clean)));
+    set_phase_skills(&fx, "pr_draft", "simplify; code-review");
+    linked_to_prs(&fx, "pr_draft", &["https://github.com/acme/app/pull/42"]);
+    let mut agent = FakeAgent::new(&fx.fleet);
+    let mut pilot = autopilot(&fx, Budget::default()).with_pr_poll_interval(Duration::ZERO);
+    let outcome = pilot.run(&fx.fleet, &mut agent).unwrap();
+    assert_eq!(agent.turns, 2, "{outcome:?}");
+    let sessions = openings(&fx, ProtocolKind::Pr);
+    assert_eq!(sessions.iter().map(|(g, _)| *g).collect::<Vec<_>>(), [0, 1], "{sessions:#?}");
+    assert!(sessions[0].1.contains("simplify") && !sessions[0].1.contains("code-review"));
+    assert!(sessions[1].1.contains("code-review") && !sessions[1].1.contains("simplify"));
+
+    // A restart in the same stay is not a new phase: nothing runs again.
+    let mut again = autopilot(&fx, Budget::default()).with_pr_poll_interval(Duration::ZERO);
+    again.run(&fx.fleet, &mut agent).unwrap();
+    assert_eq!(agent.turns, 2);
+}
+
+/// A pull request that is open, ready, and waits on a person's review.
+struct AwaitingReview;
+
+impl crate::pr_readiness::PrFeed for AwaitingReview {
+    fn snapshot(&self, _: &tod_store::github::NodePr) -> Result<tod_store::github::PrSnapshot, String> {
+        use tod_store::github::{PrSnapshot, PrStatus};
+        Ok(PrSnapshot {
+            status: PrStatus {
+                mergeable: Some(true),
+                mergeable_state: Some("blocked".into()),
+                behind_by: Some(0),
+                checks: Some("success".into()),
+                head_sha: Some("abcdef1".into()),
+                head_committed_at: Some("2020-01-01T00:00:00Z".into()),
+                draft: false,
+                open: true,
+                ..Default::default()
+            },
+            threads: vec![],
+            comments: vec![],
+            reviews: vec![],
+        })
+    }
+}
+
+#[test]
+fn pr_review_with_skills_runs_every_group_on_entry_then_waits_for_the_person() {
+    // Entering `pr_review` runs the agent's session and each later group of the
+    // phase's skills, in order, once; then the run waits for the human review
+    // (and is woken by it). A restart in the same stay runs nothing again.
+    let fx = setup();
+    retire_outside_criteria(&fx);
+    crate::pr_readiness::set_feed_override(Some(Arc::new(AwaitingReview)));
+    set_phase_skills(&fx, "pr_review", "simplify; code-review");
+    linked_to_prs(&fx, "pr_review", &["https://github.com/acme/app/pull/42"]);
+    let mut agent = FakeAgent::new(&fx.fleet);
+    let outcome = autopilot(&fx, Budget::default()).with_pr_poll_interval(Duration::ZERO).run(&fx.fleet, &mut agent).unwrap();
+    assert!(matches!(outcome, Outcome::Waiting { .. }), "{outcome:?}");
+    assert_eq!(agent.turns, 2);
+    let sessions = openings(&fx, ProtocolKind::Pr);
+    assert_eq!(sessions.iter().map(|(g, _)| *g).collect::<Vec<_>>(), [0, 1], "{sessions:#?}");
+
+    let again = autopilot(&fx, Budget::default()).with_pr_poll_interval(Duration::ZERO).run(&fx.fleet, &mut agent).unwrap();
+    assert!(matches!(again, Outcome::Waiting { .. }), "{again:?}");
+    assert_eq!(agent.turns, 2, "a restart is not a new phase");
+}
+
+#[test]
+fn pr_review_without_skills_takes_no_entry_turn() {
+    let fx = setup();
+    retire_outside_criteria(&fx);
+    crate::pr_readiness::set_feed_override(Some(Arc::new(AwaitingReview)));
+    linked_to_prs(&fx, "pr_review", &["https://github.com/acme/app/pull/42"]);
+    let mut agent = FakeAgent::new(&fx.fleet);
+    let outcome = autopilot(&fx, Budget::default()).with_pr_poll_interval(Duration::ZERO).run(&fx.fleet, &mut agent).unwrap();
+    assert!(matches!(outcome, Outcome::Waiting { .. }), "{outcome:?}");
+    assert_eq!(agent.turns, 0);
 }
 
 #[test]

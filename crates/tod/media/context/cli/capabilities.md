@@ -34,6 +34,12 @@ phase's list (`--skills ''` means none, even where an ancestor sets some);
 `--clear` removes the phase from this node so the nearest ancestor's applies
 again. Other phases are untouched.
 
+`--skills` takes names separated by commas. A semicolon starts a new group:
+the first group is worked in the phase agent's own session and every later one
+in a session of its own, run in order each time the phase runs (`a, b; c` is two
+groups). A leading semicolon (`; c`) leaves the phase agent's own session with no
+skills. An empty group (a trailing `;`, or two in a row) is refused.
+
 `groups --lifecycle true` shows the node's children grouped by lifecycle state.
 Every child then needs the Lifecycle capability: those without it move down to
 the first place that accepts them (the next sibling of the node, and so on up).

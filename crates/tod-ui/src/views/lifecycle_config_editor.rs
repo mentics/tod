@@ -4,7 +4,7 @@
 //!
 //! Each phase is a row showing what applies to this node and where it comes
 //! from. Editing a phase is a form with one input (skill names, comma
-//! separated) and an explicit Save; "Use inherited" removes the phase from this
+//! separated; a semicolon starts a group that runs in its own session) and an explicit Save; "Use inherited" removes the phase from this
 //! node so the nearest ancestor's applies again, and saving an empty list turns
 //! the phase's skills off. Names are free text and are not checked: a skill may
 //! be set up after the config.
@@ -164,9 +164,9 @@ impl LifecycleConfigEditor {
     }
 
     fn open_form(&mut self, phase: &'static str, window: &mut Window, cx: &mut Context<Self>) {
-        let current = self.own.get(phase).map(|s| s.join(", ")).unwrap_or_default();
+        let current = self.own.get(phase).map(|s| lifecycle_config::format_list(s)).unwrap_or_default();
         let skills = cx.new(|cx| {
-            let mut state = InputState::new(window, cx).placeholder("skill names, comma-separated (empty: none)");
+            let mut state = InputState::new(window, cx).placeholder("skills: a, b; c runs c in its own session (empty: none)");
             state.set_value(current, window, cx);
             state
         });
@@ -240,15 +240,15 @@ impl LifecycleConfigEditor {
     fn save(&mut self, cx: &mut Context<Self>) {
         let Some(form) = &self.form else { return };
         let phase = form.phase;
-        let names: Vec<String> = form
-            .skills
-            .read(cx)
-            .text()
-            .to_string()
-            .split(',')
-            .map(|n| n.trim().to_string())
-            .filter(|n| !n.is_empty())
-            .collect();
+        let text = form.skills.read(cx).text().to_string();
+        let names = match lifecycle_config::parse_list(&text) {
+            Ok(names) => names,
+            Err(e) => {
+                self.error = Some(e.to_string());
+                cx.notify();
+                return;
+            }
+        };
         self.write(move |skills| drop(skills.insert(phase.to_string(), names)), cx);
     }
 
@@ -269,7 +269,7 @@ impl LifecycleConfigEditor {
         let summary = match resolved {
             None => "no skills".to_string(),
             Some(r) if r.skills.is_empty() => "none (turned off)".to_string(),
-            Some(r) => r.skills.join(", "),
+            Some(r) => lifecycle_config::format_list(&r.skills),
         };
         let source = resolved.as_ref().filter(|r| r.inherited).map(|r| {
             format!(

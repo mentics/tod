@@ -168,6 +168,8 @@ pub struct ConversationDriver {
     progress_before: Option<String>,
     /// `None` until the first send creates the row.
     conversation_id: Option<Uuid>,
+    /// The group of the phase's skills the row is created for.
+    skill_group: usize,
     run: Option<Run>,
     /// Estimated tokens in the current agent session; `None` until known.
     session_tokens: Option<i64>,
@@ -202,6 +204,7 @@ impl ConversationDriver {
             continuations: 0,
             progress_before: None,
             conversation_id: None,
+            skill_group: 0,
             run: None,
             session_tokens: None,
             reported_stale: ReportedStale::new(),
@@ -215,6 +218,13 @@ impl ConversationDriver {
             notices: Vec::new(),
             lease: None,
         }
+    }
+
+    /// Work with skill group `group` of the phase (`lifecycle_config::groups`)
+    /// instead of the phase agent's own: a session of its own for that group.
+    pub fn with_skill_group(mut self, group: usize) -> Self {
+        self.skill_group = group;
+        self
     }
 
     /// Take the lease for the turn that just started. A failure to record it
@@ -250,6 +260,7 @@ impl ConversationDriver {
             .with_context(|| format!("conversation {conversation_id} not found"))?;
         let mut driver = Self::new(config, conversation.focus, conversation.protocol);
         driver.conversation_id = Some(conversation_id);
+        driver.skill_group = conversation.skill_group;
         Ok(driver)
     }
 
@@ -969,6 +980,15 @@ impl ConversationDriver {
                 },
             )?;
         }
+        if self.skill_group > 0 {
+            fleet.interview(
+                ACTOR_USER,
+                InterviewCommand::SetConversationSkillGroup {
+                    conversation_id: id,
+                    group: self.skill_group,
+                },
+            )?;
+        }
         self.conversation_id = Some(id);
         Ok(id)
     }
@@ -1270,11 +1290,13 @@ impl ConversationDriver {
     /// The agent-side session name: surface, focus title, start time.
     fn session_title(&self, fleet: &FleetStore) -> Result<String> {
         let focus = fleet.read(|conn| focus_selection(conn, self.focus))?;
-        Ok(session_name(
-            Some(self.protocol.surface()),
-            &focus.title,
-            chrono::Local::now(),
-        ))
+        // A later group of the phase's skills is a session of its own, told
+        // apart in the agent's session picker too.
+        let surface = match self.skill_group {
+            0 => self.protocol.surface().to_string(),
+            group => format!("{} skills {}", self.protocol.surface(), group + 1),
+        };
+        Ok(session_name(Some(&surface), &focus.title, chrono::Local::now()))
     }
 
     /// The session's size when this driver did not see it grow: the opening

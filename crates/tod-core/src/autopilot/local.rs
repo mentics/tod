@@ -342,11 +342,27 @@ fn push_branch(fleet: &FleetStore, node: Uuid) {
     }
 }
 
+impl<F: FnMut(LocalEvent)> Hook<'_, F> {
+    /// Say in the node's run state what this runner is doing now.
+    fn say(&mut self, what: &str) {
+        if let Err(err) = crate::run_state::record(&self.fleet, self.node, crate::run_state::working(what), WRITER) {
+            self.state_error = Some(format!("{err:#}"));
+        }
+    }
+}
+
 impl<F: FnMut(LocalEvent)> StepHook for Hook<'_, F> {
+    fn working_on(&mut self, what: &str) {
+        self.say(what);
+    }
+
     fn at(&mut self, fleet: &FleetStore, boundary: Boundary) -> Result<Option<String>> {
         if boundary == Boundary::Step {
             push_branch(fleet, self.node);
             if !self.waiting {
+                // A group of skills run in its own session said so at the last
+                // step; the next one is the run at large again.
+                self.say("running on this machine");
                 self.report(Live::default());
                 self.hold();
             }

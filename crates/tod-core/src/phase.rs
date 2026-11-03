@@ -45,6 +45,23 @@ pub fn independent_evaluation(data_root: &Path) -> bool {
         .unwrap_or(true)
 }
 
+/// Whether `state` of `node` is judged by an independent session: the setting
+/// above, or the state has later groups of skills (`;` in its lifecycle
+/// config). A later group runs after the phase agent's work and may find what
+/// the agent's certificate would then be wrong about, so the phase agent only
+/// records the phase `ready` and the evaluator, last, certifies it.
+pub fn evaluation_is_independent(
+    conn: &rusqlite::Connection,
+    data_root: &Path,
+    node: uuid::Uuid,
+    state: &str,
+) -> anyhow::Result<bool> {
+    if independent_evaluation(data_root) {
+        return Ok(true);
+    }
+    Ok(has_phase_agent(state) && crate::skills_context::extra_groups(conn, node, state)? > 0)
+}
+
 /// One criterion of a gate, as checked now.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CriterionCheck {
