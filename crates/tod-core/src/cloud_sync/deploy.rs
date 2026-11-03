@@ -174,6 +174,41 @@ mod tests {
         format!("http://{addr}")
     }
 
+    /// Like the Blaxel edge in front of the orchestrator: 401 unless the
+    /// request carries `Authorization: Bearer <token>`.
+    fn serve_behind_auth(token: &'static str, body: &'static str) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let mut stream = stream;
+                let mut buf = [0u8; 4096];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..n]).to_ascii_lowercase();
+                let reply = if request.contains(&format!("authorization: bearer {token}")) {
+                    format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len())
+                } else {
+                    let denied = "Authentication required";
+                    format!("HTTP/1.1 401 Unauthorized\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{denied}", denied.len())
+                };
+                let _ = stream.write_all(reply.as_bytes());
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    #[test]
+    fn health_is_asked_with_the_blaxel_token_the_orchestrators_edge_requires() {
+        let mine = crate::cloud_sync::my_contract();
+        let body: &'static str = Box::leak(serde_json::to_string(&mine).unwrap().into_boxed_str());
+        let base = serve_behind_auth("tok", body);
+        let with = super::super::HttpOrchestrator::new(base.clone(), Some("tok".into()));
+        assert_eq!(with.health().unwrap(), mine);
+        let without = super::super::HttpOrchestrator::new(base, None);
+        assert!(format!("{:#}", without.health().unwrap_err()).contains("401"));
+    }
+
     #[test]
     fn a_compatible_orchestrator_is_left_alone() {
         let mine = crate::cloud_sync::my_contract();

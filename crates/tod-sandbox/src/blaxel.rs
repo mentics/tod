@@ -377,7 +377,10 @@ impl Blaxel {
     /// The sandbox's whole record as Blaxel returns it (for live checks of
     /// its `spec.network.proxy`; may hold rule values: never print it as is).
     pub fn get_json(&self, name: &str) -> Result<Option<Value>> {
-        let mut resp = self.auth(self.agent.get(&format!("{API}/sandboxes/{name}"))).call().context("Blaxel API")?;
+        let mut resp = self
+            .auth(self.agent.get(&format!("{API}/sandboxes/{name}")))
+            .call()
+            .with_context(|| format!("Blaxel API: GET {API}/sandboxes/{name}"))?;
         if resp.status().as_u16() == 404 {
             return Ok(None);
         }

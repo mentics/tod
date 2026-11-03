@@ -78,6 +78,16 @@ pub(crate) fn system_roots() -> Result<ureq::tls::TlsConfig> {
         let why = loaded.errors.iter().map(|e| e.to_string()).collect::<Vec<_>>().join("; ");
         anyhow::bail!("this host has no system CA certificates to check HTTPS servers against ({why}); install ca-certificates");
     }
+    // Said once per process, so a failing chain can be told from an empty store.
+    static SAID: std::sync::Once = std::sync::Once::new();
+    SAID.call_once(|| {
+        eprintln!(
+            "tod-orchestrator: trusting {} system CA certificates (SSL_CERT_FILE={}, SSL_CERT_DIR={})",
+            loaded.certs.len(),
+            std::env::var("SSL_CERT_FILE").unwrap_or_default(),
+            std::env::var("SSL_CERT_DIR").unwrap_or_default()
+        );
+    });
     let roots: Vec<ureq::tls::Certificate<'static>> =
         loaded.certs.iter().map(|der| ureq::tls::Certificate::from_der(der.as_ref()).to_owned()).collect();
     Ok(ureq::tls::TlsConfig::builder().root_certs(ureq::tls::RootCerts::from(roots)).build())

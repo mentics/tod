@@ -520,7 +520,7 @@ impl HttpOrchestrator {
     /// `GET /health`: the orchestrator's `{wire, schema, build}`; an
     /// orchestrator from before the contract reads as wire 0.
     pub fn health(&self) -> Result<tod_store::sync::contract::Contract> {
-        let mut resp = Self::with_gateway_retry("health", || self.agent.get(&format!("{}/health", self.base)).call())?;
+        let mut resp = Self::with_gateway_retry("health", || self.auth(self.agent.get(&format!("{}/health", self.base))).call())?;
         let status = resp.status();
         let body = resp.body_mut().read_to_string().unwrap_or_default();
         if !status.is_success() {
