@@ -362,3 +362,73 @@ fn a_learn_output_the_receiver_made_itself_is_replaced_by_the_senders() {
     let _ = std::fs::remove_dir_all(&a.root);
     let _ = std::fs::remove_dir_all(&b.root);
 }
+
+/// Swapping two obligations' ordinals on one side must not cost the other
+/// side the plan-step links of either: the receiver evicts the row holding an
+/// ordinal the incoming change needs, and deleting it cascades to its links.
+#[test]
+fn swapping_obligation_ordinals_keeps_plan_step_links() {
+    let (mut a, mut b) = pair();
+    let list_id = a.fleet.list_outline_lists().unwrap()[0].id;
+    let node = Uuid::new_v4();
+    a.apply(OutlineMutation::CreateNode {
+        node_id: Some(node),
+        list_id,
+        parent_id: None,
+        anchor_id: None,
+        position: CreatePosition::Below,
+        title: "n".into(),
+    });
+    a.apply(OutlineMutation::EnableCapabilities {
+        node_id: node,
+        capabilities: vec![Capability::Spec],
+    });
+    for body in ["first", "second"] {
+        a.apply(OutlineMutation::CreateObligation {
+            obligation_id: None,
+            node_id: node,
+            kind: KIND_REQUIREMENT.into(),
+            after_id: None,
+            before: false,
+            section: None,
+            body: body.into(),
+            phase: "requirements".into(),
+        });
+    }
+    let step = Uuid::new_v4();
+    a.apply(OutlineMutation::CreatePlanStep {
+        step_id: Some(step),
+        node_id: node,
+        after_id: None,
+        before: false,
+        body: "step".into(),
+    });
+    let obligations = a.ids("SELECT id FROM node_obligations ORDER BY ordinal");
+    for id in &obligations {
+        a.apply(OutlineMutation::LinkPlanStepObligation {
+            step_id: step,
+            obligation_id: *id,
+        });
+    }
+    sync(&mut a, &mut b);
+    let links = |side: &Side| side.ids("SELECT obligation_id FROM node_plan_step_obligations ORDER BY 1");
+    assert_eq!(links(&b).len(), 2);
+
+    // The swap, through a spare ordinal as the unique index requires.
+    let conn = a.conn();
+    let (x, y) = (obligations[0].as_bytes().to_vec(), obligations[1].as_bytes().to_vec());
+    let ordinal = |id: &Vec<u8>| -> i64 {
+        conn.query_row("SELECT ordinal FROM node_obligations WHERE id = ?1", [id], |r| r.get(0))
+            .unwrap()
+    };
+    let (ox, oy) = (ordinal(&x), ordinal(&y));
+    for (id, to) in [(&x, 99), (&y, ox), (&x, oy)] {
+        conn.execute("UPDATE node_obligations SET ordinal = ?1 WHERE id = ?2", rusqlite::params![to, id])
+            .unwrap();
+    }
+    drop(conn);
+    sync(&mut a, &mut b);
+
+    assert_eq!(links(&a).len(), 2, "the sender kept its links");
+    assert_eq!(links(&b).len(), 2, "the receiver lost links to evicted obligations");
+}

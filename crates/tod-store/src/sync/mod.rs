@@ -517,7 +517,10 @@ fn apply_changes_with(conn: &mut Connection, changes: &[Change], origin: Option<
     }
     let mut report = ApplyReport::default();
     let mut infos: HashMap<String, TableInfo> = HashMap::new();
-    for change in changes {
+    // Rows moved off a unique value to make room, which a later change in
+    // this batch sets for good ([`evict_unique_holders`]).
+    let mut parked: Vec<(String, Row)> = Vec::new();
+    for (at, change) in changes.iter().enumerate() {
         if !SYNCED_TABLES.contains(&change.table.as_str()) {
             bail!("refusing to apply a change to unsynced table {}", change.table);
         }
@@ -529,7 +532,8 @@ fn apply_changes_with(conn: &mut Connection, changes: &[Change], origin: Option<
         }
         let info = &infos[&change.table];
         let found = current_row(&tx, &change.table, info, &change.key)?;
-        if !same_content(&found, &change.before) && !same_content(&found, &change.after) {
+        let was_parked = parked.iter().any(|(t, k)| *t == change.table && *k == change.key);
+        if !was_parked && !same_content(&found, &change.before) && !same_content(&found, &change.after) {
             report.conflicts.push(Conflict {
                 node_id: change.node_id,
                 table: change.table.clone(),
@@ -548,7 +552,7 @@ fn apply_changes_with(conn: &mut Connection, changes: &[Change], origin: Option<
                 tx.execute(&format!("DELETE FROM {qt} WHERE {clause}"), params_from_iter(key_values))?;
             }
             Some(row) => {
-                evict_unique_holders(&tx, change, info, row, &mut report)?;
+                evict_unique_holders(&tx, change, &changes[at + 1..], info, row, &mut parked, &mut report)?;
                 let cols: Vec<(&String, &SqlValue)> = row
                     .iter()
                     .filter(|(c, _)| info.columns.contains(c))
@@ -593,11 +597,20 @@ fn apply_changes_with(conn: &mut Connection, changes: &[Change], origin: Option<
 /// row holding a value `row` needs under a (non-partial) unique index is
 /// deleted and reported as a conflict, with its contents in
 /// [`Conflict::found`] so it can be put back.
+///
+/// Not when a later change in the same batch rewrites that holder (obligations
+/// whose ordinals were swapped or shifted on the sender, each change taking
+/// the value another still holds): it is moved to a value below every other
+/// one instead, and its own change then sets it. Deleting it would cascade to
+/// what hangs on it (an obligation's plan-step links), and re-inserting it
+/// afterwards would not bring those back.
 fn evict_unique_holders(
     tx: &Connection,
     change: &Change,
+    later: &[Change],
     info: &TableInfo,
     row: &Row,
+    parked: &mut Vec<(String, Row)>,
     report: &mut ApplyReport,
 ) -> Result<()> {
     let qt = quote(&change.table);
@@ -647,13 +660,27 @@ fn evict_unique_holders(
         for (key_json, row_json) in holders {
             let key = decode_row(&key_json)?;
             let (kc, kv) = key_clause(&key)?;
+            let held = decode_row(&row_json)?;
+            let rewritten_later = later
+                .iter()
+                .any(|c| c.table == change.table && c.key == key && c.after.is_some());
+            let movable = cols.iter().find(|c| matches!(held.get(*c), Some(SqlValue::Integer(_))));
+            if let (true, Some(col)) = (rewritten_later, movable) {
+                let qc = quote(col);
+                tx.execute(
+                    &format!("UPDATE {qt} SET {qc} = (SELECT MIN({qc}) - 1 FROM {qt}) WHERE {kc}"),
+                    params_from_iter(kv),
+                )?;
+                parked.push((change.table.clone(), key));
+                continue;
+            }
             tx.execute(&format!("DELETE FROM {qt} WHERE {kc}"), params_from_iter(kv))?;
             report.conflicts.push(Conflict {
                 node_id: change.node_id,
                 table: change.table.clone(),
                 key,
                 expected: None,
-                found: Some(decode_row(&row_json)?),
+                found: Some(held),
             });
         }
     }
