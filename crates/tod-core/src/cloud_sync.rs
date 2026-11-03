@@ -1344,7 +1344,10 @@ pub fn ensure_node_sandbox(
             std::thread::sleep(Duration::from_secs(2));
         }
     }
-    if existing.as_ref().is_none_or(sandbox_is_dead) {
+    // Only a sandbox made now is an empty checkout. One that was already up
+    // holds the node's own work, which a checkpoint must not be applied over.
+    let made_now = existing.as_ref().is_none_or(sandbox_is_dead);
+    if made_now {
         match &source {
             NodeSandboxSource::Fork(golden) => {
                 progress(&format!("forking {name} from {golden}…"));
@@ -1423,14 +1426,17 @@ pub fn ensure_node_sandbox(
     // is out of date ([`refresh`]).
     refresh::record(root, node_id, &refresh::install_stamp()?)?;
     // Work checkpointed before an earlier sandbox of this node went away
-    // comes back as uncommitted edits.
-    let checkout = sandbox_checkout(&bx, &name)?;
-    let notes = tod_store::fleet::node_checkpoint::restore_into(&checkout, node_id);
-    for restored in &notes.restored {
-        progress(restored.as_str());
-    }
-    for failure in &notes.failures {
-        progress(&format!("warning: {failure}"));
+    // comes back as uncommitted edits. A sandbox that was already up (a
+    // refresh, a node that is running) has that work in it already.
+    if made_now {
+        let checkout = sandbox_checkout(&bx, &name)?;
+        let notes = tod_store::fleet::node_checkpoint::restore_into(&checkout, node_id);
+        for restored in &notes.restored {
+            progress(restored.as_str());
+        }
+        for failure in &notes.failures {
+            progress(&format!("warning: {failure}"));
+        }
     }
     Ok(name)
 }
