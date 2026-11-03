@@ -226,11 +226,14 @@ fn a_wake_runs_the_node_and_its_work_reaches_the_orchestrator() {
     assert!(matches!(woke, Woke::Ran(_)), "{woke:?}");
     sampling.store(false, std::sync::atomic::Ordering::Relaxed);
     let beats = sampler.join().unwrap();
-    assert!(!beats.is_empty(), "the orchestrator never saw the supervisor say it was working");
-    assert!(beats.iter().all(|b| b.is_live(b.heartbeat_at) && b.what == "active"), "{beats:?}");
-    // And it ended: a finished run must not look like a live one.
+    let working: Vec<_> = beats.iter().filter(|b| !b.is_idle()).collect();
+    assert!(!working.is_empty(), "the orchestrator never saw the supervisor say it was working: {beats:?}");
+    assert!(working.iter().all(|b| b.is_live(b.heartbeat_at) && b.what == "active"), "{beats:?}");
+    // And it ended: a finished run must not look like a live one. The row is
+    // kept, as idle, so a wake between two syncs is still heard.
     let conn = rusqlite::Connection::open(&remote_db).unwrap();
-    assert_eq!(tod_store::cloud_activity::get(&conn, node).unwrap(), None, "the heartbeat outlived the run");
+    let last = tod_store::cloud_activity::get(&conn, node).unwrap().expect("the run left no activity row");
+    assert!(last.is_idle() && !last.is_live(last.heartbeat_at), "the heartbeat outlived the run: {last:?}");
     drop(conn);
 
     // The supervisor's own writes (the implementation conversation, its
