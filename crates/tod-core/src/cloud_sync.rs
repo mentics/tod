@@ -1798,6 +1798,21 @@ fn node_sandbox_source(
     }
 }
 
+/// The workspace, this data root's client id and the repository (`owner/name`)
+/// a node being recorded belongs to.
+fn ownership_of(fleet: &FleetStore, node_id: &str) -> Result<tod_store::cloud_nodes::Ownership> {
+    let root = fleet.paths().root();
+    let workspace = tod_store::fleet::sandbox::Sandboxes::load(root)?.account()?.workspace.clone();
+    let (_, repo_url, _) = node_source(fleet, node_id)?;
+    let repo = tod_store::cloud_nodes::normalize_repo(&repo_url)
+        .ok_or_else(|| anyhow!("cannot read an owner and repository name from {repo_url}"))?;
+    Ok(tod_store::cloud_nodes::Ownership {
+        workspace: Some(workspace),
+        owner_client: Some(client_id(root)?),
+        repo: Some(repo),
+    })
+}
+
 /// Records that `node_id` runs in `sandbox` (clearing any lost mark) in the
 /// database, which is synced: the orchestrator needs to know the node is
 /// active (`tod_core::impact`), and its supervisor reads its context mark
@@ -1824,6 +1839,10 @@ fn record_cloud_node(fleet: &FleetStore, node_id: &str, sandbox: String, user: &
         user: record.user.clone(),
         accepted_at: record.accepted_at_ms,
     })?;
+    // Whose it is (robustness plan 3.10): the orchestrator routes the
+    // broker, webhooks, and the seed by it. A failure to say is an error,
+    // not a row left unknown.
+    fleet.enqueue(FleetMutation::CloudNodeSetOwnership { node: node_uuid, ownership: ownership_of(fleet, node_id)? })?;
     fleet.writer().flush()?;
     let _ = fleet.reload_if_stale();
     provisioning::clear_intent(root, node_id)?;

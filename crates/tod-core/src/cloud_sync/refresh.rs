@@ -281,6 +281,7 @@ mod tests {
             accepted_at: 0,
             context_changed_at: None,
             lost_at: lost.then_some(1),
+            ownership: Default::default(),
         }
     }
 

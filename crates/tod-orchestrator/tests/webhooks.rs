@@ -232,3 +232,89 @@ fn a_node_with_linked_pull_requests_hears_only_its_own_repository_and_releases()
     drop(fleet);
     let _ = std::fs::remove_dir_all(&base);
 }
+
+/// Records `repo` as the node's repository, as the app does when it sends it
+/// to the cloud (robustness plan 3.10).
+fn record_repo(conn: &rusqlite::Connection, node: Uuid, repo: &str) {
+    tod_store::cloud_nodes::set_ownership(
+        conn,
+        node,
+        &tod_store::cloud_nodes::Ownership {
+            workspace: Some("w".into()),
+            owner_client: Some("app-1".into()),
+            repo: Some(repo.into()),
+        },
+    )
+    .unwrap();
+}
+
+#[test]
+fn a_branch_name_in_another_repository_is_ignored() {
+    let base: PathBuf = std::env::temp_dir().join(format!("tod-orch-webhooks-owned-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&base).unwrap();
+    let app = base.join("app");
+    let fleet = FleetStore::open(&app).unwrap();
+    fleet.enqueue_outline(OutlineMutation::CreateList { slug: "t".into(), title: "T".into() }).unwrap();
+    fleet.writer().flush().unwrap();
+    let list_id = fleet.list_outline_lists().unwrap()[0].id;
+    let a = node(&fleet, list_id, "In acme/a");
+    let b = node(&fleet, list_id, "In acme/b");
+    let old = node(&fleet, list_id, "Recorded by an older client");
+    {
+        let conn = rusqlite::Connection::open(app.join("tod.db")).unwrap();
+        for (n, sandbox) in [(a, "node-a"), (b, "node-b"), (old, "node-old")] {
+            tod_store::cloud_nodes::upsert(&conn, n, sandbox, "alice", 1).unwrap();
+            conn.execute(
+                "INSERT INTO node_fields (node_id, branch, updated_at) VALUES (?1, 'task/fix', 1)",
+                rusqlite::params![uuid_to_blob(n)],
+            )
+            .unwrap();
+        }
+        record_repo(&conn, a, "acme/a");
+        record_repo(&conn, b, "acme/b");
+        // `old` records nothing: unknown.
+    }
+    let _ = fleet.reload_if_stale();
+    let poked = Arc::new(Mutex::new(Vec::new()));
+    let orch = base.join("orchestrator");
+    let server = Server::with_sink(
+        Config { base: orch.clone(), tod_cli: "unused".into(), tod_cli_prefix: Vec::new() },
+        Box::new(FakePoker(poked.clone())),
+        Box::new(NoSink),
+    )
+    .unwrap();
+    let snap = base.join("snap.db");
+    tod_store::sync::snapshot(&app.join("tod.db"), &snap).unwrap();
+    let seeded = server.handle(&Request {
+        method: "POST".into(),
+        path: "/users/alice/seed".into(),
+        query: String::new(),
+        headers: Vec::new(),
+        body: std::fs::read(&snap).unwrap(),
+    });
+    assert_eq!(seeded.status, 200, "{}", String::from_utf8_lossy(&seeded.body));
+    let secret = Secrets::load(&orch).unwrap().github;
+
+    let checks = |repo: &str| {
+        serde_json::json!({"action":"completed","repository":{"full_name":repo},
+            "check_suite":{"head_branch":"task/fix","conclusion":"success","pull_requests":[]}})
+    };
+    // acme/a's event reaches its node, and the unknown one (nothing wider than
+    // before for it), never acme/b's.
+    let resp = server.handle(&delivery(Some(&secret), "check_suite", &checks("Acme/A")));
+    assert_eq!(resp.status, 200, "{}", String::from_utf8_lossy(&resp.body));
+    let mut got = poked.lock().unwrap().clone();
+    got.sort();
+    assert_eq!(got, ["node-a", "node-old"]);
+
+    // A repository no node records reaches only the unknown one.
+    poked.lock().unwrap().clear();
+    server.handle(&delivery(Some(&secret), "check_suite", &checks("other/repo")));
+    assert_eq!(*poked.lock().unwrap(), ["node-old"]);
+
+    let remote = orch.join("users").join("alice").join("tod.db");
+    assert!(events(&remote, b).is_empty(), "acme/b's node heard nothing");
+
+    drop(fleet);
+    let _ = std::fs::remove_dir_all(&base);
+}

@@ -570,6 +570,7 @@ mod tests {
             accepted_at: 1,
             context_changed_at: None,
             lost_at,
+            ownership: Default::default(),
         }
     }
 

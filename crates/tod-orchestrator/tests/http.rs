@@ -364,3 +364,57 @@ fn another_client_may_seed_only_by_taking_over() {
     assert_eq!(send(h.port, "POST", "/users/fay/seed", &[("X-Tod-Client", "app-1")], &snap).0, 409);
     assert!(h.base.join("users/fay/orchestrator-seed-client").is_file());
 }
+
+/// A database with one cloud node recorded as owned by `owner`.
+fn snapshot_with_node(h: &Harness, name: &str, node: uuid::Uuid, owner: &str) -> Vec<u8> {
+    use tod_store::outline::{CreatePosition, OutlineMutation};
+    let app = h.base.join(format!("app-{name}"));
+    let fleet = tod_store::fleet::FleetStore::open(&app).unwrap();
+    fleet.enqueue_outline(OutlineMutation::CreateList { slug: "t".into(), title: "T".into() }).unwrap();
+    fleet.writer().flush().unwrap();
+    let list_id = fleet.list_outline_lists().unwrap()[0].id;
+    fleet
+        .enqueue_outline(OutlineMutation::CreateNode {
+            node_id: Some(node),
+            list_id,
+            parent_id: None,
+            anchor_id: None,
+            position: CreatePosition::Below,
+            title: "n".into(),
+        })
+        .unwrap();
+    fleet.writer().flush().unwrap();
+    drop(fleet);
+    let conn = rusqlite::Connection::open(app.join("tod.db")).unwrap();
+    tod_store::cloud_nodes::upsert(&conn, node, "node-x", "fay", 1).unwrap();
+    tod_store::cloud_nodes::set_ownership(
+        &conn,
+        node,
+        &tod_store::cloud_nodes::Ownership { workspace: Some("w".into()), owner_client: Some(owner.into()), repo: Some("a/b".into()) },
+    )
+    .unwrap();
+    drop(conn);
+    let snap = h.base.join(format!("snap-{name}.db"));
+    tod_store::sync::snapshot(&app.join("tod.db"), &snap).unwrap();
+    std::fs::read(&snap).unwrap()
+}
+
+#[test]
+fn a_second_data_root_cannot_take_over_a_database_holding_the_first_ones_nodes() {
+    let h = start("seed-owned");
+    let node = uuid::Uuid::new_v4();
+    let first = snapshot_with_node(&h, "first", node, "app-1");
+    assert_eq!(send(h.port, "POST", "/users/fay/seed", &[("X-Tod-Client", "app-1")], &first).0, 200);
+    // app-2's own database does not hold the node: refused even with take-over.
+    let theirs = snapshot_bytes(&h, "second");
+    let takeover = [("X-Tod-Client", "app-2"), ("X-Tod-Take-Over", "yes")];
+    let (status, body) = send(h.port, "POST", "/users/fay/seed", &takeover, &theirs);
+    let text = String::from_utf8_lossy(&body);
+    assert_eq!(status, 409, "{text}");
+    assert!(text.contains("app-1") && text.contains("owned by another data root"), "{text}");
+    // The first root still seeds, and a copy that holds the node may be taken over.
+    let (status, body) = seed_retrying(&h, "fay", "app-1", &first);
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    let (status, body) = send(h.port, "POST", "/users/fay/seed", &takeover, &first);
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+}

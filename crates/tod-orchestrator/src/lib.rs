@@ -197,6 +197,22 @@ impl Server {
         response
     }
 
+    /// The machine (`X-Tod-Client`) the node named by the request's `X-Tod-Node`
+    /// is recorded as belonging to (`cloud_nodes.owner_client`), `None` when
+    /// the node is not a recorded cloud node or an older client recorded it
+    /// without an owner: those keep the broker's old behaviour.
+    fn recorded_owner(&self, user: &str, request: &Request) -> Result<Option<String>> {
+        let Some(node) = request
+            .header(tod_store::fleet::cli_relay::NODE_HEADER)
+            .and_then(|n| uuid::Uuid::parse_str(n).ok())
+        else {
+            return Ok(None);
+        };
+        let data = self.users.get(user)?;
+        let row = data.store.read(|conn| tod_store::cloud_nodes::get(conn, node))?;
+        Ok(row.and_then(|r| r.ownership.owner_client).filter(|o| !o.is_empty()))
+    }
+
     /// This orchestrator's version contract (`GET /health`).
     pub fn contract(&self) -> tod_store::sync::contract::Contract {
         tod_store::sync::contract::Contract::current(tod_core::CLI_BUILD_STAMP)
@@ -301,7 +317,10 @@ impl Server {
                             Err(err) => Response::text(500, format!("{err:#}")),
                         }
                     }
-                    ("POST", ["broker", "request"]) => self.broker.request(&user, request),
+                    ("POST", ["broker", "request"]) => match self.recorded_owner(&user, request) {
+                        Ok(owner) => self.broker.request_owned(&user, request, owner.as_deref()),
+                        Err(err) => Response::text(500, format!("{err:#}")),
+                    },
                     ("GET", ["broker", "next"]) => self.broker.next(&user, request),
                     ("POST", ["broker", "reply", id]) => self.broker.reply(&user, id, request),
                     ("GET", ["notify"]) => self.notify_topics(&user),

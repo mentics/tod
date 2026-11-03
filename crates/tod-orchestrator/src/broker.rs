@@ -44,6 +44,10 @@ struct Queued {
     offered: HashSet<String>,
     /// Machines that answered that the node is not theirs.
     declined: HashSet<String>,
+    /// The machine the node's `cloud_nodes` row records as its owner
+    /// (robustness plan 3.10). When set, only it is ever offered the request:
+    /// no broadcast, and no other machine's answer counts.
+    pinned: Option<String>,
 }
 
 #[derive(Default)]
@@ -71,6 +75,9 @@ impl State {
     /// The machine to offer `q` to alone: the node's known owner, while it is
     /// connected and has not declined this request. `None` means broadcast.
     fn owner_of(&self, user: &str, q: &Queued) -> Option<String> {
+        if let Some(pinned) = &q.pinned {
+            return Some(pinned.clone());
+        }
         let owner = self.owners.get(&(user.to_string(), q.node.clone()))?;
         let live = self.seen.get(user).and_then(|m| m.get(owner)).is_some_and(|at| at.elapsed() < CONNECTED_FOR);
         (live && !q.declined.contains(owner)).then(|| owner.clone())
@@ -80,6 +87,24 @@ impl State {
     /// node is not theirs.
     fn nobody_claimed(&self, user: &str, id: u64) -> Option<String> {
         let q = self.queued.get(user)?.iter().find(|q| q.id == id)?;
+        if let Some(pinned) = &q.pinned {
+            let live = self.seen.get(user).and_then(|m| m.get(pinned)).is_some_and(|at| at.elapsed() < CONNECTED_FOR);
+            return if q.declined.contains(pinned) {
+                Some(format!(
+                    "node {} is recorded as belonging to machine {pinned}, which says it does not know it: \
+                     the node's record is stale; run it in the cloud again from the data root it belongs to",
+                    q.node
+                ))
+            } else if !live {
+                Some(format!(
+                    "node {} belongs to machine {pinned} (the tod data root that sent it to the cloud), which is not connected: \
+                     it must be on, with tod running (the tod-agentd daemon), to answer this",
+                    q.node
+                ))
+            } else {
+                None
+            };
+        }
         let connected = self.connected(user);
         if connected.is_empty() || !connected.iter().all(|m| q.declined.contains(*m)) {
             return None;
@@ -110,8 +135,14 @@ fn machine(request: &Request) -> String {
 }
 
 impl Broker {
-    /// `POST /users/<u>/broker/request`.
+    /// `POST /users/<u>/broker/request`, for a node whose owner is not recorded.
     pub fn request(&self, user: &str, request: &Request) -> Response {
+        self.request_owned(user, request, None)
+    }
+
+    /// [`Self::request`], for a node whose `cloud_nodes` row records `owner`
+    /// (a machine's `X-Tod-Client`): the request goes to that machine alone.
+    pub fn request_owned(&self, user: &str, request: &Request, owner: Option<&str>) -> Response {
         let Some(node) = request.header(tod_store::fleet::cli_relay::NODE_HEADER).filter(|n| !n.is_empty()) else {
             return Response::text(400, "missing X-Tod-Node");
         };
@@ -120,7 +151,17 @@ impl Broker {
             Err(err) => return Response::text(400, format!("the request is not JSON: {err}")),
         };
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if state.connected(user).is_empty() {
+        if let Some(owner) = owner {
+            let live = state.seen.get(user).and_then(|m| m.get(owner)).is_some_and(|at| at.elapsed() < CONNECTED_FOR);
+            if !live {
+                return json(
+                    503,
+                    serde_json::json!({"ok": false, "error": format!(
+                        "node {node} belongs to machine {owner} (the tod data root that sent it to the cloud), which is not connected: \
+                         it must be on, with tod running (the tod-agentd daemon), to answer this")}),
+                );
+            }
+        } else if state.connected(user).is_empty() {
             return json(
                 503,
                 serde_json::json!({"ok": false, "error": "the user's machine is not connected: it must be on, with tod running (the tod-agentd daemon), to answer this"}),
@@ -138,6 +179,7 @@ impl Broker {
             request: body,
             offered: HashSet::new(),
             declined: HashSet::new(),
+            pinned: owner.map(str::to_string),
         });
         self.changed.notify_all();
         let deadline = Instant::now() + ANSWER_WITHIN;
@@ -217,7 +259,11 @@ impl Broker {
         let machine = machine(request);
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         state.seen.entry(user.to_string()).or_default().insert(machine.clone(), Instant::now());
-        let waiting = state.queued.get(user).is_some_and(|q| q.iter().any(|q| q.id == id));
+        // A request pinned to its recorded owner takes no other machine's word.
+        let waiting = state
+            .queued
+            .get(user)
+            .is_some_and(|q| q.iter().any(|q| q.id == id && q.pinned.as_ref().is_none_or(|p| *p == machine)));
         if waiting {
             if parsed["not_mine"].as_bool() == Some(true) {
                 let mut node = None;
@@ -310,6 +356,7 @@ mod tests {
             request: serde_json::json!({}),
             offered: HashSet::new(),
             declined: HashSet::new(),
+            pinned: None,
         });
         assert_eq!(broker.next("other", &req(None, "", "wait=0")).body, b"{}");
         assert_ne!(broker.next("u", &req(None, "", "wait=0")).body, b"{}");
@@ -404,6 +451,48 @@ mod tests {
         b.join().unwrap();
         assert_eq!(r.status, 200);
         assert_eq!(broker.state.lock().unwrap().owners.get(&("u".into(), "n1".into())).map(String::as_str), Some("b"));
+    }
+
+    #[test]
+    fn a_node_with_a_recorded_owner_goes_to_that_machine_alone() {
+        let broker = Arc::new(Broker::default());
+        for m in ["a", "b"] {
+            broker.next("u", &req_from(m, None, "", "wait=0"));
+        }
+        // "a" polls too, and is never offered the request pinned to "b".
+        let a_poll = {
+            let broker = broker.clone();
+            std::thread::spawn(move || broker.next("u", &req_from("a", None, "", "wait=1")).body)
+        };
+        let b = machine_replying(&broker, "b", r#"{"ok":true}"#);
+        let r = broker.request_owned("u", &req(Some("n1"), "{}", ""), Some("b"));
+        b.join().unwrap();
+        assert_eq!(r.status, 200);
+        assert_eq!(a_poll.join().unwrap(), b"{}", "a machine that is not the recorded owner was offered it");
+    }
+
+    #[test]
+    fn a_recorded_owner_that_is_not_connected_is_named_not_replaced() {
+        let broker = Broker::default();
+        broker.next("u", &req_from("a", None, "", "wait=0"));
+        let r = broker.request_owned("u", &req(Some("n1"), "{}", ""), Some("b"));
+        assert_eq!(r.status, 503);
+        let text = String::from_utf8_lossy(&r.body);
+        assert!(text.contains("belongs to machine b") && text.contains("not connected"), "{text}");
+    }
+
+    #[test]
+    fn a_recorded_owner_that_declines_ends_the_request_with_its_name() {
+        let broker = Arc::new(Broker::default());
+        for m in ["a", "b"] {
+            broker.next("u", &req_from(m, None, "", "wait=0"));
+        }
+        let b = machine_replying(&broker, "b", NOT_MINE);
+        let r = broker.request_owned("u", &req(Some("n1"), "{}", ""), Some("b"));
+        b.join().unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
+        assert_eq!(v["ok"], false);
+        assert!(v["error"].as_str().unwrap().contains("machine b"), "{v}");
     }
 
     #[test]

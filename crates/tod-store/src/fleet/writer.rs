@@ -196,6 +196,11 @@ pub enum FleetMutation {
         user: String,
         accepted_at: i64,
     },
+    /// Whose the cloud node is (`cloud_nodes::set_ownership`).
+    CloudNodeSetOwnership {
+        node: uuid::Uuid,
+        ownership: crate::cloud_nodes::Ownership,
+    },
     /// The node no longer runs in the cloud.
     CloudNodeRemove {
         node: uuid::Uuid,
@@ -294,6 +299,7 @@ impl FleetMutation {
                 | FleetMutation::UpdateInterviewSessionScaffolding { .. }
                 | FleetMutation::SetInterviewSessionStatus { .. }
                 | FleetMutation::CloudNodeUpsert { .. }
+                | FleetMutation::CloudNodeSetOwnership { .. }
                 | FleetMutation::CloudNodeRemove { .. }
                 | FleetMutation::CloudNodeMarkLost { .. }
                 | FleetMutation::ActivityStart { .. }
@@ -520,6 +526,9 @@ impl FleetMutation {
             }
             FleetMutation::CloudNodeUpsert { node, sandbox, user, accepted_at } => {
                 crate::cloud_nodes::upsert(conn, *node, sandbox, user, *accepted_at)?;
+            }
+            FleetMutation::CloudNodeSetOwnership { node, ownership } => {
+                crate::cloud_nodes::set_ownership(conn, *node, ownership)?;
             }
             FleetMutation::CloudNodeRemove { node } => {
                 crate::cloud_nodes::remove(conn, *node)?;

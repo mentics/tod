@@ -16,6 +16,10 @@
 //!   separated by `:` or spaces) matches a key when it is the key or a prefix
 //!   of it ending at a `:` ([`spec_matches`]): `github:pr 12 checks` matches
 //!   `github:pr:12:checks:success`.
+//! - **Ownership.** A node row that records its repository (`owner/name`,
+//!   `cloud_nodes.repo`) is never routed an event about another repository,
+//!   by branch or by wait ([`recorded_repo_matches`]). A row without one (an
+//!   older client's) keeps the checks below and nothing wider.
 //! - **Routing.** First by branch: the cloud nodes (`cloud_nodes`) whose Files
 //!   branch (`node_fields.branch`) is the event's, in the event's repository
 //!   when the node has linked pull requests ([`in_repository`]). Otherwise,
@@ -340,7 +344,7 @@ fn targets(conn: &Connection, event: &Event) -> Result<Vec<Target>> {
     let links = tod_store::github::NodePrRepo::new(conn).all()?;
     let mut nodes: Vec<Uuid> = Vec::new();
     for row in &cloud {
-        if !in_repository(links.get(&row.node_id), event) {
+        if !recorded_repo_matches(row.ownership.repo.as_deref(), event) || !in_repository(links.get(&row.node_id), event) {
             continue;
         }
         let branch: Option<String> = conn
@@ -358,6 +362,10 @@ fn targets(conn: &Connection, event: &Event) -> Result<Vec<Target>> {
         // By wait alone a PR number or a release names no repository, so a
         // node that has linked pull requests hears only what concerns them.
         for (_, node) in &waits {
+            let recorded = cloud.iter().find(|c| c.node_id == *node).and_then(|c| c.ownership.repo.as_deref());
+            if !recorded_repo_matches(recorded, event) {
+                continue;
+            }
             if !nodes.contains(node) && concerns(conn, *node, links.get(node), event) {
                 nodes.push(*node);
             }
@@ -371,6 +379,19 @@ fn targets(conn: &Connection, event: &Event) -> Result<Vec<Target>> {
             waits: waits.iter().filter(|(_, n)| *n == node).map(|(w, _)| *w).collect(),
         })
         .collect())
+}
+
+/// Whether the repository recorded on a node's `cloud_nodes` row
+/// (`owner/name`, lower case; robustness plan 3.10) is the one `event` is
+/// about. A node recorded by an older client has none recorded and an event
+/// may name none (Linear's): both are unknown, which leaves the other checks
+/// ([`in_repository`], [`concerns`]) to decide as they always did. Known
+/// and different never matches.
+fn recorded_repo_matches(recorded: Option<&str>, event: &Event) -> bool {
+    match (recorded, event.repo.as_deref()) {
+        (Some(recorded), Some(event_repo)) => recorded.eq_ignore_ascii_case(event_repo),
+        _ => true,
+    }
 }
 
 /// Whether a node whose branch is `event`'s is in the repository the event

@@ -129,6 +129,31 @@ fn seed_inner(users: &Users, user: &str, snapshot: &[u8], client: &str, take_ove
             return Ok(Response::text(400, format!("the seed is not a tod database: {err:#}")));
         }
     }
+    // Another data root's cloud nodes are not this seed's to drop, take-over
+    // or not (robustness plan 3.10, extending 2.9).
+    if is_seeded(&root) {
+        match foreign_nodes(users, user, &incoming, client) {
+            Ok(held) if held.is_empty() => {}
+            Ok(held) => {
+                let _ = std::fs::remove_file(&incoming);
+                return Ok(Response::text(
+                    409,
+                    format!(
+                        "this user's orchestrator database holds {} cloud node{} owned by another data root ({}) that this \
+                         seed from {client} does not contain; seeding would drop them. Use a different orchestrator user for \
+                         this data root (`owner` in sandboxes.toml), or remove those nodes from the data root that owns them first",
+                        held.len(),
+                        if held.len() == 1 { "" } else { "s" },
+                        held.iter().map(|(_, owner)| owner.as_str()).collect::<std::collections::BTreeSet<_>>().into_iter().collect::<Vec<_>>().join(", ")
+                    ),
+                ));
+            }
+            Err(err) => {
+                let _ = std::fs::remove_file(&incoming);
+                return Err(err.context("check who owns the cloud nodes the seed would replace"));
+            }
+        }
+    }
     // The store must be closed while its database is replaced.
     if !users.close_if_idle(user) {
         let _ = std::fs::remove_file(&incoming);
@@ -153,6 +178,39 @@ fn seed_inner(users: &Users, user: &str, snapshot: &[u8], client: &str, take_ove
     write_atomic(&root, SEED_CLIENT_FILE, client)?;
     write_atomic(&root, SEED_SEQ_FILE, &last.to_string())?;
     Ok(json(&serde_json::json!({ "last_seq": last, "seed_id": id })))
+}
+
+/// The cloud nodes (node id, owning client) the user's database records as
+/// owned by a client other than `client` and that the `incoming` snapshot
+/// does not hold: a seed from `client` would orphan them. A row with no
+/// recorded owner (an older client's) is nobody's and not counted.
+fn foreign_nodes(users: &Users, user: &str, incoming: &Path, client: &str) -> Result<Vec<(String, String)>> {
+    let current = users.get(user)?;
+    let rows = {
+        let _guard = current.sync_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = current.store.flush_on_quit();
+        tod_store::cloud_nodes::list(&connect(&current)?)?
+    };
+    let foreign: Vec<_> = rows
+        .into_iter()
+        .filter_map(|r| r.ownership.owner_client.filter(|o| !o.is_empty() && o != client).map(|o| (r.node_id, o)))
+        .collect();
+    if foreign.is_empty() {
+        return Ok(Vec::new());
+    }
+    let theirs = Connection::open_with_flags(incoming, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .context("open the incoming snapshot")?;
+    let has_table = theirs
+        .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'cloud_nodes'")?
+        .exists([])?;
+    let mut held = std::collections::HashSet::new();
+    if has_table {
+        let mut stmt = theirs.prepare("SELECT node_id FROM cloud_nodes")?;
+        for blob in stmt.query_map([], |r| r.get::<_, Vec<u8>>(0))? {
+            held.insert(tod_store::outline::uuid_blob::blob_to_uuid_sql(&blob?)?);
+        }
+    }
+    Ok(foreign.into_iter().filter(|(id, _)| !held.contains(id)).map(|(id, o)| (id.to_string(), o)).collect())
 }
 
 /// Logged, tagged with the sending `client`, so every other client gets

@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Current fleet schema epoch stored in `PRAGMA user_version`.
-pub const CURRENT_USER_VERSION: i32 = 88;
+pub const CURRENT_USER_VERSION: i32 = 89;
 
 const BUSY_TIMEOUT_MS: i64 = 5000;
 
@@ -595,6 +595,12 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
         crate::waits::add_stay(conn)?;
         conn.pragma_update(None, "user_version", 88)?;
     }
+    if version < 89 {
+        // Whose a cloud node is: workspace, owner client, repository
+        // (`crate::cloud_nodes::add_ownership`); the sync triggers are remade below.
+        crate::cloud_nodes::add_ownership(conn)?;
+        conn.pragma_update(None, "user_version", 89)?;
+    }
     // Other branches (the task panel) numbered their own steps 66–67 at the
     // same time as 66–70 above, so a store may be past a version without
     // having these. Every one is idempotent: make sure of them all.
@@ -611,6 +617,7 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
     conn.execute_batch(crate::node_events::CREATE_TABLE)?;
     conn.execute_batch(&crate::journey_changes::node_events_triggers_sql())?;
     crate::cloud_nodes::add_lost_at(conn)?;
+    crate::cloud_nodes::add_ownership(conn)?;
     crate::waits::add_detail(conn)?;
     crate::waits::add_retry(conn)?;
     crate::waits::add_stay(conn)?;

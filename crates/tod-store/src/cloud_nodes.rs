@@ -47,6 +47,52 @@ pub fn add_lost_at(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// The v89 migration: who the node belongs to (idempotent): the Blaxel
+/// `workspace`, the `owner_client` (the data root's sync client id) and the
+/// `repo` (`owner/name`, lower case). All NULL for a row an older client
+/// wrote: unknown, never matched as if it were known.
+pub fn add_ownership(conn: &Connection) -> Result<()> {
+    for column in ["workspace", "owner_client", "repo"] {
+        let has = conn
+            .prepare("SELECT 1 FROM pragma_table_info('cloud_nodes') WHERE name = ?1")?
+            .exists([column])?;
+        if !has {
+            conn.execute_batch(&format!("ALTER TABLE cloud_nodes ADD COLUMN {column} TEXT"))?;
+        }
+    }
+    Ok(())
+}
+
+/// Whose a cloud node is (`doc/cloud-sandboxes/robustness-plan.md`, 3.10).
+/// A field is `None` when the client that recorded the node did not say.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Ownership {
+    pub workspace: Option<String>,
+    pub owner_client: Option<String>,
+    /// `owner/name`, lower case ([`normalize_repo`]).
+    pub repo: Option<String>,
+}
+
+/// `owner/name` of a GitHub repository URL or slug, lower case, without a
+/// `.git` suffix. `None` when it names no owner and repository.
+pub fn normalize_repo(url_or_slug: &str) -> Option<String> {
+    let s = url_or_slug.trim().trim_end_matches('/');
+    let s = s.strip_suffix(".git").unwrap_or(s);
+    let path = match s.split_once("://") {
+        Some((_, rest)) => rest.split_once('/')?.1,
+        None => match s.split_once(':') {
+            Some((host, path)) if host.contains('@') => path,
+            _ => s,
+        },
+    };
+    let mut parts = path.split('/').filter(|p| !p.is_empty());
+    let (owner, name) = (parts.next()?, parts.next()?);
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(format!("{owner}/{name}").to_ascii_lowercase())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CloudNodeRow {
     pub node_id: Uuid,
@@ -56,6 +102,7 @@ pub struct CloudNodeRow {
     pub context_changed_at: Option<i64>,
     /// When the orchestrator found the sandbox gone (ms), until replaced.
     pub lost_at: Option<i64>,
+    pub ownership: Ownership,
 }
 
 fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CloudNodeRow> {
@@ -67,10 +114,11 @@ fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CloudNodeRow> {
         accepted_at: row.get(3)?,
         context_changed_at: row.get(4)?,
         lost_at: row.get(5)?,
+        ownership: Ownership { workspace: row.get(6)?, owner_client: row.get(7)?, repo: row.get(8)? },
     })
 }
 
-const COLUMNS: &str = "node_id, sandbox, user_name, accepted_at, context_changed_at, lost_at";
+const COLUMNS: &str = "node_id, sandbox, user_name, accepted_at, context_changed_at, lost_at, workspace, owner_client, repo";
 
 fn has_table(conn: &Connection) -> Result<bool> {
     Ok(conn
@@ -86,6 +134,18 @@ pub fn upsert(conn: &Connection, node: Uuid, sandbox: &str, user: &str, accepted
          ON CONFLICT(node_id) DO UPDATE SET sandbox = excluded.sandbox,
              user_name = excluded.user_name, accepted_at = excluded.accepted_at, lost_at = NULL",
         params![uuid_to_blob(node), sandbox, user, accepted_at],
+    )?;
+    Ok(())
+}
+
+/// Records whose `node` is. A field left `None` keeps what is there (a
+/// re-record that does not know must not erase what was known).
+pub fn set_ownership(conn: &Connection, node: Uuid, o: &Ownership) -> Result<()> {
+    conn.execute(
+        "UPDATE cloud_nodes SET workspace = COALESCE(?2, workspace),
+             owner_client = COALESCE(?3, owner_client), repo = COALESCE(?4, repo)
+         WHERE node_id = ?1",
+        params![uuid_to_blob(node), o.workspace, o.owner_client, o.repo],
     )?;
     Ok(())
 }
@@ -135,4 +195,24 @@ pub fn mark_lost(conn: &Connection, node: Uuid, at: i64) -> Result<()> {
 pub fn remove(conn: &Connection, node: Uuid) -> Result<()> {
     conn.execute("DELETE FROM cloud_nodes WHERE node_id = ?1", params![uuid_to_blob(node)])?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_repo;
+
+    #[test]
+    fn repositories_compare_by_owner_and_name() {
+        for url in [
+            "https://github.com/Acme/Widget.git",
+            "https://github.com/acme/widget/",
+            "git@github.com:acme/widget.git",
+            "ssh://git@github.com/acme/widget",
+            "acme/widget",
+        ] {
+            assert_eq!(normalize_repo(url).as_deref(), Some("acme/widget"), "{url}");
+        }
+        assert_eq!(normalize_repo("widget"), None);
+        assert_eq!(normalize_repo("https://github.com/acme/widget/tree/main"), None);
+    }
 }
