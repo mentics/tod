@@ -12,6 +12,12 @@ use std::time::Duration;
 use tod_store::fleet::cli_relay::{NODE_HEADER, USER_HEADER};
 use tod_store::sync::{CLIENT_HEADER, Change};
 
+/// The refusal for a 426: the orchestrator found this supervisor newer than
+/// itself. Named, not retried: only a redeploy of the orchestrator fixes it.
+pub fn older_orchestrator_message(body: &str) -> String {
+    format!("the orchestrator is older than this supervisor: redeploy it (`scripts/deploy.sh`, or the app does so at launch): {}", body.trim())
+}
+
 #[derive(Clone)]
 pub struct Orchestrator {
     /// E.g. `https://<orchestrator>.bl.run/port/8090`, no trailing `/`.
@@ -66,6 +72,18 @@ impl Orchestrator {
         format!("supervisor-{}", self.node)
     }
 
+    /// The identity and version-contract headers every request carries.
+    fn stamp<B>(&self, req: ureq::RequestBuilder<B>) -> ureq::RequestBuilder<B> {
+        let mut req = req
+            .header(USER_HEADER, &self.user)
+            .header(NODE_HEADER, &self.node)
+            .header(CLIENT_HEADER, &self.client());
+        for (name, value) in tod_core::cloud_sync::my_contract().headers() {
+            req = req.header(name, &value);
+        }
+        req
+    }
+
     fn url(&self, path: &str) -> String {
         format!("{}/users/{}{path}", self.base, self.user)
     }
@@ -77,27 +95,9 @@ impl Orchestrator {
         loop {
             attempt += 1;
             let result = match body {
-                Some(body) => self
-                    .agent
-                    .post(url)
-                    .header(USER_HEADER, &self.user)
-                    .header(NODE_HEADER, &self.node)
-                    .header(CLIENT_HEADER, &self.client())
-                    .send(body),
-                None if method == "GET" => self
-                    .agent
-                    .get(url)
-                    .header(USER_HEADER, &self.user)
-                    .header(NODE_HEADER, &self.node)
-                    .header(CLIENT_HEADER, &self.client())
-                    .call(),
-                None => self
-                    .agent
-                    .post(url)
-                    .header(USER_HEADER, &self.user)
-                    .header(NODE_HEADER, &self.node)
-                    .header(CLIENT_HEADER, &self.client())
-                    .send_empty(),
+                Some(body) => self.stamp(self.agent.post(url)).send(body),
+                None if method == "GET" => self.stamp(self.agent.get(url)).call(),
+                None => self.stamp(self.agent.post(url)).send_empty(),
             };
             let retry = match result {
                 Ok(mut resp) => {
@@ -107,6 +107,9 @@ impl Orchestrator {
                         .as_reader()
                         .read_to_end(&mut bytes)
                         .with_context(|| format!("read {method} {url}"))?;
+                    if status == 426 {
+                        bail!("{}", older_orchestrator_message(&String::from_utf8_lossy(&bytes)));
+                    }
                     if !(status >= 500 || status == 407 || status == 429) {
                         return Ok((status, bytes));
                     }
@@ -235,6 +238,48 @@ impl Orchestrator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpListener;
+
+    /// Serves one request with `status`/`body`; returns the base URL and the
+    /// request's lowercased header block.
+    fn stub(status: u16, body: &'static str) -> (String, std::thread::JoinHandle<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let h = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(sock.try_clone().unwrap());
+            let mut head = String::new();
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line.trim().is_empty() {
+                    break;
+                }
+                head.push_str(&line.to_lowercase());
+            }
+            write!(sock, "HTTP/1.1 {status} X\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).unwrap();
+            head
+        });
+        (base, h)
+    }
+
+    #[test]
+    fn requests_carry_the_version_contract() {
+        let (base, h) = stub(200, "{}");
+        Orchestrator::new(base, "u", "n").ok("GET", "/snapshot", None).unwrap();
+        let head = h.join().unwrap();
+        assert!(head.contains("x-tod-wire: "), "{head}");
+        assert!(head.contains("x-tod-schema: "), "{head}");
+    }
+
+    #[test]
+    fn a_426_is_a_named_error_not_a_retry() {
+        let (base, h) = stub(426, "this orchestrator is older");
+        let err = Orchestrator::new(base, "u", "n").ok("GET", "/snapshot", None).unwrap_err().to_string();
+        h.join().unwrap();
+        assert!(err.contains("orchestrator is older than this supervisor: redeploy it"), "{err}");
+    }
 
     #[test]
     fn base_url_drops_the_cli_route() {

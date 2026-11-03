@@ -135,18 +135,20 @@ impl Broker {
     fn ask(&self, request: &serde_json::Value) -> Result<serde_json::Value> {
         let mut last = None;
         for attempt in 0..4u64 {
-            let sent = self
-                .agent
-                .post(&self.url)
-                .header(USER_HEADER, &self.user)
-                .header(NODE_HEADER, &self.node)
-                .send_json(request);
+            let mut req = self.agent.post(&self.url).header(USER_HEADER, &self.user).header(NODE_HEADER, &self.node);
+            for (name, value) in tod_core::cloud_sync::my_contract().headers() {
+                req = req.header(name, &value);
+            }
+            let sent = req.send_json(request);
             match sent {
                 // The sandbox's proxy answers 407 for a moment after it starts.
                 Ok(resp) if resp.status().as_u16() == 407 => last = Some(anyhow!("the sandbox's proxy answered 407")),
                 Ok(mut resp) => {
                     let status = resp.status();
                     let body = resp.body_mut().read_to_string().unwrap_or_default();
+                    if status.as_u16() == 426 {
+                        bail!("the orchestrator is older than this tod-cli: redeploy it (`scripts/deploy.sh`, or the app does so at launch): {}", body.trim());
+                    }
                     let value: serde_json::Value = serde_json::from_str(&body)
                         .map_err(|_| anyhow!("the orchestrator answered {status}: {}", body.trim().chars().take(300).collect::<String>()))?;
                     if value["ok"].as_bool() == Some(true) {

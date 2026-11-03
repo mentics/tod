@@ -5,11 +5,22 @@
 # own those binaries and every workspace crate they depend on (normal and
 # build dependencies; dev-only ones never reach a binary). A change anywhere
 # else, such as the UI, cannot change what is deployed, so it is not hashed.
+#
+# $1 picks the artifact: `orchestrator` (tod-orchestrator and tod-watchdog),
+# `node` (what a node sandbox runs: tod-supervisor, tod-relay, tod-cli), or
+# `all` (the default, every sandbox binary).
 sandbox_crate_dirs() {
-    cargo metadata --format-version 1 --locked --offline 2>/dev/null | python3 -c '
+    local group="${1:-all}"
+    case "$group" in
+        orchestrator) group="tod-orchestrator tod-watchdog" ;;
+        node) group="tod-relay tod-supervisor tod-cli" ;;
+        all) group="tod-relay tod-supervisor tod-orchestrator tod-cli tod-watchdog" ;;
+        *) echo "sandbox_crate_dirs: unknown artifact '$group'" >&2; return 1 ;;
+    esac
+    cargo metadata --format-version 1 --locked --offline 2>/dev/null | BINS="$group" python3 -c '
 import json, os, sys
 m = json.load(sys.stdin)
-bins = {"tod-relay", "tod-supervisor", "tod-orchestrator", "tod-cli", "tod-watchdog"}
+bins = set(os.environ["BINS"].split())
 pkgs = {p["id"]: p for p in m["packages"]}
 members = set(m["workspace_members"])
 nodes = {n["id"]: n for n in m["resolve"]["nodes"]}
@@ -36,10 +47,13 @@ for i in sorted(seen):
 # above, the lockfile, cargo config, sandbox assets, and the build script),
 # tracked or not, minus deleted files. Hashes file contents, so touching a file
 # or switching branches back and forth does not rebuild.
+# $1 is the artifact, as for sandbox_crate_dirs; the shared files (lockfile,
+# cargo config, sandbox assets) count for every artifact.
 sandbox_source_hash() {
+    local group="${1:-all}"
     local paths=(Cargo.toml Cargo.lock .cargo assets/sandbox scripts/build-sandbox-binaries.sh)
     local dirs
-    dirs="$(sandbox_crate_dirs)" || return 1
+    dirs="$(sandbox_crate_dirs "$group")" || return 1
     [[ -n $dirs ]] || { echo "sandbox_source_hash: no crates found" >&2; return 1; }
     # Only what is compiled: a crate's src/, manifest and build script. Its
     # tests/, benches and docs cannot change a binary. (Whether a running
