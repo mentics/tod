@@ -58,7 +58,9 @@ pub fn spawn_ensure(root: PathBuf) {
     }
 }
 
-/// Whether a process probe (`echo up` / `echo down`) says the orchestrator's
+/// Whether a process probe (`echo up` / `echo down`; its pattern is written
+/// `orchestrato[r]` so the probe's own shell, whose command line holds the
+/// pattern, does not match it) says the orchestrator's
 /// process is not running. Anything else, an empty answer included, is not
 /// taken for "down": restarting a running server over a garbled probe would
 /// interrupt every sync.
@@ -117,7 +119,7 @@ pub fn ensure_orchestrator(root: &Path, progress: &mut dyn FnMut(&str)) -> Resul
                 // with a volume nothing is lost. If the process is there the
                 // fault is something else, and is reported as it is.
                 let probe = bx
-                    .run(&url, "pgrep -f 'tod-orchestrator --port' >/dev/null 2>&1 && echo up || echo down", 30)
+                    .run(&url, "pgrep -f 'tod-orchestrato[r] --port' >/dev/null 2>&1 && echo up || echo down", 30)
                     .context("check whether the orchestrator's process runs")?;
                 if !process_is_down(&probe.output()) {
                     return Err(err.context("the orchestrator's sandbox is up and its process runs, but /health fails"));

@@ -377,3 +377,15 @@ orchestrator` (starts it again), then each app reseeds on its next sync, which
 also re-sends its GitHub routes, and the orchestrator rebuilds its wakes from
 the pending waits it was reseeded with (`wake_rebuild`). Use
 `orchestrator_volume` so none of that is needed.
+
+## The app starts it again
+
+`tod_core::cloud_sync::deploy::ensure_orchestrator` runs in the daemon at start
+and, at most every ten minutes, after a failed sync. When the sandbox is up but
+`/health` does not answer, it asks the sandbox whether the process runs; if
+not (a reset container comes back without `/opt/tod-orchestrator`) it installs
+and starts it again, which with `orchestrator_volume` keeps the webhook secrets
+and wakes (the databases are seeded again by the apps). A sandbox that is
+`EXPIRED` is removed and made again the same way. Drilled live 2026-11-03:
+binary moved aside and process stopped; the daemon had it serving again within a
+minute. A process that runs but fails `/health` is reported, not restarted.
