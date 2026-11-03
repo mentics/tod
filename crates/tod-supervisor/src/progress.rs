@@ -22,6 +22,17 @@ use std::time::{Duration, Instant};
 /// The marker file's name in the state directory (`tod-relay` reads it too).
 pub const PROGRESS_FILE: &str = "progress";
 
+/// The file beside the marker holding the supervisor's agent hang limit in
+/// whole minutes (`tod-relay`'s `liveness` reads it to size its stall limit).
+pub const HANG_LIMIT_FILE: &str = "hang-limit-minutes";
+
+/// Records `hang_after` in `state_dir` for the relay. A failure is returned:
+/// the relay would otherwise judge by its default and could kill a healthy
+/// supervisor whose limit is longer.
+pub fn write_hang_limit(state_dir: &Path, hang_after: Duration) -> std::io::Result<()> {
+    std::fs::write(state_dir.join(HANG_LIMIT_FILE), hang_after.as_secs().div_ceil(60).to_string())
+}
+
 /// The least time between two writes of the file.
 const WRITE_EVERY: Duration = Duration::from_secs(1);
 
@@ -119,6 +130,15 @@ impl Progress {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_hang_limit_is_written_in_minutes() {
+        let dir = std::env::temp_dir().join(format!("tod-hang-limit-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        write_hang_limit(&dir, Duration::from_secs(45 * 60)).unwrap();
+        assert_eq!(std::fs::read_to_string(dir.join(HANG_LIMIT_FILE)).unwrap(), "45");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn fresh_until_the_limit_then_stale_until_marked_again() {

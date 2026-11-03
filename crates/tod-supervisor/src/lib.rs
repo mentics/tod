@@ -45,7 +45,7 @@ pub mod usage_limit;
 pub mod waits;
 
 use agent::{AgentKind, Syncing};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use hold::{HoldGuard, Holder};
 use replica::Replica;
 use std::path::PathBuf;
@@ -459,6 +459,9 @@ pub fn wake(config: Config) -> Result<Woke> {
         }
     };
     let progress = progress::Progress::new(progress::path(&config.state_dir));
+    // The relay sizes its stall limit from this (`tod-relay`'s `liveness`).
+    progress::write_hang_limit(&config.state_dir, config.guards.hang_after)
+        .context("recording the hang limit for the relay")?;
     // How long without a mark means wedged: a hung agent is cancelled by its
     // guard after `hang_after`, so this is that and the time a cancelled run
     // takes to reach a boundary.
