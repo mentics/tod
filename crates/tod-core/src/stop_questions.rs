@@ -10,6 +10,9 @@
 //!   ([`KEEP_GOING`] / [`LEAVE_STOPPED`]);
 //! - [`BUDGET`]: the autopilot spent its budget (same options; keep going
 //!   grants another budget of the same size);
+//! - [`CONFIG`]: the node's configuration cannot be used (a skill the
+//!   lifecycle config names is missing), which retrying cannot fix
+//!   ([`FIXED_TRY_AGAIN`] / [`LEAVE_STOPPED`]);
 //! - [`WATCHDOG`]: the watchdog let the node's sandbox sleep
 //!   ([`WAKE_AGAIN`] / [`LEAVE_ASLEEP`]).
 //!
@@ -30,15 +33,19 @@ use uuid::Uuid;
 pub const FAILURES: &str = "supervisor:failures";
 pub const BUDGET: &str = "supervisor:budget";
 pub const WATCHDOG: &str = "watchdog";
-pub const KINDS: [&str; 3] = [FAILURES, BUDGET, WATCHDOG];
+pub const CONFIG: &str = "supervisor:config";
+pub const KINDS: [&str; 4] = [FAILURES, BUDGET, WATCHDOG, CONFIG];
 
 pub const KEEP_GOING: &str = "Keep going";
 pub const LEAVE_STOPPED: &str = "Leave it stopped";
+pub const FIXED_TRY_AGAIN: &str = "Fixed, try again";
 pub const WAKE_AGAIN: &str = "Wake it again";
 pub const LEAVE_ASLEEP: &str = "Leave it asleep";
 
 /// The supervisor's options, in order.
 pub const SUPERVISOR_OPTIONS: [&str; 2] = [KEEP_GOING, LEAVE_STOPPED];
+/// The configuration question's options, in order.
+pub const CONFIG_OPTIONS: [&str; 2] = [FIXED_TRY_AGAIN, LEAVE_STOPPED];
 /// The watchdog's options, in order.
 pub const WATCHDOG_OPTIONS: [&str; 2] = [WAKE_AGAIN, LEAVE_ASLEEP];
 
@@ -74,9 +81,9 @@ pub fn latest(conn: &Connection, node: Uuid) -> Result<Option<Latest>> {
     let id: Option<Vec<u8>> = conn
         .query_row(
             "SELECT id FROM decisions
-             WHERE node_id = ?1 AND protocol IN (?2, ?3, ?4) AND status != 'withdrawn'
+             WHERE node_id = ?1 AND protocol IN (?2, ?3, ?4, ?5) AND status != 'withdrawn'
              ORDER BY created_at DESC, rowid DESC LIMIT 1",
-            params![uuid_to_blob(node), KINDS[0], KINDS[1], KINDS[2]],
+            params![uuid_to_blob(node), KINDS[0], KINDS[1], KINDS[2], KINDS[3]],
             |r| r.get(0),
         )
         .optional()?;

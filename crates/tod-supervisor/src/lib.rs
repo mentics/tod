@@ -239,6 +239,11 @@ fn budget_question(limit: &BudgetLimit) -> String {
 /// `ask` would; the next wake stops on it until it is answered. Not again
 /// while an earlier one is unanswered.
 fn ask(store: &FleetStore, node: Uuid, conversation: Option<Uuid>, kind: &str, question: String) -> Result<()> {
+    let options = if kind == tod_core::stop_questions::CONFIG {
+        tod_core::stop_questions::CONFIG_OPTIONS
+    } else {
+        tod_core::stop_questions::SUPERVISOR_OPTIONS
+    };
     if answers::still_asking(store, node)? {
         tracing::info!(%question, "already asked; still waiting on the answer");
         return Ok(());
@@ -253,7 +258,7 @@ fn ask(store: &FleetStore, node: Uuid, conversation: Option<Uuid>, kind: &str, q
                 protocol: Some(kind.to_string()),
                 decision: tod_store::decisions::NewDecision {
                     question,
-                    options: tod_core::stop_questions::SUPERVISOR_OPTIONS.iter().map(|o| o.to_string()).collect(),
+                    options: options.iter().map(|o| o.to_string()).collect(),
                     evidence: Vec::new(),
                     ..Default::default()
                 },
@@ -405,6 +410,23 @@ pub fn wake(config: Config) -> Result<Woke> {
                 match &outcome {
                     Outcome::NeedsHuman { reason: NeedsHuman::AgentFailed { error } } => {
                         let done = pilot.state().steps.len();
+                        if tod_core::skills_context::is_missing_skill(error) {
+                            // Configuration, not a flaky agent: not counted,
+                            // not retried.
+                            tracing::warn!(%error, "a configured skill is missing; stopping");
+                            ask(
+                                &store,
+                                config.node,
+                                current,
+                                tod_core::stop_questions::CONFIG,
+                                format!(
+                                    "The lifecycle configuration cannot be used: {error}. Fix it (add the skill \
+                                     to the repository or the home directory, or correct the lifecycle config), \
+                                     then try again."
+                                ),
+                            )?;
+                            break Ok(outcome);
+                        }
                         if done > steps_at_failure {
                             failures = 0;
                         }
@@ -420,6 +442,7 @@ pub fn wake(config: Config) -> Result<Woke> {
                                 tracing::warn!(failures, %error, "the agent failed; running the step again");
                                 continue;
                             }
+                            OnFailure::Config => unreachable!("a missing skill is handled before counting"),
                             OnFailure::Ask => {
                                 ask(
                                     &store,
