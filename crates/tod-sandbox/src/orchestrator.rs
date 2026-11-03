@@ -314,7 +314,12 @@ fn unpack_command() -> String {
 }
 
 pub fn is_dead(status: &str) -> bool {
-    matches!(status.to_ascii_uppercase().as_str(), "FAILED" | "TERMINATED" | "DELETING" | "DELETED")
+    // EXPIRED / EXPIRING: a sandbox that reached Blaxel's lifetime limit. It is
+    // removed and made again; with a volume its webhook secrets and wakes stay.
+    matches!(
+        status.to_ascii_uppercase().as_str(),
+        "FAILED" | "TERMINATED" | "DELETING" | "DELETED" | "EXPIRED" | "EXPIRING"
+    )
 }
 
 /// With a volume at `/data`: the users' databases go to the local disk and
@@ -401,6 +406,14 @@ mod tests {
             volumes: volumes.iter().map(|v| v.to_string()).collect(),
             node_env: Vec::new(),
         }
+    }
+
+    #[test]
+    fn an_expired_orchestrator_sandbox_is_dead_like_a_terminated_one() {
+        for status in ["FAILED", "TERMINATED", "DELETING", "DELETED", "EXPIRED", "expiring"] {
+            assert!(is_dead(status), "{status}");
+        }
+        assert!(!is_dead("DEPLOYED") && !is_dead("DEPLOYING"));
     }
 
     #[test]

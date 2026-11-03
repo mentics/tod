@@ -58,6 +58,27 @@ pub fn spawn_ensure(root: PathBuf) {
     }
 }
 
+/// Whether a process probe (`echo up` / `echo down`) says the orchestrator's
+/// process is not running. Anything else, an empty answer included, is not
+/// taken for "down": restarting a running server over a garbled probe would
+/// interrupt every sync.
+pub fn process_is_down(output: &str) -> bool {
+    output.trim() == "down"
+}
+
+/// After a failed sync: [`spawn_ensure`], at most once every ten minutes, so a
+/// reset orchestrator is started again without waiting for the next launch.
+pub fn heal_after_failed_sync(root: &Path) {
+    static LAST: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+    const EVERY_MS: i64 = 10 * 60 * 1000;
+    let now = tod_store::outline::uuid_blob::now_ms();
+    let last = LAST.load(Ordering::SeqCst);
+    if now - last < EVERY_MS || LAST.compare_exchange(last, now, Ordering::SeqCst, Ordering::SeqCst).is_err() {
+        return;
+    }
+    spawn_ensure(root.to_path_buf());
+}
+
 /// What to do with an orchestrator that reported `theirs`, from this app's
 /// `mine`: `Ok(false)` leave it, `Ok(true)` update it, `Err` refuse (a newer
 /// schema or wire this app cannot read).
@@ -87,7 +108,24 @@ pub fn ensure_orchestrator(root: &Path, progress: &mut dyn FnMut(&str)) -> Resul
     {
         let url = sandboxes.url(&bx, &acct.orchestrator).context("find the orchestrator's URL")?;
         let base = format!("{}/port/{}", url.trim_end_matches('/'), orch::PORT);
-        let theirs = super::HttpOrchestrator::new(base, Some(bx.token().to_string())).health()?;
+        let theirs = match super::HttpOrchestrator::new(base, Some(bx.token().to_string())).health() {
+            Ok(theirs) => theirs,
+            Err(err) => {
+                // The sandbox is up and the server does not answer. If its
+                // process is gone (the container was reset or expired, and
+                // came back without `/opt/tod-orchestrator`), start it again:
+                // with a volume nothing is lost. If the process is there the
+                // fault is something else, and is reported as it is.
+                let probe = bx
+                    .run(&url, "pgrep -f 'tod-orchestrator --port' >/dev/null 2>&1 && echo up || echo down", 30)
+                    .context("check whether the orchestrator's process runs")?;
+                if !process_is_down(&probe.output()) {
+                    return Err(err.context("the orchestrator's sandbox is up and its process runs, but /health fails"));
+                }
+                progress("the orchestrator's process is gone (its container was reset?); starting it again");
+                return install(&bx, &acct, progress).map(Outcome::Updated);
+            }
+        };
         let mine = super::my_contract();
         if !assess(&mine, &theirs)? {
             return Ok(Outcome::Present);
@@ -207,6 +245,14 @@ mod tests {
         assert_eq!(with.health().unwrap(), mine);
         let without = super::super::HttpOrchestrator::new(base, None);
         assert!(format!("{:#}", without.health().unwrap_err()).contains("401"));
+    }
+
+    #[test]
+    fn only_an_explicit_down_means_the_process_is_gone() {
+        assert!(process_is_down("down\n"));
+        assert!(!process_is_down("up\n"));
+        assert!(!process_is_down(""), "an empty probe is not a reason to restart a server");
+        assert!(!process_is_down("pgrep: not found"));
     }
 
     #[test]

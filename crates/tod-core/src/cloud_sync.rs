@@ -1134,7 +1134,13 @@ pub fn resolve(root: &Path) -> Result<(HttpOrchestrator, String)> {
 /// [`sync`] with the resolved orchestrator: the "Sync with the cloud" action.
 pub fn sync_now(fleet: &FleetStore, root: &Path) -> Result<SyncReport> {
     let (orch, user) = resolve(root)?;
-    sync(fleet, root, &orch, &user)
+    let result = sync(fleet, root, &orch, &user);
+    if result.is_err() {
+        // The orchestrator may be down (its container reset): see whether it
+        // needs starting again, without blocking this call on it.
+        deploy::heal_after_failed_sync(root);
+    }
+    result
 }
 
 /// Sync on a thread of its own, when this data root has been seeded (a data
