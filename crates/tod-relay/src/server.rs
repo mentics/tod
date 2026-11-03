@@ -1,6 +1,7 @@
 //! The WebSocket server: sessions for `/exec`, long-lived agents for `/agent/<name>`.
 
 use crate::hold::Hold;
+use crate::liveness;
 use crate::pty;
 use crate::reaper;
 use crate::tunnel::Tunnel;
@@ -10,10 +11,10 @@ use serde::Deserialize;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::CStr;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
-use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
@@ -71,7 +72,20 @@ struct Relay {
     poke_gen: AtomicU64,
     /// What only the supervisor is given: [`take_supervisor_env`].
     supervisor_env: Vec<(String, String)>,
+    /// Where supervisors keep their state, one directory per node
+    /// (`--supervisor-state-root`): their lock and progress marker, which
+    /// [`liveness`] reads.
+    supervisor_root: PathBuf,
+    /// When the supervisor in `supervisor` was started.
+    supervisor_since: Mutex<Option<Instant>>,
+    /// A supervisor is being adopted ([`adopt`]); not twice at once.
+    adopting: AtomicBool,
 }
+
+/// How often the supervisor's liveness is looked at ([`liveness_tick`]).
+const LIVENESS_EVERY: Duration = Duration::from_secs(15);
+/// How long an adopted supervisor has to end after `SIGTERM` before `SIGKILL`.
+const ADOPT_TERM_WAIT: Duration = Duration::from_secs(15);
 
 /// The relay's own environment variables under this prefix are for the
 /// supervisor alone (`tod_sandbox::node::RELAY_SUPERVISOR_ENV_PREFIX`): e.g.
@@ -108,6 +122,7 @@ pub fn main(args: &[String]) {
     let mut port = 2222u16;
     let mut max_hold = 4 * 3600u64;
     let mut tunnel_port = crate::tunnel::DEFAULT_PORT;
+    let mut supervisor_root = PathBuf::from("/var/lib/tod-supervisor");
     let mut supervisor_cmd = concat!(
         "/opt/tod/tod-supervisor wake --workspace \"",
         "$(if [ -d /workspace/repo/.git ]; then echo /workspace/repo; else echo /workspace; fi)",
@@ -120,6 +135,11 @@ pub fn main(args: &[String]) {
             "--port" => port = it.next().and_then(|v| v.parse().ok()).unwrap_or(port),
             "--max-hold-secs" => max_hold = it.next().and_then(|v| v.parse().ok()).unwrap_or(max_hold),
             "--tunnel-port" => tunnel_port = it.next().and_then(|v| v.parse().ok()).unwrap_or(tunnel_port),
+            "--supervisor-state-root" => {
+                if let Some(v) = it.next() {
+                    supervisor_root = PathBuf::from(v);
+                }
+            }
             "--supervisor-cmd" => {
                 supervisor_cmd = it.next().cloned().unwrap_or(supervisor_cmd);
             }
@@ -137,12 +157,16 @@ pub fn main(args: &[String]) {
         supervisor: Mutex::new(None),
         poke_gen: AtomicU64::new(0),
         supervisor_env,
+        supervisor_root,
+        supervisor_since: Mutex::new(None),
+        adopting: AtomicBool::new(false),
     });
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
     rt.block_on(async move {
         let listener = TcpListener::bind(("0.0.0.0", port)).await.expect("bind relay port");
         log!("tod-relay {} listening on {port}, home {}", crate::VERSION, relay.home);
         tokio::spawn(relay.tunnel.clone().listen(tunnel_port));
+        tokio::spawn(liveness_loop(relay.clone()));
         loop {
             let Ok((stream, _)) = listener.accept().await else { continue };
             tokio::spawn(handle(relay.clone(), stream));
@@ -365,7 +389,113 @@ fn poke(relay: &Arc<Relay>) {
         }
         *sup = None;
     }
+    // One the relay did not start (a schedule's fallback ran it): replace it
+    // with one it tracks, rather than start a second that would only find the
+    // lock held.
+    match liveness::find(&relay.supervisor_root, std::time::SystemTime::now(), &is_supervisor_process) {
+        Ok(Some(found)) => {
+            adopt(relay, found.pid);
+            return;
+        }
+        Ok(None) => {}
+        Err(e) => {
+            log!("poke: cannot look for a running supervisor: {e}");
+            crate::problem_limited(
+                tod_problems::Level::Error,
+                &format!("poke: cannot look for a running supervisor in {}: {e}", relay.supervisor_root.display()),
+            );
+        }
+    }
     start_supervisor(relay, &mut sup);
+}
+
+/// Whether `pid` is a live `tod-supervisor` (not a reused pid).
+fn is_supervisor_process(pid: u32) -> bool {
+    alive(pid)
+        && std::fs::read(format!("/proc/{pid}/cmdline"))
+            .map(|c| String::from_utf8_lossy(&c).contains("tod-supervisor"))
+            .unwrap_or(false)
+}
+
+/// Looks at the supervisor every [`LIVENESS_EVERY`], for the life of the relay.
+async fn liveness_loop(relay: Arc<Relay>) {
+    loop {
+        tokio::time::sleep(LIVENESS_EVERY).await;
+        liveness_tick(&relay, &is_supervisor_process);
+    }
+}
+
+/// One look ([`liveness::decide`]): kills a supervisor this relay started
+/// that has made no progress for [`liveness::STALL_LIMIT`], and adopts one it
+/// did not start. A failure to look is reported, never taken for "all well".
+fn liveness_tick(relay: &Arc<Relay>, is_supervisor: &dyn Fn(u32) -> bool) {
+    let tracked = {
+        let sup = relay.supervisor.lock().unwrap();
+        let since = relay.supervisor_since.lock().unwrap();
+        match (*sup, *since) {
+            (Some((pid, _)), Some(at)) if alive(pid) => Some((pid, at.elapsed())),
+            _ => None,
+        }
+    };
+    let found = match liveness::find(&relay.supervisor_root, std::time::SystemTime::now(), is_supervisor) {
+        Ok(found) => found,
+        Err(e) => {
+            log!("liveness: cannot read {}: {e}", relay.supervisor_root.display());
+            crate::problem_limited(
+                tod_problems::Level::Error,
+                &format!("liveness: cannot read the supervisor's state in {}: {e}", relay.supervisor_root.display()),
+            );
+            return;
+        }
+    };
+    match liveness::decide(tracked, found.as_ref(), liveness::STALL_LIMIT) {
+        liveness::Action::Nothing => {}
+        liveness::Action::KillStalled { pid, age } => {
+            let msg = format!(
+                "supervisor pid {pid} made no progress for {} min; killed it (its holds are released; the dead-man wake starts the next)",
+                age.as_secs() / 60
+            );
+            log!("liveness: {msg}");
+            crate::problem(tod_problems::Level::Error, &msg);
+            // SAFETY: a signal to the supervisor this relay started.
+            unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+        }
+        liveness::Action::Adopt { pid } => adopt(relay, pid),
+    }
+}
+
+/// Replaces a supervisor the relay did not start with one it does: ends it
+/// (`SIGTERM`, then `SIGKILL`), and starts another once it is gone, unless one
+/// was started meanwhile. Off the async threads: it waits.
+fn adopt(relay: &Arc<Relay>, pid: u32) {
+    if relay.adopting.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    log!("liveness: supervisor pid {pid} was not started by this relay; replacing it with one it tracks");
+    // A bridge for the gap: the replacement needs a moment to hold for itself.
+    relay.hold.lease(POKE_REASON, POKE_BRIDGE_SECS);
+    let relay = relay.clone();
+    tokio::task::spawn_blocking(move || {
+        // SAFETY: a signal to the untracked supervisor the lock file names.
+        unsafe { libc::kill(pid as i32, libc::SIGTERM) };
+        let deadline = Instant::now() + ADOPT_TERM_WAIT;
+        while alive(pid) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        if alive(pid) {
+            // SAFETY: as above.
+            unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        let mut sup = relay.supervisor.lock().unwrap();
+        if sup.is_some_and(|(p, _)| alive(p)) {
+            log!("liveness: a supervisor was started meanwhile; not starting another");
+        } else {
+            *sup = None;
+            start_supervisor(&relay, &mut sup);
+        }
+        relay.adopting.store(false, Ordering::SeqCst);
+    });
 }
 
 /// Whether a supervisor that has seen `seen` pokes missed one by exiting.
@@ -402,6 +532,7 @@ fn start_supervisor(relay: &Arc<Relay>, sup: &mut Option<(u32, u64)>) {
         Ok(mut child) => {
             let pid = child.id().unwrap_or(0);
             *sup = Some((pid, started_gen));
+            *relay.supervisor_since.lock().unwrap() = Some(Instant::now());
             log!("poke: started supervisor pid {pid}: {}", relay.supervisor_cmd);
             let relay = relay.clone();
             tokio::spawn(async move {
@@ -1172,6 +1303,9 @@ mod abandoned_tests {
             supervisor: Mutex::new(None),
             poke_gen: AtomicU64::new(0),
             supervisor_env: vec![],
+            supervisor_root: std::env::temp_dir().join(format!("tod-relay-test-no-supervisors-{}", std::process::id())),
+            supervisor_since: Mutex::new(None),
+            adopting: AtomicBool::new(false),
         })
     }
 
@@ -1210,6 +1344,98 @@ mod abandoned_tests {
             poke(&relay);
             tokio::time::sleep(Duration::from_millis(800)).await;
             assert_eq!(current_pid(&relay), None);
+        });
+    }
+
+    /// A relay whose supervisor state root holds a lock naming `pid`.
+    fn relay_with_untracked(cmd: &str, pid: u32, tag: &str) -> Arc<Relay> {
+        let root = std::env::temp_dir().join(format!("tod-relay-adopt-{tag}-{}", std::process::id()));
+        let node = root.join("node-1");
+        std::fs::create_dir_all(&node).unwrap();
+        std::fs::write(node.join(liveness::LOCK_FILE), pid.to_string()).unwrap();
+        let relay = test_relay(cmd);
+        // Rebuilt with the root: `Relay` has no setter, and tests own it alone.
+        Arc::new(Relay {
+            sessions: Mutex::new(HashMap::new()),
+            agents: Mutex::new(HashMap::new()),
+            tunnel: Arc::new(Tunnel::default()),
+            hold: Hold::new(3600),
+            home: "/tmp".into(),
+            supervisor_cmd: relay.supervisor_cmd.clone(),
+            supervisor: Mutex::new(None),
+            poke_gen: AtomicU64::new(0),
+            supervisor_env: vec![],
+            supervisor_root: root,
+            supervisor_since: Mutex::new(None),
+            adopting: AtomicBool::new(false),
+        })
+    }
+
+    /// The process API's fallback ran the supervisor itself, untracked and
+    /// under a 120 s kill: the relay replaces it with one it tracks.
+    #[test]
+    fn an_untracked_supervisor_is_replaced_by_one_the_relay_tracks() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let mut untracked = std::process::Command::new("sleep").arg("60").spawn().unwrap();
+            let old = untracked.id();
+            let relay = relay_with_untracked("sleep 5", old, "replace");
+            liveness_tick(&relay, &|p| p == old && alive(p));
+            // Ended, and another started that is tracked.
+            let mut tracked = None;
+            for _ in 0..60 {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                tracked = current_pid(&relay);
+                if tracked.is_some() {
+                    break;
+                }
+            }
+            let new = tracked.expect("the relay started its own supervisor");
+            assert_ne!(new, old);
+            assert!(untracked.wait().is_ok());
+            assert!(!alive(old), "the untracked one was ended");
+            // SAFETY: ends the test's own child.
+            unsafe { libc::kill(new as i32, libc::SIGKILL) };
+        });
+    }
+
+    /// A poke that finds an untracked supervisor adopts it rather than start
+    /// a second one beside it.
+    #[test]
+    fn a_poke_adopts_an_untracked_supervisor_instead_of_starting_a_second() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let mut untracked = std::process::Command::new("sleep").arg("60").spawn().unwrap();
+            let old = untracked.id();
+            let relay = relay_with_untracked("sleep 5", old, "poke");
+            // The default check wants a `tod-supervisor` command line, which
+            // `sleep` has not: this lock is not a live supervisor, so the poke
+            // starts one. With the lock naming a supervisor it adopts.
+            assert!(!is_supervisor_process(old));
+            poke(&relay);
+            let started = current_pid(&relay).expect("a poke with no supervisor starts one");
+            assert_ne!(started, old);
+            assert!(alive(old), "a pid that is not a supervisor is left alone");
+            untracked.kill().unwrap();
+            let _ = untracked.wait();
+            // SAFETY: ends the test's own child.
+            unsafe { libc::kill(started as i32, libc::SIGKILL) };
+        });
+    }
+
+    /// A supervisor the relay started that stops marking progress is killed.
+    #[test]
+    fn a_tracked_supervisor_with_a_stale_progress_marker_is_killed() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let relay = test_relay("sleep 30");
+            poke(&relay);
+            let pid = current_pid(&relay).expect("started");
+            // Started long ago, never marked anything.
+            *relay.supervisor_since.lock().unwrap() = Some(Instant::now() - liveness::STALL_LIMIT - Duration::from_secs(5));
+            liveness_tick(&relay, &|_| false);
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            assert!(!alive(pid), "a wedged supervisor must be killed");
         });
     }
 }

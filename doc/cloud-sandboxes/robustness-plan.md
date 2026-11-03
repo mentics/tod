@@ -171,6 +171,20 @@ supervisor should not read as working for 6 hours), a supervisor
 itself when the process API's fallback would otherwise run it untracked
 and kill it at 120 s.
 
+Landed: the hold's `keepAlive` timeout is the longest of every holder's ask
+(a lease-less reason asks a rolling 10 min, not the 4 h cap); the supervisor
+marks `<state_dir>/progress` (`tod_supervisor::progress`) and renews its hold
+and sends heartbeats only while it is younger than the agent's hang limit
+plus 10 min; `<state_dir>/supervisor.lock` (`flock`, holds the pid) makes a
+second supervisor exit with `Woke::AlreadyRunning` before touching anything,
+poking the holder; the relay (`liveness.rs`, every 15 s and on each poke)
+kills a supervisor it started that made no progress for 40 min and adopts
+(ends and restarts as its own) a supervisor it did not start. Not done: the
+wake command's fallback still `exec`s the supervisor when the relay is
+down (the relay's environment, which carries the supervisor's secrets, is
+not recoverable from inside the sandbox), so that one runs untracked until
+the relay returns and adopts it.
+
 ### 3.9 Pull that does not depend on ntfy (orchestrator D6, 8)
 
 A failed publish marks the change announced; the cached topic can be
