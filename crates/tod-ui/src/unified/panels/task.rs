@@ -1327,7 +1327,10 @@ impl TaskPanel {
         }
         if let Some(cloud) = &self.runner.cloud {
             let mut text = format!("in the cloud (sandbox {})", cloud.sandbox);
-            if cloud.lost_at.is_some() {
+            // While the app is making the replacement the standing says
+            // working; the stale "deleted, run it" note would contradict it.
+            let replacing = standing.as_ref().is_some_and(|s| matches!(s.actor, NextActor::Working { .. }));
+            if cloud.lost_at.is_some() && !replacing {
                 // What woke it (a release, a merge) found nothing there: the
                 // orchestrator marked it, and the app makes a new one at its
                 // next sync, so a closed app leaves the node waiting for it.
