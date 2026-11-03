@@ -783,6 +783,13 @@ fn sync_once(fleet: &FleetStore, root: &Path, orch: &dyn Orchestrator, user: &st
         state.save(root)?;
     }
 
+    // What the orchestrator has accepted is not read again, and each entry
+    // holds a whole old row: drop them (also the ones a seeding covered).
+    let pruned = sync::prune_sent(&connect(&db)?, state.sent_after).context("prune the sent change log")?;
+    if pruned > 0 {
+        tracing::debug!(pruned, upto = state.sent_after, "cloud sync: pruned sent changes from the outbox");
+    }
+
     let pulled = orch.pull(user, state.feed_after)?;
     if let (Some(known), Some(now)) = (&state.seed_id, &pulled.seed_id)
         && known != now

@@ -426,8 +426,28 @@ fn key_clause(key: &Row) -> Result<(String, Vec<Value>)> {
 
 /// The largest `sync_changes.seq` so far (0 when empty): the cursor a copy
 /// seeded from this database starts at.
+///
+/// Read from `sqlite_sequence` as well as the rows: the log is pruned
+/// ([`prune_sent`]) and left out of a snapshot, and its numbering must not
+/// start over (every cursor compares against it).
 pub fn last_seq(conn: &Connection) -> Result<i64> {
-    Ok(conn.query_row("SELECT COALESCE(MAX(seq), 0) FROM sync_changes", [], |r| r.get(0))?)
+    let rows: i64 = conn.query_row("SELECT COALESCE(MAX(seq), 0) FROM sync_changes", [], |r| r.get(0))?;
+    let used: i64 = conn.query_row(
+        "SELECT COALESCE((SELECT seq FROM sqlite_sequence WHERE name = 'sync_changes'), 0)",
+        [],
+        |r| r.get(0),
+    )?;
+    Ok(rows.max(used))
+}
+
+/// Deletes the log entries up to and including `upto`: what a copy has sent
+/// to the other side and had accepted. Nothing reads a sent entry again (a
+/// conflict is judged on the receiving side from the entry it was sent, and a
+/// snapshot leaves the log out), and each carries the whole old row, so kept
+/// they are most of the database. Numbering continues ([`last_seq`]).
+/// Returns how many were deleted.
+pub fn prune_sent(conn: &Connection, upto: i64) -> Result<usize> {
+    Ok(conn.execute("DELETE FROM sync_changes WHERE seq <= ?1", [upto])?)
 }
 
 /// Every row changed after `after`, one [`Change`] per row with its current
@@ -744,12 +764,27 @@ fn drop_orphans(tx: &Connection, report: &mut ApplyReport) -> Result<()> {
     bail!("could not resolve foreign key violations while applying sync changes")
 }
 
-/// Copies the whole database at `db` to `to` (SQLite online backup), for
-/// seeding another copy. The copy's [`last_seq`] is the cursor to export from.
+/// Copies the database at `db` to `to` (SQLite online backup), for seeding
+/// another copy, without its change log (`sync_changes`: a copy starts with
+/// nothing to send, and the entries are the old rows of every change made).
+/// The copy's [`last_seq`] is the cursor to export from.
 /// One step, not the paced backup: the orchestrator takes it under the
 /// user's sync lock while a node's supervisor waits to start.
 pub fn snapshot(db: &Path, to: &Path) -> Result<()> {
-    crate::fleet::schema::copy_database(db, to)
+    crate::fleet::schema::copy_database(db, to)?;
+    let conn = Connection::open(to).with_context(|| format!("open the snapshot {}", to.display()))?;
+    // A database that never had sync installed has no log to leave out. The
+    // numbering stays in `sqlite_sequence`, so `last_seq` is unchanged.
+    let has_log: bool = conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sync_changes')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !has_log {
+        return Ok(());
+    }
+    conn.execute_batch("DELETE FROM sync_changes; VACUUM;").context("leave the change log out of the snapshot")?;
+    Ok(())
 }
 
 /// Replaces the database at `db` with the snapshot at `from` (in one step,
