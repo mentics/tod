@@ -658,6 +658,48 @@ mod tests {
         }
     }
 
+    /// What an agent reads, it tends to write: a review that says "node" or
+    /// "tod" in a pull request comment means nothing to the people reading it.
+    /// Outside backticked commands and identifiers, the fragments call a
+    /// unit of work a "task" and never name the app. `cli/` documents the
+    /// literal `node` noun, `domain/outline.md` is where the two words are
+    /// introduced, and `workspace/codebase.md` lists what not to write, so
+    /// each is exempt from its half of this rule; anything else that really
+    /// needs a word belongs in backticks.
+    #[test]
+    fn prose_says_task_and_never_names_the_app() {
+        let Some(root) = context_root() else { return };
+        let mut found = Vec::new();
+        for key in all_fragments(&root) {
+            let text = std::fs::read_to_string(root.join(format!("{key}.md"))).unwrap();
+            let prose: String = text
+                .split('`')
+                .enumerate()
+                .filter(|(i, _)| i % 2 == 0)
+                .map(|(_, s)| s)
+                .collect::<Vec<_>>()
+                .join(" ");
+            let allows_node = key.starts_with("cli/")
+                || key == "domain/outline"
+                || key == "workspace/codebase";
+            for word in prose.split(|c: char| !(c.is_alphanumeric() || c == '-' || c == '_')) {
+                let lower = word.to_lowercase();
+                let bad = match lower.as_str() {
+                    "node" | "nodes" => !allows_node,
+                    "tod" => key != "domain/outline",
+                    _ => false,
+                };
+                if bad {
+                    found.push(format!("{key}.md: \"{word}\""));
+                }
+            }
+        }
+        assert!(
+            found.is_empty(),
+            "say \"task\" (or \"the app\") in prose, or put a command in backticks: {found:#?}"
+        );
+    }
+
     /// The same rule over `assets/process/`. The interview role docs (and the
     /// since-removed ones for the old spec-writing agent) carried their own command table, abbreviated and already
     /// drifted from the binary (the interview one omitted `obligations add

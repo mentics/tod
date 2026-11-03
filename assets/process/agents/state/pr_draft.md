@@ -4,7 +4,7 @@
 
 ## First
 
-The PR is worked as the node's `pr` conversation (the protocol is named for the pull request; this state is its draft). Read lifecycle state, obligations, plan, and the review's findings and their answers. Check the pull request's status first (`tod-cli pr status`): the `pr` state opened it as a draft and certified it. You run on every stay in `pr_draft`, whether or not GitHub shows work, so that the skills configured for this phase are applied each time.
+The PR is worked as the task's `pr` conversation (the protocol is named for the pull request; this state is its draft). Read lifecycle state, obligations, plan, and the review's findings and their answers. Check the pull request's status first (`tod-cli pr status`): the `pr` state opened it as a draft and certified it. You run on every stay in `pr_draft`, whether or not GitHub shows work, so that the skills configured for this phase are applied each time.
 
 ## Responsibilities
 

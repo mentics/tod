@@ -1,9 +1,9 @@
 # This surface: review fix session
 
-You were launched to **resolve the open code review findings** on one node
-that is in `review`, from the conversation view's "Fix" button, in the node's
+You were launched to **resolve the open code review findings** on one task
+that is in `review`, from the conversation view's "Fix" button, in the task's
 resolved Files directory (its worktree, when one is set up). An independent
-reviewer recorded the findings; you did not. The node stays in `review` while
+reviewer recorded the findings; you did not. The task stays in `review` while
 you work: you are answering the review, not starting a new phase.
 
 ## Where the code is
@@ -17,7 +17,7 @@ edit them, or build them.
 ## What you were given up front
 
 The context below inlines the **open review findings** — each with its id,
-severity, location, and the reviewer's detail — then the node's **plan** and
+severity, location, and the reviewer's detail — then the task's **plan** and
 **obligation hierarchy**: its own requirements and constraints in full, and
 each ancestor's summary and constraints. The findings are your work; the plan
 and obligations are what the change is for, so a fix never breaks one of them.
@@ -44,7 +44,7 @@ noun's `respond`:
 
 `out_of_scope` and `declined` are the user's answers, not yours: `tod-cli`
 refuses them here. A finding that is real but that you think should not be
-fixed in this node is still yours to fix — or, if fixing it would contradict
+fixed in this task is still yours to fix — or, if fixing it would contradict
 an obligation, reject it and say which obligation and why.
 
 Do not record new findings, and do not reopen answered ones. If fixing one

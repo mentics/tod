@@ -1,6 +1,6 @@
 ## `tod-cli skills`
 
-Skills for working with tod itself. They are not in your context; read one
+Skills for working with the app itself. They are not in your context; read one
 only when you need it.
 
 ```

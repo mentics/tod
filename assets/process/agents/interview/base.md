@@ -1,6 +1,6 @@
 # Interview
 
-An interview turns a conversation with the user into the obligations — refined further in the design phase, then turned into a plan — of one **node**. Two agents cooperate through the database while the user answers questions in the app at their own pace.
+An interview turns a conversation with the user into the obligations — refined further in the design phase, then turned into a plan — of one **task**. Two agents cooperate through the database while the user answers questions in the app at their own pace.
 
 | Actor | Does |
 |--|--|
@@ -14,22 +14,22 @@ Neither agent talks to the user. Everything flows through **questions**, **oblig
 
 Your context is given once and then only added to.
 
-- **Your first turn** carries these docs and a **snapshot** of the node: this node's obligations by section, inherited context (each ancestor's summary and constraints), its details, the memory your role sees, open and deferred questions, and one line per answered question.
+- **Your first turn** carries these docs and a **snapshot** of the task: this task's obligations by section, inherited context (each ancestor's summary and constraints), its details, the memory your role sees, open and deferred questions, and one line per answered question.
 - **Every later turn** carries only **what changed** since your previous turn, then the instruction. Your own changes are left out — you made them. Anything new to you arrives in full once; after that, only its changed fields.
 
 Your context is therefore current. **Don't re-read with `tod-cli` what you were given.** If something you change was modified by someone else in the meantime, `tod-cli` refuses the write and prints the current version — decide again with that.
 
 A session can be replaced by a fresh one between turns. Anything worth keeping beyond this turn must be in obligations, interview memory, or a question — never only in the conversation or in a memory feature of your own.
 
-Questions and memory belong to the **node**, not to one session. They survive app restarts and carry over when the user returns to this node, including in later phases.
+Questions and memory belong to the **task**, not to one session. They survive app restarts and carry over when the user returns to this task, including in later phases.
 
 ## Obligations form a hierarchy
 
 **Requirements** say what must be true for the work to be done. **Constraints** bound how it may be done — platforms, compatibility, data rules, boundaries with other work.
 
-**Across the tree.** A node inherits every obligation of its ancestors. Put an obligation on the highest node where it is true for everything beneath; by default that is the interview node. Never restate an inherited obligation on this node. When this node genuinely needs to differ from an inherited one, that is a conflict for the user to settle: propose rewording the ancestor's obligation to carve out the exception, not a contradicting copy here.
+**Across the tree.** A task inherits every obligation of its ancestors. Put an obligation on the highest task where it is true for everything beneath; by default that is the interview task. Never restate an inherited obligation on this task. When this task genuinely needs to differ from an inherited one, that is a conflict for the user to settle: propose rewording the ancestor's obligation to carve out the exception, not a contradicting copy here.
 
-**Within a node.** Obligations are grouped by kind, then by optional **section**. Use existing section names exactly. Start a new section only when several related obligations would share it; small lists stay unsectioned. Regrouping an existing list is not interview work.
+**Within a task.** Obligations are grouped by kind, then by optional **section**. Use existing section names exactly. Start a new section only when several related obligations would share it; small lists stay unsectioned. Regrouping an existing list is not interview work.
 
 ## Writing obligations
 
@@ -74,7 +74,7 @@ syntax; it is right there, and it is generated from the binary.
 What that reference doesn't say, because it is specific to interviews:
 
 - Ids as you see them here: obligations by the 8-character prefix shown to you;
-  questions `q-<n>` and memory notes `m-<n>`, numbered per node.
+  questions `q-<n>` and memory notes `m-<n>`, numbered per task.
 - Your context is already current. Use `list` / `show` only when you truly lack
   something.
 - Never open the database directly.

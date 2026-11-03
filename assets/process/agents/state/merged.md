@@ -4,13 +4,13 @@
 
 ## Before you run
 
-When the node has a linked pull request, the app holds this state until a published GitHub release's notes name that pull request (by its title, link, or number); the release is not assumed to be the next one. You run once it has, so the release already exists: find its tag in the project's releases and record it as evidence. With no linked pull request nothing is awaited, and you drive the release yourself.
+When the task has a linked pull request, the app holds this state until a published GitHub release's notes name that pull request (by its title, link, or number); the release is not assumed to be the next one. You run once it has, so the release already exists: find its tag in the project's releases and record it as evidence. With no linked pull request nothing is awaited, and you drive the release yourself.
 
 ## Your work
 
 1. First, read the merge evidence.
-2. Take the node's `merged` plan steps, in dependency order, as part of the release: each is done here and verified here (see "Plan steps belong to phases" and "Acting on shared environments" in the base doc).
-3. Drive the **release** to the agreed production or runtime environment: follow the node's or project's release process (deploy pipeline, tags, and so on), and watch the release and build pipelines.
+2. Take the task's `merged` plan steps, in dependency order, as part of the release: each is done here and verified here (see "Plan steps belong to phases" and "Acting on shared environments" in the base doc).
+3. Drive the **release** to the agreed production or runtime environment: follow the task's or project's release process (deploy pipeline, tags, and so on), and watch the release and build pipelines.
 4. On a failure, diagnose and fix what an agent can. Ask the user only for what needs them: a deploy permission, credentials, or a release decision that is theirs.
 
 ## Done when

@@ -4,7 +4,7 @@
 
 ## First
 
-The review runs as the node's review conversation: the runner starts it, or the conversation view's **Review**.
+The review runs as the task's review conversation: the runner starts it, or the conversation view's **Review**.
 
 1. Read lifecycle state, obligations (including design-phase) and plan steps, implementation, and verification evidence from `verifying`.
 2. Functional correctness should already be established—do not treat this state as primary QA.
@@ -13,9 +13,9 @@ The review runs as the node's review conversation: the runner starts it, or the 
 
 ### Independent code review
 
-The review is done by an agent **not involved** in building this node's docs or implementation — the review conversation's agent is one. Use a code-review skill when available.
+The review is done by an agent **not involved** in building this task's docs or implementation — the review conversation's agent is one. Use a code-review skill when available.
 
-Record every finding on the node through the `review` noun, one at a time, as it is found: that is how the user sees them, and how their responses are tracked. A finding that is only in a reply is lost.
+Record every finding on the task through the `review` noun, one at a time, as it is found: that is how the user sees them, and how their responses are tracked. A finding that is only in a reply is lost.
 
 Track all findings until each has an explicit response:
 
@@ -43,4 +43,4 @@ Implement fixes or document responses. Re-verify when fixes touch behavior cover
 
 ## Blockers
 
-Unresolved findings keep the node in `review`; a finding only the user can answer is asked through the `decisions` noun.
+Unresolved findings keep the task in `review`; a finding only the user can answer is asked through the `decisions` noun.

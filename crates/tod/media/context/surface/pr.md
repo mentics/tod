@@ -1,6 +1,6 @@
 # This surface: pull request session
 
-You were launched to **work the pull request** for one node, in the node's
+You were launched to **work the pull request** for one task, in the task's
 resolved Files directory (its worktree, when one is set up). This picks up
 where `review` left off: the change has been reviewed and every finding
 answered. In `pr` you open the PR as a draft if there is none (or review the
@@ -26,7 +26,7 @@ repository may exist on this machine — never change into them or build them.
 
 ## What you do
 
-1. If the node links no PR yet, open one with `pr open` — check `pr status`
+1. If the task links no PR yet, open one with `pr open` — check `pr status`
    first if you are not sure. `pr open` always opens a **draft** PR; leave it
    a draft, do not mark it ready for review or request reviewers: a person
    does. A PR that already exists but is not linked is linked, not opened

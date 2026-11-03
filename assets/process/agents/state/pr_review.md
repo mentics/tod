@@ -4,7 +4,7 @@
 
 ## First
 
-The PR is driven as the node's `pr` conversation (the protocol is named for the pull request; this state is its review). The lifecycle runner sends you into it when there is something to do, and tells you what: the open threads, the failing check, the branch behind its base.
+The PR is driven as the task's `pr` conversation (the protocol is named for the pull request; this state is its review). The lifecycle runner sends you into it when there is something to do, and tells you what: the open threads, the failing check, the branch behind its base.
 
 1. Read lifecycle state, obligations, plan, and the review's findings and their answers.
 2. Check the pull request's status before doing anything else (`tod-cli pr status`): the `pr` state opened it as a draft, `pr_draft` cleared the automated feedback on it, and a person has since marked it ready and asked for a review.
@@ -25,8 +25,8 @@ You never wait for a review or for CI: the app does, and calls you back when the
 Do not grow the PR. For each piece of feedback ask:
 
 - **Does this change introduce the problem?** Then it is in scope. Fix it. No exceptions.
-- **Was the problem already there, and is fixing it not what this node is for?** Then it is out of scope: decline, say it predates the change, and where it is worth keeping, record it as a new task under the project so it is not lost.
-- **Would fixing it enlarge what the node set out to do** (new behaviour, a refactor past what the change touches)? Out of scope, same handling.
+- **Was the problem already there, and is fixing it not what this task is for?** Then it is out of scope: decline, say it predates the change, and where it is worth keeping, record it as a new task under the project so it is not lost.
+- **Would fixing it enlarge what the task set out to do** (new behaviour, a refactor past what the change touches)? Out of scope, same handling.
 - A real concern (correctness, security, data loss) is never declined for scope alone. If a problem that was already there makes this change unsafe, fixing it is in scope.
 
 Always give the reason in the reply, so the reviewer can disagree. If you cannot tell whether something is in scope, that is a question for the user, not a guess.

@@ -1,7 +1,7 @@
 # This surface: implementation session
 
-You were launched to **implement the plan** for one node, from its lifecycle
-panel's Active-phase "Implement" button, in the node's resolved Files directory
+You were launched to **implement the plan** for one task, from its lifecycle
+panel's Active-phase "Implement" button, in the task's resolved Files directory
 (its worktree, when one is set up).
 
 ## Where the code is
@@ -19,9 +19,9 @@ your turn ends.
 The context below inlines, for efficiency, the two things you need almost every
 turn:
 
-- **The plan** for this node — its plan steps, in order, with their dependency
+- **The plan** for this task — its plan steps, in order, with their dependency
   and `--satisfies` links to obligations.
-- **The obligation hierarchy for this node** — this node's own requirements and
+- **The obligation hierarchy for this task** — this task's own requirements and
   constraints in full (they define what "done" means for this session), plus
   each ancestor's generated summary and constraints, most general first.
 
@@ -34,8 +34,8 @@ The plan's `--satisfies` / `--depends-on` links refer to obligations by id.
 Most of what a plan step references is already inlined above — check there
 first. Reach for `tod-cli` only when:
 
-- a reference points outside this node's own subtree (an ancestor obligation
-  not covered by the inlined hierarchy, or a sibling node's), or
+- a reference points outside this task's own subtree (an ancestor obligation
+  not covered by the inlined hierarchy, or a sibling task's), or
 - you need to re-check current state, since obligations can change after this
   session started and the inlined copy will not reflect that.
 
@@ -58,7 +58,7 @@ changed underneath you.
   work; it never drops any, and it is not a way to defer part of it.
 - Do as much of every step as you can. A step that needs the user for part of
   it still gets everything else done first — see *Leaving work for the user*.
-- This conversation is the node's implementation record. Finish the plan here
+- This conversation is the task's implementation record. Finish the plan here
   rather than assuming a later session will pick up what you leave.
 
 ## Run what you build
@@ -84,7 +84,7 @@ store a secret's value, and never put it in code, fixtures, or tests.
   schema (e.g. an introspection query), capture real responses to save as
   fixtures, check an assumption — and for a check a plan step or obligation
   explicitly asks to be run live.
-- Only when the secret you need is not set, or is not one tod stores, does the
+- Only when the secret you need is not set, or is not one the app stores, does the
   live part need the user: build and test everything else against fixtures,
   and leave just the live part for them.
 
@@ -143,7 +143,7 @@ the step on from `failed`).
 ## Leaving work for the user
 
 Only something that needs the user — a decision, an answer, or access only
-they can give, like a secret tod does not have — may be left undone. The size
+they can give, like a secret the app does not have — may be left undone. The size
 of a step, needing to run the app to check it, or a missing credential you can
 work around with fixtures never needs the user. When something does:
 

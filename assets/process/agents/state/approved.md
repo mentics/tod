@@ -18,4 +18,4 @@ The app checks this gate itself from GitHub's live status; no agent evaluates it
 
 ## Blockers
 
-None — if the PR needs more work, the node moves back to `pr_review`, not forward from here.
+None — if the PR needs more work, the task moves back to `pr_review`, not forward from here.

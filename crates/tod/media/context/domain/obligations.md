@@ -1,7 +1,7 @@
 # Obligations
 
-Obligations are what a node commits to. They come in two kinds, both attached
-directly to one node:
+Obligations are what a task commits to. They come in two kinds, both attached
+directly to one task:
 
 - **Requirements** — what must be true for the work to be considered done.
 - **Constraints** — what bounds how the work may be carried out: technology
@@ -13,7 +13,7 @@ order shown to the user in the app.
 An obligation's text must stand on its own. It is stored with the outline, not
 beside any repository, so it cannot link to or name a file (a repo doc, a
 relative markdown link, a local path) — state what the file says instead. Such
-text is refused. URLs and `[[slug]]` node references are fine.
+text is refused. URLs and `[[slug]]` task references are fine.
 
 ## Inheritance
 
@@ -30,11 +30,11 @@ only a summary of its requirements. That is deliberate, not truncation.
 
 ## References
 
-A `[[slug]]` in an obligation names another node, usually a reusable
-component this node uses. A referenced node is not inherited: none of its
+A `[[slug]]` in an obligation names another task, usually a reusable
+component this task uses. A referenced task is not inherited: none of its
 obligations are in your context. When you need them, most often when
 planning, since the component's requirements and constraints can call for plan
-steps here, look the node up by its slug and list its obligations with
+steps here, look the task up by its slug and list its obligations with
 `tod-cli`.
 
 
@@ -44,7 +44,7 @@ Every obligation carries two lifecycle states. They answer different
 questions and are set separately; the app shows both.
 
 - **Introduced in** (`phase`): the state whose work wrote it. Always
-  `requirements` (written while the node is `proposed`: what the user wants,
+  `requirements` (written while the task is `proposed`: what the user wants,
   high level) or `design` (written in `design`, or later when verification or
   review turns up something the spec left out: how it is to be built and what
   the work must do). It records where the obligation came from and is not

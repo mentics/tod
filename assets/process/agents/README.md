@@ -10,7 +10,7 @@ First turn of each pooled session (order matters):
 2. **Interview phase** — `interview/phases/{proposed|design|planning}.md` (from session phase)
 3. **Shared conventions** — `interview/base.md`
 
-Then a compact **node snapshot**, once per agent session. Every later turn carries only the **changes** since that session's previous turn, excluding its own writes, plus the turn instruction. Sessions rotate to a fresh snapshot instead of using `/compact`. Agents read and write through `tod-cli`. See [doc/new-reqs/interview-protocol.md](../../../doc/new-reqs/interview-protocol.md).
+Then a compact **task snapshot**, once per agent session. Every later turn carries only the **changes** since that session's previous turn, excluding its own writes, plus the turn instruction. Sessions rotate to a fresh snapshot instead of using `/compact`. Agents read and write through `tod-cli`. See [doc/new-reqs/interview-protocol.md](../../../doc/new-reqs/interview-protocol.md).
 
 | Phase key | Phase doc |
 |--|--|

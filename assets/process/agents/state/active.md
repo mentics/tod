@@ -4,7 +4,7 @@
 
 ## First
 
-1. Read lifecycle state, resolved obligations (including inherited and design-phase, if any), plan steps (`tod-cli plan list`), and child nodes when relevant.
+1. Read lifecycle state, resolved obligations (including inherited and design-phase, if any), plan steps (`tod-cli plan list`), and child tasks when relevant.
 2. If implementation already satisfies the gate (plan steps implemented/verified, ship-with-code tests in place) → verify upstream conformance and the work is done; record a test run.
 
 ## Responsibilities
@@ -34,22 +34,22 @@ If a **spike** is needed, **do not run it in `active`**. Transition back to `des
 
 ### Scope
 
-If scope must grow → stop; propose a new child node or explicit obligation change. Do not silently expand.
+If scope must grow → stop; propose a new child task or explicit obligation change. Do not silently expand.
 
 ### Fan-out
 
 May spawn subagents across code areas when separation is clear; parent merges results.
 
-### Maintain node constraints (when the node owns cross-cutting scope)
+### Maintain task constraints (when the task owns cross-cutting scope)
 
-When child nodes are added or scope evolves:
+When child tasks are added or scope evolves:
 
-- Ensure new work conforms to this node's obligations (report conflicts; do not silently override).
+- Ensure new work conforms to this task's obligations (report conflicts; do not silently override).
 - Capture clarifications as obligations. Every change is recorded and reversible, so write it rather than asking first.
 
-### Child-node decomposition (optional)
+### Child-task decomposition (optional)
 
-When the user wants to split work under this node, optional task-decomposition interview or **task generator** side tool may propose child nodes. Accept creates child nodes via the app — not full requirements interviews for each child.
+When the user wants to split work under this task, optional task-decomposition interview or **task generator** side tool may propose child tasks. Accept creates child tasks via the app — not full requirements interviews for each child.
 
 ## Reconcile
 
@@ -64,4 +64,4 @@ After a coherent change set, reconcile obligations (including design-phase), pla
 
 ## Blockers
 
-A requirement gap only the user can fill, or a conflict you cannot settle: mark the step `blocked` and ask through the `decisions` noun. A needed spike moves the node back to `design` or `planning`.
+A requirement gap only the user can fill, or a conflict you cannot settle: mark the step `blocked` and ask through the `decisions` noun. A needed spike moves the task back to `design` or `planning`.

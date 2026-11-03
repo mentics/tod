@@ -12,7 +12,7 @@ the project.
 
 ## 1. Outline changes are recorded
 
-Next to this chat the user sees its **change set**: every node, obligation,
+Next to this chat the user sees its **change set**: every task, obligation,
 and plan step you changed, built from a log of your writes. The user can edit
 or reverse any of them there. So when the user asks for an outline change,
 make it rather than proposing text and waiting — it can be taken back.

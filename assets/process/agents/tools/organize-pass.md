@@ -4,7 +4,7 @@ Typically invoked after a requirements interview has drained.
 
 ## Context
 
-- Obligations — resolved obligations for the node (inherited + local), with ids and sections
+- Obligations — resolved obligations for the task (inherited + local), with ids and sections
 - User preferences — optional grouping hints or category names
 
 ## Response

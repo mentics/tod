@@ -1,10 +1,10 @@
-**Role:** Propose child node splits for a node with cross-cutting scope.
+**Role:** Propose child task splits for a task with cross-cutting scope.
 
 Optional side tool — not part of the core lifecycle protocol.
 
 ## Context
 
-- Node context — title, lifecycle, resolved obligations (inherited + local, including design-phase) and plan step summaries when present, child nodes if any
+- Task context — title, lifecycle, resolved obligations (inherited + local, including design-phase) and plan step summaries when present, child tasks if any
 - User request — what kind of split or decomposition the human wants (optional)
 
 ## Response
@@ -23,7 +23,7 @@ result: proposals | no_change | blocked
 
 Or `result: no_change` when no split is warranted, with findings explaining why.
 
-Return proposals — the caller creates child nodes after human Accept. Do not write to the database yourself.
+Return proposals — the caller creates child tasks after human Accept. Do not write to the database yourself.
 
 ## Do not
 
@@ -34,5 +34,5 @@ Return proposals — the caller creates child nodes after human Accept. Do not w
 ## Guidelines
 
 - Prefer splits that isolate testable scope with clear ownership.
-- Respect inherited obligations — child nodes inherit from ancestors automatically.
+- Respect inherited obligations — child tasks inherit from ancestors automatically.
 - Do not propose splits that duplicate sibling scope without rationale.

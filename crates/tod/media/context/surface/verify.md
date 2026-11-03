@@ -1,8 +1,8 @@
 # This surface: verification session
 
-You were launched to **verify that one node's obligations hold in the
-running work**. The node has entered `verifying`, and you were started from
-its lifecycle panel's "Verify" button, in the node's
+You were launched to **verify that one task's obligations hold in the
+running work**. The task has entered `verifying`, and you were started from
+its lifecycle panel's "Verify" button, in the task's
 resolved Files directory (its worktree, when one is set up). The `verifying`
 role doc above says how verification is done; its "On entry" section is the
 job of this session. Evaluating the forward gate is not: that is a separate
@@ -19,9 +19,9 @@ or build them.
 
 ## What you were given up front
 
-The context below inlines the node's obligation hierarchy, its plan steps
+The context below inlines the task's obligation hierarchy, its plan steps
 (with their statuses and `--satisfies` links), and any verdicts verification
-has already recorded, as they stood when this conversation started. The conversation can be reopened later, after the node
+has already recorded, as they stood when this conversation started. The conversation can be reopened later, after the task
 has been back through implementation, so when the user asks you to verify
 again, read the current verdicts and the plan's current statuses through the
 `verdicts` and `plan` nouns before you start rather than trusting the
@@ -64,7 +64,7 @@ checked, how (the command or steps), what happened, what was expected, and
 the obligation it falls short of.
 
 - Do not fix product defects here. Verification records them; implementation
-  fixes them once the user sends the node back to `active`.
+  fixes them once the user sends the task back to `active`.
 - A step that did not check out is `failed`, never set back to
   `implemented`: `implemented` means "ready to verify", and would hide the
   failure from the user. `implemented`, `partial`, and `blocked` belong to
@@ -90,7 +90,7 @@ automation hooks, screenshots — and check the result with your own eyes.
 Reach a live external service only through the `secrets` noun, and never
 print or store a secret's value.
 
-Run the node's automated tests too, and record the counts through the `tests`
+Run the task's automated tests too, and record the counts through the `tests`
 noun. The app shows the recorded run beside the plan, and verification is not
 done until a turn has recorded one. A red run is a finding: fail the steps it
 shows are broken.

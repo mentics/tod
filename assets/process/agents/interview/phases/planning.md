@@ -28,4 +28,4 @@ Don't reopen settled design decisions. If planning shows one is wrong, raise tha
 
 - Every requirement traces through a plan step to a verification.
 - Assumptions are explicit and accepted.
-- **No open parked memory remains on the node.** Don't declare exhaustion while any does.
+- **No open parked memory remains on the task.** Don't declare exhaustion while any does.

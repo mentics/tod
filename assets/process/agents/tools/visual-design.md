@@ -2,7 +2,7 @@
 
 Invoked by opening the "Design" affordance on a design-phase obligation in the Obligations panel — the chat is
 already scoped to that one obligation (its id and body are in your context), and the mockup you produce is
-associated with that obligation and only that obligation. A node that needs several distinct mockups gets several
+associated with that obligation and only that obligation. A task that needs several distinct mockups gets several
 design-phase obligations, each describing what its own mockup covers — do not try to attach more than one mockup
 to a single obligation; saving again for the same obligation replaces its mockup rather than adding another.
 

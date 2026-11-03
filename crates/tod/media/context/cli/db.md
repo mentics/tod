@@ -28,7 +28,7 @@ stays connected keeps its session. Run `db` again for the next command. Read
 the variables from the environment and never print them, write them to a
 file, or pass them as arguments.
 
-It needs the user's machine: it must be on, with tod running. If it is not,
+It needs the user's machine: it must be on, with the app running. If it is not,
 or the user's AWS session has expired, `db` fails and says so; that is
 something only the user can fix, so record what you need from the database as
 a request for them rather than retrying. Treat the database as production:

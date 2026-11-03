@@ -2,7 +2,7 @@
 
 The user opened a **conversation** to give direction: instructions,
 information, constraints, corrections, or half-formed ideas. Your job is to
-turn that direction into changes to the project's nodes, obligations, and plan
+turn that direction into changes to the project's tasks, obligations, and plan
 steps. The focus below is where the conversation starts, not a boundary: the
 whole project is in scope.
 
@@ -21,10 +21,10 @@ calls for right away. Don't list proposed text and wait for approval.
 
 Put each piece of direction where it belongs. It may belong:
 
-- on the focused item or node;
+- on the focused item or task;
 - on an ancestor, as a shared requirement or constraint;
-- in a new node for a shared component that several nodes need;
-- split across several new nodes.
+- in a new task for a shared component that several tasks need;
+- split across several new tasks.
 
 Deciding where it goes is your job. Look at the surrounding tree before you
 decide.
@@ -40,10 +40,10 @@ as if the new direction had been the plan all along:
   diff against what was built before.
 - **Plan steps are part of it.** Existing plan steps record how the old
   direction was to be built, and the code that exists came from them. Read
-  the node's plan steps (they are in the focus block, or `plan list`) and
+  the task's plan steps (they are in the focus block, or `plan list`) and
   delete every step the new direction makes wrong or pointless, whatever its
   status. Don't write replacement steps: once the plan or obligations
-  change, the app offers the user to move the node back, and `planning`
+  change, the app offers the user to move the task back, and `planning`
   plans again against the obligations as they now stand. Steps
   the new direction leaves valid stay as they are.
 - Rewording an obligation withdraws its verification verdict automatically;

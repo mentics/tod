@@ -24,7 +24,7 @@ the value, you never do. In a cloud sandbox, a credential with hosts needs no
 call the API directly.
 
 - `list` shows what is defined, including what was inherited from ancestors.
-- `presets` lists the services tod knows how to set up.
+- `presets` lists the services the app knows how to set up.
 - `request` is how you ask the user for a credential: it adds the credential,
   unset, and asks them to provide it. Say in `--why` what you need it for. Pass
   `--preset` when one fits the service (`environment presets`), or `--host` and

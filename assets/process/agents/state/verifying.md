@@ -4,7 +4,7 @@
 
 ## First
 
-This runs as the node's verification conversation: the runner starts it, or the conversation view's **Verify**.
+This runs as the task's verification conversation: the runner starts it, or the conversation view's **Verify**.
 
 1. Read lifecycle state, resolved obligations (including inherited and design-phase) and plan steps, implementation, and evidence from `active`.
 2. Ship-with-code tests should already exist from `active`.
@@ -56,9 +56,9 @@ Complete self-review before `review`. **`review` is not where functional bugs ar
 
 **Do not treat `review` as the place that finds bugs.** Leave `verifying` only when near-certain the work is ready to release.
 
-- **Every requirement** in the applicable obligations (the node's and its ancestors', including design-phase) has been checked and has a verdict, and is **traceable** through the plan steps that satisfy it (each `verified`).
+- **Every requirement** in the applicable obligations (the task's and its ancestors', including design-phase) has been checked and has a verdict, and is **traceable** through the plan steps that satisfy it (each `verified`).
 - Verification was **agent-executed** in the work's running context (a harness built if needed).
-- **Constraints, both directions:** the implementation does nothing this node's or an inherited constraint forbids, and does everything one requires. A constraint that breaks is a `failed` verdict naming what breaks it.
+- **Constraints, both directions:** the implementation does nothing this task's or an inherited constraint forbids, and does everything one requires. A constraint that breaks is a `failed` verdict naming what breaks it.
 - Upstream conformance **revalidated** (or skipped only for unchanged files).
 - **Self-code review** completed.
 - Verification extras defined as obligations (static analysis, and so on) are satisfied.
