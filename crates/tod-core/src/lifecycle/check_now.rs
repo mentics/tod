@@ -31,6 +31,10 @@ pub struct CheckNow {
     /// `merged`). `GithubCheck::Unreadable` is the look failing: the caller
     /// shows it.
     pub github: Option<GithubCheck>,
+    /// Why a clear gate was not advanced through: what the autopilot would
+    /// have waited on or worked first (see [`check_now`]). `None` when
+    /// nothing held it.
+    pub held: Option<String>,
 }
 
 /// The states whose standing depends on the node's pull requests.
@@ -51,14 +55,32 @@ pub fn check_now(fleet: &FleetStore, node: Uuid, data_root: &std::path::Path) ->
     }
     let branch_template = tod_store::TodSettings::load(&tod_store::TodPaths::at(data_root))?.branch_template;
     let gate = settle_gate(fleet, node, &branch_template)?;
-    let advanced = if gate.clear() { advance(fleet, node)? } else { None };
-    let state = current_state(fleet, node)?;
-    let github = if reads_github(&state) {
-        Some(check_github(fleet, node, data_root, &state)?)
-    } else {
-        None
+    let from = current_state(fleet, node)?;
+    // `pr_draft` reads GitHub before the gate, as the autopilot's
+    // `hold_for_github` does: a draft waiting for a person to mark it ready
+    // and review it is not advanced past.
+    let mut github = if from == "pr_draft" { Some(check_github(fleet, node, data_root, &from)?) } else { None };
+    let mut held = match &github {
+        Some(GithubCheck::Waiting { what, .. }) => Some(what.clone()),
+        // The autopilot's babysitter gives the agent this before the gate.
+        Some(GithubCheck::Feedback { what }) => Some(format!("the pull request needs the agent: {what}")),
+        _ => None,
     };
-    Ok(CheckNow { gate, advanced, github })
+    // The babysitter also stops short of the gate while a decision is open.
+    if held.is_none() && matches!(from.as_str(), "pr_draft" | "pr_review") {
+        let pending = fleet
+            .read(|conn| Ok(tod_store::decisions::DecisionRepo::new(conn).list_pending_for_node(node)?))?
+            .len();
+        if pending > 0 {
+            held = Some(format!("{pending} decision(s) are waiting for an answer"));
+        }
+    }
+    let advanced = if gate.clear() && held.is_none() { advance(fleet, node)? } else { None };
+    let state = current_state(fleet, node)?;
+    if reads_github(&state) && (state != from || github.is_none()) {
+        github = Some(check_github(fleet, node, data_root, &state)?);
+    }
+    Ok(CheckNow { gate, advanced, github, held })
 }
 
 #[cfg(test)]
@@ -184,12 +206,16 @@ mod tests {
         fx.fleet.writer().flush().unwrap();
         fx.fleet.reload_if_stale().ok();
         enable_lifecycle(&fx, "pr_draft");
+        // The gate itself is clear: only the hold keeps the node here.
+        retire_all_criteria(&fx);
         crate::pr_readiness::set_feed_override(Some(Arc::new(Draft)));
 
         let found = check_now(&fx.fleet, fx.node, &fx.root).unwrap();
         // A draft is not ready for review: the node stays, and the wait on
         // the pull request is recorded.
+        assert!(found.gate.clear(), "{found:?}");
         assert!(found.advanced.is_none(), "a draft must not pass its gate: {found:?}");
+        assert!(found.held.as_deref().is_some_and(|h| h.contains("marked ready")), "{:?}", found.held);
         assert_eq!(current_state(&fx.fleet, fx.node).unwrap(), "pr_draft");
         assert!(matches!(found.github, Some(GithubCheck::Waiting { .. })), "{:?}", found.github);
         assert_eq!(pending_specs(&fx), ["github:pr:42:ready_for_review"]);
