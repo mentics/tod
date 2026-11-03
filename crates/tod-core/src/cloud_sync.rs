@@ -2179,8 +2179,9 @@ pub fn wake_node_with(fleet: &FleetStore, root: &Path, node_id: &str, fresh_sess
 }
 
 pub use tod_store::node_requests::{
-    KIND_CHECK_NOW as REQUEST_CHECK_NOW, KIND_FRESH_SESSION as REQUEST_FRESH_SESSION, KIND_KEEP_GOING as REQUEST_KEEP_GOING,
-    KIND_RUN as REQUEST_RUN,
+    KIND_CHECK_NOW as REQUEST_CHECK_NOW, KIND_FRESH_BUDGET as REQUEST_FRESH_BUDGET,
+    KIND_FRESH_SESSION as REQUEST_FRESH_SESSION, KIND_KEEP_GOING as REQUEST_KEEP_GOING, KIND_PAUSE as REQUEST_PAUSE,
+    KIND_RUN as REQUEST_RUN, KIND_STOP_NOW as REQUEST_STOP_NOW,
 };
 
 /// Writes the node's `starting` run state (`tod_store::run_state`) before
@@ -2222,17 +2223,29 @@ pub fn record_node_request(fleet: &FleetStore, node_id: &str, kind: &str) -> Res
 /// it, whenever it next wakes). A request to run or to go on also answers the
 /// node's stop question to continue (2.1), for a supervisor that reads only
 /// that; a new session also leaves the marker file an older supervisor reads.
+/// A `pause` or `stop_now` is not a request to run: it records, syncs and
+/// pokes only (no stop answer, no "starting" state), and `stop_now` also
+/// leaves the marker ([`crate::autopilot::STOP_NOW_REQUEST_FILE`]) a turn in
+/// flight sees before the row arrives. `fresh_budget` goes as a request to run.
 pub fn wake_node_requesting(fleet: &FleetStore, root: &Path, node_id: &str, kind: &str) -> Result<String> {
     let fresh_session = kind == REQUEST_FRESH_SESSION;
+    let stops = matches!(kind, REQUEST_PAUSE | REQUEST_STOP_NOW);
     let row = cloud_node(fleet, node_id).ok_or_else(|| anyhow!("this node does not run in the cloud"))?;
     let (orch, user) = resolve(root)?;
     // Before the sync, so the answer and the row travel with it: a supervisor
     // that reads "left stopped" would ignore the request.
-    if kind != REQUEST_CHECK_NOW {
+    if kind != REQUEST_CHECK_NOW && !stops {
         continue_over_stop_answer(fleet, node_id)?;
     }
+    // A fresh budget also answers the budget question still waiting, or the
+    // pending decision would stop the run again before it used it.
+    if kind == REQUEST_FRESH_BUDGET {
+        continue_over_pending_budget_question(fleet, node_id)?;
+    }
     record_node_request(fleet, node_id, kind)?;
-    record_starting(fleet, node_id)?;
+    if !stops {
+        record_starting(fleet, node_id)?;
+    }
     sync(fleet, root, &orch, &user).context("send the change to the orchestrator")?;
     let sandboxes = tod_store::fleet::sandbox::Sandboxes::load(root)?;
     let bx = sandboxes.blaxel()?;
@@ -2288,6 +2301,15 @@ pub fn wake_node_requesting(fleet: &FleetStore, root: &Path, node_id: &str, kind
         bx.upload(&url, &request, b"", "0644")
             .with_context(|| format!("ask the supervisor for a new session ({request})"))?;
     }
+    if kind == REQUEST_STOP_NOW {
+        let request = format!(
+            "{}/{node_id}/{}",
+            tod_store::fleet::cli_relay::SUPERVISOR_STATE_ROOT,
+            crate::autopilot::STOP_NOW_REQUEST_FILE
+        );
+        bx.upload(&url, &request, b"", "0644")
+            .with_context(|| format!("ask the supervisor to stop the turn now ({request})"))?;
+    }
     let poke = format!("{}/port/{}/poke", url.trim_end_matches('/'), tod_sandbox::blaxel::RELAY_PORT);
     let resp = ureq::post(&poke)
         .header("Authorization", &format!("Bearer {}", bx.token()))
@@ -2314,12 +2336,33 @@ pub const RUN_REQUEST_ACTOR: &str = "app:run-with-a-new-session";
 /// old answer and go back to sleep. Answers are append-only, so the earlier
 /// one stays in the log. Returns the decision answered, if any.
 pub fn continue_over_stop_answer(fleet: &FleetStore, node_id: &str) -> Result<Option<uuid::Uuid>> {
+    use crate::stop_questions::Answer;
+    let node = uuid::Uuid::parse_str(node_id).with_context(|| format!("node id {node_id}"))?;
+    answer_latest_to_continue(fleet, node, |latest| latest.answer == Answer::Stop)
+}
+
+/// "Resume with a fresh budget": if the node's latest stop question is the
+/// budget one and still unanswered, it is answered to continue (which grants
+/// the budget, `tod_supervisor::answers`). Returns the decision answered, if any.
+pub fn continue_over_pending_budget_question(fleet: &FleetStore, node_id: &str) -> Result<Option<uuid::Uuid>> {
     use crate::stop_questions::{self, Answer};
     let node = uuid::Uuid::parse_str(node_id).with_context(|| format!("node id {node_id}"))?;
+    answer_latest_to_continue(fleet, node, |latest| {
+        latest.answer == Answer::Pending && latest.kind == stop_questions::BUDGET
+    })
+}
+
+/// Answers the node's latest stop question to continue when `wanted` says so.
+fn answer_latest_to_continue(
+    fleet: &FleetStore,
+    node: uuid::Uuid,
+    wanted: impl Fn(&crate::stop_questions::Latest) -> bool,
+) -> Result<Option<uuid::Uuid>> {
+    use crate::stop_questions;
     let Some(latest) = fleet.read(|conn| stop_questions::latest(conn, node))? else {
         return Ok(None);
     };
-    if latest.answer != Answer::Stop {
+    if !wanted(&latest) {
         return Ok(None);
     }
     let decision = fleet

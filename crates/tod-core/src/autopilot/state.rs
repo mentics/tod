@@ -15,6 +15,11 @@ use uuid::Uuid;
 /// stopping point, or when it wakes.
 pub const FRESH_SESSION_REQUEST_FILE: &str = "fresh-session";
 
+/// The file the app puts in a cloud node's supervisor state directory to
+/// cancel the turn in flight ("Stop now"): the supervisor sees it while the
+/// turn runs, cancels it and deletes the file.
+pub const STOP_NOW_REQUEST_FILE: &str = "stop-now";
+
 pub(crate) fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

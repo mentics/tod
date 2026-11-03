@@ -33,7 +33,7 @@ mod state;
 #[cfg(test)]
 mod tests;
 
-pub use state::{AutopilotState, CYCLE_LIMIT, CurrentStep, FRESH_SESSION_REQUEST_FILE, LoopCounters, StepRecord, state_path};
+pub use state::{AutopilotState, CYCLE_LIMIT, CurrentStep, FRESH_SESSION_REQUEST_FILE, LoopCounters, STOP_NOW_REQUEST_FILE, StepRecord, state_path};
 
 use crate::conversation::driver::{
     AgentAccess, ConversationConfig, ConversationDriver, ConversationEvent, ConversationStatus,
@@ -492,7 +492,11 @@ impl Autopilot {
                 self.start_fresh_session()?;
             }
             let at = state::now_ms();
-            for request in &requests {
+            // Not Pause and Stop now (a supervised node's): the run's first
+            // boundary stops at them, and consumes them there.
+            for request in requests.iter().filter(|r| {
+                !matches!(r.kind.as_str(), tod_store::node_requests::KIND_PAUSE | tod_store::node_requests::KIND_STOP_NOW)
+            }) {
                 fleet
                     .interview(
                         LOCAL_CONSUMER,

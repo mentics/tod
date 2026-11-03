@@ -112,6 +112,8 @@ struct Hook<'a> {
     state_dir: &'a std::path::Path,
     /// A request for a new session found, to take.
     fresh_pending: bool,
+    /// A "Stop now" found while a turn ran (its marker), to take.
+    stop_pending: bool,
     /// Who consumes requests (`consumed_by`).
     consumer: String,
     /// The last context mark taken.
@@ -138,6 +140,30 @@ pub const FRESH_SESSION_REQUESTED: &str = "new session requested";
 /// beside the request row, `tod_store::node_requests`).
 fn fresh_marker(state_dir: &std::path::Path) -> bool {
     state_dir.join(tod_core::autopilot::FRESH_SESSION_REQUEST_FILE).exists()
+}
+
+/// Whether the marker file asking to stop the turn now is there (the app
+/// writes it beside the `stop_now` row, which arrives only with the next
+/// pull: the file is what a turn in flight sees).
+fn stop_marker(state_dir: &std::path::Path) -> bool {
+    state_dir.join(tod_core::autopilot::STOP_NOW_REQUEST_FILE).exists()
+}
+
+/// Takes the requests to pause or stop: deletes the stop marker (an error
+/// removing one that is there is returned, never left to stop the next run)
+/// and consumes the pending `pause` and `stop_now` rows.
+fn take_stop_requests(state_dir: &std::path::Path, fleet: &FleetStore, node: Uuid, by: &str) -> Result<()> {
+    let path = state_dir.join(tod_core::autopilot::STOP_NOW_REQUEST_FILE);
+    match std::fs::remove_file(&path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(anyhow::anyhow!("remove {}: {e}", path.display())),
+    }
+    let stops: Vec<_> = pending_requests(fleet, node)?
+        .into_iter()
+        .filter(|r| matches!(r.kind.as_str(), tod_store::node_requests::KIND_PAUSE | tod_store::node_requests::KIND_STOP_NOW))
+        .collect();
+    consume_requests(fleet, &stops, by)
 }
 
 /// The node's requests not yet consumed (`tod_store::node_requests`).
@@ -191,6 +217,10 @@ impl StepHook for Hook<'_> {
         // current, and taking the request drops it).
         // Only the marker file is seen mid-turn: a request row arrives with
         // the next pull, at a boundary ([`StepHook::at`]).
+        if stop_marker(self.state_dir) {
+            self.stop_pending = true;
+            return Some(tod_core::autopilot::local::STOPPED.to_string());
+        }
         if fresh_marker(self.state_dir) {
             self.fresh_pending = true;
             return Some(FRESH_SESSION_REQUESTED.to_string());
@@ -248,6 +278,19 @@ impl StepHook for Hook<'_> {
             }
         }
         let pending = pending_requests(fleet, self.node)?;
+        // The user's Stop now and Pause end the run here, at the boundary:
+        // taken (and the marker deleted) now, so the next wake does not stop
+        // again. Stop now is read first: it is the stronger word.
+        let stop_now = stop_marker(self.state_dir)
+            || tod_store::node_requests::any_of(&pending, tod_store::node_requests::KIND_STOP_NOW);
+        if stop_now || tod_store::node_requests::any_of(&pending, tod_store::node_requests::KIND_PAUSE) {
+            take_stop_requests(self.state_dir, fleet, self.node, &self.consumer)?;
+            return Ok(Some(if stop_now {
+                tod_core::autopilot::local::STOPPED.to_string()
+            } else {
+                tod_core::autopilot::local::PAUSED.to_string()
+            }));
+        }
         if fresh_marker(self.state_dir)
             || tod_store::node_requests::any_of(&pending, tod_store::node_requests::KIND_FRESH_SESSION)
         {
@@ -348,6 +391,12 @@ pub fn stop_reason(outcome: &Outcome, budget: &Budget) -> Option<String> {
         // The hook stops for a wait as "waiting: ..."; a usage limit is a
         // wait the supervisor recorded and scheduled.
         Outcome::Stopped { reason } if reason.starts_with("waiting") || reason.starts_with("usage limit: waiting") => None,
+        Outcome::Stopped { reason } if reason == tod_core::autopilot::local::PAUSED => {
+            Some("you paused it; resume it to carry on".to_string())
+        }
+        Outcome::Stopped { reason } if reason == tod_core::autopilot::local::STOPPED => {
+            Some("you stopped it; run it again to carry on".to_string())
+        }
         Outcome::Stopped { reason } => Some(format!("the supervisor stopped: {reason}")),
         Outcome::BudgetExhausted { limit } => Some(budget_reason(limit, budget)),
         Outcome::NeedsHuman { reason } => match reason {
@@ -495,7 +544,19 @@ pub fn wake(config: Config) -> Result<Woke> {
     let consumer = format!("supervisor:{}:pid{}", config.sandbox, std::process::id());
     let requested = pending_requests(&store, config.node)?;
     let run_requested = fresh_marker(&config.state_dir) || tod_store::node_requests::asks_to_run(&requested);
-    let budget = match answers::before_wake_with(&store, config.node, &config.state_dir, config.budget, run_requested)? {
+    let fresh_budget: Vec<Uuid> = requested
+        .iter()
+        .filter(|r| r.kind == tod_store::node_requests::KIND_FRESH_BUDGET)
+        .map(|r| r.id)
+        .collect();
+    let budget = match answers::before_wake_requested(
+        &store,
+        config.node,
+        &config.state_dir,
+        config.budget,
+        run_requested,
+        &fresh_budget,
+    )? {
         answers::Before::LeaveStopped(reason) => {
             // Say so, as a wait does below: the app waits to hear from a
             // supervisor it woke, and a wake that leaves the node stopped is
@@ -526,6 +587,9 @@ pub fn wake(config: Config) -> Result<Woke> {
         let looked: Vec<_> =
             requested.iter().filter(|r| r.kind == tod_store::node_requests::KIND_CHECK_NOW).cloned().collect();
         consume_requests(&store, &looked, &consumer)?;
+        // Nothing is running to pause or stop: those are taken, not kept for
+        // the next run to stop at once.
+        take_stop_requests(&config.state_dir, &store, config.node, &consumer)?;
         schedule(&store, &config)?;
         // Say so: the app waits to hear from a supervisor it started (a
         // reinstall, "Check now"), and a wake that finds nothing due is an
@@ -597,6 +661,7 @@ pub fn wake(config: Config) -> Result<Woke> {
         push_branch: config.push_branch,
         state_dir: &config.state_dir,
         fresh_pending: false,
+        stop_pending: false,
         consumer: consumer.clone(),
         context_seen: context::load_seen(&config.state_dir),
         context_pending: None,
@@ -613,11 +678,23 @@ pub fn wake(config: Config) -> Result<Woke> {
         tracing::info!("a new session was requested: the run starts in one");
     }
     // The run starts: the rest of what was asked is taken with it.
-    consume_requests(&store, &pending_requests(&store, config.node)?, &consumer)?;
+    // Not Pause and Stop now: the run's first boundary stops at them.
+    let taken: Vec<_> = pending_requests(&store, config.node)?
+        .into_iter()
+        .filter(|r| !matches!(r.kind.as_str(), tod_store::node_requests::KIND_PAUSE | tod_store::node_requests::KIND_STOP_NOW))
+        .collect();
+    consume_requests(&store, &taken, &consumer)?;
     let run = Autopilot::new(conversation, config.node, budget)
         .map(|pilot| pilot.with_poll_interval(config.poll))
         .and_then(|mut pilot| loop {
             let outcome = pilot.run_with(&store, &mut agent, &mut hook)?;
+            if std::mem::take(&mut hook.stop_pending) {
+                // Stopped mid-turn by the user's Stop now: take it, and end
+                // the run stopped (the turn is kept as current).
+                take_stop_requests(&config.state_dir, &store, config.node, &consumer)?;
+                tracing::info!("took a request to stop now");
+                break Ok(outcome);
+            }
             if std::mem::take(&mut hook.fresh_pending) {
                 // Stopped for a request made while it ran: end the turn's
                 // agent session and go on in a new one.
@@ -769,8 +846,16 @@ mod tests {
         assert_eq!(reason(Outcome::Stopped { reason: "waiting: a review".into() }), None);
         assert_eq!(reason(Outcome::Stopped { reason: usage_limit_reason(&usage_limit::UsageLimit { reset_at_ms: 5, parsed: true }) }), None);
         assert_eq!(
-            reason(Outcome::Stopped { reason: "the user paused it".into() }).as_deref(),
-            Some("the supervisor stopped: the user paused it")
+            reason(Outcome::Stopped { reason: "an unknown reason".into() }).as_deref(),
+            Some("the supervisor stopped: an unknown reason")
+        );
+        assert_eq!(
+            reason(Outcome::Stopped { reason: tod_core::autopilot::local::PAUSED.into() }).as_deref(),
+            Some("you paused it; resume it to carry on")
+        );
+        assert_eq!(
+            reason(Outcome::Stopped { reason: tod_core::autopilot::local::STOPPED.into() }).as_deref(),
+            Some("you stopped it; run it again to carry on")
         );
         let spent = reason(Outcome::BudgetExhausted { limit: BudgetLimit::Sessions { used: 60, elapsed_secs: 5 * 60 } }).unwrap();
         assert!(spent.contains("60 of 60 sessions") && spent.contains("0.1 of 16 hours") && spent.contains("Keep going"), "{spent}");
