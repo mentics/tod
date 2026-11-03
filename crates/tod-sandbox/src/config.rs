@@ -316,9 +316,19 @@ impl Config {
             "# tod's cloud sandboxes; managed by `tod-sandbox`.\n{}",
             toml::to_string_pretty(self)?
         );
-        let tmp = path.with_extension("toml.tmp");
+        // A temp file of its own per save, so two saves at once (threads, or
+        // the app and the daemon) never write or rename each other's file.
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let tmp = path.with_extension(format!(
+            "toml.tmp.{}.{}",
+            std::process::id(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
         std::fs::write(&tmp, text).with_context(|| format!("write {}", tmp.display()))?;
-        std::fs::rename(&tmp, path).with_context(|| format!("write {}", path.display()))
+        std::fs::rename(&tmp, path).map_err(|err| {
+            let _ = std::fs::remove_file(&tmp);
+            anyhow::Error::new(err).context(format!("write {}", path.display()))
+        })
     }
 
     pub fn sandbox(&self, name: &str) -> Option<&Sandbox> {
