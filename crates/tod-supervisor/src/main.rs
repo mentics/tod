@@ -190,11 +190,21 @@ fn run(args: &[String]) -> Result<()> {
         Ok(woke) => woke,
         Err(err) => return Err(retry.after_error(err)),
     };
+    // Another supervisor has the node: nothing here ran, so nothing here
+    // ended; the schedule and the failure count are the running one's.
+    if let Woke::AlreadyRunning { holder } = &woke {
+        match holder {
+            Some(pid) => eprintln!("tod-supervisor: another supervisor (pid {pid}) is already running this node; poked it and exiting"),
+            None => eprintln!("tod-supervisor: another supervisor is already running this node; exiting"),
+        }
+        return Ok(());
+    }
     // An orderly end: the next failure backs off from the start again.
     tod_supervisor::waits::save_count(&retry.state_dir, tod_supervisor::waits::WAKE_ERRORS_FILE, 0)?;
     match woke {
         Woke::StillWaiting(reason) => eprintln!("tod-supervisor: still waiting ({reason})"),
         Woke::LeftStopped(reason) => eprintln!("tod-supervisor: left stopped ({reason})"),
+        Woke::AlreadyRunning { .. } => unreachable!("returned above"),
         Woke::Ran(outcome) => eprintln!("tod-supervisor: stopped: {}", serde_json::to_string(&outcome)?),
     }
     Ok(())

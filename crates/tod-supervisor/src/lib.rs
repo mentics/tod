@@ -34,8 +34,10 @@ pub mod context;
 pub mod git;
 pub mod guard;
 pub mod hold;
+pub mod lock;
 pub mod orchestrator;
 pub mod problems;
+pub mod progress;
 pub mod replica;
 pub mod signal;
 pub mod transcripts;
@@ -94,6 +96,9 @@ pub enum Woke {
     LeftStopped(String),
     /// The autopilot ran and stopped.
     Ran(Outcome),
+    /// Another supervisor holds this node's lock ([`lock`]): this one did
+    /// nothing, changed no schedule, and poked the holder to look again.
+    AlreadyRunning { holder: Option<u32> },
 }
 
 /// The autopilot's hook: sync at every boundary, and stop for a wait.
@@ -111,6 +116,10 @@ struct Hook<'a> {
     context_seen: i64,
     /// A newer mark found at the last boundary, to take.
     context_pending: Option<i64>,
+    /// Proof of work moving, for the hold and the heartbeat ([`progress`]).
+    progress: &'a progress::Progress,
+    /// The reply as it was when it last moved.
+    last_parts: Vec<tod_agent::ReplyPart>,
     /// The reply in flight last sent to the app, and when.
     live_sent: Option<(std::time::Instant, Vec<tod_agent::ReplyPart>)>,
 }
@@ -141,6 +150,11 @@ impl StepHook for Hook<'_> {
         if fresh_requested(self.state_dir) {
             self.fresh_pending = true;
             return Some(FRESH_SESSION_REQUESTED.to_string());
+        }
+        if turn.status.parts != self.last_parts {
+            // The agent said or did something: work is moving.
+            self.progress.mark();
+            self.last_parts = turn.status.parts.clone();
         }
         let (Some(conversation), parts) = (turn.conversation_id, &turn.status.parts) else {
             return None;
@@ -174,6 +188,7 @@ impl StepHook for Hook<'_> {
         // A turn ended or a step did: what was in flight is stored now, or
         // gone. The push below carries the deletion.
         self.live_sent = None;
+        self.progress.mark();
         self.replica.lock().unwrap_or_else(|e| e.into_inner()).clear_live_turn(self.node)?;
         if signal::take_poke() {
             tracing::info!("poked: looking again");
@@ -303,7 +318,7 @@ pub fn stop_reason(outcome: &Outcome, budget: &Budget) -> Option<String> {
 /// The reason a wake that ended with `woke` leaves in the beat.
 fn woke_reason(woke: &Woke, budget: &Budget) -> Option<String> {
     match woke {
-        Woke::StillWaiting(_) => None,
+        Woke::StillWaiting(_) | Woke::AlreadyRunning { .. } => None,
         Woke::LeftStopped(reason) => Some(reason.clone()),
         Woke::Ran(outcome) => stop_reason(outcome, budget),
     }
@@ -342,6 +357,10 @@ fn ask(store: &FleetStore, node: Uuid, conversation: Option<Uuid>, kind: &str, q
     Ok(())
 }
 
+/// What is added to the agent's hang limit to give the time without progress
+/// after which the supervisor stops claiming to be working.
+const STALL_MARGIN: Duration = Duration::from_secs(10 * 60);
+
 /// A phase of starting up that takes longer than this is a warning, so it
 /// reaches the app's log panel (only warnings and errors are forwarded):
 /// the app waits `SUPERVISOR_REPORTS_WITHIN` for the first heartbeat, and
@@ -350,9 +369,10 @@ const SLOW_PHASE: Duration = Duration::from_secs(15);
 
 /// Runs `f`, logging how long the startup phase `name` took (and warning when
 /// it was slow, see [`SLOW_PHASE`]).
-fn phase<T>(name: &str, since_wake: std::time::Instant, f: impl FnOnce() -> T) -> T {
+fn phase<T>(name: &str, since_wake: std::time::Instant, progress: &progress::Progress, f: impl FnOnce() -> T) -> T {
     let started = std::time::Instant::now();
     let out = f();
+    progress.mark();
     let took = started.elapsed();
     let at = since_wake.elapsed().as_secs();
     if took >= SLOW_PHASE {
@@ -367,11 +387,34 @@ fn phase<T>(name: &str, since_wake: std::time::Instant, f: impl FnOnce() -> T) -
 pub fn wake(config: Config) -> Result<Woke> {
     let began = std::time::Instant::now();
     signal::install();
+    // One supervisor per node: before anything is touched, the schedule
+    // included. A second one (the dead-man retry wake firing during a long
+    // run, a poke racing the relay's own start) says so and leaves.
+    let _lock = match lock::acquire(&config.state_dir)? {
+        lock::Taken::Held(lock) => lock,
+        lock::Taken::Busy { holder } => {
+            match holder {
+                Some(pid) => {
+                    tracing::info!(pid, "another supervisor is already running this node; poking it to look again");
+                    if let Err(err) = lock::poke_holder(pid) {
+                        tracing::warn!("could not poke the running supervisor: {err:#}");
+                    }
+                }
+                None => tracing::info!("another supervisor is already running this node"),
+            }
+            return Ok(Woke::AlreadyRunning { holder });
+        }
+    };
+    let progress = progress::Progress::new(progress::path(&config.state_dir));
+    // How long without a mark means wedged: a hung agent is cancelled by its
+    // guard after `hang_after`, so this is that and the time a cancelled run
+    // takes to reach a boundary.
+    let stall = config.guards.hang_after + STALL_MARGIN;
     // Hold the sandbox awake from the start: seeding a new replica from the
     // orchestrator can outlast the relay's poke hold, and the sandbox must
     // not go to standby mid-seed. Released when the wake returns, including
     // when it finds nothing to do.
-    let hold = HoldGuard::take(config.holder.clone());
+    let hold = HoldGuard::take_gated(config.holder.clone(), hold::LEASE_SECS, hold::RENEW_EVERY, Some((progress.clone(), stall)));
     // Say so before anything slow: seeding a new copy and restoring
     // transcripts can take minutes, and the app waits `SUPERVISOR_REPORTS_WITHIN`
     // for a first word. The local copy does not exist yet to record it in, so
@@ -383,12 +426,12 @@ pub fn wake(config: Config) -> Result<Woke> {
     if let Err(err) = config.orchestrator.push_starting_beat(config.node, waits_now_ms()) {
         tracing::warn!("the starting heartbeat could not be sent: {err:#}");
     }
-    let replica = phase("open the local copy (seeding it from the orchestrator when new)", began, || {
+    let replica = phase("open the local copy (seeding it from the orchestrator when new)", began, &progress, || {
         Replica::open(&config.state_dir, config.orchestrator.clone(), config.node, &config.workspace)
     })?;
     let replica = Arc::new(Mutex::new(replica));
     let store = replica.lock().unwrap_or_else(|e| e.into_inner()).store().clone();
-    phase("pull the orchestrator's changes", began, || replica.lock().unwrap_or_else(|e| e.into_inner()).pull())?;
+    phase("pull the orchestrator's changes", began, &progress, || replica.lock().unwrap_or_else(|e| e.into_inner()).pull())?;
 
     let budget = match answers::before_wake_with(
         &store,
@@ -444,7 +487,7 @@ pub fn wake(config: Config) -> Result<Woke> {
     let follow = match &config.transcripts {
         Some((projects, sink)) => {
             let mirror = Arc::new(Mirror::new(projects.clone(), sink.clone()));
-            match phase("restore agent transcripts", began, || mirror.restore()) {
+            match phase("restore agent transcripts", began, &progress, || mirror.restore()) {
                 Ok(0) => {}
                 Ok(n) => tracing::info!(n, "restored agent transcripts"),
                 Err(err) => tracing::warn!("restoring transcripts: {err:#}"),
@@ -463,7 +506,9 @@ pub fn wake(config: Config) -> Result<Woke> {
         context: InterviewContextSettings::default(),
     };
     // From here the autopilot runs: say so to the app, and keep saying it.
-    let beating = phase("first heartbeat", began, || beat::Beating::start(replica.clone(), config.node, beat::BEAT_EVERY))?;
+    let beating = phase("first heartbeat", began, &progress, || {
+        beat::Beating::start_gated(replica.clone(), config.node, beat::BEAT_EVERY, Some((progress.clone(), stall)))
+    })?;
     let mut agent = Guarded::new(
         Syncing::new(config.agent.provider(&data_root), replica.clone()),
         config.guards.hang_after,
@@ -485,6 +530,8 @@ pub fn wake(config: Config) -> Result<Woke> {
         fresh_pending: false,
         context_seen: context::load_seen(&config.state_dir),
         context_pending: None,
+        progress: &progress,
+        last_parts: Vec::new(),
         live_sent: None,
     };
     // Asked for while the supervisor slept: this run starts in a new session.

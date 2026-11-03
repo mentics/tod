@@ -11,13 +11,14 @@
 //! exactly as long as it is `set(reason, true)`, and its own liveness check
 //! (the foreground-job poll, the agent's pending-request tracking) is what
 //! keeps it valid, so the relay renews the underlying process for it on its
-//! own, in a rolling window, as long as it is still set. Or it is **leased**
+//! own, in a rolling window (`LEASELESS_WINDOW_SECS`), as long as it is still set. Or it is **leased**
 //! (`lease`, taken by an external caller such as the supervisor): it holds
 //! until a deadline, and ends there unless renewed with a later one before
 //! then — a caller that dies or hangs stops renewing, and the hold ends
 //! within its lease, never longer. The `keepAlive` process's `timeout` is set
-//! to the longest lease still open (or `max_secs` when a lease-less reason is
-//! open), replacing the old fixed 4-hour cap. A lease that ends sooner drops
+//! to the longest of what the open reasons ask for (a lease's remaining time,
+//! a lease-less reason's rolling window), capped by `max_secs`: one lease for
+//! every holder, whose backstop follows the longest. A lease that ends sooner drops
 //! out of the reasons itself, and the process is killed once none is left.
 
 use std::collections::HashMap;
@@ -26,6 +27,11 @@ use std::net::TcpStream;
 use std::sync::{Arc, Mutex};
 use std::sync::mpsc::{Sender, channel};
 use std::time::{Duration, Instant};
+
+/// How much time a lease-less reason asks of the `keepAlive` process at a
+/// time: it is renewed every tick while the reason stays open, so this only
+/// bounds how long the sandbox stays held if the relay stops.
+const LEASELESS_WINDOW_SECS: u64 = 600;
 
 /// How much slack there is before a running `keepAlive` process is renewed:
 /// small enough that a lease reliably ends close to its deadline, large
@@ -122,28 +128,30 @@ impl HoldState {
     }
 
     /// The `keepAlive` process's `timeout`, in seconds, for the reasons open
-    /// right now: `max_secs` when a lease-less reason is open or none is,
-    /// else the *longest* lease left (capped by `max_secs`). The shortest
-    /// would make the process end, and be restarted every tick, as the
-    /// nearest lease ran out while another still needs the sandbox.
+    /// right now (see [`HoldState::timeout_ms`]).
     fn timeout_secs(&self, now: Instant, max_secs: u64) -> u64 {
-        if self.reasons.values().any(|d| d.is_none()) {
-            return max_secs;
-        }
-        let longest_lease =
-            self.reasons.values().filter_map(|d| *d).map(|d| d.saturating_duration_since(now).as_secs()).max();
-        longest_lease.map(|s| s.min(max_secs)).unwrap_or(max_secs)
+        self.timeout_ms(now, max_secs) / 1000
     }
-}
 
-impl HoldState {
-    /// [`HoldState::timeout_secs`] in milliseconds (the restart decision
-    /// must not be rounded to a second).
+    /// The same in milliseconds (the restart decision must not be rounded to
+    /// a second). One backstop for every holder: each reason asks for the
+    /// time it needs, a lease its remaining time and a lease-less reason a
+    /// rolling window ([`LEASELESS_WINDOW_SECS`], renewed every tick while it
+    /// stays open), and the process gets the *longest*, capped by `max_secs`.
+    /// The shortest would end the process, and restart it every tick, as the
+    /// nearest lease ran out while another still needs the sandbox; a flat
+    /// `max_secs` for a lease-less reason would keep a sandbox awake for
+    /// hours after the relay itself stopped renewing.
     fn timeout_ms(&self, now: Instant, max_secs: u64) -> u64 {
-        if self.reasons.values().any(|d| d.is_none()) {
-            return max_secs * 1000;
-        }
-        let longest = self.reasons.values().filter_map(|d| *d).map(|d| d.saturating_duration_since(now).as_millis() as u64).max();
+        let window = LEASELESS_WINDOW_SECS * 1000;
+        let longest = self
+            .reasons
+            .values()
+            .map(|d| match d {
+                Some(d) => d.saturating_duration_since(now).as_millis() as u64,
+                None => window,
+            })
+            .max();
         longest.map(|m| m.min(max_secs * 1000)).unwrap_or(max_secs * 1000)
     }
 }
@@ -321,12 +329,14 @@ mod tests {
     }
 
     #[test]
-    fn lease_less_hold_has_no_deadline_and_uses_max_secs() {
+    fn lease_less_hold_has_no_deadline_and_asks_for_a_rolling_window() {
         let now = Instant::now();
         let mut s = HoldState::default();
         s.set("busy:1", true);
         assert!(!s.is_empty());
-        assert_eq!(s.timeout_secs(now, 3600), 3600);
+        assert_eq!(s.timeout_secs(now, 3600), LEASELESS_WINDOW_SECS);
+        // Never longer than the cap.
+        assert_eq!(s.timeout_secs(now, 100), 100);
         // Never expires on its own.
         assert!(!s.expire(now + secs(10_000)));
         assert!(!s.is_empty());
@@ -377,13 +387,18 @@ mod tests {
     }
 
     #[test]
-    fn mixing_lease_and_lease_less_takes_max_secs() {
+    fn mixing_lease_and_lease_less_follows_the_longest_holder() {
         let now = Instant::now();
         let mut s = HoldState::default();
         s.set("busy:1", true);
         s.lease("supervisor", now + secs(30));
-        assert_eq!(s.timeout_secs(now, 3600), 3600);
+        assert_eq!(s.timeout_secs(now, 3600), LEASELESS_WINDOW_SECS);
+        // A lease longer than the window outlasts it.
+        s.lease("supervisor", now + secs(1800));
+        assert_eq!(s.timeout_secs(now, 3600), 1800);
         s.set("busy:1", false);
+        assert_eq!(s.timeout_secs(now, 3600), 1800);
+        s.lease("supervisor", now + secs(30));
         assert_eq!(s.timeout_secs(now, 3600), 30);
     }
 

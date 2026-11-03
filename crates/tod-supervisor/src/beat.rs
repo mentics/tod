@@ -19,6 +19,7 @@
 //! A supervisor that dies leaves the row to go stale, which the app shows
 //! as the loss it is.
 
+use crate::progress::Progress;
 use crate::replica::{BeatWriter, Replica};
 use anyhow::{Context, Result};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
@@ -44,6 +45,19 @@ impl Beating {
     /// recorded and sent: work that cannot prove it is running must not
     /// claim to be, and the caller reports why.
     pub fn start(replica: Arc<Mutex<Replica>>, node: Uuid, every: Duration) -> Result<Self> {
+        Self::start_gated(replica, node, every, None)
+    }
+
+    /// Like [`Beating::start`], but a beat is recorded and sent only while
+    /// `gate` (the progress marker and the age it may reach) is fresh: a
+    /// supervisor that is wedged must not read as working. Its row goes
+    /// stale and the app says it stopped responding.
+    pub fn start_gated(
+        replica: Arc<Mutex<Replica>>,
+        node: Uuid,
+        every: Duration,
+        gate: Option<(Progress, Duration)>,
+    ) -> Result<Self> {
         beat_once(&replica, node).context("telling the app this node is being worked on")?;
         let (stop, stopped) = mpsc::channel::<()>();
         let beating = replica.clone();
@@ -54,6 +68,10 @@ impl Beating {
                 // `recv_timeout` is the sleep: dropping the sender wakes it.
                 let mut skipped = 0u32;
                 while let Err(RecvTimeoutError::Timeout) = stopped.recv_timeout(every) {
+                    if stalled(&gate) {
+                        tracing::warn!("cloud heartbeat: no progress; not claiming the node is being worked on");
+                        continue;
+                    }
                     match beat_without_waiting(&beating, &writer) {
                         Ok(true) => skipped = 0,
                         Ok(false) => {
@@ -112,6 +130,12 @@ impl Drop for Beating {
 /// supervisor returned early with an error (its log has it).
 const UNEXPECTED_END: &str = "the supervisor ended its run without finishing it; see the supervisor's log in the log panel, then run it again";
 
+/// Whether the gate says the supervisor has made no progress for too long to
+/// claim it is working.
+fn stalled(gate: &Option<(Progress, Duration)>) -> bool {
+    gate.as_ref().is_some_and(|(progress, limit)| !progress.fresh(*limit))
+}
+
 /// Records a beat and sends it unless a sync holds the replica. Whether it
 /// was sent.
 fn beat_without_waiting(replica: &Arc<Mutex<Replica>>, writer: &BeatWriter) -> Result<bool> {
@@ -130,4 +154,21 @@ fn beat_without_waiting(replica: &Arc<Mutex<Replica>>, writer: &BeatWriter) -> R
 fn beat_once(replica: &Arc<Mutex<Replica>>, node: Uuid) -> Result<()> {
     let mut replica = replica.lock().unwrap_or_else(|e| e.into_inner());
     replica.cloud_beat(node)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_stalled_supervisor_does_not_beat_and_an_ungated_one_always_does() {
+        assert!(!stalled(&None));
+        let progress = Progress::in_memory();
+        let gate = Some((progress.clone(), Duration::from_secs(60)));
+        assert!(!stalled(&gate));
+        progress.backdate(Duration::from_secs(61));
+        assert!(stalled(&gate), "wedged: the beat is skipped, so the row goes stale");
+        progress.mark();
+        assert!(!stalled(&gate));
+    }
 }

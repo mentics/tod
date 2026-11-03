@@ -4,6 +4,7 @@
 //! it lapses. A supervisor that dies or hangs stops renewing, and the sandbox
 //! can sleep once the lease runs out.
 
+use crate::progress::Progress;
 use anyhow::{Result, bail};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread::JoinHandle;
@@ -72,6 +73,18 @@ impl HoldGuard {
     }
 
     pub fn take_with(holder: std::sync::Arc<dyn Holder>, lease_secs: u64, renew: Duration) -> Self {
+        Self::take_gated(holder, lease_secs, renew, None)
+    }
+
+    /// Like [`HoldGuard::take_with`], but renewed only while `gate` (the
+    /// progress marker and the age it may reach) is fresh: a wedged
+    /// supervisor stops holding the sandbox awake within one lease.
+    pub fn take_gated(
+        holder: std::sync::Arc<dyn Holder>,
+        lease_secs: u64,
+        renew: Duration,
+        gate: Option<(Progress, Duration)>,
+    ) -> Self {
         if let Err(err) = holder.hold(REASON, lease_secs) {
             tracing::warn!("could not take the hold: {err:#}");
         }
@@ -82,6 +95,18 @@ impl HoldGuard {
                 loop {
                     match rx.recv_timeout(renew) {
                         Err(RecvTimeoutError::Timeout) => {
+                            if let Some((progress, limit)) = &gate
+                                && !progress.fresh(*limit)
+                            {
+                                // Let the lease lapse: nothing has moved for
+                                // `limit`, and a supervisor that cannot say it is
+                                // working does not keep the sandbox awake.
+                                tracing::warn!(
+                                    stalled_secs = progress.age().as_secs(),
+                                    "no progress; not renewing the hold, it lapses with its lease"
+                                );
+                                continue;
+                            }
                             if let Err(err) = holder.hold(REASON, lease_secs) {
                                 tracing::warn!("could not renew the hold: {err:#}");
                             }
@@ -136,5 +161,27 @@ mod tests {
         assert_eq!(calls.first().unwrap(), "hold supervisor 3");
         assert!(calls.iter().filter(|c| c.starts_with("hold")).count() >= 2, "{calls:?}");
         assert_eq!(calls.last().unwrap(), "release supervisor");
+    }
+
+    /// A wedged supervisor (no progress mark) must not keep renewing: the
+    /// lease lapses, and renewal resumes when it moves again.
+    #[test]
+    fn a_stalled_supervisor_stops_renewing_its_hold() {
+        let rec = Arc::new(Recorder::default());
+        let progress = Progress::in_memory();
+        progress.backdate(Duration::from_secs(600));
+        let guard = HoldGuard::take_gated(
+            rec.clone(),
+            3,
+            Duration::from_millis(20),
+            Some((progress.clone(), Duration::from_secs(60))),
+        );
+        std::thread::sleep(Duration::from_millis(120));
+        let holds = |rec: &Recorder| rec.0.lock().unwrap().iter().filter(|c| c.starts_with("hold")).count();
+        assert_eq!(holds(&rec), 1, "only the first take, no renewals while stalled");
+        progress.mark();
+        std::thread::sleep(Duration::from_millis(120));
+        assert!(holds(&rec) >= 2, "renews again once it progresses");
+        drop(guard);
     }
 }

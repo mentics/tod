@@ -29,6 +29,8 @@
 mod log;
 #[cfg(target_os = "linux")]
 mod hold;
+#[allow(dead_code)]
+mod liveness;
 #[cfg(target_os = "linux")]
 mod pty;
 #[cfg(target_os = "linux")]
