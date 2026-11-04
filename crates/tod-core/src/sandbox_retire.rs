@@ -451,4 +451,25 @@ mod tests {
         retire_due_with(&fx.fleet, now + 10_000_000_000, &mut fail).unwrap();
         assert_eq!(attempts.get(), 1 + BACKOFF.len());
     }
+
+    /// The real `retire_due` (no fake) deletes through the very function the
+    /// task panel's Delete sandbox uses, `lost::delete_node_sandbox`: with no
+    /// Blaxel account in this root both fail the same way, and the retire
+    /// report and problem carry the menu path's own error.
+    #[test]
+    fn the_real_retire_goes_through_the_menus_delete() {
+        let fx = fx();
+        fx.locate("sb-real");
+        fx.set_lifecycle("done");
+        let id = fx.id();
+        let _ = tod_store::fleet::session_log::take_problems();
+        let menu_error = format!("{:#}", lost::delete_node_sandbox(&fx.fleet, &id).unwrap_err());
+        assert!(!menu_error.is_empty());
+        let report = retire_due(&fx.fleet).unwrap();
+        assert_eq!((report.deleted.len(), report.failed), (0, 1), "{report:?}");
+        let problems: Vec<_> =
+            tod_store::fleet::session_log::take_problems().into_iter().filter(|(n, _)| *n == id).collect();
+        assert!(problems.len() == 1 && problems[0].1.contains(&menu_error), "{menu_error:?} in {problems:?}");
+        assert!(fx.has_location(), "a failed delete forgets nothing");
+    }
 }
