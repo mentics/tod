@@ -980,3 +980,56 @@ fn a_start_that_fails_leaves_the_node_failed_not_starting() {
     assert!(row.reason_text.contains("the golden sandbox g does not exist"), "{}", row.reason_text);
     let _ = std::fs::remove_dir_all(&root);
 }
+
+fn plain_node(fleet: &FleetStore) -> uuid::Uuid {
+    add_list(fleet, "t");
+    let list_id = fleet.list_outline_lists().unwrap()[0].id;
+    let node = uuid::Uuid::new_v4();
+    fleet
+        .enqueue_outline(OutlineMutation::CreateNode {
+            node_id: Some(node),
+            list_id,
+            parent_id: None,
+            anchor_id: None,
+            position: tod_store::outline::CreatePosition::Below,
+            title: "cloud node".into(),
+        })
+        .unwrap();
+    fleet.writer().flush().unwrap();
+    node
+}
+
+/// The wake path (Run with a new session, Resume, ...): a request that fails
+/// while the node's state is still the `starting` it wrote replaces it with
+/// the failure; a state that is no longer `starting` (a better, later answer)
+/// is left alone, and a Pause or Stop now, which writes no `starting`, never
+/// touches it.
+#[test]
+fn a_failed_wake_request_replaces_starting_only_while_it_is_the_state() {
+    let root = temp_root("wake-fails");
+    let fleet = FleetStore::open(&root).unwrap();
+    let node = plain_node(&fleet);
+    let id = node.to_string();
+    let phase = || fleet.read(|conn| tod_store::run_state::get(conn, node)).unwrap().map(|row| (row.phase, row.reason_text));
+
+    // The node does not run in the cloud, so every request fails at once.
+    record_starting(&fleet, &id).unwrap();
+    let err = wake_node_requesting(&fleet, &root, &id, REQUEST_KEEP_GOING).unwrap_err();
+    assert!(format!("{err:#}").contains("does not run in the cloud"), "{err:#}");
+    let (state, text) = phase().unwrap();
+    assert_eq!(state, tod_store::run_state::Phase::Stopped, "failed, not starting");
+    assert!(text.contains("does not run in the cloud"), "{text}");
+
+    // A later state is not replaced by the failure of an earlier call.
+    crate::run_state::record(&fleet, node, crate::run_state::runner_failed("an earlier, better answer"), "app").unwrap();
+    let _ = wake_node_requesting(&fleet, &root, &id, REQUEST_FRESH_SESSION).unwrap_err();
+    assert!(phase().unwrap().1.contains("an earlier, better answer"));
+
+    // A stop request writes no `starting`, so it leaves one alone.
+    record_starting(&fleet, &id).unwrap();
+    for kind in [REQUEST_PAUSE, REQUEST_STOP_NOW] {
+        let _ = wake_node_requesting(&fleet, &root, &id, kind).unwrap_err();
+        assert_eq!(phase().unwrap().0, tod_store::run_state::Phase::Starting, "{kind}");
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
