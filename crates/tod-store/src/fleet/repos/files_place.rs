@@ -33,10 +33,48 @@ CREATE TABLE IF NOT EXISTS files_places (
     container_kind         TEXT NOT NULL DEFAULT 'docker',
     sandbox_source         TEXT NOT NULL DEFAULT 'image',
     sandbox_from           TEXT NOT NULL DEFAULT '',
+    clone_url              TEXT,
     created_at             INTEGER NOT NULL,
     updated_at             INTEGER NOT NULL
 );
 ";
+
+/// Stores `clone_url` on a `files_places` made before it existed. Idempotent,
+/// so run on every start with no schema version (like `node_problems`).
+pub fn ensure_clone_url(conn: &Connection) -> Result<()> {
+    let present = conn
+        .prepare("SELECT 1 FROM pragma_table_info('files_places') WHERE name = 'clone_url'")?
+        .exists([])?;
+    if !present {
+        conn.execute_batch("ALTER TABLE files_places ADD COLUMN clone_url TEXT;")?;
+    }
+    Ok(())
+}
+
+/// What a clone URL may be, said to the user.
+pub const CLONE_URL_RULE: &str =
+    "The repository must be a GitHub HTTPS URL, like https://github.com/owner/name or https://github.com/owner/name.git";
+
+/// `url` as stored (trimmed, no trailing slash), or why it is not a GitHub
+/// HTTPS repository URL (`https://github.com/owner/name[.git]`, no
+/// credentials, port, query or other path).
+pub fn validate_clone_url(url: &str) -> std::result::Result<String, String> {
+    let url = url.trim().trim_end_matches('/');
+    let bad = || format!("{url:?} is not a repository URL. {CLONE_URL_RULE}");
+    let path = url.strip_prefix("https://github.com/").ok_or_else(bad)?;
+    let mut parts = path.split('/');
+    let (Some(owner), Some(name), None) = (parts.next(), parts.next(), parts.next()) else {
+        return Err(bad());
+    };
+    let name = name.strip_suffix(".git").unwrap_or(name);
+    let word = |s: &str| {
+        !s.is_empty() && !s.starts_with('.') && s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    };
+    if !word(owner) || !word(name) {
+        return Err(bad());
+    }
+    Ok(url.to_string())
+}
 
 /// One location.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -73,7 +111,10 @@ impl FilesPlace {
     pub fn describe(&self) -> String {
         match &self.dev_container {
             Some(dev) if dev.sandbox => {
-                format!("a cloud sandbox from {}", dev.sandbox_from.describe())
+                match dev.clone_url() {
+                    Some(url) => format!("a cloud sandbox from {}, cloning {url}", dev.sandbox_from.describe()),
+                    None => format!("a cloud sandbox from {}", dev.sandbox_from.describe()),
+                }
             }
             Some(dev) => {
                 let container = dev.container().unwrap_or("(none chosen)");
@@ -96,8 +137,17 @@ impl FilesPlace {
             container: if dev.sandbox { None } else { dev.container().map(str::to_string) },
             repo_on_host: dev.repo_on_host && !dev.sandbox,
             sandbox: dev.sandbox,
+            // Only an image has a repository to clone; a fork's is its golden's.
+            clone_url: dev.clone_url().map(|u| u.trim_end_matches('/').to_string()),
             sandbox_from: if dev.sandbox { dev.sandbox_from } else { SandboxFrom::default() },
         });
+        // The clone goes where tod always puts it, so the directory is that.
+        if let Some(dev) = &self.dev_container
+            && dev.clone_url().is_some()
+            && self.repo.is_none()
+        {
+            self.repo = Some(tod_sandbox::node::WORKSPACE_DIR.to_string());
+        }
         self
     }
 
@@ -127,6 +177,19 @@ impl FilesPlace {
             {
                 return Some(format!("{err:#}"));
             }
+            if let Some(url) = dev.clone_url() {
+                if let Err(problem) = validate_clone_url(url) {
+                    return Some(problem);
+                }
+                if let Some(repo) = self.repo()
+                    && repo != tod_sandbox::node::WORKSPACE_DIR
+                {
+                    return Some(format!(
+                        "A repository tod clones goes to {}: leave the directory empty (or use that)",
+                        tod_sandbox::node::WORKSPACE_DIR
+                    ));
+                }
+            }
             if !dev.sandbox
                 && let Some(container) = dev.container()
                 && let Err(err) = tod_agent::devcontainer::validate_container_ref(container)
@@ -149,8 +212,15 @@ impl FilesPlace {
                 return Some("Choose a dev container".into());
             }
         }
-        let Some(repo) = self.repo() else {
-            return Some("Set a workspace directory".into());
+        let Some(repo) = self.repo().or_else(|| {
+            dev.filter(|d| d.clone_url().is_some()).map(|_| tod_sandbox::node::WORKSPACE_DIR)
+        }) else {
+            return Some(match dev {
+                Some(dev) if dev.sandbox && matches!(dev.sandbox_from, SandboxFrom::Image(_)) => {
+                    "Give the repository's GitHub URL (the image has none to ask), or the directory the image holds it in".into()
+                }
+                _ => "Set a workspace directory".to_string(),
+            });
         };
         let remote = match dev {
             Some(dev) if dev.sandbox => Some(("the sandbox", "/root/app")),
@@ -169,7 +239,7 @@ impl FilesPlace {
 }
 
 const COLUMNS: &str = "id, name, repo, use_worktree, dev_container, container,
-                       container_repo_on_host, container_kind, sandbox_source, sandbox_from";
+                       container_repo_on_host, container_kind, sandbox_source, sandbox_from, clone_url";
 
 fn row_to_place(row: &rusqlite::Row<'_>) -> rusqlite::Result<FilesPlace> {
     Ok(FilesPlace {
@@ -183,6 +253,7 @@ fn row_to_place(row: &rusqlite::Row<'_>) -> rusqlite::Result<FilesPlace> {
                 repo_on_host: row.get::<_, i64>(6)? != 0,
                 sandbox: row.get::<_, String>(7)? == "sandbox",
                 sandbox_from: SandboxFrom::from_columns(&row.get::<_, String>(8)?, row.get(9)?),
+                clone_url: row.get(10)?,
             })
         } else {
             None
@@ -258,8 +329,8 @@ impl<'a> FilesPlaceRepo<'a> {
         self.conn.execute(
             "INSERT INTO files_places
                (id, name, repo, use_worktree, dev_container, container, container_repo_on_host,
-                container_kind, sandbox_source, sandbox_from, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11)
+                container_kind, sandbox_source, sandbox_from, clone_url, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12)
              ON CONFLICT(id) DO UPDATE SET
                name = excluded.name, repo = excluded.repo,
                use_worktree = excluded.use_worktree, dev_container = excluded.dev_container,
@@ -267,6 +338,7 @@ impl<'a> FilesPlaceRepo<'a> {
                container_repo_on_host = excluded.container_repo_on_host,
                container_kind = excluded.container_kind,
                sandbox_source = excluded.sandbox_source, sandbox_from = excluded.sandbox_from,
+               clone_url = excluded.clone_url,
                updated_at = excluded.updated_at",
             params![
                 place.id,
@@ -279,6 +351,7 @@ impl<'a> FilesPlaceRepo<'a> {
                 dev.map_or("docker", DevContainerSetting::kind),
                 source,
                 from,
+                dev.and_then(|d| d.clone_url()),
                 now,
             ],
         )?;
@@ -339,6 +412,7 @@ pub fn migrate_from_node_files(conn: &Connection) -> Result<()> {
                                 &row.get::<_, String>(6)?,
                                 row.get(7)?,
                             ),
+                            clone_url: None,
                         })
                     })
                     .transpose()?,
@@ -549,5 +623,99 @@ mod tests {
             ..place("", "/root/app")
         };
         assert_eq!(suggested_name(&sandbox, &[]), "app (sandbox)");
+    }
+
+    fn image_place(url: Option<&str>, repo: Option<&str>) -> FilesPlace {
+        FilesPlace {
+            name: "cloud".into(),
+            repo: repo.map(str::to_string),
+            dev_container: Some(DevContainerSetting {
+                sandbox: true,
+                sandbox_from: SandboxFrom::Image(String::new()),
+                clone_url: url.map(str::to_string),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn clone_urls_are_github_https_only() {
+        for good in [
+            "https://github.com/owner/name",
+            "https://github.com/owner/name.git",
+            " https://github.com/Owner-1/na_me.x/ ",
+        ] {
+            assert!(validate_clone_url(good).is_ok(), "{good}");
+        }
+        for bad in [
+            "",
+            "http://github.com/o/n",
+            "git@github.com:o/n.git",
+            "ssh://git@github.com/o/n",
+            "https://gitlab.com/o/n",
+            "https://user:pw@github.com/o/n",
+            "https://github.com/o",
+            "https://github.com/o/n/tree/main",
+            "https://github.com/o/n?x=1",
+            "https://github.com/../n",
+            "/workspace/repo",
+        ] {
+            let err = validate_clone_url(bad).unwrap_err();
+            assert!(err.contains("GitHub HTTPS URL"), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn an_image_location_takes_a_url_and_clones_to_the_fixed_directory() {
+        let mut p = image_place(Some(" https://github.com/o/n/ "), None).normalized();
+        assert_eq!(p.dev_container.as_ref().unwrap().clone_url(), Some("https://github.com/o/n"));
+        assert_eq!(p.repo(), Some(tod_sandbox::node::WORKSPACE_DIR));
+        assert_eq!(p.problem(&[]), None);
+        assert_eq!(p.incomplete(), None);
+        assert!(p.describe().contains("cloning https://github.com/o/n"));
+        // A directory elsewhere is refused, never ignored.
+        p.repo = Some("/srv/other".into());
+        assert!(p.problem(&[]).unwrap().contains(tod_sandbox::node::WORKSPACE_DIR));
+        // A bad URL is refused with what is accepted.
+        let bad = image_place(Some("https://gitlab.com/o/n"), None).normalized();
+        assert!(bad.problem(&[]).unwrap().contains("GitHub HTTPS URL"));
+        // An image location with neither says what to give.
+        let neither = image_place(None, None);
+        assert!(neither.incomplete().unwrap().contains("GitHub URL"));
+    }
+
+    #[test]
+    fn a_fork_never_keeps_a_clone_url() {
+        let mut p = image_place(Some("https://github.com/o/n"), Some("/workspace/repo"));
+        p.dev_container.as_mut().unwrap().sandbox_from = SandboxFrom::Fork("golden".into());
+        let p = p.normalized();
+        assert_eq!(p.dev_container.unwrap().clone_url, None);
+    }
+
+    #[test]
+    fn the_clone_url_round_trips_and_an_old_table_gets_the_column() {
+        let (dir, conn) = test_writer_conn();
+        let repo = FilesPlaceRepo::new(&conn);
+        let saved = repo.save(&image_place(Some("https://github.com/o/n.git"), None)).unwrap();
+        assert_eq!(repo.get(&saved.id).unwrap().unwrap(), saved);
+        assert_eq!(saved.dev_container.unwrap().clone_url(), Some("https://github.com/o/n.git"));
+        // A store from before the column: dropped, then ensured twice.
+        conn.execute_batch("ALTER TABLE files_places DROP COLUMN clone_url;").unwrap();
+        ensure_clone_url(&conn).unwrap();
+        ensure_clone_url(&conn).unwrap();
+        assert_eq!(repo.list().unwrap().len(), 1);
+        cleanup_test_dir(&dir);
+    }
+
+    /// A changed URL makes an existing node's sandbox stale (so the impact
+    /// dialog is shown), while a location without one keeps its old key.
+    #[test]
+    fn the_clone_url_is_part_of_the_recipe() {
+        let a = image_place(Some("https://github.com/o/a"), None).normalized();
+        let b = image_place(Some("https://github.com/o/b"), None).normalized();
+        assert_ne!(a.recipe_key(), b.recipe_key());
+        let none = image_place(None, Some("/workspace/repo")).normalized();
+        assert_eq!(none.recipe_key(), "sandbox\n/workspace/repo\nimage:");
     }
 }

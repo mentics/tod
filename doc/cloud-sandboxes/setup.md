@@ -229,8 +229,14 @@ files (a turn, a shell, an editor). There is nothing to create by hand.
 **Each node's sandbox starts from** chooses between *An image* (a cold
 start; empty uses the default image from Settings) and *A fork of a sandbox*
 (pick one from the list of the workspace's sandboxes; see **Forks** above).
-Either way it must already hold the repository: give the workspace directory
-as its path there (`/root/app`). A baked image takes seconds, any other image
+The two differ in how the repository is named. For *An image*, give
+**Repository to clone**: a GitHub HTTPS URL
+(`https://github.com/owner/name` or `.git`); tod clones it into each new
+sandbox at `/workspace/repo` through the proxy with your GitHub token. (An
+image that already holds the repository, such as a baked one, may leave the
+URL empty and give the directory it is in.) For *A fork*, give the directory of
+the repository inside the golden (`/workspace/app`); the URL is read from
+that checkout. A baked image takes seconds, any other image
 a minute or more. Each sandbox is named `tod-<slug>-<6 hex of the node id>`
 (never with a numeric suffix) and checks out the node's own branch
 (`task/<slug>` unless set). A node has exactly one sandbox, and the same one

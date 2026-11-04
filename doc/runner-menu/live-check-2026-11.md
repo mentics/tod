@@ -480,7 +480,8 @@ worktree, which has `target/sandbox`) was stopped; another session's `tod` (pid 
     (`node_source`), which for an image there is no sandbox to ask for. The error text tells the user
     to set the Files directory to a URL, which the dialog refuses. Possible fix: accept an HTTPS URL
     as the directory of an image-sourced cloud location (it is the clone source; the checkout dir
-    `/workspace/repo` is then recorded on the location). Not done here.
+    `/workspace/repo` is then recorded on the location). Fixed afterwards: the Locations dialog
+    takes a separate "Repository to clone" URL for an image location (implementation.md, What remains).
 15. A golden cannot be made for a repository whose checkout is not in the golden it forks (a fork
     never clones). `golden refresh <repo>` of a new repository forks the old golden unchanged.
 16. A `tod-cli` error printed by a separate shell command (`capabilities show`, which does not exist)

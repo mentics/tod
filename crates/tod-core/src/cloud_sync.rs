@@ -1348,11 +1348,28 @@ fn origin_url_of(fleet: &FleetStore, node_id: &str, repo: &str) -> Result<String
         // The Files directory is not at fault; do not send the user to change it.
         bail!("no HTTPS repository URL for the cloud run: {why}");
     }
-    bail!(
-        "no HTTPS repository URL for the cloud run ({why}); the cloud checks the repository out from its \
-         HTTPS URL, so set the Files directory to that URL (e.g. https://github.com/owner/repo) or to a \
-         checkout on this machine whose origin is on GitHub"
-    )
+    bail!("no HTTPS repository URL for the cloud run ({why}); {}", what_to_set(fleet, node_id))
+}
+
+/// What the user can do about a repository tod cannot find the URL of, by how
+/// the node's Files location gets its files.
+fn what_to_set(fleet: &FleetStore, node_id: &str) -> String {
+    let dev = fleet.resolve_files_for_node(node_id).ok().flatten().and_then(|files| files.dev_container);
+    match dev {
+        Some(dev) if dev.sandbox && matches!(dev.sandbox_from, tod_store::fleet::SandboxFrom::Image(_)) => {
+            "the cloud clones the repository from its GitHub HTTPS URL: open Locations, edit this node's \
+             location, and give the repository (e.g. https://github.com/owner/repo) under \"Repository to clone\""
+                .into()
+        }
+        Some(dev) if dev.sandbox => "the sandbox is forked from a golden whose checkout must have a GitHub \
+             remote: in Locations, choose a directory inside the golden that is a git checkout, or refresh the \
+             golden (`tod-sandbox golden refresh <repo>`)"
+            .into(),
+        _ => "the cloud checks the repository out from its HTTPS URL, so set the Files directory (in \
+              Locations) to a checkout on this machine whose origin is on GitHub, or to that URL (e.g. \
+              https://github.com/owner/repo)"
+            .into(),
+    }
 }
 
 /// Where a node's code comes from: its repository as an HTTPS URL, and branch.
@@ -1364,7 +1381,15 @@ fn node_source(fleet: &FleetStore, node_id: &str) -> Result<(tod_store::fleet::F
     // each distinct candidate; the first error is the one reported.
     let inherited = fleet.resolve_files_for_node(node_id).ok().flatten().and_then(|files| files.repo);
     let mut candidates: Vec<String> = Vec::new();
-    for repo in [inherited, task.repo.clone()].into_iter().flatten() {
+    // A location that makes sandboxes from an image says where to clone from:
+    // an empty image has no checkout to ask.
+    let clone_url = fleet
+        .resolve_files_for_node(node_id)
+        .ok()
+        .flatten()
+        .and_then(|files| files.dev_container)
+        .and_then(|dev| dev.clone_url().map(str::to_string));
+    for repo in [clone_url, inherited, task.repo.clone()].into_iter().flatten() {
         let repo = repo.trim().to_string();
         if !repo.is_empty() && !candidates.contains(&repo) {
             candidates.push(repo);

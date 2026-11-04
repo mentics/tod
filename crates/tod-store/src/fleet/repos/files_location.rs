@@ -47,7 +47,12 @@ pub fn recipe_key(repo: Option<&str>, use_worktree: bool, dev: Option<&DevContai
     match dev {
         Some(dev) if dev.sandbox => {
             let (source, from) = dev.sandbox_from.columns();
-            format!("sandbox\n{repo}\n{source}:{from}")
+            // The clone URL joins the key only when there is one, so locations
+            // made before it existed keep theirs.
+            match dev.clone_url() {
+                Some(url) => format!("sandbox\n{repo}\n{source}:{from}\nclone={url}"),
+                None => format!("sandbox\n{repo}\n{source}:{from}"),
+            }
         }
         Some(dev) => format!(
             "docker\n{repo}\nworktree={use_worktree}\n{}\nmounted={}",
@@ -333,6 +338,7 @@ pub fn migrate_from_node_files(conn: &Connection) -> Result<()> {
                 Some(name) => crate::fleet::repos::node_files::SandboxFrom::Fork(name.trim().into()),
                 None => Default::default(),
             },
+            clone_url: None,
         });
         if let Some(name) = &sandbox {
             conn.execute(

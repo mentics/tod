@@ -330,6 +330,42 @@ mod tests {
         cleanup_fleet_root(&root);
     }
 
+    /// Gap 14: changing the repository URL of an image location leaves the
+    /// nodes' sandboxes behind (so the impact is shown); a rename does not.
+    #[test]
+    fn changing_a_clone_url_shows_its_impact() {
+        use crate::fleet::repos::node_files::{DevContainerSetting, SandboxFrom};
+        let root = temp_fleet_root();
+        let store = FleetStore::open(&root).unwrap();
+        let with_url = |url: &str| FilesPlace {
+            name: "Cloud".into(),
+            dev_container: Some(DevContainerSetting {
+                sandbox: true,
+                sandbox_from: SandboxFrom::Image(String::new()),
+                clone_url: Some(url.into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let place = save(&store, &with_url("https://github.com/o/a")).unwrap();
+        let a = node(&store, "A");
+        store
+            .enqueue(FleetMutation::SetNodeFilesPlace { node_id: a.to_string(), place_id: Some(place.id.clone()) })
+            .unwrap();
+        store.writer().flush().unwrap();
+        made(&store, a, a, &place);
+
+        let renamed = FilesPlace { name: "Renamed".into(), ..place.clone() };
+        assert!(impact(&store, &place.id, Some(&renamed)).unwrap().locations.is_empty());
+        let moved = FilesPlace { id: place.id.clone(), ..with_url("https://github.com/o/b") };
+        let changed = impact(&store, &place.id, Some(&moved)).unwrap();
+        assert_eq!(changed.locations.len(), 1);
+        assert_eq!(changed.locations[0].node_title, "A");
+
+        drop(store);
+        cleanup_fleet_root(&root);
+    }
+
     fn child_of(store: &FleetStore, parent: Uuid) -> Uuid {
         let list_id = store.list_outline_lists().unwrap()[0].id;
         let id = Uuid::new_v4();
