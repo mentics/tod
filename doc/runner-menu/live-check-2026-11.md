@@ -75,3 +75,46 @@ left; both nodes' sandboxes were deleted at the end.
 - Another session's `tod` (cwd `robustness-continuation-743eac`, port 47611)
   was running on this root; I used port 47625 and left it and the root's
   `tod-agentd` alone.
+
+## Second pass (same day)
+
+Rebased on origin/main 7f67651c (no change). Test nodes `RM live A/B/C`;
+sandboxes `node-rm-live-b` and `-c` deleted at the end (A's earlier). The app was
+left stopped. `independent_evaluation` was flipped to false in the root's
+`tod.yml` for one `phase certify` and restored at once (verified).
+
+| Check | Result |
+|---|---|
+| Lifecycle config editor: where | Right-click a node, Settings (or select it and use the Settings entry); expand the Lifecycle config capability; the Done block is last. (`e`/Ctrl+E opens the inline editor, not this.) |
+| "Delete sandbox" default on | PASS: checked on `ENG work` with no stored value (NULL). |
+| Toggle persists | PASS: unticking wrote `delete_sandbox = 0` on `ENG work`. |
+| Inherited | PASS: `RM live C`, with lifecycle-config enabled and nothing of its own, showed the box (unchecked, since the parent was off) with "from ENG work"; ticking it wrote `1` on C, and "Use inherited" appeared. |
+| Sandbox deleted automatically at `done` | NOT REACHED. A node cannot be cheaply walked to `done` (needs the full lifecycle, PR and merge). The code path is `delete_sandboxes_at_final_phase`, run only inside an orchestrator sync (B4 will add the daemon trigger); only its unit tests were relied on. |
+| Check now advances a clear gate | PASS. `RM live C` in `proposed` with its phase certified (independent evaluation off for the certify): the line read "Checked: the gate is clear; moved to design". |
+| Delete prompt, Cancel | PASS: node kept running, nothing deleted. |
+| Migrate while running: Pause / Stop now / Cancel prompt | PASS: shown ("Migrate to RM host once it has paused ... or been stopped now?"). Chose Pause. The migration then did not begin: the Pause job stayed busy ("Asking the supervisor to pause...") because the sandbox would not wake (Blaxel answered 404 WORKLOAD_UNAVAILABLE for 90 s; the app logged "replacing it"). Blaxel flakiness, not looked into further. |
+| Same Claude session resumes at the new location; migrate back | NOT REACHED (blocked by the above). |
+| Migrate refused for a node with children | NOT REACHED live (my click on the parent's menu missed; the menu hides Migrate for such a node and the store refuses, both unit tested). |
+
+### More bugs
+
+7. **Start of a fresh node failed after `golden refresh`**: the node's repository
+   is read from the golden it forks, and with a per-repository golden beside the
+   account-wide one the alias was ambiguous ("there is more than one golden
+   sandbox ... say which repository's is meant"). Fix: ask every golden and use
+   the URL they agree on (commit `Start: a fresh node's repository ...`;
+   test `every_distinct_golden_is_listed_for_a_caller_with_no_repository`).
+   Verified live: C started.
+8. **Over-wide log pull** (listed before): fixed, Migrate keeps only the sessions
+   of the node's conversations (test `only_the_sessions_of_the_nodes_own_conversations_are_kept`).
+   Not re-run live (the migrate was blocked).
+
+### Not fixed
+
+- **The row left behind after Migrate right after Stop now.** Reproduced once;
+  the cause (the supervisor's last push re-creating the row) needs the
+  orchestrator in the loop to test, and I did not want to ship an untested
+  guess. A sketch: after the removal sync, re-read the row and remove it again
+  if it came back.
+- A Pause on a node whose sandbox just went to standby can hang for minutes
+  on Blaxel's WORKLOAD_UNAVAILABLE and blocks a pending Migrate behind it.
