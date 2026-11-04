@@ -41,9 +41,15 @@ fn normalized(repo: &str) -> Result<String> {
 /// thread.
 pub fn ensure_golden_current(sandboxes: &mut Sandboxes, bx: &Blaxel, repo: &str, progress: &mut dyn FnMut(&str)) -> Result<String> {
     let repo = normalized(repo)?;
-    let name = sandboxes.resolve_golden(bx, &repo)?;
     let files = install_files()?;
     let mine = my_stamp(&files)?;
+    let name = match source_for(sandboxes, bx, &repo)? {
+        golden::Source::Build { why } => {
+            progress(&format!("{why}: making one from a fresh sandbox with the repository cloned into it"));
+            return build_golden(sandboxes, bx, &repo, &files, &mine, progress);
+        }
+        golden::Source::Refresh { from } => from,
+    };
     ensure_current_with(
         &repo,
         &name,
@@ -52,6 +58,47 @@ pub fn ensure_golden_current(sandboxes: &mut Sandboxes, bx: &Blaxel, repo: &str,
         progress,
         |name, progress| refresh_with(sandboxes, bx, &repo, name, &files, &mine, progress),
     )
+}
+
+/// Where `repo`'s golden comes from ([`golden::decide_source`]): its own
+/// entry, or the account-wide one only when its checkout is `repo`'s (asked
+/// of the sandbox itself, read-only), else nothing to refresh: one is built.
+fn source_for(sandboxes: &Sandboxes, bx: &Blaxel, repo: &str) -> Result<golden::Source> {
+    use tod_sandbox::config::GoldenSetting;
+    let setting = sandboxes.account()?.golden_for(repo);
+    // Resolved (a `prefix*` stands for its newest sandbox) only when there is one.
+    let resolved = match setting {
+        Some(_) => Some(sandboxes.resolve_golden(bx, repo)?),
+        None => None,
+    };
+    let (own, legacy) = match setting {
+        Some(GoldenSetting::Own(_)) => (resolved.as_deref(), None),
+        Some(GoldenSetting::Legacy(_)) => (None, resolved.as_deref()),
+        None => (None, None),
+    };
+    golden::decide_source(repo, own, legacy, &mut |name| checkout_origin(bx, name))
+}
+
+/// The repository (`owner/name`, lower case) the golden `name`'s checkout was
+/// cloned from, read from the sandbox (a read-only `git remote get-url`); `None`
+/// when it holds no checkout or one with no `origin`.
+fn checkout_origin(bx: &Blaxel, name: &str) -> Result<Option<String>> {
+    let info = bx.get(name)?.ok_or_else(|| anyhow!("the golden sandbox {name} does not exist"))?;
+    let url = info.url.ok_or_else(|| anyhow!("sandbox {name} has no URL"))?;
+    bx.wait_reachable(&url, Duration::from_secs(180)).with_context(|| format!("wake {name} to read which repository it holds"))?;
+    let probe = format!(
+        "d={}; [ -d \"$d/.git\" ] && git -C \"$d\" remote get-url origin 2>/dev/null",
+        tod_sandbox::node::WORKSPACE_PROBE
+    );
+    let out = golden::retry_step(
+        name,
+        "read its repository",
+        &golden::StepRetry::default(),
+        &mut std::thread::sleep,
+        &mut |_| {},
+        || bx.run(&url, &format!("sh -c {}", tod_sandbox::relay::shell_quote(&probe)), 60),
+    )?;
+    Ok(if out.exit_code == 0 { tod_store::cloud_nodes::normalize_repo(out.output().trim()) } else { None })
 }
 
 /// The decision of [`ensure_golden_current`], apart from Blaxel and the
@@ -86,15 +133,142 @@ fn ensure_current_with(
 /// `sandboxes.toml` pointing at the old one, and says so.
 pub fn refresh_golden(sandboxes: &mut Sandboxes, bx: &Blaxel, repo: &str, progress: &mut dyn FnMut(&str)) -> Result<String> {
     let repo = normalized(repo)?;
-    let old = sandboxes.resolve_golden(bx, &repo)?;
-    let info = bx.get(&old)?.ok_or_else(|| anyhow!("the golden sandbox {old} for {repo} does not exist"))?;
     let files = install_files()?;
     let mine = my_stamp(&files)?;
+    let old = match source_for(sandboxes, bx, &repo)? {
+        golden::Source::Build { why } => {
+            progress(&format!("{why}: making one from a fresh sandbox with the repository cloned into it"));
+            return build_golden(sandboxes, bx, &repo, &files, &mine, progress);
+        }
+        golden::Source::Refresh { from } => from,
+    };
+    let info = bx.get(&old)?.ok_or_else(|| anyhow!("the golden sandbox {old} for {repo} does not exist"))?;
     if let Some(theirs) = GoldenStamp::from_info(&info)? {
         // The same refusal `ensure_golden_current` makes: never refresh back.
         golden::decide(&repo, &mine, Some(&theirs))?;
     }
     refresh_with(sandboxes, bx, &repo, &old, &files, &mine, progress)
+}
+
+/// Makes the golden of a repository that has none (or whose only candidate
+/// is another repository's), from the right source: a fresh sandbox from the
+/// account's default image, with tod's dependencies and files installed and
+/// the repository cloned into [`tod_sandbox::node::WORKSPACE_DIR`] through the
+/// sandbox's proxy, which holds the user's GitHub token (so a private
+/// repository clones) and initializes its submodules. Then the same labels,
+/// `ready` last, and `sandboxes.toml` pointing at it. A failure deletes the
+/// half-made sandbox and names why; it never falls back to another golden.
+fn build_golden(
+    sandboxes: &mut Sandboxes,
+    bx: &Blaxel,
+    repo: &str,
+    files: &InstallFiles,
+    mine: &GoldenStamp,
+    progress: &mut dyn FnMut(&str),
+) -> Result<String> {
+    use tod_sandbox::node;
+    tod_sandbox::provision::check_relay_arch(&files.relay)?;
+    // Before anything is made: a name that cannot be cloned is refused here.
+    let script = golden::clone_script(repo)?;
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
+    let name = golden::new_name(repo, now);
+    if bx.get(&name)?.is_some() {
+        bail!("a sandbox named {name} already exists; try again in a moment");
+    }
+    let account = sandboxes.account()?.clone();
+    let github = sandboxes.node_credentials(Vec::new()).github_token.filter(|t| !t.is_empty());
+    if github.is_none() {
+        progress("warning: no GitHub token is stored, so only a public repository can be cloned (Settings → Cloud sandboxes)");
+    }
+    let creds = node::NodeCredentials { github_token: github, ..Default::default() };
+    let rules = node::credential_rules(&creds, account.claude_token_via);
+    let proxy = if rules.is_empty() { placeholder_proxy() } else { node::proxy_spec(&rules) };
+    let image = sandboxes.runtime_image("", false, progress)?;
+    progress(&format!("creating {name} from {image}…"));
+    let body = golden::build_body(&name, &image, &account.region, account.memory_mb, proxy);
+    bx.create_from_body(&body).with_context(|| format!("create {name} from {image}"))?;
+    let policy = golden::StepRetry::default();
+    let said = std::cell::RefCell::new(progress);
+    let say = |m: &str| (said.borrow_mut())(m);
+    macro_rules! step {
+        ($what:expr, $body:expr) => {
+            golden::retry_step(&name, $what, &policy, &mut std::thread::sleep, &mut |m| say(m), || $body)
+        };
+    }
+    let made = (|| -> Result<()> {
+        let info = bx.wait_deployed(&name, Duration::from_secs(300))?;
+        let url = info.url.clone().ok_or_else(|| anyhow!("sandbox {name} has no URL"))?;
+        sandboxes.config.upsert(tod_sandbox::config::Sandbox { name: name.clone(), image: info.image, url: Some(url.clone()), agents: true });
+        sandboxes.save()?;
+        step!("wake it", bx.wait_reachable(&url, Duration::from_secs(180)).with_context(|| format!("wake {name}")))?;
+        // An image holds only what it was built with: tod's dependencies
+        // first (git among them), then its own files.
+        say("installing tod's dependencies…");
+        sandboxes.ensure_as(bx, &name, tod_sandbox::provision::Mode::Install, &mut |m| say(m))?;
+        let payload = node::NodePayload {
+            relay: &files.relay,
+            shim: tod_store::fleet::cli_relay::HTTP_SHIM_SCRIPT.as_bytes(),
+            local_cli: files.local_cli.as_deref(),
+            supervisor: files.supervisor.as_deref(),
+            // Not used by `install`: the clone is made below.
+            repo_url: "",
+            branch: "",
+            git_identity: &node::GitIdentity::fallback(),
+            bundles: &files.bundles,
+            supervisor_env: &[],
+        };
+        say("installing tod's files…");
+        step!("install tod's files", node::install(bx, &url, &payload, &mut |m| say(m)))?;
+        say(&format!("cloning {repo} into {}…", node::WORKSPACE_DIR));
+        let cloned = bx.run(&url, &format!("sh -c {} 2>&1", tod_sandbox::relay::shell_quote(&script)), 900)?;
+        if cloned.exit_code != 0 {
+            bail!("cloning {repo} into {name} failed:\n{}", cloned.output().trim());
+        }
+        mark_ready(bx, &name, mine, &policy, &say)
+    })();
+    if let Err(err) = made {
+        // Nothing points at it yet; remove it unless it is somehow ready.
+        let after = match bx.get(&name).and_then(|found| match golden::half_made_action(&name, "", found.as_ref()) {
+            golden::HalfMade::Delete => bx.delete(&name).map(|()| format!("the half-made {name} was deleted")),
+            golden::HalfMade::Keep(why) => Ok(format!("{name} was left as it is: {why}")),
+        }) {
+            Ok(text) => text,
+            Err(cleanup) => format!("deleting the half-made {name} failed too ({cleanup:#}); delete it with `tod-sandbox delete {name}`"),
+        };
+        sandboxes.config.sandboxes.retain(|s| s.name != name);
+        // Not hidden if saving the forgetting fails too: said with the rest.
+        let saved = sandboxes.save().err().map(|e| format!(" (and sandboxes.toml could not be saved: {e:#})")).unwrap_or_default();
+        return Err(err.context(format!("make the golden sandbox for {repo}: {name} was built but not finished; {after}{saved}. {repo} still has no golden")));
+    }
+    let account = sandboxes.config.blaxel.as_mut().ok_or_else(|| anyhow!("run `tod-sandbox setup` first"))?;
+    account.set_golden(repo, &name);
+    sandboxes.save()?;
+    say(&format!("{name} is now the golden of {repo}"));
+    Ok(name)
+}
+
+/// Labels the sandbox with this build's stamp and `tod-kind=golden`, marks it
+/// `ready` last, and checks Blaxel says so.
+fn mark_ready(
+    bx: &Blaxel,
+    name: &str,
+    mine: &GoldenStamp,
+    policy: &golden::StepRetry,
+    say: &dyn Fn(&str),
+) -> Result<()> {
+    let run = |what: &str, f: &mut dyn FnMut() -> Result<Option<tod_sandbox::blaxel::SandboxInfo>>| {
+        golden::retry_step(name, what, policy, &mut std::thread::sleep, &mut |m| say(m), f)
+    };
+    let stamp_labels = mine.labels();
+    let mut labels: Vec<(&str, &str)> = stamp_labels.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    labels.push(("tod-kind", golden::KIND_GOLDEN));
+    run("label it", &mut || bx.set_labels(name, &labels).map(|()| None))?;
+    run("mark it ready", &mut || bx.set_labels(name, &[(golden::LABEL_READY, "true")]).map(|()| None))?;
+    match run("verify it", &mut || bx.get(name))? {
+        Some(info) if info.label(golden::LABEL_READY) == Some("true") => Ok(()),
+        Some(_) => bail!("{name} does not carry the ready label after it was set"),
+        None => bail!("{name} is gone"),
+    }
 }
 
 fn refresh_with(
@@ -166,18 +340,7 @@ fn refresh_with(
         say("installing tod's files…");
         step!("install tod's files", tod_sandbox::node::install(bx, &url, &payload, &mut |m| say(m)))?;
         // Stamp first and `ready` last: a half-made golden is never ready.
-        let stamp_labels = mine.labels();
-        let mut labels: Vec<(&str, &str)> = stamp_labels.iter().map(|(k, v)| (*k, v.as_str())).collect();
-        labels.push(("tod-kind", golden::KIND_GOLDEN));
-        step!("label it", bx.set_labels(&name, &labels))?;
-        step!("mark it ready", bx.set_labels(&name, &[(golden::LABEL_READY, "true")]))?;
-        // Verified before anything points at it: Blaxel must say it is ready.
-        let seen = step!("verify it", bx.get(&name))?;
-        match seen {
-            Some(info) if info.label(golden::LABEL_READY) == Some("true") => Ok(()),
-            Some(_) => bail!("{name} does not carry the ready label after it was set"),
-            None => bail!("{name} is gone"),
-        }
+        mark_ready(bx, &name, mine, &policy, &say)
     })();
     if let Err(err) = made {
         // `sandboxes.toml` still points at `old`, which this never touches.

@@ -88,8 +88,18 @@ this build's manifest before it is adopted, or `make_sandbox` fails naming the
 golden. An **image** source has no golden: it gets the bootstrap and the full
 `node::install`.
 
-**Refreshing.** `tod-sandbox golden refresh [<owner/name>]`
-(`cloud_sync::golden::refresh_golden`) forks the project's golden, checks what
+**A repository with no golden** (live check Pass 7, gap 15) is built, not
+forked: `golden::decide_source` (pure) says `Build` when the repository has no
+entry of its own and the account-wide golden does not hold it (its checkout's
+`origin`, read-only, must be this repository), and `build_golden` makes a fresh
+sandbox from the account's default image with a proxy holding the user's GitHub
+token, installs tod's dependencies and files, clones `https://github.com/<repo>.git`
+into `/workspace/repo` (`golden::clone_script`; submodules recursively), and
+labels it like a refreshed one. A fork of another repository's golden is never
+the answer, and a failure deletes what it made and says why.
+
+**Refreshing.** `tod-sandbox golden refresh <owner/name>`
+(`cloud_sync::golden::refresh_golden`), for a repository that has a golden, forks it, checks what
 a fork needs (`provision::require_fork_prerequisites`), gives it the
 placeholder proxy, installs tod's files, labels it with this build's stamp and
 `tod-kind=golden`, marks it `ready` last, points the repository at it, and

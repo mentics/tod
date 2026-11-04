@@ -267,6 +267,113 @@ pub fn half_made_action(new: &str, old: &str, found: Option<&SandboxInfo>) -> Ha
     HalfMade::Delete
 }
 
+/// Where the golden of a repository comes from (gap 15 of
+/// `doc/runner-menu/live-check-2026-11.md`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Source {
+    /// The repository's golden exists (its own entry, or the account-wide one
+    /// holding this very repository): make the next one from it.
+    Refresh { from: String },
+    /// There is no golden holding this repository: make one from a fresh
+    /// image sandbox, with tod's files installed and the repository cloned.
+    /// `why` is said to the user.
+    Build { why: String },
+}
+
+/// Chooses the [`Source`] for `repo` (normalized `owner/name`, lower case).
+/// `own` is the repository's own golden entry; `legacy` the account-wide
+/// `golden` of a `sandboxes.toml` from before there was one per repository,
+/// which stands for every repository that has none of its own. The legacy
+/// one is a checkout of *some* repository, so it is refreshed for `repo` only
+/// when `legacy_origin` (asked of it, given the golden's name; it answers a
+/// normalized `owner/name`, or `None` when the golden has no checkout) is
+/// `repo`. Never a fork of another repository's golden. A failure to read the
+/// origin is an error, not a guess.
+pub fn decide_source(
+    repo: &str,
+    own: Option<&str>,
+    legacy: Option<&str>,
+    legacy_origin: &mut dyn FnMut(&str) -> Result<Option<String>>,
+) -> Result<Source> {
+    if let Some(own) = own {
+        return Ok(Source::Refresh { from: own.to_string() });
+    }
+    let Some(legacy) = legacy else {
+        return Ok(Source::Build { why: format!("{repo} has no golden sandbox") });
+    };
+    match legacy_origin(legacy)? {
+        Some(origin) if origin == repo => Ok(Source::Refresh { from: legacy.to_string() }),
+        Some(origin) => Ok(Source::Build {
+            why: format!("{repo} has no golden of its own, and the account-wide golden {legacy} holds {origin}, not {repo}"),
+        }),
+        None => Ok(Source::Build {
+            why: format!("{repo} has no golden of its own, and the account-wide golden {legacy} has no repository checkout to say it is {repo}'s"),
+        }),
+    }
+}
+
+/// `owner/name` as GitHub spells it, safe to put in a clone command: letters,
+/// digits, `-`, `_` and `.` only, neither part empty, `.` or `..`.
+pub fn check_repo_slug(repo: &str) -> Result<()> {
+    let ok = |part: &str| {
+        !part.is_empty() && part != "." && part != ".." && part.chars().all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))
+    };
+    match repo.split_once('/') {
+        Some((owner, name)) if ok(owner) && ok(name) => Ok(()),
+        _ => bail!("{repo:?} is not a GitHub repository (owner/name, with letters, digits, - _ . only)"),
+    }
+}
+
+/// The HTTPS clone URL of `repo` (no credentials: the sandbox's proxy adds
+/// the user's GitHub token to what is sent to `github.com`).
+pub fn clone_url(repo: &str) -> Result<String> {
+    check_repo_slug(repo)?;
+    Ok(format!("https://github.com/{repo}.git"))
+}
+
+/// Run in a fresh sandbox to put `repo`'s checkout where a node's fork finds
+/// it ([`crate::node::WORKSPACE_DIR`], which the relay and supervisor probe
+/// first): clones through the proxy (git's CA is the proxy's), then
+/// initializes every submodule recursively. Fails with a message naming the
+/// repository when the clone cannot be made.
+pub fn clone_script(repo: &str) -> Result<String> {
+    let url = crate::relay::shell_quote(&clone_url(repo)?);
+    let dir = crate::relay::shell_quote(crate::node::WORKSPACE_DIR);
+    Ok(format!(
+        "set -e\n\
+         if [ -n \"$SSL_CERT_FILE\" ]; then git config --system http.sslCAInfo \"$SSL_CERT_FILE\"; fi\n\
+         if [ -d {dir}/.git ]; then echo \"{dir} already holds a checkout\" >&2; exit 1; fi\n\
+         mkdir -p \"$(dirname {dir})\"\n\
+         if ! git clone --quiet {url} {dir}; then echo \"cloning {repo} failed (see git's message above): a private repository needs the GitHub token stored in tod, with access to it\" >&2; exit 1; fi\n\
+         cd {dir}\n\
+         if [ -f .gitmodules ]; then \
+         if ! git submodule update --init --recursive --quiet; then echo \"{repo} cloned, but its submodules did not initialize: the token needs access to them too\" >&2; exit 1; fi; fi\n"
+    ))
+}
+
+/// The `POST /sandboxes` body of the sandbox a golden is built in: from
+/// `image`, with the given proxy (holding the user's GitHub token, so the
+/// clone can read a private repository), labelled `tod-kind=golden` (not
+/// `ready`: that is set last).
+pub fn build_body(name: &str, image: &str, region: &str, memory_mb: u32, proxy: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "metadata": { "name": name, "labels": { "tod-kind": KIND_GOLDEN } },
+        "spec": {
+            "region": region,
+            "runtime": {
+                "image": image,
+                "memory": memory_mb,
+                "ports": [{ "name": "tod-relay", "target": crate::blaxel::RELAY_PORT, "protocol": "HTTP" }],
+                "envs": [
+                    { "name": "GH_TOKEN", "value": crate::node::GH_TOKEN_PLACEHOLDER },
+                    { "name": "NODE_USE_ENV_PROXY", "value": "1" },
+                ],
+            },
+            "network": { "proxy": proxy },
+        },
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -443,5 +550,70 @@ mod tests {
     fn built_is_shown_as_a_date() {
         assert_eq!(built_text(0), "1970-01-01 00:00 UTC");
         assert_eq!(built_text(1_762_000_000), "2025-11-01 12:26 UTC");
+    }
+
+    #[test]
+    fn a_repository_with_no_golden_is_built_never_forked_from_anothers() {
+        let never = &mut |_: &str| -> Result<Option<String>> { panic!("nothing to ask") };
+        // Its own entry: refreshed in place, nothing asked.
+        assert_eq!(
+            decide_source("o/r", Some("tod-golden-o-r-1"), Some("wsx-golden-*"), never).unwrap(),
+            Source::Refresh { from: "tod-golden-o-r-1".into() }
+        );
+        // Neither: built.
+        assert!(matches!(decide_source("o/r", None, None, never).unwrap(), Source::Build { .. }));
+        // The account-wide golden of another repository (the wsx-golden): never forked.
+        let mut asked = Vec::new();
+        let other = decide_source("joel-cofactr/build-test", None, Some("wsx-golden-*"), &mut |g| {
+            asked.push(g.to_string());
+            Ok(Some("cofactr/workspace".into()))
+        })
+        .unwrap();
+        match other {
+            Source::Build { why } => assert!(why.contains("cofactr/workspace") && why.contains("wsx-golden-*"), "{why}"),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(asked, vec!["wsx-golden-*"]);
+        // One with no checkout cannot vouch for the repository.
+        assert!(matches!(decide_source("o/r", None, Some("g"), &mut |_| Ok(None)).unwrap(), Source::Build { .. }));
+        // The account-wide golden of this very repository is refreshed in place.
+        assert_eq!(
+            decide_source("cofactr/workspace", None, Some("wsx-golden-*"), &mut |_| Ok(Some("cofactr/workspace".into()))).unwrap(),
+            Source::Refresh { from: "wsx-golden-*".into() }
+        );
+        // An origin that cannot be read is an error, not a guess.
+        assert!(decide_source("o/r", None, Some("g"), &mut |_| Err(anyhow::anyhow!("unreachable"))).is_err());
+    }
+
+    #[test]
+    fn a_repository_name_must_be_safe_to_clone() {
+        for good in ["joel-cofactr/build-test", "a/b.c", "A_b/c-d"] {
+            check_repo_slug(good).unwrap();
+        }
+        for bad in ["build-test", "a/", "/b", "a/b/c", "a/..", "a b/c", "a/b;rm", "a/$(x)", "a/b'c"] {
+            assert!(check_repo_slug(bad).is_err(), "{bad}");
+        }
+        assert_eq!(clone_url("o/r").unwrap(), "https://github.com/o/r.git");
+        assert!(clone_url("o/r;x").is_err());
+    }
+
+    #[test]
+    fn the_clone_goes_to_the_directory_a_fork_looks_in_and_takes_submodules() {
+        let s = clone_script("joel-cofactr/build-test").unwrap();
+        assert!(s.contains("git clone --quiet https://github.com/joel-cofactr/build-test.git /workspace/repo"), "{s}");
+        assert!(s.contains("submodule update --init --recursive"), "{s}");
+        assert!(s.contains("cloning joel-cofactr/build-test failed") && s.contains("token"), "{s}");
+        // The same directory the checkout probe puts first.
+        assert!(crate::node::WORKSPACE_PROBE.contains(crate::node::WORKSPACE_DIR));
+        assert!(clone_script("bad").is_err());
+    }
+
+    #[test]
+    fn the_build_body_is_a_golden_with_the_given_proxy_and_not_ready() {
+        let body = build_body("tod-golden-o-r-1", "sandbox/x:latest", "us-pdx-1", 4096, serde_json::json!({"enabled": true}));
+        assert_eq!(body["metadata"]["labels"]["tod-kind"], "golden");
+        assert!(body["metadata"]["labels"].get("ready").is_none());
+        assert_eq!(body["spec"]["runtime"]["image"], "sandbox/x:latest");
+        assert_eq!(body["spec"]["network"]["proxy"]["enabled"], true);
     }
 }

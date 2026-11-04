@@ -484,6 +484,10 @@ worktree, which has `target/sandbox`) was stopped; another session's `tod` (pid 
     takes a separate "Repository to clone" URL for an image location (implementation.md, What remains).
 15. A golden cannot be made for a repository whose checkout is not in the golden it forks (a fork
     never clones). `golden refresh <repo>` of a new repository forks the old golden unchanged.
+    Fixed afterwards: a repository with no golden is built from a fresh image sandbox with the
+    repository cloned (implementation.md, What remains); live, `golden refresh
+    joel-cofactr/build-test` made `tod-golden-joel-cofactr-build-test-6aeb65d8` and a node forked
+    from it had the build-test checkout.
 16. A `tod-cli` error printed by a separate shell command (`capabilities show`, which does not exist)
     showed up as a red toast in the running app. Probably the shared error channel; not investigated.
     **Verdict: intended, not a bug.** `tod-cli`'s `main` (crates/tod-cli/src/main.rs) answers every failed

@@ -40,13 +40,20 @@ golden [<repo>] [<sandbox>]
                          repository (owner/name): a node forks `golden` once, and
                          a new golden sandbox is set here. A `golden` of an older
                          sandboxes.toml is every repository's until it has its own.
-golden refresh [<repo>]  Make the repository's golden again on this build: fork the
-                         current one, check what a fork needs, install tod's files
-                         (relay, shim, Linux tod-cli, supervisor, bundles, Claude
-                         adapter), label it with this build's stamp, mark it ready,
-                         point the repository at it, and delete the old one when tod
-                         made it and no other repository uses it. Refuses a golden a
-                         newer tod made.
+golden refresh <owner/name>
+                         Make the repository's golden on this build. With a golden
+                         of its own: fork it, check what a fork needs, install tod's
+                         files (relay, shim, Linux tod-cli, supervisor, bundles,
+                         Claude adapter), label it with this build's stamp, mark it
+                         ready, point the repository at it, and delete the old one
+                         when tod made it and no other repository uses it. Refuses a
+                         golden a newer tod made. With none (or only an account-wide
+                         golden holding another repository): build one from a fresh
+                         sandbox of the default image, install tod's dependencies and
+                         files, and clone the repository into /workspace/repo through
+                         the proxy with your stored GitHub token (a private repository
+                         works), submodules included. Never forks another repository's
+                         golden.
 fork <source> <name> [--agents]
                          Create a sandbox as a copy of another one's current
                          state (it may be in standby). Needs a Blaxel workspace
@@ -538,8 +545,8 @@ fn golden_refresh(ctx: &mut Ctx, repo: Option<String>) -> Result<i32> {
             match repos.as_slice() {
                 [only] => (*only).clone(),
                 [] => bail!(
-                    "no repository has a golden of its own yet: say which to refresh, `golden refresh <owner/name>` \
-                     (the sandbox it starts from is the account's `golden`, or one set with `golden <owner/name> <sandbox>`)"
+                    "no repository has a golden of its own yet: say which to make one for, `golden refresh <owner/name>` \
+                     (it is built from a fresh sandbox with the repository cloned into it)"
                 ),
                 many => bail!(
                     "more than one repository has a golden ({}): say which to refresh, `golden refresh <owner/name>`",

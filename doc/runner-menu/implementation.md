@@ -678,6 +678,27 @@ Pass 3 unless noted).
   `views::locations::tests`. The clone directory is not user-chosen
   (`/workspace/repo`, fixed by `checkout_script` and the supervisor's probe).
 
+- **Golden for a repository that has none (live check Pass 7, gap 15):**
+  `golden::decide_source` (pure, tod-sandbox) says `Refresh` for the repository's
+  own entry (or the account-wide golden whose checkout origin is this
+  repository) and `Build` otherwise; `cloud_sync::golden::build_golden` makes a
+  fresh sandbox from the default image with a proxy holding the stored GitHub
+  token, installs tod's dependencies and files, clones
+  `https://github.com/<repo>.git` into `/workspace/repo` (`golden::clone_script`,
+  submodules recursively), labels it and marks it `ready` last, and a failure
+  deletes it and names why. `refresh_golden` and `ensure_golden_current` both
+  go through it (so the app's automatic refresh for a repository with no golden
+  builds one too). Tests: `golden::tests::{a_repository_with_no_golden_is_built_never_forked_from_anothers,
+  a_repository_name_must_be_safe_to_clone,
+  the_clone_goes_to_the_directory_a_fork_looks_in_and_takes_submodules,
+  the_build_body_is_a_golden_with_the_given_proxy_and_not_ready}`. Live: built for
+  the private `joel-cofactr/build-test`; a node forked from it had its checkout on its
+  own branch and could push; the checkout survived the node's proxy update.
+  Not verified: a repository with submodules; a build with no GitHub token stored;
+  the golden keeping the user's token in its proxy (the golden's network rules hold
+  it, as a node sandbox's do; a placeholder swap would redeploy it).
+  `bake --repo` still cannot clone a private repository.
+
 **Still only verifiable live:**
 
 - **Image location with a repository URL:** the clone through a real sandbox

@@ -67,12 +67,12 @@ echo "Orchestrator user: $(grep -E '^owner' "$TEST/sandboxes.toml")"
 #                     Mirrors the real roots (Cofactr/workspace with flagship,
 #                     kb, ... inside it). Real-data checks and the real golden
 #                     flow. Its golden is keyed cofactr/workspace.
-#   Build test        cloud sandbox, "From an image", directory
-#                     /workspace/build-test, repository joel-cofactr/build-test
-#                     (private). Anything that pushes branches or PRs, or needs
-#                     flexibility. Until an image location can name its HTTPS
-#                     repository (gap 14), a node's `node_fields.repo` is set to
-#                     https://github.com/joel-cofactr/build-test by hand.
+#   Build test        cloud sandbox, fork of `golden`, directory /workspace/repo,
+#                     repository joel-cofactr/build-test (private). Anything that
+#                     pushes branches or PRs, or needs flexibility. Its golden is
+#                     keyed joel-cofactr/build-test and is made once with
+#                     `tod-sandbox golden refresh joel-cofactr/build-test` (built
+#                     from a fresh sandbox with the repository cloned: gap 15).
 # Never point a location at /workspace/flagship (a branch would go to
 # Cofactr/flagship).
 if [ -f "$TEST/tod.db" ] && command -v sqlite3 >/dev/null && sqlite3 "$TEST/tod.db" '.tables' | grep -q files_places; then
@@ -85,14 +85,19 @@ INSERT INTO files_places(id,name,repo,use_worktree,dev_container,container,conta
   WHERE NOT EXISTS (SELECT 1 FROM files_places WHERE name='Golden workspace');
 INSERT INTO files_places(id,name,repo,use_worktree,dev_container,container,container_repo_on_host,container_kind,sandbox_source,sandbox_from,created_at,updated_at)
   SELECT lower(hex(randomblob(4)))||'-'||lower(hex(randomblob(2)))||'-4'||substr(lower(hex(randomblob(2))),2)||'-a'||substr(lower(hex(randomblob(2))),2)||'-'||lower(hex(randomblob(6))),
-         'Build test','/workspace/build-test',0,1,NULL,0,'sandbox','image','',strftime('%s','now')*1000,strftime('%s','now')*1000
+         'Build test','/workspace/repo',0,1,NULL,0,'sandbox','fork','golden',strftime('%s','now')*1000,strftime('%s','now')*1000
   WHERE NOT EXISTS (SELECT 1 FROM files_places WHERE name='Build test');
+-- A root seeded when Build test was an image location: make it a fork of the golden.
+UPDATE files_places SET repo='/workspace/repo', sandbox_source='fork', sandbox_from='golden', updated_at=strftime('%s','now')*1000
+  WHERE name='Build test' AND sandbox_source='image';
 SQL
   echo "Locations: $(sqlite3 "$TEST/tod.db" "select group_concat(name, ', ') from files_places")"
 else
   echo "No tod.db yet (or no sqlite3): launch the app once, then rerun to add the 'Golden workspace' and 'Build test' locations."
 fi
-echo "Then: tod-sandbox --data-root $TEST golden refresh cofactr/workspace   (makes the workspace golden; never cofactr/flagship)"
+echo "Then, once each (a repository with no golden is built from a fresh sandbox; one with a golden is refreshed in place):"
+echo "  tod-sandbox --data-root $TEST golden refresh cofactr/workspace         (never cofactr/flagship)"
+echo "  tod-sandbox --data-root $TEST golden refresh joel-cofactr/build-test   (the Build test location's golden)"
 
 echo "Seeded $TEST"
 echo "Golden sandbox: $(grep -E '^golden' "$TEST/sandboxes.toml" || echo '(none)')"
