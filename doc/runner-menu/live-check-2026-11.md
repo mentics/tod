@@ -463,3 +463,25 @@ log was in the sandbox's `/root/.claude/projects/-workspace-repo/`.
 
 (The "return" prefix in the second and third user messages is the control socket's `key return`
 typed into the box; not a product issue.)
+
+### Cleanup and state left (pass 7)
+
+Deleted: node `RM p7 A`, its sandbox (without a checkpoint), locations `RM p7 cloud` and
+`RM p7 host` (through the dialog), the scratch clone, the saved session logs and the host
+`~/.claude/projects` directory for the clone, and the branch `task/rm-p7-a` in
+`joel-cofactr/build-test` (no PR was ever opened). No golden or `[blaxel.goldens]` change was made.
+My `tod` was quit through its socket and the root's `tod-agentd` that it started (built in this
+worktree, which has `target/sandbox`) was stopped; another session's `tod` (pid 96849) still runs.
+
+### Gaps and gotchas, pass 7
+
+14. **An image-based cloud location cannot learn its repository.** The Locations dialog refuses a
+    URL as the directory of a cloud location, yet the first chat needs an HTTPS repository URL
+    (`node_source`), which for an image there is no sandbox to ask for. The error text tells the user
+    to set the Files directory to a URL, which the dialog refuses. Possible fix: accept an HTTPS URL
+    as the directory of an image-sourced cloud location (it is the clone source; the checkout dir
+    `/workspace/repo` is then recorded on the location). Not done here.
+15. A golden cannot be made for a repository whose checkout is not in the golden it forks (a fork
+    never clones). `golden refresh <repo>` of a new repository forks the old golden unchanged.
+16. A `tod-cli` error printed by a separate shell command (`capabilities show`, which does not exist)
+    showed up as a red toast in the running app. Probably the shared error channel; not investigated.
