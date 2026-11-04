@@ -558,35 +558,81 @@ was never made no longer says the sandbox "was deleted".
 
 ### What remains
 
-Not verified live, or known and not fixed (the source is
-[live-check-2026-11.md](live-check-2026-11.md), Pass 3 unless noted):
+Covered by tests since the live checks (see below), and what is still only
+verifiable live (the source is [live-check-2026-11.md](live-check-2026-11.md),
+Pass 3 unless noted).
+
+**Now covered by tests (no live run needed):**
+
+- **Stale `cloud_nodes` row after Migrate right after Stop now (9):** a late
+  update of a row this side had removed is dropped, not applied, and reported
+  (`tod_store::sync::apply_one`: a `cloud_nodes` update whose row is gone is a
+  conflict that does not insert; `ApplyReport::revival_dropped`; the app logs
+  it from both the pull and the send, `cloud_sync::record_dropped_revivals`).
+  The removal also reaches the other side, so a revival cannot live on in the
+  orchestrator's copy. (Delete sandbox keeps its row, marked lost; a late
+  whole-row push over that row is a different case and is not covered.) Test:
+  `sync::tests::a_late_update_of_a_removed_cloud_node_row_does_not_bring_it_back`.
+  The writer's own path (`CloudNodeUpsert`) already refused a node whose
+  location names no sandbox. Migrate's wait for the supervisor to end is the
+  panel's (`TaskPanel::drain_migration` waits for the run state, which for a
+  supervised node is the live heartbeat); it removes the row only after that.
+- **Migrate while running:** Pause, Stop now and Cancel each lead to their own
+  job, the migration begins only after the run has ended, and a failed Pause
+  or Stop now (`sandbox ... still waking`) clears `pause_asked` and the
+  pending migration, loudly (`unified::panels::task::tests::
+  each_answer_of_migrate_while_running_leads_to_its_own_job`,
+  `a_failed_pause_or_stop_now_cancels_the_migration_loudly`). Seam:
+  `TaskPanel::stop_job`, the function that asks the supervisor.
+- **Node with children:** the panel shows exactly "You cannot migrate a node
+  that has children." (`migrating_a_node_with_children_is_refused_...`); the
+  store's own test and the menu's hiding of Migrate were already there.
+- **A failed Start or wake request leaves the node failed, not `starting`:**
+  `cloud_sync::tests::a_failed_wake_request_replaces_starting_only_while_it_is_the_state`
+  (the wake path; a later state and Pause / Stop now are left alone).
+- **Check now:** a clear gate in `pr_draft` advances once the pull request is
+  ready, and is held by review feedback or an open decision; in `pr_review`
+  it advances unless a decision is open; elsewhere it advances with no GitHub
+  read (`lifecycle::check_now::tests`, `pr_readiness::set_feed_override`).
+- **Golden "newer" refusal:** `golden::ensure_current_with` (the decision,
+  with the lookup and the refresh given) refuses a newer golden naming the
+  repository and both stamps and never calls the refresh, so nothing is made;
+  the same stamp is used and an older or unstamped one is refreshed.
+- **Delete at `done`:** the real `retire_due` goes through
+  `lost::delete_node_sandbox` (the menu's delete); the daemon's schedule
+  (30 s, then every minute, stop on quit) is `retire_schedule` with an
+  injected clock (`tod-agentd` `server::tests`); the failure path and the
+  1/5/15/60-minute retries were already unit tested with a fake delete.
+
+**Still only verifiable live:**
 
 - **Migrate:** the same Claude session id resuming at the new place (5b, needs
   Claude signed in on the host; 5c compared nothing but the transfer); the
-  Pause / Stop now / Cancel prompt while a *supervised* run is active, and a
-  pending Migrate queued behind a Pause on a sandbox that will not wake (5d,
-  pass 2); the log pull limited to the node's own sessions (pass 2, bug 8, not
-  re-run).
-- **Stale row after Migrate right after Stop now (9):** reproduced once, not
-  fixed. The sketch: after the removal sync, re-read the `cloud_nodes` row and
-  remove it again if the supervisor's last push brought it back.
-- **Delete at `done` (7):** only walked with `node_lifecycle.state` set in the
-  database, never through a real lifecycle to a merged PR; its failure path and
-  the 1/5/15/60-minute retries were not provoked (7c); a node that reached
-  `done` while the daemon was off was not tried.
+  three-button prompt against a real *supervised* run, and a Migrate queued
+  behind a Pause on a sandbox that will not wake (5d, pass 2; the logic is
+  now tested, the Blaxel behaviour is not); the log pull limited to the node's
+  own sessions (pass 2, bug 8, not re-run). The row-revival fix is tested
+  against two stores, not a real orchestrator and supervisor pushing late.
+- **Delete at `done`:** never walked through a real lifecycle to a merged PR
+  (only `node_lifecycle.state` set in the database); a delete that really
+  fails at Blaxel (7c) was not provoked; a node that reached `done` while the
+  daemon was off was not tried. `make_sandbox` itself cannot be run without
+  Blaxel (its control-plane address is fixed), so "an older tod makes nothing"
+  is tested at the golden decision, not through a whole `make_sandbox`.
 - **Adopt existing sandbox:** only the "Blaxel no longer has it" answer was
   seen; adopting a live sandbox (`Live`: the relay manifest and checkout
   probe through a real sandbox) was not.
-- **Golden:** the "both stamps" refusal for a golden a *newer* tod made (1b)
-  was not reached; the same-order-different-stamp refresh was not exercised.
-- **Check now:** a clear gate advancing a node in `pr_draft` (pass 2 only did
-  `proposed`).
+- **Golden:** the same-order-different-stamp refresh and a refusal against a
+  real newer golden were not exercised on Blaxel.
 - **Blaxel standby:** a fork left `STANDBY` answering `WORKLOAD_UNAVAILABLE`
   for 25+ minutes (bug 5): every operation failed loudly after 82-90 s, only
   Delete without a checkpoint cleared it. Tod cannot do more than say so.
 - **`sandboxes.toml` merge:** unit-tested (two interleaved writers, eight
   threads, a creation that outlives a `golden refresh`), not re-run against a
   real second app on one root.
+- **Waive:** nothing in any view calls `tod_core::lifecycle::waive` (the
+  docs that promised a Waive in the side pane were corrected); whether to
+  offer one again is a product decision, not a live check.
 
 ## Open questions
 
