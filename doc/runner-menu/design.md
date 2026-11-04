@@ -48,8 +48,8 @@ sandboxes are forked from (the repository's checkout and the toolchain).
   (`crates/tod-agentd/src/runners.rs`); `doc/ui/task-panel.md` ("Closing the
   app stops a local run") is stale. Resume is never needed because the app
   closed, locally or in the cloud.
-- **The final-phase delete only runs on a sync**, and only for `cloud_nodes`
-  rows (`lost::delete_sandboxes_at_final_phase` in `sync_once`).
+- **The final-phase delete only ran on a sync**, and only for `cloud_nodes`
+  rows (fixed in B4: `sandbox_retire`, run by the daemon).
 - **No cloud Pause or Stop now exists.** `node_requests` kinds are `run`,
   `fresh_session`, `check_now`, `keep_going`, fixed by a SQL `CHECK`.
 - **Where the gate is checked today.** `.claude/CLAUDE.md` and
@@ -381,9 +381,10 @@ a sync.
   supervisor's changes, which its background sync (`cloud_notify`, started in
   `tod-agentd/src/server.rs`) pulls in as soon as the orchestrator says
   something changed. No user action is involved.
-- **When:** on every store change that moves a node into `done` (the daemon
-  sees its own commits), at the daemon's start, and on a slow timer (every
-  few minutes) for retries. Each pass is a database read unless a node is due.
+- **When (as built):** 30 s after the daemon starts and then every minute
+  (`watch_done_sandboxes`), not on each commit: a pass is one database read
+  unless a node is due, so a node that reaches `done` loses its sandbox within
+  a minute, and the timer also drives retries and a heartbeat that has ended.
 - **What is due:** a node at or past `done` whose `node_files_locations` row
   names a sandbox, whose setting is on, and that nothing works on (no activity
   lease, no live cloud heartbeat: a supervisor that just moved the node to
@@ -391,8 +392,9 @@ a sync.
   with a Files sandbox and no `cloud_nodes` row. Only the machine holding the
   location row (the one that made the sandbox) can be the one.
 - **How:** the same function as the menu's Delete sandbox, with the
-  checkpoint. A failure is reported (log panel, toast) and retried after a
-  back-off, never dropped. `retire_done` then drops the `cloud_nodes` row.
+  checkpoint. A failure is reported (log panel, the node's problems) and retried
+  after a back-off (1, 5, 15, 60 minutes, then it stops until the daemon
+  restarts, saying so), never dropped. `retire_done` then drops the `cloud_nodes` row.
 - **Machine off or daemon not running:** nothing happens then; the sandbox
   sits in standby (Blaxel bills almost nothing while it sleeps). The daemon's
   start-up pass catches up: `sync_on_start` brings in what the supervisor did,

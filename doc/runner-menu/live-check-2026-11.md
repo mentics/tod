@@ -89,7 +89,7 @@ left stopped. `independent_evaluation` was flipped to false in the root's
 | "Delete sandbox" default on | PASS: checked on `ENG work` with no stored value (NULL). |
 | Toggle persists | PASS: unticking wrote `delete_sandbox = 0` on `ENG work`. |
 | Inherited | PASS: `RM live C`, with lifecycle-config enabled and nothing of its own, showed the box (unchecked, since the parent was off) with "from ENG work"; ticking it wrote `1` on C, and "Use inherited" appeared. |
-| Sandbox deleted automatically at `done` | NOT REACHED. A node cannot be cheaply walked to `done` (needs the full lifecycle, PR and merge). The code path is `delete_sandboxes_at_final_phase`, run only inside an orchestrator sync (B4 will add the daemon trigger); only its unit tests were relied on. |
+| Sandbox deleted automatically at `done` | NOT REACHED. A node cannot be cheaply walked to `done` (needs the full lifecycle, PR and merge). The code path was `delete_sandboxes_at_final_phase`, run only inside an orchestrator sync; B4 replaced it with the daemon's `sandbox_retire`; only unit tests were relied on. |
 | Check now advances a clear gate | PASS. `RM live C` in `proposed` with its phase certified (independent evaluation off for the certify): the line read "Checked: the gate is clear; moved to design". |
 | Delete prompt, Cancel | PASS: node kept running, nothing deleted. |
 | Migrate while running: Pause / Stop now / Cancel prompt | PASS: shown ("Migrate to RM host once it has paused ... or been stopped now?"). Chose Pause. The migration then did not begin: the Pause job stayed busy ("Asking the supervisor to pause...") because the sandbox would not wake (Blaxel answered 404 WORKLOAD_UNAVAILABLE for 90 s; the app logged "replacing it"). Blaxel flakiness, not looked into further. |

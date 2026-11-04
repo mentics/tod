@@ -126,6 +126,7 @@ pub fn run(data_root: &Path) -> Result<bool> {
     // notifications. One process holds them, whoever has the app open.
     tod_core::cloud_sync::sync_on_start(shared.store.clone());
     tod_core::cloud_notify::start(shared.store.clone());
+    watch_done_sandboxes(shared.clone());
     tod_core::db_broker::start(shared.store.clone());
     // Old build copies go (this one is running from `daemon/`, not removed).
     let running = std::env::current_exe().ok();
@@ -164,6 +165,42 @@ pub fn run(data_root: &Path) -> Result<bool> {
     drop(lock);
     eprintln!("tod-agentd {stamp} stopped");
     Ok(true)
+}
+
+/// How long after start the first pass waits (the start's sync pulls first),
+/// and how often a pass runs after that.
+const RETIRE_FIRST_AFTER: std::time::Duration = std::time::Duration::from_secs(30);
+const RETIRE_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Deletes the sandbox of every node that is in its final phase and whose
+/// "Delete sandbox" setting is on ([`tod_core::sandbox_retire`]): once shortly
+/// after start, which catches up a node that reached `done` while the daemon
+/// was down, and then every minute, which covers a node that gets there while
+/// it runs and the retries of a failed delete (each node's own back-off lives
+/// in `sandbox_retire`). A thread of its own: it blocks on the network.
+fn watch_done_sandboxes(shared: Arc<Shared>) {
+    let spawned = std::thread::Builder::new().name("tod-agentd-retire".into()).spawn(move || {
+        std::thread::sleep(RETIRE_FIRST_AFTER);
+        loop {
+            if shared.quit.load(Ordering::SeqCst) {
+                return;
+            }
+            // A pass that cannot even read the store is loud, never skipped.
+            if let Err(err) = tod_core::sandbox_retire::retire_due(&shared.store) {
+                let message = format!("Checking which done nodes' sandboxes to delete failed: {err:#}");
+                tracing::warn!("tod-agentd: {message}");
+                tod_core::logging::buffer::record(
+                    tod_core::logging::buffer::Level3::Error,
+                    tod_core::logging::buffer::LogSource::App,
+                    message,
+                );
+            }
+            std::thread::sleep(RETIRE_EVERY);
+        }
+    });
+    if let Err(err) = spawned {
+        tracing::warn!("tod-agentd: the done-sandbox check did not start: {err}");
+    }
 }
 
 /// Ends the daemon when [`lifetime::should_exit`] says to, checked every

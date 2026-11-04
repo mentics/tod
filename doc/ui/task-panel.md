@@ -155,9 +155,10 @@ stopped run is left as it was.
 **Delete sandbox when done.** The lifecycle config editor's Done block has a
 **Delete sandbox** checkbox, on by default, inherited from the nearest node
 that sets it like the skills are: when the node reaches `done` its sandbox is
-deleted. The automatic trigger is being reworked (stage B4 of
-`doc/runner-menu/implementation.md`); the menu's Delete sandbox is the manual
-way meanwhile.
+deleted, by the daemon with no click and no sync (`tod_core::sandbox_retire`,
+`doc/runner-menu/design.md`, "Deleting the sandbox at `done`"). A failed delete
+is reported on the node and retried; the menu's Delete sandbox stays the
+manual way.
 
 **Requests.** A run that stopped for a request (a decision, a plan step
 handed back, a gate criterion no agent can fix) continues by itself once the user has

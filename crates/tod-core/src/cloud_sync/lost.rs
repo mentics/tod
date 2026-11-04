@@ -26,7 +26,6 @@ use tod_sandbox::blaxel::SandboxInfo;
 use tod_store::cloud_nodes::{self, CloudNodeRow};
 use tod_store::fleet::{FleetMutation, FleetStore};
 use tod_store::fleet::provision::SandboxRefresh;
-use tod_store::lifecycle_config::{self, FINAL_PHASE};
 
 /// Which cloud nodes a check looks at.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -157,49 +156,6 @@ pub fn adopt_legacy_records(fleet: &FleetStore) -> Result<usize> {
         );
     }
     Ok(adopted)
-}
-
-/// Deletes the sandbox of every node that has entered the final lifecycle
-/// state ([`FINAL_PHASE`], `done`) while its Lifecycle config says to ("Delete
-/// sandbox", on unless a node turned it off): the node's one sandbox, as its
-/// Files location records it, through [`delete_node_sandbox`]. A location is
-/// this machine's own, so a node another client runs is never touched (only
-/// its owner holds the tokens). A node whose runner is still active is left
-/// for the next sync (the delete refuses it). Every node is tried; the
-/// failures come back together as one error naming each. Blocks on the
-/// network: never on the UI thread. (The proper daemon-driven trigger is a
-/// later item, B4.)
-pub fn delete_sandboxes_at_final_phase(fleet: &FleetStore) -> Result<Vec<String>> {
-    let final_rank = crate::task::model::lifecycle_rank(FINAL_PHASE);
-    let located: Vec<tod_store::fleet::FilesLocation> = fleet
-        .read(|c| tod_store::fleet::repos::files_location::FilesLocationRepo::new(c).list_all())?
-        .into_iter()
-        .filter(|l| l.sandbox().is_some())
-        .collect();
-    let mut deleted = Vec::new();
-    let mut failures = Vec::new();
-    for location in located {
-        let node = location.node_id.clone();
-        let Some(task) = fleet.get_node(&node)? else { continue };
-        if crate::task::model::lifecycle_rank(&task.lifecycle) < final_rank {
-            continue;
-        }
-        let uuid = uuid::Uuid::parse_str(&node).with_context(|| format!("node id {node}"))?;
-        if !fleet.read(|c| lifecycle_config::resolve_delete_sandbox(c, uuid))?.enabled {
-            continue;
-        }
-        if runner_blocker(fleet, &node)?.is_some() {
-            continue;
-        }
-        match delete_node_sandbox(fleet, &node) {
-            Ok(message) => deleted.push(message),
-            Err(err) => failures.push(format!("{} ({}): {err:#}", task.title, location.sandbox().unwrap_or_default())),
-        }
-    }
-    if !failures.is_empty() {
-        anyhow::bail!("deleting the sandbox of a node that reached {FINAL_PHASE} failed for {}", failures.join("; "));
-    }
-    Ok(deleted)
 }
 
 /// Drops the `cloud_nodes` row of every node that reached `done`.

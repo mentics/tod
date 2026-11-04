@@ -12,8 +12,8 @@ green (`cargo nextest run -p <crate> …`, ~120 s timeout) and
 **A0.** Commit the uncommitted "Delete sandbox" lifecycle-config work (schema
 v92, `lifecycle_config::{add_delete_sandbox, resolve_delete_sandbox,
 set_delete_sandbox, FINAL_PHASE}`, `OutlineMutation::SetNodeLifecycleDeleteSandbox`,
-the editor's "Done" block, `lost::delete_sandboxes_at_final_phase` in
-`sync_once`). Its trigger and record move in B4; the stored setting does not
+the editor's "Done" block, and a sync-time delete that B4 replaced with
+`sandbox_retire`). Its trigger and record moved in B4; the stored setting does not
 change. Schema numbers below start at v93.
 
 ## Stage A: the runner menu and Migrate to…
@@ -418,7 +418,7 @@ What landed, and where it departs from the text below:
   (`cloud_sandbox`), `session_log::node_sandbox` (so `keep_node_state`,
   `place_node_state`, migrate), `provision::recorded_sandboxes` (the creator's
   reuse and lost-track decisions), the delete plan (both variants,
-  `delete_sandboxes_at_final_phase`), `db_broker`, the task panel's line and
+  the old sync-time final-phase delete), `db_broker`, the task panel's line and
   menu, and the lost/reinstall check (`lost::located_rows`). `CloudNode` no
   longer has a `sandbox` field.
 - Reported, never fixed silently: `located_rows` reports (once per message, to
@@ -443,6 +443,18 @@ What landed, and where it departs from the text below:
   legacy `cloud-sync.json` records are adopted only for nodes with a location.
 
 ### B4. Automatic delete at `done`
+
+**Status: done.** As built: `sandbox_retire::{decide (pure), due, retire_due,
+retire_due_with}`; the delete is `lost::delete_node_sandbox` (the menu's), and
+"already retired" is simply "its location is gone", so a second pass does
+nothing. The daemon's `watch_done_sandboxes` thread runs a pass 30 s after
+start (`sync_on_start` runs in parallel and pulls first in practice; a node it
+brings in is caught by the next pass) and then every minute, instead of the
+commit hook below (a pass is one read). A failure goes to the node's problems
+and the app log and is retried after 1, 5, 15 and 60 minutes, then stops until
+the daemon restarts, saying so. `lost::delete_sandboxes_at_final_phase` and
+its call in `sync_once` are removed. The runner check is `lost::runner_blocker`
+(a live `run` lease or live supervisor heartbeat). The plan as written:
 
 - New `crates/tod-core/src/sandbox_retire.rs`: `due(fleet) -> Vec<node>` (a
   location with a sandbox, lifecycle at or past `FINAL_PHASE`,
