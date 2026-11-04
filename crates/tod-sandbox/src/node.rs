@@ -458,6 +458,13 @@ pub fn env_for(spec: &NodeSandboxSpec, creds: &NodeCredentials) -> Vec<(&'static
     node_env(spec, claude_placeholder, github_via_proxy)
 }
 
+/// [`rules_fingerprint`] of every rule a node's proxy is made with
+/// ([`proxy_rules`]): the `tod-creds` label every node sandbox carries, so one
+/// comparison says whether its proxy holds the credentials it should.
+pub fn node_creds_fingerprint(spec: &NodeSandboxSpec, creds: &NodeCredentials) -> String {
+    rules_fingerprint(&proxy_rules(creds, spec.orchestrator_host, spec.claude_via))
+}
+
 /// The `POST /sandboxes` body for a node's sandbox.
 pub fn create_body(spec: &NodeSandboxSpec, creds: &NodeCredentials) -> Value {
     let envs: Vec<Value> = env_for(spec, creds)
@@ -472,6 +479,7 @@ pub fn create_body(spec: &NodeSandboxSpec, creds: &NodeCredentials) -> Value {
                 "tod-user": spec.user,
                 "tod-node": spec.node,
                 ENV_LABEL: env_fingerprint(&creds.custom),
+                CREDS_LABEL: node_creds_fingerprint(spec, creds),
             },
         },
         "spec": {
@@ -614,15 +622,8 @@ pub fn checkout_script(repo_url: &str, branch: &str, identity: &GitIdentity, all
     )
 }
 
-/// Installs the relay, the shim, and the supervisor into the node's sandbox
-/// at `url`, checks out the branch, and starts the relay and supervisor.
-/// `progress` hears each slow step and any warning.
-pub fn provision(bx: &Blaxel, url: &str, payload: &NodePayload, progress: &mut dyn FnMut(&str)) -> Result<()> {
-    install(bx, url, payload, progress)?;
-    start(bx, url, payload, true, progress)
-}
-
-/// The part of [`provision`] that is the same for every node: the relay,
+/// What every node's sandbox gets from an image (a fork of a golden has it
+/// already, see [`install_into_fork`]): the relay,
 /// the shim, the supervisor, the Linux `tod-cli`, and the bundles. A base
 /// gets only this.
 pub fn install(bx: &Blaxel, url: &str, payload: &NodePayload, progress: &mut dyn FnMut(&str)) -> Result<()> {
@@ -689,29 +690,32 @@ pub fn install_into_fork(bx: &Blaxel, url: &str, payload: &NodePayload, progress
     install_bundles(bx, url, payload, progress)
 }
 
-/// The part of [`provision`] that is the node's own: checks out its branch,
-/// and starts the relay and the supervisor. All a node forked from a base
-/// needs.
-pub fn start(bx: &Blaxel, url: &str, payload: &NodePayload, allow_clone: bool, progress: &mut dyn FnMut(&str)) -> Result<()> {
-    progress(&format!("checking out {}…", payload.branch));
-    let script = format!("sh -c {} 2>&1", shell_quote(&checkout_script(payload.repo_url, payload.branch, payload.git_identity, allow_clone)));
-    checkout_with_auth_retry(&mut || bx.run(url, &script, 600), &mut |d| std::thread::sleep(d), payload.branch, progress)?;
+/// Checks out `branch` in the node's sandbox at `url` ([`checkout_script`]):
+/// the first half of a node's own setup. A sandbox forked from a golden holds
+/// the repository (`allow_clone` false); one made from an image may clone it.
+pub fn checkout(
+    bx: &Blaxel,
+    url: &str,
+    repo_url: &str,
+    branch: &str,
+    identity: &GitIdentity,
+    allow_clone: bool,
+    progress: &mut dyn FnMut(&str),
+) -> Result<()> {
+    progress(&format!("checking out {branch}…"));
+    let script = format!("sh -c {} 2>&1", shell_quote(&checkout_script(repo_url, branch, identity, allow_clone)));
+    checkout_with_auth_retry(&mut || bx.run(url, &script, 600), &mut |d| std::thread::sleep(d), branch, progress)
+}
 
-    // Restarted, so it runs the binary just installed.
+/// Starts the relay (killing a running one, so it runs the binary installed)
+/// with `supervisor_env` ([`supervisor_env`], handed to the relay, which gives
+/// it to the supervisor alone). It does **not** start the supervisor: that is
+/// [`poke_script`], run when the node is to wake.
+pub fn start_relay(bx: &Blaxel, url: &str, supervisor_env: &[(String, String)]) -> Result<()> {
     bx.kill(url, RELAY_PROCESS)?;
-    let relay_env = relay_env(payload.supervisor_env);
+    let relay_env = relay_env(supervisor_env);
     let relay_env: Vec<(&str, &str)> = relay_env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
     bx.start_with_env(url, RELAY_PROCESS, &crate::provision::relay_command(), true, &relay_env)?;
-    if payload.supervisor.is_some() {
-        // Through the relay's poke, like every later wake: the relay starts
-        // `tod-supervisor wake` (its default `--supervisor-cmd`, the same
-        // [`supervisor_command`]) and tracks it, so a later poke signals it.
-        progress("starting the supervisor…");
-        let res = bx.run(url, &poke_script(), 60)?;
-        if res.exit_code != 0 {
-            bail!("poking the relay to start the supervisor failed: {}", res.output());
-        }
-    }
     Ok(())
 }
 
@@ -851,7 +855,14 @@ pub fn fork_golden(bx: &Blaxel, source: &str, spec: &NodeSandboxSpec, creds: &No
     bx.wait_deployed(spec.name, std::time::Duration::from_secs(300))?;
     let proxy = proxy_spec(&proxy_rules(creds, spec.orchestrator_host, spec.claude_via));
     let env_label = env_fingerprint(&creds.custom);
-    let labels = [("tod-kind", "node"), ("tod-user", spec.user), ("tod-node", spec.node), (ENV_LABEL, env_label.as_str())];
+    let creds_label = node_creds_fingerprint(spec, creds);
+    let labels = [
+        ("tod-kind", "node"),
+        ("tod-user", spec.user),
+        ("tod-node", spec.node),
+        (ENV_LABEL, env_label.as_str()),
+        (CREDS_LABEL, creds_label.as_str()),
+    ];
     bx.update_proxy(spec.name, &proxy, &labels)
         .map_err(|err| err.context(format!("give {} the node's credentials (its proxy is {source}'s)", spec.name)))
 }

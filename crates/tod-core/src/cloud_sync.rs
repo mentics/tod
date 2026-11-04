@@ -375,14 +375,6 @@ pub fn user_name(raw: &str) -> Option<String> {
     (!cleaned.is_empty()).then_some(cleaned)
 }
 
-/// A node's sandbox name: `node-<slug>`, as a Blaxel name allows.
-pub fn node_sandbox_name(slug: &str) -> String {
-    let base = tod_store::fleet::sandbox::label_value(slug);
-    let base: String = base.chars().take(50).collect();
-    let base = base.trim_matches('-');
-    if base.is_empty() { "node".into() } else { format!("node-{base}") }
-}
-
 /// An HTTPS URL for a git remote (`git@host:o/r.git`, `ssh://git@host/o/r`),
 /// since git in a node's sandbox goes through the proxy over HTTPS.
 pub fn https_repo_url(remote: &str) -> Option<String> {
@@ -1145,14 +1137,7 @@ pub fn spawn_outbox_pusher(fleet: std::sync::Arc<FleetStore>) {
 pub fn resolve(root: &Path) -> Result<(HttpOrchestrator, String)> {
     let state = CloudSyncState::load(root)?;
     let sandboxes = tod_store::fleet::sandbox::Sandboxes::load(root);
-    let owner = sandboxes.as_ref().ok().and_then(|s| s.config.blaxel.as_ref()).and_then(|a| a.owner.clone());
-    let user = state
-        .user
-        .clone()
-        .or(owner)
-        .or_else(|| std::env::var("USERNAME").or_else(|_| std::env::var("USER")).ok())
-        .and_then(|u| user_name(&u))
-        .ok_or_else(|| anyhow!("no user name for the orchestrator: set `user` in {STATE_FILE}"))?;
+    let user = user_of(&state, sandboxes.as_ref().ok())?;
     let explicit = state.orchestrator_url.clone().or_else(|| std::env::var(ORCHESTRATOR_URL_ENV).ok());
     if let Some(url) = explicit {
         let token = if url.starts_with("https://") {
@@ -1170,6 +1155,25 @@ pub fn resolve(root: &Path) -> Result<(HttpOrchestrator, String)> {
         .context("find the orchestrator (run `tod-sandbox orchestrator` first)")?;
     let base = format!("{}/port/{}", url.trim_end_matches('/'), tod_sandbox::orchestrator::PORT);
     Ok((HttpOrchestrator::new(base, Some(bx.token().to_string())).with_client(client_id(root)?), user))
+}
+
+/// The user name the orchestrator knows this data root as, without finding
+/// the orchestrator (what a sandbox's environment needs; [`resolve`] also finds it).
+pub fn resolve_user(root: &Path) -> Result<String> {
+    let state = CloudSyncState::load(root)?;
+    let sandboxes = tod_store::fleet::sandbox::Sandboxes::load(root);
+    user_of(&state, sandboxes.as_ref().ok())
+}
+
+fn user_of(state: &CloudSyncState, sandboxes: Option<&tod_store::fleet::sandbox::Sandboxes>) -> Result<String> {
+    let owner = sandboxes.and_then(|s| s.config.blaxel.as_ref()).and_then(|a| a.owner.clone());
+    state
+        .user
+        .clone()
+        .or(owner)
+        .or_else(|| std::env::var("USERNAME").or_else(|_| std::env::var("USER")).ok())
+        .and_then(|u| user_name(&u))
+        .ok_or_else(|| anyhow!("no user name for the orchestrator: set `user` in {STATE_FILE}"))
 }
 
 /// [`sync`] with the resolved orchestrator: the "Sync with the cloud" action.
@@ -1225,18 +1229,6 @@ fn git_identity(repo: Option<&str>) -> tod_sandbox::node::GitIdentity {
         (Some(name), Some(email)) => tod_sandbox::node::GitIdentity { name, email },
         _ => tod_sandbox::node::GitIdentity::fallback(),
     }
-}
-
-/// The node's Environment credentials for its sandbox's proxy: secrets with
-/// hosts (the agent never has the value). Variables reach the agent through
-/// its context, not the sandbox. Unset secrets are left out.
-pub(crate) fn environment_credentials(
-    fleet: &FleetStore,
-    creds: &CredentialStore,
-    node_id: &str,
-) -> Result<Vec<tod_sandbox::node::CustomCredential>> {
-    let node: uuid::Uuid = node_id.parse().context("node id")?;
-    fleet.read(|conn| tod_store::environment::sandbox_credentials(conn, creds, node))
 }
 
 /// `git config` pattern listing every remote's URL (`remote.<name>.url <url>`).
@@ -1397,7 +1389,7 @@ fn node_source(fleet: &FleetStore, node_id: &str) -> Result<(tod_store::fleet::F
 }
 
 /// The agent a node's supervisor will run ([`CLOUD_AGENT_ENV`]), if set.
-fn cloud_agent() -> Option<String> {
+pub(crate) fn cloud_agent() -> Option<String> {
     std::env::var(CLOUD_AGENT_ENV).ok().map(|a| a.trim().to_string()).filter(|a| !a.is_empty())
 }
 
@@ -1467,268 +1459,153 @@ pub fn sandbox_unusable_reason(bx: &tod_sandbox::blaxel::Blaxel, info: &tod_sand
         .map(|err| format!("sandbox {} does not answer: {err:#}", info.name))
 }
 
-/// The sandbox `node_id` already has, so a cloud run reuses it instead of
-/// making another beside it: the one its `cloud_nodes` row names (a re-run,
-/// or a replacement of a lost one), else the one its Files location made
-/// (`tod-<slug>`, from opening a shell or launching an agent).
-fn existing_sandbox_name(fleet: &FleetStore, bx: &tod_sandbox::blaxel::Blaxel, node_id: &str) -> Result<Option<String>> {
-    let cloud = cloud_node(fleet, node_id).map(|row| row.sandbox);
-    let files = fleet
-        .read(|conn| tod_store::fleet::repos::files_location::FilesLocationRepo::new(conn).get(node_id))?
-        .and_then(|location| location.sandbox);
-    // Both are normally the same sandbox (a Files launch adopts the cloud
-    // one). They differ only after one was lost and replaced: take the one
-    // that can still run, rather than make a second beside it.
-    let usable = |name: &str| -> Result<bool> { Ok(bx.get(name)?.is_some_and(|info| !sandbox_is_dead(&info))) };
-    Ok(match (cloud, files) {
-        (Some(cloud), Some(files)) if cloud != files && !usable(&cloud)? && usable(&files)? => Some(files),
-        (Some(cloud), _) => Some(cloud),
-        (None, files) => files,
-    })
+/// What [`ensure_supervisor`] finds a node's sandbox needs to host the
+/// supervisor of this build.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SupervisorState {
+    /// It answers with this build's relay and was given this build's install.
+    Current,
+    /// It lacks them (an old sandbox, or one an older build installed into):
+    /// install this build's files, for this reason.
+    Install { why: String },
+    /// Made just now and still not answering with this build's relay: the
+    /// golden it was forked from does not carry what it should. An error, not
+    /// something to patch over by installing here.
+    BrokenNew,
 }
 
-/// Make sure `node_id` has a working sandbox: create it (with the user's
-/// credentials in its proxy) if Blaxel has none by its name, or replace one
-/// that can no longer run; wait for it, provision the relay and supervisor,
-/// and, when `wake`, poke it. Returns the sandbox's name. The one path both
-/// [`run_in_cloud`] and replacing a lost sandbox ([`lost`]) take. Blocks on
-/// the network.
-pub fn ensure_node_sandbox(
+/// Decides [`SupervisorState`] from `made_now` (this call made the sandbox),
+/// the install stamp last `recorded` for it, this build's `current` one, and
+/// whether its relay `healthy` (answered with this build's manifest).
+pub fn supervisor_state(made_now: bool, recorded: Option<&str>, current: &str, healthy: bool) -> SupervisorState {
+    if made_now {
+        return if healthy { SupervisorState::Current } else { SupervisorState::BrokenNew };
+    }
+    if !healthy {
+        return SupervisorState::Install { why: "it does not answer with this build's relay".to_string() };
+    }
+    match recorded {
+        Some(stamp) if stamp == current => SupervisorState::Current,
+        Some(_) => SupervisorState::Install { why: "it was last given an older install".to_string() },
+        None => SupervisorState::Install { why: "no install was recorded for it".to_string() },
+    }
+}
+
+/// Make sure `node_id` has a sandbox that can host its supervisor, of this
+/// build, and (with `wake`) poke it. Returns the sandbox's name. The one path
+/// Start, replacing a lost sandbox, a reinstall and Reset environment take;
+/// it makes nothing itself: the sandbox comes from
+/// [`tod_store::fleet::provision::resolve_launch_cwd_with`] (`make_sandbox`, the one creator).
+///
+/// 1. [`tod_store::fleet::provision::retire_unusable_sandbox`]: a recorded sandbox that is gone
+///    or dead is forgotten, and one made before every sandbox could host the
+///    supervisor is **replaced once** (logs saved, work checkpointed, deleted;
+///    a failure of either deletes nothing). This is the upgrade path.
+/// 2. The sandbox is made or found; a sandbox made for another orchestrator
+///    user is refused (it holds that user's database).
+/// 3. Its relay is asked for this build's manifest. A sandbox that was already
+///    there and does not answer with it, or was given an older install
+///    ([`supervisor_state`]), gets this build's files and a restarted relay.
+///    One made just now never does: it carries them from the golden, so a miss
+///    is an error.
+/// 4. The supervisor's settings are sent, and with `wake` it is poked.
+///
+/// Blocks on the network: never on the UI thread.
+pub fn ensure_supervisor(
     fleet: &FleetStore,
     root: &Path,
     node_id: &str,
-    user: &str,
     wake: bool,
     progress: &mut dyn FnMut(&str),
 ) -> Result<String> {
     use tod_sandbox::node;
-
+    register_sandbox_host();
     // One provisioning of a node at a time, across the app and the daemon:
     // two would fork the same name or start two relays.
     let _provisioning = provisioning::lock_node_provisioning(root, node_id, progress)?;
     let (task, repo_url, branch) = node_source(fleet, node_id)?;
     // Before any network call: without it the sandbox could not run Claude.
     let claude_oauth_token = claude_token_for_node(root)?;
-    let mut sandboxes = tod_store::fleet::sandbox::Sandboxes::load(root)?;
-    let account = sandboxes.account()?.clone();
-    let bx = sandboxes.blaxel()?;
-    let orchestrator_url = sandboxes
-        .url(&bx, &account.orchestrator)
-        .context("find the orchestrator sandbox: the app deploys it at launch (see the daemon log), or run `tod-sandbox orchestrator`")?;
-    let orchestrator_host = orchestrator_url
-        .trim_start_matches("https://")
-        .trim_start_matches("http://")
-        .split('/')
-        .next()
-        .unwrap_or_default()
+    let user = resolve_user(root)?;
+
+    let retired = tod_store::fleet::provision::retire_unusable_sandbox(fleet, node_id, progress)?;
+    if let tod_store::fleet::provision::Retired::Replaced(old) | tod_store::fleet::provision::Retired::Upgraded(old) = &retired {
+        progress(&format!("{old} is replaced by a new sandbox"));
+    }
+    let known = tod_store::fleet::provision::recorded_sandboxes(fleet, node_id)?;
+    let (dir, warnings) = tod_store::fleet::provision::resolve_launch_cwd_with(fleet, node_id, progress)?;
+    for warning in warnings {
+        progress(&format!("warning: {warning}"));
+    }
+    let name = dir
+        .sandbox_name()
+        .ok_or_else(|| anyhow!("node {} does not run in a sandbox: its Files setting must make one", task.slug))?
         .to_string();
-    let cli_url = format!(
-        "{}/port/{}/cli",
-        orchestrator_url.trim_end_matches('/'),
-        tod_sandbox::orchestrator::PORT
-    );
+    let made_now = !known.contains(&name);
 
-    let creds = CredentialStore::from_data_root(root);
-    let credentials = node::NodeCredentials {
-        github_token: creds.get(CredentialKind::GithubToken),
-        linear_api_key: creds.get(CredentialKind::LinearApiKey),
-        blaxel_token: bx.token().to_string(),
-        claude_oauth_token,
-        custom: Vec::new(),
-    };
-    let mut credentials = credentials;
-    match environment_credentials(fleet, &creds, node_id) {
-        Ok(custom) => credentials.custom = custom,
-        Err(err) => progress(&format!("warning: the node's Environment was not applied: {err:#}")),
-    }
-    if credentials.github_token.is_none() {
-        progress("warning: no GitHub token stored; the node cannot push or open a pull request");
-    }
-
-    let source = node_sandbox_source(fleet, &sandboxes, &bx, node_id, &repo_url)?;
-    let name = existing_sandbox_name(fleet, &bx, node_id)?.unwrap_or_else(|| node_sandbox_name(&task.slug));
-    // Before the first call that changes anything at Blaxel: a crash from
-    // here on leaves a record of the sandbox that may exist.
-    provisioning::record_intent(root, node_id, &name)?;
-    let agent = cloud_agent();
-    let spec = node::NodeSandboxSpec {
-        name: &name,
-        image: match &source {
-            NodeSandboxSource::Image(image) => image,
-            // Not used: a fork is made from its source, not from an image.
-            NodeSandboxSource::Fork(golden) => golden,
-        },
-        region: &account.region,
-        memory_mb: account.memory_mb,
-        user,
-        node: node_id,
-        orchestrator_host: &orchestrator_host,
-        orchestrator_cli_url: &cli_url,
-        agent: agent.as_deref(),
-        claude_via: account.claude_token_via,
-        scheduler: sandboxes.config.scheduler,
-        workspace: &account.workspace,
-    };
-    let relay_path = tod_store::fleet::sandbox::relay_path()?;
-    let relay = std::fs::read(&relay_path).with_context(|| format!("read {}", relay_path.display()))?;
-    let supervisor = relay_path.parent().and_then(node::supervisor_from);
-    let local_cli = relay_path.parent().and_then(node::local_cli_from);
-    // The supervisor builds the agent's context from the same process and
-    // media bundles as this app, installed beside it.
-    let mut bundles = node::bundle_files(crate::process_bundle::TodInstallPaths::discover()?.process_root(), "process")
-        .context("read the process bundle")?;
-    bundles.extend(
-        node::bundle_files(
-            crate::media::MediaPaths::discover().map_err(|e| anyhow!("media bundle: {e}"))?.media_root(),
-            "media",
-        )
-        .context("read the media bundle")?,
-    );
-    // `tod-cli skills` in the sandbox reads these (`/opt/tod/skills`).
-    bundles.extend(
-        node::bundle_files(
-            crate::skills::SkillsPaths::discover().context("skills bundle")?.root(),
-            "skills",
-        )
-        .context("read the skills bundle")?,
-    );
-    let identity = git_identity(task.repo.as_deref());
-    let supervisor_env = node::supervisor_env(&credentials, account.claude_token_via);
-    let payload = node::NodePayload {
-        relay: &relay,
-        shim: tod_store::fleet::cli_relay::HTTP_SHIM_SCRIPT.as_bytes(),
-        local_cli: local_cli.as_deref(),
-        supervisor: supervisor.as_deref(),
-        repo_url: &repo_url,
-        branch: &branch,
-        git_identity: &identity,
-        bundles: &bundles,
-        // At every provisioning, so the supervisor's next start has the
-        // token as it is now (with `claude_token_via = "env"`).
-        supervisor_env: &supervisor_env,
-    };
-
-    let started = std::time::Instant::now();
-    let existing = bx.get(&name)?;
-    if let Some(info) = &existing
-        && sandbox_is_dead(info)
-    {
-        progress(&format!("removing the dead sandbox {name} ({})…", info.status));
-        bx.delete(&name)?;
-        let deadline = std::time::Instant::now() + Duration::from_secs(120);
-        while bx.get(&name)?.is_some() && std::time::Instant::now() < deadline {
-            std::thread::sleep(Duration::from_secs(2));
-        }
-    }
+    let sandboxes = tod_store::fleet::sandbox::Sandboxes::load(root)?;
+    let bx = sandboxes.blaxel()?;
+    let info = bx.get(&name)?.ok_or_else(|| anyhow!("sandbox {name} no longer exists"))?;
     // A sandbox made for another orchestrator user would read that user's
     // database and never find the node. It may hold the node's work, so it is
     // not deleted here: say so, and let the user's Delete Sandbox checkpoint it.
-    if let Some(info) = &existing
-        && !sandbox_is_dead(info)
-        && let Some(why) = sandbox_user_reason(&name, info.env("TOD_USER").unwrap_or(user), user)
-    {
+    if let Some(why) = sandbox_user_reason(&name, info.env("TOD_USER").unwrap_or(&user), &user) {
         bail!("{why}; use Delete Sandbox in the task panel (it saves the work first), then run the node again");
     }
-    // Only a sandbox made now is an empty checkout. One that was already up
-    // holds the node's own work, which a checkpoint must not be applied over.
-    let made_now = existing.as_ref().is_none_or(sandbox_is_dead);
-    // Deletes the sandbox if there is one (a failed call may or may not have
-    // made it).
-    let mut remove = || -> Result<()> {
-        if bx.get(&name)?.is_some() {
-            bx.delete(&name)?;
-        }
-        // Gone (or never made): nothing is left for the sweeper to find.
-        provisioning::clear_intent(root, node_id)
-    };
-    if made_now {
-        match &source {
-            NodeSandboxSource::Fork(golden) => {
-                progress(&format!("forking {name} from {golden}…"));
-                if let Err(err) = node::fork_golden(&bx, golden, &spec, &credentials) {
-                    return Err(discard_failed_sandbox(err.context(format!("fork {name} from {golden}")), &name, &mut remove));
-                }
-            }
-            NodeSandboxSource::Image(image) => {
-                progress(&format!("creating sandbox {name} from {image}…"));
-                if let Err(err) = node::create(&bx, &spec, &credentials) {
-                    return Err(discard_failed_sandbox(err.context(format!("create {name} from {image}")), &name, &mut remove));
-                }
-            }
-        }
-    }
-    let expected_manifest = tod_sandbox::provision::node_manifest(&relay);
-    // A sandbox that was already up is reused on its health, never on its
-    // `DEPLOYED` status: say what is wrong with it before provisioning repairs
-    // it (a repair that does not fix it fails the probe below, naming the check).
-    if !made_now
-        && let Some(url) = existing.as_ref().and_then(|info| info.url.as_deref())
-        && let Err(failure) = probe_health(
-            &bx,
-            &HealthTarget { label: &name, node: node_id, repo_url: &repo_url, url },
-            tod_sandbox::health::Stage::Ready,
-            INSTALL_MIN_FREE,
-            None,
-            &[],
-            progress,
-        )
-    {
-        progress(&format!("{name} is not healthy ({failure}); repairing it…"));
-    }
-    // From here a sandbox made now that fails is deleted, so the next attempt
-    // makes another instead of adopting one whose proxy or checkout is bad. A
-    // sandbox is adopted as good only once the probe has passed.
-    let mut setup = || -> Result<String> {
-    progress(&format!("waiting for {name}…"));
-    let info = bx.wait_deployed(&name, Duration::from_secs(300))?;
     let url = info.url.clone().ok_or_else(|| anyhow!("sandbox {name} has no URL"))?;
-    progress(&format!("{name} is up after {:.1}s", started.elapsed().as_secs_f64()));
-    // A sandbox in standby is "up" to the control plane but its workload is
-    // not reachable until it has resumed; the first request would get a 502.
     progress(&format!("waking {name}…"));
     bx.wait_reachable(&url, Duration::from_secs(180)).with_context(|| format!("wake {name}"))?;
-    // A fork is "deployed" before its proxy rules and environment (replaced
-    // by a second call) are in effect; the checkout needs both.
-    progress(&format!("checking {name} can reach {repo_url}…"));
-    let delays = match (&source, made_now) {
-        (NodeSandboxSource::Fork(_), true) => node::FORK_PROBE_DELAYS,
-        _ => node::IMAGE_PROBE_DELAYS,
-    };
+
+    let files = refresh::install_files()?;
+    let current = files.install();
+    let expected_manifest = tod_sandbox::provision::node_manifest(&files.relay);
     let target = HealthTarget { label: &name, node: node_id, repo_url: &repo_url, url: &url };
-    probe_health(&bx, &target, tod_sandbox::health::Stage::Base, INSTALL_MIN_FREE, None, delays, progress)?;
-
-    // Agent Drive is not enabled yet, so the node's transcripts go to the
-    // orchestrator and nothing is mounted. When it is, turn this back on:
-    // mount before the supervisor starts (it mirrors into the mount when it
-    // is there); a fork does not keep its source's mounts, so this is every
-    // time. `drive::mount_for_node` takes the sandbox's region: a fork's
-    // golden's (`bx.get_json(golden)`, `spec.region`), else the account's.
-    //
-    // match tod_sandbox::drive::mount_for_node(&bx, &url, &region, user, node_id) {
-    //     Ok(()) => progress("mounted Agent Drive for the node's transcripts"),
-    //     Err(err) => progress(&format!(
-    //         "warning: no Agent Drive ({err:#}); the node's transcripts go to the orchestrator instead"
-    //     )),
-    // }
-
-    match &source {
-        NodeSandboxSource::Fork(_) => {
-            node::install_into_fork(&bx, &url, &payload, progress)?;
-            node::start(&bx, &url, &payload, false, progress)?;
+    let ready = |progress: &mut dyn FnMut(&str)| {
+        probe_health(
+            &bx,
+            &target,
+            tod_sandbox::health::Stage::Ready,
+            INSTALL_MIN_FREE,
+            Some(&expected_manifest),
+            node::IMAGE_PROBE_DELAYS,
+            progress,
+        )
+    };
+    let healthy = ready(progress);
+    let recorded = refresh::recorded_stamp(root, node_id)?;
+    match supervisor_state(made_now, recorded.as_deref(), &current.stamp, healthy.is_ok()) {
+        SupervisorState::Current => {}
+        SupervisorState::BrokenNew => {
+            let failure = healthy.err().map(|f| format!("{f}")).unwrap_or_default();
+            bail!(
+                "{name} was just made from the golden, but it does not answer with this build's relay ({failure}). \
+                 The golden does not carry this build's files: refresh it with `tod-sandbox golden refresh`"
+            );
         }
-        NodeSandboxSource::Image(_) => {
-            progress("installing the relay and supervisor…");
-            node::provision(&bx, &url, &payload, progress)?;
+        SupervisorState::Install { why } => {
+            progress(&format!("{name} gets this build's relay and supervisor: {why}…"));
+            let identity = git_identity(task.repo.as_deref());
+            let credentials = node::NodeCredentials { claude_oauth_token, ..Default::default() };
+            let claude_via = sandboxes.claude_token_via();
+            let supervisor_env = node::supervisor_env(&credentials, claude_via);
+            let payload = node::NodePayload {
+                relay: &files.relay,
+                shim: tod_store::fleet::cli_relay::HTTP_SHIM_SCRIPT.as_bytes(),
+                local_cli: files.local_cli.as_deref(),
+                supervisor: files.supervisor.as_deref(),
+                repo_url: &repo_url,
+                branch: &branch,
+                git_identity: &identity,
+                bundles: &files.bundles,
+                supervisor_env: &supervisor_env,
+            };
+            node::install_into_fork(&bx, &url, &payload, progress)?;
+            node::start_relay(&bx, &url, &supervisor_env)?;
+            // Adopted as good only now: the relay answers with the manifest just installed.
+            ready(progress).with_context(|| format!("{name} was given this build's files but is still not healthy"))?;
+            refresh::record(root, node_id, &current, Some(&why))?;
         }
     }
-    progress(&format!(
-        "{name} {} and provisioned after {:.1}s",
-        match &source {
-            NodeSandboxSource::Fork(_) => "forked",
-            NodeSandboxSource::Image(_) => "created",
-        },
-        started.elapsed().as_secs_f64()
-    ));
 
     push_supervisor_settings(&bx, &url, root, node_id)?;
     if wake {
@@ -1743,47 +1620,6 @@ pub fn ensure_node_sandbox(
             .context("poke the node")?;
         if !resp.status().is_success() {
             progress(&format!("warning: the poke got {}", resp.status()));
-        }
-    }
-    // Adopted as good only now: the relay answers with the manifest just
-    // installed, and the checkout's own prerequisites still hold.
-    progress(&format!("checking {name} is healthy…"));
-    probe_health(
-        &bx,
-        &target,
-        tod_sandbox::health::Stage::Ready,
-        INSTALL_MIN_FREE,
-        Some(&expected_manifest),
-        node::IMAGE_PROBE_DELAYS,
-        progress,
-    )?;
-    Ok(url)
-    };
-    if let Err(err) = setup() {
-        // A sandbox that was already up holds the node's own work: kept.
-        if !made_now {
-            return Err(err);
-        }
-        return Err(discard_failed_sandbox(err, &name, &mut remove));
-    }
-    // `sandboxes` is not saved here: nothing above changes the config except
-    // `Sandboxes::url`, which saves its own change, and writing this copy back
-    // after a 20-45 s provisioning would overwrite what other threads saved
-    // meanwhile.
-    // What this sandbox now runs, so a later build of the app can tell it
-    // is out of date ([`refresh`]).
-    refresh::record(root, node_id, &refresh::install()?, None)?;
-    // Work checkpointed before an earlier sandbox of this node went away
-    // comes back as uncommitted edits. A sandbox that was already up (a
-    // refresh, a node that is running) has that work in it already.
-    if made_now {
-        let checkout = sandbox_checkout(&bx, &name)?;
-        let notes = tod_store::fleet::node_checkpoint::restore_into(&checkout, node_id);
-        for restored in &notes.restored {
-            progress(restored.as_str());
-        }
-        for failure in &notes.failures {
-            progress(&format!("warning: {failure}"));
         }
     }
     Ok(name)
@@ -1824,68 +1660,6 @@ pub fn probe_health(
         probe_delays: delays,
     };
     tod_sandbox::health::probe(bx, target.url, stage, &spec, progress)
-}
-
-/// What a provisioning that failed after it made `name` returns: `err`, once
-/// the sandbox is deleted (it may lack credentials or a checkout, and the next
-/// attempt would otherwise adopt it as it is). A failed delete is part of the
-/// error, never dropped. `TOD_KEEP_FAILED_SANDBOX` keeps it for inspection.
-fn discard_failed_sandbox(err: anyhow::Error, name: &str, delete: &mut dyn FnMut() -> Result<()>) -> anyhow::Error {
-    if std::env::var_os("TOD_KEEP_FAILED_SANDBOX").is_some() {
-        return err.context(format!("{name} was kept (TOD_KEEP_FAILED_SANDBOX)"));
-    }
-    match delete() {
-        Ok(()) => err.context(format!("{name} was deleted so the next attempt makes a new one")),
-        Err(del) => err.context(format!("{name} could not be deleted either ({del:#}); delete it before trying again")),
-    }
-}
-
-/// Where a node's sandbox comes from: configured on the node or the nearest
-/// ancestor with a Files setting, never defaulted.
-enum NodeSandboxSource {
-    /// A sandbox to fork, its `golden` alias resolved.
-    Fork(String),
-    Image(String),
-}
-
-fn node_sandbox_source(
-    fleet: &FleetStore,
-    sandboxes: &tod_store::fleet::sandbox::Sandboxes,
-    bx: &tod_sandbox::blaxel::Blaxel,
-    node_id: &str,
-    repo_url: &str,
-) -> Result<NodeSandboxSource> {
-    use tod_store::fleet::SandboxFrom;
-    let files = fleet
-        .resolve_files_for_node(node_id)?
-        .ok_or_else(|| anyhow!("no Files setting applies to this node or its ancestors, so there is no sandbox to make it from"))?;
-    let origin = &files.source_title;
-    let dev = files
-        .dev_container
-        .filter(|d| d.sandbox)
-        .ok_or_else(|| anyhow!("the Files setting on \"{origin}\" does not run in a sandbox; choose the sandbox to fork or an image there"))?;
-    match dev.sandbox_from {
-        SandboxFrom::Fork(name) => match name.trim() {
-            "" => bail!("the Files setting on \"{origin}\" forks a sandbox but names none; choose the sandbox to fork"),
-            n if n == tod_sandbox::config::GOLDEN => {
-                let repo = tod_store::cloud_nodes::normalize_repo(repo_url)
-                    .ok_or_else(|| anyhow!("cannot read an owner and repository name from {repo_url}"))?;
-                Ok(NodeSandboxSource::Fork(
-                    sandboxes
-                        .resolve_golden(bx, &repo)
-                        .with_context(|| format!("resolve the golden sandbox that \"{origin}\" forks"))?,
-                ))
-            }
-            n => Ok(NodeSandboxSource::Fork(n.to_string())),
-        },
-        SandboxFrom::Image(image) => match image.trim() {
-            "" => bail!(
-                "the Files setting on \"{origin}\" uses the default image, which a cloud run never does; \
-                 choose the sandbox to fork or name an image"
-            ),
-            image => Ok(NodeSandboxSource::Image(image.to_string())),
-        },
-    }
 }
 
 /// The workspace, this data root's client id and the repository (`owner/name`)
@@ -1940,7 +1714,7 @@ fn record_cloud_node(fleet: &FleetStore, node_id: &str, sandbox: String, user: &
 }
 
 /// Run `node_id` in the cloud: sync (seeding first), make its sandbox
-/// ([`ensure_node_sandbox`]), and record it. `progress` hears each step.
+/// ([`ensure_supervisor`]), and record it. `progress` hears each step.
 /// Logs one progress line from a cloud job, at `warn` when it says "warning:"
 /// (these lines otherwise reach only the panel).
 pub fn log_progress(context: &str, msg: &str) {
@@ -1980,7 +1754,7 @@ fn run_in_cloud_reporting(
     progress("syncing with the orchestrator…");
     let (orch, user) = resolve(root)?;
     sync(fleet, root, &orch, &user)?;
-    let name = ensure_node_sandbox(fleet, root, node_id, &user, true, progress)?;
+    let name = ensure_supervisor(fleet, root, node_id, true, progress)?;
     let record = record_cloud_node(fleet, node_id, name, &user)?;
     let heard = match sync(fleet, root, &orch, &user) {
         Ok(report) => report,
@@ -2276,7 +2050,7 @@ pub fn wake_node_requesting(fleet: &FleetStore, root: &Path, node_id: &str, kind
         _ => {
             let gone = row.sandbox.clone();
             let mut progress = |msg: &str| log_progress(&format!("replacing {gone}"), msg);
-            let node = ensure_node_sandbox(fleet, root, node_id, &user, true, &mut progress)
+            let node = ensure_supervisor(fleet, root, node_id, true, &mut progress)
                 .and_then(|name| record_cloud_node(fleet, node_id, name, &user))
                 .with_context(|| format!("sandbox {gone} is gone, and replacing it failed"))?;
             let info = bx
@@ -2399,10 +2173,12 @@ fn answer_latest_to_continue(
 }
 
 pub mod golden;
+pub mod host;
 pub mod lost;
 pub mod provisioning;
 pub mod refresh;
 pub mod deploy;
+pub use host::register_sandbox_host;
 
 #[cfg(test)]
 mod tests;

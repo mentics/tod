@@ -241,11 +241,14 @@ impl Sandboxes {
         self.config.blaxel.as_ref().map(|a| a.claude_token_via).unwrap_or_default()
     }
 
-    /// Create sandbox `name` from `source`, wait for it, and make it ready
-    /// for tod. Returns its URL. Slow (seconds for a fork or a baked image,
-    /// a minute or more when an image is wrapped and set up): never on the UI
-    /// thread. `inherit_output` shows `bl`'s build output on this process's
-    /// terminal; otherwise it is only reported on failure.
+    /// Create a workspace sandbox `name` from `source` (`tod-sandbox create`
+    /// and `fork`: a base or golden the user manages by hand, not a node's
+    /// sandbox: those are made only by `provision::make_sandbox`), wait for
+    /// it, and make it ready for tod. Returns its URL. Slow (seconds for a
+    /// fork or a baked image, a minute or more when an image is wrapped and
+    /// set up): never on the UI thread. `inherit_output` shows `bl`'s build
+    /// output on this process's terminal; otherwise it is only reported on
+    /// failure.
     pub fn create(
         &mut self,
         name: &str,
@@ -254,7 +257,115 @@ impl Sandboxes {
         inherit_output: bool,
         progress: &mut dyn FnMut(&str),
     ) -> Result<String> {
-        self.create_with_proxy(name, source, agents, inherit_output, &Default::default(), progress)
+        validate_name(name)?;
+        // Before anything is made: a sandbox cannot be used without it.
+        relay_path()?;
+        let acct = self.account()?.clone();
+        let bx = self.blaxel()?;
+        if let Some(info) = bx.get(name)?
+            && info.status != "TERMINATED"
+        {
+            bail!("a sandbox named {name} already exists ({})", info.status);
+        }
+        let started = Instant::now();
+        let resolved;
+        let source = match source {
+            NewSandboxSource::Fork(name) if name == tod_sandbox::config::GOLDEN => {
+                let golden = self.resolve_sole_golden(&bx)?;
+                progress(&format!("golden is {golden}"));
+                resolved = NewSandboxSource::Fork(golden);
+                &resolved
+            }
+            other => other,
+        };
+        let image = match source {
+            NewSandboxSource::Image(image) => {
+                let runtime_image = self.runtime_image(image, inherit_output, progress)?;
+                let owner = acct.owner.as_deref().map(label_value).unwrap_or_default();
+                let mut labels = vec![("tod", "1")];
+                if !owner.is_empty() {
+                    labels.push(("tod-owner", owner.as_str()));
+                }
+                progress(&format!("creating {name} from {runtime_image}…"));
+                bx.create(&NewSandbox {
+                    name,
+                    image: &runtime_image,
+                    region: &acct.region,
+                    memory_mb: acct.memory_mb,
+                    labels: &labels,
+                    proxy: None,
+                })?;
+                runtime_image
+            }
+            NewSandboxSource::Fork(source) => {
+                validate_name(source)?;
+                let image = bx
+                    .get(source)?
+                    .ok_or_else(|| anyhow!("no sandbox named {source} to fork"))?
+                    .image;
+                progress(&format!("forking {source} into {name}…"));
+                // A fork's proxy variables come back as an unresolved
+                // `{{file(..)}}` template that curl, git, and npm reject; the
+                // sandbox's local proxy (what a new sandbox gets) works.
+                let proxy_env = "http://localhost:49152".to_string();
+                bx.fork_with_envs(
+                    source,
+                    name,
+                    &[("HTTPS_PROXY", proxy_env.clone()), ("HTTP_PROXY", proxy_env)],
+                )?;
+                image
+            }
+        };
+        let info = bx.wait_deployed(name, Duration::from_secs(300))?;
+        progress(&format!("{name}: deployed in {:.1}s", started.elapsed().as_secs_f64()));
+        self.config.upsert(Sandbox { name: name.to_string(), image, url: info.url, agents });
+        self.save()?;
+        forget(name);
+        let mode = match source {
+            NewSandboxSource::Fork(_) => provision::Mode::Fork,
+            NewSandboxSource::Image(_) => provision::Mode::Install,
+        };
+        match self.ensure_as(&bx, name, mode, progress) {
+            Ok(url) => Ok(url),
+            Err(err) => {
+                // Nothing has used it yet: leaving it would leak a sandbox
+                // per attempt (each one costs money and clutters the list).
+                let removed = match self.delete(&bx, name) {
+                    Ok(()) => format!("{name} was deleted"),
+                    Err(del) => format!("{name} could not be deleted either ({del:#}); `tod-sandbox delete {name}` removes it"),
+                };
+                Err(err.context(removed))
+            }
+        }
+    }
+
+    /// The image Blaxel runs for `image` (empty: the account's default): its
+    /// own and workspace images as they are; any other is wrapped (a build on
+    /// Blaxel with `bl`, which adds Blaxel's sandbox API) as
+    /// `sandbox/tod-<image>:latest`, which is returned. Slow when it wraps.
+    pub fn runtime_image(
+        &mut self,
+        image: &str,
+        inherit_output: bool,
+        progress: &mut dyn FnMut(&str),
+    ) -> Result<String> {
+        let acct = self.account()?.clone();
+        let image = match image.trim() {
+            "" => acct.default_image.as_str(),
+            image => image,
+        };
+        if runs_as_is(image) {
+            return Ok(image.to_string());
+        }
+        let wrapped = format!("tod-{}", label_value(short_image(image)));
+        progress(&format!(
+            "{image} is not built for Blaxel; wrapping it as sandbox/{wrapped} (adds Blaxel's sandbox API)…"
+        ));
+        let dir = build_dir(&wrapped)?;
+        std::fs::write(dir.join("Dockerfile"), provision::wrap_dockerfile(image))?;
+        std::fs::write(dir.join("blaxel.toml"), provision::blaxel_toml(&wrapped, acct.memory_mb))?;
+        self.bl_push(&dir, inherit_output, progress)?;
+        Ok(format!("sandbox/{wrapped}:latest"))
     }
 
     /// The sandbox the name `golden` stands for for `repo` (normalized as
@@ -301,185 +412,6 @@ impl Sandboxes {
             }
             None => golden.trim().to_string(),
         })
-    }
-
-    /// [`Self::create`] with `creds` as proxy rules (see
-    /// [`Self::node_credentials`]: the user's GitHub, Linear, and Claude
-    /// tokens as autonomous nodes get them, and the node's Environment
-    /// secrets with hosts), so the agent calls those hosts without ever
-    /// holding the value. A fork carries its source's proxy and, being
-    /// made rather than updated, cannot be given another, so
-    /// with credentials a fork source is made from the source's image
-    /// instead (the image must hold the repository, as a fork's source
-    /// does). The sandbox is labelled [`tod_sandbox::node::CREDS_LABEL`] with
-    /// the rules' fingerprint, which [`interactive_proxy_is_current`] compares.
-    pub fn create_with_proxy(
-        &mut self,
-        name: &str,
-        source: &NewSandboxSource,
-        agents: bool,
-        inherit_output: bool,
-        creds: &tod_sandbox::node::NodeCredentials,
-        progress: &mut dyn FnMut(&str),
-    ) -> Result<String> {
-        validate_name(name)?;
-        // Before anything is made: a sandbox cannot be used without it.
-        relay_path()?;
-        let acct = self.account()?.clone();
-        let rules = tod_sandbox::node::credential_rules(creds, acct.claude_token_via);
-        let bx = self.blaxel()?;
-        if let Some(info) = bx.get(name)?
-            && info.status != "TERMINATED"
-        {
-            bail!("a sandbox named {name} already exists ({})", info.status);
-        }
-        let started = Instant::now();
-        let from_image;
-        let resolved;
-        let source = match source {
-            NewSandboxSource::Fork(name) if name == tod_sandbox::config::GOLDEN => {
-                let golden = self.resolve_sole_golden(&bx)?;
-                progress(&format!("golden is {golden}"));
-                resolved = NewSandboxSource::Fork(golden);
-                &resolved
-            }
-            other => other,
-        };
-        let mut fork_proxy_pending = false;
-        let source = match source {
-            NewSandboxSource::Fork(base) if !rules.is_empty() => {
-                validate_name(base)?;
-                let image = bx
-                    .get(base)?
-                    .ok_or_else(|| anyhow!("no sandbox named {base} to fork"))?
-                    .image;
-                if runs_as_is(&image) {
-                    progress(&format!(
-                        "{base}'s proxy cannot carry this node's credentials; making {name} from its image instead…"
-                    ));
-                    from_image = NewSandboxSource::Image(image);
-                    &from_image
-                } else {
-                    // Its image was not built for Blaxel, so it cannot be
-                    // rebuilt from (wrapping it needs a registry image): fork,
-                    // then replace the fork's proxy rules.
-                    fork_proxy_pending = true;
-                    // A proxy is fixed at creation: a source made without one
-                    // gives forks that cannot carry credentials.
-                    let routes = bx
-                        .get_json(base)?
-                        .and_then(|v| v["spec"]["network"]["proxy"]["routing"].as_array().map(|r| r.len()))
-                        .unwrap_or(0);
-                    if routes == 0 {
-                        progress(&format!(
-                            "warning: {base} was made without a proxy, so {name} cannot carry the node's credentials \
-                             (fetching from GitHub will fail). Rebuild it so it is made with one (`blaxel-sbx golden refresh`)."
-                        ));
-                    }
-                    source
-                }
-            }
-            other => other,
-        };
-        let image = match source {
-            NewSandboxSource::Image(image) => {
-                let image = match image.trim() {
-                    "" => acct.default_image.as_str(),
-                    image => image,
-                };
-                let runtime_image = if runs_as_is(image) {
-                    image.to_string()
-                } else {
-                    let wrapped = format!("tod-{}", label_value(short_image(image)));
-                    progress(&format!(
-                        "{image} is not built for Blaxel; wrapping it as sandbox/{wrapped} \
-                         (adds Blaxel's sandbox API)…"
-                    ));
-                    let dir = build_dir(&wrapped)?;
-                    std::fs::write(dir.join("Dockerfile"), provision::wrap_dockerfile(image))?;
-                    std::fs::write(
-                        dir.join("blaxel.toml"),
-                        provision::blaxel_toml(&wrapped, acct.memory_mb),
-                    )?;
-                    self.bl_push(&dir, inherit_output, progress)?;
-                    format!("sandbox/{wrapped}:latest")
-                };
-                let owner = acct.owner.as_deref().map(label_value).unwrap_or_default();
-                let fingerprint = tod_sandbox::node::rules_fingerprint(&rules);
-                let mut labels = vec![("tod", "1"), (tod_sandbox::node::CREDS_LABEL, fingerprint.as_str())];
-                if !owner.is_empty() {
-                    labels.push(("tod-owner", owner.as_str()));
-                }
-                // The same rules an autonomous node's proxy has for the
-                // user's own credentials, without the Blaxel ones (there is
-                // no supervisor here); nothing else is routed through it.
-                let proxy = (!rules.is_empty()).then(|| tod_sandbox::node::proxy_spec(&rules));
-                progress(&format!("creating {name} from {runtime_image}…"));
-                bx.create(&NewSandbox {
-                    name,
-                    image: &runtime_image,
-                    region: &acct.region,
-                    memory_mb: acct.memory_mb,
-                    labels: &labels,
-                    proxy: proxy.as_ref(),
-                })?;
-                runtime_image
-            }
-            NewSandboxSource::Fork(source) => {
-                validate_name(source)?;
-                let image = bx
-                    .get(source)?
-                    .ok_or_else(|| anyhow!("no sandbox named {source} to fork"))?
-                    .image;
-                progress(&format!("forking {source} into {name}…"));
-                // A fork's proxy variables come back as an unresolved
-                // `{{file(..)}}` template that curl, git, and npm reject; the
-                // sandbox's local proxy (what a new sandbox gets) works.
-                let proxy_env = "http://localhost:49152".to_string();
-                bx.fork_with_envs(
-                    source,
-                    name,
-                    &[("HTTPS_PROXY", proxy_env.clone()), ("HTTP_PROXY", proxy_env)],
-                )?;
-                if fork_proxy_pending {
-                    let proxy = tod_sandbox::node::proxy_spec(&rules);
-                    let fingerprint = tod_sandbox::node::rules_fingerprint(&rules);
-                    let mut labels = vec![(tod_sandbox::node::CREDS_LABEL, fingerprint.as_str())];
-                    let owner = acct.owner.as_deref().map(label_value).unwrap_or_default();
-                    if !owner.is_empty() {
-                        labels.push(("tod-owner", owner.as_str()));
-                    }
-                    bx.wait_deployed(name, Duration::from_secs(300))?;
-                    if let Err(err) = bx.update_proxy(name, &proxy, &labels) {
-                        progress(&format!(
-                            "warning: {name} keeps {source}'s proxy; the node's credentials were not applied: {err:#}"
-                        ));
-                    }
-                }
-                image
-            }
-        };
-        let info = bx.wait_deployed(name, Duration::from_secs(300))?;
-        progress(&format!("{name}: deployed in {:.1}s", started.elapsed().as_secs_f64()));
-        self.config.upsert(Sandbox { name: name.to_string(), image, url: info.url, agents });
-        self.save()?;
-        forget(name);
-        let mode = match source {
-            NewSandboxSource::Fork(_) => provision::Mode::Fork,
-            NewSandboxSource::Image(_) => provision::Mode::Install,
-        };
-        match self.ensure_as(&bx, name, mode, progress) {
-            Ok(url) => Ok(url),
-            Err(err) => {
-                // Nothing has used it yet: leaving it would leak a sandbox
-                // per attempt (each one costs money and clutters the list).
-                let removed = match self.delete(&bx, name) {
-                    Ok(()) => format!("{name} was deleted"),
-                    Err(del) => format!("{name} could not be deleted either ({del:#}); `tod-sandbox delete {name}` removes it"),
-                };
-                Err(err.context(removed))
-            }
-        }
     }
 
     /// Builds `base_image` with tod's dependencies installed and `repos`
@@ -562,6 +494,18 @@ impl Sandboxes {
         let _ = std::fs::remove_dir_all(dir);
         Ok(())
     }
+}
+
+/// Why Blaxel's record of a sandbox says it can no longer run, if it does:
+/// its deployment `status` or its running `state` is a terminal one. A
+/// sandbox that expired can stay `DEPLOYED` for an hour while its `state`
+/// already says so.
+pub fn dead_reason(info: &tod_sandbox::blaxel::SandboxInfo) -> Option<String> {
+    const DEAD: [&str; 6] = ["FAILED", "TERMINATED", "DELETING", "DELETED", "EXPIRED", "EXPIRING"];
+    let field = |what: &str, value: &str| {
+        DEAD.contains(&value.to_ascii_uppercase().as_str()).then(|| format!("sandbox {} has {what} {value}", info.name))
+    };
+    field("status", &info.status).or_else(|| info.state.as_deref().and_then(|state| field("state", state)))
 }
 
 /// Whether an interactive sandbox's proxy was made with exactly the rules

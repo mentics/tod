@@ -3,7 +3,7 @@
 //!
 //! - **Dev container:** the launch directory is resolved again (branch,
 //!   submodules) and the `tod-cli` relay shim written into the container again.
-//! - **Cloud sandbox:** [`cloud_sync::ensure_node_sandbox`], the one path that
+//! - **Cloud sandbox:** [`cloud_sync::ensure_supervisor`], the one path that
 //!   provisions a sandbox (proxy and credentials, branch, relay, supervisor
 //!   settings). The supervisor is poked only when the node is supervised and
 //!   waiting on someone.
@@ -114,8 +114,7 @@ impl Actions for Real {
 
     fn sandbox(&mut self, fleet: &FleetStore, node: &str, wake: bool, progress: &mut dyn FnMut(&str)) -> Result<()> {
         let root = fleet.paths().root().to_path_buf();
-        let (_, user) = cloud_sync::resolve(&root)?;
-        cloud_sync::ensure_node_sandbox(fleet, &root, node, &user, wake, progress)?;
+        cloud_sync::ensure_supervisor(fleet, &root, node, wake, progress)?;
         Ok(())
     }
 }

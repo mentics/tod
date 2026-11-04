@@ -51,6 +51,8 @@ struct Shared {
 /// Run the daemon for `data_root` until told to quit. `Ok(false)` when
 /// another daemon already holds the data root (this one exits quietly).
 pub fn run(data_root: &Path) -> Result<bool> {
+    // The runs it hosts make a node's sandbox through `tod-store`'s one creator.
+    tod_core::cloud_sync::register_sandbox_host();
     // This process has no log directory: its tracing goes to stderr, which
     // the starter files in `agentd.log`.
     tod_core::logging::init_stderr();

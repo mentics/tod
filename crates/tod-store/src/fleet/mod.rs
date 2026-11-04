@@ -26,6 +26,7 @@ pub mod repositories;
 pub mod repos;
 pub mod runtime;
 pub mod sandbox;
+pub mod sandbox_host;
 pub mod schema;
 pub mod session_log;
 pub mod store;

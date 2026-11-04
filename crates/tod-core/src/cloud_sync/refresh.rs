@@ -7,12 +7,12 @@
 //! the Reinstall and restart (removed) the user always could ask for) the app
 //! compares what each cloud node's sandbox was last given with what it would
 //! give now ([`install_stamp`]) and reinstalls the ones that differ
-//! ([`super::ensure_node_sandbox`], the same path), leaving alone a node
+//! ([`super::ensure_supervisor`], the same path), leaving alone a node
 //! whose supervisor is at work: its next launch, or its next wake once idle,
 //! catches up. What each node was last given is kept per machine in
 //! [`STAMPS_FILE`]; a node with no record (made before this) counts as stale.
 
-use super::ensure_node_sandbox;
+use super::ensure_supervisor;
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -23,7 +23,7 @@ use tod_store::fleet::FleetStore;
 /// Where each node's last install is recorded, under the data root.
 pub const STAMPS_FILE: &str = "cloud-install-stamps.json";
 
-/// A hash of everything a node's sandbox is given by [`ensure_node_sandbox`]
+/// A hash of everything a node's sandbox is given by [`ensure_supervisor`]
 /// that runs there: the Linux binaries and the bundles.
 pub fn install_stamp() -> Result<String> {
     Ok(install()?.stamp)
@@ -182,6 +182,11 @@ pub fn reinstall_reason(recorded: Option<&Install>, now: &Install) -> String {
     }
 }
 
+/// The install stamp last recorded for `node_id`'s sandbox, if any.
+pub fn recorded_stamp(root: &Path, node_id: &str) -> Result<Option<String>> {
+    Ok(load(root)?.get(node_id).map(|r| r.stamp().to_string()))
+}
+
 fn load(root: &Path) -> Result<BTreeMap<String, Recorded>> {
     let path = root.join(STAMPS_FILE);
     match std::fs::read_to_string(&path) {
@@ -264,7 +269,7 @@ const REINSTALL_MIN_FREE: u64 = 128 * 1024 * 1024;
 /// Refuses to reinstall into a sandbox that is out of disk: a write that runs
 /// out of space leaves a truncated manifest, which reads as "not installed".
 fn check_disk(root: &Path, row: &CloudNodeRow) -> Result<()> {
-    let mut sandboxes = tod_store::fleet::sandbox::Sandboxes::load(root)?;
+    let sandboxes = tod_store::fleet::sandbox::Sandboxes::load(root)?;
     let bx = sandboxes.blaxel()?;
     let Some(url) = bx.get(&row.sandbox)?.and_then(|info| info.url) else {
         return Ok(());
@@ -273,7 +278,7 @@ fn check_disk(root: &Path, row: &CloudNodeRow) -> Result<()> {
         .context("not reinstalling: the sandbox is out of disk space")
 }
 
-/// Reinstalls `row`'s sandbox on this build ([`ensure_node_sandbox`]) and
+/// Reinstalls `row`'s sandbox on this build ([`ensure_supervisor`]) and
 /// records it. Blocks on the network: never on the UI thread.
 pub fn reinstall(fleet: &FleetStore, row: &CloudNodeRow, current: &str) -> Result<()> {
     let root = fleet.paths().root().to_path_buf();
@@ -285,7 +290,7 @@ pub fn reinstall(fleet: &FleetStore, row: &CloudNodeRow, current: &str) -> Resul
     let reason = reinstall_reason(load(&root)?.get(&id).map(Recorded::install).as_ref(), &now);
     tracing::info!("cloud: {id}: reinstalling its sandbox: {reason}");
     check_disk(&root, row)?;
-    ensure_node_sandbox(fleet, &root, &id, &row.user, true, &mut |m| super::log_progress(&format!("refresh {id}"), m))?;
+    ensure_supervisor(fleet, &root, &id, true, &mut |m| super::log_progress(&format!("refresh {id}"), m))?;
     record(&root, &id, &now, Some(&reason))
 }
 

@@ -3,25 +3,6 @@ use std::net::TcpListener;
 use tod_store::outline::OutlineMutation;
 
 #[test]
-fn a_failed_provisioning_deletes_the_sandbox_it_made_and_says_so() {
-    let mut deleted = 0;
-    let err = discard_failed_sandbox(anyhow!("checking out b failed"), "node-x", &mut || {
-        deleted += 1;
-        Ok(())
-    });
-    assert_eq!(deleted, 1);
-    let msg = format!("{err:#}");
-    assert!(msg.contains("node-x was deleted") && msg.contains("checking out b failed"), "{msg}");
-}
-
-#[test]
-fn a_failed_delete_of_a_failed_sandbox_is_part_of_the_error() {
-    let err = discard_failed_sandbox(anyhow!("probe failed"), "node-x", &mut || Err(anyhow!("503 from Blaxel")));
-    let msg = format!("{err:#}");
-    assert!(msg.contains("could not be deleted") && msg.contains("503 from Blaxel") && msg.contains("probe failed"), "{msg}");
-}
-
-#[test]
 fn user_names_are_what_the_orchestrator_accepts() {
     assert_eq!(user_name("Joel Shellman").as_deref(), Some("joel-shellman"));
     assert_eq!(user_name("..-alice").as_deref(), Some("alice"));
@@ -48,10 +29,25 @@ fn a_claude_node_without_a_token_fails_before_anything_is_created() {
 }
 
 #[test]
-fn node_sandbox_names() {
-    assert_eq!(node_sandbox_name("fix-login"), "node-fix-login");
-    assert_eq!(node_sandbox_name("A_B c"), "node-a-b-c");
-    assert_eq!(node_sandbox_name("--"), "node");
+fn a_sandbox_made_now_never_gets_files_installed_into_it() {
+    // Healthy: nothing to do, whatever was recorded.
+    assert_eq!(supervisor_state(true, None, "new", true), SupervisorState::Current);
+    // Not answering with this build's relay: the golden is at fault, so an error, not an install.
+    assert_eq!(supervisor_state(true, Some("new"), "new", false), SupervisorState::BrokenNew);
+}
+
+#[test]
+fn a_sandbox_that_lacks_this_builds_supervisor_gets_it() {
+    // An old sandbox whose relay is not this build's (the one-time upgrade
+    // path for sandboxes the old creator made).
+    assert!(matches!(supervisor_state(false, Some("new"), "new", false), SupervisorState::Install { .. }));
+    // Its relay answers, but it was given an older install (supervisor or bundles changed).
+    let SupervisorState::Install { why } = supervisor_state(false, Some("old"), "new", true) else { panic!() };
+    assert!(why.contains("older install"), "{why}");
+    // Nothing recorded for it counts as old.
+    assert!(matches!(supervisor_state(false, None, "new", true), SupervisorState::Install { .. }));
+    // Current and healthy: left alone.
+    assert_eq!(supervisor_state(false, Some("new"), "new", true), SupervisorState::Current);
 }
 
 #[test]

@@ -9,6 +9,7 @@ use crate::fleet::repos::files_location::{FilesLocation, FilesLocationRepo};
 use crate::fleet::sandbox::{self, Sandboxes};
 use crate::fleet::terminal::{prune_stale_shell_sessions, prune_stale_terminal_agent_runs};
 use crate::fleet::workdir::Workdir;
+use tod_sandbox::blaxel::Blaxel;
 use crate::fleet::worktree::{self, WorktreeHandle, validate_git_repo};
 use crate::fleet::writer::FleetMutation;
 use crate::paths::TodPaths;
@@ -352,29 +353,151 @@ fn make_worktree(
     Ok((location, handle.warnings))
 }
 
-/// A name for `slug`'s sandbox that no known sandbox has.
-fn free_sandbox_name(fleet: &FleetStore, root: &std::path::Path, slug: &str, skip: usize) -> Result<String> {
-    let known = sandbox::known(root);
-    let base = sandbox::suggested_name(&format!("tod-{slug}"));
-    let mut taken = skip;
-    for n in 1.. {
-        let name = if n == 1 {
-            base.clone()
-        } else {
-            let suffix = format!("-{n}");
-            let stem: String = base.chars().take(48 - suffix.len()).collect();
-            format!("{}{suffix}", stem.trim_end_matches('-'))
-        };
-        let in_use = known.contains(&name) || fleet.read(|conn| FilesLocationRepo::new(conn).sandbox_in_use(&name))?;
-        if in_use {
-            continue;
-        }
-        if taken == 0 {
-            return Ok(name);
-        }
-        taken -= 1;
+/// The longest a sandbox name made here may be (the name also goes into the
+/// sandbox's host name; Blaxel itself accepts more).
+pub const SANDBOX_NAME_MAX: usize = 48;
+
+/// The name of `node_id`'s sandbox: `tod-<slug>-<6 hex of the node's id>`, at
+/// most [`SANDBOX_NAME_MAX`] characters. The id part makes it unique across a
+/// workspace several users share, so there is never a numeric suffix: a name
+/// that is taken is [`NameDecision::Lost`], not something to count past.
+pub fn sandbox_name(slug: &str, node_id: &str) -> Result<String> {
+    let hex: String = node_id.chars().filter(char::is_ascii_hexdigit).take(6).collect::<String>().to_ascii_lowercase();
+    if hex.len() < 6 {
+        bail!("node id {node_id:?} has fewer than six hex digits, so it cannot name a sandbox");
     }
-    unreachable!()
+    let room = SANDBOX_NAME_MAX - "tod-".len() - 1 - hex.len();
+    let cut: String = sandbox::label_value(slug).chars().take(room).collect();
+    let cut = cut.trim_matches('-');
+    let slug = if cut.is_empty() { "node" } else { cut };
+    Ok(format!("tod-{slug}-{hex}"))
+}
+
+/// What to do about the sandbox name a node is about to get.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NameDecision {
+    /// Blaxel has none by that name (or one already terminated): make it.
+    Make,
+    /// The node's record names it and it can run: it is the node's sandbox.
+    Reuse,
+    /// The node's record names it, but it can no longer run: delete it, then make it.
+    ReplaceDead,
+    /// It is being deleted: wait for it to go.
+    WaitForDelete,
+    /// Blaxel has one by that name and the node's record does not name it:
+    /// tod lost track of a sandbox. Nothing is made.
+    Lost,
+}
+
+/// Decides what to do about `name`, given the sandboxes the node's record
+/// names (`recorded`) and what Blaxel has by that name (`existing`).
+pub fn decide_name(name: &str, recorded: &[String], existing: Option<&tod_sandbox::blaxel::SandboxInfo>) -> NameDecision {
+    let Some(info) = existing else { return NameDecision::Make };
+    match info.status.to_ascii_uppercase().as_str() {
+        "TERMINATED" => return NameDecision::Make,
+        "DELETING" => return NameDecision::WaitForDelete,
+        _ => {}
+    }
+    if !recorded.iter().any(|r| r == name) {
+        return NameDecision::Lost;
+    }
+    if sandbox::dead_reason(info).is_some() { NameDecision::ReplaceDead } else { NameDecision::Reuse }
+}
+
+/// The error for [`NameDecision::Lost`].
+fn lost_track_error(name: &str, slug: &str, node_id: &str, status: &str) -> anyhow::Error {
+    let short: String = node_id.chars().take(6).collect();
+    anyhow!(
+        "Cannot make sandbox {name} for node \"{slug}\" ({short}…): a sandbox by that name already exists ({status}), \
+         but this node's record does not point at it, so tod lost track of it. Check `tod-sandbox list`, the node's \
+         Files location, and its cloud record; delete or adopt the sandbox (`tod-sandbox delete {name}`), then try again. \
+         Nothing was made, renamed or deleted."
+    )
+}
+
+/// The sandboxes `node_id`'s records name: its Files location's, then its
+/// `cloud_nodes` row's (one record after B3 of the runner-menu plan).
+pub fn recorded_sandboxes(fleet: &FleetStore, node_id: &str) -> Result<Vec<String>> {
+    let node: uuid::Uuid = node_id.parse().context("node id")?;
+    let mut names = Vec::new();
+    if let Some(location) = fleet.read(|conn| FilesLocationRepo::new(conn).get(node_id))?
+        && let Some(name) = location.sandbox
+    {
+        names.push(name);
+    }
+    if let Some(row) = fleet.read(|conn| crate::cloud_nodes::get(conn, node))?
+        && !names.contains(&row.sandbox)
+    {
+        names.push(row.sandbox);
+    }
+    Ok(names)
+}
+
+fn sandbox_exists(info: Option<&tod_sandbox::blaxel::SandboxInfo>) -> bool {
+    info.is_some_and(|i| !i.status.eq_ignore_ascii_case("TERMINATED"))
+}
+
+/// Waits (up to two minutes) for `name` to leave Blaxel's list.
+fn wait_gone(bx: &Blaxel, name: &str) -> Result<()> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    while sandbox_exists(bx.get(name)?.as_ref()) {
+        if std::time::Instant::now() > deadline {
+            bail!("sandbox {name} is still being deleted after two minutes");
+        }
+        std::thread::sleep(std::time::Duration::from_secs(2));
+    }
+    Ok(())
+}
+
+/// What [`choose_sandbox`] settled.
+enum Chosen {
+    /// The node's own, running sandbox.
+    Reuse(String),
+    /// Nothing is in the way: make the sandbox under this name.
+    Make(String),
+}
+
+/// Settles which sandbox is the node's: one its records name that Blaxel
+/// still has, else the one the naming scheme gives ([`sandbox_name`]). A name
+/// taken by a sandbox the records do not name is [`NameDecision::Lost`]: an
+/// error, nothing made.
+fn choose_sandbox(
+    bx: &Blaxel,
+    recorded: &[String],
+    slug: &str,
+    node_id: &str,
+    progress: &mut dyn FnMut(&str),
+) -> Result<Chosen> {
+    let mut candidate = sandbox_name(slug, node_id)?;
+    for name in recorded {
+        if sandbox_exists(bx.get(name)?.as_ref()) {
+            candidate = name.clone();
+            break;
+        }
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    loop {
+        let existing = bx.get(&candidate)?;
+        match decide_name(&candidate, recorded, existing.as_ref()) {
+            NameDecision::Make => return Ok(Chosen::Make(candidate)),
+            NameDecision::Reuse => return Ok(Chosen::Reuse(candidate)),
+            NameDecision::ReplaceDead => {
+                progress(&format!("removing the dead sandbox {candidate}…"));
+                bx.delete(&candidate)?;
+            }
+            NameDecision::WaitForDelete => {
+                if std::time::Instant::now() > deadline {
+                    let status = existing.map(|i| i.status).unwrap_or_default();
+                    return Err(lost_track_error(&candidate, slug, node_id, &status));
+                }
+                std::thread::sleep(std::time::Duration::from_secs(2));
+            }
+            NameDecision::Lost => {
+                let status = existing.map(|i| i.status).unwrap_or_default();
+                return Err(lost_track_error(&candidate, slug, node_id, &status));
+            }
+        }
+    }
 }
 
 /// Everything that belongs in an interactive sandbox's proxy: the user's
@@ -457,8 +580,15 @@ pub fn refresh_sandbox_proxy(
     if matches!(info.status.to_ascii_uppercase().as_str(), "FAILED" | "TERMINATED" | "DELETING" | "DELETED") {
         return Ok(SandboxRefresh::NotNeeded);
     }
-    let creds = sandbox_proxy_credentials(fleet, &sandboxes, node_id, progress)?;
-    if sandbox::interactive_proxy_is_current(&info, &creds, sandboxes.claude_token_via()) {
+    // The one comparison for every node sandbox: the rules its proxy is made
+    // with ([`tod_sandbox::node::proxy_rules`], the orchestrator's and
+    // Blaxel's included, which a supervised node needs), fingerprinted in its
+    // `tod-creds` label.
+    let creds = node_proxy_credentials(fleet, &sandboxes, &bx, node_id, progress)?;
+    let orchestrator = orchestrator_of(&mut sandboxes, &bx)?;
+    let rules = tod_sandbox::node::proxy_rules(&creds, &orchestrator.host, sandboxes.claude_token_via());
+    let fingerprint = tod_sandbox::node::rules_fingerprint(&rules);
+    if info.label(tod_sandbox::node::CREDS_LABEL) == Some(fingerprint.as_str()) {
         return Ok(SandboxRefresh::NotNeeded);
     }
     let lock = node_lock(node_id);
@@ -469,13 +599,15 @@ pub fn refresh_sandbox_proxy(
         .get_json(&name)?
         .is_some_and(|record| record["spec"]["network"]["proxy"].is_object());
     if has_proxy {
-        let rules = tod_sandbox::node::credential_rules(&creds, sandboxes.claude_token_via());
-        let fingerprint = tod_sandbox::node::rules_fingerprint(&rules);
+        let env_label = tod_sandbox::node::env_fingerprint(&creds.custom);
         progress(&format!("updating {name}'s proxy with the node's credentials…"));
         bx.update_proxy(
             &name,
             &tod_sandbox::node::proxy_spec(&rules),
-            &[(tod_sandbox::node::CREDS_LABEL, fingerprint.as_str())],
+            &[
+                (tod_sandbox::node::CREDS_LABEL, fingerprint.as_str()),
+                (tod_sandbox::node::ENV_LABEL, env_label.as_str()),
+            ],
         )
         .with_context(|| format!("update sandbox {name}'s proxy"))?;
         return Ok(SandboxRefresh::Updated(name));
@@ -565,39 +697,132 @@ fn prepare_sandbox_checkout(
     Ok(warnings)
 }
 
-/// The sandbox `node_id` runs in in the cloud (its `cloud_nodes` row) and the
-/// checkout's directory in it, when Blaxel still has it and it can run.
-/// `None` when the node has none, or it is gone (the cloud check replaces it).
-fn live_cloud_sandbox(
+/// The orchestrator a node's sandbox reports to: its host (which goes in the
+/// sandbox's proxy) and its `/cli` URL (which goes in its environment).
+struct Orchestrator {
+    host: String,
+    cli_url: String,
+}
+
+/// Finds the orchestrator, or fails before anything is made: a sandbox made
+/// without one could not run the supervisor.
+fn orchestrator_of(sandboxes: &mut Sandboxes, bx: &Blaxel) -> Result<Orchestrator> {
+    let none = |why: String| {
+        anyhow!(
+            "No orchestrator is reachable, so this node's sandbox cannot be made. Start the app (it deploys the \
+             orchestrator) or run `tod-sandbox orchestrator`, then try again. ({why})"
+        )
+    };
+    let name = sandboxes.account()?.orchestrator.clone();
+    match bx.get(&name)? {
+        None => return Err(none(format!("there is no sandbox named {name}"))),
+        Some(info) => {
+            if let Some(why) = sandbox::dead_reason(&info) {
+                return Err(none(why));
+            }
+        }
+    }
+    let url = sandboxes.url(bx, &name).map_err(|e| none(format!("{e:#}")))?;
+    let host = url
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .split('/')
+        .next()
+        .unwrap_or_default()
+        .to_string();
+    let cli_url = format!("{}/port/{}/cli", url.trim_end_matches('/'), tod_sandbox::orchestrator::PORT);
+    Ok(Orchestrator { host, cli_url })
+}
+
+/// Everything a node's sandbox's proxy holds: [`sandbox_proxy_credentials`]
+/// and, for the supervisor, the Blaxel token.
+fn node_proxy_credentials(
     fleet: &FleetStore,
     sandboxes: &Sandboxes,
+    bx: &Blaxel,
     node_id: &str,
     progress: &mut dyn FnMut(&str),
-) -> Result<Option<(String, String)>> {
-    let node: uuid::Uuid = node_id.parse().context("node id")?;
-    let Some(row) = fleet.read(|conn| crate::cloud_nodes::get(conn, node))? else { return Ok(None) };
-    let alive = sandboxes.blaxel()?.get(&row.sandbox)?.is_some_and(|info| {
-        !matches!(info.status.to_ascii_uppercase().as_str(), "FAILED" | "TERMINATED" | "DELETING" | "DELETED")
-    });
-    if !alive {
-        return Ok(None);
+) -> Result<tod_sandbox::node::NodeCredentials> {
+    let mut creds = sandbox_proxy_credentials(fleet, sandboxes, node_id, progress)?;
+    creds.blaxel_token = bx.token().to_string();
+    Ok(creds)
+}
+
+fn health_spec<'a>(
+    label: &'a str,
+    node: &'a str,
+    repo_url: &'a str,
+    expected_manifest: Option<&'a str>,
+    probe_delays: &'a [u64],
+) -> tod_sandbox::health::HealthSpec<'a> {
+    tod_sandbox::health::HealthSpec {
+        label,
+        node,
+        repo_url,
+        min_free: SETUP_MIN_FREE,
+        reachable_wait: std::time::Duration::from_secs(180),
+        expected_manifest,
+        probe_delays,
     }
-    progress(&format!("using the node's cloud sandbox {}…", row.sandbox));
+}
+
+/// Free space a sandbox's setup needs on its root filesystem.
+const SETUP_MIN_FREE: u64 = 128 * 1024 * 1024;
+
+/// Uses the sandbox the node's records already name (`name`, running): its
+/// checkout is found, put on the node's branch, and recorded.
+fn reuse_sandbox(
+    fleet: &FleetStore,
+    name: &str,
+    mut location: FilesLocation,
+    branch: &str,
+    progress: &mut dyn FnMut(&str),
+) -> Result<(FilesLocation, Vec<String>)> {
+    progress(&format!("using the node's sandbox {name}…"));
     let probe = format!("echo {}", tod_sandbox::node::WORKSPACE_PROBE);
-    let out = sandbox::SandboxExec::new(&row.sandbox)
+    let out = sandbox::SandboxExec::new(name)
         .output_within(std::time::Duration::from_secs(60), "/", "sh", &["-c", &probe])
-        .with_context(|| format!("find the checkout in the node's cloud sandbox {}", row.sandbox))?;
-    let dir = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if !out.status.success() || dir.is_empty() {
+        .with_context(|| format!("find the checkout in the node's sandbox {name}"))?;
+    let repo = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if !out.status.success() || repo.is_empty() {
         bail!(
-            "could not find the checkout in the node's cloud sandbox {}: {}",
-            row.sandbox,
+            "could not find the checkout in the node's sandbox {name}: {}",
             String::from_utf8_lossy(&out.stderr).trim()
         );
     }
-    Ok(Some((row.sandbox, dir)))
+    let dir = Workdir::sandbox(name, &repo);
+    // Not deleted on failure, unlike a sandbox made here: it is the node's own.
+    let warnings = prepare_sandbox_checkout(&dir, name, &repo, branch, progress)
+        .with_context(|| format!("use the node's sandbox {name}"))?;
+    location.sandbox = Some(name.to_string());
+    location.repo = Some(repo);
+    record(fleet, &location)?;
+    Ok((location, warnings))
 }
 
+/// **The one creator of a node's sandbox.** Every sandbox tod makes for a
+/// node comes from here, and every one can host the supervisor.
+///
+/// - Before anything is made: the orchestrator must be reachable
+///   ([`orchestrator_of`]) and the name settled ([`choose_sandbox`]): a
+///   sandbox the node's records name is reused; one by the scheme's name that
+///   they do not name is an error ("tod lost track of a sandbox"), nothing made.
+/// - From a **fork** (the project's golden, current for this build through
+///   [`SandboxHost::current_golden`](super::sandbox_host::SandboxHost), or a
+///   sandbox the Files setting names): the node's environment, proxy rules and
+///   labels ([`tod_sandbox::node::fork_golden`]) and then only the node's own
+///   setup. **No file of tod's is installed**: the golden carries them, and a
+///   fork that does not answer with this build's manifest fails its check.
+/// - From an **image**: [`tod_sandbox::node::create`], the image's own
+///   dependencies, and the full [`tod_sandbox::node::install`].
+/// - The node's own setup, either way: the branch and its submodules, the
+///   relay started with the supervisor's environment, session logs and runner
+///   state sent. The supervisor itself starts only when asked
+///   (`cloud_sync::ensure_supervisor`'s `wake`).
+///
+/// The location is recorded as soon as the sandbox exists; a failure after
+/// that deletes it and forgets the location (`TOD_KEEP_FAILED_SANDBOX=1`
+/// keeps it for inspection).
 fn make_sandbox(
     fleet: &FleetStore,
     files: &ResolvedFiles,
@@ -605,91 +830,168 @@ fn make_sandbox(
     branch: &str,
     progress: &mut dyn FnMut(&str),
 ) -> Result<(FilesLocation, Vec<String>)> {
+    use tod_sandbox::node;
+    let host = super::sandbox_host::host()?;
     let dev = files.dev_container.clone().unwrap_or_default();
     let root = fleet.paths().root().to_path_buf();
-    let node = fleet
-        .get_node(&files.node_id)?
-        .ok_or_else(|| anyhow!("no node {}", files.node_id))?;
+    let node_id = files.node_id.as_str();
+    let node_row = fleet.get_node(node_id)?.ok_or_else(|| anyhow!("no node {node_id}"))?;
     let mut sandboxes = Sandboxes::load(&root)?;
-    // One sandbox per node: a node already running in the cloud has one, and
-    // a second beside it would not hold its session or its work.
-    if let Some((name, repo)) = live_cloud_sandbox(fleet, &sandboxes, &files.node_id, progress)? {
-        let dir = Workdir::sandbox(&name, &repo);
-        // Not deleted on failure, unlike a sandbox made here: it is the cloud run's.
-        let warnings = prepare_sandbox_checkout(&dir, &name, &repo, branch, progress)
-            .with_context(|| format!("use the node's cloud sandbox {name}"))?;
-        location.sandbox = Some(name);
-        location.repo = Some(repo);
-        record(fleet, &location)?;
-        return Ok((location, warnings));
-    }
+    let account = sandboxes.account()?.clone();
+    let bx = sandboxes.blaxel()?;
+    // Before anything is made.
+    let orchestrator = orchestrator_of(&mut sandboxes, &bx)?;
+    let user = host.orchestrator_user(&root)?;
+    let recorded = recorded_sandboxes(fleet, node_id)?;
+    let name = match choose_sandbox(&bx, &recorded, &node_row.slug, node_id, progress)? {
+        Chosen::Reuse(name) => return reuse_sandbox(fleet, &name, location, branch, progress),
+        Chosen::Make(name) => name,
+    };
+
+    let repo = host.node_repo(fleet, node_id)?;
+    let creds = node_proxy_credentials(fleet, &sandboxes, &bx, node_id, progress)?;
+    let node_files = host.node_files()?;
     let source = dev.sandbox_from.source();
-    // The node's Environment: secrets with hosts go in the sandbox's proxy,
-    // so the agent calls those hosts without holding the value.
-    let custom = match sandbox_proxy_credentials(fleet, &sandboxes, &files.node_id, progress) {
-        Ok(custom) => custom,
-        Err(err) => {
-            progress(&format!("warning: the node's credentials were not applied: {err:#}"));
-            sandboxes.node_credentials(Vec::new())
+    let agent = host.supervisor_agent();
+    // What the golden is: named only for a fork, and resolved before the
+    // sandbox is made (it may refresh the golden, which is slow and says so).
+    let fork_from = match &source {
+        sandbox::NewSandboxSource::Fork(from) if from.trim() == tod_sandbox::config::GOLDEN => {
+            Some(host.current_golden(&mut sandboxes, &bx, &repo.slug, progress)?)
+        }
+        sandbox::NewSandboxSource::Fork(from) => Some(from.trim().to_string()),
+        sandbox::NewSandboxSource::Image(_) => None,
+    };
+    let image = match &source {
+        sandbox::NewSandboxSource::Image(image) => sandboxes.runtime_image(image, false, progress)?,
+        // Not used: a fork is made from its source, not from an image.
+        sandbox::NewSandboxSource::Fork(_) => String::new(),
+    };
+    let spec = node::NodeSandboxSpec {
+        name: &name,
+        image: &image,
+        region: &account.region,
+        memory_mb: account.memory_mb,
+        user: &user,
+        node: node_id,
+        orchestrator_host: &orchestrator.host,
+        orchestrator_cli_url: &orchestrator.cli_url,
+        agent: agent.as_deref(),
+        claude_via: account.claude_token_via,
+        scheduler: sandboxes.config.scheduler,
+        workspace: &account.workspace,
+    };
+
+    // Before the first call that changes anything at Blaxel: a crash from
+    // here on leaves a record of the sandbox that may exist.
+    host.record_intent(&root, node_id, &name)?;
+    let started = std::time::Instant::now();
+    let created = match &fork_from {
+        Some(golden) => {
+            progress(&format!("forking {name} from {golden}…"));
+            node::fork_golden(&bx, golden, &spec, &creds).with_context(|| format!("fork {name} from {golden}"))
+        }
+        None => {
+            progress(&format!("creating {name} from {}…", dev.sandbox_from.describe()));
+            node::create(&bx, &spec, &creds).with_context(|| format!("create {name} from {image}"))
         }
     };
-    let mut attempt = 0;
-    let name = loop {
-        let name = free_sandbox_name(fleet, &root, &node.slug, attempt)?;
-        progress(&format!("making sandbox {name} from {}…", dev.sandbox_from.describe()));
-        match sandboxes.create_with_proxy(&name, &source, true, false, &custom, progress) {
-            Ok(_) => break name,
-            // Blaxel has one by that name that this data root doesn't know.
-            Err(err) if attempt < 5 && format!("{err:#}").contains("already exists") => attempt += 1,
-            Err(err) => {
-                return Err(err.context(format!(
-                    "make sandbox {name} for this node (if it was made in part, \
-                     `tod-sandbox delete {name}` removes it)"
-                )));
-            }
-        }
-    };
+    if let Err(err) = created {
+        return Err(discard_failed_sandbox(fleet, &mut sandboxes, &bx, &root, node_id, &name, false, err));
+    }
     location.sandbox = Some(name.clone());
     // Recorded before anything else can fail, so the sandbox is never lost track of.
     record(fleet, &location)?;
-    let repo = files.repo().unwrap_or_default();
-    let dir = Workdir::sandbox(&name, repo);
-    // From here a failure leaves a sandbox that is not on the node's branch.
-    // Its location is recorded, so the next launch would take it as ready and
-    // open a shell on `main`: nothing has been done in it yet, so it is
-    // deleted and the location forgotten, and the next launch makes it again.
-    let prepared = prepare_sandbox_checkout(&dir, &name, repo, branch, progress);
-    let mut warnings = match prepared {
-        Ok(warnings) => warnings,
-        // `TOD_KEEP_FAILED_SANDBOX=1` leaves it for inspection (and the
-        // location recorded, so the launch reuses it).
-        Err(err) if std::env::var_os("TOD_KEEP_FAILED_SANDBOX").is_some() => {
-            return Err(err.context(format!("{name} was kept (TOD_KEEP_FAILED_SANDBOX)")));
-        }
-        Err(err) => {
-            let cleaned = match sandboxes.delete(&sandboxes.blaxel()?, &name) {
-                Ok(()) => {
-                    let forgotten = fleet
-                        .enqueue(FleetMutation::DeleteFilesLocation { node_id: files.node_id.clone() })
-                        .and_then(|_| fleet.writer().flush());
-                    match forgotten {
-                        Ok(()) => format!("{name} was deleted so the next launch makes a fresh one"),
-                        Err(e) => format!("{name} was deleted but its location could not be forgotten ({e:#})"),
-                    }
-                }
-                Err(e) => format!(
-                    "{name} could not be deleted ({e:#}); remove it with `tod-sandbox delete {name}` and the \
-                     node's location in its Files settings"
-                ),
+    host.clear_intent(&root, node_id)?;
+
+    let supervisor_env = node::supervisor_env(&creds, account.claude_token_via);
+    let delays = if fork_from.is_some() { node::FORK_PROBE_DELAYS } else { node::IMAGE_PROBE_DELAYS };
+    let setup = |sandboxes: &mut Sandboxes, location: &mut FilesLocation, progress: &mut dyn FnMut(&str)| -> Result<Vec<String>> {
+        progress(&format!("waiting for {name}…"));
+        let info = bx.wait_deployed(&name, std::time::Duration::from_secs(300))?;
+        let url = info.url.clone().ok_or_else(|| anyhow!("sandbox {name} has no URL"))?;
+        progress(&format!("{name} is up after {:.1}s", started.elapsed().as_secs_f64()));
+        sandboxes.config.upsert(tod_sandbox::config::Sandbox { name: name.clone(), image: info.image, url: Some(url.clone()), agents: true });
+        sandboxes.save()?;
+        // A sandbox in standby is "up" to the control plane but its workload
+        // is not reachable until it has resumed.
+        bx.wait_reachable(&url, std::time::Duration::from_secs(180)).with_context(|| format!("wake {name}"))?;
+        if fork_from.is_none() {
+            // An image holds only what it was built with: tod's dependencies
+            // first, then its own files (a fork's golden carries both).
+            sandboxes.ensure_as(&bx, &name, tod_sandbox::provision::Mode::Install, progress)?;
+            let identity = host.git_identity(node_row.repo.as_deref());
+            let payload = node::NodePayload {
+                relay: &node_files.relay,
+                shim: super::cli_relay::HTTP_SHIM_SCRIPT.as_bytes(),
+                local_cli: node_files.local_cli.as_deref(),
+                supervisor: node_files.supervisor.as_deref(),
+                repo_url: &repo.url,
+                branch,
+                git_identity: &identity,
+                bundles: &node_files.bundles,
+                supervisor_env: &supervisor_env,
             };
-            return Err(err.context(cleaned));
+            progress("installing tod's files…");
+            node::install(&bx, &url, &payload, progress)?;
+        }
+        // A fork is "deployed" before its proxy rules and environment are in
+        // effect; the checkout needs both.
+        progress(&format!("checking {name} can reach {}…", repo.url));
+        let health = |expected_manifest| health_spec(&name, node_id, &repo.url, expected_manifest, delays);
+        tod_sandbox::health::probe(&bx, &url, tod_sandbox::health::Stage::Base, &health(None), progress)?;
+        let identity = host.git_identity(node_row.repo.as_deref());
+        node::checkout(&bx, &url, &repo.url, branch, &identity, fork_from.is_none(), progress)?;
+        // Where the checkout is: the clone's, else the image's own.
+        let probe = format!("echo {}", node::WORKSPACE_PROBE);
+        let out = sandbox::SandboxExec::new(&name)
+            .output_within(std::time::Duration::from_secs(60), "/", "sh", &["-c", &probe])
+            .with_context(|| format!("find the checkout in {name}"))?;
+        let dir_path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if !out.status.success() || dir_path.is_empty() {
+            bail!("could not find the checkout in {name}: {}", String::from_utf8_lossy(&out.stderr).trim());
+        }
+        location.repo = Some(dir_path.clone());
+        record(fleet, &*location)?;
+        let dir = Workdir::sandbox(&name, &dir_path);
+        let mut warnings = Vec::new();
+        if let Err(err) = worktree::init_submodules(&dir) {
+            warnings.push(format!("{err:#}"));
+        }
+        warnings.extend(worktree::branch_submodules(&dir, branch)?);
+        // Restarted, so it runs the binary the golden or install gave it.
+        node::start_relay(&bx, &url, &supervisor_env)?;
+        // Adopted as good only now: the relay answers with this build's
+        // manifest, which a fork of a golden without tod's files cannot.
+        let expected = tod_sandbox::provision::node_manifest(&node_files.relay);
+        progress(&format!("checking {name} is healthy…"));
+        tod_sandbox::health::probe(&bx, &url, tod_sandbox::health::Stage::Ready, &health(Some(&expected)), progress)
+            .map_err(|failure| match &fork_from {
+                Some(from) => anyhow::Error::new(failure).context(format!(
+                    "{name} was forked from {from}, which should carry this build's relay, supervisor and tod-cli; \
+                     refresh it (`tod-sandbox golden refresh`) or point the Files setting at the project's golden"
+                )),
+                None => anyhow::Error::new(failure),
+            })?;
+        host.record_install(&root, node_id)?;
+        progress(&format!(
+            "{name} {} and set up after {:.1}s",
+            if fork_from.is_some() { "forked" } else { "created" },
+            started.elapsed().as_secs_f64()
+        ));
+        Ok(warnings)
+    };
+    let mut warnings = match setup(&mut sandboxes, &mut location, progress) {
+        Ok(warnings) => warnings,
+        Err(err) => {
+            return Err(discard_failed_sandbox(fleet, &mut sandboxes, &bx, &root, node_id, &name, true, err));
         }
     };
     // A sandbox replacing one (a changed credential, a lost sandbox) gets the
     // agent's session logs back where Claude resumes from, so the
     // conversation's recorded session id resumes the same session. Without
     // them it falls back to a fresh session (rotation).
-    match super::session_log::restore_node(&root, &files.node_id, &name) {
+    match super::session_log::restore_node(&root, node_id, &name) {
         Ok(0) => {}
         Ok(n) => progress(&format!("restored {n} agent session log(s) in {name}")),
         Err(err) => warnings.push(format!(
@@ -698,12 +1000,128 @@ fn make_sandbox(
     }
     // A node migrated here keeps its runner state too (the autopilot's
     // position and the supervisor's grants), before its first wake.
-    match super::session_log::place_node_state(fleet, &files.node_id, &name) {
+    match super::session_log::place_node_state(fleet, node_id, &name) {
         Ok(0) => {}
         Ok(n) => progress(&format!("sent {n} runner state file(s) to {name}")),
         Err(err) => warnings.push(format!("the runner state could not be sent ({err:#}); the runner starts over")),
     }
     Ok((location, warnings))
+}
+
+/// What a failed [`make_sandbox`] returns: `err`, once the sandbox it made is
+/// deleted (and, with `recorded`, the location forgotten), so the next launch
+/// makes another instead of adopting one whose proxy or checkout is bad. A
+/// failed delete is part of the error, never dropped. `TOD_KEEP_FAILED_SANDBOX`
+/// keeps it for inspection.
+#[allow(clippy::too_many_arguments)]
+fn discard_failed_sandbox(
+    fleet: &FleetStore,
+    sandboxes: &mut Sandboxes,
+    bx: &Blaxel,
+    root: &std::path::Path,
+    node_id: &str,
+    name: &str,
+    recorded: bool,
+    err: anyhow::Error,
+) -> anyhow::Error {
+    if std::env::var_os("TOD_KEEP_FAILED_SANDBOX").is_some() {
+        return err.context(format!("{name} was kept (TOD_KEEP_FAILED_SANDBOX)"));
+    }
+    let deleted = (|| -> Result<()> {
+        if bx.get(name)?.is_some() {
+            sandboxes.delete(bx, name)?;
+        }
+        Ok(())
+    })();
+    let cleaned = match deleted {
+        Ok(()) => {
+            let forgotten = (|| -> Result<()> {
+                if recorded {
+                    fleet.enqueue(FleetMutation::DeleteFilesLocation { node_id: node_id.to_string() })?;
+                    fleet.writer().flush()?;
+                }
+                // Gone (or never made): nothing is left for the sweeper to find.
+                super::sandbox_host::host()?.clear_intent(root, node_id)
+            })();
+            match forgotten {
+                Ok(()) => format!("{name} was deleted so the next launch makes a fresh one"),
+                Err(e) => format!("{name} was deleted but its record could not be cleared ({e:#})"),
+            }
+        }
+        Err(e) => format!(
+            "{name} could not be deleted ({e:#}); remove it with `tod-sandbox delete {name}` and the \
+             node's location in its Files settings"
+        ),
+    };
+    err.context(cleaned)
+}
+
+/// What [`retire_unusable_sandbox`] did about the sandbox a node's records name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Retired {
+    /// The records name none.
+    NoneRecorded,
+    /// It is the node's own and fine as it is.
+    Current(String),
+    /// It was gone or dead; the location was forgotten, so the next
+    /// [`resolve_launch_cwd_with`] makes a new one.
+    Replaced(String),
+    /// It was made before the one creator (its `tod-kind` is not `node`) and
+    /// was replaced once: logs pulled, work checkpointed, deleted, location
+    /// forgotten. The next [`resolve_launch_cwd_with`] makes the new one and
+    /// restores both.
+    Upgraded(String),
+}
+
+/// Gets rid of what stands between a node and a working sandbox, so the
+/// creator can make one: a recorded sandbox that is gone or dead is forgotten
+/// (deleting a dead one), and one made by the creator before it made every
+/// sandbox able to host the supervisor is replaced once (design.md, "A
+/// one-time upgrade of existing sandboxes"): its session logs are pulled and
+/// its work checkpointed first, and **a failure of either deletes nothing**
+/// and says why. Nothing is made here.
+pub fn retire_unusable_sandbox(fleet: &FleetStore, node_id: &str, progress: &mut dyn FnMut(&str)) -> Result<Retired> {
+    let lock = node_lock(node_id);
+    let _held = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let recorded = recorded_sandboxes(fleet, node_id)?;
+    let Some(name) = recorded.first().cloned() else { return Ok(Retired::NoneRecorded) };
+    let root = fleet.paths().root().to_path_buf();
+    let mut sandboxes = Sandboxes::load(&root)?;
+    let bx = sandboxes.blaxel()?;
+    let location = node_location(fleet, node_id)?;
+    let forget_location = |sandboxes: &mut Sandboxes| -> Result<()> {
+        if location.as_ref().is_some_and(|l| l.sandbox.as_deref() == Some(name.as_str())) {
+            fleet.enqueue(FleetMutation::DeleteFilesLocation { node_id: node_id.to_string() })?;
+            fleet.writer().flush()?;
+            fleet.reload_if_stale()?;
+        }
+        sandboxes.forget(&name)
+    };
+    let info = bx.get(&name)?.filter(|i| !i.status.eq_ignore_ascii_case("TERMINATED"));
+    let Some(info) = info else {
+        forget_location(&mut sandboxes)?;
+        return Ok(Retired::Replaced(name));
+    };
+    if let Some(why) = sandbox::dead_reason(&info) {
+        progress(&format!("removing {name}: {why}…"));
+        bx.delete(&name).with_context(|| format!("delete sandbox {name}"))?;
+        wait_gone(&bx, &name)?;
+        forget_location(&mut sandboxes)?;
+        return Ok(Retired::Replaced(name));
+    }
+    let made_here = location.as_ref().is_some_and(|l| l.sandbox.as_deref() == Some(name.as_str()));
+    if !made_here || info.label("tod-kind") == Some("node") {
+        return Ok(Retired::Current(name));
+    }
+    progress("Upgrading the node's sandbox so it can run its autopilot…");
+    super::session_log::pull_node(&root, node_id, &name)
+        .with_context(|| format!("save {name}'s agent session logs; nothing was deleted"))?;
+    super::node_checkpoint::checkpoint_node(fleet, node_id)
+        .with_context(|| format!("checkpoint {name}'s uncommitted work; nothing was deleted"))?;
+    bx.delete(&name).with_context(|| format!("delete sandbox {name}"))?;
+    wait_gone(&bx, &name)?;
+    forget_location(&mut sandboxes)?;
+    Ok(Retired::Upgraded(name))
 }
 
 /// Change `node_id`'s branch while it has a worktree or sandbox: the branch
@@ -1093,6 +1511,109 @@ mod tests {
         assert!(!says_sandbox_gone(&format!("{err:#}"), "n-2"));
         assert!(!sandbox_is_gone(&anyhow::anyhow!("sandbox n-1 is FAILED")));
     }
+    const ID: &str = "3f9a1c2e-0000-4000-8000-000000000000";
+
+    fn info(name: &str, status: &str) -> tod_sandbox::blaxel::SandboxInfo {
+        tod_sandbox::blaxel::SandboxInfo {
+            name: name.into(),
+            status: status.into(),
+            state: None,
+            url: None,
+            image: String::new(),
+            labels: Vec::new(),
+            volumes: Vec::new(),
+            node_env: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_sandbox_is_named_tod_slug_and_six_hex_of_the_node_id() {
+        assert_eq!(sandbox_name("export-totals", ID).unwrap(), "tod-export-totals-3f9a1c");
+        // The slug goes through label_value: lower case, letters, digits and dashes.
+        assert_eq!(sandbox_name("Fix_Login Now", ID).unwrap(), "tod-fix-login-now-3f9a1c");
+        // The id is what makes names unique, so a different node gets a different name.
+        assert_ne!(sandbox_name("a", ID).unwrap(), sandbox_name("a", "ab12cd34-0000-4000-8000-000000000000").unwrap());
+        // Hex digits only, from the id as written (a UUID's dashes are skipped).
+        assert_eq!(sandbox_name("a", "ABCDEF12-3456-4000-8000-000000000000").unwrap(), "tod-a-abcdef");
+    }
+
+    #[test]
+    fn a_sandbox_name_is_at_most_48_characters_with_no_dash_left_at_the_cut() {
+        let long = "x".repeat(100);
+        let name = sandbox_name(&long, ID).unwrap();
+        assert_eq!(name.len(), SANDBOX_NAME_MAX, "{name}");
+        assert!(name.ends_with("-3f9a1c") && name.starts_with("tod-x"));
+        // A cut that lands on a dash drops it: no `--` before the id.
+        let slug = format!("{}-{}", "y".repeat(36), "z".repeat(20));
+        let name = sandbox_name(&slug, ID).unwrap();
+        assert!(name.len() <= SANDBOX_NAME_MAX && !name.contains("--"), "{name}");
+        sandbox::validate_name(&name).unwrap();
+        // Nothing usable in the slug: a stand-in, never an empty or dashed part.
+        assert_eq!(sandbox_name("--", ID).unwrap(), "tod-node-3f9a1c");
+        assert_eq!(sandbox_name("", ID).unwrap(), "tod-node-3f9a1c");
+    }
+
+    #[test]
+    fn a_node_id_with_too_few_hex_digits_cannot_name_a_sandbox() {
+        let err = sandbox_name("a", "zz-12").unwrap_err().to_string();
+        assert!(err.contains("fewer than six hex digits"), "{err}");
+    }
+
+    #[test]
+    fn a_name_has_no_numeric_suffix_whatever_is_taken() {
+        // There is no counter in the scheme: asking twice gives the same name.
+        assert_eq!(sandbox_name("a", ID).unwrap(), sandbox_name("a", ID).unwrap());
+    }
+
+    #[test]
+    fn a_free_name_is_made() {
+        assert_eq!(decide_name("tod-a-3f9a1c", &[], None), NameDecision::Make);
+        // One already terminated lingers in Blaxel's list: not in the way.
+        assert_eq!(decide_name("tod-a-3f9a1c", &[], Some(&info("tod-a-3f9a1c", "TERMINATED"))), NameDecision::Make);
+    }
+
+    #[test]
+    fn a_recorded_sandbox_that_exists_is_reused_not_a_conflict() {
+        let recorded = vec!["tod-a-3f9a1c".to_string()];
+        let running = info("tod-a-3f9a1c", "DEPLOYED");
+        assert_eq!(decide_name("tod-a-3f9a1c", &recorded, Some(&running)), NameDecision::Reuse);
+        // One that can no longer run is replaced, not reused.
+        let failed = info("tod-a-3f9a1c", "FAILED");
+        assert_eq!(decide_name("tod-a-3f9a1c", &recorded, Some(&failed)), NameDecision::ReplaceDead);
+        let mut expired = info("tod-a-3f9a1c", "DEPLOYED");
+        expired.state = Some("EXPIRED".into());
+        assert_eq!(decide_name("tod-a-3f9a1c", &recorded, Some(&expired)), NameDecision::ReplaceDead);
+    }
+
+    #[test]
+    fn a_name_taken_by_a_sandbox_the_record_does_not_name_is_lost_track_and_nothing_is_made() {
+        let running = info("tod-a-3f9a1c", "DEPLOYED");
+        // No record at all, or a record naming a different sandbox.
+        assert_eq!(decide_name("tod-a-3f9a1c", &[], Some(&running)), NameDecision::Lost);
+        let other = vec!["node-a".to_string()];
+        assert_eq!(decide_name("tod-a-3f9a1c", &other, Some(&running)), NameDecision::Lost);
+        // A failed one the record does not name is no different: still not tod's to touch.
+        assert_eq!(decide_name("tod-a-3f9a1c", &[], Some(&info("tod-a-3f9a1c", "FAILED"))), NameDecision::Lost);
+        let msg = lost_track_error("tod-a-3f9a1c", "export-totals", ID, "DEPLOYED").to_string();
+        assert!(msg.contains("tod lost track of it"), "{msg}");
+        assert!(msg.contains("tod-a-3f9a1c") && msg.contains("export-totals") && msg.contains("3f9a1c"), "{msg}");
+        assert!(msg.contains("Nothing was made"), "{msg}");
+    }
+
+    #[test]
+    fn a_sandbox_being_deleted_is_waited_for() {
+        let recorded = vec!["tod-a-3f9a1c".to_string()];
+        let deleting = info("tod-a-3f9a1c", "DELETING");
+        assert_eq!(decide_name("tod-a-3f9a1c", &recorded, Some(&deleting)), NameDecision::WaitForDelete);
+        assert_eq!(decide_name("tod-a-3f9a1c", &[], Some(&deleting)), NameDecision::WaitForDelete);
+    }
+
+    #[test]
+    fn a_program_that_never_registered_a_sandbox_host_cannot_make_a_sandbox() {
+        let err = super::super::sandbox_host::host().err().expect("no host is registered in this test").to_string();
+        assert!(err.contains("never registered a sandbox host"), "{err}");
+    }
+
     use crate::fleet::test_util::{cleanup_fleet_root, temp_fleet_root};
     use crate::outline::types::Capability;
     use crate::outline::{CreatePosition, OutlineMutation};
