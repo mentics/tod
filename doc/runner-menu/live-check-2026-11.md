@@ -423,3 +423,27 @@ shared `tod-agentd` (pid 50287, built in another worktree).
     (`ps`) and, if it is not yours, ask its owner; killing it was refused here.
 13. A per-node worktree location needs Treehouse on the machine; without it the first
     turn says "spawn treehouse get --lease: No such file or directory" (clear and honest).
+
+## Pass 7, 2026-11-04 (cloud to host, same Claude session)
+
+Main at `dca48283`. Live-verify root, my own agent-socket port 47671. Sandbox
+binaries rebuilt locally; no orchestrator redeploy. `claude auth status`: logged in.
+
+### Setup: no build-test golden is possible, an image location is used
+
+A golden for `joel-cofactr/build-test` cannot be made: `golden refresh` forks the
+existing golden (a flagship checkout), a fork's checkout step refuses to clone
+(`allow_clone` is false for a fork), and `bake --repo` takes no private repository.
+So the node's cloud location uses **An image** (the default image), whose checkout
+step clones the node's repository through the proxy with the user's GitHub token.
+
+* Locations dialog: `RM p7 cloud` (cloud sandbox, default image, dir `/workspace/repo`)
+  and `RM p7 host` (this machine, "The directory itself", a scratch clone of build-test).
+* Node `RM p7 A` (`tod-cli node create`; Lifecycle added in the task editor; Files
+  override picks `RM p7 cloud`; Agent inherited).
+* **Gap 14:** the first chat fails with "no HTTPS repository URL for the cloud run
+  (/workspace/repo is not a checkout on this machine...)". The dialog refuses a URL as the
+  directory of a cloud location ("inside the sandbox"), yet an image-based location has no
+  sandbox yet to ask for its origin, and nothing in the UI or `tod-cli` sets a node's own
+  `repo`. The error text tells the user to set the Files directory to a URL, which the
+  dialog does not allow. Worked around by setting `node_fields.repo` in the root's `tod.db`.
