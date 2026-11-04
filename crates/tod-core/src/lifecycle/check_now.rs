@@ -222,6 +222,169 @@ mod tests {
         crate::pr_readiness::set_feed_override(None);
     }
 
+    /// A pull request as the feed shows it: ready for review (not a draft),
+    /// with the review threads given.
+    struct Ready(Vec<tod_store::github::ReviewThread>);
+    impl crate::pr_readiness::PrFeed for Ready {
+        fn snapshot(&self, _: &tod_store::github::NodePr) -> Result<PrSnapshot, String> {
+            Draft.snapshot(&tod_store::github::NodePr::new("acme", "app", 42)).map(|mut snap| {
+                snap.status.draft = false;
+                snap.status.mergeable_state = Some("clean".into());
+                snap.status.reviewers = vec!["maria".into()];
+                snap.threads = self.0.clone();
+                snap
+            })
+        }
+    }
+
+    fn open_thread() -> tod_store::github::ReviewThread {
+        tod_store::github::ReviewThread {
+            id: "t1".into(),
+            resolved: false,
+            outdated: false,
+            path: Some("src/lib.rs".into()),
+            line: Some(3),
+            comments: vec![tod_store::github::ThreadComment {
+                id: 1,
+                author: Some("reviewer".into()),
+                body: "please change".into(),
+                created_at: "2026-01-01T00:00:00Z".into(),
+                diff_hunk: None,
+            }],
+        }
+    }
+
+    fn link_pr(fx: &Fixture) {
+        fx.fleet
+            .enqueue_outline(OutlineMutation::EnableCapabilities {
+                node_id: fx.node,
+                capabilities: vec![Capability::Ticket],
+            })
+            .unwrap();
+        fx.fleet.writer().flush().unwrap();
+        fx.fleet
+            .enqueue(FleetMutation::UpdateTaskLinkedPrs {
+                id: fx.node.to_string(),
+                linked_prs: vec!["https://github.com/acme/app/pull/42".into()],
+            })
+            .unwrap();
+        fx.fleet.writer().flush().unwrap();
+        fx.fleet.reload_if_stale().ok();
+    }
+
+    fn ask_a_decision(fx: &Fixture) {
+        fx.fleet
+            .interview(
+                tod_store::interview::ACTOR_AGENT,
+                tod_store::interview::InterviewCommand::AskDecision {
+                    node_id: fx.node,
+                    conversation_id: None,
+                    protocol: None,
+                    decision: tod_store::decisions::NewDecision {
+                        question: "Which way?".into(),
+                        options: vec!["a".into(), "b".into()],
+                        evidence: Vec::new(),
+                        ..Default::default()
+                    },
+                },
+            )
+            .unwrap();
+    }
+
+    /// `pr_draft`, gate clear, the pull request ready for review: the node
+    /// moves on to `pr_review`, as the autopilot's gate step would.
+    #[test]
+    fn a_clear_gate_in_pr_draft_advances_once_the_pull_request_is_ready() {
+        let fx = fixture();
+        link_pr(&fx);
+        enable_lifecycle(&fx, "pr_draft");
+        retire_all_criteria(&fx);
+        crate::pr_readiness::set_feed_override(Some(Arc::new(Ready(Vec::new()))));
+        let found = check_now(&fx.fleet, fx.node, &fx.root).unwrap();
+        crate::pr_readiness::set_feed_override(None);
+        assert!(found.gate.clear(), "{found:?}");
+        assert_eq!(found.held, None, "{found:?}");
+        assert_eq!(found.advanced, Some("pr_review"), "{found:?}");
+        assert_eq!(current_state(&fx.fleet, fx.node).unwrap(), "pr_review");
+    }
+
+    /// The other hold rules of `pr_draft`: review feedback is for the agent,
+    /// and an open decision is for the user; the clear gate is not advanced
+    /// past either.
+    #[test]
+    fn a_clear_gate_in_pr_draft_is_held_by_feedback_and_by_an_open_decision() {
+        let fx = fixture();
+        link_pr(&fx);
+        enable_lifecycle(&fx, "pr_draft");
+        retire_all_criteria(&fx);
+        crate::pr_readiness::set_feed_override(Some(Arc::new(Ready(vec![open_thread()]))));
+        let found = check_now(&fx.fleet, fx.node, &fx.root).unwrap();
+        assert!(found.gate.clear() && found.advanced.is_none(), "{found:?}");
+        assert!(found.held.as_deref().is_some_and(|h| h.contains("needs the agent")), "{:?}", found.held);
+        assert!(matches!(found.github, Some(GithubCheck::Feedback { .. })), "{:?}", found.github);
+
+        crate::pr_readiness::set_feed_override(Some(Arc::new(Ready(Vec::new()))));
+        ask_a_decision(&fx);
+        let found = check_now(&fx.fleet, fx.node, &fx.root).unwrap();
+        crate::pr_readiness::set_feed_override(None);
+        assert!(found.gate.clear() && found.advanced.is_none(), "{found:?}");
+        assert!(found.held.as_deref().is_some_and(|h| h.contains("decision")), "{:?}", found.held);
+        assert_eq!(current_state(&fx.fleet, fx.node).unwrap(), "pr_draft");
+    }
+
+    /// `pr_review` reads GitHub only after it advances (`approved` waits on
+    /// the human review); an open decision holds it, and nothing else does.
+    #[test]
+    fn a_clear_gate_in_pr_review_advances_unless_a_decision_is_open() {
+        let fx = fixture();
+        link_pr(&fx);
+        enable_lifecycle(&fx, "pr_review");
+        retire_all_criteria(&fx);
+        crate::pr_readiness::set_feed_override(Some(Arc::new(Ready(Vec::new()))));
+        ask_a_decision(&fx);
+        let held = check_now(&fx.fleet, fx.node, &fx.root).unwrap();
+        assert!(held.gate.clear() && held.advanced.is_none(), "{held:?}");
+        assert!(held.held.as_deref().is_some_and(|h| h.contains("decision")), "{:?}", held.held);
+        assert_eq!(held.github, None, "pr_review does not read GitHub before its gate");
+        assert_eq!(current_state(&fx.fleet, fx.node).unwrap(), "pr_review");
+
+        // Answered: the next check goes on.
+        let pending = fx
+            .fleet
+            .read(|conn| Ok(tod_store::decisions::DecisionRepo::new(conn).list_pending_for_node(fx.node)?))
+            .unwrap();
+        for decision in pending {
+            fx.fleet
+                .interview(
+                    tod_store::interview::ACTOR_USER,
+                    tod_store::interview::InterviewCommand::AnswerDecision {
+                        decision_id: decision.id,
+                        option: Some(1),
+                        text: None,
+                    },
+                )
+                .unwrap();
+        }
+        let found = check_now(&fx.fleet, fx.node, &fx.root).unwrap();
+        crate::pr_readiness::set_feed_override(None);
+        assert_eq!(found.advanced, Some("approved"), "{found:?}");
+        assert_eq!(current_state(&fx.fleet, fx.node).unwrap(), "approved");
+        assert!(found.github.is_some(), "`approved` waits on GitHub, which is read after the move");
+    }
+
+    /// A clear gate in a state that does not wait on GitHub advances with no
+    /// hold and no GitHub read (`design` → its next state).
+    #[test]
+    fn a_clear_gate_elsewhere_advances_with_no_github_read() {
+        let fx = fixture();
+        enable_lifecycle(&fx, "design");
+        retire_all_criteria(&fx);
+        let found = check_now(&fx.fleet, fx.node, &fx.root).unwrap();
+        assert!(found.gate.clear());
+        assert!(found.advanced.is_some(), "{found:?}");
+        assert_eq!((found.held, found.github), (None, None));
+    }
+
     #[test]
     fn a_paused_runners_outcome_is_untouched() {
         let fx = fixture();
