@@ -89,6 +89,23 @@ pub fn before_wake_with(
     budget: Budget,
     run_requested: bool,
 ) -> Result<Before> {
+    before_wake_requested(fleet, node, state_dir, budget, run_requested, &[])
+}
+
+/// [`before_wake_with`]; `fresh_budget` are the pending `fresh_budget`
+/// requests (`tod_store::node_requests`), each of which grants another budget,
+/// once: its id is kept as handled, so a wake that leaves before the request
+/// is consumed does not grant it again. A budget the node's own stop question
+/// granted in this same call counts for it (one grant, not two).
+pub fn before_wake_requested(
+    fleet: &FleetStore,
+    node: Uuid,
+    state_dir: &Path,
+    budget: Budget,
+    run_requested: bool,
+    fresh_budget: &[Uuid],
+) -> Result<Before> {
+    let mut granted_now = false;
     let latest = fleet.read(|conn| stop_questions::latest(conn, node))?;
     let mut acted = load(state_dir)?;
     if let Some(latest) = latest {
@@ -109,6 +126,7 @@ pub fn before_wake_with(
                 if !acted.handled.contains(&key) {
                     if latest.kind == stop_questions::BUDGET {
                         acted.budget_grants += 1;
+                        granted_now = true;
                         tracing::info!(grants = acted.budget_grants, "the user granted another budget");
                     } else {
                         tracing::info!(kind = %latest.kind, "the user said to keep going");
@@ -119,6 +137,19 @@ pub fn before_wake_with(
             }
             Answer::Pending => {}
         }
+    }
+    for id in fresh_budget {
+        let key = format!("request:{id}");
+        if acted.handled.contains(&key) {
+            continue;
+        }
+        if !granted_now {
+            acted.budget_grants += 1;
+            granted_now = true;
+            tracing::info!(grants = acted.budget_grants, "the user asked for a fresh budget");
+        }
+        acted.handled.push(key);
+        save(state_dir, &acted)?;
     }
     Ok(Before::Go(granted(budget, acted.budget_grants)))
 }

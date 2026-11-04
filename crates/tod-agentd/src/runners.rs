@@ -31,10 +31,15 @@ use tod_core::autopilot::local::{FAILED_PREFIX, Live, LocalEvent, LocalRun, Requ
 use tod_core::autopilot::{AutopilotState, Budget, Outcome};
 use tod_core::conversation::ConversationConfig;
 use tod_core::next_actor::{self, NextActor, NodeStanding, YouReason};
+use tod_core::runner_place::RunnerPlace;
 use tod_store::activity::{ActivityRepo, Lease};
 use tod_store::deferrals::DeferralRepo;
 use tod_store::fleet::{FleetMutation, FleetStore};
 use uuid::Uuid;
+
+/// Why this daemon does not run a node whose Files are in a cloud sandbox.
+const SUPERVISED: &str = "this node's Files run in a cloud sandbox, so its autopilot runs under the \
+supervisor in that sandbox, not in the daemon on this machine";
 
 /// How often a run that ended to wait is checked for being due, and a run
 /// that stopped for a request for having been answered. The clock is read
@@ -130,6 +135,8 @@ struct SlotView {
     active_run: bool,
     /// The slot has no outcome: the run did not end in a way anyone knows.
     outcome_none: bool,
+    /// Where the node's run is hosted now (from its resolved Files).
+    place: RunnerPlace,
 }
 
 /// What the reconciler does about a node.
@@ -143,6 +150,10 @@ enum Action {
     /// Someone else's lease is live on a node that should not be running:
     /// say so. Only its owner can stop it.
     StopForeign { owner: String, kind: String },
+    /// The node should run, but it now runs in a cloud sandbox under the
+    /// supervisor, which this daemon does not host: say so, as the node's
+    /// failure, instead of starting it.
+    MovedToSandbox,
 }
 
 /// The one rule: desired state against evidence.
@@ -153,6 +164,8 @@ enum Action {
 ///   `You::Failed` for a lifecycle lease that stopped beating. Start it.
 ///   Every other actor has a reason (processing, a request, a wait, an
 ///   outcome) and is left to it.
+/// - Desired `run` on a node that now runs in a cloud sandbox: never start it
+///   here; report it ([`Action::MovedToSandbox`]).
 /// - Desired `pause` or `stop` and a live lifecycle lease: report it.
 fn decide(view: &SlotView, standing: Option<&NodeStanding>, leases: &[Lease], now: i64) -> Option<Action> {
     match view.desired {
@@ -160,6 +173,9 @@ fn decide(view: &SlotView, standing: Option<&NodeStanding>, leases: &[Lease], no
         Desired::Run => {
             if view.starting || view.active_run || !view.outcome_none {
                 return None;
+            }
+            if view.place == RunnerPlace::Supervisor {
+                return Some(Action::MovedToSandbox);
             }
             match &standing?.actor {
                 NextActor::You { why: YouReason::NotStarted, .. } => Some(Action::Start { lost: None }),
@@ -211,6 +227,24 @@ impl Runners {
     pub fn resume_saved(&self) {
         let root = self.inner.store.paths().root().to_path_buf();
         for (node, state) in load_saved(&root) {
+            match RunnerPlace::of(&self.inner.store, node) {
+                Ok(RunnerPlace::Local) => {}
+                Ok(RunnerPlace::Supervisor) => {
+                    // Its autopilot runs under the supervisor now: this run is
+                    // not resumed, and not kept as a slot, so nothing here
+                    // starts it later. A cut-off one is shown on the node.
+                    let err = anyhow!(SUPERVISED);
+                    tracing::error!(%node, "not resuming the saved local run: {err:#}");
+                    if state.outcome.is_none() {
+                        self.record_start_failure(node, &err);
+                    }
+                    continue;
+                }
+                Err(err) => {
+                    tracing::error!(%node, "could not tell where the saved run belongs, so it is not resumed: {err:#}");
+                    continue;
+                }
+            }
             match state.outcome {
                 None => {
                     tracing::info!(%node, "resuming the run the daemon was stopped on");
@@ -333,6 +367,16 @@ impl Runners {
         }
 
         let nodes: Vec<Uuid> = self.inner.slots.lock().expect("runner slots").keys().copied().collect();
+        let mut places: HashMap<Uuid, RunnerPlace> = HashMap::new();
+        for node in &nodes {
+            match RunnerPlace::of(store, *node) {
+                Ok(place) => {
+                    places.insert(*node, place);
+                }
+                // Without its place the node is left alone this tick.
+                Err(err) => errors.push(format!("{node}: {err:#}")),
+            }
+        }
         let mut leases: HashMap<Uuid, Vec<Lease>> = HashMap::new();
         for lease in store
             .read(|conn| ActivityRepo::new(conn).list_for_nodes(&nodes))
@@ -345,7 +389,7 @@ impl Runners {
             slots
                 .iter()
                 .filter_map(|(node, slot)| {
-                    let view = Self::view(slot);
+                    let view = Self::view(slot, *places.get(node)?);
                     let mine = leases.get(node).map(Vec::as_slice).unwrap_or(&[]);
                     decide(&view, standings.get(node), mine, now).map(|a| (*node, a))
                 })
@@ -363,8 +407,9 @@ impl Runners {
         if errors.is_empty() { Ok(()) } else { Err(anyhow!("{}", errors.join("; "))) }
     }
 
-    fn view(slot: &Slot) -> SlotView {
+    fn view(slot: &Slot, place: RunnerPlace) -> SlotView {
         SlotView {
+            place,
             desired: slot.desired,
             starting: slot.starting,
             active_run: slot.run.as_ref().is_some_and(|r| !r.is_finished()),
@@ -411,6 +456,12 @@ impl Runners {
                     },
                 }]);
                 started
+            }
+            Action::MovedToSandbox => {
+                let err = anyhow!(SUPERVISED);
+                tracing::error!(%node, "desired to run here, but: {err:#}");
+                self.record_start_failure(node, &err);
+                Err(err)
             }
             Action::StopOwn => {
                 let slots = self.inner.slots.lock().expect("runner slots");
@@ -470,6 +521,12 @@ impl Runners {
     /// is left alone. When it cannot be started the failure is recorded as
     /// the run's outcome (the node shows it) and returned.
     pub fn start(&self, node: Uuid, renew_budget: bool) -> Result<()> {
+        // Refused before anything is recorded: the run is not this daemon's, so
+        // a failure outcome saved here would only mask the supervisor's.
+        match RunnerPlace::of(&self.inner.store, node)? {
+            RunnerPlace::Local => {}
+            RunnerPlace::Supervisor => return Err(anyhow!(SUPERVISED)),
+        }
         {
             let mut slots = self.inner.slots.lock().expect("runner slots");
             let slot = slots.entry(node).or_default();
@@ -683,7 +740,15 @@ mod tests {
     const NOW: i64 = 1_000_000;
 
     fn view(desired: Desired) -> SlotView {
-        SlotView { desired, starting: false, active_run: false, outcome_none: true }
+        SlotView { desired, starting: false, active_run: false, outcome_none: true, place: RunnerPlace::Local }
+    }
+
+    #[test]
+    fn a_desired_run_on_a_sandbox_node_is_reported_never_started() {
+        let mut v = view(Desired::Run);
+        v.place = RunnerPlace::Supervisor;
+        let standing = you(YouReason::NotStarted);
+        assert_eq!(decide(&v, Some(&standing), &[], 1_000), Some(Action::MovedToSandbox));
     }
 
     fn standing(actor: NextActor) -> NodeStanding {
@@ -1017,6 +1082,78 @@ mod tests {
         store.reload_if_stale().unwrap();
         let rows = store.read(|c| DeferralRepo::new(c).list_all()).unwrap();
         assert!(rows.is_empty(), "{rows:?}");
+    }
+
+    /// Give the fixture's node Files that run in a cloud sandbox.
+    fn move_to_sandbox(fx: &Fixture) {
+        use tod_store::fleet::{DevContainerSetting, FilesPlace};
+        use tod_store::outline::Capability;
+        let fleet = &fx.runners.inner.store;
+        fleet
+            .enqueue_outline(OutlineMutation::EnableCapabilities {
+                node_id: fx.node,
+                capabilities: vec![Capability::Files],
+            })
+            .unwrap();
+        let place = FilesPlace {
+            id: Uuid::new_v4().to_string(),
+            name: "cloud".into(),
+            repo: Some("/src/app".into()),
+            dev_container: Some(DevContainerSetting { sandbox: true, ..Default::default() }),
+            ..Default::default()
+        };
+        let id = place.id.clone();
+        fleet.enqueue(FleetMutation::SaveFilesPlace { place }).unwrap();
+        fleet
+            .enqueue(FleetMutation::SetNodeFilesPlace { node_id: fx.node.to_string(), place_id: Some(id) })
+            .unwrap();
+        fleet.writer().flush().unwrap();
+        fleet.reload_if_stale().unwrap();
+        assert_eq!(RunnerPlace::of(fleet, fx.node).unwrap(), RunnerPlace::Supervisor);
+    }
+
+    #[test]
+    fn a_sandbox_node_is_refused_by_start_and_nothing_is_recorded() {
+        let fx = fixture();
+        move_to_sandbox(&fx);
+        let err = fx.runners.start(fx.node, false).unwrap_err();
+        assert!(format!("{err:#}").contains("supervisor"), "{err:#}");
+        assert!(!fx.runners.inner.slots.lock().unwrap().contains_key(&fx.node));
+        assert!(AutopilotState::load(&fx.root, fx.node).map_or(true, |s| s.outcome.is_none()));
+    }
+
+    #[test]
+    fn a_sandbox_node_is_not_resumed_and_a_cut_off_local_run_is_reported() {
+        let fx = fixture();
+        AutopilotState::fresh().save(&fx.root, fx.node).unwrap();
+        move_to_sandbox(&fx);
+        fx.runners.resume_saved();
+        // Not started, not kept as a slot, and shown on the node as failed.
+        let slots = fx.runners.inner.slots.lock().unwrap();
+        let slot = slots.get(&fx.node).expect("the failure is recorded");
+        assert!(slot.run.is_none() && !slot.starting);
+        assert!(matches!(slot.outcome, Some(Outcome::Stopped { ref reason }) if reason.contains("supervisor")));
+        drop(slots);
+        let saved = AutopilotState::load(&fx.root, fx.node).unwrap();
+        assert!(matches!(saved.outcome, Some(Outcome::Stopped { ref reason }) if reason.contains("supervisor")));
+    }
+
+    #[test]
+    fn the_reconciler_does_not_restart_a_node_that_moved_to_a_sandbox() {
+        let fx = fixture();
+        {
+            let mut slots = fx.runners.inner.slots.lock().unwrap();
+            slots.entry(fx.node).or_default().desired = Desired::Run;
+        }
+        move_to_sandbox(&fx);
+        let err = fx.runners.reconcile().unwrap_err();
+        assert!(format!("{err:#}").contains("supervisor"), "{err:#}");
+        assert!(matches!(standing_of(&fx).actor, NextActor::You { why: YouReason::Failed { .. }, .. }));
+        let slots = fx.runners.inner.slots.lock().unwrap();
+        assert!(slots[&fx.node].run.is_none());
+        drop(slots);
+        // Reported once: the outcome now explains the node.
+        fx.runners.reconcile().unwrap();
     }
 
     #[test]

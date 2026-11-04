@@ -445,11 +445,21 @@ pub struct Conversation {
     /// entered); `None` for every other kind.
     pub from_state: Option<String>,
     pub to_state: Option<String>,
+    /// Which group of the phase's skills (`lifecycle_config::groups`) it works
+    /// with: 0 is the phase agent's own session, any other a session of its
+    /// own for that later group.
+    pub skill_group: usize,
     pub created_at: i64,
     pub updated_at: i64,
 }
 
 impl Conversation {
+    /// What a list adds to a session for a later group of the phase's skills
+    /// (`" · skills 2"`); empty for the phase agent's own.
+    pub fn group_suffix(&self) -> String {
+        if self.skill_group == 0 { String::new() } else { format!(" \u{b7} skills {}", self.skill_group + 1) }
+    }
+
     /// What the picker says beside a gate check or on-entry run: the
     /// transition it checks, or the state it sets up. `None` for other kinds.
     pub fn transition_label(&self) -> Option<String> {

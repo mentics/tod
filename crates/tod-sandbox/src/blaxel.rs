@@ -13,6 +13,12 @@ pub const API: &str = "https://api.blaxel.ai/v0";
 /// The port the relay listens on inside every sandbox.
 pub const RELAY_PORT: u16 = 2222;
 
+/// The most a caller waits for a sandbox Blaxel is waking from standby to
+/// answer ([`Blaxel::wait_reachable`]). A ceiling, not a delay: the wait ends
+/// the moment the sandbox answers, and one that never does fails with an error
+/// naming this many seconds. Every wake in tod uses it.
+pub const WAKE_CEILING: Duration = Duration::from_secs(180);
+
 pub struct Blaxel {
     workspace: String,
     token: String,
@@ -65,18 +71,73 @@ pub fn classify_failure(status: u16, body: &str) -> FailureClass {
     match status {
         502 | 503 | 504 | 429 => transient,
         404 => {
-            let lower = body.to_ascii_lowercase();
-            if lower.contains("workload_unavailable")
-                || lower.contains("workload is not ready")
-                || lower.contains("not ready yet")
-            {
+            if says_not_ready(body) {
                 transient
             } else {
                 FailureClass::Gone
             }
         }
+        401 | 403 => FailureClass::Permanent,
+        // Blaxel's control plane says "Resource '<sandbox>' is currently not
+        // available" for a sandbox that is redeploying (seen live right after
+        // a proxy update); under whatever status, that is a wait.
+        _ if says_not_ready(body) => transient,
         _ => FailureClass::Permanent,
     }
+}
+
+/// Whether a reply's body, or an error's text, says the workload or resource
+/// is not ready yet, so the same call would work a moment later. The one list
+/// of those phrases: [`classify_failure`] and [`error_is_not_ready`] read it.
+pub fn says_not_ready(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    ["workload_unavailable", "workload is not ready", "not ready yet", "currently not available"]
+        .iter()
+        .any(|marker| lower.contains(marker))
+}
+
+/// [`says_not_ready`] for an error that went through the API's error text
+/// (it keeps the code and message), or a wait that gave up on one.
+pub fn error_is_not_ready(err: &anyhow::Error) -> bool {
+    says_not_ready(&format!("{err:#}"))
+}
+
+/// Whether a failure (as its error text reads, causes included) looks
+/// temporary, so the same call is worth making again a minute later: the
+/// platform is not ready ([`says_not_ready`], or a wait that gave up on it), it
+/// answered 429/502/503/504, or the call timed out or could not reach it (a
+/// dropped or refused connection, a failed lookup). Everything else, a 401/403,
+/// another 4xx, a refusal of what was asked, is not: retrying it would repeat
+/// the same answer. A deliberately plain text match, because errors cross
+/// `anyhow` layers (a checkpoint's, a command's) with only their text left.
+pub fn error_is_transient(err: &anyhow::Error) -> bool {
+    text_is_transient(&format!("{err:#}"))
+}
+
+/// [`error_is_transient`] over the text.
+pub fn text_is_transient(text: &str) -> bool {
+    if says_not_ready(text) {
+        return true;
+    }
+    let lower = text.to_ascii_lowercase();
+    [
+        "was still not ready",
+        "did not wake",
+        "429 too many requests",
+        "502 bad gateway",
+        "503 service unavailable",
+        "504 gateway timeout",
+        "timed out",
+        "timeout",
+        "connection refused",
+        "connection reset",
+        "connection closed",
+        "dns error",
+        "failed to lookup",
+        "network is unreachable",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
 }
 
 /// The reply of a call that was not retried away: the response, or the
@@ -245,6 +306,17 @@ fn update_proxy_body(current: &Value, proxy: &Value, labels: &[(&str, &str)]) ->
         merged.insert(k.to_string(), json!(v));
     }
     json!({ "metadata": { "name": current["metadata"]["name"], "labels": merged }, "spec": spec })
+}
+
+/// The body of a `PUT /sandboxes/<name>` that sets `labels` on `current`
+/// (its `GET` record) and nothing else; see [`update_proxy_body`] for why the
+/// whole spec goes back.
+fn update_labels_body(current: &Value, labels: &[(&str, &str)]) -> Value {
+    let mut merged = current["metadata"]["labels"].as_object().cloned().unwrap_or_default();
+    for (k, v) in labels {
+        merged.insert(k.to_string(), json!(v));
+    }
+    json!({ "metadata": { "name": current["metadata"]["name"], "labels": merged }, "spec": current["spec"] })
 }
 
 fn check(resp: &mut ureq::http::Response<ureq::Body>, what: &str) -> Result<()> {
@@ -461,6 +533,14 @@ impl Blaxel {
         let current = self.get_json(name)?.ok_or_else(|| anyhow::anyhow!("no sandbox named {name}"))?;
         let body = update_proxy_body(&current, proxy, labels);
         self.put_json(&format!("/sandboxes/{name}"), &body, "update the sandbox's proxy")
+    }
+
+    /// Sets `labels` on a sandbox (the others stay) and changes nothing else
+    /// about it: its proxy, environment, and disk are as they were.
+    pub fn set_labels(&self, name: &str, labels: &[(&str, &str)]) -> Result<()> {
+        let current = self.get_json(name)?.ok_or_else(|| anyhow::anyhow!("no sandbox named {name}"))?;
+        let body = update_labels_body(&current, labels);
+        self.put_json(&format!("/sandboxes/{name}"), &body, "set the sandbox's labels")
     }
 
     /// `PUT {API}{path}` with a JSON body, for calls this type has no method for.
@@ -1067,6 +1147,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn transient_errors_are_told_from_permanent_ones() {
+        for transient in [
+            "delete sandbox: 503 Service Unavailable",
+            "get sandbox: sandbox API: timeout: global",
+            "delete: sandbox API: io: Connection refused (os error 61)",
+            "x: the sandbox was still not ready after 90s and 5 attempts; last answer: 404",
+            "x: 404 Not Found\nWORKLOAD_UNAVAILABLE",
+        ] {
+            assert!(text_is_transient(transient), "{transient}");
+        }
+        for permanent in [
+            "delete: not authorized (401 Unauthorized); check the workspace and credentials",
+            "the checkpoint could not push: remote rejected (non-fast-forward)",
+            "x: 400 Bad Request\ninvalid name",
+            "tod lost track of it",
+        ] {
+            assert!(!text_is_transient(permanent), "{permanent}");
+        }
+    }
+
+    #[test]
     fn a_proxy_update_keeps_the_rest_of_the_spec() {
         let current = json!({
             "metadata": { "name": "s", "labels": { "tod": "1", "tod-creds": "old" }, "url": "https://x" },
@@ -1084,6 +1185,17 @@ mod tests {
         assert_eq!(body["spec"]["network"]["proxy"], proxy);
         assert_eq!(body["metadata"]["labels"], json!({ "tod": "1", "tod-creds": "new" }));
         assert_eq!(body["metadata"]["name"], "s");
+    }
+
+    #[test]
+    fn a_label_update_changes_only_the_labels() {
+        let current = json!({
+            "metadata": { "name": "s", "labels": { "tod": "1", "ready": "false" } },
+            "spec": { "runtime": { "image": "img" }, "network": { "proxy": { "routing": [] } } },
+        });
+        let body = update_labels_body(&current, &[("ready", "true"), ("tod-install", "abc")]);
+        assert_eq!(body["spec"], current["spec"]);
+        assert_eq!(body["metadata"]["labels"], json!({ "tod": "1", "ready": "true", "tod-install": "abc" }));
     }
 
     #[test]
@@ -1243,6 +1355,16 @@ mod http_tests {
         assert_eq!(classify_failure(404, ""), FailureClass::Gone);
         assert_eq!(classify_failure(400, "bad"), FailureClass::Permanent);
         assert_eq!(classify_failure(500, "boom"), FailureClass::Permanent);
+        // The control plane's "currently not available" is a wait under any
+        // status but an authorization failure.
+        let gone = r#"{"error":{"message":"Resource 'sbx-x' is currently not available"}}"#;
+        for status in [400, 404, 409, 500] {
+            assert!(matches!(classify_failure(status, gone), FailureClass::Transient { .. }), "{status}");
+        }
+        assert_eq!(classify_failure(403, gone), FailureClass::Permanent);
+        assert!(error_is_not_ready(&anyhow::anyhow!("set labels: 409\nResource 'sbx-x' is currently not available")));
+        assert!(error_is_not_ready(&anyhow::anyhow!("run command: the sandbox was still not ready after 90s; last answer: 404 (WORKLOAD_UNAVAILABLE)")));
+        assert!(!error_is_not_ready(&anyhow::anyhow!("making /opt/tod failed: no space left")));
     }
 
     #[test]

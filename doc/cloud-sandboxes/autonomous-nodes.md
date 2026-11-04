@@ -2,7 +2,7 @@
 
 Status: built and running on the development workspace (September–October
 2026): the supervisor (`tod-supervisor`), the orchestrator
-(`tod-orchestrator`), the watchdog, the app's sync and "Run in the cloud"
+(`tod-orchestrator`), the watchdog, the app's sync and Start
 (`tod_core::cloud_sync`), and node transcripts on Agent Drive. "To verify"
 records what was measured; the parts still unmeasured are named where they
 come up. It builds on the sandbox transport in
@@ -12,26 +12,28 @@ come up. It builds on the sandbox transport in
 
 ## Where a node runs, and closing the app
 
-Two different things share the word "cloud", and only one keeps working when
-the app closes:
+A node has **one sandbox**, the one its Files location records
+(`node_files_locations.sandbox`; `doc/runner-menu/design.md`). It is made by
+one function (`provision::make_sandbox`) and is always able to host the
+supervisor, whether or not the node ever runs there. Where a node runs is
+decided by where its files are (`tod_core::runner_place`):
 
-| The node's Files capability is… | The loop (the lifecycle autopilot) runs… | With the app closed |
+| The node's Files capability is... | The loop (the lifecycle autopilot) runs... | With the app closed |
 |---|---|---|
-| this machine, a worktree, a dev container | in the app | stops where it is; restarted at the next launch |
-| a cloud sandbox, and the node is **started** | in the app (only the agent's commands run in the sandbox) | stops, as above |
-| a cloud sandbox, and the node is **run in the cloud** | in the node's own sandbox, as the supervisor | **keeps going** until it is done or needs the user |
+| this machine, a worktree, a dev container | in the daemon (`tod-agentd`) on this machine | **keeps going** while the daemon runs (it outlives the app); a stop is resumed by Resume |
+| a cloud sandbox | in the node's own sandbox, as the supervisor | **keeps going** until it is done or needs the user |
 
-Running in the cloud is a choice made on the node (the task panel's runner
-button: it is the default when the node's Files are a cloud sandbox, and "Run
-on this machine" is in its menu). Closing the app with such a node running
-shows the close warning in yellow ("running in the cloud"), never red, and
-closing goes ahead. On the next launch the app syncs (`sync_on_start`), so the
-node's lifecycle state, requests, and finished work are current when its panel
-is shown. A node counts as running in the cloud (the tree's running glyph,
-the close warning) only while it waits on nothing: no pending wait and no
-request for the user (`tod_core::cloud_sync::working_in_cloud`). The
-supervisor reports no heartbeat, so a supervisor that died mid-turn still
-reads as running. The one thing that does need the app is replacing a sandbox that was
+Where a node runs follows from where its Files are: the task panel's Start
+starts the loop in the place that says, and Migrate to... moves a node between
+places. Closing the app with a supervised node running shows the close
+warning in yellow ("running in the cloud"), never red, and closing goes
+ahead. On the next launch the app syncs (`sync_on_start`), so the node's
+lifecycle state, requests, and finished work are current when its panel is
+shown. A node counts as running in the cloud (the tree's running glyph, the
+close warning) only while its supervisor's heartbeat is live
+(`tod_core::cloud_sync::working_in_cloud`, from `next_actor`'s `Working`): one
+that is idle, stopped, waiting, or whose supervisor stopped beating is not
+working. The one thing that does need the app is replacing a sandbox that was
 lost while it was closed (see Where data lives).
 
 ## Goal
@@ -323,7 +325,7 @@ then:
    the timer instead; see Development account.)
 2. Releases its hold. The sandbox is in standby about 15 s later.
 
-**A new session on request.** The task panel's "Run with a new session" uploads
+**A new session on request.** The task panel's "Run with a new session" (for a supervised node) uploads
 an empty `fresh-session` file into the node's supervisor state directory
 (`tod_core::autopilot::FRESH_SESSION_REQUEST_FILE`) and pokes it
 (`cloud_sync::wake_node_with`); nothing is reinstalled. A sleeping supervisor
@@ -492,18 +494,20 @@ sessions at the same sizes before the agent started, and the session it then
 began was mirrored in full too. Not yet checked: that a restored session
 resumes by id, and the mount under a long run with many small appends.
 
-### Interactive sandboxes
+### Session logs kept by the app
 
-A Files "Cloud sandbox" node has no supervisor, so the app keeps the agent's
-session logs itself (`tod_store::fleet::session_log`). Claude writes a session
+The app also keeps the agent's session logs itself, for the turns it drives
+(chat, hand-started conversations; a supervisor's turns run inside the sandbox
+and are mirrored as above) (`tod_store::fleet::session_log`). Claude writes a session
 to `<claude dir>/projects/<cwd with every non-alphanumeric replaced by
 '-'>/<session id>.jsonl` (`/workspace/repo` -> `-workspace-repo`). After each
 turn the app copies the new complete lines out of the sandbox (over the relay,
 off the UI thread) into `<data root>/sandbox-sessions/<node>/<project>__<id>.jsonl`,
-and once more before it deletes the sandbox to recreate it
-(`provision::refresh_sandbox_proxy`). Any sandbox it makes for the node
-(`make_sandbox`: a changed credential, a lost sandbox replaced) gets the logs
-back at the same `projects/<project>/` path, so the conversation's recorded
+and again before a sandbox is deleted (the menu's Delete sandbox, the
+automatic delete at `done`, Migrate, and the recreate in
+`provision::refresh_sandbox_proxy`). Any sandbox it makes for the node
+(`make_sandbox`: a changed credential, a lost sandbox replaced, Start after a
+delete) gets the logs back at the same `projects/<project>/` path, so the conversation's recorded
 `agent_session_id` resumes the same session. If the restore fails the
 conversation falls back to a fresh session (rotation). A turn still running
 when a sandbox is lost is not mirrored. Moving these onto Agent Drive is not done yet.
@@ -534,7 +538,7 @@ reply reached the app's store while its turn ran and was gone after it.
   flag, are decisions marked as stop questions (`tod_core::stop_questions`);
   an answer syncs to the orchestrator, which pokes the node (so does the
   answer to any decision the node's agent raised: its run stopped as
-  `needs_human` and schedules no wake of its own). "Keep going"
+  `needs_human` and schedules no wake of its own). "Keep going" (now Resume)
   resets the failure count or grants another budget of the same size;
   "Leave it stopped" / "Leave it asleep" keeps the node stopped with no
   wake scheduled until the user answers again. See `orchestrator.md`.
@@ -633,7 +637,7 @@ The plan:
   a shim sends it: its own proxy has no GitHub rule.
 
   Measured (September 2026, `testspace-358401`, node sandbox
-  `node-cloud-test` created by "Run in the cloud" with the user's GitHub
+  `node-cloud-test` created by Start with the user's GitHub
   token, mock agent, on the throwaway `octocat/Hello-World` checkout; all
   GitHub traffic read-only except the supervisor's own branch push):
 
@@ -694,7 +698,7 @@ The plan:
   it starts, so shells and other processes the relay starts do not get it),
   never into the sandbox-wide environment. Claude Code, the supervisor's
   child, then holds the real token, and so can anything it runs.
-  "Run in the cloud" and the replacement of a lost sandbox fail before
+  Start and the replacement of a lost sandbox fail before
   creating anything when no token is stored and the node would run Claude
   (anything but `TOD_CLOUD_AGENT=mock`), naming the Settings row.
   **A token changed later** reaches a Files sandbox in place

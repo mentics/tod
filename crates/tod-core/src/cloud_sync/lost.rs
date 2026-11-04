@@ -6,7 +6,7 @@
 //!   `cloud_nodes.lost_at`; the app checks every cloud node against Blaxel on
 //!   start ([`Check::Full`]) and, after any sync that brings a lost mark,
 //!   those ([`Check::Marked`]). Either way it replaces the sandbox through
-//!   [`super::ensure_node_sandbox`], the path "Run in the cloud" takes: only
+//!   [`super::ensure_supervisor`], the path Start takes: only
 //!   the app holds the user's tokens. How that went is kept per node for the
 //!   status line ([`note`]).
 //! - [`stop_running_in_cloud`] is the user leaving the cloud: the row goes
@@ -17,7 +17,7 @@
 //! Everything here blocks on the network or the database: never call it on
 //! the UI thread ([`spawn_check`] runs on a thread of its own).
 
-use super::{CloudSyncState, ensure_node_sandbox, record_cloud_node, resolve, sandbox_is_dead, sync};
+use super::{CloudSyncState, ensure_supervisor, record_cloud_node, resolve, sandbox_is_dead, sync};
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -68,7 +68,7 @@ pub fn forget_gone_sandboxes(
 
 /// How long a node whose replacement failed is left alone by [`Check::Marked`].
 /// Its mark stays set, so without this every sync would fork a sandbox again,
-/// fail the same way, and delete it. A new "Run in the cloud" for the node
+/// fail the same way, and delete it. A new Start for the node
 /// ([`forget_failure`]) or the next start ([`Check::Full`]) tries sooner.
 const RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 
@@ -114,7 +114,9 @@ fn set_note(node_id: &str, text: Option<String>) {
 
 /// Moves node records older builds kept in `cloud-sync.json` into the
 /// `cloud_nodes` table (keeping a row already there), then drops them from
-/// the file.
+/// the file. The row's sandbox is taken from the node's Files location (the
+/// one record of it), so a legacy record of a node whose location names no
+/// sandbox cannot be adopted: it stays in the file and the error names it.
 pub fn adopt_legacy_records(fleet: &FleetStore) -> Result<usize> {
     let root = fleet.paths().root();
     let mut state = CloudSyncState::load(root)?;
@@ -122,22 +124,37 @@ pub fn adopt_legacy_records(fleet: &FleetStore) -> Result<usize> {
         return Ok(0);
     }
     let mut adopted = 0;
+    let mut kept = Vec::new();
+    let mut unadopted = Vec::new();
     for (id, node) in &state.nodes {
         let Ok(uuid) = uuid::Uuid::parse_str(id) else { continue };
-        if fleet.read(|c| cloud_nodes::get(c, uuid))?.is_none() && fleet.get_node(id)?.is_some() {
-            fleet.enqueue(FleetMutation::CloudNodeUpsert {
-                node: uuid,
-                sandbox: node.sandbox.clone(),
-                user: node.user.clone(),
-                accepted_at: node.accepted_at_ms,
-            })?;
-            adopted += 1;
+        if fleet.read(|c| cloud_nodes::get(c, uuid))?.is_some() || fleet.get_node(id)?.is_none() {
+            continue;
         }
+        if tod_store::fleet::session_log::node_sandbox(fleet, id)?.is_none() {
+            kept.push(id.clone());
+            unadopted.push(format!("{id} (it named sandbox {})", node.sandbox));
+            continue;
+        }
+        fleet.enqueue(FleetMutation::CloudNodeUpsert {
+            node: uuid,
+            user: node.user.clone(),
+            accepted_at: node.accepted_at_ms,
+        })?;
+        adopted += 1;
     }
     fleet.writer().flush()?;
-    state.nodes.clear();
+    state.nodes.retain(|id, _| kept.contains(id));
     state.save(root)?;
     let _ = fleet.reload_if_stale();
+    if !unadopted.is_empty() {
+        anyhow::bail!(
+            "an old node record in {} was not moved into the database because the node's Files location records no \
+             sandbox: {}",
+            super::STATE_FILE,
+            unadopted.join(", ")
+        );
+    }
     Ok(adopted)
 }
 
@@ -161,6 +178,63 @@ pub fn retire_done(fleet: &FleetStore) -> Result<usize> {
     Ok(done.len())
 }
 
+/// The rows of `rows` whose node's Files location records the sandbox the
+/// row's copy names. A row whose copy differs from its location is reported
+/// to the user naming both and left alone, never silently fixed; so is a live
+/// row of this client's whose node has no location sandbox (a record made
+/// before the location was the one record). A row that is lost or was deleted
+/// on purpose, or another client's (it has no location here and this machine
+/// does not act on its sandbox), is skipped without a word.
+pub fn located_rows(fleet: &FleetStore, rows: Vec<CloudNodeRow>, root: &std::path::Path) -> Result<Vec<CloudNodeRow>> {
+    let me = super::client_id(root)?;
+    let mut consistent = Vec::new();
+    for row in rows {
+        let id = row.node_id.to_string();
+        match tod_store::fleet::session_log::node_sandbox(fleet, &id)? {
+            Some(located) if located == row.sandbox => {
+                // Agrees now: an earlier report no longer stands.
+                crate::node_problems::clear(fleet, &id, tod_store::node_problems::KIND_CLOUD_RECORD)?;
+                consistent.push(row)
+            }
+            Some(located) => report_record_problem(
+                fleet,
+                &id,
+                format!(
+                    "The cloud record of node {id} names sandbox {} but its Files location records {located}; \
+                     nothing was changed. Start the node again to make the record follow its location.",
+                    row.sandbox
+                ),
+            )?,
+            None => {
+                let mine = row.ownership.owner_client.as_deref().is_none_or(|owner| owner == me);
+                if row.lost_at.is_none() && mine && !super::sandbox_deleted_by_user(root, &id) {
+                    report_record_problem(
+                        fleet,
+                        &id,
+                        format!(
+                            "The cloud record of node {id} names sandbox {} but its Files location records none; \
+                             it is not acted on until the sandbox is adopted (the node's runner menu: \
+                             \"Adopt existing sandbox\") or Start makes a new one.",
+                            row.sandbox
+                        ),
+                    )?;
+                } else {
+                    crate::node_problems::clear(fleet, &id, tod_store::node_problems::KIND_CLOUD_RECORD)?;
+                }
+            }
+        }
+    }
+    Ok(consistent)
+}
+
+/// Tells the user about a record that disagrees with the node's location, on
+/// the node itself (`tod_store::node_problems`): one row per node, and the
+/// same message again writes nothing, so a check that runs after every sync
+/// does not wake the views each time.
+fn report_record_problem(fleet: &FleetStore, node_id: &str, message: String) -> Result<()> {
+    crate::node_problems::report(fleet, node_id, tod_store::node_problems::KIND_CLOUD_RECORD, message)
+}
+
 /// What a [`check`] repaired.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Repaired {
@@ -180,9 +254,19 @@ pub fn check(fleet: &FleetStore, check: Check) -> Result<Repaired> {
     if let Err(err) = adopt_legacy_records(fleet) {
         tracing::warn!("cloud: moving old node records into the database: {err:#}");
     }
+    if check == Check::Full {
+        // Only what is unambiguous; the rest is told to the node (B5).
+        match super::adopt::adopt_at_start(fleet) {
+            Ok(adopted) if !adopted.is_empty() => {
+                tracing::info!("cloud: adopted {} old sandbox(es): {}", adopted.len(), adopted.join(", "))
+            }
+            Ok(_) => {}
+            Err(err) => tracing::error!("cloud: adopting old sandboxes: {err:#}"),
+        }
+    }
     let (orch, user) = resolve(&root)?;
     sync(fleet, &root, &orch, &user)?;
-    let rows = fleet.read(cloud_nodes::list)?;
+    let rows = located_rows(fleet, fleet.read(cloud_nodes::list)?, &root)?;
     if rows.is_empty() {
         return Ok(Repaired::default());
     }
@@ -264,15 +348,15 @@ fn replace(fleet: &FleetStore, root: &std::path::Path, row: &CloudNodeRow, owner
     set_note(&id, Some(format!("Its sandbox {} was gone; replacing it…", row.sandbox)));
     let mut progress = |msg: &str| super::log_progress(&format!("replacing {}", row.sandbox), msg);
     let result = tod_store::activity::with_lease(fleet, row.node_id, tod_store::activity::KIND_CLOUD_REPAIR, owner, || {
-        ensure_node_sandbox(fleet, root, &id, &row.user, &mut progress)
-            .and_then(|name| record_cloud_node(fleet, &id, name, &row.user))
+        ensure_supervisor(fleet, root, &id, true, &mut progress)
+            .and_then(|name| record_cloud_node(fleet, &id, &row.user).map(|_| name))
     })
     .and_then(|r| r);
     match result {
-        Ok(node) => {
+        Ok(name) => {
             set_failed(&id, false);
             let when = chrono::Local::now().format("%Y-%m-%d %H:%M");
-            set_note(&id, Some(format!("Its sandbox was gone; the app replaced it with {} at {when}.", node.sandbox)));
+            set_note(&id, Some(format!("Its sandbox was gone; the app replaced it with {name} at {when}.")));
             true
         }
         Err(err) => {
@@ -324,94 +408,30 @@ pub enum Refresh {
     NeedsConfirmation(String),
 }
 
-/// Whether `info`'s proxy was made with exactly `custom` (its `tod-env`
-/// label; a sandbox from before the label counts as having none).
-pub fn proxy_is_current(info: &SandboxInfo, custom: &[tod_sandbox::node::CustomCredential]) -> bool {
-    tod_store::fleet::sandbox::proxy_is_current(info, custom)
-}
-
 /// A credential the user provides (or changes) after a node's sandbox was
-/// made does not reach its proxy by itself. A Files sandbox's proxy is updated
-/// in place ([`Refresh::Updated`]). For an autonomous node, when its live
-/// sandbox's proxy differs from the node's Environment, push its branch and
-/// delete the sandbox, then make it
-/// again through [`ensure_node_sandbox`] (as for a lost sandbox). Uncommitted
-/// changes or a failed push make it [`Refresh::NeedsConfirmation`] unless
-/// `force`. Blocks on the network: never on the UI thread.
+/// made does not reach its proxy by itself. **One path for every node
+/// sandbox** ([`tod_store::fleet::provision::refresh_sandbox_proxy`]): when its
+/// `tod-creds` label differs from the rules the node's credentials make now
+/// (the orchestrator's and Blaxel's included), the proxy is replaced in place
+/// ([`Refresh::Updated`]), losing nothing. Only a sandbox made without a proxy
+/// is deleted and made again ([`Refresh::Recreated`], by the one creator), and
+/// uncommitted changes or a failed push make that
+/// [`Refresh::NeedsConfirmation`] unless `force`. Blocks on the network: never
+/// on the UI thread.
 pub fn refresh_credentials(fleet: &FleetStore, node_id: &str, force: bool) -> Result<Refresh> {
-    let root = fleet.paths().root().to_path_buf();
-    let uuid = uuid::Uuid::parse_str(node_id).with_context(|| format!("node id {node_id}"))?;
-    let Some(row) = fleet.read(|c| cloud_nodes::get(c, uuid))? else {
-        // Not an autonomous cloud node: maybe an interactive one, in a
-        // sandbox of its own made from its Files settings.
-        let mut progress = |msg: &str| tracing::info!("files sandbox for {node_id}: {msg}");
-        return Ok(match tod_store::fleet::provision::refresh_sandbox_proxy(fleet, node_id, force, &mut progress)? {
-            SandboxRefresh::NotNeeded => Refresh::NotNeeded,
-            SandboxRefresh::Updated(name) => {
-                set_note(node_id, Some(format!("Updated {name}'s proxy with the node's credentials.")));
-                Refresh::Updated(name)
-            }
-            SandboxRefresh::Recreated(name) => {
-                set_note(node_id, Some(format!("Recreated {name} with the node's credentials.")));
-                Refresh::Recreated(name)
-            }
-            SandboxRefresh::NeedsConfirmation(why) => Refresh::NeedsConfirmation(why),
-        });
-    };
-    let mut sandboxes = tod_store::fleet::sandbox::Sandboxes::load(&root)?;
-    let bx = sandboxes.blaxel()?;
-    let Some(info) = bx.get(&row.sandbox)? else {
-        return Ok(Refresh::NotNeeded);
-    };
-    if sandbox_is_dead(&info) {
-        return Ok(Refresh::NotNeeded);
-    }
-    let creds = tod_store::CredentialStore::from_data_root(&root);
-    let custom = super::environment_credentials(fleet, &creds, node_id)?;
-    if proxy_is_current(&info, &custom) {
-        return Ok(Refresh::NotNeeded);
-    }
-    if !force && let Some(url) = info.url.as_deref() {
-        let script = format!(
-            "cd \"{dir}\" || exit 3; if [ -n \"$(git status --porcelain)\" ]; then echo DIRTY; exit 4; fi;              git push origin HEAD 2>&1 || {{ echo PUSHFAIL; exit 5; }}",
-            dir = tod_sandbox::node::WORKSPACE_PROBE
-        );
-        let cmd = format!("sh -c {} 2>&1", tod_sandbox::relay::shell_quote(&script));
-        match bx.run(url, &cmd, 120) {
-            Ok(res) if res.exit_code == 0 => {}
-            Ok(res) if res.exit_code == 4 => {
-                return Ok(Refresh::NeedsConfirmation(format!(
-                    "{} holds uncommitted changes that recreating it would lose",
-                    row.sandbox
-                )));
-            }
-            Ok(_) | Err(_) => {
-                return Ok(Refresh::NeedsConfirmation(format!(
-                    "the branch could not be pushed from {}, so recreating it could lose commits",
-                    row.sandbox
-                )));
-            }
+    let mut progress = |msg: &str| tracing::info!("sandbox for {node_id}: {msg}");
+    Ok(match tod_store::fleet::provision::refresh_sandbox_proxy(fleet, node_id, force, &mut progress)? {
+        SandboxRefresh::NotNeeded => Refresh::NotNeeded,
+        SandboxRefresh::Updated(name) => {
+            set_note(node_id, Some(format!("Updated {name}'s proxy with the node's credentials.")));
+            Refresh::Updated(name)
         }
-    }
-    set_note(node_id, Some("A credential was provided; recreating its sandbox so the proxy has it…".into()));
-    sandboxes.delete(&bx, &row.sandbox).with_context(|| format!("delete sandbox {}", row.sandbox))?;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
-    while bx.get(&row.sandbox)?.is_some() && std::time::Instant::now() < deadline {
-        std::thread::sleep(std::time::Duration::from_secs(2));
-    }
-    let mut progress = |msg: &str| super::log_progress(&format!("recreating {}", row.sandbox), msg);
-    let result = ensure_node_sandbox(fleet, &root, node_id, &row.user, &mut progress)
-        .and_then(|name| record_cloud_node(fleet, node_id, name, &row.user));
-    match result {
-        Ok(node) => {
-            set_note(node_id, Some(format!("Recreated {} with the node's credentials.", node.sandbox)));
-            Ok(Refresh::Recreated(node.sandbox))
+        SandboxRefresh::Recreated(name) => {
+            set_note(node_id, Some(format!("Recreated {name} with the node's credentials.")));
+            Refresh::Recreated(name)
         }
-        Err(err) => {
-            set_note(node_id, Some(format!("Its sandbox was deleted for a new credential and could not be recreated: {err:#}")));
-            Err(err)
-        }
-    }
+        SandboxRefresh::NeedsConfirmation(why) => Refresh::NeedsConfirmation(why),
+    })
 }
 
 static CHECKING: AtomicBool = AtomicBool::new(false);
@@ -453,57 +473,33 @@ pub fn any_marked(fleet: &FleetStore) -> bool {
     })
 }
 
-/// The user takes `node_id` out of the cloud: its row goes, then (when
-/// `delete_sandbox`) its sandbox, and the change is synced so the
-/// orchestrator and the node's supervisor stop treating it as running.
-pub fn stop_running_in_cloud(fleet: &FleetStore, node_id: &str, delete_sandbox: bool) -> Result<String> {
-    stop_running_in_cloud_with(fleet, node_id, delete_sandbox, false)
-}
-
-/// [`stop_running_in_cloud`] for a sandbox whose checkpoint failed: deletes
-/// it without keeping its uncommitted work ("Delete anyway").
-pub fn stop_running_in_cloud_anyway(fleet: &FleetStore, node_id: &str, delete_sandbox: bool) -> Result<String> {
-    stop_running_in_cloud_with(fleet, node_id, delete_sandbox, true)
-}
-
-fn stop_running_in_cloud_with(fleet: &FleetStore, node_id: &str, delete_sandbox: bool, force: bool) -> Result<String> {
+/// Tells the orchestrator that a node left its sandbox (its location, and
+/// with it the `cloud_nodes` row, were removed by
+/// [`tod_store::fleet::provision::remove_location`]), so it and the node's
+/// supervisor stop treating the node as running there. Does nothing before
+/// the first seeding. Blocks on the network.
+pub fn announce_left_cloud(fleet: &FleetStore, node_id: &str) -> Result<()> {
     let root = fleet.paths().root().to_path_buf();
-    let uuid = uuid::Uuid::parse_str(node_id).with_context(|| format!("node id {node_id}"))?;
-    let row = fleet.read(|c| cloud_nodes::get(c, uuid))?;
-    if delete_sandbox && let Some(row) = &row {
-        let sandboxes = tod_store::fleet::sandbox::Sandboxes::load(&root)?;
-        if !force {
-            checkpoint_for_delete(&sandboxes.blaxel()?, node_id, &row.sandbox)?;
-        }
-    }
-    fleet.enqueue(FleetMutation::CloudNodeRemove { node: uuid })?;
-    fleet.writer().flush()?;
-    let _ = fleet.reload_if_stale();
     set_note(node_id, None);
     super::set_sandbox_deleted_by_user(&root, node_id, false)?;
-    let mut message = "No longer runs in the cloud.".to_string();
-    if delete_sandbox && let Some(row) = &row {
-        let mut sandboxes = tod_store::fleet::sandbox::Sandboxes::load(&root)?;
-        let bx = sandboxes.blaxel()?;
-        if bx.get(&row.sandbox).with_context(|| format!("look up sandbox {}", row.sandbox))?.is_none() {
-            sandboxes.forget(&row.sandbox)?;
-            message = format!("No longer runs in the cloud; sandbox {} was already gone.", row.sandbox);
-        } else {
-            sandboxes.delete(&bx, &row.sandbox).with_context(|| format!("delete sandbox {}", row.sandbox))?;
-            message = format!("No longer runs in the cloud; sandbox {} deleted.", row.sandbox);
-        }
-    }
     if CloudSyncState::load(&root).is_ok_and(|s| s.seeded) {
         let (orch, user) = resolve(&root)?;
         sync(fleet, &root, &orch, &user)?;
     }
-    Ok(message)
+    Ok(())
 }
 
-/// Deletes the node's cloud sandbox in Blaxel, leaving its `cloud_nodes` row
-/// marked lost and remembering the user did it, so no lost-sandbox check
-/// replaces it: only running the node in the cloud again does. A sandbox Blaxel does not have
-/// is not an error: the message says so. Blocks on the network.
+/// Deletes the node's sandbox in Blaxel: the one its Files location records
+/// (`node_files_locations.sandbox`), the one record of it. The uncommitted
+/// work is checkpointed first (it comes back when a sandbox is next made),
+/// the location is forgotten, and a `cloud_nodes` row is left marked lost,
+/// remembering the user did it, so no lost-sandbox check replaces it: only
+/// starting the node again does. A sandbox Blaxel does not have is not an
+/// error: the message says so.
+///
+/// Refuses while the node's runner is active ([`runner_blocker`]): the caller
+/// stops it first. A node whose location records no sandbox is an error
+/// saying so. Blocks on the network.
 pub fn delete_node_sandbox(fleet: &FleetStore, node_id: &str) -> Result<String> {
     delete_node_sandbox_with(fleet, node_id, false)
 }
@@ -515,46 +511,295 @@ pub fn delete_node_sandbox_anyway(fleet: &FleetStore, node_id: &str) -> Result<S
     delete_node_sandbox_with(fleet, node_id, true)
 }
 
-/// Keeps the sandbox's uncommitted work before it is deleted. A failure says
-/// so and why, and that nothing was deleted; it is never swallowed.
-fn checkpoint_for_delete(bx: &tod_sandbox::blaxel::Blaxel, node_id: &str, name: &str) -> Result<()> {
-    let explain = |err: anyhow::Error| {
-        err.context(format!(
-            "the checkpoint of sandbox {name} failed, so nothing was deleted; delete it anyway to discard its uncommitted work"
-        ))
+/// How long [`stop_and_delete_node_sandbox`] waits, and how often it looks.
+#[derive(Debug, Clone, Copy)]
+struct StopBounds {
+    /// Between two looks at whether the runner has ended.
+    poll: std::time::Duration,
+    /// A local run: how long the daemon has to end it before the delete is refused.
+    local_within: std::time::Duration,
+    /// A supervised run: how long the supervisor has to stop (its heartbeat
+    /// goes stale after `STALE_AFTER_MS` anyway), after which the sandbox is
+    /// deleted regardless.
+    supervised_within: std::time::Duration,
+}
+
+const STOP_BOUNDS: StopBounds = StopBounds {
+    poll: std::time::Duration::from_secs(4),
+    local_within: std::time::Duration::from_secs(30),
+    supervised_within: std::time::Duration::from_millis(tod_store::cloud_activity::STALE_AFTER_MS as u64 + 5_000),
+};
+
+/// Stops a node's runner and looks at how it is going, so stop-then-delete
+/// can be tested without a daemon or a supervisor.
+trait RunnerStopper {
+    fn stop(&mut self, fleet: &FleetStore, node_id: &str, place: crate::runner_place::RunnerPlace) -> Result<()>;
+    /// One pause between looks; a supervised run also syncs, so the
+    /// supervisor's report reaches this machine.
+    fn wait_step(
+        &mut self,
+        fleet: &FleetStore,
+        place: crate::runner_place::RunnerPlace,
+        poll: std::time::Duration,
+    ) -> Result<()>;
+}
+
+struct RealStopper;
+
+impl RunnerStopper for RealStopper {
+    fn stop(&mut self, fleet: &FleetStore, node_id: &str, place: crate::runner_place::RunnerPlace) -> Result<()> {
+        let root = fleet.paths().root().to_path_buf();
+        match place {
+            crate::runner_place::RunnerPlace::Supervisor => {
+                super::wake_node_requesting(fleet, &root, node_id, super::REQUEST_STOP_NOW)
+                    .context("ask the supervisor to stop now")?;
+            }
+            crate::runner_place::RunnerPlace::Local => {
+                // A run hosted in this process (no daemon) is stopped by the
+                // caller, which holds it (`NodeRunners::stop_now`); the
+                // daemon's runs are stopped here.
+                if fleet.is_client() {
+                    let uuid = uuid::Uuid::parse_str(node_id).with_context(|| format!("node id {node_id}"))?;
+                    tod_agentd_client::remote::DaemonWriter::new(&root, None)
+                        .runner_stop(uuid)
+                        .context("ask the daemon to stop the node's runner")?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn wait_step(
+        &mut self,
+        fleet: &FleetStore,
+        place: crate::runner_place::RunnerPlace,
+        poll: std::time::Duration,
+    ) -> Result<()> {
+        std::thread::sleep(poll);
+        if place == crate::runner_place::RunnerPlace::Supervisor {
+            let root = fleet.paths().root().to_path_buf();
+            let (orch, user) = resolve(&root)?;
+            sync(fleet, &root, &orch, &user).context("sync to see whether the supervisor has stopped")?;
+        }
+        Ok(())
+    }
+}
+
+/// [`delete_node_sandbox`] (or [`delete_node_sandbox_anyway`] when
+/// `checkpoint` is false) for a node whose runner may be active: the runner
+/// is stopped first and the delete waits for it to end.
+///
+/// - **Local:** the daemon's runner stop (a run hosted in this process is
+///   stopped by the caller), then until the run's activity lease ends; if it
+///   does not end in 30 seconds the delete is refused with that error.
+/// - **Supervised:** the `stop_now` request (row, marker, poke), then syncs
+///   until the supervisor's heartbeat ends, bounded by the stale-heartbeat
+///   window; if it does not stop in time the progress line says so and the
+///   sandbox, and the supervisor in it, is deleted anyway (the checkpoint
+///   still runs first when `checkpoint`).
+///
+/// A node whose runner is not active is simply deleted. Blocks.
+pub fn stop_and_delete_node_sandbox(
+    fleet: &FleetStore,
+    node_id: &str,
+    checkpoint: bool,
+    progress: &mut dyn FnMut(&str),
+) -> Result<String> {
+    let mut backend = BlaxelBackend::load(fleet.paths().root())?;
+    stop_and_delete_with(fleet, node_id, !checkpoint, progress, &mut RealStopper, STOP_BOUNDS, &mut backend)
+}
+
+fn stop_and_delete_with(
+    fleet: &FleetStore,
+    node_id: &str,
+    force: bool,
+    progress: &mut dyn FnMut(&str),
+    stopper: &mut dyn RunnerStopper,
+    bounds: StopBounds,
+    backend: &mut dyn SandboxBackend,
+) -> Result<String> {
+    use crate::runner_place::RunnerPlace;
+    let uuid = uuid::Uuid::parse_str(node_id).with_context(|| format!("node id {node_id}"))?;
+    let mut runner_ignored = false;
+    if runner_blocker(fleet, node_id)?.is_some() {
+        progress("Stopping, then deleting the sandbox\u{2026}");
+        let place = RunnerPlace::of(fleet, uuid)?;
+        stopper.stop(fleet, node_id, place)?;
+        let within = match place {
+            RunnerPlace::Local => bounds.local_within,
+            RunnerPlace::Supervisor => bounds.supervised_within,
+        };
+        let deadline = std::time::Instant::now() + within;
+        while let Some(why) = runner_blocker(fleet, node_id)? {
+            if std::time::Instant::now() >= deadline {
+                match place {
+                    RunnerPlace::Local => anyhow::bail!(
+                        "the sandbox was not deleted: {why} still, {} seconds after it was told to stop",
+                        within.as_secs()
+                    ),
+                    RunnerPlace::Supervisor => {
+                        progress(&format!(
+                            "The supervisor did not report stopping within {} seconds ({why}); deleting the sandbox anyway.",
+                            within.as_secs()
+                        ));
+                        runner_ignored = true;
+                        break;
+                    }
+                }
+            }
+            stopper.wait_step(fleet, place, bounds.poll)?;
+        }
+    }
+    let plan = delete_plan_with(fleet, node_id, !runner_ignored)?;
+    delete_with(fleet, node_id, &plan, force, backend)
+}
+
+/// Why the node's runner is active, when it is: a live `run` activity lease
+/// (a local run, which the daemon hosts) or a live supervisor heartbeat (a run
+/// in the cloud). A stale lease or heartbeat is not a runner.
+pub fn runner_blocker(fleet: &FleetStore, node_id: &str) -> Result<Option<String>> {
+    let uuid = uuid::Uuid::parse_str(node_id).with_context(|| format!("node id {node_id}"))?;
+    fleet.reload_if_stale()?;
+    let now = tod_store::outline::uuid_blob::now_ms();
+    fleet.read(|conn| {
+        let leases = tod_store::activity::ActivityRepo::new(conn).list_for_nodes(&[uuid])?;
+        if let Some(lease) = leases.iter().find(|l| l.kind == tod_store::activity::KIND_RUN && l.is_live(now)) {
+            return Ok(Some(format!("its runner is active (held by {})", lease.owner)));
+        }
+        let beats = tod_store::cloud_activity::list_for_nodes(conn, &[uuid])?;
+        Ok(beats
+            .iter()
+            .find(|b| b.is_live(now))
+            .map(|_| "its supervisor in the cloud is working on it".to_string()))
+    })
+}
+
+/// What a delete acts on: the node's sandbox, as its Files location names it.
+struct DeletePlan {
+    /// The Files location, which names the sandbox.
+    location: tod_store::fleet::FilesLocation,
+    /// The `cloud_nodes` row (a copy of the location's sandbox), when there is one.
+    row: Option<CloudNodeRow>,
+    /// The location's sandbox.
+    sandbox: String,
+}
+
+fn delete_plan(fleet: &FleetStore, node_id: &str) -> Result<DeletePlan> {
+    delete_plan_with(fleet, node_id, true)
+}
+
+/// `check_runner` false: the caller stopped the runner, waited, and chose to
+/// delete although the supervisor did not report stopping.
+fn delete_plan_with(fleet: &FleetStore, node_id: &str, check_runner: bool) -> Result<DeletePlan> {
+    let uuid = uuid::Uuid::parse_str(node_id).with_context(|| format!("node id {node_id}"))?;
+    let location = tod_store::fleet::provision::node_location(fleet, node_id)?.filter(|l| l.sandbox().is_some());
+    let Some(location) = location else {
+        anyhow::bail!("this node has no sandbox: its Files location records none");
     };
-    super::checkpoint_before_delete(bx, node_id, name).map_err(explain)
+    let sandbox = location.sandbox().unwrap_or_default().to_string();
+    let row = fleet.read(|c| cloud_nodes::get(c, uuid))?;
+    if check_runner && let Some(why) = runner_blocker(fleet, node_id)? {
+        anyhow::bail!("the sandbox was not deleted: {why}; stop it first");
+    }
+    Ok(DeletePlan { location, row, sandbox })
+}
+
+/// The Blaxel side of a delete, so the rest can be tested without Blaxel.
+trait SandboxBackend {
+    fn exists(&mut self, name: &str) -> Result<bool>;
+    /// Keeps the node's uncommitted work, found through its Files location;
+    /// an error means nothing may be deleted.
+    fn checkpoint(&mut self, fleet: &FleetStore, node_id: &str, name: &str) -> Result<()>;
+    fn delete(&mut self, name: &str) -> Result<()>;
+    /// Drops the record of a sandbox that is already gone.
+    fn forget(&mut self, name: &str) -> Result<()>;
+}
+
+struct BlaxelBackend {
+    sandboxes: tod_store::fleet::sandbox::Sandboxes,
+    bx: tod_sandbox::blaxel::Blaxel,
+}
+
+impl BlaxelBackend {
+    fn load(root: &std::path::Path) -> Result<Self> {
+        let sandboxes = tod_store::fleet::sandbox::Sandboxes::load(root)?;
+        let bx = sandboxes.blaxel()?;
+        Ok(Self { sandboxes, bx })
+    }
+}
+
+impl SandboxBackend for BlaxelBackend {
+    fn exists(&mut self, name: &str) -> Result<bool> {
+        Ok(self.bx.get(name).with_context(|| format!("look up sandbox {name}"))?.is_some())
+    }
+
+    fn checkpoint(&mut self, fleet: &FleetStore, node_id: &str, name: &str) -> Result<()> {
+        tod_store::fleet::node_checkpoint::checkpoint_node(fleet, node_id).map(|_| ()).map_err(|err| {
+            err.context(format!(
+                "the checkpoint of sandbox {name} failed, so nothing was deleted; delete it anyway to discard its uncommitted work"
+            ))
+        })
+    }
+
+    fn delete(&mut self, name: &str) -> Result<()> {
+        self.sandboxes.delete(&self.bx, name).with_context(|| format!("delete sandbox {name}"))
+    }
+
+    fn forget(&mut self, name: &str) -> Result<()> {
+        self.sandboxes.forget(name)
+    }
 }
 
 fn delete_node_sandbox_with(fleet: &FleetStore, node_id: &str, force: bool) -> Result<String> {
+    let plan = delete_plan(fleet, node_id)?;
+    let mut backend = BlaxelBackend::load(fleet.paths().root())?;
+    delete_with(fleet, node_id, &plan, force, &mut backend)
+}
+
+fn delete_with(
+    fleet: &FleetStore,
+    node_id: &str,
+    plan: &DeletePlan,
+    force: bool,
+    backend: &mut dyn SandboxBackend,
+) -> Result<String> {
     let root = fleet.paths().root().to_path_buf();
     let uuid = uuid::Uuid::parse_str(node_id).with_context(|| format!("node id {node_id}"))?;
-    let row = fleet
-        .read(|c| cloud_nodes::get(c, uuid))?
-        .context("this node does not run in the cloud")?;
-    let mut sandboxes = tod_store::fleet::sandbox::Sandboxes::load(&root)?;
-    let bx = sandboxes.blaxel()?;
-    let message = if bx.get(&row.sandbox).with_context(|| format!("look up sandbox {}", row.sandbox))?.is_none() {
-        sandboxes.forget(&row.sandbox)?;
-        format!("Sandbox {} not found; nothing to delete.", row.sandbox)
-    } else if force {
-        sandboxes.delete(&bx, &row.sandbox).with_context(|| format!("delete sandbox {}", row.sandbox))?;
-        format!("Deleted sandbox {} without keeping its uncommitted work.", row.sandbox)
+    // Everything is kept before anything is deleted: a failed checkpoint
+    // leaves the sandbox as it was.
+    let name = plan.sandbox.as_str();
+    let present = backend.exists(name)?;
+    if present {
+        if !force {
+            backend.checkpoint(fleet, node_id, name)?;
+        }
+        backend.delete(name)?;
     } else {
-        checkpoint_for_delete(&bx, node_id, &row.sandbox)?;
-        sandboxes.delete(&bx, &row.sandbox).with_context(|| format!("delete sandbox {}", row.sandbox))?;
-        format!("Deleted sandbox {}; any uncommitted work was kept on the remote and comes back when the node runs in the cloud again.", row.sandbox)
-    };
-    // The sandbox is gone either way: record it so the panel offers to run the node again.
-    super::set_sandbox_deleted_by_user(&root, node_id, true)?;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0);
-    fleet.enqueue(FleetMutation::CloudNodeMarkLost { node: uuid, at: now })?;
+        backend.forget(name)?;
+    }
+    tod_store::fleet::sandbox::forget_cached(name);
+    // The location goes; the row's copy of its sandbox stays, marked lost
+    // below, until a Start records a new location.
+    fleet.enqueue(FleetMutation::DeleteFilesLocation { node_id: plan.location.node_id.clone() })?;
+    if plan.row.is_some() {
+        // The sandbox is gone either way: record it so the panel offers to start the node again.
+        super::set_sandbox_deleted_by_user(&root, node_id, true)?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        fleet.enqueue(FleetMutation::CloudNodeMarkLost { node: uuid, at: now })?;
+    }
     fleet.writer().flush()?;
     let _ = fleet.reload_if_stale();
-    Ok(message)
+    let names = name;
+    Ok(match (present, force) {
+        (false, _) => format!("Sandbox {names} not found; nothing to delete."),
+        (true, true) => format!("Deleted sandbox {names} without keeping its uncommitted work."),
+        (true, false) => format!(
+            "Deleted sandbox {names}; any uncommitted work was kept on the remote and comes back when a sandbox is next made for the node."
+        ),
+    })
 }
 
 #[cfg(test)]
@@ -618,25 +863,6 @@ mod tests {
     }
 
     #[test]
-    fn a_proxy_is_current_when_its_label_matches_the_credentials() {
-        let mut info = sandbox("node-a", "DEPLOYED");
-        assert!(proxy_is_current(&info, &[]));
-        let cred = tod_sandbox::node::CustomCredential {
-            name: "gb".into(),
-            hosts: vec!["api.growthbook.io".into()],
-            header: "Authorization".into(),
-            template: "Bearer {value}".into(),
-            secret_value: "v".into(),
-        };
-        assert!(!proxy_is_current(&info, std::slice::from_ref(&cred)));
-        info.labels = vec![(
-            tod_sandbox::node::ENV_LABEL.to_string(),
-            tod_sandbox::node::env_fingerprint(std::slice::from_ref(&cred)),
-        )];
-        assert!(proxy_is_current(&info, std::slice::from_ref(&cred)));
-    }
-
-    #[test]
     fn a_sandbox_missing_dead_or_marked_is_lost() {
         let rows = [
             row("node-up", None),
@@ -666,5 +892,477 @@ mod tests {
         assert_eq!(note(&id).as_deref(), Some("replaced"));
         set_note(&id, None);
         assert_eq!(note(&id), None);
+    }
+
+    /// A fleet with one node, and what a delete's tests need around it.
+    struct Fx {
+        root: std::path::PathBuf,
+        fleet: FleetStore,
+        node: Uuid,
+    }
+
+    impl Drop for Fx {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn fx() -> Fx {
+        use tod_store::outline::OutlineMutation;
+        let root = std::env::temp_dir().join(format!("tod-lost-delete-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let fleet = FleetStore::open(&root).unwrap();
+        fleet.enqueue_outline(OutlineMutation::CreateList { slug: "t".into(), title: "T".into() }).unwrap();
+        fleet.writer().flush().unwrap();
+        let list_id = fleet.list_outline_lists().unwrap()[0].id;
+        fleet
+            .enqueue_outline(OutlineMutation::CreateNode {
+                node_id: None,
+                list_id,
+                parent_id: None,
+                anchor_id: None,
+                position: tod_store::outline::CreatePosition::Below,
+                title: "N".into(),
+            })
+            .unwrap();
+        fleet.writer().flush().unwrap();
+        fleet.reload_if_stale().unwrap();
+        let node = fleet.flatten_outline(list_id).unwrap()[0].node.id;
+        Fx { root, fleet, node }
+    }
+
+    impl Fx {
+        fn id(&self) -> String {
+            self.node.to_string()
+        }
+
+        fn locate(&self, sandbox: &str) {
+            self.fleet
+                .enqueue(FleetMutation::RecordFilesLocation {
+                    location: tod_store::fleet::FilesLocation {
+                        node_id: self.id(),
+                        source_node_id: self.id(),
+                        recipe: String::new(),
+                        repo: None,
+                        container: None,
+                        worktree_path: None,
+                        worktree_lease_id: None,
+                        worktree_lease_holder: None,
+                        sandbox: Some(sandbox.into()),
+                        created_at: 0,
+                    },
+                })
+                .unwrap();
+            self.fleet.writer().flush().unwrap();
+        }
+
+        /// The node's `cloud_nodes` row, made the way the app does: its
+        /// sandbox is taken from the Files location, which must name one.
+        fn cloud_row(&self) {
+            self.fleet
+                .enqueue(FleetMutation::CloudNodeUpsert { node: self.node, user: "alice".into(), accepted_at: 1 })
+                .unwrap();
+            self.fleet.writer().flush().unwrap();
+        }
+
+        /// A row naming `sandbox` directly: what an older build, or the
+        /// orchestrator's sync, left (the app's writer cannot make one).
+        fn raw_row(&self, sandbox: &str) {
+            let conn = rusqlite::Connection::open(self.fleet.paths().db()).unwrap();
+            cloud_nodes::upsert(&conn, self.node, sandbox, "alice", 1).unwrap();
+            drop(conn);
+            self.fleet.reload_if_stale().unwrap();
+        }
+
+        fn location(&self) -> Option<tod_store::fleet::FilesLocation> {
+            tod_store::fleet::provision::node_location(&self.fleet, &self.id()).unwrap()
+        }
+
+        fn row(&self) -> Option<CloudNodeRow> {
+            self.fleet.reload_if_stale().unwrap();
+            self.fleet.read(|c| cloud_nodes::get(c, self.node)).unwrap()
+        }
+
+        fn run(&self, force: bool, backend: &mut Fake) -> Result<String> {
+            let plan = delete_plan(&self.fleet, &self.id())?;
+            delete_with(&self.fleet, &self.id(), &plan, force, backend)
+        }
+    }
+
+    #[derive(Default)]
+    struct Fake {
+        /// Sandboxes Blaxel has.
+        has: Vec<String>,
+        checkpoint_fails: bool,
+        checkpointed: Vec<String>,
+        deleted: Vec<String>,
+        forgotten: Vec<String>,
+    }
+
+    impl SandboxBackend for Fake {
+        fn exists(&mut self, name: &str) -> Result<bool> {
+            Ok(self.has.iter().any(|n| n == name))
+        }
+        fn checkpoint(&mut self, _: &FleetStore, _: &str, name: &str) -> Result<()> {
+            if self.checkpoint_fails {
+                anyhow::bail!("disk full");
+            }
+            self.checkpointed.push(name.into());
+            Ok(())
+        }
+        fn delete(&mut self, name: &str) -> Result<()> {
+            self.deleted.push(name.into());
+            Ok(())
+        }
+        fn forget(&mut self, name: &str) -> Result<()> {
+            self.forgotten.push(name.into());
+            Ok(())
+        }
+    }
+
+    fn has(names: &[&str]) -> Fake {
+        Fake { has: names.iter().map(|n| n.to_string()).collect(), ..Default::default() }
+    }
+
+    #[test]
+    fn a_node_with_only_a_files_location_deletes_that_sandbox_and_forgets_it() {
+        let fx = fx();
+        fx.locate("node-a");
+        let mut fake = has(&["node-a"]);
+        fx.run(false, &mut fake).unwrap();
+        assert_eq!(fake.checkpointed, ["node-a"]);
+        assert_eq!(fake.deleted, ["node-a"]);
+        assert!(fx.location().is_none(), "the location is forgotten");
+        assert!(fx.row().is_none());
+    }
+
+    /// The live bug: a node with only a cloud row (no location) was deleted
+    /// through the row. The location is the one record, so there is nothing
+    /// to delete and the error says so; the row's copy is not acted on.
+    #[test]
+    fn a_node_with_only_a_cloud_row_has_no_sandbox_to_delete() {
+        let fx = fx();
+        fx.raw_row("node-b");
+        let mut fake = has(&["node-b"]);
+        let err = format!("{:#}", fx.run(false, &mut fake).unwrap_err());
+        assert!(err.contains("no sandbox") && err.contains("Files location"), "{err}");
+        assert!(fake.deleted.is_empty() && fake.checkpointed.is_empty());
+        assert!(fx.row().unwrap().lost_at.is_none(), "the row is left as it was");
+    }
+
+    #[test]
+    fn a_located_node_with_a_cloud_row_deletes_the_sandbox_once_and_marks_the_row_lost() {
+        let fx = fx();
+        fx.locate("node-c");
+        fx.cloud_row();
+        assert_eq!(fx.row().unwrap().sandbox, "node-c", "the writer copied the location's sandbox");
+        let mut fake = has(&["node-c"]);
+        fx.run(false, &mut fake).unwrap();
+        assert_eq!(fake.checkpointed.len(), 1);
+        assert_eq!(fake.deleted, ["node-c"]);
+        assert!(fx.location().is_none());
+        assert!(fx.row().unwrap().lost_at.is_some());
+        assert!(crate::cloud_sync::sandbox_deleted_by_user(&fx.root, &fx.id()));
+    }
+
+    #[test]
+    fn a_row_copy_that_names_another_sandbox_is_not_deleted() {
+        let fx = fx();
+        fx.locate("node-d1");
+        fx.raw_row("node-d2");
+        let mut fake = has(&["node-d1", "node-d2"]);
+        fx.run(false, &mut fake).unwrap();
+        assert_eq!(fake.deleted, ["node-d1"], "only the location's sandbox is the node's");
+    }
+
+    #[test]
+    fn a_sandbox_blaxel_lacks_is_forgotten_not_an_error() {
+        let fx = fx();
+        fx.locate("node-e");
+        let mut fake = has(&[]);
+        let message = fx.run(false, &mut fake).unwrap();
+        assert!(message.contains("not found"), "{message}");
+        assert_eq!(fake.forgotten, ["node-e"]);
+        assert!(fx.location().is_none());
+    }
+
+    #[test]
+    fn a_failed_checkpoint_deletes_nothing() {
+        let fx = fx();
+        fx.locate("node-f");
+        fx.cloud_row();
+        let mut fake = Fake { checkpoint_fails: true, ..has(&["node-f"]) };
+        let err = format!("{:#}", fx.run(false, &mut fake).unwrap_err());
+        assert!(err.contains("disk full"), "{err}");
+        assert!(fake.deleted.is_empty());
+        assert!(fx.location().is_some(), "the location is kept");
+        assert!(fx.row().unwrap().lost_at.is_none(), "the row is not marked");
+        // "Delete anyway" skips the checkpoint.
+        let mut fake = Fake { checkpoint_fails: true, ..has(&["node-f"]) };
+        fx.run(true, &mut fake).unwrap();
+        assert_eq!(fake.deleted, ["node-f"]);
+    }
+
+    impl Fx {
+        /// The messages of the node's recorded cloud-record problems.
+        fn problems(&self) -> Vec<String> {
+            self.fleet.reload_if_stale().unwrap();
+            crate::node_problems::for_node(&self.fleet, self.node)
+                .unwrap()
+                .into_iter()
+                .filter(|p| p.kind == tod_store::node_problems::KIND_CLOUD_RECORD)
+                .map(|p| p.message)
+                .collect()
+        }
+    }
+
+    fn rows_of(fx: &Fx) -> Vec<CloudNodeRow> {
+        fx.fleet.read(cloud_nodes::list).unwrap()
+    }
+
+    #[test]
+    fn a_row_whose_copy_matches_its_location_is_checked_and_a_differing_one_is_reported_not_fixed() {
+        let fx = fx();
+        fx.locate("node-1");
+        fx.cloud_row();
+        let ok = located_rows(&fx.fleet, rows_of(&fx), &fx.root).unwrap();
+        assert_eq!(ok.len(), 1);
+        assert!(fx.problems().is_empty());
+
+        fx.raw_row("node-elsewhere");
+        let ok = located_rows(&fx.fleet, rows_of(&fx), &fx.root).unwrap();
+        assert!(ok.is_empty(), "a row that disagrees with its location is not acted on");
+        let problems = fx.problems();
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(
+            problems[0].contains("node-elsewhere") && problems[0].contains("node-1"),
+            "the error names both: {}",
+            problems[0]
+        );
+        // Checked again (every sync does): still one report, not two.
+        located_rows(&fx.fleet, rows_of(&fx), &fx.root).unwrap();
+        assert_eq!(fx.problems().len(), 1);
+        assert_eq!(fx.row().unwrap().sandbox, "node-elsewhere", "never silently fixed");
+        assert_eq!(fx.location().unwrap().sandbox(), Some("node-1"));
+
+        // The record follows its location (Start again): the report goes.
+        fx.raw_row("node-1");
+        assert_eq!(located_rows(&fx.fleet, rows_of(&fx), &fx.root).unwrap().len(), 1);
+        assert!(fx.problems().is_empty(), "agreement clears the report");
+    }
+
+    #[test]
+    fn a_live_row_with_no_location_is_reported_and_a_lost_or_foreign_one_is_not() {
+        let fx = fx();
+        fx.raw_row("node-old");
+        assert!(located_rows(&fx.fleet, rows_of(&fx), &fx.root).unwrap().is_empty());
+        let problems = fx.problems();
+        assert!(problems.len() == 1 && problems[0].contains("records none"), "{problems:?}");
+
+        // Marked lost (a deleted sandbox): nothing to say.
+        fx.fleet.enqueue(FleetMutation::CloudNodeMarkLost { node: fx.node, at: 3 }).unwrap();
+        fx.fleet.writer().flush().unwrap();
+        fx.fleet.reload_if_stale().unwrap();
+        assert!(located_rows(&fx.fleet, rows_of(&fx), &fx.root).unwrap().is_empty());
+        assert!(fx.problems().is_empty(), "no longer true, so the report is dropped");
+
+        // Another client's row has no location here and is not this machine's to act on.
+        let mut foreign = rows_of(&fx);
+        foreign[0].lost_at = None;
+        foreign[0].ownership.owner_client = Some("app-someone-else".into());
+        assert!(located_rows(&fx.fleet, foreign, &fx.root).unwrap().is_empty());
+        assert!(fx.problems().is_empty());
+    }
+
+    #[test]
+    fn a_legacy_record_is_adopted_only_for_a_node_whose_location_names_a_sandbox() {
+        let fx = fx();
+        let mut state = CloudSyncState::default();
+        state.nodes.insert(
+            fx.id(),
+            crate::cloud_sync::LegacyCloudNode {
+                sandbox: "node-old".into(),
+                user: "alice".into(),
+                accepted_at_ms: 7,
+                lost_at: None,
+            },
+        );
+        state.save(&fx.root).unwrap();
+        let err = format!("{:#}", adopt_legacy_records(&fx.fleet).unwrap_err());
+        assert!(err.contains(&fx.id()) && err.contains("node-old") && err.contains("Files location"), "{err}");
+        assert!(fx.row().is_none(), "nothing was adopted");
+        assert_eq!(CloudSyncState::load(&fx.root).unwrap().nodes.len(), 1, "the record stays in the file");
+
+        fx.locate("node-new");
+        assert_eq!(adopt_legacy_records(&fx.fleet).unwrap(), 1);
+        let row = fx.row().unwrap();
+        assert_eq!((row.sandbox.as_str(), row.accepted_at), ("node-new", 7), "the sandbox is the location's");
+        assert!(CloudSyncState::load(&fx.root).unwrap().nodes.is_empty());
+        assert_eq!(adopt_legacy_records(&fx.fleet).unwrap(), 0, "idempotent");
+    }
+
+    #[test]
+    fn a_location_naming_no_sandbox_is_an_error_saying_so() {
+        let fx = fx();
+        let err = delete_plan(&fx.fleet, &fx.id()).err().expect("no sandbox").to_string();
+        assert!(err.contains("no sandbox"), "{err}");
+    }
+
+    #[test]
+    fn a_live_run_lease_refuses_the_delete_and_a_stale_one_does_not() {
+        use tod_store::activity::{KIND_RUN, STALE_AFTER_MS};
+        let fx = fx();
+        fx.locate("node-g");
+        let now = tod_store::outline::uuid_blob::now_ms();
+        let start = |at: i64| {
+            fx.fleet
+                .enqueue(FleetMutation::ActivityStart { id: Uuid::new_v4(), node: fx.node, kind: KIND_RUN.into(), owner: "daemon".into(), at })
+                .unwrap();
+            fx.fleet.writer().flush().unwrap();
+        };
+        start(now);
+        let err = delete_plan(&fx.fleet, &fx.id()).err().expect("refused").to_string();
+        assert!(err.contains("runner is active") && err.contains("stop it first"), "{err}");
+        let conn = rusqlite::Connection::open(fx.fleet.paths().db()).unwrap();
+        conn.execute("DELETE FROM node_activity", []).unwrap();
+        drop(conn);
+        start(now - STALE_AFTER_MS - 1_000);
+        delete_plan(&fx.fleet, &fx.id()).expect("a stale lease is not a runner");
+    }
+
+    #[test]
+    fn a_live_supervisor_heartbeat_refuses_the_delete() {
+        let fx = fx();
+        fx.locate("node-h");
+        fx.cloud_row();
+        let now = tod_store::outline::uuid_blob::now_ms();
+        let conn = rusqlite::Connection::open(fx.fleet.paths().db()).unwrap();
+        tod_store::cloud_activity::beat(&conn, fx.node, "active", now).unwrap();
+        drop(conn);
+        let err = delete_plan(&fx.fleet, &fx.id()).err().expect("refused").to_string();
+        assert!(err.contains("supervisor"), "{err}");
+    }
+
+    /// A stopper whose stop ends the run (a lease or heartbeat removed) or
+    /// does not, and that counts its looks.
+    struct FakeStopper {
+        db: std::path::PathBuf,
+        ends_the_run: bool,
+        stops: Vec<crate::runner_place::RunnerPlace>,
+        looks: usize,
+    }
+
+    impl RunnerStopper for FakeStopper {
+        fn stop(&mut self, _: &FleetStore, _: &str, place: crate::runner_place::RunnerPlace) -> Result<()> {
+            self.stops.push(place);
+            if self.ends_the_run {
+                let conn = rusqlite::Connection::open(&self.db).unwrap();
+                conn.execute("DELETE FROM node_activity", []).unwrap();
+                conn.execute("DELETE FROM cloud_activity", []).unwrap();
+            }
+            Ok(())
+        }
+        fn wait_step(&mut self, _: &FleetStore, _: crate::runner_place::RunnerPlace, poll: std::time::Duration) -> Result<()> {
+            self.looks += 1;
+            std::thread::sleep(poll);
+            Ok(())
+        }
+    }
+
+    const QUICK: StopBounds = StopBounds {
+        poll: std::time::Duration::from_millis(5),
+        local_within: std::time::Duration::from_millis(40),
+        supervised_within: std::time::Duration::from_millis(40),
+    };
+
+    fn live_run(fx: &Fx) {
+        let now = tod_store::outline::uuid_blob::now_ms();
+        fx.fleet
+            .enqueue(FleetMutation::ActivityStart {
+                id: Uuid::new_v4(),
+                node: fx.node,
+                kind: tod_store::activity::KIND_RUN.into(),
+                owner: "daemon".into(),
+                at: now,
+            })
+            .unwrap();
+        fx.fleet.writer().flush().unwrap();
+    }
+
+    fn stopper(fx: &Fx, ends_the_run: bool) -> FakeStopper {
+        FakeStopper { db: fx.fleet.paths().db().to_path_buf(), ends_the_run, stops: Vec::new(), looks: 0 }
+    }
+
+    #[test]
+    fn stop_and_delete_stops_a_local_run_then_deletes() {
+        let fx = fx();
+        fx.locate("node-s1");
+        live_run(&fx);
+        let mut fake = has(&["node-s1"]);
+        let mut stop = stopper(&fx, true);
+        let mut said = Vec::new();
+        fx.stop_and_delete(false, &mut said, &mut stop, &mut fake).unwrap();
+        assert_eq!(stop.stops, [crate::runner_place::RunnerPlace::Local]);
+        assert_eq!(fake.deleted, ["node-s1"]);
+        assert_eq!(said, ["Stopping, then deleting the sandbox\u{2026}"]);
+    }
+
+    #[test]
+    fn stop_and_delete_deletes_nothing_when_a_local_run_does_not_end() {
+        let fx = fx();
+        fx.locate("node-s2");
+        live_run(&fx);
+        let mut fake = has(&["node-s2"]);
+        let mut stop = stopper(&fx, false);
+        let err = format!("{:#}", fx.stop_and_delete(false, &mut Vec::new(), &mut stop, &mut fake).unwrap_err());
+        assert!(err.contains("not deleted") && err.contains("runner is active"), "{err}");
+        assert!(fake.deleted.is_empty() && fake.checkpointed.is_empty());
+        assert!(stop.looks > 0, "it waited");
+    }
+
+    #[test]
+    fn stop_and_delete_deletes_anyway_when_the_supervisor_does_not_stop_and_says_so() {
+        use crate::runner_place::test_support::{sandbox, set_files};
+        let fx = fx();
+        set_files(&fx.fleet, fx.node, sandbox(), false);
+        fx.locate("node-s3");
+        fx.cloud_row();
+        let conn = rusqlite::Connection::open(fx.fleet.paths().db()).unwrap();
+        tod_store::cloud_activity::beat(&conn, fx.node, "active", tod_store::outline::uuid_blob::now_ms()).unwrap();
+        drop(conn);
+        let mut fake = has(&["node-s3"]);
+        let mut stop = stopper(&fx, false);
+        let mut said = Vec::new();
+        fx.stop_and_delete(false, &mut said, &mut stop, &mut fake).unwrap();
+        assert_eq!(stop.stops, [crate::runner_place::RunnerPlace::Supervisor]);
+        assert!(said.iter().any(|s| s.contains("did not report stopping") && s.contains("deleting the sandbox anyway")), "{said:?}");
+        // The checkpoint still ran first.
+        assert_eq!(fake.checkpointed.len(), 1);
+        assert_eq!(fake.deleted, ["node-s3"]);
+    }
+
+    #[test]
+    fn stop_and_delete_of_an_idle_node_just_deletes() {
+        let fx = fx();
+        fx.locate("node-s4");
+        let mut fake = has(&["node-s4"]);
+        let mut stop = stopper(&fx, true);
+        let mut said = Vec::new();
+        fx.stop_and_delete(true, &mut said, &mut stop, &mut fake).unwrap();
+        assert!(stop.stops.is_empty() && said.is_empty());
+        assert_eq!(fake.deleted, ["node-s4"]);
+        assert!(fake.checkpointed.is_empty(), "without a checkpoint");
+    }
+
+    impl Fx {
+        fn stop_and_delete(
+            &self,
+            force: bool,
+            said: &mut Vec<String>,
+            stopper: &mut FakeStopper,
+            backend: &mut Fake,
+        ) -> Result<String> {
+            stop_and_delete_with(&self.fleet, &self.id(), force, &mut |m| said.push(m.to_string()), stopper, QUICK, backend)
+        }
     }
 }

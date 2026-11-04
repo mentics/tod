@@ -212,7 +212,7 @@ pub fn credentials_fingerprint(creds: &NodeCredentials, claude_via: ClaudeTokenV
     rules_fingerprint(&credential_rules(creds, claude_via))
 }
 
-/// The environment an agent launched in an interactive sandbox (not a
+/// The environment an agent launched by the app in a node's sandbox (not a
 /// supervised node) needs to use [`credential_rules`]: `NODE_USE_ENV_PROXY`
 /// (Node's fetch otherwise ignores the proxy), the GitHub placeholders, and
 /// the Claude token: a placeholder with [`ClaudeTokenVia::Proxy`], the real
@@ -427,8 +427,7 @@ fn github_token(creds: &NodeCredentials) -> Option<&str> {
     creds.github_token.as_deref().filter(|t| !t.is_empty())
 }
 
-/// What a node's sandbox is created as. With an empty `node`, a base
-/// that nodes are forked from ([`ensure_base`]).
+/// What a node's sandbox is created as.
 #[derive(Clone, Copy)]
 pub struct NodeSandboxSpec<'a> {
     pub name: &'a str,
@@ -459,6 +458,13 @@ pub fn env_for(spec: &NodeSandboxSpec, creds: &NodeCredentials) -> Vec<(&'static
     node_env(spec, claude_placeholder, github_via_proxy)
 }
 
+/// [`rules_fingerprint`] of every rule a node's proxy is made with
+/// ([`proxy_rules`]): the `tod-creds` label every node sandbox carries, so one
+/// comparison says whether its proxy holds the credentials it should.
+pub fn node_creds_fingerprint(spec: &NodeSandboxSpec, creds: &NodeCredentials) -> String {
+    rules_fingerprint(&proxy_rules(creds, spec.orchestrator_host, spec.claude_via))
+}
+
 /// The `POST /sandboxes` body for a node's sandbox.
 pub fn create_body(spec: &NodeSandboxSpec, creds: &NodeCredentials) -> Value {
     let envs: Vec<Value> = env_for(spec, creds)
@@ -473,6 +479,7 @@ pub fn create_body(spec: &NodeSandboxSpec, creds: &NodeCredentials) -> Value {
                 "tod-user": spec.user,
                 "tod-node": spec.node,
                 ENV_LABEL: env_fingerprint(&creds.custom),
+                CREDS_LABEL: node_creds_fingerprint(spec, creds),
             },
         },
         "spec": {
@@ -615,15 +622,8 @@ pub fn checkout_script(repo_url: &str, branch: &str, identity: &GitIdentity, all
     )
 }
 
-/// Installs the relay, the shim, and the supervisor into the node's sandbox
-/// at `url`, checks out the branch, and starts the relay and supervisor.
-/// `progress` hears each slow step and any warning.
-pub fn provision(bx: &Blaxel, url: &str, payload: &NodePayload, progress: &mut dyn FnMut(&str)) -> Result<()> {
-    install(bx, url, payload, progress)?;
-    start(bx, url, payload, true, progress)
-}
-
-/// The part of [`provision`] that is the same for every node: the relay,
+/// What every node's sandbox gets from an image (a fork of a golden has it
+/// already, see [`install_into_fork`]): the relay,
 /// the shim, the supervisor, the Linux `tod-cli`, and the bundles. A base
 /// gets only this.
 pub fn install(bx: &Blaxel, url: &str, payload: &NodePayload, progress: &mut dyn FnMut(&str)) -> Result<()> {
@@ -640,6 +640,13 @@ fn upload_tod_files(bx: &Blaxel, url: &str, payload: &NodePayload, progress: &mu
     // Each binary is written beside its old copy, then renamed over it.
     let bytes = (payload.relay.len() + payload.supervisor.map_or(0, <[u8]>::len) + payload.local_cli.map_or(0, <[u8]>::len)) as u64;
     bx.ensure_free_space(url, "/", INSTALL_MIN_FREE.max(bytes * 3), url)?;
+    // A sandbox that was never provisioned (a golden whose network was just
+    // reconfigured, which redeploys it from its image) has no directory yet,
+    // and the large upload checks the space where it will write.
+    let made = bx.run(url, &format!("mkdir -p {TOD_DIR}/bin"), 30)?;
+    if made.exit_code != 0 {
+        bail!("making {TOD_DIR} failed: {}", made.output());
+    }
     bx.upload_large(url, RELAY_PATH, payload.relay, "0755")?;
     bx.upload(url, TOD_CLI_PATH, payload.shim, "0755")?;
     match payload.supervisor {
@@ -690,29 +697,32 @@ pub fn install_into_fork(bx: &Blaxel, url: &str, payload: &NodePayload, progress
     install_bundles(bx, url, payload, progress)
 }
 
-/// The part of [`provision`] that is the node's own: checks out its branch,
-/// and starts the relay and the supervisor. All a node forked from a base
-/// needs.
-pub fn start(bx: &Blaxel, url: &str, payload: &NodePayload, allow_clone: bool, progress: &mut dyn FnMut(&str)) -> Result<()> {
-    progress(&format!("checking out {}…", payload.branch));
-    let script = format!("sh -c {} 2>&1", shell_quote(&checkout_script(payload.repo_url, payload.branch, payload.git_identity, allow_clone)));
-    checkout_with_auth_retry(&mut || bx.run(url, &script, 600), &mut |d| std::thread::sleep(d), payload.branch, progress)?;
+/// Checks out `branch` in the node's sandbox at `url` ([`checkout_script`]):
+/// the first half of a node's own setup. A sandbox forked from a golden holds
+/// the repository (`allow_clone` false); one made from an image may clone it.
+pub fn checkout(
+    bx: &Blaxel,
+    url: &str,
+    repo_url: &str,
+    branch: &str,
+    identity: &GitIdentity,
+    allow_clone: bool,
+    progress: &mut dyn FnMut(&str),
+) -> Result<()> {
+    progress(&format!("checking out {branch}…"));
+    let script = format!("sh -c {} 2>&1", shell_quote(&checkout_script(repo_url, branch, identity, allow_clone)));
+    checkout_with_auth_retry(&mut || bx.run(url, &script, 600), &mut |d| std::thread::sleep(d), branch, progress)
+}
 
-    // Restarted, so it runs the binary just installed.
+/// Starts the relay (killing a running one, so it runs the binary installed)
+/// with `supervisor_env` ([`supervisor_env`], handed to the relay, which gives
+/// it to the supervisor alone). It does **not** start the supervisor: that is
+/// [`poke_script`], run when the node is to wake.
+pub fn start_relay(bx: &Blaxel, url: &str, supervisor_env: &[(String, String)]) -> Result<()> {
     bx.kill(url, RELAY_PROCESS)?;
-    let relay_env = relay_env(payload.supervisor_env);
+    let relay_env = relay_env(supervisor_env);
     let relay_env: Vec<(&str, &str)> = relay_env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
     bx.start_with_env(url, RELAY_PROCESS, &crate::provision::relay_command(), true, &relay_env)?;
-    if payload.supervisor.is_some() {
-        // Through the relay's poke, like every later wake: the relay starts
-        // `tod-supervisor wake` (its default `--supervisor-cmd`, the same
-        // [`supervisor_command`]) and tracks it, so a later poke signals it.
-        progress("starting the supervisor…");
-        let res = bx.run(url, &poke_script(), 60)?;
-        if res.exit_code != 0 {
-            bail!("poking the relay to start the supervisor failed: {}", res.output());
-        }
-    }
     Ok(())
 }
 
@@ -829,78 +839,6 @@ fn wait_proxy_ready_with(
     bail!("the sandbox was still not ready after {waited}s: {last}")
 }
 
-/// What a base made from `base_body` (its [`create_body`]) with `payload`
-/// installed is: a base whose fingerprint differs (new binaries, bundles,
-/// credentials, image, orchestrator) is made again. Hex SHA-256; it
-/// covers the proxy's secrets, so it is kept only on this machine.
-pub fn base_fingerprint(base_body: &Value, payload: &NodePayload) -> String {
-    use sha2::{Digest, Sha256};
-    let mut h = Sha256::new();
-    let mut part = |bytes: &[u8]| {
-        h.update((bytes.len() as u64).to_le_bytes());
-        h.update(bytes);
-    };
-    part(base_body.to_string().as_bytes());
-    part(payload.relay);
-    part(payload.shim);
-    part(payload.local_cli.unwrap_or_default());
-    part(payload.supervisor.unwrap_or_default());
-    for (rel, bytes) in payload.bundles {
-        part(rel.as_bytes());
-        part(bytes);
-    }
-    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
-}
-
-/// Makes sure the base `base` (a [`NodeSandboxSpec`] with no node) is there,
-/// deployed, and has `payload` installed ([`install`]), making it again when
-/// it is missing, can no longer run, or its fingerprint ([`base_fingerprint`])
-/// is not `recorded`. Returns the fingerprint to record once it is ready.
-pub fn ensure_base(
-    bx: &Blaxel,
-    base: &NodeSandboxSpec,
-    creds: &NodeCredentials,
-    payload: &NodePayload,
-    recorded: Option<&str>,
-    progress: &mut dyn FnMut(&str),
-) -> Result<String> {
-    let body = create_body(base, creds);
-    let fingerprint = base_fingerprint(&body, payload);
-    let existing = bx.get(base.name)?;
-    let dead = |status: &str| matches!(status.to_ascii_uppercase().as_str(), "FAILED" | "TERMINATED" | "DELETING" | "DELETED");
-    if let Some(info) = &existing
-        && !dead(&info.status)
-        && recorded == Some(fingerprint.as_str())
-    {
-        return Ok(fingerprint);
-    }
-    if existing.is_some() {
-        progress(&format!("replacing the base {}…", base.name));
-        bx.delete(base.name)?;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
-        while bx.get(base.name)?.is_some() {
-            if std::time::Instant::now() >= deadline {
-                bail!("the old base {} is still there", base.name);
-            }
-            std::thread::sleep(std::time::Duration::from_secs(2));
-        }
-    }
-    progress(&format!("creating the base {}…", base.name));
-    bx.create_from_body(&body)?;
-    let info = bx.wait_deployed(base.name, std::time::Duration::from_secs(300))?;
-    let url = info.url.ok_or_else(|| anyhow::anyhow!("sandbox {} has no URL", base.name))?;
-    install(bx, &url, payload, progress)?;
-    Ok(fingerprint)
-}
-
-/// Forks `spec`'s sandbox from the base `base`, with `spec`'s environment
-/// ([`env_for`]) over the base's. Its proxy rules and labels are the base's
-/// (the same user's credentials); wait with [`Blaxel::wait_deployed`], then
-/// [`start`] it.
-pub fn fork(bx: &Blaxel, base: &str, spec: &NodeSandboxSpec, creds: &NodeCredentials) -> Result<()> {
-    bx.fork_with_envs(base, spec.name, &env_for(spec, creds))
-}
-
 /// Forks `spec`'s sandbox from the golden `source` and gives the fork the
 /// node's own proxy rules and labels: a fork carries its source's proxy, which
 /// does not hold this node's credentials (or, with a Blaxel one, any a
@@ -924,7 +862,14 @@ pub fn fork_golden(bx: &Blaxel, source: &str, spec: &NodeSandboxSpec, creds: &No
     bx.wait_deployed(spec.name, std::time::Duration::from_secs(300))?;
     let proxy = proxy_spec(&proxy_rules(creds, spec.orchestrator_host, spec.claude_via));
     let env_label = env_fingerprint(&creds.custom);
-    let labels = [("tod-kind", "node"), ("tod-user", spec.user), ("tod-node", spec.node), (ENV_LABEL, env_label.as_str())];
+    let creds_label = node_creds_fingerprint(spec, creds);
+    let labels = [
+        ("tod-kind", "node"),
+        ("tod-user", spec.user),
+        ("tod-node", spec.node),
+        (ENV_LABEL, env_label.as_str()),
+        (CREDS_LABEL, creds_label.as_str()),
+    ];
     bx.update_proxy(spec.name, &proxy, &labels)
         .map_err(|err| err.context(format!("give {} the node's credentials (its proxy is {source}'s)", spec.name)))
 }
@@ -1218,38 +1163,6 @@ mod tests {
         assert_eq!(create_body(&node, &creds())["metadata"]["labels"]["tod-kind"], "node");
         let base = NodeSandboxSpec { name: "tod-node-base", node: "", ..node };
         assert_eq!(create_body(&base, &creds())["metadata"]["labels"]["tod-kind"], "node-base");
-    }
-
-    #[test]
-    fn a_base_fingerprint_changes_with_what_it_is_made_from() {
-        fn payload<'a>(relay: &'a [u8], bundles: &'a [(String, Vec<u8>)], identity: &'a GitIdentity) -> NodePayload<'a> {
-            NodePayload {
-                relay,
-                shim: b"shim",
-                local_cli: None,
-                supervisor: Some(b"sup"),
-                repo_url: "https://example/r.git",
-                branch: "b",
-                git_identity: identity,
-                bundles,
-                supervisor_env: &[],
-            }
-        }
-        let identity = GitIdentity::fallback();
-        let bundles = vec![("process/a.md".to_string(), b"one".to_vec())];
-        let bundles = bundles.as_slice();
-        let body = create_body(&NodeSandboxSpec { node: "", ..spec(ClaudeTokenVia::Proxy) }, &creds());
-        let a = base_fingerprint(&body, &payload(b"relay-1", bundles, &identity));
-        assert_eq!(a, base_fingerprint(&body, &payload(b"relay-1", bundles, &identity)));
-        assert_ne!(a, base_fingerprint(&body, &payload(b"relay-2", bundles, &identity)));
-        assert_ne!(a, base_fingerprint(&body, &payload(b"relay-1", &[], &identity)));
-        let mut other = body.clone();
-        other["spec"]["runtime"]["image"] = json!("other:latest");
-        assert_ne!(a, base_fingerprint(&other, &payload(b"relay-1", bundles, &identity)));
-        // The branch and repository are the node's, not the base's.
-        let mut p = payload(b"relay-1", bundles, &identity);
-        p.branch = "other";
-        assert_eq!(a, base_fingerprint(&body, &p));
     }
 
     #[test]

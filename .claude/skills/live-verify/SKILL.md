@@ -24,9 +24,14 @@ copies credentials; agents do not read the real root's credentials).
 missing or its credentials are stale, ask the user to run the seed script.
 
 Its tree: `Linear tickets` (generator) -> Quick accept -> `ENG work` (Files =
-location `Golden flagship`, a fork of the `golden` sandbox, `/workspace/flagship`;
+location `Golden workspace`, a fork of the `golden` sandbox, `/workspace`, i.e. `Cofactr/workspace` like the real roots;
 lifecycle-config: review `code-review`, pr `open-pr`+`fix-ci`, pr_review `fix-ci`).
-A ticket accepted there is the node under test. A node left from an earlier
+A ticket accepted there is the node under test. The root has a second
+location, `Build test` (an image location on the private `joel-cofactr/build-test`):
+use `Golden workspace` for real-data checks and the real golden flow, and
+`Build test` for anything that pushes a branch or opens a PR or needs
+flexibility. Never push from a `Golden workspace` node, and never use
+`/workspace/flagship` as a location (its origin is Cofactr/flagship). A node left from an earlier
 run (ENG-2925, `nexar-ingest-mints-products-with-the-w-2`) may still be there:
 reuse it, or accept another unstarted ticket the user names.
 
@@ -69,14 +74,17 @@ yourself (the Read tool): text dumps are not enough. Wait ~1.5 s between clicks
 (dialogs animate). Positions move; take a screenshot before clicking.
 
 Useful in the task panel (Task pane, right side): the status line and "waiting
-on / working", the runner buttons ("Run in the cloud", "Sync now" dropdown:
-Check now, Run with a new session, Reinstall and restart, Delete Sandbox, Stop
-running in the cloud), Watch, and the Log button (bottom right) for errors.
+on / working", the runner split button (Start / Resume / Pause as the default; its menu: Resume
+with a fresh budget, Run with a new session, Stop now, Check now, Migrate to…,
+Reset environment, Update workspace to latest main, Delete sandbox, Sync now), Watch, and the Log button (bottom right) for errors.
 `tod-cli --data-root <root> ...` reads and edits the root's data (a node id is a
 UUID: `node show <slug>`). Look in the sandbox with `tod-sandbox --data-root
 <root> exec <sandbox> -- sh -c '...'` (processes, files, logs).
 
-GitHub: you may read anything (`gh pr view ...`). Do not post to, push to, or
+GitHub: test pull requests and branches go only in the private repo
+`joel-cofactr/build-test` (see doc/live-verification.md); never create, push,
+mark ready, comment on or touch a PR or branch in any Cofactr org repo. Close
+the PRs and delete the branches you make. You may read anything (`gh pr view ...`). Do not post to, push to, or
 edit the user's real pull requests yourself; the node's agent does that, as the
 product should. If a test needs a new comment or review on a PR, ask first.
 
@@ -132,6 +140,6 @@ new gotcha to this file and `doc/live-verification.md` and merge them.
   is in its sandbox under `/var/log/sandbox-api/` (see doc/live-verification.md).
 - Blaxel masks env values (`TOD_USER` reads `****`): treat as unknown.
 - A node with a live heartbeat is skipped by the launch reinstall: use
-  "Reinstall and restart" after a deploy, and check `user_version` of the
+  Reset environment (runner menu) after a deploy, and check `user_version` of the
   supervisor's `tod.db` in the sandbox to be sure it is the new build.
 - No `timeout` on macOS; do not wrap cargo in it, and `sed -i ''`.

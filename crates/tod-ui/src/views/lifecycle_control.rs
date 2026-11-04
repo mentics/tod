@@ -1,17 +1,13 @@
-//! The lifecycle's moving parts, shared by every surface that drives them —
-//! the lifecycle panel and the conversation view's lifecycle buttons. One
-//! entity per window holds each node's gate-check display state.
+//! What the task panel shows of the last gate check: one entity per window
+//! holds each node's gate-check display state
+//! ([`LifecycleController::load_persisted`] reads the criteria last recorded).
 //!
-//! The agent runs are not here: a state's work, its evaluation, Implement,
-//! Verify, and Review are conversations the conversation view runs. What is
-//! here is what the lifecycle does without an agent: checking the gate
-//! ([`LifecycleController::check_gate`], an app check through
-//! `tod_core::phase::settle_gate`, which advances the node when it is clear),
-//! waiving a criterion, advancing once every recorded criterion reads
-//! pass/waived ([`LifecycleController::advance_after_criteria`]), forcing or
-//! reverting a transition, and showing the criteria the last check recorded.
-//! The store writes themselves are `tod_core`'s, shared with the headless
-//! `tod_core::autopilot`; this entity keeps only what is shown.
+//! It does nothing else. The agent runs are the autopilot's, and gates are
+//! checked by `tod_core::phase::settle_gate` in the autopilot's `gate` step and
+//! by the runner menu's Check now (`tod_core::lifecycle::check_now`, which also
+//! advances the node when the gate is clear); there is no Advance, Waive or
+//! check button (the user moves a node on with the task panel's lifecycle
+//! dropdown) in this entity or any view.
 //!
 //! Observers are notified whenever anything shown changes, including the
 //! node's lifecycle, so they re-read it from the store.
@@ -32,8 +28,8 @@ pub struct CriterionOutcome {
     pub outcome: String,
     pub detail: Option<String>,
     /// How the user can resolve this row in-app if it's failing — reported
-    /// by the agent per row. `Interview` offers an Open interview button
-    /// alongside Waive; `None` leaves Waive as the only option.
+    /// by the agent per row (`Interview`: open the interview; `None`: no
+    /// in-app way). No view reads these rows today.
     pub action: GateAction,
 }
 

@@ -3,25 +3,6 @@ use std::net::TcpListener;
 use tod_store::outline::OutlineMutation;
 
 #[test]
-fn a_failed_provisioning_deletes_the_sandbox_it_made_and_says_so() {
-    let mut deleted = 0;
-    let err = discard_failed_sandbox(anyhow!("checking out b failed"), "node-x", &mut || {
-        deleted += 1;
-        Ok(())
-    });
-    assert_eq!(deleted, 1);
-    let msg = format!("{err:#}");
-    assert!(msg.contains("node-x was deleted") && msg.contains("checking out b failed"), "{msg}");
-}
-
-#[test]
-fn a_failed_delete_of_a_failed_sandbox_is_part_of_the_error() {
-    let err = discard_failed_sandbox(anyhow!("probe failed"), "node-x", &mut || Err(anyhow!("503 from Blaxel")));
-    let msg = format!("{err:#}");
-    assert!(msg.contains("could not be deleted") && msg.contains("503 from Blaxel") && msg.contains("probe failed"), "{msg}");
-}
-
-#[test]
 fn user_names_are_what_the_orchestrator_accepts() {
     assert_eq!(user_name("Joel Shellman").as_deref(), Some("joel-shellman"));
     assert_eq!(user_name("..-alice").as_deref(), Some("alice"));
@@ -48,10 +29,25 @@ fn a_claude_node_without_a_token_fails_before_anything_is_created() {
 }
 
 #[test]
-fn node_sandbox_names() {
-    assert_eq!(node_sandbox_name("fix-login"), "node-fix-login");
-    assert_eq!(node_sandbox_name("A_B c"), "node-a-b-c");
-    assert_eq!(node_sandbox_name("--"), "node");
+fn a_sandbox_made_now_never_gets_files_installed_into_it() {
+    // Healthy: nothing to do, whatever was recorded.
+    assert_eq!(supervisor_state(true, None, "new", true), SupervisorState::Current);
+    // Not answering with this build's relay: the golden is at fault, so an error, not an install.
+    assert_eq!(supervisor_state(true, Some("new"), "new", false), SupervisorState::BrokenNew);
+}
+
+#[test]
+fn a_sandbox_that_lacks_this_builds_supervisor_gets_it() {
+    // An old sandbox whose relay is not this build's (the one-time upgrade
+    // path for sandboxes the old creator made).
+    assert!(matches!(supervisor_state(false, Some("new"), "new", false), SupervisorState::Install { .. }));
+    // Its relay answers, but it was given an older install (supervisor or bundles changed).
+    let SupervisorState::Install { why } = supervisor_state(false, Some("old"), "new", true) else { panic!() };
+    assert!(why.contains("older install"), "{why}");
+    // Nothing recorded for it counts as old.
+    assert!(matches!(supervisor_state(false, None, "new", true), SupervisorState::Install { .. }));
+    // Current and healthy: left alone.
+    assert_eq!(supervisor_state(false, Some("new"), "new", true), SupervisorState::Current);
 }
 
 #[test]
@@ -68,7 +64,7 @@ fn state_round_trips_and_defaults_when_missing() {
     let root = temp_root("state");
     assert_eq!(CloudSyncState::load(&root).unwrap(), CloudSyncState::default());
     let mut s = CloudSyncState { seeded: true, sent_after: 3, feed_after: 9, ..Default::default() };
-    s.nodes.insert("n".into(), CloudNode { sandbox: "node-n".into(), user: "u".into(), accepted_at_ms: 1, lost_at: None });
+    s.nodes.insert("n".into(), LegacyCloudNode { sandbox: "node-n".into(), user: "u".into(), accepted_at_ms: 1, lost_at: None });
     s.save(&root).unwrap();
     assert_eq!(CloudSyncState::load(&root).unwrap(), s);
     let _ = std::fs::remove_dir_all(&root);
@@ -478,8 +474,25 @@ fn a_cloud_node_is_working_only_while_its_supervisor_is_beating() {
     }
     fleet.writer().flush().unwrap();
     for id in &ids {
+        // The row's sandbox comes from the node's Files location.
         fleet
-            .enqueue(FleetMutation::CloudNodeUpsert { node: *id, sandbox: "s".into(), user: "u".into(), accepted_at: 1 })
+            .enqueue(FleetMutation::RecordFilesLocation {
+                location: tod_store::fleet::FilesLocation {
+                    node_id: id.to_string(),
+                    source_node_id: id.to_string(),
+                    recipe: String::new(),
+                    repo: None,
+                    container: None,
+                    worktree_path: None,
+                    worktree_lease_id: None,
+                    worktree_lease_holder: None,
+                    sandbox: Some("s".into()),
+                    created_at: 0,
+                },
+            })
+            .unwrap();
+        fleet
+            .enqueue(FleetMutation::CloudNodeUpsert { node: *id, user: "u".into(), accepted_at: 1 })
             .unwrap();
     }
     fleet.writer().flush().unwrap();
@@ -834,6 +847,33 @@ fn a_sandbox_is_dead_by_its_state_as_well_as_its_status() {
     }
 }
 
+#[test]
+fn a_sandbox_that_is_only_waking_is_used_never_replaced() {
+    // Standby, waking, or DEPLOYED with a workload answering WORKLOAD_UNAVAILABLE:
+    // none of it is terminal in Blaxel's record.
+    for (status, state) in [("DEPLOYED", Some("STANDBY")), ("DEPLOYED", None), ("DEPLOYING", None), ("DEPLOYED", Some("RUNNING"))] {
+        assert_eq!(wake_verdict("tod-x", Some(&info_with(status, state)), None), WakeVerdict::Use, "{status} {state:?}");
+    }
+}
+
+#[test]
+fn only_a_sandbox_blaxel_lacks_or_ends_or_made_for_another_user_is_replaced() {
+    assert!(matches!(wake_verdict("tod-x", None, None), WakeVerdict::Replace(r) if r.contains("no sandbox tod-x")));
+    assert!(matches!(wake_verdict("tod-x", Some(&info_with("TERMINATED", None)), None), WakeVerdict::Replace(_)));
+    assert!(matches!(wake_verdict("tod-x", Some(&info_with("DEPLOYED", Some("EXPIRED"))), None), WakeVerdict::Replace(_)));
+    let other = sandbox_user_reason("tod-x", "a", "b");
+    assert!(matches!(wake_verdict("tod-x", Some(&info_with("DEPLOYED", None)), other), WakeVerdict::Replace(_)));
+}
+
+#[test]
+fn a_sandbox_that_never_wakes_is_an_error_naming_it_and_saying_nothing_was_deleted() {
+    let err = still_waking_error("tod-x", REQUEST_PAUSE, &anyhow::anyhow!("last answer: 404 WORKLOAD_UNAVAILABLE"));
+    let text = format!("{err:#}");
+    for want in ["tod-x", "still waking", "WORKLOAD_UNAVAILABLE", "not replaced or deleted", "pause"] {
+        assert!(text.contains(want), "{want}: {text}");
+    }
+}
+
 /// A change the orchestrator refused is raised once per distinct error, as an
 /// error the user sees, with the orchestrator-is-older hint.
 #[test]
@@ -907,4 +947,152 @@ fn the_orchestrator_records_the_names_of_the_secrets_its_proxy_holds() {
     assert_eq!(orch.github_secrets().unwrap(), Some(vec!["gh_a".to_string()]));
     assert!(orch.put_github_secrets(&["bad name".to_string()]).is_err());
     let _ = std::fs::remove_dir_all(&base);
+}
+
+/// A Start that fails after the node was marked "starting" must not leave it
+/// saying "working: starting in the cloud" for the minutes a supervisor is
+/// given to report in: the failure replaces the row and is still returned.
+#[test]
+fn a_start_that_fails_leaves_the_node_failed_not_starting() {
+    let root = temp_root("start-fails");
+    let fleet = FleetStore::open(&root).unwrap();
+    add_list(&fleet, "t");
+    let list_id = fleet.list_outline_lists().unwrap()[0].id;
+    let node = uuid::Uuid::new_v4();
+    fleet
+        .enqueue_outline(OutlineMutation::CreateNode {
+            node_id: Some(node),
+            list_id,
+            parent_id: None,
+            anchor_id: None,
+            position: tod_store::outline::CreatePosition::Below,
+            title: "cloud node".into(),
+        })
+        .unwrap();
+    fleet.writer().flush().unwrap();
+    let id = node.to_string();
+    record_starting(&fleet, &id).unwrap();
+    let err = failing_start_is_recorded::<()>(&fleet, &id, || Err(anyhow!("the golden sandbox g does not exist")))
+        .unwrap_err();
+    assert!(format!("{err:#}").contains("the golden sandbox g does not exist"), "{err:#}");
+    let row = fleet.read(|conn| tod_store::run_state::get(conn, node)).unwrap().unwrap();
+    assert_eq!(row.phase, tod_store::run_state::Phase::Stopped);
+    assert!(row.reason_text.contains("the golden sandbox g does not exist"), "{}", row.reason_text);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+fn plain_node(fleet: &FleetStore) -> uuid::Uuid {
+    add_list(fleet, "t");
+    let list_id = fleet.list_outline_lists().unwrap()[0].id;
+    let node = uuid::Uuid::new_v4();
+    fleet
+        .enqueue_outline(OutlineMutation::CreateNode {
+            node_id: Some(node),
+            list_id,
+            parent_id: None,
+            anchor_id: None,
+            position: tod_store::outline::CreatePosition::Below,
+            title: "cloud node".into(),
+        })
+        .unwrap();
+    fleet.writer().flush().unwrap();
+    node
+}
+
+/// The wake path (Run with a new session, Resume, ...): a request that fails
+/// while the node's state is still the `starting` it wrote replaces it with
+/// the failure; a state that is no longer `starting` (a better, later answer)
+/// is left alone, and a Pause or Stop now, which writes no `starting`, never
+/// touches it.
+#[test]
+fn a_failed_wake_request_replaces_starting_only_while_it_is_the_state() {
+    let root = temp_root("wake-fails");
+    let fleet = FleetStore::open(&root).unwrap();
+    let node = plain_node(&fleet);
+    let id = node.to_string();
+    let phase = || fleet.read(|conn| tod_store::run_state::get(conn, node)).unwrap().map(|row| (row.phase, row.reason_text));
+
+    // The node does not run in the cloud, so every request fails at once.
+    record_starting(&fleet, &id).unwrap();
+    let err = wake_node_requesting(&fleet, &root, &id, REQUEST_KEEP_GOING).unwrap_err();
+    assert!(format!("{err:#}").contains("does not run in the cloud"), "{err:#}");
+    let (state, text) = phase().unwrap();
+    assert_eq!(state, tod_store::run_state::Phase::Stopped, "failed, not starting");
+    assert!(text.contains("does not run in the cloud"), "{text}");
+
+    // A later state is not replaced by the failure of an earlier call.
+    crate::run_state::record(&fleet, node, crate::run_state::runner_failed("an earlier, better answer"), "app").unwrap();
+    let _ = wake_node_requesting(&fleet, &root, &id, REQUEST_FRESH_SESSION).unwrap_err();
+    assert!(phase().unwrap().1.contains("an earlier, better answer"));
+
+    // A stop request writes no `starting`, so it leaves one alone.
+    record_starting(&fleet, &id).unwrap();
+    for kind in [REQUEST_PAUSE, REQUEST_STOP_NOW] {
+        let _ = wake_node_requesting(&fleet, &root, &id, kind).unwrap_err();
+        assert_eq!(phase().unwrap().0, tod_store::run_state::Phase::Starting, "{kind}");
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A node whose Files location makes sandboxes from an image: `clone_url` is
+/// the location's repository URL, and a node with Files on it.
+fn node_on_image_location(root_name: &str, clone_url: Option<&str>) -> (FleetStore, String, std::path::PathBuf) {
+    use tod_store::fleet::repos::node_files::{DevContainerSetting, SandboxFrom};
+    use tod_store::fleet::{FilesPlace, FleetMutation};
+    use tod_store::outline::{Capability, CreatePosition};
+    let root = temp_root(root_name);
+    let fleet = FleetStore::open(&root).unwrap();
+    add_list(&fleet, "t");
+    let list_id = fleet.list_outline_lists().unwrap()[0].id;
+    let node = uuid::Uuid::new_v4();
+    fleet
+        .enqueue_outline(OutlineMutation::CreateNode {
+            node_id: Some(node),
+            list_id,
+            parent_id: None,
+            anchor_id: None,
+            position: CreatePosition::Below,
+            title: "n".into(),
+        })
+        .unwrap();
+    fleet
+        .enqueue_outline(OutlineMutation::EnableCapabilities { node_id: node, capabilities: vec![Capability::Files] })
+        .unwrap();
+    let place = FilesPlace {
+        id: uuid::Uuid::new_v4().to_string(),
+        name: "cloud".into(),
+        repo: Some("/workspace/repo".into()),
+        dev_container: Some(DevContainerSetting {
+            sandbox: true,
+            sandbox_from: SandboxFrom::Image(String::new()),
+            clone_url: clone_url.map(str::to_string),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let place_id = place.id.clone();
+    fleet.enqueue(FleetMutation::SaveFilesPlace { place }).unwrap();
+    fleet.enqueue(FleetMutation::SetNodeFilesPlace { node_id: node.to_string(), place_id: Some(place_id) }).unwrap();
+    fleet.writer().flush().unwrap();
+    (fleet, node.to_string(), root)
+}
+
+/// Gap 14: an image location's repository URL is the clone source, with no
+/// sandbox (there is none yet) or checkout to ask.
+#[test]
+fn an_image_locations_clone_url_is_the_nodes_repository() {
+    let (fleet, node, root) = node_on_image_location("clone-url", Some("https://github.com/acme/app"));
+    let (_, url, _) = node_source(&fleet, &node).unwrap();
+    assert_eq!(url, "https://github.com/acme/app");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn an_image_location_without_a_url_says_where_to_give_one() {
+    let (fleet, node, root) = node_on_image_location("no-clone-url", None);
+    let err = node_source(&fleet, &node).unwrap_err().to_string();
+    assert!(err.contains("no HTTPS repository URL for the cloud run"), "{err}");
+    assert!(err.contains("Locations") && err.contains("Repository to clone"), "{err}");
+    assert!(!err.contains("set the Files directory to"), "{err}");
+    let _ = std::fs::remove_dir_all(&root);
 }

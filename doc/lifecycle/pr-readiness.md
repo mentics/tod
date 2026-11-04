@@ -38,6 +38,14 @@ The two states, as they were split:
   so responding to reviewers can use a skill of its own. Its gate,
   `pr_review → approved`, is the one `pr` had (the criteria below, which keep
   their `pr-approved.*` slugs so existing waivers still apply).
+- Skill groups (`;` in a phase's skills, see `.claude/CLAUDE.md`, "Lifecycle
+  config") work as in every phase: on entry the PR agent's session and then each
+  later group run in order, once per stay, and the run then looks at the pull
+  request. `pr_draft` always takes its entry turn; `pr_review` only when it has
+  skills. Work on the pull request (a code review's threads, CI) sends the
+  run round again from the agent's session and through every group; with no
+  work the run waits for the person (woken by the webhook, else by polling) and
+  nothing runs again on a restart in the same stay.
 - `approved` is unchanged: it waits for the merge.
 
 Below, "the `pr` state" means `pr_review` unless it is about opening the PR.
@@ -62,8 +70,8 @@ blocker it cannot solve.
 
 Gates are app checks; no agent evaluates one (see phase-agents.md). So:
 
-- **Readiness is a list of criteria the app derives** from GitHub, each
-  waivable like any gate criterion.
+- **Readiness is a list of criteria the app derives** from GitHub; the
+  user can move a node past a failing one with the lifecycle dropdown.
 - **The babysitter runs the PR agent.** The agent changes the world (code,
   replies, thread resolution, and review requests where the project's own
   skill says to make them) so the criteria become true. Neither decides
@@ -83,8 +91,8 @@ client `pr_mergeable_outcome` uses. All apply to **every linked PR**.
 | `pr-review-score` | For each configured bot with a `min_score`, its latest review for the current head has a score at or above it. |
 
 Each fails with a detail line naming the thread, bot, or score, so the
-side pane shows why and offers Waive. A waiver is per criterion and is
-cleared when the PR head changes, as other certificates go stale.
+runner line's Check now result shows why. There is no waiver: the user moves the node on with the task panel's
+lifecycle dropdown.
 
 ### Bots
 
@@ -266,7 +274,7 @@ it is outward-facing, so it is bounded:
 - A bot score under threshold is work once: the agent's next turn sees it.
   If that turn pushes nothing (the agent judges the remaining findings
   wrong), the score is left to the gate, which stops for the user, who
-  decides whether to waive `pr-review-score`.
+  decides whether to move the node on with the lifecycle dropdown.
 - A turn that changes nothing, replies to nothing, and leaves the gate
   unchanged twice in a row stops the run (`NeedsHuman::PrStuck`), like
   `EvaluationStuck`.
@@ -286,8 +294,8 @@ it is outward-facing, so it is bounded:
 - `assets/process/`: the `pr` role doc's **Done when**; a
   `surface/` fragment and `ContextRecipe` for the babysitter.
 - `tod-ui`: the poller feeding the runner (`unified/`), the wait line in the
-  task panel runner line, failing criteria with Waive in the side pane, and
-  the Settings section for bots.
+  task panel runner line (its Check now result lists the failing criteria),
+  and the Settings section for bots.
 
 ## Build order
 
@@ -349,8 +357,8 @@ Where the code differs from the design above:
   `PrFeed`).
 - The gate criteria are `pr-approved.up-to-date`, `.threads-resolved`,
   `.review-current`, `.review-score`, beside `.mergeable`. The two review
-  criteria pass when no bot is configured. A waiver is the existing per-node
-  waiver; it is not cleared when the head changes.
+  criteria pass when no bot is configured. A criterion cannot be waived; the user moves the node on with the lifecycle
+  dropdown.
 
 ## Waiting on GitHub after the review: the merge, then the release
 

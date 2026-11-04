@@ -119,7 +119,7 @@ impl Protocol for FixProtocol {
             .context("could not read the inherited context")?;
         let cwd = self.cwd(env)?;
         let working_dir = PathBuf::from(cwd.path_text());
-        let skills = crate::skills_context::for_node(fleet, node_id, "fix", &cwd)?;
+        let skills = crate::skills_context::for_group(fleet, node_id, "fix", &cwd, env.skill_group())?;
         build_fix_message(
             env.media,
             &ImplementRequest {

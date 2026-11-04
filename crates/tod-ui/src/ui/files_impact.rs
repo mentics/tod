@@ -49,7 +49,11 @@ pub fn confirm_files_change(
     on_confirmed: OnConfirmed,
 ) {
     if affected.is_empty() {
-        on_confirmed(window, cx);
+        // Not now: the caller is usually inside an update of the view that
+        // `on_confirmed` updates again (the Locations dialog's "Change it"
+        // panicked with "cannot update ... while it is already being
+        // updated", found live, pass 6).
+        window.defer(cx, move |window, cx| on_confirmed(window, cx));
         return;
     }
     let intro = intro.into();
@@ -86,6 +90,90 @@ pub fn confirm_files_change(
             .close_button(true)
             .child(dialog.clone())
     });
+}
+
+/// What a migrate ended with: `Err` is a message to show the user.
+pub type OnMigrated = Box<dyn FnOnce(Result<(), String>, &mut Window, &mut App)>;
+
+fn migrate_error(err: anyhow::Error) -> String {
+    format!("{err:#}")
+}
+
+/// Migrate `node` to `place`: keep its sessions and runner state off the UI
+/// thread, show the impact dialog for the worktree or sandbox it leaves
+/// (removing it, each branch pushed first, on Confirm), then enable Files
+/// on it if needed and pick the location, and finally drop its cloud row if
+/// it left a sandbox. A node with children is refused with the store's own
+/// message, through `on_done`. Nothing is started.
+pub fn confirm_migrate(
+    window: &mut Window,
+    cx: &mut App,
+    fleet: Arc<FleetStore>,
+    paths: TodPaths,
+    node: String,
+    place: tod_store::fleet::FilesPlace,
+    on_done: OnMigrated,
+) {
+    let task = window.spawn(cx, async move |cx| {
+        let prepared = {
+            let (fleet, node, place_id) = (fleet.clone(), node.clone(), place.id.clone());
+            cx.background_executor()
+                .spawn(async move {
+                    let affected = tod_store::fleet::places::migrate_impact(&fleet, &node, &place_id)?;
+                    tod_store::fleet::session_log::keep_node_state(&fleet, &node)?;
+                    anyhow::Ok(affected)
+                })
+                .await
+        };
+        let _ = cx.update(|window, cx| match prepared {
+            Err(err) => on_done(Err(migrate_error(err)), window, cx),
+            Ok(affected) => {
+                // The node's Files location is the one record of its sandbox,
+                // so the impact names it whenever there is one.
+                let left_sandbox = affected.iter().any(|a| a.location.sandbox().is_some());
+                let intro = format!(
+                    "{} puts this node's files somewhere else. Its current files are removed \
+                     first (each branch is pushed before it goes); its agent sessions are kept \
+                     and resume in the new place.",
+                    place.name
+                );
+                let (fleet_for_run, node_for_run, place_id) = (fleet.clone(), node.clone(), place.id.clone());
+                confirm_files_change(
+                    window,
+                    cx,
+                    fleet,
+                    paths,
+                    affected,
+                    "Migrate this node?",
+                    intro,
+                    "Remove and migrate",
+                    Box::new(move |window, cx| {
+                        let task = window.spawn(cx, async move |cx| {
+                            let result = cx
+                                .background_executor()
+                                .spawn(async move {
+                                    tod_store::fleet::places::migrate(&fleet_for_run, &node_for_run, &place_id)?;
+                                    if left_sandbox {
+                                        // The impact dialog removed the location's
+                                        // sandbox and the row's copy of it; the
+                                        // orchestrator is told.
+                                        tod_core::cloud_sync::lost::announce_left_cloud(
+                                            &fleet_for_run,
+                                            &node_for_run,
+                                        )?;
+                                    }
+                                    anyhow::Ok(())
+                                })
+                                .await;
+                            let _ = cx.update(|window, cx| on_done(result.map_err(migrate_error), window, cx));
+                        });
+                        task.detach();
+                    }),
+                );
+            }
+        });
+    });
+    task.detach();
 }
 
 struct FilesImpact {
@@ -420,5 +508,56 @@ impl Render for FilesImpact {
                             .on_click(cx.listener(|this, _, window, cx| this.confirm(window, cx))),
                     ),
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::{Entity, TestAppContext};
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    struct Host {
+        confirmed: Rc<Cell<u32>>,
+    }
+
+    impl Render for Host {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+        }
+    }
+
+    /// With nothing to remove the change is confirmed at once, but never
+    /// inside the caller's own update: a callback that updates the caller's
+    /// view (as the Locations dialog's does) would panic with "cannot update
+    /// ... while it is already being updated" (found live, pass 6).
+    #[gpui::test]
+    fn confirming_with_nothing_affected_does_not_re_enter_the_caller(cx: &mut TestAppContext) {
+        let fixture = crate::views::rows::fixture::Fixture::new();
+        let confirmed = Rc::new(Cell::new(0));
+        let (host, cx) = cx.add_window_view({
+            let confirmed = confirmed.clone();
+            move |_, _| Host { confirmed }
+        });
+        let fleet = fixture.store.clone();
+        host.update_in(cx, |_, window, cx| {
+            let this: Entity<Host> = cx.entity();
+            confirm_files_change(
+                window,
+                cx,
+                fleet,
+                TodPaths::at(std::env::temp_dir()),
+                Vec::new(),
+                "title",
+                "intro",
+                "label",
+                Box::new(move |_, cx| {
+                    this.update(cx, |host, _| host.confirmed.set(host.confirmed.get() + 1));
+                }),
+            );
+        });
+        cx.run_until_parked();
+        assert_eq!(confirmed.get(), 1);
     }
 }

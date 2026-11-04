@@ -13,8 +13,8 @@
 //! 3. open review findings, only while the node is actually answering them.
 //!
 //! Gates are app-checked and never hand anything to the user themselves: a
-//! failing criterion goes back to a phase agent, or is waived from the
-//! lifecycle panel.
+//! failing criterion goes back to a phase agent, or the user moves the node
+//! on with the task panel's lifecycle dropdown.
 
 use anyhow::Result;
 use rusqlite::Connection;

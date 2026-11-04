@@ -104,7 +104,7 @@ impl Protocol for VerificationProtocol {
         let role_doc = state_lifecycle_doc(&manifest, VERIFYING)?;
         let cwd = self.cwd(env)?;
         let working_dir = PathBuf::from(cwd.path_text());
-        let skills = crate::skills_context::for_node(fleet, node_id, "verify", &cwd)?;
+        let skills = crate::skills_context::for_group(fleet, node_id, "verify", &cwd, env.skill_group())?;
         build_verify_message(
             env.media,
             &ImplementRequest {

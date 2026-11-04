@@ -15,6 +15,8 @@ use crate::fleet::repos::files_place::{FilesPlace, FilesPlaceRepo};
 use crate::fleet::repos::node_files::NodeFilesRepo;
 use crate::fleet::store::FleetStore;
 use crate::fleet::writer::FleetMutation;
+use crate::outline::OutlineMutation;
+use crate::outline::types::Capability;
 use anyhow::{Context, Result};
 
 /// A node that picked a location.
@@ -142,6 +144,84 @@ pub fn impact(fleet: &FleetStore, id: &str, after: Option<&FilesPlace>) -> Resul
     })
 }
 
+/// The refusal of every Migrate path (the panel, the task editor, `tod-cli`):
+/// moving or pinning a node's children is not supported.
+pub const MIGRATE_HAS_CHILDREN: &str = "You cannot migrate a node that has children.";
+
+fn refuse_children(fleet: &FleetStore, node_id: &str) -> Result<()> {
+    let uuid = uuid::Uuid::parse_str(node_id).with_context(|| format!("node id {node_id}"))?;
+    let has_children: bool = fleet.read(|conn| {
+        Ok(conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM outline_entries WHERE parent_id = ?1)",
+            [crate::outline::uuid_blob::uuid_to_blob(uuid)],
+            |row| row.get(0),
+        )?)
+    })?;
+    if has_children {
+        anyhow::bail!("{MIGRATE_HAS_CHILDREN}");
+    }
+    Ok(())
+}
+
+/// What migrating `node_id` to location `place_id` removes: its own worktree
+/// or sandbox, unless it was made from this very recipe for this very node.
+/// Refuses a node with children. Reads only: still off the UI thread, since
+/// it reads the store.
+pub fn migrate_impact(fleet: &FleetStore, node_id: &str, place_id: &str) -> Result<Vec<AffectedLocation>> {
+    fleet.reload_if_stale().ok();
+    refuse_children(fleet, node_id)?;
+    let place = fleet
+        .read(|conn| FilesPlaceRepo::new(conn).get(place_id))?
+        .with_context(|| format!("The location {place_id} was deleted meanwhile"))?;
+    let keep_recipe = place.normalized().recipe_key();
+    Ok(crate::fleet::provision::locations_affected_by(fleet, node_id)?
+        .into_iter()
+        // One made from the same settings is still used, but only for the
+        // node it was made from: an ancestor's no longer matches once the
+        // node picks for itself.
+        .filter(|a| a.location.recipe != keep_recipe || a.location.source_node_id != node_id)
+        .collect())
+}
+
+/// Make location `place_id` this node's own pick: enable Files on it if it
+/// is not its own, then pick the location (an override, never the ancestor's
+/// choice). Refuses a node with children. Remove what [`migrate_impact`]
+/// names first. Writes: never on the UI thread.
+pub fn migrate(fleet: &FleetStore, node_id: &str, place_id: &str) -> Result<()> {
+    fleet.reload_if_stale().ok();
+    refuse_children(fleet, node_id)?;
+    let uuid = uuid::Uuid::parse_str(node_id).with_context(|| format!("node id {node_id}"))?;
+    let own = fleet
+        .read(|conn| crate::outline::repos::NodeRepo::new(conn).list_capabilities(uuid))?
+        .contains(&Capability::Files);
+    if !own {
+        fleet.enqueue_outline(OutlineMutation::EnableCapabilities {
+            node_id: uuid,
+            capabilities: vec![Capability::Files],
+        })?;
+        fleet.writer().flush().context("Could not enable Files on the node")?;
+    }
+    // Two mutations: a failure between them leaves Files on with the
+    // location it already resolved to.
+    let picked = fleet
+        .enqueue(FleetMutation::SetNodeFilesPlace {
+            node_id: node_id.to_string(),
+            place_id: Some(place_id.to_string()),
+        })
+        .map_err(anyhow::Error::from)
+        .and_then(|_| fleet.writer().flush().map_err(anyhow::Error::from));
+    if let Err(err) = picked {
+        let note = if own {
+            ""
+        } else {
+            " Files is now on for the node, using the location it already resolved to."
+        };
+        return Err(err.context(format!("Could not pick the location.{note}")));
+    }
+    fleet.reload_if_stale()?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -246,6 +326,174 @@ mod tests {
         let files = store.resolve_files_for_node(&a.to_string()).unwrap().unwrap();
         assert_eq!(files.incomplete().as_deref(), Some("Choose a location"));
 
+        drop(store);
+        cleanup_fleet_root(&root);
+    }
+
+    /// Gap 14: changing the repository URL of an image location leaves the
+    /// nodes' sandboxes behind (so the impact is shown); a rename does not.
+    #[test]
+    fn changing_a_clone_url_shows_its_impact() {
+        use crate::fleet::repos::node_files::{DevContainerSetting, SandboxFrom};
+        let root = temp_fleet_root();
+        let store = FleetStore::open(&root).unwrap();
+        let with_url = |url: &str| FilesPlace {
+            name: "Cloud".into(),
+            dev_container: Some(DevContainerSetting {
+                sandbox: true,
+                sandbox_from: SandboxFrom::Image(String::new()),
+                clone_url: Some(url.into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let place = save(&store, &with_url("https://github.com/o/a")).unwrap();
+        let a = node(&store, "A");
+        store
+            .enqueue(FleetMutation::SetNodeFilesPlace { node_id: a.to_string(), place_id: Some(place.id.clone()) })
+            .unwrap();
+        store.writer().flush().unwrap();
+        made(&store, a, a, &place);
+
+        let renamed = FilesPlace { name: "Renamed".into(), ..place.clone() };
+        assert!(impact(&store, &place.id, Some(&renamed)).unwrap().locations.is_empty());
+        let moved = FilesPlace { id: place.id.clone(), ..with_url("https://github.com/o/b") };
+        let changed = impact(&store, &place.id, Some(&moved)).unwrap();
+        assert_eq!(changed.locations.len(), 1);
+        assert_eq!(changed.locations[0].node_title, "A");
+
+        drop(store);
+        cleanup_fleet_root(&root);
+    }
+
+    fn child_of(store: &FleetStore, parent: Uuid) -> Uuid {
+        let list_id = store.list_outline_lists().unwrap()[0].id;
+        let id = Uuid::new_v4();
+        store
+            .enqueue_outline(OutlineMutation::CreateNode {
+                node_id: Some(id),
+                list_id,
+                parent_id: Some(parent),
+                anchor_id: None,
+                position: CreatePosition::Below,
+                title: "child".into(),
+            })
+            .unwrap();
+        store.writer().flush().unwrap();
+        id
+    }
+
+    fn two_places(store: &FleetStore) -> (FilesPlace, FilesPlace) {
+        let a = save(
+            store,
+            &FilesPlace { name: "A".into(), repo: Some("/src/a".into()), use_worktree: true, ..Default::default() },
+        )
+        .unwrap();
+        let b = save(
+            store,
+            &FilesPlace { name: "B".into(), repo: Some("/src/b".into()), use_worktree: true, ..Default::default() },
+        )
+        .unwrap();
+        (a, b)
+    }
+
+    #[test]
+    fn migrating_removes_only_what_differs_and_inherited_ones() {
+        let root = temp_fleet_root();
+        let store = FleetStore::open(&root).unwrap();
+        let (a, b) = two_places(&store);
+        let n = node(&store, "N");
+        let ns = n.to_string();
+        store
+            .enqueue(FleetMutation::SetNodeFilesPlace { node_id: ns.clone(), place_id: Some(a.id.clone()) })
+            .unwrap();
+        store.writer().flush().unwrap();
+        made(&store, n, n, &a);
+        // Own pick, another recipe: its worktree is left behind.
+        let affected = migrate_impact(&store, &ns, &b.id).unwrap();
+        assert_eq!(affected.len(), 1);
+        assert_eq!(affected[0].node_id, ns);
+        // Same recipe, made for this node: nothing to remove.
+        assert!(migrate_impact(&store, &ns, &a.id).unwrap().is_empty());
+        drop(store);
+        cleanup_fleet_root(&root);
+    }
+
+    #[test]
+    fn an_inherited_pick_is_left_behind_even_with_the_same_recipe() {
+        let root = temp_fleet_root();
+        let store = FleetStore::open(&root).unwrap();
+        let (a, _) = two_places(&store);
+        let parent = node(&store, "P");
+        store
+            .enqueue(FleetMutation::SetNodeFilesPlace { node_id: parent.to_string(), place_id: Some(a.id.clone()) })
+            .unwrap();
+        store.writer().flush().unwrap();
+        // The leaf has no Files of its own: its location comes from the parent.
+        let leaf = child_of(&store, parent);
+        made(&store, leaf, parent, &a);
+        // The parent has a child, so it cannot migrate; the leaf can.
+        let affected = migrate_impact(&store, &leaf.to_string(), &a.id).unwrap();
+        assert_eq!(affected.len(), 1);
+        drop(store);
+        cleanup_fleet_root(&root);
+    }
+
+    #[test]
+    fn migrate_enables_files_and_sets_the_place() {
+        let root = temp_fleet_root();
+        let store = FleetStore::open(&root).unwrap();
+        let (a, _) = two_places(&store);
+        let parent = node(&store, "P");
+        store
+            .enqueue(FleetMutation::SetNodeFilesPlace { node_id: parent.to_string(), place_id: Some(a.id.clone()) })
+            .unwrap();
+        store.writer().flush().unwrap();
+        let leaf = child_of(&store, parent);
+        let b = find(&store, "B").unwrap().unwrap();
+        assert!(store.resolve_files_for_node(&leaf.to_string()).unwrap().unwrap().inherited);
+        migrate(&store, &leaf.to_string(), &b.id).unwrap();
+        let files = store.resolve_files_for_node(&leaf.to_string()).unwrap().unwrap();
+        assert!(!files.inherited);
+        assert_eq!(files.place_id.as_deref(), Some(b.id.as_str()));
+        drop(store);
+        cleanup_fleet_root(&root);
+    }
+
+    #[test]
+    fn a_node_with_children_cannot_migrate() {
+        let root = temp_fleet_root();
+        let store = FleetStore::open(&root).unwrap();
+        let (a, _) = two_places(&store);
+        let parent = node(&store, "P");
+        child_of(&store, parent);
+        let err = migrate_impact(&store, &parent.to_string(), &a.id).unwrap_err();
+        assert_eq!(err.to_string(), "You cannot migrate a node that has children.");
+        let err = migrate(&store, &parent.to_string(), &a.id).unwrap_err();
+        assert_eq!(err.to_string(), "You cannot migrate a node that has children.");
+        // Nothing was picked.
+        let files = store.resolve_files_for_node(&parent.to_string()).unwrap().unwrap();
+        assert_ne!(files.place_id.as_deref(), Some(a.id.as_str()));
+        drop(store);
+        cleanup_fleet_root(&root);
+    }
+
+    #[test]
+    fn a_live_run_lease_blocks_removing_the_location() {
+        let root = temp_fleet_root();
+        let store = FleetStore::open(&root).unwrap();
+        let n = node(&store, "N");
+        assert_eq!(store.location_blocker(&n.to_string()).unwrap(), None);
+        let lease =
+            crate::activity::ActivityLease::start(&store, n, crate::activity::KIND_RUN, "test").unwrap();
+        store.writer().flush().unwrap();
+        store.reload_if_stale().ok();
+        let blocker = store.location_blocker(&n.to_string()).unwrap().expect("a run blocks");
+        assert!(blocker.contains("runner"), "{blocker}");
+        lease.end(&store).unwrap();
+        store.writer().flush().unwrap();
+        store.reload_if_stale().ok();
+        assert_eq!(store.location_blocker(&n.to_string()).unwrap(), None);
         drop(store);
         cleanup_fleet_root(&root);
     }

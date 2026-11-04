@@ -189,10 +189,13 @@ pub enum FleetMutation {
         id: String,
     },
     // --- Cloud nodes (immediate) ---
-    /// The node runs in the cloud, in this sandbox (`cloud_nodes`).
+    /// The node runs in the cloud (`cloud_nodes`), in the sandbox its Files
+    /// location records: the writer reads that name in the same transaction
+    /// and fails when the location names none. This is the only app-side
+    /// writer of the row's `sandbox` besides [`FleetMutation::RecordFilesLocation`],
+    /// which keeps an existing row's copy in step.
     CloudNodeUpsert {
         node: uuid::Uuid,
-        sandbox: String,
         user: String,
         accepted_at: i64,
     },
@@ -244,6 +247,16 @@ pub enum FleetMutation {
     /// The node is back on the user's list.
     UndeferNode {
         node: uuid::Uuid,
+    },
+    // --- Node problems (immediate; `crate::node_problems`) ---
+    /// A background job of the node failed: recorded where the node's views show it.
+    RecordNodeProblem {
+        problem: crate::node_problems::NodeProblem,
+    },
+    /// The job succeeded (or no longer applies).
+    ClearNodeProblem {
+        node: uuid::Uuid,
+        kind: String,
     },
     // --- Outline (tree / lists) ---
     Outline(OutlineMutation),
@@ -308,6 +321,8 @@ impl FleetMutation {
                 | FleetMutation::ActivityClearLost { .. }
                 | FleetMutation::DeferNode { .. }
                 | FleetMutation::UndeferNode { .. }
+                | FleetMutation::RecordNodeProblem { .. }
+                | FleetMutation::ClearNodeProblem { .. }
         )
     }
 
@@ -366,6 +381,14 @@ impl FleetMutation {
             }
             FleetMutation::RecordFilesLocation { location } => {
                 crate::fleet::repos::files_location::FilesLocationRepo::new(conn).upsert(location)?;
+                // The location is the one record of the node's sandbox; the
+                // `cloud_nodes` row (which the orchestrator reads) holds a copy
+                // that follows it in the same transaction.
+                if let Some(sandbox) = location.sandbox()
+                    && let Ok(node) = uuid::Uuid::parse_str(&location.node_id)
+                {
+                    crate::cloud_nodes::set_sandbox(conn, node, sandbox)?;
+                }
             }
             FleetMutation::DeleteFilesLocation { node_id } => {
                 crate::fleet::repos::files_location::FilesLocationRepo::new(conn).delete(node_id)?;
@@ -524,7 +547,14 @@ impl FleetMutation {
                 let status = InterviewSessionStatus::from_str(status)?;
                 InterviewSessionRepo::new(conn).set_status(*id, status)?;
             }
-            FleetMutation::CloudNodeUpsert { node, sandbox, user, accepted_at } => {
+            FleetMutation::CloudNodeUpsert { node, user, accepted_at } => {
+                let location =
+                    crate::fleet::repos::files_location::FilesLocationRepo::new(conn).get(&node.to_string())?;
+                let sandbox = location.as_ref().and_then(|l| l.sandbox()).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "cannot record node {node} as running in the cloud: its Files location names no sandbox"
+                    )
+                })?;
                 crate::cloud_nodes::upsert(conn, *node, sandbox, user, *accepted_at)?;
             }
             FleetMutation::CloudNodeSetOwnership { node, ownership } => {
@@ -555,6 +585,12 @@ impl FleetMutation {
             }
             FleetMutation::UndeferNode { node } => {
                 crate::deferrals::DeferralRepo::new(conn).clear(*node)?;
+            }
+            FleetMutation::RecordNodeProblem { problem } => {
+                crate::node_problems::NodeProblemRepo::new(conn).record(problem)?;
+            }
+            FleetMutation::ClearNodeProblem { node, kind } => {
+                crate::node_problems::NodeProblemRepo::new(conn).clear(*node, kind)?;
             }
             FleetMutation::Outline(_) => {}
         }

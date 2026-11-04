@@ -39,17 +39,28 @@ pub struct Sandboxes {
     pub root: PathBuf,
     pub config_path: PathBuf,
     pub config: Config,
+    /// The file as it was when loaded or last saved: what [`Self::save`]
+    /// measures this copy's changes against.
+    saved: Config,
 }
 
 impl Sandboxes {
     pub fn load(root: &Path) -> Result<Self> {
         let config_path = root.join(config::FILE_NAME);
         let config = Config::load(&config_path)?;
-        Ok(Self { root: root.to_path_buf(), config_path, config })
+        Ok(Self { root: root.to_path_buf(), config_path, saved: config.clone(), config })
     }
 
-    pub fn save(&self) -> Result<()> {
-        self.config.save(&self.config_path)
+    /// Saves what this copy changed since it was loaded (or last saved) onto
+    /// the file as it is now, so another writer's entries (a `golden
+    /// refresh` during a creation that takes minutes, another app on the
+    /// root) are never put back to what this copy loaded; this copy then
+    /// holds the merged result. See `Config::save_changes`.
+    pub fn save(&mut self) -> Result<()> {
+        let merged = self.config.save_changes(&self.saved, &self.config_path)?;
+        self.saved = merged.clone();
+        self.config = merged;
+        Ok(())
     }
 
     /// The databases nodes may log in to through this machine, as declared.
@@ -219,7 +230,7 @@ pub enum NewSandboxSource {
 }
 
 impl Sandboxes {
-    /// The user's credentials for an interactive sandbox's proxy and agent
+    /// The user's credentials for a node sandbox's proxy and agent
     /// launch, as autonomous nodes get them: GitHub, Linear, and the Claude
     /// subscription token from the credential store, with `custom` (the
     /// node's Environment secrets with hosts). There is no Blaxel token: no
@@ -241,11 +252,14 @@ impl Sandboxes {
         self.config.blaxel.as_ref().map(|a| a.claude_token_via).unwrap_or_default()
     }
 
-    /// Create sandbox `name` from `source`, wait for it, and make it ready
-    /// for tod. Returns its URL. Slow (seconds for a fork or a baked image,
-    /// a minute or more when an image is wrapped and set up): never on the UI
-    /// thread. `inherit_output` shows `bl`'s build output on this process's
-    /// terminal; otherwise it is only reported on failure.
+    /// Create a workspace sandbox `name` from `source` (`tod-sandbox create`
+    /// and `fork`: a base or golden the user manages by hand, not a node's
+    /// sandbox: those are made only by `provision::make_sandbox`), wait for
+    /// it, and make it ready for tod. Returns its URL. Slow (seconds for a
+    /// fork or a baked image, a minute or more when an image is wrapped and
+    /// set up): never on the UI thread. `inherit_output` shows `bl`'s build
+    /// output on this process's terminal; otherwise it is only reported on
+    /// failure.
     pub fn create(
         &mut self,
         name: &str,
@@ -254,66 +268,10 @@ impl Sandboxes {
         inherit_output: bool,
         progress: &mut dyn FnMut(&str),
     ) -> Result<String> {
-        self.create_with_proxy(name, source, agents, inherit_output, &Default::default(), progress)
-    }
-
-    /// The sandbox the name `golden` stands for. `wsx-golden-*` stands for the
-    /// newest sandbox with that prefix (the names carry a timestamp, so they
-    /// sort oldest first).
-    pub fn resolve_golden(&self, bx: &Blaxel) -> Result<String> {
-        let golden = self
-            .account()?
-            .golden
-            .clone()
-            .filter(|g| !g.trim().is_empty())
-            .ok_or_else(|| {
-                anyhow!("no golden sandbox is set: run `tod-sandbox golden <sandbox>` (or set `golden` in sandboxes.toml)")
-            })?;
-        Ok(match golden.trim().strip_suffix('*') {
-            Some(prefix) => {
-                let all: Vec<_> = bx
-                    .list()?
-                    .into_iter()
-                    .filter(|i| i.name.starts_with(prefix) && !matches!(i.status.as_str(), "TERMINATED" | "DELETING"))
-                    .collect();
-                // A golden is marked `ready` once it passed its checks; a
-                // half-made one (left in place after a failure) is skipped
-                // unless nothing is marked.
-                let ready = all.iter().filter(|i| i.label("ready") == Some("true")).count();
-                all.into_iter()
-                    .filter(|i| ready == 0 || i.label("ready") == Some("true"))
-                    .map(|i| i.name)
-                    .max()
-                    .ok_or_else(|| anyhow!("no sandbox named {prefix}* exists to be the golden"))?
-            }
-            None => golden,
-        })
-    }
-
-    /// [`Self::create`] with `creds` as proxy rules (see
-    /// [`Self::node_credentials`]: the user's GitHub, Linear, and Claude
-    /// tokens as autonomous nodes get them, and the node's Environment
-    /// secrets with hosts), so the agent calls those hosts without ever
-    /// holding the value. A fork carries its source's proxy and, being
-    /// made rather than updated, cannot be given another, so
-    /// with credentials a fork source is made from the source's image
-    /// instead (the image must hold the repository, as a fork's source
-    /// does). The sandbox is labelled [`tod_sandbox::node::CREDS_LABEL`] with
-    /// the rules' fingerprint, which [`interactive_proxy_is_current`] compares.
-    pub fn create_with_proxy(
-        &mut self,
-        name: &str,
-        source: &NewSandboxSource,
-        agents: bool,
-        inherit_output: bool,
-        creds: &tod_sandbox::node::NodeCredentials,
-        progress: &mut dyn FnMut(&str),
-    ) -> Result<String> {
         validate_name(name)?;
         // Before anything is made: a sandbox cannot be used without it.
         relay_path()?;
         let acct = self.account()?.clone();
-        let rules = tod_sandbox::node::credential_rules(creds, acct.claude_token_via);
         let bx = self.blaxel()?;
         if let Some(info) = bx.get(name)?
             && info.status != "TERMINATED"
@@ -321,86 +279,24 @@ impl Sandboxes {
             bail!("a sandbox named {name} already exists ({})", info.status);
         }
         let started = Instant::now();
-        let from_image;
         let resolved;
         let source = match source {
             NewSandboxSource::Fork(name) if name == tod_sandbox::config::GOLDEN => {
-                let golden = self.resolve_golden(&bx)?;
+                let golden = self.resolve_sole_golden(&bx)?;
                 progress(&format!("golden is {golden}"));
                 resolved = NewSandboxSource::Fork(golden);
                 &resolved
             }
             other => other,
         };
-        let mut fork_proxy_pending = false;
-        let source = match source {
-            NewSandboxSource::Fork(base) if !rules.is_empty() => {
-                validate_name(base)?;
-                let image = bx
-                    .get(base)?
-                    .ok_or_else(|| anyhow!("no sandbox named {base} to fork"))?
-                    .image;
-                if runs_as_is(&image) {
-                    progress(&format!(
-                        "{base}'s proxy cannot carry this node's credentials; making {name} from its image instead…"
-                    ));
-                    from_image = NewSandboxSource::Image(image);
-                    &from_image
-                } else {
-                    // Its image was not built for Blaxel, so it cannot be
-                    // rebuilt from (wrapping it needs a registry image): fork,
-                    // then replace the fork's proxy rules.
-                    fork_proxy_pending = true;
-                    // A proxy is fixed at creation: a source made without one
-                    // gives forks that cannot carry credentials.
-                    let routes = bx
-                        .get_json(base)?
-                        .and_then(|v| v["spec"]["network"]["proxy"]["routing"].as_array().map(|r| r.len()))
-                        .unwrap_or(0);
-                    if routes == 0 {
-                        progress(&format!(
-                            "warning: {base} was made without a proxy, so {name} cannot carry the node's credentials \
-                             (fetching from GitHub will fail). Rebuild it so it is made with one (`blaxel-sbx golden refresh`)."
-                        ));
-                    }
-                    source
-                }
-            }
-            other => other,
-        };
         let image = match source {
             NewSandboxSource::Image(image) => {
-                let image = match image.trim() {
-                    "" => acct.default_image.as_str(),
-                    image => image,
-                };
-                let runtime_image = if runs_as_is(image) {
-                    image.to_string()
-                } else {
-                    let wrapped = format!("tod-{}", label_value(short_image(image)));
-                    progress(&format!(
-                        "{image} is not built for Blaxel; wrapping it as sandbox/{wrapped} \
-                         (adds Blaxel's sandbox API)…"
-                    ));
-                    let dir = build_dir(&wrapped)?;
-                    std::fs::write(dir.join("Dockerfile"), provision::wrap_dockerfile(image))?;
-                    std::fs::write(
-                        dir.join("blaxel.toml"),
-                        provision::blaxel_toml(&wrapped, acct.memory_mb),
-                    )?;
-                    self.bl_push(&dir, inherit_output, progress)?;
-                    format!("sandbox/{wrapped}:latest")
-                };
+                let runtime_image = self.runtime_image(image, inherit_output, progress)?;
                 let owner = acct.owner.as_deref().map(label_value).unwrap_or_default();
-                let fingerprint = tod_sandbox::node::rules_fingerprint(&rules);
-                let mut labels = vec![("tod", "1"), (tod_sandbox::node::CREDS_LABEL, fingerprint.as_str())];
+                let mut labels = vec![("tod", "1")];
                 if !owner.is_empty() {
                     labels.push(("tod-owner", owner.as_str()));
                 }
-                // The same rules an autonomous node's proxy has for the
-                // user's own credentials, without the Blaxel ones (there is
-                // no supervisor here); nothing else is routed through it.
-                let proxy = (!rules.is_empty()).then(|| tod_sandbox::node::proxy_spec(&rules));
                 progress(&format!("creating {name} from {runtime_image}…"));
                 bx.create(&NewSandbox {
                     name,
@@ -408,7 +304,7 @@ impl Sandboxes {
                     region: &acct.region,
                     memory_mb: acct.memory_mb,
                     labels: &labels,
-                    proxy: proxy.as_ref(),
+                    proxy: None,
                 })?;
                 runtime_image
             }
@@ -428,21 +324,6 @@ impl Sandboxes {
                     name,
                     &[("HTTPS_PROXY", proxy_env.clone()), ("HTTP_PROXY", proxy_env)],
                 )?;
-                if fork_proxy_pending {
-                    let proxy = tod_sandbox::node::proxy_spec(&rules);
-                    let fingerprint = tod_sandbox::node::rules_fingerprint(&rules);
-                    let mut labels = vec![(tod_sandbox::node::CREDS_LABEL, fingerprint.as_str())];
-                    let owner = acct.owner.as_deref().map(label_value).unwrap_or_default();
-                    if !owner.is_empty() {
-                        labels.push(("tod-owner", owner.as_str()));
-                    }
-                    bx.wait_deployed(name, Duration::from_secs(300))?;
-                    if let Err(err) = bx.update_proxy(name, &proxy, &labels) {
-                        progress(&format!(
-                            "warning: {name} keeps {source}'s proxy; the node's credentials were not applied: {err:#}"
-                        ));
-                    }
-                }
                 image
             }
         };
@@ -467,6 +348,91 @@ impl Sandboxes {
                 Err(err.context(removed))
             }
         }
+    }
+
+    /// The image Blaxel runs for `image` (empty: the account's default): its
+    /// own and workspace images as they are; any other is wrapped (a build on
+    /// Blaxel with `bl`, which adds Blaxel's sandbox API) as
+    /// `sandbox/tod-<image>:latest`, which is returned. Slow when it wraps.
+    pub fn runtime_image(
+        &mut self,
+        image: &str,
+        inherit_output: bool,
+        progress: &mut dyn FnMut(&str),
+    ) -> Result<String> {
+        let acct = self.account()?.clone();
+        let image = match image.trim() {
+            "" => acct.default_image.as_str(),
+            image => image,
+        };
+        if runs_as_is(image) {
+            return Ok(image.to_string());
+        }
+        let wrapped = format!("tod-{}", label_value(short_image(image)));
+        progress(&format!(
+            "{image} is not built for Blaxel; wrapping it as sandbox/{wrapped} (adds Blaxel's sandbox API)…"
+        ));
+        let dir = build_dir(&wrapped)?;
+        std::fs::write(dir.join("Dockerfile"), provision::wrap_dockerfile(image))?;
+        std::fs::write(dir.join("blaxel.toml"), provision::blaxel_toml(&wrapped, acct.memory_mb))?;
+        self.bl_push(&dir, inherit_output, progress)?;
+        Ok(format!("sandbox/{wrapped}:latest"))
+    }
+
+    /// The sandbox the name `golden` stands for for `repo` (normalized as
+    /// `cloud_nodes::normalize_repo` does): its own entry, else the old
+    /// account-wide one. `wsx-golden-*` stands for the newest sandbox with
+    /// that prefix (the names carry a timestamp, so they sort oldest first).
+    pub fn resolve_golden(&self, bx: &Blaxel, repo: &str) -> Result<String> {
+        let setting = self.account()?.golden_for(repo).ok_or_else(|| {
+            anyhow!(
+                "no golden sandbox is set for {repo}: run `tod-sandbox golden refresh {repo}` to make one, or \
+                 `tod-sandbox golden {repo} <sandbox>` to point at one"
+            )
+        })?;
+        if let tod_sandbox::config::GoldenSetting::Legacy(name) = &setting {
+            tracing::info!("{repo} has no golden of its own; using the account-wide `golden = {name:?}` of sandboxes.toml");
+        }
+        self.resolve_golden_setting(bx, setting.name())
+    }
+
+    /// [`Self::resolve_golden`] for a caller that has no repository: the only
+    /// golden there is, else an error asking for a repository.
+    pub fn resolve_sole_golden(&self, bx: &Blaxel) -> Result<String> {
+        let setting = self.account()?.sole_golden()?;
+        self.resolve_golden_setting(bx, &setting)
+    }
+
+    /// Every golden there is, resolved, for a caller that has no repository
+    /// and so asks them all (each holds a checkout of its repository).
+    pub fn resolve_all_goldens(&self, bx: &Blaxel) -> Result<Vec<String>> {
+        let settings = self.account()?.all_goldens();
+        if settings.is_empty() {
+            anyhow::bail!("no golden sandbox is set: run `tod-sandbox golden <repo> <sandbox>`");
+        }
+        settings.iter().map(|s| self.resolve_golden_setting(bx, s)).collect()
+    }
+
+    fn resolve_golden_setting(&self, bx: &Blaxel, golden: &str) -> Result<String> {
+        Ok(match golden.trim().strip_suffix('*') {
+            Some(prefix) => {
+                let all: Vec<_> = bx
+                    .list()?
+                    .into_iter()
+                    .filter(|i| i.name.starts_with(prefix) && !matches!(i.status.as_str(), "TERMINATED" | "DELETING"))
+                    .collect();
+                // A golden is marked `ready` once it passed its checks; a
+                // half-made one (left in place after a failure) is skipped
+                // unless nothing is marked.
+                let ready = all.iter().filter(|i| i.label("ready") == Some("true")).count();
+                all.into_iter()
+                    .filter(|i| ready == 0 || i.label("ready") == Some("true"))
+                    .map(|i| i.name)
+                    .max()
+                    .ok_or_else(|| anyhow!("no sandbox named {prefix}* exists to be the golden"))?
+            }
+            None => golden.trim().to_string(),
+        })
     }
 
     /// Builds `base_image` with tod's dependencies installed and `repos`
@@ -551,7 +517,19 @@ impl Sandboxes {
     }
 }
 
-/// Whether an interactive sandbox's proxy was made with exactly the rules
+/// Why Blaxel's record of a sandbox says it can no longer run, if it does:
+/// its deployment `status` or its running `state` is a terminal one. A
+/// sandbox that expired can stay `DEPLOYED` for an hour while its `state`
+/// already says so.
+pub fn dead_reason(info: &tod_sandbox::blaxel::SandboxInfo) -> Option<String> {
+    const DEAD: [&str; 6] = ["FAILED", "TERMINATED", "DELETING", "DELETED", "EXPIRED", "EXPIRING"];
+    let field = |what: &str, value: &str| {
+        DEAD.contains(&value.to_ascii_uppercase().as_str()).then(|| format!("sandbox {} has {what} {value}", info.name))
+    };
+    field("status", &info.status).or_else(|| info.state.as_deref().and_then(|state| field("state", state)))
+}
+
+/// Whether a node sandbox's proxy was made with exactly the rules
 /// `creds` gives now (its `tod-creds` label, a fingerprint of every rule
 /// and secret; a sandbox from before the label counts as having none).
 pub fn interactive_proxy_is_current(
@@ -631,14 +609,16 @@ pub fn list(root: &Path) -> Result<Vec<ListedSandbox>> {
         })
         .collect();
     all.sort_by(|a, b| a.name.cmp(&b.name));
-    // The fixed name a node can fork, ahead of the sandboxes it stands for.
-    if let Some(golden) = sandboxes.config.blaxel.as_ref().and_then(|a| a.golden.as_deref()).filter(|g| !g.trim().is_empty()) {
+    // The fixed name a node can fork, ahead of the sandboxes it stands for:
+    // one per repository, and the old account-wide one.
+    let settings = sandboxes.config.blaxel.as_ref().map(|a| a.golden_settings()).unwrap_or_default();
+    for (repo, golden) in settings.into_iter().rev() {
         all.insert(
             0,
             ListedSandbox {
                 name: tod_sandbox::config::GOLDEN.to_string(),
-                status: "always the newest".to_string(),
-                image: golden.to_string(),
+                status: if repo == "*" { "every repository without its own".to_string() } else { format!("for {repo}") },
+                image: golden,
                 owner: None,
                 known: true,
             },
@@ -654,11 +634,11 @@ pub fn list_vms(root: &Path) -> Result<Vec<tod_sandbox::vms::Vm>> {
     let sandboxes = Sandboxes::load(root)?;
     let bx = sandboxes.blaxel()?;
     // No golden set is fine; one set that cannot be resolved is an error.
-    let golden = match sandboxes.config.blaxel.as_ref().and_then(|a| a.golden.as_deref()).filter(|g| !g.trim().is_empty()) {
-        Some(_) => Some(sandboxes.resolve_golden(&bx)?),
-        None => None,
-    };
-    tod_sandbox::vms::list_managed(&bx, golden.as_deref())
+    let mut goldens = Vec::new();
+    for (_, setting) in sandboxes.config.blaxel.as_ref().map(|a| a.golden_settings()).unwrap_or_default() {
+        goldens.push(sandboxes.resolve_golden_setting(&bx, &setting)?);
+    }
+    tod_sandbox::vms::list_managed(&bx, &goldens)
 }
 
 /// The real sandbox a fork source names: `golden` is an alias for the newest
@@ -670,7 +650,7 @@ pub fn resolve_fork_source(root: &Path, name: &str) -> Result<String> {
     fork_source_with(name, || {
         let sandboxes = Sandboxes::load(root)?;
         let bx = sandboxes.blaxel()?;
-        sandboxes.resolve_golden(&bx)
+        sandboxes.resolve_sole_golden(&bx)
     })
 }
 
@@ -1214,6 +1194,32 @@ mod tests {
             assert!(validate_name(&name).is_ok(), "{slug:?} -> {name:?}");
         }
         assert_eq!(suggested_name("fix-login"), "fix-login");
+    }
+
+    #[test]
+    fn a_creation_that_takes_minutes_does_not_put_back_a_golden_changed_meanwhile() {
+        let root = std::env::temp_dir().join(format!("tod-sbx-race-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut seed = Sandboxes::load(&root).unwrap();
+        seed.config.blaxel = Some(Account::new("w"));
+        seed.config.blaxel.as_mut().unwrap().set_golden("a/b", "golden-old");
+        seed.save().unwrap();
+
+        // The creator loads; `golden refresh` (another Sandboxes, as another process) changes the golden.
+        let mut creator = Sandboxes::load(&root).unwrap();
+        let mut refresher = Sandboxes::load(&root).unwrap();
+        refresher.config.blaxel.as_mut().unwrap().set_golden("a/b", "golden-new");
+        refresher.save().unwrap();
+
+        creator.config.upsert(config::Sandbox { name: "tod-x-abc123".into(), image: "i".into(), url: None, agents: true });
+        creator.save().unwrap();
+
+        let back = Sandboxes::load(&root).unwrap();
+        assert_eq!(back.config.blaxel.as_ref().unwrap().goldens.get("a/b").map(String::as_str), Some("golden-new"));
+        assert!(back.config.sandbox("tod-x-abc123").is_some());
+        // The creator now sees the refreshed golden too.
+        assert_eq!(creator.config.blaxel.as_ref().unwrap().goldens.get("a/b").map(String::as_str), Some("golden-new"));
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

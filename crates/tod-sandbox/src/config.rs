@@ -4,6 +4,7 @@
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::Path;
 
 pub const FILE_NAME: &str = "sandboxes.toml";
@@ -32,7 +33,7 @@ pub enum AuthMode {
     ApiKey,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Account {
     pub workspace: String,
     #[serde(default = "default_region")]
@@ -62,21 +63,28 @@ pub struct Account {
     /// volumes).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub orchestrator_volume: Option<String>,
-    /// Node sandboxes are forked from a prepared base sandbox of this name
-    /// (`node_base = "..."`), made on first use; unset, or where forking is
-    /// refused, each is created from the image. See `tod_core::cloud_sync`.
+    /// Read and written back so an old file keeps parsing; nothing uses it
+    /// any more (node sandboxes fork the repository's golden, [`Self::goldens`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node_base: Option<String>,
-    /// The sandbox the name [`GOLDEN`] stands for (`golden = "..."`), so a
-    /// node can fork `golden` once and a new golden sandbox is only
-    /// pointed at here (`tod-sandbox golden <name>`). A name ending in `*`
-    /// is a prefix: the newest sandbox that starts with it (`wsx-golden-*`).
+    /// The golden sandbox of every repository that has none of its own in
+    /// [`Self::goldens`] (`golden = "..."`): how `sandboxes.toml` said it
+    /// when there was one golden per account. Read, and never written back
+    /// by tod once a repository has its own (`tod-sandbox golden <repo>
+    /// <sandbox>`). A name ending in `*` is a prefix: the newest sandbox
+    /// that starts with it (`wsx-golden-*`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub golden: Option<String>,
     /// Ports a node's sandbox forwards to hosts reachable from this machine
     /// (`forwards = ["5432=db.internal:5432"]`); see [`Forward`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub forwards: Vec<String>,
+    /// One golden per repository (`[blaxel.goldens]`, `"owner/name" =
+    /// "sandbox"`): the sandbox the name [`GOLDEN`] stands for when a node
+    /// of that repository forks it. Repositories are normalized
+    /// (`owner/name`, lower case). Same `*` prefix rule as [`Self::golden`].
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub goldens: BTreeMap<String, String>,
 }
 
 /// A port in a sandbox that reaches `host:port` from this machine: a
@@ -218,6 +226,102 @@ pub const DEFAULT_IMAGE: &str = "blaxel/base-image:latest";
 /// Drive is only available here.
 pub const DEFAULT_REGION: &str = "us-was-1";
 
+/// What [`Account::golden_for`] found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GoldenSetting {
+    /// The repository's own entry.
+    Own(String),
+    /// The account-wide `golden`, read as every repository's until the
+    /// repository has its own.
+    Legacy(String),
+}
+
+impl GoldenSetting {
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Own(n) | Self::Legacy(n) => n,
+        }
+    }
+}
+
+impl Account {
+    /// `repo`'s golden setting (a name, or a `prefix*`): its own entry, else
+    /// the account-wide `golden`. `repo` is normalized by the caller
+    /// (`tod_store::cloud_nodes::normalize_repo`: `owner/name`, lower case).
+    pub fn golden_for(&self, repo: &str) -> Option<GoldenSetting> {
+        if let Some(own) = self.goldens.get(repo).map(|g| g.trim()).filter(|g| !g.is_empty()) {
+            return Some(GoldenSetting::Own(own.to_string()));
+        }
+        self.golden.as_deref().map(str::trim).filter(|g| !g.is_empty()).map(|g| GoldenSetting::Legacy(g.to_string()))
+    }
+
+    /// Makes `name` `repo`'s golden. The account-wide `golden` of a file
+    /// from before there was one per repository stays the golden of every
+    /// other repository; the first time a repository gets its own, this
+    /// says so in the log (the file is migrated, nothing is lost by it).
+    pub fn set_golden(&mut self, repo: &str, name: &str) {
+        if self.goldens.is_empty()
+            && let Some(legacy) = self.golden.as_deref().filter(|g| !g.trim().is_empty())
+        {
+            tracing::info!(
+                "sandboxes.toml: `golden = {legacy:?}` was the golden of every repository; {repo} now has its own \
+                 ({name}), and {legacy:?} stays the golden of the repositories that have none"
+            );
+        }
+        self.goldens.insert(repo.to_string(), name.to_string());
+    }
+
+    /// Whether a golden setting other than `repo`'s own entry (another
+    /// repository's, or the account-wide one) points at the sandbox `name`,
+    /// as itself or as a `prefix*` it matches: a sandbox still wanted
+    /// elsewhere is not deleted when `repo` moves on.
+    pub fn golden_used_elsewhere(&self, name: &str, repo: &str) -> bool {
+        let hits = |setting: &str| match setting.trim().strip_suffix('*') {
+            Some(prefix) => name.starts_with(prefix),
+            None => setting.trim() == name,
+        };
+        self.golden.as_deref().is_some_and(hits) || self.goldens.iter().any(|(r, g)| r != repo && hits(g))
+    }
+
+    /// The only golden there is, for a caller that has no repository: the
+    /// account-wide one, or the single entry of `goldens`. Two different
+    /// ones is an error saying so: the caller must name a repository.
+    pub fn sole_golden(&self) -> Result<String> {
+        let mut all: Vec<&str> = self.goldens.values().map(|g| g.trim()).filter(|g| !g.is_empty()).collect();
+        all.sort_unstable();
+        all.dedup();
+        match (self.golden.as_deref().map(str::trim).filter(|g| !g.is_empty()), all.as_slice()) {
+            (Some(g), []) => Ok(g.to_string()),
+            (None, [g]) => Ok((*g).to_string()),
+            (None, []) => anyhow::bail!("no golden sandbox is set: run `tod-sandbox golden <repo> <sandbox>`"),
+            _ => anyhow::bail!(
+                "there is more than one golden sandbox (one per repository: {}{}); say which repository's is meant",
+                self.goldens.keys().cloned().collect::<Vec<_>>().join(", "),
+                if self.golden.is_some() { ", and the account-wide one" } else { "" }
+            ),
+        }
+    }
+
+    /// Every distinct golden setting there is (the account-wide one and each
+    /// repository's), for a caller that has no repository and must ask them all.
+    pub fn all_goldens(&self) -> Vec<String> {
+        let mut all: Vec<String> = self.goldens.values().map(|g| g.trim().to_string()).filter(|g| !g.is_empty()).collect();
+        all.extend(self.golden.as_deref().map(str::trim).filter(|g| !g.is_empty()).map(str::to_string));
+        all.sort_unstable();
+        all.dedup();
+        all
+    }
+
+    /// Every golden setting, for a listing: `(repository or "*", setting)`.
+    pub fn golden_settings(&self) -> Vec<(String, String)> {
+        let mut out: Vec<(String, String)> = self.goldens.iter().map(|(r, g)| (r.clone(), g.clone())).collect();
+        if let Some(g) = self.golden.as_deref().filter(|g| !g.trim().is_empty()) {
+            out.push(("*".to_string(), g.to_string()));
+        }
+        out
+    }
+}
+
 impl Account {
     /// An account signed in with `bl login`, with the defaults.
     pub fn new(workspace: impl Into<String>) -> Self {
@@ -234,6 +338,7 @@ impl Account {
             node_base: None,
             golden: None,
             forwards: Vec::new(),
+            goldens: BTreeMap::new(),
         }
     }
 }
@@ -248,7 +353,7 @@ fn default_memory() -> u32 {
     4096
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Sandbox {
     pub name: String,
     pub image: String,
@@ -288,7 +393,7 @@ impl SchedulerKind {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default)]
     pub blaxel: Option<Account>,
@@ -331,6 +436,89 @@ impl Config {
         })
     }
 
+    /// Writes only what this copy changed since `base` (the file as it was
+    /// loaded or last saved) onto the file as it is *now*, and returns the
+    /// result, so a writer never overwrites an entry another writer changed
+    /// meanwhile (a sandbox made over minutes, a `golden refresh`, the
+    /// daemon): each sandbox, golden, database and account field is its
+    /// writer's own key, and a key this copy did not change is whatever the
+    /// file has. The read-merge-write holds an exclusive lock on
+    /// `sandboxes.toml.lock`, so two writers at once are serialized, and the
+    /// file is replaced atomically ([`Self::save`]).
+    pub fn save_changes(&self, base: &Config, path: &Path) -> Result<Config> {
+        let lock_path = path.with_extension("toml.lock");
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&lock_path)
+            .with_context(|| format!("open {}", lock_path.display()))?;
+        lock.lock().with_context(|| format!("lock {}", lock_path.display()))?;
+        let mut fresh = Config::load(path)?;
+        fresh.apply_changes(base, self);
+        // The lock is released when `lock` drops, after the rename.
+        fresh.save(path)?;
+        drop(lock);
+        Ok(fresh)
+    }
+
+    /// Applies to `self` what `mine` changed relative to `base`.
+    fn apply_changes(&mut self, base: &Config, mine: &Config) {
+        if mine.scheduler != base.scheduler {
+            self.scheduler = mine.scheduler;
+        }
+        for s in &mine.sandboxes {
+            if base.sandbox(&s.name) != Some(s) {
+                self.upsert(s.clone());
+            }
+        }
+        for s in &base.sandboxes {
+            if mine.sandbox(&s.name).is_none() {
+                self.sandboxes.retain(|f| f.name != s.name);
+            }
+        }
+        for d in &mine.databases {
+            if !base.databases.contains(d) {
+                match self.databases.iter_mut().find(|f| f.name == d.name) {
+                    Some(f) => *f = d.clone(),
+                    None => self.databases.push(d.clone()),
+                }
+            }
+        }
+        for d in &base.databases {
+            if !mine.databases.iter().any(|m| m.name == d.name) {
+                self.databases.retain(|f| f.name != d.name);
+            }
+        }
+        if mine.blaxel == base.blaxel {
+            return;
+        }
+        match (&mut self.blaxel, &mine.blaxel, &base.blaxel) {
+            (slot, None, _) => *slot = None,
+            (slot @ None, Some(m), _) => *slot = Some(m.clone()),
+            (Some(f), Some(m), None) => *f = m.clone(),
+            (Some(f), Some(m), Some(b)) => {
+                macro_rules! field {
+                    ($($name:ident),*) => {$( if m.$name != b.$name { f.$name = m.$name.clone(); } )*};
+                }
+                field!(
+                    workspace, region, auth, default_image, memory_mb, owner, claude_token_via, orchestrator,
+                    orchestrator_volume, node_base, golden, forwards
+                );
+                for (repo, g) in &m.goldens {
+                    if b.goldens.get(repo) != Some(g) {
+                        f.goldens.insert(repo.clone(), g.clone());
+                    }
+                }
+                for repo in b.goldens.keys() {
+                    if !m.goldens.contains_key(repo) {
+                        f.goldens.remove(repo);
+                    }
+                }
+            }
+        }
+    }
+
     pub fn sandbox(&self, name: &str) -> Option<&Sandbox> {
         self.sandboxes.iter().find(|s| s.name == name)
     }
@@ -355,6 +543,16 @@ impl Config {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn every_distinct_golden_is_listed_for_a_caller_with_no_repository() {
+        let c: Config = toml::from_str("scheduler = \"blaxel\"\n[blaxel]\nworkspace = \"w\"\n").unwrap();
+        let mut acct = c.blaxel.unwrap();
+        acct.golden = Some("wsx-golden-*".into());
+        acct.goldens.insert("acme/widget".into(), "tod-golden-acme".into());
+        acct.goldens.insert("acme/other".into(), "tod-golden-acme".into());
+        assert_eq!(acct.all_goldens(), vec!["tod-golden-acme".to_string(), "wsx-golden-*".to_string()]);
+    }
+
     use super::*;
 
     #[test]
@@ -403,6 +601,42 @@ claude_token_via = \"env\"
     }
 
     #[test]
+    fn one_golden_per_repository_and_the_old_single_one_is_every_repositorys_until_one_is_set() {
+        let dir = std::env::temp_dir().join(format!("tod-sandbox-golden-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(FILE_NAME);
+        // A file from when there was one golden per account.
+        std::fs::write(&path, "[blaxel]\nworkspace = \"w\"\ngolden = \"wsx-golden-*\"\n").unwrap();
+        let mut c = Config::load(&path).unwrap();
+        let acct = c.blaxel.as_mut().unwrap();
+        assert_eq!(acct.golden_for("acme/widget"), Some(GoldenSetting::Legacy("wsx-golden-*".into())));
+        assert_eq!(acct.sole_golden().unwrap(), "wsx-golden-*");
+        acct.set_golden("acme/widget", "tod-golden-1");
+        assert_eq!(acct.golden_for("acme/widget"), Some(GoldenSetting::Own("tod-golden-1".into())));
+        // The other repositories keep the old one.
+        assert_eq!(acct.golden_for("acme/other"), Some(GoldenSetting::Legacy("wsx-golden-*".into())));
+        assert!(acct.golden_used_elsewhere("wsx-golden-2026", "acme/widget"));
+        assert!(!acct.golden_used_elsewhere("tod-golden-1", "acme/widget"));
+        assert!(acct.sole_golden().is_err());
+        c.save(&path).unwrap();
+        let back = Config::load(&path).unwrap().blaxel.unwrap();
+        assert_eq!(back.goldens.get("acme/widget").map(String::as_str), Some("tod-golden-1"));
+        assert_eq!(back.golden.as_deref(), Some("wsx-golden-*"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn without_a_repository_only_one_golden_can_be_meant() {
+        let mut acct = Account::new("w");
+        assert!(acct.sole_golden().is_err());
+        acct.set_golden("a/b", "g1");
+        assert_eq!(acct.sole_golden().unwrap(), "g1");
+        acct.set_golden("c/d", "g2");
+        let err = acct.sole_golden().unwrap_err().to_string();
+        assert!(err.contains("a/b") && err.contains("c/d"), "{err}");
+    }
+
+    #[test]
     fn round_trips() {
         let dir = std::env::temp_dir().join(format!("tod-sandbox-cfg-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -422,6 +656,7 @@ claude_token_via = \"env\"
             node_base: Some("base".into()),
             golden: None,
             forwards: vec![],
+            goldens: BTreeMap::new(),
         });
         c.upsert(Sandbox { name: "a".into(), image: "i".into(), url: None, agents: true });
         c.upsert(Sandbox { name: "a".into(), image: "j".into(), url: Some("u".into()), agents: true });
@@ -435,6 +670,73 @@ claude_token_via = \"env\"
         assert_eq!(acct.orchestrator, "orch-2");
         assert_eq!(acct.orchestrator_volume.as_deref(), Some("orch-data"));
         assert_eq!(acct.node_base.as_deref(), Some("base"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn interleaved_writers_each_change_only_their_own_keys() {
+        let dir = std::env::temp_dir().join(format!("tod-sandbox-merge-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(FILE_NAME);
+        let mut start = Config::default();
+        start.blaxel = Some(Account::new("w"));
+        start.blaxel.as_mut().unwrap().set_golden("a/b", "golden-old");
+        start.save(&path).unwrap();
+
+        // A slow writer (making a sandbox) loads, and a quick one (golden
+        // refresh) writes in the middle of it.
+        let slow_base = Config::load(&path).unwrap();
+        let mut slow = slow_base.clone();
+        let mut quick = Config::load(&path).unwrap();
+        let quick_base = quick.clone();
+        quick.blaxel.as_mut().unwrap().set_golden("a/b", "golden-new");
+        quick.blaxel.as_mut().unwrap().set_golden("c/d", "golden-cd");
+        quick.save_changes(&quick_base, &path).unwrap();
+
+        slow.upsert(Sandbox { name: "node".into(), image: "i".into(), url: Some("u".into()), agents: true });
+        let merged = slow.save_changes(&slow_base, &path).unwrap();
+
+        let on_disk = Config::load(&path).unwrap();
+        assert_eq!(on_disk, merged);
+        let acct = on_disk.blaxel.unwrap();
+        assert_eq!(acct.goldens.get("a/b").map(String::as_str), Some("golden-new"), "the slow writer put the old golden back");
+        assert_eq!(acct.goldens.get("c/d").map(String::as_str), Some("golden-cd"));
+        assert!(on_disk.sandboxes.iter().any(|s| s.name == "node"));
+
+        // And the other way round: a removal by one writer survives the other's add.
+        let base = Config::load(&path).unwrap();
+        let mut remover = base.clone();
+        let mut adder = base.clone();
+        remover.sandboxes.retain(|s| s.name != "node");
+        adder.upsert(Sandbox { name: "other".into(), image: "i".into(), url: None, agents: true });
+        remover.save_changes(&base, &path).unwrap();
+        adder.save_changes(&base, &path).unwrap();
+        let names: Vec<_> = Config::load(&path).unwrap().sandboxes.into_iter().map(|s| s.name).collect();
+        assert_eq!(names, vec!["other".to_string()]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn many_threads_saving_at_once_lose_no_key() {
+        let dir = std::env::temp_dir().join(format!("tod-sandbox-threads-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(FILE_NAME);
+        Config::default().save(&path).unwrap();
+        let handles: Vec<_> = (0..8)
+            .map(|i| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    let base = Config::load(&path).unwrap();
+                    let mut mine = base.clone();
+                    mine.upsert(Sandbox { name: format!("s{i}"), image: "i".into(), url: None, agents: true });
+                    mine.save_changes(&base, &path).unwrap();
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(Config::load(&path).unwrap().sandboxes.len(), 8);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

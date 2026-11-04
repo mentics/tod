@@ -40,6 +40,8 @@
 //!   [`node_requests_triggers_sql`] (same shape as `waits`).
 //! - `run_state` (`tod_store::run_state`), created by
 //!   [`run_state_triggers_sql`] (same shape as `cloud_nodes`).
+//! - `node_problems` (`tod_store::node_problems`, machine-local), created by
+//!   [`node_problems_triggers_sql`] in the v94 migration.
 //! - `waits` (`tod_store::waits`), created by [`waits_triggers_sql`] in the
 //!   v67 migration for the same reason.
 //! - `cloud_nodes` (`tod_store::cloud_nodes`), created by
@@ -306,6 +308,24 @@ pub fn node_events_triggers_sql() -> String {
 /// Triggers for `cloud_nodes` (one row per node, keyed by `node_id`).
 pub fn cloud_nodes_triggers_sql() -> String {
     node_keyed_triggers("cloud_nodes")
+}
+
+/// Triggers for `node_problems` (one row per (node, kind): the row id is the
+/// node id and the kind).
+pub fn node_problems_triggers_sql() -> String {
+    let t = "node_problems";
+    let mut sql = String::new();
+    for (op, event, rec) in [("insert", "INSERT", "NEW"), ("update", "UPDATE", "NEW"), ("delete", "DELETE", "OLD")] {
+        sql.push_str(&format!(
+            "
+        CREATE TRIGGER IF NOT EXISTS trg_journey_{t}_{op} AFTER {event} ON {t} BEGIN
+            INSERT INTO journey_changes (node_id, tbl, row_id, op, at)
+            VALUES ({rec}.node_id, '{t}', hex({rec}.node_id) || ':' || {rec}.kind, '{op}', {NOW});
+        END;
+        "
+        ));
+    }
+    sql
 }
 
 /// Triggers for `node_deferrals` (one row per node, keyed by `node_id`).

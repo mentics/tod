@@ -390,6 +390,7 @@ fn work_description(work: &[crate::pr_readiness::Work]) -> String {
         .join(", ")
 }
 
+// removed in A8: replaced by `crate::lifecycle::check_now`.
 /// "Check now": reads GitHub for the node in its current state and records
 /// what it found, with no run. Says what it found, or why it could not
 /// look. A node that is now clear is left for the runner to carry on.

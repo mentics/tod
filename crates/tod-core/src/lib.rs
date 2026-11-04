@@ -13,6 +13,11 @@ pub const CLI_BUILD_STAMP: &str = env!("TOD_CLI_BUILD_STAMP");
 /// build from a tarball with no `.git`). See `build.rs`.
 pub const GIT_COMMIT: &str = env!("TOD_GIT_COMMIT");
 
+/// The commit's time, unix seconds (`git log -1 --format=%ct`), or `"unknown"`
+/// as for [`GIT_COMMIT`]. It orders builds where a hash cannot
+/// (`tod_sandbox::golden`). See `build.rs`.
+pub const GIT_COMMIT_TIME: &str = env!("TOD_GIT_COMMIT_TIME");
+
 /// Whether the working tree had uncommitted changes at build time
 /// (`git status --porcelain`), as `"true"` / `"false"`, or `"unknown"` when
 /// git or the repository is missing. See `build.rs`.
@@ -34,6 +39,7 @@ pub mod environment_context;
 pub mod pr_context;
 pub mod skills_context;
 pub mod environment_request;
+pub mod environment_reset;
 pub mod fuzzy;
 pub mod gate;
 pub mod impact;
@@ -46,6 +52,7 @@ pub mod lifecycle;
 pub mod lifecycle_next;
 pub mod lifecycle_validity;
 pub mod next_actor;
+pub mod node_problems;
 pub mod checkpoint;
 pub mod linear_import;
 pub mod linear_sync;
@@ -63,6 +70,8 @@ pub mod release_watch;
 pub mod pull_requests;
 pub mod run_transcript;
 pub mod run_state;
+pub mod runner_place;
+pub mod sandbox_retire;
 pub mod runner_status;
 pub mod scheduler;
 pub mod wait_cadence;

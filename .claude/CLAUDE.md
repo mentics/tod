@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-`tod` is a desktop task/agent management application built with **GPUI** (GPU-accelerated UI, Rust) and **gpui-component**. It manages "obligations", a conversation view where the user directs an agent that edits the outline (with every change reversible), an interview-style workflow for turning conversation into tasks, and a "fleet" of coding agents (Claude, Cursor) working in worktrees.
+`tod` is a desktop task/agent management application built with **GPUI** (GPU-accelerated UI, Rust) and **gpui-component**. It manages "obligations", a conversation (the workbench's chat drawer) where the user directs an agent that edits the outline (with every change reversible), an interview-style workflow for turning conversation into tasks, and a "fleet" of coding agents (Claude, Cursor) working in worktrees.
 
 **Start with [doc/architecture.md](../doc/architecture.md)**: the one-page overview of the processes (app, daemon, `tod-cli`, supervisor, orchestrator, relay), the crate layering, the data root, how agents are driven, where work runs, and the rules that hold everywhere. The sections below are the crate-by-crate detail behind it.
 
@@ -78,12 +78,12 @@ The dependency direction is deliberate: **policy depends on transport, never the
 reverse.**
 
 - `crates/tod` — thin launcher binary. Owns `build.rs` (which installs the `process/`, `media/` and `skills/` bundles next to the executable) and little else.
-- `crates/tod-ui` — all GPUI code: views, app shell, input/focus primitives, the conversation view, interview views, and the dev-only agent control socket.
+- `crates/tod-ui` — all GPUI code: views, app shell, input/focus primitives, the unified workbench and its chat drawer, interview views, and the dev-only agent control socket.
 - `crates/tod-cli` — the `tod-cli` binary that agents shell out to. Depends on `tod-core` + `tod-store` only (no GPUI, no agent transport) so it starts fast.
 - `crates/tod-core` — policy and orchestration shared by the UI and the CLI: conversation and interview flow, process/phase rules, bundled process- and media-doc resolution, path/settings resolution, the task model, and agent context assembly. Decides *when* and *what* to persist.
 - `crates/tod-agent` — agent transport: the provider interface and its implementations across platforms (Cursor, Claude, mock) and environments. **A leaf crate with no `tod-*` dependencies by design** — it knows how to hold conversations and sessions, and nothing about paths, settings, process docs, or persistence. It is told what to say and reports back.
 - `crates/tod-store` — durable persistence. SQLite-backed (`rusqlite`) storage for **fleet** (agents/tasks/worktrees) and **outline** (task tree) data, plus credentials (OS keyring + `chacha20poly1305` encryption), settings, paths, and Linear API integration. Depends on `tod-agent` for the agent types it persists (`AgentPlatform`, `AgentLaunchOptions`).
-- Cloud sandboxes (Blaxel; [doc/cloud-sandboxes/setup.md](../doc/cloud-sandboxes/setup.md), design in `blaxel-remote.md`): `crates/tod-sandbox` (leaf lib: Blaxel API, relay client, provisioning, `sandboxes.toml`), `crates/tod-sandbox-cli` (the `tod-sandbox` binary), `crates/tod-zed-shim` (the `ssh`/`scp`/`sftp` Zed runs, routing `<name>.tod` hosts to sandboxes), `crates/tod-relay` (the Linux server inside each sandbox, cross-built for `x86_64-unknown-linux-musl`; protocol in `relay-protocol.md`), and `assets/sandbox/bootstrap.sh` (installs dependencies on any image).
+- Cloud sandboxes (Blaxel; [doc/cloud-sandboxes/setup.md](../doc/cloud-sandboxes/setup.md), design in `blaxel-remote.md`): `crates/tod-sandbox` (leaf lib: Blaxel API, relay client, provisioning, `sandboxes.toml`; each writer saves only the keys it changed, under a lock, so a creation that takes minutes never puts back another writer's golden: `Config::save_changes`), `crates/tod-sandbox-cli` (the `tod-sandbox` binary), `crates/tod-zed-shim` (the `ssh`/`scp`/`sftp` Zed runs, routing `<name>.tod` hosts to sandboxes), `crates/tod-relay` (the Linux server inside each sandbox, cross-built for `x86_64-unknown-linux-musl`; protocol in `relay-protocol.md`), and `assets/sandbox/bootstrap.sh` (installs dependencies on any image).
   A sandbox can reach what only this machine can (a database behind an IP allowlist): the relay's `/tunnel` carries port forwards back here ([doc/cloud-sandboxes/port-forwarding.md](../doc/cloud-sandboxes/port-forwarding.md)), and for a node running in the cloud `tod-cli db` asks the daemon, through the orchestrator's broker, to open one and sign a short-lived RDS IAM login ([database-access.md](../doc/cloud-sandboxes/database-access.md)). No credential is stored in a sandbox.
 - `assets/process/` — version-controlled source for agent behavior docs (SKILL files, agent definitions, manifest). Copied by `build.rs` to `target/{debug,release}/process/` so dev runs mirror an installed layout.
 - `crates/tod/media/context/` — version-controlled agent context documents (see **Agent chat context** below). Copied by `build.rs` to `target/{debug,release}/media/`.
@@ -108,33 +108,31 @@ Bundled agent docs resolve separately via `TodInstallPaths` (`TOD_PROCESS_ROOT` 
 
 ### Agent chat context
 
-**Ctrl+J** opens the conversation view (`crates/tod-ui/src/conversation/`) from
-anywhere, focused on the selection. `crates/tod-ui/src/ui/agent_chat.rs` owns the
-app-wide `OpenAgentChat` action (bound with no key context) and the
-`OpenConversation { focus }` action the shell handles. A view that knows its
-selection handles `OpenAgentChat` with `on_action` and dispatches
-`OpenConversation`, propagating when it has nothing to offer; the shell root is
-the fallback (the task tree's selection, else the whole project). The badge sits
+**Ctrl+J** toggles the chat drawer of the unified workbench
+(`crates/tod-ui/src/unified/chat_drawer.rs`), about the focused column's node
+or the tree selection. `crates/tod-ui/src/ui/agent_chat.rs` owns the app-wide
+`OpenAgentChat` action (bound with no key context); the shell root handles it
+(`on_open_agent_chat`: select the unified view, `toggle_chat`). The badge sits
 in the title bar (`render_shortcut_pill_in_context(.., &OpenAgentChat, None, ..)`).
-`proposed` and `design` nodes open the same view from the lifecycle panel, and
-the app nav's "Conversation" opens it on the project.
+The drawer holds only freeform conversations (`ProtocolKind::Outline`); the
+structured lifecycle conversations (Implement, Verify, Review, Fix, a phase
+agent, an evaluator, the PR agent) are driven by the autopilot (the daemon's
+local runner or the supervisor in a node's sandbox), and the user reaches them
+from the task panel's requests and runner menu, in a terminal handoff.
+There is no conversation view and no lifecycle panel any more, and no
+Implement, Verify, Review or Advance button anywhere.
 
-On a node with the Lifecycle capability, the step that moves it along —
-the state's phase work or its evaluation, Implement, Verify, Review, Advance —
-sits beside Send (`conversation/lifecycle.rs`). **Gates are app checks; no
-agent evaluates one** (`tod_core::phase::settle_gate`, over the derived
-criteria in `tod_core::gate::derived`). Advance checks the gate and moves the
-node on when it is clear; the failing criteria, each with a Waive, sit in the
-side pane beneath the list the node's state is about (obligations, plan, or
-findings), never above the input. Gate checks, waiving, and advancing run in
-`views::lifecycle_control::LifecycleController`, one entity the shell shares
-between the conversation view and the lifecycle panel, so a check started in
-either shows in both. The manual escape hatches (force advance, revert, open
-interview) stay in the panel.
+**Gates are app checks; no agent evaluates one** (`tod_core::phase::settle_gate`,
+over the derived criteria in `tod_core::gate::derived`). They are checked in
+two places: the autopilot's `gate` step, which moves the node on when the gate
+is clear, and the task panel's runner menu **Check now**
+(`tod_core::lifecycle::check_now`: `phase::settle_gate`, then the advance when
+the gate is clear, with no agent). `views::lifecycle_control::LifecycleController`
+only keeps the criteria the last check recorded, for display.
 
 **Phase agents** (`doc/lifecycle/phase-agents.md`). In `proposed`, `design`,
 `planning`, `merged`, `released`, and `learn` a phase agent
-(`conversation/phase.rs`, `ProtocolKind::Phase`) does the state's work,
+(`tod_core::conversation::phase`, `ProtocolKind::Phase`) does the state's work,
 judged against its role doc's **Done when** checklist, and records it where
 the gate can check it. Where the work is a judgment it **certifies** the phase
 (`tod-cli phase`, `tod_store::phase`): the certificate holds a digest of what
@@ -193,18 +191,16 @@ A node's state can stop holding after the fact: its obligations or plan
 changed since it entered `ready` (compared with the snapshot
 `tod_store::lifecycle_baseline` takes then, so a reversed change stops
 counting), or verification failed. `tod_core::lifecycle_validity` decides
-that deterministically and names the latest state that still holds; the
-lifecycle panel shows it as an orange callout with **Move back**, re-judged on
-every store change. The app never moves the node itself: the user confirms,
-since a conversation's changes may still be reversed.
+that deterministically and names the latest state that still holds. The app
+never moves the node itself: the user confirms, since a conversation's changes
+may still be reversed.
 
 Every conversation has a **focus** (project, node, obligation, or plan step) and
-the view lists only that focus's conversations. Ctrl+J opens the focus's most
-recent one, or an empty one that is saved on its first send; new conversations
-start only from the picker (Ctrl+N). The view always says **reverse**, never
-"undo" — reversal is built from the conversation's own action log, not the
-Ctrl+Z history. See the conversation section below and
-`doc/conversation/spec.md`.
+the drawer's sessions list shows only that focus's freeform conversations.
+Ctrl+J opens the focus's most recent one, or an empty one that is saved on its
+first send; a new session starts from the drawer's pen icon (or Ctrl+N). The UI
+says **reverse**, never "undo" — reversal is built from the conversation's own
+action log, not the Ctrl+Z history. See the conversation section below.
 
 A conversation holds **one agent session at a time**, keyed
 `conversation-<id>`, with its resume id stored on the conversation row
@@ -226,8 +222,8 @@ an empty reply is normal (shown as "Done, no notes"); `surface/conversation.md`
 states this, and that the agent acts without confirming because everything is
 reversible.
 
-The terminal icon left of Send (`ui::terminal_handoff`, in the conversation
-view and the workbench chat drawer) continues the conversation in the agent's
+The terminal icon left of Send (`ui::terminal_handoff`, in the workbench chat
+drawer and the task panel's requests) continues the conversation in the agent's
 own CLI (`claude --resume <id> --permission-mode auto`, as the app runs
 Claude, or `cursor-agent --resume <id>`), in a terminal
 opened where the agent ran: this machine, the node's dev container, or its
@@ -236,9 +232,11 @@ cloud sandbox (`tod_core::conversation::handoff`,
 conversation's actor, so its outline writes stay in the change set; the app
 closes its own session first and resumes it by id on the next Send.
 
-Every agent chat runs in the conversation view (see **Protocols** below):
-Implement, Verify, Review, the action panel's Chat, and visual design (the
-`visual_design` protocol, whose browser half is `visual_design/`;
+Every agent conversation is a `tod_core::conversation` driver (see
+**Protocols** below) run through `ui::agent_runs::AgentRuns`: the chat
+drawer's freeform chats, the lifecycle sessions the autopilot drives (Implement,
+Verify, Review, Fix, phase agents), and visual design (the `visual_design`
+protocol, whose browser half is `visual_design/`;
 `doc/ui/visual-design-browser.md`). The old standalone chat window and the
 visual-design panel's embedded chat are gone. A surface's context is assembled
 by `tod_core::context_recipes::build_message` (via
@@ -330,7 +328,7 @@ that need it. Three sets of tests hold this together:
   keeps it out of `assets/process/` too. Those role docs may still say *which*
   noun applies in prose; they must not restate how to call it.
 
-### `tod-core::conversation` / `tod-store::conversation` — the conversation view's agent and log
+### `tod-core::conversation` / `tod-store::conversation` — the conversation's agent and log
 
 `tod_store::conversation` (schema v36+) holds `conversations`, their transcript
 `conversation_turns` (`user` / `agent` / `error` / `rotation`), the
@@ -353,14 +351,14 @@ except the lifecycle process.
 **Protocols.** A conversation's `protocol` (schema v39) decides what kind of
 conversation it is: the context recipe, the working directory, the turn
 envelope, what "done" means, whether the app loops it without the user, and
-which side pane the view shows. Replies are never parsed: structured state
+whether a user-facing view of it exists. Replies are never parsed: structured state
 the app needs, the agent records through `tod-cli` as it works.
 `tod_core::conversation::protocol` holds the `Protocol` trait and
 `protocol_for`, the one registry; `implement.rs` is the implementation
 protocol, whose loop keeps sending the agent back to open plan steps until
 the plan is done and a test run it recorded (`tod-cli tests record`) is
 green; a `blocked` plan step hands back to the user. `verify.rs` is its
-mirror for a `verifying` node (the lifecycle panel's Verify). What it
+mirror for a `verifying` node (the autopilot's Verify step). What it
 verifies is the node's **obligations**, not only the plan: the agent
 exercises each one in the running work and records a verdict with evidence
 through `tod-cli verdicts` (`tod_store::verification`, an append-only
@@ -375,12 +373,11 @@ on-entry turn. The `verifying` → `review` gate app-checks both
 given the node's work history (`node_context::render_work_history`: failed
 verdicts and steps, review findings, failed gate criteria, conversation
 counts), since the final state alone reads as a clean run. `review.rs` is the code review
-for a node in `review` (the lifecycle panel's Review): the agent records each
+for a node in `review` (the autopilot's Review step): the agent records each
 finding through `tod-cli review` (`tod_store::review`, on the node, not the
 conversation) and loops until it records `review done`; it replaces the old
-`review` on-entry turn, and the side pane lists the findings, each answered
-from its status badge. `fix.rs` resolves them (the conversation view's Fix,
-beside Review): given the open findings, the agent answers each `fixed` or
+`review` on-entry turn, and the task panel lists the findings. `fix.rs`
+resolves them (the autopilot's Fix step): given the open findings, the agent answers each `fixed` or
 `rejected` with a note — `tod-cli` refuses it the user's answers — and loops
 until none is open and a test run is green. The `review` → `pr` gate is app-checked
 (`tod_core::gate::derived`): the latest review recorded done **and recorded
@@ -390,9 +387,8 @@ out of scope or declined does not count), and no finding is open. The fixer's
 Review again, each Review and Fix a conversation (session) of its own, until a
 review comes back clean. The autopilot stops for the user at
 `REVIEW_ROUND_LIMIT` reviews in one stay (`NeedsHuman::ReviewNotConverging`,
-shown as the node's stopped reason). `tod_ui::conversation::side_pane` picks the pane, and the picker offers a
-"New …" entry per kind the focus can start. Adding a kind means a
-`ProtocolKind` variant, an impl, a registry arm, and a side pane. The spec,
+shown as the node's stopped reason). Adding a kind means a
+`ProtocolKind` variant, an impl, and a registry arm. The spec,
 `doc/conversation/protocols.md`, was deleted in commit `1e13f79` ("cleanup doc
 dir") and is recoverable from that commit's parent; the module comments in
 `tod_core::conversation` are the current description.
@@ -412,7 +408,7 @@ stay only for the interview.
 Starting and collecting a turn run git, Docker, and `tod-cli` (a protocol's
 `prepare`, `progress`, and `finish`, the container environment, the build
 stamp), so the view never calls `send` or `tick` on the main thread: the
-driver goes to the background executor and `tod_ui::conversation::driver_slot`
+driver goes to the background executor and `tod_ui::ui::driver_slot`
 holds what the view shows meanwhile ("Starting the agent…"; Stop is applied
 when it is back). The driver takes the shared agent through `AgentAccess`,
 which `SharedAgentAccess` locks for one provider call at a time, so the UI's
@@ -545,7 +541,7 @@ Nothing starts or builds a container; tod only uses a running one.
   container before sending the file.
 - Code references (`path:line[:col]`) in selectable text and markdown are
   links (`ui::code_links`): a click dispatches `OpenCodeRef`, which the
-  conversation view, the unified view (the chat drawer's focus), or the
+  unified view (the chat drawer's focus) or the
   shell resolves against that node's Files directory and opens through
   `code_editor::open_code_location`, off the UI thread. Host, container,
   and sandbox directories all work.
@@ -557,11 +553,30 @@ Nothing starts or builds a container; tod only uses a running one.
 - **Cloud sandboxes** are the third place ("Runs in → Cloud sandbox";
   `files_places.container_kind = 'sandbox'`, with what each node's sandbox
   starts from in `sandbox_source` / `sandbox_from` (`SandboxFrom`: an image,
-  or a fork of a workspace sandbox)). Every node gets a sandbox of its
-  own (`provision::make_sandbox`, `Sandboxes::create`), whose name is on its
-  location, not the settings. The repository always lives in the sandbox:
-  the image or forked sandbox must already hold it. The Locations dialog lists
-  the workspace's sandboxes (`fleet::sandbox::list`) to pick one to fork;
+  or a fork of a workspace sandbox, normally the repository's golden)). Every
+  node gets **one sandbox of its own**, made by the one creator
+  `provision::make_sandbox` (the only place that makes a node's sandbox;
+  `Sandboxes::create` is only `tod-sandbox create`/`fork`, for sandboxes made
+  by hand) and always able to host the supervisor. Its name,
+  `tod-<slug>-<6 hex of the node id>` (never a numeric suffix; a name Blaxel
+  has that the location does not record is the error "tod lost track of a
+  sandbox", nothing made), is on the node's location
+  (`node_files_locations.sandbox`, the **one record**), not the settings;
+  `cloud_nodes` holds only supervisor/orchestrator state and a copy of the
+  name the orchestrator needs, written from the location. A fork comes from
+  the repository's **golden** (`tod-sandbox golden`, one per repository,
+  refreshed with `tod-sandbox golden refresh` or by the app when this build is
+  newer; it carries the toolchain, the checkout and tod's files, but a fork's
+  proxy update wipes the files, so `make_sandbox` installs them into the fork
+  again without packages: `node::install_into_fork`). `cloud_sync::ensure_supervisor`
+  adds only what the supervisor needs on top. A node whose older records name
+  a sandbox its location does not is adopted (`cloud_sync::adopt`, the menu's
+  **Adopt existing sandbox**), and at `done` the daemon deletes the sandbox
+  (`tod_core::sandbox_retire`, lifecycle config **Delete sandbox**, on by
+  default). Spec: `doc/runner-menu/design.md`. The repository always lives in
+  the sandbox: the image or forked sandbox must already hold it. The Locations
+  dialog lists the workspace's sandboxes (`fleet::sandbox::list`) to pick one
+  to fork;
   the workspace and default image are in Settings → Cloud sandboxes
   (`account_settings` / `set_account_settings`, kept in `sandboxes.toml`,
   not the settings file). `Workdir::Sandbox`
@@ -584,17 +599,47 @@ A hierarchical task/outline model with its own DDL/migration path (`ddl.rs`, `mi
 
 **Lifecycle config** (`Capability::LifecycleConfig`, `tod_store::lifecycle_config`,
 table `node_lifecycle_config`) holds, per phase, an ordered list of skill names
-the agent for that phase should use. It is a capability of its own, not part of
+the agent for that phase should use, and the model and effort it runs with
+(`agents` column, `lifecycle_config::resolve_agent`: each field from the
+nearest node that sets it, applied in `conversation::launch` over the node's
+Agent capability and the settings for that phase's conversations only, the
+phase agent, the evaluator and every skill group alike; the phase a kind runs
+in is `launch::phase_for`). It is a capability of its own, not part of
 Lifecycle, because it is meant for one or two high-level nodes and inherited by
 everything below: `lifecycle_config::resolve` takes the nearest node, from the
 node itself up, that lists the phase (so a lower node overrides per phase, and an
 explicit empty list turns a phase's skills off). The phase keys are the ten
 phase- and protocol-agent phases plus `fix` (`PHASES`). Names are free text and
 not validated when saved (the skill may be set up later).
+A phase's list is flat and ordered, with `;` (`lifecycle_config::GROUP_BREAK`) between
+groups: `a, b; c` is two. The first group is worked in the phase agent's own
+session; each later one runs in a fresh session of the same protocol
+(`Autopilot::side_groups`, `conversations.skill_group`, recorded by
+`ConversationDriver::with_skill_group`) whose Skills block holds only its own
+group (`skills_context::for_group`), after the phase agent's work, every time the
+phase loops. Every phase is the same: coming in, the agent's session and then
+each group run in order, then the gate. A gate that fails with work to do (in
+`pr_draft`/`pr_review`, GitHub showing feedback; woken by a webhook, with polling
+as the fallback) starts again from the agent's session and every group, so what
+a later group posts (a code review) becomes work for the first; a gate with
+nothing to do just waits. `pr_draft` always takes its entry turn, `pr_review`
+only when it has skills (`pr_review_entry_owed`), and neither reruns on a
+restart in the same stay. A leading `;` leaves
+the phase agent's session with no skills; an empty group elsewhere is refused
+(`lifecycle_config::parse_list`). The groups a finished step owes are recorded in the
+run state (`AutopilotState::pending_groups`, saved) and run before anything else,
+so an interrupted run resumes at the group it stopped in, never past it. A phase
+with later groups is always evaluated independently
+(`phase::evaluation_is_independent`): its agent only records `ready`, and the
+evaluator, after the last group, certifies. The local runner says which group
+is running in the node's run state (`StepHook::working_on`).
+`latest_for_focus_with_protocol` never returns a
+later group's session; `list_for_focus` shows all of them.
 `tod_core::skills_context::for_node` renders the "Skills" block
 (`DynamicBlock::ConfiguredSkills`) that each phase agent's opening carries, via
 a `skills` field on `ImplementRequest` and `GateCheckRequest`; the evaluator
-gets the skills of the state it judges. The block holds each skill's **text**,
+gets none (it judges the result against the gate and the role doc's checklist,
+not how the work was done). The block holds each skill's **text**,
 not only its name, so no agent spends turns finding it and a skill marked
 `disable-model-invocation` (kept out of every session's context, refused by
 Claude Code's Skill tool) still works: a name is looked up among tod's own
@@ -604,7 +649,8 @@ container, or sandbox, off the UI thread). A name with no file (a built-in
 such as `simplify`) is passed on for the agent's Skill tool, and the block
 says so. Edited in
 the task editor (`views::lifecycle_config_editor`) or with `tod-cli capabilities
-set <node> lifecycle-config`. Edits are not recorded in a conversation's change set.
+set <node> lifecycle-config` (`--skills`, `--model`, `--effort`). Edits are not
+recorded in a conversation's change set.
 
 **Groups** (`Capability::Groups`, `tod_store::groups`, table `node_groups`)
 has one setting, `by_lifecycle`. The node tree then shows the node's children
@@ -632,7 +678,7 @@ GPUI views live under `views/` (task list, obligations, agent panels, transcript
 
 ### Lists
 
-Every list-shaped view (obligations, plan steps, findings, the change set, the conversation side pane, command history) is converging on one item-list component, which owns the cursor, selection, navigation keys, the row menu, drag reordering, and edit mode. It groups to any depth but its *content rows never nest* — that, not grouping depth, is what separates it from the node tree, where nodes own nodes. The node tree and the transcript are out of scope. The same item affords the same actions wherever it is shown. Spec, including the keyboard-focus rules and the migration order: [doc/ui/item-list.md](../doc/ui/item-list.md).
+Every list-shaped view (obligations, plan steps, findings, the change set, command history) is converging on one item-list component, which owns the cursor, selection, navigation keys, the row menu, drag reordering, and edit mode. It groups to any depth but its *content rows never nest* — that, not grouping depth, is what separates it from the node tree, where nodes own nodes. The node tree and the transcript are out of scope. The same item affords the same actions wherever it is shown. Spec, including the keyboard-focus rules and the migration order: [doc/ui/item-list.md](../doc/ui/item-list.md).
 
 ### GPUI keyboard focus: navigation mode vs. edit mode
 
@@ -682,7 +728,7 @@ launch its own data root and port so this is unambiguous.
 
 ### Journeys
 
-`crates/tod-journey` defines the append-only record format (`Record`/`Actor`/`Event`) that captures what a user, the app, and agents did, for later analysis and for filing problem reports. Recording happens through `tod_core::journey::record`, which is a no-op when the app is not installed with a journey sink configured — call sites never need to branch on whether journeys are on. Every new user-facing lifecycle action (a button in the conversation view or lifecycle panel) must record a `UserAction` with a `Presented` snapshot of the buttons that were on screen and which was primary, following the pattern in `crates/tod-ui/src/conversation/lifecycle.rs` and `crates/tod-ui/src/views/lifecycle_panel.rs` — this is what lets later analysis tell whether the highlighted action was the one actually clicked. Any new node-scoped table needs a `journey_changes` trigger (`crates/tod-store/src/journey_changes.rs`'s pattern) so its writes surface as `DataChanged` rows in the journey; a table intentionally left out needs a documented reason at its definition site. `crates/tod-journeys` is the standalone receiver binary (`init`/`pull`/`show`/`stats`) that decrypts and analyzes bundles sent from `tod`; see `doc/journeys/spec.md` for the full format and protocol.
+`crates/tod-journey` defines the append-only record format (`Record`/`Actor`/`Event`) that captures what a user, the app, and agents did, for later analysis and for filing problem reports. Recording happens through `tod_core::journey::record`, which is a no-op when the app is not installed with a journey sink configured — call sites never need to branch on whether journeys are on. Every new user-facing lifecycle action (a button or menu entry in the task panel, such as the runner menu) must record a `UserAction` with a `Presented` snapshot of the buttons that were on screen and which was primary, following the pattern in `crates/tod-ui/src/unified/panels/task.rs` (`record_action`, `presented`) — this is what lets later analysis tell whether the highlighted action was the one actually clicked. Any new node-scoped table needs a `journey_changes` trigger (`crates/tod-store/src/journey_changes.rs`'s pattern) so its writes surface as `DataChanged` rows in the journey; a table intentionally left out needs a documented reason at its definition site. `crates/tod-journeys` is the standalone receiver binary (`init`/`pull`/`show`/`stats`) that decrypts and analyzes bundles sent from `tod`; see `doc/journeys/spec.md` for the full format and protocol.
 
 ### Unified view
 
@@ -716,11 +762,15 @@ Every failure of what a node waits on ends as `Others` with its error and
 retries or as `You` failed with the error: nothing is logged and dropped
 (`autopilot::github_look_failed`). The tree's status cell is one glyph per
 actor, the strip above it filters by actor, and `tod_core::attention` stays as
-the list of requests behind `You`. The task panel's runner line
-starts, pauses, and resumes the node's lifecycle autopilot on this machine
-(`unified/runners.rs`, `tod_core::autopilot::local`: one thread per run,
-its conversation shown in `AgentRuns` as hosted elsewhere, restarted on the
-next launch if the app closed mid-run) or hands it to the cloud
-(`doc/ui/task-panel.md`, "Runner"). See `doc/ui/unified-view.md` for
+the list of requests behind `You`. The task panel's runner line is a split
+button built by `unified::panels::runner_menu::menu` (Start, Resume, Pause,
+Stop now, Check now, Migrate to…, Reset environment, Delete sandbox, and so
+on): where the node's Files are decides where its autopilot runs
+(`tod_core::runner_place`), on this machine under `tod-agentd` (`unified/runners.rs`:
+the runs are the daemon's and go on with the app closed;
+`tod_core::autopilot::local`, its conversation shown in `AgentRuns` as hosted
+elsewhere) or, for a node whose Files are a cloud sandbox, as a supervisor in
+that sandbox (`doc/ui/task-panel.md`, "Runner"; `doc/runner-menu/design.md`).
+Migrate to… is the way to move a node between places. See `doc/ui/unified-view.md` for
 the full design (layout, pinning, panels, keys) and
 `doc/ui/unified-view-plan.md` for the work-item breakdown.

@@ -40,6 +40,7 @@ pub mod settings;
 pub mod sync;
 pub mod verification;
 pub mod node_events;
+pub mod node_problems;
 pub mod node_requests;
 pub mod run_state;
 pub mod waits;

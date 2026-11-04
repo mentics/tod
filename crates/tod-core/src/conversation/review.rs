@@ -141,7 +141,7 @@ impl Protocol for ReviewProtocol {
         let role_doc = state_role_doc(&manifest, REVIEW)?;
         let cwd = self.cwd(env)?;
         let working_dir = PathBuf::from(cwd.path_text());
-        let skills = crate::skills_context::for_node(fleet, node_id, "review", &cwd)?;
+        let skills = crate::skills_context::for_group(fleet, node_id, "review", &cwd, env.skill_group())?;
         build_review_message(
             env.media,
             &ImplementRequest {

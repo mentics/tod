@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Current fleet schema epoch stored in `PRAGMA user_version`.
-pub const CURRENT_USER_VERSION: i32 = 91;
+pub const CURRENT_USER_VERSION: i32 = 93;
 
 const BUSY_TIMEOUT_MS: i64 = 5000;
 
@@ -614,6 +614,19 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
         conn.execute_batch(&crate::journey_changes::run_state_triggers_sql())?;
         conn.pragma_update(None, "user_version", 91)?;
     }
+    if version < 92 {
+        // Whether a node's sandbox is deleted on the final phase
+        // (`crate::lifecycle_config::add_delete_sandbox`); the sync triggers are remade below.
+        crate::lifecycle_config::add_delete_sandbox(conn)?;
+        conn.pragma_update(None, "user_version", 92)?;
+    }
+    if version < 93 {
+        // `pause`, `stop_now` and `fresh_budget` node requests: the kind
+        // CHECK is rebuilt keeping rows (`crate::node_requests::ensure_kinds`);
+        // the triggers are remade below.
+        crate::node_requests::ensure_kinds(conn)?;
+        conn.pragma_update(None, "user_version", 93)?;
+    }
     // Other branches (the task panel) numbered their own steps 66–67 at the
     // same time as 66–70 above, so a store may be past a version without
     // having these. Every one is idempotent: make sure of them all.
@@ -629,7 +642,7 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
     conn.execute_batch(&crate::journey_changes::cloud_nodes_triggers_sql())?;
     conn.execute_batch(crate::node_events::CREATE_TABLE)?;
     conn.execute_batch(&crate::journey_changes::node_events_triggers_sql())?;
-    conn.execute_batch(crate::node_requests::CREATE_TABLE)?;
+    crate::node_requests::ensure_kinds(conn)?;
     conn.execute_batch(&crate::journey_changes::node_requests_triggers_sql())?;
     conn.execute_batch(crate::run_state::CREATE_TABLE)?;
     conn.execute_batch(&crate::journey_changes::run_state_triggers_sql())?;
@@ -638,6 +651,8 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
     crate::waits::add_detail(conn)?;
     crate::waits::add_retry(conn)?;
     crate::waits::add_stay(conn)?;
+    crate::lifecycle_config::add_delete_sandbox(conn)?;
+    crate::lifecycle_config::add_agents(conn)?;
     // A cloud supervisor's heartbeat for a node (`crate::cloud_activity`):
     // synced, and not journaled (high-frequency bookkeeping).
     conn.execute_batch(crate::cloud_activity::CREATE_TABLE)?;
@@ -651,6 +666,9 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
     // The user's deferrals of nodes: machine-local, not synced, journaled.
     conn.execute_batch(crate::deferrals::CREATE_TABLE)?;
     conn.execute_batch(&crate::journey_changes::deferrals_triggers_sql())?;
+    conn.execute_batch(crate::node_problems::CREATE_TABLE)?;
+    crate::node_problems::ensure_columns(conn)?;
+    conn.execute_batch(&crate::journey_changes::node_problems_triggers_sql())?;
     // The task panel's own steps, first numbered 66–69 on its branch.
     ensure_decisions_reason(conn)?;
     conn.execute_batch(crate::request_feedback::CREATE_TABLE)?;
@@ -658,6 +676,11 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
     crate::phase::ensure_table(conn)?;
     conn.execute_batch(&crate::journey_changes::phase_events_triggers_sql())?;
     ensure_turn_attachments(conn)?;
+    // Added to the v73 step after stores had passed it, so it is made sure of
+    // here, like the rest (`conversations.skill_group`).
+    ensure_skill_group(conn)?;
+    // `files_places.clone_url`: machine-local, no schema version.
+    crate::fleet::repos::files_place::ensure_clone_url(conn)?;
     crate::sync::install(conn)?;
     // Idempotent and cheap — keeps the gate criteria catalog's wording in
     // sync with the source on every startup, not just the migration that
@@ -1484,6 +1507,19 @@ fn ensure_turn_attachments(conn: &Connection) -> Result<()> {
         .exists([])?;
     if !present {
         conn.execute_batch("ALTER TABLE conversation_turns ADD COLUMN attachments TEXT;")?;
+    }
+    Ok(())
+}
+
+/// `conversations.skill_group`: which group of the phase's skills
+/// (`lifecycle_config::groups`) the conversation works with; 0 is the phase
+/// agent's own. A no-op when the column is already there.
+fn ensure_skill_group(conn: &Connection) -> Result<()> {
+    let present = conn
+        .prepare("SELECT 1 FROM pragma_table_info('conversations') WHERE name = 'skill_group'")?
+        .exists([])?;
+    if !present {
+        conn.execute_batch("ALTER TABLE conversations ADD COLUMN skill_group INTEGER NOT NULL DEFAULT 0;")?;
     }
     Ok(())
 }
@@ -4171,6 +4207,37 @@ mod tests {
         let path = dir.join("tod.db");
         let conn = open_writer_connection(&path).unwrap();
         (dir, conn)
+    }
+
+    /// `conversations.skill_group` was added inside the v73 step, after
+    /// stores had passed it: a store at the current version without the
+    /// column must get it, or every conversation query and every sync slice
+    /// of the table fails ("no such column: skill_group").
+    #[test]
+    fn a_store_past_v73_without_skill_group_gets_the_column() {
+        let (dir, conn) = temp_db();
+        // The sync triggers name the column; a store without it has none of them.
+        let triggers: Vec<String> = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 'conversations'")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        for name in triggers {
+            conn.execute_batch(&format!("DROP TRIGGER \"{name}\";")).unwrap();
+        }
+        conn.execute_batch("ALTER TABLE conversations DROP COLUMN skill_group;").unwrap();
+        drop(conn);
+
+        let conn = open_writer_connection(&dir.join("tod.db")).unwrap();
+        let present = conn
+            .prepare("SELECT 1 FROM pragma_table_info('conversations') WHERE name = 'skill_group'")
+            .unwrap()
+            .exists([])
+            .unwrap();
+        assert!(present);
+        fs::remove_dir_all(dir).ok();
     }
 
     /// Put `nodes` (and `list_health_issues`) back in their pre-v26 shape,

@@ -571,7 +571,23 @@ impl FleetStore {
                     && (run.reconnect.is_some() || run.runtime_status == RUNTIME_STATUS_ACTIVE)
             })
             .count();
-        let running = [(shells, "shell(s)"), (agents, "agent(s)")]
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let node_uuid = uuid::Uuid::parse_str(node_id)?;
+        // A runner (a live local lease of kind `run`, or the cloud
+        // supervisor's live heartbeat) must not have its place removed from
+        // under it.
+        let runs = crate::activity::ActivityRepo::new(&conn)
+            .list_for_nodes(&[node_uuid])?
+            .into_iter()
+            .filter(|lease| lease.kind == crate::activity::KIND_RUN && lease.is_live(now_ms))
+            .count();
+        let cloud_runs = usize::from(
+            crate::cloud_activity::get(&conn, node_uuid)?.is_some_and(|beat| beat.is_live(now_ms)),
+        );
+        let running = [(shells, "shell(s)"), (agents, "agent(s)"), (runs + cloud_runs, "runner(s)")]
             .into_iter()
             .filter(|(count, _)| *count > 0)
             .map(|(count, label)| format!("{count} {label}"))

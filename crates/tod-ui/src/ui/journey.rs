@@ -2,7 +2,7 @@
 //! across the whole app in the last 30 minutes — view switches, drawer
 //! opens/closes, conversations opened, keyboard-dispatched actions, the user
 //! actions recorded to a node/project journey (see
-//! `crate::conversation::lifecycle` and `crate::views::lifecycle_panel`), and
+//! `crate::unified::panels::task`), and
 //! settings changes.
 //!
 //! Modeled on the status hub (`ui::status`): a `Global` holding an `Entity`

@@ -461,6 +461,127 @@ pub fn restore_node(data_root: &Path, node_id: &str, sandbox: &str) -> Result<us
     restore(&SandboxRemote::new(sandbox), &local)
 }
 
+/// The runner state that travels with a node between places: the
+/// autopilot's own (`autopilot/<node>.json`: current step, budget used, loop
+/// counters) and the supervisor's grants (`stop-answers.json`). Each is a
+/// local path under the data root and the path the supervisor keeps it at.
+/// The supervisor's replica root is its state directory
+/// (`<SUPERVISOR_STATE_ROOT>/<node>`, `tod-supervisor`'s `Replica`), and the
+/// autopilot keeps its file under the data root it runs with, so inside a
+/// sandbox it is `<state dir>/autopilot/<node>.json`.
+fn state_files(data_root: &Path, node_id: &str) -> [(PathBuf, String); 2] {
+    let state_dir = format!("{}/{node_id}", super::cli_relay::SUPERVISOR_STATE_ROOT);
+    let autopilot = data_root.join("autopilot");
+    [
+        (autopilot.join(format!("{node_id}.json")), format!("{state_dir}/autopilot/{node_id}.json")),
+        (autopilot.join(format!("{node_id}.stop-answers.json")), format!("{state_dir}/stop-answers.json")),
+    ]
+}
+
+/// Copies the runner state a sandbox holds for `node_id` into the data root.
+/// A file the sandbox does not have is not an error (the node never ran
+/// supervised); one it has but cannot be read or kept is. The files copied.
+fn keep_state_via(run: Run, data_root: &Path, node_id: &str) -> Result<usize> {
+    let mut kept = 0;
+    for (local, remote) in state_files(data_root, node_id) {
+        let bytes = run(r#"[ -f "$1" ] && cat "$1"; exit 0"#, &[&remote])
+            .with_context(|| format!("read the runner state {remote}"))?;
+        if bytes.is_empty() {
+            continue;
+        }
+        let dir = local.parent().context("runner state path has no directory")?;
+        std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+        let tmp = local.with_extension("json.keeping");
+        std::fs::write(&tmp, &bytes).with_context(|| format!("write {}", tmp.display()))?;
+        std::fs::rename(&tmp, &local).with_context(|| format!("keep {}", local.display()))?;
+        kept += 1;
+    }
+    Ok(kept)
+}
+
+/// Copies the runner state kept in the data root for `node_id` into a
+/// sandbox, for a supervisor's first wake. Nothing kept is nothing to do.
+fn place_state_via(run: Run, data_root: &Path, node_id: &str) -> Result<usize> {
+    let mut placed = 0;
+    for (local, remote) in state_files(data_root, node_id) {
+        let bytes = match std::fs::read(&local) {
+            Ok(bytes) if !bytes.is_empty() => bytes,
+            Ok(_) => continue,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => return Err(err).with_context(|| format!("read {}", local.display())),
+        };
+        let dir = remote.rsplit_once('/').map_or("/", |(dir, _)| dir);
+        run(r#"mkdir -p "$1""#, &[dir]).with_context(|| format!("create {dir}"))?;
+        let tmp = format!("{remote}.placing");
+        for (n, chunk) in bytes.chunks(CHUNK).enumerate() {
+            let encoded = base64::engine::general_purpose::STANDARD.encode(chunk);
+            let redirect = if n == 0 { ">" } else { ">>" };
+            let script = format!(r#"printf %s "$2" | base64 -d {redirect} "$1""#);
+            run(&script, &[&tmp, &encoded]).with_context(|| format!("send the runner state {remote}"))?;
+        }
+        run(r#"mv "$1" "$2""#, &[&tmp, &remote]).with_context(|| format!("place the runner state {remote}"))?;
+        placed += 1;
+    }
+    Ok(placed)
+}
+
+/// Before `node_id`'s files are removed from where they are: copies what
+/// only that place holds into the data root, so the node resumes in its next
+/// place. A sandbox's agent session logs go into the mirror
+/// ([`pull_node`]) and the supervisor's runner state beside the app's
+/// (`autopilot/`); a supervisor's turns run inside the sandbox and never
+/// fill either. A host or dev-container place has nothing to copy: the
+/// conversation driver keeps the mirror after every turn. A failure is
+/// returned, naming what, and the caller removes nothing.
+pub fn keep_node_state(fleet: &super::FleetStore, node_id: &str) -> Result<()> {
+    let Some(sandbox) = node_sandbox(fleet, node_id)? else {
+        return Ok(());
+    };
+    let root = fleet.paths().root();
+    let remote = SandboxRemote::new(&sandbox);
+    // Only this node's sessions: a sandbox forked from a golden also holds
+    // the golden's own Claude logs, which are not the node's to carry.
+    let local = local_dir(root, node_id);
+    for session in node_session_ids(fleet, node_id)? {
+        keep_session(&remote, &local, &session)
+            .with_context(|| format!("Could not keep the agent session {session} from sandbox {sandbox}"))?;
+    }
+    keep_state_via(&|script, args| remote.sh(script, args), root, node_id)
+        .with_context(|| format!("Could not keep the runner state from sandbox {sandbox}"))?;
+    Ok(())
+}
+
+/// The agent session ids of the conversations about `node_id`.
+fn node_session_ids(fleet: &super::FleetStore, node_id: &str) -> Result<Vec<String>> {
+    let uuid = uuid::Uuid::parse_str(node_id).with_context(|| format!("node id {node_id}"))?;
+    fleet.read(|conn| {
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT agent_session_id FROM conversations
+             WHERE (focus_node_id = ?1 OR focus_id = ?1) AND agent_session_id IS NOT NULL AND agent_session_id != ''",
+        )?;
+        let ids = stmt
+            .query_map([crate::outline::uuid_blob::uuid_to_blob(uuid)], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(ids)
+    })
+}
+
+/// The sandbox `node_id` works in now: the one its Files location records,
+/// the one record of it (`cloud_nodes` holds only a copy for the
+/// orchestrator).
+pub fn node_sandbox(fleet: &super::FleetStore, node_id: &str) -> Result<Option<String>> {
+    Ok(super::provision::node_location(fleet, node_id)?.and_then(|l| l.sandbox().map(str::to_string)))
+}
+
+/// For a node entering sandbox `sandbox`: sends the runner state
+/// [`keep_node_state`] kept, before its supervisor's first wake (the session
+/// logs go in through [`restore_node`]). The number of files sent.
+pub fn place_node_state(fleet: &super::FleetStore, node_id: &str, sandbox: &str) -> Result<usize> {
+    let remote = SandboxRemote::new(sandbox);
+    place_state_via(&|script, args| remote.sh(script, args), fleet.paths().root(), node_id)
+        .with_context(|| format!("Could not send the runner state to sandbox {sandbox}"))
+}
+
 static PROBLEMS: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
 
 /// A background copy failed: logged, and held for the app to show the user
@@ -550,6 +671,191 @@ pub fn keep_session_in_background(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Live: Migrate saw nothing to keep or remove for a node whose sandbox
+    /// only its `cloud_nodes` row named. The Files location is the one record:
+    /// the node's sandbox is the location's, and a row's copy decides nothing.
+    #[test]
+    fn the_nodes_sandbox_is_the_one_its_files_location_records() {
+        use crate::fleet::test_util::{cleanup_fleet_root, temp_fleet_root};
+        let root = temp_fleet_root();
+        let fleet = crate::fleet::FleetStore::open(&root).unwrap();
+        use crate::outline::{CreatePosition, OutlineMutation};
+        fleet.enqueue_outline(OutlineMutation::CreateList { slug: "t".into(), title: "T".into() }).unwrap();
+        let list_id = fleet.list_outline_lists().unwrap()[0].id;
+        let node = uuid::Uuid::new_v4();
+        fleet
+            .enqueue_outline(OutlineMutation::CreateNode {
+                node_id: Some(node),
+                list_id,
+                parent_id: None,
+                anchor_id: None,
+                position: CreatePosition::Below,
+                title: "N".into(),
+            })
+            .unwrap();
+        fleet.writer().flush().unwrap();
+        let id = node.to_string();
+        assert_eq!(node_sandbox(&fleet, &id).unwrap(), None);
+
+        let conn = rusqlite::Connection::open(root.join("tod.db")).unwrap();
+        crate::cloud_nodes::upsert(&conn, node, "node-x", "alice", 1).unwrap();
+        drop(conn);
+        fleet.reload_if_stale().ok();
+        assert_eq!(node_sandbox(&fleet, &id).unwrap(), None, "a cloud row's copy is not the record");
+
+        fleet
+            .enqueue(crate::fleet::FleetMutation::RecordFilesLocation {
+                location: crate::fleet::FilesLocation {
+                    node_id: id.clone(),
+                    source_node_id: id.clone(),
+                    recipe: String::new(),
+                    repo: None,
+                    container: None,
+                    worktree_path: None,
+                    worktree_lease_id: None,
+                    worktree_lease_holder: None,
+                    sandbox: Some("node-y".into()),
+                    created_at: 0,
+                },
+            })
+            .unwrap();
+        fleet.writer().flush().unwrap();
+        fleet.reload_if_stale().ok();
+        assert_eq!(node_sandbox(&fleet, &id).unwrap().as_deref(), Some("node-y"));
+        // The row's copy followed the location in the same transaction.
+        let row = fleet.read(|c| crate::cloud_nodes::get(c, node)).unwrap().unwrap();
+        assert_eq!(row.sandbox, "node-y");
+        drop(fleet);
+        cleanup_fleet_root(&root);
+    }
+
+    /// The `cloud_nodes.sandbox` copy is written only from the node's Files
+    /// location: the app's upsert fails without one and reads its name, a
+    /// replacement or recreate (a new location record) moves an existing
+    /// row's copy in the same transaction, and removing the location drops
+    /// the row with it.
+    #[test]
+    fn the_cloud_row_copy_follows_the_files_location() {
+        use crate::fleet::test_util::{cleanup_fleet_root, temp_fleet_root};
+        use crate::fleet::{FilesLocation, FleetMutation};
+        use crate::outline::{CreatePosition, OutlineMutation};
+        let root = temp_fleet_root();
+        let fleet = crate::fleet::FleetStore::open(&root).unwrap();
+        fleet.enqueue_outline(OutlineMutation::CreateList { slug: "t".into(), title: "T".into() }).unwrap();
+        let list_id = fleet.list_outline_lists().unwrap()[0].id;
+        let node = uuid::Uuid::new_v4();
+        fleet
+            .enqueue_outline(OutlineMutation::CreateNode {
+                node_id: Some(node),
+                list_id,
+                parent_id: None,
+                anchor_id: None,
+                position: CreatePosition::Below,
+                title: "N".into(),
+            })
+            .unwrap();
+        fleet.writer().flush().unwrap();
+        let id = node.to_string();
+        let locate = |sandbox: &str| {
+            fleet
+                .enqueue(FleetMutation::RecordFilesLocation {
+                    location: FilesLocation {
+                        node_id: id.clone(),
+                        source_node_id: id.clone(),
+                        recipe: String::new(),
+                        repo: None,
+                        container: None,
+                        worktree_path: None,
+                        worktree_lease_id: None,
+                        worktree_lease_holder: None,
+                        sandbox: Some(sandbox.into()),
+                        created_at: 0,
+                    },
+                })
+                .unwrap();
+            fleet.writer().flush().unwrap();
+        };
+        let copy = || fleet.read(|c| crate::cloud_nodes::get(c, node)).unwrap();
+
+        // No location, no row: the upsert refuses and names why.
+        let refused = fleet
+            .enqueue(FleetMutation::CloudNodeUpsert { node, user: "alice".into(), accepted_at: 1 })
+            .map(|_| fleet.writer().flush());
+        let err = match refused {
+            Err(err) => format!("{err:#}"),
+            Ok(Err(err)) => format!("{err:#}"),
+            Ok(Ok(())) => String::new(),
+        };
+        assert!(err.contains("Files location names no sandbox"), "{err:?}");
+        assert!(copy().is_none());
+
+        // Recorded from the location.
+        locate("node-1");
+        fleet.enqueue(FleetMutation::CloudNodeUpsert { node, user: "alice".into(), accepted_at: 1 }).unwrap();
+        fleet.writer().flush().unwrap();
+        fleet.reload_if_stale().unwrap();
+        assert_eq!(copy().unwrap().sandbox, "node-1");
+
+        // A replacement or a recreate records a new location: the copy follows
+        // and keeps the row's marks.
+        fleet.enqueue(FleetMutation::CloudNodeMarkLost { node, at: 5 }).unwrap();
+        fleet.writer().flush().unwrap();
+        locate("node-2");
+        fleet.reload_if_stale().unwrap();
+        let row = copy().unwrap();
+        assert_eq!((row.sandbox.as_str(), row.lost_at), ("node-2", Some(5)));
+
+        // Removing the location removes the copy with it.
+        let location = super::super::provision::node_location(&fleet, &id).unwrap().unwrap();
+        super::super::provision::forget_removed_location(&fleet, &id, &location).unwrap();
+        assert!(copy().is_none());
+        assert!(super::super::provision::node_location(&fleet, &id).unwrap().is_none());
+        drop(fleet);
+        cleanup_fleet_root(&root);
+    }
+
+    /// Migrate carried every Claude log in the sandbox (the golden's own
+    /// included). Only the sessions of the node's conversations count.
+    #[test]
+    fn only_the_sessions_of_the_nodes_own_conversations_are_kept() {
+        use crate::conversation::{ConversationRepo, Focus, ProtocolKind};
+        use crate::fleet::test_util::{cleanup_fleet_root, temp_fleet_root};
+        use crate::outline::{CreatePosition, OutlineMutation};
+        let root = temp_fleet_root();
+        let fleet = crate::fleet::FleetStore::open(&root).unwrap();
+        fleet.enqueue_outline(OutlineMutation::CreateList { slug: "t".into(), title: "T".into() }).unwrap();
+        let list_id = fleet.list_outline_lists().unwrap()[0].id;
+        let mut ids = Vec::new();
+        for title in ["mine", "other"] {
+            let node = uuid::Uuid::new_v4();
+            fleet
+                .enqueue_outline(OutlineMutation::CreateNode {
+                    node_id: Some(node),
+                    list_id,
+                    parent_id: None,
+                    anchor_id: None,
+                    position: CreatePosition::Below,
+                    title: title.into(),
+                })
+                .unwrap();
+            ids.push(node);
+        }
+        fleet.writer().flush().unwrap();
+        let conn = rusqlite::Connection::open(root.join("tod.db")).unwrap();
+        for (node, session) in [(ids[0], "sess-mine"), (ids[1], "sess-other")] {
+            let repo = ConversationRepo::new(&conn);
+            let c = repo
+                .create_with_id(uuid::Uuid::new_v4(), Focus::Node(node), ProtocolKind::Implementation, None, None, None)
+                .unwrap();
+            repo.set_agent_session(c.id, Some(session), None).unwrap();
+        }
+        drop(conn);
+        fleet.reload_if_stale().ok();
+        assert_eq!(node_session_ids(&fleet, &ids[0].to_string()).unwrap(), vec!["sess-mine".to_string()]);
+        drop(fleet);
+        cleanup_fleet_root(&root);
+    }
 
     /// A sandbox's projects directory, on disk.
     struct Fs(PathBuf);
@@ -791,6 +1097,50 @@ mod transfer_tests {
         let logs = sh_list(&run).unwrap();
         assert_eq!(logs, vec![RemoteLog { project: "-proj".into(), session: id.into(), size: body.len() as u64 }]);
         assert_eq!(sh_read_from(&run, "-proj", id, 8).unwrap(), body[8..].to_vec());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn runner_state_is_kept_from_a_sandbox_and_placed_into_one() {
+        let Ok(probe) = std::process::Command::new("sh").arg("-c").arg("command -v base64").output() else { return };
+        if !probe.status.success() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("tod-runner-state-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (app, sandbox) = (dir.join("app"), dir.join("sandbox"));
+        std::fs::create_dir_all(&app).unwrap();
+        // A fake sandbox: every absolute path the runner state uses is moved under `sandbox`.
+        let prefix = sandbox.to_string_lossy().replace(std::path::MAIN_SEPARATOR, "/");
+        let run = |script: &str, args: &[&str]| -> Result<Vec<u8>> {
+            let rooted: Vec<String> = args
+                .iter()
+                .map(|a| if a.starts_with('/') { format!("{prefix}{a}") } else { a.to_string() })
+                .collect();
+            let mut all = vec!["-c", script, "sh"];
+            all.extend(rooted.iter().map(String::as_str));
+            let out = std::process::Command::new("sh").args(all).output()?;
+            anyhow::ensure!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+            Ok(out.stdout)
+        };
+        let node = "11111111-2222-3333-4444-555555555555";
+        // Nothing there: nothing kept, and not an error.
+        assert_eq!(keep_state_via(&run, &app, node).unwrap(), 0);
+        let files = state_files(&app, node);
+        std::fs::create_dir_all(files[0].0.parent().unwrap()).unwrap();
+        std::fs::write(&files[0].0, b"{\"step\":3}").unwrap();
+        std::fs::write(&files[1].0, b"{\"answers\":[]}").unwrap();
+        // Into the sandbox (the second arg of the write is base64, never a path), then out into a data root of its own.
+        assert_eq!(place_state_via(&run, &app, node).unwrap(), 2);
+        let other = dir.join("other");
+        assert_eq!(keep_state_via(&run, &other, node).unwrap(), 2);
+        let back = state_files(&other, node);
+        assert_eq!(std::fs::read(&back[0].0).unwrap(), b"{\"step\":3}");
+        assert_eq!(std::fs::read(&back[1].0).unwrap(), b"{\"answers\":[]}");
+        // A failing sandbox is an error naming what, never a silent skip.
+        let failing = |_: &str, _: &[&str]| -> Result<Vec<u8>> { bail!("relay down") };
+        let err = keep_state_via(&failing, &other, node).unwrap_err();
+        assert!(format!("{err:#}").contains("relay down"), "{err:#}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

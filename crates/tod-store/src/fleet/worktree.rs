@@ -630,6 +630,37 @@ fn treehouse_available_for(repo: &Workdir, settings: &TodSettings) -> bool {
     }
 }
 
+/// What to tell the user setting up a location whose nodes get worktrees when
+/// the worktree backend is "Treehouse required" and Treehouse cannot be found
+/// where `repo` is (this machine, or the dev container). `None` when nothing is
+/// wrong: another backend falls back to a plain git worktree, so a missing
+/// Treehouse is not a problem there. Runs programs (and may talk to Docker),
+/// so never on the UI thread.
+pub fn treehouse_required_problem(repo: &Workdir, settings: &TodSettings) -> Option<String> {
+    if settings.worktree_backend != WorktreeBackend::TreehouseRequired {
+        return None;
+    }
+    match repo {
+        Workdir::Host(_) => (!treehouse_available(settings)).then(|| {
+            format!(
+                "The worktree backend (Settings) is \"Treehouse required\", but Treehouse does not run on this machine ({}). \
+                 Nodes here will fail to start. Install it, or change the backend to \"Treehouse default, Git fallback\".",
+                settings.treehouse_program().display()
+            )
+        }),
+        Workdir::Container { .. } | Workdir::Sandbox { .. } => match remote_treehouse(repo) {
+            Ok(Some(_)) => None,
+            Ok(None) => Some(
+                "The worktree backend (Settings) is \"Treehouse required\", but there is no `treehouse` on the PATH in this \
+                 container. Nodes here will fail to start. Install it there, or change the backend to \
+                 \"Treehouse default, Git fallback\"."
+                    .to_string(),
+            ),
+            Err(err) => Some(format!("Could not look for `treehouse` in the container: {err:#}")),
+        },
+    }
+}
+
 /// The `treehouse` where `dir` is (a container or sandbox): the one on its
 /// `PATH`, which sets up its own environment there. Tod's settings for
 /// Treehouse name paths on this machine, so none of them apply.
@@ -1018,6 +1049,20 @@ pub fn validate_git_repo(repo: &Workdir) -> Result<Workdir> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_missing_treehouse_is_a_problem_only_when_it_is_required() {
+        let repo = Workdir::Host(std::path::PathBuf::from("/tmp/repo"));
+        let mut settings = TodSettings::default();
+        settings.treehouse_executable = Some(std::path::PathBuf::from("/nonexistent/treehouse"));
+        settings.worktree_backend = WorktreeBackend::TreehouseWithGitFallback;
+        assert_eq!(treehouse_required_problem(&repo, &settings), None);
+        settings.worktree_backend = WorktreeBackend::GitOnly;
+        assert_eq!(treehouse_required_problem(&repo, &settings), None);
+        settings.worktree_backend = WorktreeBackend::TreehouseRequired;
+        let problem = treehouse_required_problem(&repo, &settings).expect("required and missing");
+        assert!(problem.contains("Treehouse required") && problem.contains("/nonexistent/treehouse"), "{problem}");
+    }
+
     use super::*;
     use std::fs;
     use std::process::Command as StdCommand;

@@ -38,11 +38,14 @@ use crate::ui::style;
 use gpui::{ElementId, Entity, Subscription};
 use gpui_component::Sizable as _;
 use gpui_component::Disableable as _;
-use gpui_component::button::Button;
+use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::scroll::Scrollbar;
 use tod_core::conversation::ConversationStatus;
 use tod_core::runner_status::{LiveTurn, format_tokens};
-use tod_core::next_actor::{NextActor, NodeStanding};
+use tod_core::next_actor::{NextActor, NodeStanding, YouReason};
+use crate::unified::panels::runner_menu::{
+    self, EndedHow, Place, RunState, RunnerAction, RunnerActions, RunnerInputs,
+};
 use crate::views::task_list::standing::{self, PartTone};
 use tod_core::autopilot::Outcome;
 use tod_core::cloud_sync::CloudNode;
@@ -153,175 +156,275 @@ fn now_ms() -> i64 {
 }
 
 /// What the runner line knows beyond the header (T2). The store half
-/// (`lifecycle`, `waiting_since`) is read off the UI thread on store change;
-/// `run_since` is when this panel first saw the node's conversation running.
+/// (`lifecycle`, where the node's files are, the locations) is read off the
+/// UI thread on store change; `run_since` is when this panel first saw the
+/// node's conversation running.
 #[derive(Debug, Default, Clone)]
 struct RunnerLine {
     lifecycle: String,
-    /// The node's Files capability puts its work in a cloud sandbox, so
-    /// running it in the cloud is the default.
-    files_in_sandbox: bool,
-    /// Where the runner runs when it is not in the cloud, for the line:
-    /// "this machine", or this machine and the dev container its work is in.
-    place: String,
+    /// Where the node's files are, which decides the runner menu; `None`
+    /// until the first read, when the menu is empty rather than wrong.
+    place: Option<Place>,
+    /// The autopilot runs under the supervisor in the node's sandbox
+    /// (`tod_core::runner_place::RunnerPlace::Supervisor`).
+    supervised: bool,
+    /// The node has a checkout of its own (a made Files location).
+    has_checkout: bool,
+    /// The node has children: it cannot be migrated.
+    has_children: bool,
+    /// Every global location, for Migrate to…, and the one the node uses.
+    locations: Vec<tod_store::fleet::FilesPlace>,
+    current_location: Option<String>,
+    /// Where the runner runs, for the line: "this machine", or this machine
+    /// and the dev container its work is in, or its sandbox.
+    place_text: String,
+    /// Reading the store for the above failed: shown on the line.
+    load_error: Option<String>,
+    /// The node's recorded background problems (`tod_store::node_problems`):
+    /// failures that happened off any turn of the user's, such as the
+    /// daemon's delete of this node's sandbox at `done`.
+    problems: Vec<tod_store::node_problems::NodeProblem>,
     /// `(slot id, ms)`: the running slot and when it was first seen running.
     run_since: Option<(u64, i64)>,
     /// The status has an elapsed time, so the ticker re-renders each second.
     ticking: bool,
-    /// Set when the node runs in the cloud: its supervisor is its runner.
+    /// Set when the node has a cloud row: its supervisor is its runner.
     cloud: Option<CloudNode>,
-    /// A cloud job (Run in the cloud, Sync now, leaving) is in progress.
-    cloud_busy: bool,
-    /// The latest word from a cloud job; an error when `cloud_failed`.
+    /// The sandbox its Files location records (the one record of it).
+    cloud_sandbox: Option<String>,
+    /// Its old records name a sandbox its location does not: the menu offers
+    /// to adopt it.
+    adoptable: bool,
+    /// A job of the panel's own (Start, Sync now, Delete sandbox…) is in
+    /// progress, and what it is doing.
+    cloud_busy: Option<&'static str>,
+    /// The latest word from a job; an error when `cloud_failed`.
     cloud_note: Option<String>,
     cloud_failed: bool,
-    /// The node's latest supervisor stop question is answered "leave it
-    /// stopped" (`tod_core::stop_questions`): the stop the standing shows is
-    /// the user's own answer, and answering it to continue resumes the node.
-    cloud_stop_answered: bool,
+    /// Pause was asked of the supervisor and it has not stopped yet.
+    pause_asked: bool,
+    /// A question the runner line asks before going on (see [`Prompt`]).
+    prompt: Option<Prompt>,
+    /// Migrate to… the location, once the runner has ended.
+    migration_wait: Option<tod_store::fleet::FilesPlace>,
 }
 
-/// What the runner line's split button offers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RunnerAction {
-    Start,
-    /// Start the autopilot on this machine for a node whose files are in
-    /// the cloud: it stops when the app closes.
-    StartHere,
-    Resume,
-    ResumeFreshBudget,
-    /// Run the current step's agent in a new session: nothing is reopened or
-    /// resumed. Here, or (for a node in the cloud) by its supervisor, with
-    /// nothing reinstalled.
-    RunFresh,
-    /// A node in the cloud stopped by the user's own "leave it stopped"
-    /// answer: answers that question to continue, and wakes its supervisor
-    /// (what Run with a new session does, offered first and named for what
-    /// the user is doing).
-    KeepGoing,
-    Pause,
-    StopNow,
-    /// Read GitHub now instead of at the scheduled time.
-    PollNow,
-    /// Read the node's pull requests now and record where each stands, with
-    /// no run: works wherever the node runs.
-    CheckNow,
-    /// Stop a conversation the user started by hand.
-    StopTurn,
-    RunInCloud,
-    /// Hand a node that runs here to the cloud: an alternative to the
-    /// default action, which continues where it already is.
-    MoveToCloud,
-    SyncCloud,
-    /// Fast-forward the node's workspace checkout to the latest `main` (for
-    /// development, when the workspace's skills or docs changed after the
-    /// checkout was made). Refuses a checkout with uncommitted changes or
-    /// commits of its own.
-    UpdateWorkspace,
-    /// Set the node up again in the sandbox it already has: reinstall tod's
-    /// files, check out its branch, restart the relay and supervisor. For a
-    /// setup that failed or a sandbox missing a file; nothing is deleted.
-    ReinstallCloud,
-    LeaveCloud,
-    /// Delete the node's sandbox in Blaxel (a missing one is fine).
-    DeleteSandbox,
-    /// [`Self::DeleteSandbox`] without the checkpoint of uncommitted work
-    /// first: for a sandbox whose checkpoint cannot run (out of disk, a
-    /// broken checkout), which would otherwise refuse to be deleted.
-    DeleteSandboxAnyway,
+/// A question the runner line asks, with its buttons beside it.
+#[derive(Debug, Clone, PartialEq)]
+enum Prompt {
+    /// Migrate while the runner is active: Pause (finish this step, then
+    /// migrate), Stop now (interrupt, then migrate) or Cancel.
+    MigrateRunning { place: tod_store::fleet::FilesPlace, can_pause: bool },
+    /// Delete sandbox while the runner is active: Stop and delete, or Cancel.
+    DeleteRunning { checkpoint: bool },
 }
 
-impl RunnerAction {
-    fn label(self) -> &'static str {
+impl Prompt {
+    fn text(&self) -> String {
         match self {
-            Self::Start => "Start",
-            Self::StartHere => "Run on this machine instead",
-            Self::Resume => "Resume",
-            Self::ResumeFreshBudget => "Resume with a fresh budget",
-            Self::RunFresh => "Run with a new session",
-            Self::KeepGoing => "Keep going",
-            Self::Pause => "Pause",
-            Self::StopNow => "Stop now",
-            Self::PollNow => "Poll now",
-            Self::CheckNow => "Check now",
-            Self::StopTurn => "Stop",
-            Self::RunInCloud => "Run in the cloud",
-            Self::MoveToCloud => "Move to the cloud",
-            Self::SyncCloud => "Sync now",
-            Self::UpdateWorkspace => "Update workspace to latest main",
-            Self::ReinstallCloud => "Reinstall and restart",
-            Self::LeaveCloud => "Stop running in the cloud",
-            Self::DeleteSandbox => "Delete Sandbox",
-            Self::DeleteSandboxAnyway => "Delete Sandbox without a checkpoint",
+            Prompt::MigrateRunning { place, .. } => format!(
+                "This node is running. Migrate to {} once it has paused (it finishes this step) or been stopped now?",
+                place.name
+            ),
+            Prompt::DeleteRunning { .. } => "This node is running. Stop it and delete its sandbox?".to_string(),
+        }
+    }
+
+    /// The buttons, in order, by label.
+    fn buttons(&self) -> Vec<&'static str> {
+        match self {
+            Prompt::MigrateRunning { can_pause: true, .. } => vec!["Pause", "Stop now", "Cancel"],
+            Prompt::MigrateRunning { can_pause: false, .. } => vec!["Stop now", "Cancel"],
+            Prompt::DeleteRunning { .. } => vec!["Stop and delete", "Cancel"],
         }
     }
 }
 
-/// Whether "Check now" has something to read: the node is in a state that
-/// waits on its pull requests (`pr_draft`, `approved`, `merged`; any other state
-/// "waits for nothing there"), it has pull requests linked, and it is not done.
-fn offers_check_now(lifecycle: &str, has_pull_requests: bool, done: bool) -> bool {
-    !done && has_pull_requests && matches!(lifecycle, "pr_draft" | "approved" | "merged")
+/// What `load_runner` reads: the store half of [`RunnerLine`].
+#[derive(Debug, Default, Clone)]
+struct RunnerFacts {
+    lifecycle: String,
+    cloud: Option<CloudNode>,
+    cloud_sandbox: Option<String>,
+    adoptable: bool,
+    place: Option<Place>,
+    supervised: bool,
+    has_checkout: bool,
+    has_children: bool,
+    locations: Vec<tod_store::fleet::FilesPlace>,
+    current_location: Option<String>,
+    place_text: String,
+    problems: Vec<tod_store::node_problems::NodeProblem>,
+    error: Option<String>,
 }
 
-/// The split button: its default action (with its label and whether it is
-/// disabled) and the menu's.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct RunnerActions {
-    primary: Option<(RunnerAction, &'static str, bool)>,
-    menu: Vec<RunnerAction>,
-}
-
-/// The node's lifecycle state, how long it has waited on the user, and
-/// whether it runs in the cloud.
-fn load_runner(
-    fleet: &FleetStore,
-    node_id: Uuid,
-) -> (String, Option<CloudNode>, bool, String, bool) {
-    let lifecycle = fleet
-        .get_node(&node_id.to_string())
+/// Everything the runner menu needs from the store: the node's lifecycle
+/// state, its cloud row, where its files are (and whether a sandbox exists),
+/// where its runner runs, whether it has a checkout of its own and children,
+/// and the global locations. Reads only, but not for the UI thread. A read
+/// that fails is said, never taken for "no".
+fn load_runner(fleet: &FleetStore, node_id: Uuid) -> RunnerFacts {
+    let mut facts = RunnerFacts::default();
+    let id = node_id.to_string();
+    facts.lifecycle = fleet
+        .get_node(&id)
         .ok()
         .flatten()
         .map(|n| n.lifecycle)
         .unwrap_or_default();
-    let cloud = tod_core::cloud_sync::cloud_node(fleet, &node_id.to_string());
-    let files = fleet.resolve_files_for_node(&node_id.to_string()).ok().flatten();
-    let files_in_sandbox = files.as_ref().is_some_and(|files| files.runs_in_sandbox());
-    let place = match files.as_ref().and_then(|files| files.dev_container.as_ref()) {
+    facts.cloud = tod_core::cloud_sync::cloud_node(fleet, &id);
+    match tod_core::node_problems::for_node(fleet, node_id) {
+        Ok(problems) => facts.problems = problems,
+        Err(err) => {
+            tracing::error!("could not read the problems of node {node_id}: {err:#}");
+            facts.error = Some(format!("Could not read this node's problems: {err:#}"));
+        }
+    }
+    match load_place(fleet, node_id, &mut facts) {
+        Ok(()) => {}
+        Err(err) => {
+            tracing::error!("could not read where node {node_id} runs: {err:#}");
+            facts.error = Some(format!("Could not read where this node runs: {err:#}"));
+        }
+    }
+    facts
+}
+
+fn load_place(fleet: &FleetStore, node_id: Uuid, facts: &mut RunnerFacts) -> anyhow::Result<()> {
+    use anyhow::Context as _;
+    let id = node_id.to_string();
+    let files = fleet.resolve_files_for_node(&id).context("read the node's Files")?;
+    let location = tod_store::fleet::provision::node_location(fleet, &id).context("read the node's location")?;
+    facts.supervised = tod_core::runner_place::RunnerPlace::of(fleet, node_id)? == tod_core::runner_place::RunnerPlace::Supervisor;
+    facts.has_checkout = location.is_some();
+    facts.has_children = fleet.node_has_children(node_id).context("look for the node's children")?;
+    facts.locations = tod_store::fleet::places::list(fleet).context("list the locations")?;
+    facts.current_location = files.as_ref().and_then(|f| f.place_id.clone());
+    let sandbox_made = location.as_ref().and_then(|l| l.sandbox().map(str::to_string));
+    facts.cloud_sandbox = sandbox_made.clone();
+    facts.adoptable = tod_core::cloud_sync::adopt::adoptable(fleet, fleet.paths().root(), &id)
+        .context("look for an old sandbox record to adopt")?;
+    let (place, text) = match files.as_ref().and_then(|files| files.dev_container.as_ref()) {
         Some(dev) if dev.sandbox => {
             // The sandbox is made when something first needs the node's
-            // files, so it can exist (in Blaxel) before the runner is
-            // handed to the cloud.
-            let made = tod_store::fleet::provision::node_location(fleet, &node_id.to_string())
-                .ok()
-                .flatten()
-                .and_then(|location| location.sandbox().map(str::to_string));
-            match made {
-                Some(name) => format!("sandbox {name} exists; runner not in the cloud yet"),
-                None => "not running in the cloud yet".to_string(),
-            }
+            // files, so it can exist before the runner is started.
+            // Only the node's Files location says which sandbox it has.
+            let exists = sandbox_made.is_some();
+            let text = match &sandbox_made {
+                Some(name) => format!("sandbox {name}"),
+                None => "cloud sandbox, not made yet".to_string(),
+            };
+            (Place::Sandbox { exists }, text)
         }
         Some(dev) => match dev.container.as_deref().map(str::trim).filter(|c| !c.is_empty()) {
-            Some(container) => format!("this machine, dev container {container}"),
-            None => "this machine".to_string(),
+            Some(container) => (Place::DevContainer, format!("this machine, dev container {container}")),
+            None => (Place::DevContainer, "this machine, a dev container".to_string()),
         },
-        None => "this machine".to_string(),
+        None => (Place::Host, "this machine".to_string()),
     };
-    // A read that fails is not "no": the line then offers no Keep going, and
-    // the error is logged for the log panel.
-    let stop_answered = match fleet.read(|conn| tod_core::stop_questions::latest(conn, node_id)) {
-        Ok(latest) => latest.is_some_and(|l| l.answer == tod_core::stop_questions::Answer::Stop),
-        Err(err) => {
-            tracing::error!("could not read the stop question of node {node_id}: {err:#}");
-            false
-        }
-    };
-    (lifecycle, cloud, files_in_sandbox, place, stop_answered)
+    facts.place = Some(place);
+    facts.place_text = text;
+    Ok(())
 }
+
+/// What `run_state` reads.
+struct RunFacts<'a> {
+    done: bool,
+    supervised: bool,
+    /// The daemon (or this process) is running the node's autopilot.
+    runner_running: bool,
+    pausing: bool,
+    /// A conversation the user started by hand is running.
+    hand_turn: bool,
+    /// How the last local run ended.
+    outcome: Option<&'a Outcome>,
+    actor: Option<&'a NextActor>,
+    /// Pause was asked of a supervisor that has not stopped yet.
+    pause_asked: bool,
+}
+
+/// Where the node's run stands (`doc/runner-menu/design.md`, "The runner's
+/// state, wherever it runs"): locally from the runner's own state, else, and
+/// for a supervised node, from who is next (`tod_core::next_actor`).
+fn derive_run_state(f: &RunFacts) -> RunState {
+    if f.done {
+        return RunState::Done;
+    }
+    if f.runner_running {
+        return RunState::Active { pausing: f.pausing };
+    }
+    if f.hand_turn {
+        return RunState::HandTurn;
+    }
+    if f.supervised && matches!(f.actor, Some(NextActor::Working { .. })) {
+        return RunState::Active { pausing: f.pause_asked };
+    }
+    // The last local run's own word, when it has one.
+    match f.outcome {
+        Some(Outcome::BudgetExhausted { .. }) => return RunState::Ended(EndedHow::Budget),
+        Some(Outcome::Stopped { .. }) => return RunState::Ended(EndedHow::Stopped),
+        Some(Outcome::NeedsHuman { .. }) => return RunState::Ended(EndedHow::Request),
+        Some(Outcome::Waiting { .. }) => return RunState::Ended(EndedHow::Waiting),
+        Some(Outcome::Done) | None => {}
+    }
+    match f.actor {
+        Some(NextActor::You { why, .. }) => match why {
+            YouReason::Paused => RunState::Ended(EndedHow::Paused),
+            YouReason::Stopped { reason } if reason.to_lowercase().contains("budget") => {
+                RunState::Ended(EndedHow::Budget)
+            }
+            YouReason::Stopped { .. } => RunState::Ended(EndedHow::Stopped),
+            YouReason::Failed { .. } => RunState::Ended(EndedHow::Failed),
+            YouReason::Request { .. } | YouReason::Permission { .. } => RunState::Ended(EndedHow::Request),
+            YouReason::NotStarted => RunState::NeverRun,
+        },
+        // Waiting on something else, or worked by a process this one has not
+        // heard from: there is nothing to start or resume.
+        Some(NextActor::Others { .. }) | Some(NextActor::Working { .. }) => RunState::Ended(EndedHow::Waiting),
+        Some(NextActor::Done) => RunState::Done,
+        None => RunState::NeverRun,
+    }
+}
+
+/// What a check found, in words for the runner line, and whether it is a
+/// failure (red): the gate's verdict and where it went, then what reading
+/// GitHub found, an unreadable GitHub included.
+fn describe_check(found: &tod_core::lifecycle::CheckNow) -> (String, bool) {
+    use tod_core::autopilot::GithubCheck;
+    let mut failed = false;
+    let mut text = if let Some(state) = found.advanced {
+        format!("Checked: the gate is clear; moved to {state}")
+    } else if found.gate.to.is_none() {
+        format!("Checked: {} has no gate", found.gate.from)
+    } else if found.gate.clear() {
+        match &found.held {
+            Some(why) => format!("Checked: the gate is clear, but the node was not moved on: {why}"),
+            None => "Checked: the gate is clear".to_string(),
+        }
+    } else {
+        let failing: Vec<String> = found.gate.failing().map(|c| format!("{} ({})", c.criterion.label, c.detail)).collect();
+        format!("Checked: the gate is not clear: {}", failing.join("; "))
+    };
+    match &found.github {
+        Some(GithubCheck::Waiting { what, .. }) => text.push_str(&format!(". GitHub: waiting for {what}")),
+        Some(GithubCheck::Feedback { what }) => text.push_str(&format!(". GitHub: {what}")),
+        Some(GithubCheck::Clear) => text.push_str(". GitHub: nothing left to wait for"),
+        Some(GithubCheck::Unreadable(why)) => {
+            failed = true;
+            text.push_str(&format!(". GitHub could not be read: {why}"));
+        }
+        Some(GithubCheck::NothingToWaitOn) | None => {}
+    }
+    (text, failed)
+}
+
 
 pub struct TaskPanel {
     node_id: Uuid,
     fleet: Arc<FleetStore>,
+    /// Asks a supervisor to pause or stop now (the request kind), off the UI
+    /// thread. A field so a test can stand in for the network.
+    stop_job: StopJob,
     focus_handle: FocusHandle,
     header: TaskHeader,
     pending_refresh: bool,
@@ -348,6 +451,22 @@ pub struct TaskPanel {
     header_scroll: ScrollHandle,
     requests_scroll: ScrollHandle,
     answered_scroll: ScrollHandle,
+}
+
+/// Starts the job that asks a node's supervisor to pause
+/// (`cloud_sync::REQUEST_PAUSE`) or stop now (`REQUEST_STOP_NOW`); its
+/// updates reach [`TaskPanel::on_cloud_update`].
+type StopJob = fn(&mut TaskPanel, &'static str, &mut Context<TaskPanel>);
+
+/// The real [`StopJob`]: `cloud_node::pause` / `cloud_node::stop_now`.
+fn ask_supervisor_to_stop(panel: &mut TaskPanel, kind: &'static str, cx: &mut Context<TaskPanel>) {
+    let (node, fleet) = (panel.node_id, panel.fleet.clone());
+    let on_update = move |this: &mut TaskPanel, update, cx: &mut Context<TaskPanel>| this.on_cloud_update(node, update, cx);
+    if kind == tod_core::cloud_sync::REQUEST_PAUSE {
+        crate::views::cloud_node::pause(fleet, node.to_string(), cx, on_update);
+    } else {
+        crate::views::cloud_node::stop_now(fleet, node.to_string(), cx, on_update);
+    }
 }
 
 impl HasChangesWatch for TaskPanel {
@@ -424,6 +543,7 @@ impl TaskPanel {
         let mut panel = Self {
             node_id,
             fleet,
+            stop_job: ask_supervisor_to_stop,
             focus_handle,
             requests,
             _requests_subs,
@@ -639,17 +759,25 @@ impl TaskPanel {
         let fleet = self.fleet.clone();
         let node_id = self.node_id;
         cx.spawn(async move |this, cx| {
-            let (lifecycle, cloud, files_in_sandbox, place, stop_answered) = cx
+            let facts = cx
                 .background_executor()
                 .spawn(async move { load_runner(&fleet, node_id) })
                 .await;
             let _ = this.update(cx, |this: &mut TaskPanel, cx| {
                 if this.node_id == node_id {
-                    this.runner.lifecycle = lifecycle;
-                    this.runner.cloud = cloud;
-                    this.runner.files_in_sandbox = files_in_sandbox;
-                    this.runner.place = place;
-                    this.runner.cloud_stop_answered = stop_answered;
+                    this.runner.lifecycle = facts.lifecycle;
+                    this.runner.cloud = facts.cloud;
+                    this.runner.cloud_sandbox = facts.cloud_sandbox;
+                    this.runner.adoptable = facts.adoptable;
+                    this.runner.place = facts.place;
+                    this.runner.supervised = facts.supervised;
+                    this.runner.has_checkout = facts.has_checkout;
+                    this.runner.has_children = facts.has_children;
+                    this.runner.locations = facts.locations;
+                    this.runner.current_location = facts.current_location;
+                    this.runner.place_text = facts.place_text;
+                    this.runner.load_error = facts.error;
+                    this.runner.problems = facts.problems;
                     cx.notify();
                 }
             });
@@ -742,127 +870,58 @@ impl TaskPanel {
         self.agent_runs.update(cx, |runs, cx| runs.stop(slot, cx));
     }
 
-    /// What the split button offers for `status`.
-    fn runner_actions(&self, live: Option<&LiveTurn>, cx: &App) -> RunnerActions {
-        let mut actions = self.runner_actions_for_place(live, cx);
-        // A look at GitHub is tod's own code and needs no run, sandbox or
-        // agent, so it is offered wherever the node runs and whoever is
-        // next: a failed look, a paused run and a lost sandbox are when it
-        // is wanted most. It depends on the state and the links, not on the
-        // standing, since only those decide whether there is anything to read.
-        if offers_check_now(&self.runner.lifecycle, !self.header.pull_requests.is_empty(), self.is_done())
-            && !actions.menu.contains(&RunnerAction::PollNow)
-            && !actions.menu.contains(&RunnerAction::CheckNow)
-        {
-            actions.menu.insert(0, RunnerAction::CheckNow);
-        }
-        actions
-    }
-
-    fn runner_actions_for_place(&self, live: Option<&LiveTurn>, cx: &App) -> RunnerActions {
-        use RunnerAction as A;
+    /// Where the node's run stands now (see [`derive_run_state`]).
+    fn run_state(&self, live: Option<&LiveTurn>, cx: &App) -> RunState {
         let runners = self.runners.read(cx);
         let node = self.node_id;
-        if let Some(cloud) = &self.runner.cloud {
-            // Its sandbox is gone: there is nothing to sync or delete, only
-            // a new sandbox to make (or leaving the cloud).
-            if cloud.lost_at.is_some() {
-                return RunnerActions {
-                    primary: Some((A::RunInCloud, A::RunInCloud.label(), self.runner.cloud_busy)),
-                    menu: if self.runner.cloud_busy { Vec::new() } else { vec![A::LeaveCloud] },
-                };
-            }
-            // After a failure, syncing says nothing: the fix is setting the
-            // node up again in the sandbox it has, without deleting it.
-            if self.runner.cloud_failed {
-                return RunnerActions {
-                    primary: Some((A::ReinstallCloud, A::ReinstallCloud.label(), self.runner.cloud_busy)),
-                    menu: if self.runner.cloud_busy { Vec::new() } else { vec![A::RunFresh, A::SyncCloud, A::UpdateWorkspace, A::DeleteSandbox, A::DeleteSandboxAnyway, A::LeaveCloud] },
-                };
-            }
-            // Stopped by its own "leave it stopped" answer: syncing re-wakes a
-            // supervisor that reads the same answer and stops again. The way
-            // on is to answer it to continue.
-            if self.runner.cloud_stop_answered
-                && matches!(&self.standing, Some(s) if matches!(s.actor, NextActor::You { why: tod_core::next_actor::YouReason::Stopped { .. }, .. }))
-            {
-                return RunnerActions {
-                    primary: Some((A::KeepGoing, A::KeepGoing.label(), self.runner.cloud_busy)),
-                    menu: if self.runner.cloud_busy {
-                        Vec::new()
-                    } else {
-                        vec![A::RunFresh, A::SyncCloud, A::ReinstallCloud, A::UpdateWorkspace, A::DeleteSandbox, A::DeleteSandboxAnyway, A::LeaveCloud]
-                    },
-                };
-            }
-            return RunnerActions {
-                primary: Some((A::SyncCloud, A::SyncCloud.label(), self.runner.cloud_busy)),
-                menu: if self.runner.cloud_busy { Vec::new() } else { vec![A::RunFresh, A::ReinstallCloud, A::UpdateWorkspace, A::DeleteSandbox, A::DeleteSandboxAnyway, A::LeaveCloud] },
-            };
-        }
-        if self.runner.cloud_busy {
-            return RunnerActions {
-                primary: Some((A::RunInCloud, "Starting in the cloud…", true)),
-                menu: Vec::new(),
-            };
-        }
-        if runners.is_running(node) {
-            let pausing = runners.is_pausing(node);
-            return RunnerActions {
-                primary: Some((A::Pause, if pausing { "Pausing…" } else { A::Pause.label() }, pausing)),
-                menu: if live.is_some_and(|l| l.next_poll_ms.is_some()) && !pausing {
-                    vec![A::PollNow, A::StopNow]
-                } else {
-                    vec![A::StopNow]
-                },
-            };
-        }
-        if live.is_some() {
-            return RunnerActions {
-                primary: Some((A::StopTurn, A::StopTurn.label(), false)),
-                menu: Vec::new(),
-            };
-        }
-        if self.is_done() {
-            return RunnerActions::default();
-        }
-        // The default action continues where the node already runs; the menu
-        // holds the alternatives. A node whose files are in a cloud sandbox
-        // runs there (a run here would stop with the app).
-        if self.runner.files_in_sandbox {
-            return RunnerActions {
-                primary: Some((A::RunInCloud, A::RunInCloud.label(), false)),
-                menu: vec![A::StartHere],
-            };
-        }
-        match runners.outcome(node) {
-            Some(Outcome::BudgetExhausted { .. }) => RunnerActions {
-                primary: Some((A::ResumeFreshBudget, A::ResumeFreshBudget.label(), false)),
-                menu: vec![A::RunFresh, A::MoveToCloud],
-            },
-            Some(outcome) if *outcome != Outcome::Done => RunnerActions {
-                primary: Some((A::Resume, A::Resume.label(), false)),
-                menu: vec![A::ResumeFreshBudget, A::RunFresh, A::MoveToCloud],
-            },
-            _ => RunnerActions {
-                primary: Some((A::Start, A::Start.label(), false)),
-                menu: vec![A::RunFresh, A::MoveToCloud],
-            },
-        }
+        let running = runners.is_running(node);
+        derive_run_state(&RunFacts {
+            done: self.is_done(),
+            supervised: self.runner.supervised,
+            runner_running: running,
+            pausing: runners.is_pausing(node),
+            hand_turn: live.is_some() && !running,
+            // A supervised node's runs are the supervisor's: this machine's
+            // last outcome (from before a migration) says nothing of them.
+            outcome: if self.runner.supervised { None } else { runners.outcome(node) },
+            actor: self.standing.as_ref().map(|s| &s.actor),
+            pause_asked: self.runner.pause_asked,
+        })
     }
 
-    /// The journey's snapshot of the split button and the line beside it.
+    /// What the split button offers: `runner_menu::menu` over what the panel
+    /// knows. Empty until the store has been read once.
+    fn runner_actions(&self, live: Option<&LiveTurn>, cx: &App) -> RunnerActions {
+        let Some(place) = self.runner.place else {
+            return RunnerActions { default: None, menu: Vec::new(), busy: self.runner.cloud_busy };
+        };
+        runner_menu::menu(&RunnerInputs {
+            place,
+            supervised: self.runner.supervised,
+            run: self.run_state(live, cx),
+            has_checkout: self.runner.has_checkout,
+            has_children: self.runner.has_children,
+            adoptable: self.runner.adoptable,
+            busy: self.runner.cloud_busy,
+        })
+    }
+
+    /// The journey's snapshot of the split button and the line beside it:
+    /// the default action (flagged), the menu's entries, and a disabled
+    /// default while a job of the panel's own runs.
     fn presented(&self, actions: &RunnerActions) -> Presented {
-        let mut presented: Vec<PresentedAction> = actions
-            .primary
-            .iter()
-            .map(|(action, label, disabled)| PresentedAction {
+        let mut presented: Vec<PresentedAction> = Vec::new();
+        if let Some(action) = actions.default {
+            presented.push(PresentedAction {
                 id: format!("{action:?}"),
-                label: label.to_string(),
+                label: action.label().to_string(),
                 primary: true,
-                disabled: *disabled,
-            })
-            .collect();
+                disabled: false,
+            });
+        }
+        if let Some(what) = actions.busy {
+            presented.push(PresentedAction { id: "Busy".to_string(), label: what.to_string(), primary: true, disabled: true });
+        }
         presented.extend(actions.menu.iter().map(|action| PresentedAction {
             id: format!("{action:?}"),
             label: action.label().to_string(),
@@ -882,36 +941,45 @@ impl TaskPanel {
         }
     }
 
-    /// The split button's click handler, its default action's and its
-    /// menu's: records the `UserAction`, then does it.
-    fn perform(&mut self, action: RunnerAction, cx: &mut Context<Self>) {
-        use RunnerAction as A;
-        let (slot, live) = self.runner_status(cx);
-        let actions = self.runner_actions(live.as_ref(), cx);
-        let presented = self.presented(&actions);
-        let node = self.node_id;
+    /// Records a `UserAction` for `id` with the split button as presented now.
+    fn record(&self, id: String, cx: &mut Context<Self>) {
+        let (_, live) = self.runner_status(cx);
+        let presented = self.presented(&self.runner_actions(live.as_ref(), cx));
         crate::ui::journey::record_action(
             cx,
-            Focus::Node(node),
-            format!("{action:?}"),
+            Focus::Node(self.node_id),
+            id,
             crate::ui::journey::Source::Click,
             "task_panel",
             presented,
         );
+    }
+
+    /// The split button's click handler, its default action's and its
+    /// menu's: records the `UserAction`, then does it where the node's
+    /// runner runs (`tod_core::runner_place`): the daemon's local runner
+    /// through [`NodeRunners`], or the supervisor in the node's sandbox
+    /// through `views::cloud_node`.
+    fn perform(&mut self, action: RunnerAction, cx: &mut Context<Self>) {
+        use RunnerAction as A;
+        let (slot, live) = self.runner_status(cx);
+        let run = self.run_state(live.as_ref(), cx);
+        self.record(format!("{action:?}"), cx);
+        let node = self.node_id;
+        let supervised = self.runner.supervised;
         match action {
-            A::Start | A::StartHere | A::Resume => {
+            A::Start if supervised => self.supervised_go(None, cx),
+            A::Resume if supervised => self.supervised_go(Some(tod_core::cloud_sync::REQUEST_KEEP_GOING), cx),
+            A::Start | A::Resume => {
                 let _ = self.runners.update(cx, |r, cx| r.start(node, false, cx));
             }
-            // A node in the cloud: its supervisor starts the step in a new
-            // session. (A lost sandbox is not offered this: it needs a new
-            // sandbox, which starts a new session anyway.)
-            A::RunFresh if self.runner.cloud.is_some() => self.cloud_request(tod_core::cloud_sync::REQUEST_FRESH_SESSION, cx),
-            // Only offered to a node in the cloud; the wake records the
-            // answer to continue first (`continue_over_stop_answer`).
-            A::KeepGoing if self.runner.cloud.is_some() => self.cloud_request(tod_core::cloud_sync::REQUEST_KEEP_GOING, cx),
-            A::KeepGoing => self.runners.update(cx, |r, cx| {
-                r.fail(node, "Keep going answers a cloud node's stop question; this node does not run in the cloud".into(), cx)
-            }),
+            A::ResumeFreshBudget if supervised => {
+                self.supervised_go(Some(tod_core::cloud_sync::REQUEST_FRESH_BUDGET), cx)
+            }
+            A::ResumeFreshBudget => {
+                let _ = self.runners.update(cx, |r, cx| r.start(node, true, cx));
+            }
+            A::RunFresh if supervised => self.supervised_go(Some(tod_core::cloud_sync::REQUEST_FRESH_SESSION), cx),
             A::RunFresh => {
                 let root = self.fleet.paths().root().to_path_buf();
                 match tod_core::autopilot::AutopilotState::request_fresh_session(&root, node) {
@@ -921,72 +989,221 @@ impl TaskPanel {
                     Err(err) => self.runners.update(cx, |r, cx| r.fail(node, format!("{err:#}"), cx)),
                 }
             }
-            A::ResumeFreshBudget => {
-                let _ = self.runners.update(cx, |r, cx| r.start(node, true, cx));
-            }
-            A::Pause => self.runners.update(cx, |r, cx| r.pause(node, cx)),
-            A::StopNow => self.runners.update(cx, |r, cx| r.stop_now(node, cx)),
-            // A run polling reads GitHub at once; one that ended to wait is
-            // started again, which reads it first thing.
-            A::PollNow => {
-                if self.runners.read(cx).is_running(node) {
-                    self.runners.update(cx, |r, cx| r.poll_now(node, cx));
-                } else {
-                    let _ = self.runners.update(cx, |r, cx| r.start(node, false, cx));
-                }
-            }
+            A::Pause => self.pause_run(cx),
+            A::StopNow => self.stop_run(run, slot, cx),
             A::CheckNow => self.check_now(cx),
-            A::StopTurn => {
-                if let Some(slot) = slot {
-                    self.stop_runner(slot, cx);
-                }
+            // A submenu of the locations: choosing one is `choose_migration`.
+            A::MigrateTo => self.runners.update(cx, |r, cx| {
+                r.fail(node, "Migrate to… needs a location: pick one from its submenu".into(), cx)
+            }),
+            A::ResetEnvironment => {
+                self.cloud_started("Setting the environment up again…", cx);
+                crate::views::cloud_node::reset_environment(self.fleet.clone(), node, cx, move |this, update, cx| {
+                    this.on_cloud_update(node, update, cx)
+                });
             }
-            A::RunInCloud | A::MoveToCloud | A::ReinstallCloud => {
-                self.cloud_started(cx);
-                crate::views::cloud_node::run_in_cloud(
-                    self.fleet.clone(),
-                    node.to_string(),
-                    cx,
-                    move |this, update, cx| this.on_cloud_update(node, update, cx),
-                );
-            }
-            A::SyncCloud => {
-                self.cloud_started(cx);
-                crate::views::cloud_node::sync_now(self.fleet.clone(), Some(node), cx, move |this, update, cx| {
+            A::AdoptSandbox => {
+                self.cloud_started("Adopting the existing sandbox…", cx);
+                crate::views::cloud_node::adopt_sandbox(self.fleet.clone(), node.to_string(), cx, move |this, update, cx| {
                     this.on_cloud_update(node, update, cx)
                 });
             }
             A::UpdateWorkspace => self.update_workspace(cx),
-            A::DeleteSandbox => {
-                self.cloud_started(cx);
-                crate::views::cloud_node::delete_sandbox(
-                    self.fleet.clone(),
-                    node.to_string(),
-                    cx,
-                    move |this, update, cx| this.on_cloud_update(node, update, cx),
-                );
+            A::DeleteSandbox | A::DeleteSandboxAnyway => {
+                let checkpoint = action == A::DeleteSandbox;
+                if matches!(run, RunState::Active { .. }) {
+                    self.runner.prompt = Some(Prompt::DeleteRunning { checkpoint });
+                } else {
+                    self.cloud_started("Deleting the sandbox…", cx);
+                    if checkpoint {
+                        crate::views::cloud_node::delete_sandbox(
+                            self.fleet.clone(),
+                            node.to_string(),
+                            cx,
+                            move |this, update, cx| this.on_cloud_update(node, update, cx),
+                        );
+                    } else {
+                        crate::views::cloud_node::delete_sandbox_anyway(
+                            self.fleet.clone(),
+                            node.to_string(),
+                            cx,
+                            move |this, update, cx| this.on_cloud_update(node, update, cx),
+                        );
+                    }
+                }
             }
-            A::DeleteSandboxAnyway => {
-                self.cloud_started(cx);
-                crate::views::cloud_node::delete_sandbox_anyway(
-                    self.fleet.clone(),
-                    node.to_string(),
-                    cx,
-                    move |this, update, cx| this.on_cloud_update(node, update, cx),
-                );
-            }
-            A::LeaveCloud => {
-                self.cloud_started(cx);
-                crate::views::cloud_node::stop_running(
-                    self.fleet.clone(),
-                    node.to_string(),
-                    true,
-                    cx,
-                    move |this, update, cx| this.on_cloud_update(node, update, cx),
-                );
+            A::SyncNow => {
+                self.cloud_started("Syncing…", cx);
+                crate::views::cloud_node::sync_now(self.fleet.clone(), Some(node), cx, move |this, update, cx| {
+                    this.on_cloud_update(node, update, cx)
+                });
             }
         }
         cx.notify();
+    }
+
+    /// Start, or go on with, a supervised node. `None` starts it (making its
+    /// sandbox when it has none); a request goes to its supervisor, except
+    /// that a node with no sandbox now (never made, deleted, or lost) can
+    /// only be started: its new sandbox starts the step in a new session.
+    fn supervised_go(&mut self, kind: Option<&'static str>, cx: &mut Context<Self>) {
+        let node = self.node_id;
+        let has_sandbox = matches!(self.runner.place, Some(Place::Sandbox { exists: true }))
+            && self.runner.cloud.as_ref().is_some_and(|cloud| cloud.lost_at.is_none());
+        match kind {
+            Some(kind) if has_sandbox => self.cloud_request(kind, cx),
+            _ => {
+                self.cloud_started("Starting…", cx);
+                crate::views::cloud_node::run_in_cloud(self.fleet.clone(), node.to_string(), cx, move |this, update, cx| {
+                    this.on_cloud_update(node, update, cx)
+                });
+            }
+        }
+    }
+
+    /// Pause: the local runner stops once its turn ends; a supervised one is
+    /// asked to, at its next boundary.
+    fn pause_run(&mut self, cx: &mut Context<Self>) {
+        let node = self.node_id;
+        if self.runner.supervised {
+            self.runner.pause_asked = true;
+            self.cloud_started("Asking the supervisor to pause…", cx);
+            (self.stop_job)(self, tod_core::cloud_sync::REQUEST_PAUSE, cx);
+        } else {
+            self.runners.update(cx, |r, cx| r.pause(node, cx));
+        }
+    }
+
+    /// Stop now: a conversation the user started by hand through
+    /// `AgentRuns`, the local runner through [`NodeRunners`], a supervised
+    /// one by request.
+    fn stop_run(&mut self, run: RunState, slot: Option<u64>, cx: &mut Context<Self>) {
+        let node = self.node_id;
+        match run {
+            RunState::HandTurn => {
+                if let Some(slot) = slot {
+                    self.stop_runner(slot, cx);
+                }
+            }
+            _ if self.runner.supervised => {
+                self.cloud_started("Asking the supervisor to stop now…", cx);
+                (self.stop_job)(self, tod_core::cloud_sync::REQUEST_STOP_NOW, cx);
+            }
+            _ => self.runners.update(cx, |r, cx| r.stop_now(node, cx)),
+        }
+    }
+
+    /// Migrate to `place`: asks first while the runner is active, and calls
+    /// the migration (`ui::files_impact::confirm_migrate`) only once it has
+    /// ended (see `drain_migration`).
+    fn choose_migration(&mut self, place: tod_store::fleet::FilesPlace, cx: &mut Context<Self>) {
+        self.record(format!("MigrateTo({})", place.name), cx);
+        let (_, live) = self.runner_status(cx);
+        match self.run_state(live.as_ref(), cx) {
+            RunState::Active { .. } => self.runner.prompt = Some(Prompt::MigrateRunning { place, can_pause: true }),
+            RunState::HandTurn => self.runner.prompt = Some(Prompt::MigrateRunning { place, can_pause: false }),
+            _ => self.runner.migration_wait = Some(place),
+        }
+        cx.notify();
+    }
+
+    /// An answer to the runner line's question: recorded with the buttons
+    /// shown (the first is the default), then done.
+    fn answer_prompt(&mut self, label: &'static str, cx: &mut Context<Self>) {
+        let Some(prompt) = self.runner.prompt.take() else {
+            return;
+        };
+        let presented = Presented {
+            actions: prompt
+                .buttons()
+                .into_iter()
+                .enumerate()
+                .map(|(i, l)| PresentedAction { id: l.to_string(), label: l.to_string(), primary: i == 0, disabled: false })
+                .collect(),
+            focused: None,
+            notices: vec![prompt.text()],
+        };
+        crate::ui::journey::record_action(
+            cx,
+            Focus::Node(self.node_id),
+            label.to_string(),
+            crate::ui::journey::Source::Click,
+            "task_panel",
+            presented,
+        );
+        let node = self.node_id;
+        let (slot, live) = self.runner_status(cx);
+        let run = self.run_state(live.as_ref(), cx);
+        match (prompt, label) {
+            (Prompt::MigrateRunning { place, .. }, "Pause") => {
+                self.pause_run(cx);
+                self.runner.migration_wait = Some(place);
+            }
+            (Prompt::MigrateRunning { place, .. }, "Stop now") => {
+                self.stop_run(run, slot, cx);
+                self.runner.migration_wait = Some(place);
+            }
+            (Prompt::DeleteRunning { checkpoint }, "Stop and delete") => {
+                // A run hosted in this process is stopped here; the daemon's
+                // and a supervisor's are stopped by the job itself.
+                if self.runners.read(cx).is_running(node) {
+                    self.runners.update(cx, |r, cx| r.stop_now(node, cx));
+                }
+                self.cloud_started("Stopping, then deleting the sandbox…", cx);
+                crate::views::cloud_node::stop_and_delete_sandbox(
+                    self.fleet.clone(),
+                    node.to_string(),
+                    checkpoint,
+                    cx,
+                    move |this, update, cx| this.on_cloud_update(node, update, cx),
+                );
+            }
+            // Cancel: nothing changes.
+            _ => {}
+        }
+        cx.notify();
+    }
+
+    /// Once the runner has ended, the pending migration begins: the sessions
+    /// are kept, the impact is shown, and the node's location is changed.
+    /// Called from render, which has the window the dialog needs.
+    fn drain_migration(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(place) = self.runner.migration_wait.clone() else {
+            return;
+        };
+        if self.runner.cloud_busy.is_some() {
+            return;
+        }
+        let (_, live) = self.runner_status(cx);
+        if matches!(self.run_state(live.as_ref(), cx), RunState::Active { .. } | RunState::HandTurn) {
+            return;
+        }
+        self.runner.migration_wait = None;
+        self.runner.cloud_note = None;
+        self.runner.cloud_failed = false;
+        let weak = cx.weak_entity();
+        let name = place.name.clone();
+        crate::ui::files_impact::confirm_migrate(
+            window,
+            cx,
+            self.fleet.clone(),
+            tod_store::TodPaths::at(self.fleet.paths().root()),
+            self.node_id.to_string(),
+            place,
+            Box::new(move |result, _window, cx| {
+                let _ = weak.update(cx, |this: &mut TaskPanel, cx| {
+                    let (note, failed) = match result {
+                        Ok(()) => (format!("Migrated to {name}. Nothing was started."), false),
+                        // The children refusal shows here too.
+                        Err(message) => (format!("Could not migrate to {name}: {message}"), true),
+                    };
+                    this.runner.cloud_note = Some(note);
+                    this.runner.cloud_failed = failed;
+                    this.refresh_runner(cx);
+                    cx.notify();
+                });
+            }),
+        );
     }
 
     /// "Update workspace to latest main": git runs in the node's workspace
@@ -1016,100 +1233,37 @@ impl TaskPanel {
         .detach();
     }
 
-    /// "Check now": reads GitHub off the UI thread, records where each pull
-    /// request stands, and says what it found (or why it could not look).
+    /// "Check now": the gate check the autopilot makes, with no agent
+    /// (`tod_core::lifecycle::check_now`), off the UI thread; the line says
+    /// what it found, an unreadable GitHub and a reason the node was not
+    /// moved on included. It never starts or wakes the runner.
     fn check_now(&mut self, cx: &mut Context<Self>) {
         let node = self.node_id;
         let fleet = self.fleet.clone();
         let root = fleet.paths().root().to_path_buf();
-        // A lost sandbox has no supervisor to wake.
-        let in_cloud = self.runner.cloud.as_ref().is_some_and(|cloud| cloud.lost_at.is_none());
-        let sandbox_lost = self.runner.cloud.as_ref().is_some_and(|cloud| cloud.lost_at.is_some());
-        self.runner.cloud_note = Some("Checking GitHub…".to_string());
+        self.runner.cloud_note = Some("Checking the gate…".to_string());
         self.runner.cloud_failed = false;
         cx.spawn(async move |this, cx| {
-            // A clear node goes on at once: a node in the cloud has its
-            // supervisor woken (the cancelled wait is sent first), one here
-            // is started, rather than left until the next scheduled look.
             let result = cx
                 .background_executor()
-                .spawn(async move {
-                    let found = tod_core::autopilot::check_now(&fleet, node, &root)?;
-                    let woke = match (&found, in_cloud) {
-                        (tod_core::autopilot::GithubCheck::Clear | tod_core::autopilot::GithubCheck::Feedback { .. }, true) => Some(
-                            tod_core::cloud_sync::wake_node_tracked(&fleet, &root, &node.to_string(), &mut |_| {}),
-                        ),
-                        _ => None,
-                    };
-                    anyhow::Ok((found, woke))
-                })
+                .spawn(async move { tod_core::lifecycle::check_now(&fleet, node, &root) })
                 .await;
             let _ = this.update(cx, |this: &mut TaskPanel, cx| {
-                use tod_core::autopilot::GithubCheck;
                 let (note, failed) = match result {
-                    Ok((GithubCheck::Waiting { what, .. }, _)) => (format!("Checked GitHub: waiting for {what}"), false),
-                    // The work is the agent's, so the note says what putting
-                    // it on that work did, never that it is on it already.
-                    Ok((GithubCheck::Feedback { what }, woke)) => match woke {
-                        Some(Err(err)) => (format!("Checked GitHub: {what}, but waking the cloud node failed: {err:#}"), true),
-                        Some(Ok((done, true))) => (format!("Checked GitHub: {what}; {done}."), false),
-                        Some(Ok((done, false))) => (
-                            format!(
-                                "Checked GitHub: {what}; {done}, but its supervisor has not reported in after {} \
-                                 seconds. Sync now looks again.",
-                                tod_core::cloud_sync::SUPERVISOR_REPORTS_WITHIN.as_secs()
-                            ),
-                            true,
-                        ),
-                        None if sandbox_lost => {
-                            (format!("Checked GitHub: {what}. Run in the cloud to put its agent on it."), false)
-                        }
-                        None => {
-                            if this.runners.read(cx).is_running(node) {
-                                (format!("Checked GitHub: {what}; its runner is already going."), false)
-                            } else {
-                                match this.runners.update(cx, |r, cx| r.start(node, false, cx)) {
-                                    Ok(()) => (format!("Checked GitHub: {what}; starting its runner."), false),
-                                    Err(err) => (format!("Checked GitHub: {what}, but its runner could not start: {err}"), true),
-                                }
-                            }
-                        }
-                    },
-                    Ok((GithubCheck::Clear, Some(Ok((done, true))))) => {
-                        (format!("Checked GitHub: nothing left to wait for; {done}."), false)
-                    }
-                    Ok((GithubCheck::Clear, Some(Ok((done, false))))) => (
-                        format!(
-                            "Checked GitHub: nothing left to wait for; {done}, but its supervisor has not reported \
-                             in after {} seconds. Sync now looks again.",
-                            tod_core::cloud_sync::SUPERVISOR_REPORTS_WITHIN.as_secs()
-                        ),
-                        true,
-                    ),
-                    Ok((GithubCheck::Clear, Some(Err(err)))) => {
-                        (format!("Checked GitHub: nothing left to wait for, but waking the cloud node failed: {err:#}"), true)
-                    }
-                    Ok((GithubCheck::Clear, None)) if sandbox_lost => (
-                        "Checked GitHub: nothing left to wait for. Run in the cloud to go on.".to_string(),
-                        false,
-                    ),
-                    Ok((GithubCheck::Clear, None)) => {
-                        if !this.runners.read(cx).is_running(node) {
-                            let _ = this.runners.update(cx, |r, cx| r.start(node, false, cx));
-                        }
-                        ("Checked GitHub: nothing left to wait for; going on.".to_string(), false)
-                    }
-                    Ok(_) => ("Checked GitHub: this state waits for nothing there.".to_string(), false),
-                    Err(err) => (format!("Could not check GitHub: {err:#}"), true),
+                    Ok(found) => describe_check(&found),
+                    Err(err) => (format!("Could not check: {err:#}"), true),
                 };
-                this.runner.cloud_note = Some(note);
-                this.runner.cloud_failed = failed;
-                this.refresh_runner(cx);
-                cx.notify();
+                if this.node_id == node {
+                    this.runner.cloud_note = Some(note);
+                    this.runner.cloud_failed = failed;
+                    this.refresh_runner(cx);
+                    cx.notify();
+                }
             });
         })
         .detach();
     }
+
 
     /// Defer (a menu of how long) for a node that is on the user, Bring back
     /// for one deferred, nothing otherwise.
@@ -1189,6 +1343,10 @@ impl TaskPanel {
     pub fn set_standing(&mut self, standing: Option<NodeStanding>, cx: &mut Context<Self>) {
         if standing != self.standing {
             self.standing = standing;
+            // A supervised node that is no longer working has paused.
+            if !matches!(self.standing.as_ref().map(|s| &s.actor), Some(NextActor::Working { .. })) {
+                self.runner.pause_asked = false;
+            }
             cx.notify();
         }
     }
@@ -1262,14 +1420,15 @@ impl TaskPanel {
     /// continue first, and wakes it, off the UI thread.
     fn cloud_request(&mut self, kind: &'static str, cx: &mut Context<Self>) {
         let node = self.node_id;
-        self.cloud_started(cx);
+        self.cloud_started("Asking the supervisor…", cx);
         crate::views::cloud_node::request(self.fleet.clone(), node.to_string(), kind, cx, move |this, update, cx| {
             this.on_cloud_update(node, update, cx)
         });
     }
 
-    fn cloud_started(&mut self, cx: &mut Context<Self>) {
-        self.runner.cloud_busy = true;
+    /// A job of the panel's own begins: the button shows `what` until it ends.
+    fn cloud_started(&mut self, what: &'static str, cx: &mut Context<Self>) {
+        self.runner.cloud_busy = Some(what);
         self.runner.cloud_note = None;
         self.runner.cloud_failed = false;
         cx.notify();
@@ -1286,34 +1445,66 @@ impl TaskPanel {
                 (String::new(), false, true)
             }
             CloudUpdate::Synced(msg) => (msg, false, true),
-            CloudUpdate::Left(msg) => {
-                self.runner.cloud = None;
-                (msg, false, true)
-            }
             CloudUpdate::Failed(msg) => (msg, true, true),
         };
         self.runner.cloud_note = (!note.is_empty()).then_some(note);
         self.runner.cloud_failed = failed;
         if done {
-            self.runner.cloud_busy = false;
+            self.runner.cloud_busy = None;
+            // A pause or stop that could not be asked is not pending, and
+            // neither is the migration that waited for it.
+            if failed {
+                self.runner.pause_asked = false;
+                self.runner.migration_wait = None;
+            }
             self.refresh_runner(cx);
         }
         cx.notify();
     }
 
     /// The split button: the default action, with the rest in its menu.
-    fn render_runner_button(&self, actions: RunnerActions, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let (primary, label, disabled) = actions.primary?;
+    /// While a job of the panel's own runs the button shows what it is doing,
+    /// disabled, with an empty menu; after Pause (or Stop now) it says
+    /// "Pausing…" until the runner has ended.
+    fn render_runner_button(&self, actions: RunnerActions, pausing: bool, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let (primary, label, disabled) = runner_button_face(&actions, pausing)?;
         let button = Button::new("unified-task-runner-action")
             .label(label)
             .disabled(disabled)
-            .on_click(cx.listener(move |this, _, _, cx| this.perform(primary, cx)));
+            .on_click(cx.listener(move |this, _, _, cx| {
+                if let Some(primary) = primary {
+                    this.perform(primary, cx)
+                }
+            }));
         let mut split = DropdownButton::new("unified-task-runner").small().button(button);
         if !actions.menu.is_empty() {
             let weak = cx.weak_entity();
             let menu = actions.menu;
-            split = split.dropdown_menu(move |mut popup, _, _| {
+            let locations = self.runner.locations.clone();
+            let current = self.runner.current_location.clone();
+            split = split.dropdown_menu(move |mut popup, window, cx| {
                 for action in menu.iter().copied() {
+                    if action == RunnerAction::MigrateTo {
+                        // A submenu of every location; the one the node
+                        // uses is marked and cannot be picked.
+                        let (weak, locations, current) = (weak.clone(), locations.clone(), current.clone());
+                        popup = popup.submenu(action.label(), window, cx, move |mut sub, _, _| {
+                            if locations.is_empty() {
+                                sub = sub.item(PopupMenuItem::new("No locations yet").disabled(true));
+                            }
+                            for place in locations.iter().cloned() {
+                                let is_current = current.as_deref() == Some(place.id.as_str());
+                                let label = if is_current { format!("{} (current)", place.name) } else { place.name.clone() };
+                                let weak = weak.clone();
+                                sub = sub.item(PopupMenuItem::new(label).disabled(is_current).on_click(move |_, _, cx| {
+                                    let place = place.clone();
+                                    let _ = weak.update(cx, |this: &mut TaskPanel, cx| this.choose_migration(place, cx));
+                                }));
+                            }
+                            sub
+                        });
+                        continue;
+                    }
                     let weak = weak.clone();
                     popup = popup.item(PopupMenuItem::new(action.label()).on_click(move |_, _, cx| {
                         let _ = weak.update(cx, |this: &mut TaskPanel, cx| this.perform(action, cx));
@@ -1325,6 +1516,32 @@ impl TaskPanel {
         Some(split.into_any_element())
     }
 
+    /// The runner line's question and its buttons ([`Prompt`]).
+    fn render_prompt(&self, prompt: &Prompt, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let buttons = prompt.buttons().into_iter().enumerate().map(|(ix, label)| {
+            let button = Button::new(SharedString::from(format!("unified-task-prompt-{ix}")))
+                .label(label)
+                .small()
+                .on_click(cx.listener(move |this, _, _, cx| this.answer_prompt(label, cx)));
+            // The first is what the question expects; Cancel is plain.
+            if ix == 0 { button.primary() } else { button }
+        }).collect::<Vec<_>>();
+        div()
+            .w_full()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap_2()
+            .child(div().flex_auto().min_w(gpui::px(160.)).child(selectable_text(
+                "unified-task-prompt-text",
+                prompt.text(),
+                window,
+                cx,
+            )))
+            .child(div().flex().flex_none().gap_2().children(buttons))
+            .into_any_element()
+    }
+
     /// T2: the runner line — lifecycle state, then what the runner is doing
     /// (`doc/ui/task-panel.md`, "Runner"), then the split button.
     fn render_runner_line(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
@@ -1334,7 +1551,9 @@ impl TaskPanel {
         // controls and a live turn's activity.
         let standing = self.standing.clone();
         let done = standing.as_ref().is_some_and(|s| matches!(s.actor, NextActor::Done));
-        self.runner.ticking = standing.is_some() && !done;
+        // A pending migration is looked at again each second, since the
+        // runner ending is what releases it.
+        self.runner.ticking = (standing.is_some() && !done) || self.runner.migration_wait.is_some();
         let sep = || style::text_muted(div().flex_none()).child("·");
 
         // Status pieces wrap onto further lines when the panel is narrow;
@@ -1344,7 +1563,10 @@ impl TaskPanel {
             line = line.child(self.render_phase_chip(cx));
         }
         if let Some(cloud) = &self.runner.cloud {
-            let mut text = format!("in the cloud (sandbox {})", cloud.sandbox);
+            let mut text = match &self.runner.cloud_sandbox {
+                Some(sandbox) => format!("in the cloud (sandbox {sandbox})"),
+                None => "in the cloud (its Files location records no sandbox)".to_string(),
+            };
             // While the app is making the replacement the standing says
             // working; the stale "deleted, run it" note would contradict it.
             let replacing = standing.as_ref().is_some_and(|s| matches!(s.actor, NextActor::Working { .. }));
@@ -1353,7 +1575,7 @@ impl TaskPanel {
                 // orchestrator marked it, and the app makes a new one at its
                 // next sync, so a closed app leaves the node waiting for it.
                 if tod_core::cloud_sync::sandbox_deleted_by_user(self.fleet.paths().root(), &self.node_id.to_string()) {
-                    text.push_str(", its sandbox was deleted: run it in the cloud to make a new one");
+                    text.push_str(", its sandbox was deleted: Start makes a new one");
                 } else {
                     text.push_str(", its sandbox is gone: the app makes a new one when it next syncs");
                 }
@@ -1361,8 +1583,8 @@ impl TaskPanel {
             line = line.child(sep()).child(style::text_muted(div().flex_auto().min_w(gpui::px(160.))).child(
                 selectable_text("unified-task-runner-cloud", text, window, cx),
             ));
-        } else if !self.runner.place.is_empty() {
-            line = line.child(sep()).child(style::text_muted(div().flex_none()).child(self.runner.place.clone()));
+        } else if !self.runner.place_text.is_empty() {
+            line = line.child(sep()).child(style::text_muted(div().flex_none()).child(self.runner.place_text.clone()));
         }
         if let Some(standing) = &standing {
             for (ix, part) in standing::runner_parts(standing, now_ms()).into_iter().enumerate() {
@@ -1404,6 +1626,9 @@ impl TaskPanel {
             (None, Some(error)) => Some((error.to_string(), true)),
             (None, None) => None,
         };
+        // Not being able to read where the node runs outranks nothing, but is
+        // never left unsaid.
+        let note = note.or_else(|| self.runner.load_error.clone().map(|error| (error, true)));
         if let Some((note, failed)) = note {
             // A multi-line note (a failure: its title, then each cause) is a
             // block of its own, a line per row, causes set back in muted
@@ -1426,6 +1651,7 @@ impl TaskPanel {
                 line = line.child(sep()).child(el.child(selectable_text("unified-task-runner-note", note, window, cx)));
             }
         }
+        let problems = self.render_problems(window, cx);
         let actions = self.runner_actions(live.as_ref(), cx);
         let node = self.node_id;
         let watch = self.watch_target(cx).map(|_| {
@@ -1436,7 +1662,9 @@ impl TaskPanel {
                     this.open(PanelKind::Watch(node), false, cx)
                 }))
         });
-        let button = self.render_runner_button(actions, cx);
+        let pausing = matches!(self.run_state(live.as_ref(), cx), RunState::Active { pausing: true });
+        let button = self.render_runner_button(actions, pausing, cx);
+        let prompt = self.runner.prompt.clone().map(|prompt| self.render_prompt(&prompt, window, cx));
         let mut buttons = div().flex().flex_none().items_center().gap_2().ml_auto();
         if let Some(defer) = self.render_defer_control(cx) {
             buttons = buttons.child(defer);
@@ -1456,8 +1684,40 @@ impl TaskPanel {
             .gap_y_2()
             .child(line)
             .children(extra_note)
+            .children(problems)
+            .children(prompt)
             .child(buttons);
         Some(line.into_any_element())
+    }
+
+    /// The node's recorded background problems, one block each: what failed
+    /// and why (selectable: it is data), then, for a job the daemon retries,
+    /// that it will retry automatically, or that it needs the user.
+    fn render_problems(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if self.runner.problems.is_empty() {
+            return None;
+        }
+        let mut block = div().id("unified-task-problems").w_full().flex().flex_col().gap_1();
+        for (ix, problem) in self.runner.problems.iter().enumerate() {
+            let status = problem_status(problem);
+            let message = div().w_full();
+            let message = if problem.transient { style::text_muted(message) } else { style::text_error(message) };
+            block = block.child(message.child(selectable_text(
+                SharedString::from(format!("unified-task-problem-{ix}")),
+                problem.message.clone(),
+                window,
+                cx,
+            )));
+            if let Some(status) = status {
+                block = block.child(style::text_muted(div().w_full().pl(gpui::px(12.))).child(selectable_text(
+                    SharedString::from(format!("unified-task-problem-status-{ix}")),
+                    status,
+                    window,
+                    cx,
+                )));
+            }
+        }
+        Some(block.into_any_element())
     }
 
     /// T4: the requests waiting on the user, oldest first — the only part
@@ -1540,6 +1800,22 @@ impl Focusable for TaskPanel {
 
 /// `content` in a vertical scroll area with a scrollbar that appears only when
 /// it overflows. `frame` carries the sizing (its max height or flex).
+/// The state of a recorded problem, in words: that the daemon will retry it
+/// automatically, or that it needs the user and what to do. `None` for a kind
+/// of problem that has neither (it is only reported).
+fn problem_status(problem: &tod_store::node_problems::NodeProblem) -> Option<String> {
+    if problem.kind != tod_store::node_problems::KIND_SANDBOX_RETIRE {
+        return None;
+    }
+    Some(if problem.transient {
+        "Will retry automatically.".to_string()
+    } else {
+        "Needs you: Delete sandbox in this panel's menu tries again, or Delete sandbox without a checkpoint \
+         deletes it and loses its uncommitted work."
+            .to_string()
+    })
+}
+
 fn scroll_with_bar(
     id: &'static str,
     handle: &ScrollHandle,
@@ -1578,6 +1854,7 @@ impl Render for TaskPanel {
             self.header = load(&self.fleet, self.node_id);
             self.refresh_pr_states(cx);
         }
+        self.drain_migration(window, cx);
         let identity = self.render_identity(window, cx);
         let artifacts = self.render_artifacts(cx);
         let runner = self.render_runner_line(window, cx);
@@ -1628,21 +1905,43 @@ fn test_runners(
     cx.new(|cx| NodeRunners::new(fleet, agent, agent_runs, cx))
 }
 
+/// The split button's own face: the action it performs (none for a label
+/// only), its words, and whether it is disabled. `None` when there is
+/// nothing to show. A node with no default action (waiting on something
+/// outside) still has a menu (Check now, Migrate, Reset environment), so its
+/// button reads "Actions", disabled, and the caret opens the menu.
+fn runner_button_face(actions: &RunnerActions, pausing: bool) -> Option<(Option<RunnerAction>, &'static str, bool)> {
+    match (actions.busy, actions.default) {
+        (Some(what), _) => Some((None, what, true)),
+        (None, Some(action)) if action == RunnerAction::Pause && pausing => Some((Some(action), "Pausing…", true)),
+        (None, Some(action)) => Some((Some(action), action.label(), false)),
+        (None, None) if actions.menu.is_empty() => None,
+        (None, None) => Some((None, "Actions", true)),
+    }
+}
+
 #[cfg(test)]
-mod tests {
+mod face_tests {
     use super::*;
 
     #[test]
-    fn check_now_is_offered_for_a_state_that_waits_on_its_pull_requests() {
-        for state in ["pr_draft", "approved", "merged"] {
-            assert!(offers_check_now(state, true, false), "{state}");
-            assert!(!offers_check_now(state, false, false), "{state} without a pull request");
-            assert!(!offers_check_now(state, true, true), "{state} when done");
-        }
-        for state in ["", "proposed", "design", "planning", "implementing", "verifying", "review", "pr", "released", "learn"] {
-            assert!(!offers_check_now(state, true, false), "{state:?} reads nothing on GitHub");
-        }
+    fn a_node_with_a_menu_but_no_default_still_gets_a_button() {
+        let waiting = RunnerActions {
+            default: None,
+            menu: vec![RunnerAction::CheckNow, RunnerAction::MigrateTo],
+            busy: None,
+        };
+        assert_eq!(runner_button_face(&waiting, false), Some((None, "Actions", true)));
+        let nothing = RunnerActions { default: None, menu: Vec::new(), busy: None };
+        assert_eq!(runner_button_face(&nothing, false), None);
+        let running = RunnerActions { default: Some(RunnerAction::Pause), menu: Vec::new(), busy: None };
+        assert_eq!(runner_button_face(&running, true), Some((Some(RunnerAction::Pause), "Pausing…", true)));
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
 
     #[test]
     fn labels_show_failed_only_when_any() {
@@ -1658,16 +1957,105 @@ mod tests {
         assert_eq!(header.obligations_label(), "Obligations 7 · 1 failed");
     }
 
-    /// A cloud node the user left stopped offers Keep going first (syncing
-    /// would only wake a supervisor that stops at the same answer); one
-    /// stopped for any other reason keeps Sync now.
-    #[gpui::test]
-    fn a_cloud_node_stopped_by_the_users_answer_offers_keep_going(cx: &mut gpui::TestAppContext) {
+    fn facts<'a>(supervised: bool, actor: Option<&'a NextActor>) -> RunFacts<'a> {
+        RunFacts {
+            done: false,
+            supervised,
+            runner_running: false,
+            pausing: false,
+            hand_turn: false,
+            outcome: None,
+            actor,
+            pause_asked: false,
+        }
+    }
+
+    fn you(why: YouReason) -> NextActor {
+        NextActor::You { why, since: 1 }
+    }
+
+    #[test]
+    fn the_run_state_follows_the_runner_here_and_the_standing_in_the_cloud() {
+        use tod_core::next_actor::Work;
+        let working = NextActor::Working { what: Work::Cloud, since: 1 };
+        // Locally the runner's own state wins; a hand-started turn is its own state.
+        let mut f = facts(false, Some(&working));
+        f.runner_running = true;
+        f.pausing = true;
+        assert_eq!(derive_run_state(&f), RunState::Active { pausing: true });
+        let mut f = facts(false, None);
+        f.hand_turn = true;
+        assert_eq!(derive_run_state(&f), RunState::HandTurn);
+        // Supervised, a live heartbeat is an active run, and Pause stays asked.
+        let mut f = facts(true, Some(&working));
+        f.pause_asked = true;
+        assert_eq!(derive_run_state(&f), RunState::Active { pausing: true });
+        // A node worked by something this process has not heard of is not Start-able.
+        assert_eq!(derive_run_state(&facts(false, Some(&working))), RunState::Ended(EndedHow::Waiting));
+        // Ended: by how.
+        let cases = [
+            (you(YouReason::Paused), RunState::Ended(EndedHow::Paused)),
+            (you(YouReason::Stopped { reason: "budget spent: 6 sessions".into() }), RunState::Ended(EndedHow::Budget)),
+            (you(YouReason::Stopped { reason: "an agent is stuck".into() }), RunState::Ended(EndedHow::Stopped)),
+            (you(YouReason::Failed { error: "x".into() }), RunState::Ended(EndedHow::Failed)),
+            (you(YouReason::Request { count: 1 }), RunState::Ended(EndedHow::Request)),
+            (you(YouReason::NotStarted), RunState::NeverRun),
+            (NextActor::Done, RunState::Done),
+        ];
+        for (actor, expected) in cases {
+            assert_eq!(derive_run_state(&facts(true, Some(&actor))), expected, "{actor:?}");
+        }
+        assert_eq!(derive_run_state(&facts(false, None)), RunState::NeverRun);
+        // A local outcome beats the standing; a finished one says nothing.
+        let spent = Outcome::BudgetExhausted { limit: tod_core::autopilot::BudgetLimit::Sessions { used: 6, elapsed_secs: 0 } };
+        let mut f = facts(false, None);
+        f.outcome = Some(&spent);
+        assert_eq!(derive_run_state(&f), RunState::Ended(EndedHow::Budget));
+        let mut f = facts(false, None);
+        f.outcome = Some(&Outcome::Done);
+        assert_eq!(derive_run_state(&f), RunState::NeverRun);
+        let mut f = facts(false, None);
+        f.done = true;
+        assert_eq!(derive_run_state(&f), RunState::Done);
+    }
+
+    #[test]
+    fn a_check_now_result_says_the_gate_where_it_went_and_an_unreadable_github() {
+        use tod_core::autopilot::GithubCheck;
+        use tod_core::lifecycle::CheckNow;
+        use tod_core::phase::GateCheck;
+        let gate = |to: Option<&str>| GateCheck { from: "pr_draft".into(), to: to.map(str::to_string), criteria: Vec::new() };
+        let moved = CheckNow { gate: gate(Some("pr_review")), advanced: Some("pr_review"), github: None, held: None };
+        assert_eq!(describe_check(&moved), ("Checked: the gate is clear; moved to pr_review".to_string(), false));
+        let held = CheckNow {
+            gate: gate(Some("pr_review")),
+            advanced: None,
+            github: Some(GithubCheck::Waiting { what: "a review".into(), due_at_ms: 0 }),
+            held: Some("a review".into()),
+        };
+        let (text, failed) = describe_check(&held);
+        assert!(!failed);
+        assert!(text.contains("gate is clear, but the node was not moved on: a review"), "{text}");
+        assert!(text.contains("GitHub: waiting for a review"), "{text}");
+        let unreadable = CheckNow {
+            gate: gate(Some("pr_review")),
+            advanced: None,
+            github: Some(GithubCheck::Unreadable("no network".into())),
+            held: None,
+        };
+        let (text, failed) = describe_check(&unreadable);
+        assert!(failed && text.contains("GitHub could not be read: no network"), "{text}");
+    }
+
+    /// A panel over a fixture node, with its runner line pointed at a node
+    /// whose files are in a cloud sandbox, so its runs are the supervisor's.
+    fn supervised_panel(
+        cx: &mut gpui::TestAppContext,
+    ) -> (crate::views::rows::fixture::Fixture, Entity<TaskPanel>, &mut gpui::VisualTestContext) {
         use crate::views::rows::fixture::Fixture;
         use gpui::AppContext as _;
         use std::cell::RefCell;
         use std::rc::Rc;
-        use tod_core::next_actor::{NextActor, NodeStanding, YouReason};
 
         let fixture = Fixture::new();
         cx.update(gpui_component::init);
@@ -1686,32 +2074,368 @@ mod tests {
         });
         let view = slot.borrow_mut().take().unwrap();
         cx.run_until_parked();
-        let stopped = |reason: &str| NodeStanding {
-            node_id: node,
-            actor: NextActor::You { why: YouReason::Stopped { reason: reason.into() }, since: 1 },
-            deferred: None,
-        };
-        let primary = |cx: &mut gpui::VisualTestContext, answered: bool, standing: NodeStanding| {
-            view.update(cx, |view, _| {
-                view.runner.cloud = Some(CloudNode {
-                    sandbox: "sb".into(),
-                    user: "alice".into(),
-                    accepted_at_ms: 1,
-                    lost_at: None,
-                });
-                view.runner.cloud_stop_answered = answered;
-                view.standing = Some(standing);
+        view.update(cx, |view, _| {
+            view.runner.place = Some(Place::Sandbox { exists: true });
+            view.runner.supervised = true;
+            view.runner.cloud = Some(CloudNode {
+                user: "alice".into(),
+                accepted_at_ms: 1,
+                lost_at: None,
             });
-            let actions = view.read_with(cx, |view, cx| view.runner_actions(None, cx));
-            (actions.primary.map(|p| p.0), actions.menu)
+        });
+        (fixture, view, cx)
+    }
+
+    fn set_actor(view: &Entity<TaskPanel>, cx: &mut gpui::VisualTestContext, actor: NextActor) {
+        let node = view.read_with(cx, |view, _| view.node_id);
+        view.update(cx, |view, cx| {
+            view.set_standing(Some(NodeStanding { node_id: node, actor, deferred: None }), cx)
+        });
+    }
+
+    fn working() -> NextActor {
+        NextActor::Working { what: tod_core::next_actor::Work::Cloud, since: 1 }
+    }
+
+    /// A background problem recorded on the node (the daemon's failed delete
+    /// of its sandbox at `done`) shows in the task panel, with its error and
+    /// "will retry automatically" while transient, or "needs you" with the
+    /// menu entries when permanent; clearing it removes the block.
+    #[gpui::test]
+    fn a_recorded_node_problem_shows_with_its_state_and_clears(cx: &mut gpui::TestAppContext) {
+        use tod_store::node_problems::{KIND_SANDBOX_RETIRE, NodeProblem};
+
+        let (fixture, view, cx) = supervised_panel(cx);
+        let node = fixture.node_id;
+        let now = now_ms();
+        let mut problem = NodeProblem::new(node, KIND_SANDBOX_RETIRE, "Deleting the sandbox s failed: blaxel said no".into(), now);
+        problem.transient = true;
+        tod_core::node_problems::record(&fixture.store, problem.clone()).unwrap();
+        fixture.store.reload_if_stale().unwrap();
+        view.update(cx, |view, cx| view.refresh_runner(cx));
+        cx.run_until_parked();
+        let shown = view.read_with(cx, |view, _| view.runner.problems.clone());
+        assert_eq!(shown.len(), 1);
+        assert!(shown[0].message.contains("blaxel said no"));
+        let status = problem_status(&shown[0]).unwrap();
+        assert_eq!(status, "Will retry automatically.");
+        let rendered = cx.update(|window, cx| view.update(cx, |view, cx| view.render_problems(window, cx).is_some()));
+        assert!(rendered, "the block is drawn");
+
+        problem.transient = false;
+        let status = problem_status(&problem).unwrap();
+        assert!(status.starts_with("Needs you") && status.contains("Delete sandbox"), "{status}");
+        // Another kind of problem has no status line of its own.
+        assert_eq!(problem_status(&NodeProblem::new(node, tod_store::node_problems::KIND_ADOPT, "x".into(), now)), None);
+
+        tod_core::node_problems::clear(&fixture.store, &node.to_string(), KIND_SANDBOX_RETIRE).unwrap();
+        fixture.store.reload_if_stale().unwrap();
+        view.update(cx, |view, cx| view.refresh_runner(cx));
+        cx.run_until_parked();
+        assert!(view.read_with(cx, |view, _| view.runner.problems.is_empty()));
+        let rendered = cx.update(|window, cx| view.update(cx, |view, cx| view.render_problems(window, cx).is_some()));
+        assert!(!rendered, "nothing recorded, nothing drawn");
+    }
+
+    /// A supervised node's menu follows the run's state: Resume after a
+    /// stop, a fresh budget (and no plain Resume) after a spent budget, Pause
+    /// while it works, and no default while it only waits.
+    #[gpui::test]
+    fn a_supervised_node_offers_resume_after_a_stop_and_a_fresh_budget_after_a_spent_one(cx: &mut gpui::TestAppContext) {
+        let (_fixture, view, cx) = supervised_panel(cx);
+        let menu = |cx: &mut gpui::VisualTestContext| view.read_with(cx, |view, cx| view.runner_actions(None, cx));
+
+        set_actor(&view, cx, you(YouReason::Stopped { reason: "an agent is stuck".into() }));
+        let actions = menu(cx);
+        assert_eq!(actions.default, Some(RunnerAction::Resume));
+        assert!(actions.menu.contains(&RunnerAction::ResumeFreshBudget) && actions.menu.contains(&RunnerAction::RunFresh));
+        assert!(actions.menu.contains(&RunnerAction::SyncNow) && actions.menu.contains(&RunnerAction::DeleteSandbox));
+
+        set_actor(&view, cx, you(YouReason::Stopped { reason: "you answered the question about its budget".into() }));
+        let actions = menu(cx);
+        assert_eq!(actions.default, Some(RunnerAction::ResumeFreshBudget));
+        assert!(!actions.menu.contains(&RunnerAction::Resume));
+
+        set_actor(&view, cx, working());
+        let actions = menu(cx);
+        assert_eq!(actions.default, Some(RunnerAction::Pause));
+        assert!(actions.menu.contains(&RunnerAction::StopNow));
+        assert!(!actions.menu.contains(&RunnerAction::CheckNow), "Check now is hidden while it runs");
+
+        // Done after waiting on someone: no default (the owner's decision for
+        // a run that ended only to wait), but Check now and Migrate remain.
+        set_actor(&view, cx, NextActor::Others {
+            wait: tod_core::next_actor::ExternalWait {
+                kind: tod_core::next_actor::WaitKind::HumanReview,
+                who: None,
+                detail: None,
+                since: 1,
+                next_check_ms: None,
+                overdue: false,
+                retry: None,
+            },
+        });
+        let actions = menu(cx);
+        assert_eq!(actions.default, None);
+        assert!(actions.menu.contains(&RunnerAction::CheckNow) && actions.menu.contains(&RunnerAction::MigrateTo));
+    }
+
+    fn elsewhere() -> tod_store::fleet::FilesPlace {
+        tod_store::fleet::FilesPlace { id: "elsewhere-id".into(), name: "elsewhere".into(), ..Default::default() }
+    }
+
+    /// Migrate while the runner is active asks first, and migrates (calls
+    /// `confirm_migrate`) only after the run has ended.
+    #[gpui::test]
+    fn migrate_while_running_asks_first_and_migrates_only_after_the_run_ends(cx: &mut gpui::TestAppContext) {
+        let (_fixture, view, cx) = supervised_panel(cx);
+        set_actor(&view, cx, working());
+        view.update(cx, |view, cx| view.choose_migration(elsewhere(), cx));
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.runner.prompt, Some(Prompt::MigrateRunning { place: elsewhere(), can_pause: true }));
+            assert!(view.runner.migration_wait.is_none(), "nothing is pending until it is answered");
+        });
+        assert_eq!(
+            Prompt::MigrateRunning { place: elsewhere(), can_pause: true }.buttons(),
+            ["Pause", "Stop now", "Cancel"]
+        );
+        // Cancel: the question goes and nothing is pending.
+        view.update(cx, |view, cx| view.answer_prompt("Cancel", cx));
+        view.read_with(cx, |view, _| {
+            assert!(view.runner.prompt.is_none() && view.runner.migration_wait.is_none());
+            assert!(view.runner.cloud_busy.is_none() && view.runner.cloud_note.is_none());
+        });
+
+        // Answered (Pause or Stop now) while the run is still going: it waits.
+        view.update(cx, |view, _| view.runner.migration_wait = Some(elsewhere()));
+        view.update_in(cx, |view, window, cx| view.drain_migration(window, cx));
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.runner.migration_wait, Some(elsewhere()), "the run has not ended");
+            assert!(view.runner.cloud_note.is_none(), "nothing was migrated");
+        });
+        // The run ended: the migration begins (the location is not in this
+        // store, so the store's own refusal comes back on the line).
+        set_actor(&view, cx, you(YouReason::Paused));
+        view.update_in(cx, |view, window, cx| view.drain_migration(window, cx));
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(view.runner.migration_wait.is_none());
+            let note = view.runner.cloud_note.clone().unwrap_or_default();
+            assert!(note.contains("Could not migrate to elsewhere"), "{note}");
+            assert!(view.runner.cloud_failed);
+        });
+    }
+
+    /// A stand-in for the supervisor round trip: delivers its answer on a
+    /// later turn of the event loop, as the real job's updates arrive.
+    fn answer_later(panel: &mut TaskPanel, update: CloudUpdate, cx: &mut Context<TaskPanel>) {
+        let node = panel.node_id;
+        cx.spawn(async move |this, cx| {
+            let _ = this.update(cx, |this: &mut TaskPanel, cx| this.on_cloud_update(node, update, cx));
+        })
+        .detach();
+    }
+
+    fn supervisor_accepts(panel: &mut TaskPanel, kind: &'static str, cx: &mut Context<TaskPanel>) {
+        answer_later(panel, CloudUpdate::Synced(format!("asked {kind}")), cx);
+    }
+
+    fn supervisor_still_waking(panel: &mut TaskPanel, kind: &'static str, cx: &mut Context<TaskPanel>) {
+        answer_later(
+            panel,
+            CloudUpdate::Failed(format!("{kind} failed\nsandbox sb is still waking after 90s")),
+            cx,
+        );
+    }
+
+    /// Makes the fixture node's Files run in a cloud sandbox in the store
+    /// (not only on the panel), so a refresh of the runner line keeps it
+    /// supervised.
+    fn put_files_in_a_sandbox(
+        fixture: &crate::views::rows::fixture::Fixture,
+        view: &Entity<TaskPanel>,
+        cx: &mut gpui::VisualTestContext,
+    ) {
+        use tod_store::fleet::{DevContainerSetting, FilesPlace, FleetMutation};
+        use tod_store::outline::{Capability, OutlineMutation};
+        fixture
+            .store
+            .enqueue_outline(OutlineMutation::EnableCapabilities {
+                node_id: fixture.node_id,
+                capabilities: vec![Capability::Files],
+            })
+            .unwrap();
+        let place = FilesPlace {
+            id: Uuid::new_v4().to_string(),
+            name: "cloud".into(),
+            repo: Some("/src/app".into()),
+            dev_container: Some(DevContainerSetting { sandbox: true, ..Default::default() }),
+            ..Default::default()
         };
-        let (action, menu) = primary(cx, true, stopped("you answered the question about its budget"));
-        assert_eq!(action, Some(RunnerAction::KeepGoing));
-        assert!(menu.contains(&RunnerAction::RunFresh) && menu.contains(&RunnerAction::SyncCloud), "{menu:?}");
-        let (action, _) = primary(cx, false, stopped("the pull request needs a person"));
-        assert_eq!(action, Some(RunnerAction::SyncCloud));
-        let (action, _) = primary(cx, true, NodeStanding { actor: NextActor::Done, ..stopped("x") });
-        assert_eq!(action, Some(RunnerAction::SyncCloud));
+        let id = place.id.clone();
+        fixture.store.enqueue(FleetMutation::SaveFilesPlace { place }).unwrap();
+        fixture
+            .store
+            .enqueue(FleetMutation::SetNodeFilesPlace { node_id: fixture.node_id.to_string(), place_id: Some(id) })
+            .unwrap();
+        fixture.store.writer().flush().unwrap();
+        fixture.store.reload_if_stale().unwrap();
+        view.update(cx, |view, cx| view.refresh_runner(cx));
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| assert!(view.runner.supervised, "the store says it runs in the cloud"));
+    }
+
+    /// Each answer of the Migrate-while-running question leads to its job:
+    /// Pause asks the supervisor to pause and Stop now to stop now, each
+    /// leaving the migration pending until the run has ended, when it begins;
+    /// Cancel asks nothing and changes nothing.
+    #[gpui::test]
+    fn each_answer_of_migrate_while_running_leads_to_its_own_job(cx: &mut gpui::TestAppContext) {
+        use tod_core::cloud_sync::{REQUEST_PAUSE, REQUEST_STOP_NOW};
+        for (label, kind) in [("Pause", REQUEST_PAUSE), ("Stop now", REQUEST_STOP_NOW)] {
+            let (fixture, view, cx) = supervised_panel(cx);
+            put_files_in_a_sandbox(&fixture, &view, cx);
+            view.update(cx, |view, _| view.stop_job = supervisor_accepts);
+            set_actor(&view, cx, working());
+            view.update(cx, |view, cx| view.choose_migration(elsewhere(), cx));
+            view.update(cx, |view, cx| view.answer_prompt(label, cx));
+            cx.run_until_parked();
+            view.read_with(cx, |view, _| {
+                assert_eq!(view.runner.cloud_note.as_deref(), Some(format!("asked {kind}").as_str()), "{label}");
+                assert!(!view.runner.cloud_failed);
+                assert_eq!(view.runner.migration_wait, Some(elsewhere()), "{label}: the migration waits for the run");
+                assert_eq!(view.runner.pause_asked, kind == REQUEST_PAUSE, "{label}");
+            });
+            // Still running: nothing migrates yet.
+            view.update_in(cx, |view, window, cx| view.drain_migration(window, cx));
+            view.read_with(cx, |view, _| assert_eq!(view.runner.migration_wait, Some(elsewhere())));
+            // The supervisor stopped: the migration begins (this store has no
+            // such location, so its own refusal comes back on the line).
+            set_actor(&view, cx, you(YouReason::Paused));
+            view.update_in(cx, |view, window, cx| view.drain_migration(window, cx));
+            cx.run_until_parked();
+            view.read_with(cx, |view, _| {
+                assert!(view.runner.migration_wait.is_none() && !view.runner.pause_asked, "{label}");
+                let note = view.runner.cloud_note.clone().unwrap_or_default();
+                assert!(note.contains("Could not migrate to elsewhere"), "{label}: {note}");
+            });
+        }
+
+        // Cancel asks the supervisor nothing.
+        let (_fixture, view, cx) = supervised_panel(cx);
+        view.update(cx, |view, _| view.stop_job = supervisor_accepts);
+        set_actor(&view, cx, working());
+        view.update(cx, |view, cx| view.choose_migration(elsewhere(), cx));
+        view.update(cx, |view, cx| view.answer_prompt("Cancel", cx));
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(view.runner.cloud_note.is_none(), "no job ran: {:?}", view.runner.cloud_note);
+            assert!(!view.runner.pause_asked && view.runner.migration_wait.is_none() && view.runner.prompt.is_none());
+        });
+    }
+
+    /// A Pause or Stop now that fails (a sandbox still waking after 90
+    /// seconds) is not pending, and neither is the migration queued behind it:
+    /// the failure is on the line, and nothing waits forever.
+    #[gpui::test]
+    fn a_failed_pause_or_stop_now_cancels_the_migration_loudly(cx: &mut gpui::TestAppContext) {
+        for label in ["Pause", "Stop now"] {
+            let (_fixture, view, cx) = supervised_panel(cx);
+            view.update(cx, |view, _| view.stop_job = supervisor_still_waking);
+            set_actor(&view, cx, working());
+            view.update(cx, |view, cx| view.choose_migration(elsewhere(), cx));
+            view.update(cx, |view, cx| view.answer_prompt(label, cx));
+            // Until the answer comes the migration is queued behind the job.
+            view.read_with(cx, |view, _| {
+                assert_eq!(view.runner.migration_wait, Some(elsewhere()), "{label}");
+                assert!(view.runner.cloud_busy.is_some(), "{label}");
+            });
+            cx.run_until_parked();
+            view.read_with(cx, |view, _| {
+                assert!(view.runner.cloud_failed, "{label}");
+                let note = view.runner.cloud_note.clone().unwrap_or_default();
+                assert!(note.contains("still waking after 90s"), "{label}: {note}");
+                assert!(view.runner.cloud_busy.is_none(), "{label}");
+                assert!(!view.runner.pause_asked, "{label}: Pause is not pending");
+                assert!(view.runner.migration_wait.is_none(), "{label}: the migration is cancelled");
+            });
+            // Even once the run has ended, nothing migrates by itself.
+            set_actor(&view, cx, you(YouReason::Paused));
+            view.update_in(cx, |view, window, cx| view.drain_migration(window, cx));
+            cx.run_until_parked();
+            view.read_with(cx, |view, _| {
+                let note = view.runner.cloud_note.clone().unwrap_or_default();
+                assert!(note.contains("still waking"), "{label}: the failure stays: {note}");
+            });
+        }
+    }
+
+    /// A node with children is refused with exactly the store's sentence,
+    /// shown on the runner line when the migration begins (the menu does not
+    /// offer Migrate for such a node: `runner_menu`'s own test).
+    #[gpui::test]
+    fn migrating_a_node_with_children_is_refused_with_the_stores_sentence(cx: &mut gpui::TestAppContext) {
+        use tod_store::outline::{CreatePosition, OutlineMutation};
+        let (fixture, view, cx) = supervised_panel(cx);
+        let list_id = fixture.store.list_outline_lists().unwrap()[0].id;
+        fixture
+            .store
+            .enqueue_outline(OutlineMutation::CreateNode {
+                node_id: Some(Uuid::new_v4()),
+                list_id,
+                parent_id: Some(fixture.node_id),
+                anchor_id: None,
+                position: CreatePosition::Below,
+                title: "child".into(),
+            })
+            .unwrap();
+        fixture.store.writer().flush().unwrap();
+        let place = tod_store::fleet::places::save(
+            &fixture.store,
+            &tod_store::fleet::FilesPlace {
+                name: "elsewhere".into(),
+                repo: Some("/src/elsewhere".into()),
+                use_worktree: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        view.update(cx, |view, _| view.runner.migration_wait = Some(place));
+        set_actor(&view, cx, you(YouReason::Paused));
+        view.update_in(cx, |view, window, cx| view.drain_migration(window, cx));
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.runner.cloud_note.as_deref(),
+                Some("Could not migrate to elsewhere: You cannot migrate a node that has children.")
+            );
+            assert!(view.runner.cloud_failed && view.runner.migration_wait.is_none());
+        });
+    }
+
+    /// Delete sandbox while the runner is active asks "Stop it and delete its
+    /// sandbox?" first; Cancel changes nothing.
+    #[gpui::test]
+    fn delete_sandbox_while_running_shows_the_confirmation_and_cancel_changes_nothing(cx: &mut gpui::TestAppContext) {
+        let (_fixture, view, cx) = supervised_panel(cx);
+        set_actor(&view, cx, working());
+        for (action, checkpoint) in [(RunnerAction::DeleteSandbox, true), (RunnerAction::DeleteSandboxAnyway, false)] {
+            view.update(cx, |view, cx| view.perform(action, cx));
+            view.read_with(cx, |view, _| {
+                assert_eq!(view.runner.prompt, Some(Prompt::DeleteRunning { checkpoint }));
+                assert!(view.runner.cloud_busy.is_none(), "nothing runs until it is confirmed");
+                assert!(view.runner.cloud_note.is_none());
+            });
+            view.update(cx, |view, cx| view.answer_prompt("Cancel", cx));
+            view.read_with(cx, |view, _| {
+                assert!(view.runner.prompt.is_none());
+                assert!(view.runner.cloud_busy.is_none() && view.runner.cloud_note.is_none());
+                assert!(view.runner.cloud.is_some() && view.runner.migration_wait.is_none());
+            });
+        }
+        let prompt = Prompt::DeleteRunning { checkpoint: true };
+        assert_eq!(prompt.text(), "This node is running. Stop it and delete its sandbox?");
+        assert_eq!(prompt.buttons(), ["Stop and delete", "Cancel"]);
     }
 
     /// T2: a run starting in `AgentRuns` shows on the runner line as
@@ -1745,13 +2469,11 @@ mod tests {
         assert_eq!(status, None);
         // No runner yet: Start, with the cloud in the menu.
         let actions = view.read_with(cx, |view, cx| view.runner_actions(status.as_ref(), cx));
-        assert_eq!(
-            actions,
-            RunnerActions {
-                primary: Some((RunnerAction::Start, "Start", false)),
-                menu: vec![RunnerAction::RunFresh, RunnerAction::MoveToCloud],
-            }
-        );
+        assert_eq!(actions.default, Some(RunnerAction::Start));
+        assert_eq!(actions.busy, None);
+        assert!(actions.menu.contains(&RunnerAction::RunFresh), "{:?}", actions.menu);
+        assert!(actions.menu.contains(&RunnerAction::CheckNow), "{:?}", actions.menu);
+        assert!(!actions.menu.contains(&RunnerAction::ResetEnvironment), "a host directory has no environment to reset");
 
         let focus = Focus::Node(node);
         let slot_id = agent_runs.update(cx, |registry, cx| {
@@ -1790,7 +2512,8 @@ mod tests {
             let (_, status) = view.runner_status(cx);
             view.runner_actions(status.as_ref(), cx)
         });
-        assert_eq!(actions.primary, Some((RunnerAction::StopTurn, "Stop", false)));
+        assert_eq!(actions.default, Some(RunnerAction::StopNow));
+        assert!(!actions.menu.contains(&RunnerAction::Pause) && !actions.menu.contains(&RunnerAction::CheckNow));
 
         // Stop while the driver is away marks the slot to cancel.
         view.update(cx, |view, cx| view.stop_runner(slot_id, cx));

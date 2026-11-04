@@ -1,5 +1,9 @@
 # Cloud nodes: robustness audit and plan
 
+> **Historical.** Written before the runner menu rebuild ([doc/runner-menu](../runner-menu/design.md)).
+> The menu entries it names (Run in the cloud, Keep going, Poll now, ...) no longer exist under those
+> names; "Run in the cloud" is now Start, and "Keep going" is Resume. Read it for the findings.
+
 Status: audit of 2026-11-03 over the live data root (`~/.config/tod`), its
 database, logs, the orchestrator and node sandboxes, the last three weeks
 of sessions (65 catalogued problems), and the code. The goal it serves:

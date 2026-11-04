@@ -1,15 +1,19 @@
 //! What a conversation's agent launches with: platform, model, and effort.
 //!
-//! The focus node's Agent capability (its own, or the nearest ancestor's)
-//! decides whatever it sets; the rest follows the settings for the kind of
-//! conversation — "Chat with agent" for talking with the agent, "Default
-//! agent" for the work the lifecycle runs. Resolved again for every turn, so
-//! a change to either applies to the next one.
+//! For a lifecycle conversation, the Lifecycle config's model and effort for
+//! its phase (`lifecycle_config::resolve_agent`, from the nearest node that
+//! sets each) win. Under them, the focus node's Agent capability (its own, or
+//! the nearest ancestor's) decides whatever it sets; the rest follows the
+//! settings for the kind of conversation — "Chat with agent" for talking with
+//! the agent, "Default agent" for the work the lifecycle runs. Resolved again
+//! for every turn, so a change to any of them applies to the next one.
 
 use std::path::Path;
 use tod_agent::AgentLaunchOptions;
+use tod_agent::agent_launch::{coerce_effort, coerce_model};
 use tod_store::conversation::{Focus, ProtocolKind};
 use tod_store::fleet::FleetStore;
+use tod_store::lifecycle_config;
 use tod_store::{AgentRole, TodSettings};
 
 /// Which settings a conversation of `kind` follows where the node's Agent
@@ -30,32 +34,83 @@ pub fn role_for(kind: ProtocolKind) -> AgentRole {
     }
 }
 
-/// `fallback` with whatever the focus node's Agent capability sets over it.
-/// A failure to read it is logged and `fallback` used: for showing what a
+/// The Lifecycle config phase key a conversation of `kind` about `focus`
+/// works in, whose model and effort apply to it: the protocol's own phase
+/// for the implementation, verification, review and fix protocols; the
+/// node's lifecycle state for a phase agent, an evaluator, and the PR
+/// agent (`pr`, `pr_draft`, `pr_review`). `None` for every other kind, and
+/// for a node whose state has no phase.
+pub fn phase_for(fleet: &FleetStore, focus: Focus, kind: ProtocolKind) -> Option<String> {
+    let state = || {
+        let node = focus.node_id()?;
+        fleet.get_node(&node.to_string()).ok()?.map(|n| n.lifecycle)
+    };
+    let phase = match kind {
+        ProtocolKind::Implementation => "implement".to_string(),
+        ProtocolKind::Verification => "verify".to_string(),
+        ProtocolKind::Review => "review".to_string(),
+        ProtocolKind::Fix => "fix".to_string(),
+        ProtocolKind::Pr => match state()?.as_str() {
+            "pr_draft" => "pr_draft".to_string(),
+            "pr_review" => "pr_review".to_string(),
+            _ => "pr".to_string(),
+        },
+        ProtocolKind::Phase | ProtocolKind::Evaluate => state()?,
+        ProtocolKind::Outline
+        | ProtocolKind::Chat
+        | ProtocolKind::VisualDesign
+        | ProtocolKind::GateCheck
+        | ProtocolKind::OnEntry
+        | ProtocolKind::Incoming => return None,
+    };
+    lifecycle_config::is_phase(&phase).then_some(phase)
+}
+
+/// `fallback` with whatever the focus node's Agent capability sets over it,
+/// and the Lifecycle config's model and effort for `phase` over that.
+/// A failure to read them is logged and `fallback` used: for showing what a
 /// launch would be. A launch itself uses [`try_for_focus`].
-pub fn for_focus(fleet: &FleetStore, focus: Focus, fallback: AgentLaunchOptions) -> AgentLaunchOptions {
-    try_for_focus(fleet, focus, fallback.clone()).unwrap_or_else(|err| {
+pub fn for_focus(
+    fleet: &FleetStore,
+    focus: Focus,
+    phase: Option<&str>,
+    fallback: AgentLaunchOptions,
+) -> AgentLaunchOptions {
+    try_for_focus(fleet, focus, phase, fallback.clone()).unwrap_or_else(|err| {
         tracing::warn!("{err:#}");
         fallback
     })
 }
 
-/// [`for_focus`], refusing when the node's Agent capability cannot be read:
-/// launching with other settings than the node's would be a silent change of
-/// model or platform.
+/// [`for_focus`], refusing when the node's Agent capability or Lifecycle
+/// config cannot be read: launching with other settings than the node's
+/// would be a silent change of model or platform.
 pub fn try_for_focus(
     fleet: &FleetStore,
     focus: Focus,
+    phase: Option<&str>,
     fallback: AgentLaunchOptions,
 ) -> anyhow::Result<AgentLaunchOptions> {
     let Some(node) = focus.node_id() else {
         return Ok(fallback);
     };
-    match fleet.resolve_agent_for_node(&node.to_string()) {
-        Ok(Some(resolved)) => Ok(resolved.agent.launch_options(&fallback)),
-        Ok(None) => Ok(fallback),
-        Err(err) => Err(err.context(format!("reading node {node}'s Agent capability"))),
+    let mut options = match fleet.resolve_agent_for_node(&node.to_string()) {
+        Ok(Some(resolved)) => resolved.agent.launch_options(&fallback),
+        Ok(None) => fallback,
+        Err(err) => return Err(err.context(format!("reading node {node}'s Agent capability"))),
+    };
+    if let Some(phase) = phase {
+        let configured = fleet
+            .read(|conn| lifecycle_config::resolve_agent(conn, node, phase))
+            .map_err(|err| err.context(format!("reading node {node}'s Lifecycle config for the {phase} phase")))?;
+        if let Some((model, _)) = configured.model {
+            options.model = coerce_model(options.platform, &model);
+        }
+        if let Some((effort, _)) = configured.effort {
+            options.effort = coerce_effort(options.platform, &effort);
+        }
     }
+    Ok(options)
 }
 
 /// The launch for a conversation of `kind` about `focus`, from `settings`.
@@ -65,7 +120,8 @@ pub fn resolve(
     focus: Focus,
     kind: ProtocolKind,
 ) -> AgentLaunchOptions {
-    for_focus(fleet, focus, settings.launch_options_for(role_for(kind)))
+    let phase = phase_for(fleet, focus, kind);
+    for_focus(fleet, focus, phase.as_deref(), settings.launch_options_for(role_for(kind)))
 }
 
 /// [`resolve`] with the settings read from `settings_path`; the defaults
@@ -93,7 +149,8 @@ pub fn try_resolve_from(
 ) -> anyhow::Result<AgentLaunchOptions> {
     let settings = TodSettings::load_from_path(settings_path)
         .map_err(|err| err.context("reading the settings for the agent's launch"))?;
-    try_for_focus(fleet, focus, settings.launch_options_for(role_for(kind)))
+    let phase = phase_for(fleet, focus, kind);
+    try_for_focus(fleet, focus, phase.as_deref(), settings.launch_options_for(role_for(kind)))
 }
 
 #[cfg(test)]
@@ -176,6 +233,53 @@ mod tests {
         let chat = resolve(&store, &settings(), Focus::Node(node), ProtocolKind::Chat);
         // Its model; the effort it leaves unset follows the settings.
         assert_eq!((chat.model.as_str(), chat.effort.as_str()), ("opus[1m]", "medium"));
+        drop(store);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_lifecycle_configs_phase_model_and_effort_win_for_that_phase() {
+        use tod_store::lifecycle_config::{Agents, PhaseAgent};
+        let (root, store, node) = store_with_node();
+        store
+            .enqueue_outline(OutlineMutation::EnableCapabilities {
+                node_id: node,
+                capabilities: vec![Capability::Agent, Capability::LifecycleConfig, Capability::Lifecycle],
+            })
+            .unwrap();
+        store
+            .enqueue(FleetMutation::UpsertNodeAgent {
+                node_id: node.to_string(),
+                platform: None,
+                model: Some("sonnet".into()),
+                effort: Some("low".into()),
+            })
+            .unwrap();
+        let agents: Agents = [
+            ("review".to_string(), PhaseAgent { model: Some("opus".into()), effort: None }),
+            ("proposed".to_string(), PhaseAgent { model: None, effort: Some("max".into()) }),
+            ("implement".to_string(), PhaseAgent { model: Some("not-a-model".into()), effort: None }),
+        ]
+        .into();
+        store.enqueue_outline(OutlineMutation::SetNodeLifecycleAgents { node_id: node, agents }).unwrap();
+        store.writer().flush().unwrap();
+        store.reload_if_stale().ok();
+        let at = |kind| resolve(&store, &settings(), Focus::Node(node), kind);
+        // The review phase's model, the Agent capability's effort.
+        let review = at(ProtocolKind::Review);
+        assert_eq!((review.model.as_str(), review.effort.as_str()), ("opus", "low"));
+        // A phase with nothing set follows the Agent capability.
+        let verify = at(ProtocolKind::Verification);
+        assert_eq!((verify.model.as_str(), verify.effort.as_str()), ("sonnet", "low"));
+        // A phase agent is in the node's state (`proposed`, from creation).
+        let phase = at(ProtocolKind::Phase);
+        assert_eq!((phase.model.as_str(), phase.effort.as_str()), ("sonnet", "max"));
+        assert_eq!(at(ProtocolKind::Evaluate).effort, "max");
+        // A model the platform does not know falls to its default, as the
+        // Agent capability's would.
+        assert_eq!(at(ProtocolKind::Implementation).model, "default");
+        // Chat is not a phase.
+        assert_eq!(at(ProtocolKind::Chat).model, "sonnet");
         drop(store);
         let _ = std::fs::remove_dir_all(&root);
     }

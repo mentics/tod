@@ -149,7 +149,7 @@ impl Protocol for PrProtocol {
         let role_doc = state_role_doc(&manifest, state)?;
         let cwd = self.cwd(env)?;
         let working_dir = PathBuf::from(cwd.path_text());
-        let skills = crate::skills_context::for_node(fleet, node_id, state, &cwd)?;
+        let skills = crate::skills_context::for_group(fleet, node_id, state, &cwd, env.skill_group())?;
         build_pr_message(
             env.media,
             &ImplementRequest {

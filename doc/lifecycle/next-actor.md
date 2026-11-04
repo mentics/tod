@@ -94,6 +94,19 @@ pub enum WaitKind {
   just `next_check_ms` on an `Others` wait. Staleness is an age threshold
   applied when drawing (see "Showing it"), with nothing recorded.
 
+### A `done` node whose sandbox could not be deleted
+
+`done` is `Done` except while the daemon's automatic delete of the node's
+sandbox has failed (`tod_store::node_problems`, kind `sandbox_retire`). A
+failure that looks temporary (Blaxel not ready or unavailable, a timeout, no
+network: `tod_sandbox::blaxel::error_is_transient`) is `transient`: the node
+is `Others` with the error (it needs nobody, since the daemon's next pass, every
+minute, tries again, but a running sandbox must not read as finished). Any
+other failure (the checkpoint refused, a 4xx, a lost sandbox) is not retried:
+the node is `You::Failed` with the error, once (the record does not change
+again until something does, so a deferral holds). Deleting the sandbox from the
+menu clears it.
+
 ### `Working`, `Done`
 
 `Working` is a conversation running or an autopilot run in an agent turn.
@@ -468,11 +481,11 @@ deleted when the run stops, and each write is pushed at once
   leaves none (the wait row, or the request, says it);
 - the node's latest stop question (`tod_core::stop_questions`) answered
   "leave it": `You::Stopped`, naming the question and the answer that resumes
-  it (the task panel offers **Keep going**, which answers it to continue and
+  it (the task panel offers **Resume**, which answers it to continue and
   wakes the supervisor);
 - the node's sandbox gone (`cloud_nodes.lost_at`): `You::Stopped`, "its sandbox
-  was deleted; Run in the cloud makes a new one" (or "is gone; a new one is
-  made at the next sync");
+  was deleted; Start makes a new one" (or "is gone; a new one is
+  made at the next sync, or Start makes one now");
 - an idle row with none of these, or no row: whatever the node's waits,
   requests and last outcome say, as before (a node that finished or waits on
   GitHub is `Others`, not `Working`).
@@ -487,9 +500,8 @@ the quit dialog (`cloud_sync::working_in_cloud`) is `Working` and nothing else:
 being assigned to the cloud, or having no wait or request, proves nothing.
 
 The app also takes a lease of its own, `cloud_start`
-(`Work::CloudStart`, "starting in the cloud"), the moment the user clicks Run
-in the cloud, Move to the cloud, Reinstall and restart, or Check now on a
-cloud node, so the node never reads as waiting on the user while their request
+(`Work::CloudStart`, "starting in the cloud"), the moment the user clicks Start,
+Resume, or Migrate to… on a node whose runner is a supervisor, so the node never reads as waiting on the user while their request
 is carried out. It holds it until the supervisor is heard from (a heartbeat,
 or any change to the node coming down the feed), pulling every few seconds
 meanwhile. If nothing comes within 150 s the click ends in an error saying so;
@@ -531,7 +543,7 @@ it), something outside (the wait row shows it) or a retry time, and `done` is
 the lifecycle's. `next_actor` reads the row for cloud and local alike:
 
 - `starting`: `Working { CloudStart }` for 150 s from the write, then
-  `You::Failed` ("the cloud supervisor has not reported in ... Run in the cloud
+  `You::Failed` ("the cloud supervisor has not reported in ... Start
   sends it again"). Ignored once a heartbeat newer than the row exists.
 - `stopped`: `You::Stopped { reason_text }`, `You::Failed { error }`
   (`failed`) or `You::Paused` (`paused`, `stopped_now`), since `since`.

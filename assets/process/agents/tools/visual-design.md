@@ -55,6 +55,6 @@ Do not write mockup files directly to the data root or invent a storage path you
 
 ## Guidelines
 
-- Appearance and layout need human Accept before leaving `design` (unless waived at the prior gate).
+- Appearance and layout need human Accept before leaving `design` (unless the user has moved the node past `design` themselves).
 - Label external references **required** vs **guideline** in recommendations.
 - Iterate with the human; do not finalize UI without explicit Accept.

@@ -26,6 +26,7 @@ pub mod repositories;
 pub mod repos;
 pub mod runtime;
 pub mod sandbox;
+pub mod sandbox_host;
 pub mod schema;
 pub mod session_log;
 pub mod store;
@@ -81,5 +82,5 @@ pub use treehouse::{
     treehouse_config_path, treehouse_home,
 };
 pub use workdir::Workdir;
-pub use worktree::{validate_git_repo, validate_interview_workspace};
+pub use worktree::{treehouse_required_problem, validate_git_repo, validate_interview_workspace};
 pub use writer::{FleetMutation, FleetWriter};

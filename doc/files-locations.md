@@ -55,8 +55,29 @@ background run — `provision::resolve_launch_cwd` makes its location:
 
 - a worktree (`ensure_worktree`, on this machine or in the dev container),
   on the node's branch; nodes on the same branch share it;
-- a sandbox from the image or as a fork (`Sandboxes::create`), named after
-  the node, then the node's branch checked out in the repository there.
+- a sandbox from `provision::make_sandbox`, the one creator of a node's
+  sandbox, named `tod-<slug>-<6 hex of the node id>` (no numeric suffix; a
+  name taken by a sandbox the location does not record is the error "tod lost
+  track of a sandbox", and nothing is made), forked from the repository's
+  golden or created from an image, then the node's branch checked out in the
+  repository there.
+
+**Where a cloud location's repository comes from.** A location from an
+*image* starts empty, so there is no checkout to ask: the Locations dialog
+takes **Repository to clone**, a GitHub HTTPS URL
+(`https://github.com/owner/name[.git]`; nothing else is accepted, and the
+dialog says so). It is stored on the location (`files_places.clone_url`,
+machine-local, added idempotently at start with no schema version), cloned by
+the node's first checkout into `/workspace/repo` (the one directory tod's
+checkout step and the supervisor use, so the location's directory is
+that: leave it empty, or the dialog refuses another), and is the clone source
+`cloud_sync::node_source` uses ahead of any path. Leave it empty only for an
+image that already holds the repository, giving the directory it is in. A
+location *forked* from a golden keeps no URL: it names a directory inside the
+golden, and the URL is read from the golden's checkout. The URL is part of the
+recipe (`recipe_key`, only when set, so earlier locations keep theirs): changing
+it makes existing node sandboxes stale and shows the impact dialog. When no
+URL can be found the first chat says what to set for that kind of location.
 
 Either way `origin` is fetched first (`worktree::fetch_origin`), so the work
 starts from the latest: a branch `origin` already has (work pushed before)
@@ -117,8 +138,19 @@ or below it: removing them needs the user.
   old per-node "Image with repositories" form). `tod-sandbox bake` does it.
 - The removal check sees shells and agents recorded for the node, not a
   conversation turn or autopilot run that is starting.
-- "Run in the cloud" (a node's autonomous runner, `doc/cloud-sandboxes/
-  autonomous-nodes.md`) makes its sandbox on its own path
-  (`cloud_sync::ensure_node_sandbox`): it clones the repository by URL and
-  starts the node's branch from `origin/HEAD` there, but it is not recorded
-  as the node's location and none of the above applies to it.
+- A node has one sandbox, and its location row is the one record of it
+  (`node_files_locations.sandbox`); `cloud_nodes.sandbox` is only a copy for
+  the orchestrator, written from the location. Start on a node whose Files are
+  a cloud sandbox (its autonomous runner,
+  `doc/cloud-sandboxes/autonomous-nodes.md`) uses the same sandbox as every
+  other launch; `cloud_sync::ensure_supervisor` adds only what the supervisor
+  needs on top: this build's files when the sandbox does not answer with this
+  build's manifest, its settings, and a poke. A sandbox an older build
+  recorded only in `cloud_nodes` is adopted (menu entry **Adopt existing
+  sandbox**, and automatically at the app's start when unambiguous).
+- At `done` the daemon deletes the node's sandbox (with a checkpoint) unless
+  the lifecycle config's **Delete sandbox** is off for the node
+  (`tod_core::sandbox_retire`, `doc/runner-menu/design.md`).
+- Migrate to... is the task panel's way to move a node to another location;
+  it removes the old location after the impact dialog and keeps the node's
+  sessions.

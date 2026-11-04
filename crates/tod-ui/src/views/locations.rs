@@ -88,6 +88,8 @@ struct LocationsDialog {
     repo: Entity<InputState>,
     container: Entity<InputState>,
     image: Entity<InputState>,
+    /// An image location's repository: the GitHub HTTPS URL tod clones.
+    clone_url: Entity<InputState>,
     use_worktree: bool,
     runs_in: RunsIn,
     repo_on_host: bool,
@@ -109,6 +111,11 @@ struct LocationsDialog {
     list_error: Option<String>,
     /// Where launches would run, or why they cannot, per the last check.
     check: Option<Result<String, String>>,
+    /// Shown under the Worktrees choice: Treehouse is required by Settings but
+    /// is not where this location's nodes would run. Probed off the UI thread
+    /// whenever the choice or the place changes.
+    worktree_note: Option<String>,
+    note_generation: u64,
     checking: bool,
     /// Bumped per check, so a late result for an edit since changed is dropped.
     generation: u64,
@@ -169,6 +176,7 @@ impl LocationsDialog {
             repo: input("Workspace directory", window, cx),
             container: input("Container name", window, cx),
             image: input("Image (empty uses the default)", window, cx),
+            clone_url: input("https://github.com/owner/name", window, cx),
             use_worktree: true,
             runs_in: RunsIn::Machine,
             repo_on_host: false,
@@ -190,6 +198,8 @@ impl LocationsDialog {
             listing: false,
             list_error: None,
             check: None,
+            worktree_note: None,
+            note_generation: 0,
             checking: false,
             generation: 0,
             busy: false,
@@ -256,6 +266,7 @@ impl LocationsDialog {
         set(&self.repo, draft.repo().unwrap_or_default().to_string(), window, cx);
         set(&self.container, dev.container().unwrap_or_default().to_string(), window, cx);
         set(&self.image, image, window, cx);
+        set(&self.clone_url, dev.clone_url().unwrap_or_default().to_string(), window, cx);
         self.editing = place;
         self.error = None;
         self.build_open = false;
@@ -269,6 +280,7 @@ impl LocationsDialog {
         if self.runs_in != RunsIn::Machine {
             self.refresh_list(cx);
         }
+        self.probe_worktree(cx);
         cx.notify();
     }
 
@@ -290,6 +302,8 @@ impl LocationsDialog {
                 } else {
                     SandboxFrom::Image(text(&self.image))
                 },
+                // An image has no checkout to ask; a fork's is its golden's.
+                clone_url: Some(text(&self.clone_url)).filter(|u| !u.is_empty() && !self.fork),
                 ..Default::default()
             }),
         };
@@ -315,6 +329,7 @@ impl LocationsDialog {
         if runs_in != RunsIn::Machine {
             self.refresh_list(cx);
         }
+        self.probe_worktree(cx);
         cx.notify();
     }
 
@@ -350,6 +365,31 @@ impl LocationsDialog {
                     }
                     Err(err) => this.list_error = Some(err),
                 }
+                cx.notify();
+            },
+        );
+    }
+
+    /// Looks, off the UI thread, for what would stop worktrees here (Treehouse
+    /// required by Settings but missing) and shows it under the Worktrees choice.
+    fn probe_worktree(&mut self, cx: &mut Context<Self>) {
+        self.note_generation += 1;
+        self.worktree_note = None;
+        cx.notify();
+        if !self.use_worktree || self.runs_in == RunsIn::Sandbox {
+            return;
+        }
+        let draft = self.draft(cx);
+        let root = self.fleet.paths().root().to_path_buf();
+        let generation = self.note_generation;
+        off_thread(
+            cx,
+            move || worktree_problem(&draft, &root),
+            move |this, note, cx| {
+                if this.note_generation != generation {
+                    return;
+                }
+                this.worktree_note = note;
                 cx.notify();
             },
         );
@@ -391,6 +431,7 @@ impl LocationsDialog {
             self.container.update(cx, |input, cx| input.set_value(name, window, cx));
         }
         self.check = None;
+        self.probe_worktree(cx);
         cx.notify();
     }
 
@@ -872,12 +913,23 @@ impl LocationsDialog {
         v_flex()
             .gap_3()
             .child(field("Name", &self.name, cx))
+            .when(runs_in == RunsIn::Sandbox && !self.fork, |el| {
+                el.child(field("Repository to clone (GitHub HTTPS URL)", &self.clone_url, cx)).child(
+                    div().text_xs().text_color(muted).child(format!(
+                        "An image starts empty, so tod clones this repository into each node's sandbox, \
+                         at {}. Accepted: https://github.com/owner/name or https://github.com/owner/name.git. \
+                         Leave it empty only when the image already holds the repository.",
+                        tod_sandbox::node::WORKSPACE_DIR
+                    )),
+                )
+            })
             .child(field(
                 match runs_in {
                     RunsIn::Machine => "Workspace directory (on this machine)",
                     RunsIn::DevContainer if self.repo_on_host => "Workspace directory (on this machine)",
                     RunsIn::DevContainer => "Workspace directory (inside the dev container)",
-                    RunsIn::Sandbox => "Workspace directory (inside the sandbox)",
+                    RunsIn::Sandbox if self.fork => "Directory of the repository inside the golden sandbox",
+                    RunsIn::Sandbox => "Directory where the image already holds it (leave empty when cloning)",
                 },
                 &self.repo,
                 cx,
@@ -906,14 +958,15 @@ impl LocationsDialog {
                         .child(self.choice("loc-worktree-on", "A worktree for each node", self.use_worktree, cx, |this, _, cx| {
                             this.use_worktree = true;
                             this.check = None;
-                            cx.notify();
+                            this.probe_worktree(cx);
                         }))
                         .child(self.choice("loc-worktree-off", "The directory itself", !self.use_worktree, cx, |this, _, cx| {
                             this.use_worktree = false;
                             this.check = None;
-                            cx.notify();
+                            this.probe_worktree(cx);
                         })),
                 )
+                .when_some(self.worktree_note.clone(), |el, note| el.child(self.error_text(note, window, cx)))
             })
             .when(runs_in == RunsIn::DevContainer, |el| {
                 el.child(
@@ -1176,12 +1229,20 @@ fn check_place(place: &FilesPlace, root: &std::path::Path) -> Result<String, Str
             let target = match &dev.sandbox_from {
                 SandboxFrom::Fork(name) if !name.trim().is_empty() => name.trim().to_string(),
                 from => {
-                    return Ok(format!(
-                        "Each node gets a sandbox of its own from {}, made when it needs its \
-                         files. The image must hold the repository at {}.",
-                        from.describe(),
-                        repo.unwrap_or_default()
-                    ));
+                    return Ok(match dev.clone_url() {
+                        Some(url) => format!(
+                            "Each node gets a sandbox of its own from {}, made when it needs its \
+                             files, and tod clones {url} into it at {}.",
+                            from.describe(),
+                            repo.unwrap_or_default()
+                        ),
+                        None => format!(
+                            "Each node gets a sandbox of its own from {}, made when it needs its \
+                             files. The image must hold the repository at {}.",
+                            from.describe(),
+                            repo.unwrap_or_default()
+                        ),
+                    });
                 }
             };
             // `golden` is an alias: check the sandbox it stands for.
@@ -1205,6 +1266,25 @@ fn check_place(place: &FilesPlace, root: &std::path::Path) -> Result<String, Str
             }
         }
     }
+}
+
+/// Treehouse required by Settings but missing where `place`'s nodes would run
+/// (see [`tod_store::fleet::treehouse_required_problem`]). Runs programs and
+/// may talk to Docker: off the UI thread only.
+fn worktree_problem(place: &FilesPlace, root: &std::path::Path) -> Option<String> {
+    use tod_store::fleet::Workdir;
+    let settings = match tod_store::settings::TodSettings::load_from_path(&root.join(tod_store::paths::SETTINGS_FILE)) {
+        Ok(settings) => settings,
+        Err(err) => return Some(format!("Could not read the settings to check Treehouse: {err:#}")),
+    };
+    let repo = place.repo().unwrap_or_default().to_string();
+    let workdir = match &place.dev_container {
+        Some(dev) if !dev.sandbox && !dev.repo_on_host => {
+            Workdir::Container { container: dev.container()?.to_string(), path: repo }
+        }
+        _ => Workdir::Host(std::path::PathBuf::from(repo)),
+    };
+    tod_store::fleet::treehouse_required_problem(&workdir, &settings)
 }
 
 fn check_repo_in_sandbox(sandbox: &str, repo: Option<&str>) -> Result<String, String> {
@@ -1276,4 +1356,69 @@ fn check_repo_in_container(
             .map_err(|err| format!("{err:#}"))
     };
     directory_verdict(repo, &exec.name, &as_user, git, is_dir, use_worktree)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::TestAppContext;
+    use gpui_component::Root;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    /// Gap 14: for a cloud location from an image the form takes the
+    /// repository's GitHub URL (the clone source), keeps the directory a
+    /// sandbox path, and says what is accepted; a fork takes none.
+    #[gpui::test]
+    fn an_image_location_takes_the_repository_url_and_a_fork_does_not(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let fixture = crate::views::rows::fixture::Fixture::new();
+        let fleet = fixture.store.clone();
+        let slot: Rc<RefCell<Option<Entity<LocationsDialog>>>> = Rc::default();
+        let slot_in = slot.clone();
+        let (_, cx) = cx.add_window_view(move |window, cx| {
+            let dialog = cx.new(|cx| LocationsDialog::new(fleet.clone(), TodPaths::at(std::env::temp_dir()), window, cx));
+            *slot_in.borrow_mut() = Some(dialog.clone());
+            Root::new(dialog, window, cx)
+        });
+        let dialog = slot.borrow_mut().take().unwrap();
+        let set = |cx: &mut gpui::VisualTestContext, input: fn(&LocationsDialog) -> Entity<InputState>, value: &str| {
+            let value = value.to_string();
+            dialog.update_in(cx, move |d, window, cx| {
+                input(d).update(cx, |i, cx| i.set_value(value, window, cx));
+            });
+        };
+        dialog.update_in(cx, |d, window, cx| {
+            d.begin_edit(None, window, cx);
+            d.runs_in = RunsIn::Sandbox;
+        });
+        set(cx, |d| d.name.clone(), "Cloud");
+        set(cx, |d| d.clone_url.clone(), " https://github.com/owner/name.git ");
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        let draft = dialog.read_with(cx, |d, cx| d.draft(cx));
+        assert_eq!(draft.dev_container.as_ref().unwrap().clone_url(), Some("https://github.com/owner/name.git"));
+        assert_eq!(draft.repo(), Some(tod_sandbox::node::WORKSPACE_DIR), "the clone goes to a sandbox path");
+        assert_eq!(draft.problem(&[]), None);
+
+        // A URL that is not GitHub HTTPS is refused with what is accepted.
+        set(cx, |d| d.clone_url.clone(), "git@github.com:owner/name.git");
+        let bad = dialog.read_with(cx, |d, cx| draft_problem(&d.draft(cx), &[]));
+        assert!(bad.unwrap().contains("GitHub HTTPS URL"));
+
+        // A fork keeps no URL: its repository is read from the golden.
+        dialog.update_in(cx, |d, _, _| {
+            d.fork = true;
+            d.fork_name = "golden".into();
+        });
+        set(cx, |d| d.repo.clone(), "/workspace/app");
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        let fork = dialog.read_with(cx, |d, cx| d.draft(cx));
+        assert_eq!(fork.dev_container.as_ref().unwrap().clone_url, None);
+        assert_eq!(fork.repo(), Some("/workspace/app"));
+        assert_eq!(fork.problem(&[]), None);
+    }
 }

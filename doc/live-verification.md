@@ -27,7 +27,10 @@ engineer on the team would, and fixing what breaks.
    keeps one database per user, and two roots with the same user seed over
    each other. An existing root with the real root's owner must be changed
    by hand the same way (then it seeds a fresh copy on the next launch).
-3. Copy `target/sandbox/*` (relay, orchestrator, Linux `tod-cli`, ...) from a
+3. `tod-sandbox --data-root <root> golden refresh cofactr/workspace` makes the
+   workspace golden (a fork of the account's `wsx-golden-*`, which stays; its
+   `/workspace` origin is Cofactr/workspace). Do not make a `cofactr/flagship` one.
+4. Copy `target/sandbox/*` (relay, orchestrator, Linux `tod-cli`, ...) from a
    checkout that has built them; `tod-sandbox --data-root <root> doctor` must
    be clean.
 
@@ -51,12 +54,46 @@ click before the next one (dialogs animate).
   250). Settings: `filter_query` and `result_cap` (`tod-cli` accepts any key,
   so use these exactly).
 - `ENG work`: the destination. Files capability picks the location
-  `Golden flagship` (a cloud sandbox, fork of `golden`, directory
-  `/workspace/flagship`).
+  `Golden workspace` (a cloud sandbox, fork of `golden`, directory
+  `/workspace`).
 - The generator's Quick accept: destination slug `eng-work`, accept
   capabilities Spec, Lifecycle, Agent, Files, Ticket.
 - Accept a ticket (search it, click Accept): it is copied under `ENG work`
   and inherits the location.
+
+## Two locations, two repositories
+
+The root has two Files locations (Locations dialog; the seed script adds them):
+
+| Location | Repository | Use it for |
+|---|---|---|
+| `Golden workspace` | `Cofactr/workspace` (flagship, kb, ... are submodules inside it); a fork of `golden`, directory `/workspace`; its golden is `cofactr/workspace` (`tod-sandbox golden refresh cofactr/workspace`) | Checks on real data and the real golden flow: Linear tickets, `ENG work`, Start/Migrate/Reset environment on what the real roots do. **Nothing may be pushed from it** (see below). |
+| `Build test` | private `joel-cofactr/build-test`; cloud sandbox, "From a sandbox" `golden`, directory `/workspace/repo`; its golden is `joel-cofactr/build-test` (`tod-sandbox golden refresh joel-cofactr/build-test`) | Anything that pushes a branch or opens a PR, and anything that needs flexibility (any repository content). |
+
+Never use `/workspace/flagship` as a location directory: its origin is
+`Cofactr/flagship`, so the golden is keyed `cofactr/flagship` and Migrate would
+push branches there. The old `Golden flagship` location and the
+`cofactr/flagship` golden were retired for that reason (the location kept its id
+and became `Golden workspace`, so nodes that used it follow).
+
+**One-time golden for `Build test`.** A repository with no golden is built, not
+forked: `tod-sandbox --data-root ~/.local/share/tod-live-verify golden refresh
+joel-cofactr/build-test` makes a fresh sandbox from the default image, installs
+tod's files, clones the private repository into `/workspace/repo` through the
+proxy with your stored GitHub token (submodules too), labels it `ready`, and
+maps `[blaxel.goldens]` to it (the account-wide `wsx-golden-*` holds
+`cofactr/workspace`, so it is never forked for this repository). Run it again
+after a tod update (or let the app do it when it starts a node); with the golden
+in place it refreshes in place. Do the same for any new repository. The
+location is set in the Locations dialog or by the seed script (it also turns an
+old image-based `Build test` into this). The golden made on 2026-11-04 is
+`tod-golden-joel-cofactr-build-test-6aeb65d8`; a node on it has
+`/workspace/repo` on its own `task/<slug>` branch with origin
+`https://github.com/joel-cofactr/build-test.git`. A node's first fork can hit
+Blaxel's slow wake (`WORKLOAD_UNAVAILABLE` for minutes; the app deletes that
+sandbox and a second Open shell/Start worked). Starting a node asks every
+golden at the Files directory which repository it holds (`origin_url_of`), which
+also wakes the `wsx-golden-*`.
 
 ## Loop
 
@@ -101,7 +138,7 @@ regression test, merge, rebuild, relaunch, and rerun from the failing step.
   once on a fresh deploy and not again after a second one; the cause is not
   known (Python in the sandbox verified the proxy chain with the same bundle).
 - **A node with a live heartbeat is not reinstalled at app launch.** After a
-  deploy use the task panel's "Sync now" dropdown, "Reinstall and restart", to
+  deploy use the task panel's runner menu, Reset environment, to
   put the new supervisor on it; check with `tod-sandbox exec <sandbox> --
   python3 -c ...` on `/var/lib/tod-supervisor/<node>/tod.db` (`user_version`).
 - **The live-verify root's `orchestrator-github.json`** lists the GitHub tokens
@@ -109,9 +146,31 @@ regression test, merge, rebuild, relaunch, and rerun from the failing step.
   reads. If none covers the node's repository the gate logs "pull request not
   found (GitHub also answers 404 when tod's token cannot see the repository)"
   and wakes the sandbox instead; the supervisor then looks itself.
+- **Updating a sandbox's proxy redeploys it from its image.** Whatever was
+  installed into it before (tod's relay, manifest, supervisor, bundles) is gone;
+  a plain `tod-sandbox fork` of a sandbox keeps them. So install after any proxy
+  update (`golden refresh`, `fork_golden`), never before.
+- **A second `tod` on the root** (another session's) overwrites
+  `sandboxes.toml` with its stale copy and logs "Could not checkpoint" for your
+  sandboxes; check `ps aux | grep 'debug/tod '` first, use your own port, and
+  re-read `tod-sandbox golden` after anything you did to the golden.
+- **The control socket's `shot2` lags one action** after a click that opens a
+  menu or dialog: take it twice. A node's turn on a throwaway PR node lasts
+  ~20 s; catching "running" menus needs a script that clicks without a tool
+  round trip in between.
 - **No `timeout` command on macOS**: `timeout 120 cargo ...` fails with
   "command not found", and a pipeline that greps its output hides that. Run
   cargo plainly, or check the exit code. macOS `sed -i` needs `-i ''`.
+
+## Test pull requests and branches: only in `joel-cofactr/build-test`
+
+Any pull request or branch a live check needs (a throwaway draft PR, a
+`task/<slug>` branch, a review request) goes **only** in the private repository
+`joel-cofactr/build-test`, so a node that will push or open a PR uses the
+`Build test` location, never `Golden workspace`. Never create, push, mark ready, comment on, or touch
+a PR or branch in any Cofactr organisation repository (`Cofactr/workspace`,
+`Cofactr/flagship`, ...): that notifies code owners and is the user's to handle.
+Close every PR you open there and delete the branches you make when you are done.
 
 ## Testing the webhook wake (`joel-cofactr/build-test`)
 
@@ -131,7 +190,7 @@ due 3 minutes later):
    lifecycle agent files ticket`, `pr link joel-cofactr/build-test#<N> --node
    <uuid>` (needs the UUID), and set `node_lifecycle.state = 'pr_review'` in the
    root's `tod.db` (no CLI sets it). The Files location can stay
-   `Golden flagship`: only the PR link matters for the wait.
+   `Golden workspace`: only the PR link matters for the wait.
 3. Run it in the cloud (task panel). With the PR having failing or stuck checks
    the node ends `pr_stuck`; `gh workflow disable` the repo's two workflows and
    push a commit so the PR has none, then "Run with a new session": the node
