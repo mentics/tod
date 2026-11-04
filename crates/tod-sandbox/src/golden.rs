@@ -302,8 +302,7 @@ pub fn half_made_action(new: &str, old: &str, found: Option<&SandboxInfo>) -> Ha
 /// `doc/runner-menu/live-check-2026-11.md`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Source {
-    /// The repository's golden exists (its own entry, or the account-wide one
-    /// holding this very repository): make the next one from it.
+    /// The repository's golden exists: make the next one from it.
     Refresh { from: String },
     /// There is no golden holding this repository: make one from a fresh
     /// image sandbox, with tod's files installed and the repository cloned.
@@ -311,35 +310,13 @@ pub enum Source {
     Build { why: String },
 }
 
-/// Chooses the [`Source`] for `repo` (normalized `owner/name`, lower case).
-/// `own` is the repository's own golden entry; `legacy` the account-wide
-/// `golden` of a `sandboxes.toml` from before there was one per repository,
-/// which stands for every repository that has none of its own. The legacy
-/// one is a checkout of *some* repository, so it is refreshed for `repo` only
-/// when `legacy_origin` (asked of it, given the golden's name; it answers a
-/// normalized `owner/name`, or `None` when the golden has no checkout) is
-/// `repo`. Never a fork of another repository's golden. A failure to read the
-/// origin is an error, not a guess.
-pub fn decide_source(
-    repo: &str,
-    own: Option<&str>,
-    legacy: Option<&str>,
-    legacy_origin: &mut dyn FnMut(&str) -> Result<Option<String>>,
-) -> Result<Source> {
-    if let Some(own) = own {
-        return Ok(Source::Refresh { from: own.to_string() });
-    }
-    let Some(legacy) = legacy else {
-        return Ok(Source::Build { why: format!("{repo} has no golden sandbox") });
-    };
-    match legacy_origin(legacy)? {
-        Some(origin) if origin == repo => Ok(Source::Refresh { from: legacy.to_string() }),
-        Some(origin) => Ok(Source::Build {
-            why: format!("{repo} has no golden of its own, and the account-wide golden {legacy} holds {origin}, not {repo}"),
-        }),
-        None => Ok(Source::Build {
-            why: format!("{repo} has no golden of its own, and the account-wide golden {legacy} has no repository checkout to say it is {repo}'s"),
-        }),
+/// Chooses the [`Source`] for `repo` (normalized `owner/name`, lower case)
+/// from its golden entry `own`: refreshed from it when there is one, else
+/// built. Never a fork of another repository's golden.
+pub fn decide_source(repo: &str, own: Option<&str>) -> Source {
+    match own {
+        Some(own) => Source::Refresh { from: own.to_string() },
+        None => Source::Build { why: format!("{repo} has no golden sandbox") },
     }
 }
 
@@ -605,35 +582,8 @@ mod tests {
 
     #[test]
     fn a_repository_with_no_golden_is_built_never_forked_from_anothers() {
-        let never = &mut |_: &str| -> Result<Option<String>> { panic!("nothing to ask") };
-        // Its own entry: refreshed in place, nothing asked.
-        assert_eq!(
-            decide_source("o/r", Some("tod-golden-o-r-1"), Some("wsx-golden-*"), never).unwrap(),
-            Source::Refresh { from: "tod-golden-o-r-1".into() }
-        );
-        // Neither: built.
-        assert!(matches!(decide_source("o/r", None, None, never).unwrap(), Source::Build { .. }));
-        // The account-wide golden of another repository (the wsx-golden): never forked.
-        let mut asked = Vec::new();
-        let other = decide_source("joel-cofactr/build-test", None, Some("wsx-golden-*"), &mut |g| {
-            asked.push(g.to_string());
-            Ok(Some("cofactr/workspace".into()))
-        })
-        .unwrap();
-        match other {
-            Source::Build { why } => assert!(why.contains("cofactr/workspace") && why.contains("wsx-golden-*"), "{why}"),
-            other => panic!("{other:?}"),
-        }
-        assert_eq!(asked, vec!["wsx-golden-*"]);
-        // One with no checkout cannot vouch for the repository.
-        assert!(matches!(decide_source("o/r", None, Some("g"), &mut |_| Ok(None)).unwrap(), Source::Build { .. }));
-        // The account-wide golden of this very repository is refreshed in place.
-        assert_eq!(
-            decide_source("cofactr/workspace", None, Some("wsx-golden-*"), &mut |_| Ok(Some("cofactr/workspace".into()))).unwrap(),
-            Source::Refresh { from: "wsx-golden-*".into() }
-        );
-        // An origin that cannot be read is an error, not a guess.
-        assert!(decide_source("o/r", None, Some("g"), &mut |_| Err(anyhow::anyhow!("unreachable"))).is_err());
+        assert_eq!(decide_source("o/r", Some("tod-golden-o-r-1")), Source::Refresh { from: "tod-golden-o-r-1".into() });
+        assert!(matches!(decide_source("o/r", None), Source::Build { .. }));
     }
 
     #[test]

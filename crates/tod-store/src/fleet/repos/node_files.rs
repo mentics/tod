@@ -27,7 +27,9 @@ use serde::{Deserialize, Serialize};
 /// [`crate::fleet::sandbox`]), made from `sandbox_from` when the node first
 /// needs its files; `container` is unused. The repository always lives in
 /// the sandbox: a fork's golden must already hold it, and an image either
-/// holds it or is given `clone_url`, which tod clones.
+/// holds it or is given `clone_url`, which tod clones. A fork of
+/// [`tod_sandbox::config::GOLDEN`] names the repository whose golden it
+/// forks in `clone_url` too.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DevContainerSetting {
     /// Container name or id; `None` until one is chosen.
@@ -42,10 +44,11 @@ pub struct DevContainerSetting {
     /// What each node's sandbox is made from.
     #[serde(default)]
     pub sandbox_from: SandboxFrom,
-    /// For a sandbox made from an image only: the repository's GitHub HTTPS
-    /// URL, which tod clones into each new sandbox (an empty image has none
-    /// to ask). A fork reads it from the golden's checkout instead, and
-    /// `normalized` clears it there. Machine-local, like the rest.
+    /// The repository's GitHub HTTPS URL. From an image, tod clones it into
+    /// each new sandbox (an empty image has none to ask); a fork of `golden`
+    /// forks that repository's golden. A fork of a sandbox by name holds
+    /// its own (its `tod-repo` label says which), and `normalized` clears
+    /// it there. Machine-local, like the rest.
     #[serde(default)]
     pub clone_url: Option<String>,
 }
@@ -84,6 +87,11 @@ impl SandboxFrom {
             .then_some("Choose the sandbox to fork")
     }
 
+    /// A fork of the repository's golden (the alias, not a sandbox by name).
+    pub fn is_golden(&self) -> bool {
+        matches!(self, Self::Fork(name) if name.trim() == tod_sandbox::config::GOLDEN)
+    }
+
     pub fn source(&self) -> crate::fleet::sandbox::NewSandboxSource {
         use crate::fleet::sandbox::NewSandboxSource;
         match self {
@@ -107,6 +115,15 @@ impl DevContainerSetting {
     /// The repository URL tod clones into a sandbox made from an image.
     pub fn clone_url(&self) -> Option<&str> {
         if !self.sandbox || !matches!(self.sandbox_from, SandboxFrom::Image(_)) {
+            return None;
+        }
+        self.clone_url.as_deref().map(str::trim).filter(|u| !u.is_empty())
+    }
+
+    /// The repository the location names: the one cloned into a sandbox made
+    /// from an image, or the one whose golden a fork of `golden` forks.
+    pub fn repo_url(&self) -> Option<&str> {
+        if !self.sandbox || !(matches!(self.sandbox_from, SandboxFrom::Image(_)) || self.sandbox_from.is_golden()) {
             return None;
         }
         self.clone_url.as_deref().map(str::trim).filter(|u| !u.is_empty())

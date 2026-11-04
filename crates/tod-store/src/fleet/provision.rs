@@ -914,6 +914,7 @@ fn make_sandbox(
     // sandbox is made (it may refresh the golden, which is slow and says so).
     let fork_from = match &source {
         sandbox::NewSandboxSource::Fork(from) if from.trim() == tod_sandbox::config::GOLDEN => {
+            // `repo` is the location's (`DevContainerSetting::repo_url`): whose golden.
             Some(host.current_golden(&mut sandboxes, &bx, &repo.slug, progress)?)
         }
         sandbox::NewSandboxSource::Fork(from) => Some(from.trim().to_string()),

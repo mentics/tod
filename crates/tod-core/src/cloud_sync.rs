@@ -1293,36 +1293,37 @@ fn origin_url_of(fleet: &FleetStore, node_id: &str, repo: &str) -> Result<String
         {
             sandboxes.push(name.trim().to_string());
         }
-        // `golden` is an alias for the repository's golden, not a sandbox name,
-        // and the repository is what is being looked for: every golden is
-        // looked at (one per repository, and the account-wide one), and the
-        // ones that say which repository they hold must agree. A golden that
-        // does not say is passed over when another does.
-        let mut named = Vec::new();
-        let mut goldens = Vec::new();
+        // `golden` is the location's repository's golden, and that repository
+        // is a candidate of its own ahead of this (`DevContainerSetting::repo_url`):
+        // a location that forks it without naming one is incomplete.
+        let mut resolved = Vec::new();
         for name in sandboxes {
-            if name != tod_sandbox::config::GOLDEN {
-                named.push(name);
-                continue;
-            }
-            let root = fleet.paths().root();
-            match tod_store::fleet::sandbox::Sandboxes::load(root).and_then(|s| s.blaxel().and_then(|bx| s.resolve_all_goldens(&bx))) {
-                Ok(all) => goldens.extend(all),
-                Err(err) => {
-                    golden_missing = true;
-                    tried.push(format!(
-                        "this node's files are forked from the golden sandbox, which cannot be found: {err:#}. \
-                         Make one with `tod-sandbox golden refresh <repo>`, or point tod at one with `tod-sandbox golden <repo> <sandbox>`"
-                    ));
-                }
+            if name == tod_sandbox::config::GOLDEN {
+                golden_missing = true;
+                tried.push(
+                    "this node's files are forked from `golden`, and its location names no repository: in \
+                     Locations, give the repository whose golden its nodes fork"
+                        .to_string(),
+                );
+            } else {
+                resolved.push(name);
             }
         }
         // The repository each holds is on the sandbox itself (its `tod-repo`
         // label), read from Blaxel's listing: no sandbox is started or asked.
-        let named: Vec<_> = named.iter().map(|name| golden_repo(fleet, name)).collect();
-        let goldens: Vec<_> = goldens.iter().map(|name| golden_repo(fleet, name)).collect();
-        if let Some(url) = repo_the_sandboxes_agree_on(named, goldens, &mut tried) {
-            return Ok(url);
+        let mut found: Vec<String> = Vec::new();
+        for name in resolved {
+            match golden_repo(fleet, &name) {
+                Ok(repo_slug) => found.push(format!("https://github.com/{repo_slug}.git")),
+                Err(err) => tried.push(format!("{err:#}")),
+            }
+        }
+        found.sort();
+        found.dedup();
+        match found.as_slice() {
+            [] => {}
+            [url] => return Ok(url.clone()),
+            many => tried.push(format!("the goldens hold different repositories ({}): say which the node's files are", many.join(", "))),
         }
     }
     let why = if tried.is_empty() { format!("{repo} is not a checkout on this machine") } else { tried.join("; ") };
@@ -1331,46 +1332,6 @@ fn origin_url_of(fleet: &FleetStore, node_id: &str, repo: &str) -> Result<String
         bail!("no HTTPS repository URL for the cloud run: {why}");
     }
     bail!("no HTTPS repository URL for the cloud run ({why}); {}", what_to_set(fleet, node_id))
-}
-
-/// The HTTPS URL of the one repository the sandboxes a node's files may come
-/// from say they hold: the ones it names (each must say), and the goldens
-/// `golden` may stand for, of which one that does not say is passed over
-/// when another does. Two different repositories is no answer; what is
-/// wrong goes in `tried`.
-fn repo_the_sandboxes_agree_on(named: Vec<Result<String>>, goldens: Vec<Result<String>>, tried: &mut Vec<String>) -> Option<String> {
-    let url = |slug: String| format!("https://github.com/{slug}.git");
-    let mut found: Vec<String> = Vec::new();
-    for repo in named {
-        match repo {
-            Ok(slug) => found.push(url(slug)),
-            Err(err) => tried.push(format!("{err:#}")),
-        }
-    }
-    let mut unlabelled: Vec<String> = Vec::new();
-    for repo in goldens {
-        match repo {
-            Ok(slug) => found.push(url(slug)),
-            Err(err) => unlabelled.push(format!("{err:#}")),
-        }
-    }
-    if found.is_empty() {
-        tried.extend(unlabelled);
-    }
-    found.sort();
-    found.dedup();
-    match found.as_slice() {
-        [] => None,
-        [one] => Some(one.clone()),
-        many => {
-            tried.push(format!(
-                "the sandboxes this node's files may come from hold different repositories ({}): in Locations, \
-                 fork them from the golden sandbox of the node's repository by its name instead of `golden`",
-                many.join(", ")
-            ));
-            None
-        }
-    }
 }
 
 /// The repository the golden sandbox `name` holds, from its `tod-repo` label.
@@ -1398,9 +1359,12 @@ fn what_to_set(fleet: &FleetStore, node_id: &str) -> String {
              location, and give the repository (e.g. https://github.com/owner/repo) under \"Repository to clone\""
                 .into()
         }
-        Some(dev) if dev.sandbox => "the sandbox is forked from a golden whose checkout must have a GitHub \
-             remote: in Locations, choose a directory inside the golden that is a git checkout, or refresh the \
-             golden (`tod-sandbox golden refresh <repo>`)"
+        Some(dev) if dev.sandbox && dev.sandbox_from.is_golden() => "in Locations, give the repository whose \
+             golden this node's location forks"
+            .into(),
+        Some(dev) if dev.sandbox => "the sandbox the location forks must say which repository it holds (its \
+             `tod-repo` label): make it a repository's golden with `tod-sandbox golden <owner/name> <sandbox>`, \
+             or fork `golden` and give the repository in Locations"
             .into(),
         _ => "the cloud checks the repository out from its HTTPS URL, so set the Files directory (in \
               Locations) to a checkout on this machine whose origin is on GitHub, or to that URL (e.g. \
@@ -1418,14 +1382,15 @@ fn node_source(fleet: &FleetStore, node_id: &str) -> Result<(tod_store::fleet::F
     // each distinct candidate; the first error is the one reported.
     let inherited = fleet.resolve_files_for_node(node_id).ok().flatten().and_then(|files| files.repo);
     let mut candidates: Vec<String> = Vec::new();
-    // A location that makes sandboxes from an image says where to clone from:
-    // an empty image has no checkout to ask.
+    // A location that makes sandboxes from an image says where to clone from
+    // (an empty image has no checkout to ask), and one that forks `golden`
+    // says whose golden.
     let clone_url = fleet
         .resolve_files_for_node(node_id)
         .ok()
         .flatten()
         .and_then(|files| files.dev_container)
-        .and_then(|dev| dev.clone_url().map(str::to_string));
+        .and_then(|dev| dev.repo_url().map(str::to_string));
     for repo in [clone_url, inherited, task.repo.clone()].into_iter().flatten() {
         let repo = repo.trim().to_string();
         if !repo.is_empty() && !candidates.contains(&repo) {

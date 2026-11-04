@@ -176,9 +176,12 @@ without packages: the proxy update that gives it the node's rules redeploys it
 from its image and drops what the golden had installed). `tod-sandbox golden` lists the goldens;
 `golden <owner/name>` shows one; `golden <owner/name> <sandbox>` points a
 repository at a sandbox (a name ending in `*` is the newest sandbox with that
-prefix). A `golden = "..."` from before there was one per repository is read
-as the golden of every repository that has none of its own, and stays when
-one is set (the log says so); `[blaxel.goldens]` holds the per-repository ones.
+prefix) and labels it `tod-repo` with the repository it holds.
+`[blaxel.goldens]` holds them. An account-wide `golden = "..."` (from before
+there was one per repository) is refused when the file is read, with what to
+do instead. A Files location that forks `golden` names the repository whose
+golden its nodes fork (Locations: "Repository"; choosing a golden in the list
+fills it in).
 
 **A repository with no golden** (`tod-sandbox golden refresh <owner/name>`, and
 the app's own refresh before a fork) gets one built from the right source, never
@@ -188,9 +191,7 @@ into `/workspace/repo` (where the relay, the supervisor and a node's checkout
 look first) through the sandbox's proxy, which holds your stored GitHub token,
 so a **private** repository clones; submodules are initialized recursively.
 It is then labelled, marked `ready` and set as the repository's golden, like any
-other. The account-wide `golden` of an old `sandboxes.toml` counts as this
-repository's only when its checkout's `origin` is this repository (asked of the
-sandbox, read-only); otherwise it is left alone and one is built. A clone that
+other. A clone that
 cannot be made (no token, no access) fails naming the repository, deletes the
 half-made sandbox, and changes nothing. (`tod-sandbox bake --repo` still cannot
 clone a private repository: a Dockerfile cannot carry a token.)

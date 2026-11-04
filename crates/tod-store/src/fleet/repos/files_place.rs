@@ -111,9 +111,10 @@ impl FilesPlace {
     pub fn describe(&self) -> String {
         match &self.dev_container {
             Some(dev) if dev.sandbox => {
-                match dev.clone_url() {
-                    Some(url) => format!("a cloud sandbox from {}, cloning {url}", dev.sandbox_from.describe()),
-                    None => format!("a cloud sandbox from {}", dev.sandbox_from.describe()),
+                match (dev.clone_url(), dev.repo_url()) {
+                    (Some(url), _) => format!("a cloud sandbox from {}, cloning {url}", dev.sandbox_from.describe()),
+                    (None, Some(url)) => format!("a cloud sandbox from {} for {url}", dev.sandbox_from.describe()),
+                    (None, None) => format!("a cloud sandbox from {}", dev.sandbox_from.describe()),
                 }
             }
             Some(dev) => {
@@ -137,8 +138,9 @@ impl FilesPlace {
             container: if dev.sandbox { None } else { dev.container().map(str::to_string) },
             repo_on_host: dev.repo_on_host && !dev.sandbox,
             sandbox: dev.sandbox,
-            // Only an image has a repository to clone; a fork's is its golden's.
-            clone_url: dev.clone_url().map(|u| u.trim_end_matches('/').to_string()),
+            // An image's repository to clone, or the one whose golden a fork
+            // of `golden` forks; a fork by name holds its own.
+            clone_url: dev.repo_url().map(|u| u.trim_end_matches('/').to_string()),
             sandbox_from: if dev.sandbox { dev.sandbox_from } else { SandboxFrom::default() },
         });
         // The clone goes where tod always puts it, so the directory is that.
@@ -177,10 +179,12 @@ impl FilesPlace {
             {
                 return Some(format!("{err:#}"));
             }
-            if let Some(url) = dev.clone_url() {
-                if let Err(problem) = validate_clone_url(url) {
-                    return Some(problem);
-                }
+            if let Some(url) = dev.repo_url()
+                && let Err(problem) = validate_clone_url(url)
+            {
+                return Some(problem);
+            }
+            if dev.clone_url().is_some() {
                 if let Some(repo) = self.repo()
                     && repo != tod_sandbox::node::WORKSPACE_DIR
                 {
@@ -207,6 +211,9 @@ impl FilesPlace {
             if dev.sandbox {
                 if let Some(reason) = dev.sandbox_from.incomplete() {
                     return Some(reason.into());
+                }
+                if dev.sandbox_from.is_golden() && dev.repo_url().is_none() {
+                    return Some("Give the repository whose golden each node forks (its GitHub URL)".into());
                 }
             } else if dev.container().is_none() {
                 return Some("Choose a dev container".into());
@@ -351,7 +358,7 @@ impl<'a> FilesPlaceRepo<'a> {
                 dev.map_or("docker", DevContainerSetting::kind),
                 source,
                 from,
-                dev.and_then(|d| d.clone_url()),
+                dev.and_then(|d| d.repo_url()),
                 now,
             ],
         )?;
@@ -686,11 +693,25 @@ mod tests {
     }
 
     #[test]
-    fn a_fork_never_keeps_a_clone_url() {
+    fn a_fork_by_name_never_keeps_a_repository_and_a_fork_of_golden_needs_one() {
+        let mut p = image_place(Some("https://github.com/o/n"), Some("/workspace/repo"));
+        p.dev_container.as_mut().unwrap().sandbox_from = SandboxFrom::Fork("tod-golden-o-n-1".into());
+        let p = p.normalized();
+        assert_eq!(p.dev_container.unwrap().clone_url, None);
+
+        // `golden` is the named repository's golden: the URL is kept, never cloned.
         let mut p = image_place(Some("https://github.com/o/n"), Some("/workspace/repo"));
         p.dev_container.as_mut().unwrap().sandbox_from = SandboxFrom::Fork("golden".into());
         let p = p.normalized();
-        assert_eq!(p.dev_container.unwrap().clone_url, None);
+        let dev = p.dev_container.as_ref().unwrap();
+        assert_eq!(dev.repo_url(), Some("https://github.com/o/n"));
+        assert_eq!(dev.clone_url(), None);
+        assert_eq!(p.problem(&[]), None);
+        assert!(p.describe().contains("for https://github.com/o/n"), "{}", p.describe());
+
+        let mut p = image_place(None, Some("/workspace/repo"));
+        p.dev_container.as_mut().unwrap().sandbox_from = SandboxFrom::Fork("golden".into());
+        assert!(p.incomplete().unwrap().contains("repository whose golden"), "{:?}", p.incomplete());
     }
 
     #[test]

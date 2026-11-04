@@ -508,18 +508,17 @@ fn golden(ctx: &mut Ctx, mut args: Args) -> Result<i32> {
     };
     match (first, sandbox) {
         (None, _) => {
-            let all = acct.golden_settings();
-            if all.is_empty() {
+            if acct.goldens.is_empty() {
                 println!("(none set)");
             }
-            for (repo, golden) in all {
-                println!("{repo}: {golden}{}", if repo == "*" { " (every repository without its own)" } else { "" });
+            for (repo, golden) in &acct.goldens {
+                println!("{repo}: {golden}");
             }
         }
         (Some(repo), None) => {
             let repo = normalize(&repo)?;
             match acct.golden_for(&repo) {
-                Some(setting) => println!("{}", setting.name()),
+                Some(setting) => println!("{setting}"),
                 None => println!("(none set for {repo})"),
             }
         }

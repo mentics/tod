@@ -61,44 +61,13 @@ pub fn ensure_golden_current(sandboxes: &mut Sandboxes, bx: &Blaxel, repo: &str,
 }
 
 /// Where `repo`'s golden comes from ([`golden::decide_source`]): its own
-/// entry, or the account-wide one only when its checkout is `repo`'s (asked
-/// of the sandbox itself, read-only), else nothing to refresh: one is built.
+/// entry (a `prefix*` resolved to its newest sandbox), else one is built.
 fn source_for(sandboxes: &Sandboxes, bx: &Blaxel, repo: &str) -> Result<golden::Source> {
-    use tod_sandbox::config::GoldenSetting;
-    let setting = sandboxes.account()?.golden_for(repo);
-    // Resolved (a `prefix*` stands for its newest sandbox) only when there is one.
-    let resolved = match setting {
+    let own = match sandboxes.account()?.golden_for(repo) {
         Some(_) => Some(sandboxes.resolve_golden(bx, repo)?),
         None => None,
     };
-    let (own, legacy) = match setting {
-        Some(GoldenSetting::Own(_)) => (resolved.as_deref(), None),
-        Some(GoldenSetting::Legacy(_)) => (None, resolved.as_deref()),
-        None => (None, None),
-    };
-    golden::decide_source(repo, own, legacy, &mut |name| checkout_origin(bx, name))
-}
-
-/// The repository (`owner/name`, lower case) the golden `name`'s checkout was
-/// cloned from, read from the sandbox (a read-only `git remote get-url`); `None`
-/// when it holds no checkout or one with no `origin`.
-fn checkout_origin(bx: &Blaxel, name: &str) -> Result<Option<String>> {
-    let info = bx.get(name)?.ok_or_else(|| anyhow!("the golden sandbox {name} does not exist"))?;
-    let url = info.url.ok_or_else(|| anyhow!("sandbox {name} has no URL"))?;
-    bx.wait_reachable(&url, tod_sandbox::blaxel::WAKE_CEILING).with_context(|| format!("wake {name} to read which repository it holds"))?;
-    let probe = format!(
-        "d={}; [ -d \"$d/.git\" ] && git -C \"$d\" remote get-url origin 2>/dev/null",
-        tod_sandbox::node::WORKSPACE_PROBE
-    );
-    let out = golden::retry_step(
-        name,
-        "read its repository",
-        &golden::StepRetry::default(),
-        &mut std::thread::sleep,
-        &mut |_| {},
-        || bx.run(&url, &format!("sh -c {}", tod_sandbox::relay::shell_quote(&probe)), 60),
-    )?;
-    Ok(if out.exit_code == 0 { tod_store::cloud_nodes::normalize_repo(out.output().trim()) } else { None })
+    Ok(golden::decide_source(repo, own.as_deref()))
 }
 
 /// The decision of [`ensure_golden_current`], apart from Blaxel and the

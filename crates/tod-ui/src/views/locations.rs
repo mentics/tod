@@ -266,7 +266,7 @@ impl LocationsDialog {
         set(&self.repo, draft.repo().unwrap_or_default().to_string(), window, cx);
         set(&self.container, dev.container().unwrap_or_default().to_string(), window, cx);
         set(&self.image, image, window, cx);
-        set(&self.clone_url, dev.clone_url().unwrap_or_default().to_string(), window, cx);
+        set(&self.clone_url, dev.repo_url().unwrap_or_default().to_string(), window, cx);
         self.editing = place;
         self.error = None;
         self.build_open = false;
@@ -302,8 +302,9 @@ impl LocationsDialog {
                 } else {
                     SandboxFrom::Image(text(&self.image))
                 },
-                // An image has no checkout to ask; a fork's is its golden's.
-                clone_url: Some(text(&self.clone_url)).filter(|u| !u.is_empty() && !self.fork),
+                // An image's repository to clone, or the one whose golden a
+                // fork of `golden` forks (`normalized` drops it for a fork by name).
+                clone_url: Some(text(&self.clone_url)).filter(|u| !u.is_empty()),
                 ..Default::default()
             }),
         };
@@ -426,6 +427,12 @@ impl LocationsDialog {
         let name = chosen.name.clone();
         if self.runs_in == RunsIn::Sandbox {
             self.fork = true;
+            // `golden` is listed once per repository: choosing one names it.
+            if name == tod_sandbox::config::GOLDEN
+                && let Some(Ok(Some(repo))) = self.listed_sandboxes.get(index).map(|l| l.repo.clone())
+            {
+                self.clone_url.update(cx, |input, cx| input.set_value(format!("https://github.com/{repo}"), window, cx));
+            }
             self.fork_name = name;
         } else {
             self.container.update(cx, |input, cx| input.set_value(name, window, cx));
@@ -861,7 +868,14 @@ impl LocationsDialog {
         let chosen_container = self.container.read(cx).value().trim().to_string();
         for (index, item) in self.listed.iter().enumerate() {
             let chosen = if runs_in == RunsIn::Sandbox {
-                self.fork && self.fork_name == item.name
+                let golden_repo = self.listed_sandboxes.get(index).and_then(|l| l.repo.clone().ok().flatten());
+                self.fork
+                    && self.fork_name == item.name
+                    && (item.name != tod_sandbox::config::GOLDEN
+                        || golden_repo.is_some_and(|repo| {
+                            tod_store::cloud_nodes::normalize_repo(self.clone_url.read(cx).value().trim()).as_deref()
+                                == Some(repo.as_str())
+                        }))
             } else {
                 !chosen_container.is_empty()
                     && (chosen_container == item.name
@@ -913,6 +927,13 @@ impl LocationsDialog {
         v_flex()
             .gap_3()
             .child(field("Name", &self.name, cx))
+            .when(runs_in == RunsIn::Sandbox && self.fork && self.fork_name == tod_sandbox::config::GOLDEN, |el| {
+                el.child(field("Repository (GitHub HTTPS URL)", &self.clone_url, cx)).child(
+                    div().text_xs().text_color(muted).child(
+                        "Each node forks this repository's golden sandbox. Choosing a golden below fills it in.",
+                    ),
+                )
+            })
             .when(runs_in == RunsIn::Sandbox && !self.fork, |el| {
                 el.child(field("Repository to clone (GitHub HTTPS URL)", &self.clone_url, cx)).child(
                     div().text_xs().text_color(muted).child(format!(
@@ -1246,7 +1267,7 @@ fn check_place(place: &FilesPlace, root: &std::path::Path) -> Result<String, Str
                 }
             };
             // `golden` is an alias: check the sandbox it stands for.
-            let real = sandboxes::resolve_fork_source(root, &target).map_err(|err| format!("{err:#}"))?;
+            let real = sandboxes::resolve_fork_source(root, &target, dev.repo_url()).map_err(|err| format!("{err:#}"))?;
             let alias = if real != target { format!("{target} -> {real}: ") } else { String::new() };
             check_repo_in_sandbox(&real, repo.as_deref())
                 .map(|found| format!("The sandbox each node forks ({alias}{found})"))
@@ -1407,7 +1428,8 @@ mod tests {
         let bad = dialog.read_with(cx, |d, cx| draft_problem(&d.draft(cx), &[]));
         assert!(bad.unwrap().contains("GitHub HTTPS URL"));
 
-        // A fork keeps no URL: its repository is read from the golden.
+        // A fork of `golden` keeps the URL: it names whose golden, and nothing is cloned.
+        set(cx, |d| d.clone_url.clone(), "https://github.com/owner/name");
         dialog.update_in(cx, |d, _, _| {
             d.fork = true;
             d.fork_name = "golden".into();
@@ -1417,8 +1439,15 @@ mod tests {
             let _ = window.draw(cx);
         });
         let fork = dialog.read_with(cx, |d, cx| d.draft(cx));
-        assert_eq!(fork.dev_container.as_ref().unwrap().clone_url, None);
+        let dev = fork.dev_container.as_ref().unwrap();
+        assert_eq!(dev.repo_url(), Some("https://github.com/owner/name"));
+        assert_eq!(dev.clone_url(), None);
         assert_eq!(fork.repo(), Some("/workspace/app"));
         assert_eq!(fork.problem(&[]), None);
+
+        // A fork by name keeps none: the sandbox's label says its repository.
+        dialog.update_in(cx, |d, _, _| d.fork_name = "tod-golden-owner-name-1".into());
+        let named = dialog.read_with(cx, |d, cx| d.draft(cx));
+        assert_eq!(named.dev_container.as_ref().unwrap().clone_url, None);
     }
 }

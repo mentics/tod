@@ -1096,29 +1096,3 @@ fn an_image_location_without_a_url_says_where_to_give_one() {
     assert!(!err.contains("set the Files directory to"), "{err}");
     let _ = std::fs::remove_dir_all(&root);
 }
-
-/// `golden` with a golden per repository and the account-wide one: the
-/// repository is the one the labelled goldens agree on, an unlabelled one
-/// passed over, and a disagreement is no answer.
-#[test]
-fn golden_stands_for_the_repository_the_labelled_goldens_agree_on() {
-    let unlabelled = || Err(anyhow!("the golden sandbox wsx-golden-1 does not say which repository it holds"));
-    let mut tried = Vec::new();
-    let got = repo_the_sandboxes_agree_on(vec![], vec![Ok("cofactr/workspace".into()), unlabelled()], &mut tried);
-    assert_eq!(got.as_deref(), Some("https://github.com/cofactr/workspace.git"));
-
-    let mut tried = Vec::new();
-    assert_eq!(repo_the_sandboxes_agree_on(vec![], vec![unlabelled()], &mut tried), None);
-    assert!(tried.iter().any(|t| t.contains("does not say")), "{tried:?}");
-
-    let mut tried = Vec::new();
-    let got = repo_the_sandboxes_agree_on(vec![], vec![Ok("a/one".into()), Ok("b/two".into())], &mut tried);
-    assert_eq!(got, None);
-    assert!(tried.iter().any(|t| t.contains("different repositories") && t.contains("by its name")), "{tried:?}");
-
-    // A sandbox the node names must say; it is not passed over.
-    let mut tried = Vec::new();
-    let got = repo_the_sandboxes_agree_on(vec![Err(anyhow!("tod-x has no label"))], vec![Ok("a/one".into())], &mut tried);
-    assert_eq!(got.as_deref(), Some("https://github.com/a/one.git"));
-    assert!(tried.iter().any(|t| t.contains("tod-x")), "{tried:?}");
-}

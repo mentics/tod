@@ -279,14 +279,11 @@ impl Sandboxes {
             bail!("a sandbox named {name} already exists ({})", info.status);
         }
         let started = Instant::now();
-        let resolved;
         let source = match source {
-            NewSandboxSource::Fork(name) if name == tod_sandbox::config::GOLDEN => {
-                let golden = self.resolve_sole_golden(&bx)?;
-                progress(&format!("golden is {golden}"));
-                resolved = NewSandboxSource::Fork(golden);
-                &resolved
-            }
+            NewSandboxSource::Fork(name) if name == tod_sandbox::config::GOLDEN => bail!(
+                "`{name}` stands for a repository's golden, and none is named here: fork the golden sandbox \
+                 by its name (`tod-sandbox golden <owner/name>` prints it)"
+            ),
             other => other,
         };
         let image = match source {
@@ -380,9 +377,9 @@ impl Sandboxes {
     }
 
     /// The sandbox the name `golden` stands for for `repo` (normalized as
-    /// `cloud_nodes::normalize_repo` does): its own entry, else the old
-    /// account-wide one. `wsx-golden-*` stands for the newest sandbox with
-    /// that prefix (the names carry a timestamp, so they sort oldest first).
+    /// `cloud_nodes::normalize_repo` does): its entry in `[blaxel.goldens]`.
+    /// `wsx-golden-*` stands for the newest sandbox with that prefix (the
+    /// names carry a timestamp, so they sort oldest first).
     pub fn resolve_golden(&self, bx: &Blaxel, repo: &str) -> Result<String> {
         let setting = self.account()?.golden_for(repo).ok_or_else(|| {
             anyhow!(
@@ -390,27 +387,7 @@ impl Sandboxes {
                  `tod-sandbox golden {repo} <sandbox>` to point at one"
             )
         })?;
-        if let tod_sandbox::config::GoldenSetting::Legacy(name) = &setting {
-            tracing::info!("{repo} has no golden of its own; using the account-wide `golden = {name:?}` of sandboxes.toml");
-        }
-        self.resolve_golden_setting(bx, setting.name())
-    }
-
-    /// [`Self::resolve_golden`] for a caller that has no repository: the only
-    /// golden there is, else an error asking for a repository.
-    pub fn resolve_sole_golden(&self, bx: &Blaxel) -> Result<String> {
-        let setting = self.account()?.sole_golden()?;
-        self.resolve_golden_setting(bx, &setting)
-    }
-
-    /// Every golden there is, resolved, for a caller that has no repository
-    /// and so asks them all (each holds a checkout of its repository).
-    pub fn resolve_all_goldens(&self, bx: &Blaxel) -> Result<Vec<String>> {
-        let settings = self.account()?.all_goldens();
-        if settings.is_empty() {
-            anyhow::bail!("no golden sandbox is set: run `tod-sandbox golden <repo> <sandbox>`");
-        }
-        settings.iter().map(|s| self.resolve_golden_setting(bx, s)).collect()
+        self.resolve_golden_setting(bx, setting)
     }
 
     fn resolve_golden_setting(&self, bx: &Blaxel, golden: &str) -> Result<String> {
@@ -589,6 +566,10 @@ pub struct ListedSandbox {
     pub owner: Option<String>,
     /// In this data root's `sandboxes.toml`.
     pub known: bool,
+    /// The repository it holds (`owner/name`): its `tod-repo` label, or for
+    /// the `golden` entry, the repository it is the golden of. A label that
+    /// is not a repository is the error saying so.
+    pub repo: std::result::Result<Option<String>, String>,
 }
 
 /// Every sandbox in the workspace, by name. Asks Blaxel (which does not wake
@@ -604,23 +585,26 @@ pub fn list(root: &Path) -> Result<Vec<ListedSandbox>> {
             status: info.state_or_status().to_string(),
             owner: info.label("tod-owner").map(str::to_string),
             known: sandboxes.config.sandbox(&info.name).is_some(),
+            repo: tod_sandbox::golden::info_repo(&info).map_err(|err| format!("{err:#}")),
             name: info.name,
             image: info.image,
         })
         .collect();
     all.sort_by(|a, b| a.name.cmp(&b.name));
     // The fixed name a node can fork, ahead of the sandboxes it stands for:
-    // one per repository, and the old account-wide one.
-    let settings = sandboxes.config.blaxel.as_ref().map(|a| a.golden_settings()).unwrap_or_default();
+    // one per repository.
+    let settings: Vec<(String, String)> =
+        sandboxes.config.blaxel.as_ref().map(|a| a.goldens.clone().into_iter().collect()).unwrap_or_default();
     for (repo, golden) in settings.into_iter().rev() {
         all.insert(
             0,
             ListedSandbox {
                 name: tod_sandbox::config::GOLDEN.to_string(),
-                status: if repo == "*" { "every repository without its own".to_string() } else { format!("for {repo}") },
+                status: format!("for {repo}"),
                 image: golden,
                 owner: None,
                 known: true,
+                repo: Ok(Some(repo)),
             },
         );
     }
@@ -635,22 +619,25 @@ pub fn list_vms(root: &Path) -> Result<Vec<tod_sandbox::vms::Vm>> {
     let bx = sandboxes.blaxel()?;
     // No golden set is fine; one set that cannot be resolved is an error.
     let mut goldens = Vec::new();
-    for (_, setting) in sandboxes.config.blaxel.as_ref().map(|a| a.golden_settings()).unwrap_or_default() {
+    for setting in sandboxes.config.blaxel.as_ref().map(|a| a.goldens.values().cloned().collect::<Vec<_>>()).unwrap_or_default() {
         goldens.push(sandboxes.resolve_golden_setting(&bx, &setting)?);
     }
     tod_sandbox::vms::list_managed(&bx, &goldens)
 }
 
-/// The real sandbox a fork source names: `golden` is an alias for the newest
-/// golden sandbox ([`Sandboxes::resolve_golden`]), any other name is itself.
-/// A golden that cannot be resolved is an error saying why, never the literal
-/// name `golden` (no sandbox is called that). Asks Blaxel: never on the UI
-/// thread.
-pub fn resolve_fork_source(root: &Path, name: &str) -> Result<String> {
+/// The real sandbox a fork source names: `golden` is an alias for `repo`'s
+/// golden ([`Sandboxes::resolve_golden`]; `repo` is a GitHub URL or
+/// `owner/name`), any other name is itself. `golden` with no repository, or
+/// a golden that cannot be resolved, is an error saying why, never the
+/// literal name `golden` (no sandbox is called that). Asks Blaxel: never on
+/// the UI thread.
+pub fn resolve_fork_source(root: &Path, name: &str, repo: Option<&str>) -> Result<String> {
     fork_source_with(name, || {
+        let repo = repo.ok_or_else(|| anyhow!("the location names no repository, so it is not known whose golden to fork"))?;
+        let slug = crate::cloud_nodes::normalize_repo(repo).ok_or_else(|| anyhow!("{repo:?} is not a GitHub repository"))?;
         let sandboxes = Sandboxes::load(root)?;
         let bx = sandboxes.blaxel()?;
-        sandboxes.resolve_sole_golden(&bx)
+        sandboxes.resolve_golden(&bx, &slug)
     })
 }
 

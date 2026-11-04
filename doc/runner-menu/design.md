@@ -64,8 +64,9 @@ A sandbox location either makes the node's sandbox from an image or forks the
 repository's **golden** (`SandboxFrom::Fork("golden")`, resolved by
 `Sandboxes::resolve_golden`). There is one golden per repository
 (`owner/name`, as `cloud_nodes::normalize_repo` writes it), in
-`[blaxel.goldens]` of `sandboxes.toml`; a `golden = "..."` from before that
-is read as every repository's until it has its own. A golden is never kept per
+`[blaxel.goldens]` of `sandboxes.toml`, and the location names the repository
+(`DevContainerSetting::repo_url`), so `golden` is never a guess among several.
+An account-wide `golden = "..."` is refused when the file is read. A golden is never kept per
 build, and only moves forward.
 
 What it holds, and what each node's fork still gets:
@@ -90,8 +91,7 @@ golden. An **image** source has no golden: it gets the bootstrap and the full
 
 **A repository with no golden** (live check Pass 7, gap 15) is built, not
 forked: `golden::decide_source` (pure) says `Build` when the repository has no
-entry of its own and the account-wide golden does not hold it (its checkout's
-`origin`, read-only, must be this repository), and `build_golden` makes a fresh
+entry of its own, and `build_golden` makes a fresh
 sandbox from the account's default image with a proxy holding the user's GitHub
 token, installs tod's dependencies and files, clones `https://github.com/<repo>.git`
 into `/workspace/repo` (`golden::clone_script`; submodules recursively), and
