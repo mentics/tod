@@ -376,3 +376,50 @@ Node `RM p6 H` (Lifecycle added, Files override picking the new location `RM p6 
   location then read "the workspace directory on this machine".
 * Host session: `conversations.agent_session_id` = `23c60987-e22d-4ccd-b216-8c075d986d02`,
   log at `~/.claude/projects/-Users-...-rm6-host-repo/23c60987-....jsonl`; reply "pong".
+
+* **Host to cloud, result: PASS.** Migrate to `Golden flagship` answered "Migrated to Golden
+  flagship. Nothing was started." (nothing to remove for a shared directory, so no impact
+  dialog). The next message made sandbox `tod-rm-p6-h-08216f` and went to the same
+  session: `conversations.agent_session_id` still `23c60987-...`, no rotation marker, and
+  the agent answered "pong" to "what single word did you reply with before" (cost fell
+  from $0.69 to $0.15: cache read). I could not look into the sandbox for the session
+  file (Blaxel answered WORKLOAD_UNAVAILABLE, retryable, to every `exec` after the turn),
+  so the continuity is shown by the id, the answer and the cache read, not the file.
+* Cloud to host, and so "back to the host" after that: not run (see above).
+
+### Item B, last step
+
+"Delete sandbox without a checkpoint" on the `done` node: "Deleting the sandbox without a
+checkpoint..." then "Deleted sandbox ... without keeping its uncommitted work."; the node
+read "cloud sandbox, not made yet / done" at once. The `sandbox_retire` row and the red
+"retrying 4 of 5" status stayed until the daemon's next pass cleared them (under a
+minute later; the menu action does not clear it itself): then the strip went from "2 on
+others · 1 in trouble" to "1 on others" (the other is Webhook e2e) and the node is plain
+`done`. PASS, with that short lag noted. The give-up path (attempt 5) was not waited for:
+the back-off is 1, 5, 15 and 60 minutes, and it stays covered by unit tests.
+
+### Cleanup and state left
+
+Deleted: nodes `RM p6 A` and `RM p6 H`, both node sandboxes (without checkpoints, so
+nothing was pushed), location `RM p6 host` (through the dialog: the second live use of
+the fix), the scratch clone, and the half-made golden `tod-golden-cofactr-flagship-6aeb3ebc`
+(left by the failed refresh). No branch or pull request was created anywhere. Not mine,
+left: `tod-golden-cofactr-flagship-6aeb4148` is now the golden of `cofactr/flagship` (the
+app refreshed it; the old `...6aeb2ee1` was deleted by the refresh as designed), and the
+shared `tod-agentd` (pid 50287, built in another worktree).
+
+### Bugs and gotchas, pass 6
+
+10. **Locations dialog panic on "Change it" / "Delete it" with nothing to remove**: fixed
+    (above), regression test `ui::files_impact::tests::confirming_with_nothing_affected_does_not_re_enter_the_caller`.
+11. Golden refresh at first use can end with "Resource ... is currently not available"
+    (Blaxel WORKLOAD_UNAVAILABLE right after the proxy redeploy); it leaves a
+    half-made golden that nothing points at and says so ("delete it with `tod-sandbox
+    delete`"); a second Send refreshed again and worked. Not fixed (transient on Blaxel's
+    side; a retry in `wait_reachable` after `update_proxy` might be worth it).
+12. A daemon (`tod-agentd`) started from a worktree without `target/sandbox` fails every
+    sandbox call with "tod-relay not found (<that worktree>/target/debug/sandbox/tod-relay)".
+    Before checking daemon-side behaviour (retire at `done`), look at the daemon's path
+    (`ps`) and, if it is not yours, ask its owner; killing it was refused here.
+13. A per-node worktree location needs Treehouse on the machine; without it the first
+    turn says "spawn treehouse get --lease: No such file or directory" (clear and honest).
