@@ -318,3 +318,29 @@ Settings on the node, "Add a capability...", Lifecycle. Agent and Files are inhe
 from `ENG work` (Claude opus medium; location `Golden flagship`, cloud sandbox), so
 the node had everything it needs with no blocked command and no database edit.
 The task panel then read "cloud sandbox, not made yet / on you: not started".
+
+Starting the first chat on the node: the golden for `cofactr/flagship` was older than
+this build, so the app refreshed it. The first refresh ended with "Resource
+'sbx-tod-golden-...-6aeb3ebc-budku6' is currently not available" (a Blaxel transient;
+the half-made golden `...6aeb3ebc` was left behind and had to be deleted by hand); the
+retry (a second Send) refreshed again, succeeded, and the old golden was deleted by the
+refresh as designed. Sandbox `tod-rm-p6-a-0e3df0` was then made and the one-line chat
+("pong") ran in it; `conversations.agent_session_id` = `af94f802-635e-4007-aa7b-e8eff994d355`.
+
+### Item B (failed delete at `done`, shown in the app) on node RM p6 A
+
+State set to `done` with the task panel's lifecycle dropdown. The daemon retired it 60 s
+later and failed. (The failure came out different from the one planned: the root's
+`tod-agentd` (pid 50287, started 06:04 from another session's worktree build) looks for
+`tod-relay` under that worktree's `target/debug/sandbox`, which does not exist, so even
+its `git` spawn in the sandbox failed: "tod-relay not found". Killing the shared daemon
+was refused by the harness, so it was left; a daemon built in a worktree without
+`target/sandbox` fails every sandbox call. Not a tod bug, a procedure gotcha.) What the app showed:
+
+| # | Check | Result |
+|---|---|---|
+| B1 | `node_problems` row | PASS. `sandbox_retire|attempts 1|max 5|gave_up 0|next_retry_at +5 min|message "Deleting the sandbox ... (it reached done) failed: the checkpoint ... failed, so nothing was deleted; delete it anyway ..."`; attempt 2 was written 5 min later (`updated_at` moved, next retry +5 min). |
+| B2 | Task panel | PASS. Runner line: "waiting on others: something outside / deleting its sandbox failed; the daemon tries again / waiting 15s", a red "retrying 1 of 5: <error>" line, "next check Wed 06:33", the selectable problem text and beneath it "Attempt 1 of 5: next try in 44s." (a countdown; "Attempt 2 of 5: next try in 4m." after the second try). |
+| B3 | App saw the daemon's write | PASS. The panel changed from no problem to attempt 1, then attempt 2, without a reselect or restart. |
+| B4 | Tree glyph and strip | PASS. The tree row got the "others" diamond (orange); the strip read "2 on others · 1 in trouble"; the On-others filter groups the node under "deleting its sandbox failed; the daemon tries again" with the error and "next check". |
+| B5 | Runner menu for a `done` node | PASS. Check now, Migrate to..., Reset environment, Update workspace to latest main, **Delete sandbox**, **Delete sandbox without a checkpoint**, Sync now. |
