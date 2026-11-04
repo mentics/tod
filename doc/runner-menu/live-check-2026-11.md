@@ -230,3 +230,19 @@ draft PR Cofactr/workspace#192). A's plan step was changed to three foreground
 | 1 | Stop now then Migrate immediately (stale `cloud_nodes` row) | PASS in the sense that matters: I clicked "Remove and migrate" at once after the Stop now dialog appeared; 3 minutes later `cloud_nodes` had no row for the sandbox, the Files location of A is the host, `tod-sandbox list` no longer shows `tod-rm-p4-a-89a8d9`, "Migrated to RM host". The pre-fix race (a late supervisor push) did not occur this time, so the "drop is reported" log line was not seen live; the drop itself is unit tested. |
 | 7a | Check now in `pr_draft` with the real PR #192 | PASS for the hold: B set to `pr_draft` (I set `node_lifecycle.state` in the root's `tod.db` directly), Check now answered "Checked: the gate is clear, but the node was not moved on: the pull request needs the agent: Cofactr/workspace#192: behind its base", state unchanged. The pure human-review (draft) hold was not separated from this: that needed marking #192 ready for review, which would notify Cofactr/workspace code owners, so I did not. |
 | 8 | Same Claude session resumes at the host | NOT VERIFIED: `claude auth status` on this machine says `loggedIn: false`; signing in is the user's. |
+
+| 6 | Newer-golden refusal | PASS. A throwaway fork of the repository's golden (`tod-rm-p4-newer-golden`), labelled `tod-schema=94`, `tod-built` in the future and another `tod-install`, was mapped for `cofactr/flagship` in my root. Start on a new node `RM p4 C` failed with "The golden sandbox for cofactr/flagship was refreshed by a newer tod (install aaaabbbb..., schema 94); this tod is older (install b47a1bf4..., schema 93). Update tod to make sandboxes for this project." The node stayed "cloud sandbox, not made yet", no sandbox was created (`tod-sandbox list`, `cloud_nodes` unchanged). Mapping restored to the real golden and the throwaway deleted. (A later Start then, correctly, refreshed the real golden forward because this build's commit is newer: `...6aeb217c` -> `...6aeb2ee1`.) |
+| 5a | Adopt existing sandbox (menu) | PASS. C started (`tod-rm-p4-c-a50ec6`); I deleted only C's `node_files_locations` row in the live-verify root's `tod.db`; the menu then offered Adopt existing sandbox (after reselecting the node: the facts are not reloaded by a direct database edit, my doing); it answered "Adopted sandbox tod-rm-p4-c-a50ec6: its checkout is /workspace, on branch task/rm-p4-c."; location and `cloud_nodes` copy both name it. I did not press Resume afterwards on C (it only asks its question). |
+| 5b | Automatic adoption at start, labelled sandbox | BUG 9, fixed (below). Before the fix the daemon refused a sandbox that carries `tod-node=<this node>`: "does not say which node it is for". After: "cloud: adopted 1 old sandbox(es): tod-rm-p4-c-a50ec6" and the location row was back. |
+| 5c | Automatic adoption refuses an unlabelled sandbox | PASS. With C's `tod-node` label emptied and its location row deleted, a fresh daemon logged "The node's old sandbox was not adopted automatically: sandbox tod-rm-p4-c-a50ec6 does not say which node it is for ... Nothing was changed." (reported as a node problem), the location stayed empty. Label restored afterwards. |
+
+### Bugs found in pass 4
+
+9. **The automatic adoption at start could never adopt on a real workspace.**
+   `adopt::decide` read the node a sandbox says it is for only from its `TOD_NODE`
+   variable, which Blaxel masks in its listing (read as absent), so every sandbox
+   "did not say which node it is for". Fix: the `tod-node` label first, then the
+   variable (`says_node`; the watchdog already did that). Test
+   `the_node_label_counts_when_blaxel_masks_the_variable`. Verified live (5b/5c).
+   Note: the automatic form runs in `tod-agentd` at its start, so a test needs the
+   root's daemon restarted (`pkill -f "tod-agentd.*tod-live-verify"`), not only the app.
