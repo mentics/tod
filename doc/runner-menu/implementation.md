@@ -436,7 +436,7 @@ What landed, and where it departs from the text below:
 - Kept on purpose: the orphan sweeper's known names still include every
   `cloud_nodes` row (another machine's node protects its sandbox from being
   listed as an orphan).
-- Until B5, a node started before B2 that has a `cloud_nodes` row and no
+- Until B5 (now done, below), a node started before B2 that has a `cloud_nodes` row and no
   location is not acted on (the panel says its Files location records no
   sandbox, the check reports it, Start makes a new sandbox through the creator
   or fails with the lost-track error if the old sandbox has that name). The
@@ -475,11 +475,41 @@ its call in `sync_once` are removed. The runner check is `lost::runner_blocker`
 
 ### B5. Adopt records written before the merge
 
-- At start, beside `adopt_legacy_records`: a `cloud_nodes` row of this client
-  whose node has no location row, and whose resolved Files is a sandbox
-  location, gets a location row naming that sandbox. One that no longer
-  resolves to a sandbox is reported, not adopted.
-- Tests: adoption, refusal of a mismatch, idempotence.
+- A node with a live `cloud_nodes` row (this client's, not lost, not deleted
+  by the user) or a legacy `cloud-sync.json` record naming a sandbox, whose
+  resolved Files are a cloud-sandbox location, and with no location row, is
+  **adoptable**. Adoption records the location naming that sandbox, the
+  checkout path and branch found by asking the sandbox.
+- Two entry points, one implementation (`cloud_sync/adopt.rs`): the runner
+  menu's **Adopt existing sandbox** (shown only for an adoptable node; the
+  user's form) and, once at the app's start (`lost::check`, `Check::Full`),
+  the automatic form, which adopts only what is unambiguous.
+- Tests: the pure decision (adoptable, gone, ambiguous, refused, located),
+  the store write, the legacy record, idempotence, the menu entry.
+
+**B5 status: done (code and tests), no schema change.**
+
+- `decide` (pure): exactly one sandbox named across the row and the legacy
+  record; Blaxel has it and it can run (else `Gone`, nothing written, Start
+  remakes it); `tod-kind` is `node` or `node-base`; its `TOD_NODE`, when it
+  has one, is this node; no other live sandbox says it is this node's. The
+  automatic form also needs the sandbox to say `TOD_NODE` itself. A name
+  outside the `tod-<slug>-<6hex>` scheme is adopted as recorded.
+- `adopt_with` over a `Backend` (Blaxel's listing, the relay check, the
+  checkout probe; `Live` is the real one, fakes in the tests): the relay must
+  answer as a node's before anything is written; then
+  `provision::adopt_location` records the location through
+  `RecordFilesLocation` (so an existing row's copy follows in the same
+  transaction; it refuses a stale location or one naming another sandbox, and
+  repeats harmlessly). A node with only a legacy record gets its row from the
+  location afterwards and the record leaves the file. The branch found is
+  reported, never changed; no checkout is touched.
+- Refusals, an unanswering relay and ambiguity are errors naming what failed
+  (the panel's red note). At start the same failures are reported to the
+  node's problems and left for the menu entry. `find_sandbox_checkout` is now
+  the one probe `reuse_sandbox`, `make_sandbox` and adoption share.
+- Not verified live (no Blaxel here): `Live` (the relay manifest and checkout
+  probe through a real sandbox).
 
 ### B6. Docs
 

@@ -188,6 +188,9 @@ struct RunnerLine {
     cloud: Option<CloudNode>,
     /// The sandbox its Files location records (the one record of it).
     cloud_sandbox: Option<String>,
+    /// Its old records name a sandbox its location does not: the menu offers
+    /// to adopt it.
+    adoptable: bool,
     /// A job of the panel's own (Start, Sync now, Delete sandbox…) is in
     /// progress, and what it is doing.
     cloud_busy: Option<&'static str>,
@@ -239,6 +242,7 @@ struct RunnerFacts {
     lifecycle: String,
     cloud: Option<CloudNode>,
     cloud_sandbox: Option<String>,
+    adoptable: bool,
     place: Option<Place>,
     supervised: bool,
     has_checkout: bool,
@@ -286,6 +290,8 @@ fn load_place(fleet: &FleetStore, node_id: Uuid, facts: &mut RunnerFacts) -> any
     facts.current_location = files.as_ref().and_then(|f| f.place_id.clone());
     let sandbox_made = location.as_ref().and_then(|l| l.sandbox().map(str::to_string));
     facts.cloud_sandbox = sandbox_made.clone();
+    facts.adoptable = tod_core::cloud_sync::adopt::adoptable(fleet, fleet.paths().root(), &id)
+        .context("look for an old sandbox record to adopt")?;
     let (place, text) = match files.as_ref().and_then(|files| files.dev_container.as_ref()) {
         Some(dev) if dev.sandbox => {
             // The sandbox is made when something first needs the node's
@@ -730,6 +736,7 @@ impl TaskPanel {
                     this.runner.lifecycle = facts.lifecycle;
                     this.runner.cloud = facts.cloud;
                     this.runner.cloud_sandbox = facts.cloud_sandbox;
+                    this.runner.adoptable = facts.adoptable;
                     this.runner.place = facts.place;
                     this.runner.supervised = facts.supervised;
                     this.runner.has_checkout = facts.has_checkout;
@@ -861,6 +868,7 @@ impl TaskPanel {
             run: self.run_state(live, cx),
             has_checkout: self.runner.has_checkout,
             has_children: self.runner.has_children,
+            adoptable: self.runner.adoptable,
             busy: self.runner.cloud_busy,
         })
     }
@@ -958,6 +966,12 @@ impl TaskPanel {
             A::ResetEnvironment => {
                 self.cloud_started("Setting the environment up again…", cx);
                 crate::views::cloud_node::reset_environment(self.fleet.clone(), node, cx, move |this, update, cx| {
+                    this.on_cloud_update(node, update, cx)
+                });
+            }
+            A::AdoptSandbox => {
+                self.cloud_started("Adopting the existing sandbox…", cx);
+                crate::views::cloud_node::adopt_sandbox(self.fleet.clone(), node.to_string(), cx, move |this, update, cx| {
                     this.on_cloud_update(node, update, cx)
                 });
             }

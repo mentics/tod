@@ -55,6 +55,27 @@ pub fn delete_sandbox<T: 'static>(
     });
 }
 
+/// Adopt the sandbox an older build started `node_id` in
+/// (`cloud_sync::adopt::adopt_node_sandbox`) off the UI thread: it is checked
+/// to be the node's and to answer, then recorded as its Files location.
+pub fn adopt_sandbox<T: 'static>(
+    fleet: Arc<FleetStore>,
+    node_id: String,
+    cx: &mut Context<T>,
+    on_update: impl Fn(&mut T, CloudUpdate, &mut Context<T>) + 'static,
+) {
+    spawn(cx, on_update, move |tx| {
+        let mut progress = |msg: &str| {
+            cloud_sync::log_progress(&format!("adopting the sandbox of {node_id}"), msg);
+            let _ = tx.send_blocking(CloudUpdate::Progress(msg.to_string()));
+        };
+        let _ = tx.send_blocking(match cloud_sync::adopt::adopt_node_sandbox(&fleet, &node_id, &mut progress) {
+            Ok(msg) => CloudUpdate::Synced(msg),
+            Err(err) => CloudUpdate::failed(describe("Adopt existing sandbox failed", &err)),
+        });
+    });
+}
+
 /// [`delete_sandbox`] without the checkpoint first
 /// (`cloud_sync::lost::delete_node_sandbox_anyway`): uncommitted work in the
 /// sandbox is lost, so the caller offers it only beside the ordinary delete.

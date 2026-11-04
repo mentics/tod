@@ -760,6 +760,79 @@ fn health_spec<'a>(
 /// Free space a sandbox's setup needs on its root filesystem.
 const SETUP_MIN_FREE: u64 = 128 * 1024 * 1024;
 
+/// Where the checkout is in the sandbox `name`: the clone's, else the image's
+/// own ([`tod_sandbox::node::WORKSPACE_PROBE`]). Asked of the sandbox through
+/// its relay, so a relay that does not answer is the error.
+pub fn find_sandbox_checkout(name: &str) -> Result<String> {
+    let probe = format!("echo {}", tod_sandbox::node::WORKSPACE_PROBE);
+    let out = sandbox::SandboxExec::new(name)
+        .output_within(std::time::Duration::from_secs(60), "/", "sh", &["-c", &probe])
+        .with_context(|| format!("find the checkout in sandbox {name}"))?;
+    let repo = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if !out.status.success() || repo.is_empty() {
+        bail!("could not find the checkout in sandbox {name}: {}", String::from_utf8_lossy(&out.stderr).trim());
+    }
+    Ok(repo)
+}
+
+/// The branch the checkout at `repo` in sandbox `name` is on (`HEAD` when
+/// detached). Reads only.
+pub fn sandbox_checkout_branch(name: &str, repo: &str) -> Result<String> {
+    let dir = Workdir::sandbox(name, repo);
+    dir.git(&["rev-parse", "--show-toplevel"])
+        .with_context(|| format!("sandbox {name} has no git repository at {repo}"))?;
+    let branch = dir
+        .git(&["rev-parse", "--abbrev-ref", "HEAD"])
+        .with_context(|| format!("read the branch in sandbox {name}"))?;
+    Ok(branch.trim().to_string())
+}
+
+/// **Adopts a sandbox made before the location was the one record of it**
+/// (`doc/runner-menu/implementation.md`, B5): records `node_id`'s Files
+/// location naming `sandbox`, its checkout at `repo`. The caller has already
+/// verified the sandbox is the node's and answers; this only writes. The row
+/// goes through [`FleetMutation::RecordFilesLocation`], so an existing
+/// `cloud_nodes` row's copy follows in the same transaction.
+///
+/// Idempotent: a location that already records `sandbox` is returned as it
+/// is. It refuses, naming why, when the node's Files do not resolve to a
+/// sandbox location, when its location records another sandbox, and when the
+/// location it has was made from other settings (stale). Nothing is guessed.
+pub fn adopt_location(fleet: &FleetStore, node_id: &str, sandbox: &str, repo: &str) -> Result<FilesLocation> {
+    let lock = node_lock(node_id);
+    let _held = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let files = resolve_files(fleet, node_id)?;
+    if !files.runs_in_sandbox() {
+        bail!(
+            "node {node_id}'s Files do not run in a cloud sandbox, so there is no sandbox location to adopt {sandbox} into"
+        );
+    }
+    if let Some(stale) = &files.stale_location {
+        bail!("{}", stale_message(&files, stale));
+    }
+    if let Some(existing) = &files.location {
+        return match existing.sandbox() {
+            Some(name) if name == sandbox => Ok(existing.clone()),
+            Some(other) => bail!("node {node_id}'s Files location already records sandbox {other}, not {sandbox}"),
+            None => bail!("node {node_id}'s Files location is not a sandbox's, so {sandbox} is not adopted"),
+        };
+    }
+    let location = FilesLocation {
+        node_id: node_id.to_string(),
+        source_node_id: files.source_node_id.clone(),
+        recipe: files.recipe_key(),
+        repo: Some(repo.to_string()),
+        container: None,
+        worktree_path: None,
+        worktree_lease_id: None,
+        worktree_lease_holder: None,
+        sandbox: Some(sandbox.to_string()),
+        created_at: 0,
+    };
+    record(fleet, &location)?;
+    Ok(location)
+}
+
 /// Uses the sandbox the node's records already name (`name`, running): its
 /// checkout is found, put on the node's branch, and recorded.
 fn reuse_sandbox(
@@ -770,17 +843,7 @@ fn reuse_sandbox(
     progress: &mut dyn FnMut(&str),
 ) -> Result<(FilesLocation, Vec<String>)> {
     progress(&format!("using the node's sandbox {name}…"));
-    let probe = format!("echo {}", tod_sandbox::node::WORKSPACE_PROBE);
-    let out = sandbox::SandboxExec::new(name)
-        .output_within(std::time::Duration::from_secs(60), "/", "sh", &["-c", &probe])
-        .with_context(|| format!("find the checkout in the node's sandbox {name}"))?;
-    let repo = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if !out.status.success() || repo.is_empty() {
-        bail!(
-            "could not find the checkout in the node's sandbox {name}: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
+    let repo = find_sandbox_checkout(name)?;
     let dir = Workdir::sandbox(name, &repo);
     // Not deleted on failure, unlike a sandbox made here: it is the node's own.
     let warnings = prepare_sandbox_checkout(&dir, name, &repo, branch, progress)
@@ -934,14 +997,7 @@ fn make_sandbox(
         let identity = host.git_identity(node_row.repo.as_deref());
         node::checkout(&bx, &url, &repo.url, branch, &identity, fork_from.is_none(), progress)?;
         // Where the checkout is: the clone's, else the image's own.
-        let probe = format!("echo {}", node::WORKSPACE_PROBE);
-        let out = sandbox::SandboxExec::new(&name)
-            .output_within(std::time::Duration::from_secs(60), "/", "sh", &["-c", &probe])
-            .with_context(|| format!("find the checkout in {name}"))?;
-        let dir_path = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        if !out.status.success() || dir_path.is_empty() {
-            bail!("could not find the checkout in {name}: {}", String::from_utf8_lossy(&out.stderr).trim());
-        }
+        let dir_path = find_sandbox_checkout(&name)?;
         location.repo = Some(dir_path.clone());
         record(fleet, &*location)?;
         let dir = Workdir::sandbox(&name, &dir_path);

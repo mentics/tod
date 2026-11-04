@@ -207,7 +207,8 @@ pub fn located_rows(fleet: &FleetStore, rows: Vec<CloudNodeRow>, root: &std::pat
                         &id,
                         format!(
                             "The cloud record of node {id} names sandbox {} but its Files location records none; \
-                             it is not acted on until the record is adopted.",
+                             it is not acted on until the sandbox is adopted (the node's runner menu: \
+                             \"Adopt existing sandbox\") or Start makes a new one.",
                             row.sandbox
                         ),
                     );
@@ -248,6 +249,16 @@ pub fn check(fleet: &FleetStore, check: Check) -> Result<Repaired> {
     let root = fleet.paths().root().to_path_buf();
     if let Err(err) = adopt_legacy_records(fleet) {
         tracing::warn!("cloud: moving old node records into the database: {err:#}");
+    }
+    if check == Check::Full {
+        // Only what is unambiguous; the rest is told to the node (B5).
+        match super::adopt::adopt_at_start(fleet) {
+            Ok(adopted) if !adopted.is_empty() => {
+                tracing::info!("cloud: adopted {} old sandbox(es): {}", adopted.len(), adopted.join(", "))
+            }
+            Ok(_) => {}
+            Err(err) => tracing::error!("cloud: adopting old sandboxes: {err:#}"),
+        }
     }
     let (orch, user) = resolve(&root)?;
     sync(fleet, &root, &orch, &user)?;
