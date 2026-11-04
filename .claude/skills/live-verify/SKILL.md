@@ -76,7 +76,10 @@ Reset environment, Update workspace to latest main, Delete sandbox, Sync now), W
 UUID: `node show <slug>`). Look in the sandbox with `tod-sandbox --data-root
 <root> exec <sandbox> -- sh -c '...'` (processes, files, logs).
 
-GitHub: you may read anything (`gh pr view ...`). Do not post to, push to, or
+GitHub: test pull requests and branches go only in the private repo
+`joel-cofactr/build-test` (see doc/live-verification.md); never create, push,
+mark ready, comment on or touch a PR or branch in any Cofactr org repo. Close
+the PRs and delete the branches you make. You may read anything (`gh pr view ...`). Do not post to, push to, or
 edit the user's real pull requests yourself; the node's agent does that, as the
 product should. If a test needs a new comment or review on a PR, ask first.
 

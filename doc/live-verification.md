@@ -125,6 +125,15 @@ regression test, merge, rebuild, relaunch, and rerun from the failing step.
   "command not found", and a pipeline that greps its output hides that. Run
   cargo plainly, or check the exit code. macOS `sed -i` needs `-i ''`.
 
+## Test pull requests and branches: only in `joel-cofactr/build-test`
+
+Any pull request or branch a live check needs (a throwaway draft PR, a
+`task/<slug>` branch, a review request) goes **only** in the private repository
+`joel-cofactr/build-test`. Never create, push, mark ready, comment on, or touch
+a PR or branch in any Cofactr organisation repository (`Cofactr/workspace`,
+`Cofactr/flagship`, ...): that notifies code owners and is the user's to handle.
+Close every PR you open there and delete the branches you make when you are done.
+
 ## Testing the webhook wake (`joel-cofactr/build-test`)
 
 A throwaway private repo for GitHub tests; a webhook for the live-verify
