@@ -82,8 +82,8 @@ fn ensure_current_with(
 /// only when needed). The steps: fork it, check what a fork needs, install
 /// tod's files, label it with this build's stamp, mark it `ready`, point
 /// `repo`'s golden at it, and delete the old one (see below). Returns its name.
-/// A failure leaves the half-made sandbox in place (it is not `ready`, and
-/// nothing points at it) and names it.
+/// A failure deletes the half-made sandbox (never the old golden), leaves
+/// `sandboxes.toml` pointing at the old one, and says so.
 pub fn refresh_golden(sandboxes: &mut Sandboxes, bx: &Blaxel, repo: &str, progress: &mut dyn FnMut(&str)) -> Result<String> {
     let repo = normalized(repo)?;
     let old = sandboxes.resolve_golden(bx, &repo)?;
@@ -118,10 +118,21 @@ fn refresh_with(
     let envs: Vec<(&str, String)> =
         tod_sandbox::provision::local_proxy_env().into_iter().map(|(k, v)| (k, v.to_string())).collect();
     bx.fork_with_envs(old, &name, &envs).with_context(|| format!("fork {old}"))?;
+    let policy = golden::StepRetry::default();
+    let said = std::cell::RefCell::new(progress);
+    let say = |m: &str| (said.borrow_mut())(m);
+    // Right after a deploy or a proxy update Blaxel answers "not ready" or
+    // "currently not available" for a while: each step that can hit that is
+    // run again (they are all safe to repeat), and failing for good names it.
+    macro_rules! step {
+        ($what:expr, $body:expr) => {
+            golden::retry_step(&name, $what, &policy, &mut std::thread::sleep, &mut |m| say(m), || $body)
+        };
+    }
     let made = (|| -> Result<()> {
         let info = bx.wait_deployed(&name, Duration::from_secs(300))?;
         let url = info.url.ok_or_else(|| anyhow!("sandbox {name} has no URL"))?;
-        tod_sandbox::provision::require_fork_prerequisites(bx, &url, true, progress)?;
+        step!("check what a fork needs", tod_sandbox::provision::require_fork_prerequisites(bx, &url, true, &mut |m| say(m)))?;
         // The proxy goes in BEFORE tod's files: updating a sandbox's network
         // configuration redeploys it from its image, and what was installed
         // into it until then is gone (seen live: a freshly refreshed golden had
@@ -131,12 +142,12 @@ fn refresh_with(
         // fork's `network` comes back empty), and `fork_golden` refuses a
         // golden with none, since a fork of it cannot take the node's rules.
         // Give it a placeholder rule, as a hand-made golden has.
-        bx.update_proxy(&name, &placeholder_proxy(), &[])
+        step!("give it a proxy", bx.update_proxy(&name, &placeholder_proxy(), &[]))
             .with_context(|| format!("give {name} a proxy, so nodes can be forked from it"))?;
-        let info = bx.wait_deployed(&name, Duration::from_secs(300))?;
+        let info = step!("wait until deployed", bx.wait_deployed(&name, Duration::from_secs(300)))?;
         let url = info.url.ok_or_else(|| anyhow!("sandbox {name} has no URL"))?;
-        bx.wait_reachable(&url, Duration::from_secs(180)).with_context(|| format!("wake {name}"))?;
-        let routed = bx.get_json(&name)?.is_some_and(|j| has_proxy_routes(&j));
+        step!("wake it", bx.wait_reachable(&url, Duration::from_secs(180)).with_context(|| format!("wake {name}")))?;
+        let routed = step!("read its proxy", bx.get_json(&name))?.is_some_and(|j| has_proxy_routes(&j));
         if !routed {
             bail!("{name} did not keep the proxy it was given, so nodes cannot be forked from it");
         }
@@ -152,18 +163,38 @@ fn refresh_with(
             bundles: &files.bundles,
             supervisor_env: &[],
         };
-        progress("installing tod's files…");
-        tod_sandbox::node::install(bx, &url, &payload, progress)?;
+        say("installing tod's files…");
+        step!("install tod's files", tod_sandbox::node::install(bx, &url, &payload, &mut |m| say(m)))?;
         // Stamp first and `ready` last: a half-made golden is never ready.
         let stamp_labels = mine.labels();
         let mut labels: Vec<(&str, &str)> = stamp_labels.iter().map(|(k, v)| (*k, v.as_str())).collect();
         labels.push(("tod-kind", golden::KIND_GOLDEN));
-        bx.set_labels(&name, &labels)?;
-        bx.set_labels(&name, &[(golden::LABEL_READY, "true")])
+        step!("label it", bx.set_labels(&name, &labels))?;
+        step!("mark it ready", bx.set_labels(&name, &[(golden::LABEL_READY, "true")]))?;
+        // Verified before anything points at it: Blaxel must say it is ready.
+        let seen = step!("verify it", bx.get(&name))?;
+        match seen {
+            Some(info) if info.label(golden::LABEL_READY) == Some("true") => Ok(()),
+            Some(_) => bail!("{name} does not carry the ready label after it was set"),
+            None => bail!("{name} is gone"),
+        }
     })();
-    made.with_context(|| {
-        format!("refresh the golden sandbox for {repo}: {name} was made from {old} but not finished (it is not ready, and nothing points at it; delete it with `tod-sandbox delete {name}`)")
-    })?;
+    if let Err(err) = made {
+        // `sandboxes.toml` still points at `old`, which this never touches.
+        // A half-made golden must not stay for a later step to mistake for
+        // one: remove it (`half_made_action` says whether it may be), and say
+        // what happened to it.
+        let after = match bx.get(&name).and_then(|found| match golden::half_made_action(&name, old, found.as_ref()) {
+            golden::HalfMade::Delete => bx.delete(&name).map(|()| format!("the half-made {name} was deleted")),
+            golden::HalfMade::Keep(why) => Ok(format!("{name} was left as it is: {why}")),
+        }) {
+            Ok(text) => text,
+            Err(cleanup) => format!("deleting the half-made {name} failed too ({cleanup:#}); delete it with `tod-sandbox delete {name}`"),
+        };
+        return Err(err.context(format!(
+            "refresh the golden sandbox for {repo}: {name} was made from {old} but not finished; {after}. {repo}'s golden is still {old}"
+        )));
+    }
 
     let account = sandboxes
         .config
@@ -174,18 +205,18 @@ fn refresh_with(
     // Whether anything else still points at the old one, as it stood.
     let wanted_elsewhere = account.golden_used_elsewhere(old, repo);
     sandboxes.save()?;
-    progress(&format!("{name} is now the golden of {repo}"));
+    say(&format!("{name} is now the golden of {repo}"));
 
     // Forks are independent of the sandbox they were made from, so nothing
     // needs the old one once nothing points at it. One tod did not make is
     // the user's to delete.
     let made_by_tod = bx.get(old)?.is_some_and(|i| i.label("tod-kind") == Some(golden::KIND_GOLDEN));
     if wanted_elsewhere {
-        progress(&format!("left {old} in place: another repository's golden setting still points at it"));
+        say(&format!("left {old} in place: another repository's golden setting still points at it"));
     } else if !made_by_tod {
-        progress(&format!("left {old} in place: tod did not make it (delete it yourself when you no longer need it)"));
+        say(&format!("left {old} in place: tod did not make it (delete it yourself when you no longer need it)"));
     } else {
-        progress(&format!("deleting the old golden {old}…"));
+        say(&format!("deleting the old golden {old}…"));
         bx.delete(old).with_context(|| format!("{name} is the golden now, but deleting the old golden {old} failed"))?;
     }
     Ok(name)

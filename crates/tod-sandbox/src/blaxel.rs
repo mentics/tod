@@ -65,18 +65,35 @@ pub fn classify_failure(status: u16, body: &str) -> FailureClass {
     match status {
         502 | 503 | 504 | 429 => transient,
         404 => {
-            let lower = body.to_ascii_lowercase();
-            if lower.contains("workload_unavailable")
-                || lower.contains("workload is not ready")
-                || lower.contains("not ready yet")
-            {
+            if says_not_ready(body) {
                 transient
             } else {
                 FailureClass::Gone
             }
         }
+        401 | 403 => FailureClass::Permanent,
+        // Blaxel's control plane says "Resource '<sandbox>' is currently not
+        // available" for a sandbox that is redeploying (seen live right after
+        // a proxy update); under whatever status, that is a wait.
+        _ if says_not_ready(body) => transient,
         _ => FailureClass::Permanent,
     }
+}
+
+/// Whether a reply's body, or an error's text, says the workload or resource
+/// is not ready yet, so the same call would work a moment later. The one list
+/// of those phrases: [`classify_failure`] and [`error_is_not_ready`] read it.
+pub fn says_not_ready(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    ["workload_unavailable", "workload is not ready", "not ready yet", "currently not available"]
+        .iter()
+        .any(|marker| lower.contains(marker))
+}
+
+/// [`says_not_ready`] for an error that went through the API's error text
+/// (it keeps the code and message), or a wait that gave up on one.
+pub fn error_is_not_ready(err: &anyhow::Error) -> bool {
+    says_not_ready(&format!("{err:#}"))
 }
 
 /// The reply of a call that was not retried away: the response, or the
@@ -1273,6 +1290,16 @@ mod http_tests {
         assert_eq!(classify_failure(404, ""), FailureClass::Gone);
         assert_eq!(classify_failure(400, "bad"), FailureClass::Permanent);
         assert_eq!(classify_failure(500, "boom"), FailureClass::Permanent);
+        // The control plane's "currently not available" is a wait under any
+        // status but an authorization failure.
+        let gone = r#"{"error":{"message":"Resource 'sbx-x' is currently not available"}}"#;
+        for status in [400, 404, 409, 500] {
+            assert!(matches!(classify_failure(status, gone), FailureClass::Transient { .. }), "{status}");
+        }
+        assert_eq!(classify_failure(403, gone), FailureClass::Permanent);
+        assert!(error_is_not_ready(&anyhow::anyhow!("set labels: 409\nResource 'sbx-x' is currently not available")));
+        assert!(error_is_not_ready(&anyhow::anyhow!("run command: the sandbox was still not ready after 90s; last answer: 404 (WORKLOAD_UNAVAILABLE)")));
+        assert!(!error_is_not_ready(&anyhow::anyhow!("making /opt/tod failed: no space left")));
     }
 
     #[test]

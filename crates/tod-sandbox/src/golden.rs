@@ -185,9 +185,174 @@ pub fn new_name(repo: &str, now: u64) -> String {
     format!("tod-golden-{}-{suffix}", slug.trim_end_matches('-'))
 }
 
+/// How a step of making a golden is retried when Blaxel says the sandbox is
+/// still waking (a proxy update redeploys it, and for a while its calls answer
+/// `WORKLOAD_UNAVAILABLE` or "currently not available").
+#[derive(Debug, Clone, Copy)]
+pub struct StepRetry {
+    /// Tries in all, the first included.
+    pub attempts: u32,
+    pub initial: std::time::Duration,
+    pub max: std::time::Duration,
+}
+
+impl Default for StepRetry {
+    fn default() -> Self {
+        Self { attempts: 6, initial: std::time::Duration::from_secs(3), max: std::time::Duration::from_secs(30) }
+    }
+}
+
+/// Runs `step` (named `step_name`, on `sandbox`) and retries it while it fails
+/// with a not-ready answer ([`crate::blaxel::error_is_not_ready`]), waiting
+/// with doubled backoff by `sleep` (injected, so tests need no clock). Any
+/// other failure comes back at once, unchanged. Running out of attempts is an
+/// error naming the sandbox, the step, the attempts and Blaxel's last answer.
+/// The step must be safe to run again.
+pub fn retry_step<T>(
+    sandbox: &str,
+    step_name: &str,
+    policy: &StepRetry,
+    sleep: &mut dyn FnMut(std::time::Duration),
+    progress: &mut dyn FnMut(&str),
+    mut step: impl FnMut() -> Result<T>,
+) -> Result<T> {
+    let mut delay = policy.initial;
+    let mut attempt = 0u32;
+    loop {
+        attempt += 1;
+        let err = match step() {
+            Ok(value) => return Ok(value),
+            Err(err) if crate::blaxel::error_is_not_ready(&err) => err,
+            Err(err) => return Err(err),
+        };
+        if attempt >= policy.attempts {
+            return Err(err.context(format!(
+                "sandbox {sandbox} was still not available for the step \"{step_name}\" after {attempt} attempts (Blaxel's last answer is the cause)"
+            )));
+        }
+        progress(&format!("{sandbox} is not ready yet for \"{step_name}\" (attempt {attempt} of {}); trying again in {}s…", policy.attempts, delay.as_secs()));
+        sleep(delay);
+        delay = (delay * 2).min(policy.max);
+    }
+}
+
+/// What a failed refresh does about the golden it half made.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HalfMade {
+    /// Delete it: tod made it just now, it is not `ready`, and nothing uses it.
+    Delete,
+    /// Leave it, for this reason.
+    Keep(String),
+}
+
+/// Decides [`HalfMade`] for `new`, the sandbox a failed refresh made from
+/// `old`. `found` is Blaxel's record of `new` (`None`: it is gone or was never
+/// made). Only a sandbox this refresh named itself ([`new_name`]'s
+/// `tod-golden-` prefix), different from the golden it started from, and not
+/// marked `ready` is deleted: never the previous good golden, never one the
+/// user made by hand (`wsx-golden`), never a finished one.
+pub fn half_made_action(new: &str, old: &str, found: Option<&SandboxInfo>) -> HalfMade {
+    if new == old {
+        return HalfMade::Keep(format!("{new} is the golden the refresh started from"));
+    }
+    let Some(info) = found else {
+        return HalfMade::Keep(format!("{new} does not exist"));
+    };
+    if !new.starts_with("tod-golden-") {
+        return HalfMade::Keep(format!("{new} was not named by tod's refresh"));
+    }
+    if info.label(LABEL_READY) == Some("true") {
+        return HalfMade::Keep(format!("{new} is marked ready"));
+    }
+    HalfMade::Delete
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn info_named(name: &str, labels: &[(&str, &str)]) -> SandboxInfo {
+        SandboxInfo {
+            name: name.into(),
+            status: "DEPLOYED".into(),
+            state: None,
+            url: None,
+            image: String::new(),
+            labels: labels.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+            volumes: vec![],
+            node_env: vec![],
+        }
+    }
+
+    fn fast() -> StepRetry {
+        StepRetry { attempts: 4, initial: std::time::Duration::from_secs(1), max: std::time::Duration::from_secs(3) }
+    }
+
+    #[test]
+    fn a_step_that_is_not_ready_is_retried_with_doubling_backoff_until_it_works() {
+        let mut calls = 0;
+        let mut slept = Vec::new();
+        let mut said = Vec::new();
+        let out = retry_step(
+            "tod-golden-a-b-1",
+            "install",
+            &fast(),
+            &mut |d| slept.push(d.as_secs()),
+            &mut |m| said.push(m.to_string()),
+            || {
+                calls += 1;
+                if calls < 4 { Err(anyhow::anyhow!("Resource 'sbx-x' is currently not available")) } else { Ok(calls) }
+            },
+        );
+        assert_eq!(out.unwrap(), 4);
+        assert_eq!(slept, vec![1, 2, 3], "doubling, capped at max");
+        assert_eq!(said.len(), 3);
+    }
+
+    #[test]
+    fn running_out_of_attempts_names_the_sandbox_step_attempts_and_last_answer() {
+        let mut calls = 0;
+        let err = retry_step("tod-golden-a-b-1", "set labels", &fast(), &mut |_| {}, &mut |_| {}, || -> Result<()> {
+            calls += 1;
+            Err(anyhow::anyhow!("404 (WORKLOAD_UNAVAILABLE) The workload is not ready yet"))
+        })
+        .unwrap_err();
+        assert_eq!(calls, 4);
+        let text = format!("{err:#}");
+        for want in ["tod-golden-a-b-1", "set labels", "4 attempts", "WORKLOAD_UNAVAILABLE"] {
+            assert!(text.contains(want), "{want} missing from {text}");
+        }
+    }
+
+    #[test]
+    fn any_other_failure_is_not_retried() {
+        let mut calls = 0;
+        let mut slept = 0;
+        let err = retry_step("g", "install", &fast(), &mut |_| slept += 1, &mut |_| {}, || -> Result<()> {
+            calls += 1;
+            Err(anyhow::anyhow!("making /opt/tod failed: no space left"))
+        })
+        .unwrap_err();
+        assert_eq!((calls, slept), (1, 0));
+        assert!(err.to_string().contains("no space left"));
+    }
+
+    #[test]
+    fn only_an_unfinished_golden_tod_just_named_is_deleted() {
+        let half = info_named("tod-golden-a-b-1", &[("tod-kind", "golden")]);
+        assert_eq!(half_made_action("tod-golden-a-b-1", "wsx-golden", Some(&half)), HalfMade::Delete);
+        // Nothing made: nothing to delete.
+        assert!(matches!(half_made_action("tod-golden-a-b-1", "wsx-golden", None), HalfMade::Keep(_)));
+        // The golden it started from, even when it is the user's or the only good one.
+        let old = info_named("tod-golden-a-b-0", &[]);
+        assert!(matches!(half_made_action("tod-golden-a-b-0", "tod-golden-a-b-0", Some(&old)), HalfMade::Keep(_)));
+        // A name tod's refresh did not give.
+        let mine = info_named("wsx-golden", &[]);
+        assert!(matches!(half_made_action("wsx-golden", "tod-golden-a-b-0", Some(&mine)), HalfMade::Keep(_)));
+        // A finished one.
+        let ready = info_named("tod-golden-a-b-1", &[(LABEL_READY, "true")]);
+        assert!(matches!(half_made_action("tod-golden-a-b-1", "wsx-golden", Some(&ready)), HalfMade::Keep(r) if r.contains("ready")));
+    }
 
     fn stamp(install: &str, schema: u32, wire: u32, built: u64) -> GoldenStamp {
         GoldenStamp { install: install.into(), schema, wire, built }

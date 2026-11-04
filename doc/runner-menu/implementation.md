@@ -671,6 +671,16 @@ Pass 3 unless noted).
 - **Adopt existing sandbox:** only the "Blaxel no longer has it" answer was
   seen; adopting a live sandbox (`Live`: the relay manifest and checkout
   probe through a real sandbox) was not.
+- **Golden refresh right after the proxy redeploy (live-check Pass 6, bug 11):**
+  fixed but unverified live. A refresh step that hits "currently not
+  available" / `WORKLOAD_UNAVAILABLE` is retried with backoff (six tries,
+  `tod_sandbox::golden::retry_step`, the one classification
+  `blaxel::says_not_ready`), failing loudly with sandbox, step, attempts and
+  Blaxel's last answer; a failed refresh deletes the half-made new golden
+  (`golden::half_made_action`: never the old one, never a name tod did not
+  give, never a `ready` one), `sandboxes.toml` still points at the old golden
+  until the new one is verified `ready`. Unit tested with an injected sleep;
+  the real Blaxel timing was not re-run.
 - **Golden:** the same-order-different-stamp refresh and a refusal against a
   real newer golden were not exercised on Blaxel.
 - **Blaxel standby:** a fork left `STANDBY` answering `WORKLOAD_UNAVAILABLE`
