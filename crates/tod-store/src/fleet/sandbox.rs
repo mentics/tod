@@ -281,6 +281,16 @@ impl Sandboxes {
         self.resolve_golden_setting(bx, &setting)
     }
 
+    /// Every golden there is, resolved, for a caller that has no repository
+    /// and so asks them all (each holds a checkout of its repository).
+    pub fn resolve_all_goldens(&self, bx: &Blaxel) -> Result<Vec<String>> {
+        let settings = self.account()?.all_goldens();
+        if settings.is_empty() {
+            anyhow::bail!("no golden sandbox is set: run `tod-sandbox golden <repo> <sandbox>`");
+        }
+        settings.iter().map(|s| self.resolve_golden_setting(bx, s)).collect()
+    }
+
     fn resolve_golden_setting(&self, bx: &Blaxel, golden: &str) -> Result<String> {
         Ok(match golden.trim().strip_suffix('*') {
             Some(prefix) => {

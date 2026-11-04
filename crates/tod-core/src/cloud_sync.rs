@@ -1311,8 +1311,10 @@ fn origin_url_of(fleet: &FleetStore, node_id: &str, repo: &str) -> Result<String
                 continue;
             }
             let root = fleet.paths().root();
-            match tod_store::fleet::sandbox::Sandboxes::load(root).and_then(|s| s.blaxel().and_then(|bx| s.resolve_sole_golden(&bx))) {
-                Ok(real) => resolved.push(real),
+            // Several goldens (one per repository, and the account-wide one):
+            // each is asked, and the answers must agree below.
+            match tod_store::fleet::sandbox::Sandboxes::load(root).and_then(|s| s.blaxel().and_then(|bx| s.resolve_all_goldens(&bx))) {
+                Ok(real) => resolved.extend(real),
                 Err(err) => {
                     golden_missing = true;
                     tried.push(format!(
@@ -1323,13 +1325,14 @@ fn origin_url_of(fleet: &FleetStore, node_id: &str, repo: &str) -> Result<String
             }
         }
         let sandboxes = resolved;
+        let mut found: Vec<String> = Vec::new();
         for name in sandboxes {
             match tod_store::fleet::sandbox::SandboxExec::new(&name).output(repo, "git", &["config", "--get-regexp", REMOTE_URLS]) {
                 Err(err) => tried.push(format!("could not run git in sandbox {name} at {repo}: {err:#}")),
                 Ok(o) if o.status.success() => {
                     let remotes = String::from_utf8_lossy(&o.stdout).trim().to_string();
                     match github_remote_url(&remotes) {
-                        Some(url) => return Ok(url),
+                        Some(url) => found.push(url),
                         None => tried.push(format!("sandbox {name} has remotes {remotes:?} at {repo}")),
                     }
                 }
@@ -1339,6 +1342,13 @@ fn origin_url_of(fleet: &FleetStore, node_id: &str, repo: &str) -> Result<String
                     String::from_utf8_lossy(&o.stderr).trim()
                 )),
             }
+        }
+        found.sort();
+        found.dedup();
+        match found.as_slice() {
+            [] => {}
+            [url] => return Ok(url.clone()),
+            many => tried.push(format!("the goldens hold different repositories ({}): say which the node's files are", many.join(", "))),
         }
     }
     let why = if tried.is_empty() { format!("{repo} is not a checkout on this machine") } else { tried.join("; ") };
