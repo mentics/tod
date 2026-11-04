@@ -100,6 +100,24 @@ fn refresh_with(
         let info = bx.wait_deployed(&name, Duration::from_secs(300))?;
         let url = info.url.ok_or_else(|| anyhow!("sandbox {name} has no URL"))?;
         tod_sandbox::provision::require_fork_prerequisites(bx, &url, true, progress)?;
+        // The proxy goes in BEFORE tod's files: updating a sandbox's network
+        // configuration redeploys it from its image, and what was installed
+        // into it until then is gone (seen live: a freshly refreshed golden had
+        // no node manifest, relay or bundles, so every fork reinstalled them).
+        //
+        // A fork does not keep its source's proxy routing (checked live: the
+        // fork's `network` comes back empty), and `fork_golden` refuses a
+        // golden with none, since a fork of it cannot take the node's rules.
+        // Give it a placeholder rule, as a hand-made golden has.
+        bx.update_proxy(&name, &placeholder_proxy(), &[])
+            .with_context(|| format!("give {name} a proxy, so nodes can be forked from it"))?;
+        let info = bx.wait_deployed(&name, Duration::from_secs(300))?;
+        let url = info.url.ok_or_else(|| anyhow!("sandbox {name} has no URL"))?;
+        bx.wait_reachable(&url, Duration::from_secs(180)).with_context(|| format!("wake {name}"))?;
+        let routed = bx.get_json(&name)?.is_some_and(|j| has_proxy_routes(&j));
+        if !routed {
+            bail!("{name} did not keep the proxy it was given, so nodes cannot be forked from it");
+        }
         let payload = tod_sandbox::node::NodePayload {
             relay: &files.relay,
             shim: tod_store::fleet::cli_relay::HTTP_SHIM_SCRIPT.as_bytes(),
@@ -114,16 +132,6 @@ fn refresh_with(
         };
         progress("installing tod's files…");
         tod_sandbox::node::install(bx, &url, &payload, progress)?;
-        // A fork does not keep its source's proxy routing (checked live: the
-        // fork's `network` comes back empty), and `fork_golden` refuses a
-        // golden with none, since a fork of it cannot take the node's rules.
-        // Give it a placeholder rule, as a hand-made golden has.
-        bx.update_proxy(&name, &placeholder_proxy(), &[])
-            .with_context(|| format!("give {name} a proxy, so nodes can be forked from it"))?;
-        let routed = bx.get_json(&name)?.is_some_and(|j| has_proxy_routes(&j));
-        if !routed {
-            bail!("{name} did not keep the proxy it was given, so nodes cannot be forked from it");
-        }
         // Stamp first and `ready` last: a half-made golden is never ready.
         let stamp_labels = mine.labels();
         let mut labels: Vec<(&str, &str)> = stamp_labels.iter().map(|(k, v)| (*k, v.as_str())).collect();

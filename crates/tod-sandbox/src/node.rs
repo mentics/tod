@@ -640,6 +640,13 @@ fn upload_tod_files(bx: &Blaxel, url: &str, payload: &NodePayload, progress: &mu
     // Each binary is written beside its old copy, then renamed over it.
     let bytes = (payload.relay.len() + payload.supervisor.map_or(0, <[u8]>::len) + payload.local_cli.map_or(0, <[u8]>::len)) as u64;
     bx.ensure_free_space(url, "/", INSTALL_MIN_FREE.max(bytes * 3), url)?;
+    // A sandbox that was never provisioned (a golden whose network was just
+    // reconfigured, which redeploys it from its image) has no directory yet,
+    // and the large upload checks the space where it will write.
+    let made = bx.run(url, &format!("mkdir -p {TOD_DIR}/bin"), 30)?;
+    if made.exit_code != 0 {
+        bail!("making {TOD_DIR} failed: {}", made.output());
+    }
     bx.upload_large(url, RELAY_PATH, payload.relay, "0755")?;
     bx.upload(url, TOD_CLI_PATH, payload.shim, "0755")?;
     match payload.supervisor {
