@@ -85,8 +85,11 @@ fn external_edit_reloads_fleet_store_projection() {
         .unwrap();
     }
 
-    assert_eq!(store.projection().lock().unwrap().metadata().task_count, 1);
-    assert!(store.reload_if_stale().unwrap());
+    // A background reload may already have picked the edit up (under load it
+    // does), so only the outcome is asserted: after the check the projection
+    // holds the external edit, however it got there.
+    store.reload_if_stale().unwrap();
+    assert_eq!(store.projection().lock().unwrap().metadata().task_count, 2);
     assert_eq!(store.list_tasks().unwrap().len(), 2);
 
     drop(store);
