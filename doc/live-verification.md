@@ -68,7 +68,7 @@ The root has two Files locations (Locations dialog; the seed script adds them):
 | Location | Repository | Use it for |
 |---|---|---|
 | `Golden workspace` | `Cofactr/workspace` (flagship, kb, ... are submodules inside it); a fork of `golden`, directory `/workspace`; its golden is `cofactr/workspace` (`tod-sandbox golden refresh cofactr/workspace`) | Checks on real data and the real golden flow: Linear tickets, `ENG work`, Start/Migrate/Reset environment on what the real roots do. **Nothing may be pushed from it** (see below). |
-| `Build test` | private `joel-cofactr/build-test`; cloud sandbox "From an image", directory `/workspace/build-test` | Anything that pushes a branch or opens a PR, and anything that needs flexibility (any repository content). |
+| `Build test` | private `joel-cofactr/build-test`; cloud sandbox, "From a sandbox" `golden`, directory `/workspace/repo`; its golden is `joel-cofactr/build-test` (`tod-sandbox golden refresh joel-cofactr/build-test`) | Anything that pushes a branch or opens a PR, and anything that needs flexibility (any repository content). |
 
 Never use `/workspace/flagship` as a location directory: its origin is
 `Cofactr/flagship`, so the golden is keyed `cofactr/flagship` and Migrate would
@@ -76,11 +76,24 @@ push branches there. The old `Golden flagship` location and the
 `cofactr/flagship` golden were retired for that reason (the location kept its id
 and became `Golden workspace`, so nodes that used it follow).
 
-`Build test` is an image location, so its repository has to come from somewhere:
-until the Locations dialog accepts an HTTPS repository URL for it (gap 14 of
-`runner-menu/live-check-2026-11.md`), set the node's `node_fields.repo` to
-`https://github.com/joel-cofactr/build-test` in the root's `tod.db` (as pass 7
-did). A golden cannot be made for build-test (a fork never clones).
+**One-time golden for `Build test`.** A repository with no golden is built, not
+forked: `tod-sandbox --data-root ~/.local/share/tod-live-verify golden refresh
+joel-cofactr/build-test` makes a fresh sandbox from the default image, installs
+tod's files, clones the private repository into `/workspace/repo` through the
+proxy with your stored GitHub token (submodules too), labels it `ready`, and
+maps `[blaxel.goldens]` to it (the account-wide `wsx-golden-*` holds
+`cofactr/workspace`, so it is never forked for this repository). Run it again
+after a tod update (or let the app do it when it starts a node); with the golden
+in place it refreshes in place. Do the same for any new repository. The
+location is set in the Locations dialog or by the seed script (it also turns an
+old image-based `Build test` into this). The golden made on 2026-11-04 is
+`tod-golden-joel-cofactr-build-test-6aeb65d8`; a node on it has
+`/workspace/repo` on its own `task/<slug>` branch with origin
+`https://github.com/joel-cofactr/build-test.git`. A node's first fork can hit
+Blaxel's slow wake (`WORKLOAD_UNAVAILABLE` for minutes; the app deletes that
+sandbox and a second Open shell/Start worked). Starting a node asks every
+golden at the Files directory which repository it holds (`origin_url_of`), which
+also wakes the `wsx-golden-*`.
 
 ## Loop
 

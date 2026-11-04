@@ -180,7 +180,23 @@ prefix). A `golden = "..."` from before there was one per repository is read
 as the golden of every repository that has none of its own, and stays when
 one is set (the log says so); `[blaxel.goldens]` holds the per-repository ones.
 
-`tod-sandbox golden refresh [<owner/name>]` makes the golden again on this
+**A repository with no golden** (`tod-sandbox golden refresh <owner/name>`, and
+the app's own refresh before a fork) gets one built from the right source, never
+a fork of another repository's: a fresh sandbox from the account's default
+image, with tod's dependencies and files installed and the repository cloned
+into `/workspace/repo` (where the relay, the supervisor and a node's checkout
+look first) through the sandbox's proxy, which holds your stored GitHub token,
+so a **private** repository clones; submodules are initialized recursively.
+It is then labelled, marked `ready` and set as the repository's golden, like any
+other. The account-wide `golden` of an old `sandboxes.toml` counts as this
+repository's only when its checkout's `origin` is this repository (asked of the
+sandbox, read-only); otherwise it is left alone and one is built. A clone that
+cannot be made (no token, no access) fails naming the repository, deletes the
+half-made sandbox, and changes nothing. (`tod-sandbox bake --repo` still cannot
+clone a private repository: a Dockerfile cannot carry a token.)
+
+`tod-sandbox golden refresh <owner/name>`, for a repository that has a golden,
+makes it again on this
 build: it forks the current golden, checks what a fork needs, installs tod's
 files, labels it `tod-install` (the install stamp), `tod-schema`, `tod-wire`,
 and `tod-built` (the commit time of the build) plus `tod-kind=golden`, marks
