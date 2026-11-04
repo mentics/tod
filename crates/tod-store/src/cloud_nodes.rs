@@ -126,7 +126,10 @@ fn has_table(conn: &Connection) -> Result<bool> {
         .exists([])?)
 }
 
-/// Records (or re-records) that `node` runs in `sandbox` for `user`. Keeps
+/// Records (or re-records) that `node` runs in `sandbox` for `user`. The app
+/// never calls this directly: its one writer takes `sandbox` from the node's
+/// Files location (`FleetMutation::CloudNodeUpsert`); the orchestrator, which
+/// has no locations, stores what it is sent. Keeps
 /// an existing context mark; clears a lost mark (the sandbox was replaced).
 pub fn upsert(conn: &Connection, node: Uuid, sandbox: &str, user: &str, accepted_at: i64) -> Result<()> {
     conn.execute(
@@ -134,6 +137,20 @@ pub fn upsert(conn: &Connection, node: Uuid, sandbox: &str, user: &str, accepted
          ON CONFLICT(node_id) DO UPDATE SET sandbox = excluded.sandbox,
              user_name = excluded.user_name, accepted_at = excluded.accepted_at, lost_at = NULL",
         params![uuid_to_blob(node), sandbox, user, accepted_at],
+    )?;
+    Ok(())
+}
+
+/// Points the existing row of `node` at `sandbox`: the copy of the node's
+/// Files location, which is the one record of its sandbox. A node with no
+/// row is left alone (nothing runs it in the cloud). Keeps every mark.
+pub fn set_sandbox(conn: &Connection, node: Uuid, sandbox: &str) -> Result<()> {
+    if !has_table(conn)? {
+        return Ok(());
+    }
+    conn.execute(
+        "UPDATE cloud_nodes SET sandbox = ?2 WHERE node_id = ?1 AND sandbox != ?2",
+        params![uuid_to_blob(node), sandbox],
     )?;
     Ok(())
 }

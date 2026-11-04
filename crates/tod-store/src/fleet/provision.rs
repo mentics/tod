@@ -409,28 +409,19 @@ fn lost_track_error(name: &str, slug: &str, node_id: &str, status: &str) -> anyh
     let short: String = node_id.chars().take(6).collect();
     anyhow!(
         "Cannot make sandbox {name} for node \"{slug}\" ({short}…): a sandbox by that name already exists ({status}), \
-         but this node's record does not point at it, so tod lost track of it. Check `tod-sandbox list`, the node's \
-         Files location, and its cloud record; delete or adopt the sandbox (`tod-sandbox delete {name}`), then try again. \
+         but this node's Files location does not point at it, so tod lost track of it. Check `tod-sandbox list` \
+         and the node's Files location; delete or adopt the sandbox (`tod-sandbox delete {name}`), then try again. \
          Nothing was made, renamed or deleted."
     )
 }
 
-/// The sandboxes `node_id`'s records name: its Files location's, then its
-/// `cloud_nodes` row's (one record after B3 of the runner-menu plan).
+/// The sandbox `node_id`'s Files location records: **the one record** of
+/// which sandbox belongs to the node (runner-menu plan, B3). The
+/// `cloud_nodes` row keeps a copy for the orchestrator, written from this and
+/// never read to decide anything here. At most one name.
 pub fn recorded_sandboxes(fleet: &FleetStore, node_id: &str) -> Result<Vec<String>> {
-    let node: uuid::Uuid = node_id.parse().context("node id")?;
-    let mut names = Vec::new();
-    if let Some(location) = fleet.read(|conn| FilesLocationRepo::new(conn).get(node_id))?
-        && let Some(name) = location.sandbox
-    {
-        names.push(name);
-    }
-    if let Some(row) = fleet.read(|conn| crate::cloud_nodes::get(conn, node))?
-        && !names.contains(&row.sandbox)
-    {
-        names.push(row.sandbox);
-    }
-    Ok(names)
+    let location = fleet.read(|conn| FilesLocationRepo::new(conn).get(node_id))?;
+    Ok(location.and_then(|l| l.sandbox().map(str::to_string)).into_iter().collect())
 }
 
 fn sandbox_exists(info: Option<&tod_sandbox::blaxel::SandboxInfo>) -> bool {
@@ -1109,8 +1100,7 @@ pub fn retire_unusable_sandbox(fleet: &FleetStore, node_id: &str, progress: &mut
         forget_location(&mut sandboxes)?;
         return Ok(Retired::Replaced(name));
     }
-    let made_here = location.as_ref().is_some_and(|l| l.sandbox.as_deref() == Some(name.as_str()));
-    if !made_here || info.label("tod-kind") == Some("node") {
+    if info.label("tod-kind") == Some("node") {
         return Ok(Retired::Current(name));
     }
     progress("Upgrading the node's sandbox so it can run its autopilot…");
@@ -1411,7 +1401,19 @@ pub fn remove_location(
             }
         }
     }
+    forget_removed_location(fleet, node_id, &location)
+}
+
+/// Forgets a location whose files were removed. The `cloud_nodes` row is a
+/// copy of the location's sandbox for the orchestrator, so it goes in the same
+/// flush when the location named one: the node no longer has a sandbox (the
+/// caller syncs to tell the orchestrator).
+pub(crate) fn forget_removed_location(fleet: &FleetStore, node_id: &str, location: &FilesLocation) -> Result<()> {
     fleet.enqueue(FleetMutation::DeleteFilesLocation { node_id: node_id.to_string() })?;
+    if location.sandbox().is_some() {
+        let uuid = uuid::Uuid::parse_str(node_id).with_context(|| format!("node id {node_id}"))?;
+        fleet.enqueue(FleetMutation::CloudNodeRemove { node: uuid })?;
+    }
     fleet.writer().flush()?;
     fleet.reload_if_stale()?;
     Ok(())

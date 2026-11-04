@@ -395,6 +395,53 @@ What landed, and where it departs from the text below:
   elsewhere and must not act on its sandbox (the `owner_client` check covers
   `cloud_nodes`; A7 and B4 only act through the location row).
 
+**B3 status: done (code and tests), no schema change.**
+
+- The split chosen: `node_files_locations.sandbox` is the one record of which
+  sandbox a node has; `cloud_nodes.sandbox` stays only because the
+  orchestrator reads it (it has no locations), and is a copy. The schema,
+  the sync contract and the orchestrator are unchanged, so **no orchestrator
+  redeploy is needed** (`CURRENT_USER_VERSION` stays 93; nothing about what is
+  synced changed). No in-schema copy of old rows into locations was made: a
+  location needs the checkout path found by probing the sandbox, which a
+  migration cannot do. That is B5 (below).
+- Writers of the copy, all in the store's writer: `CloudNodeUpsert` no longer
+  carries a sandbox; the writer reads it from the node's location in the same
+  transaction and fails ("its Files location names no sandbox") when there is
+  none. `RecordFilesLocation` moves an existing row's copy in the same
+  transaction (Start, a lost replacement, Reset environment's recreate and
+  `refresh_sandbox_proxy` all record a location). `remove_location` removes
+  the row in the same flush (`forget_removed_location`); the caller syncs
+  (`lost::announce_left_cloud`, used by Migrate). `record_cloud_node` takes no
+  sandbox.
+- Everything that acts reads the location: `wake_node_requesting`
+  (`cloud_sandbox`), `session_log::node_sandbox` (so `keep_node_state`,
+  `place_node_state`, migrate), `provision::recorded_sandboxes` (the creator's
+  reuse and lost-track decisions), the delete plan (both variants,
+  `delete_sandboxes_at_final_phase`), `db_broker`, the task panel's line and
+  menu, and the lost/reinstall check (`lost::located_rows`). `CloudNode` no
+  longer has a `sandbox` field.
+- Reported, never fixed silently: `located_rows` reports (once per message, to
+  the node's problems) a row whose copy differs from its location, naming
+  both, and a live row of this client's whose node has no location sandbox;
+  neither is acted on. A lost row, a user-deleted one and another client's are
+  skipped without a word.
+- Removed workarounds: `node_sandbox`'s fallback to the cloud row,
+  `confirm_migrate`'s cloud-row-only branch (and `stop_running_in_cloud*`,
+  `checkpoint_before_delete`, `sandbox_checkout`), `handoff::cloud_node_workdir`,
+  the delete plan's second name, the task panel treating a cloud row as an
+  existing sandbox. Their regression tests now assert the single record
+  (`the_nodes_sandbox_is_the_one_its_files_location_records`,
+  `a_node_with_only_a_cloud_row_has_no_sandbox_to_delete`).
+- Kept on purpose: the orphan sweeper's known names still include every
+  `cloud_nodes` row (another machine's node protects its sandbox from being
+  listed as an orphan).
+- Until B5, a node started before B2 that has a `cloud_nodes` row and no
+  location is not acted on (the panel says its Files location records no
+  sandbox, the check reports it, Start makes a new sandbox through the creator
+  or fails with the lost-track error if the old sandbox has that name). The
+  legacy `cloud-sync.json` records are adopted only for nodes with a location.
+
 ### B4. Automatic delete at `done`
 
 - New `crates/tod-core/src/sandbox_retire.rs`: `due(fleet) -> Vec<node>` (a

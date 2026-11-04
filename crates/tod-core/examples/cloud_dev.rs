@@ -133,7 +133,7 @@ fn main() -> Result<()> {
         ("run", [node]) => {
             let id = resolve(&fleet, node)?;
             let record = tod_core::cloud_sync::run_in_cloud(&fleet, &root, &id, &mut |m| eprintln!("{m}"))?;
-            println!("{id} runs in {} (user {})", record.sandbox, record.user);
+            println!("{id} runs in {} (user {})", tod_core::cloud_sync::cloud_sandbox(&fleet, &id)?, record.user);
         }
         ("sync", []) => {
             let report = tod_core::cloud_sync::sync_now(&fleet, &root)?;
@@ -169,7 +169,7 @@ fn main() -> Result<()> {
         }
         ("stop", [node]) => {
             let id = resolve(&fleet, node)?;
-            println!("{}", tod_core::cloud_sync::lost::stop_running_in_cloud(&fleet, &id, true)?);
+            println!("{}", tod_core::cloud_sync::lost::delete_node_sandbox(&fleet, &id)?);
         }
         _ => bail!("{USAGE}"),
     }

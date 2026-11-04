@@ -69,9 +69,10 @@ pub struct CloudSyncState {
     /// The feed's cursor: the orchestrator's `last_seq` last pulled.
     #[serde(default)]
     pub feed_after: i64,
-    /// Nodes running in the cloud, by node id.
+    /// Nodes running in the cloud, by node id: the record older builds kept
+    /// here, moved into the database by [`lost::adopt_legacy_records`].
     #[serde(default)]
-    pub nodes: BTreeMap<String, CloudNode>,
+    pub nodes: BTreeMap<String, LegacyCloudNode>,
     /// Nodes whose sandbox the user deleted on purpose: the lost-sandbox
     /// check leaves them alone until the user runs them in the cloud again.
     #[serde(default)]
@@ -102,20 +103,49 @@ pub fn client_id(root: &Path) -> Result<String> {
     Ok(id)
 }
 
+/// A node record as older builds kept it in [`STATE_FILE`], which named the
+/// sandbox itself.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CloudNode {
+pub struct LegacyCloudNode {
     pub sandbox: String,
     pub user: String,
     pub accepted_at_ms: i64,
-    /// When the orchestrator found its sandbox gone, until the app replaces it.
     #[serde(default)]
+    pub lost_at: Option<i64>,
+}
+
+/// A node that runs in the cloud, as its `cloud_nodes` row says. The row's
+/// copy of the sandbox's name is deliberately not here: which sandbox the
+/// node has is its Files location's to say ([`cloud_sandbox`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CloudNode {
+    pub user: String,
+    pub accepted_at_ms: i64,
+    /// When the orchestrator found its sandbox gone, until the app replaces it.
     pub lost_at: Option<i64>,
 }
 
 impl From<tod_store::cloud_nodes::CloudNodeRow> for CloudNode {
     fn from(row: tod_store::cloud_nodes::CloudNodeRow) -> Self {
-        Self { sandbox: row.sandbox, user: row.user, accepted_at_ms: row.accepted_at, lost_at: row.lost_at }
+        Self { user: row.user, accepted_at_ms: row.accepted_at, lost_at: row.lost_at }
     }
+}
+
+/// The sandbox `node_id` has, if any: the one its Files location records, the one
+/// record of it (`cloud_nodes.sandbox` is a copy for the orchestrator that
+/// nothing here reads). Reads the store's own connection: fine on the UI thread.
+pub fn cloud_sandbox_if_any(fleet: &FleetStore, node_id: &str) -> Result<Option<String>> {
+    tod_store::fleet::session_log::node_sandbox(fleet, node_id)
+}
+
+/// [`cloud_sandbox_if_any`] for a node that must have one.
+pub fn cloud_sandbox(fleet: &FleetStore, node_id: &str) -> Result<String> {
+    cloud_sandbox_if_any(fleet, node_id)?.ok_or_else(|| {
+        anyhow!(
+            "node {node_id} runs in the cloud but its Files location records no sandbox (a record made before \
+             the location was the one record: Start makes the node a sandbox, or a later step adopts the old one)"
+        )
+    })
 }
 
 impl CloudSyncState {
@@ -140,50 +170,8 @@ impl CloudSyncState {
     }
 }
 
-/// The node's checkout inside its cloud sandbox `name`, as a directory git
-/// can run in (the probe picks `/workspace/repo` or the forked `/workspace`).
-pub fn sandbox_checkout(bx: &tod_sandbox::blaxel::Blaxel, name: &str) -> Result<tod_store::fleet::Workdir> {
-    let info = bx.get(name)?.with_context(|| format!("sandbox {name} does not exist"))?;
-    let url = info.url.with_context(|| format!("sandbox {name} has no URL"))?;
-    let cmd = format!("sh -c {}", tod_sandbox::relay::shell_quote(&format!("echo {}", tod_sandbox::node::WORKSPACE_PROBE)));
-    let res = bx.run(&url, &cmd, 60).with_context(|| format!("find the checkout in {name}"))?;
-    if res.exit_code != 0 {
-        anyhow::bail!("could not find the checkout in {name}: exit {}", res.exit_code);
-    }
-    let path = res.output().trim().to_string();
-    if !path.starts_with('/') {
-        anyhow::bail!("could not find the checkout in {name}: got {path:?}");
-    }
-    Ok(tod_store::fleet::Workdir::sandbox(name, path))
-}
-
-/// Free space a checkpoint needs on the sandbox's root filesystem.
-const CHECKPOINT_MIN_FREE: u64 = 32 * 1024 * 1024;
-
 /// Free space a wake needs (the supervisor's settings, its state, its logs).
 const WAKE_MIN_FREE: u64 = 64 * 1024 * 1024;
-
-/// Pushes `node_id`'s uncommitted work in its cloud sandbox `name` to the
-/// hidden checkpoint ref (`tod_store::fleet::checkpoint`), so deleting the
-/// sandbox loses nothing. A sandbox Blaxel does not have has nothing to keep.
-/// Fails, naming why, when the work cannot be kept: the caller must then not
-/// delete. Blocks on git and the network.
-pub fn checkpoint_before_delete(
-    bx: &tod_sandbox::blaxel::Blaxel,
-    node_id: &str,
-    name: &str,
-) -> Result<()> {
-    let Some(info) = bx.get(name)? else {
-        return Ok(());
-    };
-    if let Some(url) = info.url {
-        bx.ensure_free_space(&url, "/", CHECKPOINT_MIN_FREE, name)?;
-    }
-    let checkout = sandbox_checkout(bx, name)?;
-    tod_store::fleet::node_checkpoint::checkpoint_dir(&checkout, node_id, &tod_store::fleet::checkpoint::Limits::default())
-        .with_context(|| format!("could not keep {name}'s uncommitted work, so the sandbox was not deleted"))?;
-    Ok(())
-}
 
 /// Records (or, with `deleted` false, forgets) that the user deleted
 /// `node_id`'s sandbox on purpose.
@@ -1687,17 +1675,18 @@ fn ownership_of(fleet: &FleetStore, node_id: &str) -> Result<tod_store::cloud_no
     })
 }
 
-/// Records that `node_id` runs in `sandbox` (clearing any lost mark) in the
+/// Records that `node_id` runs in the cloud (clearing any lost mark) in the
 /// database, which is synced: the orchestrator needs to know the node is
 /// active (`tod_core::impact`), and its supervisor reads its context mark
-/// there.
-fn record_cloud_node(fleet: &FleetStore, node_id: &str, sandbox: String, user: &str) -> Result<CloudNode> {
+/// there. The sandbox is not an argument: the row's copy of it is taken from
+/// the node's Files location by the writer, which fails when the location
+/// names none.
+fn record_cloud_node(fleet: &FleetStore, node_id: &str, user: &str) -> Result<CloudNode> {
     let root = fleet.paths().root();
     set_sandbox_deleted_by_user(root, node_id, false)?;
     // Recorded now, so the sweeper no longer needs the intent to know the
     // sandbox is the node's.
     let record = CloudNode {
-        sandbox,
         user: user.to_string(),
         accepted_at_ms: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1709,7 +1698,6 @@ fn record_cloud_node(fleet: &FleetStore, node_id: &str, sandbox: String, user: &
     // Through the writer (the daemon's, in the app), not a connection of its own.
     fleet.enqueue(FleetMutation::CloudNodeUpsert {
         node: node_uuid,
-        sandbox: record.sandbox.clone(),
         user: record.user.clone(),
         accepted_at: record.accepted_at_ms,
     })?;
@@ -1764,8 +1752,8 @@ fn run_in_cloud_reporting(
     progress("syncing with the orchestrator…");
     let (orch, user) = resolve(root)?;
     sync(fleet, root, &orch, &user)?;
-    let name = ensure_supervisor(fleet, root, node_id, true, progress)?;
-    let record = record_cloud_node(fleet, node_id, name, &user)?;
+    ensure_supervisor(fleet, root, node_id, true, progress)?;
+    let record = record_cloud_node(fleet, node_id, &user)?;
     let heard = match sync(fleet, root, &orch, &user) {
         Ok(report) => report,
         Err(err) => {
@@ -2025,6 +2013,8 @@ pub fn wake_node_requesting(fleet: &FleetStore, root: &Path, node_id: &str, kind
     let fresh_session = kind == REQUEST_FRESH_SESSION;
     let stops = matches!(kind, REQUEST_PAUSE | REQUEST_STOP_NOW);
     let row = cloud_node(fleet, node_id).ok_or_else(|| anyhow!("this node does not run in the cloud"))?;
+    // The node's sandbox is its Files location's, not the row's copy.
+    let sandbox = cloud_sandbox(fleet, node_id)?;
     let (orch, user) = resolve(root)?;
     // Before the sync, so the answer and the row travel with it: a supervisor
     // that reads "left stopped" would ignore the request.
@@ -2045,31 +2035,29 @@ pub fn wake_node_requesting(fleet: &FleetStore, root: &Path, node_id: &str, kind
     let bx = sandboxes.blaxel()?;
     // A sandbox that is gone (deleted or reclaimed since the last look) is
     // replaced the way the lost-sandbox check does, then woken.
-    let found = bx.get(&row.sandbox)?;
+    let found = bx.get(&sandbox)?;
     // A sandbox in standby answers 502/503/504 and Blaxel's own 404 "workload
     // is not ready" for up to ~30s after waking: every upload below waits it
     // out, and one that never answers is replaced rather than reused.
     let made_for = found.as_ref().and_then(|info| info.env("TOD_USER")).unwrap_or(&row.user);
-    let unusable = sandbox_user_reason(&row.sandbox, made_for, &user)
+    let unusable = sandbox_user_reason(&sandbox, made_for, &user)
         .or_else(|| found.as_ref().and_then(|info| sandbox_unusable_reason(&bx, info)));
     if let Some(reason) = &unusable {
         tracing::warn!("cloud: {reason}; replacing it");
     }
-    let (row, info, replaced) = match found {
-        Some(info) if unusable.is_none() => (row, info, None),
+    let (sandbox, info, replaced) = match found {
+        Some(info) if unusable.is_none() => (sandbox, info, None),
         _ => {
-            let gone = row.sandbox.clone();
+            let gone = sandbox;
             let mut progress = |msg: &str| log_progress(&format!("replacing {gone}"), msg);
-            let node = ensure_supervisor(fleet, root, node_id, true, &mut progress)
-                .and_then(|name| record_cloud_node(fleet, node_id, name, &user))
+            let name = ensure_supervisor(fleet, root, node_id, true, &mut progress)
+                .and_then(|name| record_cloud_node(fleet, node_id, &user).map(|_| name))
                 .with_context(|| format!("sandbox {gone} is gone, and replacing it failed"))?;
-            let info = bx
-                .get(&node.sandbox)?
-                .ok_or_else(|| anyhow!("sandbox {} no longer exists", node.sandbox))?;
-            (node, info, Some(gone))
+            let info = bx.get(&name)?.ok_or_else(|| anyhow!("sandbox {name} no longer exists"))?;
+            (name, info, Some(gone))
         }
     };
-    let url = info.url.ok_or_else(|| anyhow!("sandbox {} has no URL", row.sandbox))?;
+    let url = info.url.ok_or_else(|| anyhow!("sandbox {sandbox} has no URL"))?;
     // The disk check, and the rest of the health probe: a sandbox that is
     // `DEPLOYED` but cannot reach GitHub, lost its environment or has no relay
     // is named here, not discovered by a turn that fails later.
@@ -2077,7 +2065,7 @@ pub fn wake_node_requesting(fleet: &FleetStore, root: &Path, node_id: &str, kind
     let mut wake_progress = |msg: &str| log_progress(&format!("wake {node_id}"), msg);
     probe_health(
         &bx,
-        &HealthTarget { label: &row.sandbox, node: node_id, repo_url: &repo_url, url: &url },
+        &HealthTarget { label: &sandbox, node: node_id, repo_url: &repo_url, url: &url },
         tod_sandbox::health::Stage::Ready,
         WAKE_MIN_FREE,
         None,
@@ -2113,11 +2101,11 @@ pub fn wake_node_requesting(fleet: &FleetStore, root: &Path, node_id: &str, kind
         .send_empty()
         .context("poke the node")?;
     if !resp.status().is_success() {
-        bail!("poking sandbox {} got {}", row.sandbox, resp.status());
+        bail!("poking sandbox {sandbox} got {}", resp.status());
     }
     Ok(match replaced {
-        Some(gone) => format!("replaced the missing sandbox {gone} with {} and woke its supervisor", row.sandbox),
-        None => format!("woke the supervisor in {}", row.sandbox),
+        Some(gone) => format!("replaced the missing sandbox {gone} with {sandbox} and woke its supervisor"),
+        None => format!("woke the supervisor in {sandbox}"),
     })
 }
 
