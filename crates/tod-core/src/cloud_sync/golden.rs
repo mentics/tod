@@ -85,7 +85,7 @@ fn source_for(sandboxes: &Sandboxes, bx: &Blaxel, repo: &str) -> Result<golden::
 fn checkout_origin(bx: &Blaxel, name: &str) -> Result<Option<String>> {
     let info = bx.get(name)?.ok_or_else(|| anyhow!("the golden sandbox {name} does not exist"))?;
     let url = info.url.ok_or_else(|| anyhow!("sandbox {name} has no URL"))?;
-    bx.wait_reachable(&url, Duration::from_secs(180)).with_context(|| format!("wake {name} to read which repository it holds"))?;
+    bx.wait_reachable(&url, tod_sandbox::blaxel::WAKE_CEILING).with_context(|| format!("wake {name} to read which repository it holds"))?;
     let probe = format!(
         "d={}; [ -d \"$d/.git\" ] && git -C \"$d\" remote get-url origin 2>/dev/null",
         tod_sandbox::node::WORKSPACE_PROBE
@@ -200,7 +200,7 @@ fn build_golden(
         let url = info.url.clone().ok_or_else(|| anyhow!("sandbox {name} has no URL"))?;
         sandboxes.config.upsert(tod_sandbox::config::Sandbox { name: name.clone(), image: info.image, url: Some(url.clone()), agents: true });
         sandboxes.save()?;
-        step!("wake it", bx.wait_reachable(&url, Duration::from_secs(180)).with_context(|| format!("wake {name}")))?;
+        step!("wake it", bx.wait_reachable(&url, tod_sandbox::blaxel::WAKE_CEILING).with_context(|| format!("wake {name}")))?;
         // An image holds only what it was built with: tod's dependencies
         // first (git among them), then its own files.
         say("installing tod's dependencies…");
@@ -324,7 +324,7 @@ fn refresh_with(
             .with_context(|| format!("give {name} a proxy, so nodes can be forked from it"))?;
         let info = step!("wait until deployed", bx.wait_deployed(&name, Duration::from_secs(300)))?;
         let url = info.url.ok_or_else(|| anyhow!("sandbox {name} has no URL"))?;
-        step!("wake it", bx.wait_reachable(&url, Duration::from_secs(180)).with_context(|| format!("wake {name}")))?;
+        step!("wake it", bx.wait_reachable(&url, tod_sandbox::blaxel::WAKE_CEILING).with_context(|| format!("wake {name}")))?;
         let routed = step!("read its proxy", bx.get_json(&name))?.is_some_and(|j| has_proxy_routes(&j));
         if !routed {
             bail!("{name} did not keep the proxy it was given, so nodes cannot be forked from it");

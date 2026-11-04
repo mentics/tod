@@ -248,7 +248,7 @@ impl Backend for Live {
     fn verify_relay(&mut self, info: &SandboxInfo) -> Result<()> {
         let url = info.url.clone().ok_or_else(|| anyhow!("Blaxel gives sandbox {} no URL", info.name))?;
         self.bx
-            .wait_reachable(&url, std::time::Duration::from_secs(180))
+            .wait_reachable(&url, tod_sandbox::blaxel::WAKE_CEILING)
             .with_context(|| format!("wake {}", info.name))?;
         let Some(manifest) = tod_sandbox::provision::relay_manifest(&self.bx, &url) else {
             bail!("the relay in {} does not answer", info.name);

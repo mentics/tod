@@ -1621,7 +1621,7 @@ pub fn ensure_supervisor(
     }
     let url = info.url.clone().ok_or_else(|| anyhow!("sandbox {name} has no URL"))?;
     progress(&format!("waking {name}…"));
-    bx.wait_reachable(&url, Duration::from_secs(180)).with_context(|| format!("wake {name}"))?;
+    bx.wait_reachable(&url, tod_sandbox::blaxel::WAKE_CEILING).with_context(|| format!("wake {name}"))?;
 
     let files = refresh::install_files()?;
     let current = files.install();
@@ -1722,7 +1722,7 @@ pub fn probe_health(
         node: target.node,
         repo_url: target.repo_url,
         min_free,
-        reachable_wait: Duration::from_secs(180),
+        reachable_wait: tod_sandbox::blaxel::WAKE_CEILING,
         expected_manifest,
         probe_delays: delays,
     };

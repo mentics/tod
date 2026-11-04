@@ -13,6 +13,12 @@ pub const API: &str = "https://api.blaxel.ai/v0";
 /// The port the relay listens on inside every sandbox.
 pub const RELAY_PORT: u16 = 2222;
 
+/// The most a caller waits for a sandbox Blaxel is waking from standby to
+/// answer ([`Blaxel::wait_reachable`]). A ceiling, not a delay: the wait ends
+/// the moment the sandbox answers, and one that never does fails with an error
+/// naming this many seconds. Every wake in tod uses it.
+pub const WAKE_CEILING: Duration = Duration::from_secs(180);
+
 pub struct Blaxel {
     workspace: String,
     token: String,

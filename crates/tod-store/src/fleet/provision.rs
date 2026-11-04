@@ -751,7 +751,7 @@ fn health_spec<'a>(
         node,
         repo_url,
         min_free: SETUP_MIN_FREE,
-        reachable_wait: std::time::Duration::from_secs(180),
+        reachable_wait: tod_sandbox::blaxel::WAKE_CEILING,
         expected_manifest,
         probe_delays,
     }
@@ -972,7 +972,7 @@ fn make_sandbox(
         sandboxes.save()?;
         // A sandbox in standby is "up" to the control plane but its workload
         // is not reachable until it has resumed.
-        bx.wait_reachable(&url, std::time::Duration::from_secs(180)).with_context(|| format!("wake {name}"))?;
+        bx.wait_reachable(&url, tod_sandbox::blaxel::WAKE_CEILING).with_context(|| format!("wake {name}"))?;
         if fork_from.is_none() {
             // An image holds only what it was built with: tod's dependencies
             // first, then its own files.
