@@ -81,6 +81,14 @@ pub enum Verdict {
     Refused(String),
 }
 
+/// The node a sandbox says it is for: its `tod-node` label, else its `TOD_NODE`
+/// variable. Blaxel masks every variable's value in its listing (all asterisks,
+/// read as absent), so the variable alone never answered on a real workspace and
+/// the automatic form refused every sandbox, labelled or not.
+fn says_node(info: &SandboxInfo) -> Option<&str> {
+    info.label("tod-node").filter(|v| !v.is_empty()).or_else(|| info.env("TOD_NODE"))
+}
+
 /// Decides whether `claimed` (what the node's old records name) is adopted,
 /// against Blaxel's `listing`. `automatic` is the stricter form that runs
 /// without the user: the sandbox must say it is this node's.
@@ -106,7 +114,7 @@ pub fn decide(node_id: &str, claimed: &[String], listing: &[SandboxInfo], automa
             ));
         }
     }
-    match info.env("TOD_NODE") {
+    match says_node(info) {
         Some(owner) if owner != node_id => {
             return Verdict::Refused(format!("sandbox {name} belongs to node {owner}, not node {node_id}; it is not adopted"));
         }
@@ -120,7 +128,7 @@ pub fn decide(node_id: &str, claimed: &[String], listing: &[SandboxInfo], automa
     }
     let rivals: Vec<&str> = listing
         .iter()
-        .filter(|s| &s.name != name && s.env("TOD_NODE") == Some(node_id) && sandbox_dead_reason(s).is_none())
+        .filter(|s| &s.name != name && says_node(s) == Some(node_id) && sandbox_dead_reason(s).is_none())
         .map(|s| s.name.as_str())
         .collect();
     if !rivals.is_empty() {
@@ -366,6 +374,26 @@ mod tests {
             volumes: Vec::new(),
             node_env: node.map(|n| vec![("TOD_NODE".to_string(), n.to_string())]).unwrap_or_default(),
         }
+    }
+
+    /// A sandbox as the live Blaxel lists it: the node is in the `tod-node`
+    /// label and the variable's value is masked.
+    fn masked(name: &str, node: &str) -> SandboxInfo {
+        let mut i = info(name, Some("node"), None, "DEPLOYED");
+        i.labels.push(("tod-node".to_string(), node.to_string()));
+        i.node_env = vec![("TOD_NODE".to_string(), "****".to_string())];
+        i
+    }
+
+    #[test]
+    fn the_node_label_counts_when_blaxel_masks_the_variable() {
+        let listing = [masked("s", NODE)];
+        assert!(matches!(decide(NODE, &names(&["s"]), &listing, true), Verdict::Adopt(_)));
+        let other = [masked("s", "someone-else")];
+        assert!(matches!(decide(NODE, &names(&["s"]), &other, true), Verdict::Refused(w) if w.contains("belongs to node someone-else")));
+        // A second sandbox labelled for the node is a rival.
+        let rival = [masked("a", NODE), masked("b", NODE)];
+        assert!(matches!(decide(NODE, &names(&["a"]), &rival, true), Verdict::Refused(w) if w.contains("also say")));
     }
 
     fn names(v: &[&str]) -> Vec<String> {
