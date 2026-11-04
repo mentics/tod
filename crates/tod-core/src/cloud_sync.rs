@@ -927,6 +927,7 @@ fn sync_once(fleet: &FleetStore, root: &Path, orch: &dyn Orchestrator, user: &st
         report.conflicts += applied.conflicts.len();
         record_conflicts(&applied.conflicts);
         record_rejects(&applied);
+        record_dropped_revivals("the orchestrator", &applied);
         state.sent_after = outbox.iter().map(|c| c.seq).max().unwrap_or(state.sent_after);
         state.save(root)?;
     }
@@ -961,6 +962,7 @@ fn sync_once(fleet: &FleetStore, root: &Path, orch: &dyn Orchestrator, user: &st
             .filter_map(|c| c.node_id)
             .collect();
         report.conflicts += applied.conflicts.len();
+        record_dropped_revivals("the orchestrator's feed", &applied);
         let _ = fleet.reload_if_stale();
     }
     state.feed_after = last;
@@ -1012,6 +1014,25 @@ fn record_rejects(applied: &sync::ApplyReport) {
             ),
         );
     }
+}
+
+/// A late update of a `cloud_nodes` row this side had removed (the node left
+/// its sandbox) was dropped, not applied (`tod_store::sync`): said, once per
+/// sync, so a sandbox that is still pushing for a node that left it is seen.
+fn record_dropped_revivals(from: &str, applied: &sync::ApplyReport) {
+    if applied.revival_dropped.is_empty() {
+        return;
+    }
+    let nodes: Vec<String> = applied.revival_dropped.iter().map(|n| n.to_string()).collect();
+    tracing::warn!(?nodes, "cloud sync: dropped a late update of a removed cloud node row from {from}");
+    crate::logging::buffer::record(
+        crate::logging::buffer::Level3::Warn,
+        crate::logging::buffer::LogSource::App,
+        format!(
+            "A late update from {from} for node(s) {} would have recorded them in a sandbox again after they left it; it was dropped, and the removal is sent on. Something in the cloud is still reporting for them.",
+            nodes.join(", ")
+        ),
+    );
 }
 
 /// Logs the changes the orchestrator reported as conflicting with its copy.

@@ -802,3 +802,37 @@ fn a_node_request_syncs_slices_and_its_consumption_comes_back() {
     let _ = std::fs::remove_dir_all(&a.root);
     let _ = std::fs::remove_dir_all(&b.root);
 }
+
+/// Migrate removes a node's `cloud_nodes` row on the app; a late update of the
+/// old row from the other side (the orchestrator marking its context, a
+/// supervisor's last push) must not insert it again naming a sandbox that is
+/// gone. The removal also reaches the other side.
+#[test]
+fn a_late_update_of_a_removed_cloud_node_row_does_not_bring_it_back() {
+    let (mut a, mut b) = pair();
+    let node = create_node(&a, None, "n");
+    crate::cloud_nodes::upsert(&a.conn(), node, "old-sandbox", "alice", 1).unwrap();
+    sync(&mut a, &mut b);
+    assert!(crate::cloud_nodes::get(&b.conn(), node).unwrap().is_some(), "the row reached the other side");
+
+    // The other side updates the row (a late push) while the app removes it.
+    crate::cloud_nodes::mark_context_changed(&b.conn(), node, 99).unwrap();
+    crate::cloud_nodes::remove(&a.conn(), node).unwrap();
+
+    // The app's removal goes up and the other side's update comes down.
+    let up = export_changes(&a.conn(), a.cursor).unwrap();
+    a.cursor = up.iter().map(|c| c.seq).max().unwrap_or(a.cursor);
+    let down = export_changes(&b.conn(), b.cursor).unwrap();
+    b.cursor = down.iter().map(|c| c.seq).max().unwrap_or(b.cursor);
+    assert!(down.iter().any(|c| c.table == "cloud_nodes"), "the update is in the feed");
+    let report = apply_changes(&mut a.conn(), &down).unwrap();
+    assert_eq!(report.revival_dropped, vec![node], "the dropped revival is reported");
+    assert!(
+        crate::cloud_nodes::get(&a.conn(), node).unwrap().is_none(),
+        "the removed row is not created again from a pull"
+    );
+    apply_changes(&mut b.conn(), &up).unwrap();
+    assert!(crate::cloud_nodes::get(&b.conn(), node).unwrap().is_none(), "the removal reached the other side");
+    let _ = std::fs::remove_dir_all(&a.root);
+    let _ = std::fs::remove_dir_all(&b.root);
+}

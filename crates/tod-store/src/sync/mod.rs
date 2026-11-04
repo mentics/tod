@@ -238,6 +238,11 @@ pub struct ApplyReport {
     /// The first few reasons, each naming the table and the error.
     #[serde(default)]
     pub reject_errors: Vec<String>,
+    /// `cloud_nodes` updates dropped because this side had removed the row
+    /// (the node left its sandbox): see [`apply_one`]. Reported loudly by the
+    /// caller; the removal wins, so a late change cannot bring the row back.
+    #[serde(default)]
+    pub revival_dropped: Vec<Uuid>,
 }
 
 /// How many reject reasons an [`ApplyReport`] carries.
@@ -690,6 +695,26 @@ fn apply_one(
     }
     let info = &infos[&change.table];
     let found = current_row(&tx, &change.table, info, &change.key)?;
+    // A `cloud_nodes` row is removed when a node leaves its sandbox (Migrate,
+    // Delete), and the removal must win: a late update of the old row (the
+    // supervisor's last push, the orchestrator marking its context) would
+    // otherwise insert it again, naming a sandbox that is gone. An update of
+    // a row this side no longer has is dropped and reported; an insert (the
+    // row's first appearance, `before` empty) still applies.
+    if change.table == crate::cloud_nodes::TABLE && found.is_none() && change.before.is_some() && change.after.is_some()
+    {
+        if let Some(node) = change.node_id {
+            report.revival_dropped.push(node);
+        }
+        report.conflicts.push(Conflict {
+            node_id: change.node_id,
+            table: change.table.clone(),
+            key: change.key.clone(),
+            expected: change.before.clone(),
+            found: None,
+        });
+        return Ok(());
+    }
     let was_parked = parked.iter().any(|(t, k)| *t == change.table && *k == change.key);
     if !was_parked && !same_content(&found, &change.before) && !same_content(&found, &change.after) {
         report.conflicts.push(Conflict {
