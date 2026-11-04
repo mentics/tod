@@ -39,17 +39,28 @@ pub struct Sandboxes {
     pub root: PathBuf,
     pub config_path: PathBuf,
     pub config: Config,
+    /// The file as it was when loaded or last saved: what [`Self::save`]
+    /// measures this copy's changes against.
+    saved: Config,
 }
 
 impl Sandboxes {
     pub fn load(root: &Path) -> Result<Self> {
         let config_path = root.join(config::FILE_NAME);
         let config = Config::load(&config_path)?;
-        Ok(Self { root: root.to_path_buf(), config_path, config })
+        Ok(Self { root: root.to_path_buf(), config_path, saved: config.clone(), config })
     }
 
-    pub fn save(&self) -> Result<()> {
-        self.config.save(&self.config_path)
+    /// Saves what this copy changed since it was loaded (or last saved) onto
+    /// the file as it is now, so another writer's entries (a `golden
+    /// refresh` during a creation that takes minutes, another app on the
+    /// root) are never put back to what this copy loaded; this copy then
+    /// holds the merged result. See `Config::save_changes`.
+    pub fn save(&mut self) -> Result<()> {
+        let merged = self.config.save_changes(&self.saved, &self.config_path)?;
+        self.saved = merged.clone();
+        self.config = merged;
+        Ok(())
     }
 
     /// The databases nodes may log in to through this machine, as declared.
@@ -1183,6 +1194,32 @@ mod tests {
             assert!(validate_name(&name).is_ok(), "{slug:?} -> {name:?}");
         }
         assert_eq!(suggested_name("fix-login"), "fix-login");
+    }
+
+    #[test]
+    fn a_creation_that_takes_minutes_does_not_put_back_a_golden_changed_meanwhile() {
+        let root = std::env::temp_dir().join(format!("tod-sbx-race-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut seed = Sandboxes::load(&root).unwrap();
+        seed.config.blaxel = Some(Account::new("w"));
+        seed.config.blaxel.as_mut().unwrap().set_golden("a/b", "golden-old");
+        seed.save().unwrap();
+
+        // The creator loads; `golden refresh` (another Sandboxes, as another process) changes the golden.
+        let mut creator = Sandboxes::load(&root).unwrap();
+        let mut refresher = Sandboxes::load(&root).unwrap();
+        refresher.config.blaxel.as_mut().unwrap().set_golden("a/b", "golden-new");
+        refresher.save().unwrap();
+
+        creator.config.upsert(config::Sandbox { name: "tod-x-abc123".into(), image: "i".into(), url: None, agents: true });
+        creator.save().unwrap();
+
+        let back = Sandboxes::load(&root).unwrap();
+        assert_eq!(back.config.blaxel.as_ref().unwrap().goldens.get("a/b").map(String::as_str), Some("golden-new"));
+        assert!(back.config.sandbox("tod-x-abc123").is_some());
+        // The creator now sees the refreshed golden too.
+        assert_eq!(creator.config.blaxel.as_ref().unwrap().goldens.get("a/b").map(String::as_str), Some("golden-new"));
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

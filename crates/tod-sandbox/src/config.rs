@@ -33,7 +33,7 @@ pub enum AuthMode {
     ApiKey,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Account {
     pub workspace: String,
     #[serde(default = "default_region")]
@@ -354,7 +354,7 @@ fn default_memory() -> u32 {
     4096
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Sandbox {
     pub name: String,
     pub image: String,
@@ -394,7 +394,7 @@ impl SchedulerKind {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default)]
     pub blaxel: Option<Account>,
@@ -435,6 +435,89 @@ impl Config {
             let _ = std::fs::remove_file(&tmp);
             anyhow::Error::new(err).context(format!("write {}", path.display()))
         })
+    }
+
+    /// Writes only what this copy changed since `base` (the file as it was
+    /// loaded or last saved) onto the file as it is *now*, and returns the
+    /// result, so a writer never overwrites an entry another writer changed
+    /// meanwhile (a sandbox made over minutes, a `golden refresh`, the
+    /// daemon): each sandbox, golden, database and account field is its
+    /// writer's own key, and a key this copy did not change is whatever the
+    /// file has. The read-merge-write holds an exclusive lock on
+    /// `sandboxes.toml.lock`, so two writers at once are serialized, and the
+    /// file is replaced atomically ([`Self::save`]).
+    pub fn save_changes(&self, base: &Config, path: &Path) -> Result<Config> {
+        let lock_path = path.with_extension("toml.lock");
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&lock_path)
+            .with_context(|| format!("open {}", lock_path.display()))?;
+        lock.lock().with_context(|| format!("lock {}", lock_path.display()))?;
+        let mut fresh = Config::load(path)?;
+        fresh.apply_changes(base, self);
+        // The lock is released when `lock` drops, after the rename.
+        fresh.save(path)?;
+        drop(lock);
+        Ok(fresh)
+    }
+
+    /// Applies to `self` what `mine` changed relative to `base`.
+    fn apply_changes(&mut self, base: &Config, mine: &Config) {
+        if mine.scheduler != base.scheduler {
+            self.scheduler = mine.scheduler;
+        }
+        for s in &mine.sandboxes {
+            if base.sandbox(&s.name) != Some(s) {
+                self.upsert(s.clone());
+            }
+        }
+        for s in &base.sandboxes {
+            if mine.sandbox(&s.name).is_none() {
+                self.sandboxes.retain(|f| f.name != s.name);
+            }
+        }
+        for d in &mine.databases {
+            if !base.databases.contains(d) {
+                match self.databases.iter_mut().find(|f| f.name == d.name) {
+                    Some(f) => *f = d.clone(),
+                    None => self.databases.push(d.clone()),
+                }
+            }
+        }
+        for d in &base.databases {
+            if !mine.databases.iter().any(|m| m.name == d.name) {
+                self.databases.retain(|f| f.name != d.name);
+            }
+        }
+        if mine.blaxel == base.blaxel {
+            return;
+        }
+        match (&mut self.blaxel, &mine.blaxel, &base.blaxel) {
+            (slot, None, _) => *slot = None,
+            (slot @ None, Some(m), _) => *slot = Some(m.clone()),
+            (Some(f), Some(m), None) => *f = m.clone(),
+            (Some(f), Some(m), Some(b)) => {
+                macro_rules! field {
+                    ($($name:ident),*) => {$( if m.$name != b.$name { f.$name = m.$name.clone(); } )*};
+                }
+                field!(
+                    workspace, region, auth, default_image, memory_mb, owner, claude_token_via, orchestrator,
+                    orchestrator_volume, node_base, golden, forwards
+                );
+                for (repo, g) in &m.goldens {
+                    if b.goldens.get(repo) != Some(g) {
+                        f.goldens.insert(repo.clone(), g.clone());
+                    }
+                }
+                for repo in b.goldens.keys() {
+                    if !m.goldens.contains_key(repo) {
+                        f.goldens.remove(repo);
+                    }
+                }
+            }
+        }
     }
 
     pub fn sandbox(&self, name: &str) -> Option<&Sandbox> {
@@ -588,6 +671,73 @@ claude_token_via = \"env\"
         assert_eq!(acct.orchestrator, "orch-2");
         assert_eq!(acct.orchestrator_volume.as_deref(), Some("orch-data"));
         assert_eq!(acct.node_base.as_deref(), Some("base"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn interleaved_writers_each_change_only_their_own_keys() {
+        let dir = std::env::temp_dir().join(format!("tod-sandbox-merge-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(FILE_NAME);
+        let mut start = Config::default();
+        start.blaxel = Some(Account::new("w"));
+        start.blaxel.as_mut().unwrap().set_golden("a/b", "golden-old");
+        start.save(&path).unwrap();
+
+        // A slow writer (making a sandbox) loads, and a quick one (golden
+        // refresh) writes in the middle of it.
+        let slow_base = Config::load(&path).unwrap();
+        let mut slow = slow_base.clone();
+        let mut quick = Config::load(&path).unwrap();
+        let quick_base = quick.clone();
+        quick.blaxel.as_mut().unwrap().set_golden("a/b", "golden-new");
+        quick.blaxel.as_mut().unwrap().set_golden("c/d", "golden-cd");
+        quick.save_changes(&quick_base, &path).unwrap();
+
+        slow.upsert(Sandbox { name: "node".into(), image: "i".into(), url: Some("u".into()), agents: true });
+        let merged = slow.save_changes(&slow_base, &path).unwrap();
+
+        let on_disk = Config::load(&path).unwrap();
+        assert_eq!(on_disk, merged);
+        let acct = on_disk.blaxel.unwrap();
+        assert_eq!(acct.goldens.get("a/b").map(String::as_str), Some("golden-new"), "the slow writer put the old golden back");
+        assert_eq!(acct.goldens.get("c/d").map(String::as_str), Some("golden-cd"));
+        assert!(on_disk.sandboxes.iter().any(|s| s.name == "node"));
+
+        // And the other way round: a removal by one writer survives the other's add.
+        let base = Config::load(&path).unwrap();
+        let mut remover = base.clone();
+        let mut adder = base.clone();
+        remover.sandboxes.retain(|s| s.name != "node");
+        adder.upsert(Sandbox { name: "other".into(), image: "i".into(), url: None, agents: true });
+        remover.save_changes(&base, &path).unwrap();
+        adder.save_changes(&base, &path).unwrap();
+        let names: Vec<_> = Config::load(&path).unwrap().sandboxes.into_iter().map(|s| s.name).collect();
+        assert_eq!(names, vec!["other".to_string()]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn many_threads_saving_at_once_lose_no_key() {
+        let dir = std::env::temp_dir().join(format!("tod-sandbox-threads-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(FILE_NAME);
+        Config::default().save(&path).unwrap();
+        let handles: Vec<_> = (0..8)
+            .map(|i| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    let base = Config::load(&path).unwrap();
+                    let mut mine = base.clone();
+                    mine.upsert(Sandbox { name: format!("s{i}"), image: "i".into(), url: None, agents: true });
+                    mine.save_changes(&base, &path).unwrap();
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(Config::load(&path).unwrap().sandboxes.len(), 8);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

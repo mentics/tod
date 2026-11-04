@@ -1088,14 +1088,18 @@ fn discard_failed_sandbox(
     if std::env::var_os("TOD_KEEP_FAILED_SANDBOX").is_some() {
         return err.context(format!("{name} was kept (TOD_KEEP_FAILED_SANDBOX)"));
     }
-    let deleted = (|| -> Result<()> {
+    // Whether Blaxel had a sandbox of that name to delete: a fork or create
+    // that failed before Blaxel made one leaves nothing, and the message must
+    // not say it was deleted.
+    let deleted = (|| -> Result<bool> {
         if bx.get(name)?.is_some() {
             sandboxes.delete(bx, name)?;
+            return Ok(true);
         }
-        Ok(())
+        Ok(false)
     })();
     let cleaned = match deleted {
-        Ok(()) => {
+        Ok(existed) => {
             let forgotten = (|| -> Result<()> {
                 if recorded {
                     fleet.enqueue(FleetMutation::DeleteFilesLocation { node_id: node_id.to_string() })?;
@@ -1105,8 +1109,10 @@ fn discard_failed_sandbox(
                 super::sandbox_host::host()?.clear_intent(root, node_id)
             })();
             match forgotten {
-                Ok(()) => format!("{name} was deleted so the next launch makes a fresh one"),
-                Err(e) => format!("{name} was deleted but its record could not be cleared ({e:#})"),
+                Ok(()) if existed => format!("{name} was deleted so the next launch makes a fresh one"),
+                Ok(()) => format!("{name} was never made (Blaxel has no sandbox of that name), so nothing was deleted; the next launch makes a fresh one"),
+                Err(e) if existed => format!("{name} was deleted but its record could not be cleared ({e:#})"),
+                Err(e) => format!("{name} was never made, but its record could not be cleared ({e:#})"),
             }
         }
         Err(e) => format!(
