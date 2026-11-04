@@ -94,6 +94,15 @@ pub enum WaitKind {
   just `next_check_ms` on an `Others` wait. Staleness is an age threshold
   applied when drawing (see "Showing it"), with nothing recorded.
 
+### A `done` node whose sandbox could not be deleted
+
+`done` is `Done` except while the daemon's automatic delete of the node's
+sandbox keeps failing (`tod_store::node_problems`, kind `sandbox_retire`):
+while it retries the node is `Others` with the attempt count and the error
+(it needs nobody, but a running sandbox must not read as finished); after the
+last attempt it is `You::Failed` with the error, once (the record then stops
+changing, so a deferral holds). Deleting the sandbox from the menu clears it.
+
 ### `Working`, `Done`
 
 `Working` is a conversation running or an autopilot run in an agent turn.

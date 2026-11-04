@@ -261,5 +261,8 @@ draft PR Cofactr/workspace#192). A's plan step was changed to three foreground
     the retire runs, nothing drains it, so the only trace is the WARN line in `daemon/agentd.log`
     (and the retries). A node with a stuck sandbox shows "done" with no error. A fix needs a
     place on the node for such a problem (not just a conversation turn); not designed here.
+    **Fixed after this pass:** a failed delete is recorded on the node (`node_problems`, schema
+    v94), shown in the task panel, and counted by `next_actor` (see
+    [implementation.md](implementation.md), "Node problems"). Not re-run live.
 11. The runner menu's facts (e.g. "Adopt existing sandbox") did not refresh after a direct
     database change until the node was selected again (only for out-of-band edits, not a product path).

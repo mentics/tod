@@ -426,8 +426,9 @@ What landed, and where it departs from the text below:
   the old sync-time final-phase delete), `db_broker`, the task panel's line and
   menu, and the lost/reinstall check (`lost::located_rows`). `CloudNode` no
   longer has a `sandbox` field.
-- Reported, never fixed silently: `located_rows` reports (once per message, to
-  the node's problems) a row whose copy differs from its location, naming
+- Reported, never fixed silently: `located_rows` reports (once per message, on
+  the node: `node_problems`, kind `cloud_record`, cleared when the row agrees
+  with its location or no longer applies) a row whose copy differs from its location, naming
   both, and a live row of this client's whose node has no location sandbox;
   neither is acted on. A lost row, a user-deleted one and another client's are
   skipped without a word.
@@ -455,9 +456,9 @@ retire_due_with}`; the delete is `lost::delete_node_sandbox` (the menu's), and
 nothing. The daemon's `watch_done_sandboxes` thread runs a pass 30 s after
 start (`sync_on_start` runs in parallel and pulls first in practice; a node it
 brings in is caught by the next pass) and then every minute, instead of the
-commit hook below (a pass is one read). A failure goes to the node's problems
-and the app log and is retried after 1, 5, 15 and 60 minutes, then stops until
-the daemon restarts, saying so. `lost::delete_sandboxes_at_final_phase` and
+commit hook below (a pass is one read). A failure is recorded on the node
+(`tod_store::node_problems`, below) and the app log and is retried after 1, 5,
+15 and 60 minutes, then stops until the daemon restarts, saying so. `lost::delete_sandboxes_at_final_phase` and
 its call in `sync_once` are removed. The runner check is `lost::runner_blocker`
 (a live `run` lease or live supervisor heartbeat). The plan as written:
 
@@ -511,7 +512,8 @@ its call in `sync_once` are removed. The runner check is `lost::runner_blocker`
   reported, never changed; no checkout is touched.
 - Refusals, an unanswering relay and ambiguity are errors naming what failed
   (the panel's red note). At start the same failures are reported to the
-  node's problems and left for the menu entry. `find_sandbox_checkout` is now
+  node's problems (`node_problems`, kind `adopt`, cleared by a later adoption)
+  and left for the menu entry. `find_sandbox_checkout` is now
   the one probe `reuse_sandbox`, `make_sandbox` and adoption share.
 - Not verified live (no Blaxel here): `Live` (the relay manifest and checkout
   probe through a real sandbox).
@@ -555,6 +557,60 @@ it minutes earlier (`Config::save_changes`: each writer saves only the keys it
 changed onto the file as it is now, under a lock; seen twice live as the golden
 mapping going back to a deleted golden), and the failure text after a fork that
 was never made no longer says the sandbox "was deleted".
+
+### Node problems: where a background failure shows (schema v94)
+
+`session_log::report_problem` fills a per-process list that only a
+conversation driver drains, only into an existing conversation. In the daemon
+nothing drains it, so a failed delete at `done` was a WARN line in
+`daemon/agentd.log` and nothing else (live check pass 4, item 10). A failure
+that happens off any turn of the user's now goes on the node:
+
+- **Store:** `tod_store::node_problems`, table `node_problems`, one row per
+  (node, kind): `message`, `attempts`, `max_attempts`, `next_retry_at`,
+  `gave_up`, `first_at`, `updated_at`. Kinds: `sandbox_retire`, `adopt`,
+  `cloud_record`. `FleetMutation::RecordNodeProblem` / `ClearNodeProblem`;
+  `tod_core::node_problems::{record, report, clear, for_node}` are the callers'
+  helpers (`report` says nothing new, and writes nothing, for the same message
+  again, so a check after every sync does not wake the views). Rows cascade
+  with the node.
+- **Schema, sync, orchestrator:** `CURRENT_USER_VERSION` is 94, an idempotent
+  step that creates the table and its `journey_changes` triggers (also made
+  sure of on every open, like the deferrals table). The table is
+  **machine-local and not in `SYNCED_TABLES`**: nothing about what is synced
+  changes and the orchestrator never reads it. **But the version number is
+  part of the sync contract** (`sync::contract`: `schema` is the fleet
+  database's `user_version`), so an orchestrator deployed at schema 93 answers
+  a 94 client with a 426 until it is redeployed (the app does that itself, or
+  `tod-sandbox orchestrator`); sandboxes' supervisors on an older build are
+  judged "older" and need the usual reinstall. The deferrals table avoided
+  this by being created in the idempotent block with no bump; if a redeploy is
+  unwanted for this change, dropping the `version < 94` step and the bump
+  (the table is still created on every open) is the alternative.
+- **Sandbox retire:** every failed attempt records attempts so far, the total
+  (the first try plus one per back-off), the next retry time and, after the
+  last, `gave_up` with the sentence "not tried again until the daemon
+  restarts; Delete sandbox in the task panel's menu still works". The attempt
+  schedule itself stays in the daemon's memory, so a restart tries again at
+  once (the row is then updated from attempt 1). A success, or the node no
+  longer being due (the sandbox deleted from the menu, the setting turned
+  off, the node moved back), clears the row.
+- **`next_actor`:** a `done` node with a `sandbox_retire` row is no longer
+  plain `Done`. While the daemon still retries it is `Others` (the wait's
+  `retry` carries the attempt, the maximum and the error; `next_check_ms` the
+  next try): it needs nobody, but is not hidden. After the last attempt it is
+  `You::Failed` with the error, since the first failure: the sandbox is a
+  running cost only the user can now clear (Delete sandbox). The row does not
+  change again until the daemon restarts, so a deferral holds and the `You`
+  list is not woken per attempt. Other kinds never change the actor.
+- **Task panel:** the runner line already shows the standing; beneath it
+  `render_problems` lists each recorded problem as selectable text with a
+  second line "Attempt n of m: next try in …" or the give-up sentence.
+- **Not converted:** the log-copy failures in `session_log` itself ("Could not
+  keep ...'s agent session log", "The agent session log copy did not start")
+  and `conversation::problems::or_report` still use `report_problem`: they
+  happen where a conversation driver is draining the list (the app, in a
+  conversation), unlike the daemon-side reports above.
 
 ### What remains
 

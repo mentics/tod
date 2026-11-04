@@ -122,7 +122,8 @@ place. The driver now closes it and resumes the same session in the new one
 the agent's session continues in …", or an error when the session's log could
 not be brought). Also, a node whose files cannot be made used to fall back to
 a scratch directory silently; it is now an error in the transcript and the
-turn is not sent. Failed background log copies (`session_log::take_problems`)
+turn is not sent. Failed background log copies (`session_log::take_problems`; the daemon-side
+failures go on the node instead, `tod_store::node_problems`)
 and an unreadable Agent capability or settings file are errors the user sees
 too, rather than log lines.
 
