@@ -55,8 +55,20 @@ impl Service {
         Self {
             root,
             databases: Box::new(move || databases(&databases_root)),
+            // The node's Files location is the one record of its sandbox: a
+            // node this machine has no location for is not this machine's to
+            // answer for (the `cloud_nodes` copy is not read).
             sandbox_of: Box::new(move |node| {
-                cloud_sync::cloud_node(&fleet, node).filter(|c| c.lost_at.is_none()).map(|c| c.sandbox)
+                if cloud_sync::cloud_node(&fleet, node).is_some_and(|c| c.lost_at.is_some()) {
+                    return None;
+                }
+                match cloud_sync::cloud_sandbox_if_any(&fleet, node) {
+                    Ok(sandbox) => sandbox,
+                    Err(err) => {
+                        tracing::warn!("db broker: reading node {node}'s sandbox: {err:#}");
+                        None
+                    }
+                }
             }),
             orchestrator: Box::new(move || cloud_sync::resolve(&orchestrator_root)),
         }

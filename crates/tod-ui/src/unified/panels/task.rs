@@ -186,6 +186,8 @@ struct RunnerLine {
     ticking: bool,
     /// Set when the node has a cloud row: its supervisor is its runner.
     cloud: Option<CloudNode>,
+    /// The sandbox its Files location records (the one record of it).
+    cloud_sandbox: Option<String>,
     /// A job of the panel's own (Start, Sync now, Delete sandbox…) is in
     /// progress, and what it is doing.
     cloud_busy: Option<&'static str>,
@@ -236,6 +238,7 @@ impl Prompt {
 struct RunnerFacts {
     lifecycle: String,
     cloud: Option<CloudNode>,
+    cloud_sandbox: Option<String>,
     place: Option<Place>,
     supervised: bool,
     has_checkout: bool,
@@ -282,11 +285,13 @@ fn load_place(fleet: &FleetStore, node_id: Uuid, facts: &mut RunnerFacts) -> any
     facts.locations = tod_store::fleet::places::list(fleet).context("list the locations")?;
     facts.current_location = files.as_ref().and_then(|f| f.place_id.clone());
     let sandbox_made = location.as_ref().and_then(|l| l.sandbox().map(str::to_string));
+    facts.cloud_sandbox = sandbox_made.clone();
     let (place, text) = match files.as_ref().and_then(|files| files.dev_container.as_ref()) {
         Some(dev) if dev.sandbox => {
             // The sandbox is made when something first needs the node's
             // files, so it can exist before the runner is started.
-            let exists = sandbox_made.is_some() || facts.cloud.is_some();
+            // Only the node's Files location says which sandbox it has.
+            let exists = sandbox_made.is_some();
             let text = match &sandbox_made {
                 Some(name) => format!("sandbox {name}"),
                 None => "cloud sandbox, not made yet".to_string(),
@@ -724,6 +729,7 @@ impl TaskPanel {
                 if this.node_id == node_id {
                     this.runner.lifecycle = facts.lifecycle;
                     this.runner.cloud = facts.cloud;
+                    this.runner.cloud_sandbox = facts.cloud_sandbox;
                     this.runner.place = facts.place;
                     this.runner.supervised = facts.supervised;
                     this.runner.has_checkout = facts.has_checkout;
@@ -1514,7 +1520,10 @@ impl TaskPanel {
             line = line.child(self.render_phase_chip(cx));
         }
         if let Some(cloud) = &self.runner.cloud {
-            let mut text = format!("in the cloud (sandbox {})", cloud.sandbox);
+            let mut text = match &self.runner.cloud_sandbox {
+                Some(sandbox) => format!("in the cloud (sandbox {sandbox})"),
+                None => "in the cloud (its Files location records no sandbox)".to_string(),
+            };
             // While the app is making the replacement the standing says
             // working; the stale "deleted, run it" note would contradict it.
             let replacing = standing.as_ref().is_some_and(|s| matches!(s.actor, NextActor::Working { .. }));
@@ -1978,7 +1987,6 @@ mod tests {
             view.runner.place = Some(Place::Sandbox { exists: true });
             view.runner.supervised = true;
             view.runner.cloud = Some(CloudNode {
-                sandbox: "sb".into(),
                 user: "alice".into(),
                 accepted_at_ms: 1,
                 lost_at: None,

@@ -567,17 +567,10 @@ fn node_session_ids(fleet: &super::FleetStore, node_id: &str) -> Result<Vec<Stri
 }
 
 /// The sandbox `node_id` works in now: the one its Files location records,
-/// else the one its `cloud_nodes` row names (a sandbox the cloud start made
-/// leaves no location row) unless that one is marked lost.
+/// the one record of it (`cloud_nodes` holds only a copy for the
+/// orchestrator).
 pub fn node_sandbox(fleet: &super::FleetStore, node_id: &str) -> Result<Option<String>> {
-    if let Some(location) = super::provision::node_location(fleet, node_id)?
-        && let Some(sandbox) = location.sandbox()
-    {
-        return Ok(Some(sandbox.to_string()));
-    }
-    let uuid = uuid::Uuid::parse_str(node_id).with_context(|| format!("node id {node_id}"))?;
-    let row = fleet.read(|conn| crate::cloud_nodes::get(conn, uuid))?;
-    Ok(row.filter(|r| r.lost_at.is_none()).map(|r| r.sandbox))
+    Ok(super::provision::node_location(fleet, node_id)?.and_then(|l| l.sandbox().map(str::to_string)))
 }
 
 /// For a node entering sandbox `sandbox`: sends the runner state
@@ -679,11 +672,11 @@ pub fn keep_session_in_background(
 mod tests {
     use super::*;
 
-    /// Live: a sandbox the cloud start made has a `cloud_nodes` row and no
-    /// Files location row, so Migrate saw nothing to keep or remove. The
-    /// node's sandbox is the row's, unless it is marked lost.
+    /// Live: Migrate saw nothing to keep or remove for a node whose sandbox
+    /// only its `cloud_nodes` row named. The Files location is the one record:
+    /// the node's sandbox is the location's, and a row's copy decides nothing.
     #[test]
-    fn a_sandbox_only_the_cloud_row_names_is_the_nodes_sandbox() {
+    fn the_nodes_sandbox_is_the_one_its_files_location_records() {
         use crate::fleet::test_util::{cleanup_fleet_root, temp_fleet_root};
         let root = temp_fleet_root();
         let fleet = crate::fleet::FleetStore::open(&root).unwrap();
@@ -709,13 +702,115 @@ mod tests {
         crate::cloud_nodes::upsert(&conn, node, "node-x", "alice", 1).unwrap();
         drop(conn);
         fleet.reload_if_stale().ok();
-        assert_eq!(node_sandbox(&fleet, &id).unwrap().as_deref(), Some("node-x"));
+        assert_eq!(node_sandbox(&fleet, &id).unwrap(), None, "a cloud row's copy is not the record");
 
-        let conn = rusqlite::Connection::open(root.join("tod.db")).unwrap();
-        crate::cloud_nodes::mark_lost(&conn, node, 2).unwrap();
-        drop(conn);
+        fleet
+            .enqueue(crate::fleet::FleetMutation::RecordFilesLocation {
+                location: crate::fleet::FilesLocation {
+                    node_id: id.clone(),
+                    source_node_id: id.clone(),
+                    recipe: String::new(),
+                    repo: None,
+                    container: None,
+                    worktree_path: None,
+                    worktree_lease_id: None,
+                    worktree_lease_holder: None,
+                    sandbox: Some("node-y".into()),
+                    created_at: 0,
+                },
+            })
+            .unwrap();
+        fleet.writer().flush().unwrap();
         fleet.reload_if_stale().ok();
-        assert_eq!(node_sandbox(&fleet, &id).unwrap(), None, "a lost sandbox is not kept or removed");
+        assert_eq!(node_sandbox(&fleet, &id).unwrap().as_deref(), Some("node-y"));
+        // The row's copy followed the location in the same transaction.
+        let row = fleet.read(|c| crate::cloud_nodes::get(c, node)).unwrap().unwrap();
+        assert_eq!(row.sandbox, "node-y");
+        drop(fleet);
+        cleanup_fleet_root(&root);
+    }
+
+    /// The `cloud_nodes.sandbox` copy is written only from the node's Files
+    /// location: the app's upsert fails without one and reads its name, a
+    /// replacement or recreate (a new location record) moves an existing
+    /// row's copy in the same transaction, and removing the location drops
+    /// the row with it.
+    #[test]
+    fn the_cloud_row_copy_follows_the_files_location() {
+        use crate::fleet::test_util::{cleanup_fleet_root, temp_fleet_root};
+        use crate::fleet::{FilesLocation, FleetMutation};
+        use crate::outline::{CreatePosition, OutlineMutation};
+        let root = temp_fleet_root();
+        let fleet = crate::fleet::FleetStore::open(&root).unwrap();
+        fleet.enqueue_outline(OutlineMutation::CreateList { slug: "t".into(), title: "T".into() }).unwrap();
+        let list_id = fleet.list_outline_lists().unwrap()[0].id;
+        let node = uuid::Uuid::new_v4();
+        fleet
+            .enqueue_outline(OutlineMutation::CreateNode {
+                node_id: Some(node),
+                list_id,
+                parent_id: None,
+                anchor_id: None,
+                position: CreatePosition::Below,
+                title: "N".into(),
+            })
+            .unwrap();
+        fleet.writer().flush().unwrap();
+        let id = node.to_string();
+        let locate = |sandbox: &str| {
+            fleet
+                .enqueue(FleetMutation::RecordFilesLocation {
+                    location: FilesLocation {
+                        node_id: id.clone(),
+                        source_node_id: id.clone(),
+                        recipe: String::new(),
+                        repo: None,
+                        container: None,
+                        worktree_path: None,
+                        worktree_lease_id: None,
+                        worktree_lease_holder: None,
+                        sandbox: Some(sandbox.into()),
+                        created_at: 0,
+                    },
+                })
+                .unwrap();
+            fleet.writer().flush().unwrap();
+        };
+        let copy = || fleet.read(|c| crate::cloud_nodes::get(c, node)).unwrap();
+
+        // No location, no row: the upsert refuses and names why.
+        let refused = fleet
+            .enqueue(FleetMutation::CloudNodeUpsert { node, user: "alice".into(), accepted_at: 1 })
+            .map(|_| fleet.writer().flush());
+        let err = match refused {
+            Err(err) => format!("{err:#}"),
+            Ok(Err(err)) => format!("{err:#}"),
+            Ok(Ok(())) => String::new(),
+        };
+        assert!(err.contains("Files location names no sandbox"), "{err:?}");
+        assert!(copy().is_none());
+
+        // Recorded from the location.
+        locate("node-1");
+        fleet.enqueue(FleetMutation::CloudNodeUpsert { node, user: "alice".into(), accepted_at: 1 }).unwrap();
+        fleet.writer().flush().unwrap();
+        fleet.reload_if_stale().unwrap();
+        assert_eq!(copy().unwrap().sandbox, "node-1");
+
+        // A replacement or a recreate records a new location: the copy follows
+        // and keeps the row's marks.
+        fleet.enqueue(FleetMutation::CloudNodeMarkLost { node, at: 5 }).unwrap();
+        fleet.writer().flush().unwrap();
+        locate("node-2");
+        fleet.reload_if_stale().unwrap();
+        let row = copy().unwrap();
+        assert_eq!((row.sandbox.as_str(), row.lost_at), ("node-2", Some(5)));
+
+        // Removing the location removes the copy with it.
+        let location = super::super::provision::node_location(&fleet, &id).unwrap().unwrap();
+        super::super::provision::forget_removed_location(&fleet, &id, &location).unwrap();
+        assert!(copy().is_none());
+        assert!(super::super::provision::node_location(&fleet, &id).unwrap().is_none());
         drop(fleet);
         cleanup_fleet_root(&root);
     }

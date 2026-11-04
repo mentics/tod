@@ -64,7 +64,7 @@ fn state_round_trips_and_defaults_when_missing() {
     let root = temp_root("state");
     assert_eq!(CloudSyncState::load(&root).unwrap(), CloudSyncState::default());
     let mut s = CloudSyncState { seeded: true, sent_after: 3, feed_after: 9, ..Default::default() };
-    s.nodes.insert("n".into(), CloudNode { sandbox: "node-n".into(), user: "u".into(), accepted_at_ms: 1, lost_at: None });
+    s.nodes.insert("n".into(), LegacyCloudNode { sandbox: "node-n".into(), user: "u".into(), accepted_at_ms: 1, lost_at: None });
     s.save(&root).unwrap();
     assert_eq!(CloudSyncState::load(&root).unwrap(), s);
     let _ = std::fs::remove_dir_all(&root);
@@ -474,8 +474,25 @@ fn a_cloud_node_is_working_only_while_its_supervisor_is_beating() {
     }
     fleet.writer().flush().unwrap();
     for id in &ids {
+        // The row's sandbox comes from the node's Files location.
         fleet
-            .enqueue(FleetMutation::CloudNodeUpsert { node: *id, sandbox: "s".into(), user: "u".into(), accepted_at: 1 })
+            .enqueue(FleetMutation::RecordFilesLocation {
+                location: tod_store::fleet::FilesLocation {
+                    node_id: id.to_string(),
+                    source_node_id: id.to_string(),
+                    recipe: String::new(),
+                    repo: None,
+                    container: None,
+                    worktree_path: None,
+                    worktree_lease_id: None,
+                    worktree_lease_holder: None,
+                    sandbox: Some("s".into()),
+                    created_at: 0,
+                },
+            })
+            .unwrap();
+        fleet
+            .enqueue(FleetMutation::CloudNodeUpsert { node: *id, user: "u".into(), accepted_at: 1 })
             .unwrap();
     }
     fleet.writer().flush().unwrap();
