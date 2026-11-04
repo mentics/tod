@@ -180,6 +180,10 @@ struct RunnerLine {
     place_text: String,
     /// Reading the store for the above failed: shown on the line.
     load_error: Option<String>,
+    /// The node's recorded background problems (`tod_store::node_problems`):
+    /// failures that happened off any turn of the user's, such as the
+    /// daemon's delete of this node's sandbox at `done`.
+    problems: Vec<tod_store::node_problems::NodeProblem>,
     /// `(slot id, ms)`: the running slot and when it was first seen running.
     run_since: Option<(u64, i64)>,
     /// The status has an elapsed time, so the ticker re-renders each second.
@@ -250,6 +254,7 @@ struct RunnerFacts {
     locations: Vec<tod_store::fleet::FilesPlace>,
     current_location: Option<String>,
     place_text: String,
+    problems: Vec<tod_store::node_problems::NodeProblem>,
     error: Option<String>,
 }
 
@@ -268,6 +273,13 @@ fn load_runner(fleet: &FleetStore, node_id: Uuid) -> RunnerFacts {
         .map(|n| n.lifecycle)
         .unwrap_or_default();
     facts.cloud = tod_core::cloud_sync::cloud_node(fleet, &id);
+    match tod_core::node_problems::for_node(fleet, node_id) {
+        Ok(problems) => facts.problems = problems,
+        Err(err) => {
+            tracing::error!("could not read the problems of node {node_id}: {err:#}");
+            facts.error = Some(format!("Could not read this node's problems: {err:#}"));
+        }
+    }
     match load_place(fleet, node_id, &mut facts) {
         Ok(()) => {}
         Err(err) => {
@@ -765,6 +777,7 @@ impl TaskPanel {
                     this.runner.current_location = facts.current_location;
                     this.runner.place_text = facts.place_text;
                     this.runner.load_error = facts.error;
+                    this.runner.problems = facts.problems;
                     cx.notify();
                 }
             });
@@ -1638,6 +1651,7 @@ impl TaskPanel {
                 line = line.child(sep()).child(el.child(selectable_text("unified-task-runner-note", note, window, cx)));
             }
         }
+        let problems = self.render_problems(window, cx);
         let actions = self.runner_actions(live.as_ref(), cx);
         let node = self.node_id;
         let watch = self.watch_target(cx).map(|_| {
@@ -1670,9 +1684,41 @@ impl TaskPanel {
             .gap_y_2()
             .child(line)
             .children(extra_note)
+            .children(problems)
             .children(prompt)
             .child(buttons);
         Some(line.into_any_element())
+    }
+
+    /// The node's recorded background problems, one block each: what failed
+    /// and why (selectable: it is data), then, for a job that retries, the
+    /// attempt and the next try, or that it will not try again and what to do.
+    fn render_problems(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if self.runner.problems.is_empty() {
+            return None;
+        }
+        let now = now_ms();
+        let mut block = div().id("unified-task-problems").w_full().flex().flex_col().gap_1();
+        for (ix, problem) in self.runner.problems.iter().enumerate() {
+            let status = problem_status(problem, now);
+            let message = div().w_full();
+            let message = if problem.gave_up { style::text_error(message) } else { style::text_muted(message) };
+            block = block.child(message.child(selectable_text(
+                SharedString::from(format!("unified-task-problem-{ix}")),
+                problem.message.clone(),
+                window,
+                cx,
+            )));
+            if let Some(status) = status {
+                block = block.child(style::text_muted(div().w_full().pl(gpui::px(12.))).child(selectable_text(
+                    SharedString::from(format!("unified-task-problem-status-{ix}")),
+                    status,
+                    window,
+                    cx,
+                )));
+            }
+        }
+        Some(block.into_any_element())
     }
 
     /// T4: the requests waiting on the user, oldest first — the only part
@@ -1755,6 +1801,26 @@ impl Focusable for TaskPanel {
 
 /// `content` in a vertical scroll area with a scrollbar that appears only when
 /// it overflows. `frame` carries the sizing (its max height or flex).
+/// The retry state of a recorded problem, in words: which attempt, and when
+/// the next one is (or that there is none until the daemon restarts, with the
+/// action that still works). `None` for a problem that does not retry.
+fn problem_status(problem: &tod_store::node_problems::NodeProblem, now_ms: i64) -> Option<String> {
+    let max = problem.max_attempts?;
+    if problem.gave_up {
+        return Some(format!(
+            "Attempt {} of {max}: not tried again until the daemon restarts. \
+             Delete sandbox in this panel's menu deletes it now.",
+            problem.attempts
+        ));
+    }
+    let next = match problem.next_retry_at {
+        Some(at) if at > now_ms => format!("next try in {}", tod_core::runner_status::format_elapsed(at - now_ms)),
+        Some(_) => "next try is due".to_string(),
+        None => "no next try is scheduled".to_string(),
+    };
+    Some(format!("Attempt {} of {max}: {next}.", problem.attempts))
+}
+
 fn scroll_with_bar(
     id: &'static str,
     handle: &ScrollHandle,
@@ -2034,6 +2100,50 @@ mod tests {
 
     fn working() -> NextActor {
         NextActor::Working { what: tod_core::next_actor::Work::Cloud, since: 1 }
+    }
+
+    /// A background problem recorded on the node (the daemon's failed delete
+    /// of its sandbox at `done`) shows in the task panel, with its error, the
+    /// attempt and the next try, and after the last attempt says it will not
+    /// retry and points to Delete sandbox; clearing it removes the block.
+    #[gpui::test]
+    fn a_recorded_node_problem_shows_with_its_retry_state_and_clears(cx: &mut gpui::TestAppContext) {
+        use tod_store::node_problems::{KIND_SANDBOX_RETIRE, NodeProblem};
+
+        let (fixture, view, cx) = supervised_panel(cx);
+        let node = fixture.node_id;
+        let now = now_ms();
+        let mut problem = NodeProblem::new(node, KIND_SANDBOX_RETIRE, "Deleting the sandbox s failed: blaxel said no".into(), now);
+        problem.attempts = 2;
+        problem.max_attempts = Some(5);
+        problem.next_retry_at = Some(now + 5 * 60_000);
+        tod_core::node_problems::record(&fixture.store, problem.clone()).unwrap();
+        fixture.store.reload_if_stale().unwrap();
+        view.update(cx, |view, cx| view.refresh_runner(cx));
+        cx.run_until_parked();
+        let shown = view.read_with(cx, |view, _| view.runner.problems.clone());
+        assert_eq!(shown.len(), 1);
+        assert!(shown[0].message.contains("blaxel said no"));
+        let status = problem_status(&shown[0], now).unwrap();
+        assert!(status.starts_with("Attempt 2 of 5: next try in"), "{status}");
+        let rendered = cx.update(|window, cx| view.update(cx, |view, cx| view.render_problems(window, cx).is_some()));
+        assert!(rendered, "the block is drawn");
+
+        problem.attempts = 5;
+        problem.gave_up = true;
+        problem.next_retry_at = None;
+        let status = problem_status(&problem, now).unwrap();
+        assert!(status.contains("not tried again until the daemon restarts") && status.contains("Delete sandbox"), "{status}");
+        // A problem that does not retry has no status line of its own.
+        assert_eq!(problem_status(&NodeProblem::new(node, KIND_SANDBOX_RETIRE, "x".into(), now), now), None);
+
+        tod_core::node_problems::clear(&fixture.store, &node.to_string(), KIND_SANDBOX_RETIRE).unwrap();
+        fixture.store.reload_if_stale().unwrap();
+        view.update(cx, |view, cx| view.refresh_runner(cx));
+        cx.run_until_parked();
+        assert!(view.read_with(cx, |view, _| view.runner.problems.is_empty()));
+        let rendered = cx.update(|window, cx| view.update(cx, |view, cx| view.render_problems(window, cx).is_some()));
+        assert!(!rendered, "nothing recorded, nothing drawn");
     }
 
     /// A supervised node's menu follows the run's state: Resume after a
