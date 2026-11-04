@@ -224,7 +224,7 @@ fn build_golden(
         if cloned.exit_code != 0 {
             bail!("cloning {repo} into {name} failed:\n{}", cloned.output().trim());
         }
-        mark_ready(bx, &name, mine, &policy, &say)
+        mark_ready(bx, &name, repo, mine, &policy, &say)
     })();
     if let Err(err) = made {
         // Nothing points at it yet; remove it unless it is somehow ready.
@@ -247,11 +247,13 @@ fn build_golden(
     Ok(name)
 }
 
-/// Labels the sandbox with this build's stamp and `tod-kind=golden`, marks it
+/// Labels the sandbox with this build's stamp, `tod-kind=golden` and the
+/// repository it holds (`tod-repo`), marks it
 /// `ready` last, and checks Blaxel says so.
 fn mark_ready(
     bx: &Blaxel,
     name: &str,
+    repo: &str,
     mine: &GoldenStamp,
     policy: &golden::StepRetry,
     say: &dyn Fn(&str),
@@ -262,6 +264,8 @@ fn mark_ready(
     let stamp_labels = mine.labels();
     let mut labels: Vec<(&str, &str)> = stamp_labels.iter().map(|(k, v)| (*k, v.as_str())).collect();
     labels.push(("tod-kind", golden::KIND_GOLDEN));
+    let repo_label = golden::repo_label(repo)?;
+    labels.push((golden::LABEL_REPO, repo_label.as_str()));
     run("label it", &mut || bx.set_labels(name, &labels).map(|()| None))?;
     run("mark it ready", &mut || bx.set_labels(name, &[(golden::LABEL_READY, "true")]).map(|()| None))?;
     match run("verify it", &mut || bx.get(name))? {
@@ -340,7 +344,7 @@ fn refresh_with(
         say("installing tod's files…");
         step!("install tod's files", tod_sandbox::node::install(bx, &url, &payload, &mut |m| say(m)))?;
         // Stamp first and `ready` last: a half-made golden is never ready.
-        mark_ready(bx, &name, mine, &policy, &say)
+        mark_ready(bx, &name, repo, mine, &policy, &say)
     })();
     if let Err(err) = made {
         // `sandboxes.toml` still points at `old`, which this never touches.

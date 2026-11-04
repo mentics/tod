@@ -28,6 +28,10 @@ pub const LABEL_BUILT: &str = "tod-built";
 /// `tod-kind=golden`: marks a sandbox tod made as a golden (and so one it may
 /// delete when it makes a newer one).
 pub const KIND_GOLDEN: &str = "golden";
+/// `tod-repo=<owner>--<name>`: the repository the golden holds (see
+/// [`repo_label`]), so the repository of a golden is read from its listing and
+/// no sandbox has to be woken to ask.
+pub const LABEL_REPO: &str = "tod-repo";
 /// `ready=true`: set last, once the golden passed its checks and has its files.
 pub const LABEL_READY: &str = "ready";
 
@@ -90,6 +94,33 @@ impl GoldenStamp {
             built: number(LABEL_BUILT)?,
         }))
     }
+}
+
+/// `owner/name` as a label value: `owner--name`. A label value cannot hold a
+/// `/`, and a GitHub owner never has two hyphens in a row, so the first `--`
+/// is the separator and [`repo_from_label`] gives the repository back exactly.
+/// A value over Blaxel's 63 characters is an error, never cut short.
+pub fn repo_label(repo: &str) -> Result<String> {
+    check_repo_slug(repo)?;
+    let value = repo.replacen('/', "--", 1);
+    if value.len() > 63 {
+        bail!("{repo} is too long to record on its golden sandbox (a label value holds 63 characters, this needs {})", value.len());
+    }
+    Ok(value)
+}
+
+/// The repository a [`repo_label`] value stands for.
+pub fn repo_from_label(value: &str) -> Result<String> {
+    match value.split_once("--") {
+        Some((owner, name)) if !owner.is_empty() && !name.is_empty() => Ok(format!("{owner}/{name}")),
+        _ => bail!("the {LABEL_REPO} label {value:?} is not an owner--name repository"),
+    }
+}
+
+/// The repository a sandbox's `tod-repo` label says it holds; `None` when it
+/// has no such label (a golden made before the label, or by hand).
+pub fn info_repo(info: &SandboxInfo) -> Result<Option<String>> {
+    info.label(LABEL_REPO).filter(|v| !v.is_empty()).map(repo_from_label).transpose()
 }
 
 fn built_text(secs: u64) -> String {
@@ -389,6 +420,26 @@ mod tests {
             volumes: vec![],
             node_env: vec![],
         }
+    }
+
+    #[test]
+    fn a_repository_round_trips_through_its_label() {
+        for repo in ["joel-cofactr/build-test", "Cofactr/workspace", "a/b--c", "o/x.y_z"] {
+            let label = repo_label(repo).unwrap();
+            assert!(!label.contains('/'));
+            assert_eq!(repo_from_label(&label).unwrap(), repo);
+        }
+        assert!(repo_label("not-a-repo").is_err());
+        let long = format!("owner/{}", "n".repeat(60));
+        assert!(repo_label(&long).unwrap_err().to_string().contains("too long"));
+        assert!(repo_from_label("nodashes").is_err());
+    }
+
+    #[test]
+    fn a_golden_says_its_repository_or_nothing() {
+        assert_eq!(info_repo(&info_named("g", &[])).unwrap(), None);
+        assert_eq!(info_repo(&info_named("g", &[(LABEL_REPO, "a--b")])).unwrap().as_deref(), Some("a/b"));
+        assert!(info_repo(&info_named("g", &[(LABEL_REPO, "garbled")])).is_err());
     }
 
     fn fast() -> StepRetry {

@@ -199,7 +199,7 @@ clone a private repository: a Dockerfile cannot carry a token.)
 makes it again on this
 build: it forks the current golden, checks what a fork needs, installs tod's
 files, labels it `tod-install` (the install stamp), `tod-schema`, `tod-wire`,
-and `tod-built` (the commit time of the build) plus `tod-kind=golden`, marks
+and `tod-built` (the commit time of the build) plus `tod-kind=golden` and `tod-repo` (the repository it holds), marks
 it `ready`, points the repository at it, and deletes the old golden when tod
 made it (`tod-kind=golden`) and no other setting points at it. The library
 entry `tod_core::cloud_sync::golden::ensure_golden_current` does the same
@@ -221,7 +221,7 @@ order: `forking ...`, the prerequisites check, `installing tod's files…`,
 `<new> is now the golden of <repo>`, and either `deleting the old golden` or
 `left ... in place` with the reason. Then `tod-sandbox status <new> --json`
 shows labels `tod-install`, `tod-schema`, `tod-wire`, `tod-built`,
-`tod-kind=golden`, `ready=true`; `tod-sandbox exec <new> -- ls /opt/tod`
+`tod-kind=golden`, `tod-repo=<owner>--<name>`, `ready=true`; `tod-sandbox exec <new> -- ls /opt/tod`
 shows `tod-relay`, `tod-cli`, `tod-supervisor`, `process`, `media`, `skills`;
 and `tod-sandbox golden <owner/name>` names it. Run the refresh a second time
 from the same build: it forks again (refresh always remakes), and a

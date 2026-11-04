@@ -525,9 +525,16 @@ fn golden(ctx: &mut Ctx, mut args: Args) -> Result<i32> {
         }
         (Some(repo), Some(sandbox)) => {
             let repo = normalize(&repo)?;
+            // The label says which repository the golden holds, so a node's
+            // repository is read from it without waking the sandbox.
+            let label = tod_sandbox::golden::repo_label(&repo)?;
             acct.set_golden(&repo, &sandbox);
             ctx.save()?;
-            println!("the golden of {repo} is now {sandbox}");
+            let bx = ctx.blaxel()?;
+            let real = ctx.resolve_golden(&bx, &repo)?;
+            bx.set_labels(&real, &[(tod_sandbox::golden::LABEL_REPO, label.as_str())])
+                .with_context(|| format!("label {real} with the repository {repo} it holds"))?;
+            println!("the golden of {repo} is now {sandbox} ({real} is labelled {}={label})", tod_sandbox::golden::LABEL_REPO);
         }
     }
     Ok(0)

@@ -75,7 +75,7 @@ What it holds, and what each node's fork still gets:
 | Toolchain: git, curl, tar, bash, ssh tools, Node >= 20.10, `claude-agent-acp`, `claude` | Environment: `TOD_NODE`, `TOD_USER`, orchestrator URL, scheduler, workspace (`fork_with_envs`) |
 | The repository checkout | Proxy rules and labels: the user's and the node's credentials, Blaxel, orchestrator (`update_proxy`), `tod-kind=node`, `tod-creds` |
 | tod's files: the relay, `tod-cli` shim and Linux `tod-cli`, the supervisor, the process, media and skills bundles, the node manifest | **tod's files again, without packages** (`node::install_into_fork`), then the relay restarted |
-| Labels `tod-install` (the install stamp), `tod-schema`, `tod-wire`, `tod-built` (commit time), `tod-kind=golden`, `ready` | The branch checked out, submodules on it; supervisor settings; session logs and runner state restored |
+| Labels `tod-install` (the install stamp), `tod-schema`, `tod-wire`, `tod-built` (commit time), `tod-kind=golden`, `tod-repo=<owner>--<name>` (the repository it holds; read from the listing to find a node's repository, so no golden is woken or asked), `ready` | The branch checked out, submodules on it; supervisor settings; session logs and runner state restored |
 
 The third row is what the live check found (live-check-2026-11.md, Pass 3,
 bug 1): the proxy update that ends `fork_golden` redeploys the fork from its

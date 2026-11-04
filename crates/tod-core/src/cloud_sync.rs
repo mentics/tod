@@ -1293,9 +1293,9 @@ fn origin_url_of(fleet: &FleetStore, node_id: &str, repo: &str) -> Result<String
         {
             sandboxes.push(name.trim().to_string());
         }
-        // `golden` is an alias for the newest golden sandbox, not a sandbox name:
-        // one that cannot be resolved is not asked (there is no sandbox called
-        // `golden`), and the error says why.
+        // `golden` is an alias for the repository's golden, not a sandbox name:
+        // one that cannot be resolved (none, or several: the location must name
+        // one) is not asked, and the error says why.
         let mut resolved = Vec::new();
         for name in sandboxes {
             if name != tod_sandbox::config::GOLDEN {
@@ -1303,10 +1303,8 @@ fn origin_url_of(fleet: &FleetStore, node_id: &str, repo: &str) -> Result<String
                 continue;
             }
             let root = fleet.paths().root();
-            // Several goldens (one per repository, and the account-wide one):
-            // each is asked, and the answers must agree below.
-            match tod_store::fleet::sandbox::Sandboxes::load(root).and_then(|s| s.blaxel().and_then(|bx| s.resolve_all_goldens(&bx))) {
-                Ok(real) => resolved.extend(real),
+            match tod_store::fleet::sandbox::resolve_fork_source(root, &name) {
+                Ok(real) => resolved.push(real),
                 Err(err) => {
                     golden_missing = true;
                     tried.push(format!(
@@ -1316,23 +1314,14 @@ fn origin_url_of(fleet: &FleetStore, node_id: &str, repo: &str) -> Result<String
                 }
             }
         }
-        let sandboxes = resolved;
+        // The repository each golden holds is on the golden itself (its
+        // `tod-repo` label), read from Blaxel's listing: no sandbox is started
+        // or asked, and none but the node's own golden is looked at.
         let mut found: Vec<String> = Vec::new();
-        for name in sandboxes {
-            match tod_store::fleet::sandbox::SandboxExec::new(&name).output(repo, "git", &["config", "--get-regexp", REMOTE_URLS]) {
-                Err(err) => tried.push(format!("could not run git in sandbox {name} at {repo}: {err:#}")),
-                Ok(o) if o.status.success() => {
-                    let remotes = String::from_utf8_lossy(&o.stdout).trim().to_string();
-                    match github_remote_url(&remotes) {
-                        Some(url) => found.push(url),
-                        None => tried.push(format!("sandbox {name} has remotes {remotes:?} at {repo}")),
-                    }
-                }
-                Ok(o) => tried.push(format!(
-                    "sandbox {name} has no git remotes at {repo} (git exited {}: {})",
-                    o.status,
-                    String::from_utf8_lossy(&o.stderr).trim()
-                )),
+        for name in resolved {
+            match golden_repo(fleet, &name) {
+                Ok(repo_slug) => found.push(format!("https://github.com/{repo_slug}.git")),
+                Err(err) => tried.push(format!("{err:#}")),
             }
         }
         found.sort();
@@ -1349,6 +1338,21 @@ fn origin_url_of(fleet: &FleetStore, node_id: &str, repo: &str) -> Result<String
         bail!("no HTTPS repository URL for the cloud run: {why}");
     }
     bail!("no HTTPS repository URL for the cloud run ({why}); {}", what_to_set(fleet, node_id))
+}
+
+/// The repository the golden sandbox `name` holds, from its `tod-repo` label.
+/// A golden without one is an error saying how to give it one.
+fn golden_repo(fleet: &FleetStore, name: &str) -> Result<String> {
+    let sandboxes = tod_store::fleet::sandbox::Sandboxes::load(fleet.paths().root())?;
+    let bx = sandboxes.blaxel()?;
+    let info = bx.get(name)?.ok_or_else(|| anyhow!("the golden sandbox {name} does not exist"))?;
+    tod_sandbox::golden::info_repo(&info)?.ok_or_else(|| {
+        anyhow!(
+            "the golden sandbox {name} does not say which repository it holds (it has no {} label): \
+             run `tod-sandbox golden <owner/name> {name}` to record it, or `tod-sandbox golden refresh <owner/name>`",
+            tod_sandbox::golden::LABEL_REPO
+        )
+    })
 }
 
 /// What the user can do about a repository tod cannot find the URL of, by how
