@@ -574,19 +574,12 @@ that happens off any turn of the user's now goes on the node:
   helpers (`report` says nothing new, and writes nothing, for the same message
   again, so a check after every sync does not wake the views). Rows cascade
   with the node.
-- **Schema, sync, orchestrator:** `CURRENT_USER_VERSION` is 94, an idempotent
-  step that creates the table and its `journey_changes` triggers (also made
-  sure of on every open, like the deferrals table). The table is
-  **machine-local and not in `SYNCED_TABLES`**: nothing about what is synced
-  changes and the orchestrator never reads it. **But the version number is
-  part of the sync contract** (`sync::contract`: `schema` is the fleet
-  database's `user_version`), so an orchestrator deployed at schema 93 answers
-  a 94 client with a 426 until it is redeployed (the app does that itself, or
-  `tod-sandbox orchestrator`); sandboxes' supervisors on an older build are
-  judged "older" and need the usual reinstall. The deferrals table avoided
-  this by being created in the idempotent block with no bump; if a redeploy is
-  unwanted for this change, dropping the `version < 94` step and the bump
-  (the table is still created on every open) is the alternative.
+- **Schema, sync, orchestrator:** no version bump (`CURRENT_USER_VERSION` stays
+  93): the table and its `journey_changes` triggers are made on every open, in
+  the idempotent block, like the deferrals table. It is **machine-local and not
+  in `SYNCED_TABLES`**, so nothing about what is synced changes, the
+  orchestrator never reads it, and no orchestrator redeploy is needed (the
+  version number is part of the sync contract, which is why it is not bumped).
 - **Sandbox retire:** every failed attempt records attempts so far, the total
   (the first try plus one per back-off), the next retry time and, after the
   last, `gave_up` with the sentence "not tried again until the daemon
