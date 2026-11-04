@@ -278,7 +278,12 @@ impl Backend for Live {
 pub fn adopt_node_sandbox(fleet: &FleetStore, node_id: &str, progress: &mut dyn FnMut(&str)) -> Result<String> {
     let root = fleet.paths().root().to_path_buf();
     let mut live = Live::open(&root)?;
-    adopt_with(fleet, &root, node_id, false, &mut live, progress).map(|outcome| outcome.message())
+    let outcome = adopt_with(fleet, &root, node_id, false, &mut live, progress)?;
+    // Adopted (or nothing to adopt): an earlier refusal no longer stands.
+    if !matches!(outcome, Outcome::Gone { .. }) {
+        crate::node_problems::clear(fleet, node_id, tod_store::node_problems::KIND_ADOPT)?;
+    }
+    Ok(outcome.message())
 }
 
 /// The nodes this client's records name a sandbox for with no location, as
@@ -310,11 +315,16 @@ pub fn adopt_at_start(fleet: &FleetStore) -> Result<Vec<String>> {
         return Ok(Vec::new());
     }
     let mut live = Live::open(&root)?;
-    Ok(adopt_each(fleet, &root, &nodes, &mut live))
+    adopt_each(fleet, &root, &nodes, &mut live)
 }
 
 /// [`adopt_at_start`] over `backend` for `nodes`, listing Blaxel once.
-fn adopt_each(fleet: &FleetStore, root: &std::path::Path, nodes: &[String], backend: &mut dyn Backend) -> Vec<String> {
+fn adopt_each(
+    fleet: &FleetStore,
+    root: &std::path::Path,
+    nodes: &[String],
+    backend: &mut dyn Backend,
+) -> Result<Vec<String>> {
     struct Cached<'a> {
         inner: &'a mut dyn Backend,
         listing: Option<Vec<SandboxInfo>>,
@@ -335,23 +345,42 @@ fn adopt_each(fleet: &FleetStore, root: &std::path::Path, nodes: &[String], back
     }
     let mut cached = Cached { inner: backend, listing: None };
     let mut adopted = Vec::new();
+    // A refusal is recorded on the node (`tod_store::node_problems`), where its
+    // task panel shows it, not in a per-process list nobody drains in the
+    // daemon; a later adoption clears it. A failure to write the record is
+    // returned after the pass.
+    let mut write_error: Option<anyhow::Error> = None;
+    let mut note = |result: Result<()>| {
+        if let Err(err) = result {
+            write_error.get_or_insert(err);
+        }
+    };
     for id in nodes {
         match adopt_with(fleet, root, id, true, &mut cached, &mut |msg| tracing::info!("cloud: adopting node {id}'s sandbox: {msg}")) {
             Ok(Outcome::Adopted { sandbox, .. }) => {
                 tracing::info!("cloud: adopted sandbox {sandbox} for node {id}");
                 adopted.push(sandbox);
+                note(crate::node_problems::clear(fleet, id, tod_store::node_problems::KIND_ADOPT));
             }
-            Ok(Outcome::NotNeeded) => {}
-            Ok(gone @ Outcome::Gone { .. }) => {
-                session_log::report_problem(id, format!("The node's old sandbox was not adopted. {}", gone.message()))
-            }
-            Err(err) => session_log::report_problem(
+            Ok(Outcome::NotNeeded) => note(crate::node_problems::clear(fleet, id, tod_store::node_problems::KIND_ADOPT)),
+            Ok(gone @ Outcome::Gone { .. }) => note(crate::node_problems::report(
+                fleet,
                 id,
+                tod_store::node_problems::KIND_ADOPT,
+                format!("The node's old sandbox was not adopted. {}", gone.message()),
+            )),
+            Err(err) => note(crate::node_problems::report(
+                fleet,
+                id,
+                tod_store::node_problems::KIND_ADOPT,
                 format!("The node's old sandbox was not adopted automatically: {err:#}. Nothing was changed."),
-            ),
+            )),
         }
     }
-    adopted
+    match write_error {
+        Some(err) => Err(err),
+        None => Ok(adopted),
+    }
 }
 
 #[cfg(test)]
@@ -688,16 +717,29 @@ mod tests {
         let fx = fx();
         fx.raw_row("clear");
         let mut fake = Fake::with(vec![info("clear", Some("node"), Some(&fx.id()), "DEPLOYED")]);
-        let adopted = adopt_each(&fx.fleet, &fx.root, &[fx.id()], &mut fake);
+        let adopted = adopt_each(&fx.fleet, &fx.root, &[fx.id()], &mut fake).unwrap();
         assert_eq!(adopted, ["clear"]);
         assert_eq!(fake.calls.iter().filter(|c| **c == "list").count(), 1);
 
         // One that does not say whose it is is left, and told to the node.
         let fx = fx2_named("quiet");
         let mut fake = Fake::with(vec![info("quiet", Some("node"), None, "DEPLOYED")]);
-        assert!(adopt_each(&fx.fleet, &fx.root, &[fx.id()], &mut fake).is_empty());
+        assert!(adopt_each(&fx.fleet, &fx.root, &[fx.id()], &mut fake).unwrap().is_empty());
         assert_eq!(fx.located(), None);
         assert!(!fake.calls.contains(&"relay"));
+        // The refusal is on the node, durable, and says why.
+        fx.fleet.reload_if_stale().unwrap();
+        let problems = crate::node_problems::for_node(&fx.fleet, fx.node).unwrap();
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert_eq!(problems[0].kind, tod_store::node_problems::KIND_ADOPT);
+        assert!(problems[0].message.contains("not adopted"), "{}", problems[0].message);
+        // Run again: still refused, still one row. Once the sandbox says it is this node's, it is adopted and the refusal goes.
+        assert!(adopt_each(&fx.fleet, &fx.root, &[fx.id()], &mut fake).unwrap().is_empty());
+        assert_eq!(crate::node_problems::for_node(&fx.fleet, fx.node).unwrap().len(), 1);
+        let mut fake = Fake::with(vec![info("quiet", Some("node"), Some(&fx.id()), "DEPLOYED")]);
+        assert_eq!(adopt_each(&fx.fleet, &fx.root, &[fx.id()], &mut fake).unwrap(), ["quiet"]);
+        fx.fleet.reload_if_stale().unwrap();
+        assert!(crate::node_problems::for_node(&fx.fleet, fx.node).unwrap().is_empty());
     }
 
     fn fx2_named(sandbox: &str) -> Fx {

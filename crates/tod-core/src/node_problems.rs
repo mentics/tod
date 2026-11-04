@@ -25,6 +25,15 @@ pub fn record(fleet: &FleetStore, problem: NodeProblem) -> Result<()> {
 /// A problem that does not retry, of `kind` on `node_id` (a node id string).
 pub fn report(fleet: &FleetStore, node_id: &str, kind: &str, message: String) -> Result<()> {
     let node = Uuid::parse_str(node_id).with_context(|| format!("node id {node_id:?}"))?;
+    // Saying the same thing again is not news: no write, no log line (a check
+    // that runs after every sync reports the same disagreement each time).
+    let said = fleet
+        .read(|c| NodeProblemRepo::new(c).list_for_nodes(&[node]))?
+        .iter()
+        .any(|p| p.kind == kind && p.message == message);
+    if said {
+        return Ok(());
+    }
     record(fleet, NodeProblem::new(node, kind, message, tod_store::outline::uuid_blob::now_ms()))
 }
 

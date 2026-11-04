@@ -191,19 +191,25 @@ pub fn located_rows(fleet: &FleetStore, rows: Vec<CloudNodeRow>, root: &std::pat
     for row in rows {
         let id = row.node_id.to_string();
         match tod_store::fleet::session_log::node_sandbox(fleet, &id)? {
-            Some(located) if located == row.sandbox => consistent.push(row),
+            Some(located) if located == row.sandbox => {
+                // Agrees now: an earlier report no longer stands.
+                crate::node_problems::clear(fleet, &id, tod_store::node_problems::KIND_CLOUD_RECORD)?;
+                consistent.push(row)
+            }
             Some(located) => report_record_problem(
+                fleet,
                 &id,
                 format!(
                     "The cloud record of node {id} names sandbox {} but its Files location records {located}; \
                      nothing was changed. Start the node again to make the record follow its location.",
                     row.sandbox
                 ),
-            ),
+            )?,
             None => {
                 let mine = row.ownership.owner_client.as_deref().is_none_or(|owner| owner == me);
                 if row.lost_at.is_none() && mine && !super::sandbox_deleted_by_user(root, &id) {
                     report_record_problem(
+                        fleet,
                         &id,
                         format!(
                             "The cloud record of node {id} names sandbox {} but its Files location records none; \
@@ -211,7 +217,9 @@ pub fn located_rows(fleet: &FleetStore, rows: Vec<CloudNodeRow>, root: &std::pat
                              \"Adopt existing sandbox\") or Start makes a new one.",
                             row.sandbox
                         ),
-                    );
+                    )?;
+                } else {
+                    crate::node_problems::clear(fleet, &id, tod_store::node_problems::KIND_CLOUD_RECORD)?;
                 }
             }
         }
@@ -219,16 +227,12 @@ pub fn located_rows(fleet: &FleetStore, rows: Vec<CloudNodeRow>, root: &std::pat
     Ok(consistent)
 }
 
-static REPORTED_RECORDS: Mutex<Option<std::collections::HashSet<String>>> = Mutex::new(None);
-
-/// Tells the user (through the node's problem list) about a record that
-/// disagrees with the node's location, once per distinct message while the
-/// app runs: a check runs after every sync and would otherwise repeat it.
-fn report_record_problem(node_id: &str, message: String) {
-    let mut seen = REPORTED_RECORDS.lock().unwrap_or_else(|e| e.into_inner());
-    if seen.get_or_insert_with(Default::default).insert(message.clone()) {
-        tod_store::fleet::session_log::report_problem(node_id, message);
-    }
+/// Tells the user about a record that disagrees with the node's location, on
+/// the node itself (`tod_store::node_problems`): one row per node, and the
+/// same message again writes nothing, so a check that runs after every sync
+/// does not wake the views each time.
+fn report_record_problem(fleet: &FleetStore, node_id: &str, message: String) -> Result<()> {
+    crate::node_problems::report(fleet, node_id, tod_store::node_problems::KIND_CLOUD_RECORD, message)
 }
 
 /// What a [`check`] repaired.
@@ -1099,6 +1103,19 @@ mod tests {
         assert_eq!(fake.deleted, ["node-f"]);
     }
 
+    impl Fx {
+        /// The messages of the node's recorded cloud-record problems.
+        fn problems(&self) -> Vec<String> {
+            self.fleet.reload_if_stale().unwrap();
+            crate::node_problems::for_node(&self.fleet, self.node)
+                .unwrap()
+                .into_iter()
+                .filter(|p| p.kind == tod_store::node_problems::KIND_CLOUD_RECORD)
+                .map(|p| p.message)
+                .collect()
+        }
+    }
+
     fn rows_of(fx: &Fx) -> Vec<CloudNodeRow> {
         fx.fleet.read(cloud_nodes::list).unwrap()
     }
@@ -1110,20 +1127,28 @@ mod tests {
         fx.cloud_row();
         let ok = located_rows(&fx.fleet, rows_of(&fx), &fx.root).unwrap();
         assert_eq!(ok.len(), 1);
-        assert!(tod_store::fleet::session_log::take_problems().is_empty());
+        assert!(fx.problems().is_empty());
 
         fx.raw_row("node-elsewhere");
         let ok = located_rows(&fx.fleet, rows_of(&fx), &fx.root).unwrap();
         assert!(ok.is_empty(), "a row that disagrees with its location is not acted on");
-        let problems = tod_store::fleet::session_log::take_problems();
+        let problems = fx.problems();
         assert_eq!(problems.len(), 1, "{problems:?}");
         assert!(
-            problems[0].1.contains("node-elsewhere") && problems[0].1.contains("node-1"),
+            problems[0].contains("node-elsewhere") && problems[0].contains("node-1"),
             "the error names both: {}",
-            problems[0].1
+            problems[0]
         );
+        // Checked again (every sync does): still one report, not two.
+        located_rows(&fx.fleet, rows_of(&fx), &fx.root).unwrap();
+        assert_eq!(fx.problems().len(), 1);
         assert_eq!(fx.row().unwrap().sandbox, "node-elsewhere", "never silently fixed");
         assert_eq!(fx.location().unwrap().sandbox(), Some("node-1"));
+
+        // The record follows its location (Start again): the report goes.
+        fx.raw_row("node-1");
+        assert_eq!(located_rows(&fx.fleet, rows_of(&fx), &fx.root).unwrap().len(), 1);
+        assert!(fx.problems().is_empty(), "agreement clears the report");
     }
 
     #[test]
@@ -1131,22 +1156,22 @@ mod tests {
         let fx = fx();
         fx.raw_row("node-old");
         assert!(located_rows(&fx.fleet, rows_of(&fx), &fx.root).unwrap().is_empty());
-        let problems = tod_store::fleet::session_log::take_problems();
-        assert!(problems.len() == 1 && problems[0].1.contains("records none"), "{problems:?}");
+        let problems = fx.problems();
+        assert!(problems.len() == 1 && problems[0].contains("records none"), "{problems:?}");
 
         // Marked lost (a deleted sandbox): nothing to say.
         fx.fleet.enqueue(FleetMutation::CloudNodeMarkLost { node: fx.node, at: 3 }).unwrap();
         fx.fleet.writer().flush().unwrap();
         fx.fleet.reload_if_stale().unwrap();
         assert!(located_rows(&fx.fleet, rows_of(&fx), &fx.root).unwrap().is_empty());
-        assert!(tod_store::fleet::session_log::take_problems().is_empty());
+        assert!(fx.problems().is_empty(), "no longer true, so the report is dropped");
 
         // Another client's row has no location here and is not this machine's to act on.
         let mut foreign = rows_of(&fx);
         foreign[0].lost_at = None;
         foreign[0].ownership.owner_client = Some("app-someone-else".into());
         assert!(located_rows(&fx.fleet, foreign, &fx.root).unwrap().is_empty());
-        assert!(tod_store::fleet::session_log::take_problems().is_empty());
+        assert!(fx.problems().is_empty());
     }
 
     #[test]
