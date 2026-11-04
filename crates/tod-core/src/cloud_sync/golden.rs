@@ -42,15 +42,36 @@ fn normalized(repo: &str) -> Result<String> {
 pub fn ensure_golden_current(sandboxes: &mut Sandboxes, bx: &Blaxel, repo: &str, progress: &mut dyn FnMut(&str)) -> Result<String> {
     let repo = normalized(repo)?;
     let name = sandboxes.resolve_golden(bx, &repo)?;
-    let info = bx.get(&name)?.ok_or_else(|| anyhow!("the golden sandbox {name} for {repo} does not exist"))?;
-    let theirs = GoldenStamp::from_info(&info)?;
     let files = install_files()?;
     let mine = my_stamp(&files)?;
-    match golden::decide(&repo, &mine, theirs.as_ref())? {
-        Plan::Use => Ok(name),
+    ensure_current_with(
+        &repo,
+        &name,
+        &mine,
+        |name| bx.get(name),
+        progress,
+        |name, progress| refresh_with(sandboxes, bx, &repo, name, &files, &mine, progress),
+    )
+}
+
+/// The decision of [`ensure_golden_current`], apart from Blaxel and the
+/// files: `lookup` reads the golden, `refresh` makes the next one from it
+/// (called only when the plan says to, never for a newer golden).
+fn ensure_current_with(
+    repo: &str,
+    name: &str,
+    mine: &GoldenStamp,
+    lookup: impl FnOnce(&str) -> Result<Option<tod_sandbox::blaxel::SandboxInfo>>,
+    progress: &mut dyn FnMut(&str),
+    refresh: impl FnOnce(&str, &mut dyn FnMut(&str)) -> Result<String>,
+) -> Result<String> {
+    let info = lookup(name)?.ok_or_else(|| anyhow!("the golden sandbox {name} for {repo} does not exist"))?;
+    let theirs = GoldenStamp::from_info(&info)?;
+    match golden::decide(repo, mine, theirs.as_ref())? {
+        Plan::Use => Ok(name.to_string()),
         Plan::Refresh { why } => {
             progress(&format!("the golden sandbox {name} for {repo} is being refreshed: {why}"));
-            refresh_with(sandboxes, bx, &repo, &name, &files, &mine, progress)
+            refresh(name, progress)
         }
         Plan::Refuse => unreachable!("decide turns a refusal into an error"),
     }
@@ -199,6 +220,83 @@ mod tests {
         let record = serde_json::json!({ "spec": { "network": { "proxy": placeholder_proxy() } } });
         assert!(has_proxy_routes(&record));
         assert!(!has_proxy_routes(&serde_json::json!({ "spec": { "network": {} } })));
+    }
+
+    fn info_with(stamp: Option<&GoldenStamp>) -> tod_sandbox::blaxel::SandboxInfo {
+        tod_sandbox::blaxel::SandboxInfo {
+            name: "tod-golden-acme-widget-1".into(),
+            status: "DEPLOYED".into(),
+            state: None,
+            url: None,
+            image: String::new(),
+            labels: stamp.map(|s| s.labels().into_iter().map(|(k, v)| (k.to_string(), v)).collect()).unwrap_or_default(),
+            volumes: Vec::new(),
+            node_env: Vec::new(),
+        }
+    }
+
+    /// An older tod meeting a golden a newer one made: the error names the
+    /// repository and both stamps, and nothing is made (the refresh is never
+    /// called, so no sandbox is made and `sandboxes.toml` is not changed).
+    #[test]
+    fn an_older_tod_is_refused_a_newer_golden_naming_both_stamps_and_makes_nothing() {
+        let mine = GoldenStamp { install: "mine-files".into(), schema: 93, wire: 1, built: 100 };
+        let newer = GoldenStamp { install: "newer-files".into(), schema: 94, wire: 1, built: 200 };
+        let info = info_with(Some(&newer));
+        let mut said = Vec::new();
+        let mut refreshed = false;
+        let err = ensure_current_with(
+            "acme/widget",
+            "tod-golden-acme-widget-1",
+            &mine,
+            |_| Ok(Some(info)),
+            &mut |m| said.push(m.to_string()),
+            |_, _| {
+                refreshed = true;
+                Ok("never".into())
+            },
+        )
+        .unwrap_err();
+        let text = format!("{err:#}");
+        assert!(text.contains("acme/widget") && text.contains("newer tod"), "{text}");
+        assert!(text.contains("install newer-files, schema 94") && text.contains("install mine-files, schema 93"), "{text}");
+        assert!(!refreshed, "a newer golden is never refreshed back");
+        assert!(said.is_empty(), "nothing was said as if it were being made: {said:?}");
+    }
+
+    /// The other plans through the same seam: the same stamp is used as it is
+    /// (no refresh); an older one, or one with no stamp, is refreshed, and the
+    /// new golden's name comes back.
+    #[test]
+    fn the_same_golden_is_used_and_an_older_or_unstamped_one_is_refreshed() {
+        let mine = GoldenStamp { install: "mine-files".into(), schema: 93, wire: 1, built: 100 };
+        let run = |stamp: Option<GoldenStamp>| {
+            let mut refreshed = Vec::new();
+            let mut said = Vec::new();
+            let out = ensure_current_with(
+                "acme/widget",
+                "old-name",
+                &mine,
+                |_| Ok(Some(info_with(stamp.as_ref()))),
+                &mut |m| said.push(m.to_string()),
+                |from, _| {
+                    refreshed.push(from.to_string());
+                    Ok("new-name".into())
+                },
+            );
+            (out.unwrap(), refreshed, said)
+        };
+        assert_eq!(run(Some(mine.clone())), ("old-name".to_string(), vec![], vec![]));
+        let older = GoldenStamp { install: "old-files".into(), schema: 92, wire: 1, built: 50 };
+        let (name, refreshed, said) = run(Some(older));
+        assert_eq!((name.as_str(), refreshed), ("new-name", vec!["old-name".to_string()]));
+        assert!(said[0].contains("being refreshed") && said[0].contains("older tod"), "{said:?}");
+        let (name, _, said) = run(None);
+        assert_eq!(name, "new-name");
+        assert!(said[0].contains("no tod-install label"), "{said:?}");
+        // A golden that is gone is an error saying so, with nothing made.
+        let err = ensure_current_with("acme/widget", "gone", &mine, |_| Ok(None), &mut |_| {}, |_, _| Ok("x".into())).unwrap_err();
+        assert!(err.to_string().contains("does not exist"), "{err}");
     }
 
     #[test]
