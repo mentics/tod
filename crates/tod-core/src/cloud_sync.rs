@@ -1768,19 +1768,40 @@ fn run_in_cloud_reporting(
     // supersedes an older answer to leave the node stopped.
     record_node_request(fleet, node_id, REQUEST_RUN)?;
     record_starting(fleet, node_id)?;
-    progress("syncing with the orchestrator…");
-    let (orch, user) = resolve(root)?;
-    sync(fleet, root, &orch, &user)?;
-    ensure_supervisor(fleet, root, node_id, true, progress)?;
-    let record = record_cloud_node(fleet, node_id, &user)?;
-    let heard = match sync(fleet, root, &orch, &user) {
-        Ok(report) => report,
+    failing_start_is_recorded(fleet, node_id, || {
+        progress("syncing with the orchestrator…");
+        let (orch, user) = resolve(root)?;
+        sync(fleet, root, &orch, &user)?;
+        ensure_supervisor(fleet, root, node_id, true, progress)?;
+        let record = record_cloud_node(fleet, node_id, &user)?;
+        let heard = match sync(fleet, root, &orch, &user) {
+            Ok(report) => report,
+            Err(err) => {
+                progress(&format!("warning: could not send the record to the orchestrator yet: {err:#}"));
+                SyncReport::default()
+            }
+        };
+        Ok((record, heard))
+    })
+}
+
+/// Runs `step`, the work after [`record_starting`]. When it fails the node's
+/// `starting` row would go on saying "working: starting in the cloud" for the
+/// whole time a supervisor is given to report in, though nothing is coming;
+/// so the failure replaces it (`runner_failed`, the user's to resume), and the
+/// original error is returned either way.
+fn failing_start_is_recorded<T>(fleet: &FleetStore, node_id: &str, step: impl FnOnce() -> Result<T>) -> Result<T> {
+    match step() {
+        Ok(v) => Ok(v),
         Err(err) => {
-            progress(&format!("warning: could not send the record to the orchestrator yet: {err:#}"));
-            SyncReport::default()
+            let node = uuid::Uuid::parse_str(node_id).with_context(|| format!("node id {node_id}"))?;
+            let text = format!("starting in the cloud failed: {err:#}");
+            match crate::run_state::record(fleet, node, crate::run_state::runner_failed(&text), "app") {
+                Ok(_) => Err(err),
+                Err(rec) => Err(err.context(format!("(and the failure could not be recorded on the node: {rec:#})"))),
+            }
         }
-    };
-    Ok((record, heard))
+    }
 }
 
 /// How long after sending a node to the cloud its supervisor has to report

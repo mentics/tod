@@ -948,3 +948,35 @@ fn the_orchestrator_records_the_names_of_the_secrets_its_proxy_holds() {
     assert!(orch.put_github_secrets(&["bad name".to_string()]).is_err());
     let _ = std::fs::remove_dir_all(&base);
 }
+
+/// A Start that fails after the node was marked "starting" must not leave it
+/// saying "working: starting in the cloud" for the minutes a supervisor is
+/// given to report in: the failure replaces the row and is still returned.
+#[test]
+fn a_start_that_fails_leaves_the_node_failed_not_starting() {
+    let root = temp_root("start-fails");
+    let fleet = FleetStore::open(&root).unwrap();
+    add_list(&fleet, "t");
+    let list_id = fleet.list_outline_lists().unwrap()[0].id;
+    let node = uuid::Uuid::new_v4();
+    fleet
+        .enqueue_outline(OutlineMutation::CreateNode {
+            node_id: Some(node),
+            list_id,
+            parent_id: None,
+            anchor_id: None,
+            position: tod_store::outline::CreatePosition::Below,
+            title: "cloud node".into(),
+        })
+        .unwrap();
+    fleet.writer().flush().unwrap();
+    let id = node.to_string();
+    record_starting(&fleet, &id).unwrap();
+    let err = failing_start_is_recorded::<()>(&fleet, &id, || Err(anyhow!("the golden sandbox g does not exist")))
+        .unwrap_err();
+    assert!(format!("{err:#}").contains("the golden sandbox g does not exist"), "{err:#}");
+    let row = fleet.read(|conn| tod_store::run_state::get(conn, node)).unwrap().unwrap();
+    assert_eq!(row.phase, tod_store::run_state::Phase::Stopped);
+    assert!(row.reason_text.contains("the golden sandbox g does not exist"), "{}", row.reason_text);
+    let _ = std::fs::remove_dir_all(&root);
+}
