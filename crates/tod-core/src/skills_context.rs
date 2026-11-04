@@ -480,7 +480,7 @@ mod tests {
     fn the_pr_skills_ship_in_the_bundle() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/skills");
         let names = crate::skills::SkillsPaths::from_root(root).unwrap().names().unwrap();
-        for name in ["tod-open-pr", "tod-fix-ci"] {
+        for name in ["tod-open-pr", "tod-fix-ci", "code-review-general"] {
             assert!(names.iter().any(|n| n == name), "{name} missing from {names:?}");
         }
     }
