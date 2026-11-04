@@ -304,3 +304,17 @@ allowing that command or enabling the capabilities by hand in the task editor.
 Nothing was started in the cloud this pass (no sandbox was made).
 `claude auth status` on this machine now reports `loggedIn: true`
 (claude.ai, Cofactr), so item 2 is unblocked on the account side.
+
+## Pass 6, 2026-11-04
+
+Main at `fe9fb350`. Live-verify root, my own agent-socket port (47661); another
+session's older `tod` (47611) kept running on the root and was not touched. No
+orchestrator redeploy. Sandbox binaries rebuilt locally (Docker) for the install.
+
+### Setup without `tod-cli capabilities enable`
+
+`tod-cli node create --title "RM p6 A" --parent eng-work` (allowed), then in the app:
+Settings on the node, "Add a capability...", Lifecycle. Agent and Files are inherited
+from `ENG work` (Claude opus medium; location `Golden flagship`, cloud sandbox), so
+the node had everything it needs with no blocked command and no database edit.
+The task panel then read "cloud sandbox, not made yet / on you: not started".
