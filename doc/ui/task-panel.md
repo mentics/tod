@@ -106,23 +106,22 @@ and reasons are in `doc/runner-menu/design.md`.
 
 | Runner is | Default action | Menu |
 |---|---|---|
-| never started, or done and moved back | **Start** | Check now, Run with a new session (when there is one), Migrate to…, Reset environment, Update workspace to latest main, Delete sandbox |
+| never started, or done and moved back | **Start** | Run with a new session, Check now, Migrate to…, Reset environment, Update workspace to latest main, Delete sandbox |
 | running | **Pause** (once the agent's turn ends) | Stop now (cancels the turn) |
-| paused, stopped, failed, or waiting on a request | **Resume** | Resume with a fresh budget, Run with a new session, Check now, and the rest as above |
+| paused, stopped, failed, or waiting on a request | **Resume** (none for a run that ended only to wait: the button reads "Actions", disabled, and its caret opens the menu) | Resume with a fresh budget, Run with a new session, Check now, and the rest as above |
 | stopped because its budget ran out | **Resume with a fresh budget** | Run with a new session, Check now, and the rest as above |
 | a conversation the user started by hand is running | **Stop now** | |
 | done | | Delete sandbox, Update workspace to latest main, Sync now (where they apply) |
 
-Further entries show when they apply: **Migrate to…** (a node with no
+Further entries show when they apply: **Adopt existing sandbox** (a node
+whose older records name a sandbox its Files location does not; it records it
+as the node's, after checking it is the node's and answers), **Migrate to…** (a node with no
 children), **Reset environment** (a dev container or cloud sandbox; sets the
 environment up again, deleting nothing), **Delete sandbox** and **Delete
 sandbox without a checkpoint** (a node with a cloud sandbox, even while it
 runs, in which case it asks first), and **Sync now** (a node whose runner is a
 supervisor in a sandbox). While a job of the panel's own is running the
-default shows what it is doing, disabled, and the menu is empty. The removed
-entries are Run in the cloud, Run on this machine instead, Move to the cloud,
-Stop running in the cloud, Keep going (now Resume), Poll now (now Check now)
-and Stop (now Stop now).
+default shows what it is doing, disabled, and the menu is empty.
 
 **Check now** runs the current state's gate check at once with no agent
 (`tod_core::lifecycle::check_now`): the same `phase::settle_gate` the
@@ -130,9 +129,10 @@ autopilot's gate step makes, then, when the gate is clear, the advance; in
 `pr_draft`, `approved` and `merged` it also looks at GitHub. It never starts
 or wakes the runner and is offered only while the runner is idle.
 
-The line says where the node runs: `in the cloud (sandbox …)`, `this machine`
-(with `dev container …` when its work is in one), or `not running in the
-cloud yet` for a node whose files are in a sandbox.
+The line says where the node runs: `in the cloud (sandbox …)` for a node
+supervised in a sandbox (`in the cloud (its Files location records no
+sandbox)` when only an older record names one; Adopt existing sandbox fixes
+that), `this machine` (with `dev container …` when its work is in one).
 
 **Where it runs.** Start looks at where the node's Files capability puts its
 work (`tod_core::runner_place`). Files on this machine or in a dev container:

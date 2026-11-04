@@ -63,9 +63,8 @@ pub struct Account {
     /// volumes).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub orchestrator_volume: Option<String>,
-    /// Node sandboxes are forked from a prepared base sandbox of this name
-    /// (`node_base = "..."`), made on first use; unset, or where forking is
-    /// refused, each is created from the image. See `tod_core::cloud_sync`.
+    /// Read and written back so an old file keeps parsing; nothing uses it
+    /// any more (node sandboxes fork the repository's golden, [`Self::goldens`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node_base: Option<String>,
     /// The golden sandbox of every repository that has none of its own in

@@ -55,8 +55,12 @@ background run — `provision::resolve_launch_cwd` makes its location:
 
 - a worktree (`ensure_worktree`, on this machine or in the dev container),
   on the node's branch; nodes on the same branch share it;
-- a sandbox from the image or as a fork (`Sandboxes::create`), named after
-  the node, then the node's branch checked out in the repository there.
+- a sandbox from `provision::make_sandbox`, the one creator of a node's
+  sandbox, named `tod-<slug>-<6 hex of the node id>` (no numeric suffix; a
+  name taken by a sandbox the location does not record is the error "tod lost
+  track of a sandbox", and nothing is made), forked from the repository's
+  golden or created from an image, then the node's branch checked out in the
+  repository there.
 
 Either way `origin` is fetched first (`worktree::fetch_origin`), so the work
 starts from the latest: a branch `origin` already has (work pushed before)
@@ -117,11 +121,19 @@ or below it: removing them needs the user.
   old per-node "Image with repositories" form). `tod-sandbox bake` does it.
 - The removal check sees shells and agents recorded for the node, not a
   conversation turn or autopilot run that is starting.
-- Start on a node whose Files are a cloud sandbox (its autonomous runner,
-  `doc/cloud-sandboxes/autonomous-nodes.md`) makes its sandbox through the
-  same creator as every other launch (`provision::make_sandbox`, named
-  `tod-<slug>-<6 hex of the node id>`), so the sandbox is the node's recorded
-  location and everything above applies to it. `cloud_sync::ensure_supervisor`
-  adds only what the supervisor needs on top: this build's relay and
-  supervisor (installed into a sandbox that lacks them), its settings, and a
-  poke.
+- A node has one sandbox, and its location row is the one record of it
+  (`node_files_locations.sandbox`); `cloud_nodes.sandbox` is only a copy for
+  the orchestrator, written from the location. Start on a node whose Files are
+  a cloud sandbox (its autonomous runner,
+  `doc/cloud-sandboxes/autonomous-nodes.md`) uses the same sandbox as every
+  other launch; `cloud_sync::ensure_supervisor` adds only what the supervisor
+  needs on top: this build's files when the sandbox does not answer with this
+  build's manifest, its settings, and a poke. A sandbox an older build
+  recorded only in `cloud_nodes` is adopted (menu entry **Adopt existing
+  sandbox**, and automatically at the app's start when unambiguous).
+- At `done` the daemon deletes the node's sandbox (with a checkpoint) unless
+  the lifecycle config's **Delete sandbox** is off for the node
+  (`tod_core::sandbox_retire`, `doc/runner-menu/design.md`).
+- Migrate to... is the task panel's way to move a node to another location;
+  it removes the old location after the impact dialog and keeps the node's
+  sessions.

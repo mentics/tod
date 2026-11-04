@@ -1,5 +1,9 @@
 # The runner menu, and one sandbox per node: implementation plan
 
+> This is the plan as it was executed; items name the entries and functions of that time (including
+> ones since removed, such as "Run in the cloud" and `ensure_node_sandbox`). The system as built is
+> [design.md](design.md); B6 below says where the build departed from the plan.
+
 The design is [design.md](design.md). **Stage A** rebuilds the runner menu and
 adds Migrate to…, on the records as they are; **Stage B** merges the two
 sandbox creators and the two records, moves tod's files into the golden, and
@@ -305,7 +309,8 @@ What landed, and where it departs from the text below:
   `node::install` follow), runs the node's checkout (`node::checkout`, with its
   auth retry), submodules, starts the relay (`node::start_relay`, which no
   longer starts the supervisor) and requires the relay to answer with this
-  build's manifest. A fork installs nothing. A failure after the sandbox
+  build's manifest. (A fork installs no *packages*; the live check showed it
+  must still be given tod's files: see B6.) A failure after the sandbox
   exists deletes it and forgets the location. `Sandboxes::create_with_proxy`
   is gone (`Sandboxes::create` remains for `tod-sandbox create`/`fork`, which
   make workspace sandboxes by hand), as are `node::provision`, `node::start`,
@@ -436,7 +441,7 @@ What landed, and where it departs from the text below:
 - Kept on purpose: the orphan sweeper's known names still include every
   `cloud_nodes` row (another machine's node protects its sandbox from being
   listed as an orphan).
-- Until B5 (now done, below), a node started before B2 that has a `cloud_nodes` row and no
+- Until B5 (done, below), a node started before B2 that has a `cloud_nodes` row and no
   location is not acted on (the panel says its Files location records no
   sandbox, the check reports it, Start makes a new sandbox through the creator
   or fails with the lost-track error if the old sandbox has that name). The
@@ -513,12 +518,75 @@ its call in `sync_once` are removed. The runner check is `lost::runner_blocker`
 
 ### B6. Docs
 
-- `doc/files-locations.md` (one creator; Known gaps), `doc/cloud-sandboxes/
-  autonomous-nodes.md` ("Interactive sandboxes": one creator now, the node's sandbox),
-  `doc/cloud-sandboxes/setup.md` (the golden and `tod-sandbox golden refresh`),
-  `blaxel-remote.md` if it describes `create_with_proxy` for nodes,
-  `doc/architecture.md` ("Where the work runs"), `.claude/CLAUDE.md` ("Cloud
-  sandboxes are the third place"; `cloud_nodes`).
+**B6 status: done.** The docs and the project instructions now describe the
+system as built:
+
+- `doc/runner-menu/design.md` is the as-built description (one sandbox per
+  node, the one record, the golden and what a fork still needs, the creator's
+  names and the "lost track" error, adoption, the runner menu with the entries
+  the code has, the automatic delete at `done`); the removed menu entries
+  survive only in its "Historical" section.
+- `doc/cloud-sandboxes/autonomous-nodes.md` ("Where a node runs": the daemon
+  or the node's own supervisor, decided by where the Files are),
+  `setup.md` (golden, refresh, stamps, names, adoption, automatic delete,
+  the unused `node_base`), `blaxel-remote.md`, `doc/files-locations.md`,
+  `doc/ui/task-panel.md` (Adopt existing sandbox, the "Actions" face), and
+  `doc/architecture.md` ("Where the work runs").
+- `.claude/CLAUDE.md`: the Cloud sandboxes bullet (one creator, one record,
+  golden, adoption, automatic delete), the task-panel runner sentence, and the
+  Agent chat context section, which described a conversation view, a
+  lifecycle panel and Implement/Verify/Review/Advance buttons that no longer
+  exist (`crates/tod-ui/src/conversation/` is gone; Ctrl+J toggles the chat
+  drawer; gates are checked by the autopilot's `gate` step and Check now).
+- Comments in code that said otherwise: `make_sandbox`, `golden.rs` (a fork
+  does install tod's files, without packages), `runner_menu.rs`,
+  `lifecycle_control.rs`, `ui/journey.rs`, and the orchestrator broker's
+  "run it in the cloud again" (now "start it again", which takes effect when
+  the orchestrator is next redeployed).
+- Corrections to this plan, found by the live check
+  ([live-check-2026-11.md](live-check-2026-11.md), Pass 3): B2's "a fork
+  installs nothing" does not hold on Blaxel, because the proxy update that
+  ends `fork_golden` redeploys the fork from its image; `make_sandbox` installs
+  tod's files into each fork (`node::install_into_fork`, no packages) and
+  `golden refresh` sets the golden's proxy before installing.
+
+Also in B6: `sandboxes.toml` is no longer overwritten by a writer that loaded
+it minutes earlier (`Config::save_changes`: each writer saves only the keys it
+changed onto the file as it is now, under a lock; seen twice live as the golden
+mapping going back to a deleted golden), and the failure text after a fork that
+was never made no longer says the sandbox "was deleted".
+
+### What remains
+
+Not verified live, or known and not fixed (the source is
+[live-check-2026-11.md](live-check-2026-11.md), Pass 3 unless noted):
+
+- **Migrate:** the same Claude session id resuming at the new place (5b, needs
+  Claude signed in on the host; 5c compared nothing but the transfer); the
+  Pause / Stop now / Cancel prompt while a *supervised* run is active, and a
+  pending Migrate queued behind a Pause on a sandbox that will not wake (5d,
+  pass 2); the log pull limited to the node's own sessions (pass 2, bug 8, not
+  re-run).
+- **Stale row after Migrate right after Stop now (9):** reproduced once, not
+  fixed. The sketch: after the removal sync, re-read the `cloud_nodes` row and
+  remove it again if the supervisor's last push brought it back.
+- **Delete at `done` (7):** only walked with `node_lifecycle.state` set in the
+  database, never through a real lifecycle to a merged PR; its failure path and
+  the 1/5/15/60-minute retries were not provoked (7c); a node that reached
+  `done` while the daemon was off was not tried.
+- **Adopt existing sandbox:** only the "Blaxel no longer has it" answer was
+  seen; adopting a live sandbox (`Live`: the relay manifest and checkout
+  probe through a real sandbox) was not.
+- **Golden:** the "both stamps" refusal for a golden a *newer* tod made (1b)
+  was not reached; the same-order-different-stamp refresh was not exercised.
+- **Check now:** a clear gate advancing a node in `pr_draft` (pass 2 only did
+  `proposed`).
+- **Blaxel standby:** a fork left `STANDBY` answering `WORKLOAD_UNAVAILABLE`
+  for 25+ minutes (bug 5): every operation failed loudly after 82-90 s, only
+  Delete without a checkpoint cleared it. Tod cannot do more than say so.
+- **`sandboxes.toml` merge:** unit-tested (two interleaved writers, eight
+  threads, a creation that outlives a `golden refresh`), not re-run against a
+  real second app on one root.
 
 ## Open questions
 

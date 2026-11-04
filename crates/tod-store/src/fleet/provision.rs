@@ -491,7 +491,7 @@ fn choose_sandbox(
     }
 }
 
-/// Everything that belongs in an interactive sandbox's proxy: the user's
+/// Everything that belongs in a node sandbox's proxy: the user's
 /// GitHub, Linear, and Claude tokens (as autonomous nodes get them) and the
 /// node's Environment secrets with hosts. A failure reading the Environment
 /// is reported through `progress` and leaves those out. Reads the credential

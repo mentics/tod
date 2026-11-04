@@ -75,7 +75,7 @@ impl Host {
     }
 
     // The daemon command stays (a running run polls on its own); the task
-    // panel no longer has a Poll now entry.
+    // panel has no entry for it (Check now replaced Poll now).
     #[allow(dead_code)]
     fn poll_now(&self, node: Uuid) {
         match self {

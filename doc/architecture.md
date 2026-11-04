@@ -245,8 +245,24 @@ launch takes, so the rest of the code does not branch on where it runs.
 | Dev container, repository mounted | here | `docker exec` | the same relay |
 | Cloud sandbox | `tod-sandbox exec` through the relay | `tod-sandbox agent` bridged to the relay | the relay's tunnel back to this machine, or the orchestrator when it runs under a supervisor |
 
-Nothing starts or builds a container; tod only uses a running one. A
-sandbox is awake only while it has work, and every hold on it expires or is
+Nothing starts or builds a container; tod only uses a running one.
+
+A node has **one cloud sandbox**, and its Files location row is the one
+record of it (`node_files_locations.sandbox`; `cloud_nodes` keeps only the
+supervisor's and orchestrator's state and a copy of the name for the
+orchestrator). `provision::make_sandbox` is the only creator, whether the
+sandbox serves a chat, a shell, or the supervisor: it is named
+`tod-<slug>-<6 hex>`, forked from the repository's **golden** (one per
+repository, carrying the toolchain, the checkout and tod's files;
+`tod-sandbox golden`, refreshed when this build is newer) or created from an
+image, and then given the node's environment, proxy rules, checkout and a copy
+of tod's files (a fork's proxy update wipes what the golden had installed). A
+sandbox an older build recorded only in `cloud_nodes` is adopted. At `done`
+the daemon deletes the node's sandbox (with a checkpoint) unless the lifecycle
+config's **Delete sandbox** is off, and the runner menu's Delete sandbox does
+it on demand. `doc/runner-menu/design.md`.
+
+A sandbox is awake only while it has work, and every hold on it expires or is
 cleared by the hourly watchdog, so a crash never leaves one awake.
 `doc/files-locations.md`, `doc/cloud-sandboxes/`.
 

@@ -230,7 +230,7 @@ pub enum NewSandboxSource {
 }
 
 impl Sandboxes {
-    /// The user's credentials for an interactive sandbox's proxy and agent
+    /// The user's credentials for a node sandbox's proxy and agent
     /// launch, as autonomous nodes get them: GitHub, Linear, and the Claude
     /// subscription token from the credential store, with `custom` (the
     /// node's Environment secrets with hosts). There is no Blaxel token: no
@@ -529,7 +529,7 @@ pub fn dead_reason(info: &tod_sandbox::blaxel::SandboxInfo) -> Option<String> {
     field("status", &info.status).or_else(|| info.state.as_deref().and_then(|state| field("state", state)))
 }
 
-/// Whether an interactive sandbox's proxy was made with exactly the rules
+/// Whether a node sandbox's proxy was made with exactly the rules
 /// `creds` gives now (its `tod-creds` label, a fingerprint of every rule
 /// and secret; a sandbox from before the label counts as having none).
 pub fn interactive_proxy_is_current(

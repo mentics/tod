@@ -171,7 +171,9 @@ it refuses with "fork feature is not enabled for this workspace".
 **The golden sandbox, one per repository.** A node's sandbox is a fork of
 its project's golden, which holds the repository, the dependencies, and tod's
 own files (relay, shim, Linux `tod-cli`, supervisor, bundles, Claude adapter),
-so a fork installs nothing of tod's. `tod-sandbox golden` lists the goldens;
+so a fork needs no packages (a node's fork still gets tod's files again,
+without packages: the proxy update that gives it the node's rules redeploys it
+from its image and drops what the golden had installed). `tod-sandbox golden` lists the goldens;
 `golden <owner/name>` shows one; `golden <owner/name> <sandbox>` points a
 repository at a sandbox (a name ending in `*` is the newest sandbox with that
 prefix). A `golden = "..."` from before there was one per repository is read
@@ -187,9 +189,14 @@ made it (`tod-kind=golden`) and no other setting points at it. The library
 entry `tod_core::cloud_sync::golden::ensure_golden_current` does the same
 only when needed: the same stamp is used; an older golden (by schema, wire,
 then commit time) or one of the same order but another stamp (a build with
-local changes) is refreshed forward; a **newer** golden is refused, naming the
+local changes) is refreshed forward, and one with no `tod-install` label (made
+by hand) counts as older than any build; a **newer** golden is refused, naming the
 repository and both stamps, since a fork would run a newer supervisor against
-this older tod's schema. Nothing in the app calls it yet.
+this older tod's schema. The app calls it before making a node's sandbox from
+a golden (through `SandboxHost::current_golden`), saying in the progress when
+it refreshes. `tod-sandbox golden refresh` gives the new golden a placeholder
+proxy first and installs tod's files after it, because a proxy update
+redeploys a sandbox from its image.
 
 *Live check* (not run in tests: there is no fake Blaxel; use a throwaway
 workspace or data root, never the live one). With a golden set for a test
@@ -224,8 +231,20 @@ start; empty uses the default image from Settings) and *A fork of a sandbox*
 (pick one from the list of the workspace's sandboxes; see **Forks** above).
 Either way it must already hold the repository: give the workspace directory
 as its path there (`/root/app`). A baked image takes seconds, any other image
-a minute or more. Each sandbox is named after its node and checks out the
-node's own branch (`task/<slug>` unless set). See
+a minute or more. Each sandbox is named `tod-<slug>-<6 hex of the node id>`
+(never with a numeric suffix) and checks out the node's own branch
+(`task/<slug>` unless set). A node has exactly one sandbox, and the same one
+serves its chat, shells, agent turns and, when the node runs there, its
+supervisor (Start). If Blaxel already has a sandbox of that name that the
+node's Files location does not record, creating fails with "tod lost track of
+a sandbox" and changes nothing: delete it (`tod-sandbox delete <name>`) or
+adopt it. **Adopt existing sandbox** in the task panel's runner menu (shown
+only for a node whose older records name one) records a sandbox an older tod
+made for the node. When the node reaches `done`, the daemon deletes its
+sandbox after checkpointing uncommitted work (the lifecycle config's **Delete
+sandbox**, on by default, inherited), checking about once a minute, retrying a
+failure after 1, 5, 15 and 60 minutes and reporting it on the node; the
+runner menu's Delete sandbox does the same on demand. See
 [../files-locations.md](../files-locations.md) for how these are kept and
 removed. An agent can pick an existing location (it cannot create or edit
 one):
@@ -304,18 +323,14 @@ scheduler = "blaxel"                        # who wakes a waiting node: "orchest
 [blaxel]
 orchestrator = "tod-orchestrator"           # the orchestrator sandbox's name (default)
 orchestrator_volume = "tod-orchestrator-data" # keep its /data on a volume (see orchestrator.md)
-node_base = "tod-node-base"                 # fork node sandboxes from this base (needs forking)
 ```
 
 `scheduler = "blaxel"` has each node's supervisor schedule its own wake on
 its sandbox (a Blaxel schedule; the workspace needs sandbox schedules, and
 the node's proxy adds the token, so prefer an API key, whose token does not
 expire); `"orchestrator"` has the orchestrator's timer poke it. It is read
-when a node's sandbox is created. `node_base` makes a base sandbox with the
-relay, supervisor, and bundles once (again when any of them, the
-credentials, the image, or the orchestrator change) and forks each new node
-from it; where forking is refused, nodes are created from the image as
-without it, so leave it unset there, or the base sits unused. See
+when a node's sandbox is created. (An old `node_base = "..."` is still read
+and ignored: the per-repository golden replaced the per-user base.) See
 [autonomous-nodes.md](autonomous-nodes.md), Development account.
 
 ## Running a node in the cloud without the window
@@ -345,7 +360,9 @@ a fresh data root, and `... node <title> <repo> <branch> <step>...` a node
 in it (`active`, with Lifecycle, Agent, and Files on the repository, an
 HTTPS URL or a checkout, and one plan step per argument), printing its
 UUID; `... state <node> proposed` starts it from the beginning instead,
-and `... stop <node>` takes it out of the cloud and deletes its sandbox. Build the sandbox
+and `... stop <node>` takes it out of the cloud and deletes its sandbox (this
+developer tool predates the runner menu; the app's own ways are Start, Migrate
+to... and Delete sandbox). Build the sandbox
 binaries first, and never point it at a data root the app has open. Each
 run reports how long the sandbox took to come up and to be provisioned.
 
@@ -376,12 +393,12 @@ token changed later reaches a node when its sandbox is next created.
 token in the supervisor's environment instead (see
 [autonomous-nodes.md](autonomous-nodes.md), Credentials).
 
-**Interactive nodes** (Files "Cloud sandbox", where the app's own agent runs
-in the sandbox through `tod-sandbox agent`) use the same token and the same
-rules: their proxy holds GitHub (`api.github.com` Bearer, `github.com`
-Basic), Linear, and, with `claude_token_via = "proxy"`, `api.anthropic.com`,
-beside the node's Environment secrets (no Blaxel rules; no supervisor runs
-there). The agent process is launched with `CLAUDE_CODE_OAUTH_TOKEN` set to
+**Every node sandbox** (Files "Cloud sandbox"; one per node, whether the app's
+own agent runs in it through `tod-sandbox agent` or its supervisor does) has
+the same token and the same rules: its proxy holds GitHub (`api.github.com`
+Bearer, `github.com` Basic), Linear, and, with `claude_token_via = "proxy"`,
+`api.anthropic.com`, beside the node's Environment secrets, and the Blaxel and
+orchestrator rules the supervisor needs. The app's agent process is launched with `CLAUDE_CODE_OAUTH_TOKEN` set to
 the placeholder, `GH_TOKEN` a placeholder, `TOD_GITHUB_AUTH=proxy`, and
 `NODE_USE_ENV_PROXY=1`; with `"env"` it gets the real token on the agent
 process alone (never stored in the sandbox). A missing token just leaves its

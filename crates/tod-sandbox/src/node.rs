@@ -212,7 +212,7 @@ pub fn credentials_fingerprint(creds: &NodeCredentials, claude_via: ClaudeTokenV
     rules_fingerprint(&credential_rules(creds, claude_via))
 }
 
-/// The environment an agent launched in an interactive sandbox (not a
+/// The environment an agent launched by the app in a node's sandbox (not a
 /// supervised node) needs to use [`credential_rules`]: `NODE_USE_ENV_PROXY`
 /// (Node's fetch otherwise ignores the proxy), the GitHub placeholders, and
 /// the Claude token: a placeholder with [`ClaudeTokenVia::Proxy`], the real

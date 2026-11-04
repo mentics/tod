@@ -1,5 +1,9 @@
 # Autonomous nodes: implementation plan
 
+> **Historical.** The work items below were built; where a node runs and how its sandbox is made is now
+> described in [autonomous-nodes.md](autonomous-nodes.md) and [../runner-menu/design.md](../runner-menu/design.md).
+> The "Run in the cloud" action named here is now the task panel's Start.
+
 How to build [autonomous-nodes.md](autonomous-nodes.md). Each work item is
 sized for one agent, names what it depends on, and names what it owns, so
 that items running at the same time do not edit the same code. Everything is
