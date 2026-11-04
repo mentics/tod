@@ -1456,17 +1456,45 @@ pub fn sandbox_user_reason(sandbox: &str, recorded_user: &str, user: &str) -> Op
     })
 }
 
-/// Why `info`'s sandbox cannot be reused, if it cannot: [`sandbox_dead_reason`],
-/// else its workload not answering after the reachability wait (Blaxel's
-/// record can say `DEPLOYED` for a sandbox that is gone).
-pub fn sandbox_unusable_reason(bx: &tod_sandbox::blaxel::Blaxel, info: &tod_sandbox::blaxel::SandboxInfo) -> Option<String> {
-    if let Some(reason) = sandbox_dead_reason(info) {
-        return Some(reason);
+/// How long a wake of a node's supervisor waits for a sandbox in standby to
+/// answer. Blaxel answers 404 `WORKLOAD_UNAVAILABLE` (and 502-504) while one
+/// wakes; that is an outage to wait out, never a dead sandbox.
+pub const WAKE_WAIT: std::time::Duration = std::time::Duration::from_secs(90);
+
+/// What a wake does about the sandbox Blaxel reports for a node.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WakeVerdict {
+    /// Use it. Whether it answers yet is a bounded wait ([`WAKE_WAIT`]) whose
+    /// failure is an error, never a reason to replace it.
+    Use,
+    /// Replace it, for this reason: Blaxel has no such sandbox (a 404 on the
+    /// sandbox itself, not on its workload), or reports it terminal, or it was
+    /// made for another orchestrator user.
+    Replace(String),
+}
+
+/// Decides [`WakeVerdict`] from Blaxel's record `found` for the node's
+/// `sandbox` (`None`: Blaxel has none by that name), and `user_reason`
+/// ([`sandbox_user_reason`]). Pure: a sandbox that is merely not answering
+/// (standby, waking, `WORKLOAD_UNAVAILABLE`) is `Use`.
+pub fn wake_verdict(sandbox: &str, found: Option<&tod_sandbox::blaxel::SandboxInfo>, user_reason: Option<String>) -> WakeVerdict {
+    if let Some(reason) = user_reason {
+        return WakeVerdict::Replace(reason);
     }
-    let url = info.url.as_deref()?;
-    bx.wait_reachable(url, std::time::Duration::from_secs(90))
-        .err()
-        .map(|err| format!("sandbox {} does not answer: {err:#}", info.name))
+    match found {
+        None => WakeVerdict::Replace(format!("Blaxel has no sandbox {sandbox}")),
+        Some(info) => sandbox_dead_reason(info).map_or(WakeVerdict::Use, WakeVerdict::Replace),
+    }
+}
+
+/// The error for a sandbox that did not answer within [`WAKE_WAIT`]: names
+/// what failed and says nothing was replaced or deleted.
+pub fn still_waking_error(sandbox: &str, kind: &str, err: &anyhow::Error) -> anyhow::Error {
+    anyhow!(
+        "sandbox {sandbox} is still waking after {}s ({err:#}). It was not replaced or deleted; \
+         the {kind} request is recorded and the supervisor takes it once the sandbox answers. Try again in a minute",
+        WAKE_WAIT.as_secs()
+    )
 }
 
 /// What [`ensure_supervisor`] finds a node's sandbox needs to host the
@@ -2047,16 +2075,22 @@ pub fn wake_node_requesting(fleet: &FleetStore, root: &Path, node_id: &str, kind
     // replaced the way the lost-sandbox check does, then woken.
     let found = bx.get(&row.sandbox)?;
     // A sandbox in standby answers 502/503/504 and Blaxel's own 404 "workload
-    // is not ready" for up to ~30s after waking: every upload below waits it
-    // out, and one that never answers is replaced rather than reused.
+    // is not ready" for up to ~30s after waking, and WORKLOAD_UNAVAILABLE for
+    // longer in an outage. That is waited out below, bounded, and an error
+    // when it lasts: only Blaxel having no such sandbox, or reporting it
+    // terminal, replaces it (`wake_verdict`).
     let made_for = found.as_ref().and_then(|info| info.env("TOD_USER")).unwrap_or(&row.user);
-    let unusable = sandbox_user_reason(&row.sandbox, made_for, &user)
-        .or_else(|| found.as_ref().and_then(|info| sandbox_unusable_reason(&bx, info)));
-    if let Some(reason) = &unusable {
+    let verdict = wake_verdict(&row.sandbox, found.as_ref(), sandbox_user_reason(&row.sandbox, made_for, &user));
+    if let WakeVerdict::Replace(reason) = &verdict {
         tracing::warn!("cloud: {reason}; replacing it");
     }
-    let (row, info, replaced) = match found {
-        Some(info) if unusable.is_none() => (row, info, None),
+    let (row, info, replaced) = match (found, verdict) {
+        (Some(info), WakeVerdict::Use) => {
+            if let Some(url) = info.url.as_deref() {
+                bx.wait_reachable(url, WAKE_WAIT).map_err(|err| still_waking_error(&row.sandbox, kind, &err))?;
+            }
+            (row, info, None)
+        }
         _ => {
             let gone = row.sandbox.clone();
             let mut progress = |msg: &str| log_progress(&format!("replacing {gone}"), msg);

@@ -830,6 +830,33 @@ fn a_sandbox_is_dead_by_its_state_as_well_as_its_status() {
     }
 }
 
+#[test]
+fn a_sandbox_that_is_only_waking_is_used_never_replaced() {
+    // Standby, waking, or DEPLOYED with a workload answering WORKLOAD_UNAVAILABLE:
+    // none of it is terminal in Blaxel's record.
+    for (status, state) in [("DEPLOYED", Some("STANDBY")), ("DEPLOYED", None), ("DEPLOYING", None), ("DEPLOYED", Some("RUNNING"))] {
+        assert_eq!(wake_verdict("tod-x", Some(&info_with(status, state)), None), WakeVerdict::Use, "{status} {state:?}");
+    }
+}
+
+#[test]
+fn only_a_sandbox_blaxel_lacks_or_ends_or_made_for_another_user_is_replaced() {
+    assert!(matches!(wake_verdict("tod-x", None, None), WakeVerdict::Replace(r) if r.contains("no sandbox tod-x")));
+    assert!(matches!(wake_verdict("tod-x", Some(&info_with("TERMINATED", None)), None), WakeVerdict::Replace(_)));
+    assert!(matches!(wake_verdict("tod-x", Some(&info_with("DEPLOYED", Some("EXPIRED"))), None), WakeVerdict::Replace(_)));
+    let other = sandbox_user_reason("tod-x", "a", "b");
+    assert!(matches!(wake_verdict("tod-x", Some(&info_with("DEPLOYED", None)), other), WakeVerdict::Replace(_)));
+}
+
+#[test]
+fn a_sandbox_that_never_wakes_is_an_error_naming_it_and_saying_nothing_was_deleted() {
+    let err = still_waking_error("tod-x", REQUEST_PAUSE, &anyhow::anyhow!("last answer: 404 WORKLOAD_UNAVAILABLE"));
+    let text = format!("{err:#}");
+    for want in ["tod-x", "still waking", "WORKLOAD_UNAVAILABLE", "not replaced or deleted", "pause"] {
+        assert!(text.contains(want), "{want}: {text}");
+    }
+}
+
 /// A change the orchestrator refused is raised once per distinct error, as an
 /// error the user sees, with the orchestrator-is-older hint.
 #[test]
