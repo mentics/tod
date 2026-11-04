@@ -538,12 +538,32 @@ pub fn keep_node_state(fleet: &super::FleetStore, node_id: &str) -> Result<()> {
         return Ok(());
     };
     let root = fleet.paths().root();
-    pull_node(root, node_id, &sandbox)
-        .with_context(|| format!("Could not keep the agent session logs from sandbox {sandbox}"))?;
     let remote = SandboxRemote::new(&sandbox);
+    // Only this node's sessions: a sandbox forked from a golden also holds
+    // the golden's own Claude logs, which are not the node's to carry.
+    let local = local_dir(root, node_id);
+    for session in node_session_ids(fleet, node_id)? {
+        keep_session(&remote, &local, &session)
+            .with_context(|| format!("Could not keep the agent session {session} from sandbox {sandbox}"))?;
+    }
     keep_state_via(&|script, args| remote.sh(script, args), root, node_id)
         .with_context(|| format!("Could not keep the runner state from sandbox {sandbox}"))?;
     Ok(())
+}
+
+/// The agent session ids of the conversations about `node_id`.
+fn node_session_ids(fleet: &super::FleetStore, node_id: &str) -> Result<Vec<String>> {
+    let uuid = uuid::Uuid::parse_str(node_id).with_context(|| format!("node id {node_id}"))?;
+    fleet.read(|conn| {
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT agent_session_id FROM conversations
+             WHERE (focus_node_id = ?1 OR focus_id = ?1) AND agent_session_id IS NOT NULL AND agent_session_id != ''",
+        )?;
+        let ids = stmt
+            .query_map([crate::outline::uuid_blob::uuid_to_blob(uuid)], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(ids)
+    })
 }
 
 /// The sandbox `node_id` works in now: the one its Files location records,
@@ -696,6 +716,48 @@ mod tests {
         drop(conn);
         fleet.reload_if_stale().ok();
         assert_eq!(node_sandbox(&fleet, &id).unwrap(), None, "a lost sandbox is not kept or removed");
+        drop(fleet);
+        cleanup_fleet_root(&root);
+    }
+
+    /// Migrate carried every Claude log in the sandbox (the golden's own
+    /// included). Only the sessions of the node's conversations count.
+    #[test]
+    fn only_the_sessions_of_the_nodes_own_conversations_are_kept() {
+        use crate::conversation::{ConversationRepo, Focus, ProtocolKind};
+        use crate::fleet::test_util::{cleanup_fleet_root, temp_fleet_root};
+        use crate::outline::{CreatePosition, OutlineMutation};
+        let root = temp_fleet_root();
+        let fleet = crate::fleet::FleetStore::open(&root).unwrap();
+        fleet.enqueue_outline(OutlineMutation::CreateList { slug: "t".into(), title: "T".into() }).unwrap();
+        let list_id = fleet.list_outline_lists().unwrap()[0].id;
+        let mut ids = Vec::new();
+        for title in ["mine", "other"] {
+            let node = uuid::Uuid::new_v4();
+            fleet
+                .enqueue_outline(OutlineMutation::CreateNode {
+                    node_id: Some(node),
+                    list_id,
+                    parent_id: None,
+                    anchor_id: None,
+                    position: CreatePosition::Below,
+                    title: title.into(),
+                })
+                .unwrap();
+            ids.push(node);
+        }
+        fleet.writer().flush().unwrap();
+        let conn = rusqlite::Connection::open(root.join("tod.db")).unwrap();
+        for (node, session) in [(ids[0], "sess-mine"), (ids[1], "sess-other")] {
+            let repo = ConversationRepo::new(&conn);
+            let c = repo
+                .create_with_id(uuid::Uuid::new_v4(), Focus::Node(node), ProtocolKind::Implementation, None, None, None)
+                .unwrap();
+            repo.set_agent_session(c.id, Some(session), None).unwrap();
+        }
+        drop(conn);
+        fleet.reload_if_stale().ok();
+        assert_eq!(node_session_ids(&fleet, &ids[0].to_string()).unwrap(), vec!["sess-mine".to_string()]);
         drop(fleet);
         cleanup_fleet_root(&root);
     }

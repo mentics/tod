@@ -303,6 +303,16 @@ impl Account {
         }
     }
 
+    /// Every distinct golden setting there is (the account-wide one and each
+    /// repository's), for a caller that has no repository and must ask them all.
+    pub fn all_goldens(&self) -> Vec<String> {
+        let mut all: Vec<String> = self.goldens.values().map(|g| g.trim().to_string()).filter(|g| !g.is_empty()).collect();
+        all.extend(self.golden.as_deref().map(str::trim).filter(|g| !g.is_empty()).map(str::to_string));
+        all.sort_unstable();
+        all.dedup();
+        all
+    }
+
     /// Every golden setting, for a listing: `(repository or "*", setting)`.
     pub fn golden_settings(&self) -> Vec<(String, String)> {
         let mut out: Vec<(String, String)> = self.goldens.iter().map(|(r, g)| (r.clone(), g.clone())).collect();
@@ -451,6 +461,16 @@ impl Config {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn every_distinct_golden_is_listed_for_a_caller_with_no_repository() {
+        let c: Config = toml::from_str("scheduler = \"blaxel\"\n[blaxel]\nworkspace = \"w\"\n").unwrap();
+        let mut acct = c.blaxel.unwrap();
+        acct.golden = Some("wsx-golden-*".into());
+        acct.goldens.insert("acme/widget".into(), "tod-golden-acme".into());
+        acct.goldens.insert("acme/other".into(), "tod-golden-acme".into());
+        assert_eq!(acct.all_goldens(), vec!["tod-golden-acme".to_string(), "wsx-golden-*".to_string()]);
+    }
+
     use super::*;
 
     #[test]
