@@ -282,6 +282,58 @@ Sequential, except B5 alongside B4.
 
 ### B2. One creator
 
+**Status: done on branch `worktree-agent-a8ab91133663eaf0b` (not live-verified).**
+What landed, and where it departs from the text below:
+
+- **Layering.** `ensure_golden_current`, the orchestrator user, the install
+  files, the node's repository URL and the per-node bookkeeping stay in
+  `tod-core`; `tod-store` states what it needs as the `SandboxHost` trait
+  (`fleet/sandbox_host.rs`), `tod-core` implements it
+  (`cloud_sync/host.rs`), and each program that can make a sandbox registers
+  it once (`register_sandbox_host`: the app, `tod-agentd`, and
+  `ensure_supervisor`; a program that did not gets a loud error from
+  `make_sandbox`). A process-wide registration, not a parameter, because the
+  callers of `resolve_launch_cwd` are in every launch path. The alternative,
+  moving `TodInstallPaths`/`MediaPaths`/`SkillsPaths`, the sync contract and
+  the build stamp into `tod-store`, would put install-file discovery in the
+  persistence layer for no other use.
+- **Creator.** `make_sandbox` chooses the sandbox (`choose_sandbox`:
+  `sandbox_name`, `decide_name`), requires the orchestrator before anything is
+  made, records the intent and then the location, forks from the golden
+  (`SandboxHost::current_golden`) or creates from an image
+  (`Sandboxes::runtime_image` wraps a non-Blaxel image; bootstrap and
+  `node::install` follow), runs the node's checkout (`node::checkout`, with its
+  auth retry), submodules, starts the relay (`node::start_relay`, which no
+  longer starts the supervisor) and requires the relay to answer with this
+  build's manifest. A fork installs nothing. A failure after the sandbox
+  exists deletes it and forgets the location. `Sandboxes::create_with_proxy`
+  is gone (`Sandboxes::create` remains for `tod-sandbox create`/`fork`, which
+  make workspace sandboxes by hand), as are `node::provision`, `node::start`,
+  `free_sandbox_name`, `node_sandbox_name`, `live_cloud_sandbox`, and the
+  `e2e_env_proxy` / `e2e_env_recreate` examples that called it.
+- **`ensure_supervisor`** (`cloud_sync.rs`) replaces `ensure_node_sandbox` and
+  is what Start, a lost sandbox, a reinstall and Reset environment call:
+  `provision::retire_unusable_sandbox` (forgets a gone or dead sandbox; the
+  one-time upgrade of a sandbox whose `tod-kind` is not `node`: logs pulled,
+  work checkpointed, deleted, nothing deleted if either fails), then
+  `resolve_launch_cwd_with`, then `supervisor_state`: a sandbox that was
+  already there and does not answer with this build's manifest, or was given an
+  older install, gets this build's files (`install_into_fork`) and a restarted
+  relay; one made just now never does, and not answering is an error naming the
+  golden.
+- **One proxy path.** Every node sandbox carries `tod-creds`, the fingerprint
+  of all its proxy rules (`node::node_creds_fingerprint`); `refresh_sandbox_proxy`
+  compares and updates against the same rules, and `lost::refresh_credentials`
+  is a thin wrapper over it (no more delete-and-recreate for an autonomous
+  node).
+- **Not done here:** one record (B3): the creator still reads both the
+  location and `cloud_nodes.sandbox` as "the node's record"; a sandbox made by
+  `make_sandbox` is not yet written into `cloud_nodes` until `record_cloud_node`.
+  No fake Blaxel exists, so the create body, the name scheme and the
+  collision rule are tested as pure functions (`decide_name`,
+  `sandbox_name`, `supervisor_state`), and the creation itself waits for live
+  verification.
+
 - `fleet/provision.rs::make_sandbox` is the only creator, in `tod-store`, and
   every sandbox it makes can host the supervisor: from the golden,
   `ensure_golden_current`, then `node::fork_golden` (node environment, proxy
