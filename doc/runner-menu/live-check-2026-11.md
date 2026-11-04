@@ -246,3 +246,20 @@ draft PR Cofactr/workspace#192). A's plan step was changed to three foreground
    `the_node_label_counts_when_blaxel_masks_the_variable`. Verified live (5b/5c).
    Note: the automatic form runs in `tod-agentd` at its start, so a test needs the
    root's daemon restarted (`pkill -f "tod-agentd.*tod-live-verify"`), not only the app.
+
+| 4a | Delete at `done` through a more honest lifecycle | PASS for the trigger, driven as a user would: I moved `RM p4 C` to `done` with the task panel's lifecycle dropdown (no database edit for the state). Directly in the live-verify root's `tod.db` I only (1) enabled lifecycle-config on C with `tod-cli` and set its `node_lifecycle_config.delete_sandbox = 1` (the parent's stored 0 from pass 2 would otherwise inherit), and (2) deleted/re-created C's location row for the adopt checks above. The daemon (`agentd.log`) tried the retire 94 s after the move. A walk to `done` through a real merged PR was not done. |
+| 4b | Delete failure path | PASS. I made the checkpoint fail safely: in C's sandbox an uncommitted file plus `git remote set-url --push origin https://invalid.invalid/x.git`. `agentd.log` at 13:23:39: "Deleting the sandbox tod-rm-p4-c-a50ec6 of RM p4 C (it reached done) failed: the checkpoint ... failed, so nothing was deleted ... push ... failed: fatal: unable to access 'https://invalid.invalid/x.git/' ... It is tried again in 1 minute(s)." and the retry ran at 13:24:44 (65 s later) and failed again; nothing was deleted. |
+| 3 | Pause request on a standby sandbox, Migrate queued behind it | NOT REPRODUCED. Pause is only offered for an Active node (a live heartbeat); my throwaway nodes' supervisors exit after a turn (the sandbox then idles to STANDBY and the node shows "on you"/Resume), so there is no Active node on a standby sandbox to press Pause on, and every wake this pass (B and C from STANDBY, A's Pause) answered in seconds. The `still waking` path stays covered by the unit tests only. |
+| 9 | Blaxel standby hang (WORKLOAD_UNAVAILABLE 25+ min) | NOT REPRODUCED in this pass (all STANDBY sandboxes woke normally). |
+
+### Seen, not fixed (pass 4)
+
+10. **A failed delete-at-done is invisible in the app.** `sandbox_retire` reports it with
+    `session_log::report_problem`, which only fills a per-process list; `problems::record_pending`
+    drains it into the node's latest conversation, and it is called only by a conversation driver
+    (and only writes when the node has a conversation: `Ok(None) => {}`). In the daemon, where
+    the retire runs, nothing drains it, so the only trace is the WARN line in `daemon/agentd.log`
+    (and the retries). A node with a stuck sandbox shows "done" with no error. A fix needs a
+    place on the node for such a problem (not just a conversation turn); not designed here.
+11. The runner menu's facts (e.g. "Adopt existing sandbox") did not refresh after a direct
+    database change until the node was selected again (only for out-of-band edits, not a product path).
