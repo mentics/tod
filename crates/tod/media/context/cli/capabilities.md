@@ -12,7 +12,7 @@ tod-cli --data-root <DATA_ROOT> capabilities set     <NODE> files [--location <N
 tod-cli --data-root <DATA_ROOT> capabilities set     <NODE> ticket [--ticket <ID>] [--pr <URL>]...
 tod-cli --data-root <DATA_ROOT> capabilities set     <NODE> tags (--tags <A,B,..> | --add <TAG> | --remove <TAG>)
 tod-cli --data-root <DATA_ROOT> capabilities set     <NODE> generator --source <TYPE> --config <JSON>
-tod-cli --data-root <DATA_ROOT> capabilities set     <NODE> lifecycle-config (--phase <PHASE> --skills <A,B,..> | --clear <PHASE>)
+tod-cli --data-root <DATA_ROOT> capabilities set     <NODE> lifecycle-config (--phase <PHASE> [--skills <A,B,..>] [--model <TEXT>] [--effort <TEXT>] | --clear <PHASE>)
 tod-cli --data-root <DATA_ROOT> capabilities set     <NODE> groups --lifecycle <true|false>
 ```
 
@@ -27,12 +27,16 @@ valid keys named.
 Refreshing a generator updates every node that is one of its tickets,
 wherever that node came from.
 
-`lifecycle-config` sets the skills the agent for a phase uses, for the node and
-everything below it. `<PHASE>` is one of proposed, design, planning, implement,
-verify, review, fix, pr, merged, released, learn. `--skills` replaces that
-phase's list (`--skills ''` means none, even where an ancestor sets some);
-`--clear` removes the phase from this node so the nearest ancestor's applies
-again. Other phases are untouched.
+`lifecycle-config` sets the skills the agent for a phase uses, and the model
+and effort it runs with, for the node and everything below it. `<PHASE>` is one
+of proposed, design, planning, implement, verify, review, fix, pr, pr_draft,
+pr_review, merged, released, learn. `--skills` replaces that phase's list
+(`--skills ''` means none, even where an ancestor sets some). `--model` and
+`--effort` set that phase's (`--model ''` unsets one, so an ancestor's, the
+node's Agent capability, or the settings apply again); each resolves on its own
+from the nearest node that sets it, and wins over the Agent capability for that
+phase only. `--clear` removes the phase from this node so the nearest ancestor's
+applies again. Other phases are untouched.
 
 `--skills` takes names separated by commas. A semicolon starts a new group:
 the first group is worked in the phase agent's own session and every later one

@@ -27,7 +27,7 @@ COMMANDS:
     set     <NODE> ticket [--ticket <ID>] [--pr <URL>]...
     set     <NODE> tags (--tags <A,B,..> | --add <TAG> | --remove <TAG>)
     set     <NODE> generator --source <TYPE> --config <JSON>
-    set     <NODE> lifecycle-config (--phase <PHASE> --skills <A,B,..> | --clear <PHASE>)
+    set     <NODE> lifecycle-config (--phase <PHASE> [--skills <A,B,..>] [--model <TEXT>] [--effort <TEXT>] | --clear <PHASE>)
     set     <NODE> groups --lifecycle <true|false>
 
 `list` shows the enabled capabilities and each one's settings. `enable` adds
@@ -41,11 +41,15 @@ empty value (`--model ''`) clears one. A node is at most one ticket:
 on the node instead. `--pr` replaces the whole list when given. The capability must already be enabled. A node's lifecycle
 state cannot be set here.
 
-`lifecycle-config` sets the skills the agent for a phase uses, for this node
-and everything below it. <PHASE> is one of proposed, design, planning,
-implement, verify, review, fix, pr, merged, released, learn. `--skills` replaces
-that phase's list (`--skills ''` means no skills, even where an ancestor sets
-some); `--clear` removes the phase from this node so the nearest ancestor's
+`lifecycle-config` sets the skills the agent for a phase uses, and the model
+and effort it runs with, for this node and everything below it. <PHASE> is one
+of proposed, design, planning, implement, verify, review, fix, pr, pr_draft,
+pr_review, merged, released, learn. `--skills` replaces that phase's list
+(`--skills ''` means no skills, even where an ancestor sets some); `--model`
+and `--effort` set that phase's (`--model ''` unsets one, so an ancestor's, the
+node's Agent capability, or the settings apply again); each resolves on its own
+from the nearest node that sets it, and wins over the Agent capability for that
+phase only. `--clear` removes the phase from this node so the nearest ancestor's
 applies again. Other phases are untouched.
 
 `--skills` takes names separated by commas. A semicolon starts a new group:
@@ -232,20 +236,37 @@ fn list(inv: &Invocation, node: Uuid) -> anyhow::Result<String> {
                 "environment: see `tod-cli environment list`".to_string()
             }
             Capability::LifecycleConfig => {
-                let skills = inv
-                    .client()
-                    .read(|conn| tod_store::lifecycle_config::skills(conn, node))?;
-                if skills.is_empty() {
+                let (skills, agents) = inv.client().read(|conn| {
+                    Ok((
+                        tod_store::lifecycle_config::skills(conn, node)?,
+                        tod_store::lifecycle_config::agents(conn, node)?,
+                    ))
+                })?;
+                let phases: std::collections::BTreeSet<&String> = skills.keys().chain(agents.keys()).collect();
+                if phases.is_empty() {
                     "lifecycle-config: no phases set".to_string()
                 } else {
-                    let phases: Vec<String> = skills
-                        .iter()
-                        .map(|(phase, names)| {
-                            if names.is_empty() {
-                                format!("{phase}: none")
-                            } else {
-                                format!("{phase}: {}", tod_store::lifecycle_config::format_list(names))
+                    let phases: Vec<String> = phases
+                        .into_iter()
+                        .map(|phase| {
+                            let mut parts = Vec::new();
+                            match skills.get(phase) {
+                                Some(names) if names.is_empty() => parts.push("skills none".to_string()),
+                                Some(names) => parts.push(format!(
+                                    "skills {}",
+                                    tod_store::lifecycle_config::format_list(names)
+                                )),
+                                None => {}
                             }
+                            if let Some(agent) = agents.get(phase) {
+                                if let Some(model) = &agent.model {
+                                    parts.push(format!("model {model}"));
+                                }
+                                if let Some(effort) = &agent.effort {
+                                    parts.push(format!("effort {effort}"));
+                                }
+                            }
+                            format!("{phase}: {}", parts.join(", "))
                         })
                         .collect();
                     format!("lifecycle-config: {}", phases.join("; "))
@@ -438,9 +459,12 @@ fn set(inv: &Invocation, node: Uuid, args: &Args) -> anyhow::Result<String> {
             }
         }
         Capability::LifecycleConfig => {
-            let mut skills = inv
-                .client()
-                .read(|conn| tod_store::lifecycle_config::skills(conn, node))?;
+            let (mut skills, mut agents) = inv.client().read(|conn| {
+                Ok((
+                    tod_store::lifecycle_config::skills(conn, node)?,
+                    tod_store::lifecycle_config::agents(conn, node)?,
+                ))
+            })?;
             let phase_ok = |phase: &str| -> anyhow::Result<()> {
                 if tod_store::lifecycle_config::is_phase(phase) {
                     Ok(())
@@ -451,20 +475,44 @@ fn set(inv: &Invocation, node: Uuid, args: &Args) -> anyhow::Result<String> {
                     )
                 }
             };
-            match (args.get("--phase"), args.get("--skills"), args.get("--clear")) {
-                (Some(phase), Some(names), None) => {
+            let (names, model, effort) = (args.get("--skills"), args.get("--model"), args.get("--effort"));
+            // The two halves are separate rows' columns, so a change to one
+            // is one mutation; both change only when both are given.
+            let mut mutations = Vec::new();
+            match (args.get("--phase"), args.get("--clear")) {
+                (Some(phase), None) if names.is_some() || model.is_some() || effort.is_some() => {
                     phase_ok(phase)?;
-                    skills.insert(phase.to_string(), tod_store::lifecycle_config::parse_list(names)?);
+                    if let Some(names) = names {
+                        skills.insert(phase.to_string(), tod_store::lifecycle_config::parse_list(names)?);
+                        mutations.push(OutlineMutation::SetNodeLifecycleConfig { node_id: node, skills });
+                    }
+                    if model.is_some() || effort.is_some() {
+                        let agent = agents.entry(phase.to_string()).or_default();
+                        if let Some(model) = model {
+                            agent.model = Some(model.to_string()).filter(|m| !m.trim().is_empty());
+                        }
+                        if let Some(effort) = effort {
+                            agent.effort = Some(effort.to_string()).filter(|e| !e.trim().is_empty());
+                        }
+                        mutations.push(OutlineMutation::SetNodeLifecycleAgents { node_id: node, agents });
+                    }
                 }
-                (None, None, Some(phase)) => {
+                (None, Some(phase)) => {
                     phase_ok(phase)?;
                     skills.remove(phase);
+                    agents.remove(phase);
+                    mutations.push(OutlineMutation::SetNodeLifecycleConfig { node_id: node, skills });
+                    mutations.push(OutlineMutation::SetNodeLifecycleAgents { node_id: node, agents });
                 }
                 _ => anyhow::bail!(
-                    "give `--phase <PHASE> --skills <A,B,..>` or `--clear <PHASE>`"
+                    "give `--phase <PHASE>` with `--skills <A,B,..>`, `--model <TEXT>` and/or `--effort <TEXT>`, or `--clear <PHASE>`"
                 ),
             }
-            OutlineMutation::SetNodeLifecycleConfig { node_id: node, skills }
+            let last = mutations.pop().expect("at least one mutation");
+            for mutation in mutations {
+                write(inv, mutation)?;
+            }
+            last
         }
         Capability::Groups => {
             let on = match args.require("--lifecycle")?.trim() {

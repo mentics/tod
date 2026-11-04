@@ -376,22 +376,25 @@ impl ConversationDriver {
         let kind = self.protocol.kind();
         match &self.config.settings_path {
             Some(path) => crate::conversation::launch::try_resolve_from(fleet, path, self.focus, kind),
-            None => crate::conversation::launch::try_for_focus(fleet, self.focus, self.config.launch.clone()),
+            None => {
+                let phase = crate::conversation::launch::phase_for(fleet, self.focus, kind);
+                crate::conversation::launch::try_for_focus(fleet, self.focus, phase.as_deref(), self.config.launch.clone())
+            }
         }
     }
 
     /// What the next turn launches with: the settings for this kind of
-    /// conversation, and the focus node's Agent capability over them. Reads
+    /// conversation, the focus node's Agent capability over them, and the
+    /// Lifecycle config's model and effort for the phase over that. Reads
     /// the settings file and the store.
     pub fn launch_options(&self, fleet: &FleetStore) -> AgentLaunchOptions {
         let kind = self.protocol.kind();
         match &self.config.settings_path {
             Some(path) => crate::conversation::launch::resolve_from(fleet, path, self.focus, kind),
-            None => crate::conversation::launch::for_focus(
-                fleet,
-                self.focus,
-                self.config.launch.clone(),
-            ),
+            None => {
+                let phase = crate::conversation::launch::phase_for(fleet, self.focus, kind);
+                crate::conversation::launch::for_focus(fleet, self.focus, phase.as_deref(), self.config.launch.clone())
+            }
         }
     }
 

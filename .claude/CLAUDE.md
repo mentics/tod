@@ -592,7 +592,12 @@ A hierarchical task/outline model with its own DDL/migration path (`ddl.rs`, `mi
 
 **Lifecycle config** (`Capability::LifecycleConfig`, `tod_store::lifecycle_config`,
 table `node_lifecycle_config`) holds, per phase, an ordered list of skill names
-the agent for that phase should use. It is a capability of its own, not part of
+the agent for that phase should use, and the model and effort it runs with
+(`agents` column, `lifecycle_config::resolve_agent`: each field from the
+nearest node that sets it, applied in `conversation::launch` over the node's
+Agent capability and the settings for that phase's conversations only, the
+phase agent, the evaluator and every skill group alike; the phase a kind runs
+in is `launch::phase_for`). It is a capability of its own, not part of
 Lifecycle, because it is meant for one or two high-level nodes and inherited by
 everything below: `lifecycle_config::resolve` takes the nearest node, from the
 node itself up, that lists the phase (so a lower node overrides per phase, and an
@@ -637,7 +642,8 @@ container, or sandbox, off the UI thread). A name with no file (a built-in
 such as `simplify`) is passed on for the agent's Skill tool, and the block
 says so. Edited in
 the task editor (`views::lifecycle_config_editor`) or with `tod-cli capabilities
-set <node> lifecycle-config`. Edits are not recorded in a conversation's change set.
+set <node> lifecycle-config` (`--skills`, `--model`, `--effort`). Edits are not
+recorded in a conversation's change set.
 
 **Groups** (`Capability::Groups`, `tod_store::groups`, table `node_groups`)
 has one setting, `by_lifecycle`. The node tree then shows the node's children

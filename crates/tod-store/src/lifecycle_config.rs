@@ -1,5 +1,5 @@
 //! The Lifecycle config capability: the skills the agent for each lifecycle
-//! phase should use.
+//! phase should use, and the model and effort it runs with.
 //!
 //! It is its own capability, not part of Lifecycle, because Lifecycle sits on
 //! nearly every leaf node while this is meant for one or two high-level nodes
@@ -8,6 +8,12 @@
 //! one JSON row). A node's skills for a phase come from the nearest node, from
 //! itself up, that lists that phase ([`resolve`]); an explicit empty list
 //! means no skills, and stops an ancestor's list applying below.
+//!
+//! The model and effort for a phase (`agents`, one JSON row beside the skills)
+//! resolve field by field the same way ([`resolve_agent`]): the nearest node
+//! that sets the phase's model gives the model, the nearest that sets its
+//! effort gives the effort. A launch applies them over the node's Agent
+//! capability and the settings, so a phase's choice wins for that phase only.
 
 use crate::outline::uuid_blob::{now_ms, uuid_to_blob};
 use anyhow::{Result, bail};
@@ -20,8 +26,21 @@ CREATE TABLE IF NOT EXISTS node_lifecycle_config (
     node_id     BLOB PRIMARY KEY NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
     skills      TEXT NOT NULL DEFAULT '{}',
     updated_at  INTEGER NOT NULL,
-    delete_sandbox INTEGER
+    delete_sandbox INTEGER,
+    agents      TEXT NOT NULL DEFAULT '{}'
 );";
+
+/// The `agents` column (idempotent, no schema bump: the sync copies only the
+/// columns both sides have): the model and effort by phase, as JSON.
+pub fn add_agents(conn: &Connection) -> Result<()> {
+    let has = conn
+        .prepare("SELECT 1 FROM pragma_table_info('node_lifecycle_config') WHERE name = 'agents'")?
+        .exists([])?;
+    if !has {
+        conn.execute_batch("ALTER TABLE node_lifecycle_config ADD COLUMN agents TEXT NOT NULL DEFAULT '{}'")?;
+    }
+    Ok(())
+}
 
 /// The `delete_sandbox` column (schema v92, idempotent): NULL means this node
 /// says nothing and the nearest ancestor that does decides.
@@ -125,6 +144,35 @@ pub fn groups(list: &[String]) -> Vec<Vec<String>> {
     list.split(|n| n == GROUP_BREAK).map(<[String]>::to_vec).collect()
 }
 
+/// The model and effort the agent for one phase runs with, as stored on one
+/// node. Either may be unset, leaving it to an ancestor, the node's Agent
+/// capability, or the settings. Free text, like the Agent capability's: the
+/// launch coerces a value its platform does not know to the default.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PhaseAgent {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+}
+
+impl PhaseAgent {
+    pub fn is_empty(&self) -> bool {
+        self.model.is_none() && self.effort.is_none()
+    }
+}
+
+/// Model and effort by phase key, as stored on one node.
+pub type Agents = BTreeMap<String, PhaseAgent>;
+
+/// The model and effort for one phase after inheritance, each with the node
+/// it came from. `None` where no node sets it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ResolvedAgent {
+    pub model: Option<(String, Uuid)>,
+    pub effort: Option<(String, Uuid)>,
+}
+
 /// The skills for one phase after inheritance, and the node they came from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Resolved {
@@ -196,6 +244,65 @@ pub fn resolve(conn: &Connection, node_id: Uuid, phase: &str) -> Result<Option<R
         }
     }
     Ok(None)
+}
+
+/// The model and effort defined on `node_id` itself, by phase.
+pub fn agents(conn: &Connection, node_id: Uuid) -> Result<Agents> {
+    let has = conn
+        .prepare("SELECT 1 FROM pragma_table_info('node_lifecycle_config') WHERE name = 'agents'")?
+        .exists([])?;
+    if !has {
+        return Ok(Agents::new());
+    }
+    let raw: Option<String> = conn
+        .query_row(
+            "SELECT agents FROM node_lifecycle_config WHERE node_id = ?1",
+            params![uuid_to_blob(node_id)],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(raw.and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default())
+}
+
+/// Replace the model and effort by phase on `node_id`. Rejects an unknown
+/// phase; trims values, and drops a blank one and a phase that sets nothing.
+pub fn set_agents(conn: &Connection, node_id: Uuid, config: &Agents) -> Result<()> {
+    let mut clean = Agents::new();
+    for (phase, agent) in config {
+        if !is_phase(phase) {
+            bail!("{phase} is not a lifecycle phase ({})", PHASES.join(", "));
+        }
+        let trim = |v: &Option<String>| v.as_deref().map(str::trim).filter(|v| !v.is_empty()).map(String::from);
+        let agent = PhaseAgent { model: trim(&agent.model), effort: trim(&agent.effort) };
+        if !agent.is_empty() {
+            clean.insert(phase.clone(), agent);
+        }
+    }
+    conn.execute(
+        "INSERT INTO node_lifecycle_config (node_id, skills, updated_at, agents) VALUES (?1, '{}', ?2, ?3)
+         ON CONFLICT(node_id) DO UPDATE SET agents = excluded.agents, updated_at = excluded.updated_at",
+        params![uuid_to_blob(node_id), now_ms(), serde_json::to_string(&clean)?],
+    )?;
+    Ok(())
+}
+
+/// The model and effort for `phase` on `node_id`, each from the nearest
+/// node, from itself up, that sets it.
+pub fn resolve_agent(conn: &Connection, node_id: Uuid, phase: &str) -> Result<ResolvedAgent> {
+    let mut out = ResolvedAgent::default();
+    for id in crate::outline::ancestor_chain(conn, node_id)?.into_iter().rev() {
+        let Some(agent) = agents(conn, id)?.remove(phase) else { continue };
+        if out.model.is_none() && let Some(model) = agent.model {
+            out.model = Some((model, id));
+        }
+        if out.effort.is_none() && let Some(effort) = agent.effort {
+            out.effort = Some((effort, id));
+        }
+        if out.model.is_some() && out.effort.is_some() {
+            break;
+        }
+    }
+    Ok(out)
 }
 
 /// Whether the node's sandbox is deleted when it enters [`FINAL_PHASE`], and
@@ -283,6 +390,27 @@ mod tests {
         for text in ["a;", "a;;b", ";", "; ;a", "a; ,"] {
             assert!(parse_list(text).is_err(), "{text:?}");
         }
+    }
+
+    #[test]
+    fn set_agents_trims_and_drops_phases_that_set_nothing() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE nodes (id BLOB PRIMARY KEY NOT NULL);").unwrap();
+        conn.execute_batch(CREATE_TABLE).unwrap();
+        let node = Uuid::new_v4();
+        conn.execute("INSERT INTO nodes (id) VALUES (?1)", params![uuid_to_blob(node)]).unwrap();
+        let mut config = Agents::new();
+        config.insert("review".into(), PhaseAgent { model: Some(" opus ".into()), effort: Some("".into()) });
+        config.insert("fix".into(), PhaseAgent::default());
+        set_agents(&conn, node, &config).unwrap();
+        let stored = agents(&conn, node).unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored["review"], PhaseAgent { model: Some("opus".into()), effort: None });
+        // The skills column is untouched by it.
+        assert!(skills(&conn, node).unwrap().is_empty());
+        let mut bad = Agents::new();
+        bad.insert("done".into(), PhaseAgent { model: Some("opus".into()), effort: None });
+        assert!(set_agents(&conn, node, &bad).is_err());
     }
 
     #[test]

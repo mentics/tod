@@ -2814,6 +2814,58 @@ fn copy_node_subtree_copies_capability_settings_and_obligations() {
 }
 
 #[test]
+fn phase_model_and_effort_resolve_field_by_field_from_the_nearest_node() {
+    use crate::lifecycle_config::{self, Agents, PhaseAgent};
+    let (store, root, list_id) = setup_store_with_list();
+    let top = create_node_in(&store, list_id, None, "Top");
+    let mid = create_node_in(&store, list_id, Some(top), "Mid");
+    let leaf = create_node_in(&store, list_id, Some(mid), "Leaf");
+    for node in [top, mid] {
+        store
+            .enqueue_outline(OutlineMutation::EnableCapabilities {
+                node_id: node,
+                capabilities: vec![Capability::LifecycleConfig],
+            })
+            .unwrap();
+    }
+    let set = |node, agents: Agents| {
+        store
+            .enqueue_outline(OutlineMutation::SetNodeLifecycleAgents { node_id: node, agents })
+            .unwrap();
+        store.writer().flush().unwrap();
+    };
+    set(
+        top,
+        [("review".to_string(), PhaseAgent { model: Some("opus".into()), effort: Some("high".into()) })].into(),
+    );
+    set(mid, [("review".to_string(), PhaseAgent { model: Some("sonnet".into()), effort: None })].into());
+    // Saving skills on the same node leaves the model and effort alone.
+    store
+        .enqueue_outline(OutlineMutation::SetNodeLifecycleConfig {
+            node_id: mid,
+            skills: [("review".to_string(), vec!["r".to_string()])].into(),
+        })
+        .unwrap();
+    store.writer().flush().unwrap();
+    store
+        .read(|conn| {
+            let r = lifecycle_config::resolve_agent(conn, leaf, "review")?;
+            assert_eq!(r.model, Some(("sonnet".to_string(), mid)));
+            assert_eq!(r.effort, Some(("high".to_string(), top)));
+            assert_eq!(lifecycle_config::resolve_agent(conn, leaf, "fix")?, Default::default());
+            Ok(())
+        })
+        .unwrap();
+    // A node without the capability cannot set one.
+    store
+        .enqueue_outline(OutlineMutation::SetNodeLifecycleAgents { node_id: leaf, agents: Agents::new() })
+        .unwrap();
+    assert!(store.writer().flush().is_err());
+    drop(store);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn delete_sandbox_defaults_on_and_resolves_from_the_nearest_node() {
     use crate::lifecycle_config;
     let (store, root, list_id) = setup_store_with_list();
