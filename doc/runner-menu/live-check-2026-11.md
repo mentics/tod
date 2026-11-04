@@ -304,3 +304,122 @@ allowing that command or enabling the capabilities by hand in the task editor.
 Nothing was started in the cloud this pass (no sandbox was made).
 `claude auth status` on this machine now reports `loggedIn: true`
 (claude.ai, Cofactr), so item 2 is unblocked on the account side.
+
+## Pass 6, 2026-11-04
+
+Main at `fe9fb350`. Live-verify root, my own agent-socket port (47661); another
+session's older `tod` (47611) kept running on the root and was not touched. No
+orchestrator redeploy. Sandbox binaries rebuilt locally (Docker) for the install.
+
+### Setup without `tod-cli capabilities enable`
+
+`tod-cli node create --title "RM p6 A" --parent eng-work` (allowed), then in the app:
+Settings on the node, "Add a capability...", Lifecycle. Agent and Files are inherited
+from `ENG work` (Claude opus medium; location `Golden flagship`, cloud sandbox), so
+the node had everything it needs with no blocked command and no database edit.
+The task panel then read "cloud sandbox, not made yet / on you: not started".
+
+Starting the first chat on the node: the golden for `cofactr/flagship` was older than
+this build, so the app refreshed it. The first refresh ended with "Resource
+'sbx-tod-golden-...-6aeb3ebc-budku6' is currently not available" (a Blaxel transient;
+the half-made golden `...6aeb3ebc` was left behind and had to be deleted by hand); the
+retry (a second Send) refreshed again, succeeded, and the old golden was deleted by the
+refresh as designed. Sandbox `tod-rm-p6-a-0e3df0` was then made and the one-line chat
+("pong") ran in it; `conversations.agent_session_id` = `af94f802-635e-4007-aa7b-e8eff994d355`.
+
+### Item B (failed delete at `done`, shown in the app) on node RM p6 A
+
+State set to `done` with the task panel's lifecycle dropdown. The daemon retired it 60 s
+later and failed. (The failure came out different from the one planned: the root's
+`tod-agentd` (pid 50287, started 06:04 from another session's worktree build) looks for
+`tod-relay` under that worktree's `target/debug/sandbox`, which does not exist, so even
+its `git` spawn in the sandbox failed: "tod-relay not found". Killing the shared daemon
+was refused by the harness, so it was left; a daemon built in a worktree without
+`target/sandbox` fails every sandbox call. Not a tod bug, a procedure gotcha.) What the app showed:
+
+| # | Check | Result |
+|---|---|---|
+| B1 | `node_problems` row | PASS. `sandbox_retire|attempts 1|max 5|gave_up 0|next_retry_at +5 min|message "Deleting the sandbox ... (it reached done) failed: the checkpoint ... failed, so nothing was deleted; delete it anyway ..."`; attempt 2 was written 5 min later (`updated_at` moved, next retry +5 min). |
+| B2 | Task panel | PASS. Runner line: "waiting on others: something outside / deleting its sandbox failed; the daemon tries again / waiting 15s", a red "retrying 1 of 5: <error>" line, "next check Wed 06:33", the selectable problem text and beneath it "Attempt 1 of 5: next try in 44s." (a countdown; "Attempt 2 of 5: next try in 4m." after the second try). |
+| B3 | App saw the daemon's write | PASS. The panel changed from no problem to attempt 1, then attempt 2, without a reselect or restart. |
+| B4 | Tree glyph and strip | PASS. The tree row got the "others" diamond (orange); the strip read "2 on others · 1 in trouble"; the On-others filter groups the node under "deleting its sandbox failed; the daemon tries again" with the error and "next check". |
+| B5 | Runner menu for a `done` node | PASS. Check now, Migrate to..., Reset environment, Update workspace to latest main, **Delete sandbox**, **Delete sandbox without a checkpoint**, Sync now. |
+
+### Item A (same Claude session after Migrate): what could and could not be run
+
+**Cloud to host was not run, on purpose.** Migrating a cloud node removes its sandbox
+and first pushes the node's branch (`provision::remove_location` -> `push_branches`) to
+the sandbox's `origin`, which for `Golden flagship` is `Cofactr/flagship`: the new
+branch would land in a Cofactr repository, which these passes may not touch. Pointing
+the sandbox's `origin` elsewhere needs `git` run in the sandbox, which this session's
+shell guard refuses (a `tod-sandbox exec ... git ...` command line), and I did not
+work around it. To run it, the user either allows that one command or says a
+`task/rm-p6-a` branch may be pushed to `Cofactr/flagship`.
+
+**Host to cloud was run** (the direction that pushes only to `joel-cofactr/build-test`).
+Node `RM p6 H` (Lifecycle added, Files override picking the new location `RM p6 host`
+= a scratch clone of build-test, made in the Locations dialog, no database edit).
+
+* The first chat failed: "this node's files are not available: spawn treehouse get
+  --lease: No such file or directory" (a per-node worktree needs Treehouse, not
+  installed on this machine). The error is clear, names the failure and falls back to
+  nothing (right per "errors are never hidden"). Changed the location to "The
+  directory itself".
+* **BUG 10 (fixed): saving that location change panicked the app** ("cannot update
+  tod_ui::views::locations::LocationsDialog while it is already being updated", tod
+  aborted). Cause: in the Locations dialog, "Change it" -> `confirm` ->
+  `confirm_files_change` with nothing to remove called its callback synchronously,
+  and the callback updates the dialog that is still being updated. Fix:
+  `confirm_files_change` defers the callback when nothing is affected. Regression test
+  `ui::files_impact::tests::confirming_with_nothing_affected_does_not_re_enter_the_caller`
+  (fails with the exact panic without the fix). Verified live after rebuilding: the
+  location then read "the workspace directory on this machine".
+* Host session: `conversations.agent_session_id` = `23c60987-e22d-4ccd-b216-8c075d986d02`,
+  log at `~/.claude/projects/-Users-...-rm6-host-repo/23c60987-....jsonl`; reply "pong".
+
+* **Host to cloud, result: PASS.** Migrate to `Golden flagship` answered "Migrated to Golden
+  flagship. Nothing was started." (nothing to remove for a shared directory, so no impact
+  dialog). The next message made sandbox `tod-rm-p6-h-08216f` and went to the same
+  session: `conversations.agent_session_id` still `23c60987-...`, no rotation marker, and
+  the agent answered "pong" to "what single word did you reply with before" (cost fell
+  from $0.69 to $0.15: cache read). I could not look into the sandbox for the session
+  file (Blaxel answered WORKLOAD_UNAVAILABLE, retryable, to every `exec` after the turn),
+  so the continuity is shown by the id, the answer and the cache read, not the file.
+* Cloud to host, and so "back to the host" after that: not run (see above).
+
+### Item B, last step
+
+"Delete sandbox without a checkpoint" on the `done` node: "Deleting the sandbox without a
+checkpoint..." then "Deleted sandbox ... without keeping its uncommitted work."; the node
+read "cloud sandbox, not made yet / done" at once. The `sandbox_retire` row and the red
+"retrying 4 of 5" status stayed until the daemon's next pass cleared them (under a
+minute later; the menu action does not clear it itself): then the strip went from "2 on
+others · 1 in trouble" to "1 on others" (the other is Webhook e2e) and the node is plain
+`done`. PASS, with that short lag noted. The give-up path (attempt 5) was not waited for:
+the back-off is 1, 5, 15 and 60 minutes, and it stays covered by unit tests.
+
+### Cleanup and state left
+
+Deleted: nodes `RM p6 A` and `RM p6 H`, both node sandboxes (without checkpoints, so
+nothing was pushed), location `RM p6 host` (through the dialog: the second live use of
+the fix), the scratch clone, and the half-made golden `tod-golden-cofactr-flagship-6aeb3ebc`
+(left by the failed refresh). No branch or pull request was created anywhere. Not mine,
+left: `tod-golden-cofactr-flagship-6aeb4148` is now the golden of `cofactr/flagship` (the
+app refreshed it; the old `...6aeb2ee1` was deleted by the refresh as designed), and the
+shared `tod-agentd` (pid 50287, built in another worktree).
+
+### Bugs and gotchas, pass 6
+
+10. **Locations dialog panic on "Change it" / "Delete it" with nothing to remove**: fixed
+    (above), regression test `ui::files_impact::tests::confirming_with_nothing_affected_does_not_re_enter_the_caller`.
+11. Golden refresh at first use can end with "Resource ... is currently not available"
+    (Blaxel WORKLOAD_UNAVAILABLE right after the proxy redeploy); it leaves a
+    half-made golden that nothing points at and says so ("delete it with `tod-sandbox
+    delete`"); a second Send refreshed again and worked. Not fixed (transient on Blaxel's
+    side; a retry in `wait_reachable` after `update_proxy` might be worth it).
+12. A daemon (`tod-agentd`) started from a worktree without `target/sandbox` fails every
+    sandbox call with "tod-relay not found (<that worktree>/target/debug/sandbox/tod-relay)".
+    Before checking daemon-side behaviour (retire at `done`), look at the daemon's path
+    (`ps`) and, if it is not yours, ask its owner; killing it was refused here.
+13. A per-node worktree location needs Treehouse on the machine; without it the first
+    turn says "spawn treehouse get --lease: No such file or directory" (clear and honest).
