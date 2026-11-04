@@ -266,3 +266,30 @@ draft PR Cofactr/workspace#192). A's plan step was changed to three foreground
     [implementation.md](implementation.md), "Node problems"). Not re-run live.
 11. The runner menu's facts (e.g. "Adopt existing sandbox") did not refresh after a direct
     database change until the node was selected again (only for out-of-band edits, not a product path).
+
+## Pass 5, 2026-11-04
+
+Main at `03aa392d` (no schema bump since pass 4: `node_problems` is made on every
+open, so **no orchestrator redeploy**; none was done). Live-verify root, my own
+agent-socket port (47651); another session's older `tod` (47611) kept running and was
+not touched. Starting this tod replaced the root's stale `tod-agentd` (6:04) by one of this build.
+Test PRs only in `joel-cofactr/build-test` (rule now in `doc/live-verification.md`).
+
+### Item 1: Check now in `pr_draft` with a real PR (PR joel-cofactr/build-test#4)
+
+Setup: node `RM p5 PR` under `eng-work` (`tod-cli node create`, `capabilities enable spec
+lifecycle agent files`), Files location `RM p5 host` (a host location whose directory is a
+scratch clone of build-test; inserted directly into the root's `files_places`, then
+`capabilities set ... files --location`), `pr link joel-cofactr/build-test#4`, and
+`node_lifecycle.state = 'pr_draft'` set directly in the root's `tod.db`. Branch
+`task/rm-p5-check-now` with one commit, draft PR, `pr_readiness` unchanged (no bots).
+
+| # | Check | Result |
+|---|---|---|
+| 1a | Draft PR: Check now holds, state stays | PASS. "Checked: the gate is not clear: PR open and out of draft? (...#4 is still a draft: mark it ready for review.); A person assigned to review it? (... has no reviewer: request one.). GitHub: waiting for ...#4 to be marked ready for review"; node showed "waiting on others: something outside ... to be marked ready for review"; state still `pr_draft`. |
+| 1b-i | Marked ready, no reviewer: still held | PASS. Message now names only the missing reviewer. State unchanged. |
+| 1b-ii | A review comment from me (`gh pr review --comment`, as the owner cannot be a requested reviewer) | PASS (correct hold): "the gate is clear, but the node was not moved on: the pull request needs the agent: ...: 1 review with comments to answer". |
+| 1b-iii | After a newer commit (the comment no longer newer than head), Check now | PASS. Node advanced to `pr_review` (checked in `tod.db`). |
+| 1c | Nothing merged | PASS. PR closed unmerged, branch deleted (`gh pr view`: `state CLOSED, mergedAt null`). |
+
+Cleanup: node deleted (`tod-cli node delete`), `RM p5 host` row deleted, scratch clone removed.
