@@ -1547,6 +1547,64 @@ fn the_wait_for_a_person_records_who_was_asked_to_review() {
     assert_eq!(crate::next_actor::WaitKind::from_spec(&waits[0].match_spec), crate::next_actor::WaitKind::HumanReview);
 }
 
+/// Seen live with three repositories: one pull request waiting for a person
+/// put another's running checks on the review cadence (the run ended with
+/// "a review of" the first, and the checks finishing woke nothing).
+#[test]
+fn one_pull_request_waiting_for_a_person_does_not_end_the_poll_on_anothers_checks() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    struct Feed {
+        reads_of_7: AtomicU32,
+    }
+    impl crate::pr_readiness::PrFeed for Feed {
+        fn snapshot(&self, pr: &tod_store::github::NodePr) -> Result<tod_store::github::PrSnapshot, String> {
+            use tod_store::github::{PrSnapshot, PrStatus};
+            // #7's checks finish on its third read.
+            let checks = if pr.pr_number == 7 && self.reads_of_7.fetch_add(1, Ordering::SeqCst) < 2 {
+                "pending"
+            } else {
+                "success"
+            };
+            Ok(PrSnapshot {
+                status: PrStatus {
+                    mergeable: Some(true),
+                    mergeable_state: Some("blocked".into()),
+                    behind_by: Some(0),
+                    checks: Some(checks.into()),
+                    head_sha: Some("abcdef1".into()),
+                    head_committed_at: Some("2020-01-01T00:00:00Z".into()),
+                    reviewers: vec!["maria".into()],
+                    open: true,
+                    ..Default::default()
+                },
+                threads: vec![],
+                comments: vec![],
+                reviews: vec![],
+            })
+        }
+    }
+    let fx = bare();
+    retire_outside_criteria(&fx);
+    let feed = Arc::new(Feed { reads_of_7: AtomicU32::new(0) });
+    crate::pr_readiness::set_feed_override(Some(feed.clone()));
+    linked_to_prs(
+        &fx,
+        "pr_review",
+        &["https://github.com/acme/app/pull/42", "https://github.com/acme/infra/pull/7"],
+    );
+    let mut agent = FakeAgent::new(&fx.fleet);
+    let outcome = autopilot(&fx, Budget::default())
+        .with_pr_poll_interval(Duration::ZERO)
+        .run(&fx.fleet, &mut agent)
+        .unwrap();
+    let Outcome::Waiting { what, .. } = &outcome else { panic!("{outcome:?}") };
+    assert!(feed.reads_of_7.load(Ordering::SeqCst) >= 3, "the checks were polled until they finished");
+    assert!(what.starts_with("a review of https://github.com/acme/app/pull/42"), "{what}");
+    let specs = pending_specs(&fx);
+    assert_eq!(specs.len(), 1, "{specs:?}");
+    assert!(specs[0].starts_with("github:pr:42:review"), "{specs:?}");
+}
+
 #[test]
 fn a_pull_request_that_never_changes_stops_for_a_person() {
     let fx = setup();

@@ -905,7 +905,7 @@ impl Autopilot {
         hook: &mut H,
         before_review: bool,
     ) -> Result<Option<Outcome>> {
-        use crate::pr_readiness::{self, Next as PrNext, Wait};
+        use crate::pr_readiness::{self, Next as PrNext};
         let mut waited_since: Option<std::time::Instant> = None;
         let mut unchanged = 0u32;
         // Like every phase: coming in, the agent's session and then each later
@@ -1021,15 +1021,20 @@ impl Autopilot {
                     }
                 }
                 PrNext::Wait(waits) => {
-                    if before_review && waits.iter().all(|w| matches!(w, Wait::HumanReview)) {
-                        // Ready for a person: the gate asks that one is on it.
+                    // The waits of every linked pull request together. A
+                    // person's review is the long wait only once nothing
+                    // shorter is left on any of them: one pull request
+                    // waiting for a person must not put another's running
+                    // checks on the review cadence.
+                    let waits = short_waits(waits);
+                    if waits.is_empty() {
                         hook.waiting(None, None);
-                        return Ok(None);
-                    }
-                    if waits.iter().any(|w| matches!(w, Wait::HumanReview)) {
+                        if before_review {
+                            // Ready for a person: the gate asks that one is on it.
+                            return Ok(None);
+                        }
                         // Hours or days: the run ends, and is woken at the
                         // time recorded (or by the review's webhook).
-                        hook.waiting(None, None);
                         return Ok(Some(self.wait_for_review(fleet, &live, &settings)?));
                     }
                     let since = *waited_since.get_or_insert_with(std::time::Instant::now);
@@ -1460,6 +1465,18 @@ fn blocked_why(report: &serde_json::Value) -> Option<String> {
 }
 
 /// What a wait is for, in a few words.
+/// The waits the babysitter polls for itself: every one but a person's
+/// review, each once (the same wait on several pull requests is one).
+fn short_waits(waits: Vec<crate::pr_readiness::Wait>) -> Vec<crate::pr_readiness::Wait> {
+    let mut short = Vec::new();
+    for wait in waits {
+        if wait != crate::pr_readiness::Wait::HumanReview && !short.contains(&wait) {
+            short.push(wait);
+        }
+    }
+    short
+}
+
 fn wait_description(waits: &[crate::pr_readiness::Wait]) -> String {
     use crate::pr_readiness::Wait;
     let parts: Vec<String> = waits

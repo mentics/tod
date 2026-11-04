@@ -1775,6 +1775,7 @@ fn record_cloud_node(fleet: &FleetStore, node_id: &str, user: &str) -> Result<Cl
     fleet.writer().flush()?;
     let _ = fleet.reload_if_stale();
     provisioning::clear_intent(root, node_id)?;
+    lost::record_follows_location(fleet, node_id)?;
     Ok(record)
 }
 

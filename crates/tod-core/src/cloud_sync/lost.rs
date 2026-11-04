@@ -227,6 +227,15 @@ pub fn located_rows(fleet: &FleetStore, rows: Vec<CloudNodeRow>, root: &std::pat
     Ok(consistent)
 }
 
+/// The node's record was just written from its Files location (Start, or a
+/// replacement): a disagreement reported earlier, and an old sandbox that
+/// could not be adopted, no longer stand. Nothing else drops them until the
+/// app starts again, so the task panel would go on showing both.
+pub(super) fn record_follows_location(fleet: &FleetStore, node_id: &str) -> Result<()> {
+    crate::node_problems::clear(fleet, node_id, tod_store::node_problems::KIND_CLOUD_RECORD)?;
+    crate::node_problems::clear(fleet, node_id, tod_store::node_problems::KIND_ADOPT)
+}
+
 /// Tells the user about a record that disagrees with the node's location, on
 /// the node itself (`tod_store::node_problems`): one row per node, and the
 /// same message again writes nothing, so a check that runs after every sync
@@ -1149,6 +1158,30 @@ mod tests {
         fx.raw_row("node-1");
         assert_eq!(located_rows(&fx.fleet, rows_of(&fx), &fx.root).unwrap().len(), 1);
         assert!(fx.problems().is_empty(), "agreement clears the report");
+    }
+
+    #[test]
+    fn a_record_written_from_the_location_drops_the_reports_about_the_old_sandbox() {
+        let fx = fx();
+        // Before Start: an old record naming a sandbox Blaxel no longer has.
+        fx.raw_row("node-old");
+        located_rows(&fx.fleet, rows_of(&fx), &fx.root).unwrap();
+        crate::node_problems::report(
+            &fx.fleet,
+            &fx.id(),
+            tod_store::node_problems::KIND_ADOPT,
+            "The node's old sandbox was not adopted.".into(),
+        )
+        .unwrap();
+        assert_eq!(fx.problems().len(), 1);
+
+        // Start makes a new sandbox and records the node from its location.
+        fx.locate("node-new");
+        fx.cloud_row();
+        record_follows_location(&fx.fleet, &fx.id()).unwrap();
+        fx.fleet.reload_if_stale().unwrap();
+        let left = crate::node_problems::for_node(&fx.fleet, fx.node).unwrap();
+        assert!(left.is_empty(), "{left:?}");
     }
 
     #[test]
