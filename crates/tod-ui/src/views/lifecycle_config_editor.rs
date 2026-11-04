@@ -343,7 +343,7 @@ impl LifecycleConfigEditor {
         };
         let skills = match resolved {
             None => "no skills".to_string(),
-            Some(r) if r.skills.is_empty() => "none (turned off)".to_string(),
+            Some(r) if r.skills.is_empty() => "none (no extra skills)".to_string(),
             Some(r) => lifecycle_config::format_list(&r.skills),
         };
         let mut summary = format!(
