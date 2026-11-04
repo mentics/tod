@@ -653,7 +653,26 @@ Pass 3 unless noted).
   injected clock (`tod-agentd` `server::tests`); the failure path and the
   1/5/15/60-minute retries were already unit tested with a fake delete.
 
+- **Image location with no way to name its repository (live check Pass 7, gap
+  14):** a cloud location from an image takes the repository's GitHub HTTPS URL
+  in the Locations dialog (`files_places.clone_url`, validated by
+  `files_place::validate_clone_url`), used first by `cloud_sync::node_source`,
+  recorded as the node's cloud-row repo as before, and part of `recipe_key`
+  (a change shows the impact). The first-chat error now names what to set per
+  location kind (`cloud_sync::what_to_set`). Tests:
+  `files_place::tests::{clone_urls_are_github_https_only,
+  an_image_location_takes_a_url_and_clones_to_the_fixed_directory,
+  the_clone_url_is_part_of_the_recipe}`, `places::tests::
+  changing_a_clone_url_shows_its_impact`, `cloud_sync::tests::
+  an_image_locations_clone_url_is_the_nodes_repository`, `...without_a_url_says_where_to_give_one`,
+  `views::locations::tests`. The clone directory is not user-chosen
+  (`/workspace/repo`, fixed by `checkout_script` and the supervisor's probe).
+
 **Still only verifiable live:**
+
+- **Image location with a repository URL:** the clone through a real sandbox
+  from the URL the dialog stored (the first chat on a fresh image sandbox) was
+  not re-run.
 
 - **Migrate:** the same Claude session id resuming at the new place (5b, needs
   Claude signed in on the host; 5c compared nothing but the transfer); the

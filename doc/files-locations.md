@@ -62,6 +62,23 @@ background run — `provision::resolve_launch_cwd` makes its location:
   golden or created from an image, then the node's branch checked out in the
   repository there.
 
+**Where a cloud location's repository comes from.** A location from an
+*image* starts empty, so there is no checkout to ask: the Locations dialog
+takes **Repository to clone**, a GitHub HTTPS URL
+(`https://github.com/owner/name[.git]`; nothing else is accepted, and the
+dialog says so). It is stored on the location (`files_places.clone_url`,
+machine-local, added idempotently at start with no schema version), cloned by
+the node's first checkout into `/workspace/repo` (the one directory tod's
+checkout step and the supervisor use, so the location's directory is
+that: leave it empty, or the dialog refuses another), and is the clone source
+`cloud_sync::node_source` uses ahead of any path. Leave it empty only for an
+image that already holds the repository, giving the directory it is in. A
+location *forked* from a golden keeps no URL: it names a directory inside the
+golden, and the URL is read from the golden's checkout. The URL is part of the
+recipe (`recipe_key`, only when set, so earlier locations keep theirs): changing
+it makes existing node sandboxes stale and shows the impact dialog. When no
+URL can be found the first chat says what to set for that kind of location.
+
 Either way `origin` is fetched first (`worktree::fetch_origin`), so the work
 starts from the latest: a branch `origin` already has (work pushed before)
 is continued from there, and a new one starts from `origin`'s default branch
