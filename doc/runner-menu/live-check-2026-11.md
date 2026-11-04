@@ -118,3 +118,78 @@ left stopped. `independent_evaluation` was flipped to false in the root's
   if it came back.
 - A Pause on a node whose sandbox just went to standby can hang for minutes
   on Blaxel's WORKLOAD_UNAVAILABLE and blocks a pending Migrate behind it.
+
+## Pass 3 (B2-B5), 2026-11-03
+
+Main at `400e2545` (B2-B5 and the wake fix) plus the commits listed below, schema
+v93. Live-verify root, owner `jshellman-live-verify`, my own agent-socket port
+(47631); the root's `tod-agentd` is my build's (the app restarted it at launch:
+an older build's daemon was replaced). **The shared orchestrator was redeployed**
+(B2/B3 changed the synced data). Test nodes `RM live A/B/C`; sandboxes
+`tod-rm-live-b-847327` and `tod-rm-live-c-eba2f7` (the new `tod-<slug>-<6hex>`
+names). A second `tod` from another session (`robustness-continuation-743eac`, port
+47611) stayed running on this root the whole time: it is an older build, logged
+"Could not checkpoint ..." for my sandboxes every ~30 s, and it can overwrite
+`sandboxes.toml` with a stale copy (the golden mapping went back to a deleted
+golden twice, see bug 4).
+
+| # | Check | Result |
+|---|---|---|
+| 1 | Pre-B2 nodes report loudly | PASS. A/B/C (`cloud_nodes` row, no location): "in the cloud (its Files location records no sandbox)". Their sandboxes were gone, so Adopt existing sandbox on C answered "Blaxel no longer has sandbox node-rm-live-c ... nothing was changed. Start makes the node a new one" (PASS: loud, no change). Start remade C from the golden; name `tod-rm-live-c-eba2f7`. "installing N bundle files" still appears (see bug 1: a fork cannot keep what its golden had installed). |
+| 1b | Older/unstamped golden | PASS with a different shape than the plan said. The `wsx-golden-*` has no `tod-install` label, so Start refreshed it itself ("is being refreshed: it carries no tod-install label", new golden `tod-golden-cofactr-flagship-6aea8d1b`); a stale `golden` mapping to a deleted sandbox gave "the golden sandbox ... does not exist". The "both stamps" message exists only for a golden a NEWER tod made (not reached). The fork then failed its health check with the loud "was forked from <golden>, which should carry this build's relay ..." until bugs 1 and 2 were fixed. |
+| 2 | Start on a fresh throwaway node | PASS after fixes 1-3. Fork from the golden in ~30 s, relay healthy with the node manifest, supervisor ran the node (plan 1/1, PR agent handed back), `node_files_locations.sandbox` = `tod-rm-live-c-eba2f7` = `cloud_nodes.sandbox`. |
+| 3 | Naming collision | PASS. A `tod-sandbox create tod-rm-live-a-66e15f` and Start on A: "Cannot make sandbox ... a sandbox by that name already exists (DEPLOYED), but this node's Files location does not point at it, so tod lost track of it ... Nothing was made, renamed or deleted." The throwaway still existed afterwards (then I deleted it). |
+| 4 | Reset environment | PASS. "The environment was set up again."; nothing deleted (same sandbox name before and after), relay and manifest healthy, node still waiting. |
+| 5a | Migrate to a host while idle | PASS. The impact dialog now exists for the single record ("Nothing uncommitted: its branch is pushed, then it is removed."); after "Remove and migrate" the sandbox was deleted, the location and `cloud_nodes` row gone, "Migrated to RM host", and `sandbox-sessions/<node>/` held exactly the node's 7 session logs. (My first host location needed `treehouse`, absent here; I pointed `RM host` at a scratch git repo with no worktree recipe. Its `open-pr`/`fix-ci` skills were missing, loudly, until I added throwaway ones.) |
+| 5b | Same Claude session resumes at the host | NOT VERIFIED. The host run stopped at "Claude Code is not signed in on this machine"; signing in is the user's. The new host project directory only held a fresh session, so I cannot say the old id was copied. |
+| 5c | Migrate back to a cloud sandbox resumes it | PASS for the transfer: "restored 7 agent session log(s)" in the new sandbox, including the PR session; the agent then ran there. The same-id resume itself was not compared. |
+| 5d | Migrate while running offers Pause / Stop now / Cancel | NOT REACHED. Each turn on my throwaway nodes ends in ~20 s and the control socket plus screenshot lag lost the window four times. |
+| 5e | Node with children refused | PASS by absence: the menu has no Migrate for a node with a child (the refusal text is only the store's, unit tested). |
+| 6 | Pause (any wake) on a standby sandbox | PASS for the wake path, through "Run with a new session": C's sandbox stayed at Blaxel's `WORKLOAD_UNAVAILABLE`; after 90 s "sandbox tod-rm-live-c-eba2f7 is still waking after 90s ... It was not replaced or deleted; the fresh_session request is recorded ... Try again in a minute". Not exercised: a queued Migrate behind it, and the Pause request itself (same code, `still_waking_error`). The node then read "working: starting in the cloud" for minutes: bug 3, fixed. |
+| 7a | Delete at done, setting off | PASS. B reached `done` (I set `node_lifecycle.state = 'done'` for B directly in the root's `tod.db`; B inherited `delete_sandbox = 0` from `ENG work`, left by pass 2): 2.5 minutes, nothing deleted. |
+| 7b | Delete at done, setting on, no click | PASS. I set B's own `node_lifecycle_config.delete_sandbox = 1` directly in the DB; 63 s later `agentd.log` (this root's daemon, mine) said "sandbox retire: RM live B reached done: Deleted sandbox tod-rm-live-b-847327; any uncommitted work was kept on the remote ...", the location and the `cloud_nodes` row were gone. |
+| 7c | Delete failure path | NOT PROVOKED (no safe way). |
+| 8 | Delete sandbox menu on the single record | PASS. On C, whose sandbox would not wake: "Delete sandbox" failed loudly ("the checkpoint ... failed, so nothing was deleted; delete it anyway to discard its uncommitted work"), then "Delete sandbox without a checkpoint" deleted it ("Deleted sandbox ... without keeping its uncommitted work"; location forgotten, the `cloud_nodes` row kept with `lost_at`, the user-deleted mark). The checkpointing delete on a healthy sandbox is B4's path (7b). |
+| 9 | Stop now then Migrate immediately: stale row | NOT REACHED (same timing as 5d). After Migrate off the host, B's/C's rows were consistent in every path I did run. |
+
+### Bugs found in pass 3
+
+1. **A fork of the golden loses everything tod installed in it.** `fork_golden` ends
+   with the node's proxy update, which redeploys the fork from its image: the
+   golden's relay, manifest, supervisor and bundles are gone (a plain
+   `tod-sandbox fork` of the golden keeps them, checked). B2's "a fork installs
+   nothing" therefore left every fresh node with no node manifest; the
+   next connect ran the generic bootstrap over it, the health check then saw
+   `bootstrap=... agents=false` instead of `node relay=...`, and the Start failed
+   after minutes of retries. Fix: `make_sandbox` installs tod's files into the fork
+   (`node::install_into_fork`, no packages) and starts its relay before the checkout
+   steps. The "no `installing N bundle files` on a fork" part of B2 does not hold
+   on Blaxel.
+2. **`golden refresh` produced a golden with nothing installed**, for the same
+   reason (the placeholder proxy update came after the install). Fix: proxy first,
+   install after; and `node::upload_tod_files` makes `/opt/tod` before its first
+   upload (the large-upload free-space check failed on a missing directory). Live:
+   the refreshed golden answers with the node manifest.
+3. **A failed Start left the node saying "working: starting in the cloud".** The
+   `starting` run state written before the sync stayed for the 150 s a supervisor
+   is given to report in, even when the sandbox could not be made. Fix:
+   `failing_start_is_recorded` replaces it with `runner_failed` (test
+   `a_start_that_fails_leaves_the_node_failed_not_starting`), and the wake path
+   does the same only while `starting` is still the state. Verified live for Start.
+4. **Seen, not fixed:** `make_sandbox` does `Sandboxes::load` ... `save` around a
+   multi-minute creation, so a concurrent `golden refresh` (or another app on the
+   root) is overwritten with the old golden mapping; and the failure text after a
+   fork that never got made still says "was deleted so the next launch makes a
+   fresh one".
+5. **Seen, not fixed:** Blaxel left one forked sandbox in `STANDBY` that answered
+   `WORKLOAD_UNAVAILABLE` for 25+ minutes; every tod operation on it failed loudly
+   after 82-90 s, as designed, and only Delete (without checkpoint) cleared it.
+
+### Cleanup
+
+Deleted: nodes `RM live A/B/C`, their sandboxes, the `RM host` location (and the
+scratch repo and Claude project directory behind it), the `tod-rm-live-a-66e15f`
+throwaway, two failed golden forks. Left: the user's `wsx-golden-...` (another
+setting still pointed at it), the refreshed `tod-golden-cofactr-flagship-6aea8fd9`
+(now `cofactr/flagship`'s golden), and `ENG work`'s `delete_sandbox = 0` from
+pass 2 (the default is on; turn it back with the editor if wanted).

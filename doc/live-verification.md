@@ -109,6 +109,18 @@ regression test, merge, rebuild, relaunch, and rerun from the failing step.
   reads. If none covers the node's repository the gate logs "pull request not
   found (GitHub also answers 404 when tod's token cannot see the repository)"
   and wakes the sandbox instead; the supervisor then looks itself.
+- **Updating a sandbox's proxy redeploys it from its image.** Whatever was
+  installed into it before (tod's relay, manifest, supervisor, bundles) is gone;
+  a plain `tod-sandbox fork` of a sandbox keeps them. So install after any proxy
+  update (`golden refresh`, `fork_golden`), never before.
+- **A second `tod` on the root** (another session's) overwrites
+  `sandboxes.toml` with its stale copy and logs "Could not checkpoint" for your
+  sandboxes; check `ps aux | grep 'debug/tod '` first, use your own port, and
+  re-read `tod-sandbox golden` after anything you did to the golden.
+- **The control socket's `shot2` lags one action** after a click that opens a
+  menu or dialog: take it twice. A node's turn on a throwaway PR node lasts
+  ~20 s; catching "running" menus needs a script that clicks without a tool
+  round trip in between.
 - **No `timeout` command on macOS**: `timeout 120 cargo ...` fails with
   "command not found", and a pipeline that greps its output hides that. Run
   cargo plainly, or check the exit code. macOS `sed -i` needs `-i ''`.
