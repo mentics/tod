@@ -58,6 +58,10 @@ pub struct RunnerInputs {
     pub run: RunState,
     pub has_checkout: bool,
     pub has_children: bool,
+    /// The node's old records name a sandbox its Files location does not
+    /// record, and adoption can take it
+    /// (`tod_core::cloud_sync::adopt::adoptable`).
+    pub adoptable: bool,
     /// A cloud job of the panel's own is running; what it is doing.
     pub busy: Option<&'static str>,
 }
@@ -85,6 +89,9 @@ pub enum RunnerAction {
     DeleteSandbox,
     DeleteSandboxAnyway,
     SyncNow,
+    /// Record the sandbox an older build started the node in as its
+    /// location, after checking it is the node's and answers.
+    AdoptSandbox,
 }
 
 impl RunnerAction {
@@ -103,6 +110,7 @@ impl RunnerAction {
             RunnerAction::DeleteSandbox => "Delete sandbox",
             RunnerAction::DeleteSandboxAnyway => "Delete sandbox without a checkpoint",
             RunnerAction::SyncNow => "Sync now",
+            RunnerAction::AdoptSandbox => "Adopt existing sandbox",
         }
     }
 }
@@ -153,6 +161,9 @@ pub fn menu(inputs: &RunnerInputs) -> RunnerActions {
     if matches!(inputs.run, RunState::Active { .. }) {
         entries.push(StopNow);
     }
+    if !done && inputs.adoptable {
+        entries.push(AdoptSandbox);
+    }
     if idle {
         entries.push(CheckNow);
     }
@@ -193,6 +204,7 @@ mod tests {
             run,
             has_checkout: false,
             has_children: false,
+            adoptable: false,
             busy: None,
         }
     }
@@ -416,7 +428,23 @@ mod tests {
     }
 
     #[test]
+    fn adopt_existing_sandbox_only_when_the_node_is_in_the_adoptable_state() {
+        let adoptable = |run, place| RunnerInputs { adoptable: true, place, ..inputs(run) };
+        let not_made = Place::Sandbox { exists: false };
+        for run in [RunState::NeverRun, RunState::Ended(EndedHow::Failed), RunState::Active { pausing: false }] {
+            assert!(menu(&adoptable(run, not_made)).menu.contains(&AdoptSandbox), "{run:?}");
+        }
+        assert!(!all(&menu(&adoptable(RunState::Done, not_made))).contains(&AdoptSandbox));
+        assert!(!all(&menu(&sandbox(RunState::NeverRun))).contains(&AdoptSandbox), "a located node has nothing to adopt");
+        assert!(!all(&menu(&inputs(RunState::NeverRun))).contains(&AdoptSandbox));
+        // A running job hides the whole menu, this entry with it.
+        let busy = RunnerInputs { busy: Some("x"), ..adoptable(RunState::NeverRun, not_made) };
+        assert!(menu(&busy).menu.is_empty());
+    }
+
+    #[test]
     fn labels_match_the_design() {
+        assert_eq!(AdoptSandbox.label(), "Adopt existing sandbox");
         assert_eq!(MigrateTo.label(), "Migrate to\u{2026}");
         assert_eq!(
             DeleteSandboxAnyway.label(),

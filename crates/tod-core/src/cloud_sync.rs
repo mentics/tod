@@ -2204,6 +2204,7 @@ fn answer_latest_to_continue(
     Ok(Some(latest.decision))
 }
 
+pub mod adopt;
 pub mod golden;
 pub mod host;
 pub mod lost;
