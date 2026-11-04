@@ -153,8 +153,8 @@ told what changed since it certified; the certificate keeps a JSON snapshot
 alongside the digest so the app can diff it. It re-judges, and may be done in
 one turn.
 
-The user can certify from the lifecycle panel ("Mark phase done"). That replaces
-Waive for the certificate criterion. Force advance stays as it is.
+A gate is advanced past by the user moving the node with the task panel's
+lifecycle dropdown; there is no Waive.
 
 ## Per-transition design
 

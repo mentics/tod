@@ -11,8 +11,8 @@
 //! `AgentRuns::respond_review_finding`. A gate criterion is not a request
 //! (`tod_core::attention` has those three sources only: gates are app checks
 //! and never hand anything to the user); the criteria last found failing show
-//! on the runner line's Check now result, and `tod_core::lifecycle::waive`,
-//! which records a waiver, is called by no view today. Every answer records
+//! on the runner line's Check now result; there is no way to waive one, the
+//! user moves the node on with the lifecycle dropdown. Every answer records
 //! a journey `UserAction` with a `Presented` snapshot of the choices shown.
 //!
 //! Keys (digits answer the top request, Up/Down move a stop across the

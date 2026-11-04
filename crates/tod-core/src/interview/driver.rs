@@ -322,8 +322,7 @@ impl InterviewDriver {
     }
 
     /// Prefix tagging a handoff note as one derived from a failing gate row,
-    /// so it can be found again later to dedupe or close it. Kept in sync
-    /// with the app-side equivalent used when a human waives a row directly.
+    /// so it can be found again later to dedupe or close it. 
     const GATE_HANDOFF_PREFIX: &'static str = "Gate check failed: ";
 
     /// The lifecycle name a failing gate row's `from_state` uses for this

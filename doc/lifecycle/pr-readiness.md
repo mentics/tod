@@ -70,8 +70,8 @@ blocker it cannot solve.
 
 Gates are app checks; no agent evaluates one (see phase-agents.md). So:
 
-- **Readiness is a list of criteria the app derives** from GitHub, each
-  waivable like any gate criterion.
+- **Readiness is a list of criteria the app derives** from GitHub; the
+  user can move a node past a failing one with the lifecycle dropdown.
 - **The babysitter runs the PR agent.** The agent changes the world (code,
   replies, thread resolution, and review requests where the project's own
   skill says to make them) so the criteria become true. Neither decides
@@ -91,9 +91,8 @@ client `pr_mergeable_outcome` uses. All apply to **every linked PR**.
 | `pr-review-score` | For each configured bot with a `min_score`, its latest review for the current head has a score at or above it. |
 
 Each fails with a detail line naming the thread, bot, or score, so the
-runner line's Check now result shows why. A waiver (`tod_core::lifecycle::waive`,
-which no view calls today) is per criterion and is cleared when the PR head
-changes, as other certificates go stale.
+runner line's Check now result shows why. There is no waiver: the user moves the node on with the task panel's
+lifecycle dropdown.
 
 ### Bots
 
@@ -275,7 +274,7 @@ it is outward-facing, so it is bounded:
 - A bot score under threshold is work once: the agent's next turn sees it.
   If that turn pushes nothing (the agent judges the remaining findings
   wrong), the score is left to the gate, which stops for the user, who
-  decides whether to waive `pr-review-score`.
+  decides whether to move the node on with the lifecycle dropdown.
 - A turn that changes nothing, replies to nothing, and leaves the gate
   unchanged twice in a row stops the run (`NeedsHuman::PrStuck`), like
   `EvaluationStuck`.
@@ -358,8 +357,8 @@ Where the code differs from the design above:
   `PrFeed`).
 - The gate criteria are `pr-approved.up-to-date`, `.threads-resolved`,
   `.review-current`, `.review-score`, beside `.mergeable`. The two review
-  criteria pass when no bot is configured. A waiver is the existing per-node
-  waiver; it is not cleared when the head changes.
+  criteria pass when no bot is configured. A criterion cannot be waived; the user moves the node on with the lifecycle
+  dropdown.
 
 ## Waiting on GitHub after the review: the merge, then the release
 

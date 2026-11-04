@@ -6,7 +6,8 @@
 //! checked by `tod_core::phase::settle_gate` in the autopilot's `gate` step and
 //! by the runner menu's Check now (`tod_core::lifecycle::check_now`, which also
 //! advances the node when the gate is clear); there is no Advance, Waive or
-//! check button in this entity or any view.
+//! check button (the user moves a node on with the task panel's lifecycle
+//! dropdown) in this entity or any view.
 //!
 //! Observers are notified whenever anything shown changes, including the
 //! node's lifecycle, so they re-read it from the store.

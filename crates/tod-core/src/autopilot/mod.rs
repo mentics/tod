@@ -231,12 +231,12 @@ impl NeedsHuman {
                  or add the steps yourself"
                 .into(),
             Self::FailingCriteria { criteria } => format!(
-                "it cannot move on yet because these checks fail: {}. Fix them, or waive one you accept",
+                "it cannot move on yet because these checks fail: {}. Fix them, or move the node on yourself with the lifecycle dropdown",
                 criteria.join("; ")
             ),
             Self::GateNotPassed { result, summary } => format!(
                 "the check for moving on did not pass ({result}): {summary}. Look at what it says, \
-                 then fix it or waive it"
+                 then fix it, or move the node on yourself with the lifecycle dropdown"
             ),
             Self::EvaluationStuck { fixes } => format!(
                 "the reviewer sent the same work back twice and the agent changed nothing in between. \

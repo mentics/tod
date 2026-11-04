@@ -630,9 +630,9 @@ Pass 3 unless noted).
 - **`sandboxes.toml` merge:** unit-tested (two interleaved writers, eight
   threads, a creation that outlives a `golden refresh`), not re-run against a
   real second app on one root.
-- **Waive:** nothing in any view calls `tod_core::lifecycle::waive` (the
-  docs that promised a Waive in the side pane were corrected); whether to
-  offer one again is a product decision, not a live check.
+- **Waive:** decided against: `tod_core::lifecycle::waive` is gone and no
+  view offers one; the user moves a node on with the task panel's lifecycle
+  dropdown. A stored `waived` outcome still reads as passing.
 
 ## Open questions
 

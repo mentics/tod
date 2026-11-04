@@ -1,13 +1,13 @@
 //! What the lifecycle does without an agent: advancing once every recorded
-//! gate criterion reads pass/waived, waiving a criterion, forcing or reverting
-//! a transition, and deciding whether a state's agent starts on entry.
+//! gate criterion reads pass/waived, forcing or reverting a transition, and deciding whether a state's agent starts on entry.
 //!
 //! Plain functions over [`FleetStore`], with no UI state. [`crate::autopilot`]
 //! calls them headless, and the runner menu's Check now calls
 //! [`check_now`]. `tod_ui::views::lifecycle_control::LifecycleController`
-//! only keeps what the task panel shows of the last gate check; no view calls
-//! [`waive`] today (it is exercised by tests and available to a caller that
-//! offers it).
+//! only keeps what the task panel shows of the last gate check. There is no
+//! way to waive a criterion: the user moves a node on with the task panel's
+//! lifecycle dropdown. A `waived` outcome already stored still reads as
+//! passing.
 //!
 //! Which step comes next is [`crate::lifecycle_next`]; whether the current
 //! state still holds is [`crate::lifecycle_validity`].
@@ -18,7 +18,6 @@ pub use check_now::{CheckNow, check_now};
 use crate::task::model::{next_lifecycle, previous_lifecycle};
 use anyhow::{Context, Result};
 use tod_store::fleet::FleetStore;
-use tod_store::outline::repos::gate::ACTION_NONE;
 use tod_store::outline::{
     GateCriterion, NodeGateEvaluation, OUTCOME_PASS, OUTCOME_WAIVED, OutlineMutation, SOURCE_HUMAN,
 };
@@ -78,26 +77,6 @@ pub fn revert(fleet: &FleetStore, node: Uuid) -> Result<Option<&'static str>> {
 /// Move the node straight back to `target`, several states if need be.
 pub fn revert_to(fleet: &FleetStore, node: Uuid, target: &str) -> Result<()> {
     set_lifecycle(fleet, node, target)
-}
-
-/// Waive one gate criterion for the node (`SOURCE_HUMAN`). Never advances by
-/// itself: see [`advance_after_criteria`].
-pub fn waive(fleet: &FleetStore, node: Uuid, criterion: Uuid) -> Result<()> {
-    fleet
-        .enqueue_outline(OutlineMutation::ApplyGateResults {
-            node_id: node,
-            results: vec![(
-                criterion,
-                OUTCOME_WAIVED.to_string(),
-                Some(WAIVED_DETAIL.to_string()),
-                ACTION_NONE.to_string(),
-            )],
-            forward_state: None,
-            source: SOURCE_HUMAN.to_string(),
-        })
-        .map_err(|err| anyhow::anyhow!("{err:#}"))?;
-    let _ = fleet.writer().flush();
-    Ok(())
 }
 
 /// Move the node to its next state, recording the advance as the gate's
@@ -198,17 +177,31 @@ pub fn implement_directory(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tod_store::outline::repos::gate::ACTION_NONE;
 
     #[test]
-    fn waiving_then_advancing_moves_the_node() {
+    fn passing_then_advancing_moves_the_node() {
         let fx = crate::interview::test_support::fixture();
-        // `ready` → `active` has one app-answered criterion; record it failing.
+        // `ready` → `active` has one app-answered criterion; none recorded yet.
         set_lifecycle(&fx.fleet, fx.node, "ready").unwrap();
         let rows = recorded_criteria(&fx.fleet, fx.node).unwrap();
         assert!(!rows.is_empty());
         assert_eq!(advance_after_criteria(&fx.fleet, fx.node).unwrap(), None);
         for row in &rows {
-            waive(&fx.fleet, fx.node, row.criterion.id).unwrap();
+            fx.fleet
+                .enqueue_outline(OutlineMutation::ApplyGateResults {
+                    node_id: fx.node,
+                    results: vec![(
+                        row.criterion.id,
+                        OUTCOME_PASS.to_string(),
+                        None,
+                        ACTION_NONE.to_string(),
+                    )],
+                    forward_state: None,
+                    source: SOURCE_HUMAN.to_string(),
+                })
+                .unwrap();
+            let _ = fx.fleet.writer().flush();
         }
         assert!(all_clear(&recorded_criteria(&fx.fleet, fx.node).unwrap()));
         assert_eq!(

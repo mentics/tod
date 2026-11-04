@@ -53,8 +53,8 @@ impl GateOutcome {
 
 /// How the user can resolve a failing criterion from within the app, as
 /// reported by the agent for that row. Drives which button(s) the lifecycle
-/// panel shows next to it — `Interview` alongside the always-present Waive,
-/// `None` when there's no in-app destination and Waive is the only option.
+/// panel shows next to it — `Interview`, or `None` when there's no in-app
+/// destination.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum GateAction {
     #[default]
@@ -91,7 +91,7 @@ pub struct GateBlocker {
     /// Plan step id, test path, criterion id — whatever names it.
     pub reference: String,
     pub what: String,
-    /// `implement | fix | verify | waive | interview | ask_user`.
+    /// `implement | fix | verify | interview | ask_user`.
     pub action: String,
 }
 
@@ -344,13 +344,13 @@ blockers:
   - kind: test
     ref: "paths::tests::x"
     what: "fails, untouched by this node"
-    do: waive
+    do: ask_user
 "#,
         )
         .unwrap();
         assert_eq!(reply.next, "implement");
         assert_eq!(reply.blockers.len(), 2);
-        assert_eq!(reply.blockers[1].action, "waive");
+        assert_eq!(reply.blockers[1].action, "ask_user");
         assert!(!reply.gives_no_reasons());
     }
 

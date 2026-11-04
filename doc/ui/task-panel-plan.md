@@ -18,7 +18,7 @@ The facts that shape the plan:
   (decisions, plan steps handed back, open findings in `review`, a gate
   check needing a human), answers each through its existing code path
   (`AgentRuns::answer_decision`, `answer_plan_step_handoff`,
-  `respond_review_finding`; gate criteria are not requests: `tod_core::lifecycle::waive` has no view calling it), renders evidence
+  `respond_review_finding`; gate criteria are not requests, and there is no Waive: the user moves a node on with the lifecycle dropdown), renders evidence
   links (`evidence_target`), handles the number keys and keyboard stops,
   records journey `UserAction`s with `Presented`, and shows the
   `decision_answers` log with **Change**. The task panel reuses all of this;

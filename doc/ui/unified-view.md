@@ -211,7 +211,7 @@ label wherever the node is shown:
 | `design` | In this state. |
 | `design →` | The state's agent, or its evaluator, is working. |
 
-Decisions the lifecycle panel used to hold (gate verdicts, waives, what to do
+Decisions the lifecycle panel used to hold (gate verdicts, what to do
 next) move to the task panel's requests.
 
 ### Structured agents
