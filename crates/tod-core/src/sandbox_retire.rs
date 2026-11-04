@@ -172,11 +172,30 @@ pub fn retire_due_with(
     now_ms: i64,
     delete: &mut dyn FnMut(&str) -> Result<String>,
 ) -> Result<Retired> {
+    use tod_store::node_problems::{KIND_SANDBOX_RETIRE, NodeProblem, NodeProblemRepo};
     let mut report = Retired::default();
     let live: Vec<Due> = due(fleet)?;
-    // A node that is no longer due (retired, setting turned off, moved back) starts afresh.
+    // A node that is no longer due (retired, setting turned off, moved back, its
+    // sandbox deleted from the menu) starts afresh: its schedule and its
+    // recorded problem go.
     if let Some(map) = failing().as_mut() {
         map.retain(|node, _| live.iter().any(|d| &d.node_id == node));
+    }
+    let recorded: Vec<NodeProblem> = fleet
+        .read(|c| NodeProblemRepo::new(c).list_all())?
+        .into_iter()
+        .filter(|p| p.kind == KIND_SANDBOX_RETIRE)
+        .collect();
+    // The first failure to write the node's record is returned after the pass,
+    // so one bad write does not leave the other nodes unattended.
+    let mut write_error: Option<anyhow::Error> = None;
+    let mut note = |result: Result<()>| {
+        if let Err(err) = result {
+            write_error.get_or_insert(err);
+        }
+    };
+    for stale in recorded.iter().filter(|p| !live.iter().any(|d| d.node_id == p.node_id.to_string())) {
+        note(crate::node_problems::clear(fleet, &stale.node_id.to_string(), KIND_SANDBOX_RETIRE));
     }
     for item in live {
         let state = failing().get_or_insert_with(Default::default).get(&item.node_id).copied();
@@ -190,6 +209,7 @@ pub fn retire_due_with(
                 failing().get_or_insert_with(Default::default).remove(&item.node_id);
                 tracing::info!("sandbox retire: {} reached {FINAL_PHASE}: {message}", item.title);
                 report.deleted.push(message);
+                note(crate::node_problems::clear(fleet, &item.node_id, KIND_SANDBOX_RETIRE));
             }
             Err(err) => {
                 report.failed += 1;
@@ -214,11 +234,35 @@ pub fn retire_due_with(
                     crate::logging::buffer::LogSource::App,
                     message.clone(),
                 );
-                tod_store::fleet::session_log::report_problem(&item.node_id, message);
+                // The node's own record: durable, shown in its task panel, and
+                // counted by `next_actor` (see there for how a `done` node reads).
+                match uuid::Uuid::parse_str(&item.node_id) {
+                    Ok(node) => {
+                        let first_at = recorded.iter().find(|p| p.node_id == node).map_or(now_ms, |p| p.first_at);
+                        note(crate::node_problems::record(
+                            fleet,
+                            NodeProblem {
+                                node_id: node,
+                                kind: KIND_SANDBOX_RETIRE.to_string(),
+                                message,
+                                attempts: failures as u32,
+                                max_attempts: Some(BACKOFF.len() as u32 + 1),
+                                next_retry_at: retry.map(|_| next_at_ms),
+                                gave_up: retry.is_none(),
+                                first_at,
+                                updated_at: now_ms,
+                            },
+                        ));
+                    }
+                    Err(e) => note(Err(anyhow::anyhow!("node id {}: {e}", item.node_id))),
+                }
             }
         }
     }
-    Ok(report)
+    match write_error {
+        Some(err) => Err(err),
+        None => Ok(report),
+    }
 }
 
 #[cfg(test)]
@@ -334,6 +378,15 @@ mod tests {
             self.fleet.reload_if_stale().unwrap();
         }
 
+        /// The node's recorded sandbox-retire problem, if any.
+        fn problem(&self) -> Option<tod_store::node_problems::NodeProblem> {
+            self.fleet.reload_if_stale().unwrap();
+            crate::node_problems::for_node(&self.fleet, self.node)
+                .unwrap()
+                .into_iter()
+                .find(|p| p.kind == tod_store::node_problems::KIND_SANDBOX_RETIRE)
+        }
+
         fn has_location(&self) -> bool {
             tod_store::fleet::provision::node_location(&self.fleet, &self.id()).unwrap().is_some()
         }
@@ -421,7 +474,6 @@ mod tests {
         let fx = fx();
         fx.locate("sb-5");
         fx.set_lifecycle("done");
-        let _ = tod_store::fleet::session_log::take_problems();
         let attempts = std::cell::Cell::new(0);
         let mut fail = |_: &str| -> Result<String> {
             attempts.set(attempts.get() + 1);
@@ -429,27 +481,56 @@ mod tests {
         };
         let r = retire_due_with(&fx.fleet, 0, &mut fail).unwrap();
         assert_eq!(r.failed, 1);
-        let id = fx.id();
-        let problems: Vec<_> =
-            tod_store::fleet::session_log::take_problems().into_iter().filter(|(n, _)| *n == id).collect();
-        assert_eq!(problems.len(), 1);
-        assert!(problems[0].1.contains("blaxel said no") && problems[0].1.contains("tried again"), "{problems:?}");
+        let problem = fx.problem().expect("the failure is recorded on the node");
+        assert!(problem.message.contains("blaxel said no") && problem.message.contains("tried again"), "{problem:?}");
+        assert_eq!((problem.attempts, problem.max_attempts), (1, Some(BACKOFF.len() as u32 + 1)));
+        assert_eq!(problem.next_retry_at, Some(BACKOFF[0].as_millis() as i64));
+        assert!(!problem.gave_up);
         assert!(fx.has_location(), "the location stays for the retry");
         // Too early: not tried.
         retire_due_with(&fx.fleet, 1_000, &mut fail).unwrap();
         assert_eq!(attempts.get(), 1);
         // After each back-off: tried again, to the last attempt.
         let mut now = 0;
-        for wait in BACKOFF {
+        for (i, wait) in BACKOFF.iter().enumerate() {
             now += wait.as_millis() as i64;
             retire_due_with(&fx.fleet, now, &mut fail).unwrap();
+            assert_eq!(fx.problem().unwrap().attempts as usize, i + 2, "the count follows the attempts");
         }
         assert_eq!(attempts.get(), 1 + BACKOFF.len());
-        let last = tod_store::fleet::session_log::take_problems();
-        assert!(last.iter().any(|(_, m)| m.contains("not tried again")), "{last:?}");
+        let last = fx.problem().unwrap();
+        assert!(last.gave_up && last.next_retry_at.is_none(), "{last:?}");
+        assert!(last.message.contains("not tried again") && last.message.contains("Delete sandbox"), "{last:?}");
+        assert_eq!(last.first_at, 0, "when it first failed is kept");
         // Then it stops.
         retire_due_with(&fx.fleet, now + 10_000_000_000, &mut fail).unwrap();
         assert_eq!(attempts.get(), 1 + BACKOFF.len());
+    }
+
+    #[test]
+    fn a_later_success_clears_the_problem_and_so_does_the_sandbox_going_another_way() {
+        let fx = fx();
+        fx.locate("sb-6");
+        fx.set_lifecycle("done");
+        let mut fail = |_: &str| -> Result<String> { anyhow::bail!("blaxel said no") };
+        retire_due_with(&fx.fleet, 0, &mut fail).unwrap();
+        assert!(fx.problem().is_some());
+        // Tried again after the first back-off: it works now.
+        let calls = std::cell::RefCell::new(Vec::new());
+        let at = BACKOFF[0].as_millis() as i64;
+        retire_due_with(&fx.fleet, at, &mut |n| fx.fake_delete(&calls, n)).unwrap();
+        assert!(fx.problem().is_none(), "a successful delete clears it");
+
+        // Failing again, then the user deletes it from the menu (the location goes):
+        // the next pass finds nothing due and clears the record.
+        let fx = self::fx();
+        fx.locate("sb-7");
+        fx.set_lifecycle("done");
+        retire_due_with(&fx.fleet, 0, &mut fail).unwrap();
+        assert!(fx.problem().is_some());
+        fx.fake_delete(&calls, &fx.id()).unwrap();
+        retire_due_with(&fx.fleet, 1, &mut fail).unwrap();
+        assert!(fx.problem().is_none(), "no longer due: nothing left to report");
     }
 
     /// The real `retire_due` (no fake) deletes through the very function the
@@ -462,14 +543,12 @@ mod tests {
         fx.locate("sb-real");
         fx.set_lifecycle("done");
         let id = fx.id();
-        let _ = tod_store::fleet::session_log::take_problems();
         let menu_error = format!("{:#}", lost::delete_node_sandbox(&fx.fleet, &id).unwrap_err());
         assert!(!menu_error.is_empty());
         let report = retire_due(&fx.fleet).unwrap();
         assert_eq!((report.deleted.len(), report.failed), (0, 1), "{report:?}");
-        let problems: Vec<_> =
-            tod_store::fleet::session_log::take_problems().into_iter().filter(|(n, _)| *n == id).collect();
-        assert!(problems.len() == 1 && problems[0].1.contains(&menu_error), "{menu_error:?} in {problems:?}");
+        let problem = fx.problem().expect("recorded on the node");
+        assert!(problem.message.contains(&menu_error), "{menu_error:?} in {problem:?}");
         assert!(fx.has_location(), "a failed delete forgets nothing");
     }
 }
