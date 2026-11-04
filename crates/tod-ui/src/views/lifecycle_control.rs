@@ -27,8 +27,8 @@ pub struct CriterionOutcome {
     pub outcome: String,
     pub detail: Option<String>,
     /// How the user can resolve this row in-app if it's failing — reported
-    /// by the agent per row. `Interview` offers an Open interview button
-    /// alongside Waive; `None` leaves Waive as the only option.
+    /// by the agent per row (`Interview`: open the interview; `None`: no
+    /// in-app way). No view reads these rows today.
     pub action: GateAction,
 }
 

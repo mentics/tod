@@ -8,9 +8,12 @@
 //! [`LifecycleController`]. Each kind answers through its existing code path,
 //! never a new mutation: a decision through `AgentRuns::answer_decision`; a
 //! plan step through `AgentRuns::answer_plan_step_handoff`; a finding through
-//! `AgentRuns::respond_review_finding`; a gate criterion through
-//! `LifecycleController::waive`. Every answer records a journey `UserAction`
-//! with a `Presented` snapshot of the choices shown.
+//! `AgentRuns::respond_review_finding`. A gate criterion is not a request
+//! (`tod_core::attention` has those three sources only: gates are app checks
+//! and never hand anything to the user); the criteria last found failing show
+//! on the runner line's Check now result, and `tod_core::lifecycle::waive`,
+//! which records a waiver, is called by no view today. Every answer records
+//! a journey `UserAction` with a `Presented` snapshot of the choices shown.
 //!
 //! Keys (digits answer the top request, Up/Down move a stop across the
 //! current decision's evidence links and freeform field, Enter/Ctrl+Enter
@@ -361,8 +364,9 @@ pub struct Requests {
     pub(crate) node_id: Option<Uuid>,
     fleet: Arc<FleetStore>,
     agent_runs: Entity<AgentRuns>,
-    /// The one lifecycle controller shared with the conversation view and
-    /// the lifecycle panel: gate criteria and `waive` live there.
+    /// The one lifecycle controller the shell shares: it holds the criteria
+    /// the last gate check recorded (`load_persisted`), and nothing else a
+    /// request answers through.
     pub(crate) lifecycle: Entity<LifecycleController>,
     /// The host panel's focus handle, refocused when the freeform field is
     /// left.
@@ -423,7 +427,7 @@ impl Requests {
                 this.host_focus.focus(window, cx);
             }
         });
-        // A gate criterion waived elsewhere shows here too: one controller.
+        // A change to the shared controller (the criteria it shows) reloads here too.
         let lifecycle_sub = cx.observe(&lifecycle, |this, _, cx| this.reload_data(cx));
         let fleet_for_poll = fleet.clone();
         let _poll = cx.spawn(async move |this, cx| {

@@ -91,8 +91,9 @@ client `pr_mergeable_outcome` uses. All apply to **every linked PR**.
 | `pr-review-score` | For each configured bot with a `min_score`, its latest review for the current head has a score at or above it. |
 
 Each fails with a detail line naming the thread, bot, or score, so the
-side pane shows why and offers Waive. A waiver is per criterion and is
-cleared when the PR head changes, as other certificates go stale.
+runner line's Check now result shows why. A waiver (`tod_core::lifecycle::waive`,
+which no view calls today) is per criterion and is cleared when the PR head
+changes, as other certificates go stale.
 
 ### Bots
 
@@ -294,8 +295,8 @@ it is outward-facing, so it is bounded:
 - `assets/process/`: the `pr` role doc's **Done when**; a
   `surface/` fragment and `ContextRecipe` for the babysitter.
 - `tod-ui`: the poller feeding the runner (`unified/`), the wait line in the
-  task panel runner line, failing criteria with Waive in the side pane, and
-  the Settings section for bots.
+  task panel runner line (its Check now result lists the failing criteria),
+  and the Settings section for bots.
 
 ## Build order
 

@@ -214,9 +214,9 @@ pub struct UnifiedView {
     fleet: Arc<FleetStore>,
     paths: TodPaths,
     agent_runs: Entity<AgentRuns>,
-    /// The one lifecycle controller the shell shares with the conversation
-    /// view and the lifecycle panel (`.claude/CLAUDE.md`): a gate check
-    /// started or waived in either shows in the task panel too.
+    /// The one lifecycle controller the shell shares with the task panels:
+    /// it keeps the criteria the last gate check recorded
+    /// (`views::lifecycle_control`), so every panel shows the same ones.
     lifecycle: Entity<LifecycleController>,
     /// Every task's runner on this machine, shared with the task panels.
     runners: Entity<runners::NodeRunners>,

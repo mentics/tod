@@ -2,11 +2,12 @@
 //! gate criterion reads pass/waived, waiving a criterion, forcing or reverting
 //! a transition, and deciding whether a state's agent starts on entry.
 //!
-//! Plain functions over [`FleetStore`], with no UI state: the lifecycle
-//! panel and the conversation view reach them through
-//! `tod_ui::views::lifecycle_control::LifecycleController`, which keeps only
-//! what is shown (status lines, two-click confirmations), and
-//! [`crate::autopilot`] calls them headless.
+//! Plain functions over [`FleetStore`], with no UI state. [`crate::autopilot`]
+//! calls them headless, and the runner menu's Check now calls
+//! [`check_now`]. `tod_ui::views::lifecycle_control::LifecycleController`
+//! only keeps what the task panel shows of the last gate check; no view calls
+//! [`waive`] today (it is exercised by tests and available to a caller that
+//! offers it).
 //!
 //! Which step comes next is [`crate::lifecycle_next`]; whether the current
 //! state still holds is [`crate::lifecycle_validity`].
