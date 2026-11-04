@@ -23,5 +23,5 @@ When external references matter, say whether each one is **required** or only a 
 
 - Every costly-to-reverse choice is decided or has a decision tree.
 - Each requirement has a concrete, checkable way to be verified.
-- User-visible appearance is accepted, or the user has waived it.
+- User-visible appearance is accepted, unless the user has moved the node past this phase.
 - No open memory is parked for design.

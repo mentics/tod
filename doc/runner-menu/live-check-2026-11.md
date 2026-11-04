@@ -486,3 +486,17 @@ worktree, which has `target/sandbox`) was stopped; another session's `tod` (pid 
     never clones). `golden refresh <repo>` of a new repository forks the old golden unchanged.
 16. A `tod-cli` error printed by a separate shell command (`capabilities show`, which does not exist)
     showed up as a red toast in the running app. Probably the shared error channel; not investigated.
+    **Verdict: intended, not a bug.** `tod-cli`'s `main` (crates/tod-cli/src/main.rs) answers every failed
+    command (and every ignored-option warning) twice: on stderr, and through `tod_problems::report_to`
+    into `<data root>/problems/tod-cli.jsonl` ("Also to the app's problem log (log panel and toast)").
+    The data root is the `--data-root` flag, else the one the app passed in the environment, so a shell
+    that has that environment (or names the root) reports into the same channel. The app's problem-log
+    tail (`tod_core::logging::buffer::start_problem_tail`, every 3 s) feeds each line into the log ring,
+    and `refresh_agent_status` (crates/tod-ui/src/app/window.rs) raises a toast for every fresh error in
+    it, naming the source `[tod-cli]` (repeats fold). The failure text also carries "while running:
+    tod-cli ..." so the user can tell which command it was. Failures reaching the toast is the point of
+    the channel (agents' failed commands must not be dropped, see doc/problems.md); the channel cannot
+    tell an agent's `tod-cli` from one typed in a terminal, since both are the same binary with the same
+    root. If a hand-typed typo toasting is unwanted, the narrow fix would be to report only when the
+    invocation carries an agent identity (`TOD_INTERVIEW_ACTOR` or the implement node/conversation env),
+    but that would also hide failures of non-agent callers (the supervisor, scripts); left as is.

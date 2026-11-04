@@ -23,9 +23,6 @@ use tod_store::outline::{
 };
 use uuid::Uuid;
 
-/// What a waived criterion's detail says.
-pub const WAIVED_DETAIL: &str = "Waived by user";
-
 /// The node's current lifecycle state, as the store has it now.
 pub fn current_state(fleet: &FleetStore, node: Uuid) -> Result<String> {
     Ok(fleet
