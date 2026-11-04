@@ -49,7 +49,11 @@ pub fn confirm_files_change(
     on_confirmed: OnConfirmed,
 ) {
     if affected.is_empty() {
-        on_confirmed(window, cx);
+        // Not now: the caller is usually inside an update of the view that
+        // `on_confirmed` updates again (the Locations dialog's "Change it"
+        // panicked with "cannot update ... while it is already being
+        // updated", found live, pass 6).
+        window.defer(cx, move |window, cx| on_confirmed(window, cx));
         return;
     }
     let intro = intro.into();
@@ -504,5 +508,56 @@ impl Render for FilesImpact {
                             .on_click(cx.listener(|this, _, window, cx| this.confirm(window, cx))),
                     ),
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::{Entity, TestAppContext};
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    struct Host {
+        confirmed: Rc<Cell<u32>>,
+    }
+
+    impl Render for Host {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+        }
+    }
+
+    /// With nothing to remove the change is confirmed at once, but never
+    /// inside the caller's own update: a callback that updates the caller's
+    /// view (as the Locations dialog's does) would panic with "cannot update
+    /// ... while it is already being updated" (found live, pass 6).
+    #[gpui::test]
+    fn confirming_with_nothing_affected_does_not_re_enter_the_caller(cx: &mut TestAppContext) {
+        let fixture = crate::views::rows::fixture::Fixture::new();
+        let confirmed = Rc::new(Cell::new(0));
+        let (host, cx) = cx.add_window_view({
+            let confirmed = confirmed.clone();
+            move |_, _| Host { confirmed }
+        });
+        let fleet = fixture.store.clone();
+        host.update_in(cx, |_, window, cx| {
+            let this: Entity<Host> = cx.entity();
+            confirm_files_change(
+                window,
+                cx,
+                fleet,
+                TodPaths::at(std::env::temp_dir()),
+                Vec::new(),
+                "title",
+                "intro",
+                "label",
+                Box::new(move |_, cx| {
+                    this.update(cx, |host, _| host.confirmed.set(host.confirmed.get() + 1));
+                }),
+            );
+        });
+        cx.run_until_parked();
+        assert_eq!(confirmed.get(), 1);
     }
 }
