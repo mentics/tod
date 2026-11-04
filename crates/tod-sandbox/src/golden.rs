@@ -3,7 +3,11 @@
 //! meets newer golden").
 //!
 //! The golden carries tod's own files (relay, shim, Linux `tod-cli`,
-//! supervisor, bundles), so a fork needs no install. The install stamp is a
+//! supervisor, bundles) and a fork's own proxy update wipes them again, so
+//! each node's fork gets tod's files from the app, without packages
+//! (`node::install_into_fork`); the golden still holds what a fork cannot
+//! have installed per node (the toolchain, the checkout) and the stamp that
+//! says whether this build can use it. The install stamp is a
 //! hash: it says "different", not "newer". The golden is therefore also
 //! labelled with an order: the sync contract (`schema`, `wire`) and the
 //! commit time of the build that made it. Making one is `tod_core`'s

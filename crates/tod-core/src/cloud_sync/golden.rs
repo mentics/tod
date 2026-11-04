@@ -1,5 +1,6 @@
 //! A project's golden sandbox: the one every node of the repository forks,
-//! carrying tod's own files so a fork installs none
+//! carrying the toolchain, the checkout and tod's own files (a node's fork
+//! gets tod's files again, because its proxy update redeploys it from its image)
 //! (`doc/runner-menu/design.md`, "The golden sandbox").
 //!
 //! [`ensure_golden_current`] is the entry a creator calls before any fork;

@@ -92,7 +92,7 @@ impl State {
             return if q.declined.contains(pinned) {
                 Some(format!(
                     "node {} is recorded as belonging to machine {pinned}, which says it does not know it: \
-                     the node's record is stale; run it in the cloud again from the data root it belongs to",
+                     the node's record is stale; start it again (Start in its task panel) from the data root it belongs to",
                     q.node
                 ))
             } else if !live {

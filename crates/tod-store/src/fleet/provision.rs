@@ -865,8 +865,11 @@ fn reuse_sandbox(
 ///   [`SandboxHost::current_golden`](super::sandbox_host::SandboxHost), or a
 ///   sandbox the Files setting names): the node's environment, proxy rules and
 ///   labels ([`tod_sandbox::node::fork_golden`]) and then only the node's own
-///   setup. **No file of tod's is installed**: the golden carries them, and a
-///   fork that does not answer with this build's manifest fails its check.
+///   setup. Tod's own files are installed into the fork without packages
+///   ([`tod_sandbox::node::install_into_fork`]), because the proxy update that
+///   ends `fork_golden` redeploys the fork from its image and wipes what the
+///   golden carried (seen live); the relay is then restarted, and a fork that
+///   does not answer with this build's manifest fails its check.
 /// - From an **image**: [`tod_sandbox::node::create`], the image's own
 ///   dependencies, and the full [`tod_sandbox::node::install`].
 /// - The node's own setup, either way: the branch and its submodules, the

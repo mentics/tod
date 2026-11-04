@@ -5,7 +5,7 @@
 //! location, calls [`menu`], and draws the answer, so every rule is tested
 //! without a window.
 //!
-//! Nothing calls this yet; the panel switches over in work item A8.
+//! The task panel (`panels/task.rs`, `runner_actions`) is its one caller.
 
 /// Where the node's files, and so its work, live.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

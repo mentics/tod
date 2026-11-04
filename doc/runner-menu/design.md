@@ -1,68 +1,39 @@
 # The runner menu, and one sandbox per node
 
-Status: design (November 2026), revised with the product owner's answers.
-Nothing here is built yet except the lifecycle config's "Delete sandbox"
-checkbox (schema v92, uncommitted in this worktree). The plan is
+Status: built (November 2026) and live-checked
+([live-check-2026-11.md](live-check-2026-11.md); what is still unverified is
+listed there and in [implementation.md](implementation.md), "What remains").
+This document describes the system as built. The plan that built it is
 [implementation.md](implementation.md).
 
-## Today (being removed)
+## The problem it solved
 
-The code has two creators that make differently configured sandboxes for a
-node. `provision::make_sandbox` (`tod-store`, through
-`Sandboxes::create_with_proxy`) makes one when the node's Files location runs
-in a cloud sandbox, and records it in `node_files_locations.sandbox`; it has
-the repository, the relay and the user's credentials, but not the node
-environment (`TOD_NODE`, `TOD_USER`, the orchestrator URL), the orchestrator
-and Blaxel proxy rules, or the supervisor. `cloud_sync::ensure_node_sandbox`
-(`tod-core`, behind the menu's "Run in the cloud") forks the golden or creates
-from an image, with all of those, installs the supervisor, and records the name
-in `cloud_nodes.sandbox`. Each tries to adopt the other's sandbox, but one made
-by `make_sandbox` cannot pass the supervisor's health check (`Check::Env`
-needs `TOD_NODE`); read from the code, not verified live.
-
-This work merges them into one creator that always makes a sandbox able to
-host the supervisor. The menu that exposed the split, today:
-
-| Today's entry | What it acts on |
-|---|---|
-| Run in the cloud, Move to the cloud, Reinstall and restart | `cloud_sync::start_in_cloud` → `cloud_nodes` |
-| Run on this machine instead, Stop running in the cloud | the local runner / `lost::stop_running_in_cloud` |
-| Delete Sandbox (and without a checkpoint) | `lost::delete_node_sandbox`: only a `cloud_nodes` row; a sandbox made by `make_sandbox` alone fails with "this node does not run in the cloud" |
-| Check now | `autopilot::check_now`: reads GitHub in `pr_draft`, `approved`, `merged` only |
-| Poll now, Keep going, Stop | a running poll; the supervisor's "leave it stopped" answer; a hand-started conversation |
-
-In the rest of this document there is one sandbox per node, called **the
-node's sandbox**. The chat panel, shells, agent turns, lifecycle phases and
-the supervisor all use it. The **golden** is the sandbox a project's node
+A node whose Files location is a cloud sandbox used to have two creators that
+made differently configured sandboxes (one for chat, shells and agent turns,
+one for the autonomous supervisor), two records of which sandbox it had
+(`node_files_locations.sandbox` and `cloud_nodes.sandbox`), a runner menu that
+exposed the split, and a final-phase delete that only ran inside an
+orchestrator sync. Now there is **one sandbox per node**, called **the node's
+sandbox**: the chat panel, shells, agent turns, lifecycle phases and the
+supervisor all use it. The **golden** is the sandbox a project's node
 sandboxes are forked from (the repository's checkout and the toolchain).
 
-### Other findings
+Facts that held before and still shape the code:
 
-- **Delete does not forget the Files record.** `delete_node_sandbox_with`
-  marks the `cloud_nodes` row lost; `node_files_locations` keeps naming the
-  deleted sandbox until a launch fails and `retry_if_sandbox_lost` forgets it.
-- **Two checkpoint paths.** `cloud_sync::checkpoint_before_delete` (by name)
-  and `fleet::node_checkpoint::checkpoint_node` (by location), both ending in
-  `checkpoint::checkpoint_dir`.
 - **Local runs outlive the app.** `tod-agentd` hosts them
-  (`crates/tod-agentd/src/runners.rs`); `doc/ui/task-panel.md` ("Closing the
-  app stops a local run") is stale. Resume is never needed because the app
-  closed, locally or in the cloud.
-- **The final-phase delete only ran on a sync**, and only for `cloud_nodes`
-  rows (fixed in B4: `sandbox_retire`, run by the daemon).
-- **No cloud Pause or Stop now exists.** `node_requests` kinds are `run`,
-  `fresh_session`, `check_now`, `keep_going`, fixed by a SQL `CHECK`.
-- **Where the gate is checked today.** `.claude/CLAUDE.md` and
-  `views/lifecycle_control.rs`'s module comment describe a
-  `LifecycleController::check_gate` and an Advance button in the conversation
-  view and lifecycle panel. Neither exists in this tree:
-  `LifecycleController` only reloads the criteria last recorded
-  (`load_persisted`), and `crates/tod-ui/src/conversation/` is gone. The gate is
-  checked in one place, the autopilot's `gate` step (`Autopilot::gate`,
-  `autopilot/mod.rs`): `phase::settle_gate` (derived criteria from
-  `gate::derived`, saved as evaluations), then `lifecycle::advance` when clear.
-  `lifecycle::advance_after_criteria` exists but only tests call it. Check now
-  calls the same two functions.
+  (`crates/tod-agentd/src/runners.rs`), so Resume is never needed because the
+  app closed, locally or in the cloud.
+- **Where the gate is checked.** The gate is checked in one place, the
+  autopilot's `gate` step (`Autopilot::gate`, `autopilot/mod.rs`):
+  `phase::settle_gate` (derived criteria from `gate::derived`, saved as
+  evaluations), then `lifecycle::advance` when clear. Check now calls the same
+  two functions (`tod_core::lifecycle::check_now`). No view has a gate button
+  or a `LifecycleController::check_gate`: `LifecycleController` only reloads
+  the criteria last recorded, and `crates/tod-ui/src/conversation/` is gone.
+- **Supervised nodes take requests.** `node_requests` kinds are `run`,
+  `fresh_session`, `check_now`, `keep_going`, `pause`, `stop_now` and
+  `fresh_budget`, fixed by a SQL `CHECK`.
+
 
 ## The model
 
@@ -89,64 +60,57 @@ sandboxes are forked from (the repository's checkout and the toolchain).
 
 ## The golden sandbox
 
-**Today.** A sandbox location either makes the node's sandbox from an image or
-forks the workspace's **golden** sandbox (`SandboxFrom::Fork("golden")`,
-resolved by `Sandboxes::resolve_golden`; `tod-sandbox golden <name>` points the
-name at a sandbox). The golden is made outside tod (the error text names
-`blaxel-sbx golden refresh`). Before using a fork, tod checks the golden
-supplied (`provision::require_fork_prerequisites`): the repository checkout,
-`git`, `curl`, `tar`, `gzip`, `bash`, `ps`, `scp`, an `sftp-server`, Node ≥
-20.10 with npm, and `claude-agent-acp`. Then, **on every fork**,
-`node::install_into_fork` uploads tod's own files: the relay, the `tod-cli`
-shim, the Linux `tod-cli`, the supervisor, and the process, media and skills
-bundles (hundreds of files, one upload each), and writes the manifest.
-(`node::ensure_base`, a per-user "base" with tod's files in it, has no
-caller.)
+A sandbox location either makes the node's sandbox from an image or forks the
+repository's **golden** (`SandboxFrom::Fork("golden")`, resolved by
+`Sandboxes::resolve_golden`). There is one golden per repository
+(`owner/name`, as `cloud_nodes::normalize_repo` writes it), in
+`[blaxel.goldens]` of `sandboxes.toml`; a `golden = "..."` from before that
+is read as every repository's until it has its own. A golden is never kept per
+build, and only moves forward.
 
-**Target.** Everything that is the same for every node goes into the golden,
-so a fork needs only per-node setup:
+What it holds, and what each node's fork still gets:
 
 | In the golden (built once per tod build) | Per node, after the fork |
 |---|---|
-| Toolchain: git, curl, tar, bash, ssh tools, Node ≥ 20.10, `claude-agent-acp`, `claude` | Environment: `TOD_NODE`, `TOD_USER`, orchestrator URL, scheduler, workspace (`fork_with_envs`) |
-| The repository checkout (as today) | Proxy rules and labels: the user's and the node's credentials, Blaxel, orchestrator (`update_proxy`) |
-| The relay, `tod-cli` shim and Linux `tod-cli`, the supervisor | The branch checked out, submodules on it |
-| The process, media and skills bundles; the node manifest | Supervisor settings (`push_supervisor_settings`) |
-| A label with the tod install stamp (`refresh::install_stamp`) | Session logs and the checkpoint restored; relay started; poke only if the runner is to run |
+| Toolchain: git, curl, tar, bash, ssh tools, Node >= 20.10, `claude-agent-acp`, `claude` | Environment: `TOD_NODE`, `TOD_USER`, orchestrator URL, scheduler, workspace (`fork_with_envs`) |
+| The repository checkout | Proxy rules and labels: the user's and the node's credentials, Blaxel, orchestrator (`update_proxy`), `tod-kind=node`, `tod-creds` |
+| tod's files: the relay, `tod-cli` shim and Linux `tod-cli`, the supervisor, the process, media and skills bundles, the node manifest | **tod's files again, without packages** (`node::install_into_fork`), then the relay restarted |
+| Labels `tod-install` (the install stamp), `tod-schema`, `tod-wire`, `tod-built` (commit time), `tod-kind=golden`, `ready` | The branch checked out, submodules on it; supervisor settings; session logs and runner state restored |
 
-**One golden per project** (per repository, since it holds that repository's
-checkout), and it only moves forward. Today `golden` is one name per Blaxel
-account (`Account::golden` in `sandboxes.toml`); it becomes one per repository
-(`owner/name`, as `cloud_nodes::normalize_repo` writes it). It is never kept
-per build.
+The third row is what the live check found (live-check-2026-11.md, Pass 3,
+bug 1): the proxy update that ends `fork_golden` redeploys the fork from its
+image, which drops everything the golden had installed (a plain `tod-sandbox
+fork` of the golden keeps it). The first design said a fork installs nothing
+of tod's; on Blaxel it must, and only the packages (which are in the image)
+are skipped. The same update is why `golden refresh` sets the golden's own
+placeholder proxy **before** installing tod's files. A fork must answer with
+this build's manifest before it is adopted, or `make_sandbox` fails naming the
+golden. An **image** source has no golden: it gets the bootstrap and the full
+`node::install`.
 
-A golden whose tod files are older than this build is **refreshed**, not
-patched per node: `tod-sandbox golden refresh` (new) forks the project's
-golden, installs tod's files with `node::install`, labels it, and points the
-project's golden at the result. The app runs it before making a sandbox when
-the golden is older, and says so in the progress. A fork then never gets a
-per-node install of tod's files. An **image** source has no golden: it gets
-the full `node::provision`, as today.
+**Refreshing.** `tod-sandbox golden refresh [<owner/name>]`
+(`cloud_sync::golden::refresh_golden`) forks the project's golden, checks what
+a fork needs (`provision::require_fork_prerequisites`), gives it the
+placeholder proxy, installs tod's files, labels it with this build's stamp and
+`tod-kind=golden`, marks it `ready` last, points the repository at it, and
+deletes the old golden when tod made it and no other setting points at it.
+The app does the same before making a sandbox when the golden is older
+(`ensure_golden_current`, through `SandboxHost::current_golden`), saying so in
+the progress. A golden with no `tod-install` label (made by hand) counts as
+older than any build.
 
-**Older build meets newer golden (proposal).** The install stamp
-(`refresh::install_stamp`) is a hash, so it says "different" but not "newer".
-The golden is therefore labelled with the stamp **and** an order: the sync
-contract (`wire`, `schema`, `sync::contract::Contract`) and the build's commit
-time. Then:
+**Older build meets newer golden.** The install stamp is a hash, so the
+golden also carries an order: the sync contract (`schema`, then `wire`) and
+the build's commit time (`tod_sandbox::golden::plan`).
 
 - same stamp: use it;
 - the golden is older: refresh it forward;
-- the golden is newer: **refuse**, naming both: "The golden sandbox for
-  acme/widget was refreshed by a newer tod (install <theirs>, schema <n>);
-  this tod is older (install <mine>, schema <m>). Update tod to make sandboxes
-  for this project." Never refresh it back, since that would break the newer
-  users' sandboxes;
-- same order, different stamp (two builds of one commit with local changes,
-  the developer's case): treat as forward and refresh, saying so.
-
-Refusing is right because a fork would run the newer supervisor and `tod-cli`
-against this app's older schema and sync contract, which the contract check
-already treats as an error for the orchestrator.
+- the golden is newer: **refuse**, naming both (the repository, install,
+  schema), and never refresh it back, since that would break the newer users'
+  sandboxes: a fork would run the newer supervisor and `tod-cli` against this
+  app's older schema and sync contract;
+- same order, different stamp (two builds of one commit with local changes):
+  treated as forward and refreshed, saying so.
 
 ## The runner menu
 
@@ -161,6 +125,7 @@ rest. Entries show whenever they make sense.
 | **Run with a new session** | with Start or Resume (including after a spent budget) | The current step in a new agent session. |
 | **Pause** (default while running) | the runner is active | Stops once the current turn ends. Supervised: a new `pause` request, read at the supervisor's next boundary. |
 | **Stop now** | the runner is active, or a conversation started by hand is running | Cancels the turn in flight. Locally `NodeRunners::stop_now`; a hand-started conversation through `AgentRuns::stop` (today's Stop, then the default); supervised, a new `stop_now` request plus a marker file the supervisor's `watch` sees mid-turn. |
+| **Adopt existing sandbox** | not done, and the node's old records (`cloud_nodes`, a legacy `cloud-sync.json` record) name a sandbox its Files location does not (`cloud_sync::adopt::adoptable`) | Records that sandbox as the node's location after checking it is the node's and answers (below, "Adopting"). |
 | **Check now** | the node is idle and in any state but `done` | Runs the current state's gate check now (below). Hidden while the runner is active. |
 | **Migrate to…** | not done, and the node has no children | A submenu of the global locations (below). |
 | **Reset environment** | the location is a dev container or a cloud sandbox | Sets the environment up again, deleting nothing (below). |
@@ -169,13 +134,14 @@ rest. Entries show whenever they make sense.
 | **Delete sandbox without a checkpoint** | with Delete sandbox | The same, discarding uncommitted work. |
 | **Sync now** | the node runs under a supervisor | `cloud_sync::sync_now`, saying what the sync shows of the supervisor. |
 
-Removed: Run in the cloud, Run on this machine instead, Move to the cloud,
-Stop running in the cloud (replaced by Migrate to…), Keep going (folded into
-Resume), Poll now (folded into Check now; a running run already polls on its
-own), Stop (folded into Stop now).
+The menu is built by `runner_menu::menu` (`unified/panels/runner_menu.rs`,
+`task.rs` is its one caller). While a cloud job of the panel's own runs
+(`cloud_busy`), the default action shows what it is doing, disabled, and the
+menu is empty. A node with entries but no default action (a run that ended
+only to wait) shows a disabled "Actions" button whose caret opens the menu.
 
-While a cloud job of the panel's own runs (`cloud_busy`), the default action
-shows what it is doing, disabled, and the menu is empty, as today.
+Menu entries from before this work have no counterpart under their old names;
+see "Historical" at the end for where each went.
 
 ### The runner's state, wherever it runs
 
@@ -186,7 +152,9 @@ RunnerInputs {
     place: Host | DevContainer | Sandbox { exists: bool },
     supervised: bool,              // runner_place == Supervisor
     run: NeverRun | Active { pausing } | HandTurn | Ended(EndedHow) | Done,
-    has_checkout: bool, busy: Option<&'static str>,
+    has_checkout: bool, has_children: bool,
+    adoptable: bool,               // old records name a sandbox the location lacks
+    busy: Option<&'static str>,
 }
 EndedHow: Paused | Stopped | Failed | Request | Budget | Waiting
 ```
@@ -280,8 +248,10 @@ What Migrate adds:
 - **Into a sandbox,** the mirror is copied in when the sandbox is made, and
   the supervisor's driver finds the log under the old project name in its own
   Claude directory and moves it to `/workspace/repo`'s (`bring_session`'s host
-  source). This is what the code implies; a supervised move is to be checked
-  live by extending `e2e_move_node`.
+  source). Live (Pass 3, 5c): the logs were restored in the new sandbox and the
+  agent ran there; that the same session id then resumes was not compared, and
+  neither was resuming it at a host (5b), where the run stopped at "Claude
+  Code is not signed in".
 
 ### Reset environment
 
@@ -290,9 +260,12 @@ Sets the environment up again as if starting over, deleting nothing:
 - **Dev container:** `resolve_launch_cwd_with` again (branch, submodules) and
   the `tod-cli` relay shim written again (`fleet::cli_relay`).
 - **Cloud sandbox:** proxy and credentials, the branch, the relay, the
-  supervisor settings (and tod's files, if the sandbox predates the golden
-  that carries them); the supervisor is poked only if the runner was active
-  or the node was supervised and waiting.
+  supervisor settings, and tod's files when the sandbox does not answer with
+  this build's manifest (`cloud_sync::ensure_supervisor`, the one path that
+  provisions a sandbox; a recorded sandbox that is gone or dead is forgotten
+  first and made again). The supervisor is poked only if the node is
+  supervised and waiting on someone. Refused while the runner is active
+  ("Stop it first").
 
 Not offered for a worktree on this machine.
 
@@ -315,15 +288,16 @@ and **Cancel**. Cancel does nothing. Stop and delete:
   heartbeat goes stale), then delete. If the supervisor does not stop within a
   bound (the stale-heartbeat window), the line says so and deletes anyway,
   since the sandbox, and the supervisor in it, is what is being deleted and
-  the checkpoint has already kept the work. (Proposal; the checkpoint runs
-  before the delete in either case.)
+  the checkpoint has already kept the work (the checkpoint runs before the
+  delete in either case). A local run that does not end within 30 seconds
+  refuses the delete with an error.
 
 The line shows "Stopping, then deleting the sandbox…" meanwhile.
 
 ## A one-time upgrade of existing sandboxes
 
-Sandboxes that `make_sandbox` already created in Blaxel before this change
-lack the node environment and the orchestrator and Blaxel proxy rules (their
+Sandboxes that an earlier `make_sandbox` created in Blaxel, before it made
+every sandbox able to host the supervisor, lack the node environment and the orchestrator and Blaxel proxy rules (their
 `tod-kind` label is not `node`), and Blaxel does not let tod add environment
 variables to an existing sandbox (this code only ever updates the proxy,
 `update_proxy`). They keep working for shells, editors and chat until they are
@@ -349,24 +323,24 @@ existing margin is kept), and dashes trimmed at the cut. The id makes names
 unique across a Blaxel workspace that several users share. **No numeric
 suffix**, ever:
 
-- The node's record names a sandbox that exists: that is the node's sandbox,
-  reused. Not a conflict.
-- Blaxel has a sandbox by the name and the node's record does not name it:
+- The node's Files location names a sandbox that exists: that is the node's
+  sandbox, reused. Not a conflict.
+- Blaxel has a sandbox by the name and the node's Files location does not name it:
   tod lost track of a sandbox, which is a bug. Creation fails, loudly and
   visibly (the runner line and the log panel): "Cannot make sandbox
   tod-export-totals-3f9a1c for node "Export totals" (3f9a1c…): a sandbox by
-  that name already exists, but this node's record does not point at it, so
-  tod lost track of it. Check `tod-sandbox list`, the node's Files location,
-  and `cloud_nodes` for this node; delete or adopt the sandbox, then try
-  again." Nothing is made, renamed or deleted.
+  that name already exists (<status>), but this node's Files location does
+  not point at it, so tod lost track of it. Check `tod-sandbox list` and the
+  node's Files location; delete or adopt the sandbox, then try again. Nothing
+  was made, renamed or deleted." (Seen live, Pass 3, check 3.)
 - A sandbox by that name still being deleted (status `DELETING`) after a
-  Delete sandbox: the creator waits for it to go (as `ensure_node_sandbox`
-  waits for a dead one today) and fails with the same kind of message if it
-  does not within the wait.
+  Delete sandbox: the creator waits up to two minutes for it to go and fails
+  with the same kind of message if it is still there.
 
-Existing sandboxes keep their names (`node-<slug>` from `node_sandbox_name`,
-`tod-<slug>[-n]` from `free_sandbox_name`). Both functions, and
-`free_sandbox_name`'s suffix loop, are replaced by the one.
+The one function is `provision::sandbox_name` (decided by `decide_name`,
+settled by `choose_sandbox`); no numeric suffix exists anywhere. Sandboxes
+made before it keep the names they had (`node-<slug>`, `tod-<slug>[-n]`) and
+are adopted as recorded.
 
 ## Deleting the sandbox at `done`
 
@@ -400,6 +374,23 @@ a sync.
   start-up pass catches up: `sync_on_start` brings in what the supervisor did,
   then the pass deletes every due sandbox.
 
+## Adopting a sandbox an older build recorded
+
+A node with a live `cloud_nodes` row (this client's, not lost, not deleted by
+the user) or a legacy `cloud-sync.json` record naming a sandbox, whose
+resolved Files are a cloud sandbox, and no location row, is **adoptable**
+(`cloud_sync::adopt`). Adoption records the location naming that sandbox, with
+the checkout path and branch found by asking the sandbox, after checking it is
+the node's: Blaxel has it and it can run, its `tod-kind` is `node` or
+`node-base`, its `TOD_NODE` (when it has one) is this node, and its relay
+answers as a node's. Nothing about the checkout is changed. Two entries, one
+implementation: the runner menu's **Adopt existing sandbox** (the user's
+form), and once at the app's start (`lost::check`, `Check::Full`) the
+automatic form, which adopts only what is unambiguous. A sandbox Blaxel no
+longer has is not adopted and nothing is written: the panel says so, and Start
+makes a new one. Until adopted, the panel says the node's Files location
+records no sandbox.
+
 ## What does not change
 
 - The supervisor and orchestrator, and how a supervised node waits, wakes,
@@ -409,15 +400,23 @@ a sync.
   removal or session copy fails, a final-phase delete that fails, each says
   what and why, and nothing falls back to another place to run.
 - Every runner action records a journey `UserAction` with a `Presented`
-  snapshot. The action ids change with the enum; analysis keyed on the old
-  ids (`RunInCloud`, `KeepGoing`, `PollNow`, `StopTurn`) needs a mapping.
+  snapshot. The action ids follow the `RunnerAction` enum.
 
 ## Open questions
 
-None. Two points are stated as proposals and stand unless the owner objects:
-refusing an older build against a newer golden (and refreshing on equal order
-with a different stamp), and deleting a supervised node's sandbox after a
-bounded wait when its supervisor does not report stopping.
+None. Possible later extension: Migrate on a node with children (moving or
+pinning them).
 
-Possible later extension: Migrate on a node with children (moving or pinning
-them).
+## Historical
+
+The menu before this work, for reading older journeys, audits and sessions:
+"Run in the cloud", "Move to the cloud" and "Reinstall and restart" started a
+supervisor (now Start, Resume and Reset environment); "Run on this machine
+instead" and "Stop running in the cloud" (now Migrate to...); "Keep going"
+(now Resume; the budget stop question still has a "Keep going" answer, which
+Resume also gives); "Poll now" (now Check now; a running run polls on its
+own); "Stop" (now Stop now). Journey action ids from then (`RunInCloud`,
+`KeepGoing`, `PollNow`, `StopTurn`) have no equivalent in the current enum.
+Before stage B a second creator (`cloud_sync::ensure_node_sandbox`) made the
+supervisor's sandbox and `cloud_nodes.sandbox` was the second record; both
+are gone.
