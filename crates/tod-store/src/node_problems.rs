@@ -13,7 +13,7 @@
 //! next succeeds at the same thing.
 //!
 //! One row per (node, kind), so the same job failing again updates its row
-//! (the attempt count, the next retry) instead of piling up. Writing the same
+//! (its message, whether it is transient) instead of piling up. Writing the same
 //! message again changes nothing, so a check that runs after every sync does
 //! not wake the views each time. Machine-local, not synced (it is this
 //! machine's job that failed, and no orchestrator reads it), journaled.
@@ -33,18 +33,29 @@ pub const KIND_CLOUD_RECORD: &str = "cloud_record";
 
 pub const CREATE_TABLE: &str = "
     CREATE TABLE IF NOT EXISTS node_problems (
-        node_id       BLOB NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
-        kind          TEXT NOT NULL,
-        message       TEXT NOT NULL,
-        attempts      INTEGER NOT NULL DEFAULT 1,
-        max_attempts  INTEGER,
-        next_retry_at INTEGER,
-        gave_up       INTEGER NOT NULL DEFAULT 0,
-        first_at      INTEGER NOT NULL,
-        updated_at    INTEGER NOT NULL,
+        node_id    BLOB NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+        kind       TEXT NOT NULL,
+        message    TEXT NOT NULL,
+        transient  INTEGER NOT NULL DEFAULT 0,
+        first_at   INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
         PRIMARY KEY (node_id, kind)
     );
 ";
+
+/// Adds `transient` to a table made before it existed (idempotent, no schema
+/// version). Such a table also keeps its old, now unused `attempts`,
+/// `max_attempts`, `next_retry_at` and `gave_up` columns (they all have
+/// defaults, so a write that does not name them works): dropping them would
+/// need a table rebuild for no gain, since the table is machine-local and a
+/// fresh one never has them.
+pub fn ensure_columns(conn: &Connection) -> Result<()> {
+    let has = conn.prepare("SELECT 1 FROM pragma_table_info('node_problems') WHERE name = 'transient'")?.exists([])?;
+    if !has {
+        conn.execute_batch("ALTER TABLE node_problems ADD COLUMN transient INTEGER NOT NULL DEFAULT 0")?;
+    }
+    Ok(())
+}
 
 /// One problem of a node.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -54,14 +65,10 @@ pub struct NodeProblem {
     pub kind: String,
     /// What failed and why, for the user; the row's text is selectable in the UI.
     pub message: String,
-    /// How many times the job has failed in a row.
-    pub attempts: u32,
-    /// How many attempts it makes in all, when it retries.
-    pub max_attempts: Option<u32>,
-    /// When it is tried again (ms since the epoch), when it will be.
-    pub next_retry_at: Option<i64>,
-    /// It will not be tried again by itself (until the daemon restarts).
-    pub gave_up: bool,
+    /// The failure looks temporary and the daemon's own next pass tries the
+    /// job again (shown as "will retry automatically"). False: nothing is
+    /// retried until something changes, and it needs the user.
+    pub transient: bool,
     /// When it first failed (ms); kept while the row is updated.
     pub first_at: i64,
     /// When it last failed (ms).
@@ -69,19 +76,9 @@ pub struct NodeProblem {
 }
 
 impl NodeProblem {
-    /// A problem that does not retry, failing now.
+    /// A problem that needs the user (nothing retries it), failing now.
     pub fn new(node_id: Uuid, kind: &str, message: String, now_ms: i64) -> Self {
-        Self {
-            node_id,
-            kind: kind.to_string(),
-            message,
-            attempts: 1,
-            max_attempts: None,
-            next_retry_at: None,
-            gave_up: false,
-            first_at: now_ms,
-            updated_at: now_ms,
-        }
+        Self { node_id, kind: kind.to_string(), message, transient: false, first_at: now_ms, updated_at: now_ms }
     }
 }
 
@@ -99,24 +96,16 @@ impl<'a> NodeProblemRepo<'a> {
     /// (no write, so no journey row and no store change for the views).
     pub fn record(&self, problem: &NodeProblem) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO node_problems
-                 (node_id, kind, message, attempts, max_attempts, next_retry_at, gave_up, first_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            "INSERT INTO node_problems (node_id, kind, message, transient, first_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(node_id, kind) DO UPDATE SET
-                 message = excluded.message, attempts = excluded.attempts,
-                 max_attempts = excluded.max_attempts, next_retry_at = excluded.next_retry_at,
-                 gave_up = excluded.gave_up, updated_at = excluded.updated_at
-             WHERE message IS NOT excluded.message OR attempts IS NOT excluded.attempts
-                OR max_attempts IS NOT excluded.max_attempts OR next_retry_at IS NOT excluded.next_retry_at
-                OR gave_up IS NOT excluded.gave_up",
+                 message = excluded.message, transient = excluded.transient, updated_at = excluded.updated_at
+             WHERE message IS NOT excluded.message OR transient IS NOT excluded.transient",
             params![
                 uuid_to_blob(problem.node_id),
                 problem.kind,
                 problem.message,
-                problem.attempts,
-                problem.max_attempts,
-                problem.next_retry_at,
-                problem.gave_up,
+                problem.transient,
                 problem.first_at,
                 problem.updated_at,
             ],
@@ -150,7 +139,7 @@ impl<'a> NodeProblemRepo<'a> {
 
     fn query(&self, filter: &str, params: impl rusqlite::Params) -> Result<Vec<NodeProblem>> {
         let mut stmt = self.conn.prepare(&format!(
-            "SELECT node_id, kind, message, attempts, max_attempts, next_retry_at, gave_up, first_at, updated_at
+            "SELECT node_id, kind, message, transient, first_at, updated_at
              FROM node_problems {filter} ORDER BY first_at, kind"
         ))?;
         let rows = stmt.query_map(params, |r| {
@@ -158,28 +147,15 @@ impl<'a> NodeProblemRepo<'a> {
                 r.get::<_, Vec<u8>>(0)?,
                 r.get::<_, String>(1)?,
                 r.get::<_, String>(2)?,
-                r.get::<_, u32>(3)?,
-                r.get::<_, Option<u32>>(4)?,
-                r.get::<_, Option<i64>>(5)?,
-                r.get::<_, bool>(6)?,
-                r.get::<_, i64>(7)?,
-                r.get::<_, i64>(8)?,
+                r.get::<_, bool>(3)?,
+                r.get::<_, i64>(4)?,
+                r.get::<_, i64>(5)?,
             ))
         })?;
         let mut out = Vec::new();
         for row in rows {
-            let (id, kind, message, attempts, max_attempts, next_retry_at, gave_up, first_at, updated_at) = row?;
-            out.push(NodeProblem {
-                node_id: blob_to_uuid_sql(&id)?,
-                kind,
-                message,
-                attempts,
-                max_attempts,
-                next_retry_at,
-                gave_up,
-                first_at,
-                updated_at,
-            });
+            let (id, kind, message, transient, first_at, updated_at) = row?;
+            out.push(NodeProblem { node_id: blob_to_uuid_sql(&id)?, kind, message, transient, first_at, updated_at });
         }
         Ok(out)
     }
@@ -205,17 +181,15 @@ mod tests {
         let (dir, conn, node) = setup();
         let repo = NodeProblemRepo::new(&conn);
         let mut p = NodeProblem::new(node, KIND_SANDBOX_RETIRE, "first".into(), 1_000);
-        p.max_attempts = Some(5);
-        p.next_retry_at = Some(61_000);
+        p.transient = true;
         repo.record(&p).unwrap();
-        let mut again =
-            NodeProblem { message: "second".into(), attempts: 2, updated_at: 62_000, first_at: 62_000, ..p.clone() };
-        again.gave_up = true;
+        let again =
+            NodeProblem { message: "second".into(), transient: false, updated_at: 62_000, first_at: 62_000, ..p.clone() };
         repo.record(&again).unwrap();
         let rows = repo.list_for_nodes(&[node]).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].message, "second");
-        assert_eq!((rows[0].attempts, rows[0].max_attempts, rows[0].gave_up), (2, Some(5), true));
+        assert!(!rows[0].transient);
         assert_eq!((rows[0].first_at, rows[0].updated_at), (1_000, 62_000));
         // Another kind is its own row.
         repo.record(&NodeProblem::new(node, KIND_ADOPT, "x".into(), 5)).unwrap();
@@ -252,6 +226,28 @@ mod tests {
         assert!(repo.list_all().unwrap().is_empty());
         let version: i32 = conn.pragma_query_value(None, "user_version", |r| r.get(0)).unwrap();
         assert_eq!(version, schema::CURRENT_USER_VERSION);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_table_from_before_transient_gets_it_and_still_works() {
+        let (dir, conn, node) = setup();
+        conn.execute_batch(
+            "DROP TABLE node_problems;
+             CREATE TABLE node_problems (
+                node_id BLOB NOT NULL REFERENCES nodes(id) ON DELETE CASCADE, kind TEXT NOT NULL,
+                message TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 1, max_attempts INTEGER,
+                next_retry_at INTEGER, gave_up INTEGER NOT NULL DEFAULT 0,
+                first_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, PRIMARY KEY (node_id, kind));",
+        )
+        .unwrap();
+        ensure_columns(&conn).unwrap();
+        ensure_columns(&conn).unwrap();
+        let repo = NodeProblemRepo::new(&conn);
+        let mut p = NodeProblem::new(node, KIND_SANDBOX_RETIRE, "x".into(), 1);
+        p.transient = true;
+        repo.record(&p).unwrap();
+        assert_eq!(repo.list_all().unwrap(), vec![p]);
         let _ = std::fs::remove_dir_all(dir);
     }
 }

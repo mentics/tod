@@ -96,6 +96,44 @@ pub fn error_is_not_ready(err: &anyhow::Error) -> bool {
     says_not_ready(&format!("{err:#}"))
 }
 
+/// Whether a failure (as its error text reads, causes included) looks
+/// temporary, so the same call is worth making again a minute later: the
+/// platform is not ready ([`says_not_ready`], or a wait that gave up on it), it
+/// answered 429/502/503/504, or the call timed out or could not reach it (a
+/// dropped or refused connection, a failed lookup). Everything else, a 401/403,
+/// another 4xx, a refusal of what was asked, is not: retrying it would repeat
+/// the same answer. A deliberately plain text match, because errors cross
+/// `anyhow` layers (a checkpoint's, a command's) with only their text left.
+pub fn error_is_transient(err: &anyhow::Error) -> bool {
+    text_is_transient(&format!("{err:#}"))
+}
+
+/// [`error_is_transient`] over the text.
+pub fn text_is_transient(text: &str) -> bool {
+    if says_not_ready(text) {
+        return true;
+    }
+    let lower = text.to_ascii_lowercase();
+    [
+        "was still not ready",
+        "did not wake",
+        "429 too many requests",
+        "502 bad gateway",
+        "503 service unavailable",
+        "504 gateway timeout",
+        "timed out",
+        "timeout",
+        "connection refused",
+        "connection reset",
+        "connection closed",
+        "dns error",
+        "failed to lookup",
+        "network is unreachable",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+}
+
 /// The reply of a call that was not retried away: the response, or the
 /// failure it carried (status and body already read).
 enum Answer {
@@ -1101,6 +1139,27 @@ pub fn jwt_expiry(token: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transient_errors_are_told_from_permanent_ones() {
+        for transient in [
+            "delete sandbox: 503 Service Unavailable",
+            "get sandbox: sandbox API: timeout: global",
+            "delete: sandbox API: io: Connection refused (os error 61)",
+            "x: the sandbox was still not ready after 90s and 5 attempts; last answer: 404",
+            "x: 404 Not Found\nWORKLOAD_UNAVAILABLE",
+        ] {
+            assert!(text_is_transient(transient), "{transient}");
+        }
+        for permanent in [
+            "delete: not authorized (401 Unauthorized); check the workspace and credentials",
+            "the checkpoint could not push: remote rejected (non-fast-forward)",
+            "x: 400 Bad Request\ninvalid name",
+            "tod lost track of it",
+        ] {
+            assert!(!text_is_transient(permanent), "{permanent}");
+        }
+    }
 
     #[test]
     fn a_proxy_update_keeps_the_rest_of_the_spec() {

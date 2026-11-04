@@ -1691,18 +1691,17 @@ impl TaskPanel {
     }
 
     /// The node's recorded background problems, one block each: what failed
-    /// and why (selectable: it is data), then, for a job that retries, the
-    /// attempt and the next try, or that it will not try again and what to do.
+    /// and why (selectable: it is data), then, for a job the daemon retries,
+    /// that it will retry automatically, or that it needs the user.
     fn render_problems(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
         if self.runner.problems.is_empty() {
             return None;
         }
-        let now = now_ms();
         let mut block = div().id("unified-task-problems").w_full().flex().flex_col().gap_1();
         for (ix, problem) in self.runner.problems.iter().enumerate() {
-            let status = problem_status(problem, now);
+            let status = problem_status(problem);
             let message = div().w_full();
-            let message = if problem.gave_up { style::text_error(message) } else { style::text_muted(message) };
+            let message = if problem.transient { style::text_muted(message) } else { style::text_error(message) };
             block = block.child(message.child(selectable_text(
                 SharedString::from(format!("unified-task-problem-{ix}")),
                 problem.message.clone(),
@@ -1801,24 +1800,20 @@ impl Focusable for TaskPanel {
 
 /// `content` in a vertical scroll area with a scrollbar that appears only when
 /// it overflows. `frame` carries the sizing (its max height or flex).
-/// The retry state of a recorded problem, in words: which attempt, and when
-/// the next one is (or that there is none until the daemon restarts, with the
-/// action that still works). `None` for a problem that does not retry.
-fn problem_status(problem: &tod_store::node_problems::NodeProblem, now_ms: i64) -> Option<String> {
-    let max = problem.max_attempts?;
-    if problem.gave_up {
-        return Some(format!(
-            "Attempt {} of {max}: not tried again until the daemon restarts. \
-             Delete sandbox in this panel's menu deletes it now.",
-            problem.attempts
-        ));
+/// The state of a recorded problem, in words: that the daemon will retry it
+/// automatically, or that it needs the user and what to do. `None` for a kind
+/// of problem that has neither (it is only reported).
+fn problem_status(problem: &tod_store::node_problems::NodeProblem) -> Option<String> {
+    if problem.kind != tod_store::node_problems::KIND_SANDBOX_RETIRE {
+        return None;
     }
-    let next = match problem.next_retry_at {
-        Some(at) if at > now_ms => format!("next try in {}", tod_core::runner_status::format_elapsed(at - now_ms)),
-        Some(_) => "next try is due".to_string(),
-        None => "no next try is scheduled".to_string(),
-    };
-    Some(format!("Attempt {} of {max}: {next}.", problem.attempts))
+    Some(if problem.transient {
+        "Will retry automatically.".to_string()
+    } else {
+        "Needs you: Delete sandbox in this panel's menu tries again, or Delete sandbox without a checkpoint \
+         deletes it and loses its uncommitted work."
+            .to_string()
+    })
 }
 
 fn scroll_with_bar(
@@ -2103,20 +2098,18 @@ mod tests {
     }
 
     /// A background problem recorded on the node (the daemon's failed delete
-    /// of its sandbox at `done`) shows in the task panel, with its error, the
-    /// attempt and the next try, and after the last attempt says it will not
-    /// retry and points to Delete sandbox; clearing it removes the block.
+    /// of its sandbox at `done`) shows in the task panel, with its error and
+    /// "will retry automatically" while transient, or "needs you" with the
+    /// menu entries when permanent; clearing it removes the block.
     #[gpui::test]
-    fn a_recorded_node_problem_shows_with_its_retry_state_and_clears(cx: &mut gpui::TestAppContext) {
+    fn a_recorded_node_problem_shows_with_its_state_and_clears(cx: &mut gpui::TestAppContext) {
         use tod_store::node_problems::{KIND_SANDBOX_RETIRE, NodeProblem};
 
         let (fixture, view, cx) = supervised_panel(cx);
         let node = fixture.node_id;
         let now = now_ms();
         let mut problem = NodeProblem::new(node, KIND_SANDBOX_RETIRE, "Deleting the sandbox s failed: blaxel said no".into(), now);
-        problem.attempts = 2;
-        problem.max_attempts = Some(5);
-        problem.next_retry_at = Some(now + 5 * 60_000);
+        problem.transient = true;
         tod_core::node_problems::record(&fixture.store, problem.clone()).unwrap();
         fixture.store.reload_if_stale().unwrap();
         view.update(cx, |view, cx| view.refresh_runner(cx));
@@ -2124,18 +2117,16 @@ mod tests {
         let shown = view.read_with(cx, |view, _| view.runner.problems.clone());
         assert_eq!(shown.len(), 1);
         assert!(shown[0].message.contains("blaxel said no"));
-        let status = problem_status(&shown[0], now).unwrap();
-        assert!(status.starts_with("Attempt 2 of 5: next try in"), "{status}");
+        let status = problem_status(&shown[0]).unwrap();
+        assert_eq!(status, "Will retry automatically.");
         let rendered = cx.update(|window, cx| view.update(cx, |view, cx| view.render_problems(window, cx).is_some()));
         assert!(rendered, "the block is drawn");
 
-        problem.attempts = 5;
-        problem.gave_up = true;
-        problem.next_retry_at = None;
-        let status = problem_status(&problem, now).unwrap();
-        assert!(status.contains("not tried again until the daemon restarts") && status.contains("Delete sandbox"), "{status}");
-        // A problem that does not retry has no status line of its own.
-        assert_eq!(problem_status(&NodeProblem::new(node, KIND_SANDBOX_RETIRE, "x".into(), now), now), None);
+        problem.transient = false;
+        let status = problem_status(&problem).unwrap();
+        assert!(status.starts_with("Needs you") && status.contains("Delete sandbox"), "{status}");
+        // Another kind of problem has no status line of its own.
+        assert_eq!(problem_status(&NodeProblem::new(node, tod_store::node_problems::KIND_ADOPT, "x".into(), now)), None);
 
         tod_core::node_problems::clear(&fixture.store, &node.to_string(), KIND_SANDBOX_RETIRE).unwrap();
         fixture.store.reload_if_stale().unwrap();

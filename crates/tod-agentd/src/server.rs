@@ -176,40 +176,19 @@ const RETIRE_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
 /// "Delete sandbox" setting is on ([`tod_core::sandbox_retire`]): once shortly
 /// after start, which catches up a node that reached `done` while the daemon
 /// was down, and then every minute, which covers a node that gets there while
-/// it runs and the retries of a failed delete (each node's own back-off lives
-/// in `sandbox_retire`). A thread of its own: it blocks on the network.
+/// it runs and is also the retry of a delete that failed temporarily (a
+/// permanent failure is not retried; see `sandbox_retire`). A thread of its
+/// own: it blocks on the network.
 fn watch_done_sandboxes(shared: Arc<Shared>) {
     let spawned = std::thread::Builder::new().name("tod-agentd-retire".into()).spawn(move || {
-        retire_schedule(
-            RETIRE_FIRST_AFTER,
-            RETIRE_EVERY,
-            &mut std::thread::sleep,
-            &|| shared.quit.load(Ordering::SeqCst),
-            &mut || retire_pass(&shared.store),
-        );
+        std::thread::sleep(RETIRE_FIRST_AFTER);
+        while !shared.quit.load(Ordering::SeqCst) {
+            retire_pass(&shared.store);
+            std::thread::sleep(RETIRE_EVERY);
+        }
     });
     if let Err(err) = spawned {
         tracing::warn!("tod-agentd: the done-sandbox check did not start: {err}");
-    }
-}
-
-/// When the retire passes run: after `first_after`, then every `every`, until
-/// `quit` says so (checked before each pass). `sleep` is the clock, so a test
-/// can see the schedule without waiting for it.
-fn retire_schedule(
-    first_after: std::time::Duration,
-    every: std::time::Duration,
-    sleep: &mut dyn FnMut(std::time::Duration),
-    quit: &dyn Fn() -> bool,
-    pass: &mut dyn FnMut(),
-) {
-    sleep(first_after);
-    loop {
-        if quit() {
-            return;
-        }
-        pass();
-        sleep(every);
     }
 }
 
@@ -420,40 +399,5 @@ fn feed(writer: &mut TcpStream, shared: &Shared) {
             return;
         }
         seq = shared.seq.fetch_add(1, Ordering::SeqCst) + 1;
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::cell::{Cell, RefCell};
-    use std::time::Duration;
-
-    /// The done-sandbox watcher: one wait of `first_after`, a pass, then a wait
-    /// of `every` before each later pass, and it stops at the first `quit`
-    /// (checked before a pass, so a daemon told to end runs no more).
-    #[test]
-    fn the_retire_schedule_waits_first_then_every_period_and_stops_on_quit() {
-        let sleeps = RefCell::new(Vec::new());
-        let passes = Cell::new(0);
-        retire_schedule(
-            RETIRE_FIRST_AFTER,
-            RETIRE_EVERY,
-            &mut |d| sleeps.borrow_mut().push(d),
-            &|| passes.get() >= 3,
-            &mut || passes.set(passes.get() + 1),
-        );
-        assert_eq!(passes.get(), 3);
-        assert_eq!(
-            *sleeps.borrow(),
-            [RETIRE_FIRST_AFTER, RETIRE_EVERY, RETIRE_EVERY, RETIRE_EVERY],
-            "the first pass waits for the start's sync, each later one a minute"
-        );
-        assert_eq!((RETIRE_FIRST_AFTER, RETIRE_EVERY), (Duration::from_secs(30), Duration::from_secs(60)));
-
-        // Told to quit during the first wait: no pass at all.
-        let ran = Cell::new(false);
-        retire_schedule(RETIRE_FIRST_AFTER, RETIRE_EVERY, &mut |_| {}, &|| true, &mut || ran.set(true));
-        assert!(!ran.get());
     }
 }

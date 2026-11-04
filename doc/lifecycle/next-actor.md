@@ -97,11 +97,15 @@ pub enum WaitKind {
 ### A `done` node whose sandbox could not be deleted
 
 `done` is `Done` except while the daemon's automatic delete of the node's
-sandbox keeps failing (`tod_store::node_problems`, kind `sandbox_retire`):
-while it retries the node is `Others` with the attempt count and the error
-(it needs nobody, but a running sandbox must not read as finished); after the
-last attempt it is `You::Failed` with the error, once (the record then stops
-changing, so a deferral holds). Deleting the sandbox from the menu clears it.
+sandbox has failed (`tod_store::node_problems`, kind `sandbox_retire`). A
+failure that looks temporary (Blaxel not ready or unavailable, a timeout, no
+network: `tod_sandbox::blaxel::error_is_transient`) is `transient`: the node
+is `Others` with the error (it needs nobody, since the daemon's next pass, every
+minute, tries again, but a running sandbox must not read as finished). Any
+other failure (the checkpoint refused, a 4xx, a lost sandbox) is not retried:
+the node is `You::Failed` with the error, once (the record does not change
+again until something does, so a deferral holds). Deleting the sandbox from the
+menu clears it.
 
 ### `Working`, `Done`
 

@@ -15,11 +15,17 @@
 //! node with no location names no sandbox, so it is not due. Running twice
 //! deletes once.
 //!
-//! A failure is never swallowed: it is logged, put on the node's problems and
-//! the app's log, and the node is tried again on a bounded schedule
-//! ([`BACKOFF`]); after the last attempt the report says it gave up and that
-//! the task panel's Delete sandbox still works. A node whose setting is off
-//! is never touched.
+//! A failure is never swallowed, and it is retried only when retrying can
+//! help. The daemon's pass (every minute) is the retry: while the failure looks
+//! temporary ([`tod_sandbox::blaxel::error_is_transient`]: Blaxel not ready or
+//! unavailable, a timeout, no network) the node's problem says so and the next
+//! pass tries again, with no back-off and no count. Any other failure (the
+//! checkpoint refused or could not push, a 4xx, a sandbox tod lost track of) is
+//! recorded once and *not* retried: the problem says what failed and points at
+//! the task panel's Delete sandbox and Delete sandbox without a checkpoint. It
+//! is tried again only when something changes: the node stops being due (the
+//! user deleted the sandbox, the setting went off, the location changed) or
+//! the daemon restarts. A node whose setting is off is never touched.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -29,16 +35,6 @@ use tod_store::fleet::FleetStore;
 use tod_store::lifecycle_config::{self, FINAL_PHASE};
 
 use crate::cloud_sync::lost;
-
-/// Waits between attempts on a node whose delete failed. One entry per retry;
-/// the attempts are the first try plus one per entry, then it stops (until the
-/// daemon restarts).
-pub const BACKOFF: [std::time::Duration; 4] = [
-    std::time::Duration::from_secs(60),
-    std::time::Duration::from_secs(5 * 60),
-    std::time::Duration::from_secs(15 * 60),
-    std::time::Duration::from_secs(60 * 60),
-];
 
 /// What the decision reads about one node.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -137,18 +133,14 @@ pub fn due(fleet: &FleetStore) -> Result<Vec<Due>> {
     Ok(out)
 }
 
-#[derive(Debug, Clone, Copy)]
-struct Failing {
-    /// Failed attempts so far.
-    failures: usize,
-    /// Not before this (ms since the epoch).
-    next_at_ms: i64,
-}
+/// The nodes whose delete failed permanently in this process, with the
+/// sandbox it failed on: not tried again while the node stays due with that
+/// sandbox. A restart empties it (so a recorded permanent failure is tried once
+/// more then), and a node that stops being due leaves it.
+static STOPPED: Mutex<Option<HashMap<String, String>>> = Mutex::new(None);
 
-static FAILING: Mutex<Option<HashMap<String, Failing>>> = Mutex::new(None);
-
-fn failing() -> std::sync::MutexGuard<'static, Option<HashMap<String, Failing>>> {
-    FAILING.lock().unwrap_or_else(|e| e.into_inner())
+fn stopped() -> std::sync::MutexGuard<'static, Option<HashMap<String, String>>> {
+    STOPPED.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// What one pass did.
@@ -158,6 +150,23 @@ pub struct Retired {
     pub deleted: Vec<String>,
     /// Nodes whose delete failed on this pass (reported).
     pub failed: usize,
+}
+
+/// The problem's text for a failed delete.
+fn failure_message(item: &Due, err: &anyhow::Error, transient: bool) -> String {
+    let what = format!(
+        "Deleting the sandbox {} of {} (it reached {FINAL_PHASE}) failed: {err:#}.",
+        item.sandbox, item.title
+    );
+    if transient {
+        format!("{what} This looks temporary; it is tried again automatically every minute.")
+    } else {
+        format!(
+            "{what} It is not tried again by itself. In the task panel's menu, Delete sandbox tries again (it \
+             keeps the uncommitted work first), and Delete sandbox without a checkpoint deletes it and loses \
+             that work."
+        )
+    }
 }
 
 /// Deletes the sandbox of every due node, through [`lost::delete_node_sandbox`].
@@ -176,9 +185,9 @@ pub fn retire_due_with(
     let mut report = Retired::default();
     let live: Vec<Due> = due(fleet)?;
     // A node that is no longer due (retired, setting turned off, moved back, its
-    // sandbox deleted from the menu) starts afresh: its schedule and its
-    // recorded problem go.
-    if let Some(map) = failing().as_mut() {
+    // sandbox deleted from the menu) starts afresh: its stop and its recorded
+    // problem go.
+    if let Some(map) = stopped().as_mut() {
         map.retain(|node, _| live.iter().any(|d| &d.node_id == node));
     }
     let recorded: Vec<NodeProblem> = fleet
@@ -198,37 +207,28 @@ pub fn retire_due_with(
         note(crate::node_problems::clear(fleet, &stale.node_id.to_string(), KIND_SANDBOX_RETIRE));
     }
     for item in live {
-        let state = failing().get_or_insert_with(Default::default).get(&item.node_id).copied();
-        if let Some(state) = state {
-            if state.failures > BACKOFF.len() || now_ms < state.next_at_ms {
-                continue;
-            }
+        let stopped_on = stopped().get_or_insert_with(Default::default).get(&item.node_id).cloned();
+        if stopped_on.as_deref() == Some(item.sandbox.as_str()) {
+            continue;
         }
         match delete(&item.node_id) {
             Ok(message) => {
-                failing().get_or_insert_with(Default::default).remove(&item.node_id);
+                stopped().get_or_insert_with(Default::default).remove(&item.node_id);
                 tracing::info!("sandbox retire: {} reached {FINAL_PHASE}: {message}", item.title);
                 report.deleted.push(message);
                 note(crate::node_problems::clear(fleet, &item.node_id, KIND_SANDBOX_RETIRE));
             }
             Err(err) => {
                 report.failed += 1;
-                let failures = state.map_or(0, |s| s.failures) + 1;
-                let retry = BACKOFF.get(failures - 1);
-                let next_at_ms = retry.map_or(i64::MAX, |d| now_ms.saturating_add(d.as_millis() as i64));
-                failing()
-                    .get_or_insert_with(Default::default)
-                    .insert(item.node_id.clone(), Failing { failures, next_at_ms });
-                let next = match retry {
-                    Some(d) => format!("It is tried again in {} minute(s).", d.as_secs() / 60),
-                    None => "It was tried several times and is not tried again until the daemon restarts; \
-                             Delete sandbox in the task panel's menu still works."
-                        .to_string(),
-                };
-                let message = format!(
-                    "Deleting the sandbox {} of {} (it reached {FINAL_PHASE}) failed: {err:#}. {next}",
-                    item.sandbox, item.title
-                );
+                let transient = tod_sandbox::blaxel::error_is_transient(&err);
+                if transient {
+                    stopped().get_or_insert_with(Default::default).remove(&item.node_id);
+                } else {
+                    stopped()
+                        .get_or_insert_with(Default::default)
+                        .insert(item.node_id.clone(), item.sandbox.clone());
+                }
+                let message = failure_message(&item, &err, transient);
                 crate::logging::buffer::record(
                     crate::logging::buffer::Level3::Error,
                     crate::logging::buffer::LogSource::App,
@@ -245,10 +245,7 @@ pub fn retire_due_with(
                                 node_id: node,
                                 kind: KIND_SANDBOX_RETIRE.to_string(),
                                 message,
-                                attempts: failures as u32,
-                                max_attempts: Some(BACKOFF.len() as u32 + 1),
-                                next_retry_at: retry.map(|_| next_at_ms),
-                                gave_up: retry.is_none(),
+                                transient,
                                 first_at,
                                 updated_at: now_ms,
                             },
@@ -470,41 +467,72 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_delete_is_reported_and_retried_on_a_schedule() {
+    fn a_transient_failure_is_retried_by_every_pass_with_no_count() {
         let fx = fx();
         fx.locate("sb-5");
         fx.set_lifecycle("done");
         let attempts = std::cell::Cell::new(0);
         let mut fail = |_: &str| -> Result<String> {
             attempts.set(attempts.get() + 1);
-            anyhow::bail!("blaxel said no")
+            anyhow::bail!("delete sandbox: 503 Service Unavailable")
         };
         let r = retire_due_with(&fx.fleet, 0, &mut fail).unwrap();
         assert_eq!(r.failed, 1);
         let problem = fx.problem().expect("the failure is recorded on the node");
-        assert!(problem.message.contains("blaxel said no") && problem.message.contains("tried again"), "{problem:?}");
-        assert_eq!((problem.attempts, problem.max_attempts), (1, Some(BACKOFF.len() as u32 + 1)));
-        assert_eq!(problem.next_retry_at, Some(BACKOFF[0].as_millis() as i64));
-        assert!(!problem.gave_up);
+        assert!(problem.transient, "{problem:?}");
+        assert!(problem.message.contains("503") && problem.message.contains("tried again automatically"), "{problem:?}");
         assert!(fx.has_location(), "the location stays for the retry");
-        // Too early: not tried.
-        retire_due_with(&fx.fleet, 1_000, &mut fail).unwrap();
-        assert_eq!(attempts.get(), 1);
-        // After each back-off: tried again, to the last attempt.
-        let mut now = 0;
-        for (i, wait) in BACKOFF.iter().enumerate() {
-            now += wait.as_millis() as i64;
-            retire_due_with(&fx.fleet, now, &mut fail).unwrap();
-            assert_eq!(fx.problem().unwrap().attempts as usize, i + 2, "the count follows the attempts");
+        // Every pass tries again, at once, however many have failed.
+        for i in 1..=6 {
+            retire_due_with(&fx.fleet, i * 1_000, &mut fail).unwrap();
         }
-        assert_eq!(attempts.get(), 1 + BACKOFF.len());
+        assert_eq!(attempts.get(), 7);
         let last = fx.problem().unwrap();
-        assert!(last.gave_up && last.next_retry_at.is_none(), "{last:?}");
-        assert!(last.message.contains("not tried again") && last.message.contains("Delete sandbox"), "{last:?}");
-        assert_eq!(last.first_at, 0, "when it first failed is kept");
-        // Then it stops.
-        retire_due_with(&fx.fleet, now + 10_000_000_000, &mut fail).unwrap();
-        assert_eq!(attempts.get(), 1 + BACKOFF.len());
+        assert!(last.transient);
+        assert_eq!((last.first_at, last.updated_at), (0, 0), "an identical report changes nothing");
+    }
+
+    #[test]
+    fn a_permanent_failure_is_recorded_once_and_not_retried_until_something_changes() {
+        let fx = fx();
+        fx.locate("sb-perm");
+        fx.set_lifecycle("done");
+        let attempts = std::cell::Cell::new(0);
+        let mut fail = |_: &str| -> Result<String> {
+            attempts.set(attempts.get() + 1);
+            anyhow::bail!("the checkpoint could not push: remote rejected")
+        };
+        retire_due_with(&fx.fleet, 0, &mut fail).unwrap();
+        let problem = fx.problem().expect("recorded");
+        assert!(!problem.transient, "{problem:?}");
+        for needle in ["checkpoint could not push", "Delete sandbox", "without a checkpoint", "not tried again"] {
+            assert!(problem.message.contains(needle), "{needle}: {problem:?}");
+        }
+        for i in 1..=5 {
+            retire_due_with(&fx.fleet, i * 60_000, &mut fail).unwrap();
+        }
+        assert_eq!(attempts.get(), 1, "never retried");
+        // The setting off and back on is a change: tried again.
+        fx.delete_setting(Some(false));
+        retire_due_with(&fx.fleet, 400_000, &mut fail).unwrap();
+        assert!(fx.problem().is_none(), "no longer due: the record goes");
+        fx.delete_setting(None);
+        retire_due_with(&fx.fleet, 500_000, &mut fail).unwrap();
+        assert_eq!(attempts.get(), 2);
+    }
+
+    #[test]
+    fn a_failure_turning_from_transient_to_permanent_updates_the_one_record() {
+        let fx = fx();
+        fx.locate("sb-flip");
+        fx.set_lifecycle("done");
+        let mut flaky = |_: &str| -> Result<String> { anyhow::bail!("timeout: global") };
+        retire_due_with(&fx.fleet, 10, &mut flaky).unwrap();
+        assert!(fx.problem().unwrap().transient);
+        let mut refused = |_: &str| -> Result<String> { anyhow::bail!("not authorized (401 Unauthorized)") };
+        retire_due_with(&fx.fleet, 20, &mut refused).unwrap();
+        let p = fx.problem().unwrap();
+        assert!(!p.transient && p.first_at == 10 && p.updated_at == 20, "{p:?}");
     }
 
     #[test]
@@ -512,13 +540,12 @@ mod tests {
         let fx = fx();
         fx.locate("sb-6");
         fx.set_lifecycle("done");
-        let mut fail = |_: &str| -> Result<String> { anyhow::bail!("blaxel said no") };
+        let mut fail = |_: &str| -> Result<String> { anyhow::bail!("503 Service Unavailable") };
         retire_due_with(&fx.fleet, 0, &mut fail).unwrap();
         assert!(fx.problem().is_some());
-        // Tried again after the first back-off: it works now.
+        // The next pass: it works now.
         let calls = std::cell::RefCell::new(Vec::new());
-        let at = BACKOFF[0].as_millis() as i64;
-        retire_due_with(&fx.fleet, at, &mut |n| fx.fake_delete(&calls, n)).unwrap();
+        retire_due_with(&fx.fleet, 60_000, &mut |n| fx.fake_delete(&calls, n)).unwrap();
         assert!(fx.problem().is_none(), "a successful delete clears it");
 
         // Failing again, then the user deletes it from the menu (the location goes):

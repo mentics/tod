@@ -157,8 +157,11 @@ stopped run is left as it was.
 that sets it like the skills are: when the node reaches `done` its sandbox is
 deleted, by the daemon with no click and no sync (`tod_core::sandbox_retire`,
 `doc/runner-menu/design.md`, "Deleting the sandbox at `done`"). A failed delete
-is reported on the node and retried; the menu's Delete sandbox stays the
-manual way.
+is reported on the node. If it looks temporary (Blaxel unavailable, a
+timeout) the panel says "Will retry automatically" and the daemon's next pass
+(every minute) tries again; otherwise it says "Needs you", is not retried, and
+points at the menu's Delete sandbox (which tries again) and Delete sandbox
+without a checkpoint. The menu's Delete sandbox stays the manual way.
 
 **Requests.** A run that stopped for a request (a decision, a plan step
 handed back, a gate criterion no agent can fix) continues by itself once the user has

@@ -457,16 +457,22 @@ nothing. The daemon's `watch_done_sandboxes` thread runs a pass 30 s after
 start (`sync_on_start` runs in parallel and pulls first in practice; a node it
 brings in is caught by the next pass) and then every minute, instead of the
 commit hook below (a pass is one read). A failure is recorded on the node
-(`tod_store::node_problems`, below) and the app log and is retried after 1, 5,
-15 and 60 minutes, then stops until the daemon restarts, saying so. `lost::delete_sandboxes_at_final_phase` and
+(`tod_store::node_problems`, below) and the app log. There is no back-off and
+no attempt count: the minute pass is the retry, and only while the failure
+looks temporary (`tod_sandbox::blaxel::error_is_transient`). A permanent
+failure is recorded once and not retried while the node stays due with that
+sandbox (a process-local stop, so a daemon restart tries once more; the user
+deleting the sandbox, turning the setting off or moving the location ends it
+too), and its message points at Delete sandbox and Delete sandbox without a
+checkpoint. `lost::delete_sandboxes_at_final_phase` and
 its call in `sync_once` are removed. The runner check is `lost::runner_blocker`
 (a live `run` lease or live supervisor heartbeat). The plan as written:
 
 - New `crates/tod-core/src/sandbox_retire.rs`: `due(fleet) -> Vec<node>` (a
   location with a sandbox, lifecycle at or past `FINAL_PHASE`,
   `resolve_delete_sandbox` on, no `run` lease, no live heartbeat) and
-  `retire_due(fleet)`: A7's delete for each, back-off per failed node,
-  failures reported through `logging::buffer::record` and the problems
+  `retire_due(fleet)`: A7's delete for each (a transient failure is tried again
+  by the next pass, a permanent one not),   failures reported through `logging::buffer::record` and the problems
   channel. Replaces `lost::delete_sandboxes_at_final_phase`; its call in
   `sync_once` goes.
 - `crates/tod-agentd`: call `retire_due` on its own thread (it blocks on the
@@ -475,8 +481,8 @@ its call in `sync_once` are removed. The runner check is `lost::runner_blocker`
   timer (a few minutes) for retries and for a heartbeat that has since ended.
 - Tests: a done node with the setting on and a location is retired with no
   sync and no `cloud_nodes` row; off (itself or an ancestor) keeps it; a live
-  heartbeat defers it until it ends; a failure is reported and backed off; a
-  node moved to `done` by an applied sync is retired after it; a daemon
+  heartbeat defers it until it ends; a failure is reported (retried while
+  transient, not when permanent); a node moved to `done` by an applied sync is retired after it; a daemon
   started after the fact retires it at start.
 
 ### B5. Adopt records written before the merge
@@ -567,8 +573,10 @@ nothing drains it, so a failed delete at `done` was a WARN line in
 that happens off any turn of the user's now goes on the node:
 
 - **Store:** `tod_store::node_problems`, table `node_problems`, one row per
-  (node, kind): `message`, `attempts`, `max_attempts`, `next_retry_at`,
-  `gave_up`, `first_at`, `updated_at`. Kinds: `sandbox_retire`, `adopt`,
+  (node, kind): `message`, `transient`, `first_at`, `updated_at` (a table made
+  before `transient` gets it by an idempotent `ALTER`, and keeps its old unused
+  `attempts`, `max_attempts`, `next_retry_at` and `gave_up` columns, which all
+  have defaults). Kinds: `sandbox_retire`, `adopt`,
   `cloud_record`. `FleetMutation::RecordNodeProblem` / `ClearNodeProblem`;
   `tod_core::node_problems::{record, report, clear, for_node}` are the callers'
   helpers (`report` says nothing new, and writes nothing, for the same message
@@ -580,25 +588,26 @@ that happens off any turn of the user's now goes on the node:
   in `SYNCED_TABLES`**, so nothing about what is synced changes, the
   orchestrator never reads it, and no orchestrator redeploy is needed (the
   version number is part of the sync contract, which is why it is not bumped).
-- **Sandbox retire:** every failed attempt records attempts so far, the total
-  (the first try plus one per back-off), the next retry time and, after the
-  last, `gave_up` with the sentence "not tried again until the daemon
-  restarts; Delete sandbox in the task panel's menu still works". The attempt
-  schedule itself stays in the daemon's memory, so a restart tries again at
-  once (the row is then updated from attempt 1). A success, or the node no
-  longer being due (the sandbox deleted from the menu, the setting turned
-  off, the node moved back), clears the row.
+- **Sandbox retire:** a failed delete records its message and whether it is
+  `transient` (`tod_sandbox::blaxel::error_is_transient`; the rest is
+  permanent). A transient one is simply tried again by the daemon's next
+  minute pass. A permanent one is recorded once and not retried (see B4) until
+  something changes; its message says what failed and points at Delete sandbox
+  and Delete sandbox without a checkpoint. A success, or the node no longer
+  being due (the sandbox deleted from the menu, the setting turned off, the
+  node moved back), clears the row.
 - **`next_actor`:** a `done` node with a `sandbox_retire` row is no longer
-  plain `Done`. While the daemon still retries it is `Others` (the wait's
-  `retry` carries the attempt, the maximum and the error; `next_check_ms` the
-  next try): it needs nobody, but is not hidden. After the last attempt it is
+  plain `Done`. While the failure is transient it is `Others` (the daemon
+  retries; the error is in the wait's detail): it needs nobody, but is not
+  hidden. When it is permanent it is
   `You::Failed` with the error, since the first failure: the sandbox is a
-  running cost only the user can now clear (Delete sandbox). The row does not
-  change again until the daemon restarts, so a deferral holds and the `You`
+  running cost only the user can clear (Delete sandbox). The row does not
+  change again until something does, so a deferral holds and the `You`
   list is not woken per attempt. Other kinds never change the actor.
 - **Task panel:** the runner line already shows the standing; beneath it
   `render_problems` lists each recorded problem as selectable text with a
-  second line "Attempt n of m: next try in …" or the give-up sentence.
+  second line "Will retry automatically." or "Needs you: ..." naming the two
+  menu entries.
 - **Not converted:** the log-copy failures in `session_log` itself ("Could not
   keep ...'s agent session log", "The agent session log copy did not start")
   and `conversation::problems::or_report` still use `report_problem`: they
@@ -649,9 +658,10 @@ Pass 3 unless noted).
   the same stamp is used and an older or unstamped one is refreshed.
 - **Delete at `done`:** the real `retire_due` goes through
   `lost::delete_node_sandbox` (the menu's delete); the daemon's schedule
-  (30 s, then every minute, stop on quit) is `retire_schedule` with an
-  injected clock (`tod-agentd` `server::tests`); the failure path and the
-  1/5/15/60-minute retries were already unit tested with a fake delete.
+  (30 s, then every minute) is a plain sleep loop in `watch_done_sandboxes`
+  (the injected-clock `retire_schedule` and its test are gone); the failure
+  paths (transient retried every pass, permanent recorded once and stopped,
+  a change restarting it) are unit tested with a fake delete.
 
 **Still only verifiable live:**
 

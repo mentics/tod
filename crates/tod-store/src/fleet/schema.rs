@@ -667,6 +667,7 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
     conn.execute_batch(crate::deferrals::CREATE_TABLE)?;
     conn.execute_batch(&crate::journey_changes::deferrals_triggers_sql())?;
     conn.execute_batch(crate::node_problems::CREATE_TABLE)?;
+    crate::node_problems::ensure_columns(conn)?;
     conn.execute_batch(&crate::journey_changes::node_problems_triggers_sql())?;
     // The task panel's own steps, first numbered 66–69 on its branch.
     ensure_decisions_reason(conn)?;

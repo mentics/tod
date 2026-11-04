@@ -539,14 +539,16 @@ const RUN_STATE_SKEW_MS: i64 = 5_000;
 /// without opening a log; but only the part that is the user's to fix is on
 /// the user's list:
 ///
-/// - **While the daemon still retries** (the schedule in `sandbox_retire`) the
-///   node is `Others`: nothing for the user to do, the retry count and the
-///   error are shown (`ExternalWait::retry`), and it does not wake the `You`
-///   list for each failed attempt.
-/// - **After the last attempt** it is `You::Failed` with the error, once: the
-///   record does not change again until the daemon restarts, so `newest` is
-///   fixed and a deferral holds (the user can set it aside); Delete sandbox in
-///   the task panel's menu is the action, and it clears the record.
+/// - **While the failure looks temporary** (`problem.transient`: Blaxel not
+///   ready, a timeout; the daemon's next pass, every minute, tries again) the
+///   node is `Others`: nothing for the user to do, the error is shown in the
+///   wait's detail, and it does not wake the `You` list for each failed pass.
+/// - **When it is permanent** (nothing retries it) it is `You::Failed` with the
+///   error, once: the record does not change again until something does (the
+///   user deletes the sandbox, the setting or location changes, the daemon
+///   restarts), so `newest` is fixed and a deferral holds (the user can set it
+///   aside); Delete sandbox in the task panel's menu is the action, and it
+///   clears the record.
 ///
 /// Every other `done` node, and every other kind of problem, is `Done`: those
 /// are shown by the task panel only, and never count as someone's turn.
@@ -555,7 +557,7 @@ fn done_actor(facts: &Facts<'_>) -> (NextActor, i64) {
     let Some(problem) = facts.problems.iter().find(|p| p.kind == KIND_SANDBOX_RETIRE) else {
         return (NextActor::Done, 0);
     };
-    if problem.gave_up {
+    if !problem.transient {
         return (
             NextActor::You { why: YouReason::Failed { error: problem.message.clone() }, since: problem.first_at },
             problem.updated_at,
@@ -564,15 +566,11 @@ fn done_actor(facts: &Facts<'_>) -> (NextActor, i64) {
     let wait = ExternalWait {
         kind: WaitKind::Other,
         who: None,
-        detail: Some("deleting its sandbox failed; the daemon tries again".to_string()),
+        detail: Some(format!("deleting its sandbox failed; the daemon tries again: {}", problem.message)),
         since: problem.first_at,
-        next_check_ms: problem.next_retry_at,
+        next_check_ms: None,
         overdue: false,
-        retry: Some(Retry {
-            attempt: problem.attempts,
-            max: problem.max_attempts.unwrap_or(problem.attempts),
-            error: problem.message.clone(),
-        }),
+        retry: None,
     };
     (NextActor::Others { wait }, 0)
 }
@@ -1013,54 +1011,49 @@ mod tests {
         assert_eq!(standing(&c).actor, NextActor::Done);
     }
 
-    fn retire_problem(attempts: u32, gave_up: bool, updated_at: i64) -> NodeProblem {
+    fn retire_problem(transient: bool, updated_at: i64) -> NodeProblem {
         NodeProblem {
             node_id: Uuid::nil(),
             kind: tod_store::node_problems::KIND_SANDBOX_RETIRE.to_string(),
             message: "Deleting the sandbox s failed: blaxel said no".to_string(),
-            attempts,
-            max_attempts: Some(5),
-            next_retry_at: (!gave_up).then_some(NOW + 60_000),
-            gave_up,
+            transient,
             first_at: 100,
             updated_at,
         }
     }
 
     #[test]
-    fn a_done_node_whose_sandbox_delete_is_retried_is_others_with_the_error_and_count() {
+    fn a_done_node_whose_sandbox_delete_is_transient_is_others_with_the_error() {
         let mut c = case("done");
-        c.problems = vec![retire_problem(2, false, 300)];
+        c.problems = vec![retire_problem(true, 300)];
         let s = standing(&c);
         let NextActor::Others { wait } = &s.actor else { panic!("{:?}", s.actor) };
-        let retry = wait.retry.as_ref().expect("the retry is shown");
-        assert_eq!((retry.attempt, retry.max), (2, 5));
-        assert!(retry.error.contains("blaxel said no"));
-        assert_eq!((wait.since, wait.next_check_ms), (100, Some(NOW + 60_000)));
+        assert!(wait.detail.as_deref().unwrap().contains("blaxel said no"));
+        assert_eq!(wait.since, 100);
         assert!(!s.on_you(), "a retry the daemon does by itself is not the user's turn");
     }
 
     #[test]
-    fn a_done_node_whose_delete_gave_up_is_you_failed_once_and_a_deferral_holds() {
+    fn a_done_node_whose_delete_failed_permanently_is_you_failed_once_and_a_deferral_holds() {
         let mut c = case("done");
-        c.problems = vec![retire_problem(5, true, 300)];
+        c.problems = vec![retire_problem(false, 300)];
         let s = standing(&c);
         let NextActor::You { why: YouReason::Failed { error }, since } = &s.actor else { panic!("{:?}", s.actor) };
         assert!(error.contains("blaxel said no"));
         assert_eq!(*since, 100);
         assert!(s.on_you());
-        // Deferred after it gave up: it stays off the list (nothing newer reaches the user).
+        // Deferred: it stays off the list (nothing newer reaches the user).
         c.deferral = Some(Deferral { until: None, deferred_at: 400 });
         assert!(!standing(&c).on_you());
         // A new failure after a daemon restart wakes it once.
-        c.problems = vec![retire_problem(5, true, 500)];
+        c.problems = vec![retire_problem(false, 500)];
         assert!(standing(&c).on_you());
     }
 
     #[test]
     fn other_problems_and_a_cleared_one_leave_a_done_node_done() {
         let mut c = case("done");
-        let mut other = retire_problem(1, false, 1);
+        let mut other = retire_problem(true, 1);
         other.kind = tod_store::node_problems::KIND_ADOPT.to_string();
         c.problems = vec![other];
         assert_eq!(standing(&c).actor, NextActor::Done);
@@ -1625,11 +1618,11 @@ mod tests {
         let done = node(&fx.conn, "done", Some("done"));
         let inputs = Inputs { now_ms: NOW, ..Default::default() };
         assert_eq!(for_nodes(&fx.conn, &[done], &inputs).unwrap()[&done].actor, NextActor::Done);
-        let mut p = retire_problem(1, false, 5);
+        let mut p = retire_problem(true, 5);
         p.node_id = done;
         NodeProblemRepo::new(&fx.conn).record(&p).unwrap();
         let got = for_nodes(&fx.conn, &[done], &inputs).unwrap();
-        assert!(matches!(&got[&done].actor, NextActor::Others { wait } if wait.retry.is_some()), "{:?}", got[&done].actor);
+        assert!(matches!(&got[&done].actor, NextActor::Others { .. }), "{:?}", got[&done].actor);
         NodeProblemRepo::new(&fx.conn).clear(done, tod_store::node_problems::KIND_SANDBOX_RETIRE).unwrap();
         assert_eq!(for_nodes(&fx.conn, &[done], &inputs).unwrap()[&done].actor, NextActor::Done);
     }
