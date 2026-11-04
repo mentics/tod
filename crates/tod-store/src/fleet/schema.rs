@@ -678,6 +678,8 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
     // Added to the v73 step after stores had passed it, so it is made sure of
     // here, like the rest (`conversations.skill_group`).
     ensure_skill_group(conn)?;
+    // `files_places.clone_url`: machine-local, no schema version.
+    crate::fleet::repos::files_place::ensure_clone_url(conn)?;
     crate::sync::install(conn)?;
     // Idempotent and cheap — keeps the gate criteria catalog's wording in
     // sync with the source on every startup, not just the migration that

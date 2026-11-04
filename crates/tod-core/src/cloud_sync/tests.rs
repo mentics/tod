@@ -1033,3 +1033,66 @@ fn a_failed_wake_request_replaces_starting_only_while_it_is_the_state() {
     }
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// A node whose Files location makes sandboxes from an image: `clone_url` is
+/// the location's repository URL, and a node with Files on it.
+fn node_on_image_location(root_name: &str, clone_url: Option<&str>) -> (FleetStore, String, std::path::PathBuf) {
+    use tod_store::fleet::repos::node_files::{DevContainerSetting, SandboxFrom};
+    use tod_store::fleet::{FilesPlace, FleetMutation};
+    use tod_store::outline::{Capability, CreatePosition};
+    let root = temp_root(root_name);
+    let fleet = FleetStore::open(&root).unwrap();
+    add_list(&fleet, "t");
+    let list_id = fleet.list_outline_lists().unwrap()[0].id;
+    let node = uuid::Uuid::new_v4();
+    fleet
+        .enqueue_outline(OutlineMutation::CreateNode {
+            node_id: Some(node),
+            list_id,
+            parent_id: None,
+            anchor_id: None,
+            position: CreatePosition::Below,
+            title: "n".into(),
+        })
+        .unwrap();
+    fleet
+        .enqueue_outline(OutlineMutation::EnableCapabilities { node_id: node, capabilities: vec![Capability::Files] })
+        .unwrap();
+    let place = FilesPlace {
+        id: uuid::Uuid::new_v4().to_string(),
+        name: "cloud".into(),
+        repo: Some("/workspace/repo".into()),
+        dev_container: Some(DevContainerSetting {
+            sandbox: true,
+            sandbox_from: SandboxFrom::Image(String::new()),
+            clone_url: clone_url.map(str::to_string),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let place_id = place.id.clone();
+    fleet.enqueue(FleetMutation::SaveFilesPlace { place }).unwrap();
+    fleet.enqueue(FleetMutation::SetNodeFilesPlace { node_id: node.to_string(), place_id: Some(place_id) }).unwrap();
+    fleet.writer().flush().unwrap();
+    (fleet, node.to_string(), root)
+}
+
+/// Gap 14: an image location's repository URL is the clone source, with no
+/// sandbox (there is none yet) or checkout to ask.
+#[test]
+fn an_image_locations_clone_url_is_the_nodes_repository() {
+    let (fleet, node, root) = node_on_image_location("clone-url", Some("https://github.com/acme/app"));
+    let (_, url, _) = node_source(&fleet, &node).unwrap();
+    assert_eq!(url, "https://github.com/acme/app");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn an_image_location_without_a_url_says_where_to_give_one() {
+    let (fleet, node, root) = node_on_image_location("no-clone-url", None);
+    let err = node_source(&fleet, &node).unwrap_err().to_string();
+    assert!(err.contains("no HTTPS repository URL for the cloud run"), "{err}");
+    assert!(err.contains("Locations") && err.contains("Repository to clone"), "{err}");
+    assert!(!err.contains("set the Files directory to"), "{err}");
+    let _ = std::fs::remove_dir_all(&root);
+}

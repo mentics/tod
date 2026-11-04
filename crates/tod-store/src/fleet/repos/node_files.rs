@@ -26,7 +26,8 @@ use serde::{Deserialize, Serialize};
 /// With `sandbox`, every node works in a cloud sandbox of its own (see
 /// [`crate::fleet::sandbox`]), made from `sandbox_from` when the node first
 /// needs its files; `container` is unused. The repository always lives in
-/// the sandbox: the image or the forked sandbox must already hold it.
+/// the sandbox: a fork's golden must already hold it, and an image either
+/// holds it or is given `clone_url`, which tod clones.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DevContainerSetting {
     /// Container name or id; `None` until one is chosen.
@@ -41,6 +42,12 @@ pub struct DevContainerSetting {
     /// What each node's sandbox is made from.
     #[serde(default)]
     pub sandbox_from: SandboxFrom,
+    /// For a sandbox made from an image only: the repository's GitHub HTTPS
+    /// URL, which tod clones into each new sandbox (an empty image has none
+    /// to ask). A fork reads it from the golden's checkout instead, and
+    /// `normalized` clears it there. Machine-local, like the rest.
+    #[serde(default)]
+    pub clone_url: Option<String>,
 }
 
 /// What a node's new sandbox starts from.
@@ -97,6 +104,14 @@ impl SandboxFrom {
 }
 
 impl DevContainerSetting {
+    /// The repository URL tod clones into a sandbox made from an image.
+    pub fn clone_url(&self) -> Option<&str> {
+        if !self.sandbox || !matches!(self.sandbox_from, SandboxFrom::Image(_)) {
+            return None;
+        }
+        self.clone_url.as_deref().map(str::trim).filter(|u| !u.is_empty())
+    }
+
     pub fn container(&self) -> Option<&str> {
         self.container.as_deref().map(str::trim).filter(|c| !c.is_empty())
     }
