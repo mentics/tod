@@ -24,9 +24,14 @@ copies credentials; agents do not read the real root's credentials).
 missing or its credentials are stale, ask the user to run the seed script.
 
 Its tree: `Linear tickets` (generator) -> Quick accept -> `ENG work` (Files =
-location `Golden flagship`, a fork of the `golden` sandbox, `/workspace/flagship`;
+location `Golden workspace`, a fork of the `golden` sandbox, `/workspace`, i.e. `Cofactr/workspace` like the real roots;
 lifecycle-config: review `code-review`, pr `open-pr`+`fix-ci`, pr_review `fix-ci`).
-A ticket accepted there is the node under test. A node left from an earlier
+A ticket accepted there is the node under test. The root has a second
+location, `Build test` (an image location on the private `joel-cofactr/build-test`):
+use `Golden workspace` for real-data checks and the real golden flow, and
+`Build test` for anything that pushes a branch or opens a PR or needs
+flexibility. Never push from a `Golden workspace` node, and never use
+`/workspace/flagship` as a location (its origin is Cofactr/flagship). A node left from an earlier
 run (ENG-2925, `nexar-ingest-mints-products-with-the-w-2`) may still be there:
 reuse it, or accept another unstarted ticket the user names.
 
