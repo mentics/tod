@@ -2050,6 +2050,28 @@ pub fn record_node_request(fleet: &FleetStore, node_id: &str, kind: &str) -> Res
 /// leaves the marker ([`crate::autopilot::STOP_NOW_REQUEST_FILE`]) a turn in
 /// flight sees before the row arrives. `fresh_budget` goes as a request to run.
 pub fn wake_node_requesting(fleet: &FleetStore, root: &Path, node_id: &str, kind: &str) -> Result<String> {
+    match wake_node_requesting_inner(fleet, root, node_id, kind) {
+        Ok(said) => Ok(said),
+        // The `starting` row this call wrote (see [`failing_start_is_recorded`]),
+        // only while it is still the node's state: a stop request writes none,
+        // and a call that failed before writing it must not replace a better one.
+        Err(err) if !matches!(kind, REQUEST_PAUSE | REQUEST_STOP_NOW) && still_starting(fleet, node_id) => {
+            failing_start_is_recorded::<String>(fleet, node_id, || Err(err))
+        }
+        Err(err) => Err(err),
+    }
+}
+
+fn still_starting(fleet: &FleetStore, node_id: &str) -> bool {
+    let Ok(node) = uuid::Uuid::parse_str(node_id) else { return false };
+    fleet
+        .read(|conn| tod_store::run_state::get(conn, node))
+        .ok()
+        .flatten()
+        .is_some_and(|row| row.phase == tod_store::run_state::Phase::Starting)
+}
+
+fn wake_node_requesting_inner(fleet: &FleetStore, root: &Path, node_id: &str, kind: &str) -> Result<String> {
     let fresh_session = kind == REQUEST_FRESH_SESSION;
     let stops = matches!(kind, REQUEST_PAUSE | REQUEST_STOP_NOW);
     let row = cloud_node(fleet, node_id).ok_or_else(|| anyhow!("this node does not run in the cloud"))?;
