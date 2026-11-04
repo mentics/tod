@@ -193,3 +193,22 @@ throwaway, two failed golden forks. Left: the user's `wsx-golden-...` (another
 setting still pointed at it), the refreshed `tod-golden-cofactr-flagship-6aea8fd9`
 (now `cofactr/flagship`'s golden), and `ENG work`'s `delete_sandbox = 0` from
 pass 2 (the default is on; turn it back with the editor if wanted).
+
+## Pass 4, 2026-11-04
+
+Main at `6c395438`. Live-verify root, my own agent-socket port; another session's
+older `tod` (port 47611, started 9:50) stayed running on the root and was not touched.
+
+### Step 0: what the stopped agent left
+
+- Nodes `RM p4 A` and `RM p4 B` (both in `pr`), `node_files_locations` rows
+  (sandbox, `fork:golden`) and `cloud_nodes` rows for `tod-rm-p4-a-89a8d9` and
+  `tod-rm-p4-b-186bd3`; both sandboxes live (STANDBY), labelled `tod-kind=node`.
+- No throwaway golden: `sandboxes.toml` maps `cofactr/flagship` to
+  `tod-golden-cofactr-flagship-6aeb217c` (the repository's real tod golden,
+  labels intact: `tod-schema=93`, `tod-built=1793793033`). A stale
+  `[[sandbox]]` entry for the already deleted `...-6aea8fd9` remains (harmless).
+- Left alone, not ours: `wsx-golden-...`, `product-ingest`, `tod-orchestrator`, and
+  three older `cloud_nodes` rows from earlier passes (`node-nexar-...`,
+  `node-webhook-e2e-build-test`, `node-missing-skill-test`: no sandbox in Blaxel).
+- The previous agent's A/B nodes are reused below.
