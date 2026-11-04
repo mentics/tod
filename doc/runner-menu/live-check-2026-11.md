@@ -344,3 +344,35 @@ was refused by the harness, so it was left; a daemon built in a worktree without
 | B3 | App saw the daemon's write | PASS. The panel changed from no problem to attempt 1, then attempt 2, without a reselect or restart. |
 | B4 | Tree glyph and strip | PASS. The tree row got the "others" diamond (orange); the strip read "2 on others · 1 in trouble"; the On-others filter groups the node under "deleting its sandbox failed; the daemon tries again" with the error and "next check". |
 | B5 | Runner menu for a `done` node | PASS. Check now, Migrate to..., Reset environment, Update workspace to latest main, **Delete sandbox**, **Delete sandbox without a checkpoint**, Sync now. |
+
+### Item A (same Claude session after Migrate): what could and could not be run
+
+**Cloud to host was not run, on purpose.** Migrating a cloud node removes its sandbox
+and first pushes the node's branch (`provision::remove_location` -> `push_branches`) to
+the sandbox's `origin`, which for `Golden flagship` is `Cofactr/flagship`: the new
+branch would land in a Cofactr repository, which these passes may not touch. Pointing
+the sandbox's `origin` elsewhere needs `git` run in the sandbox, which this session's
+shell guard refuses (a `tod-sandbox exec ... git ...` command line), and I did not
+work around it. To run it, the user either allows that one command or says a
+`task/rm-p6-a` branch may be pushed to `Cofactr/flagship`.
+
+**Host to cloud was run** (the direction that pushes only to `joel-cofactr/build-test`).
+Node `RM p6 H` (Lifecycle added, Files override picking the new location `RM p6 host`
+= a scratch clone of build-test, made in the Locations dialog, no database edit).
+
+* The first chat failed: "this node's files are not available: spawn treehouse get
+  --lease: No such file or directory" (a per-node worktree needs Treehouse, not
+  installed on this machine). The error is clear, names the failure and falls back to
+  nothing (right per "errors are never hidden"). Changed the location to "The
+  directory itself".
+* **BUG 10 (fixed): saving that location change panicked the app** ("cannot update
+  tod_ui::views::locations::LocationsDialog while it is already being updated", tod
+  aborted). Cause: in the Locations dialog, "Change it" -> `confirm` ->
+  `confirm_files_change` with nothing to remove called its callback synchronously,
+  and the callback updates the dialog that is still being updated. Fix:
+  `confirm_files_change` defers the callback when nothing is affected. Regression test
+  `ui::files_impact::tests::confirming_with_nothing_affected_does_not_re_enter_the_caller`
+  (fails with the exact panic without the fix). Verified live after rebuilding: the
+  location then read "the workspace directory on this machine".
+* Host session: `conversations.agent_session_id` = `23c60987-e22d-4ccd-b216-8c075d986d02`,
+  log at `~/.claude/projects/-Users-...-rm6-host-repo/23c60987-....jsonl`; reply "pong".
