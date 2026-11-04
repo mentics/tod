@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Current fleet schema epoch stored in `PRAGMA user_version`.
-pub const CURRENT_USER_VERSION: i32 = 93;
+pub const CURRENT_USER_VERSION: i32 = 94;
 
 const BUSY_TIMEOUT_MS: i64 = 5000;
 
@@ -627,6 +627,13 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
         crate::node_requests::ensure_kinds(conn)?;
         conn.pragma_update(None, "user_version", 93)?;
     }
+    if version < 94 {
+        // Problems of a node that happen off any turn (`crate::node_problems`):
+        // machine-local, not synced, journaled.
+        conn.execute_batch(crate::node_problems::CREATE_TABLE)?;
+        conn.execute_batch(&crate::journey_changes::node_problems_triggers_sql())?;
+        conn.pragma_update(None, "user_version", 94)?;
+    }
     // Other branches (the task panel) numbered their own steps 66–67 at the
     // same time as 66–70 above, so a store may be past a version without
     // having these. Every one is idempotent: make sure of them all.
@@ -665,6 +672,8 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
     // The user's deferrals of nodes: machine-local, not synced, journaled.
     conn.execute_batch(crate::deferrals::CREATE_TABLE)?;
     conn.execute_batch(&crate::journey_changes::deferrals_triggers_sql())?;
+    conn.execute_batch(crate::node_problems::CREATE_TABLE)?;
+    conn.execute_batch(&crate::journey_changes::node_problems_triggers_sql())?;
     // The task panel's own steps, first numbered 66–69 on its branch.
     ensure_decisions_reason(conn)?;
     conn.execute_batch(crate::request_feedback::CREATE_TABLE)?;

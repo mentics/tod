@@ -248,6 +248,16 @@ pub enum FleetMutation {
     UndeferNode {
         node: uuid::Uuid,
     },
+    // --- Node problems (immediate; `crate::node_problems`) ---
+    /// A background job of the node failed: recorded where the node's views show it.
+    RecordNodeProblem {
+        problem: crate::node_problems::NodeProblem,
+    },
+    /// The job succeeded (or no longer applies).
+    ClearNodeProblem {
+        node: uuid::Uuid,
+        kind: String,
+    },
     // --- Outline (tree / lists) ---
     Outline(OutlineMutation),
     // --- Interview sessions (immediate) ---
@@ -311,6 +321,8 @@ impl FleetMutation {
                 | FleetMutation::ActivityClearLost { .. }
                 | FleetMutation::DeferNode { .. }
                 | FleetMutation::UndeferNode { .. }
+                | FleetMutation::RecordNodeProblem { .. }
+                | FleetMutation::ClearNodeProblem { .. }
         )
     }
 
@@ -573,6 +585,12 @@ impl FleetMutation {
             }
             FleetMutation::UndeferNode { node } => {
                 crate::deferrals::DeferralRepo::new(conn).clear(*node)?;
+            }
+            FleetMutation::RecordNodeProblem { problem } => {
+                crate::node_problems::NodeProblemRepo::new(conn).record(problem)?;
+            }
+            FleetMutation::ClearNodeProblem { node, kind } => {
+                crate::node_problems::NodeProblemRepo::new(conn).clear(*node, kind)?;
             }
             FleetMutation::Outline(_) => {}
         }
