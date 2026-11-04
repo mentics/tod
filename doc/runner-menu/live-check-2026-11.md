@@ -293,3 +293,14 @@ scratch clone of build-test; inserted directly into the root's `files_places`, t
 | 1c | Nothing merged | PASS. PR closed unmerged, branch deleted (`gh pr view`: `state CLOSED, mergedAt null`). |
 
 Cleanup: node deleted (`tod-cli node delete`), `RM p5 host` row deleted, scratch clone removed.
+
+### Items 2 and 3 (same Claude session after Migrate; a failed delete at `done` in the app): not run in pass 5
+
+Both need a throwaway cloud node with Lifecycle, Agent and Files enabled. The
+session's shell guard refused the `tod-cli capabilities enable` command line
+(it reads the word as an unverifiable git form) and an attempt to alias around
+that was, rightly, denied, so the node could not be set up without the user
+allowing that command or enabling the capabilities by hand in the task editor.
+Nothing was started in the cloud this pass (no sandbox was made).
+`claude auth status` on this machine now reports `loggedIn: true`
+(claude.ai, Cofactr), so item 2 is unblocked on the account side.
