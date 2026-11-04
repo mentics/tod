@@ -111,6 +111,11 @@ struct LocationsDialog {
     list_error: Option<String>,
     /// Where launches would run, or why they cannot, per the last check.
     check: Option<Result<String, String>>,
+    /// Shown under the Worktrees choice: Treehouse is required by Settings but
+    /// is not where this location's nodes would run. Probed off the UI thread
+    /// whenever the choice or the place changes.
+    worktree_note: Option<String>,
+    note_generation: u64,
     checking: bool,
     /// Bumped per check, so a late result for an edit since changed is dropped.
     generation: u64,
@@ -193,6 +198,8 @@ impl LocationsDialog {
             listing: false,
             list_error: None,
             check: None,
+            worktree_note: None,
+            note_generation: 0,
             checking: false,
             generation: 0,
             busy: false,
@@ -273,6 +280,7 @@ impl LocationsDialog {
         if self.runs_in != RunsIn::Machine {
             self.refresh_list(cx);
         }
+        self.probe_worktree(cx);
         cx.notify();
     }
 
@@ -321,6 +329,7 @@ impl LocationsDialog {
         if runs_in != RunsIn::Machine {
             self.refresh_list(cx);
         }
+        self.probe_worktree(cx);
         cx.notify();
     }
 
@@ -356,6 +365,31 @@ impl LocationsDialog {
                     }
                     Err(err) => this.list_error = Some(err),
                 }
+                cx.notify();
+            },
+        );
+    }
+
+    /// Looks, off the UI thread, for what would stop worktrees here (Treehouse
+    /// required by Settings but missing) and shows it under the Worktrees choice.
+    fn probe_worktree(&mut self, cx: &mut Context<Self>) {
+        self.note_generation += 1;
+        self.worktree_note = None;
+        cx.notify();
+        if !self.use_worktree || self.runs_in == RunsIn::Sandbox {
+            return;
+        }
+        let draft = self.draft(cx);
+        let root = self.fleet.paths().root().to_path_buf();
+        let generation = self.note_generation;
+        off_thread(
+            cx,
+            move || worktree_problem(&draft, &root),
+            move |this, note, cx| {
+                if this.note_generation != generation {
+                    return;
+                }
+                this.worktree_note = note;
                 cx.notify();
             },
         );
@@ -397,6 +431,7 @@ impl LocationsDialog {
             self.container.update(cx, |input, cx| input.set_value(name, window, cx));
         }
         self.check = None;
+        self.probe_worktree(cx);
         cx.notify();
     }
 
@@ -923,14 +958,15 @@ impl LocationsDialog {
                         .child(self.choice("loc-worktree-on", "A worktree for each node", self.use_worktree, cx, |this, _, cx| {
                             this.use_worktree = true;
                             this.check = None;
-                            cx.notify();
+                            this.probe_worktree(cx);
                         }))
                         .child(self.choice("loc-worktree-off", "The directory itself", !self.use_worktree, cx, |this, _, cx| {
                             this.use_worktree = false;
                             this.check = None;
-                            cx.notify();
+                            this.probe_worktree(cx);
                         })),
                 )
+                .when_some(self.worktree_note.clone(), |el, note| el.child(self.error_text(note, window, cx)))
             })
             .when(runs_in == RunsIn::DevContainer, |el| {
                 el.child(
@@ -1230,6 +1266,25 @@ fn check_place(place: &FilesPlace, root: &std::path::Path) -> Result<String, Str
             }
         }
     }
+}
+
+/// Treehouse required by Settings but missing where `place`'s nodes would run
+/// (see [`tod_store::fleet::treehouse_required_problem`]). Runs programs and
+/// may talk to Docker: off the UI thread only.
+fn worktree_problem(place: &FilesPlace, root: &std::path::Path) -> Option<String> {
+    use tod_store::fleet::Workdir;
+    let settings = match tod_store::settings::TodSettings::load_from_path(&root.join(tod_store::paths::SETTINGS_FILE)) {
+        Ok(settings) => settings,
+        Err(err) => return Some(format!("Could not read the settings to check Treehouse: {err:#}")),
+    };
+    let repo = place.repo().unwrap_or_default().to_string();
+    let workdir = match &place.dev_container {
+        Some(dev) if !dev.sandbox && !dev.repo_on_host => {
+            Workdir::Container { container: dev.container()?.to_string(), path: repo }
+        }
+        _ => Workdir::Host(std::path::PathBuf::from(repo)),
+    };
+    tod_store::fleet::treehouse_required_problem(&workdir, &settings)
 }
 
 fn check_repo_in_sandbox(sandbox: &str, repo: Option<&str>) -> Result<String, String> {
