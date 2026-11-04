@@ -159,7 +159,9 @@ fn settle_gate_unleased(fleet: &FleetStore, node: Uuid, branch_template: &str) -
     if from == "ready" {
         crate::gate::derived::generate_missing_branch(fleet, node, branch_template)?;
     }
-    let gate = fleet.read(|conn| check_gate(conn, node, &from))?;
+    // Derived criteria may read GitHub: not under the projection lock, which
+    // the UI thread reads through.
+    let gate = fleet.read_detached(|conn| check_gate(conn, node, &from))?;
     let rows: Vec<(Uuid, String, Option<String>, String)> = gate
         .criteria
         .iter()

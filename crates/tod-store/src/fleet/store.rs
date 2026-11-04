@@ -922,6 +922,15 @@ impl FleetStore {
         f(&conn)
     }
 
+    /// Read through a connection of its own, not the projection's, for a read
+    /// that may wait on something slow (a gate check that reads GitHub):
+    /// [`Self::read`] holds the projection lock for the whole closure, and
+    /// every other reader, the UI thread among them, would wait behind it.
+    pub fn read_detached<R>(&self, f: impl FnOnce(&rusqlite::Connection) -> Result<R>) -> Result<R> {
+        let conn = crate::fleet::schema::open_read_connection(self.paths.db())?;
+        f(&conn)
+    }
+
     /// Reload projection if the on-disk store changed externally.
     pub fn reload_if_stale(&self) -> Result<bool> {
         self.projection
