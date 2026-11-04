@@ -212,3 +212,21 @@ older `tod` (port 47611, started 9:50) stayed running on the root and was not to
   three older `cloud_nodes` rows from earlier passes (`node-nexar-...`,
   `node-webhook-e2e-build-test`, `node-missing-skill-test`: no sandbox in Blaxel).
 - The previous agent's A/B nodes are reused below.
+
+Build: main `6c395438`, sandbox binaries rebuilt (`scripts/build-sandbox-binaries.sh`),
+**the shared orchestrator was redeployed** (`tod-sandbox orchestrator --bin target/sandbox/tod-orchestrator ...`).
+My `tod` ran on agent-socket port 47641. Test nodes: the previous agent's `RM p4 A`
+(sandbox `tod-rm-p4-a-89a8d9`) and `RM p4 B` (`tod-rm-p4-b-186bd3`, linked to the throwaway
+draft PR Cofactr/workspace#192). A's plan step was changed to three foreground
+`python3 time.sleep(100)` runs (about 5 minutes of turn), its `pending` status set with
+`tod-cli plan update`.
+
+| # | Check | Result |
+|---|---|---|
+| 2a | Migrate while RUNNING asks Pause / Stop now / Cancel | PASS. Prompt: "This node is running. Migrate to RM host once it has paused (it finishes this step) or been stopped now?" with Pause, Stop now, Cancel (screenshot, node mid-`sleep`, checked with `exec ps`). |
+| 2b | Cancel changes nothing | PASS. Prompt gone, node still `working`, `cloud_nodes` row and sandbox untouched. |
+| 2c | Pause, migration proceeds when idle | PASS. "Pause asked of the supervisor", the turn finished its sleep, the node read "on you: paused", then the "Migrate this node?" impact dialog appeared by itself ("Nothing uncommitted: its branch is pushed, then it is removed."). I cancelled that dialog (node stayed paused in the cloud). |
+| 2d | Stop now, then it migrates | PASS. Stop now mid-`sleep`; within ~9 s the node was "paused" and the impact dialog was up. |
+| 1 | Stop now then Migrate immediately (stale `cloud_nodes` row) | PASS in the sense that matters: I clicked "Remove and migrate" at once after the Stop now dialog appeared; 3 minutes later `cloud_nodes` had no row for the sandbox, the Files location of A is the host, `tod-sandbox list` no longer shows `tod-rm-p4-a-89a8d9`, "Migrated to RM host". The pre-fix race (a late supervisor push) did not occur this time, so the "drop is reported" log line was not seen live; the drop itself is unit tested. |
+| 7a | Check now in `pr_draft` with the real PR #192 | PASS for the hold: B set to `pr_draft` (I set `node_lifecycle.state` in the root's `tod.db` directly), Check now answered "Checked: the gate is clear, but the node was not moved on: the pull request needs the agent: Cofactr/workspace#192: behind its base", state unchanged. The pure human-review (draft) hold was not separated from this: that needed marking #192 ready for review, which would notify Cofactr/workspace code owners, so I did not. |
+| 8 | Same Claude session resumes at the host | NOT VERIFIED: `claude auth status` on this machine says `loggedIn: false`; signing in is the user's. |
