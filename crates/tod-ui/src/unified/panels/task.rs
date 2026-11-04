@@ -410,6 +410,9 @@ fn describe_check(found: &tod_core::lifecycle::CheckNow) -> (String, bool) {
 pub struct TaskPanel {
     node_id: Uuid,
     fleet: Arc<FleetStore>,
+    /// Asks a supervisor to pause or stop now (the request kind), off the UI
+    /// thread. A field so a test can stand in for the network.
+    stop_job: StopJob,
     focus_handle: FocusHandle,
     header: TaskHeader,
     pending_refresh: bool,
@@ -436,6 +439,22 @@ pub struct TaskPanel {
     header_scroll: ScrollHandle,
     requests_scroll: ScrollHandle,
     answered_scroll: ScrollHandle,
+}
+
+/// Starts the job that asks a node's supervisor to pause
+/// (`cloud_sync::REQUEST_PAUSE`) or stop now (`REQUEST_STOP_NOW`); its
+/// updates reach [`TaskPanel::on_cloud_update`].
+type StopJob = fn(&mut TaskPanel, &'static str, &mut Context<TaskPanel>);
+
+/// The real [`StopJob`]: `cloud_node::pause` / `cloud_node::stop_now`.
+fn ask_supervisor_to_stop(panel: &mut TaskPanel, kind: &'static str, cx: &mut Context<TaskPanel>) {
+    let (node, fleet) = (panel.node_id, panel.fleet.clone());
+    let on_update = move |this: &mut TaskPanel, update, cx: &mut Context<TaskPanel>| this.on_cloud_update(node, update, cx);
+    if kind == tod_core::cloud_sync::REQUEST_PAUSE {
+        crate::views::cloud_node::pause(fleet, node.to_string(), cx, on_update);
+    } else {
+        crate::views::cloud_node::stop_now(fleet, node.to_string(), cx, on_update);
+    }
 }
 
 impl HasChangesWatch for TaskPanel {
@@ -512,6 +531,7 @@ impl TaskPanel {
         let mut panel = Self {
             node_id,
             fleet,
+            stop_job: ask_supervisor_to_stop,
             focus_handle,
             requests,
             _requests_subs,
@@ -1035,9 +1055,7 @@ impl TaskPanel {
         if self.runner.supervised {
             self.runner.pause_asked = true;
             self.cloud_started("Asking the supervisor to pause…", cx);
-            crate::views::cloud_node::pause(self.fleet.clone(), node.to_string(), cx, move |this, update, cx| {
-                this.on_cloud_update(node, update, cx)
-            });
+            (self.stop_job)(self, tod_core::cloud_sync::REQUEST_PAUSE, cx);
         } else {
             self.runners.update(cx, |r, cx| r.pause(node, cx));
         }
@@ -1056,9 +1074,7 @@ impl TaskPanel {
             }
             _ if self.runner.supervised => {
                 self.cloud_started("Asking the supervisor to stop now…", cx);
-                crate::views::cloud_node::stop_now(self.fleet.clone(), node.to_string(), cx, move |this, update, cx| {
-                    this.on_cloud_update(node, update, cx)
-                });
+                (self.stop_job)(self, tod_core::cloud_sync::REQUEST_STOP_NOW, cx);
             }
             _ => self.runners.update(cx, |r, cx| r.stop_now(node, cx)),
         }
@@ -2106,6 +2122,193 @@ mod tests {
             let note = view.runner.cloud_note.clone().unwrap_or_default();
             assert!(note.contains("Could not migrate to elsewhere"), "{note}");
             assert!(view.runner.cloud_failed);
+        });
+    }
+
+    /// A stand-in for the supervisor round trip: delivers its answer on a
+    /// later turn of the event loop, as the real job's updates arrive.
+    fn answer_later(panel: &mut TaskPanel, update: CloudUpdate, cx: &mut Context<TaskPanel>) {
+        let node = panel.node_id;
+        cx.spawn(async move |this, cx| {
+            let _ = this.update(cx, |this: &mut TaskPanel, cx| this.on_cloud_update(node, update, cx));
+        })
+        .detach();
+    }
+
+    fn supervisor_accepts(panel: &mut TaskPanel, kind: &'static str, cx: &mut Context<TaskPanel>) {
+        answer_later(panel, CloudUpdate::Synced(format!("asked {kind}")), cx);
+    }
+
+    fn supervisor_still_waking(panel: &mut TaskPanel, kind: &'static str, cx: &mut Context<TaskPanel>) {
+        answer_later(
+            panel,
+            CloudUpdate::Failed(format!("{kind} failed\nsandbox sb is still waking after 90s")),
+            cx,
+        );
+    }
+
+    /// Makes the fixture node's Files run in a cloud sandbox in the store
+    /// (not only on the panel), so a refresh of the runner line keeps it
+    /// supervised.
+    fn put_files_in_a_sandbox(
+        fixture: &crate::views::rows::fixture::Fixture,
+        view: &Entity<TaskPanel>,
+        cx: &mut gpui::VisualTestContext,
+    ) {
+        use tod_store::fleet::{DevContainerSetting, FilesPlace, FleetMutation};
+        use tod_store::outline::{Capability, OutlineMutation};
+        fixture
+            .store
+            .enqueue_outline(OutlineMutation::EnableCapabilities {
+                node_id: fixture.node_id,
+                capabilities: vec![Capability::Files],
+            })
+            .unwrap();
+        let place = FilesPlace {
+            id: Uuid::new_v4().to_string(),
+            name: "cloud".into(),
+            repo: Some("/src/app".into()),
+            dev_container: Some(DevContainerSetting { sandbox: true, ..Default::default() }),
+            ..Default::default()
+        };
+        let id = place.id.clone();
+        fixture.store.enqueue(FleetMutation::SaveFilesPlace { place }).unwrap();
+        fixture
+            .store
+            .enqueue(FleetMutation::SetNodeFilesPlace { node_id: fixture.node_id.to_string(), place_id: Some(id) })
+            .unwrap();
+        fixture.store.writer().flush().unwrap();
+        fixture.store.reload_if_stale().unwrap();
+        view.update(cx, |view, cx| view.refresh_runner(cx));
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| assert!(view.runner.supervised, "the store says it runs in the cloud"));
+    }
+
+    /// Each answer of the Migrate-while-running question leads to its job:
+    /// Pause asks the supervisor to pause and Stop now to stop now, each
+    /// leaving the migration pending until the run has ended, when it begins;
+    /// Cancel asks nothing and changes nothing.
+    #[gpui::test]
+    fn each_answer_of_migrate_while_running_leads_to_its_own_job(cx: &mut gpui::TestAppContext) {
+        use tod_core::cloud_sync::{REQUEST_PAUSE, REQUEST_STOP_NOW};
+        for (label, kind) in [("Pause", REQUEST_PAUSE), ("Stop now", REQUEST_STOP_NOW)] {
+            let (fixture, view, cx) = supervised_panel(cx);
+            put_files_in_a_sandbox(&fixture, &view, cx);
+            view.update(cx, |view, _| view.stop_job = supervisor_accepts);
+            set_actor(&view, cx, working());
+            view.update(cx, |view, cx| view.choose_migration(elsewhere(), cx));
+            view.update(cx, |view, cx| view.answer_prompt(label, cx));
+            cx.run_until_parked();
+            view.read_with(cx, |view, _| {
+                assert_eq!(view.runner.cloud_note.as_deref(), Some(format!("asked {kind}").as_str()), "{label}");
+                assert!(!view.runner.cloud_failed);
+                assert_eq!(view.runner.migration_wait, Some(elsewhere()), "{label}: the migration waits for the run");
+                assert_eq!(view.runner.pause_asked, kind == REQUEST_PAUSE, "{label}");
+            });
+            // Still running: nothing migrates yet.
+            view.update_in(cx, |view, window, cx| view.drain_migration(window, cx));
+            view.read_with(cx, |view, _| assert_eq!(view.runner.migration_wait, Some(elsewhere())));
+            // The supervisor stopped: the migration begins (this store has no
+            // such location, so its own refusal comes back on the line).
+            set_actor(&view, cx, you(YouReason::Paused));
+            view.update_in(cx, |view, window, cx| view.drain_migration(window, cx));
+            cx.run_until_parked();
+            view.read_with(cx, |view, _| {
+                assert!(view.runner.migration_wait.is_none() && !view.runner.pause_asked, "{label}");
+                let note = view.runner.cloud_note.clone().unwrap_or_default();
+                assert!(note.contains("Could not migrate to elsewhere"), "{label}: {note}");
+            });
+        }
+
+        // Cancel asks the supervisor nothing.
+        let (_fixture, view, cx) = supervised_panel(cx);
+        view.update(cx, |view, _| view.stop_job = supervisor_accepts);
+        set_actor(&view, cx, working());
+        view.update(cx, |view, cx| view.choose_migration(elsewhere(), cx));
+        view.update(cx, |view, cx| view.answer_prompt("Cancel", cx));
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(view.runner.cloud_note.is_none(), "no job ran: {:?}", view.runner.cloud_note);
+            assert!(!view.runner.pause_asked && view.runner.migration_wait.is_none() && view.runner.prompt.is_none());
+        });
+    }
+
+    /// A Pause or Stop now that fails (a sandbox still waking after 90
+    /// seconds) is not pending, and neither is the migration queued behind it:
+    /// the failure is on the line, and nothing waits forever.
+    #[gpui::test]
+    fn a_failed_pause_or_stop_now_cancels_the_migration_loudly(cx: &mut gpui::TestAppContext) {
+        for label in ["Pause", "Stop now"] {
+            let (_fixture, view, cx) = supervised_panel(cx);
+            view.update(cx, |view, _| view.stop_job = supervisor_still_waking);
+            set_actor(&view, cx, working());
+            view.update(cx, |view, cx| view.choose_migration(elsewhere(), cx));
+            view.update(cx, |view, cx| view.answer_prompt(label, cx));
+            // Until the answer comes the migration is queued behind the job.
+            view.read_with(cx, |view, _| {
+                assert_eq!(view.runner.migration_wait, Some(elsewhere()), "{label}");
+                assert!(view.runner.cloud_busy.is_some(), "{label}");
+            });
+            cx.run_until_parked();
+            view.read_with(cx, |view, _| {
+                assert!(view.runner.cloud_failed, "{label}");
+                let note = view.runner.cloud_note.clone().unwrap_or_default();
+                assert!(note.contains("still waking after 90s"), "{label}: {note}");
+                assert!(view.runner.cloud_busy.is_none(), "{label}");
+                assert!(!view.runner.pause_asked, "{label}: Pause is not pending");
+                assert!(view.runner.migration_wait.is_none(), "{label}: the migration is cancelled");
+            });
+            // Even once the run has ended, nothing migrates by itself.
+            set_actor(&view, cx, you(YouReason::Paused));
+            view.update_in(cx, |view, window, cx| view.drain_migration(window, cx));
+            cx.run_until_parked();
+            view.read_with(cx, |view, _| {
+                let note = view.runner.cloud_note.clone().unwrap_or_default();
+                assert!(note.contains("still waking"), "{label}: the failure stays: {note}");
+            });
+        }
+    }
+
+    /// A node with children is refused with exactly the store's sentence,
+    /// shown on the runner line when the migration begins (the menu does not
+    /// offer Migrate for such a node: `runner_menu`'s own test).
+    #[gpui::test]
+    fn migrating_a_node_with_children_is_refused_with_the_stores_sentence(cx: &mut gpui::TestAppContext) {
+        use tod_store::outline::{CreatePosition, OutlineMutation};
+        let (fixture, view, cx) = supervised_panel(cx);
+        let list_id = fixture.store.list_outline_lists().unwrap()[0].id;
+        fixture
+            .store
+            .enqueue_outline(OutlineMutation::CreateNode {
+                node_id: Some(Uuid::new_v4()),
+                list_id,
+                parent_id: Some(fixture.node_id),
+                anchor_id: None,
+                position: CreatePosition::Below,
+                title: "child".into(),
+            })
+            .unwrap();
+        fixture.store.writer().flush().unwrap();
+        let place = tod_store::fleet::places::save(
+            &fixture.store,
+            &tod_store::fleet::FilesPlace {
+                name: "elsewhere".into(),
+                repo: Some("/src/elsewhere".into()),
+                use_worktree: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        view.update(cx, |view, _| view.runner.migration_wait = Some(place));
+        set_actor(&view, cx, you(YouReason::Paused));
+        view.update_in(cx, |view, window, cx| view.drain_migration(window, cx));
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.runner.cloud_note.as_deref(),
+                Some("Could not migrate to elsewhere: You cannot migrate a node that has children.")
+            );
+            assert!(view.runner.cloud_failed && view.runner.migration_wait.is_none());
         });
     }
 
