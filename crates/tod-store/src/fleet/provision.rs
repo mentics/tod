@@ -972,22 +972,36 @@ fn make_sandbox(
         bx.wait_reachable(&url, std::time::Duration::from_secs(180)).with_context(|| format!("wake {name}"))?;
         if fork_from.is_none() {
             // An image holds only what it was built with: tod's dependencies
-            // first, then its own files (a fork's golden carries both).
+            // first, then its own files.
             sandboxes.ensure_as(&bx, &name, tod_sandbox::provision::Mode::Install, progress)?;
-            let identity = host.git_identity(node_row.repo.as_deref());
-            let payload = node::NodePayload {
-                relay: &node_files.relay,
-                shim: super::cli_relay::HTTP_SHIM_SCRIPT.as_bytes(),
-                local_cli: node_files.local_cli.as_deref(),
-                supervisor: node_files.supervisor.as_deref(),
-                repo_url: &repo.url,
-                branch,
-                git_identity: &identity,
-                bundles: &node_files.bundles,
-                supervisor_env: &supervisor_env,
-            };
-            progress("installing tod's files…");
+        }
+        let install_identity = host.git_identity(node_row.repo.as_deref());
+        let payload = node::NodePayload {
+            relay: &node_files.relay,
+            shim: super::cli_relay::HTTP_SHIM_SCRIPT.as_bytes(),
+            local_cli: node_files.local_cli.as_deref(),
+            supervisor: node_files.supervisor.as_deref(),
+            repo_url: &repo.url,
+            branch,
+            git_identity: &install_identity,
+            bundles: &node_files.bundles,
+            supervisor_env: &supervisor_env,
+        };
+        progress("installing tod's files…");
+        if fork_from.is_none() {
             node::install(&bx, &url, &payload, progress)?;
+        } else {
+            // A fork's files come from tod's own bundle, not its golden's:
+            // `fork_golden` ends by giving the fork the node's proxy, and that
+            // update redeploys it from its image, which drops whatever the
+            // golden had installed (checked live: a plain fork of the golden
+            // has the node manifest, relay and bundles; the node's fork, after
+            // its proxy update, had none). No package is installed here: the
+            // golden's image has them.
+            node::install_into_fork(&bx, &url, &payload, progress)?;
+            // The fork's relay did not survive that update either, and the
+            // steps below reach the sandbox through it.
+            node::start_relay(&bx, &url, &supervisor_env)?;
         }
         // A fork is "deployed" before its proxy rules and environment are in
         // effect; the checkout needs both.
