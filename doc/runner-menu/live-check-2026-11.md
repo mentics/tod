@@ -447,3 +447,19 @@ step clones the node's repository through the proxy with the user's GitHub token
   sandbox yet to ask for its origin, and nothing in the UI or `tod-cli` sets a node's own
   `repo`. The error text tells the user to set the Files directory to a URL, which the
   dialog does not allow. Worked around by setting `node_fields.repo` in the root's `tod.db`.
+
+### Same Claude session across Migrate, cloud to host and back (PASS)
+
+Node `RM p7 A`, one-line chat "pong" in cloud sandbox `tod-rm-p7-a-ce79df` (image
+location, repository `joel-cofactr/build-test`, checked out by the clone step).
+`conversations.agent_session_id` = `1ef44f5a-9ec6-49ca-98a1-710503938cda`; the session
+log was in the sandbox's `/root/.claude/projects/-workspace-repo/`.
+
+| # | Step | Result |
+|---|---|---|
+| 1 | Migrate to `RM p7 host` (runner menu, impact dialog "Nothing uncommitted: its branch is pushed, then it is removed.") | PASS. "Migrated to RM p7 host. Nothing was started." The branch `task/rm-p7-a` arrived in `joel-cofactr/build-test` (`gh api .../branches`), the sandbox was gone from `tod-sandbox list`. The session log was kept in `<root>/sandbox-sessions/<node>/`. |
+| 2 | Next message on the host | PASS. Same id; the log appeared under `~/.claude/projects/<host-clone dir>/1ef44f5a-....jsonl` and holds the cloud turns (cwd `/workspace/repo`) followed by the host turn (cwd the clone); the agent answered "pong" to "what word did you reply with before"; `conversation_turns` has only user/agent rows (no rotation marker); the app log has no "fresh session" notice. |
+| 3 | Migrate back to `RM p7 cloud`, next message | PASS. "This node moved: the agent's session continues in /workspace/repo (in sandbox tod-rm-p7-a-ce79df)", then `acp_session_resume` with the same id; answered "pong"; the sandbox's `-workspace-repo/1ef44f5a-....jsonl` carries the host turn, and the host project dir was copied too. Still no rotation. |
+
+(The "return" prefix in the second and third user messages is the control socket's `key return`
+typed into the box; not a product issue.)
