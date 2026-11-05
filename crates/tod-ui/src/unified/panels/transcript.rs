@@ -116,6 +116,21 @@ const WATCH_THROTTLE: std::time::Duration = std::time::Duration::from_millis(60)
 /// How wide the list of the node's conversations is, beside the transcript.
 const RUNS_WIDTH: f32 = 210.0;
 
+/// The phase a session worked in: the state it was started for, else the one
+/// its kind belongs to.
+fn session_phase(c: &Conversation) -> Option<String> {
+    if let Some(from) = &c.from_state {
+        return Some(from.clone());
+    }
+    match c.protocol {
+        ProtocolKind::Implementation => Some("active"),
+        ProtocolKind::Verification => Some("verifying"),
+        ProtocolKind::Review => Some("review"),
+        _ => None,
+    }
+    .map(str::to_string)
+}
+
 /// What a lifecycle conversation is called in the list: the work it does
 /// (and for a phase or evaluation, the state), not its protocol's name.
 fn run_label(c: &Conversation) -> String {
@@ -420,6 +435,7 @@ impl TranscriptPanel {
                             at: c.updated_at,
                             started: c.created_at,
                             failed: false,
+                            phase: session_phase(c),
                         })
                         .collect();
                     items.extend(timeline::entry_items(&entries));

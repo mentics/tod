@@ -33,6 +33,9 @@ pub struct Item {
     pub started: i64,
     /// A gate check that did not clear, or commands that did not all pass.
     pub failed: bool,
+    /// The phase it worked in, when it says (a session records the state it
+    /// was started for). Only used where no phase change was recorded.
+    pub phase: Option<String>,
 }
 
 impl Item {
@@ -85,35 +88,69 @@ pub fn entry_items(timeline: &[TimelineEntry]) -> Vec<Item> {
                 KIND_CHECKS => ItemKind::Commands(e.clone()),
                 _ => return None,
             };
-            Some(Item { id: e.id, kind, label: e.title.clone(), at: e.at, started: e.at, failed: e.failed })
+            Some(Item {
+                id: e.id,
+                kind,
+                label: e.title.clone(),
+                at: e.at,
+                started: e.at,
+                failed: e.failed,
+                phase: Some(e.phase.clone()),
+            })
         })
         .collect()
 }
 
 /// Group `items` into stays, oldest first, each holding its items oldest
 /// first. `current` is the node's state now.
+///
+/// From the first recorded phase change on, a stay is what the timeline says.
+/// Before it (or everywhere, for a node older than the timeline) nothing
+/// recorded the changes, so a stay is a run of items that worked in the same
+/// phase ([`Item::phase`]); one that does not say belongs with its
+/// neighbours.
 pub fn build_groups(mut items: Vec<Item>, timeline: &[TimelineEntry], current: &str) -> Vec<Group> {
     items.sort_by_key(|i| (i.started, i.at));
     let changes = changes(timeline);
-    let mut groups: Vec<Group> = Vec::with_capacity(changes.len() + 1);
-    let first_phase = changes
-        .first()
-        .and_then(|c| c.phase_change())
-        .map(|p| p.from)
-        .unwrap_or_else(|| current.to_string());
-    groups.push(Group { key: i64::MIN, phase: first_phase, by_user: false, items: Vec::new() });
+    let first_change = changes.first().map(|c| c.at);
+    let split = items.iter().position(|i| first_change.is_some_and(|at| i.started >= at)).unwrap_or(items.len());
+    let recorded = items.split_off(split);
+    let legacy = items;
+
+    let mut groups: Vec<Group> = Vec::new();
+    // The phase before the first recorded change, when nothing says otherwise.
+    let fallback = changes.first().and_then(|c| c.phase_change()).map(|p| p.from).unwrap_or_else(|| current.to_string());
+    let known: Vec<Option<&str>> = legacy.iter().map(|i| i.phase.as_deref()).collect();
+    let first_known = known.iter().flatten().next().map(|p| p.to_string());
+    let mut run_phase: Option<String> = None;
+    for item in legacy {
+        let phase = item
+            .phase
+            .clone()
+            .or_else(|| run_phase.clone())
+            .or_else(|| first_known.clone())
+            .unwrap_or_else(|| fallback.clone());
+        if run_phase.as_deref() != Some(phase.as_str()) {
+            groups.push(Group { key: item.started, phase: phase.clone(), by_user: false, items: Vec::new() });
+            run_phase = Some(phase);
+        }
+        groups.last_mut().expect("a run was started").items.push(item);
+    }
+
+    let first_recorded = groups.len();
     for change in &changes {
         groups.push(Group { key: change.at, phase: change.phase.clone(), by_user: change.by_user, items: Vec::new() });
     }
-    for item in items {
-        // The last stay that began at or before it.
-        let ix = groups.iter().rposition(|g| g.key <= item.started).unwrap_or(0);
+    for item in recorded {
+        // The last recorded stay that began at or before it.
+        let ix = groups[first_recorded..]
+            .iter()
+            .rposition(|g| g.key <= item.started)
+            .map_or(first_recorded, |i| i + first_recorded);
         groups[ix].items.push(item);
     }
-    // The stay before the first change is only worth a header when something
-    // happened in it.
-    if groups.len() > 1 && groups[0].items.is_empty() {
-        groups.remove(0);
+    if groups.is_empty() {
+        groups.push(Group { key: i64::MIN, phase: fallback, by_user: false, items: Vec::new() });
     }
     groups
 }
@@ -123,7 +160,7 @@ mod tests {
     use super::*;
 
     fn session(at: i64) -> Item {
-        Item { id: Uuid::new_v4(), kind: ItemKind::Session, label: "s".into(), at, started: at, failed: false }
+        Item { id: Uuid::new_v4(), kind: ItemKind::Session, label: "s".into(), at, started: at, failed: false, phase: None }
     }
 
     fn change(node: Uuid, at: i64, from: &str, to: &str, by_user: bool) -> TimelineEntry {
@@ -157,6 +194,38 @@ mod tests {
         let timeline = [change(node, 10, "design", "planning", false)];
         let groups = build_groups(vec![session(12)], &timeline, "planning");
         assert_eq!(groups.iter().map(Group::title).collect::<Vec<_>>(), vec!["Planning"]);
+    }
+
+    fn in_phase(at: i64, phase: &str) -> Item {
+        Item { phase: Some(phase.into()), ..session(at) }
+    }
+
+    #[test]
+    fn without_recorded_changes_stays_follow_the_phase_each_session_worked_in() {
+        let items = vec![
+            in_phase(1, "proposed"),
+            in_phase(2, "proposed"),
+            in_phase(3, "design"),
+            session(4),
+            in_phase(5, "planning"),
+            in_phase(6, "design"),
+            in_phase(7, "pr_draft"),
+        ];
+        let groups = build_groups(items, &[], "pr_draft");
+        let shape: Vec<_> = groups.iter().map(|g| (g.title(), g.items.len())).collect();
+        assert_eq!(
+            shape,
+            vec![("Proposed".into(), 2), ("Design".into(), 2), ("Planning".into(), 1), ("Design".into(), 1), ("Pr draft".into(), 1)]
+        );
+    }
+
+    #[test]
+    fn recorded_stays_follow_inferred_ones() {
+        let node = Uuid::new_v4();
+        let timeline = [change(node, 10, "design", "planning", false)];
+        let groups = build_groups(vec![in_phase(1, "proposed"), in_phase(2, "design"), session(12)], &timeline, "planning");
+        let titles: Vec<_> = groups.iter().map(Group::title).collect();
+        assert_eq!(titles, vec!["Proposed", "Design", "Planning"]);
     }
 
     #[test]
