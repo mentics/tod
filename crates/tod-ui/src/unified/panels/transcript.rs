@@ -20,6 +20,8 @@ use crate::ui::agent_conversation::{
     forward_panel_keys,
 };
 use crate::ui::agent_runs::AgentRuns;
+use crate::ui::session_info::SessionInfo;
+use tod_core::conversation::ConversationStatus;
 use crate::ui::style;
 use crate::unified::panel::ColumnPanel;
 
@@ -87,6 +89,10 @@ pub struct TranscriptPanel {
     items_loading: bool,
     /// A `sync_watch` is waiting out its throttle.
     sync_scheduled: bool,
+    /// Platform, model, effort, and spending of the conversation shown.
+    session_info: SessionInfo,
+    /// The conversation shown was running at the last `show`.
+    was_running: bool,
     _load: gpui::Task<()>,
     _search: gpui::Task<()>,
     _items: gpui::Task<()>,
@@ -167,6 +173,8 @@ struct Watching {
     runs: Entity<AgentRuns>,
     /// The streamed reply of the turn in flight.
     live: Vec<tod_agent::ReplyPart>,
+    /// What the running conversation's agent reports it has spent so far.
+    live_usage: Option<tod_agent::TokenUsage>,
     _sub: Subscription,
 }
 
@@ -204,6 +212,8 @@ impl TranscriptPanel {
             searching: false,
             items_loading: false,
             sync_scheduled: false,
+            session_info: SessionInfo::default(),
+            was_running: false,
             _load: gpui::Task::ready(()),
             _search: gpui::Task::ready(()),
             _items: gpui::Task::ready(()),
@@ -257,6 +267,7 @@ impl TranscriptPanel {
             live_id: None,
             runs,
             live: Vec::new(),
+            live_usage: None,
             _sub,
         });
         this.load_items(cx);
@@ -341,7 +352,7 @@ impl TranscriptPanel {
                     && !matches!(slot.protocol, ProtocolKind::Outline | ProtocolKind::Chat)
                     && let Some(conversation) = slot.conversation_id
                 {
-                    found = Some((conversation, slot.status.parts.clone()));
+                    found = Some((conversation, slot.status.parts.clone(), slot.status.live_usage.clone()));
                     break;
                 }
             }
@@ -350,16 +361,17 @@ impl TranscriptPanel {
         self.cloud = tod_core::cloud_sync::cloud_status(&self.fleet, node, tod_store::outline::uuid_blob::now_ms());
         let pinned = self.watching.as_ref().is_some_and(|w| w.pinned);
         let running = running.or_else(|| self.cloud_live_turn(node));
-        let live_id = running.as_ref().map(|(conversation, _)| *conversation);
+        let live_id = running.as_ref().map(|(conversation, ..)| *conversation);
+        let live_usage = running.as_ref().and_then(|(_, _, usage)| usage.clone());
         let (target, live) = match running {
             // The one the user chose stays; its reply streams in only while
             // it is the one running.
-            Some((conversation, parts)) if pinned => {
+            Some((conversation, parts, _)) if pinned => {
                 (Some(self.conversation_id), if conversation == self.conversation_id { parts } else { Vec::new() })
             }
             // Mid-turn, here or in the node's cloud sandbox (whose reply
             // in flight arrives through the store): show it as it streams.
-            Some((conversation, parts)) => (Some(conversation), parts),
+            Some((conversation, parts, _)) => (Some(conversation), parts),
             None if pinned => (Some(self.conversation_id), Vec::new()),
             None => {
                 self.find_latest(node, cx);
@@ -369,6 +381,7 @@ impl TranscriptPanel {
         if let Some(watching) = &mut self.watching {
             watching.live = live;
             watching.live_id = live_id;
+            watching.live_usage = live_usage;
         }
         match target {
             Some(id) if id != self.conversation_id => self.retarget(id, cx),
@@ -509,12 +522,12 @@ impl TranscriptPanel {
     /// The turn `node`'s cloud supervisor has in flight, as it last sent it
     /// (`tod_store::conversation_live`). Only while the supervisor is heard
     /// from: a row left by one that died is not a turn in progress.
-    fn cloud_live_turn(&self, node: Uuid) -> Option<(Uuid, Vec<tod_agent::ReplyPart>)> {
+    fn cloud_live_turn(&self, node: Uuid) -> Option<(Uuid, Vec<tod_agent::ReplyPart>, Option<tod_agent::TokenUsage>)> {
         if !matches!(self.cloud, Some(tod_core::cloud_sync::CloudStatus::Working { .. })) {
             return None;
         }
         match self.fleet.read(|conn| tod_store::conversation_live::get(conn, node)) {
-            Ok(live) => live.map(|live| (live.conversation_id, live.parts)),
+            Ok(live) => live.map(|live| (live.conversation_id, live.parts, None)),
             Err(err) => {
                 tracing::warn!("reading the cloud node's reply in flight: {err:#}");
                 None
@@ -552,24 +565,26 @@ impl TranscriptPanel {
         let fleet = self.fleet.clone();
         let known = self.stored.clone();
         self._load = cx.spawn(async move |this, cx| {
-            let (entries, session_name) = cx
+            let (entries, session_name, meta) = cx
                 .background_executor()
                 .spawn(async move {
-                    let (turns, session_name) = fleet
+                    let (turns, session_name, meta) = fleet
                         .read(|conn| {
                             let repo = ConversationRepo::new(conn);
                             let turns = repo.turns(id)?;
-                            let session_name = repo.get(id)?.and_then(|c| c.session_name);
-                            anyhow::Ok((turns, session_name))
+                            let row = repo.get(id)?;
+                            let meta = row.as_ref().map(|c| (c.focus, c.protocol));
+                            let session_name = row.and_then(|c| c.session_name);
+                            anyhow::Ok((turns, session_name, meta))
                         })
                         .unwrap_or_default();
                     let root = fleet.paths().root();
                     let entries: Vec<Entry> = turns.iter().map(|turn| entry_of(turn, root)).collect();
                     // `None`: the same turns as are shown.
-                    ((*known != entries).then_some(entries), session_name)
+                    ((*known != entries).then_some(entries), session_name, meta)
                 })
                 .await;
-            this.update(cx, |this, cx| this.loaded_turns(id, entries, session_name, cx)).ok();
+            this.update(cx, |this, cx| this.loaded_turns(id, entries, session_name, meta, cx)).ok();
         });
     }
 
@@ -578,11 +593,15 @@ impl TranscriptPanel {
         id: Uuid,
         entries: Option<Vec<Entry>>,
         session_name: Option<String>,
+        meta: Option<(Focus, ProtocolKind)>,
         cx: &mut Context<Self>,
     ) {
         self.loading = false;
         if id == self.conversation_id {
             self.loaded = true;
+            if let Some((focus, kind)) = meta {
+                self.session_info.show(focus, kind, Some(id));
+            }
             if let Some(entries) = entries {
                 self.stored = Arc::new(entries);
                 self.stored_dirty = true;
@@ -610,7 +629,16 @@ impl TranscriptPanel {
         let message = if self.loaded { "No turns recorded yet." } else { "Loading…" };
         let whole = std::mem::take(&mut self.stored_dirty);
         let stored = self.stored.clone();
+        let status = self.session_status();
+        // A turn ended: what it spent is in the session log now.
+        if self.was_running && !status.running {
+            self.session_info.mark_stale();
+        }
+        self.was_running = status.running;
+        self.refresh_session_info(status.running, cx);
+        let usage = self.session_info.line(&status);
         self.panel.update(cx, |panel, cx| {
+            panel.set_usage(usage, cx);
             panel.set_title(self.title.clone(), cx);
             if whole {
                 let mut entries = Vec::with_capacity(stored.len() + 1);
@@ -623,6 +651,47 @@ impl TranscriptPanel {
             panel.set_empty_message(message, cx);
         });
         cx.notify();
+    }
+}
+
+impl TranscriptPanel {
+    /// What the shown conversation's run reports, when it is the one running
+    /// here: whether it runs, and what its agent says it has spent so far.
+    fn session_status(&self) -> ConversationStatus {
+        let live = self
+            .watching
+            .as_ref()
+            .filter(|w| w.live_id == Some(self.conversation_id));
+        ConversationStatus {
+            running: live.is_some(),
+            live_usage: live.and_then(|w| w.live_usage.clone()),
+            ..ConversationStatus::default()
+        }
+    }
+
+    /// Read the model, effort, and spending again when due (see
+    /// [`SessionInfo::take_due`]), off the UI thread.
+    fn refresh_session_info(&mut self, running: bool, cx: &mut Context<Self>) {
+        let Some(read) = self.session_info.take_due(running) else {
+            return;
+        };
+        let fleet = self.fleet.clone();
+        cx.spawn(async move |this, cx| {
+            let (read, result) = cx
+                .background_executor()
+                .spawn(async move {
+                    let result = read.run(&fleet);
+                    (read, result)
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if this.session_info.apply(&read, result) {
+                    let line = this.session_info.line(&this.session_status());
+                    this.panel.update(cx, |panel, cx| panel.set_usage(line, cx));
+                }
+            });
+        })
+        .detach();
     }
 }
 
