@@ -824,9 +824,9 @@ impl AgentConversationPanel {
             self.toggle(id, cx);
             return true;
         }
-        match id.part {
-            Some(_) => {
-                self.set_highlight(PanelStop::Chunk(ChunkId { entry: id.entry, part: None }), cx);
+        match transcript_list::parent(&self.entries, id) {
+            Some(parent) => {
+                self.set_highlight(PanelStop::Chunk(parent), cx);
                 true
             }
             None => false,
