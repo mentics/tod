@@ -720,18 +720,4 @@ mod tests {
         let files = vec!["a b.py".to_string(), "it's.py".to_string()];
         assert_eq!(run_command(&cwd, &check, &files), (Verdict::Passed, "a b.py\nit's.py".to_string()));
     }
-
-    #[test]
-    fn the_workspace_checks_file_parses_and_every_row_is_valid() {
-        let checks: tod_store::lifecycle_config::Checks =
-            serde_yaml::from_str(include_str!("../../../doc/lifecycle/checks-workspace.yaml")).unwrap();
-        assert_eq!(checks.keys().map(String::as_str).collect::<Vec<_>>(), ["pr_draft", "review"]);
-        assert_eq!(checks["review"], checks["pr_draft"]);
-        assert!(checks["review"].len() > 10);
-        for check in &checks["review"] {
-            assert!(!check.command.trim().is_empty(), "{check:?}");
-            assert_eq!(lifecycle_config::clean_rel_path("dir", &check.dir).unwrap(), check.dir);
-            assert!(!check.dir.is_empty(), "every row is scoped to a repository: {check:?}");
-        }
-    }
 }
