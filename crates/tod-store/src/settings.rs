@@ -53,6 +53,14 @@ fn default_independent_evaluation() -> bool {
     true
 }
 
+/// How many review-and-fix rounds a node gets in one stay in `review`
+/// before the run stops and asks the user.
+pub const DEFAULT_REVIEW_ROUND_LIMIT: u32 = 5;
+
+fn default_review_round_limit() -> u32 {
+    DEFAULT_REVIEW_ROUND_LIMIT
+}
+
 /// How the lifecycle runner judges a phase done
 /// (`doc/lifecycle/phase-agents.md`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -62,6 +70,11 @@ pub struct LifecycleSettings {
     /// certifies its own phase.
     #[serde(default = "default_independent_evaluation")]
     pub independent_evaluation: bool,
+    /// The most review-and-fix rounds one stay in `review` runs before the
+    /// run stops for the user (`lifecycle.review_round_limit`; at least 1).
+    /// Running the node again starts a fresh set of rounds.
+    #[serde(default = "default_review_round_limit")]
+    pub review_round_limit: u32,
     /// How each repository ships (`doc/lifecycle/repo-profiles.md`). The
     /// first entry that matches a pull request's repository applies; a
     /// repository nothing matches uses [`RepoProfile::Release`].
@@ -73,6 +86,7 @@ impl Default for LifecycleSettings {
     fn default() -> Self {
         Self {
             independent_evaluation: default_independent_evaluation(),
+            review_round_limit: default_review_round_limit(),
             repo_profiles: Vec::new(),
         }
     }
@@ -1129,6 +1143,7 @@ mod tests {
             journeys: JourneySettings::default(),
             lifecycle: LifecycleSettings {
                 independent_evaluation: false,
+                review_round_limit: 8,
                 repo_profiles: vec![RepoProfileSetting { repo: "acme/infra".into(), profile: RepoProfile::Merge }],
             },
             visual_design: VisualDesignSettings {

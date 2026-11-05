@@ -71,10 +71,12 @@ exactly this.
 troubleshooting and process improvement), but putting it here makes the line
 read as navigation: everything on it goes somewhere.
 
-Findings, verdicts, and each phase's change sets are still stored. They are
+Findings appear as a link on the artifact strip only when the review has
+recorded some (`Findings 3 · 2 open`); it opens the findings panel in the next
+column. Verdicts and each phase's change sets are still stored. They are
 steps toward the goal, not the goal, so they are not artifacts and are seen
-through the journey, not here. The exception is one the user has to answer,
-which appears as a request.
+through the journey, not here. A finding the user has to answer also appears
+as a request.
 
 ### Runner
 

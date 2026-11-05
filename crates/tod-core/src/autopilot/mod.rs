@@ -595,7 +595,11 @@ impl Autopilot {
                 self.state.loops.review_rounds = 0;
             }
             if step == NextStep::Review {
-                if self.state.loops.review_rounds >= REVIEW_ROUND_LIMIT {
+                let round_limit = tod_store::TodSettings::load(&tod_store::TodPaths::at(&self.config.data_root))?
+                    .lifecycle
+                    .review_round_limit
+                    .max(1);
+                if self.state.loops.review_rounds >= round_limit {
                     let node = self.node;
                     let standing = fleet.read(|conn| {
                         // What the latest review recorded and the fixer claims to have fixed.

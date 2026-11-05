@@ -91,8 +91,9 @@ pub const CYCLE_LIMIT: u32 = 3;
 
 /// How many reviews a node may have in one stay in `review` before the run
 /// stops and asks the user: review, fix, review again, and so on, until a
-/// review finds nothing. Reaching it means the two are not converging.
-pub const REVIEW_ROUND_LIMIT: u32 = 3;
+/// review finds nothing. Reaching it means the two are not converging. This
+/// is the default; `lifecycle.review_round_limit` in the settings overrides it.
+pub const REVIEW_ROUND_LIMIT: u32 = tod_store::settings::DEFAULT_REVIEW_ROUND_LIMIT;
 
 /// Everything that counts a loop the run is in. Sessions
 /// ([`AutopilotState::sessions`]) and the pull request's start
