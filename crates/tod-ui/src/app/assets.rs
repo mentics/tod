@@ -96,6 +96,11 @@ mod tests {
     }
 
     #[test]
+    fn node_chat_new_icon_is_bundled() {
+        assert!(serves(&gpui_kit_assets::IconName::MessageSquareDot.path()));
+    }
+
+    #[test]
     fn chat_running_square_icon_is_bundled() {
         assert!(serves(&gpui_kit_assets::IconName::Square.path()));
     }
