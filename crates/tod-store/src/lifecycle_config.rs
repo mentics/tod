@@ -338,8 +338,22 @@ pub struct Check {
     /// What messages call it ("pyright"); the command itself when blank.
     #[serde(default)]
     pub label: String,
-    /// Run by the shell in the node's Files directory.
+    /// Run by the shell in `dir`.
     pub command: String,
+    /// Where it runs, relative to the node's Files directory (`flagship`);
+    /// blank for the directory itself.
+    #[serde(default)]
+    pub dir: String,
+    /// The path whose changes make the check apply (relative to the Files
+    /// directory); blank means `dir`. With neither this, `dir` nor a
+    /// `pattern`, the check applies always. `.` is the whole tree.
+    #[serde(default)]
+    pub changed: String,
+    /// Space-separated globs (`*.py`) a changed file must match, matched
+    /// against its path under `dir`; blank matches any. The matching files are
+    /// exported to the command as `TOD_CHANGED_FILES`, one per line.
+    #[serde(default)]
+    pub pattern: String,
 }
 
 impl Check {
@@ -348,6 +362,59 @@ impl Check {
         let label = self.label.trim();
         if label.is_empty() { self.command.trim() } else { label }
     }
+
+    /// [`Self::name`], with the directory when there is one, since the same
+    /// label may be configured for several repositories.
+    pub fn display(&self) -> String {
+        display_name(&self.label, &self.command, &self.dir)
+    }
+
+    /// The path whose changes make this check apply: `changed`, else `dir`,
+    /// else `.` (the whole tree).
+    pub fn scope(&self) -> &str {
+        let changed = self.changed.trim();
+        let dir = self.dir.trim();
+        if !changed.is_empty() {
+            changed
+        } else if !dir.is_empty() {
+            dir
+        } else {
+            "."
+        }
+    }
+
+    /// Whether the check applies only when something changed: it has a scope
+    /// of its own or a pattern. Otherwise it applies always.
+    pub fn is_scoped(&self) -> bool {
+        self.scope() != "." || !self.pattern.trim().is_empty()
+    }
+}
+
+/// A check's name in messages: its label, else its command, then ` in <dir>`.
+pub fn display_name(label: &str, command: &str, dir: &str) -> String {
+    let label = label.trim();
+    let name = if label.is_empty() { command.trim() } else { label };
+    let dir = dir.trim();
+    if dir.is_empty() { name.to_string() } else { format!("{name} in {dir}") }
+}
+
+/// A relative path as `set_checks` keeps it: no `./`, no trailing `/`, `.` or
+/// blank for the root; absolute paths and `..` are refused (a check stays
+/// inside the node's files).
+pub fn clean_rel_path(what: &str, raw: &str) -> Result<String> {
+    let text = raw.trim().replace('\\', "/");
+    let mut parts = Vec::new();
+    for part in text.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => bail!("{what} {raw:?} leaves the node's files"),
+            other => parts.push(other),
+        }
+    }
+    if text.starts_with('/') {
+        bail!("{what} {raw:?} must be relative to the node's files");
+    }
+    Ok(parts.join("/"))
 }
 
 /// Checks by phase key, as stored on one node.
@@ -397,7 +464,15 @@ pub fn set_checks(conn: &Connection, node_id: Uuid, config: &Checks) -> Result<(
             if command.is_empty() {
                 bail!("{phase}: a check has no command (label {:?})", check.label.trim());
             }
-            out.push(Check { label: check.label.trim().to_string(), command: command.to_string() });
+            let dir = clean_rel_path("a check's directory", &check.dir)?;
+            let changed = clean_rel_path("a check's changed path", &check.changed)?;
+            out.push(Check {
+                label: check.label.trim().to_string(),
+                command: command.to_string(),
+                dir,
+                changed,
+                pattern: check.pattern.split_whitespace().collect::<Vec<_>>().join(" "),
+            });
         }
         clean.insert(phase.clone(), out);
     }
@@ -586,5 +661,37 @@ mod tests {
         assert!(set_skills(&conn, Uuid::new_v4(), &bad).is_err());
         bad.insert("pr_draft".into(), v(&["a", ";"]));
         assert!(set_skills(&conn, Uuid::new_v4(), &bad).is_err());
+    }
+}
+
+#[cfg(test)]
+mod scope_tests {
+    use super::*;
+
+    #[test]
+    fn paths_are_kept_relative_and_inside_the_files() {
+        assert_eq!(clean_rel_path("p", " ./flagship/ ").unwrap(), "flagship");
+        assert_eq!(clean_rel_path("p", ".").unwrap(), "");
+        assert_eq!(clean_rel_path("p", "a//b/./c").unwrap(), "a/b/c");
+        assert!(clean_rel_path("p", "../x").is_err());
+        assert!(clean_rel_path("p", "a/../../x").is_err());
+        assert!(clean_rel_path("p", "/etc").is_err());
+    }
+
+    #[test]
+    fn a_checks_scope_is_changed_else_dir_else_everything() {
+        let c = |dir: &str, changed: &str, pattern: &str| Check {
+            command: "x".into(),
+            dir: dir.into(),
+            changed: changed.into(),
+            pattern: pattern.into(),
+            ..Check::default()
+        };
+        assert_eq!(c("", "", "").scope(), ".");
+        assert!(!c("", "", "").is_scoped());
+        assert_eq!(c("kb", "", "").scope(), "kb");
+        assert_eq!(c("kb", "kb/api", "").scope(), "kb/api");
+        assert!(c("", "", "*.py").is_scoped());
+        assert_eq!(c("kb", "", "").display(), "x in kb");
     }
 }

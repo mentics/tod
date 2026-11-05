@@ -52,3 +52,30 @@ checks pass (`NeedsHuman::ChecksNotConverging`); failing again on the files
 the fixer was already sent means it changed nothing
 (`NeedsHuman::ChecksUnfixed`). A gate that fails only on checks returns to
 the loop instead of stopping.
+
+## Scope: directory, changed path, file pattern
+
+A check can be scoped so one list on the workspace node serves every
+repository below it. Each row has, besides label and command:
+
+- **Run in** (`dir`): a directory under the node's Files directory (a
+  submodule, say); blank is the directory itself. `..` and absolute paths are
+  refused at save.
+- **Only if changed** (`changed`): the path whose changes make the check
+  apply; blank means `dir`, and `.` the whole tree.
+- **Files** (`pattern`): space-separated globs (`*.py`; `*` also crosses `/`)
+  a changed file must match, taken against its path under `dir`.
+
+With none of the three the check always applies. Otherwise it applies when
+something in its scope differs from where this branch left `origin`'s default
+branch (`origin/HEAD`, else `origin/main`/`master`; none known is an error,
+not a guess): commits, uncommitted changes, untracked files, and deletions,
+in the repository that holds the scope and every submodule inside it. A check
+that does not apply is recorded as `skipped`: it does not run and is not in
+the gate. The files that matched (those that exist, under `dir`, relative to
+it) reach the command as `$TOD_CHANGED_FILES`, one per line.
+
+A scoped check's fingerprint covers only the repositories in its scope plus
+its file list, so a change in one repository does not run another's checks.
+Runs are keyed by phase, directory and command, so the same command may be
+configured for several directories. Messages name a check `label in dir`.
