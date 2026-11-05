@@ -73,8 +73,9 @@ pub trait SandboxHost: Send + Sync {
     fn node_files(&self) -> Result<NodeFiles>;
     /// The repository `node_id`'s sandbox works on.
     fn node_repo(&self, fleet: &super::FleetStore, node_id: &str) -> Result<NodeRepo>;
-    /// Who the node's commits are by (`repo` is the node's local repository, if any).
-    fn git_identity(&self, repo: Option<&str>) -> GitIdentity;
+    /// Who the node's commits are by: the identity in the user's database
+    /// (`crate::git_identity`); an error when none is set.
+    fn git_identity(&self, fleet: &super::FleetStore) -> Result<GitIdentity>;
     /// The agent the node's supervisor runs (`claude`, `mock`); `None` for its default.
     fn supervisor_agent(&self) -> Option<String>;
     /// Notes, before anything is made at Blaxel, the sandbox name `node_id`

@@ -238,6 +238,12 @@ pub enum FleetMutation {
         node: uuid::Uuid,
         at: i64,
     },
+    /// The user changed the git identity sandboxes author commits as
+    /// (`crate::git_identity`).
+    SetGitIdentity {
+        name: String,
+        email: String,
+    },
     // --- Deferrals (immediate; `crate::deferrals`) ---
     /// The user took the node off their list, until `until` (ms) or until
     /// they bring it back.
@@ -324,6 +330,7 @@ impl FleetMutation {
                 | FleetMutation::ActivityClearLost { .. }
                 | FleetMutation::DeferNode { .. }
                 | FleetMutation::UndeferNode { .. }
+                | FleetMutation::SetGitIdentity { .. }
                 | FleetMutation::RecordNodeProblem { .. }
                 | FleetMutation::ClearNodeProblem { .. }
         )
@@ -588,6 +595,9 @@ impl FleetMutation {
             }
             FleetMutation::DeferNode { node, until, at } => {
                 crate::deferrals::DeferralRepo::new(conn).set(*node, *until, *at)?;
+            }
+            FleetMutation::SetGitIdentity { name, email } => {
+                crate::git_identity::set(conn, &crate::git_identity::GitIdentity::validated(name, email)?)?;
             }
             FleetMutation::UndeferNode { node } => {
                 crate::deferrals::DeferralRepo::new(conn).clear(*node)?;

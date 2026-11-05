@@ -1208,27 +1208,13 @@ pub fn sync_on_start(fleet: std::sync::Arc<FleetStore>) {
     lost::spawn_check(fleet, lost::Check::Full);
 }
 
-/// The user's git identity, for the node's commits in its sandbox: the
-/// node's repository's own when it is on this machine, else this machine's
-/// global one, else [`tod_sandbox::node::GitIdentity::fallback`].
-fn git_identity(repo: Option<&str>) -> tod_sandbox::node::GitIdentity {
-    let local = repo.map(Path::new).filter(|dir| dir.is_dir());
-    let get = |key: &str| {
-        let mut cmd = std::process::Command::new("git");
-        if let Some(dir) = local {
-            cmd.arg("-C").arg(dir);
-        }
-        cmd.args(["config", "--get", key])
-            .output()
-            .ok()
-            .filter(|out| out.status.success())
-            .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
-            .filter(|value| !value.is_empty())
-    };
-    match (get("user.name"), get("user.email")) {
-        (Some(name), Some(email)) => tod_sandbox::node::GitIdentity { name, email },
-        _ => tod_sandbox::node::GitIdentity::fallback(),
-    }
+/// The user's git identity, for the node's commits in its sandbox: the one
+/// in their database (`tod_store::git_identity`, seeded from this machine's git
+/// config and edited in Settings). An error says how to set one when there is
+/// none; no other author is made up.
+fn git_identity(fleet: &FleetStore) -> Result<tod_sandbox::node::GitIdentity> {
+    let identity = fleet.read(tod_store::git_identity::require)?;
+    Ok(tod_sandbox::node::GitIdentity { name: identity.name, email: identity.email })
 }
 
 /// `git config` pattern listing every remote's URL (`remote.<name>.url <url>`).
@@ -1649,7 +1635,7 @@ pub fn ensure_supervisor(
         }
         SupervisorState::Install { why } => {
             progress(&format!("{name} gets this build's relay and supervisor: {why}…"));
-            let identity = git_identity(task.repo.as_deref());
+            let identity = git_identity(fleet)?;
             let credentials = node::NodeCredentials { claude_oauth_token, ..Default::default() };
             let claude_via = sandboxes.claude_token_via();
             let supervisor_env = node::supervisor_env(&credentials, claude_via);
