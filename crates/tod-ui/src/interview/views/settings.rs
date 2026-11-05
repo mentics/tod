@@ -26,7 +26,7 @@ use tod_core::logging;
 use tod_journey::RelayCode;
 use tod_store::fleet::default_terminal_hint;
 use tod_store::branch_name::DEFAULT_BRANCH_TEMPLATE;
-use tod_store::settings::{DEFAULT_TREEHOUSE_EXECUTABLE, JourneySettings, RepoProfileSetting};
+use tod_store::settings::{DEFAULT_TREEHOUSE_EXECUTABLE, JourneySettings, PrReviewBotSettings, RepoProfileSetting};
 use tod_store::{AgentRole, efforts_for, models_for, parse_platform};
 
 const SAVE_DEBOUNCE: Duration = Duration::from_secs(2);
@@ -176,7 +176,7 @@ impl SettingsSection {
                 ClaudeAdapter,
                 MaxParallelSessions,
             ],
-            Self::Lifecycle => &[LifecycleIndependentEvaluation, LifecycleReviewRoundLimit, LifecycleRepoProfiles],
+            Self::Lifecycle => &[LifecycleIndependentEvaluation, LifecycleReviewRoundLimit, LifecycleRepoProfiles, PrReviewBots],
             Self::QuestionMaker => &[ReplenishThreshold],
             Self::AnswerProcessor => &[ContextBudget, PromptCacheIdle, AnsweredHistoryCap],
             Self::Workspaces => &[
@@ -275,6 +275,8 @@ enum SettingField {
     LifecycleReviewRoundLimit,
     /// `lifecycle.repo_profiles`, as text.
     LifecycleRepoProfiles,
+    /// `pr_readiness.bots`, as text.
+    PrReviewBots,
     /// Seconds an idle sandbox terminal keeps its connection.
     SandboxTerminalPark,
     /// Seconds an idle Zed on a sandbox keeps its connection.
@@ -325,6 +327,7 @@ impl SettingField {
             Self::LifecycleIndependentEvaluation => "lifecycle-independent-evaluation",
             Self::LifecycleReviewRoundLimit => "lifecycle-review-round-limit",
             Self::LifecycleRepoProfiles => "lifecycle-repo-profiles",
+            Self::PrReviewBots => "pr-review-bots",
             Self::SandboxTerminalPark => "sandbox-terminal-park",
             Self::SandboxZedPark => "sandbox-zed-park",
             Self::SandboxAgentIdle => "sandbox-agent-idle",
@@ -336,7 +339,7 @@ const PLATFORM_ORDER: [AgentPlatform; 2] = [AgentPlatform::Claude, AgentPlatform
 /// Platform, model, effort — the dropdowns in one agent role row.
 const AGENT_ROW_COLUMNS: usize = 3;
 /// The fields edited as text, each in its own input (`SettingsView::text_input`).
-const TEXT_FIELDS: [SettingField; 14] = [
+const TEXT_FIELDS: [SettingField; 15] = [
     SettingField::TreehouseExecutable,
     SettingField::TreehouseWorktreesRoot,
     SettingField::BranchTemplate,
@@ -351,6 +354,7 @@ const TEXT_FIELDS: [SettingField; 14] = [
     SettingField::JourneysRelayCode,
     SettingField::JourneysMilestoneStates,
     SettingField::LifecycleRepoProfiles,
+    SettingField::PrReviewBots,
 ];
 
 /// Platform / model / effort dropdowns for one agent role's settings line.
@@ -452,6 +456,9 @@ pub struct SettingsView {
     repo_profiles_input: Entity<InputState>,
     /// Why the text in `repo_profiles_input` was not saved.
     repo_profiles_error: Option<String>,
+    pr_review_bots_input: Entity<InputState>,
+    /// Why the text in `pr_review_bots_input` was not saved.
+    pr_review_bots_error: Option<String>,
     branch_template_input: Entity<InputState>,
     /// Why the text in `branch_template_input` was not saved.
     branch_template_error: Option<String>,
@@ -511,6 +518,7 @@ pub struct SettingsView {
     _relay_code_subscription: Subscription,
     _milestone_states_subscription: Subscription,
     _repo_profiles_subscription: Subscription,
+    _pr_review_bots_subscription: Subscription,
     _branch_template_subscription: Subscription,
     _orchestrator_github_subscription: Subscription,
     _databases_subscription: Subscription,
@@ -672,6 +680,16 @@ impl SettingsView {
                 this.apply_text_field(SettingField::LifecycleRepoProfiles, cx);
             }
         });
+        let pr_review_bots_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("greptile=4")
+                .default_value(PrReviewBotSettings::format_list(&settings.pr_readiness.bots))
+        });
+        let _pr_review_bots_subscription = cx.subscribe(&pr_review_bots_input, |this, _, event, cx| {
+            if matches!(event, InputEvent::Blur | InputEvent::PressEnter { .. }) {
+                this.apply_text_field(SettingField::PrReviewBots, cx);
+            }
+        });
         let branch_template_input = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder(format!("Enter to edit · Default: {DEFAULT_BRANCH_TEMPLATE}"))
@@ -753,6 +771,8 @@ impl SettingsView {
             milestone_states_input,
             repo_profiles_input,
             repo_profiles_error: None,
+            pr_review_bots_input,
+            pr_review_bots_error: None,
             branch_template_input,
             branch_template_error: None,
             agent_selects,
@@ -781,6 +801,7 @@ impl SettingsView {
             _relay_code_subscription,
             _milestone_states_subscription,
             _repo_profiles_subscription,
+            _pr_review_bots_subscription,
             _branch_template_subscription,
             _orchestrator_github_subscription,
             orchestrator_github_editor,
@@ -808,6 +829,30 @@ impl SettingsView {
         }
         self.settings.journeys.milestone_states = states;
         self.schedule_save("journeys.milestone_states", cx);
+        cx.notify();
+    }
+
+    /// Saves the review bots text, or says why it was not saved.
+    fn apply_pr_review_bots_input(&mut self, raw: String, cx: &mut Context<Self>) {
+        let parsed = PrReviewBotSettings::parse_list(&raw, &self.settings.pr_readiness.bots).and_then(|list| {
+            match list.iter().find(|b| tod_core::pr_readiness::builtin_bot(&b.name).is_none()) {
+                Some(unknown) => Err(format!(
+                    "\"{}\" is not a bot tod knows (greptile)",
+                    unknown.name
+                )),
+                None => Ok(list),
+            }
+        });
+        match parsed {
+            Ok(list) => {
+                self.pr_review_bots_error = None;
+                if self.settings.pr_readiness.bots != list {
+                    self.settings.pr_readiness.bots = list;
+                    self.schedule_save("pr_readiness.bots", cx);
+                }
+            }
+            Err(why) => self.pr_review_bots_error = Some(why),
+        }
         cx.notify();
     }
 
@@ -904,6 +949,7 @@ impl SettingsView {
                 SettingField::JourneysRelayCode => &self.relay_code_input,
                 SettingField::JourneysMilestoneStates => &self.milestone_states_input,
                 SettingField::LifecycleRepoProfiles => &self.repo_profiles_input,
+                SettingField::PrReviewBots => &self.pr_review_bots_input,
                 _ => return None,
             }
             .clone(),
@@ -1022,6 +1068,7 @@ impl SettingsView {
             }
             SettingField::JourneysMilestoneStates => self.apply_milestone_states_input(text, cx),
             SettingField::LifecycleRepoProfiles => self.apply_repo_profiles_input(text, cx),
+            SettingField::PrReviewBots => self.apply_pr_review_bots_input(text, cx),
             SettingField::BranchTemplate => self.apply_branch_template_input(text, cx),
             _ => {}
         }
@@ -1482,6 +1529,7 @@ impl SettingsView {
             | SettingField::JourneysSendTest
             | SettingField::JourneysMilestoneStates
             | SettingField::LifecycleRepoProfiles
+            | SettingField::PrReviewBots
             | SettingField::BranchTemplate
             | SettingField::ClaudeAdapter => {}
             SettingField::SandboxTerminalPark => self.step_sandbox_idle(
@@ -2770,6 +2818,18 @@ impl SettingsView {
                         None => "Comma-separated owner/repo=profile (also owner/* or *); the first match wins. release (default): a merged pull request waits for a published release naming it. merge: the repository publishes no releases, so merging is shipping.".to_string(),
                     },
                     &self.repo_profiles_input,
+                    theme,
+                ))
+                .child(text_input_row(
+                    cx,
+                    self,
+                    SettingField::PrReviewBots,
+                    "Review bots to wait for",
+                    match &self.pr_review_bots_error {
+                        Some(why) => format!("Not saved: {why}."),
+                        None => "Comma-separated name=minimum score (1 to 5), like greptile=4. In pr_draft and pr_review a pull request waits for the bot's review of its current head, and a score below the minimum is work for the PR agent. tod never asks the bot to review: that is your project's skill.".to_string(),
+                    },
+                    &self.pr_review_bots_input,
                     theme,
                 ))
                 .into_any_element(),
