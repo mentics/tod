@@ -54,33 +54,224 @@ pub fn configured(conn: &rusqlite::Connection, node: Uuid, state: &str) -> Resul
     Ok(lifecycle_config::resolve_checks(conn, node, key)?.map(|r| r.checks).unwrap_or_default())
 }
 
-/// What the files at `cwd` look like: for the repository and each submodule,
-/// its `HEAD`, its diff against `HEAD`, and its untracked files' contents.
-/// Equal fingerprints mean nothing a check could read has changed.
-pub fn fingerprint(cwd: &Workdir) -> Result<String> {
-    let mut repos = vec![cwd.clone()];
-    repos.extend(worktree::submodule_dirs(cwd).context("list the submodules")?);
+/// What one repository's files look like: its `HEAD`, its diff against
+/// `HEAD`, and its untracked files' contents.
+fn repo_fingerprint(repo: &Workdir) -> Result<String> {
     let mut hasher = Sha256::new();
-    for repo in &repos {
-        hasher.update(format!("repo {repo}\n"));
-        hasher.update(repo.git(&["rev-parse", "HEAD"]).with_context(|| format!("read HEAD in {repo}"))?);
-        let diff = repo.git_output(&["diff", "HEAD", "--binary", "--no-ext-diff"])?;
-        anyhow::ensure!(diff.status.success(), "git diff failed in {repo}: {}", String::from_utf8_lossy(&diff.stderr).trim());
-        hasher.update(&diff.stdout);
-        let listed = repo.git_output(&["ls-files", "-o", "--exclude-standard", "-z"])?;
-        anyhow::ensure!(listed.status.success(), "git ls-files failed in {repo}: {}", String::from_utf8_lossy(&listed.stderr).trim());
-        let files: Vec<&str> = listed.stdout.split(|b| *b == 0).filter(|f| !f.is_empty()).filter_map(|f| std::str::from_utf8(f).ok()).collect();
-        for chunk in files.chunks(200) {
-            let mut args = vec!["hash-object", "--"];
-            args.extend(chunk.iter().copied());
-            let hashed = repo.git_output(&args)?;
-            anyhow::ensure!(hashed.status.success(), "git hash-object failed in {repo}: {}", String::from_utf8_lossy(&hashed.stderr).trim());
-            for (name, hash) in chunk.iter().zip(String::from_utf8_lossy(&hashed.stdout).lines()) {
-                hasher.update(format!("{name} {hash}\n"));
+    hasher.update(repo.git(&["rev-parse", "HEAD"]).with_context(|| format!("read HEAD in {repo}"))?);
+    let diff = repo.git_output(&["diff", "HEAD", "--binary", "--no-ext-diff"])?;
+    anyhow::ensure!(diff.status.success(), "git diff failed in {repo}: {}", String::from_utf8_lossy(&diff.stderr).trim());
+    hasher.update(&diff.stdout);
+    let listed = repo.git_output(&["ls-files", "-o", "--exclude-standard", "-z"])?;
+    anyhow::ensure!(listed.status.success(), "git ls-files failed in {repo}: {}", String::from_utf8_lossy(&listed.stderr).trim());
+    let files: Vec<&str> = listed.stdout.split(|b| *b == 0).filter(|f| !f.is_empty()).filter_map(|f| std::str::from_utf8(f).ok()).collect();
+    for chunk in files.chunks(200) {
+        let mut args = vec!["hash-object", "--"];
+        args.extend(chunk.iter().copied());
+        let hashed = repo.git_output(&args)?;
+        anyhow::ensure!(hashed.status.success(), "git hash-object failed in {repo}: {}", String::from_utf8_lossy(&hashed.stderr).trim());
+        for (name, hash) in chunk.iter().zip(String::from_utf8_lossy(&hashed.stdout).lines()) {
+            hasher.update(format!("{name} {hash}\n"));
+        }
+    }
+    Ok(hex(&hasher.finalize()))
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// What the files at `cwd` look like: for the repository and each submodule,
+/// [`repo_fingerprint`]. Equal fingerprints mean nothing a check could read
+/// has changed.
+pub fn fingerprint(cwd: &Workdir) -> Result<String> {
+    Tree::new(cwd)?.fingerprint_all()
+}
+
+/// The repository at a node's files and its submodules, with what git says
+/// about each, read once however many checks ask.
+struct Tree {
+    /// `(path under the root, "" for the root; directory)`, parents first.
+    repos: Vec<(String, Workdir)>,
+    fingerprints: std::cell::RefCell<std::collections::HashMap<usize, String>>,
+    changes: std::cell::RefCell<std::collections::HashMap<usize, Changes>>,
+}
+
+/// What differs in one repository from where its branch left `origin`'s
+/// default branch: commits, uncommitted changes and untracked files. Paths
+/// are under the tree's root.
+#[derive(Clone, Default)]
+struct Changes {
+    /// Added, copied, modified, renamed or untracked: files that exist.
+    present: Vec<String>,
+    deleted: Vec<String>,
+}
+
+impl Tree {
+    fn new(cwd: &Workdir) -> Result<Self> {
+        let mut repos = vec![(String::new(), cwd.clone())];
+        for rel in worktree::submodule_paths(cwd).context("list the submodules")? {
+            let dir = cwd.join(&rel);
+            repos.push((rel, dir));
+        }
+        Ok(Self { repos, fingerprints: Default::default(), changes: Default::default() })
+    }
+
+    fn fingerprint_of(&self, index: usize) -> Result<String> {
+        if let Some(found) = self.fingerprints.borrow().get(&index) {
+            return Ok(found.clone());
+        }
+        let repo = &self.repos[index].1;
+        let fp = repo_fingerprint(repo)?;
+        self.fingerprints.borrow_mut().insert(index, fp.clone());
+        Ok(fp)
+    }
+
+    fn fingerprint_all(&self) -> Result<String> {
+        self.fingerprint_over(&(0..self.repos.len()).collect::<Vec<_>>(), "")
+    }
+
+    fn fingerprint_over(&self, indexes: &[usize], extra: &str) -> Result<String> {
+        let mut hasher = Sha256::new();
+        for &i in indexes {
+            hasher.update(format!("repo {}\n{}\n", self.repos[i].1, self.fingerprint_of(i)?));
+        }
+        hasher.update(extra);
+        Ok(hex(&hasher.finalize()))
+    }
+
+    /// The repositories a check scoped to `scope` depends on: those inside it,
+    /// and the one that holds it.
+    fn in_scope(&self, scope: &str) -> Vec<usize> {
+        if scope == "." {
+            return (0..self.repos.len()).collect();
+        }
+        let owner = (0..self.repos.len())
+            .filter(|&i| under(scope, &self.repos[i].0))
+            .max_by_key(|&i| self.repos[i].0.len());
+        (0..self.repos.len())
+            .filter(|&i| Some(i) == owner || (!self.repos[i].0.is_empty() && under(&self.repos[i].0, scope)))
+            .collect()
+    }
+
+    fn changes_of(&self, index: usize) -> Result<Changes> {
+        if let Some(found) = self.changes.borrow().get(&index) {
+            return Ok(found.clone());
+        }
+        let (rel, repo) = &self.repos[index];
+        let base = worktree::new_branch_base(repo).with_context(|| {
+            format!("no origin/HEAD, origin/main or origin/master in {repo}: cannot tell what this branch changed")
+        })?;
+        let merge_base = repo.git(&["merge-base", &base, "HEAD"]).with_context(|| format!("find where this branch left {base} in {repo}"))?;
+        let names = |args: &[&str]| -> Result<Vec<String>> {
+            let out = repo.git_output(args)?;
+            anyhow::ensure!(out.status.success(), "git {} failed in {repo}: {}", args[0], String::from_utf8_lossy(&out.stderr).trim());
+            Ok(out
+                .stdout
+                .split(|b| *b == 0)
+                .filter(|f| !f.is_empty())
+                .filter_map(|f| std::str::from_utf8(f).ok())
+                .map(|f| if rel.is_empty() { f.to_string() } else { format!("{rel}/{f}") })
+                .collect())
+        };
+        let mut present = names(&["diff", "--name-only", "-z", "--diff-filter=ACMRT", "--ignore-submodules=all", &merge_base])?;
+        present.extend(names(&["ls-files", "-o", "--exclude-standard", "-z"])?);
+        let deleted = names(&["diff", "--name-only", "-z", "--diff-filter=D", "--ignore-submodules=all", &merge_base])?;
+        let found = Changes { present, deleted };
+        self.changes.borrow_mut().insert(index, found.clone());
+        Ok(found)
+    }
+}
+
+/// Whether `path` is `prefix` or below it (`.` and blank hold everything).
+fn under(path: &str, prefix: &str) -> bool {
+    prefix.is_empty() || prefix == "." || path == prefix || path.strip_prefix(prefix).is_some_and(|rest| rest.starts_with('/'))
+}
+
+/// `*` (any run of characters, `/` included) and `?` against all of `text`.
+fn glob_match(pattern: &str, text: &str) -> bool {
+    let (p, t): (Vec<char>, Vec<char>) = (pattern.chars().collect(), text.chars().collect());
+    let (mut pi, mut ti, mut star, mut mark) = (0, 0, None, 0);
+    while ti < t.len() {
+        if pi < p.len() && (p[pi] == '?' || p[pi] == t[ti]) {
+            pi += 1;
+            ti += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star = Some(pi);
+            mark = ti;
+            pi += 1;
+        } else if let Some(s) = star {
+            pi = s + 1;
+            mark += 1;
+            ti = mark;
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
+    }
+    pi == p.len()
+}
+
+/// Whether a check applies to the tree as it is, with the files to hand it
+/// and the fingerprint its latest run is judged against.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Assessment {
+    applicable: bool,
+    /// Changed files under the check's directory that match its pattern,
+    /// relative to it, in order.
+    files: Vec<String>,
+    fingerprint: String,
+}
+
+fn assess(tree: &Tree, check: &Check) -> Result<Assessment> {
+    let scope = check.scope().to_string();
+    let indexes = tree.in_scope(&scope);
+    if !check.is_scoped() {
+        return Ok(Assessment { applicable: true, files: Vec::new(), fingerprint: tree.fingerprint_over(&indexes, "")? });
+    }
+    let patterns: Vec<&str> = check.pattern.split_whitespace().collect();
+    let dir = check.dir.trim();
+    let wanted = |path: &str| -> bool {
+        if !under(path, &scope) {
+            return false;
+        }
+        let rel = relative_to(path, dir);
+        patterns.is_empty() || patterns.iter().any(|g| glob_match(g, rel))
+    };
+    let (mut files, mut any) = (Vec::new(), false);
+    let mut seen = std::collections::BTreeSet::new();
+    let mut deleted = Vec::new();
+    for &i in &indexes {
+        let changes = tree.changes_of(i)?;
+        for path in changes.present {
+            if wanted(&path) && seen.insert(path.clone()) {
+                any = true;
+                if under(&path, dir) {
+                    files.push(relative_to(&path, dir).to_string());
+                }
+            }
+        }
+        for path in changes.deleted {
+            if wanted(&path) {
+                any = true;
+                deleted.push(path);
             }
         }
     }
-    Ok(hasher.finalize().iter().map(|b| format!("{b:02x}")).collect())
+    files.sort();
+    deleted.sort();
+    let extra = format!("files\n{}\ndeleted\n{}", files.join("\n"), deleted.join("\n"));
+    Ok(Assessment { applicable: any, files, fingerprint: tree.fingerprint_over(&indexes, &extra)? })
+}
+
+/// `path` below `dir` (the whole path when it is not).
+fn relative_to<'a>(path: &'a str, dir: &str) -> &'a str {
+    if dir.is_empty() || dir == "." {
+        return path;
+    }
+    path.strip_prefix(dir).and_then(|r| r.strip_prefix('/')).unwrap_or(path)
 }
 
 /// The end of `bytes` as text, at most [`OUTPUT_TAIL_BYTES`], cut on a line.
@@ -101,9 +292,9 @@ pub fn tail(bytes: &[u8]) -> String {
 /// Run one check at `cwd`: its command through the shell, stderr folded into
 /// stdout. Exit 0 passes, any other exit fails; a command that cannot be run
 /// or outlasts [`CHECK_TIMEOUT`] is broken.
-pub fn run_command(cwd: &Workdir, check: &Check) -> (Verdict, String) {
+pub fn run_command(cwd: &Workdir, check: &Check, files: &[String]) -> (Verdict, String) {
     // `exec 2>&1` makes one stream of what a person would see in a terminal.
-    let script = format!("exec 2>&1\n{}", check.command);
+    let script = format!("exec 2>&1\nexport TOD_CHANGED_FILES={}\n{}", shell_quote(&files.join("\n")), check.command);
     let result = match cwd {
         Workdir::Host(path) => {
             let mut command = std::process::Command::new("sh");
@@ -119,6 +310,11 @@ pub fn run_command(cwd: &Workdir, check: &Check) -> (Verdict, String) {
         Ok((None, out)) => (Verdict::Broken, format!("the command was stopped by a signal\n{}", tail(&out))),
         Err(err) => (Verdict::Broken, format!("{err:#}")),
     }
+}
+
+/// `text` as one single-quoted shell word.
+fn shell_quote(text: &str) -> String {
+    format!("'{}'", text.replace('\'', "'\\''"))
 }
 
 /// Run `script` in a dev container. The check is wrapped in the container's
@@ -192,7 +388,7 @@ impl Round {
     }
 
     pub fn clear(&self) -> bool {
-        self.runs.iter().all(|r| r.verdict == Verdict::Passed)
+        self.runs.iter().all(|r| matches!(r.verdict, Verdict::Passed | Verdict::Skipped))
     }
 }
 
@@ -208,20 +404,27 @@ pub fn run_stale(fleet: &FleetStore, node: Uuid, state: &str) -> Result<Round> {
     }
     let cwd = tod_store::fleet::provision::resolve_launch_cwd(fleet, &node.to_string())
         .with_context(|| format!("find the files to run the {state} checks in"))?;
-    let fingerprint = fingerprint(&cwd)?;
-    let mut round = Round { fingerprint: fingerprint.clone(), runs: Vec::new() };
+    let tree = Tree::new(&cwd)?;
+    let mut round = Round { fingerprint: tree.fingerprint_all()?, runs: Vec::new() };
     for check in &checks {
-        let latest = fleet.read(|conn| CheckRunRepo::new(conn).latest(node, key, &check.command))?;
+        let dir = clean_dir(&check.dir);
+        let assessment = assess(&tree, check)?;
+        let latest = fleet.read(|conn| CheckRunRepo::new(conn).latest(node, key, &dir, &check.command))?;
         let run = match latest {
-            Some(run) if run.fingerprint == fingerprint && run.label == check.label => run,
+            Some(run) if run.fingerprint == assessment.fingerprint && run.label == check.label => run,
             _ => {
-                let (verdict, output) = run_command(&cwd, check);
+                let (verdict, output) = if assessment.applicable {
+                    run_command(&cwd.join(&dir), check, &assessment.files)
+                } else {
+                    (Verdict::Skipped, format!("nothing changed in {}", check.scope()))
+                };
                 let run = CheckRun {
                     node_id: node,
                     phase: key.to_string(),
+                    dir,
                     command: check.command.clone(),
                     label: check.label.clone(),
-                    fingerprint: fingerprint.clone(),
+                    fingerprint: assessment.fingerprint,
                     verdict,
                     output,
                     ran_at: tod_store::check_runs::now(),
@@ -236,10 +439,15 @@ pub fn run_stale(fleet: &FleetStore, node: Uuid, state: &str) -> Result<Round> {
     Ok(round)
 }
 
+/// A check's directory as run keys hold it: `.` is the root, blank.
+fn clean_dir(dir: &str) -> String {
+    let dir = dir.trim();
+    if dir == "." { String::new() } else { dir.to_string() }
+}
+
 /// The name a run goes by in messages: its label, else its command.
-pub fn run_name(run: &CheckRun) -> &str {
-    let label = run.label.trim();
-    if label.is_empty() { run.command.trim() } else { label }
+pub fn run_name(run: &CheckRun) -> String {
+    lifecycle_config::display_name(&run.label, &run.command, &run.dir)
 }
 
 /// The gate criteria for the checks configured for `state`, answered from
@@ -250,21 +458,24 @@ pub fn gate_criteria(conn: &rusqlite::Connection, node: Uuid, state: &str, to: &
     let repo = CheckRunRepo::new(conn);
     let mut out = Vec::new();
     for (index, check) in configured(conn, node, state)?.into_iter().enumerate() {
-        let (outcome, detail) = match repo.latest(node, key, &check.command)? {
+        let dir = clean_dir(&check.dir);
+        let (outcome, detail) = match repo.latest(node, key, &dir, &check.command)? {
             None => (OUTCOME_FAIL, "has not run yet".to_string()),
             Some(run) => match run.verdict {
                 Verdict::Passed => (OUTCOME_PASS, String::new()),
                 Verdict::Failed => (OUTCOME_FAIL, format!("failed\n{}", run.output)),
                 Verdict::Broken => (OUTCOME_FAIL, format!("could not run: {}", run.output)),
+                // Nothing it is scoped to changed: not part of this gate.
+                Verdict::Skipped => continue,
             },
         };
         out.push(CriterionCheck {
             criterion: GateCriterion {
-                id: criterion_id(node, key, &check.command),
+                id: criterion_id(node, key, &dir, &check.command),
                 from_state: state.to_string(),
                 to_state: to.to_string(),
-                slug: format!("{SLUG_PREFIX}{}", slug(check.name())),
-                label: format!("Check: {}", check.name()),
+                slug: format!("{SLUG_PREFIX}{}", slug(&check.display())),
+                label: format!("Check: {}", check.display()),
                 sort_order: 1000 + index as i32,
                 active: true,
             },
@@ -280,8 +491,8 @@ pub fn is_check_criterion(criterion: &GateCriterion) -> bool {
     criterion.slug.starts_with(SLUG_PREFIX)
 }
 
-fn criterion_id(node: Uuid, phase: &str, command: &str) -> Uuid {
-    let digest = Sha256::digest(format!("check\0{node}\0{phase}\0{command}"));
+fn criterion_id(node: Uuid, phase: &str, dir: &str, command: &str) -> Uuid {
+    let digest = Sha256::digest(format!("check\0{node}\0{phase}\0{dir}\0{command}"));
     let mut bytes = [0u8; 16];
     bytes.copy_from_slice(&digest[..16]);
     Uuid::from_bytes(bytes)
@@ -313,7 +524,7 @@ pub fn record_findings(fleet: &FleetStore, node: Uuid, failed: &[&CheckRun]) -> 
     })?;
     let mut added = 0;
     for run in failed {
-        let summary = finding_summary(run_name(run));
+        let summary = finding_summary(&run_name(run));
         if open.contains(&summary) {
             continue;
         }
@@ -328,9 +539,10 @@ pub fn record_findings(fleet: &FleetStore, node: Uuid, failed: &[&CheckRun]) -> 
                     line: None,
                     summary,
                     detail: Some(format!(
-                        "The phase's check `{}` (`{}`) exited non-zero. Fix what it reports; the app runs it again after your change.\n\n{}",
+                        "The phase's check `{}` (`{}`{}) exited non-zero. Fix what it reports; the app runs it again after your change.\n\n{}",
                         run_name(run),
                         run.command,
+                        if run.dir.is_empty() { String::new() } else { format!(", run in `{}`", run.dir) },
                         run.output
                     )),
                 },
@@ -370,18 +582,18 @@ mod tests {
     fn a_check_passes_on_exit_zero_fails_otherwise_and_folds_stderr_in() {
         let dir = tempfile::tempdir().unwrap();
         let cwd = Workdir::host(dir.path());
-        let check = |command: &str| Check { label: String::new(), command: command.to_string() };
-        assert_eq!(run_command(&cwd, &check("echo fine")), (Verdict::Passed, "fine".to_string()));
-        assert_eq!(run_command(&cwd, &check("echo bad >&2; exit 3")), (Verdict::Failed, "bad".to_string()));
+        let check = |command: &str| Check { command: command.to_string(), ..Check::default() };
+        assert_eq!(run_command(&cwd, &check("echo fine"), &[]), (Verdict::Passed, "fine".to_string()));
+        assert_eq!(run_command(&cwd, &check("echo bad >&2; exit 3"), &[]), (Verdict::Failed, "bad".to_string()));
         // Output on success is kept too, and a missing command is a failure of the
         // command (exit 127), not of running it.
-        assert_eq!(run_command(&cwd, &check("no-such-command-here")).0, Verdict::Failed);
+        assert_eq!(run_command(&cwd, &check("no-such-command-here"), &[]).0, Verdict::Failed);
     }
 
     #[test]
     fn a_missing_directory_is_broken_not_failed() {
         let cwd = Workdir::host("/no/such/dir/for/checks");
-        let (verdict, why) = run_command(&cwd, &Check { label: String::new(), command: "true".to_string() });
+        let (verdict, why) = run_command(&cwd, &Check { command: "true".to_string(), ..Check::default() }, &[]);
         assert_eq!(verdict, Verdict::Broken, "{why}");
     }
 
@@ -403,5 +615,109 @@ mod tests {
         let committed = fingerprint(&cwd).unwrap();
         std::fs::write(dir.path().join("new.txt"), "three").unwrap();
         assert_ne!(committed, fingerprint(&cwd).unwrap(), "an edit to a tracked file counts");
+    }
+
+    fn commit(cwd: &Workdir, message: &str) {
+        cwd.git(&["add", "-A"]).unwrap();
+        cwd.git(&["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "-m", message]).unwrap();
+    }
+
+    /// A repository whose `origin/main` is its first commit, with `a/x.py`,
+    /// `a/y.txt` and `b/z.py`.
+    fn base_repo() -> (tempfile::TempDir, Workdir) {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = Workdir::host(dir.path());
+        cwd.git(&["init", "-q", "-b", "main"]).unwrap();
+        for f in ["a/x.py", "a/y.txt", "b/z.py"] {
+            std::fs::create_dir_all(dir.path().join(f).parent().unwrap()).unwrap();
+            std::fs::write(dir.path().join(f), "1").unwrap();
+        }
+        commit(&cwd, "first");
+        cwd.git(&["update-ref", "refs/remotes/origin/main", "HEAD"]).unwrap();
+        (dir, cwd)
+    }
+
+    fn scoped(dir: &str, changed: &str, pattern: &str) -> Check {
+        Check { command: "true".into(), dir: dir.into(), changed: changed.into(), pattern: pattern.into(), ..Check::default() }
+    }
+
+    #[test]
+    fn globs_match_whole_paths_with_star_crossing_directories() {
+        assert!(glob_match("*.py", "x.py"));
+        assert!(glob_match("*.py", "pkg/sub/x.py"));
+        assert!(!glob_match("*.py", "x.pyc"));
+        assert!(glob_match("src/*.ts", "src/a/b.ts"));
+        assert!(glob_match("?.md", "a.md"));
+        assert!(!glob_match("?.md", "ab.md"));
+    }
+
+    #[test]
+    fn a_scoped_check_applies_only_when_its_path_and_pattern_saw_a_change() {
+        let (dir, cwd) = base_repo();
+        let tree = || Tree::new(&cwd).unwrap();
+        // Nothing changed since origin/main: scoped checks do not apply, an unscoped one does.
+        assert!(!assess(&tree(), &scoped("a", "", "")).unwrap().applicable);
+        assert!(assess(&tree(), &scoped("", "", "")).unwrap().applicable);
+
+        // A committed change and an uncommitted one in `a`, an untracked one in `b`.
+        std::fs::write(dir.path().join("a/x.py"), "2").unwrap();
+        commit(&cwd, "edit x");
+        std::fs::write(dir.path().join("a/y.txt"), "2").unwrap();
+        std::fs::write(dir.path().join("b/new.py"), "1").unwrap();
+
+        let a = assess(&tree(), &scoped("a", "", "")).unwrap();
+        assert!(a.applicable);
+        assert_eq!(a.files, ["x.py", "y.txt"], "relative to the check's directory");
+        let a_py = assess(&tree(), &scoped("a", "", "*.py")).unwrap();
+        assert_eq!(a_py.files, ["x.py"]);
+        let b = assess(&tree(), &scoped("b", "", "*.py")).unwrap();
+        assert_eq!(b.files, ["new.py"], "an untracked file counts");
+        // A pattern with no match in the scope: not applicable.
+        assert!(!assess(&tree(), &scoped("b", "", "*.rs")).unwrap().applicable);
+        // `changed` overrides `dir` as the scope.
+        let wide = assess(&tree(), &scoped("a", ".", "*.py")).unwrap();
+        assert_eq!(wide.files, ["x.py"], "files outside the directory apply the check but are not handed to it");
+        assert!(wide.applicable);
+
+        // A deletion applies a check and is not handed over as a file.
+        std::fs::remove_file(dir.path().join("b/z.py")).unwrap();
+        let b = assess(&tree(), &scoped("b", "", "*.py")).unwrap();
+        assert!(b.applicable);
+        assert_eq!(b.files, ["new.py"]);
+    }
+
+    #[test]
+    fn a_checks_fingerprint_moves_only_with_what_it_reads() {
+        let (dir, cwd) = base_repo();
+        std::fs::write(dir.path().join("a/x.py"), "2").unwrap();
+        let before = assess(&Tree::new(&cwd).unwrap(), &scoped("a", "", "*.py")).unwrap();
+        // Same files for the check: same fingerprint, even with the check's own repo edited elsewhere
+        // only if the file list is unchanged and the repo is not (one repository here, so it moves).
+        assert_eq!(before, assess(&Tree::new(&cwd).unwrap(), &scoped("a", "", "*.py")).unwrap());
+        std::fs::write(dir.path().join("a/x.py"), "3").unwrap();
+        let after = assess(&Tree::new(&cwd).unwrap(), &scoped("a", "", "*.py")).unwrap();
+        assert_ne!(before.fingerprint, after.fingerprint);
+    }
+
+    #[test]
+    fn without_an_origin_default_branch_a_scoped_check_errors_instead_of_guessing() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = Workdir::host(dir.path());
+        cwd.git(&["init", "-q", "-b", "main"]).unwrap();
+        std::fs::write(dir.path().join("f"), "1").unwrap();
+        commit(&cwd, "first");
+        let err = assess(&Tree::new(&cwd).unwrap(), &scoped("a", "", "")).unwrap_err();
+        assert!(format!("{err:#}").contains("origin"), "{err:#}");
+        // An unscoped check needs no base.
+        assert!(assess(&Tree::new(&cwd).unwrap(), &scoped("", "", "")).unwrap().applicable);
+    }
+
+    #[test]
+    fn changed_files_reach_the_command_as_one_quoted_variable() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = Workdir::host(dir.path());
+        let check = Check { command: "printf '%s' \"$TOD_CHANGED_FILES\"".into(), ..Check::default() };
+        let files = vec!["a b.py".to_string(), "it's.py".to_string()];
+        assert_eq!(run_command(&cwd, &check, &files), (Verdict::Passed, "a b.py\nit's.py".to_string()));
     }
 }

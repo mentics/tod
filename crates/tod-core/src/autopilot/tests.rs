@@ -2478,7 +2478,7 @@ fn with_check(fx: &Fixture, phase: &str, label: &str, command: &str) -> PathBuf 
             node_id: fx.node,
             checks: [(
                 phase.to_string(),
-                vec![tod_store::lifecycle_config::Check { label: label.into(), command: command.into() }],
+                vec![tod_store::lifecycle_config::Check { label: label.into(), command: command.into(), ..Default::default() }],
             )]
             .into(),
         })
@@ -2508,7 +2508,7 @@ fn a_failing_check_goes_to_the_fix_agent_as_a_finding_and_a_change_reruns_it() {
     // And it passes now, on the files the fix left.
     let run = fx
         .fleet
-        .read(|conn| tod_store::check_runs::CheckRunRepo::new(conn).latest(fx.node, "review", "test -f ok.txt || { echo 'ok.txt is missing'; exit 1; }"))
+        .read(|conn| tod_store::check_runs::CheckRunRepo::new(conn).latest(fx.node, "review", "", "test -f ok.txt || { echo 'ok.txt is missing'; exit 1; }"))
         .unwrap()
         .unwrap();
     assert_eq!(run.verdict, tod_store::check_runs::Verdict::Passed);

@@ -663,7 +663,7 @@ latest results in `check_runs`; `doc/lifecycle/checks.md`) are per-phase command
 command) the app runs in the node's Files directory; exit 0 passes. Each is a gate
 criterion of its phase, and the autopilot's `checks_round` runs the stale ones (keyed by a
 fingerprint of the files, committed or not) and sends failures to the Fix protocol as
-findings (in a phase-agent state the failing gate re-runs the phase agent instead, with the output in its gate status), bounded by `review_round_limit`. `tod-cli` cannot set them: the app runs the
+findings (in a phase-agent state the failing gate re-runs the phase agent instead, with the output in its gate status), bounded by `review_round_limit`. A check may be scoped (`dir`, `changed`, `pattern`): it applies only when that part of the tree changed on the branch, and is otherwise `skipped`, not in the gate. `tod-cli` cannot set them: the app runs the
 command, so only the user configures one.
 
 **Groups** (`Capability::Groups`, `tod_store::groups`, table `node_groups`)

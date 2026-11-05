@@ -2986,7 +2986,7 @@ fn checks_resolve_per_phase_from_the_nearest_node_and_survive_other_saves() {
         .enqueue_outline(OutlineMutation::EnableCapabilities { node_id: top, capabilities: vec![Capability::LifecycleConfig] })
         .unwrap();
     store.writer().flush().unwrap();
-    let check = |label: &str, command: &str| Check { label: label.into(), command: command.into() };
+    let check = |label: &str, command: &str| Check { label: label.into(), command: command.into(), ..Default::default() };
     let set = |node, phase: &str, list: Vec<Check>| {
         store
             .enqueue_outline(OutlineMutation::SetNodeLifecycleChecks { node_id: node, checks: [(phase.to_string(), list)].into() })

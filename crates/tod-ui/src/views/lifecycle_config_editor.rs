@@ -76,6 +76,9 @@ struct Form {
 struct CheckRow {
     label: Entity<InputState>,
     command: Entity<InputState>,
+    dir: Entity<InputState>,
+    changed: Entity<InputState>,
+    pattern: Entity<InputState>,
 }
 
 /// The label a phase is shown under.
@@ -260,31 +263,34 @@ impl LifecycleConfigEditor {
         let checks = self
             .own_checks
             .get(phase)
-            .map(|list| list.iter().map(|c| Self::check_row(&c.label, &c.command, window, cx)).collect())
+            .map(|list| list.iter().map(|c| Self::check_row(c, window, cx)).collect())
             .unwrap_or_default();
         self.form = Some(Form { phase, skills, model, effort, checks, saving: false });
         self.error = None;
         cx.notify();
     }
 
-    fn check_row(label: &str, command: &str, window: &mut Window, cx: &mut Context<Self>) -> CheckRow {
-        let (label, command) = (label.to_string(), command.to_string());
+    fn check_row(check: &Check, window: &mut Window, cx: &mut Context<Self>) -> CheckRow {
+        let mut input = |placeholder: &str, value: &str, cx: &mut Context<Self>| {
+            let value = value.to_string();
+            let placeholder = placeholder.to_string();
+            cx.new(|cx| {
+                let mut state = InputState::new(window, cx).placeholder(placeholder);
+                state.set_value(value, window, cx);
+                state
+            })
+        };
         CheckRow {
-            label: cx.new(|cx| {
-                let mut state = InputState::new(window, cx).placeholder("label (optional)");
-                state.set_value(label, window, cx);
-                state
-            }),
-            command: cx.new(|cx| {
-                let mut state = InputState::new(window, cx).placeholder("command, run in the node's files (exit 0 passes)");
-                state.set_value(command, window, cx);
-                state
-            }),
+            label: input("label (optional)", &check.label, cx),
+            command: input("command (exit 0 passes)", &check.command, cx),
+            dir: input("run in (e.g. flagship)", &check.dir, cx),
+            changed: input("only if changed (default: run in)", &check.changed, cx),
+            pattern: input("files (e.g. *.py)", &check.pattern, cx),
         }
     }
 
     fn add_check_row(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let row = Self::check_row("", "", window, cx);
+        let row = Self::check_row(&Check::default(), window, cx);
         if let Some(form) = self.form.as_mut() {
             form.checks.push(row);
         }
@@ -419,11 +425,18 @@ impl LifecycleConfigEditor {
         let mut checks = Vec::new();
         for row in &form.checks {
             let (label, command) = (field(&row.label), field(&row.command));
+            let scope = [field(&row.dir), field(&row.changed), field(&row.pattern)];
             match (label, command) {
-                (None, None) => {}
-                (label, Some(command)) => checks.push(Check { label: label.unwrap_or_default(), command }),
-                (Some(label), None) => {
-                    self.error = Some(format!("the check `{label}` has no command"));
+                (None, None) if scope.iter().all(Option::is_none) => {}
+                (label, Some(command)) => checks.push(Check {
+                    label: label.unwrap_or_default(),
+                    command,
+                    dir: scope[0].clone().unwrap_or_default(),
+                    changed: scope[1].clone().unwrap_or_default(),
+                    pattern: scope[2].clone().unwrap_or_default(),
+                }),
+                (label, None) => {
+                    self.error = Some(format!("the check `{}` has no command", label.unwrap_or_default()));
                     cx.notify();
                     return;
                 }
@@ -663,18 +676,31 @@ impl LifecycleConfigEditor {
             )
             .child(div().text_xs().font_semibold().child("Checks"))
             .children(form.checks.iter().enumerate().map(|(i, row)| {
-                h_flex()
-                    .gap_2()
+                v_flex()
+                    .gap_1()
                     .w_full()
-                    .items_center()
-                    .child(div().w_40().child(Input::new(&row.label)))
-                    .child(div().flex_1().child(Input::new(&row.command)))
                     .child(
-                        Button::new(("lc-check-remove", i))
-                            .label("Remove")
-                            .ghost()
-                            .compact()
-                            .on_click(cx.listener(move |this, _, _, cx| this.remove_check_row(i, cx))),
+                        h_flex()
+                            .gap_2()
+                            .w_full()
+                            .items_center()
+                            .child(div().w_40().child(Input::new(&row.label)))
+                            .child(div().flex_1().child(Input::new(&row.command)))
+                            .child(
+                                Button::new(("lc-check-remove", i))
+                                    .label("Remove")
+                                    .ghost()
+                                    .compact()
+                                    .on_click(cx.listener(move |this, _, _, cx| this.remove_check_row(i, cx))),
+                            ),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .w_full()
+                            .child(div().flex_1().child(Input::new(&row.dir)))
+                            .child(div().flex_1().child(Input::new(&row.changed)))
+                            .child(div().flex_1().child(Input::new(&row.pattern))),
                     )
             }))
             .child(
@@ -689,8 +715,11 @@ impl LifecycleConfigEditor {
             .child(div().text_xs().text_color(cx.theme().muted_foreground).child(
                 "Commands (type checking, lint, tests) the app runs in the node's files before this phase's gate \
                  and again after every change. A command that exits 0 passes; any other exit fails, and its \
-                 output goes to the fix agent. The label names it in messages. With none listed here, the \
-                 inherited checks apply.",
+                 output goes to the fix agent. The label names it in messages. \"Run in\" is a directory under \
+                 the node's files (a submodule, say); \"only if changed\" (default: the same directory) and \
+                 \"files\" make the check apply only when a matching file there changed on this branch, \
+                 committed or not, and hand those files to the command as $TOD_CHANGED_FILES, one per line. \
+                 With none listed here, the inherited checks apply.",
             ))
             .child(
                 h_flex()
