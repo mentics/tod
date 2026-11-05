@@ -442,6 +442,22 @@ impl<'a> ConversationRepo<'a> {
             .max(0) as usize)
     }
 
+    /// Record, on a turn, what was sent with its text besides the text.
+    pub fn set_turn_sent_context(
+        &self,
+        conversation_id: Uuid,
+        seq: i64,
+        sent_context: &str,
+    ) -> Result<()> {
+        let n = self.conn.execute(
+            "UPDATE conversation_turns SET sent_context = ?1
+             WHERE conversation_id = ?2 AND seq = ?3",
+            params![sent_context, uuid_to_blob(conversation_id), seq],
+        )?;
+        anyhow::ensure!(n == 1, "turn {seq} of conversation {conversation_id} not found");
+        Ok(())
+    }
+
     /// Record the context the conversation's first turn sent.
     pub fn set_opening_context(&self, conversation_id: Uuid, context: &str) -> Result<()> {
         let n = self.conn.execute(

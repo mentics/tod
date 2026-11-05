@@ -584,7 +584,7 @@ fn a_send_with_a_delta_stores_it_as_sent_context_on_the_user_turn() {
     );
     let id = driver.conversation_id().unwrap();
 
-    // The first (opening) turn carries no delta: nothing came before it.
+    // The first turn carries the opening context, not a delta.
     let first = fx
         .fleet
         .read(|conn| ConversationRepo::new(conn).turns(id))
@@ -592,7 +592,7 @@ fn a_send_with_a_delta_stores_it_as_sent_context_on_the_user_turn() {
         .into_iter()
         .find(|t| t.role == TurnRole::User)
         .unwrap();
-    assert_eq!(first.sent_context, None);
+    assert!(first.sent_context.is_some_and(|c| !c.is_empty()));
 
     let change = fx
         .fleet

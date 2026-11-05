@@ -603,6 +603,7 @@ impl AgentTranscriptsView {
             summary: None,
             live: false,
             images: Vec::new(),
+            context: None,
         });
         let read_error = self.read_error.iter().map(|err| Entry {
             kind: EntryKind::Error,
@@ -612,6 +613,7 @@ impl AgentTranscriptsView {
             summary: None,
             live: false,
             images: Vec::new(),
+            context: None,
         });
         format_problems
             .into_iter()
@@ -1042,6 +1044,7 @@ fn entry_of_turn(turn: &TranscriptTurn) -> Entry {
         summary: None,
         live: false,
         images: Vec::new(),
+        context: None,
     }
 }
 

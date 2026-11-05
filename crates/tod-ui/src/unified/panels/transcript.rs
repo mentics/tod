@@ -60,6 +60,7 @@ fn entry_of(turn: &Turn, root: &std::path::Path) -> Entry {
         summary: None,
         live: false,
         images: turn.attachments.iter().map(|a| a.path(root)).collect(),
+        context: turn.sent_context.clone().filter(|c| !c.trim().is_empty()),
     }
 }
 

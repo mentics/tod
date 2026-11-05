@@ -196,6 +196,14 @@ pub enum InterviewCommand {
         conversation_id: Uuid,
         context: String,
     },
+    /// Record, on a user turn, everything sent with the user's text that was
+    /// not the text itself (the opening context or rotation snapshot, and the
+    /// delta).
+    SetConversationTurnSentContext {
+        conversation_id: Uuid,
+        seq: i64,
+        sent_context: String,
+    },
     /// A user edit made from the conversation view: recorded as the user's
     /// action, and it clears the item's unsure flag.
     ConversationEdit {
@@ -994,6 +1002,18 @@ pub fn execute(
                 *conversation_id,
                 agent_session_id.as_deref(),
                 session_name.as_deref(),
+            )?;
+            Ok(json!({}))
+        }
+        InterviewCommand::SetConversationTurnSentContext {
+            conversation_id,
+            seq,
+            sent_context,
+        } => {
+            crate::conversation::ConversationRepo::new(conn).set_turn_sent_context(
+                *conversation_id,
+                *seq,
+                sent_context,
             )?;
             Ok(json!({}))
         }
