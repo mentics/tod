@@ -1020,6 +1020,7 @@ impl TaskPanel {
             A::Pause => self.pause_run(cx),
             A::StopNow => self.stop_run(run, slot, cx),
             A::CheckNow => self.check_now(cx),
+            A::RerunPhase => self.rerun_phase(cx),
             // A submenu of the locations: choosing one is `choose_migration`.
             A::MigrateTo => self.runners.update(cx, |r, cx| {
                 r.fail(node, "Migrate to… needs a location: pick one from its submenu".into(), cx)
@@ -1086,6 +1087,27 @@ impl TaskPanel {
                     this.on_cloud_update(node, update, cx)
                 });
             }
+        }
+    }
+
+    /// Rerun this phase: a new stay in the node's current state (so it
+    /// behaves as if just entered), then the runner starts in a new session.
+    fn rerun_phase(&mut self, cx: &mut Context<Self>) {
+        let node = self.node_id;
+        if let Err(err) = tod_core::lifecycle::restart_stay(&self.fleet, node) {
+            self.runners.update(cx, |r, cx| r.fail(node, format!("{err:#}"), cx));
+            return;
+        }
+        if self.runner.supervised {
+            self.supervised_go(Some(tod_core::cloud_sync::REQUEST_FRESH_SESSION), cx);
+            return;
+        }
+        let root = self.fleet.paths().root().to_path_buf();
+        match tod_core::autopilot::AutopilotState::request_rerun_phase(&root, node) {
+            Ok(()) => {
+                let _ = self.runners.update(cx, |r, cx| r.start(node, false, cx));
+            }
+            Err(err) => self.runners.update(cx, |r, cx| r.fail(node, format!("{err:#}"), cx)),
         }
     }
 

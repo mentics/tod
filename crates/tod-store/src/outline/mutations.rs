@@ -325,6 +325,11 @@ pub enum OutlineMutation {
         node_id: Uuid,
         state: String,
     },
+    /// Start a new stay in the node's current lifecycle state: the state is
+    /// run again as if just entered (`NodeRepo::restart_stay`).
+    RestartLifecycleStay {
+        node_id: Uuid,
+    },
     /// Persist per-criterion gate outcomes — from an agent's gate-check reply
     /// or a human's manual waive/override — and, when the check passed,
     /// advance the node's lifecycle in the same mutation.
@@ -489,6 +494,7 @@ impl OutlineMutation {
                 | OutlineMutation::UnlinkPlanStepObligation { .. }
                 | OutlineMutation::SetExtraContent { .. }
                 | OutlineMutation::SetLifecycle { .. }
+                | OutlineMutation::RestartLifecycleStay { .. }
                 | OutlineMutation::ApplyGateResults { .. }
                 | OutlineMutation::SetGeneratorConfig { .. }
                 | OutlineMutation::DeleteGeneratorConfig { .. }
@@ -900,6 +906,9 @@ impl OutlineMutation {
             }
             OutlineMutation::SetLifecycle { node_id, state } => {
                 NodeRepo::new(conn).set_lifecycle(*node_id, state)?;
+            }
+            OutlineMutation::RestartLifecycleStay { node_id } => {
+                NodeRepo::new(conn).restart_stay(*node_id)?;
             }
             OutlineMutation::ApplyGateResults {
                 node_id,
