@@ -12,7 +12,6 @@ pub use tod_integration::{
     ConfigField, ConfigFieldType, ConfigSchema, CredentialRequirement, FilterPreset,
     delete_preset, load_presets, rename_preset, save_preset,
 };
-use tod_store::credentials::{CredentialStore, resolve_linear_api_key};
 use tod_store::fleet::FleetStore;
 use tod_store::outline::repos::generator::copy_title;
 use tod_store::outline::repos::{GeneratorRepo, NodeRepo, OutlineRepo};
@@ -199,30 +198,28 @@ struct ExistingManaged {
     user_modified_fields: Vec<String>,
 }
 
-/// Resolve a credential value for one of a data source's declared
-/// [`CredentialRequirement`]s. Only `linear_api_key` is backed by real
-/// storage today; unknown keys resolve to `None` (the data source itself
-/// decides whether that is fatal, via [`DataSource::fetch`]).
-fn resolve_credential(
-    store: &CredentialStore,
-    requirement: &CredentialRequirement,
-) -> Option<String> {
-    match requirement.key.as_str() {
-        CREDENTIAL_LINEAR_API_KEY => resolve_linear_api_key(store),
-        _ => None,
-    }
-}
-
+/// Resolve the credentials a data source declares, for the generator `node`.
+/// `linear_api_key` is the node's Environment secret of that name, from the
+/// node or the nearest ancestor that defines it; unknown keys resolve to
+/// nothing (the data source itself decides whether that is fatal, via
+/// [`DataSource::fetch`]). A store that cannot be read is an error, never a
+/// missing key.
 fn resolve_credentials(
-    data_root: &std::path::Path,
+    fleet: &FleetStore,
+    node: Uuid,
     data_source: &dyn DataSource,
-) -> HashMap<String, String> {
-    let store = CredentialStore::from_data_root(data_root);
-    data_source
-        .credential_requirements()
-        .iter()
-        .filter_map(|req| resolve_credential(&store, req).map(|value| (req.key.clone(), value)))
-        .collect()
+) -> Result<HashMap<String, String>, RefreshError> {
+    let mut out = HashMap::new();
+    for req in data_source.credential_requirements() {
+        if req.key == CREDENTIAL_LINEAR_API_KEY {
+            let key = tod_store::environment::linear_api_key_for(fleet, node)
+                .map_err(|err| RefreshError::Other(format!("could not read the Linear API key: {err:#}")))?;
+            if let Some(value) = key {
+                out.insert(req.key.clone(), value);
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Credential requirements a data source declares that have no resolved
@@ -327,7 +324,7 @@ pub fn refresh_generator(fleet: &FleetStore, node_id: Uuid) -> Result<Vec<Uuid>,
                 config.data_source_type
             ))
         })?;
-    let credentials = resolve_credentials(data_root, data_source.as_ref());
+    let credentials = resolve_credentials(fleet, node_id, data_source.as_ref())?;
 
     let missing = missing_credentials(data_source.as_ref(), &credentials);
     if !missing.is_empty() {
@@ -1668,6 +1665,101 @@ mod tests {
             1,
             "refresh proceeds once credentials are present"
         );
+
+        drop(fleet);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// A plain node: a child of `parent`, or top level.
+    fn create_child(fleet: &FleetStore, list_id: Uuid, parent: Option<Uuid>, title: &str) -> Uuid {
+        let node_id = Uuid::new_v4();
+        fleet
+            .enqueue_outline(OutlineMutation::CreateNode {
+                node_id: Some(node_id),
+                list_id,
+                parent_id: parent,
+                anchor_id: None,
+                position: if parent.is_some() { CreatePosition::Child } else { CreatePosition::Below },
+                title: title.into(),
+            })
+            .unwrap();
+        fleet.writer().flush().unwrap();
+        node_id
+    }
+
+    /// The Linear key is a secret in a node's Environment: a node below it
+    /// uses it, a nearer definition wins, and a node elsewhere has none.
+    #[test]
+    fn linear_key_comes_from_the_nearest_environment() {
+        use tod_store::environment::{linear_api_key_for, store_linear_api_key};
+
+        let (root, fleet) = setup();
+        let list_id = fleet.list_outline_lists().unwrap()[0].id;
+        let top = create_child(&fleet, list_id, None, "Top");
+        let group = create_child(&fleet, list_id, Some(top), "Group");
+        let leaf = create_child(&fleet, list_id, Some(group), "Leaf");
+        let other = create_child(&fleet, list_id, None, "Other");
+
+        assert_eq!(linear_api_key_for(&fleet, leaf).unwrap(), None);
+
+        // Stored on an ancestor that has no Environment yet: the capability
+        // is enabled there, and everything below inherits the key.
+        store_linear_api_key(&fleet, &root, top, "lin_top").unwrap();
+        assert_eq!(linear_api_key_for(&fleet, leaf).unwrap().as_deref(), Some("lin_top"));
+        assert_eq!(linear_api_key_for(&fleet, top).unwrap().as_deref(), Some("lin_top"));
+        assert_eq!(linear_api_key_for(&fleet, other).unwrap(), None);
+
+        // A nearer definition wins for its subtree only.
+        store_linear_api_key(&fleet, &root, group, "lin_group").unwrap();
+        assert_eq!(linear_api_key_for(&fleet, leaf).unwrap().as_deref(), Some("lin_group"));
+        assert_eq!(linear_api_key_for(&fleet, top).unwrap().as_deref(), Some("lin_top"));
+
+        // Storing again replaces the value without duplicating the entry.
+        store_linear_api_key(&fleet, &root, group, "lin_group2").unwrap();
+        assert_eq!(linear_api_key_for(&fleet, leaf).unwrap().as_deref(), Some("lin_group2"));
+        let entries = fleet
+            .read(|conn| tod_store::environment::entries(conn, group))
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].preset.as_deref(), Some("linear"));
+
+        // The picker's candidates: the node, then its ancestors.
+        let chain = fleet
+            .read(|conn| tod_store::environment::ancestry(conn, leaf))
+            .unwrap();
+        assert_eq!(chain, vec![leaf, group, top]);
+
+        drop(fleet);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// A generator refresh finds the key in an ancestor's Environment, and
+    /// reports it missing, not unreadable, where none is defined.
+    #[test]
+    fn generator_credentials_come_from_the_environment() {
+        let (root, fleet) = setup();
+        let list_id = fleet.list_outline_lists().unwrap()[0].id;
+        let top = create_child(&fleet, list_id, None, "Top");
+        let generator = create_child(&fleet, list_id, Some(top), "Generator below");
+        fleet
+            .enqueue_outline(OutlineMutation::EnableCapabilities {
+                node_id: generator,
+                capabilities: vec![Capability::Generator],
+            })
+            .unwrap();
+        fleet.writer().flush().unwrap();
+        let ds = MockDataSource::new().with_credentials(vec![CredentialRequirement {
+            key: CREDENTIAL_LINEAR_API_KEY.into(),
+            label: "Linear API key".into(),
+        }]);
+
+        let none = resolve_credentials(&fleet, generator, &ds).unwrap();
+        assert_eq!(missing_credentials(&ds, &none).len(), 1);
+
+        tod_store::environment::store_linear_api_key(&fleet, &root, top, "lin_top").unwrap();
+        let found = resolve_credentials(&fleet, generator, &ds).unwrap();
+        assert_eq!(found.get(CREDENTIAL_LINEAR_API_KEY).map(String::as_str), Some("lin_top"));
+        assert!(missing_credentials(&ds, &found).is_empty());
 
         drop(fleet);
         let _ = fs::remove_dir_all(root);

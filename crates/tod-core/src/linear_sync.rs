@@ -12,7 +12,7 @@
 //! failure is logged; the next milestone tries again.
 
 use crate::linear_import::parse_ticket_reference;
-use tod_store::credentials::{CredentialStore, resolve_linear_api_key};
+use tod_store::credentials::CredentialStore;
 use tod_store::fleet::FleetStore;
 use tod_store::linear::StateGoal;
 use uuid::Uuid;
@@ -62,12 +62,7 @@ pub fn push(fleet: &FleetStore, node: Uuid, milestone: Milestone) {
     let Some(ticket) = task.ticket.as_deref().and_then(parse_ticket_reference) else {
         return;
     };
-    push_ticket(fleet, ticket, milestone);
-}
-
-/// [`push`] for a ticket already known, e.g. the source of an accepted copy.
-pub fn push_ticket(fleet: &FleetStore, ticket: String, milestone: Milestone) {
-    spawn_sync(fleet, ticket, milestone, false);
+    spawn_sync(fleet, node, ticket, milestone, false);
 }
 
 /// The user accepted `node`'s ticket: [`push`] to [`Milestone::Accepted`], and
@@ -79,13 +74,24 @@ pub fn accept(fleet: &FleetStore, node: Uuid) {
     let Some(ticket) = task.ticket.as_deref().and_then(parse_ticket_reference) else {
         return;
     };
-    spawn_sync(fleet, ticket, Milestone::Accepted, true);
+    spawn_sync(fleet, node, ticket, Milestone::Accepted, true);
 }
 
-fn spawn_sync(fleet: &FleetStore, ticket: String, milestone: Milestone, assign: bool) {
+/// The key is the one in `node`'s Environment (its own or an ancestor's). The
+/// entries are read here, a cheap query; the value comes from the credential
+/// store (the OS keyring) on the thread that goes to Linear.
+fn spawn_sync(fleet: &FleetStore, node: Uuid, ticket: String, milestone: Milestone, assign: bool) {
     let root = fleet.paths().root().to_path_buf();
+    let resolved = match fleet.read(|conn| tod_store::environment::resolve(conn, node)) {
+        Ok(resolved) => resolved,
+        Err(err) => {
+            tracing::warn!(%ticket, "Linear ticket not updated: could not read the environment: {err:#}");
+            return;
+        }
+    };
     let spawned = std::thread::Builder::new().name("tod-linear-sync".into()).spawn(move || {
-        let Some(key) = resolve_linear_api_key(&CredentialStore::from_data_root(&root)) else {
+        let Some(key) = tod_store::environment::linear_api_key(&resolved, &CredentialStore::from_data_root(&root))
+        else {
             return;
         };
         match tod_store::linear::ensure_state_at_least(&key, &ticket, &milestone.goal()) {

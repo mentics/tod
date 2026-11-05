@@ -62,8 +62,12 @@ pub fn run(inv: Invocation) -> anyhow::Result<String> {
 
 fn list(inv: &Invocation, store: &CredentialStore) -> String {
     // A secret the sandbox's proxy injects is set, though never here.
+    let entries = environment_entries(inv);
+    // An Environment entry of the same name stands in for tod's own kind
+    // (`resolve_value` reads it first), so the kind is not listed twice.
     let rows: Vec<(CredentialKind, bool, bool)> = CredentialKind::ALL
         .into_iter()
+        .filter(|kind| !entries.iter().any(|r| r.entry.name.eq_ignore_ascii_case(kind.name())))
         .map(|kind| {
             let proxy = store.backend(kind) == Some(tod_store::CredentialBackend::Proxy);
             (kind, store.get(kind).is_some(), proxy)
@@ -77,7 +81,7 @@ fn list(inv: &Invocation, store: &CredentialStore) -> String {
             })
             .collect();
         let mut rows = rows;
-        rows.extend(environment_entries(inv).iter().map(|r| {
+        rows.extend(entries.iter().map(|r| {
             serde_json::json!({
                 "name": r.entry.name, "label": r.entry.description(), "set": r.is_set(store),
                 "via_proxy": false, "user_defined": true
@@ -96,7 +100,7 @@ fn list(inv: &Invocation, store: &CredentialStore) -> String {
             format!("{} ({}): {state}", kind.name(), kind.label())
         })
         .collect();
-    lines.extend(environment_entries(inv).iter().map(|r| {
+    lines.extend(entries.iter().map(|r| {
         let state = if r.is_set(store) { "set" } else { "not set" };
         let what = r.entry.description().map(|d| format!(": {d}")).unwrap_or_default();
         format!("{} (user-defined, {state}){what}", r.entry.name)
@@ -154,9 +158,10 @@ fn set(rest: &[String], store: &CredentialStore) -> anyhow::Result<String> {
 fn how_to_set(kind: CredentialKind) -> &'static str {
     match kind {
         CredentialKind::LinearApiKey => {
-            "tod asks for it the first time you create a task from a Linear ticket \
-             (paste a Linear ticket URL into the task list); or set LINEAR_API_KEY \
-             in the environment tod is launched from"
+            "put it in the node's Environment: `tod-cli environment request linear_api_key \
+             --preset linear --why <what for>` asks the user, who stores it on this node or \
+             one above it (the app also asks the first time they create a task from a Linear \
+             ticket); or LINEAR_API_KEY can be set in the environment tod is launched from"
         }
         CredentialKind::GithubToken => {
             "tell the user: tod shows a red banner with an \"Add token\" button, or they \
@@ -206,23 +211,24 @@ fn parse_run(args: &[String]) -> anyhow::Result<RunArgs> {
     anyhow::bail!("missing `--` before the command to run")
 }
 
-/// What `--env VAR=<name>` stands for: one of tod's own kinds, else an entry
-/// in the work's environment. Returns the value and whether to mask it (a
-/// variable is plain text).
+/// What `--env VAR=<name>` stands for: an entry in the work's environment
+/// (the user defined it for this node or one above, so it wins), else one of
+/// tod's own kinds. Returns the value and whether to mask it (a variable is
+/// plain text).
 fn resolve_value(inv: &Invocation, store: &CredentialStore, name: &str) -> anyhow::Result<(String, bool)> {
-    if let Some(kind) = CredentialKind::from_name(name) {
-        let value = store.get(kind).ok_or_else(|| {
-            anyhow::anyhow!(
-                "secret `{}` ({}) is not set. The user can add it: {}.",
-                kind.name(),
-                kind.label(),
-                how_to_set(kind)
-            )
-        })?;
-        return Ok((value, true));
-    }
     let entries = environment_entries(inv);
     let Some(found) = entries.iter().find(|r| r.entry.name.eq_ignore_ascii_case(name)) else {
+        if let Some(kind) = CredentialKind::from_name(name) {
+            let value = store.get(kind).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "secret `{}` ({}) is not set. The user can add it: {}.",
+                    kind.name(),
+                    kind.label(),
+                    how_to_set(kind)
+                )
+            })?;
+            return Ok((value, true));
+        }
         let mut known: Vec<String> = CredentialKind::ALL.iter().map(|kind| kind.name().to_string()).collect();
         known.extend(entries.iter().map(|r| r.entry.name.clone()));
         anyhow::bail!(

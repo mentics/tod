@@ -302,6 +302,11 @@ pub struct TaskListView {
     credential_prompt_open: bool,
     credential_input: Entity<InputState>,
     pending_credential_request: Option<PendingCredentialRequest>,
+    /// The nodes the Linear key can be kept on (the request's node, then its
+    /// ancestors), with their titles, and which one is picked.
+    credential_prompt_nodes: Vec<(uuid::Uuid, String)>,
+    credential_prompt_choice: usize,
+    credential_prompt_saving: bool,
     pending_credential_submit: bool,
     selection_before_compose: Option<String>,
     open_row_menu: Option<(RowMenuKind, String)>,
@@ -514,6 +519,9 @@ impl TaskListView {
             credential_prompt_open: false,
             credential_input,
             pending_credential_request: None,
+            credential_prompt_nodes: Vec::new(),
+            credential_prompt_choice: 0,
+            credential_prompt_saving: false,
             pending_credential_submit: false,
             selection_before_compose: None,
             open_row_menu: None,

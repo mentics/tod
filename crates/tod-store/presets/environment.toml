@@ -26,6 +26,15 @@ env_var = "GROWTHBOOK_API_KEY"
 test_url = "https://{host}/api/v1/features?limit=1"
 
 [[preset]]
+id = "linear"
+label = "Linear"
+description = "Linear API: tickets and projects (personal API key)"
+hosts = ["api.linear.app"]
+auth = "header:Authorization"
+name = "linear_api_key"
+env_var = "LINEAR_API_KEY"
+
+[[preset]]
 id = "openai"
 label = "OpenAI"
 description = "OpenAI API"
