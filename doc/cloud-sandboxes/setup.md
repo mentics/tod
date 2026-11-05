@@ -200,7 +200,9 @@ clone a private repository: a Dockerfile cannot carry a token.)
 makes it again on this
 build: it forks the current golden, checks what a fork needs, installs tod's
 files, labels it `tod-install` (the install stamp), `tod-schema`, `tod-wire`,
-and `tod-built` (the commit time of the build) plus `tod-kind=golden` and `tod-repo` (the repository it holds), marks
+and `tod-built` (the commit time of the build) plus `tod-kind=golden`, `tod-repo` (the repository it holds) and
+`keep-when-idle=true` (so a workspace's idle prune, such as Cofactr's `Blaxel Prune` workflow, never deletes it; a
+node's fork sets it back to `false`, and the orchestrator carries `true` too), marks
 it `ready`, points the repository at it, and deletes the old golden when tod
 made it (`tod-kind=golden`) and no other setting points at it. The library
 entry `tod_core::cloud_sync::golden::ensure_golden_current` does the same

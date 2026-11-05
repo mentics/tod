@@ -86,9 +86,20 @@ pub(crate) struct TaskHeader {
     pub obligations_failed: usize,
     pub plan_done: usize,
     pub plan_total: usize,
+    /// Review findings recorded on the node, and how many are still open.
+    pub findings_total: usize,
+    pub findings_open: usize,
 }
 
 impl TaskHeader {
+    pub(crate) fn findings_label(&self) -> String {
+        if self.findings_open > 0 {
+            format!("Findings {} · {} open", self.findings_total, self.findings_open)
+        } else {
+            format!("Findings {}", self.findings_total)
+        }
+    }
+
     pub(crate) fn obligations_label(&self) -> String {
         if self.obligations_failed > 0 {
             format!(
@@ -144,6 +155,12 @@ fn load(fleet: &FleetStore, node_id: Uuid) -> TaskHeader {
     if let Ok(steps) = fleet.list_plan_steps_for_node(node_id) {
         header.plan_total = steps.len();
         header.plan_done = steps.iter().filter(|s| s.status == STATUS_VERIFIED).count();
+    }
+    if let Ok(findings) =
+        fleet.read(|conn| tod_store::review::ReviewRepo::new(conn).list_for_node(node_id))
+    {
+        header.findings_total = findings.len();
+        header.findings_open = findings.iter().filter(|f| f.is_open()).count();
     }
     header
 }
@@ -735,6 +752,16 @@ impl TaskPanel {
             PanelKind::Plan(node_id),
             cx,
         );
+        // Only when the review has recorded something, as the details panel
+        // shows it.
+        let findings = (self.header.findings_total > 0).then(|| {
+            self.artifact_link(
+                "unified-task-findings",
+                self.header.findings_label(),
+                PanelKind::Findings(node_id),
+                cx,
+            )
+        });
         div()
             .flex()
             .flex_wrap()
@@ -742,6 +769,7 @@ impl TaskPanel {
             .gap_3()
             .child(obligations)
             .child(plan)
+            .children(findings)
             // Only a current count: none while unknown or recomputing.
             .children(self.changes.state.label().map(|label| {
                 self.artifact_link("unified-task-changes", label, PanelKind::Changes(node_id), cx)
@@ -1955,6 +1983,17 @@ mod tests {
         assert_eq!(header.plan_label(), "Plan 5/6");
         header.obligations_failed = 1;
         assert_eq!(header.obligations_label(), "Obligations 7 · 1 failed");
+    }
+
+    #[test]
+    fn findings_label_shows_open_only_when_any() {
+        let mut header = TaskHeader {
+            findings_total: 3,
+            ..Default::default()
+        };
+        assert_eq!(header.findings_label(), "Findings 3");
+        header.findings_open = 2;
+        assert_eq!(header.findings_label(), "Findings 3 · 2 open");
     }
 
     fn facts<'a>(supervised: bool, actor: Option<&'a NextActor>) -> RunFacts<'a> {

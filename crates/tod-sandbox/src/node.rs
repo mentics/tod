@@ -869,6 +869,9 @@ pub fn fork_golden(bx: &Blaxel, source: &str, spec: &NodeSandboxSpec, creds: &No
         ("tod-node", spec.node),
         (ENV_LABEL, env_label.as_str()),
         (CREDS_LABEL, creds_label.as_str()),
+        // The golden's `true` came with the fork; a node's sandbox is left
+        // to the idle prune as before.
+        (crate::blaxel::LABEL_KEEP_WHEN_IDLE, crate::blaxel::KEEP_WHEN_IDLE_NO),
     ];
     bx.update_proxy(spec.name, &proxy, &labels)
         .map_err(|err| err.context(format!("give {} the node's credentials (its proxy is {source}'s)", spec.name)))
