@@ -238,7 +238,9 @@ pub fn save_repo(repo: &Workdir, reference: &str, limits: &Limits) -> Result<Sav
     has_origin(repo)?;
 
     let git_dir = repo.git(&["rev-parse", "--absolute-git-dir"])?;
-    let index = format!("{}/tod-checkpoint.index", git_dir.trim_end_matches('/'));
+    // Its own file: the app and the node's supervisor may checkpoint the
+    // same checkout at once.
+    let index = format!("{}/tod-checkpoint-{}.index", git_dir.trim_end_matches('/'), uuid::Uuid::new_v4().simple());
     let result = build_commit(repo, &index, &head, reference);
     // Never left behind, whatever happened.
     let _ = repo.output("rm", &["-f", &index]);

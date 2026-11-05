@@ -177,6 +177,12 @@ fn build_golden(
         sandboxes.config.upsert(tod_sandbox::config::Sandbox { name: name.clone(), image: info.image, url: Some(url.clone()), agents: true });
         sandboxes.save()?;
         step!("wake it", bx.wait_reachable(&url, tod_sandbox::blaxel::WAKE_CEILING).with_context(|| format!("wake {name}")))?;
+        // A node's fork is redeployed from this sandbox's image by its proxy
+        // update, which wipes whatever is installed here afterwards. So the
+        // packages tod needs must be in the image itself; installing them
+        // below would make a golden whose every fork fails. Refuse it now.
+        step!("check the image has what forks need", tod_sandbox::provision::require_fork_prerequisites(bx, &url, true, &mut |m| say(m)))
+            .with_context(|| format!("the image {image} is what every fork of this golden is redeployed from"))?;
         // An image holds only what it was built with: tod's dependencies
         // first (git among them), then its own files.
         say("installing tod's dependencies…");
@@ -286,9 +292,7 @@ fn refresh_with(
         };
     }
     let made = (|| -> Result<()> {
-        let info = bx.wait_deployed(&name, Duration::from_secs(300))?;
-        let url = info.url.ok_or_else(|| anyhow!("sandbox {name} has no URL"))?;
-        step!("check what a fork needs", tod_sandbox::provision::require_fork_prerequisites(bx, &url, true, &mut |m| say(m)))?;
+        bx.wait_deployed(&name, Duration::from_secs(300))?;
         // The proxy goes in BEFORE tod's files: updating a sandbox's network
         // configuration redeploys it from its image, and what was installed
         // into it until then is gone (seen live: a freshly refreshed golden had
@@ -303,6 +307,9 @@ fn refresh_with(
         let info = step!("wait until deployed", bx.wait_deployed(&name, Duration::from_secs(300)))?;
         let url = info.url.ok_or_else(|| anyhow!("sandbox {name} has no URL"))?;
         step!("wake it", bx.wait_reachable(&url, tod_sandbox::blaxel::WAKE_CEILING).with_context(|| format!("wake {name}")))?;
+        // After the proxy update: it redeploys from the image and drops what
+        // was installed since, which is exactly what a node's fork loses too.
+        step!("check what a fork needs", tod_sandbox::provision::require_fork_prerequisites(bx, &url, true, &mut |m| say(m)))?;
         let routed = step!("read its proxy", bx.get_json(&name))?.is_some_and(|j| has_proxy_routes(&j));
         if !routed {
             bail!("{name} did not keep the proxy it was given, so nodes cannot be forked from it");
