@@ -822,6 +822,17 @@ mod tests {
     }
 
     #[test]
+    fn restarting_the_stay_starts_a_new_one_in_the_same_state() {
+        let fx = setup("design");
+        let repo = PhaseRepo::new(&fx.conn);
+        let before = repo.stay_started_at(fx.node).unwrap().unwrap();
+        let state = NodeRepo::new(&fx.conn).restart_stay(fx.node).unwrap();
+        assert_eq!(state.as_deref(), Some("design"));
+        assert!(repo.stay_started_at(fx.node).unwrap().unwrap() > before);
+        assert_eq!(NodeRepo::new(&fx.conn).get_lifecycle(fx.node).unwrap().as_deref(), Some("design"));
+    }
+
+    #[test]
     fn only_the_listed_states_are_certifiable() {
         let fx = setup("proposed");
         for state in CERTIFIABLE_STATES {

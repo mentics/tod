@@ -204,6 +204,19 @@ impl AutopilotState {
         state.save(data_root, node)
     }
 
+    /// Ask that the next run of `node` redo its state from the top, as if it
+    /// had just entered it: a new session, and none of the earlier run's
+    /// conversation, owed skill groups or loop counts carried over.
+    pub fn request_rerun_phase(data_root: &Path, node: Uuid) -> Result<()> {
+        let mut state = Self::load(data_root, node)?;
+        state.fresh_session = true;
+        state.current = None;
+        state.pending_groups = None;
+        state.loops.clear();
+        state.outcome = None;
+        state.save(data_root, node)
+    }
+
     pub fn save(&self, data_root: &Path, node: Uuid) -> Result<()> {
         let path = state_path(data_root, node);
         let dir = path.parent().expect("state path has a parent");

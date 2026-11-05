@@ -264,6 +264,25 @@ impl<'a> NodeRepo<'a> {
         Ok(())
     }
 
+    /// Starts a new stay in the state the node is in, as if it had just
+    /// entered it: what is counted per stay (the phase conversation, its
+    /// events, a certificate, review rounds) starts over, and what the node
+    /// waited on is moot. The state itself does not change. Returns the
+    /// state; `None` when the node has none.
+    pub fn restart_stay(&self, node_id: Uuid) -> Result<Option<String>> {
+        let Some(state) = self.get_lifecycle(node_id)? else {
+            return Ok(None);
+        };
+        // Strictly later than anything the old stay recorded, even in the
+        // same millisecond.
+        self.conn.execute(
+            "UPDATE node_lifecycle SET updated_at = MAX(?2, updated_at + 1) WHERE node_id = ?1",
+            params![uuid_to_blob(node_id), now_ms()],
+        )?;
+        crate::waits::cancel_for_node(self.conn, node_id, &format!("{state} was run again"))?;
+        Ok(Some(state))
+    }
+
     pub fn get_lifecycle(&self, node_id: Uuid) -> Result<Option<String>> {
         self.conn
             .query_row(

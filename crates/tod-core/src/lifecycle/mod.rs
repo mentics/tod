@@ -44,6 +44,19 @@ pub fn set_lifecycle(fleet: &FleetStore, node: Uuid, state: &str) -> Result<()> 
     Ok(())
 }
 
+/// Run the node's current state again as if it had just entered it: a new
+/// stay starts in the store (what is counted per stay, such as the phase
+/// conversation, a certificate or review rounds, starts over) and returns the
+/// state. Nothing runs; the caller starts the runner with a new session.
+pub fn restart_stay(fleet: &FleetStore, node: Uuid) -> Result<String> {
+    let state = current_state(fleet, node)?;
+    fleet
+        .enqueue_outline(OutlineMutation::RestartLifecycleStay { node_id: node })
+        .map_err(|err| anyhow::anyhow!("{err:#}"))?;
+    let _ = fleet.writer().flush();
+    Ok(state)
+}
+
 /// Brings the node's Linear ticket up to the state it entered.
 fn push_to_ticket(fleet: &FleetStore, node: Uuid, state: &str) {
     if let Some(milestone) = crate::linear_sync::Milestone::for_lifecycle(state) {

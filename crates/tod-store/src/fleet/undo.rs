@@ -472,6 +472,7 @@ fn capture_outline_inverse(conn: &Connection, m: &OutlineMutation) -> Result<Opt
         | OutlineMutation::UnlinkPlanStepObligation { .. }
         | OutlineMutation::SetExtraContent { .. }
         | OutlineMutation::SetLifecycle { .. }
+        | OutlineMutation::RestartLifecycleStay { .. }
         | OutlineMutation::ApplyGateResults { .. }
         | OutlineMutation::SetGeneratorConfig { .. }
         | OutlineMutation::DeleteGeneratorConfig { .. }
