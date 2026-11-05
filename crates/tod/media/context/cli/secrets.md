@@ -26,7 +26,9 @@ tod-cli --data-root <DATA_ROOT> secrets run --env LINEAR_API_KEY=linear_api_key 
 `list` and `run` also know the credentials and variables defined for this work
 (the Environment block of your context lists them; `tod-cli environment`
 manages them). `--env GROWTHBOOK_API_KEY=growthbook` works the same for one of
-those. If you need one that is not there, ask for it with `tod-cli environment
+those. A defined entry wins over the app's own secret of the same name, so the
+user's `linear_api_key` entry is the one `--env LINEAR_API_KEY=linear_api_key`
+reads. If you need one that is not there, ask for it with `tod-cli environment
 request`.
 
 In a cloud sandbox `secrets run` is refused: a credential that has hosts (the

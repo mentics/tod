@@ -343,6 +343,83 @@ pub fn sandbox_credentials(
     Ok(custom)
 }
 
+/// The Linear API key of a node's environment: the nearest secret named
+/// `linear_api_key` ([`resolve`]'s output), with its value. `None` when no
+/// such entry is set. Import and sync use the node they act for (a new
+/// node's parent, a generator node itself), so an entry on an ancestor covers
+/// everything below it.
+pub fn linear_api_key(resolved: &[Resolved], store: &CredentialStore) -> Option<String> {
+    resolved
+        .iter()
+        .find(|r| r.entry.kind == EntryKind::Secret && r.entry.name.eq_ignore_ascii_case("linear_api_key"))
+        .and_then(|r| r.value(store))
+}
+
+/// The Linear API key for work on `node`: its environment's `linear_api_key`
+/// secret, from `node` or the nearest ancestor that defines it. `Ok(None)`
+/// when none is defined or its value is not stored. Reads the credential
+/// store (the OS keyring): never on the UI thread.
+pub fn linear_api_key_for(fleet: &crate::fleet::FleetStore, node: Uuid) -> Result<Option<String>> {
+    let resolved = fleet.read(|conn| resolve(conn, node))?;
+    Ok(linear_api_key(&resolved, &CredentialStore::from_data_root(fleet.paths().root())))
+}
+
+/// `node` and its ancestors, nearest first: where a Linear key for work on
+/// `node` can be kept so that `node` inherits it.
+pub fn ancestry(conn: &Connection, node: Uuid) -> Result<Vec<Uuid>> {
+    let mut chain = crate::outline::ancestor_chain(conn, node)?;
+    chain.reverse();
+    Ok(chain)
+}
+
+/// Store the Linear API key on `node`: enables the Environment capability
+/// there if it is missing, defines the `linear` preset's entry (replacing
+/// any entry of that name), and stores `value` as its secret. The node may be
+/// any node the user picked, ancestors included.
+pub fn store_linear_api_key(
+    fleet: &crate::fleet::FleetStore,
+    data_root: &std::path::Path,
+    node: Uuid,
+    value: &str,
+) -> Result<()> {
+    use crate::outline::OutlineMutation;
+    use crate::outline::types::Capability;
+
+    let presets = crate::environment_presets::load(data_root)?;
+    let preset = presets
+        .into_iter()
+        .find(|p| p.id == "linear")
+        .ok_or_else(|| anyhow::anyhow!("no `linear` environment preset"))?;
+    let mut entry = preset.to_entry();
+    entry.name = LINEAR_ENTRY.into();
+
+    let (has_capability, mut list) = fleet.read(|conn| {
+        let has = crate::outline::repos::node::NodeRepo::new(conn)
+            .list_capabilities(node)?
+            .contains(&Capability::Environment);
+        Ok((has, entries(conn, node)?))
+    })?;
+    if !has_capability {
+        fleet.enqueue_outline(OutlineMutation::EnableCapabilities {
+            node_id: node,
+            capabilities: vec![Capability::Environment],
+        })?;
+        // The entry's write checks the capability, so it has to have landed.
+        fleet.writer().flush()?;
+    }
+    list.retain(|e| !e.name.eq_ignore_ascii_case(LINEAR_ENTRY));
+    list.push(entry);
+
+    CredentialStore::from_data_root(data_root).set_named(&secret_account(node, LINEAR_ENTRY), value)?;
+    fleet.enqueue_outline(OutlineMutation::SetNodeEnvironment { node_id: node, entries: list })?;
+    // Wait for both writes: the caller reads the environment straight away.
+    fleet.writer().flush()?;
+    Ok(())
+}
+
+/// The name of the Linear key's entry (the `linear` preset's `name`).
+pub const LINEAR_ENTRY: &str = "linear_api_key";
+
 /// Remove a secret's stored value (when its entry is removed or renamed).
 pub fn forget_secret(store: &CredentialStore, node: Uuid, name: &str) {
     store.delete_named(&secret_account(node, name));

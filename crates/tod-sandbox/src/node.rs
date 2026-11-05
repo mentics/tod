@@ -246,7 +246,12 @@ pub fn credential_rules(creds: &NodeCredentials, claude_via: ClaudeTokenVia) -> 
         let basic = base64::engine::general_purpose::STANDARD.encode(format!("x-access-token:{token}"));
         rules.push(rule("github.com", "github_basic", "Basic ", basic));
     }
-    if let Some(key) = creds.linear_api_key.as_deref().filter(|k| !k.is_empty()) {
+    // An Environment entry for Linear's host is the user's own and wins over
+    // the app-wide key: two rules for one host would fight.
+    let linear_in_environment = creds.custom.iter().any(|c| c.hosts.iter().any(|h| h == "api.linear.app"));
+    if let Some(key) = creds.linear_api_key.as_deref().filter(|k| !k.is_empty())
+        && !linear_in_environment
+    {
         rules.push(rule("api.linear.app", "linear", "", key.to_string()));
     }
     if claude_via == ClaudeTokenVia::Proxy
@@ -1335,6 +1340,35 @@ mod tests {
         let env = agent_env(&creds(), ClaudeTokenVia::Env);
         assert_eq!(get(&env, CLAUDE_TOKEN_ENV).as_deref(), Some("sk-ant-oat01-real"));
         assert!(agent_env(&NodeCredentials::default(), ClaudeTokenVia::Proxy).is_empty());
+    }
+
+    #[test]
+    fn a_linear_environment_entry_replaces_the_app_wide_linear_rule() {
+        let rules_for = |creds: &NodeCredentials| credential_rules(creds, ClaudeTokenVia::Proxy);
+        let linear_rules = |rules: &[ProxyRule]| -> Vec<(String, String)> {
+            rules
+                .iter()
+                .filter(|r| r.destination == "api.linear.app")
+                .map(|r| (r.value.clone(), r.secret_value.clone()))
+                .collect()
+        };
+        // The app-wide key alone: its rule.
+        let app_wide = NodeCredentials { linear_api_key: Some("lin_app".into()), ..Default::default() };
+        assert_eq!(linear_rules(&rules_for(&app_wide)), [("{{SECRET:linear}}".to_string(), "lin_app".to_string())]);
+        // An Environment entry for the host: only that rule, never two for one host.
+        let with_entry = NodeCredentials {
+            custom: vec![CustomCredential {
+                name: "linear_api_key".into(),
+                hosts: vec!["api.linear.app".into()],
+                header: "Authorization".into(),
+                template: "{value}".into(),
+                secret_value: "lin_env".into(),
+            }],
+            ..app_wide
+        };
+        let rules = linear_rules(&rules_for(&with_entry));
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].1, "lin_env");
     }
 
     #[test]
