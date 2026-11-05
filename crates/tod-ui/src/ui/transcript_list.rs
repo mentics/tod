@@ -78,6 +78,10 @@ pub struct Entry {
     pub live: bool,
     /// Image files a user message was sent with, shown beneath its text.
     pub images: Vec<PathBuf>,
+    /// For a user entry: what was sent to the agent besides the message (the
+    /// opening context or snapshot, the delta). Markdown. Shown as a chunk of
+    /// its own inside the entry, collapsed, and only on the turn that sent it.
+    pub context: Option<String>,
 }
 
 impl Entry {
@@ -91,6 +95,7 @@ impl Entry {
             summary: None,
             live: false,
             images: Vec::new(),
+            context: None,
         }
     }
 
@@ -104,6 +109,7 @@ impl Entry {
             summary: None,
             live: true,
             images: Vec::new(),
+            context: None,
         }
     }
 }
@@ -208,6 +214,8 @@ pub fn expanded_by_default(entries: &[Entry], id: ChunkId, start: StartState) ->
     };
     match id.part {
         None => true,
+        // A user entry's context is huge: collapsed until asked for.
+        Some(_) if entry.kind == EntryKind::User => false,
         Some(ix) => pieces(entry)
             .get(ix)
             .is_some_and(|(kind, _)| kind.expanded_by_default()),
@@ -251,6 +259,8 @@ enum Row {
         entry: usize,
         marker: bool,
     },
+    /// An expanded user entry's context chunk.
+    Context(usize),
     /// An expanded agent reply that has no pieces: its body.
     AgentBody(usize),
     /// One piece of an expanded agent reply.
@@ -269,7 +279,9 @@ enum Row {
 impl Row {
     fn entry(self) -> Option<usize> {
         match self {
-            Row::Entry { entry, .. } | Row::Piece { entry, .. } => Some(entry),
+            Row::Entry { entry, .. } | Row::Piece { entry, .. } | Row::Context(entry) => {
+                Some(entry)
+            }
             Row::AgentBody(entry) | Row::NoNotes(entry) | Row::Summary(entry) => Some(entry),
             Row::Working | Row::Empty => None,
         }
@@ -284,6 +296,10 @@ impl Row {
             Row::Piece { entry, part } => Some(ChunkId {
                 entry,
                 part: Some(part),
+            }),
+            Row::Context(entry) => Some(ChunkId {
+                entry,
+                part: Some(0),
             }),
             _ => None,
         }
@@ -302,6 +318,12 @@ fn rows(entries: &[Entry], toggled: &HashMap<ChunkId, bool>, start: StartState) 
             entry: entry_ix,
             part: None,
         };
+        if entry.kind == EntryKind::User
+            && entry.context.is_some()
+            && is_expanded(entries, toggled, id, start)
+        {
+            rows.push(Row::Context(entry_ix));
+        }
         if entry.kind != EntryKind::Agent || !is_expanded(entries, toggled, id, start) {
             continue;
         }
@@ -373,6 +395,9 @@ fn chunk_texts(entries: &[Entry]) -> Vec<(ChunkId, String)> {
                     _ => "You",
                 });
                 out.push((whole, format!("{label}\n{}", entry.body)));
+                if let Some(context) = &entry.context {
+                    out.push((ChunkId { entry: ix, part: Some(0) }, format!("Context\n{context}")));
+                }
             }
             EntryKind::Agent => {
                 let pieces = pieces(entry);
@@ -916,6 +941,7 @@ impl TranscriptList {
         let find = self.find.as_ref().filter(|f| !f.hits.is_empty())?;
         let id = match row {
             Row::Piece { entry, part } => ChunkId { entry, part: Some(part) },
+            Row::Context(entry) => ChunkId { entry, part: Some(0) },
             Row::Entry { entry, marker: false } => ChunkId { entry, part: None },
             Row::AgentBody(entry) | Row::Summary(entry) => ChunkId { entry, part: None },
             _ => return None,
@@ -954,6 +980,33 @@ impl TranscriptList {
                     .into_any_element()
             }
             Row::Piece { entry, part } => self.render_piece(entry, part, window, cx),
+            Row::Context(entry_ix) => {
+                let id = ChunkId { entry: entry_ix, part: Some(0) };
+                let context = self.entries[entry_ix].context.clone().unwrap_or_default();
+                let mut chunk = style::chunk(v_flex())
+                    .ml(style::space::INSET)
+                    .bg(style::color::badge_fill())
+                    .child(self.chunk_header(
+                        id,
+                        None,
+                        SharedString::from("Context"),
+                        Some(first_line(&context)),
+                        cx,
+                    ));
+                if self.is_expanded(id) {
+                    // What is sent is markdown.
+                    chunk = chunk.child(style::chunk_body(div()).child(style::text(
+                        selectable_markdown(
+                            ElementId::Name(format!("entry-context-{entry_ix}").into()),
+                            context.trim().to_string(),
+                            window,
+                            cx,
+                        )
+                        .w_full(),
+                    )));
+                }
+                chunk.into_any_element()
+            }
             Row::Summary(entry_ix) => style::chunk_children(div())
                 .child(style::text(selectable_text(
                     ElementId::Name(format!("entry-summary-{entry_ix}").into()),
@@ -1290,6 +1343,7 @@ mod tests {
             summary: None,
             live: false,
             images: Vec::new(),
+            context: None,
         }
     }
 
@@ -1310,6 +1364,7 @@ mod tests {
             summary: None,
             live: false,
             images: Vec::new(),
+            context: None,
         }
     }
 

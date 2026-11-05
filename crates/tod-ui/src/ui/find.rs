@@ -76,6 +76,7 @@ mod host_tests {
             summary: None,
             live: false,
             images: Vec::new(),
+            context: None,
         }
     }
 

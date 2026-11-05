@@ -1184,6 +1184,28 @@ impl ConversationDriver {
                 fleet.paths().root().to_path_buf()
             }
         };
+        // Everything sent besides the user's text is kept on the user turn,
+        // so the transcript can show it: the opening context or snapshot
+        // (only on the turn that actually sent it), then the delta.
+        if let Some(context) = &context {
+            let delta = fleet
+                .read(|conn| ConversationRepo::new(conn).turns(id))?
+                .into_iter()
+                .find(|t| t.seq == user_seq)
+                .and_then(|t| t.sent_context);
+            let sent_context = match delta {
+                Some(delta) => format!("{}\n\n{delta}", context.trim_end()),
+                None => context.clone(),
+            };
+            fleet.interview(
+                ACTOR_USER,
+                InterviewCommand::SetConversationTurnSentContext {
+                    conversation_id: id,
+                    seq: user_seq,
+                    sent_context,
+                },
+            )?;
+        }
         let opening = context.as_ref().map(|context| SessionOpening {
             context: Some(context.clone()),
         });

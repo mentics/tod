@@ -362,6 +362,7 @@ mod real {
                     summary: None,
                     live: false,
                     images: Vec::new(),
+                    context: None,
                 }
             })
             .collect()
