@@ -36,6 +36,10 @@ pub struct SessionInfo {
     recorded: Option<TokenUsage>,
     /// What the next turn launches with.
     expected: Option<AgentLaunchOptions>,
+    /// The platform, model, and effort the conversation was started with, as
+    /// its row records them: what a conversation that is not running (or not
+    /// in this app) shows, instead of today's settings.
+    stored: Option<AgentLaunchOptions>,
     read_at: Option<Instant>,
     /// When the usage was last read: the whole session log, so only while a
     /// turn runs, or when one ended.
@@ -68,6 +72,7 @@ pub struct SessionReadResult {
     /// `None` when the usage was not read.
     recorded: Option<Option<TokenUsage>>,
     expected: Option<AgentLaunchOptions>,
+    stored: Option<AgentLaunchOptions>,
 }
 
 impl SessionRead {
@@ -82,7 +87,19 @@ impl SessionRead {
         let expected = self.settings_path.as_deref().map(|path| {
             tod_core::conversation::launch::resolve_from(fleet, path, self.shown.focus, self.shown.kind)
         });
-        SessionReadResult { recorded, expected }
+        let stored = self.shown.conversation.and_then(|id| {
+            let row = fleet
+                .read(|conn| tod_store::conversation::ConversationRepo::new(conn).get(id))
+                .ok()
+                .flatten()?;
+            let platform = tod_store::parse_platform(row.platform.as_deref()?)?;
+            Some(AgentLaunchOptions::from_settings(
+                platform,
+                row.model.filter(|m| !m.is_empty())?,
+                row.effort.filter(|e| !e.is_empty())?,
+            ))
+        });
+        SessionReadResult { recorded, expected, stored }
     }
 }
 
@@ -148,6 +165,8 @@ impl SessionInfo {
         self.reading = false;
         let mut changed = self.expected != result.expected;
         self.expected = result.expected;
+        changed |= self.stored != result.stored;
+        self.stored = result.stored;
         if let Some(recorded) = result.recorded {
             changed |= self.recorded != recorded;
             self.recorded = recorded;
@@ -170,8 +189,13 @@ impl SessionInfo {
     /// The line under the title and every figure behind it, for a
     /// conversation whose driver reports `status`.
     pub fn line(&self, status: &ConversationStatus) -> Option<(String, String)> {
-        // What the latest turn asked for; what the next one will before any.
-        let asked = status.launch.as_ref().or(self.expected.as_ref());
+        // What the latest turn asked for; else what the conversation was
+        // recorded as started with; else what the next one will.
+        let asked = status
+            .launch
+            .as_ref()
+            .or(self.stored.as_ref())
+            .or(self.expected.as_ref());
         line(asked, self.usage(status).as_ref())
     }
 }
