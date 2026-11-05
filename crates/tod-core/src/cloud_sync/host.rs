@@ -41,8 +41,8 @@ impl SandboxHost for CoreHost {
         Ok(NodeRepo { slug, url })
     }
 
-    fn git_identity(&self, repo: Option<&str>) -> GitIdentity {
-        super::git_identity(repo)
+    fn git_identity(&self, fleet: &FleetStore) -> Result<GitIdentity> {
+        super::git_identity(fleet)
     }
 
     fn supervisor_agent(&self) -> Option<String> {

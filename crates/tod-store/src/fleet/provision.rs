@@ -979,7 +979,7 @@ fn make_sandbox(
             // first, then its own files.
             sandboxes.ensure_as(&bx, &name, tod_sandbox::provision::Mode::Install, progress)?;
         }
-        let install_identity = host.git_identity(node_row.repo.as_deref());
+        let install_identity = host.git_identity(fleet)?;
         let payload = node::NodePayload {
             relay: &node_files.relay,
             shim: super::cli_relay::HTTP_SHIM_SCRIPT.as_bytes(),
@@ -1012,7 +1012,7 @@ fn make_sandbox(
         progress(&format!("checking {name} can reach {}…", repo.url));
         let health = |expected_manifest| health_spec(&name, node_id, &repo.url, expected_manifest, delays);
         tod_sandbox::health::probe(&bx, &url, tod_sandbox::health::Stage::Base, &health(None), progress)?;
-        let identity = host.git_identity(node_row.repo.as_deref());
+        let identity = host.git_identity(fleet)?;
         node::checkout(&bx, &url, &repo.url, branch, &identity, fork_from.is_none(), progress)?;
         // Where the checkout is: the clone's, else the image's own.
         let dir_path = find_sandbox_checkout(&name)?;

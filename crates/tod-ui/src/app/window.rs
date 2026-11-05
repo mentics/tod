@@ -1473,7 +1473,7 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                             },
                             cx,
                         );
-                        let settings = cx.new(|cx| SettingsView::new(window, cx));
+                        let settings = cx.new(|cx| SettingsView::new(window, cx, fleet.clone()));
                         let database = cx.new(|cx| DatabaseView::new(window, cx, fleet.clone()));
                         let pull_requests = cx.new(|cx| {
                             PullRequestsView::new(cx, fleet.clone(), paths.data_root().to_path_buf())

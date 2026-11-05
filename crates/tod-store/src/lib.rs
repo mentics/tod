@@ -8,6 +8,7 @@ pub mod conversation;
 pub mod conversation_live;
 pub mod credentials;
 pub mod deferrals;
+pub mod git_identity;
 pub mod decisions;
 pub mod environment;
 pub mod groups;

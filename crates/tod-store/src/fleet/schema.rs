@@ -683,6 +683,9 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
     ensure_skill_group(conn)?;
     // `files_places.clone_url`: machine-local, no schema version.
     crate::fleet::repos::files_place::ensure_clone_url(conn)?;
+    // The git identity cloud sandboxes author commits as: seeded from this
+    // machine's git config when first made (`crate::git_identity`).
+    crate::git_identity::ensure(conn, crate::git_identity::read_local())?;
     crate::sync::install(conn)?;
     // Idempotent and cheap — keeps the gate criteria catalog's wording in
     // sync with the source on every startup, not just the migration that

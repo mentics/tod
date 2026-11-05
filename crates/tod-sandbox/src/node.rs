@@ -613,6 +613,8 @@ pub fn checkout_script(repo_url: &str, branch: &str, identity: &GitIdentity, all
          elif [ -d {forked_dir}/.git ]; then dir={forked_dir}; git -C \"$dir\" fetch --quiet --prune --no-recurse-submodules origin; \
          else {missing}; fi\n\
          cd \"$dir\"\n\
+         git config --global user.name {name}\n\
+         git config --global user.email {email}\n\
          git config user.name {name}\n\
          git config user.email {email}\n\
          if git show-ref --verify --quiet refs/remotes/origin/{br}; then \
@@ -1385,6 +1387,10 @@ mod tests {
         let s = checkout_script("https://github.com/o/r.git", "feat/x", &me, true);
         assert!(s.contains(r"git config user.name 'Ada O'\''Neil'"), "{s}");
         assert!(s.contains("git config user.email ada@example.com"), "{s}");
+        // Global too: a submodule's own config does not inherit the checkout's,
+        // so its commits would otherwise carry whatever the image baked in.
+        assert!(s.contains(r"git config --global user.name 'Ada O'\''Neil'"), "{s}");
+        assert!(s.contains("git config --global user.email ada@example.com"), "{s}");
         assert!(s.contains("git config --system http.sslCAInfo \"$SSL_CERT_FILE\""));
         assert!(s.contains("git clone https://github.com/o/r.git /workspace/repo"));
         assert!(s.contains("refs/remotes/origin/feat/x"));

@@ -20,6 +20,7 @@ use gpui_component::scroll::ScrollableElement;
 use gpui_component::select::{Select, SelectEvent, SelectState};
 use gpui_component::{ActiveTheme, Disableable, IndexPath, Selectable, StyledExt, h_flex, v_flex};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 use tod_core::logging;
 use tod_journey::RelayCode;
@@ -191,6 +192,8 @@ impl SettingsSection {
                 SandboxSignIn,
                 SandboxApiKey,
                 SandboxDefaultImage,
+                SandboxGitName,
+                SandboxGitEmail,
                 SandboxClaudeToken,
                 SandboxClaudeGetToken,
                 SandboxClaudeClear,
@@ -245,6 +248,10 @@ enum SettingField {
     SandboxApiKey,
     /// The image a new sandbox starts from unless one is given.
     SandboxDefaultImage,
+    /// The git author name sandbox commits carry (the user's database).
+    SandboxGitName,
+    /// The git author email sandbox commits carry (the user's database).
+    SandboxGitEmail,
     /// The Claude subscription token for autonomous nodes, kept in the
     /// credential store (never shown).
     SandboxClaudeToken,
@@ -300,6 +307,8 @@ impl SettingField {
             Self::SandboxSignIn => "sandbox-sign-in",
             Self::SandboxApiKey => "sandbox-api-key",
             Self::SandboxDefaultImage => "sandbox-default-image",
+            Self::SandboxGitName => "sandbox-git-name",
+            Self::SandboxGitEmail => "sandbox-git-email",
             Self::SandboxClaudeToken => "sandbox-claude-token",
             Self::SandboxClaudeGetToken => "sandbox-claude-get-token",
             Self::SandboxClaudeClear => "sandbox-claude-clear",
@@ -327,7 +336,7 @@ const PLATFORM_ORDER: [AgentPlatform; 2] = [AgentPlatform::Claude, AgentPlatform
 /// Platform, model, effort — the dropdowns in one agent role row.
 const AGENT_ROW_COLUMNS: usize = 3;
 /// The fields edited as text, each in its own input (`SettingsView::text_input`).
-const TEXT_FIELDS: [SettingField; 12] = [
+const TEXT_FIELDS: [SettingField; 14] = [
     SettingField::TreehouseExecutable,
     SettingField::TreehouseWorktreesRoot,
     SettingField::BranchTemplate,
@@ -336,6 +345,8 @@ const TEXT_FIELDS: [SettingField; 12] = [
     SettingField::SandboxWorkspace,
     SettingField::SandboxApiKey,
     SettingField::SandboxDefaultImage,
+    SettingField::SandboxGitName,
+    SettingField::SandboxGitEmail,
     SettingField::SandboxClaudeToken,
     SettingField::JourneysRelayCode,
     SettingField::JourneysMilestoneStates,
@@ -448,6 +459,11 @@ pub struct SettingsView {
     /// not in the settings file; saved when leaving the field.
     sandbox_workspace_input: Entity<InputState>,
     sandbox_image_input: Entity<InputState>,
+    /// The git author a sandbox's commits carry: kept in the user's database
+    /// (`tod_store::git_identity`), saved when leaving the field.
+    git_name_input: Entity<InputState>,
+    git_email_input: Entity<InputState>,
+    fleet: Arc<tod_store::fleet::FleetStore>,
     sandbox_key_input: Entity<InputState>,
     sandbox_auth: tod_store::fleet::sandbox::AuthMode,
     /// Whether an API key is stored; `None` until the keyring has been read
@@ -502,7 +518,7 @@ pub struct SettingsView {
 }
 
 impl SettingsView {
-    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(window: &mut Window, cx: &mut Context<Self>, fleet: Arc<tod_store::fleet::FleetStore>) -> Self {
         let paths = TodPaths::discover().expect("failed to resolve tod paths");
         let presets_root = paths.data_root().to_path_buf();
         let settings = TodSettings::load(&paths).expect("failed to load tod settings");
@@ -528,6 +544,17 @@ impl SettingsView {
             InputState::new(window, cx)
                 .placeholder("Enter to edit · Not set up")
                 .default_value(sandbox_workspace)
+        });
+        let git_identity = fleet.read(|conn| tod_store::git_identity::get(conn)).ok().flatten();
+        let git_name_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Enter to edit · Not set")
+                .default_value(git_identity.as_ref().map(|i| i.name.clone()).unwrap_or_default())
+        });
+        let git_email_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Enter to edit · Not set")
+                .default_value(git_identity.map(|i| i.email).unwrap_or_default())
         });
         let sandbox_image_input = cx.new(|cx| {
             InputState::new(window, cx)
@@ -711,6 +738,9 @@ impl SettingsView {
             treehouse_executable_input,
             sandbox_workspace_input,
             sandbox_image_input,
+            git_name_input,
+            git_email_input,
+            fleet,
             sandbox_key_input,
             sandbox_auth,
             sandbox_has_key: None,
@@ -868,6 +898,8 @@ impl SettingsView {
                 SettingField::SandboxWorkspace => &self.sandbox_workspace_input,
                 SettingField::SandboxApiKey => &self.sandbox_key_input,
                 SettingField::SandboxDefaultImage => &self.sandbox_image_input,
+                SettingField::SandboxGitName => &self.git_name_input,
+                SettingField::SandboxGitEmail => &self.git_email_input,
                 SettingField::SandboxClaudeToken => &self.claude_token_input,
                 SettingField::JourneysRelayCode => &self.relay_code_input,
                 SettingField::JourneysMilestoneStates => &self.milestone_states_input,
@@ -941,6 +973,7 @@ impl SettingsView {
             SettingField::SandboxWorkspace | SettingField::SandboxDefaultImage => {
                 self.save_sandbox_account(cx)
             }
+            SettingField::SandboxGitName | SettingField::SandboxGitEmail => self.save_git_identity(cx),
             field => self.apply_text_field(field, cx),
         }
         cx.notify();
@@ -1225,6 +1258,41 @@ impl SettingsView {
         cx.notify();
     }
 
+    /// Save the git name and email sandbox commits carry to the database.
+    /// Both are required: a bad value is shown, and the stored one stays.
+    fn save_git_identity(&mut self, cx: &mut Context<Self>) {
+        let name = self.git_name_input.read(cx).text().to_string();
+        let email = self.git_email_input.read(cx).text().to_string();
+        let stored = self.fleet.read(|conn| tod_store::git_identity::get(conn)).ok().flatten();
+        let identity = match tod_store::git_identity::GitIdentity::validated(&name, &email) {
+            Ok(identity) => identity,
+            Err(err) => {
+                // Unset and untouched: nothing to complain about yet.
+                if stored.is_some() || !(name.trim().is_empty() && email.trim().is_empty()) {
+                    self.sandbox_status = Some(Err(format!("Git identity not saved: {err:#}").into()));
+                }
+                cx.notify();
+                return;
+            }
+        };
+        if stored.as_ref() == Some(&identity) {
+            return;
+        }
+        let saved = self
+            .fleet
+            .enqueue(tod_store::fleet::FleetMutation::SetGitIdentity {
+                name: identity.name.clone(),
+                email: identity.email.clone(),
+            })
+            .map_err(anyhow::Error::from)
+            .and_then(|()| self.fleet.writer().flush().map_err(anyhow::Error::from));
+        self.sandbox_status = Some(match saved {
+            Ok(()) => Ok("Saved. Sandboxes made or replaced from now on commit as this author.".into()),
+            Err(err) => Err(format!("Could not save the git identity: {err:#}").into()),
+        });
+        cx.notify();
+    }
+
     fn activate_section(
         &mut self,
         section: SettingsSection,
@@ -1384,6 +1452,8 @@ impl SettingsView {
             | SettingField::SandboxWorkspace
             | SettingField::SandboxApiKey
             | SettingField::SandboxDefaultImage
+            | SettingField::SandboxGitName
+            | SettingField::SandboxGitEmail
             | SettingField::SandboxClaudeToken
             | SettingField::SandboxClaudeGetToken
             | SettingField::SandboxClaudeClear => {}
@@ -2484,6 +2554,24 @@ impl SettingsView {
                     "Default image",
                     "What a new sandbox starts from unless the Files capability names another image. A baked image (`tod-sandbox bake`) is ready in seconds. Any other image is set up the first time, which takes a minute or more.",
                     &self.sandbox_image_input,
+                    theme,
+                ))
+                .child(text_input_row(
+                    cx,
+                    self,
+                    SettingField::SandboxGitName,
+                    "Git name",
+                    "The author name on commits made in your cloud sandboxes (`git config user.name`). It started as this machine's git config and is kept in your database, so a sandbox replaced while the app is closed still uses it.",
+                    &self.git_name_input,
+                    theme,
+                ))
+                .child(text_input_row(
+                    cx,
+                    self,
+                    SettingField::SandboxGitEmail,
+                    "Git email",
+                    "The author email on those commits (`git config user.email`).",
+                    &self.git_email_input,
                     theme,
                 ))
                 .when_some(self.sandbox_status.clone(), |el, status| {
