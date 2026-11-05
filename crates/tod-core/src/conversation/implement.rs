@@ -529,8 +529,9 @@ pub(super) fn commit_worktree(
     branch: Option<&str>,
     message: &str,
 ) -> Result<bool> {
-    // Submodules first, deepest first, so each parent commits the child's new
-    // commit; they go on the superproject's branch, like the rest of the work.
+    // Each submodule's work is committed on the superproject's branch, like the
+    // rest. No repository records a submodule's commit: tod never writes a
+    // submodule pointer (see `commit_repo`).
     let branch = current_branch(cwd).or_else(|| branch.map(str::to_string));
     let mut committed = false;
     if let Some(branch) = branch.as_deref() {
@@ -543,7 +544,13 @@ pub(super) fn commit_worktree(
     Ok(commit_repo(cwd, branch.as_deref(), message)? || committed)
 }
 
-/// Commit everything in the one repository at `cwd`; see [`commit_worktree`].
+/// Commit everything in the one repository at `cwd` except its submodule
+/// pointers; see [`commit_worktree`].
+///
+/// Each repository is worked on as if it stood alone: a submodule checked out
+/// at another commit than its parent records (its own work, or a checkout that
+/// came from elsewhere) is not a change of the parent's. The pointers are
+/// updated outside tod, so a run never stages or commits them.
 fn commit_repo(cwd: &Workdir, branch: Option<&str>, message: &str) -> Result<bool> {
     fn git(cwd: &Workdir, args: &[&str]) -> Result<std::process::Output> {
         cwd.git_output(args)
@@ -553,10 +560,16 @@ fn commit_repo(cwd: &Workdir, branch: Option<&str>, message: &str) -> Result<boo
     if !inside.status.success() {
         return Ok(false);
     }
-    let status = git(cwd, &["status", "--porcelain"])?;
+    let status = git(cwd, &["status", "--porcelain", "--ignore-submodules=all"])?;
+    anyhow::ensure!(
+        status.status.success(),
+        "git status: {}",
+        String::from_utf8_lossy(&status.stderr).trim()
+    );
     if String::from_utf8_lossy(&status.stdout).trim().is_empty() {
         return Ok(false);
     }
+    let gitlinks = submodule_pointers(cwd)?;
     // `symbolic-ref` fails on a detached HEAD.
     if !git(cwd, &["symbolic-ref", "-q", "HEAD"])?.status.success() {
         let branch =
@@ -568,7 +581,10 @@ fn commit_repo(cwd: &Workdir, branch: Option<&str>, message: &str) -> Result<boo
             String::from_utf8_lossy(&out.stderr).trim()
         );
     }
-    let add = git(cwd, &["add", "-A"])?;
+    let mut add_args: Vec<String> = ["add", "-A", "--", "."].map(String::from).to_vec();
+    add_args.extend(gitlinks.iter().map(|path| format!(":(exclude,literal){path}")));
+    let add_args: Vec<&str> = add_args.iter().map(String::as_str).collect();
+    let add = git(cwd, &add_args)?;
     anyhow::ensure!(
         add.status.success(),
         "git add: {}",
@@ -582,6 +598,26 @@ fn commit_repo(cwd: &Workdir, branch: Option<&str>, message: &str) -> Result<boo
         String::from_utf8_lossy(&commit.stderr).trim()
     );
     Ok(true)
+}
+
+/// The paths of the submodule pointers (gitlinks) in `cwd`'s index, the
+/// repository's direct submodules, whether checked out or not.
+fn submodule_pointers(cwd: &Workdir) -> Result<Vec<String>> {
+    let out = cwd
+        .git_output(&["ls-files", "--stage", "-z"])
+        .context("running git ls-files --stage")?;
+    anyhow::ensure!(
+        out.status.success(),
+        "git ls-files --stage: {}",
+        String::from_utf8_lossy(&out.stderr).trim()
+    );
+    Ok(String::from_utf8_lossy(&out.stdout)
+        .split('\0')
+        .filter_map(|entry| {
+            let (meta, path) = entry.split_once('\t')?;
+            meta.starts_with("160000 ").then(|| path.to_string())
+        })
+        .collect())
 }
 
 /// What tells one run's commit from another's: which run of the conversation
@@ -931,6 +967,52 @@ write : nothing";
         assert_eq!(current_branch(&work).as_deref(), Some("task/x"));
         assert_eq!(git(&dir, &["log", "-1", "--format=%s"]), "second");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The work inside a submodule is committed there, and the superproject
+    /// never records the submodule's commit: a run that changes only the
+    /// submodule leaves the superproject without a commit, and one that also
+    /// changes the superproject commits only its own files.
+    #[test]
+    fn a_run_never_commits_a_submodule_pointer() {
+        let root = std::env::temp_dir().join(format!("tod-commit-sub-{}", Uuid::new_v4()));
+        let (lib, top) = (root.join("lib"), root.join("top"));
+        for dir in [&lib, &top] {
+            std::fs::create_dir_all(dir).unwrap();
+            git(dir, &["init", "-q", "-b", "main"]);
+            std::fs::write(dir.join("a.txt"), "a").unwrap();
+            git(dir, &["add", "."]);
+            git(dir, &["commit", "-q", "-m", "init"]);
+        }
+        git(
+            &top,
+            &["-c", "protocol.file.allow=always", "submodule", "add", "-q", lib.to_str().unwrap(), "lib"],
+        );
+        git(&top, &["commit", "-q", "-m", "add lib"]);
+        git(&top, &["switch", "-q", "-c", "task/x"]);
+        let pinned = git(&top, &["rev-parse", "HEAD:lib"]);
+        let top_head = git(&top, &["rev-parse", "HEAD"]);
+        let work = Workdir::host(&top);
+
+        // Only the submodule changed: it is committed, the superproject is not.
+        std::fs::write(top.join("lib/b.txt"), "b").unwrap();
+        assert!(commit_worktree(&work, Some("task/x"), "run 1").unwrap());
+        let sub = top.join("lib");
+        assert_eq!(git(&sub, &["log", "-1", "--format=%s"]), "run 1");
+        assert_eq!(git(&top, &["rev-parse", "HEAD"]), top_head, "no superproject commit");
+
+        // A submodule at another commit than the one recorded, with nothing
+        // else changed, is not a change of the superproject's.
+        assert!(!commit_worktree(&work, Some("task/x"), "nothing").unwrap());
+        assert_eq!(git(&top, &["rev-parse", "HEAD"]), top_head);
+
+        // The superproject's own files are committed; the pointer stays.
+        std::fs::write(top.join("c.txt"), "c").unwrap();
+        assert!(commit_worktree(&work, Some("task/x"), "run 2").unwrap());
+        assert_eq!(git(&top, &["log", "-1", "--format=%s"]), "run 2");
+        assert_eq!(git(&top, &["rev-parse", "HEAD:lib"]), pinned, "the pointer is not committed");
+        assert_eq!(git(&top, &["show", "--name-only", "--format=", "HEAD"]), "c.txt");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
 
