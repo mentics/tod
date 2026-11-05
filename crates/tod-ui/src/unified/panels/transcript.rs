@@ -749,7 +749,10 @@ impl TranscriptPanel {
                             let turns = repo.turns(id)?;
                             let row = repo.get(id)?;
                             let meta = row.as_ref().map(|c| (c.focus, c.protocol));
-                            let session_name = row.and_then(|c| c.session_name);
+                            let session_name = row.and_then(|c| {
+                                let created = c.created_at;
+                                c.session_name.map(|n| tod_core::session_name::localize(&n, created))
+                            });
                             anyhow::Ok((turns, session_name, meta))
                         })
                         .unwrap_or_default();
