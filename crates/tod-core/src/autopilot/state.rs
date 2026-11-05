@@ -111,6 +111,15 @@ pub struct LoopCounters {
     /// review, then fix; the run stops for the user at [`REVIEW_ROUND_LIMIT`].
     #[serde(default)]
     pub review_rounds: u32,
+    /// Times failing checks (`tod_core::checks`) went to the fix agent since
+    /// they last all passed; the run stops for the user at the review round
+    /// limit (`lifecycle.review_round_limit`).
+    #[serde(default)]
+    pub check_rounds: u32,
+    /// The fingerprint of the files the failing checks were last sent to the
+    /// fix agent for: failing again on the same files means it changed nothing.
+    #[serde(default)]
+    pub checks_sent: Option<String>,
     /// Times a failed verification sent the node back to be fixed.
     #[serde(default)]
     pub fix_cycles: u32,

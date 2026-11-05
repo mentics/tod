@@ -222,6 +222,8 @@ pub enum FleetMutation {
         owner: String,
         at: i64,
     },
+    /// A gate check ran (`crate::check_runs`).
+    RecordCheckRun(Box<crate::check_runs::CheckRun>),
     /// The processing is still alive.
     ActivityBeat {
         id: uuid::Uuid,
@@ -317,6 +319,7 @@ impl FleetMutation {
                 | FleetMutation::CloudNodeMarkLost { .. }
                 | FleetMutation::ActivityStart { .. }
                 | FleetMutation::ActivityBeat { .. }
+                | FleetMutation::RecordCheckRun(_)
                 | FleetMutation::ActivityEnd { .. }
                 | FleetMutation::ActivityClearLost { .. }
                 | FleetMutation::DeferNode { .. }
@@ -568,6 +571,9 @@ impl FleetMutation {
             }
             FleetMutation::ActivityStart { id, node, kind, owner, at } => {
                 crate::activity::ActivityRepo::new(conn).start(*id, *node, kind, owner, *at)?;
+            }
+            FleetMutation::RecordCheckRun(run) => {
+                crate::check_runs::CheckRunRepo::new(conn).record(run)?;
             }
             FleetMutation::ActivityBeat { id, at } => {
                 // A lease cleared under its owner is the owner's to notice

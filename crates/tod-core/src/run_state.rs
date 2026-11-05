@@ -61,6 +61,12 @@ pub mod kind {
     pub const LOOPING: &str = "looping";
     /// Review and fix ran out of rounds without a review coming back clean.
     pub const REVIEW_NOT_CONVERGING: &str = "review_not_converging";
+    /// A phase's check could not run at all.
+    pub const CHECK_BROKEN: &str = "check_broken";
+    /// A phase's checks went to the fix agent as often as allowed and still fail.
+    pub const CHECKS_NOT_CONVERGING: &str = "checks_not_converging";
+    /// The fix agent changed nothing when sent the failing checks.
+    pub const CHECKS_UNFIXED: &str = "checks_unfixed";
 }
 
 /// How a run's words differ by who ran it.
@@ -182,6 +188,11 @@ pub fn for_outcome(outcome: &Outcome, words: Words<'_>) -> Draft {
                 NeedsHuman::ReviewNotConverging { .. } => {
                     draft(Phase::Stopped, kind::REVIEW_NOT_CONVERGING, text, RESUMABLE_BY_YOU)
                 }
+                NeedsHuman::CheckBroken { .. } => draft(Phase::Stopped, kind::CHECK_BROKEN, text, RESUMABLE_BY_YOU),
+                NeedsHuman::ChecksNotConverging { .. } => {
+                    draft(Phase::Stopped, kind::CHECKS_NOT_CONVERGING, text, RESUMABLE_BY_YOU)
+                }
+                NeedsHuman::ChecksUnfixed { .. } => draft(Phase::Stopped, kind::CHECKS_UNFIXED, text, RESUMABLE_BY_YOU),
             }
         }
     }
@@ -334,6 +345,12 @@ mod tests {
                 NeedsHuman::ReviewNotConverging { rounds: 3, standing: vec!["[ab12] a bug (fixed)".into()] },
                 kind::REVIEW_NOT_CONVERGING,
             ),
+            (NeedsHuman::CheckBroken { check: "lint".into(), why: "not found".into() }, kind::CHECK_BROKEN),
+            (
+                NeedsHuman::ChecksNotConverging { rounds: 5, failing: vec!["lint".into()] },
+                kind::CHECKS_NOT_CONVERGING,
+            ),
+            (NeedsHuman::ChecksUnfixed { failing: vec!["lint".into()] }, kind::CHECKS_UNFIXED),
         ];
         for (reason, expected) in stops {
             let got = needs(reason.clone());

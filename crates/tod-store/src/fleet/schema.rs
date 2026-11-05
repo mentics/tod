@@ -653,6 +653,7 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
     crate::waits::add_stay(conn)?;
     crate::lifecycle_config::add_delete_sandbox(conn)?;
     crate::lifecycle_config::add_agents(conn)?;
+    crate::lifecycle_config::add_checks(conn)?;
     crate::lifecycle_config::add_pr_draft_review(conn)?;
     crate::review::add_pr_columns(conn)?;
     // A cloud supervisor's heartbeat for a node (`crate::cloud_activity`):
@@ -665,6 +666,9 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
     // Machine-local lease bookkeeping: no sync, no journey trigger
     // (`crate::activity`).
     conn.execute_batch(crate::activity::CREATE_TABLE)?;
+    // The latest result of each gate check: machine-local, not journaled
+    // (`crate::check_runs`).
+    conn.execute_batch(crate::check_runs::CREATE_TABLE)?;
     // The user's deferrals of nodes: machine-local, not synced, journaled.
     conn.execute_batch(crate::deferrals::CREATE_TABLE)?;
     conn.execute_batch(&crate::journey_changes::deferrals_triggers_sql())?;

@@ -130,6 +130,9 @@ pub fn check_gate(conn: &Connection, node: Uuid, from: &str) -> Result<GateCheck
             detail,
         });
     }
+    // The commands configured for the phase come last, answered from their
+    // latest run (`crate::checks`).
+    criteria.extend(crate::checks::gate_criteria(conn, node, from, to)?);
     Ok(GateCheck {
         from: from.to_string(),
         to: Some(to.to_string()),
@@ -159,6 +162,12 @@ fn settle_gate_unleased(fleet: &FleetStore, node: Uuid, branch_template: &str) -
     if from == "ready" {
         crate::gate::derived::generate_missing_branch(fleet, node, branch_template)?;
     }
+    // The phase's configured checks run first, those whose files changed since
+    // their last run; a command that cannot run is an error, not a failure.
+    let round = crate::checks::run_stale(fleet, node, &from)?;
+    if let Some(run) = round.broken().next() {
+        anyhow::bail!("the check `{}` could not run: {}", crate::checks::run_name(run), run.output);
+    }
     // Derived criteria may read GitHub: not under the projection lock, which
     // the UI thread reads through.
     let gate = fleet.read_detached(|conn| check_gate(conn, node, &from))?;
@@ -166,6 +175,8 @@ fn settle_gate_unleased(fleet: &FleetStore, node: Uuid, branch_template: &str) -
         .criteria
         .iter()
         .filter(|c| c.outcome != OUTCOME_WAIVED)
+        // A check is not a row of the catalog: nothing to save it against.
+        .filter(|c| !crate::checks::is_check_criterion(&c.criterion))
         .map(|c| {
             (
                 c.criterion.id,

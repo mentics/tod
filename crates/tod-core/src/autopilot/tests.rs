@@ -39,6 +39,9 @@ struct FakeAgent {
     /// Every review turn records a new finding and finishes: a reviewer that
     /// never comes back clean.
     review_never_clean: bool,
+    /// Every fix turn first writes this file (its path and content): the
+    /// change that makes a configured check pass.
+    fix_writes: Option<(PathBuf, String)>,
 }
 
 type VerifyScript = Arc<dyn Fn(usize, &[Uuid]) -> Vec<Uuid> + Send + Sync>;
@@ -55,6 +58,7 @@ impl FakeAgent {
             verify_rounds: std::sync::atomic::AtomicUsize::new(0),
             phase_churn: false,
             review_never_clean: false,
+            fix_writes: None,
         }
     }
 
@@ -184,6 +188,16 @@ impl FakeAgent {
                             target: None,
                         },
                     )?;
+                }
+            }
+            if let Some((path, content)) = &self.fix_writes {
+                let protocol = self.fleet.read(|conn| {
+                    Ok(tod_store::conversation::ConversationRepo::new(conn)
+                        .get(conversation.parse()?)?
+                        .map(|c| c.protocol))
+                })?;
+                if protocol == Some(tod_store::conversation::ProtocolKind::Fix) {
+                    std::fs::write(path, content)?;
                 }
             }
             let place = crate::conversation::mock::Place {
@@ -2439,4 +2453,92 @@ fn pr_draft_review_findings_are_posted_and_a_resolved_thread_declines_its_findin
     assert_eq!(findings[0].pr_thread.as_deref(), Some("T_0_0"));
     assert_eq!(findings[0].status, tod_store::review::FINDING_DECLINED);
     assert_eq!(openings(&fx, ProtocolKind::Review).len(), 1, "a declined finding leaves the round clean");
+}
+
+
+/// A repository in the fixture's workspace (checks fingerprint it with git),
+/// with `command` configured as a check for `phase`.
+fn with_check(fx: &Fixture, phase: &str, label: &str, command: &str) -> PathBuf {
+    let workspace = fx.root.join("workspace");
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git").arg("-C").arg(&workspace).args(args).output().unwrap();
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    };
+    git(&["init", "-q"]);
+    git(&["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "first"]);
+    fx.fleet
+        .enqueue_outline(OutlineMutation::EnableCapabilities {
+            node_id: fx.node,
+            capabilities: vec![Capability::LifecycleConfig],
+        })
+        .unwrap();
+    fx.fleet.writer().flush().unwrap();
+    fx.fleet
+        .enqueue_outline(OutlineMutation::SetNodeLifecycleChecks {
+            node_id: fx.node,
+            checks: [(
+                phase.to_string(),
+                vec![tod_store::lifecycle_config::Check { label: label.into(), command: command.into() }],
+            )]
+            .into(),
+        })
+        .unwrap();
+    fx.fleet.writer().flush().unwrap();
+    workspace
+}
+
+#[test]
+fn a_failing_check_goes_to_the_fix_agent_as_a_finding_and_a_change_reruns_it() {
+    let fx = setup();
+    retire_outside_criteria(&fx);
+    let workspace = with_check(&fx, "review", "ok file", "test -f ok.txt || { echo 'ok.txt is missing'; exit 1; }");
+    let mut agent = FakeAgent::new(&fx.fleet);
+    agent.fix_writes = Some((workspace.join("ok.txt"), "fixed".into()));
+    let mut pilot = autopilot(&fx, Budget::default());
+    let outcome = pilot.run(&fx.fleet, &mut agent).unwrap();
+    assert_eq!(outcome, Outcome::Done, "{:#?}", pilot.state().steps);
+    let steps = &pilot.state().steps;
+    assert_eq!(steps.iter().filter(|s| s.step == "fix_checks").count(), 1, "{steps:#?}");
+    // The failure was a finding the fix agent was given, with the output.
+    let findings = fx.fleet.read(|conn| Ok(tod_store::review::ReviewRepo::new(conn).list_for_node(fx.node)?)).unwrap();
+    let finding = findings.iter().find(|f| f.summary == "Check `ok file` fails").expect("a finding for the check");
+    assert!(finding.detail.as_deref().unwrap().contains("ok.txt is missing"), "{finding:?}");
+    let fixes = openings(&fx, ProtocolKind::Fix);
+    assert!(fixes.iter().any(|(_, opening)| opening.contains("Check `ok file` fails")), "the fixer is told");
+    // And it passes now, on the files the fix left.
+    let run = fx
+        .fleet
+        .read(|conn| tod_store::check_runs::CheckRunRepo::new(conn).latest(fx.node, "review", "test -f ok.txt || { echo 'ok.txt is missing'; exit 1; }"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(run.verdict, tod_store::check_runs::Verdict::Passed);
+}
+
+#[test]
+fn a_fix_that_changes_nothing_stops_the_run_instead_of_going_round() {
+    let fx = setup();
+    retire_outside_criteria(&fx);
+    with_check(&fx, "review", "", "exit 1");
+    let mut agent = FakeAgent::new(&fx.fleet);
+    let mut pilot = autopilot(&fx, Budget::default());
+    let outcome = pilot.run(&fx.fleet, &mut agent).unwrap();
+    match &outcome {
+        Outcome::NeedsHuman { reason: NeedsHuman::ChecksUnfixed { failing } } => {
+            assert_eq!(failing, &["exit 1".to_string()], "a check with no label goes by its command");
+        }
+        other => panic!("{other:?} {:#?}", pilot.state().steps),
+    }
+    assert_eq!(lifecycle::current_state(&fx.fleet, fx.node).unwrap(), "review");
+    assert!(outcome_words(&outcome).contains("changed nothing"));
+}
+
+#[test]
+fn checks_in_a_phase_are_part_of_its_gate() {
+    let fx = setup();
+    retire_outside_criteria(&fx);
+    with_check(&fx, "proposed", "never passes", "exit 2");
+    let gate = crate::phase::settle_gate(&fx.fleet, fx.node, "task/{slug}").unwrap();
+    let failing: Vec<_> = gate.failing().map(|c| (c.criterion.label.clone(), c.detail.clone())).collect();
+    assert!(failing.iter().any(|(label, detail)| label == "Check: never passes" && detail.starts_with("failed")), "{failing:?}");
+    assert!(!gate.clear());
 }
