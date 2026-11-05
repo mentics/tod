@@ -267,6 +267,12 @@ pub struct AgentTranscriptsView {
     highlight: Option<ChunkId>,
     /// Every usage figure is shown, not just the one-line summary.
     usage_expanded: bool,
+    /// The platform, model, and effort the selected session's conversation
+    /// was started with, when it is one.
+    launch: Option<tod_agent::AgentLaunchOptions>,
+    /// When the selected session's platform record was last checked, so a
+    /// running session's usage is re-read as it goes, not on every change.
+    history_checked: Option<std::time::Instant>,
     _transcript_subscription: Subscription,
     /// Follows the store and the traffic log, so a running session's
     /// transcript grows as it goes by.
@@ -320,6 +326,8 @@ impl AgentTranscriptsView {
             transcript_focused: false,
             highlight: None,
             usage_expanded: false,
+            launch: None,
+            history_checked: None,
             _transcript_subscription: subscription,
             _live: gpui::Task::ready(()),
         };
@@ -379,6 +387,15 @@ impl AgentTranscriptsView {
             .map(|key| self.load_turns(key))
             .unwrap_or_default();
         self.set_header(&id);
+        // A running session spends as it goes: look at its record again
+        // (a read only when the platform's fingerprint moved).
+        if self.history.is_some()
+            && self.history_checked.is_none_or(|at| at.elapsed() >= std::time::Duration::from_secs(10))
+            && let Some(session) = self.fleet.get_agent_session(&id).ok().flatten()
+        {
+            self.history_checked = Some(std::time::Instant::now());
+            self.refresh_history(session, cx);
+        }
         self.sync_transcript(cx);
         cx.notify();
     }
@@ -708,12 +725,35 @@ impl AgentTranscriptsView {
             .and_then(Transcript::from_stored);
         self.read_error = None;
         self.format_problems.clear();
+        self.history_checked = Some(std::time::Instant::now());
+        self.launch = session.as_ref().and_then(|s| self.recorded_launch(s));
         self.set_header(&agent_id);
         if let Some(session) = session {
             self.refresh_history(session, cx);
         }
         self.sync_transcript(cx);
         cx.notify();
+    }
+
+    /// What the conversation behind `session` was started with, from its row.
+    fn recorded_launch(&self, session: &AgentSession) -> Option<tod_agent::AgentLaunchOptions> {
+        let id: uuid::Uuid = session
+            .session_key
+            .as_deref()?
+            .strip_prefix("conversation-")?
+            .parse()
+            .ok()?;
+        let row = self
+            .fleet
+            .read(|conn| tod_store::conversation::ConversationRepo::new(conn).get(id))
+            .ok()
+            .flatten()?;
+        let platform = tod_store::parse_platform(row.platform.as_deref()?)?;
+        Some(tod_agent::AgentLaunchOptions::from_settings(
+            platform,
+            row.model.filter(|m| !m.is_empty())?,
+            row.effort.filter(|e| !e.is_empty())?,
+        ))
     }
 
     fn load_turns(&self, agent_id: &str) -> Vec<TurnRow> {
@@ -1040,16 +1080,22 @@ impl AgentTranscriptsView {
     fn render_usage(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
         let history = self.history.as_ref()?;
         let border = cx.theme().border;
-        let line = match (&history.usage, history.usage_read) {
-            (Some(usage), _) => token_usage::summary(usage),
-            (None, false) => "Tokens: not read yet — kept from before usage was".to_string(),
-            (None, true) => "Tokens: the platform's record of this session has none".to_string(),
+        let (line, details) = match (&history.usage, history.usage_read) {
+            (Some(usage), _) => {
+                let (line, details) = crate::ui::session_info::line(self.launch.as_ref(), Some(usage))
+                    .unwrap_or_else(|| (token_usage::summary(usage), token_usage::details(usage)));
+                (line, Some(details).filter(|_| self.usage_expanded))
+            }
+            (None, read) => {
+                let tokens = if read {
+                    "Tokens: the platform's record of this session has none"
+                } else {
+                    "Tokens: not read yet — kept from before usage was"
+                };
+                let head = crate::ui::session_info::line(self.launch.as_ref(), None).map(|(l, _)| l);
+                (head.map_or_else(|| tokens.to_string(), |h| format!("{h} · {tokens}")), None)
+            }
         };
-        let details = history
-            .usage
-            .as_ref()
-            .filter(|_| self.usage_expanded)
-            .map(token_usage::details);
         Some(
             v_flex()
                 .w_full()
