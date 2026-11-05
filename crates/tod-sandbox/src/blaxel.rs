@@ -290,6 +290,18 @@ fn parse_drive(v: &Value) -> DriveInfo {
     }
 }
 
+/// `keep-when-idle=true` exempts a sandbox from the workspace's idle prune
+/// (a scheduled job outside tod, e.g. Cofactr's `Blaxel Prune` workflow,
+/// deletes every sandbox asleep longer than its TTL without it). tod sets it
+/// on what must outlive a quiet hour: a golden and the orchestrator. A fork
+/// keeps its source's labels and a label update only adds, so a node forked
+/// from a golden sets it back to `false` ([`KEEP_WHEN_IDLE_NO`]).
+pub const LABEL_KEEP_WHEN_IDLE: &str = "keep-when-idle";
+/// The value that keeps a sandbox through the idle prune.
+pub const KEEP_WHEN_IDLE_YES: &str = "true";
+/// The value that leaves it to the prune.
+pub const KEEP_WHEN_IDLE_NO: &str = "false";
+
 /// The body of a `PUT /sandboxes/<name>` that sets `proxy` and `labels` on
 /// `current` (its `GET` record) and nothing else. `PUT` replaces the whole
 /// spec: a body of only the network clears `runtime.image` and the sandbox

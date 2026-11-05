@@ -62,12 +62,19 @@ pub fn ensure_golden_current(sandboxes: &mut Sandboxes, bx: &Blaxel, repo: &str,
 
 /// Where `repo`'s golden comes from ([`golden::decide_source`]): its own
 /// entry (a `prefix*` resolved to its newest sandbox), else one is built.
+/// An entry naming a sandbox Blaxel no longer has (deleted outside tod, as
+/// the workspace's idle prune did to goldens made before they were labelled
+/// `keep-when-idle`) is built again too, and the user is told why.
 fn source_for(sandboxes: &Sandboxes, bx: &Blaxel, repo: &str) -> Result<golden::Source> {
     let own = match sandboxes.account()?.golden_for(repo) {
-        Some(_) => Some(sandboxes.resolve_golden(bx, repo)?),
+        Some(_) => {
+            let name = sandboxes.resolve_golden(bx, repo)?;
+            let exists = bx.get(&name)?.is_some();
+            Some((name, exists))
+        }
         None => None,
     };
-    Ok(golden::decide_source(repo, own.as_deref()))
+    Ok(golden::decide_source(repo, own.as_ref().map(|(name, exists)| (name.as_str(), *exists))))
 }
 
 /// The decision of [`ensure_golden_current`], apart from Blaxel and the
@@ -216,7 +223,8 @@ fn build_golden(
     Ok(name)
 }
 
-/// Labels the sandbox with this build's stamp, `tod-kind=golden` and the
+/// Labels the sandbox with this build's stamp, `tod-kind=golden`,
+/// `keep-when-idle=true` (so the idle prune never deletes it) and the
 /// repository it holds (`tod-repo`), marks it
 /// `ready` last, and checks Blaxel says so.
 fn mark_ready(
@@ -233,6 +241,7 @@ fn mark_ready(
     let stamp_labels = mine.labels();
     let mut labels: Vec<(&str, &str)> = stamp_labels.iter().map(|(k, v)| (*k, v.as_str())).collect();
     labels.push(("tod-kind", golden::KIND_GOLDEN));
+    labels.push((tod_sandbox::blaxel::LABEL_KEEP_WHEN_IDLE, tod_sandbox::blaxel::KEEP_WHEN_IDLE_YES));
     let repo_label = golden::repo_label(repo)?;
     labels.push((golden::LABEL_REPO, repo_label.as_str()));
     run("label it", &mut || bx.set_labels(name, &labels).map(|()| None))?;

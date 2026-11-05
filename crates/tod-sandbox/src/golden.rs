@@ -311,11 +311,14 @@ pub enum Source {
 }
 
 /// Chooses the [`Source`] for `repo` (normalized `owner/name`, lower case)
-/// from its golden entry `own`: refreshed from it when there is one, else
-/// built. Never a fork of another repository's golden.
-pub fn decide_source(repo: &str, own: Option<&str>) -> Source {
+/// from its golden entry `own` (its name, and whether Blaxel still has it):
+/// refreshed from it when there is one, else built. Never a fork of another repository's golden.
+pub fn decide_source(repo: &str, own: Option<(&str, bool)>) -> Source {
     match own {
-        Some(own) => Source::Refresh { from: own.to_string() },
+        Some((own, true)) => Source::Refresh { from: own.to_string() },
+        Some((own, false)) => Source::Build {
+            why: format!("the golden sandbox {own} for {repo} no longer exists (it was deleted outside tod)"),
+        },
         None => Source::Build { why: format!("{repo} has no golden sandbox") },
     }
 }
@@ -361,11 +364,14 @@ pub fn clone_script(repo: &str) -> Result<String> {
 
 /// The `POST /sandboxes` body of the sandbox a golden is built in: from
 /// `image`, with the given proxy (holding the user's GitHub token, so the
-/// clone can read a private repository), labelled `tod-kind=golden` (not
-/// `ready`: that is set last).
+/// clone can read a private repository), labelled `tod-kind=golden` and
+/// `keep-when-idle=true` from the start (not `ready`: that is set last).
 pub fn build_body(name: &str, image: &str, region: &str, memory_mb: u32, proxy: serde_json::Value) -> serde_json::Value {
     serde_json::json!({
-        "metadata": { "name": name, "labels": { "tod-kind": KIND_GOLDEN } },
+        "metadata": {
+            "name": name,
+            "labels": { "tod-kind": KIND_GOLDEN, (crate::blaxel::LABEL_KEEP_WHEN_IDLE): crate::blaxel::KEEP_WHEN_IDLE_YES },
+        },
         "spec": {
             "region": region,
             "runtime": {
@@ -582,7 +588,12 @@ mod tests {
 
     #[test]
     fn a_repository_with_no_golden_is_built_never_forked_from_anothers() {
-        assert_eq!(decide_source("o/r", Some("tod-golden-o-r-1")), Source::Refresh { from: "tod-golden-o-r-1".into() });
+        assert_eq!(decide_source("o/r", Some(("tod-golden-o-r-1", true))), Source::Refresh { from: "tod-golden-o-r-1".into() });
+        // Deleted outside tod (the idle prune): built again, saying so.
+        match decide_source("o/r", Some(("tod-golden-o-r-1", false))) {
+            Source::Build { why } => assert!(why.contains("tod-golden-o-r-1") && why.contains("no longer exists"), "{why}"),
+            other => panic!("{other:?}"),
+        }
         assert!(matches!(decide_source("o/r", None), Source::Build { .. }));
     }
 
@@ -613,6 +624,7 @@ mod tests {
     fn the_build_body_is_a_golden_with_the_given_proxy_and_not_ready() {
         let body = build_body("tod-golden-o-r-1", "sandbox/x:latest", "us-pdx-1", 4096, serde_json::json!({"enabled": true}));
         assert_eq!(body["metadata"]["labels"]["tod-kind"], "golden");
+        assert_eq!(body["metadata"]["labels"]["keep-when-idle"], "true");
         assert!(body["metadata"]["labels"].get("ready").is_none());
         assert_eq!(body["spec"]["runtime"]["image"], "sandbox/x:latest");
         assert_eq!(body["spec"]["network"]["proxy"]["enabled"], true);

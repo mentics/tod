@@ -531,8 +531,12 @@ fn golden(ctx: &mut Ctx, mut args: Args) -> Result<i32> {
             ctx.save()?;
             let bx = ctx.blaxel()?;
             let real = ctx.resolve_golden(&bx, &repo)?;
-            bx.set_labels(&real, &[(tod_sandbox::golden::LABEL_REPO, label.as_str())])
-                .with_context(|| format!("label {real} with the repository {repo} it holds"))?;
+            // And keep it through the workspace's idle prune.
+            let labels = [
+                (tod_sandbox::golden::LABEL_REPO, label.as_str()),
+                (tod_sandbox::blaxel::LABEL_KEEP_WHEN_IDLE, tod_sandbox::blaxel::KEEP_WHEN_IDLE_YES),
+            ];
+            bx.set_labels(&real, &labels).with_context(|| format!("label {real} with the repository {repo} it holds"))?;
             println!("the golden of {repo} is now {sandbox} ({real} is labelled {}={label})", tod_sandbox::golden::LABEL_REPO);
         }
     }

@@ -343,7 +343,10 @@ pub fn start_command() -> String {
 
 fn create_body(spec: &Spec) -> serde_json::Value {
     let mut body = json!({
-        "metadata": { "name": spec.name, "labels": { "tod-role": "orchestrator" } },
+        "metadata": {
+            "name": spec.name,
+            "labels": { "tod-role": "orchestrator", (crate::blaxel::LABEL_KEEP_WHEN_IDLE): crate::blaxel::KEEP_WHEN_IDLE_YES },
+        },
         "spec": {
             "region": spec.region,
             "runtime": {
