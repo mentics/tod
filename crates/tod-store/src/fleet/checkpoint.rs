@@ -50,6 +50,10 @@ impl Default for Limits {
 pub enum Saved {
     /// Nothing uncommitted: there is nothing to keep.
     Clean,
+    /// Nothing uncommitted, and the checkpoint this checkout pushed or
+    /// restored was deleted: its work has since been committed (or thrown
+    /// away) here, so restoring it later would only bring back old edits.
+    Retired,
     /// The same work as the checkpoint already pushed.
     Unchanged,
     /// Pushed.
@@ -228,7 +232,7 @@ pub fn save_repo(repo: &Workdir, reference: &str, limits: &Limits) -> Result<Sav
         .with_context(|| format!("{repo} has no commit yet to checkpoint on"))?;
     let paths = changed_paths(repo)?;
     if paths.is_empty() {
-        return Ok(Saved::Clean);
+        return retire_own(repo, reference);
     }
     gate(repo, &paths, limits)?;
     has_origin(repo)?;
@@ -239,7 +243,7 @@ pub fn save_repo(repo: &Workdir, reference: &str, limits: &Limits) -> Result<Sav
     // Never left behind, whatever happened.
     let _ = repo.output("rm", &["-f", &index]);
     let (commit, files) = match result? {
-        Built::Nothing => return Ok(Saved::Clean),
+        Built::Nothing => return retire_own(repo, reference),
         Built::Same => return Ok(Saved::Unchanged),
         Built::Commit { commit, files } => (commit, files),
     };
@@ -248,6 +252,29 @@ pub fn save_repo(repo: &Workdir, reference: &str, limits: &Limits) -> Result<Sav
     // Only after it is on the remote, so "unchanged" never means unpushed.
     repo.git(&["update-ref", reference, &commit])?;
     Ok(Saved::Pushed { commit, files })
+}
+
+/// `repo` has nothing uncommitted. The local copy of `reference` exists only
+/// where this checkout pushed the checkpoint or restored it, so the work it
+/// holds was here and is not any more: the checkpoint is deleted, on origin
+/// and locally. A checkpoint this checkout never had (a restore that did not
+/// apply, in a sandbox made since) is left alone, and so is one origin holds
+/// at another commit (pushed from elsewhere since).
+fn retire_own(repo: &Workdir, reference: &str) -> Result<Saved> {
+    let Ok(local) = repo.git(&["rev-parse", "-q", "--verify", reference]) else {
+        return Ok(Saved::Clean);
+    };
+    match remote_ref(repo, reference)? {
+        Some(remote) if remote == local => {
+            delete_ref(repo, reference)?;
+            Ok(Saved::Retired)
+        }
+        Some(_) => Ok(Saved::Clean),
+        None => {
+            repo.git(&["update-ref", "-d", reference])?;
+            Ok(Saved::Clean)
+        }
+    }
 }
 
 enum Built {
@@ -362,6 +389,9 @@ pub fn restore_repo(repo: &Workdir, reference: &str) -> Result<Restored> {
     }
     // Uncommitted, as it was, not staged.
     repo.git(&["reset", "--quiet"])?;
+    // This checkout has the checkpoint now: once its work is committed here,
+    // the next checkpoint retires it (`retire_own`).
+    repo.git(&["update-ref", reference, &commit])?;
     let files = repo.git(&["status", "--porcelain", "--ignore-submodules=all"])?.lines().count();
     Ok(if files == 0 { Restored::Nothing } else { Restored::Applied { files } })
 }
@@ -512,6 +542,65 @@ mod tests {
         assert!(err.contains("does not apply") && err.contains("still on origin"), "{err}");
         assert_eq!(fresh.git(&["status", "--porcelain"]).unwrap(), "");
         assert!(remote_ref(&fresh, REF).unwrap().is_some());
+        // This checkout never had the work, so being clean says nothing about
+        // it: the checkpoint stays for a person to look at.
+        assert_eq!(save_repo(&fresh, REF, &Limits::default()).unwrap(), Saved::Clean);
+        assert!(remote_ref(&fresh, REF).unwrap().is_some());
+    }
+
+    /// Seen live: a checkpoint pushed on Oct 27 whose work the same sandbox
+    /// committed later stayed on origin, and every sandbox made since tried
+    /// it and warned that it did not apply.
+    #[test]
+    fn a_checkpoint_whose_work_was_committed_where_it_was_made_is_retired() {
+        let f = Fixture::new();
+        let dir = f.clone_named("w");
+        std::fs::write(dir.join("a.txt"), "two\n").unwrap();
+        let work = Workdir::host(&dir);
+        assert!(matches!(save_repo(&work, REF, &Limits::default()).unwrap(), Saved::Pushed { .. }));
+
+        run(&dir, &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qam", "the work"]);
+        assert_eq!(save_repo(&work, REF, &Limits::default()).unwrap(), Saved::Retired);
+        assert!(remote_ref(&work, REF).unwrap().is_none());
+        assert!(work.git(&["rev-parse", "-q", "--verify", REF]).is_err(), "the local copy goes too");
+        assert_eq!(save_repo(&work, REF, &Limits::default()).unwrap(), Saved::Clean);
+    }
+
+    #[test]
+    fn a_restored_checkpoint_is_retired_once_its_work_is_committed() {
+        let f = Fixture::new();
+        let dir = f.clone_named("w");
+        std::fs::write(dir.join("a.txt"), "two\n").unwrap();
+        save_repo(&Workdir::host(&dir), REF, &Limits::default()).unwrap();
+
+        let fresh_dir = f.clone_named("fresh");
+        let fresh = Workdir::host(&fresh_dir);
+        assert!(matches!(restore_repo(&fresh, REF).unwrap(), Restored::Applied { .. }));
+        // Still uncommitted: the checkpoint is the same work and stays.
+        assert_eq!(save_repo(&fresh, REF, &Limits::default()).unwrap(), Saved::Unchanged);
+        assert!(remote_ref(&fresh, REF).unwrap().is_some());
+
+        run(&fresh_dir, &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qam", "the work"]);
+        assert_eq!(save_repo(&fresh, REF, &Limits::default()).unwrap(), Saved::Retired);
+        assert!(remote_ref(&fresh, REF).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_clean_checkout_leaves_a_checkpoint_pushed_from_elsewhere_since() {
+        let f = Fixture::new();
+        let dir = f.clone_named("w");
+        std::fs::write(dir.join("a.txt"), "two\n").unwrap();
+        let work = Workdir::host(&dir);
+        save_repo(&work, REF, &Limits::default()).unwrap();
+        // Another checkout of the node pushed newer work under the same ref.
+        let other = f.clone_named("other");
+        std::fs::write(other.join("a.txt"), "three\n").unwrap();
+        save_repo(&Workdir::host(&other), REF, &Limits::default()).unwrap();
+        let newer = remote_ref(&work, REF).unwrap();
+
+        run(&dir, &["checkout", "-q", "--", "a.txt"]);
+        assert_eq!(save_repo(&work, REF, &Limits::default()).unwrap(), Saved::Clean);
+        assert_eq!(remote_ref(&work, REF).unwrap(), newer, "not this checkout's to retire");
     }
 
     #[test]
