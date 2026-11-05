@@ -65,15 +65,16 @@ env_var = "STRIPE_API_KEY"
 test_url = "https://{host}/v1/balance"
 
 # Datadog sends two keys as two headers, so it is two presets. Add both to a
-# node. The site is `datadoghq.com`; for another site (us3, us5, eu, ...)
-# change the entry's host, e.g. `api.us5.datadoghq.com`. The application key
+# node. The host is the Gov Cloud site, `api.ddog-gov.com` (what Cofactr's ddapi
+# uses); for another site (datadoghq.com, us5, eu, ...)
+# change the entry's host, e.g. `api.datadoghq.com`. The application key
 # needs the scopes of what is read (`logs_read_data` for log search) and has
 # no test URL of its own: no harmless GET accepts it without a scope.
 [[preset]]
 id = "datadog-api-key"
 label = "Datadog (API key)"
 description = "Datadog API key, sent as DD-API-KEY. Use with the Datadog application key: logs, metrics, monitors"
-hosts = ["api.datadoghq.com"]
+hosts = ["api.ddog-gov.com"]
 auth = "header:DD-API-KEY"
 name = "datadog_api_key"
 env_var = "DD_API_KEY"
@@ -83,7 +84,7 @@ test_url = "https://{host}/api/v1/validate"
 id = "datadog-app-key"
 label = "Datadog (application key)"
 description = "Datadog application key, sent as DD-APPLICATION-KEY. Use with the Datadog API key; needs scopes such as logs_read_data"
-hosts = ["api.datadoghq.com"]
+hosts = ["api.ddog-gov.com"]
 auth = "header:DD-APPLICATION-KEY"
 name = "datadog_app_key"
 env_var = "DD_APPLICATION_KEY"
