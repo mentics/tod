@@ -119,6 +119,11 @@ pub enum OutlineMutation {
         node_id: Uuid,
         agents: crate::lifecycle_config::Agents,
     },
+    /// The Lifecycle config capability's checks (commands the gate runs) by phase.
+    SetNodeLifecycleChecks {
+        node_id: Uuid,
+        checks: crate::lifecycle_config::Checks,
+    },
     /// The Lifecycle config capability's "delete the sandbox on the final
     /// phase" choice; `None` leaves it to an ancestor.
     SetNodeLifecycleDeleteSandbox {
@@ -647,6 +652,10 @@ impl OutlineMutation {
             OutlineMutation::SetNodeLifecycleAgents { node_id, agents } => {
                 require_capability(conn, *node_id, Capability::LifecycleConfig)?;
                 crate::lifecycle_config::set_agents(conn, *node_id, agents)?;
+            }
+            OutlineMutation::SetNodeLifecycleChecks { node_id, checks } => {
+                require_capability(conn, *node_id, Capability::LifecycleConfig)?;
+                crate::lifecycle_config::set_checks(conn, *node_id, checks)?;
             }
             OutlineMutation::SetNodeLifecycleDeleteSandbox { node_id, delete_sandbox } => {
                 require_capability(conn, *node_id, Capability::LifecycleConfig)?;
@@ -1938,6 +1947,10 @@ fn copy_capabilities(conn: &Connection, source_id: Uuid, new_id: Uuid) -> Result
                 let agents = crate::lifecycle_config::agents(conn, source_id)?;
                 if !agents.is_empty() {
                     crate::lifecycle_config::set_agents(conn, new_id, &agents)?;
+                }
+                let checks = crate::lifecycle_config::checks(conn, source_id)?;
+                if !checks.is_empty() {
+                    crate::lifecycle_config::set_checks(conn, new_id, &checks)?;
                 }
             }
             Capability::Groups => {

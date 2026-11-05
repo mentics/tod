@@ -201,6 +201,7 @@ pub fn classify(mutation: &OutlineMutation) -> Option<(ActionKind, Entity, Uuid)
         | M::SetNodeEnvironment { .. }
         | M::SetNodeLifecycleConfig { .. }
         | M::SetNodeLifecycleAgents { .. }
+        | M::SetNodeLifecycleChecks { .. }
         | M::SetNodeLifecycleDeleteSandbox { .. }
         | M::SetNodeLifecyclePrDraftReview { .. }
         | M::SetNodeGroups { .. }

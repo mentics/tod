@@ -443,6 +443,7 @@ fn capture_outline_inverse(conn: &Connection, m: &OutlineMutation) -> Result<Opt
         | OutlineMutation::SetNodeEnvironment { .. }
         | OutlineMutation::SetNodeLifecycleConfig { .. }
         | OutlineMutation::SetNodeLifecycleAgents { .. }
+        | OutlineMutation::SetNodeLifecycleChecks { .. }
         | OutlineMutation::SetNodeLifecycleDeleteSandbox { .. }
         | OutlineMutation::SetNodeLifecyclePrDraftReview { .. }
         | OutlineMutation::SetNodeGroups { .. }

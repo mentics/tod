@@ -28,7 +28,8 @@ CREATE TABLE IF NOT EXISTS node_lifecycle_config (
     updated_at  INTEGER NOT NULL,
     delete_sandbox INTEGER,
     agents      TEXT NOT NULL DEFAULT '{}',
-    pr_draft_review INTEGER
+    pr_draft_review INTEGER,
+    checks      TEXT NOT NULL DEFAULT '{}'
 );";
 
 /// The `pr_draft_review` column (idempotent, no schema bump, like `agents`):
@@ -39,6 +40,18 @@ pub fn add_pr_draft_review(conn: &Connection) -> Result<()> {
         .exists([])?;
     if !has {
         conn.execute_batch("ALTER TABLE node_lifecycle_config ADD COLUMN pr_draft_review INTEGER")?;
+    }
+    Ok(())
+}
+
+/// The `checks` column (idempotent, no schema bump): the commands each phase's
+/// gate runs, by phase, as JSON.
+pub fn add_checks(conn: &Connection) -> Result<()> {
+    let has = conn
+        .prepare("SELECT 1 FROM pragma_table_info('node_lifecycle_config') WHERE name = 'checks'")?
+        .exists([])?;
+    if !has {
+        conn.execute_batch("ALTER TABLE node_lifecycle_config ADD COLUMN checks TEXT NOT NULL DEFAULT '{}'")?;
     }
     Ok(())
 }
@@ -316,6 +329,95 @@ pub fn resolve_agent(conn: &Connection, node_id: Uuid, phase: &str) -> Result<Re
         }
     }
     Ok(out)
+}
+
+/// One command a phase's gate runs (type checking, lint, and so on): it
+/// passes when it exits 0, and fails otherwise, with its output as the finding.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Check {
+    /// What messages call it ("pyright"); the command itself when blank.
+    #[serde(default)]
+    pub label: String,
+    /// Run by the shell in the node's Files directory.
+    pub command: String,
+}
+
+impl Check {
+    /// The name shown for the check: its label, else its command.
+    pub fn name(&self) -> &str {
+        let label = self.label.trim();
+        if label.is_empty() { self.command.trim() } else { label }
+    }
+}
+
+/// Checks by phase key, as stored on one node.
+pub type Checks = BTreeMap<String, Vec<Check>>;
+
+/// The checks for one phase after inheritance, and the node they came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedChecks {
+    pub checks: Vec<Check>,
+    pub source_node: Uuid,
+    pub inherited: bool,
+}
+
+/// The checks defined on `node_id` itself, by phase.
+pub fn checks(conn: &Connection, node_id: Uuid) -> Result<Checks> {
+    let has = conn
+        .prepare("SELECT 1 FROM pragma_table_info('node_lifecycle_config') WHERE name = 'checks'")?
+        .exists([])?;
+    if !has {
+        return Ok(Checks::new());
+    }
+    let raw: Option<String> = conn
+        .query_row(
+            "SELECT checks FROM node_lifecycle_config WHERE node_id = ?1",
+            params![uuid_to_blob(node_id)],
+            |row| row.get(0),
+        )
+        .optional()?;
+    match raw {
+        Some(s) => serde_json::from_str(&s).map_err(|err| anyhow::anyhow!("the stored checks of {node_id} are not readable: {err}")),
+        None => Ok(Checks::new()),
+    }
+}
+
+/// Replace the checks by phase on `node_id`. Rejects an unknown phase and a
+/// blank command; trims, and keeps an explicit empty list (it stops an
+/// ancestor's checks applying below, as an empty skill list does).
+pub fn set_checks(conn: &Connection, node_id: Uuid, config: &Checks) -> Result<()> {
+    let mut clean = Checks::new();
+    for (phase, list) in config {
+        if !is_phase(phase) {
+            bail!("{phase} is not a lifecycle phase ({})", PHASES.join(", "));
+        }
+        let mut out = Vec::new();
+        for check in list {
+            let command = check.command.trim();
+            if command.is_empty() {
+                bail!("{phase}: a check has no command (label {:?})", check.label.trim());
+            }
+            out.push(Check { label: check.label.trim().to_string(), command: command.to_string() });
+        }
+        clean.insert(phase.clone(), out);
+    }
+    conn.execute(
+        "INSERT INTO node_lifecycle_config (node_id, skills, updated_at, checks) VALUES (?1, '{}', ?2, ?3)
+         ON CONFLICT(node_id) DO UPDATE SET checks = excluded.checks, updated_at = excluded.updated_at",
+        params![uuid_to_blob(node_id), now_ms(), serde_json::to_string(&clean)?],
+    )?;
+    Ok(())
+}
+
+/// The checks for `phase` on `node_id`: the nearest node, from itself up,
+/// that lists the phase wins. `None` when no node does.
+pub fn resolve_checks(conn: &Connection, node_id: Uuid, phase: &str) -> Result<Option<ResolvedChecks>> {
+    for id in crate::outline::ancestor_chain(conn, node_id)?.into_iter().rev() {
+        if let Some(list) = checks(conn, id)?.remove(phase) {
+            return Ok(Some(ResolvedChecks { checks: list, source_node: id, inherited: id != node_id }));
+        }
+    }
+    Ok(None)
 }
 
 /// Whether the node's sandbox is deleted when it enters [`FINAL_PHASE`], and

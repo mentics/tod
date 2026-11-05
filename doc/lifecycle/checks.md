@@ -1,0 +1,54 @@
+# Checks: commands a phase's gate runs
+
+A project's own mechanical checks (type checking, lint, tests) belong in the
+phase they guard, run by the app, so an agent is only spent on what they find.
+
+## Configuration
+
+The Lifecycle config capability holds, per phase, an ordered list of checks:
+an optional **label** and a **command** (`tod_store::lifecycle_config::Check`).
+They are edited in the task editor next to the phase's skills ("Add check"),
+resolve like skills (the nearest node that lists the phase wins; an explicit
+empty list switches an ancestor's off), and exist for every phase key,
+including `implement` (the `active` state) and `verify` (`verifying`).
+`tod-cli` cannot set them: a command is run by the app, so only the user
+configures one.
+
+## What runs, and when
+
+- **Where**: the node's Files directory (this machine, a dev container, or its
+  cloud sandbox), through the shell, stderr folded into stdout.
+- **Result**: exit 0 passes; any other exit fails, with the tail of the output
+  (16 KB) as the finding. A command that cannot run at all (directory missing,
+  ten-minute timeout (host, sandbox and dev container alike; in a container the
+  command runs under the container's `timeout` and `docker exec` is killed
+  shortly after as a backstop), the sandbox failing) is *broken*: the run stops for the
+  user (`NeedsHuman::CheckBroken`), nothing is sent to an agent.
+- **Freshness**: each run records a fingerprint of the files
+  (`checks::fingerprint`: every repository's and submodule's `HEAD`, diff
+  against `HEAD`, and untracked files' contents). A run is current while the
+  fingerprint is unchanged, so uncommitted edits, a commit, or a push each make
+  the next look run them again, and nothing changed means nothing re-runs.
+- **Gate**: each check is a criterion of the gate out of its phase
+  (`Check: <label>`), answered from its latest run; `settle_gate` (the
+  autopilot's gate step and the runner menu's Check now) runs the stale ones
+  first. They are not catalog rows, so they are not saved as evaluations.
+
+## The loop
+
+`Autopilot::checks_round` runs at the top of every loop iteration and, in
+`pr_draft`, before tod's own review (the PR agent may just have pushed). All
+passing proceeds. Failing checks in a state with its own fixer (`active`, `verifying`,
+`review`, `pr`, `pr_draft`, `pr_review`) are recorded as open review findings
+(`Check \`<name>\` fails`, detail: the output) and the **Fix protocol** runs.
+In a phase-agent state (`proposed`, `design`, `planning`, `merged`, `released`,
+`learn`) there is no fixer: the failing check criterion fails the gate, which
+runs the phase agent again, and the gate status it is given carries the
+check's label and output. Both routes count rounds and stop on unchanged files.
+After a change the files differ, so the checks run again.
+
+Limits: rounds count against `lifecycle.review_round_limit` and reset once all
+checks pass (`NeedsHuman::ChecksNotConverging`); failing again on the files
+the fixer was already sent means it changed nothing
+(`NeedsHuman::ChecksUnfixed`). A gate that fails only on checks returns to
+the loop instead of stopping.

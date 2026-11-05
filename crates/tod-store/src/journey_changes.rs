@@ -68,6 +68,9 @@
 //! - `node_activity` (`crate::activity`) — lease bookkeeping refreshed every
 //!   few seconds while a node is processed: high-frequency and about whether
 //!   something is alive, not a change to the node.
+//! - `check_runs` (`crate::check_runs`) — the latest result of each gate check,
+//!   machine-local; its output may hold source text, and the gate's own
+//!   result already journals pass or fail.
 //! - `gate_criteria` — a global catalog with no `node_id`.
 //! - `incoming_changes` — a queue over changes that are already journaled at
 //!   their source; recording it too would double-count the same edit.

@@ -30,7 +30,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tod_store::fleet::FleetStore;
 use tod_store::lifecycle_config::{
-    self, Agents, DeleteSandbox, PHASES, PhaseAgent, PrDraftReview, Resolved, ResolvedAgent, Skills,
+    self, Agents, Check, Checks, DeleteSandbox, PHASES, PhaseAgent, PrDraftReview, Resolved, ResolvedAgent,
+    ResolvedChecks, Skills,
 };
 use tod_store::outline::OutlineMutation;
 use uuid::Uuid;
@@ -43,6 +44,10 @@ pub struct LifecycleConfigEditor {
     own: Skills,
     /// The model and effort this node itself sets, by phase.
     own_agents: Agents,
+    /// The checks this node itself lists, by phase.
+    own_checks: Checks,
+    /// The checks that apply to this node for each phase, after inheritance.
+    effective_checks: HashMap<&'static str, ResolvedChecks>,
     /// What applies to this node for each phase, after inheritance.
     effective: Vec<(&'static str, Option<Resolved>, ResolvedAgent)>,
     titles: HashMap<Uuid, String>,
@@ -63,7 +68,14 @@ struct Form {
     skills: Entity<InputState>,
     model: Entity<InputState>,
     effort: Entity<InputState>,
+    /// One row per command the phase's gate runs: a label and the command.
+    checks: Vec<CheckRow>,
     saving: bool,
+}
+
+struct CheckRow {
+    label: Entity<InputState>,
+    command: Entity<InputState>,
 }
 
 /// The label a phase is shown under.
@@ -110,6 +122,8 @@ impl LifecycleConfigEditor {
             enabled: false,
             own: Skills::new(),
             own_agents: Agents::new(),
+            own_checks: Checks::new(),
+            effective_checks: HashMap::new(),
             effective: Vec::new(),
             titles: HashMap::new(),
             delete_sandbox: DeleteSandbox { enabled: true, source_node: None },
@@ -149,6 +163,8 @@ impl LifecycleConfigEditor {
                 .spawn(async move {
                     let own = fleet.read(|conn| lifecycle_config::skills(conn, node)).unwrap_or_default();
                     let own_agents = fleet.read(|conn| lifecycle_config::agents(conn, node)).unwrap_or_default();
+                    let own_checks = fleet.read(|conn| lifecycle_config::checks(conn, node)).unwrap_or_default();
+                    let mut effective_checks = HashMap::new();
                     let mut effective = Vec::new();
                     let mut titles = HashMap::new();
                     let mut title_of = |source: Uuid| {
@@ -175,6 +191,12 @@ impl LifecycleConfigEditor {
                         for source in [&agent.model, &agent.effort].into_iter().flatten().map(|(_, s)| *s) {
                             title_of(source);
                         }
+                        if let Some(checks) =
+                            fleet.read(|conn| lifecycle_config::resolve_checks(conn, node, phase)).ok().flatten()
+                        {
+                            title_of(checks.source_node);
+                            effective_checks.insert(phase, checks);
+                        }
                         effective.push((phase, resolved, agent));
                     }
                     let delete = fleet
@@ -195,7 +217,7 @@ impl LifecycleConfigEditor {
                     if let Some(source) = review.source_node {
                         title_of(source);
                     }
-                    (own, own_agents, effective, titles, delete, own_delete, review, own_review)
+                    (own, own_agents, effective, titles, delete, own_delete, review, own_review, own_checks, effective_checks)
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
@@ -208,6 +230,8 @@ impl LifecycleConfigEditor {
                     this.own_delete_sandbox,
                     this.pr_draft_review,
                     this.own_pr_draft_review,
+                    this.own_checks,
+                    this.effective_checks,
                 ) = loaded;
                 cx.notify();
             });
@@ -233,17 +257,60 @@ impl LifecycleConfigEditor {
             state.set_value(agent.effort.unwrap_or_default(), window, cx);
             state
         });
-        self.form = Some(Form { phase, skills, model, effort, saving: false });
+        let checks = self
+            .own_checks
+            .get(phase)
+            .map(|list| list.iter().map(|c| Self::check_row(&c.label, &c.command, window, cx)).collect())
+            .unwrap_or_default();
+        self.form = Some(Form { phase, skills, model, effort, checks, saving: false });
         self.error = None;
         cx.notify();
     }
 
-    /// Write this node's skills, model and effort with `change` applied to a
-    /// copy of them.
-    fn write(&mut self, change: impl FnOnce(&mut Skills, &mut Agents) + Send + 'static, cx: &mut Context<Self>) {
+    fn check_row(label: &str, command: &str, window: &mut Window, cx: &mut Context<Self>) -> CheckRow {
+        let (label, command) = (label.to_string(), command.to_string());
+        CheckRow {
+            label: cx.new(|cx| {
+                let mut state = InputState::new(window, cx).placeholder("label (optional)");
+                state.set_value(label, window, cx);
+                state
+            }),
+            command: cx.new(|cx| {
+                let mut state = InputState::new(window, cx).placeholder("command, run in the node's files (exit 0 passes)");
+                state.set_value(command, window, cx);
+                state
+            }),
+        }
+    }
+
+    fn add_check_row(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let row = Self::check_row("", "", window, cx);
+        if let Some(form) = self.form.as_mut() {
+            form.checks.push(row);
+        }
+        cx.notify();
+    }
+
+    fn remove_check_row(&mut self, index: usize, cx: &mut Context<Self>) {
+        if let Some(form) = self.form.as_mut()
+            && index < form.checks.len()
+        {
+            form.checks.remove(index);
+        }
+        cx.notify();
+    }
+
+    /// Write this node's skills, model, effort and checks with `change`
+    /// applied to a copy of them.
+    fn write(
+        &mut self,
+        change: impl FnOnce(&mut Skills, &mut Agents, &mut Checks) + Send + 'static,
+        cx: &mut Context<Self>,
+    ) {
         let mut skills = self.own.clone();
         let mut agents = self.own_agents.clone();
-        change(&mut skills, &mut agents);
+        let mut checks = self.own_checks.clone();
+        change(&mut skills, &mut agents, &mut checks);
         if let Some(form) = self.form.as_mut() {
             form.saving = true;
         }
@@ -256,6 +323,9 @@ impl LifecycleConfigEditor {
                         .enqueue_outline(OutlineMutation::SetNodeLifecycleConfig { node_id: node, skills })
                         .and_then(|()| {
                             fleet.enqueue_outline(OutlineMutation::SetNodeLifecycleAgents { node_id: node, agents })
+                        })
+                        .and_then(|()| {
+                            fleet.enqueue_outline(OutlineMutation::SetNodeLifecycleChecks { node_id: node, checks })
                         })
                         .map_err(|e| e.to_string())
                 })
@@ -346,8 +416,26 @@ impl LifecycleConfigEditor {
             Some(input.read(cx).text().to_string().trim().to_string()).filter(|v| !v.is_empty())
         };
         let agent = PhaseAgent { model: field(&form.model), effort: field(&form.effort) };
+        let mut checks = Vec::new();
+        for row in &form.checks {
+            let (label, command) = (field(&row.label), field(&row.command));
+            match (label, command) {
+                (None, None) => {}
+                (label, Some(command)) => checks.push(Check { label: label.unwrap_or_default(), command }),
+                (Some(label), None) => {
+                    self.error = Some(format!("the check `{label}` has no command"));
+                    cx.notify();
+                    return;
+                }
+            }
+        }
         self.write(
-            move |skills, agents| {
+            move |skills, agents, all_checks| {
+                if checks.is_empty() {
+                    all_checks.remove(phase);
+                } else {
+                    all_checks.insert(phase.to_string(), checks);
+                }
                 skills.insert(phase.to_string(), names);
                 if agent.is_empty() {
                     agents.remove(phase);
@@ -361,7 +449,8 @@ impl LifecycleConfigEditor {
 
     fn use_inherited(&mut self, phase: &'static str, cx: &mut Context<Self>) {
         self.write(
-            move |skills, agents| {
+            move |skills, agents, checks| {
+                checks.remove(phase);
                 skills.remove(phase);
                 agents.remove(phase);
             },
@@ -379,7 +468,9 @@ impl LifecycleConfigEditor {
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let muted = cx.theme().muted_foreground;
-        let has_own = self.own.contains_key(phase) || self.own_agents.contains_key(phase);
+        let has_own = self.own.contains_key(phase)
+            || self.own_agents.contains_key(phase)
+            || self.own_checks.contains_key(phase);
         let from = |source: Uuid| {
             (source != self.node)
                 .then(|| format!(" · from {}", self.titles.get(&source).map_or("an ancestor", String::as_str)))
@@ -399,6 +490,16 @@ impl LifecycleConfigEditor {
         }
         if let Some((effort, source)) = &agent.effort {
             summary.push_str(&format!("\neffort {effort}{}", from(*source)));
+        }
+        if let Some(checks) = self.effective_checks.get(phase) {
+            if checks.checks.is_empty() {
+                summary.push_str(&format!("\nno checks{}", from(checks.source_node)));
+            } else {
+                for check in &checks.checks {
+                    summary.push_str(&format!("\ncheck {}: {}", check.name(), check.command));
+                }
+                summary.push_str(&from(checks.source_node).replacen(" · ", "\nchecks ", 1));
+            }
         }
         v_flex()
             .gap_0p5()
@@ -560,6 +661,37 @@ impl LifecycleConfigEditor {
                     .text_color(cx.theme().muted_foreground)
                     .child("What the agent for this phase runs with, over the node's Agent capability and the settings. Leave one empty to inherit it."),
             )
+            .child(div().text_xs().font_semibold().child("Checks"))
+            .children(form.checks.iter().enumerate().map(|(i, row)| {
+                h_flex()
+                    .gap_2()
+                    .w_full()
+                    .items_center()
+                    .child(div().w_40().child(Input::new(&row.label)))
+                    .child(div().flex_1().child(Input::new(&row.command)))
+                    .child(
+                        Button::new(("lc-check-remove", i))
+                            .label("Remove")
+                            .ghost()
+                            .compact()
+                            .on_click(cx.listener(move |this, _, _, cx| this.remove_check_row(i, cx))),
+                    )
+            }))
+            .child(
+                h_flex().child(
+                    Button::new("lc-check-add")
+                        .label("Add check")
+                        .ghost()
+                        .compact()
+                        .on_click(cx.listener(|this, _, window, cx| this.add_check_row(window, cx))),
+                ),
+            )
+            .child(div().text_xs().text_color(cx.theme().muted_foreground).child(
+                "Commands (type checking, lint, tests) the app runs in the node's files before this phase's gate \
+                 and again after every change. A command that exits 0 passes; any other exit fails, and its \
+                 output goes to the fix agent. The label names it in messages. With none listed here, the \
+                 inherited checks apply.",
+            ))
             .child(
                 h_flex()
                     .gap_2()
