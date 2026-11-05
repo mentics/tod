@@ -175,7 +175,7 @@ impl SettingsSection {
                 ClaudeAdapter,
                 MaxParallelSessions,
             ],
-            Self::Lifecycle => &[LifecycleIndependentEvaluation, LifecycleRepoProfiles],
+            Self::Lifecycle => &[LifecycleIndependentEvaluation, LifecycleReviewRoundLimit, LifecycleRepoProfiles],
             Self::QuestionMaker => &[ReplenishThreshold],
             Self::AnswerProcessor => &[ContextBudget, PromptCacheIdle, AnsweredHistoryCap],
             Self::Workspaces => &[
@@ -264,6 +264,8 @@ enum SettingField {
     JourneysStorageCap,
     /// `lifecycle.independent_evaluation`.
     LifecycleIndependentEvaluation,
+    /// `lifecycle.review_round_limit`.
+    LifecycleReviewRoundLimit,
     /// `lifecycle.repo_profiles`, as text.
     LifecycleRepoProfiles,
     /// Seconds an idle sandbox terminal keeps its connection.
@@ -312,6 +314,7 @@ impl SettingField {
             Self::JourneysMilestoneStates => "journeys-milestone-states",
             Self::JourneysStorageCap => "journeys-storage-cap",
             Self::LifecycleIndependentEvaluation => "lifecycle-independent-evaluation",
+            Self::LifecycleReviewRoundLimit => "lifecycle-review-round-limit",
             Self::LifecycleRepoProfiles => "lifecycle-repo-profiles",
             Self::SandboxTerminalPark => "sandbox-terminal-park",
             Self::SandboxZedPark => "sandbox-zed-park",
@@ -1402,6 +1405,9 @@ impl SettingsView {
                 let step = if delta >= 0 { 64 } else { -64 };
                 self.step_journeys_storage_cap(step, cx);
             }
+            SettingField::LifecycleReviewRoundLimit => {
+                self.step_lifecycle_review_round_limit(if delta >= 0 { 1 } else { -1 }, cx);
+            }
             SettingField::JourneysRelayCode
             | SettingField::JourneysSendTest
             | SettingField::JourneysMilestoneStates
@@ -1610,6 +1616,14 @@ impl SettingsView {
         self.settings.lifecycle.independent_evaluation =
             !self.settings.lifecycle.independent_evaluation;
         self.schedule_save("lifecycle.independent_evaluation", cx);
+        cx.notify();
+    }
+
+    /// Steps `lifecycle.review_round_limit` by one, never below 1.
+    fn step_lifecycle_review_round_limit(&mut self, delta: i32, cx: &mut Context<Self>) {
+        let limit = &mut self.settings.lifecycle.review_round_limit;
+        *limit = if delta >= 0 { limit.saturating_add(1) } else { limit.saturating_sub(1).max(1) };
+        self.schedule_save("lifecycle.review_round_limit", cx);
         cx.notify();
     }
 
@@ -2646,6 +2660,17 @@ impl SettingsView {
                     "A fresh agent session, separate from the one that did the phase's work, judges whether each phase is done. It cannot edit; it sends fixes back to the phase agent.",
                     theme,
                     |this, cx| this.toggle_lifecycle_independent_evaluation(cx),
+                ))
+                .child(stepper_row(
+                    cx,
+                    self,
+                    SettingField::LifecycleReviewRoundLimit,
+                    self.settings.lifecycle.review_round_limit.to_string(),
+                    "Review rounds before stopping",
+                    "The most review-and-fix rounds one stay in review runs before the run stops and asks you. Running the node again starts a fresh set. Default 5.",
+                    theme,
+                    |this, _, cx| this.step_lifecycle_review_round_limit(-1, cx),
+                    |this, _, cx| this.step_lifecycle_review_round_limit(1, cx),
                 ))
                 .child(text_input_row(
                     cx,
