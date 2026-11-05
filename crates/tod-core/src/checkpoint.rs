@@ -110,6 +110,10 @@ pub fn run(fleet: &FleetStore, due: &Due) -> Vec<String> {
             Ok(Some(saved)) => {
                 let pushed = saved.iter().filter(|(_, s)| matches!(s, Saved::Pushed { .. })).count();
                 tracing::debug!(%node, pushed, "checkpointed the node's uncommitted work");
+                for (repo, _) in saved.iter().filter(|(_, s)| *s == Saved::Retired) {
+                    let repo = if repo.is_empty() { "the checkout" } else { repo.as_str() };
+                    tracing::info!(%node, "retired the checkpoint of {repo}: its work is committed");
+                }
             }
             Ok(None) => {}
             Err(err) => failures.push(format!("Could not checkpoint \"{title}\": {err:#}")),

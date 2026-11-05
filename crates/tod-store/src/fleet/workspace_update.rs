@@ -46,7 +46,10 @@ pub fn update_to_main(dir: &Workdir) -> Result<String> {
         );
     }
     let new_commits = dir.git(&["rev-list", "--count", "HEAD..FETCH_HEAD"])?;
-    dir.git(&["merge", "--ff-only", "-q", "FETCH_HEAD"])?;
+    // Only the superproject moves: each submodule stays checked out where it
+    // is, even where main records another commit for it, whatever the
+    // repository's `submodule.recurse` says.
+    dir.git(&["-c", "submodule.recurse=false", "merge", "--ff-only", "-q", "FETCH_HEAD"])?;
     Ok(format!("Updated the workspace ({branch}) from {before} to {latest}: {new_commits} new commit(s) from main."))
 }
 
@@ -152,5 +155,66 @@ mod tests {
         let err = update_to_main(&Workdir::host(&r.work)).unwrap_err().to_string();
         assert!(err.contains("cannot be fast-forwarded"), "{err}");
         assert!(r.work.join("mine").exists() && !r.work.join("b").exists());
+    }
+
+    /// A submodule checked out at a commit of its own (the node's work) is
+    /// left there when main records another one for it, and the update still
+    /// goes ahead: a submodule's checkout is never a change of the workspace's.
+    #[test]
+    fn submodules_stay_where_they_are() {
+        let r = Repos::new();
+        let tmp = r._tmp.path();
+        let lib = tmp.join("lib");
+        std::fs::create_dir_all(&lib).unwrap();
+        git(&lib, &["init", "-q", "-b", "main"]);
+        std::fs::write(lib.join("x"), "1").unwrap();
+        git(&lib, &["add", "."]);
+        git(&lib, &["commit", "-q", "-m", "lib one"]);
+        let file_ok = ["-c", "protocol.file.allow=always"];
+        let add_lib = |repo: &Path| {
+            let mut args = file_ok.to_vec();
+            args.extend(["submodule", "add", "-q", lib.to_str().unwrap(), "lib"]);
+            git(repo, &args);
+            git(repo, &["commit", "-q", "-m", "add lib"]);
+            git(repo, &["push", "-q", "origin", "HEAD:main"]);
+        };
+        let seed = tmp.join("seed");
+        git(&seed, &["pull", "-q", "origin", "main"]);
+        add_lib(&seed);
+        git(&r.work, &["pull", "-q", "origin", "main"]);
+        let mut init = file_ok.to_vec();
+        init.extend(["submodule", "update", "-q", "--init"]);
+        git(&r.work, &init);
+
+        // The node's own work in the submodule, recorded nowhere else.
+        let sub = r.work.join("lib");
+        git(&sub, &["switch", "-q", "-c", "task/x"]);
+        std::fs::write(sub.join("mine"), "1").unwrap();
+        git(&sub, &["add", "."]);
+        git(&sub, &["commit", "-q", "-m", "mine"]);
+        let node_head = String::from_utf8(
+            Command::new("git").arg("-C").arg(&sub).args(["rev-parse", "HEAD"]).output().unwrap().stdout,
+        )
+        .unwrap();
+
+        // Main moves the pointer to another commit of lib, and adds a file.
+        std::fs::write(lib.join("y"), "2").unwrap();
+        git(&lib, &["add", "."]);
+        git(&lib, &["commit", "-q", "-m", "lib two"]);
+        git(&seed.join("lib"), &["pull", "-q", "origin", "main"]);
+        git(&seed, &["add", "lib"]);
+        git(&seed, &["commit", "-q", "-m", "bump lib"]);
+        git(&seed, &["push", "-q", "origin", "HEAD:main"]);
+        r.push_to_main("b");
+
+        let said = update_to_main(&Workdir::host(&r.work)).unwrap();
+        assert!(said.contains("Updated the workspace"), "{said}");
+        assert!(r.work.join("b").exists());
+        let after = String::from_utf8(
+            Command::new("git").arg("-C").arg(&sub).args(["rev-parse", "HEAD"]).output().unwrap().stdout,
+        )
+        .unwrap();
+        assert_eq!(after, node_head, "the submodule's checkout was moved");
+        assert!(sub.join("mine").exists() && !sub.join("y").exists());
     }
 }
