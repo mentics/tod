@@ -113,6 +113,22 @@ impl Entry {
 pub struct ChunkId {
     pub entry: usize,
     pub part: Option<usize>,
+    /// The agent-activity block that begins at piece `part`, not the piece.
+    pub group: bool,
+}
+
+impl ChunkId {
+    pub fn entry(entry: usize) -> Self {
+        Self { entry, part: None, group: false }
+    }
+
+    pub fn piece(entry: usize, part: usize) -> Self {
+        Self { entry, part: Some(part), group: false }
+    }
+
+    pub fn activity(entry: usize, first: usize) -> Self {
+        Self { entry, part: Some(first), group: true }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -196,6 +212,50 @@ pub fn pieces(entry: &Entry) -> Vec<(PieceKind, &ReplyPart)> {
         .collect()
 }
 
+/// One block of an agent turn: a run of work (narration, thoughts, tool
+/// calls), which ends where a reply begins, or one reply piece.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Segment {
+    /// The work in pieces `first..=last`.
+    Activity { first: usize, last: usize },
+    Reply(usize),
+}
+
+/// An agent entry's turn as blocks, in order: each run of work, then each
+/// reply piece. A turn may alternate any number of times.
+pub fn segments(entry: &Entry) -> Vec<Segment> {
+    let mut out: Vec<Segment> = Vec::new();
+    for (ix, (kind, _)) in pieces(entry).into_iter().enumerate() {
+        if matches!(kind, PieceKind::Answer | PieceKind::Structured) {
+            out.push(Segment::Reply(ix));
+        } else if let Some(Segment::Activity { last, .. }) = out.last_mut() {
+            *last = ix;
+        } else {
+            out.push(Segment::Activity { first: ix, last: ix });
+        }
+    }
+    out
+}
+
+/// Whether `entry` is shown as blocks (activity, reply) rather than under a
+/// header of its own: an agent turn that has pieces.
+fn is_blocks(entry: &Entry) -> bool {
+    entry.kind == EntryKind::Agent && !pieces(entry).is_empty()
+}
+
+/// The chunk `id` sits inside: a piece of work is inside its activity block.
+/// Everything else is at the top level.
+pub fn parent(entries: &[Entry], id: ChunkId) -> Option<ChunkId> {
+    let part = id.part.filter(|_| !id.group)?;
+    let entry = entries.get(id.entry)?;
+    segments(entry).into_iter().find_map(|segment| match segment {
+        Segment::Activity { first, last } if (first..=last).contains(&part) => {
+            Some(ChunkId::activity(id.entry, first))
+        }
+        _ => None,
+    })
+}
+
 /// Whether `id` shows expanded before the user toggles it. Reading, entries
 /// do, and so does the answer of a reply — the work above it starts
 /// collapsed. Collapsed, nothing does.
@@ -208,6 +268,7 @@ pub fn expanded_by_default(entries: &[Entry], id: ChunkId, start: StartState) ->
     };
     match id.part {
         None => true,
+        Some(_) if id.group => true,
         Some(ix) => pieces(entry)
             .get(ix)
             .is_some_and(|(kind, _)| kind.expanded_by_default()),
@@ -253,6 +314,11 @@ enum Row {
     },
     /// An expanded agent reply that has no pieces: its body.
     AgentBody(usize),
+    /// The header of a run of agent work; its pieces follow while open.
+    Activity {
+        entry: usize,
+        first: usize,
+    },
     /// One piece of an expanded agent reply.
     Piece {
         entry: usize,
@@ -269,7 +335,9 @@ enum Row {
 impl Row {
     fn entry(self) -> Option<usize> {
         match self {
-            Row::Entry { entry, .. } | Row::Piece { entry, .. } => Some(entry),
+            Row::Entry { entry, .. } | Row::Piece { entry, .. } | Row::Activity { entry, .. } => {
+                Some(entry)
+            }
             Row::AgentBody(entry) | Row::NoNotes(entry) | Row::Summary(entry) => Some(entry),
             Row::Working | Row::Empty => None,
         }
@@ -280,11 +348,9 @@ impl Row {
             Row::Entry {
                 entry,
                 marker: false,
-            } => Some(ChunkId { entry, part: None }),
-            Row::Piece { entry, part } => Some(ChunkId {
-                entry,
-                part: Some(part),
-            }),
+            } => Some(ChunkId::entry(entry)),
+            Row::Piece { entry, part } => Some(ChunkId::piece(entry, part)),
+            Row::Activity { entry, first } => Some(ChunkId::activity(entry, first)),
             _ => None,
         }
     }
@@ -294,26 +360,42 @@ impl Row {
 fn rows(entries: &[Entry], toggled: &HashMap<ChunkId, bool>, start: StartState) -> Vec<Row> {
     let mut rows = Vec::new();
     for (entry_ix, entry) in entries.iter().enumerate() {
-        rows.push(Row::Entry {
-            entry: entry_ix,
-            marker: entry.kind == EntryKind::Marker,
-        });
-        let id = ChunkId {
-            entry: entry_ix,
-            part: None,
-        };
-        if entry.kind != EntryKind::Agent || !is_expanded(entries, toggled, id, start) {
-            continue;
-        }
         let pieces = pieces(entry);
-        if pieces.is_empty() {
+        // A turn with pieces is its blocks, with no header of its own.
+        if is_blocks(entry) {
+            for segment in segments(entry) {
+                match segment {
+                    Segment::Activity { first, last } => {
+                        rows.push(Row::Activity {
+                            entry: entry_ix,
+                            first,
+                        });
+                        if is_expanded(entries, toggled, ChunkId::activity(entry_ix, first), start)
+                        {
+                            rows.extend((first..=last).map(|part| Row::Piece {
+                                entry: entry_ix,
+                                part,
+                            }));
+                        }
+                    }
+                    Segment::Reply(part) => rows.push(Row::Piece {
+                        entry: entry_ix,
+                        part,
+                    }),
+                }
+            }
+        } else {
+            rows.push(Row::Entry {
+                entry: entry_ix,
+                marker: entry.kind == EntryKind::Marker,
+            });
+            let id = ChunkId::entry(entry_ix);
+            if entry.kind != EntryKind::Agent || !is_expanded(entries, toggled, id, start) {
+                continue;
+            }
             rows.push(Row::AgentBody(entry_ix));
             continue;
         }
-        rows.extend((0..pieces.len()).map(|part| Row::Piece {
-            entry: entry_ix,
-            part,
-        }));
         if entry.summary.is_some() {
             rows.push(Row::Summary(entry_ix));
         } else if !entry.live
@@ -359,12 +441,27 @@ fn tool_line(title: &str, status: &str) -> String {
     }
 }
 
+/// A body longer than this many lines is clamped, with a "Show more".
+const CLAMP_LINES: usize = 20;
+
+/// Characters per line a body is taken to wrap at, for deciding whether it is
+/// longer than [`CLAMP_LINES`] without laying it out.
+const WRAP_COLUMNS: usize = 90;
+
+/// How many lines `text` takes, wrapping included, as far as is known
+/// without laying it out.
+fn estimated_lines(text: &str) -> usize {
+    text.lines()
+        .map(|line| line.len().div_ceil(WRAP_COLUMNS).max(1))
+        .sum()
+}
+
 /// What a find searches, chunk by chunk: the text a chunk shows, collapsed or
 /// not (a match inside a collapsed chunk is revealed when it is visited).
 fn chunk_texts(entries: &[Entry]) -> Vec<(ChunkId, String)> {
     let mut out = Vec::new();
     for (ix, entry) in entries.iter().enumerate() {
-        let whole = ChunkId { entry: ix, part: None };
+        let whole = ChunkId::entry(ix);
         match entry.kind {
             EntryKind::Marker => {}
             EntryKind::User | EntryKind::Error | EntryKind::Raw { .. } => {
@@ -382,13 +479,12 @@ fn chunk_texts(entries: &[Entry]) -> Vec<(ChunkId, String)> {
                     out.push((whole, format!("{label}\n{}\n{summary}", entry.body)));
                     continue;
                 }
-                out.push((whole, label.to_string()));
                 for (part_ix, (_, part)) in pieces.iter().enumerate() {
                     let text = match part {
                         ReplyPart::Text { text } | ReplyPart::Thought { text } => text.clone(),
                         ReplyPart::Tool { title, status, .. } => tool_line(title, status),
                     };
-                    out.push((ChunkId { entry: ix, part: Some(part_ix) }, text));
+                    out.push((ChunkId::piece(ix, part_ix), text));
                 }
                 if let Some(summary) = &entry.summary {
                     out.push((whole, summary.clone()));
@@ -449,6 +545,9 @@ pub struct TranscriptList {
     find_open: HashSet<ChunkId>,
     /// Scroll the current occurrence into view on the next render.
     scroll_to_find: bool,
+    /// Chunks whose clamped body the user opened in full. Never saved: it is
+    /// forgotten with the list.
+    shown_in_full: HashSet<ChunkId>,
 }
 
 impl EventEmitter<TranscriptListEvent> for TranscriptList {}
@@ -484,6 +583,7 @@ impl TranscriptList {
             find: None,
             find_open: HashSet::new(),
             scroll_to_find: false,
+            shown_in_full: HashSet::new(),
         }
     }
 
@@ -640,6 +740,7 @@ impl TranscriptList {
         self.highlight = None;
         self.rendered_entries = 0;
         self.find_open.clear();
+        self.shown_in_full.clear();
         if let Some(find) = &mut self.find {
             find.hits.clear();
             find.current = 0;
@@ -726,8 +827,10 @@ impl TranscriptList {
         self.find_open.clear();
         let hit = self.find.as_ref().and_then(|f| f.hits.get(f.current).copied());
         if let Some(id) = hit {
-            self.find_open.insert(ChunkId { entry: id.entry, part: None });
+            self.find_open.insert(ChunkId::entry(id.entry));
+            self.find_open.extend(parent(&self.entries, id));
             self.find_open.insert(id);
+            self.shown_in_full.insert(id);
             self.scroll_to_find = true;
         }
         self.sync_rows_all();
@@ -915,9 +1018,9 @@ impl TranscriptList {
     fn find_tint(&self, row: Row) -> Option<gpui::Hsla> {
         let find = self.find.as_ref().filter(|f| !f.hits.is_empty())?;
         let id = match row {
-            Row::Piece { entry, part } => ChunkId { entry, part: Some(part) },
-            Row::Entry { entry, marker: false } => ChunkId { entry, part: None },
-            Row::AgentBody(entry) | Row::Summary(entry) => ChunkId { entry, part: None },
+            Row::Piece { entry, part } => ChunkId::piece(entry, part),
+            Row::Entry { entry, marker: false } => ChunkId::entry(entry),
+            Row::AgentBody(entry) | Row::Summary(entry) => ChunkId::entry(entry),
             _ => return None,
         };
         if find.hits.get(find.current) == Some(&id) {
@@ -940,7 +1043,7 @@ impl TranscriptList {
                             .child("Done, no notes")
                             .into_any_element()
                     } else {
-                        style::text(
+                        let text = style::text(
                             selectable_markdown(
                                 ElementId::Name(format!("entry-body-{entry_ix}").into()),
                                 body.clone(),
@@ -949,11 +1052,13 @@ impl TranscriptList {
                             )
                             .w_full(),
                         )
-                        .into_any_element()
+                        .into_any_element();
+                        self.clamped(ChunkId::entry(entry_ix), body, text, style::color::surface(), window, cx)
                     })
                     .into_any_element()
             }
             Row::Piece { entry, part } => self.render_piece(entry, part, window, cx),
+            Row::Activity { entry, first } => self.render_activity(entry, first, cx),
             Row::Summary(entry_ix) => style::chunk_children(div())
                 .child(style::text(selectable_text(
                     ElementId::Name(format!("entry-summary-{entry_ix}").into()),
@@ -995,10 +1100,7 @@ impl TranscriptList {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let entry = &self.entries[entry_ix];
-        let id = ChunkId {
-            entry: entry_ix,
-            part: None,
-        };
+        let id = ChunkId::entry(entry_ix);
         match entry.kind {
             EntryKind::Marker => h_flex()
                 .items_center()
@@ -1054,12 +1156,18 @@ impl TranscriptList {
                         cx,
                     )
                     .w_full();
+                    let text = if entry.kind == EntryKind::Error {
+                        style::text_error(text).into_any_element()
+                    } else {
+                        style::text(text).into_any_element()
+                    };
+                    let fade = if tinted {
+                        style::color::badge_fill()
+                    } else {
+                        style::color::surface()
+                    };
                     chunk = chunk.child(style::chunk_body(div()).child(
-                        if entry.kind == EntryKind::Error {
-                            style::text_error(text).into_any_element()
-                        } else {
-                            style::text(text).into_any_element()
-                        },
+                        self.clamped(id, &entry.body, text, fade, window, cx),
                     ));
                     if entry.kind == EntryKind::Error
                         && crate::ui::report_problem::is_available(cx)
@@ -1142,10 +1250,7 @@ impl TranscriptList {
         let Some(&(kind, part)) = pieces.get(part_ix) else {
             return div().into_any_element();
         };
-        let part_id = ChunkId {
-            entry: entry_ix,
-            part: Some(part_ix),
-        };
+        let part_id = ChunkId::piece(entry_ix, part_ix);
         let (icon, summary) = match part {
             ReplyPart::Text { text } | ReplyPart::Thought { text } => (
                 (kind == PieceKind::Thought).then_some(IconName::Brain),
@@ -1178,9 +1283,92 @@ impl TranscriptList {
                 )
                 .into_any_element(),
             };
+            let source = match part {
+                ReplyPart::Text { text } | ReplyPart::Thought { text } => text.as_str(),
+                ReplyPart::Tool { .. } => "",
+            };
+            let body = self.clamped(part_id, source, body, style::color::surface(), window, cx);
             chunk = chunk.child(style::chunk_body(div()).child(body));
         }
-        style::chunk_children(div()).child(chunk).into_any_element()
+        // Work sits inside its activity block; a reply is a block of its own.
+        if matches!(kind, PieceKind::Answer | PieceKind::Structured) {
+            div().w_full().child(chunk).into_any_element()
+        } else {
+            style::chunk_children(div()).child(chunk).into_any_element()
+        }
+    }
+
+    /// The header of a run of agent work: "Agent activity" and how many
+    /// steps it holds. The steps are the pieces rows below it.
+    fn render_activity(&self, entry_ix: usize, first: usize, cx: &mut Context<Self>) -> AnyElement {
+        let steps = segments(&self.entries[entry_ix])
+            .into_iter()
+            .find_map(|segment| match segment {
+                Segment::Activity { first: f, last } if f == first => Some(last - first + 1),
+                _ => None,
+            })
+            .unwrap_or(0);
+        let summary = match steps {
+            1 => "1 step".to_string(),
+            n => format!("{n} steps"),
+        };
+        style::chunk(v_flex())
+            .child(self.chunk_header(
+                ChunkId::activity(entry_ix, first),
+                None,
+                SharedString::from("Agent activity"),
+                Some(summary),
+                cx,
+            ))
+            .into_any_element()
+    }
+
+    /// `body`, held to [`CLAMP_LINES`] lines when `source` is longer: its end
+    /// fades into `fade` under a "Show more" that opens it in full, and "Show
+    /// less" puts it back. Short bodies are returned as they are.
+    fn clamped(
+        &self,
+        id: ChunkId,
+        source: &str,
+        body: AnyElement,
+        fade: gpui::Hsla,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        if estimated_lines(source) <= CLAMP_LINES {
+            return body;
+        }
+        let entry = id.entry;
+        let toggle = |label: &'static str, name: &'static str| {
+            Button::new(ElementId::Name(
+                format!("{name}-{}-{}", id.entry, id.part.map_or(-1, |p| p as i64)).into(),
+            ))
+            .ghost()
+            .compact()
+            .label(label)
+            .on_click(cx.listener(move |this, _, _, cx| {
+                if !this.shown_in_full.remove(&id) {
+                    this.shown_in_full.insert(id);
+                }
+                this.sync_rows(&HashSet::from([entry]));
+                cx.notify();
+            }))
+        };
+        if self.shown_in_full.contains(&id) {
+            return v_flex()
+                .w_full()
+                .child(body)
+                .child(h_flex().child(toggle("Show less", "transcript-less")))
+                .into_any_element();
+        }
+        div()
+            .relative()
+            .w_full()
+            .max_h(window.line_height() * CLAMP_LINES as f32)
+            .overflow_hidden()
+            .child(body)
+            .child(style::chunk_fade(div(), fade).child(toggle("Show more", "transcript-more")))
+            .into_any_element()
     }
 }
 
@@ -1272,10 +1460,10 @@ mod tests {
         assert_eq!(
             hits,
             vec![
-                ChunkId { entry: 0, part: None },
-                ChunkId { entry: 1, part: Some(1) },
-                ChunkId { entry: 1, part: Some(2) },
-                ChunkId { entry: 1, part: Some(2) },
+                ChunkId::entry(0),
+                ChunkId::piece(1, 1),
+                ChunkId::piece(1, 2),
+                ChunkId::piece(1, 2),
             ]
         );
         assert!(find_hits(&[], "x").is_empty());
@@ -1298,7 +1486,7 @@ mod tests {
     }
 
     fn entry_chunk(entry: usize) -> ChunkId {
-        ChunkId { entry, part: None }
+        ChunkId::entry(entry)
     }
 
     fn plain(kind: EntryKind, body: &str) -> Entry {
@@ -1367,10 +1555,7 @@ mod tests {
         assert_eq!(
             rows(&entries, &HashMap::new(), StartState::Reading),
             [
-                Row::Entry {
-                    entry: 0,
-                    marker: false
-                },
+                Row::Activity { entry: 0, first: 0 },
                 Row::Piece { entry: 0, part: 0 },
                 Row::Piece { entry: 0, part: 1 },
                 Row::Summary(0),
@@ -1432,22 +1617,16 @@ mod tests {
         assert_eq!(
             chunks(&entries, &toggled, StartState::Reading),
             [
-                entry_chunk(0),
-                ChunkId {
-                    entry: 0,
-                    part: Some(0)
-                },
-                ChunkId {
-                    entry: 0,
-                    part: Some(1)
-                },
+                ChunkId::activity(0, 0),
+                ChunkId::piece(0, 0),
+                ChunkId::piece(0, 1),
             ]
         );
-        // Collapsed, the reply's pieces are no longer stops.
-        toggled.insert(entry_chunk(0), false);
+        // Collapsed, the activity's pieces are no longer stops; the reply is.
+        toggled.insert(ChunkId::activity(0, 0), false);
         assert_eq!(
             chunks(&entries, &toggled, StartState::Reading),
-            [entry_chunk(0)]
+            [ChunkId::activity(0, 0), ChunkId::piece(0, 1)]
         );
     }
 
@@ -1458,24 +1637,40 @@ mod tests {
             agent(vec![text("Done.")], "Done."),
             Entry::raw(false, "#2 · response", "{}"),
         ];
-        let mut toggled = HashMap::new();
+        let answer = ChunkId::piece(1, 0);
+        // A turn is its blocks: here only a reply, shown collapsed.
         assert_eq!(
-            chunks(&entries, &toggled, StartState::Collapsed),
-            [entry_chunk(0), entry_chunk(1), entry_chunk(2)]
+            chunks(&entries, &HashMap::new(), StartState::Collapsed),
+            [entry_chunk(0), answer, entry_chunk(2)]
         );
-        // Opening a reply shows its answer as a collapsed piece.
-        toggled.insert(entry_chunk(1), true);
-        let answer = ChunkId {
-            entry: 1,
-            part: Some(0),
-        };
-        assert!(chunks(&entries, &toggled, StartState::Collapsed).contains(&answer));
-        assert!(!is_expanded(
-            &entries,
-            &toggled,
-            answer,
-            StartState::Collapsed
-        ));
+        assert!(!is_expanded(&entries, &HashMap::new(), answer, StartState::Collapsed));
+        let work = vec![agent(vec![ReplyPart::Thought { text: "Hmm".into() }, text("Done.")], "Done.")];
+        assert!(!is_expanded(&work, &HashMap::new(), ChunkId::activity(0, 0), StartState::Collapsed));
+        assert!(is_expanded(&work, &HashMap::new(), ChunkId::activity(0, 0), StartState::Reading));
+    }
+
+    #[test]
+    fn a_turn_is_blocks_of_work_ended_by_each_reply() {
+        let tool = |id: &str| ReplyPart::Tool { id: id.into(), title: "Read".into(), status: String::new() };
+        let entry = agent(vec![tool("1"), tool("2"), text("Done.")], "Done.");
+        assert_eq!(
+            segments(&entry),
+            [Segment::Activity { first: 0, last: 1 }, Segment::Reply(2)]
+        );
+        // Work belongs to its block; a reply has no parent.
+        let entries = vec![entry];
+        assert_eq!(parent(&entries, ChunkId::piece(0, 1)), Some(ChunkId::activity(0, 0)));
+        assert_eq!(parent(&entries, ChunkId::piece(0, 2)), None);
+        assert_eq!(parent(&entries, ChunkId::activity(0, 0)), None);
+    }
+
+    #[test]
+    fn long_bodies_are_clamped_and_short_ones_are_not() {
+        let long = "line\n".repeat(CLAMP_LINES + 1);
+        assert!(estimated_lines(&long) > CLAMP_LINES);
+        assert!(estimated_lines(&"line\n".repeat(CLAMP_LINES)) <= CLAMP_LINES);
+        // A long wrapped line counts as several.
+        assert!(estimated_lines(&"x".repeat(WRAP_COLUMNS * CLAMP_LINES + 1)) > CLAMP_LINES);
     }
 
     #[test]
@@ -1495,29 +1690,18 @@ mod tests {
             kinds,
             [PieceKind::Narration, PieceKind::Tool, PieceKind::Narration]
         );
-        // The reply is open, so each step is a line of its own, and none of
-        // them is open.
+        // The work is one open activity block, each step a line of its own,
+        // and none of them is open.
         assert_eq!(
             rows(&entries, &toggled, StartState::Reading),
             [
-                Row::Entry {
-                    entry: 0,
-                    marker: false
-                },
+                Row::Activity { entry: 0, first: 0 },
                 Row::Piece { entry: 0, part: 0 },
                 Row::Piece { entry: 0, part: 1 },
                 Row::Piece { entry: 0, part: 2 },
             ]
         );
-        assert!((0..3).all(|part| !is_expanded(
-            &entries,
-            &toggled,
-            ChunkId {
-                entry: 0,
-                part: Some(part)
-            },
-            StartState::Reading
-        )));
+        assert!((0..3).all(|part| !is_expanded(&entries, &toggled, ChunkId::piece(0, part), StartState::Reading)));
     }
 
     #[test]

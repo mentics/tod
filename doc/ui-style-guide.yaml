@@ -313,6 +313,13 @@ styles:
     padding-bottom: related
   chunk-children:
     padding-left: section
+  # A chunk body past 20 lines is clamped; the shade fades it out over its
+  # last lines and holds the "Show more" control.
+  chunk-fade:
+    position: bottom of the clamped body
+    height: 56px
+    padding-x: related
+    background: gradient from clear to the body's own background
   # An image attached to a message: in the input before it is sent, and in
   # the transcript after. Cropped to fill the square, never stretched.
   image-thumbnail:

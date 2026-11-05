@@ -508,9 +508,8 @@ impl AgentTranscriptsView {
                 if key == TranscriptKey::Collapse {
                     if open {
                         self.toggle(id, cx);
-                    } else if id.part.is_some() {
-                        let reply = ChunkId { entry: id.entry, part: None };
-                        self.set_transcript_cursor(Some(reply), true, cx);
+                    } else if let Some(parent) = transcript_list::parent(&self.entries, id) {
+                        self.set_transcript_cursor(Some(parent), true, cx);
                     }
                 } else if !open {
                     self.toggle(id, cx);

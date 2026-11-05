@@ -624,6 +624,27 @@ pub fn chunk_body<E: Styled>(el: E) -> E {
     el.w_full().px(space::RELATED).pb(space::RELATED)
 }
 
+/// `styles.chunk-fade`: the shaded strip over the bottom of a clamped chunk
+/// body, fading from clear into `into`, the background the body sits on. Hold
+/// the "Show more" control inside it.
+pub fn chunk_fade<E: Styled>(el: E, into: gpui::Hsla) -> E {
+    let mut clear = into;
+    clear.a = 0.;
+    el.absolute()
+        .left_0()
+        .right_0()
+        .bottom_0()
+        .h(px(56.))
+        .flex()
+        .items_end()
+        .px(space::RELATED)
+        .bg(gpui::linear_gradient(
+            180.,
+            gpui::linear_color_stop(clear, 0.),
+            gpui::linear_color_stop(into, 0.85),
+        ))
+}
+
 /// `styles.chunk-children`: the chunks inside another chunk, indented.
 pub fn chunk_children<E: Styled>(el: E) -> E {
     el.w_full().pl(space::SECTION)
