@@ -736,9 +736,6 @@ impl ListDelegate for TaskListDelegate {
                 chips = chips.children(rollup_chip(below));
             }
         }
-        if let Some(decorator) = chat_decorator(&item) {
-            chips = chips.child(decorator);
-        }
         let chips_menu_open = self.open_row_menu.as_ref().is_some_and(|(kind, id)| {
             (selected && matches!(kind, RowMenuKind::Shells | RowMenuKind::Defer)
                 || matches!(kind, RowMenuKind::Context(None)))
@@ -848,6 +845,7 @@ impl ListDelegate for TaskListDelegate {
                 item.incoming_count > 0,
             ))
             .child(pr_icon_cell(&item.id, &item))
+            .child(chat_icon_cell(&item.id, &item))
             .child(title_line)
             .when_some(menu_at, |el, (at, menu)| el.child(popup_at(at, menu)));
 
@@ -1092,29 +1090,41 @@ fn actor_glyph(glyph: Glyph) -> gpui::Div {
 }
 
 /// `styles.node-chat-working` (a spinner, the one animated element in the
-/// tree) while the chat agent works; `styles.node-chat-new` (a small dot)
-/// once it finished or is waiting on the user and the row has not been seen
-/// since. Nothing otherwise, and it takes no column of its own.
-fn chat_decorator(item: &TaskItem) -> Option<gpui::AnyElement> {
-    if item.chat_running {
-        return Some(
-            div()
-                .flex_shrink_0()
-                .child(gpui_component::spinner::Spinner::new().xsmall().color(crate::ui::style::color::node_chat_text()))
-                .into_any_element(),
-        );
-    }
-    if item.chat_finished {
-        return Some(
-            div()
-                .flex_shrink_0()
-                .size(px(7.0))
-                .rounded_full()
-                .bg(crate::ui::style::color::node_chat_text())
-                .into_any_element(),
-        );
-    }
-    None
+/// tree) while the chat agent works; `styles.node-chat-new` (a speech bubble
+/// with a dot) once it replied or is waiting on the user and the row has not
+/// been seen since. A cell of its own right of the pull-request icon, always
+/// reserved so titles stay aligned.
+fn chat_icon_cell(id: &str, item: &TaskItem) -> gpui::Stateful<gpui::Div> {
+    use gpui_kit_assets::IconName;
+    let (lines, child): (Vec<String>, Option<gpui::AnyElement>) = if item.chat_running {
+        (
+            vec!["The chat agent is working".to_string()],
+            Some(
+                gpui_component::spinner::Spinner::new()
+                    .xsmall()
+                    .color(crate::ui::style::color::node_chat_text())
+                    .into_any_element(),
+            ),
+        )
+    } else if item.chat_finished {
+        (
+            vec!["The chat agent replied; select the row to clear this".to_string()],
+            Some(
+                gpui_component::Icon::new(IconName::MessageSquareDot)
+                    .xsmall()
+                    .text_color(crate::ui::style::color::node_chat_text())
+                    .into_any_element(),
+            ),
+        )
+    } else {
+        (Vec::new(), None)
+    };
+    hover_lines(
+        div().w(px(16.0)).flex_shrink_0().flex().items_center(),
+        format!("row-chat-{id}"),
+        lines,
+    )
+    .children(child)
 }
 
 /// A deferred node's return time at its trailing edge, so the Deferred
