@@ -690,6 +690,9 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
     // The git identity cloud sandboxes author commits as: seeded from this
     // machine's git config when first made (`crate::git_identity`).
     crate::git_identity::ensure(conn, crate::git_identity::read_local())?;
+    // The node's timeline of gate checks, command runs and phase changes:
+    // synced, not journaled (`crate::node_timeline`).
+    conn.execute_batch(crate::node_timeline::CREATE_TABLE)?;
     crate::sync::install(conn)?;
     // Idempotent and cheap — keeps the gate criteria catalog's wording in
     // sync with the source on every startup, not just the migration that

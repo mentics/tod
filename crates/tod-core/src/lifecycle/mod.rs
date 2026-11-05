@@ -44,6 +44,20 @@ pub fn set_lifecycle(fleet: &FleetStore, node: Uuid, state: &str) -> Result<()> 
     Ok(())
 }
 
+/// [`set_lifecycle`], by the user's own choice: the node's activity shows the
+/// change as theirs.
+pub fn set_lifecycle_by_user(fleet: &FleetStore, node: Uuid, state: &str) -> Result<()> {
+    fleet
+        .enqueue_outline(OutlineMutation::SetLifecycleByUser {
+            node_id: node,
+            state: state.to_string(),
+        })
+        .map_err(|err| anyhow::anyhow!("{err:#}"))?;
+    let _ = fleet.writer().flush();
+    push_to_ticket(fleet, node, state);
+    Ok(())
+}
+
 /// Run the node's current state again as if it had just entered it: a new
 /// stay starts in the store (what is counted per stay, such as the phase
 /// conversation, a certificate or review rounds, starts over) and returns the

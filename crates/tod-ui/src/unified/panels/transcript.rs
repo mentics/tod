@@ -1,7 +1,14 @@
 //! The transcript column panel: one conversation's turns, read-only, reusing
 //! `conversation/transcript.rs`'s entry rendering
 //! ([`AgentConversationPanel`]).
+//!
+//! Watching a node it is the node's **activity** panel: a list, grouped by
+//! stay in a phase, of the node's agent sessions, gate checks and rounds of
+//! the phase's configured commands (`activity_timeline`), and beside it
+//! what the chosen one shows: a session's transcript, a gate check's
+//! criteria, or one collapsible chunk per command that ran.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use gpui::{
@@ -22,6 +29,7 @@ use crate::ui::agent_conversation::{
 use crate::ui::agent_runs::AgentRuns;
 use crate::ui::style;
 use crate::unified::panel::ColumnPanel;
+use crate::unified::panels::activity_timeline::{self as timeline, Group, Item, ItemKind};
 
 pub const TRANSCRIPT_PANEL_CONTEXT: &str = "TranscriptPanel";
 
@@ -71,6 +79,9 @@ pub struct TranscriptPanel {
     /// the transcript is only what its supervisor has synced so far, so the
     /// panel says whether anything is running and when it was last heard.
     cloud: Option<tod_core::cloud_sync::CloudStatus>,
+    /// The gate check or command round shown instead of a transcript
+    /// (`Watching::items`), when the node's activity is on one.
+    shown_activity: Option<Uuid>,
     /// The stored turns, as entries. Shared so a load can compare against
     /// them off the UI thread.
     stored: Arc<Vec<Entry>>,
@@ -81,14 +92,11 @@ pub struct TranscriptPanel {
     /// A load is running; a change meanwhile asks for one more after it.
     loading: bool,
     reload_again: bool,
-    /// Looking for the node's latest conversation.
-    searching: bool,
     /// The list of the node's conversations is being read.
     items_loading: bool,
     /// A `sync_watch` is waiting out its throttle.
     sync_scheduled: bool,
     _load: gpui::Task<()>,
-    _search: gpui::Task<()>,
     _items: gpui::Task<()>,
     /// Scroll position of the list of the watched node's conversations.
     runs_scroll: ScrollHandle,
@@ -101,15 +109,6 @@ const WATCH_THROTTLE: std::time::Duration = std::time::Duration::from_millis(60)
 
 /// How wide the list of the node's conversations is, beside the transcript.
 const RUNS_WIDTH: f32 = 210.0;
-
-/// One of the watched node's conversations, as the list beside the
-/// transcript shows it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct RunItem {
-    id: Uuid,
-    label: String,
-    updated_at: i64,
-}
 
 /// What a lifecycle conversation is called in the list: the work it does
 /// (and for a phase or evaluation, the state), not its protocol's name.
@@ -155,13 +154,27 @@ fn format_time(ms: i64) -> String {
     }
 }
 
+/// What the panel shows: a session's transcript or one gate check or round
+/// of commands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Target {
+    Session(Uuid),
+    Entry(Uuid),
+}
+
 struct Watching {
     node: Uuid,
     /// The user chose a conversation from the list: stay on it instead of
     /// following the node's running (or latest) one.
     pinned: bool,
-    /// The node's conversations, oldest first, as last read.
-    items: Vec<RunItem>,
+    /// The node's sessions, gate checks and command rounds, oldest first, as
+    /// last read, and the same grouped by stay in a phase.
+    items: Vec<Item>,
+    groups: Vec<Group>,
+    /// Stays the user opened; the rest are collapsed.
+    expanded_groups: HashSet<i64>,
+    /// Command chunks the user opened, by round and position.
+    expanded_chunks: HashSet<(Uuid, usize)>,
     /// The conversation the node is running now (here or in the cloud).
     live_id: Option<Uuid>,
     runs: Entity<AgentRuns>,
@@ -196,16 +209,15 @@ impl TranscriptPanel {
             _follow: gpui::Task::ready(()),
             watching: None,
             cloud: None,
+            shown_activity: None,
             stored: Arc::new(Vec::new()),
             stored_dirty: false,
             loaded: false,
             loading: false,
             reload_again: false,
-            searching: false,
             items_loading: false,
             sync_scheduled: false,
             _load: gpui::Task::ready(()),
-            _search: gpui::Task::ready(()),
             _items: gpui::Task::ready(()),
             runs_scroll: ScrollHandle::new(),
             _sync: gpui::Task::ready(()),
@@ -254,6 +266,9 @@ impl TranscriptPanel {
             node,
             pinned: false,
             items: Vec::new(),
+            groups: Vec::new(),
+            expanded_groups: HashSet::new(),
+            expanded_chunks: HashSet::new(),
             live_id: None,
             runs,
             live: Vec::new(),
@@ -281,49 +296,8 @@ impl TranscriptPanel {
         });
     }
 
-    /// Find the node's latest conversation off the UI thread, and move to it
-    /// unless the panel has found one meanwhile.
-    fn find_latest(&mut self, node: Uuid, cx: &mut Context<Self>) {
-        if self.searching {
-            return;
-        }
-        self.searching = true;
-        let fleet = self.fleet.clone();
-        self._search = cx.spawn(async move |this, cx| {
-            let latest = cx
-                .background_executor()
-                .spawn(async move {
-                    fleet
-                        .read(|conn| ConversationRepo::new(conn).list_for_focus(Focus::Node(node)))
-                        .ok()
-                        .and_then(|list| {
-                            list.into_iter()
-                                .map(|s| s.conversation)
-                                .filter(|c| !matches!(c.protocol, ProtocolKind::Outline | ProtocolKind::Chat))
-                                .max_by_key(|c| c.updated_at)
-                                .map(|c| c.id)
-                        })
-                })
-                .await;
-            this.update(cx, |this, cx| {
-                this.searching = false;
-                // Watching a node with nothing running here (a cloud node's
-                // work arrives through the store): follow its newest
-                // conversation, not the first one found.
-                if let Some(id) = latest
-                    && id != this.conversation_id
-                    && (this.conversation_id.is_nil()
-                        || this.watching.as_ref().is_some_and(|w| !w.pinned))
-                {
-                    this.retarget(id, cx);
-                }
-            })
-            .ok();
-        });
-    }
-
     /// Move to the node's running conversation (else, when none is showing
-    /// yet, its latest), and take its streamed reply.
+    /// yet, its latest activity), and take its streamed reply.
     fn sync_watch(&mut self, cx: &mut Context<Self>) {
         let Some(watching) = &self.watching else {
             return;
@@ -351,32 +325,57 @@ impl TranscriptPanel {
         let pinned = self.watching.as_ref().is_some_and(|w| w.pinned);
         let running = running.or_else(|| self.cloud_live_turn(node));
         let live_id = running.as_ref().map(|(conversation, _)| *conversation);
+        let chosen = match self.shown_activity {
+            Some(entry) => Target::Entry(entry),
+            None => Target::Session(self.conversation_id),
+        };
         let (target, live) = match running {
             // The one the user chose stays; its reply streams in only while
             // it is the one running.
-            Some((conversation, parts)) if pinned => {
-                (Some(self.conversation_id), if conversation == self.conversation_id { parts } else { Vec::new() })
-            }
+            Some((conversation, parts)) if pinned => (
+                Some(chosen),
+                if chosen == Target::Session(conversation) { parts } else { Vec::new() },
+            ),
             // Mid-turn, here or in the node's cloud sandbox (whose reply
             // in flight arrives through the store): show it as it streams.
-            Some((conversation, parts)) => (Some(conversation), parts),
-            None if pinned => (Some(self.conversation_id), Vec::new()),
-            None => {
-                self.find_latest(node, cx);
-                (None, Vec::new())
-            }
+            Some((conversation, parts)) => (Some(Target::Session(conversation)), parts),
+            None if pinned => (Some(chosen), Vec::new()),
+            // Nothing running (a cloud node's work arrives through the
+            // store): follow the latest thing that happened, a session, a
+            // gate check or a round of commands.
+            None => (self.latest_target(), Vec::new()),
         };
         if let Some(watching) = &mut self.watching {
             watching.live = live;
             watching.live_id = live_id;
         }
         match target {
-            Some(id) if id != self.conversation_id => self.retarget(id, cx),
-            _ => self.show(cx),
+            Some(Target::Session(id)) => {
+                self.shown_activity = None;
+                if id != self.conversation_id {
+                    self.retarget(id, cx)
+                } else {
+                    self.show(cx)
+                }
+            }
+            Some(Target::Entry(id)) => {
+                self.shown_activity = Some(id);
+                self.show(cx)
+            }
+            None => self.show(cx),
         }
     }
 
-    /// Read the watched node's conversations off the UI thread, for the list.
+    /// The most recent of the watched node's sessions, gate checks and command
+    /// rounds.
+    fn latest_target(&self) -> Option<Target> {
+        let watching = self.watching.as_ref()?;
+        let latest = watching.items.iter().max_by_key(|i| i.at)?;
+        Some(if latest.entry().is_some() { Target::Entry(latest.id) } else { Target::Session(latest.id) })
+    }
+
+    /// Read what the watched node has done (its sessions, gate checks and
+    /// command rounds) off the UI thread, for the list.
     fn load_items(&mut self, cx: &mut Context<Self>) {
         let Some(node) = self.watching.as_ref().map(|w| w.node) else {
             return;
@@ -390,52 +389,95 @@ impl TranscriptPanel {
             let found = cx
                 .background_executor()
                 .spawn(async move {
-                    fleet.read(|conn| ConversationRepo::new(conn).conversations_for_focus(Focus::Node(node)))
+                    let (mut conversations, entries) = fleet.read(|conn| {
+                        anyhow::Ok((
+                            ConversationRepo::new(conn).conversations_for_focus(Focus::Node(node))?,
+                            tod_store::node_timeline::TimelineRepo::new(conn).list(node)?,
+                        ))
+                    })?;
+                    conversations.retain(|c| !matches!(c.protocol, ProtocolKind::Outline | ProtocolKind::Chat));
+                    conversations.sort_by_key(|c| (c.created_at, c.updated_at));
+                    let current = tod_core::lifecycle::current_state(&fleet, node).unwrap_or_default();
+                    let mut items: Vec<Item> = conversations
+                        .iter()
+                        .map(|c| Item {
+                            id: c.id,
+                            kind: ItemKind::Session,
+                            label: run_label(c),
+                            at: c.updated_at,
+                            started: c.created_at,
+                            failed: false,
+                        })
+                        .collect();
+                    items.extend(timeline::entry_items(&entries));
+                    items.sort_by_key(|i| (i.started, i.at));
+                    let groups = timeline::build_groups(items.clone(), &entries, &current);
+                    anyhow::Ok((items, groups))
                 })
                 .await;
             this.update(cx, |this, cx| {
                 this.items_loading = false;
                 match found {
-                    Ok(mut conversations) => {
-                        conversations.retain(|c| !matches!(c.protocol, ProtocolKind::Outline | ProtocolKind::Chat));
-                        conversations.sort_by_key(|c| (c.created_at, c.updated_at));
-                        let items: Vec<RunItem> = conversations
-                            .iter()
-                            .map(|c| RunItem { id: c.id, label: run_label(c), updated_at: c.updated_at })
-                            .collect();
+                    Ok((items, groups)) => {
                         if let Some(watching) = &mut this.watching
-                            && watching.items != items
+                            && (watching.items != items || watching.groups != groups)
                         {
                             watching.items = items;
+                            watching.groups = groups;
                             cx.notify();
+                            // What is latest may have changed.
+                            this.sync_watch(cx);
                         }
                     }
-                    Err(err) => tracing::warn!("reading the node's conversations: {err:#}"),
+                    Err(err) => tracing::warn!("reading the node's activity: {err:#}"),
                 }
             })
             .ok();
         });
     }
 
-    /// Show `conversation` and stay on it; `None` goes back to following
-    /// the node's running (else latest) conversation.
-    fn choose(&mut self, conversation: Option<Uuid>, cx: &mut Context<Self>) {
+    /// Show the session or entry `id` and stay on it; `None` goes back to
+    /// following the node's running (else latest) one.
+    fn choose(&mut self, id: Option<Uuid>, cx: &mut Context<Self>) {
         let Some(watching) = &mut self.watching else {
             return;
         };
-        watching.pinned = conversation.is_some();
-        if let Some(id) = conversation
-            && id != self.conversation_id
-        {
-            self.retarget(id, cx);
+        watching.pinned = id.is_some();
+        if let Some(id) = id {
+            if watching.items.iter().any(|i| i.id == id && i.entry().is_some()) {
+                self.shown_activity = Some(id);
+            } else {
+                self.shown_activity = None;
+                if id != self.conversation_id {
+                    self.retarget(id, cx);
+                }
+            }
         }
         // Takes the streamed reply only if this is the running one.
         self.sync_watch(cx);
         cx.notify();
     }
 
-    /// The list of the node's conversations, oldest first, with "Follow
-    /// latest" above it.
+    fn toggle_group(&mut self, key: i64, cx: &mut Context<Self>) {
+        if let Some(watching) = &mut self.watching
+            && !watching.expanded_groups.remove(&key)
+        {
+            watching.expanded_groups.insert(key);
+        }
+        cx.notify();
+    }
+
+    fn toggle_chunk(&mut self, key: (Uuid, usize), cx: &mut Context<Self>) {
+        if let Some(watching) = &mut self.watching
+            && !watching.expanded_chunks.remove(&key)
+        {
+            watching.expanded_chunks.insert(key);
+        }
+        cx.notify();
+    }
+
+    /// The list, a header per stay in a phase (collapsed until opened) over
+    /// its rows, with "Follow latest" above it.
     fn render_runs(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
         let watching = self.watching.as_ref()?;
         // Rows keep their own height (`flex_none`): a flex column shrinks its
@@ -459,29 +501,63 @@ impl TranscriptPanel {
                     )
                     .child("Follow latest"),
             );
-        for item in &watching.items {
-            let id = item.id;
-            let current = watching.pinned && self.conversation_id == id;
-            let live = watching.live_id == Some(id);
+        for group in &watching.groups {
+            let key = group.key;
+            let open = watching.expanded_groups.contains(&key);
+            let live = group.items.iter().any(|i| watching.live_id == Some(i.id));
             rows = rows.child(
-                style::menu_item(div().id(SharedString::from(format!("transcript-run-{id}"))), current)
+                style::menu_item(div().id(SharedString::from(format!("transcript-group-{key}"))), false)
                     .flex_none()
                     .flex()
                     .items_center()
                     .cursor_pointer()
                     .on_mouse_down(
                         MouseButton::Left,
-                        cx.listener(move |this, _: &MouseDownEvent, _, cx| this.choose(Some(id), cx)),
+                        cx.listener(move |this, _: &MouseDownEvent, _, cx| this.toggle_group(key, cx)),
+                    )
+                    .child(
+                        style::list_group_chevron(div())
+                            .child(if open { "\u{25be}" } else { "\u{25b8}" }),
                     )
                     .child(
                         div().flex_1().min_w_0().overflow_hidden().text_ellipsis().child(format!(
                             "{}{}",
-                            if live { "\u{25cf} " } else { "" },
-                            item.label
+                            if live && !open { "\u{25cf} " } else { "" },
+                            group.title()
                         )),
                     )
-                    .child(style::text_dense_muted(div()).flex_shrink_0().child(format_time(item.updated_at))),
+                    .child(style::text_dense_muted(div()).flex_shrink_0().child(group.items.len().to_string())),
             );
+            if !open {
+                continue;
+            }
+            for item in &group.items {
+                let id = item.id;
+                let current = watching.pinned
+                    && match item.entry() {
+                        Some(_) => self.shown_activity == Some(id),
+                        None => self.shown_activity.is_none() && self.conversation_id == id,
+                    };
+                let live = watching.live_id == Some(id);
+                let mut label = div().flex_1().min_w_0().overflow_hidden().text_ellipsis();
+                if item.failed {
+                    label = label.text_color(style::color::danger());
+                }
+                rows = rows.child(
+                    style::menu_item(div().id(SharedString::from(format!("transcript-run-{id}"))), current)
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .pl_4()
+                        .cursor_pointer()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _: &MouseDownEvent, _, cx| this.choose(Some(id), cx)),
+                        )
+                        .child(label.child(format!("{}{}", if live { "\u{25cf} " } else { "" }, item.label)))
+                        .child(style::text_dense_muted(div()).flex_shrink_0().child(format_time(item.at))),
+                );
+            }
         }
         Some(
             div()
@@ -504,6 +580,89 @@ impl TranscriptPanel {
                 )
                 .into_any_element(),
         )
+    }
+
+    /// What a gate check or round of commands found: the criteria, or one
+    /// chunk per command (collapsed until opened, red when it did not pass).
+    fn render_entry(&self, id: Uuid, window: &mut Window, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let watching = self.watching.as_ref()?;
+        let item = watching.items.iter().find(|i| i.id == id)?;
+        let entry = item.entry()?;
+        let mut body = div().id("activity-entry").size_full().overflow_y_scroll().flex().flex_col().gap_2().p_2();
+        body = body.child(
+            style::text_dense_muted(div())
+                .child(format!("{} \u{b7} {}", entry.title, format_time(entry.at))),
+        );
+        match &item.kind {
+            ItemKind::Gate(_) => {
+                for (n, line) in entry.gate_lines().into_iter().enumerate() {
+                    let clear = line.outcome == tod_store::outline::OUTCOME_PASS
+                        || line.outcome == tod_store::outline::OUTCOME_WAIVED;
+                    let mut row = style::chunk(div()).px_2().py_1().flex().flex_col();
+                    if !clear {
+                        row = style::log_row_error(row);
+                    }
+                    row = row.child(div().child(format!("{} \u{b7} {}", line.criterion, line.outcome)));
+                    if !line.detail.is_empty() {
+                        row = row.child(crate::ui::selectable_text::selectable_text(
+                            SharedString::from(format!("activity-gate-{id}-{n}")),
+                            line.detail,
+                            window,
+                            cx,
+                        ));
+                    }
+                    body = body.child(row);
+                }
+            }
+            ItemKind::Commands(_) => {
+                for (n, command) in entry.commands().into_iter().enumerate() {
+                    let key = (id, n);
+                    let open = watching.expanded_chunks.contains(&key);
+                    let failed = command.is_failure();
+                    let mut header = style::chunk_header(div().id(SharedString::from(format!("activity-chunk-{id}-{n}"))))
+                        .flex()
+                        .w_full()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _: &MouseDownEvent, _, cx| this.toggle_chunk(key, cx)),
+                        );
+                    if failed {
+                        header = style::log_row_error(header);
+                    }
+                    let verdict = match command.verdict.as_str() {
+                        "broken" => "could not run".to_string(),
+                        other => other.to_string(),
+                    };
+                    let mut chunk = style::chunk(div()).flex().flex_col().child(
+                        header
+                            .child(style::list_group_chevron(div()).child(if open { "\u{25be}" } else { "\u{25b8}" }))
+                            .child(div().flex_1().min_w_0().overflow_hidden().text_ellipsis().child(command.name.clone()))
+                            .child(style::text_dense_muted(div()).flex_shrink_0().child(verdict)),
+                    );
+                    if failed {
+                        chunk = chunk.border_color(style::color::danger());
+                    }
+                    if open {
+                        let text = if command.output.trim().is_empty() {
+                            "(no output)".to_string()
+                        } else {
+                            command.output.clone()
+                        };
+                        chunk = chunk.child(style::chunk_body(div()).child(
+                            crate::ui::selectable_text::selectable_text(
+                                SharedString::from(format!("activity-output-{id}-{n}")),
+                                text,
+                                window,
+                                cx,
+                            ),
+                        ));
+                    }
+                    body = body.child(chunk);
+                }
+            }
+            ItemKind::Session => return None,
+        }
+        Some(body.into_any_element())
     }
 
     /// The turn `node`'s cloud supervisor has in flight, as it last sent it
@@ -628,7 +787,7 @@ impl TranscriptPanel {
 
 impl ColumnPanel for TranscriptPanel {
     fn title(&self, _cx: &App) -> SharedString {
-        "Transcript".into()
+        if self.watching.is_some() { "Activity".into() } else { "Transcript".into() }
     }
 
 }
@@ -699,7 +858,10 @@ impl Render for TranscriptPanel {
             .flex()
             .flex_col()
             .children(self.render_cloud_status(window, cx))
-            .child(div().flex_auto().min_h_0().child(self.panel.clone()));
+            .child(match self.shown_activity.and_then(|id| self.render_entry(id, window, cx)) {
+                Some(entry) => div().flex_auto().min_h_0().child(entry),
+                None => div().flex_auto().min_h_0().child(self.panel.clone()),
+            });
         forward_panel_keys(div(), &self.panel, true)
             .size_full()
             .key_context(TRANSCRIPT_PANEL_CONTEXT)
@@ -993,6 +1155,87 @@ mod tests {
             assert_eq!(view.conversation_id(), second);
             assert_eq!(view.panel.read(cx).entries().len(), 3);
         });
+    }
+
+    /// Gate checks and command rounds are listed with the sessions, in groups
+    /// that start collapsed; following the latest shows the newest of them,
+    /// and a user's phase change is marked in its group's title.
+    #[gpui::test]
+    fn the_activity_lists_gates_and_commands_by_phase_and_follows_the_latest(cx: &mut TestAppContext) {
+        use crate::interview::agent::SharedAgent;
+        use std::sync::{Arc, Mutex};
+        use tod_store::node_timeline::{CommandResult, GateLine, KIND_CHECKS, KIND_GATE, TimelineEntry};
+
+        let fixture = Fixture::new();
+        let session = add_conversation_under(&fixture, ProtocolKind::Implementation);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let gate = TimelineEntry::new(
+            fixture.node_id,
+            KIND_GATE,
+            "active",
+            "Gate check: active \u{2192} verifying",
+            true,
+            serde_json::to_string(&[GateLine { criterion: "Tests pass".into(), outcome: "fail".into(), detail: "2 failing".into() }]).unwrap(),
+        );
+        fixture.store.enqueue(tod_store::fleet::FleetMutation::RecordGateTimeline(Box::new(gate.clone()))).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let commands = TimelineEntry::new(
+            fixture.node_id,
+            KIND_CHECKS,
+            "active",
+            "Ran cargo test",
+            true,
+            serde_json::to_string(&[CommandResult {
+                name: "cargo test".into(),
+                command: "cargo test".into(),
+                verdict: "failed".into(),
+                output: "boom".into(),
+            }])
+            .unwrap(),
+        );
+        fixture.store.enqueue(tod_store::fleet::FleetMutation::RecordTimeline(Box::new(commands.clone()))).unwrap();
+        fixture.store.writer().flush().unwrap();
+
+        cx.update(gpui_component::init);
+        let agent: SharedAgent = Arc::new(Mutex::new(Box::new(crate::interview::agent::MockAgentProvider::new())));
+        let runs = cx.new(|_| AgentRuns::new(fixture.store.clone(), agent));
+        let (store, node, runs_in) = (fixture.store.clone(), fixture.node_id, runs.clone());
+        let slot = std::rc::Rc::new(RefCell::new(None));
+        let slot_in = slot.clone();
+        let (_, cx) = cx.add_window_view(move |window, cx| {
+            let view = cx.new(|cx| TranscriptPanel::watching(node, store, runs_in, window, cx));
+            *slot_in.borrow_mut() = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let view = slot.borrow_mut().take().unwrap();
+        settle(cx);
+        view.read_with(cx, |view, cx| {
+            let watching = view.watching.as_ref().unwrap();
+            assert_eq!(
+                watching.items.iter().map(|i| i.id).collect::<Vec<_>>(),
+                vec![session, gate.id, commands.id]
+            );
+            assert!(watching.items[1].failed && watching.items[2].failed);
+            // One stay, collapsed.
+            assert_eq!(watching.groups.len(), 1);
+            assert!(watching.expanded_groups.is_empty());
+            // Following the latest: the commands, not the session.
+            assert_eq!(view.shown_activity, Some(commands.id));
+            assert!(view.title(cx) == "Activity");
+        });
+
+        // Choosing the session shows its transcript; Follow latest returns.
+        view.update(cx, |view, cx| view.choose(Some(session), cx));
+        settle(cx);
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.shown_activity, None);
+            assert_eq!(view.conversation_id(), session);
+        });
+        view.update(cx, |view, cx| view.choose(Some(gate.id), cx));
+        view.read_with(cx, |view, _| assert_eq!(view.shown_activity, Some(gate.id)));
+        view.update(cx, |view, cx| view.choose(None, cx));
+        settle(cx);
+        view.read_with(cx, |view, _| assert_eq!(view.shown_activity, Some(commands.id)));
     }
 
     #[gpui::test]

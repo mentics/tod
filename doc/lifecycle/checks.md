@@ -79,3 +79,16 @@ A scoped check's fingerprint covers only the repositories in its scope plus
 its file list, so a change in one repository does not run another's checks.
 Runs are keyed by phase, directory and command, so the same command may be
 configured for several directories. Messages name a check `label in dir`.
+
+## Where the runs are seen
+
+The task panel's **Watch** opens the node's **Activity** panel. Each round of
+commands that actually ran (not a cached or skipped check) is a row there
+(`node_timeline`, kind `checks`), in the group for the stay in its phase; the
+row opens to one chunk per command, collapsed, named by its label, tinted red
+when it failed or could not run, and holding the output when opened. Each gate
+check is a row too, listing its criteria; a check that reads exactly as the
+last one did is not recorded again, so a runner polling a waiting gate does not
+fill the list. A node's stays come from the phase changes the timeline
+recorded (the phase chip's are marked "(user)"); a node older than the
+timeline shows everything under its current phase.

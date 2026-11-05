@@ -325,6 +325,12 @@ pub enum OutlineMutation {
         node_id: Uuid,
         state: String,
     },
+    /// [`Self::SetLifecycle`] by the user's own choice (the task panel's
+    /// phase chip): the activity shows the change as theirs.
+    SetLifecycleByUser {
+        node_id: Uuid,
+        state: String,
+    },
     /// Start a new stay in the node's current lifecycle state: the state is
     /// run again as if just entered (`NodeRepo::restart_stay`).
     RestartLifecycleStay {
@@ -494,6 +500,7 @@ impl OutlineMutation {
                 | OutlineMutation::UnlinkPlanStepObligation { .. }
                 | OutlineMutation::SetExtraContent { .. }
                 | OutlineMutation::SetLifecycle { .. }
+                | OutlineMutation::SetLifecycleByUser { .. }
                 | OutlineMutation::RestartLifecycleStay { .. }
                 | OutlineMutation::ApplyGateResults { .. }
                 | OutlineMutation::SetGeneratorConfig { .. }
@@ -906,6 +913,9 @@ impl OutlineMutation {
             }
             OutlineMutation::SetLifecycle { node_id, state } => {
                 NodeRepo::new(conn).set_lifecycle(*node_id, state)?;
+            }
+            OutlineMutation::SetLifecycleByUser { node_id, state } => {
+                NodeRepo::new(conn).set_lifecycle_by(*node_id, state, true)?;
             }
             OutlineMutation::RestartLifecycleStay { node_id } => {
                 NodeRepo::new(conn).restart_stay(*node_id)?;

@@ -406,6 +406,8 @@ pub fn run_stale(fleet: &FleetStore, node: Uuid, state: &str) -> Result<Round> {
         .with_context(|| format!("find the files to run the {state} checks in"))?;
     let tree = Tree::new(&cwd)?;
     let mut round = Round { fingerprint: tree.fingerprint_all()?, runs: Vec::new() };
+    // The commands this round actually ran, for the node's activity.
+    let mut ran: Vec<tod_store::node_timeline::CommandResult> = Vec::new();
     for check in &checks {
         let dir = clean_dir(&check.dir);
         let assessment = assess(&tree, check)?;
@@ -431,10 +433,32 @@ pub fn run_stale(fleet: &FleetStore, node: Uuid, state: &str) -> Result<Round> {
                 };
                 fleet.enqueue(tod_store::fleet::FleetMutation::RecordCheckRun(Box::new(run.clone())))?;
                 fleet.writer().flush()?;
+                if run.verdict != Verdict::Skipped {
+                    ran.push(tod_store::node_timeline::CommandResult {
+                        name: run_name(&run),
+                        command: run.command.clone(),
+                        verdict: run.verdict.as_str().to_string(),
+                        output: run.output.clone(),
+                    });
+                }
                 run
             }
         };
         round.runs.push(run);
+    }
+    if !ran.is_empty() {
+        let failed = ran.iter().any(|r| r.is_failure());
+        let title = if ran.len() == 1 { format!("Ran {}", ran[0].name) } else { format!("Ran {} commands", ran.len()) };
+        let entry = tod_store::node_timeline::TimelineEntry::new(
+            node,
+            tod_store::node_timeline::KIND_CHECKS,
+            state,
+            title,
+            failed,
+            serde_json::to_string(&ran)?,
+        );
+        fleet.enqueue(tod_store::fleet::FleetMutation::RecordTimeline(Box::new(entry)))?;
+        fleet.writer().flush()?;
     }
     Ok(round)
 }

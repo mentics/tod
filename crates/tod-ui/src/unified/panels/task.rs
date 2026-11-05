@@ -1424,7 +1424,7 @@ impl TaskPanel {
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
-                .spawn(async move { tod_core::lifecycle::set_lifecycle(&fleet, node, target) })
+                .spawn(async move { tod_core::lifecycle::set_lifecycle_by_user(&fleet, node, target) })
                 .await;
             let _ = this.update(cx, |this: &mut TaskPanel, cx| {
                 if let Err(err) = result {

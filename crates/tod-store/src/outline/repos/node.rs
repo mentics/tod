@@ -231,6 +231,12 @@ impl<'a> NodeRepo<'a> {
     }
 
     pub fn set_lifecycle(&self, node_id: Uuid, state: &str) -> Result<()> {
+        self.set_lifecycle_by(node_id, state, false)
+    }
+
+    /// [`Self::set_lifecycle`]; `by_user` says the user chose the state, which
+    /// the node's timeline shows.
+    pub fn set_lifecycle_by(&self, node_id: Uuid, state: &str, by_user: bool) -> Result<()> {
         let now = now_ms();
         let previous = self.get_lifecycle(node_id)?;
         self.conn.execute(
@@ -252,6 +258,7 @@ impl<'a> NodeRepo<'a> {
             // stay's runs and show the node as waiting on others forever.
             if previous != state {
                 crate::waits::cancel_for_node(self.conn, node_id, &format!("the node left {previous}"))?;
+                crate::node_timeline::TimelineRepo::new(self.conn).record_phase_change(node_id, &previous, state, by_user)?;
             }
         }
         // What `ready` onwards is built on; see `crate::lifecycle_baseline`.
@@ -280,6 +287,8 @@ impl<'a> NodeRepo<'a> {
             params![uuid_to_blob(node_id), now_ms()],
         )?;
         crate::waits::cancel_for_node(self.conn, node_id, &format!("{state} was run again"))?;
+        // Only the runner menu's Rerun restarts a stay.
+        crate::node_timeline::TimelineRepo::new(self.conn).record_phase_change(node_id, &state, &state, true)?;
         Ok(Some(state))
     }
 

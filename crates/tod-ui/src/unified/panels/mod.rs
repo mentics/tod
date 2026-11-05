@@ -10,6 +10,7 @@ pub mod plan;
 pub mod runner_menu;
 pub mod settings;
 pub mod task;
+pub mod activity_timeline;
 pub mod transcript;
 pub mod changes;
 

@@ -224,6 +224,10 @@ pub enum FleetMutation {
     },
     /// A gate check ran (`crate::check_runs`).
     RecordCheckRun(Box<crate::check_runs::CheckRun>),
+    /// Something to show in the node's activity (`crate::node_timeline`).
+    RecordTimeline(Box<crate::node_timeline::TimelineEntry>),
+    /// A gate check's result, left out when it reads as the last one did.
+    RecordGateTimeline(Box<crate::node_timeline::TimelineEntry>),
     /// The processing is still alive.
     ActivityBeat {
         id: uuid::Uuid,
@@ -326,6 +330,8 @@ impl FleetMutation {
                 | FleetMutation::ActivityStart { .. }
                 | FleetMutation::ActivityBeat { .. }
                 | FleetMutation::RecordCheckRun(_)
+                | FleetMutation::RecordTimeline(_)
+                | FleetMutation::RecordGateTimeline(_)
                 | FleetMutation::ActivityEnd { .. }
                 | FleetMutation::ActivityClearLost { .. }
                 | FleetMutation::DeferNode { .. }
@@ -581,6 +587,12 @@ impl FleetMutation {
             }
             FleetMutation::RecordCheckRun(run) => {
                 crate::check_runs::CheckRunRepo::new(conn).record(run)?;
+            }
+            FleetMutation::RecordTimeline(entry) => {
+                crate::node_timeline::TimelineRepo::new(conn).record(entry)?;
+            }
+            FleetMutation::RecordGateTimeline(entry) => {
+                crate::node_timeline::TimelineRepo::new(conn).record_gate_if_changed(entry)?;
             }
             FleetMutation::ActivityBeat { id, at } => {
                 // A lease cleared under its owner is the owner's to notice

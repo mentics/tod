@@ -2512,6 +2512,16 @@ fn a_failing_check_goes_to_the_fix_agent_as_a_finding_and_a_change_reruns_it() {
         .unwrap()
         .unwrap();
     assert_eq!(run.verdict, tod_store::check_runs::Verdict::Passed);
+    // The node's activity has a round per run of the command: the failure,
+    // with its output, then the pass.
+    let timeline = fx.fleet.read(|conn| tod_store::node_timeline::TimelineRepo::new(conn).list(fx.node)).unwrap();
+    let rounds: Vec<_> = timeline.iter().filter(|e| e.kind == tod_store::node_timeline::KIND_CHECKS).collect();
+    assert_eq!(rounds.len(), 2, "{timeline:#?}");
+    assert!(rounds[0].failed && rounds[0].commands()[0].output.contains("ok.txt is missing"));
+    assert_eq!(rounds[0].commands()[0].name, "ok file");
+    assert!(!rounds[1].failed);
+    // And gate checks are there, each phase change too.
+    assert!(timeline.iter().any(|e| e.kind == tod_store::node_timeline::KIND_GATE), "{timeline:#?}");
 }
 
 #[test]

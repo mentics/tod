@@ -187,6 +187,7 @@ pub fn classify(mutation: &OutlineMutation) -> Option<(ActionKind, Entity, Uuid)
         | M::RestorePlanStep { .. }
         | M::SetExtraContent { .. }
         | M::SetLifecycle { .. }
+        | M::SetLifecycleByUser { .. }
         | M::RestartLifecycleStay { .. }
         | M::ApplyGateResults { .. }
         | M::DeleteGeneratorConfig { .. }

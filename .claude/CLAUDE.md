@@ -749,7 +749,11 @@ launch its own data root and port so this is unambiguous.
 `crates/tod-ui/src/unified/` is the multi-column workbench for supervising
 many nodes at once: `mod.rs` (`UnifiedView`, `ColumnModel`, column
 placement), `panels/` (`DetailsPanel`, `TaskPanel`, `ObligationsPanel`,
-`PlanPanel`, `FindingsPanel`, `SettingsPanel`, `TranscriptPanel`), and
+`PlanPanel`, `FindingsPanel`, `SettingsPanel`, `TranscriptPanel`, which the
+task panel's **Watch** opens as the node's **Activity**: its agent sessions,
+gate checks and rounds of the phase's commands, grouped by stay in a phase
+and collapsed until opened, a phase the user chose marked "(user)"; the gate
+checks and command rounds are `tod_store::node_timeline`, synced), and
 `chat_drawer.rs`. Column 1 is always the node tree; a panel opens in the
 first unpinned column from the one it was opened from, or a new column is
 appended, and the same panel already shown is focused instead —
