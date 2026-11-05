@@ -2288,3 +2288,155 @@ fn the_real_loop_stops_an_evaluator_that_rejects_changed_work_with_the_same_asks
     assert_eq!(evaluations, CYCLE_LIMIT as usize, "{steps:?}");
     assert!(pilot.state().sessions < budget.max_sessions);
 }
+
+/// Turns on the review steps in `pr_draft` for the fixture's node.
+fn with_pr_draft_review(fx: &Fixture) {
+    fx.fleet
+        .enqueue_outline(OutlineMutation::EnableCapabilities {
+            node_id: fx.node,
+            capabilities: vec![Capability::LifecycleConfig],
+        })
+        .unwrap();
+    fx.fleet.writer().flush().unwrap();
+    fx.fleet
+        .enqueue_outline(OutlineMutation::SetNodeLifecyclePrDraftReview {
+            node_id: fx.node,
+            pr_draft_review: Some(true),
+        })
+        .unwrap();
+    fx.fleet.writer().flush().unwrap();
+}
+
+/// A draft pull request with nothing on it but what tod's own review posts.
+/// Each posted line comment becomes a thread, resolved when `resolve` (a
+/// person dismissed it on GitHub).
+struct OwnReviewFeed {
+    resolve: bool,
+    threads: std::sync::Mutex<Vec<tod_store::github::ReviewThread>>,
+    posts: std::sync::atomic::AtomicUsize,
+}
+
+impl OwnReviewFeed {
+    fn new(resolve: bool) -> Arc<Self> {
+        Arc::new(Self {
+            resolve,
+            threads: std::sync::Mutex::new(Vec::new()),
+            posts: std::sync::atomic::AtomicUsize::new(0),
+        })
+    }
+}
+
+impl crate::pr_readiness::PrFeed for OwnReviewFeed {
+    fn snapshot(&self, _: &tod_store::github::NodePr) -> Result<tod_store::github::PrSnapshot, String> {
+        use tod_store::github::{PrSnapshot, PrStatus};
+        Ok(PrSnapshot {
+            status: PrStatus {
+                mergeable: Some(true),
+                mergeable_state: Some("blocked".into()),
+                behind_by: Some(0),
+                checks: Some("success".into()),
+                head_sha: Some("abcdef1".into()),
+                head_committed_at: Some("2020-01-01T00:00:00Z".into()),
+                draft: true,
+                open: true,
+                ..Default::default()
+            },
+            threads: self.threads.lock().unwrap().clone(),
+            comments: vec![],
+            reviews: vec![],
+        })
+    }
+
+    fn changed_files(&self, _: &tod_store::github::NodePr) -> Result<Vec<tod_store::github::PrFile>, String> {
+        Ok(vec![tod_store::github::PrFile {
+            filename: "src/lib.rs".into(),
+            patch: Some("@@ -0,0 +1,3 @@\n+a\n+b\n+c".into()),
+        }])
+    }
+
+    fn post_review(&self, _: &tod_store::github::NodePr, post: &crate::pr_readiness::ReviewPost) -> Result<(), String> {
+        assert_eq!(post.commit_id, "abcdef1");
+        self.posts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let mut threads = self.threads.lock().unwrap();
+        let before = threads.len();
+        for (i, line) in post.lines.iter().enumerate() {
+            threads.push(tod_store::github::ReviewThread {
+                id: format!("T_{before}_{i}"),
+                resolved: self.resolve,
+                outdated: false,
+                path: Some(line.path.clone()),
+                line: Some(line.line),
+                comments: vec![tod_store::github::ThreadComment {
+                    id: 1,
+                    author: Some("someone".into()),
+                    body: line.body.clone(),
+                    created_at: "2020-01-02T00:00:00Z".into(),
+                    diff_hunk: None,
+                }],
+            });
+        }
+        Ok(())
+    }
+}
+
+#[test]
+fn pr_draft_with_review_steps_reviews_the_clean_head_once() {
+    // Nothing on the draft but a person: tod's own review runs on the head,
+    // records nothing, and the run goes on to the gate. A restart in the same
+    // stay does not review the same head again.
+    let fx = setup();
+    retire_outside_criteria(&fx);
+    let feed = OwnReviewFeed::new(false);
+    crate::pr_readiness::set_feed_override(Some(feed.clone()));
+    with_pr_draft_review(&fx);
+    // The mock reviewer finds something only on a node with no findings yet:
+    // one from `review` makes this head's review clean.
+    fx.fleet
+        .interview(
+            ACTOR_USER,
+            InterviewCommand::AddReviewFinding {
+                node_id: fx.node,
+                conversation_id: None,
+                finding: tod_store::review::NewFinding {
+                    severity: "low".into(),
+                    file: None,
+                    line: None,
+                    summary: "From the review before the pull request.".into(),
+                    detail: None,
+                },
+            },
+        )
+        .unwrap();
+    linked_to_prs(&fx, "pr_draft", &["https://github.com/acme/app/pull/42"]);
+    let mut agent = FakeAgent::new(&fx.fleet);
+    let outcome = autopilot(&fx, Budget::default()).with_pr_poll_interval(Duration::ZERO).run(&fx.fleet, &mut agent).unwrap();
+    let reviews = openings(&fx, ProtocolKind::Review);
+    assert_eq!(reviews.len(), 1, "{outcome:?}");
+    assert!(reviews[0].1.contains("pr_draft"), "the reviewer is told it reviews the pull request");
+    assert_eq!(feed.posts.load(std::sync::atomic::Ordering::SeqCst), 0, "nothing to post");
+    let heads = [("acme/app#42".to_string(), "abcdef1".to_string())].into();
+    let gate = fx.fleet.read(|conn| crate::pr_draft_review::gate(conn, fx.node, &heads)).unwrap();
+    assert!(gate.is_ok(), "{gate:?}");
+
+    autopilot(&fx, Budget::default()).with_pr_poll_interval(Duration::ZERO).run(&fx.fleet, &mut agent).unwrap();
+    assert_eq!(openings(&fx, ProtocolKind::Review).len(), 1, "the same head is not reviewed again");
+}
+
+#[test]
+fn pr_draft_review_findings_are_posted_and_a_resolved_thread_declines_its_finding() {
+    let fx = setup();
+    retire_outside_criteria(&fx);
+    let feed = OwnReviewFeed::new(true);
+    crate::pr_readiness::set_feed_override(Some(feed.clone()));
+    with_pr_draft_review(&fx);
+    linked_to_prs(&fx, "pr_draft", &["https://github.com/acme/app/pull/42"]);
+    let mut agent = FakeAgent::new(&fx.fleet);
+    agent.review_never_clean = true;
+    let outcome = autopilot(&fx, Budget::default()).with_pr_poll_interval(Duration::ZERO).run(&fx.fleet, &mut agent).unwrap();
+    assert_eq!(feed.posts.load(std::sync::atomic::Ordering::SeqCst), 1, "{outcome:?}");
+    let findings = fx.fleet.read(|conn| crate::pr_draft_review::own_findings(conn, fx.node)).unwrap();
+    assert_eq!(findings.len(), 1, "{findings:#?}");
+    assert_eq!(findings[0].pr_thread.as_deref(), Some("T_0_0"));
+    assert_eq!(findings[0].status, tod_store::review::FINDING_DECLINED);
+    assert_eq!(openings(&fx, ProtocolKind::Review).len(), 1, "a declined finding leaves the round clean");
+}

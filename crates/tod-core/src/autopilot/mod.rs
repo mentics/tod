@@ -908,6 +908,8 @@ impl Autopilot {
         use crate::pr_readiness::{self, Next as PrNext};
         let mut waited_since: Option<std::time::Instant> = None;
         let mut unchanged = 0u32;
+        // The findings last sent to the agent by name ([`OwnReview`]).
+        let mut answered: Option<Vec<Uuid>> = None;
         // Like every phase: coming in, the agent's session and then each later
         // group of the phase's skills run in order, once per stay; the pull
         // request is looked at after. What a later group posts (a code review)
@@ -975,9 +977,21 @@ impl Autopilot {
             };
             let overall = pr_readiness::overall(&live);
             match overall {
-                PrNext::Merged | PrNext::Clear => {
+                PrNext::Merged => {
                     self.clear_poll_waits(fleet)?;
                     hook.waiting(None, None);
+                    return Ok(None);
+                }
+                PrNext::Clear => {
+                    self.clear_poll_waits(fleet)?;
+                    hook.waiting(None, None);
+                    if before_review {
+                        match self.own_review(fleet, agent, hook, feed.as_ref(), &live, &mut answered)? {
+                            OwnReview::Again => continue,
+                            OwnReview::Stop(outcome) => return Ok(Some(outcome)),
+                            OwnReview::Clear => {}
+                        }
+                    }
                     return Ok(None);
                 }
                 PrNext::Work(_) => {
@@ -1030,8 +1044,14 @@ impl Autopilot {
                     if waits.is_empty() {
                         hook.waiting(None, None);
                         if before_review {
-                            // Ready for a person: the gate asks that one is on it.
-                            return Ok(None);
+                            // Ready for a person, once tod's own review (when
+                            // the review steps are on) has nothing left: the
+                            // gate asks that one is on it.
+                            match self.own_review(fleet, agent, hook, feed.as_ref(), &live, &mut answered)? {
+                                OwnReview::Again => continue,
+                                OwnReview::Stop(outcome) => return Ok(Some(outcome)),
+                                OwnReview::Clear => return Ok(None),
+                            }
                         }
                         // Hours or days: the run ends, and is woken at the
                         // time recorded (or by the review's webhook).
@@ -1052,6 +1072,105 @@ impl Autopilot {
                         return Ok(Some(Outcome::Stopped { reason }));
                     }
                 }
+            }
+        }
+    }
+
+    /// tod's own code review in `pr_draft` ([`crate::pr_draft_review`]), once
+    /// nothing but a person is left on the pull request: post the findings
+    /// not yet on it, send the agent the ones no open thread carries, or
+    /// review the current head. [`OwnReview::Again`] after any of those, so
+    /// the pull request is read again (a posted thread is work for the agent).
+    fn own_review<A: AgentAccess + ?Sized, H: StepHook + ?Sized>(
+        &mut self,
+        fleet: &FleetStore,
+        agent: &mut A,
+        hook: &mut H,
+        feed: &dyn crate::pr_readiness::PrFeed,
+        live: &[crate::pr_readiness::LivePr],
+        answered: &mut Option<Vec<Uuid>>,
+    ) -> Result<OwnReview> {
+        use crate::pr_draft_review::{self, Owed};
+        let node = self.node;
+        if !fleet.read(|conn| pr_draft_review::enabled(conn, node))? {
+            return Ok(OwnReview::Clear);
+        }
+        pr_draft_review::sync_resolved(fleet, node, live)?;
+        match fleet.read(|conn| pr_draft_review::owed(conn, node, live))? {
+            Owed::Clear => Ok(OwnReview::Clear),
+            Owed::Post(findings) => {
+                hook.working_on("posting tod's code review on the pull request");
+                match pr_draft_review::post(fleet, feed, live, &findings) {
+                    Ok(()) => Ok(OwnReview::Again),
+                    Err(why) => Ok(OwnReview::Stop(Outcome::NeedsHuman {
+                        reason: NeedsHuman::PrBlocked {
+                            why: format!("could not post tod's code review on the pull request: {why}"),
+                        },
+                    })),
+                }
+            }
+            Owed::Answer(findings) => {
+                let ids: Vec<Uuid> = findings.iter().map(|f| f.id).collect();
+                if answered.as_ref() == Some(&ids) {
+                    return Ok(OwnReview::Stop(Outcome::NeedsHuman {
+                        reason: NeedsHuman::PrStuck {
+                            why: format!(
+                                "the agent was sent tod's review findings {} and left them unanswered",
+                                ids.iter().map(|id| tod_store::interview::short_id(*id)).collect::<Vec<_>>().join(", ")
+                            ),
+                        },
+                    }));
+                }
+                *answered = Some(ids);
+                // The stay's pull request conversation (`pr_draft` always
+                // opens one on entry) is sent them.
+                let message = pr_draft_review::answer_message(&findings);
+                let reopen = self.pr_reopen(fleet, live)?.map(|(id, _)| (id, message));
+                match self.pr_turn(fleet, agent, hook, reopen, pr_draft_review::STATE)? {
+                    Some(outcome) => Ok(OwnReview::Stop(outcome)),
+                    None => Ok(OwnReview::Again),
+                }
+            }
+            Owed::Review => {
+                let rounds = fleet.read(|conn| pr_draft_review::reviews_this_stay(conn, node))?;
+                // A review the last run left unfinished is resumed, not a new round.
+                let resuming = self.state.current.as_ref().is_some_and(|c| {
+                    c.protocol == protocol_name(ProtocolKind::Review) && c.lifecycle == pr_draft_review::STATE
+                });
+                if !resuming && rounds >= REVIEW_ROUND_LIMIT {
+                    let standing = fleet.read(|conn| {
+                        let latest = pr_draft_review::latest_review(conn, node)?;
+                        Ok(pr_draft_review::own_findings(conn, node)?
+                            .iter()
+                            .filter(|f| latest.as_ref().is_some_and(|l| f.created_at >= l.created_at))
+                            .filter(|f| !matches!(f.status.as_str(), "out_of_scope" | "declined"))
+                            .map(|f| format!("[{}] {} ({})", tod_store::interview::short_id(f.id), f.summary, f.status))
+                            .collect::<Vec<_>>())
+                    })?;
+                    return Ok(OwnReview::Stop(Outcome::NeedsHuman {
+                        reason: NeedsHuman::ReviewNotConverging { rounds, standing },
+                    }));
+                }
+                let heads = pr_draft_review::current_heads(live);
+                hook.working_on("tod's code review of the pull request");
+                if let Some(outcome) = self.converse(fleet, agent, hook, ProtocolKind::Review, None)? {
+                    return Ok(OwnReview::Stop(outcome));
+                }
+                let review = fleet.read(|conn| pr_draft_review::latest_review(conn, node))?;
+                self.owe_groups(fleet, ProtocolKind::Review, "review", pr_draft_review::STATE)?;
+                if let Some(outcome) = self.run_pending_groups(fleet, agent, hook, pr_draft_review::STATE)? {
+                    return Ok(OwnReview::Stop(outcome));
+                }
+                if let Some(review) = review {
+                    fleet.interview(
+                        "autopilot",
+                        InterviewCommand::RecordConversationReport {
+                            conversation_id: review.id,
+                            body: pr_draft_review::heads_report(&heads),
+                        },
+                    )?;
+                }
+                Ok(OwnReview::Again)
             }
         }
     }
@@ -1489,4 +1608,14 @@ fn wait_description(waits: &[crate::pr_readiness::Wait]) -> String {
         })
         .collect();
     format!("waiting for {}", parts.join(", "))
+}
+
+/// What [`Autopilot::own_review`] left the babysit loop to do.
+enum OwnReview {
+    /// Nothing is owed: the pull request is ready for a person.
+    Clear,
+    /// Something was done: read the pull request again.
+    Again,
+    /// The run stops.
+    Stop(Outcome),
 }

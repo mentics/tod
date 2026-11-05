@@ -163,7 +163,7 @@ fn phase_env(env: &ProtocolEnv<'_>) -> Vec<(String, String)> {
 
 /// The state and the one after it, recorded on the conversation. The last
 /// state has no next; it is recorded as itself.
-fn state_and_next(fleet: &FleetStore, focus: Focus) -> Option<(String, String)> {
+pub(crate) fn state_and_next(fleet: &FleetStore, focus: Focus) -> Option<(String, String)> {
     let (state, next) = current_and_next(fleet, focus)?;
     let next = next.unwrap_or_else(|| state.clone());
     Some((state, next))

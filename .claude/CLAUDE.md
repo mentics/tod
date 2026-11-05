@@ -174,7 +174,13 @@ project-specific, in the project's own skill; a review overdue is work that
 tells the agent (`Work::BotReviewMissing`). For the same reason no tod skill
 or role doc names a bot or says whether to ask one, so it cannot contradict
 the project's skill in the same prompt. The project's bots and round limits are
-`pr_readiness` in `tod.yml`. The same assessment answers the `pr →
+`pr_readiness` in `tod.yml`. With the lifecycle config's **Include review
+steps** on for `pr_draft` (`lifecycle_config::resolve_pr_draft_review`), once
+nothing but a person is left the babysitter also runs tod's own code review
+(`tod_core::pr_draft_review`): the Review protocol on the current head, its
+findings posted on the PR as threads (`review_findings.pr_thread`), fixed by
+the PR agent with the `fix` phase's skills, reviewed again until clean; the
+`pr-pr_review.own-review` criterion gates on it. The same assessment answers the `pr →
 approved` criteria (`pr-approved.up-to-date`, `.threads-resolved`,
 `.review-current`, `.review-score`). Tests replace GitHub with
 `pr_readiness::set_feed_override`.

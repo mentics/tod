@@ -125,6 +125,12 @@ pub enum OutlineMutation {
         node_id: Uuid,
         delete_sandbox: Option<bool>,
     },
+    /// The Lifecycle config capability's "include review steps in `pr_draft`"
+    /// choice; `None` leaves it to an ancestor.
+    SetNodeLifecyclePrDraftReview {
+        node_id: Uuid,
+        pr_draft_review: Option<bool>,
+    },
     /// The Groups capability's setting: group the children by lifecycle state.
     SetNodeGroups {
         node_id: Uuid,
@@ -645,6 +651,10 @@ impl OutlineMutation {
             OutlineMutation::SetNodeLifecycleDeleteSandbox { node_id, delete_sandbox } => {
                 require_capability(conn, *node_id, Capability::LifecycleConfig)?;
                 crate::lifecycle_config::set_delete_sandbox(conn, *node_id, *delete_sandbox)?;
+            }
+            OutlineMutation::SetNodeLifecyclePrDraftReview { node_id, pr_draft_review } => {
+                require_capability(conn, *node_id, Capability::LifecycleConfig)?;
+                crate::lifecycle_config::set_pr_draft_review(conn, *node_id, *pr_draft_review)?;
             }
             OutlineMutation::SetNodeGroups { node_id, by_lifecycle } => {
                 require_capability(conn, *node_id, Capability::Groups)?;

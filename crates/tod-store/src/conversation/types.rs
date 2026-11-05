@@ -468,6 +468,7 @@ impl Conversation {
             ProtocolKind::OnEntry => format!("on entry to {to}"),
             ProtocolKind::Phase => format!("{from} phase"),
             ProtocolKind::Evaluate => format!("evaluating {from}"),
+            ProtocolKind::Review => format!("code review in {from}"),
             _ => format!("{from} \u{2192} {to}"),
         })
     }

@@ -12,7 +12,7 @@ tod-cli --data-root <DATA_ROOT> capabilities set     <NODE> files [--location <N
 tod-cli --data-root <DATA_ROOT> capabilities set     <NODE> ticket [--ticket <ID>] [--pr <URL>]...
 tod-cli --data-root <DATA_ROOT> capabilities set     <NODE> tags (--tags <A,B,..> | --add <TAG> | --remove <TAG>)
 tod-cli --data-root <DATA_ROOT> capabilities set     <NODE> generator --source <TYPE> --config <JSON>
-tod-cli --data-root <DATA_ROOT> capabilities set     <NODE> lifecycle-config (--phase <PHASE> [--skills <A,B,..>] [--model <TEXT>] [--effort <TEXT>] | --clear <PHASE>)
+tod-cli --data-root <DATA_ROOT> capabilities set     <NODE> lifecycle-config (--phase <PHASE> [--skills <A,B,..>] [--model <TEXT>] [--effort <TEXT>] | --clear <PHASE> | --pr-draft-review on|off|inherit)
 tod-cli --data-root <DATA_ROOT> capabilities set     <NODE> groups --lifecycle <true|false>
 ```
 
@@ -43,6 +43,12 @@ the first group is worked in the phase agent's own session and every later one
 in a session of its own, run in order each time the phase runs (`a, b; c` is two
 groups). A leading semicolon (`; c`) leaves the phase agent's own session with no
 skills. An empty group (a trailing `;`, or two in a row) is refused.
+
+`--pr-draft-review on` includes the review steps in `pr_draft`: once the bots
+and checks are done, the `review` phase's code review runs on the pull request,
+its findings are posted there, and the pull request's agent fixes them with the
+`fix` phase's skills. `off` leaves them out; `inherit` takes the nearest
+ancestor's choice again (off when none says).
 
 `groups --lifecycle true` shows the node's children grouped by lifecycle state.
 Every child then needs the Lifecycle capability: those without it move down to

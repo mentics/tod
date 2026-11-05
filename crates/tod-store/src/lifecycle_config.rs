@@ -27,8 +27,21 @@ CREATE TABLE IF NOT EXISTS node_lifecycle_config (
     skills      TEXT NOT NULL DEFAULT '{}',
     updated_at  INTEGER NOT NULL,
     delete_sandbox INTEGER,
-    agents      TEXT NOT NULL DEFAULT '{}'
+    agents      TEXT NOT NULL DEFAULT '{}',
+    pr_draft_review INTEGER
 );";
+
+/// The `pr_draft_review` column (idempotent, no schema bump, like `agents`):
+/// NULL means this node says nothing and the nearest ancestor that does decides.
+pub fn add_pr_draft_review(conn: &Connection) -> Result<()> {
+    let has = conn
+        .prepare("SELECT 1 FROM pragma_table_info('node_lifecycle_config') WHERE name = 'pr_draft_review'")?
+        .exists([])?;
+    if !has {
+        conn.execute_batch("ALTER TABLE node_lifecycle_config ADD COLUMN pr_draft_review INTEGER")?;
+    }
+    Ok(())
+}
 
 /// The `agents` column (idempotent, no schema bump: the sync copies only the
 /// columns both sides have): the model and effort by phase, as JSON.
@@ -348,6 +361,55 @@ pub fn set_delete_sandbox(conn: &Connection, node_id: Uuid, value: Option<bool>)
     conn.execute(
         "INSERT INTO node_lifecycle_config (node_id, skills, updated_at, delete_sandbox) VALUES (?1, '{}', ?2, ?3)
          ON CONFLICT(node_id) DO UPDATE SET delete_sandbox = excluded.delete_sandbox, updated_at = excluded.updated_at",
+        params![uuid_to_blob(node_id), now_ms(), value.map(i64::from)],
+    )?;
+    Ok(())
+}
+
+/// Whether `pr_draft` includes the review steps (the `review` phase's code
+/// review, posted on the pull request, and the `fix` phase's skills for its
+/// agent), and the node the answer came from: the nearest node, from itself
+/// up, that states it; off by default when none does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PrDraftReview {
+    pub enabled: bool,
+    pub source_node: Option<Uuid>,
+}
+
+/// What `node_id` itself says about the review steps in `pr_draft`, if anything.
+pub fn own_pr_draft_review(conn: &Connection, node_id: Uuid) -> Result<Option<bool>> {
+    let has = conn
+        .prepare("SELECT 1 FROM pragma_table_info('node_lifecycle_config') WHERE name = 'pr_draft_review'")?
+        .exists([])?;
+    if !has {
+        return Ok(None);
+    }
+    let value: Option<Option<i64>> = conn
+        .query_row(
+            "SELECT pr_draft_review FROM node_lifecycle_config WHERE node_id = ?1",
+            params![uuid_to_blob(node_id)],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(value.flatten().map(|v| v != 0))
+}
+
+/// [`PrDraftReview`] for `node_id`.
+pub fn resolve_pr_draft_review(conn: &Connection, node_id: Uuid) -> Result<PrDraftReview> {
+    for id in crate::outline::ancestor_chain(conn, node_id)?.into_iter().rev() {
+        if let Some(enabled) = own_pr_draft_review(conn, id)? {
+            return Ok(PrDraftReview { enabled, source_node: Some(id) });
+        }
+    }
+    Ok(PrDraftReview { enabled: false, source_node: None })
+}
+
+/// Set (`Some`) or clear (`None`, so an ancestor's choice applies again) what
+/// `node_id` says about the review steps in `pr_draft`.
+pub fn set_pr_draft_review(conn: &Connection, node_id: Uuid, value: Option<bool>) -> Result<()> {
+    conn.execute(
+        "INSERT INTO node_lifecycle_config (node_id, skills, updated_at, pr_draft_review) VALUES (?1, '{}', ?2, ?3)
+         ON CONFLICT(node_id) DO UPDATE SET pr_draft_review = excluded.pr_draft_review, updated_at = excluded.updated_at",
         params![uuid_to_blob(node_id), now_ms(), value.map(i64::from)],
     )?;
     Ok(())

@@ -72,6 +72,13 @@ pub struct ReviewFinding {
     pub response: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
+    /// The pull request review thread the finding was posted as, by a review
+    /// in `pr_draft` (`tod_core::pr_draft_review`): its GraphQL id. `None`
+    /// when it was not posted, or was posted in the review's text because no
+    /// line of the change could hold it.
+    pub pr_thread: Option<String>,
+    /// When it was posted on the pull request; `None` until then.
+    pub pr_posted_at: Option<i64>,
 }
 
 impl ReviewFinding {
@@ -118,13 +125,29 @@ pub const CREATE_TABLE: &str = "
         response        TEXT,
         created_at      INTEGER NOT NULL,
         updated_at      INTEGER NOT NULL,
+        pr_thread       TEXT,
+        pr_posted_at    INTEGER,
         UNIQUE (node_id, seq)
     );
     CREATE INDEX IF NOT EXISTS idx_review_findings_node ON review_findings(node_id, seq);
 ";
 
 const COLUMNS: &str = "id, node_id, conversation_id, seq, severity, file, line, summary, detail, \
-     status, response, created_at, updated_at";
+     status, response, created_at, updated_at, pr_thread, pr_posted_at";
+
+/// The `pr_thread` and `pr_posted_at` columns (idempotent, no schema bump: the
+/// sync copies only the columns both sides have).
+pub fn add_pr_columns(conn: &Connection) -> Result<()> {
+    for (column, kind) in [("pr_thread", "TEXT"), ("pr_posted_at", "INTEGER")] {
+        let has = conn
+            .prepare("SELECT 1 FROM pragma_table_info('review_findings') WHERE name = ?1")?
+            .exists(params![column])?;
+        if !has {
+            conn.execute_batch(&format!("ALTER TABLE review_findings ADD COLUMN {column} {kind}"))?;
+        }
+    }
+    Ok(())
+}
 
 /// `raw` as one of `allowed`, case-insensitively.
 pub fn normalize<'s>(raw: &str, allowed: &[&'s str], what: &str) -> Result<&'s str> {
@@ -221,6 +244,31 @@ impl<'a> ReviewRepo<'a> {
         Ok(())
     }
 
+    /// Record that the finding was posted on the pull request: as the review
+    /// thread `thread`, or (`None`) in the review's text.
+    pub fn set_pr_posted(&self, id: Uuid, thread: Option<&str>) -> Result<()> {
+        let changed = self.conn.execute(
+            "UPDATE review_findings SET pr_thread = ?2, pr_posted_at = ?3, updated_at = ?3 WHERE id = ?1",
+            params![uuid_to_blob(id), thread, now_ms()],
+        )?;
+        if changed == 0 {
+            bail!("finding {id} not found");
+        }
+        Ok(())
+    }
+
+    /// The node's finding posted as review thread `thread`, if any.
+    pub fn find_by_pr_thread(&self, node_id: Uuid, thread: &str) -> Result<Option<ReviewFinding>> {
+        Ok(self
+            .conn
+            .query_row(
+                &format!("SELECT {COLUMNS} FROM review_findings WHERE node_id = ?1 AND pr_thread = ?2"),
+                params![uuid_to_blob(node_id), thread],
+                map_row,
+            )
+            .optional()?)
+    }
+
     pub fn get(&self, id: Uuid) -> Result<Option<ReviewFinding>> {
         Ok(self
             .conn
@@ -312,6 +360,8 @@ fn map_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ReviewFinding> {
         response: row.get(10)?,
         created_at: row.get(11)?,
         updated_at: row.get(12)?,
+        pr_thread: row.get(13)?,
+        pr_posted_at: row.get(14)?,
     })
 }
 
@@ -420,6 +470,20 @@ mod tests {
         let got = repo.get(id).unwrap().unwrap();
         assert_eq!(got.status, FINDING_REJECTED);
         assert!(!got.is_open());
+    }
+
+    #[test]
+    fn a_posted_finding_is_found_by_its_thread() {
+        let fx = setup();
+        let repo = ReviewRepo::new(&fx.conn);
+        let a = repo.add(fx.node, None, &finding("a")).unwrap().id;
+        let b = repo.add(fx.node, None, &finding("b")).unwrap().id;
+        assert_eq!(repo.get(a).unwrap().unwrap().pr_posted_at, None);
+        repo.set_pr_posted(a, Some("PRRT_1")).unwrap();
+        repo.set_pr_posted(b, None).unwrap();
+        assert_eq!(repo.find_by_pr_thread(fx.node, "PRRT_1").unwrap().map(|f| f.id), Some(a));
+        let b = repo.get(b).unwrap().unwrap();
+        assert!(b.pr_posted_at.is_some() && b.pr_thread.is_none());
     }
 
     /// Findings belong to the node: deleting the conversation that recorded

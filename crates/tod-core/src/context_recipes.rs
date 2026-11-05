@@ -236,6 +236,28 @@ pub const REVIEW_SESSION: ContextRecipe = ContextRecipe {
     ],
 };
 
+/// A code review session on a node in `pr_draft`, whose findings the app posts
+/// on its draft pull request (`crate::pr_draft_review`): the review session
+/// with `surface/review-on-pr`, which says so and keeps the reviewer off
+/// GitHub.
+pub const REVIEW_ON_PR_SESSION: ContextRecipe = ContextRecipe {
+    name: "code review session on a pull request",
+    situational: false,
+    layers: &[
+        "stance/autonomous-session",
+        "domain/outline",
+        "domain/obligations",
+        "domain/lifecycle",
+        "cli/intro",
+        "cli/obligations",
+        "cli/review",
+        "cli/decisions",
+        "surface/review",
+        "surface/review-on-pr",
+    ],
+    blocks: REVIEW_SESSION.blocks,
+};
+
 /// A pr session: an agent opening and driving a node's pull request. The `pr`
 /// state agent's role doc goes ahead of the dynamic blocks; `surface/pr`
 /// scopes it to opening the PR and driving it to mergeable — no approval, no
@@ -514,6 +536,7 @@ pub const ALL_RECIPES: &[ContextRecipe] = &[
     IMPLEMENT_SESSION,
     VERIFY_SESSION,
     REVIEW_SESSION,
+    REVIEW_ON_PR_SESSION,
     PR_SESSION,
     FIX_SESSION,
     PHASE,

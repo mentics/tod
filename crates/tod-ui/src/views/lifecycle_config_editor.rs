@@ -29,7 +29,9 @@ use gpui_component::{ActiveTheme, Disableable, StyledExt, h_flex, v_flex};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tod_store::fleet::FleetStore;
-use tod_store::lifecycle_config::{self, Agents, DeleteSandbox, PHASES, PhaseAgent, Resolved, ResolvedAgent, Skills};
+use tod_store::lifecycle_config::{
+    self, Agents, DeleteSandbox, PHASES, PhaseAgent, PrDraftReview, Resolved, ResolvedAgent, Skills,
+};
 use tod_store::outline::OutlineMutation;
 use uuid::Uuid;
 
@@ -48,6 +50,10 @@ pub struct LifecycleConfigEditor {
     /// whether this node itself says.
     delete_sandbox: DeleteSandbox,
     own_delete_sandbox: Option<bool>,
+    /// Whether `pr_draft` includes the review steps, after inheritance, and
+    /// whether this node itself says.
+    pr_draft_review: PrDraftReview,
+    own_pr_draft_review: Option<bool>,
     form: Option<Form>,
     error: Option<String>,
 }
@@ -108,6 +114,8 @@ impl LifecycleConfigEditor {
             titles: HashMap::new(),
             delete_sandbox: DeleteSandbox { enabled: true, source_node: None },
             own_delete_sandbox: None,
+            pr_draft_review: PrDraftReview { enabled: false, source_node: None },
+            own_pr_draft_review: None,
             form: None,
             error: None,
         };
@@ -178,7 +186,16 @@ impl LifecycleConfigEditor {
                     if let Some(source) = delete.source_node {
                         title_of(source);
                     }
-                    (own, own_agents, effective, titles, delete, own_delete)
+                    let review = fleet
+                        .read(|conn| lifecycle_config::resolve_pr_draft_review(conn, node))
+                        .unwrap_or(PrDraftReview { enabled: false, source_node: None });
+                    let own_review = fleet
+                        .read(|conn| lifecycle_config::own_pr_draft_review(conn, node))
+                        .unwrap_or(None);
+                    if let Some(source) = review.source_node {
+                        title_of(source);
+                    }
+                    (own, own_agents, effective, titles, delete, own_delete, review, own_review)
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
@@ -189,6 +206,8 @@ impl LifecycleConfigEditor {
                     this.titles,
                     this.delete_sandbox,
                     this.own_delete_sandbox,
+                    this.pr_draft_review,
+                    this.own_pr_draft_review,
                 ) = loaded;
                 cx.notify();
             });
@@ -273,6 +292,31 @@ impl LifecycleConfigEditor {
                         .enqueue_outline(OutlineMutation::SetNodeLifecycleDeleteSandbox {
                             node_id: node,
                             delete_sandbox: value,
+                        })
+                        .map_err(|e| e.to_string())
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.error = result.err();
+                this.reload(cx);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Set whether `pr_draft` includes the review steps for this node
+    /// (`None`: leave it to an ancestor again).
+    fn write_pr_draft_review(&mut self, value: Option<bool>, cx: &mut Context<Self>) {
+        let (fleet, node) = (self.fleet.clone(), self.node);
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    fleet
+                        .enqueue_outline(OutlineMutation::SetNodeLifecyclePrDraftReview {
+                            node_id: node,
+                            pr_draft_review: value,
                         })
                         .map_err(|e| e.to_string())
                 })
@@ -397,6 +441,7 @@ impl LifecycleConfigEditor {
                 window,
                 cx,
             )))
+            .when(phase == "pr_draft", |el| el.child(self.render_pr_draft_review(cx)))
             .into_any_element()
     }
 
@@ -431,6 +476,39 @@ impl LifecycleConfigEditor {
                         .ghost()
                         .compact()
                         .on_click(cx.listener(|this, _, _, cx| this.write_delete_sandbox(None, cx))),
+                )
+            })
+            .into_any_element()
+    }
+
+    /// The "Include review steps" choice on the `pr_draft` row.
+    fn render_pr_draft_review(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let muted = cx.theme().muted_foreground;
+        let from = self.pr_draft_review.source_node.filter(|source| *source != self.node).map(|source| {
+            format!("from {}", self.titles.get(&source).map_or("an ancestor", String::as_str))
+        });
+        h_flex()
+            .gap_2()
+            .items_center()
+            .child(
+                Checkbox::new("lc-pr-draft-review")
+                    .label("Include review steps")
+                    .checked(self.pr_draft_review.enabled)
+                    .disabled(!self.enabled)
+                    .on_click(cx.listener(|this, checked: &bool, _, cx| this.write_pr_draft_review(Some(*checked), cx))),
+            )
+            .child(div().text_xs().text_color(muted).child(
+                "once the bots and checks are done, run the Review phase's code review on the pull request \
+                 and fix what it finds with the Fix phase's skills",
+            ))
+            .when_some(from, |el, from| el.child(div().text_xs().text_color(muted).child(from)))
+            .when(self.enabled && self.own_pr_draft_review.is_some(), |el| {
+                el.child(
+                    Button::new("lc-pr-draft-review-inherit")
+                        .label("Use inherited")
+                        .ghost()
+                        .compact()
+                        .on_click(cx.listener(|this, _, _, cx| this.write_pr_draft_review(None, cx))),
                 )
             })
             .into_any_element()

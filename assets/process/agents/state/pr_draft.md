@@ -1,6 +1,6 @@
 # State: `pr_draft`
 
-**Gate:** `pr_draft` → `pr_review`. The app checks it against GitHub; no agent evaluates it: the pull request is open and no longer a draft, and a person is on it as reviewer. The gate is hardcoded for now (what "ready for human review" means will want to be scriptable per project).
+**Gate:** `pr_draft` → `pr_review`. The app checks it against GitHub; no agent evaluates it: the pull request is open and no longer a draft, a person is on it as reviewer, and (when the review steps are on) the app's own review of the current head is clean. The gate is hardcoded for now (what "ready for human review" means will want to be scriptable per project).
 
 ## First
 
@@ -15,6 +15,10 @@ The pull request already exists: do not open another. Get the draft **ready for 
 - Keep it a draft. A person marks it ready for review and puts a reviewer on it; that is what the gate waits for. Do not mark it ready, and do not request reviewers yourself.
 
 Decide the scope of each piece of feedback as `pr_review` does: fix what this change introduced, and decline with a reason what was already there or would enlarge the change.
+
+### The app's own code review
+
+When the task's lifecycle config includes the review steps in `pr_draft`, the app runs its own code review (the `review` phase's reviewer and skills) once the bots and checks have nothing left, and posts its findings on the pull request as review threads. Your context then also lists the `fix` phase's skills: use them on those findings. Answer each thread like any other (answering it answers its finding); a finding sent to you by id, with no thread, is answered through the `review` noun. The app reviews the new head after you, until a review comes back clean, and the gate holds until it does.
 
 A human reviewer's feedback comes after that, in `pr_review`.
 

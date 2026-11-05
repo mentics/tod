@@ -423,6 +423,14 @@ pub const GATE_CRITERIA: &[GateCriterionSeed] = &[
         label: "A person assigned to review it?",
         sort_order: 2,
     },
+    GateCriterionSeed {
+        id_str: "a1000006-0006-4006-8006-00000000000e",
+        from_state: "pr_draft",
+        to_state: "pr_review",
+        slug: crate::outline::repos::gate::PR_PR_REVIEW_OWN_REVIEW_SLUG,
+        label: "tod's own code review clear on the current head (when the review steps are on)?",
+        sort_order: 3,
+    },
     // pr_review → approved — app-checked: the PR is mergeable (checks green,
     // required reviews satisfied). `tod_core::gate::pr_mergeable_outcome`.
     GateCriterionSeed {

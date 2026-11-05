@@ -28,7 +28,7 @@ use tod_store::outline::{
 
 pub use tod_store::outline::{
     APPROVED_MERGED_PR_MERGED_SLUG, PR_APPROVED_MERGEABLE_SLUG, PR_PR_DRAFT_PHASE_CERTIFIED_SLUG,
-    PR_PR_DRAFT_PR_OPEN_SLUG, PR_PR_REVIEW_READY_SLUG, PR_PR_REVIEW_REVIEWER_SLUG,
+    PR_PR_DRAFT_PR_OPEN_SLUG, PR_PR_REVIEW_OWN_REVIEW_SLUG, PR_PR_REVIEW_READY_SLUG, PR_PR_REVIEW_REVIEWER_SLUG,
 };
 use tod_store::outline::{
     PR_APPROVED_REVIEW_CURRENT_SLUG, PR_APPROVED_REVIEW_SCORE_SLUG, PR_APPROVED_THREADS_RESOLVED_SLUG,
@@ -93,6 +93,7 @@ pub fn evaluate_derived_criterion(
         PR_PR_DRAFT_PHASE_CERTIFIED_SLUG => phase_certified_outcome(conn, node_id, "pr").map(Some),
         PR_PR_REVIEW_READY_SLUG => pr_ready_for_review_outcome(conn, node_id).map(Some),
         PR_PR_REVIEW_REVIEWER_SLUG => pr_reviewer_outcome(conn, node_id).map(Some),
+        PR_PR_REVIEW_OWN_REVIEW_SLUG => own_review_outcome(conn, node_id).map(Some),
         PR_APPROVED_MERGEABLE_SLUG => pr_mergeable_outcome(conn, node_id).map(Some),
         APPROVED_MERGED_PR_MERGED_SLUG => pr_merged_outcome(conn, node_id).map(Some),
         PR_APPROVED_UP_TO_DATE_SLUG => pr_readiness_outcome(conn, node_id, Readiness::UpToDate).map(Some),
@@ -571,6 +572,36 @@ fn linked_prs(
         )));
     };
     Ok(Ok((links.prs, github)))
+}
+
+/// tod's own code review in `pr_draft` is clear on the linked pull requests'
+/// current heads ([`crate::pr_draft_review::gate`]). Passes without reading
+/// GitHub when the review steps are off.
+fn own_review_outcome(conn: &Connection, node_id: Uuid) -> Result<DerivedOutcome> {
+    if !crate::pr_draft_review::enabled(conn, node_id)? {
+        return Ok(DerivedOutcome {
+            outcome: OUTCOME_PASS,
+            detail: "The lifecycle config does not include the review steps in `pr_draft`.".to_string(),
+        });
+    }
+    let (prs, github) = match linked_prs(conn, node_id)? {
+        Ok(found) => found,
+        Err(outcome) => return Ok(outcome),
+    };
+    let mut heads = std::collections::BTreeMap::new();
+    for pr in &prs {
+        let snapshot = match crate::pr_readiness::cached_snapshot(&github, pr) {
+            Ok(snapshot) => snapshot,
+            Err(err) => return Ok(fail(format!("Could not read {}: {err}", pr.url))),
+        };
+        if let Some(sha) = snapshot.status.head_sha {
+            heads.insert(crate::pr_readiness::pr_label(pr), sha);
+        }
+    }
+    Ok(match crate::pr_draft_review::gate(conn, node_id, &heads)? {
+        Ok(detail) => DerivedOutcome { outcome: OUTCOME_PASS, detail },
+        Err(why) => fail(why),
+    })
 }
 
 /// Every linked PR is open (a draft is what `pr` opens) or already merged:

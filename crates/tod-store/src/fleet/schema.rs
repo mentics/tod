@@ -653,6 +653,8 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
     crate::waits::add_stay(conn)?;
     crate::lifecycle_config::add_delete_sandbox(conn)?;
     crate::lifecycle_config::add_agents(conn)?;
+    crate::lifecycle_config::add_pr_draft_review(conn)?;
+    crate::review::add_pr_columns(conn)?;
     // A cloud supervisor's heartbeat for a node (`crate::cloud_activity`):
     // synced, and not journaled (high-frequency bookkeeping).
     conn.execute_batch(crate::cloud_activity::CREATE_TABLE)?;

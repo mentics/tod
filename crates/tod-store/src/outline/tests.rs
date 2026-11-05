@@ -880,7 +880,10 @@ fn gate_criteria_seed_on_migration() {
         [REVIEW_APPROVED_REVIEW_DONE_SLUG, REVIEW_APPROVED_FINDINGS_ANSWERED_SLUG]
     );
     assert_eq!(slugs("pr", "pr_draft"), [PR_PR_DRAFT_PR_OPEN_SLUG, PR_PR_DRAFT_PHASE_CERTIFIED_SLUG]);
-    assert_eq!(slugs("pr_draft", "pr_review"), [PR_PR_REVIEW_READY_SLUG, PR_PR_REVIEW_REVIEWER_SLUG]);
+    assert_eq!(
+        slugs("pr_draft", "pr_review"),
+        [PR_PR_REVIEW_READY_SLUG, PR_PR_REVIEW_REVIEWER_SLUG, PR_PR_REVIEW_OWN_REVIEW_SLUG]
+    );
     assert_eq!(
         slugs("pr_review", "approved"),
         [
@@ -2920,6 +2923,55 @@ fn delete_sandbox_defaults_on_and_resolves_from_the_nearest_node() {
             .enqueue_outline(OutlineMutation::SetNodeLifecycleDeleteSandbox { node_id: leaf, delete_sandbox: Some(true) })
             .is_err()
     );
+    drop(store);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn pr_draft_review_defaults_off_and_resolves_from_the_nearest_node() {
+    use crate::lifecycle_config;
+    let (store, root, list_id) = setup_store_with_list();
+    let top = create_node_in(&store, list_id, None, "Top");
+    let leaf = create_node_in(&store, list_id, Some(top), "Leaf");
+    store
+        .enqueue_outline(OutlineMutation::EnableCapabilities {
+            node_id: top,
+            capabilities: vec![Capability::LifecycleConfig],
+        })
+        .unwrap();
+    store.writer().flush().unwrap();
+    let resolved = || store.read(|conn| Ok(lifecycle_config::resolve_pr_draft_review(conn, leaf)?)).unwrap();
+    let r = resolved();
+    assert!(!r.enabled && r.source_node.is_none(), "off unless someone says otherwise");
+    let set = |value| {
+        store
+            .enqueue_outline(OutlineMutation::SetNodeLifecyclePrDraftReview { node_id: top, pr_draft_review: value })
+            .unwrap();
+        store.writer().flush().unwrap();
+    };
+    set(Some(true));
+    // Saving skills or the sandbox choice must not clear it.
+    store
+        .enqueue_outline(OutlineMutation::SetNodeLifecycleConfig {
+            node_id: top,
+            skills: [("review".to_string(), vec!["r".to_string()])].into(),
+        })
+        .unwrap();
+    store.writer().flush().unwrap();
+    store
+        .enqueue_outline(OutlineMutation::SetNodeLifecycleDeleteSandbox { node_id: top, delete_sandbox: Some(false) })
+        .unwrap();
+    store.writer().flush().unwrap();
+    let r = resolved();
+    assert_eq!((r.enabled, r.source_node), (true, Some(top)));
+    set(None);
+    assert!(!resolved().enabled);
+    // A node without the capability cannot be given the choice.
+    let refused = store
+        .enqueue_outline(OutlineMutation::SetNodeLifecyclePrDraftReview { node_id: leaf, pr_draft_review: Some(true) })
+        .is_err()
+        || store.writer().flush().is_err();
+    assert!(refused);
     drop(store);
     let _ = fs::remove_dir_all(root);
 }

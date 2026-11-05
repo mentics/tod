@@ -1106,6 +1106,32 @@ pub trait PrFeed: Send + Sync {
     fn releases(&self, _pr: &tod_store::github::NodePr) -> Result<Vec<tod_store::github::Release>, String> {
         Err("this feed does not read releases".to_string())
     }
+    /// The pull request's review threads as they are now, never cached: what
+    /// a review just posted became.
+    fn threads(&self, pr: &tod_store::github::NodePr) -> Result<Vec<tod_store::github::ReviewThread>, String> {
+        self.snapshot(pr).map(|s| s.threads)
+    }
+    /// The files the pull request changes, with their patches: the lines a
+    /// review comment can be put on.
+    fn changed_files(&self, _pr: &tod_store::github::NodePr) -> Result<Vec<tod_store::github::PrFile>, String> {
+        Err("this feed does not read changed files".to_string())
+    }
+    /// Post tod's own code review of `post.commit_id` (`crate::pr_draft_review`).
+    fn post_review(&self, _pr: &tod_store::github::NodePr, _post: &ReviewPost) -> Result<(), String> {
+        Err("this feed does not post reviews".to_string())
+    }
+}
+
+/// What tod's own review of a pull request posts: one review with `body` as
+/// its text and a comment on each of `lines`, and a file-level thread for
+/// each of `files`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReviewPost {
+    pub commit_id: String,
+    pub body: String,
+    pub lines: Vec<tod_store::github::LineComment>,
+    /// `(path, body)`.
+    pub files: Vec<(String, String)>,
 }
 
 /// [`PrFeed`] over the GitHub API, with the credentials the app itself uses.
@@ -1122,6 +1148,26 @@ impl PrFeed for GithubFeed {
 
     fn snapshot(&self, pr: &tod_store::github::NodePr) -> Result<PrSnapshot, String> {
         cached_snapshot(&self.0, pr).map_err(|err| err.to_string())
+    }
+
+    fn threads(&self, pr: &tod_store::github::NodePr) -> Result<Vec<tod_store::github::ReviewThread>, String> {
+        self.0.list_review_threads(&pr.owner, &pr.repo, pr.pr_number).map_err(|err| err.to_string())
+    }
+
+    fn changed_files(&self, pr: &tod_store::github::NodePr) -> Result<Vec<tod_store::github::PrFile>, String> {
+        self.0.list_pr_files(&pr.owner, &pr.repo, pr.pr_number).map_err(|err| err.to_string())
+    }
+
+    fn post_review(&self, pr: &tod_store::github::NodePr, post: &ReviewPost) -> Result<(), String> {
+        self.0
+            .post_review(&pr.owner, &pr.repo, pr.pr_number, &post.commit_id, &post.body, &post.lines)
+            .map_err(|err| format!("posting the review: {err}"))?;
+        for (path, body) in &post.files {
+            self.0
+                .post_file_comment(&pr.owner, &pr.repo, pr.pr_number, &post.commit_id, path, body)
+                .map_err(|err| format!("posting the comment on {path}: {err}"))?;
+        }
+        Ok(())
     }
 }
 
@@ -1190,6 +1236,10 @@ pub struct LivePr {
     pub assessment: Assessment,
     /// Head commit and open threads: changes when a turn did something.
     pub fingerprint: String,
+    /// The head commit's SHA, when GitHub said.
+    pub head_sha: Option<String>,
+    /// Every review thread, open or not.
+    pub threads: Vec<tod_store::github::ReviewThread>,
 }
 
 /// `owner/repo#number`: how a pull request is named in a status line.
@@ -1262,7 +1312,14 @@ pub fn live_answered(
                 snapshot.comments.len(),
                 open.join(",")
             );
-            Ok(LivePr { pr: pr.clone(), draft: snapshot.status.draft, assessment, fingerprint })
+            Ok(LivePr {
+                pr: pr.clone(),
+                draft: snapshot.status.draft,
+                assessment,
+                fingerprint,
+                head_sha: snapshot.status.head_sha.clone(),
+                threads: snapshot.threads.clone(),
+            })
         })
         .collect()
 }

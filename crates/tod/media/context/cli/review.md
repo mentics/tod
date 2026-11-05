@@ -32,9 +32,9 @@ findings nobody has responded to.
 commit), `out_of_scope` (real, but not this node's), `declined` (not
 critical, beyond the requirements, or not worth the cost), or `rejected` (not
 a problem after all — the response says why, for the user to read). Every
-status but `open` needs `--response`; `open` clears it. Inside a fix
-conversation only `fixed` and `rejected` are accepted: the others are the
-user's answers.
+status but `open` needs `--response`; `open` clears it. Inside a fix or pull
+request conversation only `fixed` and `rejected` are accepted: the others are
+the user's answers.
 
 `done` records that the review is finished. It only works inside a review
 conversation; until a turn records it, the app sends the review back to you.

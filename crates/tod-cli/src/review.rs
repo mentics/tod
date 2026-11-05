@@ -209,7 +209,7 @@ fn respond(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
     if in_fix_conversation(inv)? {
         anyhow::ensure!(
             FIX_AGENT_STATUSES.contains(&status),
-            "a fix conversation may only respond {}: out_of_scope and declined \
+            "a fix or pull request conversation may only respond {}: out_of_scope and declined \
              are the user's to give, and open is where the finding already is",
             FIX_AGENT_STATUSES.join(" or ")
         );
@@ -223,7 +223,8 @@ fn respond(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
     Ok(format!("ok {}", short_id(id)))
 }
 
-/// Whether this runs inside a fix conversation, whose agent may only give the
+/// Whether this runs inside a fix conversation, or the pull request's (which
+/// answers tod's own review in `pr_draft`), whose agent may only give the
 /// statuses in [`FIX_AGENT_STATUSES`].
 fn in_fix_conversation(inv: &Invocation) -> anyhow::Result<bool> {
     let Some(conversation) = env_uuid(IMPLEMENT_CONVERSATION_ENV)? else {
@@ -232,7 +233,7 @@ fn in_fix_conversation(inv: &Invocation) -> anyhow::Result<bool> {
     inv.client().read(|conn| {
         Ok(ConversationRepo::new(conn)
             .get(conversation)?
-            .is_some_and(|c| c.protocol == ProtocolKind::Fix))
+            .is_some_and(|c| matches!(c.protocol, ProtocolKind::Fix | ProtocolKind::Pr)))
     })
 }
 

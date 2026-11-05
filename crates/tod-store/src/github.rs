@@ -464,6 +464,67 @@ impl Github {
         Ok(())
     }
 
+    /// The files the pull request changes, each with its patch (GitHub omits
+    /// the patch of a binary or very large file). The first 3000, as GitHub
+    /// lists no more.
+    pub fn list_pr_files(&self, owner: &str, repo: &str, number: i64) -> Result<Vec<PrFile>, GithubError> {
+        let mut all = Vec::new();
+        for page in 1..=30 {
+            let raw: Vec<PrFileRaw> =
+                self.get_json(&format!("/repos/{owner}/{repo}/pulls/{number}/files?per_page=100&page={page}"))?;
+            let last = raw.len() < 100;
+            all.extend(raw.into_iter().map(|f| PrFile { filename: f.filename, patch: f.patch }));
+            if last {
+                break;
+            }
+        }
+        Ok(all)
+    }
+
+    /// Submit a review (`COMMENT`, neither approving nor asking for changes)
+    /// of `commit_id`: `body` as its text and each of `comments` on a line of
+    /// the change's new side. Nothing is posted when both are empty.
+    pub fn post_review(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: i64,
+        commit_id: &str,
+        body: &str,
+        comments: &[LineComment],
+    ) -> Result<(), GithubError> {
+        if body.trim().is_empty() && comments.is_empty() {
+            return Ok(());
+        }
+        let comments: Vec<serde_json::Value> = comments
+            .iter()
+            .map(|c| serde_json::json!({ "path": c.path, "line": c.line, "side": "RIGHT", "body": c.body }))
+            .collect();
+        self.post_json::<serde_json::Value>(
+            &format!("/repos/{owner}/{repo}/pulls/{number}/reviews"),
+            serde_json::json!({ "commit_id": commit_id, "event": "COMMENT", "body": body, "comments": comments }),
+        )?;
+        Ok(())
+    }
+
+    /// Start a review thread on a whole file the pull request changes, not on
+    /// one of its lines.
+    pub fn post_file_comment(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: i64,
+        commit_id: &str,
+        path: &str,
+        body: &str,
+    ) -> Result<(), GithubError> {
+        self.post_json::<serde_json::Value>(
+            &format!("/repos/{owner}/{repo}/pulls/{number}/comments"),
+            serde_json::json!({ "commit_id": commit_id, "path": path, "subject_type": "file", "body": body }),
+        )?;
+        Ok(())
+    }
+
     /// The pull request's top-level comments, oldest first (the first 300).
     pub fn list_issue_comments(&self, owner: &str, repo: &str, number: i64) -> Result<Vec<IssueComment>, GithubError> {
         let mut all = Vec::new();
@@ -610,6 +671,29 @@ pub struct ThreadComment {
     pub body: String,
     pub created_at: String,
     pub diff_hunk: Option<String>,
+}
+
+/// A file a pull request changes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrFile {
+    pub filename: String,
+    /// The unified diff of the file; `None` for a binary or very large one.
+    pub patch: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PrFileRaw {
+    filename: String,
+    #[serde(default)]
+    patch: Option<String>,
+}
+
+/// A review comment on one line of a pull request's new side.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LineComment {
+    pub path: String,
+    pub line: i64,
+    pub body: String,
 }
 
 /// A top-level comment on a pull request.

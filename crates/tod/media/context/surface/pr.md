@@ -42,6 +42,18 @@ repository may exist on this machine — never change into them or build them.
    each with what you did or why you did not. Decide scope as the role doc
    says.
 
+## The app's own code review
+
+In `pr_draft`, when the task's lifecycle config includes the review steps,
+the app runs its own code review once the bots and checks are done, and posts
+what it finds on the pull request as review threads, each naming a finding
+id. Answer those threads like any other; answering one answers its finding
+too. A finding that no line of the change could hold is in the review's text
+instead, or is sent to you by id: answer each of those through the `review`
+noun (`fixed`, or `rejected` with a note saying why it is not a problem).
+Either way, only another review clears the change: the app reviews the new head
+when you are done.
+
 There is no live polling inside a turn: once the PR needs nothing from you,
 stop. The app watches GitHub and comes back when there is more.
 

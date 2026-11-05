@@ -149,7 +149,23 @@ impl Protocol for PrProtocol {
         let role_doc = state_role_doc(&manifest, state)?;
         let cwd = self.cwd(env)?;
         let working_dir = PathBuf::from(cwd.path_text());
-        let skills = crate::skills_context::for_group(fleet, node_id, state, &cwd, env.skill_group())?;
+        let mut skills = crate::skills_context::for_group(fleet, node_id, state, &cwd, env.skill_group())?;
+        // With the review steps in `pr_draft`, this agent fixes what tod's own
+        // code review finds there (`crate::pr_draft_review`): the `fix` phase's
+        // skills (its first group) are for that.
+        if state == crate::pr_draft_review::STATE
+            && env.skill_group() == 0
+            && fleet.read(|conn| crate::pr_draft_review::enabled(conn, node_id))?
+        {
+            let fix = crate::skills_context::for_group(fleet, node_id, "fix", &cwd, 0)?;
+            if !fix.is_empty() {
+                skills.push_str(
+                    "\nThe fix phase's skills below are for fixing what tod's own code review \
+                     finds on this pull request (its review threads, and findings sent to you by id).\n",
+                );
+                skills.push_str(&fix);
+            }
+        }
         build_pr_message(
             env.media,
             &ImplementRequest {

@@ -27,7 +27,7 @@ COMMANDS:
     set     <NODE> ticket [--ticket <ID>] [--pr <URL>]...
     set     <NODE> tags (--tags <A,B,..> | --add <TAG> | --remove <TAG>)
     set     <NODE> generator --source <TYPE> --config <JSON>
-    set     <NODE> lifecycle-config (--phase <PHASE> [--skills <A,B,..>] [--model <TEXT>] [--effort <TEXT>] | --clear <PHASE>)
+    set     <NODE> lifecycle-config (--phase <PHASE> [--skills <A,B,..>] [--model <TEXT>] [--effort <TEXT>] | --clear <PHASE> | --pr-draft-review on|off|inherit)
     set     <NODE> groups --lifecycle <true|false>
 
 `list` shows the enabled capabilities and each one's settings. `enable` adds
@@ -57,6 +57,12 @@ the first group is worked in the phase agent's own session and every later one
 in a session of its own, run in order each time the phase runs (`a, b; c` is two
 groups). A leading semicolon (`; c`) leaves the phase agent's own session with no
 skills. An empty group (a trailing `;`, or two in a row) is refused.
+
+`--pr-draft-review on` includes the review steps in `pr_draft`: once the bots
+and checks are done, the `review` phase's code review runs on the pull request,
+its findings are posted there, and the pull request's agent fixes them with the
+`fix` phase's skills. `off` leaves them out; `inherit` takes the nearest
+ancestor's choice again (off when none says).
 
 `groups --lifecycle true` shows the node's children grouped by lifecycle state.
 Every child then needs the Lifecycle capability: those without it move down to
@@ -242,8 +248,13 @@ fn list(inv: &Invocation, node: Uuid) -> anyhow::Result<String> {
                         tod_store::lifecycle_config::agents(conn, node)?,
                     ))
                 })?;
+                let review = inv
+                    .client()
+                    .read(|conn| tod_store::lifecycle_config::own_pr_draft_review(conn, node))?
+                    .map(|on| format!("; pr_draft review steps {}", if on { "on" } else { "off" }))
+                    .unwrap_or_default();
                 let phases: std::collections::BTreeSet<&String> = skills.keys().chain(agents.keys()).collect();
-                if phases.is_empty() {
+                let listed = if phases.is_empty() {
                     "lifecycle-config: no phases set".to_string()
                 } else {
                     let phases: Vec<String> = phases
@@ -270,7 +281,8 @@ fn list(inv: &Invocation, node: Uuid) -> anyhow::Result<String> {
                         })
                         .collect();
                     format!("lifecycle-config: {}", phases.join("; "))
-                }
+                };
+                format!("{listed}{review}")
             }
             Capability::Groups => {
                 let on = inv.client().read(|conn| tod_store::groups::by_lifecycle(conn, node))?;
@@ -475,6 +487,19 @@ fn set(inv: &Invocation, node: Uuid, args: &Args) -> anyhow::Result<String> {
                     )
                 }
             };
+            if let Some(value) = args.get("--pr-draft-review") {
+                if args.get("--phase").is_some() || args.get("--clear").is_some() {
+                    anyhow::bail!("give `--pr-draft-review` on its own, not with `--phase` or `--clear`");
+                }
+                let pr_draft_review = match value {
+                    "on" => Some(true),
+                    "off" => Some(false),
+                    "inherit" => None,
+                    other => anyhow::bail!("`--pr-draft-review {other}`: expected on, off, or inherit"),
+                };
+                write(inv, OutlineMutation::SetNodeLifecyclePrDraftReview { node_id: node, pr_draft_review })?;
+                return Ok(format!("set {}", cap.as_str()));
+            }
             let (names, model, effort) = (args.get("--skills"), args.get("--model"), args.get("--effort"));
             // The two halves are separate rows' columns, so a change to one
             // is one mutation; both change only when both are given.
@@ -505,7 +530,7 @@ fn set(inv: &Invocation, node: Uuid, args: &Args) -> anyhow::Result<String> {
                     mutations.push(OutlineMutation::SetNodeLifecycleAgents { node_id: node, agents });
                 }
                 _ => anyhow::bail!(
-                    "give `--phase <PHASE>` with `--skills <A,B,..>`, `--model <TEXT>` and/or `--effort <TEXT>`, or `--clear <PHASE>`"
+                    "give `--phase <PHASE>` with `--skills <A,B,..>`, `--model <TEXT>` and/or `--effort <TEXT>`, `--clear <PHASE>`, or `--pr-draft-review on|off|inherit`"
                 ),
             }
             let last = mutations.pop().expect("at least one mutation");

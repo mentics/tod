@@ -292,6 +292,13 @@ pub enum InterviewCommand {
         repo: String,
         pr_number: i64,
     },
+    /// Record that a review finding was posted on the pull request, as review
+    /// thread `thread` or (`None`) in the review's text (`crate::review`).
+    RecordFindingPosted {
+        finding_id: Uuid,
+        #[serde(default)]
+        thread: Option<String>,
+    },
     /// Respond to a review finding: its status, and the fix or why not.
     RespondReviewFinding {
         finding_id: Uuid,
@@ -1103,6 +1110,10 @@ pub fn execute(
             let pr = crate::github::NodePr::new(owner, repo, *pr_number);
             let removed = crate::github::NodePrRepo::new(conn).remove(*node_id, &pr)?;
             Ok(json!({ "removed": removed }))
+        }
+        InterviewCommand::RecordFindingPosted { finding_id, thread } => {
+            crate::review::ReviewRepo::new(conn).set_pr_posted(*finding_id, thread.as_deref())?;
+            Ok(json!({}))
         }
         InterviewCommand::RespondReviewFinding {
             finding_id,

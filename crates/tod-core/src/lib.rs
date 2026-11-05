@@ -37,6 +37,7 @@ pub mod conversation;
 pub mod dynamic;
 pub mod environment_context;
 pub mod pr_context;
+pub mod pr_draft_review;
 pub mod skills_context;
 pub mod environment_request;
 pub mod environment_reset;

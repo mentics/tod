@@ -14,7 +14,7 @@
 use tod_store::fleet::Workdir;
 use super::implement::{IMPLEMENT_CONVERSATION_ENV, IMPLEMENT_NODE_ENV, node_id};
 use super::protocol::{Next, Protocol, ProtocolEnv, Stop, TurnContext, cap_or_stall};
-use crate::agent_context::{ImplementRequest, NodeSelection, build_review_message};
+use crate::agent_context::{ImplementRequest, NodeSelection, build_review_message, build_review_on_pr_message};
 use crate::process_bundle::{ProcessManifest, TodInstallPaths, state_role_doc};
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
@@ -96,6 +96,12 @@ impl Protocol for ReviewProtocol {
         Some("Review the change.")
     }
 
+    /// The state it reviews in, recorded on the conversation: a review run in
+    /// `pr_draft` is the one posted on the pull request (`crate::pr_draft_review`).
+    fn transition(&self, fleet: &tod_store::fleet::FleetStore, focus: Focus) -> Option<(String, String)> {
+        super::phase::state_and_next(fleet, focus)
+    }
+
     /// The same variables as implementation: `tod-cli review` files each
     /// finding on the node and under this conversation, and the findings are
     /// the agent's own writes, not a reversible change set.
@@ -142,7 +148,14 @@ impl Protocol for ReviewProtocol {
         let cwd = self.cwd(env)?;
         let working_dir = PathBuf::from(cwd.path_text());
         let skills = crate::skills_context::for_group(fleet, node_id, "review", &cwd, env.skill_group())?;
-        build_review_message(
+        // In `pr_draft` the review runs on the draft pull request, and the app
+        // posts what it records there (`crate::pr_draft_review`).
+        let build = if node.lifecycle == crate::pr_draft_review::STATE {
+            build_review_on_pr_message
+        } else {
+            build_review_message
+        };
+        build(
             env.media,
             &ImplementRequest {
                 data_root: env.data_root,

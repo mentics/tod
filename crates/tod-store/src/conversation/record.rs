@@ -202,6 +202,7 @@ pub fn classify(mutation: &OutlineMutation) -> Option<(ActionKind, Entity, Uuid)
         | M::SetNodeLifecycleConfig { .. }
         | M::SetNodeLifecycleAgents { .. }
         | M::SetNodeLifecycleDeleteSandbox { .. }
+        | M::SetNodeLifecyclePrDraftReview { .. }
         | M::SetNodeGroups { .. }
         | M::SetRefreshStatus { .. } => return None,
     })

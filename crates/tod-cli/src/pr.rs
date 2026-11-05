@@ -21,6 +21,7 @@ use tod_store::credentials::{CredentialBackend, CredentialKind, CredentialStore,
 use tod_store::github_token::TokenStatus;
 use tod_store::github::{Github, GithubError, NodePrRepo, PrLinks, parse_pr_link};
 use tod_store::interview::{InterviewCommand, short_id};
+use tod_store::review::{FINDING_FIXED, FINDING_REJECTED};
 use uuid::Uuid;
 
 pub(crate) const USAGE: &str = "\
@@ -584,7 +585,23 @@ fn answer_thread(inv: &Invocation, rest: &[String]) -> anyhow::Result<String> {
     github
         .resolve_thread(thread_id)
         .map_err(|err| gh_err(inv, "replied, but could not resolve the thread: GitHub", err))?;
-    Ok(format!("ok {} ({})", thread_id, if fixed { "fixed" } else { "rejected" }))
+    // A thread tod's own review posted (`tod_core::pr_draft_review`) carries a
+    // finding: the answer is the finding's too.
+    let status = if fixed { FINDING_FIXED } else { FINDING_REJECTED };
+    let finding = inv
+        .client()
+        .read(|conn| tod_store::review::ReviewRepo::new(conn).find_by_pr_thread(node, thread_id))?;
+    if let Some(finding) = finding.filter(|f| f.is_open()) {
+        inv.client()
+            .interview(InterviewCommand::RespondReviewFinding {
+                finding_id: finding.id,
+                status: status.to_string(),
+                response: Some(reply.clone()),
+            })
+            .map_err(|err| anyhow::anyhow!("answered the thread, but could not answer its finding {}: {err}", finding.id))?;
+        return Ok(format!("ok {thread_id} ({status}; finding {})", short_id(finding.id)));
+    }
+    Ok(format!("ok {} ({})", thread_id, status))
 }
 
 fn conversation(inv: &Invocation) -> anyhow::Result<Uuid> {

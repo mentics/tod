@@ -163,10 +163,45 @@ Each round reads every linked PR (`pr_readiness::Assessment`):
 3. **Waiting** (a bot has not reviewed the current head, checks still
    running, GitHub has not computed mergeability) → poll. No agent turn is
    used while waiting.
-4. **Waiting on a person** → in `pr_draft`, go to the gate (a person on
-   the draft is what it asks); in `pr_review`, end the run with a wait the
-   review's webhook or the next scheduled look wakes.
-5. **Clear** → the gate.
+4. **Waiting on a person** → in `pr_draft`, tod's own review first (below),
+   then the gate (a person on the draft is what it asks); in `pr_review`,
+   end the run with a wait the review's webhook or the next scheduled look
+   wakes.
+5. **Clear** → in `pr_draft`, tod's own review first; then the gate.
+
+### tod's own code review in `pr_draft`
+
+The bots may be satisfied while the project's own review would not be. A
+node whose lifecycle config has **Include review steps** on for `pr_draft`
+(`lifecycle_config::resolve_pr_draft_review`, inherited like the rest of the
+config, off by default; `tod-cli capabilities set <node> lifecycle-config
+--pr-draft-review on`) runs it once nothing but a person is left on the pull
+request (`tod_core::pr_draft_review`, `Autopilot::own_review`):
+
+- **Review.** The Review protocol, with the `review` phase's skills in every
+  group, on the current head. Its opening (`REVIEW_ON_PR_SESSION`,
+  `surface/review-on-pr`) says it is reviewing the pull request; it records
+  findings through `tod-cli review` as in `review` and never posts itself.
+  The app records the heads it reviewed on the review's report (`pr_heads`).
+- **Post.** The app posts the findings as one review: on a changed line,
+  else on the file, else in the review's text. Each finding records its
+  thread (`review_findings.pr_thread`), found by a marker in the comment.
+  A failure to post stops the run (`PrBlocked`).
+- **Fix.** An open thread is work for the PR agent, whose opening adds the
+  `fix` phase's skills; `tod-cli pr threads answer` answers the thread's
+  finding too. A finding no open thread carries is sent to the agent by id,
+  answered through the `review` noun (fixed or rejected); the same ones left
+  unanswered twice stop the run (`PrStuck`). A thread a person resolves
+  without an answer declines its finding.
+- **Again.** As in `review`, only a review clears the change: the new head
+  is reviewed again until a review records nothing that stands. More than
+  `REVIEW_ROUND_LIMIT` reviews in one stay stops the run
+  (`ReviewNotConverging`).
+
+The `pr_draft → pr_review` gate checks the same thing
+(`pr-pr_review.own-review`): it passes when the steps are off, else needs
+the latest own review to cover every linked PR's current head, a clean round,
+and no open finding.
 
 After a push the sequence is: the agent's fixes are pushed and its replies
 posted **at once** in its turn (and, where the project's skill says so, it

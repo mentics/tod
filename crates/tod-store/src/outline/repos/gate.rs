@@ -73,6 +73,11 @@ pub const PR_PR_REVIEW_READY_SLUG: &str = "pr-pr_review.ready-for-review";
 /// already reviewed). Hardcoded for now: a project will want to say what
 /// "ready for human review" means for it, which wants scripting.
 pub const PR_PR_REVIEW_REVIEWER_SLUG: &str = "pr-pr_review.reviewer-assigned";
+/// `pr_draft` → `pr_review`: when the lifecycle config includes the review
+/// steps in `pr_draft`, tod's own code review of the current head recorded
+/// nothing that stands and none of its findings is open
+/// (`tod_core::pr_draft_review::gate`). Passes when the steps are off.
+pub const PR_PR_REVIEW_OWN_REVIEW_SLUG: &str = "pr-pr_review.own-review";
 
 // The five below gate `pr_review` → `approved`. They kept the slugs they had
 // when the state was `pr`, so existing waivers and journeys still name them.
@@ -145,6 +150,7 @@ pub const DERIVED_CRITERION_SLUGS: &[&str] = &[
     PR_PR_DRAFT_PHASE_CERTIFIED_SLUG,
     PR_PR_REVIEW_READY_SLUG,
     PR_PR_REVIEW_REVIEWER_SLUG,
+    PR_PR_REVIEW_OWN_REVIEW_SLUG,
     PR_APPROVED_MERGEABLE_SLUG,
     PR_APPROVED_UP_TO_DATE_SLUG,
     PR_APPROVED_THREADS_RESOLVED_SLUG,
