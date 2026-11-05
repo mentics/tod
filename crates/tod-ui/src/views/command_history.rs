@@ -289,8 +289,9 @@ impl CommandHistoryView {
     }
 
     fn format_time(ms: i64) -> String {
-        use chrono::{TimeZone, Utc};
-        Utc.timestamp_millis_opt(ms)
+        use chrono::{Local, TimeZone};
+        Local
+            .timestamp_millis_opt(ms)
             .single()
             .map(|t| t.format("%H:%M:%S").to_string())
             .unwrap_or_else(|| "—".into())

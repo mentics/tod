@@ -559,7 +559,10 @@ impl TranscriptPanel {
                         .read(|conn| {
                             let repo = ConversationRepo::new(conn);
                             let turns = repo.turns(id)?;
-                            let session_name = repo.get(id)?.and_then(|c| c.session_name);
+                            let session_name = repo.get(id)?.and_then(|c| {
+                                let created = c.created_at;
+                                c.session_name.map(|n| tod_core::session_name::localize(&n, created))
+                            });
                             anyhow::Ok((turns, session_name))
                         })
                         .unwrap_or_default();

@@ -43,14 +43,9 @@ pub struct LogPanelView {
     _poll: gpui::Task<()>,
 }
 
-/// `HH:MM:SS` (UTC) of an entry.
+/// `HH:MM:SS` (local time) of an entry.
 fn clock(entry: &LogEntry) -> String {
-    let secs = entry
-        .at
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    format!("{:02}:{:02}:{:02}", secs / 3600 % 24, secs / 60 % 60, secs % 60)
+    chrono::DateTime::<chrono::Local>::from(entry.at).format("%H:%M:%S").to_string()
 }
 
 /// One entry as plain text, for Copy.
