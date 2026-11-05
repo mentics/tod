@@ -30,6 +30,7 @@
 pub mod agent;
 pub mod answers;
 pub mod beat;
+pub mod checkpoint;
 pub mod context;
 pub mod git;
 pub mod guard;
@@ -107,6 +108,8 @@ struct Hook<'a> {
     node: Uuid,
     workspace: &'a std::path::Path,
     push_branch: bool,
+    /// Keeps the uncommitted work on the remote (with `push_branch`).
+    checkpoints: Option<checkpoint::Checkpointer>,
     /// The supervisor's state directory, where the app leaves a request for
     /// a new session ([`fresh_requested`]).
     state_dir: &'a std::path::Path,
@@ -304,6 +307,10 @@ fn take_fresh_request(state_dir: &std::path::Path, fleet: &FleetStore, node: Uui
 
 impl StepHook for Hook<'_> {
     fn watch(&mut self, turn: tod_core::autopilot::Turn<'_>) -> Option<String> {
+        // A long turn is checkpointed every period, off this thread.
+        if let Some(checkpoints) = &mut self.checkpoints {
+            checkpoints.tick(false);
+        }
         // The user wants this turn replaced: cancel it (the run keeps it as
         // current, and taking the request drops it).
         // Only the marker file is seen mid-turn: a request row arrives with
@@ -367,6 +374,11 @@ impl StepHook for Hook<'_> {
             if let Err(err) = git::push_branch(self.workspace) {
                 tracing::warn!("pushing the branch: {err:#}");
             }
+        }
+        // Every step, and a turn once the period has passed: what is not
+        // committed survives the sandbox too.
+        if let Some(checkpoints) = &mut self.checkpoints {
+            checkpoints.tick(boundary == Boundary::Step);
         }
         settle_owed_stop_rows(self.state_dir, fleet, self.node, &self.consumer)?;
         let pending = pending_requests(fleet, self.node)?;
@@ -761,6 +773,9 @@ pub fn wake(config: Config) -> Result<Woke> {
         node: config.node,
         workspace: &config.workspace,
         push_branch: config.push_branch,
+        checkpoints: config
+            .push_branch
+            .then(|| checkpoint::Checkpointer::new(&config.workspace, config.node, checkpoint::EVERY)),
         state_dir: &config.state_dir,
         fresh_pending: false,
         stop_pending: false,
@@ -910,6 +925,10 @@ pub fn wake(config: Config) -> Result<Woke> {
         && let Err(err) = git::push_branch(&config.workspace)
     {
         tracing::warn!("pushing the branch: {err:#}");
+    }
+    // Last, so the checkpoint sits on the branch as pushed.
+    if let Some(checkpoints) = &mut hook.checkpoints {
+        checkpoints.now();
     }
     if let Some(follow) = follow {
         follow.stop();

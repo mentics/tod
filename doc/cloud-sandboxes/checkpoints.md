@@ -4,7 +4,8 @@ A cloud sandbox expires on its own (Blaxel), and anything uncommitted in it
 goes with it. A **checkpoint** keeps that work on the remote, under a hidden
 ref, so a node whose sandbox is made again gets it back. Code:
 `tod_store::fleet::checkpoint` (git), `fleet::node_checkpoint` (per node),
-`tod_core::checkpoint` (when).
+`tod_supervisor::checkpoint` and `tod_core::checkpoint` (when). Each
+checkpoint builds its own temporary index, so the two never collide.
 
 ## What is saved
 
@@ -34,7 +35,22 @@ are `checkpoint::Limits::default()`, not yet a setting.
 
 ## When
 
-`tod_core::checkpoint::Tracker`, fed by the unified view's standings pass:
+**In the sandbox, by the node's supervisor** (`tod_supervisor::checkpoint`),
+so it needs nothing outside the sandbox: not the app, not the daemon, not
+this machine. While the autopilot runs there:
+
+- at every step boundary (after the branch is pushed);
+- at a turn boundary, and during a long turn (on a thread of its own), once
+  15 minutes have passed since the last;
+- once more before the run exits, after the final branch push, so a node
+  that stops for the user or for a wait is saved before its sandbox sleeps.
+
+A failure is a warning in the node's problem log, forwarded to the user; it
+never stops the run.
+
+**In the app too**, `tod_core::checkpoint::Tracker`, fed by the unified
+view's standings pass (this also covers work done in a terminal handoff,
+where no supervisor runs):
 
 - a node **turns to `You`** (request, failure, stop, pause): its agent has
   just finished, so the sandbox is awake and the push costs no wake-up;
