@@ -334,6 +334,7 @@ pub fn resolve_agent(conn: &Connection, node_id: Uuid, phase: &str) -> Result<Re
 /// One command a phase's gate runs (type checking, lint, and so on): it
 /// passes when it exits 0, and fails otherwise, with its output as the finding.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Check {
     /// What messages call it ("pyright"); the command itself when blank.
     #[serde(default)]
