@@ -1943,6 +1943,47 @@ fn check_now_records_where_each_pull_request_stands_with_no_run() {
 }
 
 #[test]
+fn a_pr_draft_wake_leaves_running_checks_to_the_babysitter() {
+    use tod_store::github::{PrSnapshot, PrStatus};
+    struct Feed(PrSnapshot);
+    impl crate::pr_readiness::PrFeed for Feed {
+        fn snapshot(&self, _: &tod_store::github::NodePr) -> Result<PrSnapshot, String> {
+            Ok(self.0.clone())
+        }
+    }
+    let fx = bare();
+    retire_outside_criteria(&fx);
+    let status = PrStatus {
+        mergeable: Some(true),
+        mergeable_state: Some("blocked".into()),
+        behind_by: Some(0),
+        merged: false,
+        checks: Some("pending".into()),
+        head_sha: None,
+        head_committed_at: None,
+        draft: true,
+        open: true,
+        reviewers: Vec::new(),
+        base_ref: None,
+        body: None,
+    };
+    crate::pr_readiness::set_feed_override(Some(Arc::new(Feed(PrSnapshot {
+        status,
+        threads: vec![],
+        comments: vec![],
+        reviews: vec![],
+    }))));
+    linked_to_prs(&fx, "pr_draft", &["https://github.com/acme/app/pull/42"]);
+
+    // Not a wait for a person: the run's own poll of the checks comes first,
+    // so the orchestrator's gate wakes the node instead of moving the wake
+    // hours out.
+    let found = super::check_now(&fx.fleet, fx.node, &fx.root).unwrap();
+    assert_eq!(found, super::GithubCheck::NothingToWaitOn);
+    assert!(pending_specs(&fx).is_empty());
+}
+
+#[test]
 fn check_now_in_pr_draft_waits_for_the_draft_to_be_ready_and_reviewed() {
     use tod_store::github::{PrReview, PrSnapshot, PrStatus};
     struct Feed(std::sync::Mutex<PrSnapshot>);
