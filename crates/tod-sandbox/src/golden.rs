@@ -346,13 +346,18 @@ pub fn clone_url(repo: &str) -> Result<String> {
 /// it ([`crate::node::WORKSPACE_DIR`], which the relay and supervisor probe
 /// first): clones through the proxy (git's CA is the proxy's), then
 /// initializes every submodule recursively. Fails with a message naming the
-/// repository when the clone cannot be made.
+/// repository when the clone cannot be made. GitHub SSH URLs (a
+/// submodule's `git@github.com:owner/name`) are rewritten to HTTPS in the
+/// system git config, kept in the golden and its forks: the sandbox reaches
+/// GitHub only over HTTPS, where its proxy adds the token.
 pub fn clone_script(repo: &str) -> Result<String> {
     let url = crate::relay::shell_quote(&clone_url(repo)?);
     let dir = crate::relay::shell_quote(crate::node::WORKSPACE_DIR);
     Ok(format!(
         "set -e\n\
          if [ -n \"$SSL_CERT_FILE\" ]; then git config --system http.sslCAInfo \"$SSL_CERT_FILE\"; fi\n\
+         git config --system --replace-all url.https://github.com/.insteadOf git@github.com:\n\
+         git config --system --add url.https://github.com/.insteadOf ssh://git@github.com/\n\
          if [ -d {dir}/.git ]; then echo \"{dir} already holds a checkout\" >&2; exit 1; fi\n\
          mkdir -p \"$(dirname {dir})\"\n\
          if ! git clone --quiet {url} {dir}; then echo \"cloning {repo} failed (see git's message above): a private repository needs the GitHub token stored in tod, with access to it\" >&2; exit 1; fi\n\
@@ -614,6 +619,8 @@ mod tests {
         let s = clone_script("joel-cofactr/build-test").unwrap();
         assert!(s.contains("git clone --quiet https://github.com/joel-cofactr/build-test.git /workspace/repo"), "{s}");
         assert!(s.contains("submodule update --init --recursive"), "{s}");
+        // Submodules named by SSH URL come over HTTPS, through the proxy.
+        assert!(s.contains("--replace-all url.https://github.com/.insteadOf git@github.com:"), "{s}");
         assert!(s.contains("cloning joel-cofactr/build-test failed") && s.contains("token"), "{s}");
         // The same directory the checkout probe puts first.
         assert!(crate::node::WORKSPACE_PROBE.contains(crate::node::WORKSPACE_DIR));
