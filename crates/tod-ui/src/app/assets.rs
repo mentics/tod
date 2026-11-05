@@ -27,7 +27,8 @@ gpui_kit_assets::icon_assets!(
         GitPullRequestDraft,
         GitPullRequestClosed,
         GitMerge,
-        Trash
+        Trash,
+        MessageSquareDot
     ]
 );
 
