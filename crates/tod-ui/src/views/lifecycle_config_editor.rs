@@ -24,7 +24,7 @@ use gpui::{
 };
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::checkbox::Checkbox;
-use gpui_component::input::{Input, InputState};
+use gpui_component::input::{Input, InputState, Textarea, TextareaState};
 use gpui_component::{ActiveTheme, Disableable, StyledExt, h_flex, v_flex};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -60,6 +60,8 @@ pub struct LifecycleConfigEditor {
     pr_draft_review: PrDraftReview,
     own_pr_draft_review: Option<bool>,
     form: Option<Form>,
+    /// The import/export box: all of this node's checks as YAML.
+    transfer: Option<Entity<TextareaState>>,
     error: Option<String>,
 }
 
@@ -134,6 +136,7 @@ impl LifecycleConfigEditor {
             pr_draft_review: PrDraftReview { enabled: false, source_node: None },
             own_pr_draft_review: None,
             form: None,
+            transfer: None,
             error: None,
         };
         this.reload(cx);
@@ -295,6 +298,126 @@ impl LifecycleConfigEditor {
             form.checks.push(row);
         }
         cx.notify();
+    }
+
+    /// Open the import/export box, filled with this node's own checks as YAML
+    /// (empty when it has none, ready to paste into).
+    fn open_transfer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let text = if self.own_checks.is_empty() {
+            String::new()
+        } else {
+            match serde_yaml::to_string(&self.own_checks) {
+                Ok(text) => text,
+                Err(e) => {
+                    self.error = Some(format!("could not write the checks as YAML: {e}"));
+                    cx.notify();
+                    return;
+                }
+            }
+        };
+        self.transfer = Some(cx.new(|cx| {
+            let mut state = TextareaState::new(window, cx)
+                .rows(14)
+                .placeholder("phase:\n  - label: pyright\n    command: uv run basedpyright\n    dir: flagship\n    pattern: \"*.py\"");
+            state.set_value(text, window, cx);
+            state
+        }));
+        self.error = None;
+        cx.notify();
+    }
+
+    /// Replace all of this node's own checks with the YAML in the box.
+    fn apply_transfer(&mut self, cx: &mut Context<Self>) {
+        let Some(box_) = &self.transfer else { return };
+        let text = box_.read(cx).text().to_string();
+        let checks: Checks = if text.trim().is_empty() {
+            Checks::new()
+        } else {
+            match serde_yaml::from_str(&text) {
+                Ok(checks) => checks,
+                Err(e) => {
+                    self.error = Some(format!("the checks are not valid: {e}"));
+                    cx.notify();
+                    return;
+                }
+            }
+        };
+        let (fleet, node) = (self.fleet.clone(), self.node);
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    fleet
+                        .enqueue_outline(OutlineMutation::SetNodeLifecycleChecks { node_id: node, checks })
+                        .map_err(|e| format!("{e:#}"))
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                match result {
+                    Ok(()) => {
+                        this.transfer = None;
+                        this.error = None;
+                    }
+                    Err(e) => this.error = Some(e),
+                }
+                this.reload(cx);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn render_transfer(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let muted = cx.theme().muted_foreground;
+        let mut block = v_flex()
+            .gap_1()
+            .w_full()
+            .p_2()
+            .rounded_md()
+            .border_1()
+            .border_color(cx.theme().border)
+            .child(div().text_sm().font_semibold().child("Checks, all phases at once"));
+        if let Some(box_) = &self.transfer {
+            block = block
+                .child(Textarea::new(box_).w_full().h(gpui::px(260.)))
+                .child(div().text_xs().text_color(muted).child(
+                    "YAML: a phase, then its checks (label, command, dir, changed, pattern). Apply replaces \
+                     every check this node lists, in every phase. Empty clears them.",
+                ))
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .child(
+                            Button::new("lc-transfer-apply")
+                                .label("Apply")
+                                .primary()
+                                .compact()
+                                .on_click(cx.listener(|this, _, _, cx| this.apply_transfer(cx))),
+                        )
+                        .child(
+                            Button::new("lc-transfer-close")
+                                .label("Close")
+                                .ghost()
+                                .compact()
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.transfer = None;
+                                    cx.notify();
+                                })),
+                        ),
+                );
+        } else {
+            block = block.child(
+                h_flex().gap_2().child(
+                    Button::new("lc-transfer-open")
+                        .label("Import / export checks")
+                        .ghost()
+                        .compact()
+                        .disabled(!self.enabled)
+                        .on_click(cx.listener(|this, _, window, cx| this.open_transfer(window, cx))),
+                ),
+            );
+        }
+        block.into_any_element()
     }
 
     fn remove_check_row(&mut self, index: usize, cx: &mut Context<Self>) {
@@ -780,6 +903,7 @@ impl Render for LifecycleConfigEditor {
                 .child(div().text_sm().font_semibold().child("Done"))
                 .child(self.render_delete_sandbox(cx)),
         );
+        col = col.child(self.render_transfer(cx));
         if self.form.is_some() {
             col = col.child(self.render_form(window, cx));
         } else if let Some(err) = &self.error {
