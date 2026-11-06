@@ -103,6 +103,7 @@ actions!(
         TaskListCopy,
         TaskListPaste,
         TaskListToggleMark,
+        TaskListAcceptStay,
         TaskListDefer,
     ]
 );
@@ -180,6 +181,7 @@ pub fn register_task_list_keyboard_bindings(cx: &mut App) {
         KeyBinding::new("backspace", TaskListDelete, context),
         KeyBinding::new("secondary-c", TaskListCopy, context),
         KeyBinding::new("space", TaskListToggleMark, context),
+        KeyBinding::new("shift-space", TaskListAcceptStay, context),
         // Z: take the selected node off the list for a while, or bring a
         // deferred one back.
         KeyBinding::new("z", TaskListDefer, context),
@@ -898,7 +900,7 @@ impl TaskListView {
                     .find(|t| t.id == task_id)
                     .is_some_and(|t| t.accept_ready);
                 if ready {
-                    self.accept_ticket(&task_id, Source::Click, window, cx);
+                    self.accept_ticket(&task_id, Source::Click, true, window, cx);
                 }
             }
         }
@@ -2881,7 +2883,7 @@ impl TaskListView {
             && task.external_id.is_some()
         {
             if task.accept_ready {
-                self.accept_ticket(&task_id, Source::Keyboard, window, cx);
+                self.accept_ticket(&task_id, Source::Keyboard, true, window, cx);
             }
             return;
         }
@@ -2898,6 +2900,7 @@ impl TaskListView {
         &mut self,
         task_id: &str,
         source: Source,
+        select_copy: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -2938,9 +2941,45 @@ impl TaskListView {
                 // The copy is the same ticket: make sure Linear has it at least up next and assigned to the user.
                 tod_core::linear_sync::accept(&this.fleet, new_node_id);
                 this.live_refresh(window, cx);
-                this.select_created_task(&new_node_id.to_string(), window, cx);
+                if select_copy {
+                    this.select_created_task(&new_node_id.to_string(), window, cx);
+                }
             },
         );
+    }
+
+    /// Shift+Space: accept the selected ticket but leave the copy alone and
+    /// move the selection to the ticket's next sibling, so a run of presses
+    /// accepts a run of tickets. Selection moves at once, not when the write
+    /// lands, so rapid presses each act on a different ticket.
+    fn on_accept_stay(&mut self, _: &TaskListAcceptStay, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(task_id) = self
+            .working_set
+            .selected_id
+            .clone()
+            .or_else(|| self.selected_task(cx).map(|t| t.id))
+        else {
+            return;
+        };
+        let Some(task) = self.all_tasks.iter().find(|t| t.id == task_id) else {
+            return;
+        };
+        if !(task.managed && task.external_id.is_some() && task.accept_ready) {
+            return;
+        }
+        let visible = Self::visible_tasks(&self.all_tasks, &self.search_query, &self.working_set, &self.actor_view);
+        let next = visible.iter().position(|t| t.id == task_id).and_then(|row| {
+            let cur = &visible[row];
+            visible[row + 1..]
+                .iter()
+                .take_while(|t| t.depth >= cur.depth)
+                .find(|t| t.depth == cur.depth && t.parent_id == cur.parent_id && t.group_header.is_none())
+                .map(|t| t.id.clone())
+        });
+        self.accept_ticket(&task_id, Source::Keyboard, false, window, cx);
+        if let Some(next) = next {
+            self.select_task_by_id(&next, window, cx);
+        }
     }
 
     fn on_open_plan(&mut self, _: &TaskListOpenPlan, window: &mut Window, cx: &mut Context<Self>) {
@@ -3491,6 +3530,7 @@ impl Render for TaskListView {
             .on_action(cx.listener(Self::on_copy))
             .on_action(cx.listener(Self::on_paste))
             .on_action(cx.listener(Self::on_toggle_mark))
+            .on_action(cx.listener(Self::on_accept_stay))
             .on_action(cx.listener(on_app_nav_toggle::<Self>))
             .child(self.render_header(window, cx))
             .when_some(self.render_quick_filters(window, cx), |el, bar| {
