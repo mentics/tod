@@ -22,8 +22,9 @@
 //! and forwards the actions with [`bind_request_actions`].
 //!
 //! Each request ends with one footer line: its evidence links (each item's
-//! name), the reason ([`reason_label`]), and at the right **Shouldn't have
-//! asked** (`doc/ui/task-panel.md`): one click records `should_not_ask`
+//! name), the reason ([`reason_label`]), when it was raised ([`when_label`]:
+//! the wall-clock time, with the date once it is not today's), and at the
+//! right **Shouldn't have asked** (`doc/ui/task-panel.md`): one click records `should_not_ask`
 //! feedback (`tod_store::request_feedback`) without answering or dismissing
 //! the request, then offers a note and a switch to "bad question".
 //!
@@ -175,6 +176,22 @@ pub fn reason_label(reason: RequestReason) -> &'static str {
         RequestReason::Capability => "Capability setting",
         RequestReason::Broken => "Something is broken",
         RequestReason::Other => "Other",
+    }
+}
+
+/// When a request was raised (`AttentionItem::since`), as its footer shows
+/// it: the time of day when it was raised today, else the date and time, in
+/// local time. `today` is the day the footer is drawn on, so the label does
+/// not depend on the clock in a test.
+pub fn when_label(since_ms: i64, today: chrono::NaiveDate) -> String {
+    use chrono::{Local, TimeZone};
+    let Some(at) = Local.timestamp_millis_opt(since_ms).single() else {
+        return String::new();
+    };
+    if at.date_naive() == today {
+        at.format("%H:%M").to_string()
+    } else {
+        at.format("%b %-d %H:%M").to_string()
     }
 }
 
@@ -1191,6 +1208,10 @@ impl Requests {
             .gap_2()
             .children(links)
             .child(style::text_muted(div().text_xs().flex_none()).child(reason_label(item.reason)))
+            .child(
+                style::text_muted(div().text_xs().flex_none())
+                    .child(when_label(item.since, chrono::Local::now().date_naive())),
+            )
             .child(div().flex_1())
             .children(terminal)
             .children(elsewhere)
@@ -1653,6 +1674,17 @@ mod tests {
         ] {
             assert!(!reason_label(reason).is_empty());
         }
+    }
+
+    /// The footer shows only the time for a request raised today, and the
+    /// date too for an older one.
+    #[test]
+    fn when_label_shows_the_time_today_and_the_date_otherwise() {
+        use chrono::{Local, TimeZone};
+        let at = Local.with_ymd_and_hms(2026, 11, 5, 14, 32, 0).single().unwrap();
+        let ms = at.timestamp_millis();
+        assert_eq!(when_label(ms, at.date_naive()), "14:32");
+        assert_eq!(when_label(ms, at.date_naive().succ_opt().unwrap()), "Nov 5 14:32");
     }
 
     #[test]

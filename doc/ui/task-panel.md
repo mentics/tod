@@ -199,6 +199,9 @@ Each request shows:
   - its **reason**: why the agent or runner could not handle it itself.
     Reasons are a fixed set (missing rule, conflict, access, risk,
     capability, broken, other) so they can be counted.
+  - **when** it was raised: the time of day if today, else the date and
+    time (`Nov 5 14:32`), in local time, so the user can tell a question
+    from this morning from one that has waited a week.
   - a **terminal** icon, when the lifecycle conversation that asked (the
     decision's or finding's own, or the implement/verify conversation that
     handed the plan step back) has an agent session:
@@ -217,7 +220,7 @@ Each request shows:
     itself (see below).
 
   ```
-  Totals match the ledger · Plan step 5 · Missing rule     Shouldn't have asked
+  Totals match the ledger · Plan step 5 · Missing rule · 14:32     Shouldn't have asked
   ```
 
 Oldest first. There is rarely more than one; the list scrolls when there is.
