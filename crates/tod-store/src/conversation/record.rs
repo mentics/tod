@@ -238,6 +238,9 @@ pub fn record_and_execute(
     media_root: &Path,
 ) -> Result<Option<i64>> {
     let mutation = normalize(mutation);
+    if actor == ActionActor::Agent {
+        super::settled::check_conversation_agent(conn, conversation_id, &mutation)?;
+    }
     let Some((kind, entity, entity_id)) = classify(&mutation) else {
         mutation.execute(conn, media_root)?;
         return Ok(None);
@@ -266,6 +269,9 @@ pub fn record_direct(
     mutation: &OutlineMutation,
     media_root: &Path,
 ) -> Result<Applied> {
+    if direct_actor(writer_actor) == ActionActor::Agent {
+        super::settled::check_agent(conn, mutation)?;
+    }
     let Some((kind, entity, entity_id)) = classify(mutation) else {
         let archive_id = mutation.execute(conn, media_root)?;
         return Ok(Applied {

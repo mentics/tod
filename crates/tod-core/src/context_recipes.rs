@@ -236,9 +236,9 @@ pub const REVIEW_SESSION: ContextRecipe = ContextRecipe {
     ],
 };
 
-/// A code review session on a node in `pr_draft`, whose findings the app posts
-/// on its draft pull request (`crate::pr_draft_review`): the review session
-/// with `surface/review-on-pr`, which says so and keeps the reviewer off
+/// A code review session on a node in `pr_draft` (`crate::pr_draft_review`):
+/// the review session with `surface/review-on-pr`, which says it reviews the
+/// branch's local head, usually not pushed yet, and keeps the reviewer off
 /// GitHub.
 pub const REVIEW_ON_PR_SESSION: ContextRecipe = ContextRecipe {
     name: "code review session on a pull request",

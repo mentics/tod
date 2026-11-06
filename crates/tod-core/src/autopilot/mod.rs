@@ -40,7 +40,7 @@ use crate::conversation::driver::{
 };
 use crate::conversation::protocol::protocol_for;
 use crate::lifecycle;
-use state::PendingGroups;
+use state::{PendingGroups, PrChange};
 use crate::lifecycle_next::{NextStep, Standing, next_step};
 use crate::phase::{PhaseStanding, settle_gate};
 use tod_store::phase::PhaseRepo;
@@ -1013,6 +1013,12 @@ impl Autopilot {
     /// least one turn in each stay (or when a new session was asked for), since its skills
     /// and the project's own checks apply even when GitHub shows no work, and
     /// a wait for the human review is the goal, not something to wait out.
+    /// With its review steps on, work is reviewed before it reaches the pull
+    /// request ([`Self::pr_change_reviewed`]): the agent makes the change and
+    /// commits it, tod's Review → Fix loop runs on it until a review is clean,
+    /// and only then does the agent push and answer the threads. Once nothing
+    /// but a person is left, a head that did not go through that loop is
+    /// reviewed there ([`Self::own_review`]).
     fn babysit<A: AgentAccess + ?Sized, H: StepHook + ?Sized>(
         &mut self,
         fleet: &FleetStore,
@@ -1090,7 +1096,16 @@ impl Autopilot {
                     return Ok(Some(github_wait::github_look_failed(fleet, self.node, false, &err)?));
                 }
             };
-            let overall = pr_readiness::overall(&live);
+            let mut overall = pr_readiness::overall(&live);
+            // A change the agent made and tod has not reviewed or pushed yet
+            // (the run stopped in between) is finished first, whatever the
+            // pull request shows meanwhile.
+            let change_owed = before_review
+                && self.state.pr_change.as_ref().is_some_and(|c| c.made_at_ms.is_some())
+                && overall != PrNext::Merged;
+            if change_owed {
+                overall = PrNext::Work(Vec::new());
+            }
             match overall {
                 PrNext::Merged => {
                     self.clear_poll_waits(fleet)?;
@@ -1122,17 +1137,31 @@ impl Autopilot {
                     hook.waiting(None, None);
                     let turns = self.pr_agent_turns(fleet)?;
                     let base = *self.state.pr_turns_base.get_or_insert(turns);
+                    // With the review steps on in `pr_draft`, the agent takes
+                    // two turns a round: the change, then the push.
+                    let reviewed = before_review && fleet.read(|conn| crate::pr_draft_review::enabled(conn, node))?;
                     // The first turn opens the pull request: it is not a round.
                     let rounds = turns.saturating_sub(base);
+                    let rounds = if reviewed { rounds.div_ceil(2) } else { rounds };
                     self.state.loops.pr_rounds = rounds;
                     if let Some(why) = crate::conversation::pr::pr_stuck(&live, &settings, rounds) {
                         return Ok(Some(Outcome::NeedsHuman { reason: NeedsHuman::PrStuck { why } }));
                     }
                     let before = self.pr_report(fleet)?;
                     let fingerprint: Vec<String> = live.iter().map(|p| p.fingerprint.clone()).collect();
-                    let reopen = self.pr_reopen(fleet, &live)?;
-                    if let Some(outcome) = self.pr_turn(fleet, agent, hook, reopen, phase_key)? {
-                        return Ok(Some(outcome));
+                    if reviewed {
+                        if let Some(outcome) = self.pr_change_reviewed(fleet, agent, hook, &live, phase_key, &before)? {
+                            return Ok(Some(outcome));
+                        }
+                    } else {
+                        let reopen = self.pr_reopen(fleet, &live)?;
+                        if let Some(outcome) = self.pr_turn(fleet, agent, hook, reopen, phase_key)? {
+                            return Ok(Some(outcome));
+                        }
+                    }
+                    // The agent pushed and answered: the next read has to show it.
+                    for pr in &links.prs {
+                        pr_readiness::forget_snapshot(pr);
                     }
                     let after = self.pr_report(fleet)?;
                     if after != before
@@ -1192,6 +1221,212 @@ impl Autopilot {
                     if let Some(reason) = self.sleep_watching(fleet, hook, interval)? {
                         hook.waiting(None, None);
                         return Ok(Some(Outcome::Stopped { reason }));
+                    }
+                }
+            }
+        }
+    }
+
+    /// One round of work on the pull request's feedback in `pr_draft` with the
+    /// review steps on ([`crate::pr_draft_review`]), reviewed before it
+    /// reaches the pull request, in the stay's pull request conversation:
+    ///
+    /// 1. The agent brings the branch up to date, makes the change the
+    ///    feedback needs, runs the tests and commits, without pushing or
+    ///    answering anything ([`crate::conversation::pr::change_message`]),
+    ///    then the later groups of the phase's skills run.
+    /// 2. If the branch's change against its base differs from before
+    ///    ([`crate::pr_draft_review::branch_change`]; merging the base in
+    ///    alone does not count), tod's Review → Fix → Review loop runs on the
+    ///    local head until a review records nothing that stands
+    ///    ([`Self::review_change`]), and that review records the head as the
+    ///    one it cleared. A merge alone carries a clean review of the head
+    ///    before it over to the new one.
+    /// 3. The agent pushes and answers each thread
+    ///    ([`crate::conversation::pr::push_message`]).
+    ///
+    /// Where it is is saved ([`AutopilotState::pr_change`]), so a restart goes
+    /// on from there. A git command that fails stops the run with its error.
+    fn pr_change_reviewed<A: AgentAccess + ?Sized, H: StepHook + ?Sized>(
+        &mut self,
+        fleet: &FleetStore,
+        agent: &mut A,
+        hook: &mut H,
+        live: &[crate::pr_readiness::LivePr],
+        phase_key: &str,
+        report_before: &Option<serde_json::Value>,
+    ) -> Result<Option<Outcome>> {
+        use crate::pr_draft_review;
+        use anyhow::Context;
+        let node = self.node;
+        let stay = fleet.read(|conn| PhaseRepo::new(conn).stay_started_at(node))?;
+        if self.state.pr_change.as_ref().is_some_and(|c| stay.is_some_and(|stay| c.started_ms < stay)) {
+            // An earlier stay's: what it changed is on the branch, and this
+            // stay's review covers it.
+            self.state.pr_change = None;
+            self.save()?;
+        }
+        let cwd = tod_store::fleet::provision::resolve_launch_cwd(fleet, &node.to_string())
+            .context("finding the node's checkout, to review the pull request's change before it is pushed")?;
+        let base = live.iter().find_map(|p| p.base_ref.clone()).with_context(|| {
+            format!(
+                "GitHub did not say which branch {} merges into, so its change cannot be told from a merge of its base",
+                live.iter().map(|p| p.pr.url.as_str()).collect::<Vec<_>>().join(", ")
+            )
+        })?;
+        let change_of = |cwd: &tod_store::fleet::Workdir| {
+            pr_draft_review::branch_change(cwd, &base)
+                .with_context(|| format!("reading the branch's change against origin/{base} in {cwd}"))
+        };
+        let change = match self.state.pr_change.clone() {
+            Some(change) => change,
+            None => {
+                let change = PrChange {
+                    started_ms: state::now_ms(),
+                    before: change_of(&cwd)?,
+                    made_at_ms: None,
+                    changed: false,
+                };
+                self.state.pr_change = Some(change.clone());
+                self.save()?;
+                change
+            }
+        };
+        let (made_at, changed) = match change.made_at_ms {
+            Some(at) => (at, change.changed),
+            None => {
+                hook.working_on("the change the pull request's feedback needs, committed for tod's review before it is pushed");
+                let reopen = self
+                    .pr_reopen(fleet, live)?
+                    .map(|(id, _)| (id, crate::conversation::pr::change_message(live)));
+                if let Some(outcome) = self.pr_turn(fleet, agent, hook, reopen, phase_key)? {
+                    return Ok(Some(outcome));
+                }
+                let report = self.pr_report(fleet)?;
+                if &report != report_before
+                    && let Some(why) = report.as_ref().and_then(blocked_why)
+                {
+                    return Ok(Some(Outcome::NeedsHuman { reason: NeedsHuman::PrBlocked { why } }));
+                }
+                // A question for the user comes before the review: the answer
+                // may change what the agent does (the turn is asked for again).
+                let pending = fleet.read(|conn| Ok(DecisionRepo::new(conn).list_pending_for_node(node)?))?.len();
+                if pending > 0 {
+                    return Ok(Some(Outcome::NeedsHuman { reason: NeedsHuman::Decision { pending } }));
+                }
+                let at = state::now_ms();
+                let changed = change_of(&cwd)? != change.before;
+                self.state.pr_change = Some(PrChange { made_at_ms: Some(at), changed, ..change });
+                self.save()?;
+                (at, changed)
+            }
+        };
+        let cleared = if changed {
+            if let Some(outcome) = self.review_change(fleet, agent, hook, made_at)? {
+                return Ok(Some(outcome));
+            }
+            fleet.read(|conn| Ok(pr_draft_review::reviews_since(conn, node, made_at)?.pop()))?
+        } else {
+            fleet.read(|conn| pr_draft_review::cleared(conn, node, &pr_draft_review::current_heads(live)))?
+        };
+        if let Some(review) = cleared {
+            let head = pr_draft_review::local_head(&cwd).with_context(|| format!("reading the head commit in {cwd}"))?;
+            fleet.interview(
+                "autopilot",
+                InterviewCommand::RecordConversationReport {
+                    conversation_id: review.id,
+                    body: pr_draft_review::heads_report(&pr_draft_review::local_heads(live, &head)),
+                },
+            )?;
+        }
+        hook.working_on("pushing the reviewed change and answering the pull request's threads");
+        let reopen = self
+            .pr_reopen(fleet, live)?
+            .map(|(id, _)| (id, crate::conversation::pr::push_message(changed)));
+        if let Some(outcome) = self.converse(fleet, agent, hook, ProtocolKind::Pr, reopen)? {
+            return Ok(Some(outcome));
+        }
+        self.state.pr_change = None;
+        self.save()?;
+        Ok(None)
+    }
+
+    /// tod's Review → Fix → Review loop on the change the pull request's agent
+    /// made at `made_at` (ms), not pushed yet, decided as in `review`
+    /// ([`crate::pr_draft_review::change_step`]): `None` once a review of it
+    /// recorded nothing that stands. Each review and fix is a session of its
+    /// own, followed by the later groups of its phase's skills. It stops for
+    /// the user after `lifecycle.review_round_limit` reviews
+    /// ([`NeedsHuman::ReviewNotConverging`]), or when a fix leaves the same
+    /// findings open.
+    fn review_change<A: AgentAccess + ?Sized, H: StepHook + ?Sized>(
+        &mut self,
+        fleet: &FleetStore,
+        agent: &mut A,
+        hook: &mut H,
+        made_at: i64,
+    ) -> Result<Option<Outcome>> {
+        use crate::pr_draft_review::{self, ChangeStep};
+        let node = self.node;
+        let round_limit = tod_store::TodSettings::load(&tod_store::TodPaths::at(&self.config.data_root))?
+            .lifecycle
+            .review_round_limit
+            .max(1);
+        let open_of_round = |fleet: &FleetStore| -> Result<Vec<Uuid>> {
+            fleet.read(|conn| {
+                let Some(latest) = pr_draft_review::reviews_since(conn, node, made_at)?.pop() else {
+                    return Ok(Vec::new());
+                };
+                Ok(pr_draft_review::own_findings(conn, node)?
+                    .iter()
+                    .filter(|f| f.created_at >= latest.created_at && f.is_open())
+                    .map(|f| f.id)
+                    .collect())
+            })
+        };
+        loop {
+            if let Some(reason) = hook.at(fleet, Boundary::Step)? {
+                return Ok(Some(Outcome::Stopped { reason }));
+            }
+            match fleet.read(|conn| pr_draft_review::change_step(conn, node, made_at))? {
+                ChangeStep::Clean => return Ok(None),
+                ChangeStep::Fix => {
+                    let open = open_of_round(fleet)?;
+                    hook.working_on("fixing what tod's review found in the change, before it is pushed");
+                    if let Some(outcome) = self.converse(fleet, agent, hook, ProtocolKind::Fix, None)? {
+                        return Ok(Some(outcome));
+                    }
+                    self.owe_groups(fleet, ProtocolKind::Fix, "fix", pr_draft_review::STATE)?;
+                    if let Some(outcome) = self.run_pending_groups(fleet, agent, hook, pr_draft_review::STATE)? {
+                        return Ok(Some(outcome));
+                    }
+                    if open_of_round(fleet)? == open {
+                        return Ok(Some(Outcome::NeedsHuman {
+                            reason: NeedsHuman::NoProgress { step: step_name(NextStep::Fix).to_string() },
+                        }));
+                    }
+                }
+                ChangeStep::Review => {
+                    let rounds = fleet.read(|conn| pr_draft_review::reviews_since(conn, node, made_at))?.len() as u32;
+                    // A review the last run left unfinished is resumed, not a new round.
+                    let resuming = self.state.current.as_ref().is_some_and(|c| {
+                        c.protocol == protocol_name(ProtocolKind::Review) && c.lifecycle == pr_draft_review::STATE
+                    });
+                    if !resuming && rounds >= round_limit {
+                        let standing = fleet.read(|conn| pr_draft_review::change_standing(conn, node, made_at))?;
+                        return Ok(Some(Outcome::NeedsHuman {
+                            reason: NeedsHuman::ReviewNotConverging { rounds, standing },
+                        }));
+                    }
+                    self.state.loops.review_rounds = rounds + u32::from(!resuming);
+                    self.save()?;
+                    hook.working_on("tod's code review of the change, before it is pushed");
+                    if let Some(outcome) = self.converse(fleet, agent, hook, ProtocolKind::Review, None)? {
+                        return Ok(Some(outcome));
+                    }
+                    self.owe_groups(fleet, ProtocolKind::Review, "review", pr_draft_review::STATE)?;
+                    if let Some(outcome) = self.run_pending_groups(fleet, agent, hook, pr_draft_review::STATE)? {
+                        return Ok(Some(outcome));
                     }
                 }
             }

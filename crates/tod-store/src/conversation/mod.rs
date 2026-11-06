@@ -15,6 +15,7 @@ mod inverse;
 mod project;
 mod record;
 mod repo;
+mod settled;
 mod types;
 
 #[cfg(test)]
@@ -27,6 +28,7 @@ pub use record::{
     record_direct, record_undo, snapshot,
 };
 pub use repo::ConversationRepo;
+pub use settled::{LAST_OPEN_STATE, user_directed};
 pub use types::*;
 
 /// `conversation_actions.source` of a row written by a conversation.

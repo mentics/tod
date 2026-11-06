@@ -590,30 +590,55 @@ fn mentions_commit(body: &str) -> bool {
     body.to_ascii_lowercase().contains("last reviewed commit")
 }
 
+/// Snapshots read in the last few seconds, by [`pr_label`]-style key.
+type SnapshotCache = std::collections::HashMap<String, (std::time::Instant, PrSnapshot)>;
+static SNAPSHOTS: std::sync::Mutex<Option<SnapshotCache>> = std::sync::Mutex::new(None);
+/// How long a snapshot is reused.
+const SNAPSHOT_TTL: std::time::Duration = std::time::Duration::from_secs(5);
+
+fn snapshot_key(pr: &tod_store::github::NodePr) -> String {
+    format!("{}/{}#{}", pr.owner, pr.repo, pr.pr_number)
+}
+
 /// [`Github::get_pr_snapshot`], reused for a few seconds: the gate answers
 /// four criteria in a row from the same pull request, and each read is
-/// several requests.
+/// several requests. Whoever writes to the pull request (posts a review)
+/// calls [`forget_snapshot`], so the next read sees what it wrote.
 pub fn cached_snapshot(
     github: &tod_store::github::Github,
     pr: &tod_store::github::NodePr,
 ) -> Result<PrSnapshot, tod_store::github::GithubError> {
-    use std::collections::HashMap;
-    use std::sync::Mutex;
-    use std::time::{Duration, Instant};
-    static CACHE: Mutex<Option<HashMap<String, (Instant, PrSnapshot)>>> = Mutex::new(None);
-    const TTL: Duration = Duration::from_secs(5);
-    let key = format!("{}/{}#{}", pr.owner, pr.repo, pr.pr_number);
-    if let Ok(cache) = CACHE.lock()
+    cached_snapshot_with(pr, || github.get_pr_snapshot(&pr.owner, &pr.repo, pr.pr_number))
+}
+
+/// [`cached_snapshot`] over any read: `fetch` runs unless a snapshot of `pr`
+/// read in the last few seconds is kept.
+pub fn cached_snapshot_with<E>(
+    pr: &tod_store::github::NodePr,
+    fetch: impl FnOnce() -> Result<PrSnapshot, E>,
+) -> Result<PrSnapshot, E> {
+    let key = snapshot_key(pr);
+    if let Ok(cache) = SNAPSHOTS.lock()
         && let Some((at, snapshot)) = cache.as_ref().and_then(|c| c.get(&key))
-        && at.elapsed() < TTL
+        && at.elapsed() < SNAPSHOT_TTL
     {
         return Ok(snapshot.clone());
     }
-    let snapshot = github.get_pr_snapshot(&pr.owner, &pr.repo, pr.pr_number)?;
-    if let Ok(mut cache) = CACHE.lock() {
-        cache.get_or_insert_with(HashMap::new).insert(key, (Instant::now(), snapshot.clone()));
+    let snapshot = fetch()?;
+    if let Ok(mut cache) = SNAPSHOTS.lock() {
+        cache.get_or_insert_with(Default::default).insert(key, (std::time::Instant::now(), snapshot.clone()));
     }
     Ok(snapshot)
+}
+
+/// Drops the snapshot of `pr` [`cached_snapshot`] keeps: something was just
+/// written to it, and the next read has to show it.
+pub fn forget_snapshot(pr: &tod_store::github::NodePr) {
+    if let Ok(mut cache) = SNAPSHOTS.lock()
+        && let Some(cache) = cache.as_mut()
+    {
+        cache.remove(&snapshot_key(pr));
+    }
 }
 
 /// The babysitter's opening message for a turn: what to do about this pull
@@ -844,6 +869,21 @@ Not safe.
 
     fn snap(status: PrStatus, threads: Vec<ReviewThread>, comments: Vec<IssueComment>) -> PrSnapshot {
         PrSnapshot { status, threads, comments, reviews: vec![] }
+    }
+
+    #[test]
+    fn a_snapshot_is_reused_until_it_is_forgotten() {
+        let pr = tod_store::github::NodePr::new("acme", "cache-test", 7);
+        let read = |head: &str| {
+            let status = PrStatus { head_sha: Some(head.to_string()), ..Default::default() };
+            move || Ok::<_, String>(snap(status, vec![], vec![]))
+        };
+        assert_eq!(cached_snapshot_with(&pr, read("one")).unwrap().status.head_sha.as_deref(), Some("one"));
+        // Read again at once: the snapshot kept, not the new one.
+        assert_eq!(cached_snapshot_with(&pr, read("two")).unwrap().status.head_sha.as_deref(), Some("one"));
+        // Something was written to the pull request: the next read is fresh.
+        forget_snapshot(&pr);
+        assert_eq!(cached_snapshot_with(&pr, read("two")).unwrap().status.head_sha.as_deref(), Some("two"));
     }
 
     #[test]
@@ -1301,6 +1341,8 @@ pub struct LivePr {
     pub head_sha: Option<String>,
     /// Every review thread, open or not.
     pub threads: Vec<tod_store::github::ReviewThread>,
+    /// The branch it merges into, when GitHub said.
+    pub base_ref: Option<String>,
 }
 
 /// `owner/repo#number`: how a pull request is named in a status line.
@@ -1380,6 +1422,7 @@ pub fn live_answered(
                 fingerprint,
                 head_sha: snapshot.status.head_sha.clone(),
                 threads: snapshot.threads.clone(),
+                base_ref: snapshot.status.base_ref.clone(),
             })
         })
         .collect()

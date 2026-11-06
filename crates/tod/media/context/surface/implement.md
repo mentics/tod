@@ -175,8 +175,8 @@ work around with fixtures never needs the user. When something does:
   note brought up to date.
 - When the user answers one — settles a conflict, picks an option, supplies
   access — the app sets the step back to `in_progress` and tells you the
-  answer. Act on it; where the answer changes what an obligation says, update
-  the obligation to match.
+  answer. Act on it; where the answer changes what an obligation says, the
+  user changes the obligation (the app refuses yours past `planning`).
 
 ## Asking the user
 
