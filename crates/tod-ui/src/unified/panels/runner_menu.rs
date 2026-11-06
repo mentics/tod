@@ -82,6 +82,9 @@ pub enum RunnerAction {
     StopNow,
     /// Run the current state's gate check now, with no agent.
     CheckNow,
+    /// Run the current state again as if the node had just entered it, in a
+    /// new session.
+    RerunPhase,
     /// A submenu of the locations; the panel lists them.
     MigrateTo,
     ResetEnvironment,
@@ -104,6 +107,7 @@ impl RunnerAction {
             RunnerAction::Pause => "Pause",
             RunnerAction::StopNow => "Stop now",
             RunnerAction::CheckNow => "Check now",
+            RunnerAction::RerunPhase => "Rerun this phase",
             RunnerAction::MigrateTo => "Migrate to\u{2026}",
             RunnerAction::ResetEnvironment => "Reset environment",
             RunnerAction::UpdateWorkspace => "Update workspace to latest main",
@@ -166,6 +170,7 @@ pub fn menu(inputs: &RunnerInputs) -> RunnerActions {
     }
     if idle {
         entries.push(CheckNow);
+        entries.push(RerunPhase);
     }
     if !done && !inputs.has_children {
         entries.push(MigrateTo);

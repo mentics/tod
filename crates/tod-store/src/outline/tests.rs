@@ -2977,6 +2977,59 @@ fn pr_draft_review_defaults_off_and_resolves_from_the_nearest_node() {
 }
 
 #[test]
+fn checks_resolve_per_phase_from_the_nearest_node_and_survive_other_saves() {
+    use crate::lifecycle_config::{self, Check};
+    let (store, root, list_id) = setup_store_with_list();
+    let top = create_node_in(&store, list_id, None, "Top");
+    let leaf = create_node_in(&store, list_id, Some(top), "Leaf");
+    store
+        .enqueue_outline(OutlineMutation::EnableCapabilities { node_id: top, capabilities: vec![Capability::LifecycleConfig] })
+        .unwrap();
+    store.writer().flush().unwrap();
+    let check = |label: &str, command: &str| Check { label: label.into(), command: command.into(), ..Default::default() };
+    let set = |node, phase: &str, list: Vec<Check>| {
+        store
+            .enqueue_outline(OutlineMutation::SetNodeLifecycleChecks { node_id: node, checks: [(phase.to_string(), list)].into() })
+            .unwrap();
+        store.writer().flush().unwrap();
+    };
+    set(top, "review", vec![check(" lint ", " ruff check . "), check("", "pyright")]);
+    // Saving skills or the model must not clear them.
+    store
+        .enqueue_outline(OutlineMutation::SetNodeLifecycleConfig {
+            node_id: top,
+            skills: [("review".to_string(), vec!["r".to_string()])].into(),
+        })
+        .unwrap();
+    store.writer().flush().unwrap();
+    let resolved = |phase: &str| store.read(|conn| Ok(lifecycle_config::resolve_checks(conn, leaf, phase)?)).unwrap();
+    let r = resolved("review").expect("inherited");
+    assert_eq!((r.source_node, r.inherited), (top, true));
+    assert_eq!(r.checks, vec![check("lint", "ruff check ."), check("", "pyright")], "trimmed, in order");
+    assert_eq!(r.checks[1].name(), "pyright", "a check with no label goes by its command");
+    assert!(resolved("pr_draft").is_none(), "only the phases that list them");
+    // A lower node's list replaces the phase's, and an empty one turns it off.
+    store
+        .enqueue_outline(OutlineMutation::EnableCapabilities { node_id: leaf, capabilities: vec![Capability::LifecycleConfig] })
+        .unwrap();
+    store.writer().flush().unwrap();
+    set(leaf, "review", Vec::new());
+    assert!(resolved("review").unwrap().checks.is_empty());
+    // A blank command and an unknown phase are refused, nothing saved.
+    let refused = |node, phase: &str, list: Vec<Check>| {
+        store
+            .enqueue_outline(OutlineMutation::SetNodeLifecycleChecks { node_id: node, checks: [(phase.to_string(), list)].into() })
+            .is_err()
+            || store.writer().flush().is_err()
+    };
+    assert!(refused(top, "review", vec![check("x", "  ")]));
+    assert!(refused(top, "nonsense", vec![check("x", "true")]));
+    assert_eq!(store.read(|conn| Ok(lifecycle_config::checks(conn, top)?)).unwrap()["review"].len(), 2);
+    drop(store);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn lifecycle_config_resolves_per_phase_from_the_nearest_node() {
     use crate::lifecycle_config::{self, Skills};
     let (store, root, list_id) = setup_store_with_list();

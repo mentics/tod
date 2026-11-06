@@ -106,6 +106,12 @@ impl Protocol for PrProtocol {
         Some("Open the pull request, or drive it through review.")
     }
 
+    /// The state the PR agent works in (`pr`, `pr_draft`, `pr_review`), so the
+    /// list can say which stay a session belongs to.
+    fn transition(&self, fleet: &tod_store::fleet::FleetStore, focus: tod_store::conversation::Focus) -> Option<(String, String)> {
+        super::phase::state_and_next(fleet, focus)
+    }
+
     fn turn_env(&self, env: &ProtocolEnv<'_>) -> Vec<(String, String)> {
         let mut vars = vec![(
             IMPLEMENT_CONVERSATION_ENV.to_string(),

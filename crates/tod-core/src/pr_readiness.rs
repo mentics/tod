@@ -22,12 +22,16 @@ pub struct ReviewBot {
     pub author: &'static str,
     /// What the summary comment's score line starts with; `<n>/5` follows.
     score_label: &'static str,
+    /// What the bot's comment of findings it could not post inline (their
+    /// lines are outside the diff) carries, when it leaves one.
+    outside_diff_marker: Option<&'static str>,
 }
 
 pub const GREPTILE: ReviewBot = ReviewBot {
     name: "greptile",
     author: "greptile-apps",
     score_label: "Confidence Score:",
+    outside_diff_marker: Some("<!-- greptile_outside_diff -->"),
 };
 
 /// The built-in bot `name` selects.
@@ -268,7 +272,11 @@ impl Assessment {
             bots,
             human_review: human_review(snapshot, head_at),
             requested_reviewers: snapshot.status.reviewers.clone(),
-            review_comments: review_comments(snapshot, head_at),
+            review_comments: review_comments(
+                snapshot,
+                head_at,
+                &settings.bots.iter().filter_map(|b| builtin_bot(&b.name)).collect::<Vec<_>>(),
+            ),
             read_at: now,
             answered_at: None,
         }
@@ -451,7 +459,7 @@ fn human_review(snapshot: &PrSnapshot, head_at: Option<DateTime<Utc>>) -> HumanR
 /// The reviews people left with text and no verdict since the head commit.
 /// A bot's report (a score, a summary) is read through its own standing, and
 /// a review that approves or asks for changes through [`human_review`].
-fn review_comments(snapshot: &PrSnapshot, head_at: Option<DateTime<Utc>>) -> Vec<ReviewComment> {
+fn review_comments(snapshot: &PrSnapshot, head_at: Option<DateTime<Utc>>, bots: &[&ReviewBot]) -> Vec<ReviewComment> {
     let mut found: Vec<ReviewComment> = snapshot
         .reviews
         .iter()
@@ -473,6 +481,26 @@ fn review_comments(snapshot: &PrSnapshot, head_at: Option<DateTime<Utc>>) -> Vec
     // of its turn, which answers them ([`Assessment::answered_through`]).
     for c in &snapshot.comments {
         let body = c.body.trim();
+        // A configured bot's findings it could not post inline (their lines
+        // are outside the diff) are feedback whatever its score says: no
+        // review thread carries them. The bot edits the comment in place, so
+        // the edit time is when it last said something.
+        if let Some(bot) = bots.iter().find(|b| c.author.as_deref().is_some_and(|a| b.is_author(a)))
+            && bot.outside_diff_marker.is_some_and(|marker| body.contains(marker))
+        {
+            let at = parse_time(&c.updated_at).or_else(|| parse_time(&c.created_at));
+            if let Some(at) = at
+                && head_at.is_none_or(|h| at > h)
+            {
+                found.push(ReviewComment {
+                    kind: "list of findings it could not post inline",
+                    author: c.author.clone().unwrap_or_default(),
+                    at,
+                    body: body.to_string(),
+                });
+            }
+            continue;
+        }
         let Some(author) = c.author.as_deref().filter(|a| is_person(a)) else { continue };
         let Some(at) = parse_time(&c.created_at) else { continue };
         if body.is_empty() || !head_at.is_none_or(|h| at > h) {
@@ -838,6 +866,39 @@ Not safe.
         ] {
             assert_eq!(GREPTILE.parse_score(body), want, "{body}");
         }
+    }
+
+    #[test]
+    fn a_configured_bots_findings_outside_the_diff_are_work_whatever_its_score() {
+        let mut st = status("blocked", "success");
+        st.head_committed_at = Some("2026-01-01T09:00:00Z".into());
+        st.head_sha = Some("abcdef1234".into());
+        let summary = comment(
+            "greptile-apps[bot]",
+            "<!-- greptile_summary -->\nConfidence Score: 5/5\nLast reviewed commit: abcdef1",
+            "2026-01-01T10:00:00Z",
+        );
+        let outside = comment(
+            "greptile-apps[bot]",
+            "<!-- greptile_outside_diff -->\n### Comments Outside Diff\n- P1 **Merged parts lose local fields** `a.py:121`",
+            "2026-01-01T10:01:00Z",
+        );
+        let snapshot = snap(st, vec![], vec![summary, outside]);
+
+        let a = Assessment::of(&snapshot, &greptile_settings(), now());
+        assert_eq!(a.work(), vec![Work::ReviewComments(1)]);
+        let render = render_work("https://github.com/o/r/pull/1", &a);
+        assert!(render.contains("Merged parts lose local fields"), "{render}");
+        assert!(render.contains("could not post inline"), "{render}");
+
+        // Once the agent has had a turn on it, it is answered.
+        let answered = Assessment::of(&snapshot, &greptile_settings(), now())
+            .answered_through(parse_time("2026-01-01T11:00:00Z"));
+        assert!(answered.work().is_empty(), "{:?}", answered.work());
+
+        // Not a bot tod was told to watch: a bot's comment is not feedback.
+        let a = Assessment::of(&snapshot, &PrReadinessSettings::default(), now());
+        assert!(a.work().is_empty(), "{:?}", a.work());
     }
 
     #[test]

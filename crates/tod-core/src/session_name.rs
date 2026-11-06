@@ -94,6 +94,26 @@ pub fn session_name(
     truncate_chars(&name, MAX_TOTAL_CHARS)
 }
 
+/// A stored session name with its time shown in this machine's zone.
+///
+/// A name is stamped where the session starts, and a cloud sandbox's clock is
+/// UTC, so the stored time can be hours off for the person reading it. The
+/// time is replaced by the conversation's creation time in local time; a name
+/// that does not end in a time (an older or hand-set name) is returned as is.
+pub fn localize(name: &str, created_ms: i64) -> String {
+    use chrono::TimeZone;
+    let Some((head, tail)) = name.rsplit_once(" · ") else {
+        return name.to_string();
+    };
+    if chrono::NaiveDateTime::parse_from_str(&format!("2000 {tail}"), "%Y %b %-d, %-I:%M %p").is_err() {
+        return name.to_string();
+    }
+    let Some(at) = Local.timestamp_millis_opt(created_ms).single() else {
+        return name.to_string();
+    };
+    format!("{head} · {}", at.format("%b %-d, %-I:%M %p"))
+}
+
 /// Last-resort truncation if the fixed parts alone somehow exceed the cap.
 fn truncate_chars(text: &str, max_chars: usize) -> String {
     if text.chars().count() <= max_chars {
@@ -137,6 +157,18 @@ fn shorten(subject: &str, max_chars: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn localize_replaces_the_stamped_time_and_leaves_other_names() {
+        use chrono::TimeZone;
+        let ms = Local.with_ymd_and_hms(2026, 11, 5, 14, 24, 0).unwrap().timestamp_millis();
+        assert_eq!(
+            super::localize("Phase · Ship it · Nov 5, 8:22 PM", ms),
+            "Phase · Ship it · Nov 5, 2:24 PM"
+        );
+        assert_eq!(super::localize("Project chat", ms), "Project chat");
+        assert_eq!(super::localize("Chat · not a time", ms), "Chat · not a time");
+    }
+
     use super::*;
     use chrono::TimeZone;
 

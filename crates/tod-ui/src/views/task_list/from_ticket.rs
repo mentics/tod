@@ -1,5 +1,5 @@
 use gpui::{Context, Window};
-use tod_store::{CredentialStore, resolve_linear_api_key};
+use tod_store::CredentialStore;
 use uuid::Uuid;
 
 use tod_store::outline::types::Capability;
@@ -24,6 +24,8 @@ pub(super) struct PendingTicketImport {
     pub description: Option<String>,
     pub error: Option<String>,
     pub draft_node_id: Option<String>,
+    /// The node the new one goes under; its Environment holds the key.
+    pub parent: Uuid,
     pub auth_failure: bool,
 }
 
@@ -52,21 +54,66 @@ impl TaskListView {
             return TicketImportResult::Completed(true);
         }
 
-        let store = CredentialStore::from_data_root(&self.config_dir);
-        let Some(api_key) = resolve_linear_api_key(&store) else {
-            self.open_linear_credential_prompt(
-                PendingCredentialRequest::TicketImport {
-                    ticket: ticket.to_string(),
-                    draft_node_id: draft_node_id.map(str::to_string),
-                },
+        // The key is in the Environment of the node the new one goes under (or
+        // an ancestor of it), so a top-level node has nowhere to look.
+        let Some(parent) = self.ticket_import_parent(draft_node_id) else {
+            self.show_error(
+                "Add the ticket under a node: the Linear API key is kept in a node's Environment",
                 window,
                 cx,
             );
-            return TicketImportResult::Pending;
+            return TicketImportResult::Completed(false);
+        };
+        let api_key = match tod_store::environment::linear_api_key_for(&self.fleet, parent) {
+            Ok(Some(key)) => key,
+            Ok(None) => {
+                self.open_linear_credential_prompt(
+                    PendingCredentialRequest::TicketImport {
+                        ticket: ticket.to_string(),
+                        draft_node_id: draft_node_id.map(str::to_string),
+                        parent,
+                    },
+                    window,
+                    cx,
+                );
+                return TicketImportResult::Pending;
+            }
+            Err(err) => {
+                self.show_error(format!("Could not read the Linear API key: {err:#}"), window, cx);
+                return TicketImportResult::Completed(false);
+            }
         };
 
-        self.start_linear_ticket_fetch(&api_key, ticket, draft_node_id, window, cx);
+        self.start_linear_ticket_fetch(&api_key, ticket, draft_node_id, parent, window, cx);
         TicketImportResult::Pending
+    }
+
+    /// The node an imported ticket's new node goes under: the draft's parent
+    /// (or, for a sibling, its anchor's parent), else the selected node's
+    /// parent for a ticket pasted into the compose field. `None` when the new
+    /// node would be top level.
+    fn ticket_import_parent(&self, draft_node_id: Option<&str>) -> Option<Uuid> {
+        let parent_of = |id: Uuid| {
+            let id = id.to_string();
+            self.all_tasks
+                .iter()
+                .find(|t| t.id == id)
+                .and_then(|t| t.parent_id.as_deref())
+                .and_then(|p| Uuid::parse_str(p).ok())
+        };
+        let draft = draft_node_id
+            .filter(|id| self.is_draft_id(id))
+            .and_then(|_| self.draft.as_ref());
+        match draft {
+            Some(draft) => draft.parent_id.or_else(|| draft.anchor_id.and_then(parent_of)),
+            None => self
+                .working_set
+                .selected_id
+                .as_deref()
+                .filter(|id| !self.is_draft_id(id))
+                .and_then(|id| Uuid::parse_str(id).ok())
+                .and_then(parent_of),
+        }
     }
 
     pub(super) fn create_task_with_title(
@@ -111,12 +158,31 @@ impl TaskListView {
             return;
         }
         if pending.auth_failure {
-            let store = CredentialStore::from_data_root(&self.config_dir);
-            let _ = store.delete(tod_store::CredentialKind::LinearApiKey);
+            // Linear refused the key: forget the value (the entry stays, so the
+            // prompt replaces it) wherever it was defined.
+            let source = self.fleet.read(|conn| {
+                Ok(tod_store::environment::resolve(conn, pending.parent)?
+                    .into_iter()
+                    .find(|r| r.entry.name.eq_ignore_ascii_case(tod_store::environment::LINEAR_ENTRY))
+                    .map(|r| r.source_node))
+            });
+            match source {
+                Ok(Some(node)) => tod_store::environment::forget_secret(
+                    &CredentialStore::from_data_root(&self.config_dir),
+                    node,
+                    tod_store::environment::LINEAR_ENTRY,
+                ),
+                Ok(None) => {}
+                Err(err) => {
+                    self.show_error(format!("Could not clear the rejected Linear API key: {err:#}"), window, cx);
+                    return;
+                }
+            }
             self.open_linear_credential_prompt(
                 PendingCredentialRequest::TicketImport {
                     ticket: pending.ticket.clone(),
                     draft_node_id: pending.draft_node_id.clone(),
+                    parent: pending.parent,
                 },
                 window,
                 cx,

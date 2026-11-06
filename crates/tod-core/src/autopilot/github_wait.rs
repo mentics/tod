@@ -265,6 +265,26 @@ fn check_ready_for_review(fleet: &FleetStore, node: uuid::Uuid, data_root: &std:
     };
     let settings = crate::pr_readiness::settings_at(data_root);
     let answered_at = crate::pr_readiness::agent_answered_at(fleet, node)?;
+    // The babysitter's own work comes first: a bot's review or running checks
+    // it polls for, and what tod's own review still owes the pull request
+    // (findings to post, to fix, a head to review). Recording the wait for a
+    // person here would end the run before that work is done, and the wake
+    // would go to the review cadence instead of the sandbox.
+    let live = match crate::pr_readiness::live_answered(feed.as_ref(), &links.prs, &settings, answered_at) {
+        Ok(live) => live,
+        Err(err) => return Ok(GithubCheck::Unreadable(err)),
+    };
+    if let crate::pr_readiness::Next::Wait(waits) = crate::pr_readiness::overall(&live)
+        && waits.iter().any(|w| !matches!(w, crate::pr_readiness::Wait::HumanReview))
+    {
+        return Ok(GithubCheck::NothingToWaitOn);
+    }
+    if !matches!(
+        fleet.read(|conn| crate::pr_draft_review::owed(conn, node, &live))?,
+        crate::pr_draft_review::Owed::Clear
+    ) {
+        return Ok(GithubCheck::NothingToWaitOn);
+    }
     let mut pending: Option<(&NodePr, String, &str)> = None;
     let mut standing: Vec<String> = Vec::new();
     let mut feedback: Vec<String> = Vec::new();

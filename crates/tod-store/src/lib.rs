@@ -1,6 +1,7 @@
 //! Durable persistence for fleet tasks, outline trees, and related storage.
 
 pub mod activity;
+pub mod check_runs;
 pub mod branch_name;
 pub mod cloud_activity;
 pub mod cloud_nodes;
@@ -8,6 +9,7 @@ pub mod conversation;
 pub mod conversation_live;
 pub mod credentials;
 pub mod deferrals;
+pub mod git_identity;
 pub mod decisions;
 pub mod environment;
 pub mod groups;
@@ -40,6 +42,7 @@ pub mod settings;
 pub mod sync;
 pub mod verification;
 pub mod node_events;
+pub mod node_timeline;
 pub mod node_problems;
 pub mod node_requests;
 pub mod run_state;

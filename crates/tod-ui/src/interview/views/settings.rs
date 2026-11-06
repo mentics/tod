@@ -20,12 +20,13 @@ use gpui_component::scroll::ScrollableElement;
 use gpui_component::select::{Select, SelectEvent, SelectState};
 use gpui_component::{ActiveTheme, Disableable, IndexPath, Selectable, StyledExt, h_flex, v_flex};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 use tod_core::logging;
 use tod_journey::RelayCode;
 use tod_store::fleet::default_terminal_hint;
 use tod_store::branch_name::DEFAULT_BRANCH_TEMPLATE;
-use tod_store::settings::{DEFAULT_TREEHOUSE_EXECUTABLE, JourneySettings, RepoProfileSetting};
+use tod_store::settings::{DEFAULT_TREEHOUSE_EXECUTABLE, JourneySettings, PrReviewBotSettings, RepoProfileSetting};
 use tod_store::{AgentRole, efforts_for, models_for, parse_platform};
 
 const SAVE_DEBOUNCE: Duration = Duration::from_secs(2);
@@ -175,7 +176,7 @@ impl SettingsSection {
                 ClaudeAdapter,
                 MaxParallelSessions,
             ],
-            Self::Lifecycle => &[LifecycleIndependentEvaluation, LifecycleReviewRoundLimit, LifecycleRepoProfiles],
+            Self::Lifecycle => &[LifecycleIndependentEvaluation, LifecycleReviewRoundLimit, LifecycleRepoProfiles, PrReviewBots],
             Self::QuestionMaker => &[ReplenishThreshold],
             Self::AnswerProcessor => &[ContextBudget, PromptCacheIdle, AnsweredHistoryCap],
             Self::Workspaces => &[
@@ -191,6 +192,8 @@ impl SettingsSection {
                 SandboxSignIn,
                 SandboxApiKey,
                 SandboxDefaultImage,
+                SandboxGitName,
+                SandboxGitEmail,
                 SandboxClaudeToken,
                 SandboxClaudeGetToken,
                 SandboxClaudeClear,
@@ -245,6 +248,10 @@ enum SettingField {
     SandboxApiKey,
     /// The image a new sandbox starts from unless one is given.
     SandboxDefaultImage,
+    /// The git author name sandbox commits carry (the user's database).
+    SandboxGitName,
+    /// The git author email sandbox commits carry (the user's database).
+    SandboxGitEmail,
     /// The Claude subscription token for autonomous nodes, kept in the
     /// credential store (never shown).
     SandboxClaudeToken,
@@ -268,6 +275,8 @@ enum SettingField {
     LifecycleReviewRoundLimit,
     /// `lifecycle.repo_profiles`, as text.
     LifecycleRepoProfiles,
+    /// `pr_readiness.bots`, as text.
+    PrReviewBots,
     /// Seconds an idle sandbox terminal keeps its connection.
     SandboxTerminalPark,
     /// Seconds an idle Zed on a sandbox keeps its connection.
@@ -300,6 +309,8 @@ impl SettingField {
             Self::SandboxSignIn => "sandbox-sign-in",
             Self::SandboxApiKey => "sandbox-api-key",
             Self::SandboxDefaultImage => "sandbox-default-image",
+            Self::SandboxGitName => "sandbox-git-name",
+            Self::SandboxGitEmail => "sandbox-git-email",
             Self::SandboxClaudeToken => "sandbox-claude-token",
             Self::SandboxClaudeGetToken => "sandbox-claude-get-token",
             Self::SandboxClaudeClear => "sandbox-claude-clear",
@@ -316,6 +327,7 @@ impl SettingField {
             Self::LifecycleIndependentEvaluation => "lifecycle-independent-evaluation",
             Self::LifecycleReviewRoundLimit => "lifecycle-review-round-limit",
             Self::LifecycleRepoProfiles => "lifecycle-repo-profiles",
+            Self::PrReviewBots => "pr-review-bots",
             Self::SandboxTerminalPark => "sandbox-terminal-park",
             Self::SandboxZedPark => "sandbox-zed-park",
             Self::SandboxAgentIdle => "sandbox-agent-idle",
@@ -327,7 +339,7 @@ const PLATFORM_ORDER: [AgentPlatform; 2] = [AgentPlatform::Claude, AgentPlatform
 /// Platform, model, effort — the dropdowns in one agent role row.
 const AGENT_ROW_COLUMNS: usize = 3;
 /// The fields edited as text, each in its own input (`SettingsView::text_input`).
-const TEXT_FIELDS: [SettingField; 12] = [
+const TEXT_FIELDS: [SettingField; 15] = [
     SettingField::TreehouseExecutable,
     SettingField::TreehouseWorktreesRoot,
     SettingField::BranchTemplate,
@@ -336,10 +348,13 @@ const TEXT_FIELDS: [SettingField; 12] = [
     SettingField::SandboxWorkspace,
     SettingField::SandboxApiKey,
     SettingField::SandboxDefaultImage,
+    SettingField::SandboxGitName,
+    SettingField::SandboxGitEmail,
     SettingField::SandboxClaudeToken,
     SettingField::JourneysRelayCode,
     SettingField::JourneysMilestoneStates,
     SettingField::LifecycleRepoProfiles,
+    SettingField::PrReviewBots,
 ];
 
 /// Platform / model / effort dropdowns for one agent role's settings line.
@@ -441,6 +456,9 @@ pub struct SettingsView {
     repo_profiles_input: Entity<InputState>,
     /// Why the text in `repo_profiles_input` was not saved.
     repo_profiles_error: Option<String>,
+    pr_review_bots_input: Entity<InputState>,
+    /// Why the text in `pr_review_bots_input` was not saved.
+    pr_review_bots_error: Option<String>,
     branch_template_input: Entity<InputState>,
     /// Why the text in `branch_template_input` was not saved.
     branch_template_error: Option<String>,
@@ -448,6 +466,11 @@ pub struct SettingsView {
     /// not in the settings file; saved when leaving the field.
     sandbox_workspace_input: Entity<InputState>,
     sandbox_image_input: Entity<InputState>,
+    /// The git author a sandbox's commits carry: kept in the user's database
+    /// (`tod_store::git_identity`), saved when leaving the field.
+    git_name_input: Entity<InputState>,
+    git_email_input: Entity<InputState>,
+    fleet: Arc<tod_store::fleet::FleetStore>,
     sandbox_key_input: Entity<InputState>,
     sandbox_auth: tod_store::fleet::sandbox::AuthMode,
     /// Whether an API key is stored; `None` until the keyring has been read
@@ -495,6 +518,7 @@ pub struct SettingsView {
     _relay_code_subscription: Subscription,
     _milestone_states_subscription: Subscription,
     _repo_profiles_subscription: Subscription,
+    _pr_review_bots_subscription: Subscription,
     _branch_template_subscription: Subscription,
     _orchestrator_github_subscription: Subscription,
     _databases_subscription: Subscription,
@@ -502,7 +526,7 @@ pub struct SettingsView {
 }
 
 impl SettingsView {
-    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(window: &mut Window, cx: &mut Context<Self>, fleet: Arc<tod_store::fleet::FleetStore>) -> Self {
         let paths = TodPaths::discover().expect("failed to resolve tod paths");
         let presets_root = paths.data_root().to_path_buf();
         let settings = TodSettings::load(&paths).expect("failed to load tod settings");
@@ -528,6 +552,17 @@ impl SettingsView {
             InputState::new(window, cx)
                 .placeholder("Enter to edit · Not set up")
                 .default_value(sandbox_workspace)
+        });
+        let git_identity = fleet.read(|conn| tod_store::git_identity::get(conn)).ok().flatten();
+        let git_name_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Enter to edit · Not set")
+                .default_value(git_identity.as_ref().map(|i| i.name.clone()).unwrap_or_default())
+        });
+        let git_email_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Enter to edit · Not set")
+                .default_value(git_identity.map(|i| i.email).unwrap_or_default())
         });
         let sandbox_image_input = cx.new(|cx| {
             InputState::new(window, cx)
@@ -645,6 +680,16 @@ impl SettingsView {
                 this.apply_text_field(SettingField::LifecycleRepoProfiles, cx);
             }
         });
+        let pr_review_bots_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("greptile=4")
+                .default_value(PrReviewBotSettings::format_list(&settings.pr_readiness.bots))
+        });
+        let _pr_review_bots_subscription = cx.subscribe(&pr_review_bots_input, |this, _, event, cx| {
+            if matches!(event, InputEvent::Blur | InputEvent::PressEnter { .. }) {
+                this.apply_text_field(SettingField::PrReviewBots, cx);
+            }
+        });
         let branch_template_input = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder(format!("Enter to edit · Default: {DEFAULT_BRANCH_TEMPLATE}"))
@@ -711,6 +756,9 @@ impl SettingsView {
             treehouse_executable_input,
             sandbox_workspace_input,
             sandbox_image_input,
+            git_name_input,
+            git_email_input,
+            fleet,
             sandbox_key_input,
             sandbox_auth,
             sandbox_has_key: None,
@@ -723,6 +771,8 @@ impl SettingsView {
             milestone_states_input,
             repo_profiles_input,
             repo_profiles_error: None,
+            pr_review_bots_input,
+            pr_review_bots_error: None,
             branch_template_input,
             branch_template_error: None,
             agent_selects,
@@ -751,6 +801,7 @@ impl SettingsView {
             _relay_code_subscription,
             _milestone_states_subscription,
             _repo_profiles_subscription,
+            _pr_review_bots_subscription,
             _branch_template_subscription,
             _orchestrator_github_subscription,
             orchestrator_github_editor,
@@ -778,6 +829,30 @@ impl SettingsView {
         }
         self.settings.journeys.milestone_states = states;
         self.schedule_save("journeys.milestone_states", cx);
+        cx.notify();
+    }
+
+    /// Saves the review bots text, or says why it was not saved.
+    fn apply_pr_review_bots_input(&mut self, raw: String, cx: &mut Context<Self>) {
+        let parsed = PrReviewBotSettings::parse_list(&raw, &self.settings.pr_readiness.bots).and_then(|list| {
+            match list.iter().find(|b| tod_core::pr_readiness::builtin_bot(&b.name).is_none()) {
+                Some(unknown) => Err(format!(
+                    "\"{}\" is not a bot tod knows (greptile)",
+                    unknown.name
+                )),
+                None => Ok(list),
+            }
+        });
+        match parsed {
+            Ok(list) => {
+                self.pr_review_bots_error = None;
+                if self.settings.pr_readiness.bots != list {
+                    self.settings.pr_readiness.bots = list;
+                    self.schedule_save("pr_readiness.bots", cx);
+                }
+            }
+            Err(why) => self.pr_review_bots_error = Some(why),
+        }
         cx.notify();
     }
 
@@ -868,10 +943,13 @@ impl SettingsView {
                 SettingField::SandboxWorkspace => &self.sandbox_workspace_input,
                 SettingField::SandboxApiKey => &self.sandbox_key_input,
                 SettingField::SandboxDefaultImage => &self.sandbox_image_input,
+                SettingField::SandboxGitName => &self.git_name_input,
+                SettingField::SandboxGitEmail => &self.git_email_input,
                 SettingField::SandboxClaudeToken => &self.claude_token_input,
                 SettingField::JourneysRelayCode => &self.relay_code_input,
                 SettingField::JourneysMilestoneStates => &self.milestone_states_input,
                 SettingField::LifecycleRepoProfiles => &self.repo_profiles_input,
+                SettingField::PrReviewBots => &self.pr_review_bots_input,
                 _ => return None,
             }
             .clone(),
@@ -941,6 +1019,7 @@ impl SettingsView {
             SettingField::SandboxWorkspace | SettingField::SandboxDefaultImage => {
                 self.save_sandbox_account(cx)
             }
+            SettingField::SandboxGitName | SettingField::SandboxGitEmail => self.save_git_identity(cx),
             field => self.apply_text_field(field, cx),
         }
         cx.notify();
@@ -989,6 +1068,7 @@ impl SettingsView {
             }
             SettingField::JourneysMilestoneStates => self.apply_milestone_states_input(text, cx),
             SettingField::LifecycleRepoProfiles => self.apply_repo_profiles_input(text, cx),
+            SettingField::PrReviewBots => self.apply_pr_review_bots_input(text, cx),
             SettingField::BranchTemplate => self.apply_branch_template_input(text, cx),
             _ => {}
         }
@@ -1225,6 +1305,41 @@ impl SettingsView {
         cx.notify();
     }
 
+    /// Save the git name and email sandbox commits carry to the database.
+    /// Both are required: a bad value is shown, and the stored one stays.
+    fn save_git_identity(&mut self, cx: &mut Context<Self>) {
+        let name = self.git_name_input.read(cx).text().to_string();
+        let email = self.git_email_input.read(cx).text().to_string();
+        let stored = self.fleet.read(|conn| tod_store::git_identity::get(conn)).ok().flatten();
+        let identity = match tod_store::git_identity::GitIdentity::validated(&name, &email) {
+            Ok(identity) => identity,
+            Err(err) => {
+                // Unset and untouched: nothing to complain about yet.
+                if stored.is_some() || !(name.trim().is_empty() && email.trim().is_empty()) {
+                    self.sandbox_status = Some(Err(format!("Git identity not saved: {err:#}").into()));
+                }
+                cx.notify();
+                return;
+            }
+        };
+        if stored.as_ref() == Some(&identity) {
+            return;
+        }
+        let saved = self
+            .fleet
+            .enqueue(tod_store::fleet::FleetMutation::SetGitIdentity {
+                name: identity.name.clone(),
+                email: identity.email.clone(),
+            })
+            .map_err(anyhow::Error::from)
+            .and_then(|()| self.fleet.writer().flush().map_err(anyhow::Error::from));
+        self.sandbox_status = Some(match saved {
+            Ok(()) => Ok("Saved. Sandboxes made or replaced from now on commit as this author.".into()),
+            Err(err) => Err(format!("Could not save the git identity: {err:#}").into()),
+        });
+        cx.notify();
+    }
+
     fn activate_section(
         &mut self,
         section: SettingsSection,
@@ -1384,6 +1499,8 @@ impl SettingsView {
             | SettingField::SandboxWorkspace
             | SettingField::SandboxApiKey
             | SettingField::SandboxDefaultImage
+            | SettingField::SandboxGitName
+            | SettingField::SandboxGitEmail
             | SettingField::SandboxClaudeToken
             | SettingField::SandboxClaudeGetToken
             | SettingField::SandboxClaudeClear => {}
@@ -1412,6 +1529,7 @@ impl SettingsView {
             | SettingField::JourneysSendTest
             | SettingField::JourneysMilestoneStates
             | SettingField::LifecycleRepoProfiles
+            | SettingField::PrReviewBots
             | SettingField::BranchTemplate
             | SettingField::ClaudeAdapter => {}
             SettingField::SandboxTerminalPark => self.step_sandbox_idle(
@@ -2486,6 +2604,24 @@ impl SettingsView {
                     &self.sandbox_image_input,
                     theme,
                 ))
+                .child(text_input_row(
+                    cx,
+                    self,
+                    SettingField::SandboxGitName,
+                    "Git name",
+                    "The author name on commits made in your cloud sandboxes (`git config user.name`). It started as this machine's git config and is kept in your database, so a sandbox replaced while the app is closed still uses it.",
+                    &self.git_name_input,
+                    theme,
+                ))
+                .child(text_input_row(
+                    cx,
+                    self,
+                    SettingField::SandboxGitEmail,
+                    "Git email",
+                    "The author email on those commits (`git config user.email`).",
+                    &self.git_email_input,
+                    theme,
+                ))
                 .when_some(self.sandbox_status.clone(), |el, status| {
                     let (color, text) = match status {
                         Ok(text) => (theme.muted_foreground, text),
@@ -2682,6 +2818,18 @@ impl SettingsView {
                         None => "Comma-separated owner/repo=profile (also owner/* or *); the first match wins. release (default): a merged pull request waits for a published release naming it. merge: the repository publishes no releases, so merging is shipping.".to_string(),
                     },
                     &self.repo_profiles_input,
+                    theme,
+                ))
+                .child(text_input_row(
+                    cx,
+                    self,
+                    SettingField::PrReviewBots,
+                    "Review bots to wait for",
+                    match &self.pr_review_bots_error {
+                        Some(why) => format!("Not saved: {why}."),
+                        None => "Comma-separated name=minimum score (1 to 5), like greptile=4. In pr_draft and pr_review a pull request waits for the bot's review of its current head, and a score below the minimum is work for the PR agent. tod never asks the bot to review: that is your project's skill.".to_string(),
+                    },
+                    &self.pr_review_bots_input,
                     theme,
                 ))
                 .into_any_element(),

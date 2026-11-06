@@ -653,6 +653,7 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
     crate::waits::add_stay(conn)?;
     crate::lifecycle_config::add_delete_sandbox(conn)?;
     crate::lifecycle_config::add_agents(conn)?;
+    crate::lifecycle_config::add_checks(conn)?;
     crate::lifecycle_config::add_pr_draft_review(conn)?;
     crate::review::add_pr_columns(conn)?;
     // A cloud supervisor's heartbeat for a node (`crate::cloud_activity`):
@@ -665,6 +666,9 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
     // Machine-local lease bookkeeping: no sync, no journey trigger
     // (`crate::activity`).
     conn.execute_batch(crate::activity::CREATE_TABLE)?;
+    // The latest result of each gate check: machine-local, not journaled
+    // (`crate::check_runs`).
+    crate::check_runs::migrate(conn)?;
     // The user's deferrals of nodes: machine-local, not synced, journaled.
     conn.execute_batch(crate::deferrals::CREATE_TABLE)?;
     conn.execute_batch(&crate::journey_changes::deferrals_triggers_sql())?;
@@ -683,6 +687,12 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
     ensure_skill_group(conn)?;
     // `files_places.clone_url`: machine-local, no schema version.
     crate::fleet::repos::files_place::ensure_clone_url(conn)?;
+    // The git identity cloud sandboxes author commits as: seeded from this
+    // machine's git config when first made (`crate::git_identity`).
+    crate::git_identity::ensure(conn, crate::git_identity::read_local())?;
+    // The node's timeline of gate checks, command runs and phase changes:
+    // synced, not journaled (`crate::node_timeline`).
+    conn.execute_batch(crate::node_timeline::CREATE_TABLE)?;
     crate::sync::install(conn)?;
     // Idempotent and cheap — keeps the gate criteria catalog's wording in
     // sync with the source on every startup, not just the migration that

@@ -27,7 +27,8 @@ gpui_kit_assets::icon_assets!(
         GitPullRequestDraft,
         GitPullRequestClosed,
         GitMerge,
-        Trash
+        Trash,
+        MessageSquareDot
     ]
 );
 
@@ -93,6 +94,11 @@ mod tests {
         ] {
             assert!(serves(&icon.path()));
         }
+    }
+
+    #[test]
+    fn node_chat_new_icon_is_bundled() {
+        assert!(serves(&gpui_kit_assets::IconName::MessageSquareDot.path()));
     }
 
     #[test]

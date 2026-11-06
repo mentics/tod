@@ -517,7 +517,10 @@ pub fn stop_reason(outcome: &Outcome, budget: &Budget) -> Option<String> {
             | NeedsHuman::AgentFailed { .. }
             | NeedsHuman::NoProgress { .. }
             | NeedsHuman::Looping { .. }
-            | NeedsHuman::ReviewNotConverging { .. } => Some(reason.describe()),
+            | NeedsHuman::ReviewNotConverging { .. }
+            | NeedsHuman::CheckBroken { .. }
+            | NeedsHuman::ChecksNotConverging { .. }
+            | NeedsHuman::ChecksUnfixed { .. } => Some(reason.describe()),
         },
     }
 }

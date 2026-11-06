@@ -313,6 +313,13 @@ styles:
     padding-bottom: related
   chunk-children:
     padding-left: section
+  # A chunk body past 20 lines is clamped; the shade fades it out over its
+  # last lines and holds the "Show more" control.
+  chunk-fade:
+    position: bottom of the clamped body
+    height: 56px
+    padding-x: related
+    background: gradient from clear to the body's own background
   # An image attached to a message: in the input before it is sent, and in
   # the transcript after. Cropped to fill the square, never stretched.
   image-thumbnail:
@@ -427,14 +434,14 @@ styles:
     # observed since (the thing that should be looking is not): the diamond
     # in the failure color.
     color: node-failed-text
-  # The chat decorator sits at the trailing edge of a row, and only when
-  # there is something to show; it takes no column.
+  # The chat icon has a cell of its own right of the pull-request icon, always
+  # reserved, empty unless there is something to show.
   node-chat-working:
     # A spinner while the chat agent works: the one animated element.
     color: node-chat-text
   node-chat-new:
-    # A small dot once the chat finished or waits on the user and the row has
-    # not been seen since. Selecting the row clears it.
+    # A speech bubble with a dot once the chat replied or waits on the user and
+    # the row has not been seen since. Selecting the row clears it.
     color: node-chat-text
   node-rollup:
     # What a collapsed branch holds, in words at the row's trailing edge:

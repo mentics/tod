@@ -184,7 +184,7 @@ pub fn fetch_origin(repo: &Workdir) -> Result<()> {
 /// Where a new branch starts: `origin`'s default branch (`origin/HEAD`,
 /// else `origin/main` or `origin/master`) as of the last fetch. `None` for a
 /// repository without one, whose new branches start at HEAD.
-fn new_branch_base(repo: &Workdir) -> Option<String> {
+pub fn new_branch_base(repo: &Workdir) -> Option<String> {
     if let Ok(head) = run_git(
         repo,
         &["symbolic-ref", "--quiet", "--short", &format!("refs/remotes/{REMOTE}/HEAD")],

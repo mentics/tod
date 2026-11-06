@@ -41,6 +41,12 @@ pub const GH_TOKEN_PLACEHOLDER: &str = "placeholder-injected-by-proxy";
 /// sends no token of its own, through the proxy, trusting its CA.
 pub const GITHUB_AUTH_ENV: &str = "TOD_GITHUB_AUTH";
 pub const GITHUB_AUTH_PROXY: &str = "proxy";
+
+/// Set to `1` in a node's sandbox whose proxy adds credentials to requests
+/// for the hosts of the node's Environment secrets. A script that would
+/// otherwise insist on a key in its environment (`ddapi`) sends none and lets
+/// the proxy authenticate. Not tied to any one service.
+pub const PROXY_AUTH_ENV: &str = "PROXY_AUTH";
 /// Set to this in the orchestrator's process: its proxy holds one GitHub
 /// token per name ([`keyed_secrets_spec`]) and the client chooses one per
 /// repository by sending its placeholder ([`secret_placeholder`]).
@@ -222,6 +228,7 @@ pub fn agent_env(creds: &NodeCredentials, claude_via: ClaudeTokenVia) -> Vec<(St
     let mut env = Vec::new();
     if !credential_rules(creds, claude_via).is_empty() {
         env.push(("NODE_USE_ENV_PROXY".to_string(), "1".to_string()));
+        env.push((PROXY_AUTH_ENV.to_string(), "1".to_string()));
     }
     if github_token(creds).is_some() {
         env.push(("GH_TOKEN".to_string(), GH_TOKEN_PLACEHOLDER.to_string()));
@@ -246,7 +253,12 @@ pub fn credential_rules(creds: &NodeCredentials, claude_via: ClaudeTokenVia) -> 
         let basic = base64::engine::general_purpose::STANDARD.encode(format!("x-access-token:{token}"));
         rules.push(rule("github.com", "github_basic", "Basic ", basic));
     }
-    if let Some(key) = creds.linear_api_key.as_deref().filter(|k| !k.is_empty()) {
+    // An Environment entry for Linear's host is the user's own and wins over
+    // the app-wide key: two rules for one host would fight.
+    let linear_in_environment = creds.custom.iter().any(|c| c.hosts.iter().any(|h| h == "api.linear.app"));
+    if let Some(key) = creds.linear_api_key.as_deref().filter(|k| !k.is_empty())
+        && !linear_in_environment
+    {
         rules.push(rule("api.linear.app", "linear", "", key.to_string()));
     }
     if claude_via == ClaudeTokenVia::Proxy
@@ -404,6 +416,7 @@ pub fn node_env(spec: &NodeSandboxSpec, claude_placeholder: bool, github_via_pro
         ("GH_TOKEN", GH_TOKEN_PLACEHOLDER.to_string()),
         // Node's fetch ignores HTTP(S)_PROXY without it, and so gets nothing injected.
         ("NODE_USE_ENV_PROXY", "1".to_string()),
+        (PROXY_AUTH_ENV, "1".to_string()),
         ("TOD_SANDBOX", spec.name.to_string()),
         ("TOD_USER", spec.user.to_string()),
         ("TOD_NODE", spec.node.to_string()),
@@ -613,6 +626,8 @@ pub fn checkout_script(repo_url: &str, branch: &str, identity: &GitIdentity, all
          elif [ -d {forked_dir}/.git ]; then dir={forked_dir}; git -C \"$dir\" fetch --quiet --prune --no-recurse-submodules origin; \
          else {missing}; fi\n\
          cd \"$dir\"\n\
+         git config --global user.name {name}\n\
+         git config --global user.email {email}\n\
          git config user.name {name}\n\
          git config user.email {email}\n\
          if git show-ref --verify --quiet refs/remotes/origin/{br}; then \
@@ -1338,6 +1353,35 @@ mod tests {
     }
 
     #[test]
+    fn a_linear_environment_entry_replaces_the_app_wide_linear_rule() {
+        let rules_for = |creds: &NodeCredentials| credential_rules(creds, ClaudeTokenVia::Proxy);
+        let linear_rules = |rules: &[ProxyRule]| -> Vec<(String, String)> {
+            rules
+                .iter()
+                .filter(|r| r.destination == "api.linear.app")
+                .map(|r| (r.value.clone(), r.secret_value.clone()))
+                .collect()
+        };
+        // The app-wide key alone: its rule.
+        let app_wide = NodeCredentials { linear_api_key: Some("lin_app".into()), ..Default::default() };
+        assert_eq!(linear_rules(&rules_for(&app_wide)), [("{{SECRET:linear}}".to_string(), "lin_app".to_string())]);
+        // An Environment entry for the host: only that rule, never two for one host.
+        let with_entry = NodeCredentials {
+            custom: vec![CustomCredential {
+                name: "linear_api_key".into(),
+                hosts: vec!["api.linear.app".into()],
+                header: "Authorization".into(),
+                template: "{value}".into(),
+                secret_value: "lin_env".into(),
+            }],
+            ..app_wide
+        };
+        let rules = linear_rules(&rules_for(&with_entry));
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].1, "lin_env");
+    }
+
+    #[test]
     fn custom_credentials_become_proxy_rules_and_nothing_reaches_the_supervisor() {
         let creds = NodeCredentials {
             custom: vec![CustomCredential {
@@ -1385,6 +1429,10 @@ mod tests {
         let s = checkout_script("https://github.com/o/r.git", "feat/x", &me, true);
         assert!(s.contains(r"git config user.name 'Ada O'\''Neil'"), "{s}");
         assert!(s.contains("git config user.email ada@example.com"), "{s}");
+        // Global too: a submodule's own config does not inherit the checkout's,
+        // so its commits would otherwise carry whatever the image baked in.
+        assert!(s.contains(r"git config --global user.name 'Ada O'\''Neil'"), "{s}");
+        assert!(s.contains("git config --global user.email ada@example.com"), "{s}");
         assert!(s.contains("git config --system http.sslCAInfo \"$SSL_CERT_FILE\""));
         assert!(s.contains("git clone https://github.com/o/r.git /workspace/repo"));
         assert!(s.contains("refs/remotes/origin/feat/x"));

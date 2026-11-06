@@ -187,6 +187,8 @@ pub fn classify(mutation: &OutlineMutation) -> Option<(ActionKind, Entity, Uuid)
         | M::RestorePlanStep { .. }
         | M::SetExtraContent { .. }
         | M::SetLifecycle { .. }
+        | M::SetLifecycleByUser { .. }
+        | M::RestartLifecycleStay { .. }
         | M::ApplyGateResults { .. }
         | M::DeleteGeneratorConfig { .. }
         | M::CreateManagedNode { .. }
@@ -201,6 +203,7 @@ pub fn classify(mutation: &OutlineMutation) -> Option<(ActionKind, Entity, Uuid)
         | M::SetNodeEnvironment { .. }
         | M::SetNodeLifecycleConfig { .. }
         | M::SetNodeLifecycleAgents { .. }
+        | M::SetNodeLifecycleChecks { .. }
         | M::SetNodeLifecycleDeleteSandbox { .. }
         | M::SetNodeLifecyclePrDraftReview { .. }
         | M::SetNodeGroups { .. }

@@ -163,6 +163,15 @@ pub enum BudgetLimit {
 }
 
 /// What the user is needed for.
+/// What [`Autopilot::checks_round`] decided.
+enum ChecksStep {
+    /// Nothing configured, or everything passes: carry on with the phase.
+    Proceed,
+    /// Failing checks went to the fix agent: look at the phase again.
+    Fixed,
+    Stop(Outcome),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum NeedsHuman {
@@ -202,6 +211,15 @@ pub enum NeedsHuman {
     /// review still did not come back clean. `standing` is what it left:
     /// the findings it recorded, with their status.
     ReviewNotConverging { rounds: u32, standing: Vec<String> },
+    /// A phase's check could not run at all (command or directory missing, a
+    /// timeout, the sandbox failing): nothing an agent can fix.
+    CheckBroken { check: String, why: String },
+    /// The phase's checks went to the fix agent as many rounds as the review
+    /// round limit allows and still fail.
+    ChecksNotConverging { rounds: u32, failing: Vec<String> },
+    /// The fix agent was sent the failing checks and left the files as they
+    /// were, so sending them again would not help.
+    ChecksUnfixed { failing: Vec<String> },
 }
 
 impl NeedsHuman {
@@ -277,6 +295,20 @@ impl NeedsHuman {
                 } else {
                     format!(" (last review: {})", standing.join("; "))
                 }
+            ),
+            Self::CheckBroken { check, why } => format!(
+                "the check `{check}` could not run: {why}. Fix the command in the lifecycle config \
+                 (or what it needs), then run again"
+            ),
+            Self::ChecksNotConverging { rounds, failing } => format!(
+                "the checks went to the fix agent {rounds} times and still fail ({}). Look at their output \
+                 and the fix transcripts, then run again for a fresh set of rounds",
+                failing.join("; ")
+            ),
+            Self::ChecksUnfixed { failing } => format!(
+                "the fix agent was sent the failing checks ({}) and changed nothing, so sending them again \
+                 would not help. Look at what it said, or fix them yourself, then run again",
+                failing.join("; ")
             ),
             Self::Looping { what, times } => format!(
                 "the same problem has come back {times} times and the agent is going in circles: {what}. \
@@ -558,6 +590,17 @@ impl Autopilot {
                 // after them, and the same step again is not "no progress".
                 last = None;
             }
+            // The phase's configured checks run before anything else in it, on
+            // whatever changed since they last did; what fails goes to the fix
+            // agent as findings.
+            match self.checks_round(fleet, agent, hook, &lifecycle)? {
+                ChecksStep::Proceed => {}
+                ChecksStep::Fixed => {
+                    last = None;
+                    continue;
+                }
+                ChecksStep::Stop(outcome) => return self.finish(outcome),
+            }
             // `approved` waits for the merge and `merged` for the release.
             // `pr_draft` waits for a person to take the draft too, but only
             // after its agent has got it ready ([`Self::gate`]); so does
@@ -670,6 +713,68 @@ impl Autopilot {
         }
     }
 
+    /// Run the checks configured for `lifecycle` that are stale and see what
+    /// they found (`crate::checks`). All passing proceeds. A failing one goes
+    /// to the Fix protocol as an open finding, the same agent whatever the
+    /// phase (the `review` phase's and `pr_draft`'s included), until the review
+    /// round limit; a run that cannot happen at all stops the run for the user.
+    fn checks_round<A: AgentAccess + ?Sized, H: StepHook + ?Sized>(
+        &mut self,
+        fleet: &FleetStore,
+        agent: &mut A,
+        hook: &mut H,
+        lifecycle: &str,
+    ) -> Result<ChecksStep> {
+        let node = self.node;
+        let round = crate::checks::run_stale(fleet, node, lifecycle)?;
+        if round.runs.is_empty() {
+            return Ok(ChecksStep::Proceed);
+        }
+        if let Some(run) = round.broken().next() {
+            return Ok(ChecksStep::Stop(Outcome::NeedsHuman {
+                reason: NeedsHuman::CheckBroken { check: crate::checks::run_name(run).to_string(), why: run.output.clone() },
+            }));
+        }
+        if round.clear() {
+            if self.state.loops.check_rounds != 0 || self.state.loops.checks_sent.is_some() {
+                self.state.loops.check_rounds = 0;
+                self.state.loops.checks_sent = None;
+                self.save()?;
+            }
+            return Ok(ChecksStep::Proceed);
+        }
+        let failed: Vec<&tod_store::check_runs::CheckRun> = round.failed().collect();
+        let failing: Vec<String> = failed.iter().map(|r| crate::checks::run_name(r).to_string()).collect();
+        if self.state.loops.checks_sent.as_deref() == Some(round.fingerprint.as_str()) {
+            return Ok(ChecksStep::Stop(Outcome::NeedsHuman { reason: NeedsHuman::ChecksUnfixed { failing } }));
+        }
+        let limit = tod_store::TodSettings::load(&tod_store::TodPaths::at(&self.config.data_root))?
+            .lifecycle
+            .review_round_limit
+            .max(1);
+        if self.state.loops.check_rounds >= limit {
+            return Ok(ChecksStep::Stop(Outcome::NeedsHuman {
+                reason: NeedsHuman::ChecksNotConverging { rounds: self.state.loops.check_rounds, failing },
+            }));
+        }
+        self.state.loops.check_rounds += 1;
+        self.state.loops.checks_sent = Some(round.fingerprint.clone());
+        self.save()?;
+        // A phase agent's state has no fix protocol: its failing gate runs the
+        // phase agent again, and the gate's detail carries the check's output.
+        // The rounds and the unchanged-files guard above still bound it.
+        if crate::phase::has_phase_agent(lifecycle) {
+            return Ok(ChecksStep::Proceed);
+        }
+        crate::checks::record_findings(fleet, node, &failed)?;
+        if let Some(outcome) = self.converse(fleet, agent, hook, ProtocolKind::Fix, None)? {
+            return Ok(ChecksStep::Stop(outcome));
+        }
+        self.owe_groups(fleet, ProtocolKind::Fix, "fix", lifecycle)?;
+        self.record(fleet, "fix_checks", lifecycle, None)?;
+        Ok(ChecksStep::Fixed)
+    }
+
     /// Settle the gate and advance through it: the `GateCheck` step.
     fn gate<A: AgentAccess + ?Sized, H: StepHook + ?Sized>(
         &mut self,
@@ -710,6 +815,12 @@ impl Autopilot {
         }
         let branch_template = tod_store::TodSettings::load(&tod_store::TodPaths::at(&self.config.data_root))?.branch_template;
         let gate = settle_gate(fleet, self.node, &branch_template)?;
+        // Only configured checks failing (they ran just now, on files changed
+        // since the loop's own look): back to the loop, which sends them to the
+        // fix agent.
+        if !gate.clear() && gate.failing().all(|c| crate::checks::is_check_criterion(&c.criterion)) {
+            return Ok(None);
+        }
         if !gate.clear() {
             let failing: Vec<String> = gate
                 .failing()
@@ -990,6 +1101,13 @@ impl Autopilot {
                     self.clear_poll_waits(fleet)?;
                     hook.waiting(None, None);
                     if before_review {
+                        // The agent may just have pushed: the checks first,
+                        // so the review never reads code that fails them.
+                        match self.checks_round(fleet, agent, hook, "pr_draft")? {
+                            ChecksStep::Proceed => {}
+                            ChecksStep::Fixed => continue,
+                            ChecksStep::Stop(outcome) => return Ok(Some(outcome)),
+                        }
                         match self.own_review(fleet, agent, hook, feed.as_ref(), &live, &mut answered)? {
                             OwnReview::Again => continue,
                             OwnReview::Stop(outcome) => return Ok(Some(outcome)),

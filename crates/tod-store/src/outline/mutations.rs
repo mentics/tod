@@ -119,6 +119,11 @@ pub enum OutlineMutation {
         node_id: Uuid,
         agents: crate::lifecycle_config::Agents,
     },
+    /// The Lifecycle config capability's checks (commands the gate runs) by phase.
+    SetNodeLifecycleChecks {
+        node_id: Uuid,
+        checks: crate::lifecycle_config::Checks,
+    },
     /// The Lifecycle config capability's "delete the sandbox on the final
     /// phase" choice; `None` leaves it to an ancestor.
     SetNodeLifecycleDeleteSandbox {
@@ -320,6 +325,17 @@ pub enum OutlineMutation {
         node_id: Uuid,
         state: String,
     },
+    /// [`Self::SetLifecycle`] by the user's own choice (the task panel's
+    /// phase chip): the activity shows the change as theirs.
+    SetLifecycleByUser {
+        node_id: Uuid,
+        state: String,
+    },
+    /// Start a new stay in the node's current lifecycle state: the state is
+    /// run again as if just entered (`NodeRepo::restart_stay`).
+    RestartLifecycleStay {
+        node_id: Uuid,
+    },
     /// Persist per-criterion gate outcomes — from an agent's gate-check reply
     /// or a human's manual waive/override — and, when the check passed,
     /// advance the node's lifecycle in the same mutation.
@@ -484,6 +500,8 @@ impl OutlineMutation {
                 | OutlineMutation::UnlinkPlanStepObligation { .. }
                 | OutlineMutation::SetExtraContent { .. }
                 | OutlineMutation::SetLifecycle { .. }
+                | OutlineMutation::SetLifecycleByUser { .. }
+                | OutlineMutation::RestartLifecycleStay { .. }
                 | OutlineMutation::ApplyGateResults { .. }
                 | OutlineMutation::SetGeneratorConfig { .. }
                 | OutlineMutation::DeleteGeneratorConfig { .. }
@@ -647,6 +665,10 @@ impl OutlineMutation {
             OutlineMutation::SetNodeLifecycleAgents { node_id, agents } => {
                 require_capability(conn, *node_id, Capability::LifecycleConfig)?;
                 crate::lifecycle_config::set_agents(conn, *node_id, agents)?;
+            }
+            OutlineMutation::SetNodeLifecycleChecks { node_id, checks } => {
+                require_capability(conn, *node_id, Capability::LifecycleConfig)?;
+                crate::lifecycle_config::set_checks(conn, *node_id, checks)?;
             }
             OutlineMutation::SetNodeLifecycleDeleteSandbox { node_id, delete_sandbox } => {
                 require_capability(conn, *node_id, Capability::LifecycleConfig)?;
@@ -891,6 +913,12 @@ impl OutlineMutation {
             }
             OutlineMutation::SetLifecycle { node_id, state } => {
                 NodeRepo::new(conn).set_lifecycle(*node_id, state)?;
+            }
+            OutlineMutation::SetLifecycleByUser { node_id, state } => {
+                NodeRepo::new(conn).set_lifecycle_by(*node_id, state, true)?;
+            }
+            OutlineMutation::RestartLifecycleStay { node_id } => {
+                NodeRepo::new(conn).restart_stay(*node_id)?;
             }
             OutlineMutation::ApplyGateResults {
                 node_id,
@@ -1938,6 +1966,10 @@ fn copy_capabilities(conn: &Connection, source_id: Uuid, new_id: Uuid) -> Result
                 let agents = crate::lifecycle_config::agents(conn, source_id)?;
                 if !agents.is_empty() {
                     crate::lifecycle_config::set_agents(conn, new_id, &agents)?;
+                }
+                let checks = crate::lifecycle_config::checks(conn, source_id)?;
+                if !checks.is_empty() {
+                    crate::lifecycle_config::set_checks(conn, new_id, &checks)?;
                 }
             }
             Capability::Groups => {

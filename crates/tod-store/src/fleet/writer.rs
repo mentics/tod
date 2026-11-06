@@ -222,6 +222,12 @@ pub enum FleetMutation {
         owner: String,
         at: i64,
     },
+    /// A gate check ran (`crate::check_runs`).
+    RecordCheckRun(Box<crate::check_runs::CheckRun>),
+    /// Something to show in the node's activity (`crate::node_timeline`).
+    RecordTimeline(Box<crate::node_timeline::TimelineEntry>),
+    /// A gate check's result, left out when it reads as the last one did.
+    RecordGateTimeline(Box<crate::node_timeline::TimelineEntry>),
     /// The processing is still alive.
     ActivityBeat {
         id: uuid::Uuid,
@@ -235,6 +241,12 @@ pub enum FleetMutation {
     ActivityClearLost {
         node: uuid::Uuid,
         at: i64,
+    },
+    /// The user changed the git identity sandboxes author commits as
+    /// (`crate::git_identity`).
+    SetGitIdentity {
+        name: String,
+        email: String,
     },
     // --- Deferrals (immediate; `crate::deferrals`) ---
     /// The user took the node off their list, until `until` (ms) or until
@@ -317,10 +329,14 @@ impl FleetMutation {
                 | FleetMutation::CloudNodeMarkLost { .. }
                 | FleetMutation::ActivityStart { .. }
                 | FleetMutation::ActivityBeat { .. }
+                | FleetMutation::RecordCheckRun(_)
+                | FleetMutation::RecordTimeline(_)
+                | FleetMutation::RecordGateTimeline(_)
                 | FleetMutation::ActivityEnd { .. }
                 | FleetMutation::ActivityClearLost { .. }
                 | FleetMutation::DeferNode { .. }
                 | FleetMutation::UndeferNode { .. }
+                | FleetMutation::SetGitIdentity { .. }
                 | FleetMutation::RecordNodeProblem { .. }
                 | FleetMutation::ClearNodeProblem { .. }
         )
@@ -569,6 +585,15 @@ impl FleetMutation {
             FleetMutation::ActivityStart { id, node, kind, owner, at } => {
                 crate::activity::ActivityRepo::new(conn).start(*id, *node, kind, owner, *at)?;
             }
+            FleetMutation::RecordCheckRun(run) => {
+                crate::check_runs::CheckRunRepo::new(conn).record(run)?;
+            }
+            FleetMutation::RecordTimeline(entry) => {
+                crate::node_timeline::TimelineRepo::new(conn).record(entry)?;
+            }
+            FleetMutation::RecordGateTimeline(entry) => {
+                crate::node_timeline::TimelineRepo::new(conn).record_gate_if_changed(entry)?;
+            }
             FleetMutation::ActivityBeat { id, at } => {
                 // A lease cleared under its owner is the owner's to notice
                 // (`ActivityGuard`), not an error of the writer.
@@ -582,6 +607,9 @@ impl FleetMutation {
             }
             FleetMutation::DeferNode { node, until, at } => {
                 crate::deferrals::DeferralRepo::new(conn).set(*node, *until, *at)?;
+            }
+            FleetMutation::SetGitIdentity { name, email } => {
+                crate::git_identity::set(conn, &crate::git_identity::GitIdentity::validated(name, email)?)?;
             }
             FleetMutation::UndeferNode { node } => {
                 crate::deferrals::DeferralRepo::new(conn).clear(*node)?;

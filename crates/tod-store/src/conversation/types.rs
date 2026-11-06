@@ -469,6 +469,11 @@ impl Conversation {
             ProtocolKind::Phase => format!("{from} phase"),
             ProtocolKind::Evaluate => format!("evaluating {from}"),
             ProtocolKind::Review => format!("code review in {from}"),
+            ProtocolKind::Pr => match from {
+                "pr_draft" => "Pull request (draft)".to_string(),
+                "pr_review" => "Pull request (review)".to_string(),
+                _ => "Pull request".to_string(),
+            },
             _ => format!("{from} \u{2192} {to}"),
         })
     }

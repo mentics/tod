@@ -658,6 +658,14 @@ the task editor (`views::lifecycle_config_editor`) or with `tod-cli capabilities
 set <node> lifecycle-config` (`--skills`, `--model`, `--effort`). Edits are not
 recorded in a conversation's change set.
 
+**Checks** (`lifecycle_config::Check`, `tod_core::checks`, `node_lifecycle_config.checks`,
+latest results in `check_runs`; `doc/lifecycle/checks.md`) are per-phase commands (label +
+command) the app runs in the node's Files directory; exit 0 passes. Each is a gate
+criterion of its phase, and the autopilot's `checks_round` runs the stale ones (keyed by a
+fingerprint of the files, committed or not) and sends failures to the Fix protocol as
+findings (in a phase-agent state the failing gate re-runs the phase agent instead, with the output in its gate status), bounded by `review_round_limit`. A check may be scoped (`dir`, `changed`, `pattern`): it applies only when that part of the tree changed on the branch, and is otherwise `skipped`, not in the gate. `tod-cli` cannot set them: the app runs the
+command, so only the user configures one.
+
 **Groups** (`Capability::Groups`, `tod_store::groups`, table `node_groups`)
 has one setting, `by_lifecycle`. The node tree then shows the node's children
 under a header per lifecycle state, in lifecycle order, made only while a child
@@ -741,7 +749,11 @@ launch its own data root and port so this is unambiguous.
 `crates/tod-ui/src/unified/` is the multi-column workbench for supervising
 many nodes at once: `mod.rs` (`UnifiedView`, `ColumnModel`, column
 placement), `panels/` (`DetailsPanel`, `TaskPanel`, `ObligationsPanel`,
-`PlanPanel`, `FindingsPanel`, `SettingsPanel`, `TranscriptPanel`), and
+`PlanPanel`, `FindingsPanel`, `SettingsPanel`, `TranscriptPanel`, which the
+task panel's **Watch** opens as the node's **Activity**: its agent sessions,
+gate checks and rounds of the phase's commands, grouped by stay in a phase
+and collapsed until opened, a phase the user chose marked "(user)"; the gate
+checks and command rounds are `tod_store::node_timeline`, synced), and
 `chat_drawer.rs`. Column 1 is always the node tree; a panel opens in the
 first unpinned column from the one it was opened from, or a new column is
 appended, and the same panel already shown is focused instead —

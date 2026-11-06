@@ -37,8 +37,8 @@ use tod_store::fleet::{
 use tod_store::outline::types::EXTRA_CONTENT_METADATA;
 use tod_store::outline::{Capability, EXTRA_CONTENT_DETAILS, NodeSummary, OutlineMutation};
 use tod_store::{
-    AgentLaunchOptions, AgentPlatform, AgentRole, CredentialStore, efforts_for, models_for,
-    parse_platform, platform_storage, resolve_linear_api_key,
+    AgentLaunchOptions, AgentPlatform, AgentRole, efforts_for, models_for, parse_platform,
+    platform_storage,
 };
 
 
@@ -2398,11 +2398,14 @@ impl TaskEditView {
             tod_integration::load_presets(data_root).unwrap_or_else(|_| Vec::new());
 
         // Check credential status
-        let store = CredentialStore::from_data_root(self.fleet.paths().root());
-        self.linear_credential_status = match resolve_linear_api_key(&store) {
-            Some(_) => Some(Ok(())),
-            None => Some(Err("Linear API key not set".to_string())),
-        };
+        self.linear_credential_status = Some(match self.node_uuid() {
+            Some(node) => match tod_store::environment::linear_api_key_for(&self.fleet, node) {
+                Ok(Some(_)) => Ok(()),
+                Ok(None) => Err("Linear API key not set".to_string()),
+                Err(err) => Err(format!("Linear API key unreadable: {err:#}")),
+            },
+            None => Err("Linear API key not set".to_string()),
+        });
     }
 
     fn clear_linear_state(&mut self) {
@@ -2427,6 +2430,7 @@ impl TaskEditView {
 
         let data_root = self.paths.data_root().to_path_buf();
         let fleet = self.fleet.clone();
+        let node = self.node_uuid();
 
         self.linear_introspection_fetching = true;
         self.linear_introspection_error = None;
@@ -2436,10 +2440,12 @@ impl TaskEditView {
             let result: Result<(), String> = cx
                 .background_executor()
                 .spawn(async move {
-                    let store = CredentialStore::from_data_root(fleet.paths().root());
-                    let Some(api_key) = resolve_linear_api_key(&store) else {
+                    let Some(node) = node else {
                         return Err("Linear API key not configured".to_string());
                     };
+                    let api_key = tod_store::environment::linear_api_key_for(&fleet, node)
+                        .map_err(|err| format!("Linear API key unreadable: {err:#}"))?
+                        .ok_or_else(|| "Linear API key not configured".to_string())?;
 
                     use tod_integration::LinearDataSource;
                     let ds = LinearDataSource::with_data_root(data_root.clone());
@@ -3712,18 +3718,35 @@ impl TaskEditView {
             });
             return;
         };
-        let store = CredentialStore::from_data_root(self.fleet.paths().root());
-        let Some(api_key) = resolve_linear_api_key(&store) else {
-            let _ = self.fleet.enqueue(FleetMutation::UpdateTaskTicket {
-                id,
-                ticket: Some(ticket.clone()),
-            });
-            self.pending_toast = Some(
-                "Linear API key not configured — linked ticket only; description not imported"
-                    .into(),
-            );
-            cx.notify();
-            return;
+        let key = match self.node_uuid() {
+            Some(node) => tod_store::environment::linear_api_key_for(&self.fleet, node),
+            None => Ok(None),
+        };
+        let api_key = match key {
+            Ok(Some(key)) => key,
+            Ok(None) => {
+                let _ = self.fleet.enqueue(FleetMutation::UpdateTaskTicket {
+                    id,
+                    ticket: Some(ticket.clone()),
+                });
+                self.pending_toast = Some(
+                    "Linear API key not configured — linked ticket only; description not imported"
+                        .into(),
+                );
+                cx.notify();
+                return;
+            }
+            Err(err) => {
+                let _ = self.fleet.enqueue(FleetMutation::UpdateTaskTicket {
+                    id,
+                    ticket: Some(ticket.clone()),
+                });
+                self.pending_toast = Some(format!(
+                    "Linear API key unreadable ({err:#}) — linked ticket only; description not imported"
+                ));
+                cx.notify();
+                return;
+            }
         };
         self.linear_fetch_generation = self.linear_fetch_generation.wrapping_add(1);
         let generation = self.linear_fetch_generation;
@@ -6490,8 +6513,7 @@ impl TaskEditView {
         // Check credential status
         let credential_status = if let Some(data_source_type) = &self.generator_data_source_type {
             if data_source_type == tod_core::generator::DATA_SOURCE_LINEAR {
-                let store = CredentialStore::from_data_root(self.fleet.paths().root());
-                if resolve_linear_api_key(&store).is_some() {
+                if matches!(self.linear_credential_status, Some(Ok(()))) {
                     "Linear API key configured".to_string()
                 } else {
                     "Linear API key not configured".to_string()

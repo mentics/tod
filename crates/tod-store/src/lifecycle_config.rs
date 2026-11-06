@@ -28,7 +28,8 @@ CREATE TABLE IF NOT EXISTS node_lifecycle_config (
     updated_at  INTEGER NOT NULL,
     delete_sandbox INTEGER,
     agents      TEXT NOT NULL DEFAULT '{}',
-    pr_draft_review INTEGER
+    pr_draft_review INTEGER,
+    checks      TEXT NOT NULL DEFAULT '{}'
 );";
 
 /// The `pr_draft_review` column (idempotent, no schema bump, like `agents`):
@@ -39,6 +40,18 @@ pub fn add_pr_draft_review(conn: &Connection) -> Result<()> {
         .exists([])?;
     if !has {
         conn.execute_batch("ALTER TABLE node_lifecycle_config ADD COLUMN pr_draft_review INTEGER")?;
+    }
+    Ok(())
+}
+
+/// The `checks` column (idempotent, no schema bump): the commands each phase's
+/// gate runs, by phase, as JSON.
+pub fn add_checks(conn: &Connection) -> Result<()> {
+    let has = conn
+        .prepare("SELECT 1 FROM pragma_table_info('node_lifecycle_config') WHERE name = 'checks'")?
+        .exists([])?;
+    if !has {
+        conn.execute_batch("ALTER TABLE node_lifecycle_config ADD COLUMN checks TEXT NOT NULL DEFAULT '{}'")?;
     }
     Ok(())
 }
@@ -318,6 +331,171 @@ pub fn resolve_agent(conn: &Connection, node_id: Uuid, phase: &str) -> Result<Re
     Ok(out)
 }
 
+/// One command a phase's gate runs (type checking, lint, and so on): it
+/// passes when it exits 0, and fails otherwise, with its output as the finding.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Check {
+    /// What messages call it ("pyright"); the command itself when blank.
+    #[serde(default)]
+    pub label: String,
+    /// Run by the shell in `dir`.
+    pub command: String,
+    /// Where it runs, relative to the node's Files directory (`flagship`);
+    /// blank for the directory itself.
+    #[serde(default)]
+    pub dir: String,
+    /// The path whose changes make the check apply (relative to the Files
+    /// directory); blank means `dir`. With neither this, `dir` nor a
+    /// `pattern`, the check applies always. `.` is the whole tree.
+    #[serde(default)]
+    pub changed: String,
+    /// Space-separated globs (`*.py`) a changed file must match, matched
+    /// against its path under `dir`; blank matches any. The matching files are
+    /// exported to the command as `TOD_CHANGED_FILES`, one per line.
+    #[serde(default)]
+    pub pattern: String,
+}
+
+impl Check {
+    /// The name shown for the check: its label, else its command.
+    pub fn name(&self) -> &str {
+        let label = self.label.trim();
+        if label.is_empty() { self.command.trim() } else { label }
+    }
+
+    /// [`Self::name`], with the directory when there is one, since the same
+    /// label may be configured for several repositories.
+    pub fn display(&self) -> String {
+        display_name(&self.label, &self.command, &self.dir)
+    }
+
+    /// The path whose changes make this check apply: `changed`, else `dir`,
+    /// else `.` (the whole tree).
+    pub fn scope(&self) -> &str {
+        let changed = self.changed.trim();
+        let dir = self.dir.trim();
+        if !changed.is_empty() {
+            changed
+        } else if !dir.is_empty() {
+            dir
+        } else {
+            "."
+        }
+    }
+
+    /// Whether the check applies only when something changed: it has a scope
+    /// of its own or a pattern. Otherwise it applies always.
+    pub fn is_scoped(&self) -> bool {
+        self.scope() != "." || !self.pattern.trim().is_empty()
+    }
+}
+
+/// A check's name in messages: its label, else its command, then ` in <dir>`.
+pub fn display_name(label: &str, command: &str, dir: &str) -> String {
+    let label = label.trim();
+    let name = if label.is_empty() { command.trim() } else { label };
+    let dir = dir.trim();
+    if dir.is_empty() { name.to_string() } else { format!("{name} in {dir}") }
+}
+
+/// A relative path as `set_checks` keeps it: no `./`, no trailing `/`, `.` or
+/// blank for the root; absolute paths and `..` are refused (a check stays
+/// inside the node's files).
+pub fn clean_rel_path(what: &str, raw: &str) -> Result<String> {
+    let text = raw.trim().replace('\\', "/");
+    let mut parts = Vec::new();
+    for part in text.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => bail!("{what} {raw:?} leaves the node's files"),
+            other => parts.push(other),
+        }
+    }
+    if text.starts_with('/') {
+        bail!("{what} {raw:?} must be relative to the node's files");
+    }
+    Ok(parts.join("/"))
+}
+
+/// Checks by phase key, as stored on one node.
+pub type Checks = BTreeMap<String, Vec<Check>>;
+
+/// The checks for one phase after inheritance, and the node they came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedChecks {
+    pub checks: Vec<Check>,
+    pub source_node: Uuid,
+    pub inherited: bool,
+}
+
+/// The checks defined on `node_id` itself, by phase.
+pub fn checks(conn: &Connection, node_id: Uuid) -> Result<Checks> {
+    let has = conn
+        .prepare("SELECT 1 FROM pragma_table_info('node_lifecycle_config') WHERE name = 'checks'")?
+        .exists([])?;
+    if !has {
+        return Ok(Checks::new());
+    }
+    let raw: Option<String> = conn
+        .query_row(
+            "SELECT checks FROM node_lifecycle_config WHERE node_id = ?1",
+            params![uuid_to_blob(node_id)],
+            |row| row.get(0),
+        )
+        .optional()?;
+    match raw {
+        Some(s) => serde_json::from_str(&s).map_err(|err| anyhow::anyhow!("the stored checks of {node_id} are not readable: {err}")),
+        None => Ok(Checks::new()),
+    }
+}
+
+/// Replace the checks by phase on `node_id`. Rejects an unknown phase and a
+/// blank command; trims, and keeps an explicit empty list (it stops an
+/// ancestor's checks applying below, as an empty skill list does).
+pub fn set_checks(conn: &Connection, node_id: Uuid, config: &Checks) -> Result<()> {
+    let mut clean = Checks::new();
+    for (phase, list) in config {
+        if !is_phase(phase) {
+            bail!("{phase} is not a lifecycle phase ({})", PHASES.join(", "));
+        }
+        let mut out = Vec::new();
+        for check in list {
+            let command = check.command.trim();
+            if command.is_empty() {
+                bail!("{phase}: a check has no command (label {:?})", check.label.trim());
+            }
+            let dir = clean_rel_path("a check's directory", &check.dir)?;
+            let changed = clean_rel_path("a check's changed path", &check.changed)?;
+            out.push(Check {
+                label: check.label.trim().to_string(),
+                command: command.to_string(),
+                dir,
+                changed,
+                pattern: check.pattern.split_whitespace().collect::<Vec<_>>().join(" "),
+            });
+        }
+        clean.insert(phase.clone(), out);
+    }
+    conn.execute(
+        "INSERT INTO node_lifecycle_config (node_id, skills, updated_at, checks) VALUES (?1, '{}', ?2, ?3)
+         ON CONFLICT(node_id) DO UPDATE SET checks = excluded.checks, updated_at = excluded.updated_at",
+        params![uuid_to_blob(node_id), now_ms(), serde_json::to_string(&clean)?],
+    )?;
+    Ok(())
+}
+
+/// The checks for `phase` on `node_id`: the nearest node, from itself up,
+/// that lists the phase wins. `None` when no node does.
+pub fn resolve_checks(conn: &Connection, node_id: Uuid, phase: &str) -> Result<Option<ResolvedChecks>> {
+    for id in crate::outline::ancestor_chain(conn, node_id)?.into_iter().rev() {
+        if let Some(list) = checks(conn, id)?.remove(phase) {
+            return Ok(Some(ResolvedChecks { checks: list, source_node: id, inherited: id != node_id }));
+        }
+    }
+    Ok(None)
+}
+
 /// Whether the node's sandbox is deleted when it enters [`FINAL_PHASE`], and
 /// the node the answer came from: the nearest node, from itself up, that
 /// states it; on by default when none does.
@@ -484,5 +662,37 @@ mod tests {
         assert!(set_skills(&conn, Uuid::new_v4(), &bad).is_err());
         bad.insert("pr_draft".into(), v(&["a", ";"]));
         assert!(set_skills(&conn, Uuid::new_v4(), &bad).is_err());
+    }
+}
+
+#[cfg(test)]
+mod scope_tests {
+    use super::*;
+
+    #[test]
+    fn paths_are_kept_relative_and_inside_the_files() {
+        assert_eq!(clean_rel_path("p", " ./flagship/ ").unwrap(), "flagship");
+        assert_eq!(clean_rel_path("p", ".").unwrap(), "");
+        assert_eq!(clean_rel_path("p", "a//b/./c").unwrap(), "a/b/c");
+        assert!(clean_rel_path("p", "../x").is_err());
+        assert!(clean_rel_path("p", "a/../../x").is_err());
+        assert!(clean_rel_path("p", "/etc").is_err());
+    }
+
+    #[test]
+    fn a_checks_scope_is_changed_else_dir_else_everything() {
+        let c = |dir: &str, changed: &str, pattern: &str| Check {
+            command: "x".into(),
+            dir: dir.into(),
+            changed: changed.into(),
+            pattern: pattern.into(),
+            ..Check::default()
+        };
+        assert_eq!(c("", "", "").scope(), ".");
+        assert!(!c("", "", "").is_scoped());
+        assert_eq!(c("kb", "", "").scope(), "kb");
+        assert_eq!(c("kb", "kb/api", "").scope(), "kb/api");
+        assert!(c("", "", "*.py").is_scoped());
+        assert_eq!(c("kb", "", "").display(), "x in kb");
     }
 }

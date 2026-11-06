@@ -3,6 +3,7 @@ use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::input::Input;
 use gpui_component::{ActiveTheme, StyledExt, v_flex};
 use tod_store::CredentialKind;
+use uuid::Uuid;
 
 use super::TaskListView;
 use super::from_ticket::PendingTicketImport;
@@ -12,13 +13,27 @@ use super::from_ticket::PendingTicketImport;
 /// says here what it was in the middle of doing.
 #[derive(Clone, Debug)]
 pub(super) enum PendingCredentialRequest {
-    /// Import a Linear ticket, from the compose field or an inline edit.
+    /// Import a Linear ticket, from the compose field or an inline edit. The
+    /// new node goes under `parent`, whose Environment (or an ancestor's)
+    /// holds the key.
     TicketImport {
         ticket: String,
         draft_node_id: Option<String>,
+        parent: Uuid,
     },
     /// Refresh a generator node whose data source declared the key.
-    GeneratorRefresh { node_id: uuid::Uuid },
+    GeneratorRefresh { node_id: Uuid },
+}
+
+impl PendingCredentialRequest {
+    /// The node whose Environment the key is looked up in: the picker offers
+    /// it and its ancestors.
+    fn context_node(&self) -> Uuid {
+        match self {
+            Self::TicketImport { parent, .. } => *parent,
+            Self::GeneratorRefresh { node_id } => *node_id,
+        }
+    }
 }
 
 impl TaskListView {
@@ -28,6 +43,33 @@ impl TaskListView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let context = request.context_node();
+        let chain = match self
+            .fleet
+            .read(|conn| tod_store::environment::ancestry(conn, context))
+        {
+            Ok(chain) => chain,
+            Err(err) => {
+                self.show_error(format!("Could not read the node's ancestry: {err:#}"), window, cx);
+                return;
+            }
+        };
+        self.credential_prompt_nodes = chain
+            .into_iter()
+            .map(|id| {
+                let title = self
+                    .fleet
+                    .get_node(&id.to_string())
+                    .ok()
+                    .flatten()
+                    .map(|node| node.title)
+                    .filter(|title| !title.trim().is_empty())
+                    .unwrap_or_else(|| "Untitled".to_string());
+                (id, title)
+            })
+            .collect();
+        self.credential_prompt_choice = 0;
+        self.credential_prompt_saving = false;
         self.credential_prompt_open = true;
         self.pending_credential_request = Some(request);
         self.credential_input.update(cx, |input, cx| {
@@ -43,6 +85,8 @@ impl TaskListView {
             return;
         }
         self.credential_prompt_open = false;
+        self.credential_prompt_saving = false;
+        self.credential_prompt_nodes.clear();
         self.pending_credential_request = None;
         self.credential_input.update(cx, |input, cx| {
             input.set_value("", window, cx);
@@ -53,6 +97,9 @@ impl TaskListView {
     }
 
     pub(super) fn submit_credential_prompt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.credential_prompt_saving {
+            return;
+        }
         let Some(request) = self.pending_credential_request.clone() else {
             return;
         };
@@ -70,54 +117,68 @@ impl TaskListView {
             });
             return;
         }
+        let Some((node, title)) = self.credential_prompt_nodes.get(self.credential_prompt_choice).cloned() else {
+            crate::ui::toast::error_toast(window, cx, "Pick the node to keep the Linear API key on");
+            return;
+        };
 
-        let store = tod_store::CredentialStore::from_data_root(&self.config_dir);
-        match store.set(CredentialKind::LinearApiKey, &secret) {
-            Ok(backend) => {
-                self.credential_prompt_open = false;
-                self.pending_credential_request = None;
-                self.credential_input.update(cx, |input, cx| {
-                    input.set_value("", window, cx);
-                });
-                self.status_line = match backend {
-                    tod_store::CredentialBackend::Keyring => {
-                        "Saved Linear API key to OS keyring".into()
+        // Storing the value goes to the OS keyring, and the entry (with the
+        // Environment capability, if the node lacks it) is written and waited
+        // for, so the resumed work finds it.
+        self.credential_prompt_saving = true;
+        cx.notify();
+        let (fleet, root) = (self.fleet.clone(), self.config_dir.clone());
+        let stored = secret.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    tod_store::environment::store_linear_api_key(&fleet, &root, node, &stored)
+                        .map_err(|err| format!("{err:#}"))
+                })
+                .await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.credential_prompt_saving = false;
+                match result {
+                    Ok(()) => {
+                        this.credential_prompt_open = false;
+                        this.credential_prompt_nodes.clear();
+                        this.pending_credential_request = None;
+                        this.credential_input.update(cx, |input, cx| {
+                            input.set_value("", window, cx);
+                        });
+                        this.status_line = format!("Saved Linear API key to {title}'s Environment");
+                        match request {
+                            PendingCredentialRequest::TicketImport { ticket, draft_node_id, parent } => {
+                                this.start_linear_ticket_fetch(
+                                    &secret,
+                                    &ticket,
+                                    draft_node_id.as_deref(),
+                                    parent,
+                                    window,
+                                    cx,
+                                );
+                            }
+                            PendingCredentialRequest::GeneratorRefresh { node_id } => {
+                                this.start_generator_refresh(node_id, window, cx);
+                            }
+                        }
                     }
-                    tod_store::CredentialBackend::EncryptedFile => {
-                        "Saved Linear API key to encrypted credentials file".into()
-                    }
-                    tod_store::CredentialBackend::Environment
-                    | tod_store::CredentialBackend::Proxy => "Saved Linear API key".into(),
-                };
-                match request {
-                    PendingCredentialRequest::TicketImport {
-                        ticket,
-                        draft_node_id,
-                    } => {
-                        self.start_linear_ticket_fetch(
-                            &secret,
-                            &ticket,
-                            draft_node_id.as_deref(),
+                    Err(err) => {
+                        crate::ui::toast::error_toast(
                             window,
                             cx,
+                            format!("Failed to store Linear API key: {err}"),
                         );
-                    }
-                    PendingCredentialRequest::GeneratorRefresh { node_id } => {
-                        self.start_generator_refresh(node_id, window, cx);
+                        this.credential_input.update(cx, |input, cx| {
+                            input.focus(window, cx);
+                        });
                     }
                 }
-            }
-            Err(err) => {
-                crate::ui::toast::error_toast(
-                    window,
-                    cx,
-                    format!("Failed to store Linear API key: {err}"),
-                );
-                self.credential_input.update(cx, |input, cx| {
-                    input.focus(window, cx);
-                });
-            }
-        }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     pub(super) fn render_credential_prompt_overlay(
@@ -126,6 +187,29 @@ impl TaskListView {
     ) -> impl gpui::IntoElement {
         let theme = cx.theme();
         let kind = CredentialKind::LinearApiKey;
+        let choice = self.credential_prompt_choice;
+        let saving = self.credential_prompt_saving;
+        let nearest = match &self.pending_credential_request {
+            Some(PendingCredentialRequest::GeneratorRefresh { .. }) => "this node",
+            _ => "the new node's parent",
+        };
+        let nodes = div().flex().flex_col().gap_1().children(
+            self.credential_prompt_nodes
+                .iter()
+                .enumerate()
+                .map(|(ix, (_, title))| {
+                    let label = match ix {
+                        0 => format!("{title} ({nearest})"),
+                        _ => title.clone(),
+                    };
+                    let button = Button::new(("credential-node", ix)).label(label).w_full();
+                    let button = if ix == choice { button.primary() } else { button.ghost() };
+                    button.on_click(cx.listener(move |this, _, _, cx| {
+                        this.credential_prompt_choice = ix;
+                        cx.notify();
+                    }))
+                }),
+        );
         div()
             .absolute()
             .inset_0()
@@ -156,9 +240,11 @@ impl TaskListView {
                                     .text_sm()
                                     .text_color(theme.muted_foreground)
                                     .child(
-                                        "Used to reach Linear on your behalf — importing tickets, and refreshing generator nodes. Stored in your OS keyring when available, otherwise an encrypted local credentials file.",
+                                        "Used to reach Linear on your behalf: importing tickets, refreshing generator nodes, and agents' own Linear calls. It is kept in a node's Environment, and every node below that node uses it.",
                                     ),
                             )
+                            .child(div().text_sm().font_semibold().child("Keep it on"))
+                            .child(nodes)
                             .child(Input::new(&self.credential_input).w_full())
                             .child(
                                 div()
@@ -176,6 +262,7 @@ impl TaskListView {
                                         Button::new("credential-save")
                                             .label("Save")
                                             .primary()
+                                            .loading(saving)
                                             .on_click(cx.listener(|this, _, window, cx| {
                                                 this.submit_credential_prompt(window, cx);
                                             })),
@@ -192,6 +279,7 @@ impl TaskListView {
         api_key: &str,
         ticket: &str,
         draft_node_id: Option<&str>,
+        parent: Uuid,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -223,6 +311,7 @@ impl TaskListView {
                     description: issue.description,
                     error: None,
                     draft_node_id: draft_node_id.clone(),
+                    parent,
                     auth_failure: false,
                 },
                 Err(err) => PendingTicketImport {
@@ -232,6 +321,7 @@ impl TaskListView {
                     description: None,
                     error: Some(err.to_string()),
                     draft_node_id: draft_node_id.clone(),
+                    parent,
                     auth_failure: matches!(
                         err,
                         tod_store::linear::LinearError::Api(ref msg)

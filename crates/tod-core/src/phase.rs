@@ -130,6 +130,9 @@ pub fn check_gate(conn: &Connection, node: Uuid, from: &str) -> Result<GateCheck
             detail,
         });
     }
+    // The commands configured for the phase come last, answered from their
+    // latest run (`crate::checks`).
+    criteria.extend(crate::checks::gate_criteria(conn, node, from, to)?);
     Ok(GateCheck {
         from: from.to_string(),
         to: Some(to.to_string()),
@@ -145,19 +148,53 @@ pub fn check_gate(conn: &Connection, node: Uuid, from: &str) -> Result<GateCheck
 pub fn settle_gate(fleet: &FleetStore, node: Uuid, branch_template: &str) -> Result<GateCheck> {
     // The check may call GitHub: while it runs the node is being worked on,
     // and says so (`tod_core::next_actor`).
-    tod_store::activity::with_lease(
+    let gate = tod_store::activity::with_lease(
         fleet,
         node,
         tod_store::activity::KIND_GATE_CHECK,
         &crate::next_actor::this_process(),
         || settle_gate_unleased(fleet, node, branch_template),
-    )?
+    )??;
+    record_gate_timeline(fleet, node, &gate)?;
+    Ok(gate)
+}
+
+/// Show the check in the node's activity. A check that reads as the last
+/// one did is left out (`TimelineRepo::record_gate_if_changed`).
+fn record_gate_timeline(fleet: &FleetStore, node: Uuid, gate: &GateCheck) -> Result<()> {
+    let Some(to) = &gate.to else { return Ok(()) };
+    let lines: Vec<tod_store::node_timeline::GateLine> = gate
+        .criteria
+        .iter()
+        .map(|c| tod_store::node_timeline::GateLine {
+            criterion: c.criterion.label.clone(),
+            outcome: c.outcome.to_string(),
+            detail: c.detail.clone(),
+        })
+        .collect();
+    let entry = tod_store::node_timeline::TimelineEntry::new(
+        node,
+        tod_store::node_timeline::KIND_GATE,
+        &gate.from,
+        format!("Gate check: {} \u{2192} {to}", gate.from),
+        !gate.clear(),
+        serde_json::to_string(&lines)?,
+    );
+    fleet.enqueue(tod_store::fleet::FleetMutation::RecordGateTimeline(Box::new(entry)))?;
+    fleet.writer().flush()?;
+    Ok(())
 }
 
 fn settle_gate_unleased(fleet: &FleetStore, node: Uuid, branch_template: &str) -> Result<GateCheck> {
     let from = crate::lifecycle::current_state(fleet, node)?;
     if from == "ready" {
         crate::gate::derived::generate_missing_branch(fleet, node, branch_template)?;
+    }
+    // The phase's configured checks run first, those whose files changed since
+    // their last run; a command that cannot run is an error, not a failure.
+    let round = crate::checks::run_stale(fleet, node, &from)?;
+    if let Some(run) = round.broken().next() {
+        anyhow::bail!("the check `{}` could not run: {}", crate::checks::run_name(run), run.output);
     }
     // Derived criteria may read GitHub: not under the projection lock, which
     // the UI thread reads through.
@@ -166,6 +203,8 @@ fn settle_gate_unleased(fleet: &FleetStore, node: Uuid, branch_template: &str) -
         .criteria
         .iter()
         .filter(|c| c.outcome != OUTCOME_WAIVED)
+        // A check is not a row of the catalog: nothing to save it against.
+        .filter(|c| !crate::checks::is_check_criterion(&c.criterion))
         .map(|c| {
             (
                 c.criterion.id,

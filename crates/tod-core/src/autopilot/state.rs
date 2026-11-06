@@ -111,6 +111,15 @@ pub struct LoopCounters {
     /// review, then fix; the run stops for the user at [`REVIEW_ROUND_LIMIT`].
     #[serde(default)]
     pub review_rounds: u32,
+    /// Times failing checks (`tod_core::checks`) went to the fix agent since
+    /// they last all passed; the run stops for the user at the review round
+    /// limit (`lifecycle.review_round_limit`).
+    #[serde(default)]
+    pub check_rounds: u32,
+    /// The fingerprint of the files the failing checks were last sent to the
+    /// fix agent for: failing again on the same files means it changed nothing.
+    #[serde(default)]
+    pub checks_sent: Option<String>,
     /// Times a failed verification sent the node back to be fixed.
     #[serde(default)]
     pub fix_cycles: u32,
@@ -201,6 +210,19 @@ impl AutopilotState {
     pub fn request_fresh_session(data_root: &Path, node: Uuid) -> Result<()> {
         let mut state = Self::load(data_root, node)?;
         state.fresh_session = true;
+        state.save(data_root, node)
+    }
+
+    /// Ask that the next run of `node` redo its state from the top, as if it
+    /// had just entered it: a new session, and none of the earlier run's
+    /// conversation, owed skill groups or loop counts carried over.
+    pub fn request_rerun_phase(data_root: &Path, node: Uuid) -> Result<()> {
+        let mut state = Self::load(data_root, node)?;
+        state.fresh_session = true;
+        state.current = None;
+        state.pending_groups = None;
+        state.loops.clear();
+        state.outcome = None;
         state.save(data_root, node)
     }
 

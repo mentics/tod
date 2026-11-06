@@ -80,24 +80,30 @@ pub fn reviews_this_stay(conn: &Connection, node: Uuid) -> Result<u32> {
         .count() as u32)
 }
 
-/// The findings recorded by the reviews run in `pr_draft` in this stay, any
-/// group's, oldest first.
+/// The findings of tod's own reviews in `pr_draft`, oldest first: every one
+/// recorded in this stay, and any still open from an earlier stay (a rerun
+/// or a move back starts a new stay, but a finding nobody answered is still
+/// owed a post and a fix). Only the stay's own reviews say the head was
+/// reviewed ([`latest_review`], [`round_clean`]).
 pub fn own_findings(conn: &Connection, node: Uuid) -> Result<Vec<ReviewFinding>> {
     let since = PhaseRepo::new(conn).stay_started_at(node)?;
     let conversations = ConversationRepo::new(conn);
-    let mut own = BTreeMap::new();
+    // Per conversation: (a review run in `pr_draft`, run in this stay).
+    let mut own: BTreeMap<Uuid, (bool, bool)> = BTreeMap::new();
     let mut out = Vec::new();
     for finding in ReviewRepo::new(conn).list_for_node(node)? {
         let Some(id) = finding.conversation_id else { continue };
-        let mine = match own.get(&id) {
-            Some(mine) => *mine,
+        let (ever, this_stay) = match own.get(&id) {
+            Some(known) => *known,
             None => {
-                let mine = conversations.get(id)?.is_some_and(|c| is_own(&c, since));
-                own.insert(id, mine);
-                mine
+                let known = conversations
+                    .get(id)?
+                    .map_or((false, false), |c| (is_own(&c, None), is_own(&c, since)));
+                own.insert(id, known);
+                known
             }
         };
-        if mine {
+        if this_stay || (ever && finding.is_open()) {
             out.push(finding);
         }
     }
