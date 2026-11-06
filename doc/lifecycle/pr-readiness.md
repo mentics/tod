@@ -181,11 +181,32 @@ node whose lifecycle config has **Include review steps** on for `pr_draft`
 (`lifecycle_config::resolve_pr_draft_review`, inherited like the rest of the
 config, off by default; `tod-cli capabilities set <node> lifecycle-config
 --pr-draft-review on`) runs it once nothing but a person is left on the pull
-request (`tod_core::pr_draft_review`, `Autopilot::own_review`):
+request (`tod_core::pr_draft_review`, `Autopilot::own_review`), and it
+reviews every change the PR agent makes for feedback before that change is
+pushed (`Autopilot::pr_change_reviewed`), so a person is troubled again only
+with a change tod's review has cleared:
+
+- **Change, review, then push.** A round of work is two turns of the PR
+  agent in the stay's conversation. First it brings the branch up to date,
+  fixes what the feedback needs, runs the tests and commits, without pushing
+  or answering (`pr::change_message`). If the branch's change against its
+  base then differs from before (`pr_draft_review::branch_change`: the
+  `-U0` diff from the merge base of `origin/<base>` and `HEAD`, without hunk
+  positions, so merging the base in alone does not count), the Review → Fix
+  → Review loop of `review` runs on the local head (`Autopilot::review_change`,
+  same `lifecycle.review_round_limit` and `ReviewNotConverging`), and the
+  clean review records the local `HEAD` as the head it reviewed. A merge
+  alone carries a clean review of the previous head over. Then the agent
+  pushes and answers each thread (`pr::push_message`); `owed` finds the
+  pushed head already reviewed. Where the round is is saved
+  (`AutopilotState::pr_change`), and a git failure stops the run.
+
+The steps below are for a head that reaches the pull request without that
+loop (the stay's first turn, or a push from outside):
 
 - **Review.** The Review protocol, with the `review` phase's skills in every
   group, on the current head. Its opening (`REVIEW_ON_PR_SESSION`,
-  `surface/review-on-pr`) says it is reviewing the pull request; it records
+  `surface/review-on-pr`) says it is reviewing the branch's local head; it records
   findings through `tod-cli review` as in `review` and never posts itself.
   The app records the heads it reviewed on the review's report (`pr_heads`).
 - **Post.** The app posts the findings as one review: on a changed line,

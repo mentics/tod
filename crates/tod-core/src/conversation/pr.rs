@@ -285,12 +285,49 @@ Your reply, when you stop, is at most a sentence or two, or nothing.";
 
 /// What the agent is sent for a turn: the work, then how to go about it.
 pub fn work_message(live: &[crate::pr_readiness::LivePr]) -> String {
+    render_work(live, WORK_GUIDANCE)
+}
+
+fn render_work(live: &[crate::pr_readiness::LivePr], guidance: &str) -> String {
     let mut out = String::new();
     for p in live.iter().filter(|p| !p.assessment.work().is_empty()) {
         out.push_str(&crate::pr_readiness::render_work(&p.pr.url, &p.assessment));
     }
-    out.push_str(WORK_GUIDANCE);
+    out.push_str(guidance);
     out
+}
+
+/// How to go about the work when tod reviews the change before it is pushed
+/// (`pr_draft` with its review steps on): change and commit, nothing more.
+const CHANGE_GUIDANCE: &str = "
+Do it now, in order: bring the branch up to date with its base, fix what the feedback needs, run the tests, and commit. Then stop: do not push, and do not answer any thread yet. tod reviews your commits first, and once that review is clean you will be told to push and answer. Apply this phase's skills, given at the start of this session, throughout.
+
+Stay within what this node set out to do. Fix a problem this change introduces. A problem that was already there, or one whose fix would enlarge the scope, you leave alone now and reject, giving the reason, when you are told to answer. A thread you cannot decide goes to the user with `tod-cli decisions ask`.
+
+Your reply, when you stop, is at most a sentence or two, or nothing.";
+
+/// The first of the two turns the agent takes on feedback in `pr_draft`
+/// with the review steps on: the work, and to commit it without pushing
+/// (`crate::pr_draft_review`).
+pub fn change_message(live: &[crate::pr_readiness::LivePr]) -> String {
+    render_work(live, CHANGE_GUIDANCE)
+}
+
+/// The second of those turns, once tod's review of the commits is clean
+/// (`reviewed`), or when the first changed nothing of the branch's own
+/// change and there was nothing to review.
+pub fn push_message(reviewed: bool) -> String {
+    let lead = if reviewed {
+        "tod reviewed your commits and its review is clean (any fixes it needed are committed on the branch)."
+    } else {
+        "Your commits leave the branch's own change as it was, so there was nothing for tod to review."
+    };
+    format!(
+        "{lead} Now push the branch, then answer each open review thread with `tod-cli pr threads answer` \
+         (which posts your reply and resolves it): say what you changed for it, or why you rejected it. \
+         Make no other change. A thread you cannot decide goes to the user with `tod-cli decisions ask`.\n\n\
+         Your reply, when you stop, is at most a sentence or two, or nothing."
+    )
 }
 
 /// Why the babysitter must hand back rather than go on: a thread answered

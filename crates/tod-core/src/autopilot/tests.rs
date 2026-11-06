@@ -42,7 +42,14 @@ struct FakeAgent {
     /// Every fix turn first writes this file (its path and content): the
     /// change that makes a configured check pass.
     fix_writes: Option<(PathBuf, String)>,
+    /// Every node turn, in order: its protocol and what it was sent.
+    log: Arc<std::sync::Mutex<Vec<(ProtocolKind, String)>>>,
+    /// Called with what a pull request turn was sent, before the mock plays
+    /// it: what the agent does to the checkout and on GitHub.
+    pr_hook: Option<PrHook>,
 }
+
+type PrHook = Arc<dyn Fn(&str) + Send + Sync>;
 
 type VerifyScript = Arc<dyn Fn(usize, &[Uuid]) -> Vec<Uuid> + Send + Sync>;
 
@@ -59,6 +66,8 @@ impl FakeAgent {
             phase_churn: false,
             review_never_clean: false,
             fix_writes: None,
+            log: Default::default(),
+            pr_hook: None,
         }
     }
 
@@ -128,6 +137,20 @@ impl FakeAgent {
                 fleet: &self.fleet,
                 actor: env(ACTOR_ENV).unwrap_or_else(|| ACTOR_USER.to_string()),
             };
+            let kind = self.fleet.read(|conn| {
+                Ok(tod_store::conversation::ConversationRepo::new(conn)
+                    .get(conversation.parse()?)?
+                    .map(|c| c.protocol))
+            })?;
+            if let Some(kind) = kind {
+                let sent = turn.prompt_blocks().join("\n");
+                if kind == ProtocolKind::Pr
+                    && let Some(hook) = &self.pr_hook
+                {
+                    hook(&sent);
+                }
+                self.log.lock().unwrap().push((kind, sent));
+            }
             if let Some(script) = &self.verify_script {
                 let protocol = self.fleet.read(|conn| {
                     Ok(tod_store::conversation::ConversationRepo::new(conn)
@@ -2391,6 +2414,7 @@ impl crate::pr_readiness::PrFeed for OwnReviewFeed {
                 behind_by: Some(0),
                 checks: Some("success".into()),
                 head_sha: Some("abcdef1".into()),
+                base_ref: Some("main".into()),
                 head_committed_at: Some("2020-01-01T00:00:00Z".into()),
                 draft: true,
                 open: true,
@@ -2505,6 +2529,8 @@ fn a_finding_left_open_by_an_earlier_stay_is_still_owed_after_the_phase_is_rerun
     let feed = OwnReviewFeed::new(false);
     crate::pr_readiness::set_feed_override(Some(feed.clone()));
     with_pr_draft_review(&fx);
+    // The babysitter reviews the agent's commits before a push, which reads the checkout.
+    git_workspace(&fx);
     linked_to_prs(&fx, "pr_draft", &["https://github.com/acme/app/pull/42"]);
     let mut agent = FakeAgent::new(&fx.fleet);
     agent.review_never_clean = true;
@@ -2624,4 +2650,329 @@ fn checks_in_a_phase_are_part_of_its_gate() {
     let failing: Vec<_> = gate.failing().map(|c| (c.criterion.label.clone(), c.detail.clone())).collect();
     assert!(failing.iter().any(|(label, detail)| label == "Check: never passes" && detail.starts_with("failed")), "{failing:?}");
     assert!(!gate.clear());
+}
+
+/// `git args…` in `dir`, which must succeed; its trimmed stdout.
+fn git_in(dir: &std::path::Path, args: &[&str]) -> String {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["-c", "user.name=Test", "-c", "user.email=test@example.com", "-c", "commit.gpgsign=false"])
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// Makes the fixture's workspace a checkout of the node's branch `task`,
+/// one commit ahead of its base `main` (as `origin/main`), and returns it.
+fn git_workspace(fx: &Fixture) -> PathBuf {
+    let dir = fx.root.join("workspace");
+    git_in(&dir, &["init", "-q", "-b", "main"]);
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::write(dir.join("src/lib.rs"), "fn a() {}\n").unwrap();
+    git_in(&dir, &["add", "-A"]);
+    git_in(&dir, &["commit", "-q", "-m", "base"]);
+    git_in(&dir, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+    git_in(&dir, &["checkout", "-q", "-b", "task"]);
+    std::fs::write(dir.join("src/lib.rs"), "fn a() {}\nfn b() {}\n").unwrap();
+    git_in(&dir, &["commit", "-q", "-am", "the change"]);
+    dir
+}
+
+/// A draft pull request on the workspace's branch: its head is what was last
+/// pushed ([`Self::push`]), it has the open review threads in `threads`, and
+/// what tod's own review posts becomes open threads. With `cached`, it is
+/// read through `pr_readiness`'s snapshot cache, as GitHub is.
+struct BranchFeed {
+    pushed: std::sync::Mutex<String>,
+    threads: std::sync::Mutex<Vec<tod_store::github::ReviewThread>>,
+    posts: std::sync::atomic::AtomicUsize,
+    cached: bool,
+}
+
+impl BranchFeed {
+    fn new(dir: &std::path::Path, threads: Vec<tod_store::github::ReviewThread>, cached: bool) -> Arc<Self> {
+        Arc::new(Self {
+            pushed: std::sync::Mutex::new(git_in(dir, &["rev-parse", "HEAD"])),
+            threads: std::sync::Mutex::new(threads),
+            posts: Default::default(),
+            cached,
+        })
+    }
+
+    /// The agent pushed the checkout and answered every thread.
+    fn push(&self, dir: &std::path::Path) {
+        *self.pushed.lock().unwrap() = git_in(dir, &["rev-parse", "HEAD"]);
+        for thread in self.threads.lock().unwrap().iter_mut() {
+            thread.resolved = true;
+        }
+    }
+
+    fn read(&self) -> tod_store::github::PrSnapshot {
+        use tod_store::github::{PrSnapshot, PrStatus};
+        PrSnapshot {
+            status: PrStatus {
+                mergeable: Some(true),
+                mergeable_state: Some("blocked".into()),
+                behind_by: Some(0),
+                checks: Some("success".into()),
+                head_sha: Some(self.pushed.lock().unwrap().clone()),
+                head_committed_at: Some("2020-01-01T00:00:00Z".into()),
+                draft: true,
+                open: true,
+                base_ref: Some("main".into()),
+                ..Default::default()
+            },
+            threads: self.threads.lock().unwrap().clone(),
+            comments: vec![],
+            reviews: vec![],
+        }
+    }
+}
+
+impl crate::pr_readiness::PrFeed for BranchFeed {
+    fn snapshot(&self, pr: &tod_store::github::NodePr) -> Result<tod_store::github::PrSnapshot, String> {
+        if self.cached {
+            crate::pr_readiness::cached_snapshot_with(pr, || Ok::<_, String>(self.read()))
+        } else {
+            Ok(self.read())
+        }
+    }
+
+    fn threads(&self, _: &tod_store::github::NodePr) -> Result<Vec<tod_store::github::ReviewThread>, String> {
+        Ok(self.threads.lock().unwrap().clone())
+    }
+
+    fn changed_files(&self, _: &tod_store::github::NodePr) -> Result<Vec<tod_store::github::PrFile>, String> {
+        Ok(vec![tod_store::github::PrFile {
+            filename: "src/lib.rs".into(),
+            patch: Some("@@ -1,1 +1,2 @@\n fn a() {}\n+fn b() {}".into()),
+        }])
+    }
+
+    fn post_review(&self, _: &tod_store::github::NodePr, post: &crate::pr_readiness::ReviewPost) -> Result<(), String> {
+        self.posts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let mut threads = self.threads.lock().unwrap();
+        let before = threads.len();
+        for (i, line) in post.lines.iter().enumerate() {
+            threads.push(review_thread(&format!("T_{before}_{i}"), &line.path, line.line, &line.body));
+        }
+        for (i, (path, body)) in post.files.iter().enumerate() {
+            threads.push(review_thread(&format!("F_{before}_{i}"), path, 1, body));
+        }
+        Ok(())
+    }
+}
+
+fn review_thread(id: &str, path: &str, line: i64, body: &str) -> tod_store::github::ReviewThread {
+    tod_store::github::ReviewThread {
+        id: id.into(),
+        resolved: false,
+        outdated: false,
+        path: Some(path.into()),
+        line: Some(line),
+        comments: vec![tod_store::github::ThreadComment {
+            id: 1,
+            author: Some("someone".into()),
+            body: body.into(),
+            created_at: "2020-01-02T00:00:00Z".into(),
+            diff_hunk: None,
+        }],
+    }
+}
+
+/// What the pull request agent's change turn and push turn are told.
+const CHANGE_TURN: &str = "do not push, and do not answer any thread yet";
+const PUSH_TURN: &str = "Now push the branch";
+
+/// The node turns the agent was sent, as `pr:change`, `pr:push`, `pr`,
+/// `review`, `fix`, ….
+fn turn_labels(agent: &FakeAgent) -> Vec<String> {
+    agent
+        .log
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(kind, sent)| match kind {
+            ProtocolKind::Pr if sent.contains(CHANGE_TURN) => "pr:change".to_string(),
+            ProtocolKind::Pr if sent.contains(PUSH_TURN) => "pr:push".to_string(),
+            other => other.as_str().to_string(),
+        })
+        .collect()
+}
+
+/// The labels without a turn repeating the one before it (a conversation's
+/// continuations).
+fn steps_of(labels: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for label in labels {
+        if out.last() != Some(label) {
+            out.push(label.clone());
+        }
+    }
+    out
+}
+
+/// The agent's change turn runs `change` in the checkout; its push turn
+/// pushes it and answers the threads.
+fn branch_agent(fx: &Fixture, dir: &std::path::Path, feed: &Arc<BranchFeed>, change: fn(&std::path::Path)) -> FakeAgent {
+    let mut agent = FakeAgent::new(&fx.fleet);
+    let (dir, feed) = (dir.to_path_buf(), feed.clone());
+    agent.pr_hook = Some(Arc::new(move |sent: &str| {
+        if sent.contains(CHANGE_TURN) {
+            change(&dir);
+        } else if sent.contains(PUSH_TURN) {
+            feed.push(&dir);
+        }
+    }));
+    agent
+}
+
+/// A change to the branch's own lines, committed.
+fn edit_and_commit(dir: &std::path::Path) {
+    std::fs::write(dir.join("src/lib.rs"), "fn a() {}\nfn b() { /* fixed */ }\n").unwrap();
+    git_in(dir, &["commit", "-q", "-am", "answer the feedback"]);
+}
+
+#[test]
+fn pr_draft_feedback_is_reviewed_and_fixed_before_it_is_pushed() {
+    let fx = setup();
+    retire_outside_criteria(&fx);
+    let dir = git_workspace(&fx);
+    with_pr_draft_review(&fx);
+    let feed = BranchFeed::new(&dir, vec![review_thread("PRRT_1", "src/lib.rs", 2, "Rename b.")], false);
+    crate::pr_readiness::set_feed_override(Some(feed.clone()));
+    linked_to_prs(&fx, "pr_draft", &["https://github.com/acme/app/pull/42"]);
+    let mut agent = branch_agent(&fx, &dir, &feed, edit_and_commit);
+    let outcome = autopilot(&fx, Budget::default()).with_pr_poll_interval(Duration::ZERO).run(&fx.fleet, &mut agent).unwrap();
+    let steps = steps_of(&turn_labels(&agent));
+    // The stay's opening turn, then the change, tod's review (which finds
+    // something), the fix, the review that comes back clean, and only then
+    // the push and the answers. Nothing is reviewed after the push.
+    assert_eq!(steps, ["pr", "pr:change", "review", "fix", "review", "pr:push"], "{outcome:?}");
+    assert_eq!(feed.posts.load(std::sync::atomic::Ordering::SeqCst), 0, "nothing is posted on the pull request");
+    // The clean review recorded the head that was pushed.
+    let head = git_in(&dir, &["rev-parse", "HEAD"]);
+    assert_eq!(*feed.pushed.lock().unwrap(), head);
+    let heads = [("acme/app#42".to_string(), head)].into();
+    let gate = fx.fleet.read(|conn| crate::pr_draft_review::gate(conn, fx.node, &heads)).unwrap();
+    assert!(gate.is_ok(), "{gate:?}");
+    let live = crate::pr_readiness::live_answered(
+        feed.as_ref(),
+        &fx.fleet.read(|conn| tod_store::github::NodePrRepo::new(conn).read(fx.node)).unwrap().prs,
+        &Default::default(),
+        None,
+    )
+    .unwrap();
+    let owed = fx.fleet.read(|conn| crate::pr_draft_review::owed(conn, fx.node, &live)).unwrap();
+    assert_eq!(owed, crate::pr_draft_review::Owed::Clear);
+    assert!(fx.fleet.read(|conn| Ok(tod_store::review::ReviewRepo::new(conn).list_for_node(fx.node)?)).unwrap().iter().all(|f| !f.is_open()));
+    assert!(Autopilot::new(config(&fx), fx.node, Budget::default()).unwrap().state().pr_change.is_none());
+}
+
+#[test]
+fn a_merge_of_the_base_alone_is_pushed_without_a_review() {
+    let fx = setup();
+    retire_outside_criteria(&fx);
+    let dir = git_workspace(&fx);
+    with_pr_draft_review(&fx);
+    // The mock reviewer finds something only on a node with no findings yet:
+    // with one already there, the review after the push is clean.
+    fx.fleet
+        .interview(
+            ACTOR_USER,
+            InterviewCommand::AddReviewFinding {
+                node_id: fx.node,
+                conversation_id: None,
+                finding: tod_store::review::NewFinding {
+                    severity: "low".into(),
+                    file: None,
+                    line: None,
+                    summary: "From the review before the pull request.".into(),
+                    detail: None,
+                },
+            },
+        )
+        .unwrap();
+    let feed = BranchFeed::new(&dir, vec![review_thread("PRRT_1", "src/lib.rs", 2, "Merge main in.")], false);
+    crate::pr_readiness::set_feed_override(Some(feed.clone()));
+    linked_to_prs(&fx, "pr_draft", &["https://github.com/acme/app/pull/42"]);
+    // The base moved on (a new file, and a line ahead of the branch's own
+    // change), and the agent only merges it in.
+    fn merge_base_in(dir: &std::path::Path) {
+        git_in(dir, &["checkout", "-q", "-b", "upstream", "origin/main"]);
+        std::fs::write(dir.join("src/lib.rs"), "// header\nfn a() {}\n").unwrap();
+        std::fs::write(dir.join("other.txt"), "upstream\n").unwrap();
+        git_in(dir, &["add", "-A"]);
+        git_in(dir, &["commit", "-q", "-m", "upstream work"]);
+        git_in(dir, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        git_in(dir, &["checkout", "-q", "task"]);
+        git_in(dir, &["merge", "-q", "--no-edit", "origin/main"]);
+    }
+    let mut agent = branch_agent(&fx, &dir, &feed, merge_base_in);
+    let outcome = autopilot(&fx, Budget::default()).with_pr_poll_interval(Duration::ZERO).run(&fx.fleet, &mut agent).unwrap();
+    let steps = steps_of(&turn_labels(&agent));
+    let change = steps.iter().position(|s| s == "pr:change").unwrap_or_else(|| panic!("{steps:?} {outcome:?}"));
+    assert_eq!(steps.get(change + 1).map(String::as_str), Some("pr:push"), "{steps:?}");
+    let push = agent.log.lock().unwrap().iter().find(|(_, sent)| sent.contains(PUSH_TURN)).unwrap().1.clone();
+    assert!(push.contains("nothing for tod to review"), "{push}");
+    assert!(git_in(&dir, &["log", "--oneline"]).contains("Merge"), "the merge is on the branch");
+}
+
+#[test]
+fn a_review_of_the_change_that_never_comes_back_clean_stops_before_the_push() {
+    let fx = setup();
+    retire_outside_criteria(&fx);
+    let dir = git_workspace(&fx);
+    with_pr_draft_review(&fx);
+    let feed = BranchFeed::new(&dir, vec![review_thread("PRRT_1", "src/lib.rs", 2, "Rename b.")], false);
+    crate::pr_readiness::set_feed_override(Some(feed.clone()));
+    linked_to_prs(&fx, "pr_draft", &["https://github.com/acme/app/pull/42"]);
+    let mut agent = branch_agent(&fx, &dir, &feed, edit_and_commit);
+    agent.review_never_clean = true;
+    let outcome = autopilot(&fx, Budget::default()).with_pr_poll_interval(Duration::ZERO).run(&fx.fleet, &mut agent).unwrap();
+    let limit = tod_store::settings::DEFAULT_REVIEW_ROUND_LIMIT;
+    match &outcome {
+        Outcome::NeedsHuman { reason: NeedsHuman::ReviewNotConverging { rounds, standing } } => {
+            assert_eq!(*rounds, limit);
+            assert!(standing.iter().any(|s| s.contains("Another defect.")), "{standing:?}");
+        }
+        other => panic!("{other:?}"),
+    }
+    let steps = steps_of(&turn_labels(&agent));
+    assert!(!steps.iter().any(|s| s == "pr:push"), "nothing is pushed: {steps:?}");
+    assert_eq!(steps.iter().filter(|s| *s == "review").count() as u32, limit, "{steps:?}");
+    assert_eq!(feed.posts.load(std::sync::atomic::Ordering::SeqCst), 0);
+    // The run stopped in the middle of the round: the next one goes on with
+    // the review rather than asking for the change again.
+    let saved = Autopilot::new(config(&fx), fx.node, Budget::default()).unwrap().state().pr_change.clone();
+    assert!(saved.is_some_and(|c| c.changed && c.made_at_ms.is_some()));
+}
+
+#[test]
+fn findings_just_posted_are_read_back_as_threads_not_sent_by_name() {
+    // GitHub is read through the snapshot cache. tod's review of the pushed
+    // head finds something and posts it; the next read, a moment later, must
+    // show the new thread (work for the agent's change turn), not a cached
+    // pull request without it, which would send the finding by name.
+    let fx = setup();
+    retire_outside_criteria(&fx);
+    let dir = git_workspace(&fx);
+    with_pr_draft_review(&fx);
+    let feed = BranchFeed::new(&dir, Vec::new(), true);
+    crate::pr_readiness::set_feed_override(Some(feed.clone()));
+    linked_to_prs(&fx, "pr_draft", &["https://github.com/acme/app/pull/42"]);
+    let mut agent = branch_agent(&fx, &dir, &feed, edit_and_commit);
+    let outcome = autopilot(&fx, Budget::default()).with_pr_poll_interval(Duration::ZERO).run(&fx.fleet, &mut agent).unwrap();
+    assert_eq!(feed.posts.load(std::sync::atomic::Ordering::SeqCst), 1, "{outcome:?}");
+    let log = agent.log.lock().unwrap().clone();
+    assert!(
+        !log.iter().any(|(_, sent)| sent.contains("findings to answer")),
+        "the posted finding was sent by name: {:?}",
+        steps_of(&turn_labels(&agent))
+    );
+    let steps = steps_of(&turn_labels(&agent));
+    assert_eq!(steps, ["pr", "review", "pr:change", "review", "pr:push"], "{outcome:?}");
 }

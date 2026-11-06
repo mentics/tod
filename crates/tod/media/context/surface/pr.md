@@ -17,6 +17,8 @@ Either way:
   user does the merge.
 - Do not ask a review bot to look again and do not wait for one. The app does
   both, and sends you back when a review lands.
+- A review thread (or a finding) that contradicts an obligation is a decision
+  for the user (`decisions ask`), never a reason to change the obligation.
 
 ## Where the code is
 
@@ -35,9 +37,12 @@ repository may exist on this machine — never change into them or build them.
    phase (`phase certify`); you certify it yourself, since no separate
    session evaluates this state.
 3. Where you are told what needs doing (in `pr_draft` and `pr_review`), do
-   it. Do all of it in this turn: bring the branch up to date with its base,
-   fix what the feedback needs, run the tests, push, then answer each review
-   thread so the reply is posted and the thread resolved.
+   it, in the order the turn's message gives: bring the branch up to date
+   with its base, fix what the feedback needs, run the tests, push, then
+   answer each review thread so the reply is posted and the thread resolved.
+   When the message says to commit and stop instead of pushing, stop there:
+   the app reviews the change first and sends you a later turn to push and
+   answer.
 4. Answer threads only after pushing, and answer every thread you were given,
    each with what you did or why you did not. Decide scope as the role doc
    says.
@@ -45,14 +50,17 @@ repository may exist on this machine — never change into them or build them.
 ## The app's own code review
 
 In `pr_draft`, when the task's lifecycle config includes the review steps,
-the app runs its own code review once the bots and checks are done, and posts
-what it finds on the pull request as review threads, each naming a finding
-id. Answer those threads like any other; answering one answers its finding
-too. A finding that no line of the change could hold is in the review's text
-instead, or is sent to you by id: answer each of those through the `review`
-noun (`fixed`, or `rejected` with a note saying why it is not a problem).
-Either way, only another review clears the change: the app reviews the new head
-when you are done.
+every change you make for the pull request is reviewed before it is pushed:
+you commit and stop, the app runs its own code review and fix sessions on
+the branch until a review records nothing that stands, and then sends you a
+turn to push and answer the threads. A head that reaches the pull request
+without that review (pushed from outside it) is reviewed there instead, and
+what the review finds is posted on the pull request as review threads, each
+naming a finding id. Answer those threads like any other; answering one
+answers its finding too. A finding that no line of the change could hold is
+in the review's text instead, or is sent to you by id: answer each of those
+through the `review` noun (`fixed`, or `rejected` with a note saying why it
+is not a problem). Either way, only another review clears the change.
 
 There is no live polling inside a turn: once the PR needs nothing from you,
 stop. The app watches GitHub and comes back when there is more.

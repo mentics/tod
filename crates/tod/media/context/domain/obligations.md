@@ -10,6 +10,11 @@ directly to one task:
 They are ordered within their kind, and that order is meaningful: it is the
 order shown to the user in the app.
 
+Obligations are the user's. Once a task is past `planning`, you never add,
+change, move, or delete one yourself, even when the code or a reviewer
+disagrees with it: ask the user, quoting the change you propose and why, and
+the user makes it if they agree.
+
 An obligation's text must stand on its own. It is stored with the outline, not
 beside any repository, so it cannot link to or name a file (a repo doc, a
 relative markdown link, a local path) — state what the file says instead. Such
@@ -45,9 +50,9 @@ questions and are set separately; the app shows both.
 
 - **Introduced in** (`phase`): the state whose work wrote it. Always
   `requirements` (written while the task is `proposed`: what the user wants,
-  high level) or `design` (written in `design`, or later when verification or
-  review turns up something the spec left out: how it is to be built and what
-  the work must do). It records where the obligation came from and is not
+  high level) or `design` (written in `design`, or later by the user when
+  verification or review turns up something the spec left out: how it is to
+  be built and what the work must do). It records where the obligation came from and is not
   changed to say where it is acted on. A design obligation refines the requirements
   it is written for.
 - **Acts in** (`acts_in`): the state whose agent takes action on it, which is
