@@ -201,6 +201,47 @@ pub struct PrReviewBotSettings {
     pub rerun_after_minutes: u64,
 }
 
+impl PrReviewBotSettings {
+    /// Parses `greptile=4, other=3` (the Settings text field): a bot's name
+    /// and the lowest score that passes. A bot already in `existing` keeps
+    /// its other tuning (`rerun_after_minutes`). A bare name takes the
+    /// default score.
+    pub fn parse_list(text: &str, existing: &[Self]) -> Result<Vec<Self>, String> {
+        let mut out: Vec<Self> = Vec::new();
+        for entry in text.split(',').map(str::trim).filter(|e| !e.is_empty()) {
+            let (name, score) = match entry.split_once('=') {
+                Some((name, score)) => (name.trim(), Some(score.trim())),
+                None => (entry, None),
+            };
+            if name.is_empty() {
+                return Err(format!("\"{entry}\": write it as name=minimum score, like greptile=4"));
+            }
+            let min_score = match score {
+                None => default_min_score(),
+                Some(score) => score
+                    .parse::<u8>()
+                    .ok()
+                    .filter(|n| (1..=5).contains(n))
+                    .ok_or_else(|| format!("\"{score}\" is not a score from 1 to 5"))?,
+            };
+            if out.iter().any(|b| b.name.eq_ignore_ascii_case(name)) {
+                return Err(format!("\"{name}\" is listed twice"));
+            }
+            let rerun_after_minutes = existing
+                .iter()
+                .find(|b| b.name.eq_ignore_ascii_case(name))
+                .map_or_else(default_rerun_after_minutes, |b| b.rerun_after_minutes);
+            out.push(Self { name: name.to_string(), min_score, rerun_after_minutes });
+        }
+        Ok(out)
+    }
+
+    /// The text [`Self::parse_list`] reads back.
+    pub fn format_list(list: &[Self]) -> String {
+        list.iter().map(|b| format!("{}={}", b.name, b.min_score)).collect::<Vec<_>>().join(", ")
+    }
+}
+
 /// What makes a pull request ready, and how far the babysitter goes to get it
 /// there (`doc/lifecycle/pr-readiness.md`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -995,6 +1036,20 @@ mod tests {
     use super::*;
     use crate::paths::{clear_data_root_override, set_data_root};
     use std::fs;
+
+    #[test]
+    fn review_bots_parse_with_a_score_keep_their_tuning_and_round_trip() {
+        let existing = vec![PrReviewBotSettings { name: "greptile".into(), min_score: 4, rerun_after_minutes: 25 }];
+        let list = PrReviewBotSettings::parse_list(" Greptile = 3 ", &existing).unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!((list[0].min_score, list[0].rerun_after_minutes), (3, 25));
+        assert_eq!(PrReviewBotSettings::parse_list("greptile", &[]).unwrap()[0].min_score, 4);
+        assert_eq!(PrReviewBotSettings::format_list(&list), "Greptile=3");
+        assert!(PrReviewBotSettings::parse_list("", &existing).unwrap().is_empty());
+        for bad in ["greptile=9", "greptile=x", "=4", "greptile=4, greptile=3"] {
+            assert!(PrReviewBotSettings::parse_list(bad, &[]).is_err(), "{bad}");
+        }
+    }
 
     #[test]
     fn sandbox_idle_reads_the_data_roots_settings_and_defaults_what_is_missing() {

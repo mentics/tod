@@ -2497,6 +2497,38 @@ fn pr_draft_review_findings_are_posted_and_a_resolved_thread_declines_its_findin
 }
 
 
+#[test]
+fn a_finding_left_open_by_an_earlier_stay_is_still_owed_after_the_phase_is_rerun() {
+    use crate::pr_draft_review::{Owed, own_findings, owed};
+    let fx = setup();
+    retire_outside_criteria(&fx);
+    let feed = OwnReviewFeed::new(false);
+    crate::pr_readiness::set_feed_override(Some(feed.clone()));
+    with_pr_draft_review(&fx);
+    linked_to_prs(&fx, "pr_draft", &["https://github.com/acme/app/pull/42"]);
+    let mut agent = FakeAgent::new(&fx.fleet);
+    agent.review_never_clean = true;
+    autopilot(&fx, Budget::default()).with_pr_poll_interval(Duration::ZERO).run(&fx.fleet, &mut agent).unwrap();
+    let open = |fx: &Fixture| {
+        fx.fleet
+            .read(|conn| own_findings(conn, fx.node))
+            .unwrap()
+            .into_iter()
+            .filter(|f| f.is_open())
+            .count()
+    };
+    assert_eq!(open(&fx), 1, "the review's finding is open");
+
+    // Rerun this phase: a new stay. The open finding is still the node's.
+    crate::lifecycle::restart_stay(&fx.fleet, fx.node).unwrap();
+    assert_eq!(open(&fx), 1, "an open finding outlives the stay that recorded it");
+    let links = fx.fleet.read(|conn| tod_store::github::NodePrRepo::new(conn).read(fx.node)).unwrap();
+    let settings = crate::pr_readiness::settings_at(&fx.root);
+    let live = crate::pr_readiness::live_answered(feed.as_ref(), &links.prs, &settings, None).unwrap();
+    let owed = fx.fleet.read(|conn| owed(conn, fx.node, &live)).unwrap();
+    assert!(!matches!(owed, Owed::Clear), "the open finding is owed, not a clear review: {owed:?}");
+}
+
 /// A repository in the fixture's workspace (checks fingerprint it with git),
 /// with `command` configured as a check for `phase`.
 fn with_check(fx: &Fixture, phase: &str, label: &str, command: &str) -> PathBuf {
