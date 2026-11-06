@@ -46,6 +46,11 @@ The two states, as they were split:
   run round again from the agent's session and through every group; with no
   work the run waits for the person (woken by the webhook, else by polling) and
   nothing runs again on a restart in the same stay.
+- A configured bot's findings it could not post inline (Greptile's
+  "Comments Outside Diff" comment, whose lines are outside the diff) are work
+  whatever its score: the comment's text goes to the agent as feedback, like a
+  person's review comment, once per edit of it. Other comments by a bot are
+  not feedback. Bots are set in Settings → Lifecycle, "Review bots to wait for".
 - `approved` is unchanged: it waits for the merge.
 
 Below, "the `pr` state" means `pr_review` unless it is about opening the PR.
