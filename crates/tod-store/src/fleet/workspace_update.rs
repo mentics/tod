@@ -8,7 +8,7 @@
 //! node's repository is one of them and carries the work.
 
 use crate::fleet::FleetStore;
-use crate::fleet::provision::launch_cwd_if_made;
+use crate::fleet::provision::{launch_cwd_if_made, resolve_launch_cwd, retry_if_sandbox_lost};
 use crate::fleet::workdir::Workdir;
 use anyhow::{Context, Result, bail};
 
@@ -16,9 +16,15 @@ use anyhow::{Context, Result, bail};
 /// machine, in its container or in its sandbox) and says what it did. Runs
 /// git there, so never call it on the UI thread.
 pub fn update_workspace_to_main(fleet: &FleetStore, node_id: &str) -> Result<String> {
-    let dir = launch_cwd_if_made(fleet, node_id)?
+    launch_cwd_if_made(fleet, node_id)?
         .context("this node has no workspace yet: it is made the first time something launches from it")?;
-    update_to_main(&dir)
+    // The same recovery a shell or a launch has: a sandbox the node's location
+    // still records but Blaxel no longer has (deleted, or retired at `done`)
+    // is forgotten and made again, rather than failing with "no sandbox named".
+    retry_if_sandbox_lost(fleet, node_id, || {
+        let dir = resolve_launch_cwd(fleet, node_id)?;
+        update_to_main(&dir)
+    })
 }
 
 /// [`update_workspace_to_main`] for a directory.
