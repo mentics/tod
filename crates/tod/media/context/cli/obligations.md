@@ -39,6 +39,13 @@ with its earlier wording. With `--node` and `--by` it restores every listed
 deletion by that party, newest first, so they return to their original order. A
 restore is recorded like any other edit, so it can itself be restored.
 
+Past `planning` the obligations are settled: on a node whose lifecycle
+state is later than `planning`, an agent's `add`, `update`, `move`, `delete`
+and `restore` are refused (the user's own edits, and a freeform conversation
+the user directs, are not). Propose the change with `decisions ask` instead,
+quoting the obligation's id, its current text, the text you propose, and why;
+if the user approves, they make it.
+
 Obligation text can reference any node inline by slug: `[[dynamic-form]]`. A
 write naming a slug no node has is refused; `check-refs` lists existing
 obligations whose references are broken.

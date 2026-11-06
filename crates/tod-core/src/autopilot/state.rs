@@ -69,6 +69,32 @@ pub struct AutopilotState {
     /// at the group it stopped in instead of moving on without it.
     #[serde(default)]
     pub pending_groups: Option<PendingGroups>,
+    /// In `pr_draft`: the pull request's agent made its change for the
+    /// feedback (committed, not pushed) and tod's own review of it, then the
+    /// push and the answers, are still owed (`super::Autopilot::babysit`).
+    /// Saved so a restart goes on with the review instead of asking for the
+    /// change again.
+    #[serde(default)]
+    pub pr_change: Option<PrChange>,
+}
+
+/// A change the pull request's agent is making for feedback in `pr_draft`,
+/// not yet reviewed by tod or pushed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrChange {
+    /// When the round began (ms since the epoch): a change saved in an
+    /// earlier stay in the state is dropped.
+    pub started_ms: i64,
+    /// The branch's change against its base before the agent's turn
+    /// (`crate::pr_draft_review::branch_change`).
+    pub before: String,
+    /// When the agent's turn that made the change ended; `None` until it
+    /// has (a restart asks for the change again). The reviews of the change
+    /// are the ones started after.
+    pub made_at_ms: Option<i64>,
+    /// Whether the turn changed the branch's own change: when it did not (a
+    /// merge of the base alone), no review of it is owed.
+    pub changed: bool,
 }
 
 /// The later skill groups (`lifecycle_config::groups`, 1 and up) a finished
@@ -183,6 +209,7 @@ impl AutopilotState {
             fresh_session: false,
             loops: LoopCounters::default(),
             pending_groups: None,
+            pr_change: None,
         }
     }
 

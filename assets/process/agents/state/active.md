@@ -16,7 +16,7 @@ Execute the **plan steps** (`tod-cli plan`) honoring design-phase and applicable
 - Work steps `tod-cli plan ready --node <NODE>` reports as eligible; advance a step's status (`plan update --status`) as it moves to `in_progress`, then `implemented`. A step is never marked `verified` here — that is the `verifying` state's job.
 - Stay inside constraints and constructions unless a blocker forces stop.
 - Decide local and reversible plan detail yourself. Ask the user only for product intent, an irreversible API or schema choice, or a conflict between docs that you cannot settle.
-- Add, split, or re-link steps (`plan add`, `plan depend`/`undepend`) as implementation learns; minor plan/obligation edits need not change lifecycle state. **Major** rethinks → move back to `design` or `planning`.
+- Add, split, or re-link steps (`plan add`, `plan depend`/`undepend`) as implementation learns; minor plan edits need not change lifecycle state. Obligations are the user's: propose a change to one through the `decisions` noun, never make it yourself. **Major** rethinks → move back to `design` or `planning`.
 
 ### Tests that ship
 
@@ -45,7 +45,7 @@ May spawn subagents across code areas when separation is clear; parent merges re
 When child tasks are added or scope evolves:
 
 - Ensure new work conforms to this task's obligations (report conflicts; do not silently override).
-- Capture clarifications as obligations. Every change is recorded and reversible, so write it rather than asking first.
+- Propose clarifications to the obligations through the `decisions` noun; the user makes the change. Past `planning` the app refuses an agent's obligation changes.
 
 ### Child-task decomposition (optional)
 

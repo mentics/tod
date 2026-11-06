@@ -1,31 +1,36 @@
 //! tod's own code review in `pr_draft`, when the node's lifecycle config
 //! includes the review steps there (`tod_store::lifecycle_config::resolve_pr_draft_review`).
 //!
-//! The review bots run on the draft, the pull request's agent fixes what they
-//! say, and the bots may be satisfied while the project's own review would
-//! not be. So once nothing is left on the pull request but a person, the
-//! autopilot runs the `review` phase's code review (the Review protocol, with
-//! the `review` phase's skills, in every group) on the current head. The
-//! reviewer records findings exactly as it does in `review`, through
-//! `tod-cli review`; it never posts anything itself. The app then posts them
-//! on the pull request as one review ([`post`]): each finding on a line of the
-//! change goes on that line, one on a file the change touches but not on a
-//! changed line goes on the file, and the rest in the review's text. Each
-//! finding records the thread it became (`ReviewFinding::pr_thread`).
+//! The point is to get each change exactly right before a person is troubled
+//! with it again. So when the pull request has feedback to act on, the
+//! autopilot (`Autopilot::babysit`) splits the pull request agent's work in
+//! two: first it makes the change and commits it, without pushing or
+//! answering anything; then, if the branch's change against its base differs
+//! from before ([`branch_change`]: merging the base in alone does not count),
+//! tod's own Review → Fix → Review loop runs on the local head ([`change_step`])
+//! until a review records nothing that stands, with the same round limit as
+//! `review`; only then is the agent told to push and answer the threads. The
+//! review's report records the head it cleared ([`heads_report`], with
+//! [`local_heads`]), which is the head the push makes current, so [`owed`]
+//! finds nothing more to do once it is pushed.
 //!
-//! From there the pull request's own loop does the fixing: an open thread is
-//! work for its agent, which also has the `fix` phase's skills while the
-//! review steps are on, and answering a thread (`tod-cli pr threads answer`)
-//! answers its finding. A finding no open thread carries (put in the review's
-//! text, or its thread went outdated) is sent to the agent by name
-//! ([`Owed::Answer`]). A thread a person resolves without an answer leaves
-//! its finding declined ([`sync_resolved`]).
+//! The reviewer records findings exactly as it does in `review`, through
+//! `tod-cli review`; it never posts anything itself. A head that reaches the
+//! pull request without that loop (pushed from outside, or the agent's first
+//! turn in the stay) is still reviewed once nothing but a person is left on
+//! it ([`Owed::Review`]), and what that review records is posted on the pull
+//! request as one review ([`post`]): each finding on a line of the change goes
+//! on that line, one on a file the change touches but not on a changed line
+//! goes on the file, and the rest in the review's text. Each finding records
+//! the thread it became (`ReviewFinding::pr_thread`). From there an open
+//! thread is feedback like any other, and answering it (`tod-cli pr threads
+//! answer`) answers its finding. A finding no open thread carries is sent to
+//! the agent by name ([`Owed::Answer`]). A thread a person resolves without an
+//! answer leaves its finding declined ([`sync_resolved`]).
 //!
-//! Like `review`, only a review can clear the change: once its findings are
-//! answered, the next time nothing else is left the head is reviewed again,
-//! until a review of the current head records nothing that stands
-//! ([`Owed::Clear`]). The `pr_draft → pr_review` gate checks the same thing
-//! (`pr-pr_review.own-review`).
+//! Like `review`, only a review can clear the change: [`Owed::Clear`] once a
+//! review of the current head recorded nothing that stands. The `pr_draft →
+//! pr_review` gate checks the same thing (`pr-pr_review.own-review`).
 
 use crate::pr_readiness::{LivePr, PrFeed, ReviewPost, pr_label};
 use anyhow::Result;
@@ -33,7 +38,7 @@ use rusqlite::Connection;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use tod_store::conversation::{Conversation, ConversationRepo, Focus, ProtocolKind};
-use tod_store::fleet::FleetStore;
+use tod_store::fleet::{FleetStore, Workdir};
 use tod_store::interview::InterviewCommand;
 use tod_store::phase::PhaseRepo;
 use tod_store::review::{FINDING_DECLINED, FINDING_OUT_OF_SCOPE, ReviewFinding, ReviewRepo};
@@ -185,6 +190,112 @@ pub fn owed(conn: &Connection, node: Uuid, live: &[LivePr]) -> Result<Owed> {
         return Ok(Owed::Review);
     }
     Ok(if round_clean(&findings, &latest) { Owed::Clear } else { Owed::Review })
+}
+
+/// The branch's own change against `base` (a branch of `origin`), as a
+/// fingerprint: the changed lines (committed or not, against the merge base
+/// of `origin/<base>` and `HEAD`) and the untracked files, without hunk
+/// positions or blob ids. Merging the base in leaves it as it was, since the
+/// merge base moves with it and the lines around the change are not counted;
+/// any change to the branch's own lines changes it. `Err` when git fails.
+pub fn branch_change(cwd: &Workdir, base: &str) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    let base_ref = format!("origin/{base}");
+    let merge_base = cwd.git(&["merge-base", &base_ref, "HEAD"])?;
+    let diff = cwd.git(&["diff", "--no-color", "--no-ext-diff", "--no-renames", "-U0", &merge_base])?;
+    let untracked = cwd.git(&["ls-files", "--others", "--exclude-standard"])?;
+    let mut hash = Sha256::new();
+    for line in diff.lines().filter(|l| !l.starts_with("@@") && !l.starts_with("index ")) {
+        hash.update(line.as_bytes());
+        hash.update(b"\n");
+    }
+    hash.update(b"untracked\n");
+    hash.update(untracked.as_bytes());
+    Ok(format!("{:x}", hash.finalize()))
+}
+
+/// The commit checked out in `cwd`: the head about to be pushed.
+pub fn local_head(cwd: &Workdir) -> Result<String> {
+    cwd.git(&["rev-parse", "HEAD"])
+}
+
+/// The heads a review of the local head `head` covers, by [`pr_label`]: every
+/// linked pull request, since the node's branch is the head of each.
+pub fn local_heads(live: &[LivePr], head: &str) -> BTreeMap<String, String> {
+    live.iter().map(|p| (pr_label(&p.pr), head.to_string())).collect()
+}
+
+/// The reviews (first groups' sessions) run in `pr_draft` in this stay since
+/// `since_ms`, oldest first: the rounds of the review of one change.
+pub fn reviews_since(conn: &Connection, node: Uuid, since_ms: i64) -> Result<Vec<Conversation>> {
+    let stay = PhaseRepo::new(conn).stay_started_at(node)?;
+    let mut out: Vec<Conversation> = ConversationRepo::new(conn)
+        .conversations_for_focus(Focus::Node(node))?
+        .into_iter()
+        .filter(|c| c.skill_group == 0 && is_own(c, stay) && c.created_at >= since_ms)
+        .collect();
+    out.sort_by_key(|c| c.created_at);
+    Ok(out)
+}
+
+/// What the review of a change made in `pr_draft` does next.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChangeStep {
+    /// Review the change (again).
+    Review,
+    /// Resolve the latest review's open findings.
+    Fix,
+    /// The latest review recorded nothing that stands.
+    Clean,
+}
+
+/// [`ChangeStep`] for the change made at `since_ms`, decided as `review`
+/// decides its own (`crate::lifecycle_next::next_step`): no finished review
+/// of it yet, review; the latest left findings open, fix; it recorded
+/// nothing that stands, clean; otherwise (its findings answered by the
+/// fixer, whose claim is not the verdict) review again.
+pub fn change_step(conn: &Connection, node: Uuid, since_ms: i64) -> Result<ChangeStep> {
+    let Some(latest) = reviews_since(conn, node, since_ms)?.pop() else {
+        return Ok(ChangeStep::Review);
+    };
+    let done = ConversationRepo::new(conn)
+        .latest_report(latest.id)?
+        .is_some_and(|r| crate::conversation::review::is_done_report(&r));
+    if !done {
+        return Ok(ChangeStep::Review);
+    }
+    let findings = own_findings(conn, node)?;
+    if findings.iter().any(|f| f.created_at >= latest.created_at && f.is_open()) {
+        return Ok(ChangeStep::Fix);
+    }
+    Ok(if round_clean(&findings, &latest) { ChangeStep::Clean } else { ChangeStep::Review })
+}
+
+/// What the latest review of the change made at `since_ms` left standing, in
+/// words, for [`crate::autopilot::NeedsHuman::ReviewNotConverging`].
+pub fn change_standing(conn: &Connection, node: Uuid, since_ms: i64) -> Result<Vec<String>> {
+    let Some(latest) = reviews_since(conn, node, since_ms)?.pop() else {
+        return Ok(Vec::new());
+    };
+    Ok(own_findings(conn, node)?
+        .iter()
+        .filter(|f| f.created_at >= latest.created_at)
+        .filter(|f| !matches!(f.status.as_str(), FINDING_OUT_OF_SCOPE | FINDING_DECLINED))
+        .map(|f| format!("[{}] {} ({})", tod_store::interview::short_id(f.id), f.summary, f.status))
+        .collect())
+}
+
+/// Whether the latest review in this stay recorded `heads` and came back
+/// clean: the head before a change was cleared, so a change that leaves the
+/// branch's own lines as they were (a merge of the base) is cleared too.
+pub fn cleared(conn: &Connection, node: Uuid, heads: &BTreeMap<String, String>) -> Result<Option<Conversation>> {
+    let Some(latest) = latest_review(conn, node)? else { return Ok(None) };
+    if reviewed_heads(conn, latest.id)?.is_none_or(|reviewed| &reviewed != heads) {
+        return Ok(None);
+    }
+    let findings = own_findings(conn, node)?;
+    let open = findings.iter().any(|f| f.created_at >= latest.created_at && f.is_open());
+    Ok((!open && round_clean(&findings, &latest)).then_some(latest))
 }
 
 /// The `pr_draft → pr_review` gate's check (`pr-pr_review.own-review`), for
@@ -393,6 +504,9 @@ pub fn post(
             );
         }
         feed.post_review(&p.pr, &post).map_err(|err| format!("{}: {err}", p.pr.url))?;
+        // The next read of the pull request has to show the threads just
+        // posted, not a snapshot from before them.
+        crate::pr_readiness::forget_snapshot(&p.pr);
         let threads = feed.threads(&p.pr).map_err(|err| format!("{}: {err}", p.pr.url))?;
         let mut missing = Vec::new();
         for (finding, place) in placed {

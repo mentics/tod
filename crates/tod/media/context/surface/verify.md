@@ -51,11 +51,10 @@ Work in this order:
    delivered the behaviour; if no step covers it, add one that `--satisfies`
    the obligation and fail that. The app sends you back until this is so.
 
-If verifying shows the work must also do something no obligation states, you
-may add it as an obligation. It is a design obligation (`--phase design`), not
-a requirement the user made. If the work must be changed to meet it, leave
-where it acts as `active`, so it gets a plan step; if it only needs checking,
-set `--acts-in verifying` and record its verdict now.
+If verifying shows the work must also do something no obligation states, do
+not add an obligation: past `planning` they change only with the user's
+approval. Propose it with `decisions ask`, quoting the obligation you would
+add and why; the user adds it if they agree.
 
 The app reads the verdicts and the plan steps, not your reply — a finding
 that is only in your reply is lost. A `failed` step's note is what the
