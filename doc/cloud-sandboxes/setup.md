@@ -424,7 +424,9 @@ the same token and the same rules: its proxy holds GitHub (`api.github.com`
 Bearer, `github.com` Basic), Linear, and, with `claude_token_via = "proxy"`,
 `api.anthropic.com`, beside the node's Environment secrets, and the Blaxel and
 orchestrator rules the supervisor needs. The app's agent process is launched with `CLAUDE_CODE_OAUTH_TOKEN` set to
-the placeholder, `GH_TOKEN` a placeholder, `TOD_GITHUB_AUTH=proxy`, and
+the placeholder, `GH_TOKEN` a placeholder, `TOD_GITHUB_AUTH=proxy`,
+`TOD_PROXY_AUTHENTICATES=1` (the proxy adds the credentials; a script that
+would insist on a key in its environment sends none), and
 `NODE_USE_ENV_PROXY=1`; with `"env"` it gets the real token on the agent
 process alone (never stored in the sandbox). A missing token just leaves its
 rule out, with a warning. The sandbox carries a `tod-creds` label, a hash of
