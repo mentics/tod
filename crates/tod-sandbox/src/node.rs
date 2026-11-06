@@ -46,7 +46,7 @@ pub const GITHUB_AUTH_PROXY: &str = "proxy";
 /// for the hosts of the node's Environment secrets. A script that would
 /// otherwise insist on a key in its environment (`ddapi`) sends none and lets
 /// the proxy authenticate. Not tied to any one service.
-pub const PROXY_AUTHENTICATES_ENV: &str = "TOD_PROXY_AUTHENTICATES";
+pub const PROXY_AUTH_ENV: &str = "PROXY_AUTH";
 /// Set to this in the orchestrator's process: its proxy holds one GitHub
 /// token per name ([`keyed_secrets_spec`]) and the client chooses one per
 /// repository by sending its placeholder ([`secret_placeholder`]).
@@ -228,7 +228,7 @@ pub fn agent_env(creds: &NodeCredentials, claude_via: ClaudeTokenVia) -> Vec<(St
     let mut env = Vec::new();
     if !credential_rules(creds, claude_via).is_empty() {
         env.push(("NODE_USE_ENV_PROXY".to_string(), "1".to_string()));
-        env.push((PROXY_AUTHENTICATES_ENV.to_string(), "1".to_string()));
+        env.push((PROXY_AUTH_ENV.to_string(), "1".to_string()));
     }
     if github_token(creds).is_some() {
         env.push(("GH_TOKEN".to_string(), GH_TOKEN_PLACEHOLDER.to_string()));
@@ -416,7 +416,7 @@ pub fn node_env(spec: &NodeSandboxSpec, claude_placeholder: bool, github_via_pro
         ("GH_TOKEN", GH_TOKEN_PLACEHOLDER.to_string()),
         // Node's fetch ignores HTTP(S)_PROXY without it, and so gets nothing injected.
         ("NODE_USE_ENV_PROXY", "1".to_string()),
-        (PROXY_AUTHENTICATES_ENV, "1".to_string()),
+        (PROXY_AUTH_ENV, "1".to_string()),
         ("TOD_SANDBOX", spec.name.to_string()),
         ("TOD_USER", spec.user.to_string()),
         ("TOD_NODE", spec.node.to_string()),
