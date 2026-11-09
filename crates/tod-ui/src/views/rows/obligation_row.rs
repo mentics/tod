@@ -1,6 +1,7 @@
 //! One obligation, as a row.
 
 use super::{RowHost, RowOptions, row_group, row_tail};
+use crate::ui::panel_export::RecordText as _;
 use crate::ui::item_list::{ColumnSpec, column_cell};
 use crate::ui::selectable_text::selectable_text_with_menu;
 use crate::ui::style;
@@ -124,14 +125,18 @@ pub fn obligation_row<A: From<ObligationRowEvent> + 'static>(
         format!("{}.", obligation.ordinal)
     };
     row = row.child(if compact {
-        style::text_muted(div()).flex_shrink_0().child(label)
+        style::text_muted(div())
+            .flex_shrink_0()
+            .child(label.clone())
+            .record_text(label)
     } else {
         div()
             .text_xs()
             .text_color(muted)
             .flex_shrink_0()
             .pt_0p5()
-            .child(label)
+            .child(label.clone())
+            .record_text(label)
     });
 
     if let Some(editor) = editor {
@@ -199,7 +204,8 @@ pub fn obligation_row<A: From<ObligationRowEvent> + 'static>(
             .whitespace_nowrap()
             .text_ellipsis()
             .overflow_hidden()
-            .child(obligation.acts_in.clone());
+            .child(obligation.acts_in.clone())
+            .record_text(obligation.acts_in.clone());
         row = row.child(status).child(acts_in);
     }
 

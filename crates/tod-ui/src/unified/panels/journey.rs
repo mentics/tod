@@ -23,6 +23,7 @@ use tod_journey::{Event, JourneyKey, JourneyReader, Record};
 use tod_store::fleet::FleetStore;
 use uuid::Uuid;
 
+use crate::ui::panel_export::RecordText as _;
 use crate::ui::selectable_text::selectable_text;
 use crate::ui::style;
 use crate::unified::columns::PanelKind;
@@ -169,7 +170,9 @@ impl Render for JourneyPanel {
 
         match &self.state {
             State::Loading => {
-                body = body.child(style::empty_message(div()).child("Reading the journey…"));
+                body = body.child(style::empty_message(div())
+                        .child("Reading the journey…")
+                        .record_text("Reading the journey…"));
             }
             State::Failed(why) => {
                 body = body.child(style::text_error(div()).child(selectable_text(
@@ -195,11 +198,16 @@ impl Render for JourneyPanel {
                                 window,
                                 cx,
                             )))
-                            .child(style::text_dense_muted(div()).child(format!(
-                                "showing {} of {} records",
-                                loaded.lines.len(),
-                                loaded.total
-                            ))),
+                            .child({
+                                let shown = format!(
+                                    "showing {} of {} records",
+                                    loaded.lines.len(),
+                                    loaded.total
+                                );
+                                style::text_dense_muted(div())
+                                    .child(shown.clone())
+                                    .record_text(shown)
+                            }),
                     )
                     .child(
                         div()
@@ -252,12 +260,14 @@ impl Render for JourneyPanel {
                             })),
                     )
                     .children(self.copied.map(|what| {
-                        style::text_dense_muted(div()).child(format!("Copied the {what}."))
+                        let copied = format!("Copied the {what}.");
+                        style::text_dense_muted(div())
+                            .child(copied.clone())
+                            .record_text(copied)
                     }));
                 if loaded.lines.is_empty() {
-                    body = body.child(style::empty_message(div()).child(
-                        "Nothing recorded yet. Journeys are recorded while \"Record journeys on this computer\" is on in Settings.",
-                    ));
+                    let none = "Nothing recorded yet. Journeys are recorded while \"Record journeys on this computer\" is on in Settings.";
+                    body = body.child(style::empty_message(div()).child(none).record_text(none));
                 }
                 for (i, line) in loaded.lines.iter().enumerate() {
                     body = body.child(style::text_dense(div().font_family("monospace")).child(selectable_text(

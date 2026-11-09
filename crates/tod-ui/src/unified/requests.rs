@@ -83,6 +83,7 @@ use tod_store::request_feedback::{
 use tod_store::review::{FINDING_DECLINED, FINDING_FIXED, FINDING_OUT_OF_SCOPE, ReviewFinding, ReviewRepo};
 use uuid::Uuid;
 
+use crate::ui::panel_export::RecordText as _;
 use crate::ui::off_thread::off_thread;
 use crate::ui::agent_runs::AgentRuns;
 use crate::ui::journey::{Source, record_action};
@@ -988,7 +989,7 @@ impl Requests {
             .flex_wrap()
             .items_center()
             .gap_1()
-            .child(style::text_muted(div().text_xs()).child(recorded))
+            .child(style::text_muted(div().text_xs()).child(recorded).record_text(recorded))
             .child(
                 Button::new(SharedString::from(format!("unified-requests-feedback-bad-question-{request_id}")))
                     .label(if bad { "Bad question ✓" } else { "Bad question" })
@@ -1127,7 +1128,10 @@ impl Requests {
                     .cursor_pointer()
                     .hover(move |el| el.bg(hover))
                     .on_click(cx.listener(move |this, _, _, cx| this.click_option(decision.clone(), option, cx)))
-                    .child(format!("{option}. {label}"))
+                    .child({
+                        let text = format!("{option}. {label}");
+                        div().child(text.clone()).record_text(text)
+                    })
             },
         ))
     }
@@ -1166,9 +1170,15 @@ impl Requests {
                                 this.open(target, ctrl, cx);
                             }),
                         )
-                        .child(link.label)
+                        .child(link.label.clone())
+                        .record_text(link.label)
                         .into_any_element(),
-                    None => div().text_xs().text_color(muted).child(link.label).into_any_element(),
+                    None => div()
+                        .text_xs()
+                        .text_color(muted)
+                        .child(link.label.clone())
+                        .record_text(link.label)
+                        .into_any_element(),
                 }
             })
             .collect()
@@ -1207,11 +1217,17 @@ impl Requests {
             .items_center()
             .gap_2()
             .children(links)
-            .child(style::text_muted(div().text_xs().flex_none()).child(reason_label(item.reason)))
             .child(
                 style::text_muted(div().text_xs().flex_none())
-                    .child(when_label(item.since, chrono::Local::now().date_naive())),
+                    .child(reason_label(item.reason))
+                    .record_text(reason_label(item.reason)),
             )
+            .child({
+                let when = when_label(item.since, chrono::Local::now().date_naive());
+                style::text_muted(div().text_xs().flex_none())
+                    .child(when.clone())
+                    .record_text(when)
+            })
             .child(div().flex_1())
             .children(terminal)
             .children(elsewhere)
@@ -1370,11 +1386,12 @@ impl Requests {
             } else {
                 let draft = Some(FreeformDrafts::get(decision_id, cx)).filter(|text| !text.trim().is_empty());
                 match draft {
-                    Some(draft) => div().text_xs().child(draft).into_any_element(),
+                    Some(draft) => div().text_xs().child(draft.clone()).record_text(draft).into_any_element(),
                     None => div()
                         .text_xs()
                         .text_color(cx.theme().muted_foreground)
                         .child(if only { "Enter to type your answer…" } else { "Enter to answer freely…" })
+                        .record_text(if only { "Enter to type your answer…" } else { "Enter to answer freely…" })
                         .into_any_element(),
                 }
             })
@@ -1569,7 +1586,8 @@ impl Requests {
                         div()
                             .text_xs()
                             .text_color(muted)
-                            .child(format!("Answered: {chosen} · {}", entry.answer.actor)),
+                            .child(format!("Answered: {chosen} · {}", entry.answer.actor))
+                            .record_text(format!("Answered: {chosen} · {}", entry.answer.actor)),
                     )
                     .child(
                         Button::new(("unified-decisions-change", entry.answer.id as u64))
@@ -1614,7 +1632,7 @@ impl Requests {
 
 /// A small label naming which kind a card is.
 fn kind_badge(label: &'static str) -> impl IntoElement {
-    div().text_xs().child(label)
+    div().text_xs().child(label).record_text(label)
 }
 
 /// "\"per invoice\"" or "\"free text\"" for one log entry.

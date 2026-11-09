@@ -7,6 +7,7 @@
 //! in what to run. A conversation records the choice as the user's own edit,
 //! the plan panel applies it as a plain outline mutation.
 
+use crate::ui::panel_export::RecordText as _;
 use crate::ui::style;
 use gpui::{
     Anchor, AnyElement, App, ElementId, InteractiveElement, IntoElement, MouseButton,
@@ -102,6 +103,7 @@ pub fn status_chip(
                 .items_center()
                 .gap(style::space::HAIRLINE)
                 .child(current.clone())
+                .record_text(current.clone())
                 .child(Icon::new(IconName::ChevronDown).xsmall()),
         )
         .when_some(popup, |el, popup| {

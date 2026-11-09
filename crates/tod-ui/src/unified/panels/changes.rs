@@ -26,6 +26,7 @@ use tod_store::fleet::FleetStore;
 use tod_store::fleet::changes::{BranchChanges, ChangesTrigger, changes_trigger, node_branch_changes};
 use uuid::Uuid;
 
+use crate::ui::panel_export::RecordText as _;
 use crate::ui::selectable_text::selectable_text;
 use crate::ui::style;
 use crate::unified::panel::{ColumnPanel, PanelOpenRequest};
@@ -275,6 +276,7 @@ impl Render for ChangesPanel {
         let body = match self.watch.state.clone() {
             ChangesState::Unknown => style::text_muted(div())
                 .child("Counting changes…")
+                .record_text("Counting changes…")
                 .into_any_element(),
             ChangesState::Unavailable(reason) => style::text_muted(div())
                 .child(selectable_text("unified-changes-unavailable", reason, window, cx))
@@ -305,8 +307,16 @@ impl Render for ChangesPanel {
                                 MouseButton::Left,
                                 cx.listener(move |this, _, _, cx| this.open_file(rel.clone(), cx)),
                             )
-                            .child(style::text_link(div().min_w_0()).child(file.path.clone()))
-                            .child(style::text_muted(div().flex_none()).child(counts)),
+                            .child(
+                                style::text_link(div().min_w_0())
+                                    .child(file.path.clone())
+                                    .record_text(file.path.clone()),
+                            )
+                            .child(
+                                style::text_muted(div().flex_none())
+                                    .child(counts.clone())
+                                    .record_text(counts),
+                            ),
                     );
                 }
                 list.into_any_element()

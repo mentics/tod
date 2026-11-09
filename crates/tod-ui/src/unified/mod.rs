@@ -54,6 +54,7 @@ use crate::ui::app_nav::{AppNavToggle, HasAppNav};
 use crate::ui::code_links::{OpenCodeRef, open_code_ref};
 use crate::ui::key_context;
 use crate::ui::pane_nav::{PaneFocusLeft, PaneFocusRight, bind_pane_nav};
+use crate::ui::panel_export;
 use crate::ui::style;
 use crate::views::lifecycle_control::LifecycleController;
 use crate::views::task_list::{TaskListEvent, TaskListView};
@@ -1294,6 +1295,15 @@ impl UnifiedView {
                     .items_center()
                     .gap_1()
                     .child(
+                        Button::new(("unified-col-copy", index))
+                            .icon(IconName::Copy)
+                            .small()
+                            .tooltip("Copy what this panel shows, as Markdown")
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.copy_column_markdown(index, window, cx);
+                            })),
+                    )
+                    .child(
                         Button::new(("unified-col-pin", index))
                             .label(if pinned { "Pinned" } else { "Pin" })
                             .small()
@@ -1312,6 +1322,24 @@ impl UnifiedView {
                             })),
                     ),
             )
+    }
+
+    /// The copy icon: put the Markdown of what column `index` shows (only
+    /// what is painted: collapsed or scrolled-away content is left out,
+    /// `ui::panel_export`) on the clipboard.
+    fn copy_column_markdown(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(hosted) = self.hosted.get(index) else {
+            return;
+        };
+        let title = hosted.panel.title(cx);
+        let region = self.column_widths[index].laid_out.get();
+        match panel_export::export(&title, region, cx) {
+            Some(markdown) => {
+                cx.write_to_clipboard(gpui::ClipboardItem::new_string(markdown));
+                crate::ui::toast::info_toast(window, cx, format!("Copied “{title}” as Markdown"));
+            }
+            None => crate::ui::toast::info_toast(window, cx, "Nothing to copy: no text is shown here"),
+        }
     }
 
     /// A draggable divider; `divider` as in [`ColumnDivider`].
@@ -1551,6 +1579,7 @@ impl Render for UnifiedView {
             .on_drop(cx.listener(|this, _: &ChatDrawerEdge, _, cx| this.save_layout(cx)))
             .size_full()
             .flex()
+            .child(panel_export::frame_start())
             .child(tree_column)
             .children(column_elements)
     }

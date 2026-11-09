@@ -22,6 +22,7 @@ use tod_store::conversation::{Conversation, ConversationRepo, Focus, ProtocolKin
 use tod_store::fleet::FleetStore;
 use uuid::Uuid;
 
+use crate::ui::panel_export::RecordText as _;
 use crate::ui::agent_conversation::{
     AgentConversationEvent, AgentConversationPanel, Entry, EntryKind, bind_panel_host_keys,
     forward_panel_keys,
@@ -549,14 +550,27 @@ impl TranscriptPanel {
                         style::list_group_chevron(div())
                             .child(if open { "\u{25be}" } else { "\u{25b8}" }),
                     )
-                    .child(
-                        div().flex_1().min_w_0().overflow_hidden().text_ellipsis().child(format!(
+                    .child({
+                        let label = format!(
                             "{}{}",
                             if live && !open { "\u{25cf} " } else { "" },
                             group.title()
-                        )),
-                    )
-                    .child(style::text_dense_muted(div()).flex_shrink_0().child(group.items.len().to_string())),
+                        );
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .child(label.clone())
+                            .record_text(label)
+                    })
+                    .child({
+                        let count = group.items.len().to_string();
+                        style::text_dense_muted(div())
+                            .flex_shrink_0()
+                            .child(count.clone())
+                            .record_text(count)
+                    }),
             );
             if !open {
                 continue;

@@ -15,6 +15,7 @@ use gpui::{
 };
 use gpui_component::{ActiveTheme, v_flex};
 
+use crate::ui::panel_export::RecordText as _;
 use crate::ui::item_list::keyboard::{
     ItemListDown, ItemListEnd, ItemListHome, ItemListPageDown, ItemListPageUp, ItemListUp,
 };
@@ -460,7 +461,8 @@ impl Render for FindingsPanel {
                     .border_color(border)
                     .text_xs()
                     .text_color(muted)
-                    .child(title),
+                    .child(title.clone())
+                    .record_text(title),
             )
             .child(if empty {
                 div()
@@ -468,6 +470,7 @@ impl Render for FindingsPanel {
                     .text_sm()
                     .text_color(muted)
                     .child("No findings recorded.")
+                    .record_text("No findings recorded.")
                     .into_any_element()
             } else {
                 let row_host = self.host.clone();

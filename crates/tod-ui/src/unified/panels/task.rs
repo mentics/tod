@@ -33,6 +33,7 @@ use uuid::Uuid;
 
 use crate::ui::selectable_text::{selectable_text, selectable_text_colored};
 use crate::ui::style;
+use crate::ui::panel_export::{RecordText as _, recorded};
 
 // T2: the runner line.
 use gpui::{ElementId, Entity, Subscription};
@@ -679,7 +680,8 @@ impl TaskPanel {
                             ),
                             None => style::text_muted(div())
                                 .when(self.header.ticket_terminal, |el| el.line_through())
-                                .child(ticket)
+                                .child(ticket.clone())
+                                .record_text(ticket)
                                 .into_any_element(),
                         })
                     })
@@ -711,7 +713,8 @@ impl TaskPanel {
                     cx.open_url(&url);
                 }),
             )
-            .child(label)
+            .child(label.clone())
+            .record_text(label)
             .into_any_element()
     }
 
@@ -733,7 +736,8 @@ impl TaskPanel {
                     this.open(target, ctrl, cx);
                 }),
             )
-            .child(label)
+            .child(label.clone())
+            .record_text(label)
             .into_any_element()
     }
 
@@ -1444,7 +1448,8 @@ impl TaskPanel {
         let weak = cx.weak_entity();
         let current = self.runner.lifecycle.clone();
         let menu_current = current.clone();
-        Button::new("unified-task-phase")
+        let recorded_current = current.clone();
+        let chip = Button::new("unified-task-phase")
             .label(current)
             .outline()
             .xsmall()
@@ -1461,8 +1466,8 @@ impl TaskPanel {
                     }));
                 }
                 popup
-            })
-            .into_any_element()
+            });
+        recorded(chip, recorded_current).into_any_element()
     }
 
     /// Records the user's request of `kind` (a new session, or going on) for
@@ -1563,7 +1568,7 @@ impl TaskPanel {
                 popup
             });
         }
-        Some(split.into_any_element())
+        Some(recorded(split, label).into_any_element())
     }
 
     /// The runner line's question and its buttons ([`Prompt`]).
@@ -1634,7 +1639,7 @@ impl TaskPanel {
                 selectable_text("unified-task-runner-cloud", text, window, cx),
             ));
         } else if !self.runner.place_text.is_empty() {
-            line = line.child(sep()).child(style::text_muted(div().flex_none()).child(self.runner.place_text.clone()));
+            line = line.child(sep()).child(style::text_muted(div().flex_none()).child(self.runner.place_text.clone()).record_text(self.runner.place_text.clone()));
         }
         if let Some(standing) = &standing {
             for (ix, part) in standing::runner_parts(standing, now_ms()).into_iter().enumerate() {
@@ -1662,7 +1667,10 @@ impl TaskPanel {
             if let Some(tokens) = tokens {
                 line = line
                     .child(sep())
-                    .child(style::text_muted(div().flex_none()).child(format_tokens(*tokens)));
+                    .child({
+                        let t = format_tokens(*tokens);
+                        style::text_muted(div().flex_none()).child(t.clone()).record_text(t)
+                    });
             }
         }
         // Why the runner could not start, or the latest word from the cloud.
@@ -1808,6 +1816,7 @@ impl TaskPanel {
                         .text_sm()
                         .cursor_pointer()
                         .child(format!("{} Answered ({count})", if open { "▾" } else { "▸" }))
+                        .record_text(format!("Answered ({count})"))
                         .on_click(cx.listener(|this, _, _, cx| this.toggle_answered(cx))),
                 )
                 .when_some(entries, |el, entries| {
@@ -1817,7 +1826,7 @@ impl TaskPanel {
                             &self.answered_scroll,
                             div().px_3().max_h(gpui::px(320.)),
                             div().px_3().child(entries).when(count == 0, |el| {
-                                el.child(div().text_xs().text_color(muted).pb_2().child("No answers yet."))
+                                el.child(div().text_xs().text_color(muted).pb_2().child("No answers yet.").record_text("No answers yet."))
                             }),
                         )
                     )

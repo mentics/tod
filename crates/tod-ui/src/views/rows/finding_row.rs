@@ -8,6 +8,7 @@
 
 use super::status_menu::{StatusMenu, StatusMenuHandlers, status_chip};
 use super::{RowHost, RowOptions, row_group, row_tail};
+use crate::ui::panel_export::RecordText as _;
 use crate::ui::item_list::{ColumnSpec, column_cell};
 use crate::ui::selectable_text::selectable_text;
 use crate::ui::style;
@@ -95,7 +96,8 @@ pub fn finding_row<A: From<FindingRowEvent> + 'static>(
 
     let severity = style::badge(div())
         .flex_shrink_0()
-        .child(finding.severity.clone());
+        .child(finding.severity.clone())
+        .record_text(finding.severity.clone());
     let severity = if finding.severity == "high" {
         style::text_error(severity)
     } else {
