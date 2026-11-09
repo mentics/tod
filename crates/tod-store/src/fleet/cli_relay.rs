@@ -91,7 +91,7 @@ done
   for arg in "$@"; do printf '%s\0' "$arg"; done
   printf '%d\n' "$(wc -c < "$tmp/in")"
   cat "$tmp/in"
-} >&3
+} >&3 2>/dev/null
 if ! read -r code out_len _ <&3; then
   echo "tod-cli: no reply from tod at $host:$port: the connection back to the machine running tod is closed (in a cloud sandbox it is open only while tod runs a turn or a terminal there)" >&2
   exit 70
@@ -945,6 +945,7 @@ mod tests {
         assert_eq!(out.status.code(), Some(70));
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(stderr.contains("connection back to the machine running tod is closed"), "{stderr}");
+        assert!(!stderr.contains("write error"), "{stderr}");
         // A second connection lets the server thread finish.
         let _ = TcpStream::connect(("127.0.0.1", port));
         server.join().unwrap();
