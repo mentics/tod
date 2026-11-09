@@ -279,7 +279,14 @@ pub fn sync_now<T: 'static>(
                         cloud_sync::cloud_status(&fleet, node, tod_store::outline::uuid_blob::now_ms())
                 {
                     msg.push_str(". ");
-                    msg.push_str(&status.describe());
+                    if status == cloud_sync::CloudStatus::Lost && cloud_sync::lost::any_marked(&fleet) {
+                        // Sync now is the "next sync": replace it now rather
+                        // than promise it for later.
+                        cloud_sync::lost::spawn_check(fleet.clone(), cloud_sync::lost::Check::Marked);
+                        msg.push_str("Its sandbox is gone; making a new one now (this can take a few minutes).");
+                    } else {
+                        msg.push_str(&status.describe());
+                    }
                 }
                 CloudUpdate::Synced(msg)
             }
