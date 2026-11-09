@@ -258,7 +258,13 @@ mod tests {
             div()
                 .w(px(240.))
                 .child(crate::ui::panel_export::frame_start())
-                .child(selectable_text("export-a", "alpha beta", window, cx))
+                .child(
+                    // Clipped to its own box, as a panel's title is: the
+                    // record must still count as visible.
+                    div()
+                        .overflow_hidden()
+                        .child(selectable_text("export-a", "alpha beta", window, cx)),
+                )
                 .child(super::selectable_markdown("export-b", "## Head\n\nbody", window, cx))
         }
     }
