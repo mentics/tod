@@ -290,21 +290,36 @@ pub fn sync_now<T: 'static>(
         let _ = tx.send_blocking(match cloud_sync::sync_now(&fleet, &root) {
             Ok(report) => {
                 let mut msg = report.summary();
+                let mut return_failed: Option<CloudUpdate> = None;
                 if let Some(node) = node
                     && let Some(status) =
                         cloud_sync::cloud_status(&fleet, node, tod_store::outline::uuid_blob::now_ms())
                 {
                     msg.push_str(". ");
                     if status == cloud_sync::CloudStatus::Lost && cloud_sync::lost::any_marked(&fleet) {
-                        // Sync now is the "next sync": replace it now rather
-                        // than promise it for later.
-                        cloud_sync::lost::spawn_check(fleet.clone(), cloud_sync::lost::Check::Marked);
-                        msg.push_str("Its sandbox is gone; making a new one now (this can take a few minutes).");
+                        // Sync now is the "next sync": replace it now, and
+                        // say what happened, not only that it was started.
+                        match cloud_sync::lost::check_marked_now(&fleet) {
+                            Ok(Some(done)) if done.replaced > 0 => {
+                                msg.push_str("Its sandbox was gone; a new one was made.")
+                            }
+                            Ok(Some(_)) => {
+                                let why = cloud_sync::lost::note(&node.to_string())
+                                    .unwrap_or_else(|| "nothing was replaced".into());
+                                return_failed = Some(CloudUpdate::failed(describe("Replacing its sandbox failed", &anyhow::anyhow!(why))));
+                            }
+                            Ok(None) => msg.push_str(
+                                "Its sandbox is gone; another check is already making a new one.",
+                            ),
+                            Err(err) => {
+                                return_failed = Some(CloudUpdate::failed(describe("Replacing its sandbox failed", &err)));
+                            }
+                        }
                     } else {
                         msg.push_str(&status.describe());
                     }
                 }
-                CloudUpdate::Synced(msg)
+                return_failed.unwrap_or(CloudUpdate::Synced(msg))
             }
             Err(err) => CloudUpdate::failed(describe("Sync failed", &err)),
         });
