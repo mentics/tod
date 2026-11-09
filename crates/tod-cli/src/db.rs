@@ -13,7 +13,6 @@
 //!
 //! Design: `doc/cloud-sandboxes/database-access.md`.
 
-use crate::Invocation;
 use anyhow::{Context, Result, anyhow, bail};
 use std::io::Write;
 use std::path::PathBuf;
@@ -44,14 +43,15 @@ running tod; otherwise it says so.
 /// connection open.
 const KEEP_OPEN_EVERY: Duration = Duration::from_secs(60);
 
-pub fn run(inv: Invocation) -> Result<String> {
-    let mut rest = inv.rest.clone();
+/// Takes no data root: it reads no database.
+pub fn run(rest: &[String], json: bool) -> Result<String> {
+    let mut rest = rest.to_vec();
     if rest.is_empty() || rest[0] == "-h" || rest[0] == "--help" {
         return Ok(USAGE.trim_end().to_string());
     }
     let command = rest.remove(0);
     match command.as_str() {
-        "list" => list(&inv),
+        "list" => list(json),
         "run" => {
             let (name, argv) = parse_run(&rest)?;
             finish(run_command(&name, &argv)?)
@@ -88,10 +88,10 @@ fn parse_run(args: &[String]) -> Result<(String, Vec<String>)> {
     }
 }
 
-fn list(inv: &Invocation) -> Result<String> {
+fn list(json: bool) -> Result<String> {
     let reply = Broker::from_env()?.ask(&serde_json::json!({"op": "list"}))?;
     let dbs = reply["databases"].as_array().cloned().unwrap_or_default();
-    if inv.json {
+    if json {
         return Ok(serde_json::to_string_pretty(&dbs)?);
     }
     if dbs.is_empty() {
