@@ -63,6 +63,11 @@ pub fn record(text: SharedString, markdown: bool) -> AnyElement {
         },
     )
     .absolute()
+    // Pinned: with no insets an absolute child sits where it would have
+    // flowed, below its siblings in a block parent, outside the parent's
+    // clip, and the text would count as not visible.
+    .top_0()
+    .left_0()
     .size_full()
     .into_any_element()
 }
