@@ -398,6 +398,14 @@ impl Assessment {
         waits
     }
 
+    /// The code review has passed clean: nothing left for the babysitter to
+    /// do (threads resolved, checks green, up to date, bot scores met) and
+    /// nothing to wait for but a person. This is what lets the pull request
+    /// be opened and sent to a reviewer.
+    pub fn review_clean(&self) -> bool {
+        !self.merged && self.work().is_empty() && self.waits().iter().all(|w| matches!(w, Wait::HumanReview))
+    }
+
     pub fn next(&self) -> Next {
         if self.merged {
             return Next::Merged;
@@ -1103,6 +1111,16 @@ Not safe.
         assert_eq!(a.next(), Next::Wait(vec![Wait::HumanReview]));
         let clean = Assessment::of(&snap(status("clean", "success"), vec![], vec![]), &none, now());
         assert_eq!(clean.next(), Next::Clear);
+    }
+
+    #[test]
+    fn the_review_is_clean_only_with_nothing_to_do_and_nothing_to_wait_for_but_a_person() {
+        let none = PrReadinessSettings::default();
+        let a = |s: &str, checks: &str| Assessment::of(&snap(status(s, checks), vec![], vec![]), &none, now());
+        assert!(a("blocked", "success").review_clean(), "only a person is missing");
+        assert!(a("clean", "success").review_clean());
+        assert!(!a("unstable", "failure").review_clean(), "failing checks are work");
+        assert!(!a("blocked", "pending").review_clean(), "running checks are a wait");
     }
 
     fn review(author: &str, at: &str, state: &str) -> tod_store::github::PrReview {

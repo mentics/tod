@@ -55,6 +55,19 @@ anchored to the bottom of the column.
 The title and the external ticket id (Linear), so the user can confirm they
 are on the task they meant.
 
+### Pull-request buttons
+
+In `pr`, `pr_draft` and `pr_review`, one row per linked pull request sits
+under the identity line (`unified/panels/pr_controls.rs`, logic in
+`tod_core::pr_actions`): **Labels** (the standard searchable multi-select over
+the repository's own labels, each toggle applied at once), **Open** (draft →
+ready for review) and **Reviewer** (a searchable pick, GitHub's own
+suggestions first, then the people who can be asked). Open and Reviewer stay
+disabled, with the reason in a tooltip, until the code review has passed
+clean (`Assessment::review_clean`: no work left for the babysitter and
+nothing to wait for but a person). Every call to GitHub runs off the UI thread
+and a failure is said on the row.
+
 ### Artifacts
 
 A task's **artifacts** are its lasting outputs: **obligations**, the
