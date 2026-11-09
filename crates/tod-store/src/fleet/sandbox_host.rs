@@ -86,6 +86,11 @@ pub trait SandboxHost: Send + Sync {
     /// Records what `node_id`'s sandbox now runs (the install stamp), so a
     /// later build can tell it is out of date.
     fn record_install(&self, root: &Path, node_id: &str) -> Result<()>;
+    /// Returns once no provisioning or install of `node_id`'s sandbox is
+    /// running (this process or another). An install replaces the relay, which
+    /// ends every agent the relay runs, so an agent must not start in the
+    /// middle of one.
+    fn wait_for_provisioning(&self, root: &Path, node_id: &str) -> Result<()>;
 }
 
 static HOST: RwLock<Option<Arc<dyn SandboxHost>>> = RwLock::new(None);

@@ -57,6 +57,11 @@ impl SandboxHost for CoreHost {
         provisioning::clear_intent(root, node_id)
     }
 
+    fn wait_for_provisioning(&self, root: &Path, node_id: &str) -> Result<()> {
+        drop(provisioning::lock_node_provisioning(root, node_id, &mut |m| tracing::info!("{m}"))?);
+        Ok(())
+    }
+
     fn record_install(&self, root: &Path, node_id: &str) -> Result<()> {
         refresh::record(root, node_id, &refresh::install()?, None)
     }

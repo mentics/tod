@@ -123,6 +123,12 @@ pub fn environment_for(
     cwd: &Workdir,
     data_root: &Path,
 ) -> Result<AgentEnvironment> {
+    if let (Workdir::Sandbox { .. }, Some(files)) = (cwd, files) {
+        // An install of this node's sandbox restarts its relay and so ends an
+        // agent started during it (the chat's turn failed with "the agent is
+        // no longer running in the sandbox"): wait for it to finish.
+        super::sandbox_host::host()?.wait_for_provisioning(data_root, &files.node_id)?;
+    }
     if let Some(launch) = sandbox_launch_for(cwd, data_root)? {
         return Ok(AgentEnvironment::Sandbox(launch));
     }
