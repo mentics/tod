@@ -516,10 +516,48 @@ impl Blaxel {
             .header("X-Blaxel-Workspace", &self.workspace)
     }
 
+    /// A control-plane call (create, fork, delete, list, ...), made again when
+    /// the network, not the API, failed it, within the retry budget: a call that
+    /// only reads or deletes (`idempotent`) after any network error or a
+    /// 502/503/504/429 answer; any other only after an error that means the
+    /// request was never sent ([`transport_never_sent`]), so it cannot happen
+    /// twice. What still fails is the caller's to report.
+    fn cp(
+        &self,
+        idempotent: bool,
+        send: impl Fn() -> Result<ureq::http::Response<ureq::Body>, ureq::Error>,
+    ) -> Result<ureq::http::Response<ureq::Body>, ureq::Error> {
+        let start = Instant::now();
+        let mut delay = self.retry.initial;
+        let mut attempt = 0u32;
+        loop {
+            attempt += 1;
+            let again = match send() {
+                Ok(resp) if idempotent && matches!(resp.status().as_u16(), 502 | 503 | 504 | 429) => {
+                    Some(format!("{}", resp.status()))
+                }
+                Ok(resp) => return Ok(resp),
+                Err(err) if (idempotent || transport_never_sent(&err)) && transport_is_retryable(&err) => {
+                    if start.elapsed() + delay > self.retry.budget {
+                        return Err(err);
+                    }
+                    Some(err.to_string())
+                }
+                Err(err) => return Err(err),
+            };
+            let wait = delay.min(self.retry.max);
+            if start.elapsed() + wait > self.retry.budget {
+                // Out of budget on a bad status: the last answer, for the caller to read.
+                return send();
+            }
+            tracing::info!("Blaxel API: {}; retrying in {wait:?} (attempt {attempt})", again.unwrap_or_default());
+            std::thread::sleep(wait);
+            delay = (delay * 2).min(self.retry.max);
+        }
+    }
+
     pub fn get(&self, name: &str) -> Result<Option<SandboxInfo>> {
-        let mut resp = self
-            .auth(self.agent.get(&format!("{API}/sandboxes/{name}")))
-            .call()
+        let mut resp = self.cp(true, || self.auth(self.agent.get(&format!("{API}/sandboxes/{name}"))).call())
             .context("Blaxel API")?;
         if resp.status().as_u16() == 404 {
             return Ok(None);
@@ -532,9 +570,7 @@ impl Blaxel {
     /// The sandbox's whole record as Blaxel returns it (for live checks of
     /// its `spec.network.proxy`; may hold rule values: never print it as is).
     pub fn get_json(&self, name: &str) -> Result<Option<Value>> {
-        let mut resp = self
-            .auth(self.agent.get(&format!("{API}/sandboxes/{name}")))
-            .call()
+        let mut resp = self.cp(true, || self.auth(self.agent.get(&format!("{API}/sandboxes/{name}"))).call())
             .with_context(|| format!("Blaxel API: GET {API}/sandboxes/{name}"))?;
         if resp.status().as_u16() == 404 {
             return Ok(None);
@@ -544,7 +580,7 @@ impl Blaxel {
     }
 
     pub fn list(&self) -> Result<Vec<SandboxInfo>> {
-        let mut resp = self.auth(self.agent.get(&format!("{API}/sandboxes"))).call().context("Blaxel API")?;
+        let mut resp = self.cp(true, || self.auth(self.agent.get(&format!("{API}/sandboxes"))).call()).context("Blaxel API")?;
         check(&mut resp, "list sandboxes")?;
         let v: Value = resp.body_mut().read_json()?;
         Ok(v.as_array().map(|a| a.iter().map(parse_info).collect()).unwrap_or_default())
@@ -552,7 +588,7 @@ impl Blaxel {
 
     /// The listing as Blaxel returns it, for what [`SandboxInfo`] does not keep.
     pub fn list_json(&self) -> Result<Vec<Value>> {
-        let mut resp = self.auth(self.agent.get(&format!("{API}/sandboxes"))).call().context("Blaxel API")?;
+        let mut resp = self.cp(true, || self.auth(self.agent.get(&format!("{API}/sandboxes"))).call()).context("Blaxel API")?;
         check(&mut resp, "list sandboxes")?;
         let v: Value = resp.body_mut().read_json()?;
         Ok(v.as_array().cloned().unwrap_or_default())
@@ -578,20 +614,20 @@ impl Blaxel {
             body["spec"]["network"] = json!({ "proxy": proxy });
         }
         let mut resp =
-            self.auth(self.agent.post(&format!("{API}/sandboxes"))).send_json(&body).context("Blaxel API")?;
+            self.cp(false, || self.auth(self.agent.post(&format!("{API}/sandboxes"))).send_json(&body)).context("Blaxel API")?;
         check(&mut resp, "create sandbox")
     }
 
     /// Creates a sandbox from a full request body (see `node::create_body`).
     pub fn create_from_body(&self, body: &Value) -> Result<()> {
         let mut resp =
-            self.auth(self.agent.post(&format!("{API}/sandboxes"))).send_json(body).context("Blaxel API")?;
+            self.cp(false, || self.auth(self.agent.post(&format!("{API}/sandboxes"))).send_json(body)).context("Blaxel API")?;
         check(&mut resp, "create sandbox")
     }
 
     /// `GET {API}{path}`, for calls this type has no method for; `None` on a 404.
     pub fn get_path(&self, path: &str, what: &str) -> Result<Option<Value>> {
-        let mut resp = self.auth(self.agent.get(&format!("{API}{path}"))).call().context("Blaxel API")?;
+        let mut resp = self.cp(true, || self.auth(self.agent.get(&format!("{API}{path}"))).call()).context("Blaxel API")?;
         if resp.status().as_u16() == 404 {
             return Ok(None);
         }
@@ -623,13 +659,13 @@ impl Blaxel {
 
     /// `PUT {API}{path}` with a JSON body, for calls this type has no method for.
     pub fn put_json(&self, path: &str, body: &Value, what: &str) -> Result<()> {
-        let mut resp = self.auth(self.agent.put(&format!("{API}{path}"))).send_json(body).context("Blaxel API")?;
+        let mut resp = self.cp(false, || self.auth(self.agent.put(&format!("{API}{path}"))).send_json(body)).context("Blaxel API")?;
         check(&mut resp, what)
     }
 
     /// `POST {API}{path}` with a JSON body, for calls this type has no method for.
     pub fn post_json(&self, path: &str, body: &Value, what: &str) -> Result<()> {
-        let mut resp = self.auth(self.agent.post(&format!("{API}{path}"))).send_json(body).context("Blaxel API")?;
+        let mut resp = self.cp(false, || self.auth(self.agent.post(&format!("{API}{path}"))).send_json(body)).context("Blaxel API")?;
         check(&mut resp, what)
     }
 
@@ -649,9 +685,7 @@ impl Blaxel {
         if !envs.is_empty() {
             body["envs"] = envs.iter().map(|(name, value)| json!({ "name": name, "value": value })).collect();
         }
-        let mut resp = self
-            .auth(self.agent.post(&format!("{API}/sandboxes/{source}/fork")))
-            .send_json(&body)
+        let mut resp = self.cp(false, || self.auth(self.agent.post(&format!("{API}/sandboxes/{source}/fork"))).send_json(&body))
             .context("Blaxel API")?;
         match resp.status().as_u16() {
             404 => bail!("fork: no sandbox named {source}"),
@@ -673,7 +707,7 @@ impl Blaxel {
 
     /// `DELETE {API}{path}`; a 404 (already gone) is not an error.
     pub fn delete_path(&self, path: &str, what: &str) -> Result<()> {
-        let mut resp = self.auth(self.agent.delete(&format!("{API}{path}"))).call().context("Blaxel API")?;
+        let mut resp = self.cp(true, || self.auth(self.agent.delete(&format!("{API}{path}"))).call()).context("Blaxel API")?;
         if resp.status().as_u16() == 404 {
             return Ok(());
         }
@@ -682,9 +716,7 @@ impl Blaxel {
 
     /// The schedules on `sandbox` (a control-plane call: it does not wake it).
     pub fn list_schedules(&self, sandbox: &str) -> Result<Vec<Schedule>> {
-        let mut resp = self
-            .auth(self.agent.get(&format!("{API}/sandboxes/{sandbox}/schedules")))
-            .call()
+        let mut resp = self.cp(true, || self.auth(self.agent.get(&format!("{API}/sandboxes/{sandbox}/schedules"))).call())
             .context("Blaxel API")?;
         check(&mut resp, "list schedules")?;
         let v: Value = resp.body_mut().read_json()?;
@@ -693,9 +725,7 @@ impl Blaxel {
 
     /// Creates a schedule on `sandbox` from [`schedule_body`]; Blaxel picks its id.
     pub fn create_schedule(&self, sandbox: &str, body: &Value) -> Result<Schedule> {
-        let mut resp = self
-            .auth(self.agent.post(&format!("{API}/sandboxes/{sandbox}/schedules")))
-            .send_json(body)
+        let mut resp = self.cp(false, || self.auth(self.agent.post(&format!("{API}/sandboxes/{sandbox}/schedules"))).send_json(body))
             .context("Blaxel API")?;
         check(&mut resp, "create schedule")?;
         let v: Value = resp.body_mut().read_json()?;
@@ -722,7 +752,7 @@ impl Blaxel {
 
     /// A volume by name, if it exists: its raw record.
     pub fn get_volume(&self, name: &str) -> Result<Option<Value>> {
-        let mut resp = self.auth(self.agent.get(&format!("{API}/volumes/{name}"))).call().context("Blaxel API")?;
+        let mut resp = self.cp(true, || self.auth(self.agent.get(&format!("{API}/volumes/{name}"))).call()).context("Blaxel API")?;
         if resp.status().as_u16() == 404 {
             return Ok(None);
         }
@@ -735,7 +765,7 @@ impl Blaxel {
     pub fn create_volume(&self, name: &str, region: &str, size_mb: u32, labels: &[(&str, &str)]) -> Result<bool> {
         let body = volume_body(name, region, size_mb, labels);
         let mut resp =
-            self.auth(self.agent.post(&format!("{API}/volumes"))).send_json(&body).context("Blaxel API")?;
+            self.cp(false, || self.auth(self.agent.post(&format!("{API}/volumes"))).send_json(&body)).context("Blaxel API")?;
         if resp.status().as_u16() == 409 {
             return Ok(false);
         }
@@ -760,7 +790,7 @@ impl Blaxel {
         }
         let body = json!({ "metadata": { "name": name }, "spec": { "region": region } });
         let mut resp =
-            self.auth(self.agent.post(&format!("{API}/drives"))).send_json(&body).context("Blaxel API")?;
+            self.cp(false, || self.auth(self.agent.post(&format!("{API}/drives"))).send_json(&body)).context("Blaxel API")?;
         // Another node's provisioning made it first.
         if resp.status().as_u16() != 409 {
             check(&mut resp, &format!("create drive {name}"))?;
@@ -771,9 +801,7 @@ impl Blaxel {
     /// A short-lived token (and its lifetime in seconds) for the drive's S3
     /// endpoint, sent as `Authorization: Bearer` (see [`crate::drive`]).
     pub fn drive_access_token(&self, name: &str) -> Result<(String, u64)> {
-        let mut resp = self
-            .auth(self.agent.post(&format!("{API}/drives/{name}/access-token")))
-            .send_empty()
+        let mut resp = self.cp(false, || self.auth(self.agent.post(&format!("{API}/drives/{name}/access-token"))).send_empty())
             .context("Blaxel API")?;
         check(&mut resp, "drive access token")?;
         let v: Value = resp.body_mut().read_json()?;
@@ -787,9 +815,7 @@ impl Blaxel {
     /// it again. The mount survives standby.
     pub fn mount_drive(&self, url: &str, drive: &str, mount_path: &str, drive_path: &str) -> Result<()> {
         let body = json!({ "driveName": drive, "mountPath": mount_path, "drivePath": drive_path });
-        let mut resp = self
-            .auth(self.agent.post(&format!("{url}/drives/mount")))
-            .send_json(&body)
+        let mut resp = self.cp(false, || self.auth(self.agent.post(&format!("{url}/drives/mount"))).send_json(&body))
             .context("sandbox drive API")?;
         check(&mut resp, "mount drive")
     }
@@ -800,7 +826,7 @@ impl Blaxel {
 
     pub fn delete(&self, name: &str) -> Result<()> {
         let mut resp =
-            self.auth(self.agent.delete(&format!("{API}/sandboxes/{name}"))).call().context("Blaxel API")?;
+            self.cp(true, || self.auth(self.agent.delete(&format!("{API}/sandboxes/{name}"))).call()).context("Blaxel API")?;
         if resp.status().as_u16() == 404 {
             return Ok(());
         }
@@ -1510,6 +1536,30 @@ mod http_tests {
         let (url, _) = stub(|_, _, _| (404, NOT_READY.to_string()));
         let err = client().get_url(&format!("{url}/port/1")).map(|_| ()).unwrap_err();
         assert!(format!("{err:#}").contains("still not ready after"), "{err:#}");
+    }
+
+    #[test]
+    fn a_control_plane_call_is_repeated_only_when_that_cannot_do_it_twice() {
+        use std::cell::Cell;
+        let tries = |idempotent: bool, err: fn() -> ureq::Error| {
+            let n = Cell::new(0u32);
+            let r = client().cp(idempotent, || {
+                n.set(n.get() + 1);
+                Err(err())
+            });
+            assert!(r.is_err());
+            n.get()
+        };
+        let reset = || ureq::Error::Io(std::io::Error::from(std::io::ErrorKind::ConnectionReset));
+        let refused = || ureq::Error::Io(std::io::Error::from(std::io::ErrorKind::ConnectionRefused));
+        // Never sent: always safe to repeat.
+        assert!(tries(false, refused) > 1);
+        assert!(tries(true, refused) > 1);
+        // May have been sent: only a read or delete is repeated.
+        assert_eq!(tries(false, reset), 1);
+        assert!(tries(true, reset) > 1);
+        // Not the network's: not repeated.
+        assert_eq!(tries(true, || ureq::Error::BadUri("x".into())), 1);
     }
 
     #[test]

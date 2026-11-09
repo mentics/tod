@@ -191,6 +191,10 @@ impl LiveConversation {
     }
 }
 
+/// How long to wait before each new try of a turn whose agent was lost before
+/// it replied (a relay restart takes a few seconds): two tries.
+const LOST_RETRY_WAITS: &[Duration] = &[Duration::from_secs(3), Duration::from_secs(8)];
+
 struct ConversationWorker {
     spec: ConversationSpec,
     child: Arc<Mutex<Option<AgentProcess>>>,
@@ -241,7 +245,32 @@ impl ConversationWorker {
                 break;
             }
             self.cancelled.store(false, Ordering::SeqCst);
-            let result = self.turn(&mut live, run_id, &blocks, &images, &title);
+            let mut result = self.turn(&mut live, run_id, &blocks, &images, &title);
+            // An agent lost before it produced anything for this turn (its
+            // sandbox's relay restarted, a process died on start) has done
+            // nothing to repeat: start another, resuming the session, and send
+            // the turn again, so the user never sees it. Once it has produced
+            // output, repeating the turn could repeat what it did.
+            for wait in LOST_RETRY_WAITS {
+                let lost_early = matches!(&result, Err(err) if err.downcast_ref::<AgentLost>().is_some())
+                    && self.reply_parts.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+                    && !self.cancelled.load(Ordering::SeqCst)
+                    && !self.closed.load(Ordering::SeqCst);
+                if !lost_early {
+                    break;
+                }
+                tracing::warn!(
+                    event = "agent",
+                    action = "acp_agent_lost_retry",
+                    wait_secs = wait.as_secs(),
+                    "the agent was lost before replying; starting another and sending the turn again"
+                );
+                if let Some(session) = live.take() {
+                    session.shutdown(self.child.clone());
+                }
+                thread::sleep(*wait);
+                result = self.turn(&mut live, run_id, &blocks, &images, &title);
+            }
             if result.is_err() {
                 // A failed or cancelled turn can leave the process mid-reply;
                 // the next message starts clean by resuming the session.
@@ -972,6 +1001,46 @@ fn append_claude_custom_title(
     Ok(())
 }
 
+/// How many of the agent's last stderr lines are kept to say why it stopped.
+const STDERR_TAIL_LINES: usize = 5;
+
+/// The agent's last few stderr lines: what a lost agent said on its way out
+/// (for a cloud sandbox, the bridge's own reason).
+type StderrTail = Arc<Mutex<Vec<String>>>;
+
+/// The agent process ended or its connection dropped while tod was waiting
+/// for it: not what it was asked, so not an answer. A turn that lost its agent
+/// before the agent produced anything is run again (see
+/// `ConversationWorker::run`); otherwise this is what the user is told.
+#[derive(Debug)]
+pub struct AgentLost {
+    /// The agent's last stderr lines, if it said anything.
+    pub said: Option<String>,
+    /// Whether the agent was in a cloud sandbox or dev container.
+    pub remote: bool,
+}
+
+impl std::fmt::Display for AgentLost {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let said = self.said.as_deref().map(|s| format!(" ({s})")).unwrap_or_default();
+        if self.remote {
+            write!(
+                f,
+                "The agent stopped unexpectedly{said}. Its sandbox or container may have restarted, for example while \
+                 tod updated it. What to do: send your message again; the conversation continues where it was"
+            )
+        } else {
+            write!(
+                f,
+                "The agent process stopped unexpectedly{said}. What to do: send your message again; the conversation \
+                 continues where it was"
+            )
+        }
+    }
+}
+
+impl std::error::Error for AgentLost {}
+
 /// Drain the ACP child's stderr into the same traffic log used for its
 /// JSON-RPC stdio, so process-level errors (e.g. the ACP bridge's own
 /// "Internal error" diagnostics) end up somewhere other than an inherited
@@ -981,12 +1050,20 @@ fn spawn_stderr_logger(
     traffic_log: Option<SharedAgentTrafficLog>,
     tag: TrafficTag,
     kind: AgentRunKind,
+    tail: StderrTail,
 ) {
     thread::spawn(move || {
         let reader = BufReader::new(stderr);
         for line in reader.lines().map_while(Result::ok) {
             if line.trim().is_empty() {
                 continue;
+            }
+            {
+                let mut tail = tail.lock().unwrap_or_else(|e| e.into_inner());
+                if tail.len() >= STDERR_TAIL_LINES {
+                    tail.remove(0);
+                }
+                tail.push(line.clone());
             }
             match &traffic_log {
                 Some(log) => tag.record(
@@ -1032,7 +1109,8 @@ fn run_acp_session(
     let stdin = child.stdin.take().context("agent stdin unavailable")?;
     let stdout = child.stdout.take().context("agent stdout unavailable")?;
     let stderr = child.stderr.take().context("agent stderr unavailable")?;
-    spawn_stderr_logger(stderr, traffic_log.clone(), tag.clone(), kind);
+    let stderr_tail = StderrTail::default();
+    spawn_stderr_logger(stderr, traffic_log.clone(), tag.clone(), kind, stderr_tail.clone());
     {
         let mut guard = child_slot.lock().unwrap_or_else(|e| e.into_inner());
         *guard = Some(child);
@@ -1058,6 +1136,8 @@ fn run_acp_session(
         reply_parts: None,
         usage: None,
         sign_in_hint: sign_in_hint(host, environment),
+        stderr_tail,
+        remote: !matches!(environment, AgentEnvironment::Host),
     };
 
     let client_name = host.client_name();
@@ -1203,6 +1283,10 @@ struct AcpClient {
     usage: Option<SharedAcpUsage>,
     /// What to tell the user when the agent says it is not signed in.
     sign_in_hint: String,
+    /// The agent's last stderr lines, for [`AgentLost`].
+    stderr_tail: StderrTail,
+    /// Whether the agent runs in a sandbox or container, for [`AgentLost`].
+    remote: bool,
 }
 
 impl AcpClient {
@@ -1294,6 +1378,14 @@ impl AcpClient {
         result
     }
 
+    /// The agent is gone: [`AgentLost`], with what it last said.
+    fn lost(&self) -> AgentLost {
+        // The logger thread may not have read the last line yet.
+        thread::sleep(Duration::from_millis(200));
+        let said = self.stderr_tail.lock().unwrap_or_else(|e| e.into_inner()).last().cloned();
+        AgentLost { said, remote: self.remote }
+    }
+
     fn send_request(&mut self, method: &str, params: Value) -> Result<i64> {
         let id = self.next_id;
         self.next_id += 1;
@@ -1302,8 +1394,12 @@ impl AcpClient {
             TrafficDirection::Request,
             &format!("ACP → {method}\n{message}"),
         );
-        writeln!(self.stdin, "{message}")?;
-        self.stdin.flush()?;
+        if let Err(err) = writeln!(self.stdin, "{message}").and_then(|()| self.stdin.flush()) {
+            return Err(match err.kind() {
+                std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset => self.lost().into(),
+                _ => anyhow::Error::new(err).context("write to the agent"),
+            });
+        }
         Ok(id)
     }
 
@@ -1368,7 +1464,7 @@ impl AcpClient {
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => continue,
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    bail!("ACP stdout reader disconnected")
+                    return Err(self.lost().into());
                 }
             }
         }
@@ -2201,7 +2297,8 @@ impl PersistentAcpSession {
         let stdin = child.stdin.take().context("agent stdin unavailable")?;
         let stdout = child.stdout.take().context("agent stdout unavailable")?;
         let stderr = child.stderr.take().context("agent stderr unavailable")?;
-        spawn_stderr_logger(stderr, traffic_log.clone(), tag.clone(), kind);
+        let stderr_tail = StderrTail::default();
+        spawn_stderr_logger(stderr, traffic_log.clone(), tag.clone(), kind, stderr_tail.clone());
         {
             let mut guard = child_slot.lock().unwrap_or_else(|e| e.into_inner());
             *guard = Some(child);
@@ -2227,6 +2324,8 @@ impl PersistentAcpSession {
             reply_parts,
             usage,
             sign_in_hint: sign_in_hint(host, environment),
+            stderr_tail,
+            remote: !matches!(environment, AgentEnvironment::Host),
         };
 
         let client_name = host.client_name();
@@ -2616,6 +2715,59 @@ while True:
             }
         }
         panic!("timed out waiting for run {id:?}");
+    }
+
+    /// The first launch dies on its first request (as an agent does when its
+    /// sandbox's relay restarts); later ones are [`FAKE_ACP_AGENT`].
+    #[test]
+    fn a_turn_whose_agent_is_lost_before_replying_is_run_again() {
+        use crate::agent_launch::AgentLaunchOptions;
+        use crate::platform::AgentPlatform;
+
+        if !python_available() {
+            eprintln!("skipping: python is not available to run the fake ACP agent");
+            return;
+        }
+        let dir = scratch_dir("fake-acp-lost");
+        let agent_bin = dir.join("fake-claude-agent-acp.py");
+        let script = format!(
+            "import os, sys\n\
+             MARK = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'died')\n\
+             if not os.path.exists(MARK):\n\
+             \topen(MARK, 'w').close()\n\
+             \tsys.stdin.readline()\n\
+             \tprint('the agent is no longer running in the sandbox', file=sys.stderr, flush=True)\n\
+             \tsys.exit(1)\n{FAKE_ACP_AGENT}"
+        );
+        std::fs::write(&agent_bin, script).unwrap();
+        let mut provider = CursorAcpProvider::with_agent_bin(AcpHost::Claude, agent_bin);
+        let handle = provider
+            .send_session_turn(SessionTurn {
+                key: "run-lost".into(),
+                owner_id: "config".into(),
+                title: String::new(),
+                cwd: dir.clone(),
+                options: AgentLaunchOptions::for_platform(AgentPlatform::Claude),
+                resume_session_id: None,
+                opening: None,
+                message: "hello".into(),
+                images: Vec::new(),
+                purpose: crate::provider::SessionPurpose::Chat,
+                env: Vec::new(),
+                environment: AgentEnvironment::Host,
+            })
+            .unwrap();
+        assert_eq!(wait_for_reply(&mut provider, handle.id), "reply to: hello");
+        assert!(dir.join("died").exists());
+    }
+
+    #[test]
+    fn a_lost_agent_says_what_to_do() {
+        let host = AgentLost { said: Some("relay restarted".into()), remote: false };
+        let text = host.to_string();
+        assert!(text.contains("relay restarted") && text.contains("What to do: send your message again"), "{text}");
+        let remote = AgentLost { said: None, remote: true }.to_string();
+        assert!(remote.contains("sandbox or container may have restarted"), "{remote}");
     }
 
     #[test]
