@@ -207,7 +207,14 @@ pub fn located_rows(fleet: &FleetStore, rows: Vec<CloudNodeRow>, root: &std::pat
             )?,
             None => {
                 let mine = row.ownership.owner_client.as_deref().is_none_or(|owner| owner == me);
-                if row.lost_at.is_none() && mine && !super::sandbox_deleted_by_user(root, &id) {
+                if row.lost_at.is_some() && mine && !super::sandbox_deleted_by_user(root, &id) {
+                    // Marked lost and its location is gone too (the sandbox
+                    // was removed): nothing to disagree with, and exactly
+                    // what a replacement makes again. Dropping it here left
+                    // Sync now saying "nothing was replaced".
+                    crate::node_problems::clear(fleet, &id, tod_store::node_problems::KIND_CLOUD_RECORD)?;
+                    consistent.push(row);
+                } else if row.lost_at.is_none() && mine && !super::sandbox_deleted_by_user(root, &id) {
                     report_record_problem(
                         fleet,
                         &id,
@@ -1204,11 +1211,12 @@ mod tests {
         let problems = fx.problems();
         assert!(problems.len() == 1 && problems[0].contains("records none"), "{problems:?}");
 
-        // Marked lost (a deleted sandbox): nothing to say.
+        // Marked lost (its sandbox is gone): nothing to say, and it is kept
+        // so a replacement makes the sandbox again.
         fx.fleet.enqueue(FleetMutation::CloudNodeMarkLost { node: fx.node, at: 3 }).unwrap();
         fx.fleet.writer().flush().unwrap();
         fx.fleet.reload_if_stale().unwrap();
-        assert!(located_rows(&fx.fleet, rows_of(&fx), &fx.root).unwrap().is_empty());
+        assert_eq!(located_rows(&fx.fleet, rows_of(&fx), &fx.root).unwrap().len(), 1);
         assert!(fx.problems().is_empty(), "no longer true, so the report is dropped");
 
         // Another client's row has no location here and is not this machine's to act on.
