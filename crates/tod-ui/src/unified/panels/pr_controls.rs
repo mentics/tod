@@ -193,12 +193,14 @@ impl PrControls {
             row.busy = Some("Reading GitHub…");
         }
         let root = self.root.clone();
+        let (fleet, node) = (self.fleet.clone(), self.node_id);
         cx.spawn(async move |this, cx| {
             let read = {
                 let pr = pr.clone();
                 cx.background_executor()
                     .spawn(async move {
-                        let facts = tod_core::pr_actions::load(&root, &pr)?;
+                        let answered = tod_core::pr_readiness::agent_answered_at(&fleet, node).map_err(|e| format!("{e:#}"))?;
+                        let facts = tod_core::pr_actions::load(&root, &pr, answered)?;
                         let labels = tod_core::pr_actions::repo_labels(&root, &pr)?;
                         let reviewers = if facts.review_clean && !facts.merged {
                             tod_core::pr_actions::reviewer_choices(&root, &pr)?
@@ -288,17 +290,19 @@ impl PrControls {
 
     fn apply_labels(&mut self, pr: NodePr, labels: Vec<String>, cx: &mut Context<Self>) {
         self.record("pr_labels", cx);
-        self.run(pr, "Setting labels…", cx, move |root, pr| tod_core::pr_actions::set_labels(root, pr, &labels));
+        self.run(pr, "Setting labels…", cx, move |root, pr, _| tod_core::pr_actions::set_labels(root, pr, &labels));
     }
 
     fn open(&mut self, pr: NodePr, cx: &mut Context<Self>) {
         self.record("pr_open", cx);
-        self.run(pr, "Opening for review…", cx, tod_core::pr_actions::open_for_review);
+        self.run(pr, "Opening for review…", cx, move |root, pr, answered| {
+            tod_core::pr_actions::open_for_review(root, pr, answered)
+        });
     }
 
     fn apply_reviewer(&mut self, pr: NodePr, login: String, cx: &mut Context<Self>) {
         self.record("pr_reviewer", cx);
-        self.run(pr, "Asking for review…", cx, move |root, pr| tod_core::pr_actions::request_reviewer(root, pr, &login));
+        self.run(pr, "Asking for review…", cx, move |root, pr, answered| tod_core::pr_actions::request_reviewer(root, pr, &login, answered));
     }
 
     /// Run `job` against GitHub off the UI thread, then read the pull request
@@ -308,7 +312,7 @@ impl PrControls {
         pr: NodePr,
         what: &'static str,
         cx: &mut Context<Self>,
-        job: impl FnOnce(&std::path::Path, &NodePr) -> Result<(), String> + Send + 'static,
+        job: impl FnOnce(&std::path::Path, &NodePr, Option<chrono::DateTime<chrono::Utc>>) -> Result<(), String> + Send + 'static,
     ) {
         if let Some(row) = self.row_mut(&pr) {
             row.busy = Some(what);
@@ -316,10 +320,16 @@ impl PrControls {
         }
         cx.notify();
         let root = self.root.clone();
+        let (fleet, node) = (self.fleet.clone(), self.node_id);
         cx.spawn(async move |this, cx| {
             let result = {
                 let pr = pr.clone();
-                cx.background_executor().spawn(async move { job(&root, &pr) }).await
+                cx.background_executor()
+                    .spawn(async move {
+                        let answered = tod_core::pr_readiness::agent_answered_at(&fleet, node).map_err(|e| format!("{e:#}"))?;
+                        job(&root, &pr, answered)
+                    })
+                    .await
             };
             this.update(cx, |this, cx| {
                 if let Err(err) = result {
