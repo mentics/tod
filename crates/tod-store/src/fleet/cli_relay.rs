@@ -59,6 +59,9 @@ if ! exec 3<>"/dev/tcp/$host/$port"; then
 fi
 tmp="$(mktemp -d)" || exit 70
 trap 'rm -rf "$tmp"' EXIT
+# A far end that closes at once (a sandbox's tunnel with nobody on this
+# machine's side) must reach the error below, not kill this with SIGPIPE.
+trap '' PIPE
 : > "$tmp/in"
 # stdin goes along only to a command that reads it (a `-` value, or
 # `questions add`): an agent's stdin may be a pipe that never closes.
@@ -90,7 +93,7 @@ done
   cat "$tmp/in"
 } >&3
 if ! read -r code out_len _ <&3; then
-  echo "tod-cli: no reply from tod" >&2
+  echo "tod-cli: no reply from tod at $host:$port: the connection back to the machine running tod is closed (in a cloud sandbox it is open only while tod runs a turn or a terminal there)" >&2
   exit 70
 fi
 cat <&3 > "$tmp/out"
@@ -911,6 +914,40 @@ mod tests {
         assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
         assert_eq!(String::from_utf8_lossy(&out.stdout), "from tod\n");
         assert_eq!(server.join().unwrap(), ["pr", "status", "--node", "x"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A tunnel whose far end hangs up at once says so, instead of dying of
+    /// SIGPIPE with no word.
+    #[cfg(unix)]
+    #[test]
+    fn a_closed_tunnel_is_named_not_a_silent_sigpipe() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let (stream, _) = listener.accept().unwrap();
+                drop(stream);
+            }
+        });
+        let dir = std::env::temp_dir().join(format!("tod-shim-closed-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let shim = dir.join("tod-cli");
+        std::fs::write(&shim, SHIM_SCRIPT).unwrap();
+        let out = Command::new("bash")
+            .arg(&shim)
+            .args(["node", "show", "x"])
+            .env(HOST_ENV, "127.0.0.1")
+            .env(PORT_ENV, port.to_string())
+            .env(TOKEN_ENV, "tok")
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(70));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("connection back to the machine running tod is closed"), "{stderr}");
+        // A second connection lets the server thread finish.
+        let _ = TcpStream::connect(("127.0.0.1", port));
+        server.join().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 

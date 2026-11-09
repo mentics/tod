@@ -57,11 +57,11 @@ impl Service {
             databases: Box::new(move || databases(&databases_root)),
             // The node's Files location is the one record of its sandbox: a
             // node this machine has no location for is not this machine's to
-            // answer for (the `cloud_nodes` copy is not read).
+            // answer for (the `cloud_nodes` copy is not read). Nor is its
+            // lost mark: the request came from a sandbox, and a mark left
+            // stale (a sandbox made again, a poke that only failed) would
+            // otherwise refuse the node's own machine.
             sandbox_of: Box::new(move |node| {
-                if cloud_sync::cloud_node(&fleet, node).is_some_and(|c| c.lost_at.is_some()) {
-                    return None;
-                }
                 match cloud_sync::cloud_sandbox_if_any(&fleet, node) {
                     Ok(sandbox) => sandbox,
                     Err(err) => {
