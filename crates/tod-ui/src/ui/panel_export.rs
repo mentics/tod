@@ -153,6 +153,12 @@ fn render(title: &str, mut blocks: Vec<Block>) -> String {
             _ => lines.push(vec![block]),
         }
     }
+    // A taller block (bigger type) can start a little higher than the text
+    // beside it, so the top-to-bottom sort alone puts it first: within a
+    // line, read left to right.
+    for line in &mut lines {
+        line.sort_by(|a, b| a.left.total_cmp(&b.left));
+    }
     let mut out = format!("# {}\n", title.trim());
     for line in lines {
         let parts: Vec<String> = line
@@ -205,6 +211,16 @@ mod tests {
             ],
         );
         assert_eq!(out, "# Plan — Ship it\n\nlabel · value\n\nsecond\n");
+    }
+
+    #[test]
+    fn a_taller_block_that_starts_higher_still_reads_after_the_one_on_its_left() {
+        let mut tall = block(0., 200., "Conflicting requirements", false);
+        tall.bottom = 22.;
+        let mut small = block(3., 0., "Run the KB cleanup…", false);
+        small.bottom = 19.;
+        let out = render("T", vec![tall, small]);
+        assert_eq!(out, "# T\n\nRun the KB cleanup… · Conflicting requirements\n");
     }
 
     #[test]
