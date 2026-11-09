@@ -365,6 +365,32 @@ pub fn describe_failure(status: ureq::http::StatusCode, body: &str) -> String {
     format!("{status}\n{}{detail}", message.trim().trim_end_matches('.'))
 }
 
+/// Whether a transport error means the request was never sent (the
+/// connection was not made), so repeating it cannot do anything twice.
+fn transport_never_sent(err: &ureq::Error) -> bool {
+    use std::io::ErrorKind::*;
+    match err {
+        ureq::Error::Timeout(ureq::Timeout::Connect | ureq::Timeout::Resolve) => true,
+        ureq::Error::HostNotFound | ureq::Error::ConnectionFailed => true,
+        ureq::Error::Io(e) => matches!(e.kind(), ConnectionRefused | NetworkUnreachable | HostUnreachable),
+        _ => false,
+    }
+}
+
+/// Whether a transport error is the network's, so a wait may cure it.
+fn transport_is_retryable(err: &ureq::Error) -> bool {
+    use std::io::ErrorKind::*;
+    match err {
+        ureq::Error::Timeout(_) | ureq::Error::HostNotFound | ureq::Error::ConnectionFailed => true,
+        ureq::Error::Io(e) => matches!(
+            e.kind(),
+            ConnectionReset | ConnectionAborted | ConnectionRefused | BrokenPipe | TimedOut | UnexpectedEof
+                | NetworkUnreachable | HostUnreachable
+        ),
+        _ => false,
+    }
+}
+
 impl Blaxel {
     pub fn new(workspace: impl Into<String>, token: impl Into<String>) -> Self {
         let config = ureq::Agent::config_builder()
@@ -393,11 +419,34 @@ impl Blaxel {
 
     /// Sends a request built by `send`, retrying a [`FailureClass::Transient`]
     /// answer with exponential backoff within the budget, each retry logged
-    /// with its reason. A transport error is not retried (the request may have
-    /// reached the sandbox); any other failure comes back as `Answer::Failed`.
+    /// with its reason. A transport error is retried only when the request
+    /// certainly never reached the sandbox ([`transport_never_sent`]: the
+    /// connection was not made); any other failure comes back as
+    /// `Answer::Failed`. Use [`Self::send_retrying_idempotent`] for a call that
+    /// is safe to repeat.
     fn send_retrying(
         &self,
         what: &str,
+        send: impl Fn() -> Result<ureq::http::Response<ureq::Body>, ureq::Error>,
+    ) -> Result<Answer> {
+        self.send_retrying_as(what, false, send)
+    }
+
+    /// [`Self::send_retrying`] for a call that is safe to repeat (a file
+    /// upload to a path, a read): every transport error is retried within the
+    /// budget, whether or not the request got through.
+    fn send_retrying_idempotent(
+        &self,
+        what: &str,
+        send: impl Fn() -> Result<ureq::http::Response<ureq::Body>, ureq::Error>,
+    ) -> Result<Answer> {
+        self.send_retrying_as(what, true, send)
+    }
+
+    fn send_retrying_as(
+        &self,
+        what: &str,
+        idempotent: bool,
         send: impl Fn() -> Result<ureq::http::Response<ureq::Body>, ureq::Error>,
     ) -> Result<Answer> {
         let start = Instant::now();
@@ -405,7 +454,24 @@ impl Blaxel {
         let mut attempt = 0u32;
         loop {
             attempt += 1;
-            let mut resp = send().with_context(|| format!("{what}: sandbox API"))?;
+            let mut resp = match send() {
+                Ok(resp) => resp,
+                Err(err) if (idempotent || transport_never_sent(&err)) && transport_is_retryable(&err) => {
+                    let wait = delay.min(self.retry.max);
+                    if start.elapsed() + wait > self.retry.budget {
+                        return Err(anyhow::Error::new(err).context(format!(
+                            "{what}: sandbox API: still unreachable after {}s and {attempt} attempts; \
+                             check this machine's network connection and Blaxel's status, then try again",
+                            start.elapsed().as_secs()
+                        )));
+                    }
+                    tracing::info!("{what}: sandbox API: {err}; retrying in {wait:?} (attempt {attempt})");
+                    std::thread::sleep(wait);
+                    delay = (delay * 2).min(self.retry.max);
+                    continue;
+                }
+                Err(err) => return Err(anyhow::Error::new(err).context(format!("{what}: sandbox API"))),
+            };
             if resp.status().is_success() {
                 return Ok(Answer::Ok(resp));
             }
@@ -851,7 +917,7 @@ impl Blaxel {
 
     /// The status of a named process (`running`, `completed`, ...), if it exists.
     pub fn process_status(&self, url: &str, name: &str) -> Result<Option<String>> {
-        let mut resp = match self.send_retrying("process status", || {
+        let mut resp = match self.send_retrying_idempotent("process status", || {
             self.auth(self.agent.get(&format!("{url}/process/{name}"))).call()
         })? {
             Answer::Ok(r) => r,
@@ -875,7 +941,7 @@ impl Blaxel {
     /// `GET` any URL with this account's token (a sandbox's `/port/<n>/...`,
     /// which wakes it): the status and the body.
     pub fn get_url(&self, url: &str) -> Result<(u16, String)> {
-        match self.send_retrying(&format!("GET {url}"), || self.auth(self.agent.get(url)).call())? {
+        match self.send_retrying_idempotent(&format!("GET {url}"), || self.auth(self.agent.get(url)).call())? {
             Answer::Ok(mut resp) => {
                 let status = resp.status().as_u16();
                 Ok((status, resp.body_mut().read_to_string().unwrap_or_default()))
@@ -1027,7 +1093,7 @@ impl Blaxel {
     pub fn download(&self, url: &str, path: &str) -> Result<Vec<u8>> {
         let target = format!("{url}/filesystem%2F{}", path.trim_start_matches('/'));
         let what = format!("download {path}");
-        let mut resp = match self.send_retrying(&what, || {
+        let mut resp = match self.send_retrying_idempotent(&what, || {
             self.auth(self.agent.get(&target))
                 // Without it the API answers with the file's metadata as JSON.
                 .header("Accept", "application/octet-stream")
@@ -1061,7 +1127,7 @@ impl Blaxel {
         // The same PUT to the same path is idempotent, so a transient answer
         // (see `classify_failure`) is retried like any other call.
         let what = format!("upload {path}");
-        match self.send_retrying(&what, || {
+        match self.send_retrying_idempotent(&what, || {
             self.auth(self.agent.put(&target))
                 .header("Content-Type", &format!("multipart/form-data; boundary={BOUNDARY}"))
                 .config()
@@ -1177,6 +1243,25 @@ mod tests {
         ] {
             assert!(!text_is_transient(permanent), "{permanent}");
         }
+    }
+
+    #[test]
+    fn an_unreachable_api_is_retried_then_says_what_to_do() {
+        // A port nothing listens on: the connection is refused, so the
+        // request was never sent and is retried, even for a non-idempotent call.
+        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let url = format!("http://127.0.0.1:{port}");
+        let bx = Blaxel::new("w", "t").with_retry_policy(RetryPolicy {
+            initial: Duration::from_millis(5),
+            max: Duration::from_millis(20),
+            budget: Duration::from_millis(100),
+            poll: Duration::from_millis(5),
+        });
+        let err = bx.upload(&url, "/x/y.md", b"hi", "0644").unwrap_err();
+        let text = format!("{err:#}");
+        assert!(text.contains("still unreachable"), "{text}");
+        assert!(text.contains("upload /x/y.md"), "{text}");
+        assert!(text_is_transient(&text), "{text}");
     }
 
     #[test]

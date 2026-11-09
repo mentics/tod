@@ -878,8 +878,9 @@ fn reuse_sandbox(
 ///   (`cloud_sync::ensure_supervisor`'s `wake`).
 ///
 /// The location is recorded as soon as the sandbox exists; a failure after
-/// that deletes it and forgets the location (`TOD_KEEP_FAILED_SANDBOX=1`
-/// keeps it for inspection).
+/// that deletes it and forgets the location when the failure is temporary,
+/// and keeps it for inspection (location forgotten) when its cause is not
+/// known: see [`discard_failed_sandbox`].
 fn make_sandbox(
     fleet: &FleetStore,
     files: &ResolvedFiles,
@@ -1073,11 +1074,21 @@ fn make_sandbox(
     Ok((location, warnings))
 }
 
-/// What a failed [`make_sandbox`] returns: `err`, once the sandbox it made is
-/// deleted (and, with `recorded`, the location forgotten), so the next launch
-/// makes another instead of adopting one whose proxy or checkout is bad. A
-/// failed delete is part of the error, never dropped. `TOD_KEEP_FAILED_SANDBOX`
-/// keeps it for inspection.
+/// What a failed [`make_sandbox`] returns: `err`, with what became of the
+/// sandbox it made and what the user should do next (always the last line,
+/// after "What to do:").
+///
+/// - A **temporary** failure (the network or Blaxel not ready:
+///   [`tod_sandbox::blaxel::error_is_transient`]): the sandbox is deleted (and,
+///   with `recorded`, the location forgotten), so the next start makes another.
+///   Nothing about it is worth investigating.
+/// - **Any other** failure, which tod does not know the cause of: the sandbox is
+///   kept so the cause can be found in it (`tod-sandbox shell`), and the
+///   location is forgotten so the next start cannot adopt a half-made one: it
+///   stops at "tod lost track of a sandbox" until the user deletes it.
+///   `TOD_KEEP_FAILED_SANDBOX` keeps it for a temporary failure too.
+///
+/// A failed delete is part of the error, never dropped.
 #[allow(clippy::too_many_arguments)]
 fn discard_failed_sandbox(
     fleet: &FleetStore,
@@ -1089,40 +1100,65 @@ fn discard_failed_sandbox(
     recorded: bool,
     err: anyhow::Error,
 ) -> anyhow::Error {
-    if std::env::var_os("TOD_KEEP_FAILED_SANDBOX").is_some() {
-        return err.context(format!("{name} was kept (TOD_KEEP_FAILED_SANDBOX)"));
-    }
-    // Whether Blaxel had a sandbox of that name to delete: a fork or create
-    // that failed before Blaxel made one leaves nothing, and the message must
-    // not say it was deleted.
-    let deleted = (|| -> Result<bool> {
-        if bx.get(name)?.is_some() {
-            sandboxes.delete(bx, name)?;
-            return Ok(true);
+    // Whether Blaxel has a sandbox of that name: a fork or create that failed
+    // before Blaxel made one leaves nothing, and the message must not say it
+    // was deleted or kept.
+    let existing = bx.get(name).map(|info| info.is_some());
+    let transient = tod_sandbox::blaxel::error_is_transient(&err);
+    let keep = matches!(existing, Ok(true)) && (!transient || std::env::var_os("TOD_KEEP_FAILED_SANDBOX").is_some());
+    let forget = || -> Result<()> {
+        if recorded {
+            fleet.enqueue(FleetMutation::DeleteFilesLocation { node_id: node_id.to_string() })?;
+            fleet.writer().flush()?;
         }
-        Ok(false)
-    })();
-    let cleaned = match deleted {
+        // Deleted, kept or never made: the sweeper has nothing to look for.
+        super::sandbox_host::host()?.clear_intent(root, node_id)
+    };
+    let cleaned = match existing {
+        Err(e) => format!(
+            "tod could not check whether {name} exists ({e:#}). What to do: check this machine's network \
+             connection and Blaxel's status; if `tod-sandbox list` shows {name}, delete it with \
+             `tod-sandbox delete {name}`; then start the node again"
+        ),
+        Ok(_) if keep => match forget() {
+            Ok(()) => format!(
+                "{name} was kept so the cause can be found in it. What to do: open it with \
+                 `tod-sandbox shell {name}` (the relay's log is in its process API, \
+                 `curl 127.0.0.1:8080/process/tod-relay/logs`), or send this error to whoever maintains tod; \
+                 when you are done, delete it with `tod-sandbox delete {name}` and start the node again"
+            ),
+            Err(e) => format!("{name} was kept, but its record could not be cleared ({e:#}); delete it with `tod-sandbox delete {name}`"),
+        },
         Ok(existed) => {
-            let forgotten = (|| -> Result<()> {
-                if recorded {
-                    fleet.enqueue(FleetMutation::DeleteFilesLocation { node_id: node_id.to_string() })?;
-                    fleet.writer().flush()?;
-                }
-                // Gone (or never made): nothing is left for the sweeper to find.
-                super::sandbox_host::host()?.clear_intent(root, node_id)
-            })();
-            match forgotten {
-                Ok(()) if existed => format!("{name} was deleted so the next launch makes a fresh one"),
-                Ok(()) => format!("{name} was never made (Blaxel has no sandbox of that name), so nothing was deleted; the next launch makes a fresh one"),
-                Err(e) if existed => format!("{name} was deleted but its record could not be cleared ({e:#})"),
-                Err(e) => format!("{name} was never made, but its record could not be cleared ({e:#})"),
+            let deleted = if existed { sandboxes.delete(bx, name) } else { Ok(()) };
+            match deleted {
+                Err(e) => format!(
+                    "{name} could not be deleted ({e:#}). What to do: delete it with `tod-sandbox delete {name}` \
+                     and the node's location in its Files settings, then start the node again"
+                ),
+                Ok(()) => match forget() {
+                    Ok(()) => {
+                        let what = if existed {
+                            format!("{name} was deleted")
+                        } else {
+                            format!("{name} was never made (Blaxel has no sandbox of that name), so nothing was deleted")
+                        };
+                        if transient {
+                            format!(
+                                "{what}. This looks temporary (the network or Blaxel). What to do: start the node \
+                                 again, which makes a fresh sandbox"
+                            )
+                        } else {
+                            format!(
+                                "{what}. What to do: start the node again; if it fails the same way, send this \
+                                 error to whoever maintains tod"
+                            )
+                        }
+                    }
+                    Err(e) => format!("{name} was deleted, but its record could not be cleared ({e:#})"),
+                },
             }
         }
-        Err(e) => format!(
-            "{name} could not be deleted ({e:#}); remove it with `tod-sandbox delete {name}` and the \
-             node's location in its Files settings"
-        ),
     };
     err.context(cleaned)
 }
