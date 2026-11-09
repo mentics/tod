@@ -291,6 +291,13 @@ fn run(args: &[String]) -> anyhow::Result<String> {
         };
     }
 
+    // `db` reads no database: the user's machine answers it through the
+    // orchestrator's broker. A sandbox no supervisor runs has no data root.
+    if rest[0] == "db" {
+        rest.remove(0);
+        return db::run(&rest, json);
+    }
+
     let data_root = data_root.ok_or_else(|| {
         anyhow::anyhow!(
             "--data-root <PATH> is required (the agent context message supplies the value)"
@@ -326,7 +333,6 @@ fn run(args: &[String]) -> anyhow::Result<String> {
         "incoming" => incoming::run(invocation),
         "learn" => learn::run(invocation),
         "secrets" => secrets::run(invocation),
-        "db" => db::run(invocation),
         "environment" => environment::run(invocation),
         "decisions" => decisions::run(invocation),
         "phase" => phase::run(invocation),
@@ -357,6 +363,14 @@ mod tests {
         assert_eq!(help(&["secrets", "run", "-h"]).unwrap(), crate::secrets::USAGE.trim_end());
         // After `--` the flag belongs to the command `secrets run` starts.
         assert!(help(&["secrets", "run", "--", "tool", "--help"]).is_err());
+    }
+
+    #[test]
+    fn db_needs_no_data_root() {
+        let run = |args: &[&str]| run(&args.iter().map(|a| a.to_string()).collect::<Vec<_>>());
+        assert_eq!(run(&["db"]).unwrap(), crate::db::USAGE.trim_end());
+        let err = run(&["db", "query", "select 1"]).unwrap_err().to_string();
+        assert!(err.contains("unknown command `query`"), "{err}");
     }
 
     /// A data root holding one Spec node and its interview session. The store

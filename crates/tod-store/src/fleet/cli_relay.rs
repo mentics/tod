@@ -41,11 +41,12 @@ pub const TOKEN_ENV: &str = "TOD_CLI_RELAY_TOKEN";
 /// Where the shim finds the relay (`host.docker.internal` when unset).
 pub const HOST_ENV: &str = "TOD_CLI_RELAY_HOST";
 
-/// The `tod-cli` a dev container runs.
-pub const SHIM_SCRIPT: &str = r#"#!/usr/bin/env bash
-# tod-cli, relayed: runs the real tod-cli on the machine running tod, which
-# holds the data. Written into this container by tod; edits are overwritten.
-host="${TOD_CLI_RELAY_HOST:-host.docker.internal}"
+/// [`SHIM_SCRIPT`] after its header: also the body of [`HTTP_SHIM_SCRIPT`]'s
+/// `relay_to_tod`, which sends `pr` and `secrets` the same way when tod
+/// started the agent with a tunnel to this machine.
+macro_rules! relay_to_tod_body {
+    () => {
+        r#"host="${TOD_CLI_RELAY_HOST:-host.docker.internal}"
 port="${TOD_CLI_RELAY_PORT:-}"
 token="${TOD_CLI_RELAY_TOKEN:-}"
 if [ -z "$port" ] || [ -z "$token" ]; then
@@ -96,7 +97,17 @@ cat <&3 > "$tmp/out"
 head -c "$out_len" "$tmp/out"
 tail -c +"$((out_len + 1))" "$tmp/out" >&2
 exit "$code"
-"#;
+"#
+    };
+}
+
+/// The `tod-cli` a dev container runs.
+pub const SHIM_SCRIPT: &str = concat!(
+    "#!/usr/bin/env bash\n",
+    "# tod-cli, relayed: runs the real tod-cli on the machine running tod, which\n",
+    "# holds the data. Written into this container by tod; edits are overwritten.\n",
+    relay_to_tod_body!()
+);
 
 /// The orchestrator's `/cli` URL, for [`HTTP_SHIM_SCRIPT`] (e.g.
 /// `https://<orchestrator>.bl.run/port/8090/cli`).
@@ -133,10 +144,19 @@ pub const LOCAL_NOUNS: &[&str] = &["pr", "secrets", "db"];
 /// `tod-cli` installed beside the shim ([`LOCAL_CLI_DEFAULT`]) against the
 /// supervisor's copy of the database (under [`SUPERVISOR_STATE_ROOT`]),
 /// whatever `--data-root` says; the supervisor pushes what they write to
-/// the orchestrator after each step, as it does its own writes.
-pub const HTTP_SHIM_SCRIPT: &str = r#"#!/usr/bin/env bash
+/// the orchestrator after each step, as it does its own writes. An agent tod
+/// started from the user's machine instead sends `pr` and `secrets` through
+/// its tunnel there (`TOD_CLI_RELAY_*`, as [`SHIM_SCRIPT`] does): no
+/// supervisor runs for it, so there is no copy. `db` reads no database, so
+/// it runs with no data root and needs no copy.
+pub const HTTP_SHIM_SCRIPT: &str = concat!(
+    r#"#!/usr/bin/env bash
 # tod-cli, relayed over HTTP to the tod orchestrator, which runs the real
 # tod-cli against this user's database. Written by tod; edits are overwritten.
+relay_to_tod() {
+"#,
+    relay_to_tod_body!(),
+    r#"}
 url="${TOD_ORCHESTRATOR_CLI_URL:-}"
 user="${TOD_USER:-}"
 node="${TOD_NODE:-}"
@@ -161,7 +181,35 @@ for arg in "$@"; do
   esac
 done
 case "$noun" in
-  pr|secrets|db)
+  db)
+    # db reads no database (the user's machine answers it through the
+    # orchestrator's broker), so it needs no copy: a node an interactive
+    # conversation drives has no supervisor and so none.
+    if [ ! -x "$local_cli" ]; then
+      echo "tod-cli: $noun runs in this sandbox, but $local_cli is not installed (run the node in the cloud again)" >&2
+      exit 70
+    fi
+    args=(); skip=; rest=
+    for arg in "$@"; do
+      if [ -n "$rest" ]; then args+=("$arg"); continue; fi
+      if [ -n "$skip" ]; then skip=; continue; fi
+      case "$arg" in
+        --) rest=1; args+=("$arg") ;;
+        --data-root) skip=1 ;;
+        --data-root=*) ;;
+        *) args+=("$arg") ;;
+      esac
+    done
+    exec "$local_cli" "${args[@]}"
+    ;;
+  pr|secrets)
+    # An agent tod started from the user's machine (a conversation, a
+    # terminal) has a tunnel back to it, where tod runs the real tod-cli with
+    # the user's data and GitHub token; no supervisor runs there, so there is
+    # no copy. The supervisor's own agents have no tunnel.
+    if [ -n "${TOD_CLI_RELAY_PORT:-}" ] && [ -n "${TOD_CLI_RELAY_TOKEN:-}" ]; then
+      relay_to_tod "$@"
+    fi
     if [ ! -x "$local_cli" ]; then
       echo "tod-cli: $noun runs in this sandbox, but $local_cli is not installed (run the node in the cloud again)" >&2
       exit 70
@@ -237,7 +285,8 @@ tail -c +"$((header_len + 1))" "$tmp/reply" > "$tmp/body"
 head -c "$out_len" "$tmp/body"
 tail -c +"$((out_len + 1))" "$tmp/body" >&2
 exit "$code"
-"#;
+"#
+);
 
 const MAX_ITEMS: usize = 4096;
 const MAX_STDIN: usize = 16 * 1024 * 1024;
@@ -750,7 +799,9 @@ mod tests {
         let s = HTTP_SHIM_SCRIPT;
         assert!(s.contains(&format!("${{TOD_LOCAL_CLI:-{LOCAL_CLI_DEFAULT}}}")));
         assert!(s.contains(&format!("${{TOD_LOCAL_DATA_ROOT:-{SUPERVISOR_STATE_ROOT}/$node}}")));
-        assert!(s.contains(&format!("  {})", LOCAL_NOUNS.join("|"))));
+        assert!(s.contains("  db)\n"));
+        let copied: Vec<_> = LOCAL_NOUNS.iter().filter(|n| **n != "db").copied().collect();
+        assert!(s.contains(&format!("  {})", copied.join("|"))));
     }
 
     /// Runs the HTTP shim with bash: `pr` and `secrets` go to the local
@@ -807,9 +858,59 @@ mod tests {
         let (out, _) = run(&["secrets", "run", "--env", "GH_TOKEN=github_token", "--", "x", "--data-root", "y"]);
         assert!(out.ends_with("local:--\nlocal:x\nlocal:--data-root\nlocal:y\n"), "{out}");
 
+        // `db` reads no database: no data root, and no copy needed.
+        std::fs::remove_file(root.join("tod.db")).unwrap();
+        let (out, remote) = run(&["--data-root", "/elsewhere", "db", "psql", "prod", "--", "-c", "select 1"]);
+        assert!(!remote);
+        assert_eq!(out, "local:db\nlocal:psql\nlocal:prod\nlocal:--\nlocal:-c\nlocal:select 1\n");
+        let (out, _) = run(&["pr", "status"]);
+        assert_eq!(out, "", "pr still needs the copy");
+
         let (out, remote) = run(&["--data-root", "/elsewhere", "node", "list"]);
         assert!(remote, "{out}");
         assert!(!out.contains("local:"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An agent tod started from the user's machine has a tunnel back to it
+    /// (`TOD_CLI_RELAY_*`) and no supervisor's copy: the HTTP shim sends `pr`
+    /// and `secrets` through the tunnel, as [`SHIM_SCRIPT`] would.
+    #[cfg(unix)]
+    #[test]
+    fn the_http_shim_sends_pr_through_the_tunnel_when_tod_started_the_agent() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("tod-http-shim-tunnel-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let shim = dir.join("tod-cli");
+        std::fs::write(&shim, HTTP_SHIM_SCRIPT).unwrap();
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let request = decode_request_with(&mut reader, |t| t == "tok").unwrap();
+            let reply = RelayReply { code: 0, stdout: b"from tod\n".to_vec(), stderr: Vec::new() };
+            let mut stream = stream;
+            stream.write_all(&encode_reply(&reply)).unwrap();
+            request.args
+        });
+        let out = Command::new("bash")
+            .arg(&shim)
+            .args(["pr", "status", "--node", "x"])
+            .env(ORCHESTRATOR_CLI_URL_ENV, "http://127.0.0.1:9/cli")
+            .env(USER_ENV, "u")
+            .env(NODE_ENV, "n")
+            .env("TOD_LOCAL_CLI", dir.join("missing"))
+            .env("TOD_LOCAL_DATA_ROOT", dir.join("no-copy"))
+            .env(HOST_ENV, "127.0.0.1")
+            .env(PORT_ENV, port.to_string())
+            .env(TOKEN_ENV, "tok")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "from tod\n");
+        assert_eq!(server.join().unwrap(), ["pr", "status", "--node", "x"]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
