@@ -252,6 +252,15 @@ impl Github {
         read_json(response)
     }
 
+    /// `PUT <api><path>` with a JSON body, the reply as JSON.
+    fn put_json<T: serde::de::DeserializeOwned>(&self, path: &str, body: serde_json::Value) -> Result<T, GithubError> {
+        if self.proxy_missing {
+            return Err(GithubError::ProxyMissing);
+        }
+        let response = self.authorize(self.agent.put(&format!("{}{path}", self.api)), path, None).send_json(body);
+        read_json(response)
+    }
+
     /// The signed-in user's login: whether authentication works at all.
     pub fn user_login(&self) -> Result<String, GithubError> {
         Ok(self.get_json::<UserRaw>("/user")?.login)
@@ -414,6 +423,78 @@ impl Github {
             return Err(GithubError::Api(message));
         }
         reply.data.ok_or_else(|| GithubError::Api("GitHub returned no data".into()))
+    }
+
+    /// Every label `owner/repo` defines (the first 100): what a pull request
+    /// there can be given.
+    pub fn list_repo_labels(&self, owner: &str, repo: &str) -> Result<Vec<RepoLabel>, GithubError> {
+        let raw: Vec<LabelRaw> = self.get_json(&format!("/repos/{owner}/{repo}/labels?per_page=100"))?;
+        Ok(raw.into_iter().map(|l| RepoLabel { name: l.name, color: l.color }).collect())
+    }
+
+    /// The names of the labels on a pull request.
+    pub fn pr_labels(&self, owner: &str, repo: &str, number: i64) -> Result<Vec<String>, GithubError> {
+        let raw: IssueLabelsRaw = self.get_json(&format!("/repos/{owner}/{repo}/issues/{number}"))?;
+        Ok(raw.labels.into_iter().map(|l| l.name).collect())
+    }
+
+    /// Replace the labels on a pull request with exactly `labels`.
+    pub fn set_pr_labels(&self, owner: &str, repo: &str, number: i64, labels: &[String]) -> Result<(), GithubError> {
+        self.put_json::<serde_json::Value>(
+            &format!("/repos/{owner}/{repo}/issues/{number}/labels"),
+            serde_json::json!({ "labels": labels }),
+        )?;
+        Ok(())
+    }
+
+    /// Switch a draft pull request to open (ready for review). REST cannot;
+    /// GraphQL can, by the pull request's node id.
+    pub fn mark_ready_for_review(&self, owner: &str, repo: &str, number: i64) -> Result<(), GithubError> {
+        const QUERY: &str = "query($owner: String!, $repo: String!, $number: Int!) { repository(owner: $owner, name: $repo) { pullRequest(number: $number) { id } } }";
+        const MUTATION: &str = "mutation($id: ID!) { markPullRequestReadyForReview(input: {pullRequestId: $id}) { pullRequest { id } } }";
+        let data: IdData =
+            self.graphql(QUERY, serde_json::json!({ "owner": owner, "repo": repo, "number": number }), Some((owner, repo)))?;
+        let id = data.repository.and_then(|r| r.pull_request).ok_or(GithubError::NotFound)?.id;
+        self.graphql::<serde_json::Value>(MUTATION, serde_json::json!({ "id": id }), Some((owner, repo)))?;
+        Ok(())
+    }
+
+    /// Who GitHub suggests as reviewers for the pull request, in the order
+    /// its own Reviewers menu lists them (people who touched the changed code
+    /// first), then the rest of the people who can be asked (the first 100),
+    /// without the pull request's author.
+    pub fn suggested_reviewers(&self, owner: &str, repo: &str, number: i64) -> Result<Vec<Reviewer>, GithubError> {
+        const QUERY: &str = "query($owner: String!, $repo: String!, $number: Int!) { repository(owner: $owner, name: $repo) { pullRequest(number: $number) { author { login } suggestedReviewers { isAuthor reviewer { login name } } } assignableUsers(first: 100) { nodes { login name } } } }";
+        let data: SuggestedData =
+            self.graphql(QUERY, serde_json::json!({ "owner": owner, "repo": repo, "number": number }), Some((owner, repo)))?;
+        let repository = data.repository.ok_or(GithubError::NotFound)?;
+        let pull = repository.pull_request.ok_or(GithubError::NotFound)?;
+        let author = pull.author.map(|a| a.login);
+        let mut out: Vec<Reviewer> = Vec::new();
+        let mut push = |login: String, name: Option<String>, suggested: bool| {
+            if Some(&login) == author.as_ref() || out.iter().any(|r| r.login == login) {
+                return;
+            }
+            out.push(Reviewer { login, name: name.filter(|n| !n.is_empty()), suggested });
+        };
+        for s in pull.suggested_reviewers {
+            if !s.is_author {
+                push(s.reviewer.login, s.reviewer.name, true);
+            }
+        }
+        for u in repository.assignable_users.nodes {
+            push(u.login, u.name, false);
+        }
+        Ok(out)
+    }
+
+    /// Ask `reviewers` (logins) to review the pull request.
+    pub fn request_reviewers(&self, owner: &str, repo: &str, number: i64, reviewers: &[String]) -> Result<(), GithubError> {
+        self.post_json::<serde_json::Value>(
+            &format!("/repos/{owner}/{repo}/pulls/{number}/requested_reviewers"),
+            serde_json::json!({ "reviewers": reviewers }),
+        )?;
+        Ok(())
     }
 
     /// Every review thread on the pull request (the first 100), with its
@@ -727,6 +808,85 @@ pub struct PrReview {
     pub state: String,
     /// The text the reviewer wrote with it; empty when there is none.
     pub body: String,
+}
+
+/// A label a repository defines.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepoLabel {
+    pub name: String,
+    /// Hex, without `#`.
+    pub color: String,
+}
+
+/// A person a pull request can be sent to for review.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reviewer {
+    pub login: String,
+    pub name: Option<String>,
+    /// GitHub's own suggestion for this pull request (listed first).
+    pub suggested: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct LabelRaw {
+    name: String,
+    #[serde(default)]
+    color: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct IssueLabelsRaw {
+    #[serde(default)]
+    labels: Vec<LabelRaw>,
+}
+
+#[derive(Debug, Deserialize)]
+struct IdData {
+    repository: Option<IdRepo>,
+}
+
+#[derive(Debug, Deserialize)]
+struct IdRepo {
+    #[serde(rename = "pullRequest")]
+    pull_request: Option<IdPull>,
+}
+
+#[derive(Debug, Deserialize)]
+struct IdPull {
+    id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SuggestedData {
+    repository: Option<SuggestedRepo>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SuggestedRepo {
+    #[serde(rename = "pullRequest")]
+    pull_request: Option<SuggestedPull>,
+    #[serde(rename = "assignableUsers")]
+    assignable_users: Nodes<PersonRaw>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SuggestedPull {
+    author: Option<UserRaw>,
+    #[serde(rename = "suggestedReviewers", default)]
+    suggested_reviewers: Vec<SuggestedRaw>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SuggestedRaw {
+    #[serde(rename = "isAuthor", default)]
+    is_author: bool,
+    reviewer: PersonRaw,
+}
+
+#[derive(Debug, Deserialize)]
+struct PersonRaw {
+    login: String,
+    name: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

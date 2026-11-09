@@ -460,6 +460,8 @@ pub struct TaskPanel {
     _runners_sub: Subscription,
     /// T4: what the task is waiting on the user for.
     pub(crate) requests: Entity<Requests>,
+    /// The pull-request buttons under the PR links.
+    pr_controls: Entity<crate::unified::panels::pr_controls::PrControls>,
     _requests_subs: Vec<Subscription>,
     /// T5: whether the Answered drawer is open; kept for the session only.
     pub(crate) answered_open: bool,
@@ -554,6 +556,10 @@ impl TaskPanel {
             let (fleet, agent_runs, focus) = (fleet.clone(), agent_runs.clone(), focus_handle.clone());
             cx.new(|cx| Requests::new(Some(node_id), fleet, agent_runs, lifecycle, focus, window, cx))
         };
+        let pr_controls = {
+            let fleet = fleet.clone();
+            cx.new(|_| crate::unified::panels::pr_controls::PrControls::new(node_id, fleet))
+        };
         let _requests_subs = vec![
             cx.subscribe(&requests, |_, _, event: &PanelOpenRequest, cx| cx.emit(event.clone())),
             cx.observe(&requests, |_, _, cx| cx.notify()),
@@ -564,6 +570,7 @@ impl TaskPanel {
             stop_job: ask_supervisor_to_stop,
             focus_handle,
             requests,
+            pr_controls,
             _requests_subs,
             answered_open: false,
             header_scroll: ScrollHandle::new(),
@@ -609,6 +616,7 @@ impl TaskPanel {
         self.refresh_runner(cx);
         ChangesWatch::recompute(self, node_id, cx);
         self.requests.update(cx, |requests, cx| requests.set_node(Some(node_id), cx));
+        self.pr_controls.update(cx, |controls, cx| controls.set_node(node_id, cx));
         self.reload(cx);
     }
 
@@ -1914,7 +1922,10 @@ impl Render for TaskPanel {
             self.refresh_pr_states(cx);
         }
         self.drain_migration(window, cx);
+        let in_pr_phase = crate::unified::panels::pr_controls::is_pr_phase(&self.runner.lifecycle);
+        self.pr_controls.update(cx, |controls, cx| controls.set_active(in_pr_phase, cx));
         let identity = self.render_identity(window, cx);
+        let pr_controls = self.pr_controls.clone();
         let artifacts = self.render_artifacts(cx);
         let runner = self.render_runner_line(window, cx);
         let requests = self.render_requests(cx);
@@ -1938,6 +1949,7 @@ impl Render for TaskPanel {
                     .gap_2()
                     .p_3()
                     .child(identity)
+                    .child(pr_controls)
                     .child(artifacts)
                     .children(runner),
             ))
