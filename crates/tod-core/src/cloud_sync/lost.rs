@@ -471,6 +471,18 @@ pub fn spawn_check(fleet: Arc<FleetStore>, kind: Check) {
     }
 }
 
+/// A [`Check::Marked`] run on the calling thread (which may block for
+/// minutes), for a caller that reports its outcome. `Ok(None)` when another
+/// check is already running, which will see what this one would.
+pub fn check_marked_now(fleet: &FleetStore) -> Result<Option<Repaired>> {
+    if CHECKING.swap(true, Ordering::SeqCst) {
+        return Ok(None);
+    }
+    let result = check(fleet, Check::Marked);
+    CHECKING.store(false, Ordering::SeqCst);
+    result.map(Some)
+}
+
 /// Whether any cloud node carries the orchestrator's lost mark.
 pub fn any_marked(fleet: &FleetStore) -> bool {
     let root = fleet.paths().root();
