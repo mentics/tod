@@ -34,7 +34,7 @@ pub fn install_stamp() -> Result<String> {
 #[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct Install {
     pub stamp: String,
-    /// `relay`, `supervisor`, `tod-cli`, and one entry per bundle
+    /// `relay`, `shim`, `supervisor`, `tod-cli`, and one entry per bundle
     /// (`process`, `media`, `skills`), each a hash of its bytes.
     #[serde(default)]
     pub parts: BTreeMap<String, String>,
@@ -57,6 +57,11 @@ pub fn install_of(relay: &[u8], supervisor: Option<&[u8]>, tod_cli: Option<&[u8]
     };
     part("relay", relay);
     parts.insert("relay".to_string(), hex(Sha256::digest(relay)));
+    // The `tod-cli` shim is compiled into this build, not read from disk, but
+    // a sandbox runs it all the same: a changed shim is a changed install.
+    let shim = tod_store::fleet::cli_relay::HTTP_SHIM_SCRIPT.as_bytes();
+    part("shim", shim);
+    parts.insert("shim".to_string(), hex(Sha256::digest(shim)));
     if let Some(bytes) = supervisor {
         part("supervisor", bytes);
         parts.insert("supervisor".to_string(), hex(Sha256::digest(bytes)));
