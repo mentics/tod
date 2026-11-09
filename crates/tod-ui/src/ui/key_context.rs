@@ -91,3 +91,21 @@ where
         KeyBinding::new("escape", action, Some(including_input(surface))),
     ]);
 }
+
+/// Make Up/Down work in the menu of a gpui-component `Combobox` or `Select`
+/// inside `el`.
+///
+/// The menu's list is a `List` key context, and the app rebinds Up/Down in
+/// that context to its own clamped `ListArrowUp`/`ListArrowDown`
+/// (`ui::list::keyboard`), which only the app's own lists handle: the menu
+/// never moved. Wrap every dropdown's element in this so those two actions
+/// become the menu's own `SelectUp`/`SelectDown`.
+pub fn forward_menu_arrows<E: gpui::InteractiveElement>(el: E) -> E {
+    use crate::ui::list::{ListArrowDown, ListArrowUp};
+    el.on_action(|_: &ListArrowUp, window, cx| {
+        window.dispatch_action(Box::new(gpui_base::actions::SelectUp), cx);
+    })
+    .on_action(|_: &ListArrowDown, window, cx| {
+        window.dispatch_action(Box::new(gpui_base::actions::SelectDown), cx);
+    })
+}
