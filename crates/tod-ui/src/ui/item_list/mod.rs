@@ -26,6 +26,7 @@ pub mod search;
 use std::collections::HashSet;
 use std::rc::Rc;
 
+use crate::ui::panel_export::RecordText as _;
 use crate::ui::style;
 use crate::views::rows::{RowAction, RowHost, RowOptions};
 use gpui::{
@@ -1252,7 +1253,11 @@ impl<T, G> ItemList<T, G> {
             Some(count) => format!("{} ({count})", group.label),
             None => group.label.to_string(),
         };
-        let mut text = div().flex_1().min_w_0().child(label);
+        let mut text = div()
+            .flex_1()
+            .min_w_0()
+            .child(label.clone())
+            .record_text(label);
         if let Some(on_rename) = group.on_rename.clone() {
             // Renaming from the heading follows the cursor, as double-click to
             // edit does on an item row.

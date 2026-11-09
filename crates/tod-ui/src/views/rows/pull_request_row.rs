@@ -6,6 +6,7 @@
 //! it, are trailing context inside the content column.
 
 use super::{RowHost, row_action_buttons, row_group};
+use crate::ui::panel_export::RecordText as _;
 use crate::ui::item_list::{ColumnSpec, ItemListEvent, ItemRowState};
 use crate::ui::selectable_text::selectable_text;
 use crate::ui::style::{self, StatusTone};
@@ -78,11 +79,14 @@ pub fn pull_request_row<A: From<ItemListEvent> + 'static>(
                 .column(COLUMN_NUMBER, style::text_dense_muted(div()))
                 // A merged or closed pull request is struck through.
                 .when(pull.state.is_terminal(), |el| el.line_through())
-                .child(format!("#{}", pull.number)),
+                .child(format!("#{}", pull.number))
+                .record_text(format!("#{}", pull.number)),
         )
         .child(
             state.column(COLUMN_STATE, div()).child(
-                style::status_chip(div(), state_tone(pull.state)).child(pull.state.as_str()),
+                style::status_chip(div(), state_tone(pull.state))
+                    .child(pull.state.as_str())
+                    .record_text(pull.state.as_str()),
             ),
         )
         .child(

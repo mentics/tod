@@ -61,7 +61,13 @@ pub fn text(lifecycle: &str, runs: &[NodeRun]) -> SharedString {
 /// guide — no raw colors).
 pub fn render(lifecycle: &str, runs: &[NodeRun], cx: &App) -> impl IntoElement {
     let muted = cx.theme().muted_foreground;
-    div().text_xs().text_color(muted).child(text(lifecycle, runs))
+    use crate::ui::panel_export::RecordText as _;
+    let label = text(lifecycle, runs);
+    div()
+        .text_xs()
+        .text_color(muted)
+        .child(label.clone())
+        .record_text(label)
 }
 
 #[cfg(test)]

@@ -19,6 +19,7 @@ use gpui_component::ActiveTheme;
 use gpui_component::menu::{ContextMenu, ContextMenuExt, PopupMenuItem};
 use gpui_component::text::{TextView, TextViewStyle};
 
+use super::panel_export;
 use super::code_links::{linkify_html_line, linkify_markdown, on_link_click};
 
 /// A selectable text view with a right-click Copy menu.
@@ -65,10 +66,18 @@ fn plain_text_html(text: &str) -> SharedString {
 /// right-click menu carrying Copy — an item-list row. One right-click hovers
 /// both hitboxes, so two menus would open on top of each other; the row's,
 /// which also offers what the row affords, is the one to keep.
-fn with_copy_menu(id: ElementId, view: TextView, own_menu: bool) -> SelectableText {
+fn with_copy_menu(
+    id: ElementId,
+    view: TextView,
+    own_menu: bool,
+    source: SharedString,
+    markdown: bool,
+) -> SelectableText {
     div()
         .id(id)
+        .relative()
         .child(view)
+        .child(panel_export::record(source, markdown))
         .context_menu(move |menu, window, cx| {
             if !own_menu {
                 // An empty menu is never shown, so the row's menu is the only
@@ -107,12 +116,13 @@ pub fn selectable_text_colored(
     _cx: &mut App,
 ) -> SelectableText {
     let id = id.into();
-    let view = TextView::html(id.clone(), plain_text_html(&text.into()))
+    let text = text.into();
+    let view = TextView::html(id.clone(), plain_text_html(&text))
         .on_link_click(on_link_click)
         .selectable(true)
         .style(TextViewStyle::default().paragraph_gap(rems(0.)))
         .text_color(color);
-    with_copy_menu(id, view, true)
+    with_copy_menu(id, view, true, text, false)
 }
 
 /// The same, with its own Copy menu only when `own_menu`.
@@ -133,7 +143,7 @@ pub fn selectable_text_with_menu(
         .on_link_click(on_link_click)
         .selectable(true)
         .style(TextViewStyle::default().paragraph_gap(rems(0.)));
-    with_copy_menu(id, view, own_menu)
+    with_copy_menu(id, view, own_menu, text, false)
 }
 
 /// Agents write plain prose with single newlines, which Markdown folds into
@@ -179,7 +189,8 @@ pub fn selectable_markdown(
     cx: &mut App,
 ) -> SelectableText {
     let id = id.into();
-    let view = TextView::markdown(id.clone(), linkify_markdown(&keep_line_breaks(&markdown.into())))
+    let markdown = markdown.into();
+    let view = TextView::markdown(id.clone(), linkify_markdown(&keep_line_breaks(&markdown)))
         .on_link_click(on_link_click)
         .style(
             TextViewStyle::default()
@@ -200,7 +211,7 @@ pub fn selectable_markdown(
                 ),
         )
         .selectable(true);
-    with_copy_menu(id, view, true)
+    with_copy_menu(id, view, true, markdown, true)
 }
 
 #[cfg(test)]
@@ -238,6 +249,33 @@ mod tests {
         cx.simulate_mouse_move(end, Some(MouseButton::Left), Modifiers::default());
         cx.simulate_mouse_up(end, MouseButton::Left, Modifiers::default());
         cx
+    }
+
+    struct ExportHost;
+
+    impl Render for ExportHost {
+        fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .w(px(240.))
+                .child(crate::ui::panel_export::frame_start())
+                .child(selectable_text("export-a", "alpha beta", window, cx))
+                .child(super::selectable_markdown("export-b", "## Head\n\nbody", window, cx))
+        }
+    }
+
+    #[gpui::test]
+    fn painted_text_is_exported_as_markdown(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let (_, cx) = cx.add_window_view(|window, cx| {
+            let host = cx.new(|_| ExportHost);
+            Root::new(host, window, cx)
+        });
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+            let region = window.bounds();
+            let out = crate::ui::panel_export::export("Panel", region, cx).unwrap();
+            assert_eq!(out, "# Panel\n\nalpha beta\n\n## Head\n\nbody\n");
+        });
     }
 
     #[gpui::test]

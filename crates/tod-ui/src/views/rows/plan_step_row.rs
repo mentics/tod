@@ -8,6 +8,7 @@
 use super::obligation_row::one_line;
 use super::status_menu::{StatusMenu, StatusMenuHandlers, status_chip};
 use super::{RowHost, RowOptions, row_group, row_tail};
+use crate::ui::panel_export::RecordText as _;
 use crate::ui::item_list::{ColumnSpec, column_cell};
 use crate::ui::selectable_text::selectable_text_with_menu;
 use crate::ui::style;
@@ -180,7 +181,12 @@ pub fn plan_step_row<A: From<PlanStepRowEvent> + 'static>(
             .on_mouse_down(MouseButton::Left, on_select)
             .when(highlighted, style::highlighted)
             .children(opts.leading.take())
-            .child(style::text_muted(div()).flex_shrink_0().child(short_id(id)))
+            .child(
+                style::text_muted(div())
+                    .flex_shrink_0()
+                    .child(short_id(id))
+                    .record_text(short_id(id)),
+            )
             .children(editor)
             .children(body);
         return row
@@ -191,7 +197,8 @@ pub fn plan_step_row<A: From<PlanStepRowEvent> + 'static>(
     let ordinal = column_cell(columns, COLUMN_ORDINAL, div())
         .text_xs()
         .text_color(muted)
-        .child(format!("{}.", step.ordinal));
+        .child(format!("{}.", step.ordinal))
+        .record_text(format!("{}.", step.ordinal));
     // A flex cell so the chip hugs its text instead of stretching to
     // the column's width.
     let status = column_cell(columns, COLUMN_STATUS, h_flex()).child(status_chip(
@@ -233,10 +240,12 @@ pub fn plan_step_row<A: From<PlanStepRowEvent> + 'static>(
     let links = |label: &str, ids: &[Uuid]| {
         (!ids.is_empty()).then(|| {
             let ids: Vec<String> = ids.iter().map(|id| short_id(*id)).collect();
+            let text = format!("{label}: [{}]", ids.join(", "));
             div()
                 .text_xs()
                 .text_color(muted)
-                .child(format!("{label}: [{}]", ids.join(", ")))
+                .child(text.clone())
+                .record_text(text)
         })
     };
 
@@ -263,6 +272,7 @@ pub fn plan_step_row<A: From<PlanStepRowEvent> + 'static>(
             .text_xs()
             .text_color(status_color)
             .child(reason.label())
+            .record_text(reason.label())
     });
     let note = step.note.as_ref().map(|note| {
         div()
@@ -282,6 +292,7 @@ pub fn plan_step_row<A: From<PlanStepRowEvent> + 'static>(
             .text_xs()
             .text_color(muted)
             .child(format!("phase: {}", step.phase))
+            .record_text(format!("phase: {}", step.phase))
     });
     // Everything the step *says* goes in the content column: its text, why it
     // stopped, and what it is tied to. The two fixed columns hold only the

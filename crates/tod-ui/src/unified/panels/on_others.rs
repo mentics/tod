@@ -22,6 +22,7 @@ use tod_core::runner_status::format_elapsed;
 use tod_store::fleet::FleetStore;
 use uuid::Uuid;
 
+use crate::ui::panel_export::RecordText as _;
 use crate::ui::selectable_text::selectable_text;
 use crate::ui::style;
 use crate::unified::columns::PanelKind;
@@ -223,7 +224,11 @@ impl Render for OnOthersPanel {
             .flex_col()
             .gap_3();
         if groups.is_empty() {
-            body = body.child(style::empty_message(div()).child("Nothing is waiting on anyone else."));
+            body = body.child(
+                style::empty_message(div())
+                    .child("Nothing is waiting on anyone else.")
+                    .record_text("Nothing is waiting on anyone else."),
+            );
         }
         for (gi, group) in groups.iter().enumerate() {
             let mut section = div().flex().flex_col().gap_1();
@@ -238,7 +243,12 @@ impl Render for OnOthersPanel {
                         window,
                         cx,
                     )))
-                    .child(style::text_dense_muted(div()).child(group_summary(group, now))),
+                    .child({
+                        let summary = group_summary(group, now);
+                        style::text_dense_muted(div())
+                            .child(summary.clone())
+                            .record_text(summary)
+                    }),
             );
             for (ei, entry) in group.entries.iter().enumerate() {
                 let node = entry.node;
@@ -256,7 +266,11 @@ impl Render for OnOthersPanel {
                                 });
                             }),
                         )
-                        .child(style::text(div()).child(entry.title.clone())),
+                        .child(
+                            style::text(div())
+                                .child(entry.title.clone())
+                                .record_text(entry.title.clone()),
+                        ),
                 );
                 for (li, (text, is_error)) in entry_lines(entry, now).into_iter().enumerate() {
                     let id = SharedString::from(format!("on-others-line-{gi}-{ei}-{li}"));

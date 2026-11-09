@@ -24,6 +24,7 @@ use uuid::Uuid;
 
 use crate::ui::agent_runs::AgentRuns;
 use crate::ui::key_context;
+use crate::ui::panel_export::{RecordText as _, recorded};
 use crate::ui::selectable_text::selectable_markdown;
 use crate::ui::style;
 use crate::unified::columns::PanelKind;
@@ -447,11 +448,13 @@ impl Render for DetailsPanel {
                                     move |_, _, cx| cx.open_url(&url),
                                 )
                                 .when(self.loaded.ticket_terminal, |el| el.line_through())
-                                .child(ticket)
+                                .child(ticket.clone())
+                                .record_text(ticket)
                                 .into_any_element(),
                                 None => style::text_muted(div())
                                     .when(self.loaded.ticket_terminal, |el| el.line_through())
-                                    .child(ticket)
+                                    .child(ticket.clone())
+                                    .record_text(ticket)
                                     .into_any_element(),
                             },
                         ))
@@ -490,9 +493,10 @@ impl Render for DetailsPanel {
                             .rounded(style::radius::CONTROL)
                             .px(style::space::INSET)
                             .py(style::space::RELATED)
-                            .child(style::empty_message(div().child(
-                                "No details — press Enter to add",
-                            )))
+                            .child(
+                                style::empty_message(div().child("No details — press Enter to add"))
+                                    .record_text("No details — press Enter to add"),
+                            )
                             .into_any_element()
                     } else {
                         selectable_markdown(
@@ -510,7 +514,10 @@ impl Render for DetailsPanel {
                         .flex()
                         .items_center()
                         .gap_2()
-                        .child(style::text_muted(div().child("Unsaved changes")))
+                        .child(
+                            style::text_muted(div().child("Unsaved changes"))
+                                .record_text("Unsaved changes"),
+                        )
                         .when(editing, |el| {
                             el.child(
                                 Button::new("unified-details-save")
@@ -536,41 +543,46 @@ impl Render for DetailsPanel {
                     .flex()
                     .flex_wrap()
                     .gap_2()
-                    .child(
+                    .child(recorded(
                         Button::new("unified-details-open-obligations")
-                            .label(obligations_label)
+                            .label(obligations_label.clone())
                             .small()
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.open(PanelKind::Obligations(node_id), cx);
                             })),
-                    )
-                    .child(
+                        obligations_label,
+                    ))
+                    .child(recorded(
                         Button::new("unified-details-open-plan")
-                            .label(plan_label)
+                            .label(plan_label.clone())
                             .small()
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.open(PanelKind::Plan(node_id), cx);
                             })),
-                    )
+                        plan_label,
+                    ))
                     .when(findings_total > 0, |el| {
-                        el.child(
+                        el.child(recorded(
                             Button::new("unified-details-open-findings")
-                                .label(findings_label)
+                                .label(findings_label.clone())
                                 .small()
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.open(PanelKind::Findings(node_id), cx);
                                 })),
-                        )
+                            findings_label,
+                        ))
                     })
                     .when(decisions_waiting > 0, |el| {
-                        el.child(
+                        let label = format!("Requests waiting ({decisions_waiting})");
+                        el.child(recorded(
                             Button::new("unified-details-open-decisions")
-                                .label(format!("Requests waiting ({decisions_waiting})"))
+                                .label(label.clone())
                                 .small()
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.open(PanelKind::Task(node_id), cx);
                                 })),
-                        )
+                            label,
+                        ))
                     })
                     .child(
                         Button::new("unified-details-open-settings")
