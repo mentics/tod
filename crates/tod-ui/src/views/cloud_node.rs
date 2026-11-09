@@ -28,14 +28,30 @@ impl CloudUpdate {
 }
 
 /// A failure as the panel shows it: the title on the first line, then each
-/// cause of the error on a line of its own.
+/// cause of the error on a line of its own, and always what to do next. A
+/// cause that already says ("What to do: ...", as the sandbox maker's do) is
+/// left to; otherwise a temporary failure (the network, Blaxel not ready) says
+/// to try again, and any other says where to look.
 fn describe(title: &str, err: &anyhow::Error) -> String {
     let mut out = title.to_string();
     for cause in err.chain() {
         out.push('\n');
         out.push_str(&cause.to_string());
     }
+    if !out.contains("What to do:") {
+        out.push('\n');
+        out.push_str(&next_step(tod_sandbox::blaxel::error_is_transient(err)));
+    }
     out
+}
+
+/// What the user does next after a failure nothing more specific explained.
+fn next_step(transient: bool) -> String {
+    if transient {
+        "What to do: this looks temporary (the network or Blaxel). Try again in a minute.".to_string()
+    } else {
+        "What to do: try again. If it fails the same way, the log panel has the full detail; send it to whoever maintains tod.".to_string()
+    }
 }
 
 /// Delete `node_id`'s sandbox in Blaxel off the UI thread, keeping its
@@ -317,5 +333,22 @@ mod tests {
             let (what, _) = request_words(kind);
             assert!(!what.starts_with("to "), "{kind}: Asked for {what}");
         }
+    }
+
+    #[test]
+    fn every_failure_says_what_to_do_next() {
+        let temporary = anyhow::anyhow!("sandbox API timeout: connect").context("upload /x");
+        let text = describe("Start failed", &temporary);
+        assert!(text.starts_with("Start failed\nupload /x\n"), "{text}");
+        assert!(text.contains("What to do: this looks temporary"), "{text}");
+
+        let unknown = anyhow::anyhow!("the checkout has no branch");
+        let text = describe("Start failed", &unknown);
+        assert!(text.contains("What to do: try again. If it fails the same way"), "{text}");
+
+        // A cause that already says what to do is not given a second line.
+        let said = anyhow::anyhow!("x was kept. What to do: open it with `tod-sandbox shell x`");
+        let text = describe("Start failed", &said);
+        assert_eq!(text.matches("What to do:").count(), 1, "{text}");
     }
 }
