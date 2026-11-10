@@ -57,8 +57,9 @@ turn to push and answer the threads. A head that reaches the pull request
 without that review (pushed from outside it) is reviewed there instead, and
 what the review finds is posted on the pull request as review threads, each
 naming a finding id. Answer those threads like any other; answering one
-answers its finding too. A finding that no line of the change could hold is
-in the review's text instead, or is sent to you by id: answer each of those
+answers its finding too. A finding whose file the change does not touch is
+still a thread, on the nearest changed file, and so is one with no file.
+A finding the review's text carries instead, or that is sent to you by id: answer each of those
 through the `review` noun (`fixed`, or `rejected` with a note saying why it
 is not a problem). Either way, only another review clears the change.
 
