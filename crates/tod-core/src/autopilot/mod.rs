@@ -909,10 +909,17 @@ impl Autopilot {
             }
         }
         if standing.stuck {
+            // `standing.fixes` is empty when the agent recorded `ready` again
+            // after the rejection; what was asked for is the latest rejection's.
+            let fixes = fleet.read(|conn| {
+                Ok(PhaseRepo::new(conn)
+                    .rejections_in_stay(node, state)?
+                    .last()
+                    .map(|e| e.fixes())
+                    .unwrap_or_default())
+            })?;
             return Ok(Some(Outcome::NeedsHuman {
-                reason: NeedsHuman::EvaluationStuck {
-                    fixes: standing.fixes,
-                },
+                reason: NeedsHuman::EvaluationStuck { fixes },
             }));
         }
         Ok(None)
