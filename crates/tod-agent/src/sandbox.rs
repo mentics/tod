@@ -7,9 +7,55 @@
 //! decided by the caller (`tod_store::fleet::dev_container`).
 
 use anyhow::{Context, Result, bail};
+use std::io::Read;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
+
+/// How long one look for a program in the sandbox may take. Waking a
+/// sleeping sandbox takes seconds; a connection that has gone dead never
+/// answers, and without a limit the first message of a chat waits on it for
+/// as long as the user lets it.
+const FIND_PROGRAM_LIMIT: Duration = Duration::from_secs(90);
+
+/// Runs `command` and collects its output, killing it and returning an error
+/// naming `what` if it has not finished within `limit`.
+fn output_within(mut command: Command, limit: Duration, what: &str) -> Result<Output> {
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("run {what}"))?;
+    let drain = |pipe: Option<Box<dyn Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            if let Some(mut pipe) = pipe {
+                let _ = pipe.read_to_end(&mut bytes);
+            }
+            bytes
+        })
+    };
+    let stdout = drain(child.stdout.take().map(|p| Box::new(p) as Box<dyn Read + Send>));
+    let stderr = drain(child.stderr.take().map(|p| Box::new(p) as Box<dyn Read + Send>));
+    let started = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().with_context(|| format!("wait for {what}"))? {
+            break status;
+        }
+        if started.elapsed() >= limit {
+            child.kill().with_context(|| format!("stop {what} after {}s", limit.as_secs()))?;
+            child.wait().with_context(|| format!("reap {what}"))?;
+            bail!("{what} did not answer within {}s", limit.as_secs());
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    Ok(Output {
+        status,
+        stdout: stdout.join().unwrap_or_default(),
+        stderr: stderr.join().unwrap_or_default(),
+    })
+}
 
 /// How to start a process in a cloud sandbox.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,13 +92,16 @@ impl SandboxLaunch {
             .collect::<String>()
             // Not 1, which is also the launcher's own failure.
             + " exit 3";
-        let mut command = self.launcher_command();
-        command
-            .args(["exec", &self.sandbox, "--", "sh", "-lc", &script])
-            .stdin(Stdio::null());
-        let out = command
-            .output()
-            .with_context(|| format!("run {}", self.launcher.display()))?;
+        let what = format!("{} exec in sandbox {}", self.launcher.display(), self.sandbox);
+        let run = || {
+            let mut command = self.launcher_command();
+            command
+                .args(["exec", &self.sandbox, "--", "sh", "-lc", &script])
+                .stdin(Stdio::null());
+            output_within(command, FIND_PROGRAM_LIMIT, &what)
+        };
+        // A connection gone dead is made again by the second try.
+        let out = run().or_else(|_| run())?;
         match out.status.code() {
             Some(0) => {}
             Some(3) => return Ok(None),
@@ -130,6 +179,22 @@ mod tests {
             env: vec![("A".into(), "1".into())],
             cli_relay: vec![("TOD_CLI_RELAY_PORT".into(), "4000".into())],
         }
+    }
+
+    #[test]
+    fn a_command_that_never_finishes_is_an_error_not_a_wait() {
+        let mut command = Command::new("sleep");
+        command.arg("30");
+        let started = Instant::now();
+        let err = output_within(command, Duration::from_millis(200), "sleep").unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(format!("{err:#}").contains("did not answer within"), "{err:#}");
+        let mut quick = Command::new("sh");
+        quick.args(["-c", "echo out; echo err >&2; exit 3"]);
+        let out = output_within(quick, Duration::from_secs(5), "sh").unwrap();
+        assert_eq!(out.status.code(), Some(3));
+        assert_eq!(out.stdout, b"out\n");
+        assert_eq!(out.stderr, b"err\n");
     }
 
     #[test]
