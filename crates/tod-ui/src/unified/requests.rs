@@ -63,7 +63,7 @@ use gpui::{
     prelude::FluentBuilder,
 };
 use gpui_component::button::{Button, ButtonVariants};
-use gpui_component::input::{Input, InputEvent, InputState};
+use gpui_component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
 use gpui_component::scroll::ScrollableElement;
 use gpui_component::{ActiveTheme, Disableable, IconName, Sizable};
 use tod_core::attention::{AttentionItem, AttentionKind, RequestReason};
@@ -101,6 +101,9 @@ pub const REQUESTS_CONTEXT: &str = "UnifiedRequests";
 /// Key-context tag for whichever freeform answer field is in edit mode, so
 /// Escape only fires for that one field (`key_context::including_tag`).
 const FREEFORM_TAG: &str = "RequestsFreeform";
+/// Height of the free-text answer area while it is being edited (a textarea
+/// has no height of its own).
+const FREEFORM_HEIGHT: f32 = 96.;
 /// Key-context tag for the feedback note field while it is in edit mode.
 const FEEDBACK_NOTE_TAG: &str = "RequestsFeedbackNote";
 /// The journey surface every answer is recorded under; the name "decisions"
@@ -121,6 +124,7 @@ actions!(
         DecisionsActivate,
         DecisionsCtrlActivate,
         DecisionsFreeformEscape,
+        DecisionsFreeformSubmit,
         DecisionsLinkPrev,
         DecisionsLinkNext,
     ]
@@ -136,6 +140,7 @@ pub fn register_request_keyboard_bindings(cx: &mut App) {
         KeyBinding::new("enter", DecisionsActivate, outside_input),
         KeyBinding::new("ctrl-enter", DecisionsCtrlActivate, outside_input),
         KeyBinding::new("escape", DecisionsFreeformEscape, with_input),
+        KeyBinding::new("ctrl-enter", DecisionsFreeformSubmit, with_input),
         KeyBinding::new(
             "escape",
             DecisionsFreeformEscape,
@@ -155,6 +160,7 @@ pub fn bind_request_actions(el: Stateful<gpui::Div>, requests: &Entity<Requests>
     let r4 = requests.clone();
     let r5 = requests.clone();
     let r6 = requests.clone();
+    let r7 = requests.clone();
     el.key_context(REQUESTS_CONTEXT)
         .on_action(move |a: &DecisionOptionKey, window, cx| {
             r1.update(cx, |r, cx| r.answer_option_key(a, window, cx))
@@ -162,6 +168,7 @@ pub fn bind_request_actions(el: Stateful<gpui::Div>, requests: &Entity<Requests>
         .on_action(move |_: &DecisionsActivate, window, cx| r2.update(cx, |r, cx| r.activate(false, window, cx)))
         .on_action(move |_: &DecisionsCtrlActivate, window, cx| r3.update(cx, |r, cx| r.activate(true, window, cx)))
         .on_action(move |_: &DecisionsFreeformEscape, window, cx| r4.update(cx, |r, cx| r.exit_freeform_edit(window, cx)))
+        .on_action(move |_: &DecisionsFreeformSubmit, _, cx| r7.update(cx, |r, cx| r.submit_freeform(cx)))
         .on_action(move |_: &DecisionsLinkPrev, _, cx| r5.update(cx, |r, cx| r.link_prev(cx)))
         .on_action(move |_: &DecisionsLinkNext, _, cx| r6.update(cx, |r, cx| r.link_next(cx)))
 }
@@ -396,7 +403,7 @@ pub struct Requests {
     freeform_editing: Option<Uuid>,
     /// The decision whose unsent text `freeform_input` holds.
     freeform_draft_for: Option<Uuid>,
-    freeform_input: Entity<InputState>,
+    freeform_input: Entity<TextareaState>,
     /// A log entry's decision the user asked to change.
     pub(crate) changing: Option<Uuid>,
     /// Index of the keyboard stop on the current decision.
@@ -424,10 +431,9 @@ impl Requests {
         cx: &mut Context<Self>,
     ) -> Self {
         let freeform_input =
-            cx.new(|cx| InputState::new(window, cx).placeholder("Freeform answer… (Enter to submit)"));
+            cx.new(|cx| TextareaState::new(window, cx).rows(4).placeholder("Freeform answer… (Ctrl+Enter to submit)"));
         let freeform_sub = cx.subscribe(&freeform_input, |this, _, event, cx| {
             match event {
-                InputEvent::PressEnter { .. } => this.submit_freeform(cx),
                 InputEvent::Change => {
                     if let Some(owner) = this.freeform_draft_for {
                         let text = this.freeform_input.read(cx).text().to_string();
@@ -1382,7 +1388,7 @@ impl Requests {
                 cx.listener(move |this, _, window, cx| this.begin_freeform_edit(decision_id, window, cx)),
             )
             .child(if editing {
-                Input::new(&self.freeform_input).small().into_any_element()
+                Textarea::new(&self.freeform_input).disabled(false).w_full().h(gpui::px(FREEFORM_HEIGHT)).into_any_element()
             } else {
                 let draft = Some(FreeformDrafts::get(decision_id, cx)).filter(|text| !text.trim().is_empty());
                 match draft {
