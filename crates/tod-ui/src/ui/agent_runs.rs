@@ -754,7 +754,30 @@ impl AgentRuns {
         {
             self.deliver_answer(conversation_id, &message, cx)?;
         }
+        self.wake_cloud_node(decision_id, cx);
         Ok(())
+    }
+
+    /// A node that runs in the cloud goes on by itself only if its sandbox is
+    /// there; the answer wakes it now, replacing a sandbox that expired, with
+    /// the node showing the work from the click (`cloud_sync::wake_after_answer`).
+    fn wake_cloud_node(&self, decision_id: Uuid, cx: &mut Context<Self>) {
+        let fleet = self.fleet.clone();
+        cx.background_executor()
+            .spawn(async move {
+                let result = fleet
+                    .read(|conn| DecisionRepo::new(conn).get(decision_id))
+                    .map_err(anyhow::Error::from)
+                    .and_then(|decision| {
+                        let Some(decision) = decision else { return Ok(None) };
+                        let root = fleet.paths().root().to_path_buf();
+                        tod_core::cloud_sync::wake_after_answer(&fleet, &root, &decision.node_id.to_string())
+                    });
+                if let Err(err) = result {
+                    tracing::warn!("waking the node after answering {decision_id}: {err:#}");
+                }
+            })
+            .detach();
     }
 
     /// [`Self::answer_decision`] without blocking the UI thread: the answer
@@ -774,6 +797,9 @@ impl AgentRuns {
                 .background_executor()
                 .spawn(async move { Self::record_decision_answer(&fleet, decision_id, option, text) })
                 .await;
+            if recorded.is_ok() {
+                this.update(cx, |this, cx| this.wake_cloud_node(decision_id, cx)).ok();
+            }
             let result = match recorded {
                 Ok(Some((conversation_id, message))) => this
                     .update(cx, |this, cx| this.deliver_answer(conversation_id, &message, cx))
