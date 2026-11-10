@@ -97,7 +97,22 @@ pub fn restore_into(dir: &Workdir, node_id: &str) -> RestoreNotes {
             return notes;
         }
     };
-    for repo in repos {
+    // Looking for a checkpoint is one round trip per repository (a sandbox's
+    // checkout has several), almost always to find none: ask side by side.
+    let found: Vec<bool> = std::thread::scope(|scope| {
+        let handles: Vec<_> = repos
+            .iter()
+            .map(|repo| {
+                let reference = checkpoint::ref_name(node_id, &rel(dir, repo));
+                scope.spawn(move || checkpoint::remote_ref(repo, &reference).map_or(true, |found| found.is_some()))
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap_or(true)).collect()
+    });
+    for (repo, found) in repos.into_iter().zip(found) {
+        if !found {
+            continue;
+        }
         let rel = rel(dir, &repo);
         let reference = checkpoint::ref_name(node_id, &rel);
         match checkpoint::restore_repo(&repo, &reference) {

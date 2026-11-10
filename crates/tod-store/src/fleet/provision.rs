@@ -1025,13 +1025,44 @@ fn make_sandbox(
         }
         // A fork is "deployed" before its proxy rules and environment are in
         // effect; the checkout needs both.
-        progress(&format!("checking {name} can reach {}…", repo.url));
         let health = |expected_manifest| health_spec(&name, node_id, &repo.url, expected_manifest, delays);
-        tod_sandbox::health::probe(&bx, &url, tod_sandbox::health::Stage::Base, &health(None), progress)?;
+        let expected = tod_sandbox::provision::node_manifest(&node_files.relay);
+        let ready = |progress: &mut dyn FnMut(&str)| -> Result<()> {
+            progress(&format!("checking {name} is healthy…"));
+            tod_sandbox::health::probe(&bx, &url, tod_sandbox::health::Stage::Ready, &health(Some(&expected)), progress)
+                .map_err(|failure| match &fork_from {
+                    Some(from) => anyhow::Error::new(failure).context(format!(
+                        "{name} was forked from {from}, which should carry this build's relay, supervisor and tod-cli; \
+                         refresh it (`tod-sandbox golden refresh`) or point the Files setting at the project's golden"
+                    )),
+                    None => anyhow::Error::new(failure),
+                })
+        };
+        // A fork of a tod golden runs the relay the golden gave it and nothing
+        // below changes it, so the one probe that checks the relay's manifest
+        // as well comes first, instead of a base probe now and a second probe
+        // after the checkout (each is a round trip to the sandbox).
+        if golden_has_tod_files {
+            ready(progress)?;
+        } else {
+            progress(&format!("checking {name} can reach {}…", repo.url));
+            tod_sandbox::health::probe(&bx, &url, tod_sandbox::health::Stage::Base, &health(None), progress)?;
+        }
         let identity = host.git_identity(fleet)?;
-        node::checkout(&bx, &url, &repo.url, branch, &identity, fork_from.is_none(), progress)?;
-        // Where the checkout is: the clone's, else the image's own.
-        let dir_path = find_sandbox_checkout(&name)?;
+        // Where the checkout is: the clone's, else the image's own. A fork's
+        // is there before the checkout runs, so it is looked for meanwhile.
+        let dir_path = if fork_from.is_some() {
+            let (checked, found) = std::thread::scope(|scope| {
+                let finder = scope.spawn(|| find_sandbox_checkout(&name));
+                let checked = node::checkout(&bx, &url, &repo.url, branch, &identity, false, progress);
+                (checked, finder.join().unwrap_or_else(|_| Err(anyhow!("looking for the checkout panicked"))))
+            });
+            checked?;
+            found?
+        } else {
+            node::checkout(&bx, &url, &repo.url, branch, &identity, true, progress)?;
+            find_sandbox_checkout(&name)?
+        };
         location.repo = Some(dir_path.clone());
         record(fleet, &*location)?;
         let dir = Workdir::sandbox(&name, &dir_path);
@@ -1040,20 +1071,13 @@ fn make_sandbox(
             warnings.push(format!("{err:#}"));
         }
         warnings.extend(worktree::branch_submodules(&dir, branch)?);
-        // Restarted, so it runs the binary the golden or install gave it.
-        node::start_relay(&bx, &url, &supervisor_env)?;
-        // Adopted as good only now: the relay answers with this build's
-        // manifest, which a fork of a golden without tod's files cannot.
-        let expected = tod_sandbox::provision::node_manifest(&node_files.relay);
-        progress(&format!("checking {name} is healthy…"));
-        tod_sandbox::health::probe(&bx, &url, tod_sandbox::health::Stage::Ready, &health(Some(&expected)), progress)
-            .map_err(|failure| match &fork_from {
-                Some(from) => anyhow::Error::new(failure).context(format!(
-                    "{name} was forked from {from}, which should carry this build's relay, supervisor and tod-cli; \
-                     refresh it (`tod-sandbox golden refresh`) or point the Files setting at the project's golden"
-                )),
-                None => anyhow::Error::new(failure),
-            })?;
+        if !golden_has_tod_files {
+            // Restarted, so it runs the binary the install gave it. Adopted
+            // as good only now: the relay answers with this build's manifest,
+            // which a fork of a golden without tod's files cannot.
+            node::start_relay(&bx, &url, &supervisor_env)?;
+            ready(progress)?;
+        }
         host.record_install(&root, node_id)?;
         progress(&format!(
             "{name} {} and set up after {:.1}s",

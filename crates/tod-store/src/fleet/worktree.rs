@@ -9,7 +9,7 @@ use crate::fleet::treehouse::{TREEHOUSE_NO_UPDATE_CHECK_ENV, TreehouseInvocation
 use crate::fleet::workdir::{CONTAINER_GIT_CONFIG_ENV, Workdir, strip_verbatim};
 use crate::paths::TodPaths;
 use crate::settings::{TodSettings, WorktreeBackend};
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -432,15 +432,32 @@ pub fn branch_submodules(worktree: &Workdir, branch: &str) -> Result<Vec<String>
     if branch.is_empty() {
         return Ok(Vec::new());
     }
+    // Each submodule is its own repository, and in a sandbox every git call
+    // is a round trip, so they are switched side by side, not one after
+    // another (the warnings stay in the submodules' order).
+    let dirs = submodule_dirs(worktree)?;
+    let results: Vec<Result<()>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = dirs
+            .iter()
+            .map(|dir| {
+                scope.spawn(move || {
+                    switch_to_branch(dir, branch, None).and_then(|created_at_head| {
+                        if created_at_head {
+                            let head = run_git(dir, &["rev-parse", "HEAD"])?;
+                            run_git(dir, &["config", &start_key(branch), &head])?;
+                        }
+                        Ok(())
+                    })
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().unwrap_or_else(|_| Err(anyhow!("switching a submodule panicked"))))
+            .collect()
+    });
     let mut warnings = Vec::new();
-    for dir in submodule_dirs(worktree)? {
-        let switched = switch_to_branch(&dir, branch, None).and_then(|created_at_head| {
-            if created_at_head {
-                let head = run_git(&dir, &["rev-parse", "HEAD"])?;
-                run_git(&dir, &["config", &start_key(branch), &head])?;
-            }
-            Ok(())
-        });
+    for (dir, switched) in dirs.iter().zip(results) {
         if let Err(err) = switched {
             warnings.push(format!("Submodule {dir} is not on \"{branch}\": {err:#}"));
         }
