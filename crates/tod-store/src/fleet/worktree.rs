@@ -423,6 +423,29 @@ pub fn init_submodules(worktree: &Workdir) -> Result<()> {
     Ok(())
 }
 
+/// [`branch_submodules`] for the common case in a cloud sandbox, in one call
+/// instead of about fifteen (each is a round trip): every submodule is
+/// initialized and none has `branch` yet, locally or on `origin`, so each gets
+/// it created at the commit it is on. `Ok(false)` when anything else is so
+/// (nothing is then assumed: the caller runs [`init_submodules`] and
+/// [`branch_submodules`], which are idempotent and so finish what this began).
+pub fn branch_submodules_quickly(worktree: &Workdir, branch: &str) -> Result<bool> {
+    if branch.is_empty() || !matches!(worktree, Workdir::Sandbox { .. }) {
+        return Ok(false);
+    }
+    let script = format!(
+        r#"export BR="$1" KEY="$2"
+[ -f .gitmodules ] || exit 0
+if git submodule status --recursive | grep -q '^-'; then exit 7; fi
+git submodule foreach --recursive --quiet '
+  if git show-ref --verify --quiet "refs/heads/$BR" || git show-ref --verify --quiet "refs/remotes/{REMOTE}/$BR"; then exit 7; fi
+  git switch -q -c "$BR" && git config "$KEY" "$(git rev-parse HEAD)"'"#
+    );
+    let key = start_key(branch);
+    let out = worktree.output_within(SUBMODULE_LIST_LIMIT.max(std::time::Duration::from_secs(60)), "sh", &["-c", &script, "sh", branch, &key])?;
+    Ok(out.status.success())
+}
+
 /// Check `branch` out in every initialized submodule of `worktree` (see
 /// [`switch_to_branch`]: from `origin/<branch>` if the submodule has one, else
 /// at the commit the superproject pins), so an agent's commits inside a submodule land on a

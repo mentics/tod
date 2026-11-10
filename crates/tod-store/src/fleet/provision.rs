@@ -1067,10 +1067,16 @@ fn make_sandbox(
         record(fleet, &*location)?;
         let dir = Workdir::sandbox(&name, &dir_path);
         let mut warnings = Vec::new();
-        if let Err(err) = worktree::init_submodules(&dir) {
-            warnings.push(format!("{err:#}"));
+        // A fork of a golden has its submodules set up already: one call puts
+        // the branch in each; otherwise (or if that one finds anything
+        // unusual) the step-by-step way runs.
+        let quick = fork_from.is_some() && worktree::branch_submodules_quickly(&dir, branch).unwrap_or(false);
+        if !quick {
+            if let Err(err) = worktree::init_submodules(&dir) {
+                warnings.push(format!("{err:#}"));
+            }
+            warnings.extend(worktree::branch_submodules(&dir, branch)?);
         }
-        warnings.extend(worktree::branch_submodules(&dir, branch)?);
         if !golden_has_tod_files {
             // Restarted, so it runs the binary the install gave it. Adopted
             // as good only now: the relay answers with this build's manifest,
