@@ -1942,6 +1942,22 @@ pub fn wake_node_tracked_requesting(
     })?
 }
 
+/// The user answered a request on `node_id`. A node that runs in the cloud
+/// continues by itself only if its sandbox is there to hear it, and one that
+/// expired overnight is not: nothing would notice until the orchestrator's
+/// poke found it gone and a later sync brought the mark. So the answer wakes
+/// the supervisor now, under a lease, replacing the sandbox first when it is
+/// gone, the node showing each step. `Ok(None)` for a node that does not run
+/// in the cloud. Blocks on the network: never on the UI thread.
+pub fn wake_after_answer(fleet: &FleetStore, root: &Path, node_id: &str) -> Result<Option<String>> {
+    if cloud_node(fleet, node_id).is_none() {
+        return Ok(None);
+    }
+    let mut progress = |msg: &str| log_progress(&format!("answer for {node_id}"), msg);
+    let (said, _heard) = wake_node_tracked_requesting(fleet, root, node_id, REQUEST_CHECK_NOW, &mut progress)?;
+    Ok(Some(said))
+}
+
 /// Pulls from the orchestrator every [`REPORT_POLL`] until the node's
 /// supervisor is heard from ([`supervisor_heard`], starting with `report`) or
 /// [`SUPERVISOR_REPORTS_WITHIN`] passes.
@@ -2152,7 +2168,19 @@ fn wake_node_requesting_inner(fleet: &FleetStore, root: &Path, node_id: &str, ki
         }
         _ => {
             let gone = sandbox;
-            let mut progress = |msg: &str| log_progress(&format!("replacing {gone}"), msg);
+            // Shown on the node as it happens: replacing a sandbox takes
+            // minutes, and the node must say what it is doing from the first
+            // second, not read as idle until the supervisor reports in.
+            let say = |msg: &str| {
+                if let Ok(node) = uuid::Uuid::parse_str(node_id) {
+                    let _ = crate::run_state::record(fleet, node, crate::run_state::sending_now(msg), "app");
+                }
+            };
+            say(&format!("its sandbox {gone} is gone; making a new one…"));
+            let mut progress = |msg: &str| {
+                log_progress(&format!("replacing {gone}"), msg);
+                say(&format!("making a new sandbox (replacing {gone}): {msg}"));
+            };
             let name = ensure_supervisor(fleet, root, node_id, true, &mut progress)
                 .and_then(|name| record_cloud_node(fleet, node_id, &user).map(|_| name))
                 .with_context(|| format!("sandbox {gone} is gone, and replacing it failed"))?;

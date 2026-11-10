@@ -112,6 +112,13 @@ pub fn sending() -> Draft {
     )
 }
 
+/// [`sending`], saying what the app is doing now (replacing a lost sandbox:
+/// forking, installing, checking), so a start that takes minutes shows its
+/// progress instead of one fixed line.
+pub fn sending_now(what: &str) -> Draft {
+    draft(Phase::Starting, kind::SENDING, what, RESUMABLE_BY_RUNNER)
+}
+
 /// A runner is at work.
 pub fn working(what: &str) -> Draft {
     draft(Phase::Working, kind::WORKING, what, RESUMABLE_BY_NOBODY)
