@@ -43,12 +43,21 @@ fn say(err: impl std::fmt::Display) -> String {
 }
 
 /// Read `pr`: its state, whether its review is clean, and its labels.
-pub fn load(data_root: &Path, pr: &NodePr) -> Result<PrFacts, String> {
+///
+/// `answered_at` is when the node's pull request agent last took a turn
+/// ([`crate::pr_readiness::agent_answered_at`]): comments up to then are
+/// answered, not feedback still to do.
+pub fn load(
+    data_root: &Path,
+    pr: &NodePr,
+    answered_at: Option<chrono::DateTime<chrono::Utc>>,
+) -> Result<PrFacts, String> {
     let feed = crate::pr_readiness::feed_for(data_root)
         .ok_or_else(|| crate::pull_requests::NO_TOKEN.to_string())?;
     let snapshot = feed.snapshot(pr)?;
     let settings = crate::pr_readiness::settings_at(data_root);
-    let assessment = crate::pr_readiness::Assessment::of(&snapshot, &settings, chrono::Utc::now());
+    let assessment =
+        crate::pr_readiness::Assessment::of(&snapshot, &settings, chrono::Utc::now()).answered_through(answered_at);
     let review_clean = assessment.review_clean();
     let not_clean_because = if review_clean {
         String::new()
@@ -78,8 +87,12 @@ pub fn set_labels(data_root: &Path, pr: &NodePr, labels: &[String]) -> Result<()
 }
 
 /// Switch the draft to open. Refused until its review is clean.
-pub fn open_for_review(data_root: &Path, pr: &NodePr) -> Result<(), String> {
-    let facts = load(data_root, pr)?;
+pub fn open_for_review(
+    data_root: &Path,
+    pr: &NodePr,
+    answered_at: Option<chrono::DateTime<chrono::Utc>>,
+) -> Result<(), String> {
+    let facts = load(data_root, pr, answered_at)?;
     if !facts.review_clean {
         return Err(format!("the code review has not passed yet: {}", facts.not_clean_because));
     }
@@ -91,10 +104,16 @@ pub fn reviewer_choices(data_root: &Path, pr: &NodePr) -> Result<Vec<Reviewer>, 
     github(data_root)?.suggested_reviewers(&pr.owner, &pr.repo, pr.pr_number).map_err(say)
 }
 
-/// Ask `login` to review. Refused until the review is clean.
-pub fn request_reviewer(data_root: &Path, pr: &NodePr, login: &str) -> Result<(), String> {
-    let facts = load(data_root, pr)?;
-    if !facts.review_clean {
+/// Ask `login` to review. While the pull request is still a draft this is
+/// refused until the review is clean; once it is open there is nothing to wait for.
+pub fn request_reviewer(
+    data_root: &Path,
+    pr: &NodePr,
+    login: &str,
+    answered_at: Option<chrono::DateTime<chrono::Utc>>,
+) -> Result<(), String> {
+    let facts = load(data_root, pr, answered_at)?;
+    if facts.draft && !facts.review_clean {
         return Err(format!("the code review has not passed yet: {}", facts.not_clean_because));
     }
     github(data_root)?

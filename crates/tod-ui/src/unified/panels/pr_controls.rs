@@ -3,9 +3,9 @@
 //!
 //! They show in the pull-request phases (`pr`, `pr_draft`, `pr_review`).
 //! Labels are the repository's own, picked with the standard searchable
-//! multi-select. Open (draft → ready for review) and Reviewer wait for the
-//! code review to pass clean (`tod_core::pr_actions`), and say why while they
-//! wait. Reviewer lists GitHub's own suggestions first. Everything talks to
+//! multi-select. Open (draft → ready for review) waits for the code review to pass
+//! clean (`tod_core::pr_actions`), and so does Reviewer while the pull request
+//! is a draft; they say why while they wait. Reviewer lists GitHub's own suggestions first. Everything talks to
 //! GitHub, so it runs off the UI thread.
 
 use std::path::PathBuf;
@@ -19,7 +19,8 @@ use gpui::{
 use gpui_component::button::Button;
 use gpui_component::combobox::{Combobox, ComboboxEvent, ComboboxState};
 use gpui_component::select::{SearchableVec, SelectItem};
-use gpui_component::{Disableable as _, Sizable as _};
+use gpui_component::{Disableable as _, IconName, Sizable as _};
+use gpui_component::button::ButtonVariants as _;
 use tod_core::pr_actions::PrFacts;
 use tod_journey::{Presented, PresentedAction};
 use tod_store::conversation::Focus;
@@ -182,6 +183,20 @@ impl PrControls {
         Row { pr, facts: None, error: None, busy: Some("Reading GitHub…"), labels, reviewers, _subs: vec![labels_sub, reviewers_sub] }
     }
 
+    /// When the node's pull request agent last answered; comments before it
+    /// are not feedback still to do.
+    fn answered_at(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        tod_core::pr_readiness::agent_answered_at(&self.fleet, self.node_id).unwrap_or(None)
+    }
+
+    /// Read every linked pull request from GitHub again (the cache is dropped).
+    fn refresh(&mut self, cx: &mut Context<Self>) {
+        for pr in self.linked.clone() {
+            tod_core::pr_readiness::forget_snapshot(&pr);
+            self.load(pr, cx);
+        }
+    }
+
     fn row_mut(&mut self, pr: &NodePr) -> Option<&mut Row> {
         self.rows.iter_mut().find(|r| r.pr.same_as(pr))
     }
@@ -193,12 +208,13 @@ impl PrControls {
             row.busy = Some("Reading GitHub…");
         }
         let root = self.root.clone();
+        let answered_at = self.answered_at();
         cx.spawn(async move |this, cx| {
             let read = {
                 let pr = pr.clone();
                 cx.background_executor()
                     .spawn(async move {
-                        let facts = tod_core::pr_actions::load(&root, &pr)?;
+                        let facts = tod_core::pr_actions::load(&root, &pr, answered_at)?;
                         let labels = tod_core::pr_actions::repo_labels(&root, &pr)?;
                         let reviewers = if facts.review_clean && !facts.merged {
                             tod_core::pr_actions::reviewer_choices(&root, &pr)?
@@ -267,11 +283,12 @@ impl PrControls {
             disabled,
         };
         let clean = self.rows.iter().all(|r| r.facts.as_ref().is_some_and(|f| f.review_clean));
+        let reviewer_ready = self.rows.iter().all(|r| r.facts.as_ref().is_some_and(|f| !f.draft || f.review_clean));
         let presented = Presented {
             actions: vec![
                 action("pr_labels", "Labels", false),
                 action("pr_open", "Open", !clean),
-                action("pr_reviewer", "Reviewer", !clean),
+                action("pr_reviewer", "Reviewer", !reviewer_ready),
             ],
             focused: None,
             notices: Vec::new(),
@@ -293,12 +310,18 @@ impl PrControls {
 
     fn open(&mut self, pr: NodePr, cx: &mut Context<Self>) {
         self.record("pr_open", cx);
-        self.run(pr, "Opening for review…", cx, tod_core::pr_actions::open_for_review);
+        let answered_at = self.answered_at();
+        self.run(pr, "Opening for review…", cx, move |root, pr| {
+            tod_core::pr_actions::open_for_review(root, pr, answered_at)
+        });
     }
 
     fn apply_reviewer(&mut self, pr: NodePr, login: String, cx: &mut Context<Self>) {
         self.record("pr_reviewer", cx);
-        self.run(pr, "Asking for review…", cx, move |root, pr| tod_core::pr_actions::request_reviewer(root, pr, &login));
+        let answered_at = self.answered_at();
+        self.run(pr, "Asking for review…", cx, move |root, pr| {
+            tod_core::pr_actions::request_reviewer(root, pr, &login, answered_at)
+        });
     }
 
     /// Run `job` against GitHub off the UI thread, then read the pull request
@@ -342,7 +365,7 @@ impl PrControls {
         let idle = row.busy.is_none();
         let wait_reason = match facts {
             Some(f) if f.merged => "This pull request is merged.".to_string(),
-            Some(f) if !f.review_clean => {
+            Some(f) if f.draft && !f.review_clean => {
                 format!("Waiting for the code review to pass clean:\n{}", f.not_clean_because)
             }
             _ => String::new(),
@@ -395,8 +418,17 @@ impl PrControls {
                         Combobox::new(&row.reviewers)
                             .placeholder("Reviewer…")
                             .search_placeholder("Type to search people")
-                            .disabled(!idle || !clean || merged),
+                            .disabled(!idle || (draft && !clean) || merged),
                     ),
+            )
+            .child(
+                Button::new(("pr-refresh", ix))
+                    .small()
+                    .ghost()
+                    .icon(IconName::Redo2)
+                    .tooltip("Check GitHub again")
+                    .disabled(!idle)
+                    .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
             )
             .children(status.map(|(text, is_error)| {
                 let el = if is_error { style::text_error(div()) } else { style::text_muted(div()) };
