@@ -32,6 +32,14 @@ pub const KIND_GOLDEN: &str = "golden";
 /// [`repo_label`]), so the repository of a golden is read from its listing and
 /// no sandbox has to be woken to ask.
 pub const LABEL_REPO: &str = "tod-repo";
+/// `tod-from=<sandbox>`: on a golden tod made by forking the workspace's
+/// original golden (named here), with tod's files and no network update. Such a
+/// golden holds no proxy routes, which `fork_golden` accepts because its
+/// original had them (checked when it was made).
+pub const LABEL_FROM: &str = "tod-from";
+/// `tod-origin=true`: a golden tod built from an image (never updated), which a
+/// refresh forks from instead of deleting.
+pub const LABEL_ORIGIN: &str = "tod-origin";
 /// `ready=true`: set last, once the golden passed its checks and has its files.
 pub const LABEL_READY: &str = "ready";
 
@@ -270,7 +278,7 @@ pub fn retry_step<T>(
 /// What a failed refresh does about the golden it half made.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HalfMade {
-    /// Delete it: tod made it just now, it is not `ready`, and nothing uses it.
+    /// Delete it: tod made it just now, and nothing uses it.
     Delete,
     /// Leave it, for this reason.
     Keep(String),
@@ -279,9 +287,9 @@ pub enum HalfMade {
 /// Decides [`HalfMade`] for `new`, the sandbox a failed refresh made from
 /// `old`. `found` is Blaxel's record of `new` (`None`: it is gone or was never
 /// made). Only a sandbox this refresh named itself ([`new_name`]'s
-/// `tod-golden-` prefix), different from the golden it started from, and not
-/// marked `ready` is deleted: never the previous good golden, never one the
-/// user made by hand (`wsx-golden`), never a finished one.
+/// `tod-golden-` prefix) and different from the golden it started from is
+/// deleted: never the previous good golden, never one the user made by hand
+/// (`wsx-golden`).
 pub fn half_made_action(new: &str, old: &str, found: Option<&SandboxInfo>) -> HalfMade {
     if new == old {
         return HalfMade::Keep(format!("{new} is the golden the refresh started from"));
@@ -292,9 +300,10 @@ pub fn half_made_action(new: &str, old: &str, found: Option<&SandboxInfo>) -> Ha
     if !new.starts_with("tod-golden-") {
         return HalfMade::Keep(format!("{new} was not named by tod's refresh"));
     }
-    if info.label(LABEL_READY) == Some("true") {
-        return HalfMade::Keep(format!("{new} is marked ready"));
-    }
+    // Not judged by its `ready` label: a golden is labelled `ready` before
+    // its files go in (see `label_golden`), and a fork inherits `ready` from
+    // its original. A finished golden is the one `sandboxes.toml` points at,
+    // and the callers run this before that.
     HalfMade::Delete
 }
 
@@ -495,9 +504,9 @@ mod tests {
         // A name tod's refresh did not give.
         let mine = info_named("wsx-golden", &[]);
         assert!(matches!(half_made_action("wsx-golden", "tod-golden-a-b-0", Some(&mine)), HalfMade::Keep(_)));
-        // A finished one.
+        // Labelled ready before its files went in: still half made.
         let ready = info_named("tod-golden-a-b-1", &[(LABEL_READY, "true")]);
-        assert!(matches!(half_made_action("tod-golden-a-b-1", "wsx-golden", Some(&ready)), HalfMade::Keep(r) if r.contains("ready")));
+        assert_eq!(half_made_action("tod-golden-a-b-1", "wsx-golden", Some(&ready)), HalfMade::Delete);
     }
 
     fn stamp(install: &str, schema: u32, wire: u32, built: u64) -> GoldenStamp {

@@ -695,11 +695,55 @@ fn install_bundles(bx: &Blaxel, url: &str, payload: &NodePayload, progress: &mut
         if res.exit_code != 0 {
             bail!("clearing the old bundles failed: {}", res.output());
         }
-        for (rel, bytes) in payload.bundles {
-            bx.upload(url, &format!("{TOD_DIR}/{rel}"), bytes, "0644")?;
+        // One archive, one upload, one extract: a request per file made this
+        // the slowest step of a fork (about 80 files, each a round trip).
+        let archive = bundle_archive(payload.bundles)?;
+        let remote = format!("{TOD_DIR}/bundles.tar");
+        bx.upload_large(url, &remote, &archive, "0644")?;
+        let res = bx.run(url, &format!("tar -xf {remote} -C {TOD_DIR} && rm -f {remote}"), 120)?;
+        if res.exit_code != 0 {
+            bail!("unpacking the bundles failed: {}", res.output());
         }
     }
     Ok(())
+}
+
+/// The bundles as a ustar archive, each at `rel` (relative to `/opt/tod`).
+/// Only what ustar's name fields hold; a longer path is an error, not a cut.
+fn bundle_archive(bundles: &[(String, Vec<u8>)]) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    for (rel, bytes) in bundles {
+        let (name, prefix) = split_tar_name(rel).ok_or_else(|| anyhow::anyhow!("bundle path too long for a tar header: {rel}"))?;
+        let mut header = [0u8; 512];
+        header[..name.len()].copy_from_slice(name.as_bytes());
+        header[100..108].copy_from_slice(b"0000644\0");
+        header[108..116].copy_from_slice(b"0000000\0");
+        header[116..124].copy_from_slice(b"0000000\0");
+        header[124..136].copy_from_slice(format!("{:011o}\0", bytes.len()).as_bytes());
+        header[136..148].copy_from_slice(b"00000000000\0");
+        header[156] = b'0';
+        header[257..263].copy_from_slice(b"ustar\0");
+        header[263..265].copy_from_slice(b"00");
+        header[345..345 + prefix.len()].copy_from_slice(prefix.as_bytes());
+        header[148..156].copy_from_slice(b"        ");
+        let sum: u32 = header.iter().map(|b| u32::from(*b)).sum();
+        header[148..156].copy_from_slice(format!("{sum:06o}\0 ").as_bytes());
+        out.extend_from_slice(&header);
+        out.extend_from_slice(bytes);
+        out.resize(out.len().div_ceil(512) * 512, 0);
+    }
+    out.extend_from_slice(&[0u8; 1024]);
+    Ok(out)
+}
+
+/// Splits `path` into a ustar `(name, prefix)`: the name at most 100 bytes,
+/// the prefix at most 155, split at a `/`.
+fn split_tar_name(path: &str) -> Option<(String, String)> {
+    if path.len() <= 100 {
+        return Some((path.to_string(), String::new()));
+    }
+    let split = path.match_indices('/').map(|(i, _)| i).filter(|i| *i <= 155 && path.len() - i - 1 <= 100).last()?;
+    Some((path[split + 1..].to_string(), path[..split].to_string()))
 }
 
 /// [`install`] for a fork of a golden: tod's own files only (the relay,
@@ -863,7 +907,11 @@ fn wait_proxy_ready_with(
 pub fn fork_golden(bx: &Blaxel, source: &str, spec: &NodeSandboxSpec, creds: &NodeCredentials) -> Result<()> {
     let current = bx.get_json(source)?.ok_or_else(|| anyhow::anyhow!("no sandbox named {source} to fork"))?;
     let routes = current["spec"]["network"]["proxy"]["routing"].as_array().map_or(0, Vec::len);
-    if routes == 0 {
+    // A tod golden holds no routes (a fork keeps none) and does not need any:
+    // it is a fork of an original that had them, and only the node's own
+    // fork is ever given the node's rules.
+    let tod_golden = current["metadata"]["labels"][crate::golden::LABEL_FROM].as_str().is_some();
+    if routes == 0 && !tod_golden {
         bail!(
             "{source} was made without a proxy, so a fork of it cannot carry the node's credentials; \
              rebuild it with one (`blaxel-sbx golden refresh`)"
@@ -1479,5 +1527,32 @@ mod tests {
     fn the_supervisor_workspace_is_the_clone_else_the_images_checkout() {
         assert!(supervisor_command().contains(WORKSPACE_PROBE));
         assert!(WORKSPACE_PROBE.contains("/workspace/repo/.git") && WORKSPACE_PROBE.contains("echo /workspace;"));
+    }
+}
+
+#[cfg(test)]
+mod bundle_archive_tests {
+    use super::*;
+
+    #[test]
+    fn the_archive_extracts_to_the_same_files_with_system_tar() {
+        let long = format!("process/{}/{}.md", "d".repeat(90), "e".repeat(60));
+        let bundles = vec![
+            ("process/a.md".to_string(), b"alpha".to_vec()),
+            ("media/context/b.md".to_string(), vec![b'b'; 1000]),
+            (long.clone(), b"deep".to_vec()),
+        ];
+        let archive = bundle_archive(&bundles).unwrap();
+        assert_eq!(archive.len() % 512, 0);
+        let dir = std::env::temp_dir().join(format!("tod-bundle-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tar = dir.join("bundles.tar");
+        std::fs::write(&tar, &archive).unwrap();
+        let out = std::process::Command::new("tar").arg("-xf").arg(&tar).arg("-C").arg(&dir).output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        for (rel, bytes) in &bundles {
+            assert_eq!(std::fs::read(dir.join(rel)).unwrap(), *bytes, "{rel}");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

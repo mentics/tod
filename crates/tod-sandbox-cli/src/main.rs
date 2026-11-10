@@ -42,11 +42,13 @@ golden [<repo>] [<sandbox>]
                          sandboxes.toml is every repository's until it has its own.
 golden refresh <owner/name>
                          Make the repository's golden on this build. With a golden
-                         of its own: fork it, check what a fork needs, install tod's
-                         files (relay, shim, Linux tod-cli, supervisor, bundles,
-                         Claude adapter), label it with this build's stamp, mark it
-                         ready, point the repository at it, and delete the old one
-                         when tod made it and no other repository uses it. Refuses a
+                         of its own: fork the workspace's own golden it came from
+                         (set it with `golden <owner/name> <name or prefix*>`), label
+                         the fork with this build's stamp, check what a fork needs,
+                         install tod's files (relay, shim, Linux tod-cli, supervisor,
+                         bundles, Claude adapter), point the repository at it, and
+                         delete the old tod golden. It never updates the fork's
+                         network, so node forks of it keep their files. Refuses a
                          golden a newer tod made. With none (or only an account-wide
                          golden holding another repository): build one from a fresh
                          sandbox of the default image, install tod's dependencies and

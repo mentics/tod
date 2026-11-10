@@ -51,6 +51,21 @@ impl Sandboxes {
         Ok(Self { root: root.to_path_buf(), config_path, saved: config.clone(), config })
     }
 
+    /// Takes the goldens and their originals as the file has them now (another
+    /// process may have refreshed one since this copy loaded), leaving this
+    /// copy's other changes to be saved as they are.
+    pub fn reload(&mut self) -> Result<()> {
+        let disk = Config::load(&self.config_path)?;
+        let (Some(now), Some(mine), Some(saved)) = (disk.blaxel, self.config.blaxel.as_mut(), self.saved.blaxel.as_mut()) else {
+            return Ok(());
+        };
+        mine.goldens = now.goldens.clone();
+        mine.golden_sources = now.golden_sources.clone();
+        saved.goldens = now.goldens;
+        saved.golden_sources = now.golden_sources;
+        Ok(())
+    }
+
     /// Saves what this copy changed since it was loaded (or last saved) onto
     /// the file as it is now, so another writer's entries (a `golden
     /// refresh` during a creation that takes minutes, another app on the
@@ -390,7 +405,7 @@ impl Sandboxes {
         self.resolve_golden_setting(bx, setting)
     }
 
-    fn resolve_golden_setting(&self, bx: &Blaxel, golden: &str) -> Result<String> {
+    pub fn resolve_golden_setting(&self, bx: &Blaxel, golden: &str) -> Result<String> {
         Ok(match golden.trim().strip_suffix('*') {
             Some(prefix) => {
                 let all: Vec<_> = bx

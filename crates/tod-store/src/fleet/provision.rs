@@ -921,6 +921,16 @@ fn make_sandbox(
         sandbox::NewSandboxSource::Fork(from) => Some(from.trim().to_string()),
         sandbox::NewSandboxSource::Image(_) => None,
     };
+    // A golden tod made by forking the workspace's original already carries
+    // tod's files, and the node's own fork keeps them through its one network
+    // update (that fork's source was never updated); any other golden's fork
+    // gets them uploaded.
+    let golden_has_tod_files = match &fork_from {
+        Some(golden) => bx
+            .get(golden)?
+            .is_some_and(|info| info.label(tod_sandbox::golden::LABEL_FROM).is_some_and(|v| !v.is_empty())),
+        None => false,
+    };
     let image = match &source {
         sandbox::NewSandboxSource::Image(image) => sandboxes.runtime_image(image, false, progress)?,
         // Not used: a fork is made from its source, not from an image.
@@ -992,10 +1002,15 @@ fn make_sandbox(
             bundles: &node_files.bundles,
             supervisor_env: &supervisor_env,
         };
-        progress("installing tod's files…");
         if fork_from.is_none() {
+            progress("installing tod's files…");
             node::install(&bx, &url, &payload, progress)?;
+        } else if golden_has_tod_files {
+            // Nothing to upload: the Ready check below fails, naming the
+            // golden, if it does not carry this build's files.
+            node::start_relay(&bx, &url, &supervisor_env)?;
         } else {
+            progress("installing tod's files…");
             // A fork's files come from tod's own bundle, not its golden's:
             // `fork_golden` ends by giving the fork the node's proxy, and that
             // update redeploys it from its image, which drops whatever the
