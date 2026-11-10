@@ -41,6 +41,12 @@ fn normalized(repo: &str) -> Result<String> {
 /// thread.
 pub fn ensure_golden_current(sandboxes: &mut Sandboxes, bx: &Blaxel, repo: &str, progress: &mut dyn FnMut(&str)) -> Result<String> {
     let repo = normalized(repo)?;
+    // One refresh at a time on a data root (the app making a node and the
+    // daemon's background check both come here); the one that waits then
+    // finds the golden current.
+    let _lock = RefreshLock::take(&sandboxes.root)?;
+    // What another process saved while this one waited.
+    sandboxes.reload()?;
     let files = install_files()?;
     let mine = my_stamp(&files)?;
     let name = match source_for(sandboxes, bx, &repo)? {
@@ -50,14 +56,121 @@ pub fn ensure_golden_current(sandboxes: &mut Sandboxes, bx: &Blaxel, repo: &str,
         }
         golden::Source::Refresh { from } => from,
     };
-    ensure_current_with(
-        &repo,
-        &name,
-        &mine,
-        |name| bx.get(name),
-        progress,
-        |name, progress| refresh_with(sandboxes, bx, &repo, name, &files, &mine, progress),
-    )
+    let mut refreshed = false;
+    let current = ensure_current_with(&repo, &name, &mine, |name| bx.get(name), progress, |name, progress| {
+        refreshed = true;
+        let info = bx.get(name)?.ok_or_else(|| anyhow!("the golden sandbox {name} for {repo} does not exist"))?;
+        let origin = origin_of(sandboxes, bx, &repo, name, &info)?;
+        refresh_with(sandboxes, bx, &repo, name, &origin, &files, &mine, progress)
+    })?;
+    if refreshed {
+        return Ok(current);
+    }
+    // Current for this build: still out of date when the workspace's golden
+    // it was forked from has been replaced since.
+    if let Some(why) = origin_moved(sandboxes, bx, &repo, &current, progress)? {
+        progress(&format!("the golden sandbox {current} for {repo} is being refreshed: {why}"));
+        return refresh_locked(sandboxes, bx, &repo, progress);
+    }
+    Ok(current)
+}
+
+/// The lock that keeps two golden refreshes of one data root apart
+/// (`golden-refresh.lock`); released when dropped.
+struct RefreshLock(std::fs::File);
+
+impl RefreshLock {
+    fn take(root: &std::path::Path) -> Result<Self> {
+        use fs2::FileExt;
+        let path = root.join("golden-refresh.lock");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .with_context(|| format!("open {}", path.display()))?;
+        file.lock_exclusive().with_context(|| format!("lock {}", path.display()))?;
+        Ok(Self(file))
+    }
+}
+
+impl Drop for RefreshLock {
+    fn drop(&mut self) {
+        let _ = fs2::FileExt::unlock(&self.0);
+    }
+}
+
+/// Makes every repository's golden current for this build and, for a tod
+/// golden, for the original it was forked from (the daemon's background
+/// check, [`ensure_golden_current`] for each repository with a golden). The
+/// first failure for a repository is returned after the others were tried.
+pub fn ensure_all_current(sandboxes: &mut Sandboxes, bx: &Blaxel, progress: &mut dyn FnMut(&str)) -> Result<()> {
+    let repos: Vec<String> = sandboxes.account()?.goldens.keys().cloned().collect();
+    let mut failures = Vec::new();
+    for repo in repos {
+        if let Err(err) = ensure_golden_current(sandboxes, bx, &repo, progress) {
+            failures.push(format!("{repo}: {err:#}"));
+        }
+    }
+    if failures.is_empty() { Ok(()) } else { bail!("{}", failures.join("; ")) }
+}
+
+/// The original golden a refresh of `repo`'s golden `old` forks from, as a
+/// sandbox name. For a golden tod made by forking an original, the original
+/// its repository's `golden_sources` entry now names (newest ready one for a
+/// `prefix*`); for one built from an image, or one tod did not make, `old`
+/// itself. A golden an older tod made by forking and updating a golden (it
+/// has neither mark) cannot be forked from cleanly and is refused, with what
+/// to do.
+fn origin_of(sandboxes: &Sandboxes, bx: &Blaxel, repo: &str, old: &str, info: &tod_sandbox::blaxel::SandboxInfo) -> Result<String> {
+    let made_by_tod = info.label("tod-kind") == Some(golden::KIND_GOLDEN);
+    let has = |key: &str| info.label(key).is_some_and(|v| !v.is_empty());
+    let origin = if made_by_tod && has(golden::LABEL_FROM) {
+        let setting = sandboxes.account()?.golden_source_for(repo).ok_or_else(|| {
+            anyhow!(
+                "{old} was forked from {}, but no original golden is recorded for {repo}: \
+                 run `tod-sandbox golden {repo} <the workspace's golden or prefix*>`, then refresh again",
+                info.label(golden::LABEL_FROM).unwrap_or("?")
+            )
+        })?;
+        sandboxes.resolve_golden_setting(bx, setting)?
+    } else if made_by_tod && info.label(golden::LABEL_ORIGIN) != Some("true") {
+        bail!(
+            "{old} was made by an older tod, by forking a golden and updating its network, so a fork of it \
+             would lose the files in it. Point {repo} at the workspace's own golden (`tod-sandbox golden {repo} \
+             <name or prefix*>`) and refresh again, which forks that one",
+        );
+    } else {
+        old.to_string()
+    };
+    let routed = bx.get_json(&origin)?.ok_or_else(|| anyhow!("the original golden {origin} for {repo} does not exist"))?;
+    if !has_proxy_routes(&routed) {
+        bail!(
+            "the original golden {origin} was made without a proxy, so nodes cannot take their credentials on a fork of it; \
+             rebuild it with one (`blaxel-sbx golden refresh`)"
+        );
+    }
+    Ok(origin)
+}
+
+/// Why `golden` (a tod golden forked from an original) is behind: the
+/// original its repository now names is another sandbox than the one it was
+/// forked from. `None` when it is not a fork of an original, or is current.
+/// A setting that cannot be resolved is said through `progress` and leaves the
+/// golden as it is (nothing to refresh from).
+fn origin_moved(sandboxes: &Sandboxes, bx: &Blaxel, repo: &str, golden_name: &str, progress: &mut dyn FnMut(&str)) -> Result<Option<String>> {
+    let Some(info) = bx.get(golden_name)? else { return Ok(None) };
+    let Some(from) = info.label(golden::LABEL_FROM).filter(|v| !v.is_empty()) else { return Ok(None) };
+    let Some(setting) = sandboxes.account()?.golden_source_for(repo) else { return Ok(None) };
+    match sandboxes.resolve_golden_setting(bx, setting) {
+        Ok(now) if now != from => Ok(Some(format!("it was forked from {from}, and {repo}'s original golden is now {now}"))),
+        Ok(_) => Ok(None),
+        Err(err) => {
+            progress(&format!("cannot check whether {repo}'s original golden changed ({err:#}); using {golden_name} as it is"));
+            Ok(None)
+        }
+    }
 }
 
 /// Where `repo`'s golden comes from ([`golden::decide_source`]): its own
@@ -109,6 +222,14 @@ fn ensure_current_with(
 /// `sandboxes.toml` pointing at the old one, and says so.
 pub fn refresh_golden(sandboxes: &mut Sandboxes, bx: &Blaxel, repo: &str, progress: &mut dyn FnMut(&str)) -> Result<String> {
     let repo = normalized(repo)?;
+    let _lock = RefreshLock::take(&sandboxes.root)?;
+    sandboxes.reload()?;
+    refresh_locked(sandboxes, bx, &repo, progress)
+}
+
+/// [`refresh_golden`] with the lock held and `sandboxes` current.
+fn refresh_locked(sandboxes: &mut Sandboxes, bx: &Blaxel, repo: &str, progress: &mut dyn FnMut(&str)) -> Result<String> {
+    let repo = repo.to_string();
     let files = install_files()?;
     let mine = my_stamp(&files)?;
     let old = match source_for(sandboxes, bx, &repo)? {
@@ -123,7 +244,8 @@ pub fn refresh_golden(sandboxes: &mut Sandboxes, bx: &Blaxel, repo: &str, progre
         // The same refusal `ensure_golden_current` makes: never refresh back.
         golden::decide(&repo, &mine, Some(&theirs))?;
     }
-    refresh_with(sandboxes, bx, &repo, &old, &files, &mine, progress)
+    let origin = origin_of(sandboxes, bx, &repo, &old, &info)?;
+    refresh_with(sandboxes, bx, &repo, &old, &origin, &files, &mine, progress)
 }
 
 /// Makes the golden of a repository that has none (or whose only candidate
@@ -177,6 +299,7 @@ fn build_golden(
         sandboxes.config.upsert(tod_sandbox::config::Sandbox { name: name.clone(), image: info.image, url: Some(url.clone()), agents: true });
         sandboxes.save()?;
         step!("wake it", bx.wait_reachable(&url, tod_sandbox::blaxel::WAKE_CEILING).with_context(|| format!("wake {name}")))?;
+        label_golden(bx, &name, repo, mine, &policy, &say, None)?;
         // A node's fork is redeployed from this sandbox's image by its proxy
         // update, which wipes whatever is installed here afterwards. So the
         // packages tod needs must be in the image itself; installing them
@@ -206,7 +329,7 @@ fn build_golden(
         if cloned.exit_code != 0 {
             bail!("cloning {repo} into {name} failed:\n{}", cloned.output().trim());
         }
-        mark_ready(bx, &name, repo, mine, &policy, &say)
+        verify_ready(bx, &name, &policy, &say)
     })();
     if let Err(err) = made {
         // Nothing points at it yet; remove it unless it is somehow ready.
@@ -230,29 +353,47 @@ fn build_golden(
 }
 
 /// Labels the sandbox with this build's stamp, `tod-kind=golden`,
-/// `keep-when-idle=true` (so the idle prune never deletes it) and the
-/// repository it holds (`tod-repo`), marks it
-/// `ready` last, and checks Blaxel says so.
-fn mark_ready(
+/// `keep-when-idle=true` (so the idle prune never deletes it), the repository
+/// it holds (`tod-repo`) and `ready=true`, in **one** update, and **before**
+/// tod's files go in. Seen live: a node's fork of a golden that was updated
+/// after files were installed in it loses everything on its own network
+/// update (its disk goes back to the image's), from the second fork on; the
+/// same update made right after the fork, before any install, never does.
+/// So nothing may update the golden after its install; `verify_ready` only
+/// reads. (A fork inherits `ready=true` from its original anyway; this
+/// golden is not used until `sandboxes.toml` points at it, and a failure
+/// deletes it.)
+fn label_golden(
     bx: &Blaxel,
     name: &str,
     repo: &str,
     mine: &GoldenStamp,
     policy: &golden::StepRetry,
     say: &dyn Fn(&str),
+    // `Some(original)` for a fork of the workspace's golden; `None` for one
+    // built from an image, which is itself an original.
+    from: Option<&str>,
 ) -> Result<()> {
-    let run = |what: &str, f: &mut dyn FnMut() -> Result<Option<tod_sandbox::blaxel::SandboxInfo>>| {
-        golden::retry_step(name, what, policy, &mut std::thread::sleep, &mut |m| say(m), f)
-    };
     let stamp_labels = mine.labels();
     let mut labels: Vec<(&str, &str)> = stamp_labels.iter().map(|(k, v)| (*k, v.as_str())).collect();
     labels.push(("tod-kind", golden::KIND_GOLDEN));
     labels.push((tod_sandbox::blaxel::LABEL_KEEP_WHEN_IDLE, tod_sandbox::blaxel::KEEP_WHEN_IDLE_YES));
     let repo_label = golden::repo_label(repo)?;
     labels.push((golden::LABEL_REPO, repo_label.as_str()));
-    run("label it", &mut || bx.set_labels(name, &labels).map(|()| None))?;
-    run("mark it ready", &mut || bx.set_labels(name, &[(golden::LABEL_READY, "true")]).map(|()| None))?;
-    match run("verify it", &mut || bx.get(name))? {
+    // Set both explicitly: a fork keeps its source's labels, and a label
+    // update only adds.
+    labels.push((golden::LABEL_ORIGIN, if from.is_none() { "true" } else { "false" }));
+    if let Some(from) = from {
+        labels.push((golden::LABEL_FROM, from));
+    }
+    labels.push((golden::LABEL_READY, "true"));
+    golden::retry_step(name, "label it", policy, &mut std::thread::sleep, &mut |m| say(m), || bx.set_labels(name, &labels))
+}
+
+/// Checks Blaxel says the golden is `ready` (see [`label_golden`]).
+fn verify_ready(bx: &Blaxel, name: &str, policy: &golden::StepRetry, say: &dyn Fn(&str)) -> Result<()> {
+    let found = golden::retry_step(name, "verify it", policy, &mut std::thread::sleep, &mut |m| say(m), || bx.get(name))?;
+    match found {
         Some(info) if info.label(golden::LABEL_READY) == Some("true") => Ok(()),
         Some(_) => bail!("{name} does not carry the ready label after it was set"),
         None => bail!("{name} is gone"),
@@ -264,6 +405,7 @@ fn refresh_with(
     bx: &Blaxel,
     repo: &str,
     old: &str,
+    origin: &str,
     files: &InstallFiles,
     mine: &GoldenStamp,
     progress: &mut dyn FnMut(&str),
@@ -274,12 +416,13 @@ fn refresh_with(
     if bx.get(&name)?.is_some() {
         bail!("a sandbox named {name} already exists; try again in a moment");
     }
-    progress(&format!("forking {old} to {name}…"));
-    // A fork's proxy variables come back as an unrendered template; the
-    // sandbox's local proxy is what works (as `node::fork_golden` does).
-    let envs: Vec<(&str, String)> =
-        tod_sandbox::provision::local_proxy_env().into_iter().map(|(k, v)| (k, v.to_string())).collect();
-    bx.fork_with_envs(old, &name, &envs).with_context(|| format!("fork {old}"))?;
+    progress(&format!("forking {origin} to {name}…"));
+    // A plain fork, with no environment set on it: seen live, a golden forked
+    // with environment variables loses its files in every node fork's network
+    // update once tod's files are installed in it (the same fork without
+    // them keeps them). The node's own fork sets the proxy variables
+    // (`node::fork_golden`).
+    bx.fork(origin, &name).with_context(|| format!("fork {origin}"))?;
     let policy = golden::StepRetry::default();
     let said = std::cell::RefCell::new(progress);
     let say = |m: &str| (said.borrow_mut())(m);
@@ -292,28 +435,17 @@ fn refresh_with(
         };
     }
     let made = (|| -> Result<()> {
-        bx.wait_deployed(&name, Duration::from_secs(300))?;
-        // The proxy goes in BEFORE tod's files: updating a sandbox's network
-        // configuration redeploys it from its image, and what was installed
-        // into it until then is gone (seen live: a freshly refreshed golden had
-        // no node manifest, relay or bundles, so every fork reinstalled them).
-        //
-        // A fork does not keep its source's proxy routing (checked live: the
-        // fork's `network` comes back empty), and `fork_golden` refuses a
-        // golden with none, since a fork of it cannot take the node's rules.
-        // Give it a placeholder rule, as a hand-made golden has.
-        step!("give it a proxy", bx.update_proxy(&name, &placeholder_proxy(), &[]))
-            .with_context(|| format!("give {name} a proxy, so nodes can be forked from it"))?;
+        // No network update here, ever: a fork of an updated fork redeploys
+        // from its image and loses everything installed (see
+        // `scripts/repro-blaxel-network-update-wipe.sh`). The original has the
+        // proxy; this fork inherits none, and only a node's own fork, one
+        // level down, is given rules (verified live: its files and boot
+        // survive that one update, and its credentials work).
         let info = step!("wait until deployed", bx.wait_deployed(&name, Duration::from_secs(300)))?;
         let url = info.url.ok_or_else(|| anyhow!("sandbox {name} has no URL"))?;
         step!("wake it", bx.wait_reachable(&url, tod_sandbox::blaxel::WAKE_CEILING).with_context(|| format!("wake {name}")))?;
-        // After the proxy update: it redeploys from the image and drops what
-        // was installed since, which is exactly what a node's fork loses too.
+        label_golden(bx, &name, repo, mine, &policy, &say, Some(origin))?;
         step!("check what a fork needs", tod_sandbox::provision::require_fork_prerequisites(bx, &url, true, &mut |m| say(m)))?;
-        let routed = step!("read its proxy", bx.get_json(&name))?.is_some_and(|j| has_proxy_routes(&j));
-        if !routed {
-            bail!("{name} did not keep the proxy it was given, so nodes cannot be forked from it");
-        }
         let payload = tod_sandbox::node::NodePayload {
             relay: &files.relay,
             shim: tod_store::fleet::cli_relay::HTTP_SHIM_SCRIPT.as_bytes(),
@@ -328,8 +460,7 @@ fn refresh_with(
         };
         say("installing tod's files…");
         step!("install tod's files", tod_sandbox::node::install(bx, &url, &payload, &mut |m| say(m)))?;
-        // Stamp first and `ready` last: a half-made golden is never ready.
-        mark_ready(bx, &name, repo, mine, &policy, &say)
+        verify_ready(bx, &name, &policy, &say)
     })();
     if let Err(err) = made {
         // `sandboxes.toml` still points at `old`, which this never touches.
@@ -353,6 +484,14 @@ fn refresh_with(
         .blaxel
         .as_mut()
         .ok_or_else(|| anyhow!("run `tod-sandbox setup` first"))?;
+    // The setting the original came from: what the repository's golden said
+    // (a name or `prefix*`) when `old` was the original itself, else the one
+    // already recorded.
+    let source_setting = match account.golden_source_for(repo) {
+        Some(recorded) if old != origin => recorded.to_string(),
+        _ => account.golden_for(repo).unwrap_or(origin).to_string(),
+    };
+    account.set_golden_source(repo, &source_setting);
     account.set_golden(repo, &name);
     // Whether anything else still points at the old one, as it stood.
     let wanted_elsewhere = account.golden_used_elsewhere(old, repo);
@@ -365,6 +504,8 @@ fn refresh_with(
     let made_by_tod = bx.get(old)?.is_some_and(|i| i.label("tod-kind") == Some(golden::KIND_GOLDEN));
     if wanted_elsewhere {
         say(&format!("left {old} in place: another repository's golden setting still points at it"));
+    } else if old == origin {
+        say(&format!("left {old} in place: {name} is forked from it"));
     } else if !made_by_tod {
         say(&format!("left {old} in place: tod did not make it (delete it yourself when you no longer need it)"));
     } else {

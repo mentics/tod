@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Deploys whatever shared cloud piece is out of date, and nothing that is not:
 #   - the cloud orchestrator, recorded in <data root>/orchestrator-deployed.hash,
-#   - the hourly watchdog job, recorded in <data root>/watchdog-deployed.hash.
+#   - the hourly watchdog job, recorded in <data root>/watchdog-deployed.hash,
+#   - each repository's golden sandbox, which is made again on every deploy.
 # Each record is compared with the hash of the orchestrator artifact's sources
 # (not the supervisor, relay or tod-cli, which node sandboxes run). A deploy
 # records the hash it deployed, so the next run finds it up to date.
@@ -50,3 +51,13 @@ else
     cargo run --release -q -p tod-sandbox-cli -- --data-root "$root" watchdog deploy
     record_deploy "$root/watchdog-deployed.hash" "$want"
 fi
+
+# Each repository's golden sandbox (its tod golden: a fork of the workspace's
+# own golden with this build's files), so nodes made after a deploy fork it at
+# once. `golden` lists "<owner/name>: <setting>" lines, or "(none set)".
+tod_sandbox=(cargo run --release -q -p tod-sandbox-cli -- --data-root "$root")
+while IFS= read -r repo; do
+    [[ -n $repo ]] || continue
+    echo "==> refreshing the golden sandbox of $repo"
+    "${tod_sandbox[@]}" golden refresh "$repo"
+done < <("${tod_sandbox[@]}" golden | sed -n 's/^\([^:]*\): .*/\1/p')

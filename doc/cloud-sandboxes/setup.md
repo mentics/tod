@@ -171,9 +171,7 @@ it refuses with "fork feature is not enabled for this workspace".
 **The golden sandbox, one per repository.** A node's sandbox is a fork of
 its project's golden, which holds the repository, the dependencies, and tod's
 own files (relay, shim, Linux `tod-cli`, supervisor, bundles, Claude adapter),
-so a fork needs no packages (a node's fork still gets tod's files again,
-without packages: the proxy update that gives it the node's rules redeploys it
-from its image and drops what the golden had installed). `tod-sandbox golden` lists the goldens;
+so a fork needs no packages and uploads no files (a tod golden is a plain fork of the workspace's own golden with tod's files installed and no network update, which keeps the lineage clean: see `doc/runner-menu/design.md`, "A tod golden"). `tod-sandbox golden` lists the goldens;
 `golden <owner/name>` shows one; `golden <owner/name> <sandbox>` points a
 repository at a sandbox (a name ending in `*` is the newest sandbox with that
 prefix) and labels it `tod-repo` with the repository it holds.
@@ -213,9 +211,11 @@ by hand) counts as older than any build; a **newer** golden is refused, naming t
 repository and both stamps, since a fork would run a newer supervisor against
 this older tod's schema. The app calls it before making a node's sandbox from
 a golden (through `SandboxHost::current_golden`), saying in the progress when
-it refreshes. `tod-sandbox golden refresh` gives the new golden a placeholder
-proxy first and installs tod's files after it, because a proxy update
-redeploys a sandbox from its image.
+it refreshes. `tod-sandbox golden refresh` forks the workspace's own golden (the original, set
+with `tod-sandbox golden <owner/name> <name or prefix*>` and kept in
+`[blaxel.golden_sources]`) and installs tod's files into the fork. It gives the
+fork no network update, since a node's fork of an updated fork loses its files
+on its own update.
 
 *Live check* (not run in tests: there is no fake Blaxel; use a throwaway
 workspace or data root, never the live one). With a golden set for a test

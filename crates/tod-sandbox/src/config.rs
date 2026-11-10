@@ -83,6 +83,13 @@ pub struct Account {
     /// newest sandbox that starts with it.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub goldens: BTreeMap<String, String>,
+    /// The original each repository's tod golden is forked from
+    /// (`[blaxel.golden_sources]`, same keys and spelling as
+    /// [`Self::goldens`]): the workspace's golden, a name or a `prefix*`. A
+    /// tod golden is a fork of it with tod's files and no network update, so
+    /// nodes forked from it keep a clean lineage (see `doc/runner-menu/design.md`).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub golden_sources: BTreeMap<String, String>,
 }
 
 /// A port in a sandbox that reaches `host:port` from this machine: a
@@ -232,6 +239,16 @@ impl Account {
         self.goldens.get(repo).map(|g| g.trim()).filter(|g| !g.is_empty())
     }
 
+    /// The original `repo`'s tod golden is forked from (a name or `prefix*`).
+    pub fn golden_source_for(&self, repo: &str) -> Option<&str> {
+        self.golden_sources.get(repo).map(|g| g.trim()).filter(|g| !g.is_empty())
+    }
+
+    /// Records the original `repo`'s tod golden is forked from.
+    pub fn set_golden_source(&mut self, repo: &str, setting: &str) {
+        self.golden_sources.insert(repo.to_string(), setting.to_string());
+    }
+
     /// Makes `name` `repo`'s golden.
     pub fn set_golden(&mut self, repo: &str, name: &str) {
         self.goldens.insert(repo.to_string(), name.to_string());
@@ -266,6 +283,7 @@ impl Account {
             retired_golden: None,
             forwards: Vec::new(),
             goldens: BTreeMap::new(),
+            golden_sources: BTreeMap::new(),
         }
     }
 }
@@ -453,6 +471,16 @@ impl Config {
                         f.goldens.remove(repo);
                     }
                 }
+                for (repo, g) in &m.golden_sources {
+                    if b.golden_sources.get(repo) != Some(g) {
+                        f.golden_sources.insert(repo.clone(), g.clone());
+                    }
+                }
+                for repo in b.golden_sources.keys() {
+                    if !m.golden_sources.contains_key(repo) {
+                        f.golden_sources.remove(repo);
+                    }
+                }
             }
         }
     }
@@ -551,6 +579,28 @@ claude_token_via = \"env\"
     }
 
     #[test]
+    fn a_goldens_original_is_kept_beside_it_and_merged_on_save() {
+        let dir = std::env::temp_dir().join(format!("tod-sandbox-src-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(FILE_NAME);
+        std::fs::write(&path, "[blaxel]\nworkspace = \"w\"\n[blaxel.goldens]\n\"acme/widget\" = \"wsx-golden-*\"\n").unwrap();
+        let base = Config::load(&path).unwrap();
+        let mut mine = base.clone();
+        let acct = mine.blaxel.as_mut().unwrap();
+        assert_eq!(acct.golden_source_for("acme/widget"), None);
+        acct.set_golden_source("acme/widget", "wsx-golden-*");
+        acct.set_golden("acme/widget", "tod-golden-acme-widget-1");
+        let saved = mine.save_changes(&base, &path).unwrap();
+        let reread = Config::load(&path).unwrap();
+        for c in [saved, reread] {
+            let a = c.blaxel.as_ref().unwrap();
+            assert_eq!(a.golden_source_for("acme/widget"), Some("wsx-golden-*"));
+            assert_eq!(a.golden_for("acme/widget"), Some("tod-golden-acme-widget-1"));
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn round_trips() {
         let dir = std::env::temp_dir().join(format!("tod-sandbox-cfg-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -571,6 +621,7 @@ claude_token_via = \"env\"
             retired_golden: None,
             forwards: vec![],
             goldens: BTreeMap::new(),
+            golden_sources: Default::default(),
         });
         c.upsert(Sandbox { name: "a".into(), image: "i".into(), url: None, agents: true });
         c.upsert(Sandbox { name: "a".into(), image: "j".into(), url: Some("u".into()), agents: true });

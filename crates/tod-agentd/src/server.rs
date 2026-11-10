@@ -10,7 +10,7 @@ use std::net::{TcpListener, TcpStream};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use crate::lifetime;
 use crate::runners::Runners;
 use tod_agent::AgentBackend;
@@ -53,6 +53,7 @@ struct Shared {
 pub fn run(data_root: &Path) -> Result<bool> {
     // The runs it hosts make a node's sandbox through `tod-store`'s one creator.
     tod_core::cloud_sync::register_sandbox_host();
+    spawn_golden_check(data_root);
     // This process has no log directory: its tracing goes to stderr, which
     // the starter files in `agentd.log`.
     tod_core::logging::init_stderr();
@@ -400,4 +401,33 @@ fn feed(writer: &mut TcpStream, shared: &Shared) {
         }
         seq = shared.seq.fetch_add(1, Ordering::SeqCst) + 1;
     }
+}
+
+/// How often the daemon checks that each repository's tod golden is current.
+const GOLDEN_CHECK_EVERY: Duration = Duration::from_secs(10 * 60);
+
+/// Keeps each repository's tod golden current in the background, so a node
+/// made later forks it at once instead of refreshing it first: every ten
+/// minutes, [`tod_core::cloud_sync::golden::ensure_all_current`] refreshes one
+/// only when this build's stamp is newer or the workspace's golden it was
+/// forked from has been replaced. A data root with no Blaxel account has
+/// nothing to check; any other failure is logged, and tried again next time.
+fn spawn_golden_check(data_root: &Path) {
+    let root = data_root.to_path_buf();
+    let _ = std::thread::Builder::new().name("tod-agentd-golden".into()).spawn(move || {
+        loop {
+            let result = (|| -> Result<()> {
+                let mut sandboxes = tod_store::fleet::sandbox::Sandboxes::load(&root)?;
+                if sandboxes.config.blaxel.as_ref().is_none_or(|a| a.goldens.is_empty()) {
+                    return Ok(());
+                }
+                let bx = sandboxes.blaxel()?;
+                tod_core::cloud_sync::golden::ensure_all_current(&mut sandboxes, &bx, &mut |m| tracing::info!("golden: {m}"))
+            })();
+            if let Err(err) = result {
+                tracing::error!("the background golden check failed: {err:#}");
+            }
+            std::thread::sleep(GOLDEN_CHECK_EVERY);
+        }
+    });
 }

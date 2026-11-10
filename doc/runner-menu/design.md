@@ -75,19 +75,33 @@ What it holds, and what each node's fork still gets:
 |---|---|
 | Toolchain: git, curl, tar, bash, ssh tools, Node >= 20.10, `claude-agent-acp`, `claude` | Environment: `TOD_NODE`, `TOD_USER`, orchestrator URL, scheduler, workspace (`fork_with_envs`) |
 | The repository checkout | Proxy rules and labels: the user's and the node's credentials, Blaxel, orchestrator (`update_proxy`), `tod-kind=node`, `tod-creds` |
-| tod's files: the relay, `tod-cli` shim and Linux `tod-cli`, the supervisor, the process, media and skills bundles, the node manifest | **tod's files again, without packages** (`node::install_into_fork`), then the relay restarted |
-| Labels `tod-install` (the install stamp), `tod-schema`, `tod-wire`, `tod-built` (commit time), `tod-kind=golden`, `tod-repo=<owner>--<name>` (the repository it holds; read from the listing to find a node's repository, so no golden is woken or asked), `keep-when-idle=true` (spared by the workspace's idle prune; a gone golden is built again), `ready` | The branch checked out, submodules on it; supervisor settings; session logs and runner state restored |
+| tod's files: the relay, `tod-cli` shim and Linux `tod-cli`, the supervisor, the process, media and skills bundles, the node manifest (a **tod golden**, below) | Nothing to upload: the relay is restarted, and the Ready check fails naming the golden if it lacks this build's files |
+| Labels `tod-install` (the install stamp), `tod-schema`, `tod-wire`, `tod-built` (commit time), `tod-kind=golden`, `tod-from=<original>` (or `tod-origin=true` for one built from an image), `tod-repo=<owner>--<name>` (the repository it holds; read from the listing to find a node's repository, so no golden is woken or asked), `keep-when-idle=true` (spared by the workspace's idle prune; a gone golden is built again), `ready` | The branch checked out, submodules on it; supervisor settings; session logs and runner state restored |
 
-The third row is what the live check found (live-check-2026-11.md, Pass 3,
-bug 1): the proxy update that ends `fork_golden` redeploys the fork from its
-image, which drops everything the golden had installed (a plain `tod-sandbox
-fork` of the golden keeps it). The first design said a fork installs nothing
-of tod's; on Blaxel it must, and only the packages (which are in the image)
-are skipped. The same update is why `golden refresh` sets the golden's own
-placeholder proxy **before** installing tod's files. A fork must answer with
-this build's manifest before it is adopted, or `make_sandbox` fails naming the
-golden. An **image** source has no golden: it gets the bootstrap and the full
-`node::install`.
+**A tod golden, and why the lineage must stay clean.** On Blaxel, updating the
+network (proxy) of a sandbox whose lineage holds an *updated fork* redeploys it
+from its image and drops every file written since (`scripts/repro-blaxel-network-update-wipe.sh`
+reproduces it with `bl` alone; reported to Blaxel). A node's fork needs one
+such update, to get its rules, so nothing above it may have been updated, and
+a golden **never is**: it is a plain fork of the workspace's own golden (the
+*original*, which has a proxy from its creation: a fork inherits none, and the
+node's update brings it up), with tod's files installed and no network update.
+Verified live: original → tod golden (files, labels) → node fork + one
+`update_proxy` keeps its files and boot, and its credentials inject through the
+sandbox's local proxy. Two traps found doing it, both in `refresh_with`:
+the golden is forked with **no environment** (`fork_with_envs` on it makes every
+node fork lose its files once tod's files are in it), and it is labelled
+**once, before** tod's files go in (`label_golden`; a label update after the
+install has the same effect), so nothing updates it afterwards. A node's fork
+of a tod golden (`tod-from` set; it holds no proxy routes, which `fork_golden`
+accepts for exactly that case) uploads no files. The original is named by
+`[blaxel.golden_sources]` (a name or `prefix*`, recorded by the first refresh
+from what `[blaxel.goldens]` said then); `tod-sandbox golden <owner/name>
+<workspace golden or prefix*>` points a repository back at one, which is also
+how a golden an older tod made (a fork that was updated, with no `tod-from`)
+is replaced: `origin_of` refuses forking it, naming that command. An
+original built from an image (`build_golden`) is its own original and is never
+deleted by a refresh.
 
 **A repository with no golden** (live check Pass 7, gap 15) is built, not
 forked: `golden::decide_source` (pure) says `Build` when the repository has no
@@ -99,14 +113,18 @@ labels it like a refreshed one. A fork of another repository's golden is never
 the answer, and a failure deletes what it made and says why.
 
 **Refreshing.** `tod-sandbox golden refresh <owner/name>`
-(`cloud_sync::golden::refresh_golden`), for a repository that has a golden, forks it, checks what
-a fork needs (`provision::require_fork_prerequisites`), gives it the
-placeholder proxy, installs tod's files, labels it with this build's stamp and
-`tod-kind=golden`, marks it `ready` last, points the repository at it, and
-deletes the old golden when tod made it and no other setting points at it.
-The app does the same before making a sandbox when the golden is older
-(`ensure_golden_current`, through `SandboxHost::current_golden`), saying so in
-the progress. A golden with no `tod-install` label (made by hand) counts as
+(`cloud_sync::golden::refresh_golden`), for a repository that has a golden, forks
+the **original** (not the previous tod golden), labels the fork with this
+build's stamp, `tod-kind=golden` and `tod-from`, checks what a fork needs
+(`provision::require_fork_prerequisites`), installs tod's files, points the
+repository at it, and deletes the old tod golden (never the original). One
+refresh runs at a time per data root (`golden-refresh.lock`). The app does the
+same before making a sandbox when the golden is older, or when the workspace's
+golden it was forked from has been replaced (`ensure_golden_current`, through
+`SandboxHost::current_golden`), saying so in the progress. The daemon checks
+every ten minutes in the background (`tod-agentd`'s golden check,
+`ensure_all_current`), so a node made later forks at once; `scripts/deploy.sh`
+refreshes each repository's golden after a deploy. A golden with no `tod-install` label (made by hand) counts as
 older than any build.
 
 **Older build meets newer golden.** The install stamp is a hash, so the
