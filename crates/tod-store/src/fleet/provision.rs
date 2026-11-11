@@ -384,6 +384,11 @@ pub enum NameDecision {
     ReplaceDead,
     /// It is being deleted: wait for it to go.
     WaitForDelete,
+    /// Blaxel has one by that name that this node made (its `tod-kind=node`
+    /// and `tod-node` labels) but whose setup failed, so the location does
+    /// not record it: it was kept to find the cause. Starting again deletes
+    /// it, then makes a fresh one.
+    ReplaceFailed,
     /// Blaxel has one by that name and the node's record does not name it:
     /// tod lost track of a sandbox. Nothing is made.
     Lost,
@@ -391,7 +396,7 @@ pub enum NameDecision {
 
 /// Decides what to do about `name`, given the sandboxes the node's record
 /// names (`recorded`) and what Blaxel has by that name (`existing`).
-pub fn decide_name(name: &str, recorded: &[String], existing: Option<&tod_sandbox::blaxel::SandboxInfo>) -> NameDecision {
+pub fn decide_name(name: &str, node_id: &str, recorded: &[String], existing: Option<&tod_sandbox::blaxel::SandboxInfo>) -> NameDecision {
     let Some(info) = existing else { return NameDecision::Make };
     match info.status.to_ascii_uppercase().as_str() {
         "TERMINATED" => return NameDecision::Make,
@@ -399,7 +404,8 @@ pub fn decide_name(name: &str, recorded: &[String], existing: Option<&tod_sandbo
         _ => {}
     }
     if !recorded.iter().any(|r| r == name) {
-        return NameDecision::Lost;
+        let ours = tod_sandbox::provision::is_node_kind(info.label("tod-kind")) && info.label("tod-node") == Some(node_id);
+        return if ours { NameDecision::ReplaceFailed } else { NameDecision::Lost };
     }
     if sandbox::dead_reason(info).is_some() { NameDecision::ReplaceDead } else { NameDecision::Reuse }
 }
@@ -469,9 +475,13 @@ fn choose_sandbox(
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
     loop {
         let existing = bx.get(&candidate)?;
-        match decide_name(&candidate, recorded, existing.as_ref()) {
+        match decide_name(&candidate, node_id, recorded, existing.as_ref()) {
             NameDecision::Make => return Ok(Chosen::Make(candidate)),
             NameDecision::Reuse => return Ok(Chosen::Reuse(candidate)),
+            NameDecision::ReplaceFailed => {
+                progress(&format!("deleting {candidate}, kept after its setup failed, to make a fresh one…"));
+                bx.delete(&candidate)?;
+            }
             NameDecision::ReplaceDead => {
                 progress(&format!("removing the dead sandbox {candidate}…"));
                 bx.delete(&candidate)?;
@@ -985,10 +995,23 @@ fn make_sandbox(
         // A sandbox in standby is "up" to the control plane but its workload
         // is not reachable until it has resumed.
         bx.wait_reachable(&url, tod_sandbox::blaxel::WAKE_CEILING).with_context(|| format!("wake {name}"))?;
+        // The golden's label says the golden has tod's files, not that this
+        // fork kept them: its proxy update may have redeployed it from its
+        // image (timing-dependent). Only this build's node manifest from the
+        // fork's relay is taken as the files being there.
+        let golden_has_tod_files = golden_has_tod_files && {
+            let expected = tod_sandbox::provision::node_manifest(&node_files.relay);
+            let reported = tod_sandbox::provision::relay_manifest(&bx, &url);
+            let needs = tod_sandbox::provision::fork_needs_tod_files(true, reported.as_deref(), &expected);
+            if needs {
+                progress(&format!("{name} does not carry this build's tod files (its relay reports {reported:?}); installing them…"));
+            }
+            !needs
+        };
         if fork_from.is_none() {
             // An image holds only what it was built with: tod's dependencies
             // first, then its own files.
-            sandboxes.ensure_as(&bx, &name, tod_sandbox::provision::Mode::Install, progress)?;
+            sandboxes.ensure_node_as(&bx, &name, tod_sandbox::provision::Mode::Install, progress)?;
         }
         let install_identity = host.git_identity(fleet)?;
         let payload = node::NodePayload {
@@ -1730,33 +1753,33 @@ mod tests {
 
     #[test]
     fn a_free_name_is_made() {
-        assert_eq!(decide_name("tod-a-3f9a1c", &[], None), NameDecision::Make);
+        assert_eq!(decide_name("tod-a-3f9a1c", ID, &[], None), NameDecision::Make);
         // One already terminated lingers in Blaxel's list: not in the way.
-        assert_eq!(decide_name("tod-a-3f9a1c", &[], Some(&info("tod-a-3f9a1c", "TERMINATED"))), NameDecision::Make);
+        assert_eq!(decide_name("tod-a-3f9a1c", ID, &[], Some(&info("tod-a-3f9a1c", "TERMINATED"))), NameDecision::Make);
     }
 
     #[test]
     fn a_recorded_sandbox_that_exists_is_reused_not_a_conflict() {
         let recorded = vec!["tod-a-3f9a1c".to_string()];
         let running = info("tod-a-3f9a1c", "DEPLOYED");
-        assert_eq!(decide_name("tod-a-3f9a1c", &recorded, Some(&running)), NameDecision::Reuse);
+        assert_eq!(decide_name("tod-a-3f9a1c", ID, &recorded, Some(&running)), NameDecision::Reuse);
         // One that can no longer run is replaced, not reused.
         let failed = info("tod-a-3f9a1c", "FAILED");
-        assert_eq!(decide_name("tod-a-3f9a1c", &recorded, Some(&failed)), NameDecision::ReplaceDead);
+        assert_eq!(decide_name("tod-a-3f9a1c", ID, &recorded, Some(&failed)), NameDecision::ReplaceDead);
         let mut expired = info("tod-a-3f9a1c", "DEPLOYED");
         expired.state = Some("EXPIRED".into());
-        assert_eq!(decide_name("tod-a-3f9a1c", &recorded, Some(&expired)), NameDecision::ReplaceDead);
+        assert_eq!(decide_name("tod-a-3f9a1c", ID, &recorded, Some(&expired)), NameDecision::ReplaceDead);
     }
 
     #[test]
     fn a_name_taken_by_a_sandbox_the_record_does_not_name_is_lost_track_and_nothing_is_made() {
         let running = info("tod-a-3f9a1c", "DEPLOYED");
         // No record at all, or a record naming a different sandbox.
-        assert_eq!(decide_name("tod-a-3f9a1c", &[], Some(&running)), NameDecision::Lost);
+        assert_eq!(decide_name("tod-a-3f9a1c", ID, &[], Some(&running)), NameDecision::Lost);
         let other = vec!["node-a".to_string()];
-        assert_eq!(decide_name("tod-a-3f9a1c", &other, Some(&running)), NameDecision::Lost);
+        assert_eq!(decide_name("tod-a-3f9a1c", ID, &other, Some(&running)), NameDecision::Lost);
         // A failed one the record does not name is no different: still not tod's to touch.
-        assert_eq!(decide_name("tod-a-3f9a1c", &[], Some(&info("tod-a-3f9a1c", "FAILED"))), NameDecision::Lost);
+        assert_eq!(decide_name("tod-a-3f9a1c", ID, &[], Some(&info("tod-a-3f9a1c", "FAILED"))), NameDecision::Lost);
         let msg = lost_track_error("tod-a-3f9a1c", "export-totals", ID, "DEPLOYED").to_string();
         assert!(msg.contains("tod lost track of it"), "{msg}");
         assert!(msg.contains("tod-a-3f9a1c") && msg.contains("export-totals") && msg.contains("3f9a1c"), "{msg}");
@@ -1764,11 +1787,22 @@ mod tests {
     }
 
     #[test]
+    fn a_kept_failed_sandbox_of_this_node_is_replaced_not_lost() {
+        let mut kept = info("tod-a-3f9a1c", "DEPLOYED");
+        kept.labels = vec![("tod-kind".into(), "node".into()), ("tod-node".into(), ID.into())];
+        assert_eq!(decide_name("tod-a-3f9a1c", ID, &[], Some(&kept)), NameDecision::ReplaceFailed);
+        // Another node's sandbox, or one that is not a node's, is still not tod's to touch.
+        assert_eq!(decide_name("tod-a-3f9a1c", "ab12cd34-0000-4000-8000-000000000000", &[], Some(&kept)), NameDecision::Lost);
+        kept.labels = vec![("tod-kind".into(), "golden".into()), ("tod-node".into(), ID.into())];
+        assert_eq!(decide_name("tod-a-3f9a1c", ID, &[], Some(&kept)), NameDecision::Lost);
+    }
+
+    #[test]
     fn a_sandbox_being_deleted_is_waited_for() {
         let recorded = vec!["tod-a-3f9a1c".to_string()];
         let deleting = info("tod-a-3f9a1c", "DELETING");
-        assert_eq!(decide_name("tod-a-3f9a1c", &recorded, Some(&deleting)), NameDecision::WaitForDelete);
-        assert_eq!(decide_name("tod-a-3f9a1c", &[], Some(&deleting)), NameDecision::WaitForDelete);
+        assert_eq!(decide_name("tod-a-3f9a1c", ID, &recorded, Some(&deleting)), NameDecision::WaitForDelete);
+        assert_eq!(decide_name("tod-a-3f9a1c", ID, &[], Some(&deleting)), NameDecision::WaitForDelete);
     }
 
     #[test]
