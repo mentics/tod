@@ -38,6 +38,64 @@ Starting state (live root): 12 nodes in `pr_draft`; 8 stopped
 waiting for the PR to be marked ready. Every node's cloud sandbox was gone
 from Blaxel.
 
+### basedpyright check killed for memory in node sandboxes
+
+- **Seen**: 3 nodes (ENG-2680, ENG-3055, ENG-2927), 2026-11-11; any node whose
+  pr_draft or review checks include flagship's basedpyright.
+- **Symptom**: the check fails with no output (exit 247 or nothing after
+  `uv sync`); the agent files "give the sandbox more memory".
+- **Cause**: a fork has its golden's 8 GB, and its root filesystem is in RAM
+  (about 2.7 GB for the checkout, venvs and node_modules). The workspace's
+  Blaxel boot starts the dev servers (UI vite about 1.5 GB, two flagship
+  runservers and the KB API, about 1.4 GB). basedpyright reaches 2.5–3.2 GB
+  RSS, and the check gives it an 8 GB heap cap, so the kernel kills it before
+  V8 collects. The checks themselves run one at a time.
+- **Fix**: open, for the user to choose. Either lower the check's heap
+  (`--max-old-space-size=3072`; the agent saw a 2.8 GB heap finish with 0
+  errors), or give the golden more memory (Cofactr workspace's golden). As a
+  stopgap I stopped the dev servers by hand in two sandboxes.
+- **Measure**: check failures with no output, or exit 137/247, per check.
+
+### Agent-made git worktrees hide the work
+
+- **Seen**: 1 node (ENG-2927).
+- **Symptom**: after Reset environment the checkout stayed on a detached HEAD;
+  the PR head was in `/workspace/.worktrees/{flagship,kb}-eng-2927`.
+- **Cause**: the workspace's CLAUDE.md tells agents to work in a worktree.
+  tod reviews, checks and pushes the checkout it set up, and the worktree held
+  the branch, so the checkout could not be put back on it.
+- **Fix**: `workspace/codebase.md` (c3db91b2): work in the checkout you were
+  started in; never make a worktree or switch branches.
+- **Measure**: a check after each turn that the checkout is on the node's
+  branch and `git worktree list` has one entry.
+
+### Sandbox setup fails on concurrent forks; the kept sandbox cannot be recovered
+
+- **Seen**: 3 nodes (ENG-3067, ENG-3193, ENG-2228), 2026-11-11 00:2x UTC.
+- **Symptom**: "sandbox health check 'manifest' failed: ... agents=false,
+  expected node ..."; Adopt existing sandbox then refused the kept sandbox.
+- **Cause**: `fleet::sandbox::connect` ran `Sandboxes::ensure` on a half-made
+  node sandbox and installed a plain manifest. A fork whose proxy update wiped
+  tod's files was not reinstalled. A failed sandbox was kept for inspection
+  with nothing in the app able to replace it.
+- **Fix**: 240ab386 (merged 74292b77): `ensure` refuses node sandboxes that
+  are not ready; `make_sandbox` reinstalls tod's files into a fork that lost
+  them; Start deletes a kept failed sandbox of the same node and makes a fresh
+  one (`NameDecision::ReplaceFailed`). Seen working live for ENG-3067 and
+  ENG-3193.
+- **Measure**: setup failures per fork, by health check.
+
+### Small UI problems seen
+
+- Stale "the cloud record names sandbox … not adopted" notes stay on the task
+  panel after Start has made a new sandbox.
+- The task panel's upper scroll area is short: the runner buttons (Defer,
+  Watch, Resume) are below its fold on a 1000 px window when a node has a long
+  failure text.
+- Stop texts stored before the rewording keep the old wording.
+- `tod-sandbox exec ""` (a node with no sandbox) answers "not authorized
+  (401)" instead of naming the missing sandbox.
+
 ### Review "not converging" with nothing standing
 
 - **Seen**: 8 nodes (ENG-2927 12 rounds, ENG-2157 10, ENG-2228 8, ENG-3095 8,
