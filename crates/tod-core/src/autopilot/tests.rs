@@ -2976,3 +2976,142 @@ fn findings_just_posted_are_read_back_as_threads_not_sent_by_name() {
     let steps = steps_of(&turn_labels(&agent));
     assert_eq!(steps, ["pr", "review", "pr:change", "review", "pr:push"], "{outcome:?}");
 }
+
+/// Like [`OwnReviewFeed`], but the pull request's head moves on every read
+/// until `moves` reads have passed: a review is owed again each time.
+struct MovingHeadFeed {
+    inner: Arc<OwnReviewFeed>,
+    reads: std::sync::atomic::AtomicUsize,
+    moves: usize,
+}
+
+impl crate::pr_readiness::PrFeed for MovingHeadFeed {
+    fn snapshot(&self, pr: &tod_store::github::NodePr) -> Result<tod_store::github::PrSnapshot, String> {
+        let n = self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst).min(self.moves);
+        let mut snapshot = self.inner.snapshot(pr)?;
+        snapshot.status.head_sha = Some(format!("head{n:04}"));
+        Ok(snapshot)
+    }
+
+    fn changed_files(&self, pr: &tod_store::github::NodePr) -> Result<Vec<tod_store::github::PrFile>, String> {
+        self.inner.changed_files(pr)
+    }
+
+    fn post_review(&self, pr: &tod_store::github::NodePr, post: &crate::pr_readiness::ReviewPost) -> Result<(), String> {
+        // The inner feed checks the commit id against its fixed head.
+        let post = crate::pr_readiness::ReviewPost { commit_id: "abcdef1".into(), ..post.clone() };
+        self.inner.post_review(pr, &post)
+    }
+}
+
+fn a_finding_before_the_pull_request(fx: &Fixture) {
+    fx.fleet
+        .interview(
+            ACTOR_USER,
+            InterviewCommand::AddReviewFinding {
+                node_id: fx.node,
+                conversation_id: None,
+                finding: tod_store::review::NewFinding {
+                    severity: "low".into(),
+                    file: None,
+                    line: None,
+                    summary: "From the review before the pull request.".into(),
+                    detail: None,
+                },
+            },
+        )
+        .unwrap();
+}
+
+#[test]
+fn clean_reviews_of_new_heads_never_count_toward_the_round_limit() {
+    let fx = setup();
+    retire_outside_criteria(&fx);
+    let feed = Arc::new(MovingHeadFeed {
+        inner: OwnReviewFeed::new(false),
+        reads: Default::default(),
+        moves: 8 * REVIEW_ROUND_LIMIT as usize,
+    });
+    crate::pr_readiness::set_feed_override(Some(feed.clone()));
+    with_pr_draft_review(&fx);
+    // One finding from before makes every review of the mock reviewer clean.
+    a_finding_before_the_pull_request(&fx);
+    linked_to_prs(&fx, "pr_draft", &["https://github.com/acme/app/pull/42"]);
+    let mut agent = FakeAgent::new(&fx.fleet);
+    let outcome = autopilot(&fx, Budget::default()).with_pr_poll_interval(Duration::ZERO).run(&fx.fleet, &mut agent).unwrap();
+    let reviews = openings(&fx, ProtocolKind::Review).len();
+    assert!(reviews > REVIEW_ROUND_LIMIT as usize, "{reviews} reviews, {outcome:?}");
+    assert!(!matches!(outcome, Outcome::NeedsHuman { reason: NeedsHuman::ReviewNotConverging { .. } }), "{outcome:?}");
+    assert_eq!(fx.fleet.read(|conn| crate::pr_draft_review::unconverged_rounds(conn, fx.node)).unwrap(), 0);
+}
+
+/// A finished review of `pr_draft` that recorded one finding the fixer
+/// then claimed fixed: a round that did not come back clean.
+fn seed_unclean_review(fx: &Fixture, n: usize) {
+    let id = Uuid::new_v4();
+    let conversation = |command| fx.fleet.interview(ACTOR_USER, command).unwrap();
+    conversation(InterviewCommand::CreateConversation {
+        id,
+        focus: Focus::Node(fx.node),
+        protocol: ProtocolKind::Review,
+        platform: None,
+        model: None,
+        effort: None,
+    });
+    conversation(InterviewCommand::SetConversationTransition {
+        conversation_id: id,
+        from_state: "pr_draft".into(),
+        to_state: "pr_review".into(),
+    });
+    let finding = conversation(InterviewCommand::AddReviewFinding {
+        node_id: fx.node,
+        conversation_id: Some(id),
+        finding: tod_store::review::NewFinding {
+            severity: "medium".into(),
+            file: None,
+            line: None,
+            summary: format!("Defect {n}."),
+            detail: None,
+        },
+    });
+    conversation(InterviewCommand::RecordConversationReport {
+        conversation_id: id,
+        body: crate::conversation::review::done_report(),
+    });
+    conversation(InterviewCommand::RespondReviewFinding {
+        finding_id: finding["id"].as_str().unwrap().parse().unwrap(),
+        status: tod_store::review::FINDING_FIXED.into(),
+        response: Some("Fixed.".into()),
+    });
+    // Conversations and findings are ordered by their millisecond stamps.
+    std::thread::sleep(Duration::from_millis(3));
+}
+
+#[test]
+fn reviews_that_each_leave_findings_standing_stop_at_the_round_limit_naming_them() {
+    let fx = setup();
+    retire_outside_criteria(&fx);
+    let feed = OwnReviewFeed::new(false);
+    crate::pr_readiness::set_feed_override(Some(feed.clone()));
+    with_pr_draft_review(&fx);
+    linked_to_prs(&fx, "pr_draft", &["https://github.com/acme/app/pull/42"]);
+    for n in 0..REVIEW_ROUND_LIMIT as usize {
+        seed_unclean_review(&fx, n);
+    }
+    assert_eq!(
+        fx.fleet.read(|conn| crate::pr_draft_review::unconverged_rounds(conn, fx.node)).unwrap(),
+        REVIEW_ROUND_LIMIT
+    );
+    let mut agent = FakeAgent::new(&fx.fleet);
+    let outcome = autopilot(&fx, Budget::default()).with_pr_poll_interval(Duration::ZERO).run(&fx.fleet, &mut agent).unwrap();
+    match &outcome {
+        Outcome::NeedsHuman { reason: NeedsHuman::ReviewNotConverging { rounds, standing } } => {
+            assert_eq!(*rounds, REVIEW_ROUND_LIMIT);
+            assert!(standing.iter().any(|s| s.contains("Defect 4.")), "{standing:?}");
+            let words = outcome_words(&outcome);
+            assert!(words.contains("Defect 4."), "{words}");
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(openings(&fx, ProtocolKind::Review).len() == REVIEW_ROUND_LIMIT as usize, "no further review ran");
+}
