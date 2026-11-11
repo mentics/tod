@@ -356,7 +356,7 @@ const PLATFORM_ORDER: [AgentPlatform; 2] = [AgentPlatform::Claude, AgentPlatform
 /// Platform, model, effort — the dropdowns in one agent role row.
 const AGENT_ROW_COLUMNS: usize = 3;
 /// The fields edited as text, each in its own input (`SettingsView::text_input`).
-const TEXT_FIELDS: [SettingField; 16] = [
+const TEXT_FIELDS: [SettingField; 17] = [
     SettingField::TreehouseExecutable,
     SettingField::TreehouseWorktreesRoot,
     SettingField::BranchTemplate,
