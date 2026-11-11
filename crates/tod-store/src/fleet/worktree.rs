@@ -423,27 +423,63 @@ pub fn init_submodules(worktree: &Workdir) -> Result<()> {
     Ok(())
 }
 
+/// What [`branch_submodules_quickly`] did.
+#[derive(Debug, PartialEq, Eq)]
+pub enum QuickBranch {
+    /// Every submodule is on the branch.
+    Done,
+    /// Not applicable or not completed, and why; the step-by-step way
+    /// ([`init_submodules`] then [`branch_submodules`], idempotent, so they
+    /// finish what this began) must run, and the reason is to be reported.
+    Declined(String),
+}
+
 /// [`branch_submodules`] for the common case in a cloud sandbox, in one call
-/// instead of about fifteen (each is a round trip): every submodule is
-/// initialized and none has `branch` yet, locally or on `origin`, so each gets
-/// it created at the commit it is on. `Ok(false)` when anything else is so
-/// (nothing is then assumed: the caller runs [`init_submodules`] and
-/// [`branch_submodules`], which are idempotent and so finish what this began).
-pub fn branch_submodules_quickly(worktree: &Workdir, branch: &str) -> Result<bool> {
-    if branch.is_empty() || !matches!(worktree, Workdir::Sandbox { .. }) {
-        return Ok(false);
+/// instead of about fifteen (each is a round trip), the submodules side by
+/// side: every submodule is initialized and none has `branch` yet, locally or
+/// on `origin`, so each gets it created at the commit it is on.
+///
+/// It reads `.gitmodules` and the directories, never the superproject's index,
+/// so it can run while the superproject's own checkout does.
+pub fn branch_submodules_quickly(worktree: &Workdir, branch: &str) -> Result<QuickBranch> {
+    if branch.is_empty() {
+        return Ok(QuickBranch::Declined("no branch to create".into()));
+    }
+    if !matches!(worktree, Workdir::Sandbox { .. }) {
+        return Ok(QuickBranch::Declined("not a cloud sandbox".into()));
     }
     let script = format!(
         r#"export BR="$1" KEY="$2"
-[ -f .gitmodules ] || exit 0
-if git submodule status --recursive | grep -q '^-'; then exit 7; fi
-git submodule foreach --recursive --quiet '
-  if git show-ref --verify --quiet "refs/heads/$BR" || git show-ref --verify --quiet "refs/remotes/{REMOTE}/$BR"; then exit 7; fi
-  git switch -q -c "$BR" && git config "$KEY" "$(git rev-parse HEAD)"'"#
+walk() {{
+  [ -f "$1/.gitmodules" ] || return 0
+  for p in $(git config -f "$1/.gitmodules" --get-regexp '^submodule\..*\.path$' | awk '{{print $2}}'); do
+    if [ -e "$1/$p/.git" ]; then echo "$1/$p"; walk "$1/$p"; else echo "UNINIT $1/$p"; fi
+  done
+}}
+paths=$(walk .) || exit 1
+case "$paths" in *UNINIT*) echo "a submodule is not set up: $paths"; exit 7;; esac
+pids=""
+for sp in $paths; do
+  (
+    cd "$sp" || exit 1
+    if git show-ref --verify --quiet "refs/heads/$BR" || git show-ref --verify --quiet "refs/remotes/{REMOTE}/$BR"; then
+      echo "$sp already has the branch"; exit 7
+    fi
+    git switch -q -c "$BR" && git config "$KEY" "$(git rev-parse HEAD)"
+  ) 2>&1 &
+  pids="$pids $!"
+done
+rc=0
+for pid in $pids; do wait "$pid" || rc=1; done
+exit $rc"#
     );
     let key = start_key(branch);
-    let out = worktree.output_within(SUBMODULE_LIST_LIMIT.max(std::time::Duration::from_secs(60)), "sh", &["-c", &script, "sh", branch, &key])?;
-    Ok(out.status.success())
+    let out = worktree.output_within(std::time::Duration::from_secs(60), "sh", &["-c", &script, "sh", branch, &key])?;
+    if out.status.success() {
+        return Ok(QuickBranch::Done);
+    }
+    let said = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    Ok(QuickBranch::Declined(format!("exit {:?}: {}", out.status.code(), said.trim())))
 }
 
 /// Check `branch` out in every initialized submodule of `worktree` (see

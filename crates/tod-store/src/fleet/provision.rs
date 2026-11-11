@@ -1050,28 +1050,38 @@ fn make_sandbox(
         }
         let identity = host.git_identity(fleet)?;
         // Where the checkout is: the clone's, else the image's own. A fork's
-        // is there before the checkout runs, so it is looked for meanwhile.
-        let dir_path = if fork_from.is_some() {
-            let (checked, found) = std::thread::scope(|scope| {
-                let finder = scope.spawn(|| find_sandbox_checkout(&name));
+        // is there before the checkout runs, and so are its submodules, so
+        // both are dealt with while the checkout runs: each is a round trip
+        // that does not depend on it.
+        let mut warnings = Vec::new();
+        let (dir_path, quick) = if fork_from.is_some() {
+            let (checked, beside) = std::thread::scope(|scope| {
+                let beside = scope.spawn(|| -> Result<(String, worktree::QuickBranch)> {
+                    let dir = find_sandbox_checkout(&name)?;
+                    let quick = worktree::branch_submodules_quickly(&Workdir::sandbox(&name, &dir), branch)?;
+                    Ok((dir, quick))
+                });
                 let checked = node::checkout(&bx, &url, &repo.url, branch, &identity, false, progress);
-                (checked, finder.join().unwrap_or_else(|_| Err(anyhow!("looking for the checkout panicked"))))
+                (checked, beside.join().unwrap_or_else(|_| Err(anyhow!("looking at the checkout panicked"))))
             });
             checked?;
-            found?
+            let (dir, quick) = beside?;
+            (dir, Some(quick))
         } else {
             node::checkout(&bx, &url, &repo.url, branch, &identity, true, progress)?;
-            find_sandbox_checkout(&name)?
+            (find_sandbox_checkout(&name)?, None)
         };
         location.repo = Some(dir_path.clone());
         record(fleet, &*location)?;
         let dir = Workdir::sandbox(&name, &dir_path);
-        let mut warnings = Vec::new();
-        // A fork of a golden has its submodules set up already: one call puts
-        // the branch in each; otherwise (or if that one finds anything
-        // unusual) the step-by-step way runs.
-        let quick = fork_from.is_some() && worktree::branch_submodules_quickly(&dir, branch).unwrap_or(false);
-        if !quick {
+        // Anything the one-call way did not complete is said, not hidden: the
+        // step-by-step way then does the work, and it fails loudly if the
+        // sandbox is really wrong.
+        if let Some(worktree::QuickBranch::Declined(why)) = &quick {
+            tracing::warn!(sandbox = %name, "the one-call submodule branching did not complete: {why}");
+            progress(&format!("warning: the one-call submodule branching did not complete ({why}); doing it step by step"));
+        }
+        if !matches!(quick, Some(worktree::QuickBranch::Done)) {
             if let Err(err) = worktree::init_submodules(&dir) {
                 warnings.push(format!("{err:#}"));
             }
