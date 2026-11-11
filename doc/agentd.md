@@ -118,6 +118,21 @@ starts `tod`; waits that came due meanwhile fire then.
 
 **`quit`** is a protocol command, as with the agent control socket: drain
 (below), then exit. Anything launched for a test must be stopped this way.
+Never `quit` the daemon of a root an app has open (the user's live root
+above all) to open the store directly: the app's change feed starts it again
+at once (below), and while the other process holds `tod.lock` it cannot, so
+nothing syncs. A dev tool goes through the running daemon
+(`remote::open_store`) instead.
+
+**An app's feed keeps it running.** The app's change feed
+(`remote::follow_changes_with`, given the executable) starts the daemon again
+when it is gone, looking again after 0.5 s and doubling up to 10 s. Without
+it nothing syncs the cloud, and the app would show the last of it as if it
+were current, so an outage is never silent: it is logged at error, and after
+10 s the status bar shows **Not syncing since HH:MM** with the reason (a
+daemon that exits at start is reported with the last line of `agentd.log`;
+a held `tod.lock` names its holder's pid and command line, which every
+holder writes into the file).
 
 ### Lifetime
 

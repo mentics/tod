@@ -191,24 +191,103 @@ fn broadcast(event: &Event) {
 /// every reconnect (a change may have been missed while it was down). Ends
 /// when `notify` is dropped. It never starts a daemon: only a write does.
 pub fn follow_changes(data_root: &Path, notify: &Arc<tokio::sync::Notify>) -> Result<()> {
-    follow_changes_with(data_root, notify, None)
+    follow_changes_with(data_root, notify, None, None)
 }
 
+/// Whether this process's change feed reaches its daemon. While it does not,
+/// nothing the daemon does (the cloud's sync among it) reaches this process,
+/// so what it shows is as of `since`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FeedState {
+    Connected,
+    /// The feed lost the daemon at `since` (ms since the epoch) and has not
+    /// got it back; `error` is why the latest attempt failed.
+    Down { since_ms: i64, error: String },
+}
+
+fn feeds() -> &'static Mutex<std::collections::HashMap<PathBuf, FeedState>> {
+    static FEEDS: std::sync::OnceLock<Mutex<std::collections::HashMap<PathBuf, FeedState>>> =
+        std::sync::OnceLock::new();
+    FEEDS.get_or_init(Default::default)
+}
+
+/// Every data root whose change feed is down in this process, with its
+/// state. An app has one root; empty when its daemon is reachable.
+pub fn feeds_down() -> Vec<(PathBuf, FeedState)> {
+    let feeds = feeds().lock().unwrap_or_else(|e| e.into_inner());
+    feeds.iter().filter(|(_, s)| matches!(s, FeedState::Down { .. })).map(|(r, s)| (r.clone(), s.clone())).collect()
+}
+
+fn note_connected(root: &Path) {
+    let mut feeds = feeds().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(FeedState::Down { since_ms, .. }) = feeds.insert(root.to_path_buf(), FeedState::Connected) {
+        let secs = (now_ms() - since_ms) / 1000;
+        tracing::info!("tod-agentd for {} answers again after {secs}s", root.display());
+    }
+}
+
+fn note_down(root: &Path, error: &anyhow::Error) {
+    let error = format!("{error:#}");
+    let mut feeds = feeds().lock().unwrap_or_else(|e| e.into_inner());
+    match feeds.get_mut(root) {
+        Some(FeedState::Down { error: last, .. }) => {
+            if *last != error {
+                tracing::error!("tod-agentd for {} is still down: {error}", root.display());
+                *last = error;
+            }
+        }
+        _ => {
+            tracing::error!(
+                "tod-agentd for {} is down, so nothing syncs (the cloud's changes among it): {error}",
+                root.display()
+            );
+            feeds.insert(root.to_path_buf(), FeedState::Down { since_ms: now_ms(), error });
+        }
+    }
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// How long the feed waits after losing the daemon before it looks again, at
+/// first; each failed look doubles it, up to [`RETRY_MAX`].
+const RETRY_MIN: Duration = Duration::from_millis(500);
+const RETRY_MAX: Duration = Duration::from_secs(10);
+
 /// [`follow_changes`] that also mirrors the daemon's undo history into
-/// `history` before each notification.
+/// `history` before each notification, and, given `executable`, starts the
+/// daemon again when it is gone. The app's feed does: the daemon is what
+/// syncs the cloud, so without one the app would show the last of it as if
+/// it were current. Every outage is logged and kept for [`feeds_down`].
 pub fn follow_changes_with(
     data_root: &Path,
     notify: &Arc<tokio::sync::Notify>,
     history: Option<Arc<Mutex<tod_store::fleet::command_log::CommandLog>>>,
+    executable: Option<PathBuf>,
 ) -> Result<()> {
-    let writer = DaemonWriter::new(data_root, None);
+    let root = data_root.to_path_buf();
+    let writer = DaemonWriter::new(data_root, executable);
     let notify = Arc::downgrade(notify);
     std::thread::Builder::new()
         .name("tod-agentd-follow".into())
         .spawn(move || {
+            let mut wait = RETRY_MIN;
             loop {
-                if let Ok(mut connection) = writer.reconnect() {
-                    if connection.request(Command::Subscribe).is_ok() {
+                // Nothing to follow for: never start a daemon for no one.
+                if notify.strong_count() == 0 {
+                    return;
+                }
+                let subscribed = writer
+                    .reconnect()
+                    .and_then(|mut connection| connection.request(Command::Subscribe).map(|_| connection));
+                match subscribed {
+                    Ok(mut connection) => {
+                        note_connected(&root);
+                        wait = RETRY_MIN;
                         while let Some(event) = connection.next_event() {
                             match event {
                                 Event::Changed { .. } => {
@@ -224,9 +303,13 @@ pub fn follow_changes_with(
                             }
                         }
                     }
+                    Err(err) => {
+                        note_down(&root, &err);
+                        wait = (wait * 2).min(RETRY_MAX);
+                    }
                 }
                 // Gone: look again shortly, and tell the store to re-read.
-                std::thread::sleep(Duration::from_millis(500));
+                std::thread::sleep(wait);
                 let Some(notify) = notify.upgrade() else { return };
                 notify.notify_waiters();
             }
@@ -248,6 +331,6 @@ pub fn open_store(data_root: &Path, executable: Option<&Path>) -> Result<FleetSt
     let notify = Arc::new(tokio::sync::Notify::new());
     let writer = Arc::new(DaemonWriter::new(data_root, executable.map(Path::to_path_buf)));
     let store = FleetStore::open_client(data_root, writer, notify.clone()).map_err(|err| anyhow!("{err}"))?;
-    follow_changes_with(data_root, &notify, Some(store.command_log()))?;
+    follow_changes_with(data_root, &notify, Some(store.command_log()), executable.map(Path::to_path_buf))?;
     Ok(store)
 }

@@ -186,3 +186,50 @@ fn a_client_mirrors_the_daemons_undo_history() {
     drop(store);
     stop(&root);
 }
+
+#[test]
+fn the_change_feed_starts_a_stopped_daemon_again() {
+    let root = root("feed-restart");
+    let store = remote::open_store(&root, Some(&exe())).unwrap();
+    assert!(client::quit(&root).unwrap());
+    // No write: the feed alone brings it back.
+    wait_for("the feed to start the daemon again", || {
+        client::connect(&tod_agentd_client::Paths::new(&root)).is_some()
+    });
+    drop(store);
+    stop(&root);
+}
+
+#[test]
+fn a_daemon_that_cannot_start_is_reported_with_who_holds_the_store() {
+    let root = root("feed-blocked");
+    let store = remote::open_store(&root, Some(&exe())).unwrap();
+    // Take the store's lock the moment the daemon lets it go (the feed may
+    // win the race and start it again first: then stop it again).
+    let mut held = None;
+    for _ in 0..10 {
+        assert!(client::quit(&root).unwrap() || client::connect(&tod_agentd_client::Paths::new(&root)).is_none());
+        if let Ok(lock) = tod_store::fleet::lock::FleetLock::try_acquire(&root) {
+            held = Some(lock);
+            break;
+        }
+    }
+    let held = held.expect("took the store's lock from a stopped daemon");
+    let down = || {
+        remote::feeds_down().into_iter().find_map(|(r, s)| match s {
+            remote::FeedState::Down { error, .. } if r == root => Some(error),
+            _ => None,
+        })
+    };
+    wait_for("the feed to report the daemon down", || down().is_some_and(|e| e.contains("held by pid")));
+    let error = down().unwrap();
+    assert!(error.contains("exited at start"), "{error}");
+    assert!(error.contains(&format!("pid {}", std::process::id())), "{error}");
+    // Let go: the feed starts it and the outage ends.
+    drop(held);
+    wait_for("the daemon to come back", || {
+        client::connect(&tod_agentd_client::Paths::new(&root)).is_some() && down().is_none()
+    });
+    drop(store);
+    stop(&root);
+}

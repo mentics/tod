@@ -255,7 +255,9 @@ pub fn quit(data_root: &Path) -> Result<bool> {
     Ok(true)
 }
 
-/// Wait for the daemon to give up its lock (it has exited).
+/// Wait for the daemon `pid` to exit: its lock is free, or another daemon
+/// already serves (an app's change feed starts one as soon as the old one is
+/// gone, and that one then holds the lock).
 fn wait_gone(paths: &Paths, pid: u32) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(30);
     while Instant::now() < deadline {
@@ -267,7 +269,7 @@ fn wait_gone(paths: &Paths, pid: u32) -> Result<()> {
             .open(paths.daemon_lock())
             .map(|f| f.try_lock_exclusive().is_ok())
             .unwrap_or(false);
-        if free {
+        if free || Info::read(paths).is_some_and(|info| info.pid != pid) {
             return Ok(());
         }
         std::thread::sleep(Duration::from_millis(50));
@@ -346,11 +348,26 @@ fn spawn(paths: &Paths, executable: &Path, me: &Identity) -> Result<Info> {
                 deadline = Instant::now() + Duration::from_secs(60);
                 continue;
             }
-            bail!("tod-agentd exited at start ({status}); see {}", paths.log().display());
+            match last_log_line(&paths.log()) {
+                Some(line) => bail!("tod-agentd exited at start ({status}): {line} (see {})", paths.log().display()),
+                None => bail!("tod-agentd exited at start ({status}); see {}", paths.log().display()),
+            }
         }
         std::thread::sleep(Duration::from_millis(50));
     }
     bail!("tod-agentd did not answer within 60s; see {}", paths.log().display())
+}
+
+/// The daemon log's last line: why a daemon that just exited did, since it
+/// says so on stderr, which goes there. Read from the end; the log is long.
+fn last_log_line(log: &Path) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(log).ok()?;
+    let len = file.metadata().ok()?.len();
+    file.seek(SeekFrom::Start(len.saturating_sub(4096))).ok()?;
+    let mut tail = Vec::new();
+    file.read_to_end(&mut tail).ok()?;
+    String::from_utf8_lossy(&tail).lines().rev().map(str::trim).find(|l| !l.is_empty()).map(str::to_string)
 }
 
 /// How many times a daemon killed at start is started again.
@@ -408,6 +425,24 @@ impl Detach {
         // launcher does not signal it.
         command.process_group(0);
         let _ = self;
+    }
+}
+
+#[cfg(test)]
+mod log_tests {
+    #[test]
+    fn the_last_log_line_says_why_it_exited() {
+        let dir = std::env::temp_dir().join(format!("tod-agentd-log-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("agentd.log");
+        assert_eq!(super::last_log_line(&log), None);
+        let early = "x".repeat(10_000);
+        std::fs::write(&log, format!("{early}\ntod-agentd: open the store: another tod instance is using it\n\n")).unwrap();
+        assert_eq!(
+            super::last_log_line(&log).as_deref(),
+            Some("tod-agentd: open the store: another tod instance is using it")
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
 

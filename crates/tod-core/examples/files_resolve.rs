@@ -10,10 +10,7 @@ fn main() -> anyhow::Result<()> {
     tod_core::cloud_sync::register_sandbox_host();
     tod_store::fleet::sandbox::set_data_root(&root);
     tod_store::paths::set_data_root(root.clone());
-    // The resident daemon holds the fleet lock; stop it (as the docs say a test must).
-    println!("daemon quit: {:?}", tod_agentd_client::client::quit(&root));
-    tod_store::paths::set_data_root(root.clone());
-    let fleet = FleetStore::open(&root)?;
+    let fleet = open_fleet(&root)?;
     let id = node;
     let t0 = std::time::Instant::now();
     let mut say = |m: &str| println!("  [{:6.2}s] {m}", t0.elapsed().as_secs_f64());
@@ -23,4 +20,14 @@ fn main() -> anyhow::Result<()> {
         Err(err) => println!("ERROR: {err:#}"),
     }
     Ok(())
+}
+
+/// The store, through the daemon when one serves `root`, so the app's
+/// daemon is never stopped for this (`doc/agentd.md`, "`quit`"); opened
+/// directly only when none runs.
+fn open_fleet(root: &std::path::Path) -> anyhow::Result<FleetStore> {
+    if tod_agentd_client::client::connect(&tod_agentd_client::Paths::new(root)).is_some() {
+        return tod_agentd_client::remote::open_store(root, None);
+    }
+    Ok(FleetStore::open(root)?)
 }

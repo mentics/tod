@@ -185,7 +185,14 @@ fn second_fleet_store_open_rejected_while_lock_held() {
         Ok(_) => panic!("expected second FleetStore::open to fail while lock held"),
     };
     match err {
-        FleetLaunchError::StorageInUse(path) => assert!(path.ends_with("tod.lock")),
+        FleetLaunchError::StorageInUse { path, holder } => {
+            assert!(path.ends_with("tod.lock"));
+            // Windows refuses reads of a locked file, so only there it is unnamed.
+            if cfg!(unix) {
+                let holder = holder.expect("the holder is named");
+                assert!(holder.starts_with(&format!("pid {}:", std::process::id())), "{holder}");
+            }
+        }
         FleetLaunchError::Other(inner) => {
             assert!(
                 inner.downcast_ref::<FleetLockError>().is_some()

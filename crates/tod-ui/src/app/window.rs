@@ -110,6 +110,9 @@ pub struct Shell {
     log_window: LogWindowControl,
     /// Warnings+errors and errors logged since the log panel was last open.
     log_unread: (usize, usize),
+    /// The daemon has not answered this long (since, why): nothing syncs, so
+    /// the status bar says what is shown is as of then.
+    daemon_outage: Option<(i64, String)>,
     /// Which logged errors have raised a toast, and which repeats fold into one.
     toast_gate: tod_core::logging::buffer::ToastGate,
     agent_status_text: SharedString,
@@ -381,6 +384,11 @@ impl Shell {
         let unread = crate::views::log_panel::unread();
         if unread != self.log_unread {
             self.log_unread = unread;
+            cx.notify();
+        }
+        let outage = daemon_outage(chrono::Utc::now().timestamp_millis());
+        if outage != self.daemon_outage {
+            self.daemon_outage = outage;
             cx.notify();
         }
         let text = format_status_bar(&self.compute_status_groups());
@@ -704,6 +712,25 @@ impl Shell {
                     .gap_1()
                     .items_center()
                     .flex_shrink_0()
+                    .when_some(self.daemon_outage.clone(), |el, (since, error)| {
+                        let at = chrono::DateTime::from_timestamp_millis(since)
+                            .map(|t| t.with_timezone(&chrono::Local).format("%H:%M").to_string())
+                            .unwrap_or_default();
+                        el.child(
+                            Button::new("daemon-outage")
+                                .outline()
+                                .compact()
+                                .danger()
+                                .label(format!("Not syncing since {at}"))
+                                .tooltip(format!(
+                                    "tod-agentd is not answering, so nothing syncs and what is shown is as of {at}. \
+                                     tod keeps trying to start it.\n\n{error}"
+                                ))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.open_log_window(cx);
+                                })),
+                        )
+                    })
                     .child(
                         Button::new("open-agent-transcripts")
                             .outline()
@@ -1201,6 +1228,21 @@ fn open_fleet_store(
     Ok(Arc::new(store))
 }
 
+/// How long the daemon may be unreachable before the status bar says so: a
+/// restart for a new build takes a few seconds and is not an outage.
+const DAEMON_OUTAGE_AFTER_MS: i64 = 10_000;
+
+/// When the daemon stopped answering and why, once it has been down for
+/// [`DAEMON_OUTAGE_AFTER_MS`].
+fn daemon_outage(now_ms: i64) -> Option<(i64, String)> {
+    tod_agentd_client::remote::feeds_down().into_iter().find_map(|(_, state)| match state {
+        tod_agentd_client::remote::FeedState::Down { since_ms, error } if now_ms - since_ms >= DAEMON_OUTAGE_AFTER_MS => {
+            Some((since_ms, error))
+        }
+        _ => None,
+    })
+}
+
 /// The banner for a transcript format the reader does not know.
 /// The adapter warning's "Update now": run the global install and say how it
 /// went.
@@ -1520,6 +1562,7 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                 history_window: history_window.clone(),
                                 log_window: log_window.clone(),
                                 log_unread: (0, 0),
+                                daemon_outage: None,
                                 toast_gate: Default::default(),
                                 agent_status_text,
                                 paths: paths.clone(),

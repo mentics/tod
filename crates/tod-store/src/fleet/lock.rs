@@ -7,8 +7,8 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum FleetLockError {
-    #[error("another tod instance holds the fleet storage lock at {0}")]
-    InUse(String),
+    #[error("another tod instance holds the fleet storage lock at {path}{}", held_by(holder))]
+    InUse { path: String, holder: Option<String> },
     #[error(transparent)]
     Other(#[from] anyhow::Error),
 }
@@ -37,11 +37,15 @@ impl FleetLock {
 
         file.try_lock_exclusive().map_err(|e| {
             if e.kind() == std::io::ErrorKind::WouldBlock {
-                FleetLockError::InUse(paths.lock().display().to_string())
+                FleetLockError::InUse { path: paths.lock().display().to_string(), holder: read_holder(paths.lock()) }
             } else {
                 FleetLockError::Other(e.into())
             }
         })?;
+        // Say who holds it, so a process refused the lock can name it.
+        // Best effort: the lock is what matters, and it is held.
+        let mut file = file;
+        let _ = write_holder(&mut file);
 
         Ok(Self {
             path: paths.lock().to_path_buf(),
@@ -52,6 +56,36 @@ impl FleetLock {
     pub fn path(&self) -> &Path {
         &self.path
     }
+}
+
+/// What a holder writes into the lock file: its pid and command line.
+fn write_holder(file: &mut File) -> std::io::Result<()> {
+    use std::io::{Seek, Write};
+    let command: Vec<String> = std::env::args().collect();
+    file.set_len(0)?;
+    file.seek(std::io::SeekFrom::Start(0))?;
+    write!(file, "pid {}: {}", std::process::id(), command.join(" "))?;
+    file.flush()
+}
+
+/// The holder's pid and command line, as it wrote them; `None` when they
+/// cannot be read (Windows refuses reads of a locked file).
+pub fn read_holder(lock: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(lock).ok()?;
+    let text = text.trim();
+    (!text.is_empty()).then(|| cut(text, 300))
+}
+
+fn cut(text: &str, max: usize) -> String {
+    match text.char_indices().nth(max) {
+        Some((at, _)) => format!("{}…", &text[..at]),
+        None => text.to_string(),
+    }
+}
+
+/// " (held by …)" when the holder is known.
+pub fn held_by(holder: &Option<String>) -> String {
+    holder.as_deref().map(|h| format!(" (held by {h})")).unwrap_or_default()
 }
 
 impl Drop for FleetLock {
@@ -79,7 +113,7 @@ mod tests {
                 Err(e) => e,
                 Ok(_) => panic!("expected second acquire to fail"),
             };
-            assert!(matches!(err, FleetLockError::InUse(_)));
+            assert!(matches!(err, FleetLockError::InUse { .. }));
         }
         #[cfg(windows)]
         {
@@ -92,7 +126,7 @@ mod tests {
                 }
             };
             assert!(
-                matches!(err, FleetLockError::InUse(_)) || matches!(err, FleetLockError::Other(_))
+                matches!(err, FleetLockError::InUse { .. }) || matches!(err, FleetLockError::Other(_))
             );
         }
         drop(lock1);
@@ -117,7 +151,7 @@ mod tests {
             Err(e) => e,
             Ok(_) => panic!("expected lock in use from other thread"),
         };
-        assert!(matches!(err, FleetLockError::InUse(_)));
+        assert!(matches!(err, FleetLockError::InUse { .. }));
         drop(lock);
         let _ = fs::remove_dir_all(root);
     }

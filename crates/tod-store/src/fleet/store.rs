@@ -1053,7 +1053,7 @@ use crate::fleet::reconnect_identity;
 
 fn map_lock_error(err: FleetLockError) -> FleetLaunchError {
     match err {
-        FleetLockError::InUse(path) => FleetLaunchError::StorageInUse(path),
+        FleetLockError::InUse { path, holder } => FleetLaunchError::StorageInUse { path, holder },
         FleetLockError::Other(e) => FleetLaunchError::Other(e),
     }
 }

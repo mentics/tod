@@ -25,8 +25,8 @@ pub enum FleetLaunchError {
     BackupFailed { backup: String, reason: String },
     #[error("format upgrade failed; restore manually from backup at {backup}: {reason}")]
     UpgradeFailed { backup: String, reason: String },
-    #[error("another tod instance is using the fleet storage root at {0}")]
-    StorageInUse(String),
+    #[error("another tod instance is using the fleet storage root at {path}{}", crate::fleet::lock::held_by(holder))]
+    StorageInUse { path: String, holder: Option<String> },
     #[error(transparent)]
     Other(#[from] anyhow::Error),
 }
