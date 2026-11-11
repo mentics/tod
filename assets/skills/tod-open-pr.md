@@ -64,8 +64,10 @@ says "Could not resolve to a PullRequest", which reads like a broken PR.
 
 ## The title
 
-Short and specific: what the change does, not how. When the node has an issue
-in a tracker, the project skill says whether and how to name it.
+Short and specific: what the change does, not how. When the node has a
+ticket, the title is `<ticket ID>: <title>` (for example `ENG-123: Retry
+failed uploads`), unless the project skill names PRs another way; then its
+format wins.
 
 ## The description
 
@@ -75,8 +77,6 @@ A short summary, not a report:
    obvious, why. Leave motivation out when the change speaks for itself.
 2. **Prose after**: a sentence or two only if the bullets leave something
    worth clarifying. Many small PRs need none.
-3. **The issue reference** on its own last line, when there is one and the
-   tracker links PRs that way.
 
 Write it for a reviewer who has not followed the work, from the node's
 obligations and what was actually built. When a change spans several PRs,
