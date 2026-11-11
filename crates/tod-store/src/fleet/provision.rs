@@ -684,7 +684,7 @@ fn prepare_sandbox_checkout(
     if let Err(err) = worktree::init_submodules(dir) {
         warnings.push(format!("{err:#}"));
     }
-    warnings.extend(worktree::branch_submodules(dir, branch)?);
+    warnings.extend(worktree::branch_submodules_from_origin(dir, branch)?);
     Ok(warnings)
 }
 
@@ -1075,7 +1075,7 @@ fn make_sandbox(
             if let Err(err) = worktree::init_submodules(&dir) {
                 warnings.push(format!("{err:#}"));
             }
-            warnings.extend(worktree::branch_submodules(&dir, branch)?);
+            warnings.extend(worktree::branch_submodules_from_origin(&dir, branch)?);
         }
         if !golden_has_tod_files {
             // Restarted, so it runs the binary the install gave it. Adopted
