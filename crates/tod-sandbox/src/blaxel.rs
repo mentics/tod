@@ -1044,6 +1044,40 @@ impl Blaxel {
         )
     }
 
+    /// [`Self::upload_large`] for a binary: gzipped here (level 1) and
+    /// unpacked in the sandbox, so about half the bytes cross the network
+    /// (the upload is bandwidth-bound, about 3.5 MB/s to a sandbox).
+    pub fn upload_large_compressed(&self, url: &str, path: &str, bytes: &[u8], mode: &str) -> Result<()> {
+        use std::io::Write;
+        let q = crate::relay::shell_quote;
+        let mut enc = flate2::write::GzEncoder::new(Vec::with_capacity(bytes.len() / 2), flate2::Compression::fast());
+        enc.write_all(bytes).context("compress the upload")?;
+        let gz = enc.finish().context("compress the upload")?;
+        let dir = path.rsplit_once('/').map_or("/", |(d, _)| if d.is_empty() { "/" } else { d });
+        // The unpacked copy lands beside the gzip, which upload_large's own
+        // check does not count.
+        self.require_free_space(url, dir, (bytes.len() as u64) + 16 * 1024 * 1024, url)?;
+        let packed = format!("{path}.gz");
+        self.upload_large(url, &packed, &gz, "0644")?;
+        let staged = format!("{path}.unpacked");
+        let res = self.run(
+            url,
+            &format!(
+                "gunzip -c {1} > {2} && chmod {3} {2} && mv -f {2} {0} && rm -f {1}",
+                q(path),
+                q(&packed),
+                q(&staged),
+                q(mode)
+            ),
+            120,
+        )?;
+        if res.exit_code != 0 {
+            let _ = self.run(url, &format!("rm -f {} {}", q(&packed), q(&staged)), 30);
+            bail!("unpacking {path} failed: {}", res.output());
+        }
+        Ok(())
+    }
+
     /// Writes a file of any size: in parts of at most 4 MB (the filesystem
     /// API takes at most 5 MB per call), joined into a staging file, which is
     /// then renamed over `path`, so a binary that is running can be replaced.

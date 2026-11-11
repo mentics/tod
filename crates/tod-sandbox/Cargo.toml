@@ -17,6 +17,7 @@ path = "src/bin/tod-watchdog.rs"
 [dependencies]
 anyhow = "1.0"
 base64 = "0.22"
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 futures-util = "0.3"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 # Both already come with tokio-tungstenite; named here to set up TLS once per

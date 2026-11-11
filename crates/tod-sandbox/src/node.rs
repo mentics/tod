@@ -665,11 +665,11 @@ fn upload_tod_files(bx: &Blaxel, url: &str, payload: &NodePayload, progress: &mu
     bx.upload_large(url, RELAY_PATH, payload.relay, "0755")?;
     bx.upload(url, TOD_CLI_PATH, payload.shim, "0755")?;
     match payload.supervisor {
-        Some(bytes) => bx.upload_large(url, SUPERVISOR_PATH, bytes, "0755")?,
+        Some(bytes) => bx.upload_large_compressed(url, SUPERVISOR_PATH, bytes, "0755")?,
         None => progress("warning: tod-supervisor is not built (target/sandbox/); the node will not run on its own"),
     }
     match payload.local_cli {
-        Some(bytes) => bx.upload_large(url, LOCAL_CLI_PATH, bytes, "0755")?,
+        Some(bytes) => bx.upload_large_compressed(url, LOCAL_CLI_PATH, bytes, "0755")?,
         None => progress("warning: tod-cli is not built for Linux (target/sandbox/); `tod-cli pr` will not work in the node"),
     }
     // The node manifest keeps `tod-sandbox`'s own provisioning (a shell,
