@@ -149,7 +149,8 @@ new gotcha to this file and `doc/live-verification.md` and merge them.
 - The task panel's upper part scrolls: with a long failure text the runner
   buttons sit below its fold (`scroll 1400 400 0 300` brings them up).
 - Sandboxes left asleep over an hour are deleted by Cofactr's `Blaxel Prune`
-  workflow unless labelled `keep-when-idle=true` (node sandboxes are).
+  workflow unless labelled `keep-when-idle=true` (goldens and the
+  orchestrator are; node sandboxes are not, and are made again on the next start).
 - A submodule whose origin fetches only its default branch needs the node's
   branch in its fetch refspec and an upstream in config; `git switch --track`
   refuses it.

@@ -500,7 +500,7 @@ pub fn create_body(spec: &NodeSandboxSpec, creds: &NodeCredentials) -> Value {
                 "tod-node": spec.node,
                 ENV_LABEL: env_fingerprint(&creds.custom),
                 CREDS_LABEL: node_creds_fingerprint(spec, creds),
-                (crate::blaxel::LABEL_KEEP_WHEN_IDLE): crate::blaxel::KEEP_WHEN_IDLE_YES,
+                (crate::blaxel::LABEL_KEEP_WHEN_IDLE): crate::blaxel::KEEP_WHEN_IDLE_NO,
             },
         },
         "spec": {
@@ -941,10 +941,9 @@ pub fn fork_golden(bx: &Blaxel, source: &str, spec: &NodeSandboxSpec, creds: &No
         ("tod-node", spec.node),
         (ENV_LABEL, env_label.as_str()),
         (CREDS_LABEL, creds_label.as_str()),
-        // A node's sandbox outlives a quiet hour: it waits on reviews, CI and
-        // people for hours, and holds the node's checkout. It is deleted when
-        // the node is done (`tod_core::sandbox_retire`) or deleted.
-        (crate::blaxel::LABEL_KEEP_WHEN_IDLE, crate::blaxel::KEEP_WHEN_IDLE_YES),
+        // The fork has the golden's `true`; a node's sandbox is left to the
+        // workspace's idle prune (only goldens and the orchestrator are kept).
+        (crate::blaxel::LABEL_KEEP_WHEN_IDLE, crate::blaxel::KEEP_WHEN_IDLE_NO),
     ];
     bx.update_proxy(spec.name, &proxy, &labels)
         .map_err(|err| err.context(format!("give {} the node's credentials (its proxy is {source}'s)", spec.name)))
@@ -1341,15 +1340,14 @@ mod tests {
         assert_eq!(create_body(&base, &creds())["metadata"]["labels"]["tod-kind"], "node-base");
     }
 
-    /// The workspace's idle prune deletes a sandbox asleep over an hour
-    /// unless it carries `keep-when-idle=true`; a node waits hours on reviews
-    /// and people, so its sandbox must carry it.
+    /// Only goldens and the orchestrator are kept through the workspace's
+    /// idle prune; a node's sandbox is left to it.
     #[test]
-    fn a_node_sandbox_is_kept_through_the_idle_prune() {
+    fn a_node_sandbox_is_left_to_the_idle_prune() {
         let body = create_body(&spec(ClaudeTokenVia::Proxy), &creds());
         assert_eq!(
             body["metadata"]["labels"][crate::blaxel::LABEL_KEEP_WHEN_IDLE],
-            crate::blaxel::KEEP_WHEN_IDLE_YES
+            crate::blaxel::KEEP_WHEN_IDLE_NO
         );
     }
 
