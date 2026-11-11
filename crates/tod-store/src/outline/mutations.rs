@@ -1,6 +1,6 @@
 //! Outline mutations executed by the fleet writer.
 
-use crate::outline::file_refs::check_no_file_references;
+use crate::outline::file_refs::check_file_references;
 use crate::outline::repos::gate::GateRepo;
 use crate::outline::repos::generator::GeneratorRepo;
 use crate::outline::repos::obligations::{KIND_CONSTRAINT, KIND_REQUIREMENT, ObligationRepo};
@@ -671,7 +671,7 @@ impl OutlineMutation {
                 phase,
             } => {
                 guard_not_managed(conn, *node_id)?;
-                check_no_file_references(body)?;
+                check_file_references(conn, *node_id, body)?;
                 create_obligation(
                     conn,
                     *obligation_id,
@@ -688,7 +688,9 @@ impl OutlineMutation {
                 obligation_id,
                 body,
             } => {
-                check_no_file_references(body)?;
+                if let Some(o) = ObligationRepo::new(conn).get(*obligation_id)? {
+                    check_file_references(conn, o.node_id, body)?;
+                }
                 ObligationRepo::new(conn).update_body(*obligation_id, body)?;
             }
             OutlineMutation::UpdateObligationVisualDesign {

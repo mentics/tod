@@ -14,7 +14,7 @@ pub mod slug;
 pub mod types;
 pub mod uuid_blob;
 
-pub use file_refs::{check_no_file_references, referenced_files};
+pub use file_refs::{check_file_references, referenced_files};
 pub use gate_criteria_seed::{GATE_CRITERIA, seed_gate_criteria};
 pub use mutations::{CreatePosition, OutlineMutation, ReorderDirection};
 pub use references::{BrokenReference, broken_references, check_references, referenced_slugs};

@@ -128,6 +128,27 @@ fn obligation_text_cannot_reference_files() {
         .unwrap();
     assert_eq!(bodies, vec!["Row controls activate on Enter and on click.".to_string()]);
 
+    // With a Files location a path relative to it means something, whether or
+    // not the file exists; one that leaves the location's root still does not.
+    store
+        .enqueue_outline(OutlineMutation::EnableCapabilities {
+            node_id,
+            capabilities: vec![Capability::Files],
+        })
+        .unwrap();
+    store.writer().flush().unwrap();
+    let edit = |body: &str| {
+        store
+            .enqueue_outline(OutlineMutation::UpdateObligationBody {
+                obligation_id: kept,
+                body: body.into(),
+            })
+            .and_then(|_| store.writer().flush())
+    };
+    edit("Create doc/row-controls.md describing activation.").unwrap();
+    assert!(edit("Follow ../../shared/row-controls.md.").is_err());
+    assert!(edit("Follow /etc/row-controls.md.").is_err());
+
     drop(store);
     let _ = fs::remove_dir_all(root);
 }
