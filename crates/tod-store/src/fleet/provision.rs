@@ -1029,9 +1029,24 @@ fn make_sandbox(
             progress("installing tod's files…");
             node::install(&bx, &url, &payload, progress)?;
         } else if golden_has_tod_files {
-            // Nothing to upload: the Ready check below fails, naming the
-            // golden, if it does not carry this build's files.
-            node::start_relay(&bx, &url, &supervisor_env)?;
+            // Nothing to upload when the golden's files came through the
+            // fork's network update (the Ready check below fails, naming the
+            // golden, if they are not this build's). Blaxel sometimes
+            // redeploys the fork from its image on that update and drops
+            // everything installed since (seen live, with a plain `bl fork` of
+            // the golden too): then the files are put in, as for any other
+            // golden, and the user is told.
+            let carried = bx.run(&url, &format!("cat {} 2>/dev/null", tod_sandbox::provision::MANIFEST_PATH), 30)?;
+            if tod_sandbox::provision::is_node_manifest(carried.output()) {
+                node::start_relay(&bx, &url, &supervisor_env)?;
+            } else {
+                tracing::warn!(sandbox = %name, "the golden's files did not survive the fork's network update; installing them");
+                progress(&format!(
+                    "warning: the files tod put in the golden did not survive {name}'s network update (Blaxel redeployed it from its image); installing them, which takes longer"
+                ));
+                node::install_into_fork(&bx, &url, &payload, progress)?;
+                node::start_relay(&bx, &url, &supervisor_env)?;
+            }
         } else {
             progress("installing tod's files…");
             // A fork's files come from tod's own bundle, not its golden's:
