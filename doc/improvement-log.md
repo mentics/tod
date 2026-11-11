@@ -149,8 +149,12 @@ from Blaxel.
   every 30 min) deletes any sandbox asleep over `SANDBOX_IDLE_TTL` (1h)
   unless labelled `keep-when-idle=true`; tod labelled node sandboxes
   `false` on purpose.
-- **Fix**: node sandboxes carry `keep-when-idle=true`; tod deletes them at
-  `done` (`sandbox_retire`).
+- **Fix** (2026-11-10): node sandboxes carry `keep-when-idle=true`; tod
+  deletes them at `done` (`sandbox_retire`).
+- **Reverted** (2026-11-11): only goldens and the orchestrator are kept;
+  node sandboxes are `false` again, left to the prune and made again on the
+  next start. Sandboxes made between the two keep `true` (relabeling resets
+  a sandbox's container) until `sandbox_retire` deletes them.
 - **Measure**: replacements per node per day.
 
 ### Agents in a sandbox cannot query the database

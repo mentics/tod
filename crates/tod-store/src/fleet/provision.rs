@@ -1000,11 +1000,17 @@ fn make_sandbox(
         // image (timing-dependent). Only this build's node manifest from the
         // fork's relay is taken as the files being there.
         let golden_has_tod_files = golden_has_tod_files && {
+            // Read from the file, not asked of the relay: a golden runs no
+            // relay (a fork starts its own below), and asking one that is not
+            // there waits out the relay's whole timeout.
             let expected = tod_sandbox::provision::node_manifest(&node_files.relay);
-            let reported = tod_sandbox::provision::relay_manifest(&bx, &url);
-            let needs = tod_sandbox::provision::fork_needs_tod_files(true, reported.as_deref(), &expected);
+            let carried = bx
+                .run(&url, &format!("cat {} 2>/dev/null", tod_sandbox::provision::MANIFEST_PATH), 30)
+                .with_context(|| format!("read {name}'s tod manifest"))?;
+            let reported = carried.output().trim().to_string();
+            let needs = tod_sandbox::provision::fork_needs_tod_files(true, Some(&reported), &expected);
             if needs {
-                progress(&format!("{name} does not carry this build's tod files (its relay reports {reported:?}); installing them…"));
+                progress(&format!("{name} does not carry this build's tod files (its manifest says {reported:?}); installing them…"));
             }
             !needs
         };
@@ -1029,8 +1035,12 @@ fn make_sandbox(
             progress("installing tod's files…");
             node::install(&bx, &url, &payload, progress)?;
         } else if golden_has_tod_files {
-            // Nothing to upload: the Ready check below fails, naming the
-            // golden, if it does not carry this build's files.
+            // Nothing to upload: the fork's own relay just reported this
+            // build's manifest (`golden_has_tod_files` is true only then), so
+            // the golden's files came through the network update. When Blaxel
+            // redeploys the fork from its image on that update and drops them,
+            // the relay does not report it and the files are put in below,
+            // with the user told.
             node::start_relay(&bx, &url, &supervisor_env)?;
         } else {
             progress("installing tod's files…");
@@ -1064,10 +1074,9 @@ fn make_sandbox(
         // A fork of a tod golden runs the relay the golden gave it and nothing
         // below changes it, so the one probe that checks the relay's manifest
         // as well comes first, instead of a base probe now and a second probe
-        // after the checkout (each is a round trip to the sandbox).
-        if golden_has_tod_files {
-            ready(progress)?;
-        } else {
+        // after the checkout (each is a round trip to the sandbox). For a fork
+        // of a tod golden it runs while the checkout does (below).
+        if !golden_has_tod_files {
             progress(&format!("checking {name} can reach {}…", repo.url));
             tod_sandbox::health::probe(&bx, &url, tod_sandbox::health::Stage::Base, &health(None), progress)?;
         }
@@ -1075,18 +1084,32 @@ fn make_sandbox(
         // Where the checkout is: the clone's, else the image's own. A fork's
         // is there before the checkout runs, and so are its submodules, so
         // both are dealt with while the checkout runs: each is a round trip
-        // that does not depend on it.
+        // that does not depend on it. A fork of a tod golden is also probed
+        // meanwhile: the probe and the checkout both only read the
+        // sandbox, and the probe's verdict wins when it fails (the sandbox is
+        // discarded either way). The checkout's own retry covers a proxy that
+        // is still taking effect.
         let mut warnings = Vec::new();
         let (dir_path, quick) = if fork_from.is_some() {
-            let (checked, beside) = std::thread::scope(|scope| {
+            let (probed, checked, checked_said, beside) = std::thread::scope(|scope| {
                 let beside = scope.spawn(|| -> Result<(String, worktree::QuickBranch)> {
                     let dir = find_sandbox_checkout(&name)?;
                     let quick = worktree::branch_submodules_quickly(&Workdir::sandbox(&name, &dir), branch)?;
                     Ok((dir, quick))
                 });
-                let checked = node::checkout(&bx, &url, &repo.url, branch, &identity, false, progress);
-                (checked, beside.join().unwrap_or_else(|_| Err(anyhow!("looking at the checkout panicked"))))
+                let checkout = scope.spawn(|| {
+                    let mut said = Vec::new();
+                    let checked = node::checkout(&bx, &url, &repo.url, branch, &identity, false, &mut |m: &str| said.push(m.to_string()));
+                    (checked, said)
+                });
+                let probed = if golden_has_tod_files { ready(progress) } else { Ok(()) };
+                let (checked, said) = checkout.join().unwrap_or_else(|_| (Err(anyhow!("the checkout panicked")), Vec::new()));
+                (probed, checked, said, beside.join().unwrap_or_else(|_| Err(anyhow!("looking at the checkout panicked"))))
             });
+            for message in &checked_said {
+                progress(message);
+            }
+            probed?;
             checked?;
             let (dir, quick) = beside?;
             (dir, Some(quick))

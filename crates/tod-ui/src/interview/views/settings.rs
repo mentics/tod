@@ -199,6 +199,8 @@ impl SettingsSection {
                 SandboxClaudeToken,
                 SandboxClaudeGetToken,
                 SandboxClaudeClear,
+                SandboxCloudflareApp,
+                SandboxCloudflareSignIn,
             ],
             Self::Databases => &[Databases],
             Self::OrchestratorGithub => &[OrchestratorGithub],
@@ -266,6 +268,10 @@ enum SettingField {
     SandboxClaudeGetToken,
     /// Forgets the stored Claude subscription token.
     SandboxClaudeClear,
+    /// An app behind Cloudflare Access to sign in to (its URL; Enter signs in).
+    SandboxCloudflareApp,
+    /// Signs in again to every app behind Cloudflare Access signed in to.
+    SandboxCloudflareSignIn,
     LogLevel,
     LogMaxSize,
     MaxParallelSessions,
@@ -323,6 +329,8 @@ impl SettingField {
             Self::SandboxClaudeToken => "sandbox-claude-token",
             Self::SandboxClaudeGetToken => "sandbox-claude-get-token",
             Self::SandboxClaudeClear => "sandbox-claude-clear",
+            Self::SandboxCloudflareApp => "sandbox-cloudflare-app",
+            Self::SandboxCloudflareSignIn => "sandbox-cloudflare-sign-in",
             Self::LogLevel => "log-level",
             Self::LogMaxSize => "log-max-size",
             Self::MaxParallelSessions => "max-parallel-sessions",
@@ -361,6 +369,7 @@ const TEXT_FIELDS: [SettingField; 16] = [
     SettingField::SandboxGitEmail,
     SettingField::SandboxCommandRedirects,
     SettingField::SandboxClaudeToken,
+    SettingField::SandboxCloudflareApp,
     SettingField::JourneysRelayCode,
     SettingField::JourneysMilestoneStates,
     SettingField::LifecycleRepoProfiles,
@@ -507,6 +516,13 @@ pub struct SettingsView {
     /// until the keyring has been read (off the UI thread).
     claude_token_backend: Option<Option<tod_store::credentials::CredentialBackend>>,
     claude_status: Option<Result<SharedString, SharedString>>,
+    /// An app URL to sign in to behind Cloudflare Access.
+    cloudflare_app_input: Entity<InputState>,
+    /// The apps signed in to; `None` until read from the credential store.
+    cloudflare_apps: Option<Vec<tod_store::cloudflare_access::AppStatus>>,
+    cloudflare_status: Option<Result<SharedString, SharedString>>,
+    /// A sign-in is running (it waits on the browser).
+    cloudflare_busy: bool,
     agent_selects: Vec<AgentRoleSelects>,
     focus_handle: FocusHandle,
     app_nav: AppNavMenu,
@@ -606,22 +622,27 @@ impl SettingsView {
         {
             let root = paths.data_root().to_path_buf();
             cx.spawn(async move |this, cx| {
-                let (has_key, claude) = cx
+                let (has_key, claude, cloudflare) = cx
                     .background_spawn(async move {
                         (
                             tod_store::fleet::sandbox::has_api_key(&root),
                             tod_store::fleet::sandbox::claude_token_backend(&root),
+                            tod_store::cloudflare_access::status(&tod_store::credentials::CredentialStore::from_data_root(&root)),
                         )
                     })
                     .await;
                 let _ = this.update(cx, |this, cx| {
                     this.sandbox_has_key = Some(has_key);
                     this.claude_token_backend = Some(claude);
+                    this.cloudflare_apps = Some(cloudflare);
                     cx.notify();
                 });
             })
             .detach();
         }
+        let cloudflare_app_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("Enter to edit · An app's URL, e.g. https://dagster.cofactr.com (Enter signs in)")
+        });
         let claude_token_input = cx.new(|cx| {
             InputState::new(window, cx)
                 .masked(true)
@@ -799,6 +820,10 @@ impl SettingsView {
             claude_token_input,
             claude_token_backend: None,
             claude_status: None,
+            cloudflare_app_input,
+            cloudflare_apps: None,
+            cloudflare_status: None,
+            cloudflare_busy: false,
             relay_code_input,
             milestone_states_input,
             repo_profiles_input,
@@ -979,6 +1004,7 @@ impl SettingsView {
                 SettingField::SandboxGitEmail => &self.git_email_input,
                 SettingField::SandboxCommandRedirects => &self.command_redirects_input,
                 SettingField::SandboxClaudeToken => &self.claude_token_input,
+                SettingField::SandboxCloudflareApp => &self.cloudflare_app_input,
                 SettingField::JourneysRelayCode => &self.relay_code_input,
                 SettingField::JourneysMilestoneStates => &self.milestone_states_input,
                 SettingField::LifecycleRepoProfiles => &self.repo_profiles_input,
@@ -1049,6 +1075,7 @@ impl SettingsView {
         match field {
             SettingField::SandboxApiKey => self.save_sandbox_key(window, cx),
             SettingField::SandboxClaudeToken => self.save_claude_token(window, cx),
+            SettingField::SandboxCloudflareApp => self.add_cloudflare_app(window, cx),
             SettingField::SandboxWorkspace | SettingField::SandboxDefaultImage => {
                 self.save_sandbox_account(cx)
             }
@@ -1249,6 +1276,68 @@ impl SettingsView {
                         Err("Cleared the stored token, but CLAUDE_CODE_OAUTH_TOKEN is set in the environment tod was started from, and is used instead.".into())
                     }
                     Err(err) => Err(format!("{err:#}").into()),
+                });
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Sign in to the app whose URL was typed, then clear the field.
+    fn add_cloudflare_app(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let app: String = self.cloudflare_app_input.read(cx).text().to_string();
+        let app = app.trim().to_string();
+        if app.is_empty() {
+            return;
+        }
+        if let Err(err) = tod_store::cloudflare_access::app_host(&app) {
+            self.cloudflare_status = Some(Err(format!("{err:#}").into()));
+            cx.notify();
+            return;
+        }
+        self.cloudflare_app_input.update(cx, |input, cx| input.set_value("", window, cx));
+        self.sign_in_cloudflare(vec![app], crate::ui::journey::Source::Keyboard, cx);
+    }
+
+    /// Sign in to `apps` through `cloudflared`, or with none, again to every
+    /// app already signed in to. It opens the browser and waits, so it runs off
+    /// the UI thread; the apps and their expiry are read again after.
+    fn sign_in_cloudflare(&mut self, apps: Vec<String>, source: crate::ui::journey::Source, cx: &mut Context<Self>) {
+        if self.cloudflare_busy {
+            return;
+        }
+        let any = !self.cloudflare_apps.as_ref().is_none_or(Vec::is_empty);
+        record_cloudflare_action(cx, "cloudflare_sign_in", any, source);
+        self.cloudflare_busy = true;
+        self.cloudflare_status = Some(Ok("Signing in… your browser may open; the sign-in finishes by itself.".into()));
+        cx.notify();
+        let root = self.paths.data_root().to_path_buf();
+        cx.spawn(async move |this, cx| {
+            let (nothing, failures, apps) = cx
+                .background_spawn(async move {
+                    let store = tod_store::credentials::CredentialStore::from_data_root(&root);
+                    let results: Vec<(String, anyhow::Result<tod_store::cloudflare_access::AppStatus>)> = if apps.is_empty() {
+                        tod_store::cloudflare_access::login_all(&store)
+                    } else {
+                        apps.into_iter().map(|a| (a.clone(), tod_store::cloudflare_access::login(&store, &a))).collect()
+                    };
+                    let nothing = results.is_empty();
+                    let failures: Vec<String> = results
+                        .into_iter()
+                        .filter_map(|(app, r)| r.err().map(|e| format!("{app}: {e:#}")))
+                        .collect();
+                    (nothing, failures, tod_store::cloudflare_access::status(&store))
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.cloudflare_busy = false;
+                this.cloudflare_apps = Some(apps);
+                this.cloudflare_status = Some(if nothing {
+                    Err("No app yet: type an app's URL above (for example https://dagster.cofactr.com) and press Enter.".into())
+                } else if failures.is_empty() {
+                    Ok("Signed in. Sandboxes created from now on use it.".into())
+                } else {
+                    Err(failures.join("\n").into())
                 });
                 cx.notify();
             });
@@ -1592,7 +1681,9 @@ impl SettingsView {
             | SettingField::SandboxGoldenRefresh
             | SettingField::SandboxClaudeToken
             | SettingField::SandboxClaudeGetToken
-            | SettingField::SandboxClaudeClear => {}
+            | SettingField::SandboxClaudeClear
+            | SettingField::SandboxCloudflareApp
+            | SettingField::SandboxCloudflareSignIn => {}
             SettingField::SandboxSignIn => self.cycle_sandbox_sign_in(cx),
             SettingField::LogLevel => self.step_log_level(delta, cx),
             SettingField::LogMaxSize => {
@@ -1670,6 +1761,9 @@ impl SettingsView {
             }
             SettingField::SandboxClaudeClear => {
                 self.clear_claude_token(crate::ui::journey::Source::Keyboard, cx)
+            }
+            SettingField::SandboxCloudflareSignIn => {
+                self.sign_in_cloudflare(Vec::new(), crate::ui::journey::Source::Keyboard, cx)
             }
             SettingField::Agent(role) => self.focus_agent_select(role, window, cx),
             SettingField::JourneysSendTest => self.send_journeys_test(cx),
@@ -2148,6 +2242,63 @@ fn claude_token_help(
     }
 }
 
+/// What the Cloudflare Access row says: each app and how long its sign-in has left.
+fn cloudflare_help(apps: &Option<Vec<tod_store::cloudflare_access::AppStatus>>) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64);
+    let intro = "Sites of yours behind Cloudflare Access (Dagster, an admin console) need a sign-in that cloud nodes' agents cannot make. Signing in here (needs `cloudflared`: `brew install cloudflared`) keeps it encrypted on this machine and has each new sandbox's proxy add it for that site only; agents never see it. It expires, and an agent that hits the login page asks you to sign in again. Each site is its own app, so add each once.";
+    match apps {
+        None => intro.to_string(),
+        Some(apps) if apps.is_empty() => format!("{intro}\n\nNo app signed in yet."),
+        Some(apps) => {
+            let lines: Vec<String> = apps
+                .iter()
+                .map(|a| match a.expires_at {
+                    Some(_) if a.expired(now) => format!("{}: EXPIRED", a.host),
+                    Some(e) => {
+                        let left = (e - now) / 60;
+                        if left >= 48 * 60 {
+                            format!("{}: signed in, {} days left", a.host, left / (24 * 60))
+                        } else {
+                            format!("{}: signed in, {}h {}m left", a.host, left / 60, left % 60)
+                        }
+                    }
+                    None => format!("{}: signed in", a.host),
+                })
+                .collect();
+            format!("{intro}\n\n{}", lines.join("\n"))
+        }
+    }
+}
+
+/// A `UserAction` for the Cloudflare Access rows: "Sign in" primary once an
+/// app is listed.
+fn record_cloudflare_action(cx: &mut App, action: &str, any_app: bool, source: crate::ui::journey::Source) {
+    let entry = |id: &str, label: &str, primary: bool| tod_journey::PresentedAction {
+        id: id.to_string(),
+        label: label.to_string(),
+        primary,
+        disabled: false,
+    };
+    let presented = tod_journey::Presented {
+        actions: vec![
+            entry("cloudflare_app", "Cloudflare Access app", false),
+            entry("cloudflare_sign_in", "Sign in", any_app),
+        ],
+        focused: Some(action.to_string()),
+        notices: Vec::new(),
+    };
+    crate::ui::journey::record_action(
+        cx,
+        tod_store::conversation::Focus::Project,
+        action,
+        source,
+        "settings_cloud_sandboxes",
+        presented,
+    );
+}
+
 /// The Claude subscription rows, for the journey's `Presented` snapshot.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ClaudeRow {
@@ -2208,7 +2359,7 @@ fn claude_button_row(
     view: &SettingsView,
     field: SettingField,
     label: &'static str,
-    help: &'static str,
+    help: impl Into<SharedString>,
     primary: bool,
     disabled: bool,
     theme: &gpui_component::Theme,
@@ -2247,7 +2398,7 @@ fn claude_button_row(
                 .text_sm()
                 .text_color(theme.muted_foreground)
                 .whitespace_normal()
-                .child(help),
+                .child(help.into()),
         )
         .child(if primary { button.primary() } else { button })
 }
@@ -2811,6 +2962,44 @@ impl SettingsView {
                             .text_color(color)
                             .child(crate::ui::selectable_text::selectable_text(
                                 "settings-claude-status",
+                                text,
+                                window,
+                                cx,
+                            )),
+                    )
+                })
+                .child(text_input_row(
+                    cx,
+                    self,
+                    SettingField::SandboxCloudflareApp,
+                    "Cloudflare Access: add an app",
+                    "The URL of a site behind Cloudflare Access; Enter signs in to it.",
+                    &self.cloudflare_app_input,
+                    theme,
+                ))
+                .child(claude_button_row(
+                    cx,
+                    self,
+                    SettingField::SandboxCloudflareSignIn,
+                    if self.cloudflare_busy { "Signing in…" } else { "Sign in" },
+                    cloudflare_help(&self.cloudflare_apps),
+                    self.cloudflare_apps.as_ref().is_some_and(|a| !a.is_empty()),
+                    self.cloudflare_busy,
+                    theme,
+                    |this, cx| this.sign_in_cloudflare(Vec::new(), crate::ui::journey::Source::Click, cx),
+                ))
+                .when_some(self.cloudflare_status.clone(), |el, status| {
+                    let (color, text) = match status {
+                        Ok(text) => (theme.muted_foreground, text),
+                        Err(text) => (theme.danger, text),
+                    };
+                    el.child(
+                        div()
+                            .px_3()
+                            .text_sm()
+                            .text_color(color)
+                            .child(crate::ui::selectable_text::selectable_text(
+                                "settings-cloudflare-status",
                                 text,
                                 window,
                                 cx,

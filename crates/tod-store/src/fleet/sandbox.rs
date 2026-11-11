@@ -281,6 +281,9 @@ impl Sandboxes {
     /// never on the UI thread.
     pub fn node_credentials(&self, custom: Vec<tod_sandbox::node::CustomCredential>) -> tod_sandbox::node::NodeCredentials {
         let store = self.credentials();
+        // The apps the user signed in to behind Cloudflare Access, then their own entries.
+        let mut custom = custom;
+        custom.extend(crate::cloudflare_access::credentials(&store));
         tod_sandbox::node::NodeCredentials {
             github_token: store.get(CredentialKind::GithubToken),
             linear_api_key: store.get(CredentialKind::LinearApiKey),
