@@ -243,7 +243,7 @@ impl NeedsHuman {
     pub fn describe(&self) -> String {
         match self {
             Self::Decision { pending } => {
-                format!("the agent asked you {pending} question(s) and is waiting for your answer")
+                format!("the agent is waiting on {pending} question(s) only you can answer; open the node's requests and answer them")
             }
             Self::BlockedSteps { count } => format!(
                 "the agent handed back {count} plan step(s) it could not finish; open the plan to see why, \
@@ -266,15 +266,15 @@ impl NeedsHuman {
                 fixes.join("; ")
             ),
             Self::PrBlocked { why } => {
-                format!("the agent handed the pull request back to you: {why}. Resolve that, then run it again")
+                format!("the agent stopped work on the pull request because: {why}. Fix that (or tell the agent what to do instead), then run it again")
             }
             Self::PrStuck { why } => format!(
                 "the pull request keeps needing work and the agent is not getting it through: {why}. \
                  Look at the pull request yourself, then run it again"
             ),
             Self::Permission { title } => format!(
-                "the agent is asking for permission ({title}) and nobody has granted it; \
-                 allow or deny it and the agent carries on"
+                "the agent needs permission for: {title}. Nobody has granted it; \
+                 open the node's requests and allow or deny it, and the agent carries on"
             ),
             Self::AgentFailed { error } => {
                 format!("the agent's turn failed: {error}. Run it again to retry")

@@ -18,7 +18,10 @@ in full or as the 8-character prefix listings show.
 
 `ask` records a pending decision:
 
-- The question is one positional argument — quote it.
+- The question is one positional argument — quote it. It is the whole request
+  as the user reads it: the ask on the first line, a blank line, then the
+  background (see "Wording a request" in how you work here). Options go in
+  `--option`, never in the question text.
 - `--option`: repeatable, in the order they should be offered to the user
   (numbered 1, 2, 3 … in the task panel). The user can always answer in
   their own words instead. With none, the question asks for free text.
