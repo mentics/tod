@@ -85,11 +85,34 @@ pub struct RestoreNotes {
     pub failures: Vec<String>,
 }
 
+/// Whether `dir` is in a cloud sandbox and a single call there found that no
+/// repository (the checkout or any submodule) has a checkpoint of `node_id` on
+/// its `origin`. `false` means "not known to be none", never an error.
+fn nothing_saved_in_sandbox(dir: &Workdir, node_id: &str) -> bool {
+    if !matches!(dir, Workdir::Sandbox { .. }) {
+        return false;
+    }
+    let script = r#"export P="$1"
+paths=$(git submodule foreach --recursive --quiet 'echo "$displaypath"') || { echo FAIL; exit 0; }
+for d in . $paths; do ( cd "$d" && { git ls-remote origin "$P*" || echo FAIL; } ) & done
+wait"#;
+    let prefix = checkpoint::node_prefix(node_id);
+    let limit = std::time::Duration::from_secs(60);
+    dir.output_within(limit, "sh", &["-c", script, "sh", &prefix])
+        .is_ok_and(|out| out.status.success() && String::from_utf8_lossy(&out.stdout).trim().is_empty())
+}
+
 /// Put `node_id`'s checkpoints into `dir`, a checkout made just now.
 /// A checkpoint that does not apply, or could not be read, is left on the
 /// remote and reported in `failures`, never dropped.
 pub fn restore_into(dir: &Workdir, node_id: &str) -> RestoreNotes {
     let mut notes = RestoreNotes::default();
+    // Nearly always there is nothing to restore: one call in a sandbox asks
+    // every repository at once (listing them and asking each is a dozen round
+    // trips). Anything else, including a failed call, takes the full way.
+    if nothing_saved_in_sandbox(dir, node_id) {
+        return notes;
+    }
     let repos = match repos_deepest_first(dir) {
         Ok(repos) => repos,
         Err(err) => {
@@ -97,7 +120,22 @@ pub fn restore_into(dir: &Workdir, node_id: &str) -> RestoreNotes {
             return notes;
         }
     };
-    for repo in repos {
+    // Looking for a checkpoint is one round trip per repository (a sandbox's
+    // checkout has several), almost always to find none: ask side by side.
+    let found: Vec<bool> = std::thread::scope(|scope| {
+        let handles: Vec<_> = repos
+            .iter()
+            .map(|repo| {
+                let reference = checkpoint::ref_name(node_id, &rel(dir, repo));
+                scope.spawn(move || checkpoint::remote_ref(repo, &reference).map_or(true, |found| found.is_some()))
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap_or(true)).collect()
+    });
+    for (repo, found) in repos.into_iter().zip(found) {
+        if !found {
+            continue;
+        }
         let rel = rel(dir, &repo);
         let reference = checkpoint::ref_name(node_id, &rel);
         match checkpoint::restore_repo(&repo, &reference) {

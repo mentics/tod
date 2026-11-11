@@ -9,6 +9,7 @@
 3. Run **post-release smoke** (or its equivalent) in the released environment: confirm the task's requirements still hold there, not just the pre-release checks.
 4. If smoke fails, treat it as a defect: record what failed. Moving the task back toward `active` or `verifying` is the user's call, so ask them, with that as the recommended option.
 5. Ask the user only for environment access you do not have, or for that move back.
+6. If the evidence cannot be produced yet (no access to the released environment, a nightly job that has not run since the deploy), do **not** record `ready` without it: ask the user how to proceed (`decisions ask`, options such as accept without evidence, wait, or grant access) and end your turn. A `ready` with the same missing evidence is rejected, and the second identical rejection stops the run.
 
 ## Done when
 

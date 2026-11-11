@@ -9,7 +9,7 @@ use crate::fleet::treehouse::{TREEHOUSE_NO_UPDATE_CHECK_ENV, TreehouseInvocation
 use crate::fleet::workdir::{CONTAINER_GIT_CONFIG_ENV, Workdir, strip_verbatim};
 use crate::paths::TodPaths;
 use crate::settings::{TodSettings, WorktreeBackend};
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -423,6 +423,65 @@ pub fn init_submodules(worktree: &Workdir) -> Result<()> {
     Ok(())
 }
 
+/// What [`branch_submodules_quickly`] did.
+#[derive(Debug, PartialEq, Eq)]
+pub enum QuickBranch {
+    /// Every submodule is on the branch.
+    Done,
+    /// Not applicable or not completed, and why; the step-by-step way
+    /// ([`init_submodules`] then [`branch_submodules`], idempotent, so they
+    /// finish what this began) must run, and the reason is to be reported.
+    Declined(String),
+}
+
+/// [`branch_submodules`] for the common case in a cloud sandbox, in one call
+/// instead of about fifteen (each is a round trip), the submodules side by
+/// side: every submodule is initialized and none has `branch` yet, locally or
+/// on `origin`, so each gets it created at the commit it is on.
+///
+/// It reads `.gitmodules` and the directories, never the superproject's index,
+/// so it can run while the superproject's own checkout does.
+pub fn branch_submodules_quickly(worktree: &Workdir, branch: &str) -> Result<QuickBranch> {
+    if branch.is_empty() {
+        return Ok(QuickBranch::Declined("no branch to create".into()));
+    }
+    if !matches!(worktree, Workdir::Sandbox { .. }) {
+        return Ok(QuickBranch::Declined("not a cloud sandbox".into()));
+    }
+    let script = format!(
+        r#"export BR="$1" KEY="$2"
+walk() {{
+  [ -f "$1/.gitmodules" ] || return 0
+  for p in $(git config -f "$1/.gitmodules" --get-regexp '^submodule\..*\.path$' | awk '{{print $2}}'); do
+    if [ -e "$1/$p/.git" ]; then echo "$1/$p"; walk "$1/$p"; else echo "UNINIT $1/$p"; fi
+  done
+}}
+paths=$(walk .) || exit 1
+case "$paths" in *UNINIT*) echo "a submodule is not set up: $paths"; exit 7;; esac
+pids=""
+for sp in $paths; do
+  (
+    cd "$sp" || exit 1
+    if git show-ref --verify --quiet "refs/heads/$BR" || git show-ref --verify --quiet "refs/remotes/{REMOTE}/$BR"; then
+      echo "$sp already has the branch"; exit 7
+    fi
+    git switch -q -c "$BR" && git config "$KEY" "$(git rev-parse HEAD)"
+  ) 2>&1 &
+  pids="$pids $!"
+done
+rc=0
+for pid in $pids; do wait "$pid" || rc=1; done
+exit $rc"#
+    );
+    let key = start_key(branch);
+    let out = worktree.output_within(std::time::Duration::from_secs(60), "sh", &["-c", &script, "sh", branch, &key])?;
+    if out.status.success() {
+        return Ok(QuickBranch::Done);
+    }
+    let said = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    Ok(QuickBranch::Declined(format!("exit {:?}: {}", out.status.code(), said.trim())))
+}
+
 /// Check `branch` out in every initialized submodule of `worktree` (see
 /// [`switch_to_branch`]: from `origin/<branch>` if the submodule has one, else
 /// at the commit the superproject pins), so an agent's commits inside a submodule land on a
@@ -432,15 +491,32 @@ pub fn branch_submodules(worktree: &Workdir, branch: &str) -> Result<Vec<String>
     if branch.is_empty() {
         return Ok(Vec::new());
     }
+    // Each submodule is its own repository, and in a sandbox every git call
+    // is a round trip, so they are switched side by side, not one after
+    // another (the warnings stay in the submodules' order).
+    let dirs = submodule_dirs(worktree)?;
+    let results: Vec<Result<()>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = dirs
+            .iter()
+            .map(|dir| {
+                scope.spawn(move || {
+                    switch_to_branch(dir, branch, None).and_then(|created_at_head| {
+                        if created_at_head {
+                            let head = run_git(dir, &["rev-parse", "HEAD"])?;
+                            run_git(dir, &["config", &start_key(branch), &head])?;
+                        }
+                        Ok(())
+                    })
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().unwrap_or_else(|_| Err(anyhow!("switching a submodule panicked"))))
+            .collect()
+    });
     let mut warnings = Vec::new();
-    for dir in submodule_dirs(worktree)? {
-        let switched = switch_to_branch(&dir, branch, None).and_then(|created_at_head| {
-            if created_at_head {
-                let head = run_git(&dir, &["rev-parse", "HEAD"])?;
-                run_git(&dir, &["config", &start_key(branch), &head])?;
-            }
-            Ok(())
-        });
+    for (dir, switched) in dirs.iter().zip(results) {
         if let Err(err) = switched {
             warnings.push(format!("Submodule {dir} is not on \"{branch}\": {err:#}"));
         }

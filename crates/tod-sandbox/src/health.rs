@@ -92,7 +92,7 @@ pub struct HealthSpec<'a> {
 }
 
 /// What the probe asks the sandbox; [`Blaxel`] answers it for real.
-pub trait Probes {
+pub trait Probes: Sync {
     fn reachable(&self, wait: Duration) -> Result<()>;
     fn disk(&self, min_free: u64, label: &str) -> Result<()>;
     /// The manifest the relay reports, `None` if it does not answer.
@@ -142,11 +142,24 @@ pub fn evaluate(
 ) -> Result<(), HealthFailure> {
     let fail = |check: Check, detail: String| HealthFailure { check, detail };
     probes.reachable(spec.reachable_wait).map_err(|e| fail(Check::Reachable, format!("{}: {e:#}", spec.label)))?;
-    probes.disk(spec.min_free, spec.label).map_err(|e| fail(Check::Disk, format!("{e:#}")))?;
     let script = probe_script(spec.repo_url, spec.node);
+    // Each check is a round trip to the sandbox, so they are asked together
+    // and judged in the order they always were: disk, then the relay's
+    // manifest, then the environment and the repository.
     let once = || -> Result<(), HealthFailure> {
-        if stage == Stage::Ready {
-            let Some(reported) = probes.relay_manifest() else {
+        let (disk, manifest, env) = std::thread::scope(|scope| {
+            let disk = scope.spawn(|| probes.disk(spec.min_free, spec.label));
+            let manifest = (stage == Stage::Ready).then(|| scope.spawn(|| probes.relay_manifest()));
+            let env = scope.spawn(|| probes.env_and_git(&script));
+            (
+                disk.join().unwrap_or_else(|_| Err(anyhow::anyhow!("the disk check panicked"))),
+                manifest.map(|m| m.join().unwrap_or(None)),
+                env.join().unwrap_or_else(|_| Err(anyhow::anyhow!("the environment check panicked"))),
+            )
+        });
+        disk.map_err(|e| fail(Check::Disk, format!("{e:#}")))?;
+        if let Some(reported) = manifest {
+            let Some(reported) = reported else {
                 return Err(fail(Check::Relay, format!("the relay in {} does not answer", spec.label)));
             };
             let sane = match spec.expected_manifest {
@@ -164,7 +177,7 @@ pub fn evaluate(
                 ));
             }
         }
-        match probes.env_and_git(&script) {
+        match env {
             Ok(res) if res.exit_code == 0 => Ok(()),
             Ok(res) if res.exit_code == PROBE_NO_NODE_ENV => Err(fail(Check::Env, res.output().trim().to_string())),
             Ok(res) => Err(fail(Check::GitRemote, format!("exit {}: {}", res.exit_code, res.output().trim()))),
@@ -175,6 +188,10 @@ pub fn evaluate(
     let mut attempt = 0;
     loop {
         let Err(failure) = once() else { return Ok(()) };
+        // A full disk is not waited out.
+        if failure.check == Check::Disk {
+            return Err(failure);
+        }
         let Some(delay) = spec.probe_delays.get(attempt) else { return Err(failure) };
         progress(&format!(
             "{} is not healthy yet ({}: {}); trying again in {delay}s…",
@@ -190,19 +207,19 @@ pub fn evaluate(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::RefCell;
+    use std::sync::Mutex;
 
     struct Fake {
         reachable: bool,
         disk: bool,
         manifest: Option<String>,
-        runs: RefCell<Vec<(i32, &'static str)>>,
-        ran: RefCell<u32>,
+        runs: Mutex<Vec<(i32, &'static str)>>,
+        ran: Mutex<u32>,
     }
 
     impl Fake {
         fn healthy() -> Self {
-            Self { reachable: true, disk: true, manifest: Some("node relay=abc".into()), runs: RefCell::new(vec![]), ran: RefCell::new(0) }
+            Self { reachable: true, disk: true, manifest: Some("node relay=abc".into()), runs: Mutex::new(vec![]), ran: Mutex::new(0) }
         }
     }
 
@@ -221,8 +238,8 @@ mod tests {
             self.manifest.clone()
         }
         fn env_and_git(&self, _: &str) -> Result<ProcessResult> {
-            *self.ran.borrow_mut() += 1;
-            let mut runs = self.runs.borrow_mut();
+            *self.ran.lock().unwrap() += 1;
+            let mut runs = self.runs.lock().unwrap();
             let (code, out) = if runs.is_empty() { (0, "") } else { runs.remove(0) };
             Ok(result(code, out))
         }
@@ -274,11 +291,11 @@ mod tests {
         assert_eq!(run(&f, Stage::Ready, &spec(Some("node relay=other"), &[])).unwrap_err().check, Check::Manifest);
 
         let f = Fake::healthy();
-        *f.runs.borrow_mut() = vec![(PROBE_NO_NODE_ENV, "TOD_NODE is ''")];
+        *f.runs.lock().unwrap() = vec![(PROBE_NO_NODE_ENV, "TOD_NODE is ''")];
         assert_eq!(run(&f, Stage::Ready, &spec(None, &[])).unwrap_err().check, Check::Env);
 
         let f = Fake::healthy();
-        *f.runs.borrow_mut() = vec![(128, "could not read Username")];
+        *f.runs.lock().unwrap() = vec![(128, "could not read Username")];
         let e = run(&f, Stage::Ready, &spec(None, &[])).unwrap_err();
         assert_eq!(e.check, Check::GitRemote);
         assert!(e.detail.contains("could not read Username"), "{e}");
@@ -294,15 +311,15 @@ mod tests {
     #[test]
     fn the_proxy_checks_are_retried_and_the_last_failure_is_the_error() {
         let f = Fake::healthy();
-        *f.runs.borrow_mut() = vec![(41, "env"), (128, "auth"), (0, "")];
+        *f.runs.lock().unwrap() = vec![(41, "env"), (128, "auth"), (0, "")];
         run(&f, Stage::Ready, &spec(None, &[1, 1])).unwrap();
-        assert_eq!(*f.ran.borrow(), 3);
+        assert_eq!(*f.ran.lock().unwrap(), 3);
 
         let f = Fake::healthy();
-        *f.runs.borrow_mut() = vec![(41, "env"), (128, "auth"), (128, "auth")];
+        *f.runs.lock().unwrap() = vec![(41, "env"), (128, "auth"), (128, "auth")];
         let e = run(&f, Stage::Ready, &spec(None, &[1])).unwrap_err();
         assert_eq!(e.check, Check::GitRemote);
-        assert_eq!(*f.ran.borrow(), 2);
+        assert_eq!(*f.ran.lock().unwrap(), 2);
     }
 
     #[test]

@@ -850,7 +850,13 @@ impl Blaxel {
             if start.elapsed() > timeout {
                 bail!("sandbox {name} did not deploy within {}s", timeout.as_secs());
             }
-            std::thread::sleep(Duration::from_secs(2));
+            // A fork is usually deployed within a second or two: look often
+            // at first, then settle to the old pace.
+            std::thread::sleep(if start.elapsed() < Duration::from_secs(20) {
+                Duration::from_millis(250)
+            } else {
+                Duration::from_secs(2)
+            });
         }
     }
 

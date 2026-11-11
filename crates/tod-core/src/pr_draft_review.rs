@@ -399,12 +399,51 @@ pub fn commentable_lines(files: &[tod_store::github::PrFile]) -> BTreeMap<String
     out
 }
 
+/// The changed file a finding's path names. Agents record paths from where
+/// they stood (`flagship/flagship/settings.py` for a pull request on the
+/// `flagship` repository, whose file is `flagship/settings.py`), so a path
+/// matches a changed file when either ends with the other at a folder
+/// boundary (the longest such file wins). A path that matches none still
+/// gets a file, the changed one it shares the most trailing folders with
+/// (else the first), so the finding is a thread that can be answered and
+/// resolved, never loose text; its body names the location it is about.
+fn resolve_file(path: &str, lines: &BTreeMap<String, BTreeSet<i64>>) -> Option<String> {
+    if lines.contains_key(path) {
+        return Some(path.to_string());
+    }
+    let ends = |long: &str, short: &str| long.strip_suffix(short).is_some_and(|rest| rest.ends_with('/'));
+    if let Some(f) = lines
+        .keys()
+        .filter(|f| ends(path, f) || ends(f, path))
+        .max_by_key(|f| f.len())
+    {
+        return Some(f.clone());
+    }
+    let shared = |f: &str| path.rsplit('/').zip(f.rsplit('/')).take_while(|(a, b)| a == b).count();
+    let mut best: Option<(&String, usize)> = None;
+    for f in lines.keys() {
+        let n = shared(f);
+        if best.is_none_or(|(_, m)| n > m) {
+            best = Some((f, n));
+        }
+    }
+    best.map(|(f, _)| f.clone())
+}
+
 fn place(finding: &ReviewFinding, lines: &BTreeMap<String, BTreeSet<i64>>) -> Place {
-    let Some(path) = finding.file.as_deref() else { return Place::Text };
-    let Some(file_lines) = lines.get(path) else { return Place::Text };
+    // A finding with no file goes on the file with the most changed lines: a
+    // thread is the only thing that can be answered and resolved.
+    let Some(path) = finding.file.as_deref() else {
+        return match lines.iter().max_by_key(|(_, l)| l.len()) {
+            Some((file, _)) => Place::File { path: file.clone() },
+            None => Place::Text,
+        };
+    };
+    let Some(file) = resolve_file(path, lines) else { return Place::Text };
+    let exact = file == path || path.ends_with(&format!("/{file}"));
     match finding.line {
-        Some(line) if file_lines.contains(&line) => Place::Line { path: path.to_string(), line },
-        _ => Place::File { path: path.to_string() },
+        Some(line) if exact && lines[&file].contains(&line) => Place::Line { path: file, line },
+        _ => Place::File { path: file },
     }
 }
 
@@ -415,8 +454,15 @@ fn marker(finding: &ReviewFinding) -> String {
 
 fn comment_body(finding: &ReviewFinding, place: &Place) -> String {
     let mut out = format!("**[{}]** {}", finding.severity, finding.summary.trim());
-    if let (Place::File { .. }, Some(line)) = (place, finding.line) {
-        out = format!("**[{}]** (line {line}) {}", finding.severity, finding.summary.trim());
+    if let (Place::File { path }, Some(location)) = (place, finding.location()) {
+        // Say where it is about when the thread could not sit on that line.
+        let about = match finding.line {
+            Some(line) if location == format!("{path}:{line}") || finding.file.as_deref() == Some(path) => {
+                format!("line {line}")
+            }
+            _ => format!("`{location}`"),
+        };
+        out = format!("**[{}]** ({about}) {}", finding.severity, finding.summary.trim());
     }
     if let Some(detail) = finding.detail.as_deref().filter(|d| !d.trim().is_empty()) {
         out.push_str("\n\n");
@@ -618,8 +664,15 @@ mod tests {
         assert_eq!(place(&finding(Some("src/a.rs"), Some(2)), &lines), Place::Line { path: "src/a.rs".into(), line: 2 });
         assert_eq!(place(&finding(Some("src/a.rs"), Some(9)), &lines), Place::File { path: "src/a.rs".into() });
         assert_eq!(place(&finding(Some("src/a.rs"), None), &lines), Place::File { path: "src/a.rs".into() });
-        assert_eq!(place(&finding(Some("src/other.rs"), Some(1)), &lines), Place::Text);
-        assert_eq!(place(&finding(None, None), &lines), Place::Text);
+        // A path from a parent folder still names the changed file, and its line.
+        assert_eq!(
+            place(&finding(Some("repo/src/a.rs"), Some(2)), &lines),
+            Place::Line { path: "src/a.rs".into(), line: 2 }
+        );
+        // A file the change does not touch is still a thread, on the changed file.
+        assert_eq!(place(&finding(Some("src/other.rs"), Some(1)), &lines), Place::File { path: "src/a.rs".into() });
+        assert_eq!(place(&finding(None, None), &lines), Place::File { path: "src/a.rs".into() });
+        assert_eq!(place(&finding(None, None), &BTreeMap::new()), Place::Text);
     }
 
     #[test]

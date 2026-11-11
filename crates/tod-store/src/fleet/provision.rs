@@ -1025,35 +1025,75 @@ fn make_sandbox(
         }
         // A fork is "deployed" before its proxy rules and environment are in
         // effect; the checkout needs both.
-        progress(&format!("checking {name} can reach {}…", repo.url));
         let health = |expected_manifest| health_spec(&name, node_id, &repo.url, expected_manifest, delays);
-        tod_sandbox::health::probe(&bx, &url, tod_sandbox::health::Stage::Base, &health(None), progress)?;
+        let expected = tod_sandbox::provision::node_manifest(&node_files.relay);
+        let ready = |progress: &mut dyn FnMut(&str)| -> Result<()> {
+            progress(&format!("checking {name} is healthy…"));
+            tod_sandbox::health::probe(&bx, &url, tod_sandbox::health::Stage::Ready, &health(Some(&expected)), progress)
+                .map_err(|failure| match &fork_from {
+                    Some(from) => anyhow::Error::new(failure).context(format!(
+                        "{name} was forked from {from}, which should carry this build's relay, supervisor and tod-cli; \
+                         refresh it (`tod-sandbox golden refresh`) or point the Files setting at the project's golden"
+                    )),
+                    None => anyhow::Error::new(failure),
+                })
+        };
+        // A fork of a tod golden runs the relay the golden gave it and nothing
+        // below changes it, so the one probe that checks the relay's manifest
+        // as well comes first, instead of a base probe now and a second probe
+        // after the checkout (each is a round trip to the sandbox).
+        if golden_has_tod_files {
+            ready(progress)?;
+        } else {
+            progress(&format!("checking {name} can reach {}…", repo.url));
+            tod_sandbox::health::probe(&bx, &url, tod_sandbox::health::Stage::Base, &health(None), progress)?;
+        }
         let identity = host.git_identity(fleet)?;
-        node::checkout(&bx, &url, &repo.url, branch, &identity, fork_from.is_none(), progress)?;
-        // Where the checkout is: the clone's, else the image's own.
-        let dir_path = find_sandbox_checkout(&name)?;
+        // Where the checkout is: the clone's, else the image's own. A fork's
+        // is there before the checkout runs, and so are its submodules, so
+        // both are dealt with while the checkout runs: each is a round trip
+        // that does not depend on it.
+        let mut warnings = Vec::new();
+        let (dir_path, quick) = if fork_from.is_some() {
+            let (checked, beside) = std::thread::scope(|scope| {
+                let beside = scope.spawn(|| -> Result<(String, worktree::QuickBranch)> {
+                    let dir = find_sandbox_checkout(&name)?;
+                    let quick = worktree::branch_submodules_quickly(&Workdir::sandbox(&name, &dir), branch)?;
+                    Ok((dir, quick))
+                });
+                let checked = node::checkout(&bx, &url, &repo.url, branch, &identity, false, progress);
+                (checked, beside.join().unwrap_or_else(|_| Err(anyhow!("looking at the checkout panicked"))))
+            });
+            checked?;
+            let (dir, quick) = beside?;
+            (dir, Some(quick))
+        } else {
+            node::checkout(&bx, &url, &repo.url, branch, &identity, true, progress)?;
+            (find_sandbox_checkout(&name)?, None)
+        };
         location.repo = Some(dir_path.clone());
         record(fleet, &*location)?;
         let dir = Workdir::sandbox(&name, &dir_path);
-        let mut warnings = Vec::new();
-        if let Err(err) = worktree::init_submodules(&dir) {
-            warnings.push(format!("{err:#}"));
+        // Anything the one-call way did not complete is said, not hidden: the
+        // step-by-step way then does the work, and it fails loudly if the
+        // sandbox is really wrong.
+        if let Some(worktree::QuickBranch::Declined(why)) = &quick {
+            tracing::warn!(sandbox = %name, "the one-call submodule branching did not complete: {why}");
+            progress(&format!("warning: the one-call submodule branching did not complete ({why}); doing it step by step"));
         }
-        warnings.extend(worktree::branch_submodules(&dir, branch)?);
-        // Restarted, so it runs the binary the golden or install gave it.
-        node::start_relay(&bx, &url, &supervisor_env)?;
-        // Adopted as good only now: the relay answers with this build's
-        // manifest, which a fork of a golden without tod's files cannot.
-        let expected = tod_sandbox::provision::node_manifest(&node_files.relay);
-        progress(&format!("checking {name} is healthy…"));
-        tod_sandbox::health::probe(&bx, &url, tod_sandbox::health::Stage::Ready, &health(Some(&expected)), progress)
-            .map_err(|failure| match &fork_from {
-                Some(from) => anyhow::Error::new(failure).context(format!(
-                    "{name} was forked from {from}, which should carry this build's relay, supervisor and tod-cli; \
-                     refresh it (`tod-sandbox golden refresh`) or point the Files setting at the project's golden"
-                )),
-                None => anyhow::Error::new(failure),
-            })?;
+        if !matches!(quick, Some(worktree::QuickBranch::Done)) {
+            if let Err(err) = worktree::init_submodules(&dir) {
+                warnings.push(format!("{err:#}"));
+            }
+            warnings.extend(worktree::branch_submodules(&dir, branch)?);
+        }
+        if !golden_has_tod_files {
+            // Restarted, so it runs the binary the install gave it. Adopted
+            // as good only now: the relay answers with this build's manifest,
+            // which a fork of a golden without tod's files cannot.
+            node::start_relay(&bx, &url, &supervisor_env)?;
+            ready(progress)?;
+        }
         host.record_install(&root, node_id)?;
         progress(&format!(
             "{name} {} and set up after {:.1}s",

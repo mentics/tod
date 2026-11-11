@@ -210,7 +210,12 @@ loop (the stay's first turn, or a push from outside):
   findings through `tod-cli review` as in `review` and never posts itself.
   The app records the heads it reviewed on the review's report (`pr_heads`).
 - **Post.** The app posts the findings as one review: on a changed line,
-  else on the file, else in the review's text. Each finding records its
+  else on the file (a path from a parent folder, such as a submodule's
+  `flagship/flagship/settings.py`, is matched to the changed `flagship/settings.py`;
+  a file the change does not touch goes on the nearest changed file, its body
+  naming the real location), and a finding with no file goes on the file with the most changed lines. Only a
+  pull request with no changed files gets the review's text, since only a thread
+  can be replied to and resolved. Each finding records its
   thread (`review_findings.pr_thread`), found by a marker in the comment.
   A failure to post stops the run (`PrBlocked`).
 - **Fix.** An open thread is work for the PR agent, whose opening adds the
