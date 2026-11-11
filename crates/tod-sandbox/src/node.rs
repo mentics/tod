@@ -697,10 +697,67 @@ fn upload_tod_files(bx: &Blaxel, url: &str, payload: &NodePayload, progress: &mu
     Ok(())
 }
 
+
+/// Where the command-redirect hook is installed, under [`TOD_DIR`]: a bundle
+/// of its own (`hooks/`), so what it says is part of the install stamp and a
+/// change to the settings makes a golden (and every older node sandbox) stale.
+pub const REDIRECT_HOOK_REL: &str = "hooks/redirect.sh";
+
+/// The Claude Code hook that turns an agent away from `redirects`' commands
+/// (PreToolUse on Bash, installed in the sandbox's **user-level** settings by
+/// [`install_bundles`]): a command that runs one of them by name, as a
+/// command and not as an argument (`grep db-query` passes), is denied with
+/// the path to run instead; a command that already names that path passes.
+/// Hooks from every settings level run and a deny beats the project hook's
+/// allow, so this holds where the project's own scripts, skills and hooks say
+/// otherwise, and nothing about the project is in tod. (A managed settings
+/// file does not work: an account's server-managed settings replace it.)
+pub fn redirect_hook(redirects: &[crate::config::CommandRedirect]) -> String {
+    let mut s = String::from(
+        "#!/bin/sh\n# Written by tod from Settings -> Cloud sandboxes -> Command redirects.\n\
+         cmd=$(jq -r '.tool_input.command // empty')\n",
+    );
+    for r in redirects {
+        let (name, path) = (&r.command, &r.path);
+        s.push_str(&format!(
+            "case \"$cmd\" in *{path}*) ;; *{name}*)\n  \
+             if printf '%s' \"$cmd\" | grep -Eq '(^|[;&|(]|\\$\\()[[:space:]]*{name}([[:space:]]|$)'; then\n    \
+             jq -n '{{hookSpecificOutput:{{hookEventName:\"PreToolUse\",permissionDecision:\"deny\",permissionDecisionReason:\"In this sandbox run {path} instead of {name}.\"}}}}'\n    \
+             exit 0\n  fi ;;\nesac\n"
+        ));
+    }
+    s.push_str("exit 0\n");
+    s
+}
+
+/// The `hooks/` bundle files for `redirects`: none when there are none.
+pub fn redirect_bundle(redirects: &[crate::config::CommandRedirect]) -> Vec<(String, Vec<u8>)> {
+    if redirects.is_empty() {
+        return Vec::new();
+    }
+    vec![(REDIRECT_HOOK_REL.to_string(), redirect_hook(redirects).into_bytes())]
+}
+
+/// Puts the hook in (or takes it out of) the sandbox's user-level Claude
+/// settings, keeping whatever else is there, once, by matching its command.
+fn redirect_settings_script() -> String {
+    let hook = format!("{TOD_DIR}/{REDIRECT_HOOK_REL}");
+    format!(
+        "set -e\nf=\"${{HOME:-/root}}/.claude/settings.json\"; c='sh {hook}'\n\
+         if [ -f {hook} ]; then\n\
+           command -v jq >/dev/null || {{ echo 'jq is not installed in this sandbox, so the command redirects cannot be set up' >&2; exit 1; }}\n\
+           mkdir -p \"$(dirname \"$f\")\"; [ -f \"$f\" ] || echo '{{}}' > \"$f\"\n\
+           jq --arg c \"$c\" '.hooks.PreToolUse = ((.hooks.PreToolUse // []) | map(select(((.hooks // []) | map(.command) | index($c)) == null))) + [{{matcher:\"Bash\",hooks:[{{type:\"command\",command:$c}}]}}]' \"$f\" > \"$f.tmp\" && mv -f \"$f.tmp\" \"$f\"\n\
+         elif [ -f \"$f\" ] && command -v jq >/dev/null; then\n\
+           jq --arg c \"$c\" 'if .hooks.PreToolUse then .hooks.PreToolUse |= map(select(((.hooks // []) | map(.command) | index($c)) == null)) else . end' \"$f\" > \"$f.tmp\" && mv -f \"$f.tmp\" \"$f\"\n\
+         fi\n"
+    )
+}
+
 fn install_bundles(bx: &Blaxel, url: &str, payload: &NodePayload, progress: &mut dyn FnMut(&str)) -> Result<()> {
     if !payload.bundles.is_empty() {
         progress(&format!("installing {} bundle files…", payload.bundles.len()));
-        let res = bx.run(url, &format!("rm -rf {TOD_DIR}/process {TOD_DIR}/media {TOD_DIR}/skills"), 30)?;
+        let res = bx.run(url, &format!("rm -rf {TOD_DIR}/process {TOD_DIR}/media {TOD_DIR}/skills {TOD_DIR}/hooks"), 30)?;
         if res.exit_code != 0 {
             bail!("clearing the old bundles failed: {}", res.output());
         }
@@ -712,6 +769,10 @@ fn install_bundles(bx: &Blaxel, url: &str, payload: &NodePayload, progress: &mut
         let res = bx.run(url, &format!("tar -xf {remote} -C {TOD_DIR} && rm -f {remote}"), 120)?;
         if res.exit_code != 0 {
             bail!("unpacking the bundles failed: {}", res.output());
+        }
+        let res = bx.run(url, &redirect_settings_script(), 30)?;
+        if res.exit_code != 0 {
+            bail!("setting up the command redirects failed: {}", res.output());
         }
     }
     Ok(())
@@ -1289,6 +1350,88 @@ mod tests {
         assert_eq!(code, 0, "{err}");
         assert!(calls.contains("real local-kb select 1"), "{calls}");
         assert!(!calls.contains("tod-cli"), "{calls}");
+    }
+
+    /// Runs the redirect hook on a Bash `command`; the hook's stdout.
+    fn run_redirect_hook(tag: &str, command: &str) -> String {
+        let dir = std::env::temp_dir().join(format!("tod-redirect-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let hook = dir.join("redirect.sh");
+        let redirects = crate::config::CommandRedirect::parse_all(&["db-query=/usr/local/bin/db-query"]).unwrap();
+        std::fs::write(&hook, redirect_hook(&redirects)).unwrap();
+        let input = serde_json::json!({ "tool_input": { "command": command } }).to_string();
+        let mut child = std::process::Command::new("sh")
+            .arg(&hook)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        std::io::Write::write_all(child.stdin.as_mut().unwrap(), input.as_bytes()).unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert!(out.status.success());
+        let _ = std::fs::remove_dir_all(&dir);
+        String::from_utf8(out.stdout).unwrap()
+    }
+
+    #[test]
+    fn the_redirect_hook_turns_away_the_command_but_not_a_mention_of_it() {
+        for denied in [
+            "db-query --list",
+            "cd /workspace && db-query prod-kb 'select 1'",
+            "export PATH=x:$PATH && db-query --list",
+            "echo hi; db-query --list",
+            "(db-query --list)",
+            "ls | db-query --list",
+        ] {
+            let out = run_redirect_hook("deny", denied);
+            let v: serde_json::Value = serde_json::from_str(&out).unwrap_or_else(|e| panic!("{denied}: {e}: {out}"));
+            assert_eq!(v["hookSpecificOutput"]["permissionDecision"], "deny", "{denied}");
+            assert!(out.contains("/usr/local/bin/db-query instead of db-query"), "{denied}: {out}");
+        }
+        for passed in [
+            "/usr/local/bin/db-query --list",
+            "grep -rn db-query .claude/skills",
+            "cat scripts/db-query.md",
+            "ls",
+        ] {
+            assert_eq!(run_redirect_hook("pass", passed).trim(), "", "{passed}");
+        }
+    }
+
+    #[test]
+    fn no_redirects_make_no_hook_files() {
+        assert!(redirect_bundle(&[]).is_empty());
+        let r = crate::config::CommandRedirect::parse_all(&["a=/b"]).unwrap();
+        assert_eq!(redirect_bundle(&r)[0].0, "hooks/redirect.sh");
+    }
+
+    #[test]
+    fn the_settings_step_adds_the_hook_once_and_takes_it_out_keeping_the_rest() {
+        let dir = std::env::temp_dir().join(format!("tod-redirect-settings-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".claude")).unwrap();
+        std::fs::write(dir.join(".claude/settings.json"), r#"{"model":"x","hooks":{"PreToolUse":[{"matcher":"Edit","hooks":[{"type":"command","command":"keep"}]}]}}"#).unwrap();
+        // The script names /opt/tod/hooks/redirect.sh: point it at a scratch copy.
+        let hook = dir.join("redirect.sh");
+        let script = redirect_settings_script().replace(&format!("{TOD_DIR}/{REDIRECT_HOOK_REL}"), hook.to_str().unwrap());
+        let run = || {
+            let out = std::process::Command::new("sh").arg("-c").arg(&script).env("HOME", &dir).output().unwrap();
+            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+            let v: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join(".claude/settings.json")).unwrap()).unwrap();
+            v
+        };
+        std::fs::write(&hook, "#!/bin/sh\n").unwrap();
+        run();
+        let v = run();
+        let pre = v["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(pre.len(), 2, "{v}");
+        assert_eq!(v["model"], "x");
+        assert!(pre.iter().any(|h| h["hooks"][0]["command"] == format!("sh {}", hook.display())));
+        std::fs::remove_file(&hook).unwrap();
+        let v = run();
+        assert_eq!(v["hooks"]["PreToolUse"].as_array().unwrap().len(), 1, "{v}");
+        assert_eq!(v["hooks"]["PreToolUse"][0]["hooks"][0]["command"], "keep");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

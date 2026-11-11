@@ -727,6 +727,46 @@ pub fn set_account_settings(root: &Path, workspace: &str, default_image: &str) -
     sandboxes.save()
 }
 
+/// The command redirects set up in this data root, as the Settings field
+/// shows them: `COMMAND=PATH` entries joined by `; `. Reads the file only.
+pub fn command_redirects(root: &Path) -> String {
+    let acct = Sandboxes::load(root).ok().and_then(|s| s.config.blaxel);
+    acct.map(|a| a.command_redirects.join("; ")).unwrap_or_default()
+}
+
+/// Records the command redirects (`COMMAND=PATH`, separated by `;` or new
+/// lines; none clears them), refusing a bad entry before anything is saved.
+/// True when they changed: only a golden refreshed (and a sandbox made) after
+/// that has them. Needs a workspace set up, like the rest of the account.
+pub fn set_command_redirects(root: &Path, text: &str) -> Result<bool> {
+    let specs: Vec<String> = text.split([';', '\n']).map(str::trim).filter(|s| !s.is_empty()).map(str::to_string).collect();
+    let parsed = tod_sandbox::config::CommandRedirect::parse_all(&specs)?;
+    let specs: Vec<String> = parsed.iter().map(|r| format!("{}={}", r.command, r.path)).collect();
+    let mut sandboxes = Sandboxes::load(root)?;
+    let Some(acct) = sandboxes.config.blaxel.as_mut() else {
+        if specs.is_empty() {
+            return Ok(false);
+        }
+        bail!("set up a Blaxel workspace above first: command redirects are kept with it");
+    };
+    if acct.command_redirects == specs {
+        return Ok(false);
+    }
+    acct.command_redirects = specs;
+    sandboxes.save()?;
+    Ok(true)
+}
+
+/// The repositories (`owner/name`) that have a golden sandbox of their own
+/// in this data root: what a change to what sandboxes are given must refresh.
+pub fn golden_repos(root: &Path) -> Vec<String> {
+    Sandboxes::load(root)
+        .ok()
+        .and_then(|s| s.config.blaxel)
+        .map(|a| a.goldens.keys().cloned().collect())
+        .unwrap_or_default()
+}
+
 /// How this data root signs in to Blaxel (an API key when nothing is set up
 /// yet). Reads the file only.
 pub fn sign_in_mode(root: &Path) -> AuthMode {
@@ -1270,6 +1310,24 @@ mod tests {
         sandboxes.forget("never-known").unwrap();
         let names: Vec<_> = Sandboxes::load(&root).unwrap().config.sandboxes.into_iter().map(|s| s.name).collect();
         assert_eq!(names, ["keep"]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn command_redirects_round_trip_and_say_when_they_changed() {
+        let root = std::env::temp_dir().join(format!("tod-redirects-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        // Nothing to clear without an account; a redirect needs one.
+        assert!(!set_command_redirects(&root, "").unwrap());
+        assert!(set_command_redirects(&root, "a=/b").is_err());
+        set_account_settings(&root, "team", "").unwrap();
+        assert!(set_command_redirects(&root, " db-query = /usr/local/bin/db-query ;\nx=/y").unwrap());
+        assert_eq!(command_redirects(&root), "db-query=/usr/local/bin/db-query; x=/y");
+        assert!(!set_command_redirects(&root, "db-query=/usr/local/bin/db-query; x=/y").unwrap());
+        assert!(set_command_redirects(&root, "bad").is_err());
+        assert_eq!(command_redirects(&root), "db-query=/usr/local/bin/db-query; x=/y");
+        assert!(set_command_redirects(&root, "").unwrap());
+        assert_eq!(command_redirects(&root), "");
         let _ = std::fs::remove_dir_all(&root);
     }
 

@@ -70,7 +70,7 @@ pub trait SandboxHost: Send + Sync {
         progress: &mut dyn FnMut(&str),
     ) -> Result<String>;
     /// Reads the install files from where this build keeps them.
-    fn node_files(&self) -> Result<NodeFiles>;
+    fn node_files(&self, root: &Path) -> Result<NodeFiles>;
     /// The repository `node_id`'s sandbox works on.
     fn node_repo(&self, fleet: &super::FleetStore, node_id: &str) -> Result<NodeRepo>;
     /// Who the node's commits are by: the identity in the user's database

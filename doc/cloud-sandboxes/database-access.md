@@ -205,3 +205,27 @@ per-node allowlist of which databases a node may use; approval prompts per
 login; databases for a node that runs on this
 machine with its files in a sandbox (use the database directly there); a
 Windows sandbox.
+
+## Turning agents away from a project command (command redirects)
+
+A project's scripts and skills may tell agents to run a command that cannot
+work in a sandbox (the workspace's `db-query` needs the AWS CLI). tod does not
+know the project, and the project does not know tod, so the user says it in
+**Settings → Cloud sandboxes → Command redirects**: `COMMAND=PATH` entries
+separated by `;` (`db-query=/usr/local/bin/db-query`, tod's shim, which logs in
+through `tod-cli db`; `sandboxes.toml` `command_redirects`).
+
+tod installs a PreToolUse hook for Bash (`/opt/tod/hooks/redirect.sh`, written
+by `tod_sandbox::node::redirect_hook`) in the sandbox's **user-level** Claude
+settings (`~/.claude/settings.json`, merged, never replaced). A Bash command that
+runs the command by name is denied with the path to run instead; `grep
+db-query` and the path itself pass. Hooks from every settings level run and a
+deny beats the project's PATH-prepending hook's allow. A managed settings file
+(`/etc/claude-code`) does not work: an account's server-managed settings replace
+it (tested in a node sandbox).
+
+The hook is a `hooks/` bundle, so it is part of the install stamp: a change makes
+the golden stale (the next fork refreshes it) and idle node sandboxes reinstall
+at launch. Saving a change in Settings offers **Refresh golden sandboxes**
+right there (`tod_core::cloud_sync::golden::refresh_all_goldens`), because only
+sandboxes forked from a refreshed golden have it.

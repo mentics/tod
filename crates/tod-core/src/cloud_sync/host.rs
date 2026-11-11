@@ -29,8 +29,8 @@ impl SandboxHost for CoreHost {
         golden::ensure_golden_current(sandboxes, bx, repo, progress)
     }
 
-    fn node_files(&self) -> Result<NodeFiles> {
-        let files = refresh::install_files()?;
+    fn node_files(&self, root: &Path) -> Result<NodeFiles> {
+        let files = refresh::install_files(root)?;
         Ok(NodeFiles { relay: files.relay, supervisor: files.supervisor, local_cli: files.local_cli, bundles: files.bundles })
     }
 
@@ -63,7 +63,7 @@ impl SandboxHost for CoreHost {
     }
 
     fn record_install(&self, root: &Path, node_id: &str) -> Result<()> {
-        refresh::record(root, node_id, &refresh::install()?, None)
+        refresh::record(root, node_id, &refresh::install(root)?, None)
     }
 }
 

@@ -56,7 +56,7 @@ pub fn ensure_golden_current(sandboxes: &mut Sandboxes, bx: &Blaxel, repo: &str,
     let (info, origin_now, loaded) = std::thread::scope(|scope| {
         let info = own_name.as_ref().map(|name| scope.spawn(|| bx.get(name)));
         let origin = origin_setting.as_ref().map(|setting| scope.spawn(|| sandboxes.resolve_golden_setting(bx, setting)));
-        let loaded = install_files().and_then(|files| my_stamp(&files).map(|mine| (files, mine)));
+        let loaded = install_files(&sandboxes.root).and_then(|files| my_stamp(&files).map(|mine| (files, mine)));
         (
             info.map(|h| h.join().unwrap_or_else(|_| Err(anyhow!("looking up the golden panicked")))),
             origin.map(|h| h.join().unwrap_or_else(|_| Err(anyhow!("looking up the original golden panicked")))),
@@ -249,10 +249,28 @@ pub fn refresh_golden(sandboxes: &mut Sandboxes, bx: &Blaxel, repo: &str, progre
     refresh_locked(sandboxes, bx, &repo, progress)
 }
 
+/// [`refresh_golden`] for every repository of this data root that has a
+/// golden, returning each new golden's name; stops at the first failure,
+/// which names its repository. Slow: never on the UI thread.
+pub fn refresh_all_goldens(root: &std::path::Path, progress: &mut dyn FnMut(&str)) -> Result<Vec<String>> {
+    let repos = tod_store::fleet::sandbox::golden_repos(root);
+    if repos.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut sandboxes = Sandboxes::load(root)?;
+    let bx = sandboxes.blaxel()?;
+    let mut names = Vec::new();
+    for repo in repos {
+        progress(&format!("{repo}: making its golden sandbox again…"));
+        names.push(refresh_golden(&mut sandboxes, &bx, &repo, progress).with_context(|| format!("refresh {repo}'s golden sandbox"))?);
+    }
+    Ok(names)
+}
+
 /// [`refresh_golden`] with the lock held and `sandboxes` current.
 fn refresh_locked(sandboxes: &mut Sandboxes, bx: &Blaxel, repo: &str, progress: &mut dyn FnMut(&str)) -> Result<String> {
     let repo = repo.to_string();
-    let files = install_files()?;
+    let files = install_files(&sandboxes.root)?;
     let mine = my_stamp(&files)?;
     let old = match source_for(sandboxes, bx, &repo)? {
         golden::Source::Build { why } => {

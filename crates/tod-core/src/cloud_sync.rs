@@ -1607,7 +1607,7 @@ pub fn ensure_supervisor(
     progress(&format!("waking {name}…"));
     bx.wait_reachable(&url, tod_sandbox::blaxel::WAKE_CEILING).with_context(|| format!("wake {name}"))?;
 
-    let files = refresh::install_files()?;
+    let files = refresh::install_files(root)?;
     let current = files.install();
     let expected_manifest = tod_sandbox::provision::node_manifest(&files.relay);
     let target = HealthTarget { label: &name, node: node_id, repo_url: &repo_url, url: &url };

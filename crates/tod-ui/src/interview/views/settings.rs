@@ -194,6 +194,8 @@ impl SettingsSection {
                 SandboxDefaultImage,
                 SandboxGitName,
                 SandboxGitEmail,
+                SandboxCommandRedirects,
+                SandboxGoldenRefresh,
                 SandboxClaudeToken,
                 SandboxClaudeGetToken,
                 SandboxClaudeClear,
@@ -252,6 +254,11 @@ enum SettingField {
     SandboxGitName,
     /// The git author email sandbox commits carry (the user's database).
     SandboxGitEmail,
+    /// Commands agents in a sandbox are turned away from, and what to run
+    /// instead (`sandboxes.toml`).
+    SandboxCommandRedirects,
+    /// Makes the golden sandboxes again, so a change reaches new sandboxes.
+    SandboxGoldenRefresh,
     /// The Claude subscription token for autonomous nodes, kept in the
     /// credential store (never shown).
     SandboxClaudeToken,
@@ -311,6 +318,8 @@ impl SettingField {
             Self::SandboxDefaultImage => "sandbox-default-image",
             Self::SandboxGitName => "sandbox-git-name",
             Self::SandboxGitEmail => "sandbox-git-email",
+            Self::SandboxCommandRedirects => "sandbox-command-redirects",
+            Self::SandboxGoldenRefresh => "sandbox-golden-refresh",
             Self::SandboxClaudeToken => "sandbox-claude-token",
             Self::SandboxClaudeGetToken => "sandbox-claude-get-token",
             Self::SandboxClaudeClear => "sandbox-claude-clear",
@@ -339,7 +348,7 @@ const PLATFORM_ORDER: [AgentPlatform; 2] = [AgentPlatform::Claude, AgentPlatform
 /// Platform, model, effort — the dropdowns in one agent role row.
 const AGENT_ROW_COLUMNS: usize = 3;
 /// The fields edited as text, each in its own input (`SettingsView::text_input`).
-const TEXT_FIELDS: [SettingField; 15] = [
+const TEXT_FIELDS: [SettingField; 16] = [
     SettingField::TreehouseExecutable,
     SettingField::TreehouseWorktreesRoot,
     SettingField::BranchTemplate,
@@ -350,6 +359,7 @@ const TEXT_FIELDS: [SettingField; 15] = [
     SettingField::SandboxDefaultImage,
     SettingField::SandboxGitName,
     SettingField::SandboxGitEmail,
+    SettingField::SandboxCommandRedirects,
     SettingField::SandboxClaudeToken,
     SettingField::JourneysRelayCode,
     SettingField::JourneysMilestoneStates,
@@ -470,6 +480,17 @@ pub struct SettingsView {
     /// (`tod_store::git_identity`), saved when leaving the field.
     git_name_input: Entity<InputState>,
     git_email_input: Entity<InputState>,
+    /// `COMMAND=PATH; …` (`sandboxes.toml`), saved when leaving the field. A
+    /// change reaches only sandboxes made from a refreshed golden, so saving
+    /// one offers that refresh.
+    command_redirects_input: Entity<InputState>,
+    /// A command redirect changed and the golden sandboxes are not yet
+    /// refreshed: the refresh button is the primary action.
+    golden_refresh_offered: bool,
+    golden_refresh_running: bool,
+    /// Whether any repository has a golden of its own to refresh.
+    goldens_exist: bool,
+    golden_refresh_status: Option<Result<SharedString, SharedString>>,
     fleet: Arc<tod_store::fleet::FleetStore>,
     sandbox_key_input: Entity<InputState>,
     sandbox_auth: tod_store::fleet::sandbox::AuthMode,
@@ -564,6 +585,12 @@ impl SettingsView {
                 .placeholder("Enter to edit · Not set")
                 .default_value(git_identity.map(|i| i.email).unwrap_or_default())
         });
+        let command_redirects_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Enter to edit · None. Example: db-query=/usr/local/bin/db-query")
+                .default_value(tod_store::fleet::sandbox::command_redirects(paths.data_root()))
+        });
+        let goldens_exist = !tod_store::fleet::sandbox::golden_repos(paths.data_root()).is_empty();
         let sandbox_image_input = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder(format!(
@@ -758,6 +785,11 @@ impl SettingsView {
             sandbox_image_input,
             git_name_input,
             git_email_input,
+            command_redirects_input,
+            golden_refresh_offered: false,
+            golden_refresh_running: false,
+            goldens_exist,
+            golden_refresh_status: None,
             fleet,
             sandbox_key_input,
             sandbox_auth,
@@ -945,6 +977,7 @@ impl SettingsView {
                 SettingField::SandboxDefaultImage => &self.sandbox_image_input,
                 SettingField::SandboxGitName => &self.git_name_input,
                 SettingField::SandboxGitEmail => &self.git_email_input,
+                SettingField::SandboxCommandRedirects => &self.command_redirects_input,
                 SettingField::SandboxClaudeToken => &self.claude_token_input,
                 SettingField::JourneysRelayCode => &self.relay_code_input,
                 SettingField::JourneysMilestoneStates => &self.milestone_states_input,
@@ -1020,6 +1053,7 @@ impl SettingsView {
                 self.save_sandbox_account(cx)
             }
             SettingField::SandboxGitName | SettingField::SandboxGitEmail => self.save_git_identity(cx),
+            SettingField::SandboxCommandRedirects => self.save_command_redirects(cx),
             field => self.apply_text_field(field, cx),
         }
         cx.notify();
@@ -1305,6 +1339,59 @@ impl SettingsView {
         cx.notify();
     }
 
+    /// Write the command redirects to `sandboxes.toml`. They reach only
+    /// sandboxes made from a refreshed golden, so a change offers that
+    /// refresh right here.
+    fn save_command_redirects(&mut self, cx: &mut Context<Self>) {
+        let text = self.command_redirects_input.read(cx).text().to_string();
+        match tod_store::fleet::sandbox::set_command_redirects(self.paths.data_root(), &text) {
+            Ok(false) => {}
+            Ok(true) => {
+                self.goldens_exist = !tod_store::fleet::sandbox::golden_repos(self.paths.data_root()).is_empty();
+                self.golden_refresh_offered = self.goldens_exist;
+                self.golden_refresh_status = Some(Ok(if self.goldens_exist {
+                    "Saved. It does not take effect until the golden sandbox is made again: only sandboxes forked from a refreshed golden have it. Refresh now?".into()
+                } else {
+                    "Saved. It applies to sandboxes made from now on.".into()
+                }));
+            }
+            Err(err) => self.golden_refresh_status = Some(Err(format!("Not saved: {err:#}").into())),
+        }
+        cx.notify();
+    }
+
+    /// Makes every golden sandbox again on this build, off the UI thread (it
+    /// takes minutes: a fork, the install, the checks).
+    fn refresh_goldens(&mut self, cx: &mut Context<Self>) {
+        if self.golden_refresh_running || !self.goldens_exist {
+            return;
+        }
+        self.golden_refresh_running = true;
+        self.golden_refresh_status = Some(Ok("Refreshing the golden sandboxes… this takes a few minutes.".into()));
+        cx.notify();
+        let root = self.paths.data_root().to_path_buf();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move {
+                    tod_core::cloud_sync::golden::refresh_all_goldens(&root, &mut |m| tracing::info!("golden refresh: {m}"))
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.golden_refresh_running = false;
+                match result {
+                    Ok(names) => {
+                        this.golden_refresh_offered = false;
+                        this.golden_refresh_status =
+                            Some(Ok(format!("Done: {}. New sandboxes have the change.", names.join(", ")).into()));
+                    }
+                    Err(err) => this.golden_refresh_status = Some(Err(format!("Refresh failed: {err:#}").into())),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     /// Save the git name and email sandbox commits carry to the database.
     /// Both are required: a bad value is shown, and the stored one stays.
     fn save_git_identity(&mut self, cx: &mut Context<Self>) {
@@ -1501,6 +1588,8 @@ impl SettingsView {
             | SettingField::SandboxDefaultImage
             | SettingField::SandboxGitName
             | SettingField::SandboxGitEmail
+            | SettingField::SandboxCommandRedirects
+            | SettingField::SandboxGoldenRefresh
             | SettingField::SandboxClaudeToken
             | SettingField::SandboxClaudeGetToken
             | SettingField::SandboxClaudeClear => {}
@@ -1575,6 +1664,7 @@ impl SettingsView {
                 editor.update(cx, |e, cx| e.focus(window, cx));
             }
             field if self.text_input(field).is_some() => self.enter_text_edit(field, window, cx),
+            SettingField::SandboxGoldenRefresh => self.refresh_goldens(cx),
             SettingField::SandboxClaudeGetToken => {
                 self.get_claude_token(crate::ui::journey::Source::Keyboard, cx)
             }
@@ -2622,6 +2712,44 @@ impl SettingsView {
                     &self.git_email_input,
                     theme,
                 ))
+                .child(text_input_row(
+                    cx,
+                    self,
+                    SettingField::SandboxCommandRedirects,
+                    "Command redirects",
+                    "Commands agents in your cloud sandboxes are turned away from, each with what to run instead: `db-query=/usr/local/bin/db-query; other=/path`. A project's own scripts and skills may name a command that cannot work in a sandbox; this overrides them without the project knowing, and is set up in the sandbox's user-level Claude settings. It reaches only sandboxes made from a refreshed golden.",
+                    &self.command_redirects_input,
+                    theme,
+                ))
+                .child(claude_button_row(
+                    cx,
+                    self,
+                    SettingField::SandboxGoldenRefresh,
+                    if self.golden_refresh_running { "Refreshing…" } else { "Refresh golden sandboxes" },
+                    "Makes each repository's golden sandbox again so new sandboxes get what changed here. Sandboxes already made keep their golden's copy; a node's own sandbox catches up the next time it is idle at launch.",
+                    self.golden_refresh_offered,
+                    self.golden_refresh_running || !self.goldens_exist,
+                    theme,
+                    |this, cx| this.refresh_goldens(cx),
+                ))
+                .when_some(self.golden_refresh_status.clone(), |el, status| {
+                    let (color, text) = match status {
+                        Ok(text) => (theme.muted_foreground, text),
+                        Err(text) => (theme.danger, text),
+                    };
+                    el.child(
+                        div()
+                            .px_3()
+                            .text_sm()
+                            .text_color(color)
+                            .child(crate::ui::selectable_text::selectable_text(
+                                "settings-golden-refresh-status",
+                                text,
+                                window,
+                                cx,
+                            )),
+                    )
+                })
                 .when_some(self.sandbox_status.clone(), |el, status| {
                     let (color, text) = match status {
                         Ok(text) => (theme.muted_foreground, text),

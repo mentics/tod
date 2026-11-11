@@ -918,7 +918,7 @@ fn make_sandbox(
 
     let repo = host.node_repo(fleet, node_id)?;
     let creds = node_proxy_credentials(fleet, &sandboxes, &bx, node_id, progress)?;
-    let node_files = host.node_files()?;
+    let node_files = host.node_files(fleet.paths().root())?;
     let source = dev.sandbox_from.source();
     let agent = host.supervisor_agent();
     // What the golden is: named only for a fork, and resolved before the

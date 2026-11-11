@@ -76,6 +76,14 @@ pub struct Account {
     /// (`forwards = ["5432=db.internal:5432"]`); see [`Forward`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub forwards: Vec<String>,
+    /// Commands an agent in a node's sandbox is turned away from, and what to
+    /// run instead (`command_redirects = ["db-query=/usr/local/bin/db-query"]`);
+    /// see [`CommandRedirect`]. Installed in the sandbox's user-level Claude
+    /// settings, so it holds even where the project's own hooks and skills
+    /// say otherwise; only a sandbox made (or a golden refreshed) after a
+    /// change has it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub command_redirects: Vec<String>,
     /// One golden per repository (`[blaxel.goldens]`, `"owner/name" =
     /// "sandbox"`): the sandbox the name [`GOLDEN`] stands for when a node
     /// of that repository forks it. Repositories are normalized
@@ -90,6 +98,40 @@ pub struct Account {
     /// nodes forked from it keep a clean lineage (see `doc/runner-menu/design.md`).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub golden_sources: BTreeMap<String, String>,
+}
+
+/// A command an agent is turned away from in a node's sandbox, and the one to
+/// run instead: `COMMAND=PATH` (`db-query=/usr/local/bin/db-query`). The
+/// command is a bare name; the path is absolute. Only plain characters, since
+/// both go into a shell script.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandRedirect {
+    pub command: String,
+    pub path: String,
+}
+
+impl CommandRedirect {
+    pub fn parse(spec: &str) -> Result<Self> {
+        let (command, path) = spec
+            .split_once('=')
+            .with_context(|| format!("command redirect {spec:?}: expected COMMAND=/absolute/path"))?;
+        let (command, path) = (command.trim(), path.trim());
+        let plain = |c: char| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '/');
+        anyhow::ensure!(
+            !command.is_empty() && command.chars().all(|c| plain(c) && c != '/' && c != '.'),
+            "command redirect {spec:?}: the command is a bare name of letters, digits, - and _"
+        );
+        anyhow::ensure!(
+            path.starts_with('/') && path.chars().all(plain),
+            "command redirect {spec:?}: the path to run instead is absolute, of letters, digits, / . - and _"
+        );
+        Ok(Self { command: command.into(), path: path.into() })
+    }
+
+    /// Parses a whole list; empty entries are skipped.
+    pub fn parse_all<S: AsRef<str>>(specs: &[S]) -> Result<Vec<Self>> {
+        specs.iter().map(|s| s.as_ref().trim()).filter(|s| !s.is_empty()).map(Self::parse).collect()
+    }
 }
 
 /// A port in a sandbox that reaches `host:port` from this machine: a
@@ -181,6 +223,12 @@ impl Config {
         let before = self.databases.len();
         self.databases.retain(|d| d.name != name);
         self.databases.len() != before
+    }
+
+    /// The configured `command_redirects`, each checked.
+    pub fn command_redirects(&self) -> Result<Vec<CommandRedirect>> {
+        let specs: &[String] = self.blaxel.as_ref().map_or(&[], |a| &a.command_redirects);
+        CommandRedirect::parse_all(specs).context("command_redirects")
     }
 
     /// The configured `forwards` (a database's own forward is opened by the
@@ -282,6 +330,7 @@ impl Account {
             node_base: None,
             retired_golden: None,
             forwards: Vec::new(),
+            command_redirects: Vec::new(),
             goldens: BTreeMap::new(),
             golden_sources: BTreeMap::new(),
         }
@@ -459,7 +508,7 @@ impl Config {
                 }
                 field!(
                     workspace, region, auth, default_image, memory_mb, owner, claude_token_via, orchestrator,
-                    orchestrator_volume, node_base, forwards
+                    orchestrator_volume, node_base, forwards, command_redirects
                 );
                 for (repo, g) in &m.goldens {
                     if b.goldens.get(repo) != Some(g) {
@@ -509,6 +558,17 @@ impl Config {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn command_redirects_parse_and_refuse_what_a_shell_script_would_misread() {
+        use super::CommandRedirect;
+        let r = CommandRedirect::parse(" db-query = /usr/local/bin/db-query ").unwrap();
+        assert_eq!((r.command.as_str(), r.path.as_str()), ("db-query", "/usr/local/bin/db-query"));
+        for bad in ["db-query", "=/x", "a b=/x", "a;b=/x", "db-query=relative", "x=/a;rm", "x=/a b", "a/b=/x", "a.b=/x"] {
+            assert!(CommandRedirect::parse(bad).is_err(), "{bad}");
+        }
+        assert_eq!(CommandRedirect::parse_all(&["", "a=/b"]).unwrap().len(), 1);
+    }
+
     use super::*;
 
     #[test]
@@ -620,6 +680,7 @@ claude_token_via = \"env\"
             node_base: Some("base".into()),
             retired_golden: None,
             forwards: vec![],
+            command_redirects: vec![],
             goldens: BTreeMap::new(),
             golden_sources: Default::default(),
         });

@@ -25,8 +25,8 @@ pub const STAMPS_FILE: &str = "cloud-install-stamps.json";
 
 /// A hash of everything a node's sandbox is given by [`ensure_supervisor`]
 /// that runs there: the Linux binaries and the bundles.
-pub fn install_stamp() -> Result<String> {
-    Ok(install()?.stamp)
+pub fn install_stamp(root: &Path) -> Result<String> {
+    Ok(install(root)?.stamp)
 }
 
 /// What a sandbox is given: the [`install_stamp`] and, per file the sandbox
@@ -88,8 +88,8 @@ pub fn install_of(relay: &[u8], supervisor: Option<&[u8]>, tod_cli: Option<&[u8]
 }
 
 /// The [`Install`] this machine would give a node's sandbox now.
-pub fn install() -> Result<Install> {
-    Ok(install_files()?.install())
+pub fn install(root: &Path) -> Result<Install> {
+    Ok(install_files(root)?.install())
 }
 
 /// The files this machine gives a sandbox, read from disk: the stamp
@@ -109,7 +109,7 @@ impl InstallFiles {
 }
 
 /// Reads [`InstallFiles`] from where this build keeps them.
-pub fn install_files() -> Result<InstallFiles> {
+pub fn install_files(root: &Path) -> Result<InstallFiles> {
     let relay_path = tod_store::fleet::sandbox::relay_path()?;
     let dir = relay_path.parent().context("the sandbox binaries' directory")?;
     let relay = std::fs::read(&relay_path).with_context(|| format!("read {}", relay_path.display()))?;
@@ -119,6 +119,10 @@ pub fn install_files() -> Result<InstallFiles> {
         "media",
     )?);
     bundles.extend(tod_sandbox::node::bundle_files(crate::skills::SkillsPaths::discover()?.root(), "skills")?);
+    // The user's command redirects (Settings -> Cloud sandboxes) are part of
+    // what a sandbox is given, so changing them makes an install stale.
+    let config = tod_sandbox::config::Config::load(&root.join(tod_sandbox::config::FILE_NAME))?;
+    bundles.extend(tod_sandbox::node::redirect_bundle(&config.command_redirects()?));
     Ok(InstallFiles {
         relay,
         supervisor: tod_sandbox::node::supervisor_from(dir),
@@ -248,7 +252,7 @@ pub fn stale_rows(
 /// read a node's heartbeat is an error, not taken for idle.
 pub fn stale(fleet: &FleetStore, rows: &[CloudNodeRow]) -> Result<(Vec<CloudNodeRow>, String)> {
     let root = fleet.paths().root().to_path_buf();
-    let current = install_stamp()?;
+    let current = install_stamp(&root)?;
     let now = tod_store::outline::uuid_blob::now_ms();
     let mut busy = std::collections::HashSet::new();
     for row in rows {
@@ -288,7 +292,7 @@ fn check_disk(root: &Path, row: &CloudNodeRow) -> Result<()> {
 pub fn reinstall(fleet: &FleetStore, row: &CloudNodeRow, current: &str) -> Result<()> {
     let root = fleet.paths().root().to_path_buf();
     let id = row.node_id.to_string();
-    let now = install()?;
+    let now = install(&root)?;
     if now.stamp != current {
         tracing::info!("cloud: {id}: the sandbox binaries changed again since the check; installing the newest");
     }
