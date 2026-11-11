@@ -50,8 +50,8 @@ from Blaxel.
   the stay, clean ones included, and a review is owed on every new PR head
   (merge of main, CI fix, answering a bot), so ordinary progress used up the
   rounds. The message claimed problems the stop list did not have.
-- **Fix**: only consecutive unclean reviews count; never stop with nothing
-  standing. (in progress)
+- **Fix**: only consecutive unclean reviews count
+  (`pr_draft_review::unconverged_rounds`); never stop with nothing standing.
 - **Measure**: rounds per stay vs. findings per round; a stop whose standing
   list is empty.
 
@@ -64,8 +64,9 @@ from Blaxel.
 - **Cause**: `prepare_sandbox_checkout` fetched only the superproject; the
   submodules (flagship, kb, ui) never learned `origin/<branch>`, so the branch
   was created at the pinned commit.
-- **Fix**: fetch the node's branch in each submodule before branching. (in
-  progress)
+- **Fix**: each submodule fetches `origin/<branch>` before branching; a
+  local branch behind it is fast-forwarded, a diverged one is an error
+  (`worktree::sync_branch_with_origin`).
 - **Measure**: a check after setup that each submodule's branch contains
   `origin/<branch>`.
 
@@ -82,6 +83,28 @@ from Blaxel.
 - **Fix**: node sandboxes carry `keep-when-idle=true`; tod deletes them at
   `done` (`sandbox_retire`).
 - **Measure**: replacements per node per day.
+
+### Agents in a sandbox cannot query the database
+
+- **Seen**: 5+ requests to the user (remediate-stale-primary ×2,
+  editing-a-linked-org-part, nightly-auto-dedup, retract-manufacturer), all
+  `db-query: aws CLI not found`.
+- **Cause**: the workspace repo tells agents to use its `db-query`, which
+  needs the aws CLI and an SSO session; a sandbox has neither. tod's brokered
+  `tod-cli db` was not in the phase agents' or evaluator's context.
+- **Fix**: a `db-query` shim in every node sandbox routes `prod-platform` /
+  `prod-kb` through `tod-cli db run` (read only, same limits); `cli/db` is in
+  the phase and evaluate recipes.
+- **Measure**: requests whose text contains a tool error, by error.
+
+### Requests to the user are hard to read
+
+- **Seen**: most requests (user's report).
+- **Symptom**: dense run-on text, bare ids, unclear what to do, long options.
+- **Fix**: "Wording a request" in `stance/autonomous-session.md` (imperative
+  first line, background after, ids explained, short options with
+  consequences, recommended first); app stop texts reworded.
+- **Measure**: request length; answers that pick the first option.
 
 ### Bot review keeps finding new things (PR stuck)
 

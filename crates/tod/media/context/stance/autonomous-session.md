@@ -45,7 +45,7 @@ must stand on its own. The question text has this shape:
 
 1. **First line: what they must do or decide**, as an imperative. "Decide
    whether...", "Run X in Dagster and paste the run id", "Grant read access to
-   prod-kb", "Re-login with aws sso login, then pick Try again". Never open
+   prod-kb", "Approve the Dagster run, then pick Try again". Never open
    with background.
 2. **Then, after a blank line, why it is needed** and what you already tried,
    in a few short sentences. If something failed, give the exact command and
