@@ -67,6 +67,15 @@ bake <base-image> [--name IMAGE-NAME] [--agents] [--repo URL[=DIR]]...
                          repositories cloned into it (https, no credentials;
                          DIR defaults to /root/<name>).
 list                     Sandboxes in the workspace.
+cloudflare login [<app-url>...] | status | logout <host>
+                         Sign in (in your browser, with `cloudflared`) to apps behind
+                         Cloudflare Access, e.g. https://dagster.cofactr.com, so
+                         nodes in the cloud reach them as you: each app's token is
+                         kept encrypted here and added by each sandbox's proxy,
+                         never given to an agent. Cloudflare issues one token per
+                         app, so each is signed in to by name; with no URL, `login`
+                         renews every app already signed in to. A token lasts the
+                         app's Access session duration; `status` shows when.
 database add <name> --host H --user U --dbname D --region R [--profile P]
       [--port 5432] [--sandbox-port 15432] [--check]
 database list | remove <name> | test <name>
@@ -241,6 +250,7 @@ fn run() -> Result<i32> {
         "fork" => fork(&mut ctx, args),
         "golden" => golden(&mut ctx, args),
         "database" => database(&mut ctx, args),
+        "cloudflare" => cloudflare(&mut ctx, args),
         "ensure" => {
             let install = args.flag("--install");
             let name = args.positional("sandbox name")?;
@@ -417,6 +427,70 @@ fn create(ctx: &mut Ctx, mut args: Args) -> Result<i32> {
     ctx.create(&name, &NewSandboxSource::Image(image), agents, true, &mut |m| eprintln!("{m}"))?;
     println!("{name}: ready. Open it with `tod-sandbox zed {name}` or `tod-sandbox shell {name}`.");
     Ok(0)
+}
+
+/// `cloudflare login|status|logout`: apps behind Cloudflare Access that cloud
+/// nodes reach as the user (`tod_store::cloudflare_access`).
+fn cloudflare(ctx: &mut Ctx, mut args: Args) -> Result<i32> {
+    use tod_store::cloudflare_access as cf;
+    if args.0.is_empty() {
+        bail!("usage: tod-sandbox cloudflare login <app-url> | status | logout <host>");
+    }
+    let verb = args.0.remove(0);
+    let store = ctx.credentials();
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs() as i64;
+    let show = |s: &cf::AppStatus| match s.expires_at {
+        Some(_) if s.expired(now) => format!("{}: EXPIRED (sign in again with `tod-sandbox cloudflare login https://{}`)", s.host, s.host),
+        Some(e) => format!("{}: signed in, expires in {}h {}m", s.host, (e - now) / 3600, (e - now) % 3600 / 60),
+        None => format!("{}: signed in (no expiry in the token)", s.host),
+    };
+    match verb.as_str() {
+        "login" => {
+            let apps = std::mem::take(&mut args.0);
+            let results: Vec<(String, anyhow::Result<cf::AppStatus>)> = if apps.is_empty() {
+                let all = cf::login_all(&store);
+                if all.is_empty() {
+                    bail!("not signed in to any app yet: give the URL, e.g. `tod-sandbox cloudflare login https://dagster.cofactr.com`");
+                }
+                all
+            } else {
+                apps.into_iter().map(|a| (a.clone(), cf::login(&store, &a))).collect()
+            };
+            let mut failed = 0;
+            for (app, r) in &results {
+                match r {
+                    Ok(s) => println!("{}", show(s)),
+                    Err(e) => {
+                        failed += 1;
+                        eprintln!("{app}: {e:#}");
+                    }
+                }
+            }
+            println!("New sandboxes get it; a running node's sandbox picks it up the next time tod syncs its credentials.");
+            Ok(i32::from(failed > 0))
+        }
+        "status" => {
+            args.done()?;
+            let all = cf::status(&store);
+            if all.is_empty() {
+                println!("(none) sign in with `tod-sandbox cloudflare login https://<app>`");
+            }
+            for s in &all {
+                println!("{}", show(s));
+            }
+            Ok(0)
+        }
+        "logout" => {
+            let host = cf::app_host(&args.positional("app host")?)?;
+            args.done()?;
+            if !cf::remove(&store, &host) {
+                bail!("not signed in to {host}");
+            }
+            println!("{host}: signed out.");
+            Ok(0)
+        }
+        other => bail!("unknown cloudflare command {other:?}; use login, status, or logout"),
+    }
 }
 
 /// `database add|list|remove|test`: what a cloud node may log in to through
