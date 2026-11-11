@@ -84,4 +84,4 @@ Good:
 Options (each its own `--option`, not part of the question text):
 
 1. "Ship now, measure after rollout (recommended): both stay unchecked"
-2. "Send back to implementation: the node fails verification now"
+2. "Send back to implementation: the task fails verification now"
