@@ -40,7 +40,7 @@ from Blaxel.
 
 ### basedpyright check killed for memory in node sandboxes
 
-- **Seen**: 3 nodes (ENG-2680, ENG-3055, ENG-2927), 2026-11-11; any node whose
+- **Seen**: 4 nodes (ENG-2680, ENG-3055, ENG-2927, ENG-2923), 2026-11-11; any node whose
   pr_draft or review checks include flagship's basedpyright.
 - **Symptom**: the check fails with no output (exit 247 or nothing after
   `uv sync`); the agent files "give the sandbox more memory".
