@@ -31,6 +31,31 @@ turns, findings, run_state, node_timeline, journey records):
 
 ---
 
+## 2026-11-11: overnight stops
+
+### PR babysitter counts housekeeping as rounds ("PR stuck")
+
+- **Seen**: 3 nodes (ENG-2228, ENG-2927, ENG-3055), on the night of 2026-11-10/11. CI was green on all of them, and Greptile scored them 4/5 to 5/5.
+- **Symptom**: the node stopped with `pr_stuck` after hitting `max_rounds` (4).
+- **Cause**: rounds were every PR agent turn since the run started. Merging main, resolving a conflict, and asking a bot to review a new head all used up the cap.
+- **Fix**: b23d8034. Only a turn on feedback is a round (`Work::is_feedback`: threads, failing checks, low score, changes requested, review comments). The count resets when the PR is clear or waiting for a person.
+- **Measure**: PR turns per stay, split by the kind of work.
+
+### Review of a PR change counts clean reviews ("not converging")
+
+- **Seen**: 4 nodes (ENG-3067 10 rounds, ENG-3095 10, ENG-3193 10, ENG-2923 7). ENG-3193's last review was clean.
+- **Cause**: `pr_change_reviewed` counted every review since the change was made (`reviews_since(..).len()`). The fix of 2026-11-10 covered only the own-review path.
+- **Fix**: b23d8034. Both paths now share `unconverged_rounds_since`, which counts only consecutive unclean reviews.
+- **Measure**: a stop whose standing list is empty, or whose last review was clean.
+
+### Another build refreshes the shared golden, which blocks Start
+
+- **Seen**: 2026-11-11. All 7 stopped nodes are blocked.
+- **Symptom**: "The golden sandbox for cofactr/workspace was refreshed by a newer tod (install cc0ea2cf…); this tod is older".
+- **Cause**: another session's build, which is not on main, refreshed the one golden every root shares. Main's build then refuses to fork from it.
+- **Fix**: open. The install stamp says which is newer, not which build is on main.
+- **Measure**: golden refreshes by install stamp; Start refusals for this reason.
+
 ## 2026-11-10 — first pass over the 12 `pr_draft` nodes
 
 Starting state (live root): 12 nodes in `pr_draft`; 8 stopped
