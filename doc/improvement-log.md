@@ -56,6 +56,12 @@ turns, findings, run_state, node_timeline, journey records):
 - **Fix**: open. The install stamp says which is newer, not which build is on main.
 - **Measure**: golden refreshes by install stamp; Start refusals for this reason.
 
+### Waiting for the user to mark ready misses a new conflict
+
+- **Seen**: 1 node (ENG-3093, 2026-11-11). It waited on "flagship#6641 to be marked ready" while GitHub showed the PR as `CONFLICTING`.
+- **Cause**: open. The node may only have been stopped, since its sandbox was pruned. Otherwise the long wait for a person does not look at mergeability again.
+- **Measure**: nodes waiting for a person whose PR is not mergeable.
+
 ## 2026-11-10 — first pass over the 12 `pr_draft` nodes
 
 Starting state (live root): 12 nodes in `pr_draft`; 8 stopped
@@ -87,6 +93,9 @@ from Blaxel.
 - **Seen again**: ENG-2157 (2026-11-11), this time the ui `tsc` check, which runs with
   `--max-old-space-size=6144`. It was killed at 3.3 GB RSS, with about 3.4 GB free
   next to the dev servers. It is the same kind of problem and is not fixed yet.
+  Measured: at 2048 MB tsc runs out of V8 heap after 46 s, and at 3072 MB the kernel kills it
+  (available memory fell to 21 MB). So a smaller heap cannot fix it. It needs memory freed
+  (the dev servers stopped while it runs) or a smaller tsc footprint.
 - **Measure**: check failures with no output, or exit 137/247, per check.
 
 ### Agent-made git worktrees hide the work
