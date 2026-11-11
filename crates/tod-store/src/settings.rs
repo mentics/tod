@@ -253,7 +253,10 @@ pub struct PrReadinessSettings {
     /// Rounds on one review thread before the babysitter hands it to the user.
     #[serde(default = "default_max_thread_rounds")]
     pub max_thread_rounds: u32,
-    /// Fix-and-push rounds on the whole PR before the babysitter stops.
+    /// Consecutive rounds of feedback on the change (open threads, failing
+    /// checks, a low score, requested changes) before the babysitter stops.
+    /// Merging the base in and asking a bot to review again are not rounds,
+    /// and the count starts over when the PR is clear or waits for a person.
     #[serde(default = "default_max_rounds")]
     pub max_rounds: u32,
     /// When the babysitter looks again at a pull request waiting for a

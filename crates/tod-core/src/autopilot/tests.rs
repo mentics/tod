@@ -1689,6 +1689,150 @@ fn a_pull_request_that_never_changes_stops_for_a_person() {
     );
 }
 
+/// What a pull request shows on one agent turn of [`Scripted`].
+#[derive(Clone, Copy)]
+enum Look {
+    /// Main moved: the branch is behind (housekeeping).
+    Behind,
+    /// The head changed and the bot has not reviewed it (housekeeping).
+    BotMissing,
+    /// One open review thread (feedback).
+    Thread,
+    /// Nothing for the agent; only a person's review is missing.
+    HumanReview,
+}
+
+/// A pull request that looks as a script says, one entry per agent turn
+/// since the script was set; the head is new on every turn, so no turn
+/// leaves it as it was.
+struct Scripted {
+    turns: Arc<std::sync::atomic::AtomicUsize>,
+    script: std::sync::Mutex<(Vec<Look>, usize)>,
+}
+
+impl Scripted {
+    fn new(turns: Arc<std::sync::atomic::AtomicUsize>, script: Vec<Look>) -> Arc<Self> {
+        Arc::new(Self { turns, script: std::sync::Mutex::new((script, 0)) })
+    }
+
+    /// From the next turn on, look as `script` says.
+    fn restart(&self, script: Vec<Look>) {
+        *self.script.lock().unwrap() = (script, self.turns.load(std::sync::atomic::Ordering::SeqCst));
+    }
+}
+
+impl crate::pr_readiness::PrFeed for Scripted {
+    fn snapshot(&self, _: &tod_store::github::NodePr) -> Result<tod_store::github::PrSnapshot, String> {
+        use tod_store::github::{IssueComment, PrSnapshot, PrStatus, ReviewThread};
+        let turns = self.turns.load(std::sync::atomic::Ordering::SeqCst);
+        let (script, base) = &*self.script.lock().unwrap();
+        let look = script.get(turns - base).copied().unwrap_or(Look::HumanReview);
+        let bot_reviewed = !matches!(look, Look::BotMissing);
+        let comments = if bot_reviewed {
+            vec![IssueComment {
+                id: 2,
+                author: Some("greptile-apps".into()),
+                body: "Confidence Score: 5/5\n".into(),
+                created_at: "2021-01-01T00:00:00Z".into(),
+                updated_at: "2021-01-01T00:00:00Z".into(),
+            }]
+        } else {
+            Vec::new()
+        };
+        let behind = matches!(look, Look::Behind);
+        Ok(PrSnapshot {
+            status: PrStatus {
+                mergeable: Some(true),
+                mergeable_state: Some(if behind { "behind" } else { "blocked" }.into()),
+                behind_by: Some(if behind { 3 } else { 0 }),
+                checks: Some("success".into()),
+                head_sha: Some(format!("{:07}", turns + 1)),
+                head_committed_at: Some("2020-01-01T00:00:00Z".into()),
+                open: true,
+                reviewers: vec!["maria".into()],
+                base_ref: Some("main".into()),
+                ..Default::default()
+            },
+            threads: if matches!(look, Look::Thread) {
+                vec![ReviewThread {
+                    id: format!("PRRT_{turns}"),
+                    resolved: false,
+                    outdated: false,
+                    path: Some("src/a.rs".into()),
+                    line: Some(1),
+                    comments: vec![],
+                }]
+            } else {
+                Vec::new()
+            },
+            comments,
+            reviews: vec![],
+        })
+    }
+}
+
+/// A node in `pr_review` on a scripted pull request, two rounds allowed.
+fn scripted_pr(script: Vec<Look>) -> (Fixture, Arc<Scripted>, FakeAgent) {
+    let fx = bare();
+    retire_outside_criteria(&fx);
+    std::fs::write(
+        fx.root.join("tod.yml"),
+        "pr_readiness:\n  max_rounds: 2\n  bots:\n    - name: greptile\n      rerun_after_minutes: 0\n",
+    )
+    .unwrap();
+    let turns = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let feed = Scripted::new(turns.clone(), script);
+    crate::pr_readiness::set_feed_override(Some(feed.clone()));
+    linked_to_prs(&fx, "pr_review", &["https://github.com/acme/app/pull/42"]);
+    let mut agent = FakeAgent::new(&fx.fleet);
+    agent.shared_turns = Some(turns);
+    (fx, feed, agent)
+}
+
+/// Seen live: merges of main and asks for a bot's review used up the rounds
+/// of pull requests that were converging, and three nodes stopped.
+#[test]
+fn rounds_of_housekeeping_do_not_stop_the_babysitter() {
+    use Look::*;
+    let (fx, _, mut agent) = scripted_pr(vec![Behind, BotMissing, Behind, BotMissing, Behind, BotMissing]);
+    let mut pilot = autopilot(&fx, Budget::default()).with_pr_poll_interval(Duration::ZERO);
+    let outcome = pilot.run(&fx.fleet, &mut agent).unwrap();
+    assert!(matches!(outcome, Outcome::Waiting { .. }), "{outcome:?}");
+    assert_eq!(agent.turns, 6);
+    assert_eq!(pilot.state().loops.pr_rounds, 0);
+}
+
+#[test]
+fn consecutive_rounds_of_feedback_still_stop_the_babysitter() {
+    use Look::*;
+    let (fx, _, mut agent) = scripted_pr(vec![Thread, Behind, Thread, Thread]);
+    let mut pilot = autopilot(&fx, Budget::default()).with_pr_poll_interval(Duration::ZERO);
+    let outcome = pilot.run(&fx.fleet, &mut agent).unwrap();
+    assert!(
+        matches!(&outcome, Outcome::NeedsHuman { reason: NeedsHuman::PrStuck { .. } }),
+        "{outcome:?}"
+    );
+    // Two rounds of feedback, with a merge between them that is not one.
+    assert_eq!(agent.turns, 3);
+    assert_eq!(pilot.state().loops.pr_rounds, 2);
+}
+
+#[test]
+fn a_pull_request_waiting_for_a_person_starts_the_count_again() {
+    use Look::*;
+    let (fx, feed, mut agent) = scripted_pr(vec![Thread, HumanReview]);
+    let mut pilot = autopilot(&fx, Budget::default()).with_pr_poll_interval(Duration::ZERO);
+    let outcome = pilot.run(&fx.fleet, &mut agent).unwrap();
+    assert!(matches!(outcome, Outcome::Waiting { .. }), "{outcome:?}");
+    assert_eq!(pilot.state().loops.pr_rounds, 0);
+    // The person's review brings two more rounds: three in all, two together.
+    feed.restart(vec![Thread, Thread, HumanReview]);
+    let mut pilot = autopilot(&fx, Budget::default()).with_pr_poll_interval(Duration::ZERO);
+    let outcome = pilot.run(&fx.fleet, &mut agent).unwrap();
+    assert!(matches!(outcome, Outcome::Waiting { .. }), "{outcome:?}");
+    assert_eq!(agent.turns, 3);
+}
+
 /// GitHub after the review: whether the pull request is merged yet, and the
 /// notes of the one release (if any) published since.
 struct AfterReview {
@@ -3043,6 +3187,54 @@ fn clean_reviews_of_new_heads_never_count_toward_the_round_limit() {
     assert!(reviews > REVIEW_ROUND_LIMIT as usize, "{reviews} reviews, {outcome:?}");
     assert!(!matches!(outcome, Outcome::NeedsHuman { reason: NeedsHuman::ReviewNotConverging { .. } }), "{outcome:?}");
     assert_eq!(fx.fleet.read(|conn| crate::pr_draft_review::unconverged_rounds(conn, fx.node)).unwrap(), 0);
+}
+
+/// A finished review of `pr_draft` that recorded nothing.
+fn seed_clean_review(fx: &Fixture) {
+    let id = Uuid::new_v4();
+    let conversation = |command| fx.fleet.interview(ACTOR_USER, command).unwrap();
+    conversation(InterviewCommand::CreateConversation {
+        id,
+        focus: Focus::Node(fx.node),
+        protocol: ProtocolKind::Review,
+        platform: None,
+        model: None,
+        effort: None,
+    });
+    conversation(InterviewCommand::SetConversationTransition {
+        conversation_id: id,
+        from_state: "pr_draft".into(),
+        to_state: "pr_review".into(),
+    });
+    conversation(InterviewCommand::RecordConversationReport {
+        conversation_id: id,
+        body: crate::conversation::review::done_report(),
+    });
+    std::thread::sleep(Duration::from_millis(3));
+}
+
+/// Seen live: a node stopped at "10 rounds" of reviewing one change when the
+/// latest review was clean and the one before had a single fixed finding.
+#[test]
+fn clean_reviews_of_a_change_do_not_count_toward_its_round_limit() {
+    let fx = setup();
+    retire_outside_criteria(&fx);
+    with_pr_draft_review(&fx);
+    linked_to_prs(&fx, "pr_draft", &["https://github.com/acme/app/pull/42"]);
+    let made_at = chrono::Utc::now().timestamp_millis();
+    std::thread::sleep(Duration::from_millis(3));
+    for _ in 0..2 * REVIEW_ROUND_LIMIT {
+        seed_clean_review(&fx);
+    }
+    seed_unclean_review(&fx, 0);
+    let since = |ms| fx.fleet.read(|conn| crate::pr_draft_review::unconverged_rounds_since(conn, fx.node, ms)).unwrap();
+    let every = fx.fleet.read(|conn| crate::pr_draft_review::reviews_since(conn, fx.node, made_at)).unwrap().len();
+    assert!(every > REVIEW_ROUND_LIMIT as usize, "the old count would have stopped: {every}");
+    assert_eq!(since(Some(made_at)), 1);
+    assert_eq!(since(None), 1);
+    // A clean review last: nothing is unconverged.
+    seed_clean_review(&fx);
+    assert_eq!(since(Some(made_at)), 0);
 }
 
 /// A finished review of `pr_draft` that recorded one finding the fixer

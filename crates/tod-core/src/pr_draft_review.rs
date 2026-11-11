@@ -82,12 +82,19 @@ pub fn latest_review(conn: &Connection, node: Uuid) -> Result<Option<Conversatio
 /// fix, an answer to a bot) and clean ones prove convergence, not the
 /// opposite. A review's round is its findings up to the next review.
 pub fn unconverged_rounds(conn: &Connection, node: Uuid) -> Result<u32> {
+    unconverged_rounds_since(conn, node, None)
+}
+
+/// [`unconverged_rounds`] over only the reviews started at or after
+/// `since_ms` (the review of one change, [`reviews_since`]), counted the same
+/// way so the two cannot drift.
+pub fn unconverged_rounds_since(conn: &Connection, node: Uuid, since_ms: Option<i64>) -> Result<u32> {
     let since = PhaseRepo::new(conn).stay_started_at(node)?;
     let repo = ConversationRepo::new(conn);
     let mut reviews: Vec<Conversation> = repo
         .conversations_for_focus(Focus::Node(node))?
         .into_iter()
-        .filter(|c| c.skill_group == 0 && is_own(c, since))
+        .filter(|c| c.skill_group == 0 && is_own(c, since) && since_ms.is_none_or(|ms| c.created_at >= ms))
         .collect();
     reviews.sort_by_key(|c| c.created_at);
     let findings = own_findings(conn, node)?;

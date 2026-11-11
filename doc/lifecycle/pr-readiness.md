@@ -404,8 +404,12 @@ Where the code differs from the design above:
 - **Rounds are approximate.** Replies carry no marker, so rounds on a thread
   are estimated as its comments divided by two (`pr_readiness::rounds`); the
   aim is only to stop a loop that never settles. Rounds on
-  the PR are the agent turns of its conversation since the run began counting
-  (`AutopilotState::pr_turns_base`, reset by renewing the budget). Both limits
+  the PR are consecutive agent turns on feedback about the change itself (open
+  threads, failing checks, a low score, requested changes, review comments:
+  `Work::is_feedback`); merging the base in or asking a bot to review the new
+  head is housekeeping and not a round. The count
+  (`AutopilotState::loops.pr_rounds`) starts over when the PR is clear or
+  waits for a person's review, and when the budget is renewed. Both limits
   are `pr_readiness.max_thread_rounds` / `max_rounds`.
 - **One loop.** The pull request protocol (`conversation::pr`) loops only
   in `pr`, until the draft is certified; in `pr_draft` and `pr_review` it

@@ -52,10 +52,6 @@ pub struct AutopilotState {
     pub steps: Vec<StepRecord>,
     /// How the last run stopped; `None` while one runs.
     pub outcome: Option<Outcome>,
-    /// The pull request conversation's agent turns when rounds on it began
-    /// to count (`doc/lifecycle/pr-readiness.md`); `None` until the first.
-    #[serde(default)]
-    pub pr_turns_base: Option<u32>,
     /// The user asked for the next run's agent to start a new session
     /// instead of continuing or reopening one; the run clears it as it
     /// starts ([`super::Autopilot::new`]).
@@ -122,12 +118,13 @@ pub const CYCLE_LIMIT: u32 = 3;
 pub const REVIEW_ROUND_LIMIT: u32 = tod_store::settings::DEFAULT_REVIEW_ROUND_LIMIT;
 
 /// Everything that counts a loop the run is in. Sessions
-/// ([`AutopilotState::sessions`]) and the pull request's start
-/// ([`AutopilotState::pr_turns_base`]) stay beside it; this holds the rest,
+/// ([`AutopilotState::sessions`]) stays beside it; this holds the rest,
 /// so one place says how far each loop has gone.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LoopCounters {
-    /// Rounds of work on the pull request since they began to count.
+    /// Consecutive rounds of work on the pull request's feedback
+    /// ([`crate::pr_readiness::Work::is_feedback`]) that have not got it
+    /// clear; reset when it is clear or waits for a person.
     #[serde(default)]
     pub pr_rounds: u32,
     /// Evaluator rejections in the current stay in the state being judged.
@@ -214,7 +211,6 @@ impl AutopilotState {
             current: None,
             steps: Vec::new(),
             outcome: None,
-            pr_turns_base: None,
             fresh_session: false,
             loops: LoopCounters::default(),
             pending_groups: None,

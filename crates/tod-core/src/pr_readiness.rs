@@ -200,6 +200,24 @@ pub enum Work {
     ReviewComments(usize),
 }
 
+impl Work {
+    /// Whether this is feedback on the change itself, which makes a round
+    /// toward `max_rounds`. Merging the base in and asking a bot to review a
+    /// new head are housekeeping (a bot asked again after a low score is
+    /// feedback).
+    pub fn is_feedback(&self) -> bool {
+        match self {
+            Work::Threads(_)
+            | Work::FailingChecks
+            | Work::LowScore { .. }
+            | Work::ChangesRequested
+            | Work::ReviewComments(_) => true,
+            Work::BotReviewMissing { low_last_score, .. } => low_last_score.is_some(),
+            Work::Behind | Work::Conflict => false,
+        }
+    }
+}
+
 /// Something the babysitter can only wait for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Wait {

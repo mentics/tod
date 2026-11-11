@@ -475,11 +475,20 @@ impl Autopilot {
         self.state.active_ms = 0;
         self.state.active_since_ms = None;
         self.state.sessions = 0;
-        // Rounds on the pull request count from here: the user has seen why
-        // it stopped and wants it to go on.
-        self.state.pr_turns_base = None;
+        // Rounds on the pull request count from here (they are in `loops`):
+        // the user has seen why it stopped and wants it to go on.
         self.state.loops.clear();
         self.save()
+    }
+
+    /// The pull request has nothing left for the agent (clear, or waiting for
+    /// a person): the next feedback starts the count of rounds again.
+    fn reset_pr_rounds(&mut self) -> Result<()> {
+        if self.state.loops.pr_rounds != 0 {
+            self.state.loops.pr_rounds = 0;
+            self.save()?;
+        }
+        Ok(())
     }
 
     fn save(&mut self) -> Result<()> {
@@ -936,21 +945,6 @@ impl Autopilot {
         })
     }
 
-    /// Agent turns the node's pull request conversation has had.
-    fn pr_agent_turns(&self, fleet: &FleetStore) -> Result<u32> {
-        fleet.read(|conn| {
-            let repo = ConversationRepo::new(conn);
-            match repo.latest_for_focus_with_protocol(Focus::Node(self.node), ProtocolKind::Pr)? {
-                Some(c) => Ok(repo
-                    .turns(c.id)?
-                    .iter()
-                    .filter(|t| t.role == tod_store::conversation::TurnRole::Agent)
-                    .count() as u32),
-                None => Ok(0),
-            }
-        })
-    }
-
     /// The `blocked` reason the pull request's agent recorded, if its latest
     /// report is one.
     fn blocked_report(&self, fleet: &FleetStore) -> Result<Option<String>> {
@@ -1120,6 +1114,7 @@ impl Autopilot {
                     return Ok(None);
                 }
                 PrNext::Clear => {
+                    self.reset_pr_rounds()?;
                     self.clear_poll_waits(fleet)?;
                     hook.waiting(None, None);
                     if before_review {
@@ -1138,21 +1133,23 @@ impl Autopilot {
                     }
                     return Ok(None);
                 }
-                PrNext::Work(_) => {
+                PrNext::Work(works) => {
                     waited_since = None;
                     self.clear_poll_waits(fleet)?;
                     hook.waiting(None, None);
-                    let turns = self.pr_agent_turns(fleet)?;
-                    let base = *self.state.pr_turns_base.get_or_insert(turns);
                     // With the review steps on in `pr_draft`, the agent takes
                     // two turns a round: the change, then the push.
                     let reviewed = before_review && fleet.read(|conn| crate::pr_draft_review::enabled(conn, node))?;
-                    // The first turn opens the pull request: it is not a round.
-                    let rounds = turns.saturating_sub(base);
-                    let rounds = if reviewed { rounds.div_ceil(2) } else { rounds };
-                    self.state.loops.pr_rounds = rounds;
+                    // Only feedback on the change itself is a round; merging
+                    // the base in or asking a bot again is housekeeping.
+                    // Rounds the pull request has not got clear since, counted.
+                    let rounds = self.state.loops.pr_rounds;
                     if let Some(why) = crate::conversation::pr::pr_stuck(&live, &settings, rounds) {
                         return Ok(Some(Outcome::NeedsHuman { reason: NeedsHuman::PrStuck { why } }));
+                    }
+                    if works.iter().any(pr_readiness::Work::is_feedback) {
+                        self.state.loops.pr_rounds += 1;
+                        self.save()?;
                     }
                     let before = self.pr_report(fleet)?;
                     let fingerprint: Vec<String> = live.iter().map(|p| p.fingerprint.clone()).collect();
@@ -1201,6 +1198,9 @@ impl Autopilot {
                     let waits = short_waits(waits);
                     if waits.is_empty() {
                         hook.waiting(None, None);
+                        // Nothing is left for the agent: the next feedback
+                        // starts the count again.
+                        self.reset_pr_rounds()?;
                         if before_review {
                             // Ready for a person, once tod's own review (when
                             // the review steps are on) has nothing left: the
@@ -1414,7 +1414,9 @@ impl Autopilot {
                     }
                 }
                 ChangeStep::Review => {
-                    let rounds = fleet.read(|conn| pr_draft_review::reviews_since(conn, node, made_at))?.len() as u32;
+                    // Only consecutive reviews that did not come back clean count: a
+                    // clean one of an earlier head proves convergence.
+                    let rounds = fleet.read(|conn| pr_draft_review::unconverged_rounds_since(conn, node, Some(made_at)))?;
                     // A review the last run left unfinished is resumed, not a new round.
                     let resuming = self.state.current.as_ref().is_some_and(|c| {
                         c.protocol == protocol_name(ProtocolKind::Review) && c.lifecycle == pr_draft_review::STATE
