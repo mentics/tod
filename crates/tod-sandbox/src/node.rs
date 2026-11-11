@@ -55,6 +55,13 @@ pub const GITHUB_AUTH_ROUTED: &str = "routed";
 /// HTTP shim at `TOD_CLI_PATH`: the shim runs the nouns that reach GitHub
 /// with it (`tod_store::fleet::cli_relay::HTTP_SHIM_SCRIPT`).
 pub const LOCAL_CLI_PATH: &str = "/opt/tod/tod-cli-local";
+/// Where tod's `db-query` is installed in a node's sandbox
+/// (`assets/sandbox/db-query.sh`), linked as `/usr/local/bin/db-query`: the
+/// workspace's own script needs the aws CLI to sign a prod login, which a
+/// sandbox never has, so this one gets the login from `tod-cli db`.
+pub const DB_QUERY_PATH: &str = "/opt/tod/bin/db-query";
+/// The script installed at [`DB_QUERY_PATH`].
+pub const DB_QUERY_SHIM: &str = include_str!("../../../assets/sandbox/db-query.sh");
 /// The supervisor keeps its copy of the user's database in
 /// `<this>/<node>` (its default `--state-dir`).
 pub const SUPERVISOR_STATE_ROOT: &str = "/var/lib/tod-supervisor";
@@ -665,6 +672,7 @@ fn upload_tod_files(bx: &Blaxel, url: &str, payload: &NodePayload, progress: &mu
     }
     bx.upload_large(url, RELAY_PATH, payload.relay, "0755")?;
     bx.upload(url, TOD_CLI_PATH, payload.shim, "0755")?;
+    bx.upload(url, DB_QUERY_PATH, DB_QUERY_SHIM.as_bytes(), "0755")?;
     match payload.supervisor {
         Some(bytes) => bx.upload_large(url, SUPERVISOR_PATH, bytes, "0755")?,
         None => progress("warning: tod-supervisor is not built (target/sandbox/); the node will not run on its own"),
@@ -678,7 +686,7 @@ fn upload_tod_files(bx: &Blaxel, url: &str, payload: &NodePayload, progress: &mu
     let res = bx.run(
         url,
         &format!(
-            "mkdir -p {TOD_DIR}/bin && ln -sf {TOD_CLI_PATH} /usr/local/bin/tod-cli && {LOOPBACK_HOSTS} && printf '%s\\n' {} > {MANIFEST_PATH}.tmp && mv -f {MANIFEST_PATH}.tmp {MANIFEST_PATH}",
+            "mkdir -p {TOD_DIR}/bin && ln -sf {TOD_CLI_PATH} /usr/local/bin/tod-cli && ln -sf {DB_QUERY_PATH} /usr/local/bin/db-query && {LOOPBACK_HOSTS} && printf '%s\\n' {} > {MANIFEST_PATH}.tmp && mv -f {MANIFEST_PATH}.tmp {MANIFEST_PATH}",
             shell_quote(&node_manifest(payload.relay))
         ),
         30,
@@ -1187,6 +1195,106 @@ mod tests {
         assert_eq!(run_adapter_script(true, true), (0, false));
         assert_eq!(run_adapter_script(false, true), (0, true));
         assert_eq!(run_adapter_script(false, false), (3, false));
+    }
+
+    /// Runs the `db-query` shim with fake `tod-cli`, `psql` and a workspace
+    /// `db-query` on `PATH`; returns (exit code, stdout, stderr, calls made).
+    #[cfg(unix)]
+    fn run_db_query(tag: &str, args: &[&str], list: &str, psql_row: &str) -> (i32, String, String, String) {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("tod-dbq-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let bin = dir.join("bin");
+        let real = dir.join("workspace-bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(&real).unwrap();
+        let calls = dir.join("calls");
+        let script = |at: &std::path::Path, name: &str, body: &str| {
+            let p = at.join(name);
+            std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        let log = calls.display();
+        script(
+            &bin,
+            "tod-cli",
+            &format!(
+                "echo \"tod-cli $*\" >> {log}\nif [ \"$2\" = list ]; then printf '%s\\n' '{list}'; exit 0; fi\nshift 2; shift 1; [ \"$1\" = -- ] && shift; echo \"opts=$PGOPTIONS\" >> {log}; exec \"$@\""
+            ),
+        );
+        script(&bin, "psql", &format!("echo \"psql $*\" >> {log}\nprintf '%s\\n' '{psql_row}' 'Time: 2.5 ms'"));
+        script(&real, "db-query", &format!("echo \"real $*\" >> {log}"));
+        std::fs::write(bin.join("db-query"), DB_QUERY_SHIM).unwrap();
+        std::fs::set_permissions(bin.join("db-query"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = format!("{}:{}:{}", bin.display(), real.display(), std::env::var("PATH").unwrap());
+        let out = std::process::Command::new(bin.join("db-query"))
+            .args(args)
+            .env("PATH", path)
+            .current_dir(&dir)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        let calls = std::fs::read_to_string(&calls).unwrap_or_default();
+        let _ = std::fs::remove_dir_all(&dir);
+        (
+            out.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+            calls,
+        )
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn db_query_shim_routes_a_prod_id_through_tod_cli_db_read_only() {
+        if std::process::Command::new("jq").arg("--version").output().is_err() {
+            return;
+        }
+        let (code, out, err, calls) = run_db_query(
+            "prod",
+            &["prod-kb", "select 1 as n;"],
+            "prod-kb (database kb, user u@x)",
+            r#"[{"n":1}]"#,
+        );
+        assert_eq!(code, 0, "{err}");
+        let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+        assert_eq!(v["success"], true);
+        assert_eq!(v["data"]["rows"][0]["n"], 1);
+        assert_eq!(v["data"]["db"], "prod-kb");
+        assert_eq!(v["data"]["execution_time_ms"], 2.5);
+        assert!(calls.contains("tod-cli db run prod-kb -- psql"), "{calls}");
+        assert!(calls.contains("default_transaction_read_only=on"), "{calls}");
+        assert!(!calls.contains("real "), "{calls}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn db_query_shim_names_what_to_do_for_a_database_that_is_not_set_up() {
+        let (code, _out, err, calls) = run_db_query("missing", &["prod-platform", "select 1"], "prod-kb (database kb, user u)", "[]");
+        assert_eq!(code, 1);
+        assert!(err.contains("'prod-platform' is not set up"), "{err}");
+        assert!(err.contains("prod-kb"), "{err}");
+        assert!(err.contains("request"), "{err}");
+        assert!(!calls.contains("db run"), "{calls}");
+        // The `-postgres` maintenance database is not a declared one either.
+        let (code, _out, err, _) = run_db_query("pg", &["prod-kb-postgres", "select 1"], "prod-kb (database kb, user u)", "[]");
+        assert_eq!(code, 1);
+        assert!(err.contains("'prod-kb-postgres' is not set up"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn db_query_shim_leaves_local_databases_to_the_workspace_script() {
+        let (code, _out, err, calls) = run_db_query("local", &["local-kb", "select 1"], "", "[]");
+        assert_eq!(code, 0, "{err}");
+        assert!(calls.contains("real local-kb select 1"), "{calls}");
+        assert!(!calls.contains("tod-cli"), "{calls}");
+    }
+
+    #[test]
+    fn db_query_is_installed_beside_tod_cli() {
+        assert!(DB_QUERY_SHIM.starts_with("#!/usr/bin/env bash"));
+        assert!(DB_QUERY_PATH.starts_with(TOD_DIR));
     }
 
     fn creds() -> NodeCredentials {

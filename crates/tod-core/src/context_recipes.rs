@@ -348,6 +348,7 @@ pub const PHASE: ContextRecipe = ContextRecipe {
         "surface/phase",
     ],
     blocks: &[
+        DynamicBlock::Databases,
         DynamicBlock::DataRoot,
         DynamicBlock::PullRequests,
         DynamicBlock::Node,
@@ -406,6 +407,7 @@ pub const FLEET_AUTONOMOUS: ContextRecipe = ContextRecipe {
         "cli/plan",
     ],
     blocks: &[
+        DynamicBlock::Databases,
         DynamicBlock::DataRoot,
         DynamicBlock::PullRequests,
         DynamicBlock::Node,
