@@ -62,7 +62,21 @@ pub fn load(
     let not_clean_because = if review_clean {
         String::new()
     } else {
-        crate::pr_readiness::render_work(&pr.url, &assessment)
+        let mut why = String::new();
+        if !assessment.work().is_empty() {
+            why = crate::pr_readiness::render_work(&pr.url, &assessment);
+        }
+        for wait in assessment.waits() {
+            use crate::pr_readiness::Wait;
+            let line = match wait {
+                Wait::BotReview { bot } => format!("waiting for {bot} to review the latest commit"),
+                Wait::ChecksRunning => "checks are still running".to_string(),
+                Wait::GitHub => "GitHub has not computed the merge state yet".to_string(),
+                Wait::HumanReview => continue,
+            };
+            why.push_str(&format!("\n- {line}"));
+        }
+        why
     };
     let labels = github(data_root)?.pr_labels(&pr.owner, &pr.repo, pr.pr_number).map_err(say)?;
     Ok(PrFacts {

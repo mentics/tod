@@ -12,6 +12,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use gpui::prelude::FluentBuilder as _;
+use gpui::InteractiveElement as _;
 use gpui::{
     AnyElement, AppContext as _, Context, Entity, IntoElement, ParentElement as _, Render,
     SharedString, Styled as _, Subscription, Window, div,
@@ -385,7 +386,7 @@ impl PrControls {
                     (format!("Review requested from {}", f.requested_reviewers.join(", ")), false)
                 })
             });
-        div()
+        crate::ui::key_context::forward_menu_arrows(div().id(("pr-controls-row", ix)))
             .flex()
             .flex_wrap()
             .items_center()
@@ -451,5 +452,73 @@ impl Render for PrControls {
             .map(|(ix, row)| self.render_row(ix, row, window, cx))
             .collect::<Vec<_>>();
         div().flex().flex_col().gap_1().children(rows).into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::unified::requests::{DecisionsLinkNext, REQUESTS_CONTEXT};
+    use gpui::{TestAppContext, px};
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    /// Hosts the labels picker the way the task panel does: under the
+    /// requests' key context, whose Up/Down bindings must not take the keys
+    /// of the open menu.
+    struct Host {
+        labels: LabelPicker,
+        stolen: Rc<Cell<usize>>,
+    }
+
+    impl Render for Host {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let stolen = self.stolen.clone();
+            crate::ui::key_context::forward_menu_arrows(div().id("host"))
+                .key_context(REQUESTS_CONTEXT)
+                .on_action(move |_: &DecisionsLinkNext, _, _| stolen.set(stolen.get() + 1))
+                .size_full()
+                .child(div().w(px(240.)).child(Combobox::new(&self.labels).placeholder("Labels…")))
+        }
+    }
+
+    #[gpui::test]
+    fn down_in_the_open_labels_menu_moves_through_the_choices(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::app::register_main_keyboard_bindings(cx);
+        });
+        let stolen = Rc::new(Cell::new(0));
+        let mut picker = None;
+        let stolen_in = stolen.clone();
+        let (_, cx) = cx.add_window_view(|window, cx| {
+            let labels: LabelPicker = cx.new(|cx| {
+                ComboboxState::new(
+                    SearchableVec::new(
+                        ["bug", "docs", "feature"]
+                            .map(|n| LabelChoice(RepoLabel { name: n.into(), color: String::new() }))
+                            .to_vec(),
+                    ),
+                    vec![],
+                    window,
+                    cx,
+                )
+                .multiple(true)
+                .searchable(true)
+            });
+            picker = Some(labels.clone());
+            gpui_component::Root::new(cx.new(|_| Host { labels, stolen: stolen_in }), window, cx)
+        });
+        let picker = picker.unwrap();
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        cx.simulate_click(gpui::point(px(40.), px(15.)), gpui::Modifiers::none());
+        cx.run_until_parked();
+        cx.simulate_keystrokes("down down enter");
+        cx.run_until_parked();
+        let chosen = cx.update(|_, cx| picker.read(cx).selected_values());
+        assert_eq!(stolen.get(), 0, "the panel's Down took the menu's key");
+        assert_eq!(chosen, vec!["docs".to_string()], "two Downs then Enter should choose the second label");
     }
 }

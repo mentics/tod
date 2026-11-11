@@ -732,7 +732,12 @@ mod live {
             }],
             ..Default::default()
         };
-        let a = Assessment::of(&snap, &settings, Utc::now());
+        let mut a = Assessment::of(&snap, &settings, Utc::now());
+        // `TOD_TEST_ANSWERED_AT=<RFC 3339>`: when the PR agent last took a turn.
+        if let Ok(at) = std::env::var("TOD_TEST_ANSWERED_AT") {
+            a = a.answered_through(parse_time(&at));
+        }
+        println!("review clean: {} (work {:?}, waits {:?})", a.review_clean(), a.work(), a.waits());
         println!("bots: {:#?}
 open threads: {}
 next: {:?}", a.bots, a.open_threads.len(), a.next());
