@@ -40,7 +40,8 @@ from Blaxel.
 
 ### basedpyright check killed for memory in node sandboxes
 
-- **Seen**: 4 nodes (ENG-2680, ENG-3055, ENG-2927, ENG-2923), 2026-11-11; any node whose
+- **Seen**: 7 nodes (ENG-2680, ENG-3055, ENG-2927, ENG-2923, ENG-3067,
+  ENG-3193, ENG-3095), 2026-11-10/11, five of them as requests to the user; any node whose
   pr_draft or review checks include flagship's basedpyright.
 - **Symptom**: the check fails with no output (exit 247 or nothing after
   `uv sync`); the agent files "give the sandbox more memory".
@@ -50,10 +51,14 @@ from Blaxel.
   runservers and the KB API, about 1.4 GB). basedpyright reaches 2.5–3.2 GB
   RSS, and the check gives it an 8 GB heap cap, so the kernel kills it before
   V8 collects. The checks themselves run one at a time.
-- **Fix**: open, for the user to choose. Either lower the check's heap
-  (`--max-old-space-size=3072`; the agent saw a 2.8 GB heap finish with 0
-  errors), or give the golden more memory (Cofactr workspace's golden). As a
-  stopgap I stopped the dev servers by hand in two sandboxes.
+- **Fix**: the check's heap is 2 GB (`--max-old-space-size=2048`) in the
+  pr_draft and review checks of "All tasks" (2026-11-11, by the user's
+  choice; a check setting, not a commit). Measured in ENG-2680's sandbox with
+  the dev servers running: 108 s, peak RSS 2.2 GB, 0 errors and the baseline
+  unchanged. The five OOM requests were answered "fixed, try again". A bigger
+  golden was not needed: Blaxel takes any memory size in MB (CPU follows at
+  1 per 2 GB, about $0.041 per GB-hour active), but a fork cannot choose its
+  own, so it would mean changing the golden.
 - **Measure**: check failures with no output, or exit 137/247, per check.
 
 ### Agent-made git worktrees hide the work
@@ -95,6 +100,12 @@ from Blaxel.
 - Stop texts stored before the rewording keep the old wording.
 - `tod-sandbox exec ""` (a node with no sandbox) answers "not authorized
   (401)" instead of naming the missing sandbox.
+- The task panel's layout shifts when "Reading GitHub…" clears, so a click
+  aimed at a request can land on another control (here it opened Findings).
+- Enter on a request that carries evidence (a finding link) opens the
+  finding instead of the free-text answer field.
+- "journey: prune failed: tod-agentd exited at start" in the log: the prune
+  starts a second daemon while one is already running.
 
 ### Review "not converging" with nothing standing
 
