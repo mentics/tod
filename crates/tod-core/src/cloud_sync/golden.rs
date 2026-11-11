@@ -47,9 +47,25 @@ pub fn ensure_golden_current(sandboxes: &mut Sandboxes, bx: &Blaxel, repo: &str,
     let _lock = RefreshLock::take(&sandboxes.root)?;
     // What another process saved while this one waited.
     sandboxes.reload()?;
-    let files = install_files()?;
-    let mine = my_stamp(&files)?;
-    let name = match source_for(sandboxes, bx, &repo)? {
+    // Every look at Blaxel and at the disk this needs is independent of the
+    // others (the golden, the workspace's original it was forked from, tod's
+    // own files and their stamp), and each is a round trip or a hash, so they
+    // are done together.
+    let own_name = sandboxes.account()?.golden_for(&repo).map(|setting| sandboxes.resolve_golden_setting(bx, setting)).transpose()?;
+    let origin_setting = sandboxes.account()?.golden_source_for(&repo).map(str::to_string);
+    let (info, origin_now, loaded) = std::thread::scope(|scope| {
+        let info = own_name.as_ref().map(|name| scope.spawn(|| bx.get(name)));
+        let origin = origin_setting.as_ref().map(|setting| scope.spawn(|| sandboxes.resolve_golden_setting(bx, setting)));
+        let loaded = install_files().and_then(|files| my_stamp(&files).map(|mine| (files, mine)));
+        (
+            info.map(|h| h.join().unwrap_or_else(|_| Err(anyhow!("looking up the golden panicked")))),
+            origin.map(|h| h.join().unwrap_or_else(|_| Err(anyhow!("looking up the original golden panicked")))),
+            loaded,
+        )
+    });
+    let (files, mine) = loaded?;
+    let info = info.transpose()?.flatten();
+    let name = match golden::decide_source(&repo, own_name.as_deref().map(|name| (name, info.is_some()))) {
         golden::Source::Build { why } => {
             progress(&format!("{why}: making one from a fresh sandbox with the repository cloned into it"));
             return build_golden(sandboxes, bx, &repo, &files, &mine, progress);
@@ -57,7 +73,7 @@ pub fn ensure_golden_current(sandboxes: &mut Sandboxes, bx: &Blaxel, repo: &str,
         golden::Source::Refresh { from } => from,
     };
     let mut refreshed = false;
-    let current = ensure_current_with(&repo, &name, &mine, |name| bx.get(name), progress, |name, progress| {
+    let current = ensure_current_with(&repo, &name, &mine, |_| Ok(info.clone()), progress, |name, progress| {
         refreshed = true;
         let info = bx.get(name)?.ok_or_else(|| anyhow!("the golden sandbox {name} for {repo} does not exist"))?;
         let origin = origin_of(sandboxes, bx, &repo, name, &info)?;
@@ -68,9 +84,11 @@ pub fn ensure_golden_current(sandboxes: &mut Sandboxes, bx: &Blaxel, repo: &str,
     }
     // Current for this build: still out of date when the workspace's golden
     // it was forked from has been replaced since.
-    if let Some(why) = origin_moved(sandboxes, bx, &repo, &current, progress)? {
-        progress(&format!("the golden sandbox {current} for {repo} is being refreshed: {why}"));
-        return refresh_locked(sandboxes, bx, &repo, progress);
+    if let Some(info) = &info {
+        if let Some(why) = origin_moved(&repo, &current, info, origin_now, progress) {
+            progress(&format!("the golden sandbox {current} for {repo} is being refreshed: {why}"));
+            return refresh_locked(sandboxes, bx, &repo, progress);
+        }
     }
     Ok(current)
 }
@@ -159,16 +177,20 @@ fn origin_of(sandboxes: &Sandboxes, bx: &Blaxel, repo: &str, old: &str, info: &t
 /// forked from. `None` when it is not a fork of an original, or is current.
 /// A setting that cannot be resolved is said through `progress` and leaves the
 /// golden as it is (nothing to refresh from).
-fn origin_moved(sandboxes: &Sandboxes, bx: &Blaxel, repo: &str, golden_name: &str, progress: &mut dyn FnMut(&str)) -> Result<Option<String>> {
-    let Some(info) = bx.get(golden_name)? else { return Ok(None) };
-    let Some(from) = info.label(golden::LABEL_FROM).filter(|v| !v.is_empty()) else { return Ok(None) };
-    let Some(setting) = sandboxes.account()?.golden_source_for(repo) else { return Ok(None) };
-    match sandboxes.resolve_golden_setting(bx, setting) {
-        Ok(now) if now != from => Ok(Some(format!("it was forked from {from}, and {repo}'s original golden is now {now}"))),
-        Ok(_) => Ok(None),
+fn origin_moved(
+    repo: &str,
+    golden_name: &str,
+    info: &tod_sandbox::blaxel::SandboxInfo,
+    original_now: Option<Result<String>>,
+    progress: &mut dyn FnMut(&str),
+) -> Option<String> {
+    let from = info.label(golden::LABEL_FROM).filter(|v| !v.is_empty())?;
+    match original_now? {
+        Ok(now) if now != from => Some(format!("it was forked from {from}, and {repo}'s original golden is now {now}")),
+        Ok(_) => None,
         Err(err) => {
             progress(&format!("cannot check whether {repo}'s original golden changed ({err:#}); using {golden_name} as it is"));
-            Ok(None)
+            None
         }
     }
 }
