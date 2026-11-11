@@ -1877,6 +1877,19 @@ impl TaskListView {
         cx.notify();
     }
 
+    /// Clear the search text only, keeping the selected row and scrolling it
+    /// into view (its position changes once the filter is gone).
+    fn clear_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.search_query.clear();
+        self.search_input.update(cx, |input, cx| {
+            input.set_value("", window, cx);
+        });
+        self.rebuild_visible_list(window, cx);
+        self.list_state.update(cx, |state, cx| {
+            state.scroll_to_selected_item(window, cx);
+        });
+    }
+
     fn clear_filters(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.working_set.tag_filter = None;
         self.search_query.clear();
@@ -2058,9 +2071,7 @@ impl TaskListView {
         if self.search_field.leave(window, cx) {
             return;
         }
-        if self.drawer_open {
-            cx.emit(TaskListEvent::CloseDrawer);
-        } else if self.is_editing() {
+        if self.is_editing() {
             self.abandon_inline_edit(window, cx, true);
         } else if self.compose_open {
             self.close_compose(window, cx);
@@ -2072,6 +2083,12 @@ impl TaskListView {
             self.close_sort_menu(cx);
         } else if self.open_row_menu.is_some() {
             self.close_row_menu(cx);
+        } else if !self.search_query.is_empty() {
+            // Second Escape (the first left the search field): drop the
+            // filter and stay on the selected row.
+            self.clear_search(window, cx);
+        } else if self.drawer_open {
+            cx.emit(TaskListEvent::CloseDrawer);
         }
     }
 
