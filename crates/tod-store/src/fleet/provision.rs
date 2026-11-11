@@ -283,8 +283,11 @@ pub fn make_location(
         sandbox: None,
         created_at: 0,
     };
+    // What a sandbox made now already found out about saved work, while it
+    // was being set up ([`node_checkpoint::nothing_saved_in_sandbox`]).
+    let mut none_saved = None;
     let (location, warnings) = if files.runs_in_sandbox() {
-        make_sandbox(fleet, &files, location, &branch, progress)?
+        make_sandbox(fleet, &files, location, &branch, &mut none_saved, progress)?
     } else {
         make_worktree(fleet, paths, settings, &files, location, &branch, progress)?
     };
@@ -296,7 +299,7 @@ pub fn make_location(
         // A sandbox that expired took its uncommitted work with it; the
         // last checkpoint is on the remote (`fleet::checkpoint`).
         progress("Looking for saved work…");
-        let notes = crate::fleet::node_checkpoint::restore_into(&dir, node_id);
+        let notes = crate::fleet::node_checkpoint::restore_into(&dir, node_id, none_saved);
         for restored in &notes.restored {
             progress(restored.as_str());
         }
@@ -896,6 +899,7 @@ fn make_sandbox(
     files: &ResolvedFiles,
     mut location: FilesLocation,
     branch: &str,
+    none_saved: &mut Option<bool>,
     progress: &mut dyn FnMut(&str),
 ) -> Result<(FilesLocation, Vec<String>)> {
     use tod_sandbox::node;
@@ -985,14 +989,14 @@ fn make_sandbox(
 
     let supervisor_env = node::supervisor_env(&creds, account.claude_token_via);
     let delays = if fork_from.is_some() { node::FORK_PROBE_DELAYS } else { node::IMAGE_PROBE_DELAYS };
-    let setup = |sandboxes: &mut Sandboxes, location: &mut FilesLocation, progress: &mut dyn FnMut(&str)| -> Result<Vec<String>> {
+    let mut setup = |sandboxes: &mut Sandboxes, location: &mut FilesLocation, progress: &mut dyn FnMut(&str)| -> Result<Vec<String>> {
         progress(&format!("waiting for {name}…"));
         let info = bx.wait_deployed(&name, std::time::Duration::from_secs(300))?;
         let url = info.url.clone().ok_or_else(|| anyhow!("sandbox {name} has no URL"))?;
         progress(&format!("{name} is up after {:.1}s", started.elapsed().as_secs_f64()));
         sandboxes.config.upsert(tod_sandbox::config::Sandbox { name: name.clone(), image: info.image, url: Some(url.clone()), agents: true });
         sandboxes.save()?;
-        // A sandbox in standby is "up" to the control plane but its workload
+
         // is not reachable until it has resumed.
         bx.wait_reachable(&url, tod_sandbox::blaxel::WAKE_CEILING).with_context(|| format!("wake {name}"))?;
         // The golden's label says the golden has tod's files, not that this
@@ -1092,10 +1096,20 @@ fn make_sandbox(
         let mut warnings = Vec::new();
         let (dir_path, quick) = if fork_from.is_some() {
             let (probed, checked, checked_said, beside) = std::thread::scope(|scope| {
-                let beside = scope.spawn(|| -> Result<(String, worktree::QuickBranch)> {
+                let beside = scope.spawn(|| -> Result<(String, worktree::QuickBranch, bool)> {
                     let dir = find_sandbox_checkout(&name)?;
-                    let quick = worktree::branch_submodules_quickly(&Workdir::sandbox(&name, &dir), branch)?;
-                    Ok((dir, quick))
+                    let at = Workdir::sandbox(&name, &dir);
+                    // Whether the node has saved work on the remote
+                    // (`node_checkpoint::restore_into` would ask after the
+                    // checkout): a question about origin and the submodule
+                    // list, neither of which the checkout changes, so it
+                    // is asked meanwhile, and the answer used afterwards.
+                    let (quick, none_saved) = std::thread::scope(|inner| {
+                        let saved = inner.spawn(|| crate::fleet::node_checkpoint::nothing_saved_in_sandbox(&at, node_id));
+                        let quick = worktree::branch_submodules_quickly(&at, branch);
+                        (quick, saved.join().unwrap_or(false))
+                    });
+                    Ok((dir, quick?, none_saved))
                 });
                 let checkout = scope.spawn(|| {
                     let mut said = Vec::new();
@@ -1111,7 +1125,8 @@ fn make_sandbox(
             }
             probed?;
             checked?;
-            let (dir, quick) = beside?;
+            let (dir, quick, saved) = beside?;
+            *none_saved = Some(saved);
             (dir, Some(quick))
         } else {
             node::checkout(&bx, &url, &repo.url, branch, &identity, true, progress)?;

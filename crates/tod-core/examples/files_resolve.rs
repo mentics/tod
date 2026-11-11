@@ -15,7 +15,9 @@ fn main() -> anyhow::Result<()> {
     let t0 = std::time::Instant::now();
     let mut say = |m: &str| println!("  [{:6.2}s] {m}", t0.elapsed().as_secs_f64());
     println!("refresh proxy: {:?}", provision::refresh_sandbox_proxy(&fleet, &id, false, &mut say));
-    match provision::resolve_launch_cwd_with(&fleet, &id, &mut say) {
+    let result = provision::resolve_launch_cwd_with(&fleet, &id, &mut say);
+    println!("  [{:6.2}s] done", t0.elapsed().as_secs_f64());
+    match result {
         Ok((dir, warnings)) => println!("OK: {dir} warnings={warnings:?}"),
         Err(err) => println!("ERROR: {err:#}"),
     }

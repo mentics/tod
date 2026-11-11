@@ -88,7 +88,7 @@ pub struct RestoreNotes {
 /// Whether `dir` is in a cloud sandbox and a single call there found that no
 /// repository (the checkout or any submodule) has a checkpoint of `node_id` on
 /// its `origin`. `false` means "not known to be none", never an error.
-fn nothing_saved_in_sandbox(dir: &Workdir, node_id: &str) -> bool {
+pub fn nothing_saved_in_sandbox(dir: &Workdir, node_id: &str) -> bool {
     if !matches!(dir, Workdir::Sandbox { .. }) {
         return false;
     }
@@ -105,12 +105,15 @@ wait"#;
 /// Put `node_id`'s checkpoints into `dir`, a checkout made just now.
 /// A checkpoint that does not apply, or could not be read, is left on the
 /// remote and reported in `failures`, never dropped.
-pub fn restore_into(dir: &Workdir, node_id: &str) -> RestoreNotes {
+///
+/// `none_saved` is the answer to [`nothing_saved_in_sandbox`] when the caller
+/// already asked it (while the checkout was made); `None` asks it here.
+pub fn restore_into(dir: &Workdir, node_id: &str, none_saved: Option<bool>) -> RestoreNotes {
     let mut notes = RestoreNotes::default();
     // Nearly always there is nothing to restore: one call in a sandbox asks
     // every repository at once (listing them and asking each is a dozen round
     // trips). Anything else, including a failed call, takes the full way.
-    if nothing_saved_in_sandbox(dir, node_id) {
+    if none_saved.unwrap_or_else(|| nothing_saved_in_sandbox(dir, node_id)) {
         return notes;
     }
     let repos = match repos_deepest_first(dir) {

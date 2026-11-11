@@ -613,6 +613,11 @@ impl GitIdentity {
 /// would otherwise leave a stale `origin/<branch>` here, and checking it out
 /// asks the remote for a commit it no longer offers ("not our ref").
 ///
+/// Every `git checkout` is quiet (`-q`): without it git lists the local
+/// changes after switching, which runs `git status` in every submodule, and
+/// in a fresh fork those (cold, every index entry looking changed) took about
+/// 1.6 s of a 3 s checkout. Nothing here reads that listing.
+///
 /// It never recurses into submodules: the first fetch in a fork brings in
 /// every branch, and git would then fetch, in each (blobless) submodule, the
 /// commits those old branches point at, some of which the submodule's remote
@@ -639,9 +644,9 @@ pub fn checkout_script(repo_url: &str, branch: &str, identity: &GitIdentity, all
          git config user.name {name}\n\
          git config user.email {email}\n\
          if git show-ref --verify --quiet refs/remotes/origin/{br}; then \
-         git checkout -B {br} origin/{br} && git branch --set-upstream-to=origin/{br}; \
-         elif git show-ref --verify --quiet refs/heads/{br}; then git checkout {br}; \
-         else git checkout --no-track -b {br} \"$(git symbolic-ref -q --short refs/remotes/origin/HEAD || echo origin/main)\"; fi\n",
+         git checkout -q -B {br} origin/{br} && git branch --set-upstream-to=origin/{br}; \
+         elif git show-ref --verify --quiet refs/heads/{br}; then git checkout -q {br}; \
+         else git checkout -q --no-track -b {br} \"$(git symbolic-ref -q --short refs/remotes/origin/HEAD || echo origin/main)\"; fi\n",
     )
 }
 
@@ -1747,10 +1752,10 @@ mod tests {
         assert!(s.contains("git config --system http.sslCAInfo \"$SSL_CERT_FILE\""));
         assert!(s.contains("git clone https://github.com/o/r.git /workspace/repo"));
         assert!(s.contains("refs/remotes/origin/feat/x"));
-        assert!(s.contains("git checkout -B feat/x origin/feat/x"));
+        assert!(s.contains("git checkout -q -B feat/x origin/feat/x"));
         // A new branch starts from origin's default branch, never a stale HEAD.
-        assert!(s.contains("git checkout --no-track -b feat/x \"$(git symbolic-ref -q --short refs/remotes/origin/HEAD"));
-        assert!(!s.contains("else git checkout -B feat/x;"));
+        assert!(s.contains("git checkout -q --no-track -b feat/x \"$(git symbolic-ref -q --short refs/remotes/origin/HEAD"));
+        assert!(!s.contains("else git checkout -q -B feat/x;"));
         // A branch needing quotes stays one word after `origin/`.
         assert!(checkout_script("u", "a b", &me, true).contains("origin/'a b'"));
     }
