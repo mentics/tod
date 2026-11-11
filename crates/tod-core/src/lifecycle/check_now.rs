@@ -35,6 +35,11 @@ pub struct CheckNow {
     /// have waited on or worked first (see [`check_now`]). `None` when
     /// nothing held it.
     pub held: Option<String>,
+    /// The gate is not clear, and the state's phase agent is what clears it
+    /// (it certifies the phase), with nothing on GitHub left to wait for:
+    /// the caller starts the node's run, the same as Start, rather than
+    /// leave a checked node sitting. `false` when anything is held.
+    pub needs_agent: bool,
 }
 
 /// The states whose standing depends on the node's pull requests.
@@ -80,7 +85,17 @@ pub fn check_now(fleet: &FleetStore, node: Uuid, data_root: &std::path::Path) ->
     if reads_github(&state) && (state != from || github.is_none()) {
         github = Some(check_github(fleet, node, data_root, &state)?);
     }
-    Ok(CheckNow { gate, advanced, github, held })
+    // A phase-agent state whose gate fails is cleared by its agent's work
+    // (`doc/lifecycle/phase-agents.md`), which only a run does: unless
+    // something outside it is still to come (a release, a review, a decision).
+    let github_waits = matches!(&github, Some(GithubCheck::Waiting { .. } | GithubCheck::Unreadable(_)));
+    let needs_agent = advanced.is_none()
+        && held.is_none()
+        && !github_waits
+        && !gate.clear()
+        && gate.to.is_some()
+        && crate::phase::has_phase_agent(&state);
+    Ok(CheckNow { gate, advanced, github, held, needs_agent })
 }
 
 #[cfg(test)]
@@ -167,6 +182,21 @@ mod tests {
         assert!(found.gate.failing().count() > 0);
         assert_eq!(found.advanced, None);
         assert_eq!(current_state(&fx.fleet, fx.node).unwrap(), "ready");
+    }
+
+    #[test]
+    fn a_phase_agent_state_whose_gate_fails_needs_the_agent() {
+        let fx = fixture();
+        // `merged` → `released` needs the phase agent's certificate; no pull
+        // request is linked, so nothing is left to wait for.
+        enable_lifecycle(&fx, "merged");
+        let found = check_now(&fx.fleet, fx.node, &fx.root).unwrap();
+        assert!(!found.gate.clear());
+        assert!(found.needs_agent, "{found:?}");
+        // A state with no phase agent never asks for one.
+        enable_lifecycle(&fx, "ready");
+        let found = check_now(&fx.fleet, fx.node, &fx.root).unwrap();
+        assert!(!found.needs_agent, "{found:?}");
     }
 
     #[test]

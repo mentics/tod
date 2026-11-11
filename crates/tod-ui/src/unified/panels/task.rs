@@ -433,6 +433,9 @@ fn describe_check(found: &tod_core::lifecycle::CheckNow) -> (String, bool) {
         }
         Some(GithubCheck::NothingToWaitOn) | None => {}
     }
+    if found.needs_agent {
+        text.push_str(". Starting the agent to do what is left");
+    }
     (text, failed)
 }
 
@@ -1311,6 +1314,7 @@ impl TaskPanel {
                 .spawn(async move { tod_core::lifecycle::check_now(&fleet, node, &root) })
                 .await;
             let _ = this.update(cx, |this: &mut TaskPanel, cx| {
+                let needs_agent = result.as_ref().is_ok_and(|found| found.needs_agent);
                 let (note, failed) = match result {
                     Ok(found) => describe_check(&found),
                     Err(err) => (format!("Could not check: {err:#}"), true),
@@ -1320,6 +1324,16 @@ impl TaskPanel {
                     this.runner.cloud_failed = failed;
                     this.refresh_runner(cx);
                     cx.notify();
+                    // A check that finds only the phase agent's work left
+                    // does that work, as Start would: a checked node must
+                    // not just sit.
+                    if needs_agent {
+                        if this.runner.supervised {
+                            this.supervised_go(None, cx);
+                        } else {
+                            let _ = this.runners.update(cx, |r, cx| r.start(node, false, cx));
+                        }
+                    }
                 }
             });
         })
@@ -2107,13 +2121,14 @@ mod tests {
         use tod_core::lifecycle::CheckNow;
         use tod_core::phase::GateCheck;
         let gate = |to: Option<&str>| GateCheck { from: "pr_draft".into(), to: to.map(str::to_string), criteria: Vec::new() };
-        let moved = CheckNow { gate: gate(Some("pr_review")), advanced: Some("pr_review"), github: None, held: None };
+        let moved = CheckNow { gate: gate(Some("pr_review")), advanced: Some("pr_review"), github: None, held: None, needs_agent: false };
         assert_eq!(describe_check(&moved), ("Checked: the gate is clear; moved to pr_review".to_string(), false));
         let held = CheckNow {
             gate: gate(Some("pr_review")),
             advanced: None,
             github: Some(GithubCheck::Waiting { what: "a review".into(), due_at_ms: 0 }),
             held: Some("a review".into()),
+            needs_agent: false,
         };
         let (text, failed) = describe_check(&held);
         assert!(!failed);
@@ -2124,6 +2139,7 @@ mod tests {
             advanced: None,
             github: Some(GithubCheck::Unreadable("no network".into())),
             held: None,
+            needs_agent: false,
         };
         let (text, failed) = describe_check(&unreadable);
         assert!(failed && text.contains("GitHub could not be read: no network"), "{text}");
