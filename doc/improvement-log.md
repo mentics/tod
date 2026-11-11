@@ -84,6 +84,9 @@ from Blaxel.
   golden was not needed: Blaxel takes any memory size in MB (CPU follows at
   1 per 2 GB, about $0.041 per GB-hour active), but a fork cannot choose its
   own, so it would mean changing the golden.
+- **Seen again**: ENG-2157 (2026-11-11), this time the ui `tsc` check, which runs with
+  `--max-old-space-size=6144`. It was killed at 3.3 GB RSS, with about 3.4 GB free
+  next to the dev servers. It is the same kind of problem and is not fixed yet.
 - **Measure**: check failures with no output, or exit 137/247, per check.
 
 ### Agent-made git worktrees hide the work
