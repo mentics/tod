@@ -1152,8 +1152,8 @@ fn make_sandbox(
 ///   Nothing about it is worth investigating.
 /// - **Any other** failure, which tod does not know the cause of: the sandbox is
 ///   kept so the cause can be found in it (`tod-sandbox shell`), and the
-///   location is forgotten so the next start cannot adopt a half-made one: it
-///   stops at "tod lost track of a sandbox" until the user deletes it.
+///   location is forgotten so the next start cannot adopt a half-made one: the
+///   next start deletes it and makes a fresh one (`NameDecision::ReplaceFailed`).
 ///   `TOD_KEEP_FAILED_SANDBOX` keeps it for a temporary failure too.
 ///
 /// A failed delete is part of the error, never dropped.
