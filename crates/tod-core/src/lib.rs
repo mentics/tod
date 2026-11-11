@@ -70,6 +70,7 @@ pub mod checks;
 pub mod pr_readiness;
 pub mod release_watch;
 pub mod pr_actions;
+pub mod pr_choices;
 pub mod pull_requests;
 pub mod run_transcript;
 pub mod run_state;

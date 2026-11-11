@@ -59,14 +59,20 @@ are on the task they meant.
 
 In `pr`, `pr_draft` and `pr_review`, one row per linked pull request sits
 under the identity line (`unified/panels/pr_controls.rs`, logic in
-`tod_core::pr_actions`): **Labels** (the standard searchable multi-select over
-the repository's own labels, each toggle applied at once), **Open** (draft →
-ready for review) and **Reviewer** (a searchable pick, GitHub's own
-suggestions first, then the people who can be asked). Open and Reviewer stay
-disabled, with the reason in a tooltip, until the code review has passed
-clean (`Assessment::review_clean`: no work left for the babysitter and
-nothing to wait for but a person). Every call to GitHub runs off the UI thread
-and a failure is said on the row.
+`tod_core::pr_actions`, memory in `tod_core::pr_choices`): **Labels** (the
+standard searchable multi-select over the repository's own labels),
+**Open** (a toggle: open for review, or back to a draft), **Reviewer** (a
+searchable pick, GitHub's suggestions first) and **Update PR**.
+
+Nothing waits on GitHub. The menus' lists are remembered in the data root
+(`pr-controls.json`) and read again only from the last entry of each menu,
+"Refresh this list" (the first time, when nothing is remembered yet). A choice
+is saved as it is made, so it is still there after a restart, and "Not sent to
+GitHub yet" shows until **Update PR** sends it (labels, then open or draft,
+then the reviewer; it stops at the first failure and says why on the row).
+Opening a draft, and asking a reviewer of a draft, are refused at Update PR
+until the code review has passed clean (`Assessment::review_clean`); the error
+says what is left. Every call to GitHub runs off the UI thread.
 
 ### Artifacts
 

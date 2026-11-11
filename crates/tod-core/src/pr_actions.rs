@@ -1,8 +1,9 @@
 //! What the task panel's pull-request buttons do (labels, open, reviewer).
 //!
 //! Everything here talks to GitHub, so none of it is for the UI thread.
-//! Opening a pull request and asking a reviewer need the code review to have
-//! passed clean ([`PrFacts::review_clean`]); labels never wait.
+//! Choices are sent together by [`update`]; opening a draft and asking a
+//! reviewer of a draft need the code review to have passed clean
+//! ([`PrFacts::review_clean`]); labels never wait.
 
 use std::path::Path;
 
@@ -90,47 +91,68 @@ pub fn load(
     })
 }
 
-/// The labels the pull request's repository defines.
-pub fn repo_labels(data_root: &Path, pr: &NodePr) -> Result<Vec<RepoLabel>, String> {
-    github(data_root)?.list_repo_labels(&pr.owner, &pr.repo).map_err(say)
+/// Read the repository's labels from GitHub and remember them.
+pub fn refresh_labels(data_root: &Path, pr: &NodePr) -> Result<Vec<RepoLabel>, String> {
+    let labels = github(data_root)?.list_repo_labels(&pr.owner, &pr.repo).map_err(say)?;
+    crate::pr_choices::store_labels(data_root, pr, labels.clone())?;
+    Ok(labels)
 }
 
-/// Give the pull request exactly `labels`.
-pub fn set_labels(data_root: &Path, pr: &NodePr, labels: &[String]) -> Result<(), String> {
-    github(data_root)?.set_pr_labels(&pr.owner, &pr.repo, pr.pr_number, labels).map_err(say)
+/// Read who can be asked to review (GitHub's suggestions first) and remember it.
+pub fn refresh_reviewers(data_root: &Path, pr: &NodePr) -> Result<Vec<Reviewer>, String> {
+    let people = github(data_root)?.suggested_reviewers(&pr.owner, &pr.repo, pr.pr_number).map_err(say)?;
+    crate::pr_choices::store_reviewers(data_root, pr, people.clone())?;
+    Ok(people)
 }
 
-/// Switch the draft to open. Refused until its review is clean.
-pub fn open_for_review(
+/// Send what the user chose to GitHub: labels, then open or back to draft,
+/// then the reviewer. Opening a draft, and asking a reviewer of a draft, are
+/// refused until the code review is clean; nothing else waits. Stops at the
+/// first failure, and what was sent before it stays sent. On success the
+/// remembered choice is cleared.
+pub fn update(
     data_root: &Path,
     pr: &NodePr,
+    choice: &crate::pr_choices::Choice,
     answered_at: Option<chrono::DateTime<chrono::Utc>>,
 ) -> Result<(), String> {
     let facts = load(data_root, pr, answered_at)?;
-    if !facts.review_clean {
-        return Err(format!("the code review has not passed yet: {}", facts.not_clean_because));
+    if facts.merged {
+        return Err("this pull request is merged".to_string());
     }
-    github(data_root)?.mark_ready_for_review(&pr.owner, &pr.repo, pr.pr_number).map_err(say)
-}
-
-/// Who can be asked to review, GitHub's own suggestions first.
-pub fn reviewer_choices(data_root: &Path, pr: &NodePr) -> Result<Vec<Reviewer>, String> {
-    github(data_root)?.suggested_reviewers(&pr.owner, &pr.repo, pr.pr_number).map_err(say)
-}
-
-/// Ask `login` to review. While the pull request is still a draft this is
-/// refused until the review is clean; once it is open there is nothing to wait for.
-pub fn request_reviewer(
-    data_root: &Path,
-    pr: &NodePr,
-    login: &str,
-    answered_at: Option<chrono::DateTime<chrono::Utc>>,
-) -> Result<(), String> {
-    let facts = load(data_root, pr, answered_at)?;
-    if facts.draft && !facts.review_clean {
-        return Err(format!("the code review has not passed yet: {}", facts.not_clean_because));
+    let not_clean = || format!("the code review has not passed yet: {}", facts.not_clean_because);
+    let gh = github(data_root)?;
+    let mut draft = facts.draft;
+    if let Some(labels) = &choice.labels {
+        let mut want = labels.clone();
+        let mut have = facts.labels.clone();
+        want.sort();
+        have.sort();
+        if want != have {
+            gh.set_pr_labels(&pr.owner, &pr.repo, pr.pr_number, labels).map_err(say)?;
+        }
     }
-    github(data_root)?
-        .request_reviewers(&pr.owner, &pr.repo, pr.pr_number, &[login.to_string()])
-        .map_err(say)
+    match choice.open {
+        Some(true) if draft => {
+            if !facts.review_clean {
+                return Err(not_clean());
+            }
+            gh.mark_ready_for_review(&pr.owner, &pr.repo, pr.pr_number).map_err(say)?;
+            draft = false;
+        }
+        Some(false) if !draft => {
+            gh.convert_to_draft(&pr.owner, &pr.repo, pr.pr_number).map_err(say)?;
+            draft = true;
+        }
+        _ => {}
+    }
+    if let Some(login) = &choice.reviewer
+        && !facts.requested_reviewers.iter().any(|r| r.eq_ignore_ascii_case(login))
+    {
+        if draft && !facts.review_clean {
+            return Err(not_clean());
+        }
+        gh.request_reviewers(&pr.owner, &pr.repo, pr.pr_number, &[login.clone()]).map_err(say)?;
+    }
+    crate::pr_choices::store_choice(data_root, pr, &crate::pr_choices::Choice::default())
 }

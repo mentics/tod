@@ -8,7 +8,7 @@
 use crate::outline::uuid_blob::uuid_to_blob;
 use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension, params};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -459,6 +459,17 @@ impl Github {
         Ok(())
     }
 
+    /// Switch an open pull request back to a draft (GraphQL, by node id).
+    pub fn convert_to_draft(&self, owner: &str, repo: &str, number: i64) -> Result<(), GithubError> {
+        const QUERY: &str = "query($owner: String!, $repo: String!, $number: Int!) { repository(owner: $owner, name: $repo) { pullRequest(number: $number) { id } } }";
+        const MUTATION: &str = "mutation($id: ID!) { convertPullRequestToDraft(input: {pullRequestId: $id}) { pullRequest { id } } }";
+        let data: IdData =
+            self.graphql(QUERY, serde_json::json!({ "owner": owner, "repo": repo, "number": number }), Some((owner, repo)))?;
+        let id = data.repository.and_then(|r| r.pull_request).ok_or(GithubError::NotFound)?.id;
+        self.graphql::<serde_json::Value>(MUTATION, serde_json::json!({ "id": id }), Some((owner, repo)))?;
+        Ok(())
+    }
+
     /// Who GitHub suggests as reviewers for the pull request, in the order
     /// its own Reviewers menu lists them (people who touched the changed code
     /// first), then the rest of the people who can be asked (the first 100),
@@ -811,7 +822,7 @@ pub struct PrReview {
 }
 
 /// A label a repository defines.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RepoLabel {
     pub name: String,
     /// Hex, without `#`.
@@ -819,7 +830,7 @@ pub struct RepoLabel {
 }
 
 /// A person a pull request can be sent to for review.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Reviewer {
     pub login: String,
     pub name: Option<String>,
