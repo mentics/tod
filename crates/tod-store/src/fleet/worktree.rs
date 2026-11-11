@@ -253,7 +253,8 @@ fn switch_to_branch(repo: &Workdir, branch: &str, base: Option<&str>) -> Result<
     let tracking = format!("{REMOTE}/{branch}");
     if !state.local {
         if state.remote {
-            run_git(repo, &["switch", "--track", "-c", branch, &tracking])?;
+            run_git(repo, &["switch", "--no-track", "-c", branch, &tracking])?;
+            set_upstream(repo, branch)?;
             return Ok(false);
         }
         if let Some(base) = base {
@@ -267,12 +268,31 @@ fn switch_to_branch(repo: &Workdir, branch: &str, base: Option<&str>) -> Result<
         run_git(repo, &["switch", branch])?;
     }
     if state.remote && !state.upstream {
-        let upstream = format!("--set-upstream-to={tracking}");
-        if let Err(err) = run_git(repo, &["branch", &upstream, branch]) {
-            tracing::warn!("link {branch} in {repo} to {tracking}: {err:#}");
-        }
+        set_upstream(repo, branch)?;
     }
     Ok(false)
+}
+
+/// Make `origin/<branch>` the upstream of `branch` by writing the config git
+/// would. `git switch --track` and `git branch --set-upstream-to` refuse when
+/// `origin`'s fetch refspec does not cover the branch (a submodule cloned
+/// with only its default branch, whose `origin/<branch>` was fetched by an
+/// explicit refspec): "starting point ... is not a branch". Such a refspec
+/// gets the branch added, so `@{u}` resolves and later fetches update it.
+fn set_upstream(repo: &Workdir, branch: &str) -> Result<()> {
+    let key = format!("remote.{REMOTE}.fetch");
+    let specs = run_git(repo, &["config", "--get-all", &key]).unwrap_or_default();
+    let covered = specs.lines().any(|spec| {
+        let spec = spec.trim().trim_start_matches('+');
+        spec.starts_with("refs/heads/*:") || spec.starts_with(&format!("refs/heads/{branch}:"))
+    });
+    if !covered {
+        let spec = format!("+refs/heads/{branch}:refs/remotes/{REMOTE}/{branch}");
+        run_git(repo, &["config", "--add", &key, &spec])?;
+    }
+    run_git(repo, &["config", &format!("branch.{branch}.remote"), REMOTE])?;
+    run_git(repo, &["config", &format!("branch.{branch}.merge"), &format!("refs/heads/{branch}")])?;
+    Ok(())
 }
 
 /// Initialized submodules of `repo`, recursively, parents before children.
@@ -1431,6 +1451,27 @@ mod tests {
         assert_eq!(upstream_of(&a, "task/x").as_deref(), Some("origin/task/x"));
         // `b` shares the same origin, so it gets the branch too.
         assert_eq!(git_in(&top.join("b"), &["rev-parse", "HEAD"]), tip);
+    }
+
+    /// A submodule cloned with only its default branch in `origin`'s fetch
+    /// refspec (as the workspace golden's are): `git switch --track` refuses
+    /// the explicitly fetched `origin/<branch>` ("is not a branch"), so the
+    /// upstream is written as config.
+    #[test]
+    fn a_branch_outside_the_fetch_refspec_is_still_tracked() {
+        let top = repo_with_submodules();
+        for sub in ["a", "b"] {
+            git_in(
+                &top.join(sub),
+                &["config", "remote.origin.fetch", "+refs/heads/main:refs/remotes/origin/main"],
+            );
+        }
+        let (_, tip) = push_to_submodule_origin(&top, "task/x", "pr work");
+        assert!(branch_submodules_from_origin(&top, "task/x").unwrap().is_empty());
+        let a = top.join("a");
+        assert_eq!(current_branch(&a).as_deref(), Some("task/x"));
+        assert_eq!(git_in(&a, &["rev-parse", "HEAD"]), tip);
+        assert_eq!(upstream_of(&a, "task/x").as_deref(), Some("origin/task/x"));
     }
 
     #[test]
