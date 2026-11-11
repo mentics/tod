@@ -223,12 +223,49 @@ pub fn missing_in_fork_message(missing: &[String]) -> String {
     )
 }
 
+/// Whether a sandbox's `tod-kind` label says it is a node's (or the node
+/// base's). Unlike the manifest, the label survives a redeploy that wipes
+/// `/opt/tod`.
+pub fn is_node_kind(kind_label: Option<&str>) -> bool {
+    matches!(kind_label, Some("node" | "node-base"))
+}
+
+/// Why a plain provisioning of a node's sandbox is refused: only the node's
+/// own provisioning may install into it, with the supervisor's environment.
+pub fn node_sandbox_refusal(name: &str) -> String {
+    format!(
+        "{name} is a node's sandbox and is being set up by that node (or its files are missing); tod will not \
+         provision it as a plain sandbox. Run the node in the cloud again to set it up"
+    )
+}
+
+/// Whether a fork whose golden carried tod's files needs them installed
+/// anyway: the fork's own update may have redeployed it from its image,
+/// wiping them. `reported` is what the fork's relay says (`None`: it does
+/// not answer); only this build's node manifest means the files are there.
+pub fn fork_needs_tod_files(golden_has_tod_files: bool, reported: Option<&str>, expected_node_manifest: &str) -> bool {
+    !golden_has_tod_files || reported.map(str::trim) != Some(expected_node_manifest)
+}
+
 /// Makes the sandbox at `url` ready. `progress` hears about each slow step.
 pub fn ensure(
     bx: &Blaxel,
     url: &str,
     payload: &Payload,
     mode: Mode,
+    progress: &mut dyn FnMut(&str),
+) -> Result<Outcome> {
+    ensure_with(bx, url, payload, mode, None, progress)
+}
+
+/// [`ensure`] for `node_sandbox` (`Some(name)`) never installs: a node's
+/// sandbox that is not already ready is an error, not a plain sandbox.
+pub fn ensure_with(
+    bx: &Blaxel,
+    url: &str,
+    payload: &Payload,
+    mode: Mode,
+    node_sandbox: Option<&str>,
     progress: &mut dyn FnMut(&str),
 ) -> Result<Outcome> {
     let manifest = payload.manifest();
@@ -251,6 +288,9 @@ pub fn ensure(
         return Ok(Outcome::AlreadyReady);
     }
 
+    if let Some(name) = node_sandbox {
+        bail!("{}", node_sandbox_refusal(name));
+    }
     let current = bx.run(url, &format!("cat {MANIFEST_PATH} 2>/dev/null"), 30)?;
     if is_node_manifest(current.output()) {
         // Its relay is started by the node's provisioning, with the
@@ -547,6 +587,23 @@ protocol = "HTTP"
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn node_kind_is_read_from_the_label() {
+        assert!(is_node_kind(Some("node")) && is_node_kind(Some("node-base")));
+        assert!(!is_node_kind(Some("golden")) && !is_node_kind(None));
+        assert!(node_sandbox_refusal("tod-x-1").contains("tod-x-1"));
+    }
+
+    #[test]
+    fn a_fork_without_the_node_manifest_gets_tod_files() {
+        let want = "node relay=abc";
+        assert!(!fork_needs_tod_files(true, Some("node relay=abc\n"), want));
+        assert!(fork_needs_tod_files(true, None, want));
+        assert!(fork_needs_tod_files(true, Some("bootstrap=1 relay=2"), want));
+        assert!(fork_needs_tod_files(true, Some(""), want));
+        assert!(fork_needs_tod_files(false, Some(want), want));
+    }
+
     #[test]
     fn fork_manifest_tracks_relay_and_cli_not_the_bootstrap() {
         let a = Payload { bootstrap: b"a", relay: b"r", tod_cli: b"t", agents: true };

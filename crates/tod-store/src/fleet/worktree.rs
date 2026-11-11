@@ -253,7 +253,8 @@ fn switch_to_branch(repo: &Workdir, branch: &str, base: Option<&str>) -> Result<
     let tracking = format!("{REMOTE}/{branch}");
     if !state.local {
         if state.remote {
-            run_git(repo, &["switch", "--track", "-c", branch, &tracking])?;
+            run_git(repo, &["switch", "--no-track", "-c", branch, &tracking])?;
+            set_upstream(repo, branch)?;
             return Ok(false);
         }
         if let Some(base) = base {
@@ -267,12 +268,31 @@ fn switch_to_branch(repo: &Workdir, branch: &str, base: Option<&str>) -> Result<
         run_git(repo, &["switch", branch])?;
     }
     if state.remote && !state.upstream {
-        let upstream = format!("--set-upstream-to={tracking}");
-        if let Err(err) = run_git(repo, &["branch", &upstream, branch]) {
-            tracing::warn!("link {branch} in {repo} to {tracking}: {err:#}");
-        }
+        set_upstream(repo, branch)?;
     }
     Ok(false)
+}
+
+/// Make `origin/<branch>` the upstream of `branch` by writing the config git
+/// would. `git switch --track` and `git branch --set-upstream-to` refuse when
+/// `origin`'s fetch refspec does not cover the branch (a submodule cloned
+/// with only its default branch, whose `origin/<branch>` was fetched by an
+/// explicit refspec): "starting point ... is not a branch". Such a refspec
+/// gets the branch added, so `@{u}` resolves and later fetches update it.
+fn set_upstream(repo: &Workdir, branch: &str) -> Result<()> {
+    let key = format!("remote.{REMOTE}.fetch");
+    let specs = run_git(repo, &["config", "--get-all", &key]).unwrap_or_default();
+    let covered = specs.lines().any(|spec| {
+        let spec = spec.trim().trim_start_matches('+');
+        spec.starts_with("refs/heads/*:") || spec.starts_with(&format!("refs/heads/{branch}:"))
+    });
+    if !covered {
+        let spec = format!("+refs/heads/{branch}:refs/remotes/{REMOTE}/{branch}");
+        run_git(repo, &["config", "--add", &key, &spec])?;
+    }
+    run_git(repo, &["config", &format!("branch.{branch}.remote"), REMOTE])?;
+    run_git(repo, &["config", &format!("branch.{branch}.merge"), &format!("refs/heads/{branch}")])?;
+    Ok(())
 }
 
 /// Initialized submodules of `repo`, recursively, parents before children.
@@ -448,8 +468,36 @@ pub fn branch_submodules_quickly(worktree: &Workdir, branch: &str) -> Result<Qui
     if !matches!(worktree, Workdir::Sandbox { .. }) {
         return Ok(QuickBranch::Declined("not a cloud sandbox".into()));
     }
-    let script = format!(
-        r#"export BR="$1" KEY="$2"
+    let key = start_key(branch);
+    let out = worktree.output_within(
+        SUBMODULE_LIST_LIMIT.max(std::time::Duration::from_secs(60)),
+        "sh",
+        &["-c", &quick_branch_script(), "sh", branch, &key],
+    )?;
+    if out.status.code() == Some(FETCH_FAILED_EXIT) {
+        bail!("{}", String::from_utf8_lossy(&out.stderr).trim());
+    }
+    if out.status.success() {
+        return Ok(QuickBranch::Done);
+    }
+    let said = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    Ok(QuickBranch::Declined(format!("exit {:?}: {}", out.status.code(), said.trim())))
+}
+
+/// Exit status of [`quick_branch_script`] when a submodule's fetch of the
+/// branch failed (not "origin has no such branch").
+const FETCH_FAILED_EXIT: i32 = 9;
+
+/// The shell script behind [`branch_submodules_quickly`]: `$1` the branch,
+/// `$2` the key that records where it started. Each submodule, side by side,
+/// first asks its `origin` for the branch as of now (a golden's checkout is
+/// days old, and a branch pushed since, a pull request's, must not be missed);
+/// the branch missing there is fine, any other failure exits
+/// [`FETCH_FAILED_EXIT`]. A submodule that has the branch, locally or on
+/// `origin`, exits 7: the careful path must run.
+fn quick_branch_script() -> String {
+    format!(
+        r#"export BR="$1" KEY="$2" LC_ALL=C
 walk() {{
   [ -f "$1/.gitmodules" ] || return 0
   for p in $(git config -f "$1/.gitmodules" --get-regexp '^submodule\..*\.path$' | awk '{{print $2}}'); do
@@ -462,24 +510,123 @@ pids=""
 for sp in $paths; do
   (
     cd "$sp" || exit 1
+    if git config --get remote.{REMOTE}.url >/dev/null; then
+      if ! out=$(git fetch --quiet --no-recurse-submodules {REMOTE} "+refs/heads/$BR:refs/remotes/{REMOTE}/$BR" 2>&1); then
+        case "$out" in
+          *"couldn't find remote ref"*)
+            if git show-ref --verify --quiet "refs/remotes/{REMOTE}/$BR"; then git update-ref -d "refs/remotes/{REMOTE}/$BR"; fi ;;
+          *) echo "fetch {REMOTE} $BR in submodule ${{sp#./}} failed: $out" >&2; exit {FETCH_FAILED_EXIT} ;;
+        esac
+      fi
+    fi
     if git show-ref --verify --quiet "refs/heads/$BR" || git show-ref --verify --quiet "refs/remotes/{REMOTE}/$BR"; then
       echo "$sp already has the branch"; exit 7
     fi
     git switch -q -c "$BR" && git config "$KEY" "$(git rev-parse HEAD)"
-  ) 2>&1 &
+  ) &
   pids="$pids $!"
 done
-rc=0
-for pid in $pids; do wait "$pid" || rc=1; done
+rc=0 fetch=""
+for pid in $pids; do
+  wait "$pid"; s=$?
+  [ "$s" -eq {FETCH_FAILED_EXIT} ] && fetch=1
+  [ "$s" -ne 0 ] && rc=1
+done
+[ -n "$fetch" ] && exit {FETCH_FAILED_EXIT}
 exit $rc"#
-    );
-    let key = start_key(branch);
-    let out = worktree.output_within(std::time::Duration::from_secs(60), "sh", &["-c", &script, "sh", branch, &key])?;
-    if out.status.success() {
-        return Ok(QuickBranch::Done);
+    )
+}
+
+/// Makes `dir` know what `origin` has of `branch` NOW, and brings a local
+/// `branch` up to it. A checkout can be days old (a fork of a golden
+/// sandbox), and its branch may have been pushed since: made from the pinned
+/// commit instead, it would lack that work, and a later push could clobber it.
+/// `origin` not having the branch is fine; any other failed fetch is an error,
+/// as is a local branch that has diverged from `origin`'s. A local branch
+/// behind `origin`'s is fast-forwarded to it. Network: never on the UI thread.
+pub fn sync_branch_with_origin(dir: &Workdir, branch: &str) -> Result<()> {
+    let has_url = run_git(dir, &["config", "--get", &format!("remote.{REMOTE}.url")])
+        .is_ok_and(|url| !url.trim().is_empty());
+    if !has_url {
+        return Ok(());
     }
-    let said = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
-    Ok(QuickBranch::Declined(format!("exit {:?}: {}", out.status.code(), said.trim())))
+    let tracking = format!("{REMOTE}/{branch}");
+    let tracking_ref = format!("refs/remotes/{tracking}");
+    let refspec = format!("+refs/heads/{branch}:{tracking_ref}");
+    let out = dir
+        .git_output(&["fetch", "--quiet", "--no-recurse-submodules", REMOTE, &refspec])
+        .with_context(|| format!("spawn git fetch in {dir}"))?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if stderr.to_lowercase().contains("couldn't find remote ref") {
+            // `origin` has no such branch (any more): a stale record of one
+            // must not make the branch start from it.
+            if run_git(dir, &["rev-parse", "--verify", "-q", &tracking_ref]).is_ok() {
+                run_git(dir, &["update-ref", "-d", &tracking_ref])?;
+            }
+            return Ok(());
+        }
+        bail!(
+            "fetch {REMOTE} {branch} in submodule {dir} failed, so its branch is not made from stale work: {}",
+            stderr.trim()
+        );
+    }
+    let local_ref = format!("refs/heads/{branch}");
+    if run_git(dir, &["rev-parse", "--verify", "-q", &local_ref]).is_err() {
+        return Ok(());
+    }
+    let heads = run_git(dir, &["rev-parse", &local_ref, &tracking_ref])?;
+    let mut heads = heads.lines();
+    let (local, remote) = (heads.next().unwrap_or_default(), heads.next().unwrap_or_default());
+    if local == remote {
+        return Ok(());
+    }
+    let is_ancestor = |a: &str, b: &str| -> Result<bool> {
+        Ok(dir.git_output(&["merge-base", "--is-ancestor", a, b])?.status.success())
+    };
+    if is_ancestor(local, remote)? {
+        if current_branch(dir).as_deref() == Some(branch) {
+            run_git(dir, &["merge", "--ff-only", "-q", &tracking])?;
+        } else {
+            run_git(dir, &["branch", "-f", branch, &tracking])?;
+        }
+        return Ok(());
+    }
+    if is_ancestor(remote, local)? {
+        return Ok(()); // ahead of origin: unpushed work stays
+    }
+    bail!(
+        "branch {branch} in {dir} is at {local} but {tracking} is at {remote}, and neither holds the other: \
+         it has diverged, so tod will not move it; reconcile them there"
+    )
+}
+
+/// [`branch_submodules`] for a checkout that may be older than `origin`
+/// (a new or replaced sandbox, a new worktree): each submodule first learns
+/// what `origin` has of `branch` now ([`sync_branch_with_origin`], side by
+/// side) so a branch pushed meanwhile is tracked instead of remade at the
+/// pinned commit. Fails, naming the submodule, rather than branch from
+/// stale work.
+pub fn branch_submodules_from_origin(worktree: &Workdir, branch: &str) -> Result<Vec<String>> {
+    if branch.is_empty() {
+        return Ok(Vec::new());
+    }
+    let dirs = submodule_dirs(worktree)?;
+    let results: Vec<Result<()>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = dirs
+            .iter()
+            .map(|dir| scope.spawn(move || sync_branch_with_origin(dir, branch)))
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().unwrap_or_else(|_| Err(anyhow!("fetching a submodule panicked"))))
+            .collect()
+    });
+    let errors: Vec<String> = results.into_iter().filter_map(|r| r.err()).map(|e| format!("{e:#}")).collect();
+    if !errors.is_empty() {
+        bail!("{}", errors.join("; "));
+    }
+    branch_submodules(worktree, branch)
 }
 
 /// Check `branch` out in every initialized submodule of `worktree` (see
@@ -963,7 +1110,7 @@ pub fn ensure_worktree(
                 }
                 handle
                     .warnings
-                    .extend(branch_submodules(&handle.path, &branch_key)?);
+                    .extend(branch_submodules_from_origin(&handle.path, &branch_key)?);
             }
         }
         for warning in &handle.warnings {
@@ -1318,6 +1465,164 @@ mod tests {
         assert_eq!(upstream_of(&a, "feature").as_deref(), Some("origin/feature"));
         prune_submodule_branches(&top, "feature").unwrap();
         assert_eq!(current_branch(&a).as_deref(), Some("feature"));
+    }
+
+    /// The origin of submodule `a`, and the commit it gets on `branch`
+    /// after the superproject's checkout was made (a pull request's head).
+    fn push_to_submodule_origin(top: &Workdir, branch: &str, file: &str) -> (Workdir, String) {
+        let origin = Workdir::host(PathBuf::from(run_git(&top.join("a"), &["remote", "get-url", "origin"]).unwrap()));
+        let was = run_git(&origin, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap();
+        if run_git(&origin, &["rev-parse", "--verify", "-q", &format!("refs/heads/{branch}")]).is_ok() {
+            git_in(&origin, &["switch", "-q", branch]);
+        } else {
+            git_in(&origin, &["switch", "-q", "-c", branch]);
+        }
+        git_in(&origin, &["commit", "-q", "--allow-empty", "-m", file]);
+        let tip = git_in(&origin, &["rev-parse", "HEAD"]);
+        git_in(&origin, &["switch", "-q", &was]);
+        (origin, tip)
+    }
+
+    #[test]
+    fn a_branch_pushed_after_the_checkout_was_made_is_fetched_and_tracked() {
+        let top = repo_with_submodules();
+        let (_, tip) = push_to_submodule_origin(&top, "task/x", "pr work");
+        assert!(branch_submodules_from_origin(&top, "task/x").unwrap().is_empty());
+        let a = top.join("a");
+        assert_eq!(current_branch(&a).as_deref(), Some("task/x"));
+        assert_eq!(git_in(&a, &["rev-parse", "HEAD"]), tip);
+        assert_eq!(upstream_of(&a, "task/x").as_deref(), Some("origin/task/x"));
+        // `b` shares the same origin, so it gets the branch too.
+        assert_eq!(git_in(&top.join("b"), &["rev-parse", "HEAD"]), tip);
+    }
+
+    /// A submodule cloned with only its default branch in `origin`'s fetch
+    /// refspec (as the workspace golden's are): `git switch --track` refuses
+    /// the explicitly fetched `origin/<branch>` ("is not a branch"), so the
+    /// upstream is written as config.
+    #[test]
+    fn a_branch_outside_the_fetch_refspec_is_still_tracked() {
+        let top = repo_with_submodules();
+        for sub in ["a", "b"] {
+            git_in(
+                &top.join(sub),
+                &["config", "remote.origin.fetch", "+refs/heads/main:refs/remotes/origin/main"],
+            );
+        }
+        let (_, tip) = push_to_submodule_origin(&top, "task/x", "pr work");
+        assert!(branch_submodules_from_origin(&top, "task/x").unwrap().is_empty());
+        let a = top.join("a");
+        assert_eq!(current_branch(&a).as_deref(), Some("task/x"));
+        assert_eq!(git_in(&a, &["rev-parse", "HEAD"]), tip);
+        assert_eq!(upstream_of(&a, "task/x").as_deref(), Some("origin/task/x"));
+    }
+
+    #[test]
+    fn a_branch_origin_lacks_is_made_at_the_pinned_commit() {
+        let top = repo_with_submodules();
+        let pinned = git_in(&top.join("a"), &["rev-parse", "HEAD"]);
+        assert!(branch_submodules_from_origin(&top, "task/none").unwrap().is_empty());
+        assert_eq!(git_in(&top.join("a"), &["rev-parse", "HEAD"]), pinned);
+        assert_eq!(current_branch(&top.join("a")).as_deref(), Some("task/none"));
+    }
+
+    #[test]
+    fn a_failed_fetch_is_an_error_naming_the_submodule() {
+        let top = repo_with_submodules();
+        git_in(&top.join("a"), &["remote", "set-url", "origin", "/nonexistent/origin"]);
+        let err = format!("{:#}", branch_submodules_from_origin(&top, "task/x").unwrap_err());
+        assert!(err.contains("fetch origin task/x in submodule") && err.contains("a"), "{err}");
+        assert_ne!(current_branch(&top.join("a")).as_deref(), Some("task/x"), "nothing was branched");
+    }
+
+    #[test]
+    fn a_local_branch_behind_origin_is_fast_forwarded() {
+        let top = repo_with_submodules();
+        let a = top.join("a");
+        git_in(&a, &["switch", "-q", "-c", "task/x"]);
+        let (_, tip) = push_to_submodule_origin(&top, "task/x", "later");
+        // Checked out: moved with the working tree.
+        branch_submodules_from_origin(&top, "task/x").unwrap();
+        assert_eq!(git_in(&a, &["rev-parse", "HEAD"]), tip);
+        // Not checked out: the branch moves.
+        git_in(&a, &["switch", "-q", "--detach"]);
+        let (_, tip2) = push_to_submodule_origin(&top, "task/x", "later still");
+        sync_branch_with_origin(&a, "task/x").unwrap();
+        assert_eq!(git_in(&a, &["rev-parse", "refs/heads/task/x"]), tip2);
+    }
+
+    #[test]
+    fn a_diverged_local_branch_is_an_error_naming_both_commits() {
+        let top = repo_with_submodules();
+        let a = top.join("a");
+        git_in(&a, &["switch", "-q", "-c", "task/x"]);
+        git_in(&a, &["commit", "-q", "--allow-empty", "-m", "mine"]);
+        let local = git_in(&a, &["rev-parse", "HEAD"]);
+        let (_, remote) = push_to_submodule_origin(&top, "task/x", "theirs");
+        let err = format!("{:#}", branch_submodules_from_origin(&top, "task/x").unwrap_err());
+        assert!(err.contains(&local) && err.contains(&remote) && err.contains("diverged"), "{err}");
+        assert_eq!(git_in(&a, &["rev-parse", "HEAD"]), local, "unpushed work is left alone");
+    }
+
+    #[test]
+    fn a_stale_record_of_a_deleted_origin_branch_is_dropped() {
+        let top = repo_with_submodules();
+        let a = top.join("a");
+        let (origin, _) = push_to_submodule_origin(&top, "task/x", "pr work");
+        git_in(&a, &["fetch", "-q", "origin"]);
+        git_in(&origin, &["branch", "-q", "-D", "task/x"]);
+        branch_submodules_from_origin(&top, "task/x").unwrap();
+        assert!(run_git(&a, &["rev-parse", "--verify", "-q", "refs/remotes/origin/task/x"]).is_err());
+        assert_eq!(upstream_of(&a, "task/x"), None);
+    }
+
+    /// The one-call script a sandbox runs, run here on the host.
+    #[cfg(unix)]
+    fn run_quick_script(top: &Workdir, branch: &str) -> std::process::Output {
+        let key = start_key(branch);
+        // A submodule's `git` refuses a local-path origin unless told otherwise.
+        let script = format!(
+            "export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=protocol.file.allow GIT_CONFIG_VALUE_0=always\n{}",
+            quick_branch_script()
+        );
+        top.output("sh", &["-c", &script, "sh", branch, &key]).unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_quick_script_fetches_a_branch_pushed_meanwhile_before_deciding() {
+        let top = repo_with_submodules();
+        let (_, tip) = push_to_submodule_origin(&top, "task/x", "pr work");
+        // The branch is on origin now: the script leaves it to the careful path (exit 7)...
+        let out = run_quick_script(&top, "task/x");
+        assert!(!out.status.success(), "{out:?}");
+        assert_ne!(out.status.code(), Some(FETCH_FAILED_EXIT), "{out:?}");
+        // ...which finds it, because the script fetched it.
+        assert_eq!(git_in(&top.join("a"), &["rev-parse", "refs/remotes/origin/task/x"]), tip);
+        branch_submodules(&top, "task/x").unwrap();
+        assert_eq!(git_in(&top.join("a"), &["rev-parse", "HEAD"]), tip);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_quick_script_branches_every_submodule_when_origin_has_no_branch() {
+        let top = repo_with_submodules();
+        let out = run_quick_script(&top, "task/none");
+        assert!(out.status.success(), "{out:?}");
+        for sub in ["a", "b"] {
+            assert_eq!(current_branch(&top.join(sub)).as_deref(), Some("task/none"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_quick_script_fails_loudly_when_a_fetch_fails() {
+        let top = repo_with_submodules();
+        git_in(&top.join("b"), &["remote", "set-url", "origin", "/nonexistent/origin"]);
+        let out = run_quick_script(&top, "task/x");
+        assert_eq!(out.status.code(), Some(FETCH_FAILED_EXIT), "{out:?}");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("submodule b") && err.contains("failed"), "{err}");
     }
 
     #[test]

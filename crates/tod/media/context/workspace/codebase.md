@@ -8,6 +8,14 @@ docs (`CLAUDE.md`, `AGENTS.md`, skills, rules) say to work in one. If the
 task's Files capability runs you in a dev container, you are already inside
 it: work there as you are.
 
+Your working directory is the checkout the app set up for this task, already
+on the right branch (in every submodule too). Make every change, commit and
+push right there. Do not make a git worktree (`git worktree add`, a `.worktrees/`
+directory) or switch branches, even when the repository's own agent docs say
+to: the app reviews, checks and pushes the checkout you were started in, so
+work done in a worktree is invisible to it, and the worktree holds the
+branch so the checkout cannot be put back on it.
+
 ## Writing that leaves the app
 
 Commit messages, pull request titles, descriptions and comments, review

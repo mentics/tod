@@ -74,15 +74,53 @@ pub fn latest_review(conn: &Connection, node: Uuid) -> Result<Option<Conversatio
         .filter(|c| is_own(c, since)))
 }
 
-/// How many reviews (first groups' sessions) have run in `pr_draft` in this
-/// stay: the rounds counted against `REVIEW_ROUND_LIMIT`.
-pub fn reviews_this_stay(conn: &Connection, node: Uuid) -> Result<u32> {
+/// The consecutive reviews in this stay that did not come back clean, counted
+/// back from the latest and stopping at the most recent clean one: the rounds
+/// counted against `REVIEW_ROUND_LIMIT`. A clean review (finished, and
+/// recording nothing that stands, as [`round_clean`]) resets the count, since
+/// a review is owed every time the head changes (a merge of the base, a CI
+/// fix, an answer to a bot) and clean ones prove convergence, not the
+/// opposite. A review's round is its findings up to the next review.
+pub fn unconverged_rounds(conn: &Connection, node: Uuid) -> Result<u32> {
     let since = PhaseRepo::new(conn).stay_started_at(node)?;
-    Ok(ConversationRepo::new(conn)
+    let repo = ConversationRepo::new(conn);
+    let mut reviews: Vec<Conversation> = repo
         .conversations_for_focus(Focus::Node(node))?
-        .iter()
+        .into_iter()
         .filter(|c| c.skill_group == 0 && is_own(c, since))
-        .count() as u32)
+        .collect();
+    reviews.sort_by_key(|c| c.created_at);
+    let findings = own_findings(conn, node)?;
+    let mut count = 0;
+    let mut next_start = i64::MAX;
+    for review in reviews.iter().rev() {
+        let done = repo
+            .latest_report(review.id)?
+            .is_some_and(|r| crate::conversation::review::is_done_report(&r));
+        let stands = findings
+            .iter()
+            .filter(|f| f.created_at >= review.created_at && f.created_at < next_start)
+            .any(|f| !matches!(f.status.as_str(), FINDING_OUT_OF_SCOPE | FINDING_DECLINED));
+        if done && !stands {
+            break;
+        }
+        count += 1;
+        next_start = review.created_at;
+    }
+    Ok(count)
+}
+
+/// What the latest review in this stay left standing, in words, for
+/// [`crate::autopilot::NeedsHuman::ReviewNotConverging`]: short id, summary
+/// and status of each finding not dismissed. Empty when nothing stands.
+pub fn stay_standing(conn: &Connection, node: Uuid) -> Result<Vec<String>> {
+    let latest = latest_review(conn, node)?;
+    Ok(own_findings(conn, node)?
+        .iter()
+        .filter(|f| latest.as_ref().is_some_and(|l| f.created_at >= l.created_at))
+        .filter(|f| !matches!(f.status.as_str(), FINDING_OUT_OF_SCOPE | FINDING_DECLINED))
+        .map(|f| format!("[{}] {} ({})", tod_store::interview::short_id(f.id), f.summary, f.status))
+        .collect())
 }
 
 /// The findings of tod's own reviews in `pr_draft`, oldest first: every one

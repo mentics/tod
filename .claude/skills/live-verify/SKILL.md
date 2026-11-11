@@ -143,3 +143,19 @@ new gotcha to this file and `doc/live-verification.md` and merge them.
   Reset environment (runner menu) after a deploy, and check `user_version` of the
   supervisor's `tod.db` in the sandbox to be sure it is the new build.
 - No `timeout` on macOS; do not wrap cargo in it, and `sed -i ''`.
+- Typing into a request's free-text field: click it, send `key enter` (edit
+  mode), then `text ...`, then `key ctrl-enter` to submit. Without the Enter
+  the text goes nowhere.
+- The task panel's upper part scrolls: with a long failure text the runner
+  buttons sit below its fold (`scroll 1400 400 0 300` brings them up).
+- Sandboxes left asleep over an hour are deleted by Cofactr's `Blaxel Prune`
+  workflow unless labelled `keep-when-idle=true` (node sandboxes are).
+- A submodule whose origin fetches only its default branch needs the node's
+  branch in its fetch refspec and an upstream in config; `git switch --track`
+  refuses it.
+- A node sandbox is a fork with its golden's memory (8 GB), its root
+  filesystem in RAM, and the workspace's dev servers started at boot (about
+  3 GB): memory-hungry checks (basedpyright) can be killed by the kernel.
+- `pkill -f <pattern>` inside `tod-sandbox exec ... sh -c` also matches, and
+  kills, that `sh`: kill by PID.
+- In zsh, `"$B:refs"` is a history modifier; write `"${B}:refs"`.

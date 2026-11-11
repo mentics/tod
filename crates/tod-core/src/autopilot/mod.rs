@@ -243,7 +243,7 @@ impl NeedsHuman {
     pub fn describe(&self) -> String {
         match self {
             Self::Decision { pending } => {
-                format!("the agent asked you {pending} question(s) and is waiting for your answer")
+                format!("the agent is waiting on {pending} question(s) only you can answer; open the node's requests and answer them")
             }
             Self::BlockedSteps { count } => format!(
                 "the agent handed back {count} plan step(s) it could not finish; open the plan to see why, \
@@ -266,15 +266,15 @@ impl NeedsHuman {
                 fixes.join("; ")
             ),
             Self::PrBlocked { why } => {
-                format!("the agent handed the pull request back to you: {why}. Resolve that, then run it again")
+                format!("the agent stopped work on the pull request because: {why}. Fix that (or tell the agent what to do instead), then run it again")
             }
             Self::PrStuck { why } => format!(
                 "the pull request keeps needing work and the agent is not getting it through: {why}. \
                  Look at the pull request yourself, then run it again"
             ),
             Self::Permission { title } => format!(
-                "the agent is asking for permission ({title}) and nobody has granted it; \
-                 allow or deny it and the agent carries on"
+                "the agent needs permission for: {title}. Nobody has granted it; \
+                 open the node's requests and allow or deny it, and the agent carries on"
             ),
             Self::AgentFailed { error } => {
                 format!("the agent's turn failed: {error}. Run it again to retry")
@@ -1421,9 +1421,12 @@ impl Autopilot {
                     });
                     if !resuming && rounds >= round_limit {
                         let standing = fleet.read(|conn| pr_draft_review::change_standing(conn, node, made_at))?;
-                        return Ok(Some(Outcome::NeedsHuman {
-                            reason: NeedsHuman::ReviewNotConverging { rounds, standing },
-                        }));
+                        // Nothing standing is not non-convergence: review again.
+                        if !standing.is_empty() {
+                            return Ok(Some(Outcome::NeedsHuman {
+                                reason: NeedsHuman::ReviewNotConverging { rounds, standing },
+                            }));
+                        }
                     }
                     self.state.loops.review_rounds = rounds + u32::from(!resuming);
                     self.save()?;
@@ -1496,24 +1499,20 @@ impl Autopilot {
                 }
             }
             Owed::Review => {
-                let rounds = fleet.read(|conn| pr_draft_review::reviews_this_stay(conn, node))?;
+                let rounds = fleet.read(|conn| pr_draft_review::unconverged_rounds(conn, node))?;
                 // A review the last run left unfinished is resumed, not a new round.
                 let resuming = self.state.current.as_ref().is_some_and(|c| {
                     c.protocol == protocol_name(ProtocolKind::Review) && c.lifecycle == pr_draft_review::STATE
                 });
                 if !resuming && rounds >= REVIEW_ROUND_LIMIT {
-                    let standing = fleet.read(|conn| {
-                        let latest = pr_draft_review::latest_review(conn, node)?;
-                        Ok(pr_draft_review::own_findings(conn, node)?
-                            .iter()
-                            .filter(|f| latest.as_ref().is_some_and(|l| f.created_at >= l.created_at))
-                            .filter(|f| !matches!(f.status.as_str(), "out_of_scope" | "declined"))
-                            .map(|f| format!("[{}] {} ({})", tod_store::interview::short_id(f.id), f.summary, f.status))
-                            .collect::<Vec<_>>())
-                    })?;
-                    return Ok(OwnReview::Stop(Outcome::NeedsHuman {
-                        reason: NeedsHuman::ReviewNotConverging { rounds, standing },
-                    }));
+                    // Nothing standing is not a review that fails to converge:
+                    // the head is simply reviewed.
+                    let standing = fleet.read(|conn| pr_draft_review::stay_standing(conn, node))?;
+                    if !standing.is_empty() {
+                        return Ok(OwnReview::Stop(Outcome::NeedsHuman {
+                            reason: NeedsHuman::ReviewNotConverging { rounds, standing },
+                        }));
+                    }
                 }
                 let heads = pr_draft_review::current_heads(live);
                 hook.working_on("tod's code review of the pull request");

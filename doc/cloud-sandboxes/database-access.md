@@ -125,6 +125,22 @@ list them in a `Databases` block and add the `cli/db` how-to only when the
 list is not empty. A node with none, and any run on this machine, is not told
 `db` exists.
 
+### `db-query` in the sandbox
+
+The Cofactr workspace's own `db-query` (`scripts/shell/bin/db-query`) signs a
+prod login with the aws CLI, which a sandbox lacks, so agents stopped and asked
+the user. Every node's sandbox therefore gets `assets/sandbox/db-query.sh` at
+`/opt/tod/bin/db-query`, linked as `/usr/local/bin/db-query`
+(`node::DB_QUERY_PATH`, installed with `tod-cli`). For a database the user set
+up under the same name (`prod-platform`, `prod-kb`) it takes the same
+arguments and prints the same JSON, running `psql` through `tod-cli db run`
+with the same read-only session, 30 s statement timeout and 500-row cap. `local-*` and
+`prod-paradedb` go to the workspace's script; a name not set up (including the
+`-postgres` variants) is an error saying to ask the user to add it. It only
+wins if `/usr/local/bin` precedes the workspace's `scripts/shell/bin` on
+`PATH`; the agent's Databases block says the same in words either way. The
+workspace's own rules for prod (EXPLAIN first, confirmations) are unchanged.
+
 ### In the sandbox (`tod-cli db`)
 
 Runs in the sandbox, like `pr` and `secrets` (`cli_relay::LOCAL_NOUNS`),

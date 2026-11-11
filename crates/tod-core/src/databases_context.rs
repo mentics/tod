@@ -53,7 +53,10 @@ pub fn render(notes: &[Note]) -> String {
     }
     let mut out = String::from(
         "\n## Databases\n\nThe user has set up these databases for you. Use them with `tod-cli db` (below), \
-         never with a login of your own:\n\n",
+         never with a login of your own. The workspace's own `db-query` for \
+         `prod-*` needs the aws CLI, which a sandbox lacks: tod installs a `db-query` \
+         here that takes the same arguments and logs in through `tod-cli db`. If any \
+         script still asks for the aws CLI, use `tod-cli db` instead of asking the user:\n\n",
     );
     for n in notes {
         out.push_str(&format!("- `{}`: database `{}`, as user `{}`\n", n.name, n.dbname, n.user));
