@@ -23,6 +23,16 @@ tod-cli --data-root <DATA_ROOT> db psql prod -- -c "select count(*) from parts"
 tod-cli --data-root <DATA_ROOT> db run prod -- python scripts/check_counts.py
 ```
 
+A project script that logs in to a database itself, such as `db-query` for a
+production database (it signs an IAM login with the aws CLI), does not work in
+a sandbox: there is no aws CLI and no AWS session, and the user does not need
+to be asked for one. When a database below has the name the script takes,
+`db-query <NAME> "<sql>"` here is the app's own, which logs in through `db` and
+returns the script's JSON; otherwise run the same SQL with `db psql <NAME>` or
+`db run`. Never stop to ask for the aws CLI, and keep to any rule the project
+sets for production (read-only, EXPLAIN first, asking before a costly query):
+`db` only provides the login.
+
 The login lasts 15 minutes, which is long enough to connect; a command that
 stays connected keeps its session. Run `db` again for the next command. Read
 the variables from the environment and never print them, write them to a
