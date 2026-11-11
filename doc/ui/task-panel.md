@@ -72,7 +72,10 @@ GitHub yet" shows until **Update PR** sends it (labels, then open or draft,
 then the reviewer; it stops at the first failure and says why on the row).
 Opening a draft, and asking a reviewer of a draft, are refused at Update PR
 until the code review has passed clean (`Assessment::review_clean`); the error
-says what is left. Every call to GitHub runs off the UI thread.
+says what is left. Beside the buttons an indicator says where the review
+stands without waiting for a click: "✓ Ready to open and assign", or
+"⏳ Review feedback to address / Waiting for <bot> / Checks running", with the
+full list of what is left in its tooltip (also on Open while it is a draft). Every call to GitHub runs off the UI thread.
 
 ### Artifacts
 

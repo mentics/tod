@@ -20,6 +20,8 @@ pub struct PrFacts {
     pub review_clean: bool,
     /// Why it is not clean, for the disabled buttons' tooltip.
     pub not_clean_because: String,
+    /// The same in a few words, for the indicator beside the buttons.
+    pub waiting_on: String,
     pub labels: Vec<String>,
     /// Logins GitHub still waits on for a review.
     pub requested_reviewers: Vec<String>,
@@ -60,6 +62,23 @@ pub fn load(
     let assessment =
         crate::pr_readiness::Assessment::of(&snapshot, &settings, chrono::Utc::now()).answered_through(answered_at);
     let review_clean = assessment.review_clean();
+    let waiting_on = if review_clean {
+        String::new()
+    } else if !assessment.work().is_empty() {
+        "Review feedback to address".to_string()
+    } else {
+        use crate::pr_readiness::Wait;
+        assessment
+            .waits()
+            .iter()
+            .find_map(|w| match w {
+                Wait::BotReview { bot } => Some(format!("Waiting for {bot}")),
+                Wait::ChecksRunning => Some("Checks running".to_string()),
+                Wait::GitHub => Some("GitHub still computing".to_string()),
+                Wait::HumanReview => None,
+            })
+            .unwrap_or_else(|| "Not clean yet".to_string())
+    };
     let not_clean_because = if review_clean {
         String::new()
     } else {
@@ -86,6 +105,7 @@ pub fn load(
         merged: assessment.merged,
         review_clean,
         not_clean_because,
+        waiting_on,
         labels,
         requested_reviewers: assessment.requested_reviewers.clone(),
     })

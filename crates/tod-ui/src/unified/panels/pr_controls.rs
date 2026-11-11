@@ -558,10 +558,22 @@ impl PrControls {
         let pr = row.pr.clone();
         let pr_update = row.pr.clone();
         let open_label = if want_open { "Open ✓" } else { "Open" };
-        let open_tip = if want_open {
-            "Open for review. Click to switch back to a draft (sent with Update PR)."
-        } else {
-            "A draft. Click to open it for review (sent with Update PR, once the code review is clean)."
+        let reason = facts
+            .filter(|f| !f.merged && !f.review_clean)
+            .map(|f| format!("Not ready to open or send to a reviewer. Waiting on:\n{}", f.not_clean_because));
+        let (ready_label, ready_tip) = match facts {
+            None => ("Checking review…".to_string(), "Reading the pull request and its review from GitHub.".to_string()),
+            Some(f) if f.merged => ("Merged".to_string(), "This pull request is merged.".to_string()),
+            Some(f) if f.review_clean => (
+                "✓ Ready to open and assign".to_string(),
+                "The code review is clean: all feedback is answered and resolved, and nothing is left but a person's review.".to_string(),
+            ),
+            Some(f) => (format!("⏳ {}", f.waiting_on), reason.clone().unwrap_or_default()),
+        };
+        let open_tip = match (&reason, want_open) {
+            (Some(r), _) if !facts.is_some_and(|f| f.is_open()) => r.clone(),
+            (_, true) => "Open for review. Click to switch back to a draft (sent with Update PR).".to_string(),
+            _ => "A draft. Click to open it for review (sent with Update PR).".to_string(),
         };
         let status = row
             .error
@@ -614,6 +626,9 @@ impl PrControls {
                 if unsent { button.primary() } else { button }
             })
             .child(
+                Button::new(("pr-ready", ix)).small().ghost().label(ready_label).tooltip(ready_tip),
+            )
+            .child(
                 Button::new(("pr-refresh", ix))
                     .small()
                     .ghost()
@@ -657,6 +672,7 @@ mod tests {
             merged: false,
             review_clean: false,
             not_clean_because: String::new(),
+            waiting_on: String::new(),
             labels: labels.iter().map(|s| s.to_string()).collect(),
             requested_reviewers: requested.iter().map(|s| s.to_string()).collect(),
         }
