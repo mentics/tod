@@ -194,11 +194,38 @@ impl Sandboxes {
     /// [`Self::ensure`], with `mode` saying whether a sandbox that lacks tod's
     /// packages gets them installed (a plain image) or is only checked (a
     /// fork of a prepared sandbox).
+    ///
+    /// Refuses a node's sandbox (its `tod-kind` label) that is not already
+    /// ready: only the node's own provisioning ([`Self::ensure_node_as`])
+    /// installs into one, so a git or Files call on a half-made node sandbox
+    /// never turns it into a plain one.
     pub fn ensure_as(
         &mut self,
         bx: &Blaxel,
         name: &str,
         mode: provision::Mode,
+        progress: &mut dyn FnMut(&str),
+    ) -> Result<String> {
+        self.ensure_inner(bx, name, mode, false, progress)
+    }
+
+    /// [`Self::ensure_as`] for the node's own provisioning of its sandbox.
+    pub fn ensure_node_as(
+        &mut self,
+        bx: &Blaxel,
+        name: &str,
+        mode: provision::Mode,
+        progress: &mut dyn FnMut(&str),
+    ) -> Result<String> {
+        self.ensure_inner(bx, name, mode, true, progress)
+    }
+
+    fn ensure_inner(
+        &mut self,
+        bx: &Blaxel,
+        name: &str,
+        mode: provision::Mode,
+        by_node: bool,
         progress: &mut dyn FnMut(&str),
     ) -> Result<String> {
         let info = bx.get(name)?.ok_or_else(|| anyhow!("no sandbox named {name}"))?;
@@ -208,11 +235,12 @@ impl Sandboxes {
             bx.wait_deployed(name, Duration::from_secs(180))?
         };
         let url = info.url.clone().unwrap_or_default();
+        let refuse = !by_node && mode != provision::Mode::ForceInstall && provision::is_node_kind(info.label("tod-kind"));
         let agents = self.config.sandbox(name).is_some_and(|s| s.agents);
         let relay_bin = relay_binary()?;
         let payload = payload(&relay_bin, agents);
         let started = Instant::now();
-        let outcome = provision::ensure(bx, &url, &payload, mode, progress)
+        let outcome = provision::ensure_with(bx, &url, &payload, mode, refuse.then_some(name), progress)
             .with_context(|| format!("make sandbox {name} ready for tod"))?;
         if outcome != provision::Outcome::AlreadyReady {
             progress(&format!("{name}: ready ({outcome:?}, {:.1}s)", started.elapsed().as_secs_f64()));
