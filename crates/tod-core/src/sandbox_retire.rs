@@ -172,7 +172,7 @@ fn failure_message(item: &Due, err: &anyhow::Error, transient: bool) -> String {
 /// Deletes the sandbox of every due node, through [`lost::delete_node_sandbox`].
 /// Blocks on the network: never on the UI thread.
 pub fn retire_due(fleet: &FleetStore) -> Result<Retired> {
-    retire_due_with(fleet, tod_store::outline::uuid_blob::now_ms(), &mut |node| lost::delete_node_sandbox(fleet, node))
+    retire_due_with(fleet, tod_store::outline::uuid_blob::now_ms(), &mut |node| lost::retire_node_sandbox(fleet, node))
 }
 
 /// [`retire_due`] with the clock and the delete given.

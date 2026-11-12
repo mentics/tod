@@ -123,7 +123,7 @@ pub fn sandbox_is_gone(err: &anyhow::Error) -> bool {
 }
 
 /// Whether `error` says the sandbox called `sandbox` is gone.
-fn says_sandbox_gone(error: &str, sandbox: &str) -> bool {
+pub fn says_sandbox_gone(error: &str, sandbox: &str) -> bool {
     error.contains(&format!("no sandbox named {sandbox}"))
         || error.contains(&format!("sandbox {sandbox} is TERMINATED"))
         || error.contains(&format!("sandbox {sandbox} is DELETING"))

@@ -257,3 +257,19 @@ from Blaxel.
   for "Pruned sandbox".
 - **Measure**: nodes showing "sandbox is gone/deleted" for longer than one sync;
   replacements per node; nodes failed by `could not be made after 3 tries`.
+
+- **Follow-up (pruned sandbox, second pass)**: the first fix did not help the
+  live nodes because `cloud-sync.json`'s `deleted_by_user` flag was set on 13
+  non-done nodes, which kept them out of replacement. Cause: the flag was set by
+  every `delete_with`, including the daemon's retirement of a done node's
+  sandbox (`sandbox_retire`), and outlived the node's next run. Fix: only the
+  user's explicit Delete sandbox (menu, delete anyway, stop and delete) sets
+  it, bound to the sandbox it removed (`deleted_sandboxes`); retirement leaves
+  none and a done node is never replaced. `lost::heal_deleted_flags` (every
+  sync, in the app and the daemon) clears a flag whose row now names another
+  sandbox, and a legacy flag (no sandbox name) on a node whose run row is
+  starting/working/waiting. The replacement tries are persisted
+  (`replace_tries`), kept until a sandbox is made so a failed record write is
+  recorded again without another try, and the conversation driver's resend
+  after a launch finds the sandbox gone shares the same bound
+  (`allow_remake`).

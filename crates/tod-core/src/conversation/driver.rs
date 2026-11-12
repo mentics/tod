@@ -688,6 +688,9 @@ impl ConversationDriver {
             .unwrap_or(run.chars_at_start);
         match outcome {
             Ok(reply) => {
+                if let Some(node) = self.focus.node_id().filter(|_| run.sandbox.is_some()) {
+                    crate::cloud_sync::lost::remade(fleet, &node.to_string());
+                }
                 let parts = agent
                     .with(|a| a.session_reply_parts(&run.key))
                     .unwrap_or_default();
@@ -748,7 +751,11 @@ impl ConversationDriver {
             // send the same message again, which makes it a new one.
             Err(message)
                 if self.focus.node_id().zip(run.sandbox.as_deref()).is_some_and(|(node, sandbox)| {
-                    tod_store::fleet::provision::forget_lost_sandbox(fleet, &node.to_string(), sandbox, &message)
+                    // Remaking is bounded like the lost-sandbox check's: a spent
+                    // bound leaves the real error to the arms below.
+                    tod_store::fleet::provision::says_sandbox_gone(&message, sandbox)
+                        && crate::cloud_sync::lost::allow_remake(fleet, &node.to_string())
+                        && tod_store::fleet::provision::forget_lost_sandbox(fleet, &node.to_string(), sandbox, &message)
                         .unwrap_or(false)
                 }) =>
             {

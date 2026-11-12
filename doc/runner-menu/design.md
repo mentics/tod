@@ -459,3 +459,11 @@ from its saved state. Only a node meant to run is replaced: one whose run row
 is `Stopped` (paused, stopped, failed, needs someone) or `Done` is not, and a
 sandbox the user deleted waits for Start. A failed replacement is tried three
 times ten minutes apart, then the node is recorded failed with the last error.
+
+The "deleted by the user" flag (`cloud-sync.json`, `deleted_by_user` plus
+`deleted_sandboxes`) means exactly: the user chose Delete sandbox for that
+sandbox. Retiring a done node's sandbox does not set it. `heal_deleted_flags`
+drops a flag whose cloud row now names another sandbox, and a legacy flag with
+no sandbox name for a node whose run row says it is meant to run. Replacement
+tries are kept in `replace_tries` in the same file, so a restart does not grant
+them again.
