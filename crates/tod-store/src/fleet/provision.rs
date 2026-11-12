@@ -1205,6 +1205,7 @@ fn discard_failed_sandbox(
     // Whether Blaxel has a sandbox of that name: a fork or create that failed
     // before Blaxel made one leaves nothing, and the message must not say it
     // was deleted or kept.
+    let todo = tod_sandbox::health::WHAT_TO_DO;
     let existing = bx.get(name).map(|info| info.is_some());
     let transient = tod_sandbox::blaxel::error_is_transient(&err);
     let keep = matches!(existing, Ok(true)) && (!transient || std::env::var_os("TOD_KEEP_FAILED_SANDBOX").is_some());
@@ -1218,13 +1219,13 @@ fn discard_failed_sandbox(
     };
     let cleaned = match existing {
         Err(e) => format!(
-            "tod could not check whether {name} exists ({e:#}). What to do: check this machine's network \
+            "tod could not check whether {name} exists ({e:#}). {todo} check this machine's network \
              connection and Blaxel's status; if `tod-sandbox list` shows {name}, delete it with \
              `tod-sandbox delete {name}`; then start the node again"
         ),
         Ok(_) if keep => match forget() {
             Ok(()) => format!(
-                "{name} was kept so the cause can be found in it. What to do: open it with \
+                "{name} was kept so the cause can be found in it. {todo} open it with \
                  `tod-sandbox shell {name}` (the relay's log is in its process API, \
                  `curl 127.0.0.1:8080/process/tod-relay/logs`), or send this error to whoever maintains tod; \
                  when you are done, delete it with `tod-sandbox delete {name}` and start the node again"
@@ -1235,7 +1236,7 @@ fn discard_failed_sandbox(
             let deleted = if existed { sandboxes.delete(bx, name) } else { Ok(()) };
             match deleted {
                 Err(e) => format!(
-                    "{name} could not be deleted ({e:#}). What to do: delete it with `tod-sandbox delete {name}` \
+                    "{name} could not be deleted ({e:#}). {todo} delete it with `tod-sandbox delete {name}` \
                      and the node's location in its Files settings, then start the node again"
                 ),
                 Ok(()) => match forget() {
@@ -1247,12 +1248,12 @@ fn discard_failed_sandbox(
                         };
                         if transient {
                             format!(
-                                "{what}. This looks temporary (the network or Blaxel). What to do: start the node \
+                                "{what}. This looks temporary (the network or Blaxel). {todo} start the node \
                                  again, which makes a fresh sandbox"
                             )
                         } else {
                             format!(
-                                "{what}. What to do: start the node again; if it fails the same way, send this \
+                                "{what}. {todo} start the node again; if it fails the same way, send this \
                                  error to whoever maintains tod"
                             )
                         }

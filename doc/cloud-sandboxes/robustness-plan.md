@@ -207,15 +207,17 @@ reuse is decided on health, never on `status = DEPLOYED`. A per-node
 cross-process lock for provisioning; the name recorded before the first
 call; delete on failure; an orphan sweeper.
 
-A failed check reads in plain words (`HealthFailure::problem`, then a single
-"What to do:" step, `next_step`), then a `Technical detail:` line with the
-check name and what it saw. The step depends on `Setup`: a sandbox made by this
-Start is kept and the next Start deletes it and makes another
-(`NameDecision::ReplaceFailed`); an existing one is never deleted by Start, so
-the step names the runner menu's Reset environment (installs tod's files again
-and re-probes) and, if that fails the same way, Delete sandbox. A GitHub
-failure points at the red "GitHub token" banner's Add/Replace token button.
-The autopilot does not retry a failed setup itself.
+A failed check reads in plain words (`HealthFailure::problem`, then a hint or
+step, `next_step`), then a `Technical detail:` line with the check name and
+what it saw. One owner writes the "What to do:" step (`health::WHAT_TO_DO`).
+For a sandbox this Start made (`Setup::New`) the failure is wrapped by
+`discard_failed_sandbox`, which deletes a temporary failure's sandbox at once
+or keeps another for the next Start to replace, and says which; the health text
+adds only hints (golden refresh, disk, the GitHub token banner). An existing
+sandbox (`Setup::Existing`) is never deleted by Start, so its health text is
+the step: the runner menu's Reset environment (installs tod's files again and
+re-probes) and, if that fails the same way, Delete sandbox. The autopilot does
+not retry a failed setup itself.
 
 ### 3.6 A version contract instead of source hashes (orchestrator D1, 19)
 
