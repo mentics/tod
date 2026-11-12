@@ -704,6 +704,14 @@ impl TranscriptPanel {
                     body = body.child(chunk);
                 }
             }
+            ItemKind::Note(_) => {
+                body = body.child(crate::ui::selectable_text::selectable_text(
+                    SharedString::from(format!("activity-note-{id}")),
+                    entry.detail.clone(),
+                    window,
+                    cx,
+                ));
+            }
             ItemKind::Session => return None,
         }
         Some(body.into_any_element())

@@ -524,7 +524,8 @@ pub fn stop_reason(outcome: &Outcome, budget: &Budget) -> Option<String> {
             | NeedsHuman::ReviewNotConverging { .. }
             | NeedsHuman::CheckBroken { .. }
             | NeedsHuman::ChecksNotConverging { .. }
-            | NeedsHuman::ChecksUnfixed { .. } => Some(reason.describe()),
+            | NeedsHuman::ChecksUnfixed { .. }
+            | NeedsHuman::LostWork { .. } => Some(reason.describe()),
         },
     }
 }

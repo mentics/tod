@@ -67,6 +67,8 @@ pub mod kind {
     pub const CHECKS_NOT_CONVERGING: &str = "checks_not_converging";
     /// The fix agent changed nothing when sent the failing checks.
     pub const CHECKS_UNFIXED: &str = "checks_unfixed";
+    /// The node's code was lost again after the app reopened its implementation.
+    pub const LOST_WORK: &str = "lost_work";
 }
 
 /// How a run's words differ by who ran it.
@@ -200,6 +202,7 @@ pub fn for_outcome(outcome: &Outcome, words: Words<'_>) -> Draft {
                     draft(Phase::Stopped, kind::CHECKS_NOT_CONVERGING, text, RESUMABLE_BY_YOU)
                 }
                 NeedsHuman::ChecksUnfixed { .. } => draft(Phase::Stopped, kind::CHECKS_UNFIXED, text, RESUMABLE_BY_YOU),
+                NeedsHuman::LostWork { .. } => draft(Phase::Stopped, kind::LOST_WORK, text, RESUMABLE_BY_YOU),
             }
         }
     }
@@ -358,6 +361,7 @@ mod tests {
                 kind::CHECKS_NOT_CONVERGING,
             ),
             (NeedsHuman::ChecksUnfixed { failing: vec!["lint".into()] }, kind::CHECKS_UNFIXED),
+            (NeedsHuman::LostWork { why: "w".into() }, kind::LOST_WORK),
         ];
         for (reason, expected) in stops {
             let got = needs(reason.clone());

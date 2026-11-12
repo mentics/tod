@@ -17,6 +17,15 @@ checkouts of the same repository may exist on this machine — the data root may
 even sit inside one — but they belong to someone else: never change into them
 or build them.
 
+If the change is simply not there (the branch holds nothing beyond its base,
+though the plan says the work is done), do not verify and do not offer to
+"send the task back" or to "try again" as options: the app checks this itself
+before each turn and, when the checkout proves the code was lost, moves the
+task back to `active` and reopens its steps without asking anyone. Ask one
+decision with the reason `broken` that says what you found (the branch, the
+base, what is missing), and stop; the app reads it, reopens the work if the
+branch proves it lost, and otherwise leaves your question for the user.
+
 ## What you were given up front
 
 The context below inlines the task's obligation hierarchy, its plan steps

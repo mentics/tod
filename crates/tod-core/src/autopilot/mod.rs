@@ -220,6 +220,11 @@ pub enum NeedsHuman {
     /// The fix agent was sent the failing checks and left the files as they
     /// were, so sending them again would not help.
     ChecksUnfixed { failing: Vec<String> },
+    /// The node's implementation was reopened once because its branch held
+    /// none of the code its done steps describe ([`crate::lost_work`]), and
+    /// it is in that state again: the rebuilt work is gone too, or the steps
+    /// make no commits.
+    LostWork { why: String },
 }
 
 impl NeedsHuman {
@@ -323,6 +328,10 @@ impl NeedsHuman {
                  would not help. Look at what it said, or fix them yourself, then run again",
                 failing.join("; ")
             ),
+            Self::LostWork { why } => format!(
+                "the node's code is missing again after tod reopened its implementation once: {why} \
+                 Check where the work is being committed and pushed, then run it again"
+            ),
             Self::Looping { what, times } => format!(
                 "the same problem has come back {times} times and the agent is going in circles: {what}. \
                  Look at it yourself, or change the plan or the instructions, then run it again"
@@ -411,6 +420,9 @@ pub struct Autopilot {
     /// the next conversation is a new one, never a reopened one. Taken by
     /// [`Self::converse`].
     fresh_session: bool,
+    /// The state [`crate::lost_work`] last looked in for this run, so the
+    /// checkout is read once per state, not at every step in it.
+    lost_checked: Option<String>,
 }
 
 /// How often a waiting pull request is read again, at first.
@@ -437,6 +449,7 @@ impl Autopilot {
             pr_poll: PR_POLL,
             state,
             fresh_session,
+            lost_checked: None,
         };
         if fresh_session {
             pilot.start_fresh_session()?;
@@ -593,6 +606,16 @@ impl Autopilot {
             if lifecycle == "done" {
                 return self.finish(Outcome::Done);
             }
+            // Work the node's branch no longer holds is rebuilt, never asked
+            // about, and comes before a question an agent asked about it.
+            match self.reopen_lost_work(fleet, hook, &lifecycle)? {
+                ChecksStep::Proceed => {}
+                ChecksStep::Fixed => {
+                    last = None;
+                    continue;
+                }
+                ChecksStep::Stop(outcome) => return self.finish(outcome),
+            }
             let pending = fleet
                 .read(|conn| Ok(DecisionRepo::new(conn).list_pending_for_node(self.node)?))?
                 .len();
@@ -733,6 +756,40 @@ impl Autopilot {
                 return self.finish(outcome);
             }
         }
+    }
+
+    /// The lost-work rule ([`crate::lost_work`]): in `verifying`, `review` or
+    /// `pr`, a node whose implementation steps are done but whose checkout
+    /// holds none of the work goes back to `active` with those steps open,
+    /// with no question to the user. Looked at once per state of the run, and
+    /// again when an agent there has asked a `broken` question (it may be
+    /// about exactly this). `Fixed` when it reopened the node; a second time
+    /// stops the run ([`NeedsHuman::LostWork`]).
+    fn reopen_lost_work<H: StepHook + ?Sized>(&mut self, fleet: &FleetStore, hook: &mut H, lifecycle: &str) -> Result<ChecksStep> {
+        if !crate::lost_work::STATES.contains(&lifecycle) {
+            return Ok(ChecksStep::Proceed);
+        }
+        let asked = !crate::lost_work::broken_questions(fleet, self.node)?.is_empty();
+        if self.lost_checked.as_deref() == Some(lifecycle) && !asked {
+            return Ok(ChecksStep::Proceed);
+        }
+        self.lost_checked = Some(lifecycle.to_string());
+        let Some(proof) = crate::lost_work::check(fleet, self.node, lifecycle)? else {
+            return Ok(ChecksStep::Proceed);
+        };
+        hook.working_on("reopening the implementation: the node's code is not on its branch");
+        if self.state.loops.lost_work_reopens >= 1 {
+            // The first reopening did not stick: rebuilding made no commits,
+            // or they were lost again. Stopping is for the user to look at.
+            self.state.loops.lost_work_reopens = 0;
+            self.save()?;
+            return Ok(ChecksStep::Stop(Outcome::NeedsHuman { reason: NeedsHuman::LostWork { why: proof.why(lifecycle) } }));
+        }
+        crate::lost_work::reopen(fleet, self.node, lifecycle, &proof)?;
+        self.state.loops.lost_work_reopens += 1;
+        self.lost_checked = None;
+        self.record(fleet, "lost_work", lifecycle, None)?;
+        Ok(ChecksStep::Fixed)
     }
 
     /// Run the checks configured for `lifecycle` that are stale and see what

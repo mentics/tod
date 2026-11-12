@@ -412,6 +412,33 @@ impl<'a> PlanStepRepo<'a> {
         Ok((steps, verdicts))
     }
 
+    /// The code the node's implementation steps describe is gone (its branch
+    /// holds none of it: `tod_core::lost_work`), so the steps are open work
+    /// again: every `implemented` or `verified` step of `active` or `verifying`
+    /// goes back to `pending` (`ready` when what it waits on is done), its
+    /// history kept and `why` added to it as a note, and every `verified`
+    /// verdict is reopened. Failed and handed-back steps stay as they are.
+    /// Returns how many steps and verdicts were reopened.
+    pub fn reopen_lost_work(&self, node_id: Uuid, why: &str) -> Result<(usize, usize)> {
+        let reopened: Vec<Uuid> = self
+            .list_for_node(node_id)?
+            .into_iter()
+            .filter(|s| {
+                matches!(s.status.as_str(), STATUS_IMPLEMENTED | STATUS_VERIFIED)
+                    && matches!(s.phase.as_str(), PHASE_ACTIVE | PHASE_VERIFYING)
+            })
+            .map(|s| s.id)
+            .collect();
+        for id in &reopened {
+            self.update_status(*id, STATUS_PENDING, Some(why), None)?;
+        }
+        for id in &reopened {
+            self.maybe_promote_to_ready(*id)?;
+        }
+        let verdicts = crate::verification::VerdictRepo::new(self.conn).reopen_verified(node_id, why)?;
+        Ok((reopened.len(), verdicts))
+    }
+
     /// Append `note` to `id`'s history, unless the step already has this
     /// note with this status — which is what reversing a status change, or
     /// repeating one, would otherwise add again.

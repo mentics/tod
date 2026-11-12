@@ -328,6 +328,13 @@ pub enum InterviewCommand {
     /// Withdraw what verification confirmed on a node whose code changed
     /// since (`PlanStepRepo::reopen_verification`).
     ReopenVerification { node_id: Uuid, why: String },
+    /// Open a node's implementation steps and verdicts again because its
+    /// branch holds none of their code (`PlanStepRepo::reopen_lost_work`).
+    ReopenLostWork { node_id: Uuid, why: String },
+    /// Withdraw a pending decision that no longer needs an answer
+    /// (`DecisionRepo::withdraw`): the app's own, when what it asked about
+    /// was settled without the user.
+    WithdrawDecision { decision_id: Uuid },
     /// Record an evaluation's verdict on a node's incoming changes and
     /// resolve the entries it covers (`crate::incoming`): `action_ids`, or
     /// every pending entry when unset.
@@ -1163,6 +1170,15 @@ pub fn execute(
             let (steps, verdicts) = crate::outline::repos::PlanStepRepo::new(conn)
                 .reopen_verification(*node_id, why)?;
             Ok(json!({ "steps": steps, "verdicts": verdicts }))
+        }
+        InterviewCommand::ReopenLostWork { node_id, why } => {
+            let (steps, verdicts) = crate::outline::repos::PlanStepRepo::new(conn)
+                .reopen_lost_work(*node_id, why)?;
+            Ok(json!({ "steps": steps, "verdicts": verdicts }))
+        }
+        InterviewCommand::WithdrawDecision { decision_id } => {
+            crate::decisions::DecisionRepo::new(conn).withdraw(*decision_id)?;
+            Ok(json!({ "id": decision_id.to_string() }))
         }
         InterviewCommand::ResolveIncoming {
             node_id,

@@ -24,6 +24,9 @@ pub const TABLE: &str = "node_timeline";
 pub const KIND_GATE: &str = "gate";
 pub const KIND_CHECKS: &str = "checks";
 pub const KIND_PHASE: &str = "phase";
+/// A note the app left on the node's activity about something it did by
+/// itself (`tod_core::lost_work`): the title says what, the detail why.
+pub const KIND_NOTE: &str = "note";
 
 pub const CREATE_TABLE: &str = "
     CREATE TABLE IF NOT EXISTS node_timeline (
