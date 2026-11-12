@@ -2874,7 +2874,9 @@ fn a_check_killed_for_memory_stops_the_run_for_the_user_and_never_reaches_the_fi
         words.starts_with("Lower the heap of check `tsc`, scope it, or remove it: it was killed for lack of memory, not because the code failed.\n\n"),
         "{words}"
     );
-    assert!(words.contains("Killed for memory (SIGKILL") && words.contains("Last of its output:\ncompiling"), "{words}");
+    assert!(words.contains("Killed for memory (SIGKILL")
+            && words.contains("Command: `echo compiling; kill -9 $$`.")
+            && words.contains("Last of its output:\ncompiling"), "{words}");
     // Run again: the stored kill is not the answer, the check runs once more.
     let again = autopilot(&fx, Budget::default()).run(&fx.fleet, &mut FakeAgent::new(&fx.fleet)).unwrap();
     assert!(matches!(again, Outcome::NeedsHuman { reason: NeedsHuman::CheckBroken { .. } }));

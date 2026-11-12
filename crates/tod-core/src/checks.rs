@@ -343,7 +343,7 @@ fn killed_for_memory(code: i32, text: &str) -> bool {
 }
 
 /// The first line of a memory failure's output.
-fn memory_message(code: i32, text: &str, mem: Option<(u64, u64)>, place: &str) -> String {
+fn memory_message(code: i32, mem: Option<(u64, u64)>, place: &str, command: &str) -> String {
     let how = if code == 137 {
         "SIGKILL, likely the out-of-memory killer"
     } else if code == 134 || code == 1 {
@@ -351,20 +351,19 @@ fn memory_message(code: i32, text: &str, mem: Option<(u64, u64)>, place: &str) -
     } else {
         "the shell reported it killed, likely by the out-of-memory killer"
     };
-    let _ = text;
     let machine = match mem {
-        Some((total, free)) => format!(" {place} has {total} MB; {free} MB were free when the check started."),
+        Some((total, free)) => format!(" It ran in {place}, which has {total} MB; {free} MB were free when the check started."),
         None => format!(" It ran in {place}."),
     };
-    format!("{KILLED_FOR_MEMORY} ({how}).{machine}")
+    format!("{KILLED_FOR_MEMORY} ({how}).{machine} Command: `{}`.", command.trim())
 }
 
 /// Where a check ran, for the message.
 fn place_name(cwd: &Workdir) -> String {
     match cwd {
-        Workdir::Host(_) => "This machine".to_string(),
-        Workdir::Container { container, .. } => format!("The dev container {container}"),
-        Workdir::Sandbox { sandbox, .. } => format!("The sandbox {sandbox}"),
+        Workdir::Host(_) => "this machine".to_string(),
+        Workdir::Container { container, .. } => format!("dev container {container}"),
+        Workdir::Sandbox { sandbox, .. } => format!("sandbox {sandbox}"),
     }
 }
 
@@ -397,7 +396,7 @@ pub fn run_command(cwd: &Workdir, check: &Check, files: &[String]) -> (Verdict, 
             if code == 0 {
                 (Verdict::Passed, text)
             } else if killed_for_memory(code, &text) {
-                (Verdict::Broken, format!("{}\n\n{text}", memory_message(code, &text, mem, &place_name(cwd))))
+                (Verdict::Broken, format!("{}\n\n{text}", memory_message(code, mem, &place_name(cwd), &check.command)))
             } else {
                 (Verdict::Failed, text)
             }
@@ -733,7 +732,7 @@ mod tests {
         assert!(out.starts_with("Killed for memory (SIGKILL, likely the out-of-memory killer)."), "{out}");
         assert!(out.contains("working"));
         assert!(!out.contains("@@tod-mem"));
-        assert!(out.contains("This machine"));
+        assert!(out.contains("It ran in this machine."), "{out}");
         // The shell's own exit 137 reads the same, as it does through a relay.
         assert_eq!(run_command(&cwd, &check("exit 137"), &[]).0, Verdict::Broken);
     }
@@ -757,9 +756,10 @@ mod tests {
         assert_eq!(split_memory(b"hello"), (None, b"hello".to_vec()));
         // Stripped wherever it is: an error from a missing `awk` may come first.
         assert_eq!(split_memory(b"sh: awk: not found\n@@tod-mem \nhi\n"), (None, b"sh: awk: not found\nhi\n".to_vec()));
-        let message = memory_message(137, "", Some((8000, 3400)), "The sandbox s");
-        assert!(message.contains("The sandbox s has 8000 MB; 3400 MB were free when the check started."));
-        assert!(!memory_message(137, "", None, "This machine").contains(" MB"));
+        let message = memory_message(137, Some((8000, 3400)), "sandbox s", "tsc --noEmit");
+        assert!(message.contains("It ran in sandbox s, which has 8000 MB; 3400 MB were free when the check started."));
+        assert!(message.contains("Command: `tsc --noEmit`."));
+        assert!(!memory_message(137, None, "this machine", "x").contains(" MB"));
     }
 
     #[test]
