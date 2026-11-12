@@ -370,19 +370,6 @@ impl StepHook for Hook<'_> {
             replica.push()?;
             replica.pull()?;
         }
-        // At a turn too: an implement or fix turn's commits (in a submodule,
-        // the parent records only their id) must not wait for the step to
-        // end, with the sandbox idle-reclaimed in between.
-        if self.push_branch {
-            // A failure stops the run with the repositories named: work that
-            // cannot reach the remote is not something to carry on past.
-            git::push_branch(self.workspace).context("pushing the node's branch at a turn or step boundary")?;
-        }
-        // Every step, and a turn once the period has passed: what is not
-        // committed survives the sandbox too.
-        if let Some(checkpoints) = &mut self.checkpoints {
-            checkpoints.tick(boundary == Boundary::Step);
-        }
         settle_owed_stop_rows(self.state_dir, fleet, self.node, &self.consumer)?;
         let pending = pending_requests(fleet, self.node)?;
         // The user's Stop now and Pause end the run here, at the boundary:
@@ -397,6 +384,20 @@ impl StepHook for Hook<'_> {
             } else {
                 tod_core::autopilot::local::PAUSED.to_string()
             }));
+        }
+        // After the stop check, so a user's stop wins over a failing push (the
+        // run-end push still reports it). At a turn too: an implement or fix turn's commits (in a submodule,
+        // the parent records only their id) must not wait for the step to
+        // end, with the sandbox idle-reclaimed in between.
+        if self.push_branch {
+            // A failure stops the run with the repositories named: work that
+            // cannot reach the remote is not something to carry on past.
+            git::push_branch(self.workspace).context("pushing the node's branch at a turn or step boundary")?;
+        }
+        // Every step, and a turn once the period has passed: what is not
+        // committed survives the sandbox too.
+        if let Some(checkpoints) = &mut self.checkpoints {
+            checkpoints.tick(boundary == Boundary::Step);
         }
         if fresh_marker(self.state_dir)
             || tod_store::node_requests::any_of(&pending, tod_store::node_requests::KIND_FRESH_SESSION)
@@ -927,11 +928,11 @@ pub fn wake(config: Config) -> Result<Woke> {
     };
     let ended = beating.finish(stopped, &state);
     let pushed = replica.lock().unwrap_or_else(|e| e.into_inner()).push();
-    if config.push_branch
-        && let Err(err) = git::push_branch(&config.workspace)
-    {
-        tracing::warn!("pushing the branch: {err:#}");
-    }
+    let branch_pushed = if config.push_branch {
+        git::push_branch(&config.workspace).context("pushing the node's branch when the run ended")
+    } else {
+        Ok(())
+    };
     // Last, so the checkpoint sits on the branch as pushed.
     if let Some(checkpoints) = &mut hook.checkpoints {
         checkpoints.now();
@@ -942,6 +943,9 @@ pub fn wake(config: Config) -> Result<Woke> {
     let outcome = run?;
     pushed?;
     ended?;
+    // Last of all: the run's end and the checkpoint are recorded first, but a
+    // branch that could not be pushed fails the run, naming the repository.
+    branch_pushed?;
     tracing::info!(?outcome, "autopilot stopped");
     record_user_stop(&config.state_dir, &outcome)?;
     if !backing_off {

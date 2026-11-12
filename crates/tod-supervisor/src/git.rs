@@ -57,11 +57,22 @@ fn default_branch(repo: &Path) -> Option<String> {
         .map(|r| r.strip_prefix("origin/").unwrap_or(&r).to_string())
 }
 
+/// Which branch `push_repo` may push.
+#[derive(Clone, Copy)]
+enum Expected<'a> {
+    /// Whatever the repository is on (the workspace itself, which defines it).
+    Any,
+    /// Only this one, the node's.
+    Branch(&'a str),
+    /// The node's branch is not known: no named branch is pushed.
+    Unknown,
+}
+
 /// Pushes `repo`'s checked-out branch to `origin`, setting it as the
 /// upstream, only when it is `expected` (the node's own branch). `Ok(false)`
 /// when there was nothing to do (detached, or no `origin`); a default branch
 /// or another branch is an error.
-fn push_repo(repo: &Path, expected: Option<&str>) -> Result<bool> {
+fn push_repo(repo: &Path, expected: Expected) -> Result<bool> {
     let branch = git(repo, &["rev-parse", "--abbrev-ref", "HEAD"])?;
     if branch == "HEAD" {
         tracing::info!("detached HEAD: nothing to push");
@@ -76,10 +87,15 @@ fn push_repo(repo: &Path, expected: Option<&str>) -> Result<bool> {
     if is_protected(&branch, default_branch(repo).as_deref()) {
         bail!("refusing to push {branch}: it is a default branch, not the node's own");
     }
-    if let Some(expected) = expected
-        && branch != expected
-    {
-        bail!("it is on {branch}, not the node's branch {expected}, and only the node's own branch is pushed");
+    match expected {
+        Expected::Any => {}
+        Expected::Branch(expected) if branch == expected => {}
+        Expected::Branch(expected) => {
+            bail!("it is on {branch}, not the node's branch {expected}, and only the node's own branch is pushed")
+        }
+        Expected::Unknown => {
+            bail!("it is on {branch}, but the node's own branch is not known (the checkout is detached), so nothing was pushed")
+        }
     }
     git(repo, &["push", "--quiet", "-u", "origin", &format!("HEAD:refs/heads/{branch}")])?;
     Ok(true)
@@ -139,11 +155,15 @@ pub fn push_branch(workspace: &Path) -> Result<()> {
                     if !sub.dir.join(".git").exists() {
                         return Ok(());
                     }
-                    let pinned = pinned_commit(&sub.parent, &sub.in_parent);
+                    let pinned = pinned_commit(&sub.parent, &sub.in_parent)
+                        // Nothing to compare with (the parent has no origin):
+                        // what the parent records at its HEAD is the base.
+                        .or_else(|| git(&sub.parent, &["remote", "get-url", "origin"]).err().and_then(|_| git(&sub.parent, &["rev-parse", "--verify", "-q", &format!("HEAD:{}", sub.in_parent)]).ok()))
+                        .filter(|s| !s.is_empty());
                     if !has_unpushed(&sub.dir, pinned.as_deref())? {
                         return Ok(());
                     }
-                    if !push_repo(&sub.dir, node_branch.as_deref())? {
+                    if !push_repo(&sub.dir, node_branch.as_deref().map_or(Expected::Unknown, Expected::Branch))? {
                         bail!("it has commits of the node's own no remote has, but nothing was pushed (detached HEAD or no origin)");
                     }
                     Ok(())
@@ -155,7 +175,7 @@ pub fn push_branch(workspace: &Path) -> Result<()> {
         }
         Err(err) => failures.push(format!("listing the submodules: {err:#}")),
     }
-    if let Err(err) = push_repo(workspace, None) {
+    if let Err(err) = push_repo(workspace, Expected::Any) {
         failures.push(format!("{err:#}"));
     }
     if !failures.is_empty() {
@@ -240,6 +260,28 @@ mod tests {
         run(&work.join("kb"), &["remote", "remove", "origin"]);
         push_branch(&work).unwrap();
         // With work of its own and nowhere to push it, it is an error.
+        commit_in_kb(&work);
+        let err = format!("{:#}", push_branch(&work).unwrap_err());
+        assert!(err.contains("submodule kb") && err.contains("no origin"), "{err}");
+    }
+
+    #[test]
+    fn a_detached_parent_never_pushes_a_named_submodule_branch() {
+        let (work, _ws_remote, sub_remote) = fixture();
+        run(&work.join("kb"), &["checkout", "-q", "-b", "shared/other"]);
+        commit_in_kb(&work);
+        run(&work, &["checkout", "-q", "--detach"]);
+        let err = format!("{:#}", push_branch(&work).unwrap_err());
+        assert!(err.contains("submodule kb") && err.contains("not known"), "{err}");
+        assert!(run(&sub_remote, &["branch", "--list", "shared/other"]).is_empty());
+    }
+
+    #[test]
+    fn no_origin_anywhere_and_no_work_is_fine_and_own_work_is_an_error() {
+        let (work, _ws_remote, _sub_remote) = fixture();
+        run(&work, &["remote", "remove", "origin"]);
+        run(&work.join("kb"), &["remote", "remove", "origin"]);
+        push_branch(&work).unwrap();
         commit_in_kb(&work);
         let err = format!("{:#}", push_branch(&work).unwrap_err());
         assert!(err.contains("submodule kb") && err.contains("no origin"), "{err}");
