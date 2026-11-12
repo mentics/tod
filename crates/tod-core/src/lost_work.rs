@@ -66,9 +66,10 @@ pub enum RepoState {
     OwnCommits,
     /// Uncommitted changes or untracked files.
     Dirty,
-    /// The node's branch is on `origin` at a commit other than the base (merged
-    /// into it, or behind it): its work is there.
-    RemoteBranch,
+    /// The node's branch (local or on `origin`) is at a commit other than the
+    /// base, and has none beyond it (merged into the default branch, or behind
+    /// it): its work is there.
+    BranchBehindBase,
     /// There is no `origin` to compare with; it proves nothing either way.
     Unknown(String),
 }
@@ -153,13 +154,11 @@ fn state_of(repo: &Workdir, base: Option<&str>, what: &str, branch: Option<&str>
         return Ok(RepoState::Unknown(format!("{what} has no origin to compare with")));
     };
     let mut args = vec!["rev-list".to_string(), "--count".to_string(), "HEAD".to_string()];
-    let mut remote_tip = None;
+    let mut tips = Vec::new();
     if let Some(branch) = branch {
         for r in [format!("refs/heads/{branch}"), format!("refs/remotes/origin/{branch}")] {
             if let Some(sha) = git_ref(repo, &["rev-parse", "--verify", "-q", &format!("{r}^{{commit}}")])? {
-                if r.starts_with("refs/remotes/") {
-                    remote_tip = Some(sha);
-                }
+                tips.push(sha);
                 args.push(r);
             }
         }
@@ -174,39 +173,70 @@ fn state_of(repo: &Workdir, base: Option<&str>, what: &str, branch: Option<&str>
     if count > 0 {
         return Ok(RepoState::OwnCommits);
     }
-    // The node's branch is on origin at a commit other than the base (merged
-    // into it, or left behind it): its work is there, not lost.
-    if let Some(tip) = remote_tip {
+    // The node's branch, here or on origin, is at a commit other than the base
+    // (merged into it, then perhaps deleted on origin, or left behind it): its
+    // work is in the default branch, not lost.
+    if !tips.is_empty() {
         let base_tip = git_text(repo, &["rev-parse", &format!("{base}^{{commit}}")])?;
-        if tip != base_tip {
-            return Ok(RepoState::RemoteBranch);
+        if tips.iter().any(|tip| *tip != base_tip) {
+            return Ok(RepoState::BranchBehindBase);
         }
     }
     Ok(RepoState::Untouched)
+}
+
+/// Whether `cwd` is the top of a git work tree. `false` only for a directory
+/// that is no repository at all (there is no branch to have lost). A directory
+/// inside another repository, a bare repository, a git directory, or a
+/// checkout git cannot read is an error: the node relies on it. Decided from
+/// exit statuses and paths, never from git's wording.
+fn is_checkout(cwd: &Workdir) -> Result<bool> {
+    let top = cwd
+        .git_output(&["rev-parse", "--show-toplevel"])
+        .with_context(|| format!("run git rev-parse --show-toplevel in {cwd}"))?;
+    if top.status.success() {
+        let top = String::from_utf8_lossy(&top.stdout).trim().to_string();
+        let same = match cwd.host_path() {
+            Some(path) => {
+                let (a, b) = (std::fs::canonicalize(&top), std::fs::canonicalize(path));
+                match (a, b) {
+                    (Ok(a), Ok(b)) => a == b,
+                    (a, b) => anyhow::bail!("cannot compare {top} with {cwd}: {:?} {:?}", a.err(), b.err()),
+                }
+            }
+            None => cwd.remote_path().is_some_and(|p| p.trim_end_matches('/') == top.trim_end_matches('/')),
+        };
+        if !same {
+            anyhow::bail!("{cwd} is inside the repository at {top}, not a checkout of its own");
+        }
+        return Ok(true);
+    }
+    let stderr = String::from_utf8_lossy(&top.stderr).trim().to_string();
+    for (flag, what) in [("--is-bare-repository", "a bare repository"), ("--is-inside-git-dir", "a git directory")] {
+        let probe = cwd.git_output(&["rev-parse", flag]).with_context(|| format!("run git rev-parse {flag} in {cwd}"))?;
+        if probe.status.success() && String::from_utf8_lossy(&probe.stdout).trim() == "true" {
+            anyhow::bail!("{cwd} is {what}, not a checkout");
+        }
+    }
+    let dot_git = match cwd.host_path() {
+        Some(path) => path.join(".git").exists(),
+        None => cwd.output("test", &["-e", ".git"]).with_context(|| format!("look for .git in {cwd}"))?.status.success(),
+    };
+    if dot_git {
+        anyhow::bail!("{cwd} has a .git but git cannot read it: {stderr}");
+    }
+    Ok(false)
 }
 
 /// What the checkout at `cwd` and each initialized submodule hold; `branch` is
 /// the node's branch, else the one checked out. Empty when `cwd` is not a git
 /// work tree (there is no branch to have lost).
 pub fn inspect(cwd: &Workdir, branch: Option<&str>) -> Result<Vec<(String, RepoState)>> {
-    let probe = cwd
-        .git_output(&["rev-parse", "--is-inside-work-tree"])
-        .with_context(|| format!("run git rev-parse in {cwd}"))?;
-    if !probe.status.success() {
-        let stderr = String::from_utf8_lossy(&probe.stderr);
-        if stderr.contains("not a git repository") {
-            return Ok(Vec::new());
-        }
-        anyhow::bail!("git rev-parse --is-inside-work-tree in {cwd} failed: {}", stderr.trim());
-    }
-    if String::from_utf8_lossy(&probe.stdout).trim() != "true" {
+    if !is_checkout(cwd)? {
         return Ok(Vec::new());
     }
-    let checked_out = git_text(cwd, &["rev-parse", "--abbrev-ref", "HEAD"])?;
-    let branch = branch
-        .map(str::to_string)
-        .or_else(|| Some(checked_out).filter(|b| b != "HEAD" && !matches!(b.as_str(), "main" | "master")));
-    let branch = branch.as_deref();
+    // Only the node's own branch, as Files records it; with none known, HEAD
+    // alone is compared (never a guess from the branch checked out).
     let mut out = vec![(".".to_string(), state_of(cwd, default_ref(cwd)?.as_deref(), "the checkout", branch)?)];
     // No `.gitmodules` is the only way to have none; a listing that fails is an error.
     let subs: Vec<String> = if git_text(cwd, &["ls-files", "--", ".gitmodules"])?.is_empty() {
@@ -251,15 +281,28 @@ pub fn done_steps(fleet: &FleetStore, node: Uuid) -> Result<usize> {
 
 /// The `broken` questions pending on the node from the agents that work in
 /// [`STATES`].
-pub fn broken_questions(fleet: &FleetStore, node: Uuid) -> Result<Vec<Uuid>> {
+pub fn broken_questions(fleet: &FleetStore, node: Uuid) -> Result<Vec<(Uuid, String)>> {
     fleet.read(|conn| {
         Ok(DecisionRepo::new(conn)
             .list_pending_for_node(node)?
             .into_iter()
             .filter(|d| d.reason == REASON_BROKEN && d.protocol.as_deref().is_some_and(|p| PROTOCOLS.contains(&p)))
-            .map(|d| d.id)
+            .map(|d| (d.id, d.question))
             .collect())
     })
+}
+
+/// Words that make a `broken` question about the code missing from the
+/// checkout (case-insensitive, anywhere in its text). The rule for what
+/// [`reopen`] withdraws: a `broken` question from a verification, review or
+/// pull-request agent whose text mentions one of these. Any other (a tool that
+/// failed, a credential refused) stays pending.
+pub const LOST_WORK_WORDS: [&str; 5] = ["checkout", "branch", "commit", "pushed", "lost"];
+
+/// Whether a `broken` question is about the missing work ([`LOST_WORK_WORDS`]).
+pub fn is_about_lost_work(question: &str) -> bool {
+    let q = question.to_lowercase();
+    LOST_WORK_WORDS.iter().any(|w| q.contains(w))
 }
 
 /// Whether the node, in `state`, has lost its work. `None` when the state is
@@ -289,13 +332,20 @@ pub fn check(fleet: &FleetStore, node: Uuid, state: &str) -> Result<Option<Proof
 /// steps and verdicts, the questions about it, and the note.
 pub fn reopen(fleet: &FleetStore, node: Uuid, state: &str, proof: &Proof) -> Result<()> {
     let why = proof.why(state);
-    let questions = broken_questions(fleet, node)?;
+    let (about, left): (Vec<_>, Vec<_>) = broken_questions(fleet, node)?.into_iter().partition(|(_, q)| is_about_lost_work(q));
     lifecycle::set_lifecycle(fleet, node, "active")?;
     fleet.interview(ACTOR, InterviewCommand::ReopenLostWork { node_id: node, why: why.clone() })?;
-    for decision_id in questions {
-        fleet.interview(ACTOR, InterviewCommand::WithdrawDecision { decision_id })?;
+    for (decision_id, _) in &about {
+        fleet.interview(ACTOR, InterviewCommand::WithdrawDecision { decision_id: *decision_id })?;
     }
-    let entry = TimelineEntry::new(node, KIND_NOTE, "active", NOTE_TITLE, false, format!("From {state}. {why}"));
+    let mut detail = format!("From {state}. {why}");
+    if !about.is_empty() {
+        detail.push_str(&format!(" Withdrawn, as about this: {}.", about.iter().map(|(_, q)| format!("\"{q}\"")).collect::<Vec<_>>().join("; ")));
+    }
+    if !left.is_empty() {
+        detail.push_str(&format!(" Left pending, as about something else: {}.", left.iter().map(|(_, q)| format!("\"{q}\"")).collect::<Vec<_>>().join("; ")));
+    }
+    let entry = TimelineEntry::new(node, KIND_NOTE, "active", NOTE_TITLE, false, detail);
     fleet.enqueue(FleetMutation::RecordTimeline(Box::new(entry)))?;
     fleet.writer().flush()?;
     Ok(())
@@ -450,7 +500,7 @@ mod tests {
         run(&work, &["branch", "-q", "-D", "task/x"]);
         run(&work, &["fetch", "-q", "origin"]);
         let repos = inspect(&Workdir::host(&work), Some("task/x")).unwrap();
-        assert_eq!(repos[0].1, RepoState::RemoteBranch, "{repos:?}");
+        assert_eq!(repos[0].1, RepoState::BranchBehindBase, "{repos:?}");
         assert!(!is_lost(&repos));
     }
 
@@ -461,5 +511,53 @@ mod tests {
         run(&work, &["update-ref", "-d", "refs/remotes/origin/HEAD"]);
         let err = format!("{:#}", inspect(&Workdir::host(&work), None).unwrap_err());
         assert!(err.contains("fetch origin"), "{err}");
+    }
+
+    #[test]
+    fn a_subdirectory_of_another_repository_is_an_error() {
+        let (_dir, work) = fixture();
+        std::fs::create_dir(work.join("sub_dir")).unwrap();
+        let err = format!("{:#}", inspect(&Workdir::host(work.join("sub_dir")), None).unwrap_err());
+        assert!(err.contains("not a checkout of its own"), "{err}");
+    }
+
+    #[test]
+    fn a_bare_repository_or_git_directory_is_an_error() {
+        let (dir, work) = fixture();
+        let err = format!("{:#}", inspect(&Workdir::host(dir.path().join("kb.git")), None).unwrap_err());
+        assert!(err.contains("bare repository"), "{err}");
+        let err = format!("{:#}", inspect(&Workdir::host(work.join(".git")), None).unwrap_err());
+        assert!(err.contains("git directory") || err.contains("not a checkout"), "{err}");
+    }
+
+    #[test]
+    fn with_no_branch_known_only_head_is_compared() {
+        let (_dir, work) = fixture();
+        // Work on a local branch the checkout is not on, and no branch named.
+        commit_in(&work, "w");
+        run(&work, &["checkout", "-q", "--detach", "origin/main"]);
+        let repos = inspect(&Workdir::host(&work), None).unwrap();
+        assert_eq!(repos[0].1, RepoState::Untouched, "{repos:?}");
+        let repos = inspect(&Workdir::host(&work), Some("task/x")).unwrap();
+        assert_eq!(repos[0].1, RepoState::OwnCommits, "{repos:?}");
+    }
+
+    #[test]
+    fn a_merged_branch_deleted_on_origin_is_not_lost_while_it_is_still_here() {
+        let (_dir, work) = fixture();
+        commit_in(&work, "w");
+        run(&work, &["checkout", "-q", "main"]);
+        run(&work, &["merge", "-q", "--ff-only", "task/x"]);
+        commit_in(&work, "later");
+        run(&work, &["push", "-q", "origin", "main"]);
+        let repos = inspect(&Workdir::host(&work), Some("task/x")).unwrap();
+        assert_eq!(repos[0].1, RepoState::BranchBehindBase, "{repos:?}");
+    }
+
+    #[test]
+    fn only_questions_about_the_missing_work_are_taken_for_it() {
+        assert!(is_about_lost_work("Restore this task's kb code to the review checkout"));
+        assert!(is_about_lost_work("The branch was never pushed"));
+        assert!(!is_about_lost_work("The Linear token was rejected (401)"));
     }
 }

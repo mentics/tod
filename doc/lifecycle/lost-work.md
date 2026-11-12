@@ -53,8 +53,13 @@ pull-request agent is pending (it may be about exactly this). When proven:
 - every `implemented`/`verified` step of `active` or `verifying` goes back to
   `ready`/`pending` with a note saying why (`PlanStepRepo::reopen_lost_work`),
   and every `verified` verdict is reopened;
-- the pending `broken` questions from those agents are withdrawn (the answer
-  they wanted is the one just given);
+- the pending `broken` questions from those agents that are about the missing
+  work are withdrawn (the answer they wanted is the one just given). The rule
+  (`lost_work::is_about_lost_work`): the question's text, case-insensitive,
+  mentions `checkout`, `branch`, `commit`, `pushed` or `lost`. Any other
+  `broken` question (a tool that failed, a credential refused) stays pending
+  and the node is reopened regardless; the note names both the withdrawn and the
+  left-pending questions;
 - a note is left on the node's activity ("Lost work: implementation reopened",
   `node_timeline` kind `note`, shown in the Activity panel), and the run
   records a `lost_work` step.
@@ -78,13 +83,22 @@ else) the question stays for the user as any other.
 
 ## Limits
 
-- A node branch pushed at exactly the default branch's current tip (a merge
-  with nothing after it, or an empty branch) is not told apart from lost work.
-
-- Work committed to a branch that is not the checked-out one, or in a
-  repository outside the node's Files, is not seen; a checkout with such work
-  elsewhere and nothing on its own branch reads as lost. The reopened
+- A node branch, local or on `origin`, at exactly the default branch's current
+  tip (a merge with nothing after it, or an empty branch) is not told apart from
+  lost work. A branch at any other commit with nothing beyond the default branch
+  (merged and the default moved on, then deleted on origin) is not lost, as long
+  as a ref of it remains here or on origin.
+- The checkout must be the top of its own work tree: a directory inside another
+  repository, a bare repository, a `.git` directory, or a `.git` git cannot read
+  is an error, decided from git's exit status and paths, never from its wording.
+  Only a directory with no repository and no `.git` is left to the launch.
+- With no node branch known, only the checked-out HEAD is compared; no branch is
+  guessed from what is checked out, so work on another branch of a checkout then
+  reads as lost.
+- Work in a repository outside the node's Files is not seen. The reopened
   implementation finds it quickly.
 - Done steps whose work makes no commit (documentation in another system,
   say) in a node whose Files is a repository would read as lost; the once-per-run
   stop is what keeps that from looping.
+- The withdrawal rule is a keyword match; a question about the missing work that
+  uses none of the words stays pending (and is named in the note).

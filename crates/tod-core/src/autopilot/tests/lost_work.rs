@@ -152,6 +152,23 @@ fn only_the_broken_questions_of_the_checking_agents_are_withdrawn() {
     in_review_with_done_steps(&fx);
     ask_broken(&fx, "review");
     ask_broken(&fx, "implementation");
+    // A tool failure from the same agent is not about the missing work.
+    fx.fleet
+        .interview(
+            ACTOR_USER,
+            InterviewCommand::AskDecision {
+                node_id: fx.node,
+                conversation_id: None,
+                protocol: Some("review".into()),
+                decision: tod_store::decisions::NewDecision {
+                    question: "The Linear token was rejected (401)".into(),
+                    options: vec!["Fixed".into()],
+                    evidence: Vec::new(),
+                    reason: tod_store::decisions::REASON_BROKEN.into(),
+                },
+            },
+        )
+        .unwrap();
     fx.fleet
         .interview(
             ACTOR_USER,
@@ -177,7 +194,8 @@ fn only_the_broken_questions_of_the_checking_agents_are_withdrawn() {
         .into_iter()
         .map(|d| d.question)
         .collect();
-    assert_eq!(pending.len(), 2, "{pending:?}");
+    assert_eq!(pending.len(), 3, "{pending:?}");
+    assert!(pending.iter().any(|q| q.contains("401")), "{pending:?}");
     assert!(pending.iter().any(|q| q == "Which API?"));
 }
 
