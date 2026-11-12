@@ -40,7 +40,7 @@ use tod_store::fleet::{FleetMutation, FleetStore, Workdir};
 use tod_store::interview::InterviewCommand;
 use tod_store::node_timeline::{KIND_NOTE, TimelineEntry};
 use tod_store::outline::repos::PlanStepRepo;
-use tod_store::outline::repos::plan_steps::{PHASE_ACTIVE, STATUS_IMPLEMENTED, STATUS_VERIFIED};
+use tod_store::outline::repos::plan_steps::{PHASE_ACTIVE, PHASE_VERIFYING, STATUS_IMPLEMENTED, STATUS_VERIFIED};
 use uuid::Uuid;
 
 /// The states in which a node's implementation is claimed done, so lost work
@@ -66,7 +66,10 @@ pub enum RepoState {
     OwnCommits,
     /// Uncommitted changes or untracked files.
     Dirty,
-    /// There is nothing to compare with; it proves nothing either way.
+    /// The node's branch is on `origin` at a commit other than the base (merged
+    /// into it, or behind it): its work is there.
+    RemoteBranch,
+    /// There is no `origin` to compare with; it proves nothing either way.
     Unknown(String),
 }
 
@@ -93,79 +96,137 @@ impl Proof {
     }
 }
 
-fn git_ok(repo: &Workdir, args: &[&str]) -> Result<Option<String>> {
-    let out = repo.git_output(args).with_context(|| format!("run git {} in {repo}", args.join(" ")))?;
-    Ok(out.status.success().then(|| String::from_utf8_lossy(&out.stdout).trim().to_string()))
+/// `git args` in `repo`, its trimmed output; any failure is an error naming
+/// the command.
+fn git_text(repo: &Workdir, args: &[&str]) -> Result<String> {
+    repo.git(args)
 }
 
-/// The repository's default branch as a ref, from `origin`.
+/// A git query that answers "there is no such thing" with exit status 1
+/// (`rev-parse --verify -q`, `config --get`): `None` then, an error for any
+/// other failure.
+fn git_ref(repo: &Workdir, args: &[&str]) -> Result<Option<String>> {
+    let out = repo.git_output(args).with_context(|| format!("run git {} in {repo}", args.join(" ")))?;
+    if out.status.success() {
+        return Ok(Some(String::from_utf8_lossy(&out.stdout).trim().to_string()));
+    }
+    if out.status.code() == Some(1) {
+        return Ok(None);
+    }
+    anyhow::bail!("git {} in {repo} failed: {}", args.join(" "), String::from_utf8_lossy(&out.stderr).trim())
+}
+
+/// The repository's default branch as a ref, from `origin`. `None` only when
+/// it has no `origin` at all; an `origin` with no default branch ref is an
+/// error (the checkout never fetched it).
 fn default_ref(repo: &Workdir) -> Result<Option<String>> {
+    if git_ref(repo, &["config", "--get", "remote.origin.url"])?.is_none() {
+        return Ok(None);
+    }
     for candidate in ["refs/remotes/origin/HEAD", "refs/remotes/origin/main", "refs/remotes/origin/master"] {
-        if git_ok(repo, &["rev-parse", "--verify", "-q", &format!("{candidate}^{{commit}}")])?.is_some() {
+        if git_ref(repo, &["rev-parse", "--verify", "-q", &format!("{candidate}^{{commit}}")])?.is_some() {
             return Ok(Some(candidate.to_string()));
         }
     }
-    Ok(None)
+    anyhow::bail!("{repo} has an origin but none of refs/remotes/origin/HEAD, main or master, so the node's base cannot be told; fetch origin")
 }
 
 /// The commit a submodule at `rel` in `parent` was pinned to before the
 /// node's work: its gitlink at the merge base of the parent's HEAD and its
-/// default branch.
+/// default branch. `None` when the parent has no origin or did not have it.
 fn pinned(parent: &Workdir, rel: &str) -> Result<Option<String>> {
     let Some(base) = default_ref(parent)? else {
         return Ok(None);
     };
-    let Some(merge_base) = git_ok(parent, &["merge-base", "HEAD", &base])? else {
-        return Ok(None);
-    };
-    Ok(git_ok(parent, &["rev-parse", "--verify", "-q", &format!("{merge_base}:{rel}")])?.filter(|s| !s.is_empty()))
+    let merge_base = git_text(parent, &["merge-base", "HEAD", &base])?;
+    Ok(git_ref(parent, &["rev-parse", "--verify", "-q", &format!("{merge_base}:{rel}")])?.filter(|s| !s.is_empty()))
 }
 
-/// What `repo` holds, against `base` (a ref or commit), `None` when it is not
-/// known.
-fn state_of(repo: &Workdir, base: Option<&str>, what: &str) -> Result<RepoState> {
-    let Some(status) = git_ok(repo, &["status", "--porcelain"])? else {
-        return Ok(RepoState::Unknown(format!("git status failed in {what}")));
-    };
-    if !status.is_empty() {
+/// What `repo` holds, against `base` (a ref or commit; `None` when there is no
+/// origin). Commits on the node's branch (`branch`: local or on `origin`)
+/// count wherever the checkout sits.
+fn state_of(repo: &Workdir, base: Option<&str>, what: &str, branch: Option<&str>) -> Result<RepoState> {
+    if !git_text(repo, &["status", "--porcelain"])?.is_empty() {
         return Ok(RepoState::Dirty);
     }
     let Some(base) = base else {
-        return Ok(RepoState::Unknown(format!("{what} has no base to compare with (no origin default branch)")));
+        return Ok(RepoState::Unknown(format!("{what} has no origin to compare with")));
     };
-    match git_ok(repo, &["rev-list", "--count", "HEAD", "--not", base])?.and_then(|n| n.parse::<u64>().ok()) {
-        Some(0) => Ok(RepoState::Untouched),
-        Some(_) => Ok(RepoState::OwnCommits),
-        None => Ok(RepoState::Unknown(format!("could not count {what}'s commits beyond {base}"))),
+    let mut args = vec!["rev-list".to_string(), "--count".to_string(), "HEAD".to_string()];
+    let mut remote_tip = None;
+    if let Some(branch) = branch {
+        for r in [format!("refs/heads/{branch}"), format!("refs/remotes/origin/{branch}")] {
+            if let Some(sha) = git_ref(repo, &["rev-parse", "--verify", "-q", &format!("{r}^{{commit}}")])? {
+                if r.starts_with("refs/remotes/") {
+                    remote_tip = Some(sha);
+                }
+                args.push(r);
+            }
+        }
     }
+    args.push("--not".to_string());
+    args.push(base.to_string());
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let counted = git_text(repo, &args)?;
+    let count: u64 = counted
+        .parse()
+        .with_context(|| format!("git {} in {repo} printed `{counted}`, not a count", args.join(" ")))?;
+    if count > 0 {
+        return Ok(RepoState::OwnCommits);
+    }
+    // The node's branch is on origin at a commit other than the base (merged
+    // into it, or left behind it): its work is there, not lost.
+    if let Some(tip) = remote_tip {
+        let base_tip = git_text(repo, &["rev-parse", &format!("{base}^{{commit}}")])?;
+        if tip != base_tip {
+            return Ok(RepoState::RemoteBranch);
+        }
+    }
+    Ok(RepoState::Untouched)
 }
 
-/// What the checkout at `cwd` and each initialized submodule hold. Empty when
-/// `cwd` is not a git work tree (there is no branch to have lost).
-pub fn inspect(cwd: &Workdir) -> Result<Vec<(String, RepoState)>> {
-    if git_ok(cwd, &["rev-parse", "--is-inside-work-tree"])?.as_deref() != Some("true") {
+/// What the checkout at `cwd` and each initialized submodule hold; `branch` is
+/// the node's branch, else the one checked out. Empty when `cwd` is not a git
+/// work tree (there is no branch to have lost).
+pub fn inspect(cwd: &Workdir, branch: Option<&str>) -> Result<Vec<(String, RepoState)>> {
+    let probe = cwd
+        .git_output(&["rev-parse", "--is-inside-work-tree"])
+        .with_context(|| format!("run git rev-parse in {cwd}"))?;
+    if !probe.status.success() {
+        let stderr = String::from_utf8_lossy(&probe.stderr);
+        if stderr.contains("not a git repository") {
+            return Ok(Vec::new());
+        }
+        anyhow::bail!("git rev-parse --is-inside-work-tree in {cwd} failed: {}", stderr.trim());
+    }
+    if String::from_utf8_lossy(&probe.stdout).trim() != "true" {
         return Ok(Vec::new());
     }
-    let mut out = vec![(".".to_string(), state_of(cwd, default_ref(cwd)?.as_deref(), "the checkout")?)];
-    let listed = git_ok(cwd, &["submodule", "foreach", "--recursive", "--quiet", "echo \"$displaypath\""])?;
-    let subs: Vec<String> = listed
-        .unwrap_or_default()
-        .lines()
-        .map(|l| l.trim().to_string())
-        .filter(|l| !l.is_empty())
-        .collect();
+    let checked_out = git_text(cwd, &["rev-parse", "--abbrev-ref", "HEAD"])?;
+    let branch = branch
+        .map(str::to_string)
+        .or_else(|| Some(checked_out).filter(|b| b != "HEAD" && !matches!(b.as_str(), "main" | "master")));
+    let branch = branch.as_deref();
+    let mut out = vec![(".".to_string(), state_of(cwd, default_ref(cwd)?.as_deref(), "the checkout", branch)?)];
+    // No `.gitmodules` is the only way to have none; a listing that fails is an error.
+    let subs: Vec<String> = if git_text(cwd, &["ls-files", "--", ".gitmodules"])?.is_empty() {
+        Vec::new()
+    } else {
+        git_text(cwd, &["submodule", "foreach", "--recursive", "--quiet", "echo \"$displaypath\""])?
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect()
+    };
     for rel in &subs {
         // The nearest listed ancestor is the repository that records it.
-        let parent_rel = subs
-            .iter()
-            .filter(|p| rel.starts_with(&format!("{p}/")))
-            .max_by_key(|p| p.len());
+        let parent_rel = subs.iter().filter(|p| rel.starts_with(&format!("{p}/"))).max_by_key(|p| p.len());
         let (parent, in_parent) = match parent_rel {
             Some(p) => (cwd.join(p), rel[p.len() + 1..].to_string()),
             None => (cwd.clone(), rel.clone()),
         };
         let base = pinned(&parent, &in_parent)?;
-        out.push((rel.clone(), state_of(&cwd.join(rel), base.as_deref(), &format!("submodule {rel}"))?));
+        out.push((rel.clone(), state_of(&cwd.join(rel), base.as_deref(), &format!("submodule {rel}"), branch)?));
     }
     Ok(out)
 }
@@ -176,13 +237,14 @@ pub fn is_lost(repos: &[(String, RepoState)]) -> bool {
     !repos.is_empty() && repos.iter().all(|(_, s)| *s == RepoState::Untouched)
 }
 
-/// How many of the node's implementation steps are marked done.
+/// How many of the node's implementation (and verification) steps are marked
+/// done: the ones [`reopen`] opens again.
 pub fn done_steps(fleet: &FleetStore, node: Uuid) -> Result<usize> {
     fleet.read(|conn| {
         Ok(PlanStepRepo::new(conn)
             .list_for_node(node)?
             .iter()
-            .filter(|s| s.phase == PHASE_ACTIVE && matches!(s.status.as_str(), STATUS_IMPLEMENTED | STATUS_VERIFIED))
+            .filter(|s| matches!(s.phase.as_str(), PHASE_ACTIVE | PHASE_VERIFYING) && matches!(s.status.as_str(), STATUS_IMPLEMENTED | STATUS_VERIFIED))
             .count())
     })
 }
@@ -212,10 +274,13 @@ pub fn check(fleet: &FleetStore, node: Uuid, state: &str) -> Result<Option<Proof
     if done == 0 {
         return Ok(None);
     }
-    let Ok(Some(cwd)) = tod_store::fleet::provision::launch_cwd_if_made(fleet, &node.to_string()) else {
+    // Not made yet: nothing to look at. Any error (a stale location, Files
+    // missing) is the caller's to see.
+    let Some(cwd) = tod_store::fleet::provision::launch_cwd_if_made(fleet, &node.to_string())? else {
         return Ok(None);
     };
-    let repos = inspect(&cwd)?;
+    let branch = fleet.resolve_files_for_node(&node.to_string())?.and_then(|files| files.branch().map(str::to_string));
+    let repos = inspect(&cwd, branch.as_deref())?;
     Ok(is_lost(&repos).then(|| Proof { repos: repos.into_iter().map(|(name, _)| name).collect(), done_steps: done }))
 }
 
@@ -281,7 +346,7 @@ mod tests {
     }
 
     fn states(work: &Path) -> Vec<(String, RepoState)> {
-        inspect(&Workdir::host(work)).unwrap()
+        inspect(&Workdir::host(work), None).unwrap()
     }
 
     #[test]
@@ -339,5 +404,62 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         assert!(states(dir.path()).is_empty());
         assert!(!is_lost(&[]));
+    }
+
+    fn commit_in(dir: &Path, file: &str) {
+        std::fs::write(dir.join(file), file).unwrap();
+        run(dir, &["add", file]);
+        run(dir, &["commit", "-qm", file]);
+    }
+
+    #[test]
+    fn a_failed_submodule_listing_is_an_error_not_no_submodules() {
+        let (_dir, work) = fixture();
+        std::fs::write(work.join(".gitmodules"), "[submodule \"kb\"\n").unwrap();
+        let err = format!("{:#}", inspect(&Workdir::host(&work), None).unwrap_err());
+        // Git refuses a work tree whose .gitmodules is unreadable, at whichever
+        // call comes first; it is never read as "no submodules".
+        assert!(err.contains("git "), "{err}");
+    }
+
+    #[test]
+    fn work_on_the_nodes_branch_is_found_though_the_checkout_sits_on_main() {
+        let (_dir, work) = fixture();
+        commit_in(&work, "w");
+        run(&work, &["push", "-q", "origin", "HEAD:refs/heads/task/x"]);
+        run(&work, &["checkout", "-q", "main"]);
+        // The local branch has it.
+        let repos = inspect(&Workdir::host(&work), Some("task/x")).unwrap();
+        assert_eq!(repos[0].1, RepoState::OwnCommits, "{repos:?}");
+        // Only origin has it.
+        run(&work, &["branch", "-q", "-D", "task/x"]);
+        let repos = inspect(&Workdir::host(&work), Some("task/x")).unwrap();
+        assert_eq!(repos[0].1, RepoState::OwnCommits, "{repos:?}");
+        assert!(!is_lost(&repos));
+    }
+
+    #[test]
+    fn a_branch_merged_into_main_and_left_behind_it_is_not_lost() {
+        let (_dir, work) = fixture();
+        commit_in(&work, "w");
+        run(&work, &["push", "-q", "origin", "HEAD:refs/heads/task/x"]);
+        run(&work, &["checkout", "-q", "main"]);
+        run(&work, &["merge", "-q", "--ff-only", "task/x"]);
+        commit_in(&work, "later");
+        run(&work, &["push", "-q", "origin", "main"]);
+        run(&work, &["branch", "-q", "-D", "task/x"]);
+        run(&work, &["fetch", "-q", "origin"]);
+        let repos = inspect(&Workdir::host(&work), Some("task/x")).unwrap();
+        assert_eq!(repos[0].1, RepoState::RemoteBranch, "{repos:?}");
+        assert!(!is_lost(&repos));
+    }
+
+    #[test]
+    fn an_origin_without_a_default_branch_ref_is_an_error() {
+        let (_dir, work) = fixture();
+        run(&work, &["update-ref", "-d", "refs/remotes/origin/main"]);
+        run(&work, &["update-ref", "-d", "refs/remotes/origin/HEAD"]);
+        let err = format!("{:#}", inspect(&Workdir::host(&work), None).unwrap_err());
+        assert!(err.contains("fetch origin"), "{err}");
     }
 }

@@ -101,7 +101,7 @@ fn the_steps_and_verdicts_a_lost_node_had_are_open_work_again() {
     workspace_is_a_clone(&fx);
     in_review_with_done_steps(&fx);
     let cwd = tod_store::fleet::Workdir::host(fx.root.join("workspace"));
-    let repos = crate::lost_work::inspect(&cwd).unwrap();
+    let repos = crate::lost_work::inspect(&cwd, None).unwrap();
     assert!(crate::lost_work::is_lost(&repos), "{repos:?}");
     let proof = crate::lost_work::check(&fx.fleet, fx.node, "review").unwrap().expect("lost");
     assert_eq!(proof.done_steps, 2);
@@ -143,4 +143,49 @@ fn lost_work_is_only_looked_for_where_implementation_is_claimed_done() {
     for state in ["design", "planning", "active", "merged", "pr_draft"] {
         assert!(crate::lost_work::check(&fx.fleet, fx.node, state).unwrap().is_none(), "{state}");
     }
+}
+
+#[test]
+fn only_the_broken_questions_of_the_checking_agents_are_withdrawn() {
+    let fx = setup();
+    workspace_is_a_clone(&fx);
+    in_review_with_done_steps(&fx);
+    ask_broken(&fx, "review");
+    ask_broken(&fx, "implementation");
+    fx.fleet
+        .interview(
+            ACTOR_USER,
+            InterviewCommand::AskDecision {
+                node_id: fx.node,
+                conversation_id: None,
+                protocol: Some("review".into()),
+                decision: tod_store::decisions::NewDecision {
+                    question: "Which API?".into(),
+                    options: vec!["A".into(), "B".into()],
+                    evidence: Vec::new(),
+                    ..Default::default()
+                },
+            },
+        )
+        .unwrap();
+    let proof = crate::lost_work::check(&fx.fleet, fx.node, "review").unwrap().expect("lost");
+    crate::lost_work::reopen(&fx.fleet, fx.node, "review", &proof).unwrap();
+    let pending: Vec<String> = fx
+        .fleet
+        .read(|c| Ok(tod_store::decisions::DecisionRepo::new(c).list_pending_for_node(fx.node)?))
+        .unwrap()
+        .into_iter()
+        .map(|d| d.question)
+        .collect();
+    assert_eq!(pending.len(), 2, "{pending:?}");
+    assert!(pending.iter().any(|q| q == "Which API?"));
+}
+
+#[test]
+fn a_stale_files_location_is_an_error_not_silence() {
+    let fx = setup();
+    in_review_with_done_steps(&fx);
+    // The fixture's workspace is not a repository; remove it so Files is missing.
+    std::fs::remove_dir_all(fx.root.join("workspace")).unwrap();
+    assert!(crate::lost_work::check(&fx.fleet, fx.node, "review").is_err());
 }

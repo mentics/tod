@@ -21,7 +21,8 @@ applies only to a condition the checkout **proves**, so nobody has anything to
 decide. It holds when all of these are true:
 
 1. The node is in `verifying`, `review` or `pr` (`lost_work::STATES`).
-2. At least one implementation plan step (phase `active`) is `implemented` or
+2. At least one implementation or verification plan step (phase `active` or
+   `verifying`, the ones reopening opens again) is `implemented` or
    `verified`.
 3. The node's Files directory is a git checkout, and in it and in every
    initialized submodule (recursively):
@@ -31,8 +32,13 @@ decide. It holds when all of these are true:
      `origin/master`); for a submodule, the commit its parent pinned there at
      the parent's merge base with that default branch.
 
-A repository whose base cannot be told (no `origin`) proves nothing, so the
-rule stays silent: it never guesses. A node with no Files, or whose location
+Commits on the node's branch (local, or `origin/<branch>`) count wherever the
+checkout sits, and a node branch on `origin` at a commit other than the base
+(merged into the default branch, or behind it) is not lost. A repository with
+no `origin` proves nothing, so the rule stays silent. Every other git failure
+(a submodule listing, a missing default-branch ref, an unreadable count) is an
+error naming the command, and so is a stale or missing Files location: the
+rule never turns a failure into "not lost" or "lost". A node with no Files, or whose location
 is not made, is left to the launch, which says so itself.
 
 ## What the autopilot does
@@ -58,7 +64,8 @@ No question reaches the user. The run then implements again.
 **Once per run.** If the rebuilt work is lost again (or the steps make no
 commits at all, so the check keeps holding), the second finding stops the run
 with `NeedsHuman::LostWork`, stopped on the user with the reason: the first
-reopening did not stick and another would repeat it.
+reopening did not stick and another would repeat it. The counter is cleared as
+the run stops, so when the user runs it again the rule may reopen once more.
 
 ## What agents do
 
@@ -70,6 +77,9 @@ branch has commits, so the agent may be mistaken or the cause is something
 else) the question stays for the user as any other.
 
 ## Limits
+
+- A node branch pushed at exactly the default branch's current tip (a merge
+  with nothing after it, or an empty branch) is not told apart from lost work.
 
 - Work committed to a branch that is not the checked-out one, or in a
   repository outside the node's Files, is not seen; a checkout with such work
