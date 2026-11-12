@@ -296,6 +296,11 @@ impl NeedsHuman {
                     format!(" (last review: {})", standing.join("; "))
                 }
             ),
+            Self::CheckBroken { check, why } if why.starts_with(crate::checks::KILLED_FOR_MEMORY) => format!(
+                "the check `{check}` was stopped for lack of memory on the machine it runs on, not because \
+                 the code failed. {why}\nDecide what the check should do: lower its heap, scope it to \
+                 fewer files, or remove it in the lifecycle config, then run again"
+            ),
             Self::CheckBroken { check, why } => format!(
                 "the check `{check}` could not run: {why}. Fix the command in the lifecycle config \
                  (or what it needs), then run again"

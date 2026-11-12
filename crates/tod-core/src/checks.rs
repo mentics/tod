@@ -289,26 +289,108 @@ pub fn tail(bytes: &[u8]) -> String {
     format!("[output cut: the last {} bytes]\n{}", cut.len(), cut.trim_end())
 }
 
+/// The first words of a check's output when it was killed for memory.
+pub const KILLED_FOR_MEMORY: &str = "Killed for memory";
+
+/// What the check's script prints first, ahead of the command, where the
+/// machine has `/proc/meminfo`: total and available MB. Stripped from the
+/// output; used only to say what the machine had when a check is killed.
+const MEM_MARKER: &str = "@@tod-mem ";
+const MEM_PROBE: &str = "if [ -r /proc/meminfo ]; then echo \"@@tod-mem $(awk '/^MemTotal:/{t=$2} /^MemAvailable:/{a=$2} END{print int(t/1024), int(a/1024)}' /proc/meminfo)\"; fi";
+
+/// Split the memory line the script printed off the output: (total MB,
+/// available MB) and the rest.
+fn split_memory(out: &[u8]) -> (Option<(u64, u64)>, &[u8]) {
+    let marker = MEM_MARKER.as_bytes();
+    if !out.starts_with(marker) {
+        return (None, out);
+    }
+    let end = out.iter().position(|b| *b == b'\n').map_or(out.len(), |i| i + 1);
+    let line = String::from_utf8_lossy(&out[marker.len()..end]);
+    let mut nums = line.split_whitespace().map(|n| n.parse::<u64>());
+    let mem = match (nums.next(), nums.next()) {
+        (Some(Ok(total)), Some(Ok(free))) => Some((total, free)),
+        _ => None,
+    };
+    (mem, &out[end..])
+}
+
+/// Output that says the process ran out of memory itself (not killed from
+/// outside): V8's heap limit, Python's `MemoryError`, a C++ `bad_alloc`.
+fn shows_out_of_memory(text: &str) -> bool {
+    ["JavaScript heap out of memory", "MemoryError", "std::bad_alloc", "Cannot allocate memory", "Allocation failed - JavaScript heap"]
+        .iter()
+        .any(|needle| text.contains(needle))
+}
+
+/// Whether a non-zero exit was the machine running out of memory: a kill by
+/// SIGKILL (exit 137 = 128 + 9: how the shell, `docker exec` and the relay
+/// report one; the host's own signal is mapped to it too), the shell's
+/// "Killed", or output showing the heap running out.
+fn killed_for_memory(code: i32, text: &str) -> bool {
+    code == 137 || text.lines().any(|l| l.trim() == "Killed" || l.trim_end().ends_with(" Killed")) || shows_out_of_memory(text)
+}
+
+/// The first line of a memory failure's output.
+fn memory_message(code: i32, text: &str, mem: Option<(u64, u64)>) -> String {
+    let how = if code == 137 {
+        "SIGKILL, likely the out-of-memory killer"
+    } else if shows_out_of_memory(text) {
+        "the process ran out of memory"
+    } else {
+        "the shell reported it killed, likely by the out-of-memory killer"
+    };
+    let machine = match mem {
+        Some((total, free)) => format!(" The machine has {total} MB; {free} MB were free when the check started."),
+        None => String::new(),
+    };
+    format!("{KILLED_FOR_MEMORY} ({how}).{machine} The code may be fine: lower the check's heap, scope it, or remove it.")
+}
+
 /// Run one check at `cwd`: its command through the shell, stderr folded into
 /// stdout. Exit 0 passes, any other exit fails; a command that cannot be run
-/// or outlasts [`CHECK_TIMEOUT`] is broken.
+/// or outlasts [`CHECK_TIMEOUT`] is broken, and so is one killed for memory
+/// (an environment problem for the user, never a finding for the Fix agent).
 pub fn run_command(cwd: &Workdir, check: &Check, files: &[String]) -> (Verdict, String) {
     // `exec 2>&1` makes one stream of what a person would see in a terminal.
-    let script = format!("exec 2>&1\nexport TOD_CHANGED_FILES={}\n{}", shell_quote(&files.join("\n")), check.command);
+    let script = format!("exec 2>&1\n{MEM_PROBE}\nexport TOD_CHANGED_FILES={}\n{}", shell_quote(&files.join("\n")), check.command);
     let result = match cwd {
         Workdir::Host(path) => {
             let mut command = std::process::Command::new("sh");
             command.args(["-c", &script]).current_dir(path);
             run_with_timeout(command, CHECK_TIMEOUT, &path.display().to_string())
         }
-        Workdir::Sandbox { .. } => cwd.output_within(CHECK_TIMEOUT, "sh", &["-c", &script]).map(|o| (o.status.code(), o.stdout)),
+        Workdir::Sandbox { .. } => cwd.output_within(CHECK_TIMEOUT, "sh", &["-c", &script]).map(|o| (exit_code(&o.status), o.stdout)),
         Workdir::Container { container, path } => run_in_container(container, path, &script),
     };
     match result {
-        Ok((Some(0), out)) => (Verdict::Passed, tail(&out)),
-        Ok((Some(_), out)) => (Verdict::Failed, tail(&out)),
-        Ok((None, out)) => (Verdict::Broken, format!("the command was stopped by a signal\n{}", tail(&out))),
+        Ok((Some(code), out)) => {
+            let (mem, rest) = split_memory(&out);
+            let text = tail(rest);
+            if code == 0 {
+                (Verdict::Passed, text)
+            } else if killed_for_memory(code, &text) {
+                (Verdict::Broken, format!("{}\n\n{text}", memory_message(code, &text, mem)))
+            } else {
+                (Verdict::Failed, text)
+            }
+        }
+        Ok((None, out)) => (Verdict::Broken, format!("the command was stopped by a signal\n{}", tail(split_memory(&out).1))),
         Err(err) => (Verdict::Broken, format!("{err:#}")),
+    }
+}
+
+/// A process's exit code; one ended by a signal is `128 + signal`, as a shell
+/// and the relay report it.
+fn exit_code(status: &std::process::ExitStatus) -> Option<i32> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        status.code().or_else(|| status.signal().map(|s| 128 + s))
+    }
+    #[cfg(not(unix))]
+    {
+        status.code()
     }
 }
 
@@ -366,7 +448,7 @@ fn run_with_timeout(mut command: std::process::Command, limit: Duration, what: &
     };
     let (buf, read) = reader.join().map_err(|_| anyhow::anyhow!("reading the command's output panicked"))?;
     read.context("read the command's output")?;
-    Ok((status.code(), buf))
+    Ok((exit_code(&status), buf))
 }
 
 /// What running the stale checks found.
@@ -612,6 +694,42 @@ mod tests {
         // Output on success is kept too, and a missing command is a failure of the
         // command (exit 127), not of running it.
         assert_eq!(run_command(&cwd, &check("no-such-command-here"), &[]).0, Verdict::Failed);
+    }
+
+    #[test]
+    fn a_sigkilled_check_is_killed_for_memory_not_a_finding() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = Workdir::host(dir.path());
+        let check = |command: &str| Check { command: command.to_string(), ..Check::default() };
+        let (verdict, out) = run_command(&cwd, &check("echo working; kill -9 $$"), &[]);
+        assert_eq!(verdict, Verdict::Broken, "{out}");
+        assert!(out.starts_with("Killed for memory (SIGKILL, likely the out-of-memory killer)."), "{out}");
+        assert!(out.contains("working"));
+        assert!(!out.contains("@@tod-mem"));
+        // The shell's own exit 137 reads the same, as it does through a relay.
+        assert_eq!(run_command(&cwd, &check("exit 137"), &[]).0, Verdict::Broken);
+    }
+
+    #[test]
+    fn a_v8_heap_exhaustion_is_killed_for_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = Workdir::host(dir.path());
+        let check = Check {
+            command: "echo 'FATAL ERROR: Reached heap limit Allocation failed - JavaScript heap out of memory'; exit 134".to_string(),
+            ..Check::default()
+        };
+        let (verdict, out) = run_command(&cwd, &check, &[]);
+        assert_eq!(verdict, Verdict::Broken, "{out}");
+        assert!(out.starts_with("Killed for memory (the process ran out of memory)."), "{out}");
+    }
+
+    #[test]
+    fn the_memory_line_is_split_off_and_reported() {
+        assert_eq!(split_memory(b"@@tod-mem 8000 3400\nhello\n"), (Some((8000, 3400)), &b"hello\n"[..]));
+        assert_eq!(split_memory(b"hello"), (None, &b"hello"[..]));
+        let message = memory_message(137, "", Some((8000, 3400)));
+        assert!(message.contains("The machine has 8000 MB; 3400 MB were free when the check started."));
+        assert!(!memory_message(137, "", None).contains("MB"));
     }
 
     #[test]

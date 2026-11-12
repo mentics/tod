@@ -97,6 +97,12 @@ from Blaxel.
   Measured: at 2048 MB tsc runs out of V8 heap after 46 s, and at 3072 MB the kernel kills it
   (available memory fell to 21 MB). So a smaller heap cannot fix it. It needs memory freed
   (the dev servers stopped while it runs) or a smaller tsc footprint.
+- **Fix (tod, 2026-11-12)**: a check killed for memory (exit 137/SIGKILL, "Killed", V8 heap OOM,
+  `MemoryError`) is now *broken*, not failed: it is not sent to the Fix agent, the run stops with
+  a request to the user (lower the heap, scope or remove the check), and the output starts
+  "Killed for memory (...)" with the machine's total and free MB when `/proc/meminfo` exists
+  (`checks::run_command`; tests `a_sigkilled_check_is_killed_for_memory_not_a_finding`,
+  `a_v8_heap_exhaustion_is_killed_for_memory`). Commit: see `git log -S"KILLED_FOR_MEMORY"`.
 - **Measure**: check failures with no output, or exit 137/247, per check.
 
 ### Agent-made git worktrees hide the work
