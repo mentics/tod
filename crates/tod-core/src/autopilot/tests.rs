@@ -2219,6 +2219,70 @@ fn check_now_in_pr_draft_waits_for_the_draft_to_be_ready_and_reviewed() {
     assert!(pending_specs(&fx).is_empty());
 }
 
+/// A draft waiting for a person to mark it ready, then main moves: the next
+/// scheduled look finds work for the agent (behind, or conflicting) and
+/// cancels the wait, instead of waiting on. GitHub reports a draft's
+/// `mergeable_state` as `draft`, so a conflict shows only in `mergeable`.
+#[test]
+fn a_draft_waiting_to_be_marked_ready_gets_work_when_it_falls_behind_or_conflicts() {
+    use tod_store::github::{PrSnapshot, PrStatus};
+    struct Feed(std::sync::Mutex<PrSnapshot>);
+    impl crate::pr_readiness::PrFeed for Feed {
+        fn snapshot(&self, _: &tod_store::github::NodePr) -> Result<PrSnapshot, String> {
+            Ok(self.0.lock().unwrap().clone())
+        }
+    }
+    let fx = bare();
+    retire_outside_criteria(&fx);
+    let status = PrStatus {
+        mergeable: Some(true),
+        mergeable_state: Some("draft".into()),
+        behind_by: Some(0),
+        draft: true,
+        open: true,
+        ..Default::default()
+    };
+    let feed = Arc::new(Feed(std::sync::Mutex::new(PrSnapshot {
+        status,
+        threads: vec![],
+        comments: vec![],
+        reviews: vec![],
+    })));
+    crate::pr_readiness::set_feed_override(Some(feed.clone()));
+    linked_to_prs(&fx, "pr_draft", &["https://github.com/acme/app/pull/42"]);
+
+    let found = super::check_now(&fx.fleet, fx.node, &fx.root).unwrap();
+    assert!(matches!(found, super::GithubCheck::Waiting { .. }), "{found:?}");
+    assert_eq!(pending_specs(&fx), ["github:pr:42:ready_for_review"]);
+
+    // Main moved: behind.
+    feed.0.lock().unwrap().status.behind_by = Some(4);
+    let found = super::check_now(&fx.fleet, fx.node, &fx.root).unwrap();
+    let super::GithubCheck::Feedback { what } = found else { panic!("expected Feedback, got {found:?}") };
+    assert!(what.contains("behind its base"), "{what}");
+    assert!(pending_specs(&fx).is_empty());
+
+    // Conflicting on a draft: `mergeable` is false, the state still `draft`.
+    {
+        let mut snap = feed.0.lock().unwrap();
+        snap.status.behind_by = Some(0);
+        snap.status.mergeable = Some(false);
+    }
+    let found = super::check_now(&fx.fleet, fx.node, &fx.root).unwrap();
+    let super::GithubCheck::Feedback { what } = found else { panic!("expected Feedback, got {found:?}") };
+    assert!(what.contains("conflicts with its base"), "{what}");
+
+    // GitHub still computing it (`mergeable` null): not clean, not a
+    // conflict, and not a wait for a person; the run's own poll looks again.
+    {
+        let mut snap = feed.0.lock().unwrap();
+        snap.status.mergeable = None;
+        snap.status.mergeable_state = None;
+    }
+    let found = super::check_now(&fx.fleet, fx.node, &fx.root).unwrap();
+    assert_eq!(found, super::GithubCheck::NothingToWaitOn);
+}
+
 #[test]
 fn check_now_in_pr_draft_sends_new_changes_requested_to_the_agent_even_on_a_draft() {
     use tod_store::github::{PrReview, PrSnapshot, PrStatus};

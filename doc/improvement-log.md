@@ -59,7 +59,8 @@ turns, findings, run_state, node_timeline, journey records):
 ### Waiting for the user to mark ready misses a new conflict
 
 - **Seen**: 1 node (ENG-3093, 2026-11-11). It waited on "flagship#6641 to be marked ready" while GitHub showed the PR as `CONFLICTING`.
-- **Cause**: open. The node may only have been stopped, since its sandbox was pruned. Otherwise the long wait for a person does not look at mergeability again.
+- **Cause**: found 2026-11-12. Each scheduled look did re-read the PR, but a conflict on a draft was invisible: GitHub reports a draft's `mergeable_state` as `draft` whatever the branch is, and `Assessment::conflicted` read only `mergeable_state == dirty`, so `Work::Conflict` never fired while the draft waited to be marked ready. (Behind was caught: it comes from the compare count.) Whether ENG-3093 was also stopped cannot be proved now, its sandbox being pruned.
+- **Fix**: `conflicted()` also reads `mergeable == false` (which only ever means a conflict); `mergeable` null stays "GitHub still computing", left to the run's own poll, never clean and never a conflict. Test: `autopilot::tests::a_draft_waiting_to_be_marked_ready_gets_work_when_it_falls_behind_or_conflicts`.
 - **Measure**: nodes waiting for a person whose PR is not mergeable.
 
 ## 2026-11-10 — first pass over the 12 `pr_draft` nodes
