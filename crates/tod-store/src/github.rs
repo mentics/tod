@@ -573,43 +573,61 @@ impl Github {
         Ok(all)
     }
 
-    /// Whether the pull request's own change against `base` is the same at
-    /// `reviewed` as at `head`: `head` differs from `reviewed` only by what
-    /// merging `base` in brought (or not at all). Compares, per file, what
-    /// `base...reviewed` and `base...head` (merge-base diffs, so a merge of the
-    /// base drops out of both) add and remove: the file set, renames and the
-    /// added/removed lines, never hunk positions or context, which a merge of
-    /// the base moves. `Ok(false)` when they differ, or `reviewed` is no longer
-    /// in the repository (a force-push); `Err` when the comparison cannot be
-    /// made (GitHub failing, a diff too large to read, a binary file whose
-    /// patch GitHub omits), so a review is never counted current on a guess.
+    /// Whether a review of `reviewed` still covers `head`: the pull request's
+    /// own change against `base` at `head` is a subset of the one at
+    /// `reviewed`. Compares `base...reviewed` with `base...head` (merge-base
+    /// diffs, so what a merge of the base brought in drops out of both): every
+    /// file of the head's must be in the reviewed one's with the same added and
+    /// removed lines (hunk positions and context are ignored, the base moves
+    /// them). A file only the reviewed change has is fine (the base absorbed
+    /// it); a file only the head has, or a differing one, is a real change and
+    /// `Ok(false)`, as is a `reviewed` that is no longer in the repository (a
+    /// force-push). `Err` when the comparison cannot be made (GitHub failing,
+    /// an unknown base or head, more files than GitHub lists, a binary file
+    /// whose patch GitHub omits), so a review is never counted current on a
+    /// guess.
     pub fn same_change(&self, owner: &str, repo: &str, base: &str, reviewed: &str, head: &str) -> Result<bool, GithubError> {
         if reviewed == head {
             return Ok(true);
         }
+        // The head first: if the base or the head is unknown, that is an
+        // error, whatever became of the reviewed commit.
+        let head_files = self.compare_files(owner, repo, base, head).map_err(|err| match err {
+            GithubError::NotFound => GithubError::Api(format!(
+                "{base}...{head} was not found: the base branch or the head commit is unknown to GitHub, or tod's token cannot see the repository"
+            )),
+            other => other,
+        })?;
         let reviewed_files = match self.compare_files(owner, repo, base, reviewed) {
             Ok(files) => files,
-            // The reviewed commit is gone: the branch was rewritten.
+            // The base and head exist, so it is the reviewed commit that is
+            // gone: the branch was rewritten.
             Err(GithubError::NotFound) => return Ok(false),
             Err(err) => return Err(err),
         };
-        let head_files = self.compare_files(owner, repo, base, head)?;
-        change_equal(&reviewed_files, &head_files).map_err(GithubError::Api)
+        change_covered(&reviewed_files, &head_files).map_err(GithubError::Api)
     }
 
-    /// The files `base...head` changes, with patches.
+    /// The files `base...head` changes, with patches. GitHub lists at most
+    /// 300 files of a compare, so a compare that reaches that is cut off.
     fn compare_files(&self, owner: &str, repo: &str, base: &str, head: &str) -> Result<Vec<CompareFile>, GithubError> {
         let mut all = Vec::new();
-        for page in 1..=30 {
+        for page in 1..=3 {
             let raw: CompareFilesRaw =
                 self.get_json(&format!("/repos/{owner}/{repo}/compare/{base}...{head}?per_page=100&page={page}"))?;
             let last = raw.files.len() < 100;
             all.extend(raw.files);
             if last {
-                return Ok(all);
+                break;
             }
         }
-        Err(GithubError::Api(format!("{base}...{head} changes more than 3000 files: too large to compare")))
+        if all.len() >= COMPARE_FILE_LIMIT {
+            return Err(GithubError::Api(format!(
+                "{base}...{head} changes {} files and GitHub lists at most {COMPARE_FILE_LIMIT} of a compare, so it may be cut off: too large to compare",
+                all.len()
+            )));
+        }
+        Ok(all)
     }
 
     /// Submit a review (`COMMENT`, neither approving nor asking for changes)
@@ -1263,19 +1281,23 @@ fn change_lines(patch: &str) -> Vec<&str> {
     patch.lines().filter(|l| l.starts_with('+') || l.starts_with('-')).collect()
 }
 
-/// Whether two compares change the same thing. `Err` (with why) when a file's
-/// patch is missing on either side and so cannot be told.
-pub fn change_equal(a: &[CompareFile], b: &[CompareFile]) -> Result<bool, String> {
-    let key = |f: &CompareFile| (f.filename.clone(), f.status.clone(), f.previous_filename.clone());
-    let mut a: Vec<&CompareFile> = a.iter().collect();
-    let mut b: Vec<&CompareFile> = b.iter().collect();
-    a.sort_by_key(|f| key(f));
-    b.sort_by_key(|f| key(f));
-    if a.len() != b.len() || a.iter().zip(&b).any(|(x, y)| key(x) != key(y)) {
-        return Ok(false);
-    }
-    for (x, y) in a.iter().zip(&b) {
-        match (&x.patch, &y.patch) {
+/// The most files GitHub lists of one compare.
+const COMPARE_FILE_LIMIT: usize = 300;
+
+/// Whether the change `head` makes is covered by `reviewed`: every file of
+/// `head` is in `reviewed` with the same renamed-from and the same added and
+/// removed lines. `reviewed` may have files `head` lacks. `Err` (with why)
+/// when a head file's patch, or its reviewed one, is missing and so cannot be
+/// told.
+pub fn change_covered(reviewed: &[CompareFile], head: &[CompareFile]) -> Result<bool, String> {
+    for h in head {
+        let Some(r) = reviewed.iter().find(|r| r.filename == h.filename) else {
+            return Ok(false);
+        };
+        if r.previous_filename != h.previous_filename {
+            return Ok(false);
+        }
+        match (&r.patch, &h.patch) {
             (Some(p), Some(q)) => {
                 if change_lines(p) != change_lines(q) {
                     return Ok(false);
@@ -1284,7 +1306,7 @@ pub fn change_equal(a: &[CompareFile], b: &[CompareFile]) -> Result<bool, String
             _ => {
                 return Err(format!(
                     "GitHub gives no patch for {} (binary or too large), so the two commits cannot be compared",
-                    x.filename
+                    h.filename
                 ));
             }
         }
@@ -1304,21 +1326,32 @@ mod change_equal_tests {
     fn hunk_positions_and_context_do_not_matter() {
         let a = [file("a.rs", "@@ -1,3 +1,4 @@\n ctx\n+new\n ctx2")];
         let b = [file("a.rs", "@@ -40,3 +41,4 @@\n other ctx\n+new\n ctx3")];
-        assert_eq!(change_equal(&a, &b), Ok(true));
+        assert_eq!(change_covered(&a, &b), Ok(true));
+    }
+
+    /// #6663: the reviewed diff had `.quality/baseline.json`, which the merged
+    /// main later replaced, so the head's diff lacks it.
+    #[test]
+    fn a_file_the_base_absorbed_is_still_covered() {
+        let reviewed = [file("a.rs", "@@ -1 +1 @@\n+new"), file(".quality/baseline.json", "@@ -1 +1 @@\n+{}")];
+        let head = [file("a.rs", "@@ -9 +9 @@\n+new")];
+        assert_eq!(change_covered(&reviewed, &head), Ok(true));
     }
 
     #[test]
-    fn a_different_line_file_or_extra_file_is_a_change() {
-        let a = [file("a.rs", "@@ -1 +1 @@\n+new")];
-        assert_eq!(change_equal(&a, &[file("a.rs", "@@ -1 +1 @@\n+newer")]), Ok(false));
-        assert_eq!(change_equal(&a, &[file("b.rs", "@@ -1 +1 @@\n+new")]), Ok(false));
-        assert_eq!(change_equal(&a, &[a[0].clone(), file("b.rs", "+x")]), Ok(false));
+    fn a_new_or_differing_file_is_a_change() {
+        let reviewed = [file("a.rs", "@@ -1 +1 @@\n+new"), file("c.rs", "+c")];
+        assert_eq!(change_covered(&reviewed, &[file("a.rs", "@@ -1 +1 @@\n+newer")]), Ok(false));
+        assert_eq!(change_covered(&reviewed, &[file("b.rs", "@@ -1 +1 @@\n+new")]), Ok(false));
+        assert_eq!(change_covered(&reviewed, &[reviewed[0].clone(), file("b.rs", "+x")]), Ok(false));
+        let renamed = CompareFile { previous_filename: Some("old.rs".into()), ..reviewed[0].clone() };
+        assert_eq!(change_covered(&reviewed, &[renamed]), Ok(false));
     }
 
     #[test]
     fn a_missing_patch_cannot_be_compared() {
         let a = [CompareFile { patch: None, ..file("img.png", "") }];
-        assert!(change_equal(&a, &a).is_err());
+        assert!(change_covered(&a, &a).is_err());
     }
 }
 

@@ -117,13 +117,17 @@ score. First supported: Greptile.
   re-review a head whose own change is unchanged, so when the summary names a
   commit other than the head, `Github::same_change` compares
   `base...reviewed` with `base...head` (merge-base diffs, so what the merge
-  brought in drops out): the same files and the same added and removed lines
-  per file (hunk positions and context ignored). If they match the review is
-  current, with the reviewed commit's score, and no `BotReviewMissing` is
-  produced. A reviewed commit no longer in the repository (a force-push) is a
-  real change. If the comparison cannot be made (GitHub failing, a binary
-  file with no patch, more than 3000 files, an unknown base) the assessment
-  fails with that error, never a guess either way.
+  brought in drops out). The review covers the head when the head's diff is a
+  **subset** of the reviewed one: every file of the head's is in the reviewed
+  one's with the same added and removed lines (hunk positions and context
+  ignored). A file only the reviewed diff has (the base absorbed it) is fine;
+  a file only the head has, or a differing one, is a real change and the
+  review stays stale. Then the review is current, with the reviewed commit's
+  score, and no `BotReviewMissing` is produced. A reviewed commit no longer in
+  the repository (a force-push) is a real change. If the comparison cannot be
+  made (GitHub failing, an unknown base or head, a binary file with no patch,
+  a compare of 300 or more files, which GitHub cuts off) the assessment fails
+  with that error, never a guess either way.
 - Threshold: `min_score = 4` for this project (4 or 5 passes).
 - Asking for a review: the app never asks a bot. How and when to ask (on a
   draft, after a round of fixes) is project-specific, so it is in the
