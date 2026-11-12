@@ -106,6 +106,12 @@ pub fn pull(remote: &dyn Remote, local: &Path) -> Result<u64> {
 /// Copies each local log the sandbox lacks, or has shorter, back into it.
 /// The number restored. Nothing local is nothing to do (and no network call).
 pub fn restore(remote: &dyn Remote, local: &Path) -> Result<usize> {
+    restore_with(remote, local, &mut |_| {})
+}
+
+/// [`restore`] saying how far it is, file by file: a node with many large
+/// logs takes minutes, and silence looks like a hang.
+pub fn restore_with(remote: &dyn Remote, local: &Path, progress: &mut dyn FnMut(&str)) -> Result<usize> {
     let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut wanted = Vec::new();
     if let Ok(entries) = std::fs::read_dir(local) {
@@ -124,7 +130,10 @@ pub fn restore(remote: &dyn Remote, local: &Path) -> Result<usize> {
     }
     let there = remote.list()?;
     let mut restored = 0;
-    for (project, session, size, path) in wanted {
+    let started = std::time::Instant::now();
+    let mut sent = 0u64;
+    let total = wanted.len();
+    for (n, (project, session, size, path)) in wanted.into_iter().enumerate() {
         let held = there
             .iter()
             .find(|l| l.project == project && l.session == session)
@@ -133,8 +142,19 @@ pub fn restore(remote: &dyn Remote, local: &Path) -> Result<usize> {
             continue;
         }
         let bytes = std::fs::read(&path).with_context(|| format!("read {}", path.display()))?;
-        remote.write(&project, &session, &bytes)?;
+        progress(&format!("sending session log {} of {total} ({} KB)", n + 1, size / 1024));
+        let one = std::time::Instant::now();
+        remote
+            .write(&project, &session, &bytes)
+            .with_context(|| format!("session log {} of {total} ({session}, {} KB)", n + 1, size / 1024))?;
+        sent += size;
+        tracing::info!(session = %session, bytes = size, secs = one.elapsed().as_secs_f32(), "sent session log");
         restored += 1;
+    }
+    if restored > 0 {
+        let secs = started.elapsed().as_secs_f32();
+        tracing::info!(files = restored, bytes = sent, secs, "restored session logs");
+        progress(&format!("sent {restored} session logs ({} KB) in {secs:.1}s", sent / 1024));
     }
     Ok(restored)
 }
@@ -221,6 +241,29 @@ fn sh_write(run: Run, project: &str, session: &str, bytes: &[u8]) -> Result<()> 
     Ok(())
 }
 
+/// Sends a log as one compressed upload: one command to make the project
+/// directory and say where it is (`$CLAUDE_CONFIG_DIR` is the sandbox's, not
+/// ours), then `upload` of the whole file, which the sandbox side moves into
+/// place at once. A log is JSON lines and compresses about ten to one, and the
+/// upload is bandwidth-bound, so that is what matters: the chunked
+/// [`sh_write`] sent every 48 KB as its own process and relay call (about 21
+/// calls per MB, base64 on top), and took minutes for a few large logs.
+fn write_compressed(
+    run: Run,
+    upload: &dyn Fn(&str, &[u8]) -> Result<()>,
+    project: &str,
+    session: &str,
+    bytes: &[u8],
+) -> Result<()> {
+    let script = format!(r#"{PROJECTS}; mkdir -p "$d/$1" && printf %s "$d/$1""#);
+    let dir = run(&script, &[project])?;
+    let dir = String::from_utf8_lossy(&dir).trim().to_string();
+    if !dir.starts_with('/') {
+        bail!("the sandbox's session directory for {project} came back as {dir:?}, not an absolute path");
+    }
+    upload(&format!("{dir}/{session}.jsonl"), bytes).with_context(|| format!("send session log {session}"))
+}
+
 impl Remote for SandboxRemote {
     fn list(&self) -> Result<Vec<RemoteLog>> {
         sh_list(&|script, args| self.sh(script, args))
@@ -231,7 +274,13 @@ impl Remote for SandboxRemote {
     }
 
     fn write(&self, project: &str, session: &str, bytes: &[u8]) -> Result<()> {
-        sh_write(&|script, args| self.sh(script, args), project, session, bytes)
+        write_compressed(
+            &|script, args| self.sh(script, args),
+            &|path, bytes| self.exec.upload_compressed(path, bytes, "0644"),
+            project,
+            session,
+            bytes,
+        )
     }
 }
 
@@ -454,11 +503,16 @@ pub fn pull_node(data_root: &Path, node_id: &str, sandbox: &str) -> Result<u64> 
 
 /// Copy `node_id`'s local session logs into `sandbox`.
 pub fn restore_node(data_root: &Path, node_id: &str, sandbox: &str) -> Result<usize> {
+    restore_node_with(data_root, node_id, sandbox, &mut |_| {})
+}
+
+/// [`restore_node`] saying how far it is.
+pub fn restore_node_with(data_root: &Path, node_id: &str, sandbox: &str, progress: &mut dyn FnMut(&str)) -> Result<usize> {
     let local = local_dir(data_root, node_id);
     if !local.is_dir() {
         return Ok(0);
     }
-    restore(&SandboxRemote::new(sandbox), &local)
+    restore_with(&SandboxRemote::new(sandbox), &local, progress)
 }
 
 /// The runner state that travels with a node between places: the
@@ -1068,6 +1122,39 @@ mod transfer_tests {
 ");
         assert!(!ensure_session(&to, &[&from], "nothing", "-new").unwrap());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A log goes as one directory command and one upload, however long it is
+    /// (the chunked path made one call per 48 KB), and arrives whole.
+    #[test]
+    fn a_log_is_sent_as_one_compressed_upload() {
+        use std::cell::{Cell, RefCell};
+        let body = b"{\"a\":1}\n".repeat(200_000);
+        let runs = Cell::new(0);
+        let uploads: RefCell<Vec<(String, Vec<u8>)>> = RefCell::new(Vec::new());
+        write_compressed(
+            &|_, _| {
+                runs.set(runs.get() + 1);
+                Ok(b"/home/u/.claude/projects/-proj".to_vec())
+            },
+            &|path, bytes| {
+                uploads.borrow_mut().push((path.to_string(), bytes.to_vec()));
+                Ok(())
+            },
+            "-proj",
+            "sid",
+            &body,
+        )
+        .unwrap();
+        assert_eq!(runs.get(), 1);
+        let uploads = uploads.borrow();
+        assert_eq!(uploads.len(), 1);
+        assert_eq!(uploads[0].0, "/home/u/.claude/projects/-proj/sid.jsonl");
+        assert_eq!(uploads[0].1, body);
+        let err = write_compressed(&|_, _| Ok(b"".to_vec()), &|_, _| Ok(()), "-p", "s", b"x").unwrap_err();
+        assert!(err.to_string().contains("not an absolute path"));
+        let err = write_compressed(&|_, _| Ok(b"/d".to_vec()), &|_, _| bail!("boom"), "-p", "s", b"x").unwrap_err();
+        assert!(format!("{err:#}").contains("send session log s") && format!("{err:#}").contains("boom"));
     }
 
     /// The shell scripts the sandbox and container remotes share, run by a

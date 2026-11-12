@@ -24,6 +24,17 @@ configures one.
   command runs under the container's `timeout` and `docker exec` is killed
   shortly after as a backstop), the sandbox failing) is *broken*: the run stops for the
   user (`NeedsHuman::CheckBroken`), nothing is sent to an agent.
+- **Killed for memory** is broken too, never a finding: exit 137 (SIGKILL; the host's own
+  signal is mapped to 128 + signal, and the relay and `docker exec` already report it that
+  way), V8's heap abort or a `bad_alloc` (exit 134, with its message), Python's uncaught
+  `MemoryError` as the traceback's last line (exit 1), or the shell's "Killed" as the last
+  line. A failing test that merely mentions memory stays a failure. The output begins
+  "Killed for memory (...)" with where it ran and, where `/proc/meminfo` exists, total and
+  free MB when the check started (the script prints it ahead of the command; `run_command`
+  strips that line wherever it is). The Fix agent is not sent it: the stop asks the user to
+  lower the check's heap, scope it, or remove it (its first line is that decision, then why,
+  then the last lines of output). A stored memory kill is never reused for unchanged files:
+  the next run runs the check again.
 - **Freshness**: each run records a fingerprint of the files
   (`checks::fingerprint`: every repository's and submodule's `HEAD`, diff
   against `HEAD`, and untracked files' contents). A run is current while the

@@ -194,7 +194,7 @@ fn watch_done_sandboxes(shared: Arc<Shared>) {
 }
 
 /// One pass: [`tod_core::sandbox_retire::retire_due`], which deletes through
-/// the same `lost::delete_node_sandbox` the task panel's menu does. A pass
+/// `lost::retire_node_sandbox`, the task panel's delete without the user's "no sandbox until Start" flag. A pass
 /// that cannot even read the store is loud, never skipped.
 fn retire_pass(store: &tod_store::fleet::FleetStore) {
     if let Err(err) = tod_core::sandbox_retire::retire_due(store) {

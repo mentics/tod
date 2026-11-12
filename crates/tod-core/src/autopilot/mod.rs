@@ -296,6 +296,19 @@ impl NeedsHuman {
                     format!(" (last review: {})", standing.join("; "))
                 }
             ),
+            Self::CheckBroken { check, why } if why.starts_with(crate::checks::KILLED_FOR_MEMORY) => {
+                let (reason, output) = why.split_once("\n\n").unwrap_or((why.as_str(), ""));
+                let lines: Vec<&str> = output.lines().collect();
+                let shown = lines[lines.len().saturating_sub(10)..].join("\n");
+                let mut text = format!(
+                    "Lower the heap of check `{check}`, scope it, or remove it: it was killed for lack of memory, \
+                     not because the code failed.\n\n{reason} The app runs the check again on the next run."
+                );
+                if !shown.is_empty() {
+                    text.push_str(&format!("\n\nLast of its output:\n{shown}"));
+                }
+                text
+            }
             Self::CheckBroken { check, why } => format!(
                 "the check `{check}` could not run: {why}. Fix the command in the lifecycle config \
                  (or what it needs), then run again"

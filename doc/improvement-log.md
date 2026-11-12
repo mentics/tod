@@ -31,6 +31,16 @@ turns, findings, run_state, node_timeline, journey records):
 
 ---
 
+## 2026-11-12: slow replacement
+
+### Replacing a sandbox spends ten minutes copying session logs
+
+- **Seen**: 1 node (ENG-2925, F05EF005), 3 session logs, about 10 minutes, 2026-11-12. The node did nothing meanwhile.
+- **Symptom**: "sending session log n of 3" for minutes.
+- **Cause**: `session_log::sh_write` sent a log in 48 KB base64 chunks, each its own `tod-sandbox exec` (a relay connection plus a `sh` per chunk): about 21 calls per MB, and the bytes uncompressed. A 50 MB log is about 1,000 calls.
+- **Fix**: `SandboxRemote::write` makes the project directory with one command, then uploads the whole file gzipped through Blaxel's filesystem API (`upload_large_compressed`, 4 MB parts, unpacked and renamed in place), the path the supervisor binary already takes. JSON-lines logs compress about 10 to 1. That is one `mkdir` command, two free-space checks, one PUT per 4 MB of the gzip, and one unpack command per log (about 4 calls plus 1 per 4 MB of gzip, so ~0.25 per raw MB at 10 to 1, against ~21), and about a tenth of the bytes. Failures name the log. Total bytes and seconds are logged and shown when done. Dev containers keep the chunked path (local `docker exec`, cheap). Nothing runs differently inside the sandbox (no relay or supervisor change).
+- **Measure**: seconds and bytes per replacement's session-log copy (now logged as "restored session logs").
+
 ## 2026-11-11: overnight stops
 
 ### PR babysitter counts housekeeping as rounds ("PR stuck")
@@ -55,6 +65,13 @@ turns, findings, run_state, node_timeline, journey records):
 - **Cause**: another session's build, which is not on main, refreshed the one golden every root shares. Main's build then refuses to fork from it.
 - **Fix**: open. The install stamp says which is newer, not which build is on main.
 - **Measure**: golden refreshes by install stamp; Start refusals for this reason.
+
+### Waiting for the user to mark ready misses a new conflict
+
+- **Seen**: 1 node (ENG-3093, 2026-11-11). It waited on "flagship#6641 to be marked ready" while GitHub showed the PR as `CONFLICTING`.
+- **Cause**: found 2026-11-12. Each scheduled look did re-read the PR, but a conflict on a draft was invisible: GitHub reports a draft's `mergeable_state` as `draft` whatever the branch is, and `Assessment::conflicted` read only `mergeable_state == dirty`, so `Work::Conflict` never fired while the draft waited to be marked ready. (Behind was caught: it comes from the compare count.) Whether ENG-3093 was also stopped cannot be proved now, its sandbox being pruned.
+- **Fix**: `conflicted()` also reads `mergeable == false` (which only ever means a conflict); `mergeable` null stays "GitHub still computing", left to the run's own poll, never clean and never a conflict. Test: `autopilot::tests::a_draft_waiting_to_be_marked_ready_gets_work_when_it_falls_behind_or_conflicts`.
+- **Measure**: nodes waiting for a person whose PR is not mergeable.
 
 ## 2026-11-10 — first pass over the 12 `pr_draft` nodes
 
@@ -84,6 +101,18 @@ from Blaxel.
   golden was not needed: Blaxel takes any memory size in MB (CPU follows at
   1 per 2 GB, about $0.041 per GB-hour active), but a fork cannot choose its
   own, so it would mean changing the golden.
+- **Seen again**: ENG-2157 (2026-11-11), this time the ui `tsc` check, which runs with
+  `--max-old-space-size=6144`. It was killed at 3.3 GB RSS, with about 3.4 GB free
+  next to the dev servers. It is the same kind of problem and is not fixed yet.
+  Measured: at 2048 MB tsc runs out of V8 heap after 46 s, and at 3072 MB the kernel kills it
+  (available memory fell to 21 MB). So a smaller heap cannot fix it. It needs memory freed
+  (the dev servers stopped while it runs) or a smaller tsc footprint.
+- **Fix (tod, 2026-11-12)**: a check killed for memory (exit 137/SIGKILL, "Killed", V8 heap OOM,
+  `MemoryError`) is now *broken*, not failed: it is not sent to the Fix agent, the run stops with
+  a request to the user (lower the heap, scope or remove the check), and the output starts
+  "Killed for memory (...)" with the machine's total and free MB when `/proc/meminfo` exists
+  (`checks::run_command`; tests `a_sigkilled_check_is_killed_for_memory_not_a_finding`,
+  `a_v8_heap_exhaustion_is_killed_for_memory`). Commit: see `git log -S"KILLED_FOR_MEMORY"`.
 - **Measure**: check failures with no output, or exit 137/247, per check.
 
 ### Agent-made git worktrees hide the work
@@ -113,6 +142,11 @@ from Blaxel.
   them; Start deletes a kept failed sandbox of the same node and makes a fresh
   one (`NameDecision::ReplaceFailed`). Seen working live for ENG-3067 and
   ENG-3193.
+- **Wording**: every health failure now says what is wrong, the likely cause
+  and the next step in plain words, then a `Technical detail:` line with the
+  check name and fields (`HealthFailure` Display, a3b0a37e; next steps made
+  true per new/existing sandbox in the follow-up commit). No automatic retry
+  added.
 - **Measure**: setup failures per fork, by health check.
 
 ### Small UI problems seen
@@ -212,3 +246,56 @@ from Blaxel.
 - **Cause**: real feedback; each fix round draws new bot findings.
 - **Fix**: none needed in the app yet; rerun.
 - **Measure**: bot findings per round; whether they shrink.
+
+### Pruned sandbox stops a waiting node
+
+- **Seen**: several live nodes (ENG-3093, ENG-2925).
+- **Symptom**: a node waiting on GitHub (CI, a bot, a person) showed stopped,
+  "its sandbox was deleted; Start makes a new one", until someone clicked Resume.
+- **Cause**: the Blaxel Prune workflow deletes node sandboxes asleep over an
+  hour (they are never kept awake on purpose). The orchestrator marks the node
+  lost when a wake finds the sandbox gone and the app or daemon replaced it,
+  but with no regard for whether the node was meant to run (a paused node got
+  one too), and a replacement that failed was only logged and retried every
+  ten minutes forever while the node read "a new one is made at the next sync".
+- **Fix**: `cloud_sync::lost` replaces the sandbox lazily (only when a wake or
+  feedback finds it gone) for a node whose run row is not `Stopped`/`Done`;
+  a user-deleted sandbox is still left for Start. Three failed tries, ten
+  minutes apart, record the node failed with the real error
+  (`next_actor` shows that error instead of the loss). The status note says
+  "pruned or deleted outside the app; made a new one". Commit: see `git log`
+  for "Pruned sandbox".
+- **Measure**: nodes showing "sandbox is gone/deleted" for longer than one sync;
+  replacements per node; nodes failed by `could not be made after 3 tries`.
+
+- **Follow-up (pruned sandbox, second pass)**: the first fix did not help the
+  live nodes because `cloud-sync.json`'s `deleted_by_user` flag was set on 13
+  non-done nodes, which kept them out of replacement. Cause: the flag was set by
+  every `delete_with`, including the daemon's retirement of a done node's
+  sandbox (`sandbox_retire`), and outlived the node's next run. Fix: only the
+  user's explicit Delete sandbox (menu, delete anyway, stop and delete) sets
+  it, bound to the sandbox it removed (`deleted_sandboxes`); retirement leaves
+  none and a done node is never replaced. `lost::heal_deleted_flags` (every
+  sync, in the app and the daemon) clears a flag whose row now names another
+  sandbox, and a legacy flag (no sandbox name) on a node whose run row is
+  starting/working/waiting. The replacement tries are persisted
+  (`replace_tries`), kept until a sandbox is made so a failed record write is
+  recorded again without another try, and the conversation driver's resend
+  after a launch finds the sandbox gone shares the same bound
+  (`allow_remake`).
+
+- **Follow-up (pruned sandbox, third pass)**: after the flags healed, ten
+  replacements went quiet for minutes after "forked and set up" and the lost
+  mark stayed. The silence is the step after the fork: a replaced node's agent
+  session logs (58 for one node) are copied in chunk by chunk through the relay,
+  which logged nothing, so a slow copy looked like a hang. Fix: that copy says
+  "sending session log n of N (KB)"; a replacement is done only when the lost
+  mark is verified cleared in the database (`verify_recorded`, else an error),
+  and says so ("replaced ... with ..."); a Start also resets the persisted
+  replacement tries; the driver's remake counts a try only once it begins one
+  (`can_remake` / `note_remake`); stale flags heal before the sync, which may
+  fail; and the one-call submodule branching handles a submodule that already
+  has the branch locally (every golden fork), moving it to origin's when
+  behind, instead of declining on every fork. A5898BE2's row (sandbox
+  `node-bom-upload-...`, lost since October, no Files location) is a legacy
+  record no replacement is attempted for.

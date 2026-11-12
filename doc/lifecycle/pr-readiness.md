@@ -90,7 +90,7 @@ client `pr_mergeable_outcome` uses. All apply to **every linked PR**.
 | Slug | Passes when |
 |---|---|
 | `pr-approved-mergeable` (existing) | GitHub `mergeable_state` is `clean`, or the PR is merged. |
-| `pr-up-to-date` | The PR's head contains the base branch's tip (GitHub `mergeable_state` is not `behind`), with no conflict. |
+| `pr-up-to-date` | The PR's head contains the base branch's tip (GitHub `mergeable_state` is not `behind`), with no conflict (`mergeable_state` `dirty`, or GitHub's `mergeable` false, which a draft's `draft` state would otherwise hide). |
 | `pr-threads-resolved` | Every review thread, human or bot, is resolved or outdated. |
 | `pr-review-current` | For each configured review bot, a review exists **for the current head commit** (so a push makes the old review stale). See Bots. |
 | `pr-review-score` | For each configured bot with a `min_score`, its latest review for the current head has a score at or above it. |

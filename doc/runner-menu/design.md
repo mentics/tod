@@ -448,3 +448,22 @@ own); "Stop" (now Stop now). Journey action ids from then (`RunInCloud`,
 Before stage B a second creator (`cloud_sync::ensure_node_sandbox`) made the
 supervisor's sandbox and `cloud_nodes.sandbox` was the second record; both
 are gone.
+
+## A pruned sandbox is replaced by itself
+
+Cofactr's prune deletes node sandboxes asleep over an hour, which a node
+waiting on GitHub is. When a wake or feedback finds the sandbox gone, the
+orchestrator marks the node lost and the app or daemon (`cloud_sync::lost`)
+makes a new one through `ensure_supervisor` and pokes it, so the run continues
+from its saved state. Only a node meant to run is replaced: one whose run row
+is `Stopped` (paused, stopped, failed, needs someone) or `Done` is not, and a
+sandbox the user deleted waits for Start. A failed replacement is tried three
+times ten minutes apart, then the node is recorded failed with the last error.
+
+The "deleted by the user" flag (`cloud-sync.json`, `deleted_by_user` plus
+`deleted_sandboxes`) means exactly: the user chose Delete sandbox for that
+sandbox. Retiring a done node's sandbox does not set it. `heal_deleted_flags`
+drops a flag whose cloud row now names another sandbox, and a legacy flag with
+no sandbox name for a node whose run row says it is meant to run. Replacement
+tries are kept in `replace_tries` in the same file, so a restart does not grant
+them again.

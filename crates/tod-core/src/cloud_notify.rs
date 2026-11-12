@@ -457,6 +457,9 @@ pub fn runner(fleet: &Arc<FleetStore>) -> Arc<Coalesced> {
                     note_degraded(&root, report.notices_degraded_secs);
                     refresh_topics(&root);
                     // The orchestrator found a node's sandbox gone: replace it.
+                    if let Err(err) = cloud_sync::lost::heal_deleted_flags(&fleet) {
+                        tracing::warn!("cloud: checking the sandbox-deleted flags: {err:#}");
+                    }
                     if cloud_sync::lost::any_marked(&fleet) {
                         cloud_sync::lost::spawn_check(fleet.clone(), cloud_sync::lost::Check::Marked);
                     }

@@ -1094,6 +1094,17 @@ impl SandboxExec {
         Ok(Output { status: exit_status(code), stdout, stderr: stderr.into_bytes() })
     }
 
+    /// Writes a file in one go through Blaxel's filesystem API: gzipped here,
+    /// sent in 4 MB parts, unpacked and renamed into place in the sandbox (so
+    /// a cut-off copy is never at `path`). One round trip per part, where a
+    /// command per few KB cost one process and one relay call each.
+    pub fn upload_compressed(&self, path: &str, bytes: &[u8], mode: &str) -> Result<()> {
+        let conn = connect(&self.name)?;
+        let bx = Sandboxes::load(&data_root()?)?.blaxel()?;
+        bx.upload_large_compressed(&conn.url, path, bytes, mode)
+            .with_context(|| format!("upload {path} to sandbox {}", self.name))
+    }
+
     /// Whether `path` is a directory in the sandbox.
     pub fn is_dir(&self, path: &str) -> Result<bool> {
         Ok(self.output("/", "test", &["-d", path])?.status.success())

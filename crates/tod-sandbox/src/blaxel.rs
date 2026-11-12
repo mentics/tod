@@ -1065,22 +1065,30 @@ impl Blaxel {
         let packed = format!("{path}.gz");
         self.upload_large(url, &packed, &gz, "0644")?;
         let staged = format!("{path}.unpacked");
-        let res = self.run(
+        // The unpack and move come first and the removal of the gzip after, so
+        // the two outcomes can be told apart: the file is in place or it is not.
+        let unpack = self.run(
             url,
-            &format!(
-                "gunzip -c {1} > {2} && chmod {3} {2} && mv -f {2} {0} && rm -f {1}",
-                q(path),
-                q(&packed),
-                q(&staged),
-                q(mode)
-            ),
+            &format!("gunzip -c {1} > {2} && chmod {3} {2} && mv -f {2} {0}", q(path), q(&packed), q(&staged), q(mode)),
             120,
-        )?;
-        if res.exit_code != 0 {
-            let _ = self.run(url, &format!("rm -f {} {}", q(&packed), q(&staged)), 30);
-            bail!("unpacking {path} failed: {}", res.output());
+        );
+        let failure = match unpack {
+            Ok(res) if res.exit_code == 0 => None,
+            Ok(res) => Some(anyhow::anyhow!("unpacking {path} failed: {}", res.output())),
+            Err(err) => Some(err.context(format!("unpacking {path} failed"))),
+        };
+        let leftovers = format!("rm -f {} {} 2>&1", q(&packed), q(&staged));
+        let cleanup = match self.run(url, &leftovers, 30) {
+            Ok(r) if r.exit_code == 0 => None,
+            Ok(r) => Some(format!("could not remove {packed} and {staged}: {}", r.output().trim())),
+            Err(err) => Some(format!("could not remove {packed} and {staged}: {err:#}")),
+        };
+        match (failure, cleanup) {
+            (None, None) => Ok(()),
+            (None, Some(left)) => Err(anyhow::anyhow!("{path} is in place, but {left}")),
+            (Some(err), None) => Err(err),
+            (Some(err), Some(left)) => Err(err.context(left)),
         }
-        Ok(())
     }
 
     /// Writes a file of any size: in parts of at most 4 MB (the filesystem
@@ -1672,6 +1680,54 @@ mod http_tests {
         assert!(format!("{err:#}").contains("no space left"), "{err:#}");
         let rm = removed.lock().unwrap().clone();
         assert!(rm.contains(".part0000") && rm.contains(".part0001"), "{rm}");
+    }
+
+    #[test]
+    fn upload_large_compressed_round_trips_and_a_failed_unpack_names_the_path_and_cleans_up() {
+        for fail in [false, true] {
+            let commands = Arc::new(Mutex::new(Vec::<String>::new()));
+            let c = commands.clone();
+            let (url, _) = stub(move |method, _, body| {
+                if method == "PUT" {
+                    return (200, "{}".into());
+                }
+                if body.contains("df -Pk") {
+                    return (200, process_reply(0, ROOMY_DF));
+                }
+                c.lock().unwrap().push(body.to_string());
+                let bad = fail && body.contains("gunzip");
+                (200, process_reply(if bad { 1 } else { 0 }, if bad { "gzip: invalid" } else { "" }))
+            });
+            let res = client().upload_large_compressed(&url, "/opt/tod/bin", &[7u8; 4096], "0755");
+            let cmds = commands.lock().unwrap().join("\n");
+            if fail {
+                let err = format!("{:#}", res.unwrap_err());
+                assert!(err.contains("unpacking /opt/tod/bin failed") && err.contains("gzip: invalid"), "{err}");
+                // the packed and staged files are removed, and the final path is never touched after the failed step
+                assert!(cmds.contains("rm -f") && cmds.contains("bin.gz") && cmds.contains("bin.unpacked"), "{cmds}");
+            } else {
+                res.unwrap();
+                assert!(cmds.contains("gunzip -c") && cmds.contains("mv -f"), "{cmds}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_cleanup_failure_after_a_good_unpack_says_the_file_is_in_place() {
+        let (url, _) = stub(|method, _, body| {
+            if method == "PUT" {
+                return (200, "{}".into());
+            }
+            if body.contains("df -Pk") {
+                return (200, process_reply(0, ROOMY_DF));
+            }
+            if body.contains("rm -f") && body.contains(".gz") && !body.contains("part") {
+                return (200, process_reply(1, "rm: busy"));
+            }
+            (200, process_reply(0, ""))
+        });
+        let err = format!("{:#}", client().upload_large_compressed(&url, "/opt/tod/bin", &[7u8; 64], "0755").unwrap_err());
+        assert!(err.contains("/opt/tod/bin is in place") && err.contains("rm: busy") && !err.contains("unpacking"), "{err}");
     }
 
     const LOW_DF: &str = "Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/x 100000 99000 1000 99% /\n";

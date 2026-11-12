@@ -38,7 +38,7 @@ fn describe(title: &str, err: &anyhow::Error) -> String {
         out.push('\n');
         out.push_str(&cause.to_string());
     }
-    if !out.contains("What to do:") {
+    if !out.contains(tod_sandbox::health::WHAT_TO_DO) {
         out.push('\n');
         out.push_str(&next_step(tod_sandbox::blaxel::error_is_transient(err)));
     }
@@ -346,6 +346,40 @@ fn spawn<T: 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn failure(check: tod_sandbox::health::Check, detail: &str, setup: tod_sandbox::health::Setup) -> tod_sandbox::health::HealthFailure {
+        tod_sandbox::health::HealthFailure { check, detail: detail.into(), plain: false, setup }
+    }
+
+    /// An existing sandbox's health failure carries its own "What to do:", so
+    /// the panel adds no second, conflicting step.
+    #[test]
+    fn an_existing_sandboxes_health_failure_keeps_its_own_next_step() {
+        use tod_sandbox::health::{Check, Setup};
+        let text = describe("Start failed", &anyhow::Error::new(failure(Check::Relay, "the relay does not answer", Setup::Existing)));
+        assert_eq!(text.matches("What to do:").count(), 1, "{text}");
+        assert!(text.contains("use Reset environment in the task panel's runner menu"), "{text}");
+        assert!(text.contains("Technical detail: sandbox health check \"relay up\" failed"), "{text}");
+    }
+
+    /// A temporary failure while Start makes a sandbox (one that did not
+    /// wake): the health text has no step, and the maker's (it deleted the
+    /// sandbox), which `discard_failed_sandbox` adds, is the only one.
+    #[test]
+    fn a_new_sandboxes_temporary_health_failure_has_exactly_the_makers_step() {
+        use tod_sandbox::health::{Check, Setup};
+        let make = || failure(Check::Reachable, "node-x: did not wake", Setup::New);
+        assert!(tod_sandbox::blaxel::error_is_transient(&anyhow::Error::new(make())));
+        let err = anyhow::Error::new(make()).context(format!(
+            "node-x was deleted. This looks temporary (the network or Blaxel). {} start the node again, which makes a fresh sandbox",
+            tod_sandbox::health::WHAT_TO_DO
+        ));
+        let text = describe("Start failed", &err);
+        assert_eq!(text.matches("What to do:").count(), 1, "{text}");
+        assert!(text.contains("What to do: start the node again, which makes a fresh sandbox"), "{text}");
+        assert!(!text.contains("next Start deletes"), "{text}");
+        assert!(text.contains("Technical detail: sandbox health check \"reachable\" failed"), "{text}");
+    }
 
     /// "Asked for {what}" and "Asking the supervisor for {what}" must read as
     /// sentences for every request.

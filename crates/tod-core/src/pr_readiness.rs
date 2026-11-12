@@ -153,6 +153,9 @@ pub struct Assessment {
     pub merged: bool,
     pub draft: bool,
     pub mergeable_state: Option<String>,
+    /// GitHub's raw `mergeable` (`false` is a conflict; `None` while it is
+    /// computed).
+    pub mergeable: Option<bool>,
     /// Commits of its base the branch lacks (`PrStatus::behind_by`).
     pub behind_by: Option<u32>,
     pub checks: Option<String>,
@@ -284,6 +287,7 @@ impl Assessment {
             merged: snapshot.status.merged,
             draft: snapshot.status.draft,
             mergeable_state: snapshot.status.mergeable_state.clone(),
+            mergeable: snapshot.status.mergeable,
             behind_by: snapshot.status.behind_by,
             checks: snapshot.status.checks.clone(),
             open_threads: snapshot.threads.iter().filter(|t| wants_answer(t)).map(open_thread).collect(),
@@ -318,8 +322,14 @@ impl Assessment {
     }
 
     /// The branch conflicts with its base.
+    ///
+    /// `mergeable_state` says `dirty`, except on a draft, where GitHub
+    /// reports `draft` whatever the branch's state is; `mergeable == false`
+    /// (which only ever means a conflict) is read too. `mergeable` null
+    /// (still being computed) is neither: it is not a conflict, and
+    /// `waits` holds the run on it.
     pub fn conflicted(&self) -> bool {
-        self.mergeable_state.as_deref() == Some("dirty")
+        self.mergeable_state.as_deref() == Some("dirty") || self.mergeable == Some(false)
     }
 
     /// Everything to do now, in the order to do it: bring the branch up to

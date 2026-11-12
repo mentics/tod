@@ -289,26 +289,134 @@ pub fn tail(bytes: &[u8]) -> String {
     format!("[output cut: the last {} bytes]\n{}", cut.len(), cut.trim_end())
 }
 
+/// The first words of a check's output when it was killed for memory.
+pub const KILLED_FOR_MEMORY: &str = "Killed for memory";
+
+/// What the check's script prints first, ahead of the command, where the
+/// machine has `/proc/meminfo`: total and available MB. Stripped from the
+/// output; used only to say what the machine had when a check is killed.
+const MEM_MARKER: &str = "@@tod-mem ";
+const MEM_PROBE: &str = "if [ -r /proc/meminfo ]; then echo \"@@tod-mem $(awk '/^MemTotal:/{t=$2} /^MemAvailable:/{a=$2} END{print int(t/1024), int(a/1024)}' /proc/meminfo 2>/dev/null)\"; fi";
+
+/// Take the memory lines the script printed out of the output, wherever they
+/// are (a missing `awk` would put its error ahead of one): the first one's
+/// (total MB, available MB) and the rest of the output.
+fn split_memory(out: &[u8]) -> (Option<(u64, u64)>, Vec<u8>) {
+    let mut mem = None;
+    let mut rest = Vec::with_capacity(out.len());
+    for line in out.split_inclusive(|b| *b == b'\n') {
+        match line.strip_prefix(MEM_MARKER.as_bytes()) {
+            Some(numbers) => {
+                if mem.is_none() {
+                    let text = String::from_utf8_lossy(numbers);
+                    let mut nums = text.split_whitespace().map(|n| n.parse::<u64>());
+                    if let (Some(Ok(total)), Some(Ok(free))) = (nums.next(), nums.next()) {
+                        mem = Some((total, free));
+                    }
+                }
+            }
+            None => rest.extend_from_slice(line),
+        }
+    }
+    (mem, rest)
+}
+
+/// Whether a non-zero exit was the machine running out of memory. Only what
+/// a runtime really does then counts, so a failing test that merely mentions
+/// memory stays a failure: a SIGKILL (exit 137 = 128 + 9: how the shell,
+/// `docker exec` and the relay report one; the host's signal is mapped to it
+/// too); V8's heap abort or a C++ `bad_alloc` (SIGABRT, 134) with its message;
+/// Python's uncaught `MemoryError` (exit 1) as the final line of the
+/// traceback; the shell's "Killed" as the last line.
+fn killed_for_memory(code: i32, text: &str) -> bool {
+    if code == 137 {
+        return true;
+    }
+    let last = text.lines().map(str::trim).rfind(|l| !l.is_empty()).unwrap_or("");
+    if last == "Killed" || last.ends_with(": Killed") {
+        return true;
+    }
+    if code == 134 && (text.contains("JavaScript heap out of memory") || text.contains("std::bad_alloc")) {
+        return true;
+    }
+    code == 1 && (last == "MemoryError" || last.starts_with("MemoryError:"))
+}
+
+/// The first line of a memory failure's output.
+fn memory_message(code: i32, mem: Option<(u64, u64)>, place: &str, command: &str) -> String {
+    let how = if code == 137 {
+        "SIGKILL, likely the out-of-memory killer"
+    } else if code == 134 || code == 1 {
+        "the process ran out of memory"
+    } else {
+        "the shell reported it killed, likely by the out-of-memory killer"
+    };
+    let machine = match mem {
+        Some((total, free)) => format!(" It ran in {place}, which has {total} MB; {free} MB were free when the check started."),
+        None => format!(" It ran in {place}."),
+    };
+    format!("{KILLED_FOR_MEMORY} ({how}).{machine} Command: `{}`.", command.trim())
+}
+
+/// Where a check ran, for the message.
+fn place_name(cwd: &Workdir) -> String {
+    match cwd {
+        Workdir::Host(_) => "this machine".to_string(),
+        Workdir::Container { container, .. } => format!("dev container {container}"),
+        Workdir::Sandbox { sandbox, .. } => format!("sandbox {sandbox}"),
+    }
+}
+
+/// Whether a stored run is one killed for memory, which is never reused as
+/// the answer for unchanged files: the machine may have changed.
+pub fn is_memory_kill(run: &CheckRun) -> bool {
+    run.verdict == Verdict::Broken && run.output.starts_with(KILLED_FOR_MEMORY)
+}
+
 /// Run one check at `cwd`: its command through the shell, stderr folded into
 /// stdout. Exit 0 passes, any other exit fails; a command that cannot be run
-/// or outlasts [`CHECK_TIMEOUT`] is broken.
+/// or outlasts [`CHECK_TIMEOUT`] is broken, and so is one killed for memory
+/// (an environment problem for the user, never a finding for the Fix agent).
 pub fn run_command(cwd: &Workdir, check: &Check, files: &[String]) -> (Verdict, String) {
     // `exec 2>&1` makes one stream of what a person would see in a terminal.
-    let script = format!("exec 2>&1\nexport TOD_CHANGED_FILES={}\n{}", shell_quote(&files.join("\n")), check.command);
+    let script = format!("exec 2>&1\n{MEM_PROBE}\nexport TOD_CHANGED_FILES={}\n{}", shell_quote(&files.join("\n")), check.command);
     let result = match cwd {
         Workdir::Host(path) => {
             let mut command = std::process::Command::new("sh");
             command.args(["-c", &script]).current_dir(path);
             run_with_timeout(command, CHECK_TIMEOUT, &path.display().to_string())
         }
-        Workdir::Sandbox { .. } => cwd.output_within(CHECK_TIMEOUT, "sh", &["-c", &script]).map(|o| (o.status.code(), o.stdout)),
+        Workdir::Sandbox { .. } => cwd.output_within(CHECK_TIMEOUT, "sh", &["-c", &script]).map(|o| (exit_code(&o.status), o.stdout)),
         Workdir::Container { container, path } => run_in_container(container, path, &script),
     };
     match result {
-        Ok((Some(0), out)) => (Verdict::Passed, tail(&out)),
-        Ok((Some(_), out)) => (Verdict::Failed, tail(&out)),
-        Ok((None, out)) => (Verdict::Broken, format!("the command was stopped by a signal\n{}", tail(&out))),
+        Ok((Some(code), out)) => {
+            let (mem, rest) = split_memory(&out);
+            let text = tail(&rest);
+            if code == 0 {
+                (Verdict::Passed, text)
+            } else if killed_for_memory(code, &text) {
+                (Verdict::Broken, format!("{}\n\n{text}", memory_message(code, mem, &place_name(cwd), &check.command)))
+            } else {
+                (Verdict::Failed, text)
+            }
+        }
+        Ok((None, out)) => (Verdict::Broken, format!("the command was stopped by a signal\n{}", tail(&split_memory(&out).1))),
         Err(err) => (Verdict::Broken, format!("{err:#}")),
+    }
+}
+
+/// A process's exit code; one ended by a signal is `128 + signal`, as a shell
+/// and the relay report it.
+fn exit_code(status: &std::process::ExitStatus) -> Option<i32> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        status.code().or_else(|| status.signal().map(|s| 128 + s))
+    }
+    #[cfg(not(unix))]
+    {
+        status.code()
     }
 }
 
@@ -366,7 +474,7 @@ fn run_with_timeout(mut command: std::process::Command, limit: Duration, what: &
     };
     let (buf, read) = reader.join().map_err(|_| anyhow::anyhow!("reading the command's output panicked"))?;
     read.context("read the command's output")?;
-    Ok((status.code(), buf))
+    Ok((exit_code(&status), buf))
 }
 
 /// What running the stale checks found.
@@ -413,7 +521,7 @@ pub fn run_stale(fleet: &FleetStore, node: Uuid, state: &str) -> Result<Round> {
         let assessment = assess(&tree, check)?;
         let latest = fleet.read(|conn| CheckRunRepo::new(conn).latest(node, key, &dir, &check.command))?;
         let run = match latest {
-            Some(run) if run.fingerprint == assessment.fingerprint && run.label == check.label => run,
+            Some(run) if run.fingerprint == assessment.fingerprint && run.label == check.label && !is_memory_kill(&run) => run,
             _ => {
                 let (verdict, output) = if assessment.applicable {
                     run_command(&cwd.join(&dir), check, &assessment.files)
@@ -612,6 +720,80 @@ mod tests {
         // Output on success is kept too, and a missing command is a failure of the
         // command (exit 127), not of running it.
         assert_eq!(run_command(&cwd, &check("no-such-command-here"), &[]).0, Verdict::Failed);
+    }
+
+    #[test]
+    fn a_sigkilled_check_is_killed_for_memory_not_a_finding() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = Workdir::host(dir.path());
+        let check = |command: &str| Check { command: command.to_string(), ..Check::default() };
+        let (verdict, out) = run_command(&cwd, &check("echo working; kill -9 $$"), &[]);
+        assert_eq!(verdict, Verdict::Broken, "{out}");
+        assert!(out.starts_with("Killed for memory (SIGKILL, likely the out-of-memory killer)."), "{out}");
+        assert!(out.contains("working"));
+        assert!(!out.contains("@@tod-mem"));
+        assert!(out.contains("It ran in this machine."), "{out}");
+        // The shell's own exit 137 reads the same, as it does through a relay.
+        assert_eq!(run_command(&cwd, &check("exit 137"), &[]).0, Verdict::Broken);
+    }
+
+    #[test]
+    fn a_v8_heap_exhaustion_is_killed_for_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = Workdir::host(dir.path());
+        let check = Check {
+            command: "echo 'FATAL ERROR: Reached heap limit Allocation failed - JavaScript heap out of memory'; exit 134".to_string(),
+            ..Check::default()
+        };
+        let (verdict, out) = run_command(&cwd, &check, &[]);
+        assert_eq!(verdict, Verdict::Broken, "{out}");
+        assert!(out.starts_with("Killed for memory (the process ran out of memory)."), "{out}");
+    }
+
+    #[test]
+    fn the_memory_line_is_split_off_and_reported() {
+        assert_eq!(split_memory(b"@@tod-mem 8000 3400\nhello\n"), (Some((8000, 3400)), b"hello\n".to_vec()));
+        assert_eq!(split_memory(b"hello"), (None, b"hello".to_vec()));
+        // Stripped wherever it is: an error from a missing `awk` may come first.
+        assert_eq!(split_memory(b"sh: awk: not found\n@@tod-mem \nhi\n"), (None, b"sh: awk: not found\nhi\n".to_vec()));
+        let message = memory_message(137, Some((8000, 3400)), "sandbox s", "tsc --noEmit");
+        assert!(message.contains("It ran in sandbox s, which has 8000 MB; 3400 MB were free when the check started."));
+        assert!(message.contains("Command: `tsc --noEmit`."));
+        assert!(!memory_message(137, None, "this machine", "x").contains(" MB"));
+    }
+
+    #[test]
+    fn a_failure_that_only_mentions_memory_stays_a_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = Workdir::host(dir.path());
+        let check = |command: &str| Check { command: command.to_string(), ..Check::default() };
+        let (verdict, out) = run_command(&cwd, &check("echo 'test_big ... MemoryError caught'; echo 'std::bad_alloc'; echo 'Killed'; echo '1 failed'; exit 1"), &[]);
+        assert_eq!(verdict, Verdict::Failed, "{out}");
+        // An uncaught Python MemoryError is the traceback's last line.
+        let (verdict, _) = run_command(&cwd, &check("echo Traceback; echo MemoryError; exit 1"), &[]);
+        assert_eq!(verdict, Verdict::Broken);
+        // Text needles with the wrong exit code do not count.
+        assert!(!killed_for_memory(1, "JavaScript heap out of memory"));
+        // The shell's "Killed" counts as the last line only.
+        assert!(killed_for_memory(2, "build\n/bin/sh: 1: Killed\n"));
+    }
+
+    #[test]
+    fn a_memory_kill_is_not_reused_as_the_answer_for_unchanged_files() {
+        let run = |verdict, output: &str| CheckRun {
+            node_id: Uuid::nil(),
+            phase: "review".into(),
+            dir: String::new(),
+            command: "x".into(),
+            label: String::new(),
+            fingerprint: "f".into(),
+            verdict,
+            output: output.into(),
+            ran_at: tod_store::check_runs::now(),
+        };
+        assert!(is_memory_kill(&run(Verdict::Broken, "Killed for memory (SIGKILL).")));
+        assert!(!is_memory_kill(&run(Verdict::Broken, "no such directory")));
+        assert!(!is_memory_kill(&run(Verdict::Failed, "Killed for memory")));
     }
 
     #[test]

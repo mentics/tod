@@ -77,6 +77,17 @@ pub struct CloudSyncState {
     /// check leaves them alone until the user runs them in the cloud again.
     #[serde(default)]
     pub deleted_by_user: std::collections::BTreeSet<String>,
+    /// The sandbox each flag in `deleted_by_user` was made for. A flag with no
+    /// name is a legacy one (older builds, which also set it when a done
+    /// node's sandbox was retired); [`lost::heal_deleted_flags`] clears the
+    /// ones that no longer hold.
+    #[serde(default)]
+    pub deleted_sandboxes: BTreeMap<String, String>,
+    /// How many times a lost sandbox was replaced and failed, per node, kept
+    /// here so a restart does not grant the tries again
+    /// ([`lost::MAX_REPLACEMENTS`]).
+    #[serde(default)]
+    pub replace_tries: BTreeMap<String, ReplaceTries>,
     /// This data root's sync client id on the orchestrator (`app-<id>`),
     /// made on first use by [`client_id`].
     #[serde(default)]
@@ -101,6 +112,13 @@ pub fn client_id(root: &Path) -> Result<String> {
     state.client_id = Some(id.clone());
     state.save(root)?;
     Ok(id)
+}
+
+/// Failed replacements of a node's lost sandbox.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplaceTries {
+    pub count: u32,
+    pub last_error: String,
 }
 
 /// A node record as older builds kept it in [`STATE_FILE`], which named the
@@ -177,11 +195,25 @@ const WAKE_MIN_FREE: u64 = 64 * 1024 * 1024;
 /// `node_id`'s sandbox on purpose.
 pub fn set_sandbox_deleted_by_user(root: &Path, node_id: &str, deleted: bool) -> Result<()> {
     let mut state = CloudSyncState::load(root)?;
-    let changed = if deleted { state.deleted_by_user.insert(node_id.to_string()) } else { state.deleted_by_user.remove(node_id) };
+    let changed = if deleted {
+        state.deleted_by_user.insert(node_id.to_string())
+    } else {
+        state.deleted_sandboxes.remove(node_id).is_some() | state.deleted_by_user.remove(node_id)
+    };
     if changed {
         state.save(root)?;
     }
     Ok(())
+}
+
+/// Records that the user chose, with the explicit Delete sandbox, to have
+/// no sandbox for `node_id` until they Start it: bound to the `sandbox` they
+/// removed, so a different sandbox lost later is not covered.
+pub fn record_sandbox_deleted_by_user(root: &Path, node_id: &str, sandbox: &str) -> Result<()> {
+    let mut state = CloudSyncState::load(root)?;
+    state.deleted_by_user.insert(node_id.to_string());
+    state.deleted_sandboxes.insert(node_id.to_string(), sandbox.to_string());
+    state.save(root)
 }
 
 /// Whether the user deleted `node_id`'s sandbox on purpose and has not run
@@ -1709,6 +1741,7 @@ pub fn probe_health(
         reachable_wait: tod_sandbox::blaxel::WAKE_CEILING,
         expected_manifest,
         probe_delays: delays,
+        setup: tod_sandbox::health::Setup::Existing,
     };
     tod_sandbox::health::probe(bx, target.url, stage, &spec, progress)
 }
@@ -1798,7 +1831,7 @@ fn run_in_cloud_reporting(
     // no Claude token to run it with.
     node_source(fleet, node_id)?;
     claude_token_for_node(root)?;
-    lost::forget_failure(node_id);
+    lost::forget_failure(root, node_id);
     // "Run": a row the supervisor consumes when it starts, which also
     // supersedes an older answer to leave the node stopped.
     record_node_request(fleet, node_id, REQUEST_RUN)?;
