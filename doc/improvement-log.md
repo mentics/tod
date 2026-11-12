@@ -31,6 +31,16 @@ turns, findings, run_state, node_timeline, journey records):
 
 ---
 
+## 2026-11-12: slow replacement
+
+### Replacing a sandbox spends ten minutes copying session logs
+
+- **Seen**: 1 node (ENG-2925, F05EF005), 3 session logs, about 10 minutes, 2026-11-12. The node did nothing meanwhile.
+- **Symptom**: "sending session log n of 3" for minutes.
+- **Cause**: `session_log::sh_write` sent a log in 48 KB base64 chunks, each its own `tod-sandbox exec` (a relay connection plus a `sh` per chunk): about 21 calls per MB, and the bytes uncompressed. A 50 MB log is about 1,000 calls.
+- **Fix**: `SandboxRemote::write` makes the project directory with one command, then uploads the whole file gzipped through Blaxel's filesystem API (`upload_large_compressed`, 4 MB parts, unpacked and renamed in place), the path the supervisor binary already takes. JSON-lines logs compress about 10 to 1. That is 2 calls per log whatever its size, and about a tenth of the bytes. Failures name the log. Total bytes and seconds are logged and shown when done. Dev containers keep the chunked path (local `docker exec`, cheap). Nothing runs differently inside the sandbox (no relay or supervisor change).
+- **Measure**: seconds and bytes per replacement's session-log copy (now logged as "restored session logs").
+
 ## 2026-11-11: overnight stops
 
 ### PR babysitter counts housekeeping as rounds ("PR stuck")
