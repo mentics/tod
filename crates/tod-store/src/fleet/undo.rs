@@ -235,12 +235,17 @@ fn capture_outline_inverse(conn: &Connection, m: &OutlineMutation) -> Result<Opt
                         index,
                     };
                     std::iter::once(place)
-                        .chain(collapsed_from(conn, parent_id)?.into_iter().map(|id| {
-                            OutlineMutation::SetNodeCollapsed {
+                        .chain(
+                            match parent_id {
+                                Some(p) => collapsed_from(conn, p)?,
+                                None => Vec::new(),
+                            }
+                            .into_iter()
+                            .map(|id| OutlineMutation::SetNodeCollapsed {
                                 node_id: id,
                                 collapsed: true,
-                            }
-                        }))
+                            }),
+                        )
                         .collect()
                 }
             };
