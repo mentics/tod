@@ -113,7 +113,21 @@ from Blaxel.
   "Killed for memory (...)" with the machine's total and free MB when `/proc/meminfo` exists
   (`checks::run_command`; tests `a_sigkilled_check_is_killed_for_memory_not_a_finding`,
   `a_v8_heap_exhaustion_is_killed_for_memory`). Commit: see `git log -S"KILLED_FOR_MEMORY"`.
-- **Measure**: check failures with no output, or exit 137/247, per check.
+- **Fix (tod, 2026-11-12, second part)**: in a sandbox, the first kill for memory no longer
+  stops the run: tod frees memory itself and runs the check once more
+  (`checks::run_command_with`, `free_sandbox_memory`). It stops the dev servers found by command
+  line (node vite, `runserver`, uvicorn/gunicorn; by PID, never `pkill`) and drops the page
+  cache, then retries. The servers stay stopped (no restart, so the next check has the memory
+  too). Only if the retry is also killed does the node get the broken request, whose text now
+  says it was killed twice and what was stopped, with free MB before and after; a failure to
+  free is stated in it. Tests: `a_sandbox_check_killed_for_memory_frees_memory_and_uses_the_second_run`,
+  `a_sandbox_check_killed_twice_is_broken_and_says_what_was_freed`,
+  `a_kill_outside_a_sandbox_never_frees_memory_or_retries`. The process patterns are a guess at
+  the workspace's servers: confirm them on a live sandbox (`ps`) and add any that are missed.
+- **Measure**: check failures with no output, or exit 137/247, per check; and, in the broken
+  request text, "killed for memory twice" (the retry did not help) versus checks that pass
+  after a freeing (the output of a passing retry is not annotated: look for the sandbox's
+  dev servers gone from `ps`).
 
 ### Agent-made git worktrees hide the work
 

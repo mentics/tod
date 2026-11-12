@@ -373,11 +373,108 @@ pub fn is_memory_kill(run: &CheckRun) -> bool {
     run.verdict == Verdict::Broken && run.output.starts_with(KILLED_FOR_MEMORY)
 }
 
+/// What freeing memory in a sandbox did, for the retry and for the message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryFreed {
+    /// Free MB before and after, where `/proc/meminfo` exists.
+    pub before_mb: Option<u64>,
+    pub after_mb: Option<u64>,
+    /// One line per process stopped (pid and command line).
+    pub stopped: Vec<String>,
+}
+
+impl MemoryFreed {
+    fn describe(&self) -> String {
+        let mb = |v: Option<u64>| v.map_or("unknown".to_string(), |v| format!("{v} MB"));
+        let stopped = if self.stopped.is_empty() {
+            "no dev server was running".to_string()
+        } else {
+            format!("stopped {}", self.stopped.join("; "))
+        };
+        format!("{stopped}; free memory {} before, {} after (the page cache was dropped too)", mb(self.before_mb), mb(self.after_mb))
+    }
+}
+
+/// The script that frees memory in a sandbox. It stops only the dev servers the
+/// workspace boot starts, each found by its own command line (a vite server, a
+/// Django `runserver`, a uvicorn or gunicorn API) and stopped by PID: TERM,
+/// then KILL for what is left. Its own processes are skipped by the marker in
+/// its text. It prints `@@tod-free-before MB`, `stopped <pid> <cmd>` and
+/// `@@tod-free-after MB`.
+const FREE_MEMORY_SCRIPT: &str = r#"exec 2>&1
+# tod-free-memory
+mem() { awk '/^MemAvailable:/{a=$2} END{print int(a/1024)}' /proc/meminfo; }
+echo "@@tod-free-before $(mem)"
+pids=""
+for d in /proc/[0-9]*; do
+  pid=${d#/proc/}
+  [ "$pid" = "$$" ] && continue
+  cmd=$(tr '\0' ' ' < "$d/cmdline" 2>/dev/null)
+  case "$cmd" in *tod-free-memory*) continue;; esac
+  case "$cmd" in
+    *node*/vite*|*node*vite\ *|*manage.py\ runserver*|*python*runserver*|*uvicorn*|*gunicorn*) ;;
+    *) continue;;
+  esac
+  echo "stopped $pid $(echo "$cmd" | cut -c1-120)"
+  pids="$pids $pid"
+done
+[ -n "$pids" ] && kill -TERM $pids 2>/dev/null
+sleep 3
+[ -n "$pids" ] && kill -KILL $pids 2>/dev/null
+sync
+(echo 3 > /proc/sys/vm/drop_caches) 2>/dev/null || echo "page cache not dropped: cannot write /proc/sys/vm/drop_caches"
+echo "@@tod-free-after $(mem)"
+"#;
+
+fn parse_freed(out: &str) -> Result<MemoryFreed> {
+    let number = |tag: &str| out.lines().find_map(|l| l.strip_prefix(tag)).and_then(|n| n.trim().parse::<u64>().ok());
+    let before_mb = number("@@tod-free-before ");
+    let after_mb = number("@@tod-free-after ");
+    if after_mb.is_none() {
+        anyhow::bail!("the memory-freeing script did not finish; its output: {}", tail(out.as_bytes()));
+    }
+    let stopped = out.lines().filter_map(|l| l.strip_prefix("stopped ")).map(str::to_string).collect();
+    Ok(MemoryFreed { before_mb, after_mb, stopped })
+}
+
+/// Free memory in the sandbox `cwd` is in (stop its dev servers, drop the
+/// page cache). Never for another place: the user's machine is not touched.
+pub fn free_sandbox_memory(cwd: &Workdir) -> Result<MemoryFreed> {
+    if !matches!(cwd, Workdir::Sandbox { .. }) {
+        anyhow::bail!("memory is freed only inside a sandbox");
+    }
+    let o = cwd.output_within(Duration::from_secs(90), "sh", &["-c", FREE_MEMORY_SCRIPT])?;
+    parse_freed(&String::from_utf8_lossy(&o.stdout))
+}
+
 /// Run one check at `cwd`: its command through the shell, stderr folded into
 /// stdout. Exit 0 passes, any other exit fails; a command that cannot be run
 /// or outlasts [`CHECK_TIMEOUT`] is broken, and so is one killed for memory
 /// (an environment problem for the user, never a finding for the Fix agent).
+/// In a sandbox a first kill for memory frees memory and runs the check once more.
 pub fn run_command(cwd: &Workdir, check: &Check, files: &[String]) -> (Verdict, String) {
+    run_command_with(cwd, &|| run_command_once(cwd, check, files), &free_sandbox_memory)
+}
+
+/// [`run_command`] with the run and the memory-freeing step given (for tests). `free` is
+/// called only for a sandbox, after the first run was killed for memory.
+fn run_command_with(cwd: &Workdir, run: &dyn Fn() -> (Verdict, String), free: &dyn Fn(&Workdir) -> Result<MemoryFreed>) -> (Verdict, String) {
+    let (verdict, out) = run();
+    if !(matches!(cwd, Workdir::Sandbox { .. }) && verdict == Verdict::Broken && out.starts_with(KILLED_FOR_MEMORY)) {
+        return (verdict, out);
+    }
+    let note = match free(cwd) {
+        Ok(f) => format!("tod freed memory and ran the check once more: {}.", f.describe()),
+        Err(err) => format!("tod tried to free memory and could not: {err:#}. It ran the check once more anyway."),
+    };
+    let (verdict2, out2) = run();
+    if verdict2 == Verdict::Broken && out2.starts_with(KILLED_FOR_MEMORY) {
+        return (Verdict::Broken, format!("{out2}\n\nThe check was killed for memory twice. {note}"));
+    }
+    (verdict2, out2)
+}
+
+fn run_command_once(cwd: &Workdir, check: &Check, files: &[String]) -> (Verdict, String) {
     // `exec 2>&1` makes one stream of what a person would see in a terminal.
     let script = format!("exec 2>&1\n{MEM_PROBE}\nexport TOD_CHANGED_FILES={}\n{}", shell_quote(&files.join("\n")), check.command);
     let result = match cwd {
@@ -735,6 +832,66 @@ mod tests {
         assert!(out.contains("It ran in this machine."), "{out}");
         // The shell's own exit 137 reads the same, as it does through a relay.
         assert_eq!(run_command(&cwd, &check("exit 137"), &[]).0, Verdict::Broken);
+    }
+
+    #[test]
+    fn a_sandbox_check_killed_for_memory_frees_memory_and_uses_the_second_run() {
+        use std::cell::Cell;
+        let cwd = Workdir::sandbox("s", "/workspace");
+        let runs = Cell::new(0);
+        let frees = Cell::new(0);
+        let run = || {
+            runs.set(runs.get() + 1);
+            if runs.get() == 1 {
+                (Verdict::Broken, format!("{KILLED_FOR_MEMORY} (SIGKILL).\n\nKilled"))
+            } else {
+                (Verdict::Failed, "2 errors".to_string())
+            }
+        };
+        let free = |_: &Workdir| {
+            frees.set(frees.get() + 1);
+            Ok(MemoryFreed { before_mb: Some(300), after_mb: Some(3500), stopped: vec!["7 node vite".to_string()] })
+        };
+        assert_eq!(run_command_with(&cwd, &run, &free), (Verdict::Failed, "2 errors".to_string()));
+        assert_eq!((runs.get(), frees.get()), (2, 1));
+    }
+
+    #[test]
+    fn a_sandbox_check_killed_twice_is_broken_and_says_what_was_freed() {
+        let cwd = Workdir::sandbox("s", "/workspace");
+        let run = || (Verdict::Broken, format!("{KILLED_FOR_MEMORY} (SIGKILL).\n\nKilled"));
+        let free = |_: &Workdir| Ok(MemoryFreed { before_mb: Some(300), after_mb: Some(3500), stopped: vec!["7 node vite".to_string()] });
+        let (verdict, out) = run_command_with(&cwd, &run, &free);
+        assert_eq!(verdict, Verdict::Broken);
+        assert!(out.starts_with(KILLED_FOR_MEMORY), "{out}");
+        assert!(out.contains("killed for memory twice"), "{out}");
+        assert!(out.contains("stopped 7 node vite"), "{out}");
+        assert!(out.contains("300 MB before, 3500 MB after"), "{out}");
+        // A failure to free is reported, not hidden.
+        let bad = |_: &Workdir| Err(anyhow::anyhow!("relay down"));
+        let (_, out) = run_command_with(&cwd, &run, &bad);
+        assert!(out.contains("could not: relay down"), "{out}");
+    }
+
+    #[test]
+    fn a_kill_outside_a_sandbox_never_frees_memory_or_retries() {
+        let cwd = Workdir::host("/tmp");
+        let calls = std::cell::Cell::new(0);
+        let run = || {
+            calls.set(calls.get() + 1);
+            (Verdict::Broken, format!("{KILLED_FOR_MEMORY} (SIGKILL)."))
+        };
+        let free = |_: &Workdir| -> Result<MemoryFreed> { panic!("must not free memory on the user's machine") };
+        assert_eq!(run_command_with(&cwd, &run, &free).0, Verdict::Broken);
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn the_freed_report_is_parsed_and_an_unfinished_script_is_an_error() {
+        let ok = "@@tod-free-before 300\nstopped 7 node /x/vite\n@@tod-free-after 3500\n";
+        let f = parse_freed(ok).unwrap();
+        assert_eq!((f.before_mb, f.after_mb, f.stopped.len()), (Some(300), Some(3500), 1));
+        assert!(parse_freed("@@tod-free-before 300\nsh: boom\n").is_err());
     }
 
     #[test]
