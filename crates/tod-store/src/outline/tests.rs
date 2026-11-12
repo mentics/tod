@@ -3491,3 +3491,48 @@ fn groups_by_lifecycle_moves_nodes_without_lifecycle_down() {
     drop(store);
     let _ = fs::remove_dir_all(root);
 }
+
+#[test]
+fn reorder_in_a_lifecycle_grouped_parent_ignores_the_group_headers() {
+    use crate::outline::ReorderDirection;
+    let (store, root, list_id) = setup_store_with_list();
+    let outer = create_node_in(&store, list_id, None, "Outer");
+    let prev = create_node_in(&store, list_id, Some(outer), "Prev");
+    let grouped = create_node_in(&store, list_id, Some(outer), "Grouped");
+    let next = create_node_in(&store, list_id, Some(outer), "Next");
+    let a = create_node_in(&store, list_id, Some(grouped), "A");
+    let b = create_node_in(&store, list_id, Some(grouped), "B");
+    let enable = |node, caps: Vec<Capability>| {
+        store
+            .enqueue_outline(OutlineMutation::EnableCapabilities { node_id: node, capabilities: caps })
+            .unwrap();
+    };
+    enable(grouped, vec![Capability::Groups]);
+    enable(a, vec![Capability::Lifecycle]);
+    enable(b, vec![Capability::Lifecycle]);
+    store.writer().flush().unwrap();
+    store
+        .enqueue_outline(OutlineMutation::SetNodeGroups { node_id: grouped, by_lifecycle: true })
+        .unwrap();
+    store.writer().flush().unwrap();
+
+    let go = |node, direction| {
+        store
+            .enqueue_outline(OutlineMutation::ReorderSibling { node_id: node, direction })
+            .unwrap();
+        store.writer().flush().unwrap();
+        store.reload_if_stale().ok();
+    };
+    // Within the group they swap.
+    go(b, ReorderDirection::Up);
+    assert_eq!(child_titles(&store, list_id, Some(grouped)), vec!["B", "A"]);
+    // First in its group: Up goes to the previous node at the parent's depth,
+    // as its last child (the headers are not a level).
+    go(b, ReorderDirection::Up);
+    assert_eq!(parent_of(&store, b), Some(prev));
+    // Last in its group: Down goes to the next node at that depth, first.
+    go(a, ReorderDirection::Down);
+    assert_eq!(parent_of(&store, a), Some(next));
+    drop(store);
+    let _ = fs::remove_dir_all(root);
+}

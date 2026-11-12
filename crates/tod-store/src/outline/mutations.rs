@@ -1445,9 +1445,9 @@ pub(crate) enum ReorderOutcome {
     Unchanged,
     /// The node swaps with its adjacent sibling.
     Swap,
-    /// The node leaves its parent for `parent_id`, at the 0-based `index`
-    /// among that parent's children.
-    Reparent { parent_id: Uuid, index: i32 },
+    /// The node leaves its parent for `parent_id` (`None`: the top level), at
+    /// the 0-based `index` among that parent's children.
+    Reparent { parent_id: Option<Uuid>, index: i32 },
 }
 
 pub(crate) fn plan_reorder(
@@ -1460,10 +1460,28 @@ pub(crate) fn plan_reorder(
         return Ok(ReorderOutcome::Unchanged);
     };
     let entries = outline.list_for_list(entry.list_id)?;
-    let mut siblings: Vec<&OutlineEntry> = entries
+    let all_siblings: Vec<&OutlineEntry> = entries
         .iter()
         .filter(|e| e.parent_id == entry.parent_id)
         .collect();
+    let mut siblings = all_siblings;
+    // Under a parent that groups by lifecycle the tree shows the children by
+    // state, so a node moves among the ones in its own group, and leaves the
+    // parent (beside it) from the edge of its group.
+    let grouped_parent = match entry.parent_id {
+        Some(p) => crate::groups::by_lifecycle(conn, p)?,
+        None => false,
+    };
+    if grouped_parent {
+        let state = lifecycle_state(conn, node_id)?;
+        let mut same = Vec::new();
+        for e in siblings {
+            if lifecycle_state(conn, e.node_id)? == state {
+                same.push(e);
+            }
+        }
+        siblings = same;
+    }
     siblings.sort_by_key(|e| e.ordinal);
     let Some(pos) = siblings.iter().position(|e| e.node_id == node_id) else {
         return Ok(ReorderOutcome::Unchanged);
@@ -1486,9 +1504,21 @@ pub(crate) fn plan_reorder(
         ReorderDirection::Up => entries.iter().filter(|e| e.parent_id == Some(target)).count() as i32,
     };
     Ok(ReorderOutcome::Reparent {
-        parent_id: target,
+        parent_id: Some(target),
         index,
     })
+}
+
+fn lifecycle_state(conn: &Connection, node_id: Uuid) -> Result<Option<String>> {
+    use crate::outline::uuid_blob::uuid_to_blob;
+    use rusqlite::OptionalExtension;
+    Ok(conn
+        .query_row(
+            "SELECT state FROM node_lifecycle WHERE node_id = ?1",
+            rusqlite::params![uuid_to_blob(node_id)],
+            |row| row.get(0),
+        )
+        .optional()?)
 }
 
 /// The node a last (first) child moves into on Down (Up): the nearest node
@@ -1574,10 +1604,24 @@ fn reorder_sibling(conn: &Connection, node_id: Uuid, direction: ReorderDirection
                 .iter()
                 .position(|e| e.node_id == node_id)
                 .context("node missing from its siblings")?;
-            let new_pos = match direction {
-                ReorderDirection::Up => pos - 1,
-                ReorderDirection::Down => pos + 1,
+            // Under a grouped parent the neighbour is the next one in the
+            // node's own lifecycle group, which may not be adjacent.
+            let grouped = match parent_id {
+                Some(p) => crate::groups::by_lifecycle(conn, p)?,
+                None => false,
             };
+            let state = lifecycle_state(conn, node_id)?;
+            let mut new_pos = pos;
+            loop {
+                new_pos = match direction {
+                    ReorderDirection::Up => new_pos.checked_sub(1),
+                    ReorderDirection::Down => Some(new_pos + 1).filter(|n| *n < siblings.len()),
+                }
+                .context("no neighbour to swap with")?;
+                if !grouped || lifecycle_state(conn, siblings[new_pos].node_id)? == state {
+                    break;
+                }
+            }
             siblings.swap(pos, new_pos);
             renumber_siblings(&outline, &siblings, parent_id)?;
         }
@@ -1588,10 +1632,12 @@ fn reorder_sibling(conn: &Connection, node_id: Uuid, direction: ReorderDirection
             let old_parent = entry.parent_id;
             // Open the way to where it lands, so it is still in view (its
             // undo entry closes them again).
-            for ancestor in collapsed_from(conn, parent_id)? {
-                outline.set_collapsed(ancestor, false)?;
+            if let Some(parent_id) = parent_id {
+                for ancestor in collapsed_from(conn, parent_id)? {
+                    outline.set_collapsed(ancestor, false)?;
+                }
             }
-            place_node(conn, node_id, Some(parent_id), index)?;
+            place_node(conn, node_id, parent_id, index)?;
             let mut remaining: Vec<OutlineEntry> = outline
                 .list_for_list(entry.list_id)?
                 .into_iter()
