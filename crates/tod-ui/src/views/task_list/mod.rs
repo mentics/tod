@@ -364,6 +364,7 @@ pub struct TaskListView {
     /// is what makes the next render — and so the drain — happen.
     _list_observation: Subscription,
     _compose_subscription: Subscription,
+    _search_subscription: Subscription,
     _credential_subscription: Subscription,
     _inline_edit_subscription: Subscription,
     /// Rows marked with Space / Ctrl+click. Session-only.
@@ -438,6 +439,14 @@ impl TaskListView {
                 cx.notify();
             }
         });
+        // Enter in the search field hands focus to the tree (Escape does the
+        // same through `on_dismiss_overlay`), keeping the filter and selection.
+        let _search_subscription =
+            cx.subscribe_in(&search_input, window, |this, _, event, window, cx| {
+                if matches!(event, InputEvent::PressEnter { .. }) {
+                    this.search_field.leave(window, cx);
+                }
+            });
         let _credential_subscription = cx.subscribe(&credential_input, |this, _, event, cx| {
             if matches!(event, InputEvent::PressEnter { .. }) {
                 this.pending_credential_submit = true;
@@ -560,6 +569,7 @@ impl TaskListView {
             _list_subscription,
             _list_observation,
             _compose_subscription,
+            _search_subscription,
             _credential_subscription,
             _inline_edit_subscription,
             marked: std::collections::HashSet::new(),
@@ -1885,9 +1895,14 @@ impl TaskListView {
             input.set_value("", window, cx);
         });
         self.rebuild_visible_list(window, cx);
-        self.list_state.update(cx, |state, cx| {
-            state.scroll_to_selected_item(window, cx);
-        });
+        // Keep the row in view without pinning it to the top: its position
+        // changes when the filter goes, so centre it if it left the viewport.
+        let selected = self.list_state.read(cx).selected_index();
+        if let Some(ix) = selected {
+            self.list_state.update(cx, |state, cx| {
+                state.scroll_to_item(ix, gpui::ScrollStrategy::Nearest, window, cx);
+            });
+        }
     }
 
     fn clear_filters(&mut self, window: &mut Window, cx: &mut Context<Self>) {
