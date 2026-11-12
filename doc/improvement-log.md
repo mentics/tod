@@ -410,3 +410,9 @@ from Blaxel.
 - **Measure**: `decisions` from a `verification` protocol whose evidence is an obligation acting in
   `merged`/`released`/`design` or about production; obligations moved by a verification conversation
   with no later-phase step; nodes sent back from `verifying` for an acts-in change.
+
+## 2026-11-12: open gaps in the supervisor's submodule push (721f1161)
+
+- **Seen**: found by an independent review of the fix for ENG-2068's lost kb work; none hit a live node yet.
+- **Open**: (1) in a parent with no origin, a submodule commit the parent already records counts as the base, so it is not reported (only matters without a remote); (2) `let outcome = run?;` returns before the run-end push check, so a push failure is dropped when the run itself failed; (3) a parent with an origin but no `origin/main` ref may report a healthy detached submodule as unpushed (not reproduced); (4) the boundary-push test also passes on the old code, so it guards the wiring only loosely.
+- **Measure**: count of runs ending with a push failure named in their error.
