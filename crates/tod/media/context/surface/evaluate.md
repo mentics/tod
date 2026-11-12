@@ -37,6 +37,15 @@ Finish in exactly one of these ways, through the `phase` noun:
   grant access, wait) instead. Check the task's decisions first: if the agent
   already asked and the user answered, judge the work in that light.
 
+Where each obligation acts is part of what you judge, in `proposed`, `design`
+and `planning`: an obligation that holds only after the merge, a deploy, or a
+run on production ("after rollout", "after the cleanup runs on prod, a query
+finds none", a measurement of the live system) and acts in `active`,
+`verifying`, or `design` is a mistake the next phases cannot recover from
+without the user. Reject it with a `--fix` naming the obligation and the
+state it should act in (`released`, or `merged` for what must be in place
+before the deploy); do not certify it, and do not ask the user.
+
 Be strict but not pedantic. Reject only for something that would make the next
 phase go wrong, not for style. When you certify, you are vouching that the
 next phase can start from this without coming back.

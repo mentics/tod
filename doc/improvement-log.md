@@ -370,3 +370,27 @@ from Blaxel.
   redeployed (the grace) and `tod-cli` rebuilt/installed into sandboxes (the retry).
 - **Measure**: `db` errors containing "has not been connected" per week (target 0); requests
   that waited in the broker for a reconnect.
+
+### Verification asks the user about obligations that act in the wrong phase
+
+- **Seen**: 2 nodes in `verifying`, 2026-11-12 (digikey-productdetails-404s-50-of-look-2:
+  requirements 75042c52 `released`, 4b52118d `design`; clean-up-dangling-manufacturer-stateme-2:
+  33abe1af, eef15342, b8247541 default `active`).
+- **Symptom**: the verify agent asked "How should the measurement be handled?" for obligations
+  that are about production after the rollout / after the cleanup asset runs on prod.
+- **Cause**: (a) the proposed/design/planning Done-when checklists and the evaluator never asked
+  whether each obligation acts where it can be shown true, and design.md let a requirement act in
+  `design` once refined; (b) verify.md told the agent to exercise every listed obligation, including
+  ones acting in `merged`/`released`/`design` (the loop never owed them), and the app refused every
+  agent obligation edit past `planning` with "ask the user", so a phase mistake could only become
+  a question.
+- **Fix**: the three role docs, `domain/obligations.md` and the evaluator state the rule and reject
+  a mistake; a verification conversation may move an obligation of its node to `merged`/`released`
+  itself in `verifying` (`settled::verify_may_retag`, only that, only later); that move does not
+  count as a plan change (`lifecycle_validity`); the Verify loop requires a plan step of that phase
+  for a requirement moved there (`untraced_for_later_phase`); verify.md and verifying.md give the
+  rule; autonomous-session.md's real bad example names it a tod bug. No keyword check was added:
+  wording does not decide the phase.
+- **Measure**: `decisions` from a `verification` protocol whose evidence is an obligation acting in
+  `merged`/`released`/`design` or about production; obligations moved by a verification conversation
+  with no later-phase step; nodes sent back from `verifying` for an acts-in change.

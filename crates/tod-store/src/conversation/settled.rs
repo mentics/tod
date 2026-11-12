@@ -9,12 +9,18 @@
 //! pass it. The user's own edits are never checked. Nor are a freeform
 //! conversation's (`outline`, `chat`): there the user directs each change as
 //! it is made and sees it in the change set.
+//!
+//! One exception: a verification agent that finds an obligation which only a
+//! later phase can deliver (it needs production, a deploy, or a run only the
+//! release makes) moves it there itself ([`verify_may_retag`]), never asking
+//! the user about a phase mistake.
 
 use super::repo::ConversationRepo;
 use super::types::{EntitySnapshot, ProtocolKind};
 use crate::interview::InterviewRepo;
 use crate::outline::OutlineMutation;
 use crate::outline::repos::{NodeRepo, ObligationRepo};
+use crate::outline::{ACTS_IN_MERGED, ACTS_IN_RELEASED};
 use crate::settings::VALID_LIFECYCLE_STATES;
 use anyhow::{Result, bail};
 use rusqlite::Connection;
@@ -43,7 +49,39 @@ pub fn check_conversation_agent(
     if user_directed(conversation.protocol) {
         return Ok(());
     }
+    if conversation.protocol == ProtocolKind::Verification && verify_may_retag(conn, mutation)? {
+        return Ok(());
+    }
     check_agent(conn, mutation)
+}
+
+/// Whether `mutation` is the one change a verification agent may make to the
+/// obligations of its node in `verifying`: moving an obligation to act in
+/// `merged` or `released`, a later state than where it acts now, because the
+/// obligation can only be shown true there (after the merge, a deploy, or a
+/// run on production). The obligation's text is untouched and nothing moves
+/// earlier, so the user's spec is unchanged; only who checks it, and when.
+fn verify_may_retag(conn: &Connection, mutation: &OutlineMutation) -> Result<bool> {
+    let OutlineMutation::UpdateObligationActsIn {
+        obligation_id,
+        acts_in,
+    } = mutation
+    else {
+        return Ok(false);
+    };
+    if acts_in != ACTS_IN_MERGED && acts_in != ACTS_IN_RELEASED {
+        return Ok(false);
+    }
+    let Some(obligation) = ObligationRepo::new(conn).get(*obligation_id)? else {
+        return Ok(false);
+    };
+    let rank = |s: &str| VALID_LIFECYCLE_STATES.iter().position(|v| *v == s);
+    let (Some(from), Some(to)) = (rank(&obligation.acts_in), rank(acts_in)) else {
+        return Ok(false);
+    };
+    let in_verifying =
+        NodeRepo::new(conn).get_lifecycle(obligation.node_id)?.as_deref() == Some("verifying");
+    Ok(in_verifying && from < to)
 }
 
 /// Refuse `mutation`, written by an agent, when it changes an obligation of
@@ -332,6 +370,67 @@ mod tests {
         let chat = conversation(&fx, ProtocolKind::Outline);
         outline(&fx, &chat, edit(&fx)).unwrap();
         assert_eq!(body(&fx), "Export as JSON");
+    }
+
+    fn retag(fx: &Fx, acts_in: &str) -> OutlineMutation {
+        OutlineMutation::UpdateObligationActsIn {
+            obligation_id: fx.obligation,
+            acts_in: acts_in.into(),
+        }
+    }
+
+    fn acts_in(fx: &Fx) -> String {
+        ObligationRepo::new(&fx.conn).get(fx.obligation).unwrap().unwrap().acts_in
+    }
+
+    /// A verification agent moves an obligation only a later phase can
+    /// deliver to that phase itself, and nothing else.
+    #[test]
+    fn a_verification_agent_may_move_an_obligation_to_a_later_phase() {
+        let fx = setup("verifying");
+        let verify = conversation(&fx, ProtocolKind::Verification);
+        outline(&fx, &verify, retag(&fx, "released")).unwrap();
+        assert_eq!(acts_in(&fx), "released");
+        // Not earlier again, not the text, not another kind of change.
+        for refused in [
+            retag(&fx, "active"),
+            retag(&fx, "verifying"),
+            edit(&fx),
+            OutlineMutation::DeleteObligation {
+                obligation_id: fx.obligation,
+            },
+        ] {
+            let err = outline(&fx, &verify, refused).unwrap_err();
+            assert_refused("verifying", err);
+        }
+        assert_eq!(acts_in(&fx), "released");
+        assert_eq!(body(&fx), "Export as CSV");
+    }
+
+    #[test]
+    fn a_verification_agent_may_move_a_design_obligation_to_merged() {
+        let fx = setup("verifying");
+        outline(&fx, ACTOR_USER, retag(&fx, "design")).unwrap();
+        let verify = conversation(&fx, ProtocolKind::Verification);
+        outline(&fx, &verify, retag(&fx, "merged")).unwrap();
+        assert_eq!(acts_in(&fx), "merged");
+    }
+
+    /// Only verification, and only while the node is in `verifying`.
+    #[test]
+    fn only_verification_in_verifying_may_move_an_obligation() {
+        let fx = setup("verifying");
+        let pr = conversation(&fx, ProtocolKind::Pr);
+        assert_refused("verifying", outline(&fx, &pr, retag(&fx, "released")).unwrap_err());
+        assert_refused(
+            "verifying",
+            outline(&fx, ACTOR_AGENT, retag(&fx, "released")).unwrap_err(),
+        );
+        for state in ["review", "merged"] {
+            let fx = setup(state);
+            let verify = conversation(&fx, ProtocolKind::Verification);
+            assert_refused(state, outline(&fx, &verify, retag(&fx, "released")).unwrap_err());
+        }
     }
 
     #[test]

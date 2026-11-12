@@ -32,6 +32,11 @@ The obligations concepts say how to set each. `--acts-in` is left off when it
 is `active`. Listings show it as `acts-in=<state>` when it is not. Inside an interview, an agent's `add` always writes its own session's phase —
 `--phase` there only matters when running `add` outside an interview.
 
+Past `planning` the app refuses every obligation change from an agent, with one
+exception: a verification session may `update <id> --acts-in merged|released`
+on an obligation of its node (in `verifying`) that acts in an earlier state, to
+hand it to the phase that can show it true. Nothing else, and never back.
+
 `deleted` and `history` list changes as `r-<n>`; deletions and edits stay
 restorable for 30 days. `restore r-<n>` puts back the obligation as it was
 before that change — a deleted one with its id and position; an edited one

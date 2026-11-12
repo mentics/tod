@@ -66,22 +66,29 @@ must stand on its own. The question text has this shape:
    re-run a command, read a page you can reach. Ask only for what is theirs
    (a login, a prod action, a judgment, a preference).
 
-Bad (real): "Obligation 75042c52 (and 4b52118d) is a post-rollout
-measurement. Prod integration_status has 0 of 18,504 DigiKey FAILURE rows with
-structured detail (this code is not deployed)... How should the measurement be
-handled?" with options "Accept: verify the measurement after rollout (leave it
-unchecked now)" and "Treat as failed now and send back to...".
+Bad (real, and a bug in the app, not a question to ask): "Obligation 75042c52 (and
+4b52118d) is a post-rollout measurement. Prod integration_status has 0 of
+18,504 DigiKey FAILURE rows with structured detail (this code is not
+deployed)... How should the measurement be handled?" with options "Accept:
+verify the measurement after rollout (leave it unchecked now)" and "Treat as
+failed now and send back to...". Those obligations were assigned to the wrong
+lifecycle state (they act after the release, not in `verifying`); the session
+should have re-tagged them itself and gone on, since the answer is always the
+same. A question whose one right answer your data, a command, or your role doc
+already gives is not a question: do it, or, when the app blocks you, file it as
+`--reason broken`.
 
-Good:
+Good (the form, for a question that is the user's to answer):
 
-> Decide whether to ship without the after-release DigiKey check.
+> Decide whether the CSV export may drop rows with no email.
 >
-> Two requirements ('structured failure detail recorded' 75042c52 and
-> 4b52118d) can only be measured once this code is live; today prod has 0 of
-> 18,504 DigiKey failure rows with detail, because it is not deployed. All
-> code requirements pass (465 tests).
+> Requirement 'export every contact' (3f9a21c0) and constraint 'no
+> personal data without consent' (a41b77de) pull opposite ways for the 212
+> contacts (of 4,100) that have no email: exporting them is complete, dropping
+> them is the cautious reading. The code does the first today; both
+> versions pass the 465 tests.
 >
 Options (each its own `--option`, not part of the question text):
 
-1. "Ship now, measure after rollout (recommended): both stay unchecked"
-2. "Send back to implementation: the task fails verification now"
+1. "Export all contacts (recommended): requirement wins, constraint amended"
+2. "Drop contacts with no email: constraint wins, requirement narrowed"

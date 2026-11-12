@@ -20,6 +20,7 @@ Turn whatever the task says it is for into requirements-phase obligations: the c
 
 - [ ] The task's own requirements define a real, concrete task: someone could start designing it without asking what it is for.
 - [ ] Each requirement is specific enough to check whether it was met.
+- [ ] Each requirement acts where it can be shown true: one that holds only after the release or after a run on production ("after rollout", "after the cleanup runs on prod, a query finds none") acts in `released` (or `merged`), not `active`.
 - [ ] No two requirements conflict, and none conflicts with an inherited obligation.
 - [ ] No requirement restates an ancestor's obligation, and none duplicates a sibling's cross-cutting one. Where the same concern appears on several siblings, it is on their common ancestor instead.
 

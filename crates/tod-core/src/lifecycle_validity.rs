@@ -149,7 +149,7 @@ pub fn regression(conn: &Connection, node_id: Uuid) -> Result<Option<Regression>
                         o.body
                     ),
                 )),
-                Some(o) if o.acts_in != before.acts_in => findings.push((
+                Some(o) if o.acts_in != before.acts_in && !moved_to_later_phase(&before.acts_in, &o.acts_in) => findings.push((
                     "planning",
                     format!(
                         "{} [{}] moved from acting in {} to {}: {}",
@@ -278,6 +278,14 @@ fn finish(
         incoming,
         own,
     })
+}
+
+/// Whether an obligation went from acting in `before` to acting in `now`, a
+/// later release state: verification does that for one only that state can
+/// deliver. The work already built and checked is unaffected (the obligation
+/// is now owed by a later state), so it does not send the node back.
+fn moved_to_later_phase(before: &str, now: &str) -> bool {
+    (now == "merged" || now == "released") && lifecycle_rank(before) < lifecycle_rank(now)
 }
 
 fn capitalized(kind: &str) -> String {
@@ -452,6 +460,26 @@ mod tests {
         // The latest verdict is what counts.
         incoming_verdict(&fx, "none");
         assert_eq!(check(&fx), None);
+    }
+
+    /// Verification moves an obligation only a later phase can deliver to
+    /// that phase; the work built for the rest still holds. Moving one
+    /// earlier, or to a state that is not a later release state, is a change.
+    #[test]
+    fn moving_an_obligation_to_a_later_release_phase_does_not_send_the_node_back() {
+        let fx = planned("verifying");
+        PlanStepRepo::new(&fx.conn)
+            .update_status(fx.step, STATUS_VERIFIED, None, None)
+            .unwrap();
+        let obligations = ObligationRepo::new(&fx.conn);
+        obligations.update_acts_in(fx.obligation, "released").unwrap();
+        assert_eq!(check(&fx), None);
+        obligations.update_acts_in(fx.obligation, "verifying").unwrap();
+        assert_eq!(check(&fx).unwrap().target, "planning");
+        obligations.update_acts_in(fx.obligation, "active").unwrap();
+        assert_eq!(check(&fx), None);
+        obligations.update_acts_in(fx.obligation, "design").unwrap();
+        assert_eq!(check(&fx).unwrap().target, "planning");
     }
 
     #[test]

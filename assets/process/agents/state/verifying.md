@@ -33,6 +33,10 @@ Execute **every requirement**: run attached success criteria when present; other
 
 Re-exercise in **running context** as needed for the full sweep (prefer automated end-to-end; otherwise drive the running system). Build and run **local-only** harnesses and one-off checks here when gaps remain.
 
+### An obligation in the wrong phase
+
+An obligation that acts in `merged`, `released` or `design` is not ruled on here. If one that does not act there is really about production after the release (a measurement after rollout, a query over production data after a cleanup run), move it yourself with `obligations update --acts-in released` (or `merged`; the app lets verification make this one change past `planning`) and give it a plan step of that phase if none satisfies it. It is a phase mistake in the app's data: never a failure of the work, never a verdict on a proxy, never a question to the user.
+
 ### Test strategy
 
 - **Rule out the environment first** — When a running-context / integration / E2E check fails: first rule out environment (wrong build, stale process, harness/focus, fixture paths) before calling it a product defect.

@@ -37,8 +37,9 @@ says?", not "does each step's code exist?".
 
 Work in this order:
 
-1. **Each obligation, end to end.** For every obligation listed below — and
-   each inherited constraint that applies to this work — exercise the
+1. **Each obligation, end to end.** For every obligation listed below that
+   acts in `active` or `verifying` (no `acts_in=` mark, or `acts_in=verifying`)
+   — and each inherited constraint that applies to this work — exercise the
    behaviour it describes in the running work, the way its user would meet
    it, and record what you saw through the `verdicts` noun: `verified` or
    `failed`, always with the evidence. Reading the code, or a passing unit
@@ -50,6 +51,37 @@ Work in this order:
    from failed steps and their notes, so fail the step that should have
    delivered the behaviour; if no step covers it, add one that `--satisfies`
    the obligation and fail that. The app sends you back until this is so.
+
+### An obligation that acts in the wrong phase is yours to fix
+
+An obligation marked `acts_in=design`, `acts_in=merged` or `acts_in=released`
+is not yours to rule on here: leave it with no verdict (the app does not ask
+for one); `merged` and `released` ones are verified in that phase. Do not ask
+the user about it.
+
+While you work you may find an obligation that only a later phase can show
+true, however it is marked (usually `active`, or wrongly `design`): it is
+about production after the release, or about data after a step that runs on
+production ("after rollout, a query over `integration_status` shows...",
+"after the cleanup runs on prod, a query finds zero..."), and nothing in this
+checkout can exercise it. That is a **phase mistake in the app's own data, not a
+question for the user and not a failure of the work**. Fix it yourself and
+carry on:
+
+1. Move it: `obligations update <id> --acts-in released` (a run or
+   measurement against production data or the live system) or
+   `--acts-in merged` (must be in place before the deploy). The app allows
+   this change from here, and only this one: later states only, never the
+   text, never earlier. It is recorded, and the user can reverse it.
+2. Give it a plan step of that phase if none satisfies it: `plan add
+   --phase <same phase> --satisfies <id>`, an action the phase takes (run the
+   cleanup asset on production, take the measurement), never a check.
+3. Give it no verdict now and go on with the rest. Never `failed` (the work
+   is not at fault) and never `verified` on a proxy (the code reads right, a
+   staging query). Never `decisions ask` for this.
+
+Ask the user only when the choice is a real one: the obligation's own wording
+is ambiguous, or it can be shown true here but you doubt it should be.
 
 If verifying shows the work must also do something no obligation states, do
 not add an obligation: past `planning` they change only with the user's

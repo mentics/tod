@@ -192,7 +192,10 @@ impl Protocol for VerificationProtocol {
         let node = node_id(turn.env)?;
         let steps = verify_steps(turn.env.fleet, node);
         let standings = due_standings(turn.env.fleet, node);
+        let all_standings = self::standings(turn.env.fleet, node);
+        let all_steps = plan_steps(turn.env.fleet, node);
         let owed = Owed {
+            untraced: untraced_for_later_phase(&all_standings, &all_steps),
             obligations: standings.iter().filter(|s| s.is_unchecked()).collect(),
             stranded: stranded_failures(&standings, &steps),
             steps: steps
@@ -270,8 +273,29 @@ fn stranded_failures<'a>(
         .collect()
 }
 
+/// Requirements that act in `merged` or `released` and that no plan step
+/// satisfies. That phase's agent works from steps, and the planning trace
+/// gate is long past: a requirement verification moved to a later phase
+/// (it can only be shown true there) must leave a step of that phase that
+/// delivers it, or nothing would ever take the action.
+fn untraced_for_later_phase<'a>(
+    standings: &'a [ObligationStanding],
+    steps: &[PlanStepWithLinks],
+) -> Vec<&'a ObligationStanding> {
+    standings
+        .iter()
+        .filter(|s| s.obligation.kind == "requirement")
+        .filter(|s| {
+            s.obligation.acts_in == tod_store::outline::ACTS_IN_MERGED
+                || s.obligation.acts_in == tod_store::outline::ACTS_IN_RELEASED
+        })
+        .filter(|s| !steps.iter().any(|l| l.satisfies.contains(&s.obligation.id)))
+        .collect()
+}
+
 /// What a verification turn left undone.
 struct Owed<'a> {
+    untraced: Vec<&'a ObligationStanding>,
     obligations: Vec<&'a ObligationStanding>,
     stranded: Vec<&'a ObligationStanding>,
     steps: Vec<&'a PlanStepWithLinks>,
@@ -281,6 +305,7 @@ struct Owed<'a> {
 impl Owed<'_> {
     fn nothing(&self) -> bool {
         self.obligations.is_empty()
+            && self.untraced.is_empty()
             && self.stranded.is_empty()
             && self.steps.is_empty()
             && self.tests_recorded
@@ -291,6 +316,9 @@ impl Owed<'_> {
         let mut parts = Vec::new();
         if !self.obligations.is_empty() {
             parts.push(format!("{} obligation(s) with no verdict", self.obligations.len()));
+        }
+        if !self.untraced.is_empty() {
+            parts.push(format!("{} later-phase obligation(s) with no plan step", self.untraced.len()));
         }
         if !self.stranded.is_empty() {
             parts.push(format!("{} stranded failure(s)", self.stranded.len()));
@@ -315,6 +343,21 @@ impl Owed<'_> {
                 count(self.obligations.len(), "obligation")
             ));
             for standing in &self.obligations {
+                out.push_str(&obligation_bullet(standing));
+            }
+            out.push('\n');
+        }
+        if !self.untraced.is_empty() {
+            out.push_str(&format!(
+                "{} acts in a later phase (`merged` or `released`) but no plan \
+                 step of that phase delivers it, so nothing would ever do the \
+                 action. For each, add the step (`plan add --phase <that phase> \
+                 --satisfies <id>`): the action that phase takes (run the \
+                 cleanup on production, apply the migration), never a check, \
+                 since that phase verifies it. Do not ask the user:\n\n",
+                count(self.untraced.len(), "obligation")
+            ));
+            for standing in &self.untraced {
                 out.push_str(&obligation_bullet(standing));
             }
             out.push('\n');
@@ -615,6 +658,56 @@ mod tests {
         assert!(message.contains("Tickets sync from Linear"), "{message}");
         assert_eq!(reason, "1 obligation(s) with no verdict");
         rule(&fx, syncs, "verified");
+        assert!(matches!(decide(&fx, true, 0, true), Next::Done(Stop::Complete)));
+    }
+
+    /// An obligation verification moved to a later phase is not ruled on
+    /// here (it is not due), but it must leave a step of that phase, or
+    /// nothing would take the action it needs.
+    #[test]
+    fn a_requirement_moved_to_a_later_phase_needs_a_step_of_that_phase() {
+        let fx = planned(&[STATUS_VERIFIED]);
+        let cleanup = requirement(&fx, "After the cleanup runs on prod, no row dangles", &[]);
+        fx.fleet
+            .enqueue_outline(OutlineMutation::UpdateObligationActsIn {
+                obligation_id: cleanup,
+                acts_in: "released".into(),
+            })
+            .unwrap();
+        fx.fleet.writer().flush().unwrap();
+        let Next::Continue { message, reason } = decide(&fx, true, 0, true) else {
+            panic!("a later-phase requirement with no step should continue");
+        };
+        assert!(message.contains("acts in a later phase"), "{message}");
+        assert!(message.contains("no row dangles"), "{message}");
+        assert!(message.contains("Do not ask the user"), "{message}");
+        assert!(!message.contains("no verdict"), "{message}");
+        assert_eq!(reason, "1 later-phase obligation(s) with no plan step");
+        // The step that delivers it: of that phase, satisfying it.
+        fx.fleet
+            .enqueue_outline(OutlineMutation::CreatePlanStep {
+                step_id: None,
+                node_id: fx.node,
+                after_id: None,
+                before: false,
+                body: "Run the cleanup asset on prod".into(),
+            })
+            .unwrap();
+        fx.fleet.writer().flush().unwrap();
+        let added = *step_ids(&fx).last().unwrap();
+        for mutation in [
+            OutlineMutation::SetPlanStepPhase {
+                step_id: added,
+                phase: "released".into(),
+            },
+            OutlineMutation::LinkPlanStepObligation {
+                step_id: added,
+                obligation_id: cleanup,
+            },
+        ] {
+            fx.fleet.enqueue_outline(mutation).unwrap();
+        }
+        fx.fleet.writer().flush().unwrap();
         assert!(matches!(decide(&fx, true, 0, true), Next::Done(Stop::Complete)));
     }
 
