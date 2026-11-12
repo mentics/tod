@@ -370,7 +370,10 @@ impl StepHook for Hook<'_> {
             replica.push()?;
             replica.pull()?;
         }
-        if boundary == Boundary::Step && self.push_branch {
+        // At a turn too: an implement or fix turn's commits (in a submodule,
+        // the parent records only their id) must not wait for the step to
+        // end, with the sandbox idle-reclaimed in between.
+        if self.push_branch {
             if let Err(err) = git::push_branch(self.workspace) {
                 tracing::warn!("pushing the branch: {err:#}");
             }

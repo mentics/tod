@@ -544,7 +544,7 @@ fn replace_with(
             tracing::info!("cloud: replaced node {id}'s sandbox {} with {name}; it is no longer marked lost", row.sandbox);
             set_note(
                 &id,
-                Some(format!("Its sandbox {} was pruned or deleted outside the app; made a new one, {name}, at {when}.", row.sandbox)),
+                Some(format!("Its sandbox {} was pruned or deleted outside the app; made a new one, {name}, at {when}. Whatever its agent had not pushed to the remote (or kept as a checkpoint) is gone with it: check that the node's branch, in the repository and in each submodule, still holds the work before relying on a later step.", row.sandbox)),
             );
             true
         }

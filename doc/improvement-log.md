@@ -31,6 +31,16 @@ turns, findings, run_state, node_timeline, journey records):
 
 ---
 
+## 2026-11-12: work lost with a sandbox
+
+### A node's work committed in a submodule is never pushed, so a reclaimed sandbox takes it
+
+- **Seen**: 1 node confirmed (ENG-2068, 5631A571), 2026-11-10 to 2026-11-12; any cloud node whose work is in a submodule (`kb`, `flagship`, `ui`, `infra` of `cofactr/workspace`) is exposed. Verification ran on work that no longer existed, and review had to ask the user ("Restore this task's kb code to the review checkout...").
+- **Symptom**: the review session found /workspace/kb on the task branch equal to `origin/main`, the test file the verdicts cited nowhere, no branch for the task in the kb repository, and `workspace`'s task branch holding only a submodule pointer at kb's `main` commit.
+- **Cause**: implementation ran 2026-11-10 06:08-06:23 in the node's first sandbox. The supervisor's `git::push_branch` pushed only the workspace repository's branch; the commits were in the kb submodule, which was never pushed. Checkpoints (`checkpoint::save_repo`) keep only uncommitted work, so a committed, clean submodule had no checkpoint either. Blaxel reclaimed idle sandboxes (the app forgot 32 at 2026-11-10 14:42, and 8+ again at 2026-11-12 18:24), the node's sandbox was replaced from the golden, and nothing restored the work; its replacement note said only "made a new one". The app's own pushes (`provision::push_branches`, used by remove/refresh and the local runner) already covered submodules; only the supervisor's did not.
+- **Fix**: `tod_supervisor::git::push_branch` pushes, deepest first, the node's branch in every submodule that has commits no remote has, then the parent's; failures (a detached HEAD or default branch with such commits, a rejected push) come back together naming each repository, never skipped. It now runs at turn boundaries as well as steps, so an implement or fix turn's commits are pushed when the turn ends. The replacement note now says unpushed work is gone and to check the branch. Tests in `tod-supervisor` `git::tests`. Not done: checkpointing commits that are clean and unpushed during a long turn (a checkpoint holds only uncommitted work); the work of ENG-2068 itself is not recoverable (see the node's report).
+- **Measure**: count of replaced sandboxes (`cloud: replaced node ... sandbox`) whose node had plan steps implemented; submodule commits found on no remote branch when a sandbox is lost (not yet measured, nothing records it).
+
 ## 2026-11-12: bot review of a merge-only head
 
 ### The PR agent asks a review bot four times for a review it will never give, then stops
