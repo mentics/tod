@@ -1,6 +1,6 @@
 ---
 name: shepherd-nodes
-description: Watch the user's started nodes on the live data root as tod moves them from proposed to pr_draft. Wherever one gets stuck, find out why, make tod handle that case itself (a bug fix or an enhancement, done by subagents and merged to main), redeploy and restart, and get the node moving again. Use when asked to shepherd, babysit or unstick the live nodes, or to make the lifecycle run without help.
+description: Watch the nodes the user names (by ticket, slug, or a parent node for its subtree) on the live data root as tod moves them from proposed to pr_draft. Wherever one gets stuck, find out why, make tod handle that case itself (a bug fix or an enhancement, done by subagents and merged to main), redeploy and restart, and get the node moving again. Use when asked to shepherd, babysit or unstick the live nodes, or to make the lifecycle run without help.
 user_invocable: true
 ---
 
@@ -20,13 +20,30 @@ needs that help. A fix can be a bug fix or an enhancement: a feature, a
 fallback, a clearer message, or a smarter loop. Then get the node moving again
 with the improved tod.
 
+## Which nodes
+
+The user names the nodes in the skill's argument. Shepherd those and nothing
+else; other nodes with a lifecycle may be run by hand or left alone on purpose.
+
+- Each item may be a Linear ticket (`ENG-2925`), a node slug, or a node UUID.
+- A parent node (such as a project or `ENG work`) means every node under it
+  that has Lifecycle.
+- With no argument, don't guess: list the started nodes from `proposed` to
+  `pr_draft` (ticket, title, state, run state) and ask which to shepherd.
+- Resolve every item with `tod-cli node show` before starting, and say which
+  nodes are in scope. An item that matches nothing is an error to report, not
+  something to skip.
+- The scope holds for the whole session. Add a node only when the user names
+  it. A node outside the scope can still show a tod gap: note it in the
+  improvement log, but don't resume, answer or reset it.
+
 ## Hard rules
 
 - Use the **default live root**: the `data_root` in `install.toml`. Read it,
   never write it. Pass that root as `--data-root` on every launch.
 - Read its database read-only (`sqlite3 'file:<root>/tod.db?mode=ro'`). Change
   node state only through the app (control socket) or `tod-cli`.
-- Only nodes the user started. Never start a node, and never move one to
+- Only the nodes in scope, and only once the user has started them. Never start a node, and never move one to
   `pr_review`. Never mark a PR ready or request a reviewer: that is the
   user's step.
 - Never push to, comment on, or edit a Cofactr PR or branch yourself. The
@@ -102,7 +119,7 @@ current with `origin/main`:
 ## The loop
 
 Every node in `proposed`, `design`, `planning`, `ready`, `active`,
-`verifying`, `review`, `pr` and `pr_draft` that the user has started:
+`verifying`, `review`, `pr` and `pr_draft` that is in scope:
 
 1. **Survey.** For each node, read:
    - its state, and its run state from `run_state` (working, waiting on
