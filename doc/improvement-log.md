@@ -235,3 +235,24 @@ from Blaxel.
 - **Cause**: real feedback; each fix round draws new bot findings.
 - **Fix**: none needed in the app yet; rerun.
 - **Measure**: bot findings per round; whether they shrink.
+
+### Pruned sandbox stops a waiting node
+
+- **Seen**: several live nodes (ENG-3093, ENG-2925).
+- **Symptom**: a node waiting on GitHub (CI, a bot, a person) showed stopped,
+  "its sandbox was deleted; Start makes a new one", until someone clicked Resume.
+- **Cause**: the Blaxel Prune workflow deletes node sandboxes asleep over an
+  hour (they are never kept awake on purpose). The orchestrator marks the node
+  lost when a wake finds the sandbox gone and the app or daemon replaced it,
+  but with no regard for whether the node was meant to run (a paused node got
+  one too), and a replacement that failed was only logged and retried every
+  ten minutes forever while the node read "a new one is made at the next sync".
+- **Fix**: `cloud_sync::lost` replaces the sandbox lazily (only when a wake or
+  feedback finds it gone) for a node whose run row is not `Stopped`/`Done`;
+  a user-deleted sandbox is still left for Start. Three failed tries, ten
+  minutes apart, record the node failed with the real error
+  (`next_actor` shows that error instead of the loss). The status note says
+  "pruned or deleted outside the app; made a new one". Commit: see `git log`
+  for "Pruned sandbox".
+- **Measure**: nodes showing "sandbox is gone/deleted" for longer than one sync;
+  replacements per node; nodes failed by `could not be made after 3 tries`.

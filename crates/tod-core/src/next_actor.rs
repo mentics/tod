@@ -656,7 +656,14 @@ fn actor_for(facts: &Facts<'_>) -> (NextActor, i64) {
     // answered "leave it", or a wake that ended needing someone (what the
     // supervisor left in its idle heartbeat). Each says why and what to do;
     // none is "not started".
-    if let Some(lost) = facts.cloud_lost {
+    // A replacement that failed for good is the run row's `failed` (written
+    // after the loss), which says why; the loss alone would hide it.
+    let replacement_failed = |lost: &CloudLost| {
+        run_state.is_some_and(|r| {
+            r.phase == Phase::Stopped && r.reason_kind == crate::run_state::kind::FAILED && r.updated_at >= lost.since
+        })
+    };
+    if let Some(lost) = facts.cloud_lost.filter(|l| !replacement_failed(l)) {
         let reason = if lost.deleted_by_user {
             "its sandbox was deleted; Start makes a new one".to_string()
         } else {
@@ -1930,6 +1937,17 @@ mod tests {
         c.cloud_lost = Some(CloudLost { since: 900, deleted_by_user: false });
         let NextActor::You { why: YouReason::Stopped { reason }, .. } = standing(&c).actor else { panic!() };
         assert!(reason.contains("sandbox is gone"), "{reason}");
+    }
+
+    #[test]
+    fn a_failed_replacement_shows_its_error_not_the_loss() {
+        let mut c = case("planning");
+        c.cloud_lost = Some(CloudLost { since: 900, deleted_by_user: false });
+        c.run_state = Some(row(Phase::Stopped, crate::run_state::kind::FAILED, "could not make a new one: quota", 900, 950));
+        let NextActor::You { why: YouReason::Failed { error }, .. } = standing(&c).actor else { panic!("{:?}", standing(&c).actor) };
+        assert!(error.contains("quota"), "{error}");
+        c.run_state = Some(row(Phase::Stopped, crate::run_state::kind::FAILED, "old failure", 100, 200));
+        assert!(matches!(standing(&c).actor, NextActor::You { why: YouReason::Stopped { .. }, .. }), "an older failure does not hide the loss");
     }
 
     /// The app's `starting` row, then a runner's stop, each written the way

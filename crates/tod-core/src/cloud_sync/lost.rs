@@ -93,6 +93,7 @@ fn set_failed(node_id: &str, failed: bool) {
 /// retried by the next check.
 pub fn forget_failure(node_id: &str) {
     set_failed(node_id, false);
+    bump_attempts(node_id, true);
 }
 
 static NOTES: Mutex<Option<HashMap<String, String>>> = Mutex::new(None);
@@ -301,6 +302,7 @@ pub fn check(fleet: &FleetStore, check: Check) -> Result<Repaired> {
     let deleted = CloudSyncState::load(&root)?.deleted_by_user;
     let mut lost = lost_rows(&rows, listing.as_deref());
     lost.retain(|row| !deleted.contains(&row.node_id.to_string()));
+    lost = wanted_to_run(fleet, lost)?;
     if check == Check::Marked {
         lost.retain(|row| !backed_off(&row.node_id.to_string()));
     }
@@ -356,32 +358,104 @@ fn joined(result: std::thread::Result<bool>) -> bool {
     })
 }
 
+/// How many times a node's lost sandbox is replaced and fails before the node
+/// is said to have failed (the tries are [`RETRY_AFTER`] apart, so a storm of
+/// retries is not possible: three in about twenty minutes, then it stops).
+const MAX_REPLACEMENTS: u32 = 3;
+
+static ATTEMPTS: Mutex<Option<HashMap<String, u32>>> = Mutex::new(None);
+
+fn bump_attempts(node_id: &str, reset: bool) -> u32 {
+    let mut map = ATTEMPTS.lock().unwrap_or_else(|e| e.into_inner());
+    let map = map.get_or_insert_with(HashMap::new);
+    if reset {
+        map.remove(node_id);
+        0
+    } else {
+        let n = map.entry(node_id.to_string()).or_insert(0);
+        *n += 1;
+        *n
+    }
+}
+
+/// Keeps the lost rows whose node is still meant to run. A node the user
+/// paused or stopped, one that failed or needs someone, and one that is done
+/// has a run row saying so (`Phase::Stopped` / `Done`): its sandbox is left
+/// gone until the user starts it (Start makes a new one), so a prune never
+/// restarts work the user stopped. A node waiting (`Waiting`), working, or
+/// with no row yet is meant to run.
+fn wanted_to_run(fleet: &FleetStore, rows: Vec<CloudNodeRow>) -> Result<Vec<CloudNodeRow>> {
+    use tod_store::run_state::Phase;
+    let mut kept = Vec::new();
+    for row in rows {
+        let state = fleet.read(|conn| tod_store::run_state::get(conn, row.node_id))?;
+        if state.is_some_and(|s| matches!(s.phase, Phase::Stopped | Phase::Done)) {
+            tracing::info!("cloud: node {}'s sandbox is gone; not replacing it for a node that is stopped", row.node_id);
+            continue;
+        }
+        kept.push(row);
+    }
+    Ok(kept)
+}
+
 /// Replaces `row`'s lost sandbox under a `cloud_repair` lease. Whether it did;
-/// a failure is logged, noted for the node's status line, and backed off.
+/// a failure is logged, noted for the node's status line, and backed off, and
+/// after [`MAX_REPLACEMENTS`] failures the node is recorded as failed with the
+/// last error.
 fn replace(fleet: &FleetStore, root: &std::path::Path, row: &CloudNodeRow, owner: &str) -> bool {
     let id = row.node_id.to_string();
     tracing::info!("cloud: node {id}'s sandbox {} is gone; replacing it", row.sandbox);
     set_note(&id, Some(format!("Its sandbox {} was gone; replacing it…", row.sandbox)));
     let mut progress = |msg: &str| super::log_progress(&format!("replacing {}", row.sandbox), msg);
-    let result = tod_store::activity::with_lease(fleet, row.node_id, tod_store::activity::KIND_CLOUD_REPAIR, owner, || {
+    replace_with(fleet, row, owner, &mut || {
         ensure_supervisor(fleet, root, &id, true, &mut progress)
             .and_then(|name| record_cloud_node(fleet, &id, &row.user).map(|_| name))
     })
-    .and_then(|r| r);
+}
+
+/// [`replace`] with the making of the new sandbox passed in.
+fn replace_with(
+    fleet: &FleetStore,
+    row: &CloudNodeRow,
+    owner: &str,
+    make: &mut dyn FnMut() -> Result<String>,
+) -> bool {
+    let id = row.node_id.to_string();
+    let result = tod_store::activity::with_lease(fleet, row.node_id, tod_store::activity::KIND_CLOUD_REPAIR, owner, || make())
+        .and_then(|r| r);
     match result {
         Ok(name) => {
             set_failed(&id, false);
+            bump_attempts(&id, true);
             let when = chrono::Local::now().format("%Y-%m-%d %H:%M");
-            set_note(&id, Some(format!("Its sandbox was gone; the app replaced it with {name} at {when}.")));
+            set_note(
+                &id,
+                Some(format!("Its sandbox {} was pruned or deleted outside the app; made a new one, {name}, at {when}.", row.sandbox)),
+            );
             true
         }
         Err(err) => {
             set_failed(&id, true);
-            tracing::warn!(
-                "cloud: replacing node {id}'s sandbox: {err:#} (not retried for {} minutes unless it is run in the cloud again)",
-                RETRY_AFTER.as_secs() / 60
-            );
-            set_note(&id, Some(format!("Its sandbox is gone and could not be replaced: {err:#}")));
+            let tries = bump_attempts(&id, false);
+            let text = format!("{err:#}");
+            if tries >= MAX_REPLACEMENTS {
+                bump_attempts(&id, true);
+                let error = format!(
+                    "its sandbox {} is gone and a new one could not be made after {tries} tries: {text}; Start tries again",
+                    row.sandbox
+                );
+                tracing::error!("cloud: replacing node {id}'s sandbox: {error}");
+                set_note(&id, Some(format!("Its sandbox is gone and could not be replaced: {text}")));
+                if let Err(e) = crate::run_state::record(fleet, row.node_id, crate::run_state::runner_failed(&error), "app") {
+                    tracing::error!("cloud: recording that node {id} failed to get a new sandbox: {e:#}");
+                }
+            } else {
+                tracing::warn!(
+                    "cloud: replacing node {id}'s sandbox (try {tries} of {MAX_REPLACEMENTS}): {text} (not retried for {} minutes unless it is run in the cloud again)",
+                    RETRY_AFTER.as_secs() / 60
+                );
+                set_note(&id, Some(format!("Its sandbox is gone and could not be replaced (try {tries} of {MAX_REPLACEMENTS}): {text}")));
+            }
             false
         }
     }
@@ -1417,5 +1491,73 @@ mod tests {
         ) -> Result<String> {
             stop_and_delete_with(&self.fleet, &self.id(), force, &mut |m| said.push(m.to_string()), stopper, QUICK, backend)
         }
+    }
+
+    fn lost_node(fx: &Fx) -> CloudNodeRow {
+        fx.locate("node-gone");
+        fx.cloud_row();
+        let conn = rusqlite::Connection::open(fx.fleet.paths().db()).unwrap();
+        cloud_nodes::mark_lost(&conn, fx.node, 5).unwrap();
+        drop(conn);
+        fx.row().unwrap()
+    }
+
+    fn run_row(fx: &Fx, draft: tod_store::run_state::Draft) {
+        crate::run_state::record(&fx.fleet, fx.node, draft, "test").unwrap();
+    }
+
+    #[test]
+    fn a_running_node_whose_sandbox_was_pruned_gets_a_new_one_and_the_note_says_so() {
+        let fx = fx();
+        let row = lost_node(&fx);
+        run_row(&fx, crate::run_state::waiting_outside("CI"));
+        let wanted = wanted_to_run(&fx.fleet, vec![row.clone()]).unwrap();
+        assert_eq!(wanted.len(), 1, "a node waiting on GitHub is meant to run");
+        let mut made = 0;
+        let ok = replace_with(&fx.fleet, &row, "t", &mut || {
+            made += 1;
+            Ok("tod-new".into())
+        });
+        assert!(ok && made == 1);
+        let note = note(&fx.id()).unwrap();
+        assert!(note.contains("made a new one, tod-new"), "{note}");
+    }
+
+    #[test]
+    fn a_paused_or_stopped_node_is_not_given_a_new_sandbox() {
+        let fx = fx();
+        let row = lost_node(&fx);
+        for draft in [
+            crate::run_state::for_outcome(
+                &crate::autopilot::Outcome::Stopped { reason: crate::autopilot::local::PAUSED.into() },
+                crate::run_state::Words::local(),
+            ),
+            crate::run_state::left_stopped("you left it"),
+            crate::run_state::runner_failed("boom"),
+        ] {
+            run_row(&fx, draft);
+            assert!(wanted_to_run(&fx.fleet, vec![row.clone()]).unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn a_replacement_that_keeps_failing_ends_the_node_failed_with_the_error_after_bounded_tries() {
+        let fx = fx();
+        let row = lost_node(&fx);
+        run_row(&fx, crate::run_state::waiting_outside("CI"));
+        let mut calls = 0;
+        for _ in 0..MAX_REPLACEMENTS {
+            assert!(!replace_with(&fx.fleet, &row, "t", &mut || {
+                calls += 1;
+                anyhow::bail!("blaxel refused: quota")
+            }));
+        }
+        assert_eq!(calls, MAX_REPLACEMENTS);
+        fx.fleet.reload_if_stale().unwrap();
+        let state = fx.fleet.read(|c| tod_store::run_state::get(c, fx.node)).unwrap().unwrap();
+        assert_eq!(state.phase, tod_store::run_state::Phase::Stopped);
+        assert!(state.reason_text.contains("blaxel refused: quota"), "{}", state.reason_text);
+        // Failed: no further automatic tries.
+        assert!(wanted_to_run(&fx.fleet, vec![row]).unwrap().is_empty());
     }
 }
