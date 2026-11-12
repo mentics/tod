@@ -106,6 +106,12 @@ pub fn pull(remote: &dyn Remote, local: &Path) -> Result<u64> {
 /// Copies each local log the sandbox lacks, or has shorter, back into it.
 /// The number restored. Nothing local is nothing to do (and no network call).
 pub fn restore(remote: &dyn Remote, local: &Path) -> Result<usize> {
+    restore_with(remote, local, &mut |_| {})
+}
+
+/// [`restore`] saying how far it is, file by file: a node with many large
+/// logs takes minutes, and silence looks like a hang.
+pub fn restore_with(remote: &dyn Remote, local: &Path, progress: &mut dyn FnMut(&str)) -> Result<usize> {
     let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut wanted = Vec::new();
     if let Ok(entries) = std::fs::read_dir(local) {
@@ -124,7 +130,8 @@ pub fn restore(remote: &dyn Remote, local: &Path) -> Result<usize> {
     }
     let there = remote.list()?;
     let mut restored = 0;
-    for (project, session, size, path) in wanted {
+    let total = wanted.len();
+    for (n, (project, session, size, path)) in wanted.into_iter().enumerate() {
         let held = there
             .iter()
             .find(|l| l.project == project && l.session == session)
@@ -133,6 +140,7 @@ pub fn restore(remote: &dyn Remote, local: &Path) -> Result<usize> {
             continue;
         }
         let bytes = std::fs::read(&path).with_context(|| format!("read {}", path.display()))?;
+        progress(&format!("sending session log {} of {total} ({} KB)", n + 1, size / 1024));
         remote.write(&project, &session, &bytes)?;
         restored += 1;
     }
@@ -454,11 +462,16 @@ pub fn pull_node(data_root: &Path, node_id: &str, sandbox: &str) -> Result<u64> 
 
 /// Copy `node_id`'s local session logs into `sandbox`.
 pub fn restore_node(data_root: &Path, node_id: &str, sandbox: &str) -> Result<usize> {
+    restore_node_with(data_root, node_id, sandbox, &mut |_| {})
+}
+
+/// [`restore_node`] saying how far it is.
+pub fn restore_node_with(data_root: &Path, node_id: &str, sandbox: &str, progress: &mut dyn FnMut(&str)) -> Result<usize> {
     let local = local_dir(data_root, node_id);
     if !local.is_dir() {
         return Ok(0);
     }
-    restore(&SandboxRemote::new(sandbox), &local)
+    restore_with(&SandboxRemote::new(sandbox), &local, progress)
 }
 
 /// The runner state that travels with a node between places: the

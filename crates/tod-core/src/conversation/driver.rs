@@ -754,9 +754,14 @@ impl ConversationDriver {
                     // Remaking is bounded like the lost-sandbox check's: a spent
                     // bound leaves the real error to the arms below.
                     tod_store::fleet::provision::says_sandbox_gone(&message, sandbox)
-                        && crate::cloud_sync::lost::allow_remake(fleet, &node.to_string())
+                        && crate::cloud_sync::lost::can_remake(fleet, &node.to_string())
                         && tod_store::fleet::provision::forget_lost_sandbox(fleet, &node.to_string(), sandbox, &message)
-                        .unwrap_or(false)
+                            .unwrap_or(false)
+                        && {
+                            // Counted only now that a remake is really begun.
+                            crate::cloud_sync::lost::note_remake(fleet, &node.to_string());
+                            true
+                        }
                 }) =>
             {
                 let (conversation, text, attachments) = fleet.read(|conn| {

@@ -18,7 +18,7 @@
 //! the UI thread ([`spawn_check`] runs on a thread of its own).
 
 use super::{CloudSyncState, ensure_supervisor, record_cloud_node, resolve, sandbox_is_dead, sync};
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -91,8 +91,12 @@ fn set_failed(node_id: &str, failed: bool) {
 
 /// The user is running `node_id` in the cloud again: its replacement may be
 /// retried by the next check.
-pub fn forget_failure(node_id: &str) {
+pub fn forget_failure(root: &std::path::Path, node_id: &str) {
     set_failed(node_id, false);
+    // The spent tries too: a Start gives the node its tries again.
+    if let Err(err) = set_tries(root, node_id, None) {
+        tracing::warn!("cloud: clearing the replacement tries of node {node_id}: {err:#}");
+    }
 }
 
 static NOTES: Mutex<Option<HashMap<String, String>>> = Mutex::new(None);
@@ -280,11 +284,12 @@ pub fn check(fleet: &FleetStore, check: Check) -> Result<Repaired> {
             Err(err) => tracing::error!("cloud: adopting old sandboxes: {err:#}"),
         }
     }
-    let (orch, user) = resolve(&root)?;
-    sync(fleet, &root, &orch, &user)?;
+    // Local only, so it runs even when the orchestrator cannot be reached.
     if let Err(err) = heal_deleted_flags(fleet) {
         tracing::warn!("cloud: checking the sandbox-deleted flags: {err:#}");
     }
+    let (orch, user) = resolve(&root)?;
+    sync(fleet, &root, &orch, &user)?;
     let rows = located_rows(fleet, fleet.read(cloud_nodes::list)?, &root)?;
     if rows.is_empty() {
         return Ok(Repaired::default());
@@ -385,21 +390,27 @@ fn set_tries(root: &std::path::Path, node_id: &str, tries: Option<super::Replace
 
 /// Whether the node's sandbox may be made again by something other than
 /// [`replace`] (the conversation driver's resend after a launch found it
-/// gone): counts the try against the same [`MAX_REPLACEMENTS`] bound, and
-/// refuses (`false`) once it is spent. The count goes when a sandbox is made
-/// or the node is run again.
-pub fn allow_remake(fleet: &FleetStore, node_id: &str) -> bool {
-    let root = fleet.paths().root();
-    match tries_of(root, node_id) {
-        Ok(t) if t.count >= MAX_REPLACEMENTS => false,
-        Ok(t) => {
-            let next = super::ReplaceTries { count: t.count + 1, last_error: t.last_error };
-            set_tries(root, node_id, Some(next)).is_ok()
-        }
+/// gone): `false` once the same [`MAX_REPLACEMENTS`] bound is spent. Counts
+/// nothing: [`note_remake`] counts a remake that was actually begun. The
+/// count goes when a sandbox is made or the node is run again.
+pub fn can_remake(fleet: &FleetStore, node_id: &str) -> bool {
+    match tries_of(fleet.paths().root(), node_id) {
+        Ok(t) => t.count < MAX_REPLACEMENTS,
         Err(err) => {
             tracing::error!("cloud: reading how often node {node_id}'s sandbox was remade: {err:#}");
             false
         }
+    }
+}
+
+/// Counts one remake begun against the bound ([`can_remake`]).
+pub fn note_remake(fleet: &FleetStore, node_id: &str) {
+    let root = fleet.paths().root();
+    let result = tries_of(root, node_id).and_then(|t| {
+        set_tries(root, node_id, Some(super::ReplaceTries { count: t.count + 1, last_error: t.last_error }))
+    });
+    if let Err(err) = result {
+        tracing::error!("cloud: counting a remake of node {node_id}'s sandbox: {err:#}");
     }
 }
 
@@ -481,9 +492,23 @@ fn replace(fleet: &FleetStore, root: &std::path::Path, row: &CloudNodeRow, owner
     set_note(&id, Some(format!("Its sandbox {} was gone; replacing it…", row.sandbox)));
     let mut progress = |msg: &str| super::log_progress(&format!("replacing {}", row.sandbox), msg);
     replace_with(fleet, row, owner, &mut || {
-        ensure_supervisor(fleet, root, &id, true, &mut progress)
-            .and_then(|name| record_cloud_node(fleet, &id, &row.user).map(|_| name))
+        let name = ensure_supervisor(fleet, root, &id, true, &mut progress)?;
+        record_cloud_node(fleet, &id, &row.user)?;
+        verify_recorded(fleet, row, &name)?;
+        Ok(name)
     })
+}
+
+/// A replacement counts as done only when the node's lost mark is gone from
+/// the database (the writer's flush and a reload first); else it is an error.
+fn verify_recorded(fleet: &FleetStore, row: &CloudNodeRow, name: &str) -> Result<()> {
+    fleet.writer().flush()?;
+    fleet.reload_if_stale()?;
+    let still_lost = fleet.read(|c| cloud_nodes::get(c, row.node_id))?.is_none_or(|r| r.lost_at.is_some());
+    if still_lost {
+        bail!("the new sandbox {name} is up, but the node's lost mark could not be cleared in the database");
+    }
+    Ok(())
 }
 
 /// [`replace`] with the making of the new sandbox passed in.
@@ -516,6 +541,7 @@ fn replace_with(
                 tracing::warn!("cloud: clearing the replacement tries of node {id}: {err:#}");
             }
             let when = chrono::Local::now().format("%Y-%m-%d %H:%M");
+            tracing::info!("cloud: replaced node {id}'s sandbox {} with {name}; it is no longer marked lost", row.sandbox);
             set_note(
                 &id,
                 Some(format!("Its sandbox {} was pruned or deleted outside the app; made a new one, {name}, at {when}.", row.sandbox)),
@@ -1741,10 +1767,28 @@ mod tests {
     fn remaking_a_sandbox_from_a_launch_shares_the_bound() {
         let fx = fx();
         for _ in 0..MAX_REPLACEMENTS {
-            assert!(allow_remake(&fx.fleet, &fx.id()));
+            assert!(can_remake(&fx.fleet, &fx.id()));
+            assert!(can_remake(&fx.fleet, &fx.id()), "asking counts nothing");
+            note_remake(&fx.fleet, &fx.id());
         }
-        assert!(!allow_remake(&fx.fleet, &fx.id()));
+        assert!(!can_remake(&fx.fleet, &fx.id()));
+        // A Start gives the tries back, in the file too.
+        forget_failure(&fx.root, &fx.id());
+        assert!(can_remake(&fx.fleet, &fx.id()));
+        note_remake(&fx.fleet, &fx.id());
         remade(&fx.fleet, &fx.id());
-        assert!(allow_remake(&fx.fleet, &fx.id()));
+        assert_eq!(tries_of(&fx.root, &fx.id()).unwrap().count, 0);
+    }
+
+    #[test]
+    fn a_replacement_is_done_only_when_the_lost_mark_is_cleared_in_the_database() {
+        let fx = fx();
+        let row = lost_node(&fx);
+        let err = format!("{:#}", verify_recorded(&fx.fleet, &row, "tod-new").unwrap_err());
+        assert!(err.contains("lost mark"), "{err}");
+        // What record_cloud_node enqueues clears the mark.
+        fx.cloud_row();
+        verify_recorded(&fx.fleet, &row, "tod-new").unwrap();
+        assert!(fx.row().unwrap().lost_at.is_none());
     }
 }

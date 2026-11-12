@@ -1831,7 +1831,7 @@ fn run_in_cloud_reporting(
     // no Claude token to run it with.
     node_source(fleet, node_id)?;
     claude_token_for_node(root)?;
-    lost::forget_failure(node_id);
+    lost::forget_failure(root, node_id);
     // "Run": a row the supervisor consumes when it starts, which also
     // supersedes an older answer to leave the node stopped.
     record_node_request(fleet, node_id, REQUEST_RUN)?;

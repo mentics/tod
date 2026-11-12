@@ -273,3 +273,19 @@ from Blaxel.
   recorded again without another try, and the conversation driver's resend
   after a launch finds the sandbox gone shares the same bound
   (`allow_remake`).
+
+- **Follow-up (pruned sandbox, third pass)**: after the flags healed, ten
+  replacements went quiet for minutes after "forked and set up" and the lost
+  mark stayed. The silence is the step after the fork: a replaced node's agent
+  session logs (58 for one node) are copied in chunk by chunk through the relay,
+  which logged nothing, so a slow copy looked like a hang. Fix: that copy says
+  "sending session log n of N (KB)"; a replacement is done only when the lost
+  mark is verified cleared in the database (`verify_recorded`, else an error),
+  and says so ("replaced ... with ..."); a Start also resets the persisted
+  replacement tries; the driver's remake counts a try only once it begins one
+  (`can_remake` / `note_remake`); stale flags heal before the sync, which may
+  fail; and the one-call submodule branching handles a submodule that already
+  has the branch locally (every golden fork), moving it to origin's when
+  behind, instead of declining on every fork. A5898BE2's row (sandbox
+  `node-bom-upload-...`, lost since October, no Files location) is a legacy
+  record no replacement is attempted for.

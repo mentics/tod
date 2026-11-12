@@ -1159,7 +1159,7 @@ fn make_sandbox(
     // agent's session logs back where Claude resumes from, so the
     // conversation's recorded session id resumes the same session. Without
     // them it falls back to a fresh session (rotation).
-    match super::session_log::restore_node(&root, node_id, &name) {
+    match super::session_log::restore_node_with(&root, node_id, &name, progress) {
         Ok(0) => {}
         Ok(n) => progress(&format!("restored {n} agent session log(s) in {name}")),
         Err(err) => warnings.push(format!(

@@ -519,8 +519,27 @@ for sp in $paths; do
         esac
       fi
     fi
-    if git show-ref --verify --quiet "refs/heads/$BR" || git show-ref --verify --quiet "refs/remotes/{REMOTE}/$BR"; then
-      echo "$sp already has the branch"; exit 7
+    if git show-ref --verify --quiet "refs/heads/$BR"; then
+      # A fork of the golden carries the branch locally (a golden's checkout
+      # is of a node that had it): what the careful path does, in one call.
+      # Behind origin's: moved to it; ahead of it: left (unpushed work);
+      # diverged: the careful path says so.
+      if git show-ref --verify --quiet "refs/remotes/{REMOTE}/$BR"; then
+        l=$(git rev-parse "refs/heads/$BR"); r=$(git rev-parse "refs/remotes/{REMOTE}/$BR")
+        if [ "$l" != "$r" ]; then
+          if git merge-base --is-ancestor "$l" "$r"; then
+            if [ "$(git symbolic-ref -q --short HEAD)" = "$BR" ]; then git merge --ff-only -q "refs/remotes/{REMOTE}/$BR" || exit 7
+            else git branch -f "$BR" "refs/remotes/{REMOTE}/$BR" || exit 7; fi
+          elif ! git merge-base --is-ancestor "$r" "$l"; then
+            echo "$sp has $BR diverged from {REMOTE}/$BR"; exit 7
+          fi
+        fi
+      fi
+      [ "$(git symbolic-ref -q --short HEAD)" = "$BR" ] || git switch -q "$BR" || exit 7
+      exit 0
+    fi
+    if git show-ref --verify --quiet "refs/remotes/{REMOTE}/$BR"; then
+      echo "$sp has the branch on {REMOTE}"; exit 7
     fi
     git switch -q -c "$BR" && git config "$KEY" "$(git rev-parse HEAD)"
   ) &
@@ -2148,5 +2167,42 @@ git -c user.name=t -c user.email=t@t commit -q -m 'add sub'"#;
         let _ = fs::remove_dir_all(&data_root);
         cleanup_test_dir(&db_dir);
         clear_data_root_override();
+    }
+
+    /// The quick path used to decline whenever a submodule already had the
+    /// branch, which every fork of a golden does: it now switches to it.
+    #[test]
+    fn the_quick_branching_script_handles_a_submodule_that_already_has_the_branch() {
+        let dir = std::env::temp_dir().join(format!("tod-quick-branch-{}", uuid::Uuid::new_v4()));
+        let sub = dir.join("sub");
+        fs::create_dir_all(&sub).unwrap();
+        let git = |cwd: &std::path::Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "init.defaultBranch=main"])
+                .args(args)
+                .current_dir(cwd)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        git(&sub, &["init", "-q"]);
+        git(&sub, &["commit", "-q", "--allow-empty", "-m", "one"]);
+        git(&sub, &["branch", "task/x"]);
+        fs::write(dir.join(".gitmodules"), "[submodule \"sub\"]\n\tpath = sub\n\turl = ./sub\n").unwrap();
+        let run = |branch: &str| {
+            std::process::Command::new("sh")
+                .args(["-c", &quick_branch_script(), "sh", branch, "tod.start.x"])
+                .current_dir(&dir)
+                .output()
+                .unwrap()
+        };
+        let out = run("task/x");
+        assert!(out.status.success(), "{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        let head = std::process::Command::new("git").args(["symbolic-ref", "--short", "HEAD"]).current_dir(&sub).output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&head.stdout).trim(), "task/x");
+        // A branch no submodule has is still made by the quick path.
+        let out = run("task/new");
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let _ = fs::remove_dir_all(&dir);
     }
 }
