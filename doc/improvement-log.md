@@ -324,3 +324,23 @@ from Blaxel.
   behind, instead of declining on every fork. A5898BE2's row (sandbox
   `node-bom-upload-...`, lost since October, no Files location) is a legacy
   record no replacement is attempted for.
+
+### A request stays pending after the fix it asked for (and on a finished node)
+
+- **Seen**: 3 nodes at once (ENG-3152, ENG-2924, ENG-3358; `db-query: aws CLI not found`
+  requests filed 2026-11-06/10, before the 2026-11-10 db-query shim), plus ENG-3043
+  (`done` with its run state still "waiting on you"), 2026-11-12.
+- **Symptom**: the node shows "working: repairing its cloud sandbox" and a pending request
+  that no longer applies; the options say "AWS CLI installed and SSO logged in".
+- **Cause**: pending decisions are never re-examined when a fix lands, and a node reaching
+  `done` does not clear its run state's request.
+- **Fix**: open. Answered by hand ("Fixed, try again"); after the restart ENG-3358 went on
+  to query prod KB through the shim and asked a real product question.
+- **Measure**: pending decisions older than the deploy that fixed their cause; `done`
+  nodes with a pending decision.
+
+### Open minor gaps in the memory-freeing script (bc49872f)
+
+- An unreadable `/proc/<pid>/cmdline` is skipped silently; a process that exits between the
+  scan and the kill reads as "could not stop"; an unreaped zombie reads as still running;
+  `python -u -m uvicorn` or `node --max-old-space-size 4096 vite` do not match.
