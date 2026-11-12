@@ -28,10 +28,26 @@ pub fn is_protected(branch: &str, default: Option<&str>) -> bool {
     default == Some(branch) || matches!(branch, "main" | "master" | "trunk" | "develop")
 }
 
-/// Whether `repo`'s HEAD has commits no remote branch has: work only this
-/// checkout holds.
-fn has_unpushed(repo: &Path) -> Result<bool> {
-    Ok(!git(repo, &["rev-list", "-n1", "HEAD", "--not", "--remotes"])?.is_empty())
+/// The commit the parent of a submodule pinned before the node's work: the
+/// gitlink at `rel` (its path in that parent) at the merge base of the
+/// parent's HEAD and its `origin` default branch. Commits reachable from it
+/// are not the node's. `None` when it cannot be told (no remote, no entry).
+fn pinned_commit(parent: &Path, rel: &str) -> Option<String> {
+    let base = ["refs/remotes/origin/HEAD", "refs/remotes/origin/main", "refs/remotes/origin/master"]
+        .iter()
+        .find_map(|r| git(parent, &["merge-base", "HEAD", r]).ok())?;
+    git(parent, &["rev-parse", "--verify", "-q", &format!("{base}:{rel}")]).ok().filter(|s| !s.is_empty())
+}
+
+/// Whether `repo`'s HEAD has commits of the node's own that no remote has:
+/// not on any remote-tracking ref and not in the lineage `pinned` (what the
+/// parent recorded before the node's work) already holds.
+fn has_unpushed(repo: &Path, pinned: Option<&str>) -> Result<bool> {
+    let mut args = vec!["rev-list", "-n1", "HEAD", "--not", "--remotes"];
+    if let Some(p) = pinned {
+        args.push(p);
+    }
+    Ok(!git(repo, &args)?.is_empty())
 }
 
 /// The checkout's default branch, from `origin/HEAD`, when known.
@@ -42,59 +58,104 @@ fn default_branch(repo: &Path) -> Option<String> {
 }
 
 /// Pushes `repo`'s checked-out branch to `origin`, setting it as the
-/// upstream. `Ok(false)` when there was nothing to do (detached, or no
-/// `origin`); a default branch is an error.
-fn push_repo(repo: &Path) -> Result<bool> {
+/// upstream, only when it is `expected` (the node's own branch). `Ok(false)`
+/// when there was nothing to do (detached, or no `origin`); a default branch
+/// or another branch is an error.
+fn push_repo(repo: &Path, expected: Option<&str>) -> Result<bool> {
     let branch = git(repo, &["rev-parse", "--abbrev-ref", "HEAD"])?;
     if branch == "HEAD" {
         tracing::info!("detached HEAD: nothing to push");
         return Ok(false);
     }
-    if git(repo, &["remote"])?.lines().all(|r| r != "origin") {
+    // `git remote` also lists a remote that only has settings (a global
+    // `remote.origin.prune`), so ask for its URL.
+    if git(repo, &["remote", "get-url", "origin"]).is_err() {
         tracing::info!("no origin: nothing to push");
         return Ok(false);
     }
     if is_protected(&branch, default_branch(repo).as_deref()) {
         bail!("refusing to push {branch}: it is a default branch, not the node's own");
     }
+    if let Some(expected) = expected
+        && branch != expected
+    {
+        bail!("it is on {branch}, not the node's branch {expected}, and only the node's own branch is pushed");
+    }
     git(repo, &["push", "--quiet", "-u", "origin", &format!("HEAD:refs/heads/{branch}")])?;
     Ok(true)
 }
 
-/// Every submodule of `workspace`, recursively, deepest first (a submodule's
-/// own submodules before it), as absolute paths.
-fn submodules_deepest_first(workspace: &Path) -> Result<Vec<std::path::PathBuf>> {
-    let listed = git(workspace, &["submodule", "foreach", "--recursive", "--quiet", "echo \"$displaypath\""])?;
-    let mut paths: Vec<_> = listed.lines().filter(|l| !l.trim().is_empty()).map(|l| workspace.join(l.trim())).collect();
-    paths.reverse();
-    Ok(paths)
+/// One submodule: where it is, the repository that records it, and its path
+/// in that repository.
+struct Sub {
+    dir: std::path::PathBuf,
+    parent: std::path::PathBuf,
+    in_parent: String,
 }
 
-/// Pushes the node's own branch in `workspace` and in each submodule that
-/// holds commits no remote has (the agent's work in a submodule is lost with
-/// the sandbox otherwise: the parent only records its commit). Submodules go
-/// first, so the commit the parent records is on the remote when the parent
-/// is. Every repository is tried; the failures come back together, naming each
-/// repository: a submodule on a detached HEAD or on a default branch with
-/// commits no remote has is a failure, never skipped.
+/// Every submodule of `workspace`, recursively, a nested one before the
+/// submodule that holds it.
+fn submodules_nested_first(workspace: &Path) -> Result<Vec<Sub>> {
+    let listed = git(workspace, &["submodule", "foreach", "--recursive", "--quiet", "echo \"$displaypath\""])?;
+    let mut subs: Vec<Sub> = listed
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| {
+            let rel = Path::new(l.trim());
+            // The nearest ancestor that is itself a checkout is the parent.
+            let parent = rel
+                .ancestors()
+                .skip(1)
+                .find(|p| !p.as_os_str().is_empty() && workspace.join(p).join(".git").exists());
+            let (parent_dir, in_parent) = match parent {
+                Some(p) => (workspace.join(p), rel.strip_prefix(p).unwrap_or(rel).display().to_string()),
+                None => (workspace.to_path_buf(), rel.display().to_string()),
+            };
+            Sub { dir: workspace.join(rel), parent: parent_dir, in_parent }
+        })
+        .collect();
+    subs.reverse();
+    Ok(subs)
+}
+
+/// Pushes the node's own branch (the one `workspace` is on) in `workspace`
+/// and in each submodule that holds commits of the node's own no remote has
+/// (the agent's work in a submodule is lost with the sandbox otherwise: the
+/// parent only records its commit). Submodules go first, a nested one before
+/// the submodule holding it, so the commit a parent records is on the remote
+/// when the parent is. Only the node's branch is pushed: a submodule with such
+/// commits on any other branch, on a detached HEAD, or with no origin is a
+/// failure, never skipped. Every repository is tried, including when listing
+/// the submodules failed; the failures come back together, each naming its
+/// repository.
 pub fn push_branch(workspace: &Path) -> Result<()> {
     let mut failures = Vec::new();
-    for sub in submodules_deepest_first(workspace)? {
-        let name = sub.strip_prefix(workspace).unwrap_or(&sub).display().to_string();
-        let result = (|| -> Result<()> {
-            if !sub.join(".git").exists() || !has_unpushed(&sub)? {
-                return Ok(());
+    let node_branch = git(workspace, &["rev-parse", "--abbrev-ref", "HEAD"]).ok().filter(|b| b != "HEAD");
+    match submodules_nested_first(workspace) {
+        Ok(subs) => {
+            for sub in subs {
+                let name = sub.dir.strip_prefix(workspace).unwrap_or(&sub.dir).display().to_string();
+                let result = (|| -> Result<()> {
+                    if !sub.dir.join(".git").exists() {
+                        return Ok(());
+                    }
+                    let pinned = pinned_commit(&sub.parent, &sub.in_parent);
+                    if !has_unpushed(&sub.dir, pinned.as_deref())? {
+                        return Ok(());
+                    }
+                    if !push_repo(&sub.dir, node_branch.as_deref())? {
+                        bail!("it has commits of the node's own no remote has, but nothing was pushed (detached HEAD or no origin)");
+                    }
+                    Ok(())
+                })();
+                if let Err(err) = result {
+                    failures.push(format!("submodule {name}: {err:#}"));
+                }
             }
-            if !push_repo(&sub)? {
-                bail!("it has commits no remote has, but nothing was pushed (detached HEAD or no origin)");
-            }
-            Ok(())
-        })();
-        if let Err(err) = result {
-            failures.push(format!("submodule {name}: {err:#}"));
         }
+        Err(err) => failures.push(format!("listing the submodules: {err:#}")),
     }
-    if let Err(err) = push_repo(workspace) {
+    if let Err(err) = push_repo(workspace, None) {
         failures.push(format!("{err:#}"));
     }
     if !failures.is_empty() {
@@ -161,6 +222,72 @@ mod tests {
         push_branch(&work).unwrap();
         assert!(run(&ws_remote, &["branch", "--list", "task/x"]).contains("task/x"));
         assert_eq!(run(&sub_remote, &["rev-parse", "task/x"]), run(&work.join("kb"), &["rev-parse", "HEAD"]));
+    }
+
+    #[test]
+    fn a_submodule_on_another_branch_with_commits_is_an_error_and_is_not_pushed() {
+        let (work, _ws_remote, sub_remote) = fixture();
+        run(&work.join("kb"), &["checkout", "-q", "-b", "shared/other"]);
+        commit_in_kb(&work);
+        let err = format!("{:#}", push_branch(&work).unwrap_err());
+        assert!(err.contains("submodule kb") && err.contains("shared/other"), "{err}");
+        assert!(run(&sub_remote, &["branch", "--list", "shared/other"]).is_empty());
+    }
+
+    #[test]
+    fn a_submodule_without_origin_and_without_work_is_nothing_to_push() {
+        let (work, _ws_remote, _sub_remote) = fixture();
+        run(&work.join("kb"), &["remote", "remove", "origin"]);
+        push_branch(&work).unwrap();
+        // With work of its own and nowhere to push it, it is an error.
+        commit_in_kb(&work);
+        let err = format!("{:#}", push_branch(&work).unwrap_err());
+        assert!(err.contains("submodule kb") && err.contains("no origin"), "{err}");
+    }
+
+    #[test]
+    fn a_parent_with_no_remote_is_not_an_error() {
+        let (work, _ws_remote, _sub_remote) = fixture();
+        run(&work, &["remote", "remove", "origin"]);
+        push_branch(&work).unwrap();
+    }
+
+    #[test]
+    fn a_listing_failure_is_reported_and_the_parent_is_still_pushed() {
+        let (work, ws_remote, _sub_remote) = fixture();
+        std::fs::write(work.join(".gitmodules"), "[submodule \"kb\"\n").unwrap();
+        let err = format!("{:#}", push_branch(&work).unwrap_err());
+        assert!(err.contains("listing the submodules"), "{err}");
+        assert!(run(&ws_remote, &["branch", "--list", "task/x"]).contains("task/x"));
+    }
+
+    #[test]
+    fn a_nested_submodules_work_is_pushed_before_its_parent_submodule() {
+        let (work, _ws_remote, sub_remote) = fixture();
+        // A second repository nested in kb.
+        let root = work.parent().unwrap().to_path_buf();
+        let inner_remote = root.join("inner.git");
+        run(&root, &["init", "-q", "--bare", "-b", "main", inner_remote.to_str().unwrap()]);
+        let seed = root.join("innerseed");
+        run(&root, &["clone", "-q", inner_remote.to_str().unwrap(), seed.to_str().unwrap()]);
+        std::fs::write(seed.join("i"), "i").unwrap();
+        run(&seed, &["add", "."]);
+        run(&seed, &["commit", "-qm", "inner"]);
+        run(&seed, &["push", "-q", "origin", "HEAD:main"]);
+        let kbseed = root.join("kbseed");
+        run(&root, &["clone", "-q", sub_remote.to_str().unwrap(), kbseed.to_str().unwrap()]);
+        run(&kbseed, &["submodule", "add", "-q", inner_remote.to_str().unwrap(), "inner"]);
+        run(&kbseed, &["commit", "-qm", "nest"]);
+        run(&kbseed, &["push", "-q", "origin", "HEAD:main"]);
+        let kb = work.join("kb");
+        run(&kb, &["pull", "-q", "origin", "main"]);
+        run(&kb, &["submodule", "update", "--init", "--recursive"]);
+        run(&kb.join("inner"), &["checkout", "-q", "-b", "task/x"]);
+        std::fs::write(kb.join("inner/work"), "w").unwrap();
+        run(&kb.join("inner"), &["add", "."]);
+        run(&kb.join("inner"), &["commit", "-qm", "nested work"]);
+        push_branch(&work).unwrap();
+        assert_eq!(run(&inner_remote, &["rev-parse", "task/x"]), run(&kb.join("inner"), &["rev-parse", "HEAD"]));
     }
 
     #[test]

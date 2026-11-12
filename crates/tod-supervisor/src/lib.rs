@@ -374,9 +374,9 @@ impl StepHook for Hook<'_> {
         // the parent records only their id) must not wait for the step to
         // end, with the sandbox idle-reclaimed in between.
         if self.push_branch {
-            if let Err(err) = git::push_branch(self.workspace) {
-                tracing::warn!("pushing the branch: {err:#}");
-            }
+            // A failure stops the run with the repositories named: work that
+            // cannot reach the remote is not something to carry on past.
+            git::push_branch(self.workspace).context("pushing the node's branch at a turn or step boundary")?;
         }
         // Every step, and a turn once the period has passed: what is not
         // committed survives the sandbox too.
