@@ -573,6 +573,45 @@ impl Github {
         Ok(all)
     }
 
+    /// Whether the pull request's own change against `base` is the same at
+    /// `reviewed` as at `head`: `head` differs from `reviewed` only by what
+    /// merging `base` in brought (or not at all). Compares, per file, what
+    /// `base...reviewed` and `base...head` (merge-base diffs, so a merge of the
+    /// base drops out of both) add and remove: the file set, renames and the
+    /// added/removed lines, never hunk positions or context, which a merge of
+    /// the base moves. `Ok(false)` when they differ, or `reviewed` is no longer
+    /// in the repository (a force-push); `Err` when the comparison cannot be
+    /// made (GitHub failing, a diff too large to read, a binary file whose
+    /// patch GitHub omits), so a review is never counted current on a guess.
+    pub fn same_change(&self, owner: &str, repo: &str, base: &str, reviewed: &str, head: &str) -> Result<bool, GithubError> {
+        if reviewed == head {
+            return Ok(true);
+        }
+        let reviewed_files = match self.compare_files(owner, repo, base, reviewed) {
+            Ok(files) => files,
+            // The reviewed commit is gone: the branch was rewritten.
+            Err(GithubError::NotFound) => return Ok(false),
+            Err(err) => return Err(err),
+        };
+        let head_files = self.compare_files(owner, repo, base, head)?;
+        change_equal(&reviewed_files, &head_files).map_err(GithubError::Api)
+    }
+
+    /// The files `base...head` changes, with patches.
+    fn compare_files(&self, owner: &str, repo: &str, base: &str, head: &str) -> Result<Vec<CompareFile>, GithubError> {
+        let mut all = Vec::new();
+        for page in 1..=30 {
+            let raw: CompareFilesRaw =
+                self.get_json(&format!("/repos/{owner}/{repo}/compare/{base}...{head}?per_page=100&page={page}"))?;
+            let last = raw.files.len() < 100;
+            all.extend(raw.files);
+            if last {
+                return Ok(all);
+            }
+        }
+        Err(GithubError::Api(format!("{base}...{head} changes more than 3000 files: too large to compare")))
+    }
+
     /// Submit a review (`COMMENT`, neither approving nor asking for changes)
     /// of `commit_id`: `body` as its text and each of `comments` on a line of
     /// the change's new side. Nothing is posted when both are empty.
@@ -1197,6 +1236,89 @@ impl PullListRaw {
             base: self.base.name,
             updated_at: self.updated_at,
         }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct CompareFilesRaw {
+    #[serde(default)]
+    files: Vec<CompareFile>,
+}
+
+/// A file a compare changes.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct CompareFile {
+    pub filename: String,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub previous_filename: Option<String>,
+    #[serde(default)]
+    pub patch: Option<String>,
+}
+
+/// The added and removed lines of a unified diff: the change itself, without
+/// hunk headers and context (which move when the base does).
+fn change_lines(patch: &str) -> Vec<&str> {
+    patch.lines().filter(|l| l.starts_with('+') || l.starts_with('-')).collect()
+}
+
+/// Whether two compares change the same thing. `Err` (with why) when a file's
+/// patch is missing on either side and so cannot be told.
+pub fn change_equal(a: &[CompareFile], b: &[CompareFile]) -> Result<bool, String> {
+    let key = |f: &CompareFile| (f.filename.clone(), f.status.clone(), f.previous_filename.clone());
+    let mut a: Vec<&CompareFile> = a.iter().collect();
+    let mut b: Vec<&CompareFile> = b.iter().collect();
+    a.sort_by_key(|f| key(f));
+    b.sort_by_key(|f| key(f));
+    if a.len() != b.len() || a.iter().zip(&b).any(|(x, y)| key(x) != key(y)) {
+        return Ok(false);
+    }
+    for (x, y) in a.iter().zip(&b) {
+        match (&x.patch, &y.patch) {
+            (Some(p), Some(q)) => {
+                if change_lines(p) != change_lines(q) {
+                    return Ok(false);
+                }
+            }
+            _ => {
+                return Err(format!(
+                    "GitHub gives no patch for {} (binary or too large), so the two commits cannot be compared",
+                    x.filename
+                ));
+            }
+        }
+    }
+    Ok(true)
+}
+
+#[cfg(test)]
+mod change_equal_tests {
+    use super::*;
+
+    fn file(name: &str, patch: &str) -> CompareFile {
+        CompareFile { filename: name.into(), status: "modified".into(), previous_filename: None, patch: Some(patch.into()) }
+    }
+
+    #[test]
+    fn hunk_positions_and_context_do_not_matter() {
+        let a = [file("a.rs", "@@ -1,3 +1,4 @@\n ctx\n+new\n ctx2")];
+        let b = [file("a.rs", "@@ -40,3 +41,4 @@\n other ctx\n+new\n ctx3")];
+        assert_eq!(change_equal(&a, &b), Ok(true));
+    }
+
+    #[test]
+    fn a_different_line_file_or_extra_file_is_a_change() {
+        let a = [file("a.rs", "@@ -1 +1 @@\n+new")];
+        assert_eq!(change_equal(&a, &[file("a.rs", "@@ -1 +1 @@\n+newer")]), Ok(false));
+        assert_eq!(change_equal(&a, &[file("b.rs", "@@ -1 +1 @@\n+new")]), Ok(false));
+        assert_eq!(change_equal(&a, &[a[0].clone(), file("b.rs", "+x")]), Ok(false));
+    }
+
+    #[test]
+    fn a_missing_patch_cannot_be_compared() {
+        let a = [CompareFile { patch: None, ..file("img.png", "") }];
+        assert!(change_equal(&a, &a).is_err());
     }
 }
 

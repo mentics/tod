@@ -253,14 +253,28 @@ pub enum Next {
 impl Assessment {
     /// `snapshot`, read at `now`, against `settings`.
     pub fn of(snapshot: &PrSnapshot, settings: &PrReadinessSettings, now: DateTime<Utc>) -> Self {
+        let Ok(assessment) = Self::of_with(snapshot, settings, now, &mut |_, _| Ok::<_, std::convert::Infallible>(false));
+        assessment
+    }
+
+    /// [`Self::of`], where `same_change(reviewed, head)` says whether the pull
+    /// request's own change is the same at the commit a bot last reviewed as at
+    /// the head (the head only merges the base in): the bot's review then
+    /// counts as current. It is asked only for a review that names a commit
+    /// other than the head; its error is the assessment's.
+    pub fn of_with<E>(
+        snapshot: &PrSnapshot,
+        settings: &PrReadinessSettings,
+        now: DateTime<Utc>,
+        same_change: &mut dyn FnMut(&str, &str) -> Result<bool, E>,
+    ) -> Result<Self, E> {
         let head_at = snapshot.status.head_committed_at.as_deref().and_then(parse_time);
         let sha = snapshot.status.head_sha.as_deref();
-        let bots = settings
-            .bots
-            .iter()
-            .filter_map(|configured| {
-                let bot = builtin_bot(&configured.name)?;
-                let standing = bot_standing(bot, snapshot, sha, head_at);
+        let mut bots = Vec::new();
+        for configured in &settings.bots {
+            let Some(bot) = builtin_bot(&configured.name) else { continue };
+            {
+                let standing = bot_standing(bot, snapshot, sha, head_at, same_change)?;
                 let overdue = head_at.is_none_or(|h| {
                     now.signed_duration_since(h)
                         >= chrono::Duration::minutes(configured.rerun_after_minutes as i64)
@@ -280,10 +294,10 @@ impl Assessment {
                     )
                     .filter_map(parse_time)
                     .max();
-                Some(BotReport { settings: configured.clone(), bot, standing, reviewed_at, overdue })
-            })
-            .collect();
-        Self {
+                bots.push(BotReport { settings: configured.clone(), bot, standing, reviewed_at, overdue });
+            }
+        }
+        Ok(Self {
             merged: snapshot.status.merged,
             draft: snapshot.status.draft,
             mergeable_state: snapshot.status.mergeable_state.clone(),
@@ -301,7 +315,7 @@ impl Assessment {
             ),
             read_at: now,
             answered_at: None,
-        }
+        })
     }
 
     /// Reviews up to `at` (the pull request's agent last took a turn then)
@@ -577,12 +591,13 @@ fn parse_time(text: &str) -> Option<DateTime<Utc>> {
 /// A bot's standing: the newest of its comments that says a score. It is
 /// for the current head when it names the head's SHA, or was written or
 /// edited after the head was committed (bots edit their summary in place).
-fn bot_standing(
+fn bot_standing<E>(
     bot: &ReviewBot,
     snapshot: &PrSnapshot,
     sha: Option<&str>,
     head_at: Option<DateTime<Utc>>,
-) -> BotStanding {
+    same_change: &mut dyn FnMut(&str, &str) -> Result<bool, E>,
+) -> Result<BotStanding, E> {
     // Where a bot keeps its summary varies: a comment of its own, or its own
     // section of the pull request's description, edited in place (Greptile).
     // A description carries no edit time of its own, so it counts only when
@@ -612,13 +627,48 @@ fn bot_standing(
         }
     };
     // A summary for the current head wins over an older one kept elsewhere.
-    candidates
-        .iter()
-        .rev()
-        .map(standing)
-        .find(|s| matches!(s, BotStanding::Current { .. }))
-        .or_else(|| candidates.last().map(standing))
-        .unwrap_or(BotStanding::Missing)
+    if let Some(current) =
+        candidates.iter().rev().map(standing).find(|s| matches!(s, BotStanding::Current { .. }))
+    {
+        return Ok(current);
+    }
+    let Some(last) = candidates.last() else { return Ok(BotStanding::Missing) };
+    let stale = standing(last);
+    // A head that only merges the base in is the commit the bot reviewed,
+    // as far as the review goes: Greptile does not review it again.
+    if let (BotStanding::Stale { last_score: Some(score) }, Some(head)) = (&stale, sha) {
+        if let Some(reviewed) = reviewed_commit(last.0) {
+            if !head.starts_with(reviewed) && !reviewed.starts_with(head) && same_change(reviewed, head)? {
+                return Ok(BotStanding::Current { score: *score });
+            }
+        }
+    }
+    Ok(stale)
+}
+
+/// The commit a summary says it last reviewed: the hex after `Last reviewed
+/// commit` (a `/commit/<sha>` link, else a bare SHA), at least 7 digits.
+fn reviewed_commit(text: &str) -> Option<&str> {
+    let lower = text.to_ascii_lowercase();
+    let at = lower.find("last reviewed commit")?;
+    let rest = &text[at..];
+    let rest = rest.lines().next().unwrap_or(rest);
+    let hex = |s: &str| -> bool { s.len() >= 7 && s.len() <= 40 && s.bytes().all(|b| b.is_ascii_hexdigit()) };
+    let token = |start: usize| -> &str {
+        let tail = &rest[start..];
+        let end = tail.find(|c: char| !c.is_ascii_hexdigit()).unwrap_or(tail.len());
+        &tail[..end]
+    };
+    if let Some(link) = rest.find("/commit/") {
+        let t = token(link + "/commit/".len());
+        if hex(t) {
+            return Some(t);
+        }
+    }
+    let after = &rest["last reviewed commit".len()..];
+    after
+        .split(|c: char| !c.is_ascii_hexdigit())
+        .find(|t| hex(t))
 }
 
 /// The comment says which commit it last reviewed (`Last reviewed commit:`).
@@ -1114,6 +1164,56 @@ Not safe.
         );
     }
 
+    /// ENG-3193: Greptile reviewed 6a3e22b9; the head only merges main in.
+    fn reviewed_6a3e22b9() -> PrSnapshot {
+        let mut snap = snap(status("blocked", "success"), vec![], vec![]);
+        snap.status.body = Some(DESCRIPTION.replace("abcdef1234567", "6a3e22b9aaaaaaaaaaaaaaaa").replace("2/5", "5/5"));
+        snap.status.head_sha = Some("0d555102bbbbbbbbbbbb".into());
+        snap
+    }
+
+    #[test]
+    fn a_head_that_only_merges_the_base_in_is_covered_by_the_bots_review() {
+        let mut asked = Vec::new();
+        let a = Assessment::of_with(&reviewed_6a3e22b9(), &greptile_settings(), now(), &mut |reviewed, head| {
+            asked.push((reviewed.to_string(), head.to_string()));
+            Ok::<_, String>(true)
+        })
+        .unwrap();
+        assert_eq!(asked, vec![("6a3e22b9aaaaaaaaaaaaaaaa".to_string(), "0d555102bbbbbbbbbbbb".to_string())]);
+        assert_eq!(a.bots[0].standing, BotStanding::Current { score: 5 });
+        assert!(!a.work().iter().any(|w| matches!(w, Work::BotReviewMissing { .. })));
+        // The score of the reviewed commit is the one used.
+        let mut low = reviewed_6a3e22b9();
+        low.status.body = low.status.body.map(|b| b.replace("5/5", "2/5"));
+        let a = Assessment::of_with(&low, &greptile_settings(), now(), &mut |_, _| Ok::<_, String>(true)).unwrap();
+        assert_eq!(a.bots[0].standing, BotStanding::Current { score: 2 });
+    }
+
+    #[test]
+    fn a_head_with_a_real_new_change_is_not_covered() {
+        let a = Assessment::of_with(&reviewed_6a3e22b9(), &greptile_settings(), now(), &mut |_, _| Ok::<_, String>(false))
+            .unwrap();
+        assert_eq!(a.bots[0].standing, BotStanding::Stale { last_score: Some(5) });
+        assert!(a.work().iter().any(|w| matches!(w, Work::BotReviewMissing { .. })));
+    }
+
+    #[test]
+    fn a_comparison_that_cannot_be_made_is_the_assessments_error() {
+        let err = Assessment::of_with(&reviewed_6a3e22b9(), &greptile_settings(), now(), &mut |_, _| {
+            Err::<bool, _>("GitHub is unavailable (HTTP 503)".to_string())
+        })
+        .unwrap_err();
+        assert!(err.contains("503"));
+    }
+
+    #[test]
+    fn the_reviewed_commit_is_read_from_a_link_or_bare() {
+        assert_eq!(reviewed_commit(DESCRIPTION.split("Last").nth(1).map(|_| &DESCRIPTION[DESCRIPTION.find("Last").unwrap()..]).unwrap()), Some("abcdef1234567"));
+        assert_eq!(reviewed_commit("x\nLast reviewed commit: abcdef1"), Some("abcdef1"));
+        assert_eq!(reviewed_commit("no commit here"), None);
+    }
+
     #[test]
     fn an_edited_summary_naming_another_commit_is_stale() {
         let s = snap(
@@ -1268,6 +1368,18 @@ pub trait PrFeed: Send + Sync {
     fn changed_files(&self, _pr: &tod_store::github::NodePr) -> Result<Vec<tod_store::github::PrFile>, String> {
         Err("this feed does not read changed files".to_string())
     }
+    /// Whether the pull request's own change against `base` is the same at
+    /// `reviewed` as at `head` (`head` only merges the base in), so a review
+    /// of `reviewed` still covers `head`. `Err` when that cannot be told.
+    fn same_change(
+        &self,
+        _pr: &tod_store::github::NodePr,
+        _base: &str,
+        _reviewed: &str,
+        _head: &str,
+    ) -> Result<bool, String> {
+        Err("this feed does not compare commits".to_string())
+    }
     /// Post tod's own code review of `post.commit_id` (`crate::pr_draft_review`).
     fn post_review(&self, _pr: &tod_store::github::NodePr, _post: &ReviewPost) -> Result<(), String> {
         Err("this feed does not post reviews".to_string())
@@ -1308,6 +1420,33 @@ impl PrFeed for GithubFeed {
 
     fn changed_files(&self, pr: &tod_store::github::NodePr) -> Result<Vec<tod_store::github::PrFile>, String> {
         self.0.list_pr_files(&pr.owner, &pr.repo, pr.pr_number).map_err(|err| err.to_string())
+    }
+
+    fn same_change(
+        &self,
+        pr: &tod_store::github::NodePr,
+        base: &str,
+        reviewed: &str,
+        head: &str,
+    ) -> Result<bool, String> {
+        // Both commits are immutable, and so is whether the change between
+        // them is the same: asked once.
+        static ANSWERS: std::sync::Mutex<Option<std::collections::HashMap<String, bool>>> = std::sync::Mutex::new(None);
+        let key = format!("{}/{}|{base}|{reviewed}|{head}", pr.owner, pr.repo);
+        if let Some(known) = ANSWERS.lock().unwrap().as_ref().and_then(|m| m.get(&key)) {
+            return Ok(*known);
+        }
+        let same = self
+            .0
+            .same_change(&pr.owner, &pr.repo, base, reviewed, head)
+            .map_err(|err| format!("comparing {reviewed} with {head} to see whether the bot's review still covers the head: {err}"))?;
+        let mut answers = ANSWERS.lock().unwrap();
+        let map = answers.get_or_insert_with(Default::default);
+        if map.len() > 512 {
+            map.clear();
+        }
+        map.insert(key, same);
+        Ok(same)
     }
 
     fn post_review(&self, pr: &tod_store::github::NodePr, post: &ReviewPost) -> Result<(), String> {
@@ -1456,7 +1595,14 @@ pub fn live_answered(
     prs.iter()
         .map(|pr| {
             let snapshot = feed.snapshot(pr).map_err(|err| format!("{}: {err}", pr.url))?;
-            let assessment = Assessment::of(&snapshot, settings, now).answered_through(answered_at);
+            let base = snapshot.status.base_ref.clone();
+            let assessment = Assessment::of_with(&snapshot, settings, now, &mut |reviewed, head| {
+                let base = base.as_deref().ok_or_else(|| {
+                    format!("{}: the base branch is unknown, so the bot's review of {reviewed} cannot be compared with head {head}", pr.url)
+                })?;
+                feed.same_change(pr, base, reviewed, head).map_err(|err| format!("{}: {err}", pr.url))
+            })?
+            .answered_through(answered_at);
             let mut open: Vec<&str> = assessment.open_threads.iter().map(|t| t.id.as_str()).collect();
             open.sort_unstable();
             let fingerprint = format!(

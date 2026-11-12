@@ -31,6 +31,16 @@ turns, findings, run_state, node_timeline, journey records):
 
 ---
 
+## 2026-11-12: bot review of a merge-only head
+
+### The PR agent asks a review bot four times for a review it will never give, then stops
+
+- **Seen**: 1 node confirmed (ENG-3193, Cofactr/flagship#6663), the same shape suspected on ENG-2927 (#6640) and nodes waiting on `bot-review:greptile`, 2026-11-12. About 5 hours lost, then a request to the user ("Check why Greptile is not answering review requests").
+- **Symptom**: Greptile last reviewed 6a3e22b9; the head, 0d555102, differs only by merges of main. The agent asked "@greptileai please review." 4 times with no reply and gave up.
+- **Cause**: `bot_standing` called a review current only when it named the head or was written after it. Greptile does not review a head whose own change is unchanged, so merging the base in (which the babysitter itself does when behind) made the review stale for good: `Work::BotReviewMissing` every `rerun_after_minutes`, and the `pr-approved.review-current` criterion failing.
+- **Fix**: `Assessment::of_with` asks `PrFeed::same_change` when a bot's summary names another commit; `Github::same_change` compares per-file added/removed lines of `base...reviewed` and `base...head`. Same change means current, with the reviewed commit's score; a comparison that cannot be made is an error, not a fallback. Regression tests in `pr_readiness` (reviewed 6a3e22b9, head merge-only) and `change_equal_tests`. See `doc/lifecycle/pr-readiness.md`.
+- **Measure**: count of `BotReviewMissing` sends per head whose change equals the last reviewed commit's; and PRs where a bot's review is older than the head and the head's own diff is unchanged.
+
 ## 2026-11-12: slow replacement
 
 ### Replacing a sandbox spends ten minutes copying session logs
