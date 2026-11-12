@@ -389,8 +389,11 @@ from Blaxel.
   itself in `verifying` (`settled::verify_may_retag`, only that, only later); that move does not
   count as a plan change (`lifecycle_validity`); the Verify loop requires a plan step of that phase
   for a requirement moved there (`untraced_for_later_phase`); verify.md and verifying.md give the
-  rule; autonomous-session.md's real bad example names it a tod bug. No keyword check was added:
-  wording does not decide the phase.
+  rule; autonomous-session.md's real bad example names it a bug in the app. No keyword check was
+  added: wording does not decide the phase. Hardened after review: the retag is limited to the
+  conversation's own node, needs a `--reason` kept in the change set, is refused for an obligation
+  with a `failed` verdict or a `failed` carrying step, and the trace check covers constraints and
+  needs a step of that phase or later.
 - **Measure**: `decisions` from a `verification` protocol whose evidence is an obligation acting in
   `merged`/`released`/`design` or about production; obligations moved by a verification conversation
   with no later-phase step; nodes sent back from `verifying` for an acts-in change.

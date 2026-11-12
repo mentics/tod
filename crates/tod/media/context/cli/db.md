@@ -41,7 +41,7 @@ file, or pass them as arguments.
 It needs the user's machine to be on, with the app running. When it is not
 connected for a moment (the orchestrator restarted, a network gap), `db` waits
 and asks again by itself, for a few minutes: do not retry it yourself. If it
-still fails with "has not been connected", that is a failure of tod's own
+still fails with "has not been connected", that is a failure of the app's own
 connection, not something to ask the user about: stop and report it as a
 failure with the error. Only an expired AWS session of the user's is theirs to
 fix; `db` says so, and then you record what you need from the database as a

@@ -19,7 +19,9 @@ use super::repo::ConversationRepo;
 use super::types::{EntitySnapshot, ProtocolKind};
 use crate::interview::InterviewRepo;
 use crate::outline::OutlineMutation;
-use crate::outline::repos::{NodeRepo, ObligationRepo};
+use crate::outline::repos::plan_steps::STATUS_FAILED;
+use crate::outline::repos::{NodeRepo, ObligationRepo, PlanStepRepo};
+use crate::verification::VerdictRepo;
 use crate::outline::{ACTS_IN_MERGED, ACTS_IN_RELEASED};
 use crate::settings::VALID_LIFECYCLE_STATES;
 use anyhow::{Result, bail};
@@ -49,22 +51,39 @@ pub fn check_conversation_agent(
     if user_directed(conversation.protocol) {
         return Ok(());
     }
-    if conversation.protocol == ProtocolKind::Verification && verify_may_retag(conn, mutation)? {
-        return Ok(());
+    if conversation.protocol == ProtocolKind::Verification {
+        let own_node = match conversation.focus {
+            super::types::Focus::Node(id) => Some(id),
+            _ => None,
+        };
+        if verify_may_retag(conn, own_node, mutation)? {
+            return Ok(());
+        }
     }
     check_agent(conn, mutation)
 }
 
 /// Whether `mutation` is the one change a verification agent may make to the
-/// obligations of its node in `verifying`: moving an obligation to act in
-/// `merged` or `released`, a later state than where it acts now, because the
-/// obligation can only be shown true there (after the merge, a deploy, or a
-/// run on production). The obligation's text is untouched and nothing moves
-/// earlier, so the user's spec is unchanged; only who checks it, and when.
-fn verify_may_retag(conn: &Connection, mutation: &OutlineMutation) -> Result<bool> {
+/// obligations of its own node (`own_node`) in `verifying`: moving an
+/// obligation to act in `merged` or `released`, a later state than where it
+/// acts now, because the obligation can only be shown true there (after the
+/// merge, a deploy, or a run on production). The obligation's text is
+/// untouched and nothing moves earlier, so the user's spec is unchanged; only
+/// who checks it, and when.
+///
+/// It needs a `reason`, kept with the change in the change set, and it is
+/// refused (an error that says why, not the generic one) for an obligation
+/// that already has a `failed` verdict or that a `failed` plan step carries:
+/// a recorded failure stays a failure, so a move cannot hide one.
+fn verify_may_retag(
+    conn: &Connection,
+    own_node: Option<Uuid>,
+    mutation: &OutlineMutation,
+) -> Result<bool> {
     let OutlineMutation::UpdateObligationActsIn {
         obligation_id,
         acts_in,
+        reason,
     } = mutation
     else {
         return Ok(false);
@@ -75,13 +94,41 @@ fn verify_may_retag(conn: &Connection, mutation: &OutlineMutation) -> Result<boo
     let Some(obligation) = ObligationRepo::new(conn).get(*obligation_id)? else {
         return Ok(false);
     };
+    if own_node != Some(obligation.node_id) {
+        return Ok(false);
+    }
     let rank = |s: &str| VALID_LIFECYCLE_STATES.iter().position(|v| *v == s);
     let (Some(from), Some(to)) = (rank(&obligation.acts_in), rank(acts_in)) else {
         return Ok(false);
     };
     let in_verifying =
         NodeRepo::new(conn).get_lifecycle(obligation.node_id)?.as_deref() == Some("verifying");
-    Ok(in_verifying && from < to)
+    if !in_verifying || from >= to {
+        return Ok(false);
+    }
+    if reason.as_deref().map(str::trim).unwrap_or_default().is_empty() {
+        bail!(
+            "refused: moving an obligation to `{acts_in}` needs a reason, kept with the change: \
+            why nothing in the checkout can show it true. Pass `--reason <TEXT>`."
+        );
+    }
+    let failed_verdict = VerdictRepo::new(conn)
+        .latest_for_node(obligation.node_id)?
+        .get(&obligation.id)
+        .is_some_and(|v| v.is_failed());
+    let plan = PlanStepRepo::new(conn);
+    let mut failed_step = false;
+    for step in plan.list_steps_for_obligation(obligation.id)? {
+        failed_step |= plan.get(step)?.is_some_and(|s| s.status == STATUS_FAILED);
+    }
+    if failed_verdict || failed_step {
+        bail!(
+            "refused: this obligation already failed verification (a `failed` verdict or a \
+            `failed` plan step that carries it), and a recorded failure stays a failure: it \
+            is not moved to a later phase. Leave it `failed`; implementation fixes it."
+        );
+    }
+    Ok(true)
 }
 
 /// Refuse `mutation`, written by an agent, when it changes an obligation of
@@ -182,8 +229,10 @@ mod tests {
     use crate::fleet::schema;
     use crate::interview::{ACTOR_AGENT, ACTOR_USER, InterviewCommand, execute};
     use crate::outline::OutlineMutation;
-    use crate::outline::repos::{NodeRepo, ObligationRepo};
+    use crate::outline::repos::plan_steps::STATUS_FAILED;
+    use crate::outline::repos::{NodeRepo, ObligationRepo, PlanStepRepo};
     use crate::outline::types::Capability;
+    use crate::verification::VerdictRepo;
     use rusqlite::Connection;
     use std::path::{Path, PathBuf};
     use uuid::Uuid;
@@ -279,6 +328,7 @@ mod tests {
             OutlineMutation::UpdateObligationActsIn {
                 obligation_id: fx.obligation,
                 acts_in: "verifying".into(),
+                reason: None,
             },
             OutlineMutation::MoveObligation {
                 obligation_id: fx.obligation,
@@ -376,6 +426,7 @@ mod tests {
         OutlineMutation::UpdateObligationActsIn {
             obligation_id: fx.obligation,
             acts_in: acts_in.into(),
+            reason: Some("Needs production data: no checkout can show it.".into()),
         }
     }
 
@@ -431,6 +482,95 @@ mod tests {
             let verify = conversation(&fx, ProtocolKind::Verification);
             assert_refused(state, outline(&fx, &verify, retag(&fx, "released")).unwrap_err());
         }
+    }
+
+    /// A verification agent changes only the obligations of the node it was
+    /// started on.
+    #[test]
+    fn a_verification_agent_may_not_move_another_nodes_obligation() {
+        let fx = setup("verifying");
+        NodeRepo::new(&fx.conn).set_lifecycle(fx.other, "verifying").unwrap();
+        let theirs = Uuid::new_v4();
+        ObligationRepo::new(&fx.conn)
+            .insert_at(theirs, fx.other, "requirement", 0, None, "Other", "requirements")
+            .unwrap();
+        let verify = conversation(&fx, ProtocolKind::Verification);
+        let err = outline(
+            &fx,
+            &verify,
+            OutlineMutation::UpdateObligationActsIn {
+                obligation_id: theirs,
+                acts_in: "released".into(),
+                reason: Some("Looks late.".into()),
+            },
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("node m is in `verifying`"), "{err:#}");
+        assert_eq!(
+            ObligationRepo::new(&fx.conn).get(theirs).unwrap().unwrap().acts_in,
+            "active"
+        );
+    }
+
+    #[test]
+    fn a_retag_needs_a_reason() {
+        let fx = setup("verifying");
+        let verify = conversation(&fx, ProtocolKind::Verification);
+        for reason in [None, Some("  ".to_string())] {
+            let err = outline(
+                &fx,
+                &verify,
+                OutlineMutation::UpdateObligationActsIn {
+                    obligation_id: fx.obligation,
+                    acts_in: "released".into(),
+                    reason,
+                },
+            )
+            .unwrap_err();
+            assert!(format!("{err:#}").contains("needs a reason"), "{err:#}");
+        }
+        assert_eq!(acts_in(&fx), "active");
+    }
+
+    /// The reason is kept with the change, in the change set.
+    #[test]
+    fn the_reason_is_recorded_with_the_change() {
+        let fx = setup("verifying");
+        let verify = conversation(&fx, ProtocolKind::Verification);
+        outline(&fx, &verify, retag(&fx, "released")).unwrap();
+        let stored: String = fx
+            .conn
+            .query_row(
+                "SELECT mutation FROM conversation_actions WHERE kind = 'edit' ORDER BY id DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(stored.contains("no checkout can show it"), "{stored}");
+    }
+
+    /// A recorded failure stays a failure: not moved to a later phase to
+    /// hide it.
+    #[test]
+    fn a_failed_obligation_is_not_moved_to_a_later_phase() {
+        let fx = setup("verifying");
+        let verify = conversation(&fx, ProtocolKind::Verification);
+        VerdictRepo::new(&fx.conn)
+            .record(fx.node, fx.obligation, None, "failed", "Ran it: panics.")
+            .unwrap();
+        let err = outline(&fx, &verify, retag(&fx, "released")).unwrap_err();
+        assert!(format!("{err:#}").contains("stays a failure"), "{err:#}");
+        // Neither does a failed step that carries it.
+        let fx = setup("verifying");
+        let verify = conversation(&fx, ProtocolKind::Verification);
+        let step = Uuid::new_v4();
+        let steps = PlanStepRepo::new(&fx.conn);
+        steps.insert_at(step, fx.node, 0, "Export it").unwrap();
+        steps.link_obligation(step, fx.obligation).unwrap();
+        steps.update_status(step, STATUS_FAILED, Some("Empty file."), None).unwrap();
+        let err = outline(&fx, &verify, retag(&fx, "released")).unwrap_err();
+        assert!(format!("{err:#}").contains("stays a failure"), "{err:#}");
+        assert_eq!(acts_in(&fx), "active");
     }
 
     #[test]

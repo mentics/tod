@@ -68,11 +68,16 @@ checkout can exercise it. That is a **phase mistake in the app's own data, not a
 question for the user and not a failure of the work**. Fix it yourself and
 carry on:
 
-1. Move it: `obligations update <id> --acts-in released` (a run or
-   measurement against production data or the live system) or
-   `--acts-in merged` (must be in place before the deploy). The app allows
-   this change from here, and only this one: later states only, never the
-   text, never earlier. It is recorded, and the user can reverse it.
+1. Move it: `obligations update <id> --acts-in released --reason <TEXT>` (a
+   run or measurement against production data or the live system) or
+   `--acts-in merged` (must be in place before the deploy). The reason is
+   required: why nothing in this checkout can show it true. The app allows
+   this change from here, for an obligation of this task only, and only this
+   one: later states only, never the text, never earlier. It is recorded with
+   your reason, and the user can reverse it. It is refused for an obligation
+   that already has a `failed` verdict or that a `failed` plan step carries:
+   a recorded failure stays a failure, so rule on those and never move them
+   to hide one.
 2. Give it a plan step of that phase if none satisfies it: `plan add
    --phase <same phase> --satisfies <id>`, an action the phase takes (run the
    cleanup asset on production, take the measurement), never a check.

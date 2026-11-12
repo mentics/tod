@@ -88,6 +88,7 @@ pub fn inverse(action: &ActionRow) -> Result<Vec<OutlineMutation>> {
                 M::UpdateObligationActsIn { .. } => M::UpdateObligationActsIn {
                     obligation_id: id,
                     acts_in,
+                    reason: None,
                 },
                 _ => M::UpdateObligationVisualDesign {
                     obligation_id: id,

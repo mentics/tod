@@ -273,23 +273,31 @@ fn stranded_failures<'a>(
         .collect()
 }
 
-/// Requirements that act in `merged` or `released` and that no plan step
-/// satisfies. That phase's agent works from steps, and the planning trace
-/// gate is long past: a requirement verification moved to a later phase
+/// Obligations (of any kind a plan step delivers, `needs_plan_step`) that
+/// act in `merged` or `released` and that no plan step of that phase or a
+/// later one satisfies. That phase's agent works from steps, and the planning
+/// trace gate is long past: an obligation verification moved to a later phase
 /// (it can only be shown true there) must leave a step of that phase that
-/// delivers it, or nothing would ever take the action.
+/// delivers it, or nothing would ever take the action. A step of an earlier
+/// phase does not count: it runs before the thing it must follow.
 fn untraced_for_later_phase<'a>(
     standings: &'a [ObligationStanding],
     steps: &[PlanStepWithLinks],
 ) -> Vec<&'a ObligationStanding> {
+    use tod_store::outline::repos::plan_steps::due_by;
     standings
         .iter()
-        .filter(|s| s.obligation.kind == "requirement")
+        .filter(|s| s.obligation.needs_plan_step())
         .filter(|s| {
             s.obligation.acts_in == tod_store::outline::ACTS_IN_MERGED
                 || s.obligation.acts_in == tod_store::outline::ACTS_IN_RELEASED
         })
-        .filter(|s| !steps.iter().any(|l| l.satisfies.contains(&s.obligation.id)))
+        .filter(|s| {
+            !steps.iter().any(|l| {
+                l.satisfies.contains(&s.obligation.id)
+                    && due_by(&s.obligation.acts_in, &l.step.phase)
+            })
+        })
         .collect()
 }
 
@@ -672,6 +680,7 @@ mod tests {
             .enqueue_outline(OutlineMutation::UpdateObligationActsIn {
                 obligation_id: cleanup,
                 acts_in: "released".into(),
+                reason: None,
             })
             .unwrap();
         fx.fleet.writer().flush().unwrap();
@@ -683,6 +692,34 @@ mod tests {
         assert!(message.contains("Do not ask the user"), "{message}");
         assert!(!message.contains("no verdict"), "{message}");
         assert_eq!(reason, "1 later-phase obligation(s) with no plan step");
+        // A step of an earlier phase does not deliver it.
+        fx.fleet
+            .enqueue_outline(OutlineMutation::CreatePlanStep {
+                step_id: None,
+                node_id: fx.node,
+                after_id: None,
+                before: false,
+                body: "Write the cleanup asset".into(),
+            })
+            .unwrap();
+        fx.fleet.writer().flush().unwrap();
+        let early = *step_ids(&fx).last().unwrap();
+        fx.fleet
+            .enqueue_outline(OutlineMutation::UpdatePlanStepStatus {
+                step_id: early,
+                status: STATUS_VERIFIED.into(),
+                note: None,
+                reason: None,
+            })
+            .unwrap();
+        fx.fleet
+            .enqueue_outline(OutlineMutation::LinkPlanStepObligation {
+                step_id: early,
+                obligation_id: cleanup,
+            })
+            .unwrap();
+        fx.fleet.writer().flush().unwrap();
+        assert!(matches!(decide(&fx, true, 0, true), Next::Continue { .. }));
         // The step that delivers it: of that phase, satisfying it.
         fx.fleet
             .enqueue_outline(OutlineMutation::CreatePlanStep {
@@ -703,6 +740,50 @@ mod tests {
             OutlineMutation::LinkPlanStepObligation {
                 step_id: added,
                 obligation_id: cleanup,
+            },
+        ] {
+            fx.fleet.enqueue_outline(mutation).unwrap();
+        }
+        fx.fleet.writer().flush().unwrap();
+        assert!(matches!(decide(&fx, true, 0, true), Next::Done(Stop::Complete)));
+    }
+
+    /// A constraint verification moved to a later phase needs a step too
+    /// (`needs_plan_step`), and a `merged` one accepts a `released` step.
+    #[test]
+    fn a_constraint_moved_to_a_later_phase_needs_a_step_too() {
+        let fx = planned(&[STATUS_VERIFIED]);
+        let id = Uuid::new_v4();
+        for mutation in [
+            OutlineMutation::CreateObligation {
+                obligation_id: Some(id),
+                node_id: fx.node,
+                kind: "constraint".into(),
+                after_id: None,
+                before: false,
+                section: None,
+                body: "Prod keeps no dangling rows".into(),
+                phase: "design".into(),
+            },
+            OutlineMutation::UpdateObligationActsIn {
+                obligation_id: id,
+                acts_in: "merged".into(),
+                reason: None,
+            },
+        ] {
+            fx.fleet.enqueue_outline(mutation).unwrap();
+        }
+        fx.fleet.writer().flush().unwrap();
+        assert!(matches!(decide(&fx, true, 0, true), Next::Continue { .. }));
+        let step = step_ids(&fx)[0];
+        for mutation in [
+            OutlineMutation::SetPlanStepPhase {
+                step_id: step,
+                phase: "released".into(),
+            },
+            OutlineMutation::LinkPlanStepObligation {
+                step_id: step,
+                obligation_id: id,
             },
         ] {
             fx.fleet.enqueue_outline(mutation).unwrap();

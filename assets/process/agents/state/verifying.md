@@ -35,7 +35,7 @@ Re-exercise in **running context** as needed for the full sweep (prefer automate
 
 ### An obligation in the wrong phase
 
-An obligation that acts in `merged`, `released` or `design` is not ruled on here. If one that does not act there is really about production after the release (a measurement after rollout, a query over production data after a cleanup run), move it yourself with `obligations update --acts-in released` (or `merged`; the app lets verification make this one change past `planning`) and give it a plan step of that phase if none satisfies it. It is a phase mistake in the app's data: never a failure of the work, never a verdict on a proxy, never a question to the user.
+An obligation that acts in `merged`, `released` or `design` is not ruled on here. If one that does not act there is really about production after the release (a measurement after rollout, a query over production data after a cleanup run), move it yourself with `obligations update --acts-in released --reason <why nothing here can show it true>` (or `merged`; only this task's own obligations, never one with a `failed` verdict or a `failed` step; the app lets verification make this one change past `planning`) and give it a plan step of that phase if none satisfies it. It is a phase mistake in the app's data: never a failure of the work, never a verdict on a proxy, never a question to the user.
 
 ### Test strategy
 
