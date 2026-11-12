@@ -344,3 +344,29 @@ from Blaxel.
 - An unreadable `/proc/<pid>/cmdline` is skipped silently; a process that exits between the
   scan and the kill reads as "could not stop"; an unreaped zombie reads as still running;
   `python -u -m uvicorn` or `node --max-old-space-size 4096 vite` do not match.
+
+### `tod-cli db`: "owning machine not connected" while the machine was on
+
+- **Seen**: ENG node 5631A571 (clean-up-dangling-manufacturer-stateme-2), verify agent in its
+  sandbox, 2026-11-10 ~06:26Z (decision filed 1794291962980): "prod-kb was unreachable ...
+  (tod-cli db: owning machine not connected)", then asked the user. Also node 8f80f1e0 on
+  2026-11-06 (`... which is not connected` mid-`psql`).
+- **Symptom**: the agent stops and asks the user about access plumbing although the app and
+  `tod-agentd` were running.
+- **Cause**: not a stale pin: the node's `owner_client` (`app-1597fe1579e4`) is the live data
+  root's client id (`cloud-sync.json`). The orchestrator keeps `seen` (when each machine last
+  polled) in memory only, and refused a request **at once** when the owner had not polled in
+  the last 46 s. That window opens whenever the poll is away: an orchestrator redeploy or wake
+  (`seen` is empty), the daemon's poll timing out (`orchestrator broker: timeout: global`,
+  logged every ~16 min in `daemon/agentd.log`, e.g. 2026-11-10T05:44:42Z, just before 25
+  sandboxes were replaced at 05:47) and retrying 2 s + 4 s, or a 502 outage. A request landing
+  there got the error, and `tod-cli db` neither waited nor retried, and its docs told the agent
+  to hand the user a request.
+- **Fix**: the broker holds a request for an owner that is not connected for 60 s
+  (`NOT_CONNECTED_GRACE`) before failing, so the daemon's next poll takes it; the failure is
+  `retryable`, names the cause and says it is tod's to repair; `tod-cli db` asks again 3 more
+  times (10 s apart), then fails with an error that says to report a failure, not ask the user;
+  `cli/db.md` no longer tells the agent to file a request for this. Needs the orchestrator
+  redeployed (the grace) and `tod-cli` rebuilt/installed into sandboxes (the retry).
+- **Measure**: `db` errors containing "has not been connected" per week (target 0); requests
+  that waited in the broker for a reconnect.

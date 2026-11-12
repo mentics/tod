@@ -30,6 +30,13 @@ use std::time::{Duration, Instant};
 /// client's poll length and retries are named with it in `tod_store::sync`.
 const CONNECTED_FOR: Duration = Duration::from_secs(tod_store::sync::BROKER_CONNECTED_SECS);
 const MAX_WAIT_SECS: u64 = 30;
+/// How long a request waits for a machine that is not connected right now
+/// before it fails. The machine's poll is gone for a while whenever this
+/// orchestrator was redeployed or woke from standby (`seen` is in memory) or
+/// the poll was mid-retry; the daemon is back within its connected window
+/// plus a retry pause, so a request that arrives in that gap is held, not
+/// refused. Longer than `CONNECTED_FOR`, shorter than `ANSWER_WITHIN`.
+const NOT_CONNECTED_GRACE: Duration = Duration::from_secs(60);
 /// How long a sandbox's request waits for its answer. A login can need a
 /// tunnel to be opened first.
 const ANSWER_WITHIN: Duration = Duration::from_secs(90);
@@ -85,42 +92,61 @@ impl State {
 
     /// The error for request `id` when every connected machine has said the
     /// node is not theirs.
-    fn nobody_claimed(&self, user: &str, id: u64) -> Option<String> {
+    /// `waited_out`: the request has waited [`NOT_CONNECTED_GRACE`], so a
+    /// machine that is still not connected is the answer. The `bool` is
+    /// whether the caller may retry (the machine may yet connect).
+    fn nobody_claimed(&self, user: &str, id: u64, waited_out: bool) -> Option<(String, bool)> {
         let q = self.queued.get(user)?.iter().find(|q| q.id == id)?;
         if let Some(pinned) = &q.pinned {
             let live = self.seen.get(user).and_then(|m| m.get(pinned)).is_some_and(|at| at.elapsed() < CONNECTED_FOR);
             return if q.declined.contains(pinned) {
-                Some(format!(
+                Some((format!(
                     "node {} is recorded as belonging to machine {pinned}, which says it does not know it: \
                      the node's record is stale; start it again (Start in its task panel) from the data root it belongs to",
                     q.node
-                ))
-            } else if !live {
-                Some(format!(
-                    "node {} belongs to machine {pinned} (the tod data root that sent it to the cloud), which is not connected: \
-                     it must be on, with tod running (the tod-agentd daemon), to answer this",
-                    q.node
-                ))
+                ), false))
+            } else if !live && waited_out {
+                Some((not_connected(&q.node, Some(pinned)), true))
             } else {
                 None
             };
         }
         let connected = self.connected(user);
+        if connected.is_empty() && waited_out {
+            return Some((not_connected(&q.node, None), true));
+        }
         if connected.is_empty() || !connected.iter().all(|m| q.declined.contains(*m)) {
             return None;
         }
         let n = connected.len();
-        Some(format!(
+        Some((format!(
             "no machine owns node {}: not a cloud node that any of the user's connected machines knows: asked {n} machine{} \
              and none claimed it (each machine is a tod app with its own data root; the node belongs to a data root that is not running, or is not running its daemon)",
             q.node,
             if n == 1 { "" } else { "s" }
-        ))
+        ), false))
     }
+}
+
+/// The error for a machine that stayed away for the whole grace. It names
+/// the cause and what tod does, so no agent has to ask the user about it.
+fn not_connected(node: &str, owner: Option<&str>) -> String {
+    let who = match owner {
+        Some(m) => format!("node {node} belongs to machine {m} (the tod data root that sent it to the cloud). That machine"),
+        None => format!("The user's machine for node {node}"),
+    };
+    format!(
+        "{who} has not been connected to the orchestrator for the last {} s. This is tod's to repair, not the user's: its \
+         tod-agentd daemon reconnects by itself (usually within a minute of an orchestrator restart or a network gap), and it \
+         is down only if the machine is off or tod is not running there",
+        NOT_CONNECTED_GRACE.as_secs()
+    )
 }
 
 #[derive(Default)]
 pub struct Broker {
+    /// [`NOT_CONNECTED_GRACE`] unless a test sets another.
+    grace: Option<Duration>,
     state: Mutex<State>,
     changed: Condvar,
 }
@@ -135,6 +161,11 @@ fn machine(request: &Request) -> String {
 }
 
 impl Broker {
+    #[cfg(test)]
+    fn with_grace(grace: Duration) -> Self {
+        Self { grace: Some(grace), ..Default::default() }
+    }
+
     /// `POST /users/<u>/broker/request`, for a node whose owner is not recorded.
     pub fn request(&self, user: &str, request: &Request) -> Response {
         self.request_owned(user, request, None)
@@ -151,22 +182,6 @@ impl Broker {
             Err(err) => return Response::text(400, format!("the request is not JSON: {err}")),
         };
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(owner) = owner {
-            let live = state.seen.get(user).and_then(|m| m.get(owner)).is_some_and(|at| at.elapsed() < CONNECTED_FOR);
-            if !live {
-                return json(
-                    503,
-                    serde_json::json!({"ok": false, "error": format!(
-                        "node {node} belongs to machine {owner} (the tod data root that sent it to the cloud), which is not connected: \
-                         it must be on, with tod running (the tod-agentd daemon), to answer this")}),
-                );
-            }
-        } else if state.connected(user).is_empty() {
-            return json(
-                503,
-                serde_json::json!({"ok": false, "error": "the user's machine is not connected: it must be on, with tod running (the tod-agentd daemon), to answer this"}),
-            );
-        }
         let queue = state.queued.entry(user.to_string()).or_default();
         if queue.len() >= MAX_QUEUED {
             return json(503, serde_json::json!({"ok": false, "error": "too many requests are waiting for the user's machine"}));
@@ -182,20 +197,27 @@ impl Broker {
             pinned: owner.map(str::to_string),
         });
         self.changed.notify_all();
-        let deadline = Instant::now() + ANSWER_WITHIN;
+        let started = Instant::now();
+        let deadline = started + ANSWER_WITHIN;
+        let grace = self.grace.unwrap_or(NOT_CONNECTED_GRACE);
         let response = loop {
             if let Some(answer) = state.answers.remove(&id) {
                 break Response { status: 200, content_type: "application/json", body: answer };
             }
-            if let Some(error) = state.nobody_claimed(user, id) {
-                break json(200, serde_json::json!({"ok": false, "error": error}));
+            let waited_out = started.elapsed() >= grace;
+            if let Some((error, retryable)) = state.nobody_claimed(user, id, waited_out) {
+                // 503 for a machine that is away; `retryable` tells the caller
+                // it may try again (tod-cli db does, within a bound).
+                let status = if retryable { 503 } else { 200 };
+                break json(status, serde_json::json!({"ok": false, "error": error, "retryable": retryable}));
             }
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
                 break json(504, serde_json::json!({"ok": false, "error": "the user's machine did not answer in time"}));
             }
             // Wake now and then: a machine that went away no longer counts.
-            state = self.changed.wait_timeout(state, left.min(Duration::from_secs(5))).unwrap_or_else(|e| e.into_inner()).0;
+            let tick = Duration::from_secs(5).min(grace.saturating_sub(started.elapsed()).max(Duration::from_millis(50)));
+            state = self.changed.wait_timeout(state, left.min(tick)).unwrap_or_else(|e| e.into_inner()).0;
         };
         // Nobody should answer it later.
         if let Some(queue) = state.queued.get_mut(user) {
@@ -317,11 +339,33 @@ mod tests {
     }
 
     #[test]
-    fn no_machine_polling_fails_at_once() {
-        let broker = Broker::default();
+    fn no_machine_polling_fails_after_the_grace_and_says_it_may_be_retried() {
+        let broker = Broker::with_grace(Duration::from_millis(100));
         let r = broker.request("u", &req(Some("n"), "{}", ""));
         assert_eq!(r.status, 503);
-        assert!(String::from_utf8_lossy(&r.body).contains("not connected"));
+        let v: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
+        assert_eq!(v["retryable"], true);
+        assert!(v["error"].as_str().unwrap().contains("not been connected"), "{v}");
+    }
+
+    #[test]
+    fn a_machine_that_reconnects_within_the_grace_gets_the_request() {
+        // The orchestrator was just redeployed (`seen` empty); the daemon's
+        // poll arrives a moment after the sandbox's request.
+        let broker = Arc::new(Broker::with_grace(Duration::from_secs(10)));
+        let b = {
+            let broker = broker.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(300));
+                let polled = broker.next("u", &req_from("b", None, "", "wait=5"));
+                let v: serde_json::Value = serde_json::from_slice(&polled.body).unwrap();
+                let id = v["id"].as_u64().expect("offered the request").to_string();
+                broker.reply("u", &id, &req_from("b", None, r#"{"ok":true}"#, ""));
+            })
+        };
+        let r = broker.request_owned("u", &req(Some("n1"), "{}", ""), Some("b"));
+        b.join().unwrap();
+        assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
     }
 
     #[test]
@@ -473,12 +517,12 @@ mod tests {
 
     #[test]
     fn a_recorded_owner_that_is_not_connected_is_named_not_replaced() {
-        let broker = Broker::default();
+        let broker = Broker::with_grace(Duration::from_millis(100));
         broker.next("u", &req_from("a", None, "", "wait=0"));
         let r = broker.request_owned("u", &req(Some("n1"), "{}", ""), Some("b"));
         assert_eq!(r.status, 503);
         let text = String::from_utf8_lossy(&r.body);
-        assert!(text.contains("belongs to machine b") && text.contains("not connected"), "{text}");
+        assert!(text.contains("belongs to machine b") && text.contains("not been connected"), "{text}");
     }
 
     #[test]
