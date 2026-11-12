@@ -37,13 +37,15 @@ configures one.
   the next run runs the check again.
   **In a sandbox, the first kill is retried once** (`checks::run_command`,
   `free_sandbox_memory`): tod stops the dev servers the workspace boot started (found by
-  command line: a node `vite`, a `runserver`, `uvicorn`/`gunicorn`; stopped by PID, TERM then
-  KILL, never `pkill`), drops the page cache, and runs the check again. The servers are
+  program and arguments, not text anywhere in the line: `python manage.py runserver`,
+  `python -m uvicorn`/`gunicorn`, node running vite but not vitest; a grep, tail or editor
+  never matches; stopped by PID, TERM then KILL, never `pkill`; a process is reported stopped
+  only once it is gone, and a kill that fails is an error), drops the page cache, and runs the check again. The servers are
   **left stopped** (not restarted: a restart would bring the memory pressure back for the
   next check; the sandbox is for checks and agents, not for browsing). If the second run
   also dies for memory, the check is broken as above and its output adds "killed for memory
-  twice" with what was stopped and the free MB before and after. A failure to free memory
-  is reported in that text, never hidden. A check outside a sandbox is never retried and
+  twice" with what was stopped and the free MB before and after. If freeing memory fails,
+  the check is not run again: the broken request carries the error. A check outside a sandbox is never retried and
   nothing on the user's machine is stopped.
 - **Freshness**: each run records a fingerprint of the files
   (`checks::fingerprint`: every repository's and submodule's `HEAD`, diff

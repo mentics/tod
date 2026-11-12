@@ -381,6 +381,8 @@ pub struct MemoryFreed {
     pub after_mb: Option<u64>,
     /// One line per process stopped (pid and command line).
     pub stopped: Vec<String>,
+    /// Anything that did not go as planned but did not stop the freeing.
+    pub notes: Vec<String>,
 }
 
 impl MemoryFreed {
@@ -391,40 +393,80 @@ impl MemoryFreed {
         } else {
             format!("stopped {}", self.stopped.join("; "))
         };
-        format!("{stopped}; free memory {} before, {} after (the page cache was dropped too)", mb(self.before_mb), mb(self.after_mb))
+        let notes = if self.notes.is_empty() { " (the page cache was dropped too)".to_string() } else { format!(" ({})", self.notes.join("; ")) };
+        format!("{stopped}; free memory {} before, {} after{notes}", mb(self.before_mb), mb(self.after_mb))
     }
 }
 
-/// The script that frees memory in a sandbox. It stops only the dev servers the
-/// workspace boot starts, each found by its own command line (a vite server, a
-/// Django `runserver`, a uvicorn or gunicorn API) and stopped by PID: TERM,
-/// then KILL for what is left. Its own processes are skipped by the marker in
-/// its text. It prints `@@tod-free-before MB`, `stopped <pid> <cmd>` and
-/// `@@tod-free-after MB`.
-const FREE_MEMORY_SCRIPT: &str = r#"exec 2>&1
-# tod-free-memory
-mem() { awk '/^MemAvailable:/{a=$2} END{print int(a/1024)}' /proc/meminfo; }
-echo "@@tod-free-before $(mem)"
-pids=""
-for d in /proc/[0-9]*; do
-  pid=${d#/proc/}
-  [ "$pid" = "$$" ] && continue
-  cmd=$(tr '\0' ' ' < "$d/cmdline" 2>/dev/null)
-  case "$cmd" in *tod-free-memory*) continue;; esac
-  case "$cmd" in
-    *node*/vite*|*node*vite\ *|*manage.py\ runserver*|*python*runserver*|*uvicorn*|*gunicorn*) ;;
-    *) continue;;
+/// Shell function: does the command line `$1` (words joined by spaces) belong
+/// to a dev server the workspace boot starts? Anchored on the program, never on
+/// text anywhere in the line: `python manage.py runserver`, `python -m uvicorn`
+/// or `-m gunicorn` (or a `gunicorn`/`uvicorn` program), and node running
+/// vite (`.../node_modules/.bin/vite`, `.../vite/bin/vite.js`, `vite`; vitest
+/// does not match). A `grep`, `tail`, `sh`, editor or agent never does.
+const DEV_SERVER_MATCH: &str = r#"dev_server_match() {
+  set -f
+  set -- $1
+  prog=${1##*/}
+  case "$prog" in
+    python|python[0-9]*)
+      case "$2" in
+        manage.py|*/manage.py) [ "$3" = runserver ]; return;;
+        -m) case "$3" in uvicorn|gunicorn) return 0;; esac; return 1;;
+        *) case "${2##*/}" in gunicorn|uvicorn) return 0;; esac; return 1;;
+      esac;;
+    node)
+      shift
+      while [ $# -gt 0 ]; do
+        case "$1" in -*) shift;; *) break;; esac
+      done
+      case "$1" in */node_modules/.bin/vite|*/vite/bin/vite.js|vite) return 0;; esac
+      return 1;;
+    gunicorn|uvicorn) return 0;;
   esac
-  echo "stopped $pid $(echo "$cmd" | cut -c1-120)"
-  pids="$pids $pid"
-done
-[ -n "$pids" ] && kill -TERM $pids 2>/dev/null
-sleep 3
-[ -n "$pids" ] && kill -KILL $pids 2>/dev/null
-sync
-(echo 3 > /proc/sys/vm/drop_caches) 2>/dev/null || echo "page cache not dropped: cannot write /proc/sys/vm/drop_caches"
-echo "@@tod-free-after $(mem)"
+  return 1
+}
 "#;
+
+/// The script that frees memory in a sandbox. It stops only the dev servers the
+/// workspace boot starts ([`DEV_SERVER_MATCH`]), by PID: TERM, then KILL for
+/// what is left, and reports a process as `stopped` only once it is gone and
+/// every kill that failed as `not-stopped`. It prints `@@tod-free-before MB`,
+/// `stopped <pid> <cmd>`, `not-stopped <pid> <why>`, `note <text>` and
+/// `@@tod-free-after MB`.
+fn free_memory_script() -> String {
+    format!(
+        r#"exec 2>&1
+{DEV_SERVER_MATCH}
+mem() {{ awk '/^MemAvailable:/{{a=$2}} END{{print int(a/1024)}}' /proc/meminfo; }}
+echo "@@tod-free-before $(mem)"
+found=""
+for d in /proc/[0-9]*; do
+  pid=${{d#/proc/}}
+  [ "$pid" = "$$" ] && continue
+  cmd=$(tr '\0' ' ' < "$d/cmdline" 2>/dev/null) || continue
+  dev_server_match "$cmd" || continue
+  found="$found$pid $(echo "$cmd" | cut -c1-120)
+"
+done
+sent=""
+printf '%s' "$found" | while read -r pid cmd; do
+  err=$(kill -TERM "$pid" 2>&1) || echo "not-stopped $pid: $err"
+done
+sleep 3
+printf '%s' "$found" | while read -r pid cmd; do
+  if [ -d "/proc/$pid" ]; then
+    err=$(kill -KILL "$pid" 2>&1) || echo "not-stopped $pid: $err"
+    sleep 1
+  fi
+  if [ -d "/proc/$pid" ]; then echo "not-stopped $pid: still running after KILL"; else echo "stopped $pid $cmd"; fi
+done
+sync
+err=$(sh -c 'echo 3 > /proc/sys/vm/drop_caches' 2>&1) || echo "note page cache not dropped: $err"
+echo "@@tod-free-after $(mem)"
+"#
+    )
+}
 
 fn parse_freed(out: &str) -> Result<MemoryFreed> {
     let number = |tag: &str| out.lines().find_map(|l| l.strip_prefix(tag)).and_then(|n| n.trim().parse::<u64>().ok());
@@ -433,8 +475,13 @@ fn parse_freed(out: &str) -> Result<MemoryFreed> {
     if after_mb.is_none() {
         anyhow::bail!("the memory-freeing script did not finish; its output: {}", tail(out.as_bytes()));
     }
+    let failed: Vec<&str> = out.lines().filter_map(|l| l.strip_prefix("not-stopped ")).collect();
+    if !failed.is_empty() {
+        anyhow::bail!("could not stop {}", failed.join("; "));
+    }
     let stopped = out.lines().filter_map(|l| l.strip_prefix("stopped ")).map(str::to_string).collect();
-    Ok(MemoryFreed { before_mb, after_mb, stopped })
+    let notes = out.lines().filter_map(|l| l.strip_prefix("note ")).map(str::to_string).collect();
+    Ok(MemoryFreed { before_mb, after_mb, stopped, notes })
 }
 
 /// Free memory in the sandbox `cwd` is in (stop its dev servers, drop the
@@ -443,7 +490,7 @@ pub fn free_sandbox_memory(cwd: &Workdir) -> Result<MemoryFreed> {
     if !matches!(cwd, Workdir::Sandbox { .. }) {
         anyhow::bail!("memory is freed only inside a sandbox");
     }
-    let o = cwd.output_within(Duration::from_secs(90), "sh", &["-c", FREE_MEMORY_SCRIPT])?;
+    let o = cwd.output_within(Duration::from_secs(90), "sh", &["-c", &free_memory_script()])?;
     parse_freed(&String::from_utf8_lossy(&o.stdout))
 }
 
@@ -465,7 +512,7 @@ fn run_command_with(cwd: &Workdir, run: &dyn Fn() -> (Verdict, String), free: &d
     }
     let note = match free(cwd) {
         Ok(f) => format!("tod freed memory and ran the check once more: {}.", f.describe()),
-        Err(err) => format!("tod tried to free memory and could not: {err:#}. It ran the check once more anyway."),
+        Err(err) => return (Verdict::Broken, format!("{out}\n\ntod tried to free memory to run the check again and could not, so it did not run it again: {err:#}")),
     };
     let (verdict2, out2) = run();
     if verdict2 == Verdict::Broken && out2.starts_with(KILLED_FOR_MEMORY) {
@@ -850,7 +897,7 @@ mod tests {
         };
         let free = |_: &Workdir| {
             frees.set(frees.get() + 1);
-            Ok(MemoryFreed { before_mb: Some(300), after_mb: Some(3500), stopped: vec!["7 node vite".to_string()] })
+            Ok(MemoryFreed { before_mb: Some(300), after_mb: Some(3500), stopped: vec!["7 node vite".to_string()], notes: vec![] })
         };
         assert_eq!(run_command_with(&cwd, &run, &free), (Verdict::Failed, "2 errors".to_string()));
         assert_eq!((runs.get(), frees.get()), (2, 1));
@@ -860,7 +907,7 @@ mod tests {
     fn a_sandbox_check_killed_twice_is_broken_and_says_what_was_freed() {
         let cwd = Workdir::sandbox("s", "/workspace");
         let run = || (Verdict::Broken, format!("{KILLED_FOR_MEMORY} (SIGKILL).\n\nKilled"));
-        let free = |_: &Workdir| Ok(MemoryFreed { before_mb: Some(300), after_mb: Some(3500), stopped: vec!["7 node vite".to_string()] });
+        let free = |_: &Workdir| Ok(MemoryFreed { before_mb: Some(300), after_mb: Some(3500), stopped: vec!["7 node vite".to_string()], notes: vec![] });
         let (verdict, out) = run_command_with(&cwd, &run, &free);
         assert_eq!(verdict, Verdict::Broken);
         assert!(out.starts_with(KILLED_FOR_MEMORY), "{out}");
@@ -869,8 +916,9 @@ mod tests {
         assert!(out.contains("300 MB before, 3500 MB after"), "{out}");
         // A failure to free is reported, not hidden.
         let bad = |_: &Workdir| Err(anyhow::anyhow!("relay down"));
-        let (_, out) = run_command_with(&cwd, &run, &bad);
-        assert!(out.contains("could not: relay down"), "{out}");
+        let (_, out) = run_command_with(&cwd, &|| (Verdict::Broken, format!("{KILLED_FOR_MEMORY} (SIGKILL).")), &bad);
+        assert!(out.starts_with(KILLED_FOR_MEMORY), "{out}");
+        assert!(out.contains("could not, so it did not run it again: relay down"), "{out}");
     }
 
     #[test]
@@ -892,6 +940,49 @@ mod tests {
         let f = parse_freed(ok).unwrap();
         assert_eq!((f.before_mb, f.after_mb, f.stopped.len()), (Some(300), Some(3500), 1));
         assert!(parse_freed("@@tod-free-before 300\nsh: boom\n").is_err());
+        let err = parse_freed("@@tod-free-before 1\nnot-stopped 9: Operation not permitted\n@@tod-free-after 1\n").unwrap_err();
+        assert!(format!("{err}").contains("could not stop 9: Operation not permitted"), "{err}");
+    }
+
+    fn dev_server(cmd: &str) -> bool {
+        let script = format!("{DEV_SERVER_MATCH}\ndev_server_match \"$1\"");
+        std::process::Command::new("sh").args(["-c", &script, "sh", cmd]).status().unwrap().success()
+    }
+
+    #[test]
+    fn the_freeing_script_is_valid_shell() {
+        let ok = std::process::Command::new("sh").args(["-n", "-c", &free_memory_script()]).status().unwrap();
+        assert!(ok.success());
+    }
+
+    #[test]
+    fn only_the_workspaces_dev_servers_match() {
+        for yes in [
+            "/workspace/flagship/.venv/bin/python manage.py runserver 0.0.0.0:9000",
+            "/workspace/kb/.venv/bin/python -m uvicorn app.main:app --host 0.0.0.0 --port 8051",
+            "/usr/bin/python3 -m gunicorn app:app",
+            "/workspace/kb/.venv/bin/gunicorn app:app -w 2",
+            "node /workspace/ui/node_modules/.bin/vite --host",
+            "/usr/local/bin/node --max-old-space-size=4096 /workspace/ui/node_modules/vite/bin/vite.js",
+        ] {
+            assert!(dev_server(yes), "should match: {yes}");
+        }
+        for no in [
+            "grep -r uvicorn /workspace",
+            "tail -f /var/log/uvicorn.log",
+            "node /workspace/ui/node_modules/.bin/vitest run",
+            "node /workspace/ui/node_modules/vitest/vitest.mjs run",
+            "sh -c python manage.py runserver",
+            "/workspace/flagship/.venv/bin/python manage.py migrate",
+            "/workspace/flagship/.venv/bin/python -m pytest -k uvicorn",
+            "python -m basedpyright",
+            "vim vite.config.ts",
+            "claude --resume x",
+            "/opt/tod/tod-relay --listen vite",
+            "",
+        ] {
+            assert!(!dev_server(no), "should not match: {no}");
+        }
     }
 
     #[test]
