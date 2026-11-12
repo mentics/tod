@@ -2850,6 +2850,40 @@ fn a_fix_that_changes_nothing_stops_the_run_instead_of_going_round() {
 }
 
 #[test]
+fn a_check_killed_for_memory_stops_the_run_for_the_user_and_never_reaches_the_fix_agent() {
+    let fx = setup();
+    retire_outside_criteria(&fx);
+    with_check(&fx, "review", "tsc", "echo compiling; kill -9 $$");
+    let mut agent = FakeAgent::new(&fx.fleet);
+    let mut pilot = autopilot(&fx, Budget::default());
+    let outcome = pilot.run(&fx.fleet, &mut agent).unwrap();
+    match &outcome {
+        Outcome::NeedsHuman { reason: NeedsHuman::CheckBroken { check, why } } => {
+            assert_eq!(check, "tsc");
+            assert!(why.starts_with("Killed for memory (SIGKILL"), "{why}");
+        }
+        other => panic!("{other:?} {:#?}", pilot.state().steps),
+    }
+    // No finding, no fix turn.
+    let findings = fx.fleet.read(|conn| Ok(tod_store::review::ReviewRepo::new(conn).list_for_node(fx.node)?)).unwrap();
+    assert!(findings.iter().all(|f| !f.summary.contains("tsc")), "{findings:?}");
+    assert!(openings(&fx, ProtocolKind::Fix).is_empty());
+    // The words open with the decision, then why, then the end of the output.
+    let words = outcome_words(&outcome);
+    assert!(
+        words.starts_with("Lower the heap of check `tsc`, scope it, or remove it: it was killed for lack of memory, not because the code failed.\n\n"),
+        "{words}"
+    );
+    assert!(words.contains("Killed for memory (SIGKILL") && words.contains("Last of its output:\ncompiling"), "{words}");
+    // Run again: the stored kill is not the answer, the check runs once more.
+    let again = autopilot(&fx, Budget::default()).run(&fx.fleet, &mut FakeAgent::new(&fx.fleet)).unwrap();
+    assert!(matches!(again, Outcome::NeedsHuman { reason: NeedsHuman::CheckBroken { .. } }));
+    let timeline = fx.fleet.read(|conn| tod_store::node_timeline::TimelineRepo::new(conn).list(fx.node)).unwrap();
+    let rounds = timeline.iter().filter(|e| e.kind == tod_store::node_timeline::KIND_CHECKS).count();
+    assert_eq!(rounds, 2, "{timeline:#?}");
+}
+
+#[test]
 fn checks_in_a_phase_are_part_of_its_gate() {
     let fx = setup();
     retire_outside_criteria(&fx);
