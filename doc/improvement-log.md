@@ -393,7 +393,10 @@ from Blaxel.
   added: wording does not decide the phase. Hardened after review: the retag is limited to the
   conversation's own node, needs a `--reason` kept in the change set, is refused for an obligation
   with a `failed` verdict or a `failed` carrying step, and the trace check covers constraints and
-  needs a step of that phase or later.
+  needs a step of that phase or later. A `failed` verdict anywhere in the history blocks the
+  retag, and the reason needs at least 15 non-space characters. Known limit: a failed plan step
+  flipped to `verified` by the agent, then the obligation moved, is not caught (adversarial path,
+  out of scope).
 - **Measure**: `decisions` from a `verification` protocol whose evidence is an obligation acting in
   `merged`/`released`/`design` or about production; obligations moved by a verification conversation
   with no later-phase step; nodes sent back from `verifying` for an acts-in change.

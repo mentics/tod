@@ -36,8 +36,8 @@ Past `planning` the app refuses every obligation change from an agent, with one
 exception: a verification session may `update <id> --acts-in merged|released
 --reason <TEXT>` on an obligation of its own node (in `verifying`) that acts in
 an earlier state, to hand it to the phase that can show it true. The `--reason`
-is required and is kept with the change: say why nothing in the checkout can
-show it true. Refused when the obligation already has a `failed` verdict or a
+(at least 15 characters) is required and is kept with the change: say why nothing in the checkout can
+show it true. Refused when the obligation already has a `failed` verdict in its history or a
 `failed` plan step carries it: a recorded failure stays a failure. Nothing
 else, and never back.
 

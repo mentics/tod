@@ -63,6 +63,9 @@ pub fn check_conversation_agent(
     check_agent(conn, mutation)
 }
 
+/// The fewest non-space characters a retag's reason may have.
+const MIN_REASON_CHARS: usize = 15;
+
 /// Whether `mutation` is the one change a verification agent may make to the
 /// obligations of its own node (`own_node`) in `verifying`: moving an
 /// obligation to act in `merged` or `released`, a later state than where it
@@ -106,16 +109,23 @@ fn verify_may_retag(
     if !in_verifying || from >= to {
         return Ok(false);
     }
-    if reason.as_deref().map(str::trim).unwrap_or_default().is_empty() {
+    let substantive = reason
+        .as_deref()
+        .map(|r| r.chars().filter(|c| !c.is_whitespace()).count())
+        .unwrap_or(0);
+    if substantive < MIN_REASON_CHARS {
         bail!(
-            "refused: moving an obligation to `{acts_in}` needs a reason, kept with the change: \
-            why nothing in the checkout can show it true. Pass `--reason <TEXT>`."
+            "refused: moving an obligation to `{acts_in}` needs a reason of at least \
+            {MIN_REASON_CHARS} characters, kept with the change: why nothing in the checkout \
+            can show it true. Pass `--reason <TEXT>`."
         );
     }
+    // Any `failed` verdict in its history counts, not only the latest: failed
+    // then verified then moved is still a failure that was recorded.
     let failed_verdict = VerdictRepo::new(conn)
-        .latest_for_node(obligation.node_id)?
-        .get(&obligation.id)
-        .is_some_and(|v| v.is_failed());
+        .history_for_node(obligation.node_id)?
+        .iter()
+        .any(|v| v.obligation_id == obligation.id && v.is_failed());
     let plan = PlanStepRepo::new(conn);
     let mut failed_step = false;
     for step in plan.list_steps_for_obligation(obligation.id)? {
@@ -516,7 +526,7 @@ mod tests {
     fn a_retag_needs_a_reason() {
         let fx = setup("verifying");
         let verify = conversation(&fx, ProtocolKind::Verification);
-        for reason in [None, Some("  ".to_string())] {
+        for reason in [None, Some("  ".to_string()), Some("prod".to_string())] {
             let err = outline(
                 &fx,
                 &verify,
@@ -557,6 +567,12 @@ mod tests {
         let verify = conversation(&fx, ProtocolKind::Verification);
         VerdictRepo::new(&fx.conn)
             .record(fx.node, fx.obligation, None, "failed", "Ran it: panics.")
+            .unwrap();
+        let err = outline(&fx, &verify, retag(&fx, "released")).unwrap_err();
+        assert!(format!("{err:#}").contains("stays a failure"), "{err:#}");
+        // Nor one that failed once, however it was ruled on since.
+        VerdictRepo::new(&fx.conn)
+            .record(fx.node, fx.obligation, None, "verified", "Ran it again: fine.")
             .unwrap();
         let err = outline(&fx, &verify, retag(&fx, "released")).unwrap_err();
         assert!(format!("{err:#}").contains("stays a failure"), "{err:#}");
