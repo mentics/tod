@@ -1124,8 +1124,6 @@ mod transfer_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The shell scripts the sandbox and container remotes share, run by a
-    /// local `sh` against a throwaway Claude directory.
     /// A log goes as one directory command and one upload, however long it is
     /// (the chunked path made one call per 48 KB), and arrives whole.
     #[test]
@@ -1159,6 +1157,8 @@ mod transfer_tests {
         assert!(format!("{err:#}").contains("send session log s") && format!("{err:#}").contains("boom"));
     }
 
+    /// The shell scripts the sandbox and container remotes share, run by a
+    /// local `sh` against a throwaway Claude directory.
     #[test]
     fn the_shell_remote_scripts_round_trip_a_log() {
         let Ok(probe) = std::process::Command::new("sh").arg("-c").arg("command -v base64").output() else { return };
