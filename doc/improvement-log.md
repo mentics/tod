@@ -126,6 +126,10 @@ from Blaxel.
   them; Start deletes a kept failed sandbox of the same node and makes a fresh
   one (`NameDecision::ReplaceFailed`). Seen working live for ENG-3067 and
   ENG-3193.
+- **Wording**: every health failure now says what is wrong, the likely cause
+  and the next step in plain words, then a `Technical detail:` line with the
+  check name and fields (`HealthFailure` Display, COMMIT). No automatic retry
+  added: Start already replaces the kept sandbox.
 - **Measure**: setup failures per fork, by health check.
 
 ### Small UI problems seen

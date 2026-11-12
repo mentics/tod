@@ -55,11 +55,60 @@ impl Check {
 pub struct HealthFailure {
     pub check: Check,
     pub detail: String,
+    /// [`Check::Manifest`] only: the sandbox reports a manifest that is not a
+    /// node's at all (a plain sandbox), rather than another node build's.
+    pub plain: bool,
+}
+
+impl HealthFailure {
+    /// What is wrong, the likely cause, and the next step, in plain words.
+    pub fn explanation(&self) -> &'static str {
+        match self.check {
+            Check::Reachable => {
+                "The sandbox was made but did not answer. It may still be starting, or it has stopped. \
+                 tod waited and tried again; Start will delete it and make a new one if it stays down."
+            }
+            Check::Disk => {
+                "The sandbox is out of disk space, so tod cannot work in it. tod already removed its own \
+                 leftovers. Start will delete this sandbox and make a new one; if it fills up again, give \
+                 the sandbox more disk or a smaller image."
+            }
+            Check::Relay => {
+                "The sandbox was made but tod's relay (the program tod talks to inside it) is not running. \
+                 The setup was probably cut short. Start will delete it and make a new one."
+            }
+            Check::Manifest if self.plain => {
+                "The sandbox was made but tod's files in it are incomplete: it was set up as a plain \
+                 sandbox, not a node sandbox. This happens when a fork loses tod's files or two setups \
+                 overlap. Start will delete it and make a new one."
+            }
+            Check::Manifest => {
+                "The sandbox has tod's files from a different build than this one. It was probably made \
+                 before tod was updated. Start will delete it and make a new one; or refresh the \
+                 project's golden sandbox (`tod-sandbox golden refresh`) if new ones keep coming out old."
+            }
+            Check::Env => {
+                "The sandbox was made but tod's settings for this node did not take effect in it. A fork \
+                 may still be applying them. tod tried again; Start will delete it and make a new one."
+            }
+            Check::GitRemote => {
+                "The sandbox cannot read the project's repository, so it cannot check the code out. The \
+                 GitHub credentials may be missing or expired, or the sandbox's network proxy is not \
+                 working. Fix the GitHub access in Settings \u{2192} Cloud sandboxes, then use Start."
+            }
+        }
+    }
 }
 
 impl std::fmt::Display for HealthFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "sandbox health check \"{}\" failed: {}", self.check.name(), self.detail)
+        write!(
+            f,
+            "{}\nTechnical detail: sandbox health check \"{}\" failed: {}",
+            self.explanation(),
+            self.check.name(),
+            self.detail
+        )
     }
 }
 
@@ -140,7 +189,7 @@ pub fn evaluate(
     sleep: &mut dyn FnMut(Duration),
     progress: &mut dyn FnMut(&str),
 ) -> Result<(), HealthFailure> {
-    let fail = |check: Check, detail: String| HealthFailure { check, detail };
+    let fail = |check: Check, detail: String| HealthFailure { check, detail, plain: false };
     probes.reachable(spec.reachable_wait).map_err(|e| fail(Check::Reachable, format!("{}: {e:#}", spec.label)))?;
     let script = probe_script(spec.repo_url, spec.node);
     // Each check is a round trip to the sandbox, so they are asked together
@@ -167,14 +216,16 @@ pub fn evaluate(
                 None => is_node_manifest(&reported),
             };
             if !sane {
-                return Err(fail(
+                let mut failure = fail(
                     Check::Manifest,
                     format!(
                         "{} reports manifest {reported:?}, expected {}",
                         spec.label,
                         spec.expected_manifest.map_or("a node's".to_string(), |m| format!("{m:?}"))
                     ),
-                ));
+                );
+                failure.plain = !is_node_manifest(&reported);
+                return Err(failure);
             }
         }
         match env {
@@ -278,6 +329,7 @@ mod tests {
         let e = run(&f, Stage::Ready, &spec(None, &[])).unwrap_err();
         assert_eq!(e.check, Check::Disk);
         assert!(e.to_string().contains("\"disk free\""), "{e}");
+        assert!(e.to_string().starts_with("The sandbox is out of disk space"), "{e}");
 
         let mut f = Fake::healthy();
         f.manifest = None;
@@ -299,6 +351,50 @@ mod tests {
         let e = run(&f, Stage::Ready, &spec(None, &[])).unwrap_err();
         assert_eq!(e.check, Check::GitRemote);
         assert!(e.detail.contains("could not read Username"), "{e}");
+    }
+
+    #[test]
+    fn each_failure_says_what_is_wrong_and_what_happens_next_before_the_detail() {
+        let said = |f: &Fake, s: &HealthSpec| run(f, Stage::Ready, s).unwrap_err().to_string();
+        let split = |text: &str| {
+            let (plain, tech) = text.split_once("\nTechnical detail: ").unwrap_or_else(|| panic!("no detail line: {text}"));
+            assert!(plain.contains("Start") || plain.contains("Fix"), "no next step: {plain}");
+            (plain.to_string(), tech.to_string())
+        };
+        let mut f = Fake::healthy();
+        f.reachable = false;
+        let (p, t) = split(&said(&f, &spec(None, &[])));
+        assert!(p.starts_with("The sandbox was made but did not answer"), "{p}");
+        assert!(t.contains("sandbox health check \"reachable\" failed") && t.contains("did not wake"), "{t}");
+
+        let mut f = Fake::healthy();
+        f.manifest = None;
+        let (p, t) = split(&said(&f, &spec(None, &[])));
+        assert!(p.contains("relay"), "{p}");
+        assert!(t.contains("\"relay up\""), "{t}");
+
+        let mut f = Fake::healthy();
+        f.manifest = Some("fork agents=false".into());
+        let (p, t) = split(&said(&f, &spec(None, &[])));
+        assert!(p.contains("set up as a plain sandbox, not a node sandbox"), "{p}");
+        assert!(t.contains("\"manifest\"") && t.contains("fork agents=false"), "{t}");
+
+        let f = Fake::healthy();
+        let (p, t) = split(&said(&f, &spec(Some("node relay=other"), &[])));
+        assert!(p.contains("different build"), "{p}");
+        assert!(t.contains("node relay=other"), "{t}");
+
+        let f = Fake::healthy();
+        *f.runs.lock().unwrap() = vec![(PROBE_NO_NODE_ENV, "TOD_NODE is ''")];
+        let (p, t) = split(&said(&f, &spec(None, &[])));
+        assert!(p.contains("settings for this node did not take effect"), "{p}");
+        assert!(t.contains("TOD_NODE is ''"), "{t}");
+
+        let f = Fake::healthy();
+        *f.runs.lock().unwrap() = vec![(128, "could not read Username")];
+        let (p, t) = split(&said(&f, &spec(None, &[])));
+        assert!(p.contains("cannot read the project's repository"), "{p}");
+        assert!(t.contains("could not read Username"), "{t}");
     }
 
     #[test]

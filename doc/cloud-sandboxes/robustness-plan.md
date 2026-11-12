@@ -207,6 +207,12 @@ reuse is decided on health, never on `status = DEPLOYED`. A per-node
 cross-process lock for provisioning; the name recorded before the first
 call; delete on failure; an orphan sweeper.
 
+A failed check reads in plain words (`HealthFailure::explanation`: what is
+wrong, the likely cause, the next step, which is Start replacing the kept
+sandbox or the user's fix), then a `Technical detail:` line with the check
+name and what it saw. The autopilot does not retry a failed setup itself: Start
+already replaces a kept failed sandbox (`NameDecision::ReplaceFailed`).
+
 ### 3.6 A version contract instead of source hashes (orchestrator D1, 19)
 
 **Done:** `tod_store::sync::contract` (`WIRE`, `Contract`, `judge`); `/health`
