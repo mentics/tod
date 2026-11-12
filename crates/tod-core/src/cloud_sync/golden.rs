@@ -316,7 +316,7 @@ fn build_golden(
     let account = sandboxes.account()?.clone();
     let github = sandboxes.node_credentials(Vec::new()).github_token.filter(|t| !t.is_empty());
     if github.is_none() {
-        progress("warning: no GitHub token is stored, so only a public repository can be cloned (Settings → Cloud sandboxes)");
+        progress("warning: no GitHub token is stored, so only a public repository can be cloned (add one with the red \"GitHub token\" banner's Add token button)");
     }
     let creds = node::NodeCredentials { github_token: github, ..Default::default() };
     let rules = node::credential_rules(&creds, account.claude_token_via);

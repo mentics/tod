@@ -347,6 +347,22 @@ fn spawn<T: 'static>(
 mod tests {
     use super::*;
 
+    /// A health failure carries its own "What to do:", so the panel adds no
+    /// second, conflicting step.
+    #[test]
+    fn a_health_failure_keeps_its_own_next_step() {
+        let failure = tod_sandbox::health::HealthFailure {
+            check: tod_sandbox::health::Check::Relay,
+            detail: "the relay does not answer".into(),
+            plain: false,
+            setup: tod_sandbox::health::Setup::Existing,
+        };
+        let text = describe("Start failed", &anyhow::Error::new(failure));
+        assert_eq!(text.matches("What to do:").count(), 1, "{text}");
+        assert!(text.contains("use Reset environment in the task panel's runner menu"), "{text}");
+        assert!(text.contains("Technical detail: sandbox health check \"relay up\" failed"), "{text}");
+    }
+
     /// "Asked for {what}" and "Asking the supervisor for {what}" must read as
     /// sentences for every request.
     #[test]

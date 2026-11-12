@@ -134,8 +134,9 @@ from Blaxel.
   ENG-3193.
 - **Wording**: every health failure now says what is wrong, the likely cause
   and the next step in plain words, then a `Technical detail:` line with the
-  check name and fields (`HealthFailure` Display, a3b0a37e). No automatic retry
-  added: Start already replaces the kept sandbox.
+  check name and fields (`HealthFailure` Display, a3b0a37e; next steps made
+  true per new/existing sandbox in the follow-up commit). No automatic retry
+  added.
 - **Measure**: setup failures per fork, by health check.
 
 ### Small UI problems seen

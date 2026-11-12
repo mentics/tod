@@ -764,6 +764,7 @@ fn health_spec<'a>(
         reachable_wait: tod_sandbox::blaxel::WAKE_CEILING,
         expected_manifest,
         probe_delays,
+        setup: tod_sandbox::health::Setup::New,
     }
 }
 

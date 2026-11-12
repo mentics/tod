@@ -1709,6 +1709,7 @@ pub fn probe_health(
         reachable_wait: tod_sandbox::blaxel::WAKE_CEILING,
         expected_manifest,
         probe_delays: delays,
+        setup: tod_sandbox::health::Setup::Existing,
     };
     tod_sandbox::health::probe(bx, target.url, stage, &spec, progress)
 }

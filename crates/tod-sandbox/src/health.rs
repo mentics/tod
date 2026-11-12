@@ -50,6 +50,18 @@ impl Check {
     }
 }
 
+/// Whether the sandbox was made by the setup that is probing it, or already
+/// existed. What the user does next differs: a new sandbox that fails is kept
+/// and the next Start deletes it and makes another (`NameDecision::ReplaceFailed`);
+/// an existing one is kept by Start, which installs tod's files into it again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Setup {
+    /// Made in this Start attempt.
+    New,
+    /// Recorded earlier and reused.
+    Existing,
+}
+
 /// The failed check and what it saw.
 #[derive(Debug)]
 pub struct HealthFailure {
@@ -58,43 +70,79 @@ pub struct HealthFailure {
     /// [`Check::Manifest`] only: the sandbox reports a manifest that is not a
     /// node's at all (a plain sandbox), rather than another node build's.
     pub plain: bool,
+    pub setup: Setup,
 }
 
+/// The marker the task panel looks for: a text that has it gets no generic
+/// next step appended (`cloud_node::describe`).
+const WHAT_TO_DO: &str = "What to do:";
+
 impl HealthFailure {
-    /// What is wrong, the likely cause, and the next step, in plain words.
-    pub fn explanation(&self) -> &'static str {
+    /// What is wrong and the likely cause, in plain words.
+    pub fn problem(&self) -> &'static str {
         match self.check {
-            Check::Reachable => {
-                "The sandbox was made but did not answer. It may still be starting, or it has stopped. \
-                 tod waited and tried again; Start will delete it and make a new one if it stays down."
-            }
-            Check::Disk => {
-                "The sandbox is out of disk space, so tod cannot work in it. tod already removed its own \
-                 leftovers. Start will delete this sandbox and make a new one; if it fills up again, give \
-                 the sandbox more disk or a smaller image."
-            }
+            Check::Reachable => "The sandbox did not answer. It may still be starting, or it has stopped.",
+            Check::Disk => "The sandbox is out of disk space, so tod cannot work in it. tod already removed its own leftovers.",
             Check::Relay => {
                 "The sandbox was made but tod's relay (the program tod talks to inside it) is not running. \
-                 The setup was probably cut short. Start will delete it and make a new one."
+                 The setup was probably cut short."
             }
             Check::Manifest if self.plain => {
                 "The sandbox was made but tod's files in it are incomplete: it was set up as a plain \
-                 sandbox, not a node sandbox. This happens when a fork loses tod's files or two setups \
-                 overlap. Start will delete it and make a new one."
+                 sandbox, not a node sandbox. This happens when a fork loses tod's files or two setups overlap."
             }
             Check::Manifest => {
                 "The sandbox has tod's files from a different build than this one. It was probably made \
-                 before tod was updated. Start will delete it and make a new one; or refresh the \
-                 project's golden sandbox (`tod-sandbox golden refresh`) if new ones keep coming out old."
+                 before tod was updated."
             }
             Check::Env => {
                 "The sandbox was made but tod's settings for this node did not take effect in it. A fork \
-                 may still be applying them. tod tried again; Start will delete it and make a new one."
+                 may still be applying them."
             }
             Check::GitRemote => {
                 "The sandbox cannot read the project's repository, so it cannot check the code out. The \
-                 GitHub credentials may be missing or expired, or the sandbox's network proxy is not \
-                 working. Fix the GitHub access in Settings \u{2192} Cloud sandboxes, then use Start."
+                 GitHub token may be missing or expired, or the sandbox's network proxy is not working."
+            }
+        }
+    }
+
+    /// The next step: what tod does itself, or the exact action for the user.
+    pub fn next_step(&self) -> &'static str {
+        match (self.check, self.setup) {
+            (Check::GitRemote, Setup::New) => {
+                "What to do: add or replace the GitHub token with the red \"GitHub token\" banner's Add token \
+                 or Replace token button (no banner means the token is valid; then check the repository \
+                 URL). tod kept this sandbox, and the next Start deletes it and makes a new one."
+            }
+            (Check::GitRemote, Setup::Existing) => {
+                "What to do: add or replace the GitHub token with the red \"GitHub token\" banner's Add token \
+                 or Replace token button (no banner means the token is valid; then check the repository \
+                 URL), then use Reset environment in the task panel's runner menu to set the sandbox up again."
+            }
+            (Check::Manifest, Setup::New) if !self.plain => {
+                "What to do: tod kept this sandbox, and the next Start deletes it and makes a new one. If \
+                 the new one is old again, refresh the project's golden sandbox with `tod-sandbox golden refresh`."
+            }
+            (Check::Manifest, Setup::Existing) if !self.plain => {
+                "What to do: use Reset environment in the task panel's runner menu to install this build's \
+                 files again. If it fails the same way, run `tod-sandbox golden refresh` for the project's \
+                 golden sandbox, then use Delete sandbox (it saves the work first) and Start for a new one."
+            }
+            (Check::Disk, Setup::New) => {
+                "What to do: tod kept this sandbox, and the next Start deletes it and makes a new one. If it \
+                 fills up again, give the sandbox more disk or use a smaller image."
+            }
+            (Check::Disk, Setup::Existing) => {
+                "What to do: use Delete sandbox in the task panel's runner menu (it saves the work first), \
+                 then Start makes a new one. If that fills up too, give the sandbox more disk or use a smaller image."
+            }
+            (_, Setup::New) => {
+                "What to do: tod kept this sandbox, and the next Start deletes it and makes a new one."
+            }
+            (_, Setup::Existing) => {
+                "What to do: use Reset environment in the task panel's runner menu to install tod's files \
+                 again and check once more. If it fails the same way, use Delete sandbox (it saves the work \
+                 first); the next Start makes a new one."
             }
         }
     }
@@ -104,8 +152,9 @@ impl std::fmt::Display for HealthFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{}\nTechnical detail: sandbox health check \"{}\" failed: {}",
-            self.explanation(),
+            "{} {}\nTechnical detail: sandbox health check \"{}\" failed: {}",
+            self.problem(),
+            self.next_step(),
             self.check.name(),
             self.detail
         )
@@ -138,6 +187,8 @@ pub struct HealthSpec<'a> {
     pub expected_manifest: Option<&'a str>,
     /// Seconds to wait between tries of the relay, manifest, environment and `git ls-remote` checks.
     pub probe_delays: &'a [u64],
+    /// Whether this setup made the sandbox; decides the next step in a failure.
+    pub setup: Setup,
 }
 
 /// What the probe asks the sandbox; [`Blaxel`] answers it for real.
@@ -189,7 +240,7 @@ pub fn evaluate(
     sleep: &mut dyn FnMut(Duration),
     progress: &mut dyn FnMut(&str),
 ) -> Result<(), HealthFailure> {
-    let fail = |check: Check, detail: String| HealthFailure { check, detail, plain: false };
+    let fail = |check: Check, detail: String| HealthFailure { check, detail, plain: false, setup: spec.setup };
     probes.reachable(spec.reachable_wait).map_err(|e| fail(Check::Reachable, format!("{}: {e:#}", spec.label)))?;
     let script = probe_script(spec.repo_url, spec.node);
     // Each check is a round trip to the sandbox, so they are asked together
@@ -305,6 +356,7 @@ mod tests {
             reachable_wait: Duration::from_millis(1),
             expected_manifest: expected,
             probe_delays: delays,
+            setup: Setup::New,
         }
     }
 
@@ -329,7 +381,6 @@ mod tests {
         let e = run(&f, Stage::Ready, &spec(None, &[])).unwrap_err();
         assert_eq!(e.check, Check::Disk);
         assert!(e.to_string().contains("\"disk free\""), "{e}");
-        assert!(e.to_string().starts_with("The sandbox is out of disk space"), "{e}");
 
         let mut f = Fake::healthy();
         f.manifest = None;
@@ -354,47 +405,85 @@ mod tests {
     }
 
     #[test]
-    fn each_failure_says_what_is_wrong_and_what_happens_next_before_the_detail() {
-        let said = |f: &Fake, s: &HealthSpec| run(f, Stage::Ready, s).unwrap_err().to_string();
+    fn each_failure_says_what_is_wrong_and_the_real_next_step_before_the_detail() {
+        const NEW: &str = "tod kept this sandbox, and the next Start deletes it and makes a new one.";
+        const RESET: &str = "use Reset environment in the task panel's runner menu to install tod's files again and check once more. \
+            If it fails the same way, use Delete sandbox (it saves the work first); the next Start makes a new one.";
+        let said = |f: &Fake, setup: Setup| {
+            let s = HealthSpec { setup, ..spec(None, &[]) };
+            run(f, Stage::Ready, &s).unwrap_err().to_string()
+        };
+        let said_expected = |f: &Fake, setup: Setup| {
+            let s = HealthSpec { setup, ..spec(Some("node relay=abc"), &[]) };
+            run(f, Stage::Ready, &s).unwrap_err().to_string()
+        };
         let split = |text: &str| {
             let (plain, tech) = text.split_once("\nTechnical detail: ").unwrap_or_else(|| panic!("no detail line: {text}"));
-            assert!(plain.contains("Start") || plain.contains("Fix"), "no next step: {plain}");
+            assert_eq!(plain.matches("What to do:").count(), 1, "{plain}");
             (plain.to_string(), tech.to_string())
         };
-        let mut f = Fake::healthy();
-        f.reachable = false;
-        let (p, t) = split(&said(&f, &spec(None, &[])));
-        assert!(p.starts_with("The sandbox was made but did not answer"), "{p}");
-        assert!(t.contains("sandbox health check \"reachable\" failed") && t.contains("did not wake"), "{t}");
+        for setup in [Setup::New, Setup::Existing] {
+            let step = if setup == Setup::New { NEW } else { RESET };
 
-        let mut f = Fake::healthy();
-        f.manifest = None;
-        let (p, t) = split(&said(&f, &spec(None, &[])));
-        assert!(p.contains("relay"), "{p}");
-        assert!(t.contains("\"relay up\""), "{t}");
+            let mut f = Fake::healthy();
+            f.reachable = false;
+            let (p, t) = split(&said(&f, setup));
+            assert!(p.starts_with("The sandbox did not answer."), "{p}");
+            assert!(p.ends_with(&format!("What to do: {step}")), "{p}");
+            assert!(t.contains("sandbox health check \"reachable\" failed") && t.contains("did not wake"), "{t}");
 
-        let mut f = Fake::healthy();
-        f.manifest = Some("fork agents=false".into());
-        let (p, t) = split(&said(&f, &spec(None, &[])));
-        assert!(p.contains("set up as a plain sandbox, not a node sandbox"), "{p}");
-        assert!(t.contains("\"manifest\"") && t.contains("fork agents=false"), "{t}");
+            let mut f = Fake::healthy();
+            f.manifest = None;
+            let (p, t) = split(&said(&f, setup));
+            assert!(p.contains("tod's relay"), "{p}");
+            assert!(p.ends_with(&format!("What to do: {step}")), "{p}");
+            assert!(t.contains("\"relay up\""), "{t}");
 
+            let mut f = Fake::healthy();
+            f.manifest = Some("fork agents=false".into());
+            let (p, t) = split(&said(&f, setup));
+            assert!(p.contains("set up as a plain sandbox, not a node sandbox"), "{p}");
+            assert!(p.ends_with(&format!("What to do: {step}")), "{p}");
+            assert!(t.contains("\"manifest\"") && t.contains("fork agents=false"), "{t}");
+
+            let f = Fake::healthy();
+            *f.runs.lock().unwrap() = vec![(PROBE_NO_NODE_ENV, "TOD_NODE is ''")];
+            let (p, t) = split(&said(&f, setup));
+            assert!(p.contains("settings for this node did not take effect"), "{p}");
+            assert!(p.ends_with(&format!("What to do: {step}")), "{p}");
+            assert!(t.contains("TOD_NODE is ''"), "{t}");
+        }
+
+        // A different build's manifest: a new sandbox is replaced, an existing one reset, and both can refresh the golden.
         let f = Fake::healthy();
-        let (p, t) = split(&said(&f, &spec(Some("node relay=other"), &[])));
+        let (p, t) = split(&said_expected(&Fake { manifest: Some("node relay=other".into()), ..Fake::healthy() }, Setup::New));
         assert!(p.contains("different build"), "{p}");
+        assert!(p.ends_with("What to do: tod kept this sandbox, and the next Start deletes it and makes a new one. If the new one is old again, refresh the project's golden sandbox with `tod-sandbox golden refresh`."), "{p}");
         assert!(t.contains("node relay=other"), "{t}");
+        let (p, _) = split(&said_expected(&Fake { manifest: Some("node relay=other".into()), ..f }, Setup::Existing));
+        assert!(p.ends_with("What to do: use Reset environment in the task panel's runner menu to install this build's files again. If it fails the same way, run `tod-sandbox golden refresh` for the project's golden sandbox, then use Delete sandbox (it saves the work first) and Start for a new one."), "{p}");
 
-        let f = Fake::healthy();
-        *f.runs.lock().unwrap() = vec![(PROBE_NO_NODE_ENV, "TOD_NODE is ''")];
-        let (p, t) = split(&said(&f, &spec(None, &[])));
-        assert!(p.contains("settings for this node did not take effect"), "{p}");
-        assert!(t.contains("TOD_NODE is ''"), "{t}");
+        let mut f = Fake::healthy();
+        f.disk = false;
+        let (p, t) = split(&said(&f, Setup::New));
+        assert!(p.starts_with("The sandbox is out of disk space"), "{p}");
+        assert!(p.ends_with("the next Start deletes it and makes a new one. If it fills up again, give the sandbox more disk or use a smaller image."), "{p}");
+        assert!(t.contains("\"disk free\"") && t.contains("3 MB free"), "{t}");
+        let (p, _) = split(&said(&f, Setup::Existing));
+        assert!(p.ends_with("What to do: use Delete sandbox in the task panel's runner menu (it saves the work first), then Start makes a new one. If that fills up too, give the sandbox more disk or use a smaller image."), "{p}");
 
         let f = Fake::healthy();
         *f.runs.lock().unwrap() = vec![(128, "could not read Username")];
-        let (p, t) = split(&said(&f, &spec(None, &[])));
+        let (p, t) = split(&said(&f, Setup::New));
         assert!(p.contains("cannot read the project's repository"), "{p}");
+        assert!(p.contains("red \"GitHub token\" banner's Add token or Replace token button"), "{p}");
+        assert!(!p.contains("Settings"), "{p}");
+        assert!(p.ends_with("the next Start deletes it and makes a new one."), "{p}");
         assert!(t.contains("could not read Username"), "{t}");
+        let f = Fake::healthy();
+        *f.runs.lock().unwrap() = vec![(128, "could not read Username")];
+        let (p, _) = split(&said(&f, Setup::Existing));
+        assert!(p.ends_with("then use Reset environment in the task panel's runner menu to set the sandbox up again."), "{p}");
     }
 
     #[test]
