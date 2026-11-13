@@ -1909,6 +1909,25 @@ fn a_failed_read_after_a_turn_keeps_the_unchanged_count() {
     assert_eq!(pilot.state().loops.pr_unchanged, 1);
 }
 
+/// A base that moves once a day is not "in a row": after a long quiet
+/// stretch the count starts again, so eight such days never stop the run.
+#[test]
+fn base_merges_far_apart_never_reach_the_limit() {
+    use Look::*;
+    let (fx, _, mut agent) = scripted_pr(vec![Behind; 5]);
+    let gap = Duration::from_secs(60);
+    let mut pilot = autopilot(&fx, Budget::default())
+        .with_pr_poll_interval(Duration::ZERO)
+        .with_housekeeping_gap(gap);
+    // Seven rounds so far, the last one a day ago.
+    pilot.state.loops.pr_housekeeping_rounds = 7;
+    pilot.state.loops.pr_housekeeping_at_ms = chrono::Utc::now().timestamp_millis() - 24 * 3600 * 1000;
+    let outcome = pilot.run_with(&fx.fleet, &mut agent, &mut StopAfter(6)).unwrap();
+    assert!(matches!(outcome, Outcome::Stopped { .. }), "{outcome:?}");
+    assert_eq!(agent.turns, 1, "merged in, not stopped");
+    assert_eq!(pilot.state().loops.pr_housekeeping_rounds, 1);
+}
+
 #[test]
 fn a_base_that_never_stops_moving_ends_in_a_precise_stop() {
     use Look::*;

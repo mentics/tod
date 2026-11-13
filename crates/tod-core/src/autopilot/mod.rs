@@ -1276,6 +1276,20 @@ impl Autopilot {
                     if !change_owed
                         && works.iter().all(|w| matches!(w, pr_readiness::Work::Behind | pr_readiness::Work::Conflict))
                     {
+                        // "In a row": rounds that are 4 gaps or more apart are
+                        // not (a base that moves once a day is no loop), so the
+                        // count starts again. The gap already bounds the rate.
+                        // With no gap configured there is no such thing as
+                        // quiet, and the count only goes up.
+                        let now = chrono::Utc::now().timestamp_millis();
+                        let gap_ms = self.housekeeping_gap.as_millis() as i64;
+                        if gap_ms > 0
+                            && self.state.loops.pr_housekeeping_rounds != 0
+                            && now - self.state.loops.pr_housekeeping_at_ms >= 4 * gap_ms
+                        {
+                            self.state.loops.pr_housekeeping_rounds = 0;
+                            self.save()?;
+                        }
                         if self.state.loops.pr_housekeeping_rounds >= PR_HOUSEKEEPING_LIMIT {
                             return Ok(Some(Outcome::NeedsHuman {
                                 reason: NeedsHuman::PrStuck {
@@ -1288,7 +1302,6 @@ impl Autopilot {
                         }
                         let last = self.state.loops.pr_housekeeping_at_ms;
                         let due = last + self.housekeeping_gap.as_millis() as i64;
-                        let now = chrono::Utc::now().timestamp_millis();
                         if now < due {
                             let interval = self.pr_poll.min(Duration::from_millis((due - now) as u64));
                             let what = format!(
