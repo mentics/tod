@@ -182,6 +182,28 @@ pub fn new_decision(tried: &Tried) -> NewDecision {
     }
 }
 
+/// Record that the user told `node` to go on without `bot`.
+#[cfg(test)]
+pub(crate) fn waive_for_test(fleet: &tod_store::fleet::FleetStore, node: Uuid, bot: &str) {
+    use tod_store::interview::{ACTOR_USER, InterviewCommand};
+    let tried = Tried { bot: bot.into(), prs: vec!["o/r#1".into()], asks: 3, last_ask_at: None, last_activity_at: None };
+    fleet
+        .interview(
+            "autopilot",
+            InterviewCommand::AskDecision {
+                node_id: node,
+                conversation_id: None,
+                protocol: Some(PROTOCOL.to_string()),
+                decision: new_decision(&tried),
+            },
+        )
+        .unwrap();
+    let id = fleet.read(|conn| Ok(DecisionRepo::new(conn).list_for_node(node)?)).unwrap().last().unwrap().id;
+    fleet
+        .interview(ACTOR_USER, InterviewCommand::AnswerDecision { decision_id: id, option: Some(1), text: None })
+        .unwrap();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

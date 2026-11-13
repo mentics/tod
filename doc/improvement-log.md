@@ -71,6 +71,17 @@ turns, findings, run_state, node_timeline, journey records):
   (target <= `max_asks`); `bot_silence` requests per node (target <= 1) and how many were answered
   "Proceed without"; `pr_stuck` stops whose work was only a bot; transient GitHub errors that
   reached a request (target 0).
+- **Follow-up gap (found in independent review)**: two readers still used the unwaived settings, so
+  a waived bot was honored by the gate and babysitter but not by the PR controls
+  (`pr_actions::load`: the buttons kept saying "Waiting for {bot}" and blocked Open while the gate
+  passed) or by `conversation/pr.rs` `live_prs` (the progress fingerprint after PR agent turns);
+  and a PR with no head commit time never counted as overdue, so a bot without an `ask` could never
+  be told from a slow one and the request never came. Fixed: `pr_readiness::settings_at` is now
+  private, every reader goes through `settings_for_node` (`pr_actions::load`/`update` take the fleet
+  and node, and `live_prs` the protocol env); a missing head time while a bot has not reviewed is an
+  error (`Assessment::head_time_missing`) from `live_answered` and `pr_actions::load`, so the
+  babysitter shows it as a failed look at GitHub and the controls show it on the row.
+  Regression tests: pr_actions, conversation::pr, pr_readiness.
 
 ## 2026-11-12: lost work left a node in review, asking the user in a loop
 

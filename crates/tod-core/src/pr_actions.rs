@@ -47,20 +47,40 @@ fn say(err: impl std::fmt::Display) -> String {
 
 /// Read `pr`: its state, whether its review is clean, and its labels.
 ///
-/// `answered_at` is when the node's pull request agent last took a turn
-/// ([`crate::pr_readiness::agent_answered_at`]): comments up to then are
-/// answered, not feedback still to do.
+/// Comments up to the node's pull request agent's last turn
+/// ([`crate::pr_readiness::agent_answered_at`]) are answered, not feedback
+/// still to do, and a bot the user told the node to go on without
+/// ([`crate::pr_readiness::settings_for_node`]) is not waited for, so the
+/// buttons agree with the gate.
 pub fn load(
     data_root: &Path,
+    fleet: &tod_store::fleet::FleetStore,
+    node: uuid::Uuid,
     pr: &NodePr,
-    answered_at: Option<chrono::DateTime<chrono::Utc>>,
 ) -> Result<PrFacts, String> {
     let feed = crate::pr_readiness::feed_for(data_root)
         .ok_or_else(|| crate::pull_requests::NO_TOKEN.to_string())?;
+    let settings = crate::pr_readiness::settings_for_node(fleet, node, data_root).map_err(|e| e.to_string())?;
+    let answered_at = crate::pr_readiness::agent_answered_at(fleet, node).map_err(|e| e.to_string())?;
+    let mut facts = facts_from(feed.as_ref(), &settings, answered_at, pr)?;
+    facts.labels = github(data_root)?.pr_labels(&pr.owner, &pr.repo, pr.pr_number).map_err(say)?;
+    Ok(facts)
+}
+
+/// [`load`] without the labels: what the feed shows, judged by `settings`
+/// (which must already leave out a waived bot).
+fn facts_from(
+    feed: &dyn crate::pr_readiness::PrFeed,
+    settings: &tod_store::PrReadinessSettings,
+    answered_at: Option<chrono::DateTime<chrono::Utc>>,
+    pr: &NodePr,
+) -> Result<PrFacts, String> {
     let snapshot = feed.snapshot(pr)?;
-    let settings = crate::pr_readiness::settings_at(data_root);
     let assessment =
-        crate::pr_readiness::Assessment::of(&snapshot, &settings, chrono::Utc::now()).answered_through(answered_at);
+        crate::pr_readiness::Assessment::of(&snapshot, settings, chrono::Utc::now()).answered_through(answered_at);
+    if let Some(why) = assessment.head_time_missing() {
+        return Err(format!("{}: {why}", pr.url));
+    }
     let review_clean = assessment.review_clean();
     let waiting_on = if review_clean {
         String::new()
@@ -98,7 +118,6 @@ pub fn load(
         }
         why
     };
-    let labels = github(data_root)?.pr_labels(&pr.owner, &pr.repo, pr.pr_number).map_err(say)?;
     Ok(PrFacts {
         pr: pr.clone(),
         draft: snapshot.status.draft,
@@ -106,7 +125,7 @@ pub fn load(
         review_clean,
         not_clean_because,
         waiting_on,
-        labels,
+        labels: Vec::new(),
         requested_reviewers: assessment.requested_reviewers.clone(),
     })
 }
@@ -132,11 +151,12 @@ pub fn refresh_reviewers(data_root: &Path, pr: &NodePr) -> Result<Vec<Reviewer>,
 /// remembered choice is cleared.
 pub fn update(
     data_root: &Path,
+    fleet: &tod_store::fleet::FleetStore,
+    node: uuid::Uuid,
     pr: &NodePr,
     choice: &crate::pr_choices::Choice,
-    answered_at: Option<chrono::DateTime<chrono::Utc>>,
 ) -> Result<(), String> {
-    let facts = load(data_root, pr, answered_at)?;
+    let facts = load(data_root, fleet, node, pr)?;
     if facts.merged {
         return Err("this pull request is merged".to_string());
     }
@@ -175,4 +195,76 @@ pub fn update(
         gh.request_reviewers(&pr.owner, &pr.repo, pr.pr_number, &[login.clone()]).map_err(say)?;
     }
     crate::pr_choices::store_choice(data_root, pr, &crate::pr_choices::Choice::default())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pr_readiness::PrFeed;
+    use tod_store::github::{PrSnapshot, PrStatus};
+    use tod_store::settings::{PrReadinessSettings, PrReviewBotSettings};
+
+    struct Silent {
+        head_at: Option<&'static str>,
+    }
+
+    impl PrFeed for Silent {
+        fn snapshot(&self, _: &NodePr) -> Result<PrSnapshot, String> {
+            Ok(PrSnapshot {
+                status: PrStatus {
+                    mergeable: Some(true),
+                    mergeable_state: Some("blocked".into()),
+                    behind_by: Some(0),
+                    checks: Some("success".into()),
+                    head_sha: Some("abcdef1".into()),
+                    head_committed_at: self.head_at.map(Into::into),
+                    open: true,
+                    draft: true,
+                    base_ref: Some("main".into()),
+                    ..Default::default()
+                },
+                threads: Vec::new(),
+                comments: Vec::new(),
+                reviews: Vec::new(),
+            })
+        }
+    }
+
+    fn pr() -> NodePr {
+        NodePr { owner: "o".into(), repo: "r".into(), pr_number: 1, url: "https://github.com/o/r/pull/1".into() }
+    }
+
+    fn configured() -> PrReadinessSettings {
+        PrReadinessSettings { bots: vec![PrReviewBotSettings::new("greptile", 4, 10)], ..Default::default() }
+    }
+
+    #[test]
+    fn a_bot_that_is_waited_for_blocks_the_buttons() {
+        let facts = facts_from(&Silent { head_at: Some("2020-01-01T00:00:00Z") }, &configured(), None, &pr()).unwrap();
+        assert!(!facts.review_clean);
+        assert_eq!(facts.waiting_on, "Waiting for greptile");
+    }
+
+    #[test]
+    fn a_waived_bot_is_not_waited_for_and_the_buttons_agree_with_the_gate() {
+        let fx = crate::interview::test_support::fixture();
+        crate::bot_silence::waive_for_test(&fx.fleet, fx.node, "greptile");
+        let settings = fx
+            .fleet
+            .read(|conn| crate::bot_silence::settings_for_node(conn, fx.node, configured()))
+            .unwrap();
+        let facts = facts_from(&Silent { head_at: Some("2020-01-01T00:00:00Z") }, &settings, None, &pr()).unwrap();
+        assert!(facts.review_clean, "{facts:?}");
+        assert_eq!(facts.waiting_on, "");
+        assert!(facts.not_clean_because.is_empty());
+    }
+
+    #[test]
+    fn a_head_with_no_time_is_an_error_not_a_quiet_wait() {
+        let err = facts_from(&Silent { head_at: None }, &configured(), None, &pr()).unwrap_err();
+        assert!(err.contains("no time for the head commit"), "{err}");
+        assert!(err.contains("greptile"), "{err}");
+        // Nothing to measure when no bot is configured.
+        assert!(facts_from(&Silent { head_at: None }, &PrReadinessSettings::default(), None, &pr()).is_ok());
+    }
 }

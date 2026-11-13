@@ -2751,7 +2751,7 @@ fn a_finding_left_open_by_an_earlier_stay_is_still_owed_after_the_phase_is_rerun
     crate::lifecycle::restart_stay(&fx.fleet, fx.node).unwrap();
     assert_eq!(open(&fx), 1, "an open finding outlives the stay that recorded it");
     let links = fx.fleet.read(|conn| tod_store::github::NodePrRepo::new(conn).read(fx.node)).unwrap();
-    let settings = crate::pr_readiness::settings_at(&fx.root);
+    let settings = crate::pr_readiness::settings_for_node(&fx.fleet, fx.node, &fx.root).unwrap();
     let live = crate::pr_readiness::live_answered(feed.as_ref(), &links.prs, &settings, None).unwrap();
     let owed = fx.fleet.read(|conn| owed(conn, fx.node, &live)).unwrap();
     assert!(!matches!(owed, Owed::Clear), "the open finding is owed, not a clear review: {owed:?}");

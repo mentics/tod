@@ -226,7 +226,7 @@ impl Protocol for PrProtocol {
         if prs.is_empty() {
             return Ok(None);
         }
-        if let Some(live) = live_prs(env.data_root, &prs) {
+        if let Some(live) = live_prs(env, node, &prs) {
             return Ok(Some(live.iter().map(|p| p.fingerprint.clone()).collect::<Vec<_>>().join(" ")));
         }
         Ok(Some(
@@ -267,12 +267,15 @@ impl Protocol for PrProtocol {
 
 /// Every linked pull request as it stands now; `None` when none can be read.
 fn live_prs(
-    data_root: &std::path::Path,
+    env: &ProtocolEnv<'_>,
+    node: Uuid,
     prs: &[tod_store::github::NodePr],
 ) -> Option<Vec<crate::pr_readiness::LivePr>> {
-    let feed = crate::pr_readiness::feed_for(data_root)?;
+    let feed = crate::pr_readiness::feed_for(env.data_root)?;
+    // A bot the user told the node to go on without is not read as missing.
+    let settings = crate::pr_readiness::settings_for_node(env.fleet, node, env.data_root).ok()?;
     // Called after an agent turn: whatever it was asked has had its answer.
-    crate::pr_readiness::live_answered(feed.as_ref(), prs, &pr_settings_at(data_root), Some(chrono::Utc::now())).ok()
+    crate::pr_readiness::live_answered(feed.as_ref(), prs, &settings, Some(chrono::Utc::now())).ok()
 }
 
 /// How to go about the work, after what it is.
@@ -349,10 +352,6 @@ pub fn pr_stuck(
     (rounds >= settings.max_rounds).then(|| {
         format!("{rounds} rounds of fixing and reviewing and the pull request still is not clear")
     })
-}
-
-fn pr_settings_at(data_root: &std::path::Path) -> tod_store::PrReadinessSettings {
-    crate::pr_readiness::settings_at(data_root)
 }
 
 /// Plays the pr agent for `--agent mock`. In `pr` it opens the PR if there
@@ -587,6 +586,59 @@ open pr: Cloud test"), Some("Cloud test"));
         let next = PrProtocol.next(&TurnContext { env: &env, report: None, continuations: 0, progressed: true });
         crate::pr_readiness::set_feed_override(None);
         assert!(matches!(next.expect("a decision"), Next::Done(Stop::Complete)));
+    }
+
+    /// A feed whose only open thing is a bot that never reviewed.
+    struct BotSilent;
+
+    impl crate::pr_readiness::PrFeed for BotSilent {
+        fn snapshot(&self, _: &tod_store::github::NodePr) -> Result<tod_store::github::PrSnapshot, String> {
+            use tod_store::github::{PrSnapshot, PrStatus};
+            Ok(PrSnapshot {
+                status: PrStatus {
+                    mergeable: Some(true),
+                    mergeable_state: Some("blocked".into()),
+                    behind_by: Some(0),
+                    checks: Some("success".into()),
+                    head_sha: Some("abcdef1".into()),
+                    head_committed_at: Some("2020-01-01T00:00:00Z".into()),
+                    open: true,
+                    base_ref: Some("main".into()),
+                    ..Default::default()
+                },
+                threads: vec![],
+                comments: vec![],
+                reviews: vec![],
+            })
+        }
+    }
+
+    #[test]
+    fn live_prs_ignores_a_bot_the_user_waived() {
+        let fx = fixture();
+        std::fs::write(fx.root.join("tod.yml"), "pr_readiness:\n  bots:\n    - name: greptile\n").unwrap();
+        let pr = tod_store::github::NodePr {
+            owner: "o".into(),
+            repo: "r".into(),
+            pr_number: 1,
+            url: "https://github.com/o/r/pull/1".into(),
+        };
+        let media = MediaPaths::discover().expect("media paths");
+        let env = ProtocolEnv {
+            fleet: &fx.fleet,
+            media: &media,
+            data_root: &fx.root,
+            conversation_id: Uuid::new_v4(),
+            focus: Focus::Node(fx.node),
+        };
+        crate::pr_readiness::set_feed_override(Some(std::sync::Arc::new(BotSilent)));
+        let waiting = live_prs(&env, fx.node, std::slice::from_ref(&pr)).expect("read");
+        crate::bot_silence::waive_for_test(&fx.fleet, fx.node, "greptile");
+        let waived = live_prs(&env, fx.node, std::slice::from_ref(&pr)).expect("read");
+        crate::pr_readiness::set_feed_override(None);
+        assert!(!waiting[0].assessment.waits().is_empty(), "the bot is waited for before it is waived");
+        assert!(waived[0].assessment.bots.is_empty(), "{:?}", waived[0].assessment.bots);
+        assert!(waived[0].assessment.waits().iter().all(|w| matches!(w, crate::pr_readiness::Wait::HumanReview)));
     }
 
     #[test]

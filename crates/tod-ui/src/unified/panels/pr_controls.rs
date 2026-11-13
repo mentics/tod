@@ -303,12 +303,6 @@ impl PrControls {
         }
     }
 
-    /// When the node's pull request agent last answered; comments before it
-    /// are not feedback still to do.
-    fn answered_at(&self) -> Option<chrono::DateTime<chrono::Utc>> {
-        tod_core::pr_readiness::agent_answered_at(&self.fleet, self.node_id).unwrap_or(None)
-    }
-
     /// Read every linked pull request from GitHub again (the cache is dropped).
     fn refresh(&mut self, cx: &mut Context<Self>) {
         for pr in self.linked.clone() {
@@ -337,13 +331,14 @@ impl PrControls {
             row.busy = Some("Reading GitHub…");
         }
         let root = self.root.clone();
-        let answered_at = self.answered_at();
+        let fleet = self.fleet.clone();
+        let node = self.node_id;
         cx.spawn(async move |this, cx| {
             let read = {
                 let pr = pr.clone();
                 cx.background_executor()
                     .spawn(async move {
-                        let facts = tod_core::pr_actions::load(&root, &pr, answered_at)?;
+                        let facts = tod_core::pr_actions::load(&root, &fleet, node, &pr)?;
                         let labels = match tod_core::pr_choices::labels(&root, &pr)? {
                             Some(_) => None,
                             None => Some(tod_core::pr_actions::refresh_labels(&root, &pr)?),
@@ -514,7 +509,8 @@ impl PrControls {
     /// request again; a failure is said on its row.
     fn update_pr(&mut self, pr: NodePr, cx: &mut Context<Self>) {
         self.record("pr_update", cx);
-        let answered_at = self.answered_at();
+        let fleet = self.fleet.clone();
+        let node = self.node_id;
         let root = self.root.clone();
         let Some(row) = self.row_mut(&pr) else { return };
         row.sending = true;
@@ -525,7 +521,7 @@ impl PrControls {
             let result = {
                 let pr = pr.clone();
                 cx.background_executor()
-                    .spawn(async move { tod_core::pr_actions::update(&root, &pr, &choice, answered_at) })
+                    .spawn(async move { tod_core::pr_actions::update(&root, &fleet, node, &pr, &choice) })
                     .await
             };
             this.update(cx, |this, cx| {

@@ -509,6 +509,28 @@ impl Assessment {
         since.is_some_and(|since| self.read_at - since >= patience)
     }
 
+    /// Why the bots' patience cannot be measured: GitHub gave no (readable)
+    /// time for the head commit while a bot has yet to review it. Without it
+    /// a silent bot could never be told from a slow one, so the caller must
+    /// report this (an error, never a quiet wait).
+    pub fn head_time_missing(&self) -> Option<String> {
+        if self.merged {
+            return None;
+        }
+        let waiting: Vec<&str> = self
+            .bots
+            .iter()
+            .filter(|r| r.head_at.is_none() && !matches!(r.standing, BotStanding::Current { .. }))
+            .map(|r| r.settings.name.as_str())
+            .collect();
+        (!waiting.is_empty()).then(|| {
+            format!(
+                "GitHub gave no time for the head commit, so how long {} has had to review it cannot be measured",
+                waiting.join(", ")
+            )
+        })
+    }
+
     /// What is being waited for.
     pub fn waits(&self) -> Vec<Wait> {
         if self.merged {
@@ -1317,6 +1339,27 @@ Not safe.
     }
 
     #[test]
+    fn a_head_with_no_time_cannot_be_measured_and_live_reading_says_so() {
+        struct NoTime;
+        impl PrFeed for NoTime {
+            fn snapshot(&self, _: &tod_store::github::NodePr) -> Result<PrSnapshot, String> {
+                let mut st = status("blocked", "success");
+                st.head_committed_at = None;
+                Ok(snap(st, vec![], vec![]))
+            }
+        }
+        let mut st = status("blocked", "success");
+        st.head_committed_at = None;
+        let a = Assessment::of(&snap(st, vec![], vec![]), &settings(), now());
+        assert!(a.head_time_missing().is_some_and(|m| m.contains("greptile")));
+        let pr = tod_store::github::NodePr::new("o", "r", 1);
+        let err = live(&NoTime, std::slice::from_ref(&pr), &settings()).unwrap_err();
+        assert!(err.contains("no time for the head commit"), "{err}");
+        // Without a bot there is nothing to measure.
+        assert!(live(&NoTime, std::slice::from_ref(&pr), &PrReadinessSettings::default()).is_ok());
+    }
+
+    #[test]
     fn a_bot_asked_as_often_as_allowed_is_silent_and_never_asked_again() {
         let st = status("blocked", "success");
         let comments = vec![
@@ -1746,8 +1789,10 @@ pub fn settings_for_node(
     Ok(fleet.read(|conn| crate::bot_silence::settings_for_node(conn, node, settings))?)
 }
 
-/// The project's readiness settings; the defaults when unreadable.
-pub fn settings_at(data_root: &std::path::Path) -> PrReadinessSettings {
+/// The project's readiness settings; the defaults when unreadable. Private
+/// on purpose: it knows nothing of a bot the user waived, so every reader
+/// goes through [`settings_for_node`].
+fn settings_at(data_root: &std::path::Path) -> PrReadinessSettings {
     tod_store::TodSettings::load(&tod_store::TodPaths::at(data_root))
         .map(|settings| settings.pr_readiness)
         .unwrap_or_default()
@@ -1859,6 +1904,9 @@ pub fn live_answered(
                 feed.same_change(pr, base, reviewed, head).map_err(|err| format!("{}: {err}", pr.url))
             })?
             .answered_through(answered_at);
+            if let Some(why) = assessment.head_time_missing() {
+                return Err(format!("{}: {why}", pr.url));
+            }
             let mut open: Vec<&str> = assessment.open_threads.iter().map(|t| t.id.as_str()).collect();
             open.sort_unstable();
             let fingerprint = format!(
